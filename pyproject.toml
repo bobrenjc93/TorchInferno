@@ -12,6 +12,7 @@ dependencies = ["huggingface-hub", "safetensors", "torch"]
 
 [project.optional-dependencies]
 dev = ["pytest"]
+kernels = ["triton"]
 
 [project.scripts]
 torchinferno = "torchinferno.cli:main"

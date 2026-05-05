@@ -7,6 +7,12 @@ import torch
 
 from torchinferno.compiler import CompileConfig, compile_forward
 from torchinferno.graph import trace_with_make_fx
+from torchinferno.models.conversion import (
+    IncompatibleCheckpointError,
+    audit_deepseek_checkpoint,
+    convert_deepseek_checkpoint,
+    dtype_from_name,
+)
 from torchinferno.models.dsv4 import DSv4ForCausalLM, tiny_dsv4_config
 from torchinferno.research import ExperimentResult, ResearchHarness
 from torchinferno.runtime.batching import InferenceRequest, run_continuous_batch
@@ -157,6 +163,36 @@ def run_research_smoke(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_dsv4_audit(args: argparse.Namespace) -> int:
+    report = audit_deepseek_checkpoint(
+        args.model,
+        revision=args.revision,
+        cache_dir=args.cache_dir,
+    )
+    print(report.summary())
+    return 0 if report.compatible else 2
+
+
+def run_dsv4_convert(args: argparse.Namespace) -> int:
+    try:
+        report = convert_deepseek_checkpoint(
+            args.model,
+            args.output_dir,
+            revision=args.revision,
+            cache_dir=args.cache_dir,
+            dtype=dtype_from_name(args.dtype),
+            max_shard_size=args.max_shard_size,
+            allow_partial=args.allow_partial,
+        )
+    except IncompatibleCheckpointError as exc:
+        print(exc.report.summary())
+        print("Refusing to convert incompatible checkpoint. Use --allow-partial only for debugging.")
+        return 2
+    print(report.summary())
+    print(f"wrote={args.output_dir}")
+    return 0 if report.compatible else 2
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="torchinferno")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -208,6 +244,25 @@ def build_parser() -> argparse.ArgumentParser:
 
     research = subparsers.add_parser("research-smoke", help="Run a tiny auto research harness.")
     research.set_defaults(func=run_research_smoke)
+
+    audit = subparsers.add_parser("dsv4-audit", help="Audit a DeepSeek-style checkpoint for DSv4 conversion.")
+    audit.add_argument("model", help="Local checkpoint directory or Hugging Face repo ID.")
+    audit.add_argument("--revision", default=None)
+    audit.add_argument("--cache-dir", default=None)
+    audit.set_defaults(func=run_dsv4_audit)
+
+    convert = subparsers.add_parser(
+        "dsv4-convert",
+        help="Convert a compatible DeepSeek-style checkpoint into TorchInferno DSv4 format.",
+    )
+    convert.add_argument("model", help="Local checkpoint directory or Hugging Face repo ID.")
+    convert.add_argument("output_dir")
+    convert.add_argument("--revision", default=None)
+    convert.add_argument("--cache-dir", default=None)
+    convert.add_argument("--dtype", default=None, help="Optional output dtype: float32, float16, or bfloat16.")
+    convert.add_argument("--max-shard-size", default="5GB")
+    convert.add_argument("--allow-partial", action="store_true", help="Write only convertible tensors for debugging.")
+    convert.set_defaults(func=run_dsv4_convert)
     return parser
 
 

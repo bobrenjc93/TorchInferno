@@ -7,7 +7,8 @@ from typing import Optional
 
 import torch
 from torch import Tensor, nn
-import torch.nn.functional as F
+
+from torchinferno.kernels import rms_norm, swiglu_activation
 
 
 @dataclass
@@ -104,9 +105,7 @@ class RMSNorm(nn.Module):
         self.eps = eps
 
     def forward(self, x: Tensor) -> Tensor:
-        variance = x.float().pow(2).mean(dim=-1, keepdim=True)
-        x = x * torch.rsqrt(variance + self.eps).to(dtype=x.dtype)
-        return x * self.weight
+        return rms_norm(x, self.weight, eps=self.eps)
 
 
 class RotaryEmbedding(nn.Module):
@@ -257,7 +256,7 @@ class SwiGLUExpert(nn.Module):
         self.w2 = nn.Linear(intermediate_size, hidden_size, bias=False)
 
     def forward(self, x: Tensor) -> Tensor:
-        return self.w2(F.silu(self.w1(x)) * self.w3(x))
+        return self.w2(swiglu_activation(self.w1(x), self.w3(x)))
 
 
 class RoutedMoE(nn.Module):

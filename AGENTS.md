@@ -14,9 +14,17 @@ PYTHONPATH=src python3 -m torchinferno.cli trace-smoke --device cpu --tokens 2
 PYTHONPATH=src python3 -m torchinferno.cli sim-smoke
 ```
 
+For conversion or kernel changes, also run:
+
+```bash
+python3 -m pytest tests/test_conversion_and_kernels.py
+```
+
 ## Where To Put Work
 
 - Model architecture changes: `src/torchinferno/models/`.
+- Checkpoint audit/conversion work: `src/torchinferno/models/conversion.py`.
+- Custom kernels and kernel graph passes: `src/torchinferno/kernels/`.
 - Compiler and tracing helpers: `src/torchinferno/compiler.py` and
   `src/torchinferno/graph/`.
 - Scheduling, batching, cache, routing, and simulation policies:

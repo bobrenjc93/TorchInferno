@@ -17,6 +17,8 @@ to grow toward production-grade SOTA inference.
 - Explicit append-only KV cache for prefill and decode correctness tests.
 - Hugging Face-style local and Hub checkpoint save/load for TorchInferno DSv4
   key names and tensor shapes.
+- DeepSeek-style checkpoint audit and exact conversion for checkpoints whose
+  tensor contracts match TorchInferno DSv4.
 - Greedy and temperature sampling.
 - Ragged request API with dense continuous-batching execution buckets.
 - Deterministic time-sliced virtual GPU simulation.
@@ -31,6 +33,8 @@ to grow toward production-grade SOTA inference.
 - Flex-attention-shaped q/k/v API with eager fallback.
 - Piecewise CUDA graph runner API with CPU/eager fallback.
 - Optional Monarch adapter point with fake-world fallback.
+- Triton CUDA kernels for RMSNorm and SwiGLU activation, with eager torch
+  fallbacks on CPU or unsupported devices.
 - Minimal auto research harness for comparing scheduler/cache/routing policies.
 
 ## Quickstart
@@ -92,6 +96,8 @@ TorchInferno keeps compiler hooks explicit:
 - `torchinferno.graph.PassRegistry` registers ordered FX graph passes.
 - `replace_call_function_targets` is the first small pattern replacement helper
   for custom-kernel experiments such as NVFP4 MoE or specialized attention.
+- `torchinferno.kernels.passes.register_kernel_replacement_passes` wires
+  reference leaf calls to TorchInferno kernel APIs.
 
 Trace a DSv4 attention slice:
 
@@ -146,6 +152,21 @@ to add repeatable policy experiments without inventing a new harness each time.
 PYTHONPATH=src python3 -m torchinferno.cli research-smoke
 ```
 
+## Custom Kernels
+
+`torchinferno.kernels` exposes production-facing kernel APIs with deterministic
+torch fallbacks:
+
+- `rms_norm`: Triton CUDA RMSNorm when CUDA/Triton are available, torch fallback
+  otherwise.
+- `swiglu_activation`: Triton CUDA SwiGLU activation when available, torch
+  fallback otherwise.
+
+The DSv4 model calls these APIs from `RMSNorm` and `SwiGLUExpert`, so the model
+keeps one torch-native path while the kernel backend can evolve behind a narrow
+interface. Tests compare CUDA Triton outputs against torch references when CUDA
+is available.
+
 ## Agent Workflow
 
 `AGENTS.md` gives coding agents a short map of where to put model, compiler,
@@ -177,9 +198,23 @@ export HF_TOKEN=...
 torchinferno dsv4-hf-smoke org-or-user/repo-name --device cuda
 ```
 
-Important: the current loader expects TorchInferno DSv4-compatible key names
-and tensor shapes. Native production DeepSeek checkpoints still need a
-conversion layer, tokenizer wiring, and validation against known logits.
+TorchInferno also has DeepSeek-style checkpoint audit and conversion commands:
+
+```bash
+PYTHONPATH=src python3 -m torchinferno.cli dsv4-audit /path/to/deepseek-checkpoint
+PYTHONPATH=src python3 -m torchinferno.cli dsv4-convert /path/to/deepseek-checkpoint /tmp/torchinferno-dsv4
+```
+
+The converter indexes safetensor shard metadata without loading the whole model,
+checks every tensor shape against TorchInferno DSv4, writes sharded safetensors,
+and stores `torchinferno_conversion_report.json` in the output directory.
+
+Important: conversion is exact and conservative. If a native DeepSeek checkpoint
+uses attention or MoE contracts TorchInferno DSv4 cannot represent yet, such as
+query LoRA, split RoPE/nope heads, shared experts, grouped routing, or different
+value head dimensions, `dsv4-audit` reports the mismatch and `dsv4-convert`
+refuses to write a misleading checkpoint unless `--allow-partial` is explicitly
+used for debugging.
 
 ## Repository Layout
 
@@ -187,7 +222,11 @@ conversion layer, tokenizer wiring, and validation against known logits.
 src/torchinferno/
   compiler.py             torch.compile policy helper.
   cli.py                  CLI smoke runners.
+  kernels/ops.py          Kernel APIs with torch fallbacks.
+  kernels/triton_ops.py   Triton CUDA RMSNorm and SwiGLU kernels.
+  kernels/passes.py       Graph-pass registration for kernel replacements.
   models/dsv4.py          DSv4-style causal LM, MoE, attention, and KV cache.
+  models/conversion.py    DeepSeek-style checkpoint audit and conversion.
   models/hf.py            Hugging Face-style config and weights IO.
   graph/export.py         make_fx and FakeTensor tracing helper.
   graph/passes.py         FX graph pass registry and replacement helpers.
@@ -203,6 +242,8 @@ src/torchinferno/
   research/harness.py     Auto research experiment harness.
 tests/
   test_dsv4_e2e.py        DSv4 e2e and original runtime tests.
+  test_conversion_and_kernels.py
+                           Checkpoint conversion and custom kernel tests.
   test_scaffolding.py     Compiler/runtime/research scaffold tests.
 AGENTS.md                 Short contribution map for coding agents.
 ```
@@ -212,6 +253,7 @@ AGENTS.md                 Short contribution map for coding agents.
 Implemented as working code and tests:
 
 - DSv4 local inference path.
+- DeepSeek-style checkpoint audit and exact compatible conversion.
 - `torch.compile` smoke path.
 - `make_fx` and fake tensor trace helper.
 - Fake process groups.
@@ -225,12 +267,15 @@ Implemented as working code and tests:
 - Flex-attention-shaped fallback.
 - Auto research harness.
 - Optional Monarch integration point.
+- Triton CUDA RMSNorm and SwiGLU kernels with torch fallbacks.
 
 Still intentionally future work:
 
-- Native DeepSeek production checkpoint conversion.
+- Full native DeepSeek production architecture coverage for checkpoints with
+  query LoRA, split QK head contracts, shared experts, grouped routing, or
+  other tensors TorchInferno DSv4 cannot yet represent exactly.
 - Tokenizer integration and known-logit validation for production DSv4 weights.
-- Real paged/radix/flex/custom CUDA kernels.
+- Real paged/radix/flex attention kernels and fused MoE kernels.
 - Piecewise CUDA graph capture with static device buffers.
 - Monarch-backed distributed execution instead of the fake fallback.
 - Prefix cache reuse integrated into model execution.

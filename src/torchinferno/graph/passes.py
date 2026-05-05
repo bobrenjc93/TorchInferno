@@ -66,6 +66,25 @@ def replace_call_function_targets(
     return pass_fn
 
 
+def replace_call_module_targets(
+    replacements: Mapping[str, torch.nn.Module],
+) -> GraphPass:
+    """Build a graph pass that swaps named call_module targets.
+
+    This is a pragmatic bridge for custom kernel modules. More advanced
+    pattern-matching passes can lower into this once they identify a module
+    subtree that should become a fused implementation.
+    """
+
+    def pass_fn(graph_module: torch.fx.GraphModule) -> torch.fx.GraphModule:
+        for name, module in replacements.items():
+            graph_module.add_submodule(name, module)
+        graph_module.recompile()
+        return graph_module
+
+    return pass_fn
+
+
 def annotate_matching_nodes(
     predicate: Callable[[torch.fx.Node], bool],
     *,

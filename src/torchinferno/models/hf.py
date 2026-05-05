@@ -56,6 +56,29 @@ def load_dsv4_pretrained(
     return model
 
 
+def resolve_pretrained_path(
+    pretrained_model_name_or_path: str | Path,
+    *,
+    token: str | None = None,
+    revision: str | None = None,
+    cache_dir: str | Path | None = None,
+) -> Path:
+    return _resolve_pretrained_path(
+        pretrained_model_name_or_path,
+        token=_resolve_token(token),
+        revision=revision,
+        cache_dir=cache_dir,
+    )
+
+
+def load_config(path: str | Path) -> dict[str, object]:
+    return _load_config(Path(path))
+
+
+def load_state_dict(path: str | Path, *, map_location: str | torch.device = "cpu") -> dict[str, torch.Tensor]:
+    return _load_state_dict(Path(path), map_location=map_location)
+
+
 def _resolve_token(token: str | None) -> str | None:
     if token:
         return token
