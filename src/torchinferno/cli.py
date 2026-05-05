@@ -18,8 +18,12 @@ from torchinferno.models.conversion import (
 )
 from torchinferno.models.deepseek import DeepSeekV32ForCausalLM, tiny_deepseek_v32_config
 from torchinferno.models.dsv4 import DSv4ForCausalLM, tiny_dsv4_config
+from torchinferno.kernels import KernelBackend, KernelConfig, paged_decode_attention
 from torchinferno.research import ExperimentResult, ResearchHarness
+from torchinferno.research.benchmarks import benchmark_callable
 from torchinferno.runtime.batching import InferenceRequest, run_continuous_batch
+from torchinferno.runtime.paged import PagedKVCache
+from torchinferno.runtime.paged_attention import paged_causal_attention
 from torchinferno.runtime.scheduler import DisaggregatedPrefillDecodeSimulator, InferenceJob
 from torchinferno.runtime.traffic import TrafficPattern, simulate_traffic
 from torchinferno.tokenization import load_text_tokenizer
@@ -278,6 +282,47 @@ def run_traffic_smoke(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_perf_smoke(args: argparse.Namespace) -> int:
+    device = torch.device(args.device) if args.device else _default_device()
+    torch.manual_seed(args.seed)
+    cache = PagedKVCache(
+        num_pages=(args.seq_len + args.page_size - 1) // args.page_size,
+        page_size=args.page_size,
+        num_key_value_heads=args.heads,
+        head_dim=args.head_dim,
+        value_head_dim=args.value_dim,
+        device=device,
+        dtype=torch.float32,
+    )
+    keys = torch.randn(args.heads, args.seq_len, args.head_dim, device=device)
+    values = torch.randn(args.heads, args.seq_len, args.value_dim, device=device)
+    query = torch.randn(args.heads, 1, args.head_dim, device=device)
+    cache.append("req", keys, values)
+    position = args.seq_len - 1
+    backend = KernelBackend(args.backend)
+
+    reference = benchmark_callable(
+        "paged-reference",
+        lambda: paged_causal_attention(query, cache, "req", torch.tensor([position], device=device)),
+        warmup=args.warmup,
+        iters=args.iters,
+        device=device,
+    )
+    specialized = benchmark_callable(
+        f"paged-decode-{backend.value}",
+        lambda: paged_decode_attention(query, cache, "req", position, config=KernelConfig(backend=backend)),
+        warmup=args.warmup,
+        iters=args.iters,
+        device=device,
+    )
+    print("TorchInferno performance smoke")
+    for result in (reference, specialized):
+        print(f"{result.name}: mean_ms={result.mean_ms:.4f} iters={result.iters} device={result.device}")
+    if specialized.mean_ms > 0:
+        print(f"speedup_vs_reference={reference.mean_ms / specialized.mean_ms:.3f}")
+    return 0
+
+
 def run_capture_logits(args: argparse.Namespace) -> int:
     device = torch.device(args.device) if args.device else _default_device()
     model = load_model_auto(
@@ -487,6 +532,19 @@ def build_parser() -> argparse.ArgumentParser:
     traffic.add_argument("--print-stages", type=int, default=8)
     traffic.add_argument("--seed", type=int, default=0)
     traffic.set_defaults(func=run_traffic_smoke)
+
+    perf = subparsers.add_parser("perf-smoke", help="Benchmark paged attention reference and specialized decode paths.")
+    perf.add_argument("--device", default=None, help="Torch device, defaults to cuda when available.")
+    perf.add_argument("--backend", choices=[backend.value for backend in KernelBackend], default=KernelBackend.AUTO.value)
+    perf.add_argument("--heads", type=int, default=8)
+    perf.add_argument("--seq-len", type=int, default=128)
+    perf.add_argument("--head-dim", type=int, default=64)
+    perf.add_argument("--value-dim", type=int, default=64)
+    perf.add_argument("--page-size", type=int, default=16)
+    perf.add_argument("--warmup", type=int, default=3)
+    perf.add_argument("--iters", type=int, default=10)
+    perf.add_argument("--seed", type=int, default=0)
+    perf.set_defaults(func=run_perf_smoke)
 
     capture = subparsers.add_parser("capture-logits", help="Capture a known-logit reference for a checkpoint.")
     capture.add_argument("model", help="Local checkpoint directory or Hugging Face repo ID.")

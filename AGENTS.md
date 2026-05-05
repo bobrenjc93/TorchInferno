@@ -14,6 +14,7 @@ PYTHONPATH=src python3 -m torchinferno.cli deepseek-smoke --device cpu --batch-s
 PYTHONPATH=src python3 -m torchinferno.cli trace-smoke --device cpu --tokens 2
 PYTHONPATH=src python3 -m torchinferno.cli sim-smoke
 PYTHONPATH=src python3 -m torchinferno.cli traffic-smoke
+PYTHONPATH=src python3 -m torchinferno.cli perf-smoke --device cpu --heads 2 --seq-len 8 --head-dim 8 --value-dim 8
 ```
 
 For conversion or kernel changes, also run:
@@ -22,6 +23,7 @@ For conversion or kernel changes, also run:
 python3 -m pytest tests/test_conversion_and_kernels.py
 python3 -m pytest tests/test_deepseek_native.py
 python3 -m pytest tests/test_production_workflows.py
+python3 -m pytest tests/test_performance_specialization.py
 ```
 
 ## Where To Put Work

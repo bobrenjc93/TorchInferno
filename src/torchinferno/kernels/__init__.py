@@ -5,10 +5,17 @@ from torchinferno.kernels.ops import (
     swiglu_activation,
     swiglu_activation_reference,
 )
+from torchinferno.kernels.nvfp4 import NVFP4Tensor, dequantize_nvfp4, nvfp4_linear_reference, quantize_nvfp4
+from torchinferno.kernels.paged_attention import paged_decode_attention
 
 __all__ = [
     "KernelBackend",
     "KernelConfig",
+    "NVFP4Tensor",
+    "dequantize_nvfp4",
+    "nvfp4_linear_reference",
+    "paged_decode_attention",
+    "quantize_nvfp4",
     "rms_norm",
     "swiglu_activation",
     "swiglu_activation_reference",

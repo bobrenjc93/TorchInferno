@@ -73,3 +73,77 @@ def triton_rms_norm(x: Tensor, weight: Tensor, eps: float) -> Tensor:
         num_warps=8,
     )
     return out.view_as(x)
+
+
+@triton.jit
+def _paged_decode_attention_kernel(
+    query_ptr,
+    key_pages_ptr,
+    value_pages_ptr,
+    page_ids_ptr,
+    out_ptr,
+    seq_len: tl.constexpr,
+    position: tl.constexpr,
+    page_size: tl.constexpr,
+    n_heads: tl.constexpr,
+    head_dim: tl.constexpr,
+    value_dim: tl.constexpr,
+    scale: tl.constexpr,
+    block_s: tl.constexpr,
+    block_d: tl.constexpr,
+    block_v: tl.constexpr,
+) -> None:
+    head = tl.program_id(0)
+    value_block = tl.program_id(1)
+    offs_s = tl.arange(0, block_s)
+    offs_d = tl.arange(0, block_d)
+    page = tl.load(page_ids_ptr + (offs_s // page_size), mask=offs_s < seq_len, other=0)
+    page_offset = offs_s % page_size
+    key_offsets = (((page[:, None] * n_heads + head) * page_size + page_offset[:, None]) * head_dim) + offs_d[None, :]
+    q = tl.load(query_ptr + head * head_dim + offs_d, mask=offs_d < head_dim, other=0.0).to(tl.float32)
+    k = tl.load(key_pages_ptr + key_offsets, mask=(offs_s[:, None] < seq_len) & (offs_d[None, :] < head_dim), other=0.0)
+    scores = tl.sum(k.to(tl.float32) * q[None, :], axis=1) * scale
+    valid = (offs_s < seq_len) & (offs_s <= position)
+    scores = tl.where(valid, scores, -float("inf"))
+    scores = scores - tl.max(scores, axis=0)
+    probs = tl.exp(scores)
+    probs = probs / tl.sum(probs, axis=0)
+
+    offs_v = value_block * block_v + tl.arange(0, block_v)
+    value_offsets = (((page[:, None] * n_heads + head) * page_size + page_offset[:, None]) * value_dim) + offs_v[None, :]
+    values = tl.load(
+        value_pages_ptr + value_offsets,
+        mask=(offs_s[:, None] < seq_len) & (offs_v[None, :] < value_dim),
+        other=0.0,
+    )
+    out = tl.sum(values.to(tl.float32) * probs[:, None], axis=0)
+    tl.store(out_ptr + head * value_dim + offs_v, out, mask=offs_v < value_dim)
+
+
+def triton_paged_decode_attention(query: Tensor, cache, request_id: str, position: int) -> Tensor:
+    seq = cache.sequence(request_id)
+    page_ids = torch.tensor(seq.page_ids, device=query.device, dtype=torch.int64)
+    out = torch.empty((query.size(0), cache.value_head_dim), device=query.device, dtype=query.dtype)
+    block_s = triton.next_power_of_2(seq.length)
+    block_d = triton.next_power_of_2(query.size(-1))
+    block_v = min(64, triton.next_power_of_2(cache.value_head_dim))
+    grid = (query.size(0), triton.cdiv(cache.value_head_dim, block_v))
+    _paged_decode_attention_kernel[grid](
+        query.contiguous(),
+        cache.keys,
+        cache.values,
+        page_ids,
+        out,
+        seq.length,
+        int(position),
+        cache.page_size,
+        cache.num_key_value_heads,
+        cache.head_dim,
+        cache.value_head_dim,
+        1.0 / (query.size(-1) ** 0.5),
+        block_s,
+        block_d,
+        block_v,
+        num_warps=4,
+    )
+    return out

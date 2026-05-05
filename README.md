@@ -43,6 +43,11 @@ to grow toward production-grade SOTA inference.
 - Bursty traffic simulation for request diversity and latency modeling.
 - Triton CUDA kernels for RMSNorm and SwiGLU activation, with eager torch
   fallbacks on CPU or unsupported devices.
+- Triton-backed paged decode attention specialization with a torch reference
+  fallback.
+- NVFP4 quantized-linear reference surface and graph-pass hook for future fused
+  DeepSeek-V3.2-NVFP4 kernels.
+- Local performance benchmark smoke for reference versus specialized paths.
 - Minimal auto research harness for comparing scheduler/cache/routing policies.
 
 ## Quickstart
@@ -64,6 +69,7 @@ PYTHONPATH=src python3 -m torchinferno.cli batch-smoke --device cpu
 PYTHONPATH=src python3 -m torchinferno.cli trace-smoke --device cpu
 PYTHONPATH=src python3 -m torchinferno.cli sim-smoke
 PYTHONPATH=src python3 -m torchinferno.cli traffic-smoke
+PYTHONPATH=src python3 -m torchinferno.cli perf-smoke
 PYTHONPATH=src python3 -m torchinferno.cli research-smoke
 ```
 
@@ -228,11 +234,25 @@ torch fallbacks:
   otherwise.
 - `swiglu_activation`: Triton CUDA SwiGLU activation when available, torch
   fallback otherwise.
+- `paged_decode_attention`: decode-token paged attention that uses Triton for
+  CUDA-compatible single-token decode and falls back to the torch reference.
+- `quantize_nvfp4`, `dequantize_nvfp4`, and `nvfp4_linear_reference`: a stable
+  NVFP4 quantized-linear contract for graph passes and future fused kernels.
 
 The DSv4 model calls these APIs from `RMSNorm` and `SwiGLUExpert`, so the model
 keeps one torch-native path while the kernel backend can evolve behind a narrow
 interface. Tests compare CUDA Triton outputs against torch references when CUDA
 is available.
+
+Benchmark reference versus specialized paged attention:
+
+```bash
+PYTHONPATH=src python3 -m torchinferno.cli perf-smoke --device cuda \
+  --heads 8 \
+  --seq-len 1024 \
+  --head-dim 64 \
+  --value-dim 64
+```
 
 ## Agent Workflow
 
@@ -293,6 +313,9 @@ src/torchinferno/
   validation.py           Known-logit capture and validation.
   kernels/ops.py          Kernel APIs with torch fallbacks.
   kernels/triton_ops.py   Triton CUDA RMSNorm and SwiGLU kernels.
+  kernels/paged_attention.py
+                           Paged decode attention kernel API.
+  kernels/nvfp4.py        NVFP4 quantized-linear reference contract.
   kernels/passes.py       Graph-pass registration for kernel replacements.
   models/dsv4.py          DSv4-style causal LM, MoE, attention, and KV cache.
   models/auto.py          Config-driven model loader.
@@ -315,6 +338,7 @@ src/torchinferno/
   runtime/simulation.py   Time-sliced virtual GPU simulator.
   runtime/traffic.py      Bursty traffic simulation.
   research/harness.py     Auto research experiment harness.
+  research/benchmarks.py  Local benchmark helpers.
 tests/
   test_dsv4_e2e.py        DSv4 e2e and original runtime tests.
   test_deepseek_native.py Native architecture, cache, conversion, and CLI tests.
@@ -323,6 +347,8 @@ tests/
   test_scaffolding.py     Compiler/runtime/research scaffold tests.
   test_production_workflows.py
                            Text, validation, paged attention, prefix, traffic tests.
+  test_performance_specialization.py
+                           Triton paged decode, NVFP4, and benchmark tests.
 AGENTS.md                 Short contribution map for coding agents.
 ```
 
@@ -351,12 +377,15 @@ Implemented as working code and tests:
 - Auto research harness.
 - Optional Monarch integration point.
 - Triton CUDA RMSNorm and SwiGLU kernels with torch fallbacks.
+- Triton-backed paged decode attention with torch fallback.
+- NVFP4 quantized-linear reference and graph-pass hook.
+- Local benchmark harness and CLI.
 
 Still intentionally future work:
 
 - Validated reference files for downloaded production weights.
-- Real paged/radix/flex attention kernels and fused MoE kernels beyond the
-  current correct torch references and Triton RMSNorm/SwiGLU kernels.
+- Full production paged/radix/flex attention and fused MoE/NVFP4 kernels beyond
+  the current correct references and decode-focused Triton specialization.
 - Piecewise CUDA graph capture with static device buffers.
 - Monarch-backed distributed execution instead of the fake fallback.
 - Prefix cache reuse integrated into model execution.
