@@ -1,5 +1,6 @@
 """TorchInferno: torch-native inference building blocks."""
 
+from torchinferno.audit import FeatureAudit, TorchInfernoAudit, build_audit_report
 from torchinferno.compiler import CompileConfig, compile_forward
 from torchinferno.kernels import (
     NVFP4Tensor,
@@ -33,11 +34,14 @@ __all__ = [
     "DSv4ForCausalLM",
     "DeepSeekV32Config",
     "DeepSeekV32ForCausalLM",
+    "FeatureAudit",
     "LogitReference",
     "NVFP4Tensor",
+    "TorchInfernoAudit",
     "ValidationResult",
     "audit_deepseek_checkpoint",
     "audit_native_deepseek_checkpoint",
+    "build_audit_report",
     "capture_logit_reference",
     "compile_forward",
     "convert_deepseek_checkpoint",

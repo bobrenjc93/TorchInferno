@@ -81,15 +81,51 @@ def test_continuous_batch_engine_runs_requests_with_prefix_hits() -> None:
     requests = [
         ServingRequest("req-a", (1, 2, 3), 2, arrival_step=0),
         ServingRequest("req-b", (1, 2, 3, 4), 2, arrival_step=1),
-        ServingRequest("req-c", (5, 6), 1, arrival_step=1),
+        ServingRequest("req-c", (5, 6, 7, 8), 2, arrival_step=1),
     ]
 
     results = engine.run(requests)
 
     assert [result.request_id for result in results] == ["req-a", "req-b", "req-c"]
-    assert [len(result.tokens) for result in results] == [5, 6, 3]
+    assert [len(result.tokens) for result in results] == [5, 6, 6]
     assert results[1].prefix_hit_tokens == 3
     assert results[2].prefix_hit_tokens == 0
+    assert engine.stats.prefix_reuse_tokens == 3
+    assert engine.stats.prefix_reuse_requests == 1
+    assert engine.stats.max_model_batch_size == 2
+    assert engine.stats.decode_model_calls < 3
+
+
+def test_continuous_batch_engine_prefix_reuse_matches_full_prefill() -> None:
+    torch.manual_seed(54)
+    config = tiny_deepseek_v32_config(vocab_size=32, max_position_embeddings=16)
+    model = DeepSeekV32ForCausalLM(config).eval()
+    reuse_engine = ContinuousBatchEngine(
+        model,
+        device=torch.device("cpu"),
+        cache_backend="paged",
+        page_size=2,
+        max_active_requests=2,
+    )
+    baseline_engine = ContinuousBatchEngine(
+        model,
+        device=torch.device("cpu"),
+        cache_backend="paged",
+        page_size=2,
+        max_active_requests=1,
+    )
+
+    reuse_results = reuse_engine.run(
+        [
+            ServingRequest("warm", (1, 2, 3), 1, arrival_step=0),
+            ServingRequest("reuse", (1, 2, 3, 4), 2, arrival_step=1),
+        ]
+    )
+    baseline_results = baseline_engine.run([ServingRequest("reuse", (1, 2, 3, 4), 2, arrival_step=0)])
+
+    assert reuse_results[1].tokens == baseline_results[0].tokens
+    assert reuse_results[1].prefix_hit_tokens == 3
+    assert reuse_engine.stats.prefix_reuse_tokens == 3
 
 
 def test_serve_smoke_cli_runs() -> None:
@@ -117,3 +153,4 @@ def test_serve_smoke_cli_runs() -> None:
 
     assert "TorchInferno serving smoke" in result.stdout
     assert "prefix_hit_tokens=3" in result.stdout
+    assert "prefix_reuse_tokens=3" in result.stdout

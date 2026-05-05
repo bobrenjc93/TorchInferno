@@ -5,6 +5,7 @@ import time
 
 import torch
 
+from torchinferno.audit import build_audit_report
 from torchinferno.compiler import CompileConfig, compile_forward
 from torchinferno.graph import trace_with_make_fx
 from torchinferno.models.auto import load_model_auto
@@ -61,6 +62,11 @@ def run_dsv4_smoke(args: argparse.Namespace) -> int:
     print(f"device={device} batch={args.batch_size} prompt={args.prompt_tokens} new={args.new_tokens}")
     print(f"shape={tuple(output.shape)} elapsed_ms={elapsed_ms:.2f}")
     print(f"tokens[0]={output[0].tolist()}")
+    return 0
+
+
+def run_audit(args: argparse.Namespace) -> int:
+    print(build_audit_report().format())
     return 0
 
 
@@ -305,13 +311,19 @@ def run_serve_smoke(args: argparse.Namespace) -> int:
     requests = [
         ServingRequest("req-a", (1, 2, 3), args.new_tokens, arrival_step=0),
         ServingRequest("req-b", (1, 2, 3, 4), args.new_tokens, arrival_step=1),
-        ServingRequest("req-c", (5, 6), args.new_tokens, arrival_step=1),
+        ServingRequest("req-c", (5, 6, 7, 8), args.new_tokens, arrival_step=1),
     ]
     start = time.perf_counter()
     results = engine.run(requests)
     elapsed_ms = (time.perf_counter() - start) * 1000
     print("TorchInferno serving smoke")
     print(f"device={device} cache_backend={args.cache_backend} requests={len(results)} elapsed_ms={elapsed_ms:.2f}")
+    print(
+        f"prefill_model_calls={engine.stats.prefill_model_calls} "
+        f"decode_model_calls={engine.stats.decode_model_calls} "
+        f"prefix_reuse_tokens={engine.stats.prefix_reuse_tokens} "
+        f"max_model_batch_size={engine.stats.max_model_batch_size}"
+    )
     for result in results:
         print(
             f"{result.request_id}: tokens={list(result.tokens)} "
@@ -464,6 +476,9 @@ def run_deepseek_convert(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="torchinferno")
     subparsers = parser.add_subparsers(dest="command", required=True)
+
+    audit_status = subparsers.add_parser("audit", help="Print environment and feature readiness status.")
+    audit_status.set_defaults(func=run_audit)
 
     smoke = subparsers.add_parser("dsv4-smoke", help="Run a DSv4 end-to-end generation smoke test.")
     smoke.add_argument("--device", default=None, help="Torch device, defaults to cuda when available.")

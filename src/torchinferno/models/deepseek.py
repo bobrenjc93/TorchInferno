@@ -206,6 +206,25 @@ class DeepSeekLayerKVCache:
         self.seq_len = end
         return self.keys[:batch, :, :end, :], self.values[:batch, :, :end, :]
 
+    def copy_prefix_from(
+        self,
+        source: "DeepSeekLayerKVCache",
+        tokens: int,
+        *,
+        source_row: int = 0,
+        dest_row: int = 0,
+    ) -> None:
+        if tokens < 0 or tokens > source.seq_len:
+            raise ValueError("tokens must be in the source cache range")
+        if source_row >= source.batch_size or dest_row >= self.batch_size:
+            raise ValueError("cache row out of range")
+        if tokens > self.max_seq_len:
+            raise ValueError("KV cache capacity exceeded")
+        if tokens:
+            self.keys[dest_row, :, :tokens, :].copy_(source.keys[source_row, :, :tokens, :])
+            self.values[dest_row, :, :tokens, :].copy_(source.values[source_row, :, :tokens, :])
+        self.seq_len = tokens
+
 
 class PagedDeepSeekLayerKVCache:
     cache_backend = "paged"
@@ -260,10 +279,40 @@ class PagedDeepSeekLayerKVCache:
         keys = []
         values = []
         for row in range(batch):
-            row_keys, row_values = self.pages.materialize(self.request_ids[row])
+            row_keys, row_values = self.materialize_row(row)
             keys.append(row_keys)
             values.append(row_values)
         return torch.stack(keys, dim=0), torch.stack(values, dim=0)
+
+    def materialize_row(self, row: int) -> tuple[Tensor, Tensor]:
+        return self.pages.materialize(self.request_ids[row])
+
+    def copy_prefix_from(
+        self,
+        source: DeepSeekLayerKVCache | "PagedDeepSeekLayerKVCache",
+        tokens: int,
+        *,
+        source_row: int = 0,
+        dest_row: int = 0,
+    ) -> None:
+        if tokens < 0:
+            raise ValueError("tokens must be non-negative")
+        if dest_row >= self.batch_size:
+            raise ValueError("cache row out of range")
+        if tokens > self.max_seq_len:
+            raise ValueError("KV cache capacity exceeded")
+        if isinstance(source, PagedDeepSeekLayerKVCache):
+            if tokens > source.seq_len or source_row >= source.batch_size:
+                raise ValueError("source cache range is invalid")
+            source_keys, source_values = source.materialize_row(source_row)
+        else:
+            if tokens > source.seq_len or source_row >= source.batch_size:
+                raise ValueError("source cache range is invalid")
+            source_keys = source.keys[source_row, :, :tokens, :]
+            source_values = source.values[source_row, :, :tokens, :]
+        if tokens:
+            self.pages.append(self.request_ids[dest_row], source_keys[:, :tokens, :], source_values[:, :tokens, :])
+        self.seq_len = tokens
 
     def _append_pages(self, keys: Tensor, values: Tensor) -> int:
         batch, _, tokens, _ = keys.shape
@@ -286,6 +335,16 @@ class DeepSeekCache:
     @property
     def seq_len(self) -> int:
         return self.layers[0].seq_len if self.layers else 0
+
+    @property
+    def max_seq_len(self) -> int:
+        return self.layers[0].max_seq_len if self.layers else 0
+
+    def copy_prefix_from(self, source: "DeepSeekCache", tokens: int, *, source_row: int = 0, dest_row: int = 0) -> None:
+        if len(self.layers) != len(source.layers):
+            raise ValueError("source cache must have the same number of layers")
+        for dest_layer, source_layer in zip(self.layers, source.layers):
+            dest_layer.copy_prefix_from(source_layer, tokens, source_row=source_row, dest_row=dest_row)
 
     @classmethod
     def allocate(

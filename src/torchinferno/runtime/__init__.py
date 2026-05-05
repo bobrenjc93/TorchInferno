@@ -10,7 +10,7 @@ from torchinferno.runtime.scheduler import (
     InferenceJob,
     ScheduledStage,
 )
-from torchinferno.runtime.serving import ContinuousBatchEngine, ServingRequest, ServingResult
+from torchinferno.runtime.serving import ContinuousBatchEngine, ServingRequest, ServingResult, ServingStats
 from torchinferno.runtime.simulation import TimeSlicedSimulator, VirtualGPU
 from torchinferno.runtime.traffic import TrafficPattern, TrafficSimulationResult, generate_traffic, simulate_traffic
 
@@ -35,6 +35,7 @@ __all__ = [
     "ScheduledStage",
     "ServingRequest",
     "ServingResult",
+    "ServingStats",
     "TimeSlicedSimulator",
     "TrafficPattern",
     "TrafficSimulationResult",

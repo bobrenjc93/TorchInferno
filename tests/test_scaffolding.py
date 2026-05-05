@@ -51,6 +51,34 @@ def test_paged_kv_cache_materializes_request_tokens() -> None:
     assert cache.free_pages == (0, 1, 2)
 
 
+def test_paged_kv_cache_alias_prefix_is_copy_on_write() -> None:
+    cache = PagedKVCache(
+        num_pages=4,
+        page_size=2,
+        num_key_value_heads=1,
+        head_dim=2,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+    keys = torch.arange(6, dtype=torch.float32).view(1, 3, 2)
+    values = keys + 100
+    cache.append("source", keys, values)
+
+    target = cache.alias_prefix("source", "target", tokens=3)
+    cache.append("target", torch.tensor([[[6.0, 7.0]]]), torch.tensor([[[106.0, 107.0]]]))
+    source_keys, _ = cache.materialize("source")
+    target_keys, _ = cache.materialize("target")
+
+    assert target.page_ids[0] == 0
+    assert target.page_ids[1] != 1
+    torch.testing.assert_close(source_keys, keys)
+    torch.testing.assert_close(target_keys, torch.arange(8, dtype=torch.float32).view(1, 4, 2))
+    cache.free("target")
+    torch.testing.assert_close(cache.materialize("source")[0], keys)
+    cache.free("source")
+    assert cache.free_pages == (0, 1, 2, 3)
+
+
 def test_prefix_router_uses_longest_registered_prefix() -> None:
     router = PrefixAwareRouter(default_route="cold")
     router.add_prefix((1, 2), "warm")
@@ -131,6 +159,7 @@ def test_research_harness_selects_best_metric() -> None:
 def test_cli_scaffold_smokes_run() -> None:
     env = {**os.environ, "PYTHONPATH": "src"}
     commands = [
+        [sys.executable, "-m", "torchinferno.cli", "audit"],
         [sys.executable, "-m", "torchinferno.cli", "trace-smoke", "--device", "cpu", "--tokens", "2"],
         [sys.executable, "-m", "torchinferno.cli", "sim-smoke"],
         [sys.executable, "-m", "torchinferno.cli", "research-smoke"],
@@ -141,6 +170,7 @@ def test_cli_scaffold_smokes_run() -> None:
         for command in commands
     ]
 
-    assert "TorchInferno trace smoke" in outputs[0]
-    assert "TorchInferno disaggregated simulation smoke" in outputs[1]
-    assert "TorchInferno research smoke" in outputs[2]
+    assert "TorchInferno audit" in outputs[0]
+    assert "TorchInferno trace smoke" in outputs[1]
+    assert "TorchInferno disaggregated simulation smoke" in outputs[2]
+    assert "TorchInferno research smoke" in outputs[3]

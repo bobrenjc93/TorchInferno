@@ -29,7 +29,8 @@ to grow toward production-grade SOTA inference.
 - Greedy and temperature sampling.
 - Ragged request API with dense continuous-batching execution buckets.
 - Token-step continuous serving harness with admission, paged-cache policy, and
-  prefix-hit accounting.
+  prefix-hit accounting, prefix KV copy reuse, and same-shape prefill/decode
+  microbatching.
 - Deterministic time-sliced virtual GPU simulation.
 - Disaggregated prefill/decode planner with network latency modeling.
 - Fake process groups and fake collectives for single-process distributed
@@ -61,6 +62,7 @@ From the repo root:
 ```bash
 python3 -m pip install -e ".[dev]"
 python3 -m pytest
+torchinferno audit
 torchinferno dsv4-smoke --device cpu --batch-size 1 --prompt-tokens 3 --new-tokens 2
 ```
 
@@ -68,6 +70,7 @@ Without installing the package:
 
 ```bash
 PYTHONPATH=src python3 -m torchinferno.cli dsv4-smoke --device cpu
+PYTHONPATH=src python3 -m torchinferno.cli audit
 PYTHONPATH=src python3 -m torchinferno.cli deepseek-smoke --device cpu
 PYTHONPATH=src python3 -m torchinferno.cli batch-smoke --device cpu
 PYTHONPATH=src python3 -m torchinferno.cli trace-smoke --device cpu
@@ -270,6 +273,9 @@ runtime, scheduler, and experiment changes. The repo is intentionally organized
 so an agent can add one focused harness or graph pass and verify it with CPU
 tests before touching CUDA-only code.
 
+`docs/ROADMAP.md` and `torchinferno audit` keep the implementation status
+explicit so scaffolds are not confused for finished production paths.
+
 ## Checkpoints
 
 TorchInferno can save and load DSv4-compatible checkpoints with a Hugging
@@ -316,6 +322,7 @@ represent exactly.
 
 ```text
 src/torchinferno/
+  audit.py                Environment and feature readiness audit.
   compiler.py             torch.compile policy helper.
   cli.py                  CLI smoke runners.
   tokenization.py         Tokenizer adapters for text IO.
@@ -361,6 +368,7 @@ tests/
                            Triton paged decode, NVFP4, and benchmark tests.
   test_serving_engine.py   Native paged-cache serving engine tests.
 AGENTS.md                 Short contribution map for coding agents.
+docs/ROADMAP.md           Feature readiness map and production milestones.
 ```
 
 ## Design Coverage
@@ -382,7 +390,8 @@ Implemented as working code and tests:
 - Pattern-match graph replacement entry point.
 - Native DeepSeek dense/paged cache backend selection.
 - Paged KV allocation and paged causal attention reference.
-- Token-step continuous serving engine with prefix-hit accounting.
+- Token-step continuous serving engine with prefix-hit accounting, prefix KV
+  copy reuse, and same-shape prefill/decode microbatching.
 - Radix/prefix-aware routing and prefix cache lookup.
 - Bursty traffic simulation.
 - Piecewise CUDA graph API scaffold.
@@ -401,8 +410,7 @@ Still intentionally future work:
   the current correct references and decode-focused Triton specialization.
 - Piecewise CUDA graph capture with static device buffers.
 - Monarch-backed distributed execution instead of the fake fallback.
-- Actual cross-request KV reuse from prefix-cache hits, beyond current hit
-  accounting.
+- Shared-page cross-request KV reuse instead of current prefix KV copy reuse.
 - Full production serving scheduler with cancellation and async transport.
 
 ## Development Principles
