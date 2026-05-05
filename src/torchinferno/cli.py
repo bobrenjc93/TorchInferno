@@ -7,6 +7,7 @@ import torch
 
 from torchinferno.compiler import CompileConfig, compile_forward
 from torchinferno.graph import trace_with_make_fx
+from torchinferno.models.auto import load_model_auto
 from torchinferno.models.conversion import (
     IncompatibleCheckpointError,
     audit_deepseek_checkpoint,
@@ -20,6 +21,14 @@ from torchinferno.models.dsv4 import DSv4ForCausalLM, tiny_dsv4_config
 from torchinferno.research import ExperimentResult, ResearchHarness
 from torchinferno.runtime.batching import InferenceRequest, run_continuous_batch
 from torchinferno.runtime.scheduler import DisaggregatedPrefillDecodeSimulator, InferenceJob
+from torchinferno.runtime.traffic import TrafficPattern, simulate_traffic
+from torchinferno.tokenization import load_text_tokenizer
+from torchinferno.validation import (
+    capture_logit_reference,
+    load_logit_reference,
+    save_logit_reference,
+    validate_logit_reference,
+)
 
 
 def _default_device() -> torch.device:
@@ -133,6 +142,33 @@ def run_deepseek_hf_smoke(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_text_generate(args: argparse.Namespace) -> int:
+    device = torch.device(args.device) if args.device else _default_device()
+    model = load_model_auto(
+        args.model,
+        revision=args.revision,
+        cache_dir=args.cache_dir,
+        map_location="cpu",
+        strict=not args.non_strict,
+    ).to(device)
+    model.eval()
+    tokenizer_path = args.tokenizer if args.tokenizer is not None else args.model
+    tokenizer = load_text_tokenizer(tokenizer_path, trust_remote_code=args.trust_remote_code)
+    input_ids = tokenizer.encode(args.prompt)
+    if not input_ids:
+        raise ValueError("tokenizer produced no input ids")
+    prompt = torch.tensor([input_ids], device=device, dtype=torch.long)
+    with torch.inference_mode():
+        output = model.generate(prompt, max_new_tokens=args.new_tokens, temperature=args.temperature)  # type: ignore[attr-defined]
+    generated = output[0].detach().cpu().tolist()
+    print("TorchInferno text generation")
+    print(f"model={args.model} tokenizer={tokenizer_path} device={device}")
+    print(f"input_ids={input_ids}")
+    print(f"output_ids={generated}")
+    print(tokenizer.decode(generated))
+    return 0
+
+
 def run_trace_smoke(args: argparse.Namespace) -> int:
     device = torch.device(args.device) if args.device else torch.device("cpu")
     torch.manual_seed(args.seed)
@@ -210,6 +246,76 @@ def run_research_smoke(args: argparse.Namespace) -> int:
         print(f"{result.name}: total_us={result.metrics['total_us']:.1f}")
     print(f"best={best.name}")
     return 0
+
+
+def run_traffic_smoke(args: argparse.Namespace) -> int:
+    scheduler = DisaggregatedPrefillDecodeSimulator(
+        prefill_ranks=tuple(range(args.prefill_ranks)),
+        decode_ranks=tuple(range(args.prefill_ranks, args.prefill_ranks + args.decode_ranks)),
+        prefill_us_per_token=args.prefill_us_per_token,
+        decode_us_per_token=args.decode_us_per_token,
+        network_latency_us=args.network_latency_us,
+    )
+    pattern = TrafficPattern(
+        requests=args.requests,
+        prompt_min=args.prompt_min,
+        prompt_max=args.prompt_max,
+        decode_min=args.decode_min,
+        decode_max=args.decode_max,
+        burst_size=args.burst_size,
+        burst_gap_us=args.burst_gap_us,
+        in_burst_gap_us=args.in_burst_gap_us,
+        seed=args.seed,
+    )
+    result = simulate_traffic(pattern, scheduler)
+    print("TorchInferno traffic simulation")
+    print(
+        f"requests={len(result.jobs)} stages={len(result.stages)} "
+        f"makespan_us={result.makespan_us:.1f} rps={result.requests_per_second:.2f}"
+    )
+    for stage in result.stages[: args.print_stages]:
+        print(f"{stage.request_id} {stage.stage} rank={stage.rank} start={stage.start_us:.1f} end={stage.end_us:.1f}")
+    return 0
+
+
+def run_capture_logits(args: argparse.Namespace) -> int:
+    device = torch.device(args.device) if args.device else _default_device()
+    model = load_model_auto(
+        args.model,
+        revision=args.revision,
+        cache_dir=args.cache_dir,
+        map_location="cpu",
+        strict=not args.non_strict,
+    ).to(device)
+    model.eval()
+    reference = capture_logit_reference(
+        model,
+        args.input_ids,
+        atol=args.atol,
+        rtol=args.rtol,
+        description=args.description,
+    )
+    save_logit_reference(reference, args.output)
+    print("TorchInferno logit reference captured")
+    print(f"model={args.model} output={args.output} vocab={len(reference.logits)}")
+    return 0
+
+
+def run_validate_logits(args: argparse.Namespace) -> int:
+    device = torch.device(args.device) if args.device else _default_device()
+    model = load_model_auto(
+        args.model,
+        revision=args.revision,
+        cache_dir=args.cache_dir,
+        map_location="cpu",
+        strict=not args.non_strict,
+    ).to(device)
+    model.eval()
+    reference = load_logit_reference(args.reference)
+    result = validate_logit_reference(model, reference)
+    print("TorchInferno logit validation")
+    print(f"passed={result.passed} max_abs_error={result.max_abs_error:.6g} max_rel_error={result.max_rel_error:.6g}")
+    return 0 if result.passed else 2
 
 
 def run_dsv4_audit(args: argparse.Namespace) -> int:
@@ -333,6 +439,19 @@ def build_parser() -> argparse.ArgumentParser:
     native_hf.add_argument("--non-strict", action="store_true", help="Allow missing or unexpected weight keys.")
     native_hf.set_defaults(func=run_deepseek_hf_smoke)
 
+    text = subparsers.add_parser("text-generate", help="Load a TorchInferno checkpoint, tokenize text, and generate.")
+    text.add_argument("model", help="Local checkpoint directory or Hugging Face repo ID.")
+    text.add_argument("prompt")
+    text.add_argument("--tokenizer", default=None, help="Tokenizer path or repo ID, defaults to model.")
+    text.add_argument("--revision", default=None)
+    text.add_argument("--cache-dir", default=None)
+    text.add_argument("--device", default=None, help="Torch device, defaults to cuda when available.")
+    text.add_argument("--new-tokens", type=int, default=16)
+    text.add_argument("--temperature", type=float, default=0.0)
+    text.add_argument("--trust-remote-code", action="store_true")
+    text.add_argument("--non-strict", action="store_true", help="Allow missing or unexpected weight keys.")
+    text.set_defaults(func=run_text_generate)
+
     trace = subparsers.add_parser("trace-smoke", help="Trace a DSv4 attention slice with make_fx.")
     trace.add_argument("--device", default="cpu")
     trace.add_argument("--seed", type=int, default=0)
@@ -350,6 +469,46 @@ def build_parser() -> argparse.ArgumentParser:
 
     research = subparsers.add_parser("research-smoke", help="Run a tiny auto research harness.")
     research.set_defaults(func=run_research_smoke)
+
+    traffic = subparsers.add_parser("traffic-smoke", help="Simulate bursty request traffic through prefill/decode ranks.")
+    traffic.add_argument("--requests", type=int, default=8)
+    traffic.add_argument("--prompt-min", type=int, default=2)
+    traffic.add_argument("--prompt-max", type=int, default=32)
+    traffic.add_argument("--decode-min", type=int, default=1)
+    traffic.add_argument("--decode-max", type=int, default=8)
+    traffic.add_argument("--burst-size", type=int, default=4)
+    traffic.add_argument("--burst-gap-us", type=float, default=1000.0)
+    traffic.add_argument("--in-burst-gap-us", type=float, default=10.0)
+    traffic.add_argument("--prefill-ranks", type=int, default=1)
+    traffic.add_argument("--decode-ranks", type=int, default=1)
+    traffic.add_argument("--prefill-us-per-token", type=float, default=2.0)
+    traffic.add_argument("--decode-us-per-token", type=float, default=4.0)
+    traffic.add_argument("--network-latency-us", type=float, default=10.0)
+    traffic.add_argument("--print-stages", type=int, default=8)
+    traffic.add_argument("--seed", type=int, default=0)
+    traffic.set_defaults(func=run_traffic_smoke)
+
+    capture = subparsers.add_parser("capture-logits", help="Capture a known-logit reference for a checkpoint.")
+    capture.add_argument("model", help="Local checkpoint directory or Hugging Face repo ID.")
+    capture.add_argument("output")
+    capture.add_argument("--input-ids", type=int, nargs="+", required=True)
+    capture.add_argument("--revision", default=None)
+    capture.add_argument("--cache-dir", default=None)
+    capture.add_argument("--device", default=None, help="Torch device, defaults to cuda when available.")
+    capture.add_argument("--atol", type=float, default=1e-4)
+    capture.add_argument("--rtol", type=float, default=1e-4)
+    capture.add_argument("--description", default="")
+    capture.add_argument("--non-strict", action="store_true", help="Allow missing or unexpected weight keys.")
+    capture.set_defaults(func=run_capture_logits)
+
+    validate = subparsers.add_parser("validate-logits", help="Validate a checkpoint against a known-logit reference.")
+    validate.add_argument("model", help="Local checkpoint directory or Hugging Face repo ID.")
+    validate.add_argument("reference")
+    validate.add_argument("--revision", default=None)
+    validate.add_argument("--cache-dir", default=None)
+    validate.add_argument("--device", default=None, help="Torch device, defaults to cuda when available.")
+    validate.add_argument("--non-strict", action="store_true", help="Allow missing or unexpected weight keys.")
+    validate.set_defaults(func=run_validate_logits)
 
     audit = subparsers.add_parser("dsv4-audit", help="Audit a DeepSeek-style checkpoint for DSv4 conversion.")
     audit.add_argument("model", help="Local checkpoint directory or Hugging Face repo ID.")

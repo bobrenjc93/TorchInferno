@@ -1,3 +1,4 @@
+from torchinferno.models.auto import load_model_auto
 from torchinferno.models.dsv4 import DSv4Config, DSv4ForCausalLM, tiny_dsv4_config
 from torchinferno.models.deepseek import DeepSeekV32Config, DeepSeekV32ForCausalLM, tiny_deepseek_v32_config
 from torchinferno.models.conversion import (
@@ -20,6 +21,7 @@ __all__ = [
     "audit_native_deepseek_checkpoint",
     "convert_deepseek_checkpoint",
     "convert_native_deepseek_checkpoint",
+    "load_model_auto",
     "tiny_deepseek_v32_config",
     "tiny_dsv4_config",
 ]

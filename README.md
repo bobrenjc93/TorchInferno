@@ -23,6 +23,8 @@ to grow toward production-grade SOTA inference.
   key names and tensor shapes.
 - DeepSeek-style checkpoint audit and exact conversion for checkpoints whose
   tensor contracts match TorchInferno DSv4.
+- Auto model loading, tokenizer-backed text generation, and known-logit
+  validation for checkpoint bringup.
 - Greedy and temperature sampling.
 - Ragged request API with dense continuous-batching execution buckets.
 - Deterministic time-sliced virtual GPU simulation.
@@ -30,13 +32,15 @@ to grow toward production-grade SOTA inference.
 - Fake process groups and fake collectives for single-process distributed
   policy tests.
 - Paged KV cache allocator scaffold for paged attention kernel work.
-- Radix/prefix tree and prefix-aware router scaffold.
+- Functional paged causal attention reference for kernel replacement work.
+- Radix/prefix tree, prefix-aware router, and prefix cache lookup.
 - `torch.compile` helper and CLI smoke path.
 - `make_fx` tracing helper with FakeTensorMode support.
 - Pattern-based FX graph pass registry with call-target replacement helpers.
 - Flex-attention-shaped q/k/v API with eager fallback.
 - Piecewise CUDA graph runner API with CPU/eager fallback.
 - Optional Monarch adapter point with fake-world fallback.
+- Bursty traffic simulation for request diversity and latency modeling.
 - Triton CUDA kernels for RMSNorm and SwiGLU activation, with eager torch
   fallbacks on CPU or unsupported devices.
 - Minimal auto research harness for comparing scheduler/cache/routing policies.
@@ -59,6 +63,7 @@ PYTHONPATH=src python3 -m torchinferno.cli deepseek-smoke --device cpu
 PYTHONPATH=src python3 -m torchinferno.cli batch-smoke --device cpu
 PYTHONPATH=src python3 -m torchinferno.cli trace-smoke --device cpu
 PYTHONPATH=src python3 -m torchinferno.cli sim-smoke
+PYTHONPATH=src python3 -m torchinferno.cli traffic-smoke
 PYTHONPATH=src python3 -m torchinferno.cli research-smoke
 ```
 
@@ -163,7 +168,10 @@ The runtime package is where simulation-first serving work belongs:
 - `runtime.scheduler`: disaggregated prefill/decode planning.
 - `runtime.fake_dist`: fake process groups and collectives.
 - `runtime.paged`: page-table-shaped KV cache allocation and materialization.
+- `runtime.paged_attention`: correct torch paged causal attention reference.
 - `runtime.prefix`: radix prefix tree and prefix-aware routing.
+- `runtime.prefix_cache`: prefix cache lookup for reusable KV entries.
+- `runtime.traffic`: deterministic request burst/diversity simulation.
 - `runtime.flex`: flex-attention-shaped API with an eager fallback.
 - `runtime.cudagraphs`: named piecewise CUDA graph execution API.
 - `runtime.monarch`: optional Monarch adapter with fake process world fallback.
@@ -175,6 +183,30 @@ PYTHONPATH=src python3 -m torchinferno.cli sim-smoke \
   --prefill-us-per-token 2 \
   --decode-us-per-token 4 \
   --network-latency-us 10
+PYTHONPATH=src python3 -m torchinferno.cli traffic-smoke --requests 32 --burst-size 8
+```
+
+## Text And Validation
+
+`load_model_auto` chooses the compact DSv4 or native DeepSeek model from the
+checkpoint config. `load_text_tokenizer` loads a local `tokenizer.json` or a
+Hugging Face tokenizer behind a minimal encode/decode interface.
+
+```bash
+PYTHONPATH=src python3 -m torchinferno.cli text-generate /path/to/checkpoint "hello world" \
+  --tokenizer /path/to/tokenizer \
+  --device cuda
+```
+
+Known-logit references make checkpoint bringup reproducible without a serving
+stack:
+
+```bash
+PYTHONPATH=src python3 -m torchinferno.cli capture-logits /path/to/checkpoint reference.json \
+  --input-ids 1 2 3 \
+  --device cuda
+PYTHONPATH=src python3 -m torchinferno.cli validate-logits /path/to/checkpoint reference.json \
+  --device cuda
 ```
 
 ## Research Harnesses
@@ -257,10 +289,13 @@ represent exactly.
 src/torchinferno/
   compiler.py             torch.compile policy helper.
   cli.py                  CLI smoke runners.
+  tokenization.py         Tokenizer adapters for text IO.
+  validation.py           Known-logit capture and validation.
   kernels/ops.py          Kernel APIs with torch fallbacks.
   kernels/triton_ops.py   Triton CUDA RMSNorm and SwiGLU kernels.
   kernels/passes.py       Graph-pass registration for kernel replacements.
   models/dsv4.py          DSv4-style causal LM, MoE, attention, and KV cache.
+  models/auto.py          Config-driven model loader.
   models/deepseek.py      Native DeepSeek-V3.2-style architecture.
   models/conversion.py    DeepSeek-style checkpoint audit and conversion.
   models/hf.py            Hugging Face-style config and weights IO.
@@ -272,9 +307,13 @@ src/torchinferno/
   runtime/flex.py         Flex-attention-shaped fallback.
   runtime/monarch.py      Monarch adapter point.
   runtime/paged.py        Paged KV cache scaffold.
+  runtime/paged_attention.py
+                           Paged causal attention reference.
   runtime/prefix.py       Radix prefix and prefix-aware routing.
+  runtime/prefix_cache.py Prefix cache lookup.
   runtime/scheduler.py    Disaggregated prefill/decode planner.
   runtime/simulation.py   Time-sliced virtual GPU simulator.
+  runtime/traffic.py      Bursty traffic simulation.
   research/harness.py     Auto research experiment harness.
 tests/
   test_dsv4_e2e.py        DSv4 e2e and original runtime tests.
@@ -282,6 +321,8 @@ tests/
   test_conversion_and_kernels.py
                            Checkpoint conversion and custom kernel tests.
   test_scaffolding.py     Compiler/runtime/research scaffold tests.
+  test_production_workflows.py
+                           Text, validation, paged attention, prefix, traffic tests.
 AGENTS.md                 Short contribution map for coding agents.
 ```
 
@@ -292,6 +333,9 @@ Implemented as working code and tests:
 - DSv4 local inference path.
 - Native DeepSeek-V3.2-style inference path.
 - DeepSeek-style checkpoint audit and exact compatible conversion.
+- Auto model loading.
+- Tokenizer-backed text generation.
+- Known-logit capture and validation.
 - `torch.compile` smoke path.
 - `make_fx` and fake tensor trace helper.
 - Fake process groups.
@@ -299,8 +343,9 @@ Implemented as working code and tests:
 - Disaggregated prefill/decode planning.
 - Ragged and continuous batching.
 - Pattern-match graph replacement entry point.
-- Paged KV allocation scaffold.
-- Radix/prefix-aware routing scaffold.
+- Paged KV allocation and paged causal attention reference.
+- Radix/prefix-aware routing and prefix cache lookup.
+- Bursty traffic simulation.
 - Piecewise CUDA graph API scaffold.
 - Flex-attention-shaped fallback.
 - Auto research harness.
@@ -309,9 +354,9 @@ Implemented as working code and tests:
 
 Still intentionally future work:
 
-- Tokenizer integration and known-logit validation for downloaded production
-  weights.
-- Real paged/radix/flex attention kernels and fused MoE kernels.
+- Validated reference files for downloaded production weights.
+- Real paged/radix/flex attention kernels and fused MoE kernels beyond the
+  current correct torch references and Triton RMSNorm/SwiGLU kernels.
 - Piecewise CUDA graph capture with static device buffers.
 - Monarch-backed distributed execution instead of the fake fallback.
 - Prefix cache reuse integrated into model execution.

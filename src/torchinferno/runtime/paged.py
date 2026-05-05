@@ -29,6 +29,7 @@ class PagedKVCache:
         page_size: int,
         num_key_value_heads: int,
         head_dim: int,
+        value_head_dim: int | None = None,
         device: torch.device,
         dtype: torch.dtype,
     ) -> None:
@@ -37,8 +38,13 @@ class PagedKVCache:
         self.page_size = page_size
         self.num_key_value_heads = num_key_value_heads
         self.head_dim = head_dim
+        self.value_head_dim = head_dim if value_head_dim is None else value_head_dim
         self.keys = torch.empty((num_pages, num_key_value_heads, page_size, head_dim), device=device, dtype=dtype)
-        self.values = torch.empty_like(self.keys)
+        self.values = torch.empty(
+            (num_pages, num_key_value_heads, page_size, self.value_head_dim),
+            device=device,
+            dtype=dtype,
+        )
         self._free_pages = list(range(num_pages))
         self._sequences: dict[str, PagedSequence] = {}
 
@@ -50,11 +56,14 @@ class PagedKVCache:
         return self._sequences.setdefault(request_id, PagedSequence(request_id))
 
     def append(self, request_id: str, keys: Tensor, values: Tensor) -> PagedSequence:
-        if keys.shape != values.shape:
-            raise ValueError("keys and values must have the same shape")
-        expected_prefix = (self.num_key_value_heads,)
-        if keys.ndim != 3 or keys.shape[:1] != expected_prefix or keys.shape[-1] != self.head_dim:
+        if keys.ndim != 3 or values.ndim != 3:
+            raise ValueError("keys and values must have shape [kv_heads, tokens, head_dim]")
+        if keys.shape[:2] != values.shape[:2]:
+            raise ValueError("keys and values must have the same head and token dimensions")
+        if keys.shape[0] != self.num_key_value_heads or keys.shape[-1] != self.head_dim:
             raise ValueError("keys must have shape [kv_heads, tokens, head_dim]")
+        if values.shape[-1] != self.value_head_dim:
+            raise ValueError("values must have shape [kv_heads, tokens, value_head_dim]")
 
         seq = self.sequence(request_id)
         tokens = keys.size(1)

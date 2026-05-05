@@ -13,6 +13,7 @@ PYTHONPATH=src python3 -m torchinferno.cli dsv4-smoke --device cpu --batch-size 
 PYTHONPATH=src python3 -m torchinferno.cli deepseek-smoke --device cpu --batch-size 1 --prompt-tokens 3 --new-tokens 2
 PYTHONPATH=src python3 -m torchinferno.cli trace-smoke --device cpu --tokens 2
 PYTHONPATH=src python3 -m torchinferno.cli sim-smoke
+PYTHONPATH=src python3 -m torchinferno.cli traffic-smoke
 ```
 
 For conversion or kernel changes, also run:
@@ -20,6 +21,7 @@ For conversion or kernel changes, also run:
 ```bash
 python3 -m pytest tests/test_conversion_and_kernels.py
 python3 -m pytest tests/test_deepseek_native.py
+python3 -m pytest tests/test_production_workflows.py
 ```
 
 ## Where To Put Work
@@ -31,6 +33,8 @@ python3 -m pytest tests/test_deepseek_native.py
   `src/torchinferno/graph/`.
 - Scheduling, batching, cache, routing, and simulation policies:
   `src/torchinferno/runtime/`.
+- Text IO and validation workflows: `src/torchinferno/tokenization.py` and
+  `src/torchinferno/validation.py`.
 - Repeatable experiments and comparisons: `src/torchinferno/research/`.
 - End-to-end behavioral tests: `tests/`.
 
