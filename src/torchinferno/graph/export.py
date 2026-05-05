@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Callable
 
 import torch
 
 
-def trace_with_make_fx(module: torch.nn.Module, *args: Any, fake: bool = False, **kwargs: Any) -> torch.fx.GraphModule:
+def trace_with_make_fx(module: Callable[..., Any], *args: Any, fake: bool = False, **kwargs: Any) -> torch.fx.GraphModule:
     """Trace a module with make_fx, optionally under FakeTensorMode."""
 
     try:

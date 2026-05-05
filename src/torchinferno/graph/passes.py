@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable
+from typing import Callable, Mapping
 
 import torch
 
@@ -40,3 +40,42 @@ class PassRegistry:
 
     def names(self) -> list[str]:
         return [registered.name for registered in self._passes]
+
+    def describe(self) -> list[RegisteredPass]:
+        return list(self._passes)
+
+
+def replace_call_function_targets(
+    replacements: Mapping[Callable[..., object], Callable[..., object]],
+) -> GraphPass:
+    """Build a graph pass that swaps call_function targets.
+
+    This is intentionally small but important scaffolding: custom kernels such
+    as NVFP4 MoE or specialized attention can start as target replacements
+    before graduating to richer pattern matching.
+    """
+
+    def pass_fn(graph_module: torch.fx.GraphModule) -> torch.fx.GraphModule:
+        for node in graph_module.graph.nodes:
+            if node.op == "call_function" and node.target in replacements:
+                node.target = replacements[node.target]
+        graph_module.graph.lint()
+        graph_module.recompile()
+        return graph_module
+
+    return pass_fn
+
+
+def annotate_matching_nodes(
+    predicate: Callable[[torch.fx.Node], bool],
+    *,
+    key: str,
+    value: object = True,
+) -> GraphPass:
+    def pass_fn(graph_module: torch.fx.GraphModule) -> torch.fx.GraphModule:
+        for node in graph_module.graph.nodes:
+            if predicate(node):
+                node.meta[key] = value
+        return graph_module
+
+    return pass_fn

@@ -1,27 +1,37 @@
 # TorchInferno
 
-TorchInferno is a torch-native inference playground in the spirit of TorchTitan:
-small enough to hack on locally, but structured around the same surfaces needed
-for serious model-serving work.
+TorchInferno is a torch-native inference workbench in the spirit of
+TorchTitan. The goal is to make inference systems easy to trace, optimize,
+simulate, and extend without booting a heavyweight serving stack for every
+experiment.
 
-This repository currently ships an end-to-end DSv4-style inference path with:
+The current repo has a working DSv4-style end-to-end path plus scaffolding for
+the compiler, runtime, scheduling, cache, routing, and research surfaces needed
+to grow toward production-grade SOTA inference.
 
-- A decoder-only causal LM in pure PyTorch.
-- MLA-like latent KV projection.
-- Rotary causal attention with grouped KV heads.
-- Routed top-k MoE feed-forward blocks.
-- Explicit append-only KV cache for prefill and decode.
-- Hugging Face-compatible config and safetensors checkpoint save/load.
+## What Works Today
+
+- DSv4-style decoder-only causal LM in pure PyTorch.
+- MLA-like latent KV projection, grouped KV heads, rotary causal attention, and
+  routed top-k MoE feed-forward blocks.
+- Explicit append-only KV cache for prefill and decode correctness tests.
+- Hugging Face-style local and Hub checkpoint save/load for TorchInferno DSv4
+  key names and tensor shapes.
 - Greedy and temperature sampling.
-- A ragged request batching harness.
-- A deterministic time-sliced multi-GPU simulator.
-- `make_fx`/FakeTensor tracing utilities and a graph pass registry.
-- CLI smoke tests for local CPU or CUDA execution.
-
-The DSv4 model here is an inference harness with random local weights by
-default. It is meant to make architecture, cache, batching, tracing, compiler,
-and kernel-replacement work easy to develop and test before wiring in production
-weights or custom kernels.
+- Ragged request API with dense continuous-batching execution buckets.
+- Deterministic time-sliced virtual GPU simulation.
+- Disaggregated prefill/decode planner with network latency modeling.
+- Fake process groups and fake collectives for single-process distributed
+  policy tests.
+- Paged KV cache allocator scaffold for paged attention kernel work.
+- Radix/prefix tree and prefix-aware router scaffold.
+- `torch.compile` helper and CLI smoke path.
+- `make_fx` tracing helper with FakeTensorMode support.
+- Pattern-based FX graph pass registry with call-target replacement helpers.
+- Flex-attention-shaped q/k/v API with eager fallback.
+- Piecewise CUDA graph runner API with CPU/eager fallback.
+- Optional Monarch adapter point with fake-world fallback.
+- Minimal auto research harness for comparing scheduler/cache/routing policies.
 
 ## Quickstart
 
@@ -33,16 +43,25 @@ python3 -m pytest
 torchinferno dsv4-smoke --device cpu --batch-size 1 --prompt-tokens 3 --new-tokens 2
 ```
 
-Without installing the package, use `PYTHONPATH=src`:
+Without installing the package:
+
+```bash
+PYTHONPATH=src python3 -m torchinferno.cli dsv4-smoke --device cpu
+PYTHONPATH=src python3 -m torchinferno.cli batch-smoke --device cpu
+PYTHONPATH=src python3 -m torchinferno.cli trace-smoke --device cpu
+PYTHONPATH=src python3 -m torchinferno.cli sim-smoke
+PYTHONPATH=src python3 -m torchinferno.cli research-smoke
+```
+
+CUDA is optional for the tests, but the DSv4 smoke can run on GPU:
 
 ```bash
 PYTHONPATH=src python3 -m torchinferno.cli dsv4-smoke --device cuda
-PYTHONPATH=src python3 -m torchinferno.cli batch-smoke --device cpu
 ```
 
 ## DSv4 End-To-End Path
 
-The main model lives in `src/torchinferno/models/dsv4.py`.
+The model lives in `src/torchinferno/models/dsv4.py`.
 
 ```python
 import torch
@@ -59,20 +78,92 @@ with torch.inference_mode():
 print(output)
 ```
 
-The cache path is covered by tests that compare incremental decode logits
-against a full causal forward pass.
+The tests compare incremental cached decode logits against a full causal
+forward pass, then exercise generation, local checkpoint save/load, CLI
+execution, batching, tracing, and runtime scaffolds.
+
+## Compiler And Graph Work
+
+TorchInferno keeps compiler hooks explicit:
+
+- `torchinferno.compiler.compile_forward` wraps `torch.compile` policy.
+- `torchinferno.graph.trace_with_make_fx` wraps `make_fx` and optional fake
+  tensor tracing.
+- `torchinferno.graph.PassRegistry` registers ordered FX graph passes.
+- `replace_call_function_targets` is the first small pattern replacement helper
+  for custom-kernel experiments such as NVFP4 MoE or specialized attention.
+
+Trace a DSv4 attention slice:
+
+```bash
+PYTHONPATH=src python3 -m torchinferno.cli trace-smoke --device cpu --tokens 2
+PYTHONPATH=src python3 -m torchinferno.cli trace-smoke --device cpu --tokens 2 --fake --print-graph
+```
+
+Compile the DSv4 forward path:
+
+```bash
+PYTHONPATH=src python3 -m torchinferno.cli dsv4-smoke \
+  --device cpu \
+  --batch-size 1 \
+  --prompt-tokens 2 \
+  --new-tokens 1 \
+  --compile
+```
+
+First compile is expected to be much slower than eager execution.
+
+## Runtime Scaffolds
+
+The runtime package is where simulation-first serving work belongs:
+
+- `runtime.batching`: ragged request boundary and continuous batching buckets.
+- `runtime.simulation`: simple virtual GPU time slicing.
+- `runtime.scheduler`: disaggregated prefill/decode planning.
+- `runtime.fake_dist`: fake process groups and collectives.
+- `runtime.paged`: page-table-shaped KV cache allocation and materialization.
+- `runtime.prefix`: radix prefix tree and prefix-aware routing.
+- `runtime.flex`: flex-attention-shaped API with an eager fallback.
+- `runtime.cudagraphs`: named piecewise CUDA graph execution API.
+- `runtime.monarch`: optional Monarch adapter with fake process world fallback.
+
+Example disaggregated simulation:
+
+```bash
+PYTHONPATH=src python3 -m torchinferno.cli sim-smoke \
+  --prefill-us-per-token 2 \
+  --decode-us-per-token 4 \
+  --network-latency-us 10
+```
+
+## Research Harnesses
+
+`torchinferno.research.ResearchHarness` is intentionally small: register named
+experiments, run them, and compare metrics. It is enough for agents and humans
+to add repeatable policy experiments without inventing a new harness each time.
+
+```bash
+PYTHONPATH=src python3 -m torchinferno.cli research-smoke
+```
+
+## Agent Workflow
+
+`AGENTS.md` gives coding agents a short map of where to put model, compiler,
+runtime, scheduler, and experiment changes. The repo is intentionally organized
+so an agent can add one focused harness or graph pass and verify it with CPU
+tests before touching CUDA-only code.
 
 ## Checkpoints
 
-TorchInferno can save and load DSv4-compatible checkpoints with a
-Hugging Face-style layout:
+TorchInferno can save and load DSv4-compatible checkpoints with a Hugging
+Face-style layout:
 
 ```python
 model.save_pretrained("/tmp/tiny-dsv4")
 loaded = DSv4ForCausalLM.from_pretrained("/tmp/tiny-dsv4")
 ```
 
-The CLI can load either a local checkpoint directory or a Hub repo ID:
+The CLI can load a local checkpoint directory or a Hub repo ID:
 
 ```bash
 torchinferno dsv4-hf-smoke /tmp/tiny-dsv4 --device cpu
@@ -86,104 +177,72 @@ export HF_TOKEN=...
 torchinferno dsv4-hf-smoke org-or-user/repo-name --device cuda
 ```
 
-The current loader expects TorchInferno DSv4-compatible key names and tensor
-shapes. Loading production DeepSeek checkpoints with their native naming still
-needs a conversion layer, tokenizer wiring, and validation against known logits.
-
-## Torch Compile
-
-The CLI exposes a small compile smoke:
-
-```bash
-PYTHONPATH=src python3 -m torchinferno.cli dsv4-smoke \
-  --device cpu \
-  --batch-size 1 \
-  --prompt-tokens 2 \
-  --new-tokens 1 \
-  --compile
-```
-
-First compile is expected to be much slower than eager execution. The current
-goal is to keep the forward path traceable enough for compiler experiments, not
-to claim a tuned compiled serving path yet.
-
-## Runtime Harnesses
-
-`torchinferno.runtime.batching.run_continuous_batch` accepts ragged requests at
-the API boundary, buckets compatible prompts, runs dense model calls, and returns
-results in request order.
-
-`torchinferno.runtime.simulation.TimeSlicedSimulator` provides a deterministic
-single-process harness for virtual GPU ranks. It is intentionally simple so
-network latency, request bursts, and disaggregated prefill/decode policies can
-be modeled without booting a full distributed stack.
-
-## Graph Work
-
-`torchinferno.graph.trace_with_make_fx` wraps `make_fx` and optional
-`FakeTensorMode`.
-
-`torchinferno.graph.PassRegistry` is the landing point for pattern-match graph
-passes. This is where replacements for specialized kernels, NVFP4 MoE paths,
-radix attention, paged attention, or flex-attention experiments should be
-registered without complicating model code.
-
-## Test Matrix
-
-Current local checks:
-
-```bash
-python3 -m pytest
-PYTHONPATH=src python3 -m torchinferno.cli dsv4-smoke --device cpu
-PYTHONPATH=src python3 -m torchinferno.cli dsv4-smoke --device cuda
-PYTHONPATH=src python3 -m torchinferno.cli dsv4-hf-smoke /path/to/dsv4-checkpoint
-```
-
-The test suite covers:
-
-- Cached decode matching full forward logits.
-- End-to-end token generation.
-- Local safetensors checkpoint save/load round-trip.
-- Ragged request batching.
-- Time-sliced virtual GPU simulation.
-- CLI execution.
-
-## Roadmap
-
-Near-term work that fits the design direction:
-
-- Native DeepSeek checkpoint conversion and tokenizer integration.
-- Paged KV allocation instead of contiguous append-only cache.
-- Prefix-aware routing and prefix cache reuse.
-- Piecewise CUDA graph capture for prefill and decode.
-- Flex attention and custom attention kernel swaps.
-- Monarch and fake process group simulation for distributed policies.
-- Multi-GPU single-GPU time slicing with richer latency and bandwidth models.
-- Disaggregated prefill/decode scheduling experiments.
-- Pattern-matched graph replacements for NVFP4 and other model-specific kernels.
-- Auto research harnesses for comparing cache, batching, and routing policies.
+Important: the current loader expects TorchInferno DSv4-compatible key names
+and tensor shapes. Native production DeepSeek checkpoints still need a
+conversion layer, tokenizer wiring, and validation against known logits.
 
 ## Repository Layout
 
 ```text
 src/torchinferno/
-  cli.py                 CLI smoke runners.
-  models/dsv4.py         DSv4-style causal LM, MoE, attention, and KV cache.
-  runtime/batching.py    Ragged request batching harness.
-  runtime/simulation.py  Time-sliced virtual GPU simulator.
-  graph/export.py        make_fx and FakeTensor tracing helper.
-  graph/passes.py        Graph pass registry.
+  compiler.py             torch.compile policy helper.
+  cli.py                  CLI smoke runners.
+  models/dsv4.py          DSv4-style causal LM, MoE, attention, and KV cache.
+  models/hf.py            Hugging Face-style config and weights IO.
+  graph/export.py         make_fx and FakeTensor tracing helper.
+  graph/passes.py         FX graph pass registry and replacement helpers.
+  runtime/batching.py     Ragged request batching harness.
+  runtime/cudagraphs.py   Piecewise CUDA graph runner API.
+  runtime/fake_dist.py    Fake process groups and collectives.
+  runtime/flex.py         Flex-attention-shaped fallback.
+  runtime/monarch.py      Monarch adapter point.
+  runtime/paged.py        Paged KV cache scaffold.
+  runtime/prefix.py       Radix prefix and prefix-aware routing.
+  runtime/scheduler.py    Disaggregated prefill/decode planner.
+  runtime/simulation.py   Time-sliced virtual GPU simulator.
+  research/harness.py     Auto research experiment harness.
 tests/
-  test_dsv4_e2e.py       End-to-end DSv4 and runtime tests.
+  test_dsv4_e2e.py        DSv4 e2e and original runtime tests.
+  test_scaffolding.py     Compiler/runtime/research scaffold tests.
+AGENTS.md                 Short contribution map for coding agents.
 ```
+
+## Design Coverage
+
+Implemented as working code and tests:
+
+- DSv4 local inference path.
+- `torch.compile` smoke path.
+- `make_fx` and fake tensor trace helper.
+- Fake process groups.
+- Time-sliced multi-rank simulation.
+- Disaggregated prefill/decode planning.
+- Ragged and continuous batching.
+- Pattern-match graph replacement entry point.
+- Paged KV allocation scaffold.
+- Radix/prefix-aware routing scaffold.
+- Piecewise CUDA graph API scaffold.
+- Flex-attention-shaped fallback.
+- Auto research harness.
+- Optional Monarch integration point.
+
+Still intentionally future work:
+
+- Native DeepSeek production checkpoint conversion.
+- Tokenizer integration and known-logit validation for production DSv4 weights.
+- Real paged/radix/flex/custom CUDA kernels.
+- Piecewise CUDA graph capture with static device buffers.
+- Monarch-backed distributed execution instead of the fake fallback.
+- Prefix cache reuse integrated into model execution.
+- Full serving scheduler with admission control and cancellation.
 
 ## Development Principles
 
 - Keep model code torch-native and easy to trace.
+- Put experimental runtime policy in explicit harnesses, not hidden globals.
 - Prefer simulation-first workflows over heavyweight serving bootstraps.
-- Make small, focused harnesses that let optimization work zoom into one system
-  boundary at a time.
-- Keep graph and kernel replacement hooks explicit so experimental SOTA paths do
-  not make baseline code hard to read.
+- Make it easy to zoom into a layer, graph region, cache policy, or scheduler.
+- Keep graph and kernel replacement hooks explicit so SOTA paths do not make
+  baseline code hard to read.
 - Upstream generic PyTorch improvements where possible, and keep TorchInferno
   thin when the platform can carry the abstraction cleanly.

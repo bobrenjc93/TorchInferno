@@ -5,8 +5,12 @@ import time
 
 import torch
 
+from torchinferno.compiler import CompileConfig, compile_forward
+from torchinferno.graph import trace_with_make_fx
 from torchinferno.models.dsv4 import DSv4ForCausalLM, tiny_dsv4_config
+from torchinferno.research import ExperimentResult, ResearchHarness
 from torchinferno.runtime.batching import InferenceRequest, run_continuous_batch
+from torchinferno.runtime.scheduler import DisaggregatedPrefillDecodeSimulator, InferenceJob
 
 
 def _default_device() -> torch.device:
@@ -22,7 +26,7 @@ def run_dsv4_smoke(args: argparse.Namespace) -> int:
     )
     model = DSv4ForCausalLM(config).to(device).eval()
     if args.compile:
-        model.forward = torch.compile(model.forward, mode="reduce-overhead")  # type: ignore[method-assign]
+        compile_forward(model, CompileConfig(mode="reduce-overhead"))
 
     prompt = torch.randint(0, config.vocab_size, (args.batch_size, args.prompt_tokens), device=device)
     start = time.perf_counter()
@@ -74,6 +78,85 @@ def run_hf_smoke(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_trace_smoke(args: argparse.Namespace) -> int:
+    device = torch.device(args.device) if args.device else torch.device("cpu")
+    torch.manual_seed(args.seed)
+    config = tiny_dsv4_config(max_seq_len=args.tokens + 4)
+    model = DSv4ForCausalLM(config).to(device).eval()
+    attention = model.layers[0].attn
+    x = torch.randn(1, args.tokens, config.hidden_size, device=device)
+    positions = torch.arange(args.tokens, device=device)
+
+    def forward_attention(hidden: torch.Tensor, pos: torch.Tensor) -> torch.Tensor:
+        return attention(hidden, pos, None)
+
+    graph_module = trace_with_make_fx(forward_attention, x, positions, fake=args.fake)
+    node_count = sum(1 for _ in graph_module.graph.nodes)
+    print("TorchInferno trace smoke")
+    print(f"device={device} fake={args.fake} nodes={node_count}")
+    if args.print_graph:
+        print(graph_module.graph)
+    return 0
+
+
+def run_sim_smoke(args: argparse.Namespace) -> int:
+    simulator = DisaggregatedPrefillDecodeSimulator(
+        prefill_ranks=(0,),
+        decode_ranks=(1,),
+        prefill_us_per_token=args.prefill_us_per_token,
+        decode_us_per_token=args.decode_us_per_token,
+        network_latency_us=args.network_latency_us,
+    )
+    jobs = [
+        InferenceJob("req-a", prompt_tokens=8, decode_tokens=2, arrival_us=0),
+        InferenceJob("req-b", prompt_tokens=3, decode_tokens=4, arrival_us=args.arrival_gap_us),
+    ]
+    stages = simulator.plan(jobs)
+    print("TorchInferno disaggregated simulation smoke")
+    for stage in stages:
+        print(
+            f"{stage.request_id} {stage.stage} rank={stage.rank} "
+            f"start_us={stage.start_us:.1f} end_us={stage.end_us:.1f}"
+        )
+    return 0
+
+
+def run_research_smoke(args: argparse.Namespace) -> int:
+    harness = ResearchHarness()
+
+    def baseline() -> ExperimentResult:
+        simulator = DisaggregatedPrefillDecodeSimulator(
+            prefill_ranks=(0,),
+            decode_ranks=(1,),
+            prefill_us_per_token=2.0,
+            decode_us_per_token=4.0,
+            network_latency_us=10.0,
+        )
+        stages = simulator.plan([InferenceJob("req", prompt_tokens=8, decode_tokens=4)])
+        return ExperimentResult("baseline", {"total_us": max(stage.end_us for stage in stages)})
+
+    def faster_decode() -> ExperimentResult:
+        simulator = DisaggregatedPrefillDecodeSimulator(
+            prefill_ranks=(0,),
+            decode_ranks=(1,),
+            prefill_us_per_token=2.0,
+            decode_us_per_token=2.0,
+            network_latency_us=10.0,
+        )
+        stages = simulator.plan([InferenceJob("req", prompt_tokens=8, decode_tokens=4)])
+        return ExperimentResult("faster-decode", {"total_us": max(stage.end_us for stage in stages)})
+
+    harness.register("baseline", baseline)
+    harness.register("faster-decode", faster_decode)
+    results = harness.run()
+    best = harness.best(results, "total_us")
+    print("TorchInferno research smoke")
+    for result in results:
+        print(f"{result.name}: total_us={result.metrics['total_us']:.1f}")
+    print(f"best={best.name}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="torchinferno")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -107,6 +190,24 @@ def build_parser() -> argparse.ArgumentParser:
     hf_smoke.add_argument("--temperature", type=float, default=0.0)
     hf_smoke.add_argument("--non-strict", action="store_true", help="Allow missing or unexpected weight keys.")
     hf_smoke.set_defaults(func=run_hf_smoke)
+
+    trace = subparsers.add_parser("trace-smoke", help="Trace a DSv4 attention slice with make_fx.")
+    trace.add_argument("--device", default="cpu")
+    trace.add_argument("--seed", type=int, default=0)
+    trace.add_argument("--tokens", type=int, default=3)
+    trace.add_argument("--fake", action="store_true", help="Trace with FakeTensorMode.")
+    trace.add_argument("--print-graph", action="store_true", help="Print the full FX graph.")
+    trace.set_defaults(func=run_trace_smoke)
+
+    sim = subparsers.add_parser("sim-smoke", help="Plan disaggregated prefill/decode on virtual ranks.")
+    sim.add_argument("--prefill-us-per-token", type=float, default=2.0)
+    sim.add_argument("--decode-us-per-token", type=float, default=4.0)
+    sim.add_argument("--network-latency-us", type=float, default=10.0)
+    sim.add_argument("--arrival-gap-us", type=float, default=5.0)
+    sim.set_defaults(func=run_sim_smoke)
+
+    research = subparsers.add_parser("research-smoke", help="Run a tiny auto research harness.")
+    research.set_defaults(func=run_research_smoke)
     return parser
 
 
