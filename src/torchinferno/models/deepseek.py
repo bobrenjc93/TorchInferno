@@ -10,7 +10,7 @@ import torch
 from safetensors.torch import save_file
 from torch import Tensor, nn
 
-from torchinferno.kernels import rms_norm, swiglu_activation
+from torchinferno.kernels import paged_decode_attention, rms_norm, swiglu_activation
 from torchinferno.models.hf import HF_CONFIG_NAME, SAFETENSORS_NAME, load_config, load_state_dict, resolve_pretrained_path
 
 
@@ -175,6 +175,8 @@ def apply_rotary(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
 
 
 class DeepSeekLayerKVCache:
+    cache_backend = "dense"
+
     def __init__(
         self,
         batch_size: int,
@@ -205,9 +207,81 @@ class DeepSeekLayerKVCache:
         return self.keys[:batch, :, :end, :], self.values[:batch, :, :end, :]
 
 
+class PagedDeepSeekLayerKVCache:
+    cache_backend = "paged"
+
+    def __init__(
+        self,
+        batch_size: int,
+        max_seq_len: int,
+        num_heads: int,
+        qk_head_dim: int,
+        v_head_dim: int,
+        *,
+        page_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> None:
+        if page_size < 1:
+            raise ValueError("page_size must be positive")
+        from torchinferno.runtime.paged import PagedKVCache
+
+        num_pages = batch_size * math.ceil(max_seq_len / page_size)
+        self.pages = PagedKVCache(
+            num_pages=num_pages,
+            page_size=page_size,
+            num_key_value_heads=num_heads,
+            head_dim=qk_head_dim,
+            value_head_dim=v_head_dim,
+            device=device,
+            dtype=dtype,
+        )
+        self.request_ids = tuple(f"batch-{idx}" for idx in range(batch_size))
+        self.seq_len = 0
+        self.max_seq_len = max_seq_len
+        self.batch_size = batch_size
+
+    def append(self, keys: Tensor, values: Tensor) -> tuple[Tensor, Tensor]:
+        batch = self._append_pages(keys, values)
+        return self.materialize(batch)
+
+    def append_and_attend(self, query: Tensor, keys: Tensor, values: Tensor, positions: Tensor) -> Tensor:
+        batch = self._append_pages(keys, values)
+        if keys.size(2) == 1:
+            position = int(positions[-1].item())
+            return torch.stack(
+                [paged_decode_attention(query[row], self.pages, self.request_ids[row], position) for row in range(batch)],
+                dim=0,
+            )
+        materialized_keys, materialized_values = self.materialize(batch)
+        return dense_causal_attention(query, materialized_keys, materialized_values, positions)
+
+    def materialize(self, batch: int) -> tuple[Tensor, Tensor]:
+        keys = []
+        values = []
+        for row in range(batch):
+            row_keys, row_values = self.pages.materialize(self.request_ids[row])
+            keys.append(row_keys)
+            values.append(row_values)
+        return torch.stack(keys, dim=0), torch.stack(values, dim=0)
+
+    def _append_pages(self, keys: Tensor, values: Tensor) -> int:
+        batch, _, tokens, _ = keys.shape
+        if batch > self.batch_size:
+            raise ValueError("cache batch is smaller than incoming batch")
+        end = self.seq_len + tokens
+        if end > self.max_seq_len:
+            raise ValueError("KV cache capacity exceeded")
+        for row in range(batch):
+            self.pages.append(self.request_ids[row], keys[row], values[row])
+        self.seq_len = end
+        return batch
+
+
 class DeepSeekCache:
-    def __init__(self, layers: list[DeepSeekLayerKVCache]) -> None:
+    def __init__(self, layers: list[DeepSeekLayerKVCache | PagedDeepSeekLayerKVCache], *, cache_backend: str) -> None:
         self.layers = layers
+        self.cache_backend = cache_backend
 
     @property
     def seq_len(self) -> int:
@@ -222,21 +296,49 @@ class DeepSeekCache:
         *,
         device: torch.device,
         dtype: torch.dtype,
+        cache_backend: str = "dense",
+        page_size: int = 16,
     ) -> "DeepSeekCache":
-        return cls(
-            [
-                DeepSeekLayerKVCache(
-                    batch_size,
-                    max_seq_len,
-                    config.num_attention_heads,
-                    config.qk_head_dim,
-                    config.v_head_dim,
-                    device=device,
-                    dtype=dtype,
+        if cache_backend not in {"dense", "paged"}:
+            raise ValueError("cache_backend must be 'dense' or 'paged'")
+        layer_cls = PagedDeepSeekLayerKVCache if cache_backend == "paged" else DeepSeekLayerKVCache
+        layers = []
+        for _ in range(config.num_hidden_layers):
+            if layer_cls is PagedDeepSeekLayerKVCache:
+                layers.append(
+                    PagedDeepSeekLayerKVCache(
+                        batch_size,
+                        max_seq_len,
+                        config.num_attention_heads,
+                        config.qk_head_dim,
+                        config.v_head_dim,
+                        page_size=page_size,
+                        device=device,
+                        dtype=dtype,
+                    )
                 )
-                for _ in range(config.num_hidden_layers)
-            ]
-        )
+            else:
+                layers.append(
+                    DeepSeekLayerKVCache(
+                        batch_size,
+                        max_seq_len,
+                        config.num_attention_heads,
+                        config.qk_head_dim,
+                        config.v_head_dim,
+                        device=device,
+                        dtype=dtype,
+                    )
+                )
+        return cls(layers, cache_backend=cache_backend)
+
+
+def dense_causal_attention(query: Tensor, key: Tensor, value: Tensor, positions: Tensor) -> Tensor:
+    scores = torch.matmul(query, key.transpose(-1, -2)) / math.sqrt(query.size(-1))
+    key_positions = torch.arange(key.size(-2), device=query.device)
+    allowed = key_positions[None, :] <= positions[:, None]
+    scores = scores.masked_fill(~allowed[None, None, :, :], torch.finfo(scores.dtype).min)
+    probs = torch.softmax(scores.float(), dim=-1).to(dtype=query.dtype)
+    return torch.matmul(probs, value)
 
 
 class DeepSeekAttention(nn.Module):
@@ -261,7 +363,12 @@ class DeepSeekAttention(nn.Module):
         self.o_proj = nn.Linear(config.attention_output_size, config.hidden_size, bias=False)
         self.rotary_emb = DeepSeekRotaryEmbedding(config.qk_rope_head_dim, config.rope_theta)
 
-    def forward(self, hidden_states: Tensor, positions: Tensor, cache: Optional[DeepSeekLayerKVCache]) -> Tensor:
+    def forward(
+        self,
+        hidden_states: Tensor,
+        positions: Tensor,
+        cache: Optional[DeepSeekLayerKVCache | PagedDeepSeekLayerKVCache],
+    ) -> Tensor:
         batch, tokens, _ = hidden_states.shape
         heads = self.config.num_attention_heads
 
@@ -289,15 +396,13 @@ class DeepSeekAttention(nn.Module):
         key = torch.cat([k_nope, k_pe.expand(-1, heads, -1, -1)], dim=-1)
         query = torch.cat([q_nope, q_pe], dim=-1)
 
-        if cache is not None:
-            key, value = cache.append(key, value)
+        if isinstance(cache, PagedDeepSeekLayerKVCache):
+            out = cache.append_and_attend(query, key, value, positions)
+        else:
+            if cache is not None:
+                key, value = cache.append(key, value)
+            out = dense_causal_attention(query, key, value, positions)
 
-        scores = torch.matmul(query, key.transpose(-1, -2)) / math.sqrt(self.config.qk_head_dim)
-        key_positions = torch.arange(key.size(-2), device=hidden_states.device)
-        allowed = key_positions[None, :] <= positions[:, None]
-        scores = scores.masked_fill(~allowed[None, None, :, :], torch.finfo(scores.dtype).min)
-        probs = torch.softmax(scores.float(), dim=-1).to(dtype=query.dtype)
-        out = torch.matmul(probs, value)
         out = out.transpose(1, 2).contiguous().view(batch, tokens, self.config.attention_output_size)
         return self.o_proj(out)
 
@@ -395,7 +500,12 @@ class DeepSeekDecoderLayer(nn.Module):
         else:
             self.mlp = DeepSeekMLP(config.hidden_size, config.intermediate_size)
 
-    def forward(self, x: Tensor, positions: Tensor, cache: Optional[DeepSeekLayerKVCache]) -> Tensor:
+    def forward(
+        self,
+        x: Tensor,
+        positions: Tensor,
+        cache: Optional[DeepSeekLayerKVCache | PagedDeepSeekLayerKVCache],
+    ) -> Tensor:
         x = x + self.self_attn(self.input_layernorm(x), positions, cache)
         x = x + self.mlp(self.post_attention_layernorm(x))
         return x
@@ -431,6 +541,7 @@ class DeepSeekV32Model(nn.Module):
                 self.config.max_position_embeddings,
                 device=input_ids.device,
                 dtype=self.embed_tokens.weight.dtype,
+                cache_backend="dense",
             )
         past_len = active_cache.seq_len if active_cache is not None else 0
         if past_len + tokens > self.config.max_position_embeddings:
@@ -493,11 +604,21 @@ class DeepSeekV32ForCausalLM(nn.Module):
         *,
         device: Optional[torch.device] = None,
         dtype: Optional[torch.dtype] = None,
+        cache_backend: str = "dense",
+        page_size: int = 16,
     ) -> DeepSeekCache:
         max_seq_len = self.config.max_position_embeddings if max_seq_len is None else max_seq_len
         device = self.model.embed_tokens.weight.device if device is None else device
         dtype = self.model.embed_tokens.weight.dtype if dtype is None else dtype
-        return DeepSeekCache.allocate(self.config, batch_size, max_seq_len, device=device, dtype=dtype)
+        return DeepSeekCache.allocate(
+            self.config,
+            batch_size,
+            max_seq_len,
+            device=device,
+            dtype=dtype,
+            cache_backend=cache_backend,
+            page_size=page_size,
+        )
 
     def forward(
         self,
@@ -517,6 +638,8 @@ class DeepSeekV32ForCausalLM(nn.Module):
         max_new_tokens: int,
         temperature: float = 0.0,
         eos_token_id: Optional[int] = None,
+        cache_backend: str = "dense",
+        page_size: int = 16,
     ) -> Tensor:
         if max_new_tokens < 0:
             raise ValueError("max_new_tokens must be non-negative")
@@ -528,6 +651,8 @@ class DeepSeekV32ForCausalLM(nn.Module):
             input_ids.size(0),
             min(self.config.max_position_embeddings, input_ids.size(1) + max_new_tokens),
             device=input_ids.device,
+            cache_backend=cache_backend,
+            page_size=page_size,
         )
         logits, cache = self(input_ids, cache=cache, use_cache=True)
         next_token = sample_next_token(logits[:, -1, :], temperature)

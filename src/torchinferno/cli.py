@@ -25,6 +25,7 @@ from torchinferno.runtime.batching import InferenceRequest, run_continuous_batch
 from torchinferno.runtime.paged import PagedKVCache
 from torchinferno.runtime.paged_attention import paged_causal_attention
 from torchinferno.runtime.scheduler import DisaggregatedPrefillDecodeSimulator, InferenceJob
+from torchinferno.runtime.serving import ContinuousBatchEngine, ServingRequest
 from torchinferno.runtime.traffic import TrafficPattern, simulate_traffic
 from torchinferno.tokenization import load_text_tokenizer
 from torchinferno.validation import (
@@ -96,7 +97,13 @@ def run_deepseek_smoke(args: argparse.Namespace) -> int:
     prompt = torch.randint(0, config.vocab_size, (args.batch_size, args.prompt_tokens), device=device)
     start = time.perf_counter()
     with torch.inference_mode():
-        output = model.generate(prompt, max_new_tokens=args.new_tokens, temperature=args.temperature)
+        output = model.generate(
+            prompt,
+            max_new_tokens=args.new_tokens,
+            temperature=args.temperature,
+            cache_backend=args.cache_backend,
+            page_size=args.page_size,
+        )
     elapsed_ms = (time.perf_counter() - start) * 1000
 
     print("TorchInferno native DeepSeek smoke")
@@ -282,6 +289,37 @@ def run_traffic_smoke(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_serve_smoke(args: argparse.Namespace) -> int:
+    device = torch.device(args.device) if args.device else _default_device()
+    torch.manual_seed(args.seed)
+    config = tiny_deepseek_v32_config(vocab_size=args.vocab_size, max_position_embeddings=64)
+    model = DeepSeekV32ForCausalLM(config).to(device).eval()
+    engine = ContinuousBatchEngine(
+        model,
+        device=device,
+        cache_backend=args.cache_backend,
+        page_size=args.page_size,
+        temperature=args.temperature,
+        max_active_requests=args.max_active_requests,
+    )
+    requests = [
+        ServingRequest("req-a", (1, 2, 3), args.new_tokens, arrival_step=0),
+        ServingRequest("req-b", (1, 2, 3, 4), args.new_tokens, arrival_step=1),
+        ServingRequest("req-c", (5, 6), args.new_tokens, arrival_step=1),
+    ]
+    start = time.perf_counter()
+    results = engine.run(requests)
+    elapsed_ms = (time.perf_counter() - start) * 1000
+    print("TorchInferno serving smoke")
+    print(f"device={device} cache_backend={args.cache_backend} requests={len(results)} elapsed_ms={elapsed_ms:.2f}")
+    for result in results:
+        print(
+            f"{result.request_id}: tokens={list(result.tokens)} "
+            f"prefix_hit_tokens={result.prefix_hit_tokens} finished_step={result.finished_step}"
+        )
+    return 0
+
+
 def run_perf_smoke(args: argparse.Namespace) -> int:
     device = torch.device(args.device) if args.device else _default_device()
     torch.manual_seed(args.seed)
@@ -454,6 +492,8 @@ def build_parser() -> argparse.ArgumentParser:
     native.add_argument("--compile", action="store_true", help="Compile the native DeepSeek forward path.")
     native.add_argument("--no-q-lora", action="store_true", help="Use direct q_proj instead of q LoRA.")
     native.add_argument("--score-bias", action="store_true", help="Enable routed score correction bias.")
+    native.add_argument("--cache-backend", choices=["dense", "paged"], default="dense")
+    native.add_argument("--page-size", type=int, default=16)
     native.set_defaults(func=run_deepseek_smoke)
 
     hf_smoke = subparsers.add_parser(
@@ -532,6 +572,17 @@ def build_parser() -> argparse.ArgumentParser:
     traffic.add_argument("--print-stages", type=int, default=8)
     traffic.add_argument("--seed", type=int, default=0)
     traffic.set_defaults(func=run_traffic_smoke)
+
+    serve = subparsers.add_parser("serve-smoke", help="Run the token-level continuous serving engine.")
+    serve.add_argument("--device", default=None, help="Torch device, defaults to cuda when available.")
+    serve.add_argument("--cache-backend", choices=["dense", "paged"], default="paged")
+    serve.add_argument("--page-size", type=int, default=16)
+    serve.add_argument("--max-active-requests", type=int, default=2)
+    serve.add_argument("--new-tokens", type=int, default=2)
+    serve.add_argument("--vocab-size", type=int, default=128)
+    serve.add_argument("--temperature", type=float, default=0.0)
+    serve.add_argument("--seed", type=int, default=0)
+    serve.set_defaults(func=run_serve_smoke)
 
     perf = subparsers.add_parser("perf-smoke", help="Benchmark paged attention reference and specialized decode paths.")
     perf.add_argument("--device", default=None, help="Torch device, defaults to cuda when available.")

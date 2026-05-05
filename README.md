@@ -18,7 +18,8 @@ to grow toward production-grade SOTA inference.
   heads, latent MQA KV projection, independent value head dimensions,
   dense-to-MoE layer transitions, shared experts, grouped top-k routing, and
   score correction bias support.
-- Explicit append-only KV cache for prefill and decode correctness tests.
+- Explicit dense and paged KV cache backends for prefill and decode correctness
+  tests in the native DeepSeek path.
 - Hugging Face-style local and Hub checkpoint save/load for TorchInferno DSv4
   key names and tensor shapes.
 - DeepSeek-style checkpoint audit and exact conversion for checkpoints whose
@@ -27,11 +28,14 @@ to grow toward production-grade SOTA inference.
   validation for checkpoint bringup.
 - Greedy and temperature sampling.
 - Ragged request API with dense continuous-batching execution buckets.
+- Token-step continuous serving harness with admission, paged-cache policy, and
+  prefix-hit accounting.
 - Deterministic time-sliced virtual GPU simulation.
 - Disaggregated prefill/decode planner with network latency modeling.
 - Fake process groups and fake collectives for single-process distributed
   policy tests.
-- Paged KV cache allocator scaffold for paged attention kernel work.
+- Paged KV cache allocator integrated into native DeepSeek decode and available
+  as a standalone kernel workbench.
 - Functional paged causal attention reference for kernel replacement work.
 - Radix/prefix tree, prefix-aware router, and prefix cache lookup.
 - `torch.compile` helper and CLI smoke path.
@@ -69,6 +73,7 @@ PYTHONPATH=src python3 -m torchinferno.cli batch-smoke --device cpu
 PYTHONPATH=src python3 -m torchinferno.cli trace-smoke --device cpu
 PYTHONPATH=src python3 -m torchinferno.cli sim-smoke
 PYTHONPATH=src python3 -m torchinferno.cli traffic-smoke
+PYTHONPATH=src python3 -m torchinferno.cli serve-smoke --device cpu
 PYTHONPATH=src python3 -m torchinferno.cli perf-smoke
 PYTHONPATH=src python3 -m torchinferno.cli research-smoke
 ```
@@ -130,6 +135,7 @@ Run a native architecture smoke:
 ```bash
 PYTHONPATH=src python3 -m torchinferno.cli deepseek-smoke --device cpu
 PYTHONPATH=src python3 -m torchinferno.cli deepseek-smoke --device cpu --no-q-lora
+PYTHONPATH=src python3 -m torchinferno.cli deepseek-smoke --device cpu --cache-backend paged
 ```
 
 ## Compiler And Graph Work
@@ -177,6 +183,8 @@ The runtime package is where simulation-first serving work belongs:
 - `runtime.paged_attention`: correct torch paged causal attention reference.
 - `runtime.prefix`: radix prefix tree and prefix-aware routing.
 - `runtime.prefix_cache`: prefix cache lookup for reusable KV entries.
+- `runtime.serving`: token-step continuous serving engine for native DeepSeek
+  cache-policy and prefix-aware request experiments.
 - `runtime.traffic`: deterministic request burst/diversity simulation.
 - `runtime.flex`: flex-attention-shaped API with an eager fallback.
 - `runtime.cudagraphs`: named piecewise CUDA graph execution API.
@@ -190,6 +198,7 @@ PYTHONPATH=src python3 -m torchinferno.cli sim-smoke \
   --decode-us-per-token 4 \
   --network-latency-us 10
 PYTHONPATH=src python3 -m torchinferno.cli traffic-smoke --requests 32 --burst-size 8
+PYTHONPATH=src python3 -m torchinferno.cli serve-smoke --device cpu --cache-backend paged
 ```
 
 ## Text And Validation
@@ -335,6 +344,7 @@ src/torchinferno/
   runtime/prefix.py       Radix prefix and prefix-aware routing.
   runtime/prefix_cache.py Prefix cache lookup.
   runtime/scheduler.py    Disaggregated prefill/decode planner.
+  runtime/serving.py      Token-step continuous serving engine.
   runtime/simulation.py   Time-sliced virtual GPU simulator.
   runtime/traffic.py      Bursty traffic simulation.
   research/harness.py     Auto research experiment harness.
@@ -349,6 +359,7 @@ tests/
                            Text, validation, paged attention, prefix, traffic tests.
   test_performance_specialization.py
                            Triton paged decode, NVFP4, and benchmark tests.
+  test_serving_engine.py   Native paged-cache serving engine tests.
 AGENTS.md                 Short contribution map for coding agents.
 ```
 
@@ -369,7 +380,9 @@ Implemented as working code and tests:
 - Disaggregated prefill/decode planning.
 - Ragged and continuous batching.
 - Pattern-match graph replacement entry point.
+- Native DeepSeek dense/paged cache backend selection.
 - Paged KV allocation and paged causal attention reference.
+- Token-step continuous serving engine with prefix-hit accounting.
 - Radix/prefix-aware routing and prefix cache lookup.
 - Bursty traffic simulation.
 - Piecewise CUDA graph API scaffold.
@@ -388,8 +401,9 @@ Still intentionally future work:
   the current correct references and decode-focused Triton specialization.
 - Piecewise CUDA graph capture with static device buffers.
 - Monarch-backed distributed execution instead of the fake fallback.
-- Prefix cache reuse integrated into model execution.
-- Full serving scheduler with admission control and cancellation.
+- Actual cross-request KV reuse from prefix-cache hits, beyond current hit
+  accounting.
+- Full production serving scheduler with cancellation and async transport.
 
 ## Development Principles
 

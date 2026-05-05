@@ -14,6 +14,7 @@ PYTHONPATH=src python3 -m torchinferno.cli deepseek-smoke --device cpu --batch-s
 PYTHONPATH=src python3 -m torchinferno.cli trace-smoke --device cpu --tokens 2
 PYTHONPATH=src python3 -m torchinferno.cli sim-smoke
 PYTHONPATH=src python3 -m torchinferno.cli traffic-smoke
+PYTHONPATH=src python3 -m torchinferno.cli serve-smoke --device cpu --cache-backend paged
 PYTHONPATH=src python3 -m torchinferno.cli perf-smoke --device cpu --heads 2 --seq-len 8 --head-dim 8 --value-dim 8
 ```
 
@@ -24,6 +25,7 @@ python3 -m pytest tests/test_conversion_and_kernels.py
 python3 -m pytest tests/test_deepseek_native.py
 python3 -m pytest tests/test_production_workflows.py
 python3 -m pytest tests/test_performance_specialization.py
+python3 -m pytest tests/test_serving_engine.py
 ```
 
 ## Where To Put Work
@@ -35,6 +37,8 @@ python3 -m pytest tests/test_performance_specialization.py
   `src/torchinferno/graph/`.
 - Scheduling, batching, cache, routing, and simulation policies:
   `src/torchinferno/runtime/`.
+- Native paged-cache serving integration: `src/torchinferno/runtime/serving.py`
+  and `src/torchinferno/models/deepseek.py`.
 - Text IO and validation workflows: `src/torchinferno/tokenization.py` and
   `src/torchinferno/validation.py`.
 - Repeatable experiments and comparisons: `src/torchinferno/research/`.
