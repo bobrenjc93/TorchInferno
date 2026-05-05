@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, fields, replace
+from pathlib import Path
 from typing import Optional
 
 import torch
@@ -46,6 +47,36 @@ class DSv4Config:
     @property
     def head_dim(self) -> int:
         return self.hidden_size // self.num_attention_heads
+
+    def to_dict(self) -> dict[str, object]:
+        data = asdict(self)
+        data["model_type"] = "dsv4"
+        data["architectures"] = ["DSv4ForCausalLM"]
+        return data
+
+    @classmethod
+    def from_dict(cls, data: dict[str, object]) -> "DSv4Config":
+        aliases = {
+            "num_hidden_layers": "num_layers",
+            "num_heads": "num_attention_heads",
+            "n_heads": "num_attention_heads",
+            "num_kv_heads": "num_key_value_heads",
+            "kv_lora_rank": "latent_kv_size",
+            "moe_intermediate_size": "intermediate_size",
+            "n_routed_experts": "num_experts",
+            "num_routed_experts": "num_experts",
+            "num_experts_per_tok": "top_k",
+            "max_position_embeddings": "max_seq_len",
+        }
+        normalized = dict(data)
+        is_deepseek_v32 = normalized.get("model_type") == "deepseek_v32"
+        for source, target in aliases.items():
+            if source in normalized and (target not in normalized or is_deepseek_v32):
+                normalized[target] = normalized[source]
+        if is_deepseek_v32 and "moe_intermediate_size" in normalized:
+            normalized["intermediate_size"] = normalized["moe_intermediate_size"]
+        allowed = {field.name for field in fields(cls)}
+        return cls(**{key: value for key, value in normalized.items() if key in allowed})
 
 
 def tiny_dsv4_config(**overrides: int | float | bool) -> DSv4Config:
@@ -280,6 +311,34 @@ class DSv4ForCausalLM(nn.Module):
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         if config.tie_word_embeddings:
             self.lm_head.weight = self.embed_tokens.weight
+
+    @classmethod
+    def from_pretrained(
+        cls,
+        pretrained_model_name_or_path: str | Path,
+        *,
+        token: Optional[str] = None,
+        revision: Optional[str] = None,
+        cache_dir: Optional[str | Path] = None,
+        map_location: str | torch.device = "cpu",
+        strict: bool = True,
+    ) -> "DSv4ForCausalLM":
+        from torchinferno.models.hf import load_dsv4_pretrained
+
+        return load_dsv4_pretrained(
+            cls,
+            pretrained_model_name_or_path,
+            token=token,
+            revision=revision,
+            cache_dir=cache_dir,
+            map_location=map_location,
+            strict=strict,
+        )
+
+    def save_pretrained(self, save_directory: str | Path) -> None:
+        from torchinferno.models.hf import save_dsv4_pretrained
+
+        save_dsv4_pretrained(self, save_directory)
 
     def allocate_cache(
         self,

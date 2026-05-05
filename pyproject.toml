@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Torch-native inference experiments with a DSv4-style end-to-end path."
 readme = "README.md"
 requires-python = ">=3.10"
-dependencies = ["torch"]
+dependencies = ["huggingface-hub", "safetensors", "torch"]
 
 [project.optional-dependencies]
 dev = ["pytest"]

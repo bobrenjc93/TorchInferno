@@ -11,6 +11,7 @@ This repository currently ships an end-to-end DSv4-style inference path with:
 - Rotary causal attention with grouped KV heads.
 - Routed top-k MoE feed-forward blocks.
 - Explicit append-only KV cache for prefill and decode.
+- Hugging Face-compatible config and safetensors checkpoint save/load.
 - Greedy and temperature sampling.
 - A ragged request batching harness.
 - A deterministic time-sliced multi-GPU simulator.
@@ -61,6 +62,34 @@ print(output)
 The cache path is covered by tests that compare incremental decode logits
 against a full causal forward pass.
 
+## Checkpoints
+
+TorchInferno can save and load DSv4-compatible checkpoints with a
+Hugging Face-style layout:
+
+```python
+model.save_pretrained("/tmp/tiny-dsv4")
+loaded = DSv4ForCausalLM.from_pretrained("/tmp/tiny-dsv4")
+```
+
+The CLI can load either a local checkpoint directory or a Hub repo ID:
+
+```bash
+torchinferno dsv4-hf-smoke /tmp/tiny-dsv4 --device cpu
+```
+
+For private or gated Hub repos, provide credentials through the environment,
+not command-line flags:
+
+```bash
+export HF_TOKEN=...
+torchinferno dsv4-hf-smoke org-or-user/repo-name --device cuda
+```
+
+The current loader expects TorchInferno DSv4-compatible key names and tensor
+shapes. Loading production DeepSeek checkpoints with their native naming still
+needs a conversion layer, tokenizer wiring, and validation against known logits.
+
 ## Torch Compile
 
 The CLI exposes a small compile smoke:
@@ -107,12 +136,14 @@ Current local checks:
 python3 -m pytest
 PYTHONPATH=src python3 -m torchinferno.cli dsv4-smoke --device cpu
 PYTHONPATH=src python3 -m torchinferno.cli dsv4-smoke --device cuda
+PYTHONPATH=src python3 -m torchinferno.cli dsv4-hf-smoke /path/to/dsv4-checkpoint
 ```
 
 The test suite covers:
 
 - Cached decode matching full forward logits.
 - End-to-end token generation.
+- Local safetensors checkpoint save/load round-trip.
 - Ragged request batching.
 - Time-sliced virtual GPU simulation.
 - CLI execution.
@@ -121,7 +152,7 @@ The test suite covers:
 
 Near-term work that fits the design direction:
 
-- Real DSv4/DeepSeek checkpoint loading and tokenizer integration.
+- Native DeepSeek checkpoint conversion and tokenizer integration.
 - Paged KV allocation instead of contiguous append-only cache.
 - Prefix-aware routing and prefix cache reuse.
 - Piecewise CUDA graph capture for prefill and decode.

@@ -54,6 +54,26 @@ def run_batch_smoke(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_hf_smoke(args: argparse.Namespace) -> int:
+    device = torch.device(args.device) if args.device else _default_device()
+    model = DSv4ForCausalLM.from_pretrained(
+        args.model,
+        revision=args.revision,
+        cache_dir=args.cache_dir,
+        map_location="cpu",
+        strict=not args.non_strict,
+    ).to(device)
+    model.eval()
+    prompt = torch.tensor([args.input_ids], device=device, dtype=torch.long)
+    with torch.inference_mode():
+        output = model.generate(prompt, max_new_tokens=args.new_tokens, temperature=args.temperature)
+    print("TorchInferno DSv4 HF smoke")
+    print(f"model={args.model} device={device} new={args.new_tokens}")
+    print(f"shape={tuple(output.shape)}")
+    print(f"tokens[0]={output[0].tolist()}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="torchinferno")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -73,6 +93,20 @@ def build_parser() -> argparse.ArgumentParser:
     batch.add_argument("--device", default=None, help="Torch device, defaults to cuda when available.")
     batch.add_argument("--seed", type=int, default=0)
     batch.set_defaults(func=run_batch_smoke)
+
+    hf_smoke = subparsers.add_parser(
+        "dsv4-hf-smoke",
+        help="Load a compatible local or Hugging Face DSv4 checkpoint and generate tokens.",
+    )
+    hf_smoke.add_argument("model", help="Local checkpoint directory or Hugging Face repo ID.")
+    hf_smoke.add_argument("--revision", default=None)
+    hf_smoke.add_argument("--cache-dir", default=None)
+    hf_smoke.add_argument("--device", default=None, help="Torch device, defaults to cuda when available.")
+    hf_smoke.add_argument("--input-ids", type=int, nargs="+", default=[1, 2, 3])
+    hf_smoke.add_argument("--new-tokens", type=int, default=2)
+    hf_smoke.add_argument("--temperature", type=float, default=0.0)
+    hf_smoke.add_argument("--non-strict", action="store_true", help="Allow missing or unexpected weight keys.")
+    hf_smoke.set_defaults(func=run_hf_smoke)
     return parser
 
 
