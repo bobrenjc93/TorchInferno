@@ -14,6 +14,10 @@ to grow toward production-grade SOTA inference.
 - DSv4-style decoder-only causal LM in pure PyTorch.
 - MLA-like latent KV projection, grouped KV heads, rotary causal attention, and
   routed top-k MoE feed-forward blocks.
+- Native DeepSeek-V3.2-style causal LM with query LoRA, split RoPE/nope QK
+  heads, latent MQA KV projection, independent value head dimensions,
+  dense-to-MoE layer transitions, shared experts, grouped top-k routing, and
+  score correction bias support.
 - Explicit append-only KV cache for prefill and decode correctness tests.
 - Hugging Face-style local and Hub checkpoint save/load for TorchInferno DSv4
   key names and tensor shapes.
@@ -51,6 +55,7 @@ Without installing the package:
 
 ```bash
 PYTHONPATH=src python3 -m torchinferno.cli dsv4-smoke --device cpu
+PYTHONPATH=src python3 -m torchinferno.cli deepseek-smoke --device cpu
 PYTHONPATH=src python3 -m torchinferno.cli batch-smoke --device cpu
 PYTHONPATH=src python3 -m torchinferno.cli trace-smoke --device cpu
 PYTHONPATH=src python3 -m torchinferno.cli sim-smoke
@@ -61,11 +66,13 @@ CUDA is optional for the tests, but the DSv4 smoke can run on GPU:
 
 ```bash
 PYTHONPATH=src python3 -m torchinferno.cli dsv4-smoke --device cuda
+PYTHONPATH=src python3 -m torchinferno.cli deepseek-smoke --device cuda
 ```
 
 ## DSv4 End-To-End Path
 
-The model lives in `src/torchinferno/models/dsv4.py`.
+The compact model lives in `src/torchinferno/models/dsv4.py`. It is the fast
+local harness for compiler, cache, batching, and graph-pass experiments.
 
 ```python
 import torch
@@ -85,6 +92,34 @@ print(output)
 The tests compare incremental cached decode logits against a full causal
 forward pass, then exercise generation, local checkpoint save/load, CLI
 execution, batching, tracing, and runtime scaffolds.
+
+## Native DeepSeek Path
+
+The native model lives in `src/torchinferno/models/deepseek.py`. It mirrors the
+production DeepSeek-style tensor contracts rather than compressing them into the
+compact DSv4 harness.
+
+```python
+import torch
+
+from torchinferno import DeepSeekV32ForCausalLM, tiny_deepseek_v32_config
+
+config = tiny_deepseek_v32_config(vocab_size=128, max_position_embeddings=32)
+model = DeepSeekV32ForCausalLM(config).eval()
+prompt = torch.tensor([[1, 2, 3, 4]])
+
+with torch.inference_mode():
+    output = model.generate(prompt, max_new_tokens=4)
+
+print(output)
+```
+
+Run a native architecture smoke:
+
+```bash
+PYTHONPATH=src python3 -m torchinferno.cli deepseek-smoke --device cpu
+PYTHONPATH=src python3 -m torchinferno.cli deepseek-smoke --device cpu --no-q-lora
+```
 
 ## Compiler And Graph Work
 
@@ -203,18 +238,18 @@ TorchInferno also has DeepSeek-style checkpoint audit and conversion commands:
 ```bash
 PYTHONPATH=src python3 -m torchinferno.cli dsv4-audit /path/to/deepseek-checkpoint
 PYTHONPATH=src python3 -m torchinferno.cli dsv4-convert /path/to/deepseek-checkpoint /tmp/torchinferno-dsv4
+PYTHONPATH=src python3 -m torchinferno.cli deepseek-audit /path/to/deepseek-checkpoint
+PYTHONPATH=src python3 -m torchinferno.cli deepseek-convert /path/to/deepseek-checkpoint /tmp/torchinferno-native
 ```
 
-The converter indexes safetensor shard metadata without loading the whole model,
-checks every tensor shape against TorchInferno DSv4, writes sharded safetensors,
-and stores `torchinferno_conversion_report.json` in the output directory.
+The converters index safetensor shard metadata without loading the whole model,
+check every tensor shape against the target model, write sharded safetensors,
+and store `torchinferno_conversion_report.json` in the output directory.
 
-Important: conversion is exact and conservative. If a native DeepSeek checkpoint
-uses attention or MoE contracts TorchInferno DSv4 cannot represent yet, such as
-query LoRA, split RoPE/nope heads, shared experts, grouped routing, or different
-value head dimensions, `dsv4-audit` reports the mismatch and `dsv4-convert`
-refuses to write a misleading checkpoint unless `--allow-partial` is explicitly
-used for debugging.
+Use `deepseek-audit` and `deepseek-convert` for native production architecture
+checkpoints. The older `dsv4-*` conversion path remains intentionally
+conservative for the compact DSv4 harness and still refuses tensors DSv4 cannot
+represent exactly.
 
 ## Repository Layout
 
@@ -226,6 +261,7 @@ src/torchinferno/
   kernels/triton_ops.py   Triton CUDA RMSNorm and SwiGLU kernels.
   kernels/passes.py       Graph-pass registration for kernel replacements.
   models/dsv4.py          DSv4-style causal LM, MoE, attention, and KV cache.
+  models/deepseek.py      Native DeepSeek-V3.2-style architecture.
   models/conversion.py    DeepSeek-style checkpoint audit and conversion.
   models/hf.py            Hugging Face-style config and weights IO.
   graph/export.py         make_fx and FakeTensor tracing helper.
@@ -242,6 +278,7 @@ src/torchinferno/
   research/harness.py     Auto research experiment harness.
 tests/
   test_dsv4_e2e.py        DSv4 e2e and original runtime tests.
+  test_deepseek_native.py Native architecture, cache, conversion, and CLI tests.
   test_conversion_and_kernels.py
                            Checkpoint conversion and custom kernel tests.
   test_scaffolding.py     Compiler/runtime/research scaffold tests.
@@ -253,6 +290,7 @@ AGENTS.md                 Short contribution map for coding agents.
 Implemented as working code and tests:
 
 - DSv4 local inference path.
+- Native DeepSeek-V3.2-style inference path.
 - DeepSeek-style checkpoint audit and exact compatible conversion.
 - `torch.compile` smoke path.
 - `make_fx` and fake tensor trace helper.
@@ -271,10 +309,8 @@ Implemented as working code and tests:
 
 Still intentionally future work:
 
-- Full native DeepSeek production architecture coverage for checkpoints with
-  query LoRA, split QK head contracts, shared experts, grouped routing, or
-  other tensors TorchInferno DSv4 cannot yet represent exactly.
-- Tokenizer integration and known-logit validation for production DSv4 weights.
+- Tokenizer integration and known-logit validation for downloaded production
+  weights.
 - Real paged/radix/flex attention kernels and fused MoE kernels.
 - Piecewise CUDA graph capture with static device buffers.
 - Monarch-backed distributed execution instead of the fake fallback.

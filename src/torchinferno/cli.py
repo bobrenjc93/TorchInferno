@@ -10,9 +10,12 @@ from torchinferno.graph import trace_with_make_fx
 from torchinferno.models.conversion import (
     IncompatibleCheckpointError,
     audit_deepseek_checkpoint,
+    audit_native_deepseek_checkpoint,
     convert_deepseek_checkpoint,
+    convert_native_deepseek_checkpoint,
     dtype_from_name,
 )
+from torchinferno.models.deepseek import DeepSeekV32ForCausalLM, tiny_deepseek_v32_config
 from torchinferno.models.dsv4 import DSv4ForCausalLM, tiny_dsv4_config
 from torchinferno.research import ExperimentResult, ResearchHarness
 from torchinferno.runtime.batching import InferenceRequest, run_continuous_batch
@@ -64,6 +67,32 @@ def run_batch_smoke(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_deepseek_smoke(args: argparse.Namespace) -> int:
+    device = torch.device(args.device) if args.device else _default_device()
+    torch.manual_seed(args.seed)
+    config = tiny_deepseek_v32_config(
+        vocab_size=args.vocab_size,
+        max_position_embeddings=args.prompt_tokens + args.new_tokens + 8,
+        q_lora_rank=None if args.no_q_lora else 16,
+        use_score_correction_bias=args.score_bias,
+    )
+    model = DeepSeekV32ForCausalLM(config).to(device).eval()
+    if args.compile:
+        compile_forward(model, CompileConfig(mode="reduce-overhead"))
+
+    prompt = torch.randint(0, config.vocab_size, (args.batch_size, args.prompt_tokens), device=device)
+    start = time.perf_counter()
+    with torch.inference_mode():
+        output = model.generate(prompt, max_new_tokens=args.new_tokens, temperature=args.temperature)
+    elapsed_ms = (time.perf_counter() - start) * 1000
+
+    print("TorchInferno native DeepSeek smoke")
+    print(f"device={device} batch={args.batch_size} prompt={args.prompt_tokens} new={args.new_tokens}")
+    print(f"shape={tuple(output.shape)} elapsed_ms={elapsed_ms:.2f}")
+    print(f"tokens[0]={output[0].tolist()}")
+    return 0
+
+
 def run_hf_smoke(args: argparse.Namespace) -> int:
     device = torch.device(args.device) if args.device else _default_device()
     model = DSv4ForCausalLM.from_pretrained(
@@ -78,6 +107,26 @@ def run_hf_smoke(args: argparse.Namespace) -> int:
     with torch.inference_mode():
         output = model.generate(prompt, max_new_tokens=args.new_tokens, temperature=args.temperature)
     print("TorchInferno DSv4 HF smoke")
+    print(f"model={args.model} device={device} new={args.new_tokens}")
+    print(f"shape={tuple(output.shape)}")
+    print(f"tokens[0]={output[0].tolist()}")
+    return 0
+
+
+def run_deepseek_hf_smoke(args: argparse.Namespace) -> int:
+    device = torch.device(args.device) if args.device else _default_device()
+    model = DeepSeekV32ForCausalLM.from_pretrained(
+        args.model,
+        revision=args.revision,
+        cache_dir=args.cache_dir,
+        map_location="cpu",
+        strict=not args.non_strict,
+    ).to(device)
+    model.eval()
+    prompt = torch.tensor([args.input_ids], device=device, dtype=torch.long)
+    with torch.inference_mode():
+        output = model.generate(prompt, max_new_tokens=args.new_tokens, temperature=args.temperature)
+    print("TorchInferno native DeepSeek HF smoke")
     print(f"model={args.model} device={device} new={args.new_tokens}")
     print(f"shape={tuple(output.shape)}")
     print(f"tokens[0]={output[0].tolist()}")
@@ -193,6 +242,36 @@ def run_dsv4_convert(args: argparse.Namespace) -> int:
     return 0 if report.compatible else 2
 
 
+def run_deepseek_audit(args: argparse.Namespace) -> int:
+    report = audit_native_deepseek_checkpoint(
+        args.model,
+        revision=args.revision,
+        cache_dir=args.cache_dir,
+    )
+    print(report.summary())
+    return 0 if report.compatible else 2
+
+
+def run_deepseek_convert(args: argparse.Namespace) -> int:
+    try:
+        report = convert_native_deepseek_checkpoint(
+            args.model,
+            args.output_dir,
+            revision=args.revision,
+            cache_dir=args.cache_dir,
+            dtype=dtype_from_name(args.dtype),
+            max_shard_size=args.max_shard_size,
+            allow_partial=args.allow_partial,
+        )
+    except IncompatibleCheckpointError as exc:
+        print(exc.report.summary())
+        print("Refusing to convert incompatible checkpoint. Use --allow-partial only for debugging.")
+        return 2
+    print(report.summary())
+    print(f"wrote={args.output_dir}")
+    return 0 if report.compatible else 2
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="torchinferno")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -213,6 +292,19 @@ def build_parser() -> argparse.ArgumentParser:
     batch.add_argument("--seed", type=int, default=0)
     batch.set_defaults(func=run_batch_smoke)
 
+    native = subparsers.add_parser("deepseek-smoke", help="Run a native DeepSeek-V3.2-style generation smoke test.")
+    native.add_argument("--device", default=None, help="Torch device, defaults to cuda when available.")
+    native.add_argument("--seed", type=int, default=0)
+    native.add_argument("--batch-size", type=int, default=1)
+    native.add_argument("--prompt-tokens", type=int, default=3)
+    native.add_argument("--new-tokens", type=int, default=2)
+    native.add_argument("--vocab-size", type=int, default=128)
+    native.add_argument("--temperature", type=float, default=0.0)
+    native.add_argument("--compile", action="store_true", help="Compile the native DeepSeek forward path.")
+    native.add_argument("--no-q-lora", action="store_true", help="Use direct q_proj instead of q LoRA.")
+    native.add_argument("--score-bias", action="store_true", help="Enable routed score correction bias.")
+    native.set_defaults(func=run_deepseek_smoke)
+
     hf_smoke = subparsers.add_parser(
         "dsv4-hf-smoke",
         help="Load a compatible local or Hugging Face DSv4 checkpoint and generate tokens.",
@@ -226,6 +318,20 @@ def build_parser() -> argparse.ArgumentParser:
     hf_smoke.add_argument("--temperature", type=float, default=0.0)
     hf_smoke.add_argument("--non-strict", action="store_true", help="Allow missing or unexpected weight keys.")
     hf_smoke.set_defaults(func=run_hf_smoke)
+
+    native_hf = subparsers.add_parser(
+        "deepseek-hf-smoke",
+        help="Load a native DeepSeek-style checkpoint and generate tokens.",
+    )
+    native_hf.add_argument("model", help="Local checkpoint directory or Hugging Face repo ID.")
+    native_hf.add_argument("--revision", default=None)
+    native_hf.add_argument("--cache-dir", default=None)
+    native_hf.add_argument("--device", default=None, help="Torch device, defaults to cuda when available.")
+    native_hf.add_argument("--input-ids", type=int, nargs="+", default=[1, 2, 3])
+    native_hf.add_argument("--new-tokens", type=int, default=2)
+    native_hf.add_argument("--temperature", type=float, default=0.0)
+    native_hf.add_argument("--non-strict", action="store_true", help="Allow missing or unexpected weight keys.")
+    native_hf.set_defaults(func=run_deepseek_hf_smoke)
 
     trace = subparsers.add_parser("trace-smoke", help="Trace a DSv4 attention slice with make_fx.")
     trace.add_argument("--device", default="cpu")
@@ -263,6 +369,28 @@ def build_parser() -> argparse.ArgumentParser:
     convert.add_argument("--max-shard-size", default="5GB")
     convert.add_argument("--allow-partial", action="store_true", help="Write only convertible tensors for debugging.")
     convert.set_defaults(func=run_dsv4_convert)
+
+    native_audit = subparsers.add_parser(
+        "deepseek-audit",
+        help="Audit a native DeepSeek-style checkpoint for TorchInferno native loading.",
+    )
+    native_audit.add_argument("model", help="Local checkpoint directory or Hugging Face repo ID.")
+    native_audit.add_argument("--revision", default=None)
+    native_audit.add_argument("--cache-dir", default=None)
+    native_audit.set_defaults(func=run_deepseek_audit)
+
+    native_convert = subparsers.add_parser(
+        "deepseek-convert",
+        help="Convert a native DeepSeek-style checkpoint into TorchInferno native format.",
+    )
+    native_convert.add_argument("model", help="Local checkpoint directory or Hugging Face repo ID.")
+    native_convert.add_argument("output_dir")
+    native_convert.add_argument("--revision", default=None)
+    native_convert.add_argument("--cache-dir", default=None)
+    native_convert.add_argument("--dtype", default=None, help="Optional output dtype: float32, float16, or bfloat16.")
+    native_convert.add_argument("--max-shard-size", default="5GB")
+    native_convert.add_argument("--allow-partial", action="store_true", help="Write only convertible tensors for debugging.")
+    native_convert.set_defaults(func=run_deepseek_convert)
     return parser
 
 

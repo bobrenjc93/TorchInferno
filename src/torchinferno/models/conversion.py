@@ -12,6 +12,7 @@ from safetensors import safe_open
 from safetensors.torch import save_file
 
 from torchinferno.models.dsv4 import DSv4Config
+from torchinferno.models.deepseek import DeepSeekV32Config
 from torchinferno.models.hf import (
     CONFIG_NAME,
     HF_CONFIG_NAME,
@@ -239,6 +240,60 @@ def convert_deepseek_checkpoint(
     return report
 
 
+def audit_native_deepseek_checkpoint(
+    checkpoint: str | Path,
+    *,
+    token: str | None = None,
+    revision: str | None = None,
+    cache_dir: str | Path | None = None,
+) -> ConversionReport:
+    path = resolve_pretrained_path(checkpoint, token=token, revision=revision, cache_dir=cache_dir)
+    config_dict = load_config(path)
+    target_config = DeepSeekV32Config.from_dict(config_dict)
+    return _audit_expected_tensors(
+        path,
+        model_type=str(config_dict.get("model_type", "unknown")),
+        target_config=target_config.to_dict(),
+        expected=expected_deepseek_v32_tensors(target_config),
+        key_map=deepseek_native_key_map(target_config),
+        issues=[],
+    )
+
+
+def convert_native_deepseek_checkpoint(
+    checkpoint: str | Path,
+    output_dir: str | Path,
+    *,
+    token: str | None = None,
+    revision: str | None = None,
+    cache_dir: str | Path | None = None,
+    dtype: torch.dtype | None = None,
+    max_shard_size: int | str = "5GB",
+    allow_partial: bool = False,
+) -> ConversionReport:
+    path = resolve_pretrained_path(checkpoint, token=token, revision=revision, cache_dir=cache_dir)
+    report = audit_native_deepseek_checkpoint(path)
+    if not report.compatible and not allow_partial:
+        raise IncompatibleCheckpointError(report)
+
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+    (output_path / HF_CONFIG_NAME).write_text(json.dumps(report.target_config, indent=2, sort_keys=True) + "\n")
+    (output_path / CONVERSION_REPORT_NAME).write_text(json.dumps(report.to_dict(), indent=2, sort_keys=True) + "\n")
+    tensor_index = index_checkpoint_tensors(path)
+    shard_limit = parse_size(max_shard_size)
+    writer = _ShardWriter(output_path, shard_limit)
+    for mapping in report.mapped_tensors:
+        if allow_partial and mapping.source_name not in tensor_index:
+            continue
+        tensor = load_checkpoint_tensor(path, tensor_index[mapping.source_name])
+        if dtype is not None and tensor.is_floating_point():
+            tensor = tensor.to(dtype=dtype)
+        writer.add(mapping.target_name, tensor)
+    writer.close()
+    return report
+
+
 def index_checkpoint_tensors(path: str | Path) -> dict[str, TensorInfo]:
     root = Path(path)
     safetensor_files = _safetensor_files(root)
@@ -317,6 +372,67 @@ def expected_dsv4_tensors(config: DSv4Config) -> dict[str, tuple[int, ...]]:
     return expected
 
 
+def expected_deepseek_v32_tensors(config: DeepSeekV32Config) -> dict[str, tuple[int, ...]]:
+    hidden = config.hidden_size
+    expected: dict[str, tuple[int, ...]] = {
+        "model.embed_tokens.weight": (config.vocab_size, hidden),
+        "model.norm.weight": (hidden,),
+        "lm_head.weight": (config.vocab_size, hidden),
+    }
+    q_out = config.num_attention_heads * config.qk_head_dim
+    kv_a_out = config.kv_lora_rank + config.qk_rope_head_dim
+    kv_b_out = config.num_attention_heads * (config.qk_nope_head_dim + config.v_head_dim)
+    for layer in range(config.num_hidden_layers):
+        prefix = f"model.layers.{layer}"
+        expected[f"{prefix}.input_layernorm.weight"] = (hidden,)
+        expected[f"{prefix}.post_attention_layernorm.weight"] = (hidden,)
+        if config.q_lora_rank is None:
+            expected[f"{prefix}.self_attn.q_proj.weight"] = (q_out, hidden)
+        else:
+            expected[f"{prefix}.self_attn.q_a_proj.weight"] = (config.q_lora_rank, hidden)
+            expected[f"{prefix}.self_attn.q_a_layernorm.weight"] = (config.q_lora_rank,)
+            expected[f"{prefix}.self_attn.q_b_proj.weight"] = (q_out, config.q_lora_rank)
+        expected.update(
+            {
+                f"{prefix}.self_attn.kv_a_proj_with_mqa.weight": (kv_a_out, hidden),
+                f"{prefix}.self_attn.kv_a_layernorm.weight": (config.kv_lora_rank,),
+                f"{prefix}.self_attn.kv_b_proj.weight": (kv_b_out, config.kv_lora_rank),
+                f"{prefix}.self_attn.o_proj.weight": (hidden, config.attention_output_size),
+            }
+        )
+        if config.is_moe_layer(layer):
+            expected[f"{prefix}.mlp.gate.weight"] = (config.n_routed_experts, hidden)
+            if config.use_score_correction_bias:
+                expected[f"{prefix}.mlp.gate.e_score_correction_bias"] = (config.n_routed_experts,)
+            for expert in range(config.n_routed_experts):
+                expert_prefix = f"{prefix}.mlp.experts.{expert}"
+                expected.update(
+                    {
+                        f"{expert_prefix}.gate_proj.weight": (config.moe_intermediate_size, hidden),
+                        f"{expert_prefix}.up_proj.weight": (config.moe_intermediate_size, hidden),
+                        f"{expert_prefix}.down_proj.weight": (hidden, config.moe_intermediate_size),
+                    }
+                )
+            if config.n_shared_experts > 0:
+                shared = config.n_shared_experts * config.moe_intermediate_size
+                expected.update(
+                    {
+                        f"{prefix}.mlp.shared_experts.gate_proj.weight": (shared, hidden),
+                        f"{prefix}.mlp.shared_experts.up_proj.weight": (shared, hidden),
+                        f"{prefix}.mlp.shared_experts.down_proj.weight": (hidden, shared),
+                    }
+                )
+        else:
+            expected.update(
+                {
+                    f"{prefix}.mlp.gate_proj.weight": (config.intermediate_size, hidden),
+                    f"{prefix}.mlp.up_proj.weight": (config.intermediate_size, hidden),
+                    f"{prefix}.mlp.down_proj.weight": (hidden, config.intermediate_size),
+                }
+            )
+    return expected
+
+
 def deepseek_to_dsv4_key_map(config: DSv4Config) -> dict[str, tuple[str, ...]]:
     mapping = {
         "embed_tokens.weight": ("model.embed_tokens.weight",),
@@ -361,6 +477,29 @@ def deepseek_to_dsv4_key_map(config: DSv4Config) -> dict[str, tuple[str, ...]]:
     return mapping
 
 
+def deepseek_native_key_map(config: DeepSeekV32Config) -> dict[str, tuple[str, ...]]:
+    mapping = {name: (name,) for name in expected_deepseek_v32_tensors(config)}
+    for layer in range(config.num_hidden_layers):
+        prefix = f"model.layers.{layer}"
+        if config.is_moe_layer(layer):
+            for expert in range(config.n_routed_experts):
+                target_prefix = f"{prefix}.mlp.experts.{expert}"
+                routed_prefix = f"{prefix}.mlp.routed_experts.{expert}"
+                mapping[f"{target_prefix}.gate_proj.weight"] = (
+                    f"{target_prefix}.gate_proj.weight",
+                    f"{routed_prefix}.gate_proj.weight",
+                )
+                mapping[f"{target_prefix}.up_proj.weight"] = (
+                    f"{target_prefix}.up_proj.weight",
+                    f"{routed_prefix}.up_proj.weight",
+                )
+                mapping[f"{target_prefix}.down_proj.weight"] = (
+                    f"{target_prefix}.down_proj.weight",
+                    f"{routed_prefix}.down_proj.weight",
+                )
+    return mapping
+
+
 def parse_size(value: int | str) -> int:
     if isinstance(value, int):
         return value
@@ -395,6 +534,64 @@ def dtype_from_name(name: str | None) -> torch.dtype | None:
     if normalized in {"bf16", "bfloat16"}:
         return torch.bfloat16
     raise ValueError(f"unsupported dtype: {name}")
+
+
+def _audit_expected_tensors(
+    path: Path,
+    *,
+    model_type: str,
+    target_config: dict[str, object],
+    expected: dict[str, tuple[int, ...]],
+    key_map: dict[str, tuple[str, ...]],
+    issues: list[ConversionIssue],
+) -> ConversionReport:
+    tensor_index = index_checkpoint_tensors(path)
+    mapped: list[TensorMapping] = []
+    used_sources: set[str] = set()
+    for target_name, expected_shape in expected.items():
+        source_name = _first_existing(key_map.get(target_name, (target_name,)), tensor_index)
+        if source_name is None:
+            issues.append(
+                ConversionIssue(
+                    "error",
+                    "missing_tensor",
+                    "No source tensor maps to required TorchInferno tensor.",
+                    target_name=target_name,
+                )
+            )
+            continue
+        source_info = tensor_index[source_name]
+        if source_info.shape != expected_shape:
+            issues.append(
+                ConversionIssue(
+                    "error",
+                    "shape_mismatch",
+                    f"Expected shape {expected_shape}, found {source_info.shape}.",
+                    target_name=target_name,
+                    source_name=source_name,
+                )
+            )
+            continue
+        mapped.append(TensorMapping(target_name, source_name, expected_shape, source_info.dtype))
+        used_sources.add(source_name)
+
+    for source_name in sorted(set(tensor_index) - used_sources):
+        if _looks_like_model_weight(source_name):
+            issues.append(
+                ConversionIssue(
+                    "warning",
+                    "unused_tensor",
+                    "Source tensor is not consumed by the TorchInferno target model.",
+                    source_name=source_name,
+                )
+            )
+    return ConversionReport(
+        source=str(path),
+        model_type=model_type,
+        target_config=target_config,
+        mapped_tensors=tuple(mapped),
+        issues=tuple(issues),
+    )
 
 
 class _ShardWriter:
