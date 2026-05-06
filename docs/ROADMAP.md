@@ -28,7 +28,8 @@ The CLI view is `torchinferno audit`.
 | Prefix KV reuse | integrated | Serving aliases reusable prefix pages across model layer cache rows with copy-on-write protection. |
 | Continuous batching | bridge | Persistent row-assigned cache batches same-length prefill/decode groups without rebuilding temporary caches. |
 | Disaggregated prefill/decode | simulated | Planner models rank assignment and transfer latency. |
-| NVFP4 graph passes | reference | Quantized tensor contract and graph hook exist; fused kernel remains open. |
+| Graph pattern replacement | bridge | Leaf target swaps plus a multi-node symbolic/make_fx fused-op example exist. |
+| NVFP4 graph passes | reference | Quantized tensor contract and graph hook exist; production fused kernel remains open. |
 | Research harness | minimal | Named experiments and metric comparison exist. |
 
 ## Next Production Milestones
@@ -41,5 +42,5 @@ The CLI view is `torchinferno audit`.
 5. Add Monarch-backed distributed execution behind the fake-world interface.
 6. Validate native checkpoint conversion against real production weights with
    committed logit references.
-7. Expand graph pattern matching from call-target replacement to subgraph
-   captures for MLA, grouped MoE, and NVFP4 linear regions.
+7. Apply subgraph captures to production MLA, grouped MoE, and NVFP4 linear
+   regions with architecture/shape guards.

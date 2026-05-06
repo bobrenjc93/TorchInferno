@@ -41,7 +41,8 @@ to grow toward production-grade SOTA inference.
 - Radix/prefix tree, prefix-aware router, and prefix cache lookup.
 - `torch.compile` helper and CLI smoke path.
 - `make_fx` tracing helper with FakeTensorMode support.
-- Pattern-based FX graph pass registry with call-target replacement helpers.
+- Pattern-based FX graph pass registry with call-target and multi-node
+  subgraph replacement helpers.
 - Flex-attention-shaped q/k/v API with eager fallback.
 - Piecewise CUDA graph runner API with CPU/eager fallback.
 - Optional Monarch adapter point with fake-world fallback.
@@ -149,10 +150,11 @@ TorchInferno keeps compiler hooks explicit:
 - `torchinferno.graph.trace_with_make_fx` wraps `make_fx` and optional fake
   tensor tracing.
 - `torchinferno.graph.PassRegistry` registers ordered FX graph passes.
-- `replace_call_function_targets` is the first small pattern replacement helper
-  for custom-kernel experiments such as NVFP4 MoE or specialized attention.
+- `replace_call_function_targets` handles leaf target swaps.
+- `replace_subgraph_pattern` handles multi-node symbolic FX and make_fx/ATen
+  replacements for fused custom-kernel regions.
 - `torchinferno.kernels.passes.register_kernel_replacement_passes` wires
-  reference leaf calls to TorchInferno kernel APIs.
+  reference leaf calls and example fused subgraphs to TorchInferno kernel APIs.
 
 Trace a DSv4 attention slice:
 
@@ -246,6 +248,8 @@ torch fallbacks:
   otherwise.
 - `swiglu_activation`: Triton CUDA SwiGLU activation when available, torch
   fallback otherwise.
+- `fused_rmsnorm_swiglu`: graph-friendly custom op for residual-add, RMSNorm,
+  weighted gate/up projection, and SwiGLU with Triton CUDA and torch fallback.
 - `paged_decode_attention`: decode-token paged attention that uses Triton for
   CUDA-compatible single-token decode and falls back to the torch reference.
 - `quantize_nvfp4`, `dequantize_nvfp4`, and `nvfp4_linear_reference`: a stable
@@ -387,7 +391,8 @@ Implemented as working code and tests:
 - Time-sliced multi-rank simulation.
 - Disaggregated prefill/decode planning.
 - Ragged and continuous batching.
-- Pattern-match graph replacement entry point.
+- Pattern-match graph replacement entry point, including a multi-node
+  make_fx/ATen subgraph replacement example.
 - Native DeepSeek dense/paged cache backend selection.
 - Paged KV allocation and paged causal attention reference.
 - Token-step continuous serving engine with prefix-hit accounting, shared
@@ -400,6 +405,8 @@ Implemented as working code and tests:
 - Auto research harness.
 - Optional Monarch integration point.
 - Triton CUDA RMSNorm and SwiGLU kernels with torch fallbacks.
+- Triton CUDA fused residual-add/RMSNorm/weighted-SwiGLU custom op with torch
+  fallback and fake-tensor trace support.
 - Triton-backed paged decode attention with torch fallback.
 - NVFP4 quantized-linear reference and graph-pass hook.
 - Local benchmark harness and CLI.

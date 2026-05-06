@@ -66,6 +66,43 @@ def replace_call_function_targets(
     return pass_fn
 
 
+def replace_subgraph_pattern(
+    pattern: Callable[..., object] | torch.fx.Graph | torch.fx.GraphModule,
+    replacement: Callable[..., object] | torch.fx.Graph | torch.fx.GraphModule,
+    *,
+    match_filters: list[Callable[..., bool]] | None = None,
+    ignore_literals: bool = False,
+    metadata_key: str | None = None,
+) -> GraphPass:
+    """Build a graph pass that replaces a multi-node FX pattern.
+
+    This is the production-facing bridge between torch-native model code and
+    specialized kernels: keep the model readable, trace it, then replace a
+    guarded subgraph with a fused op.
+    """
+
+    def pass_fn(graph_module: torch.fx.GraphModule) -> torch.fx.GraphModule:
+        from torch.fx import subgraph_rewriter
+
+        if match_filters is not None or ignore_literals:
+            matches = subgraph_rewriter.replace_pattern_with_filters(
+                graph_module,
+                pattern,
+                replacement,
+                match_filters=match_filters,
+                ignore_literals=ignore_literals,
+            )
+        else:
+            matches = subgraph_rewriter.replace_pattern(graph_module, pattern, replacement)
+        if metadata_key is not None:
+            graph_module.meta[metadata_key] = len(matches)
+        graph_module.graph.lint()
+        graph_module.recompile()
+        return graph_module
+
+    return pass_fn
+
+
 def replace_call_module_targets(
     replacements: Mapping[str, torch.nn.Module],
 ) -> GraphPass:

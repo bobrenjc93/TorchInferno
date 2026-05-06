@@ -67,6 +67,11 @@ def build_audit_report() -> TorchInfernoAudit:
             FeatureAudit("piecewise cudagraphs", "scaffold", "Named pieces exist; static CUDA capture buffers are not implemented."),
             FeatureAudit("paged attention", "integrated", "Native DeepSeek can use paged decode with torch/Triton fallback."),
             FeatureAudit(
+                "graph pattern replacement",
+                "bridge",
+                "Leaf swaps and multi-node symbolic/make_fx subgraph replacement route into fused custom ops.",
+            ),
+            FeatureAudit(
                 "prefix KV reuse",
                 "integrated",
                 "Serving aliases reusable prefix pages inside persistent native paged caches.",
@@ -77,7 +82,7 @@ def build_audit_report() -> TorchInfernoAudit:
                 "Persistent row-assigned cache batches same-length prefill/decode groups without temporary cache rebuilds.",
             ),
             FeatureAudit("disaggregated prefill/decode", "simulated", "Planner models rank assignment and network latency."),
-            FeatureAudit("NVFP4 graph passes", "reference", "NVFP4 tensor contract and pass hook exist; fused kernel remains open."),
+            FeatureAudit("NVFP4 graph passes", "reference", "NVFP4 tensor contract and pass hook exist; production fused kernel remains open."),
             FeatureAudit("research harness", "minimal", "Named experiments and metric comparison are available."),
         ),
     )

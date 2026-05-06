@@ -1,6 +1,8 @@
 from torchinferno.kernels.ops import (
     KernelBackend,
     KernelConfig,
+    fused_rmsnorm_swiglu,
+    fused_rmsnorm_swiglu_reference,
     rms_norm,
     swiglu_activation,
     swiglu_activation_reference,
@@ -18,6 +20,8 @@ __all__ = [
     "KernelConfig",
     "NVFP4Tensor",
     "dequantize_nvfp4",
+    "fused_rmsnorm_swiglu",
+    "fused_rmsnorm_swiglu_reference",
     "nvfp4_linear_reference",
     "paged_decode_attention",
     "quantize_nvfp4",

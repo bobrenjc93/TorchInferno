@@ -76,6 +76,79 @@ def triton_rms_norm(x: Tensor, weight: Tensor, eps: float) -> Tensor:
 
 
 @triton.jit
+def _fused_rmsnorm_swiglu_kernel(
+    x_ptr,
+    residual_ptr,
+    norm_weight_ptr,
+    gate_weight_ptr,
+    up_weight_ptr,
+    out_ptr,
+    n_cols: tl.constexpr,
+    eps: tl.constexpr,
+    block_size: tl.constexpr,
+) -> None:
+    row = tl.program_id(0)
+    offsets = tl.arange(0, block_size)
+    mask = offsets < n_cols
+    row_offset = row * n_cols + offsets
+    x = tl.load(x_ptr + row_offset, mask=mask, other=0.0).to(tl.float32)
+    residual = tl.load(residual_ptr + row_offset, mask=mask, other=0.0).to(tl.float32)
+    hidden = x + residual
+    variance = tl.sum(hidden * hidden, axis=0) / n_cols
+    scale = tl.rsqrt(variance + eps)
+    norm_weight = tl.load(norm_weight_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+    gate_weight = tl.load(gate_weight_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+    up_weight = tl.load(up_weight_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+    normed = hidden * scale * norm_weight
+    gate = normed * gate_weight
+    up = normed * up_weight
+    out = gate / (1.0 + tl.exp(-gate)) * up
+    tl.store(out_ptr + row_offset, out, mask=mask)
+
+
+def triton_fused_rmsnorm_swiglu(
+    x: Tensor,
+    residual: Tensor,
+    norm_weight: Tensor,
+    gate_weight: Tensor,
+    up_weight: Tensor,
+    eps: float,
+) -> Tensor:
+    if x.shape != residual.shape:
+        raise ValueError("x and residual tensors must have the same shape")
+    hidden_size = x.size(-1)
+    for name, weight in (
+        ("norm_weight", norm_weight),
+        ("gate_weight", gate_weight),
+        ("up_weight", up_weight),
+    ):
+        if tuple(weight.shape) != (hidden_size,):
+            raise ValueError(f"{name} shape must be {(hidden_size,)}")
+    x_2d = x.contiguous().view(-1, hidden_size)
+    residual_2d = residual.contiguous().view(-1, hidden_size)
+    norm_weight = norm_weight.contiguous()
+    gate_weight = gate_weight.contiguous()
+    up_weight = up_weight.contiguous()
+    out = torch.empty_like(x_2d)
+    block_size = triton.next_power_of_2(hidden_size)
+    if block_size > 8192:
+        raise ValueError("Triton fused RMSNorm+SwiGLU supports hidden sizes up to 8192")
+    _fused_rmsnorm_swiglu_kernel[(x_2d.size(0),)](
+        x_2d,
+        residual_2d,
+        norm_weight,
+        gate_weight,
+        up_weight,
+        out,
+        hidden_size,
+        eps,
+        block_size,
+        num_warps=8,
+    )
+    return out.view_as(x)
+
+
+@triton.jit
 def _paged_decode_attention_kernel(
     query_ptr,
     key_pages_ptr,

@@ -5,6 +5,8 @@ from torchinferno.compiler import CompileConfig, compile_forward
 from torchinferno.kernels import (
     NVFP4Tensor,
     dequantize_nvfp4,
+    fused_rmsnorm_swiglu,
+    fused_rmsnorm_swiglu_reference,
     nvfp4_linear_reference,
     paged_decode_attention,
     quantize_nvfp4,
@@ -47,6 +49,8 @@ __all__ = [
     "convert_deepseek_checkpoint",
     "convert_native_deepseek_checkpoint",
     "dequantize_nvfp4",
+    "fused_rmsnorm_swiglu",
+    "fused_rmsnorm_swiglu_reference",
     "load_logit_reference",
     "load_model_auto",
     "load_text_tokenizer",

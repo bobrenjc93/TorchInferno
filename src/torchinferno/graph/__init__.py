@@ -5,6 +5,7 @@ from torchinferno.graph.passes import (
     replace_call_module_targets,
     annotate_matching_nodes,
     replace_call_function_targets,
+    replace_subgraph_pattern,
 )
 
 __all__ = [
@@ -13,5 +14,6 @@ __all__ = [
     "annotate_matching_nodes",
     "replace_call_function_targets",
     "replace_call_module_targets",
+    "replace_subgraph_pattern",
     "trace_with_make_fx",
 ]
