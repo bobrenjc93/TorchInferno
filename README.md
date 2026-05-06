@@ -33,6 +33,8 @@ to grow toward production-grade SOTA inference.
   paged cache state, and same-shape prefill/decode microbatching.
 - Deterministic time-sliced virtual GPU simulation.
 - Disaggregated prefill/decode planner with network latency modeling.
+- Agent-editable standalone prefill/decode rank files with local JSON-RPC
+  wrappers for disaggregated execution experiments.
 - Fake process groups and fake collectives for single-process distributed
   policy tests.
 - Paged KV cache allocator integrated into native DeepSeek decode and available
@@ -77,6 +79,7 @@ PYTHONPATH=src python3 -m torchinferno.cli batch-smoke --device cpu
 PYTHONPATH=src python3 -m torchinferno.cli trace-smoke --device cpu
 PYTHONPATH=src python3 -m torchinferno.cli sim-smoke
 PYTHONPATH=src python3 -m torchinferno.cli traffic-smoke
+PYTHONPATH=src python3 -m torchinferno.cli disagg-init .torchinferno_disagg --prefill-ranks 1 --decode-ranks 1
 PYTHONPATH=src python3 -m torchinferno.cli serve-smoke --device cpu
 PYTHONPATH=src python3 -m torchinferno.cli perf-smoke
 PYTHONPATH=src python3 -m torchinferno.cli profile-run .torchinferno_runs/dsv4-cpu --device cpu
@@ -214,6 +217,43 @@ PYTHONPATH=src python3 -m torchinferno.cli profile-run .torchinferno_runs/deepse
 python3 .torchinferno_runs/dsv4-gpu/repro.py --device cuda
 ```
 
+## Disaggregated Rank Files
+
+`disagg-init` generates one standalone Python file per rank. Each file owns one
+rank role, one model instance, and a small local RPC wrapper. The files are
+intended to be edited directly by agents while preserving the `prefill` and
+`decode` RPC contracts.
+
+```bash
+PYTHONPATH=src python3 -m torchinferno.cli disagg-init .torchinferno_disagg \
+  --prefill-ranks 4 \
+  --decode-ranks 4 \
+  --base-port 8800 \
+  --device cuda
+```
+
+Start ranks in separate shells:
+
+```bash
+python3 .torchinferno_disagg/rank_0_prefill.py
+python3 .torchinferno_disagg/rank_4_decode.py
+```
+
+Then send a request through live rank endpoints:
+
+```bash
+PYTHONPATH=src python3 -m torchinferno.cli disagg-smoke \
+  --prefill-url http://127.0.0.1:8800 \
+  --decode-url http://127.0.0.1:8804 \
+  --prompt 1 2 3 \
+  --new-tokens 2
+```
+
+The first implementation transfers tiny DSv4 KV state through JSON for
+inspectability. That is deliberately simple and agent-friendly; production
+transport can replace the wrapper with gRPC/binary page descriptors while
+keeping the rank files and method contracts intact.
+
 ## Runtime Scaffolds
 
 The runtime package is where simulation-first serving work belongs:
@@ -221,6 +261,8 @@ The runtime package is where simulation-first serving work belongs:
 - `runtime.batching`: ragged request boundary and continuous batching buckets.
 - `runtime.simulation`: simple virtual GPU time slicing.
 - `runtime.scheduler`: disaggregated prefill/decode planning.
+- `runtime.disagg`: agent-editable rank files and local RPC wrappers for
+  executable prefill/decode experiments.
 - `runtime.fake_dist`: fake process groups and collectives.
 - `runtime.paged`: page-table-shaped KV cache allocation and materialization.
 - `runtime.paged_attention`: correct torch paged causal attention reference.
@@ -430,6 +472,8 @@ Implemented as working code and tests:
 - Fake process groups.
 - Time-sliced multi-rank simulation.
 - Disaggregated prefill/decode planning.
+- Agent-editable standalone rank files for executable prefill/decode RPC
+  experiments.
 - Ragged and continuous batching.
 - Pattern-match graph replacement entry point, including a multi-node
   make_fx/ATen subgraph replacement example.

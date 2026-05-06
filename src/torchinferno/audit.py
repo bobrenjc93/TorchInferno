@@ -72,6 +72,11 @@ def build_audit_report() -> TorchInfernoAudit:
             FeatureAudit("piecewise cudagraphs", "scaffold", "Named pieces exist; static CUDA capture buffers are not implemented."),
             FeatureAudit("paged attention", "integrated", "Native DeepSeek can use paged decode with torch/Triton fallback."),
             FeatureAudit(
+                "agent rank files",
+                "bridge",
+                "disagg-init emits editable prefill/decode rank files with local RPC wrappers.",
+            ),
+            FeatureAudit(
                 "graph pattern replacement",
                 "bridge",
                 "Leaf swaps and multi-node symbolic/make_fx subgraph replacement route into fused custom ops.",

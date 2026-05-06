@@ -26,6 +26,7 @@ from torchinferno.profiling import ProfileRunConfig, run_profile_capture
 from torchinferno.research import ExperimentResult, ResearchHarness
 from torchinferno.research.benchmarks import benchmark_callable
 from torchinferno.runtime.batching import InferenceRequest, run_continuous_batch
+from torchinferno.runtime.disagg import run_disagg_request, write_rank_files
 from torchinferno.runtime.paged import PagedKVCache
 from torchinferno.runtime.paged_attention import paged_causal_attention
 from torchinferno.runtime.scheduler import DisaggregatedPrefillDecodeSimulator, InferenceJob
@@ -229,6 +230,43 @@ def run_sim_smoke(args: argparse.Namespace) -> int:
             f"{stage.request_id} {stage.stage} rank={stage.rank} "
             f"start_us={stage.start_us:.1f} end_us={stage.end_us:.1f}"
         )
+    return 0
+
+
+def run_disagg_init(args: argparse.Namespace) -> int:
+    plan = write_rank_files(
+        Path(args.output_dir),
+        prefill_ranks=args.prefill_ranks,
+        decode_ranks=args.decode_ranks,
+        host=args.host,
+        base_port=args.base_port,
+        device=args.device,
+        seed=args.seed,
+        vocab_size=args.vocab_size,
+        max_seq_len=args.max_seq_len,
+    )
+    print("TorchInferno disaggregated rank files")
+    print(f"output_dir={plan.output_dir}")
+    print(f"manifest={plan.manifest}")
+    print(f"client_smoke={plan.client_smoke}")
+    for endpoint in plan.endpoints:
+        print(f"rank={endpoint.rank_id} role={endpoint.role} url={endpoint.url} file={endpoint.file}")
+    return 0
+
+
+def run_disagg_smoke(args: argparse.Namespace) -> int:
+    result = run_disagg_request(
+        prefill_url=args.prefill_url,
+        decode_url=args.decode_url,
+        request_id=args.request_id,
+        prompt=args.prompt,
+        max_new_tokens=args.new_tokens,
+        temperature=args.temperature,
+        timeout_s=args.timeout_s,
+    )
+    print("TorchInferno disaggregated RPC smoke")
+    print(f"prefill_tokens={result['prefill']['tokens']}")
+    print(f"decode_tokens={result['decode']['tokens']}")
     return 0
 
 
@@ -614,6 +652,34 @@ def build_parser() -> argparse.ArgumentParser:
     sim.add_argument("--network-latency-us", type=float, default=10.0)
     sim.add_argument("--arrival-gap-us", type=float, default=5.0)
     sim.set_defaults(func=run_sim_smoke)
+
+    disagg_init = subparsers.add_parser(
+        "disagg-init",
+        help="Generate one standalone Python file per prefill/decode rank.",
+    )
+    disagg_init.add_argument("output_dir")
+    disagg_init.add_argument("--prefill-ranks", type=int, default=1)
+    disagg_init.add_argument("--decode-ranks", type=int, default=1)
+    disagg_init.add_argument("--host", default="127.0.0.1")
+    disagg_init.add_argument("--base-port", type=int, default=8800)
+    disagg_init.add_argument("--device", default="cpu")
+    disagg_init.add_argument("--seed", type=int, default=0)
+    disagg_init.add_argument("--vocab-size", type=int, default=128)
+    disagg_init.add_argument("--max-seq-len", type=int, default=64)
+    disagg_init.set_defaults(func=run_disagg_init)
+
+    disagg_smoke = subparsers.add_parser(
+        "disagg-smoke",
+        help="Send one request through live disaggregated rank RPC endpoints.",
+    )
+    disagg_smoke.add_argument("--prefill-url", default="http://127.0.0.1:8800")
+    disagg_smoke.add_argument("--decode-url", default="http://127.0.0.1:8801")
+    disagg_smoke.add_argument("--request-id", default="req-smoke")
+    disagg_smoke.add_argument("--prompt", type=int, nargs="+", default=[1, 2, 3])
+    disagg_smoke.add_argument("--new-tokens", type=int, default=2)
+    disagg_smoke.add_argument("--temperature", type=float, default=0.0)
+    disagg_smoke.add_argument("--timeout-s", type=float, default=30.0)
+    disagg_smoke.set_defaults(func=run_disagg_smoke)
 
     research = subparsers.add_parser("research-smoke", help="Run a tiny auto research harness.")
     research.set_defaults(func=run_research_smoke)

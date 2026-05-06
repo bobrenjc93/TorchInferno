@@ -26,6 +26,7 @@ The CLI view is `torchinferno audit`.
 | Flex attention | reference | Eager q/k/v fallback exists; real flex dispatch remains open. |
 | Piecewise CUDA graphs | scaffold | Named runner exists; static CUDA capture buffers remain open. |
 | Paged attention | integrated | Native DeepSeek paged decode path plus torch/Triton fallback. |
+| Agent rank files | bridge | `disagg-init` emits editable prefill/decode rank files with local RPC wrappers. |
 | Prefix KV reuse | integrated | Serving aliases reusable prefix pages across model layer cache rows with copy-on-write protection. |
 | Continuous batching | bridge | Persistent row-assigned cache batches same-length prefill/decode groups without rebuilding temporary caches. |
 | Disaggregated prefill/decode | simulated | Planner models rank assignment and transfer latency. |
