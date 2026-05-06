@@ -1,7 +1,8 @@
-.PHONY: audit smoke test serve perf
+.PHONY: audit smoke test serve perf profile
 
 PYTHON ?= python3
 TI_PYTHONPATH ?= src
+PROFILE_DIR ?= .torchinferno_runs/dsv4-cpu
 
 audit:
 	PYTHONPATH=$(TI_PYTHONPATH) $(PYTHON) -m torchinferno.cli audit
@@ -19,3 +20,6 @@ serve:
 
 perf:
 	PYTHONPATH=$(TI_PYTHONPATH) $(PYTHON) -m torchinferno.cli perf-smoke --device cpu --heads 2 --seq-len 8 --head-dim 8 --value-dim 8
+
+profile:
+	PYTHONPATH=$(TI_PYTHONPATH) $(PYTHON) -m torchinferno.cli profile-run $(PROFILE_DIR) --device cpu --batch-size 1 --prompt-tokens 3 --new-tokens 2 --warmup 0

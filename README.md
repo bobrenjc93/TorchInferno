@@ -79,6 +79,7 @@ PYTHONPATH=src python3 -m torchinferno.cli sim-smoke
 PYTHONPATH=src python3 -m torchinferno.cli traffic-smoke
 PYTHONPATH=src python3 -m torchinferno.cli serve-smoke --device cpu
 PYTHONPATH=src python3 -m torchinferno.cli perf-smoke
+PYTHONPATH=src python3 -m torchinferno.cli profile-run .torchinferno_runs/dsv4-cpu --device cpu
 PYTHONPATH=src python3 -m torchinferno.cli research-smoke
 ```
 
@@ -175,6 +176,43 @@ PYTHONPATH=src python3 -m torchinferno.cli dsv4-smoke \
 ```
 
 First compile is expected to be much slower than eager execution.
+
+## Profile Artifact Runs
+
+`profile-run` is the one-command loop for agent and kernel work. It runs one
+generation, captures a forward `make_fx` graph, collects profiler and memory
+data, and writes a standalone repro script into one artifact directory.
+
+```bash
+PYTHONPATH=src python3 -m torchinferno.cli profile-run .torchinferno_runs/dsv4-gpu \
+  --model-kind dsv4 \
+  --device cuda \
+  --batch-size 1 \
+  --prompt-tokens 8 \
+  --new-tokens 8
+```
+
+The output directory contains:
+
+- `manifest.json`: artifact index.
+- `run_config.json` and `environment.json`: exact run setup.
+- `input_ids.json` and `output.json`: deterministic repro inputs and tokens.
+- `graph.json`, `graph.txt`, and `graph_module.py`: captured forward graph.
+- `operator_profile.json`: `torch.profiler` key averages as JSON.
+- `chrome_trace.json`: Chrome/Perfetto trace from `torch.profiler`.
+- `memory_profile.json`: CUDA allocator stats when running on GPU.
+- `repro.py`: standalone repro for rerunning the same workload.
+
+Useful variants:
+
+```bash
+PYTHONPATH=src python3 -m torchinferno.cli profile-run .torchinferno_runs/deepseek-paged \
+  --model-kind deepseek \
+  --device cuda \
+  --cache-backend paged
+
+python3 .torchinferno_runs/dsv4-gpu/repro.py --device cuda
+```
 
 ## Runtime Scaffolds
 
@@ -385,6 +423,8 @@ Implemented as working code and tests:
 - Auto model loading.
 - Tokenizer-backed text generation.
 - Known-logit capture and validation.
+- One-command profile artifact capture with graph JSON, profiler JSON, memory
+  JSON, Chrome trace export, and standalone repro generation.
 - `torch.compile` smoke path.
 - `make_fx` and fake tensor trace helper.
 - Fake process groups.

@@ -20,6 +20,7 @@ The CLI view is `torchinferno audit`.
 | Checkpoint conversion | integrated | Shape/key audit plus sharded safetensor writer; needs real-weight golden validation. |
 | `torch.compile` | integrated | Shared compile policy and smoke path. |
 | `make_fx` and fake tensors | integrated | FakeTensorMode trace helper and tests. |
+| Profile artifact loop | integrated | One command writes graph/profile/memory JSON, Chrome trace, and repro.py. |
 | Fake process groups | integrated | Deterministic single-process collectives. |
 | Monarch | scaffold | Adapter detects Monarch and falls back to fake world. |
 | Flex attention | reference | Eager q/k/v fallback exists; real flex dispatch remains open. |

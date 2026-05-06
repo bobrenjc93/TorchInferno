@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+from pathlib import Path
+import sys
 import time
 
 import torch
@@ -20,6 +22,7 @@ from torchinferno.models.conversion import (
 from torchinferno.models.deepseek import DeepSeekV32ForCausalLM, tiny_deepseek_v32_config
 from torchinferno.models.dsv4 import DSv4ForCausalLM, tiny_dsv4_config
 from torchinferno.kernels import KernelBackend, KernelConfig, paged_decode_attention
+from torchinferno.profiling import ProfileRunConfig, run_profile_capture
 from torchinferno.research import ExperimentResult, ResearchHarness
 from torchinferno.research.benchmarks import benchmark_callable
 from torchinferno.runtime.batching import InferenceRequest, run_continuous_batch
@@ -374,6 +377,50 @@ def run_perf_smoke(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_profile_run(args: argparse.Namespace) -> int:
+    device = args.device if args.device is not None else str(_default_device())
+    if args.output_dir is None:
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        output_dir = Path(".torchinferno_runs") / f"{args.model_kind}-{stamp}"
+    else:
+        output_dir = Path(args.output_dir)
+    artifacts = run_profile_capture(
+        ProfileRunConfig(
+            output_dir=output_dir,
+            model_kind=args.model_kind,
+            device=device,
+            dtype=args.dtype,
+            seed=args.seed,
+            batch_size=args.batch_size,
+            prompt_tokens=args.prompt_tokens,
+            new_tokens=args.new_tokens,
+            vocab_size=args.vocab_size,
+            temperature=args.temperature,
+            compile=args.compile,
+            cache_backend=args.cache_backend,
+            page_size=args.page_size,
+            warmup=args.warmup,
+            capture_graph=not args.no_graph,
+            fake_graph=args.fake_graph,
+            require_graph=args.require_graph,
+            capture_profiler=not args.no_profiler,
+            export_chrome_trace=not args.no_chrome_trace,
+            with_stack=args.with_stack,
+            with_flops=not args.no_flops,
+            command=tuple(sys.argv),
+        )
+    )
+    print("TorchInferno profile run")
+    print(f"output_dir={artifacts.output_dir}")
+    print(f"manifest={artifacts.manifest}")
+    print(f"repro={artifacts.repro}")
+    if artifacts.chrome_trace is not None:
+        print(f"chrome_trace={artifacts.chrome_trace}")
+    if artifacts.graph_json is not None:
+        print(f"graph_json={artifacts.graph_json}")
+    return 0
+
+
 def run_capture_logits(args: argparse.Namespace) -> int:
     device = torch.device(args.device) if args.device else _default_device()
     model = load_model_auto(
@@ -612,6 +659,42 @@ def build_parser() -> argparse.ArgumentParser:
     perf.add_argument("--iters", type=int, default=10)
     perf.add_argument("--seed", type=int, default=0)
     perf.set_defaults(func=run_perf_smoke)
+
+    profile = subparsers.add_parser(
+        "profile-run",
+        help="Run one model generation and write graph/profile/memory artifacts.",
+    )
+    profile.add_argument(
+        "output_dir",
+        nargs="?",
+        default=None,
+        help="Artifact directory; defaults to .torchinferno_runs/<model>-<timestamp>.",
+    )
+    profile.add_argument("--model-kind", choices=["dsv4", "deepseek"], default="dsv4")
+    profile.add_argument("--device", default=None, help="Torch device, defaults to cuda when available.")
+    profile.add_argument("--dtype", choices=["float32", "float16", "bfloat16"], default="float32")
+    profile.add_argument("--seed", type=int, default=0)
+    profile.add_argument("--batch-size", type=int, default=1)
+    profile.add_argument("--prompt-tokens", type=int, default=8)
+    profile.add_argument("--new-tokens", type=int, default=8)
+    profile.add_argument("--vocab-size", type=int, default=128)
+    profile.add_argument("--temperature", type=float, default=0.0)
+    profile.add_argument(
+        "--compile",
+        action="store_true",
+        help="Compile the model before the profiled generation run.",
+    )
+    profile.add_argument("--cache-backend", choices=["dense", "paged"], default="dense")
+    profile.add_argument("--page-size", type=int, default=16)
+    profile.add_argument("--warmup", type=int, default=1)
+    profile.add_argument("--no-graph", action="store_true", help="Skip make_fx graph capture.")
+    profile.add_argument("--fake-graph", action="store_true", help="Try graph capture under FakeTensorMode.")
+    profile.add_argument("--require-graph", action="store_true", help="Fail the run if graph capture fails.")
+    profile.add_argument("--no-profiler", action="store_true", help="Skip torch.profiler capture.")
+    profile.add_argument("--no-chrome-trace", action="store_true", help="Do not export chrome_trace.json.")
+    profile.add_argument("--with-stack", action="store_true", help="Capture Python stack traces in the profiler.")
+    profile.add_argument("--no-flops", action="store_true", help="Disable profiler FLOP estimation.")
+    profile.set_defaults(func=run_profile_run)
 
     capture = subparsers.add_parser("capture-logits", help="Capture a known-logit reference for a checkpoint.")
     capture.add_argument("model", help="Local checkpoint directory or Hugging Face repo ID.")

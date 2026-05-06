@@ -61,6 +61,11 @@ def build_audit_report() -> TorchInfernoAudit:
         features=(
             FeatureAudit("torch.compile", "integrated", "CompileConfig and CLI smoke cover eager-to-compiled policy."),
             FeatureAudit("make_fx/fake tensors", "integrated", "Trace helper supports make_fx with FakeTensorMode."),
+            FeatureAudit(
+                "profile artifact loop",
+                "integrated",
+                "profile-run writes graph/profile/memory artifacts and a standalone repro.",
+            ),
             FeatureAudit("fake process groups", "integrated", "Single-process fake collectives cover distributed policy tests."),
             FeatureAudit("monarch", "adapter", "Runtime detects Monarch and otherwise routes to FakeProcessWorld."),
             FeatureAudit("flex attention", "reference", "Fallback q/k/v contract exists; real flex dispatch is still future work."),
