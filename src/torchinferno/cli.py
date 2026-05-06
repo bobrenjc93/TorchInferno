@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 import sys
 import time
@@ -26,9 +27,11 @@ from torchinferno.profiling import (
     PatternProfileConfig,
     ProfileRunConfig,
     RegionProfileConfig,
+    SubgraphProfileConfig,
     run_pattern_profile_capture,
     run_profile_capture,
     run_region_profile_capture,
+    run_subgraph_profile_capture,
 )
 from torchinferno.research import ExperimentResult, ResearchHarness
 from torchinferno.research.benchmarks import benchmark_callable
@@ -533,6 +536,51 @@ def run_profile_pattern(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_profile_subgraph(args: argparse.Namespace) -> int:
+    artifacts = run_subgraph_profile_capture(
+        SubgraphProfileConfig(
+            output_dir=Path(args.output_dir),
+            source_run_dir=Path(args.source_run),
+            node_ids=_parse_node_ids(args.nodes),
+            device=args.device,
+            warmup=args.warmup,
+            iters=args.iters,
+            capture_profiler=not args.no_profiler,
+            export_chrome_trace=not args.no_chrome_trace,
+            with_stack=args.with_stack,
+            with_flops=not args.no_flops,
+            command=tuple(sys.argv),
+        )
+    )
+    print("TorchInferno subgraph profile")
+    print(f"output_dir={artifacts.output_dir}")
+    print(f"manifest={artifacts.manifest}")
+    print(f"subgraph_spec={artifacts.subgraph_spec}")
+    print(f"subgraph_graph={artifacts.subgraph_graph}")
+    print(f"repro={artifacts.repro}")
+    if artifacts.chrome_trace is not None:
+        print(f"chrome_trace={artifacts.chrome_trace}")
+    return 0
+
+
+def run_profile_nodes(args: argparse.Namespace) -> int:
+    graph_path = Path(args.graph_or_run)
+    if graph_path.is_dir():
+        graph_path = graph_path / "graph.json"
+    graph = json.loads(graph_path.read_text())
+    needle = args.grep.lower() if args.grep is not None else None
+    for fallback_id, node in enumerate(graph["nodes"]):
+        node_id = node.get("id", fallback_id)
+        name = str(node["name"])
+        op = str(node["op"])
+        target = str(node["target"])
+        haystack = f"{node_id} {name} {op} {target}".lower()
+        if needle is not None and needle not in haystack:
+            continue
+        print(f"{node_id:04d} {op:14s} {name:32s} {target}")
+    return 0
+
+
 def run_capture_logits(args: argparse.Namespace) -> int:
     device = torch.device(args.device) if args.device else _default_device()
     model = load_model_auto(
@@ -631,6 +679,24 @@ def run_deepseek_convert(args: argparse.Namespace) -> int:
     print(report.summary())
     print(f"wrote={args.output_dir}")
     return 0 if report.compatible else 2
+
+
+def _parse_node_ids(values: list[str]) -> tuple[int, ...]:
+    node_ids: list[int] = []
+    for value in values:
+        for part in value.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            if ":" in part:
+                start_text, end_text = part.split(":", 1)
+                start = int(start_text)
+                end = int(end_text)
+                step = 1 if end >= start else -1
+                node_ids.extend(range(start, end + step, step))
+            else:
+                node_ids.append(int(part))
+    return tuple(dict.fromkeys(node_ids))
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -881,6 +947,35 @@ def build_parser() -> argparse.ArgumentParser:
     profile_pattern.add_argument("--with-stack", action="store_true", help="Capture Python stack traces in the profiler.")
     profile_pattern.add_argument("--no-flops", action="store_true", help="Disable profiler FLOP estimation.")
     profile_pattern.set_defaults(func=run_profile_pattern)
+
+    profile_subgraph = subparsers.add_parser(
+        "profile-subgraph",
+        help="Extract node ids from a prior profile-run graph and profile only that FX subgraph.",
+    )
+    profile_subgraph.add_argument("output_dir")
+    profile_subgraph.add_argument("--source-run", required=True, help="Artifact directory produced by profile-run.")
+    profile_subgraph.add_argument(
+        "--nodes",
+        nargs="+",
+        required=True,
+        help="Node ids, comma lists, or inclusive ranges such as 42 43 44 or 42:50.",
+    )
+    profile_subgraph.add_argument("--device", default=None, help="Override source run device.")
+    profile_subgraph.add_argument("--warmup", type=int, default=3)
+    profile_subgraph.add_argument("--iters", type=int, default=10)
+    profile_subgraph.add_argument("--no-profiler", action="store_true", help="Skip torch.profiler capture.")
+    profile_subgraph.add_argument("--no-chrome-trace", action="store_true", help="Do not export chrome_trace.json.")
+    profile_subgraph.add_argument("--with-stack", action="store_true", help="Capture Python stack traces in the profiler.")
+    profile_subgraph.add_argument("--no-flops", action="store_true", help="Disable profiler FLOP estimation.")
+    profile_subgraph.set_defaults(func=run_profile_subgraph)
+
+    profile_nodes = subparsers.add_parser(
+        "profile-nodes",
+        help="Print labeled node ids from a profile-run graph.json or artifact directory.",
+    )
+    profile_nodes.add_argument("graph_or_run", help="graph.json path or a profile-run artifact directory.")
+    profile_nodes.add_argument("--grep", default=None, help="Filter by id, name, op, or target substring.")
+    profile_nodes.set_defaults(func=run_profile_nodes)
 
     capture = subparsers.add_parser("capture-logits", help="Capture a known-logit reference for a checkpoint.")
     capture.add_argument("model", help="Local checkpoint directory or Hugging Face repo ID.")

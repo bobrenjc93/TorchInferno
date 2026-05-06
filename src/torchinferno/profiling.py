@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields, replace
 from datetime import datetime, timezone
 import json
 from pathlib import Path
@@ -144,12 +144,62 @@ class PatternProfileArtifacts:
 
 
 @dataclass(frozen=True)
+class SubgraphProfileConfig:
+    output_dir: Path
+    source_run_dir: Path
+    node_ids: tuple[int, ...]
+    device: str | None = None
+    warmup: int = 3
+    iters: int = 10
+    capture_profiler: bool = True
+    export_chrome_trace: bool = True
+    with_stack: bool = False
+    with_flops: bool = True
+    command: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class SubgraphProfileArtifacts:
+    output_dir: Path
+    manifest: Path
+    run_config: Path
+    environment: Path
+    source_graph: Path
+    subgraph_spec: Path
+    subgraph_graph: Path
+    subgraph_text: Path
+    subgraph_code: Path
+    output: Path
+    memory_profile: Path
+    operator_profile: Path | None
+    chrome_trace: Path | None
+    repro: Path
+
+
+@dataclass(frozen=True)
 class _RegionWorkload:
     module_path: str
     module_class: str
     fn: Callable[..., Any]
     args: tuple[Any, ...]
     input_names: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class _SubgraphBoundary:
+    arg_name: str
+    source_id: int
+    source_name: str
+    source_op: str
+    source_target: str
+
+
+@dataclass(frozen=True)
+class _ExtractedSubgraph:
+    graph_module: torch.fx.GraphModule
+    boundaries: tuple[_SubgraphBoundary, ...]
+    output_nodes: tuple[torch.fx.Node, ...]
+    selected_nodes: tuple[torch.fx.Node, ...]
 
 
 def run_profile_capture(config: ProfileRunConfig) -> ProfileRunArtifacts:
@@ -547,6 +597,143 @@ def run_pattern_profile_capture(config: PatternProfileConfig) -> PatternProfileA
     return artifacts
 
 
+def run_subgraph_profile_capture(config: SubgraphProfileConfig) -> SubgraphProfileArtifacts:
+    """Extract and profile an arbitrary FX subgraph from a prior profile-run."""
+
+    if not config.node_ids:
+        raise ValueError("node_ids must contain at least one graph node id")
+    config = replace(config, source_run_dir=config.source_run_dir.resolve())
+    output_dir = config.output_dir
+    output_dir.mkdir(parents=True, exist_ok=True)
+    source_run_dir = config.source_run_dir
+    source_config = _load_profile_run_config(source_run_dir / "run_config.json")
+    device = _normalize_device(torch.device(config.device or source_config.device))
+    dtype = _dtype_from_name(source_config.dtype)
+    torch.manual_seed(source_config.seed)
+    if device.type == "cuda":
+        torch.cuda.manual_seed_all(source_config.seed)
+
+    effective_source_config = replace(source_config, output_dir=output_dir, device=str(device))
+    model = _build_model(effective_source_config).to(device=device, dtype=dtype).eval()
+    input_ids = _load_profile_input_ids(source_run_dir, effective_source_config, device)
+
+    def forward_only(ids: torch.Tensor) -> torch.Tensor:
+        logits, _ = model(ids, use_cache=False)
+        return logits
+
+    run_config_path = output_dir / "run_config.json"
+    environment_path = output_dir / "environment.json"
+    source_graph_path = output_dir / "source_graph.json"
+    subgraph_spec_path = output_dir / "subgraph_spec.json"
+    subgraph_graph_path = output_dir / "subgraph_graph.json"
+    subgraph_text_path = output_dir / "subgraph_graph.txt"
+    subgraph_code_path = output_dir / "subgraph_graph_module.py"
+    output_path = output_dir / "output.json"
+    memory_path = output_dir / "memory_profile.json"
+    operator_path = output_dir / "operator_profile.json" if config.capture_profiler else None
+    chrome_path = output_dir / "chrome_trace.json" if config.capture_profiler and config.export_chrome_trace else None
+    manifest_path = output_dir / "manifest.json"
+    repro_path = output_dir / "subgraph_repro.py"
+
+    _write_json(run_config_path, _subgraph_config_to_json(config))
+    _write_json(environment_path, _environment_payload(device))
+
+    graph_module = trace_with_make_fx(forward_only, input_ids, fake=False)
+    _write_json(source_graph_path, _graph_to_json(graph_module))
+    (output_dir / "source_graph.txt").write_text(str(graph_module.graph) + "\n")
+    (output_dir / "source_graph_module.py").write_text(graph_module.code)
+
+    extracted = _extract_fx_subgraph(graph_module, config.node_ids)
+    needed_value_names = {boundary.source_name for boundary in extracted.boundaries}
+    needed_value_names.update(node.name for node in extracted.output_nodes)
+    with torch.inference_mode():
+        node_values = _capture_graph_node_values(graph_module, (input_ids,), needed_value_names)
+    boundary_args = tuple(node_values[boundary.source_name] for boundary in extracted.boundaries)
+    expected_outputs = tuple(node_values[node.name] for node in extracted.output_nodes)
+    expected = expected_outputs[0] if len(expected_outputs) == 1 else expected_outputs
+
+    _write_json(subgraph_graph_path, _graph_to_json(extracted.graph_module))
+    subgraph_text_path.write_text(str(extracted.graph_module.graph) + "\n")
+    subgraph_code_path.write_text(extracted.graph_module.code)
+    source_ids = _node_id_map(graph_module)
+    _write_json(
+        subgraph_spec_path,
+        {
+            "source_run_dir": str(source_run_dir),
+            "requested_node_ids": list(config.node_ids),
+            "selected_nodes": [_node_summary(node, source_ids[node]) for node in extracted.selected_nodes],
+            "boundary_inputs": [asdict(boundary) for boundary in extracted.boundaries],
+            "output_nodes": [_node_summary(node, source_ids[node]) for node in extracted.output_nodes],
+            "boundary_values": [_value_summary(arg) for arg in boundary_args],
+        },
+    )
+
+    for _ in range(config.warmup):
+        with torch.inference_mode():
+            extracted.graph_module(*boundary_args)
+    _sync_if_needed(device)
+    memory_before = _memory_snapshot(device)
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
+    result, elapsed_ms, profiler = _profile_callable(
+        extracted.graph_module,
+        boundary_args,
+        label="torchinferno.subgraph",
+        device=device,
+        iters=config.iters,
+        capture_profiler=config.capture_profiler,
+        with_stack=config.with_stack,
+        with_flops=config.with_flops,
+    )
+    memory_after = _memory_snapshot(device)
+
+    _write_json(
+        output_path,
+        {
+            "elapsed_ms": elapsed_ms,
+            "iters": config.iters,
+            "per_iter_ms": elapsed_ms / max(1, config.iters),
+            "max_abs_diff_vs_source": _max_abs_diff(expected, result),
+            "expected_output": _value_summary(expected),
+            "output": _value_summary(result),
+        },
+    )
+    _write_json(memory_path, {"before": memory_before, "after": memory_after})
+    if profiler is not None:
+        assert operator_path is not None
+        _write_json(operator_path, _profiler_key_averages(profiler))
+        if chrome_path is not None:
+            profiler.export_chrome_trace(str(chrome_path))
+    _write_subgraph_repro(repro_path, config)
+
+    artifacts = SubgraphProfileArtifacts(
+        output_dir=output_dir,
+        manifest=manifest_path,
+        run_config=run_config_path,
+        environment=environment_path,
+        source_graph=source_graph_path,
+        subgraph_spec=subgraph_spec_path,
+        subgraph_graph=subgraph_graph_path,
+        subgraph_text=subgraph_text_path,
+        subgraph_code=subgraph_code_path,
+        output=output_path,
+        memory_profile=memory_path,
+        operator_profile=operator_path,
+        chrome_trace=chrome_path,
+        repro=repro_path,
+    )
+    _write_json(
+        manifest_path,
+        {
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "output_dir": str(output_dir),
+            "artifacts": _subgraph_artifact_manifest(artifacts),
+        },
+    )
+    _write_subgraph_readme(output_dir / "README.md", artifacts)
+    return artifacts
+
+
 def _build_model(config: ProfileRunConfig) -> DSv4ForCausalLM | DeepSeekV32ForCausalLM:
     max_seq_len = config.prompt_tokens + config.new_tokens + 8
     if config.model_kind == "dsv4":
@@ -590,9 +777,11 @@ def _trace_forward_graph(
 
 def _graph_to_json(graph_module: torch.fx.GraphModule) -> dict[str, Any]:
     nodes = []
-    for node in graph_module.graph.nodes:
+    for node_id, node in enumerate(graph_module.graph.nodes):
         nodes.append(
             {
+                "id": node_id,
+                "label": f"{node_id}:{node.name}",
                 "name": node.name,
                 "op": node.op,
                 "target": str(node.target),
@@ -766,6 +955,28 @@ def _pattern_artifact_manifest(artifacts: PatternProfileArtifacts) -> dict[str, 
     }
 
 
+def _subgraph_artifact_manifest(artifacts: SubgraphProfileArtifacts) -> dict[str, str | None]:
+    output_dir = artifacts.output_dir
+
+    def rel(path: Path | None) -> str | None:
+        return str(path.relative_to(output_dir)) if path is not None else None
+
+    return {
+        "run_config": rel(artifacts.run_config),
+        "environment": rel(artifacts.environment),
+        "source_graph": rel(artifacts.source_graph),
+        "subgraph_spec": rel(artifacts.subgraph_spec),
+        "subgraph_graph": rel(artifacts.subgraph_graph),
+        "subgraph_text": rel(artifacts.subgraph_text),
+        "subgraph_code": rel(artifacts.subgraph_code),
+        "output": rel(artifacts.output),
+        "memory_profile": rel(artifacts.memory_profile),
+        "operator_profile": rel(artifacts.operator_profile),
+        "chrome_trace": rel(artifacts.chrome_trace),
+        "repro": rel(artifacts.repro),
+    }
+
+
 def _build_region_workload(
     model: DSv4ForCausalLM | DeepSeekV32ForCausalLM,
     region: str,
@@ -922,6 +1133,164 @@ def _write_graph_artifacts(output_dir: Path, prefix: str, graph_module: torch.fx
     (output_dir / f"{prefix}_graph_module.py").write_text(graph_module.code)
 
 
+def _load_profile_run_config(path: Path) -> ProfileRunConfig:
+    payload = json.loads(path.read_text())
+    field_names = {field.name for field in fields(ProfileRunConfig)}
+    kwargs = {key: value for key, value in payload.items() if key in field_names}
+    kwargs["output_dir"] = Path(kwargs.get("output_dir", path.parent))
+    kwargs["command"] = tuple(kwargs.get("command", ()))
+    return ProfileRunConfig(**kwargs)
+
+
+def _load_profile_input_ids(
+    source_run_dir: Path,
+    source_config: ProfileRunConfig,
+    device: torch.device,
+) -> torch.Tensor:
+    input_path = source_run_dir / "input_ids.json"
+    if input_path.exists():
+        payload = json.loads(input_path.read_text())
+        return torch.tensor(payload["input_ids"], device=device, dtype=torch.long)
+    return torch.randint(
+        0,
+        source_config.vocab_size,
+        (source_config.batch_size, source_config.prompt_tokens),
+        device=device,
+        dtype=torch.long,
+    )
+
+
+def _capture_graph_node_values(
+    graph_module: torch.fx.GraphModule,
+    args: tuple[Any, ...],
+    stop_after_names: set[str] | None = None,
+) -> dict[str, Any]:
+    class CaptureComplete(Exception):
+        pass
+
+    class CaptureInterpreter(torch.fx.Interpreter):
+        def __init__(self, module: torch.fx.GraphModule) -> None:
+            super().__init__(module)
+            self.values: dict[str, Any] = {}
+
+        def run_node(self, node: torch.fx.Node) -> Any:
+            result = super().run_node(node)
+            self.values[node.name] = result
+            if stop_after_names is not None and stop_after_names.issubset(self.values):
+                raise CaptureComplete
+            return result
+
+    interpreter = CaptureInterpreter(graph_module)
+    try:
+        interpreter.run(*args)
+    except CaptureComplete:
+        pass
+    if stop_after_names is not None:
+        missing = sorted(stop_after_names - interpreter.values.keys())
+        if missing:
+            raise RuntimeError(f"failed to capture requested graph node values: {missing}")
+    return interpreter.values
+
+
+def _extract_fx_subgraph(
+    graph_module: torch.fx.GraphModule,
+    requested_node_ids: tuple[int, ...],
+) -> _ExtractedSubgraph:
+    source_ids = _node_id_map(graph_module)
+    id_to_node = {node_id: node for node, node_id in source_ids.items()}
+    unique_ids = tuple(dict.fromkeys(requested_node_ids))
+    missing = [node_id for node_id in unique_ids if node_id not in id_to_node]
+    if missing:
+        raise ValueError(f"unknown graph node ids: {missing}")
+
+    requested_nodes = tuple(id_to_node[node_id] for node_id in unique_ids)
+    selected_set = {node for node in requested_nodes if node.op not in {"placeholder", "output"}}
+    compute_nodes = tuple(node for node in requested_nodes if node.op not in {"placeholder", "output", "get_attr"})
+    if not compute_nodes:
+        raise ValueError("subgraph selection must include at least one compute node")
+
+    new_graph = torch.fx.Graph()
+    env: dict[torch.fx.Node, torch.fx.Node] = {}
+    boundary_by_source: dict[torch.fx.Node, _SubgraphBoundary] = {}
+
+    def copy_get_attr(source: torch.fx.Node) -> torch.fx.Node:
+        if source not in env:
+            copied = new_graph.get_attr(source.target)
+            copied.meta = dict(source.meta)
+            env[source] = copied
+        return env[source]
+
+    def boundary_for(source: torch.fx.Node) -> torch.fx.Node:
+        if source in env:
+            return env[source]
+        arg_name = f"in_{source.name}"
+        placeholder = new_graph.placeholder(arg_name)
+        placeholder.meta = dict(source.meta)
+        env[source] = placeholder
+        boundary_by_source[source] = _SubgraphBoundary(
+            arg_name=arg_name,
+            source_id=source_ids[source],
+            source_name=source.name,
+            source_op=source.op,
+            source_target=str(source.target),
+        )
+        return placeholder
+
+    def map_input(value: torch.fx.Node) -> torch.fx.Node:
+        if value in env:
+            return env[value]
+        if value in selected_set:
+            raise ValueError(f"selected node {value.name!r} is used before it is copied")
+        if value.op == "get_attr":
+            return copy_get_attr(value)
+        return boundary_for(value)
+
+    for source in graph_module.graph.nodes:
+        if source not in selected_set:
+            continue
+        if source.op == "get_attr":
+            copy_get_attr(source)
+            continue
+        copied = new_graph.node_copy(source, map_input)
+        copied.meta = dict(source.meta)
+        env[source] = copied
+
+    output_nodes = tuple(
+        node
+        for node in requested_nodes
+        if node.op not in {"placeholder", "output", "get_attr"}
+        and not any(user in selected_set and user.op != "output" for user in node.users)
+    )
+    if not output_nodes:
+        output_nodes = (compute_nodes[-1],)
+    if len(output_nodes) == 1:
+        new_graph.output(env[output_nodes[0]])
+    else:
+        new_graph.output(tuple(env[node] for node in output_nodes))
+    new_graph.lint()
+    subgraph_module = torch.fx.GraphModule(graph_module, new_graph)
+    subgraph_module.recompile()
+    return _ExtractedSubgraph(
+        graph_module=subgraph_module,
+        boundaries=tuple(boundary_by_source.values()),
+        output_nodes=output_nodes,
+        selected_nodes=requested_nodes,
+    )
+
+
+def _node_id_map(graph_module: torch.fx.GraphModule) -> dict[torch.fx.Node, int]:
+    return {node: node_id for node_id, node in enumerate(graph_module.graph.nodes)}
+
+
+def _node_summary(node: torch.fx.Node, node_id: int) -> dict[str, Any]:
+    return {
+        "id": node_id,
+        "name": node.name,
+        "op": node.op,
+        "target": str(node.target),
+    }
+
+
 def _max_abs_diff(left: Any, right: Any) -> float | None:
     if isinstance(left, torch.Tensor) and isinstance(right, torch.Tensor):
         if left.numel() == 0 and right.numel() == 0:
@@ -980,6 +1349,15 @@ def _region_config_to_json(config: RegionProfileConfig) -> dict[str, Any]:
 def _pattern_config_to_json(config: PatternProfileConfig) -> dict[str, Any]:
     payload = asdict(config)
     payload["output_dir"] = str(config.output_dir)
+    payload["command"] = list(config.command)
+    return payload
+
+
+def _subgraph_config_to_json(config: SubgraphProfileConfig) -> dict[str, Any]:
+    payload = asdict(config)
+    payload["output_dir"] = str(config.output_dir)
+    payload["source_run_dir"] = str(config.source_run_dir)
+    payload["node_ids"] = list(config.node_ids)
     payload["command"] = list(config.command)
     return payload
 
@@ -1088,6 +1466,52 @@ if __name__ == "__main__":
     path.chmod(0o755)
 
 
+def _write_subgraph_repro(path: Path, config: SubgraphProfileConfig) -> None:
+    source = f'''#!/usr/bin/env python3
+from __future__ import annotations
+
+from pathlib import Path
+import argparse
+import sys
+
+REPO_ROOT = Path({str(Path.cwd())!r})
+if (REPO_ROOT / "src").exists():
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+
+from torchinferno.profiling import SubgraphProfileConfig, run_subgraph_profile_capture
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--output-dir", default="subgraph_repro_artifacts")
+    parser.add_argument("--device", default={config.device!r})
+    parser.add_argument("--source-run", default={str(config.source_run_dir)!r})
+    args = parser.parse_args()
+    artifacts = run_subgraph_profile_capture(
+        SubgraphProfileConfig(
+            output_dir=Path(args.output_dir),
+            source_run_dir=Path(args.source_run),
+            node_ids={config.node_ids!r},
+            device=args.device,
+            warmup={config.warmup!r},
+            iters={config.iters!r},
+            capture_profiler={config.capture_profiler!r},
+            export_chrome_trace={config.export_chrome_trace!r},
+            with_stack={config.with_stack!r},
+            with_flops={config.with_flops!r},
+        )
+    )
+    print(artifacts.manifest)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+'''
+    path.write_text(source)
+    path.chmod(0o755)
+
+
 def _write_focus_readme(path: Path, kind: str, artifacts: FocusProfileArtifacts) -> None:
     path.write_text(
         f"# TorchInferno {kind.title()} Profile\n\n"
@@ -1112,6 +1536,20 @@ def _write_pattern_readme(path: Path, artifacts: PatternProfileArtifacts) -> Non
         "- `reference_profile.json` and `optimized_profile.json`: profiler key averages.\n"
         "- `comparison.json`: timing, speedup, and max_abs_diff.\n"
         "- `pattern_repro.py`: rerun this profile in a fresh artifact directory.\n"
+    )
+
+
+def _write_subgraph_readme(path: Path, artifacts: SubgraphProfileArtifacts) -> None:
+    path.write_text(
+        "# TorchInferno Subgraph Profile\n\n"
+        "Key files:\n\n"
+        "- `source_graph.json`: re-traced full graph with stable integer node ids.\n"
+        "- `subgraph_spec.json`: selected ids, boundary inputs, and output nodes.\n"
+        "- `subgraph_graph.json`: extracted callable FX graph.\n"
+        "- `operator_profile.json`: profiler key averages for only this subgraph.\n"
+        "- `chrome_trace.json`: trace viewer artifact when profiler export is enabled.\n"
+        "- `memory_profile.json`: allocator snapshot before and after subgraph profiling.\n"
+        "- `subgraph_repro.py`: rerun this extraction/profile in a fresh artifact directory.\n"
     )
 
 

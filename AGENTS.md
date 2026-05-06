@@ -17,6 +17,9 @@ PYTHONPATH=src python3 -m torchinferno.cli sim-smoke
 PYTHONPATH=src python3 -m torchinferno.cli traffic-smoke
 PYTHONPATH=src python3 -m torchinferno.cli serve-smoke --device cpu --cache-backend paged
 PYTHONPATH=src python3 -m torchinferno.cli perf-smoke --device cpu --heads 2 --seq-len 8 --head-dim 8 --value-dim 8
+PYTHONPATH=src python3 -m torchinferno.cli profile-run .torchinferno_runs/dsv4-cpu --device cpu --warmup 0 --no-profiler
+PYTHONPATH=src python3 -m torchinferno.cli profile-nodes .torchinferno_runs/dsv4-cpu --grep embedding
+PYTHONPATH=src python3 -m torchinferno.cli profile-subgraph .torchinferno_runs/embedding-cpu --source-run .torchinferno_runs/dsv4-cpu --nodes 3 --device cpu --warmup 0 --iters 1
 PYTHONPATH=src python3 -m torchinferno.cli profile-region .torchinferno_runs/attn0-cpu --region layers.0.attn --device cpu --warmup 0 --iters 1
 PYTHONPATH=src python3 -m torchinferno.cli profile-pattern .torchinferno_runs/swiglu-pattern-cpu --device cpu --warmup 0 --iters 1
 ```
@@ -29,6 +32,10 @@ The same core checks are available as `make audit`, `make test`, and
 
 - Use `profile-run` when you need a full generation graph, memory profile,
   Chrome trace, and standalone `repro.py`.
+- Use `profile-nodes` and `profile-subgraph` when a module boundary is too
+  coarse. `profile-subgraph` accepts integer node ids, comma lists, or ranges
+  from a prior `profile-run` graph and emits a callable FX slice with boundary
+  inputs and source-output comparison.
 - Use `profile-region` when you want to optimize one module path such as
   `layers.0.attn`, `layers.0.moe`, or `model.layers.0.self_attn`.
 - Use `profile-pattern` when you are working on graph replacement. It writes

@@ -57,7 +57,8 @@ to grow toward production-grade SOTA inference.
   DeepSeek-V3.2-NVFP4 kernels.
 - Local performance benchmark smoke for reference versus specialized paths.
 - Whole-model, focused-region, and pattern-replacement profile artifact loops
-  that emit graphs, profiler JSON, traces, memory data, and repro scripts.
+  plus arbitrary FX subgraph extraction by node id. These emit graphs, profiler
+  JSON, traces, memory data, and repro scripts.
 - Minimal auto research harness for comparing scheduler/cache/routing policies.
 
 ## Quickstart
@@ -85,6 +86,8 @@ PYTHONPATH=src python3 -m torchinferno.cli disagg-init .torchinferno_disagg --pr
 PYTHONPATH=src python3 -m torchinferno.cli serve-smoke --device cpu
 PYTHONPATH=src python3 -m torchinferno.cli perf-smoke
 PYTHONPATH=src python3 -m torchinferno.cli profile-run .torchinferno_runs/dsv4-cpu --device cpu
+PYTHONPATH=src python3 -m torchinferno.cli profile-nodes .torchinferno_runs/dsv4-cpu --grep embedding
+PYTHONPATH=src python3 -m torchinferno.cli profile-subgraph .torchinferno_runs/subgraph-cpu --source-run .torchinferno_runs/dsv4-cpu --nodes 3 --device cpu
 PYTHONPATH=src python3 -m torchinferno.cli profile-region .torchinferno_runs/attn0-cpu --region layers.0.attn --device cpu
 PYTHONPATH=src python3 -m torchinferno.cli profile-pattern .torchinferno_runs/swiglu-pattern-cpu --device cpu
 PYTHONPATH=src python3 -m torchinferno.cli research-smoke
@@ -206,7 +209,8 @@ The output directory contains:
 - `manifest.json`: artifact index.
 - `run_config.json` and `environment.json`: exact run setup.
 - `input_ids.json` and `output.json`: deterministic repro inputs and tokens.
-- `graph.json`, `graph.txt`, and `graph_module.py`: captured forward graph.
+- `graph.json`, `graph.txt`, and `graph_module.py`: captured forward graph;
+  each JSON node has a stable integer `id` for subgraph extraction.
 - `operator_profile.json`: `torch.profiler` key averages as JSON.
 - `chrome_trace.json`: Chrome/Perfetto trace from `torch.profiler`.
 - `memory_profile.json`: CUDA allocator stats when running on GPU.
@@ -222,6 +226,34 @@ PYTHONPATH=src python3 -m torchinferno.cli profile-run .torchinferno_runs/deepse
 
 python3 .torchinferno_runs/dsv4-gpu/repro.py --device cuda
 ```
+
+To inspect node ids from a captured graph:
+
+```bash
+PYTHONPATH=src python3 -m torchinferno.cli profile-nodes .torchinferno_runs/dsv4-gpu
+PYTHONPATH=src python3 -m torchinferno.cli profile-nodes .torchinferno_runs/dsv4-gpu --grep rms
+```
+
+To profile an arbitrary FX slice, pass node ids from the source run. `--nodes`
+accepts ids, comma lists, and inclusive ranges such as `42 43`, `42,43`, or
+`42:50`. TorchInferno re-traces the source workload, cuts the selected nodes
+into a standalone callable graph, turns outside dependencies into boundary
+inputs, profiles only that callable, and compares its output against the same
+nodes in the full graph.
+
+```bash
+PYTHONPATH=src python3 -m torchinferno.cli profile-subgraph .torchinferno_runs/rms-slice-gpu \
+  --source-run .torchinferno_runs/dsv4-gpu \
+  --nodes 42:50 \
+  --device cuda \
+  --iters 50
+```
+
+Subgraph directories contain `source_graph.json`, `subgraph_spec.json`,
+`subgraph_graph.json`, `subgraph_graph.txt`, `subgraph_graph_module.py`,
+`operator_profile.json`, `chrome_trace.json`, `memory_profile.json`,
+`output.json`, and `subgraph_repro.py`. `subgraph_spec.json` records selected
+nodes, boundary inputs, and output nodes.
 
 To zoom into one module without booting a serving stack, use `profile-region`.
 The region name is a normal module path such as `layers.0.attn`,
@@ -510,6 +542,7 @@ Implemented as working code and tests:
 - One-command profile artifact capture with graph JSON, profiler JSON, memory
   JSON, Chrome trace export, and standalone repro generation.
 - Focused module-region profiling with isolated graphs/profiles/repros.
+- Arbitrary graph subgraph extraction/profile by stable node id.
 - Pattern-profile loop for comparing reference subgraphs against registered
   kernel replacements.
 - `torch.compile` smoke path.

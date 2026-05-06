@@ -27,9 +27,12 @@ from torchinferno.profiling import (
     ProfileRunArtifacts,
     ProfileRunConfig,
     RegionProfileConfig,
+    SubgraphProfileArtifacts,
+    SubgraphProfileConfig,
     run_pattern_profile_capture,
     run_profile_capture,
     run_region_profile_capture,
+    run_subgraph_profile_capture,
 )
 from torchinferno.tokenization import load_text_tokenizer
 from torchinferno.validation import (
@@ -56,6 +59,8 @@ __all__ = [
     "ProfileRunArtifacts",
     "ProfileRunConfig",
     "RegionProfileConfig",
+    "SubgraphProfileArtifacts",
+    "SubgraphProfileConfig",
     "TorchInfernoAudit",
     "ValidationResult",
     "audit_deepseek_checkpoint",
@@ -77,6 +82,7 @@ __all__ = [
     "run_pattern_profile_capture",
     "run_profile_capture",
     "run_region_profile_capture",
+    "run_subgraph_profile_capture",
     "save_logit_reference",
     "tiny_deepseek_v32_config",
     "tiny_dsv4_config",

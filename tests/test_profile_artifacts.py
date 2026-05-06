@@ -7,9 +7,11 @@ from torchinferno.profiling import (
     PatternProfileConfig,
     ProfileRunConfig,
     RegionProfileConfig,
+    SubgraphProfileConfig,
     run_pattern_profile_capture,
     run_profile_capture,
     run_region_profile_capture,
+    run_subgraph_profile_capture,
 )
 
 
@@ -249,3 +251,132 @@ def test_profile_focus_cli_commands_write_manifests(tmp_path) -> None:
     assert "TorchInferno pattern profile" in pattern.stdout
     assert region_manifest["artifacts"]["operator_profile"] is None
     assert pattern_manifest["artifacts"]["pass_report"] == "pass_report.json"
+
+
+def test_subgraph_profile_extracts_node_ids_from_source_run(tmp_path) -> None:
+    source_dir = tmp_path / "source"
+    source = run_profile_capture(
+        ProfileRunConfig(
+            output_dir=source_dir,
+            device="cpu",
+            batch_size=1,
+            prompt_tokens=2,
+            new_tokens=1,
+            warmup=0,
+            capture_profiler=False,
+        )
+    )
+    graph = json.loads(source.graph_json.read_text())
+    embedding_id = next(node["id"] for node in graph["nodes"] if node["target"] == "aten.embedding.default")
+
+    artifacts = run_subgraph_profile_capture(
+        SubgraphProfileConfig(
+            output_dir=tmp_path / "subgraph",
+            source_run_dir=source_dir,
+            node_ids=(embedding_id,),
+            device="cpu",
+            warmup=0,
+            iters=1,
+        )
+    )
+
+    spec = json.loads(artifacts.subgraph_spec.read_text())
+    output = json.loads(artifacts.output.read_text())
+    subgraph = json.loads(artifacts.subgraph_graph.read_text())
+
+    assert spec["requested_node_ids"] == [embedding_id]
+    assert spec["boundary_inputs"][0]["source_op"] == "placeholder"
+    assert output["max_abs_diff_vs_source"] == 0.0
+    assert any(node["target"] == "aten.embedding.default" for node in subgraph["nodes"])
+
+    subprocess.run(
+        [
+            sys.executable,
+            str(artifacts.repro),
+            "--device",
+            "cpu",
+            "--output-dir",
+            str(tmp_path / "subgraph-repro"),
+            "--source-run",
+            str(source_dir),
+        ],
+        check=True,
+        text=True,
+        capture_output=True,
+    )
+    assert (tmp_path / "subgraph-repro" / "subgraph_spec.json").exists()
+
+
+def test_subgraph_profile_cli_and_node_listing(tmp_path) -> None:
+    env = {**os.environ, "PYTHONPATH": "src"}
+    source_dir = tmp_path / "cli-source"
+    subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "torchinferno.cli",
+            "profile-run",
+            str(source_dir),
+            "--device",
+            "cpu",
+            "--batch-size",
+            "1",
+            "--prompt-tokens",
+            "2",
+            "--new-tokens",
+            "1",
+            "--warmup",
+            "0",
+            "--no-profiler",
+        ],
+        check=True,
+        env=env,
+        text=True,
+        capture_output=True,
+    )
+    nodes = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "torchinferno.cli",
+            "profile-nodes",
+            str(source_dir),
+            "--grep",
+            "embedding",
+        ],
+        check=True,
+        env=env,
+        text=True,
+        capture_output=True,
+    )
+    embedding_id = int(nodes.stdout.split()[0])
+    subgraph_dir = tmp_path / "cli-subgraph"
+    subgraph = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "torchinferno.cli",
+            "profile-subgraph",
+            str(subgraph_dir),
+            "--source-run",
+            str(source_dir),
+            "--nodes",
+            str(embedding_id),
+            "--device",
+            "cpu",
+            "--warmup",
+            "0",
+            "--iters",
+            "1",
+            "--no-profiler",
+        ],
+        check=True,
+        env=env,
+        text=True,
+        capture_output=True,
+    )
+
+    manifest = json.loads((subgraph_dir / "manifest.json").read_text())
+    assert "TorchInferno subgraph profile" in subgraph.stdout
+    assert manifest["artifacts"]["operator_profile"] is None
+    assert manifest["artifacts"]["subgraph_spec"] == "subgraph_spec.json"
