@@ -64,7 +64,7 @@ def build_audit_report() -> TorchInfernoAudit:
             FeatureAudit(
                 "profile artifact loop",
                 "integrated",
-                "profile-run writes graph/profile/memory artifacts and a standalone repro.",
+                "profile-run/profile-region/profile-pattern write focused graphs, profiles, traces, comparisons, and repros.",
             ),
             FeatureAudit("fake process groups", "integrated", "Single-process fake collectives cover distributed policy tests."),
             FeatureAudit("monarch", "adapter", "Runtime detects Monarch and otherwise routes to FakeProcessWorld."),

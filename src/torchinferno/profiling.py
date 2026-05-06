@@ -7,13 +7,16 @@ from pathlib import Path
 import platform
 import sys
 import time
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 
 import torch
 
 from torchinferno.compiler import CompileConfig, compile_forward
 from torchinferno.graph import trace_with_make_fx
+from torchinferno.graph.passes import PassRegistry
+from torchinferno.kernels.ops import fused_rmsnorm_swiglu_reference
 from torchinferno.kernels.ops import triton_available
+from torchinferno.kernels.passes import register_kernel_replacement_passes
 from torchinferno.models.deepseek import DeepSeekV32ForCausalLM, tiny_deepseek_v32_config
 from torchinferno.models.dsv4 import DSv4ForCausalLM, tiny_dsv4_config
 
@@ -61,6 +64,92 @@ class ProfileRunArtifacts:
     graph_text: Path | None
     graph_code: Path | None
     repro: Path
+
+
+@dataclass(frozen=True)
+class RegionProfileConfig:
+    output_dir: Path
+    region: str
+    model_kind: ModelKind = "dsv4"
+    device: str = "cuda"
+    dtype: str = "float32"
+    seed: int = 0
+    batch_size: int = 1
+    tokens: int = 8
+    vocab_size: int = 128
+    warmup: int = 3
+    iters: int = 10
+    fake_graph: bool = False
+    require_graph: bool = False
+    capture_profiler: bool = True
+    export_chrome_trace: bool = True
+    with_stack: bool = False
+    with_flops: bool = True
+    command: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class PatternProfileConfig:
+    output_dir: Path
+    pattern: str = "fused-rmsnorm-swiglu"
+    device: str = "cuda"
+    dtype: str = "float32"
+    seed: int = 0
+    batch_size: int = 1
+    tokens: int = 8
+    hidden_size: int = 128
+    warmup: int = 3
+    iters: int = 10
+    apply_passes: bool = True
+    fake_graph: bool = False
+    require_graph: bool = False
+    capture_profiler: bool = True
+    export_chrome_trace: bool = True
+    with_stack: bool = False
+    with_flops: bool = True
+    command: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class FocusProfileArtifacts:
+    output_dir: Path
+    manifest: Path
+    run_config: Path
+    environment: Path
+    output: Path
+    memory_profile: Path
+    operator_profile: Path | None
+    chrome_trace: Path | None
+    graph_json: Path | None
+    graph_text: Path | None
+    graph_code: Path | None
+    repro: Path
+
+
+@dataclass(frozen=True)
+class PatternProfileArtifacts:
+    output_dir: Path
+    manifest: Path
+    run_config: Path
+    environment: Path
+    comparison: Path
+    pass_report: Path
+    reference_profile: Path | None
+    optimized_profile: Path | None
+    reference_trace: Path | None
+    optimized_trace: Path | None
+    reference_graph: Path | None
+    optimized_graph: Path | None
+    repro: Path
+
+
+@dataclass(frozen=True)
+class _RegionWorkload:
+    module_path: str
+    module_class: str
+    fn: Callable[..., Any]
+    args: tuple[Any, ...]
+    input_names: tuple[str, ...]
 
 
 def run_profile_capture(config: ProfileRunConfig) -> ProfileRunArtifacts:
@@ -197,6 +286,264 @@ def run_profile_capture(config: ProfileRunConfig) -> ProfileRunArtifacts:
             "graph_error": graph_error,
         },
     )
+    return artifacts
+
+
+def run_region_profile_capture(config: RegionProfileConfig) -> FocusProfileArtifacts:
+    """Profile one named model region and write focused artifacts."""
+
+    output_dir = config.output_dir
+    output_dir.mkdir(parents=True, exist_ok=True)
+    device = _normalize_device(torch.device(config.device))
+    dtype = _dtype_from_name(config.dtype)
+    torch.manual_seed(config.seed)
+    if device.type == "cuda":
+        torch.cuda.manual_seed_all(config.seed)
+
+    model_config = ProfileRunConfig(
+        output_dir=output_dir,
+        model_kind=config.model_kind,
+        device=str(device),
+        dtype=config.dtype,
+        seed=config.seed,
+        batch_size=config.batch_size,
+        prompt_tokens=config.tokens,
+        new_tokens=1,
+        vocab_size=config.vocab_size,
+        warmup=0,
+    )
+    model = _build_model(model_config).to(device=device, dtype=dtype).eval()
+    workload = _build_region_workload(model, config.region, config.batch_size, config.tokens, device, dtype)
+
+    run_config_path = output_dir / "run_config.json"
+    environment_path = output_dir / "environment.json"
+    output_path = output_dir / "output.json"
+    memory_path = output_dir / "memory_profile.json"
+    operator_path = output_dir / "operator_profile.json" if config.capture_profiler else None
+    chrome_path = output_dir / "chrome_trace.json" if config.capture_profiler and config.export_chrome_trace else None
+    graph_json_path = output_dir / "region_graph.json"
+    graph_text_path = output_dir / "region_graph.txt"
+    graph_code_path = output_dir / "region_graph_module.py"
+    manifest_path = output_dir / "manifest.json"
+    repro_path = output_dir / "region_repro.py"
+
+    _write_json(run_config_path, _region_config_to_json(config))
+    _write_json(environment_path, _environment_payload(device))
+    _write_json(
+        output_dir / "region_spec.json",
+        {
+            "region": config.region,
+            "resolved_module_path": workload.module_path,
+            "module_class": workload.module_class,
+            "input_names": list(workload.input_names),
+            "inputs": [_value_summary(arg) for arg in workload.args],
+        },
+    )
+
+    graph_error: dict[str, Any] | None = None
+    try:
+        graph_module = trace_with_make_fx(workload.fn, *workload.args, fake=config.fake_graph)
+        _write_json(graph_json_path, _graph_to_json(graph_module))
+        graph_text_path.write_text(str(graph_module.graph) + "\n")
+        graph_code_path.write_text(graph_module.code)
+    except Exception as exc:
+        graph_error = {"type": type(exc).__name__, "message": str(exc)}
+        _write_json(output_dir / "graph_error.json", graph_error)
+        if config.require_graph:
+            raise
+
+    for _ in range(config.warmup):
+        workload.fn(*workload.args)
+    _sync_if_needed(device)
+    memory_before = _memory_snapshot(device)
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
+    result, elapsed_ms, profiler = _profile_callable(
+        workload.fn,
+        workload.args,
+        label=f"torchinferno.region.{workload.module_path}",
+        device=device,
+        iters=config.iters,
+        capture_profiler=config.capture_profiler,
+        with_stack=config.with_stack,
+        with_flops=config.with_flops,
+    )
+    memory_after = _memory_snapshot(device)
+
+    _write_json(
+        output_path,
+        {
+            "elapsed_ms": elapsed_ms,
+            "iters": config.iters,
+            "per_iter_ms": elapsed_ms / max(1, config.iters),
+            "output": _value_summary(result),
+        },
+    )
+    _write_json(memory_path, {"before": memory_before, "after": memory_after})
+    if profiler is not None:
+        assert operator_path is not None
+        _write_json(operator_path, _profiler_key_averages(profiler))
+        if chrome_path is not None:
+            profiler.export_chrome_trace(str(chrome_path))
+    _write_region_repro(repro_path, config)
+
+    artifacts = FocusProfileArtifacts(
+        output_dir=output_dir,
+        manifest=manifest_path,
+        run_config=run_config_path,
+        environment=environment_path,
+        output=output_path,
+        memory_profile=memory_path,
+        operator_profile=operator_path,
+        chrome_trace=chrome_path,
+        graph_json=graph_json_path if graph_json_path.exists() else None,
+        graph_text=graph_text_path if graph_text_path.exists() else None,
+        graph_code=graph_code_path if graph_code_path.exists() else None,
+        repro=repro_path,
+    )
+    _write_json(
+        manifest_path,
+        {
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "output_dir": str(output_dir),
+            "artifacts": _focus_artifact_manifest(artifacts),
+            "graph_error": graph_error,
+        },
+    )
+    _write_focus_readme(output_dir / "README.md", "region", artifacts)
+    return artifacts
+
+
+def run_pattern_profile_capture(config: PatternProfileConfig) -> PatternProfileArtifacts:
+    """Profile a known reference pattern and its optimized graph replacement."""
+
+    output_dir = config.output_dir
+    output_dir.mkdir(parents=True, exist_ok=True)
+    device = _normalize_device(torch.device(config.device))
+    dtype = _dtype_from_name(config.dtype)
+    torch.manual_seed(config.seed)
+    if device.type == "cuda":
+        torch.cuda.manual_seed_all(config.seed)
+    fn, args = _build_pattern_workload(config, device, dtype)
+
+    run_config_path = output_dir / "run_config.json"
+    environment_path = output_dir / "environment.json"
+    comparison_path = output_dir / "comparison.json"
+    pass_report_path = output_dir / "pass_report.json"
+    manifest_path = output_dir / "manifest.json"
+    repro_path = output_dir / "pattern_repro.py"
+    _write_json(run_config_path, _pattern_config_to_json(config))
+    _write_json(environment_path, _environment_payload(device))
+    _write_json(output_dir / "pattern_spec.json", {"pattern": config.pattern, "inputs": [_value_summary(arg) for arg in args]})
+
+    reference_graph_path: Path | None = output_dir / "reference_graph.json"
+    optimized_graph_path: Path | None = output_dir / "optimized_graph.json"
+    reference_profile_path = output_dir / "reference_profile.json" if config.capture_profiler else None
+    optimized_profile_path = output_dir / "optimized_profile.json" if config.capture_profiler else None
+    reference_trace_path = output_dir / "reference_chrome_trace.json" if config.capture_profiler and config.export_chrome_trace else None
+    optimized_trace_path = output_dir / "optimized_chrome_trace.json" if config.capture_profiler and config.export_chrome_trace else None
+
+    graph_error: dict[str, Any] | None = None
+    optimized_graph_module: torch.fx.GraphModule | None = None
+    pass_report: dict[str, Any] = {"applied": config.apply_passes, "passes": [], "graph_meta": {}}
+    try:
+        reference_graph_module = trace_with_make_fx(fn, *args, fake=config.fake_graph)
+        _write_graph_artifacts(output_dir, "reference", reference_graph_module)
+        if config.apply_passes:
+            registry = PassRegistry()
+            register_kernel_replacement_passes(registry)
+            pass_report["passes"] = [
+                {"name": registered.name, "description": registered.description}
+                for registered in registry.describe()
+            ]
+            optimized_graph_module = registry.run(reference_graph_module)
+        else:
+            optimized_graph_module = reference_graph_module
+        pass_report["graph_meta"] = _plain_json(optimized_graph_module.meta)
+        _write_graph_artifacts(output_dir, "optimized", optimized_graph_module)
+    except Exception as exc:
+        graph_error = {"type": type(exc).__name__, "message": str(exc)}
+        pass_report["error"] = graph_error
+        _write_json(output_dir / "graph_error.json", graph_error)
+        reference_graph_path = None
+        optimized_graph_path = None
+        if config.require_graph:
+            raise
+    _write_json(pass_report_path, pass_report)
+
+    reference_result, reference_elapsed_ms, reference_profiler = _profile_callable(
+        fn,
+        args,
+        label=f"torchinferno.pattern.{config.pattern}.reference",
+        device=device,
+        iters=config.iters,
+        capture_profiler=config.capture_profiler,
+        with_stack=config.with_stack,
+        with_flops=config.with_flops,
+        warmup=config.warmup,
+    )
+    optimized_callable: Callable[..., Any] = optimized_graph_module if optimized_graph_module is not None else fn
+    optimized_result, optimized_elapsed_ms, optimized_profiler = _profile_callable(
+        optimized_callable,
+        args,
+        label=f"torchinferno.pattern.{config.pattern}.optimized",
+        device=device,
+        iters=config.iters,
+        capture_profiler=config.capture_profiler,
+        with_stack=config.with_stack,
+        with_flops=config.with_flops,
+        warmup=config.warmup,
+    )
+    if reference_profiler is not None:
+        assert reference_profile_path is not None
+        _write_json(reference_profile_path, _profiler_key_averages(reference_profiler))
+        if reference_trace_path is not None:
+            reference_profiler.export_chrome_trace(str(reference_trace_path))
+    if optimized_profiler is not None:
+        assert optimized_profile_path is not None
+        _write_json(optimized_profile_path, _profiler_key_averages(optimized_profiler))
+        if optimized_trace_path is not None:
+            optimized_profiler.export_chrome_trace(str(optimized_trace_path))
+
+    comparison = {
+        "pattern": config.pattern,
+        "apply_passes": config.apply_passes,
+        "reference_elapsed_ms": reference_elapsed_ms,
+        "optimized_elapsed_ms": optimized_elapsed_ms,
+        "reference_per_iter_ms": reference_elapsed_ms / max(1, config.iters),
+        "optimized_per_iter_ms": optimized_elapsed_ms / max(1, config.iters),
+        "speedup": reference_elapsed_ms / optimized_elapsed_ms if optimized_elapsed_ms > 0 else None,
+        "max_abs_diff": _max_abs_diff(reference_result, optimized_result),
+        "reference_output": _value_summary(reference_result),
+        "optimized_output": _value_summary(optimized_result),
+    }
+    _write_json(comparison_path, comparison)
+    _write_pattern_repro(repro_path, config)
+    artifacts = PatternProfileArtifacts(
+        output_dir=output_dir,
+        manifest=manifest_path,
+        run_config=run_config_path,
+        environment=environment_path,
+        comparison=comparison_path,
+        pass_report=pass_report_path,
+        reference_profile=reference_profile_path,
+        optimized_profile=optimized_profile_path,
+        reference_trace=reference_trace_path,
+        optimized_trace=optimized_trace_path,
+        reference_graph=reference_graph_path if reference_graph_path is not None and reference_graph_path.exists() else None,
+        optimized_graph=optimized_graph_path if optimized_graph_path is not None and optimized_graph_path.exists() else None,
+        repro=repro_path,
+    )
+    _write_json(
+        manifest_path,
+        {
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "output_dir": str(output_dir),
+            "artifacts": _pattern_artifact_manifest(artifacts),
+            "graph_error": graph_error,
+        },
+    )
+    _write_pattern_readme(output_dir / "README.md", artifacts)
     return artifacts
 
 
@@ -378,6 +725,396 @@ def _artifact_manifest(artifacts: ProfileRunArtifacts) -> dict[str, str | None]:
     }
 
 
+def _focus_artifact_manifest(artifacts: FocusProfileArtifacts) -> dict[str, str | None]:
+    output_dir = artifacts.output_dir
+
+    def rel(path: Path | None) -> str | None:
+        return str(path.relative_to(output_dir)) if path is not None else None
+
+    return {
+        "run_config": rel(artifacts.run_config),
+        "environment": rel(artifacts.environment),
+        "output": rel(artifacts.output),
+        "memory_profile": rel(artifacts.memory_profile),
+        "operator_profile": rel(artifacts.operator_profile),
+        "chrome_trace": rel(artifacts.chrome_trace),
+        "graph_json": rel(artifacts.graph_json),
+        "graph_text": rel(artifacts.graph_text),
+        "graph_code": rel(artifacts.graph_code),
+        "repro": rel(artifacts.repro),
+    }
+
+
+def _pattern_artifact_manifest(artifacts: PatternProfileArtifacts) -> dict[str, str | None]:
+    output_dir = artifacts.output_dir
+
+    def rel(path: Path | None) -> str | None:
+        return str(path.relative_to(output_dir)) if path is not None else None
+
+    return {
+        "run_config": rel(artifacts.run_config),
+        "environment": rel(artifacts.environment),
+        "comparison": rel(artifacts.comparison),
+        "pass_report": rel(artifacts.pass_report),
+        "reference_profile": rel(artifacts.reference_profile),
+        "optimized_profile": rel(artifacts.optimized_profile),
+        "reference_trace": rel(artifacts.reference_trace),
+        "optimized_trace": rel(artifacts.optimized_trace),
+        "reference_graph": rel(artifacts.reference_graph),
+        "optimized_graph": rel(artifacts.optimized_graph),
+        "repro": rel(artifacts.repro),
+    }
+
+
+def _build_region_workload(
+    model: DSv4ForCausalLM | DeepSeekV32ForCausalLM,
+    region: str,
+    batch_size: int,
+    tokens: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> _RegionWorkload:
+    module_path, module = _resolve_region_module(model, region)
+    module_class = module.__class__.__name__
+    hidden_size = int(getattr(model.config, "hidden_size"))
+    hidden = torch.randn(batch_size, tokens, hidden_size, device=device, dtype=dtype)
+    positions = torch.arange(tokens, device=device)
+    lower_class = module_class.lower()
+
+    if module is model:
+        input_ids = torch.randint(0, model.config.vocab_size, (batch_size, tokens), device=device, dtype=torch.long)
+
+        def fn(ids: torch.Tensor) -> torch.Tensor:
+            logits, _ = model(ids, use_cache=False)
+            return logits
+
+        return _RegionWorkload(module_path, module_class, fn, (input_ids,), ("input_ids",))
+
+    if isinstance(module, torch.nn.Embedding):
+        input_ids = torch.randint(0, module.num_embeddings, (batch_size, tokens), device=device, dtype=torch.long)
+        return _RegionWorkload(module_path, module_class, module, (input_ids,), ("input_ids",))
+
+    if isinstance(module, torch.nn.Linear):
+        x = torch.randn(batch_size, tokens, module.in_features, device=device, dtype=dtype)
+        return _RegionWorkload(module_path, module_class, module, (x,), ("x",))
+
+    if "attention" in lower_class or "decoderlayer" in lower_class:
+
+        def fn(x: torch.Tensor, pos: torch.Tensor) -> Any:
+            return module(x, pos, None)
+
+        return _RegionWorkload(module_path, module_class, fn, (hidden, positions), ("hidden_states", "positions"))
+
+    if any(name in lower_class for name in ("rmsnorm", "layernorm", "norm", "moe", "mlp", "expert", "gate")):
+        return _RegionWorkload(module_path, module_class, module, (hidden,), ("hidden_states",))
+
+    try:
+        module(hidden)
+    except Exception as exc:
+        raise ValueError(
+            f"Do not know how to build inputs for region {region!r} ({module_class}). "
+            "Supported regions include attention, decoder layer, norm, MLP/MoE, embedding, linear, and full model."
+        ) from exc
+    return _RegionWorkload(module_path, module_class, module, (hidden,), ("hidden_states",))
+
+
+def _resolve_region_module(
+    model: DSv4ForCausalLM | DeepSeekV32ForCausalLM,
+    region: str,
+) -> tuple[str, torch.nn.Module]:
+    if region in {"", "forward", "model"}:
+        return "forward", model
+    candidates = [region]
+    if isinstance(model, DeepSeekV32ForCausalLM) and not region.startswith("model."):
+        candidates.append(f"model.{region}")
+    errors = []
+    for candidate in candidates:
+        try:
+            return candidate, model.get_submodule(candidate)
+        except AttributeError as exc:
+            errors.append(str(exc))
+    raise ValueError(f"unknown region {region!r}; tried {candidates}. Last errors: {errors}")
+
+
+def _build_pattern_workload(
+    config: PatternProfileConfig,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> tuple[Callable[..., torch.Tensor], tuple[torch.Tensor, ...]]:
+    if config.pattern != "fused-rmsnorm-swiglu":
+        raise ValueError("only pattern 'fused-rmsnorm-swiglu' is currently registered")
+    shape = (config.batch_size, config.tokens, config.hidden_size)
+    x = torch.randn(shape, device=device, dtype=dtype)
+    residual = torch.randn(shape, device=device, dtype=dtype)
+    norm_weight = torch.randn(config.hidden_size, device=device, dtype=dtype)
+    gate_weight = torch.randn(config.hidden_size, device=device, dtype=dtype)
+    up_weight = torch.randn(config.hidden_size, device=device, dtype=dtype)
+
+    def fn(
+        x: torch.Tensor,
+        residual: torch.Tensor,
+        norm_weight: torch.Tensor,
+        gate_weight: torch.Tensor,
+        up_weight: torch.Tensor,
+    ) -> torch.Tensor:
+        return fused_rmsnorm_swiglu_reference(
+            x,
+            residual,
+            norm_weight,
+            gate_weight,
+            up_weight,
+            eps=1e-6,
+        )
+
+    return fn, (x, residual, norm_weight, gate_weight, up_weight)
+
+
+def _profile_callable(
+    fn: Callable[..., Any],
+    args: tuple[Any, ...],
+    *,
+    label: str,
+    device: torch.device,
+    iters: int,
+    capture_profiler: bool,
+    with_stack: bool,
+    with_flops: bool,
+    warmup: int = 0,
+) -> tuple[Any, float, torch.profiler.profile | None]:
+    if iters < 1:
+        raise ValueError("iters must be positive")
+    for _ in range(warmup):
+        with torch.inference_mode():
+            fn(*args)
+    _sync_if_needed(device)
+    start = time.perf_counter()
+    profiler = None
+    result: Any = None
+    if capture_profiler:
+        activities = [torch.profiler.ProfilerActivity.CPU]
+        if device.type == "cuda":
+            activities.append(torch.profiler.ProfilerActivity.CUDA)
+        with torch.profiler.profile(
+            activities=activities,
+            record_shapes=True,
+            profile_memory=True,
+            with_stack=with_stack,
+            with_flops=with_flops,
+            acc_events=True,
+        ) as prof:
+            for _ in range(iters):
+                with torch.profiler.record_function(label), torch.inference_mode():
+                    result = fn(*args)
+                prof.step()
+        profiler = prof
+    else:
+        for _ in range(iters):
+            with torch.inference_mode():
+                result = fn(*args)
+    _sync_if_needed(device)
+    elapsed_ms = (time.perf_counter() - start) * 1000
+    return result, elapsed_ms, profiler
+
+
+def _write_graph_artifacts(output_dir: Path, prefix: str, graph_module: torch.fx.GraphModule) -> None:
+    _write_json(output_dir / f"{prefix}_graph.json", _graph_to_json(graph_module))
+    (output_dir / f"{prefix}_graph.txt").write_text(str(graph_module.graph) + "\n")
+    (output_dir / f"{prefix}_graph_module.py").write_text(graph_module.code)
+
+
+def _max_abs_diff(left: Any, right: Any) -> float | None:
+    if isinstance(left, torch.Tensor) and isinstance(right, torch.Tensor):
+        if left.numel() == 0 and right.numel() == 0:
+            return 0.0
+        return float((left.detach().float() - right.detach().float()).abs().max().item())
+    if isinstance(left, (tuple, list)) and isinstance(right, (tuple, list)) and len(left) == len(right):
+        values = [_max_abs_diff(l_item, r_item) for l_item, r_item in zip(left, right)]
+        values = [value for value in values if value is not None]
+        return max(values) if values else None
+    if isinstance(left, dict) and isinstance(right, dict):
+        values = [_max_abs_diff(left[key], right[key]) for key in left.keys() & right.keys()]
+        values = [value for value in values if value is not None]
+        return max(values) if values else None
+    return None
+
+
+def _plain_json(value: Any) -> Any:
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    if isinstance(value, tuple):
+        return [_plain_json(item) for item in value]
+    if isinstance(value, list):
+        return [_plain_json(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): _plain_json(item) for key, item in value.items()}
+    return repr(value)
+
+
+def _value_summary(value: Any) -> Any:
+    if isinstance(value, torch.Tensor):
+        tensor = value.detach()
+        flat = tensor.flatten()
+        return {
+            **_tensor_summary(tensor),
+            "numel": int(tensor.numel()),
+            "sample": flat[: min(8, flat.numel())].detach().cpu().tolist(),
+        }
+    if isinstance(value, tuple):
+        return [_value_summary(item) for item in value]
+    if isinstance(value, list):
+        return [_value_summary(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): _value_summary(item) for key, item in value.items()}
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return repr(value)
+
+
+def _region_config_to_json(config: RegionProfileConfig) -> dict[str, Any]:
+    payload = asdict(config)
+    payload["output_dir"] = str(config.output_dir)
+    payload["command"] = list(config.command)
+    return payload
+
+
+def _pattern_config_to_json(config: PatternProfileConfig) -> dict[str, Any]:
+    payload = asdict(config)
+    payload["output_dir"] = str(config.output_dir)
+    payload["command"] = list(config.command)
+    return payload
+
+
+def _write_region_repro(path: Path, config: RegionProfileConfig) -> None:
+    source = f'''#!/usr/bin/env python3
+from __future__ import annotations
+
+from pathlib import Path
+import argparse
+import sys
+
+REPO_ROOT = Path({str(Path.cwd())!r})
+if (REPO_ROOT / "src").exists():
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+
+from torchinferno.profiling import RegionProfileConfig, run_region_profile_capture
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--output-dir", default="region_repro_artifacts")
+    parser.add_argument("--device", default={config.device!r})
+    args = parser.parse_args()
+    artifacts = run_region_profile_capture(
+        RegionProfileConfig(
+            output_dir=Path(args.output_dir),
+            region={config.region!r},
+            model_kind={config.model_kind!r},
+            device=args.device,
+            dtype={config.dtype!r},
+            seed={config.seed!r},
+            batch_size={config.batch_size!r},
+            tokens={config.tokens!r},
+            vocab_size={config.vocab_size!r},
+            warmup={config.warmup!r},
+            iters={config.iters!r},
+            fake_graph={config.fake_graph!r},
+            require_graph={config.require_graph!r},
+            capture_profiler={config.capture_profiler!r},
+            export_chrome_trace={config.export_chrome_trace!r},
+            with_stack={config.with_stack!r},
+            with_flops={config.with_flops!r},
+        )
+    )
+    print(artifacts.manifest)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+'''
+    path.write_text(source)
+    path.chmod(0o755)
+
+
+def _write_pattern_repro(path: Path, config: PatternProfileConfig) -> None:
+    source = f'''#!/usr/bin/env python3
+from __future__ import annotations
+
+from pathlib import Path
+import argparse
+import sys
+
+REPO_ROOT = Path({str(Path.cwd())!r})
+if (REPO_ROOT / "src").exists():
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+
+from torchinferno.profiling import PatternProfileConfig, run_pattern_profile_capture
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--output-dir", default="pattern_repro_artifacts")
+    parser.add_argument("--device", default={config.device!r})
+    args = parser.parse_args()
+    artifacts = run_pattern_profile_capture(
+        PatternProfileConfig(
+            output_dir=Path(args.output_dir),
+            pattern={config.pattern!r},
+            device=args.device,
+            dtype={config.dtype!r},
+            seed={config.seed!r},
+            batch_size={config.batch_size!r},
+            tokens={config.tokens!r},
+            hidden_size={config.hidden_size!r},
+            warmup={config.warmup!r},
+            iters={config.iters!r},
+            apply_passes={config.apply_passes!r},
+            fake_graph={config.fake_graph!r},
+            require_graph={config.require_graph!r},
+            capture_profiler={config.capture_profiler!r},
+            export_chrome_trace={config.export_chrome_trace!r},
+            with_stack={config.with_stack!r},
+            with_flops={config.with_flops!r},
+        )
+    )
+    print(artifacts.manifest)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+'''
+    path.write_text(source)
+    path.chmod(0o755)
+
+
+def _write_focus_readme(path: Path, kind: str, artifacts: FocusProfileArtifacts) -> None:
+    path.write_text(
+        f"# TorchInferno {kind.title()} Profile\n\n"
+        "Key files:\n\n"
+        "- `region_spec.json`: resolved module and generated inputs.\n"
+        "- `region_graph.json`: focused make_fx graph.\n"
+        "- `operator_profile.json`: profiler key averages for only this region.\n"
+        "- `chrome_trace.json`: trace viewer artifact when profiler export is enabled.\n"
+        "- `memory_profile.json`: allocator snapshot before and after region profiling.\n"
+        "- `region_repro.py`: rerun this profile in a fresh artifact directory.\n"
+    )
+
+
+def _write_pattern_readme(path: Path, artifacts: PatternProfileArtifacts) -> None:
+    path.write_text(
+        "# TorchInferno Pattern Profile\n\n"
+        "Key files:\n\n"
+        "- `pattern_spec.json`: pattern name and generated inputs.\n"
+        "- `reference_graph.json`: make_fx graph before replacement.\n"
+        "- `optimized_graph.json`: graph after registered passes.\n"
+        "- `pass_report.json`: registered pass names and replacement match counts.\n"
+        "- `reference_profile.json` and `optimized_profile.json`: profiler key averages.\n"
+        "- `comparison.json`: timing, speedup, and max_abs_diff.\n"
+        "- `pattern_repro.py`: rerun this profile in a fresh artifact directory.\n"
+    )
+
+
 def _write_repro(path: Path, config: ProfileRunConfig, input_ids: list[list[int]]) -> None:
     source = f'''#!/usr/bin/env python3
 from __future__ import annotations
@@ -491,6 +1228,16 @@ def _dtype_from_name(name: str) -> torch.dtype:
     if name == "bfloat16":
         return torch.bfloat16
     raise ValueError(f"unknown dtype: {name}")
+
+
+def _normalize_device(device: torch.device) -> torch.device:
+    if device.type != "cuda":
+        return device
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA device requested but torch.cuda.is_available() is false")
+    cuda_index = torch.cuda.current_device() if device.index is None else device.index
+    torch.cuda.set_device(cuda_index)
+    return torch.device("cuda", cuda_index)
 
 
 def _tokens_per_second(tokens: int, elapsed_ms: float) -> float:

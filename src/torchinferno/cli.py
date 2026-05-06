@@ -22,7 +22,14 @@ from torchinferno.models.conversion import (
 from torchinferno.models.deepseek import DeepSeekV32ForCausalLM, tiny_deepseek_v32_config
 from torchinferno.models.dsv4 import DSv4ForCausalLM, tiny_dsv4_config
 from torchinferno.kernels import KernelBackend, KernelConfig, paged_decode_attention
-from torchinferno.profiling import ProfileRunConfig, run_profile_capture
+from torchinferno.profiling import (
+    PatternProfileConfig,
+    ProfileRunConfig,
+    RegionProfileConfig,
+    run_pattern_profile_capture,
+    run_profile_capture,
+    run_region_profile_capture,
+)
 from torchinferno.research import ExperimentResult, ResearchHarness
 from torchinferno.research.benchmarks import benchmark_callable
 from torchinferno.runtime.batching import InferenceRequest, run_continuous_batch
@@ -459,6 +466,73 @@ def run_profile_run(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_profile_region(args: argparse.Namespace) -> int:
+    device = args.device if args.device is not None else str(_default_device())
+    artifacts = run_region_profile_capture(
+        RegionProfileConfig(
+            output_dir=Path(args.output_dir),
+            region=args.region,
+            model_kind=args.model_kind,
+            device=device,
+            dtype=args.dtype,
+            seed=args.seed,
+            batch_size=args.batch_size,
+            tokens=args.tokens,
+            vocab_size=args.vocab_size,
+            warmup=args.warmup,
+            iters=args.iters,
+            fake_graph=args.fake_graph,
+            require_graph=args.require_graph,
+            capture_profiler=not args.no_profiler,
+            export_chrome_trace=not args.no_chrome_trace,
+            with_stack=args.with_stack,
+            with_flops=not args.no_flops,
+            command=tuple(sys.argv),
+        )
+    )
+    print("TorchInferno region profile")
+    print(f"output_dir={artifacts.output_dir}")
+    print(f"manifest={artifacts.manifest}")
+    print(f"repro={artifacts.repro}")
+    if artifacts.graph_json is not None:
+        print(f"graph_json={artifacts.graph_json}")
+    if artifacts.chrome_trace is not None:
+        print(f"chrome_trace={artifacts.chrome_trace}")
+    return 0
+
+
+def run_profile_pattern(args: argparse.Namespace) -> int:
+    device = args.device if args.device is not None else str(_default_device())
+    artifacts = run_pattern_profile_capture(
+        PatternProfileConfig(
+            output_dir=Path(args.output_dir),
+            pattern=args.pattern,
+            device=device,
+            dtype=args.dtype,
+            seed=args.seed,
+            batch_size=args.batch_size,
+            tokens=args.tokens,
+            hidden_size=args.hidden_size,
+            warmup=args.warmup,
+            iters=args.iters,
+            apply_passes=not args.no_apply_passes,
+            fake_graph=args.fake_graph,
+            require_graph=args.require_graph,
+            capture_profiler=not args.no_profiler,
+            export_chrome_trace=not args.no_chrome_trace,
+            with_stack=args.with_stack,
+            with_flops=not args.no_flops,
+            command=tuple(sys.argv),
+        )
+    )
+    print("TorchInferno pattern profile")
+    print(f"output_dir={artifacts.output_dir}")
+    print(f"manifest={artifacts.manifest}")
+    print(f"comparison={artifacts.comparison}")
+    print(f"repro={artifacts.repro}")
+    return 0
+
+
 def run_capture_logits(args: argparse.Namespace) -> int:
     device = torch.device(args.device) if args.device else _default_device()
     model = load_model_auto(
@@ -761,6 +835,52 @@ def build_parser() -> argparse.ArgumentParser:
     profile.add_argument("--with-stack", action="store_true", help="Capture Python stack traces in the profiler.")
     profile.add_argument("--no-flops", action="store_true", help="Disable profiler FLOP estimation.")
     profile.set_defaults(func=run_profile_run)
+
+    profile_region = subparsers.add_parser(
+        "profile-region",
+        help="Profile one named model region and emit focused graph/profile artifacts.",
+    )
+    profile_region.add_argument("output_dir")
+    profile_region.add_argument("--region", required=True, help="Module path such as layers.0.attn or model.layers.0.self_attn.")
+    profile_region.add_argument("--model-kind", choices=["dsv4", "deepseek"], default="dsv4")
+    profile_region.add_argument("--device", default=None, help="Torch device, defaults to cuda when available.")
+    profile_region.add_argument("--dtype", choices=["float32", "float16", "bfloat16"], default="float32")
+    profile_region.add_argument("--seed", type=int, default=0)
+    profile_region.add_argument("--batch-size", type=int, default=1)
+    profile_region.add_argument("--tokens", type=int, default=8)
+    profile_region.add_argument("--vocab-size", type=int, default=128)
+    profile_region.add_argument("--warmup", type=int, default=3)
+    profile_region.add_argument("--iters", type=int, default=10)
+    profile_region.add_argument("--fake-graph", action="store_true", help="Try graph capture under FakeTensorMode.")
+    profile_region.add_argument("--require-graph", action="store_true", help="Fail if graph capture fails.")
+    profile_region.add_argument("--no-profiler", action="store_true", help="Skip torch.profiler capture.")
+    profile_region.add_argument("--no-chrome-trace", action="store_true", help="Do not export chrome_trace.json.")
+    profile_region.add_argument("--with-stack", action="store_true", help="Capture Python stack traces in the profiler.")
+    profile_region.add_argument("--no-flops", action="store_true", help="Disable profiler FLOP estimation.")
+    profile_region.set_defaults(func=run_profile_region)
+
+    profile_pattern = subparsers.add_parser(
+        "profile-pattern",
+        help="Profile a reference graph pattern before and after registered replacement passes.",
+    )
+    profile_pattern.add_argument("output_dir")
+    profile_pattern.add_argument("--pattern", choices=["fused-rmsnorm-swiglu"], default="fused-rmsnorm-swiglu")
+    profile_pattern.add_argument("--device", default=None, help="Torch device, defaults to cuda when available.")
+    profile_pattern.add_argument("--dtype", choices=["float32", "float16", "bfloat16"], default="float32")
+    profile_pattern.add_argument("--seed", type=int, default=0)
+    profile_pattern.add_argument("--batch-size", type=int, default=1)
+    profile_pattern.add_argument("--tokens", type=int, default=8)
+    profile_pattern.add_argument("--hidden-size", type=int, default=128)
+    profile_pattern.add_argument("--warmup", type=int, default=3)
+    profile_pattern.add_argument("--iters", type=int, default=10)
+    profile_pattern.add_argument("--no-apply-passes", action="store_true", help="Profile only the reference graph.")
+    profile_pattern.add_argument("--fake-graph", action="store_true", help="Try graph capture under FakeTensorMode.")
+    profile_pattern.add_argument("--require-graph", action="store_true", help="Fail if graph capture fails.")
+    profile_pattern.add_argument("--no-profiler", action="store_true", help="Skip torch.profiler capture.")
+    profile_pattern.add_argument("--no-chrome-trace", action="store_true", help="Do not export chrome_trace JSON files.")
+    profile_pattern.add_argument("--with-stack", action="store_true", help="Capture Python stack traces in the profiler.")
+    profile_pattern.add_argument("--no-flops", action="store_true", help="Disable profiler FLOP estimation.")
+    profile_pattern.set_defaults(func=run_profile_pattern)
 
     capture = subparsers.add_parser("capture-logits", help="Capture a known-logit reference for a checkpoint.")
     capture.add_argument("model", help="Local checkpoint directory or Hugging Face repo ID.")

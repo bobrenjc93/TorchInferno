@@ -20,7 +20,17 @@ from torchinferno.models.conversion import (
 )
 from torchinferno.models.deepseek import DeepSeekV32Config, DeepSeekV32ForCausalLM, tiny_deepseek_v32_config
 from torchinferno.models.dsv4 import DSv4Config, DSv4ForCausalLM, tiny_dsv4_config
-from torchinferno.profiling import ProfileRunArtifacts, ProfileRunConfig, run_profile_capture
+from torchinferno.profiling import (
+    FocusProfileArtifacts,
+    PatternProfileArtifacts,
+    PatternProfileConfig,
+    ProfileRunArtifacts,
+    ProfileRunConfig,
+    RegionProfileConfig,
+    run_pattern_profile_capture,
+    run_profile_capture,
+    run_region_profile_capture,
+)
 from torchinferno.tokenization import load_text_tokenizer
 from torchinferno.validation import (
     LogitReference,
@@ -38,10 +48,14 @@ __all__ = [
     "DeepSeekV32Config",
     "DeepSeekV32ForCausalLM",
     "FeatureAudit",
+    "FocusProfileArtifacts",
     "LogitReference",
     "NVFP4Tensor",
+    "PatternProfileArtifacts",
+    "PatternProfileConfig",
     "ProfileRunArtifacts",
     "ProfileRunConfig",
+    "RegionProfileConfig",
     "TorchInfernoAudit",
     "ValidationResult",
     "audit_deepseek_checkpoint",
@@ -60,7 +74,9 @@ __all__ = [
     "nvfp4_linear_reference",
     "paged_decode_attention",
     "quantize_nvfp4",
+    "run_pattern_profile_capture",
     "run_profile_capture",
+    "run_region_profile_capture",
     "save_logit_reference",
     "tiny_deepseek_v32_config",
     "tiny_dsv4_config",

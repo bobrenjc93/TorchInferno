@@ -3,7 +3,14 @@ import os
 import subprocess
 import sys
 
-from torchinferno.profiling import ProfileRunConfig, run_profile_capture
+from torchinferno.profiling import (
+    PatternProfileConfig,
+    ProfileRunConfig,
+    RegionProfileConfig,
+    run_pattern_profile_capture,
+    run_profile_capture,
+    run_region_profile_capture,
+)
 
 
 def test_profile_capture_writes_artifacts_and_repro(tmp_path) -> None:
@@ -81,3 +88,164 @@ def test_profile_run_cli_writes_manifest(tmp_path) -> None:
     assert "TorchInferno profile run" in result.stdout
     assert manifest["artifacts"]["operator_profile"] is None
     assert manifest["artifacts"]["graph_json"] == "graph.json"
+
+
+def test_region_profile_capture_writes_focused_artifacts_and_repro(tmp_path) -> None:
+    output_dir = tmp_path / "region-profile"
+
+    artifacts = run_region_profile_capture(
+        RegionProfileConfig(
+            output_dir=output_dir,
+            region="layers.0.attn",
+            device="cpu",
+            batch_size=1,
+            tokens=3,
+            vocab_size=32,
+            warmup=0,
+            iters=1,
+        )
+    )
+
+    assert artifacts.manifest.exists()
+    assert artifacts.repro.exists()
+    assert artifacts.graph_json is not None and artifacts.graph_json.exists()
+    assert artifacts.operator_profile is not None and artifacts.operator_profile.exists()
+    assert artifacts.chrome_trace is not None and artifacts.chrome_trace.exists()
+
+    region_spec = json.loads((output_dir / "region_spec.json").read_text())
+    graph = json.loads(artifacts.graph_json.read_text())
+    profile = json.loads(artifacts.operator_profile.read_text())
+    output = json.loads(artifacts.output.read_text())
+
+    assert region_spec["resolved_module_path"] == "layers.0.attn"
+    assert graph["node_count"] > 0
+    assert profile["events"]
+    assert output["output"]["shape"] == [1, 3, 64]
+
+    subprocess.run(
+        [
+            sys.executable,
+            str(artifacts.repro),
+            "--device",
+            "cpu",
+            "--output-dir",
+            str(tmp_path / "region-repro"),
+        ],
+        check=True,
+        text=True,
+        capture_output=True,
+    )
+    assert (tmp_path / "region-repro" / "manifest.json").exists()
+
+
+def test_pattern_profile_capture_writes_pass_comparison_and_repro(tmp_path) -> None:
+    output_dir = tmp_path / "pattern-profile"
+
+    artifacts = run_pattern_profile_capture(
+        PatternProfileConfig(
+            output_dir=output_dir,
+            device="cpu",
+            batch_size=1,
+            tokens=3,
+            hidden_size=16,
+            warmup=0,
+            iters=1,
+        )
+    )
+
+    assert artifacts.manifest.exists()
+    assert artifacts.repro.exists()
+    assert artifacts.reference_graph is not None and artifacts.reference_graph.exists()
+    assert artifacts.optimized_graph is not None and artifacts.optimized_graph.exists()
+    assert artifacts.reference_profile is not None and artifacts.reference_profile.exists()
+    assert artifacts.optimized_profile is not None and artifacts.optimized_profile.exists()
+
+    comparison = json.loads(artifacts.comparison.read_text())
+    pass_report = json.loads(artifacts.pass_report.read_text())
+    optimized_graph = json.loads(artifacts.optimized_graph.read_text())
+    optimized_targets = [node["target"] for node in optimized_graph["nodes"]]
+
+    assert comparison["max_abs_diff"] == 0.0
+    assert pass_report["graph_meta"]["fused_rmsnorm_swiglu_aten_matches"] == 1
+    assert any("fused_rmsnorm_swiglu" in target for target in optimized_targets)
+
+    subprocess.run(
+        [
+            sys.executable,
+            str(artifacts.repro),
+            "--device",
+            "cpu",
+            "--output-dir",
+            str(tmp_path / "pattern-repro"),
+        ],
+        check=True,
+        text=True,
+        capture_output=True,
+    )
+    assert (tmp_path / "pattern-repro" / "comparison.json").exists()
+
+
+def test_profile_focus_cli_commands_write_manifests(tmp_path) -> None:
+    env = {**os.environ, "PYTHONPATH": "src"}
+    region_dir = tmp_path / "cli-region"
+    pattern_dir = tmp_path / "cli-pattern"
+
+    region = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "torchinferno.cli",
+            "profile-region",
+            str(region_dir),
+            "--region",
+            "layers.0.moe",
+            "--device",
+            "cpu",
+            "--batch-size",
+            "1",
+            "--tokens",
+            "2",
+            "--warmup",
+            "0",
+            "--iters",
+            "1",
+            "--no-profiler",
+        ],
+        check=True,
+        env=env,
+        text=True,
+        capture_output=True,
+    )
+    pattern = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "torchinferno.cli",
+            "profile-pattern",
+            str(pattern_dir),
+            "--device",
+            "cpu",
+            "--batch-size",
+            "1",
+            "--tokens",
+            "2",
+            "--hidden-size",
+            "16",
+            "--warmup",
+            "0",
+            "--iters",
+            "1",
+            "--no-profiler",
+        ],
+        check=True,
+        env=env,
+        text=True,
+        capture_output=True,
+    )
+
+    region_manifest = json.loads((region_dir / "manifest.json").read_text())
+    pattern_manifest = json.loads((pattern_dir / "manifest.json").read_text())
+    assert "TorchInferno region profile" in region.stdout
+    assert "TorchInferno pattern profile" in pattern.stdout
+    assert region_manifest["artifacts"]["operator_profile"] is None
+    assert pattern_manifest["artifacts"]["pass_report"] == "pass_report.json"

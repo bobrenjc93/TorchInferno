@@ -1,8 +1,11 @@
-.PHONY: audit smoke test serve perf profile disagg
+.PHONY: audit smoke test serve perf profile profile-region profile-pattern disagg
 
 PYTHON ?= python3
 TI_PYTHONPATH ?= src
 PROFILE_DIR ?= .torchinferno_runs/dsv4-cpu
+REGION_PROFILE_DIR ?= .torchinferno_runs/region-cpu
+PATTERN_PROFILE_DIR ?= .torchinferno_runs/pattern-cpu
+REGION ?= layers.0.attn
 DISAGG_DIR ?= .torchinferno_disagg
 
 audit:
@@ -24,6 +27,12 @@ perf:
 
 profile:
 	PYTHONPATH=$(TI_PYTHONPATH) $(PYTHON) -m torchinferno.cli profile-run $(PROFILE_DIR) --device cpu --batch-size 1 --prompt-tokens 3 --new-tokens 2 --warmup 0
+
+profile-region:
+	PYTHONPATH=$(TI_PYTHONPATH) $(PYTHON) -m torchinferno.cli profile-region $(REGION_PROFILE_DIR) --device cpu --region $(REGION) --batch-size 1 --tokens 3 --warmup 0 --iters 1
+
+profile-pattern:
+	PYTHONPATH=$(TI_PYTHONPATH) $(PYTHON) -m torchinferno.cli profile-pattern $(PATTERN_PROFILE_DIR) --device cpu --batch-size 1 --tokens 3 --hidden-size 16 --warmup 0 --iters 1
 
 disagg:
 	PYTHONPATH=$(TI_PYTHONPATH) $(PYTHON) -m torchinferno.cli disagg-init $(DISAGG_DIR) --prefill-ranks 1 --decode-ranks 1 --device cpu

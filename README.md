@@ -56,6 +56,8 @@ to grow toward production-grade SOTA inference.
 - NVFP4 quantized-linear reference surface and graph-pass hook for future fused
   DeepSeek-V3.2-NVFP4 kernels.
 - Local performance benchmark smoke for reference versus specialized paths.
+- Whole-model, focused-region, and pattern-replacement profile artifact loops
+  that emit graphs, profiler JSON, traces, memory data, and repro scripts.
 - Minimal auto research harness for comparing scheduler/cache/routing policies.
 
 ## Quickstart
@@ -83,6 +85,8 @@ PYTHONPATH=src python3 -m torchinferno.cli disagg-init .torchinferno_disagg --pr
 PYTHONPATH=src python3 -m torchinferno.cli serve-smoke --device cpu
 PYTHONPATH=src python3 -m torchinferno.cli perf-smoke
 PYTHONPATH=src python3 -m torchinferno.cli profile-run .torchinferno_runs/dsv4-cpu --device cpu
+PYTHONPATH=src python3 -m torchinferno.cli profile-region .torchinferno_runs/attn0-cpu --region layers.0.attn --device cpu
+PYTHONPATH=src python3 -m torchinferno.cli profile-pattern .torchinferno_runs/swiglu-pattern-cpu --device cpu
 PYTHONPATH=src python3 -m torchinferno.cli research-smoke
 ```
 
@@ -182,9 +186,11 @@ First compile is expected to be much slower than eager execution.
 
 ## Profile Artifact Runs
 
-`profile-run` is the one-command loop for agent and kernel work. It runs one
-generation, captures a forward `make_fx` graph, collects profiler and memory
-data, and writes a standalone repro script into one artifact directory.
+The profile commands are the fast iteration loop for agent and kernel work.
+They put every graph/profile/repro artifact for one experiment in one directory.
+
+`profile-run` runs one generation, captures a forward `make_fx` graph, collects
+profiler and memory data, and writes a standalone repro script.
 
 ```bash
 PYTHONPATH=src python3 -m torchinferno.cli profile-run .torchinferno_runs/dsv4-gpu \
@@ -216,6 +222,41 @@ PYTHONPATH=src python3 -m torchinferno.cli profile-run .torchinferno_runs/deepse
 
 python3 .torchinferno_runs/dsv4-gpu/repro.py --device cuda
 ```
+
+To zoom into one module without booting a serving stack, use `profile-region`.
+The region name is a normal module path such as `layers.0.attn`,
+`layers.0.moe`, `model.layers.0.self_attn`, or `forward`.
+
+```bash
+PYTHONPATH=src python3 -m torchinferno.cli profile-region .torchinferno_runs/attn0-gpu \
+  --model-kind dsv4 \
+  --region layers.0.attn \
+  --device cuda \
+  --tokens 8 \
+  --iters 20
+```
+
+Focused region directories contain `region_spec.json`, `region_graph.json`,
+`region_graph.txt`, `region_graph_module.py`, `operator_profile.json`,
+`chrome_trace.json`, `memory_profile.json`, and `region_repro.py`.
+
+To test a graph-pass replacement in isolation, use `profile-pattern`. The first
+registered pattern is `fused-rmsnorm-swiglu`: TorchInferno traces the reference
+ATen graph, applies the kernel replacement registry, profiles reference versus
+optimized callables, and writes a comparison.
+
+```bash
+PYTHONPATH=src python3 -m torchinferno.cli profile-pattern .torchinferno_runs/swiglu-pattern-gpu \
+  --pattern fused-rmsnorm-swiglu \
+  --device cuda \
+  --hidden-size 4096 \
+  --tokens 16 \
+  --iters 50
+```
+
+Pattern directories contain `reference_graph.json`, `optimized_graph.json`,
+`pass_report.json`, `reference_profile.json`, `optimized_profile.json`,
+Chrome traces for both paths, `comparison.json`, and `pattern_repro.py`.
 
 ## Disaggregated Rank Files
 
@@ -409,6 +450,7 @@ src/torchinferno/
   audit.py                Environment and feature readiness audit.
   compiler.py             torch.compile policy helper.
   cli.py                  CLI smoke runners.
+  profiling.py            Whole-run, region, and pattern artifact capture.
   tokenization.py         Tokenizer adapters for text IO.
   validation.py           Known-logit capture and validation.
   kernels/ops.py          Kernel APIs with torch fallbacks.
@@ -467,6 +509,9 @@ Implemented as working code and tests:
 - Known-logit capture and validation.
 - One-command profile artifact capture with graph JSON, profiler JSON, memory
   JSON, Chrome trace export, and standalone repro generation.
+- Focused module-region profiling with isolated graphs/profiles/repros.
+- Pattern-profile loop for comparing reference subgraphs against registered
+  kernel replacements.
 - `torch.compile` smoke path.
 - `make_fx` and fake tensor trace helper.
 - Fake process groups.

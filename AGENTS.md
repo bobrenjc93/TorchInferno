@@ -17,10 +17,23 @@ PYTHONPATH=src python3 -m torchinferno.cli sim-smoke
 PYTHONPATH=src python3 -m torchinferno.cli traffic-smoke
 PYTHONPATH=src python3 -m torchinferno.cli serve-smoke --device cpu --cache-backend paged
 PYTHONPATH=src python3 -m torchinferno.cli perf-smoke --device cpu --heads 2 --seq-len 8 --head-dim 8 --value-dim 8
+PYTHONPATH=src python3 -m torchinferno.cli profile-region .torchinferno_runs/attn0-cpu --region layers.0.attn --device cpu --warmup 0 --iters 1
+PYTHONPATH=src python3 -m torchinferno.cli profile-pattern .torchinferno_runs/swiglu-pattern-cpu --device cpu --warmup 0 --iters 1
 ```
 
 The same core checks are available as `make audit`, `make test`, and
-`make smoke`.
+`make smoke`. Focused profiling shortcuts are available as `make profile`,
+`make profile-region`, and `make profile-pattern`.
+
+## Fast Profile Loops
+
+- Use `profile-run` when you need a full generation graph, memory profile,
+  Chrome trace, and standalone `repro.py`.
+- Use `profile-region` when you want to optimize one module path such as
+  `layers.0.attn`, `layers.0.moe`, or `model.layers.0.self_attn`.
+- Use `profile-pattern` when you are working on graph replacement. It writes
+  reference and optimized graphs, `pass_report.json`, profiler JSON for both
+  callables, and `comparison.json`.
 
 For conversion or kernel changes, also run:
 
@@ -45,6 +58,7 @@ python3 -m pytest tests/test_serving_engine.py
   and `src/torchinferno/models/deepseek.py`.
 - Feature readiness/DX status: `src/torchinferno/audit.py` and
   `docs/ROADMAP.md`.
+- Profile artifact loops and repro generators: `src/torchinferno/profiling.py`.
 - Text IO and validation workflows: `src/torchinferno/tokenization.py` and
   `src/torchinferno/validation.py`.
 - Repeatable experiments and comparisons: `src/torchinferno/research/`.
