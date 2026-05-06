@@ -38,13 +38,14 @@ class ServingStats:
     prefix_reuse_requests: int = 0
     prefix_reuse_tokens: int = 0
     max_model_batch_size: int = 0
+    persistent_cache_rows: int = 0
 
 
 @dataclass
 class _ReusablePrefix:
     route_id: Hashable
     tokens: tuple[int, ...]
-    cache: object
+    row: int
     logits: Tensor
 
 
@@ -54,20 +55,14 @@ class _ActiveRequest:
     request: ServingRequest
     tokens: list[int]
     generated: int
-    cache: object
+    row: int
     last_token: int
     prefix_hit_tokens: int
     started_step: int
 
 
 class ContinuousBatchEngine:
-    """Token-step continuous serving harness.
-
-    The engine remains single-process and deterministic, but it now exercises
-    the production control-flow shape more closely: same-shape prefill requests
-    are batched, same-length decode requests are microbatched, and prefix hits
-    can reuse cached KV through the model cache copy contract.
-    """
+    """Token-step continuous serving harness with persistent row-assigned cache."""
 
     def __init__(
         self,
@@ -78,22 +73,30 @@ class ContinuousBatchEngine:
         page_size: int = 16,
         temperature: float = 0.0,
         max_active_requests: int = 16,
+        prefix_cache_capacity: int | None = None,
     ) -> None:
         if max_active_requests < 1:
             raise ValueError("max_active_requests must be positive")
+        if prefix_cache_capacity is not None and prefix_cache_capacity < 0:
+            raise ValueError("prefix_cache_capacity must be non-negative")
         self.model = model.to(device).eval()
         self.device = device
         self.cache_backend = cache_backend
         self.page_size = page_size
         self.temperature = temperature
         self.max_active_requests = max_active_requests
+        self.prefix_cache_capacity = max_active_requests if prefix_cache_capacity is None else prefix_cache_capacity
         self.prefix_cache = PrefixCacheIndex()
         self.reusable_prefixes: dict[Hashable, _ReusablePrefix] = {}
         self.stats = ServingStats()
+        self._cache: object | None = None
+        self._free_active_rows: list[int] = []
+        self._free_prefix_rows: list[int] = []
+        self._prefix_order: list[Hashable] = []
 
     @torch.inference_mode()
     def run(self, requests: list[ServingRequest]) -> list[ServingResult]:
-        self.stats = ServingStats()
+        self._reset_run_state(requests)
         waiting = sorted(enumerate(requests), key=lambda item: (item[1].arrival_step, item[0]))
         active: list[_ActiveRequest] = []
         indexed_results: list[tuple[int, ServingResult]] = []
@@ -122,6 +125,20 @@ class ContinuousBatchEngine:
                 step = waiting[cursor][1].arrival_step
 
         return [result for _, result in sorted(indexed_results, key=lambda item: item[0])]
+
+    def _reset_run_state(self, requests: list[ServingRequest]) -> None:
+        self.stats = ServingStats()
+        self.prefix_cache = PrefixCacheIndex()
+        self.reusable_prefixes = {}
+        self._prefix_order = []
+        max_seq_len = max((len(request.prompt) + request.max_new_tokens for request in requests), default=1)
+        total_rows = self.max_active_requests + self.prefix_cache_capacity
+        self._cache = self._allocate_cache(max(1, total_rows), max(1, max_seq_len))
+        if not hasattr(self._cache, "for_rows"):
+            raise ValueError("model cache must support row views for persistent serving")
+        self._free_active_rows = list(range(self.max_active_requests))
+        self._free_prefix_rows = list(range(self.max_active_requests, total_rows))
+        self.stats.persistent_cache_rows = total_rows
 
     def _prefill_many(
         self,
@@ -153,7 +170,7 @@ class ContinuousBatchEngine:
                     )
                 )
                 continue
-            if reusable is not None and self._cache_supports_copy(reusable.cache):
+            if reusable is not None and prefix_hit_tokens > 0:
                 active.append(self._prefill_one(original_index, request, step, prefix_hit_tokens, reusable))
             else:
                 batchable[len(request.prompt)].append((original_index, request, prefix_hit_tokens))
@@ -172,26 +189,25 @@ class ContinuousBatchEngine:
         step: int,
     ) -> list[_ActiveRequest]:
         prompt_len = len(group[0][1].prompt)
-        max_new_tokens = max(request.max_new_tokens for _, request, _ in group)
+        rows = [self._acquire_active_row() for _ in group]
         prompts = torch.tensor([request.prompt for _, request, _ in group], device=self.device, dtype=torch.long)
-        cache = self._allocate_cache(len(group), prompt_len + max_new_tokens)
-        logits, batch_cache = self.model(prompts, cache=cache, use_cache=True)  # type: ignore[misc]
+        cache_view = self._cache_view(rows)
+        logits, _ = self.model(prompts, cache=cache_view, use_cache=True)  # type: ignore[misc]
         self._record_model_call("prefill", len(group))
         next_tokens = sample_next_token(logits[:, -1, :], self.temperature).detach().cpu().tolist()
 
         active = []
-        for row, (original_index, request, prefix_hit_tokens) in enumerate(group):
-            request_cache = self._allocate_cache(1, prompt_len + request.max_new_tokens)
-            request_cache.copy_prefix_from(batch_cache, prompt_len, source_row=row)  # type: ignore[attr-defined]
-            self._store_reusable_prefix(request.request_id, request.prompt, request_cache, logits[row : row + 1])
-            next_token = int(next_tokens[row])
+        for row_index, (original_index, request, prefix_hit_tokens) in enumerate(group):
+            row = rows[row_index]
+            self._store_reusable_prefix(request.request_id, request.prompt, row, logits[row_index : row_index + 1])
+            next_token = int(next_tokens[row_index])
             active.append(
                 _ActiveRequest(
                     original_index=original_index,
                     request=request,
                     tokens=[*request.prompt, next_token],
                     generated=1,
-                    cache=request_cache,
+                    row=row,
                     last_token=next_token,
                     prefix_hit_tokens=prefix_hit_tokens,
                     started_step=step,
@@ -207,18 +223,18 @@ class ContinuousBatchEngine:
         prefix_hit_tokens: int,
         reusable: _ReusablePrefix | None,
     ) -> _ActiveRequest:
-        cache = self._allocate_cache(1, len(request.prompt) + request.max_new_tokens)
+        row = self._acquire_active_row()
         suffix = request.prompt
         logits: Tensor
-        if reusable is not None and prefix_hit_tokens > 0 and self._cache_supports_copy(cache):
-            cache.copy_prefix_from(reusable.cache, prefix_hit_tokens)  # type: ignore[attr-defined]
+        if reusable is not None and prefix_hit_tokens > 0:
+            self._copy_prefix(reusable.row, row, prefix_hit_tokens)
             suffix = request.prompt[prefix_hit_tokens:]
             self.stats.prefix_reuse_requests += 1
             self.stats.prefix_reuse_tokens += prefix_hit_tokens
 
         if suffix:
             input_ids = torch.tensor([suffix], device=self.device, dtype=torch.long)
-            logits, cache = self.model(input_ids, cache=cache, use_cache=True)  # type: ignore[misc]
+            logits, _ = self.model(input_ids, cache=self._cache_view([row]), use_cache=True)  # type: ignore[misc]
             self._record_model_call("prefill", 1)
         elif reusable is not None:
             logits = reusable.logits.to(self.device)
@@ -226,13 +242,13 @@ class ContinuousBatchEngine:
             raise RuntimeError("empty prompt suffix without a reusable prefix")
 
         next_token = int(sample_next_token(logits[:, -1, :], self.temperature).item())
-        self._store_reusable_prefix(request.request_id, request.prompt, cache, logits)
+        self._store_reusable_prefix(request.request_id, request.prompt, row, logits)
         return _ActiveRequest(
             original_index=original_index,
             request=request,
             tokens=[*request.prompt, next_token],
             generated=1,
-            cache=cache,
+            row=row,
             last_token=next_token,
             prefix_hit_tokens=prefix_hit_tokens,
             started_step=step,
@@ -247,7 +263,7 @@ class ContinuousBatchEngine:
         live: list[_ActiveRequest] = []
         for state in active:
             if self._should_finish_before_decode(state):
-                indexed_results.append((state.original_index, self._finish(state, step)))
+                indexed_results.append((state.original_index, self._finish_and_release(state, step)))
             else:
                 live.append(state)
 
@@ -262,55 +278,44 @@ class ContinuousBatchEngine:
         return indexed_results, next_active
 
     def _decode_groups(self, states: list[_ActiveRequest]) -> list[list[_ActiveRequest]]:
-        grouped: dict[tuple[str, int], list[_ActiveRequest]] = defaultdict(list)
-        unbatchable: list[list[_ActiveRequest]] = []
+        grouped: dict[int, list[_ActiveRequest]] = defaultdict(list)
         for state in states:
-            if not self._cache_supports_copy(state.cache):
-                unbatchable.append([state])
-                continue
-            grouped[(self._cache_backend(state.cache), self._cache_seq_len(state.cache))].append(state)
-        return [*unbatchable, *grouped.values()]
+            grouped[self._row_seq_len(state.row)].append(state)
+        return list(grouped.values())
 
     def _decode_batch(self, states: list[_ActiveRequest], step: int) -> list[_ActiveRequest | ServingResult]:
-        seq_len = self._cache_seq_len(states[0].cache)
-        max_seq_len = max(self._cache_max_seq_len(state.cache) for state in states)
-        batch_cache = self._allocate_cache(len(states), max_seq_len)
-        for row, state in enumerate(states):
-            batch_cache.copy_prefix_from(state.cache, seq_len, dest_row=row)  # type: ignore[attr-defined]
+        rows = [state.row for state in states]
         input_ids = torch.tensor([[state.last_token] for state in states], device=self.device, dtype=torch.long)
-        logits, batch_cache = self.model(input_ids, cache=batch_cache, use_cache=True)  # type: ignore[misc]
+        logits, _ = self.model(input_ids, cache=self._cache_view(rows), use_cache=True)  # type: ignore[misc]
         self._record_model_call("decode", len(states))
         next_tokens = sample_next_token(logits[:, -1, :], self.temperature).detach().cpu().tolist()
 
         decoded: list[_ActiveRequest | ServingResult] = []
-        for row, state in enumerate(states):
-            next_token = int(next_tokens[row])
-            state.cache = self._allocate_cache(1, max_seq_len)
-            state.cache.copy_prefix_from(batch_cache, seq_len + 1, source_row=row)  # type: ignore[attr-defined]
+        for row_index, state in enumerate(states):
+            next_token = int(next_tokens[row_index])
             state.tokens.append(next_token)
             state.generated += 1
             state.last_token = next_token
             if self._should_finish_after_decode(state):
-                decoded.append(self._finish(state, step))
+                decoded.append(self._finish_and_release(state, step))
             else:
                 decoded.append(state)
         return decoded
 
     def _decode_one(self, state: _ActiveRequest, step: int) -> _ActiveRequest | ServingResult:
         input_ids = torch.tensor([[state.last_token]], device=self.device, dtype=torch.long)
-        logits, cache = self.model(input_ids, cache=state.cache, use_cache=True)  # type: ignore[misc]
+        logits, _ = self.model(input_ids, cache=self._cache_view([state.row]), use_cache=True)  # type: ignore[misc]
         self._record_model_call("decode", 1)
         next_token = int(sample_next_token(logits[:, -1, :], self.temperature).item())
-        state.cache = cache
         state.tokens.append(next_token)
         state.generated += 1
         state.last_token = next_token
         if self._should_finish_after_decode(state):
-            return self._finish(state, step)
+            return self._finish_and_release(state, step)
         return state
 
-    def _finish(self, state: _ActiveRequest, step: int) -> ServingResult:
-        return ServingResult(
+    def _finish_and_release(self, state: _ActiveRequest, step: int) -> ServingResult:
+        result = ServingResult(
             state.request.request_id,
             tuple(state.tokens),
             state.prefix_hit_tokens,
@@ -318,19 +323,73 @@ class ContinuousBatchEngine:
             state.started_step,
             step,
         )
+        self._release_active_row(state.row)
+        return result
 
-    def _store_reusable_prefix(self, request_id: str, tokens: tuple[int, ...], cache: object, logits: Tensor) -> None:
+    def _store_reusable_prefix(self, request_id: str, tokens: tuple[int, ...], source_row: int, logits: Tensor) -> None:
         entry = self.prefix_cache.add(request_id, tokens)
-        if not self._cache_supports_copy(cache):
+        old_prefix = self.reusable_prefixes.pop(entry.route_id, None)
+        if old_prefix is not None:
+            self._clear_physical_row(old_prefix.row)
+            if entry.route_id in self._prefix_order:
+                self._prefix_order.remove(entry.route_id)
+            self._free_prefix_rows.append(old_prefix.row)
+            self._free_prefix_rows.sort()
+        prefix_row = self._acquire_prefix_row()
+        if prefix_row is None:
             return
-        prefix_cache = self._allocate_cache(1, max(1, len(tokens)))
-        prefix_cache.copy_prefix_from(cache, len(tokens))  # type: ignore[attr-defined]
+        self._copy_prefix(source_row, prefix_row, len(tokens))
         self.reusable_prefixes[entry.route_id] = _ReusablePrefix(
             entry.route_id,
             tokens,
-            prefix_cache,
+            prefix_row,
             logits[:, -1:, :].detach().clone().cpu(),
         )
+        self._prefix_order.append(entry.route_id)
+
+    def _copy_prefix(self, source_row: int, dest_row: int, tokens: int) -> None:
+        cache = self._require_cache()
+        cache.copy_prefix_from(cache, tokens, source_row=source_row, dest_row=dest_row)  # type: ignore[attr-defined]
+
+    def _acquire_active_row(self) -> int:
+        if not self._free_active_rows:
+            raise RuntimeError("no active serving rows available")
+        row = self._free_active_rows.pop(0)
+        self._clear_physical_row(row)
+        return row
+
+    def _release_active_row(self, row: int) -> None:
+        self._clear_physical_row(row)
+        if row not in self._free_active_rows:
+            self._free_active_rows.append(row)
+            self._free_active_rows.sort()
+
+    def _acquire_prefix_row(self) -> int | None:
+        if self.prefix_cache_capacity == 0:
+            return None
+        if self._free_prefix_rows:
+            return self._free_prefix_rows.pop(0)
+        while self._prefix_order:
+            route_id = self._prefix_order.pop(0)
+            prefix = self.reusable_prefixes.pop(route_id, None)
+            if prefix is not None:
+                self._clear_physical_row(prefix.row)
+                return prefix.row
+        return None
+
+    def _cache_view(self, rows: list[int]) -> object:
+        return self._require_cache().for_rows(tuple(rows))  # type: ignore[attr-defined]
+
+    def _require_cache(self) -> object:
+        if self._cache is None:
+            raise RuntimeError("serving cache has not been initialized")
+        return self._cache
+
+    def _clear_physical_row(self, row: int) -> None:
+        self._require_cache().for_rows((row,)).clear_row(0)  # type: ignore[attr-defined]
+
+    def _row_seq_len(self, row: int) -> int:
+        return int(self._cache_view([row]).seq_len)  # type: ignore[attr-defined]
 
     def _allocate_cache(self, batch_size: int, max_seq_len: int) -> object:
         allocate_cache = getattr(self.model, "allocate_cache")
@@ -357,22 +416,6 @@ class ContinuousBatchEngine:
         else:
             raise ValueError(f"unknown model call kind: {kind}")
         self.stats.max_model_batch_size = max(self.stats.max_model_batch_size, batch_size)
-
-    @staticmethod
-    def _cache_supports_copy(cache: object) -> bool:
-        return hasattr(cache, "copy_prefix_from")
-
-    @staticmethod
-    def _cache_seq_len(cache: object) -> int:
-        return int(getattr(cache, "seq_len"))
-
-    @staticmethod
-    def _cache_max_seq_len(cache: object) -> int:
-        return int(getattr(cache, "max_seq_len"))
-
-    @staticmethod
-    def _cache_backend(cache: object) -> str:
-        return str(getattr(cache, "cache_backend", "unknown"))
 
     @staticmethod
     def _should_finish_before_decode(state: _ActiveRequest) -> bool:

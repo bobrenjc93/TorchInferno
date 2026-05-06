@@ -29,8 +29,8 @@ to grow toward production-grade SOTA inference.
 - Greedy and temperature sampling.
 - Ragged request API with dense continuous-batching execution buckets.
 - Token-step continuous serving harness with admission, paged-cache policy, and
-  prefix-hit accounting, prefix KV copy reuse, and same-shape prefill/decode
-  microbatching.
+  prefix-hit accounting, shared prefix-page reuse, persistent row-assigned
+  paged cache state, and same-shape prefill/decode microbatching.
 - Deterministic time-sliced virtual GPU simulation.
 - Disaggregated prefill/decode planner with network latency modeling.
 - Fake process groups and fake collectives for single-process distributed
@@ -390,8 +390,9 @@ Implemented as working code and tests:
 - Pattern-match graph replacement entry point.
 - Native DeepSeek dense/paged cache backend selection.
 - Paged KV allocation and paged causal attention reference.
-- Token-step continuous serving engine with prefix-hit accounting, prefix KV
-  copy reuse, and same-shape prefill/decode microbatching.
+- Token-step continuous serving engine with prefix-hit accounting, shared
+  prefix-page reuse, persistent row-assigned paged cache state, and same-shape
+  prefill/decode microbatching.
 - Radix/prefix-aware routing and prefix cache lookup.
 - Bursty traffic simulation.
 - Piecewise CUDA graph API scaffold.
@@ -406,11 +407,12 @@ Implemented as working code and tests:
 Still intentionally future work:
 
 - Validated reference files for downloaded production weights.
-- Full production paged/radix/flex attention and fused MoE/NVFP4 kernels beyond
-  the current correct references and decode-focused Triton specialization.
+- Fully ragged persistent batching and production paged/radix/flex attention
+  kernels without prefill materialization.
+- Fused MoE/NVFP4 kernels beyond the current correct references and
+  decode-focused Triton specialization.
 - Piecewise CUDA graph capture with static device buffers.
 - Monarch-backed distributed execution instead of the fake fallback.
-- Shared-page cross-request KV reuse instead of current prefix KV copy reuse.
 - Full production serving scheduler with cancellation and async transport.
 
 ## Development Principles

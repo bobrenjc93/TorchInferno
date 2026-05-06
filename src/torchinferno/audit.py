@@ -66,8 +66,16 @@ def build_audit_report() -> TorchInfernoAudit:
             FeatureAudit("flex attention", "reference", "Fallback q/k/v contract exists; real flex dispatch is still future work."),
             FeatureAudit("piecewise cudagraphs", "scaffold", "Named pieces exist; static CUDA capture buffers are not implemented."),
             FeatureAudit("paged attention", "integrated", "Native DeepSeek can use paged decode with torch/Triton fallback."),
-            FeatureAudit("prefix KV reuse", "integrated", "Serving copies reusable prefix KV into new request caches."),
-            FeatureAudit("continuous batching", "bridge", "Serving batches same-shape prefill/decode through temporary batch caches."),
+            FeatureAudit(
+                "prefix KV reuse",
+                "integrated",
+                "Serving aliases reusable prefix pages inside persistent native paged caches.",
+            ),
+            FeatureAudit(
+                "continuous batching",
+                "bridge",
+                "Persistent row-assigned cache batches same-length prefill/decode groups without temporary cache rebuilds.",
+            ),
             FeatureAudit("disaggregated prefill/decode", "simulated", "Planner models rank assignment and network latency."),
             FeatureAudit("NVFP4 graph passes", "reference", "NVFP4 tensor contract and pass hook exist; fused kernel remains open."),
             FeatureAudit("research harness", "minimal", "Named experiments and metric comparison are available."),

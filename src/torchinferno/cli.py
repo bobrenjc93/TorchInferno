@@ -322,6 +322,7 @@ def run_serve_smoke(args: argparse.Namespace) -> int:
         f"prefill_model_calls={engine.stats.prefill_model_calls} "
         f"decode_model_calls={engine.stats.decode_model_calls} "
         f"prefix_reuse_tokens={engine.stats.prefix_reuse_tokens} "
+        f"persistent_cache_rows={engine.stats.persistent_cache_rows} "
         f"max_model_batch_size={engine.stats.max_model_batch_size}"
     )
     for result in results:

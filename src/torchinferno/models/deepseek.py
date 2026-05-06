@@ -190,40 +190,87 @@ class DeepSeekLayerKVCache:
     ) -> None:
         self.keys = torch.empty((batch_size, num_heads, max_seq_len, qk_head_dim), device=device, dtype=dtype)
         self.values = torch.empty((batch_size, num_heads, max_seq_len, v_head_dim), device=device, dtype=dtype)
-        self.seq_len = 0
+        self.seq_lens = [0 for _ in range(batch_size)]
         self.max_seq_len = max_seq_len
         self.batch_size = batch_size
 
-    def append(self, keys: Tensor, values: Tensor) -> tuple[Tensor, Tensor]:
+    @property
+    def seq_len(self) -> int:
+        return self.seq_len_for_rows(tuple(range(self.batch_size)))
+
+    def seq_len_for_rows(self, row_indices: tuple[int, ...]) -> int:
+        if not row_indices:
+            return 0
+        if any(row < 0 or row >= self.batch_size for row in row_indices):
+            raise ValueError("cache row out of range")
+        seq_len = self.seq_lens[row_indices[0]]
+        if any(self.seq_lens[row] != seq_len for row in row_indices):
+            raise ValueError("selected cache rows must have the same sequence length")
+        return seq_len
+
+    def append(
+        self,
+        keys: Tensor,
+        values: Tensor,
+        *,
+        row_indices: tuple[int, ...] | None = None,
+    ) -> tuple[Tensor, Tensor]:
         batch, _, tokens, _ = keys.shape
-        if batch > self.batch_size:
+        row_indices = tuple(range(batch)) if row_indices is None else row_indices
+        if batch != len(row_indices):
+            raise ValueError("cache row count must match incoming batch")
+        if any(row < 0 or row >= self.batch_size for row in row_indices):
             raise ValueError("cache batch is smaller than incoming batch")
-        end = self.seq_len + tokens
+        start = self.seq_len_for_rows(row_indices)
+        end = start + tokens
         if end > self.max_seq_len:
             raise ValueError("KV cache capacity exceeded")
-        self.keys[:batch, :, self.seq_len : end, :].copy_(keys)
-        self.values[:batch, :, self.seq_len : end, :].copy_(values)
-        self.seq_len = end
-        return self.keys[:batch, :, :end, :], self.values[:batch, :, :end, :]
+        for incoming_row, cache_row in enumerate(row_indices):
+            self.keys[cache_row, :, start:end, :].copy_(keys[incoming_row])
+            self.values[cache_row, :, start:end, :].copy_(values[incoming_row])
+            self.seq_lens[cache_row] = end
+        return (
+            torch.stack([self.keys[row, :, :end, :] for row in row_indices], dim=0),
+            torch.stack([self.values[row, :, :end, :] for row in row_indices], dim=0),
+        )
 
     def copy_prefix_from(
         self,
-        source: "DeepSeekLayerKVCache",
+        source: "DeepSeekLayerKVCache | PagedDeepSeekLayerKVCache",
         tokens: int,
         *,
         source_row: int = 0,
         dest_row: int = 0,
     ) -> None:
-        if tokens < 0 or tokens > source.seq_len:
-            raise ValueError("tokens must be in the source cache range")
-        if source_row >= source.batch_size or dest_row >= self.batch_size:
+        if (
+            source_row < 0
+            or source_row >= source.batch_size
+            or dest_row < 0
+            or dest_row >= self.batch_size
+        ):
             raise ValueError("cache row out of range")
+        source_is_dense = isinstance(source, DeepSeekLayerKVCache)
+        source_len = source.seq_lens[source_row] if source_is_dense else source.seq_len_for_row(source_row)
+        if tokens < 0 or tokens > source_len:
+            raise ValueError("tokens must be in the source cache range")
         if tokens > self.max_seq_len:
             raise ValueError("KV cache capacity exceeded")
         if tokens:
-            self.keys[dest_row, :, :tokens, :].copy_(source.keys[source_row, :, :tokens, :])
-            self.values[dest_row, :, :tokens, :].copy_(source.values[source_row, :, :tokens, :])
-        self.seq_len = tokens
+            if source_is_dense:
+                source_keys = source.keys[source_row, :, :tokens, :]
+                source_values = source.values[source_row, :, :tokens, :]
+            else:
+                source_keys, source_values = source.materialize_row(source_row)
+                source_keys = source_keys[:, :tokens, :]
+                source_values = source_values[:, :tokens, :]
+            self.keys[dest_row, :, :tokens, :].copy_(source_keys)
+            self.values[dest_row, :, :tokens, :].copy_(source_values)
+        self.seq_lens[dest_row] = tokens
+
+    def clear_row(self, row: int) -> None:
+        if row < 0 or row >= self.batch_size:
+            raise ValueError("cache row out of range")
+        self.seq_lens[row] = 0
 
 
 class PagedDeepSeekLayerKVCache:
@@ -256,29 +303,62 @@ class PagedDeepSeekLayerKVCache:
             dtype=dtype,
         )
         self.request_ids = tuple(f"batch-{idx}" for idx in range(batch_size))
-        self.seq_len = 0
         self.max_seq_len = max_seq_len
         self.batch_size = batch_size
 
-    def append(self, keys: Tensor, values: Tensor) -> tuple[Tensor, Tensor]:
-        batch = self._append_pages(keys, values)
-        return self.materialize(batch)
+    @property
+    def seq_len(self) -> int:
+        return self.seq_len_for_rows(tuple(range(self.batch_size)))
 
-    def append_and_attend(self, query: Tensor, keys: Tensor, values: Tensor, positions: Tensor) -> Tensor:
-        batch = self._append_pages(keys, values)
+    def seq_len_for_row(self, row: int) -> int:
+        if row < 0 or row >= self.batch_size:
+            raise ValueError("cache row out of range")
+        return self.pages.sequence_length(self.request_ids[row])
+
+    def seq_len_for_rows(self, row_indices: tuple[int, ...]) -> int:
+        if not row_indices:
+            return 0
+        seq_len = self.seq_len_for_row(row_indices[0])
+        if any(self.seq_len_for_row(row) != seq_len for row in row_indices):
+            raise ValueError("selected cache rows must have the same sequence length")
+        return seq_len
+
+    def append(
+        self,
+        keys: Tensor,
+        values: Tensor,
+        *,
+        row_indices: tuple[int, ...] | None = None,
+    ) -> tuple[Tensor, Tensor]:
+        row_indices = self._append_pages(keys, values, row_indices=row_indices)
+        return self.materialize(row_indices)
+
+    def append_and_attend(
+        self,
+        query: Tensor,
+        keys: Tensor,
+        values: Tensor,
+        positions: Tensor,
+        *,
+        row_indices: tuple[int, ...] | None = None,
+    ) -> Tensor:
+        row_indices = self._append_pages(keys, values, row_indices=row_indices)
         if keys.size(2) == 1:
             position = int(positions[-1].item())
             return torch.stack(
-                [paged_decode_attention(query[row], self.pages, self.request_ids[row], position) for row in range(batch)],
+                [
+                    paged_decode_attention(query[incoming_row], self.pages, self.request_ids[cache_row], position)
+                    for incoming_row, cache_row in enumerate(row_indices)
+                ],
                 dim=0,
             )
-        materialized_keys, materialized_values = self.materialize(batch)
+        materialized_keys, materialized_values = self.materialize(row_indices)
         return dense_causal_attention(query, materialized_keys, materialized_values, positions)
 
-    def materialize(self, batch: int) -> tuple[Tensor, Tensor]:
+    def materialize(self, row_indices: tuple[int, ...]) -> tuple[Tensor, Tensor]:
         keys = []
         values = []
-        for row in range(batch):
+        for row in row_indices:
             row_keys, row_values = self.materialize_row(row)
             keys.append(row_keys)
             values.append(row_values)
@@ -297,54 +377,134 @@ class PagedDeepSeekLayerKVCache:
     ) -> None:
         if tokens < 0:
             raise ValueError("tokens must be non-negative")
-        if dest_row >= self.batch_size:
+        if (
+            source_row < 0
+            or source_row >= source.batch_size
+            or dest_row < 0
+            or dest_row >= self.batch_size
+        ):
             raise ValueError("cache row out of range")
         if tokens > self.max_seq_len:
             raise ValueError("KV cache capacity exceeded")
         if isinstance(source, PagedDeepSeekLayerKVCache):
-            if tokens > source.seq_len or source_row >= source.batch_size:
+            source_len = source.seq_len_for_row(source_row)
+            if tokens > source_len:
                 raise ValueError("source cache range is invalid")
+            if source.pages is self.pages and source_row == dest_row:
+                return
+            self.clear_row(dest_row)
+            if tokens and source.pages is self.pages:
+                self.pages.alias_prefix(source.request_ids[source_row], self.request_ids[dest_row], tokens)
+                return
             source_keys, source_values = source.materialize_row(source_row)
         else:
-            if tokens > source.seq_len or source_row >= source.batch_size:
+            source_len = source.seq_lens[source_row]
+            if tokens > source_len:
                 raise ValueError("source cache range is invalid")
             source_keys = source.keys[source_row, :, :tokens, :]
             source_values = source.values[source_row, :, :tokens, :]
+            self.clear_row(dest_row)
         if tokens:
             self.pages.append(self.request_ids[dest_row], source_keys[:, :tokens, :], source_values[:, :tokens, :])
-        self.seq_len = tokens
 
-    def _append_pages(self, keys: Tensor, values: Tensor) -> int:
+    def clear_row(self, row: int) -> None:
+        if row < 0 or row >= self.batch_size:
+            raise ValueError("cache row out of range")
+        self.pages.free(self.request_ids[row])
+
+    def _append_pages(
+        self,
+        keys: Tensor,
+        values: Tensor,
+        *,
+        row_indices: tuple[int, ...] | None = None,
+    ) -> tuple[int, ...]:
         batch, _, tokens, _ = keys.shape
-        if batch > self.batch_size:
+        row_indices = tuple(range(batch)) if row_indices is None else row_indices
+        if batch != len(row_indices):
+            raise ValueError("cache row count must match incoming batch")
+        if any(row < 0 or row >= self.batch_size for row in row_indices):
             raise ValueError("cache batch is smaller than incoming batch")
-        end = self.seq_len + tokens
+        start = self.seq_len_for_rows(row_indices)
+        end = start + tokens
         if end > self.max_seq_len:
             raise ValueError("KV cache capacity exceeded")
-        for row in range(batch):
-            self.pages.append(self.request_ids[row], keys[row], values[row])
-        self.seq_len = end
-        return batch
+        for incoming_row, cache_row in enumerate(row_indices):
+            self.pages.append(self.request_ids[cache_row], keys[incoming_row], values[incoming_row])
+        return row_indices
 
 
 class DeepSeekCache:
-    def __init__(self, layers: list[DeepSeekLayerKVCache | PagedDeepSeekLayerKVCache], *, cache_backend: str) -> None:
+    def __init__(
+        self,
+        layers: list[DeepSeekLayerKVCache | PagedDeepSeekLayerKVCache],
+        *,
+        cache_backend: str,
+        row_indices: tuple[int, ...] | None = None,
+    ) -> None:
         self.layers = layers
         self.cache_backend = cache_backend
+        self.row_indices = row_indices
+
+    @property
+    def selected_rows(self) -> tuple[int, ...]:
+        if self.row_indices is not None:
+            return self.row_indices
+        if not self.layers:
+            return ()
+        return tuple(range(self.layers[0].batch_size))
 
     @property
     def seq_len(self) -> int:
-        return self.layers[0].seq_len if self.layers else 0
+        return self.layers[0].seq_len_for_rows(self.selected_rows) if self.layers else 0
 
     @property
     def max_seq_len(self) -> int:
         return self.layers[0].max_seq_len if self.layers else 0
 
-    def copy_prefix_from(self, source: "DeepSeekCache", tokens: int, *, source_row: int = 0, dest_row: int = 0) -> None:
+    @property
+    def batch_size(self) -> int:
+        return len(self.selected_rows)
+
+    def for_rows(self, row_indices: tuple[int, ...] | list[int]) -> "DeepSeekCache":
+        rows = tuple(row_indices)
+        if self.layers and any(row < 0 or row >= self.layers[0].batch_size for row in rows):
+            raise ValueError("cache row out of range")
+        return DeepSeekCache(self.layers, cache_backend=self.cache_backend, row_indices=rows)
+
+    def copy_prefix_from(
+        self,
+        source: "DeepSeekCache",
+        tokens: int,
+        *,
+        source_row: int = 0,
+        dest_row: int = 0,
+    ) -> None:
         if len(self.layers) != len(source.layers):
             raise ValueError("source cache must have the same number of layers")
+        if (
+            source_row < 0
+            or source_row >= len(source.selected_rows)
+            or dest_row < 0
+            or dest_row >= len(self.selected_rows)
+        ):
+            raise ValueError("cache row out of range")
+        source_physical_row = source.selected_rows[source_row]
+        dest_physical_row = self.selected_rows[dest_row]
         for dest_layer, source_layer in zip(self.layers, source.layers):
-            dest_layer.copy_prefix_from(source_layer, tokens, source_row=source_row, dest_row=dest_row)
+            dest_layer.copy_prefix_from(
+                source_layer,
+                tokens,
+                source_row=source_physical_row,
+                dest_row=dest_physical_row,
+            )
+
+    def clear_row(self, row: int) -> None:
+        if row < 0 or row >= len(self.selected_rows):
+            raise ValueError("cache row out of range")
+        physical_row = self.selected_rows[row]
+        for layer in self.layers:
+            layer.clear_row(physical_row)
 
     @classmethod
     def allocate(
@@ -427,6 +587,7 @@ class DeepSeekAttention(nn.Module):
         hidden_states: Tensor,
         positions: Tensor,
         cache: Optional[DeepSeekLayerKVCache | PagedDeepSeekLayerKVCache],
+        row_indices: tuple[int, ...] | None = None,
     ) -> Tensor:
         batch, tokens, _ = hidden_states.shape
         heads = self.config.num_attention_heads
@@ -456,10 +617,10 @@ class DeepSeekAttention(nn.Module):
         query = torch.cat([q_nope, q_pe], dim=-1)
 
         if isinstance(cache, PagedDeepSeekLayerKVCache):
-            out = cache.append_and_attend(query, key, value, positions)
+            out = cache.append_and_attend(query, key, value, positions, row_indices=row_indices)
         else:
             if cache is not None:
-                key, value = cache.append(key, value)
+                key, value = cache.append(key, value, row_indices=row_indices)
             out = dense_causal_attention(query, key, value, positions)
 
         out = out.transpose(1, 2).contiguous().view(batch, tokens, self.config.attention_output_size)
@@ -564,8 +725,9 @@ class DeepSeekDecoderLayer(nn.Module):
         x: Tensor,
         positions: Tensor,
         cache: Optional[DeepSeekLayerKVCache | PagedDeepSeekLayerKVCache],
+        row_indices: tuple[int, ...] | None = None,
     ) -> Tensor:
-        x = x + self.self_attn(self.input_layernorm(x), positions, cache)
+        x = x + self.self_attn(self.input_layernorm(x), positions, cache, row_indices)
         x = x + self.mlp(self.post_attention_layernorm(x))
         return x
 
@@ -603,6 +765,9 @@ class DeepSeekV32Model(nn.Module):
                 cache_backend="dense",
             )
         past_len = active_cache.seq_len if active_cache is not None else 0
+        row_indices = active_cache.selected_rows if active_cache is not None else None
+        if row_indices is not None and len(row_indices) != batch:
+            raise ValueError("cache row selection must match input batch size")
         if past_len + tokens > self.config.max_position_embeddings:
             raise ValueError("input sequence exceeds configured max_position_embeddings")
 
@@ -610,7 +775,7 @@ class DeepSeekV32Model(nn.Module):
         hidden_states = self.embed_tokens(input_ids)
         for layer_idx, layer in enumerate(self.layers):
             layer_cache = active_cache.layers[layer_idx] if active_cache is not None else None
-            hidden_states = layer(hidden_states, positions, layer_cache)
+            hidden_states = layer(hidden_states, positions, layer_cache, row_indices)
         return self.norm(hidden_states), active_cache
 
 

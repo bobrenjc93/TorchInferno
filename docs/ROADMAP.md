@@ -25,22 +25,21 @@ The CLI view is `torchinferno audit`.
 | Flex attention | reference | Eager q/k/v fallback exists; real flex dispatch remains open. |
 | Piecewise CUDA graphs | scaffold | Named runner exists; static CUDA capture buffers remain open. |
 | Paged attention | integrated | Native DeepSeek paged decode path plus torch/Triton fallback. |
-| Prefix KV reuse | integrated | Serving copies reusable prefix KV into new request caches. |
-| Continuous batching | bridge | Same-shape prefill/decode groups are batched through temporary caches. |
+| Prefix KV reuse | integrated | Serving aliases reusable prefix pages across model layer cache rows with copy-on-write protection. |
+| Continuous batching | bridge | Persistent row-assigned cache batches same-length prefill/decode groups without rebuilding temporary caches. |
 | Disaggregated prefill/decode | simulated | Planner models rank assignment and transfer latency. |
 | NVFP4 graph passes | reference | Quantized tensor contract and graph hook exist; fused kernel remains open. |
 | Research harness | minimal | Named experiments and metric comparison exist. |
 
 ## Next Production Milestones
 
-1. Replace temporary-cache decode batching with persistent row-assigned paged
-   cache state and per-row sequence lengths.
-2. Replace prefix KV copy with shared page aliasing across model layer caches.
-3. Add batched paged prefill and decode kernels that accept request/page tables.
-4. Add static buffer planning and CUDA graph capture for decode pieces.
-5. Implement real flex-attention dispatch behind the current fallback contract.
-6. Add Monarch-backed distributed execution behind the fake-world interface.
-7. Validate native checkpoint conversion against real production weights with
+1. Add batched paged prefill and decode kernels that accept request/page tables.
+2. Replace multi-token prefill materialization with paged/flex attention over
+   request page tables.
+3. Add static buffer planning and CUDA graph capture for decode pieces.
+4. Implement real flex-attention dispatch behind the current fallback contract.
+5. Add Monarch-backed distributed execution behind the fake-world interface.
+6. Validate native checkpoint conversion against real production weights with
    committed logit references.
-8. Expand graph pattern matching from call-target replacement to subgraph
+7. Expand graph pattern matching from call-target replacement to subgraph
    captures for MLA, grouped MoE, and NVFP4 linear regions.

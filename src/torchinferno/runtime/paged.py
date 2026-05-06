@@ -53,6 +53,16 @@ class PagedKVCache:
     def free_pages(self) -> tuple[int, ...]:
         return tuple(self._free_pages)
 
+    @property
+    def active_request_ids(self) -> tuple[str, ...]:
+        return tuple(self._sequences)
+
+    def has_sequence(self, request_id: str) -> bool:
+        return request_id in self._sequences
+
+    def sequence_length(self, request_id: str) -> int:
+        return self._sequences[request_id].length if request_id in self._sequences else 0
+
     def sequence(self, request_id: str) -> PagedSequence:
         return self._sequences.setdefault(request_id, PagedSequence(request_id))
 
@@ -121,6 +131,8 @@ class PagedKVCache:
         return torch.cat(keys, dim=1), torch.cat(values, dim=1)
 
     def free(self, request_id: str) -> None:
+        if request_id not in self._sequences:
+            return
         seq = self._sequences.pop(request_id)
         for page_id in seq.page_ids:
             self._release_page(page_id)
