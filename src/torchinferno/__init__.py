@@ -20,7 +20,13 @@ from torchinferno.models.conversion import (
 )
 from torchinferno.models.deepseek import DeepSeekV32Config, DeepSeekV32ForCausalLM, tiny_deepseek_v32_config
 from torchinferno.models.dsv4 import DSv4Config, DSv4ForCausalLM, tiny_dsv4_config
-from torchinferno.models.llama3_family import Llama3Config, Llama3V0ForCausalLM, Llama3V1ForCausalLM, tiny_llama3_config
+from torchinferno.models.llama3_family import (
+    Llama3Config,
+    Llama3V0ForCausalLM,
+    Llama3V1ForCausalLM,
+    llama3_70b_config,
+    tiny_llama3_config,
+)
 from torchinferno.models.provenance import ModelVariantSpec
 from torchinferno.models.variants import get_model_variant, list_model_variants, model_variant_lineage
 from torchinferno.profiling import (
@@ -93,6 +99,7 @@ __all__ = [
     "load_logit_reference",
     "load_model_auto",
     "load_text_tokenizer",
+    "llama3_70b_config",
     "get_model_variant",
     "list_model_variants",
     "model_variant_lineage",

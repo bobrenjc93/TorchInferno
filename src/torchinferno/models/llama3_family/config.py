@@ -13,6 +13,7 @@ class Llama3Config:
     num_key_value_heads: int = 8
     max_position_embeddings: int = 8192
     rope_theta: float = 500000.0
+    rope_scaling: dict[str, object] | None = None
     rms_norm_eps: float = 1e-5
     tie_word_embeddings: bool = False
 
@@ -52,7 +53,7 @@ class Llama3Config:
         return cls(**{key: value for key, value in normalized.items() if key in allowed})
 
 
-def tiny_llama3_config(**overrides: int | float | bool) -> Llama3Config:
+def tiny_llama3_config(**overrides: int | float | bool | dict[str, object] | None) -> Llama3Config:
     config = Llama3Config(
         vocab_size=128,
         hidden_size=64,
@@ -61,5 +62,30 @@ def tiny_llama3_config(**overrides: int | float | bool) -> Llama3Config:
         num_attention_heads=4,
         num_key_value_heads=2,
         max_position_embeddings=128,
+    )
+    return replace(config, **overrides)
+
+
+def llama3_70b_config(**overrides: int | float | bool | dict[str, object] | None) -> Llama3Config:
+    """Return the Llama 3 70B architecture config without allocating weights."""
+
+    config = Llama3Config(
+        vocab_size=128256,
+        hidden_size=8192,
+        intermediate_size=28672,
+        num_hidden_layers=80,
+        num_attention_heads=64,
+        num_key_value_heads=8,
+        max_position_embeddings=131072,
+        rope_theta=500000.0,
+        rope_scaling={
+            "factor": 8.0,
+            "high_freq_factor": 4.0,
+            "low_freq_factor": 1.0,
+            "original_max_position_embeddings": 8192,
+            "rope_type": "llama3",
+        },
+        rms_norm_eps=1e-5,
+        tie_word_embeddings=False,
     )
     return replace(config, **overrides)

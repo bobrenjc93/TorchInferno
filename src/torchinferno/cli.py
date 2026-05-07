@@ -3,12 +3,19 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+import subprocess
 import sys
 import time
 
 import torch
 
 from torchinferno.audit import build_audit_report
+from torchinferno.benchmarks import (
+    LLAMA3_70B_MODEL,
+    VLLMBenchmarkConfig,
+    plot_vllm_benchmark_results,
+    run_vllm_benchmark_suite,
+)
 from torchinferno.compiler import CompileConfig, compile_forward
 from torchinferno.graph import trace_with_make_fx
 from torchinferno.models.auto import load_model_auto
@@ -102,6 +109,64 @@ def run_model_variants(args: argparse.Namespace) -> int:
             f"{spec.family}:{spec.variant} stage={spec.stage} parents={parents} "
             f"status={spec.status} class={spec.class_path} ops={spec.ops_module}"
         )
+    return 0
+
+
+def run_vllm_bench_suite(args: argparse.Namespace) -> int:
+    config = VLLMBenchmarkConfig(
+        output_dir=args.output_dir,
+        model=args.model,
+        vllm_root=args.vllm_root,
+        python=args.python,
+        tensor_parallel_size=args.tensor_parallel_size,
+        dtype=args.dtype,
+        input_len=args.input_len,
+        output_len=args.output_len,
+        batch_size=args.batch_size,
+        num_iters_warmup=args.num_iters_warmup,
+        num_iters=args.num_iters,
+        num_prompts=args.num_prompts,
+        dataset_name=args.dataset_name,
+        request_rate=args.request_rate,
+        throughput_backend=args.throughput_backend,
+        serve_backend=args.serve_backend,
+        base_url=args.base_url,
+        temperature=args.temperature,
+        benchmarks=tuple(args.benchmarks),
+        disable_detokenize=args.disable_detokenize,
+        trust_remote_code=args.trust_remote_code,
+        enforce_eager=args.enforce_eager,
+        max_model_len=args.max_model_len,
+        gpu_memory_utilization=args.gpu_memory_utilization,
+        engine_args=tuple(args.engine_arg or ()),
+        throughput_args=tuple(args.throughput_arg or ()),
+        serve_args=tuple(args.serve_arg or ()),
+    )
+    try:
+        artifacts = run_vllm_benchmark_suite(config, run=args.run, plot=not args.no_plot)
+    except subprocess.CalledProcessError as error:
+        print("TorchInferno vLLM benchmark suite failed")
+        print(f"benchmark={args.benchmarks} returncode={error.returncode}")
+        print(f"output_dir={Path(args.output_dir).resolve()}")
+        print("See run_status.json and *.log in the output directory.")
+        return int(error.returncode)
+
+    mode = "ran" if args.run else "planned"
+    print("TorchInferno vLLM benchmark suite")
+    print(f"mode={mode} model={args.model} tp={args.tensor_parallel_size}")
+    print(f"output_dir={artifacts.output_dir}")
+    print(f"commands={artifacts.commands_path}")
+    print(f"summary={artifacts.summary_path}")
+    if artifacts.plot_path is not None:
+        print(f"plot={artifacts.plot_path}")
+    return 0
+
+
+def run_vllm_bench_plot(args: argparse.Namespace) -> int:
+    outputs = plot_vllm_benchmark_results(args.output_dir, output_html=args.output_html, output_csv=args.output_csv)
+    print("TorchInferno vLLM benchmark plot")
+    print(f"html={outputs['html']}")
+    print(f"csv={outputs['csv']}")
     return 0
 
 
@@ -823,6 +888,67 @@ def build_parser() -> argparse.ArgumentParser:
     variants.add_argument("--family", default=None, help="Filter to a model family such as dsv4, dsv3.2, deepseek-v3.2, or llama3.")
     variants.add_argument("--lineage", default=None, help="Print lineage ending at this variant, e.g. --family llama3 --lineage v1.")
     variants.set_defaults(func=run_model_variants)
+
+    vllm_bench = subparsers.add_parser(
+        "vllm-bench-suite",
+        help="Plan or run the vLLM latency, throughput, and serve benchmarks and plot their JSON results.",
+    )
+    vllm_bench.add_argument("output_dir", nargs="?", default=".torchinferno_runs/vllm-llama70b")
+    vllm_bench.add_argument("--model", default=LLAMA3_70B_MODEL, help="Model path or Hugging Face repo ID.")
+    vllm_bench.add_argument("--vllm-root", default="/home/bobren/local/d/vllm", help="Local vLLM checkout to prepend to PYTHONPATH.")
+    vllm_bench.add_argument("--python", default=sys.executable, help="Python executable used to launch vLLM.")
+    vllm_bench.add_argument("--tensor-parallel-size", type=int, default=8)
+    vllm_bench.add_argument("--dtype", default="auto")
+    vllm_bench.add_argument("--input-len", type=int, default=32)
+    vllm_bench.add_argument("--output-len", type=int, default=128)
+    vllm_bench.add_argument("--batch-size", type=int, default=8)
+    vllm_bench.add_argument("--num-iters-warmup", type=int, default=10)
+    vllm_bench.add_argument("--num-iters", type=int, default=30)
+    vllm_bench.add_argument("--num-prompts", type=int, default=1000)
+    vllm_bench.add_argument("--dataset-name", default="random")
+    vllm_bench.add_argument("--request-rate", default="inf")
+    vllm_bench.add_argument("--throughput-backend", default="vllm")
+    vllm_bench.add_argument("--serve-backend", default="vllm")
+    vllm_bench.add_argument("--base-url", default=None, help="Base URL for vLLM serve benchmark; defaults to vLLM's local endpoint.")
+    vllm_bench.add_argument("--temperature", type=float, default=1.0)
+    vllm_bench.add_argument(
+        "--benchmarks",
+        nargs="+",
+        choices=["latency", "throughput", "serve"],
+        default=["latency", "throughput", "serve"],
+    )
+    vllm_bench.add_argument("--run", action="store_true", help="Execute the vLLM commands instead of only writing the plan.")
+    vllm_bench.add_argument("--no-plot", action="store_true", help="Skip performance.html/performance.csv generation.")
+    vllm_bench.add_argument("--disable-detokenize", action="store_true")
+    vllm_bench.add_argument("--trust-remote-code", action="store_true")
+    vllm_bench.add_argument("--enforce-eager", action="store_true")
+    vllm_bench.add_argument("--max-model-len", type=int, default=None)
+    vllm_bench.add_argument("--gpu-memory-utilization", type=float, default=None)
+    vllm_bench.add_argument(
+        "--engine-arg",
+        action="append",
+        default=[],
+        help="Extra EngineArgs flag/value passed to latency and throughput. Repeat as --engine-arg=--flag --engine-arg=value.",
+    )
+    vllm_bench.add_argument(
+        "--throughput-arg",
+        action="append",
+        default=[],
+        help="Extra argument passed only to vllm bench throughput. Repeat once per token.",
+    )
+    vllm_bench.add_argument(
+        "--serve-arg",
+        action="append",
+        default=[],
+        help="Extra argument passed only to vllm bench serve. Repeat once per token.",
+    )
+    vllm_bench.set_defaults(func=run_vllm_bench_suite)
+
+    vllm_plot = subparsers.add_parser("vllm-bench-plot", help="Plot existing vLLM benchmark JSON results.")
+    vllm_plot.add_argument("output_dir")
+    vllm_plot.add_argument("--output-html", default=None)
+    vllm_plot.add_argument("--output-csv", default=None)
+    vllm_plot.set_defaults(func=run_vllm_bench_plot)
 
     smoke = subparsers.add_parser("dsv4-smoke", help="Run a DSv4 end-to-end generation smoke test.")
     smoke.add_argument("--device", default=None, help="Torch device, defaults to cuda when available.")

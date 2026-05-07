@@ -1,4 +1,4 @@
-.PHONY: audit variants smoke test serve perf profile profile-timeslice profile-offload profile-nodes profile-subgraph profile-region profile-pattern disagg
+.PHONY: audit variants smoke test serve perf profile profile-timeslice profile-offload profile-nodes profile-subgraph profile-region profile-pattern vllm-bench-plan disagg
 
 PYTHON ?= python3
 TI_PYTHONPATH ?= src
@@ -12,6 +12,7 @@ REGION_PROFILE_DIR ?= .torchinferno_runs/region-cpu
 PATTERN_PROFILE_DIR ?= .torchinferno_runs/pattern-cpu
 REGION ?= layers.0.attn
 DISAGG_DIR ?= .torchinferno_disagg
+VLLM_BENCH_DIR ?= .torchinferno_runs/vllm-llama70b
 
 audit:
 	PYTHONPATH=$(TI_PYTHONPATH) $(PYTHON) -m torchinferno.cli audit
@@ -53,6 +54,9 @@ profile-region:
 
 profile-pattern:
 	PYTHONPATH=$(TI_PYTHONPATH) $(PYTHON) -m torchinferno.cli profile-pattern $(PATTERN_PROFILE_DIR) --device cpu --batch-size 1 --tokens 3 --hidden-size 16 --warmup 0 --iters 1
+
+vllm-bench-plan:
+	PYTHONPATH=$(TI_PYTHONPATH) $(PYTHON) -m torchinferno.cli vllm-bench-suite $(VLLM_BENCH_DIR)
 
 disagg:
 	PYTHONPATH=$(TI_PYTHONPATH) $(PYTHON) -m torchinferno.cli disagg-init $(DISAGG_DIR) --prefill-ranks 1 --decode-ranks 1 --device cpu

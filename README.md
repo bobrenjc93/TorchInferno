@@ -60,6 +60,11 @@ to grow toward production-grade SOTA inference.
   plus arbitrary FX subgraph extraction by node id. These emit graphs, profiler
   JSON, traces, memory data, and repro scripts.
 - Minimal auto research harness for comparing scheduler/cache/routing policies.
+- Llama 3 70B architecture config for large-model planning without allocating
+  weights.
+- vLLM-compatible benchmark runner for Llama 70B latency, offline throughput,
+  and online serving results, with JSON summaries and HTML/CSV performance
+  plots.
 
 ## Quickstart
 
@@ -93,6 +98,7 @@ PYTHONPATH=src python3 -m torchinferno.cli profile-subgraph .torchinferno_runs/s
 PYTHONPATH=src python3 -m torchinferno.cli profile-region .torchinferno_runs/attn0-cpu --region layers.0.attn --device cpu
 PYTHONPATH=src python3 -m torchinferno.cli profile-pattern .torchinferno_runs/swiglu-pattern-cpu --device cpu
 PYTHONPATH=src python3 -m torchinferno.cli research-smoke
+PYTHONPATH=src python3 -m torchinferno.cli vllm-bench-suite .torchinferno_runs/vllm-llama70b --benchmarks latency throughput serve
 ```
 
 CUDA is optional for the tests, but the DSv4 smoke can run on GPU:
@@ -172,6 +178,16 @@ Current families:
 - `deepseek-v3.2` / `dsv3.2`: native DeepSeek-V3.2 tensor-contract path.
 - `llama3`: torch-native Llama3 reference path.
 
+The public Llama 3 70B shape is available as `llama3_70b_config()` for
+planning and compatibility checks without constructing the full model:
+
+```python
+from torchinferno import llama3_70b_config
+
+config = llama3_70b_config()
+print(config.num_hidden_layers, config.hidden_size, config.num_attention_heads)
+```
+
 List variants or inspect lineage:
 
 ```bash
@@ -181,6 +197,50 @@ PYTHONPATH=src python3 -m torchinferno.cli model-variants --family llama3 --line
 
 This is intentionally branch-friendly: if a new idea should not inherit from
 `v1`, add `v1_alt` with parent `v0`, then derive `v2_alt` from that branch.
+
+## vLLM-Compatible Llama 70B Benchmarks
+
+TorchInferno can drive the same vLLM benchmark entrypoints used by the local
+vLLM checkout. By default it targets `meta-llama/Llama-3.3-70B-Instruct`,
+uses tensor parallel size 8, and writes all commands/results under one output
+directory.
+
+Plan the exact commands without running them:
+
+```bash
+PYTHONPATH=src python3 -m torchinferno.cli vllm-bench-suite .torchinferno_runs/vllm-llama70b
+```
+
+Run latency and offline throughput through vLLM:
+
+```bash
+PYTHONPATH=src python3 -m torchinferno.cli vllm-bench-suite .torchinferno_runs/vllm-llama70b \
+  --run \
+  --benchmarks latency throughput \
+  --input-len 32 \
+  --output-len 128 \
+  --batch-size 8 \
+  --num-prompts 1000
+```
+
+Run the online serving benchmark against a running vLLM OpenAI-compatible
+server:
+
+```bash
+PYTHONPATH=src python3 -m torchinferno.cli vllm-bench-suite .torchinferno_runs/vllm-llama70b-serve \
+  --run \
+  --benchmarks serve \
+  --base-url http://127.0.0.1:8000 \
+  --request-rate inf
+```
+
+The suite writes `commands.json`, `run_status.json`, vLLM result JSON files,
+`summary.json`, `performance.html`, and `performance.csv`. To plot existing
+vLLM JSON results again:
+
+```bash
+PYTHONPATH=src python3 -m torchinferno.cli vllm-bench-plot .torchinferno_runs/vllm-llama70b
+```
 
 ## Compiler And Graph Work
 

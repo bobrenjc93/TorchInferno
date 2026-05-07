@@ -11,7 +11,12 @@ from torchinferno.models.deepseek_v32_family import (
     tiny_deepseek_v32_v0_config,
 )
 from torchinferno.models.dsv4_family import DSv4V0ForCausalLM, DSv4V1ForCausalLM, tiny_dsv4_v0_config
-from torchinferno.models.llama3_family import Llama3V0ForCausalLM, Llama3V1ForCausalLM, tiny_llama3_config
+from torchinferno.models.llama3_family import (
+    Llama3V0ForCausalLM,
+    Llama3V1ForCausalLM,
+    llama3_70b_config,
+    tiny_llama3_config,
+)
 from torchinferno.models.variants import get_model_variant, list_model_variants, model_variant_lineage
 
 
@@ -44,6 +49,20 @@ def test_llama3_v0_and_v1_are_weight_compatible() -> None:
 
     torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
     assert generated.shape == (1, 5)
+
+
+def test_llama3_70b_config_matches_public_architecture_shape() -> None:
+    config = llama3_70b_config()
+
+    assert config.hidden_size == 8192
+    assert config.intermediate_size == 28672
+    assert config.num_hidden_layers == 80
+    assert config.num_attention_heads == 64
+    assert config.num_key_value_heads == 8
+    assert config.head_dim == 128
+    assert config.max_position_embeddings == 131072
+    assert config.rope_scaling is not None
+    assert config.rope_scaling["rope_type"] == "llama3"
 
 
 def test_dsv4_and_deepseek_v0_match_v1_greedy_generation() -> None:
