@@ -1,9 +1,11 @@
 import importlib
+import json
 import os
 import subprocess
 import sys
 
 import torch
+from safetensors.torch import save_file
 
 from torchinferno.models.deepseek_v32_family import (
     DeepSeekV32V0ForCausalLM,
@@ -12,6 +14,8 @@ from torchinferno.models.deepseek_v32_family import (
 )
 from torchinferno.models.dsv4_family import DSv4V0ForCausalLM, DSv4V1ForCausalLM, tiny_dsv4_v0_config
 from torchinferno.models.llama3_family import (
+    Llama3PipelineForCausalLM,
+    Llama3TensorParallelForCausalLM,
     Llama3V0ForCausalLM,
     Llama3V1ForCausalLM,
     llama3_70b_config,
@@ -63,6 +67,62 @@ def test_llama3_70b_config_matches_public_architecture_shape() -> None:
     assert config.max_position_embeddings == 131072
     assert config.rope_scaling is not None
     assert config.rope_scaling["rope_type"] == "llama3"
+
+
+def test_llama3_pipeline_loads_hf_shaped_checkpoint_and_matches_v0(tmp_path) -> None:
+    torch.manual_seed(52)
+    config = tiny_llama3_config(vocab_size=32, max_position_embeddings=16)
+    reference = Llama3V0ForCausalLM(config).eval()
+    state = reference.state_dict()
+    hf_state = {
+        "model.embed_tokens.weight": state["embed_tokens.weight"],
+        "model.norm.weight": state["norm.weight"],
+        "lm_head.weight": state["lm_head.weight"],
+    }
+    for layer_id in range(config.num_hidden_layers):
+        prefix = f"layers.{layer_id}."
+        hf_prefix = f"model.layers.{layer_id}."
+        for suffix in (
+            "input_layernorm.weight",
+            "post_attention_layernorm.weight",
+            "self_attn.q_proj.weight",
+            "self_attn.k_proj.weight",
+            "self_attn.v_proj.weight",
+            "self_attn.o_proj.weight",
+            "mlp.gate_proj.weight",
+            "mlp.up_proj.weight",
+            "mlp.down_proj.weight",
+        ):
+            hf_state[hf_prefix + suffix] = state[prefix + suffix]
+
+    save_file(hf_state, tmp_path / "model-00001-of-00001.safetensors")
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "metadata": {"total_size": sum(tensor.numel() * tensor.element_size() for tensor in hf_state.values())},
+                "weight_map": {name: "model-00001-of-00001.safetensors" for name in hf_state},
+            }
+        )
+        + "\n"
+    )
+    (tmp_path / "config.json").write_text(json.dumps(config.to_dict()) + "\n")
+
+    pipeline = Llama3PipelineForCausalLM.from_pretrained(tmp_path, devices=("cpu",), dtype="float32").eval()
+    tensor_parallel = Llama3TensorParallelForCausalLM.from_pretrained(tmp_path, dtype="float32").eval()
+    input_ids = torch.tensor([[1, 2, 3]], dtype=torch.long)
+
+    with torch.inference_mode():
+        expected = reference(input_ids)
+        actual, _ = pipeline.forward(input_ids, use_cache=False)
+        tp_actual, _ = tensor_parallel.forward(input_ids, use_cache=False)
+        expected_generated = reference.generate(input_ids, max_new_tokens=2)
+        actual_generated = pipeline.generate(input_ids, max_new_tokens=2)
+        tp_generated = tensor_parallel.generate(input_ids, max_new_tokens=2)
+
+    torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(tp_actual.cpu(), expected, atol=1e-5, rtol=1e-5)
+    assert torch.equal(actual_generated.cpu(), expected_generated)
+    assert torch.equal(tp_generated.cpu(), expected_generated)
 
 
 def test_dsv4_and_deepseek_v0_match_v1_greedy_generation() -> None:

@@ -60,8 +60,9 @@ to grow toward production-grade SOTA inference.
   plus arbitrary FX subgraph extraction by node id. These emit graphs, profiler
   JSON, traces, memory data, and repro scripts.
 - Minimal auto research harness for comparing scheduler/cache/routing policies.
-- Llama 3 70B architecture config for large-model planning without allocating
-  weights.
+- Llama 3 70B architecture config plus a native pipeline-sharded checkpoint
+  loader/generate path for running production-scale weights across multiple
+  GPUs without depending on Hugging Face model classes.
 - vLLM-compatible benchmark runner for Llama 70B latency, offline throughput,
   and online serving results, with JSON summaries and HTML/CSV performance
   plots.
@@ -99,6 +100,7 @@ PYTHONPATH=src python3 -m torchinferno.cli profile-region .torchinferno_runs/att
 PYTHONPATH=src python3 -m torchinferno.cli profile-pattern .torchinferno_runs/swiglu-pattern-cpu --device cpu
 PYTHONPATH=src python3 -m torchinferno.cli research-smoke
 PYTHONPATH=src python3 -m torchinferno.cli vllm-bench-suite .torchinferno_runs/vllm-llama70b --benchmarks latency throughput serve
+PYTHONPATH=src python3 -m torchinferno.cli llama-bench-suite .torchinferno_runs/torchinferno-llama70b --benchmarks latency throughput serve
 ```
 
 CUDA is optional for the tests, but the DSv4 smoke can run on GPU:
@@ -241,6 +243,42 @@ vLLM JSON results again:
 ```bash
 PYTHONPATH=src python3 -m torchinferno.cli vllm-bench-plot .torchinferno_runs/vllm-llama70b
 ```
+
+## Native TorchInferno Llama 70B Benchmarks
+
+TorchInferno also has native Llama 70B paths that load safetensors directly.
+`pipeline-v0` keeps each decoder layer on one device and moves activations at
+layer boundaries. `tp-v0` is the closer vLLM comparison point: launch it with
+`torchrun`, shard QKV/MLP weights across ranks, use NCCL all-reduce, and keep
+decode KV cached.
+
+Plan the run:
+
+```bash
+PYTHONPATH=src python3 -m torchinferno.cli llama-bench-suite .torchinferno_runs/torchinferno-llama70b-pipeline \
+  --devices cuda:0 cuda:1 cuda:2 cuda:3 cuda:4 cuda:5 cuda:6 cuda:7
+```
+
+Run the same 32 input / 128 output shape used for the vLLM comparison:
+
+```bash
+PYTHONPATH=src torchrun --standalone --nproc-per-node 8 -- src/torchinferno/cli.py \
+  llama-bench-suite .torchinferno_runs/torchinferno-llama70b-tp \
+  --run \
+  --parallelism tensor \
+  --benchmarks latency throughput serve \
+  --input-len 32 \
+  --output-len 128 \
+  --batch-size 8 \
+  --num-prompts 1000 \
+  --max-concurrency 256
+```
+
+The native suite writes vLLM-shaped `latency.json`, `throughput.json`, and
+`serve.json` files, plus `summary.json`, `performance.html`, and
+`performance.csv`, so plots and comparisons can read both backends uniformly.
+`batch-size` controls the latency benchmark; throughput and serve use
+`max-concurrency` as the engine batch limit.
 
 ## Compiler And Graph Work
 

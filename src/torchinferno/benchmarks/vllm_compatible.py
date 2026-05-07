@@ -527,9 +527,11 @@ def _render_html(rows: list[dict[str, object]], summary: dict[str, Any]) -> str:
         )
 
     model = html.escape(str(summary.get("model", "")))
+    backend = str(summary.get("backend", "vllm"))
+    title = "TorchInferno Benchmark Performance" if backend == "torchinferno" else "vLLM Benchmark Performance"
     return (
         "<!doctype html><html><head><meta charset=\"utf-8\">"
-        "<title>vLLM Benchmark Performance</title>"
+        f"<title>{html.escape(title)}</title>"
         "<style>"
         "body{font-family:system-ui,-apple-system,Segoe UI,sans-serif;margin:32px;color:#111827;background:#f8fafc}"
         "h1{font-size:24px;margin:0 0 8px}h2{font-size:18px;margin:24px 0 12px}"
@@ -540,7 +542,7 @@ def _render_html(rows: list[dict[str, object]], summary: dict[str, Any]) -> str:
         "th{background:#f3f4f6;color:#374151}.value{white-space:nowrap;font-variant-numeric:tabular-nums}"
         ".bar-cell{width:55%}.bar{height:14px;background:#2563eb;border-radius:3px}"
         "</style></head><body>"
-        "<h1>vLLM Benchmark Performance</h1>"
+        f"<h1>{html.escape(title)}</h1>"
         f"<p>{model}</p>"
         f"{''.join(sections)}"
         "</body></html>\n"

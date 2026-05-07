@@ -120,3 +120,33 @@ def test_vllm_benchmark_cli_writes_plan_without_running(tmp_path) -> None:
     commands = json.loads((tmp_path / "commands.json").read_text())
     assert commands[0]["name"] == "latency"
     assert commands[0]["command"][:5] == ["python3", "-m", "vllm.entrypoints.cli.main", "bench", "latency"]
+
+
+def test_llama_benchmark_cli_writes_plan_without_running(tmp_path) -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "torchinferno.cli",
+            "llama-bench-suite",
+            str(tmp_path),
+            "--model",
+            "/models/llama70b",
+            "--devices",
+            "cuda:0",
+            "cuda:1",
+            "--benchmarks",
+            "latency",
+            "--no-plot",
+        ],
+        check=True,
+        env={**os.environ, "PYTHONPATH": "src"},
+        text=True,
+        capture_output=True,
+    )
+
+    assert "mode=planned" in result.stdout
+    config = json.loads((tmp_path / "suite_config.json").read_text())
+    status = json.loads((tmp_path / "run_status.json").read_text())
+    assert config["devices"] == ["cuda:0", "cuda:1"]
+    assert status[0]["name"] == "latency"

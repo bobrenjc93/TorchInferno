@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -12,8 +13,10 @@ import torch
 from torchinferno.audit import build_audit_report
 from torchinferno.benchmarks import (
     LLAMA3_70B_MODEL,
+    TorchInfernoLlamaBenchmarkConfig,
     VLLMBenchmarkConfig,
     plot_vllm_benchmark_results,
+    run_torchinferno_llama_benchmark_suite,
     run_vllm_benchmark_suite,
 )
 from torchinferno.compiler import CompileConfig, compile_forward
@@ -167,6 +170,44 @@ def run_vllm_bench_plot(args: argparse.Namespace) -> int:
     print("TorchInferno vLLM benchmark plot")
     print(f"html={outputs['html']}")
     print(f"csv={outputs['csv']}")
+    return 0
+
+
+def run_llama_bench_suite(args: argparse.Namespace) -> int:
+    config = TorchInfernoLlamaBenchmarkConfig(
+        output_dir=args.output_dir,
+        model=args.model,
+        devices=tuple(args.devices or ()),
+        dtype=args.dtype,
+        input_len=args.input_len,
+        output_len=args.output_len,
+        batch_size=args.batch_size,
+        num_iters_warmup=args.num_iters_warmup,
+        num_iters=args.num_iters,
+        num_prompts=args.num_prompts,
+        request_rate=args.request_rate,
+        max_concurrency=args.max_concurrency,
+        temperature=args.temperature,
+        seed=args.seed,
+        benchmarks=tuple(args.benchmarks),
+        token=args.token,
+        revision=args.revision,
+        cache_dir=args.cache_dir,
+        parallelism=args.parallelism,
+    )
+    artifacts = run_torchinferno_llama_benchmark_suite(config, run=args.run, plot=not args.no_plot)
+    if int(os.environ.get("RANK", "0")) != 0:
+        return 0
+    mode = "ran" if args.run else "planned"
+    print("TorchInferno native Llama benchmark suite")
+    print(
+        f"mode={mode} model={args.model} parallelism={args.parallelism} "
+        f"devices={','.join(args.devices or ['auto'])}"
+    )
+    print(f"output_dir={artifacts.output_dir}")
+    print(f"summary={artifacts.summary_path}")
+    if artifacts.plot_path is not None:
+        print(f"plot={artifacts.plot_path}")
     return 0
 
 
@@ -949,6 +990,43 @@ def build_parser() -> argparse.ArgumentParser:
     vllm_plot.add_argument("--output-html", default=None)
     vllm_plot.add_argument("--output-csv", default=None)
     vllm_plot.set_defaults(func=run_vllm_bench_plot)
+
+    llama_bench = subparsers.add_parser(
+        "llama-bench-suite",
+        help="Plan or run the native TorchInferno Llama latency, throughput, and serve-shaped benchmarks.",
+    )
+    llama_bench.add_argument("output_dir", nargs="?", default=".torchinferno_runs/torchinferno-llama70b")
+    llama_bench.add_argument("--model", default=LLAMA3_70B_MODEL, help="Model path or Hugging Face repo ID.")
+    llama_bench.add_argument(
+        "--devices",
+        nargs="+",
+        default=[],
+        help="Devices for pipeline sharding, e.g. --devices cuda:0 cuda:1 ...; defaults to all visible CUDA devices.",
+    )
+    llama_bench.add_argument("--dtype", default="auto")
+    llama_bench.add_argument("--parallelism", choices=["pipeline", "tensor"], default="pipeline")
+    llama_bench.add_argument("--input-len", type=int, default=32)
+    llama_bench.add_argument("--output-len", type=int, default=128)
+    llama_bench.add_argument("--batch-size", type=int, default=8)
+    llama_bench.add_argument("--num-iters-warmup", type=int, default=1)
+    llama_bench.add_argument("--num-iters", type=int, default=3)
+    llama_bench.add_argument("--num-prompts", type=int, default=1000)
+    llama_bench.add_argument("--request-rate", default="inf")
+    llama_bench.add_argument("--max-concurrency", type=int, default=256)
+    llama_bench.add_argument("--temperature", type=float, default=1.0)
+    llama_bench.add_argument("--seed", type=int, default=0)
+    llama_bench.add_argument(
+        "--benchmarks",
+        nargs="+",
+        choices=["latency", "throughput", "serve"],
+        default=["latency", "throughput", "serve"],
+    )
+    llama_bench.add_argument("--run", action="store_true", help="Execute the benchmark instead of only writing config.")
+    llama_bench.add_argument("--no-plot", action="store_true")
+    llama_bench.add_argument("--token", default=None)
+    llama_bench.add_argument("--revision", default=None)
+    llama_bench.add_argument("--cache-dir", default=None)
+    llama_bench.set_defaults(func=run_llama_bench_suite)
 
     smoke = subparsers.add_parser("dsv4-smoke", help="Run a DSv4 end-to-end generation smoke test.")
     smoke.add_argument("--device", default=None, help="Torch device, defaults to cuda when available.")

@@ -2,10 +2,16 @@ from torchinferno.models.auto import load_model_auto
 from torchinferno.models.dsv4 import DSv4Config, DSv4ForCausalLM, tiny_dsv4_config
 from torchinferno.models.deepseek import DeepSeekV32Config, DeepSeekV32ForCausalLM, tiny_deepseek_v32_config
 from torchinferno.models.llama3_family import (
+    LLAMA3_70B_REPO_ID,
     Llama3Config,
+    Llama3PipelineForCausalLM,
+    Llama3PipelineLoadReport,
+    Llama3TensorParallelForCausalLM,
+    Llama3TensorParallelLoadReport,
     Llama3V0ForCausalLM,
     Llama3V1ForCausalLM,
     llama3_70b_config,
+    resolve_llama3_checkpoint,
     tiny_llama3_config,
 )
 from torchinferno.models.provenance import ModelVariantSpec
@@ -26,7 +32,12 @@ __all__ = [
     "DeepSeekV32Config",
     "DeepSeekV32ForCausalLM",
     "IncompatibleCheckpointError",
+    "LLAMA3_70B_REPO_ID",
     "Llama3Config",
+    "Llama3PipelineForCausalLM",
+    "Llama3PipelineLoadReport",
+    "Llama3TensorParallelForCausalLM",
+    "Llama3TensorParallelLoadReport",
     "Llama3V0ForCausalLM",
     "Llama3V1ForCausalLM",
     "ModelVariantSpec",
@@ -36,6 +47,7 @@ __all__ = [
     "convert_native_deepseek_checkpoint",
     "load_model_auto",
     "llama3_70b_config",
+    "resolve_llama3_checkpoint",
     "get_model_variant",
     "list_model_variants",
     "model_variant_lineage",

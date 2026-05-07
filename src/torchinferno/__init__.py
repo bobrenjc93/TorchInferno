@@ -21,10 +21,16 @@ from torchinferno.models.conversion import (
 from torchinferno.models.deepseek import DeepSeekV32Config, DeepSeekV32ForCausalLM, tiny_deepseek_v32_config
 from torchinferno.models.dsv4 import DSv4Config, DSv4ForCausalLM, tiny_dsv4_config
 from torchinferno.models.llama3_family import (
+    LLAMA3_70B_REPO_ID,
     Llama3Config,
+    Llama3PipelineForCausalLM,
+    Llama3PipelineLoadReport,
+    Llama3TensorParallelForCausalLM,
+    Llama3TensorParallelLoadReport,
     Llama3V0ForCausalLM,
     Llama3V1ForCausalLM,
     llama3_70b_config,
+    resolve_llama3_checkpoint,
     tiny_llama3_config,
 )
 from torchinferno.models.provenance import ModelVariantSpec
@@ -68,7 +74,12 @@ __all__ = [
     "FeatureAudit",
     "FocusProfileArtifacts",
     "LogitReference",
+    "LLAMA3_70B_REPO_ID",
     "Llama3Config",
+    "Llama3PipelineForCausalLM",
+    "Llama3PipelineLoadReport",
+    "Llama3TensorParallelForCausalLM",
+    "Llama3TensorParallelLoadReport",
     "Llama3V0ForCausalLM",
     "Llama3V1ForCausalLM",
     "ModelVariantSpec",
@@ -106,6 +117,7 @@ __all__ = [
     "nvfp4_linear_reference",
     "paged_decode_attention",
     "quantize_nvfp4",
+    "resolve_llama3_checkpoint",
     "run_pattern_profile_capture",
     "run_offload_profile_capture",
     "run_profile_capture",
