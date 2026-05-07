@@ -41,6 +41,7 @@ class TorchInfernoLlamaBenchmarkConfig:
     revision: str | None = None
     cache_dir: str | Path | None = None
     parallelism: str = "pipeline"
+    profile_breakdown: bool = False
 
 
 @dataclass(frozen=True)
@@ -91,6 +92,8 @@ def run_torchinferno_llama_benchmark_suite(
             ).eval()
         else:
             raise ValueError("parallelism must be 'pipeline' or 'tensor'")
+        if config.profile_breakdown and hasattr(model, "enable_profile"):
+            model.enable_profile()
         primary = _model_is_primary(model)
         if primary:
             (output_dir / "load_report.json").write_text(
@@ -118,6 +121,11 @@ def run_torchinferno_llama_benchmark_suite(
                 )
                 status_path.write_text(json.dumps(statuses, indent=2) + "\n")
             _barrier_model(model)
+        if config.profile_breakdown and hasattr(model, "profile_summary"):
+            rank = getattr(model, "rank", 0)
+            (output_dir / f"profile_breakdown_rank{rank}.json").write_text(
+                json.dumps(model.profile_summary(), indent=2, sort_keys=True) + "\n"
+            )
     else:
         statuses = [
             {
@@ -193,6 +201,10 @@ def _run_throughput(
 ) -> None:
     remaining = config.num_prompts
     engine_batch_size = max(1, config.max_concurrency)
+    warmup_batch = min(engine_batch_size, config.num_prompts)
+    for _ in range(config.num_iters_warmup):
+        prompt = _random_prompts(warmup_batch, config.input_len, model.config.vocab_size)
+        model.generate(prompt, max_new_tokens=config.output_len, temperature=config.temperature)
     _sync_model_devices(model)
     start = time.perf_counter()
     while remaining > 0:
@@ -291,7 +303,7 @@ def _generate_with_timing(
     cache = model.allocate_cache(input_ids.size(0), input_ids.size(1) + output_len)
     _sync_model_devices(model)
     start = time.perf_counter()
-    logits, cache = model.forward(input_ids, cache=cache, use_cache=True, return_last_logits_only=True)
+    logits, cache = _forward_last_logits(model, input_ids, cache)
     next_token = _sample_next(model, logits[:, -1, :], temperature)
     _sync_model_devices(model)
     ttft = time.perf_counter() - start
@@ -300,7 +312,7 @@ def _generate_with_timing(
     for _ in range(1, output_len):
         _sync_model_devices(model)
         step_start = time.perf_counter()
-        logits, cache = model.forward(next_token[:, None], cache=cache, use_cache=True, return_last_logits_only=True)
+        logits, cache = _forward_last_logits(model, next_token[:, None], cache)
         next_token = _sample_next(model, logits[:, -1, :], temperature)
         _sync_model_devices(model)
         decode_steps.append(time.perf_counter() - step_start)
@@ -313,6 +325,22 @@ def _generate_with_timing(
         "itl_ms": [value * 1000.0 for value in decode_steps],
         "e2el_ms": e2e * 1000.0,
     }
+
+
+def _forward_last_logits(
+    model: Llama3PipelineForCausalLM | Llama3TensorParallelForCausalLM,
+    input_ids: torch.Tensor,
+    cache: object,
+) -> tuple[torch.Tensor, object]:
+    if isinstance(model, Llama3TensorParallelForCausalLM):
+        return model.forward(
+            input_ids,
+            cache=cache,
+            use_cache=True,
+            return_last_logits_only=True,
+            return_sharded_logits=True,
+        )
+    return model.forward(input_ids, cache=cache, use_cache=True, return_last_logits_only=True)
 
 
 def _random_prompts(batch_size: int, input_len: int, vocab_size: int) -> torch.Tensor:

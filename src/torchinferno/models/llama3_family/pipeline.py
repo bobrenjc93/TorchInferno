@@ -429,8 +429,7 @@ def _device_for_layer(layer_id: int, num_layers: int, devices: Sequence[torch.de
 
 
 def _rms_norm(x: Tensor, weight: Tensor, eps: float) -> Tensor:
-    variance = x.float().pow(2).mean(dim=-1, keepdim=True)
-    return (x * torch.rsqrt(variance + eps).to(dtype=x.dtype)) * weight
+    return F.rms_norm(x, (x.size(-1),), weight, eps)
 
 
 def _build_inv_freq(config: Llama3Config, device: torch.device) -> Tensor:

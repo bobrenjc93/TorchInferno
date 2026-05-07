@@ -194,6 +194,7 @@ def run_llama_bench_suite(args: argparse.Namespace) -> int:
         revision=args.revision,
         cache_dir=args.cache_dir,
         parallelism=args.parallelism,
+        profile_breakdown=args.profile_breakdown,
     )
     artifacts = run_torchinferno_llama_benchmark_suite(config, run=args.run, plot=not args.no_plot)
     if int(os.environ.get("RANK", "0")) != 0:
@@ -1026,6 +1027,11 @@ def build_parser() -> argparse.ArgumentParser:
     llama_bench.add_argument("--token", default=None)
     llama_bench.add_argument("--revision", default=None)
     llama_bench.add_argument("--cache-dir", default=None)
+    llama_bench.add_argument(
+        "--profile-breakdown",
+        action="store_true",
+        help="Write per-rank timing breakdown JSON for native tensor-parallel runs.",
+    )
     llama_bench.set_defaults(func=run_llama_bench_suite)
 
     smoke = subparsers.add_parser("dsv4-smoke", help="Run a DSv4 end-to-end generation smoke test.")
