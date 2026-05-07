@@ -280,6 +280,35 @@ The native suite writes vLLM-shaped `latency.json`, `throughput.json`, and
 `batch-size` controls the latency benchmark; throughput and serve use
 `max-concurrency` as the engine batch limit.
 
+## inference-bench Compatibility
+
+TorchInferno can also run behind the OpenAI-compatible API expected by
+`github.com/bobrenjc93/inference-bench`:
+
+```bash
+PYTHONPATH=src python3 -m torchinferno.openai_server \
+  --model meta-llama/Meta-Llama-3.1-70B-Instruct \
+  --tensor-parallel-size 8 \
+  --port 8000 \
+  --trust-remote-code
+```
+
+For local smoke tests without downloading a tokenizer or checkpoint:
+
+```bash
+PYTHONPATH=src python3 -m torchinferno.openai_server \
+  --model tiny \
+  --model-kind tiny-deepseek \
+  --tokenizer byte \
+  --device cpu
+```
+
+The server implements `GET /v1/models` and streaming
+`POST /v1/chat/completions`, which are the endpoints used by the
+`few_shot`, `self_consistency`, `multi_turn`, and `tree_of_thought`
+benchmarks. The drop-in provider adapter lives in
+`integrations/inference_bench/torchinferno.py`.
+
 ## Compiler And Graph Work
 
 TorchInferno keeps compiler hooks explicit:

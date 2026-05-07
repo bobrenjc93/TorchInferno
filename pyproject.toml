@@ -14,6 +14,7 @@ dependencies = ["huggingface-hub", "safetensors", "torch"]
 dev = ["pytest"]
 helion = ["helion"]
 kernels = ["triton"]
+serve = ["tokenizers", "transformers"]
 text = ["tokenizers", "transformers"]
 
 [project.scripts]

@@ -109,6 +109,11 @@ def build_audit_report() -> TorchInfernoAudit:
                 "bridge",
                 "Persistent row-assigned cache batches same-length prefill/decode groups without temporary cache rebuilds.",
             ),
+            FeatureAudit(
+                "OpenAI serving API",
+                "bridge",
+                "openai-server exposes /v1/models and streaming /v1/chat/completions for inference-bench.",
+            ),
             FeatureAudit("disaggregated prefill/decode", "simulated", "Planner models rank assignment and network latency."),
             FeatureAudit("NVFP4 graph passes", "reference", "NVFP4 tensor contract and pass hook exist; production fused kernel remains open."),
             FeatureAudit("research harness", "minimal", "Named experiments and metric comparison are available."),

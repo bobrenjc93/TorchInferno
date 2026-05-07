@@ -33,6 +33,8 @@ from torchinferno.models.conversion import (
 from torchinferno.models.deepseek import DeepSeekV32ForCausalLM, tiny_deepseek_v32_config
 from torchinferno.models.dsv4 import DSv4ForCausalLM, tiny_dsv4_config
 from torchinferno.models.variants import list_model_variants, model_variant_lineage
+from torchinferno.openai_server import config_from_args as openai_config_from_args
+from torchinferno.openai_server import serve as serve_openai_api
 from torchinferno.kernels import KernelBackend, KernelConfig, paged_decode_attention
 from torchinferno.profiling import (
     PatternProfileConfig,
@@ -651,6 +653,11 @@ def run_serve_smoke(args: argparse.Namespace) -> int:
             f"{result.request_id}: tokens={list(result.tokens)} "
             f"prefix_hit_tokens={result.prefix_hit_tokens} finished_step={result.finished_step}"
         )
+    return 0
+
+
+def run_openai_server(args: argparse.Namespace) -> int:
+    serve_openai_api(openai_config_from_args(args))
     return 0
 
 
@@ -1388,6 +1395,32 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument("--temperature", type=float, default=0.0)
     serve.add_argument("--seed", type=int, default=0)
     serve.set_defaults(func=run_serve_smoke)
+
+    openai_serve = subparsers.add_parser(
+        "openai-server",
+        help="Serve TorchInferno through the OpenAI-compatible API used by inference-bench.",
+    )
+    openai_serve.add_argument("--model", required=True, help="Model id or local checkpoint path.")
+    openai_serve.add_argument("--host", default="0.0.0.0")
+    openai_serve.add_argument("--port", type=int, default=8000)
+    openai_serve.add_argument("--model-kind", default="auto")
+    openai_serve.add_argument("--tokenizer", default=None)
+    openai_serve.add_argument("--tensor-parallel-size", type=int, default=1)
+    openai_serve.add_argument("--devices", default=None, help="Comma-separated device list.")
+    openai_serve.add_argument("--device", default=None)
+    openai_serve.add_argument(
+        "--dtype",
+        default="auto",
+        choices=["auto", "float32", "float16", "bfloat16", "fp32", "fp16", "bf16"],
+    )
+    openai_serve.add_argument("--max-model-len", type=int, default=None)
+    openai_serve.add_argument("--trust-remote-code", action="store_true")
+    openai_serve.add_argument("--token", default=None)
+    openai_serve.add_argument("--revision", default=None)
+    openai_serve.add_argument("--cache-dir", default=None)
+    openai_serve.add_argument("--cache-backend", choices=["dense", "paged"], default="dense")
+    openai_serve.add_argument("--page-size", type=int, default=16)
+    openai_serve.set_defaults(func=run_openai_server)
 
     perf = subparsers.add_parser("perf-smoke", help="Benchmark paged attention reference and specialized decode paths.")
     perf.add_argument("--device", default=None, help="Torch device, defaults to cuda when available.")
