@@ -27,6 +27,7 @@ from torchinferno.models.llama3_family.v0 import sample_next_token
 _COMPILED_ROTATE_INTERLEAVED = None
 _COMPILED_ROTATE_INTERLEAVED_CHECKED = False
 _COMPILED_ROTATE_INTERLEAVED_FAILED = False
+_TRITON_ROTARY_INPLACE_FAILED = False
 
 
 @dataclass(frozen=True)
@@ -648,7 +649,20 @@ def _all_reduce(tensor: Tensor) -> None:
 
 
 def _apply_rotary_cached(q: Tensor, k: Tensor, rotary: tuple[Tensor, Tensor]) -> tuple[Tensor, Tensor]:
+    global _TRITON_ROTARY_INPLACE_FAILED
+
     cos, sin = rotary
+    if (
+        q.is_cuda
+        and os.environ.get("TORCHINFERNO_TRITON_ROTARY_INPLACE", "1") != "0"
+        and not _TRITON_ROTARY_INPLACE_FAILED
+    ):
+        try:
+            from torchinferno.kernels.triton_ops import triton_apply_rotary_interleaved_inplace
+
+            return triton_apply_rotary_interleaved_inplace(q, k, cos, sin)
+        except Exception:
+            _TRITON_ROTARY_INPLACE_FAILED = True
     cos = cos[None, None, :, :]
     sin = sin[None, None, :, :]
     return _rotate_interleaved(q, cos, sin), _rotate_interleaved(k, cos, sin)

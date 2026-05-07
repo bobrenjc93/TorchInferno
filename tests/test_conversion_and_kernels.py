@@ -122,6 +122,8 @@ def test_triton_cuda_kernels_match_torch_reference() -> None:
     torch.manual_seed(14)
     gate = torch.randn(16, 32, device="cuda")
     up = torch.randn(16, 32, device="cuda")
+    gate_bf16 = gate.to(torch.bfloat16)
+    up_bf16 = up.to(torch.bfloat16)
     x = torch.randn(4, 8, 32, device="cuda")
     weight = torch.randn(32, device="cuda")
     config = KernelConfig(backend=KernelBackend.TRITON)
@@ -132,5 +134,40 @@ def test_triton_cuda_kernels_match_torch_reference() -> None:
         atol=1e-5,
         rtol=1e-5,
     )
+    torch.testing.assert_close(
+        swiglu_activation(gate_bf16, up_bf16, config=config),
+        torch.nn.functional.silu(gate_bf16) * up_bf16,
+        atol=2e-2,
+        rtol=2e-2,
+    )
     expected_norm = x * torch.rsqrt(x.float().pow(2).mean(dim=-1, keepdim=True) + 1e-6).to(x.dtype) * weight
     torch.testing.assert_close(rms_norm(x, weight, eps=1e-6, config=config), expected_norm, atol=1e-5, rtol=1e-5)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or not triton_available(), reason="CUDA Triton kernels unavailable")
+def test_triton_rotary_interleaved_inplace_matches_torch_reference() -> None:
+    from torchinferno.kernels.triton_ops import triton_apply_rotary_interleaved_inplace
+    from torchinferno.models.llama3_family.tensor_parallel import _rotate_interleaved_eager
+
+    torch.manual_seed(15)
+    batch, tokens, q_heads, kv_heads, head_dim = 3, 5, 4, 1, 16
+    packed = torch.randn(
+        batch,
+        tokens,
+        (q_heads + kv_heads + kv_heads) * head_dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    q, k, _ = packed.split((q_heads * head_dim, kv_heads * head_dim, kv_heads * head_dim), dim=-1)
+    q = q.view(batch, tokens, q_heads, head_dim).transpose(1, 2)
+    k = k.view(batch, tokens, kv_heads, head_dim).transpose(1, 2)
+    freqs = torch.randn(tokens, head_dim // 2, device="cuda")
+    cos = freqs.cos().to(torch.bfloat16)
+    sin = freqs.sin().to(torch.bfloat16)
+    expected_q = _rotate_interleaved_eager(q, cos[None, None, :, :], sin[None, None, :, :])
+    expected_k = _rotate_interleaved_eager(k, cos[None, None, :, :], sin[None, None, :, :])
+
+    actual_q, actual_k = triton_apply_rotary_interleaved_inplace(q.clone(), k.clone(), cos, sin)
+
+    torch.testing.assert_close(actual_q, expected_q, atol=4e-2, rtol=4e-2)
+    torch.testing.assert_close(actual_k, expected_k, atol=4e-2, rtol=4e-2)

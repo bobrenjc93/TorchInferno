@@ -15,7 +15,7 @@ def _swiglu_kernel(gate_ptr, up_ptr, out_ptr, n_elements: tl.constexpr, block_si
     program_id = tl.program_id(0)
     offsets = program_id * block_size + tl.arange(0, block_size)
     mask = offsets < n_elements
-    gate = tl.load(gate_ptr + offsets, mask=mask, other=0.0)
+    gate = tl.load(gate_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
     up = tl.load(up_ptr + offsets, mask=mask, other=0.0)
     out = gate / (1.0 + tl.exp(-gate)) * up
     tl.store(out_ptr + offsets, out, mask=mask)
@@ -32,6 +32,94 @@ def triton_swiglu_activation(gate: Tensor, up: Tensor) -> Tensor:
     grid = (triton.cdiv(n_elements, block_size),)
     _swiglu_kernel[grid](gate, up, out, n_elements, block_size, num_warps=4)
     return out
+
+
+@triton.jit
+def _rotary_interleaved_inplace_kernel(
+    x_ptr,
+    cos_ptr,
+    sin_ptr,
+    total_pairs,
+    heads: tl.constexpr,
+    tokens: tl.constexpr,
+    half_dim: tl.constexpr,
+    stride_batch: tl.constexpr,
+    stride_head: tl.constexpr,
+    stride_token: tl.constexpr,
+    stride_dim: tl.constexpr,
+    block_size: tl.constexpr,
+) -> None:
+    pair_offsets = tl.program_id(0) * block_size + tl.arange(0, block_size)
+    mask = pair_offsets < total_pairs
+    rotary_dim = pair_offsets % half_dim
+    token_head_batch = pair_offsets // half_dim
+    token = token_head_batch % tokens
+    head_batch = token_head_batch // tokens
+    head = head_batch % heads
+    batch = head_batch // heads
+
+    x_offset = (
+        batch * stride_batch
+        + head * stride_head
+        + token * stride_token
+        + rotary_dim * 2 * stride_dim
+    )
+    cos_sin_offset = token * half_dim + rotary_dim
+    x_even = tl.load(x_ptr + x_offset, mask=mask, other=0.0).to(tl.float32)
+    x_odd = tl.load(x_ptr + x_offset + stride_dim, mask=mask, other=0.0).to(tl.float32)
+    cos = tl.load(cos_ptr + cos_sin_offset, mask=mask, other=1.0).to(tl.float32)
+    sin = tl.load(sin_ptr + cos_sin_offset, mask=mask, other=0.0).to(tl.float32)
+
+    tl.store(x_ptr + x_offset, x_even * cos - x_odd * sin, mask=mask)
+    tl.store(x_ptr + x_offset + stride_dim, x_even * sin + x_odd * cos, mask=mask)
+
+
+def triton_apply_rotary_interleaved_inplace(
+    q: Tensor,
+    k: Tensor,
+    cos: Tensor,
+    sin: Tensor,
+) -> tuple[Tensor, Tensor]:
+    """Apply interleaved RoPE to tensor-parallel q/k views in place."""
+
+    if q.size(-1) != k.size(-1):
+        raise ValueError("q and k head dimensions must match")
+    if q.size(-2) != k.size(-2):
+        raise ValueError("q and k token dimensions must match")
+    if cos.shape != sin.shape:
+        raise ValueError("cos and sin must have the same shape")
+    if cos.shape != (q.size(-2), q.size(-1) // 2):
+        raise ValueError("rotary cache shape must be [tokens, head_dim / 2]")
+    if q.stride(-1) != 1 or k.stride(-1) != 1:
+        raise ValueError("q and k must have contiguous head dimensions")
+    cos = cos.contiguous()
+    sin = sin.contiguous()
+    _triton_rotate_one_interleaved_inplace(q, cos, sin)
+    _triton_rotate_one_interleaved_inplace(k, cos, sin)
+    return q, k
+
+
+def _triton_rotate_one_interleaved_inplace(x: Tensor, cos: Tensor, sin: Tensor) -> None:
+    batch, heads, tokens, head_dim = x.shape
+    half_dim = head_dim // 2
+    total_pairs = batch * heads * tokens * half_dim
+    block_size = 256
+    grid = (triton.cdiv(total_pairs, block_size),)
+    _rotary_interleaved_inplace_kernel[grid](
+        x,
+        cos,
+        sin,
+        total_pairs,
+        heads,
+        tokens,
+        half_dim,
+        x.stride(0),
+        x.stride(1),
+        x.stride(2),
+        x.stride(3),
+        block_size,
+        num_warps=4,
+    )
 
 
 @triton.jit
