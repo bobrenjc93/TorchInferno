@@ -1,6 +1,9 @@
 from torchinferno.models.auto import load_model_auto
 from torchinferno.models.dsv4 import DSv4Config, DSv4ForCausalLM, tiny_dsv4_config
 from torchinferno.models.deepseek import DeepSeekV32Config, DeepSeekV32ForCausalLM, tiny_deepseek_v32_config
+from torchinferno.models.llama3_family import Llama3Config, Llama3V0ForCausalLM, Llama3V1ForCausalLM, tiny_llama3_config
+from torchinferno.models.provenance import ModelVariantSpec
+from torchinferno.models.variants import get_model_variant, list_model_variants, model_variant_lineage
 from torchinferno.models.conversion import (
     ConversionReport,
     IncompatibleCheckpointError,
@@ -17,11 +20,19 @@ __all__ = [
     "DeepSeekV32Config",
     "DeepSeekV32ForCausalLM",
     "IncompatibleCheckpointError",
+    "Llama3Config",
+    "Llama3V0ForCausalLM",
+    "Llama3V1ForCausalLM",
+    "ModelVariantSpec",
     "audit_deepseek_checkpoint",
     "audit_native_deepseek_checkpoint",
     "convert_deepseek_checkpoint",
     "convert_native_deepseek_checkpoint",
     "load_model_auto",
+    "get_model_variant",
+    "list_model_variants",
+    "model_variant_lineage",
     "tiny_deepseek_v32_config",
     "tiny_dsv4_config",
+    "tiny_llama3_config",
 ]

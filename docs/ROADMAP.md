@@ -17,10 +17,11 @@ The CLI view is `torchinferno audit`.
 | Area | Status | Notes |
 | --- | --- | --- |
 | Native DeepSeek-V3.2-style model | integrated | Torch-native config/model/cache/checkpoint path exists. |
+| Model provenance variants | reference | DSv4, DeepSeek-V3.2, and Llama3 have raw/fused v0/v1 ladders and registry lineage. |
 | Checkpoint conversion | integrated | Shape/key audit plus sharded safetensor writer; needs real-weight golden validation. |
 | `torch.compile` | integrated | Shared compile policy and smoke path. |
 | `make_fx` and fake tensors | integrated | FakeTensorMode trace helper and tests. |
-| Profile artifact loop | integrated | Whole-run, node-id subgraph, and focused-region commands write graph/profile/memory JSON, Chrome traces, and repro scripts; graph-pattern profiling adds pass reports and reference/optimized comparisons. |
+| Profile artifact loop | integrated | Whole-run, time-sliced replay, CPU-offload replay, node-id subgraph, and focused-region commands write graph/profile/timeline/memory JSON, Chrome traces, and repro scripts; graph-pattern profiling adds pass reports and reference/optimized comparisons. |
 | Fake process groups | integrated | Deterministic single-process collectives. |
 | Monarch | scaffold | Adapter detects Monarch and falls back to fake world. |
 | Flex attention | reference | Eager q/k/v fallback exists; real flex dispatch remains open. |
@@ -29,6 +30,8 @@ The CLI view is `torchinferno audit`.
 | Agent rank files | bridge | `disagg-init` emits editable prefill/decode rank files with local RPC wrappers. |
 | Prefix KV reuse | integrated | Serving aliases reusable prefix pages across model layer cache rows with copy-on-write protection. |
 | Continuous batching | bridge | Persistent row-assigned cache batches same-length prefill/decode groups without rebuilding temporary caches. |
+| Time-sliced virtual GPU profiling | integrated | Representative generation profiles can be scaled and replayed across virtual ranks on one physical device. |
+| CPU offload profiling | bridge | Module-at-a-time CPU/device staging records movement overhead separately from compute; decode-cache offload and mmap streaming remain open. |
 | Disaggregated prefill/decode | simulated | Planner models rank assignment and transfer latency. |
 | Graph pattern replacement | bridge | Leaf target swaps plus a multi-node symbolic/make_fx fused-op example exist. |
 | NVFP4 graph passes | reference | Quantized tensor contract and graph hook exist; production fused kernel remains open. |

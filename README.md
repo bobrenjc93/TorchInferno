@@ -86,6 +86,8 @@ PYTHONPATH=src python3 -m torchinferno.cli disagg-init .torchinferno_disagg --pr
 PYTHONPATH=src python3 -m torchinferno.cli serve-smoke --device cpu
 PYTHONPATH=src python3 -m torchinferno.cli perf-smoke
 PYTHONPATH=src python3 -m torchinferno.cli profile-run .torchinferno_runs/dsv4-cpu --device cpu
+PYTHONPATH=src python3 -m torchinferno.cli profile-timeslice .torchinferno_runs/dsv4-timeslice-cpu --device cpu
+PYTHONPATH=src python3 -m torchinferno.cli profile-offload .torchinferno_runs/dsv4-offload-cpu --device cpu
 PYTHONPATH=src python3 -m torchinferno.cli profile-nodes .torchinferno_runs/dsv4-cpu --grep embedding
 PYTHONPATH=src python3 -m torchinferno.cli profile-subgraph .torchinferno_runs/subgraph-cpu --source-run .torchinferno_runs/dsv4-cpu --nodes 3 --device cpu
 PYTHONPATH=src python3 -m torchinferno.cli profile-region .torchinferno_runs/attn0-cpu --region layers.0.attn --device cpu
@@ -152,6 +154,33 @@ PYTHONPATH=src python3 -m torchinferno.cli deepseek-smoke --device cpu
 PYTHONPATH=src python3 -m torchinferno.cli deepseek-smoke --device cpu --no-q-lora
 PYTHONPATH=src python3 -m torchinferno.cli deepseek-smoke --device cpu --cache-backend paged
 ```
+
+## Model Provenance Variants
+
+TorchInferno keeps production model code torch-native and provenance-tracked.
+Each supported family has an explicit variant ladder:
+
+- `raw_ops.py`: unoptimized Python/PyTorch operation definitions.
+- `fused_ops.py`: optimized operation hooks that preserve the raw contract.
+- `v0.py`: reference model or full-prefix replay baseline.
+- `v1.py`: first fused/cached child of `v0`.
+- `registry.py`: parentage, class path, ops module, status, and notes.
+
+Current families:
+
+- `dsv4`: compact DeepSeek-style DSv4 harness.
+- `deepseek-v3.2` / `dsv3.2`: native DeepSeek-V3.2 tensor-contract path.
+- `llama3`: torch-native Llama3 reference path.
+
+List variants or inspect lineage:
+
+```bash
+PYTHONPATH=src python3 -m torchinferno.cli model-variants
+PYTHONPATH=src python3 -m torchinferno.cli model-variants --family llama3 --lineage v1
+```
+
+This is intentionally branch-friendly: if a new idea should not inherit from
+`v1`, add `v1_alt` with parent `v0`, then derive `v2_alt` from that branch.
 
 ## Compiler And Graph Work
 
@@ -226,6 +255,50 @@ PYTHONPATH=src python3 -m torchinferno.cli profile-run .torchinferno_runs/deepse
 
 python3 .torchinferno_runs/dsv4-gpu/repro.py --device cuda
 ```
+
+When full DSv4 does not fit on one node, use `profile-timeslice` to measure a
+compact representative workload and replay the measured duration across virtual
+GPU ranks. `--profile-scale` lets you inflate the measured compact latency to a
+larger target shape while keeping the artifact loop runnable on one CPU or GPU.
+
+```bash
+PYTHONPATH=src python3 -m torchinferno.cli profile-timeslice .torchinferno_runs/dsv4-timeslice-gpu \
+  --model-kind dsv4 \
+  --device cuda \
+  --virtual-gpus 8 \
+  --time-slice-us 1000 \
+  --context-switch-us 25 \
+  --profile-scale 16
+```
+
+Time-sliced profile directories contain `representative_output.json`,
+`operator_profile.json`, `chrome_trace.json`, `timeslice_summary.json`,
+`timeslice_timeline.json`, `memory_profile.json`, and `timeslice_repro.py`.
+The timeline records each virtual rank slice with start/end times, scheduling
+overhead, executed work, and remaining work.
+
+For full-model shape experiments that do not fit resident on one H100, use
+`profile-offload` to keep weights on CPU and explicitly stage modules onto the
+target device. It records movement and compute separately so you can subtract
+CPU/device paging overhead from the serialized run when estimating a resident
+or sharded production runtime.
+
+```bash
+PYTHONPATH=src python3 -m torchinferno.cli profile-offload .torchinferno_runs/full-offload \
+  --checkpoint /path/to/torchinferno-checkpoint \
+  --device cuda \
+  --dtype bfloat16 \
+  --batch-size 1 \
+  --prompt-tokens 128 \
+  --new-tokens 1 \
+  --warmup 1 \
+  --iters 3
+```
+
+Offload directories contain `offload_summary.json`, `offload_events.json`,
+`output.json`, `input_ids.json`, and `offload_repro.py`. The first
+implementation uses full-prefix recompute for generated tokens; decode-cache
+offload is intentionally left as a production milestone.
 
 To inspect node ids from a captured graph:
 
@@ -491,7 +564,9 @@ src/torchinferno/
                            Paged decode attention kernel API.
   kernels/nvfp4.py        NVFP4 quantized-linear reference contract.
   kernels/passes.py       Graph-pass registration for kernel replacements.
+  models/*_family/        Provenance-tracked raw/fused model variant ladders.
   models/dsv4.py          DSv4-style causal LM, MoE, attention, and KV cache.
+  models/llama3_family/   Torch-native Llama3 raw/fused reference variants.
   models/auto.py          Config-driven model loader.
   models/deepseek.py      Native DeepSeek-V3.2-style architecture.
   models/conversion.py    DeepSeek-style checkpoint audit and conversion.
@@ -503,6 +578,7 @@ src/torchinferno/
   runtime/fake_dist.py    Fake process groups and collectives.
   runtime/flex.py         Flex-attention-shaped fallback.
   runtime/monarch.py      Monarch adapter point.
+  runtime/offload.py      CPU/device staging profiler for oversized models.
   runtime/paged.py        Paged KV cache scaffold.
   runtime/paged_attention.py
                            Paged causal attention reference.
@@ -549,6 +625,8 @@ Implemented as working code and tests:
 - `make_fx` and fake tensor trace helper.
 - Fake process groups.
 - Time-sliced multi-rank simulation.
+- Time-sliced representative profile replay with virtual GPU timelines.
+- CPU-offloaded full-prefix replay with transfer overhead accounting.
 - Disaggregated prefill/decode planning.
 - Agent-editable standalone rank files for executable prefill/decode RPC
   experiments.

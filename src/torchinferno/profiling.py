@@ -17,8 +17,15 @@ from torchinferno.graph.passes import PassRegistry
 from torchinferno.kernels.ops import fused_rmsnorm_swiglu_reference
 from torchinferno.kernels.ops import triton_available
 from torchinferno.kernels.passes import register_kernel_replacement_passes
+from torchinferno.models.auto import load_model_auto
 from torchinferno.models.deepseek import DeepSeekV32ForCausalLM, tiny_deepseek_v32_config
 from torchinferno.models.dsv4 import DSv4ForCausalLM, tiny_dsv4_config
+from torchinferno.runtime.offload import (
+    OffloadEvent,
+    run_offloaded_generate_recompute,
+    summarize_offload_events,
+)
+from torchinferno.runtime.simulation import TimeSliceReplayResult, TimeSliceWorkload, TimeSlicedSimulator, VirtualGPU
 
 
 ModelKind = Literal["dsv4", "deepseek"]
@@ -173,6 +180,86 @@ class SubgraphProfileArtifacts:
     memory_profile: Path
     operator_profile: Path | None
     chrome_trace: Path | None
+    repro: Path
+
+
+@dataclass(frozen=True)
+class TimeSliceProfileConfig:
+    output_dir: Path
+    model_kind: ModelKind = "dsv4"
+    device: str = "cuda"
+    dtype: str = "float32"
+    seed: int = 0
+    batch_size: int = 1
+    prompt_tokens: int = 8
+    new_tokens: int = 8
+    vocab_size: int = 128
+    temperature: float = 0.0
+    compile: bool = False
+    cache_backend: str = "dense"
+    page_size: int = 16
+    warmup: int = 1
+    iters: int = 3
+    virtual_gpus: int = 4
+    time_slice_us: float = 1000.0
+    context_switch_us: float = 0.0
+    arrival_gap_us: float = 0.0
+    profile_scale: float = 1.0
+    capture_profiler: bool = True
+    export_chrome_trace: bool = True
+    with_stack: bool = False
+    with_flops: bool = True
+    command: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class TimeSliceProfileArtifacts:
+    output_dir: Path
+    manifest: Path
+    run_config: Path
+    environment: Path
+    input_ids: Path
+    output: Path
+    memory_profile: Path
+    operator_profile: Path | None
+    chrome_trace: Path | None
+    timeline: Path
+    summary: Path
+    repro: Path
+
+
+@dataclass(frozen=True)
+class OffloadProfileConfig:
+    output_dir: Path
+    checkpoint: str | None = None
+    model_kind: ModelKind = "dsv4"
+    device: str = "cuda"
+    dtype: str = "float32"
+    seed: int = 0
+    batch_size: int = 1
+    prompt_tokens: int = 8
+    new_tokens: int = 1
+    vocab_size: int = 128
+    temperature: float = 0.0
+    activation_offload: bool = False
+    warmup: int = 0
+    iters: int = 1
+    revision: str | None = None
+    cache_dir: str | None = None
+    strict: bool = True
+    command: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class OffloadProfileArtifacts:
+    output_dir: Path
+    manifest: Path
+    run_config: Path
+    environment: Path
+    input_ids: Path
+    output: Path
+    events: Path
+    summary: Path
     repro: Path
 
 
@@ -734,6 +821,335 @@ def run_subgraph_profile_capture(config: SubgraphProfileConfig) -> SubgraphProfi
     return artifacts
 
 
+def run_timeslice_profile_capture(config: TimeSliceProfileConfig) -> TimeSliceProfileArtifacts:
+    """Measure one representative generation and replay it across virtual GPUs."""
+
+    if config.virtual_gpus < 1:
+        raise ValueError("virtual_gpus must be positive")
+    if config.time_slice_us <= 0:
+        raise ValueError("time_slice_us must be positive")
+    if config.profile_scale <= 0:
+        raise ValueError("profile_scale must be positive")
+
+    output_dir = config.output_dir
+    output_dir.mkdir(parents=True, exist_ok=True)
+    device = _normalize_device(torch.device(config.device))
+    dtype = _dtype_from_name(config.dtype)
+    torch.manual_seed(config.seed)
+    if device.type == "cuda":
+        torch.cuda.manual_seed_all(config.seed)
+
+    model_config = ProfileRunConfig(
+        output_dir=output_dir,
+        model_kind=config.model_kind,
+        device=str(device),
+        dtype=config.dtype,
+        seed=config.seed,
+        batch_size=config.batch_size,
+        prompt_tokens=config.prompt_tokens,
+        new_tokens=config.new_tokens,
+        vocab_size=config.vocab_size,
+        temperature=config.temperature,
+        compile=config.compile,
+        cache_backend=config.cache_backend,
+        page_size=config.page_size,
+        warmup=0,
+    )
+    model = _build_model(model_config).to(device=device, dtype=dtype).eval()
+    input_ids = torch.randint(
+        0,
+        config.vocab_size,
+        (config.batch_size, config.prompt_tokens),
+        device=device,
+        dtype=torch.long,
+    )
+    if config.compile:
+        compile_forward(model, CompileConfig(mode="reduce-overhead"))
+
+    run_config_path = output_dir / "run_config.json"
+    environment_path = output_dir / "environment.json"
+    input_path = output_dir / "input_ids.json"
+    output_path = output_dir / "representative_output.json"
+    memory_path = output_dir / "memory_profile.json"
+    operator_path = output_dir / "operator_profile.json" if config.capture_profiler else None
+    chrome_path = output_dir / "chrome_trace.json" if config.capture_profiler and config.export_chrome_trace else None
+    timeline_path = output_dir / "timeslice_timeline.json"
+    summary_path = output_dir / "timeslice_summary.json"
+    manifest_path = output_dir / "manifest.json"
+    repro_path = output_dir / "timeslice_repro.py"
+
+    _write_json(run_config_path, _timeslice_config_to_json(config))
+    _write_json(environment_path, _environment_payload(device))
+    _write_json(input_path, {"input_ids": input_ids.detach().cpu().tolist()})
+
+    def representative(ids: torch.Tensor) -> torch.Tensor:
+        return _run_generate(model, ids, model_config)
+
+    _sync_if_needed(device)
+    memory_before = _memory_snapshot(device)
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
+    result, elapsed_ms, _ = _profile_callable(
+        representative,
+        (input_ids,),
+        label="torchinferno.timeslice.representative",
+        device=device,
+        iters=config.iters,
+        capture_profiler=False,
+        with_stack=False,
+        with_flops=False,
+        warmup=config.warmup,
+    )
+    profiler = None
+    if config.capture_profiler:
+        _, _, profiler = _profile_callable(
+            representative,
+            (input_ids,),
+            label="torchinferno.timeslice.representative.profiler",
+            device=device,
+            iters=config.iters,
+            capture_profiler=True,
+            with_stack=config.with_stack,
+            with_flops=config.with_flops,
+            warmup=0,
+        )
+    memory_after = _memory_snapshot(device)
+
+    representative_per_iter_ms = elapsed_ms / max(1, config.iters)
+    simulated_work_us = representative_per_iter_ms * 1000.0 * config.profile_scale
+    virtual_gpus = tuple(
+        VirtualGPU(
+            rank=rank,
+            latency_us=config.context_switch_us,
+            time_slice_us=config.time_slice_us,
+        )
+        for rank in range(config.virtual_gpus)
+    )
+    workloads = tuple(
+        TimeSliceWorkload(
+            rank=rank,
+            work_us=simulated_work_us,
+            label=f"virtual-rank-{rank}",
+            arrival_us=rank * config.arrival_gap_us,
+        )
+        for rank in range(config.virtual_gpus)
+    )
+    replay = TimeSlicedSimulator(virtual_gpus).replay(workloads)
+
+    _write_json(
+        output_path,
+        {
+            "shape": list(result.shape) if isinstance(result, torch.Tensor) else None,
+            "output": _value_summary(result),
+            "measured_elapsed_ms": elapsed_ms,
+            "measured_iters": config.iters,
+            "measured_per_iter_ms": representative_per_iter_ms,
+            "profile_scale": config.profile_scale,
+            "simulated_work_us_per_rank": simulated_work_us,
+            "tokens_per_second": _tokens_per_second(
+                config.batch_size * config.new_tokens * config.iters,
+                elapsed_ms,
+            ),
+        },
+    )
+    _write_json(memory_path, {"before": memory_before, "after": memory_after})
+    if profiler is not None:
+        assert operator_path is not None
+        _write_json(operator_path, _profiler_key_averages(profiler))
+        if chrome_path is not None:
+            profiler.export_chrome_trace(str(chrome_path))
+
+    replay_payload = _timeslice_replay_to_json(replay)
+    _write_json(timeline_path, {"events": replay_payload["events"]})
+    _write_json(
+        summary_path,
+        {
+            key: value
+            for key, value in replay_payload.items()
+            if key != "events"
+        },
+    )
+    _write_timeslice_repro(repro_path, config)
+    artifacts = TimeSliceProfileArtifacts(
+        output_dir=output_dir,
+        manifest=manifest_path,
+        run_config=run_config_path,
+        environment=environment_path,
+        input_ids=input_path,
+        output=output_path,
+        memory_profile=memory_path,
+        operator_profile=operator_path,
+        chrome_trace=chrome_path,
+        timeline=timeline_path,
+        summary=summary_path,
+        repro=repro_path,
+    )
+    _write_json(
+        manifest_path,
+        {
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "output_dir": str(output_dir),
+            "artifacts": _timeslice_artifact_manifest(artifacts),
+        },
+    )
+    _write_timeslice_readme(output_dir / "README.md", artifacts)
+    return artifacts
+
+
+def run_offload_profile_capture(config: OffloadProfileConfig) -> OffloadProfileArtifacts:
+    """Run an explicit CPU-offloaded generation profile and split movement/compute."""
+
+    if config.warmup < 0:
+        raise ValueError("warmup must be non-negative")
+    if config.iters < 1:
+        raise ValueError("iters must be positive")
+    output_dir = config.output_dir
+    output_dir.mkdir(parents=True, exist_ok=True)
+    device = _normalize_device(torch.device(config.device))
+    dtype = _dtype_from_name(config.dtype)
+    torch.manual_seed(config.seed)
+    if device.type == "cuda":
+        torch.cuda.manual_seed_all(config.seed)
+
+    if config.checkpoint is None:
+        model_config = ProfileRunConfig(
+            output_dir=output_dir,
+            model_kind=config.model_kind,
+            device="cpu",
+            dtype=config.dtype,
+            seed=config.seed,
+            batch_size=config.batch_size,
+            prompt_tokens=config.prompt_tokens,
+            new_tokens=config.new_tokens,
+            vocab_size=config.vocab_size,
+            temperature=config.temperature,
+            warmup=0,
+        )
+        model = _build_model(model_config).to("cpu").eval()
+        model_source = {"kind": "generated", "model_kind": config.model_kind}
+    else:
+        model = load_model_auto(
+            config.checkpoint,
+            revision=config.revision,
+            cache_dir=config.cache_dir,
+            map_location="cpu",
+            strict=config.strict,
+        ).to("cpu").eval()
+        model_source = {"kind": "checkpoint", "checkpoint": config.checkpoint}
+
+    model_vocab_size = int(getattr(getattr(model, "config", None), "vocab_size", config.vocab_size))
+    input_vocab_size = min(config.vocab_size, model_vocab_size)
+    if input_vocab_size < 1:
+        raise ValueError("vocab_size must be positive")
+    input_ids = torch.randint(
+        0,
+        input_vocab_size,
+        (config.batch_size, config.prompt_tokens),
+        device=torch.device("cpu"),
+        dtype=torch.long,
+    )
+
+    run_config_path = output_dir / "run_config.json"
+    environment_path = output_dir / "environment.json"
+    input_path = output_dir / "input_ids.json"
+    output_path = output_dir / "output.json"
+    events_path = output_dir / "offload_events.json"
+    summary_path = output_dir / "offload_summary.json"
+    manifest_path = output_dir / "manifest.json"
+    repro_path = output_dir / "offload_repro.py"
+
+    _write_json(run_config_path, _offload_config_to_json(config))
+    _write_json(environment_path, _environment_payload(device))
+    _write_json(input_path, {"input_ids": input_ids.tolist()})
+
+    for _ in range(config.warmup):
+        run_offloaded_generate_recompute(
+            model,
+            input_ids,
+            max_new_tokens=config.new_tokens,
+            device=device,
+            dtype=dtype,
+            temperature=config.temperature,
+            activation_offload=config.activation_offload,
+        )
+    all_events: list[OffloadEvent] = []
+    result = None
+    for _ in range(config.iters):
+        result = run_offloaded_generate_recompute(
+            model,
+            input_ids,
+            max_new_tokens=config.new_tokens,
+            device=device,
+            dtype=dtype,
+            temperature=config.temperature,
+            activation_offload=config.activation_offload,
+        )
+        all_events.extend(result.events)
+    assert result is not None
+    events = tuple(all_events)
+    summary = summarize_offload_events(events)
+    output_tokens = result.output.detach().cpu().tolist() if result.output.dtype == torch.long else None
+    generated_tokens = config.batch_size * config.new_tokens
+    compute_ms = float(summary["compute_only_estimate_ms"])
+    observed_ms = float(summary["observed_elapsed_ms"])
+    _write_json(
+        output_path,
+        {
+            "shape": list(result.output.shape),
+            "output": _value_summary(result.output),
+            "tokens": output_tokens,
+            "mode": "full-prefix-recompute" if config.new_tokens > 0 else "forward",
+        },
+    )
+    _write_json(events_path, {"events": [_offload_event_to_json(event) for event in events]})
+    observed_ms = float(summary["observed_elapsed_ms"])
+    compute_ms = float(summary["compute_only_estimate_ms"])
+    _write_json(
+        summary_path,
+        {
+            **summary,
+            "warmup": config.warmup,
+            "iters": config.iters,
+            "observed_per_iter_ms": observed_ms / config.iters,
+            "compute_only_per_iter_ms": compute_ms / config.iters,
+            "movement_per_iter_ms": float(summary["movement_ms"]) / config.iters,
+            "model_source": model_source,
+            "device": str(device),
+            "dtype": config.dtype,
+            "batch_size": config.batch_size,
+            "prompt_tokens": config.prompt_tokens,
+            "new_tokens": config.new_tokens,
+            "activation_offload": config.activation_offload,
+            "observed_new_tokens_per_second": _tokens_per_second(generated_tokens * config.iters, observed_ms),
+            "compute_only_new_tokens_per_second": _tokens_per_second(generated_tokens * config.iters, compute_ms),
+            "movement_subtracted_ms": compute_ms,
+        },
+    )
+    _write_offload_repro(repro_path, config)
+
+    artifacts = OffloadProfileArtifacts(
+        output_dir=output_dir,
+        manifest=manifest_path,
+        run_config=run_config_path,
+        environment=environment_path,
+        input_ids=input_path,
+        output=output_path,
+        events=events_path,
+        summary=summary_path,
+        repro=repro_path,
+    )
+    _write_json(
+        manifest_path,
+        {
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "output_dir": str(output_dir),
+            "artifacts": _offload_artifact_manifest(artifacts),
+        },
+    )
+    _write_offload_readme(output_dir / "README.md", artifacts)
+    return artifacts
+
+
 def _build_model(config: ProfileRunConfig) -> DSv4ForCausalLM | DeepSeekV32ForCausalLM:
     max_seq_len = config.prompt_tokens + config.new_tokens + 8
     if config.model_kind == "dsv4":
@@ -894,6 +1310,36 @@ def _config_to_json(config: ProfileRunConfig) -> dict[str, Any]:
     return payload
 
 
+def _timeslice_config_to_json(config: TimeSliceProfileConfig) -> dict[str, Any]:
+    payload = asdict(config)
+    payload["output_dir"] = str(config.output_dir)
+    payload["command"] = list(config.command)
+    return payload
+
+
+def _offload_config_to_json(config: OffloadProfileConfig) -> dict[str, Any]:
+    payload = asdict(config)
+    payload["output_dir"] = str(config.output_dir)
+    payload["command"] = list(config.command)
+    return payload
+
+
+def _timeslice_replay_to_json(replay: TimeSliceReplayResult) -> dict[str, Any]:
+    return {
+        "time_slice_us": replay.time_slice_us,
+        "total_elapsed_us": replay.total_elapsed_us,
+        "total_work_us": replay.total_work_us,
+        "total_overhead_us": replay.total_overhead_us,
+        "utilization": replay.utilization,
+        "slice_count": len(replay.events),
+        "events": [asdict(event) for event in replay.events],
+    }
+
+
+def _offload_event_to_json(event: OffloadEvent) -> dict[str, Any]:
+    return asdict(event)
+
+
 def _artifact_manifest(artifacts: ProfileRunArtifacts) -> dict[str, str | None]:
     output_dir = artifacts.output_dir
 
@@ -973,6 +1419,43 @@ def _subgraph_artifact_manifest(artifacts: SubgraphProfileArtifacts) -> dict[str
         "memory_profile": rel(artifacts.memory_profile),
         "operator_profile": rel(artifacts.operator_profile),
         "chrome_trace": rel(artifacts.chrome_trace),
+        "repro": rel(artifacts.repro),
+    }
+
+
+def _timeslice_artifact_manifest(artifacts: TimeSliceProfileArtifacts) -> dict[str, str | None]:
+    output_dir = artifacts.output_dir
+
+    def rel(path: Path | None) -> str | None:
+        return str(path.relative_to(output_dir)) if path is not None else None
+
+    return {
+        "run_config": rel(artifacts.run_config),
+        "environment": rel(artifacts.environment),
+        "input_ids": rel(artifacts.input_ids),
+        "representative_output": rel(artifacts.output),
+        "memory_profile": rel(artifacts.memory_profile),
+        "operator_profile": rel(artifacts.operator_profile),
+        "chrome_trace": rel(artifacts.chrome_trace),
+        "timeslice_timeline": rel(artifacts.timeline),
+        "timeslice_summary": rel(artifacts.summary),
+        "repro": rel(artifacts.repro),
+    }
+
+
+def _offload_artifact_manifest(artifacts: OffloadProfileArtifacts) -> dict[str, str | None]:
+    output_dir = artifacts.output_dir
+
+    def rel(path: Path | None) -> str | None:
+        return str(path.relative_to(output_dir)) if path is not None else None
+
+    return {
+        "run_config": rel(artifacts.run_config),
+        "environment": rel(artifacts.environment),
+        "input_ids": rel(artifacts.input_ids),
+        "output": rel(artifacts.output),
+        "offload_events": rel(artifacts.events),
+        "offload_summary": rel(artifacts.summary),
         "repro": rel(artifacts.repro),
     }
 
@@ -1512,6 +1995,117 @@ if __name__ == "__main__":
     path.chmod(0o755)
 
 
+def _write_timeslice_repro(path: Path, config: TimeSliceProfileConfig) -> None:
+    source = f'''#!/usr/bin/env python3
+from __future__ import annotations
+
+from pathlib import Path
+import argparse
+import sys
+
+REPO_ROOT = Path({str(Path.cwd())!r})
+if (REPO_ROOT / "src").exists():
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+
+from torchinferno.profiling import TimeSliceProfileConfig, run_timeslice_profile_capture
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--output-dir", default="timeslice_repro_artifacts")
+    parser.add_argument("--device", default={config.device!r})
+    args = parser.parse_args()
+    artifacts = run_timeslice_profile_capture(
+        TimeSliceProfileConfig(
+            output_dir=Path(args.output_dir),
+            model_kind={config.model_kind!r},
+            device=args.device,
+            dtype={config.dtype!r},
+            seed={config.seed!r},
+            batch_size={config.batch_size!r},
+            prompt_tokens={config.prompt_tokens!r},
+            new_tokens={config.new_tokens!r},
+            vocab_size={config.vocab_size!r},
+            temperature={config.temperature!r},
+            compile={config.compile!r},
+            cache_backend={config.cache_backend!r},
+            page_size={config.page_size!r},
+            warmup={config.warmup!r},
+            iters={config.iters!r},
+            virtual_gpus={config.virtual_gpus!r},
+            time_slice_us={config.time_slice_us!r},
+            context_switch_us={config.context_switch_us!r},
+            arrival_gap_us={config.arrival_gap_us!r},
+            profile_scale={config.profile_scale!r},
+            capture_profiler={config.capture_profiler!r},
+            export_chrome_trace={config.export_chrome_trace!r},
+            with_stack={config.with_stack!r},
+            with_flops={config.with_flops!r},
+        )
+    )
+    print(artifacts.manifest)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+'''
+    path.write_text(source)
+    path.chmod(0o755)
+
+
+def _write_offload_repro(path: Path, config: OffloadProfileConfig) -> None:
+    source = f'''#!/usr/bin/env python3
+from __future__ import annotations
+
+from pathlib import Path
+import argparse
+import sys
+
+REPO_ROOT = Path({str(Path.cwd())!r})
+if (REPO_ROOT / "src").exists():
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+
+from torchinferno.profiling import OffloadProfileConfig, run_offload_profile_capture
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--output-dir", default="offload_repro_artifacts")
+    parser.add_argument("--device", default={config.device!r})
+    args = parser.parse_args()
+    artifacts = run_offload_profile_capture(
+        OffloadProfileConfig(
+            output_dir=Path(args.output_dir),
+            checkpoint={config.checkpoint!r},
+            model_kind={config.model_kind!r},
+            device=args.device,
+            dtype={config.dtype!r},
+            seed={config.seed!r},
+            batch_size={config.batch_size!r},
+            prompt_tokens={config.prompt_tokens!r},
+            new_tokens={config.new_tokens!r},
+            vocab_size={config.vocab_size!r},
+            temperature={config.temperature!r},
+            activation_offload={config.activation_offload!r},
+            warmup={config.warmup!r},
+            iters={config.iters!r},
+            revision={config.revision!r},
+            cache_dir={config.cache_dir!r},
+            strict={config.strict!r},
+        )
+    )
+    print(artifacts.manifest)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+'''
+    path.write_text(source)
+    path.chmod(0o755)
+
+
 def _write_focus_readme(path: Path, kind: str, artifacts: FocusProfileArtifacts) -> None:
     path.write_text(
         f"# TorchInferno {kind.title()} Profile\n\n"
@@ -1550,6 +2144,35 @@ def _write_subgraph_readme(path: Path, artifacts: SubgraphProfileArtifacts) -> N
         "- `chrome_trace.json`: trace viewer artifact when profiler export is enabled.\n"
         "- `memory_profile.json`: allocator snapshot before and after subgraph profiling.\n"
         "- `subgraph_repro.py`: rerun this extraction/profile in a fresh artifact directory.\n"
+    )
+
+
+def _write_timeslice_readme(path: Path, artifacts: TimeSliceProfileArtifacts) -> None:
+    path.write_text(
+        "# TorchInferno Time-Sliced Profile\n\n"
+        "Key files:\n\n"
+        "- `representative_output.json`: measured compact model workload and scaled work estimate.\n"
+        "- `operator_profile.json`: profiler key averages for the representative workload.\n"
+        "- `timeslice_summary.json`: aggregate virtual GPU replay timing and utilization.\n"
+        "- `timeslice_timeline.json`: per-slice rank timeline with start/end/remaining work.\n"
+        "- `chrome_trace.json`: trace viewer artifact for the representative workload when enabled.\n"
+        "- `memory_profile.json`: allocator snapshot before and after representative profiling.\n"
+        "- `timeslice_repro.py`: rerun this profile in a fresh artifact directory.\n"
+    )
+
+
+def _write_offload_readme(path: Path, artifacts: OffloadProfileArtifacts) -> None:
+    path.write_text(
+        "# TorchInferno Offload Profile\n\n"
+        "Key files:\n\n"
+        "- `offload_summary.json`: observed time, movement time, compute-only estimate, and bytes moved.\n"
+        "- `offload_events.json`: ordered CPU/device staging, compute, eviction, and activation movement events.\n"
+        "- `output.json`: generated tokens or forward output summary.\n"
+        "- `input_ids.json`: deterministic profile input.\n"
+        "- `offload_repro.py`: rerun this profile in a fresh artifact directory.\n\n"
+        "`compute_only_estimate_ms` subtracts explicit offload movement from the observed serialized run. "
+        "It is intended as a rough resident/sharded production estimate, not as a replacement for a real "
+        "multi-GPU production profile.\n"
     )
 
 

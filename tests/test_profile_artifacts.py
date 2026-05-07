@@ -4,14 +4,18 @@ import subprocess
 import sys
 
 from torchinferno.profiling import (
+    OffloadProfileConfig,
     PatternProfileConfig,
     ProfileRunConfig,
     RegionProfileConfig,
     SubgraphProfileConfig,
+    TimeSliceProfileConfig,
+    run_offload_profile_capture,
     run_pattern_profile_capture,
     run_profile_capture,
     run_region_profile_capture,
     run_subgraph_profile_capture,
+    run_timeslice_profile_capture,
 )
 
 
@@ -90,6 +94,135 @@ def test_profile_run_cli_writes_manifest(tmp_path) -> None:
     assert "TorchInferno profile run" in result.stdout
     assert manifest["artifacts"]["operator_profile"] is None
     assert manifest["artifacts"]["graph_json"] == "graph.json"
+
+
+def test_timeslice_profile_writes_representative_timeline(tmp_path) -> None:
+    output_dir = tmp_path / "timeslice-profile"
+
+    artifacts = run_timeslice_profile_capture(
+        TimeSliceProfileConfig(
+            output_dir=output_dir,
+            device="cpu",
+            batch_size=1,
+            prompt_tokens=2,
+            new_tokens=1,
+            warmup=0,
+            iters=1,
+            virtual_gpus=3,
+            time_slice_us=50.0,
+            profile_scale=2.0,
+            capture_profiler=False,
+        )
+    )
+
+    manifest = json.loads(artifacts.manifest.read_text())
+    summary = json.loads(artifacts.summary.read_text())
+    timeline = json.loads(artifacts.timeline.read_text())
+    representative = json.loads(artifacts.output.read_text())
+
+    assert manifest["artifacts"]["timeslice_timeline"] == "timeslice_timeline.json"
+    assert representative["profile_scale"] == 2.0
+    assert summary["slice_count"] == len(timeline["events"])
+    assert summary["total_elapsed_us"] >= summary["total_work_us"]
+    assert {event["rank"] for event in timeline["events"]} == {0, 1, 2}
+    assert artifacts.operator_profile is None
+
+
+def test_timeslice_profile_cli_writes_manifest(tmp_path) -> None:
+    output_dir = tmp_path / "cli-timeslice"
+    env = {**os.environ, "PYTHONPATH": "src"}
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "torchinferno.cli",
+            "profile-timeslice",
+            str(output_dir),
+            "--device",
+            "cpu",
+            "--batch-size",
+            "1",
+            "--prompt-tokens",
+            "2",
+            "--new-tokens",
+            "1",
+            "--warmup",
+            "0",
+            "--iters",
+            "1",
+            "--virtual-gpus",
+            "2",
+            "--time-slice-us",
+            "100",
+            "--no-profiler",
+        ],
+        check=True,
+        env=env,
+        text=True,
+        capture_output=True,
+    )
+
+    manifest = json.loads((output_dir / "manifest.json").read_text())
+    assert "TorchInferno time-sliced profile" in result.stdout
+    assert manifest["artifacts"]["operator_profile"] is None
+    assert manifest["artifacts"]["timeslice_summary"] == "timeslice_summary.json"
+
+
+def test_offload_profile_writes_events_and_compute_estimate(tmp_path) -> None:
+    output_dir = tmp_path / "offload-profile"
+
+    artifacts = run_offload_profile_capture(
+        OffloadProfileConfig(
+            output_dir=output_dir,
+            device="cpu",
+            batch_size=1,
+            prompt_tokens=2,
+            new_tokens=1,
+        )
+    )
+
+    manifest = json.loads(artifacts.manifest.read_text())
+    summary = json.loads(artifacts.summary.read_text())
+    events = json.loads(artifacts.events.read_text())
+    output = json.loads(artifacts.output.read_text())
+
+    assert manifest["artifacts"]["offload_events"] == "offload_events.json"
+    assert summary["event_count"] == len(events["events"])
+    assert summary["compute_only_estimate_ms"] == summary["movement_subtracted_ms"]
+    assert summary["compute_ms"] > 0
+    assert output["tokens"] is not None
+
+
+def test_offload_profile_cli_writes_manifest(tmp_path) -> None:
+    output_dir = tmp_path / "cli-offload"
+    env = {**os.environ, "PYTHONPATH": "src"}
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "torchinferno.cli",
+            "profile-offload",
+            str(output_dir),
+            "--device",
+            "cpu",
+            "--batch-size",
+            "1",
+            "--prompt-tokens",
+            "2",
+            "--new-tokens",
+            "1",
+        ],
+        check=True,
+        env=env,
+        text=True,
+        capture_output=True,
+    )
+
+    manifest = json.loads((output_dir / "manifest.json").read_text())
+    assert "TorchInferno offload profile" in result.stdout
+    assert manifest["artifacts"]["offload_summary"] == "offload_summary.json"
 
 
 def test_region_profile_capture_writes_focused_artifacts_and_repro(tmp_path) -> None:

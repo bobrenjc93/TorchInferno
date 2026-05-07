@@ -1,8 +1,10 @@
-.PHONY: audit smoke test serve perf profile profile-nodes profile-subgraph profile-region profile-pattern disagg
+.PHONY: audit variants smoke test serve perf profile profile-timeslice profile-offload profile-nodes profile-subgraph profile-region profile-pattern disagg
 
 PYTHON ?= python3
 TI_PYTHONPATH ?= src
 PROFILE_DIR ?= .torchinferno_runs/dsv4-cpu
+TIMESLICE_PROFILE_DIR ?= .torchinferno_runs/dsv4-timeslice-cpu
+OFFLOAD_PROFILE_DIR ?= .torchinferno_runs/dsv4-offload-cpu
 SUBGRAPH_PROFILE_DIR ?= .torchinferno_runs/subgraph-cpu
 NODES ?= 3
 PROFILE_NODES_ARGS ?= --grep embedding
@@ -13,6 +15,9 @@ DISAGG_DIR ?= .torchinferno_disagg
 
 audit:
 	PYTHONPATH=$(TI_PYTHONPATH) $(PYTHON) -m torchinferno.cli audit
+
+variants:
+	PYTHONPATH=$(TI_PYTHONPATH) $(PYTHON) -m torchinferno.cli model-variants
 
 test:
 	$(PYTHON) -m pytest
@@ -30,6 +35,12 @@ perf:
 
 profile:
 	PYTHONPATH=$(TI_PYTHONPATH) $(PYTHON) -m torchinferno.cli profile-run $(PROFILE_DIR) --device cpu --batch-size 1 --prompt-tokens 3 --new-tokens 2 --warmup 0
+
+profile-timeslice:
+	PYTHONPATH=$(TI_PYTHONPATH) $(PYTHON) -m torchinferno.cli profile-timeslice $(TIMESLICE_PROFILE_DIR) --device cpu --batch-size 1 --prompt-tokens 3 --new-tokens 2 --warmup 0 --iters 1 --virtual-gpus 4 --time-slice-us 1000
+
+profile-offload:
+	PYTHONPATH=$(TI_PYTHONPATH) $(PYTHON) -m torchinferno.cli profile-offload $(OFFLOAD_PROFILE_DIR) --device cpu --batch-size 1 --prompt-tokens 3 --new-tokens 1 --warmup 1 --iters 3
 
 profile-nodes:
 	PYTHONPATH=$(TI_PYTHONPATH) $(PYTHON) -m torchinferno.cli profile-nodes $(PROFILE_DIR) $(PROFILE_NODES_ARGS)

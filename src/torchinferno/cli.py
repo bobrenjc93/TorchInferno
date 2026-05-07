@@ -22,16 +22,21 @@ from torchinferno.models.conversion import (
 )
 from torchinferno.models.deepseek import DeepSeekV32ForCausalLM, tiny_deepseek_v32_config
 from torchinferno.models.dsv4 import DSv4ForCausalLM, tiny_dsv4_config
+from torchinferno.models.variants import list_model_variants, model_variant_lineage
 from torchinferno.kernels import KernelBackend, KernelConfig, paged_decode_attention
 from torchinferno.profiling import (
     PatternProfileConfig,
     ProfileRunConfig,
     RegionProfileConfig,
     SubgraphProfileConfig,
+    OffloadProfileConfig,
+    TimeSliceProfileConfig,
+    run_offload_profile_capture,
     run_pattern_profile_capture,
     run_profile_capture,
     run_region_profile_capture,
     run_subgraph_profile_capture,
+    run_timeslice_profile_capture,
 )
 from torchinferno.research import ExperimentResult, ResearchHarness
 from torchinferno.research.benchmarks import benchmark_callable
@@ -81,6 +86,22 @@ def run_dsv4_smoke(args: argparse.Namespace) -> int:
 
 def run_audit(args: argparse.Namespace) -> int:
     print(build_audit_report().format())
+    return 0
+
+
+def run_model_variants(args: argparse.Namespace) -> int:
+    specs = (
+        model_variant_lineage(args.family, args.lineage)
+        if args.lineage is not None
+        else list_model_variants(args.family)
+    )
+    print("TorchInferno model variants")
+    for spec in specs:
+        parents = ",".join(spec.parents) if spec.parents else "-"
+        print(
+            f"{spec.family}:{spec.variant} stage={spec.stage} parents={parents} "
+            f"status={spec.status} class={spec.class_path} ops={spec.ops_module}"
+        )
     return 0
 
 
@@ -581,6 +602,98 @@ def run_profile_nodes(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_profile_timeslice(args: argparse.Namespace) -> int:
+    device = args.device if args.device is not None else str(_default_device())
+    artifacts = run_timeslice_profile_capture(
+        TimeSliceProfileConfig(
+            output_dir=Path(args.output_dir),
+            model_kind=args.model_kind,
+            device=device,
+            dtype=args.dtype,
+            seed=args.seed,
+            batch_size=args.batch_size,
+            prompt_tokens=args.prompt_tokens,
+            new_tokens=args.new_tokens,
+            vocab_size=args.vocab_size,
+            temperature=args.temperature,
+            compile=args.compile,
+            cache_backend=args.cache_backend,
+            page_size=args.page_size,
+            warmup=args.warmup,
+            iters=args.iters,
+            virtual_gpus=args.virtual_gpus,
+            time_slice_us=args.time_slice_us,
+            context_switch_us=args.context_switch_us,
+            arrival_gap_us=args.arrival_gap_us,
+            profile_scale=args.profile_scale,
+            capture_profiler=not args.no_profiler,
+            export_chrome_trace=not args.no_chrome_trace,
+            with_stack=args.with_stack,
+            with_flops=not args.no_flops,
+            command=tuple(sys.argv),
+        )
+    )
+    summary = json.loads(artifacts.summary.read_text())
+    representative = json.loads(artifacts.output.read_text())
+    print("TorchInferno time-sliced profile")
+    print(f"output_dir={artifacts.output_dir}")
+    print(f"manifest={artifacts.manifest}")
+    print(f"representative_per_iter_ms={representative['measured_per_iter_ms']:.4f}")
+    print(
+        f"virtual_gpus={args.virtual_gpus} slices={summary['slice_count']} "
+        f"simulated_elapsed_ms={summary['total_elapsed_us'] / 1000.0:.4f} "
+        f"utilization={summary['utilization']:.3f}"
+    )
+    print(f"timeline={artifacts.timeline}")
+    print(f"repro={artifacts.repro}")
+    if artifacts.chrome_trace is not None:
+        print(f"chrome_trace={artifacts.chrome_trace}")
+    return 0
+
+
+def run_profile_offload(args: argparse.Namespace) -> int:
+    device = args.device if args.device is not None else str(_default_device())
+    artifacts = run_offload_profile_capture(
+        OffloadProfileConfig(
+            output_dir=Path(args.output_dir),
+            checkpoint=args.checkpoint,
+            model_kind=args.model_kind,
+            device=device,
+            dtype=args.dtype,
+            seed=args.seed,
+            batch_size=args.batch_size,
+            prompt_tokens=args.prompt_tokens,
+            new_tokens=args.new_tokens,
+            vocab_size=args.vocab_size,
+            temperature=args.temperature,
+            activation_offload=args.activation_offload,
+            warmup=args.warmup,
+            iters=args.iters,
+            revision=args.revision,
+            cache_dir=args.cache_dir,
+            strict=not args.non_strict,
+            command=tuple(sys.argv),
+        )
+    )
+    summary = json.loads(artifacts.summary.read_text())
+    print("TorchInferno offload profile")
+    print(f"output_dir={artifacts.output_dir}")
+    print(f"manifest={artifacts.manifest}")
+    print(
+        f"observed_per_iter_ms={summary['observed_per_iter_ms']:.4f} "
+        f"movement_per_iter_ms={summary['movement_per_iter_ms']:.4f} "
+        f"compute_only_per_iter_ms={summary['compute_only_per_iter_ms']:.4f}"
+    )
+    print(
+        f"bytes_moved={summary['bytes_moved']} "
+        f"peak_module_bytes={summary['peak_module_bytes']} "
+        f"events={summary['event_count']}"
+    )
+    print(f"events={artifacts.events}")
+    print(f"repro={artifacts.repro}")
+    return 0
+
+
 def run_capture_logits(args: argparse.Namespace) -> int:
     device = torch.device(args.device) if args.device else _default_device()
     model = load_model_auto(
@@ -705,6 +818,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     audit_status = subparsers.add_parser("audit", help="Print environment and feature readiness status.")
     audit_status.set_defaults(func=run_audit)
+
+    variants = subparsers.add_parser("model-variants", help="List provenance-tracked model variants.")
+    variants.add_argument("--family", default=None, help="Filter to a model family such as dsv4, dsv3.2, deepseek-v3.2, or llama3.")
+    variants.add_argument("--lineage", default=None, help="Print lineage ending at this variant, e.g. --family llama3 --lineage v1.")
+    variants.set_defaults(func=run_model_variants)
 
     smoke = subparsers.add_parser("dsv4-smoke", help="Run a DSv4 end-to-end generation smoke test.")
     smoke.add_argument("--device", default=None, help="Torch device, defaults to cuda when available.")
@@ -901,6 +1019,72 @@ def build_parser() -> argparse.ArgumentParser:
     profile.add_argument("--with-stack", action="store_true", help="Capture Python stack traces in the profiler.")
     profile.add_argument("--no-flops", action="store_true", help="Disable profiler FLOP estimation.")
     profile.set_defaults(func=run_profile_run)
+
+    profile_timeslice = subparsers.add_parser(
+        "profile-timeslice",
+        help="Measure one representative generation and replay it across time-sliced virtual GPUs.",
+    )
+    profile_timeslice.add_argument("output_dir")
+    profile_timeslice.add_argument("--model-kind", choices=["dsv4", "deepseek"], default="dsv4")
+    profile_timeslice.add_argument("--device", default=None, help="Torch device, defaults to cuda when available.")
+    profile_timeslice.add_argument("--dtype", choices=["float32", "float16", "bfloat16"], default="float32")
+    profile_timeslice.add_argument("--seed", type=int, default=0)
+    profile_timeslice.add_argument("--batch-size", type=int, default=1)
+    profile_timeslice.add_argument("--prompt-tokens", type=int, default=8)
+    profile_timeslice.add_argument("--new-tokens", type=int, default=8)
+    profile_timeslice.add_argument("--vocab-size", type=int, default=128)
+    profile_timeslice.add_argument("--temperature", type=float, default=0.0)
+    profile_timeslice.add_argument(
+        "--compile",
+        action="store_true",
+        help="Compile the representative model before profiling.",
+    )
+    profile_timeslice.add_argument("--cache-backend", choices=["dense", "paged"], default="dense")
+    profile_timeslice.add_argument("--page-size", type=int, default=16)
+    profile_timeslice.add_argument("--warmup", type=int, default=1)
+    profile_timeslice.add_argument("--iters", type=int, default=3)
+    profile_timeslice.add_argument("--virtual-gpus", type=int, default=4)
+    profile_timeslice.add_argument("--time-slice-us", type=float, default=1000.0)
+    profile_timeslice.add_argument("--context-switch-us", type=float, default=0.0)
+    profile_timeslice.add_argument("--arrival-gap-us", type=float, default=0.0)
+    profile_timeslice.add_argument(
+        "--profile-scale",
+        type=float,
+        default=1.0,
+        help="Multiply measured representative latency before replaying virtual ranks.",
+    )
+    profile_timeslice.add_argument("--no-profiler", action="store_true", help="Skip torch.profiler capture.")
+    profile_timeslice.add_argument("--no-chrome-trace", action="store_true", help="Do not export chrome_trace.json.")
+    profile_timeslice.add_argument("--with-stack", action="store_true", help="Capture Python stack traces in the profiler.")
+    profile_timeslice.add_argument("--no-flops", action="store_true", help="Disable profiler FLOP estimation.")
+    profile_timeslice.set_defaults(func=run_profile_timeslice)
+
+    profile_offload = subparsers.add_parser(
+        "profile-offload",
+        help="Run explicit CPU-offloaded model replay and subtract movement overhead from timing.",
+    )
+    profile_offload.add_argument("output_dir")
+    profile_offload.add_argument("--checkpoint", default=None, help="Optional local/Hugging Face TorchInferno checkpoint.")
+    profile_offload.add_argument("--model-kind", choices=["dsv4", "deepseek"], default="dsv4")
+    profile_offload.add_argument("--device", default=None, help="Torch device, defaults to cuda when available.")
+    profile_offload.add_argument("--dtype", choices=["float32", "float16", "bfloat16"], default="float32")
+    profile_offload.add_argument("--seed", type=int, default=0)
+    profile_offload.add_argument("--batch-size", type=int, default=1)
+    profile_offload.add_argument("--prompt-tokens", type=int, default=8)
+    profile_offload.add_argument("--new-tokens", type=int, default=1)
+    profile_offload.add_argument("--vocab-size", type=int, default=128)
+    profile_offload.add_argument("--temperature", type=float, default=0.0)
+    profile_offload.add_argument("--warmup", type=int, default=0)
+    profile_offload.add_argument("--iters", type=int, default=1)
+    profile_offload.add_argument(
+        "--activation-offload",
+        action="store_true",
+        help="Move activations back to CPU between staged modules.",
+    )
+    profile_offload.add_argument("--revision", default=None)
+    profile_offload.add_argument("--cache-dir", default=None)
+    profile_offload.add_argument("--non-strict", action="store_true", help="Allow missing or unexpected weight keys.")
+    profile_offload.set_defaults(func=run_profile_offload)
 
     profile_region = subparsers.add_parser(
         "profile-region",

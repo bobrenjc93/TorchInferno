@@ -13,6 +13,13 @@ from torchinferno.runtime.disagg import (
     write_rank_files,
 )
 from torchinferno.runtime.fake_dist import FakeProcessGroup, FakeProcessWorld, FakeRankResult
+from torchinferno.runtime.offload import (
+    OffloadEvent,
+    OffloadRunResult,
+    run_offloaded_forward,
+    run_offloaded_generate_recompute,
+    summarize_offload_events,
+)
 from torchinferno.runtime.paged import PagedKVCache, PagedSequence
 from torchinferno.runtime.paged_attention import paged_causal_attention
 from torchinferno.runtime.prefix import PrefixAwareRouter, PrefixMatch, RadixPrefixTree
@@ -23,7 +30,13 @@ from torchinferno.runtime.scheduler import (
     ScheduledStage,
 )
 from torchinferno.runtime.serving import ContinuousBatchEngine, ServingRequest, ServingResult, ServingStats
-from torchinferno.runtime.simulation import TimeSlicedSimulator, VirtualGPU
+from torchinferno.runtime.simulation import (
+    TimeSliceReplayEvent,
+    TimeSliceReplayResult,
+    TimeSliceWorkload,
+    TimeSlicedSimulator,
+    VirtualGPU,
+)
 from torchinferno.runtime.traffic import TrafficPattern, TrafficSimulationResult, generate_traffic, simulate_traffic
 
 __all__ = [
@@ -40,6 +53,8 @@ __all__ = [
     "InferenceResult",
     "InferenceJob",
     "JsonRankClient",
+    "OffloadEvent",
+    "OffloadRunResult",
     "PagedKVCache",
     "PagedSequence",
     "PiecewiseCUDAGraphRunner",
@@ -54,16 +69,22 @@ __all__ = [
     "ServingRequest",
     "ServingResult",
     "ServingStats",
+    "TimeSliceReplayEvent",
+    "TimeSliceReplayResult",
+    "TimeSliceWorkload",
     "TimeSlicedSimulator",
     "TrafficPattern",
     "TrafficSimulationResult",
     "VirtualGPU",
     "generate_traffic",
     "paged_causal_attention",
+    "run_offloaded_forward",
+    "run_offloaded_generate_recompute",
     "run_disagg_request",
     "run_continuous_batch",
     "serve_rank",
     "simulate_traffic",
     "start_rank_server",
+    "summarize_offload_events",
     "write_rank_files",
 ]

@@ -20,8 +20,13 @@ from torchinferno.models.conversion import (
 )
 from torchinferno.models.deepseek import DeepSeekV32Config, DeepSeekV32ForCausalLM, tiny_deepseek_v32_config
 from torchinferno.models.dsv4 import DSv4Config, DSv4ForCausalLM, tiny_dsv4_config
+from torchinferno.models.llama3_family import Llama3Config, Llama3V0ForCausalLM, Llama3V1ForCausalLM, tiny_llama3_config
+from torchinferno.models.provenance import ModelVariantSpec
+from torchinferno.models.variants import get_model_variant, list_model_variants, model_variant_lineage
 from torchinferno.profiling import (
     FocusProfileArtifacts,
+    OffloadProfileArtifacts,
+    OffloadProfileConfig,
     PatternProfileArtifacts,
     PatternProfileConfig,
     ProfileRunArtifacts,
@@ -29,10 +34,14 @@ from torchinferno.profiling import (
     RegionProfileConfig,
     SubgraphProfileArtifacts,
     SubgraphProfileConfig,
+    TimeSliceProfileArtifacts,
+    TimeSliceProfileConfig,
+    run_offload_profile_capture,
     run_pattern_profile_capture,
     run_profile_capture,
     run_region_profile_capture,
     run_subgraph_profile_capture,
+    run_timeslice_profile_capture,
 )
 from torchinferno.tokenization import load_text_tokenizer
 from torchinferno.validation import (
@@ -53,7 +62,13 @@ __all__ = [
     "FeatureAudit",
     "FocusProfileArtifacts",
     "LogitReference",
+    "Llama3Config",
+    "Llama3V0ForCausalLM",
+    "Llama3V1ForCausalLM",
+    "ModelVariantSpec",
     "NVFP4Tensor",
+    "OffloadProfileArtifacts",
+    "OffloadProfileConfig",
     "PatternProfileArtifacts",
     "PatternProfileConfig",
     "ProfileRunArtifacts",
@@ -61,6 +76,8 @@ __all__ = [
     "RegionProfileConfig",
     "SubgraphProfileArtifacts",
     "SubgraphProfileConfig",
+    "TimeSliceProfileArtifacts",
+    "TimeSliceProfileConfig",
     "TorchInfernoAudit",
     "ValidationResult",
     "audit_deepseek_checkpoint",
@@ -76,15 +93,21 @@ __all__ = [
     "load_logit_reference",
     "load_model_auto",
     "load_text_tokenizer",
+    "get_model_variant",
+    "list_model_variants",
+    "model_variant_lineage",
     "nvfp4_linear_reference",
     "paged_decode_attention",
     "quantize_nvfp4",
     "run_pattern_profile_capture",
+    "run_offload_profile_capture",
     "run_profile_capture",
     "run_region_profile_capture",
     "run_subgraph_profile_capture",
+    "run_timeslice_profile_capture",
     "save_logit_reference",
     "tiny_deepseek_v32_config",
     "tiny_dsv4_config",
+    "tiny_llama3_config",
     "validate_logit_reference",
 ]

@@ -9,6 +9,7 @@ Run the local checks before and after non-trivial changes:
 
 ```bash
 PYTHONPATH=src python3 -m torchinferno.cli audit
+PYTHONPATH=src python3 -m torchinferno.cli model-variants
 python3 -m pytest
 PYTHONPATH=src python3 -m torchinferno.cli dsv4-smoke --device cpu --batch-size 1 --prompt-tokens 3 --new-tokens 2
 PYTHONPATH=src python3 -m torchinferno.cli deepseek-smoke --device cpu --batch-size 1 --prompt-tokens 3 --new-tokens 2
@@ -18,6 +19,8 @@ PYTHONPATH=src python3 -m torchinferno.cli traffic-smoke
 PYTHONPATH=src python3 -m torchinferno.cli serve-smoke --device cpu --cache-backend paged
 PYTHONPATH=src python3 -m torchinferno.cli perf-smoke --device cpu --heads 2 --seq-len 8 --head-dim 8 --value-dim 8
 PYTHONPATH=src python3 -m torchinferno.cli profile-run .torchinferno_runs/dsv4-cpu --device cpu --warmup 0 --no-profiler
+PYTHONPATH=src python3 -m torchinferno.cli profile-timeslice .torchinferno_runs/dsv4-timeslice-cpu --device cpu --warmup 0 --iters 1 --no-profiler
+PYTHONPATH=src python3 -m torchinferno.cli profile-offload .torchinferno_runs/dsv4-offload-cpu --device cpu --prompt-tokens 3 --new-tokens 1 --warmup 1 --iters 3
 PYTHONPATH=src python3 -m torchinferno.cli profile-nodes .torchinferno_runs/dsv4-cpu --grep embedding
 PYTHONPATH=src python3 -m torchinferno.cli profile-subgraph .torchinferno_runs/embedding-cpu --source-run .torchinferno_runs/dsv4-cpu --nodes 3 --device cpu --warmup 0 --iters 1
 PYTHONPATH=src python3 -m torchinferno.cli profile-region .torchinferno_runs/attn0-cpu --region layers.0.attn --device cpu --warmup 0 --iters 1

@@ -5,8 +5,9 @@ import sys
 import torch
 
 from torchinferno.models.dsv4 import DSv4Config, DSv4ForCausalLM, tiny_dsv4_config
+from torchinferno.runtime.offload import run_offloaded_generate_recompute, summarize_offload_events
 from torchinferno.runtime.batching import InferenceRequest, run_continuous_batch
-from torchinferno.runtime.simulation import TimeSlicedSimulator, VirtualGPU
+from torchinferno.runtime.simulation import TimeSliceWorkload, TimeSlicedSimulator, VirtualGPU
 
 
 def test_deepseek_v32_config_translation_uses_moe_expert_size() -> None:
@@ -100,6 +101,50 @@ def test_time_sliced_simulator_runs_virtual_ranks() -> None:
     assert [event.rank for event in events] == [0, 1]
     assert [event.result for event in events] == [1, 2]
     assert all(event.elapsed_us > 0 for event in events)
+
+
+def test_time_sliced_simulator_replays_profile_work_round_robin() -> None:
+    simulator = TimeSlicedSimulator(
+        [
+            VirtualGPU(0, latency_us=1.0, time_slice_us=10.0),
+            VirtualGPU(1, latency_us=1.0, time_slice_us=10.0),
+        ]
+    )
+
+    replay = simulator.replay(
+        [
+            TimeSliceWorkload(rank=0, work_us=25.0, label="prefill"),
+            TimeSliceWorkload(rank=1, work_us=10.0, label="decode"),
+        ]
+    )
+
+    assert [event.rank for event in replay.events] == [0, 1, 0, 0]
+    assert [event.work_us for event in replay.events] == [10.0, 10.0, 10.0, 5.0]
+    assert replay.total_work_us == 35.0
+    assert replay.total_overhead_us == 4.0
+    assert 0 < replay.utilization <= 1
+
+
+def test_cpu_offloaded_recompute_generate_matches_dsv4_generate() -> None:
+    torch.manual_seed(4)
+    model = DSv4ForCausalLM(tiny_dsv4_config(vocab_size=32, max_seq_len=16)).eval()
+    input_ids = torch.tensor([[1, 2, 3]], dtype=torch.long)
+
+    with torch.inference_mode():
+        expected = model.generate(input_ids, max_new_tokens=2)
+        actual = run_offloaded_generate_recompute(
+            model,
+            input_ids,
+            max_new_tokens=2,
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+        )
+
+    assert torch.equal(actual.output, expected)
+    summary = summarize_offload_events(actual.events)
+    assert summary["event_count"] > 0
+    assert summary["compute_ms"] > 0
+    assert any(event.kind == "stage_to_device" for event in actual.events)
 
 
 def test_cli_smoke_runs() -> None:

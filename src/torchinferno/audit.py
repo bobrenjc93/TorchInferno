@@ -64,9 +64,19 @@ def build_audit_report() -> TorchInfernoAudit:
             FeatureAudit(
                 "profile artifact loop",
                 "integrated",
-                "profile-run/profile-subgraph/profile-region/profile-pattern write focused graphs, profiles, traces, comparisons, and repros.",
+                "profile-run/profile-timeslice/profile-offload/profile-subgraph/profile-region/profile-pattern write focused graphs, timelines, profiles, traces, comparisons, and repros.",
             ),
             FeatureAudit("fake process groups", "integrated", "Single-process fake collectives cover distributed policy tests."),
+            FeatureAudit(
+                "time-sliced profile replay",
+                "integrated",
+                "Representative generation profiles can be scaled and replayed across virtual GPU ranks.",
+            ),
+            FeatureAudit(
+                "CPU offload profiling",
+                "bridge",
+                "Weights can be staged CPU-to-device one module at a time with movement overhead reported separately from compute.",
+            ),
             FeatureAudit("monarch", "adapter", "Runtime detects Monarch and otherwise routes to FakeProcessWorld."),
             FeatureAudit("flex attention", "reference", "Fallback q/k/v contract exists; real flex dispatch is still future work."),
             FeatureAudit("piecewise cudagraphs", "scaffold", "Named pieces exist; static CUDA capture buffers are not implemented."),
@@ -94,5 +104,10 @@ def build_audit_report() -> TorchInfernoAudit:
             FeatureAudit("disaggregated prefill/decode", "simulated", "Planner models rank assignment and network latency."),
             FeatureAudit("NVFP4 graph passes", "reference", "NVFP4 tensor contract and pass hook exist; production fused kernel remains open."),
             FeatureAudit("research harness", "minimal", "Named experiments and metric comparison are available."),
+            FeatureAudit(
+                "model variant provenance",
+                "reference",
+                "DSv4, DeepSeek-V3.2, and Llama3 have v0/v1 raw/fused variant registries.",
+            ),
         ),
     )
