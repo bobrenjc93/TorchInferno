@@ -143,7 +143,6 @@ def test_triton_cuda_kernels_match_torch_reference() -> None:
     expected_norm = x * torch.rsqrt(x.float().pow(2).mean(dim=-1, keepdim=True) + 1e-6).to(x.dtype) * weight
     torch.testing.assert_close(rms_norm(x, weight, eps=1e-6, config=config), expected_norm, atol=1e-5, rtol=1e-5)
 
-
 @pytest.mark.skipif(not torch.cuda.is_available() or not triton_available(), reason="CUDA Triton kernels unavailable")
 def test_triton_rotary_interleaved_inplace_matches_torch_reference() -> None:
     from torchinferno.kernels.triton_ops import triton_apply_rotary_interleaved_inplace

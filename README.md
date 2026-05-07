@@ -49,8 +49,8 @@ to grow toward production-grade SOTA inference.
 - Piecewise CUDA graph runner API with CPU/eager fallback.
 - Optional Monarch adapter point with fake-world fallback.
 - Bursty traffic simulation for request diversity and latency modeling.
-- Triton CUDA kernels for RMSNorm and SwiGLU activation, with eager torch
-  fallbacks on CPU or unsupported devices.
+- Triton CUDA kernels for RMSNorm and SwiGLU activation, with Helion-generated
+  candidates evaluated through the research harness before any production swap.
 - Triton-backed paged decode attention specialization with a torch reference
   fallback.
 - NVFP4 quantized-linear reference surface and graph-pass hook for future fused
@@ -581,8 +581,36 @@ torch fallbacks:
 
 The DSv4 model calls these APIs from `RMSNorm` and `SwiGLUExpert`, so the model
 keeps one torch-native path while the kernel backend can evolve behind a narrow
-interface. Tests compare CUDA Triton outputs against torch references when CUDA
-is available.
+interface. `helion-search-fx` enumerates FX node windows, benchmarks supported
+Helion-generated candidates against the current status quo and `torch.compile`,
+and records whether a candidate should be promoted. Checked-in Helion artifacts
+keep provenance in `kernels/helion_ops.py`; production routes should only move
+after a candidate beats the best baseline by the configured threshold. Tests
+compare CUDA Triton outputs against torch references when CUDA is available.
+
+Search FX windows and remember Helion decisions before promoting a kernel:
+
+```bash
+PYTHONPATH=src python3 -m torchinferno.cli helion-search-fx \
+  --candidate swiglu \
+  --batch-size 1000 \
+  --tokens 32 \
+  --hidden-size 3584 \
+  --max-nodes 5 \
+  --remember .torchinferno_runs/helion-decisions.jsonl
+```
+
+Search real model regions the same way. The region path traces a torch-native
+CPU/fake graph for discovery and can benchmark generated candidates on CUDA:
+
+```bash
+PYTHONPATH=src python3 -m torchinferno.cli helion-search-region \
+  --model-kind deepseek \
+  --region attention \
+  --trace-device cpu \
+  --device cuda \
+  --max-nodes 5
+```
 
 Benchmark reference versus specialized paged attention:
 
@@ -657,6 +685,7 @@ src/torchinferno/
   tokenization.py         Tokenizer adapters for text IO.
   validation.py           Known-logit capture and validation.
   kernels/ops.py          Kernel APIs with torch fallbacks.
+  kernels/helion_ops.py   Experimental Helion-generated CUDA kernels.
   kernels/triton_ops.py   Triton CUDA RMSNorm and SwiGLU kernels.
   kernels/paged_attention.py
                            Paged decode attention kernel API.

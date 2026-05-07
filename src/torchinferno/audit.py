@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 import torch
 
-from torchinferno.kernels.ops import triton_available
+from torchinferno.kernels.ops import helion_available, triton_available
 from torchinferno.runtime.flex import flex_attention_available
 from torchinferno.runtime.monarch import monarch_available
 
@@ -22,6 +22,7 @@ class EnvironmentAudit:
     cuda_available: bool
     cuda_device_count: int
     triton_available: bool
+    helion_available: bool
     flex_attention_available: bool
     monarch_available: bool
 
@@ -38,6 +39,7 @@ class TorchInfernoAudit:
             f"torch={env.torch_version}",
             f"cuda_available={env.cuda_available} cuda_device_count={env.cuda_device_count}",
             f"triton_available={env.triton_available}",
+            f"helion_available={env.helion_available}",
             f"flex_attention_available={env.flex_attention_available}",
             f"monarch_available={env.monarch_available}",
             "features:",
@@ -53,6 +55,7 @@ def build_audit_report() -> TorchInfernoAudit:
         cuda_available=torch.cuda.is_available(),
         cuda_device_count=torch.cuda.device_count() if torch.cuda.is_available() else 0,
         triton_available=triton_available(),
+        helion_available=helion_available(),
         flex_attention_available=flex_attention_available(),
         monarch_available=monarch_available(),
     )
@@ -90,6 +93,11 @@ def build_audit_report() -> TorchInfernoAudit:
                 "graph pattern replacement",
                 "bridge",
                 "Leaf swaps and multi-node symbolic/make_fx subgraph replacement route into fused custom ops.",
+            ),
+            FeatureAudit(
+                "Helion candidate kernels",
+                "experimental" if helion_available() else "optional",
+                "helion-search-fx enumerates FX windows and benchmarks generated kernels before any production swap.",
             ),
             FeatureAudit(
                 "prefix KV reuse",

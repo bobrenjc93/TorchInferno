@@ -30,6 +30,15 @@ def triton_available() -> bool:
     return True
 
 
+def helion_available() -> bool:
+    try:
+        import helion  # noqa: F401
+        import helion.language as hl  # noqa: F401
+    except Exception:
+        return False
+    return True
+
+
 def swiglu_activation_reference(gate: Tensor, up: Tensor) -> Tensor:
     return F.silu(gate) * up
 

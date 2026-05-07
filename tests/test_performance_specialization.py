@@ -20,6 +20,14 @@ from torchinferno.kernels import (
 from torchinferno.kernels.ops import triton_available
 from torchinferno.kernels.passes import register_kernel_replacement_passes
 from torchinferno.research.benchmarks import benchmark_callable
+from torchinferno.research.helion import (
+    HelionCandidateConfig,
+    HelionDecisionStore,
+    HelionRegionSearchConfig,
+    run_helion_candidate,
+    run_helion_fx_search,
+    run_helion_region_search,
+)
 from torchinferno.runtime.paged import PagedKVCache
 from torchinferno.runtime.paged_attention import paged_causal_attention
 
@@ -287,3 +295,75 @@ def test_benchmark_callable_and_perf_cli() -> None:
 
     assert result.mean_ms >= 0
     assert "TorchInferno performance smoke" in cli.stdout
+
+
+def test_helion_candidate_reports_unavailable_on_cpu() -> None:
+    report = run_helion_candidate(HelionCandidateConfig(device="cpu", batch_size=2, tokens=2, hidden_size=8))
+
+    assert report.status == "unavailable"
+    assert not report.promoted
+    assert "CUDA" in report.reason
+
+
+def test_helion_fx_search_finds_and_remembers_swiglu_window(tmp_path) -> None:
+    search = run_helion_fx_search(
+        HelionCandidateConfig(device="cpu", batch_size=2, tokens=2, hidden_size=8),
+        min_nodes=2,
+        max_nodes=2,
+    )
+    supported = [window for window in search.windows if window.supported_kernel == "swiglu"]
+    store = HelionDecisionStore(tmp_path / "helion-decisions.jsonl")
+    store.append_many(search.reports)
+
+    assert supported
+    assert len(search.reports) == 1
+    assert search.reports[0].candidate_id == supported[0].candidate_id
+    assert store.read()[0]["status"] == "unavailable"
+
+
+def test_helion_region_search_reports_local_and_macro_opportunities() -> None:
+    mlp = run_helion_region_search(
+        HelionRegionSearchConfig(model_kind="deepseek", region="mlp", batch_size=2, tokens=2),
+        min_nodes=2,
+        max_nodes=2,
+    )
+    attention = run_helion_region_search(
+        HelionRegionSearchConfig(model_kind="deepseek", region="attention", batch_size=1, tokens=2),
+        min_nodes=1,
+        max_nodes=2,
+    )
+
+    assert any(window.supported_kernel == "swiglu" for window in mlp.windows)
+    assert any(candidate.name == "mlp-swiglu-activation" for candidate in mlp.macro_candidates)
+    assert any(candidate.name == "attention-rope-cache-macro" for candidate in attention.macro_candidates)
+
+
+def test_helion_candidate_cli_reports_decision() -> None:
+    env = {**os.environ, "PYTHONPATH": "src"}
+    cli = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "torchinferno.cli",
+            "helion-candidate",
+            "--device",
+            "cpu",
+            "--batch-size",
+            "2",
+            "--tokens",
+            "2",
+            "--hidden-size",
+            "8",
+            "--iters",
+            "1",
+            "--warmup",
+            "1",
+        ],
+        check=True,
+        env=env,
+        text=True,
+        capture_output=True,
+    )
+
+    assert "TorchInferno Helion candidate" in cli.stdout
+    assert "status=unavailable" in cli.stdout

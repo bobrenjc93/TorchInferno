@@ -48,7 +48,16 @@ from torchinferno.profiling import (
     run_subgraph_profile_capture,
     run_timeslice_profile_capture,
 )
-from torchinferno.research import ExperimentResult, ResearchHarness
+from torchinferno.research import (
+    ExperimentResult,
+    HelionCandidateConfig,
+    HelionDecisionStore,
+    HelionRegionSearchConfig,
+    ResearchHarness,
+    run_helion_candidate as run_helion_candidate_trial,
+    run_helion_fx_search,
+    run_helion_region_search,
+)
 from torchinferno.research.benchmarks import benchmark_callable
 from torchinferno.runtime.batching import InferenceRequest, run_continuous_batch
 from torchinferno.runtime.disagg import run_disagg_request, write_rank_files
@@ -441,6 +450,139 @@ def run_research_smoke(args: argparse.Namespace) -> int:
     for result in results:
         print(f"{result.name}: total_us={result.metrics['total_us']:.1f}")
     print(f"best={best.name}")
+    return 0
+
+
+def run_helion_candidate_cli(args: argparse.Namespace) -> int:
+    report = run_helion_candidate_trial(
+        HelionCandidateConfig(
+            candidate=args.candidate,
+            batch_size=args.batch_size,
+            tokens=args.tokens,
+            hidden_size=args.hidden_size,
+            dtype=args.dtype,
+            device=args.device,
+            warmup=args.warmup,
+            iters=args.iters,
+            seed=args.seed,
+            min_speedup=args.min_speedup,
+            atol=args.atol,
+            rtol=args.rtol,
+        )
+    )
+    if args.output:
+        report.write_json(args.output)
+    print("TorchInferno Helion candidate")
+    print(
+        f"candidate={report.candidate} candidate_id={report.candidate_id} "
+        f"status={report.status} promoted={report.promoted}"
+    )
+    print(f"shape={report.shape} dtype={report.dtype} device={report.device}")
+    if report.baseline is not None and report.helion is not None:
+        print(f"baseline={report.baseline.mean_ms:.4f}ms name={report.baseline.name}")
+        if report.torch_compile is not None:
+            print(f"torch_compile={report.torch_compile.mean_ms:.4f}ms name={report.torch_compile.name}")
+        print(f"helion={report.helion.mean_ms:.4f}ms name={report.helion.name}")
+        print(f"speedup={report.speedup:.3f} min_speedup={report.min_speedup:.3f}")
+        if report.speedup_vs_compile:
+            print(f"speedup_vs_compile={report.speedup_vs_compile:.3f}")
+        print(f"correct={report.correct} max_abs_error={report.max_abs_error:.6g}")
+    print(f"reason={report.reason}")
+    if args.output:
+        print(f"output={Path(args.output).resolve()}")
+    return 0
+
+
+def run_helion_search_fx_cli(args: argparse.Namespace) -> int:
+    config = HelionCandidateConfig(
+        candidate=args.candidate,
+        batch_size=args.batch_size,
+        tokens=args.tokens,
+        hidden_size=args.hidden_size,
+        dtype=args.dtype,
+        device=args.device,
+        warmup=args.warmup,
+        iters=args.iters,
+        seed=args.seed,
+        min_speedup=args.min_speedup,
+        atol=args.atol,
+        rtol=args.rtol,
+    )
+    search = run_helion_fx_search(config, min_nodes=args.min_nodes, max_nodes=args.max_nodes)
+    if args.output:
+        search.write_json(args.output)
+    if args.remember:
+        HelionDecisionStore(args.remember).append_many(search.reports)
+    supported = [window for window in search.windows if window.supported_kernel]
+    promoted = [report for report in search.reports if report.promoted]
+    print("TorchInferno Helion FX search")
+    print(
+        f"candidate={search.candidate} windows={len(search.windows)} "
+        f"supported={len(supported)} reports={len(search.reports)} promoted={len(promoted)}"
+    )
+    for window in supported:
+        node_targets = " -> ".join(node.target for node in window.nodes)
+        print(f"window={window.candidate_id} kernel={window.supported_kernel} nodes={node_targets}")
+    for report in search.reports:
+        print(
+            f"decision={report.status} candidate_id={report.candidate_id} "
+            f"promoted={report.promoted} speedup={report.speedup:.3f} reason={report.reason}"
+        )
+    if args.output:
+        print(f"output={Path(args.output).resolve()}")
+    if args.remember:
+        print(f"remembered={Path(args.remember).resolve()}")
+    return 0
+
+
+def run_helion_search_region_cli(args: argparse.Namespace) -> int:
+    config = HelionRegionSearchConfig(
+        model_kind=args.model_kind,
+        region=args.region,
+        batch_size=args.batch_size,
+        tokens=args.tokens,
+        hidden_size=args.hidden_size,
+        intermediate_size=args.intermediate_size,
+        dtype=args.dtype,
+        device=args.device,
+        trace_device=args.trace_device,
+        warmup=args.warmup,
+        iters=args.iters,
+        seed=args.seed,
+        min_speedup=args.min_speedup,
+        atol=args.atol,
+        rtol=args.rtol,
+    )
+    search = run_helion_region_search(config, min_nodes=args.min_nodes, max_nodes=args.max_nodes)
+    if args.output:
+        search.write_json(args.output)
+    if args.remember:
+        HelionDecisionStore(args.remember).append_many(search.reports)
+    supported = [window for window in search.windows if window.supported_kernel]
+    promoted = [report for report in search.reports if report.promoted]
+    print("TorchInferno Helion region search")
+    print(
+        f"model={search.model_kind} region={search.region} windows={len(search.windows)} "
+        f"supported={len(supported)} macro={len(search.macro_candidates)} reports={len(search.reports)} "
+        f"promoted={len(promoted)}"
+    )
+    print(f"candidate_activation_shape={search.candidate_activation_shape}")
+    for candidate in search.macro_candidates:
+        print(f"macro={candidate.name} status={candidate.status} reason={candidate.reason}")
+        if candidate.evidence:
+            print(f"  evidence={'; '.join(candidate.evidence[:5])}")
+    for window in supported:
+        node_targets = " -> ".join(node.target for node in window.nodes)
+        print(f"window={window.candidate_id} kernel={window.supported_kernel} nodes={node_targets}")
+    for report in search.reports:
+        print(
+            f"decision={report.status} candidate_id={report.candidate_id} "
+            f"promoted={report.promoted} speedup={report.speedup:.3f} reason={report.reason}"
+        )
+    if args.output:
+        print(f"output={Path(args.output).resolve()}")
+    if args.remember:
+        print(f"remembered={Path(args.remember).resolve()}")
     return 0
 
 
@@ -1151,6 +1293,72 @@ def build_parser() -> argparse.ArgumentParser:
 
     research = subparsers.add_parser("research-smoke", help="Run a tiny auto research harness.")
     research.set_defaults(func=run_research_smoke)
+
+    helion = subparsers.add_parser(
+        "helion-candidate",
+        help="Benchmark a Helion-generated kernel candidate against the current TorchInferno kernel.",
+    )
+    helion.add_argument("--candidate", choices=["swiglu"], default="swiglu")
+    helion.add_argument("--device", default=None, help="Torch device, defaults to cuda when available.")
+    helion.add_argument("--batch-size", type=int, default=1000)
+    helion.add_argument("--tokens", type=int, default=32)
+    helion.add_argument("--hidden-size", type=int, default=3584)
+    helion.add_argument("--dtype", choices=["float32", "float16", "bfloat16"], default="bfloat16")
+    helion.add_argument("--warmup", type=int, default=10)
+    helion.add_argument("--iters", type=int, default=50)
+    helion.add_argument("--seed", type=int, default=0)
+    helion.add_argument("--min-speedup", type=float, default=1.02)
+    helion.add_argument("--atol", type=float, default=2e-2)
+    helion.add_argument("--rtol", type=float, default=2e-2)
+    helion.add_argument("--output", default=None, help="Optional JSON report path.")
+    helion.set_defaults(func=run_helion_candidate_cli)
+
+    helion_search = subparsers.add_parser(
+        "helion-search-fx",
+        help="Enumerate FX node windows and benchmark supported Helion candidates against current baselines.",
+    )
+    helion_search.add_argument("--candidate", choices=["swiglu"], default="swiglu")
+    helion_search.add_argument("--device", default=None, help="Torch device, defaults to cuda when available.")
+    helion_search.add_argument("--batch-size", type=int, default=1000)
+    helion_search.add_argument("--tokens", type=int, default=32)
+    helion_search.add_argument("--hidden-size", type=int, default=3584)
+    helion_search.add_argument("--dtype", choices=["float32", "float16", "bfloat16"], default="bfloat16")
+    helion_search.add_argument("--warmup", type=int, default=10)
+    helion_search.add_argument("--iters", type=int, default=50)
+    helion_search.add_argument("--seed", type=int, default=0)
+    helion_search.add_argument("--min-speedup", type=float, default=1.02)
+    helion_search.add_argument("--atol", type=float, default=2e-2)
+    helion_search.add_argument("--rtol", type=float, default=2e-2)
+    helion_search.add_argument("--min-nodes", type=int, default=1)
+    helion_search.add_argument("--max-nodes", type=int, default=5)
+    helion_search.add_argument("--output", default=None, help="Optional JSON report path.")
+    helion_search.add_argument("--remember", default=None, help="Optional JSONL decision-store path.")
+    helion_search.set_defaults(func=run_helion_search_fx_cli)
+
+    helion_region = subparsers.add_parser(
+        "helion-search-region",
+        help="Trace a model region, enumerate FX windows, and report Helion macro/local opportunities.",
+    )
+    helion_region.add_argument("--model-kind", choices=["dsv4", "deepseek"], default="deepseek")
+    helion_region.add_argument("--region", choices=["mlp", "expert", "swiglu", "attention", "attn"], default="mlp")
+    helion_region.add_argument("--device", default=None, help="Benchmark device for generated candidates.")
+    helion_region.add_argument("--trace-device", default="cpu", help="Device used for torch-native FX tracing.")
+    helion_region.add_argument("--batch-size", type=int, default=2)
+    helion_region.add_argument("--tokens", type=int, default=8)
+    helion_region.add_argument("--hidden-size", type=int, default=64)
+    helion_region.add_argument("--intermediate-size", type=int, default=128)
+    helion_region.add_argument("--dtype", choices=["float32", "float16", "bfloat16"], default="float32")
+    helion_region.add_argument("--warmup", type=int, default=5)
+    helion_region.add_argument("--iters", type=int, default=20)
+    helion_region.add_argument("--seed", type=int, default=0)
+    helion_region.add_argument("--min-speedup", type=float, default=1.02)
+    helion_region.add_argument("--atol", type=float, default=2e-2)
+    helion_region.add_argument("--rtol", type=float, default=2e-2)
+    helion_region.add_argument("--min-nodes", type=int, default=1)
+    helion_region.add_argument("--max-nodes", type=int, default=5)
+    helion_region.add_argument("--output", default=None, help="Optional JSON report path.")
+    helion_region.add_argument("--remember", default=None, help="Optional JSONL decision-store path.")
+    helion_region.set_defaults(func=run_helion_search_region_cli)
 
     traffic = subparsers.add_parser("traffic-smoke", help="Simulate bursty request traffic through prefill/decode ranks.")
     traffic.add_argument("--requests", type=int, default=8)
