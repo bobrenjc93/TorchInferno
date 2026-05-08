@@ -24,10 +24,9 @@ from torchinferno.models.llama3_family.pipeline import (
 from torchinferno.models.llama3_family.v0 import sample_next_token
 
 
-_COMPILED_ROTATE_INTERLEAVED = None
-_COMPILED_ROTATE_INTERLEAVED_CHECKED = False
-_COMPILED_ROTATE_INTERLEAVED_FAILED = False
-_TRITON_ROTARY_INPLACE_FAILED = False
+_COMPILED_ROTATE_LLAMA = None
+_COMPILED_ROTATE_LLAMA_CHECKED = False
+_COMPILED_ROTATE_LLAMA_FAILED = False
 
 
 @dataclass(frozen=True)
@@ -629,8 +628,9 @@ class Llama3TensorParallelForCausalLM:
 
     def _rotary_cache(self, positions: Tensor) -> tuple[Tensor, Tensor]:
         freqs = torch.outer(positions.float(), self.inv_freq)
-        cos = freqs.cos().to(dtype=self.dtype, device=self.device)
-        sin = freqs.sin().to(dtype=self.dtype, device=self.device)
+        emb = torch.cat((freqs, freqs), dim=-1)
+        cos = emb.cos().to(dtype=self.dtype, device=self.device)
+        sin = emb.sin().to(dtype=self.dtype, device=self.device)
         return cos, sin
 
 
@@ -649,52 +649,47 @@ def _all_reduce(tensor: Tensor) -> None:
 
 
 def _apply_rotary_cached(q: Tensor, k: Tensor, rotary: tuple[Tensor, Tensor]) -> tuple[Tensor, Tensor]:
-    global _TRITON_ROTARY_INPLACE_FAILED
-
     cos, sin = rotary
-    if (
-        q.is_cuda
-        and os.environ.get("TORCHINFERNO_TRITON_ROTARY_INPLACE", "1") != "0"
-        and not _TRITON_ROTARY_INPLACE_FAILED
-    ):
-        try:
-            from torchinferno.kernels.triton_ops import triton_apply_rotary_interleaved_inplace
-
-            return triton_apply_rotary_interleaved_inplace(q, k, cos, sin)
-        except Exception:
-            _TRITON_ROTARY_INPLACE_FAILED = True
     cos = cos[None, None, :, :]
     sin = sin[None, None, :, :]
-    return _rotate_interleaved(q, cos, sin), _rotate_interleaved(k, cos, sin)
+    return _rotate_llama(q, cos, sin), _rotate_llama(k, cos, sin)
 
 
-def _rotate_interleaved(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
+def _rotate_llama(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
     if x.is_cuda and os.environ.get("TORCHINFERNO_COMPILE_ROTARY", "1") != "0":
-        compiled = _load_compiled_rotate_interleaved()
+        compiled = _load_compiled_rotate_llama()
         if compiled is not None:
             try:
                 return compiled(x, cos, sin)
             except Exception:
-                global _COMPILED_ROTATE_INTERLEAVED_FAILED
-                _COMPILED_ROTATE_INTERLEAVED_FAILED = True
-    return _rotate_interleaved_eager(x, cos, sin)
+                global _COMPILED_ROTATE_LLAMA_FAILED
+                _COMPILED_ROTATE_LLAMA_FAILED = True
+    return _rotate_llama_eager(x, cos, sin)
 
 
-def _load_compiled_rotate_interleaved():
-    global _COMPILED_ROTATE_INTERLEAVED, _COMPILED_ROTATE_INTERLEAVED_CHECKED
-    if not _COMPILED_ROTATE_INTERLEAVED_CHECKED:
-        _COMPILED_ROTATE_INTERLEAVED_CHECKED = True
+def _load_compiled_rotate_llama():
+    global _COMPILED_ROTATE_LLAMA, _COMPILED_ROTATE_LLAMA_CHECKED
+    if not _COMPILED_ROTATE_LLAMA_CHECKED:
+        _COMPILED_ROTATE_LLAMA_CHECKED = True
         try:
-            _COMPILED_ROTATE_INTERLEAVED = torch.compile(
-                _rotate_interleaved_eager,
+            _COMPILED_ROTATE_LLAMA = torch.compile(
+                _rotate_llama_eager,
                 fullgraph=True,
                 options={"triton.cudagraphs": False},
             )
         except Exception:
-            _COMPILED_ROTATE_INTERLEAVED = None
-    if _COMPILED_ROTATE_INTERLEAVED_FAILED:
+            _COMPILED_ROTATE_LLAMA = None
+    if _COMPILED_ROTATE_LLAMA_FAILED:
         return None
-    return _COMPILED_ROTATE_INTERLEAVED
+    return _COMPILED_ROTATE_LLAMA
+
+
+def _rotate_llama_eager(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
+    half = x.size(-1) // 2
+    x1 = x[..., :half]
+    x2 = x[..., half:]
+    rotated = torch.cat((-x2, x1), dim=-1)
+    return (x * cos) + (rotated * sin)
 
 
 def _rotate_interleaved_eager(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:

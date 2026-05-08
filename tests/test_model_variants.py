@@ -18,9 +18,12 @@ from torchinferno.models.llama3_family import (
     Llama3TensorParallelForCausalLM,
     Llama3V0ForCausalLM,
     Llama3V1ForCausalLM,
+    raw_ops as llama3_raw_ops,
     llama3_70b_config,
     tiny_llama3_config,
 )
+from torchinferno.models.llama3_family.pipeline import _apply_rotary as _pipeline_apply_rotary
+from torchinferno.models.llama3_family.tensor_parallel import _apply_rotary_cached as _tp_apply_rotary
 from torchinferno.models.variants import get_model_variant, list_model_variants, model_variant_lineage
 
 
@@ -67,6 +70,31 @@ def test_llama3_70b_config_matches_public_architecture_shape() -> None:
     assert config.max_position_embeddings == 131072
     assert config.rope_scaling is not None
     assert config.rope_scaling["rope_type"] == "llama3"
+
+
+def test_llama3_rotary_matches_huggingface_rotate_half_layout() -> None:
+    torch.manual_seed(53)
+    batch, heads, tokens, head_dim = 2, 3, 4, 8
+    positions = torch.arange(tokens)
+    inv_freq = 1.0 / (500000.0 ** (torch.arange(0, head_dim, 2).float() / head_dim))
+    freqs = torch.outer(positions.float(), inv_freq)
+    emb = torch.cat((freqs, freqs), dim=-1)
+    cos = emb.cos()
+    sin = emb.sin()
+    q = torch.randn(batch, heads, tokens, head_dim)
+    k = torch.randn(batch, 1, tokens, head_dim)
+
+    expected_q = _llama_rotate_half_reference(q, cos, sin)
+    expected_k = _llama_rotate_half_reference(k, cos, sin)
+    actual_raw = llama3_raw_ops.apply_rotary(q, cos, sin)
+    actual_pipeline_q, actual_pipeline_k = _pipeline_apply_rotary(q, k, positions, inv_freq)
+    actual_tp_q, actual_tp_k = _tp_apply_rotary(q, k, (cos, sin))
+
+    torch.testing.assert_close(actual_raw, expected_q)
+    torch.testing.assert_close(actual_pipeline_q, expected_q)
+    torch.testing.assert_close(actual_pipeline_k, expected_k)
+    torch.testing.assert_close(actual_tp_q, expected_q)
+    torch.testing.assert_close(actual_tp_k, expected_k)
 
 
 def test_llama3_pipeline_loads_hf_shaped_checkpoint_and_matches_v0(tmp_path) -> None:
@@ -123,6 +151,14 @@ def test_llama3_pipeline_loads_hf_shaped_checkpoint_and_matches_v0(tmp_path) -> 
     torch.testing.assert_close(tp_actual.cpu(), expected, atol=1e-5, rtol=1e-5)
     assert torch.equal(actual_generated.cpu(), expected_generated)
     assert torch.equal(tp_generated.cpu(), expected_generated)
+
+
+def _llama_rotate_half_reference(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    half = x.size(-1) // 2
+    rotated = torch.cat((-x[..., half:], x[..., :half]), dim=-1)
+    cos = cos.to(dtype=x.dtype, device=x.device)[None, None, :, :]
+    sin = sin.to(dtype=x.dtype, device=x.device)[None, None, :, :]
+    return (x * cos) + (rotated * sin)
 
 
 def test_dsv4_and_deepseek_v0_match_v1_greedy_generation() -> None:

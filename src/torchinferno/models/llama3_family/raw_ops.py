@@ -18,15 +18,21 @@ def swiglu(gate: Tensor, up: Tensor) -> Tensor:
 def rotary_cache(head_dim: int, positions: Tensor, theta: float) -> tuple[Tensor, Tensor]:
     inv_freq = 1.0 / (theta ** (torch.arange(0, head_dim, 2, device=positions.device).float() / head_dim))
     freqs = torch.outer(positions.float(), inv_freq)
-    return freqs.cos(), freqs.sin()
+    emb = torch.cat((freqs, freqs), dim=-1)
+    return emb.cos(), emb.sin()
 
 
 def apply_rotary(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
     cos = cos.to(dtype=x.dtype, device=x.device)[None, None, :, :]
     sin = sin.to(dtype=x.dtype, device=x.device)[None, None, :, :]
-    x_even = x[..., 0::2]
-    x_odd = x[..., 1::2]
-    return torch.stack((x_even * cos - x_odd * sin, x_even * sin + x_odd * cos), dim=-1).flatten(-2)
+    return (x * cos) + (_rotate_half(x) * sin)
+
+
+def _rotate_half(x: Tensor) -> Tensor:
+    half = x.size(-1) // 2
+    x1 = x[..., :half]
+    x2 = x[..., half:]
+    return torch.cat((-x2, x1), dim=-1)
 
 
 def repeat_kv(x: Tensor, repeats: int) -> Tensor:

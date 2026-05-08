@@ -457,15 +457,18 @@ def _build_inv_freq(config: Llama3Config, device: torch.device) -> Tensor:
 
 def _apply_rotary(q: Tensor, k: Tensor, positions: Tensor, inv_freq: Tensor) -> tuple[Tensor, Tensor]:
     freqs = torch.outer(positions.float(), inv_freq)
-    cos = freqs.cos().to(dtype=q.dtype, device=q.device)[None, None, :, :]
-    sin = freqs.sin().to(dtype=q.dtype, device=q.device)[None, None, :, :]
+    emb = torch.cat((freqs, freqs), dim=-1)
+    cos = emb.cos().to(dtype=q.dtype, device=q.device)[None, None, :, :]
+    sin = emb.sin().to(dtype=q.dtype, device=q.device)[None, None, :, :]
     return _rotate_half(q, cos, sin), _rotate_half(k, cos, sin)
 
 
 def _rotate_half(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
-    x_even = x[..., 0::2]
-    x_odd = x[..., 1::2]
-    return torch.stack((x_even * cos - x_odd * sin, x_even * sin + x_odd * cos), dim=-1).flatten(-2)
+    half = x.size(-1) // 2
+    x1 = x[..., :half]
+    x2 = x[..., half:]
+    rotated = torch.cat((-x2, x1), dim=-1)
+    return (x * cos) + (rotated * sin)
 
 
 def layer_device_counts(layer_devices: Iterable[str]) -> dict[str, int]:
