@@ -105,9 +105,10 @@ def test_chat_template_batch_encoding_input_ids_are_extracted() -> None:
 
 def test_openai_engine_microbatches_same_shape_requests() -> None:
     model = _BatchRecordingModel()
+    tokenizer = _BarrierByteFallbackTokenizer(vocab_size=8, parties=2)
     engine = OpenAICompletionEngine(
         model,
-        _ByteFallbackTokenizer(vocab_size=8),
+        tokenizer,
         model_id="tiny",
         device=torch.device("cpu"),
         max_batch_size=4,
@@ -160,6 +161,33 @@ def test_openai_engine_single_request_skips_batch_wait() -> None:
     assert completion.tokens == [2]
     assert time.perf_counter() - start < 0.5
     assert model.calls[0][0] == 1
+    assert model.calls[0][2] != "torchinferno-openai-batcher"
+
+
+def test_openai_engine_single_stream_request_uses_direct_path() -> None:
+    model = _BatchRecordingModel()
+    engine = OpenAICompletionEngine(
+        model,
+        _ByteFallbackTokenizer(vocab_size=8),
+        model_id="tiny",
+        device=torch.device("cpu"),
+        max_batch_size=4,
+        batch_wait_ms=1000.0,
+    )
+    try:
+        tokens = list(
+            engine.generate_chat_tokens(
+                [{"role": "user", "content": "single"}],
+                max_tokens=2,
+                temperature=0.0,
+            )
+        )
+    finally:
+        engine.close()
+
+    assert tokens == [2, 2]
+    assert model.calls[0][0] == 1
+    assert model.calls[0][2] != "torchinferno-openai-batcher"
 
 
 class _BatchEncodingTokenizer:
@@ -178,6 +206,16 @@ class _BatchEncodingTokenizer:
         return "".join(str(token_id) for token_id in token_ids)
 
 
+class _BarrierByteFallbackTokenizer(_ByteFallbackTokenizer):
+    def __init__(self, *, vocab_size: int, parties: int) -> None:
+        super().__init__(vocab_size)
+        self.barrier = threading.Barrier(parties)
+
+    def encode_messages(self, messages: list[dict[str, object]]) -> list[int]:
+        self.barrier.wait(timeout=5)
+        return super().encode_messages(messages)
+
+
 class _BatchRecordingCache:
     def __init__(self) -> None:
         self.seq_len = 0
@@ -186,7 +224,7 @@ class _BatchRecordingCache:
 class _BatchRecordingModel:
     def __init__(self) -> None:
         self.config = type("Config", (), {"vocab_size": 8})()
-        self.calls: list[tuple[int, int]] = []
+        self.calls: list[tuple[int, int, str]] = []
 
     def allocate_cache(self, batch_size: int, max_seq_len: int, **kwargs) -> _BatchRecordingCache:
         return _BatchRecordingCache()
@@ -199,7 +237,7 @@ class _BatchRecordingModel:
         use_cache: bool,
         return_last_logits_only: bool = False,
     ):
-        self.calls.append((input_ids.size(0), input_ids.size(1)))
+        self.calls.append((input_ids.size(0), input_ids.size(1), threading.current_thread().name))
         cache.seq_len += input_ids.size(1)
         tokens = 1 if return_last_logits_only else input_ids.size(1)
         logits = torch.zeros(input_ids.size(0), tokens, 8)

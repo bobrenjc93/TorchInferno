@@ -194,7 +194,11 @@ class OpenAICompletionEngine:
         self.max_model_len = max_model_len
         self.max_batch_size = max(1, max_batch_size)
         self.batch_wait_s = max(0.0, batch_wait_ms / 1000.0)
+        self.single_request_admission_wait_s = min(self.batch_wait_s, 0.002)
         self._generation_queue: "queue.Queue[_QueuedGeneration | None]" = queue.Queue()
+        self._model_lock = threading.Lock()
+        self._live_request_condition = threading.Condition()
+        self._live_requests = 0
         self._closed = False
         self._worker: threading.Thread | None = None
         if not _is_tensor_parallel_worker_model(model):
@@ -217,8 +221,18 @@ class OpenAICompletionEngine:
         max_tokens: int,
         temperature: float,
     ) -> Iterator[int]:
-        prompt = self._encode_chat_prompt(messages, max_tokens=max_tokens)
-        yield from self._submit_generation(prompt, max_tokens=max_tokens, temperature=temperature)
+        self._enter_live_request()
+        try:
+            prompt = self._encode_chat_prompt(messages, max_tokens=max_tokens)
+            if self._try_acquire_single_request_model():
+                try:
+                    yield from self._generate_prompt_tokens(prompt, max_tokens=max_tokens, temperature=temperature)
+                finally:
+                    self._model_lock.release()
+            else:
+                yield from self._submit_generation(prompt, max_tokens=max_tokens, temperature=temperature)
+        finally:
+            self._exit_live_request()
 
     def complete_chat(
         self,
@@ -227,8 +241,18 @@ class OpenAICompletionEngine:
         max_tokens: int,
         temperature: float,
     ) -> CompletionResult:
-        prompt = self._encode_chat_prompt(messages, max_tokens=max_tokens)
-        tokens = self._submit_completion(prompt, max_tokens=max_tokens, temperature=temperature)
+        self._enter_live_request()
+        try:
+            prompt = self._encode_chat_prompt(messages, max_tokens=max_tokens)
+            if self._try_acquire_single_request_model():
+                try:
+                    tokens = self._generate_prompt_token_list(prompt, max_tokens=max_tokens, temperature=temperature)
+                finally:
+                    self._model_lock.release()
+            else:
+                tokens = self._submit_completion(prompt, max_tokens=max_tokens, temperature=temperature)
+        finally:
+            self._exit_live_request()
         return CompletionResult(tokens=tokens, prompt_tokens=len(prompt))
 
     def _encode_chat_prompt(self, messages: list[dict[str, object]], *, max_tokens: int) -> list[int]:
@@ -270,9 +294,33 @@ class OpenAICompletionEngine:
                 return
             batch = [first]
             self._drain_ready_requests(batch)
-            if len(batch) > 1:
+            if len(batch) > 1 or self._has_multiple_live_requests():
                 self._collect_batch_until_deadline(batch)
-            self._run_queued_batch(batch)
+            with self._model_lock:
+                self._run_queued_batch(batch)
+
+    def _enter_live_request(self) -> None:
+        with self._live_request_condition:
+            self._live_requests += 1
+            self._live_request_condition.notify_all()
+
+    def _exit_live_request(self) -> None:
+        with self._live_request_condition:
+            self._live_requests -= 1
+            self._live_request_condition.notify_all()
+
+    def _try_acquire_single_request_model(self) -> bool:
+        with self._live_request_condition:
+            if self._live_requests == 1 and self.single_request_admission_wait_s > 0.0:
+                self._live_request_condition.wait(timeout=self.single_request_admission_wait_s)
+            is_only_live_request = self._live_requests == 1
+        if not is_only_live_request or not self._generation_queue.empty():
+            return False
+        return self._model_lock.acquire(blocking=False)
+
+    def _has_multiple_live_requests(self) -> bool:
+        with self._live_request_condition:
+            return self._live_requests > 1
 
     def _drain_ready_requests(self, batch: list[_QueuedGeneration]) -> None:
         while len(batch) < self.max_batch_size:
@@ -397,6 +445,14 @@ class OpenAICompletionEngine:
             next_token = _sample(model, logits[:, -1, :], temperature).to(self.device)
         rows = torch.cat(generated_tokens, dim=1).detach().cpu().tolist()
         return _trim_rows_at_eos(rows, eos_token_id)
+
+    def _generate_prompt_token_list(self, prompt: list[int], *, max_tokens: int, temperature: float) -> list[int]:
+        input_ids = torch.tensor([prompt], dtype=torch.long, device=self.device)
+        return list(self._generate_tokens(input_ids, max_tokens=max_tokens, temperature=temperature))
+
+    def _generate_prompt_tokens(self, prompt: list[int], *, max_tokens: int, temperature: float) -> Iterator[int]:
+        input_ids = torch.tensor([prompt], dtype=torch.long, device=self.device)
+        yield from self._generate_tokens(input_ids, max_tokens=max_tokens, temperature=temperature)
 
     @torch.inference_mode()
     def _generate_tokens(self, input_ids: Tensor, *, max_tokens: int, temperature: float) -> Iterator[int]:
