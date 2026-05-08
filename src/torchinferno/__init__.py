@@ -64,6 +64,13 @@ from torchinferno.validation import (
     save_logit_reference,
     validate_logit_reference,
 )
+from torchinferno.variant_validation import (
+    SkippedVariantComparison,
+    VariantLogitComparison,
+    VariantLogitValidationReport,
+    run_variant_logit_validation,
+    save_variant_logit_report,
+)
 
 __all__ = [
     "CompileConfig",
@@ -91,12 +98,15 @@ __all__ = [
     "ProfileRunArtifacts",
     "ProfileRunConfig",
     "RegionProfileConfig",
+    "SkippedVariantComparison",
     "SubgraphProfileArtifacts",
     "SubgraphProfileConfig",
     "TimeSliceProfileArtifacts",
     "TimeSliceProfileConfig",
     "TorchInfernoAudit",
     "ValidationResult",
+    "VariantLogitComparison",
+    "VariantLogitValidationReport",
     "audit_deepseek_checkpoint",
     "audit_native_deepseek_checkpoint",
     "build_audit_report",
@@ -124,7 +134,9 @@ __all__ = [
     "run_region_profile_capture",
     "run_subgraph_profile_capture",
     "run_timeslice_profile_capture",
+    "run_variant_logit_validation",
     "save_logit_reference",
+    "save_variant_logit_report",
     "tiny_deepseek_v32_config",
     "tiny_dsv4_config",
     "tiny_llama3_config",

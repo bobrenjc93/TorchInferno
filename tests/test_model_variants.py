@@ -25,6 +25,7 @@ from torchinferno.models.llama3_family import (
 from torchinferno.models.llama3_family.pipeline import _apply_rotary as _pipeline_apply_rotary
 from torchinferno.models.llama3_family.tensor_parallel import _apply_rotary_cached as _tp_apply_rotary
 from torchinferno.models.variants import get_model_variant, list_model_variants, model_variant_lineage
+from torchinferno.variant_validation import run_variant_logit_validation
 
 
 def test_model_variant_registry_tracks_families_and_ops_modules() -> None:
@@ -182,6 +183,30 @@ def test_dsv4_and_deepseek_v0_match_v1_greedy_generation() -> None:
         )
 
 
+def test_variant_logit_validation_harness_covers_eager_optimized_pairs() -> None:
+    report = run_variant_logit_validation(
+        device="cpu",
+        batch_size=2,
+        tokens=3,
+        vocab_size=32,
+        seed=54,
+    )
+    compared = {(comparison.family, comparison.optimized_variant) for comparison in report.comparisons}
+    skipped = {(skipped.family, skipped.optimized_variant) for skipped in report.skipped}
+
+    assert report.passed
+    assert {
+        ("dsv4", "v1"),
+        ("deepseek-v3.2", "v1"),
+        ("llama3", "v1"),
+        ("llama3", "pipeline-v0"),
+    } <= compared
+    assert ("llama3", "tp-v0") in skipped
+    for comparison in report.comparisons:
+        assert comparison.max_abs_error <= 1e-4
+        assert comparison.compared_logits == 2 * 3 * 32
+
+
 def test_model_variants_cli_lists_lineage() -> None:
     result = subprocess.run(
         [
@@ -203,3 +228,34 @@ def test_model_variants_cli_lists_lineage() -> None:
     assert "llama3:v0" in result.stdout
     assert "llama3:v1" in result.stdout
     assert "ops=torchinferno.models.llama3_family.fused_ops" in result.stdout
+
+
+def test_validate_model_variants_cli_compares_eager_logits() -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "torchinferno.cli",
+            "validate-model-variants",
+            "--family",
+            "llama3",
+            "--variant",
+            "v1",
+            "--device",
+            "cpu",
+            "--batch-size",
+            "1",
+            "--tokens",
+            "3",
+            "--vocab-size",
+            "32",
+        ],
+        check=True,
+        env={**os.environ, "PYTHONPATH": "src"},
+        text=True,
+        capture_output=True,
+    )
+
+    assert "TorchInferno variant logit validation" in result.stdout
+    assert "passed=True" in result.stdout
+    assert "llama3:v1 vs v0" in result.stdout

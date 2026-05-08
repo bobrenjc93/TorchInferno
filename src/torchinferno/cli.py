@@ -75,6 +75,7 @@ from torchinferno.validation import (
     save_logit_reference,
     validate_logit_reference,
 )
+from torchinferno.variant_validation import run_variant_logit_validation, save_variant_logit_report
 
 
 def _default_device() -> torch.device:
@@ -124,6 +125,45 @@ def run_model_variants(args: argparse.Namespace) -> int:
             f"status={spec.status} class={spec.class_path} ops={spec.ops_module}"
         )
     return 0
+
+
+def run_validate_model_variants(args: argparse.Namespace) -> int:
+    device = torch.device(args.device or "cpu")
+    dtype = dtype_from_name(args.dtype) or torch.float32
+    report = run_variant_logit_validation(
+        family=args.family,
+        variant=args.variant,
+        device=device,
+        dtype=dtype,
+        batch_size=args.batch_size,
+        tokens=args.tokens,
+        vocab_size=args.vocab_size,
+        seed=args.seed,
+        atol=args.atol,
+        rtol=args.rtol,
+        include_tensor_parallel=args.include_tensor_parallel,
+    )
+    if args.json_output:
+        save_variant_logit_report(report, args.json_output)
+
+    print("TorchInferno variant logit validation")
+    print(
+        f"passed={report.passed} comparisons={len(report.comparisons)} skipped={len(report.skipped)} "
+        f"device={device} dtype={str(dtype).replace('torch.', '')} "
+        f"batch={args.batch_size} tokens={args.tokens} atol={args.atol:g} rtol={args.rtol:g}"
+    )
+    for comparison in report.comparisons:
+        print(
+            f"{comparison.family}:{comparison.optimized_variant} vs {comparison.eager_variant} "
+            f"passed={comparison.passed} max_abs_error={comparison.max_abs_error:.6g} "
+            f"max_rel_error={comparison.max_rel_error:.6g} mean_abs_error={comparison.mean_abs_error:.6g} "
+            f"logits={comparison.compared_logits}"
+        )
+    for skipped in report.skipped:
+        print(f"skipped {skipped.family}:{skipped.optimized_variant} vs {skipped.eager_variant}: {skipped.reason}")
+    if args.json_output:
+        print(f"json_output={args.json_output}")
+    return 0 if report.passed and report.comparisons else 2
 
 
 def run_vllm_bench_suite(args: argparse.Namespace) -> int:
@@ -1079,6 +1119,33 @@ def build_parser() -> argparse.ArgumentParser:
     variants.add_argument("--family", default=None, help="Filter to a model family such as dsv4, dsv3.2, deepseek-v3.2, or llama3.")
     variants.add_argument("--lineage", default=None, help="Print lineage ending at this variant, e.g. --family llama3 --lineage v1.")
     variants.set_defaults(func=run_model_variants)
+
+    validate_variants = subparsers.add_parser(
+        "validate-model-variants",
+        help="Compare optimized model variant logits against eager v0 references.",
+    )
+    validate_variants.add_argument("--family", default=None, help="Filter to dsv4, dsv3.2/deepseek-v3.2, or llama3.")
+    validate_variants.add_argument("--variant", default=None, help="Only validate one optimized variant, such as v1.")
+    validate_variants.add_argument("--device", default="cpu", help="Torch device for tiny validation models.")
+    validate_variants.add_argument(
+        "--dtype",
+        default="float32",
+        choices=["float32", "fp32", "float16", "fp16", "bfloat16", "bf16"],
+        help="Model dtype for the comparison.",
+    )
+    validate_variants.add_argument("--batch-size", type=int, default=2)
+    validate_variants.add_argument("--tokens", type=int, default=4)
+    validate_variants.add_argument("--vocab-size", type=int, default=32)
+    validate_variants.add_argument("--seed", type=int, default=0)
+    validate_variants.add_argument("--atol", type=float, default=1e-4)
+    validate_variants.add_argument("--rtol", type=float, default=1e-2, help="Relative tolerance; default is the 1% eager contract.")
+    validate_variants.add_argument("--json-output", default=None, help="Optional JSON report path for agent/research loops.")
+    validate_variants.add_argument(
+        "--include-tensor-parallel",
+        action="store_true",
+        help="Also validate the torchrun/NCCL tensor-parallel Llama path in the current process.",
+    )
+    validate_variants.set_defaults(func=run_validate_model_variants)
 
     vllm_bench = subparsers.add_parser(
         "vllm-bench-suite",

@@ -64,6 +64,8 @@ to grow toward production-grade SOTA inference.
 - Whole-model, focused-region, and pattern-replacement profile artifact loops
   plus arbitrary FX subgraph extraction by node id. These emit graphs, profiler
   JSON, traces, memory data, and repro scripts.
+- Eager-vs-optimized model variant logit validation with a 1% default tolerance
+  and optional JSON reports for agent/research loops.
 - Minimal auto research harness for comparing scheduler/cache/routing policies.
 - Llama 3 70B architecture config plus a native pipeline-sharded checkpoint
   loader/generate path for running production-scale weights across multiple
@@ -601,6 +603,18 @@ PYTHONPATH=src python3 -m torchinferno.cli validate-logits /path/to/checkpoint r
   --device cuda
 ```
 
+For model development, compare every optimized tiny variant against its eager
+`v0` reference without booting a server:
+
+```bash
+PYTHONPATH=src python3 -m torchinferno.cli validate-model-variants --device cpu
+PYTHONPATH=src python3 -m torchinferno.cli validate-model-variants \
+  --family llama3 \
+  --variant v1 \
+  --rtol 0.01 \
+  --json-output .torchinferno_runs/llama3-v1-logits.json
+```
+
 ## Research Harnesses
 
 `torchinferno.research.ResearchHarness` is intentionally small: register named
@@ -732,6 +746,7 @@ src/torchinferno/
   profiling.py            Whole-run, region, and pattern artifact capture.
   tokenization.py         Tokenizer adapters for text IO.
   validation.py           Known-logit capture and validation.
+  variant_validation.py   Eager-vs-optimized model variant logit validation.
   kernels/ops.py          Kernel APIs with torch fallbacks.
   kernels/helion_ops.py   Experimental Helion-generated CUDA kernels.
   kernels/triton_ops.py   Triton CUDA RMSNorm and SwiGLU kernels.

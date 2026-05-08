@@ -122,5 +122,10 @@ def build_audit_report() -> TorchInfernoAudit:
                 "reference",
                 "DSv4, DeepSeek-V3.2, and Llama3 have v0/v1 raw/fused variant registries.",
             ),
+            FeatureAudit(
+                "eager-vs-optimized logit validation",
+                "integrated",
+                "validate-model-variants compares tiny eager v0 logits against optimized variants with a 1% default tolerance and JSON reports for agent loops.",
+            ),
         ),
     )
