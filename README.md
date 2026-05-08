@@ -31,6 +31,9 @@ to grow toward production-grade SOTA inference.
 - Token-step continuous serving harness with admission, paged-cache policy, and
   prefix-hit accounting, shared prefix-page reuse, persistent row-assigned
   paged cache state, and same-shape prefill/decode microbatching.
+- OpenAI-compatible serving with same-shape request microbatching, streaming,
+  accurate prompt/completion token accounting, and a torchrun-backed Llama tensor
+  parallel worker mode.
 - Deterministic time-sliced virtual GPU simulation.
 - Disaggregated prefill/decode planner with network latency modeling.
 - Agent-editable standalone prefill/decode rank files with local JSON-RPC
@@ -45,8 +48,10 @@ to grow toward production-grade SOTA inference.
 - `make_fx` tracing helper with FakeTensorMode support.
 - Pattern-based FX graph pass registry with call-target and multi-node
   subgraph replacement helpers.
-- Flex-attention-shaped q/k/v API with eager fallback.
-- Piecewise CUDA graph runner API with CPU/eager fallback.
+- Flex-attention-shaped q/k/v API that dispatches to torch flex attention when
+  available and keeps an eager fallback.
+- Piecewise CUDA graph runner API with static CUDA tensor capture and CPU/eager
+  fallback.
 - Optional Monarch adapter point with fake-world fallback.
 - Bursty traffic simulation for request diversity and latency modeling.
 - Triton CUDA kernels for RMSNorm and SwiGLU activation, with Helion-generated
@@ -308,6 +313,20 @@ The server implements `GET /v1/models` and streaming
 `few_shot`, `self_consistency`, `multi_turn`, and `tree_of_thought`
 benchmarks. The drop-in provider adapter lives in
 `integrations/inference_bench/torchinferno.py`.
+
+By default the single-process Llama server uses pipeline layer placement across
+the selected devices. To run the real tensor-parallel Llama path, launch the
+same module under `torchrun`; nonzero ranks load the tensor-parallel shard and
+enter the worker loop while rank 0 owns the HTTP server:
+
+```bash
+PYTHONPATH=src torchrun --standalone --nproc-per-node 8 \
+  -m torchinferno.openai_server \
+  --model meta-llama/Meta-Llama-3.1-70B-Instruct \
+  --llama-parallelism tensor \
+  --port 8000 \
+  --trust-remote-code
+```
 
 ## Compiler And Graph Work
 

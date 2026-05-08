@@ -49,11 +49,11 @@ def test_native_deepseek_paged_decode_does_not_materialize_cache(monkeypatch) ->
     input_ids = torch.tensor([[1, 2, 3]], dtype=torch.long)
     decode_token = torch.tensor([[4]], dtype=torch.long)
     decode_calls: list[str] = []
-    original_decode = deepseek_mod.paged_decode_attention
+    original_decode = deepseek_mod.batched_paged_decode_attention
 
-    def record_decode(query, cache, request_id, position, **kwargs):
-        decode_calls.append(request_id)
-        return original_decode(query, cache, request_id, position, **kwargs)
+    def record_decode(query, cache, request_ids, positions, **kwargs):
+        decode_calls.extend(request_ids)
+        return original_decode(query, cache, request_ids, positions, **kwargs)
 
     def fail_materialize(self, batch):
         raise AssertionError("single-token paged decode should not materialize dense KV")
@@ -61,11 +61,26 @@ def test_native_deepseek_paged_decode_does_not_materialize_cache(monkeypatch) ->
     with torch.inference_mode():
         paged_cache = model.allocate_cache(1, max_seq_len=16, cache_backend="paged", page_size=2)
         _, paged_cache = model(input_ids, cache=paged_cache, use_cache=True)
-        monkeypatch.setattr(deepseek_mod, "paged_decode_attention", record_decode)
+        monkeypatch.setattr(deepseek_mod, "batched_paged_decode_attention", record_decode)
         monkeypatch.setattr(deepseek_mod.PagedDeepSeekLayerKVCache, "materialize", fail_materialize)
         model(decode_token, cache=paged_cache, use_cache=True)
 
     assert decode_calls == ["batch-0"] * config.num_hidden_layers
+
+
+def test_native_deepseek_paged_prefill_does_not_materialize_cache(monkeypatch) -> None:
+    torch.manual_seed(58)
+    config = tiny_deepseek_v32_config(vocab_size=32, max_position_embeddings=16)
+    model = DeepSeekV32ForCausalLM(config).eval()
+    input_ids = torch.tensor([[1, 2, 3]], dtype=torch.long)
+
+    def fail_materialize(self, batch):
+        raise AssertionError("paged prefill should attend over pages without materializing dense KV")
+
+    with torch.inference_mode():
+        paged_cache = model.allocate_cache(1, max_seq_len=16, cache_backend="paged", page_size=2)
+        monkeypatch.setattr(deepseek_mod.PagedDeepSeekLayerKVCache, "materialize", fail_materialize)
+        model(input_ids, cache=paged_cache, use_cache=True)
 
 
 def test_native_deepseek_cache_row_views_support_mixed_lengths() -> None:

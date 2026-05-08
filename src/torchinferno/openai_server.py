@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import inspect
 import json
+import os
+import queue
 import threading
 import time
 import uuid
@@ -18,6 +21,7 @@ from torch import Tensor
 from torchinferno.models.deepseek import DeepSeekV32ForCausalLM, sample_next_token, tiny_deepseek_v32_config
 from torchinferno.models.dsv4 import DSv4ForCausalLM, tiny_dsv4_config
 from torchinferno.models.llama3_family.pipeline import Llama3PipelineForCausalLM
+from torchinferno.models.llama3_family.tensor_parallel import Llama3TensorParallelForCausalLM
 from torchinferno.models.llama3_family.v0 import Llama3V0ForCausalLM, tiny_llama3_v0_config
 from torchinferno.models.auto import load_model_auto
 
@@ -40,6 +44,28 @@ class OpenAIServerConfig:
     cache_dir: str | None = None
     cache_backend: str = "dense"
     page_size: int = 16
+    max_batch_size: int = 8
+    batch_wait_ms: float = 2.0
+    llama_parallelism: str = "auto"
+
+
+@dataclass(frozen=True)
+class CompletionResult:
+    tokens: list[int]
+    prompt_tokens: int
+
+
+@dataclass
+class _QueuedGeneration:
+    prompt: list[int]
+    max_tokens: int
+    temperature: float
+    responses: "queue.Queue[object]"
+
+
+@dataclass(frozen=True)
+class _GenerationDone:
+    pass
 
 
 class _ByteFallbackTokenizer:
@@ -149,6 +175,8 @@ class OpenAICompletionEngine:
         cache_backend: str = "dense",
         page_size: int = 16,
         max_model_len: int | None = None,
+        max_batch_size: int = 8,
+        batch_wait_ms: float = 2.0,
     ) -> None:
         self.model = model
         self.tokenizer = tokenizer
@@ -157,7 +185,23 @@ class OpenAICompletionEngine:
         self.cache_backend = cache_backend
         self.page_size = page_size
         self.max_model_len = max_model_len
-        self._lock = threading.Lock()
+        self.max_batch_size = max(1, max_batch_size)
+        self.batch_wait_s = max(0.0, batch_wait_ms / 1000.0)
+        self._generation_queue: "queue.Queue[_QueuedGeneration | None]" = queue.Queue()
+        self._closed = False
+        self._worker: threading.Thread | None = None
+        if not _is_tensor_parallel_worker_model(model):
+            self._worker = threading.Thread(target=self._batch_worker, name="torchinferno-openai-batcher", daemon=True)
+            self._worker.start()
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        if self._worker is not None:
+            self._generation_queue.put(None)
+            self._worker.join(timeout=10)
+        _broadcast_tensor_parallel_stop(self.model)
 
     def generate_chat_tokens(
         self,
@@ -166,18 +210,108 @@ class OpenAICompletionEngine:
         max_tokens: int,
         temperature: float,
     ) -> Iterator[int]:
+        prompt = self._encode_chat_prompt(messages, max_tokens=max_tokens)
+        yield from self._submit_generation(prompt, max_tokens=max_tokens, temperature=temperature)
+
+    def complete_chat(
+        self,
+        messages: list[dict[str, object]],
+        *,
+        max_tokens: int,
+        temperature: float,
+    ) -> CompletionResult:
+        prompt = self._encode_chat_prompt(messages, max_tokens=max_tokens)
+        tokens = list(self._submit_generation(prompt, max_tokens=max_tokens, temperature=temperature))
+        return CompletionResult(tokens=tokens, prompt_tokens=len(prompt))
+
+    def _encode_chat_prompt(self, messages: list[dict[str, object]], *, max_tokens: int) -> list[int]:
         prompt = self.tokenizer.encode_messages(messages)
         if self.max_model_len is not None and len(prompt) + max_tokens > self.max_model_len:
             prompt_budget = max(1, self.max_model_len - max_tokens)
             prompt = prompt[-prompt_budget:]
-        input_ids = torch.tensor([prompt], dtype=torch.long, device=self.device)
-        with self._lock:
-            yield from self._generate_tokens(input_ids, max_tokens=max_tokens, temperature=temperature)
+        return prompt
+
+    def _submit_generation(self, prompt: list[int], *, max_tokens: int, temperature: float) -> Iterator[int]:
+        if self._closed:
+            raise RuntimeError("OpenAI completion engine is closed")
+        responses: "queue.Queue[object]" = queue.Queue()
+        self._generation_queue.put(_QueuedGeneration(prompt, max_tokens, temperature, responses))
+        while True:
+            item = responses.get()
+            if isinstance(item, _GenerationDone):
+                break
+            if isinstance(item, BaseException):
+                raise item
+            yield int(item)
+
+    def _batch_worker(self) -> None:
+        while True:
+            first = self._generation_queue.get()
+            if first is None:
+                return
+            batch = [first]
+            deadline = time.perf_counter() + self.batch_wait_s
+            while len(batch) < self.max_batch_size:
+                timeout = max(0.0, deadline - time.perf_counter())
+                if timeout == 0.0:
+                    break
+                try:
+                    item = self._generation_queue.get(timeout=timeout)
+                except queue.Empty:
+                    break
+                if item is None:
+                    self._generation_queue.put(None)
+                    break
+                batch.append(item)
+            self._run_queued_batch(batch)
+
+    def _run_queued_batch(self, batch: list[_QueuedGeneration]) -> None:
+        groups: dict[tuple[int, int, float], list[_QueuedGeneration]] = {}
+        for request in batch:
+            groups.setdefault((len(request.prompt), request.max_tokens, request.temperature), []).append(request)
+        for group in groups.values():
+            try:
+                input_ids = torch.tensor([request.prompt for request in group], dtype=torch.long, device=self.device)
+                for step_tokens in self._generate_batch_steps(
+                    input_ids,
+                    max_tokens=group[0].max_tokens,
+                    temperature=group[0].temperature,
+                ):
+                    for request, token_id in zip(group, step_tokens):
+                        if token_id is not None:
+                            request.responses.put(int(token_id))
+            except BaseException as exc:
+                for request in group:
+                    request.responses.put(exc)
+            finally:
+                for request in group:
+                    request.responses.put(_GenerationDone())
 
     @torch.inference_mode()
     def _generate_tokens(self, input_ids: Tensor, *, max_tokens: int, temperature: float) -> Iterator[int]:
+        for step_tokens in self._generate_batch_steps(input_ids, max_tokens=max_tokens, temperature=temperature):
+            token_id = step_tokens[0]
+            if token_id is not None:
+                yield int(token_id)
+
+    @torch.inference_mode()
+    def _generate_batch_steps(
+        self,
+        input_ids: Tensor,
+        *,
+        max_tokens: int,
+        temperature: float,
+        broadcast_tensor_parallel: bool = True,
+    ) -> Iterator[list[int | None]]:
         if max_tokens <= 0:
             return
+        if broadcast_tensor_parallel:
+            _broadcast_tensor_parallel_generate(
+                self.model,
+                input_ids,
+                max_tokens=max_tokens,
+                temperature=temperature,
+            )
         eos_token_id = self.tokenizer.eos_token_id
         model = self.model
         if not hasattr(model, "allocate_cache") or not callable(getattr(model, "forward", None)):
@@ -187,8 +321,21 @@ class OpenAICompletionEngine:
                 temperature=temperature,
                 eos_token_id=eos_token_id,
             )
-            for token in generated[0, input_ids.size(1) :].detach().cpu().tolist():
-                yield int(token)
+            rows = generated[:, input_ids.size(1) :].detach().cpu().tolist()
+            finished = [False for _ in rows]
+            for step in range(max_tokens):
+                step_tokens: list[int | None] = []
+                for row_index, row in enumerate(rows):
+                    if finished[row_index] or step >= len(row):
+                        step_tokens.append(None)
+                        continue
+                    token_id = int(row[step])
+                    step_tokens.append(token_id)
+                    if eos_token_id is not None and token_id == eos_token_id:
+                        finished[row_index] = True
+                if all(token is None for token in step_tokens):
+                    break
+                yield step_tokens
             return
 
         cache = _allocate_cache(
@@ -199,12 +346,16 @@ class OpenAICompletionEngine:
             cache_backend=self.cache_backend,
             page_size=self.page_size,
         )
+        active = torch.ones(input_ids.size(0), dtype=torch.bool, device=self.device)
         logits, cache = _forward(model, input_ids, cache)
         next_token = _sample(model, logits[:, -1, :], temperature).to(self.device)
         for _ in range(max_tokens):
-            token_id = int(next_token.item())
-            yield token_id
-            if eos_token_id is not None and token_id == eos_token_id:
+            token_ids = next_token.detach().cpu().tolist()
+            step_tokens = [int(token_id) if bool(is_active) else None for token_id, is_active in zip(token_ids, active.cpu().tolist())]
+            yield step_tokens
+            if eos_token_id is not None:
+                active &= next_token != eos_token_id
+            if not bool(active.any()):
                 break
             logits, cache = _forward(model, next_token[:, None], cache)
             next_token = _sample(model, logits[:, -1, :], temperature).to(self.device)
@@ -263,8 +414,8 @@ class _OpenAIHandler(BaseHTTPRequestHandler):
 
     def _complete_chat(self, messages: list[dict[str, object]], *, max_tokens: int, temperature: float) -> None:
         engine: OpenAICompletionEngine = self.server.engine  # type: ignore[attr-defined]
-        tokens = list(engine.generate_chat_tokens(messages, max_tokens=max_tokens, temperature=temperature))
-        content = engine.tokenizer.decode(tokens)
+        completion = engine.complete_chat(messages, max_tokens=max_tokens, temperature=temperature)
+        content = engine.tokenizer.decode(completion.tokens)
         self._send_json(
             {
                 "id": f"chatcmpl-{uuid.uuid4().hex}",
@@ -279,9 +430,9 @@ class _OpenAIHandler(BaseHTTPRequestHandler):
                     }
                 ],
                 "usage": {
-                    "prompt_tokens": 0,
-                    "completion_tokens": len(tokens),
-                    "total_tokens": len(tokens),
+                    "prompt_tokens": completion.prompt_tokens,
+                    "completion_tokens": len(completion.tokens),
+                    "total_tokens": completion.prompt_tokens + len(completion.tokens),
                 },
             }
         )
@@ -363,18 +514,26 @@ def build_engine(config: OpenAIServerConfig) -> OpenAICompletionEngine:
         cache_backend=config.cache_backend,
         page_size=config.page_size,
         max_model_len=config.max_model_len,
+        max_batch_size=config.max_batch_size,
+        batch_wait_ms=config.batch_wait_ms,
     )
 
 
 def serve(config: OpenAIServerConfig) -> None:
     engine = build_engine(config)
+    if _is_tensor_parallel_worker_model(engine.model):
+        _tensor_parallel_worker_loop(engine)
+        return
     server = _OpenAIServer((config.host, config.port), engine)
     print(
         f"TorchInferno OpenAI server listening on http://{config.host}:{server.server_port}/v1 "
         f"model={config.model}",
         flush=True,
     )
-    server.serve_forever()
+    try:
+        server.serve_forever()
+    finally:
+        engine.close()
 
 
 def _load_model(config: OpenAIServerConfig) -> tuple[object, torch.device]:
@@ -393,6 +552,15 @@ def _load_model(config: OpenAIServerConfig) -> tuple[object, torch.device]:
         model = Llama3V0ForCausalLM(tiny_llama3_v0_config(max_position_embeddings=config.max_model_len or 128))
         return model.to(device=device, dtype=dtype or torch.float32).eval(), device
     if kind == "llama3":
+        if _llama_parallelism(config) == "tensor":
+            model = Llama3TensorParallelForCausalLM.from_pretrained(
+                config.model,
+                dtype=config.dtype,
+                token=config.token,
+                revision=config.revision,
+                cache_dir=config.cache_dir,
+            ).eval()
+            return model, model.device
         devices = _server_devices(config)
         model = Llama3PipelineForCausalLM.from_pretrained(
             config.model,
@@ -456,6 +624,21 @@ def _server_devices(config: OpenAIServerConfig) -> tuple[str, ...]:
     return ("cpu",)
 
 
+def _llama_parallelism(config: OpenAIServerConfig) -> str:
+    mode = config.llama_parallelism.lower()
+    if mode == "pipeline":
+        return "pipeline"
+    if mode == "tensor":
+        return "tensor"
+    if mode != "auto":
+        raise ValueError(f"unsupported llama parallelism: {config.llama_parallelism}")
+    return "tensor" if _distributed_env_requested() else "pipeline"
+
+
+def _distributed_env_requested() -> bool:
+    return "RANK" in os.environ and "WORLD_SIZE" in os.environ
+
+
 def _resolve_dtype(dtype: str) -> torch.dtype | None:
     normalized = dtype.lower().replace("torch.", "")
     if normalized == "auto":
@@ -467,6 +650,81 @@ def _resolve_dtype(dtype: str) -> torch.dtype | None:
     if normalized in {"fp32", "float32"}:
         return torch.float32
     raise ValueError(f"unsupported dtype: {dtype}")
+
+
+def _is_tensor_parallel_model(model: object) -> bool:
+    return isinstance(model, Llama3TensorParallelForCausalLM)
+
+
+def _tensor_parallel_world_size(model: object) -> int:
+    return int(getattr(model, "world_size", 1)) if _is_tensor_parallel_model(model) else 1
+
+
+def _is_tensor_parallel_primary_model(model: object) -> bool:
+    return _is_tensor_parallel_model(model) and _tensor_parallel_world_size(model) > 1 and int(getattr(model, "rank", 0)) == 0
+
+
+def _is_tensor_parallel_worker_model(model: object) -> bool:
+    return _is_tensor_parallel_model(model) and _tensor_parallel_world_size(model) > 1 and int(getattr(model, "rank", 0)) != 0
+
+
+def _broadcast_tensor_parallel_generate(
+    model: object,
+    input_ids: Tensor,
+    *,
+    max_tokens: int,
+    temperature: float,
+) -> None:
+    if not _is_tensor_parallel_primary_model(model):
+        return
+    import torch.distributed as dist
+
+    if not dist.is_available() or not dist.is_initialized():
+        return
+    command = [
+        {
+            "op": "generate",
+            "input_ids": input_ids.detach().cpu().tolist(),
+            "max_tokens": int(max_tokens),
+            "temperature": float(temperature),
+        }
+    ]
+    dist.broadcast_object_list(command, src=0)
+
+
+def _broadcast_tensor_parallel_stop(model: object) -> None:
+    if not _is_tensor_parallel_primary_model(model):
+        return
+    import torch.distributed as dist
+
+    if dist.is_available() and dist.is_initialized():
+        dist.broadcast_object_list([{"op": "stop"}], src=0)
+
+
+def _tensor_parallel_worker_loop(engine: OpenAICompletionEngine) -> None:
+    import torch.distributed as dist
+
+    if not dist.is_available() or not dist.is_initialized():
+        raise RuntimeError("tensor-parallel worker loop requires an initialized process group")
+    while True:
+        command: list[object] = [None]
+        dist.broadcast_object_list(command, src=0)
+        payload = command[0]
+        if not isinstance(payload, dict):
+            continue
+        op = payload.get("op")
+        if op == "stop":
+            return
+        if op != "generate":
+            raise ValueError(f"unsupported tensor-parallel worker op: {op}")
+        input_ids = torch.tensor(payload["input_ids"], dtype=torch.long, device=engine.device)
+        for _ in engine._generate_batch_steps(
+            input_ids,
+            max_tokens=int(payload["max_tokens"]),
+            temperature=float(payload["temperature"]),
+            broadcast_tensor_parallel=False,
+        ):
+            pass
 
 
 def _allocate_cache(
@@ -495,15 +753,14 @@ def _allocate_cache(
 
 
 def _forward(model: object, input_ids: Tensor, cache: object) -> tuple[Tensor, object]:
-    try:
-        return model.forward(  # type: ignore[attr-defined]
-            input_ids,
-            cache=cache,
-            use_cache=True,
-            return_last_logits_only=True,
-        )
-    except TypeError:
-        return model.forward(input_ids, cache=cache, use_cache=True)  # type: ignore[attr-defined]
+    forward = model.forward  # type: ignore[attr-defined]
+    parameters = inspect.signature(forward).parameters
+    kwargs: dict[str, object] = {"cache": cache, "use_cache": True}
+    if "return_last_logits_only" in parameters:
+        kwargs["return_last_logits_only"] = True
+    if _is_tensor_parallel_model(model) and "return_sharded_logits" in parameters:
+        kwargs["return_sharded_logits"] = True
+    return forward(input_ids, **kwargs)
 
 
 def _sample(model: object, logits: Tensor, temperature: float) -> Tensor:
@@ -545,6 +802,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cache-dir", default=None)
     parser.add_argument("--cache-backend", choices=["dense", "paged"], default="dense")
     parser.add_argument("--page-size", type=int, default=16)
+    parser.add_argument("--max-batch-size", type=int, default=8)
+    parser.add_argument("--batch-wait-ms", type=float, default=2.0)
+    parser.add_argument(
+        "--llama-parallelism",
+        choices=["auto", "pipeline", "tensor"],
+        default="auto",
+        help="Use pipeline placement by default, or tensor parallel when launched with torchrun.",
+    )
     return parser
 
 
@@ -569,6 +834,9 @@ def config_from_args(args: argparse.Namespace) -> OpenAIServerConfig:
         cache_dir=args.cache_dir,
         cache_backend=args.cache_backend,
         page_size=args.page_size,
+        max_batch_size=args.max_batch_size,
+        batch_wait_ms=args.batch_wait_ms,
+        llama_parallelism=args.llama_parallelism,
     )
 
 

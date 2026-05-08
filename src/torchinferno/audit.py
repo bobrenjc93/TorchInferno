@@ -81,9 +81,9 @@ def build_audit_report() -> TorchInfernoAudit:
                 "Weights can be staged CPU-to-device one module at a time with movement overhead reported separately from compute.",
             ),
             FeatureAudit("monarch", "adapter", "Runtime detects Monarch and otherwise routes to FakeProcessWorld."),
-            FeatureAudit("flex attention", "reference", "Fallback q/k/v contract exists; real flex dispatch is still future work."),
-            FeatureAudit("piecewise cudagraphs", "scaffold", "Named pieces exist; static CUDA capture buffers are not implemented."),
-            FeatureAudit("paged attention", "integrated", "Native DeepSeek can use paged decode with torch/Triton fallback."),
+            FeatureAudit("flex attention", "bridge", "Runtime dispatches to torch flex attention when available and keeps the q/k/v eager fallback."),
+            FeatureAudit("piecewise cudagraphs", "bridge", "Named pieces can capture static CUDA tensor inputs and recapture on shape changes."),
+            FeatureAudit("paged attention", "integrated", "Native DeepSeek paged prefill/decode attend over request page tables with torch/Triton decode fallback."),
             FeatureAudit(
                 "agent rank files",
                 "bridge",
@@ -107,12 +107,12 @@ def build_audit_report() -> TorchInfernoAudit:
             FeatureAudit(
                 "continuous batching",
                 "bridge",
-                "Persistent row-assigned cache batches same-length prefill/decode groups without temporary cache rebuilds.",
+                "Persistent row-assigned cache batches same-length prefill/decode groups; OpenAI serving microbatches same-shape live requests.",
             ),
             FeatureAudit(
                 "OpenAI serving API",
                 "bridge",
-                "openai-server exposes /v1/models and streaming /v1/chat/completions for inference-bench.",
+                "openai-server exposes /v1/models and batched streaming /v1/chat/completions for inference-bench.",
             ),
             FeatureAudit("disaggregated prefill/decode", "simulated", "Planner models rank assignment and network latency."),
             FeatureAudit("NVFP4 graph passes", "reference", "NVFP4 tensor contract and pass hook exist; production fused kernel remains open."),

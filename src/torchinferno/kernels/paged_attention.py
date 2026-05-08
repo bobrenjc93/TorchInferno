@@ -46,3 +46,38 @@ def _should_use_triton(query: Tensor, config: KernelConfig, seq_len: int, cache:
     if seq_len < 1:
         return False
     return query.size(-1) <= 256 and cache.value_head_dim <= 256 and seq_len <= 4096
+
+
+def batched_paged_decode_attention(
+    query: Tensor,
+    cache: PagedKVCache,
+    request_ids: tuple[str, ...] | list[str],
+    positions: Tensor,
+    *,
+    config: KernelConfig | None = None,
+) -> Tensor:
+    """Batched decode-token paged attention over independent request page tables."""
+
+    if query.ndim == 4:
+        if query.size(2) != 1:
+            raise ValueError("batched decode query must have one token")
+        query_rows = query[:, :, 0, :]
+    elif query.ndim == 3:
+        query_rows = query
+    else:
+        raise ValueError("query must have shape [batch, heads, head_dim] or [batch, heads, 1, head_dim]")
+    if len(request_ids) != query_rows.size(0):
+        raise ValueError("request_ids length must match query batch")
+    if positions.ndim == 0:
+        row_positions = [int(positions.item()) for _ in request_ids]
+    elif positions.ndim == 1 and positions.numel() == len(request_ids):
+        row_positions = [int(value) for value in positions.detach().cpu().tolist()]
+    else:
+        raise ValueError("positions must be scalar or have shape [batch]")
+    return torch.stack(
+        [
+            paged_decode_attention(query_rows[row], cache, request_id, row_positions[row], config=config)
+            for row, request_id in enumerate(request_ids)
+        ],
+        dim=0,
+    )

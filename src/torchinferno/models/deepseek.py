@@ -10,8 +10,9 @@ import torch
 from safetensors.torch import save_file
 from torch import Tensor, nn
 
-from torchinferno.kernels import paged_decode_attention, rms_norm, swiglu_activation
+from torchinferno.kernels import batched_paged_decode_attention, rms_norm, swiglu_activation
 from torchinferno.models.hf import HF_CONFIG_NAME, SAFETENSORS_NAME, load_config, load_state_dict, resolve_pretrained_path
+from torchinferno.runtime.paged_attention import batched_paged_causal_attention
 
 
 @dataclass
@@ -343,17 +344,11 @@ class PagedDeepSeekLayerKVCache:
         row_indices: tuple[int, ...] | None = None,
     ) -> Tensor:
         row_indices = self._append_pages(keys, values, row_indices=row_indices)
+        request_ids = tuple(self.request_ids[row] for row in row_indices)
         if keys.size(2) == 1:
-            position = int(positions[-1].item())
-            return torch.stack(
-                [
-                    paged_decode_attention(query[incoming_row], self.pages, self.request_ids[cache_row], position)
-                    for incoming_row, cache_row in enumerate(row_indices)
-                ],
-                dim=0,
-            )
-        materialized_keys, materialized_values = self.materialize(row_indices)
-        return dense_causal_attention(query, materialized_keys, materialized_values, positions)
+            position = positions[-1].expand(len(row_indices))
+            return batched_paged_decode_attention(query, self.pages, request_ids, position)
+        return batched_paged_causal_attention(query, self.pages, request_ids, positions)
 
     def materialize(self, row_indices: tuple[int, ...]) -> tuple[Tensor, Tensor]:
         keys = []

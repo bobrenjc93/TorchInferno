@@ -5,11 +5,14 @@ import os
 import socket
 import subprocess
 import sys
+import threading
 import time
 import urllib.request
 from pathlib import Path
 
-from torchinferno.openai_server import _TransformersChatTokenizer
+import torch
+
+from torchinferno.openai_server import OpenAICompletionEngine, _ByteFallbackTokenizer, _TransformersChatTokenizer
 
 
 def test_openai_server_matches_inference_bench_contract() -> None:
@@ -60,6 +63,9 @@ def test_openai_server_matches_inference_bench_contract() -> None:
         completion = _json_post(f"http://127.0.0.1:{port}/v1/chat/completions", body)
         assert completion["object"] == "chat.completion"
         assert completion["choices"][0]["message"]["role"] == "assistant"
+        assert completion["usage"]["prompt_tokens"] > 0
+        assert completion["usage"]["completion_tokens"] == 2
+        assert completion["usage"]["total_tokens"] == completion["usage"]["prompt_tokens"] + 2
 
         stream_body = {**body, "stream": True}
         lines = _stream_post(f"http://127.0.0.1:{port}/v1/chat/completions", stream_body)
@@ -80,6 +86,8 @@ def test_inference_bench_provider_adapter_points_at_openai_server() -> None:
     assert "@register(\"torchinferno\")" in provider
     assert ".[serve]" in provider
     assert "torchinferno.openai_server" in provider
+    assert "torch.distributed.run" in provider
+    assert "--llama-parallelism" in provider
     assert "--tensor-parallel-size" in provider
 
 
@@ -89,6 +97,40 @@ def test_chat_template_batch_encoding_input_ids_are_extracted() -> None:
     encoded = tokenizer.encode_messages([{"role": "user", "content": "hello"}])
 
     assert encoded == [7, 8, 9]
+
+
+def test_openai_engine_microbatches_same_shape_requests() -> None:
+    model = _BatchRecordingModel()
+    engine = OpenAICompletionEngine(
+        model,
+        _ByteFallbackTokenizer(vocab_size=8),
+        model_id="tiny",
+        device=torch.device("cpu"),
+        max_batch_size=4,
+        batch_wait_ms=50.0,
+    )
+    barrier = threading.Barrier(3)
+    results: list[list[int] | None] = [None, None]
+
+    def run(index: int) -> None:
+        barrier.wait()
+        completion = engine.complete_chat(
+            [{"role": "user", "content": "same"}],
+            max_tokens=2,
+            temperature=0.0,
+        )
+        results[index] = completion.tokens
+
+    threads = [threading.Thread(target=run, args=(index,)) for index in range(2)]
+    for thread in threads:
+        thread.start()
+    barrier.wait()
+    for thread in threads:
+        thread.join(timeout=10)
+    engine.close()
+
+    assert results == [[2, 2], [2, 2]]
+    assert model.calls[0][0] == 2
 
 
 class _BatchEncodingTokenizer:
@@ -105,6 +147,35 @@ class _BatchEncodingTokenizer:
 
     def decode(self, token_ids: list[int], *, skip_special_tokens: bool) -> str:
         return "".join(str(token_id) for token_id in token_ids)
+
+
+class _BatchRecordingCache:
+    def __init__(self) -> None:
+        self.seq_len = 0
+
+
+class _BatchRecordingModel:
+    def __init__(self) -> None:
+        self.config = type("Config", (), {"vocab_size": 8})()
+        self.calls: list[tuple[int, int]] = []
+
+    def allocate_cache(self, batch_size: int, max_seq_len: int, **kwargs) -> _BatchRecordingCache:
+        return _BatchRecordingCache()
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        *,
+        cache: _BatchRecordingCache,
+        use_cache: bool,
+        return_last_logits_only: bool = False,
+    ):
+        self.calls.append((input_ids.size(0), input_ids.size(1)))
+        cache.seq_len += input_ids.size(1)
+        tokens = 1 if return_last_logits_only else input_ids.size(1)
+        logits = torch.zeros(input_ids.size(0), tokens, 8)
+        logits[..., 2] = 1.0
+        return logits, cache
 
 
 def _free_port() -> int:
