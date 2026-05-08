@@ -15,10 +15,7 @@ class TorchInfernoProvider(Provider):
         self._pip_install("-e", ".[serve]", cwd=self.repo_dir)
 
     def _server_cmd(self, model: str, tp: int, port: int) -> list[str]:
-        return [
-            self.venv_python,
-            "-m",
-            "torchinferno.openai_server",
+        server_args = [
             "--model",
             model,
             "--tensor-parallel-size",
@@ -27,3 +24,18 @@ class TorchInfernoProvider(Provider):
             str(port),
             "--trust-remote-code",
         ]
+        if tp > 1:
+            return [
+                self.venv_python,
+                "-m",
+                "torch.distributed.run",
+                "--standalone",
+                "--nproc-per-node",
+                str(tp),
+                "-m",
+                "torchinferno.openai_server",
+                *server_args,
+                "--llama-parallelism",
+                "tensor",
+            ]
+        return [self.venv_python, "-m", "torchinferno.openai_server", *server_args]

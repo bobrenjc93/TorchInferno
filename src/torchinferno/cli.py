@@ -1487,6 +1487,13 @@ def build_parser() -> argparse.ArgumentParser:
     openai_serve.add_argument("--cache-dir", default=None)
     openai_serve.add_argument("--cache-backend", choices=["dense", "paged"], default="dense")
     openai_serve.add_argument("--page-size", type=int, default=16)
+    openai_serve.add_argument("--max-batch-size", type=int, default=32)
+    openai_serve.add_argument("--batch-wait-ms", type=float, default=2.0)
+    openai_serve.add_argument(
+        "--llama-parallelism",
+        choices=["auto", "pipeline", "tensor"],
+        default="auto",
+    )
     openai_serve.set_defaults(func=run_openai_server)
 
     perf = subparsers.add_parser("perf-smoke", help="Benchmark paged attention reference and specialized decode paths.")

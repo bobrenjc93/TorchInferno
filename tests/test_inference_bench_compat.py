@@ -89,8 +89,10 @@ def test_inference_bench_provider_adapter_points_at_openai_server() -> None:
     provider = provider_path.read_text()
     assert "@register(\"torchinferno\")" in provider
     assert ".[serve]" in provider
+    assert "torch.distributed.run" in provider
     assert "torchinferno.openai_server" in provider
     assert "--tensor-parallel-size" in provider
+    assert "--llama-parallelism" in provider
 
 
 def test_chat_template_batch_encoding_input_ids_are_extracted() -> None:
@@ -133,6 +135,31 @@ def test_openai_engine_microbatches_same_shape_requests() -> None:
 
     assert results == [[2, 2], [2, 2]]
     assert model.calls[0][0] == 2
+
+
+def test_openai_engine_single_request_skips_batch_wait() -> None:
+    model = _BatchRecordingModel()
+    engine = OpenAICompletionEngine(
+        model,
+        _ByteFallbackTokenizer(vocab_size=8),
+        model_id="tiny",
+        device=torch.device("cpu"),
+        max_batch_size=4,
+        batch_wait_ms=1000.0,
+    )
+    start = time.perf_counter()
+    try:
+        completion = engine.complete_chat(
+            [{"role": "user", "content": "single"}],
+            max_tokens=1,
+            temperature=0.0,
+        )
+    finally:
+        engine.close()
+
+    assert completion.tokens == [2]
+    assert time.perf_counter() - start < 0.5
+    assert model.calls[0][0] == 1
 
 
 class _BatchEncodingTokenizer:

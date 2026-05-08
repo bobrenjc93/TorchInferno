@@ -269,20 +269,38 @@ class OpenAICompletionEngine:
             if first is None:
                 return
             batch = [first]
-            deadline = time.perf_counter() + self.batch_wait_s
-            while len(batch) < self.max_batch_size:
-                timeout = max(0.0, deadline - time.perf_counter())
-                if timeout == 0.0:
-                    break
-                try:
-                    item = self._generation_queue.get(timeout=timeout)
-                except queue.Empty:
-                    break
-                if item is None:
-                    self._generation_queue.put(None)
-                    break
-                batch.append(item)
+            self._drain_ready_requests(batch)
+            if len(batch) > 1:
+                self._collect_batch_until_deadline(batch)
             self._run_queued_batch(batch)
+
+    def _drain_ready_requests(self, batch: list[_QueuedGeneration]) -> None:
+        while len(batch) < self.max_batch_size:
+            try:
+                item = self._generation_queue.get_nowait()
+            except queue.Empty:
+                return
+            if item is None:
+                self._generation_queue.put(None)
+                return
+            batch.append(item)
+
+    def _collect_batch_until_deadline(self, batch: list[_QueuedGeneration]) -> None:
+        if self.batch_wait_s == 0.0:
+            return
+        deadline = time.perf_counter() + self.batch_wait_s
+        while len(batch) < self.max_batch_size:
+            timeout = max(0.0, deadline - time.perf_counter())
+            if timeout == 0.0:
+                break
+            try:
+                item = self._generation_queue.get(timeout=timeout)
+            except queue.Empty:
+                break
+            if item is None:
+                self._generation_queue.put(None)
+                break
+            batch.append(item)
 
     def _run_queued_batch(self, batch: list[_QueuedGeneration]) -> None:
         groups: dict[tuple[int, int, float, bool], list[_QueuedGeneration]] = {}

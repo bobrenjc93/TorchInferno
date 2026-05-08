@@ -21,17 +21,20 @@ providers:
   - torchinferno
 ```
 
-The provider starts:
+For `tensor_parallel_size > 1`, the provider starts TorchInferno with
+`python -m torch.distributed.run` so inference-bench exercises the tensor
+parallel server path instead of the pipeline fallback:
 
 ```bash
-python -m torchinferno.openai_server \
+python -m torch.distributed.run --standalone --nproc-per-node 8 \
+  -m torchinferno.openai_server \
   --model meta-llama/Meta-Llama-3.1-70B-Instruct \
   --tensor-parallel-size 8 \
+  --llama-parallelism tensor \
   --port 8000 \
   --trust-remote-code
 ```
 
-`--tensor-parallel-size` selects the first N CUDA devices for the current
-Llama3 pipeline-sharded serving path. The HTTP surface implements
+The HTTP surface implements
 `GET /v1/models` and streaming `POST /v1/chat/completions`, which are the
 endpoints used by `inference-bench`.

@@ -317,9 +317,10 @@ benchmarks. The drop-in provider adapter lives in
 `integrations/inference_bench/torchinferno.py`.
 
 By default the direct Llama server uses pipeline layer placement across the
-selected devices. The torchrun-backed tensor-parallel path is available for
-profiling and development, but it is not the default serving path until its
-per-layer collective overhead is reduced:
+selected devices. For inference-bench parity runs with multi-GPU
+`tensor_parallel_size`, use the adapter in
+`integrations/inference_bench/torchinferno.py`; it launches the tensor-parallel
+server through `torch.distributed.run`. The manual equivalent is:
 
 ```bash
 PYTHONPATH=src torchrun --standalone --nproc-per-node 8 \
