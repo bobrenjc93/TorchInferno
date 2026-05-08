@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import threading
 import time
 
 import torch
@@ -34,7 +35,15 @@ from torchinferno.models.deepseek import DeepSeekV32ForCausalLM, tiny_deepseek_v
 from torchinferno.models.dsv4 import DSv4ForCausalLM, tiny_dsv4_config
 from torchinferno.models.variants import list_model_variants, model_variant_lineage
 from torchinferno.openai_server import config_from_args as openai_config_from_args
-from torchinferno.openai_server import serve as serve_openai_api
+from torchinferno.openai_server import (
+    OpenAICompletionEngine,
+    OpenAIServerConfig,
+    _ByteFallbackTokenizer,
+    _is_tensor_parallel_worker_model,
+    _tensor_parallel_worker_loop,
+    build_engine as build_openai_engine,
+    serve as serve_openai_api,
+)
 from torchinferno.kernels import KernelBackend, KernelConfig, paged_decode_attention
 from torchinferno.profiling import (
     PatternProfileConfig,
@@ -377,6 +386,279 @@ def run_text_generate(args: argparse.Namespace) -> int:
     print(f"output_ids={generated}")
     print(tokenizer.decode(generated))
     return 0
+
+
+class _OpenAIMicrobenchCache:
+    def __init__(self) -> None:
+        self.seq_len = 0
+
+
+class _OpenAIMicrobenchModel:
+    def __init__(self, *, vocab_size: int, device: torch.device, dtype: torch.dtype, sleep_us: float = 0.0) -> None:
+        self.config = type("Config", (), {"vocab_size": vocab_size})()
+        self.device = device
+        self.dtype = dtype
+        self.sleep_s = max(0.0, sleep_us / 1_000_000.0)
+        self.calls: list[tuple[int, int]] = []
+        self.devices = (device,)
+
+    def allocate_cache(self, batch_size: int, max_seq_len: int, **kwargs: object) -> _OpenAIMicrobenchCache:
+        return _OpenAIMicrobenchCache()
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        *,
+        cache: _OpenAIMicrobenchCache,
+        use_cache: bool,
+        return_last_logits_only: bool = False,
+    ) -> tuple[torch.Tensor, _OpenAIMicrobenchCache]:
+        del use_cache
+        if self.sleep_s:
+            time.sleep(self.sleep_s)
+        batch_size = input_ids.size(0)
+        tokens = 1 if return_last_logits_only else input_ids.size(1)
+        self.calls.append((batch_size, input_ids.size(1)))
+        cache.seq_len += input_ids.size(1)
+        logits = torch.zeros(batch_size, tokens, self.config.vocab_size, device=self.device, dtype=self.dtype)
+        logits[..., min(2, self.config.vocab_size - 1)] = 1.0
+        return logits, cache
+
+
+def run_openai_microbench(args: argparse.Namespace) -> int:
+    engine = _build_openai_microbench_engine(args)
+    if _is_tensor_parallel_worker_model(engine.model):
+        _tensor_parallel_worker_loop(engine)
+        return 0
+
+    try:
+        cases: list[tuple[str, bool, int]] = []
+        if args.compare_batcher:
+            cases.append(("single-direct", True, 1))
+            cases.append(("single-batcher", False, 1))
+        else:
+            cases.append(("single", True, 1))
+        if args.concurrency > 1:
+            cases.append((f"concurrent-{args.concurrency}", True, args.concurrency))
+
+        print("TorchInferno OpenAI microbench")
+        print(
+            f"backend={args.backend} device={engine.device} prompt_tokens={args.prompt_tokens} "
+            f"max_tokens={args.max_tokens} warmup={args.warmup} iters={args.iters} "
+            f"batch_wait_ms={args.batch_wait_ms:g}"
+        )
+        results: dict[str, object] = {
+            "backend": args.backend,
+            "device": str(engine.device),
+            "prompt_tokens": args.prompt_tokens,
+            "max_tokens": args.max_tokens,
+            "batch_wait_ms": args.batch_wait_ms,
+            "cases": {},
+        }
+        for label, fast_path, concurrency in cases:
+            engine.single_request_fast_path = fast_path
+            case = _run_openai_microbench_case(
+                engine,
+                label=label,
+                concurrency=concurrency,
+                warmup=args.warmup,
+                iters=args.iters,
+                prompt_tokens=args.prompt_tokens,
+                max_tokens=args.max_tokens,
+                temperature=args.temperature,
+            )
+            results["cases"][label] = case
+            print(
+                f"case={label} concurrency={concurrency} fast_path={fast_path} "
+                f"ttft_p50_ms={case['ttft_p50_ms']:.3f} tpot_p50_ms={case['tpot_p50_ms']:.3f} "
+                f"e2e_p50_ms={case['e2e_p50_ms']:.3f} throughput_p50_tps={case['throughput_p50_tps']:.2f} "
+                f"max_model_batch={case.get('max_model_batch', 0)}"
+            )
+        if args.json_output:
+            Path(args.json_output).write_text(json.dumps(results, indent=2, sort_keys=True) + "\n")
+            print(f"json_output={args.json_output}")
+    finally:
+        engine.close()
+    return 0
+
+
+def _build_openai_microbench_engine(args: argparse.Namespace) -> OpenAICompletionEngine:
+    device = torch.device(args.device) if args.device else _default_device()
+    dtype = dtype_from_name(args.dtype) or torch.float32
+    if args.backend == "synthetic":
+        model = _OpenAIMicrobenchModel(
+            vocab_size=args.vocab_size,
+            device=device,
+            dtype=dtype,
+            sleep_us=args.synthetic_forward_sleep_us,
+        )
+        return OpenAICompletionEngine(
+            model,
+            _ByteFallbackTokenizer(vocab_size=args.vocab_size),
+            model_id="synthetic",
+            device=device,
+            max_batch_size=args.max_batch_size,
+            batch_wait_ms=args.batch_wait_ms,
+        )
+
+    if not args.model:
+        raise ValueError("--model is required when --backend=model")
+    devices = tuple(part.strip() for part in args.devices.split(",") if part.strip()) if args.devices else ()
+    return build_openai_engine(
+        OpenAIServerConfig(
+            model=args.model,
+            model_kind=args.model_kind,
+            tokenizer=args.tokenizer,
+            tensor_parallel_size=args.tensor_parallel_size,
+            devices=devices,
+            device=args.device,
+            dtype=args.dtype,
+            max_model_len=args.max_model_len,
+            trust_remote_code=args.trust_remote_code,
+            token=args.token,
+            revision=args.revision,
+            cache_dir=args.cache_dir,
+            cache_backend=args.cache_backend,
+            page_size=args.page_size,
+            max_batch_size=args.max_batch_size,
+            batch_wait_ms=args.batch_wait_ms,
+            llama_parallelism=args.llama_parallelism,
+        )
+    )
+
+
+def _run_openai_microbench_case(
+    engine: OpenAICompletionEngine,
+    *,
+    label: str,
+    concurrency: int,
+    warmup: int,
+    iters: int,
+    prompt_tokens: int,
+    max_tokens: int,
+    temperature: float,
+) -> dict[str, float | int | str]:
+    del label
+    for _ in range(warmup):
+        _run_openai_microbench_iteration(engine, concurrency, prompt_tokens, max_tokens, temperature)
+
+    start_calls = len(getattr(engine.model, "calls", ()))
+    measurements = [
+        metric
+        for _ in range(iters)
+        for metric in _run_openai_microbench_iteration(engine, concurrency, prompt_tokens, max_tokens, temperature)
+    ]
+    call_slice = getattr(engine.model, "calls", ())[start_calls:]
+    max_model_batch = max((batch for batch, _tokens in call_slice), default=0)
+    return {
+        "requests": len(measurements),
+        "ttft_p50_ms": _median([metric["ttft_ms"] for metric in measurements]),
+        "ttft_p99_ms": _p99([metric["ttft_ms"] for metric in measurements]),
+        "tpot_p50_ms": _median([metric["tpot_ms"] for metric in measurements]),
+        "tpot_p99_ms": _p99([metric["tpot_ms"] for metric in measurements]),
+        "e2e_p50_ms": _median([metric["e2e_ms"] for metric in measurements]),
+        "e2e_p99_ms": _p99([metric["e2e_ms"] for metric in measurements]),
+        "throughput_p50_tps": _median([metric["throughput_tps"] for metric in measurements]),
+        "output_tokens_p50": _median([metric["output_tokens"] for metric in measurements]),
+        "model_forward_calls": len(call_slice),
+        "max_model_batch": max_model_batch,
+    }
+
+
+def _run_openai_microbench_iteration(
+    engine: OpenAICompletionEngine,
+    concurrency: int,
+    prompt_tokens: int,
+    max_tokens: int,
+    temperature: float,
+) -> list[dict[str, float]]:
+    _sync_openai_engine(engine)
+    if concurrency == 1:
+        metrics = [_run_openai_microbench_request(engine, 0, prompt_tokens, max_tokens, temperature)]
+        _sync_openai_engine(engine)
+        return metrics
+
+    barrier = threading.Barrier(concurrency + 1)
+    results: list[dict[str, float] | None] = [None for _ in range(concurrency)]
+    errors: list[BaseException] = []
+
+    def worker(index: int) -> None:
+        try:
+            barrier.wait()
+            results[index] = _run_openai_microbench_request(engine, index, prompt_tokens, max_tokens, temperature)
+        except BaseException as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker, args=(index,)) for index in range(concurrency)]
+    for thread in threads:
+        thread.start()
+    barrier.wait()
+    for thread in threads:
+        thread.join()
+    _sync_openai_engine(engine)
+    if errors:
+        raise errors[0]
+    return [metric for metric in results if metric is not None]
+
+
+def _run_openai_microbench_request(
+    engine: OpenAICompletionEngine,
+    request_index: int,
+    prompt_tokens: int,
+    max_tokens: int,
+    temperature: float,
+) -> dict[str, float]:
+    messages = [{"role": "user", "content": _microbench_prompt_text(prompt_tokens, request_index)}]
+    start = time.perf_counter()
+    token_times: list[float] = []
+    for _token in engine.generate_chat_tokens(messages, max_tokens=max_tokens, temperature=temperature):
+        token_times.append(time.perf_counter())
+    end = time.perf_counter()
+    output_tokens = len(token_times)
+    ttft_ms = ((token_times[0] - start) * 1000.0) if token_times else 0.0
+    e2e_ms = (end - start) * 1000.0
+    if output_tokens > 1:
+        tpot_ms = ((token_times[-1] - token_times[0]) / (output_tokens - 1)) * 1000.0
+    else:
+        tpot_ms = 0.0
+    throughput_tps = output_tokens / (e2e_ms / 1000.0) if e2e_ms > 0.0 else 0.0
+    return {
+        "ttft_ms": ttft_ms,
+        "tpot_ms": tpot_ms,
+        "e2e_ms": e2e_ms,
+        "output_tokens": float(output_tokens),
+        "throughput_tps": throughput_tps,
+    }
+
+
+def _microbench_prompt_text(prompt_tokens: int, request_index: int) -> str:
+    return " ".join(f"tok{(request_index + idx) % 97:02d}" for idx in range(prompt_tokens))
+
+
+def _sync_openai_engine(engine: OpenAICompletionEngine) -> None:
+    devices = getattr(engine.model, "devices", (engine.device,))
+    for device in devices:
+        resolved = torch.device(device)
+        if resolved.type == "cuda":
+            torch.cuda.synchronize(resolved)
+
+
+def _median(values: list[float]) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    midpoint = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[midpoint]
+    return (ordered[midpoint - 1] + ordered[midpoint]) / 2.0
+
+
+def _p99(values: list[float]) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    index = min(len(ordered) - 1, int(len(ordered) * 0.99))
+    return ordered[index]
 
 
 def run_trace_smoke(args: argparse.Namespace) -> int:
@@ -1249,6 +1531,44 @@ def build_parser() -> argparse.ArgumentParser:
         help="Write per-rank timing breakdown JSON for native tensor-parallel runs.",
     )
     llama_bench.set_defaults(func=run_llama_bench_suite)
+
+    openai_microbench = subparsers.add_parser(
+        "openai-microbench",
+        help="Microbenchmark OpenAI engine request dispatch, streaming decode, and batching overhead.",
+    )
+    openai_microbench.add_argument("--backend", choices=["synthetic", "model"], default="synthetic")
+    openai_microbench.add_argument("--model", default=None, help="Model id/path for --backend=model.")
+    openai_microbench.add_argument("--model-kind", default="auto")
+    openai_microbench.add_argument("--tokenizer", default=None)
+    openai_microbench.add_argument("--tensor-parallel-size", type=int, default=1)
+    openai_microbench.add_argument("--devices", default=None, help="Comma-separated device list for model backend.")
+    openai_microbench.add_argument("--device", default=None)
+    openai_microbench.add_argument(
+        "--dtype",
+        default="float32",
+        choices=["auto", "float32", "float16", "bfloat16", "fp32", "fp16", "bf16"],
+    )
+    openai_microbench.add_argument("--max-model-len", type=int, default=None)
+    openai_microbench.add_argument("--trust-remote-code", action="store_true")
+    openai_microbench.add_argument("--token", default=None)
+    openai_microbench.add_argument("--revision", default=None)
+    openai_microbench.add_argument("--cache-dir", default=None)
+    openai_microbench.add_argument("--cache-backend", choices=["dense", "paged"], default="dense")
+    openai_microbench.add_argument("--page-size", type=int, default=16)
+    openai_microbench.add_argument("--llama-parallelism", choices=["auto", "pipeline", "tensor"], default="auto")
+    openai_microbench.add_argument("--max-batch-size", type=int, default=32)
+    openai_microbench.add_argument("--batch-wait-ms", type=float, default=2.0)
+    openai_microbench.add_argument("--prompt-tokens", type=int, default=32)
+    openai_microbench.add_argument("--max-tokens", type=int, default=64)
+    openai_microbench.add_argument("--concurrency", type=int, default=1)
+    openai_microbench.add_argument("--warmup", type=int, default=2)
+    openai_microbench.add_argument("--iters", type=int, default=5)
+    openai_microbench.add_argument("--temperature", type=float, default=0.0)
+    openai_microbench.add_argument("--vocab-size", type=int, default=256)
+    openai_microbench.add_argument("--synthetic-forward-sleep-us", type=float, default=0.0)
+    openai_microbench.add_argument("--compare-batcher", action="store_true")
+    openai_microbench.add_argument("--json-output", default=None)
+    openai_microbench.set_defaults(func=run_openai_microbench)
 
     smoke = subparsers.add_parser("dsv4-smoke", help="Run a DSv4 end-to-end generation smoke test.")
     smoke.add_argument("--device", default=None, help="Torch device, defaults to cuda when available.")

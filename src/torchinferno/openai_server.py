@@ -194,7 +194,7 @@ class OpenAICompletionEngine:
         self.max_model_len = max_model_len
         self.max_batch_size = max(1, max_batch_size)
         self.batch_wait_s = max(0.0, batch_wait_ms / 1000.0)
-        self.single_request_admission_wait_s = min(self.batch_wait_s, 0.002)
+        self.single_request_fast_path = True
         self._generation_queue: "queue.Queue[_QueuedGeneration | None]" = queue.Queue()
         self._model_lock = threading.Lock()
         self._live_request_condition = threading.Condition()
@@ -310,9 +310,9 @@ class OpenAICompletionEngine:
             self._live_request_condition.notify_all()
 
     def _try_acquire_single_request_model(self) -> bool:
+        if not self.single_request_fast_path:
+            return False
         with self._live_request_condition:
-            if self._live_requests == 1 and self.single_request_admission_wait_s > 0.0:
-                self._live_request_condition.wait(timeout=self.single_request_admission_wait_s)
             is_only_live_request = self._live_requests == 1
         if not is_only_live_request or not self._generation_queue.empty():
             return False
@@ -448,18 +448,78 @@ class OpenAICompletionEngine:
 
     def _generate_prompt_token_list(self, prompt: list[int], *, max_tokens: int, temperature: float) -> list[int]:
         input_ids = torch.tensor([prompt], dtype=torch.long, device=self.device)
-        return list(self._generate_tokens(input_ids, max_tokens=max_tokens, temperature=temperature))
+        return list(self._generate_single_tokens(input_ids, max_tokens=max_tokens, temperature=temperature))
 
     def _generate_prompt_tokens(self, prompt: list[int], *, max_tokens: int, temperature: float) -> Iterator[int]:
         input_ids = torch.tensor([prompt], dtype=torch.long, device=self.device)
-        yield from self._generate_tokens(input_ids, max_tokens=max_tokens, temperature=temperature)
+        yield from self._generate_single_tokens(input_ids, max_tokens=max_tokens, temperature=temperature)
 
     @torch.inference_mode()
     def _generate_tokens(self, input_ids: Tensor, *, max_tokens: int, temperature: float) -> Iterator[int]:
+        if input_ids.size(0) == 1:
+            yield from self._generate_single_tokens(input_ids, max_tokens=max_tokens, temperature=temperature)
+            return
         for step_tokens in self._generate_batch_steps(input_ids, max_tokens=max_tokens, temperature=temperature):
             token_id = step_tokens[0]
             if token_id is not None:
                 yield int(token_id)
+
+    @torch.inference_mode()
+    def _generate_single_tokens(
+        self,
+        input_ids: Tensor,
+        *,
+        max_tokens: int,
+        temperature: float,
+        broadcast_tensor_parallel: bool = True,
+    ) -> Iterator[int]:
+        if max_tokens <= 0:
+            return
+        if input_ids.size(0) != 1:
+            raise ValueError("single-request generation expects batch size 1")
+        if broadcast_tensor_parallel:
+            _broadcast_tensor_parallel_generate(
+                self.model,
+                input_ids,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                stream=True,
+            )
+        eos_token_id = self.tokenizer.eos_token_id
+        model = self.model
+        if not hasattr(model, "allocate_cache") or not callable(getattr(model, "forward", None)):
+            generated = model.generate(  # type: ignore[attr-defined]
+                input_ids,
+                max_new_tokens=max_tokens,
+                temperature=temperature,
+                eos_token_id=eos_token_id,
+            )
+            for token in generated[0, input_ids.size(1) :].detach().cpu().tolist():
+                token_id = int(token)
+                yield token_id
+                if eos_token_id is not None and token_id == eos_token_id:
+                    break
+            return
+
+        cache = _allocate_cache(
+            model,
+            1,
+            input_ids.size(1) + max_tokens,
+            device=self.device,
+            cache_backend=self.cache_backend,
+            page_size=self.page_size,
+        )
+        logits, cache = _forward(model, input_ids, cache)
+        next_token = _sample(model, logits[:, -1, :], temperature).to(self.device)
+        for step in range(max_tokens):
+            token_id = int(next_token.item())
+            yield token_id
+            if eos_token_id is not None and token_id == eos_token_id:
+                break
+            if step + 1 == max_tokens:
+                break
+            logits, cache = _forward(model, next_token[:, None], cache)
+            next_token = _sample(model, logits[:, -1, :], temperature).to(self.device)
 
     @torch.inference_mode()
     def _generate_batch_steps(
@@ -895,13 +955,22 @@ def _tensor_parallel_worker_loop(engine: OpenAICompletionEngine) -> None:
             raise ValueError(f"unsupported tensor-parallel worker op: {op}")
         input_ids = torch.tensor(payload["input_ids"], dtype=torch.long, device=engine.device)
         if bool(payload.get("stream", True)):
-            for _ in engine._generate_batch_steps(
-                input_ids,
-                max_tokens=int(payload["max_tokens"]),
-                temperature=float(payload["temperature"]),
-                broadcast_tensor_parallel=False,
-            ):
-                pass
+            if input_ids.size(0) == 1:
+                for _ in engine._generate_single_tokens(
+                    input_ids,
+                    max_tokens=int(payload["max_tokens"]),
+                    temperature=float(payload["temperature"]),
+                    broadcast_tensor_parallel=False,
+                ):
+                    pass
+            else:
+                for _ in engine._generate_batch_steps(
+                    input_ids,
+                    max_tokens=int(payload["max_tokens"]),
+                    temperature=float(payload["temperature"]),
+                    broadcast_tensor_parallel=False,
+                ):
+                    pass
         else:
             engine._generate_batch_tokens(
                 input_ids,

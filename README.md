@@ -331,6 +331,39 @@ PYTHONPATH=src torchrun --standalone --nproc-per-node 8 \
   --trust-remote-code
 ```
 
+For a tighter iteration loop on the serving path, run the OpenAI engine
+microbenchmark. The synthetic backend isolates Python dispatch, streaming
+handoff, admission wait, and same-shape batching without model weights:
+
+```bash
+PYTHONPATH=src python3 -m torchinferno.cli openai-microbench \
+  --backend synthetic \
+  --compare-batcher \
+  --concurrency 16 \
+  --prompt-tokens 32 \
+  --max-tokens 67
+```
+
+On the 8xH100 Llama 70B inference-bench shape, launch the model backend under
+`torchrun` so tensor-parallel workers use the same OpenAI engine path:
+
+```bash
+PYTHONPATH=src torchrun --standalone --nproc-per-node 8 \
+  -m torchinferno.cli openai-microbench \
+  --backend model \
+  --model meta-llama/Meta-Llama-3.1-70B-Instruct \
+  --llama-parallelism tensor \
+  --tensor-parallel-size 8 \
+  --trust-remote-code \
+  --compare-batcher \
+  --prompt-tokens 32 \
+  --max-tokens 67
+```
+
+The output reports TTFT, TPOT, end-to-end latency, throughput, forward-call
+count, and observed max model batch for direct single-request, forced batcher,
+and concurrent cases.
+
 ## Compiler And Graph Work
 
 TorchInferno keeps compiler hooks explicit:

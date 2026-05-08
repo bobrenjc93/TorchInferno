@@ -190,6 +190,62 @@ def test_openai_engine_single_stream_request_uses_direct_path() -> None:
     assert model.calls[0][2] != "torchinferno-openai-batcher"
 
 
+def test_openai_engine_single_request_does_not_use_batched_step_loop() -> None:
+    model = _BatchRecordingModel()
+    engine = _NoBatchStepEngine(
+        model,
+        _ByteFallbackTokenizer(vocab_size=8),
+        model_id="tiny",
+        device=torch.device("cpu"),
+        max_batch_size=4,
+        batch_wait_ms=1000.0,
+    )
+    try:
+        completion = engine.complete_chat(
+            [{"role": "user", "content": "single"}],
+            max_tokens=2,
+            temperature=0.0,
+        )
+    finally:
+        engine.close()
+
+    assert completion.tokens == [2, 2]
+    assert engine.batch_step_calls == 0
+
+
+def test_openai_microbench_cli_runs_synthetic_cases() -> None:
+    root = Path(__file__).resolve().parents[1]
+    env = {**os.environ, "PYTHONPATH": "src"}
+    cmd = [
+        sys.executable,
+        "-m",
+        "torchinferno.cli",
+        "openai-microbench",
+        "--backend",
+        "synthetic",
+        "--device",
+        "cpu",
+        "--warmup",
+        "0",
+        "--iters",
+        "1",
+        "--prompt-tokens",
+        "3",
+        "--max-tokens",
+        "2",
+        "--compare-batcher",
+        "--concurrency",
+        "2",
+    ]
+
+    result = subprocess.run(cmd, cwd=root, env=env, text=True, capture_output=True, check=True, timeout=30)
+
+    assert "TorchInferno OpenAI microbench" in result.stdout
+    assert "case=single-direct" in result.stdout
+    assert "case=single-batcher" in result.stdout
+    assert "case=concurrent-2" in result.stdout
+
+
 class _BatchEncodingTokenizer:
     eos_token_id = 0
 
@@ -243,6 +299,16 @@ class _BatchRecordingModel:
         logits = torch.zeros(input_ids.size(0), tokens, 8)
         logits[..., 2] = 1.0
         return logits, cache
+
+
+class _NoBatchStepEngine(OpenAICompletionEngine):
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.batch_step_calls = 0
+
+    def _generate_batch_steps(self, *args, **kwargs):
+        self.batch_step_calls += 1
+        raise AssertionError("single-request fast path must not use batched step generation")
 
 
 def _free_port() -> int:
