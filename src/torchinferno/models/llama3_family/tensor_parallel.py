@@ -229,6 +229,15 @@ class _Llama3TensorParallelLayer:
                 is_causal=False,
                 enable_gqa=enable_gqa,
             )
+        if k.size(-2) == q.size(-2):
+            return F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                dropout_p=0.0,
+                is_causal=True,
+                enable_gqa=enable_gqa,
+            )
         key_positions = torch.arange(k.size(-2), device=device)
         allowed = key_positions[None, :] <= positions[:, None]
         return F.scaled_dot_product_attention(

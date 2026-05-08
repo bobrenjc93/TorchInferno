@@ -314,10 +314,10 @@ The server implements `GET /v1/models` and streaming
 benchmarks. The drop-in provider adapter lives in
 `integrations/inference_bench/torchinferno.py`.
 
-By default the single-process Llama server uses pipeline layer placement across
-the selected devices. To run the real tensor-parallel Llama path, launch the
-same module under `torchrun`; nonzero ranks load the tensor-parallel shard and
-enter the worker loop while rank 0 owns the HTTP server:
+By default the direct Llama server uses pipeline layer placement across the
+selected devices. The torchrun-backed tensor-parallel path is available for
+profiling and development, but it is not the default serving path until its
+per-layer collective overhead is reduced:
 
 ```bash
 PYTHONPATH=src torchrun --standalone --nproc-per-node 8 \

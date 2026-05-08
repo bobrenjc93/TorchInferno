@@ -12,7 +12,11 @@ from pathlib import Path
 
 import torch
 
-from torchinferno.openai_server import OpenAICompletionEngine, _ByteFallbackTokenizer, _TransformersChatTokenizer
+from torchinferno.openai_server import (
+    OpenAICompletionEngine,
+    _ByteFallbackTokenizer,
+    _TransformersChatTokenizer,
+)
 
 
 def test_openai_server_matches_inference_bench_contract() -> None:
@@ -86,8 +90,6 @@ def test_inference_bench_provider_adapter_points_at_openai_server() -> None:
     assert "@register(\"torchinferno\")" in provider
     assert ".[serve]" in provider
     assert "torchinferno.openai_server" in provider
-    assert "torch.distributed.run" in provider
-    assert "--llama-parallelism" in provider
     assert "--tensor-parallel-size" in provider
 
 

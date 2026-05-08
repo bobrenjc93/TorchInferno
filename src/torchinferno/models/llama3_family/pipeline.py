@@ -166,17 +166,37 @@ class _Llama3PipelineLayer:
         if cache is not None:
             k, v = cache.append(k, v)
 
-        if kv_heads != heads:
-            repeats = heads // kv_heads
-            k = k.repeat_interleave(repeats, dim=1)
-            v = v.repeat_interleave(repeats, dim=1)
-
-        scores = torch.matmul(q, k.transpose(-1, -2)) * (1.0 / math.sqrt(head_dim))
-        key_positions = torch.arange(k.size(-2), device=hidden.device)
-        allowed = key_positions[None, :] <= positions[:, None]
-        scores = scores.masked_fill(~allowed[None, None, :, :], torch.finfo(scores.dtype).min)
-        probs = torch.softmax(scores.float(), dim=-1).to(dtype=q.dtype)
-        out = torch.matmul(probs, v)
+        enable_gqa = kv_heads != heads
+        if tokens == 1:
+            out = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                dropout_p=0.0,
+                is_causal=False,
+                enable_gqa=enable_gqa,
+            )
+        elif k.size(-2) == tokens:
+            out = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                dropout_p=0.0,
+                is_causal=True,
+                enable_gqa=enable_gqa,
+            )
+        else:
+            key_positions = torch.arange(k.size(-2), device=hidden.device)
+            allowed = key_positions[None, :] <= positions[:, None]
+            out = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_mask=allowed[None, None, :, :],
+                dropout_p=0.0,
+                is_causal=False,
+                enable_gqa=enable_gqa,
+            )
         out = out.transpose(1, 2).contiguous().view(batch, tokens, self.config.hidden_size)
         return F.linear(out, self.o_proj_weight)
 
