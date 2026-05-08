@@ -9,6 +9,8 @@ import time
 import urllib.request
 from pathlib import Path
 
+from torchinferno.openai_server import _TransformersChatTokenizer
+
 
 def test_openai_server_matches_inference_bench_contract() -> None:
     port = _free_port()
@@ -79,6 +81,30 @@ def test_inference_bench_provider_adapter_points_at_openai_server() -> None:
     assert ".[serve]" in provider
     assert "torchinferno.openai_server" in provider
     assert "--tensor-parallel-size" in provider
+
+
+def test_chat_template_batch_encoding_input_ids_are_extracted() -> None:
+    tokenizer = _TransformersChatTokenizer(_BatchEncodingTokenizer())
+
+    encoded = tokenizer.encode_messages([{"role": "user", "content": "hello"}])
+
+    assert encoded == [7, 8, 9]
+
+
+class _BatchEncodingTokenizer:
+    eos_token_id = 0
+
+    def apply_chat_template(self, messages, *, tokenize: bool, add_generation_prompt: bool):
+        assert tokenize
+        assert add_generation_prompt
+        assert messages[0]["role"] == "user"
+        return {"input_ids": [[7, 8, 9]], "attention_mask": [[1, 1, 1]]}
+
+    def encode(self, text: str, *, add_special_tokens: bool) -> list[int]:
+        raise AssertionError("apply_chat_template should be used")
+
+    def decode(self, token_ids: list[int], *, skip_special_tokens: bool) -> str:
+        return "".join(str(token_id) for token_id in token_ids)
 
 
 def _free_port() -> int:

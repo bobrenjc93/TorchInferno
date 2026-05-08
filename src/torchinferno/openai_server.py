@@ -5,6 +5,7 @@ import json
 import threading
 import time
 import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -76,7 +77,7 @@ class _TransformersChatTokenizer:
                 tokenize=True,
                 add_generation_prompt=True,
             )
-            return [int(token_id) for token_id in encoded]
+            return _coerce_token_ids(encoded)
         return self.encode(_format_messages(messages))
 
     def encode(self, text: str) -> list[int]:
@@ -112,6 +113,29 @@ def load_chat_tokenizer(
         cache_dir=config.cache_dir,
     )
     return _TransformersChatTokenizer(tokenizer)
+
+
+def _coerce_token_ids(encoded: object) -> list[int]:
+    input_ids = getattr(encoded, "input_ids", None)
+    if input_ids is None and isinstance(encoded, Mapping):
+        input_ids = encoded.get("input_ids")
+    if input_ids is not None:
+        encoded = input_ids
+    if isinstance(encoded, Tensor):
+        encoded = encoded.detach().cpu().tolist()
+    elif hasattr(encoded, "tolist") and not isinstance(encoded, (list, tuple, str, bytes)):
+        encoded = encoded.tolist()  # type: ignore[assignment]
+    if isinstance(encoded, (list, tuple)) and len(encoded) == 1 and _is_token_sequence(encoded[0]):
+        encoded = encoded[0]
+    return [int(token_id) for token_id in encoded]  # type: ignore[union-attr]
+
+
+def _is_token_sequence(value: object) -> bool:
+    if isinstance(value, Tensor):
+        return value.ndim == 1
+    if hasattr(value, "tolist") and not isinstance(value, (list, tuple, str, bytes)):
+        value = value.tolist()
+    return isinstance(value, (list, tuple))
 
 
 class OpenAICompletionEngine:
