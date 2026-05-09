@@ -97,13 +97,26 @@ def test_inference_bench_provider_adapter_points_at_openai_server() -> None:
     assert "--llama-parallelism" not in provider
 
 
-def test_openai_server_auto_launches_tensor_parallel_for_vanilla_provider(monkeypatch) -> None:
+def test_openai_server_vanilla_provider_stays_single_process(monkeypatch) -> None:
     monkeypatch.delenv("RANK", raising=False)
     monkeypatch.delenv("WORLD_SIZE", raising=False)
     monkeypatch.delenv("TORCHINFERNO_OPENAI_AUTO_TORCHRUN", raising=False)
     config = OpenAIServerConfig(
         model="meta-llama/Meta-Llama-3.1-70B-Instruct",
         tensor_parallel_size=8,
+    )
+
+    assert not _should_reexec_distributed_server(config)
+
+
+def test_openai_server_explicit_tensor_parallelism_auto_launches(monkeypatch) -> None:
+    monkeypatch.delenv("RANK", raising=False)
+    monkeypatch.delenv("WORLD_SIZE", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_AUTO_TORCHRUN", raising=False)
+    config = OpenAIServerConfig(
+        model="meta-llama/Meta-Llama-3.1-70B-Instruct",
+        tensor_parallel_size=8,
+        llama_parallelism="tensor",
     )
 
     assert _should_reexec_distributed_server(config)

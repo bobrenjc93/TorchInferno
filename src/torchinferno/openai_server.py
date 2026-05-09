@@ -1029,9 +1029,7 @@ def _llama_parallelism(config: OpenAIServerConfig) -> str:
         return "tensor"
     if mode != "auto":
         raise ValueError(f"unsupported llama parallelism: {config.llama_parallelism}")
-    if _distributed_env_requested() or config.tensor_parallel_size > 1:
-        return "tensor"
-    return "pipeline"
+    return "tensor" if _distributed_env_requested() else "pipeline"
 
 
 def _distributed_env_requested() -> bool:
@@ -1047,7 +1045,7 @@ def _should_reexec_distributed_server(config: OpenAIServerConfig) -> bool:
         return False
     if _infer_model_kind(config) != "llama3":
         return False
-    return config.llama_parallelism.lower() != "pipeline"
+    return config.llama_parallelism.lower() == "tensor"
 
 
 def _distributed_server_command(config: OpenAIServerConfig, argv: Sequence[str]) -> list[str]:
@@ -1379,8 +1377,8 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["auto", "pipeline", "tensor"],
         default="auto",
         help=(
-            "Use tensor parallel for --tensor-parallel-size > 1, auto-launching "
-            "workers when needed; use pipeline to force single-process placement."
+            "Use pipeline placement by default, tensor parallel under torchrun, "
+            "or auto-launch workers when explicitly set to tensor."
         ),
     )
     return parser
