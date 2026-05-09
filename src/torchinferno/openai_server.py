@@ -677,13 +677,23 @@ class OpenAICompletionEngine:
                     if count > cache_tokens:
                         continue
                     base = torch.arange(count, device=self.device, dtype=torch.long) % vocab_size
-                    input_ids = base[None, :].expand(batch_size, count).contiguous()
+                    input_ids = (
+                        base[None, :]
+                        if batch_size > 1
+                        else base[None, :].expand(batch_size, count).contiguous()
+                    )
                     logits = _try_prefill_logits_graph(self.model, input_ids, cache)
-                    if logits is None:
-                        _reset_generation_cache(cache)
-                        continue
-                    next_token = _sample(self.model, logits[:, -1, :], 0.7).to(self.device)
-                    _try_decode_one_token_logits_graph(self.model, next_token[:, None], cache)
+                    if logits is not None:
+                        if _shared_prefix_sample_enabled(0.7):
+                            next_token = _sample(self.model, logits[:, -1, :], 0.7).to(self.device)
+                            next_token = next_token.expand(batch_size).contiguous()
+                            decode_input = next_token[:1, None]
+                        else:
+                            sample_logits = logits[:, -1, :].expand(batch_size, logits.size(-1)).contiguous()
+                            next_token = _sample(self.model, sample_logits, 0.7).to(self.device)
+                            decode_input = next_token[:, None]
+                        _repeat_generation_cache_first_batch(cache, batch_size)
+                        _try_decode_one_token_logits_graph(self.model, decode_input, cache)
                     _reset_generation_cache(cache)
 
     def _generate_prompt_token_list(self, prompt: list[int], *, max_tokens: int, temperature: float) -> list[int]:
@@ -821,6 +831,14 @@ class OpenAICompletionEngine:
                 temperature=temperature,
                 stream=True,
             )
+        if input_ids.size(0) > 1 and _tensor_rows_are_identical(input_ids):
+            yield from self._generate_identical_prompt_batch_steps(
+                input_ids[:1],
+                batch_size=input_ids.size(0),
+                max_tokens=max_tokens,
+                temperature=temperature,
+            )
+            return
         microbatch_size = self._stream_microbatch_size(input_ids.size(0))
         if 0 < microbatch_size < input_ids.size(0):
             yield from self._generate_batch_steps_microbatched(
@@ -879,6 +897,79 @@ class OpenAICompletionEngine:
             if not any(active):
                 break
             next_token, cache = _decode_next_token(model, next_token[:, None], cache, temperature)
+            next_token = next_token.to(self.device)
+
+    @torch.inference_mode()
+    def _generate_identical_prompt_batch_steps(
+        self,
+        input_ids: Tensor,
+        *,
+        batch_size: int,
+        max_tokens: int,
+        temperature: float,
+    ) -> Iterator[list[int | None]]:
+        eos_token_id = self.tokenizer.eos_token_id
+        model = self.model
+        if not hasattr(model, "allocate_cache") or not callable(getattr(model, "forward", None)):
+            expanded = input_ids.expand(batch_size, input_ids.size(1)).contiguous()
+            generated = model.generate(  # type: ignore[attr-defined]
+                expanded,
+                max_new_tokens=max_tokens,
+                temperature=temperature,
+                eos_token_id=eos_token_id,
+            )
+            rows = generated[:, input_ids.size(1) :].detach().cpu().tolist()
+            finished = [False for _ in rows]
+            for step in range(max_tokens):
+                step_tokens: list[int | None] = []
+                for row_index, row in enumerate(rows):
+                    if finished[row_index] or step >= len(row):
+                        step_tokens.append(None)
+                        continue
+                    token_id = int(row[step])
+                    step_tokens.append(token_id)
+                    if eos_token_id is not None and token_id == eos_token_id:
+                        finished[row_index] = True
+                if all(token is None for token in step_tokens):
+                    break
+                yield step_tokens
+            return
+
+        cache = self._generation_cache(
+            batch_size,
+            input_ids.size(1) + max_tokens,
+            model=model,
+        )
+        next_token, cache = _prefill_repeated_prefix_next_token(
+            model,
+            input_ids,
+            cache,
+            batch_size,
+            temperature,
+        )
+        next_token = next_token.to(self.device)
+        _repeat_generation_cache_first_batch(cache, batch_size)
+        shared_sample = _shared_prefix_sample_enabled(temperature)
+        active = [True for _ in range(batch_size)]
+        for _ in range(max_tokens):
+            token_ids = next_token.detach().cpu().tolist()
+            step_tokens: list[int | None] = []
+            for row, token_id in enumerate(token_ids):
+                if not active[row]:
+                    step_tokens.append(None)
+                    continue
+                token_id = int(token_id)
+                step_tokens.append(token_id)
+                if eos_token_id is not None and token_id == eos_token_id:
+                    active[row] = False
+            yield step_tokens
+            if not any(active):
+                break
+            decode_input = next_token[:1, None] if shared_sample else next_token[:, None]
+            next_token, cache = _decode_next_token(model, decode_input, cache, temperature)
+            if shared_sample:
+                next_token = next_token.expand(batch_size).contiguous()
+                _repeat_generation_cache_first_batch(cache, batch_size)
             next_token = next_token.to(self.device)
 
     def _stream_microbatch_size(self, batch_size: int) -> int:
@@ -1554,6 +1645,26 @@ def _prefill_next_token(
     return _sample(model, prefill_logits[:, -1, :], temperature), cache
 
 
+def _prefill_repeated_prefix_next_token(
+    model: object,
+    input_ids: Tensor,
+    cache: object,
+    batch_size: int,
+    temperature: float,
+) -> tuple[Tensor, object]:
+    prefill_token = _try_prefill_graph(model, input_ids, cache, temperature)
+    if prefill_token is not None:
+        return prefill_token.expand(batch_size).contiguous(), cache
+    prefill_logits = _try_prefill_logits_graph(model, input_ids, cache)
+    if prefill_logits is None:
+        prefill_logits, cache = _forward(model, input_ids, cache)
+    if _shared_prefix_sample_enabled(temperature):
+        token = _sample(model, prefill_logits[:, -1, :], temperature)
+        return token.expand(batch_size).contiguous(), cache
+    logits = prefill_logits[:, -1, :].expand(batch_size, prefill_logits.size(-1)).contiguous()
+    return _sample(model, logits, temperature), cache
+
+
 def _decode_next_token(
     model: object,
     input_ids: Tensor,
@@ -1567,6 +1678,34 @@ def _decode_next_token(
     if graph_logits is None:
         graph_logits, cache = _forward(model, input_ids, cache)
     return _sample(model, graph_logits[:, -1, :], temperature), cache
+
+
+def _repeat_generation_cache_first_batch(cache: object, batch_size: int) -> None:
+    if batch_size <= 1:
+        return
+    for layer in getattr(cache, "layers", ()) or ():
+        seq_len = int(getattr(layer, "seq_len", 0))
+        if seq_len <= 0:
+            continue
+        keys = getattr(layer, "keys", None)
+        values = getattr(layer, "values", None)
+        if isinstance(keys, Tensor) and keys.size(0) >= batch_size:
+            keys[:batch_size, :, :seq_len, :].copy_(keys[:1, :, :seq_len, :].expand(batch_size, -1, -1, -1))
+        if isinstance(values, Tensor) and values.size(0) >= batch_size:
+            values[:batch_size, :, :seq_len, :].copy_(values[:1, :, :seq_len, :].expand(batch_size, -1, -1, -1))
+
+
+def _shared_prefix_sample_enabled(temperature: float) -> bool:
+    return (
+        temperature > 0.0
+        and os.environ.get("TORCHINFERNO_OPENAI_PREFIX_CACHE_SHARED_SAMPLE", "0") != "0"
+    )
+
+
+def _tensor_rows_are_identical(input_ids: Tensor) -> bool:
+    if input_ids.size(0) <= 1:
+        return True
+    return bool(torch.equal(input_ids, input_ids[:1].expand_as(input_ids)))
 
 
 def _try_decode_one_token_graph(

@@ -319,8 +319,10 @@ def test_openai_engine_batches_request_arriving_during_single_admission_wait(mon
     engine.close()
 
     assert results == [[2, 2], [2, 2]]
-    assert model.calls[0][0] == 2
+    assert model.calls[0][0] == 1
     assert model.calls[0][2] == "torchinferno-openai-batcher"
+    assert model.calls[1][0] == 2
+    assert model.calls[1][2] == "torchinferno-openai-batcher"
 
 
 def test_openai_engine_temperature_request_keeps_short_batch_window(monkeypatch) -> None:
@@ -370,8 +372,10 @@ def test_openai_engine_temperature_request_keeps_short_batch_window(monkeypatch)
     engine.close()
 
     assert results == [[2, 2], [2, 2]]
-    assert model.calls[0][0] == 2
+    assert model.calls[0][0] == 1
     assert model.calls[0][2] == "torchinferno-openai-batcher"
+    assert model.calls[1][0] == 2
+    assert model.calls[1][2] == "torchinferno-openai-batcher"
 
 
 def test_openai_engine_single_request_does_not_use_batched_step_loop() -> None:

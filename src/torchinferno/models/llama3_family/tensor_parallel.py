@@ -1789,14 +1789,17 @@ class Llama3TensorParallelForCausalLM:
         dist.all_reduce(global_max, op=dist.ReduceOp.MAX)
         weights = torch.exp(logits_float - global_max[:, None])
         local_sum = weights.sum(dim=-1)
-        gathered_sums = [torch.empty_like(local_sum) for _ in range(self.world_size)]
-        dist.all_gather(gathered_sums, local_sum)
+        gathered_sums = torch.empty(
+            (self.world_size, *local_sum.shape),
+            dtype=local_sum.dtype,
+            device=self.device,
+        )
+        dist.all_gather_into_tensor(gathered_sums, local_sum.contiguous())
 
         selected_rank = torch.empty(logits.size(0), dtype=torch.long, device=self.device)
         local_threshold = torch.empty(logits.size(0), dtype=torch.float32, device=self.device)
         if self.is_primary:
-            sums = torch.stack(gathered_sums, dim=0)
-            cumulative = torch.cumsum(sums, dim=0)
+            cumulative = torch.cumsum(gathered_sums, dim=0)
             total = cumulative[-1]
             target = torch.rand_like(total) * total
             selected_rank.copy_((cumulative < target[None, :]).sum(dim=0).to(torch.long))
@@ -1810,7 +1813,7 @@ class Llama3TensorParallelForCausalLM:
 
         cumulative_local = torch.cumsum(weights, dim=-1)
         local_threshold = torch.minimum(local_threshold, cumulative_local[:, -1])
-        local_index = (cumulative_local < local_threshold[:, None]).sum(dim=-1).to(torch.long)
+        local_index = torch.searchsorted(cumulative_local.contiguous(), local_threshold[:, None]).squeeze(-1)
         local_index = torch.clamp(local_index, max=self.local_vocab_size - 1)
         selected = selected_rank == self.rank
         local_token = torch.where(
