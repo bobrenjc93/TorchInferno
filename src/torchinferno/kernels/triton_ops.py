@@ -941,6 +941,97 @@ def _grouped_gqa_decode_attention_dynamic_kernel(
     tl.store(out_ptr + out_offsets, out, mask=(offs_q[:, None] < group_size) & (offs_v[None, :] < value_dim))
 
 
+@triton.jit
+def _grouped_gqa_decode_attention_streaming_kernel(
+    q_ptr,
+    k_ptr,
+    v_ptr,
+    out_ptr,
+    seq_len_ptr,
+    cache_tokens: tl.constexpr,
+    group_size: tl.constexpr,
+    head_dim: tl.constexpr,
+    value_dim: tl.constexpr,
+    scale: tl.constexpr,
+    q_stride_batch: tl.constexpr,
+    q_stride_head: tl.constexpr,
+    q_stride_token: tl.constexpr,
+    q_stride_dim: tl.constexpr,
+    k_stride_batch: tl.constexpr,
+    k_stride_head: tl.constexpr,
+    k_stride_token: tl.constexpr,
+    k_stride_dim: tl.constexpr,
+    v_stride_batch: tl.constexpr,
+    v_stride_head: tl.constexpr,
+    v_stride_token: tl.constexpr,
+    v_stride_dim: tl.constexpr,
+    out_stride_batch: tl.constexpr,
+    out_stride_head: tl.constexpr,
+    out_stride_token: tl.constexpr,
+    out_stride_dim: tl.constexpr,
+    block_q: tl.constexpr,
+    block_s: tl.constexpr,
+    block_d: tl.constexpr,
+    block_v: tl.constexpr,
+) -> None:
+    seq_len = tl.load(seq_len_ptr)
+    batch = tl.program_id(0)
+    kv_head = tl.program_id(1)
+    offs_q = tl.arange(0, block_q)
+    offs_s = tl.arange(0, block_s)
+    offs_d = tl.arange(0, block_d)
+    offs_v = tl.arange(0, block_v)
+    q_head = kv_head * group_size + offs_q
+    q_offsets = (
+        batch * q_stride_batch
+        + q_head[:, None] * q_stride_head
+        + offs_d[None, :] * q_stride_dim
+    )
+    q = tl.load(q_ptr + q_offsets, mask=(offs_q[:, None] < group_size) & (offs_d[None, :] < head_dim), other=0.0)
+    running_max = tl.full((block_q,), -float("inf"), dtype=tl.float32)
+    running_sum = tl.zeros((block_q,), dtype=tl.float32)
+    acc = tl.zeros((block_q, block_v), dtype=tl.float32)
+    for start in range(0, cache_tokens, block_s):
+        seq_offsets = start + offs_s
+        k_offsets = (
+            batch * k_stride_batch
+            + kv_head * k_stride_head
+            + offs_d[:, None] * k_stride_dim
+            + seq_offsets[None, :] * k_stride_token
+        )
+        keys = tl.load(
+            k_ptr + k_offsets,
+            mask=(offs_d[:, None] < head_dim) & (seq_offsets[None, :] < seq_len),
+            other=0.0,
+        )
+        scores = tl.dot(q, keys) * scale
+        scores = tl.where((offs_q[:, None] < group_size) & (seq_offsets[None, :] < seq_len), scores, -float("inf"))
+        next_max = tl.maximum(running_max, tl.max(scores, axis=1))
+        probs = tl.exp(scores - next_max[:, None])
+        scale_old = tl.exp(running_max - next_max)
+        v_offsets = (
+            batch * v_stride_batch
+            + kv_head * v_stride_head
+            + seq_offsets[:, None] * v_stride_token
+            + offs_v[None, :] * v_stride_dim
+        )
+        values = tl.load(
+            v_ptr + v_offsets,
+            mask=(seq_offsets[:, None] < seq_len) & (offs_v[None, :] < value_dim),
+            other=0.0,
+        )
+        acc = acc * scale_old[:, None] + tl.dot(probs.to(values.dtype), values)
+        running_sum = running_sum * scale_old + tl.sum(probs, axis=1)
+        running_max = next_max
+    out = acc / running_sum[:, None]
+    out_offsets = (
+        batch * out_stride_batch
+        + q_head[:, None] * out_stride_head
+        + offs_v[None, :] * out_stride_dim
+    )
+    tl.store(out_ptr + out_offsets, out, mask=(offs_q[:, None] < group_size) & (offs_v[None, :] < value_dim))
+
+
 def triton_grouped_gqa_decode_attention(q: Tensor, k: Tensor, v: Tensor, seq_len: Tensor) -> Tensor:
     """Single-token GQA decode attention that shares K/V loads across a query-head group."""
 
@@ -979,6 +1070,44 @@ def triton_grouped_gqa_decode_attention(q: Tensor, k: Tensor, v: Tensor, seq_len
     if block_d > 256 or block_v > 256:
         raise ValueError("grouped GQA decode attention supports head dimensions up to 256")
     out = torch.empty((batch, q_heads, 1, value_dim), device=q.device, dtype=q.dtype)
+    if os.environ.get("TORCHINFERNO_TRITON_STREAMING_DECODE_ATTENTION", "1") != "0":
+        block_s = int(os.environ.get("TORCHINFERNO_TRITON_STREAMING_DECODE_ATTENTION_BLOCK_S", "64"))
+        if block_s <= 0 or block_s > 2048 or block_s & (block_s - 1) != 0:
+            raise ValueError("streaming decode attention block size must be a power of two")
+        _grouped_gqa_decode_attention_streaming_kernel[(batch, kv_heads)](
+            q,
+            k,
+            v,
+            out,
+            seq_len,
+            cache_tokens,
+            group_size,
+            head_dim,
+            value_dim,
+            1.0 / (head_dim**0.5),
+            q.stride(0),
+            q.stride(1),
+            q.stride(2),
+            q.stride(3),
+            k.stride(0),
+            k.stride(1),
+            k.stride(2),
+            k.stride(3),
+            v.stride(0),
+            v.stride(1),
+            v.stride(2),
+            v.stride(3),
+            out.stride(0),
+            out.stride(1),
+            out.stride(2),
+            out.stride(3),
+            block_q,
+            block_s,
+            block_d,
+            block_v,
+            num_warps=4,
+        )
+        return out
     num_warps = int(os.environ.get("TORCHINFERNO_TRITON_GROUPED_DECODE_ATTENTION_WARPS", "4"))
     _grouped_gqa_decode_attention_dynamic_kernel[(batch, kv_heads)](
         q,
