@@ -143,6 +143,7 @@ def test_triton_cuda_kernels_match_torch_reference() -> None:
     expected_norm = x * torch.rsqrt(x.float().pow(2).mean(dim=-1, keepdim=True) + 1e-6).to(x.dtype) * weight
     torch.testing.assert_close(rms_norm(x, weight, eps=1e-6, config=config), expected_norm, atol=1e-5, rtol=1e-5)
 
+
 @pytest.mark.skipif(not torch.cuda.is_available() or not triton_available(), reason="CUDA Triton kernels unavailable")
 def test_triton_rotary_interleaved_inplace_matches_torch_reference() -> None:
     from torchinferno.kernels.triton_ops import triton_apply_rotary_interleaved_inplace
@@ -170,3 +171,81 @@ def test_triton_rotary_interleaved_inplace_matches_torch_reference() -> None:
 
     torch.testing.assert_close(actual_q, expected_q, atol=4e-2, rtol=4e-2)
     torch.testing.assert_close(actual_k, expected_k, atol=4e-2, rtol=4e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or not triton_available(), reason="CUDA Triton kernels unavailable")
+def test_triton_rotary_llama_inplace_matches_torch_reference() -> None:
+    from torchinferno.kernels.triton_ops import triton_apply_rotary_llama_inplace
+    from torchinferno.models.llama3_family.tensor_parallel import _rotate_llama_eager
+
+    torch.manual_seed(16)
+    batch, tokens, q_heads, kv_heads, head_dim = 3, 5, 4, 1, 16
+    packed = torch.randn(
+        batch,
+        tokens,
+        (q_heads + kv_heads + kv_heads) * head_dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    q, k, _ = packed.split((q_heads * head_dim, kv_heads * head_dim, kv_heads * head_dim), dim=-1)
+    q = q.view(batch, tokens, q_heads, head_dim).transpose(1, 2)
+    k = k.view(batch, tokens, kv_heads, head_dim).transpose(1, 2)
+    freqs = torch.randn(tokens, head_dim // 2, device="cuda")
+    cos_half = freqs.cos().to(torch.bfloat16)
+    sin_half = freqs.sin().to(torch.bfloat16)
+    cos_full = torch.cat((cos_half, cos_half), dim=-1)
+    sin_full = torch.cat((sin_half, sin_half), dim=-1)
+    expected_q = _rotate_llama_eager(q, cos_full[None, None, :, :], sin_full[None, None, :, :])
+    expected_k = _rotate_llama_eager(k, cos_full[None, None, :, :], sin_full[None, None, :, :])
+
+    actual_q, actual_k = triton_apply_rotary_llama_inplace(q.clone(), k.clone(), cos_half, sin_half)
+
+    torch.testing.assert_close(actual_q, expected_q, atol=4e-2, rtol=4e-2)
+    torch.testing.assert_close(actual_k, expected_k, atol=4e-2, rtol=4e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or not triton_available(), reason="CUDA Triton kernels unavailable")
+def test_triton_kv_cache_append_matches_torch_reference() -> None:
+    from torchinferno.kernels.triton_ops import triton_append_kv_cache
+
+    torch.manual_seed(17)
+    batch, heads, tokens, head_dim, max_seq_len = 2, 3, 4, 16, 12
+    packed = torch.randn(batch, tokens, heads * head_dim * 2, device="cuda", dtype=torch.bfloat16)
+    keys, values = packed.split(heads * head_dim, dim=-1)
+    keys = keys.view(batch, tokens, heads, head_dim).transpose(1, 2)
+    values = values.view(batch, tokens, heads, head_dim).transpose(1, 2)
+    cache_keys = torch.zeros(batch, heads, max_seq_len, head_dim, device="cuda", dtype=torch.bfloat16)
+    cache_values = torch.zeros_like(cache_keys)
+    expected_keys = cache_keys.clone()
+    expected_values = cache_values.clone()
+    seq_start = 3
+
+    expected_keys[:, :, seq_start : seq_start + tokens, :].copy_(keys)
+    expected_values[:, :, seq_start : seq_start + tokens, :].copy_(values)
+    triton_append_kv_cache(keys, values, cache_keys, cache_values, seq_start)
+
+    torch.testing.assert_close(cache_keys, expected_keys)
+    torch.testing.assert_close(cache_values, expected_values)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or not triton_available(), reason="CUDA Triton kernels unavailable")
+def test_triton_dense_gqa_decode_attention_matches_torch_reference() -> None:
+    from torchinferno.kernels.triton_ops import triton_dense_gqa_decode_attention
+
+    torch.manual_seed(17)
+    batch, q_heads, kv_heads, seq_len, head_dim = 2, 4, 2, 13, 16
+    q = torch.randn(batch, q_heads, 1, head_dim, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(batch, kv_heads, seq_len, head_dim, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(batch, kv_heads, seq_len, head_dim, device="cuda", dtype=torch.bfloat16)
+    expected = torch.nn.functional.scaled_dot_product_attention(
+        q,
+        k,
+        v,
+        dropout_p=0.0,
+        is_causal=False,
+        enable_gqa=True,
+    )
+
+    actual = triton_dense_gqa_decode_attention(q, k, v)
+
+    torch.testing.assert_close(actual, expected, atol=4e-2, rtol=4e-2)

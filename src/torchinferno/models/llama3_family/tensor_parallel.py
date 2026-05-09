@@ -18,7 +18,7 @@ from torchinferno.models.llama3_family.pipeline import (
     _CheckpointTensorLoader,
     _build_inv_freq,
     _resolve_dtype,
-    _rms_norm,
+    _rms_norm as _torch_rms_norm,
     resolve_llama3_checkpoint,
 )
 from torchinferno.models.llama3_family.v0 import sample_next_token
@@ -47,6 +47,24 @@ class Llama3TensorParallelLoadReport:
         }
 
 
+@dataclass
+class _StaticCudaGraphCall:
+    graph: torch.cuda.CUDAGraph
+    static_input: Tensor
+    output: Tensor
+
+
+@dataclass
+class _StaticQKVRotaryGraphCall:
+    graph: torch.cuda.CUDAGraph
+    static_input: Tensor
+    static_cos: Tensor
+    static_sin: Tensor
+    q: Tensor
+    k: Tensor
+    v: Tensor
+
+
 class Llama3TensorParallelLayerKVCache:
     def __init__(
         self,
@@ -72,8 +90,17 @@ class Llama3TensorParallelLayerKVCache:
         end = self.seq_len + tokens
         if end > self.max_seq_len:
             raise ValueError("KV cache capacity exceeded")
-        self.keys[:batch, :, self.seq_len : end, :].copy_(keys)
-        self.values[:batch, :, self.seq_len : end, :].copy_(values)
+        if keys.is_cuda and values.is_cuda and os.environ.get("TORCHINFERNO_TRITON_KV_APPEND", "1") != "0":
+            try:
+                from torchinferno.kernels.triton_ops import triton_append_kv_cache
+
+                triton_append_kv_cache(keys, values, self.keys, self.values, self.seq_len)
+            except Exception:
+                self.keys[:batch, :, self.seq_len : end, :].copy_(keys)
+                self.values[:batch, :, self.seq_len : end, :].copy_(values)
+        else:
+            self.keys[:batch, :, self.seq_len : end, :].copy_(keys)
+            self.values[:batch, :, self.seq_len : end, :].copy_(values)
         self.seq_len = end
         return self.keys[:batch, :, :end, :], self.values[:batch, :, :end, :]
 
@@ -123,6 +150,16 @@ class _Llama3TensorParallelLayer:
         self.inv_freq = _build_inv_freq(config, device)
         self.profile_seconds: dict[str, float] | None = None
         self.profile_counts: dict[str, int] | None = None
+        self._mlp_project_graph: _StaticCudaGraphCall | None = None
+        self._mlp_project_graph_failed = False
+        self._qkv_rotary_graph: _StaticQKVRotaryGraphCall | None = None
+        self._qkv_rotary_graph_failed = False
+        self._input_qkv_rotary_graph: _StaticQKVRotaryGraphCall | None = None
+        self._input_qkv_rotary_graph_failed = False
+        self._post_mlp_project_graph: _StaticCudaGraphCall | None = None
+        self._post_mlp_project_graph_failed = False
+        self._attention_o_graph: _StaticCudaGraphCall | None = None
+        self._attention_o_graph_failed = False
 
     def forward(
         self,
@@ -131,16 +168,22 @@ class _Llama3TensorParallelLayer:
         rotary: tuple[Tensor, Tensor],
         cache: Llama3TensorParallelLayerKVCache | None,
     ) -> Tensor:
+        if self.profile_seconds is None or self.profile_counts is None:
+            residual = hidden
+            hidden = residual + self._attention_from_hidden(hidden, positions, rotary, cache)
+            residual = hidden
+            return residual + self._post_attention_mlp_project(hidden)
+
         residual = hidden
         attn_in = self._profile_block(
             "norm.input",
-            lambda: _rms_norm(hidden, self.input_layernorm_weight, self.config.rms_norm_eps),
+            lambda: _tp_rms_norm(hidden, self.input_layernorm_weight, self.config.rms_norm_eps),
         )
         hidden = residual + self._attention(attn_in, positions, rotary, cache)
         residual = hidden
         mlp_in = self._profile_block(
             "norm.post_attention",
-            lambda: _rms_norm(hidden, self.post_attention_layernorm_weight, self.config.rms_norm_eps),
+            lambda: _tp_rms_norm(hidden, self.post_attention_layernorm_weight, self.config.rms_norm_eps),
         )
         hidden = residual + self._mlp(mlp_in)
         return hidden
@@ -154,6 +197,17 @@ class _Llama3TensorParallelLayer:
     ) -> Tensor:
         batch, tokens, _ = hidden.shape
         head_dim = self.config.head_dim
+        if self.profile_seconds is None or self.profile_counts is None:
+            q, k, v = self._qkv_rotary(hidden, batch, tokens, head_dim, rotary)
+            if cache is not None:
+                k, v = cache.append(k, v)
+            enable_gqa = self.local_attention_heads != self.local_key_value_heads
+            out = self._scaled_dot_product(q, k, v, positions, hidden.device, enable_gqa=enable_gqa)
+            out = out.transpose(1, 2).contiguous().view(batch, tokens, self.local_hidden_size)
+            projected = self._attention_o_project(out)
+            _all_reduce(projected)
+            return projected
+
         q, k, v = self._profile_block(
             "attention.qkv",
             lambda: self._qkv(hidden, batch, tokens, head_dim),
@@ -172,7 +226,31 @@ class _Llama3TensorParallelLayer:
         self._profile_block("attention.all_reduce", lambda: _all_reduce(projected))
         return projected
 
+    def _attention_from_hidden(
+        self,
+        hidden: Tensor,
+        positions: Tensor,
+        rotary: tuple[Tensor, Tensor],
+        cache: Llama3TensorParallelLayerKVCache | None,
+    ) -> Tensor:
+        batch, tokens, _ = hidden.shape
+        head_dim = self.config.head_dim
+        q, k, v = self._input_norm_qkv_rotary(hidden, batch, tokens, head_dim, rotary)
+        if cache is not None:
+            k, v = cache.append(k, v)
+        enable_gqa = self.local_attention_heads != self.local_key_value_heads
+        out = self._scaled_dot_product(q, k, v, positions, hidden.device, enable_gqa=enable_gqa)
+        out = out.transpose(1, 2).contiguous().view(batch, tokens, self.local_hidden_size)
+        projected = self._attention_o_project(out)
+        _all_reduce(projected)
+        return projected
+
     def _mlp(self, hidden: Tensor) -> Tensor:
+        if self.profile_seconds is None or self.profile_counts is None:
+            projected = self._mlp_project(hidden)
+            _all_reduce(projected)
+            return projected
+
         gate, up = self._profile_block(
             "mlp.gate_up",
             lambda: F.linear(hidden, self.gate_up_proj_weight).split(
@@ -180,10 +258,111 @@ class _Llama3TensorParallelLayer:
                 dim=-1,
             ),
         )
-        activated = self._profile_block("mlp.activation", lambda: F.silu(gate) * up)
+        activated = self._profile_block("mlp.activation", lambda: _tp_swiglu(gate, up))
         projected = self._profile_block("mlp.down", lambda: F.linear(activated, self.down_proj_weight))
         self._profile_block("mlp.all_reduce", lambda: _all_reduce(projected))
         return projected
+
+    def _mlp_project(self, hidden: Tensor) -> Tensor:
+        if self.world_size > 1 and _should_use_mlp_project_graph(hidden) and not self._mlp_project_graph_failed:
+            try:
+                return self._run_mlp_project_graph(hidden)
+            except Exception:
+                self._mlp_project_graph_failed = True
+        return self._mlp_project_eager(hidden)
+
+    def _mlp_project_eager(self, hidden: Tensor) -> Tensor:
+        gate, up = F.linear(hidden, self.gate_up_proj_weight).split(
+            (self.local_intermediate_size, self.local_intermediate_size),
+            dim=-1,
+        )
+        activated = _tp_swiglu(gate, up)
+        return F.linear(activated, self.down_proj_weight)
+
+    def _run_mlp_project_graph(self, hidden: Tensor) -> Tensor:
+        captured = self._mlp_project_graph
+        if captured is None or captured.static_input.shape != hidden.shape:
+            static_input = torch.empty_like(hidden)
+            static_input.copy_(hidden)
+            stream = torch.cuda.Stream(device=hidden.device)
+            stream.wait_stream(torch.cuda.current_stream(hidden.device))
+            with torch.cuda.stream(stream):
+                self._mlp_project_eager(static_input)
+            torch.cuda.current_stream(hidden.device).wait_stream(stream)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                output = self._mlp_project_eager(static_input)
+            captured = _StaticCudaGraphCall(graph=graph, static_input=static_input, output=output)
+            self._mlp_project_graph = captured
+            return captured.output
+        captured.static_input.copy_(hidden)
+        captured.graph.replay()
+        return captured.output
+
+    def _post_attention_mlp_project(self, hidden: Tensor) -> Tensor:
+        if self.world_size > 1 and _should_use_mlp_project_graph(hidden) and not self._post_mlp_project_graph_failed:
+            try:
+                projected = self._run_post_mlp_project_graph(hidden)
+                _all_reduce(projected)
+                return projected
+            except Exception:
+                self._post_mlp_project_graph_failed = True
+        mlp_in = _tp_rms_norm(hidden, self.post_attention_layernorm_weight, self.config.rms_norm_eps)
+        projected = self._mlp_project_eager(mlp_in)
+        _all_reduce(projected)
+        return projected
+
+    def _post_mlp_project_eager(self, hidden: Tensor) -> Tensor:
+        mlp_in = _tp_rms_norm(hidden, self.post_attention_layernorm_weight, self.config.rms_norm_eps)
+        return self._mlp_project_eager(mlp_in)
+
+    def _run_post_mlp_project_graph(self, hidden: Tensor) -> Tensor:
+        captured = self._post_mlp_project_graph
+        if captured is None or captured.static_input.shape != hidden.shape:
+            static_input = torch.empty_like(hidden)
+            static_input.copy_(hidden)
+            stream = torch.cuda.Stream(device=hidden.device)
+            stream.wait_stream(torch.cuda.current_stream(hidden.device))
+            with torch.cuda.stream(stream):
+                self._post_mlp_project_eager(static_input)
+            torch.cuda.current_stream(hidden.device).wait_stream(stream)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                output = self._post_mlp_project_eager(static_input)
+            captured = _StaticCudaGraphCall(graph=graph, static_input=static_input, output=output)
+            self._post_mlp_project_graph = captured
+            return captured.output
+        captured.static_input.copy_(hidden)
+        captured.graph.replay()
+        return captured.output
+
+    def _attention_o_project(self, hidden: Tensor) -> Tensor:
+        if self.world_size > 1 and _should_use_attention_o_graph(hidden) and not self._attention_o_graph_failed:
+            try:
+                return self._run_attention_o_graph(hidden)
+            except Exception:
+                self._attention_o_graph_failed = True
+        return F.linear(hidden, self.o_proj_weight)
+
+    def _run_attention_o_graph(self, hidden: Tensor) -> Tensor:
+        captured = self._attention_o_graph
+        if captured is None or captured.static_input.shape != hidden.shape:
+            static_input = torch.empty_like(hidden)
+            static_input.copy_(hidden)
+            stream = torch.cuda.Stream(device=hidden.device)
+            stream.wait_stream(torch.cuda.current_stream(hidden.device))
+            with torch.cuda.stream(stream):
+                F.linear(static_input, self.o_proj_weight)
+            torch.cuda.current_stream(hidden.device).wait_stream(stream)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                output = F.linear(static_input, self.o_proj_weight)
+            captured = _StaticCudaGraphCall(graph=graph, static_input=static_input, output=output)
+            self._attention_o_graph = captured
+            return captured.output
+        captured.static_input.copy_(hidden)
+        captured.graph.replay()
+        return captured.output
 
     def _qkv(self, hidden: Tensor, batch: int, tokens: int, head_dim: int) -> tuple[Tensor, Tensor, Tensor]:
         qkv = F.linear(hidden, self.qkv_proj_weight)
@@ -211,6 +390,153 @@ class _Llama3TensorParallelLayer:
         ).transpose(1, 2)
         return q, k, v
 
+    def _qkv_rotary(
+        self,
+        hidden: Tensor,
+        batch: int,
+        tokens: int,
+        head_dim: int,
+        rotary: tuple[Tensor, Tensor],
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        if self.world_size > 1 and _should_use_qkv_rotary_graph(hidden) and not self._qkv_rotary_graph_failed:
+            try:
+                return self._run_qkv_rotary_graph(hidden, batch, tokens, head_dim, rotary)
+            except Exception:
+                self._qkv_rotary_graph_failed = True
+        return self._qkv_rotary_eager(hidden, batch, tokens, head_dim, rotary)
+
+    def _qkv_rotary_eager(
+        self,
+        hidden: Tensor,
+        batch: int,
+        tokens: int,
+        head_dim: int,
+        rotary: tuple[Tensor, Tensor],
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        q, k, v = self._qkv(hidden, batch, tokens, head_dim)
+        q, k = _apply_rotary_cached(q, k, rotary)
+        return q, k, v
+
+    def _run_qkv_rotary_graph(
+        self,
+        hidden: Tensor,
+        batch: int,
+        tokens: int,
+        head_dim: int,
+        rotary: tuple[Tensor, Tensor],
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        cos, sin = rotary
+        captured = self._qkv_rotary_graph
+        if (
+            captured is None
+            or captured.static_input.shape != hidden.shape
+            or captured.static_cos.shape != cos.shape
+            or captured.static_sin.shape != sin.shape
+        ):
+            static_input = torch.empty_like(hidden)
+            static_cos = torch.empty_like(cos)
+            static_sin = torch.empty_like(sin)
+            static_input.copy_(hidden)
+            static_cos.copy_(cos)
+            static_sin.copy_(sin)
+            stream = torch.cuda.Stream(device=hidden.device)
+            stream.wait_stream(torch.cuda.current_stream(hidden.device))
+            with torch.cuda.stream(stream):
+                self._qkv_rotary_eager(static_input, batch, tokens, head_dim, (static_cos, static_sin))
+            torch.cuda.current_stream(hidden.device).wait_stream(stream)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                q, k, v = self._qkv_rotary_eager(static_input, batch, tokens, head_dim, (static_cos, static_sin))
+            captured = _StaticQKVRotaryGraphCall(
+                graph=graph,
+                static_input=static_input,
+                static_cos=static_cos,
+                static_sin=static_sin,
+                q=q,
+                k=k,
+                v=v,
+            )
+            self._qkv_rotary_graph = captured
+            return captured.q, captured.k, captured.v
+        captured.static_input.copy_(hidden)
+        captured.static_cos.copy_(cos)
+        captured.static_sin.copy_(sin)
+        captured.graph.replay()
+        return captured.q, captured.k, captured.v
+
+    def _input_norm_qkv_rotary(
+        self,
+        hidden: Tensor,
+        batch: int,
+        tokens: int,
+        head_dim: int,
+        rotary: tuple[Tensor, Tensor],
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        if self.world_size > 1 and _should_use_qkv_rotary_graph(hidden) and not self._input_qkv_rotary_graph_failed:
+            try:
+                return self._run_input_qkv_rotary_graph(hidden, batch, tokens, head_dim, rotary)
+            except Exception:
+                self._input_qkv_rotary_graph_failed = True
+        return self._input_qkv_rotary_eager(hidden, batch, tokens, head_dim, rotary)
+
+    def _input_qkv_rotary_eager(
+        self,
+        hidden: Tensor,
+        batch: int,
+        tokens: int,
+        head_dim: int,
+        rotary: tuple[Tensor, Tensor],
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        attn_in = _tp_rms_norm(hidden, self.input_layernorm_weight, self.config.rms_norm_eps)
+        return self._qkv_rotary_eager(attn_in, batch, tokens, head_dim, rotary)
+
+    def _run_input_qkv_rotary_graph(
+        self,
+        hidden: Tensor,
+        batch: int,
+        tokens: int,
+        head_dim: int,
+        rotary: tuple[Tensor, Tensor],
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        cos, sin = rotary
+        captured = self._input_qkv_rotary_graph
+        if (
+            captured is None
+            or captured.static_input.shape != hidden.shape
+            or captured.static_cos.shape != cos.shape
+            or captured.static_sin.shape != sin.shape
+        ):
+            static_input = torch.empty_like(hidden)
+            static_cos = torch.empty_like(cos)
+            static_sin = torch.empty_like(sin)
+            static_input.copy_(hidden)
+            static_cos.copy_(cos)
+            static_sin.copy_(sin)
+            stream = torch.cuda.Stream(device=hidden.device)
+            stream.wait_stream(torch.cuda.current_stream(hidden.device))
+            with torch.cuda.stream(stream):
+                self._input_qkv_rotary_eager(static_input, batch, tokens, head_dim, (static_cos, static_sin))
+            torch.cuda.current_stream(hidden.device).wait_stream(stream)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                q, k, v = self._input_qkv_rotary_eager(static_input, batch, tokens, head_dim, (static_cos, static_sin))
+            captured = _StaticQKVRotaryGraphCall(
+                graph=graph,
+                static_input=static_input,
+                static_cos=static_cos,
+                static_sin=static_sin,
+                q=q,
+                k=k,
+                v=v,
+            )
+            self._input_qkv_rotary_graph = captured
+            return captured.q, captured.k, captured.v
+        captured.static_input.copy_(hidden)
+        captured.static_cos.copy_(cos)
+        captured.static_sin.copy_(sin)
+        captured.graph.replay()
+        return captured.q, captured.k, captured.v
+
     @staticmethod
     def _scaled_dot_product(
         q: Tensor,
@@ -221,6 +547,13 @@ class _Llama3TensorParallelLayer:
         enable_gqa: bool,
     ) -> Tensor:
         if q.size(-2) == 1:
+            if q.is_cuda and k.size(-2) <= 2048 and os.environ.get("TORCHINFERNO_TRITON_DECODE_ATTENTION", "1") != "0":
+                try:
+                    from torchinferno.kernels.triton_ops import triton_dense_gqa_decode_attention
+
+                    return triton_dense_gqa_decode_attention(q, k, v)
+                except Exception:
+                    pass
             return F.scaled_dot_product_attention(
                 q,
                 k,
@@ -303,6 +636,12 @@ class Llama3TensorParallelForCausalLM:
         self.local_vocab_size = config.vocab_size // world_size
         self.vocab_start = rank * self.local_vocab_size
         self.inv_freq = _build_inv_freq(config, device)
+        self.rotary_cos_cache, self.rotary_sin_cache = _build_llama_rotary_cache(
+            config.max_position_embeddings,
+            self.inv_freq,
+            device=device,
+            dtype=dtype,
+        )
         self.profile_seconds: dict[str, float] = {}
         self.profile_counts: dict[str, int] = {}
         self.training = False
@@ -515,14 +854,14 @@ class Llama3TensorParallelForCausalLM:
             active_cache = self.allocate_cache(batch, tokens)
         past_len = active_cache.seq_len if active_cache is not None else 0
         positions = torch.arange(past_len, past_len + tokens, device=self.device)
-        rotary = self._rotary_cache(positions)
+        rotary = self._rotary_cache(past_len, tokens)
         hidden = F.embedding(input_ids.to(self.device, non_blocking=True), self.embed_tokens_weight)
         for layer_id, layer in enumerate(self.layers):
             layer_cache = active_cache.layers[layer_id] if active_cache is not None else None
             hidden = layer.forward(hidden, positions, rotary, layer_cache)
         if return_last_logits_only:
             hidden = hidden[:, -1:, :]
-        hidden = _rms_norm(hidden, self.norm_weight, self.config.rms_norm_eps)
+        hidden = _tp_rms_norm(hidden, self.norm_weight, self.config.rms_norm_eps)
         logits = F.linear(hidden, self.lm_head_weight)
         if return_sharded_logits:
             return logits, active_cache
@@ -575,18 +914,12 @@ class Llama3TensorParallelForCausalLM:
 
     def _sample_next_token_greedy(self, logits: Tensor) -> Tensor:
         local_values, local_indices = torch.max(logits.float(), dim=-1)
-        gathered_values = [torch.empty_like(local_values) for _ in range(self.world_size)]
-        gathered_indices = [torch.empty_like(local_indices) for _ in range(self.world_size)]
-        dist.all_gather(gathered_values, local_values)
-        dist.all_gather(gathered_indices, local_indices)
-        next_token = torch.empty(logits.size(0), dtype=torch.long, device=self.device)
-        if self.is_primary:
-            values = torch.stack(gathered_values, dim=0)
-            indices = torch.stack(gathered_indices, dim=0)
-            best_rank = torch.argmax(values, dim=0)
-            row = torch.arange(logits.size(0), device=self.device)
-            next_token.copy_(indices[best_rank, row] + best_rank.to(torch.long) * self.local_vocab_size)
-        dist.broadcast(next_token, src=0)
+        global_values = local_values.clone()
+        dist.all_reduce(global_values, op=dist.ReduceOp.MAX)
+        sentinel = torch.full_like(local_indices, self.config.vocab_size)
+        local_tokens = local_indices + self.vocab_start
+        next_token = torch.where(local_values == global_values, local_tokens, sentinel)
+        dist.all_reduce(next_token, op=dist.ReduceOp.MIN)
         return next_token
 
     def _sample_next_token_temperature(self, logits: Tensor, temperature: float) -> Tensor:
@@ -635,12 +968,13 @@ class Llama3TensorParallelForCausalLM:
         dist.all_gather(gathered, logits)
         return torch.cat(gathered, dim=-1)
 
-    def _rotary_cache(self, positions: Tensor) -> tuple[Tensor, Tensor]:
+    def _rotary_cache(self, start: int, tokens: int) -> tuple[Tensor, Tensor]:
+        end = start + tokens
+        if end <= self.rotary_cos_cache.size(0):
+            return self.rotary_cos_cache[start:end], self.rotary_sin_cache[start:end]
+        positions = torch.arange(start, end, device=self.device)
         freqs = torch.outer(positions.float(), self.inv_freq)
-        emb = torch.cat((freqs, freqs), dim=-1)
-        cos = emb.cos().to(dtype=self.dtype, device=self.device)
-        sin = emb.sin().to(dtype=self.dtype, device=self.device)
-        return cos, sin
+        return freqs.cos().to(dtype=self.dtype), freqs.sin().to(dtype=self.dtype)
 
 
 def _init_distributed_if_needed() -> None:
@@ -657,15 +991,34 @@ def _all_reduce(tensor: Tensor) -> None:
         dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
 
 
+def _build_llama_rotary_cache(
+    max_position_embeddings: int,
+    inv_freq: Tensor,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> tuple[Tensor, Tensor]:
+    positions = torch.arange(max_position_embeddings, device=device, dtype=torch.float32)
+    freqs = torch.outer(positions, inv_freq.float())
+    return freqs.cos().to(dtype=dtype), freqs.sin().to(dtype=dtype)
+
+
 def _apply_rotary_cached(q: Tensor, k: Tensor, rotary: tuple[Tensor, Tensor]) -> tuple[Tensor, Tensor]:
     cos, sin = rotary
+    if q.is_cuda and k.is_cuda and os.environ.get("TORCHINFERNO_TRITON_ROTARY", "1") != "0":
+        try:
+            from torchinferno.kernels.triton_ops import triton_apply_rotary_llama_inplace
+
+            return triton_apply_rotary_llama_inplace(q, k, cos, sin)
+        except Exception:
+            pass
     cos = cos[None, None, :, :]
     sin = sin[None, None, :, :]
     return _rotate_llama(q, cos, sin), _rotate_llama(k, cos, sin)
 
 
 def _rotate_llama(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
-    if x.is_cuda and os.environ.get("TORCHINFERNO_COMPILE_ROTARY", "1") != "0":
+    if x.is_cuda and os.environ.get("TORCHINFERNO_COMPILE_ROTARY", "0") != "0":
         compiled = _load_compiled_rotate_llama()
         if compiled is not None:
             try:
@@ -695,10 +1048,65 @@ def _load_compiled_rotate_llama():
 
 def _rotate_llama_eager(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
     half = x.size(-1) // 2
+    if cos.size(-1) == half:
+        cos = torch.cat((cos, cos), dim=-1)
+        sin = torch.cat((sin, sin), dim=-1)
     x1 = x[..., :half]
     x2 = x[..., half:]
     rotated = torch.cat((-x2, x1), dim=-1)
     return (x * cos) + (rotated * sin)
+
+
+def _tp_rms_norm(x: Tensor, weight: Tensor, eps: float) -> Tensor:
+    if x.is_cuda and weight.is_cuda and os.environ.get("TORCHINFERNO_TRITON_RMS_NORM", "0") != "0":
+        try:
+            from torchinferno.kernels import rms_norm as kernel_rms_norm
+
+            return kernel_rms_norm(x, weight, eps=eps)
+        except Exception:
+            pass
+    return _torch_rms_norm(x, weight, eps)
+
+
+def _tp_swiglu(gate: Tensor, up: Tensor) -> Tensor:
+    if gate.is_cuda and up.is_cuda and os.environ.get("TORCHINFERNO_TRITON_SWIGLU", "0") != "0":
+        try:
+            from torchinferno.kernels import swiglu_activation
+
+            return swiglu_activation(gate, up)
+        except Exception:
+            pass
+    return F.silu(gate) * up
+
+
+def _should_use_mlp_project_graph(hidden: Tensor) -> bool:
+    return (
+        hidden.is_cuda
+        and hidden.ndim == 3
+        and hidden.size(0) == 1
+        and hidden.size(1) == 1
+        and os.environ.get("TORCHINFERNO_CUDAGRAPH_MLP", "1") != "0"
+    )
+
+
+def _should_use_qkv_rotary_graph(hidden: Tensor) -> bool:
+    return (
+        hidden.is_cuda
+        and hidden.ndim == 3
+        and hidden.size(0) == 1
+        and hidden.size(1) == 1
+        and os.environ.get("TORCHINFERNO_CUDAGRAPH_QKV_ROTARY", "0") != "0"
+    )
+
+
+def _should_use_attention_o_graph(hidden: Tensor) -> bool:
+    return (
+        hidden.is_cuda
+        and hidden.ndim == 3
+        and hidden.size(0) == 1
+        and hidden.size(1) == 1
+        and os.environ.get("TORCHINFERNO_CUDAGRAPH_ATTENTION_O", "1") != "0"
+    )
 
 
 def _rotate_interleaved_eager(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:

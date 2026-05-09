@@ -213,6 +213,35 @@ def test_openai_engine_single_request_does_not_use_batched_step_loop() -> None:
     assert engine.batch_step_calls == 0
 
 
+def test_openai_engine_reuses_resettable_generation_cache() -> None:
+    model = _BatchRecordingModel()
+    engine = OpenAICompletionEngine(
+        model,
+        _ByteFallbackTokenizer(vocab_size=8),
+        model_id="tiny",
+        device=torch.device("cpu"),
+        max_batch_size=4,
+        batch_wait_ms=1000.0,
+    )
+    try:
+        first = engine.complete_chat(
+            [{"role": "user", "content": "single"}],
+            max_tokens=2,
+            temperature=0.0,
+        )
+        second = engine.complete_chat(
+            [{"role": "user", "content": "single"}],
+            max_tokens=2,
+            temperature=0.0,
+        )
+    finally:
+        engine.close()
+
+    assert first.tokens == [2, 2]
+    assert second.tokens == [2, 2]
+    assert model.cache_allocations == 1
+
+
 def test_openai_microbench_cli_runs_synthetic_cases() -> None:
     root = Path(__file__).resolve().parents[1]
     env = {**os.environ, "PYTHONPATH": "src"}
@@ -281,8 +310,10 @@ class _BatchRecordingModel:
     def __init__(self) -> None:
         self.config = type("Config", (), {"vocab_size": 8})()
         self.calls: list[tuple[int, int, str]] = []
+        self.cache_allocations = 0
 
     def allocate_cache(self, batch_size: int, max_seq_len: int, **kwargs) -> _BatchRecordingCache:
+        self.cache_allocations += 1
         return _BatchRecordingCache()
 
     def forward(

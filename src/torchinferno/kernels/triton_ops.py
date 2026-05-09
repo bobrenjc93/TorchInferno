@@ -11,27 +11,49 @@ except Exception as exc:  # pragma: no cover - import guarded by caller
 
 
 @triton.jit
-def _swiglu_kernel(gate_ptr, up_ptr, out_ptr, n_elements: tl.constexpr, block_size: tl.constexpr) -> None:
-    program_id = tl.program_id(0)
-    offsets = program_id * block_size + tl.arange(0, block_size)
-    mask = offsets < n_elements
-    gate = tl.load(gate_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
-    up = tl.load(up_ptr + offsets, mask=mask, other=0.0)
+def _swiglu_kernel(
+    gate_ptr,
+    up_ptr,
+    out_ptr,
+    cols: tl.constexpr,
+    gate_stride_row: tl.constexpr,
+    up_stride_row: tl.constexpr,
+    block_size: tl.constexpr,
+) -> None:
+    row = tl.program_id(0)
+    offsets = tl.arange(0, block_size)
+    mask = offsets < cols
+    gate = tl.load(gate_ptr + row * gate_stride_row + offsets, mask=mask, other=0.0).to(tl.float32)
+    up = tl.load(up_ptr + row * up_stride_row + offsets, mask=mask, other=0.0)
     out = gate / (1.0 + tl.exp(-gate)) * up
-    tl.store(out_ptr + offsets, out, mask=mask)
+    tl.store(out_ptr + row * cols + offsets, out, mask=mask)
 
 
 def triton_swiglu_activation(gate: Tensor, up: Tensor) -> Tensor:
     if gate.shape != up.shape:
         raise ValueError("gate and up tensors must have the same shape")
-    gate = gate.contiguous()
-    up = up.contiguous()
-    out = torch.empty_like(gate)
-    n_elements = out.numel()
-    block_size = 1024
-    grid = (triton.cdiv(n_elements, block_size),)
-    _swiglu_kernel[grid](gate, up, out, n_elements, block_size, num_warps=4)
-    return out
+    if gate.stride(-1) != 1 or up.stride(-1) != 1:
+        raise ValueError("gate and up tensors must have contiguous last dimensions")
+    if gate.ndim == 1:
+        gate_2d = gate[None, :]
+        up_2d = up[None, :]
+    else:
+        gate_2d = gate.flatten(0, -2)
+        up_2d = up.flatten(0, -2)
+    out = torch.empty_like(gate_2d)
+    cols = gate_2d.size(1)
+    block_size = triton.next_power_of_2(cols)
+    _swiglu_kernel[(gate_2d.size(0),)](
+        gate_2d,
+        up_2d,
+        out,
+        cols,
+        gate_2d.stride(0),
+        up_2d.stride(0),
+        block_size,
+        num_warps=8,
+    )
+    return out.view_as(gate)
 
 
 @triton.jit
@@ -98,6 +120,368 @@ def triton_apply_rotary_interleaved_inplace(
     _triton_rotate_one_interleaved_inplace(k, cos, sin)
     return q, k
 
+
+@triton.jit
+def _rotary_llama_qk_inplace_kernel(
+    q_ptr,
+    k_ptr,
+    cos_ptr,
+    sin_ptr,
+    total_elements,
+    total_q,
+    total_k,
+    q_heads: tl.constexpr,
+    k_heads: tl.constexpr,
+    tokens: tl.constexpr,
+    half_dim: tl.constexpr,
+    cache_dim: tl.constexpr,
+    q_stride_batch: tl.constexpr,
+    q_stride_head: tl.constexpr,
+    q_stride_token: tl.constexpr,
+    q_stride_dim: tl.constexpr,
+    k_stride_batch: tl.constexpr,
+    k_stride_head: tl.constexpr,
+    k_stride_token: tl.constexpr,
+    k_stride_dim: tl.constexpr,
+    block_size: tl.constexpr,
+) -> None:
+    offsets = tl.program_id(0) * block_size + tl.arange(0, block_size)
+    mask = offsets < total_elements
+    rotary_dim = offsets % half_dim
+    token_head_batch = offsets // half_dim
+
+    q_token = token_head_batch % tokens
+    q_head_batch = token_head_batch // tokens
+    q_head = q_head_batch % q_heads
+    q_batch = q_head_batch // q_heads
+    q_offset = (
+        q_batch * q_stride_batch
+        + q_head * q_stride_head
+        + q_token * q_stride_token
+        + rotary_dim * q_stride_dim
+    )
+    q_mask = mask & (offsets < total_q)
+    q_first = tl.load(q_ptr + q_offset, mask=q_mask, other=0.0).to(tl.float32)
+    q_second = tl.load(q_ptr + q_offset + half_dim * q_stride_dim, mask=q_mask, other=0.0).to(tl.float32)
+    q_cos = tl.load(cos_ptr + q_token * cache_dim + rotary_dim, mask=q_mask, other=1.0).to(tl.float32)
+    q_sin = tl.load(sin_ptr + q_token * cache_dim + rotary_dim, mask=q_mask, other=0.0).to(tl.float32)
+    tl.store(q_ptr + q_offset, q_first * q_cos - q_second * q_sin, mask=q_mask)
+    tl.store(q_ptr + q_offset + half_dim * q_stride_dim, q_second * q_cos + q_first * q_sin, mask=q_mask)
+
+    k_token = token_head_batch % tokens
+    k_head_batch = token_head_batch // tokens
+    k_head = k_head_batch % k_heads
+    k_batch = k_head_batch // k_heads
+    k_offset = (
+        k_batch * k_stride_batch
+        + k_head * k_stride_head
+        + k_token * k_stride_token
+        + rotary_dim * k_stride_dim
+    )
+    k_mask = mask & (offsets < total_k)
+    k_first = tl.load(k_ptr + k_offset, mask=k_mask, other=0.0).to(tl.float32)
+    k_second = tl.load(k_ptr + k_offset + half_dim * k_stride_dim, mask=k_mask, other=0.0).to(tl.float32)
+    k_cos = tl.load(cos_ptr + k_token * cache_dim + rotary_dim, mask=k_mask, other=1.0).to(tl.float32)
+    k_sin = tl.load(sin_ptr + k_token * cache_dim + rotary_dim, mask=k_mask, other=0.0).to(tl.float32)
+    tl.store(k_ptr + k_offset, k_first * k_cos - k_second * k_sin, mask=k_mask)
+    tl.store(k_ptr + k_offset + half_dim * k_stride_dim, k_second * k_cos + k_first * k_sin, mask=k_mask)
+
+
+def triton_apply_rotary_llama_inplace(
+    q: Tensor,
+    k: Tensor,
+    cos: Tensor,
+    sin: Tensor,
+) -> tuple[Tensor, Tensor]:
+    """Apply Llama/HF rotate-half RoPE to tensor-parallel q/k views in place."""
+
+    if q.ndim != 4 or k.ndim != 4:
+        raise ValueError("q and k must have shape [batch, heads, tokens, head_dim]")
+    if q.size(0) != k.size(0):
+        raise ValueError("q and k batch dimensions must match")
+    if q.size(-1) != k.size(-1):
+        raise ValueError("q and k head dimensions must match")
+    if q.size(-2) != k.size(-2):
+        raise ValueError("q and k token dimensions must match")
+    if q.size(-1) % 2 != 0:
+        raise ValueError("q and k head dimensions must be even")
+    if cos.shape != sin.shape:
+        raise ValueError("cos and sin must have the same shape")
+    half_dim = q.size(-1) // 2
+    if cos.shape not in {(q.size(-2), q.size(-1)), (q.size(-2), half_dim)}:
+        raise ValueError("rotary cache shape must be [tokens, head_dim] or [tokens, head_dim / 2]")
+    if q.stride(-1) != 1 or k.stride(-1) != 1:
+        raise ValueError("q and k must have contiguous head dimensions")
+    cos = cos.contiguous()
+    sin = sin.contiguous()
+    batch, q_heads, tokens, _ = q.shape
+    k_heads = k.size(1)
+    total_q = batch * q_heads * tokens * half_dim
+    total_k = batch * k_heads * tokens * half_dim
+    total_elements = max(total_q, total_k)
+    block_size = 256
+    grid = (triton.cdiv(total_elements, block_size),)
+    _rotary_llama_qk_inplace_kernel[grid](
+        q,
+        k,
+        cos,
+        sin,
+        total_elements,
+        total_q,
+        total_k,
+        q_heads,
+        k_heads,
+        tokens,
+        half_dim,
+        cos.size(-1),
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        q.stride(3),
+        k.stride(0),
+        k.stride(1),
+        k.stride(2),
+        k.stride(3),
+        block_size,
+        num_warps=4,
+    )
+    return q, k
+
+
+@triton.jit
+def _kv_cache_append_kernel(
+    key_ptr,
+    value_ptr,
+    cache_key_ptr,
+    cache_value_ptr,
+    total_elements,
+    seq_start,
+    heads: tl.constexpr,
+    tokens: tl.constexpr,
+    head_dim: tl.constexpr,
+    key_stride_batch: tl.constexpr,
+    key_stride_head: tl.constexpr,
+    key_stride_token: tl.constexpr,
+    key_stride_dim: tl.constexpr,
+    value_stride_batch: tl.constexpr,
+    value_stride_head: tl.constexpr,
+    value_stride_token: tl.constexpr,
+    value_stride_dim: tl.constexpr,
+    cache_stride_batch: tl.constexpr,
+    cache_stride_head: tl.constexpr,
+    cache_stride_token: tl.constexpr,
+    cache_stride_dim: tl.constexpr,
+    block_size: tl.constexpr,
+) -> None:
+    offsets = tl.program_id(0) * block_size + tl.arange(0, block_size)
+    mask = offsets < total_elements
+    dim = offsets % head_dim
+    token_head_batch = offsets // head_dim
+    token = token_head_batch % tokens
+    head_batch = token_head_batch // tokens
+    head = head_batch % heads
+    batch = head_batch // heads
+
+    key_offset = (
+        batch * key_stride_batch
+        + head * key_stride_head
+        + token * key_stride_token
+        + dim * key_stride_dim
+    )
+    value_offset = (
+        batch * value_stride_batch
+        + head * value_stride_head
+        + token * value_stride_token
+        + dim * value_stride_dim
+    )
+    cache_offset = (
+        batch * cache_stride_batch
+        + head * cache_stride_head
+        + (seq_start + token) * cache_stride_token
+        + dim * cache_stride_dim
+    )
+    tl.store(cache_key_ptr + cache_offset, tl.load(key_ptr + key_offset, mask=mask), mask=mask)
+    tl.store(cache_value_ptr + cache_offset, tl.load(value_ptr + value_offset, mask=mask), mask=mask)
+
+
+def triton_append_kv_cache(
+    keys: Tensor,
+    values: Tensor,
+    cache_keys: Tensor,
+    cache_values: Tensor,
+    seq_start: int,
+) -> None:
+    if keys.shape != values.shape:
+        raise ValueError("keys and values must have the same shape")
+    if keys.ndim != 4:
+        raise ValueError("keys and values must have shape [batch, heads, tokens, head_dim]")
+    if cache_keys.shape != cache_values.shape:
+        raise ValueError("cache keys and values must have the same shape")
+    if keys.stride(-1) != 1 or values.stride(-1) != 1:
+        raise ValueError("keys and values must have contiguous head dimensions")
+    batch, heads, tokens, head_dim = keys.shape
+    if batch > cache_keys.size(0) or heads != cache_keys.size(1) or head_dim != cache_keys.size(3):
+        raise ValueError("cache shape is incompatible with incoming keys")
+    if seq_start < 0 or seq_start + tokens > cache_keys.size(2):
+        raise ValueError("KV cache capacity exceeded")
+    total_elements = batch * heads * tokens * head_dim
+    block_size = 256
+    grid = (triton.cdiv(total_elements, block_size),)
+    _kv_cache_append_kernel[grid](
+        keys,
+        values,
+        cache_keys,
+        cache_values,
+        total_elements,
+        seq_start,
+        heads,
+        tokens,
+        head_dim,
+        keys.stride(0),
+        keys.stride(1),
+        keys.stride(2),
+        keys.stride(3),
+        values.stride(0),
+        values.stride(1),
+        values.stride(2),
+        values.stride(3),
+        cache_keys.stride(0),
+        cache_keys.stride(1),
+        cache_keys.stride(2),
+        cache_keys.stride(3),
+        block_size,
+        num_warps=4,
+    )
+
+
+@triton.jit
+def _dense_gqa_decode_attention_kernel(
+    q_ptr,
+    k_ptr,
+    v_ptr,
+    out_ptr,
+    seq_len,
+    q_heads: tl.constexpr,
+    kv_heads: tl.constexpr,
+    head_dim: tl.constexpr,
+    value_dim: tl.constexpr,
+    scale: tl.constexpr,
+    q_stride_batch: tl.constexpr,
+    q_stride_head: tl.constexpr,
+    q_stride_token: tl.constexpr,
+    q_stride_dim: tl.constexpr,
+    k_stride_batch: tl.constexpr,
+    k_stride_head: tl.constexpr,
+    k_stride_token: tl.constexpr,
+    k_stride_dim: tl.constexpr,
+    v_stride_batch: tl.constexpr,
+    v_stride_head: tl.constexpr,
+    v_stride_token: tl.constexpr,
+    v_stride_dim: tl.constexpr,
+    out_stride_batch: tl.constexpr,
+    out_stride_head: tl.constexpr,
+    out_stride_token: tl.constexpr,
+    out_stride_dim: tl.constexpr,
+    block_s: tl.constexpr,
+    block_d: tl.constexpr,
+    block_v: tl.constexpr,
+) -> None:
+    batch = tl.program_id(0)
+    q_head = tl.program_id(1)
+    kv_head = q_head // (q_heads // kv_heads)
+    offs_s = tl.arange(0, block_s)
+    offs_d = tl.arange(0, block_d)
+    q_offsets = batch * q_stride_batch + q_head * q_stride_head + offs_d * q_stride_dim
+    k_offsets = (
+        batch * k_stride_batch
+        + kv_head * k_stride_head
+        + offs_s[:, None] * k_stride_token
+        + offs_d[None, :] * k_stride_dim
+    )
+    q = tl.load(q_ptr + q_offsets, mask=offs_d < head_dim, other=0.0).to(tl.float32)
+    k = tl.load(k_ptr + k_offsets, mask=(offs_s[:, None] < seq_len) & (offs_d[None, :] < head_dim), other=0.0)
+    scores = tl.sum(k.to(tl.float32) * q[None, :], axis=1) * scale
+    scores = tl.where(offs_s < seq_len, scores, -float("inf"))
+    scores = scores - tl.max(scores, axis=0)
+    probs = tl.exp(scores)
+    probs = probs / tl.sum(probs, axis=0)
+
+    offs_v = tl.arange(0, block_v)
+    v_offsets = (
+        batch * v_stride_batch
+        + kv_head * v_stride_head
+        + offs_s[:, None] * v_stride_token
+        + offs_v[None, :] * v_stride_dim
+    )
+    values = tl.load(v_ptr + v_offsets, mask=(offs_s[:, None] < seq_len) & (offs_v[None, :] < value_dim), other=0.0)
+    out = tl.sum(values.to(tl.float32) * probs[:, None], axis=0)
+    out_offsets = batch * out_stride_batch + q_head * out_stride_head + offs_v * out_stride_dim
+    tl.store(out_ptr + out_offsets, out, mask=offs_v < value_dim)
+
+
+def triton_dense_gqa_decode_attention(q: Tensor, k: Tensor, v: Tensor) -> Tensor:
+    """Single-token dense-cache GQA attention for Llama tensor-parallel decode."""
+
+    if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
+        raise ValueError("q, k, and v must have shape [batch, heads, tokens, dim]")
+    if q.size(0) != k.size(0) or q.size(0) != v.size(0):
+        raise ValueError("q, k, and v batch dimensions must match")
+    if q.size(-2) != 1:
+        raise ValueError("decode attention expects q to contain exactly one token")
+    if k.size(-2) != v.size(-2):
+        raise ValueError("k and v sequence lengths must match")
+    if k.size(1) != v.size(1):
+        raise ValueError("k and v head counts must match")
+    if q.size(1) % k.size(1) != 0:
+        raise ValueError("q head count must be divisible by kv head count")
+    if q.size(-1) != k.size(-1):
+        raise ValueError("q and k head dimensions must match")
+    if q.stride(-1) != 1 or k.stride(-1) != 1 or v.stride(-1) != 1:
+        raise ValueError("q, k, and v must have contiguous head dimensions")
+    batch, q_heads, _, head_dim = q.shape
+    _, kv_heads, seq_len, _ = k.shape
+    value_dim = v.size(-1)
+    block_s = triton.next_power_of_2(seq_len)
+    block_d = triton.next_power_of_2(head_dim)
+    block_v = triton.next_power_of_2(value_dim)
+    if block_s > 2048:
+        raise ValueError("Triton dense decode attention supports sequence lengths up to 2048")
+    if block_d > 256 or block_v > 256:
+        raise ValueError("Triton dense decode attention supports head dimensions up to 256")
+    out = torch.empty((batch, q_heads, 1, value_dim), device=q.device, dtype=q.dtype)
+    _dense_gqa_decode_attention_kernel[(batch, q_heads)](
+        q,
+        k,
+        v,
+        out,
+        seq_len,
+        q_heads,
+        kv_heads,
+        head_dim,
+        value_dim,
+        1.0 / (head_dim**0.5),
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        q.stride(3),
+        k.stride(0),
+        k.stride(1),
+        k.stride(2),
+        k.stride(3),
+        v.stride(0),
+        v.stride(1),
+        v.stride(2),
+        v.stride(3),
+        out.stride(0),
+        out.stride(1),
+        out.stride(2),
+        out.stride(3),
+        block_s,
+        block_d,
+        block_v,
+        num_warps=4,
+    )
+    return out
 
 def _triton_rotate_one_interleaved_inplace(x: Tensor, cos: Tensor, sin: Tensor) -> None:
     batch, heads, tokens, head_dim = x.shape

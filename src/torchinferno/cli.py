@@ -433,9 +433,13 @@ def run_openai_microbench(args: argparse.Namespace) -> int:
 
     try:
         cases: list[tuple[str, bool, int]] = []
+        skipped_batcher_compare = False
         if args.compare_batcher:
             cases.append(("single-direct", True, 1))
-            cases.append(("single-batcher", False, 1))
+            if int(getattr(engine.model, "world_size", 1)) > 1:
+                skipped_batcher_compare = True
+            else:
+                cases.append(("single-batcher", False, 1))
         else:
             cases.append(("single", True, 1))
         if args.concurrency > 1:
@@ -447,12 +451,15 @@ def run_openai_microbench(args: argparse.Namespace) -> int:
             f"max_tokens={args.max_tokens} warmup={args.warmup} iters={args.iters} "
             f"batch_wait_ms={args.batch_wait_ms:g}"
         )
+        if skipped_batcher_compare:
+            print("skip=single-batcher reason=tensor_parallel_worker_protocol")
         results: dict[str, object] = {
             "backend": args.backend,
             "device": str(engine.device),
             "prompt_tokens": args.prompt_tokens,
             "max_tokens": args.max_tokens,
             "batch_wait_ms": args.batch_wait_ms,
+            "skipped_single_batcher": skipped_batcher_compare,
             "cases": {},
         }
         for label, fast_path, concurrency in cases:

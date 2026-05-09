@@ -201,6 +201,8 @@ class OpenAICompletionEngine:
         self._live_requests = 0
         self._closed = False
         self._worker: threading.Thread | None = None
+        self._cache_pool: dict[tuple[int, int, str, int, str], object] = {}
+        self._warmup_tensor_parallel_model()
         if not _is_tensor_parallel_worker_model(model):
             self._worker = threading.Thread(target=self._batch_worker, name="torchinferno-openai-batcher", daemon=True)
             self._worker.start()
@@ -415,13 +417,10 @@ class OpenAICompletionEngine:
             rows = generated[:, input_ids.size(1) :].detach().cpu().tolist()
             return _trim_rows_at_eos(rows, eos_token_id)
 
-        cache = _allocate_cache(
-            model,
+        cache = self._generation_cache(
             input_ids.size(0),
             input_ids.size(1) + max_tokens,
-            device=self.device,
-            cache_backend=self.cache_backend,
-            page_size=self.page_size,
+            model=model,
         )
         logits, cache = _forward(model, input_ids, cache)
         next_token = _sample(model, logits[:, -1, :], temperature).to(self.device)
@@ -445,6 +444,64 @@ class OpenAICompletionEngine:
             next_token = _sample(model, logits[:, -1, :], temperature).to(self.device)
         rows = torch.cat(generated_tokens, dim=1).detach().cpu().tolist()
         return _trim_rows_at_eos(rows, eos_token_id)
+
+    def _generation_cache(
+        self,
+        batch_size: int,
+        max_seq_len: int,
+        *,
+        model: object,
+    ) -> object:
+        key = (batch_size, max_seq_len, self.cache_backend, self.page_size, str(self.device))
+        for cached_key, cached in self._cache_pool.items():
+            cached_batch, cached_max_seq_len, cached_backend, cached_page_size, cached_device = cached_key
+            if (
+                cached_batch == batch_size
+                and cached_max_seq_len >= max_seq_len
+                and cached_backend == self.cache_backend
+                and cached_page_size == self.page_size
+                and cached_device == str(self.device)
+                and _reset_generation_cache(cached)
+            ):
+                return cached
+        cache = _allocate_cache(
+            model,
+            batch_size,
+            max_seq_len,
+            device=self.device,
+            cache_backend=self.cache_backend,
+            page_size=self.page_size,
+        )
+        if _reset_generation_cache(cache):
+            self._cache_pool[key] = cache
+        return cache
+
+    def _warmup_tensor_parallel_model(self) -> None:
+        if os.environ.get("TORCHINFERNO_OPENAI_STARTUP_WARMUP", "1") == "0":
+            return
+        if not _is_tensor_parallel_model(self.model) or self.device.type != "cuda":
+            return
+        if not hasattr(self.model, "generate"):
+            return
+        prompt_tokens = max(1, int(os.environ.get("TORCHINFERNO_OPENAI_WARMUP_PROMPT_TOKENS", "32")))
+        new_tokens = max(1, int(os.environ.get("TORCHINFERNO_OPENAI_WARMUP_NEW_TOKENS", "2")))
+        vocab_size = max(1, int(getattr(getattr(self.model, "config", object()), "vocab_size", 1)))
+        input_ids = (torch.arange(prompt_tokens, device=self.device, dtype=torch.long) % vocab_size)[None, :]
+        with torch.inference_mode():
+            for _ in self._generate_single_tokens(
+                input_ids,
+                max_tokens=new_tokens,
+                temperature=0.0,
+                broadcast_tensor_parallel=False,
+            ):
+                pass
+            warmup_cache_tokens = max(
+                prompt_tokens + new_tokens,
+                int(os.environ.get("TORCHINFERNO_OPENAI_WARMUP_CACHE_TOKENS", "256")),
+            )
+            self._generation_cache(1, warmup_cache_tokens, model=self.model)
+            _warmup_tensor_parallel_decode_attention(self.model)
+        torch.cuda.synchronize(self.device)
 
     def _generate_prompt_token_list(self, prompt: list[int], *, max_tokens: int, temperature: float) -> list[int]:
         input_ids = torch.tensor([prompt], dtype=torch.long, device=self.device)
@@ -501,13 +558,10 @@ class OpenAICompletionEngine:
                     break
             return
 
-        cache = _allocate_cache(
-            model,
+        cache = self._generation_cache(
             1,
             input_ids.size(1) + max_tokens,
-            device=self.device,
-            cache_backend=self.cache_backend,
-            page_size=self.page_size,
+            model=model,
         )
         logits, cache = _forward(model, input_ids, cache)
         next_token = _sample(model, logits[:, -1, :], temperature).to(self.device)
@@ -566,13 +620,10 @@ class OpenAICompletionEngine:
                 yield step_tokens
             return
 
-        cache = _allocate_cache(
-            model,
+        cache = self._generation_cache(
             input_ids.size(0),
             input_ids.size(1) + max_tokens,
-            device=self.device,
-            cache_backend=self.cache_backend,
-            page_size=self.page_size,
+            model=model,
         )
         active = [True for _ in range(input_ids.size(0))]
         logits, cache = _forward(model, input_ids, cache)
@@ -1003,6 +1054,54 @@ def _allocate_cache(
             return allocate_cache(batch_size, max_seq_len, device=device)
         except TypeError:
             return allocate_cache(batch_size, max_seq_len)
+
+
+def _reset_generation_cache(cache: object) -> bool:
+    reset = False
+    for layer in getattr(cache, "layers", ()) or ():
+        if hasattr(layer, "seq_len"):
+            try:
+                setattr(layer, "seq_len", 0)
+                reset = True
+            except Exception:
+                pass
+    if hasattr(cache, "seq_len"):
+        try:
+            setattr(cache, "seq_len", 0)
+            reset = True
+        except Exception:
+            pass
+    return reset
+
+
+def _warmup_tensor_parallel_decode_attention(model: object) -> None:
+    if os.environ.get("TORCHINFERNO_TRITON_DECODE_ATTENTION", "1") == "0":
+        return
+    if not _is_tensor_parallel_model(model):
+        return
+    device = getattr(model, "device", torch.device("cpu"))
+    if torch.device(device).type != "cuda":
+        return
+    try:
+        from torchinferno.kernels.triton_ops import triton_dense_gqa_decode_attention
+    except Exception:
+        return
+    config = getattr(model, "config", None)
+    if config is None:
+        return
+    world_size = max(1, int(getattr(model, "world_size", 1)))
+    q_heads = int(config.num_attention_heads) // world_size
+    kv_heads = int(config.num_key_value_heads) // world_size
+    head_dim = int(config.head_dim)
+    dtype = getattr(model, "dtype", torch.bfloat16)
+    q = torch.zeros((1, q_heads, 1, head_dim), device=device, dtype=dtype)
+    for seq_len in (64, 128, 256):
+        k = torch.zeros((1, kv_heads, seq_len, head_dim), device=device, dtype=dtype)
+        v = torch.zeros_like(k)
+        try:
+            triton_dense_gqa_decode_attention(q, k, v)
+        except Exception:
+            return
 
 
 def _forward(model: object, input_ids: Tensor, cache: object) -> tuple[Tensor, object]:
