@@ -29,6 +29,7 @@ vLLM and sglang providers expose tensor parallelism:
 python -m torchinferno.openai_server \
   --model meta-llama/Meta-Llama-3.1-70B-Instruct \
   --tensor-parallel-size 8 \
+  --single-request-admission-wait-ms 0 \
   --port 8000 \
   --trust-remote-code
 ```

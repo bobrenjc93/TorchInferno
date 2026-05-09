@@ -5,6 +5,7 @@ import inspect
 import json
 import os
 import queue
+import socket
 import sys
 import threading
 import time
@@ -48,6 +49,7 @@ class OpenAIServerConfig:
     page_size: int = 16
     max_batch_size: int = 32
     batch_wait_ms: float = 10.0
+    single_request_admission_wait_ms: float | None = None
     llama_parallelism: str = "auto"
 
 
@@ -185,6 +187,7 @@ class OpenAICompletionEngine:
         max_model_len: int | None = None,
         max_batch_size: int = 32,
         batch_wait_ms: float = 10.0,
+        single_request_admission_wait_ms: float | None = None,
     ) -> None:
         self.model = model
         self.tokenizer = tokenizer
@@ -195,10 +198,19 @@ class OpenAICompletionEngine:
         self.max_model_len = max_model_len
         self.max_batch_size = max(1, max_batch_size)
         self.batch_wait_s = max(0.0, batch_wait_ms / 1000.0)
+        raw_single_request_wait_ms = os.environ.get("TORCHINFERNO_OPENAI_SINGLE_ADMISSION_WAIT_MS")
+        default_single_request_wait_ms = (
+            single_request_admission_wait_ms
+            if single_request_admission_wait_ms is not None
+            else 10.0
+        )
         self.single_request_admission_wait_s = max(
             0.0,
-            float(os.environ.get("TORCHINFERNO_OPENAI_SINGLE_ADMISSION_WAIT_MS", "10.0")) / 1000.0,
+            float(raw_single_request_wait_ms)
+            if raw_single_request_wait_ms is not None
+            else float(default_single_request_wait_ms),
         )
+        self.single_request_admission_wait_s /= 1000.0
         self.single_request_fast_path = True
         self._generation_queue: "queue.Queue[_QueuedGeneration | None]" = queue.Queue()
         self._model_lock = threading.Lock()
@@ -616,6 +628,7 @@ class OpenAICompletionEngine:
                     broadcast_tensor_parallel=False,
                 ):
                     pass
+            self._warmup_tensor_parallel_prefill_graphs(prompt_token_counts, vocab_size)
             warmup_cache_tokens = max(
                 max(prompt_token_counts) + new_tokens,
                 int(os.environ.get("TORCHINFERNO_OPENAI_WARMUP_CACHE_TOKENS", "256")),
@@ -623,6 +636,25 @@ class OpenAICompletionEngine:
             self._generation_cache(1, warmup_cache_tokens, model=self.model)
             _warmup_tensor_parallel_decode_attention(self.model)
         torch.cuda.synchronize(self.device)
+
+    def _warmup_tensor_parallel_prefill_graphs(
+        self,
+        prompt_token_counts: Sequence[int],
+        vocab_size: int,
+    ) -> None:
+        if os.environ.get("TORCHINFERNO_CUDAGRAPH_PREFILL", "1") == "0":
+            return
+        cache_token_counts = _warmup_prefill_cache_token_counts()
+        if not cache_token_counts:
+            return
+        for cache_tokens in cache_token_counts:
+            cache = self._generation_cache(1, cache_tokens, model=self.model)
+            for count in prompt_token_counts:
+                if count > cache_tokens:
+                    continue
+                input_ids = (torch.arange(count, device=self.device, dtype=torch.long) % vocab_size)[None, :]
+                _try_prefill_graph(self.model, input_ids, cache, 0.0)
+                _reset_generation_cache(cache)
 
     def _generate_prompt_token_list(self, prompt: list[int], *, max_tokens: int, temperature: float) -> list[int]:
         input_ids = torch.tensor([prompt], dtype=torch.long, device=self.device)
@@ -907,6 +939,10 @@ class OpenAICompletionEngine:
 class _OpenAIHandler(BaseHTTPRequestHandler):
     server_version = "TorchInfernoOpenAI/0.1"
 
+    def setup(self) -> None:
+        super().setup()
+        _enable_tcp_nodelay(self.connection)
+
     def do_GET(self) -> None:
         if self.path == "/health":
             self._send_json({"status": "ok"})
@@ -1033,10 +1069,19 @@ class _OpenAIHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _write_sse(self, payload: dict[str, object]) -> None:
-        self.wfile.write(b"data: ")
-        self.wfile.write(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
-        self.wfile.write(b"\n\n")
+        self.wfile.write(
+            b"data: "
+            + json.dumps(payload, separators=(",", ":")).encode("utf-8")
+            + b"\n\n"
+        )
         self.wfile.flush()
+
+
+def _enable_tcp_nodelay(connection: object) -> None:
+    try:
+        connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)  # type: ignore[attr-defined]
+    except OSError:
+        pass
 
 
 class _OpenAIServer(ThreadingHTTPServer):
@@ -1061,6 +1106,7 @@ def build_engine(config: OpenAIServerConfig) -> OpenAICompletionEngine:
         max_model_len=config.max_model_len,
         max_batch_size=config.max_batch_size,
         batch_wait_ms=config.batch_wait_ms,
+        single_request_admission_wait_ms=config.single_request_admission_wait_ms,
     )
 
 
@@ -1367,7 +1413,10 @@ def _generation_cache_capacity(model: object, requested_tokens: int) -> int:
 
 
 def _warmup_prompt_token_counts(default_prompt_tokens: int) -> tuple[int, ...]:
-    raw = os.environ.get("TORCHINFERNO_OPENAI_WARMUP_PROMPT_TOKEN_BUCKETS", f"{default_prompt_tokens},99,134,186,256")
+    default_buckets = (
+        f"{default_prompt_tokens},99,128,134,136,144,153,161,169,178,186,256"
+    )
+    raw = os.environ.get("TORCHINFERNO_OPENAI_WARMUP_PROMPT_TOKEN_BUCKETS", default_buckets)
     counts: list[int] = []
     for part in raw.split(","):
         stripped = part.strip()
@@ -1376,6 +1425,17 @@ def _warmup_prompt_token_counts(default_prompt_tokens: int) -> tuple[int, ...]:
         counts.append(max(1, int(stripped)))
     if not counts:
         counts.append(default_prompt_tokens)
+    return tuple(dict.fromkeys(counts))
+
+
+def _warmup_prefill_cache_token_counts() -> tuple[int, ...]:
+    raw = os.environ.get("TORCHINFERNO_OPENAI_WARMUP_PREFILL_CACHE_TOKENS", "256,512")
+    counts: list[int] = []
+    for part in raw.split(","):
+        stripped = part.strip()
+        if not stripped:
+            continue
+        counts.append(max(1, int(stripped)))
     return tuple(dict.fromkeys(counts))
 
 
@@ -1529,6 +1589,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-batch-size", type=int, default=32)
     parser.add_argument("--batch-wait-ms", type=float, default=10.0)
     parser.add_argument(
+        "--single-request-admission-wait-ms",
+        type=float,
+        default=None,
+        help=(
+            "Optional wait before a lone request takes the direct model path. "
+            "Lower values minimize TTFT; higher values preserve a short batching window."
+        ),
+    )
+    parser.add_argument(
         "--llama-parallelism",
         choices=["auto", "pipeline", "tensor"],
         default="auto",
@@ -1563,6 +1632,7 @@ def config_from_args(args: argparse.Namespace) -> OpenAIServerConfig:
         page_size=args.page_size,
         max_batch_size=args.max_batch_size,
         batch_wait_ms=args.batch_wait_ms,
+        single_request_admission_wait_ms=args.single_request_admission_wait_ms,
         llama_parallelism=args.llama_parallelism,
     )
 

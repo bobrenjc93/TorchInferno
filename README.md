@@ -296,6 +296,7 @@ TorchInferno can also run behind the OpenAI-compatible API expected by
 PYTHONPATH=src python3 -m torchinferno.openai_server \
   --model meta-llama/Meta-Llama-3.1-70B-Instruct \
   --tensor-parallel-size 8 \
+  --single-request-admission-wait-ms 0 \
   --port 8000 \
   --trust-remote-code
 ```
@@ -326,6 +327,7 @@ plain OpenAI server shape as the other providers:
 PYTHONPATH=src python3 -m torchinferno.openai_server \
   --model meta-llama/Meta-Llama-3.1-70B-Instruct \
   --tensor-parallel-size 8 \
+  --single-request-admission-wait-ms 0 \
   --port 8000 \
   --trust-remote-code
 ```

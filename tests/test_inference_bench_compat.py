@@ -16,9 +16,13 @@ from torchinferno.openai_server import (
     OpenAICompletionEngine,
     OpenAIServerConfig,
     _ByteFallbackTokenizer,
+    _OpenAIHandler,
     _TransformersChatTokenizer,
     _distributed_server_command,
+    _enable_tcp_nodelay,
     _should_reexec_distributed_server,
+    _warmup_prefill_cache_token_counts,
+    _warmup_prompt_token_counts,
 )
 
 
@@ -87,6 +91,26 @@ def test_openai_server_matches_inference_bench_contract() -> None:
             proc.wait(timeout=10)
 
 
+def test_openai_handler_writes_sse_frame_with_single_socket_write() -> None:
+    handler = object.__new__(_OpenAIHandler)
+    writer = _CountingWriter()
+    handler.wfile = writer
+
+    handler._write_sse({"choices": [{"delta": {"content": "7"}}]})
+
+    assert writer.write_calls == 1
+    assert writer.payload == b'data: {"choices":[{"delta":{"content":"7"}}]}\n\n'
+    assert writer.flush_calls == 1
+
+
+def test_openai_handler_enables_tcp_nodelay() -> None:
+    fake_socket = _FakeSocket()
+
+    _enable_tcp_nodelay(fake_socket)
+
+    assert fake_socket.options == [(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)]
+
+
 def test_inference_bench_provider_adapter_points_at_openai_server() -> None:
     provider_path = Path(__file__).resolve().parents[1] / "integrations" / "inference_bench" / "torchinferno.py"
     provider = provider_path.read_text()
@@ -94,6 +118,7 @@ def test_inference_bench_provider_adapter_points_at_openai_server() -> None:
     assert ".[serve]" in provider
     assert "torchinferno.openai_server" in provider
     assert "--tensor-parallel-size" in provider
+    assert "--single-request-admission-wait-ms" in provider
     assert "--llama-parallelism" not in provider
 
 
@@ -123,6 +148,16 @@ def test_openai_server_auto_launches_tensor_parallel_for_vanilla_provider(monkey
     assert "--standalone" in command
     assert command[command.index("--nproc-per-node") + 1] == "8"
     assert command[command.index("torchinferno.openai_server") - 1] == "-m"
+
+
+def test_openai_server_warmup_covers_long_output_prefill_shapes(monkeypatch) -> None:
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_WARMUP_PROMPT_TOKEN_BUCKETS", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_WARMUP_PREFILL_CACHE_TOKENS", raising=False)
+
+    prompt_counts = set(_warmup_prompt_token_counts(32))
+
+    assert {128, 136, 144, 153, 161, 169, 178, 186}.issubset(prompt_counts)
+    assert set(_warmup_prefill_cache_token_counts()) >= {256, 512}
 
 
 def test_openai_server_pipeline_parallelism_skips_auto_launch(monkeypatch) -> None:
@@ -448,6 +483,29 @@ class _NoBatchStepEngine(OpenAICompletionEngine):
     def _generate_batch_steps(self, *args, **kwargs):
         self.batch_step_calls += 1
         raise AssertionError("single-request fast path must not use batched step generation")
+
+
+class _CountingWriter:
+    def __init__(self) -> None:
+        self.payload = b""
+        self.write_calls = 0
+        self.flush_calls = 0
+
+    def write(self, payload: bytes) -> int:
+        self.write_calls += 1
+        self.payload += payload
+        return len(payload)
+
+    def flush(self) -> None:
+        self.flush_calls += 1
+
+
+class _FakeSocket:
+    def __init__(self) -> None:
+        self.options: list[tuple[int, int, int]] = []
+
+    def setsockopt(self, level: int, option: int, value: int) -> None:
+        self.options.append((level, option, value))
 
 
 def _free_port() -> int:

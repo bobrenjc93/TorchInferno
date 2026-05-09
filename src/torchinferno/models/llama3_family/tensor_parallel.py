@@ -1302,7 +1302,7 @@ class Llama3TensorParallelForCausalLM:
             or captured.static_input_ids.shape != input_ids.shape
         ):
             captured = self._capture_prefill_graph(input_ids, cache)
-            max_graphs = max(1, int(os.environ.get("TORCHINFERNO_CUDAGRAPH_PREFILL_MAX_GRAPHS", "8")))
+            max_graphs = max(1, int(os.environ.get("TORCHINFERNO_CUDAGRAPH_PREFILL_MAX_GRAPHS", "32")))
             if key not in self._prefill_graphs and len(self._prefill_graphs) >= max_graphs:
                 self._prefill_graphs.clear()
             self._prefill_graphs[key] = captured

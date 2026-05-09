@@ -23,6 +23,8 @@ class TorchInfernoProvider(Provider):
             model,
             "--tensor-parallel-size",
             str(tp),
+            "--single-request-admission-wait-ms",
+            "0",
             "--port",
             str(port),
             "--trust-remote-code",
