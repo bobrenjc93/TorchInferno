@@ -112,7 +112,7 @@ def build_audit_report() -> TorchInfernoAudit:
             FeatureAudit(
                 "OpenAI serving API",
                 "bridge",
-                "openai-server exposes /v1/models, batched streaming /v1/chat/completions, and explicit torchrun Llama TP worker mode.",
+                "openai-server exposes /v1/models, batched streaming /v1/chat/completions, and auto-launched Llama TP worker mode.",
             ),
             FeatureAudit("disaggregated prefill/decode", "simulated", "Planner models rank assignment and network latency."),
             FeatureAudit("NVFP4 graph passes", "reference", "NVFP4 tensor contract and pass hook exist; production fused kernel remains open."),

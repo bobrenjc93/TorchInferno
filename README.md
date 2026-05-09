@@ -316,21 +316,22 @@ The server implements `GET /v1/models` and streaming
 benchmarks. The drop-in provider adapter lives in
 `integrations/inference_bench/torchinferno.py`.
 
-By default the Llama server uses pipeline layer placement across the selected
-devices, and the inference-bench adapter keeps that same single-process serving
-shape for `tensor_parallel_size > 1`. This is the current low-latency baseline
-for single-request inference-bench runs. The tensor-parallel server remains
-available for experiments, but should be benchmarked separately until its
-decode path catches up. The manual tensor-parallel launch is:
+For Llama models, the server follows vLLM/sglang-style launch behavior:
+`--tensor-parallel-size > 1` auto-launches tensor-parallel worker processes
+with `torch.distributed.run` when the command was not already started under a
+distributed launcher. The inference-bench adapter can therefore use the same
+plain OpenAI server shape as the other providers:
 
 ```bash
-PYTHONPATH=src torchrun --standalone --nproc-per-node 8 \
-  -m torchinferno.openai_server \
+PYTHONPATH=src python3 -m torchinferno.openai_server \
   --model meta-llama/Meta-Llama-3.1-70B-Instruct \
-  --llama-parallelism tensor \
+  --tensor-parallel-size 8 \
   --port 8000 \
   --trust-remote-code
 ```
+
+Use `--llama-parallelism pipeline` only when you explicitly want the older
+single-process layer-placement server.
 
 For a tighter iteration loop on the serving path, run the OpenAI engine
 microbenchmark. The synthetic backend isolates Python dispatch, streaming

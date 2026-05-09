@@ -5,6 +5,7 @@ import inspect
 import json
 import os
 import queue
+import sys
 import threading
 import time
 import uuid
@@ -943,6 +944,12 @@ def _load_model(config: OpenAIServerConfig) -> tuple[object, torch.device]:
         return model.to(device=device, dtype=dtype or torch.float32).eval(), device
     if kind == "llama3":
         if _llama_parallelism(config) == "tensor":
+            if config.tensor_parallel_size > 1 and not _distributed_env_requested():
+                raise RuntimeError(
+                    "Llama tensor parallel serving requires a distributed launch. "
+                    "Use torchrun, or start torchinferno.openai_server normally with "
+                    "--tensor-parallel-size > 1 so it can auto-launch workers."
+                )
             model = Llama3TensorParallelForCausalLM.from_pretrained(
                 config.model,
                 dtype=config.dtype,
@@ -1022,11 +1029,49 @@ def _llama_parallelism(config: OpenAIServerConfig) -> str:
         return "tensor"
     if mode != "auto":
         raise ValueError(f"unsupported llama parallelism: {config.llama_parallelism}")
-    return "tensor" if _distributed_env_requested() else "pipeline"
+    if _distributed_env_requested() or config.tensor_parallel_size > 1:
+        return "tensor"
+    return "pipeline"
 
 
 def _distributed_env_requested() -> bool:
     return "RANK" in os.environ and "WORLD_SIZE" in os.environ
+
+
+def _should_reexec_distributed_server(config: OpenAIServerConfig) -> bool:
+    if os.environ.get("TORCHINFERNO_OPENAI_AUTO_TORCHRUN", "1") == "0":
+        return False
+    if _distributed_env_requested():
+        return False
+    if config.tensor_parallel_size <= 1:
+        return False
+    if _infer_model_kind(config) != "llama3":
+        return False
+    return config.llama_parallelism.lower() != "pipeline"
+
+
+def _distributed_server_command(config: OpenAIServerConfig, argv: Sequence[str]) -> list[str]:
+    return [
+        sys.executable,
+        "-m",
+        "torch.distributed.run",
+        "--standalone",
+        "--nproc-per-node",
+        str(config.tensor_parallel_size),
+        "-m",
+        "torchinferno.openai_server",
+        *argv,
+    ]
+
+
+def _reexec_distributed_server(config: OpenAIServerConfig, argv: Sequence[str]) -> None:
+    command = _distributed_server_command(config, argv)
+    print(
+        "TorchInferno OpenAI server auto-launching tensor-parallel workers: "
+        + " ".join(command),
+        flush=True,
+    )
+    os.execvpe(command[0], command, os.environ.copy())
 
 
 def _resolve_dtype(dtype: str) -> torch.dtype | None:
@@ -1333,7 +1378,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--llama-parallelism",
         choices=["auto", "pipeline", "tensor"],
         default="auto",
-        help="Use pipeline placement by default, or tensor parallel when launched with torchrun.",
+        help=(
+            "Use tensor parallel for --tensor-parallel-size > 1, auto-launching "
+            "workers when needed; use pipeline to force single-process placement."
+        ),
     )
     return parser
 
@@ -1368,7 +1416,11 @@ def config_from_args(args: argparse.Namespace) -> OpenAIServerConfig:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    serve(config_from_args(args))
+    config = config_from_args(args)
+    original_argv = tuple(sys.argv[1:] if argv is None else argv)
+    if _should_reexec_distributed_server(config):
+        _reexec_distributed_server(config, original_argv)
+    serve(config)
     return 0
 
 

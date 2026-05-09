@@ -14,8 +14,11 @@ import torch
 
 from torchinferno.openai_server import (
     OpenAICompletionEngine,
+    OpenAIServerConfig,
     _ByteFallbackTokenizer,
     _TransformersChatTokenizer,
+    _distributed_server_command,
+    _should_reexec_distributed_server,
 )
 
 
@@ -92,6 +95,46 @@ def test_inference_bench_provider_adapter_points_at_openai_server() -> None:
     assert "torchinferno.openai_server" in provider
     assert "--tensor-parallel-size" in provider
     assert "--llama-parallelism" not in provider
+
+
+def test_openai_server_auto_launches_tensor_parallel_for_vanilla_provider(monkeypatch) -> None:
+    monkeypatch.delenv("RANK", raising=False)
+    monkeypatch.delenv("WORLD_SIZE", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_AUTO_TORCHRUN", raising=False)
+    config = OpenAIServerConfig(
+        model="meta-llama/Meta-Llama-3.1-70B-Instruct",
+        tensor_parallel_size=8,
+    )
+
+    assert _should_reexec_distributed_server(config)
+    command = _distributed_server_command(
+        config,
+        (
+            "--model",
+            config.model,
+            "--tensor-parallel-size",
+            "8",
+            "--port",
+            "8000",
+        ),
+    )
+
+    assert command[:3] == [sys.executable, "-m", "torch.distributed.run"]
+    assert "--standalone" in command
+    assert command[command.index("--nproc-per-node") + 1] == "8"
+    assert command[command.index("torchinferno.openai_server") - 1] == "-m"
+
+
+def test_openai_server_pipeline_parallelism_skips_auto_launch(monkeypatch) -> None:
+    monkeypatch.delenv("RANK", raising=False)
+    monkeypatch.delenv("WORLD_SIZE", raising=False)
+    config = OpenAIServerConfig(
+        model="meta-llama/Meta-Llama-3.1-70B-Instruct",
+        tensor_parallel_size=8,
+        llama_parallelism="pipeline",
+    )
+
+    assert not _should_reexec_distributed_server(config)
 
 
 def test_chat_template_batch_encoding_input_ids_are_extracted() -> None:

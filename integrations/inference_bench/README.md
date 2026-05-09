@@ -21,16 +21,14 @@ providers:
   - torchinferno
 ```
 
-For `tensor_parallel_size > 1`, the provider starts TorchInferno with
-`python -m torch.distributed.run` so inference-bench exercises the tensor
-parallel server path instead of the pipeline fallback:
+For `tensor_parallel_size > 1`, TorchInferno auto-launches tensor-parallel
+worker processes from the plain OpenAI server command, matching the way the
+vLLM and sglang providers expose tensor parallelism:
 
 ```bash
-python -m torch.distributed.run --standalone --nproc-per-node 8 \
-  -m torchinferno.openai_server \
+python -m torchinferno.openai_server \
   --model meta-llama/Meta-Llama-3.1-70B-Instruct \
   --tensor-parallel-size 8 \
-  --llama-parallelism tensor \
   --port 8000 \
   --trust-remote-code
 ```
