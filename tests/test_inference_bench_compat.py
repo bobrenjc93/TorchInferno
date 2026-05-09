@@ -23,6 +23,8 @@ from torchinferno.openai_server import (
     _should_reexec_distributed_server,
     _warmup_prefill_cache_token_counts,
     _warmup_prompt_token_counts,
+    _warmup_temperature_batch_sizes,
+    _warmup_temperature_prompt_token_counts,
 )
 
 
@@ -153,11 +155,16 @@ def test_openai_server_auto_launches_tensor_parallel_for_vanilla_provider(monkey
 def test_openai_server_warmup_covers_long_output_prefill_shapes(monkeypatch) -> None:
     monkeypatch.delenv("TORCHINFERNO_OPENAI_WARMUP_PROMPT_TOKEN_BUCKETS", raising=False)
     monkeypatch.delenv("TORCHINFERNO_OPENAI_WARMUP_PREFILL_CACHE_TOKENS", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_WARMUP_TEMPERATURE_BATCH_SIZES", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_WARMUP_TEMPERATURE_PROMPT_TOKEN_BUCKETS", raising=False)
 
     prompt_counts = set(_warmup_prompt_token_counts(32))
 
     assert {128, 136, 144, 153, 161, 169, 178, 186}.issubset(prompt_counts)
+    assert 55 in prompt_counts
     assert set(_warmup_prefill_cache_token_counts()) >= {256, 512}
+    assert 55 in set(_warmup_temperature_prompt_token_counts())
+    assert 8 in set(_warmup_temperature_batch_sizes())
 
 
 def test_openai_server_pipeline_parallelism_skips_auto_launch(monkeypatch) -> None:
@@ -299,6 +306,57 @@ def test_openai_engine_batches_request_arriving_during_single_admission_wait(mon
                 [{"role": "user", "content": "same"}],
                 max_tokens=2,
                 temperature=0.0,
+            )
+        )
+
+    second = threading.Thread(target=run_second)
+    first = threading.Thread(target=run_first)
+    second.start()
+    assert second_waiting.wait(timeout=5)
+    first.start()
+    for thread in (first, second):
+        thread.join(timeout=10)
+    engine.close()
+
+    assert results == [[2, 2], [2, 2]]
+    assert model.calls[0][0] == 2
+    assert model.calls[0][2] == "torchinferno-openai-batcher"
+
+
+def test_openai_engine_temperature_request_keeps_short_batch_window(monkeypatch) -> None:
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_SINGLE_ADMISSION_WAIT_MS", raising=False)
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TEMPERATURE_ADMISSION_WAIT_MS", "50")
+    model = _BatchRecordingModel()
+    tokenizer = _FirstEncodeEventTokenizer(vocab_size=8)
+    engine = OpenAICompletionEngine(
+        model,
+        tokenizer,
+        model_id="tiny",
+        device=torch.device("cpu"),
+        max_batch_size=4,
+        batch_wait_ms=50.0,
+        single_request_admission_wait_ms=0.0,
+    )
+    results: list[list[int] | None] = [None, None]
+    second_waiting = threading.Event()
+
+    def run_first() -> None:
+        results[0] = list(
+            engine.generate_chat_tokens(
+                [{"role": "user", "content": "same"}],
+                max_tokens=2,
+                temperature=1e-6,
+            )
+        )
+
+    def run_second() -> None:
+        second_waiting.set()
+        assert tokenizer.first_encoded.wait(timeout=5)
+        results[1] = list(
+            engine.generate_chat_tokens(
+                [{"role": "user", "content": "same"}],
+                max_tokens=2,
+                temperature=1e-6,
             )
         )
 
