@@ -14,9 +14,12 @@ import torch
 from torchinferno.audit import build_audit_report
 from torchinferno.benchmarks import (
     LLAMA3_70B_MODEL,
+    OpenAIServerMicrobenchConfig,
     TorchInfernoLlamaBenchmarkConfig,
     VLLMBenchmarkConfig,
+    format_openai_server_microbench_report,
     plot_vllm_benchmark_results,
+    run_openai_server_microbench,
     run_torchinferno_llama_benchmark_suite,
     run_vllm_benchmark_suite,
 )
@@ -269,6 +272,44 @@ def run_llama_bench_suite(args: argparse.Namespace) -> int:
     print(f"summary={artifacts.summary_path}")
     if artifacts.plot_path is not None:
         print(f"plot={artifacts.plot_path}")
+    return 0
+
+
+def run_openai_server_microbench_cli(args: argparse.Namespace) -> int:
+    config = OpenAIServerMicrobenchConfig(
+        model=args.model,
+        model_kind=args.model_kind,
+        tokenizer=args.tokenizer,
+        host=args.host,
+        port=args.port,
+        base_url=args.base_url,
+        python=args.python,
+        device=args.device,
+        dtype=args.dtype,
+        max_model_len=args.max_model_len,
+        tensor_parallel_size=args.tensor_parallel_size,
+        cache_backend=args.cache_backend,
+        page_size=args.page_size,
+        max_batch_size=args.max_batch_size,
+        batch_wait_ms=args.batch_wait_ms,
+        llama_parallelism=args.llama_parallelism,
+        trust_remote_code=args.trust_remote_code,
+        token=args.token,
+        revision=args.revision,
+        cache_dir=args.cache_dir,
+        modes=(args.mode,),
+        prompt_tokens=args.prompt_tokens,
+        max_tokens=args.max_tokens,
+        concurrency=args.concurrency,
+        warmup=args.warmup,
+        iters=args.iters,
+        temperature=args.temperature,
+        ready_timeout_s=args.ready_timeout_s,
+        request_timeout_s=args.request_timeout_s,
+        json_output=Path(args.json_output) if args.json_output else None,
+    )
+    result = run_openai_server_microbench(config)
+    print(format_openai_server_microbench_report(result))
     return 0
 
 
@@ -1636,6 +1677,46 @@ def build_parser() -> argparse.ArgumentParser:
     openai_microbench.add_argument("--profile-breakdown", action="store_true")
     openai_microbench.add_argument("--json-output", default=None)
     openai_microbench.set_defaults(func=run_openai_microbench)
+
+    openai_server_microbench = subparsers.add_parser(
+        "openai-server-microbench",
+        help="Launch or target the OpenAI-compatible server and benchmark chat completions over HTTP.",
+    )
+    openai_server_microbench.add_argument("--base-url", default=None, help="Existing /v1 base URL; when omitted a local server is launched.")
+    openai_server_microbench.add_argument("--python", default=sys.executable, help="Python executable used to launch the local server.")
+    openai_server_microbench.add_argument("--model", default="tiny")
+    openai_server_microbench.add_argument("--model-kind", default="tiny-deepseek")
+    openai_server_microbench.add_argument("--tokenizer", default="byte")
+    openai_server_microbench.add_argument("--host", default="127.0.0.1")
+    openai_server_microbench.add_argument("--port", type=int, default=0, help="Local server port; 0 chooses a free port.")
+    openai_server_microbench.add_argument("--device", default="cpu")
+    openai_server_microbench.add_argument(
+        "--dtype",
+        default="float32",
+        choices=["auto", "float32", "float16", "bfloat16", "fp32", "fp16", "bf16"],
+    )
+    openai_server_microbench.add_argument("--max-model-len", type=int, default=64)
+    openai_server_microbench.add_argument("--tensor-parallel-size", type=int, default=1)
+    openai_server_microbench.add_argument("--cache-backend", choices=["dense", "paged"], default="dense")
+    openai_server_microbench.add_argument("--page-size", type=int, default=16)
+    openai_server_microbench.add_argument("--max-batch-size", type=int, default=32)
+    openai_server_microbench.add_argument("--batch-wait-ms", type=float, default=2.0)
+    openai_server_microbench.add_argument("--llama-parallelism", choices=["auto", "pipeline", "tensor"], default="auto")
+    openai_server_microbench.add_argument("--trust-remote-code", action="store_true")
+    openai_server_microbench.add_argument("--token", default=None)
+    openai_server_microbench.add_argument("--revision", default=None)
+    openai_server_microbench.add_argument("--cache-dir", default=None)
+    openai_server_microbench.add_argument("--mode", choices=["non-stream", "stream", "both"], default="both")
+    openai_server_microbench.add_argument("--prompt-tokens", type=int, default=8)
+    openai_server_microbench.add_argument("--max-tokens", type=int, default=2)
+    openai_server_microbench.add_argument("--concurrency", type=int, default=1)
+    openai_server_microbench.add_argument("--warmup", type=int, default=1)
+    openai_server_microbench.add_argument("--iters", type=int, default=3)
+    openai_server_microbench.add_argument("--temperature", type=float, default=0.0)
+    openai_server_microbench.add_argument("--ready-timeout-s", type=float, default=30.0)
+    openai_server_microbench.add_argument("--request-timeout-s", type=float, default=30.0)
+    openai_server_microbench.add_argument("--json-output", default=None)
+    openai_server_microbench.set_defaults(func=run_openai_server_microbench_cli)
 
     smoke = subparsers.add_parser("dsv4-smoke", help="Run a DSv4 end-to-end generation smoke test.")
     smoke.add_argument("--device", default=None, help="Torch device, defaults to cuda when available.")

@@ -1,4 +1,4 @@
-.PHONY: audit variants smoke test serve perf profile profile-timeslice profile-offload profile-nodes profile-subgraph profile-region profile-pattern vllm-bench-plan disagg
+.PHONY: audit variants smoke test serve openai-server-bench perf profile profile-timeslice profile-offload profile-nodes profile-subgraph profile-region profile-pattern vllm-bench-plan disagg
 
 PYTHON ?= python3
 TI_PYTHONPATH ?= src
@@ -30,6 +30,9 @@ smoke:
 
 serve:
 	PYTHONPATH=$(TI_PYTHONPATH) $(PYTHON) -m torchinferno.cli serve-smoke --device cpu --cache-backend paged --page-size 2 --new-tokens 2
+
+openai-server-bench:
+	PYTHONPATH=$(TI_PYTHONPATH) $(PYTHON) -m torchinferno.cli openai-server-microbench --device cpu --warmup 0 --iters 1 --prompt-tokens 3 --max-tokens 2
 
 perf:
 	PYTHONPATH=$(TI_PYTHONPATH) $(PYTHON) -m torchinferno.cli perf-smoke --device cpu --heads 2 --seq-len 8 --head-dim 8 --value-dim 8

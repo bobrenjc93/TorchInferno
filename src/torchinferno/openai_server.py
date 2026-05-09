@@ -1211,7 +1211,7 @@ def _generation_cache_capacity(model: object, requested_tokens: int) -> int:
 
 
 def _warmup_prompt_token_counts(default_prompt_tokens: int) -> tuple[int, ...]:
-    raw = os.environ.get("TORCHINFERNO_OPENAI_WARMUP_PROMPT_TOKEN_BUCKETS", f"{default_prompt_tokens},99")
+    raw = os.environ.get("TORCHINFERNO_OPENAI_WARMUP_PROMPT_TOKEN_BUCKETS", f"{default_prompt_tokens},99,134,186,256")
     counts: list[int] = []
     for part in raw.split(","):
         stripped = part.strip()

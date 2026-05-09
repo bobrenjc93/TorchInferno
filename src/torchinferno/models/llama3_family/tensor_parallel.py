@@ -27,8 +27,8 @@ from torchinferno.models.llama3_family.v0 import sample_next_token
 _COMPILED_ROTATE_LLAMA = None
 _COMPILED_ROTATE_LLAMA_CHECKED = False
 _COMPILED_ROTATE_LLAMA_FAILED = False
-_SYMM_REDUCE_BUFFERS: dict[tuple[str, int, str, tuple[int, ...]], Tensor] = {}
-_SYMM_REDUCE_PROBED: set[tuple[str, int, str, tuple[int, ...]]] = set()
+_SYMM_REDUCE_BUFFERS: dict[tuple[str, int, str, str, tuple[int, ...]], Tensor] = {}
+_SYMM_REDUCE_PROBED: set[tuple[str, int, str, str, tuple[int, ...]]] = set()
 _SYMM_REDUCE_DISABLED = False
 
 
@@ -464,6 +464,7 @@ class _Llama3TensorParallelLayer:
                 output = self._prefill_gate_up_activation_eager(static_input)
             captured = _StaticPrefillActivationGraphCall(graph=graph, static_input=static_input, output=output)
             self._prefill_gate_up_activation_graphs[key] = captured
+            captured.graph.replay()
             return captured.output
         captured.static_input.copy_(hidden)
         captured.graph.replay()
@@ -511,12 +512,11 @@ class _Llama3TensorParallelLayer:
             return None
 
     def _symm_reduce_buffer(self, name: str, hidden: Tensor, expected_shape: tuple[int, ...]) -> tuple[Tensor, str]:
-        del name
         if not dist.is_available() or not dist.is_initialized():
             raise RuntimeError("symmetric-memory allreduce requires an initialized process group")
         group_name = dist.group.WORLD.group_name
         device_index = hidden.device.index if hidden.device.index is not None else torch.cuda.current_device()
-        key = (group_name, device_index, str(hidden.dtype), expected_shape)
+        key = (group_name, device_index, name, str(hidden.dtype), expected_shape)
         buffer = _SYMM_REDUCE_BUFFERS.get(key)
         if buffer is None:
             import torch.distributed._symmetric_memory as symm_mem
@@ -530,7 +530,7 @@ class _Llama3TensorParallelLayer:
 
     def _probe_symm_reduce_buffer(
         self,
-        key: tuple[str, int, str, tuple[int, ...]],
+        key: tuple[str, int, str, str, tuple[int, ...]],
         buffer: Tensor,
         group_name: str,
     ) -> None:
@@ -588,6 +588,7 @@ class _Llama3TensorParallelLayer:
                 output = self._mlp_project_eager(static_input)
             captured = _StaticCudaGraphCall(graph=graph, static_input=static_input, output=output)
             self._mlp_project_graph = captured
+            captured.graph.replay()
             return captured.output
         captured.static_input.copy_(hidden)
         captured.graph.replay()
@@ -631,6 +632,7 @@ class _Llama3TensorParallelLayer:
                 _all_reduce(output)
             captured = _StaticCudaGraphCall(graph=graph, static_input=static_input, output=output)
             self._post_mlp_project_graph = captured
+            captured.graph.replay()
             return captured.output
         captured.static_input.copy_(hidden)
         captured.graph.replay()
@@ -655,6 +657,7 @@ class _Llama3TensorParallelLayer:
                 output = self._post_mlp_project_eager(static_input)
             captured = _StaticCudaGraphCall(graph=graph, static_input=static_input, output=output)
             self._post_mlp_project_graph = captured
+            captured.graph.replay()
             return captured.output
         captured.static_input.copy_(hidden)
         captured.graph.replay()
@@ -683,6 +686,7 @@ class _Llama3TensorParallelLayer:
                 output = _decode_linear(static_input, self.o_proj_weight)
             captured = _StaticCudaGraphCall(graph=graph, static_input=static_input, output=output)
             self._attention_o_graph = captured
+            captured.graph.replay()
             return captured.output
         captured.static_input.copy_(hidden)
         captured.graph.replay()
@@ -718,6 +722,7 @@ class _Llama3TensorParallelLayer:
                 _all_reduce(output)
             captured = _StaticCudaGraphCall(graph=graph, static_input=static_input, output=output)
             self._attention_o_graph = captured
+            captured.graph.replay()
             return captured.output
         captured.static_input.copy_(hidden)
         captured.graph.replay()
@@ -812,6 +817,7 @@ class _Llama3TensorParallelLayer:
                 v=v,
             )
             self._qkv_rotary_graphs[key] = captured
+            captured.graph.replay()
             return captured.q, captured.k, captured.v
         captured.static_input.copy_(hidden)
         captured.static_cos.copy_(cos)
@@ -881,6 +887,7 @@ class _Llama3TensorParallelLayer:
                 v=v,
             )
             self._input_qkv_rotary_graphs[key] = captured
+            captured.graph.replay()
             return captured.q, captured.k, captured.v
         captured.static_input.copy_(hidden)
         captured.static_cos.copy_(cos)
@@ -1302,6 +1309,7 @@ class Llama3TensorParallelForCausalLM:
         with torch.cuda.graph(captured.graph):
             logits = self._forward_prefill_static(captured.static_input_ids, cache)
             captured.output_token = self._sample_next_token(logits[:, -1, :], 0.0)
+        captured.graph.replay()
         self._set_cache_seq_len(cache, input_ids.size(1))
         self._prefill_graph = captured
         return captured
@@ -1400,6 +1408,7 @@ class Llama3TensorParallelForCausalLM:
                 attention_block_size,
             )
             captured.output_token = self._sample_next_token(logits[:, -1, :], 0.0)
+        captured.graph.replay()
         self._decode_graph = captured
         self._decode_graphs[attention_block_size] = captured
         return captured
@@ -1730,7 +1739,7 @@ def _should_use_mlp_project_graph(hidden: Tensor) -> bool:
 
 
 def _should_use_qkv_rotary_graph(hidden: Tensor) -> bool:
-    prefill_tokens = hidden.size(1) > 1 and os.environ.get("TORCHINFERNO_CUDAGRAPH_PREFILL_QKV_ROTARY", "1") != "0"
+    prefill_tokens = hidden.size(1) > 1 and os.environ.get("TORCHINFERNO_CUDAGRAPH_PREFILL_QKV_ROTARY", "0") != "0"
     return (
         hidden.is_cuda
         and hidden.ndim == 3
@@ -1823,7 +1832,7 @@ def _should_use_symm_mem_prefill_all_reduce(hidden: Tensor, weight: Tensor, worl
     return (
         world_size > 1
         and not _SYMM_REDUCE_DISABLED
-        and os.environ.get("TORCHINFERNO_SYMM_MEM_PREFILL_ALLREDUCE", "1") != "0"
+        and os.environ.get("TORCHINFERNO_SYMM_MEM_PREFILL_ALLREDUCE", "0") != "0"
         and hidden.is_cuda
         and weight.is_cuda
         and hidden.ndim == 3

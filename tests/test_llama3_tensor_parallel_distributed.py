@@ -1,0 +1,128 @@
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+import textwrap
+from pathlib import Path
+
+import pytest
+import torch
+from safetensors.torch import save_file
+
+from torchinferno.models.llama3_family import Llama3V0ForCausalLM, tiny_llama3_config
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires at least two CUDA devices")
+def test_llama3_tensor_parallel_matches_reference_under_torchrun(tmp_path) -> None:
+    torch.manual_seed(9001)
+    config = tiny_llama3_config(vocab_size=32, max_position_embeddings=16)
+    reference = Llama3V0ForCausalLM(config).eval()
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    _write_hf_checkpoint(reference, config, checkpoint)
+
+    input_ids = torch.tensor([[1, 2, 3, 4]], dtype=torch.long)
+    with torch.inference_mode():
+        expected_logits = reference(input_ids)
+        expected_generated = reference.generate(input_ids, max_new_tokens=2)
+    torch.save(input_ids, tmp_path / "input_ids.pt")
+    torch.save(expected_logits, tmp_path / "expected_logits.pt")
+    torch.save(expected_generated, tmp_path / "expected_generated.pt")
+
+    script = tmp_path / "check_tp.py"
+    script.write_text(
+        textwrap.dedent(
+            """
+            from __future__ import annotations
+
+            import sys
+
+            import torch
+            import torch.distributed as dist
+
+            from torchinferno.models.llama3_family import Llama3TensorParallelForCausalLM
+
+
+            checkpoint, artifact_dir = sys.argv[1], sys.argv[2]
+            model = Llama3TensorParallelForCausalLM.from_pretrained(checkpoint, dtype="float32").eval()
+            input_ids = torch.load(f"{artifact_dir}/input_ids.pt", weights_only=True).to(model.device)
+            expected_logits = torch.load(f"{artifact_dir}/expected_logits.pt", weights_only=True)
+            expected_generated = torch.load(f"{artifact_dir}/expected_generated.pt", weights_only=True)
+
+            with torch.inference_mode():
+                logits, _ = model.forward(input_ids, use_cache=False)
+                generated = model.generate(input_ids, max_new_tokens=2)
+
+            torch.testing.assert_close(logits.cpu(), expected_logits, atol=2e-5, rtol=2e-5)
+            if not torch.equal(generated.cpu(), expected_generated):
+                raise AssertionError(f"generated={generated.cpu().tolist()} expected={expected_generated.tolist()}")
+
+            if dist.is_available() and dist.is_initialized():
+                dist.barrier()
+                dist.destroy_process_group()
+            """
+        )
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "torch.distributed.run",
+            "--standalone",
+            "--nproc-per-node",
+            "2",
+            str(script),
+            str(checkpoint),
+            str(tmp_path),
+        ],
+        cwd=tmp_path,
+        env={**os.environ, "PYTHONPATH": str(_repo_root() / "src")},
+        text=True,
+        capture_output=True,
+        timeout=120,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def _write_hf_checkpoint(reference: Llama3V0ForCausalLM, config, checkpoint) -> None:
+    state = reference.state_dict()
+    hf_state = {
+        "model.embed_tokens.weight": state["embed_tokens.weight"],
+        "model.norm.weight": state["norm.weight"],
+        "lm_head.weight": state["lm_head.weight"],
+    }
+    for layer_id in range(config.num_hidden_layers):
+        prefix = f"layers.{layer_id}."
+        hf_prefix = f"model.layers.{layer_id}."
+        for suffix in (
+            "input_layernorm.weight",
+            "post_attention_layernorm.weight",
+            "self_attn.q_proj.weight",
+            "self_attn.k_proj.weight",
+            "self_attn.v_proj.weight",
+            "self_attn.o_proj.weight",
+            "mlp.gate_proj.weight",
+            "mlp.up_proj.weight",
+            "mlp.down_proj.weight",
+        ):
+            hf_state[hf_prefix + suffix] = state[prefix + suffix]
+
+    save_file(hf_state, checkpoint / "model-00001-of-00001.safetensors")
+    (checkpoint / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "metadata": {"total_size": sum(tensor.numel() * tensor.element_size() for tensor in hf_state.values())},
+                "weight_map": {name: "model-00001-of-00001.safetensors" for name in hf_state},
+            }
+        )
+        + "\n"
+    )
+    (checkpoint / "config.json").write_text(json.dumps(config.to_dict()) + "\n")
+
+
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[1]
