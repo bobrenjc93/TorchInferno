@@ -316,11 +316,12 @@ The server implements `GET /v1/models` and streaming
 benchmarks. The drop-in provider adapter lives in
 `integrations/inference_bench/torchinferno.py`.
 
-By default the direct Llama server uses pipeline layer placement across the
-selected devices. For inference-bench parity runs with multi-GPU
-`tensor_parallel_size`, use the adapter in
-`integrations/inference_bench/torchinferno.py`; it launches the tensor-parallel
-server through `torch.distributed.run`. The manual equivalent is:
+By default the Llama server uses pipeline layer placement across the selected
+devices, and the inference-bench adapter keeps that same single-process serving
+shape for `tensor_parallel_size > 1`. This is the current low-latency baseline
+for single-request inference-bench runs. The tensor-parallel server remains
+available for experiments, but should be benchmarked separately until its
+decode path catches up. The manual tensor-parallel launch is:
 
 ```bash
 PYTHONPATH=src torchrun --standalone --nproc-per-node 8 \

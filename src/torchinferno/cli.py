@@ -426,7 +426,13 @@ class _OpenAIMicrobenchModel:
 
 
 def run_openai_microbench(args: argparse.Namespace) -> int:
+    if args.phase_timings:
+        os.environ["TORCHINFERNO_OPENAI_PHASE_TIMINGS"] = "1"
+    if args.profile_breakdown:
+        os.environ["TORCHINFERNO_PROFILE_FAST_PREFILL"] = "1"
     engine = _build_openai_microbench_engine(args)
+    if args.profile_breakdown and hasattr(engine.model, "enable_profile"):
+        engine.model.enable_profile()
     if _is_tensor_parallel_worker_model(engine.model):
         _tensor_parallel_worker_loop(engine)
         return 0
@@ -473,6 +479,8 @@ def run_openai_microbench(args: argparse.Namespace) -> int:
                 prompt_tokens=args.prompt_tokens,
                 max_tokens=args.max_tokens,
                 temperature=args.temperature,
+                phase_timings=args.phase_timings,
+                profile_breakdown=args.profile_breakdown,
             )
             results["cases"][label] = case
             print(
@@ -481,9 +489,29 @@ def run_openai_microbench(args: argparse.Namespace) -> int:
                 f"e2e_p50_ms={case['e2e_p50_ms']:.3f} throughput_p50_tps={case['throughput_p50_tps']:.2f} "
                 f"max_model_batch={case.get('max_model_batch', 0)}"
             )
+            phase_summary = case.get("phase_timings_ms")
+            if isinstance(phase_summary, dict):
+                print(
+                    "  phase "
+                    f"request_to_first_forward_p50_ms={phase_summary.get('request_to_first_forward_p50_ms', 0.0):.3f} "
+                    f"broadcast_p50_ms={phase_summary.get('broadcast_p50_ms', 0.0):.3f} "
+                    f"cache_p50_ms={phase_summary.get('cache_p50_ms', 0.0):.3f} "
+                    f"prefill_forward_p50_ms={phase_summary.get('prefill_forward_p50_ms', 0.0):.3f} "
+                    f"sample_p50_ms={phase_summary.get('sample_p50_ms', 0.0):.3f} "
+                    f"first_token_sync_p50_ms={phase_summary.get('first_token_sync_p50_ms', 0.0):.3f}"
+                )
         if args.json_output:
+            if args.profile_breakdown and hasattr(engine.model, "profile_summary"):
+                results["profile_summary"] = engine.model.profile_summary()
             Path(args.json_output).write_text(json.dumps(results, indent=2, sort_keys=True) + "\n")
             print(f"json_output={args.json_output}")
+        if args.profile_breakdown and hasattr(engine.model, "profile_summary"):
+            profile = engine.model.profile_summary()
+            seconds = profile.get("seconds", {})
+            if isinstance(seconds, dict):
+                top = sorted(((float(value), str(key)) for key, value in seconds.items()), reverse=True)[:8]
+                for value, key in top:
+                    print(f"  profile {key} total_ms={value * 1000.0:.3f}")
     finally:
         engine.close()
     return 0
@@ -491,7 +519,8 @@ def run_openai_microbench(args: argparse.Namespace) -> int:
 
 def _build_openai_microbench_engine(args: argparse.Namespace) -> OpenAICompletionEngine:
     device = torch.device(args.device) if args.device else _default_device()
-    dtype = dtype_from_name(args.dtype) or torch.float32
+    synthetic_dtype_name = None if args.dtype == "auto" else args.dtype
+    dtype = dtype_from_name(synthetic_dtype_name) or torch.float32
     if args.backend == "synthetic":
         model = _OpenAIMicrobenchModel(
             vocab_size=args.vocab_size,
@@ -544,10 +573,16 @@ def _run_openai_microbench_case(
     prompt_tokens: int,
     max_tokens: int,
     temperature: float,
-) -> dict[str, float | int | str]:
+    phase_timings: bool = False,
+    profile_breakdown: bool = False,
+) -> dict[str, float | int | str | dict[str, float]]:
     del label
     for _ in range(warmup):
         _run_openai_microbench_iteration(engine, concurrency, prompt_tokens, max_tokens, temperature)
+    if phase_timings and hasattr(engine, "pop_phase_records"):
+        engine.pop_phase_records()
+    if profile_breakdown and hasattr(engine.model, "enable_profile"):
+        engine.model.enable_profile()
 
     start_calls = len(getattr(engine.model, "calls", ()))
     measurements = [
@@ -557,7 +592,7 @@ def _run_openai_microbench_case(
     ]
     call_slice = getattr(engine.model, "calls", ())[start_calls:]
     max_model_batch = max((batch for batch, _tokens in call_slice), default=0)
-    return {
+    result: dict[str, float | int | str | dict[str, float]] = {
         "requests": len(measurements),
         "ttft_p50_ms": _median([metric["ttft_ms"] for metric in measurements]),
         "ttft_p99_ms": _p99([metric["ttft_ms"] for metric in measurements]),
@@ -569,6 +604,29 @@ def _run_openai_microbench_case(
         "output_tokens_p50": _median([metric["output_tokens"] for metric in measurements]),
         "model_forward_calls": len(call_slice),
         "max_model_batch": max_model_batch,
+    }
+    if phase_timings and hasattr(engine, "pop_phase_records"):
+        phase_records = engine.pop_phase_records()
+        if phase_records:
+            result["phase_timings_ms"] = _summarize_openai_phase_records(phase_records)
+    return result
+
+
+def _summarize_openai_phase_records(records: list[dict[str, float]]) -> dict[str, float]:
+    def duration(start: str, end: str) -> float:
+        values = [(record[end] - record[start]) * 1000.0 for record in records if start in record and end in record]
+        return _median(values) if values else 0.0
+
+    return {
+        "request_to_first_forward_p50_ms": duration("request_start", "first_forward_start"),
+        "encode_p50_ms": duration("request_start", "encoded_prompt"),
+        "input_tensor_p50_ms": duration("encoded_prompt", "built_input_tensor"),
+        "broadcast_p50_ms": duration("broadcast_start", "broadcast_done"),
+        "cache_p50_ms": duration("cache_start", "cache_done"),
+        "prefill_forward_p50_ms": duration("first_forward_start", "first_forward_done"),
+        "sample_p50_ms": duration("first_forward_done", "prefill_sample_done"),
+        "first_token_sync_p50_ms": duration("first_token_sync_start", "first_token_ready"),
+        "internal_ttft_p50_ms": duration("request_start", "first_token_ready"),
     }
 
 
@@ -1552,7 +1610,7 @@ def build_parser() -> argparse.ArgumentParser:
     openai_microbench.add_argument("--device", default=None)
     openai_microbench.add_argument(
         "--dtype",
-        default="float32",
+        default="auto",
         choices=["auto", "float32", "float16", "bfloat16", "fp32", "fp16", "bf16"],
     )
     openai_microbench.add_argument("--max-model-len", type=int, default=None)
@@ -1574,6 +1632,8 @@ def build_parser() -> argparse.ArgumentParser:
     openai_microbench.add_argument("--vocab-size", type=int, default=256)
     openai_microbench.add_argument("--synthetic-forward-sleep-us", type=float, default=0.0)
     openai_microbench.add_argument("--compare-batcher", action="store_true")
+    openai_microbench.add_argument("--phase-timings", action="store_true")
+    openai_microbench.add_argument("--profile-breakdown", action="store_true")
     openai_microbench.add_argument("--json-output", default=None)
     openai_microbench.set_defaults(func=run_openai_microbench)
 

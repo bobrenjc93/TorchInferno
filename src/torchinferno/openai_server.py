@@ -202,6 +202,10 @@ class OpenAICompletionEngine:
         self._closed = False
         self._worker: threading.Thread | None = None
         self._cache_pool: dict[tuple[int, int, str, int, str], object] = {}
+        self._phase_timing_enabled = os.environ.get("TORCHINFERNO_OPENAI_PHASE_TIMINGS", "0") != "0"
+        self._phase_records: list[dict[str, float]] = []
+        self._phase_records_lock = threading.Lock()
+        self._warmup_tokenizer()
         self._warmup_tensor_parallel_model()
         if not _is_tensor_parallel_worker_model(model):
             self._worker = threading.Thread(target=self._batch_worker, name="torchinferno-openai-batcher", daemon=True)
@@ -223,15 +227,25 @@ class OpenAICompletionEngine:
         max_tokens: int,
         temperature: float,
     ) -> Iterator[int]:
+        phase = self._new_phase_record()
         self._enter_live_request()
         try:
+            self._mark_phase(phase, "entered_live_request")
             prompt = self._encode_chat_prompt(messages, max_tokens=max_tokens)
+            self._mark_phase(phase, "encoded_prompt")
             if self._try_acquire_single_request_model():
                 try:
-                    yield from self._generate_prompt_tokens(prompt, max_tokens=max_tokens, temperature=temperature)
+                    self._mark_phase(phase, "acquired_model")
+                    yield from self._generate_prompt_tokens_with_phase(
+                        prompt,
+                        max_tokens=max_tokens,
+                        temperature=temperature,
+                        phase=phase,
+                    )
                 finally:
                     self._model_lock.release()
             else:
+                self._mark_phase(phase, "queued_generation")
                 yield from self._submit_generation(prompt, max_tokens=max_tokens, temperature=temperature)
         finally:
             self._exit_live_request()
@@ -310,6 +324,27 @@ class OpenAICompletionEngine:
         with self._live_request_condition:
             self._live_requests -= 1
             self._live_request_condition.notify_all()
+
+    def pop_phase_records(self) -> list[dict[str, float]]:
+        with self._phase_records_lock:
+            records = list(self._phase_records)
+            self._phase_records.clear()
+        return records
+
+    def _new_phase_record(self) -> dict[str, float] | None:
+        if not self._phase_timing_enabled:
+            return None
+        return {"request_start": time.perf_counter()}
+
+    def _mark_phase(self, phase: dict[str, float] | None, name: str) -> None:
+        if phase is not None:
+            phase[name] = time.perf_counter()
+
+    def _record_phase(self, phase: dict[str, float] | None) -> None:
+        if phase is None:
+            return
+        with self._phase_records_lock:
+            self._phase_records.append(dict(phase))
 
     def _try_acquire_single_request_model(self) -> bool:
         if not self.single_request_fast_path:
@@ -422,8 +457,12 @@ class OpenAICompletionEngine:
             input_ids.size(1) + max_tokens,
             model=model,
         )
-        logits, cache = _forward(model, input_ids, cache)
-        next_token = _sample(model, logits[:, -1, :], temperature).to(self.device)
+        prefill_token = _try_prefill_graph(model, input_ids, cache, temperature)
+        if prefill_token is None:
+            logits, cache = _forward(model, input_ids, cache)
+            next_token = _sample(model, logits[:, -1, :], temperature).to(self.device)
+        else:
+            next_token = prefill_token.to(self.device)
         generated_tokens: list[Tensor] = []
         active = (
             torch.ones(input_ids.size(0), dtype=torch.bool, device=self.device)
@@ -452,12 +491,15 @@ class OpenAICompletionEngine:
         *,
         model: object,
     ) -> object:
-        key = (batch_size, max_seq_len, self.cache_backend, self.page_size, str(self.device))
+        cache_capacity = _generation_cache_capacity(model, max_seq_len)
+        exact_capacity = _prefers_exact_generation_cache(model)
+        key = (batch_size, cache_capacity, self.cache_backend, self.page_size, str(self.device))
         for cached_key, cached in self._cache_pool.items():
             cached_batch, cached_max_seq_len, cached_backend, cached_page_size, cached_device = cached_key
+            capacity_matches = cached_max_seq_len == cache_capacity if exact_capacity else cached_max_seq_len >= max_seq_len
             if (
                 cached_batch == batch_size
-                and cached_max_seq_len >= max_seq_len
+                and capacity_matches
                 and cached_backend == self.cache_backend
                 and cached_page_size == self.page_size
                 and cached_device == str(self.device)
@@ -467,7 +509,7 @@ class OpenAICompletionEngine:
         cache = _allocate_cache(
             model,
             batch_size,
-            max_seq_len,
+            cache_capacity,
             device=self.device,
             cache_backend=self.cache_backend,
             page_size=self.page_size,
@@ -475,6 +517,18 @@ class OpenAICompletionEngine:
         if _reset_generation_cache(cache):
             self._cache_pool[key] = cache
         return cache
+
+    def _warmup_tokenizer(self) -> None:
+        if os.environ.get("TORCHINFERNO_OPENAI_TOKENIZER_WARMUP", "1") == "0":
+            return
+        if not isinstance(self.tokenizer, _TransformersChatTokenizer):
+            return
+        try:
+            self.tokenizer.encode_messages(
+                [{"role": "user", "content": " ".join(f"tok{idx:02d}" for idx in range(32))}]
+            )
+        except Exception:
+            pass
 
     def _warmup_tensor_parallel_model(self) -> None:
         if os.environ.get("TORCHINFERNO_OPENAI_STARTUP_WARMUP", "1") == "0":
@@ -484,19 +538,21 @@ class OpenAICompletionEngine:
         if not hasattr(self.model, "generate"):
             return
         prompt_tokens = max(1, int(os.environ.get("TORCHINFERNO_OPENAI_WARMUP_PROMPT_TOKENS", "32")))
+        prompt_token_counts = _warmup_prompt_token_counts(prompt_tokens)
         new_tokens = max(1, int(os.environ.get("TORCHINFERNO_OPENAI_WARMUP_NEW_TOKENS", "2")))
         vocab_size = max(1, int(getattr(getattr(self.model, "config", object()), "vocab_size", 1)))
-        input_ids = (torch.arange(prompt_tokens, device=self.device, dtype=torch.long) % vocab_size)[None, :]
         with torch.inference_mode():
-            for _ in self._generate_single_tokens(
-                input_ids,
-                max_tokens=new_tokens,
-                temperature=0.0,
-                broadcast_tensor_parallel=False,
-            ):
-                pass
+            for count in prompt_token_counts:
+                input_ids = (torch.arange(count, device=self.device, dtype=torch.long) % vocab_size)[None, :]
+                for _ in self._generate_single_tokens(
+                    input_ids,
+                    max_tokens=new_tokens,
+                    temperature=0.0,
+                    broadcast_tensor_parallel=False,
+                ):
+                    pass
             warmup_cache_tokens = max(
-                prompt_tokens + new_tokens,
+                max(prompt_token_counts) + new_tokens,
                 int(os.environ.get("TORCHINFERNO_OPENAI_WARMUP_CACHE_TOKENS", "256")),
             )
             self._generation_cache(1, warmup_cache_tokens, model=self.model)
@@ -505,11 +561,28 @@ class OpenAICompletionEngine:
 
     def _generate_prompt_token_list(self, prompt: list[int], *, max_tokens: int, temperature: float) -> list[int]:
         input_ids = torch.tensor([prompt], dtype=torch.long, device=self.device)
-        return list(self._generate_single_tokens(input_ids, max_tokens=max_tokens, temperature=temperature))
+        rows = self._generate_batch_tokens(input_ids, max_tokens=max_tokens, temperature=temperature)
+        return rows[0] if rows else []
 
     def _generate_prompt_tokens(self, prompt: list[int], *, max_tokens: int, temperature: float) -> Iterator[int]:
+        yield from self._generate_prompt_tokens_with_phase(
+            prompt,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            phase=None,
+        )
+
+    def _generate_prompt_tokens_with_phase(
+        self,
+        prompt: list[int],
+        *,
+        max_tokens: int,
+        temperature: float,
+        phase: dict[str, float] | None,
+    ) -> Iterator[int]:
         input_ids = torch.tensor([prompt], dtype=torch.long, device=self.device)
-        yield from self._generate_single_tokens(input_ids, max_tokens=max_tokens, temperature=temperature)
+        self._mark_phase(phase, "built_input_tensor")
+        yield from self._generate_single_tokens(input_ids, max_tokens=max_tokens, temperature=temperature, phase=phase)
 
     @torch.inference_mode()
     def _generate_tokens(self, input_ids: Tensor, *, max_tokens: int, temperature: float) -> Iterator[int]:
@@ -529,12 +602,14 @@ class OpenAICompletionEngine:
         max_tokens: int,
         temperature: float,
         broadcast_tensor_parallel: bool = True,
+        phase: dict[str, float] | None = None,
     ) -> Iterator[int]:
         if max_tokens <= 0:
             return
         if input_ids.size(0) != 1:
             raise ValueError("single-request generation expects batch size 1")
         if broadcast_tensor_parallel:
+            self._mark_phase(phase, "broadcast_start")
             _broadcast_tensor_parallel_generate(
                 self.model,
                 input_ids,
@@ -542,6 +617,7 @@ class OpenAICompletionEngine:
                 temperature=temperature,
                 stream=True,
             )
+            self._mark_phase(phase, "broadcast_done")
         eos_token_id = self.tokenizer.eos_token_id
         model = self.model
         if not hasattr(model, "allocate_cache") or not callable(getattr(model, "forward", None)):
@@ -558,22 +634,43 @@ class OpenAICompletionEngine:
                     break
             return
 
+        self._mark_phase(phase, "cache_start")
         cache = self._generation_cache(
             1,
             input_ids.size(1) + max_tokens,
             model=model,
         )
-        logits, cache = _forward(model, input_ids, cache)
-        next_token = _sample(model, logits[:, -1, :], temperature).to(self.device)
+        self._mark_phase(phase, "cache_done")
+        self._mark_phase(phase, "prefill_start")
+        prefill_token = _try_prefill_graph(model, input_ids, cache, temperature)
+        if prefill_token is None:
+            self._mark_phase(phase, "first_forward_start")
+            logits, cache = _forward(model, input_ids, cache)
+            self._mark_phase(phase, "first_forward_done")
+            next_token = _sample(model, logits[:, -1, :], temperature).to(self.device)
+            self._mark_phase(phase, "prefill_sample_done")
+        else:
+            next_token = prefill_token.to(self.device)
+            self._mark_phase(phase, "prefill_graph_done")
         for step in range(max_tokens):
-            token_id = int(next_token.item())
+            if step == 0:
+                self._mark_phase(phase, "first_token_sync_start")
+            token_tensor = next_token
+            token_id = int(token_tensor.item())
+            if step == 0:
+                self._mark_phase(phase, "first_token_ready")
+                self._record_phase(phase)
             yield token_id
             if eos_token_id is not None and token_id == eos_token_id:
                 break
             if step + 1 == max_tokens:
                 break
-            logits, cache = _forward(model, next_token[:, None], cache)
-            next_token = _sample(model, logits[:, -1, :], temperature).to(self.device)
+            graph_token = _try_decode_one_token_graph(model, token_tensor[:, None], cache, temperature)
+            if graph_token is None:
+                logits, cache = _forward(model, token_tensor[:, None], cache)
+                next_token = _sample(model, logits[:, -1, :], temperature).to(self.device)
+            else:
+                next_token = graph_token.to(self.device)
 
     @torch.inference_mode()
     def _generate_batch_steps(
@@ -626,8 +723,12 @@ class OpenAICompletionEngine:
             model=model,
         )
         active = [True for _ in range(input_ids.size(0))]
-        logits, cache = _forward(model, input_ids, cache)
-        next_token = _sample(model, logits[:, -1, :], temperature).to(self.device)
+        prefill_token = _try_prefill_graph(model, input_ids, cache, temperature)
+        if prefill_token is None:
+            logits, cache = _forward(model, input_ids, cache)
+            next_token = _sample(model, logits[:, -1, :], temperature).to(self.device)
+        else:
+            next_token = prefill_token.to(self.device)
         for _ in range(max_tokens):
             token_ids = next_token.detach().cpu().tolist()
             step_tokens: list[int | None] = []
@@ -642,8 +743,12 @@ class OpenAICompletionEngine:
             yield step_tokens
             if not any(active):
                 break
-            logits, cache = _forward(model, next_token[:, None], cache)
-            next_token = _sample(model, logits[:, -1, :], temperature).to(self.device)
+            graph_token = _try_decode_one_token_graph(model, next_token[:, None], cache, temperature)
+            if graph_token is None:
+                logits, cache = _forward(model, next_token[:, None], cache)
+                next_token = _sample(model, logits[:, -1, :], temperature).to(self.device)
+            else:
+                next_token = graph_token.to(self.device)
 
 
 class _OpenAIHandler(BaseHTTPRequestHandler):
@@ -1056,6 +1161,32 @@ def _allocate_cache(
             return allocate_cache(batch_size, max_seq_len)
 
 
+def _generation_cache_capacity(model: object, requested_tokens: int) -> int:
+    if _prefers_exact_generation_cache(model):
+        return 1 << (max(1, requested_tokens) - 1).bit_length()
+    return requested_tokens
+
+
+def _warmup_prompt_token_counts(default_prompt_tokens: int) -> tuple[int, ...]:
+    raw = os.environ.get("TORCHINFERNO_OPENAI_WARMUP_PROMPT_TOKEN_BUCKETS", f"{default_prompt_tokens},99")
+    counts: list[int] = []
+    for part in raw.split(","):
+        stripped = part.strip()
+        if not stripped:
+            continue
+        counts.append(max(1, int(stripped)))
+    if not counts:
+        counts.append(default_prompt_tokens)
+    return tuple(dict.fromkeys(counts))
+
+
+def _prefers_exact_generation_cache(model: object) -> bool:
+    return (
+        _is_tensor_parallel_model(model)
+        and os.environ.get("TORCHINFERNO_CUDAGRAPH_DECODE_STEP", "1") != "0"
+    )
+
+
 def _reset_generation_cache(cache: object) -> bool:
     reset = False
     for layer in getattr(cache, "layers", ()) or ():
@@ -1113,6 +1244,30 @@ def _forward(model: object, input_ids: Tensor, cache: object) -> tuple[Tensor, o
     if _is_tensor_parallel_model(model) and "return_sharded_logits" in parameters:
         kwargs["return_sharded_logits"] = True
     return forward(input_ids, **kwargs)
+
+
+def _try_decode_one_token_graph(
+    model: object,
+    input_ids: Tensor,
+    cache: object,
+    temperature: float,
+) -> Tensor | None:
+    decode_graph = getattr(model, "try_decode_one_token_graph", None)
+    if decode_graph is None:
+        return None
+    return decode_graph(input_ids, cache, temperature=temperature)
+
+
+def _try_prefill_graph(
+    model: object,
+    input_ids: Tensor,
+    cache: object,
+    temperature: float,
+) -> Tensor | None:
+    prefill_graph = getattr(model, "try_prefill_graph", None)
+    if prefill_graph is None:
+        return None
+    return prefill_graph(input_ids, cache, temperature=temperature)
 
 
 @lru_cache(maxsize=None)

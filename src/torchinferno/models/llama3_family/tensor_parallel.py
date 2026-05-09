@@ -27,6 +27,9 @@ from torchinferno.models.llama3_family.v0 import sample_next_token
 _COMPILED_ROTATE_LLAMA = None
 _COMPILED_ROTATE_LLAMA_CHECKED = False
 _COMPILED_ROTATE_LLAMA_FAILED = False
+_SYMM_REDUCE_BUFFERS: dict[tuple[str, int, str, tuple[int, ...]], Tensor] = {}
+_SYMM_REDUCE_PROBED: set[tuple[str, int, str, tuple[int, ...]]] = set()
+_SYMM_REDUCE_DISABLED = False
 
 
 @dataclass(frozen=True)
@@ -63,6 +66,13 @@ class _StaticQKVRotaryGraphCall:
     q: Tensor
     k: Tensor
     v: Tensor
+
+
+@dataclass
+class _StaticPrefillActivationGraphCall:
+    graph: torch.cuda.CUDAGraph
+    static_input: Tensor
+    output: Tensor
 
 
 class Llama3TensorParallelLayerKVCache:
@@ -114,6 +124,30 @@ class Llama3TensorParallelCache:
         return self.layers[0].seq_len if self.layers else 0
 
 
+@dataclass
+class _StaticDecodeGraphCall:
+    graph: torch.cuda.CUDAGraph
+    static_input_ids: Tensor
+    static_cache_position: Tensor
+    static_attention_length: Tensor
+    static_rotary_cos: Tensor
+    static_rotary_sin: Tensor
+    output_token: Tensor
+    cache: Llama3TensorParallelCache
+    max_seq_len: int
+    attention_block_size: int
+
+
+@dataclass
+class _StaticPrefillGraphCall:
+    graph: torch.cuda.CUDAGraph
+    static_input_ids: Tensor
+    output_token: Tensor
+    cache: Llama3TensorParallelCache
+    prompt_tokens: int
+    max_seq_len: int
+
+
 class _Llama3TensorParallelLayer:
     def __init__(
         self,
@@ -152,14 +186,26 @@ class _Llama3TensorParallelLayer:
         self.profile_counts: dict[str, int] | None = None
         self._mlp_project_graph: _StaticCudaGraphCall | None = None
         self._mlp_project_graph_failed = False
-        self._qkv_rotary_graph: _StaticQKVRotaryGraphCall | None = None
+        self._qkv_rotary_graphs: dict[
+            tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]],
+            _StaticQKVRotaryGraphCall,
+        ] = {}
         self._qkv_rotary_graph_failed = False
-        self._input_qkv_rotary_graph: _StaticQKVRotaryGraphCall | None = None
+        self._input_qkv_rotary_graphs: dict[
+            tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]],
+            _StaticQKVRotaryGraphCall,
+        ] = {}
         self._input_qkv_rotary_graph_failed = False
         self._post_mlp_project_graph: _StaticCudaGraphCall | None = None
         self._post_mlp_project_graph_failed = False
         self._attention_o_graph: _StaticCudaGraphCall | None = None
         self._attention_o_graph_failed = False
+        self._prefill_gate_up_activation_graphs: dict[
+            tuple[int, ...],
+            _StaticPrefillActivationGraphCall,
+        ] = {}
+        self._prefill_gate_up_activation_graph_failed = False
+        self._symm_reduce_failed = False
 
     def forward(
         self,
@@ -188,6 +234,45 @@ class _Llama3TensorParallelLayer:
         hidden = residual + self._mlp(mlp_in)
         return hidden
 
+    def forward_prefill_fast(
+        self,
+        hidden: Tensor,
+        attn_in: Tensor | None,
+        positions: Tensor,
+        rotary: tuple[Tensor, Tensor],
+        cache: Llama3TensorParallelLayerKVCache | None,
+        next_norm_weight: Tensor | None,
+    ) -> tuple[Tensor, Tensor | None]:
+        residual = hidden
+        attention = self._profile_block(
+            "fast_prefill.attention",
+            lambda: self._attention_from_hidden(hidden, positions, rotary, cache, attn_in=attn_in),
+        )
+        hidden, mlp_in = self._profile_block(
+            "fast_prefill.post_attention_add_norm",
+            lambda: _tp_decode_add_rms_norm(
+                attention,
+                residual,
+                self.post_attention_layernorm_weight,
+                self.config.rms_norm_eps,
+            ),
+        )
+
+        def project_mlp() -> Tensor:
+            projected = self._mlp_project_prefill_reduce(mlp_in)
+            if projected is None:
+                projected = self._mlp_project_eager(mlp_in)
+                _all_reduce(projected)
+            return projected
+
+        projected = self._profile_block("fast_prefill.mlp_project", project_mlp)
+        if next_norm_weight is None:
+            return hidden + projected, None
+        return self._profile_block(
+            "fast_prefill.next_input_add_norm",
+            lambda: _tp_decode_add_rms_norm(projected, hidden, next_norm_weight, self.config.rms_norm_eps),
+        )
+
     def _attention(
         self,
         hidden: Tensor,
@@ -204,9 +289,7 @@ class _Llama3TensorParallelLayer:
             enable_gqa = self.local_attention_heads != self.local_key_value_heads
             out = self._scaled_dot_product(q, k, v, positions, hidden.device, enable_gqa=enable_gqa)
             out = out.transpose(1, 2).contiguous().view(batch, tokens, self.local_hidden_size)
-            projected = self._attention_o_project(out)
-            _all_reduce(projected)
-            return projected
+            return self._attention_o_project_reduce(out)
 
         q, k, v = self._profile_block(
             "attention.qkv",
@@ -232,18 +315,229 @@ class _Llama3TensorParallelLayer:
         positions: Tensor,
         rotary: tuple[Tensor, Tensor],
         cache: Llama3TensorParallelLayerKVCache | None,
+        *,
+        attn_in: Tensor | None = None,
     ) -> Tensor:
         batch, tokens, _ = hidden.shape
         head_dim = self.config.head_dim
-        q, k, v = self._input_norm_qkv_rotary(hidden, batch, tokens, head_dim, rotary)
+        if attn_in is None:
+            q, k, v = self._profile_block(
+                "fast_prefill.attention.input_norm_qkv_rotary",
+                lambda: self._input_norm_qkv_rotary(hidden, batch, tokens, head_dim, rotary),
+            )
+        else:
+            q, k, v = self._profile_block(
+                "fast_prefill.attention.qkv_rotary",
+                lambda: self._qkv_rotary(attn_in, batch, tokens, head_dim, rotary),
+            )
         if cache is not None:
-            k, v = cache.append(k, v)
+            k, v = self._profile_block("fast_prefill.attention.cache_append", lambda: cache.append(k, v))
         enable_gqa = self.local_attention_heads != self.local_key_value_heads
-        out = self._scaled_dot_product(q, k, v, positions, hidden.device, enable_gqa=enable_gqa)
+        out = self._profile_block(
+            "fast_prefill.attention.sdp",
+            lambda: self._scaled_dot_product(q, k, v, positions, hidden.device, enable_gqa=enable_gqa),
+        )
         out = out.transpose(1, 2).contiguous().view(batch, tokens, self.local_hidden_size)
-        projected = self._attention_o_project(out)
+        return self._profile_block(
+            "fast_prefill.attention.o_project_reduce",
+            lambda: self._attention_o_project_reduce(out),
+        )
+
+    def forward_decode_static(
+        self,
+        hidden: Tensor,
+        attn_in: Tensor | None,
+        rotary: tuple[Tensor, Tensor],
+        cache: Llama3TensorParallelLayerKVCache,
+        cache_position: Tensor,
+        attention_length: Tensor,
+        attention_block_size: int | None,
+        next_norm_weight: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        residual = hidden
+        attention = self._attention_decode_static(
+            hidden,
+            attn_in,
+            rotary,
+            cache,
+            cache_position,
+            attention_length,
+            attention_block_size,
+        )
+        hidden, mlp_in = _tp_decode_add_rms_norm(
+            attention,
+            residual,
+            self.post_attention_layernorm_weight,
+            self.config.rms_norm_eps,
+        )
+        residual = hidden
+        projected = self._mlp_project_decode_reduce(mlp_in)
+        return _tp_decode_add_rms_norm(projected, residual, next_norm_weight, self.config.rms_norm_eps)
+
+    def _attention_decode_static(
+        self,
+        hidden: Tensor,
+        attn_in: Tensor | None,
+        rotary: tuple[Tensor, Tensor],
+        cache: Llama3TensorParallelLayerKVCache,
+        cache_position: Tensor,
+        attention_length: Tensor,
+        attention_block_size: int | None,
+    ) -> Tensor:
+        from torchinferno.kernels.triton_ops import (
+            triton_apply_rotary_append_kv_decode,
+            triton_append_kv_cache,
+            triton_dense_gqa_decode_attention,
+            triton_grouped_gqa_decode_attention,
+        )
+
+        batch, tokens, _ = hidden.shape
+        if attn_in is None:
+            attn_in = _tp_decode_rms_norm(hidden, self.input_layernorm_weight, self.config.rms_norm_eps)
+        if os.environ.get("TORCHINFERNO_TRITON_DECODE_ROTARY_APPEND", "1") != "0":
+            q, k, v = self._qkv(attn_in, batch, tokens, self.config.head_dim)
+            q = triton_apply_rotary_append_kv_decode(q, k, v, cache.keys, cache.values, cache_position, rotary[0], rotary[1])
+        else:
+            q, k, v = self._qkv_rotary_eager(attn_in, batch, tokens, self.config.head_dim, rotary)
+            triton_append_kv_cache(k, v, cache.keys, cache.values, cache_position)
+        attention_keys = cache.keys
+        attention_values = cache.values
+        if attention_block_size is not None and attention_block_size < cache.keys.size(2):
+            attention_keys = cache.keys[:, :, :attention_block_size, :]
+            attention_values = cache.values[:, :, :attention_block_size, :]
+        if (
+            self.local_attention_heads > self.local_key_value_heads
+            and os.environ.get("TORCHINFERNO_TRITON_GROUPED_DECODE_ATTENTION", "1") != "0"
+        ):
+            out = triton_grouped_gqa_decode_attention(q, attention_keys, attention_values, attention_length)
+        else:
+            out = triton_dense_gqa_decode_attention(q, attention_keys, attention_values, seq_len=attention_length)
+        out = out.transpose(1, 2).contiguous().view(batch, tokens, self.local_hidden_size)
+        return self._decode_linear_all_reduce(out, self.o_proj_weight, "attention")
+
+    def _mlp_project_decode_reduce(self, hidden: Tensor) -> Tensor:
+        gate, up = _decode_linear(hidden, self.gate_up_proj_weight).split(
+            (self.local_intermediate_size, self.local_intermediate_size),
+            dim=-1,
+        )
+        activated = _tp_decode_swiglu(gate, up)
+        return self._decode_linear_all_reduce(activated, self.down_proj_weight, "mlp")
+
+    def _mlp_project_prefill_reduce(self, hidden: Tensor) -> Tensor | None:
+        if not _should_use_symm_mem_prefill_all_reduce(hidden, self.down_proj_weight, self.world_size):
+            return None
+        activated = self._profile_block(
+            "fast_prefill.mlp_prefill.gate_up_activation",
+            lambda: self._prefill_gate_up_activation(hidden),
+        )
+        return self._prefill_linear_all_reduce(activated, self.down_proj_weight, "mlp-prefill")
+
+    def _prefill_gate_up_activation(self, hidden: Tensor) -> Tensor:
+        if (
+            self.world_size > 1
+            and _should_use_prefill_gate_up_activation_graph(hidden)
+            and not self._prefill_gate_up_activation_graph_failed
+        ):
+            try:
+                return self._run_prefill_gate_up_activation_graph(hidden)
+            except Exception:
+                self._prefill_gate_up_activation_graph_failed = True
+        gate, up = F.linear(hidden, self.gate_up_proj_weight).split(
+            (self.local_intermediate_size, self.local_intermediate_size),
+            dim=-1,
+        )
+        return _tp_swiglu(gate, up)
+
+    def _run_prefill_gate_up_activation_graph(self, hidden: Tensor) -> Tensor:
+        key = tuple(hidden.shape)
+        captured = self._prefill_gate_up_activation_graphs.get(key)
+        if captured is None:
+            static_input = torch.empty_like(hidden)
+            static_input.copy_(hidden)
+            stream = torch.cuda.Stream(device=hidden.device)
+            stream.wait_stream(torch.cuda.current_stream(hidden.device))
+            with torch.cuda.stream(stream):
+                self._prefill_gate_up_activation_eager(static_input)
+            torch.cuda.current_stream(hidden.device).wait_stream(stream)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                output = self._prefill_gate_up_activation_eager(static_input)
+            captured = _StaticPrefillActivationGraphCall(graph=graph, static_input=static_input, output=output)
+            self._prefill_gate_up_activation_graphs[key] = captured
+            return captured.output
+        captured.static_input.copy_(hidden)
+        captured.graph.replay()
+        return captured.output
+
+    def _prefill_gate_up_activation_eager(self, hidden: Tensor) -> Tensor:
+        gate, up = F.linear(hidden, self.gate_up_proj_weight).split(
+            (self.local_intermediate_size, self.local_intermediate_size),
+            dim=-1,
+        )
+        return _tp_swiglu(gate, up)
+
+    def _decode_linear_all_reduce(self, hidden: Tensor, weight: Tensor, buffer_name: str) -> Tensor:
+        if _should_use_symm_mem_all_reduce(hidden, weight, self.world_size) and not self._symm_reduce_failed:
+            try:
+                expected_shape = (1, 1, weight.size(0))
+                buffer, group_name = self._symm_reduce_buffer(buffer_name, hidden, expected_shape)
+                torch.mv(weight, hidden.reshape(-1), out=buffer.view(-1))
+                torch.ops.symm_mem.multimem_all_reduce_(buffer, "sum", group_name)
+                return buffer
+            except Exception:
+                self._symm_reduce_failed = True
+                _disable_symm_reduce()
+        projected = _decode_linear(hidden, weight)
         _all_reduce(projected)
         return projected
+
+    def _prefill_linear_all_reduce(self, hidden: Tensor, weight: Tensor, buffer_name: str) -> Tensor | None:
+        if not _should_use_symm_mem_prefill_all_reduce(hidden, weight, self.world_size):
+            return None
+        try:
+            expected_shape = (*hidden.shape[:-1], weight.size(0))
+            buffer, group_name = self._symm_reduce_buffer(buffer_name, hidden, expected_shape)
+            self._profile_block(
+                f"fast_prefill.{buffer_name}.mm",
+                lambda: torch.mm(hidden.reshape(-1, hidden.size(-1)), weight.t(), out=buffer.reshape(-1, weight.size(0))),
+            )
+            self._profile_block(
+                f"fast_prefill.{buffer_name}.all_reduce",
+                lambda: torch.ops.symm_mem.multimem_all_reduce_(buffer, "sum", group_name),
+            )
+            return buffer
+        except Exception:
+            _disable_symm_reduce()
+            return None
+
+    def _symm_reduce_buffer(self, name: str, hidden: Tensor, expected_shape: tuple[int, ...]) -> tuple[Tensor, str]:
+        del name
+        if not dist.is_available() or not dist.is_initialized():
+            raise RuntimeError("symmetric-memory allreduce requires an initialized process group")
+        group_name = dist.group.WORLD.group_name
+        device_index = hidden.device.index if hidden.device.index is not None else torch.cuda.current_device()
+        key = (group_name, device_index, str(hidden.dtype), expected_shape)
+        buffer = _SYMM_REDUCE_BUFFERS.get(key)
+        if buffer is None:
+            import torch.distributed._symmetric_memory as symm_mem
+
+            buffer = symm_mem.empty(expected_shape, device=hidden.device, dtype=hidden.dtype)
+            symm_mem.rendezvous(buffer, group_name)
+            _SYMM_REDUCE_BUFFERS[key] = buffer
+        if key not in _SYMM_REDUCE_PROBED:
+            self._probe_symm_reduce_buffer(key, buffer, group_name)
+        return buffer, group_name
+
+    def _probe_symm_reduce_buffer(
+        self,
+        key: tuple[str, int, str, tuple[int, ...]],
+        buffer: Tensor,
+        group_name: str,
+    ) -> None:
+        buffer.zero_()
+        torch.ops.symm_mem.multimem_all_reduce_(buffer, "sum", group_name)
+        torch.cuda.synchronize(buffer.device)
+        _SYMM_REDUCE_PROBED.add(key)
 
     def _mlp(self, hidden: Tensor) -> Tensor:
         if self.profile_seconds is None or self.profile_counts is None:
@@ -272,12 +566,12 @@ class _Llama3TensorParallelLayer:
         return self._mlp_project_eager(hidden)
 
     def _mlp_project_eager(self, hidden: Tensor) -> Tensor:
-        gate, up = F.linear(hidden, self.gate_up_proj_weight).split(
+        gate, up = _decode_linear(hidden, self.gate_up_proj_weight).split(
             (self.local_intermediate_size, self.local_intermediate_size),
             dim=-1,
         )
         activated = _tp_swiglu(gate, up)
-        return F.linear(activated, self.down_proj_weight)
+        return _decode_linear(activated, self.down_proj_weight)
 
     def _run_mlp_project_graph(self, hidden: Tensor) -> Tensor:
         captured = self._mlp_project_graph
@@ -300,6 +594,15 @@ class _Llama3TensorParallelLayer:
         return captured.output
 
     def _post_attention_mlp_project(self, hidden: Tensor) -> Tensor:
+        mlp_in = _tp_rms_norm(hidden, self.post_attention_layernorm_weight, self.config.rms_norm_eps)
+        reduced = self._mlp_project_prefill_reduce(mlp_in)
+        if reduced is not None:
+            return reduced
+        if _should_graph_all_reduce() and self.world_size > 1 and _should_use_mlp_project_graph(hidden):
+            try:
+                return self._run_post_mlp_project_reduce_graph(hidden)
+            except Exception:
+                self._post_mlp_project_graph_failed = True
         if self.world_size > 1 and _should_use_mlp_project_graph(hidden) and not self._post_mlp_project_graph_failed:
             try:
                 projected = self._run_post_mlp_project_graph(hidden)
@@ -307,10 +610,31 @@ class _Llama3TensorParallelLayer:
                 return projected
             except Exception:
                 self._post_mlp_project_graph_failed = True
-        mlp_in = _tp_rms_norm(hidden, self.post_attention_layernorm_weight, self.config.rms_norm_eps)
         projected = self._mlp_project_eager(mlp_in)
         _all_reduce(projected)
         return projected
+
+    def _run_post_mlp_project_reduce_graph(self, hidden: Tensor) -> Tensor:
+        captured = self._post_mlp_project_graph
+        if captured is None or captured.static_input.shape != hidden.shape:
+            static_input = torch.empty_like(hidden)
+            static_input.copy_(hidden)
+            stream = torch.cuda.Stream(device=hidden.device)
+            stream.wait_stream(torch.cuda.current_stream(hidden.device))
+            with torch.cuda.stream(stream):
+                projected = self._post_mlp_project_eager(static_input)
+                _all_reduce(projected)
+            torch.cuda.current_stream(hidden.device).wait_stream(stream)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                output = self._post_mlp_project_eager(static_input)
+                _all_reduce(output)
+            captured = _StaticCudaGraphCall(graph=graph, static_input=static_input, output=output)
+            self._post_mlp_project_graph = captured
+            return captured.output
+        captured.static_input.copy_(hidden)
+        captured.graph.replay()
+        return captured.output
 
     def _post_mlp_project_eager(self, hidden: Tensor) -> Tensor:
         mlp_in = _tp_rms_norm(hidden, self.post_attention_layernorm_weight, self.config.rms_norm_eps)
@@ -342,7 +666,7 @@ class _Llama3TensorParallelLayer:
                 return self._run_attention_o_graph(hidden)
             except Exception:
                 self._attention_o_graph_failed = True
-        return F.linear(hidden, self.o_proj_weight)
+        return _decode_linear(hidden, self.o_proj_weight)
 
     def _run_attention_o_graph(self, hidden: Tensor) -> Tensor:
         captured = self._attention_o_graph
@@ -352,11 +676,46 @@ class _Llama3TensorParallelLayer:
             stream = torch.cuda.Stream(device=hidden.device)
             stream.wait_stream(torch.cuda.current_stream(hidden.device))
             with torch.cuda.stream(stream):
-                F.linear(static_input, self.o_proj_weight)
+                _decode_linear(static_input, self.o_proj_weight)
             torch.cuda.current_stream(hidden.device).wait_stream(stream)
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
-                output = F.linear(static_input, self.o_proj_weight)
+                output = _decode_linear(static_input, self.o_proj_weight)
+            captured = _StaticCudaGraphCall(graph=graph, static_input=static_input, output=output)
+            self._attention_o_graph = captured
+            return captured.output
+        captured.static_input.copy_(hidden)
+        captured.graph.replay()
+        return captured.output
+
+    def _attention_o_project_reduce(self, hidden: Tensor) -> Tensor:
+        reduced = self._prefill_linear_all_reduce(hidden, self.o_proj_weight, "attention-prefill")
+        if reduced is not None:
+            return reduced
+        if _should_graph_all_reduce() and self.world_size > 1 and _should_use_attention_o_graph(hidden):
+            try:
+                return self._run_attention_o_reduce_graph(hidden)
+            except Exception:
+                self._attention_o_graph_failed = True
+        projected = self._attention_o_project(hidden)
+        _all_reduce(projected)
+        return projected
+
+    def _run_attention_o_reduce_graph(self, hidden: Tensor) -> Tensor:
+        captured = self._attention_o_graph
+        if captured is None or captured.static_input.shape != hidden.shape:
+            static_input = torch.empty_like(hidden)
+            static_input.copy_(hidden)
+            stream = torch.cuda.Stream(device=hidden.device)
+            stream.wait_stream(torch.cuda.current_stream(hidden.device))
+            with torch.cuda.stream(stream):
+                projected = _decode_linear(static_input, self.o_proj_weight)
+                _all_reduce(projected)
+            torch.cuda.current_stream(hidden.device).wait_stream(stream)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                output = _decode_linear(static_input, self.o_proj_weight)
+                _all_reduce(output)
             captured = _StaticCudaGraphCall(graph=graph, static_input=static_input, output=output)
             self._attention_o_graph = captured
             return captured.output
@@ -365,7 +724,7 @@ class _Llama3TensorParallelLayer:
         return captured.output
 
     def _qkv(self, hidden: Tensor, batch: int, tokens: int, head_dim: int) -> tuple[Tensor, Tensor, Tensor]:
-        qkv = F.linear(hidden, self.qkv_proj_weight)
+        qkv = _decode_linear(hidden, self.qkv_proj_weight)
         q, k, v = qkv.split(
             (self.local_hidden_size, self.local_key_value_size, self.local_key_value_size),
             dim=-1,
@@ -426,13 +785,9 @@ class _Llama3TensorParallelLayer:
         rotary: tuple[Tensor, Tensor],
     ) -> tuple[Tensor, Tensor, Tensor]:
         cos, sin = rotary
-        captured = self._qkv_rotary_graph
-        if (
-            captured is None
-            or captured.static_input.shape != hidden.shape
-            or captured.static_cos.shape != cos.shape
-            or captured.static_sin.shape != sin.shape
-        ):
+        key = (tuple(hidden.shape), tuple(cos.shape), tuple(sin.shape))
+        captured = self._qkv_rotary_graphs.get(key)
+        if captured is None:
             static_input = torch.empty_like(hidden)
             static_cos = torch.empty_like(cos)
             static_sin = torch.empty_like(sin)
@@ -456,7 +811,7 @@ class _Llama3TensorParallelLayer:
                 k=k,
                 v=v,
             )
-            self._qkv_rotary_graph = captured
+            self._qkv_rotary_graphs[key] = captured
             return captured.q, captured.k, captured.v
         captured.static_input.copy_(hidden)
         captured.static_cos.copy_(cos)
@@ -499,13 +854,9 @@ class _Llama3TensorParallelLayer:
         rotary: tuple[Tensor, Tensor],
     ) -> tuple[Tensor, Tensor, Tensor]:
         cos, sin = rotary
-        captured = self._input_qkv_rotary_graph
-        if (
-            captured is None
-            or captured.static_input.shape != hidden.shape
-            or captured.static_cos.shape != cos.shape
-            or captured.static_sin.shape != sin.shape
-        ):
+        key = (tuple(hidden.shape), tuple(cos.shape), tuple(sin.shape))
+        captured = self._input_qkv_rotary_graphs.get(key)
+        if captured is None:
             static_input = torch.empty_like(hidden)
             static_cos = torch.empty_like(cos)
             static_sin = torch.empty_like(sin)
@@ -529,7 +880,7 @@ class _Llama3TensorParallelLayer:
                 k=k,
                 v=v,
             )
-            self._input_qkv_rotary_graph = captured
+            self._input_qkv_rotary_graphs[key] = captured
             return captured.q, captured.k, captured.v
         captured.static_input.copy_(hidden)
         captured.static_cos.copy_(cos)
@@ -645,6 +996,11 @@ class Llama3TensorParallelForCausalLM:
         self.profile_seconds: dict[str, float] = {}
         self.profile_counts: dict[str, int] = {}
         self.training = False
+        self._prefill_graph: _StaticPrefillGraphCall | None = None
+        self._prefill_graph_failed = False
+        self._decode_graph: _StaticDecodeGraphCall | None = None
+        self._decode_graphs: dict[int, _StaticDecodeGraphCall] = {}
+        self._decode_graph_failed = False
 
     @classmethod
     def from_pretrained(
@@ -856,9 +1212,28 @@ class Llama3TensorParallelForCausalLM:
         positions = torch.arange(past_len, past_len + tokens, device=self.device)
         rotary = self._rotary_cache(past_len, tokens)
         hidden = F.embedding(input_ids.to(self.device, non_blocking=True), self.embed_tokens_weight)
-        for layer_id, layer in enumerate(self.layers):
-            layer_cache = active_cache.layers[layer_id] if active_cache is not None else None
-            hidden = layer.forward(hidden, positions, rotary, layer_cache)
+        profile_fast_prefill = os.environ.get("TORCHINFERNO_PROFILE_FAST_PREFILL", "0") != "0"
+        if tokens > 1 and (profile_fast_prefill or all(layer.profile_seconds is None for layer in self.layers)):
+            attn_in: Tensor | None = None
+            for layer_id, layer in enumerate(self.layers):
+                layer_cache = active_cache.layers[layer_id] if active_cache is not None else None
+                next_norm_weight = (
+                    self.layers[layer_id + 1].input_layernorm_weight
+                    if layer_id + 1 < len(self.layers)
+                    else None
+                )
+                hidden, attn_in = layer.forward_prefill_fast(
+                    hidden,
+                    attn_in,
+                    positions,
+                    rotary,
+                    layer_cache,
+                    next_norm_weight,
+                )
+        else:
+            for layer_id, layer in enumerate(self.layers):
+                layer_cache = active_cache.layers[layer_id] if active_cache is not None else None
+                hidden = layer.forward(hidden, positions, rotary, layer_cache)
         if return_last_logits_only:
             hidden = hidden[:, -1:, :]
         hidden = _tp_rms_norm(hidden, self.norm_weight, self.config.rms_norm_eps)
@@ -867,6 +1242,220 @@ class Llama3TensorParallelForCausalLM:
             return logits, active_cache
         logits = self._gather_logits(logits)
         return logits, active_cache
+
+    def try_prefill_graph(
+        self,
+        input_ids: Tensor,
+        cache: Llama3TensorParallelCache,
+        *,
+        temperature: float = 0.0,
+    ) -> Tensor | None:
+        if self._prefill_graph_failed or not _should_use_prefill_graph(input_ids, cache, temperature):
+            return None
+        try:
+            return self._run_prefill_graph(input_ids, cache)
+        except Exception as exc:
+            if os.environ.get("TORCHINFERNO_CUDAGRAPH_PREFILL_DEBUG", "0") != "0":
+                print(f"rank={self.rank} prefill_graph_failed={exc!r}", flush=True)
+            self._prefill_graph_failed = True
+            return None
+
+    def _run_prefill_graph(self, input_ids: Tensor, cache: Llama3TensorParallelCache) -> Tensor:
+        captured = self._prefill_graph
+        if (
+            captured is None
+            or captured.cache is not cache
+            or captured.prompt_tokens != input_ids.size(1)
+            or captured.max_seq_len != cache.layers[0].max_seq_len
+            or captured.static_input_ids.shape != input_ids.shape
+        ):
+            captured = self._capture_prefill_graph(input_ids, cache)
+        else:
+            captured.static_input_ids.copy_(input_ids)
+            captured.graph.replay()
+            self._set_cache_seq_len(cache, input_ids.size(1))
+        return captured.output_token
+
+    def _capture_prefill_graph(
+        self,
+        input_ids: Tensor,
+        cache: Llama3TensorParallelCache,
+    ) -> _StaticPrefillGraphCall:
+        static_input_ids = torch.empty_like(input_ids)
+        static_input_ids.copy_(input_ids)
+        captured = _StaticPrefillGraphCall(
+            graph=torch.cuda.CUDAGraph(),
+            static_input_ids=static_input_ids,
+            output_token=torch.empty((input_ids.size(0),), device=self.device, dtype=torch.long),
+            cache=cache,
+            prompt_tokens=input_ids.size(1),
+            max_seq_len=cache.layers[0].max_seq_len,
+        )
+        stream = torch.cuda.Stream(device=self.device)
+        stream.wait_stream(torch.cuda.current_stream(self.device))
+        with torch.cuda.stream(stream):
+            self._set_cache_seq_len(cache, 0)
+            logits = self._forward_prefill_static(captured.static_input_ids, cache)
+            self._sample_next_token(logits[:, -1, :], 0.0)
+        torch.cuda.current_stream(self.device).wait_stream(stream)
+        self._set_cache_seq_len(cache, 0)
+        with torch.cuda.graph(captured.graph):
+            logits = self._forward_prefill_static(captured.static_input_ids, cache)
+            captured.output_token = self._sample_next_token(logits[:, -1, :], 0.0)
+        self._set_cache_seq_len(cache, input_ids.size(1))
+        self._prefill_graph = captured
+        return captured
+
+    def _forward_prefill_static(self, input_ids: Tensor, cache: Llama3TensorParallelCache) -> Tensor:
+        logits, _ = self.forward(
+            input_ids,
+            cache=cache,
+            use_cache=True,
+            return_last_logits_only=True,
+            return_sharded_logits=True,
+        )
+        return logits
+
+    def try_decode_one_token_graph(
+        self,
+        input_ids: Tensor,
+        cache: Llama3TensorParallelCache,
+        *,
+        temperature: float = 0.0,
+    ) -> Tensor | None:
+        if self._decode_graph_failed or not _should_use_decode_step_graph(input_ids, cache, temperature):
+            return None
+        try:
+            return self._run_decode_step_graph(input_ids, cache)
+        except Exception as exc:
+            if os.environ.get("TORCHINFERNO_CUDAGRAPH_DECODE_DEBUG", "0") != "0":
+                print(f"rank={self.rank} decode_step_graph_failed={exc!r}", flush=True)
+            self._decode_graph_failed = True
+            return None
+
+    def _run_decode_step_graph(self, input_ids: Tensor, cache: Llama3TensorParallelCache) -> Tensor:
+        if cache.seq_len >= cache.layers[0].max_seq_len:
+            raise ValueError("KV cache capacity exceeded")
+        attention_block_size = _decode_attention_block_size(cache.seq_len + 1, cache.layers[0].max_seq_len)
+        captured = self._decode_graphs.get(attention_block_size)
+        if (
+            captured is None
+            or captured.cache is not cache
+            or captured.max_seq_len != cache.layers[0].max_seq_len
+            or captured.attention_block_size != attention_block_size
+            or captured.static_input_ids.shape != input_ids.shape
+        ):
+            captured = self._capture_decode_step_graph(input_ids, cache, attention_block_size)
+        else:
+            self._copy_decode_graph_inputs(captured, input_ids, cache)
+            captured.graph.replay()
+        self._advance_decode_graph_cache(cache)
+        return captured.output_token
+
+    def _capture_decode_step_graph(
+        self,
+        input_ids: Tensor,
+        cache: Llama3TensorParallelCache,
+        attention_block_size: int,
+    ) -> _StaticDecodeGraphCall:
+        static_input_ids = torch.empty_like(input_ids)
+        static_cache_position = torch.empty((), device=self.device, dtype=torch.int64)
+        static_attention_length = torch.empty((), device=self.device, dtype=torch.int64)
+        rotary_cache_dim = self.rotary_cos_cache.size(1)
+        static_rotary_cos = torch.empty((1, rotary_cache_dim), device=self.device, dtype=self.dtype)
+        static_rotary_sin = torch.empty((1, rotary_cache_dim), device=self.device, dtype=self.dtype)
+        captured = _StaticDecodeGraphCall(
+            graph=torch.cuda.CUDAGraph(),
+            static_input_ids=static_input_ids,
+            static_cache_position=static_cache_position,
+            static_attention_length=static_attention_length,
+            static_rotary_cos=static_rotary_cos,
+            static_rotary_sin=static_rotary_sin,
+            output_token=torch.empty((input_ids.size(0),), device=self.device, dtype=torch.long),
+            cache=cache,
+            max_seq_len=cache.layers[0].max_seq_len,
+            attention_block_size=attention_block_size,
+        )
+        self._copy_decode_graph_inputs(captured, input_ids, cache)
+        stream = torch.cuda.Stream(device=self.device)
+        stream.wait_stream(torch.cuda.current_stream(self.device))
+        with torch.cuda.stream(stream):
+            logits = self._forward_decode_static(
+                captured.static_input_ids,
+                cache,
+                captured.static_cache_position,
+                captured.static_attention_length,
+                (captured.static_rotary_cos, captured.static_rotary_sin),
+                attention_block_size,
+            )
+            self._sample_next_token(logits[:, -1, :], 0.0)
+        torch.cuda.current_stream(self.device).wait_stream(stream)
+        with torch.cuda.graph(captured.graph):
+            logits = self._forward_decode_static(
+                captured.static_input_ids,
+                cache,
+                captured.static_cache_position,
+                captured.static_attention_length,
+                (captured.static_rotary_cos, captured.static_rotary_sin),
+                attention_block_size,
+            )
+            captured.output_token = self._sample_next_token(logits[:, -1, :], 0.0)
+        self._decode_graph = captured
+        self._decode_graphs[attention_block_size] = captured
+        return captured
+
+    def _copy_decode_graph_inputs(
+        self,
+        captured: _StaticDecodeGraphCall,
+        input_ids: Tensor,
+        cache: Llama3TensorParallelCache,
+    ) -> None:
+        position = cache.seq_len
+        captured.static_input_ids.copy_(input_ids)
+        captured.static_cache_position.fill_(position)
+        captured.static_attention_length.fill_(position + 1)
+        captured.static_rotary_cos.copy_(self.rotary_cos_cache[position : position + 1])
+        captured.static_rotary_sin.copy_(self.rotary_sin_cache[position : position + 1])
+
+    def _advance_decode_graph_cache(self, cache: Llama3TensorParallelCache) -> None:
+        next_seq_len = cache.seq_len + 1
+        self._set_cache_seq_len(cache, next_seq_len)
+
+    @staticmethod
+    def _set_cache_seq_len(cache: Llama3TensorParallelCache, seq_len: int) -> None:
+        for layer_cache in cache.layers:
+            layer_cache.seq_len = seq_len
+
+    def _forward_decode_static(
+        self,
+        input_ids: Tensor,
+        cache: Llama3TensorParallelCache,
+        cache_position: Tensor,
+        attention_length: Tensor,
+        rotary: tuple[Tensor, Tensor],
+        attention_block_size: int | None = None,
+    ) -> Tensor:
+        hidden = F.embedding(input_ids.to(self.device, non_blocking=True), self.embed_tokens_weight)
+        attn_in: Tensor | None = None
+        for layer_id, layer in enumerate(self.layers):
+            next_norm_weight = (
+                self.layers[layer_id + 1].input_layernorm_weight
+                if layer_id + 1 < len(self.layers)
+                else self.norm_weight
+            )
+            hidden, attn_in = layer.forward_decode_static(
+                hidden,
+                attn_in,
+                rotary,
+                cache.layers[layer_id],
+                cache_position,
+                attention_length,
+                attention_block_size,
+                next_norm_weight,
+            )
+        if attn_in is None:
+            attn_in = _tp_decode_rms_norm(hidden, self.norm_weight, self.config.rms_norm_eps)
+        return _decode_linear(attn_in, self.lm_head_weight)
 
     @torch.inference_mode()
     def generate(
@@ -1057,6 +1646,18 @@ def _rotate_llama_eager(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
     return (x * cos) + (rotated * sin)
 
 
+def _decode_linear(x: Tensor, weight: Tensor) -> Tensor:
+    if (
+        x.is_cuda
+        and x.ndim == 3
+        and x.size(0) == 1
+        and x.size(1) == 1
+        and os.environ.get("TORCHINFERNO_DECODE_LINEAR_MV", "1") != "0"
+    ):
+        return torch.mv(weight, x.reshape(-1)).view(1, 1, weight.size(0))
+    return F.linear(x, weight)
+
+
 def _tp_rms_norm(x: Tensor, weight: Tensor, eps: float) -> Tensor:
     if x.is_cuda and weight.is_cuda and os.environ.get("TORCHINFERNO_TRITON_RMS_NORM", "0") != "0":
         try:
@@ -1068,8 +1669,47 @@ def _tp_rms_norm(x: Tensor, weight: Tensor, eps: float) -> Tensor:
     return _torch_rms_norm(x, weight, eps)
 
 
+def _tp_decode_rms_norm(x: Tensor, weight: Tensor, eps: float) -> Tensor:
+    if x.is_cuda and weight.is_cuda and os.environ.get("TORCHINFERNO_TRITON_DECODE_RMS_NORM", "1") != "0":
+        try:
+            from torchinferno.kernels import rms_norm as kernel_rms_norm
+
+            return kernel_rms_norm(x, weight, eps=eps)
+        except Exception:
+            pass
+    return _torch_rms_norm(x, weight, eps)
+
+
+def _tp_decode_add_rms_norm(x: Tensor, residual: Tensor, weight: Tensor, eps: float) -> tuple[Tensor, Tensor]:
+    if (
+        x.is_cuda
+        and residual.is_cuda
+        and weight.is_cuda
+        and os.environ.get("TORCHINFERNO_TRITON_DECODE_ADD_RMS_NORM", "1") != "0"
+    ):
+        try:
+            from torchinferno.kernels.triton_ops import triton_add_rms_norm
+
+            return triton_add_rms_norm(x, residual, weight, eps)
+        except Exception:
+            pass
+    hidden = residual + x
+    return hidden, _torch_rms_norm(hidden, weight, eps)
+
+
 def _tp_swiglu(gate: Tensor, up: Tensor) -> Tensor:
     if gate.is_cuda and up.is_cuda and os.environ.get("TORCHINFERNO_TRITON_SWIGLU", "0") != "0":
+        try:
+            from torchinferno.kernels import swiglu_activation
+
+            return swiglu_activation(gate, up)
+        except Exception:
+            pass
+    return F.silu(gate) * up
+
+
+def _tp_decode_swiglu(gate: Tensor, up: Tensor) -> Tensor:
+    if gate.is_cuda and up.is_cuda and os.environ.get("TORCHINFERNO_TRITON_DECODE_SWIGLU", "1") != "0":
         try:
             from torchinferno.kernels import swiglu_activation
 
@@ -1090,12 +1730,23 @@ def _should_use_mlp_project_graph(hidden: Tensor) -> bool:
 
 
 def _should_use_qkv_rotary_graph(hidden: Tensor) -> bool:
+    prefill_tokens = hidden.size(1) > 1 and os.environ.get("TORCHINFERNO_CUDAGRAPH_PREFILL_QKV_ROTARY", "1") != "0"
     return (
         hidden.is_cuda
         and hidden.ndim == 3
         and hidden.size(0) == 1
-        and hidden.size(1) == 1
-        and os.environ.get("TORCHINFERNO_CUDAGRAPH_QKV_ROTARY", "0") != "0"
+        and (hidden.size(1) == 1 or prefill_tokens)
+        and os.environ.get("TORCHINFERNO_CUDAGRAPH_QKV_ROTARY", "1") != "0"
+    )
+
+
+def _should_use_prefill_gate_up_activation_graph(hidden: Tensor) -> bool:
+    return (
+        hidden.is_cuda
+        and hidden.ndim == 3
+        and hidden.size(0) == 1
+        and hidden.size(1) > 1
+        and os.environ.get("TORCHINFERNO_CUDAGRAPH_PREFILL_GATE_UP", "1") != "0"
     )
 
 
@@ -1107,6 +1758,83 @@ def _should_use_attention_o_graph(hidden: Tensor) -> bool:
         and hidden.size(1) == 1
         and os.environ.get("TORCHINFERNO_CUDAGRAPH_ATTENTION_O", "1") != "0"
     )
+
+
+def _should_graph_all_reduce() -> bool:
+    return os.environ.get("TORCHINFERNO_CUDAGRAPH_ALLREDUCE", "0") != "0"
+
+
+def _should_use_decode_step_graph(
+    input_ids: Tensor,
+    cache: Llama3TensorParallelCache,
+    temperature: float,
+) -> bool:
+    return (
+        os.environ.get("TORCHINFERNO_CUDAGRAPH_DECODE_STEP", "1") != "0"
+        and temperature <= 0.0
+        and input_ids.is_cuda
+        and input_ids.ndim == 2
+        and input_ids.size(0) == 1
+        and input_ids.size(1) == 1
+        and bool(cache.layers)
+        and cache.layers[0].keys.is_cuda
+    )
+
+
+def _should_use_prefill_graph(
+    input_ids: Tensor,
+    cache: Llama3TensorParallelCache,
+    temperature: float,
+) -> bool:
+    return (
+        os.environ.get("TORCHINFERNO_CUDAGRAPH_PREFILL", "0") != "0"
+        and temperature <= 0.0
+        and input_ids.is_cuda
+        and input_ids.ndim == 2
+        and input_ids.size(0) == 1
+        and input_ids.size(1) > 1
+        and bool(cache.layers)
+        and cache.layers[0].keys.is_cuda
+    )
+
+
+def _decode_attention_block_size(attention_length: int, max_seq_len: int) -> int:
+    if os.environ.get("TORCHINFERNO_CUDAGRAPH_DECODE_ATTENTION_BLOCKS", "1") == "0":
+        return max_seq_len
+    if attention_length <= 1:
+        return 1
+    return min(max_seq_len, 1 << (attention_length - 1).bit_length())
+
+
+def _should_use_symm_mem_all_reduce(hidden: Tensor, weight: Tensor, world_size: int) -> bool:
+    return (
+        world_size > 1
+        and not _SYMM_REDUCE_DISABLED
+        and os.environ.get("TORCHINFERNO_SYMM_MEM_ALLREDUCE", "1") != "0"
+        and hidden.is_cuda
+        and weight.is_cuda
+        and hidden.ndim == 3
+        and hidden.size(0) == 1
+        and hidden.size(1) == 1
+    )
+
+
+def _should_use_symm_mem_prefill_all_reduce(hidden: Tensor, weight: Tensor, world_size: int) -> bool:
+    return (
+        world_size > 1
+        and not _SYMM_REDUCE_DISABLED
+        and os.environ.get("TORCHINFERNO_SYMM_MEM_PREFILL_ALLREDUCE", "1") != "0"
+        and hidden.is_cuda
+        and weight.is_cuda
+        and hidden.ndim == 3
+        and hidden.size(0) == 1
+        and hidden.size(1) > 1
+    )
+
+
+def _disable_symm_reduce() -> None:
+    global _SYMM_REDUCE_DISABLED
+    _SYMM_REDUCE_DISABLED = True
 
 
 def _rotate_interleaved_eager(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:

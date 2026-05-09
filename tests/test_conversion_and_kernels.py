@@ -119,12 +119,15 @@ def test_kernel_fallbacks_match_torch_reference() -> None:
 
 @pytest.mark.skipif(not torch.cuda.is_available() or not triton_available(), reason="CUDA Triton kernels unavailable")
 def test_triton_cuda_kernels_match_torch_reference() -> None:
+    from torchinferno.kernels.triton_ops import triton_add_rms_norm
+
     torch.manual_seed(14)
     gate = torch.randn(16, 32, device="cuda")
     up = torch.randn(16, 32, device="cuda")
     gate_bf16 = gate.to(torch.bfloat16)
     up_bf16 = up.to(torch.bfloat16)
     x = torch.randn(4, 8, 32, device="cuda")
+    residual = torch.randn_like(x)
     weight = torch.randn(32, device="cuda")
     config = KernelConfig(backend=KernelBackend.TRITON)
 
@@ -142,6 +145,15 @@ def test_triton_cuda_kernels_match_torch_reference() -> None:
     )
     expected_norm = x * torch.rsqrt(x.float().pow(2).mean(dim=-1, keepdim=True) + 1e-6).to(x.dtype) * weight
     torch.testing.assert_close(rms_norm(x, weight, eps=1e-6, config=config), expected_norm, atol=1e-5, rtol=1e-5)
+    expected_hidden = x + residual
+    expected_add_norm = (
+        expected_hidden
+        * torch.rsqrt(expected_hidden.float().pow(2).mean(dim=-1, keepdim=True) + 1e-6).to(x.dtype)
+        * weight
+    )
+    actual_hidden, actual_add_norm = triton_add_rms_norm(x, residual, weight, eps=1e-6)
+    torch.testing.assert_close(actual_hidden, expected_hidden, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(actual_add_norm, expected_add_norm, atol=1e-5, rtol=1e-5)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available() or not triton_available(), reason="CUDA Triton kernels unavailable")
@@ -227,10 +239,48 @@ def test_triton_kv_cache_append_matches_torch_reference() -> None:
     torch.testing.assert_close(cache_keys, expected_keys)
     torch.testing.assert_close(cache_values, expected_values)
 
+    cache_keys.zero_()
+    cache_values.zero_()
+    dynamic_seq_start = torch.tensor(seq_start, device="cuda", dtype=torch.int64)
+    triton_append_kv_cache(keys, values, cache_keys, cache_values, dynamic_seq_start)
+    torch.testing.assert_close(cache_keys, expected_keys)
+    torch.testing.assert_close(cache_values, expected_values)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or not triton_available(), reason="CUDA Triton kernels unavailable")
+def test_triton_decode_rotary_append_matches_torch_reference() -> None:
+    from torchinferno.kernels.triton_ops import triton_apply_rotary_append_kv_decode
+    from torchinferno.models.llama3_family.tensor_parallel import _rotate_llama_eager
+
+    torch.manual_seed(19)
+    batch, q_heads, kv_heads, head_dim, max_seq_len = 2, 4, 1, 16, 12
+    q = torch.randn(batch, q_heads, 1, head_dim, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(batch, kv_heads, 1, head_dim, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(batch, kv_heads, 1, head_dim, device="cuda", dtype=torch.bfloat16)
+    cache_keys = torch.zeros(batch, kv_heads, max_seq_len, head_dim, device="cuda", dtype=torch.bfloat16)
+    cache_values = torch.zeros_like(cache_keys)
+    freqs = torch.randn(1, head_dim // 2, device="cuda")
+    cos = freqs.cos().to(torch.bfloat16)
+    sin = freqs.sin().to(torch.bfloat16)
+    seq_start = torch.tensor(3, device="cuda", dtype=torch.int64)
+
+    expected_q = _rotate_llama_eager(q, cos[None, None, :, :], sin[None, None, :, :])
+    expected_k = _rotate_llama_eager(k, cos[None, None, :, :], sin[None, None, :, :])
+    expected_cache_keys = cache_keys.clone()
+    expected_cache_values = cache_values.clone()
+    expected_cache_keys[:, :, int(seq_start.item()) : int(seq_start.item()) + 1, :].copy_(expected_k)
+    expected_cache_values[:, :, int(seq_start.item()) : int(seq_start.item()) + 1, :].copy_(v)
+
+    actual_q = triton_apply_rotary_append_kv_decode(q.clone(), k, v, cache_keys, cache_values, seq_start, cos, sin)
+
+    torch.testing.assert_close(actual_q, expected_q, atol=4e-2, rtol=4e-2)
+    torch.testing.assert_close(cache_keys, expected_cache_keys, atol=4e-2, rtol=4e-2)
+    torch.testing.assert_close(cache_values, expected_cache_values)
+
 
 @pytest.mark.skipif(not torch.cuda.is_available() or not triton_available(), reason="CUDA Triton kernels unavailable")
 def test_triton_dense_gqa_decode_attention_matches_torch_reference() -> None:
-    from torchinferno.kernels.triton_ops import triton_dense_gqa_decode_attention
+    from torchinferno.kernels.triton_ops import triton_dense_gqa_decode_attention, triton_grouped_gqa_decode_attention
 
     torch.manual_seed(17)
     batch, q_heads, kv_heads, seq_len, head_dim = 2, 4, 2, 13, 16
@@ -249,3 +299,16 @@ def test_triton_dense_gqa_decode_attention_matches_torch_reference() -> None:
     actual = triton_dense_gqa_decode_attention(q, k, v)
 
     torch.testing.assert_close(actual, expected, atol=4e-2, rtol=4e-2)
+
+    padded_k = torch.zeros(batch, kv_heads, 32, head_dim, device="cuda", dtype=torch.bfloat16)
+    padded_v = torch.zeros_like(padded_k)
+    padded_k[:, :, :seq_len, :].copy_(k)
+    padded_v[:, :, :seq_len, :].copy_(v)
+    dynamic_seq_len = torch.tensor(seq_len, device="cuda", dtype=torch.int64)
+    dynamic_actual = triton_dense_gqa_decode_attention(q, padded_k, padded_v, seq_len=dynamic_seq_len)
+
+    torch.testing.assert_close(dynamic_actual, expected, atol=4e-2, rtol=4e-2)
+
+    grouped_actual = triton_grouped_gqa_decode_attention(q, padded_k, padded_v, dynamic_seq_len)
+
+    torch.testing.assert_close(grouped_actual, expected, atol=4e-2, rtol=4e-2)

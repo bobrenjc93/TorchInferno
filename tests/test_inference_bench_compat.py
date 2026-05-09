@@ -89,10 +89,9 @@ def test_inference_bench_provider_adapter_points_at_openai_server() -> None:
     provider = provider_path.read_text()
     assert "@register(\"torchinferno\")" in provider
     assert ".[serve]" in provider
-    assert "torch.distributed.run" in provider
     assert "torchinferno.openai_server" in provider
     assert "--tensor-parallel-size" in provider
-    assert "--llama-parallelism" in provider
+    assert "--llama-parallelism" not in provider
 
 
 def test_chat_template_batch_encoding_input_ids_are_extracted() -> None:
