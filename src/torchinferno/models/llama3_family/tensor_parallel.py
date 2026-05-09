@@ -181,6 +181,10 @@ class _Llama3TensorParallelLayer:
         self.o_proj_weight = weights["self_attn.o_proj.weight"]
         self.gate_up_proj_weight = weights["mlp.gate_up_proj.weight"]
         self.down_proj_weight = weights["mlp.down_proj.weight"]
+        self.qkv_proj_weight_decode = _maybe_decode_weight_t(self.qkv_proj_weight)
+        self.o_proj_weight_decode = _maybe_decode_weight_t(self.o_proj_weight)
+        self.gate_up_proj_weight_decode = _maybe_decode_weight_t(self.gate_up_proj_weight)
+        self.down_proj_weight_decode = _maybe_decode_weight_t(self.down_proj_weight)
         self.inv_freq = _build_inv_freq(config, device)
         self.profile_seconds: dict[str, float] | None = None
         self.profile_counts: dict[str, int] | None = None
@@ -413,15 +417,15 @@ class _Llama3TensorParallelLayer:
         else:
             out = triton_dense_gqa_decode_attention(q, attention_keys, attention_values, seq_len=attention_length)
         out = out.transpose(1, 2).contiguous().view(batch, tokens, self.local_hidden_size)
-        return self._decode_linear_all_reduce(out, self.o_proj_weight, "attention")
+        return self._decode_linear_all_reduce(out, self.o_proj_weight, "attention", self.o_proj_weight_decode)
 
     def _mlp_project_decode_reduce(self, hidden: Tensor) -> Tensor:
-        gate, up = _decode_linear(hidden, self.gate_up_proj_weight).split(
+        gate, up = _decode_linear(hidden, self.gate_up_proj_weight, self.gate_up_proj_weight_decode).split(
             (self.local_intermediate_size, self.local_intermediate_size),
             dim=-1,
         )
         activated = _tp_decode_swiglu(gate, up)
-        return self._decode_linear_all_reduce(activated, self.down_proj_weight, "mlp")
+        return self._decode_linear_all_reduce(activated, self.down_proj_weight, "mlp", self.down_proj_weight_decode)
 
     def _mlp_project_prefill_reduce(self, hidden: Tensor) -> Tensor | None:
         if not _should_use_symm_mem_prefill_all_reduce(hidden, self.down_proj_weight, self.world_size):
@@ -477,18 +481,27 @@ class _Llama3TensorParallelLayer:
         )
         return _tp_swiglu(gate, up)
 
-    def _decode_linear_all_reduce(self, hidden: Tensor, weight: Tensor, buffer_name: str) -> Tensor:
+    def _decode_linear_all_reduce(
+        self,
+        hidden: Tensor,
+        weight: Tensor,
+        buffer_name: str,
+        weight_t: Tensor | None = None,
+    ) -> Tensor:
         if _should_use_symm_mem_all_reduce(hidden, weight, self.world_size) and not self._symm_reduce_failed:
             try:
                 expected_shape = (1, 1, weight.size(0))
                 buffer, group_name = self._symm_reduce_buffer(buffer_name, hidden, expected_shape)
-                torch.mv(weight, hidden.reshape(-1), out=buffer.view(-1))
+                if weight_t is not None:
+                    torch.mm(hidden.reshape(1, -1), weight_t, out=buffer.reshape(1, -1))
+                else:
+                    torch.mv(weight, hidden.reshape(-1), out=buffer.view(-1))
                 torch.ops.symm_mem.multimem_all_reduce_(buffer, "sum", group_name)
                 return buffer
             except Exception:
                 self._symm_reduce_failed = True
                 _disable_symm_reduce()
-        projected = _decode_linear(hidden, weight)
+        projected = _decode_linear(hidden, weight, weight_t)
         _all_reduce(projected)
         return projected
 
@@ -566,12 +579,12 @@ class _Llama3TensorParallelLayer:
         return self._mlp_project_eager(hidden)
 
     def _mlp_project_eager(self, hidden: Tensor) -> Tensor:
-        gate, up = _decode_linear(hidden, self.gate_up_proj_weight).split(
+        gate, up = _decode_linear(hidden, self.gate_up_proj_weight, self.gate_up_proj_weight_decode).split(
             (self.local_intermediate_size, self.local_intermediate_size),
             dim=-1,
         )
         activated = _tp_swiglu(gate, up)
-        return _decode_linear(activated, self.down_proj_weight)
+        return _decode_linear(activated, self.down_proj_weight, self.down_proj_weight_decode)
 
     def _run_mlp_project_graph(self, hidden: Tensor) -> Tensor:
         captured = self._mlp_project_graph
@@ -669,7 +682,7 @@ class _Llama3TensorParallelLayer:
                 return self._run_attention_o_graph(hidden)
             except Exception:
                 self._attention_o_graph_failed = True
-        return _decode_linear(hidden, self.o_proj_weight)
+        return _decode_linear(hidden, self.o_proj_weight, self.o_proj_weight_decode)
 
     def _run_attention_o_graph(self, hidden: Tensor) -> Tensor:
         captured = self._attention_o_graph
@@ -679,11 +692,11 @@ class _Llama3TensorParallelLayer:
             stream = torch.cuda.Stream(device=hidden.device)
             stream.wait_stream(torch.cuda.current_stream(hidden.device))
             with torch.cuda.stream(stream):
-                _decode_linear(static_input, self.o_proj_weight)
+                _decode_linear(static_input, self.o_proj_weight, self.o_proj_weight_decode)
             torch.cuda.current_stream(hidden.device).wait_stream(stream)
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
-                output = _decode_linear(static_input, self.o_proj_weight)
+                output = _decode_linear(static_input, self.o_proj_weight, self.o_proj_weight_decode)
             captured = _StaticCudaGraphCall(graph=graph, static_input=static_input, output=output)
             self._attention_o_graph = captured
             captured.graph.replay()
@@ -713,12 +726,12 @@ class _Llama3TensorParallelLayer:
             stream = torch.cuda.Stream(device=hidden.device)
             stream.wait_stream(torch.cuda.current_stream(hidden.device))
             with torch.cuda.stream(stream):
-                projected = _decode_linear(static_input, self.o_proj_weight)
+                projected = _decode_linear(static_input, self.o_proj_weight, self.o_proj_weight_decode)
                 _all_reduce(projected)
             torch.cuda.current_stream(hidden.device).wait_stream(stream)
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
-                output = _decode_linear(static_input, self.o_proj_weight)
+                output = _decode_linear(static_input, self.o_proj_weight, self.o_proj_weight_decode)
                 _all_reduce(output)
             captured = _StaticCudaGraphCall(graph=graph, static_input=static_input, output=output)
             self._attention_o_graph = captured
@@ -729,7 +742,7 @@ class _Llama3TensorParallelLayer:
         return captured.output
 
     def _qkv(self, hidden: Tensor, batch: int, tokens: int, head_dim: int) -> tuple[Tensor, Tensor, Tensor]:
-        qkv = _decode_linear(hidden, self.qkv_proj_weight)
+        qkv = _decode_linear(hidden, self.qkv_proj_weight, self.qkv_proj_weight_decode)
         q, k, v = qkv.split(
             (self.local_hidden_size, self.local_key_value_size, self.local_key_value_size),
             dim=-1,
@@ -981,6 +994,7 @@ class Llama3TensorParallelForCausalLM:
         self.embed_tokens_weight = embed_tokens_weight
         self.norm_weight = norm_weight
         self.lm_head_weight = lm_head_weight
+        self.lm_head_weight_decode = _maybe_decode_weight_t(lm_head_weight)
         self.layers = layers
         self.rank = rank
         self.local_rank = local_rank
@@ -1483,7 +1497,7 @@ class Llama3TensorParallelForCausalLM:
             )
         if attn_in is None:
             attn_in = _tp_decode_rms_norm(hidden, self.norm_weight, self.config.rms_norm_eps)
-        return _decode_linear(attn_in, self.lm_head_weight)
+        return _decode_linear(attn_in, self.lm_head_weight, self.lm_head_weight_decode)
 
     @torch.inference_mode()
     def generate(
@@ -1530,6 +1544,11 @@ class Llama3TensorParallelForCausalLM:
         return self._sample_next_token_temperature(logits, temperature)
 
     def _sample_next_token_greedy(self, logits: Tensor) -> Tensor:
+        if os.environ.get("TORCHINFERNO_GREEDY_SAMPLE_GATHER", "1") != "0":
+            try:
+                return self._sample_next_token_greedy_gather(logits)
+            except Exception:
+                pass
         local_values, local_indices = torch.max(logits.float(), dim=-1)
         global_values = local_values.clone()
         dist.all_reduce(global_values, op=dist.ReduceOp.MAX)
@@ -1538,6 +1557,23 @@ class Llama3TensorParallelForCausalLM:
         next_token = torch.where(local_values == global_values, local_tokens, sentinel)
         dist.all_reduce(next_token, op=dist.ReduceOp.MIN)
         return next_token
+
+    def _sample_next_token_greedy_gather(self, logits: Tensor) -> Tensor:
+        local_values, local_indices = torch.max(logits.float(), dim=-1)
+        local_tokens = (local_indices + self.vocab_start).to(torch.float32)
+        local_pairs = torch.stack((local_values, local_tokens), dim=-1).contiguous()
+        gathered = torch.empty(
+            (self.world_size, *local_pairs.shape),
+            dtype=torch.float32,
+            device=self.device,
+        )
+        dist.all_gather_into_tensor(gathered, local_pairs)
+        values = gathered[..., 0]
+        tokens = gathered[..., 1].to(torch.long)
+        global_values = values.max(dim=0).values
+        sentinel = torch.full_like(tokens, self.config.vocab_size)
+        candidate_tokens = torch.where(values == global_values[None, :], tokens, sentinel)
+        return candidate_tokens.min(dim=0).values
 
     def _sample_next_token_temperature(self, logits: Tensor, temperature: float) -> Tensor:
         logits_float = logits.float() / temperature
@@ -1674,7 +1710,7 @@ def _rotate_llama_eager(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
     return (x * cos) + (rotated * sin)
 
 
-def _decode_linear(x: Tensor, weight: Tensor) -> Tensor:
+def _decode_linear(x: Tensor, weight: Tensor, weight_t: Tensor | None = None) -> Tensor:
     if (
         x.is_cuda
         and x.ndim == 3
@@ -1682,8 +1718,23 @@ def _decode_linear(x: Tensor, weight: Tensor) -> Tensor:
         and x.size(1) == 1
         and os.environ.get("TORCHINFERNO_DECODE_LINEAR_MV", "1") != "0"
     ):
+        if weight_t is not None:
+            return torch.mm(x.reshape(1, -1), weight_t).view(1, 1, weight.size(0))
         return torch.mv(weight, x.reshape(-1)).view(1, 1, weight.size(0))
     return F.linear(x, weight)
+
+
+def _maybe_decode_weight_t(weight: Tensor) -> Tensor | None:
+    if (
+        not weight.is_cuda
+        or os.environ.get("TORCHINFERNO_DECODE_TRANSPOSED_WEIGHTS", "1") == "0"
+        or weight.ndim != 2
+    ):
+        return None
+    try:
+        return weight.t().contiguous()
+    except Exception:
+        return None
 
 
 def _tp_rms_norm(x: Tensor, weight: Tensor, eps: float) -> Tensor:

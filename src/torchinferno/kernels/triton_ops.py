@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 import torch
 from torch import Tensor
 
@@ -977,6 +979,7 @@ def triton_grouped_gqa_decode_attention(q: Tensor, k: Tensor, v: Tensor, seq_len
     if block_d > 256 or block_v > 256:
         raise ValueError("grouped GQA decode attention supports head dimensions up to 256")
     out = torch.empty((batch, q_heads, 1, value_dim), device=q.device, dtype=q.dtype)
+    num_warps = int(os.environ.get("TORCHINFERNO_TRITON_GROUPED_DECODE_ATTENTION_WARPS", "4"))
     _grouped_gqa_decode_attention_dynamic_kernel[(batch, kv_heads)](
         q,
         k,
@@ -1009,7 +1012,7 @@ def triton_grouped_gqa_decode_attention(q: Tensor, k: Tensor, v: Tensor, seq_len
         block_s,
         block_d,
         block_v,
-        num_warps=4,
+        num_warps=num_warps,
     )
     return out
 

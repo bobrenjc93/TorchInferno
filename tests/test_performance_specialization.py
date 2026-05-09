@@ -19,6 +19,7 @@ from torchinferno.kernels import (
 )
 from torchinferno.kernels.ops import triton_available
 from torchinferno.kernels.passes import register_kernel_replacement_passes
+from torchinferno.models.llama3_family.tensor_parallel import _decode_linear
 from torchinferno.research.benchmarks import benchmark_callable
 from torchinferno.research.helion import (
     HelionCandidateConfig,
@@ -176,6 +177,20 @@ def test_fused_rmsnorm_swiglu_custom_op_has_fake_tensor_trace() -> None:
         node.op == "call_function" and node.target == torch.ops.torchinferno.fused_rmsnorm_swiglu.default
         for node in graph_module.graph.nodes
     )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
+def test_decode_linear_uses_transposed_weight_layout() -> None:
+    torch.manual_seed(47)
+    device = torch.device("cuda")
+    x = torch.randn(1, 1, 32, device=device, dtype=torch.bfloat16)
+    weight = torch.randn(48, 32, device=device, dtype=torch.bfloat16)
+    weight_t = weight.t().contiguous()
+
+    actual = _decode_linear(x, weight, weight_t)
+    expected = F.linear(x, weight)
+
+    torch.testing.assert_close(actual, expected)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available() or not triton_available(), reason="CUDA Triton unavailable")
