@@ -31,6 +31,12 @@ The same core checks are available as `make audit`, `make test`, and
 `make smoke`. Focused profiling shortcuts are available as `make profile`,
 `make profile-region`, and `make profile-pattern`.
 
+## Git Pushes
+
+When asked to push, use `agentexec git push ...`. Direct `git push` may be
+blocked by local command policy or lack interactive HTTPS credentials in agent
+sessions.
+
 ## Fast Profile Loops
 
 - Use `profile-run` when you need a full generation graph, memory profile,
