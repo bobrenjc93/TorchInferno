@@ -78,6 +78,15 @@ class _GenerationResult:
     tokens: list[int]
 
 
+@dataclass(frozen=True)
+class _PrefixCacheEntry:
+    tokens: tuple[int, ...]
+    layers: tuple[tuple[Tensor, Tensor], ...]
+    device: str
+    backend: str
+    page_size: int
+
+
 class _ByteFallbackTokenizer:
     eos_token_id: int | None = None
 
@@ -220,6 +229,7 @@ class OpenAICompletionEngine:
         self._worker: threading.Thread | None = None
         self._cache_pool: dict[tuple[int, int, str, int, str], object] = {}
         self._microbatch_cache_pool: dict[tuple[int, int, int, str, int, str], object] = {}
+        self._prefix_cache_entry: _PrefixCacheEntry | None = None
         self._phase_timing_enabled = os.environ.get("TORCHINFERNO_OPENAI_PHASE_TIMINGS", "0") != "0"
         self._phase_records: list[dict[str, float]] = []
         self._phase_records_lock = threading.Lock()
@@ -600,6 +610,102 @@ class OpenAICompletionEngine:
             self._microbatch_cache_pool[key] = cache
         return cache
 
+    def _restore_prefix_cache(self, input_ids: Tensor, cache: object) -> int:
+        if os.environ.get("TORCHINFERNO_OPENAI_PREFIX_CACHE", "1") == "0":
+            return 0
+        if input_ids.size(0) != 1:
+            return 0
+        entry = self._prefix_cache_entry
+        if entry is None:
+            return 0
+        if entry.device != str(self.device) or entry.backend != self.cache_backend or entry.page_size != self.page_size:
+            return 0
+        cache_layers = tuple(getattr(cache, "layers", ()) or ())
+        if not cache_layers or len(cache_layers) != len(entry.layers):
+            return 0
+        input_tokens = tuple(int(token_id) for token_id in input_ids[0].detach().cpu().tolist())
+        max_prefix = min(len(input_tokens) - 1, len(entry.tokens))
+        min_prefix = max(1, int(os.environ.get("TORCHINFERNO_OPENAI_PREFIX_CACHE_MIN_TOKENS", "16")))
+        while max_prefix >= min_prefix:
+            if input_tokens[:max_prefix] == entry.tokens[:max_prefix]:
+                break
+            max_prefix -= 1
+        if max_prefix < min_prefix:
+            return 0
+        layer_pairs: list[tuple[object, Tensor, Tensor, Tensor, Tensor]] = []
+        for layer, (keys, values) in zip(cache_layers, entry.layers):
+            layer_keys = getattr(layer, "keys", None)
+            layer_values = getattr(layer, "values", None)
+            if not isinstance(layer_keys, Tensor) or not isinstance(layer_values, Tensor):
+                return 0
+            if layer_keys.size(0) < 1 or layer_keys.size(2) < max_prefix:
+                return 0
+            layer_pairs.append((layer, layer_keys, layer_values, keys, values))
+        for layer, layer_keys, layer_values, keys, values in layer_pairs:
+            layer_keys[:1, :, :max_prefix, :].copy_(keys[:, :, :max_prefix, :])
+            layer_values[:1, :, :max_prefix, :].copy_(values[:, :, :max_prefix, :])
+            if hasattr(layer, "seq_len"):
+                setattr(layer, "seq_len", max_prefix)
+        if hasattr(cache, "seq_len"):
+            try:
+                setattr(cache, "seq_len", max_prefix)
+            except Exception:
+                pass
+        return max_prefix
+
+    def _save_prefix_cache(self, input_ids: Tensor, generated_tokens: list[int], cache: object) -> None:
+        if os.environ.get("TORCHINFERNO_OPENAI_PREFIX_CACHE", "1") == "0":
+            return
+        if input_ids.size(0) != 1 or not generated_tokens:
+            return
+        cache_layers = tuple(getattr(cache, "layers", ()) or ())
+        if not cache_layers:
+            return
+        input_tokens = tuple(int(token_id) for token_id in input_ids[0].detach().cpu().tolist())
+        tokens = (*input_tokens, *(int(token_id) for token_id in generated_tokens))
+        max_tokens = max(1, int(os.environ.get("TORCHINFERNO_OPENAI_PREFIX_CACHE_MAX_TOKENS", "1024")))
+        if len(tokens) > max_tokens:
+            self._prefix_cache_entry = None
+            return
+        self._materialize_generated_cache_tokens(input_ids, generated_tokens, cache)
+        seq_len = min(len(tokens), _generation_cache_seq_len(cache))
+        if seq_len < len(tokens):
+            self._prefix_cache_entry = None
+            return
+        layers: list[tuple[Tensor, Tensor]] = []
+        for layer in cache_layers:
+            keys = getattr(layer, "keys", None)
+            values = getattr(layer, "values", None)
+            if not isinstance(keys, Tensor) or not isinstance(values, Tensor):
+                self._prefix_cache_entry = None
+                return
+            layers.append(
+                (
+                    keys[:1, :, :seq_len, :].detach().clone(),
+                    values[:1, :, :seq_len, :].detach().clone(),
+                )
+            )
+        self._prefix_cache_entry = _PrefixCacheEntry(
+            tokens=tokens[:seq_len],
+            layers=tuple(layers),
+            device=str(self.device),
+            backend=self.cache_backend,
+            page_size=self.page_size,
+        )
+
+    def _materialize_generated_cache_tokens(
+        self,
+        input_ids: Tensor,
+        generated_tokens: list[int],
+        cache: object,
+    ) -> None:
+        cached_generated_tokens = max(0, _generation_cache_seq_len(cache) - input_ids.size(1))
+        missing = generated_tokens[cached_generated_tokens:]
+        if not missing:
+            return
+        token_tensor = torch.tensor([missing], dtype=torch.long, device=self.device)
+        _forward(self.model, token_tensor, cache)
+
     def _warmup_tokenizer(self) -> None:
         if os.environ.get("TORCHINFERNO_OPENAI_TOKENIZER_WARMUP", "1") == "0":
             return
@@ -631,6 +737,7 @@ class OpenAICompletionEngine:
                     max_tokens=new_tokens,
                     temperature=0.0,
                     broadcast_tensor_parallel=False,
+                    update_prefix_cache=False,
                 ):
                     pass
             self._warmup_tensor_parallel_prefill_graphs(prompt_token_counts, vocab_size)
@@ -740,6 +847,7 @@ class OpenAICompletionEngine:
         temperature: float,
         broadcast_tensor_parallel: bool = True,
         phase: dict[str, float] | None = None,
+        update_prefix_cache: bool = True,
     ) -> Iterator[int]:
         if max_tokens <= 0:
             return
@@ -778,15 +886,27 @@ class OpenAICompletionEngine:
             model=model,
         )
         self._mark_phase(phase, "cache_done")
+        prefix_len = self._restore_prefix_cache(input_ids, cache) if update_prefix_cache else 0
+        if phase is not None:
+            phase["prefix_cache_tokens"] = float(prefix_len)
+        if prefix_len > 0:
+            self._mark_phase(phase, "prefix_cache_done")
+        prefill_input_ids = input_ids[:, prefix_len:] if 0 < prefix_len < input_ids.size(1) else input_ids
+        if phase is not None:
+            phase["prefill_tokens"] = float(prefill_input_ids.size(1))
         self._mark_phase(phase, "prefill_start")
-        prefill_token = _try_prefill_graph(model, input_ids, cache, temperature)
-        if prefill_token is None:
-            prefill_logits = _try_prefill_logits_graph(model, input_ids, cache)
-        else:
+        if prefix_len > 0 and prefill_input_ids.size(1) < input_ids.size(1):
+            prefill_token = None
             prefill_logits = None
+        else:
+            prefill_token = _try_prefill_graph(model, prefill_input_ids, cache, temperature)
+            if prefill_token is None:
+                prefill_logits = _try_prefill_logits_graph(model, prefill_input_ids, cache)
+            else:
+                prefill_logits = None
         if prefill_token is None and prefill_logits is None:
             self._mark_phase(phase, "first_forward_start")
-            logits, cache = _forward(model, input_ids, cache)
+            logits, cache = _forward(model, prefill_input_ids, cache)
             self._mark_phase(phase, "first_forward_done")
             next_token = _sample(model, logits[:, -1, :], temperature).to(self.device)
             self._mark_phase(phase, "prefill_sample_done")
@@ -796,11 +916,13 @@ class OpenAICompletionEngine:
         else:
             next_token = prefill_token.to(self.device)
             self._mark_phase(phase, "prefill_graph_done")
+        generated_tokens: list[int] = []
         for step in range(max_tokens):
             if step == 0:
                 self._mark_phase(phase, "first_token_sync_start")
             token_tensor = next_token
             token_id = int(token_tensor.item())
+            generated_tokens.append(token_id)
             if step == 0:
                 self._mark_phase(phase, "first_token_ready")
                 self._record_phase(phase)
@@ -811,6 +933,8 @@ class OpenAICompletionEngine:
                 break
             next_token, cache = _decode_next_token(model, token_tensor[:, None], cache, temperature)
             next_token = next_token.to(self.device)
+        if update_prefix_cache:
+            self._save_prefix_cache(input_ids, generated_tokens, cache)
 
     @torch.inference_mode()
     def _generate_batch_steps(
@@ -1520,9 +1644,19 @@ def _generation_cache_capacity(model: object, requested_tokens: int) -> int:
     return requested_tokens
 
 
+def _generation_cache_seq_len(cache: object) -> int:
+    layers = getattr(cache, "layers", ()) or ()
+    for layer in layers:
+        seq_len = getattr(layer, "seq_len", None)
+        if seq_len is not None:
+            return int(seq_len)
+    seq_len = getattr(cache, "seq_len", 0)
+    return int(seq_len) if seq_len is not None else 0
+
+
 def _warmup_prompt_token_counts(default_prompt_tokens: int) -> tuple[int, ...]:
     default_buckets = (
-        f"{default_prompt_tokens},55,99,128,134,136,144,153,161,169,178,186,256"
+        f"{default_prompt_tokens},55,71,87,99,103,119,128,134,136,144,152,153,161,168,169,178,186,256"
     )
     raw = os.environ.get("TORCHINFERNO_OPENAI_WARMUP_PROMPT_TOKEN_BUCKETS", default_buckets)
     counts: list[int] = []

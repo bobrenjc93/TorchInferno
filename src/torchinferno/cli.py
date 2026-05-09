@@ -466,6 +466,21 @@ class _OpenAIMicrobenchModel:
         return logits, cache
 
 
+_OPENAI_MULTI_TURN_SYSTEM_PROMPT = (
+    "You are a calculator. Respond with only the numerical answer, nothing else."
+)
+_OPENAI_MULTI_TURN_EQUATIONS: tuple[tuple[str, str], ...] = (
+    ("8 + 13 =", "21"),
+    ("95 - 38 =", "57"),
+    ("6 * 14 =", "84"),
+    ("72 / 9 =", "8"),
+    ("234 + 567 =", "801"),
+    ("1024 - 512 =", "512"),
+    ("33 * 11 =", "363"),
+    ("450 / 15 =", "30"),
+)
+
+
 def run_openai_microbench(args: argparse.Namespace) -> int:
     if args.phase_timings:
         os.environ["TORCHINFERNO_OPENAI_PHASE_TIMINGS"] = "1"
@@ -494,7 +509,7 @@ def run_openai_microbench(args: argparse.Namespace) -> int:
 
         print("TorchInferno OpenAI microbench")
         print(
-            f"backend={args.backend} device={engine.device} prompt_tokens={args.prompt_tokens} "
+            f"backend={args.backend} scenario={args.scenario} device={engine.device} prompt_tokens={args.prompt_tokens} "
             f"max_tokens={args.max_tokens} warmup={args.warmup} iters={args.iters} "
             f"batch_wait_ms={args.batch_wait_ms:g}"
         )
@@ -503,6 +518,7 @@ def run_openai_microbench(args: argparse.Namespace) -> int:
         results: dict[str, object] = {
             "backend": args.backend,
             "device": str(engine.device),
+            "scenario": args.scenario,
             "prompt_tokens": args.prompt_tokens,
             "max_tokens": args.max_tokens,
             "batch_wait_ms": args.batch_wait_ms,
@@ -517,6 +533,7 @@ def run_openai_microbench(args: argparse.Namespace) -> int:
                 concurrency=concurrency,
                 warmup=args.warmup,
                 iters=args.iters,
+                scenario=args.scenario,
                 prompt_tokens=args.prompt_tokens,
                 max_tokens=args.max_tokens,
                 temperature=args.temperature,
@@ -537,6 +554,9 @@ def run_openai_microbench(args: argparse.Namespace) -> int:
                     f"request_to_first_forward_p50_ms={phase_summary.get('request_to_first_forward_p50_ms', 0.0):.3f} "
                     f"broadcast_p50_ms={phase_summary.get('broadcast_p50_ms', 0.0):.3f} "
                     f"cache_p50_ms={phase_summary.get('cache_p50_ms', 0.0):.3f} "
+                    f"prefix_cache_p50_ms={phase_summary.get('prefix_cache_p50_ms', 0.0):.3f} "
+                    f"prefix_cache_tokens_p50={phase_summary.get('prefix_cache_tokens_p50', 0.0):.0f} "
+                    f"prefill_tokens_p50={phase_summary.get('prefill_tokens_p50', 0.0):.0f} "
                     f"prefill_forward_p50_ms={phase_summary.get('prefill_forward_p50_ms', 0.0):.3f} "
                     f"sample_p50_ms={phase_summary.get('sample_p50_ms', 0.0):.3f} "
                     f"first_token_sync_p50_ms={phase_summary.get('first_token_sync_p50_ms', 0.0):.3f}"
@@ -611,15 +631,16 @@ def _run_openai_microbench_case(
     concurrency: int,
     warmup: int,
     iters: int,
+    scenario: str,
     prompt_tokens: int,
     max_tokens: int,
     temperature: float,
     phase_timings: bool = False,
     profile_breakdown: bool = False,
-) -> dict[str, float | int | str | dict[str, float]]:
+) -> dict[str, object]:
     del label
     for _ in range(warmup):
-        _run_openai_microbench_iteration(engine, concurrency, prompt_tokens, max_tokens, temperature)
+        _run_openai_microbench_iteration(engine, concurrency, scenario, prompt_tokens, max_tokens, temperature)
     if phase_timings and hasattr(engine, "pop_phase_records"):
         engine.pop_phase_records()
     if profile_breakdown and hasattr(engine.model, "enable_profile"):
@@ -629,11 +650,18 @@ def _run_openai_microbench_case(
     measurements = [
         metric
         for _ in range(iters)
-        for metric in _run_openai_microbench_iteration(engine, concurrency, prompt_tokens, max_tokens, temperature)
+        for metric in _run_openai_microbench_iteration(
+            engine,
+            concurrency,
+            scenario,
+            prompt_tokens,
+            max_tokens,
+            temperature,
+        )
     ]
     call_slice = getattr(engine.model, "calls", ())[start_calls:]
     max_model_batch = max((batch for batch, _tokens in call_slice), default=0)
-    result: dict[str, float | int | str | dict[str, float]] = {
+    result: dict[str, object] = {
         "requests": len(measurements),
         "ttft_p50_ms": _median([metric["ttft_ms"] for metric in measurements]),
         "ttft_p99_ms": _p99([metric["ttft_ms"] for metric in measurements]),
@@ -645,6 +673,7 @@ def _run_openai_microbench_case(
         "output_tokens_p50": _median([metric["output_tokens"] for metric in measurements]),
         "model_forward_calls": len(call_slice),
         "max_model_batch": max_model_batch,
+        "raw_requests": measurements,
     }
     if phase_timings and hasattr(engine, "pop_phase_records"):
         phase_records = engine.pop_phase_records()
@@ -658,12 +687,19 @@ def _summarize_openai_phase_records(records: list[dict[str, float]]) -> dict[str
         values = [(record[end] - record[start]) * 1000.0 for record in records if start in record and end in record]
         return _median(values) if values else 0.0
 
+    def value(name: str) -> float:
+        values = [record[name] for record in records if name in record]
+        return _median(values) if values else 0.0
+
     return {
         "request_to_first_forward_p50_ms": duration("request_start", "first_forward_start"),
         "encode_p50_ms": duration("request_start", "encoded_prompt"),
         "input_tensor_p50_ms": duration("encoded_prompt", "built_input_tensor"),
         "broadcast_p50_ms": duration("broadcast_start", "broadcast_done"),
         "cache_p50_ms": duration("cache_start", "cache_done"),
+        "prefix_cache_p50_ms": duration("cache_done", "prefix_cache_done"),
+        "prefix_cache_tokens_p50": value("prefix_cache_tokens"),
+        "prefill_tokens_p50": value("prefill_tokens"),
         "prefill_forward_p50_ms": duration("first_forward_start", "first_forward_done"),
         "sample_p50_ms": duration("first_forward_done", "prefill_sample_done"),
         "first_token_sync_p50_ms": duration("first_token_sync_start", "first_token_ready"),
@@ -674,13 +710,18 @@ def _summarize_openai_phase_records(records: list[dict[str, float]]) -> dict[str
 def _run_openai_microbench_iteration(
     engine: OpenAICompletionEngine,
     concurrency: int,
+    scenario: str,
     prompt_tokens: int,
     max_tokens: int,
     temperature: float,
 ) -> list[dict[str, float]]:
     _sync_openai_engine(engine)
+    if scenario == "multi-turn":
+        metrics = _run_openai_microbench_multi_turn_iteration(engine, max_tokens, temperature)
+        _sync_openai_engine(engine)
+        return metrics
     if concurrency == 1:
-        metrics = [_run_openai_microbench_request(engine, 0, prompt_tokens, max_tokens, temperature)]
+        metrics = [_run_openai_microbench_request(engine, 0, scenario, prompt_tokens, max_tokens, temperature)]
         _sync_openai_engine(engine)
         return metrics
 
@@ -691,7 +732,14 @@ def _run_openai_microbench_iteration(
     def worker(index: int) -> None:
         try:
             barrier.wait()
-            results[index] = _run_openai_microbench_request(engine, index, prompt_tokens, max_tokens, temperature)
+            results[index] = _run_openai_microbench_request(
+                engine,
+                index,
+                scenario,
+                prompt_tokens,
+                max_tokens,
+                temperature,
+            )
         except BaseException as exc:
             errors.append(exc)
 
@@ -710,15 +758,48 @@ def _run_openai_microbench_iteration(
 def _run_openai_microbench_request(
     engine: OpenAICompletionEngine,
     request_index: int,
+    scenario: str,
     prompt_tokens: int,
     max_tokens: int,
     temperature: float,
 ) -> dict[str, float]:
-    messages = [{"role": "user", "content": _microbench_prompt_text(prompt_tokens, request_index)}]
+    messages = _microbench_messages(scenario, prompt_tokens, request_index)
+    metrics, _content = _run_openai_microbench_messages(engine, messages, max_tokens, temperature)
+    return metrics
+
+
+def _run_openai_microbench_multi_turn_iteration(
+    engine: OpenAICompletionEngine,
+    max_tokens: int,
+    temperature: float,
+) -> list[dict[str, float]]:
+    messages: list[dict[str, object]] = [
+        {"role": "system", "content": _OPENAI_MULTI_TURN_SYSTEM_PROMPT},
+    ]
+    metrics: list[dict[str, float]] = []
+    for equation, _expected in _OPENAI_MULTI_TURN_EQUATIONS:
+        messages.append({"role": "user", "content": equation})
+        request_metrics, content = _run_openai_microbench_messages(engine, messages, max_tokens, temperature)
+        metrics.append(request_metrics)
+        messages.append({"role": "assistant", "content": content})
+    return metrics
+
+
+def _run_openai_microbench_messages(
+    engine: OpenAICompletionEngine,
+    messages: list[dict[str, object]],
+    max_tokens: int,
+    temperature: float,
+) -> tuple[dict[str, float], str]:
     start = time.perf_counter()
     token_times: list[float] = []
-    for _token in engine.generate_chat_tokens(messages, max_tokens=max_tokens, temperature=temperature):
+    chunks: list[str] = []
+    for token_id in engine.generate_chat_tokens(messages, max_tokens=max_tokens, temperature=temperature):
+        content = engine.tokenizer.decode_token(token_id)
+        if not content:
+            continue
         token_times.append(time.perf_counter())
+        chunks.append(content)
     end = time.perf_counter()
     output_tokens = len(token_times)
     ttft_ms = ((token_times[0] - start) * 1000.0) if token_times else 0.0
@@ -728,13 +809,33 @@ def _run_openai_microbench_request(
     else:
         tpot_ms = 0.0
     throughput_tps = output_tokens / (e2e_ms / 1000.0) if e2e_ms > 0.0 else 0.0
-    return {
-        "ttft_ms": ttft_ms,
-        "tpot_ms": tpot_ms,
-        "e2e_ms": e2e_ms,
-        "output_tokens": float(output_tokens),
-        "throughput_tps": throughput_tps,
-    }
+    return (
+        {
+            "ttft_ms": ttft_ms,
+            "tpot_ms": tpot_ms,
+            "e2e_ms": e2e_ms,
+            "output_tokens": float(output_tokens),
+            "throughput_tps": throughput_tps,
+        },
+        "".join(chunks),
+    )
+
+
+def _microbench_messages(scenario: str, prompt_tokens: int, request_index: int) -> list[dict[str, object]]:
+    if scenario == "single":
+        return [{"role": "user", "content": _microbench_prompt_text(prompt_tokens, request_index)}]
+    if scenario == "multi-turn":
+        turn_index = request_index % len(_OPENAI_MULTI_TURN_EQUATIONS)
+        messages: list[dict[str, object]] = [
+            {"role": "system", "content": _OPENAI_MULTI_TURN_SYSTEM_PROMPT},
+        ]
+        for previous_equation, previous_answer in _OPENAI_MULTI_TURN_EQUATIONS[:turn_index]:
+            messages.append({"role": "user", "content": previous_equation})
+            messages.append({"role": "assistant", "content": previous_answer})
+        equation, _expected = _OPENAI_MULTI_TURN_EQUATIONS[turn_index]
+        messages.append({"role": "user", "content": equation})
+        return messages
+    raise ValueError(f"unsupported OpenAI microbench scenario: {scenario}")
 
 
 def _microbench_prompt_text(prompt_tokens: int, request_index: int) -> str:
@@ -1643,6 +1744,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Microbenchmark OpenAI engine request dispatch, streaming decode, and batching overhead.",
     )
     openai_microbench.add_argument("--backend", choices=["synthetic", "model"], default="synthetic")
+    openai_microbench.add_argument(
+        "--scenario",
+        choices=["single", "multi-turn"],
+        default="single",
+        help="Request shape to measure; multi-turn matches the inference-bench calculator conversation.",
+    )
     openai_microbench.add_argument("--model", default=None, help="Model id/path for --backend=model.")
     openai_microbench.add_argument("--model-kind", default="auto")
     openai_microbench.add_argument("--tokenizer", default=None)

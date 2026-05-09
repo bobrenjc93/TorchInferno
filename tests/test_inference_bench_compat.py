@@ -160,7 +160,8 @@ def test_openai_server_warmup_covers_long_output_prefill_shapes(monkeypatch) -> 
 
     prompt_counts = set(_warmup_prompt_token_counts(32))
 
-    assert {128, 136, 144, 153, 161, 169, 178, 186}.issubset(prompt_counts)
+    assert {55, 71, 87, 103, 119, 136, 152, 168}.issubset(prompt_counts)
+    assert {128, 144, 153, 161, 169, 178, 186}.issubset(prompt_counts)
     assert 55 in prompt_counts
     assert set(_warmup_prefill_cache_token_counts()) >= {256, 512}
     assert 55 in set(_warmup_temperature_prompt_token_counts())
@@ -430,6 +431,40 @@ def test_openai_engine_reuses_resettable_generation_cache() -> None:
     assert model.cache_allocations == 1
 
 
+def test_openai_engine_reuses_single_request_prefix_cache(monkeypatch) -> None:
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_PREFIX_CACHE_MIN_TOKENS", "1")
+    model = _PrefixRecordingModel()
+    engine = OpenAICompletionEngine(
+        model,
+        _PrefixTokenizer(),
+        model_id="tiny",
+        device=torch.device("cpu"),
+        max_batch_size=1,
+        batch_wait_ms=0.0,
+    )
+    try:
+        first = list(
+            engine.generate_chat_tokens(
+                [{"role": "user", "content": "first"}],
+                max_tokens=1,
+                temperature=0.0,
+            )
+        )
+        second = list(
+            engine.generate_chat_tokens(
+                [{"role": "user", "content": "second"}],
+                max_tokens=1,
+                temperature=0.0,
+            )
+        )
+    finally:
+        engine.close()
+
+    assert first == [2]
+    assert second == [2]
+    assert model.forward_inputs == [[10, 11], [2], [12], [2]]
+
+
 def test_openai_microbench_cli_runs_synthetic_cases() -> None:
     root = Path(__file__).resolve().parents[1]
     env = {**os.environ, "PYTHONPATH": "src"}
@@ -461,6 +496,39 @@ def test_openai_microbench_cli_runs_synthetic_cases() -> None:
     assert "case=single-direct" in result.stdout
     assert "case=single-batcher" in result.stdout
     assert "case=concurrent-2" in result.stdout
+
+
+def test_openai_microbench_cli_runs_multi_turn_scenario(tmp_path) -> None:
+    root = Path(__file__).resolve().parents[1]
+    env = {**os.environ, "PYTHONPATH": "src"}
+    output = tmp_path / "multi_turn.json"
+    cmd = [
+        sys.executable,
+        "-m",
+        "torchinferno.cli",
+        "openai-microbench",
+        "--backend",
+        "synthetic",
+        "--scenario",
+        "multi-turn",
+        "--device",
+        "cpu",
+        "--warmup",
+        "0",
+        "--iters",
+        "1",
+        "--max-tokens",
+        "1",
+        "--json-output",
+        str(output),
+    ]
+
+    result = subprocess.run(cmd, cwd=root, env=env, text=True, capture_output=True, check=True, timeout=30)
+    metrics = json.loads(output.read_text())
+
+    assert "scenario=multi-turn" in result.stdout
+    assert metrics["scenario"] == "multi-turn"
+    assert metrics["cases"]["single"]["requests"] == 8
 
 
 class _BatchEncodingTokenizer:
@@ -533,6 +601,70 @@ class _BatchRecordingModel:
         cache.seq_len += input_ids.size(1)
         tokens = 1 if return_last_logits_only else input_ids.size(1)
         logits = torch.zeros(input_ids.size(0), tokens, 8)
+        logits[..., 2] = 1.0
+        return logits, cache
+
+
+class _PrefixTokenizer:
+    eos_token_id = 0
+
+    def encode_messages(self, messages: list[dict[str, object]]) -> list[int]:
+        content = str(messages[-1]["content"])
+        if content == "first":
+            return [10, 11]
+        if content == "second":
+            return [10, 11, 2, 12]
+        raise AssertionError(f"unexpected message content: {content}")
+
+    def decode_token(self, token_id: int) -> str:
+        return "A" if token_id == 2 else ""
+
+    def decode(self, token_ids: list[int]) -> str:
+        return "".join(self.decode_token(token_id) for token_id in token_ids)
+
+
+class _PrefixRecordingLayer:
+    def __init__(self, batch_size: int, max_seq_len: int) -> None:
+        self.keys = torch.zeros(batch_size, 1, max_seq_len, 1)
+        self.values = torch.zeros(batch_size, 1, max_seq_len, 1)
+        self.seq_len = 0
+
+
+class _PrefixRecordingCache:
+    def __init__(self, batch_size: int, max_seq_len: int) -> None:
+        self.layers = [_PrefixRecordingLayer(batch_size, max_seq_len)]
+
+    @property
+    def seq_len(self) -> int:
+        return self.layers[0].seq_len
+
+
+class _PrefixRecordingModel:
+    def __init__(self) -> None:
+        self.config = type("Config", (), {"vocab_size": 16})()
+        self.forward_inputs: list[list[int]] = []
+
+    def allocate_cache(self, batch_size: int, max_seq_len: int, **kwargs) -> _PrefixRecordingCache:
+        return _PrefixRecordingCache(batch_size, max_seq_len)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        *,
+        cache: _PrefixRecordingCache,
+        use_cache: bool,
+        return_last_logits_only: bool = False,
+    ):
+        del use_cache
+        self.forward_inputs.append([int(token_id) for token_id in input_ids[0].tolist()])
+        layer = cache.layers[0]
+        start = layer.seq_len
+        end = start + input_ids.size(1)
+        layer.keys[: input_ids.size(0), :, start:end, :].fill_(1)
+        layer.values[: input_ids.size(0), :, start:end, :].fill_(1)
+        layer.seq_len = end
+        tokens = 1 if return_last_logits_only else input_ids.size(1)
+        logits = torch.zeros(input_ids.size(0), tokens, 16)
         logits[..., 2] = 1.0
         return logits, cache
 

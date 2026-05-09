@@ -966,6 +966,20 @@ class _Llama3TensorParallelLayer:
                 is_causal=True,
                 enable_gqa=enable_gqa,
             )
+        try:
+            from torch.nn.attention.bias import causal_lower_right
+
+            return F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_mask=causal_lower_right(q.size(-2), k.size(-2)),
+                dropout_p=0.0,
+                is_causal=False,
+                enable_gqa=enable_gqa,
+            )
+        except Exception:
+            pass
         key_positions = torch.arange(k.size(-2), device=device)
         allowed = key_positions[None, :] <= positions[:, None]
         return F.scaled_dot_product_attention(
@@ -2090,6 +2104,7 @@ def _should_use_prefill_graph(
     cache: Llama3TensorParallelCache,
     temperature: float,
 ) -> bool:
+    max_cache_tokens = int(os.environ.get("TORCHINFERNO_CUDAGRAPH_PREFILL_MAX_CACHE_TOKENS", "512"))
     return (
         os.environ.get("TORCHINFERNO_CUDAGRAPH_PREFILL", "1") != "0"
         and temperature <= 0.0
@@ -2099,6 +2114,7 @@ def _should_use_prefill_graph(
         and input_ids.size(1) > 1
         and bool(cache.layers)
         and cache.layers[0].keys.is_cuda
+        and cache.layers[0].max_seq_len <= max_cache_tokens
     )
 
 
@@ -2106,6 +2122,7 @@ def _should_use_prefill_logits_graph(
     input_ids: Tensor,
     cache: Llama3TensorParallelCache,
 ) -> bool:
+    max_cache_tokens = int(os.environ.get("TORCHINFERNO_CUDAGRAPH_PREFILL_MAX_CACHE_TOKENS", "512"))
     return (
         os.environ.get("TORCHINFERNO_CUDAGRAPH_PREFILL", "1") != "0"
         and input_ids.is_cuda
@@ -2114,6 +2131,7 @@ def _should_use_prefill_logits_graph(
         and input_ids.size(1) > 1
         and bool(cache.layers)
         and cache.layers[0].keys.is_cuda
+        and cache.layers[0].max_seq_len <= max_cache_tokens
     )
 
 
