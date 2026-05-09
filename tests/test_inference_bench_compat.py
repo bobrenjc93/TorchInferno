@@ -232,6 +232,55 @@ def test_openai_engine_single_stream_request_uses_direct_path() -> None:
     assert model.calls[0][2] != "torchinferno-openai-batcher"
 
 
+def test_openai_engine_batches_request_arriving_during_single_admission_wait(monkeypatch) -> None:
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_SINGLE_ADMISSION_WAIT_MS", "50")
+    model = _BatchRecordingModel()
+    tokenizer = _FirstEncodeEventTokenizer(vocab_size=8)
+    engine = OpenAICompletionEngine(
+        model,
+        tokenizer,
+        model_id="tiny",
+        device=torch.device("cpu"),
+        max_batch_size=4,
+        batch_wait_ms=50.0,
+    )
+    results: list[list[int] | None] = [None, None]
+    second_waiting = threading.Event()
+
+    def run_first() -> None:
+        results[0] = list(
+            engine.generate_chat_tokens(
+                [{"role": "user", "content": "same"}],
+                max_tokens=2,
+                temperature=0.0,
+            )
+        )
+
+    def run_second() -> None:
+        second_waiting.set()
+        assert tokenizer.first_encoded.wait(timeout=5)
+        results[1] = list(
+            engine.generate_chat_tokens(
+                [{"role": "user", "content": "same"}],
+                max_tokens=2,
+                temperature=0.0,
+            )
+        )
+
+    second = threading.Thread(target=run_second)
+    first = threading.Thread(target=run_first)
+    second.start()
+    assert second_waiting.wait(timeout=5)
+    first.start()
+    for thread in (first, second):
+        thread.join(timeout=10)
+    engine.close()
+
+    assert results == [[2, 2], [2, 2]]
+    assert model.calls[0][0] == 2
+    assert model.calls[0][2] == "torchinferno-openai-batcher"
+
+
 def test_openai_engine_single_request_does_not_use_batched_step_loop() -> None:
     model = _BatchRecordingModel()
     engine = _NoBatchStepEngine(
@@ -341,6 +390,23 @@ class _BarrierByteFallbackTokenizer(_ByteFallbackTokenizer):
     def encode_messages(self, messages: list[dict[str, object]]) -> list[int]:
         self.barrier.wait(timeout=5)
         return super().encode_messages(messages)
+
+
+class _FirstEncodeEventTokenizer(_ByteFallbackTokenizer):
+    def __init__(self, *, vocab_size: int) -> None:
+        super().__init__(vocab_size)
+        self.first_encoded = threading.Event()
+        self._lock = threading.Lock()
+        self._calls = 0
+
+    def encode_messages(self, messages: list[dict[str, object]]) -> list[int]:
+        with self._lock:
+            call_index = self._calls
+            self._calls += 1
+        tokens = super().encode_messages(messages)
+        if call_index == 0:
+            self.first_encoded.set()
+        return tokens
 
 
 class _BatchRecordingCache:

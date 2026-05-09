@@ -29,7 +29,7 @@ class OpenAIServerMicrobenchConfig:
     cache_backend: str = "dense"
     page_size: int = 16
     max_batch_size: int = 32
-    batch_wait_ms: float = 2.0
+    batch_wait_ms: float = 10.0
     llama_parallelism: str = "auto"
     trust_remote_code: bool = False
     token: str | None = None

@@ -47,7 +47,7 @@ class OpenAIServerConfig:
     cache_backend: str = "dense"
     page_size: int = 16
     max_batch_size: int = 32
-    batch_wait_ms: float = 2.0
+    batch_wait_ms: float = 10.0
     llama_parallelism: str = "auto"
 
 
@@ -184,7 +184,7 @@ class OpenAICompletionEngine:
         page_size: int = 16,
         max_model_len: int | None = None,
         max_batch_size: int = 32,
-        batch_wait_ms: float = 2.0,
+        batch_wait_ms: float = 10.0,
     ) -> None:
         self.model = model
         self.tokenizer = tokenizer
@@ -195,6 +195,10 @@ class OpenAICompletionEngine:
         self.max_model_len = max_model_len
         self.max_batch_size = max(1, max_batch_size)
         self.batch_wait_s = max(0.0, batch_wait_ms / 1000.0)
+        self.single_request_admission_wait_s = max(
+            0.0,
+            float(os.environ.get("TORCHINFERNO_OPENAI_SINGLE_ADMISSION_WAIT_MS", "10.0")) / 1000.0,
+        )
         self.single_request_fast_path = True
         self._generation_queue: "queue.Queue[_QueuedGeneration | None]" = queue.Queue()
         self._model_lock = threading.Lock()
@@ -203,6 +207,7 @@ class OpenAICompletionEngine:
         self._closed = False
         self._worker: threading.Thread | None = None
         self._cache_pool: dict[tuple[int, int, str, int, str], object] = {}
+        self._microbatch_cache_pool: dict[tuple[int, int, int, str, int, str], object] = {}
         self._phase_timing_enabled = os.environ.get("TORCHINFERNO_OPENAI_PHASE_TIMINGS", "0") != "0"
         self._phase_records: list[dict[str, float]] = []
         self._phase_records_lock = threading.Lock()
@@ -350,11 +355,26 @@ class OpenAICompletionEngine:
     def _try_acquire_single_request_model(self) -> bool:
         if not self.single_request_fast_path:
             return False
+        self._wait_for_single_request_admission()
         with self._live_request_condition:
             is_only_live_request = self._live_requests == 1
         if not is_only_live_request or not self._generation_queue.empty():
             return False
         return self._model_lock.acquire(blocking=False)
+
+    def _wait_for_single_request_admission(self) -> None:
+        wait_s = min(self.batch_wait_s, self.single_request_admission_wait_s)
+        if wait_s <= 0.0 or self.max_batch_size <= 1:
+            return
+        if self._model_lock.locked() or not self._generation_queue.empty():
+            return
+        deadline = time.perf_counter() + wait_s
+        with self._live_request_condition:
+            while self._live_requests == 1 and self._generation_queue.empty():
+                timeout = deadline - time.perf_counter()
+                if timeout <= 0.0:
+                    break
+                self._live_request_condition.wait(timeout=timeout)
 
     def _has_multiple_live_requests(self) -> bool:
         with self._live_request_condition:
@@ -387,6 +407,7 @@ class OpenAICompletionEngine:
                 self._generation_queue.put(None)
                 break
             batch.append(item)
+            deadline = time.perf_counter() + self.batch_wait_s
 
     def _run_queued_batch(self, batch: list[_QueuedGeneration]) -> None:
         groups: dict[tuple[int, int, float, bool], list[_QueuedGeneration]] = {}
@@ -517,6 +538,49 @@ class OpenAICompletionEngine:
         )
         if _reset_generation_cache(cache):
             self._cache_pool[key] = cache
+        return cache
+
+    def _generation_microbatch_cache(
+        self,
+        slot: int,
+        batch_size: int,
+        max_seq_len: int,
+        *,
+        model: object,
+    ) -> object:
+        cache_capacity = _generation_cache_capacity(model, max_seq_len)
+        exact_capacity = _prefers_exact_generation_cache(model)
+        key = (slot, batch_size, cache_capacity, self.cache_backend, self.page_size, str(self.device))
+        for cached_key, cached in self._microbatch_cache_pool.items():
+            (
+                cached_slot,
+                cached_batch,
+                cached_max_seq_len,
+                cached_backend,
+                cached_page_size,
+                cached_device,
+            ) = cached_key
+            capacity_matches = cached_max_seq_len == cache_capacity if exact_capacity else cached_max_seq_len >= max_seq_len
+            if (
+                cached_slot == slot
+                and cached_batch == batch_size
+                and capacity_matches
+                and cached_backend == self.cache_backend
+                and cached_page_size == self.page_size
+                and cached_device == str(self.device)
+                and _reset_generation_cache(cached)
+            ):
+                return cached
+        cache = _allocate_cache(
+            model,
+            batch_size,
+            cache_capacity,
+            device=self.device,
+            cache_backend=self.cache_backend,
+            page_size=self.page_size,
+        )
+        if _reset_generation_cache(cache):
+            self._microbatch_cache_pool[key] = cache
         return cache
 
     def _warmup_tokenizer(self) -> None:
@@ -692,6 +756,15 @@ class OpenAICompletionEngine:
                 temperature=temperature,
                 stream=True,
             )
+        microbatch_size = self._stream_microbatch_size(input_ids.size(0))
+        if 0 < microbatch_size < input_ids.size(0):
+            yield from self._generate_batch_steps_microbatched(
+                input_ids,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                microbatch_size=microbatch_size,
+            )
+            return
         eos_token_id = self.tokenizer.eos_token_id
         model = self.model
         if not hasattr(model, "allocate_cache") or not callable(getattr(model, "forward", None)):
@@ -750,6 +823,85 @@ class OpenAICompletionEngine:
                 next_token = _sample(model, logits[:, -1, :], temperature).to(self.device)
             else:
                 next_token = graph_token.to(self.device)
+
+    def _stream_microbatch_size(self, batch_size: int) -> int:
+        if batch_size <= 1:
+            return batch_size
+        raw = os.environ.get("TORCHINFERNO_OPENAI_STREAM_MICROBATCH_SIZE")
+        if raw is not None:
+            return max(1, int(raw))
+        if _is_tensor_parallel_model(self.model) and self.device.type == "cuda":
+            return max(1, int(os.environ.get("TORCHINFERNO_CUDAGRAPH_DECODE_STEP_MAX_BATCH", "8")))
+        return batch_size
+
+    @torch.inference_mode()
+    def _generate_batch_steps_microbatched(
+        self,
+        input_ids: Tensor,
+        *,
+        max_tokens: int,
+        temperature: float,
+        microbatch_size: int,
+    ) -> Iterator[list[int | None]]:
+        eos_token_id = self.tokenizer.eos_token_id
+        model = self.model
+        states: list[dict[str, object]] = []
+        batch_size = input_ids.size(0)
+        for slot, start in enumerate(range(0, batch_size, microbatch_size)):
+            end = min(batch_size, start + microbatch_size)
+            chunk_input_ids = input_ids[start:end]
+            cache = self._generation_microbatch_cache(
+                slot,
+                chunk_input_ids.size(0),
+                chunk_input_ids.size(1) + max_tokens,
+                model=model,
+            )
+            active = [True for _ in range(chunk_input_ids.size(0))]
+            prefill_token = _try_prefill_graph(model, chunk_input_ids, cache, temperature)
+            if prefill_token is None:
+                logits, cache = _forward(model, chunk_input_ids, cache)
+                next_token = _sample(model, logits[:, -1, :], temperature).to(self.device)
+            else:
+                next_token = prefill_token.to(self.device)
+            step_tokens = [None for _ in range(batch_size)]
+            for offset, token_id in enumerate(next_token.detach().cpu().tolist()):
+                token_id = int(token_id)
+                step_tokens[start + offset] = token_id
+                if eos_token_id is not None and token_id == eos_token_id:
+                    active[offset] = False
+            states.append({"start": start, "active": active, "cache": cache, "next_token": next_token})
+            yield step_tokens
+        for _ in range(1, max_tokens):
+            emitted = False
+            for state in states:
+                active = state["active"]
+                if not isinstance(active, list) or not any(active):
+                    continue
+                next_token = state["next_token"]
+                cache = state["cache"]
+                if not isinstance(next_token, Tensor):
+                    raise RuntimeError("invalid microbatch token state")
+                graph_token = _try_decode_one_token_graph(model, next_token[:, None], cache, temperature)
+                if graph_token is None:
+                    logits, cache = _forward(model, next_token[:, None], cache)
+                    next_token = _sample(model, logits[:, -1, :], temperature).to(self.device)
+                else:
+                    next_token = graph_token.to(self.device)
+                state["cache"] = cache
+                state["next_token"] = next_token
+                start = int(state["start"])
+                step_tokens = [None for _ in range(batch_size)]
+                for offset, token_id in enumerate(next_token.detach().cpu().tolist()):
+                    if not active[offset]:
+                        continue
+                    token_id = int(token_id)
+                    step_tokens[start + offset] = token_id
+                    if eos_token_id is not None and token_id == eos_token_id:
+                        active[offset] = False
+                emitted = True
+                yield step_tokens
+            if not emitted:
+                break
 
 
 class _OpenAIHandler(BaseHTTPRequestHandler):
@@ -888,6 +1040,8 @@ class _OpenAIHandler(BaseHTTPRequestHandler):
 
 
 class _OpenAIServer(ThreadingHTTPServer):
+    request_queue_size = 128
+
     def __init__(self, server_address: tuple[str, int], engine: OpenAICompletionEngine) -> None:
         super().__init__(server_address, _OpenAIHandler)
         self.engine = engine
@@ -1373,7 +1527,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cache-backend", choices=["dense", "paged"], default="dense")
     parser.add_argument("--page-size", type=int, default=16)
     parser.add_argument("--max-batch-size", type=int, default=32)
-    parser.add_argument("--batch-wait-ms", type=float, default=2.0)
+    parser.add_argument("--batch-wait-ms", type=float, default=10.0)
     parser.add_argument(
         "--llama-parallelism",
         choices=["auto", "pipeline", "tensor"],

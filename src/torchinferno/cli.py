@@ -1663,7 +1663,7 @@ def build_parser() -> argparse.ArgumentParser:
     openai_microbench.add_argument("--page-size", type=int, default=16)
     openai_microbench.add_argument("--llama-parallelism", choices=["auto", "pipeline", "tensor"], default="auto")
     openai_microbench.add_argument("--max-batch-size", type=int, default=32)
-    openai_microbench.add_argument("--batch-wait-ms", type=float, default=2.0)
+    openai_microbench.add_argument("--batch-wait-ms", type=float, default=10.0)
     openai_microbench.add_argument("--prompt-tokens", type=int, default=32)
     openai_microbench.add_argument("--max-tokens", type=int, default=64)
     openai_microbench.add_argument("--concurrency", type=int, default=1)
@@ -1700,7 +1700,7 @@ def build_parser() -> argparse.ArgumentParser:
     openai_server_microbench.add_argument("--cache-backend", choices=["dense", "paged"], default="dense")
     openai_server_microbench.add_argument("--page-size", type=int, default=16)
     openai_server_microbench.add_argument("--max-batch-size", type=int, default=32)
-    openai_server_microbench.add_argument("--batch-wait-ms", type=float, default=2.0)
+    openai_server_microbench.add_argument("--batch-wait-ms", type=float, default=10.0)
     openai_server_microbench.add_argument("--llama-parallelism", choices=["auto", "pipeline", "tensor"], default="auto")
     openai_server_microbench.add_argument("--trust-remote-code", action="store_true")
     openai_server_microbench.add_argument("--token", default=None)
@@ -1956,7 +1956,7 @@ def build_parser() -> argparse.ArgumentParser:
     openai_serve.add_argument("--cache-backend", choices=["dense", "paged"], default="dense")
     openai_serve.add_argument("--page-size", type=int, default=16)
     openai_serve.add_argument("--max-batch-size", type=int, default=32)
-    openai_serve.add_argument("--batch-wait-ms", type=float, default=2.0)
+    openai_serve.add_argument("--batch-wait-ms", type=float, default=10.0)
     openai_serve.add_argument(
         "--llama-parallelism",
         choices=["auto", "pipeline", "tensor"],

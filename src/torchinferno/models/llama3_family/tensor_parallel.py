@@ -1003,10 +1003,10 @@ class Llama3TensorParallelForCausalLM:
         self.profile_seconds: dict[str, float] = {}
         self.profile_counts: dict[str, int] = {}
         self.training = False
-        self._prefill_graph: _StaticPrefillGraphCall | None = None
+        self._prefill_graphs: dict[tuple[int, int, int, tuple[int, ...]], _StaticPrefillGraphCall] = {}
         self._prefill_graph_failed = False
         self._decode_graph: _StaticDecodeGraphCall | None = None
-        self._decode_graphs: dict[int, _StaticDecodeGraphCall] = {}
+        self._decode_graphs: dict[tuple[int, int, int], _StaticDecodeGraphCall] = {}
         self._decode_graph_failed = False
 
     @classmethod
@@ -1257,6 +1257,11 @@ class Llama3TensorParallelForCausalLM:
         *,
         temperature: float = 0.0,
     ) -> Tensor | None:
+        if (
+            "TORCHINFERNO_CUDAGRAPH_PREFILL" not in os.environ
+            and int(getattr(self.config, "hidden_size", 0)) < 1024
+        ):
+            return None
         if self._prefill_graph_failed or not _should_use_prefill_graph(input_ids, cache, temperature):
             return None
         try:
@@ -1268,7 +1273,13 @@ class Llama3TensorParallelForCausalLM:
             return None
 
     def _run_prefill_graph(self, input_ids: Tensor, cache: Llama3TensorParallelCache) -> Tensor:
-        captured = self._prefill_graph
+        key = (
+            id(cache),
+            input_ids.size(1),
+            cache.layers[0].max_seq_len,
+            tuple(input_ids.shape),
+        )
+        captured = self._prefill_graphs.get(key)
         if (
             captured is None
             or captured.cache is not cache
@@ -1277,6 +1288,10 @@ class Llama3TensorParallelForCausalLM:
             or captured.static_input_ids.shape != input_ids.shape
         ):
             captured = self._capture_prefill_graph(input_ids, cache)
+            max_graphs = max(1, int(os.environ.get("TORCHINFERNO_CUDAGRAPH_PREFILL_MAX_GRAPHS", "8")))
+            if key not in self._prefill_graphs and len(self._prefill_graphs) >= max_graphs:
+                self._prefill_graphs.clear()
+            self._prefill_graphs[key] = captured
         else:
             captured.static_input_ids.copy_(input_ids)
             captured.graph.replay()
@@ -1311,7 +1326,6 @@ class Llama3TensorParallelForCausalLM:
             captured.output_token = self._sample_next_token(logits[:, -1, :], 0.0)
         captured.graph.replay()
         self._set_cache_seq_len(cache, input_ids.size(1))
-        self._prefill_graph = captured
         return captured
 
     def _forward_prefill_static(self, input_ids: Tensor, cache: Llama3TensorParallelCache) -> Tensor:
@@ -1345,7 +1359,8 @@ class Llama3TensorParallelForCausalLM:
         if cache.seq_len >= cache.layers[0].max_seq_len:
             raise ValueError("KV cache capacity exceeded")
         attention_block_size = _decode_attention_block_size(cache.seq_len + 1, cache.layers[0].max_seq_len)
-        captured = self._decode_graphs.get(attention_block_size)
+        key = (id(cache), input_ids.size(0), attention_block_size)
+        captured = self._decode_graphs.get(key)
         if (
             captured is None
             or captured.cache is not cache
@@ -1410,7 +1425,11 @@ class Llama3TensorParallelForCausalLM:
             captured.output_token = self._sample_next_token(logits[:, -1, :], 0.0)
         captured.graph.replay()
         self._decode_graph = captured
-        self._decode_graphs[attention_block_size] = captured
+        key = (id(cache), input_ids.size(0), attention_block_size)
+        max_graphs = max(1, int(os.environ.get("TORCHINFERNO_CUDAGRAPH_DECODE_STEP_MAX_GRAPHS", "64")))
+        if key not in self._decode_graphs and len(self._decode_graphs) >= max_graphs:
+            self._decode_graphs.clear()
+        self._decode_graphs[key] = captured
         return captured
 
     def _copy_decode_graph_inputs(
@@ -1783,7 +1802,7 @@ def _should_use_decode_step_graph(
         and temperature <= 0.0
         and input_ids.is_cuda
         and input_ids.ndim == 2
-        and input_ids.size(0) == 1
+        and 1 <= input_ids.size(0) <= int(os.environ.get("TORCHINFERNO_CUDAGRAPH_DECODE_STEP_MAX_BATCH", "8"))
         and input_ids.size(1) == 1
         and bool(cache.layers)
         and cache.layers[0].keys.is_cuda
@@ -1796,11 +1815,11 @@ def _should_use_prefill_graph(
     temperature: float,
 ) -> bool:
     return (
-        os.environ.get("TORCHINFERNO_CUDAGRAPH_PREFILL", "0") != "0"
+        os.environ.get("TORCHINFERNO_CUDAGRAPH_PREFILL", "1") != "0"
         and temperature <= 0.0
         and input_ids.is_cuda
         and input_ids.ndim == 2
-        and input_ids.size(0) == 1
+        and 1 <= input_ids.size(0) <= int(os.environ.get("TORCHINFERNO_CUDAGRAPH_PREFILL_MAX_BATCH", "8"))
         and input_ids.size(1) > 1
         and bool(cache.layers)
         and cache.layers[0].keys.is_cuda
