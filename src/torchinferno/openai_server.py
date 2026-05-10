@@ -365,7 +365,7 @@ class OpenAICompletionEngine:
         self.cache_backend = cache_backend
         self.page_size = page_size
         self.max_model_len = max_model_len
-        self.max_batch_size = max(1, max_batch_size)
+        self.max_batch_size = _effective_openai_max_batch_size(model, device, max_batch_size)
         self.batch_wait_s = max(0.0, batch_wait_ms / 1000.0)
         default_single_request_wait_ms = (
             single_request_admission_wait_ms
@@ -1947,6 +1947,14 @@ def _is_tensor_parallel_model(model: object) -> bool:
 
 def _tensor_parallel_world_size(model: object) -> int:
     return int(getattr(model, "world_size", 1)) if _is_tensor_parallel_model(model) else 1
+
+
+def _effective_openai_max_batch_size(model: object, device: torch.device, requested: int) -> int:
+    max_batch_size = max(1, requested)
+    if _is_tensor_parallel_model(model) and device.type == "cuda":
+        tp_default = env_int("TORCHINFERNO_OPENAI_TP_MAX_BATCH_SIZE", 16, minimum=1)
+        return min(max_batch_size, tp_default)
+    return max_batch_size
 
 
 def _is_tensor_parallel_primary_model(model: object) -> bool:

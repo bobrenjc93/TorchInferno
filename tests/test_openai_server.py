@@ -19,6 +19,7 @@ from torchinferno.openai_server import (
     _ByteFallbackTokenizer,
     _TransformersChatTokenizer,
     _distributed_server_command,
+    _effective_openai_max_batch_size,
     _should_reexec_distributed_server,
     _tensor_parallel_worker_loop,
     _warmup_prefill_cache_token_counts,
@@ -971,6 +972,33 @@ def test_openai_stream_microbatch_env_override_is_capped_to_batch(monkeypatch) -
     engine.model = object()
 
     assert engine._stream_microbatch_size(64) == 64
+
+
+def test_openai_effective_max_batch_size_caps_cuda_tp_by_default(monkeypatch) -> None:
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_MAX_BATCH_SIZE", raising=False)
+    model = object()
+
+    monkeypatch.setattr(
+        "torchinferno.openai_server._is_tensor_parallel_model",
+        lambda candidate: candidate is model,
+    )
+
+    assert _effective_openai_max_batch_size(model, torch.device("cuda"), 64) == 16
+    assert _effective_openai_max_batch_size(model, torch.device("cuda"), 8) == 8
+    assert _effective_openai_max_batch_size(model, torch.device("cpu"), 64) == 64
+
+
+def test_openai_effective_max_batch_size_uses_tp_env_override(monkeypatch) -> None:
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_MAX_BATCH_SIZE", "32")
+    model = object()
+
+    monkeypatch.setattr(
+        "torchinferno.openai_server._is_tensor_parallel_model",
+        lambda candidate: candidate is model,
+    )
+
+    assert _effective_openai_max_batch_size(model, torch.device("cuda"), 64) == 32
+    assert _effective_openai_max_batch_size(model, torch.device("cuda"), 16) == 16
 
 
 def test_openai_microbench_cli_runs_synthetic_cases() -> None:
