@@ -21,6 +21,7 @@ from torchinferno.openai_server import (
     _distributed_server_command,
     _effective_openai_max_batch_size,
     _should_reexec_distributed_server,
+    _sync_tensor_parallel_command,
     _tensor_parallel_worker_loop,
     _warmup_prefill_cache_token_counts,
     _warmup_prompt_token_counts,
@@ -999,6 +1000,41 @@ def test_openai_effective_max_batch_size_uses_tp_env_override(monkeypatch) -> No
 
     assert _effective_openai_max_batch_size(model, torch.device("cuda"), 64) == 32
     assert _effective_openai_max_batch_size(model, torch.device("cuda"), 16) == 16
+
+
+def test_openai_tensor_parallel_command_sync_uses_control_group(monkeypatch) -> None:
+    monkeypatch.setattr("torchinferno.openai_server._TENSOR_PARALLEL_CONTROL_GROUP", None)
+    model = type("FakeTPModel", (), {"world_size": 2})()
+    calls: list[tuple[str, object]] = []
+
+    monkeypatch.setattr(
+        "torchinferno.openai_server._is_tensor_parallel_model",
+        lambda candidate: candidate is model,
+    )
+    import torch.distributed as dist
+
+    monkeypatch.setattr(dist, "is_available", lambda: True)
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+
+    def fake_new_group(*, backend: str) -> str:
+        calls.append(("new_group", backend))
+        return "control"
+
+    def fake_barrier(**kwargs: object) -> None:
+        calls.append(("barrier", kwargs))
+
+    monkeypatch.setattr(dist, "new_group", fake_new_group)
+    monkeypatch.setattr(dist, "barrier", fake_barrier)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda device: calls.append(("sync", device.type)))
+
+    _sync_tensor_parallel_command(model, torch.device("cuda"))
+
+    assert calls == [
+        ("sync", "cuda"),
+        ("new_group", "gloo"),
+        ("barrier", {"group": "control"}),
+        ("sync", "cuda"),
+    ]
 
 
 def test_openai_microbench_cli_runs_synthetic_cases() -> None:

@@ -90,6 +90,10 @@ class _QueuedGeneration:
     responses: "queue.Queue[object]"
 
 
+_TENSOR_PARALLEL_CONTROL_GROUP: object | None = None
+_TENSOR_PARALLEL_CONTROL_GROUP_LOCK = threading.Lock()
+
+
 @dataclass(frozen=True)
 class _GenerationDone:
     pass
@@ -1957,6 +1961,23 @@ def _effective_openai_max_batch_size(model: object, device: torch.device, reques
     return max_batch_size
 
 
+def _tensor_parallel_control_group(dist: object) -> object | None:
+    global _TENSOR_PARALLEL_CONTROL_GROUP
+    if _TENSOR_PARALLEL_CONTROL_GROUP is not None:
+        return _TENSOR_PARALLEL_CONTROL_GROUP
+    with _TENSOR_PARALLEL_CONTROL_GROUP_LOCK:
+        if _TENSOR_PARALLEL_CONTROL_GROUP is None:
+            new_group = getattr(dist, "new_group", None)
+            if new_group is None:
+                return None
+            try:
+                _TENSOR_PARALLEL_CONTROL_GROUP = new_group(backend="gloo")
+            except Exception as exc:
+                warn_optional_failure("tensor-parallel control group", exc)
+                return None
+        return _TENSOR_PARALLEL_CONTROL_GROUP
+
+
 def _is_tensor_parallel_primary_model(model: object) -> bool:
     return _is_tensor_parallel_model(model) and _tensor_parallel_world_size(model) > 1 and int(getattr(model, "rank", 0)) == 0
 
@@ -1992,8 +2013,9 @@ def _sync_tensor_parallel_command(model: object, device: torch.device) -> None:
         return
     if device.type == "cuda":
         torch.cuda.synchronize(device)
-        device_ids = [device.index] if device.index is not None else None
-        dist.barrier(device_ids=device_ids)
+        control_group = _tensor_parallel_control_group(dist)
+        if control_group is not None:
+            dist.barrier(group=control_group)
         torch.cuda.synchronize(device)
         return
     dist.barrier()
