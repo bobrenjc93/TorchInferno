@@ -2008,6 +2008,15 @@ def build_parser() -> argparse.ArgumentParser:
     openai_serve.add_argument("--max-batch-size", type=int, default=32)
     openai_serve.add_argument("--batch-wait-ms", type=float, default=10.0)
     openai_serve.add_argument(
+        "--single-request-admission-wait-ms",
+        type=float,
+        default=None,
+        help=(
+            "Optional wait before a lone request takes the direct model path. "
+            "Lower values minimize TTFT; higher values preserve a short batching window."
+        ),
+    )
+    openai_serve.add_argument(
         "--llama-parallelism",
         choices=["auto", "pipeline", "tensor"],
         default="auto",

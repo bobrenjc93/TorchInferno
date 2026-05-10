@@ -32,7 +32,8 @@ to grow toward production-grade SOTA inference.
   paged cache state, and same-shape prefill/decode microbatching.
 - OpenAI-compatible serving with same-shape request microbatching, streaming,
   accurate prompt/completion token accounting, shared tensor prefix-cache reuse,
-  and a torchrun-backed Llama tensor parallel worker mode.
+  direct and HTTP microbench loops, and a torchrun-backed Llama tensor parallel
+  worker mode.
 - Deterministic time-sliced virtual GPU simulation.
 - Disaggregated prefill/decode planner with network latency modeling.
 - Agent-editable standalone prefill/decode rank files with local JSON-RPC
@@ -66,9 +67,9 @@ to grow toward production-grade SOTA inference.
 - Eager-vs-optimized model variant logit validation with a 1% default tolerance
   and optional JSON reports for agent/research loops.
 - Minimal auto research harness for comparing scheduler/cache/routing policies.
-- Llama 3 70B architecture config plus a native pipeline-sharded checkpoint
-  loader/generate path for running production-scale weights across multiple
-  GPUs without depending on Hugging Face model classes.
+- Llama 3 70B architecture config plus native pipeline-sharded and
+  tensor-parallel checkpoint loader/generate paths for running production-scale
+  weights across multiple GPUs without depending on Hugging Face model classes.
 - vLLM-compatible benchmark runner for Llama 70B latency, offline throughput,
   and online serving results, with JSON summaries and HTML/CSV performance
   plots.
@@ -902,6 +903,7 @@ src/torchinferno/
   kernels/nvfp4.py        NVFP4 quantized-linear reference contract.
   kernels/passes.py       Graph-pass registration for kernel replacements.
   models/*_family/        Provenance-tracked raw/fused model variant ladders.
+  models/provenance.py    Variant registry dataclasses and lineage helper.
   models/dsv4.py          DSv4-style causal LM, MoE, attention, and KV cache.
   models/llama3_family/   Torch-native Llama3 raw/fused reference variants.
   models/auto.py          Config-driven model loader.
@@ -912,6 +914,10 @@ src/torchinferno/
   graph/passes.py         FX graph pass registry and replacement helpers.
   benchmarks/openai_server.py
                            HTTP OpenAI server startup/latency microbench.
+  benchmarks/torchinferno_llama.py
+                           Native Llama latency/throughput/serve benchmark suite.
+  benchmarks/vllm_compatible.py
+                           vLLM-compatible benchmark commands, summaries, and plots.
   runtime/cudagraphs.py   Piecewise CUDA graph runner API.
   runtime/fake_dist.py    Fake process groups and collectives.
   runtime/flex.py         Flex-attention-shaped fallback.
@@ -939,8 +945,18 @@ tests/
                            Text, validation, paged attention, prefix, traffic tests.
   test_performance_specialization.py
                            Triton paged decode, NVFP4, and benchmark tests.
+  test_openai_cli.py       Main CLI/OpenAI server wrapper parser tests.
   test_openai_server.py    OpenAI HTTP serving and engine batching tests.
+  test_openai_server_microbench.py
+                           OpenAI HTTP microbench command and smoke tests.
   test_openai_warmup.py    OpenAI graph-warmup bucket tests.
+  test_model_variants.py   Variant registry, Llama3 model, and logit validation tests.
+  test_llama3_tensor_parallel_distributed.py
+                           Multi-GPU torchrun tensor-parallel compatibility test.
+  test_disagg_ranks.py    Disaggregated rank-file and JSON-RPC tests.
+  test_profile_artifacts.py
+                           Profile artifact, replay, and focused capture tests.
+  test_vllm_benchmarks.py  vLLM/native Llama benchmark plan and plot tests.
   test_serving_engine.py   Native paged-cache serving engine tests.
 AGENTS.md                 Short contribution map for coding agents.
 docs/ROADMAP.md           Feature readiness map and production milestones.
@@ -977,6 +993,8 @@ Implemented as working code and tests:
 - OpenAI-compatible HTTP serving with streaming/non-streaming chat completions,
   same-shape request microbatching, direct and HTTP microbench loops, and
   auto-launched Llama tensor-parallel workers.
+- Native Llama 3 pipeline and tensor-parallel checkpoint loading/generation,
+  plus vLLM-shaped latency, throughput, and serving benchmark suites.
 - Pattern-match graph replacement entry point, including a multi-node
   make_fx/ATen subgraph replacement example.
 - Native DeepSeek dense/paged cache backend selection.

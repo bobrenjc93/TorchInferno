@@ -17,6 +17,7 @@ The CLI view is `torchinferno audit`.
 | Area | Status | Notes |
 | --- | --- | --- |
 | Native DeepSeek-V3.2-style model | integrated | Torch-native config/model/cache/checkpoint path exists. |
+| Native Llama3 production-scale paths | bridge | Llama 70B config, pipeline and tensor-parallel safetensor loaders/generate paths, and torchrun TP compatibility coverage exist; production scheduler integration remains open. |
 | Model provenance variants | reference | DSv4, DeepSeek-V3.2, and Llama3 have raw/fused v0/v1 ladders and registry lineage. |
 | Eager-vs-optimized logit validation | integrated | `validate-model-variants` compares tiny eager v0 logits against optimized variants with a 1% default tolerance and optional JSON reports. |
 | Checkpoint conversion | integrated | Shape/key audit plus sharded safetensor writer; needs real-weight golden validation. |
@@ -31,6 +32,7 @@ The CLI view is `torchinferno audit`.
 | Prefix KV reuse | integrated | Serving aliases reusable prefix pages across model layer cache rows with copy-on-write protection. |
 | Continuous batching | bridge | Persistent row-assigned cache batches same-length prefill/decode groups without rebuilding temporary caches; OpenAI serving now microbatches same-shape requests. |
 | OpenAI serving API | bridge | HTTP server exposes `/v1/models` and streaming/non-streaming `/v1/chat/completions`, can auto-launch Llama tensor-parallel workers, and has direct plus HTTP microbench loops. |
+| Benchmark suites | integrated | `vllm-bench-suite`, `vllm-bench-plot`, `llama-bench-suite`, and `openai-server-microbench` write repeatable commands, JSON summaries, and plots for vLLM-compatible comparisons. |
 | Time-sliced virtual GPU profiling | integrated | Representative generation profiles can be scaled and replayed across virtual ranks on one physical device. |
 | CPU offload profiling | bridge | Module-at-a-time CPU/device staging records movement overhead separately from compute; decode-cache offload and mmap streaming remain open. |
 | Disaggregated prefill/decode | simulated | Planner models rank assignment and transfer latency. |

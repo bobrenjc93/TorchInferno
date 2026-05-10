@@ -27,9 +27,12 @@ PYTHONPATH=src python3 -m torchinferno.cli profile-region .torchinferno_runs/att
 PYTHONPATH=src python3 -m torchinferno.cli profile-pattern .torchinferno_runs/swiglu-pattern-cpu --device cpu --warmup 0 --iters 1
 ```
 
-The same core checks are available as `make audit`, `make test`, and
-`make smoke`. Focused profiling shortcuts are available as `make profile`,
-`make profile-region`, and `make profile-pattern`.
+Makefile shortcuts cover the common pieces as `make audit`, `make variants`,
+`make test`, `make smoke`, `make perf`, `make openai-server-bench`, and
+`make disagg`. Focused profiling shortcuts are available as `make profile`,
+`make profile-timeslice`, `make profile-offload`, `make profile-nodes`,
+`make profile-subgraph`, `make profile-region`, and `make profile-pattern`;
+benchmark planning is available as `make vllm-bench-plan`.
 
 ## Git Pushes
 
