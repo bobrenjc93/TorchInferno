@@ -1040,7 +1040,7 @@ def test_openai_short_tp_stream_uses_smaller_queue_batch_limit(monkeypatch) -> N
     long_stream = _QueuedGeneration([], 256, 0.0, True, queue.Queue())
     short_completion = _QueuedGeneration([], 64, 0.0, False, queue.Queue())
 
-    assert engine._queued_batch_limit(short_stream) == 8
+    assert engine._queued_batch_limit(short_stream) == 64
     assert engine._queued_batch_limit(long_stream) == 64
     assert engine._queued_batch_limit(short_completion) == 64
 
