@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -467,53 +466,6 @@ class _OpenAIMicrobenchModel:
         return logits, cache
 
 
-_OPENAI_MULTI_TURN_SYSTEM_PROMPT = (
-    "You are a calculator. Respond with only the numerical answer, nothing else."
-)
-_OPENAI_MULTI_TURN_EQUATIONS: tuple[tuple[str, str], ...] = (
-    ("8 + 13 =", "21"),
-    ("95 - 38 =", "57"),
-    ("6 * 14 =", "84"),
-    ("72 / 9 =", "8"),
-    ("234 + 567 =", "801"),
-    ("1024 - 512 =", "512"),
-    ("33 * 11 =", "363"),
-    ("450 / 15 =", "30"),
-)
-
-_OPENAI_LONG_OUTPUT_EXAMPLES: tuple[tuple[str, str], ...] = (
-    ("1 * 12345 =", "12345"),
-    ("1 * 987654 =", "987654"),
-    ("1 * 11223344556677 =", "11223344556677"),
-)
-_OPENAI_LONG_OUTPUT_SYSTEM_PROMPT = (
-    "You are a calculator. Compute the answer to each math equation. "
-    "Respond with only the numerical answer, nothing else.\n\n"
-    "Examples:\n\n"
-    + "\n\n".join(f"Q: {question}\nA: {answer}" for question, answer in _OPENAI_LONG_OUTPUT_EXAMPLES)
-)
-
-
-def _make_openai_long_output_number(length: int, *, seed: int) -> str:
-    out: list[str] = []
-    counter = 0
-    while len(out) < length:
-        digest = hashlib.sha256(f"{seed}:{counter}".encode()).hexdigest()
-        for character in digest:
-            if character.isdigit() and len(out) < length:
-                out.append(character)
-        counter += 1
-    if out[0] == "0":
-        out[0] = "1"
-    return "".join(out)
-
-
-_OPENAI_LONG_OUTPUT_DIGITS: tuple[str, ...] = tuple(
-    _make_openai_long_output_number(length, seed=seed)
-    for seed, length in enumerate((25, 50, 75, 100, 125, 150, 175, 200))
-)
-
-
 def run_openai_microbench(args: argparse.Namespace) -> int:
     if args.phase_timings:
         os.environ["TORCHINFERNO_OPENAI_PHASE_TIMINGS"] = "1"
@@ -542,7 +494,7 @@ def run_openai_microbench(args: argparse.Namespace) -> int:
 
         print("TorchInferno OpenAI microbench")
         print(
-            f"backend={args.backend} scenario={args.scenario} device={engine.device} prompt_tokens={args.prompt_tokens} "
+            f"backend={args.backend} device={engine.device} prompt_tokens={args.prompt_tokens} "
             f"max_tokens={args.max_tokens} warmup={args.warmup} iters={args.iters} "
             f"batch_wait_ms={args.batch_wait_ms:g}"
         )
@@ -551,7 +503,6 @@ def run_openai_microbench(args: argparse.Namespace) -> int:
         results: dict[str, object] = {
             "backend": args.backend,
             "device": str(engine.device),
-            "scenario": args.scenario,
             "prompt_tokens": args.prompt_tokens,
             "max_tokens": args.max_tokens,
             "batch_wait_ms": args.batch_wait_ms,
@@ -566,7 +517,6 @@ def run_openai_microbench(args: argparse.Namespace) -> int:
                 concurrency=concurrency,
                 warmup=args.warmup,
                 iters=args.iters,
-                scenario=args.scenario,
                 prompt_tokens=args.prompt_tokens,
                 max_tokens=args.max_tokens,
                 temperature=args.temperature,
@@ -664,7 +614,6 @@ def _run_openai_microbench_case(
     concurrency: int,
     warmup: int,
     iters: int,
-    scenario: str,
     prompt_tokens: int,
     max_tokens: int,
     temperature: float,
@@ -673,7 +622,7 @@ def _run_openai_microbench_case(
 ) -> dict[str, object]:
     del label
     for _ in range(warmup):
-        _run_openai_microbench_iteration(engine, concurrency, scenario, prompt_tokens, max_tokens, temperature)
+        _run_openai_microbench_iteration(engine, concurrency, prompt_tokens, max_tokens, temperature)
     if phase_timings and hasattr(engine, "pop_phase_records"):
         engine.pop_phase_records()
     if profile_breakdown and hasattr(engine.model, "enable_profile"):
@@ -686,7 +635,6 @@ def _run_openai_microbench_case(
         for metric in _run_openai_microbench_iteration(
             engine,
             concurrency,
-            scenario,
             prompt_tokens,
             max_tokens,
             temperature,
@@ -743,22 +691,13 @@ def _summarize_openai_phase_records(records: list[dict[str, float]]) -> dict[str
 def _run_openai_microbench_iteration(
     engine: OpenAICompletionEngine,
     concurrency: int,
-    scenario: str,
     prompt_tokens: int,
     max_tokens: int,
     temperature: float,
 ) -> list[dict[str, float]]:
     _sync_openai_engine(engine)
-    if scenario == "multi-turn":
-        metrics = _run_openai_microbench_multi_turn_iteration(engine, max_tokens, temperature)
-        _sync_openai_engine(engine)
-        return metrics
-    if scenario == "long-output":
-        metrics = _run_openai_microbench_long_output_iteration(engine, temperature)
-        _sync_openai_engine(engine)
-        return metrics
     if concurrency == 1:
-        metrics = [_run_openai_microbench_request(engine, 0, scenario, prompt_tokens, max_tokens, temperature)]
+        metrics = [_run_openai_microbench_request(engine, 0, prompt_tokens, max_tokens, temperature)]
         _sync_openai_engine(engine)
         return metrics
 
@@ -772,7 +711,6 @@ def _run_openai_microbench_iteration(
             results[index] = _run_openai_microbench_request(
                 engine,
                 index,
-                scenario,
                 prompt_tokens,
                 max_tokens,
                 temperature,
@@ -795,47 +733,12 @@ def _run_openai_microbench_iteration(
 def _run_openai_microbench_request(
     engine: OpenAICompletionEngine,
     request_index: int,
-    scenario: str,
     prompt_tokens: int,
     max_tokens: int,
     temperature: float,
 ) -> dict[str, float]:
-    messages = _microbench_messages(scenario, prompt_tokens, request_index)
+    messages = _microbench_messages(prompt_tokens, request_index)
     metrics, _content = _run_openai_microbench_messages(engine, messages, max_tokens, temperature)
-    return metrics
-
-
-def _run_openai_microbench_multi_turn_iteration(
-    engine: OpenAICompletionEngine,
-    max_tokens: int,
-    temperature: float,
-) -> list[dict[str, float]]:
-    messages: list[dict[str, object]] = [
-        {"role": "system", "content": _OPENAI_MULTI_TURN_SYSTEM_PROMPT},
-    ]
-    metrics: list[dict[str, float]] = []
-    for equation, _expected in _OPENAI_MULTI_TURN_EQUATIONS:
-        messages.append({"role": "user", "content": equation})
-        request_metrics, content = _run_openai_microbench_messages(engine, messages, max_tokens, temperature)
-        metrics.append(request_metrics)
-        messages.append({"role": "assistant", "content": content})
-    return metrics
-
-
-def _run_openai_microbench_long_output_iteration(
-    engine: OpenAICompletionEngine,
-    temperature: float,
-) -> list[dict[str, float]]:
-    metrics: list[dict[str, float]] = []
-    for big_number in _OPENAI_LONG_OUTPUT_DIGITS:
-        equation = f"1 * {big_number} ="
-        messages = [
-            {"role": "system", "content": _OPENAI_LONG_OUTPUT_SYSTEM_PROMPT},
-            {"role": "user", "content": f"Q: {equation}\nA:"},
-        ]
-        max_tokens = len(big_number) // 3 + 16
-        request_metrics, _content = _run_openai_microbench_messages(engine, messages, max_tokens, temperature)
-        metrics.append(request_metrics)
     return metrics
 
 
@@ -875,28 +778,8 @@ def _run_openai_microbench_messages(
     )
 
 
-def _microbench_messages(scenario: str, prompt_tokens: int, request_index: int) -> list[dict[str, object]]:
-    if scenario == "single":
-        return [{"role": "user", "content": _microbench_prompt_text(prompt_tokens, request_index)}]
-    if scenario == "multi-turn":
-        turn_index = request_index % len(_OPENAI_MULTI_TURN_EQUATIONS)
-        messages: list[dict[str, object]] = [
-            {"role": "system", "content": _OPENAI_MULTI_TURN_SYSTEM_PROMPT},
-        ]
-        for previous_equation, previous_answer in _OPENAI_MULTI_TURN_EQUATIONS[:turn_index]:
-            messages.append({"role": "user", "content": previous_equation})
-            messages.append({"role": "assistant", "content": previous_answer})
-        equation, _expected = _OPENAI_MULTI_TURN_EQUATIONS[turn_index]
-        messages.append({"role": "user", "content": equation})
-        return messages
-    if scenario == "long-output":
-        big_number = _OPENAI_LONG_OUTPUT_DIGITS[request_index % len(_OPENAI_LONG_OUTPUT_DIGITS)]
-        equation = f"1 * {big_number} ="
-        return [
-            {"role": "system", "content": _OPENAI_LONG_OUTPUT_SYSTEM_PROMPT},
-            {"role": "user", "content": f"Q: {equation}\nA:"},
-        ]
-    raise ValueError(f"unsupported OpenAI microbench scenario: {scenario}")
+def _microbench_messages(prompt_tokens: int, request_index: int) -> list[dict[str, object]]:
+    return [{"role": "user", "content": _microbench_prompt_text(prompt_tokens, request_index)}]
 
 
 def _microbench_prompt_text(prompt_tokens: int, request_index: int) -> str:
@@ -1805,12 +1688,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="Microbenchmark OpenAI engine request dispatch, streaming decode, and batching overhead.",
     )
     openai_microbench.add_argument("--backend", choices=["synthetic", "model"], default="synthetic")
-    openai_microbench.add_argument(
-        "--scenario",
-        choices=["single", "multi-turn", "long-output"],
-        default="single",
-        help="Request shape to measure; multi-turn and long-output exercise chat-style calculator workloads.",
-    )
     openai_microbench.add_argument("--model", default=None, help="Model id/path for --backend=model.")
     openai_microbench.add_argument("--model-kind", default="auto")
     openai_microbench.add_argument("--tokenizer", default=None)
