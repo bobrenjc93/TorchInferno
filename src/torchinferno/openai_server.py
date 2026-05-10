@@ -504,9 +504,10 @@ class OpenAICompletionEngine:
             if first is None:
                 return
             batch = [first]
-            self._drain_ready_requests(batch)
+            batch_limit = self._queued_batch_limit(first)
+            self._drain_ready_requests(batch, limit=batch_limit)
             if len(batch) > 1 or self._has_multiple_live_requests():
-                self._collect_batch_until_deadline(batch)
+                self._collect_batch_until_deadline(batch, limit=batch_limit)
             with self._model_lock:
                 self._run_queued_batch(batch)
 
@@ -577,8 +578,22 @@ class OpenAICompletionEngine:
         with self._live_request_condition:
             return self._live_requests > 1
 
-    def _drain_ready_requests(self, batch: list[_QueuedGeneration]) -> None:
-        while len(batch) < self.max_batch_size:
+    def _queued_batch_limit(self, first: _QueuedGeneration) -> int:
+        limit = self.max_batch_size
+        if (
+            first.stream
+            and _is_tensor_parallel_model(self.model)
+            and self.device.type == "cuda"
+            and first.max_tokens
+            <= env_int("TORCHINFERNO_OPENAI_SHORT_STREAM_MAX_TOKENS", 128, minimum=1)
+        ):
+            short_limit = env_int("TORCHINFERNO_OPENAI_TP_SHORT_STREAM_MAX_BATCH_SIZE", 8, minimum=1)
+            return min(limit, short_limit)
+        return limit
+
+    def _drain_ready_requests(self, batch: list[_QueuedGeneration], *, limit: int | None = None) -> None:
+        batch_limit = self.max_batch_size if limit is None else max(1, min(self.max_batch_size, limit))
+        while len(batch) < batch_limit:
             try:
                 item = self._generation_queue.get_nowait()
             except queue.Empty:
@@ -588,11 +603,12 @@ class OpenAICompletionEngine:
                 return
             batch.append(item)
 
-    def _collect_batch_until_deadline(self, batch: list[_QueuedGeneration]) -> None:
+    def _collect_batch_until_deadline(self, batch: list[_QueuedGeneration], *, limit: int | None = None) -> None:
         if self.batch_wait_s == 0.0:
             return
+        batch_limit = self.max_batch_size if limit is None else max(1, min(self.max_batch_size, limit))
         deadline = time.perf_counter() + self.batch_wait_s
-        while len(batch) < self.max_batch_size:
+        while len(batch) < batch_limit:
             timeout = max(0.0, deadline - time.perf_counter())
             if timeout == 0.0:
                 break

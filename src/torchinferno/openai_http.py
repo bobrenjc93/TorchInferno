@@ -165,6 +165,7 @@ def enable_tcp_nodelay(connection: object) -> None:
 
 
 class OpenAIHTTPServer(ThreadingHTTPServer):
+    allow_reuse_address = True
     request_queue_size = 128
 
     def __init__(self, server_address: tuple[str, int], engine: object) -> None:

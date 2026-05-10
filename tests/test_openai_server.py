@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import queue
 import socket
 import subprocess
 import sys
@@ -17,6 +18,7 @@ from torchinferno.openai_server import (
     OpenAICompletionEngine,
     OpenAIServerConfig,
     _ByteFallbackTokenizer,
+    _QueuedGeneration,
     _TransformersChatTokenizer,
     _distributed_server_command,
     _effective_openai_max_batch_size,
@@ -1018,6 +1020,32 @@ def test_openai_effective_max_batch_size_uses_tp_env_override(monkeypatch) -> No
 
     assert _effective_openai_max_batch_size(model, torch.device("cuda"), 64) == 32
     assert _effective_openai_max_batch_size(model, torch.device("cuda"), 16) == 16
+
+
+def test_openai_short_tp_stream_uses_smaller_queue_batch_limit(monkeypatch) -> None:
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_SHORT_STREAM_MAX_BATCH_SIZE", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_SHORT_STREAM_MAX_TOKENS", raising=False)
+    model = object()
+    engine = _cache_only_engine()
+    engine.model = model
+    engine.device = torch.device("cuda")
+    engine.max_batch_size = 64
+
+    monkeypatch.setattr(
+        "torchinferno.openai_server._is_tensor_parallel_model",
+        lambda candidate: candidate is model,
+    )
+
+    short_stream = _QueuedGeneration([], 64, 0.0, True, queue.Queue())
+    long_stream = _QueuedGeneration([], 256, 0.0, True, queue.Queue())
+    short_completion = _QueuedGeneration([], 64, 0.0, False, queue.Queue())
+
+    assert engine._queued_batch_limit(short_stream) == 8
+    assert engine._queued_batch_limit(long_stream) == 64
+    assert engine._queued_batch_limit(short_completion) == 64
+
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_SHORT_STREAM_MAX_BATCH_SIZE", "12")
+    assert engine._queued_batch_limit(short_stream) == 12
 
 
 def test_openai_tensor_parallel_command_sync_uses_control_group(monkeypatch) -> None:
