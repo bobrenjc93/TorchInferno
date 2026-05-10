@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+from importlib.util import find_spec
 from typing import Optional
 
 import torch
@@ -22,21 +23,11 @@ class KernelConfig:
 
 
 def triton_available() -> bool:
-    try:
-        import triton  # noqa: F401
-        import triton.language as tl  # noqa: F401
-    except Exception:
-        return False
-    return True
+    return find_spec("triton") is not None and find_spec("triton.language") is not None
 
 
 def helion_available() -> bool:
-    try:
-        import helion  # noqa: F401
-        import helion.language as hl  # noqa: F401
-    except Exception:
-        return False
-    return True
+    return find_spec("helion") is not None and find_spec("helion.language") is not None
 
 
 def swiglu_activation_reference(gate: Tensor, up: Tensor) -> Tensor:

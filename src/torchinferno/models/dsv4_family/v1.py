@@ -15,6 +15,9 @@ class DSv4V1ForCausalLM(DSv4ForCausalLM):
     provenance_variant = "dsv4:v1"
     ops = fused_ops
 
+    def __init__(self, config: DSv4Config) -> None:
+        super().__init__(config, fused_ops)
+
 
 def tiny_dsv4_v1_config(**overrides: int | float | bool) -> DSv4Config:
     return tiny_dsv4_config(**overrides)

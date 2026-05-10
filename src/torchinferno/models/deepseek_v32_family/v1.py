@@ -10,6 +10,9 @@ class DeepSeekV32V1ForCausalLM(DeepSeekV32ForCausalLM):
     provenance_variant = "deepseek-v3.2:v1"
     ops = fused_ops
 
+    def __init__(self, config: DeepSeekV32Config) -> None:
+        super().__init__(config, fused_ops)
+
 
 def tiny_deepseek_v32_v1_config(**overrides: int | float | bool | str | None) -> DeepSeekV32Config:
     return tiny_deepseek_v32_config(**overrides)

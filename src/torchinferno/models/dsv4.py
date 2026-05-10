@@ -3,12 +3,14 @@ from __future__ import annotations
 import math
 from dataclasses import asdict, dataclass, fields, replace
 from pathlib import Path
+from types import ModuleType
 from typing import Optional
 
 import torch
 from torch import Tensor, nn
 
 from torchinferno.kernels import rms_norm, swiglu_activation
+from torchinferno.runtime.sampling import sample_next_token
 
 
 @dataclass
@@ -99,23 +101,27 @@ def tiny_dsv4_config(**overrides: int | float | bool) -> DSv4Config:
 
 
 class RMSNorm(nn.Module):
-    def __init__(self, dim: int, eps: float) -> None:
+    def __init__(self, dim: int, eps: float, ops: ModuleType | None = None) -> None:
         super().__init__()
         self.weight = nn.Parameter(torch.ones(dim))
         self.eps = eps
+        self.ops = ops
 
     def forward(self, x: Tensor) -> Tensor:
+        if self.ops is not None:
+            return self.ops.rms_norm(x, self.weight, self.eps)
         return rms_norm(x, self.weight, eps=self.eps)
 
 
 class RotaryEmbedding(nn.Module):
-    def __init__(self, dim: int, max_seq_len: int, theta: float) -> None:
+    def __init__(self, dim: int, max_seq_len: int, theta: float, ops: ModuleType | None = None) -> None:
         super().__init__()
         if dim % 2 != 0:
             raise ValueError("RoPE head dimension must be even")
         inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2).float() / dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
         self.max_seq_len = max_seq_len
+        self.ops = ops
 
     def forward(self, q: Tensor, k: Tensor, positions: Tensor) -> tuple[Tensor, Tensor]:
         if positions.numel() == 0:
@@ -124,6 +130,8 @@ class RotaryEmbedding(nn.Module):
         freqs = torch.outer(positions.to(self.inv_freq.device).float(), self.inv_freq)
         cos = freqs.cos().to(dtype=q.dtype, device=q.device)[None, None, :, :]
         sin = freqs.sin().to(dtype=q.dtype, device=q.device)[None, None, :, :]
+        if self.ops is not None:
+            return self.ops.apply_rotary(q, cos, sin), self.ops.apply_rotary(k, cos, sin)
         return self._apply_rotary(q, cos, sin), self._apply_rotary(k, cos, sin)
 
     @staticmethod
@@ -205,16 +213,17 @@ class DSv4Cache:
 
 
 class DSv4Attention(nn.Module):
-    def __init__(self, config: DSv4Config) -> None:
+    def __init__(self, config: DSv4Config, ops: ModuleType | None = None) -> None:
         super().__init__()
         self.config = config
+        self.ops = ops
         self.q_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
         self.kv_a_proj = nn.Linear(config.hidden_size, config.latent_kv_size, bias=False)
-        self.kv_a_norm = RMSNorm(config.latent_kv_size, config.rms_norm_eps)
+        self.kv_a_norm = RMSNorm(config.latent_kv_size, config.rms_norm_eps, ops)
         kv_out = 2 * config.num_key_value_heads * config.head_dim
         self.kv_b_proj = nn.Linear(config.latent_kv_size, kv_out, bias=False)
         self.o_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
-        self.rope = RotaryEmbedding(config.head_dim, config.max_seq_len, config.rope_theta)
+        self.rope = RotaryEmbedding(config.head_dim, config.max_seq_len, config.rope_theta, ops)
 
     def forward(self, x: Tensor, positions: Tensor, cache: Optional[LayerKVCache]) -> Tensor:
         batch, tokens, _ = x.shape
@@ -237,35 +246,41 @@ class DSv4Attention(nn.Module):
             k = k.repeat_interleave(repeats, dim=1)
             v = v.repeat_interleave(repeats, dim=1)
 
-        scale = 1.0 / math.sqrt(head_dim)
-        scores = torch.matmul(q, k.transpose(-1, -2)) * scale
-        key_positions = torch.arange(k.size(-2), device=x.device)
-        allowed = key_positions[None, :] <= positions[:, None]
-        scores = scores.masked_fill(~allowed[None, None, :, :], torch.finfo(scores.dtype).min)
-        probs = torch.softmax(scores.float(), dim=-1).to(dtype=q.dtype)
-        out = torch.matmul(probs, v)
+        if self.ops is not None:
+            out = self.ops.causal_attention(q, k, v, positions)
+        else:
+            scale = 1.0 / math.sqrt(head_dim)
+            scores = torch.matmul(q, k.transpose(-1, -2)) * scale
+            key_positions = torch.arange(k.size(-2), device=x.device)
+            allowed = key_positions[None, :] <= positions[:, None]
+            scores = scores.masked_fill(~allowed[None, None, :, :], torch.finfo(scores.dtype).min)
+            probs = torch.softmax(scores.float(), dim=-1).to(dtype=q.dtype)
+            out = torch.matmul(probs, v)
         out = out.transpose(1, 2).contiguous().view(batch, tokens, self.config.hidden_size)
         return self.o_proj(out)
 
 
 class SwiGLUExpert(nn.Module):
-    def __init__(self, hidden_size: int, intermediate_size: int) -> None:
+    def __init__(self, hidden_size: int, intermediate_size: int, ops: ModuleType | None = None) -> None:
         super().__init__()
         self.w1 = nn.Linear(hidden_size, intermediate_size, bias=False)
         self.w3 = nn.Linear(hidden_size, intermediate_size, bias=False)
         self.w2 = nn.Linear(intermediate_size, hidden_size, bias=False)
+        self.ops = ops
 
     def forward(self, x: Tensor) -> Tensor:
+        if self.ops is not None:
+            return self.w2(self.ops.swiglu(self.w1(x), self.w3(x)))
         return self.w2(swiglu_activation(self.w1(x), self.w3(x)))
 
 
 class RoutedMoE(nn.Module):
-    def __init__(self, config: DSv4Config) -> None:
+    def __init__(self, config: DSv4Config, ops: ModuleType | None = None) -> None:
         super().__init__()
         self.top_k = config.top_k
         self.router = nn.Linear(config.hidden_size, config.num_experts, bias=False)
         self.experts = nn.ModuleList(
-            [SwiGLUExpert(config.hidden_size, config.intermediate_size) for _ in range(config.num_experts)]
+            [SwiGLUExpert(config.hidden_size, config.intermediate_size, ops) for _ in range(config.num_experts)]
         )
 
     def forward(self, x: Tensor) -> Tensor:
@@ -287,12 +302,12 @@ class RoutedMoE(nn.Module):
 
 
 class DSv4DecoderLayer(nn.Module):
-    def __init__(self, config: DSv4Config) -> None:
+    def __init__(self, config: DSv4Config, ops: ModuleType | None = None) -> None:
         super().__init__()
-        self.attn_norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
-        self.attn = DSv4Attention(config)
-        self.moe_norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
-        self.moe = RoutedMoE(config)
+        self.attn_norm = RMSNorm(config.hidden_size, config.rms_norm_eps, ops)
+        self.attn = DSv4Attention(config, ops)
+        self.moe_norm = RMSNorm(config.hidden_size, config.rms_norm_eps, ops)
+        self.moe = RoutedMoE(config, ops)
 
     def forward(self, x: Tensor, positions: Tensor, cache: Optional[LayerKVCache]) -> Tensor:
         x = x + self.attn(self.attn_norm(x), positions, cache)
@@ -301,12 +316,13 @@ class DSv4DecoderLayer(nn.Module):
 
 
 class DSv4ForCausalLM(nn.Module):
-    def __init__(self, config: DSv4Config) -> None:
+    def __init__(self, config: DSv4Config, ops: ModuleType | None = None) -> None:
         super().__init__()
         self.config = config
+        self.ops = ops
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
-        self.layers = nn.ModuleList([DSv4DecoderLayer(config) for _ in range(config.num_layers)])
-        self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
+        self.layers = nn.ModuleList([DSv4DecoderLayer(config, ops) for _ in range(config.num_layers)])
+        self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps, ops)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         if config.tie_word_embeddings:
             self.lm_head.weight = self.embed_tokens.weight
@@ -415,10 +431,3 @@ class DSv4ForCausalLM(nn.Module):
         if was_training:
             self.train()
         return torch.cat(output, dim=1)
-
-
-def sample_next_token(logits: Tensor, temperature: float) -> Tensor:
-    if temperature <= 0:
-        return torch.argmax(logits, dim=-1)
-    probs = torch.softmax(logits.float() / temperature, dim=-1)
-    return torch.multinomial(probs, num_samples=1).squeeze(-1)

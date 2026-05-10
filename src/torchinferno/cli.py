@@ -1523,6 +1523,50 @@ def _parse_node_ids(values: list[str]) -> tuple[int, ...]:
     return tuple(dict.fromkeys(node_ids))
 
 
+_FLOAT_DTYPE_CHOICES = ["float32", "fp32", "float16", "fp16", "bfloat16", "bf16"]
+_AUTO_DTYPE_CHOICES = ["auto", *_FLOAT_DTYPE_CHOICES]
+_PROFILE_DTYPE_CHOICES = ["float32", "float16", "bfloat16"]
+
+
+def _add_device_argument(parser: argparse.ArgumentParser, *, default: str | None = None) -> None:
+    parser.add_argument("--device", default=default, help="Torch device, defaults to cuda when available.")
+
+
+def _add_dtype_argument(
+    parser: argparse.ArgumentParser,
+    *,
+    default: str,
+    choices: list[str],
+    help_text: str | None = None,
+) -> None:
+    parser.add_argument("--dtype", default=default, choices=choices, help=help_text)
+
+
+def _add_checkpoint_source_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("model", help="Local checkpoint directory or Hugging Face repo ID.")
+    parser.add_argument("--revision", default=None)
+    parser.add_argument("--cache-dir", default=None)
+
+
+def _add_non_strict_argument(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--non-strict", action="store_true", help="Allow missing or unexpected weight keys.")
+
+
+def _add_profile_capture_arguments(
+    parser: argparse.ArgumentParser,
+    *,
+    graph_options: bool = False,
+    chrome_trace_help: str = "Do not export chrome_trace.json.",
+) -> None:
+    if graph_options:
+        parser.add_argument("--fake-graph", action="store_true", help="Try graph capture under FakeTensorMode.")
+        parser.add_argument("--require-graph", action="store_true", help="Fail if graph capture fails.")
+    parser.add_argument("--no-profiler", action="store_true", help="Skip torch.profiler capture.")
+    parser.add_argument("--no-chrome-trace", action="store_true", help=chrome_trace_help)
+    parser.add_argument("--with-stack", action="store_true", help="Capture Python stack traces in the profiler.")
+    parser.add_argument("--no-flops", action="store_true", help="Disable profiler FLOP estimation.")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="torchinferno")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -1542,11 +1586,11 @@ def build_parser() -> argparse.ArgumentParser:
     validate_variants.add_argument("--family", default=None, help="Filter to dsv4, dsv3.2/deepseek-v3.2, or llama3.")
     validate_variants.add_argument("--variant", default=None, help="Only validate one optimized variant, such as v1.")
     validate_variants.add_argument("--device", default="cpu", help="Torch device for tiny validation models.")
-    validate_variants.add_argument(
-        "--dtype",
+    _add_dtype_argument(
+        validate_variants,
         default="float32",
-        choices=["float32", "fp32", "float16", "fp16", "bfloat16", "bf16"],
-        help="Model dtype for the comparison.",
+        choices=_FLOAT_DTYPE_CHOICES,
+        help_text="Model dtype for the comparison.",
     )
     validate_variants.add_argument("--batch-size", type=int, default=2)
     validate_variants.add_argument("--tokens", type=int, default=4)
@@ -1676,11 +1720,7 @@ def build_parser() -> argparse.ArgumentParser:
     openai_microbench.add_argument("--tensor-parallel-size", type=int, default=1)
     openai_microbench.add_argument("--devices", default=None, help="Comma-separated device list for model backend.")
     openai_microbench.add_argument("--device", default=None)
-    openai_microbench.add_argument(
-        "--dtype",
-        default="auto",
-        choices=["auto", "float32", "float16", "bfloat16", "fp32", "fp16", "bf16"],
-    )
+    _add_dtype_argument(openai_microbench, default="auto", choices=_AUTO_DTYPE_CHOICES)
     openai_microbench.add_argument("--max-model-len", type=int, default=None)
     openai_microbench.add_argument("--trust-remote-code", action="store_true")
     openai_microbench.add_argument("--token", default=None)
@@ -1717,11 +1757,7 @@ def build_parser() -> argparse.ArgumentParser:
     openai_server_microbench.add_argument("--host", default="127.0.0.1")
     openai_server_microbench.add_argument("--port", type=int, default=0, help="Local server port; 0 chooses a free port.")
     openai_server_microbench.add_argument("--device", default="cpu")
-    openai_server_microbench.add_argument(
-        "--dtype",
-        default="float32",
-        choices=["auto", "float32", "float16", "bfloat16", "fp32", "fp16", "bf16"],
-    )
+    _add_dtype_argument(openai_server_microbench, default="float32", choices=_AUTO_DTYPE_CHOICES)
     openai_server_microbench.add_argument("--max-model-len", type=int, default=64)
     openai_server_microbench.add_argument("--tensor-parallel-size", type=int, default=1)
     openai_server_microbench.add_argument("--cache-backend", choices=["dense", "paged"], default="dense")
@@ -1746,7 +1782,7 @@ def build_parser() -> argparse.ArgumentParser:
     openai_server_microbench.set_defaults(func=run_openai_server_microbench_cli)
 
     smoke = subparsers.add_parser("dsv4-smoke", help="Run a DSv4 end-to-end generation smoke test.")
-    smoke.add_argument("--device", default=None, help="Torch device, defaults to cuda when available.")
+    _add_device_argument(smoke)
     smoke.add_argument("--seed", type=int, default=0)
     smoke.add_argument("--batch-size", type=int, default=2)
     smoke.add_argument("--prompt-tokens", type=int, default=8)
@@ -1757,7 +1793,7 @@ def build_parser() -> argparse.ArgumentParser:
     smoke.set_defaults(func=run_dsv4_smoke)
 
     native = subparsers.add_parser("deepseek-smoke", help="Run a native DeepSeek-V3.2-style generation smoke test.")
-    native.add_argument("--device", default=None, help="Torch device, defaults to cuda when available.")
+    _add_device_argument(native)
     native.add_argument("--seed", type=int, default=0)
     native.add_argument("--batch-size", type=int, default=1)
     native.add_argument("--prompt-tokens", type=int, default=3)
@@ -1775,28 +1811,24 @@ def build_parser() -> argparse.ArgumentParser:
         "dsv4-hf-smoke",
         help="Load a compatible local or Hugging Face DSv4 checkpoint and generate tokens.",
     )
-    hf_smoke.add_argument("model", help="Local checkpoint directory or Hugging Face repo ID.")
-    hf_smoke.add_argument("--revision", default=None)
-    hf_smoke.add_argument("--cache-dir", default=None)
-    hf_smoke.add_argument("--device", default=None, help="Torch device, defaults to cuda when available.")
+    _add_checkpoint_source_arguments(hf_smoke)
+    _add_device_argument(hf_smoke)
     hf_smoke.add_argument("--input-ids", type=int, nargs="+", default=[1, 2, 3])
     hf_smoke.add_argument("--new-tokens", type=int, default=2)
     hf_smoke.add_argument("--temperature", type=float, default=0.0)
-    hf_smoke.add_argument("--non-strict", action="store_true", help="Allow missing or unexpected weight keys.")
+    _add_non_strict_argument(hf_smoke)
     hf_smoke.set_defaults(func=run_hf_smoke)
 
     native_hf = subparsers.add_parser(
         "deepseek-hf-smoke",
         help="Load a native DeepSeek-style checkpoint and generate tokens.",
     )
-    native_hf.add_argument("model", help="Local checkpoint directory or Hugging Face repo ID.")
-    native_hf.add_argument("--revision", default=None)
-    native_hf.add_argument("--cache-dir", default=None)
-    native_hf.add_argument("--device", default=None, help="Torch device, defaults to cuda when available.")
+    _add_checkpoint_source_arguments(native_hf)
+    _add_device_argument(native_hf)
     native_hf.add_argument("--input-ids", type=int, nargs="+", default=[1, 2, 3])
     native_hf.add_argument("--new-tokens", type=int, default=2)
     native_hf.add_argument("--temperature", type=float, default=0.0)
-    native_hf.add_argument("--non-strict", action="store_true", help="Allow missing or unexpected weight keys.")
+    _add_non_strict_argument(native_hf)
     native_hf.set_defaults(func=run_deepseek_hf_smoke)
 
     text = subparsers.add_parser("text-generate", help="Load a TorchInferno checkpoint, tokenize text, and generate.")
@@ -1805,11 +1837,11 @@ def build_parser() -> argparse.ArgumentParser:
     text.add_argument("--tokenizer", default=None, help="Tokenizer path or repo ID, defaults to model.")
     text.add_argument("--revision", default=None)
     text.add_argument("--cache-dir", default=None)
-    text.add_argument("--device", default=None, help="Torch device, defaults to cuda when available.")
+    _add_device_argument(text)
     text.add_argument("--new-tokens", type=int, default=16)
     text.add_argument("--temperature", type=float, default=0.0)
     text.add_argument("--trust-remote-code", action="store_true")
-    text.add_argument("--non-strict", action="store_true", help="Allow missing or unexpected weight keys.")
+    _add_non_strict_argument(text)
     text.set_defaults(func=run_text_generate)
 
     trace = subparsers.add_parser("trace-smoke", help="Trace a DSv4 attention slice with make_fx.")
@@ -1943,7 +1975,7 @@ def build_parser() -> argparse.ArgumentParser:
     traffic.set_defaults(func=run_traffic_smoke)
 
     serve = subparsers.add_parser("serve-smoke", help="Run the token-level continuous serving engine.")
-    serve.add_argument("--device", default=None, help="Torch device, defaults to cuda when available.")
+    _add_device_argument(serve)
     serve.add_argument("--cache-backend", choices=["dense", "paged"], default="paged")
     serve.add_argument("--page-size", type=int, default=16)
     serve.add_argument("--max-active-requests", type=int, default=2)
@@ -1965,11 +1997,7 @@ def build_parser() -> argparse.ArgumentParser:
     openai_serve.add_argument("--tensor-parallel-size", type=int, default=1)
     openai_serve.add_argument("--devices", default=None, help="Comma-separated device list.")
     openai_serve.add_argument("--device", default=None)
-    openai_serve.add_argument(
-        "--dtype",
-        default="auto",
-        choices=["auto", "float32", "float16", "bfloat16", "fp32", "fp16", "bf16"],
-    )
+    _add_dtype_argument(openai_serve, default="auto", choices=_AUTO_DTYPE_CHOICES)
     openai_serve.add_argument("--max-model-len", type=int, default=None)
     openai_serve.add_argument("--trust-remote-code", action="store_true")
     openai_serve.add_argument("--token", default=None)
@@ -1987,7 +2015,7 @@ def build_parser() -> argparse.ArgumentParser:
     openai_serve.set_defaults(func=run_openai_server)
 
     perf = subparsers.add_parser("perf-smoke", help="Benchmark paged attention reference and specialized decode paths.")
-    perf.add_argument("--device", default=None, help="Torch device, defaults to cuda when available.")
+    _add_device_argument(perf)
     perf.add_argument("--backend", choices=[backend.value for backend in KernelBackend], default=KernelBackend.AUTO.value)
     perf.add_argument("--heads", type=int, default=8)
     perf.add_argument("--seq-len", type=int, default=128)
@@ -2010,8 +2038,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="Artifact directory; defaults to .torchinferno_runs/<model>-<timestamp>.",
     )
     profile.add_argument("--model-kind", choices=["dsv4", "deepseek"], default="dsv4")
-    profile.add_argument("--device", default=None, help="Torch device, defaults to cuda when available.")
-    profile.add_argument("--dtype", choices=["float32", "float16", "bfloat16"], default="float32")
+    _add_device_argument(profile)
+    _add_dtype_argument(profile, default="float32", choices=_PROFILE_DTYPE_CHOICES)
     profile.add_argument("--seed", type=int, default=0)
     profile.add_argument("--batch-size", type=int, default=1)
     profile.add_argument("--prompt-tokens", type=int, default=8)
@@ -2029,10 +2057,7 @@ def build_parser() -> argparse.ArgumentParser:
     profile.add_argument("--no-graph", action="store_true", help="Skip make_fx graph capture.")
     profile.add_argument("--fake-graph", action="store_true", help="Try graph capture under FakeTensorMode.")
     profile.add_argument("--require-graph", action="store_true", help="Fail the run if graph capture fails.")
-    profile.add_argument("--no-profiler", action="store_true", help="Skip torch.profiler capture.")
-    profile.add_argument("--no-chrome-trace", action="store_true", help="Do not export chrome_trace.json.")
-    profile.add_argument("--with-stack", action="store_true", help="Capture Python stack traces in the profiler.")
-    profile.add_argument("--no-flops", action="store_true", help="Disable profiler FLOP estimation.")
+    _add_profile_capture_arguments(profile)
     profile.set_defaults(func=run_profile_run)
 
     profile_timeslice = subparsers.add_parser(
@@ -2041,8 +2066,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     profile_timeslice.add_argument("output_dir")
     profile_timeslice.add_argument("--model-kind", choices=["dsv4", "deepseek"], default="dsv4")
-    profile_timeslice.add_argument("--device", default=None, help="Torch device, defaults to cuda when available.")
-    profile_timeslice.add_argument("--dtype", choices=["float32", "float16", "bfloat16"], default="float32")
+    _add_device_argument(profile_timeslice)
+    _add_dtype_argument(profile_timeslice, default="float32", choices=_PROFILE_DTYPE_CHOICES)
     profile_timeslice.add_argument("--seed", type=int, default=0)
     profile_timeslice.add_argument("--batch-size", type=int, default=1)
     profile_timeslice.add_argument("--prompt-tokens", type=int, default=8)
@@ -2068,10 +2093,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=1.0,
         help="Multiply measured representative latency before replaying virtual ranks.",
     )
-    profile_timeslice.add_argument("--no-profiler", action="store_true", help="Skip torch.profiler capture.")
-    profile_timeslice.add_argument("--no-chrome-trace", action="store_true", help="Do not export chrome_trace.json.")
-    profile_timeslice.add_argument("--with-stack", action="store_true", help="Capture Python stack traces in the profiler.")
-    profile_timeslice.add_argument("--no-flops", action="store_true", help="Disable profiler FLOP estimation.")
+    _add_profile_capture_arguments(profile_timeslice)
     profile_timeslice.set_defaults(func=run_profile_timeslice)
 
     profile_offload = subparsers.add_parser(
@@ -2081,8 +2103,8 @@ def build_parser() -> argparse.ArgumentParser:
     profile_offload.add_argument("output_dir")
     profile_offload.add_argument("--checkpoint", default=None, help="Optional local/Hugging Face TorchInferno checkpoint.")
     profile_offload.add_argument("--model-kind", choices=["dsv4", "deepseek"], default="dsv4")
-    profile_offload.add_argument("--device", default=None, help="Torch device, defaults to cuda when available.")
-    profile_offload.add_argument("--dtype", choices=["float32", "float16", "bfloat16"], default="float32")
+    _add_device_argument(profile_offload)
+    _add_dtype_argument(profile_offload, default="float32", choices=_PROFILE_DTYPE_CHOICES)
     profile_offload.add_argument("--seed", type=int, default=0)
     profile_offload.add_argument("--batch-size", type=int, default=1)
     profile_offload.add_argument("--prompt-tokens", type=int, default=8)
@@ -2098,7 +2120,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     profile_offload.add_argument("--revision", default=None)
     profile_offload.add_argument("--cache-dir", default=None)
-    profile_offload.add_argument("--non-strict", action="store_true", help="Allow missing or unexpected weight keys.")
+    _add_non_strict_argument(profile_offload)
     profile_offload.set_defaults(func=run_profile_offload)
 
     profile_region = subparsers.add_parser(
@@ -2108,20 +2130,15 @@ def build_parser() -> argparse.ArgumentParser:
     profile_region.add_argument("output_dir")
     profile_region.add_argument("--region", required=True, help="Module path such as layers.0.attn or model.layers.0.self_attn.")
     profile_region.add_argument("--model-kind", choices=["dsv4", "deepseek"], default="dsv4")
-    profile_region.add_argument("--device", default=None, help="Torch device, defaults to cuda when available.")
-    profile_region.add_argument("--dtype", choices=["float32", "float16", "bfloat16"], default="float32")
+    _add_device_argument(profile_region)
+    _add_dtype_argument(profile_region, default="float32", choices=_PROFILE_DTYPE_CHOICES)
     profile_region.add_argument("--seed", type=int, default=0)
     profile_region.add_argument("--batch-size", type=int, default=1)
     profile_region.add_argument("--tokens", type=int, default=8)
     profile_region.add_argument("--vocab-size", type=int, default=128)
     profile_region.add_argument("--warmup", type=int, default=3)
     profile_region.add_argument("--iters", type=int, default=10)
-    profile_region.add_argument("--fake-graph", action="store_true", help="Try graph capture under FakeTensorMode.")
-    profile_region.add_argument("--require-graph", action="store_true", help="Fail if graph capture fails.")
-    profile_region.add_argument("--no-profiler", action="store_true", help="Skip torch.profiler capture.")
-    profile_region.add_argument("--no-chrome-trace", action="store_true", help="Do not export chrome_trace.json.")
-    profile_region.add_argument("--with-stack", action="store_true", help="Capture Python stack traces in the profiler.")
-    profile_region.add_argument("--no-flops", action="store_true", help="Disable profiler FLOP estimation.")
+    _add_profile_capture_arguments(profile_region, graph_options=True)
     profile_region.set_defaults(func=run_profile_region)
 
     profile_pattern = subparsers.add_parser(
@@ -2130,8 +2147,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     profile_pattern.add_argument("output_dir")
     profile_pattern.add_argument("--pattern", choices=["fused-rmsnorm-swiglu"], default="fused-rmsnorm-swiglu")
-    profile_pattern.add_argument("--device", default=None, help="Torch device, defaults to cuda when available.")
-    profile_pattern.add_argument("--dtype", choices=["float32", "float16", "bfloat16"], default="float32")
+    _add_device_argument(profile_pattern)
+    _add_dtype_argument(profile_pattern, default="float32", choices=_PROFILE_DTYPE_CHOICES)
     profile_pattern.add_argument("--seed", type=int, default=0)
     profile_pattern.add_argument("--batch-size", type=int, default=1)
     profile_pattern.add_argument("--tokens", type=int, default=8)
@@ -2139,12 +2156,11 @@ def build_parser() -> argparse.ArgumentParser:
     profile_pattern.add_argument("--warmup", type=int, default=3)
     profile_pattern.add_argument("--iters", type=int, default=10)
     profile_pattern.add_argument("--no-apply-passes", action="store_true", help="Profile only the reference graph.")
-    profile_pattern.add_argument("--fake-graph", action="store_true", help="Try graph capture under FakeTensorMode.")
-    profile_pattern.add_argument("--require-graph", action="store_true", help="Fail if graph capture fails.")
-    profile_pattern.add_argument("--no-profiler", action="store_true", help="Skip torch.profiler capture.")
-    profile_pattern.add_argument("--no-chrome-trace", action="store_true", help="Do not export chrome_trace JSON files.")
-    profile_pattern.add_argument("--with-stack", action="store_true", help="Capture Python stack traces in the profiler.")
-    profile_pattern.add_argument("--no-flops", action="store_true", help="Disable profiler FLOP estimation.")
+    _add_profile_capture_arguments(
+        profile_pattern,
+        graph_options=True,
+        chrome_trace_help="Do not export chrome_trace JSON files.",
+    )
     profile_pattern.set_defaults(func=run_profile_pattern)
 
     profile_subgraph = subparsers.add_parser(
@@ -2162,10 +2178,7 @@ def build_parser() -> argparse.ArgumentParser:
     profile_subgraph.add_argument("--device", default=None, help="Override source run device.")
     profile_subgraph.add_argument("--warmup", type=int, default=3)
     profile_subgraph.add_argument("--iters", type=int, default=10)
-    profile_subgraph.add_argument("--no-profiler", action="store_true", help="Skip torch.profiler capture.")
-    profile_subgraph.add_argument("--no-chrome-trace", action="store_true", help="Do not export chrome_trace.json.")
-    profile_subgraph.add_argument("--with-stack", action="store_true", help="Capture Python stack traces in the profiler.")
-    profile_subgraph.add_argument("--no-flops", action="store_true", help="Disable profiler FLOP estimation.")
+    _add_profile_capture_arguments(profile_subgraph)
     profile_subgraph.set_defaults(func=run_profile_subgraph)
 
     profile_nodes = subparsers.add_parser(

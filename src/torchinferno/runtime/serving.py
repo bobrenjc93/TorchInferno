@@ -8,6 +8,7 @@ import torch
 from torch import Tensor
 
 from torchinferno.runtime.prefix_cache import PrefixCacheIndex
+from torchinferno.runtime.sampling import sample_next_token
 
 
 @dataclass(frozen=True)
@@ -188,7 +189,6 @@ class ContinuousBatchEngine:
         group: list[tuple[int, ServingRequest, int]],
         step: int,
     ) -> list[_ActiveRequest]:
-        prompt_len = len(group[0][1].prompt)
         rows = [self._acquire_active_row() for _ in group]
         prompts = torch.tensor([request.prompt for _, request, _ in group], device=self.device, dtype=torch.long)
         cache_view = self._cache_view(rows)
@@ -428,10 +428,3 @@ class ContinuousBatchEngine:
         if state.request.eos_token_id is not None and state.last_token == state.request.eos_token_id:
             return True
         return state.generated >= state.request.max_new_tokens
-
-
-def sample_next_token(logits: Tensor, temperature: float) -> Tensor:
-    if temperature <= 0:
-        return torch.argmax(logits, dim=-1)
-    probs = torch.softmax(logits.float() / temperature, dim=-1)
-    return torch.multinomial(probs, num_samples=1).squeeze(-1)

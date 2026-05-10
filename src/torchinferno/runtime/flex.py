@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from importlib.util import find_spec
 from typing import Callable, Optional
 
 import torch
@@ -11,11 +12,7 @@ MaskMod = Callable[[int, int], bool]
 
 
 def flex_attention_available() -> bool:
-    try:
-        import torch.nn.attention.flex_attention  # noqa: F401
-    except Exception:
-        return False
-    return True
+    return find_spec("torch.nn.attention.flex_attention") is not None
 
 
 def causal_mask_mod(query_position: int, key_position: int) -> bool:

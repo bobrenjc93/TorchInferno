@@ -1,39 +1,15 @@
 from __future__ import annotations
 
 import torch
-from torch import Tensor, nn
+from torch import Tensor
 
 from torchinferno.models.deepseek import (
-    DeepSeekMLP,
-    DeepSeekMoE,
-    DeepSeekRMSNorm,
     DeepSeekV32Config,
     DeepSeekV32ForCausalLM,
     sample_next_token,
     tiny_deepseek_v32_config,
 )
 from torchinferno.models.deepseek_v32_family import raw_ops
-
-
-class RawDeepSeekRMSNorm(nn.Module):
-    def __init__(self, source: DeepSeekRMSNorm) -> None:
-        super().__init__()
-        self.weight = nn.Parameter(source.weight.detach().clone())
-        self.eps = source.eps
-
-    def forward(self, x: Tensor) -> Tensor:
-        return raw_ops.rms_norm(x, self.weight, self.eps)
-
-
-class RawDeepSeekMLP(nn.Module):
-    def __init__(self, source: DeepSeekMLP) -> None:
-        super().__init__()
-        self.gate_proj = source.gate_proj
-        self.up_proj = source.up_proj
-        self.down_proj = source.down_proj
-
-    def forward(self, x: Tensor) -> Tensor:
-        return self.down_proj(raw_ops.swiglu(self.gate_proj(x), self.up_proj(x)))
 
 
 class DeepSeekV32V0ForCausalLM(DeepSeekV32ForCausalLM):
@@ -48,8 +24,7 @@ class DeepSeekV32V0ForCausalLM(DeepSeekV32ForCausalLM):
     ops = raw_ops
 
     def __init__(self, config: DeepSeekV32Config) -> None:
-        super().__init__(config)
-        _replace_raw_modules(self)
+        super().__init__(config, raw_ops)
 
     @torch.inference_mode()
     def generate(
@@ -79,15 +54,3 @@ class DeepSeekV32V0ForCausalLM(DeepSeekV32ForCausalLM):
 
 def tiny_deepseek_v32_v0_config(**overrides: int | float | bool | str | None) -> DeepSeekV32Config:
     return tiny_deepseek_v32_config(**overrides)
-
-
-def _replace_raw_modules(module: nn.Module) -> None:
-    for name, child in list(module.named_children()):
-        if isinstance(child, DeepSeekRMSNorm):
-            setattr(module, name, RawDeepSeekRMSNorm(child))
-        elif isinstance(child, DeepSeekMLP):
-            setattr(module, name, RawDeepSeekMLP(child))
-        elif isinstance(child, DeepSeekMoE):
-            _replace_raw_modules(child)
-        else:
-            _replace_raw_modules(child)

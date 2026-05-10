@@ -9,6 +9,7 @@ from torch import Tensor, nn
 
 from torchinferno.models.deepseek import DeepSeekV32ForCausalLM
 from torchinferno.models.dsv4 import DSv4ForCausalLM
+from torchinferno.runtime.sampling import sample_next_token
 
 
 @dataclass(frozen=True)
@@ -126,7 +127,7 @@ def run_offloaded_generate_recompute(
             label=f"step{step}",
         )
         events.extend(result.events)
-        next_token = _sample_next_token(result.output[:, -1, :], temperature)
+        next_token = sample_next_token(result.output[:, -1, :], temperature)
         tokens = torch.cat([tokens, next_token[:, None].cpu()], dim=1)
     return OffloadRunResult(tokens, tuple(events))
 
@@ -325,13 +326,6 @@ def _ensure_activation_on_device(
     if hidden.device == device:
         return hidden
     return _move_tensor(hidden, device, name, "activation_to_device", events)
-
-
-def _sample_next_token(logits: Tensor, temperature: float) -> Tensor:
-    if temperature <= 0:
-        return torch.argmax(logits, dim=-1)
-    probs = torch.softmax(logits.float() / temperature, dim=-1)
-    return torch.multinomial(probs, num_samples=1).squeeze(-1)
 
 
 def _time_call(fn, device: torch.device) -> float:

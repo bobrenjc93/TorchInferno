@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import torch
 from torch import Tensor
 
 from torchinferno.kernels import rms_norm as kernel_rms_norm

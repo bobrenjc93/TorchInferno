@@ -22,7 +22,14 @@ from torchinferno.runtime.offload import (
 from torchinferno.runtime.paged import PagedKVCache, PagedSequence
 from torchinferno.runtime.paged_attention import paged_causal_attention
 from torchinferno.runtime.prefix import PrefixAwareRouter, PrefixMatch, RadixPrefixTree
-from torchinferno.runtime.prefix_cache import PrefixCacheEntry, PrefixCacheIndex
+from torchinferno.runtime.prefix_cache import (
+    PrefixCacheEntry,
+    PrefixCacheIndex,
+    TensorPrefixCacheEntry,
+    restore_tensor_prefix_cache,
+    snapshot_tensor_prefix_cache,
+)
+from torchinferno.runtime.sampling import sample_next_token
 from torchinferno.runtime.scheduler import (
     DisaggregatedPrefillDecodeSimulator,
     InferenceJob,
@@ -66,6 +73,7 @@ __all__ = [
     "ServingRequest",
     "ServingResult",
     "ServingStats",
+    "TensorPrefixCacheEntry",
     "TimeSliceReplayEvent",
     "TimeSliceReplayResult",
     "TimeSliceWorkload",
@@ -78,8 +86,11 @@ __all__ = [
     "run_offloaded_forward",
     "run_offloaded_generate_recompute",
     "run_disagg_request",
+    "restore_tensor_prefix_cache",
+    "sample_next_token",
     "serve_rank",
     "simulate_traffic",
+    "snapshot_tensor_prefix_cache",
     "start_rank_server",
     "summarize_offload_events",
     "write_rank_files",

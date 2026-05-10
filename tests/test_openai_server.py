@@ -12,14 +12,13 @@ from pathlib import Path
 
 import torch
 
+from torchinferno.openai_http import OpenAIHandler, enable_tcp_nodelay
 from torchinferno.openai_server import (
     OpenAICompletionEngine,
     OpenAIServerConfig,
     _ByteFallbackTokenizer,
-    _OpenAIHandler,
     _TransformersChatTokenizer,
     _distributed_server_command,
-    _enable_tcp_nodelay,
     _should_reexec_distributed_server,
     _warmup_prefill_cache_token_counts,
     _warmup_prompt_token_counts,
@@ -96,7 +95,7 @@ def test_openai_server_matches_openai_chat_contract() -> None:
 
 
 def test_openai_handler_writes_sse_frame_with_single_socket_write() -> None:
-    handler = object.__new__(_OpenAIHandler)
+    handler = object.__new__(OpenAIHandler)
     writer = _CountingWriter()
     handler.wfile = writer
 
@@ -110,7 +109,7 @@ def test_openai_handler_writes_sse_frame_with_single_socket_write() -> None:
 def test_openai_handler_enables_tcp_nodelay() -> None:
     fake_socket = _FakeSocket()
 
-    _enable_tcp_nodelay(fake_socket)
+    enable_tcp_nodelay(fake_socket)
 
     assert fake_socket.options == [(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)]
 

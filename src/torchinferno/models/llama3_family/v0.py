@@ -7,6 +7,7 @@ from torch import Tensor, nn
 
 from torchinferno.models.llama3_family import raw_ops
 from torchinferno.models.llama3_family.config import Llama3Config, tiny_llama3_config
+from torchinferno.runtime.sampling import sample_next_token
 
 
 class Llama3RMSNorm(nn.Module):
@@ -131,14 +132,6 @@ class Llama3V0ForCausalLM(_Llama3ForCausalLMBase):
 
     def __init__(self, config: Llama3Config) -> None:
         super().__init__(config, raw_ops)
-
-
-def sample_next_token(logits: Tensor, temperature: float) -> Tensor:
-    if temperature <= 0:
-        return torch.argmax(logits, dim=-1)
-    probs = torch.softmax(logits.float() / temperature, dim=-1)
-    return torch.multinomial(probs, num_samples=1).squeeze(-1)
-
 
 def tiny_llama3_v0_config(**overrides: int | float | bool) -> Llama3Config:
     return tiny_llama3_config(**overrides)

@@ -4,6 +4,7 @@ import json
 import math
 from dataclasses import asdict, dataclass, fields, replace
 from pathlib import Path
+from types import ModuleType
 from typing import Optional
 
 import torch
@@ -13,6 +14,7 @@ from torch import Tensor, nn
 from torchinferno.kernels import batched_paged_decode_attention, rms_norm, swiglu_activation
 from torchinferno.models.hf import HF_CONFIG_NAME, SAFETENSORS_NAME, load_config, load_state_dict, resolve_pretrained_path
 from torchinferno.runtime.paged_attention import batched_paged_causal_attention
+from torchinferno.runtime.sampling import sample_next_token
 
 
 @dataclass
@@ -146,25 +148,31 @@ def tiny_deepseek_v32_config(**overrides: int | float | bool | str | None) -> De
 
 
 class DeepSeekRMSNorm(nn.Module):
-    def __init__(self, dim: int, eps: float) -> None:
+    def __init__(self, dim: int, eps: float, ops: ModuleType | None = None) -> None:
         super().__init__()
         self.weight = nn.Parameter(torch.ones(dim))
         self.eps = eps
+        self.ops = ops
 
     def forward(self, x: Tensor) -> Tensor:
+        if self.ops is not None:
+            return self.ops.rms_norm(x, self.weight, self.eps)
         return rms_norm(x, self.weight, eps=self.eps)
 
 
 class DeepSeekRotaryEmbedding(nn.Module):
-    def __init__(self, dim: int, theta: float) -> None:
+    def __init__(self, dim: int, theta: float, ops: ModuleType | None = None) -> None:
         super().__init__()
         inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2).float() / dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self.ops = ops
 
     def forward(self, q: Tensor, k: Tensor, positions: Tensor) -> tuple[Tensor, Tensor]:
         freqs = torch.outer(positions.to(self.inv_freq.device).float(), self.inv_freq)
         cos = freqs.cos().to(dtype=q.dtype, device=q.device)[None, None, :, :]
         sin = freqs.sin().to(dtype=q.dtype, device=q.device)[None, None, :, :]
+        if self.ops is not None:
+            return self.ops.apply_rotary(q, cos, sin), self.ops.apply_rotary(k, cos, sin)
         return apply_rotary(q, cos, sin), apply_rotary(k, cos, sin)
 
 
@@ -556,26 +564,27 @@ def dense_causal_attention(query: Tensor, key: Tensor, value: Tensor, positions:
 
 
 class DeepSeekAttention(nn.Module):
-    def __init__(self, config: DeepSeekV32Config) -> None:
+    def __init__(self, config: DeepSeekV32Config, ops: ModuleType | None = None) -> None:
         super().__init__()
         self.config = config
+        self.ops = ops
         q_out = config.num_attention_heads * config.qk_head_dim
         if config.q_lora_rank is None:
             self.q_proj = nn.Linear(config.hidden_size, q_out, bias=False)
         else:
             self.q_a_proj = nn.Linear(config.hidden_size, config.q_lora_rank, bias=False)
-            self.q_a_layernorm = DeepSeekRMSNorm(config.q_lora_rank, config.rms_norm_eps)
+            self.q_a_layernorm = DeepSeekRMSNorm(config.q_lora_rank, config.rms_norm_eps, ops)
             self.q_b_proj = nn.Linear(config.q_lora_rank, q_out, bias=False)
         self.kv_a_proj_with_mqa = nn.Linear(
             config.hidden_size,
             config.kv_lora_rank + config.qk_rope_head_dim,
             bias=False,
         )
-        self.kv_a_layernorm = DeepSeekRMSNorm(config.kv_lora_rank, config.rms_norm_eps)
+        self.kv_a_layernorm = DeepSeekRMSNorm(config.kv_lora_rank, config.rms_norm_eps, ops)
         kv_b_out = config.num_attention_heads * (config.qk_nope_head_dim + config.v_head_dim)
         self.kv_b_proj = nn.Linear(config.kv_lora_rank, kv_b_out, bias=False)
         self.o_proj = nn.Linear(config.attention_output_size, config.hidden_size, bias=False)
-        self.rotary_emb = DeepSeekRotaryEmbedding(config.qk_rope_head_dim, config.rope_theta)
+        self.rotary_emb = DeepSeekRotaryEmbedding(config.qk_rope_head_dim, config.rope_theta, ops)
 
     def forward(
         self,
@@ -616,25 +625,32 @@ class DeepSeekAttention(nn.Module):
         else:
             if cache is not None:
                 key, value = cache.append(key, value, row_indices=row_indices)
-            out = dense_causal_attention(query, key, value, positions)
+            out = (
+                self.ops.causal_attention(query, key, value, positions)
+                if self.ops is not None
+                else dense_causal_attention(query, key, value, positions)
+            )
 
         out = out.transpose(1, 2).contiguous().view(batch, tokens, self.config.attention_output_size)
         return self.o_proj(out)
 
 
 class DeepSeekMLP(nn.Module):
-    def __init__(self, hidden_size: int, intermediate_size: int) -> None:
+    def __init__(self, hidden_size: int, intermediate_size: int, ops: ModuleType | None = None) -> None:
         super().__init__()
         self.gate_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
         self.up_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
         self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=False)
+        self.ops = ops
 
     def forward(self, x: Tensor) -> Tensor:
+        if self.ops is not None:
+            return self.down_proj(self.ops.swiglu(self.gate_proj(x), self.up_proj(x)))
         return self.down_proj(swiglu_activation(self.gate_proj(x), self.up_proj(x)))
 
 
 class DeepSeekMoEGate(nn.Module):
-    def __init__(self, config: DeepSeekV32Config) -> None:
+    def __init__(self, config: DeepSeekV32Config, ops: ModuleType | None = None) -> None:
         super().__init__()
         self.weight = nn.Parameter(torch.empty(config.n_routed_experts, config.hidden_size))
         self.n_group = config.n_group
@@ -647,6 +663,7 @@ class DeepSeekMoEGate(nn.Module):
             self.e_score_correction_bias = nn.Parameter(torch.zeros(config.n_routed_experts))
         else:
             self.register_parameter("e_score_correction_bias", None)
+        self.ops = ops
         nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
 
     def forward(self, x: Tensor) -> tuple[Tensor, Tensor]:
@@ -659,17 +676,20 @@ class DeepSeekMoEGate(nn.Module):
         selection_scores = scores
         if self.e_score_correction_bias is not None:
             selection_scores = selection_scores + self.e_score_correction_bias
-        if self.n_group > 1 and self.topk_group < self.n_group:
-            group_size = selection_scores.size(-1) // self.n_group
-            grouped = selection_scores.view(selection_scores.size(0), self.n_group, group_size)
-            group_scores = grouped.max(dim=-1).values
-            group_idx = torch.topk(group_scores, self.topk_group, dim=-1).indices
-            group_mask = torch.zeros_like(group_scores, dtype=torch.bool)
-            group_mask.scatter_(1, group_idx, True)
-            expert_mask = group_mask[:, :, None].expand(-1, -1, group_size).reshape_as(selection_scores)
-            selection_scores = selection_scores.masked_fill(~expert_mask, torch.finfo(selection_scores.dtype).min)
+        if self.ops is not None:
+            _, top_indices = self.ops.grouped_topk(selection_scores, self.n_group, self.topk_group, self.top_k)
+        else:
+            if self.n_group > 1 and self.topk_group < self.n_group:
+                group_size = selection_scores.size(-1) // self.n_group
+                grouped = selection_scores.view(selection_scores.size(0), self.n_group, group_size)
+                group_scores = grouped.max(dim=-1).values
+                group_idx = torch.topk(group_scores, self.topk_group, dim=-1).indices
+                group_mask = torch.zeros_like(group_scores, dtype=torch.bool)
+                group_mask.scatter_(1, group_idx, True)
+                expert_mask = group_mask[:, :, None].expand(-1, -1, group_size).reshape_as(selection_scores)
+                selection_scores = selection_scores.masked_fill(~expert_mask, torch.finfo(selection_scores.dtype).min)
 
-        top_indices = torch.topk(selection_scores, self.top_k, dim=-1).indices
+            top_indices = torch.topk(selection_scores, self.top_k, dim=-1).indices
         top_weights = scores.gather(1, top_indices)
         if self.norm_topk_prob:
             top_weights = top_weights / top_weights.sum(dim=-1, keepdim=True).clamp_min(1e-20)
@@ -678,14 +698,14 @@ class DeepSeekMoEGate(nn.Module):
 
 
 class DeepSeekMoE(nn.Module):
-    def __init__(self, config: DeepSeekV32Config) -> None:
+    def __init__(self, config: DeepSeekV32Config, ops: ModuleType | None = None) -> None:
         super().__init__()
-        self.gate = DeepSeekMoEGate(config)
+        self.gate = DeepSeekMoEGate(config, ops)
         self.experts = nn.ModuleList(
-            [DeepSeekMLP(config.hidden_size, config.moe_intermediate_size) for _ in range(config.n_routed_experts)]
+            [DeepSeekMLP(config.hidden_size, config.moe_intermediate_size, ops) for _ in range(config.n_routed_experts)]
         )
         shared_size = config.n_shared_experts * config.moe_intermediate_size
-        self.shared_experts = DeepSeekMLP(config.hidden_size, shared_size) if shared_size > 0 else None
+        self.shared_experts = DeepSeekMLP(config.hidden_size, shared_size, ops) if shared_size > 0 else None
         self.top_k = config.num_experts_per_tok
 
     def forward(self, x: Tensor) -> Tensor:
@@ -705,15 +725,15 @@ class DeepSeekMoE(nn.Module):
 
 
 class DeepSeekDecoderLayer(nn.Module):
-    def __init__(self, config: DeepSeekV32Config, layer_idx: int) -> None:
+    def __init__(self, config: DeepSeekV32Config, layer_idx: int, ops: ModuleType | None = None) -> None:
         super().__init__()
-        self.input_layernorm = DeepSeekRMSNorm(config.hidden_size, config.rms_norm_eps)
-        self.self_attn = DeepSeekAttention(config)
-        self.post_attention_layernorm = DeepSeekRMSNorm(config.hidden_size, config.rms_norm_eps)
+        self.input_layernorm = DeepSeekRMSNorm(config.hidden_size, config.rms_norm_eps, ops)
+        self.self_attn = DeepSeekAttention(config, ops)
+        self.post_attention_layernorm = DeepSeekRMSNorm(config.hidden_size, config.rms_norm_eps, ops)
         if config.is_moe_layer(layer_idx):
-            self.mlp = DeepSeekMoE(config)
+            self.mlp = DeepSeekMoE(config, ops)
         else:
-            self.mlp = DeepSeekMLP(config.hidden_size, config.intermediate_size)
+            self.mlp = DeepSeekMLP(config.hidden_size, config.intermediate_size, ops)
 
     def forward(
         self,
@@ -728,14 +748,15 @@ class DeepSeekDecoderLayer(nn.Module):
 
 
 class DeepSeekV32Model(nn.Module):
-    def __init__(self, config: DeepSeekV32Config) -> None:
+    def __init__(self, config: DeepSeekV32Config, ops: ModuleType | None = None) -> None:
         super().__init__()
         self.config = config
+        self.ops = ops
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.layers = nn.ModuleList(
-            [DeepSeekDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
+            [DeepSeekDecoderLayer(config, layer_idx, ops) for layer_idx in range(config.num_hidden_layers)]
         )
-        self.norm = DeepSeekRMSNorm(config.hidden_size, config.rms_norm_eps)
+        self.norm = DeepSeekRMSNorm(config.hidden_size, config.rms_norm_eps, ops)
 
     def forward(
         self,
@@ -775,10 +796,11 @@ class DeepSeekV32Model(nn.Module):
 
 
 class DeepSeekV32ForCausalLM(nn.Module):
-    def __init__(self, config: DeepSeekV32Config) -> None:
+    def __init__(self, config: DeepSeekV32Config, ops: ModuleType | None = None) -> None:
         super().__init__()
         self.config = config
-        self.model = DeepSeekV32Model(config)
+        self.ops = ops
+        self.model = DeepSeekV32Model(config, ops)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         if config.tie_word_embeddings:
             self.lm_head.weight = self.model.embed_tokens.weight
@@ -885,10 +907,3 @@ class DeepSeekV32ForCausalLM(nn.Module):
         if was_training:
             self.train()
         return torch.cat(output, dim=1)
-
-
-def sample_next_token(logits: Tensor, temperature: float) -> Tensor:
-    if temperature <= 0:
-        return torch.argmax(logits, dim=-1)
-    probs = torch.softmax(logits.float() / temperature, dim=-1)
-    return torch.multinomial(probs, num_samples=1).squeeze(-1)

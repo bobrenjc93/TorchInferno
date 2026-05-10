@@ -10,7 +10,8 @@ from urllib import error, request
 
 import torch
 
-from torchinferno.models.dsv4 import DSv4Cache, DSv4ForCausalLM, sample_next_token, tiny_dsv4_config
+from torchinferno.models.dsv4 import DSv4Cache, DSv4ForCausalLM, tiny_dsv4_config
+from torchinferno.runtime.sampling import sample_next_token
 
 
 RankRole = Literal["prefill", "decode"]

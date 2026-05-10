@@ -1,38 +1,15 @@
 from __future__ import annotations
 
 import torch
-from torch import Tensor, nn
+from torch import Tensor
 
 from torchinferno.models.dsv4 import (
     DSv4Config,
     DSv4ForCausalLM,
-    RMSNorm,
-    SwiGLUExpert,
     sample_next_token,
     tiny_dsv4_config,
 )
 from torchinferno.models.dsv4_family import raw_ops
-
-
-class RawRMSNorm(nn.Module):
-    def __init__(self, source: RMSNorm) -> None:
-        super().__init__()
-        self.weight = nn.Parameter(source.weight.detach().clone())
-        self.eps = source.eps
-
-    def forward(self, x: Tensor) -> Tensor:
-        return raw_ops.rms_norm(x, self.weight, self.eps)
-
-
-class RawSwiGLUExpert(nn.Module):
-    def __init__(self, source: SwiGLUExpert) -> None:
-        super().__init__()
-        self.w1 = source.w1
-        self.w3 = source.w3
-        self.w2 = source.w2
-
-    def forward(self, x: Tensor) -> Tensor:
-        return self.w2(raw_ops.swiglu(self.w1(x), self.w3(x)))
 
 
 class DSv4V0ForCausalLM(DSv4ForCausalLM):
@@ -40,17 +17,14 @@ class DSv4V0ForCausalLM(DSv4ForCausalLM):
 
     v0 keeps the existing torch-native DSv4 tensor contracts but deliberately
     disables cached decode in `generate` and routes provenance-visible scalar
-    operations through `raw_ops.py`. The next step for this family is to move
-    every module body into this package so v0 is entirely independent of the
-    stable DSv4 facade.
+    operations through `raw_ops.py`.
     """
 
     provenance_variant = "dsv4:v0"
     ops = raw_ops
 
     def __init__(self, config: DSv4Config) -> None:
-        super().__init__(config)
-        _replace_raw_modules(self)
+        super().__init__(config, raw_ops)
 
     @torch.inference_mode()
     def generate(
@@ -77,13 +51,3 @@ class DSv4V0ForCausalLM(DSv4ForCausalLM):
 
 def tiny_dsv4_v0_config(**overrides: int | float | bool) -> DSv4Config:
     return tiny_dsv4_config(**overrides)
-
-
-def _replace_raw_modules(module: nn.Module) -> None:
-    for name, child in list(module.named_children()):
-        if isinstance(child, RMSNorm):
-            setattr(module, name, RawRMSNorm(child))
-        elif isinstance(child, SwiGLUExpert):
-            setattr(module, name, RawSwiGLUExpert(child))
-        else:
-            _replace_raw_modules(child)
