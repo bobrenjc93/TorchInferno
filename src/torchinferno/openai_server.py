@@ -624,6 +624,8 @@ class OpenAICompletionEngine:
         if not cache_layers or len(cache_layers) != len(entry.layers):
             return 0
         input_tokens = tuple(int(token_id) for token_id in input_ids[0].detach().cpu().tolist())
+        if len(input_tokens) <= len(entry.tokens):
+            return 0
         max_prefix = min(len(input_tokens) - 1, len(entry.tokens))
         min_prefix = max(1, int(os.environ.get("TORCHINFERNO_OPENAI_PREFIX_CACHE_MIN_TOKENS", "16")))
         while max_prefix >= min_prefix:
@@ -662,12 +664,18 @@ class OpenAICompletionEngine:
         if not cache_layers:
             return
         input_tokens = tuple(int(token_id) for token_id in input_ids[0].detach().cpu().tolist())
-        tokens = (*input_tokens, *(int(token_id) for token_id in generated_tokens))
+        materialize_generated = os.environ.get("TORCHINFERNO_OPENAI_PREFIX_CACHE_MATERIALIZE_GENERATED", "0") != "0"
+        tokens = (
+            (*input_tokens, *(int(token_id) for token_id in generated_tokens))
+            if materialize_generated
+            else input_tokens
+        )
         max_tokens = max(1, int(os.environ.get("TORCHINFERNO_OPENAI_PREFIX_CACHE_MAX_TOKENS", "1024")))
         if len(tokens) > max_tokens:
             self._prefix_cache_entry = None
             return
-        self._materialize_generated_cache_tokens(input_ids, generated_tokens, cache)
+        if materialize_generated:
+            self._materialize_generated_cache_tokens(input_ids, generated_tokens, cache)
         seq_len = min(len(tokens), _generation_cache_seq_len(cache))
         if seq_len < len(tokens):
             self._prefix_cache_entry = None
@@ -895,15 +903,11 @@ class OpenAICompletionEngine:
         if phase is not None:
             phase["prefill_tokens"] = float(prefill_input_ids.size(1))
         self._mark_phase(phase, "prefill_start")
-        if prefix_len > 0 and prefill_input_ids.size(1) < input_ids.size(1):
-            prefill_token = None
-            prefill_logits = None
+        prefill_token = _try_prefill_graph(model, prefill_input_ids, cache, temperature)
+        if prefill_token is None:
+            prefill_logits = _try_prefill_logits_graph(model, prefill_input_ids, cache)
         else:
-            prefill_token = _try_prefill_graph(model, prefill_input_ids, cache, temperature)
-            if prefill_token is None:
-                prefill_logits = _try_prefill_logits_graph(model, prefill_input_ids, cache)
-            else:
-                prefill_logits = None
+            prefill_logits = None
         if prefill_token is None and prefill_logits is None:
             self._mark_phase(phase, "first_forward_start")
             logits, cache = _forward(model, prefill_input_ids, cache)
@@ -1684,7 +1688,7 @@ def _warmup_temperature_batch_sizes() -> tuple[int, ...]:
 
 def _warmup_prefill_cache_token_counts() -> tuple[int, ...]:
     return _parse_positive_int_csv(
-        os.environ.get("TORCHINFERNO_OPENAI_WARMUP_PREFILL_CACHE_TOKENS", "256,512")
+        os.environ.get("TORCHINFERNO_OPENAI_WARMUP_PREFILL_CACHE_TOKENS", "256,512,1024")
     )
 
 

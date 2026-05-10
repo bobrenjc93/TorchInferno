@@ -163,7 +163,7 @@ def test_openai_server_warmup_covers_long_output_prefill_shapes(monkeypatch) -> 
     assert {55, 71, 87, 103, 119, 136, 152, 168}.issubset(prompt_counts)
     assert {128, 144, 153, 161, 169, 178, 186}.issubset(prompt_counts)
     assert 55 in prompt_counts
-    assert set(_warmup_prefill_cache_token_counts()) >= {256, 512}
+    assert set(_warmup_prefill_cache_token_counts()) >= {256, 512, 1024}
     assert 55 in set(_warmup_temperature_prompt_token_counts())
     assert 8 in set(_warmup_temperature_batch_sizes())
 
@@ -462,7 +462,42 @@ def test_openai_engine_reuses_single_request_prefix_cache(monkeypatch) -> None:
 
     assert first == [2]
     assert second == [2]
-    assert model.forward_inputs == [[10, 11], [2], [12], [2]]
+    assert model.forward_inputs == [[10, 11], [2, 12]]
+
+
+def test_openai_engine_uses_prefill_graph_for_prefix_suffix(monkeypatch) -> None:
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_PREFIX_CACHE_MIN_TOKENS", "1")
+    model = _PrefixGraphRecordingModel()
+    engine = OpenAICompletionEngine(
+        model,
+        _PrefixTokenizer(),
+        model_id="tiny",
+        device=torch.device("cpu"),
+        max_batch_size=1,
+        batch_wait_ms=0.0,
+    )
+    try:
+        first = list(
+            engine.generate_chat_tokens(
+                [{"role": "user", "content": "first"}],
+                max_tokens=1,
+                temperature=0.0,
+            )
+        )
+        second = list(
+            engine.generate_chat_tokens(
+                [{"role": "user", "content": "second"}],
+                max_tokens=1,
+                temperature=0.0,
+            )
+        )
+    finally:
+        engine.close()
+
+    assert first == [2]
+    assert second == [2]
+    assert model.graph_inputs == [[10, 11], [2, 12]]
+    assert model.forward_inputs == []
 
 
 def test_openai_microbench_cli_runs_synthetic_cases() -> None:
@@ -667,6 +702,29 @@ class _PrefixRecordingModel:
         logits = torch.zeros(input_ids.size(0), tokens, 16)
         logits[..., 2] = 1.0
         return logits, cache
+
+
+class _PrefixGraphRecordingModel(_PrefixRecordingModel):
+    def __init__(self) -> None:
+        super().__init__()
+        self.graph_inputs: list[list[int]] = []
+
+    def try_prefill_graph(
+        self,
+        input_ids: torch.Tensor,
+        cache: _PrefixRecordingCache,
+        *,
+        temperature: float = 0.0,
+    ) -> torch.Tensor:
+        del temperature
+        self.graph_inputs.append([int(token_id) for token_id in input_ids[0].tolist()])
+        layer = cache.layers[0]
+        start = layer.seq_len
+        end = start + input_ids.size(1)
+        layer.keys[: input_ids.size(0), :, start:end, :].fill_(1)
+        layer.values[: input_ids.size(0), :, start:end, :].fill_(1)
+        layer.seq_len = end
+        return torch.tensor([2], dtype=torch.long)
 
 
 class _NoBatchStepEngine(OpenAICompletionEngine):

@@ -159,6 +159,7 @@ class _StaticPrefillGraphCall:
     output_token: Tensor
     cache: Llama3TensorParallelCache
     prompt_tokens: int
+    initial_seq_len: int
     max_seq_len: int
 
 
@@ -169,6 +170,7 @@ class _StaticPrefillLogitsGraphCall:
     output_logits: Tensor
     cache: Llama3TensorParallelCache
     prompt_tokens: int
+    initial_seq_len: int
     max_seq_len: int
 
 
@@ -1344,8 +1346,13 @@ class Llama3TensorParallelForCausalLM:
             return None
 
     def _run_prefill_graph(self, input_ids: Tensor, cache: Llama3TensorParallelCache) -> Tensor:
+        initial_seq_len = cache.seq_len
+        end_seq_len = initial_seq_len + input_ids.size(1)
+        if end_seq_len > cache.layers[0].max_seq_len:
+            raise ValueError("KV cache capacity exceeded")
         key = (
             id(cache),
+            initial_seq_len,
             input_ids.size(1),
             cache.layers[0].max_seq_len,
             tuple(input_ids.shape),
@@ -1355,18 +1362,20 @@ class Llama3TensorParallelForCausalLM:
             captured is None
             or captured.cache is not cache
             or captured.prompt_tokens != input_ids.size(1)
+            or captured.initial_seq_len != initial_seq_len
             or captured.max_seq_len != cache.layers[0].max_seq_len
             or captured.static_input_ids.shape != input_ids.shape
         ):
             captured = self._capture_prefill_graph(input_ids, cache)
-            max_graphs = max(1, int(os.environ.get("TORCHINFERNO_CUDAGRAPH_PREFILL_MAX_GRAPHS", "32")))
+            max_graphs = max(1, int(os.environ.get("TORCHINFERNO_CUDAGRAPH_PREFILL_MAX_GRAPHS", "128")))
             if key not in self._prefill_graphs and len(self._prefill_graphs) >= max_graphs:
                 self._prefill_graphs.clear()
             self._prefill_graphs[key] = captured
         else:
             captured.static_input_ids.copy_(input_ids)
+            self._set_cache_seq_len(cache, captured.initial_seq_len)
             captured.graph.replay()
-            self._set_cache_seq_len(cache, input_ids.size(1))
+            self._set_cache_seq_len(cache, end_seq_len)
         return captured.output_token
 
     def _capture_prefill_graph(
@@ -1374,6 +1383,8 @@ class Llama3TensorParallelForCausalLM:
         input_ids: Tensor,
         cache: Llama3TensorParallelCache,
     ) -> _StaticPrefillGraphCall:
+        initial_seq_len = cache.seq_len
+        end_seq_len = initial_seq_len + input_ids.size(1)
         static_input_ids = torch.empty_like(input_ids)
         static_input_ids.copy_(input_ids)
         captured = _StaticPrefillGraphCall(
@@ -1382,26 +1393,32 @@ class Llama3TensorParallelForCausalLM:
             output_token=torch.empty((input_ids.size(0),), device=self.device, dtype=torch.long),
             cache=cache,
             prompt_tokens=input_ids.size(1),
+            initial_seq_len=initial_seq_len,
             max_seq_len=cache.layers[0].max_seq_len,
         )
         stream = torch.cuda.Stream(device=self.device)
         stream.wait_stream(torch.cuda.current_stream(self.device))
         with torch.cuda.stream(stream):
-            self._set_cache_seq_len(cache, 0)
+            self._set_cache_seq_len(cache, initial_seq_len)
             logits = self._forward_prefill_static(captured.static_input_ids, cache)
             self._sample_next_token(logits[:, -1, :], 0.0)
         torch.cuda.current_stream(self.device).wait_stream(stream)
-        self._set_cache_seq_len(cache, 0)
+        self._set_cache_seq_len(cache, initial_seq_len)
         with torch.cuda.graph(captured.graph):
             logits = self._forward_prefill_static(captured.static_input_ids, cache)
             captured.output_token = self._sample_next_token(logits[:, -1, :], 0.0)
         captured.graph.replay()
-        self._set_cache_seq_len(cache, input_ids.size(1))
+        self._set_cache_seq_len(cache, end_seq_len)
         return captured
 
     def _run_prefill_logits_graph(self, input_ids: Tensor, cache: Llama3TensorParallelCache) -> Tensor:
+        initial_seq_len = cache.seq_len
+        end_seq_len = initial_seq_len + input_ids.size(1)
+        if end_seq_len > cache.layers[0].max_seq_len:
+            raise ValueError("KV cache capacity exceeded")
         key = (
             id(cache),
+            initial_seq_len,
             input_ids.size(1),
             cache.layers[0].max_seq_len,
             tuple(input_ids.shape),
@@ -1411,18 +1428,20 @@ class Llama3TensorParallelForCausalLM:
             captured is None
             or captured.cache is not cache
             or captured.prompt_tokens != input_ids.size(1)
+            or captured.initial_seq_len != initial_seq_len
             or captured.max_seq_len != cache.layers[0].max_seq_len
             or captured.static_input_ids.shape != input_ids.shape
         ):
             captured = self._capture_prefill_logits_graph(input_ids, cache)
-            max_graphs = max(1, int(os.environ.get("TORCHINFERNO_CUDAGRAPH_PREFILL_MAX_GRAPHS", "32")))
+            max_graphs = max(1, int(os.environ.get("TORCHINFERNO_CUDAGRAPH_PREFILL_MAX_GRAPHS", "128")))
             if key not in self._prefill_logits_graphs and len(self._prefill_logits_graphs) >= max_graphs:
                 self._prefill_logits_graphs.clear()
             self._prefill_logits_graphs[key] = captured
         else:
             captured.static_input_ids.copy_(input_ids)
+            self._set_cache_seq_len(cache, captured.initial_seq_len)
             captured.graph.replay()
-            self._set_cache_seq_len(cache, input_ids.size(1))
+            self._set_cache_seq_len(cache, end_seq_len)
         return captured.output_logits
 
     def _capture_prefill_logits_graph(
@@ -1430,6 +1449,8 @@ class Llama3TensorParallelForCausalLM:
         input_ids: Tensor,
         cache: Llama3TensorParallelCache,
     ) -> _StaticPrefillLogitsGraphCall:
+        initial_seq_len = cache.seq_len
+        end_seq_len = initial_seq_len + input_ids.size(1)
         static_input_ids = torch.empty_like(input_ids)
         static_input_ids.copy_(input_ids)
         captured = _StaticPrefillLogitsGraphCall(
@@ -1442,19 +1463,20 @@ class Llama3TensorParallelForCausalLM:
             ),
             cache=cache,
             prompt_tokens=input_ids.size(1),
+            initial_seq_len=initial_seq_len,
             max_seq_len=cache.layers[0].max_seq_len,
         )
         stream = torch.cuda.Stream(device=self.device)
         stream.wait_stream(torch.cuda.current_stream(self.device))
         with torch.cuda.stream(stream):
-            self._set_cache_seq_len(cache, 0)
+            self._set_cache_seq_len(cache, initial_seq_len)
             self._forward_prefill_static(captured.static_input_ids, cache)
         torch.cuda.current_stream(self.device).wait_stream(stream)
-        self._set_cache_seq_len(cache, 0)
+        self._set_cache_seq_len(cache, initial_seq_len)
         with torch.cuda.graph(captured.graph):
             captured.output_logits = self._forward_prefill_static(captured.static_input_ids, cache)
         captured.graph.replay()
-        self._set_cache_seq_len(cache, input_ids.size(1))
+        self._set_cache_seq_len(cache, end_seq_len)
         return captured
 
     def _forward_prefill_static(self, input_ids: Tensor, cache: Llama3TensorParallelCache) -> Tensor:
@@ -2104,7 +2126,7 @@ def _should_use_prefill_graph(
     cache: Llama3TensorParallelCache,
     temperature: float,
 ) -> bool:
-    max_cache_tokens = int(os.environ.get("TORCHINFERNO_CUDAGRAPH_PREFILL_MAX_CACHE_TOKENS", "512"))
+    max_cache_tokens = int(os.environ.get("TORCHINFERNO_CUDAGRAPH_PREFILL_MAX_CACHE_TOKENS", "1024"))
     return (
         os.environ.get("TORCHINFERNO_CUDAGRAPH_PREFILL", "1") != "0"
         and temperature <= 0.0
@@ -2122,7 +2144,7 @@ def _should_use_prefill_logits_graph(
     input_ids: Tensor,
     cache: Llama3TensorParallelCache,
 ) -> bool:
-    max_cache_tokens = int(os.environ.get("TORCHINFERNO_CUDAGRAPH_PREFILL_MAX_CACHE_TOKENS", "512"))
+    max_cache_tokens = int(os.environ.get("TORCHINFERNO_CUDAGRAPH_PREFILL_MAX_CACHE_TOKENS", "1024"))
     return (
         os.environ.get("TORCHINFERNO_CUDAGRAPH_PREFILL", "1") != "0"
         and input_ids.is_cuda
