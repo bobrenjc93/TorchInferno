@@ -4,7 +4,7 @@ import json
 import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Sequence
 
 import torch
 import torch.nn.functional as F
@@ -14,7 +14,7 @@ from torch import Tensor
 
 from torchinferno.models.hf import HF_CONFIG_NAME, SAFETENSORS_INDEX_NAME
 from torchinferno.models.llama3_family.config import Llama3Config
-from torchinferno.models.llama3_family.v0 import sample_next_token
+from torchinferno.runtime.sampling import sample_next_token
 
 
 LLAMA3_70B_REPO_ID = "meta-llama/Llama-3.3-70B-Instruct"
@@ -489,10 +489,3 @@ def _rotate_half(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
     x2 = x[..., half:]
     rotated = torch.cat((-x2, x1), dim=-1)
     return (x * cos) + (rotated * sin)
-
-
-def layer_device_counts(layer_devices: Iterable[str]) -> dict[str, int]:
-    counts: dict[str, int] = {}
-    for device in layer_devices:
-        counts[device] = counts.get(device, 0) + 1
-    return counts

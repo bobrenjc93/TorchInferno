@@ -154,8 +154,8 @@ class ContinuousBatchEngine:
             if not request.prompt:
                 raise ValueError("request prompt must contain at least one token")
             match, entry = self.prefix_cache.lookup(request.prompt)
-            prefix_hit_tokens = match.depth
             reusable = self.reusable_prefixes.get(entry.route_id) if entry is not None else None
+            reusable_prefix_tokens = match.depth if reusable is not None else 0
             if request.max_new_tokens == 0:
                 indexed_results.append(
                     (
@@ -163,7 +163,7 @@ class ContinuousBatchEngine:
                         ServingResult(
                             request.request_id,
                             request.prompt,
-                            prefix_hit_tokens,
+                            0,
                             request.arrival_step,
                             step,
                             step,
@@ -171,10 +171,10 @@ class ContinuousBatchEngine:
                     )
                 )
                 continue
-            if reusable is not None and prefix_hit_tokens > 0:
-                active.append(self._prefill_one(original_index, request, step, prefix_hit_tokens, reusable))
+            if reusable is not None and reusable_prefix_tokens > 0:
+                active.append(self._prefill_one(original_index, request, step, reusable_prefix_tokens, reusable))
             else:
-                batchable[len(request.prompt)].append((original_index, request, prefix_hit_tokens))
+                batchable[len(request.prompt)].append((original_index, request, 0))
 
         for group in batchable.values():
             if len(group) == 1:

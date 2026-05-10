@@ -34,10 +34,13 @@ from torchinferno.openai_warmup import (
     warmup_temperature_batch_sizes as _warmup_temperature_batch_sizes,
     warmup_temperature_prompt_token_counts as _warmup_temperature_prompt_token_counts,
 )
-from torchinferno.runtime.options import env_flag, env_int, warn_optional_failure
+from torchinferno.runtime.options import env_flag, env_float, env_int, warn_optional_failure
 from torchinferno.runtime.prefix_cache import (
     TensorPrefixCacheEntry,
+    cache_sequence_length,
+    reset_cache_sequence,
     restore_tensor_prefix_cache,
+    set_cache_sequence_length,
     snapshot_tensor_prefix_cache,
 )
 from torchinferno.runtime.sampling import sample_next_token
@@ -297,19 +300,19 @@ class OpenAICompletionEngine:
         self.max_model_len = max_model_len
         self.max_batch_size = max(1, max_batch_size)
         self.batch_wait_s = max(0.0, batch_wait_ms / 1000.0)
-        raw_single_request_wait_ms = os.environ.get("TORCHINFERNO_OPENAI_SINGLE_ADMISSION_WAIT_MS")
         default_single_request_wait_ms = (
             single_request_admission_wait_ms
             if single_request_admission_wait_ms is not None
             else 0.0
         )
-        self.single_request_admission_wait_s = max(
-            0.0,
-            float(raw_single_request_wait_ms)
-            if raw_single_request_wait_ms is not None
-            else float(default_single_request_wait_ms),
+        self.single_request_admission_wait_s = (
+            env_float(
+                "TORCHINFERNO_OPENAI_SINGLE_ADMISSION_WAIT_MS",
+                float(default_single_request_wait_ms),
+                minimum=0.0,
+            )
+            / 1000.0
         )
-        self.single_request_admission_wait_s /= 1000.0
         self.single_request_fast_path = True
         self._generation_queue: "queue.Queue[_QueuedGeneration | None]" = queue.Queue()
         self._model_lock = threading.Lock()
@@ -494,8 +497,7 @@ class OpenAICompletionEngine:
     def _temperature_single_request_admission_wait_s(self, temperature: float) -> float:
         if temperature <= 0.0:
             return 0.0
-        raw_wait_ms = os.environ.get("TORCHINFERNO_OPENAI_TEMPERATURE_ADMISSION_WAIT_MS", "5.0")
-        return max(0.0, float(raw_wait_ms) / 1000.0)
+        return env_float("TORCHINFERNO_OPENAI_TEMPERATURE_ADMISSION_WAIT_MS", 5.0, minimum=0.0) / 1000.0
 
     def _has_multiple_live_requests(self) -> bool:
         with self._live_request_condition:
@@ -1143,9 +1145,8 @@ class OpenAICompletionEngine:
     def _stream_microbatch_size(self, batch_size: int) -> int:
         if batch_size <= 1:
             return batch_size
-        raw = os.environ.get("TORCHINFERNO_OPENAI_STREAM_MICROBATCH_SIZE")
-        if raw is not None:
-            return max(1, int(raw))
+        if "TORCHINFERNO_OPENAI_STREAM_MICROBATCH_SIZE" in os.environ:
+            return env_int("TORCHINFERNO_OPENAI_STREAM_MICROBATCH_SIZE", batch_size, minimum=1)
         if _is_tensor_parallel_model(self.model) and self.device.type == "cuda":
             return env_int("TORCHINFERNO_CUDAGRAPH_DECODE_STEP_MAX_BATCH", 8, minimum=1)
         return batch_size
@@ -1533,27 +1534,15 @@ def _generation_cache_capacity(model: object, requested_tokens: int) -> int:
 
 
 def _generation_cache_seq_len(cache: object) -> int:
-    layers = getattr(cache, "layers", ()) or ()
-    for layer in layers:
-        seq_len = getattr(layer, "seq_len", None)
-        if seq_len is not None:
-            return int(seq_len)
-    seq_len = getattr(cache, "seq_len", 0)
-    return int(seq_len) if seq_len is not None else 0
+    return cache_sequence_length(cache)
 
 
 def _set_generation_cache_seq_len(cache: object, seq_len: int) -> None:
-    for layer in getattr(cache, "layers", ()) or ():
-        if hasattr(layer, "seq_len"):
-            try:
-                setattr(layer, "seq_len", seq_len)
-            except Exception as exc:
-                warn_optional_failure("openai.generation_cache.layer_seq_len", exc)
-    if hasattr(cache, "seq_len"):
-        try:
-            setattr(cache, "seq_len", seq_len)
-        except Exception as exc:
-            warn_optional_failure("openai.generation_cache.seq_len", exc)
+    set_cache_sequence_length(
+        cache,
+        seq_len,
+        on_error=lambda exc: warn_optional_failure("openai.generation_cache.seq_len", exc),
+    )
 
 
 def _prefers_exact_generation_cache(model: object) -> bool:
@@ -1564,21 +1553,10 @@ def _prefers_exact_generation_cache(model: object) -> bool:
 
 
 def _reset_generation_cache(cache: object) -> bool:
-    reset = False
-    for layer in getattr(cache, "layers", ()) or ():
-        if hasattr(layer, "seq_len"):
-            try:
-                setattr(layer, "seq_len", 0)
-                reset = True
-            except Exception as exc:
-                warn_optional_failure("openai.generation_cache.layer_reset", exc)
-    if hasattr(cache, "seq_len"):
-        try:
-            setattr(cache, "seq_len", 0)
-            reset = True
-        except Exception as exc:
-            warn_optional_failure("openai.generation_cache.reset", exc)
-    return reset
+    return reset_cache_sequence(
+        cache,
+        on_error=lambda exc: warn_optional_failure("openai.generation_cache.reset", exc),
+    )
 
 
 def _warmup_tensor_parallel_decode_attention(model: object) -> None:

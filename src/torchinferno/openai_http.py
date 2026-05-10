@@ -54,6 +54,8 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                 self._stream_chat(messages, max_tokens=max_tokens, temperature=temperature)
             else:
                 self._complete_chat(messages, max_tokens=max_tokens, temperature=temperature)
+        except (ValueError, json.JSONDecodeError) as exc:
+            self._send_json({"error": {"message": str(exc), "type": exc.__class__.__name__}}, status=400)
         except Exception as exc:
             self._send_json({"error": {"message": str(exc), "type": exc.__class__.__name__}}, status=500)
 

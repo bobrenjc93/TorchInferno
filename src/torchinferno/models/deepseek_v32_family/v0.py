@@ -6,10 +6,10 @@ from torch import Tensor
 from torchinferno.models.deepseek import (
     DeepSeekV32Config,
     DeepSeekV32ForCausalLM,
-    sample_next_token,
     tiny_deepseek_v32_config,
 )
 from torchinferno.models.deepseek_v32_family import raw_ops
+from torchinferno.runtime.sampling import sample_next_token
 
 
 class DeepSeekV32V0ForCausalLM(DeepSeekV32ForCausalLM):

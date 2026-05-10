@@ -6,10 +6,10 @@ from torch import Tensor
 from torchinferno.models.dsv4 import (
     DSv4Config,
     DSv4ForCausalLM,
-    sample_next_token,
     tiny_dsv4_config,
 )
 from torchinferno.models.dsv4_family import raw_ops
+from torchinferno.runtime.sampling import sample_next_token
 
 
 class DSv4V0ForCausalLM(DSv4ForCausalLM):

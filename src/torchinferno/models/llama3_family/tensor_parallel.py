@@ -21,8 +21,8 @@ from torchinferno.models.llama3_family.pipeline import (
     _rms_norm as _torch_rms_norm,
     resolve_llama3_checkpoint,
 )
-from torchinferno.models.llama3_family.v0 import sample_next_token
 from torchinferno.runtime.options import env_flag, env_int, warn_optional_failure
+from torchinferno.runtime.sampling import sample_next_token
 
 
 _COMPILED_ROTATE_LLAMA = None
@@ -137,6 +137,18 @@ class Llama3TensorParallelCache:
     @property
     def seq_len(self) -> int:
         return self.layers[0].seq_len if self.layers else 0
+
+    def set_seq_len(self, seq_len: int) -> None:
+        if seq_len < 0:
+            raise ValueError("seq_len must be non-negative")
+        for layer in self.layers:
+            if seq_len > layer.max_seq_len:
+                raise ValueError("seq_len exceeds KV cache capacity")
+        for layer in self.layers:
+            layer.seq_len = seq_len
+
+    def reset(self) -> None:
+        self.set_seq_len(0)
 
 
 @dataclass
@@ -1725,8 +1737,7 @@ class Llama3TensorParallelForCausalLM:
 
     @staticmethod
     def _set_cache_seq_len(cache: Llama3TensorParallelCache, seq_len: int) -> None:
-        for layer_cache in cache.layers:
-            layer_cache.seq_len = seq_len
+        cache.set_seq_len(seq_len)
 
     def _forward_decode_static(
         self,

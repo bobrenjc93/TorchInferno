@@ -21,6 +21,12 @@ def env_int(name: str, default: int, *, minimum: int | None = None) -> int:
     return max(minimum, value) if minimum is not None else value
 
 
+def env_float(name: str, default: float, *, minimum: float | None = None) -> float:
+    raw = os.environ.get(name)
+    value = default if raw is None else float(raw)
+    return max(minimum, value) if minimum is not None else value
+
+
 def warn_once(key: str, message: str) -> None:
     if key in _WARNED_KEYS:
         return

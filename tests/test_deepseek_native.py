@@ -3,6 +3,7 @@ import os
 import subprocess
 import sys
 
+import pytest
 import torch
 from safetensors.torch import save_file
 
@@ -42,6 +43,22 @@ def test_native_deepseek_generate_and_direct_q_projection() -> None:
 
     assert output.shape == (1, 6)
     assert torch.equal(output[:, :3], input_ids)
+
+
+def test_native_deepseek_generate_restores_training_mode_when_allocation_fails(monkeypatch) -> None:
+    config = tiny_deepseek_v32_config(vocab_size=32, max_position_embeddings=16)
+    model = DeepSeekV32ForCausalLM(config).train()
+    input_ids = torch.tensor([[1, 2, 3]], dtype=torch.long)
+
+    def fail_allocate_cache(*args, **kwargs):
+        raise RuntimeError("cache allocation failed")
+
+    monkeypatch.setattr(model, "allocate_cache", fail_allocate_cache)
+
+    with pytest.raises(RuntimeError, match="cache allocation failed"):
+        model.generate(input_ids, max_new_tokens=1)
+
+    assert model.training
 
 
 def test_native_deepseek_save_load_round_trip(tmp_path) -> None:

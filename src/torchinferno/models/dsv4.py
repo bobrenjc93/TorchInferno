@@ -187,6 +187,18 @@ class DSv4Cache:
     def seq_len(self) -> int:
         return self.layers[0].seq_len if self.layers else 0
 
+    def set_seq_len(self, seq_len: int) -> None:
+        if seq_len < 0:
+            raise ValueError("seq_len must be non-negative")
+        for layer in self.layers:
+            if seq_len > layer.max_seq_len:
+                raise ValueError("seq_len exceeds KV cache capacity")
+        for layer in self.layers:
+            layer.seq_len = seq_len
+
+    def reset(self) -> None:
+        self.set_seq_len(0)
+
     @classmethod
     def allocate(
         cls,
@@ -412,22 +424,24 @@ class DSv4ForCausalLM(nn.Module):
 
         was_training = self.training
         self.eval()
-        cache = self.allocate_cache(
-            input_ids.size(0),
-            min(self.config.max_seq_len, input_ids.size(1) + max_new_tokens),
-            device=input_ids.device,
-        )
-        logits, cache = self(input_ids, cache=cache, use_cache=True)
-        next_token = sample_next_token(logits[:, -1, :], temperature)
-        output = [input_ids, next_token[:, None]]
-
-        for step in range(1, max_new_tokens):
-            if eos_token_id is not None and torch.all(next_token == eos_token_id):
-                break
-            logits, cache = self(next_token[:, None], cache=cache, use_cache=True)
+        try:
+            cache = self.allocate_cache(
+                input_ids.size(0),
+                min(self.config.max_seq_len, input_ids.size(1) + max_new_tokens),
+                device=input_ids.device,
+            )
+            logits, cache = self(input_ids, cache=cache, use_cache=True)
             next_token = sample_next_token(logits[:, -1, :], temperature)
-            output.append(next_token[:, None])
+            output = [input_ids, next_token[:, None]]
 
-        if was_training:
-            self.train()
-        return torch.cat(output, dim=1)
+            for step in range(1, max_new_tokens):
+                if eos_token_id is not None and torch.all(next_token == eos_token_id):
+                    break
+                logits, cache = self(next_token[:, None], cache=cache, use_cache=True)
+                next_token = sample_next_token(logits[:, -1, :], temperature)
+                output.append(next_token[:, None])
+
+            return torch.cat(output, dim=1)
+        finally:
+            if was_training:
+                self.train()

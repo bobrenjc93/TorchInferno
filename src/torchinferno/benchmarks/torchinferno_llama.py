@@ -18,6 +18,7 @@ from torchinferno.benchmarks.vllm_compatible import (
 )
 from torchinferno.models.llama3_family.pipeline import Llama3PipelineForCausalLM
 from torchinferno.models.llama3_family.tensor_parallel import Llama3TensorParallelForCausalLM
+from torchinferno.runtime.sampling import sample_next_token
 
 
 @dataclass(frozen=True)
@@ -356,8 +357,6 @@ def _sample_next(
     if sampler is not None:
         return sampler(logits, temperature)
     if temperature > 0:
-        from torchinferno.models.llama3_family.v0 import sample_next_token
-
         return sample_next_token(logits, temperature).to(model.embed_device, non_blocking=True)
     return torch.argmax(logits, dim=-1).to(model.embed_device, non_blocking=True)
 

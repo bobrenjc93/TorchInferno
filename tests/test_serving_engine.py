@@ -196,6 +196,57 @@ def test_continuous_batch_engine_prefix_reuse_matches_full_prefill() -> None:
     assert reuse_engine.stats.prefix_reuse_tokens == 3
 
 
+def test_continuous_batch_engine_does_not_report_hit_without_prefix_storage() -> None:
+    torch.manual_seed(55)
+    config = tiny_deepseek_v32_config(vocab_size=32, max_position_embeddings=16)
+    model = DeepSeekV32ForCausalLM(config).eval()
+    engine = ContinuousBatchEngine(
+        model,
+        device=torch.device("cpu"),
+        cache_backend="paged",
+        page_size=2,
+        max_active_requests=1,
+        prefix_cache_capacity=0,
+    )
+
+    results = engine.run(
+        [
+            ServingRequest("warm", (1, 2, 3), 1, arrival_step=0),
+            ServingRequest("cold", (1, 2, 3, 4), 1, arrival_step=1),
+        ]
+    )
+
+    assert results[1].prefix_hit_tokens == 0
+    assert engine.stats.prefix_reuse_requests == 0
+    assert engine.stats.prefix_reuse_tokens == 0
+
+
+def test_continuous_batch_engine_does_not_report_evicted_prefix_hit() -> None:
+    torch.manual_seed(56)
+    config = tiny_deepseek_v32_config(vocab_size=32, max_position_embeddings=16)
+    model = DeepSeekV32ForCausalLM(config).eval()
+    engine = ContinuousBatchEngine(
+        model,
+        device=torch.device("cpu"),
+        cache_backend="paged",
+        page_size=2,
+        max_active_requests=1,
+        prefix_cache_capacity=1,
+    )
+
+    results = engine.run(
+        [
+            ServingRequest("evicted", (1, 2, 3), 1, arrival_step=0),
+            ServingRequest("replacement", (5, 6, 7), 1, arrival_step=1),
+            ServingRequest("stale-match", (1, 2, 3, 4), 1, arrival_step=2),
+        ]
+    )
+
+    assert results[2].prefix_hit_tokens == 0
+    assert engine.stats.prefix_reuse_requests == 0
+    assert engine.stats.prefix_reuse_tokens == 0
+
+
 def test_continuous_batch_engine_uses_one_persistent_cache(monkeypatch) -> None:
     torch.manual_seed(57)
     config = tiny_deepseek_v32_config(vocab_size=32, max_position_embeddings=16)

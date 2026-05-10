@@ -2,6 +2,7 @@ import os
 import subprocess
 import sys
 
+import pytest
 import torch
 
 from torchinferno.models.dsv4 import DSv4Config, DSv4ForCausalLM, tiny_dsv4_config
@@ -58,6 +59,22 @@ def test_generate_runs_end_to_end() -> None:
 
     assert output.shape == (1, 7)
     assert torch.equal(output[:, :3], input_ids)
+
+
+def test_generate_restores_training_mode_when_allocation_fails(monkeypatch) -> None:
+    config = tiny_dsv4_config(vocab_size=32, max_seq_len=16)
+    model = DSv4ForCausalLM(config).train()
+    input_ids = torch.tensor([[1, 2, 3]], dtype=torch.long)
+
+    def fail_allocate_cache(*args, **kwargs):
+        raise RuntimeError("cache allocation failed")
+
+    monkeypatch.setattr(model, "allocate_cache", fail_allocate_cache)
+
+    with pytest.raises(RuntimeError, match="cache allocation failed"):
+        model.generate(input_ids, max_new_tokens=1)
+
+    assert model.training
 
 
 def test_save_and_load_pretrained_round_trip(tmp_path) -> None:
