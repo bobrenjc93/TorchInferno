@@ -8,6 +8,14 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
+from torchinferno.server.openai_protocol import (
+    chat_completion_chunk,
+    chat_completion_response,
+    error_response,
+    model_list_response,
+    parse_chat_completion_request,
+)
+
 
 class OpenAIHandler(BaseHTTPRequestHandler):
     server_version = "TorchInfernoOpenAI/0.1"
@@ -22,19 +30,7 @@ class OpenAIHandler(BaseHTTPRequestHandler):
             return
         if self.path == "/v1/models":
             engine = self._engine()
-            self._send_json(
-                {
-                    "object": "list",
-                    "data": [
-                        {
-                            "id": engine.model_id,
-                            "object": "model",
-                            "created": int(time.time()),
-                            "owned_by": "torchinferno",
-                        }
-                    ],
-                }
-            )
+            self._send_json(model_list_response(engine.model_id))
             return
         self.send_error(HTTPStatus.NOT_FOUND, "not found")
 
@@ -44,20 +40,15 @@ class OpenAIHandler(BaseHTTPRequestHandler):
             return
         try:
             payload = self._read_json()
-            messages = payload.get("messages")
-            if not isinstance(messages, list):
-                raise ValueError("messages must be a list")
-            max_tokens = int(payload.get("max_tokens", 256))
-            temperature = float(payload.get("temperature", 0.0))
-            stream = bool(payload.get("stream", False))
-            if stream:
-                self._stream_chat(messages, max_tokens=max_tokens, temperature=temperature)
+            request = parse_chat_completion_request(payload)
+            if request.stream:
+                self._stream_chat(request.messages, max_tokens=request.max_tokens, temperature=request.temperature)
             else:
-                self._complete_chat(messages, max_tokens=max_tokens, temperature=temperature)
+                self._complete_chat(request.messages, max_tokens=request.max_tokens, temperature=request.temperature)
         except (ValueError, json.JSONDecodeError) as exc:
-            self._send_json({"error": {"message": str(exc), "type": exc.__class__.__name__}}, status=400)
+            self._send_json(error_response(str(exc), exc.__class__.__name__), status=400)
         except Exception as exc:
-            self._send_json({"error": {"message": str(exc), "type": exc.__class__.__name__}}, status=500)
+            self._send_json(error_response(str(exc), exc.__class__.__name__), status=500)
 
     def log_message(self, format: str, *args: object) -> None:
         return
@@ -75,24 +66,12 @@ class OpenAIHandler(BaseHTTPRequestHandler):
         completion = engine.complete_chat(messages, max_tokens=max_tokens, temperature=temperature)
         content = engine.tokenizer.decode(completion.tokens)
         self._send_json(
-            {
-                "id": f"chatcmpl-{uuid.uuid4().hex}",
-                "object": "chat.completion",
-                "created": int(time.time()),
-                "model": engine.model_id,
-                "choices": [
-                    {
-                        "index": 0,
-                        "message": {"role": "assistant", "content": content},
-                        "finish_reason": "stop",
-                    }
-                ],
-                "usage": {
-                    "prompt_tokens": completion.prompt_tokens,
-                    "completion_tokens": len(completion.tokens),
-                    "total_tokens": completion.prompt_tokens + len(completion.tokens),
-                },
-            }
+            chat_completion_response(
+                model_id=engine.model_id,
+                content=content,
+                prompt_tokens=completion.prompt_tokens,
+                completion_tokens=len(completion.tokens),
+            )
         )
 
     def _stream_chat(self, messages: list[dict[str, object]], *, max_tokens: int, temperature: float) -> None:
@@ -109,13 +88,12 @@ class OpenAIHandler(BaseHTTPRequestHandler):
             self.close_connection = True
             return
         client_open = self._try_write_sse(
-            {
-                "id": completion_id,
-                "object": "chat.completion.chunk",
-                "created": created,
-                "model": engine.model_id,
-                "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
-            }
+            chat_completion_chunk(
+                completion_id=completion_id,
+                model_id=engine.model_id,
+                created=created,
+                delta={"role": "assistant"},
+            )
         )
         for token_id in engine.generate_chat_tokens(messages, max_tokens=max_tokens, temperature=temperature):
             if not client_open:
@@ -124,23 +102,22 @@ class OpenAIHandler(BaseHTTPRequestHandler):
             if not content:
                 continue
             client_open = self._try_write_sse(
-                {
-                    "id": completion_id,
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": engine.model_id,
-                    "choices": [{"index": 0, "delta": {"content": content}, "finish_reason": None}],
-                }
+                chat_completion_chunk(
+                    completion_id=completion_id,
+                    model_id=engine.model_id,
+                    created=created,
+                    delta={"content": content},
+                )
             )
         if client_open:
             client_open = self._try_write_sse(
-                {
-                    "id": completion_id,
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": engine.model_id,
-                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-                }
+                chat_completion_chunk(
+                    completion_id=completion_id,
+                    model_id=engine.model_id,
+                    created=created,
+                    delta={},
+                    finish_reason="stop",
+                )
             )
         if client_open:
             self._try_write_done()

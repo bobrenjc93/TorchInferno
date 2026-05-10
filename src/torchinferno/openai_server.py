@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import copy
 import inspect
-import json
 import os
 import queue
 import sys
@@ -12,18 +11,23 @@ import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 from functools import lru_cache
-from pathlib import Path
 from typing import Iterable, Iterator, Protocol, Sequence, runtime_checkable
 
 import torch
 from torch import Tensor
 
-from torchinferno.models.deepseek import DeepSeekV32ForCausalLM, tiny_deepseek_v32_config
-from torchinferno.models.dsv4 import DSv4ForCausalLM, tiny_dsv4_config
-from torchinferno.models.llama3_family.pipeline import Llama3PipelineForCausalLM
 from torchinferno.models.llama3_family.tensor_parallel import Llama3TensorParallelForCausalLM
-from torchinferno.models.llama3_family.v0 import Llama3V0ForCausalLM, tiny_llama3_v0_config
-from torchinferno.models.auto import load_model_auto
+from torchinferno.engine.loader import (
+    distributed_env_requested as _engine_distributed_env_requested,
+    distributed_server_command as _engine_distributed_server_command,
+    infer_model_kind as _engine_infer_model_kind,
+    llama_parallelism as _engine_llama_parallelism,
+    load_model_for_engine,
+    primary_device as _engine_primary_device,
+    resolve_dtype as _engine_resolve_dtype,
+    server_devices as _engine_server_devices,
+    should_reexec_distributed_server as _engine_should_reexec_distributed_server,
+)
 from torchinferno.openai_http import (
     OpenAIHTTPServer as _OpenAIServer,
 )
@@ -1853,140 +1857,35 @@ def serve(config: OpenAIServerConfig) -> None:
 
 
 def _load_model(config: OpenAIServerConfig) -> tuple[object, torch.device]:
-    kind = _infer_model_kind(config)
-    dtype = _resolve_dtype(config.dtype)
-    if kind == "tiny-deepseek":
-        device = _primary_device(config)
-        model = DeepSeekV32ForCausalLM(tiny_deepseek_v32_config(max_position_embeddings=config.max_model_len or 128))
-        return model.to(device=device, dtype=dtype or torch.float32).eval(), device
-    if kind == "tiny-dsv4":
-        device = _primary_device(config)
-        model = DSv4ForCausalLM(tiny_dsv4_config(max_seq_len=config.max_model_len or 128))
-        return model.to(device=device, dtype=dtype or torch.float32).eval(), device
-    if kind == "tiny-llama3":
-        device = _primary_device(config)
-        model = Llama3V0ForCausalLM(tiny_llama3_v0_config(max_position_embeddings=config.max_model_len or 128))
-        return model.to(device=device, dtype=dtype or torch.float32).eval(), device
-    if kind == "llama3":
-        if _llama_parallelism(config) == "tensor":
-            if config.tensor_parallel_size > 1 and not _distributed_env_requested():
-                raise RuntimeError(
-                    "Llama tensor parallel serving requires a distributed launch. "
-                    "Use torchrun, or start torchinferno.openai_server normally with "
-                    "--tensor-parallel-size > 1 so it can auto-launch workers."
-                )
-            model = Llama3TensorParallelForCausalLM.from_pretrained(
-                config.model,
-                dtype=config.dtype,
-                token=config.token,
-                revision=config.revision,
-                cache_dir=config.cache_dir,
-            ).eval()
-            return model, model.device
-        devices = _server_devices(config)
-        model = Llama3PipelineForCausalLM.from_pretrained(
-            config.model,
-            devices=devices,
-            dtype=config.dtype,
-            token=config.token,
-            revision=config.revision,
-            cache_dir=config.cache_dir,
-        ).eval()
-        return model, torch.device(devices[0])
-    device = _primary_device(config)
-    model = load_model_auto(
-        config.model,
-        token=config.token,
-        revision=config.revision,
-        cache_dir=config.cache_dir,
-        map_location=device,
-        strict=True,
-    )
-    if dtype is not None:
-        model = model.to(dtype=dtype)
-    return model.to(device).eval(), device
+    return load_model_for_engine(config)
 
 
 def _infer_model_kind(config: OpenAIServerConfig) -> str:
-    kind = config.model_kind.lower()
-    if kind != "auto":
-        return kind
-    model = config.model.lower()
-    if "llama" in model:
-        return "llama3"
-    path = Path(config.model).expanduser()
-    config_path = path / "config.json"
-    if config_path.exists():
-        data = json.loads(config_path.read_text())
-        model_type = str(data.get("model_type", "")).lower()
-        if "llama" in model_type:
-            return "llama3"
-        if "deepseek" in model_type:
-            return "deepseek"
-        if model_type == "dsv4":
-            return "dsv4"
-    return "auto"
+    return _engine_infer_model_kind(config)
 
 
 def _primary_device(config: OpenAIServerConfig) -> torch.device:
-    if config.device:
-        return torch.device(config.device)
-    devices = _server_devices(config)
-    return torch.device(devices[0])
+    return _engine_primary_device(config)
 
 
 def _server_devices(config: OpenAIServerConfig) -> tuple[str, ...]:
-    if config.devices:
-        return config.devices
-    if config.device:
-        return (config.device,)
-    if torch.cuda.is_available():
-        count = max(1, min(config.tensor_parallel_size, torch.cuda.device_count()))
-        return tuple(f"cuda:{idx}" for idx in range(count))
-    return ("cpu",)
+    return _engine_server_devices(config)
 
 
 def _llama_parallelism(config: OpenAIServerConfig) -> str:
-    mode = config.llama_parallelism.lower()
-    if mode == "pipeline":
-        return "pipeline"
-    if mode == "tensor":
-        return "tensor"
-    if mode != "auto":
-        raise ValueError(f"unsupported llama parallelism: {config.llama_parallelism}")
-    if _distributed_env_requested() or config.tensor_parallel_size > 1:
-        return "tensor"
-    return "pipeline"
+    return _engine_llama_parallelism(config)
 
 
 def _distributed_env_requested() -> bool:
-    return "RANK" in os.environ and "WORLD_SIZE" in os.environ
+    return _engine_distributed_env_requested()
 
 
 def _should_reexec_distributed_server(config: OpenAIServerConfig) -> bool:
-    if os.environ.get("TORCHINFERNO_OPENAI_AUTO_TORCHRUN", "1") == "0":
-        return False
-    if _distributed_env_requested():
-        return False
-    if config.tensor_parallel_size <= 1:
-        return False
-    if _infer_model_kind(config) != "llama3":
-        return False
-    return config.llama_parallelism.lower() != "pipeline"
+    return _engine_should_reexec_distributed_server(config)
 
 
 def _distributed_server_command(config: OpenAIServerConfig, argv: Sequence[str]) -> list[str]:
-    return [
-        sys.executable,
-        "-m",
-        "torch.distributed.run",
-        "--standalone",
-        "--nproc-per-node",
-        str(config.tensor_parallel_size),
-        "-m",
-        "torchinferno.openai_server",
-        *argv,
-    ]
+    return _engine_distributed_server_command(config, argv)
 
 
 def _reexec_distributed_server(config: OpenAIServerConfig, argv: Sequence[str]) -> None:
@@ -2000,16 +1899,7 @@ def _reexec_distributed_server(config: OpenAIServerConfig, argv: Sequence[str]) 
 
 
 def _resolve_dtype(dtype: str) -> torch.dtype | None:
-    normalized = dtype.lower().replace("torch.", "")
-    if normalized == "auto":
-        return None
-    if normalized in {"bf16", "bfloat16"}:
-        return torch.bfloat16
-    if normalized in {"fp16", "float16", "half"}:
-        return torch.float16
-    if normalized in {"fp32", "float32"}:
-        return torch.float32
-    raise ValueError(f"unsupported dtype: {dtype}")
+    return _engine_resolve_dtype(dtype)
 
 
 def _is_tensor_parallel_model(model: object) -> bool:

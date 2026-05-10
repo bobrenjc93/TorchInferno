@@ -2,6 +2,19 @@
 
 from torchinferno.audit import FeatureAudit, TorchInfernoAudit, build_audit_report
 from torchinferno.compiler import CompileConfig, compile_forward
+from torchinferno.engine import (
+    AsyncInferenceEngine,
+    CacheConfig,
+    EngineConfig,
+    GenerateOutput,
+    GenerateRequest,
+    InferenceEngine,
+    ModelConfig,
+    SamplingConfig,
+    SchedulerConfig,
+    TokenOutput,
+    Usage,
+)
 from torchinferno.models.auto import load_model_auto
 from torchinferno.models.deepseek import DeepSeekV32Config, DeepSeekV32ForCausalLM, tiny_deepseek_v32_config
 from torchinferno.models.dsv4 import DSv4Config, DSv4ForCausalLM, tiny_dsv4_config
@@ -25,7 +38,13 @@ __all__ = [
     "DSv4ForCausalLM",
     "DeepSeekV32Config",
     "DeepSeekV32ForCausalLM",
+    "AsyncInferenceEngine",
+    "CacheConfig",
+    "EngineConfig",
     "FeatureAudit",
+    "GenerateOutput",
+    "GenerateRequest",
+    "InferenceEngine",
     "LLAMA3_70B_REPO_ID",
     "Llama3Config",
     "Llama3PipelineForCausalLM",
@@ -33,7 +52,12 @@ __all__ = [
     "Llama3V0ForCausalLM",
     "Llama3V1ForCausalLM",
     "ModelVariantSpec",
+    "ModelConfig",
+    "SamplingConfig",
+    "SchedulerConfig",
+    "TokenOutput",
     "TorchInfernoAudit",
+    "Usage",
     "build_audit_report",
     "compile_forward",
     "get_model_variant",
