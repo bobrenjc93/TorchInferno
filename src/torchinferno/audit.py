@@ -58,6 +58,21 @@ def build_audit_report() -> TorchInfernoAudit:
     return TorchInfernoAudit(
         environment=environment,
         features=(
+            FeatureAudit(
+                "compact DSv4 harness",
+                "integrated",
+                "Torch-native decoder-only model covers local generation, checkpoints, tracing, serving, profiling, and conversion compatibility.",
+            ),
+            FeatureAudit(
+                "native DeepSeek-V3.2 model",
+                "integrated",
+                "Native config/model/cache/checkpoint path mirrors production tensor contracts.",
+            ),
+            FeatureAudit(
+                "native Llama3 production-scale paths",
+                "bridge",
+                "Llama 70B config plus pipeline and tensor-parallel safetensor loaders/generate paths exist; scheduler integration remains open.",
+            ),
             FeatureAudit("torch.compile", "integrated", "CompileConfig and CLI smoke cover eager-to-compiled policy."),
             FeatureAudit("make_fx/fake tensors", "integrated", "Trace helper supports make_fx with FakeTensorMode."),
             FeatureAudit(
@@ -92,7 +107,7 @@ def build_audit_report() -> TorchInfernoAudit:
             FeatureAudit(
                 "Helion candidate kernels",
                 "experimental" if helion_available() else "optional",
-                "helion-search-fx enumerates FX windows and benchmarks generated kernels before any production swap.",
+                "helion-candidate, helion-search-fx, and helion-search-region benchmark generated kernels before any production swap.",
             ),
             FeatureAudit(
                 "prefix KV reuse",
@@ -107,7 +122,17 @@ def build_audit_report() -> TorchInfernoAudit:
             FeatureAudit(
                 "OpenAI serving API",
                 "bridge",
-                "openai-server exposes /v1/models, batched streaming /v1/chat/completions, and auto-launched Llama TP worker mode.",
+                "openai-server exposes /health, /v1/models, batched streaming /v1/chat/completions, and auto-launched Llama TP worker mode.",
+            ),
+            FeatureAudit(
+                "benchmark suites",
+                "integrated",
+                "vLLM-compatible, native Llama, direct OpenAI, and HTTP OpenAI benchmark loops write repeatable JSON summaries and plots.",
+            ),
+            FeatureAudit(
+                "text IO and known-logit validation",
+                "integrated",
+                "Auto loading, tokenizer-backed generation, capture-logits, and validate-logits cover checkpoint bringup without a server.",
             ),
             FeatureAudit("disaggregated prefill/decode", "simulated", "Planner models rank assignment and network latency."),
             FeatureAudit("NVFP4 graph passes", "reference", "NVFP4 tensor contract and pass hook exist; production fused kernel remains open."),

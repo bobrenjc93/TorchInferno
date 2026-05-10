@@ -66,9 +66,10 @@ available from [`torchinferno audit`](src/torchinferno/audit.py).
 - NVFP4 quantized-linear reference surface and graph-pass hook for future fused
   DeepSeek-V3.2-NVFP4 kernels.
 - Local performance benchmark smoke for reference versus specialized paths.
-- Whole-model, focused-region, and pattern-replacement profile artifact loops
-  plus arbitrary FX subgraph extraction by node id. These emit graphs, profiler
-  JSON, traces, memory data, and repro scripts.
+- Whole-model, time-sliced replay, CPU-offload, focused-region, and
+  pattern-replacement profile artifact loops plus arbitrary FX subgraph
+  extraction by node id. These emit graphs, profiler JSON, traces, memory data,
+  and repro scripts.
 - Eager-vs-optimized model variant logit validation with a 1% default tolerance
   and optional JSON reports for agent/research loops.
 - Minimal auto research harness for comparing scheduler/cache/routing policies.
@@ -83,6 +84,25 @@ available from [`torchinferno audit`](src/torchinferno/audit.py).
 > Every command below works either through the installed `torchinferno` console
 > script or directly from the checkout with `PYTHONPATH=src python3 -m torchinferno.cli`.
 
+<details open>
+<summary>Architecture at a glance</summary>
+
+```mermaid
+flowchart LR
+  CLI["CLI: torchinferno.cli"] --> Models["Torch-native models"]
+  Models --> DSv4["Compact DSv4 harness"]
+  Models --> DeepSeek["Native DeepSeek V3.2 path"]
+  Models --> Llama["Llama 3 pipeline and tensor-parallel paths"]
+  CLI --> Runtime["Runtime workbenches"]
+  Runtime --> Serving["Continuous batching and OpenAI HTTP"]
+  Runtime --> Profiles["Profile artifacts, offload, and FX subgraphs"]
+  Runtime --> Kernels["Triton, Helion, and NVFP4 kernel hooks"]
+  Profiles --> Artifacts["JSON, Chrome traces, repro.py"]
+  Serving --> Benchmarks["OpenAI and vLLM-compatible benchmarks"]
+```
+
+</details>
+
 ## Source Map
 
 | Surface | Primary code | Fast verification |
@@ -90,12 +110,12 @@ available from [`torchinferno audit`](src/torchinferno/audit.py).
 | Compact DSv4 model | [`models/dsv4.py`](src/torchinferno/models/dsv4.py), [`models/dsv4_family/`](src/torchinferno/models/dsv4_family/) | `dsv4-smoke`, `dsv4-hf-smoke`, `model-variants` |
 | Native DeepSeek-V3.2-style model | [`models/deepseek.py`](src/torchinferno/models/deepseek.py), [`models/deepseek_v32_family/`](src/torchinferno/models/deepseek_v32_family/) | `deepseek-smoke`, `deepseek-hf-smoke`, `deepseek-audit` |
 | Native Llama production-scale paths | [`models/llama3_family/`](src/torchinferno/models/llama3_family/) | `llama-bench-suite`, `validate-model-variants --family llama3` |
-| OpenAI-compatible serving | [`openai_server.py`](src/torchinferno/openai_server.py), [`openai_http.py`](src/torchinferno/openai_http.py), [`runtime/serving.py`](src/torchinferno/runtime/serving.py) | `openai-server`, `openai-microbench`, `openai-server-microbench`, `serve-smoke` |
+| OpenAI-compatible serving | [`openai_server.py`](src/torchinferno/openai_server.py), [`openai_http.py`](src/torchinferno/openai_http.py), [`openai_warmup.py`](src/torchinferno/openai_warmup.py), [`runtime/serving.py`](src/torchinferno/runtime/serving.py) | `openai-server`, `openai-microbench`, `openai-server-microbench`, `serve-smoke` |
 | Runtime policy experiments | [`runtime/`](src/torchinferno/runtime/) | `sim-smoke`, `traffic-smoke`, `disagg-init`, `disagg-smoke` |
 | Compiler and FX graph work | [`compiler.py`](src/torchinferno/compiler.py), [`graph/`](src/torchinferno/graph/) | `trace-smoke`, `profile-pattern`, `profile-subgraph` |
 | Kernel replacement work | [`kernels/`](src/torchinferno/kernels/) | `perf-smoke`, `helion-candidate`, `helion-search-fx`, `helion-search-region` |
-| Profile artifact loops | [`profiling.py`](src/torchinferno/profiling.py) | `profile-run`, `profile-timeslice`, `profile-offload`, `profile-region`, `profile-nodes` |
-| Text, checkpoints, validation | [`tokenization.py`](src/torchinferno/tokenization.py), [`validation.py`](src/torchinferno/validation.py), [`models/conversion.py`](src/torchinferno/models/conversion.py) | `text-generate`, `capture-logits`, `validate-logits`, `dsv4-convert`, `deepseek-convert` |
+| Profile artifact loops | [`profiling.py`](src/torchinferno/profiling.py), [`runtime/offload.py`](src/torchinferno/runtime/offload.py) | `profile-run`, `profile-timeslice`, `profile-offload`, `profile-region`, `profile-pattern`, `profile-subgraph`, `profile-nodes` |
+| Text, checkpoints, validation | [`tokenization.py`](src/torchinferno/tokenization.py), [`validation.py`](src/torchinferno/validation.py), [`models/auto.py`](src/torchinferno/models/auto.py), [`models/conversion.py`](src/torchinferno/models/conversion.py) | `text-generate`, `capture-logits`, `validate-logits`, `dsv4-hf-smoke`, `deepseek-hf-smoke`, `dsv4-audit`, `deepseek-audit`, `dsv4-convert`, `deepseek-convert` |
 | Benchmark comparisons | [`benchmarks/`](src/torchinferno/benchmarks/) | `vllm-bench-suite`, `vllm-bench-plot`, `llama-bench-suite` |
 
 Useful upstream references: [PyTorch `torch.compile`](https://pytorch.org/docs/stable/generated/torch.compile.html),
@@ -132,6 +152,15 @@ python3 -m pytest
 torchinferno audit
 torchinferno dsv4-smoke --device cpu --batch-size 1 --prompt-tokens 3 --new-tokens 2
 ```
+
+Optional extras are declared in [`pyproject.toml`](pyproject.toml):
+
+| Extra | Adds | Use when |
+| --- | --- | --- |
+| `dev` | `pytest`, `ruff`, `pyflakes`, `vulture` | Running the local test and lint loop. |
+| `serve` / `text` | `transformers`, `tokenizers` | Loading Hub tokenizers or running the OpenAI-compatible server against real checkpoints. |
+| `kernels` | [Triton](https://triton-lang.org/main/index.html) | Exercising CUDA kernel specializations instead of torch fallbacks. |
+| `helion` | [Helion](https://github.com/pytorch-labs/helion) | Searching generated CUDA candidates before promotion. |
 
 Without installing the package:
 
@@ -243,6 +272,22 @@ Current families:
 - `dsv4`: compact DeepSeek-style DSv4 harness.
 - `deepseek-v3.2` / `dsv3.2`: native DeepSeek-V3.2 tensor-contract path.
 - `llama3`: torch-native Llama3 reference path.
+
+<details>
+<summary>Current variant ladder</summary>
+
+| Family | Variant | Status | Role |
+| --- | --- | --- | --- |
+| `dsv4` | `v0` | reference | Raw Python/PyTorch compact DSv4 baseline. |
+| `dsv4` | `v1` | integrated | Fused/cached DSv4 child used by local smoke and profile loops. |
+| `deepseek-v3.2` | `v0` | reference | Raw native DeepSeek-V3.2 tensor-contract baseline. |
+| `deepseek-v3.2` | `v1` | integrated | Fused/cached native DeepSeek child for paged-cache and serving work. |
+| `llama3` | `v0` | reference | Torch-native Llama3 reference model. |
+| `llama3` | `v1` | reference | Fused-op Llama3 variant with the same public contract as `v0`. |
+| `llama3` | `pipeline-v0` | experimental | Safetensor loader/generate path that places whole decoder layers on devices. |
+| `llama3` | `tp-v0` | experimental | Torchrun/NCCL tensor-parallel loader/generate path for production-scale comparisons. |
+
+</details>
 
 The public Llama 3 70B shape is available as `llama3_70b_config()` for
 planning and compatibility checks without constructing the full model:
@@ -374,8 +419,9 @@ PYTHONPATH=src python3 -m torchinferno.openai_server \
   --device cpu
 ```
 
-The server implements `GET /v1/models` and streaming or non-streaming
-`POST /v1/chat/completions`.
+The server implements `GET /health`, `GET /v1/models`, and streaming or
+non-streaming `POST /v1/chat/completions` in the shape expected by the
+[OpenAI Chat Completions API](https://platform.openai.com/docs/api-reference/chat/create).
 
 The same server is available through the main CLI wrapper:
 
@@ -649,7 +695,9 @@ PYTHONPATH=src python3 -m torchinferno.cli profile-offload .torchinferno_runs/fu
 Offload directories contain `offload_summary.json`, `offload_events.json`,
 `output.json`, `input_ids.json`, and `offload_repro.py`. The first
 implementation uses full-prefix recompute for generated tokens; decode-cache
-offload is intentionally left as a production milestone.
+offload is intentionally left as a production milestone. Add
+`--activation-offload` when you also want intermediate activations moved back to
+CPU between staged modules.
 
 To inspect node ids from a captured graph:
 
@@ -760,6 +808,7 @@ The runtime package is where simulation-first serving work belongs:
 - `runtime.disagg`: agent-editable rank files and local RPC wrappers for
   executable prefill/decode experiments.
 - `runtime.fake_dist`: fake process groups and collectives.
+- `runtime.offload`: CPU/device module staging and transfer-overhead summaries.
 - `runtime.paged`: page-table-shaped KV cache allocation and materialization.
 - `runtime.paged_attention`: correct torch paged causal attention reference.
 - `runtime.prefix`: radix prefix tree and prefix-aware routing.
@@ -817,6 +866,10 @@ PYTHONPATH=src python3 -m torchinferno.cli validate-model-variants \
   --rtol 0.01 \
   --json-output .torchinferno_runs/llama3-v1-logits.json
 ```
+
+`validate-model-variants` keeps the torchrun/NCCL Llama tensor-parallel case
+out of the default CPU loop. Add `--include-tensor-parallel` when the current
+process group is ready and you want to include `llama3:tp-v0` in the comparison.
 
 ## Research Harnesses
 
@@ -955,7 +1008,8 @@ src/torchinferno/
   openai_warmup.py        OpenAI serving graph-warmup bucket parsing.
   compiler.py             torch.compile policy helper.
   cli.py                  CLI smoke, benchmark, validation, and profile runners.
-  profiling.py            Whole-run, region, and pattern artifact capture.
+  profiling.py            Whole-run, time-sliced, offload, region, subgraph,
+                           and pattern artifact capture.
   tokenization.py         Tokenizer adapters for text IO.
   validation.py           Known-logit capture and validation.
   variant_validation.py   Eager-vs-optimized model variant logit validation.
@@ -969,7 +1023,8 @@ src/torchinferno/
   models/*_family/        Provenance-tracked raw/fused model variant ladders.
   models/provenance.py    Variant registry dataclasses and lineage helper.
   models/dsv4.py          DSv4-style causal LM, MoE, attention, and KV cache.
-  models/llama3_family/   Torch-native Llama3 raw/fused reference variants.
+  models/llama3_family/   Torch-native Llama3 raw/fused, pipeline, and
+                           tensor-parallel variants.
   models/auto.py          Config-driven model loader.
   models/deepseek.py      Native DeepSeek-V3.2-style architecture.
   models/conversion.py    DeepSeek-style checkpoint audit and conversion.

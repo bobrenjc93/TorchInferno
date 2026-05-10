@@ -16,10 +16,12 @@ The CLI view is [`torchinferno audit`](../src/torchinferno/audit.py).
 
 | Area | Status | Notes |
 | --- | --- | --- |
+| Compact DSv4 harness | integrated | Torch-native decoder-only causal LM, local checkpoint save/load, CLI smoke, tracing, serving, profiling, and conversion compatibility paths exist. |
 | Native DeepSeek-V3.2-style model | integrated | Torch-native config/model/cache/checkpoint path exists. |
 | Native Llama3 production-scale paths | bridge | Llama 70B config, pipeline and tensor-parallel safetensor loaders/generate paths, and torchrun TP compatibility coverage exist; production scheduler integration remains open. |
 | Model provenance variants | reference | DSv4, DeepSeek-V3.2, and Llama3 have raw/fused v0/v1 ladders and registry lineage. |
 | Eager-vs-optimized logit validation | integrated | `validate-model-variants` compares tiny eager v0 logits against optimized variants with a 1% default tolerance and optional JSON reports. |
+| Text IO and known-logit validation | integrated | Auto model loading, tokenizer-backed generation, `capture-logits`, and `validate-logits` cover checkpoint bringup without a server. |
 | Checkpoint conversion | integrated | Shape/key audit plus sharded safetensor writer; needs real-weight golden validation. |
 | `torch.compile` | integrated | Shared compile policy and smoke path. |
 | `make_fx` and fake tensors | integrated | FakeTensorMode trace helper and tests. |
@@ -31,13 +33,13 @@ The CLI view is [`torchinferno audit`](../src/torchinferno/audit.py).
 | Agent rank files | bridge | `disagg-init` emits editable prefill/decode rank files with local RPC wrappers. |
 | Prefix KV reuse | integrated | Serving aliases reusable prefix pages across model layer cache rows with copy-on-write protection. |
 | Continuous batching | bridge | Persistent row-assigned cache batches same-length prefill/decode groups without rebuilding temporary caches; OpenAI serving now microbatches same-shape requests. |
-| OpenAI serving API | bridge | HTTP server exposes `/v1/models` and streaming/non-streaming `/v1/chat/completions`, can auto-launch Llama tensor-parallel workers, and has direct plus HTTP microbench loops. |
-| Benchmark suites | integrated | `vllm-bench-suite`, `vllm-bench-plot`, `llama-bench-suite`, and `openai-server-microbench` write repeatable commands, JSON summaries, and plots for vLLM-compatible comparisons. |
+| OpenAI serving API | bridge | HTTP server exposes `/health`, `/v1/models`, and streaming/non-streaming `/v1/chat/completions`, can auto-launch Llama tensor-parallel workers, and has direct plus HTTP microbench loops. |
+| Benchmark suites | integrated | `vllm-bench-suite`, `vllm-bench-plot`, `llama-bench-suite`, `openai-microbench`, and `openai-server-microbench` write repeatable commands, JSON summaries, and plots for vLLM-compatible comparisons. |
 | Time-sliced virtual GPU profiling | integrated | Representative generation profiles can be scaled and replayed across virtual ranks on one physical device. |
 | CPU offload profiling | bridge | Module-at-a-time CPU/device staging records movement overhead separately from compute; decode-cache offload and mmap streaming remain open. |
 | Disaggregated prefill/decode | simulated | Planner models rank assignment and transfer latency. |
 | Graph pattern replacement | bridge | Leaf target swaps plus a multi-node symbolic/make_fx fused-op example exist. |
-| Helion candidate kernels | optional/experimental | `helion-search-fx` and `helion-search-region` enumerate supported FX windows and benchmark generated kernels before production promotion. |
+| Helion candidate kernels | optional/experimental | `helion-candidate`, `helion-search-fx`, and `helion-search-region` benchmark supported generated kernels before production promotion. |
 | NVFP4 graph passes | reference | Quantized tensor contract and graph hook exist; production fused kernel remains open. |
 | Research harness | minimal | Named experiments and metric comparison exist. |
 
@@ -46,14 +48,16 @@ The CLI view is [`torchinferno audit`](../src/torchinferno/audit.py).
 
 | Area | Code | Verification |
 | --- | --- | --- |
+| Compact DSv4 harness | [`models/dsv4.py`](../src/torchinferno/models/dsv4.py), [`models/dsv4_family/`](../src/torchinferno/models/dsv4_family/) | `dsv4-smoke`, `dsv4-hf-smoke`, `tests/test_dsv4_e2e.py` |
 | Native DeepSeek-V3.2-style model | [`models/deepseek.py`](../src/torchinferno/models/deepseek.py), [`models/deepseek_v32_family/`](../src/torchinferno/models/deepseek_v32_family/) | `deepseek-smoke`, `deepseek-hf-smoke`, `tests/test_deepseek_native.py` |
 | Native Llama3 production-scale paths | [`models/llama3_family/`](../src/torchinferno/models/llama3_family/) | `llama-bench-suite`, `tests/test_llama3_tensor_parallel_distributed.py` |
 | Model provenance and validation | [`models/variants.py`](../src/torchinferno/models/variants.py), [`variant_validation.py`](../src/torchinferno/variant_validation.py) | `model-variants`, `validate-model-variants`, `tests/test_model_variants.py` |
+| Text IO and known-logit validation | [`tokenization.py`](../src/torchinferno/tokenization.py), [`validation.py`](../src/torchinferno/validation.py), [`models/auto.py`](../src/torchinferno/models/auto.py) | `text-generate`, `capture-logits`, `validate-logits`, `tests/test_production_workflows.py` |
 | Checkpoint conversion | [`models/conversion.py`](../src/torchinferno/models/conversion.py) | `dsv4-audit`, `dsv4-convert`, `deepseek-audit`, `deepseek-convert`, `tests/test_conversion_and_kernels.py` |
 | Graph and compiler hooks | [`compiler.py`](../src/torchinferno/compiler.py), [`graph/`](../src/torchinferno/graph/) | `trace-smoke`, `profile-pattern`, `tests/test_scaffolding.py` |
-| Profile artifact loops | [`profiling.py`](../src/torchinferno/profiling.py) | `profile-run`, `profile-timeslice`, `profile-offload`, `profile-region`, `profile-subgraph`, `tests/test_profile_artifacts.py` |
-| Runtime policy scaffolds | [`runtime/`](../src/torchinferno/runtime/) | `sim-smoke`, `traffic-smoke`, `serve-smoke`, `disagg-init`, `tests/test_serving_engine.py` |
-| OpenAI-compatible serving | [`openai_server.py`](../src/torchinferno/openai_server.py), [`openai_http.py`](../src/torchinferno/openai_http.py) | `openai-server`, `openai-microbench`, `openai-server-microbench`, `tests/test_openai_server.py` |
+| Profile artifact loops | [`profiling.py`](../src/torchinferno/profiling.py), [`runtime/offload.py`](../src/torchinferno/runtime/offload.py) | `profile-run`, `profile-timeslice`, `profile-offload`, `profile-region`, `profile-pattern`, `profile-subgraph`, `profile-nodes`, `tests/test_profile_artifacts.py` |
+| Runtime policy scaffolds | [`runtime/`](../src/torchinferno/runtime/) | `sim-smoke`, `traffic-smoke`, `serve-smoke`, `disagg-init`, `disagg-smoke`, `tests/test_serving_engine.py`, `tests/test_disagg_ranks.py` |
+| OpenAI-compatible serving | [`openai_server.py`](../src/torchinferno/openai_server.py), [`openai_http.py`](../src/torchinferno/openai_http.py), [`openai_warmup.py`](../src/torchinferno/openai_warmup.py) | `openai-server`, `openai-microbench`, `openai-server-microbench`, `tests/test_openai_server.py`, `tests/test_openai_server_microbench.py`, `tests/test_openai_warmup.py` |
 | Kernel replacement surfaces | [`kernels/`](../src/torchinferno/kernels/) | `perf-smoke`, `helion-candidate`, `helion-search-fx`, `helion-search-region`, `tests/test_performance_specialization.py` |
 | Benchmark comparisons | [`benchmarks/`](../src/torchinferno/benchmarks/) | `vllm-bench-suite`, `vllm-bench-plot`, `llama-bench-suite`, `tests/test_vllm_benchmarks.py` |
 
