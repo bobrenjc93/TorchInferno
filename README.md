@@ -11,6 +11,21 @@ scheduling, cache, routing, serving, profiling, and research work. The
 readiness snapshot lives in [`docs/ROADMAP.md`](docs/ROADMAP.md) and is also
 available from [`torchinferno audit`](src/torchinferno/audit.py).
 
+<details>
+<summary>Documentation guide</summary>
+
+- [What Works Today](#what-works-today): implemented behavior and readiness.
+- [Source Map](#source-map): code ownership, CLI checks, and upstream docs.
+- [Quickstart](#quickstart): install, smoke, and Makefile loops.
+- [Model Provenance Variants](#model-provenance-variants): raw/fused ladders.
+- [Serving and Benchmarks](#openai-compatible-serving): OpenAI, vLLM, and Llama
+  70B comparison paths.
+- [Profile Artifact Runs](#profile-artifact-runs): whole-model, region,
+  subgraph, offload, and graph-pattern loops.
+- [Repository Layout](#repository-layout): file-by-file map for contributors.
+
+</details>
+
 ## What Works Today
 
 - DSv4-style decoder-only causal LM in pure PyTorch.
@@ -76,6 +91,9 @@ available from [`torchinferno audit`](src/torchinferno/audit.py).
 - Llama 3 70B architecture config plus native pipeline-sharded and
   tensor-parallel checkpoint loader/generate paths for running production-scale
   weights across multiple GPUs without depending on Hugging Face model classes.
+- Tensor-parallel Llama fast paths for optional Triton rotary, KV append,
+  RMSNorm, SwiGLU, dense/grouped decode attention, and decode-step CUDA graph
+  capture.
 - vLLM-compatible benchmark runner for Llama 70B latency, offline throughput,
   and online serving results, with JSON summaries and HTML/CSV performance
   plots.
@@ -113,7 +131,7 @@ flowchart LR
 | OpenAI-compatible serving | [`openai_server.py`](src/torchinferno/openai_server.py), [`openai_http.py`](src/torchinferno/openai_http.py), [`openai_warmup.py`](src/torchinferno/openai_warmup.py), [`runtime/serving.py`](src/torchinferno/runtime/serving.py) | `openai-server`, `openai-microbench`, `openai-server-microbench`, `serve-smoke` |
 | Runtime policy experiments | [`runtime/`](src/torchinferno/runtime/) | `sim-smoke`, `traffic-smoke`, `disagg-init`, `disagg-smoke` |
 | Compiler and FX graph work | [`compiler.py`](src/torchinferno/compiler.py), [`graph/`](src/torchinferno/graph/) | `trace-smoke`, `profile-pattern`, `profile-subgraph` |
-| Kernel replacement work | [`kernels/`](src/torchinferno/kernels/) | `perf-smoke`, `helion-candidate`, `helion-search-fx`, `helion-search-region` |
+| Kernel replacement work | [`kernels/`](src/torchinferno/kernels/), [`research/helion.py`](src/torchinferno/research/helion.py) | `perf-smoke`, `helion-candidate`, `helion-search-fx`, `helion-search-region` |
 | Profile artifact loops | [`profiling.py`](src/torchinferno/profiling.py), [`runtime/offload.py`](src/torchinferno/runtime/offload.py) | `profile-run`, `profile-timeslice`, `profile-offload`, `profile-region`, `profile-pattern`, `profile-subgraph`, `profile-nodes` |
 | Text, checkpoints, validation | [`tokenization.py`](src/torchinferno/tokenization.py), [`validation.py`](src/torchinferno/validation.py), [`models/auto.py`](src/torchinferno/models/auto.py), [`models/conversion.py`](src/torchinferno/models/conversion.py) | `text-generate`, `capture-logits`, `validate-logits`, `dsv4-hf-smoke`, `deepseek-hf-smoke`, `dsv4-audit`, `deepseek-audit`, `dsv4-convert`, `deepseek-convert` |
 | Benchmark comparisons | [`benchmarks/`](src/torchinferno/benchmarks/) | `vllm-bench-suite`, `vllm-bench-plot`, `llama-bench-suite` |
@@ -139,6 +157,18 @@ Useful upstream references: [PyTorch `torch.compile`](https://pytorch.org/docs/s
 | Disaggregated experiments | `disagg-init`, `disagg-smoke` |
 | Kernel candidate loops | `helion-candidate`, `helion-search-fx`, `helion-search-region` |
 | Benchmark suites | `vllm-bench-suite`, `vllm-bench-plot`, `llama-bench-suite` |
+
+</details>
+
+<details>
+<summary>Public Python API map</summary>
+
+| Import | Exports |
+| --- | --- |
+| [`torchinferno`](src/torchinferno/__init__.py) | `DSv4ForCausalLM`, `DeepSeekV32ForCausalLM`, Llama3 variants, tiny/full config helpers, `compile_forward`, `load_model_auto`, and variant registry helpers. |
+| [`torchinferno.runtime`](src/torchinferno/runtime/__init__.py) | Serving requests/results, paged KV cache, prefix cache/router helpers, fake distributed collectives, disaggregated rank helpers, CPU offload helpers, and time-sliced simulation primitives. |
+| [`torchinferno.kernels`](src/torchinferno/kernels/__init__.py) | `rms_norm`, `swiglu_activation`, `fused_rmsnorm_swiglu`, paged decode attention APIs, and NVFP4 reference quantization/linear helpers. |
+| [`torchinferno.benchmarks`](src/torchinferno/benchmarks/__init__.py) | vLLM-compatible benchmark planning/plotting, native Llama benchmark suites, and OpenAI HTTP server microbench helpers. |
 
 </details>
 
@@ -186,7 +216,18 @@ PYTHONPATH=src python3 -m torchinferno.cli vllm-bench-suite .torchinferno_runs/v
 PYTHONPATH=src python3 -m torchinferno.cli llama-bench-suite .torchinferno_runs/torchinferno-llama70b --benchmarks latency throughput serve
 ```
 
-CUDA is optional for the tests, but the DSv4 smoke can run on GPU:
+Makefile shortcuts wrap the common loops:
+
+| Target | Runs |
+| --- | --- |
+| `make audit` / `make variants` | Feature readiness and model variant provenance. |
+| `make lint` / `make dead-code` / `make test` | Static checks and pytest. |
+| `make smoke` / `make perf` / `make openai-server-bench` | CPU smoke and microbenchmark paths. |
+| `make profile` / `make profile-region` / `make profile-pattern` | Focused profiling artifact loops. |
+| `make vllm-bench-plan` / `make disagg` | Benchmark planning and rank-file generation. |
+
+CUDA is optional for the tests, but the DSv4 and native DeepSeek smokes can run
+on GPU:
 
 ```bash
 PYTHONPATH=src python3 -m torchinferno.cli dsv4-smoke --device cuda
@@ -389,12 +430,13 @@ The native suite writes vLLM-shaped `latency.json`, `throughput.json`, and
 `batch-size` controls the latency benchmark; throughput and serve use
 `max-concurrency` as the engine batch limit.
 
-The tensor-parallel Llama sampler gathers greedy and temperature samples across
-ranks by default so every worker observes the same token. Set
-`TORCHINFERNO_GREEDY_SAMPLE_GATHER=0` or
-`TORCHINFERNO_TEMPERATURE_SAMPLE_GATHER=0` to use the distributed reduce path;
-set `TORCHINFERNO_TEMPERATURE_SAMPLE_GATHER_STRICT=1` to fail instead of
-falling back if the gather path errors.
+The tensor-parallel Llama sampler gathers greedy samples across ranks by
+default so every worker observes the same token. Set
+`TORCHINFERNO_GREEDY_SAMPLE_GATHER=0` to use the greedy distributed reduce
+path. Temperature sampling uses the distributed path by default; set
+`TORCHINFERNO_TEMPERATURE_SAMPLE_GATHER=1` to try gather-based sampling and
+`TORCHINFERNO_TEMPERATURE_SAMPLE_GATHER_STRICT=1` to fail instead of falling
+back if that gather path errors.
 
 ## OpenAI-Compatible Serving
 
@@ -1015,7 +1057,8 @@ src/torchinferno/
   variant_validation.py   Eager-vs-optimized model variant logit validation.
   kernels/ops.py          Kernel APIs with torch fallbacks.
   kernels/helion_ops.py   Experimental Helion-generated CUDA kernels.
-  kernels/triton_ops.py   Triton CUDA RMSNorm and SwiGLU kernels.
+  kernels/triton_ops.py   Triton CUDA rotary, KV, decode attention, RMSNorm,
+                           and SwiGLU helpers.
   kernels/paged_attention.py
                            Paged decode attention kernel API.
   kernels/nvfp4.py        NVFP4 quantized-linear reference contract.
@@ -1025,6 +1068,7 @@ src/torchinferno/
   models/dsv4.py          DSv4-style causal LM, MoE, attention, and KV cache.
   models/llama3_family/   Torch-native Llama3 raw/fused, pipeline, and
                            tensor-parallel variants.
+  models/variants.py      Model variant listing and lineage helpers.
   models/auto.py          Config-driven model loader.
   models/deepseek.py      Native DeepSeek-V3.2-style architecture.
   models/conversion.py    DeepSeek-style checkpoint audit and conversion.
@@ -1054,6 +1098,7 @@ src/torchinferno/
   runtime/traffic.py      Bursty traffic simulation.
   research/harness.py     Auto research experiment harness.
   research/benchmarks.py  Local benchmark helpers.
+  research/helion.py      Helion candidate search reports and decision store.
 tests/
   test_dsv4_e2e.py        DSv4 e2e and original runtime tests.
   test_deepseek_native.py Native architecture, cache, conversion, and CLI tests.
@@ -1131,7 +1176,8 @@ Implemented as working code and tests:
   fallback.
 - Flex-attention-shaped fallback.
 - Auto research harness.
-- Triton CUDA RMSNorm and SwiGLU kernels with torch fallbacks.
+- Triton CUDA rotary, KV append, decode attention, RMSNorm, and SwiGLU helpers
+  with torch fallbacks or guarded optional dispatch.
 - Triton CUDA fused residual-add/RMSNorm/weighted-SwiGLU custom op with torch
   fallback and fake-tensor trace support.
 - Triton-backed paged decode attention with torch fallback.
