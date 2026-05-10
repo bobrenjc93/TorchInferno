@@ -625,14 +625,17 @@ class OpenAICompletionEngine:
     def _run_queued_stream_group(self, group: list[_QueuedGeneration]) -> None:
         prompts = [request.prompt for request in group]
         if self._shared_prefix_prompt_list_tokens(prompts) > 0:
-            for step_tokens in self._generate_prompt_list_batch_steps(
-                prompts,
-                max_tokens=group[0].max_tokens,
-                temperature=group[0].temperature,
-            ):
-                for request, token_id in zip(group, step_tokens):
-                    if token_id is not None:
-                        request.responses.put(int(token_id))
+            try:
+                for step_tokens in self._generate_prompt_list_batch_steps(
+                    prompts,
+                    max_tokens=group[0].max_tokens,
+                    temperature=group[0].temperature,
+                ):
+                    for request, token_id in zip(group, step_tokens):
+                        if token_id is not None:
+                            request.responses.put(int(token_id))
+            finally:
+                _sync_tensor_parallel_command(self.model, self.device)
             return
         for same_length_group in _queued_groups_by_prompt_length(group):
             input_ids = torch.tensor(
@@ -640,14 +643,17 @@ class OpenAICompletionEngine:
                 dtype=torch.long,
                 device=self.device,
             )
-            for step_tokens in self._generate_batch_steps(
-                input_ids,
-                max_tokens=same_length_group[0].max_tokens,
-                temperature=same_length_group[0].temperature,
-            ):
-                for request, token_id in zip(same_length_group, step_tokens):
-                    if token_id is not None:
-                        request.responses.put(int(token_id))
+            try:
+                for step_tokens in self._generate_batch_steps(
+                    input_ids,
+                    max_tokens=same_length_group[0].max_tokens,
+                    temperature=same_length_group[0].temperature,
+                ):
+                    for request, token_id in zip(same_length_group, step_tokens):
+                        if token_id is not None:
+                            request.responses.put(int(token_id))
+            finally:
+                _sync_tensor_parallel_command(self.model, self.device)
 
     def _run_queued_completion_group(self, group: list[_QueuedGeneration]) -> None:
         for same_length_group in _queued_groups_by_prompt_length(group):
@@ -661,6 +667,7 @@ class OpenAICompletionEngine:
                 max_tokens=same_length_group[0].max_tokens,
                 temperature=same_length_group[0].temperature,
             )
+            _sync_tensor_parallel_command(self.model, self.device)
             for request, tokens in zip(same_length_group, rows):
                 request.responses.put(_GenerationResult(tokens))
 
@@ -1956,6 +1963,13 @@ def _runtime_prefill_graph_capture_enabled(model: object) -> bool:
     return not (_is_tensor_parallel_model(model) and _tensor_parallel_world_size(model) > 1)
 
 
+def _sync_tensor_parallel_command(model: object, device: torch.device) -> None:
+    if not _is_tensor_parallel_model(model) or _tensor_parallel_world_size(model) <= 1:
+        return
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+
+
 def _broadcast_tensor_parallel_generate(
     model: object,
     input_ids: Tensor,
@@ -2033,60 +2047,63 @@ def _tensor_parallel_worker_loop(engine: OpenAICompletionEngine) -> None:
             return
         if op != "generate":
             raise ValueError(f"unsupported tensor-parallel worker op: {op}")
-        if "input_id_lists" in payload:
+        try:
+            if "input_id_lists" in payload:
+                if bool(payload.get("stream", True)):
+                    for _ in engine._generate_prompt_list_batch_steps(
+                        payload["input_id_lists"],
+                        max_tokens=int(payload["max_tokens"]),
+                        temperature=float(payload["temperature"]),
+                        broadcast_tensor_parallel=False,
+                    ):
+                        pass
+                else:
+                    for prompt_group in _indexed_prompts_by_length(
+                        [
+                            (index, list(prompt))
+                            for index, prompt in enumerate(payload["input_id_lists"])
+                        ]
+                    ):
+                        input_ids = torch.tensor(
+                            [prompt for _index, prompt in prompt_group],
+                            dtype=torch.long,
+                            device=engine.device,
+                        )
+                        engine._generate_batch_tokens(
+                            input_ids,
+                            max_tokens=int(payload["max_tokens"]),
+                            temperature=float(payload["temperature"]),
+                            broadcast_tensor_parallel=False,
+                        )
+                continue
+            input_ids = torch.tensor(payload["input_ids"], dtype=torch.long, device=engine.device)
             if bool(payload.get("stream", True)):
-                for _ in engine._generate_prompt_list_batch_steps(
-                    payload["input_id_lists"],
-                    max_tokens=int(payload["max_tokens"]),
-                    temperature=float(payload["temperature"]),
-                    broadcast_tensor_parallel=False,
-                ):
-                    pass
-            else:
-                for prompt_group in _indexed_prompts_by_length(
-                    [
-                        (index, list(prompt))
-                        for index, prompt in enumerate(payload["input_id_lists"])
-                    ]
-                ):
-                    input_ids = torch.tensor(
-                        [prompt for _index, prompt in prompt_group],
-                        dtype=torch.long,
-                        device=engine.device,
-                    )
-                    engine._generate_batch_tokens(
+                if input_ids.size(0) == 1:
+                    for _ in engine._generate_single_tokens(
                         input_ids,
                         max_tokens=int(payload["max_tokens"]),
                         temperature=float(payload["temperature"]),
                         broadcast_tensor_parallel=False,
-                    )
-            continue
-        input_ids = torch.tensor(payload["input_ids"], dtype=torch.long, device=engine.device)
-        if bool(payload.get("stream", True)):
-            if input_ids.size(0) == 1:
-                for _ in engine._generate_single_tokens(
-                    input_ids,
-                    max_tokens=int(payload["max_tokens"]),
-                    temperature=float(payload["temperature"]),
-                    broadcast_tensor_parallel=False,
-                    update_prefix_cache=False,
-                ):
-                    pass
+                        update_prefix_cache=False,
+                    ):
+                        pass
+                else:
+                    for _ in engine._generate_batch_steps(
+                        input_ids,
+                        max_tokens=int(payload["max_tokens"]),
+                        temperature=float(payload["temperature"]),
+                        broadcast_tensor_parallel=False,
+                    ):
+                        pass
             else:
-                for _ in engine._generate_batch_steps(
+                engine._generate_batch_tokens(
                     input_ids,
                     max_tokens=int(payload["max_tokens"]),
                     temperature=float(payload["temperature"]),
                     broadcast_tensor_parallel=False,
-                ):
-                    pass
-        else:
-            engine._generate_batch_tokens(
-                input_ids,
-                max_tokens=int(payload["max_tokens"]),
-                temperature=float(payload["temperature"]),
-                broadcast_tensor_parallel=False,
-            )
+                )
+        finally:
+            _sync_tensor_parallel_command(getattr(engine, "model", None), engine.device)
 
 
 def _allocate_cache(
