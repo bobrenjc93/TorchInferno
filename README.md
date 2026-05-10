@@ -27,7 +27,6 @@ to grow toward production-grade SOTA inference.
 - Auto model loading, tokenizer-backed text generation, and known-logit
   validation for checkpoint bringup.
 - Greedy and temperature sampling.
-- Ragged request API with dense continuous-batching execution buckets.
 - Token-step continuous serving harness with admission, paged-cache policy, and
   prefix-hit accounting, shared prefix-page reuse, persistent row-assigned
   paged cache state, and same-shape prefill/decode microbatching.
@@ -118,7 +117,7 @@ PYTHONPATH=src python3 -m torchinferno.cli deepseek-smoke --device cuda
 ## DSv4 End-To-End Path
 
 The compact model lives in `src/torchinferno/models/dsv4.py`. It is the fast
-local harness for compiler, cache, batching, and graph-pass experiments.
+local harness for compiler, cache, serving, and graph-pass experiments.
 
 ```python
 import torch
@@ -137,7 +136,7 @@ print(output)
 
 The tests compare incremental cached decode logits against a full causal
 forward pass, then exercise generation, local checkpoint save/load, CLI
-execution, batching, tracing, and runtime scaffolds.
+execution, serving, tracing, and runtime scaffolds.
 
 ## Native DeepSeek Path
 
@@ -311,6 +310,16 @@ PYTHONPATH=src python3 -m torchinferno.openai_server \
 The server implements `GET /v1/models` and streaming or non-streaming
 `POST /v1/chat/completions`.
 
+The same server is available through the main CLI wrapper:
+
+```bash
+PYTHONPATH=src python3 -m torchinferno.cli openai-server \
+  --model tiny \
+  --model-kind tiny-deepseek \
+  --tokenizer byte \
+  --device cpu
+```
+
 For Llama models, the server follows vLLM/sglang-style launch behavior:
 `--tensor-parallel-size > 1` auto-launches tensor-parallel worker processes
 with `torch.distributed.run` when the command was not already started under a
@@ -361,6 +370,56 @@ PYTHONPATH=src torchrun --standalone --nproc-per-node 8 \
 The output reports TTFT, TPOT, end-to-end latency, throughput, forward-call
 count, and observed max model batch for direct single-request, forced batcher,
 and concurrent cases.
+
+To include the actual HTTP server path in the loop, use
+`openai-server-microbench`. With no `--base-url`, it launches a local
+`torchinferno.openai_server`, waits for `/v1/models`, then measures
+non-streaming and streaming `/v1/chat/completions`; with `--base-url`, it
+targets an already-running OpenAI-compatible server.
+
+```bash
+PYTHONPATH=src python3 -m torchinferno.cli openai-server-microbench \
+  --device cpu \
+  --warmup 0 \
+  --iters 1 \
+  --prompt-tokens 8 \
+  --max-tokens 2 \
+  --json-output .torchinferno_runs/openai-server-microbench.json
+```
+
+OpenAI serving also has explicit environment knobs for production-shape tuning:
+
+- `TORCHINFERNO_OPENAI_AUTO_TORCHRUN=0` disables automatic tensor-parallel
+  worker launch.
+- `TORCHINFERNO_OPENAI_PREFIX_CACHE=0` disables the single-entry OpenAI prefix
+  KV cache; `TORCHINFERNO_OPENAI_PREFIX_CACHE_MIN_TOKENS`,
+  `TORCHINFERNO_OPENAI_PREFIX_CACHE_MAX_TOKENS`, and
+  `TORCHINFERNO_OPENAI_PREFIX_CACHE_MATERIALIZE_GENERATED` tune reuse.
+- `TORCHINFERNO_OPENAI_STARTUP_WARMUP=0` and
+  `TORCHINFERNO_OPENAI_TOKENIZER_WARMUP=0` disable startup warmups.
+- `TORCHINFERNO_OPENAI_WARMUP_PROMPT_TOKENS`,
+  `TORCHINFERNO_OPENAI_WARMUP_NEW_TOKENS`, and
+  `TORCHINFERNO_OPENAI_WARMUP_CACHE_TOKENS` set the default startup warmup
+  size; `TORCHINFERNO_OPENAI_WARMUP_PROMPT_TOKEN_BUCKETS`,
+  `TORCHINFERNO_OPENAI_WARMUP_PREFILL_CACHE_TOKENS`,
+  `TORCHINFERNO_OPENAI_WARMUP_PREFIX_SUFFIX_TOKENS`,
+  `TORCHINFERNO_OPENAI_WARMUP_PREFIX_SUFFIX_CACHE_TOKENS`,
+  `TORCHINFERNO_OPENAI_WARMUP_TEMPERATURE_PROMPT_TOKEN_BUCKETS`, and
+  `TORCHINFERNO_OPENAI_WARMUP_TEMPERATURE_BATCH_SIZES` override graph-warmup
+  shape buckets.
+- `TORCHINFERNO_OPENAI_STREAM_MICROBATCH_SIZE`,
+  `TORCHINFERNO_OPENAI_SINGLE_ADMISSION_WAIT_MS`, and
+  `TORCHINFERNO_OPENAI_TEMPERATURE_ADMISSION_WAIT_MS` tune live request
+  batching behavior.
+- `TORCHINFERNO_OPENAI_PHASE_TIMINGS=1` records serving phase timings, and
+  `TORCHINFERNO_OPENAI_PREFIX_CACHE_SHARED_SAMPLE=1` enables shared-prefix
+  cache reuse for temperature sampling.
+- Tensor-parallel Llama serving fast paths also respect
+  `TORCHINFERNO_CUDAGRAPH_PREFILL`, `TORCHINFERNO_CUDAGRAPH_DECODE_STEP`,
+  `TORCHINFERNO_CUDAGRAPH_DECODE_STEP_MAX_BATCH`, and
+  `TORCHINFERNO_TRITON_DECODE_ATTENTION`.
+- `TORCHINFERNO_OPTIONAL_WARNINGS=1` reports optional fast-path fallbacks once
+  instead of silently using the torch fallback.
 
 ## Compiler And Graph Work
 
@@ -683,6 +742,9 @@ compare CUDA Triton outputs against torch references when CUDA is available.
 Search FX windows and remember Helion decisions before promoting a kernel:
 
 ```bash
+PYTHONPATH=src python3 -m torchinferno.cli helion-candidate \
+  --candidate swiglu \
+  --device cuda
 PYTHONPATH=src python3 -m torchinferno.cli helion-search-fx \
   --candidate swiglu \
   --batch-size 1000 \
@@ -738,6 +800,7 @@ The CLI can load a local checkpoint directory or a Hub repo ID:
 
 ```bash
 torchinferno dsv4-hf-smoke /tmp/tiny-dsv4 --device cpu
+torchinferno deepseek-hf-smoke /tmp/native-deepseek --device cpu
 ```
 
 For private or gated Hub repos, provide credentials through the environment,
@@ -771,6 +834,9 @@ represent exactly.
 ```text
 src/torchinferno/
   audit.py                Environment and feature readiness audit.
+  openai_server.py        OpenAI-compatible chat completions engine/server.
+  openai_http.py          HTTP handler and ThreadingHTTPServer wrapper.
+  openai_warmup.py        OpenAI serving graph-warmup bucket parsing.
   compiler.py             torch.compile policy helper.
   cli.py                  CLI smoke runners.
   profiling.py            Whole-run, region, and pattern artifact capture.
@@ -793,10 +859,13 @@ src/torchinferno/
   models/hf.py            Hugging Face-style config and weights IO.
   graph/export.py         make_fx and FakeTensor tracing helper.
   graph/passes.py         FX graph pass registry and replacement helpers.
+  benchmarks/openai_server.py
+                           HTTP OpenAI server startup/latency microbench.
   runtime/cudagraphs.py   Piecewise CUDA graph runner API.
   runtime/fake_dist.py    Fake process groups and collectives.
   runtime/flex.py         Flex-attention-shaped fallback.
   runtime/offload.py      CPU/device staging profiler for oversized models.
+  runtime/options.py      Environment parsing and optional-path warnings.
   runtime/paged.py        Paged KV cache scaffold.
   runtime/paged_attention.py
                            Paged causal attention reference.
@@ -848,7 +917,7 @@ Implemented as working code and tests:
 - Disaggregated prefill/decode planning.
 - Agent-editable standalone rank files for executable prefill/decode RPC
   experiments.
-- Ragged and continuous batching.
+- Token-step continuous serving with same-length prefill/decode batching.
 - Pattern-match graph replacement entry point, including a multi-node
   make_fx/ATen subgraph replacement example.
 - Native DeepSeek dense/paged cache backend selection.

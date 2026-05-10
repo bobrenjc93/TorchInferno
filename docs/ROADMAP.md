@@ -29,6 +29,7 @@ The CLI view is `torchinferno audit`.
 | Agent rank files | bridge | `disagg-init` emits editable prefill/decode rank files with local RPC wrappers. |
 | Prefix KV reuse | integrated | Serving aliases reusable prefix pages across model layer cache rows with copy-on-write protection. |
 | Continuous batching | bridge | Persistent row-assigned cache batches same-length prefill/decode groups without rebuilding temporary caches; OpenAI serving now microbatches same-shape requests. |
+| OpenAI serving API | bridge | HTTP server exposes `/v1/models` and streaming/non-streaming `/v1/chat/completions`, can auto-launch Llama tensor-parallel workers, and has direct plus HTTP microbench loops. |
 | Time-sliced virtual GPU profiling | integrated | Representative generation profiles can be scaled and replayed across virtual ranks on one physical device. |
 | CPU offload profiling | bridge | Module-at-a-time CPU/device staging records movement overhead separately from compute; decode-cache offload and mmap streaming remain open. |
 | Disaggregated prefill/decode | simulated | Planner models rank assignment and transfer latency. |
