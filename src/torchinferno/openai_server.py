@@ -873,7 +873,7 @@ class OpenAICompletionEngine:
             return 0
         if input_ids.size(0) != 1:
             return 0
-        entry = self._prefix_cache_entry
+        entry = getattr(self, "_prefix_cache_entry", None)
         if entry is None:
             return 0
         input_tokens = tuple(int(token_id) for token_id in input_ids[0].detach().cpu().tolist())
@@ -933,7 +933,7 @@ class OpenAICompletionEngine:
             return 0
         if input_ids.size(0) != 1:
             return 0
-        entry = self._prefix_cache_entry
+        entry = getattr(self, "_prefix_cache_entry", None)
         if entry is None:
             return 0
         input_tokens = tuple(int(token_id) for token_id in input_ids[0].detach().cpu().tolist())
@@ -1678,7 +1678,12 @@ class OpenAICompletionEngine:
                 }
             )
         yield first_tokens
-        if max_tokens <= 1:
+        should_continue = max_tokens > 1 and any(
+            isinstance(state["active"], list) and any(state["active"])
+            for state in states
+        )
+        should_continue = _sync_tensor_parallel_continue(model, should_continue, self.device)
+        if not should_continue:
             return
 
         for _ in range(1, max_tokens):
@@ -1686,7 +1691,9 @@ class OpenAICompletionEngine:
             emitted = False
             for state in states:
                 active = state["active"]
-                if not isinstance(active, list) or not any(active):
+                local_should_decode = isinstance(active, list) and any(active)
+                should_decode = _sync_tensor_parallel_continue(model, local_should_decode, self.device)
+                if not should_decode:
                     continue
                 next_token = state["next_token"]
                 cache = state["cache"]
@@ -1769,7 +1776,9 @@ class OpenAICompletionEngine:
             if token_id in stop_token_ids:
                 active[row] = False
         yield step_tokens
-        if max_tokens <= 1 or not any(active):
+        should_continue = max_tokens > 1 and any(active)
+        should_continue = _sync_tensor_parallel_continue(model, should_continue, next_token.device)
+        if not should_continue:
             return
 
         if 0 < microbatch_size < batch_size:
@@ -1956,7 +1965,7 @@ def _tensor_parallel_world_size(model: object) -> int:
 def _effective_openai_max_batch_size(model: object, device: torch.device, requested: int) -> int:
     max_batch_size = max(1, requested)
     if _is_tensor_parallel_model(model) and device.type == "cuda":
-        tp_default = env_int("TORCHINFERNO_OPENAI_TP_MAX_BATCH_SIZE", 16, minimum=1)
+        tp_default = env_int("TORCHINFERNO_OPENAI_TP_MAX_BATCH_SIZE", 64, minimum=1)
         return min(max_batch_size, tp_default)
     return max_batch_size
 
@@ -1987,14 +1996,15 @@ def _is_tensor_parallel_worker_model(model: object) -> bool:
 
 
 def _prefix_cache_enabled_for_model(model: object) -> bool:
-    return not (_is_tensor_parallel_model(model) and _tensor_parallel_world_size(model) > 1)
+    if _is_tensor_parallel_model(model) and _tensor_parallel_world_size(model) > 1:
+        return env_flag("TORCHINFERNO_OPENAI_TP_PREFIX_CACHE", True)
+    return True
 
 
 def _shared_prefix_batch_enabled_for_model(model: object) -> bool:
-    # Shared-prefix batch splitting interleaves one prefix prefill with several
-    # suffix prefills. Under TP, a request burst can leave rank 0 and worker
-    # ranks at different split points, which changes NCCL collective sizes.
-    return not (_is_tensor_parallel_model(model) and _tensor_parallel_world_size(model) > 1)
+    if _is_tensor_parallel_model(model) and _tensor_parallel_world_size(model) > 1:
+        return env_flag("TORCHINFERNO_OPENAI_TP_SHARED_PREFIX_BATCH", True)
+    return True
 
 
 def _runtime_prefill_graph_capture_enabled(model: object) -> bool:

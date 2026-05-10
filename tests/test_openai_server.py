@@ -863,7 +863,7 @@ def test_openai_engine_batches_variable_length_shared_prefix_suffixes(monkeypatc
     ]
 
 
-def test_openai_engine_disables_prefix_cache_for_tensor_parallel(monkeypatch) -> None:
+def test_openai_engine_can_disable_prefix_cache_for_tensor_parallel(monkeypatch) -> None:
     model = _PrefixRecordingModel()
     engine = _cache_only_engine()
     engine.model = model
@@ -882,6 +882,13 @@ def test_openai_engine_disables_prefix_cache_for_tensor_parallel(monkeypatch) ->
     cache = model.allocate_cache(1, 8)
     model.forward(input_ids, cache=cache, use_cache=True)
 
+    engine._save_prompt_prefix_cache(input_ids, cache)
+    assert engine._prefix_cache_entry is not None
+    assert engine._restore_exact_prefix_cache(input_ids, cache) == 2
+
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_PREFIX_CACHE", "0")
+
+    engine._prefix_cache_entry = object()
     assert engine._restore_prefix_cache(input_ids, cache) == 0
     assert engine._prefix_cache_entry is None
 
@@ -898,7 +905,7 @@ def test_openai_engine_disables_prefix_cache_for_tensor_parallel(monkeypatch) ->
     assert engine._prefix_cache_entry is None
 
 
-def test_openai_engine_disables_shared_prefix_batching_for_tensor_parallel(monkeypatch) -> None:
+def test_openai_engine_can_disable_shared_prefix_batching_for_tensor_parallel(monkeypatch) -> None:
     model = _PrefixRecordingModel()
     engine = _cache_only_engine()
     engine.model = model
@@ -918,6 +925,11 @@ def test_openai_engine_disables_shared_prefix_batching_for_tensor_parallel(monke
         "torchinferno.openai_server._tensor_parallel_world_size",
         lambda candidate: 8 if candidate is model else 1,
     )
+
+    assert engine._shared_prefix_batch_tokens(input_ids) == 2
+    assert engine._shared_prefix_prompt_list_tokens(prompts) == 2
+
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_SHARED_PREFIX_BATCH", "0")
 
     assert engine._shared_prefix_batch_tokens(input_ids) == 0
     assert engine._shared_prefix_prompt_list_tokens(prompts) == 0
@@ -990,8 +1002,8 @@ def test_openai_effective_max_batch_size_caps_cuda_tp_by_default(monkeypatch) ->
         lambda candidate: candidate is model,
     )
 
-    assert _effective_openai_max_batch_size(model, torch.device("cuda"), 64) == 16
-    assert _effective_openai_max_batch_size(model, torch.device("cuda"), 8) == 8
+    assert _effective_openai_max_batch_size(model, torch.device("cuda"), 64) == 64
+    assert _effective_openai_max_batch_size(model, torch.device("cuda"), 128) == 64
     assert _effective_openai_max_batch_size(model, torch.device("cpu"), 64) == 64
 
 
