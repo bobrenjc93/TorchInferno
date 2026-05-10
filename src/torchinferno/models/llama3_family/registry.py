@@ -1,51 +1,11 @@
 from __future__ import annotations
 
-from torchinferno.models.provenance import ModelVariantSpec
+import sys as _sys
 
+from torchinferno.models.llama3 import registry as _module
+from torchinferno.models.llama3.registry import *  # noqa: F401,F403
 
-VARIANTS = (
-    ModelVariantSpec(
-        family="llama3",
-        variant="v0",
-        stage="raw-python-reference",
-        parents=(),
-        module="torchinferno.models.llama3_family.v0",
-        class_name="Llama3V0ForCausalLM",
-        ops_module="torchinferno.models.llama3_family.raw_ops",
-        status="reference",
-        notes="Torch-native Llama3 full-prefix reference with raw Python/PyTorch ops.",
-    ),
-    ModelVariantSpec(
-        family="llama3",
-        variant="v1",
-        stage="fused-ops",
-        parents=("v0",),
-        module="torchinferno.models.llama3_family.v1",
-        class_name="Llama3V1ForCausalLM",
-        ops_module="torchinferno.models.llama3_family.fused_ops",
-        status="reference",
-        notes="Same parameter layout as v0 with kernel-backed norm/SwiGLU hooks.",
-    ),
-    ModelVariantSpec(
-        family="llama3",
-        variant="pipeline-v0",
-        stage="pipeline-sharded-production-scale",
-        parents=("v0",),
-        module="torchinferno.models.llama3_family.pipeline",
-        class_name="Llama3PipelineForCausalLM",
-        ops_module="torchinferno.models.llama3_family.raw_ops",
-        status="experimental",
-        notes="Direct safetensors loader with per-layer device placement and KV-cached decode for Llama70B.",
-    ),
-    ModelVariantSpec(
-        family="llama3",
-        variant="tp-v0",
-        stage="tensor-parallel-production-scale",
-        parents=("pipeline-v0",),
-        module="torchinferno.models.llama3_family.tensor_parallel",
-        class_name="Llama3TensorParallelForCausalLM",
-        ops_module="torchinferno.models.llama3_family.raw_ops",
-        status="experimental",
-        notes="Torchrun/NCCL tensor-parallel Llama70B path with sharded QKV/MLP weights and KV-cached decode.",
-    ),
-)
+_parent = _sys.modules.get(__name__.rsplit(".", 1)[0])
+if _parent is not None:
+    setattr(_parent, "registry", _module)
+_sys.modules[__name__] = _module

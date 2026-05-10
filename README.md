@@ -104,10 +104,10 @@ for the full workflow.
 
 | Surface | Primary code | Fast verification |
 | --- | --- | --- |
-| DSv4 model family | [`models/dsv4.py`](src/torchinferno/models/dsv4.py), [`models/dsv4_family/`](src/torchinferno/models/dsv4_family/) | `dsv4-smoke`, `dsv4-hf-smoke`, `model-variants` |
-| DeepSeek-V3.2 model family | [`models/deepseek.py`](src/torchinferno/models/deepseek.py), [`models/deepseek_v32_family/`](src/torchinferno/models/deepseek_v32_family/) | `deepseek-smoke`, `deepseek-hf-smoke`, `deepseek-audit` |
-| Llama3 model family | [`models/llama3_family/`](src/torchinferno/models/llama3_family/) | `validate-model-variants --family llama3`, `llama-bench-suite` |
-| Parallel and distributed execution | [`runtime/`](src/torchinferno/runtime/), [`models/llama3_family/pipeline.py`](src/torchinferno/models/llama3_family/pipeline.py), [`models/llama3_family/tensor_parallel.py`](src/torchinferno/models/llama3_family/tensor_parallel.py) | `disagg-smoke`, `llama-bench-suite`, `tests/test_llama3_tensor_parallel_distributed.py` |
+| DSv4 model family | [`models/dsv4/`](src/torchinferno/models/dsv4/), compatibility [`models/dsv4_family/`](src/torchinferno/models/dsv4_family/) | `dsv4-smoke`, `dsv4-hf-smoke`, `model-variants` |
+| DeepSeek-V3.2 model family | [`models/deepseek_v32/`](src/torchinferno/models/deepseek_v32/), compatibility [`models/deepseek.py`](src/torchinferno/models/deepseek.py) | `deepseek-smoke`, `deepseek-hf-smoke`, `deepseek-audit` |
+| Llama3 model family | [`models/llama3/`](src/torchinferno/models/llama3/), compatibility [`models/llama3_family/`](src/torchinferno/models/llama3_family/) | `validate-model-variants --family llama3`, `llama-bench-suite` |
+| Parallel and distributed execution | [`runtime/`](src/torchinferno/runtime/), [`models/llama3/pipeline.py`](src/torchinferno/models/llama3/pipeline.py), [`models/llama3/tensor_parallel.py`](src/torchinferno/models/llama3/tensor_parallel.py) | `disagg-smoke`, `llama-bench-suite`, `tests/test_llama3_tensor_parallel_distributed.py` |
 | OpenAI-compatible serving | [`openai_server.py`](src/torchinferno/openai_server.py), [`openai_http.py`](src/torchinferno/openai_http.py), [`openai_warmup.py`](src/torchinferno/openai_warmup.py), [`runtime/serving.py`](src/torchinferno/runtime/serving.py) | `openai-server`, `openai-microbench`, `openai-server-microbench`, `serve-smoke` |
 | Runtime policy experiments | [`runtime/`](src/torchinferno/runtime/) | `sim-smoke`, `traffic-smoke`, `disagg-init`, `disagg-smoke` |
 | Offline graph optimization | [`compiler.py`](src/torchinferno/compiler.py), [`graph/`](src/torchinferno/graph/), [`profiling.py`](src/torchinferno/profiling.py), [`docs/OFFLINE_OPTIMIZATION.md`](docs/OFFLINE_OPTIMIZATION.md) | `trace-smoke`, `profile-pattern`, `profile-subgraph` |
@@ -216,7 +216,7 @@ PYTHONPATH=src python3 -m torchinferno.cli deepseek-smoke --device cuda
 
 ## DSv4 Model Family
 
-The compact model lives in `src/torchinferno/models/dsv4.py`. It is the fast
+The compact model lives in `src/torchinferno/models/dsv4/model.py`. It is the fast
 CPU-friendly model family for compiler, cache, serving, and graph-pass
 experiments.
 
@@ -241,7 +241,7 @@ execution, serving, tracing, and runtime scaffolds.
 
 ## Native DeepSeek Path
 
-The native model lives in `src/torchinferno/models/deepseek.py`. It mirrors the
+The native model lives in `src/torchinferno/models/deepseek_v32/model.py`. It mirrors the
 production DeepSeek-style tensor contracts rather than compressing them into the
 compact DSv4 family.
 
@@ -1070,14 +1070,15 @@ src/torchinferno/
                            Paged decode attention kernel API.
   kernels/nvfp4.py        NVFP4 quantized-linear reference contract.
   kernels/passes.py       Graph-pass registration for kernel replacements.
-  models/*_family/        Provenance-tracked raw/fused model variant ladders.
+  models/*_family/        Backward-compatible import shims.
   models/provenance.py    Variant registry dataclasses and lineage helper.
-  models/dsv4.py          DSv4-style causal LM, MoE, attention, and KV cache.
-  models/llama3_family/   Torch-native Llama3 raw/fused variants plus current
+  models/dsv4/            DSv4-style causal LM, MoE, attention, and KV cache.
+  models/llama3/          Torch-native Llama3 raw/fused variants plus current
                            family-specific pipeline and tensor-parallel adapters.
   models/variants.py      Model variant listing and lineage helpers.
   models/auto.py          Config-driven model loader.
-  models/deepseek.py      Native DeepSeek-V3.2-style architecture.
+  models/deepseek.py      Compatibility alias for the native DeepSeek package.
+  models/deepseek_v32/    Native DeepSeek-V3.2-style architecture.
   models/conversion.py    DeepSeek-style checkpoint audit and conversion.
   models/hf.py            Hugging Face-style config and weights IO.
   graph/export.py         make_fx and FakeTensor tracing helper.

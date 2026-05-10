@@ -18,7 +18,7 @@ from torchinferno.kernels.ops import fused_rmsnorm_swiglu_reference
 from torchinferno.kernels.ops import triton_available
 from torchinferno.kernels.passes import register_kernel_replacement_passes
 from torchinferno.models.auto import load_model_auto
-from torchinferno.models.deepseek import DeepSeekV32ForCausalLM, tiny_deepseek_v32_config
+from torchinferno.models.deepseek_v32 import DeepSeekV32ForCausalLM, tiny_deepseek_v32_config
 from torchinferno.models.dsv4 import DSv4ForCausalLM, tiny_dsv4_config
 from torchinferno.runtime.offload import (
     OffloadEvent,
@@ -2141,7 +2141,7 @@ def _write_repro(path: Path, config: ProfileRunConfig, input_ids: list[list[int]
 import torch
 
 from torchinferno.compiler import CompileConfig, compile_forward
-from torchinferno.models.deepseek import DeepSeekV32ForCausalLM, tiny_deepseek_v32_config
+from torchinferno.models.deepseek_v32 import DeepSeekV32ForCausalLM, tiny_deepseek_v32_config
 from torchinferno.models.dsv4 import DSv4ForCausalLM, tiny_dsv4_config
 
 MODEL_KIND = {config.model_kind!r}

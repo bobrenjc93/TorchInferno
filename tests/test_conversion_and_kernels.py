@@ -159,7 +159,7 @@ def test_triton_cuda_kernels_match_torch_reference() -> None:
 @pytest.mark.skipif(not torch.cuda.is_available() or not triton_available(), reason="CUDA Triton kernels unavailable")
 def test_triton_rotary_interleaved_inplace_matches_torch_reference() -> None:
     from torchinferno.kernels.triton_ops import triton_apply_rotary_interleaved_inplace
-    from torchinferno.models.llama3_family.tensor_parallel import _rotate_interleaved_eager
+    from torchinferno.models.llama3.tensor_parallel import _rotate_interleaved_eager
 
     torch.manual_seed(15)
     batch, tokens, q_heads, kv_heads, head_dim = 3, 5, 4, 1, 16
@@ -188,7 +188,7 @@ def test_triton_rotary_interleaved_inplace_matches_torch_reference() -> None:
 @pytest.mark.skipif(not torch.cuda.is_available() or not triton_available(), reason="CUDA Triton kernels unavailable")
 def test_triton_rotary_llama_inplace_matches_torch_reference() -> None:
     from torchinferno.kernels.triton_ops import triton_apply_rotary_llama_inplace
-    from torchinferno.models.llama3_family.tensor_parallel import _rotate_llama_eager
+    from torchinferno.models.llama3.tensor_parallel import _rotate_llama_eager
 
     torch.manual_seed(16)
     batch, tokens, q_heads, kv_heads, head_dim = 3, 5, 4, 1, 16
@@ -250,7 +250,7 @@ def test_triton_kv_cache_append_matches_torch_reference() -> None:
 @pytest.mark.skipif(not torch.cuda.is_available() or not triton_available(), reason="CUDA Triton kernels unavailable")
 def test_triton_decode_rotary_append_matches_torch_reference() -> None:
     from torchinferno.kernels.triton_ops import triton_apply_rotary_append_kv_decode
-    from torchinferno.models.llama3_family.tensor_parallel import _rotate_llama_eager
+    from torchinferno.models.llama3.tensor_parallel import _rotate_llama_eager
 
     torch.manual_seed(19)
     batch, q_heads, kv_heads, head_dim, max_seq_len = 2, 4, 1, 16, 12

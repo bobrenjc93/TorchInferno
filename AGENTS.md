@@ -98,7 +98,7 @@ python3 -m pytest tests/test_serving_engine.py
   `src/torchinferno/runtime/`; family-specific checkpoint loading or sharding
   adapters beside the affected model family.
 - Native paged-cache serving integration: `src/torchinferno/runtime/serving.py`
-  and `src/torchinferno/models/deepseek.py`.
+  and `src/torchinferno/models/deepseek_v32/model.py`.
 - Feature readiness/DX status: `src/torchinferno/audit.py` and
   `docs/ROADMAP.md`.
 - Profile artifact loops and repro generators: `src/torchinferno/profiling.py`.

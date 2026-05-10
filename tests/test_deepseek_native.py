@@ -9,7 +9,7 @@ from safetensors.torch import save_file
 
 from torchinferno.graph import trace_with_make_fx
 from torchinferno.models.conversion import audit_native_deepseek_checkpoint, convert_native_deepseek_checkpoint
-from torchinferno.models.deepseek import DeepSeekV32ForCausalLM, tiny_deepseek_v32_config
+from torchinferno.models.deepseek_v32 import DeepSeekV32ForCausalLM, tiny_deepseek_v32_config
 
 
 def test_native_deepseek_cached_decode_matches_full_forward() -> None:

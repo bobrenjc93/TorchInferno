@@ -5,7 +5,7 @@ import sys
 import torch
 
 from torchinferno.models.auto import load_model_auto
-from torchinferno.models.deepseek import DeepSeekV32ForCausalLM, tiny_deepseek_v32_config
+from torchinferno.models.deepseek_v32 import DeepSeekV32ForCausalLM, tiny_deepseek_v32_config
 from torchinferno.runtime.paged import PagedKVCache
 from torchinferno.runtime.paged_attention import paged_causal_attention
 from torchinferno.runtime.prefix_cache import PrefixCacheIndex

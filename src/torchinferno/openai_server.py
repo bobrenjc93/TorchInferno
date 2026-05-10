@@ -16,7 +16,7 @@ from typing import Iterable, Iterator, Protocol, Sequence, runtime_checkable
 import torch
 from torch import Tensor
 
-from torchinferno.models.llama3_family.tensor_parallel import Llama3TensorParallelForCausalLM
+from torchinferno.models.llama3.tensor_parallel import Llama3TensorParallelForCausalLM
 from torchinferno.engine.loader import (
     distributed_env_requested as _engine_distributed_env_requested,
     distributed_server_command as _engine_distributed_server_command,

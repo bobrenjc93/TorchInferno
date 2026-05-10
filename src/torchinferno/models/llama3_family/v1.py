@@ -1,22 +1,11 @@
 from __future__ import annotations
 
-from torchinferno.models.llama3_family import fused_ops
-from torchinferno.models.llama3_family.config import Llama3Config, tiny_llama3_config
-from torchinferno.models.llama3_family.v0 import _Llama3ForCausalLMBase
+import sys as _sys
 
+from torchinferno.models.llama3 import v1 as _module
+from torchinferno.models.llama3.v1 import *  # noqa: F401,F403
 
-class Llama3V1ForCausalLM(_Llama3ForCausalLMBase):
-    """Llama3 v1 fused-op variant.
-
-    It preserves v0 module boundaries and parameter names while swapping the
-    operation module from `raw_ops.py` to `fused_ops.py`.
-    """
-
-    provenance_variant = "llama3:v1"
-
-    def __init__(self, config: Llama3Config) -> None:
-        super().__init__(config, fused_ops)
-
-
-def tiny_llama3_v1_config(**overrides: int | float | bool) -> Llama3Config:
-    return tiny_llama3_config(**overrides)
+_parent = _sys.modules.get(__name__.rsplit(".", 1)[0])
+if _parent is not None:
+    setattr(_parent, "v1", _module)
+_sys.modules[__name__] = _module

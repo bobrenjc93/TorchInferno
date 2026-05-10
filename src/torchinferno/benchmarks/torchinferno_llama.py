@@ -16,8 +16,8 @@ from torchinferno.benchmarks.vllm_compatible import (
     collect_vllm_benchmark_summary,
     plot_vllm_benchmark_results,
 )
-from torchinferno.models.llama3_family.pipeline import Llama3PipelineForCausalLM
-from torchinferno.models.llama3_family.tensor_parallel import Llama3TensorParallelForCausalLM
+from torchinferno.models.llama3.pipeline import Llama3PipelineForCausalLM
+from torchinferno.models.llama3.tensor_parallel import Llama3TensorParallelForCausalLM
 from torchinferno.runtime.sampling import sample_next_token
 
 

@@ -436,7 +436,7 @@ def _build_region_workload(config: HelionRegionSearchConfig) -> dict[str, object
             positions = torch.arange(config.tokens, device=device)
             return {"fn": lambda x, positions: module(x, positions, None), "args": (x, positions), "device": device, "candidate_activation_size": config.hidden_size}
     elif model_kind in {"deepseek", "deepseek-v3.2", "deepseek_v32"}:
-        from torchinferno.models.deepseek import DeepSeekV32ForCausalLM, tiny_deepseek_v32_config
+        from torchinferno.models.deepseek_v32 import DeepSeekV32ForCausalLM, tiny_deepseek_v32_config
 
         model = DeepSeekV32ForCausalLM(
             tiny_deepseek_v32_config(

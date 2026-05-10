@@ -11,7 +11,7 @@ import pytest
 import torch
 from safetensors.torch import save_file
 
-from torchinferno.models.llama3_family import Llama3V0ForCausalLM, tiny_llama3_config
+from torchinferno.models.llama3 import Llama3V0ForCausalLM, tiny_llama3_config
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires at least two CUDA devices")
@@ -42,7 +42,7 @@ def test_llama3_tensor_parallel_matches_reference_under_torchrun(tmp_path) -> No
             import torch
             import torch.distributed as dist
 
-            from torchinferno.models.llama3_family import Llama3TensorParallelForCausalLM
+            from torchinferno.models.llama3 import Llama3TensorParallelForCausalLM
 
 
             checkpoint, artifact_dir = sys.argv[1], sys.argv[2]

@@ -10,14 +10,14 @@ import torch
 from safetensors.torch import save_file
 from torch import Tensor
 
-from torchinferno.models.deepseek_v32_family import (
+from torchinferno.models.deepseek_v32 import (
     DeepSeekV32V0ForCausalLM,
     DeepSeekV32V1ForCausalLM,
     tiny_deepseek_v32_v0_config,
 )
-from torchinferno.models.dsv4_family import DSv4V0ForCausalLM, DSv4V1ForCausalLM, tiny_dsv4_v0_config
+from torchinferno.models.dsv4 import DSv4V0ForCausalLM, DSv4V1ForCausalLM, tiny_dsv4_v0_config
 from torchinferno.models.hf import HF_CONFIG_NAME, SAFETENSORS_INDEX_NAME
-from torchinferno.models.llama3_family import (
+from torchinferno.models.llama3 import (
     Llama3PipelineForCausalLM,
     Llama3V0ForCausalLM,
     Llama3V1ForCausalLM,
@@ -315,7 +315,7 @@ def _build_llama3_tensor_parallel_case(
     tokens: int,
     vocab_size: int,
 ) -> tuple[object, object]:
-    from torchinferno.models.llama3_family import Llama3TensorParallelForCausalLM
+    from torchinferno.models.llama3 import Llama3TensorParallelForCausalLM
 
     config = tiny_llama3_v0_config(vocab_size=vocab_size, max_position_embeddings=tokens + 8)
     eager = Llama3V0ForCausalLM(config).to(device=device, dtype=dtype).eval()

@@ -7,7 +7,7 @@ from typing import Optional
 import torch
 from torch import Tensor, nn
 
-from torchinferno.models.deepseek import DeepSeekV32ForCausalLM
+from torchinferno.models.deepseek_v32 import DeepSeekV32ForCausalLM
 from torchinferno.models.dsv4 import DSv4ForCausalLM
 from torchinferno.runtime.sampling import sample_next_token
 

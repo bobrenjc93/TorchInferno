@@ -9,11 +9,11 @@ from typing import Sequence
 import torch
 
 from torchinferno.models.auto import load_model_auto
-from torchinferno.models.deepseek import DeepSeekV32ForCausalLM, tiny_deepseek_v32_config
+from torchinferno.models.deepseek_v32 import DeepSeekV32ForCausalLM, tiny_deepseek_v32_config
 from torchinferno.models.dsv4 import DSv4ForCausalLM, tiny_dsv4_config
-from torchinferno.models.llama3_family.pipeline import Llama3PipelineForCausalLM
-from torchinferno.models.llama3_family.tensor_parallel import Llama3TensorParallelForCausalLM
-from torchinferno.models.llama3_family.v0 import Llama3V0ForCausalLM, tiny_llama3_v0_config
+from torchinferno.models.llama3 import Llama3V0ForCausalLM, tiny_llama3_v0_config
+from torchinferno.models.llama3.pipeline import Llama3PipelineForCausalLM
+from torchinferno.models.llama3.tensor_parallel import Llama3TensorParallelForCausalLM
 
 
 def load_model_for_engine(config: object) -> tuple[object, torch.device]:

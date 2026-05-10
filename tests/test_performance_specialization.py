@@ -19,7 +19,7 @@ from torchinferno.kernels import (
 )
 from torchinferno.kernels.ops import triton_available
 from torchinferno.kernels.passes import register_kernel_replacement_passes
-from torchinferno.models.llama3_family.tensor_parallel import _decode_linear
+from torchinferno.models.llama3.tensor_parallel import _decode_linear
 from torchinferno.research.benchmarks import benchmark_callable
 from torchinferno.research.helion import (
     HelionCandidateConfig,

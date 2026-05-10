@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from torchinferno.models.deepseek_v32_family.registry import VARIANTS as DEEPSEEK_V32_VARIANTS
-from torchinferno.models.dsv4_family.registry import VARIANTS as DSV4_VARIANTS
-from torchinferno.models.llama3_family.registry import VARIANTS as LLAMA3_VARIANTS
+from torchinferno.models.deepseek_v32.registry import VARIANTS as DEEPSEEK_V32_VARIANTS
+from torchinferno.models.dsv4.registry import VARIANTS as DSV4_VARIANTS
+from torchinferno.models.llama3.registry import VARIANTS as LLAMA3_VARIANTS
 from torchinferno.models.provenance import ModelVariantRegistry, ModelVariantSpec
 
 

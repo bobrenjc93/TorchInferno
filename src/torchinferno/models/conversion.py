@@ -12,7 +12,7 @@ from safetensors import safe_open
 from safetensors.torch import save_file
 
 from torchinferno.models.dsv4 import DSv4Config
-from torchinferno.models.deepseek import DeepSeekV32Config
+from torchinferno.models.deepseek_v32 import DeepSeekV32Config
 from torchinferno.models.hf import (
     CONFIG_NAME,
     HF_CONFIG_NAME,

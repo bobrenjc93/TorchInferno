@@ -1,18 +1,11 @@
 from __future__ import annotations
 
-from torchinferno.models.deepseek import DeepSeekV32Config, DeepSeekV32ForCausalLM, tiny_deepseek_v32_config
-from torchinferno.models.deepseek_v32_family import fused_ops
+import sys as _sys
 
+from torchinferno.models.deepseek_v32 import v1 as _module
+from torchinferno.models.deepseek_v32.v1 import *  # noqa: F401,F403
 
-class DeepSeekV32V1ForCausalLM(DeepSeekV32ForCausalLM):
-    """DeepSeek-V3.2 v1 fused/cached native variant."""
-
-    provenance_variant = "deepseek-v3.2:v1"
-    ops = fused_ops
-
-    def __init__(self, config: DeepSeekV32Config) -> None:
-        super().__init__(config, fused_ops)
-
-
-def tiny_deepseek_v32_v1_config(**overrides: int | float | bool | str | None) -> DeepSeekV32Config:
-    return tiny_deepseek_v32_config(**overrides)
+_parent = _sys.modules.get(__name__.rsplit(".", 1)[0])
+if _parent is not None:
+    setattr(_parent, "v1", _module)
+_sys.modules[__name__] = _module

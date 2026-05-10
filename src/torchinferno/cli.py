@@ -34,7 +34,7 @@ from torchinferno.models.conversion import (
     convert_native_deepseek_checkpoint,
     dtype_from_name,
 )
-from torchinferno.models.deepseek import DeepSeekV32ForCausalLM, tiny_deepseek_v32_config
+from torchinferno.models.deepseek_v32 import DeepSeekV32ForCausalLM, tiny_deepseek_v32_config
 from torchinferno.models.dsv4 import DSv4ForCausalLM, tiny_dsv4_config
 from torchinferno.models.variants import list_model_variants, model_variant_lineage
 from torchinferno.openai_server import config_from_args as openai_config_from_args

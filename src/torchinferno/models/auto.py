@@ -5,7 +5,7 @@ from typing import Optional
 
 import torch
 
-from torchinferno.models.deepseek import DeepSeekV32ForCausalLM
+from torchinferno.models.deepseek_v32 import DeepSeekV32ForCausalLM
 from torchinferno.models.dsv4 import DSv4ForCausalLM
 from torchinferno.models.hf import load_config, resolve_pretrained_path
 

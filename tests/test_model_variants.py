@@ -7,13 +7,17 @@ import sys
 import torch
 from safetensors.torch import save_file
 
-from torchinferno.models.deepseek_v32_family import (
+import torchinferno.models.deepseek as legacy_deepseek_mod
+import torchinferno.models.deepseek_v32.model as canonical_deepseek_mod
+import torchinferno.models.llama3.model as canonical_llama3_model
+import torchinferno.models.llama3_family.v0 as legacy_llama3_v0_mod
+from torchinferno.models.deepseek_v32 import (
     DeepSeekV32V0ForCausalLM,
     DeepSeekV32V1ForCausalLM,
     tiny_deepseek_v32_v0_config,
 )
-from torchinferno.models.dsv4_family import DSv4V0ForCausalLM, DSv4V1ForCausalLM, tiny_dsv4_v0_config
-from torchinferno.models.llama3_family import (
+from torchinferno.models.dsv4 import DSv4V0ForCausalLM, DSv4V1ForCausalLM, tiny_dsv4_v0_config
+from torchinferno.models.llama3 import (
     Llama3PipelineForCausalLM,
     Llama3TensorParallelForCausalLM,
     Llama3V0ForCausalLM,
@@ -22,10 +26,43 @@ from torchinferno.models.llama3_family import (
     llama3_70b_config,
     tiny_llama3_config,
 )
-from torchinferno.models.llama3_family.pipeline import _apply_rotary as _pipeline_apply_rotary
-from torchinferno.models.llama3_family.tensor_parallel import _apply_rotary_cached as _tp_apply_rotary
-from torchinferno.models.variants import get_model_variant, list_model_variants, model_variant_lineage
+from torchinferno.models.llama3.pipeline import _apply_rotary as _pipeline_apply_rotary
+from torchinferno.models.llama3.tensor_parallel import _apply_rotary_cached as _tp_apply_rotary
+from torchinferno.models.catalog import get_model_family, list_model_families
+from torchinferno.models.variants import (
+    get_model_variant,
+    list_model_variants,
+    model_variant_lineage,
+)
 from torchinferno.variant_validation import run_variant_logit_validation
+
+
+def test_model_family_catalog_uses_canonical_packages() -> None:
+    families = {family.name: family for family in list_model_families()}
+
+    assert set(families) == {"dsv4", "deepseek-v3.2", "llama3"}
+    assert families["dsv4"].package == "torchinferno.models.dsv4"
+    assert families["deepseek-v3.2"].package == "torchinferno.models.deepseek_v32"
+    assert families["llama3"].package == "torchinferno.models.llama3"
+    assert families["llama3"].model_module == "torchinferno.models.llama3.model"
+    assert get_model_family("deepseek_v32").name == "deepseek-v3.2"
+
+
+def test_legacy_model_imports_alias_canonical_modules() -> None:
+    assert legacy_deepseek_mod is canonical_deepseek_mod
+    assert legacy_llama3_v0_mod is canonical_llama3_model
+
+    legacy_dsv4_raw_ops = importlib.import_module("torchinferno.models.dsv4_family.raw_ops")
+    canonical_dsv4_raw_ops = importlib.import_module("torchinferno.models.dsv4.raw_ops")
+    legacy_deepseek_registry = importlib.import_module(
+        "torchinferno.models.deepseek_v32_family.registry"
+    )
+    canonical_deepseek_registry = importlib.import_module(
+        "torchinferno.models.deepseek_v32.registry"
+    )
+
+    assert legacy_dsv4_raw_ops is canonical_dsv4_raw_ops
+    assert legacy_deepseek_registry is canonical_deepseek_registry
 
 
 def test_model_variant_registry_tracks_families_and_ops_modules() -> None:
@@ -227,7 +264,7 @@ def test_model_variants_cli_lists_lineage() -> None:
 
     assert "llama3:v0" in result.stdout
     assert "llama3:v1" in result.stdout
-    assert "ops=torchinferno.models.llama3_family.fused_ops" in result.stdout
+    assert "ops=torchinferno.models.llama3.fused_ops" in result.stdout
 
 
 def test_validate_model_variants_cli_compares_eager_logits() -> None:

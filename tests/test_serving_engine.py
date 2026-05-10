@@ -5,8 +5,8 @@ import sys
 import pytest
 import torch
 
-import torchinferno.models.deepseek as deepseek_mod
-from torchinferno.models.deepseek import DeepSeekV32ForCausalLM, tiny_deepseek_v32_config
+import torchinferno.models.deepseek_v32.model as deepseek_mod
+from torchinferno.models.deepseek_v32 import DeepSeekV32ForCausalLM, tiny_deepseek_v32_config
 from torchinferno.runtime.serving import ContinuousBatchEngine, ServingRequest
 
 
