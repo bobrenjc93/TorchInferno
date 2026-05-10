@@ -31,76 +31,31 @@ tensor-parallel adapters. The readiness snapshot lives in
 
 ## What Works Today
 
-- DSv4-style decoder-only causal LM in pure PyTorch.
-- MLA-like latent KV projection, grouped KV heads, rotary causal attention, and
-  routed top-k MoE feed-forward blocks.
-- Native DeepSeek-V3.2-style causal LM with query LoRA, split RoPE/nope QK
-  heads, latent MQA KV projection, independent value head dimensions,
-  dense-to-MoE layer transitions, shared experts, grouped top-k routing, and
-  score correction bias support.
-- Explicit dense and paged KV cache backends for prefill and decode correctness
-  tests in the native DeepSeek path.
-- Hugging Face-style local and Hub checkpoint save/load for TorchInferno DSv4
-  key names and tensor shapes.
-- DeepSeek-style checkpoint audit and exact conversion for checkpoints whose
-  tensor contracts match TorchInferno DSv4.
-- Auto model loading, tokenizer-backed text generation, and known-logit
-  validation for checkpoint bringup.
-- Greedy and temperature sampling.
-- Token-step continuous serving harness with admission, paged-cache policy, and
-  prefix-hit accounting, shared prefix-page reuse, persistent row-assigned
-  paged cache state, and same-shape prefill/decode microbatching.
-- OpenAI-compatible serving with same-shape request microbatching, streaming,
-  accurate prompt/completion token accounting, shared tensor prefix-cache reuse,
-  direct and HTTP microbench loops, self-consistency prompt mode, phase timing
-  reports, profile breakdowns, and a torchrun-backed Llama tensor parallel
-  worker mode.
-- Deterministic time-sliced virtual GPU simulation.
-- Disaggregated prefill/decode planner with network latency modeling.
-- Agent-editable standalone prefill/decode rank files with local JSON-RPC
-  wrappers for disaggregated execution experiments.
-- Fake process groups and fake collectives for single-process distributed
-  policy tests.
-- Paged KV cache allocator integrated into native DeepSeek decode and available
-  as a standalone kernel workbench.
-- Functional paged causal attention reference for kernel replacement work.
-- Single-request and batched paged decode attention APIs over independent
-  request page tables.
-- Radix/prefix tree, prefix-aware router, prefix cache lookup, and tensor KV
-  prefix snapshot/restore helpers.
-- `torch.compile` helper and CLI smoke path.
-- `make_fx` tracing helper with FakeTensorMode support.
-- Pattern-based FX graph pass registry with call-target and multi-node
-  subgraph replacement helpers.
-- Flex-attention-shaped q/k/v API that dispatches to torch flex attention when
-  available and keeps an eager fallback.
-- Piecewise CUDA graph runner API with static CUDA tensor capture and CPU/eager
-  fallback.
-- Bursty traffic simulation for request diversity and latency modeling.
-- Triton CUDA kernels for RMSNorm and SwiGLU activation, with Helion-generated
-  candidates evaluated through the research harness before any production swap.
-- Triton-backed paged decode attention specialization with a torch reference
-  fallback.
-- NVFP4 quantized-linear reference surface and graph-pass hook for future fused
-  DeepSeek-V3.2-NVFP4 kernels.
-- Local performance benchmark smoke for reference versus specialized paths.
-- Whole-model, time-sliced replay, CPU-offload, focused-region, and
-  pattern-replacement profile artifact loops plus arbitrary FX subgraph
-  extraction by node id. These emit graphs, profiler JSON, traces, memory data,
-  and repro scripts.
-- Eager-vs-optimized model variant logit validation with a 1% default tolerance
-  and optional JSON reports for agent/research loops.
-- Minimal auto research harness for comparing scheduler/cache/routing policies.
-- Llama 3 70B architecture config plus family-specific pipeline-sharded and
-  tensor-parallel checkpoint loader/generate adapters for running
-  production-scale weights across multiple GPUs without depending on Hugging
-  Face model classes.
-- Tensor-parallel Llama fast paths for optional Triton rotary, KV append,
-  RMSNorm, SwiGLU, dense/grouped decode attention, and decode-step CUDA graph
-  capture.
-- vLLM-compatible benchmark runner for Llama 70B latency, offline throughput,
-  and online serving results, with JSON summaries and HTML/CSV performance
-  plots.
+- Torch-native model families: compact DSv4, native DeepSeek-V3.2-style, and
+  Llama3. These cover pure PyTorch causal LM execution, DeepSeek-style
+  attention/MoE contracts, dense and paged KV cache paths, and Llama 70B
+  planning plus current pipeline/tensor-parallel adapters.
+- Bringup and validation loops: Hugging Face-style checkpoint IO, DeepSeek
+  checkpoint audit/conversion, auto model loading, tokenizer-backed generation,
+  greedy and temperature sampling, known-logit validation, and
+  eager-vs-optimized variant checks.
+- Serving and cache policy workbenches: token-step continuous serving,
+  OpenAI-compatible chat completions, same-shape microbatching, prefix reuse,
+  paged KV allocation, radix/prefix routing, and direct/HTTP serving
+  microbenchmarks.
+- Distributed and traffic simulation: deterministic time-sliced virtual GPU
+  replay, disaggregated prefill/decode planning, editable prefill/decode rank
+  files with local JSON-RPC wrappers, fake process groups, fake collectives,
+  and bursty traffic modeling.
+- Compiler, graph, and kernel replacement surfaces: `torch.compile`,
+  `make_fx` with FakeTensorMode, FX graph pass registration, flex-attention and
+  CUDA graph shaped APIs, Triton fallbacks/specializations, Helion candidate
+  evaluation, and NVFP4 graph hooks.
+- Profiling, research, and benchmark loops: whole-model, region, offload,
+  time-sliced, pattern, and node-id subgraph profile artifacts; local
+  reference-vs-specialized performance smokes; scheduler/cache/routing research
+  comparisons; and vLLM-compatible Llama 70B benchmark reports with JSON,
+  HTML, and CSV outputs.
 
 > [!TIP]
 > Every command below works either through the installed `torchinferno` console
