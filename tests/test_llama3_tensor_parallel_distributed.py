@@ -54,10 +54,21 @@ def test_llama3_tensor_parallel_matches_reference_under_torchrun(tmp_path) -> No
             with torch.inference_mode():
                 logits, _ = model.forward(input_ids, use_cache=False)
                 generated = model.generate(input_ids, max_new_tokens=2)
+                local_sample_logits = torch.arange(
+                    model.local_vocab_size,
+                    device=model.device,
+                    dtype=torch.float32,
+                )[None, :].expand(3, model.local_vocab_size)
+                sampled = model._sample_next_token(local_sample_logits, temperature=0.7)
 
             torch.testing.assert_close(logits.cpu(), expected_logits, atol=2e-5, rtol=2e-5)
             if not torch.equal(generated.cpu(), expected_generated):
                 raise AssertionError(f"generated={generated.cpu().tolist()} expected={expected_generated.tolist()}")
+            gathered_samples = [torch.empty_like(sampled) for _ in range(dist.get_world_size())]
+            dist.all_gather(gathered_samples, sampled)
+            for rank_samples in gathered_samples:
+                if not torch.equal(sampled, rank_samples):
+                    raise AssertionError(f"temperature samples diverged across ranks: {gathered_samples}")
 
             if dist.is_available() and dist.is_initialized():
                 dist.barrier()

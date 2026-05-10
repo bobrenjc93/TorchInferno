@@ -1786,6 +1786,12 @@ class Llama3TensorParallelForCausalLM:
             return sample_next_token(logits, temperature).to(self.device)
         if temperature <= 0:
             return self._sample_next_token_greedy(logits)
+        if os.environ.get("TORCHINFERNO_TEMPERATURE_SAMPLE_GATHER", "1") != "0":
+            try:
+                return self._sample_next_token_temperature_gather(logits, temperature)
+            except Exception:
+                if os.environ.get("TORCHINFERNO_TEMPERATURE_SAMPLE_GATHER_STRICT", "0") != "0":
+                    raise
         return self._sample_next_token_temperature(logits, temperature)
 
     def _sample_next_token_greedy(self, logits: Tensor) -> Tensor:
@@ -1819,6 +1825,22 @@ class Llama3TensorParallelForCausalLM:
         sentinel = torch.full_like(tokens, self.config.vocab_size)
         candidate_tokens = torch.where(values == global_values[None, :], tokens, sentinel)
         return candidate_tokens.min(dim=0).values
+
+    def _sample_next_token_temperature_gather(self, logits: Tensor, temperature: float) -> Tensor:
+        local_logits = logits.contiguous()
+        gathered = torch.empty(
+            (self.world_size, *local_logits.shape),
+            dtype=local_logits.dtype,
+            device=self.device,
+        )
+        dist.all_gather_into_tensor(gathered, local_logits)
+        next_token = torch.empty(logits.size(0), dtype=torch.long, device=self.device)
+        if self.is_primary:
+            full_logits = gathered.permute(1, 0, 2).reshape(logits.size(0), self.world_size * logits.size(1))
+            probs = torch.softmax(full_logits.float() / temperature, dim=-1)
+            next_token.copy_(torch.multinomial(probs, num_samples=1).squeeze(-1))
+        dist.broadcast(next_token, src=0)
+        return next_token
 
     def _sample_next_token_temperature(self, logits: Tensor, temperature: float) -> Tensor:
         logits_float = logits.float() / temperature
