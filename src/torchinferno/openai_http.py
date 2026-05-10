@@ -99,12 +99,16 @@ class OpenAIHandler(BaseHTTPRequestHandler):
         engine = self._engine()
         completion_id = f"chatcmpl-{uuid.uuid4().hex}"
         created = int(time.time())
-        self.send_response(HTTPStatus.OK)
-        self.send_header("Content-Type", "text/event-stream")
-        self.send_header("Cache-Control", "no-cache")
-        self.send_header("Connection", "close")
-        self.end_headers()
-        self._write_sse(
+        try:
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "close")
+            self.end_headers()
+        except OSError:
+            self.close_connection = True
+            return
+        client_open = self._try_write_sse(
             {
                 "id": completion_id,
                 "object": "chat.completion.chunk",
@@ -114,10 +118,12 @@ class OpenAIHandler(BaseHTTPRequestHandler):
             }
         )
         for token_id in engine.generate_chat_tokens(messages, max_tokens=max_tokens, temperature=temperature):
+            if not client_open:
+                continue
             content = engine.tokenizer.decode_token(token_id)
             if not content:
                 continue
-            self._write_sse(
+            client_open = self._try_write_sse(
                 {
                     "id": completion_id,
                     "object": "chat.completion.chunk",
@@ -126,17 +132,18 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                     "choices": [{"index": 0, "delta": {"content": content}, "finish_reason": None}],
                 }
             )
-        self._write_sse(
-            {
-                "id": completion_id,
-                "object": "chat.completion.chunk",
-                "created": created,
-                "model": engine.model_id,
-                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-            }
-        )
-        self.wfile.write(b"data: [DONE]\n\n")
-        self.wfile.flush()
+        if client_open:
+            client_open = self._try_write_sse(
+                {
+                    "id": completion_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": engine.model_id,
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                }
+            )
+        if client_open:
+            self._try_write_done()
         self.close_connection = True
 
     def _send_json(self, payload: dict[str, object], *, status: int = 200) -> None:
@@ -154,6 +161,23 @@ class OpenAIHandler(BaseHTTPRequestHandler):
             + b"\n\n"
         )
         self.wfile.flush()
+
+    def _try_write_sse(self, payload: dict[str, object]) -> bool:
+        try:
+            self._write_sse(payload)
+            return True
+        except OSError:
+            self.close_connection = True
+            return False
+
+    def _try_write_done(self) -> bool:
+        try:
+            self.wfile.write(b"data: [DONE]\n\n")
+            self.wfile.flush()
+            return True
+        except OSError:
+            self.close_connection = True
+            return False
 
 
 def enable_tcp_nodelay(connection: object) -> None:

@@ -20,6 +20,7 @@ from torchinferno.openai_server import (
     _TransformersChatTokenizer,
     _distributed_server_command,
     _should_reexec_distributed_server,
+    _tensor_parallel_worker_loop,
     _warmup_prefill_cache_token_counts,
     _warmup_prompt_token_counts,
     _warmup_prefix_suffix_cache_token_counts,
@@ -166,6 +167,7 @@ def test_openai_temperature_warmup_uses_configured_batch_size(monkeypatch) -> No
     monkeypatch.setenv("TORCHINFERNO_OPENAI_WARMUP_TEMPERATURE_BATCH_SIZES", "3")
     monkeypatch.setenv("TORCHINFERNO_OPENAI_WARMUP_TEMPERATURE_PROMPT_TOKEN_BUCKETS", "2")
     monkeypatch.setenv("TORCHINFERNO_OPENAI_WARMUP_PREFILL_CACHE_TOKENS", "4")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_CUDAGRAPH_DECODE_STEP", "1")
 
     model = _WarmupShapeModel()
     engine = object.__new__(OpenAICompletionEngine)
@@ -200,6 +202,138 @@ def test_chat_template_batch_encoding_input_ids_are_extracted() -> None:
     encoded = tokenizer.encode_messages([{"role": "user", "content": "hello"}])
 
     assert encoded == [7, 8, 9]
+
+
+def test_transformers_chat_tokenizer_stops_on_llama_eot() -> None:
+    tokenizer = _TransformersChatTokenizer(_LlamaStyleTokenizer())
+
+    assert 128001 in tokenizer.stop_token_ids
+    assert 128009 in tokenizer.stop_token_ids
+
+
+def test_openai_engine_stops_generation_on_chat_terminator() -> None:
+    model = _ScriptedTokenModel([2, 9, 3], vocab_size=16)
+    engine = OpenAICompletionEngine(
+        model,
+        _StopTokenTokenizer(),
+        model_id="tiny",
+        device=torch.device("cpu"),
+        max_batch_size=1,
+        batch_wait_ms=0.0,
+    )
+    try:
+        tokens = list(
+            engine.generate_chat_tokens(
+                [{"role": "user", "content": "stop"}],
+                max_tokens=5,
+                temperature=0.0,
+            )
+        )
+    finally:
+        engine.close()
+
+    assert tokens == [2, 9]
+    assert len(model.calls) == 2
+
+
+def test_openai_engine_drains_tensor_parallel_direct_generator_on_close(monkeypatch) -> None:
+    monkeypatch.setattr("torchinferno.openai_server._is_tensor_parallel_primary_model", lambda model: True)
+    model = _ScriptedTokenModel([2, 3, 4], vocab_size=16)
+    engine = OpenAICompletionEngine(
+        model,
+        _ByteFallbackTokenizer(vocab_size=16),
+        model_id="tiny",
+        device=torch.device("cpu"),
+        max_batch_size=1,
+        batch_wait_ms=0.0,
+    )
+    engine.single_request_fast_path = True
+    try:
+        generator = engine.generate_chat_tokens(
+            [{"role": "user", "content": "close"}],
+            max_tokens=3,
+            temperature=0.0,
+        )
+        assert next(generator) == 2
+        generator.close()
+    finally:
+        engine.close()
+
+    assert len(model.calls) == 3
+
+
+def test_openai_engine_tensor_parallel_primary_queues_single_stream_request(monkeypatch) -> None:
+    monkeypatch.setattr("torchinferno.openai_server._is_tensor_parallel_primary_model", lambda model: True)
+    model = _BatchRecordingModel()
+    engine = OpenAICompletionEngine(
+        model,
+        _ByteFallbackTokenizer(vocab_size=8),
+        model_id="tiny",
+        device=torch.device("cpu"),
+        max_batch_size=4,
+        batch_wait_ms=0.0,
+    )
+    try:
+        tokens = list(
+            engine.generate_chat_tokens(
+                [{"role": "user", "content": "single"}],
+                max_tokens=2,
+                temperature=0.0,
+            )
+        )
+    finally:
+        engine.close()
+
+    assert engine.single_request_fast_path is False
+    assert tokens == [2, 2]
+    assert model.calls[0][0] == 1
+    assert model.calls[0][2] == "torchinferno-openai-batcher"
+
+
+def test_tensor_parallel_worker_loop_disables_single_prefix_cache(monkeypatch) -> None:
+    import torch.distributed as dist
+
+    commands: list[dict[str, object]] = [
+        {
+            "op": "generate",
+            "input_ids": [[1, 2, 3]],
+            "max_tokens": 1,
+            "temperature": 0.0,
+            "stream": True,
+        },
+        {"op": "stop"},
+    ]
+
+    def broadcast_object_list(payload: list[object], *, src: int) -> None:
+        del src
+        payload[0] = commands.pop(0)
+
+    monkeypatch.setattr(dist, "is_available", lambda: True)
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(dist, "broadcast_object_list", broadcast_object_list)
+
+    engine = _WorkerLoopRecordingEngine()
+
+    _tensor_parallel_worker_loop(engine)
+
+    assert engine.single_calls == [([[1, 2, 3]], 1, 0.0, False, False)]
+
+
+def test_openai_stream_disconnect_drains_generation() -> None:
+    engine = _DrainRecordingEngine()
+    handler = object.__new__(OpenAIHandler)
+    handler.server = type("Server", (), {"engine": engine})()
+    handler.wfile = _FailingWriter(fail_on_call=2)
+    handler.close_connection = False
+    handler.send_response = lambda status: None
+    handler.send_header = lambda key, value: None
+    handler.end_headers = lambda: None
+
+    handler._stream_chat([{"role": "user", "content": "hi"}], max_tokens=3, temperature=0.0)
+
+    assert engine.drained_tokens == [1, 2, 3]
+    assert handler.close_connection is True
+    assert handler.wfile.write_calls == 2
 
 
 def test_openai_engine_microbatches_same_shape_requests() -> None:
@@ -514,6 +648,125 @@ def test_openai_engine_uses_prefill_graph_for_prefix_suffix(monkeypatch) -> None
     assert model.forward_inputs == []
 
 
+def test_openai_engine_skips_runtime_prefill_graph_capture_on_miss() -> None:
+    model = _RuntimePrefillGraphCaptureModel()
+    engine = OpenAICompletionEngine(
+        model,
+        _ByteFallbackTokenizer(vocab_size=16),
+        model_id="tiny",
+        device=torch.device("cpu"),
+        max_batch_size=1,
+        batch_wait_ms=0.0,
+    )
+    try:
+        tokens = list(
+            engine.generate_chat_tokens(
+                [{"role": "user", "content": "graph miss"}],
+                max_tokens=1,
+                temperature=0.0,
+            )
+        )
+    finally:
+        engine.close()
+
+    assert tokens == [2]
+    assert model.capture_flags == [False]
+    assert model.graph_inputs == []
+    assert model.forward_inputs
+
+
+def test_openai_engine_uses_decode_graph_by_default() -> None:
+    model = _DecodeGraphRecordingModel()
+    engine = OpenAICompletionEngine(
+        model,
+        _ByteFallbackTokenizer(vocab_size=16),
+        model_id="tiny",
+        device=torch.device("cpu"),
+        max_batch_size=1,
+        batch_wait_ms=0.0,
+    )
+    try:
+        tokens = list(
+            engine.generate_chat_tokens(
+                [{"role": "user", "content": "decode graph"}],
+                max_tokens=2,
+                temperature=0.0,
+            )
+        )
+    finally:
+        engine.close()
+
+    assert tokens == [2, 3]
+    assert model.decode_graph_calls == 1
+
+
+def test_openai_engine_decode_graph_can_be_disabled(monkeypatch) -> None:
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_CUDAGRAPH_DECODE_STEP", "0")
+    model = _DecodeGraphRecordingModel()
+    engine = OpenAICompletionEngine(
+        model,
+        _ByteFallbackTokenizer(vocab_size=16),
+        model_id="tiny",
+        device=torch.device("cpu"),
+        max_batch_size=1,
+        batch_wait_ms=0.0,
+    )
+    try:
+        tokens = list(
+            engine.generate_chat_tokens(
+                [{"role": "user", "content": "decode graph"}],
+                max_tokens=2,
+                temperature=0.0,
+            )
+        )
+    finally:
+        engine.close()
+
+    assert tokens == [2, 2]
+    assert model.decode_graph_calls == 0
+
+
+def test_openai_engine_batches_shared_prefix_suffixes(monkeypatch) -> None:
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_PREFIX_CACHE_MIN_TOKENS", "2")
+    model = _SharedPrefixRecordingModel()
+    tokenizer = _SharedPrefixTokenizer(parties=2)
+    engine = OpenAICompletionEngine(
+        model,
+        tokenizer,
+        model_id="tiny",
+        device=torch.device("cpu"),
+        max_batch_size=4,
+        batch_wait_ms=50.0,
+    )
+    barrier = threading.Barrier(3)
+    results: list[list[int] | None] = [None, None]
+
+    def run(index: int, content: str) -> None:
+        barrier.wait()
+        results[index] = list(
+            engine.generate_chat_tokens(
+                [{"role": "user", "content": content}],
+                max_tokens=1,
+                temperature=0.0,
+            )
+        )
+
+    threads = [
+        threading.Thread(target=run, args=(0, "left")),
+        threading.Thread(target=run, args=(1, "right")),
+    ]
+    for thread in threads:
+        thread.start()
+    barrier.wait()
+    for thread in threads:
+        thread.join(timeout=10)
+    engine.close()
+
+    assert results == [[2], [2]]
+    assert model.forward_inputs[0] == [[10, 11]]
+    assert sorted(model.forward_inputs[1]) == [[12], [13]]
+
+
 def test_openai_microbench_cli_runs_synthetic_cases() -> None:
     root = Path(__file__).resolve().parents[1]
     env = {**os.environ, "PYTHONPATH": "src"}
@@ -561,6 +814,33 @@ class _BatchEncodingTokenizer:
 
     def decode(self, token_ids: list[int], *, skip_special_tokens: bool) -> str:
         return "".join(str(token_id) for token_id in token_ids)
+
+
+class _LlamaStyleTokenizer(_BatchEncodingTokenizer):
+    eos_token_id = 128001
+    vocab_size = 128000
+    all_special_tokens = ("<|end_of_text|>", "<|eot_id|>")
+
+    def convert_tokens_to_ids(self, token: str) -> int:
+        if token == "<|end_of_text|>":
+            return 128001
+        if token == "<|eot_id|>":
+            return 128009
+        return 0
+
+
+class _StopTokenTokenizer:
+    eos_token_id = 0
+    stop_token_ids = (0, 9)
+
+    def encode_messages(self, messages: list[dict[str, object]]) -> list[int]:
+        return [1]
+
+    def decode_token(self, token_id: int) -> str:
+        return "" if token_id in self.stop_token_ids else str(token_id)
+
+    def decode(self, token_ids: list[int]) -> str:
+        return "".join(self.decode_token(token_id) for token_id in token_ids)
 
 
 class _BarrierByteFallbackTokenizer(_ByteFallbackTokenizer):
@@ -621,6 +901,59 @@ class _BatchRecordingModel:
         return logits, cache
 
 
+class _WorkerLoopRecordingEngine:
+    def __init__(self) -> None:
+        self.device = torch.device("cpu")
+        self.single_calls: list[tuple[list[list[int]], int, float, bool, bool]] = []
+
+    def _generate_single_tokens(
+        self,
+        input_ids: torch.Tensor,
+        *,
+        max_tokens: int,
+        temperature: float,
+        broadcast_tensor_parallel: bool,
+        update_prefix_cache: bool = True,
+    ):
+        self.single_calls.append(
+            (
+                [[int(token_id) for token_id in row.tolist()] for row in input_ids],
+                max_tokens,
+                temperature,
+                broadcast_tensor_parallel,
+                update_prefix_cache,
+            )
+        )
+        yield 2
+
+
+class _ScriptedTokenModel:
+    def __init__(self, tokens: list[int], *, vocab_size: int) -> None:
+        self.config = type("Config", (), {"vocab_size": vocab_size})()
+        self.tokens = tokens
+        self.calls: list[tuple[int, int]] = []
+
+    def allocate_cache(self, batch_size: int, max_seq_len: int, **kwargs) -> _BatchRecordingCache:
+        return _BatchRecordingCache()
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        *,
+        cache: _BatchRecordingCache,
+        use_cache: bool,
+        return_last_logits_only: bool = False,
+    ):
+        del use_cache
+        self.calls.append((input_ids.size(0), input_ids.size(1)))
+        cache.seq_len += input_ids.size(1)
+        token = self.tokens[min(len(self.calls) - 1, len(self.tokens) - 1)]
+        tokens = 1 if return_last_logits_only else input_ids.size(1)
+        logits = torch.zeros(input_ids.size(0), tokens, self.config.vocab_size)
+        logits[..., token] = 1.0
+        return logits, cache
+
+
 class _WarmupShapeCache:
     def __init__(self) -> None:
         self.seq_len = 0
@@ -646,6 +979,7 @@ class _WarmupShapeModel:
 
 class _PrefixTokenizer:
     eos_token_id = 0
+    stop_token_ids: frozenset[int] = frozenset()
 
     def encode_messages(self, messages: list[dict[str, object]]) -> list[int]:
         content = str(messages[-1]["content"])
@@ -653,6 +987,29 @@ class _PrefixTokenizer:
             return [10, 11]
         if content == "second":
             return [10, 11, 2, 12]
+        raise AssertionError(f"unexpected message content: {content}")
+
+    def decode_token(self, token_id: int) -> str:
+        return "A" if token_id == 2 else ""
+
+    def decode(self, token_ids: list[int]) -> str:
+        return "".join(self.decode_token(token_id) for token_id in token_ids)
+
+
+class _SharedPrefixTokenizer:
+    eos_token_id = 0
+    stop_token_ids: frozenset[int] = frozenset()
+
+    def __init__(self, *, parties: int) -> None:
+        self.barrier = threading.Barrier(parties)
+
+    def encode_messages(self, messages: list[dict[str, object]]) -> list[int]:
+        self.barrier.wait(timeout=5)
+        content = str(messages[-1]["content"])
+        if content == "left":
+            return [10, 11, 12]
+        if content == "right":
+            return [10, 11, 13]
         raise AssertionError(f"unexpected message content: {content}")
 
     def decode_token(self, token_id: int) -> str:
@@ -731,6 +1088,75 @@ class _PrefixGraphRecordingModel(_PrefixRecordingModel):
         return torch.tensor([2], dtype=torch.long)
 
 
+class _RuntimePrefillGraphCaptureModel(_PrefixRecordingModel):
+    def __init__(self) -> None:
+        super().__init__()
+        self.capture_flags: list[bool] = []
+        self.graph_inputs: list[list[int]] = []
+
+    def try_prefill_graph(
+        self,
+        input_ids: torch.Tensor,
+        cache: _PrefixRecordingCache,
+        *,
+        temperature: float = 0.0,
+        capture_on_miss: bool = True,
+    ) -> torch.Tensor | None:
+        del temperature, cache
+        self.capture_flags.append(capture_on_miss)
+        if not capture_on_miss:
+            return None
+        self.graph_inputs.append([int(token_id) for token_id in input_ids[0].tolist()])
+        return torch.tensor([2], dtype=torch.long)
+
+
+class _DecodeGraphRecordingModel(_PrefixRecordingModel):
+    def __init__(self) -> None:
+        super().__init__()
+        self.decode_graph_calls = 0
+
+    def try_decode_one_token_graph(
+        self,
+        input_ids: torch.Tensor,
+        cache: _PrefixRecordingCache,
+        *,
+        temperature: float = 0.0,
+    ) -> torch.Tensor:
+        del input_ids, cache, temperature
+        self.decode_graph_calls += 1
+        return torch.tensor([3], dtype=torch.long)
+
+
+class _SharedPrefixRecordingModel:
+    def __init__(self) -> None:
+        self.config = type("Config", (), {"vocab_size": 16})()
+        self.forward_inputs: list[list[list[int]]] = []
+
+    def allocate_cache(self, batch_size: int, max_seq_len: int, **kwargs) -> _PrefixRecordingCache:
+        return _PrefixRecordingCache(batch_size, max_seq_len)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        *,
+        cache: _PrefixRecordingCache,
+        use_cache: bool,
+        return_last_logits_only: bool = False,
+    ):
+        del use_cache
+        self.forward_inputs.append([[int(token_id) for token_id in row.tolist()] for row in input_ids])
+        layer = cache.layers[0]
+        start = layer.seq_len
+        end = start + input_ids.size(1)
+        layer.keys[: input_ids.size(0), :, start:end, :].fill_(1)
+        layer.values[: input_ids.size(0), :, start:end, :].fill_(1)
+        layer.seq_len = end
+        tokens = 1 if return_last_logits_only else input_ids.size(1)
+        logits = torch.zeros(input_ids.size(0), tokens, self.config.vocab_size)
+        logits[..., 2] = 1.0
+        return logits, cache
+
+
 class _NoBatchStepEngine(OpenAICompletionEngine):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -754,6 +1180,43 @@ class _CountingWriter:
 
     def flush(self) -> None:
         self.flush_calls += 1
+
+
+class _FailingWriter:
+    def __init__(self, *, fail_on_call: int) -> None:
+        self.fail_on_call = fail_on_call
+        self.write_calls = 0
+        self.payload = b""
+
+    def write(self, payload: bytes) -> int:
+        self.write_calls += 1
+        if self.write_calls >= self.fail_on_call:
+            raise BrokenPipeError("client disconnected")
+        self.payload += payload
+        return len(payload)
+
+    def flush(self) -> None:
+        return
+
+
+class _DrainRecordingEngine:
+    model_id = "tiny"
+    tokenizer = _ByteFallbackTokenizer(vocab_size=16)
+
+    def __init__(self) -> None:
+        self.drained_tokens: list[int] = []
+
+    def generate_chat_tokens(
+        self,
+        messages: list[dict[str, object]],
+        *,
+        max_tokens: int,
+        temperature: float,
+    ):
+        del messages, temperature
+        for token_id in range(1, max_tokens + 1):
+            self.drained_tokens.append(token_id)
+            yield token_id
 
 
 class _FakeSocket:

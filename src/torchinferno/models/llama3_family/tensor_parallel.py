@@ -1340,6 +1340,7 @@ class Llama3TensorParallelForCausalLM:
         cache: Llama3TensorParallelCache,
         *,
         temperature: float = 0.0,
+        capture_on_miss: bool = True,
     ) -> Tensor | None:
         if (
             not _tp_env_set("TORCHINFERNO_CUDAGRAPH_PREFILL")
@@ -1349,7 +1350,7 @@ class Llama3TensorParallelForCausalLM:
         if self._prefill_graph_failed or not _should_use_prefill_graph(input_ids, cache, temperature):
             return None
         try:
-            return self._run_prefill_graph(input_ids, cache)
+            return self._run_prefill_graph(input_ids, cache, capture_on_miss=capture_on_miss)
         except Exception as exc:
             warn_optional_failure("llama3_tensor_parallel.prefill_graph", exc)
             if _tp_flag("TORCHINFERNO_CUDAGRAPH_PREFILL_DEBUG", False):
@@ -1361,11 +1362,13 @@ class Llama3TensorParallelForCausalLM:
         self,
         input_ids: Tensor,
         cache: Llama3TensorParallelCache,
+        *,
+        capture_on_miss: bool = True,
     ) -> Tensor | None:
         if self._prefill_logits_graph_failed or not _should_use_prefill_logits_graph(input_ids, cache):
             return None
         try:
-            return self._run_prefill_logits_graph(input_ids, cache)
+            return self._run_prefill_logits_graph(input_ids, cache, capture_on_miss=capture_on_miss)
         except Exception as exc:
             warn_optional_failure("llama3_tensor_parallel.prefill_logits_graph", exc)
             if _tp_flag("TORCHINFERNO_CUDAGRAPH_PREFILL_DEBUG", False):
@@ -1373,7 +1376,13 @@ class Llama3TensorParallelForCausalLM:
             self._prefill_logits_graph_failed = True
             return None
 
-    def _run_prefill_graph(self, input_ids: Tensor, cache: Llama3TensorParallelCache) -> Tensor:
+    def _run_prefill_graph(
+        self,
+        input_ids: Tensor,
+        cache: Llama3TensorParallelCache,
+        *,
+        capture_on_miss: bool = True,
+    ) -> Tensor | None:
         initial_seq_len = cache.seq_len
         end_seq_len = initial_seq_len + input_ids.size(1)
         if end_seq_len > cache.layers[0].max_seq_len:
@@ -1394,6 +1403,8 @@ class Llama3TensorParallelForCausalLM:
             or captured.max_seq_len != cache.layers[0].max_seq_len
             or captured.static_input_ids.shape != input_ids.shape
         ):
+            if not capture_on_miss:
+                return None
             captured = self._capture_prefill_graph(input_ids, cache)
             max_graphs = _tp_int("TORCHINFERNO_CUDAGRAPH_PREFILL_MAX_GRAPHS", 128, minimum=1)
             if key not in self._prefill_graphs and len(self._prefill_graphs) >= max_graphs:
@@ -1439,7 +1450,13 @@ class Llama3TensorParallelForCausalLM:
         self._set_cache_seq_len(cache, end_seq_len)
         return captured
 
-    def _run_prefill_logits_graph(self, input_ids: Tensor, cache: Llama3TensorParallelCache) -> Tensor:
+    def _run_prefill_logits_graph(
+        self,
+        input_ids: Tensor,
+        cache: Llama3TensorParallelCache,
+        *,
+        capture_on_miss: bool = True,
+    ) -> Tensor | None:
         initial_seq_len = cache.seq_len
         end_seq_len = initial_seq_len + input_ids.size(1)
         if end_seq_len > cache.layers[0].max_seq_len:
@@ -1460,6 +1477,8 @@ class Llama3TensorParallelForCausalLM:
             or captured.max_seq_len != cache.layers[0].max_seq_len
             or captured.static_input_ids.shape != input_ids.shape
         ):
+            if not capture_on_miss:
+                return None
             captured = self._capture_prefill_logits_graph(input_ids, cache)
             max_graphs = _tp_int("TORCHINFERNO_CUDAGRAPH_PREFILL_MAX_GRAPHS", 128, minimum=1)
             if key not in self._prefill_logits_graphs and len(self._prefill_logits_graphs) >= max_graphs:
@@ -1621,7 +1640,7 @@ class Llama3TensorParallelForCausalLM:
             captured.output_token = self._sample_next_token(logits[:, -1, :], 0.0)
         captured.graph.replay()
         key = (id(cache), input_ids.size(0), attention_block_size)
-        max_graphs = _tp_int("TORCHINFERNO_CUDAGRAPH_DECODE_STEP_MAX_GRAPHS", 64, minimum=1)
+        max_graphs = _tp_int("TORCHINFERNO_CUDAGRAPH_DECODE_STEP_MAX_GRAPHS", 4096, minimum=1)
         if key not in self._decode_graphs and len(self._decode_graphs) >= max_graphs:
             self._decode_graphs.clear()
         self._decode_graphs[key] = captured
@@ -1699,7 +1718,7 @@ class Llama3TensorParallelForCausalLM:
             )
         captured.graph.replay()
         key = (id(cache), input_ids.size(0), attention_block_size)
-        max_graphs = _tp_int("TORCHINFERNO_CUDAGRAPH_DECODE_STEP_MAX_GRAPHS", 64, minimum=1)
+        max_graphs = _tp_int("TORCHINFERNO_CUDAGRAPH_DECODE_STEP_MAX_GRAPHS", 4096, minimum=1)
         if key not in self._decode_logits_graphs and len(self._decode_logits_graphs) >= max_graphs:
             self._decode_logits_graphs.clear()
         self._decode_logits_graphs[key] = captured

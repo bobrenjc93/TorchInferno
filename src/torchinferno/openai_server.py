@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import inspect
 import json
 import os
@@ -119,6 +120,7 @@ class _ByteFallbackTokenizer:
 
     def __init__(self, vocab_size: int = 256) -> None:
         self.vocab_size = max(2, vocab_size)
+        self.stop_token_ids: frozenset[int] = frozenset()
 
     def encode_messages(self, messages: list[dict[str, object]]) -> list[int]:
         return self.encode(_format_messages(messages))
@@ -140,6 +142,7 @@ class _TransformersChatTokenizer:
     def __init__(self, tokenizer: object) -> None:
         self.tokenizer = tokenizer
         self.eos_token_id = getattr(tokenizer, "eos_token_id", None)
+        self.stop_token_ids = _chat_stop_token_ids(tokenizer)
 
     def encode_messages(self, messages: list[dict[str, object]]) -> list[int]:
         apply_chat_template = getattr(self.tokenizer, "apply_chat_template", None)
@@ -185,6 +188,64 @@ def load_chat_tokenizer(
         cache_dir=config.cache_dir,
     )
     return _TransformersChatTokenizer(tokenizer)
+
+
+def _chat_stop_token_ids(tokenizer: object) -> frozenset[int]:
+    token_ids: set[int] = set()
+    eos_token_id = getattr(tokenizer, "eos_token_id", None)
+    token_ids.update(_coerce_optional_token_ids(eos_token_id))
+    token_ids.update(_coerce_optional_token_ids(getattr(tokenizer, "eos_token_ids", None)))
+    token_ids.update(_known_chat_terminator_ids(tokenizer))
+    return frozenset(token_ids)
+
+
+def _known_chat_terminator_ids(tokenizer: object) -> set[int]:
+    token_ids: set[int] = set()
+    convert = getattr(tokenizer, "convert_tokens_to_ids", None)
+    if not callable(convert):
+        return token_ids
+    vocab_size = getattr(tokenizer, "vocab_size", None)
+    all_special_ids = _coerce_optional_token_ids(getattr(tokenizer, "all_special_ids", None))
+    for token in ("<|eot_id|>",):
+        try:
+            token_id = convert(token)
+        except Exception:
+            continue
+        for coerced in _coerce_optional_token_ids(token_id):
+            if vocab_size is not None and coerced >= int(vocab_size):
+                token_ids.add(coerced)
+            elif coerced in all_special_ids:
+                token_ids.add(coerced)
+            elif token in getattr(tokenizer, "all_special_tokens", ()):
+                token_ids.add(coerced)
+    return token_ids
+
+
+def _coerce_optional_token_ids(value: object) -> set[int]:
+    if value is None:
+        return set()
+    if isinstance(value, Tensor):
+        value = value.detach().cpu().tolist()
+    elif hasattr(value, "tolist") and not isinstance(value, (list, tuple, set, str, bytes)):
+        value = value.tolist()  # type: ignore[assignment]
+    if isinstance(value, (list, tuple, set)):
+        token_ids: set[int] = set()
+        for item in value:
+            token_ids.update(_coerce_optional_token_ids(item))
+        return token_ids
+    try:
+        token_id = int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return set()
+    if token_id < 0:
+        return set()
+    return {token_id}
+
+
+def _tokenizer_stop_token_ids(tokenizer: object) -> frozenset[int]:
+    token_ids = _coerce_optional_token_ids(getattr(tokenizer, "stop_token_ids", None))
+    token_ids.update(_coerce_optional_token_ids(getattr(tokenizer, "eos_token_id", None)))
+    return frozenset(token_ids)
 
 
 def _coerce_token_ids(encoded: object) -> list[int]:
@@ -243,6 +304,7 @@ def _generated_rows_with_model(
     max_tokens: int,
     temperature: float,
     eos_token_id: int | None,
+    stop_token_ids: frozenset[int],
 ) -> list[list[int]]:
     generated = _generate_with_model(
         model,
@@ -252,13 +314,13 @@ def _generated_rows_with_model(
         eos_token_id=eos_token_id,
     )
     rows = generated[:, input_ids.size(1) :].detach().cpu().tolist()
-    return _trim_rows_at_eos(rows, eos_token_id)
+    return _trim_rows_at_stop(rows, stop_token_ids)
 
 
 def _iter_generated_steps(
     rows: Sequence[Sequence[int]],
     max_tokens: int,
-    eos_token_id: int | None,
+    stop_token_ids: frozenset[int],
 ) -> Iterator[list[int | None]]:
     finished = [False for _ in rows]
     for step in range(max_tokens):
@@ -269,7 +331,7 @@ def _iter_generated_steps(
                 continue
             token_id = int(row[step])
             step_tokens.append(token_id)
-            if eos_token_id is not None and token_id == eos_token_id:
+            if token_id in stop_token_ids:
                 finished[row_index] = True
         if all(token is None for token in step_tokens):
             break
@@ -293,6 +355,7 @@ class OpenAICompletionEngine:
     ) -> None:
         self.model = model
         self.tokenizer = tokenizer
+        self.stop_token_ids = _tokenizer_stop_token_ids(tokenizer)
         self.model_id = model_id
         self.device = device
         self.cache_backend = cache_backend
@@ -313,7 +376,10 @@ class OpenAICompletionEngine:
             )
             / 1000.0
         )
-        self.single_request_fast_path = True
+        # Tensor-parallel workers consume one command stream from rank 0. Keep
+        # rank 0 on the queued path so direct requests cannot interleave with
+        # batched requests in a different order from the worker ranks.
+        self.single_request_fast_path = not _is_tensor_parallel_primary_model(model)
         self._generation_queue: "queue.Queue[_QueuedGeneration | None]" = queue.Queue()
         self._model_lock = threading.Lock()
         self._live_request_condition = threading.Condition()
@@ -586,6 +652,7 @@ class OpenAICompletionEngine:
                 stream=False,
             )
         eos_token_id = self.tokenizer.eos_token_id
+        stop_token_ids = self.stop_token_ids
         model = self.model
         if not _supports_incremental_generation(model):
             return _generated_rows_with_model(
@@ -594,6 +661,7 @@ class OpenAICompletionEngine:
                 max_tokens=max_tokens,
                 temperature=temperature,
                 eos_token_id=eos_token_id,
+                stop_token_ids=stop_token_ids,
             )
 
         cache = self._generation_cache(
@@ -606,23 +674,23 @@ class OpenAICompletionEngine:
         generated_tokens: list[Tensor] = []
         active = (
             torch.ones(input_ids.size(0), dtype=torch.bool, device=self.device)
-            if eos_token_id is not None
+            if stop_token_ids
             else None
         )
         for step in range(max_tokens):
             generated_tokens.append(next_token[:, None])
             if active is not None:
-                active &= next_token != eos_token_id
+                active &= _tokens_not_in_stop(next_token, stop_token_ids)
                 # Keep non-stream decode mostly async; exact output is trimmed after the final transfer.
-                should_check_eos = (step + 1) % 8 == 0 or step + 1 == max_tokens
-                if should_check_eos and not bool(active.any()):
+                should_check_stop = (step + 1) % 8 == 0 or step + 1 == max_tokens
+                if should_check_stop and not bool(active.any()):
                     break
             if step + 1 == max_tokens:
                 break
             next_token, cache = _decode_next_token(model, next_token[:, None], cache, temperature)
             next_token = next_token.to(self.device)
         rows = torch.cat(generated_tokens, dim=1).detach().cpu().tolist()
-        return _trim_rows_at_eos(rows, eos_token_id)
+        return _trim_rows_at_stop(rows, stop_token_ids)
 
     def _generation_cache(
         self,
@@ -829,7 +897,7 @@ class OpenAICompletionEngine:
                 if count > cache_tokens:
                     continue
                 input_ids = (torch.arange(count, device=self.device, dtype=torch.long) % vocab_size)[None, :]
-                _try_prefill_graph(self.model, input_ids, cache, 0.0)
+                _try_prefill_graph(self.model, input_ids, cache, 0.0, allow_capture=True)
                 _reset_generation_cache(cache)
 
     def _warmup_tensor_parallel_prefix_suffix_graphs(self, vocab_size: int) -> None:
@@ -849,7 +917,7 @@ class OpenAICompletionEngine:
                     (torch.arange(suffix_tokens, device=self.device, dtype=torch.long) + prefix_tokens)
                     % vocab_size
                 )[None, :]
-                _try_prefill_graph(self.model, input_ids, cache, 0.0)
+                _try_prefill_graph(self.model, input_ids, cache, 0.0, allow_capture=True)
                 _reset_generation_cache(cache)
 
     def _warmup_tensor_parallel_temperature_graphs(self, vocab_size: int) -> None:
@@ -880,7 +948,7 @@ class OpenAICompletionEngine:
         cache: object,
         batch_size: int,
     ) -> None:
-        logits = _try_prefill_logits_graph(self.model, input_ids, cache)
+        logits = _try_prefill_logits_graph(self.model, input_ids, cache, allow_capture=True)
         if logits is None:
             return
         if logits.size(0) == batch_size:
@@ -939,6 +1007,7 @@ class OpenAICompletionEngine:
             )
             self._mark_phase(phase, "broadcast_done")
         eos_token_id = self.tokenizer.eos_token_id
+        stop_token_ids = self.stop_token_ids
         model = self.model
         if not _supports_incremental_generation(model):
             generated = _generate_with_model(
@@ -951,7 +1020,7 @@ class OpenAICompletionEngine:
             for token in generated[0, input_ids.size(1) :].detach().cpu().tolist():
                 token_id = int(token)
                 yield token_id
-                if eos_token_id is not None and token_id == eos_token_id:
+                if token_id in stop_token_ids:
                     break
             return
 
@@ -989,6 +1058,7 @@ class OpenAICompletionEngine:
             next_token = prefill_token.to(self.device)
             self._mark_phase(phase, "prefill_graph_done")
         generated_tokens: list[int] = []
+        drained_after_close = False
         for step in range(max_tokens):
             if step == 0:
                 self._mark_phase(phase, "first_token_sync_start")
@@ -998,14 +1068,31 @@ class OpenAICompletionEngine:
             if step == 0:
                 self._mark_phase(phase, "first_token_ready")
                 self._record_phase(phase)
-            yield token_id
-            if eos_token_id is not None and token_id == eos_token_id:
+            try:
+                yield token_id
+            except GeneratorExit:
+                if _is_tensor_parallel_primary_model(model):
+                    drained_after_close = True
+                    self._drain_closed_single_generation(
+                        model,
+                        token_tensor,
+                        cache,
+                        temperature,
+                        stop_token_ids,
+                        step,
+                        max_tokens,
+                        generated_tokens,
+                    )
+                    if update_prefix_cache:
+                        self._save_prefix_cache(input_ids, generated_tokens, cache)
+                raise
+            if token_id in stop_token_ids:
                 break
             if step + 1 == max_tokens:
                 break
             next_token, cache = _decode_next_token(model, token_tensor[:, None], cache, temperature)
             next_token = next_token.to(self.device)
-        if update_prefix_cache:
+        if update_prefix_cache and not drained_after_close:
             self._save_prefix_cache(input_ids, generated_tokens, cache)
 
     @torch.inference_mode()
@@ -1036,6 +1123,16 @@ class OpenAICompletionEngine:
             )
             return
         microbatch_size = self._stream_microbatch_size(input_ids.size(0))
+        shared_prefix_tokens = self._shared_prefix_batch_tokens(input_ids)
+        if shared_prefix_tokens > 0:
+            yield from self._generate_shared_prefix_batch_steps(
+                input_ids,
+                prefix_tokens=shared_prefix_tokens,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                microbatch_size=microbatch_size,
+            )
+            return
         if 0 < microbatch_size < input_ids.size(0):
             yield from self._generate_batch_steps_microbatched(
                 input_ids,
@@ -1045,6 +1142,7 @@ class OpenAICompletionEngine:
             )
             return
         eos_token_id = self.tokenizer.eos_token_id
+        stop_token_ids = self.stop_token_ids
         model = self.model
         if not _supports_incremental_generation(model):
             rows = _generated_rows_with_model(
@@ -1053,8 +1151,9 @@ class OpenAICompletionEngine:
                 max_tokens=max_tokens,
                 temperature=temperature,
                 eos_token_id=eos_token_id,
+                stop_token_ids=stop_token_ids,
             )
-            yield from _iter_generated_steps(rows, max_tokens, eos_token_id)
+            yield from _iter_generated_steps(rows, max_tokens, stop_token_ids)
             return
 
         cache = self._generation_cache(
@@ -1074,7 +1173,7 @@ class OpenAICompletionEngine:
                     continue
                 token_id = int(token_id)
                 step_tokens.append(token_id)
-                if eos_token_id is not None and token_id == eos_token_id:
+                if token_id in stop_token_ids:
                     active[row] = False
             yield step_tokens
             if not any(active):
@@ -1092,6 +1191,7 @@ class OpenAICompletionEngine:
         temperature: float,
     ) -> Iterator[list[int | None]]:
         eos_token_id = self.tokenizer.eos_token_id
+        stop_token_ids = self.stop_token_ids
         model = self.model
         if not _supports_incremental_generation(model):
             expanded = input_ids.expand(batch_size, input_ids.size(1)).contiguous()
@@ -1101,8 +1201,9 @@ class OpenAICompletionEngine:
                 max_tokens=max_tokens,
                 temperature=temperature,
                 eos_token_id=eos_token_id,
+                stop_token_ids=stop_token_ids,
             )
-            yield from _iter_generated_steps(rows, max_tokens, eos_token_id)
+            yield from _iter_generated_steps(rows, max_tokens, stop_token_ids)
             return
 
         cache = self._generation_cache(
@@ -1130,7 +1231,7 @@ class OpenAICompletionEngine:
                     continue
                 token_id = int(token_id)
                 step_tokens.append(token_id)
-                if eos_token_id is not None and token_id == eos_token_id:
+                if token_id in stop_token_ids:
                     active[row] = False
             yield step_tokens
             if not any(active):
@@ -1160,7 +1261,7 @@ class OpenAICompletionEngine:
         temperature: float,
         microbatch_size: int,
     ) -> Iterator[list[int | None]]:
-        eos_token_id = self.tokenizer.eos_token_id
+        stop_token_ids = self.stop_token_ids
         model = self.model
         states: list[dict[str, object]] = []
         batch_size = input_ids.size(0)
@@ -1180,7 +1281,7 @@ class OpenAICompletionEngine:
             for offset, token_id in enumerate(next_token.detach().cpu().tolist()):
                 token_id = int(token_id)
                 step_tokens[start + offset] = token_id
-                if eos_token_id is not None and token_id == eos_token_id:
+                if token_id in stop_token_ids:
                     active[offset] = False
             states.append({"start": start, "active": active, "cache": cache, "next_token": next_token})
             yield step_tokens
@@ -1205,8 +1306,173 @@ class OpenAICompletionEngine:
                         continue
                     token_id = int(token_id)
                     step_tokens[start + offset] = token_id
-                    if eos_token_id is not None and token_id == eos_token_id:
+                    if token_id in stop_token_ids:
                         active[offset] = False
+                emitted = True
+                yield step_tokens
+            if not emitted:
+                break
+
+    def _drain_closed_single_generation(
+        self,
+        model: object,
+        token_tensor: Tensor,
+        cache: object,
+        temperature: float,
+        stop_token_ids: frozenset[int],
+        completed_step: int,
+        max_tokens: int,
+        generated_tokens: list[int],
+    ) -> None:
+        token_id = int(token_tensor.item())
+        if token_id in stop_token_ids or completed_step + 1 >= max_tokens:
+            return
+        next_token = token_tensor
+        for _ in range(completed_step + 1, max_tokens):
+            next_token, cache = _decode_next_token(model, next_token[:, None], cache, temperature)
+            next_token = next_token.to(self.device)
+            token_id = int(next_token.item())
+            generated_tokens.append(token_id)
+            if token_id in stop_token_ids:
+                break
+
+    def _shared_prefix_batch_tokens(self, input_ids: Tensor) -> int:
+        if not env_flag("TORCHINFERNO_OPENAI_SHARED_PREFIX_BATCH", True):
+            return 0
+        if input_ids.size(0) <= 1 or input_ids.size(1) <= 1:
+            return 0
+        prefix_tokens = min(_common_prefix_token_count(input_ids), input_ids.size(1) - 1)
+        min_tokens = env_int("TORCHINFERNO_OPENAI_PREFIX_CACHE_MIN_TOKENS", 16, minimum=1)
+        return prefix_tokens if prefix_tokens >= min_tokens else 0
+
+    @torch.inference_mode()
+    def _generate_shared_prefix_batch_steps(
+        self,
+        input_ids: Tensor,
+        *,
+        prefix_tokens: int,
+        max_tokens: int,
+        temperature: float,
+        microbatch_size: int,
+    ) -> Iterator[list[int | None]]:
+        stop_token_ids = self.stop_token_ids
+        model = self.model
+        if not _supports_incremental_generation(model):
+            rows = _generated_rows_with_model(
+                model,
+                input_ids,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                eos_token_id=self.tokenizer.eos_token_id,
+                stop_token_ids=stop_token_ids,
+            )
+            yield from _iter_generated_steps(rows, max_tokens, stop_token_ids)
+            return
+
+        batch_size = input_ids.size(0)
+        cache = self._generation_cache(
+            batch_size,
+            input_ids.size(1) + max_tokens,
+            model=model,
+        )
+        cache = _prefill_cache_only(model, input_ids[:1, :prefix_tokens], cache)
+        _repeat_generation_cache_first_batch(cache, batch_size)
+        next_token, cache = _prefill_next_token(model, input_ids[:, prefix_tokens:], cache, temperature)
+        next_token = next_token.to(self.device)
+
+        active = [True for _ in range(batch_size)]
+        step_tokens: list[int | None] = []
+        for row, token_id in enumerate(next_token.detach().cpu().tolist()):
+            token_id = int(token_id)
+            step_tokens.append(token_id)
+            if token_id in stop_token_ids:
+                active[row] = False
+        yield step_tokens
+        if max_tokens <= 1 or not any(active):
+            return
+
+        if 0 < microbatch_size < batch_size:
+            cache_views = [
+                _cache_row_slice(cache, start, min(batch_size, start + microbatch_size))
+                for start in range(0, batch_size, microbatch_size)
+            ]
+            if all(view is not None for view in cache_views):
+                yield from self._decode_shared_prefix_microbatches(
+                    cache_views=[view for view in cache_views if view is not None],
+                    active=active,
+                    batch_size=batch_size,
+                    microbatch_size=microbatch_size,
+                    max_tokens=max_tokens,
+                    next_token=next_token,
+                    temperature=temperature,
+                )
+                return
+
+        for _ in range(1, max_tokens):
+            next_token, cache = _decode_next_token(model, next_token[:, None], cache, temperature)
+            next_token = next_token.to(self.device)
+            token_ids = next_token.detach().cpu().tolist()
+            step_tokens = []
+            for row, token_id in enumerate(token_ids):
+                if not active[row]:
+                    step_tokens.append(None)
+                    continue
+                token_id = int(token_id)
+                step_tokens.append(token_id)
+                if token_id in stop_token_ids:
+                    active[row] = False
+            yield step_tokens
+            if not any(active):
+                break
+
+    def _decode_shared_prefix_microbatches(
+        self,
+        *,
+        cache_views: list[object],
+        active: list[bool],
+        batch_size: int,
+        microbatch_size: int,
+        max_tokens: int,
+        next_token: Tensor,
+        temperature: float,
+    ) -> Iterator[list[int | None]]:
+        stop_token_ids = self.stop_token_ids
+        model = self.model
+        states: list[dict[str, object]] = []
+        for slot, start in enumerate(range(0, batch_size, microbatch_size)):
+            end = min(batch_size, start + microbatch_size)
+            states.append(
+                {
+                    "start": start,
+                    "active": active[start:end],
+                    "cache": cache_views[slot],
+                    "next_token": next_token[start:end].contiguous(),
+                }
+            )
+        for _ in range(1, max_tokens):
+            emitted = False
+            for state in states:
+                chunk_active = state["active"]
+                if not isinstance(chunk_active, list) or not any(chunk_active):
+                    continue
+                chunk_token = state["next_token"]
+                cache = state["cache"]
+                if not isinstance(chunk_token, Tensor):
+                    raise RuntimeError("invalid shared-prefix microbatch token state")
+                chunk_token, cache = _decode_next_token(model, chunk_token[:, None], cache, temperature)
+                chunk_token = chunk_token.to(self.device)
+                state["cache"] = cache
+                state["next_token"] = chunk_token
+                start = int(state["start"])
+                step_tokens = [None for _ in range(batch_size)]
+                for offset, token_id in enumerate(chunk_token.detach().cpu().tolist()):
+                    if not chunk_active[offset]:
+                        continue
+                    token_id = int(token_id)
+                    step_tokens[start + offset] = token_id
+                    if token_id in stop_token_ids:
+                        chunk_active[offset] = False
+                        active[start + offset] = False
                 emitted = True
                 yield step_tokens
             if not emitted:
@@ -1483,6 +1749,7 @@ def _tensor_parallel_worker_loop(engine: OpenAICompletionEngine) -> None:
                     max_tokens=int(payload["max_tokens"]),
                     temperature=float(payload["temperature"]),
                     broadcast_tensor_parallel=False,
+                    update_prefix_cache=False,
                 ):
                     pass
             else:
@@ -1667,6 +1934,14 @@ def _repeat_generation_cache_first_batch(cache: object, batch_size: int) -> None
             values[:batch_size, :, :seq_len, :].copy_(values[:1, :, :seq_len, :].expand(batch_size, -1, -1, -1))
 
 
+def _prefill_cache_only(model: object, input_ids: Tensor, cache: object) -> object:
+    prefill_logits = _try_prefill_logits_graph(model, input_ids, cache)
+    if prefill_logits is not None:
+        return cache
+    _, cache = _forward(model, input_ids, cache)
+    return cache
+
+
 def _shared_prefix_sample_enabled(temperature: float) -> bool:
     return (
         temperature > 0.0
@@ -1680,12 +1955,56 @@ def _tensor_rows_are_identical(input_ids: Tensor) -> bool:
     return bool(torch.equal(input_ids, input_ids[:1].expand_as(input_ids)))
 
 
+def _common_prefix_token_count(input_ids: Tensor) -> int:
+    if input_ids.size(0) <= 1:
+        return input_ids.size(1)
+    matches = (input_ids == input_ids[:1]).all(dim=0)
+    mismatch = torch.nonzero(~matches, as_tuple=False)
+    if mismatch.numel() == 0:
+        return input_ids.size(1)
+    return int(mismatch[0].item())
+
+
+def _cache_row_slice(cache: object, start: int, end: int) -> object | None:
+    if end <= start:
+        return None
+    layers = tuple(getattr(cache, "layers", ()) or ())
+    if not layers:
+        return None
+    sliced_layers = []
+    for layer in layers:
+        keys = getattr(layer, "keys", None)
+        values = getattr(layer, "values", None)
+        if not isinstance(keys, Tensor) or not isinstance(values, Tensor):
+            return None
+        if keys.size(0) < end or values.size(0) < end:
+            return None
+        layer_view = copy.copy(layer)
+        layer_view.keys = keys[start:end]
+        layer_view.values = values[start:end]
+        if hasattr(layer_view, "batch_size"):
+            layer_view.batch_size = end - start
+        sliced_layers.append(layer_view)
+    cache_view = copy.copy(cache)
+    cache_view.layers = sliced_layers
+    return cache_view
+
+
+def _tokens_not_in_stop(tokens: Tensor, stop_token_ids: frozenset[int]) -> Tensor:
+    active = torch.ones(tokens.shape, dtype=torch.bool, device=tokens.device)
+    for token_id in stop_token_ids:
+        active &= tokens != token_id
+    return active
+
+
 def _try_decode_one_token_graph(
     model: object,
     input_ids: Tensor,
     cache: object,
     temperature: float,
 ) -> Tensor | None:
+    if not _openai_decode_graph_enabled():
+        return None
     decode_graph = getattr(model, "try_decode_one_token_graph", None)
     if decode_graph is None:
         return None
@@ -1697,10 +2016,16 @@ def _try_decode_one_token_logits_graph(
     input_ids: Tensor,
     cache: object,
 ) -> Tensor | None:
+    if not _openai_decode_graph_enabled():
+        return None
     decode_graph = getattr(model, "try_decode_one_token_logits_graph", None)
     if decode_graph is None:
         return None
     return decode_graph(input_ids, cache)
+
+
+def _openai_decode_graph_enabled() -> bool:
+    return env_flag("TORCHINFERNO_OPENAI_CUDAGRAPH_DECODE_STEP", True)
 
 
 def _try_prefill_graph(
@@ -1708,10 +2033,14 @@ def _try_prefill_graph(
     input_ids: Tensor,
     cache: object,
     temperature: float,
+    *,
+    allow_capture: bool = False,
 ) -> Tensor | None:
     prefill_graph = getattr(model, "try_prefill_graph", None)
     if prefill_graph is None:
         return None
+    if _callable_accepts_keyword(prefill_graph, "capture_on_miss"):
+        return prefill_graph(input_ids, cache, temperature=temperature, capture_on_miss=allow_capture)
     return prefill_graph(input_ids, cache, temperature=temperature)
 
 
@@ -1719,11 +2048,22 @@ def _try_prefill_logits_graph(
     model: object,
     input_ids: Tensor,
     cache: object,
+    *,
+    allow_capture: bool = False,
 ) -> Tensor | None:
     prefill_graph = getattr(model, "try_prefill_logits_graph", None)
     if prefill_graph is None:
         return None
+    if _callable_accepts_keyword(prefill_graph, "capture_on_miss"):
+        return prefill_graph(input_ids, cache, capture_on_miss=allow_capture)
     return prefill_graph(input_ids, cache)
+
+
+def _callable_accepts_keyword(callable_obj: object, keyword: str) -> bool:
+    try:
+        return keyword in inspect.signature(callable_obj).parameters
+    except (TypeError, ValueError):
+        return False
 
 
 @lru_cache(maxsize=None)
@@ -1738,14 +2078,14 @@ def _sample(model: object, logits: Tensor, temperature: float) -> Tensor:
     return sample_next_token(logits, temperature)
 
 
-def _trim_rows_at_eos(rows: Sequence[Sequence[int]], eos_token_id: int | None) -> list[list[int]]:
+def _trim_rows_at_stop(rows: Sequence[Sequence[int]], stop_token_ids: frozenset[int]) -> list[list[int]]:
     trimmed_rows: list[list[int]] = []
     for row in rows:
         trimmed: list[int] = []
         for token_id in row:
             token = int(token_id)
             trimmed.append(token)
-            if eos_token_id is not None and token == eos_token_id:
+            if token in stop_token_ids:
                 break
         trimmed_rows.append(trimmed)
     return trimmed_rows
