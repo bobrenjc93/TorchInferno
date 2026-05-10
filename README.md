@@ -31,8 +31,8 @@ to grow toward production-grade SOTA inference.
   prefix-hit accounting, shared prefix-page reuse, persistent row-assigned
   paged cache state, and same-shape prefill/decode microbatching.
 - OpenAI-compatible serving with same-shape request microbatching, streaming,
-  accurate prompt/completion token accounting, and a torchrun-backed Llama tensor
-  parallel worker mode.
+  accurate prompt/completion token accounting, shared tensor prefix-cache reuse,
+  and a torchrun-backed Llama tensor parallel worker mode.
 - Deterministic time-sliced virtual GPU simulation.
 - Disaggregated prefill/decode planner with network latency modeling.
 - Agent-editable standalone prefill/decode rank files with local JSON-RPC
@@ -42,7 +42,8 @@ to grow toward production-grade SOTA inference.
 - Paged KV cache allocator integrated into native DeepSeek decode and available
   as a standalone kernel workbench.
 - Functional paged causal attention reference for kernel replacement work.
-- Radix/prefix tree, prefix-aware router, and prefix cache lookup.
+- Radix/prefix tree, prefix-aware router, prefix cache lookup, and tensor KV
+  prefix snapshot/restore helpers.
 - `torch.compile` helper and CLI smoke path.
 - `make_fx` tracing helper with FakeTensorMode support.
 - Pattern-based FX graph pass registry with call-target and multi-node
@@ -178,6 +179,11 @@ Each supported family has an explicit variant ladder:
 - `v1.py`: first fused/cached child of `v0`.
 - `registry.py`: parentage, class path, ops module, status, and notes.
 
+DSv4 and native DeepSeek model constructors accept an optional ops module. The
+variant classes pass `raw_ops` or `fused_ops` at construction time, keeping
+provenance-visible behavior explicit without patching model subtrees after
+initialization.
+
 Current families:
 
 - `dsv4`: compact DeepSeek-style DSv4 harness.
@@ -283,6 +289,13 @@ The native suite writes vLLM-shaped `latency.json`, `throughput.json`, and
 `performance.csv`, so plots and comparisons can read both backends uniformly.
 `batch-size` controls the latency benchmark; throughput and serve use
 `max-concurrency` as the engine batch limit.
+
+The tensor-parallel Llama sampler gathers greedy and temperature samples across
+ranks by default so every worker observes the same token. Set
+`TORCHINFERNO_GREEDY_SAMPLE_GATHER=0` or
+`TORCHINFERNO_TEMPERATURE_SAMPLE_GATHER=0` to use the distributed reduce path;
+set `TORCHINFERNO_TEMPERATURE_SAMPLE_GATHER_STRICT=1` to fail instead of
+falling back if the gather path errors.
 
 ## OpenAI-Compatible Serving
 
@@ -406,7 +419,8 @@ OpenAI serving also has explicit environment knobs for production-shape tuning:
   `TORCHINFERNO_OPENAI_WARMUP_PREFIX_SUFFIX_CACHE_TOKENS`,
   `TORCHINFERNO_OPENAI_WARMUP_TEMPERATURE_PROMPT_TOKEN_BUCKETS`, and
   `TORCHINFERNO_OPENAI_WARMUP_TEMPERATURE_BATCH_SIZES` override graph-warmup
-  shape buckets.
+  shape buckets. Temperature warmup batches cover `1`, `8`, and `16` by
+  default.
 - `TORCHINFERNO_OPENAI_STREAM_MICROBATCH_SIZE`,
   `TORCHINFERNO_OPENAI_SINGLE_ADMISSION_WAIT_MS`, and
   `TORCHINFERNO_OPENAI_TEMPERATURE_ADMISSION_WAIT_MS` tune live request
@@ -414,10 +428,45 @@ OpenAI serving also has explicit environment knobs for production-shape tuning:
 - `TORCHINFERNO_OPENAI_PHASE_TIMINGS=1` records serving phase timings, and
   `TORCHINFERNO_OPENAI_PREFIX_CACHE_SHARED_SAMPLE=1` enables shared-prefix
   cache reuse for temperature sampling.
-- Tensor-parallel Llama serving fast paths also respect
-  `TORCHINFERNO_CUDAGRAPH_PREFILL`, `TORCHINFERNO_CUDAGRAPH_DECODE_STEP`,
-  `TORCHINFERNO_CUDAGRAPH_DECODE_STEP_MAX_BATCH`, and
-  `TORCHINFERNO_TRITON_DECODE_ATTENTION`.
+- Tensor-parallel Llama serving fast paths also respect CUDA graph capture
+  toggles including `TORCHINFERNO_CUDAGRAPH_PREFILL`,
+  `TORCHINFERNO_CUDAGRAPH_PREFILL_MAX_BATCH`,
+  `TORCHINFERNO_CUDAGRAPH_PREFILL_MAX_CACHE_TOKENS`,
+  `TORCHINFERNO_CUDAGRAPH_PREFILL_MAX_GRAPHS`,
+  `TORCHINFERNO_CUDAGRAPH_DECODE_STEP`,
+  `TORCHINFERNO_CUDAGRAPH_DECODE_STEP_MAX_BATCH`,
+  `TORCHINFERNO_CUDAGRAPH_DECODE_STEP_MAX_GRAPHS`,
+  `TORCHINFERNO_CUDAGRAPH_DECODE_ATTENTION_BLOCKS`,
+  `TORCHINFERNO_CUDAGRAPH_QKV_ROTARY`,
+  `TORCHINFERNO_CUDAGRAPH_PREFILL_QKV_ROTARY`,
+  `TORCHINFERNO_CUDAGRAPH_PREFILL_GATE_UP`,
+  `TORCHINFERNO_CUDAGRAPH_ATTENTION_O`,
+  `TORCHINFERNO_CUDAGRAPH_MLP`, `TORCHINFERNO_CUDAGRAPH_ALLREDUCE`,
+  `TORCHINFERNO_CUDAGRAPH_PREFILL_DEBUG`, and
+  `TORCHINFERNO_CUDAGRAPH_DECODE_DEBUG`.
+  `TORCHINFERNO_CUDAGRAPH_DECODE_STEP_MAX_BATCH` defaults to `16`.
+- Tensor-parallel Llama kernel and sampling toggles include
+  `TORCHINFERNO_TRITON_DECODE_ATTENTION`,
+  `TORCHINFERNO_TRITON_GROUPED_DECODE_ATTENTION`,
+  `TORCHINFERNO_TRITON_KV_APPEND`,
+  `TORCHINFERNO_TRITON_DECODE_ROTARY_APPEND`,
+  `TORCHINFERNO_TRITON_ROTARY`,
+  `TORCHINFERNO_TRITON_RMS_NORM`,
+  `TORCHINFERNO_TRITON_DECODE_RMS_NORM`,
+  `TORCHINFERNO_TRITON_DECODE_ADD_RMS_NORM`,
+  `TORCHINFERNO_TRITON_SWIGLU`,
+  `TORCHINFERNO_TRITON_DECODE_SWIGLU`,
+  `TORCHINFERNO_TRITON_STREAMING_DECODE_ATTENTION`,
+  `TORCHINFERNO_TRITON_STREAMING_DECODE_ATTENTION_BLOCK_S`,
+  `TORCHINFERNO_TRITON_GROUPED_DECODE_ATTENTION_WARPS`,
+  `TORCHINFERNO_DECODE_LINEAR_MV`,
+  `TORCHINFERNO_DECODE_TRANSPOSED_WEIGHTS`,
+  `TORCHINFERNO_SYMM_MEM_ALLREDUCE`,
+  `TORCHINFERNO_SYMM_MEM_PREFILL_ALLREDUCE`,
+  `TORCHINFERNO_COMPILE_ROTARY`, `TORCHINFERNO_GREEDY_SAMPLE_GATHER`,
+  `TORCHINFERNO_TEMPERATURE_SAMPLE_GATHER`,
+  `TORCHINFERNO_TEMPERATURE_SAMPLE_GATHER_STRICT`, and
+  `TORCHINFERNO_PROFILE_FAST_PREFILL`.
 - `TORCHINFERNO_OPTIONAL_WARNINGS=1` reports optional fast-path fallbacks once
   instead of silently using the torch fallback.
 
@@ -651,7 +700,9 @@ The runtime package is where simulation-first serving work belongs:
 - `runtime.paged`: page-table-shaped KV cache allocation and materialization.
 - `runtime.paged_attention`: correct torch paged causal attention reference.
 - `runtime.prefix`: radix prefix tree and prefix-aware routing.
-- `runtime.prefix_cache`: prefix cache lookup for reusable KV entries.
+- `runtime.prefix_cache`: prefix cache lookup plus tensor KV snapshot/restore
+  helpers for reusable entries.
+- `runtime.sampling`: shared greedy and temperature sampling helper.
 - `runtime.serving`: token-step continuous serving engine for native DeepSeek
   cache-policy and prefix-aware request experiments.
 - `runtime.traffic`: deterministic request burst/diversity simulation.
@@ -838,7 +889,7 @@ src/torchinferno/
   openai_http.py          HTTP handler and ThreadingHTTPServer wrapper.
   openai_warmup.py        OpenAI serving graph-warmup bucket parsing.
   compiler.py             torch.compile policy helper.
-  cli.py                  CLI smoke runners.
+  cli.py                  CLI smoke, benchmark, validation, and profile runners.
   profiling.py            Whole-run, region, and pattern artifact capture.
   tokenization.py         Tokenizer adapters for text IO.
   validation.py           Known-logit capture and validation.
@@ -866,11 +917,12 @@ src/torchinferno/
   runtime/flex.py         Flex-attention-shaped fallback.
   runtime/offload.py      CPU/device staging profiler for oversized models.
   runtime/options.py      Environment parsing and optional-path warnings.
-  runtime/paged.py        Paged KV cache scaffold.
+  runtime/paged.py        Paged KV cache allocator and materialization.
   runtime/paged_attention.py
                            Paged causal attention reference.
   runtime/prefix.py       Radix prefix and prefix-aware routing.
-  runtime/prefix_cache.py Prefix cache lookup.
+  runtime/prefix_cache.py Prefix cache lookup and tensor KV snapshot/restore.
+  runtime/sampling.py     Shared greedy and temperature token sampling.
   runtime/scheduler.py    Disaggregated prefill/decode planner.
   runtime/serving.py      Token-step continuous serving engine.
   runtime/simulation.py   Time-sliced virtual GPU simulator.
@@ -887,6 +939,8 @@ tests/
                            Text, validation, paged attention, prefix, traffic tests.
   test_performance_specialization.py
                            Triton paged decode, NVFP4, and benchmark tests.
+  test_openai_server.py    OpenAI HTTP serving and engine batching tests.
+  test_openai_warmup.py    OpenAI graph-warmup bucket tests.
   test_serving_engine.py   Native paged-cache serving engine tests.
 AGENTS.md                 Short contribution map for coding agents.
 docs/ROADMAP.md           Feature readiness map and production milestones.
@@ -902,6 +956,8 @@ Implemented as working code and tests:
 - Auto model loading.
 - Tokenizer-backed text generation.
 - Known-logit capture and validation.
+- Shared greedy and temperature sampling across model, serving, offload, and
+  disaggregated paths.
 - One-command profile artifact capture with graph JSON, profiler JSON, memory
   JSON, Chrome trace export, and standalone repro generation.
 - Focused module-region profiling with isolated graphs/profiles/repros.
@@ -918,6 +974,9 @@ Implemented as working code and tests:
 - Agent-editable standalone rank files for executable prefill/decode RPC
   experiments.
 - Token-step continuous serving with same-length prefill/decode batching.
+- OpenAI-compatible HTTP serving with streaming/non-streaming chat completions,
+  same-shape request microbatching, direct and HTTP microbench loops, and
+  auto-launched Llama tensor-parallel workers.
 - Pattern-match graph replacement entry point, including a multi-node
   make_fx/ATen subgraph replacement example.
 - Native DeepSeek dense/paged cache backend selection.
@@ -925,9 +984,11 @@ Implemented as working code and tests:
 - Token-step continuous serving engine with prefix-hit accounting, shared
   prefix-page reuse, persistent row-assigned paged cache state, and same-shape
   prefill/decode microbatching.
-- Radix/prefix-aware routing and prefix cache lookup.
+- Radix/prefix-aware routing, prefix cache lookup, and tensor KV prefix
+  snapshot/restore helpers.
 - Bursty traffic simulation.
-- Piecewise CUDA graph API scaffold.
+- Piecewise CUDA graph runner with static CUDA tensor capture and CPU/eager
+  fallback.
 - Flex-attention-shaped fallback.
 - Auto research harness.
 - Triton CUDA RMSNorm and SwiGLU kernels with torch fallbacks.
@@ -944,7 +1005,8 @@ Still intentionally future work:
   kernels without prefill materialization.
 - Fused MoE/NVFP4 kernels beyond the current correct references and
   decode-focused Triton specialization.
-- Piecewise CUDA graph capture with static device buffers.
+- Decode-shape static buffer planning policies on top of the CUDA graph capture
+  runner.
 - Full production serving scheduler with cancellation and async transport.
 
 ## Development Principles

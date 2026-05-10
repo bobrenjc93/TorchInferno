@@ -18,6 +18,7 @@ The CLI view is `torchinferno audit`.
 | --- | --- | --- |
 | Native DeepSeek-V3.2-style model | integrated | Torch-native config/model/cache/checkpoint path exists. |
 | Model provenance variants | reference | DSv4, DeepSeek-V3.2, and Llama3 have raw/fused v0/v1 ladders and registry lineage. |
+| Eager-vs-optimized logit validation | integrated | `validate-model-variants` compares tiny eager v0 logits against optimized variants with a 1% default tolerance and optional JSON reports. |
 | Checkpoint conversion | integrated | Shape/key audit plus sharded safetensor writer; needs real-weight golden validation. |
 | `torch.compile` | integrated | Shared compile policy and smoke path. |
 | `make_fx` and fake tensors | integrated | FakeTensorMode trace helper and tests. |
@@ -34,6 +35,7 @@ The CLI view is `torchinferno audit`.
 | CPU offload profiling | bridge | Module-at-a-time CPU/device staging records movement overhead separately from compute; decode-cache offload and mmap streaming remain open. |
 | Disaggregated prefill/decode | simulated | Planner models rank assignment and transfer latency. |
 | Graph pattern replacement | bridge | Leaf target swaps plus a multi-node symbolic/make_fx fused-op example exist. |
+| Helion candidate kernels | optional/experimental | `helion-search-fx` and `helion-search-region` enumerate supported FX windows and benchmark generated kernels before production promotion. |
 | NVFP4 graph passes | reference | Quantized tensor contract and graph hook exist; production fused kernel remains open. |
 | Research harness | minimal | Named experiments and metric comparison exist. |
 

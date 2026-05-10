@@ -31,6 +31,7 @@ _COMPILED_ROTATE_LLAMA_FAILED = False
 _SYMM_REDUCE_BUFFERS: dict[tuple[str, int, str, str, tuple[int, ...]], Tensor] = {}
 _SYMM_REDUCE_PROBED: set[tuple[str, int, str, str, tuple[int, ...]]] = set()
 _SYMM_REDUCE_DISABLED = False
+_DEFAULT_DECODE_STEP_MAX_BATCH = 16
 
 
 @dataclass(frozen=True)
@@ -2124,7 +2125,7 @@ def _should_use_decode_step_graph(
         and temperature <= 0.0
         and input_ids.is_cuda
         and input_ids.ndim == 2
-        and 1 <= input_ids.size(0) <= int(os.environ.get("TORCHINFERNO_CUDAGRAPH_DECODE_STEP_MAX_BATCH", "8"))
+        and 1 <= input_ids.size(0) <= _decode_step_max_batch()
         and input_ids.size(1) == 1
         and bool(cache.layers)
         and cache.layers[0].keys.is_cuda
@@ -2139,11 +2140,15 @@ def _should_use_decode_step_logits_graph(
         os.environ.get("TORCHINFERNO_CUDAGRAPH_DECODE_STEP", "1") != "0"
         and input_ids.is_cuda
         and input_ids.ndim == 2
-        and 1 <= input_ids.size(0) <= int(os.environ.get("TORCHINFERNO_CUDAGRAPH_DECODE_STEP_MAX_BATCH", "8"))
+        and 1 <= input_ids.size(0) <= _decode_step_max_batch()
         and input_ids.size(1) == 1
         and bool(cache.layers)
         and cache.layers[0].keys.is_cuda
     )
+
+
+def _decode_step_max_batch() -> int:
+    return int(os.environ.get("TORCHINFERNO_CUDAGRAPH_DECODE_STEP_MAX_BATCH", str(_DEFAULT_DECODE_STEP_MAX_BATCH)))
 
 
 def _should_use_prefill_graph(
