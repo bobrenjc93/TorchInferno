@@ -23,7 +23,6 @@ The CLI view is `torchinferno audit`.
 | `make_fx` and fake tensors | integrated | FakeTensorMode trace helper and tests. |
 | Profile artifact loop | integrated | Whole-run, time-sliced replay, CPU-offload replay, node-id subgraph, and focused-region commands write graph/profile/timeline/memory JSON, Chrome traces, and repro scripts; graph-pattern profiling adds pass reports and reference/optimized comparisons. |
 | Fake process groups | integrated | Deterministic single-process collectives. |
-| Monarch | scaffold | Adapter detects Monarch and falls back to fake world. |
 | Flex attention | bridge | Dispatches to torch flex attention when available, with eager q/k/v fallback. |
 | Piecewise CUDA graphs | bridge | Named runner captures static CUDA tensor inputs and recaptures on shape changes. |
 | Paged attention | integrated | Native DeepSeek paged prefill/decode attends over request page tables with torch/Triton decode fallback. |
@@ -45,8 +44,7 @@ The CLI view is `torchinferno audit`.
    traffic.
 3. Add decode-shape static buffer planning policies on top of the CUDA graph
    capture runner.
-4. Add Monarch-backed distributed execution behind the fake-world interface.
-5. Validate native checkpoint conversion against real production weights with
+4. Validate native checkpoint conversion against real production weights with
    committed logit references.
-6. Apply subgraph captures to production MLA, grouped MoE, and NVFP4 linear
+5. Apply subgraph captures to production MLA, grouped MoE, and NVFP4 linear
    regions with architecture/shape guards.

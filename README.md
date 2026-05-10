@@ -52,7 +52,6 @@ to grow toward production-grade SOTA inference.
   available and keeps an eager fallback.
 - Piecewise CUDA graph runner API with static CUDA tensor capture and CPU/eager
   fallback.
-- Optional Monarch adapter point with fake-world fallback.
 - Bursty traffic simulation for request diversity and latency modeling.
 - Triton CUDA kernels for RMSNorm and SwiGLU activation, with Helion-generated
   candidates evaluated through the research harness before any production swap.
@@ -91,7 +90,6 @@ Without installing the package:
 PYTHONPATH=src python3 -m torchinferno.cli dsv4-smoke --device cpu
 PYTHONPATH=src python3 -m torchinferno.cli audit
 PYTHONPATH=src python3 -m torchinferno.cli deepseek-smoke --device cpu
-PYTHONPATH=src python3 -m torchinferno.cli batch-smoke --device cpu
 PYTHONPATH=src python3 -m torchinferno.cli trace-smoke --device cpu
 PYTHONPATH=src python3 -m torchinferno.cli sim-smoke
 PYTHONPATH=src python3 -m torchinferno.cli traffic-smoke
@@ -586,7 +584,6 @@ keeping the rank files and method contracts intact.
 
 The runtime package is where simulation-first serving work belongs:
 
-- `runtime.batching`: ragged request boundary and continuous batching buckets.
 - `runtime.simulation`: simple virtual GPU time slicing.
 - `runtime.scheduler`: disaggregated prefill/decode planning.
 - `runtime.disagg`: agent-editable rank files and local RPC wrappers for
@@ -601,7 +598,6 @@ The runtime package is where simulation-first serving work belongs:
 - `runtime.traffic`: deterministic request burst/diversity simulation.
 - `runtime.flex`: flex-attention-shaped API with an eager fallback.
 - `runtime.cudagraphs`: named piecewise CUDA graph execution API.
-- `runtime.monarch`: optional Monarch adapter with fake process world fallback.
 
 Example disaggregated simulation:
 
@@ -797,11 +793,9 @@ src/torchinferno/
   models/hf.py            Hugging Face-style config and weights IO.
   graph/export.py         make_fx and FakeTensor tracing helper.
   graph/passes.py         FX graph pass registry and replacement helpers.
-  runtime/batching.py     Ragged request batching harness.
   runtime/cudagraphs.py   Piecewise CUDA graph runner API.
   runtime/fake_dist.py    Fake process groups and collectives.
   runtime/flex.py         Flex-attention-shaped fallback.
-  runtime/monarch.py      Monarch adapter point.
   runtime/offload.py      CPU/device staging profiler for oversized models.
   runtime/paged.py        Paged KV cache scaffold.
   runtime/paged_attention.py
@@ -867,7 +861,6 @@ Implemented as working code and tests:
 - Piecewise CUDA graph API scaffold.
 - Flex-attention-shaped fallback.
 - Auto research harness.
-- Optional Monarch integration point.
 - Triton CUDA RMSNorm and SwiGLU kernels with torch fallbacks.
 - Triton CUDA fused residual-add/RMSNorm/weighted-SwiGLU custom op with torch
   fallback and fake-tensor trace support.
@@ -883,7 +876,6 @@ Still intentionally future work:
 - Fused MoE/NVFP4 kernels beyond the current correct references and
   decode-focused Triton specialization.
 - Piecewise CUDA graph capture with static device buffers.
-- Monarch-backed distributed execution instead of the fake fallback.
 - Full production serving scheduler with cancellation and async transport.
 
 ## Development Principles

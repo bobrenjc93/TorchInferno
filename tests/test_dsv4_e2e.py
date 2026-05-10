@@ -6,7 +6,6 @@ import torch
 
 from torchinferno.models.dsv4 import DSv4Config, DSv4ForCausalLM, tiny_dsv4_config
 from torchinferno.runtime.offload import run_offloaded_generate_recompute, summarize_offload_events
-from torchinferno.runtime.batching import InferenceRequest, run_continuous_batch
 from torchinferno.runtime.simulation import TimeSliceWorkload, TimeSlicedSimulator, VirtualGPU
 
 
@@ -75,23 +74,6 @@ def test_save_and_load_pretrained_round_trip(tmp_path) -> None:
         actual, _ = loaded(input_ids, use_cache=False)
 
     torch.testing.assert_close(actual, expected)
-
-
-def test_continuous_batch_accepts_ragged_requests() -> None:
-    torch.manual_seed(2)
-    config = tiny_dsv4_config(vocab_size=32, max_seq_len=16)
-    model = DSv4ForCausalLM(config).eval()
-    requests = [
-        InferenceRequest("b", (1, 2), 2),
-        InferenceRequest("a", (3, 4, 5), 1),
-    ]
-
-    with torch.inference_mode():
-        results = run_continuous_batch(model, requests, device=torch.device("cpu"))
-
-    assert [result.request_id for result in results] == ["b", "a"]
-    assert len(results[0].tokens) == 4
-    assert len(results[1].tokens) == 4
 
 
 def test_time_sliced_simulator_runs_virtual_ranks() -> None:

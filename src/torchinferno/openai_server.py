@@ -5,16 +5,12 @@ import inspect
 import json
 import os
 import queue
-import socket
 import sys
 import threading
 import time
-import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
 from functools import lru_cache
-from http import HTTPStatus
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Iterable, Iterator, Sequence
 
@@ -27,6 +23,20 @@ from torchinferno.models.llama3_family.pipeline import Llama3PipelineForCausalLM
 from torchinferno.models.llama3_family.tensor_parallel import Llama3TensorParallelForCausalLM
 from torchinferno.models.llama3_family.v0 import Llama3V0ForCausalLM, tiny_llama3_v0_config
 from torchinferno.models.auto import load_model_auto
+from torchinferno.openai_http import (
+    OpenAIHTTPServer as _OpenAIServer,
+    OpenAIHandler as _OpenAIHandler,
+    enable_tcp_nodelay as _enable_tcp_nodelay,
+)
+from torchinferno.openai_warmup import (
+    warmup_prefill_cache_token_counts as _warmup_prefill_cache_token_counts,
+    warmup_prefix_suffix_cache_token_counts as _warmup_prefix_suffix_cache_token_counts,
+    warmup_prefix_suffix_token_counts as _warmup_prefix_suffix_token_counts,
+    warmup_prompt_token_counts as _warmup_prompt_token_counts,
+    warmup_temperature_batch_sizes as _warmup_temperature_batch_sizes,
+    warmup_temperature_prompt_token_counts as _warmup_temperature_prompt_token_counts,
+)
+from torchinferno.runtime.options import env_flag, env_int, warn_optional_failure
 
 
 @dataclass(frozen=True)
@@ -230,7 +240,7 @@ class OpenAICompletionEngine:
         self._cache_pool: dict[tuple[int, int, str, int, str], object] = {}
         self._microbatch_cache_pool: dict[tuple[int, int, int, str, int, str], object] = {}
         self._prefix_cache_entry: _PrefixCacheEntry | None = None
-        self._phase_timing_enabled = os.environ.get("TORCHINFERNO_OPENAI_PHASE_TIMINGS", "0") != "0"
+        self._phase_timing_enabled = env_flag("TORCHINFERNO_OPENAI_PHASE_TIMINGS")
         self._phase_records: list[dict[str, float]] = []
         self._phase_records_lock = threading.Lock()
         self._warmup_tokenizer()
@@ -611,7 +621,7 @@ class OpenAICompletionEngine:
         return cache
 
     def _restore_prefix_cache(self, input_ids: Tensor, cache: object) -> int:
-        if os.environ.get("TORCHINFERNO_OPENAI_PREFIX_CACHE", "1") == "0":
+        if not env_flag("TORCHINFERNO_OPENAI_PREFIX_CACHE", True):
             return 0
         if input_ids.size(0) != 1:
             return 0
@@ -627,7 +637,7 @@ class OpenAICompletionEngine:
         if len(input_tokens) <= len(entry.tokens):
             return 0
         max_prefix = min(len(input_tokens) - 1, len(entry.tokens))
-        min_prefix = max(1, int(os.environ.get("TORCHINFERNO_OPENAI_PREFIX_CACHE_MIN_TOKENS", "16")))
+        min_prefix = env_int("TORCHINFERNO_OPENAI_PREFIX_CACHE_MIN_TOKENS", 16, minimum=1)
         while max_prefix >= min_prefix:
             if input_tokens[:max_prefix] == entry.tokens[:max_prefix]:
                 break
@@ -651,12 +661,12 @@ class OpenAICompletionEngine:
         if hasattr(cache, "seq_len"):
             try:
                 setattr(cache, "seq_len", max_prefix)
-            except Exception:
-                pass
+            except Exception as exc:
+                warn_optional_failure("openai.prefix_cache.seq_len_restore", exc)
         return max_prefix
 
     def _save_prefix_cache(self, input_ids: Tensor, generated_tokens: list[int], cache: object) -> None:
-        if os.environ.get("TORCHINFERNO_OPENAI_PREFIX_CACHE", "1") == "0":
+        if not env_flag("TORCHINFERNO_OPENAI_PREFIX_CACHE", True):
             return
         if input_ids.size(0) != 1 or not generated_tokens:
             return
@@ -664,13 +674,13 @@ class OpenAICompletionEngine:
         if not cache_layers:
             return
         input_tokens = tuple(int(token_id) for token_id in input_ids[0].detach().cpu().tolist())
-        materialize_generated = os.environ.get("TORCHINFERNO_OPENAI_PREFIX_CACHE_MATERIALIZE_GENERATED", "0") != "0"
+        materialize_generated = env_flag("TORCHINFERNO_OPENAI_PREFIX_CACHE_MATERIALIZE_GENERATED")
         tokens = (
             (*input_tokens, *(int(token_id) for token_id in generated_tokens))
             if materialize_generated
             else input_tokens
         )
-        max_tokens = max(1, int(os.environ.get("TORCHINFERNO_OPENAI_PREFIX_CACHE_MAX_TOKENS", "1024")))
+        max_tokens = env_int("TORCHINFERNO_OPENAI_PREFIX_CACHE_MAX_TOKENS", 1024, minimum=1)
         if len(tokens) > max_tokens:
             self._prefix_cache_entry = None
             return
@@ -715,7 +725,7 @@ class OpenAICompletionEngine:
         _forward(self.model, token_tensor, cache)
 
     def _warmup_tokenizer(self) -> None:
-        if os.environ.get("TORCHINFERNO_OPENAI_TOKENIZER_WARMUP", "1") == "0":
+        if not env_flag("TORCHINFERNO_OPENAI_TOKENIZER_WARMUP", True):
             return
         if not isinstance(self.tokenizer, _TransformersChatTokenizer):
             return
@@ -723,19 +733,19 @@ class OpenAICompletionEngine:
             self.tokenizer.encode_messages(
                 [{"role": "user", "content": " ".join(f"tok{idx:02d}" for idx in range(32))}]
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            warn_optional_failure("openai.tokenizer_warmup", exc)
 
     def _warmup_tensor_parallel_model(self) -> None:
-        if os.environ.get("TORCHINFERNO_OPENAI_STARTUP_WARMUP", "1") == "0":
+        if not env_flag("TORCHINFERNO_OPENAI_STARTUP_WARMUP", True):
             return
         if not _is_tensor_parallel_model(self.model) or self.device.type != "cuda":
             return
         if not hasattr(self.model, "generate"):
             return
-        prompt_tokens = max(1, int(os.environ.get("TORCHINFERNO_OPENAI_WARMUP_PROMPT_TOKENS", "32")))
+        prompt_tokens = env_int("TORCHINFERNO_OPENAI_WARMUP_PROMPT_TOKENS", 32, minimum=1)
         prompt_token_counts = _warmup_prompt_token_counts(prompt_tokens)
-        new_tokens = max(1, int(os.environ.get("TORCHINFERNO_OPENAI_WARMUP_NEW_TOKENS", "2")))
+        new_tokens = env_int("TORCHINFERNO_OPENAI_WARMUP_NEW_TOKENS", 2, minimum=1)
         vocab_size = max(1, int(getattr(getattr(self.model, "config", object()), "vocab_size", 1)))
         with torch.inference_mode():
             for count in prompt_token_counts:
@@ -753,7 +763,7 @@ class OpenAICompletionEngine:
             self._warmup_tensor_parallel_temperature_graphs(vocab_size)
             warmup_cache_tokens = max(
                 max(prompt_token_counts) + new_tokens,
-                int(os.environ.get("TORCHINFERNO_OPENAI_WARMUP_CACHE_TOKENS", "256")),
+                env_int("TORCHINFERNO_OPENAI_WARMUP_CACHE_TOKENS", 256, minimum=1),
             )
             self._generation_cache(1, warmup_cache_tokens, model=self.model)
             _warmup_tensor_parallel_decode_attention(self.model)
@@ -764,7 +774,7 @@ class OpenAICompletionEngine:
         prompt_token_counts: Sequence[int],
         vocab_size: int,
     ) -> None:
-        if os.environ.get("TORCHINFERNO_CUDAGRAPH_PREFILL", "1") == "0":
+        if not env_flag("TORCHINFERNO_CUDAGRAPH_PREFILL", True):
             return
         cache_token_counts = _warmup_prefill_cache_token_counts()
         if not cache_token_counts:
@@ -779,7 +789,7 @@ class OpenAICompletionEngine:
                 _reset_generation_cache(cache)
 
     def _warmup_tensor_parallel_prefix_suffix_graphs(self, vocab_size: int) -> None:
-        if os.environ.get("TORCHINFERNO_CUDAGRAPH_PREFILL", "1") == "0":
+        if not env_flag("TORCHINFERNO_CUDAGRAPH_PREFILL", True):
             return
         specs = _warmup_prefix_suffix_token_counts()
         cache_token_counts = _warmup_prefix_suffix_cache_token_counts()
@@ -799,7 +809,7 @@ class OpenAICompletionEngine:
                 _reset_generation_cache(cache)
 
     def _warmup_tensor_parallel_temperature_graphs(self, vocab_size: int) -> None:
-        if os.environ.get("TORCHINFERNO_CUDAGRAPH_PREFILL", "1") == "0":
+        if not env_flag("TORCHINFERNO_CUDAGRAPH_PREFILL", True):
             return
         prompt_counts = _warmup_temperature_prompt_token_counts()
         batch_sizes = _warmup_temperature_batch_sizes()
@@ -1128,7 +1138,7 @@ class OpenAICompletionEngine:
         if raw is not None:
             return max(1, int(raw))
         if _is_tensor_parallel_model(self.model) and self.device.type == "cuda":
-            return max(1, int(os.environ.get("TORCHINFERNO_CUDAGRAPH_DECODE_STEP_MAX_BATCH", "8")))
+            return env_int("TORCHINFERNO_CUDAGRAPH_DECODE_STEP_MAX_BATCH", 8, minimum=1)
         return batch_size
 
     @torch.inference_mode()
@@ -1191,162 +1201,6 @@ class OpenAICompletionEngine:
                 yield step_tokens
             if not emitted:
                 break
-
-
-class _OpenAIHandler(BaseHTTPRequestHandler):
-    server_version = "TorchInfernoOpenAI/0.1"
-
-    def setup(self) -> None:
-        super().setup()
-        _enable_tcp_nodelay(self.connection)
-
-    def do_GET(self) -> None:
-        if self.path == "/health":
-            self._send_json({"status": "ok"})
-            return
-        if self.path == "/v1/models":
-            self._send_json(
-                {
-                    "object": "list",
-                    "data": [
-                        {
-                            "id": self.server.engine.model_id,  # type: ignore[attr-defined]
-                            "object": "model",
-                            "created": int(time.time()),
-                            "owned_by": "torchinferno",
-                        }
-                    ],
-                }
-            )
-            return
-        self.send_error(HTTPStatus.NOT_FOUND, "not found")
-
-    def do_POST(self) -> None:
-        if self.path != "/v1/chat/completions":
-            self.send_error(HTTPStatus.NOT_FOUND, "not found")
-            return
-        try:
-            payload = self._read_json()
-            messages = payload.get("messages")
-            if not isinstance(messages, list):
-                raise ValueError("messages must be a list")
-            max_tokens = int(payload.get("max_tokens", 256))
-            temperature = float(payload.get("temperature", 0.0))
-            stream = bool(payload.get("stream", False))
-            if stream:
-                self._stream_chat(messages, max_tokens=max_tokens, temperature=temperature)
-            else:
-                self._complete_chat(messages, max_tokens=max_tokens, temperature=temperature)
-        except Exception as exc:
-            self._send_json({"error": {"message": str(exc), "type": exc.__class__.__name__}}, status=500)
-
-    def log_message(self, format: str, *args: object) -> None:
-        return
-
-    def _read_json(self) -> dict[str, object]:
-        length = int(self.headers.get("Content-Length", "0"))
-        raw = self.rfile.read(length)
-        return json.loads(raw.decode("utf-8"))
-
-    def _complete_chat(self, messages: list[dict[str, object]], *, max_tokens: int, temperature: float) -> None:
-        engine: OpenAICompletionEngine = self.server.engine  # type: ignore[attr-defined]
-        completion = engine.complete_chat(messages, max_tokens=max_tokens, temperature=temperature)
-        content = engine.tokenizer.decode(completion.tokens)
-        self._send_json(
-            {
-                "id": f"chatcmpl-{uuid.uuid4().hex}",
-                "object": "chat.completion",
-                "created": int(time.time()),
-                "model": engine.model_id,
-                "choices": [
-                    {
-                        "index": 0,
-                        "message": {"role": "assistant", "content": content},
-                        "finish_reason": "stop",
-                    }
-                ],
-                "usage": {
-                    "prompt_tokens": completion.prompt_tokens,
-                    "completion_tokens": len(completion.tokens),
-                    "total_tokens": completion.prompt_tokens + len(completion.tokens),
-                },
-            }
-        )
-
-    def _stream_chat(self, messages: list[dict[str, object]], *, max_tokens: int, temperature: float) -> None:
-        engine: OpenAICompletionEngine = self.server.engine  # type: ignore[attr-defined]
-        completion_id = f"chatcmpl-{uuid.uuid4().hex}"
-        created = int(time.time())
-        self.send_response(HTTPStatus.OK)
-        self.send_header("Content-Type", "text/event-stream")
-        self.send_header("Cache-Control", "no-cache")
-        self.send_header("Connection", "close")
-        self.end_headers()
-        self._write_sse(
-            {
-                "id": completion_id,
-                "object": "chat.completion.chunk",
-                "created": created,
-                "model": engine.model_id,
-                "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
-            }
-        )
-        for token_id in engine.generate_chat_tokens(messages, max_tokens=max_tokens, temperature=temperature):
-            content = engine.tokenizer.decode_token(token_id)
-            if not content:
-                continue
-            self._write_sse(
-                {
-                    "id": completion_id,
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": engine.model_id,
-                    "choices": [{"index": 0, "delta": {"content": content}, "finish_reason": None}],
-                }
-            )
-        self._write_sse(
-            {
-                "id": completion_id,
-                "object": "chat.completion.chunk",
-                "created": created,
-                "model": engine.model_id,
-                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-            }
-        )
-        self.wfile.write(b"data: [DONE]\n\n")
-        self.wfile.flush()
-        self.close_connection = True
-
-    def _send_json(self, payload: dict[str, object], *, status: int = 200) -> None:
-        body = json.dumps(payload).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    def _write_sse(self, payload: dict[str, object]) -> None:
-        self.wfile.write(
-            b"data: "
-            + json.dumps(payload, separators=(",", ":")).encode("utf-8")
-            + b"\n\n"
-        )
-        self.wfile.flush()
-
-
-def _enable_tcp_nodelay(connection: object) -> None:
-    try:
-        connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)  # type: ignore[attr-defined]
-    except OSError:
-        pass
-
-
-class _OpenAIServer(ThreadingHTTPServer):
-    request_queue_size = 128
-
-    def __init__(self, server_address: tuple[str, int], engine: OpenAICompletionEngine) -> None:
-        super().__init__(server_address, _OpenAIHandler)
-        self.engine = engine
 
 
 def build_engine(config: OpenAIServerConfig) -> OpenAICompletionEngine:
@@ -1679,96 +1533,24 @@ def _generation_cache_seq_len(cache: object) -> int:
     return int(seq_len) if seq_len is not None else 0
 
 
-def _warmup_prompt_token_counts(default_prompt_tokens: int) -> tuple[int, ...]:
-    default_buckets = (
-        f"{default_prompt_tokens},55,71,87,99,103,119,128,134,136,144,152,153,161,168,169,178,186,256"
-    )
-    raw = os.environ.get("TORCHINFERNO_OPENAI_WARMUP_PROMPT_TOKEN_BUCKETS", default_buckets)
-    counts: list[int] = []
-    for part in raw.split(","):
-        stripped = part.strip()
-        if not stripped:
-            continue
-        counts.append(max(1, int(stripped)))
-    if not counts:
-        counts.append(default_prompt_tokens)
-    return tuple(dict.fromkeys(counts))
-
-
-def _warmup_temperature_prompt_token_counts() -> tuple[int, ...]:
-    return _parse_positive_int_csv(
-        os.environ.get("TORCHINFERNO_OPENAI_WARMUP_TEMPERATURE_PROMPT_TOKEN_BUCKETS", "55")
-    )
-
-
-def _warmup_temperature_batch_sizes() -> tuple[int, ...]:
-    return _parse_positive_int_csv(
-        os.environ.get("TORCHINFERNO_OPENAI_WARMUP_TEMPERATURE_BATCH_SIZES", "1,8")
-    )
-
-
-def _warmup_prefill_cache_token_counts() -> tuple[int, ...]:
-    return _parse_positive_int_csv(
-        os.environ.get("TORCHINFERNO_OPENAI_WARMUP_PREFILL_CACHE_TOKENS", "256,512,1024")
-    )
-
-
-def _warmup_prefix_suffix_token_counts() -> tuple[tuple[int, int], ...]:
-    raw = os.environ.get(
-        "TORCHINFERNO_OPENAI_WARMUP_PREFIX_SUFFIX_TOKENS",
-        "55:16,71:16,87:16,103:16,119:17,136:16,152:16,"
-        "111:25,111:33,111:42,111:50,111:58,111:67,111:75",
-    )
-    return _parse_nonnegative_positive_int_pair_csv(raw)
-
-
-def _warmup_prefix_suffix_cache_token_counts() -> tuple[int, ...]:
-    return _parse_positive_int_csv(
-        os.environ.get("TORCHINFERNO_OPENAI_WARMUP_PREFIX_SUFFIX_CACHE_TOKENS", "128,256,512,1024")
-    )
-
-
-def _parse_positive_int_csv(raw: str) -> tuple[int, ...]:
-    counts: list[int] = []
-    for part in raw.split(","):
-        stripped = part.strip()
-        if not stripped:
-            continue
-        counts.append(max(1, int(stripped)))
-    return tuple(dict.fromkeys(counts))
-
-
-def _parse_nonnegative_positive_int_pair_csv(raw: str) -> tuple[tuple[int, int], ...]:
-    pairs: list[tuple[int, int]] = []
-    for part in raw.split(","):
-        stripped = part.strip()
-        if not stripped:
-            continue
-        prefix, separator, suffix = stripped.partition(":")
-        if not separator:
-            raise ValueError(f"expected prefix:suffix pair, got {stripped!r}")
-        pairs.append((max(0, int(prefix.strip())), max(1, int(suffix.strip()))))
-    return tuple(dict.fromkeys(pairs))
-
-
 def _set_generation_cache_seq_len(cache: object, seq_len: int) -> None:
     for layer in getattr(cache, "layers", ()) or ():
         if hasattr(layer, "seq_len"):
             try:
                 setattr(layer, "seq_len", seq_len)
-            except Exception:
-                pass
+            except Exception as exc:
+                warn_optional_failure("openai.generation_cache.layer_seq_len", exc)
     if hasattr(cache, "seq_len"):
         try:
             setattr(cache, "seq_len", seq_len)
-        except Exception:
-            pass
+        except Exception as exc:
+            warn_optional_failure("openai.generation_cache.seq_len", exc)
 
 
 def _prefers_exact_generation_cache(model: object) -> bool:
     return (
         _is_tensor_parallel_model(model)
-        and os.environ.get("TORCHINFERNO_CUDAGRAPH_DECODE_STEP", "1") != "0"
+        and env_flag("TORCHINFERNO_CUDAGRAPH_DECODE_STEP", True)
     )
 
 
@@ -1779,19 +1561,19 @@ def _reset_generation_cache(cache: object) -> bool:
             try:
                 setattr(layer, "seq_len", 0)
                 reset = True
-            except Exception:
-                pass
+            except Exception as exc:
+                warn_optional_failure("openai.generation_cache.layer_reset", exc)
     if hasattr(cache, "seq_len"):
         try:
             setattr(cache, "seq_len", 0)
             reset = True
-        except Exception:
-            pass
+        except Exception as exc:
+            warn_optional_failure("openai.generation_cache.reset", exc)
     return reset
 
 
 def _warmup_tensor_parallel_decode_attention(model: object) -> None:
-    if os.environ.get("TORCHINFERNO_TRITON_DECODE_ATTENTION", "1") == "0":
+    if not env_flag("TORCHINFERNO_TRITON_DECODE_ATTENTION", True):
         return
     if not _is_tensor_parallel_model(model):
         return
@@ -1800,7 +1582,8 @@ def _warmup_tensor_parallel_decode_attention(model: object) -> None:
         return
     try:
         from torchinferno.kernels.triton_ops import triton_dense_gqa_decode_attention
-    except Exception:
+    except Exception as exc:
+        warn_optional_failure("openai.decode_attention_warmup_import", exc)
         return
     config = getattr(model, "config", None)
     if config is None:
@@ -1816,7 +1599,8 @@ def _warmup_tensor_parallel_decode_attention(model: object) -> None:
         v = torch.zeros_like(k)
         try:
             triton_dense_gqa_decode_attention(q, k, v)
-        except Exception:
+        except Exception as exc:
+            warn_optional_failure("openai.decode_attention_warmup", exc)
             return
 
 
@@ -1899,7 +1683,7 @@ def _repeat_generation_cache_first_batch(cache: object, batch_size: int) -> None
 def _shared_prefix_sample_enabled(temperature: float) -> bool:
     return (
         temperature > 0.0
-        and os.environ.get("TORCHINFERNO_OPENAI_PREFIX_CACHE_SHARED_SAMPLE", "0") != "0"
+        and env_flag("TORCHINFERNO_OPENAI_PREFIX_CACHE_SHARED_SAMPLE")
     )
 
 

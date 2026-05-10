@@ -6,7 +6,6 @@ import torch
 
 from torchinferno.kernels.ops import helion_available, triton_available
 from torchinferno.runtime.flex import flex_attention_available
-from torchinferno.runtime.monarch import monarch_available
 
 
 @dataclass(frozen=True)
@@ -24,7 +23,6 @@ class EnvironmentAudit:
     triton_available: bool
     helion_available: bool
     flex_attention_available: bool
-    monarch_available: bool
 
 
 @dataclass(frozen=True)
@@ -41,7 +39,6 @@ class TorchInfernoAudit:
             f"triton_available={env.triton_available}",
             f"helion_available={env.helion_available}",
             f"flex_attention_available={env.flex_attention_available}",
-            f"monarch_available={env.monarch_available}",
             "features:",
         ]
         for feature in self.features:
@@ -57,7 +54,6 @@ def build_audit_report() -> TorchInfernoAudit:
         triton_available=triton_available(),
         helion_available=helion_available(),
         flex_attention_available=flex_attention_available(),
-        monarch_available=monarch_available(),
     )
     return TorchInfernoAudit(
         environment=environment,
@@ -80,7 +76,6 @@ def build_audit_report() -> TorchInfernoAudit:
                 "bridge",
                 "Weights can be staged CPU-to-device one module at a time with movement overhead reported separately from compute.",
             ),
-            FeatureAudit("monarch", "adapter", "Runtime detects Monarch and otherwise routes to FakeProcessWorld."),
             FeatureAudit("flex attention", "bridge", "Runtime dispatches to torch flex attention when available and keeps the q/k/v eager fallback."),
             FeatureAudit("piecewise cudagraphs", "bridge", "Named pieces can capture static CUDA tensor inputs and recapture on shape changes."),
             FeatureAudit("paged attention", "integrated", "Native DeepSeek paged prefill/decode attend over request page tables with torch/Triton decode fallback."),

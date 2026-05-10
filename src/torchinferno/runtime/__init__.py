@@ -1,4 +1,3 @@
-from torchinferno.runtime.batching import InferenceRequest, InferenceResult, run_continuous_batch
 from torchinferno.runtime.cudagraphs import CUDAGraphPiece, PiecewiseCUDAGraphRunner
 from torchinferno.runtime.disagg import (
     AgentRank,
@@ -49,8 +48,6 @@ __all__ = [
     "FakeProcessGroup",
     "FakeProcessWorld",
     "FakeRankResult",
-    "InferenceRequest",
-    "InferenceResult",
     "InferenceJob",
     "JsonRankClient",
     "OffloadEvent",
@@ -81,7 +78,6 @@ __all__ = [
     "run_offloaded_forward",
     "run_offloaded_generate_recompute",
     "run_disagg_request",
-    "run_continuous_batch",
     "serve_rank",
     "simulate_traffic",
     "start_rank_server",

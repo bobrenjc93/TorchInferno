@@ -73,7 +73,6 @@ from torchinferno.research import (
     run_helion_region_search,
 )
 from torchinferno.research.benchmarks import benchmark_callable
-from torchinferno.runtime.batching import InferenceRequest, run_continuous_batch
 from torchinferno.runtime.disagg import run_disagg_request, write_rank_files
 from torchinferno.runtime.paged import PagedKVCache
 from torchinferno.runtime.paged_attention import paged_causal_attention
@@ -310,23 +309,6 @@ def run_openai_server_microbench_cli(args: argparse.Namespace) -> int:
     )
     result = run_openai_server_microbench(config)
     print(format_openai_server_microbench_report(result))
-    return 0
-
-
-def run_batch_smoke(args: argparse.Namespace) -> int:
-    device = torch.device(args.device) if args.device else _default_device()
-    torch.manual_seed(args.seed)
-    config = tiny_dsv4_config(max_seq_len=64)
-    model = DSv4ForCausalLM(config).to(device).eval()
-    requests = [
-        InferenceRequest("req-a", (1, 2, 3), 2),
-        InferenceRequest("req-b", (4, 5), 3),
-        InferenceRequest("req-c", (6, 7, 8), 1),
-    ]
-    with torch.inference_mode():
-        results = run_continuous_batch(model, requests, device=device)
-    for result in results:
-        print(f"{result.request_id}: {list(result.tokens)}")
     return 0
 
 
@@ -1773,11 +1755,6 @@ def build_parser() -> argparse.ArgumentParser:
     smoke.add_argument("--temperature", type=float, default=0.0)
     smoke.add_argument("--compile", action="store_true", help="Compile the DSv4 forward path with torch.compile.")
     smoke.set_defaults(func=run_dsv4_smoke)
-
-    batch = subparsers.add_parser("batch-smoke", help="Run the ragged request batching harness.")
-    batch.add_argument("--device", default=None, help="Torch device, defaults to cuda when available.")
-    batch.add_argument("--seed", type=int, default=0)
-    batch.set_defaults(func=run_batch_smoke)
 
     native = subparsers.add_parser("deepseek-smoke", help="Run a native DeepSeek-V3.2-style generation smoke test.")
     native.add_argument("--device", default=None, help="Torch device, defaults to cuda when available.")

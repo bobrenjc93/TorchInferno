@@ -22,6 +22,7 @@ from torchinferno.models.llama3_family.pipeline import (
     resolve_llama3_checkpoint,
 )
 from torchinferno.models.llama3_family.v0 import sample_next_token
+from torchinferno.runtime.options import warn_optional_failure
 
 
 _COMPILED_ROTATE_LLAMA = None
@@ -105,7 +106,8 @@ class Llama3TensorParallelLayerKVCache:
                 from torchinferno.kernels.triton_ops import triton_append_kv_cache
 
                 triton_append_kv_cache(keys, values, self.keys, self.values, self.seq_len)
-            except Exception:
+            except Exception as exc:
+                warn_optional_failure("llama3_tensor_parallel.triton_kv_append", exc)
                 self.keys[:batch, :, self.seq_len : end, :].copy_(keys)
                 self.values[:batch, :, self.seq_len : end, :].copy_(values)
         else:
@@ -1979,7 +1981,8 @@ def _maybe_decode_weight_t(weight: Tensor) -> Tensor | None:
         return None
     try:
         return weight.t().contiguous()
-    except Exception:
+    except Exception as exc:
+        warn_optional_failure("llama3_tensor_parallel.decode_weight_transpose", exc)
         return None
 
 
@@ -1989,8 +1992,8 @@ def _tp_rms_norm(x: Tensor, weight: Tensor, eps: float) -> Tensor:
             from torchinferno.kernels import rms_norm as kernel_rms_norm
 
             return kernel_rms_norm(x, weight, eps=eps)
-        except Exception:
-            pass
+        except Exception as exc:
+            warn_optional_failure("llama3_tensor_parallel.rms_norm", exc)
     return _torch_rms_norm(x, weight, eps)
 
 
@@ -2000,8 +2003,8 @@ def _tp_decode_rms_norm(x: Tensor, weight: Tensor, eps: float) -> Tensor:
             from torchinferno.kernels import rms_norm as kernel_rms_norm
 
             return kernel_rms_norm(x, weight, eps=eps)
-        except Exception:
-            pass
+        except Exception as exc:
+            warn_optional_failure("llama3_tensor_parallel.decode_rms_norm", exc)
     return _torch_rms_norm(x, weight, eps)
 
 
@@ -2016,8 +2019,8 @@ def _tp_decode_add_rms_norm(x: Tensor, residual: Tensor, weight: Tensor, eps: fl
             from torchinferno.kernels.triton_ops import triton_add_rms_norm
 
             return triton_add_rms_norm(x, residual, weight, eps)
-        except Exception:
-            pass
+        except Exception as exc:
+            warn_optional_failure("llama3_tensor_parallel.decode_add_rms_norm", exc)
     hidden = residual + x
     return hidden, _torch_rms_norm(hidden, weight, eps)
 
@@ -2028,8 +2031,8 @@ def _tp_swiglu(gate: Tensor, up: Tensor) -> Tensor:
             from torchinferno.kernels import swiglu_activation
 
             return swiglu_activation(gate, up)
-        except Exception:
-            pass
+        except Exception as exc:
+            warn_optional_failure("llama3_tensor_parallel.swiglu", exc)
     return F.silu(gate) * up
 
 
@@ -2039,8 +2042,8 @@ def _tp_decode_swiglu(gate: Tensor, up: Tensor) -> Tensor:
             from torchinferno.kernels import swiglu_activation
 
             return swiglu_activation(gate, up)
-        except Exception:
-            pass
+        except Exception as exc:
+            warn_optional_failure("llama3_tensor_parallel.decode_swiglu", exc)
     return F.silu(gate) * up
 
 
