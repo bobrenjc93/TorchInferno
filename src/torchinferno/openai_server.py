@@ -2004,6 +2004,12 @@ def _runtime_prefill_graph_capture_enabled(model: object) -> bool:
     return not (_is_tensor_parallel_model(model) and _tensor_parallel_world_size(model) > 1)
 
 
+def _openai_cuda_graph_enabled_for_model(model: object) -> bool:
+    if _is_tensor_parallel_model(model) and _tensor_parallel_world_size(model) > 1:
+        return env_flag("TORCHINFERNO_OPENAI_TP_CUDAGRAPH", False)
+    return True
+
+
 def _sync_tensor_parallel_command(model: object, device: torch.device) -> None:
     if not _is_tensor_parallel_model(model) or _tensor_parallel_world_size(model) <= 1:
         return
@@ -2213,7 +2219,7 @@ def _set_generation_cache_seq_len(cache: object, seq_len: int) -> None:
 def _prefers_exact_generation_cache(model: object) -> bool:
     return (
         _is_tensor_parallel_model(model)
-        and env_flag("TORCHINFERNO_CUDAGRAPH_DECODE_STEP", True)
+        and _openai_decode_graph_enabled(model)
     )
 
 
@@ -2467,7 +2473,7 @@ def _try_decode_one_token_graph(
     cache: object,
     temperature: float,
 ) -> Tensor | None:
-    if not _openai_decode_graph_enabled():
+    if not _openai_decode_graph_enabled(model):
         return None
     decode_graph = getattr(model, "try_decode_one_token_graph", None)
     if decode_graph is None:
@@ -2480,7 +2486,7 @@ def _try_decode_one_token_logits_graph(
     input_ids: Tensor,
     cache: object,
 ) -> Tensor | None:
-    if not _openai_decode_graph_enabled():
+    if not _openai_decode_graph_enabled(model):
         return None
     decode_graph = getattr(model, "try_decode_one_token_logits_graph", None)
     if decode_graph is None:
@@ -2488,8 +2494,11 @@ def _try_decode_one_token_logits_graph(
     return decode_graph(input_ids, cache)
 
 
-def _openai_decode_graph_enabled() -> bool:
-    return env_flag("TORCHINFERNO_OPENAI_CUDAGRAPH_DECODE_STEP", True)
+def _openai_decode_graph_enabled(model: object) -> bool:
+    return (
+        env_flag("TORCHINFERNO_OPENAI_CUDAGRAPH_DECODE_STEP", True)
+        and _openai_cuda_graph_enabled_for_model(model)
+    )
 
 
 def _try_prefill_graph(
@@ -2500,6 +2509,8 @@ def _try_prefill_graph(
     *,
     allow_capture: bool = False,
 ) -> Tensor | None:
+    if not _openai_cuda_graph_enabled_for_model(model):
+        return None
     prefill_graph = getattr(model, "try_prefill_graph", None)
     if prefill_graph is None:
         return None
@@ -2515,6 +2526,8 @@ def _try_prefill_logits_graph(
     *,
     allow_capture: bool = False,
 ) -> Tensor | None:
+    if not _openai_cuda_graph_enabled_for_model(model):
+        return None
     prefill_graph = getattr(model, "try_prefill_logits_graph", None)
     if prefill_graph is None:
         return None

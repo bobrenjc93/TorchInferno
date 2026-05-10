@@ -20,9 +20,15 @@ from torchinferno.openai_server import (
     _TransformersChatTokenizer,
     _distributed_server_command,
     _effective_openai_max_batch_size,
+    _openai_cuda_graph_enabled_for_model,
+    _prefers_exact_generation_cache,
     _should_reexec_distributed_server,
     _sync_tensor_parallel_command,
     _tensor_parallel_worker_loop,
+    _try_decode_one_token_graph,
+    _try_decode_one_token_logits_graph,
+    _try_prefill_graph,
+    _try_prefill_logits_graph,
     _warmup_prefill_cache_token_counts,
     _warmup_prompt_token_counts,
     _warmup_prefix_suffix_cache_token_counts,
@@ -703,7 +709,7 @@ def test_openai_engine_skips_runtime_shared_prefix_capture_for_tensor_parallel(m
     )
 
     assert steps == [[2, 2]]
-    assert model.capture_flags == [False, False, False]
+    assert model.capture_flags == []
     assert model.graph_inputs == []
     assert model.forward_inputs == [[10, 11], [13, 14], [12]]
 
@@ -1035,6 +1041,40 @@ def test_openai_tensor_parallel_command_sync_uses_control_group(monkeypatch) -> 
         ("barrier", {"group": "control"}),
         ("sync", "cuda"),
     ]
+
+
+def test_openai_tensor_parallel_disables_cuda_graphs_by_default(monkeypatch) -> None:
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_CUDAGRAPH", raising=False)
+
+    class GraphProbeModel:
+        world_size = 2
+
+        def try_prefill_graph(self, *args, **kwargs):  # noqa: ANN002, ANN003
+            raise AssertionError("prefill graph should be disabled for TP serving")
+
+        def try_prefill_logits_graph(self, *args, **kwargs):  # noqa: ANN002, ANN003
+            raise AssertionError("prefill logits graph should be disabled for TP serving")
+
+        def try_decode_one_token_graph(self, *args, **kwargs):  # noqa: ANN002, ANN003
+            raise AssertionError("decode graph should be disabled for TP serving")
+
+        def try_decode_one_token_logits_graph(self, *args, **kwargs):  # noqa: ANN002, ANN003
+            raise AssertionError("decode logits graph should be disabled for TP serving")
+
+    model = GraphProbeModel()
+    monkeypatch.setattr(
+        "torchinferno.openai_server._is_tensor_parallel_model",
+        lambda candidate: candidate is model,
+    )
+    input_ids = torch.zeros((1, 1), dtype=torch.long)
+    cache = object()
+
+    assert not _openai_cuda_graph_enabled_for_model(model)
+    assert not _prefers_exact_generation_cache(model)
+    assert _try_prefill_graph(model, input_ids, cache, 0.0) is None
+    assert _try_prefill_logits_graph(model, input_ids, cache) is None
+    assert _try_decode_one_token_graph(model, input_ids, cache, 0.0) is None
+    assert _try_decode_one_token_logits_graph(model, input_ids, cache) is None
 
 
 def test_openai_microbench_cli_runs_synthetic_cases() -> None:
