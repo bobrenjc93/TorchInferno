@@ -290,7 +290,7 @@ def test_openai_engine_tensor_parallel_primary_queues_single_stream_request(monk
     assert model.calls[0][2] == "torchinferno-openai-batcher"
 
 
-def test_tensor_parallel_worker_loop_disables_single_prefix_cache(monkeypatch) -> None:
+def test_tensor_parallel_worker_loop_uses_batched_stream_path(monkeypatch) -> None:
     import torch.distributed as dist
 
     commands: list[dict[str, object]] = [
@@ -316,7 +316,8 @@ def test_tensor_parallel_worker_loop_disables_single_prefix_cache(monkeypatch) -
 
     _tensor_parallel_worker_loop(engine)
 
-    assert engine.single_calls == [([[1, 2, 3]], 1, 0.0, False, False)]
+    assert engine.single_calls == []
+    assert engine.batch_calls == [([[1, 2, 3]], 1, 0.0, False)]
 
 
 def test_openai_stream_disconnect_drains_generation() -> None:
@@ -1112,6 +1113,7 @@ class _WorkerLoopRecordingEngine:
     def __init__(self) -> None:
         self.device = torch.device("cpu")
         self.single_calls: list[tuple[list[list[int]], int, float, bool, bool]] = []
+        self.batch_calls: list[tuple[list[list[int]], int, float, bool]] = []
 
     def _generate_single_tokens(
         self,
@@ -1132,6 +1134,24 @@ class _WorkerLoopRecordingEngine:
             )
         )
         yield 2
+
+    def _generate_batch_steps(
+        self,
+        input_ids: torch.Tensor,
+        *,
+        max_tokens: int,
+        temperature: float,
+        broadcast_tensor_parallel: bool,
+    ):
+        self.batch_calls.append(
+            (
+                [[int(token_id) for token_id in row.tolist()] for row in input_ids],
+                max_tokens,
+                temperature,
+                broadcast_tensor_parallel,
+            )
+        )
+        yield [2 for _ in range(input_ids.size(0))]
 
 
 class _ScriptedTokenModel:

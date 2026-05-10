@@ -718,13 +718,15 @@ class OpenAICompletionEngine:
         )
         for step in range(max_tokens):
             generated_tokens.append(next_token[:, None])
+            should_continue = step + 1 < max_tokens
             if active is not None:
                 active &= _tokens_not_in_stop(next_token, stop_token_ids)
                 # Keep non-stream decode mostly async; exact output is trimmed after the final transfer.
                 should_check_stop = (step + 1) % 8 == 0 or step + 1 == max_tokens
                 if should_check_stop and not bool(active.any()):
-                    break
-            if step + 1 == max_tokens:
+                    should_continue = False
+            should_continue = _sync_tensor_parallel_continue(model, should_continue, next_token.device)
+            if not should_continue:
                 break
             next_token, cache = _decode_next_token(model, next_token[:, None], cache, temperature)
             next_token = next_token.to(self.device)
@@ -1317,7 +1319,7 @@ class OpenAICompletionEngine:
         active = [True for _ in range(input_ids.size(0))]
         next_token, cache = _prefill_next_token(model, input_ids, cache, temperature)
         next_token = next_token.to(self.device)
-        for _ in range(max_tokens):
+        for step in range(max_tokens):
             token_ids = next_token.detach().cpu().tolist()
             step_tokens: list[int | None] = []
             for row, token_id in enumerate(token_ids):
@@ -1329,7 +1331,9 @@ class OpenAICompletionEngine:
                 if token_id in stop_token_ids:
                     active[row] = False
             yield step_tokens
-            if not any(active):
+            should_continue = step + 1 < max_tokens and any(active)
+            should_continue = _sync_tensor_parallel_continue(model, should_continue, next_token.device)
+            if not should_continue:
                 break
             next_token, cache = _decode_next_token(model, next_token[:, None], cache, temperature)
             next_token = next_token.to(self.device)
@@ -1375,7 +1379,7 @@ class OpenAICompletionEngine:
         _repeat_generation_cache_first_batch(cache, batch_size)
         shared_sample = _shared_prefix_sample_enabled(temperature)
         active = [True for _ in range(batch_size)]
-        for _ in range(max_tokens):
+        for step in range(max_tokens):
             token_ids = next_token.detach().cpu().tolist()
             step_tokens: list[int | None] = []
             for row, token_id in enumerate(token_ids):
@@ -1387,7 +1391,9 @@ class OpenAICompletionEngine:
                 if token_id in stop_token_ids:
                     active[row] = False
             yield step_tokens
-            if not any(active):
+            should_continue = step + 1 < max_tokens and any(active)
+            should_continue = _sync_tensor_parallel_continue(model, should_continue, next_token.device)
+            if not should_continue:
                 break
             decode_input = next_token[:1, None] if shared_sample else next_token[:, None]
             next_token, cache = _decode_next_token(model, decode_input, cache, temperature)
@@ -1442,7 +1448,9 @@ class OpenAICompletionEngine:
             emitted = False
             for state in states:
                 active = state["active"]
-                if not isinstance(active, list) or not any(active):
+                local_should_decode = isinstance(active, list) and any(active)
+                should_decode = _sync_tensor_parallel_continue(model, local_should_decode, self.device)
+                if not should_decode:
                     continue
                 next_token = state["next_token"]
                 cache = state["cache"]
@@ -1777,7 +1785,7 @@ class OpenAICompletionEngine:
                 )
                 return
 
-        for _ in range(1, max_tokens):
+        for step in range(1, max_tokens):
             next_token, cache = _decode_next_token(model, next_token[:, None], cache, temperature)
             next_token = next_token.to(self.device)
             token_ids = next_token.detach().cpu().tolist()
@@ -1791,7 +1799,9 @@ class OpenAICompletionEngine:
                 if token_id in stop_token_ids:
                     active[row] = False
             yield step_tokens
-            if not any(active):
+            should_continue = step + 1 < max_tokens and any(active)
+            should_continue = _sync_tensor_parallel_continue(model, should_continue, next_token.device)
+            if not should_continue:
                 break
 
     def _decode_shared_prefix_microbatches(
@@ -1822,7 +1832,9 @@ class OpenAICompletionEngine:
             emitted = False
             for state in states:
                 chunk_active = state["active"]
-                if not isinstance(chunk_active, list) or not any(chunk_active):
+                local_should_decode = isinstance(chunk_active, list) and any(chunk_active)
+                should_decode = _sync_tensor_parallel_continue(model, local_should_decode, self.device)
+                if not should_decode:
                     continue
                 chunk_token = state["next_token"]
                 cache = state["cache"]
@@ -1970,6 +1982,18 @@ def _sync_tensor_parallel_command(model: object, device: torch.device) -> None:
         torch.cuda.synchronize(device)
 
 
+def _sync_tensor_parallel_continue(model: object, should_continue: bool, device: torch.device) -> bool:
+    if not _is_tensor_parallel_model(model) or _tensor_parallel_world_size(model) <= 1:
+        return should_continue
+    import torch.distributed as dist
+
+    if not dist.is_available() or not dist.is_initialized():
+        return should_continue
+    flag = torch.tensor([1 if should_continue else 0], dtype=torch.int32, device=device)
+    dist.broadcast(flag, src=0)
+    return bool(flag.item())
+
+
 def _broadcast_tensor_parallel_generate(
     model: object,
     input_ids: Tensor,
@@ -2078,23 +2102,13 @@ def _tensor_parallel_worker_loop(engine: OpenAICompletionEngine) -> None:
                 continue
             input_ids = torch.tensor(payload["input_ids"], dtype=torch.long, device=engine.device)
             if bool(payload.get("stream", True)):
-                if input_ids.size(0) == 1:
-                    for _ in engine._generate_single_tokens(
-                        input_ids,
-                        max_tokens=int(payload["max_tokens"]),
-                        temperature=float(payload["temperature"]),
-                        broadcast_tensor_parallel=False,
-                        update_prefix_cache=False,
-                    ):
-                        pass
-                else:
-                    for _ in engine._generate_batch_steps(
-                        input_ids,
-                        max_tokens=int(payload["max_tokens"]),
-                        temperature=float(payload["temperature"]),
-                        broadcast_tensor_parallel=False,
-                    ):
-                        pass
+                for _ in engine._generate_batch_steps(
+                    input_ids,
+                    max_tokens=int(payload["max_tokens"]),
+                    temperature=float(payload["temperature"]),
+                    broadcast_tensor_parallel=False,
+                ):
+                    pass
             else:
                 engine._generate_batch_tokens(
                     input_ids,
