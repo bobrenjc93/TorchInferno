@@ -65,7 +65,7 @@ class OpenAIServerConfig:
     cache_dir: str | None = None
     cache_backend: str = "dense"
     page_size: int = 16
-    max_batch_size: int = 32
+    max_batch_size: int = 64
     batch_wait_ms: float = 10.0
     single_request_admission_wait_ms: float | None = None
     llama_parallelism: str = "auto"
@@ -349,7 +349,7 @@ class OpenAICompletionEngine:
         cache_backend: str = "dense",
         page_size: int = 16,
         max_model_len: int | None = None,
-        max_batch_size: int = 32,
+        max_batch_size: int = 64,
         batch_wait_ms: float = 10.0,
         single_request_admission_wait_ms: float | None = None,
     ) -> None:
@@ -599,31 +599,17 @@ class OpenAICompletionEngine:
             deadline = time.perf_counter() + self.batch_wait_s
 
     def _run_queued_batch(self, batch: list[_QueuedGeneration]) -> None:
-        groups: dict[tuple[int, int, float, bool], list[_QueuedGeneration]] = {}
+        groups: dict[tuple[int, float, bool], list[_QueuedGeneration]] = {}
         for request in batch:
-            key = (len(request.prompt), request.max_tokens, request.temperature, request.stream)
+            key = (request.max_tokens, request.temperature, request.stream)
             groups.setdefault(key, []).append(request)
         for group in groups.values():
             is_stream = group[0].stream
             try:
-                input_ids = torch.tensor([request.prompt for request in group], dtype=torch.long, device=self.device)
                 if is_stream:
-                    for step_tokens in self._generate_batch_steps(
-                        input_ids,
-                        max_tokens=group[0].max_tokens,
-                        temperature=group[0].temperature,
-                    ):
-                        for request, token_id in zip(group, step_tokens):
-                            if token_id is not None:
-                                request.responses.put(int(token_id))
+                    self._run_queued_stream_group(group)
                 else:
-                    rows = self._generate_batch_tokens(
-                        input_ids,
-                        max_tokens=group[0].max_tokens,
-                        temperature=group[0].temperature,
-                    )
-                    for request, tokens in zip(group, rows):
-                        request.responses.put(_GenerationResult(tokens))
+                    self._run_queued_completion_group(group)
             except BaseException as exc:
                 for request in group:
                     request.responses.put(exc)
@@ -631,6 +617,48 @@ class OpenAICompletionEngine:
                 if is_stream:
                     for request in group:
                         request.responses.put(_GenerationDone())
+
+    def _run_queued_stream_group(self, group: list[_QueuedGeneration]) -> None:
+        prompts = [request.prompt for request in group]
+        if self._shared_prefix_prompt_list_tokens(prompts) > 0:
+            for step_tokens in self._generate_prompt_list_batch_steps(
+                prompts,
+                max_tokens=group[0].max_tokens,
+                temperature=group[0].temperature,
+            ):
+                for request, token_id in zip(group, step_tokens):
+                    if token_id is not None:
+                        request.responses.put(int(token_id))
+            return
+        for same_length_group in _queued_groups_by_prompt_length(group):
+            input_ids = torch.tensor(
+                [request.prompt for request in same_length_group],
+                dtype=torch.long,
+                device=self.device,
+            )
+            for step_tokens in self._generate_batch_steps(
+                input_ids,
+                max_tokens=same_length_group[0].max_tokens,
+                temperature=same_length_group[0].temperature,
+            ):
+                for request, token_id in zip(same_length_group, step_tokens):
+                    if token_id is not None:
+                        request.responses.put(int(token_id))
+
+    def _run_queued_completion_group(self, group: list[_QueuedGeneration]) -> None:
+        for same_length_group in _queued_groups_by_prompt_length(group):
+            input_ids = torch.tensor(
+                [request.prompt for request in same_length_group],
+                dtype=torch.long,
+                device=self.device,
+            )
+            rows = self._generate_batch_tokens(
+                input_ids,
+                max_tokens=same_length_group[0].max_tokens,
+                temperature=same_length_group[0].temperature,
+            )
+            for request, tokens in zip(same_length_group, rows):
+                request.responses.put(_GenerationResult(tokens))
 
     @torch.inference_mode()
     def _generate_batch_tokens(
@@ -813,6 +841,57 @@ class OpenAICompletionEngine:
         seq_len = min(len(tokens), _generation_cache_seq_len(cache))
         if seq_len < len(tokens):
             self._prefix_cache_entry = None
+            return
+        self._prefix_cache_entry = snapshot_tensor_prefix_cache(
+            cache,
+            tokens,
+            seq_len=seq_len,
+            device=str(self.device),
+            backend=self.cache_backend,
+            page_size=self.page_size,
+        )
+
+    def _restore_exact_prefix_cache(self, input_ids: Tensor, cache: object) -> int:
+        if not env_flag("TORCHINFERNO_OPENAI_PREFIX_CACHE", True):
+            return 0
+        if input_ids.size(0) != 1:
+            return 0
+        entry = self._prefix_cache_entry
+        if entry is None:
+            return 0
+        input_tokens = tuple(int(token_id) for token_id in input_ids[0].detach().cpu().tolist())
+        if input_tokens != entry.tokens:
+            return 0
+        if entry.device != str(self.device) or entry.backend != self.cache_backend or entry.page_size != self.page_size:
+            return 0
+        cache_layers = tuple(getattr(cache, "layers", ()) or ())
+        if not cache_layers or len(cache_layers) != len(entry.layers):
+            return 0
+        seq_len = len(input_tokens)
+        for layer, (keys, values) in zip(cache_layers, entry.layers):
+            layer_keys = getattr(layer, "keys", None)
+            layer_values = getattr(layer, "values", None)
+            if not isinstance(layer_keys, Tensor) or not isinstance(layer_values, Tensor):
+                return 0
+            if layer_keys.size(0) < 1 or layer_keys.size(2) < seq_len:
+                return 0
+            layer_keys[:1, :, :seq_len, :].copy_(keys[:, :, :seq_len, :])
+            layer_values[:1, :, :seq_len, :].copy_(values[:, :, :seq_len, :])
+        _set_generation_cache_seq_len(cache, seq_len)
+        return seq_len
+
+    def _save_prompt_prefix_cache(self, input_ids: Tensor, cache: object) -> None:
+        if not env_flag("TORCHINFERNO_OPENAI_PREFIX_CACHE", True):
+            return
+        if input_ids.size(0) != 1:
+            return
+        tokens = tuple(int(token_id) for token_id in input_ids[0].detach().cpu().tolist())
+        max_tokens = env_int("TORCHINFERNO_OPENAI_PREFIX_CACHE_MAX_TOKENS", 1024, minimum=1)
+        if len(tokens) > max_tokens:
+            self._prefix_cache_entry = None
+            return
+        seq_len = min(len(tokens), _generation_cache_seq_len(cache))
+        if seq_len < len(tokens):
             return
         self._prefix_cache_entry = snapshot_tensor_prefix_cache(
             cache,
@@ -1249,7 +1328,7 @@ class OpenAICompletionEngine:
         if "TORCHINFERNO_OPENAI_STREAM_MICROBATCH_SIZE" in os.environ:
             return env_int("TORCHINFERNO_OPENAI_STREAM_MICROBATCH_SIZE", batch_size, minimum=1)
         if _is_tensor_parallel_model(self.model) and self.device.type == "cuda":
-            return env_int("TORCHINFERNO_CUDAGRAPH_DECODE_STEP_MAX_BATCH", 8, minimum=1)
+            return env_int("TORCHINFERNO_CUDAGRAPH_DECODE_STEP_MAX_BATCH", 64, minimum=1)
         return batch_size
 
     @torch.inference_mode()
@@ -1345,6 +1424,192 @@ class OpenAICompletionEngine:
         min_tokens = env_int("TORCHINFERNO_OPENAI_PREFIX_CACHE_MIN_TOKENS", 16, minimum=1)
         return prefix_tokens if prefix_tokens >= min_tokens else 0
 
+    def _shared_prefix_prompt_list_tokens(self, prompts: Sequence[Sequence[int]]) -> int:
+        if not env_flag("TORCHINFERNO_OPENAI_SHARED_PREFIX_BATCH", True):
+            return 0
+        if len(prompts) <= 1:
+            return 0
+        min_prompt_len = min((len(prompt) for prompt in prompts), default=0)
+        if min_prompt_len <= 1:
+            return 0
+        prefix_tokens = min(_common_prefix_list_token_count(prompts), min_prompt_len - 1)
+        min_tokens = env_int("TORCHINFERNO_OPENAI_PREFIX_CACHE_MIN_TOKENS", 16, minimum=1)
+        return prefix_tokens if prefix_tokens >= min_tokens else 0
+
+    @torch.inference_mode()
+    def _generate_prompt_list_batch_steps(
+        self,
+        prompts: Sequence[Sequence[int]],
+        *,
+        max_tokens: int,
+        temperature: float,
+        broadcast_tensor_parallel: bool = True,
+    ) -> Iterator[list[int | None]]:
+        if max_tokens <= 0:
+            return
+        if not prompts:
+            return
+        if broadcast_tensor_parallel:
+            _broadcast_tensor_parallel_generate_prompt_lists(
+                self.model,
+                prompts,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                stream=True,
+            )
+        prompt_lengths = {len(prompt) for prompt in prompts}
+        if len(prompt_lengths) == 1:
+            input_ids = torch.tensor(prompts, dtype=torch.long, device=self.device)
+            yield from self._generate_batch_steps(
+                input_ids,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                broadcast_tensor_parallel=False,
+            )
+            return
+        prefix_tokens = self._shared_prefix_prompt_list_tokens(prompts)
+        if prefix_tokens > 0:
+            yield from self._generate_shared_prefix_prompt_list_steps(
+                prompts,
+                prefix_tokens=prefix_tokens,
+                max_tokens=max_tokens,
+                temperature=temperature,
+            )
+            return
+        indexed = [
+            (index, list(prompt))
+            for index, prompt in enumerate(prompts)
+        ]
+        for same_length in _indexed_prompts_by_length(indexed):
+            original_indices = [index for index, _prompt in same_length]
+            input_ids = torch.tensor([prompt for _index, prompt in same_length], dtype=torch.long, device=self.device)
+            for group_step in self._generate_batch_steps(
+                input_ids,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                broadcast_tensor_parallel=False,
+            ):
+                step_tokens: list[int | None] = [None for _ in prompts]
+                for original_index, token_id in zip(original_indices, group_step):
+                    step_tokens[original_index] = token_id
+                yield step_tokens
+
+    @torch.inference_mode()
+    def _generate_shared_prefix_prompt_list_steps(
+        self,
+        prompts: Sequence[Sequence[int]],
+        *,
+        prefix_tokens: int,
+        max_tokens: int,
+        temperature: float,
+    ) -> Iterator[list[int | None]]:
+        stop_token_ids = self.stop_token_ids
+        model = self.model
+        if not _supports_incremental_generation(model):
+            indexed = [
+                (index, list(prompt))
+                for index, prompt in enumerate(prompts)
+            ]
+            for same_length in _indexed_prompts_by_length(indexed):
+                original_indices = [index for index, _prompt in same_length]
+                input_ids = torch.tensor([prompt for _index, prompt in same_length], dtype=torch.long, device=self.device)
+                rows = _generated_rows_with_model(
+                    model,
+                    input_ids,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    eos_token_id=self.tokenizer.eos_token_id,
+                    stop_token_ids=stop_token_ids,
+                )
+                for group_step in _iter_generated_steps(rows, max_tokens, stop_token_ids):
+                    step_tokens: list[int | None] = [None for _ in prompts]
+                    for original_index, token_id in zip(original_indices, group_step):
+                        step_tokens[original_index] = token_id
+                    yield step_tokens
+            return
+
+        indexed = [
+            (index, list(prompt))
+            for index, prompt in enumerate(prompts)
+        ]
+        length_groups = _indexed_prompts_by_length(indexed)
+        prefix_cache = self._generation_microbatch_cache(
+            -1,
+            1,
+            prefix_tokens,
+            model=model,
+        )
+        prefix_ids = torch.tensor([length_groups[0][0][1][:prefix_tokens]], dtype=torch.long, device=self.device)
+        restored_prefix_tokens = self._restore_exact_prefix_cache(prefix_ids, prefix_cache)
+        if restored_prefix_tokens != prefix_tokens:
+            prefix_cache = _prefill_cache_only(model, prefix_ids, prefix_cache, allow_capture=True)
+            self._save_prompt_prefix_cache(prefix_ids, prefix_cache)
+
+        states: list[dict[str, object]] = []
+        first_tokens: list[int | None] = [None for _ in prompts]
+        for slot, same_length in enumerate(length_groups):
+            original_indices = [index for index, _prompt in same_length]
+            prompt_rows = [prompt for _index, prompt in same_length]
+            suffix_rows = [prompt[prefix_tokens:] for prompt in prompt_rows]
+            suffix_len = len(suffix_rows[0])
+            cache = self._generation_microbatch_cache(
+                slot,
+                len(prompt_rows),
+                prefix_tokens + suffix_len + max_tokens,
+                model=model,
+            )
+            _copy_generation_cache_first_row(prefix_cache, cache, len(prompt_rows))
+            suffix_ids = torch.tensor(suffix_rows, dtype=torch.long, device=self.device)
+            next_token, cache = _prefill_next_token(model, suffix_ids, cache, temperature, allow_capture=True)
+            next_token = next_token.to(self.device)
+            active = [True for _ in prompt_rows]
+            for offset, token_id in enumerate(next_token.detach().cpu().tolist()):
+                token_id = int(token_id)
+                first_tokens[original_indices[offset]] = token_id
+                if token_id in stop_token_ids:
+                    active[offset] = False
+            states.append(
+                {
+                    "indices": original_indices,
+                    "active": active,
+                    "cache": cache,
+                    "next_token": next_token,
+                }
+            )
+        yield first_tokens
+        if max_tokens <= 1:
+            return
+
+        for _ in range(1, max_tokens):
+            step_tokens: list[int | None] = [None for _ in prompts]
+            emitted = False
+            for state in states:
+                active = state["active"]
+                if not isinstance(active, list) or not any(active):
+                    continue
+                next_token = state["next_token"]
+                cache = state["cache"]
+                if not isinstance(next_token, Tensor):
+                    raise RuntimeError("invalid shared-prefix prompt-list token state")
+                next_token, cache = _decode_next_token(model, next_token[:, None], cache, temperature)
+                next_token = next_token.to(self.device)
+                state["cache"] = cache
+                state["next_token"] = next_token
+                original_indices = state["indices"]
+                if not isinstance(original_indices, list):
+                    raise RuntimeError("invalid shared-prefix prompt-list index state")
+                for offset, token_id in enumerate(next_token.detach().cpu().tolist()):
+                    if not active[offset]:
+                        continue
+                    token_id = int(token_id)
+                    step_tokens[int(original_indices[offset])] = token_id
+                    if token_id in stop_token_ids:
+                        active[offset] = False
+                    emitted = True
+            if not emitted:
+                break
+            yield step_tokens
+
     @torch.inference_mode()
     def _generate_shared_prefix_batch_steps(
         self,
@@ -1375,9 +1640,19 @@ class OpenAICompletionEngine:
             input_ids.size(1) + max_tokens,
             model=model,
         )
-        cache = _prefill_cache_only(model, input_ids[:1, :prefix_tokens], cache)
+        prefix_ids = input_ids[:1, :prefix_tokens]
+        restored_prefix_tokens = self._restore_exact_prefix_cache(prefix_ids, cache)
+        if restored_prefix_tokens != prefix_tokens:
+            cache = _prefill_cache_only(model, prefix_ids, cache, allow_capture=True)
+            self._save_prompt_prefix_cache(prefix_ids, cache)
         _repeat_generation_cache_first_batch(cache, batch_size)
-        next_token, cache = _prefill_next_token(model, input_ids[:, prefix_tokens:], cache, temperature)
+        next_token, cache = _prefill_next_token(
+            model,
+            input_ids[:, prefix_tokens:],
+            cache,
+            temperature,
+            allow_capture=True,
+        )
         next_token = next_token.to(self.device)
 
         active = [True for _ in range(batch_size)]
@@ -1716,6 +1991,32 @@ def _broadcast_tensor_parallel_generate(
     dist.broadcast_object_list(command, src=0)
 
 
+def _broadcast_tensor_parallel_generate_prompt_lists(
+    model: object,
+    prompts: Sequence[Sequence[int]],
+    *,
+    max_tokens: int,
+    temperature: float,
+    stream: bool,
+) -> None:
+    if not _is_tensor_parallel_primary_model(model):
+        return
+    import torch.distributed as dist
+
+    if not dist.is_available() or not dist.is_initialized():
+        return
+    command = [
+        {
+            "op": "generate",
+            "input_id_lists": [list(prompt) for prompt in prompts],
+            "max_tokens": int(max_tokens),
+            "temperature": float(temperature),
+            "stream": bool(stream),
+        }
+    ]
+    dist.broadcast_object_list(command, src=0)
+
+
 def _broadcast_tensor_parallel_stop(model: object) -> None:
     if not _is_tensor_parallel_primary_model(model):
         return
@@ -1741,6 +2042,34 @@ def _tensor_parallel_worker_loop(engine: OpenAICompletionEngine) -> None:
             return
         if op != "generate":
             raise ValueError(f"unsupported tensor-parallel worker op: {op}")
+        if "input_id_lists" in payload:
+            if bool(payload.get("stream", True)):
+                for _ in engine._generate_prompt_list_batch_steps(
+                    payload["input_id_lists"],
+                    max_tokens=int(payload["max_tokens"]),
+                    temperature=float(payload["temperature"]),
+                    broadcast_tensor_parallel=False,
+                ):
+                    pass
+            else:
+                for prompt_group in _indexed_prompts_by_length(
+                    [
+                        (index, list(prompt))
+                        for index, prompt in enumerate(payload["input_id_lists"])
+                    ]
+                ):
+                    input_ids = torch.tensor(
+                        [prompt for _index, prompt in prompt_group],
+                        dtype=torch.long,
+                        device=engine.device,
+                    )
+                    engine._generate_batch_tokens(
+                        input_ids,
+                        max_tokens=int(payload["max_tokens"]),
+                        temperature=float(payload["temperature"]),
+                        broadcast_tensor_parallel=False,
+                    )
+            continue
         input_ids = torch.tensor(payload["input_ids"], dtype=torch.long, device=engine.device)
         if bool(payload.get("stream", True)):
             if input_ids.size(0) == 1:
@@ -1874,11 +2203,13 @@ def _prefill_next_token(
     input_ids: Tensor,
     cache: object,
     temperature: float,
+    *,
+    allow_capture: bool = False,
 ) -> tuple[Tensor, object]:
-    prefill_token = _try_prefill_graph(model, input_ids, cache, temperature)
+    prefill_token = _try_prefill_graph(model, input_ids, cache, temperature, allow_capture=allow_capture)
     if prefill_token is not None:
         return prefill_token, cache
-    prefill_logits = _try_prefill_logits_graph(model, input_ids, cache)
+    prefill_logits = _try_prefill_logits_graph(model, input_ids, cache, allow_capture=allow_capture)
     if prefill_logits is None:
         prefill_logits, cache = _forward(model, input_ids, cache)
     return _sample(model, prefill_logits[:, -1, :], temperature), cache
@@ -1934,8 +2265,14 @@ def _repeat_generation_cache_first_batch(cache: object, batch_size: int) -> None
             values[:batch_size, :, :seq_len, :].copy_(values[:1, :, :seq_len, :].expand(batch_size, -1, -1, -1))
 
 
-def _prefill_cache_only(model: object, input_ids: Tensor, cache: object) -> object:
-    prefill_logits = _try_prefill_logits_graph(model, input_ids, cache)
+def _prefill_cache_only(
+    model: object,
+    input_ids: Tensor,
+    cache: object,
+    *,
+    allow_capture: bool = False,
+) -> object:
+    prefill_logits = _try_prefill_logits_graph(model, input_ids, cache, allow_capture=allow_capture)
     if prefill_logits is not None:
         return cache
     _, cache = _forward(model, input_ids, cache)
@@ -1955,6 +2292,20 @@ def _tensor_rows_are_identical(input_ids: Tensor) -> bool:
     return bool(torch.equal(input_ids, input_ids[:1].expand_as(input_ids)))
 
 
+def _queued_groups_by_prompt_length(group: Sequence[_QueuedGeneration]) -> list[list[_QueuedGeneration]]:
+    groups: dict[int, list[_QueuedGeneration]] = {}
+    for request in group:
+        groups.setdefault(len(request.prompt), []).append(request)
+    return list(groups.values())
+
+
+def _indexed_prompts_by_length(indexed: Sequence[tuple[int, list[int]]]) -> list[list[tuple[int, list[int]]]]:
+    groups: dict[int, list[tuple[int, list[int]]]] = {}
+    for item in indexed:
+        groups.setdefault(len(item[1]), []).append(item)
+    return sorted(groups.values(), key=lambda group: len(group[0][1]), reverse=True)
+
+
 def _common_prefix_token_count(input_ids: Tensor) -> int:
     if input_ids.size(0) <= 1:
         return input_ids.size(1)
@@ -1963,6 +2314,23 @@ def _common_prefix_token_count(input_ids: Tensor) -> int:
     if mismatch.numel() == 0:
         return input_ids.size(1)
     return int(mismatch[0].item())
+
+
+def _common_prefix_list_token_count(prompts: Sequence[Sequence[int]]) -> int:
+    if not prompts:
+        return 0
+    prefix = list(prompts[0])
+    for prompt in prompts[1:]:
+        limit = min(len(prefix), len(prompt))
+        mismatch = limit
+        for index in range(limit):
+            if prefix[index] != prompt[index]:
+                mismatch = index
+                break
+        del prefix[mismatch:]
+        if not prefix:
+            return 0
+    return len(prefix)
 
 
 def _cache_row_slice(cache: object, start: int, end: int) -> object | None:
@@ -1988,6 +2356,33 @@ def _cache_row_slice(cache: object, start: int, end: int) -> object | None:
     cache_view = copy.copy(cache)
     cache_view.layers = sliced_layers
     return cache_view
+
+
+def _copy_generation_cache_first_row(source: object, target: object, batch_size: int) -> None:
+    if batch_size <= 0:
+        return
+    for source_layer, target_layer in zip(
+        getattr(source, "layers", ()) or (),
+        getattr(target, "layers", ()) or (),
+    ):
+        seq_len = int(getattr(source_layer, "seq_len", 0))
+        if seq_len <= 0:
+            continue
+        source_keys = getattr(source_layer, "keys", None)
+        source_values = getattr(source_layer, "values", None)
+        target_keys = getattr(target_layer, "keys", None)
+        target_values = getattr(target_layer, "values", None)
+        if not all(isinstance(tensor, Tensor) for tensor in (source_keys, source_values, target_keys, target_values)):
+            raise RuntimeError("cannot copy shared prefix cache for non-tensor KV layer")
+        if target_keys.size(0) < batch_size or target_values.size(0) < batch_size:
+            raise RuntimeError("shared prefix target cache batch is too small")
+        target_keys[:batch_size, :, :seq_len, :].copy_(
+            source_keys[:1, :, :seq_len, :].expand(batch_size, -1, -1, -1)
+        )
+        target_values[:batch_size, :, :seq_len, :].copy_(
+            source_values[:1, :, :seq_len, :].expand(batch_size, -1, -1, -1)
+        )
+        target_layer.seq_len = seq_len
 
 
 def _tokens_not_in_stop(tokens: Tensor, stop_token_ids: frozenset[int]) -> Tensor:
@@ -2123,7 +2518,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cache-dir", default=None)
     parser.add_argument("--cache-backend", choices=["dense", "paged"], default="dense")
     parser.add_argument("--page-size", type=int, default=16)
-    parser.add_argument("--max-batch-size", type=int, default=32)
+    parser.add_argument("--max-batch-size", type=int, default=64)
     parser.add_argument("--batch-wait-ms", type=float, default=10.0)
     parser.add_argument(
         "--single-request-admission-wait-ms",

@@ -338,6 +338,27 @@ def _request_messages(
             },
             {"role": "user", "content": "17 * 23 ="},
         ]
+    if config.prompt_mode == "few-shot":
+        examples = (
+            ("15 + 27 =", 42),
+            ("198 - 53 =", 145),
+            ("12 * 14 =", 168),
+            ("225 / 9 =", 25),
+            ("347 + 258 =", 605),
+        )
+        example_text = "\n\n".join(f"Q: {question}\nA: {answer}" for question, answer in examples)
+        system_prompt = (
+            "You are a calculator. Compute the answer to each math equation. "
+            "Respond with only the numerical answer, nothing else.\n\n"
+            "Examples:\n\n" + example_text
+        )
+        offset = iteration * max(1, config.concurrency) + request_index
+        left = 100 + (offset * 37) % 1900
+        right = 1 + (offset * 17) % 1900
+        return [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": f"Q: {left} + {right} =\nA:"},
+        ]
     if config.prompt_mode != "synthetic":
         raise ValueError(f"unsupported prompt_mode {config.prompt_mode!r}")
     return [{"role": "user", "content": _prompt_text(config.prompt_tokens, iteration, request_index)}]

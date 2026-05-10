@@ -31,7 +31,7 @@ _COMPILED_ROTATE_LLAMA_FAILED = False
 _SYMM_REDUCE_BUFFERS: dict[tuple[str, int, str, str, tuple[int, ...]], Tensor] = {}
 _SYMM_REDUCE_PROBED: set[tuple[str, int, str, str, tuple[int, ...]]] = set()
 _SYMM_REDUCE_DISABLED = False
-_DEFAULT_DECODE_STEP_MAX_BATCH = 16
+_DEFAULT_DECODE_STEP_MAX_BATCH = 64
 
 
 def _tp_flag(name: str, default: bool = True) -> bool:
@@ -2207,7 +2207,7 @@ def _should_use_prefill_graph(
         and temperature <= 0.0
         and input_ids.is_cuda
         and input_ids.ndim == 2
-        and 1 <= input_ids.size(0) <= _tp_int("TORCHINFERNO_CUDAGRAPH_PREFILL_MAX_BATCH", 8, minimum=1)
+        and 1 <= input_ids.size(0) <= _tp_int("TORCHINFERNO_CUDAGRAPH_PREFILL_MAX_BATCH", 64, minimum=1)
         and input_ids.size(1) > 1
         and bool(cache.layers)
         and cache.layers[0].keys.is_cuda
@@ -2224,7 +2224,7 @@ def _should_use_prefill_logits_graph(
         _tp_flag("TORCHINFERNO_CUDAGRAPH_PREFILL")
         and input_ids.is_cuda
         and input_ids.ndim == 2
-        and 1 <= input_ids.size(0) <= _tp_int("TORCHINFERNO_CUDAGRAPH_PREFILL_MAX_BATCH", 8, minimum=1)
+        and 1 <= input_ids.size(0) <= _tp_int("TORCHINFERNO_CUDAGRAPH_PREFILL_MAX_BATCH", 64, minimum=1)
         and input_ids.size(1) > 1
         and bool(cache.layers)
         and cache.layers[0].keys.is_cuda

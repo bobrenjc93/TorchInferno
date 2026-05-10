@@ -41,6 +41,19 @@ def test_openai_server_microbench_self_consistency_prompt_is_identical() -> None
     assert first["max_tokens"] == 256
 
 
+def test_openai_server_microbench_few_shot_prompt_has_shared_prefix() -> None:
+    config = OpenAIServerMicrobenchConfig(prompt_mode="few-shot", temperature=0.0, max_tokens=256)
+
+    first = _request_payload(config, stream=True, iteration=0, request_index=0)
+    second = _request_payload(config, stream=True, iteration=0, request_index=15)
+
+    assert first["messages"][0] == second["messages"][0]
+    assert "Examples:" in first["messages"][0]["content"]
+    assert first["messages"][1]["content"].startswith("Q: ")
+    assert first["messages"][1] != second["messages"][1]
+    assert first["max_tokens"] == 256
+
+
 def test_openai_server_microbench_cli_runs_tiny_server(tmp_path) -> None:
     output = tmp_path / "openai-server-microbench.json"
     result = subprocess.run(

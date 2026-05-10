@@ -767,6 +767,63 @@ def test_openai_engine_batches_shared_prefix_suffixes(monkeypatch) -> None:
     assert sorted(model.forward_inputs[1]) == [[12], [13]]
 
 
+def test_openai_engine_batches_variable_length_shared_prefix_suffixes(monkeypatch) -> None:
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_PREFIX_CACHE_MIN_TOKENS", "2")
+    model = _SharedPrefixRecordingModel()
+    tokenizer = _SharedPrefixTokenizer(parties=2)
+    engine = OpenAICompletionEngine(
+        model,
+        tokenizer,
+        model_id="tiny",
+        device=torch.device("cpu"),
+        max_batch_size=4,
+        batch_wait_ms=50.0,
+    )
+
+    def run_pair() -> list[list[int] | None]:
+        barrier = threading.Barrier(3)
+        results: list[list[int] | None] = [None, None]
+
+        def run(index: int, content: str) -> None:
+            barrier.wait()
+            results[index] = list(
+                engine.generate_chat_tokens(
+                    [{"role": "user", "content": content}],
+                    max_tokens=1,
+                    temperature=0.0,
+                )
+            )
+
+        threads = [
+            threading.Thread(target=run, args=(0, "left")),
+            threading.Thread(target=run, args=(1, "long")),
+        ]
+        for thread in threads:
+            thread.start()
+        barrier.wait()
+        for thread in threads:
+            thread.join(timeout=10)
+        return results
+
+    results = run_pair()
+    assert results == [[2], [2]]
+    assert model.forward_inputs == [
+        [[10, 11]],
+        [[13, 14]],
+        [[12]],
+    ]
+
+    model.forward_inputs.clear()
+    results = run_pair()
+    engine.close()
+
+    assert results == [[2], [2]]
+    assert model.forward_inputs == [
+        [[13, 14]],
+        [[12]],
+    ]
+
+
 def test_openai_microbench_cli_runs_synthetic_cases() -> None:
     root = Path(__file__).resolve().parents[1]
     env = {**os.environ, "PYTHONPATH": "src"}
@@ -798,6 +855,33 @@ def test_openai_microbench_cli_runs_synthetic_cases() -> None:
     assert "case=single-direct" in result.stdout
     assert "case=single-batcher" in result.stdout
     assert "case=concurrent-2" in result.stdout
+
+
+def test_openai_microbench_cases_preserve_tensor_parallel_default() -> None:
+    from torchinferno.cli import _openai_microbench_cases
+
+    class _Model:
+        world_size = 8
+
+    class _Engine:
+        model = _Model()
+        single_request_fast_path = False
+
+    cases, skipped_batcher_compare = _openai_microbench_cases(
+        _Engine(),
+        compare_batcher=False,
+        concurrency=64,
+    )
+    assert cases == [("single", False, 1), ("concurrent-64", False, 64)]
+    assert skipped_batcher_compare is False
+
+    compare_cases, skipped_batcher_compare = _openai_microbench_cases(
+        _Engine(),
+        compare_batcher=True,
+        concurrency=64,
+    )
+    assert compare_cases == [("single-direct", True, 1), ("concurrent-64", False, 64)]
+    assert skipped_batcher_compare is True
 
 
 class _BatchEncodingTokenizer:
@@ -1010,6 +1094,8 @@ class _SharedPrefixTokenizer:
             return [10, 11, 12]
         if content == "right":
             return [10, 11, 13]
+        if content == "long":
+            return [10, 11, 13, 14]
         raise AssertionError(f"unexpected message content: {content}")
 
     def decode_token(self, token_id: int) -> str:

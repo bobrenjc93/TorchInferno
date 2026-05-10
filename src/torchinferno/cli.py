@@ -462,18 +462,11 @@ def run_openai_microbench(args: argparse.Namespace) -> int:
         return 0
 
     try:
-        cases: list[tuple[str, bool, int]] = []
-        skipped_batcher_compare = False
-        if args.compare_batcher:
-            cases.append(("single-direct", True, 1))
-            if int(getattr(engine.model, "world_size", 1)) > 1:
-                skipped_batcher_compare = True
-            else:
-                cases.append(("single-batcher", False, 1))
-        else:
-            cases.append(("single", True, 1))
-        if args.concurrency > 1:
-            cases.append((f"concurrent-{args.concurrency}", True, args.concurrency))
+        cases, skipped_batcher_compare = _openai_microbench_cases(
+            engine,
+            compare_batcher=args.compare_batcher,
+            concurrency=args.concurrency,
+        )
 
         print("TorchInferno OpenAI microbench")
         print(
@@ -544,6 +537,28 @@ def run_openai_microbench(args: argparse.Namespace) -> int:
     finally:
         engine.close()
     return 0
+
+
+def _openai_microbench_cases(
+    engine: OpenAICompletionEngine,
+    *,
+    compare_batcher: bool,
+    concurrency: int,
+) -> tuple[list[tuple[str, bool, int]], bool]:
+    default_fast_path = bool(engine.single_request_fast_path)
+    cases: list[tuple[str, bool, int]] = []
+    skipped_batcher_compare = False
+    if compare_batcher:
+        cases.append(("single-direct", True, 1))
+        if int(getattr(engine.model, "world_size", 1)) > 1:
+            skipped_batcher_compare = True
+        else:
+            cases.append(("single-batcher", False, 1))
+    else:
+        cases.append(("single", default_fast_path, 1))
+    if concurrency > 1:
+        cases.append((f"concurrent-{concurrency}", default_fast_path, concurrency))
+    return cases, skipped_batcher_compare
 
 
 def _build_openai_microbench_engine(args: argparse.Namespace) -> OpenAICompletionEngine:
@@ -787,6 +802,26 @@ def _microbench_messages(
                 "content": "You are a calculator. Respond with only the numerical answer, nothing else.",
             },
             {"role": "user", "content": "17 * 23 ="},
+        ]
+    if prompt_mode == "few-shot":
+        examples = (
+            ("15 + 27 =", 42),
+            ("198 - 53 =", 145),
+            ("12 * 14 =", 168),
+            ("225 / 9 =", 25),
+            ("347 + 258 =", 605),
+        )
+        example_text = "\n\n".join(f"Q: {question}\nA: {answer}" for question, answer in examples)
+        system_prompt = (
+            "You are a calculator. Compute the answer to each math equation. "
+            "Respond with only the numerical answer, nothing else.\n\n"
+            "Examples:\n\n" + example_text
+        )
+        left = 100 + (request_index * 37) % 1900
+        right = 1 + (request_index * 17) % 1900
+        return [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": f"Q: {left} + {right} =\nA:"},
         ]
     if prompt_mode != "synthetic":
         raise ValueError(f"unsupported prompt_mode {prompt_mode!r}")
@@ -1758,14 +1793,14 @@ def build_parser() -> argparse.ArgumentParser:
     openai_microbench.add_argument("--cache-backend", choices=["dense", "paged"], default="dense")
     openai_microbench.add_argument("--page-size", type=int, default=16)
     openai_microbench.add_argument("--llama-parallelism", choices=["auto", "pipeline", "tensor"], default="auto")
-    openai_microbench.add_argument("--max-batch-size", type=int, default=32)
+    openai_microbench.add_argument("--max-batch-size", type=int, default=64)
     openai_microbench.add_argument("--batch-wait-ms", type=float, default=10.0)
     openai_microbench.add_argument("--prompt-tokens", type=int, default=32)
     openai_microbench.add_argument(
         "--prompt-mode",
-        choices=["synthetic", "self-consistency"],
+        choices=["synthetic", "self-consistency", "few-shot"],
         default="synthetic",
-        help="Prompt shape to benchmark; self-consistency matches the calculator workload from inference-bench.",
+        help="Prompt shape to benchmark; few-shot and self-consistency match inference-bench calculator workloads.",
     )
     openai_microbench.add_argument("--max-tokens", type=int, default=64)
     openai_microbench.add_argument("--concurrency", type=int, default=1)
@@ -1797,7 +1832,7 @@ def build_parser() -> argparse.ArgumentParser:
     openai_server_microbench.add_argument("--tensor-parallel-size", type=int, default=1)
     openai_server_microbench.add_argument("--cache-backend", choices=["dense", "paged"], default="dense")
     openai_server_microbench.add_argument("--page-size", type=int, default=16)
-    openai_server_microbench.add_argument("--max-batch-size", type=int, default=32)
+    openai_server_microbench.add_argument("--max-batch-size", type=int, default=64)
     openai_server_microbench.add_argument("--batch-wait-ms", type=float, default=10.0)
     openai_server_microbench.add_argument("--llama-parallelism", choices=["auto", "pipeline", "tensor"], default="auto")
     openai_server_microbench.add_argument("--trust-remote-code", action="store_true")
@@ -1807,9 +1842,9 @@ def build_parser() -> argparse.ArgumentParser:
     openai_server_microbench.add_argument("--mode", choices=["non-stream", "stream", "both"], default="both")
     openai_server_microbench.add_argument(
         "--prompt-mode",
-        choices=["synthetic", "self-consistency"],
+        choices=["synthetic", "self-consistency", "few-shot"],
         default="synthetic",
-        help="Prompt shape to benchmark; self-consistency matches the calculator workload from inference-bench.",
+        help="Prompt shape to benchmark; few-shot and self-consistency match inference-bench calculator workloads.",
     )
     openai_server_microbench.add_argument("--prompt-tokens", type=int, default=8)
     openai_server_microbench.add_argument("--max-tokens", type=int, default=2)
@@ -2046,7 +2081,7 @@ def build_parser() -> argparse.ArgumentParser:
     openai_serve.add_argument("--cache-dir", default=None)
     openai_serve.add_argument("--cache-backend", choices=["dense", "paged"], default="dense")
     openai_serve.add_argument("--page-size", type=int, default=16)
-    openai_serve.add_argument("--max-batch-size", type=int, default=32)
+    openai_serve.add_argument("--max-batch-size", type=int, default=64)
     openai_serve.add_argument("--batch-wait-ms", type=float, default=10.0)
     openai_serve.add_argument(
         "--single-request-admission-wait-ms",
