@@ -1,4 +1,4 @@
-.PHONY: audit variants smoke test serve openai-server-bench perf profile profile-timeslice profile-offload profile-nodes profile-subgraph profile-region profile-pattern vllm-bench-plan disagg
+.PHONY: audit variants lint dead-code smoke test serve openai-server-bench perf profile profile-timeslice profile-offload profile-nodes profile-subgraph profile-region profile-pattern vllm-bench-plan disagg
 
 PYTHON ?= python3
 TI_PYTHONPATH ?= src
@@ -19,6 +19,13 @@ audit:
 
 variants:
 	PYTHONPATH=$(TI_PYTHONPATH) $(PYTHON) -m torchinferno.cli model-variants
+
+lint:
+	$(PYTHON) -m pyflakes src tests
+	$(PYTHON) -m ruff check .
+
+dead-code:
+	$(PYTHON) -m vulture src tests --min-confidence 80
 
 test:
 	$(PYTHON) -m pytest

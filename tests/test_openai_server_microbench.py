@@ -6,6 +6,7 @@ import subprocess
 import sys
 
 from torchinferno.benchmarks import OpenAIServerMicrobenchConfig, build_openai_server_microbench_command
+from torchinferno.benchmarks.openai_server import _request_payload
 
 
 def test_openai_server_microbench_command_uses_openai_server_entrypoint() -> None:
@@ -27,6 +28,19 @@ def test_openai_server_microbench_command_uses_openai_server_entrypoint() -> Non
     assert command[command.index("--llama-parallelism") + 1] == "pipeline"
 
 
+def test_openai_server_microbench_self_consistency_prompt_is_identical() -> None:
+    config = OpenAIServerMicrobenchConfig(prompt_mode="self-consistency", temperature=0.7, max_tokens=256)
+
+    first = _request_payload(config, stream=True, iteration=0, request_index=0)
+    second = _request_payload(config, stream=True, iteration=0, request_index=15)
+
+    assert first["messages"] == second["messages"]
+    assert first["messages"][0]["role"] == "system"
+    assert first["messages"][1]["content"] == "17 * 23 ="
+    assert first["temperature"] == 0.7
+    assert first["max_tokens"] == 256
+
+
 def test_openai_server_microbench_cli_runs_tiny_server(tmp_path) -> None:
     output = tmp_path / "openai-server-microbench.json"
     result = subprocess.run(
@@ -45,6 +59,8 @@ def test_openai_server_microbench_cli_runs_tiny_server(tmp_path) -> None:
             "2",
             "--mode",
             "both",
+            "--prompt-mode",
+            "self-consistency",
             "--json-output",
             str(output),
         ],
@@ -61,6 +77,7 @@ def test_openai_server_microbench_cli_runs_tiny_server(tmp_path) -> None:
     assert "mode=stream" in result.stdout
     payload = json.loads(output.read_text())
     assert payload["started_server"] is True
+    assert payload["config"]["prompt_mode"] == "self-consistency"
     assert payload["results"]["non-stream"]["completed"] == 1
     assert payload["results"]["stream"]["completed"] == 1
     assert payload["results"]["non-stream"]["output_tokens"] == 2

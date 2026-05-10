@@ -28,11 +28,12 @@ PYTHONPATH=src python3 -m torchinferno.cli profile-pattern .torchinferno_runs/sw
 ```
 
 Makefile shortcuts cover the common pieces as `make audit`, `make variants`,
-`make test`, `make smoke`, `make perf`, `make openai-server-bench`, and
-`make disagg`. Focused profiling shortcuts are available as `make profile`,
-`make profile-timeslice`, `make profile-offload`, `make profile-nodes`,
-`make profile-subgraph`, `make profile-region`, and `make profile-pattern`;
-benchmark planning is available as `make vllm-bench-plan`.
+`make lint`, `make dead-code`, `make test`, `make smoke`, `make perf`,
+`make openai-server-bench`, and `make disagg`. Focused profiling shortcuts
+are available as `make profile`, `make profile-timeslice`,
+`make profile-offload`, `make profile-nodes`, `make profile-subgraph`,
+`make profile-region`, and `make profile-pattern`; benchmark planning is
+available as `make vllm-bench-plan`.
 
 ## Git Pushes
 

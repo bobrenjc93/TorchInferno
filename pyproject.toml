@@ -11,7 +11,7 @@ requires-python = ">=3.10"
 dependencies = ["huggingface-hub", "safetensors", "torch"]
 
 [project.optional-dependencies]
-dev = ["pytest"]
+dev = ["pyflakes", "pytest", "ruff", "vulture"]
 helion = ["helion"]
 kernels = ["triton"]
 serve = ["tokenizers", "transformers"]

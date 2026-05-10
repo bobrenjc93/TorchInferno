@@ -12,7 +12,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import Iterable, Iterator, Sequence
+from typing import Iterable, Iterator, Protocol, Sequence, runtime_checkable
 
 import torch
 from torch import Tensor
@@ -90,6 +90,25 @@ class _GenerationDone:
 @dataclass(frozen=True)
 class _GenerationResult:
     tokens: list[int]
+
+
+@runtime_checkable
+class _IncrementalGenerationModel(Protocol):
+    def allocate_cache(self, batch_size: int, max_seq_len: int, **kwargs: object) -> object: ...
+
+    def forward(self, input_ids: Tensor, **kwargs: object) -> tuple[Tensor, object]: ...
+
+
+@runtime_checkable
+class _GenerateModel(Protocol):
+    def generate(
+        self,
+        input_ids: Tensor,
+        *,
+        max_new_tokens: int,
+        temperature: float,
+        eos_token_id: int | None,
+    ) -> Tensor: ...
 
 
 class _ByteFallbackTokenizer:
@@ -186,6 +205,72 @@ def _is_token_sequence(value: object) -> bool:
     if hasattr(value, "tolist") and not isinstance(value, (list, tuple, str, bytes)):
         value = value.tolist()
     return isinstance(value, (list, tuple))
+
+
+def _supports_incremental_generation(model: object) -> bool:
+    return (
+        isinstance(model, _IncrementalGenerationModel)
+        and callable(getattr(model, "allocate_cache", None))
+        and callable(getattr(model, "forward", None))
+    )
+
+
+def _generate_with_model(
+    model: object,
+    input_ids: Tensor,
+    *,
+    max_tokens: int,
+    temperature: float,
+    eos_token_id: int | None,
+) -> Tensor:
+    if not isinstance(model, _GenerateModel):
+        raise TypeError("model must expose either allocate_cache/forward or generate")
+    return model.generate(
+        input_ids,
+        max_new_tokens=max_tokens,
+        temperature=temperature,
+        eos_token_id=eos_token_id,
+    )
+
+
+def _generated_rows_with_model(
+    model: object,
+    input_ids: Tensor,
+    *,
+    max_tokens: int,
+    temperature: float,
+    eos_token_id: int | None,
+) -> list[list[int]]:
+    generated = _generate_with_model(
+        model,
+        input_ids,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        eos_token_id=eos_token_id,
+    )
+    rows = generated[:, input_ids.size(1) :].detach().cpu().tolist()
+    return _trim_rows_at_eos(rows, eos_token_id)
+
+
+def _iter_generated_steps(
+    rows: Sequence[Sequence[int]],
+    max_tokens: int,
+    eos_token_id: int | None,
+) -> Iterator[list[int | None]]:
+    finished = [False for _ in rows]
+    for step in range(max_tokens):
+        step_tokens: list[int | None] = []
+        for row_index, row in enumerate(rows):
+            if finished[row_index] or step >= len(row):
+                step_tokens.append(None)
+                continue
+            token_id = int(row[step])
+            step_tokens.append(token_id)
+            if eos_token_id is not None and token_id == eos_token_id:
+                finished[row_index] = True
+        if all(token is None for token in step_tokens):
+            break
+        yield step_tokens
 
 
 class OpenAICompletionEngine:
@@ -500,15 +585,14 @@ class OpenAICompletionEngine:
             )
         eos_token_id = self.tokenizer.eos_token_id
         model = self.model
-        if not hasattr(model, "allocate_cache") or not callable(getattr(model, "forward", None)):
-            generated = model.generate(  # type: ignore[attr-defined]
+        if not _supports_incremental_generation(model):
+            return _generated_rows_with_model(
+                model,
                 input_ids,
-                max_new_tokens=max_tokens,
+                max_tokens=max_tokens,
                 temperature=temperature,
                 eos_token_id=eos_token_id,
             )
-            rows = generated[:, input_ids.size(1) :].detach().cpu().tolist()
-            return _trim_rows_at_eos(rows, eos_token_id)
 
         cache = self._generation_cache(
             input_ids.size(0),
@@ -781,24 +865,34 @@ class OpenAICompletionEngine:
                     if count > cache_tokens:
                         continue
                     base = torch.arange(count, device=self.device, dtype=torch.long) % vocab_size
-                    input_ids = (
-                        base[None, :]
-                        if batch_size > 1
-                        else base[None, :].expand(batch_size, count).contiguous()
-                    )
-                    logits = _try_prefill_logits_graph(self.model, input_ids, cache)
-                    if logits is not None:
-                        if _shared_prefix_sample_enabled(0.7):
-                            next_token = _sample(self.model, logits[:, -1, :], 0.7).to(self.device)
-                            next_token = next_token.expand(batch_size).contiguous()
-                            decode_input = next_token[:1, None]
-                        else:
-                            sample_logits = logits[:, -1, :].expand(batch_size, logits.size(-1)).contiguous()
-                            next_token = _sample(self.model, sample_logits, 0.7).to(self.device)
-                            decode_input = next_token[:, None]
-                        _repeat_generation_cache_first_batch(cache, batch_size)
-                        _try_decode_one_token_logits_graph(self.model, decode_input, cache)
+                    input_ids = base[None, :].expand(batch_size, count).contiguous()
+                    self._warmup_temperature_prefill_decode_graphs(input_ids, cache, batch_size)
+                    if batch_size > 1:
+                        _reset_generation_cache(cache)
+                        self._warmup_temperature_prefill_decode_graphs(base[None, :], cache, batch_size)
                     _reset_generation_cache(cache)
+
+    def _warmup_temperature_prefill_decode_graphs(
+        self,
+        input_ids: Tensor,
+        cache: object,
+        batch_size: int,
+    ) -> None:
+        logits = _try_prefill_logits_graph(self.model, input_ids, cache)
+        if logits is None:
+            return
+        if logits.size(0) == batch_size:
+            next_token = _sample(self.model, logits[:, -1, :], 0.7).to(self.device)
+            decode_input = next_token[:, None]
+        elif _shared_prefix_sample_enabled(0.7):
+            next_token = _sample(self.model, logits[:, -1, :], 0.7).to(self.device)
+            decode_input = next_token[:1, None]
+        else:
+            sample_logits = logits[:, -1, :].expand(batch_size, logits.size(-1)).contiguous()
+            next_token = _sample(self.model, sample_logits, 0.7).to(self.device)
+            decode_input = next_token[:, None]
+        _repeat_generation_cache_first_batch(cache, batch_size)
+        _try_decode_one_token_logits_graph(self.model, decode_input, cache)
 
     def _generate_prompt_token_list(self, prompt: list[int], *, max_tokens: int, temperature: float) -> list[int]:
         input_ids = torch.tensor([prompt], dtype=torch.long, device=self.device)
@@ -844,10 +938,11 @@ class OpenAICompletionEngine:
             self._mark_phase(phase, "broadcast_done")
         eos_token_id = self.tokenizer.eos_token_id
         model = self.model
-        if not hasattr(model, "allocate_cache") or not callable(getattr(model, "forward", None)):
-            generated = model.generate(  # type: ignore[attr-defined]
+        if not _supports_incremental_generation(model):
+            generated = _generate_with_model(
+                model,
                 input_ids,
-                max_new_tokens=max_tokens,
+                max_tokens=max_tokens,
                 temperature=temperature,
                 eos_token_id=eos_token_id,
             )
@@ -949,28 +1044,15 @@ class OpenAICompletionEngine:
             return
         eos_token_id = self.tokenizer.eos_token_id
         model = self.model
-        if not hasattr(model, "allocate_cache") or not callable(getattr(model, "forward", None)):
-            generated = model.generate(  # type: ignore[attr-defined]
+        if not _supports_incremental_generation(model):
+            rows = _generated_rows_with_model(
+                model,
                 input_ids,
-                max_new_tokens=max_tokens,
+                max_tokens=max_tokens,
                 temperature=temperature,
                 eos_token_id=eos_token_id,
             )
-            rows = generated[:, input_ids.size(1) :].detach().cpu().tolist()
-            finished = [False for _ in rows]
-            for step in range(max_tokens):
-                step_tokens: list[int | None] = []
-                for row_index, row in enumerate(rows):
-                    if finished[row_index] or step >= len(row):
-                        step_tokens.append(None)
-                        continue
-                    token_id = int(row[step])
-                    step_tokens.append(token_id)
-                    if eos_token_id is not None and token_id == eos_token_id:
-                        finished[row_index] = True
-                if all(token is None for token in step_tokens):
-                    break
-                yield step_tokens
+            yield from _iter_generated_steps(rows, max_tokens, eos_token_id)
             return
 
         cache = self._generation_cache(
@@ -1009,29 +1091,16 @@ class OpenAICompletionEngine:
     ) -> Iterator[list[int | None]]:
         eos_token_id = self.tokenizer.eos_token_id
         model = self.model
-        if not hasattr(model, "allocate_cache") or not callable(getattr(model, "forward", None)):
+        if not _supports_incremental_generation(model):
             expanded = input_ids.expand(batch_size, input_ids.size(1)).contiguous()
-            generated = model.generate(  # type: ignore[attr-defined]
+            rows = _generated_rows_with_model(
+                model,
                 expanded,
-                max_new_tokens=max_tokens,
+                max_tokens=max_tokens,
                 temperature=temperature,
                 eos_token_id=eos_token_id,
             )
-            rows = generated[:, input_ids.size(1) :].detach().cpu().tolist()
-            finished = [False for _ in rows]
-            for step in range(max_tokens):
-                step_tokens: list[int | None] = []
-                for row_index, row in enumerate(rows):
-                    if finished[row_index] or step >= len(row):
-                        step_tokens.append(None)
-                        continue
-                    token_id = int(row[step])
-                    step_tokens.append(token_id)
-                    if eos_token_id is not None and token_id == eos_token_id:
-                        finished[row_index] = True
-                if all(token is None for token in step_tokens):
-                    break
-                yield step_tokens
+            yield from _iter_generated_steps(rows, max_tokens, eos_token_id)
             return
 
         cache = self._generation_cache(

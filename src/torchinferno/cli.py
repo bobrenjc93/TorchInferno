@@ -297,6 +297,7 @@ def run_openai_server_microbench_cli(args: argparse.Namespace) -> int:
         revision=args.revision,
         cache_dir=args.cache_dir,
         modes=(args.mode,),
+        prompt_mode=args.prompt_mode,
         prompt_tokens=args.prompt_tokens,
         max_tokens=args.max_tokens,
         concurrency=args.concurrency,
@@ -478,7 +479,7 @@ def run_openai_microbench(args: argparse.Namespace) -> int:
         print(
             f"backend={args.backend} device={engine.device} prompt_tokens={args.prompt_tokens} "
             f"max_tokens={args.max_tokens} warmup={args.warmup} iters={args.iters} "
-            f"batch_wait_ms={args.batch_wait_ms:g}"
+            f"batch_wait_ms={args.batch_wait_ms:g} prompt_mode={args.prompt_mode}"
         )
         if skipped_batcher_compare:
             print("skip=single-batcher reason=tensor_parallel_worker_protocol")
@@ -486,6 +487,7 @@ def run_openai_microbench(args: argparse.Namespace) -> int:
             "backend": args.backend,
             "device": str(engine.device),
             "prompt_tokens": args.prompt_tokens,
+            "prompt_mode": args.prompt_mode,
             "max_tokens": args.max_tokens,
             "batch_wait_ms": args.batch_wait_ms,
             "skipped_single_batcher": skipped_batcher_compare,
@@ -500,6 +502,7 @@ def run_openai_microbench(args: argparse.Namespace) -> int:
                 warmup=args.warmup,
                 iters=args.iters,
                 prompt_tokens=args.prompt_tokens,
+                prompt_mode=args.prompt_mode,
                 max_tokens=args.max_tokens,
                 temperature=args.temperature,
                 phase_timings=args.phase_timings,
@@ -597,6 +600,7 @@ def _run_openai_microbench_case(
     warmup: int,
     iters: int,
     prompt_tokens: int,
+    prompt_mode: str,
     max_tokens: int,
     temperature: float,
     phase_timings: bool = False,
@@ -604,7 +608,14 @@ def _run_openai_microbench_case(
 ) -> dict[str, object]:
     del label
     for _ in range(warmup):
-        _run_openai_microbench_iteration(engine, concurrency, prompt_tokens, max_tokens, temperature)
+        _run_openai_microbench_iteration(
+            engine,
+            concurrency,
+            prompt_tokens,
+            prompt_mode,
+            max_tokens,
+            temperature,
+        )
     if phase_timings and hasattr(engine, "pop_phase_records"):
         engine.pop_phase_records()
     if profile_breakdown and hasattr(engine.model, "enable_profile"):
@@ -618,6 +629,7 @@ def _run_openai_microbench_case(
             engine,
             concurrency,
             prompt_tokens,
+            prompt_mode,
             max_tokens,
             temperature,
         )
@@ -674,12 +686,13 @@ def _run_openai_microbench_iteration(
     engine: OpenAICompletionEngine,
     concurrency: int,
     prompt_tokens: int,
+    prompt_mode: str,
     max_tokens: int,
     temperature: float,
 ) -> list[dict[str, float]]:
     _sync_openai_engine(engine)
     if concurrency == 1:
-        metrics = [_run_openai_microbench_request(engine, 0, prompt_tokens, max_tokens, temperature)]
+        metrics = [_run_openai_microbench_request(engine, 0, prompt_tokens, prompt_mode, max_tokens, temperature)]
         _sync_openai_engine(engine)
         return metrics
 
@@ -694,6 +707,7 @@ def _run_openai_microbench_iteration(
                 engine,
                 index,
                 prompt_tokens,
+                prompt_mode,
                 max_tokens,
                 temperature,
             )
@@ -716,10 +730,11 @@ def _run_openai_microbench_request(
     engine: OpenAICompletionEngine,
     request_index: int,
     prompt_tokens: int,
+    prompt_mode: str,
     max_tokens: int,
     temperature: float,
 ) -> dict[str, float]:
-    messages = _microbench_messages(prompt_tokens, request_index)
+    messages = _microbench_messages(prompt_tokens, request_index, prompt_mode)
     metrics, _content = _run_openai_microbench_messages(engine, messages, max_tokens, temperature)
     return metrics
 
@@ -760,7 +775,21 @@ def _run_openai_microbench_messages(
     )
 
 
-def _microbench_messages(prompt_tokens: int, request_index: int) -> list[dict[str, object]]:
+def _microbench_messages(
+    prompt_tokens: int,
+    request_index: int,
+    prompt_mode: str = "synthetic",
+) -> list[dict[str, object]]:
+    if prompt_mode == "self-consistency":
+        return [
+            {
+                "role": "system",
+                "content": "You are a calculator. Respond with only the numerical answer, nothing else.",
+            },
+            {"role": "user", "content": "17 * 23 ="},
+        ]
+    if prompt_mode != "synthetic":
+        raise ValueError(f"unsupported prompt_mode {prompt_mode!r}")
     return [{"role": "user", "content": _microbench_prompt_text(prompt_tokens, request_index)}]
 
 
@@ -1732,6 +1761,12 @@ def build_parser() -> argparse.ArgumentParser:
     openai_microbench.add_argument("--max-batch-size", type=int, default=32)
     openai_microbench.add_argument("--batch-wait-ms", type=float, default=10.0)
     openai_microbench.add_argument("--prompt-tokens", type=int, default=32)
+    openai_microbench.add_argument(
+        "--prompt-mode",
+        choices=["synthetic", "self-consistency"],
+        default="synthetic",
+        help="Prompt shape to benchmark; self-consistency matches the calculator workload from inference-bench.",
+    )
     openai_microbench.add_argument("--max-tokens", type=int, default=64)
     openai_microbench.add_argument("--concurrency", type=int, default=1)
     openai_microbench.add_argument("--warmup", type=int, default=2)
@@ -1770,6 +1805,12 @@ def build_parser() -> argparse.ArgumentParser:
     openai_server_microbench.add_argument("--revision", default=None)
     openai_server_microbench.add_argument("--cache-dir", default=None)
     openai_server_microbench.add_argument("--mode", choices=["non-stream", "stream", "both"], default="both")
+    openai_server_microbench.add_argument(
+        "--prompt-mode",
+        choices=["synthetic", "self-consistency"],
+        default="synthetic",
+        help="Prompt shape to benchmark; self-consistency matches the calculator workload from inference-bench.",
+    )
     openai_server_microbench.add_argument("--prompt-tokens", type=int, default=8)
     openai_server_microbench.add_argument("--max-tokens", type=int, default=2)
     openai_server_microbench.add_argument("--concurrency", type=int, default=1)

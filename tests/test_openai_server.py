@@ -158,8 +158,28 @@ def test_openai_server_warmup_uses_generic_shape_buckets(monkeypatch) -> None:
     assert set(_warmup_prefill_cache_token_counts()) >= {128, 256, 512, 1024}
     assert prefix_suffix_counts == {(32, 16), (64, 16), (128, 32), (256, 32)}
     assert set(_warmup_prefix_suffix_cache_token_counts()) >= {128, 256, 512, 1024}
-    assert set(_warmup_temperature_prompt_token_counts()) == {32}
+    assert set(_warmup_temperature_prompt_token_counts()) == {32, 55, 64}
     assert 8 in set(_warmup_temperature_batch_sizes())
+
+
+def test_openai_temperature_warmup_uses_configured_batch_size(monkeypatch) -> None:
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_WARMUP_TEMPERATURE_BATCH_SIZES", "3")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_WARMUP_TEMPERATURE_PROMPT_TOKEN_BUCKETS", "2")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_WARMUP_PREFILL_CACHE_TOKENS", "4")
+
+    model = _WarmupShapeModel()
+    engine = object.__new__(OpenAICompletionEngine)
+    engine.model = model
+    engine.device = torch.device("cpu")
+    engine.cache_backend = "dense"
+    engine.page_size = 16
+    engine._cache_pool = {}
+    engine._microbatch_cache_pool = {}
+
+    engine._warmup_tensor_parallel_temperature_graphs(vocab_size=16)
+
+    assert model.prefill_shapes == [(3, 2), (1, 2)]
+    assert model.decode_shapes == [(3, 1), (3, 1)]
 
 
 def test_openai_server_pipeline_parallelism_skips_auto_launch(monkeypatch) -> None:
@@ -599,6 +619,29 @@ class _BatchRecordingModel:
         logits = torch.zeros(input_ids.size(0), tokens, 8)
         logits[..., 2] = 1.0
         return logits, cache
+
+
+class _WarmupShapeCache:
+    def __init__(self) -> None:
+        self.seq_len = 0
+
+
+class _WarmupShapeModel:
+    def __init__(self) -> None:
+        self.config = type("Config", (), {"vocab_size": 16})()
+        self.prefill_shapes: list[tuple[int, int]] = []
+        self.decode_shapes: list[tuple[int, int]] = []
+
+    def allocate_cache(self, batch_size: int, max_seq_len: int, **kwargs) -> _WarmupShapeCache:
+        return _WarmupShapeCache()
+
+    def try_prefill_logits_graph(self, input_ids: torch.Tensor, cache: _WarmupShapeCache) -> torch.Tensor:
+        self.prefill_shapes.append((input_ids.size(0), input_ids.size(1)))
+        return torch.zeros(input_ids.size(0), input_ids.size(1), self.config.vocab_size)
+
+    def try_decode_one_token_logits_graph(self, input_ids: torch.Tensor, cache: _WarmupShapeCache) -> torch.Tensor:
+        self.decode_shapes.append((input_ids.size(0), input_ids.size(1)))
+        return torch.zeros(input_ids.size(0), input_ids.size(1), self.config.vocab_size)
 
 
 class _PrefixTokenizer:

@@ -13,7 +13,7 @@ def warmup_prompt_token_counts(default_prompt_tokens: int) -> tuple[int, ...]:
 
 def warmup_temperature_prompt_token_counts() -> tuple[int, ...]:
     return parse_positive_int_csv(
-        os.environ.get("TORCHINFERNO_OPENAI_WARMUP_TEMPERATURE_PROMPT_TOKEN_BUCKETS", "32")
+        os.environ.get("TORCHINFERNO_OPENAI_WARMUP_TEMPERATURE_PROMPT_TOKEN_BUCKETS", "32,55,64")
     )
 
 

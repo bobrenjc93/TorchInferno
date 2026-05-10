@@ -22,7 +22,7 @@ from torchinferno.models.llama3_family.pipeline import (
     resolve_llama3_checkpoint,
 )
 from torchinferno.models.llama3_family.v0 import sample_next_token
-from torchinferno.runtime.options import warn_optional_failure
+from torchinferno.runtime.options import env_flag, env_int, warn_optional_failure
 
 
 _COMPILED_ROTATE_LLAMA = None
@@ -32,6 +32,18 @@ _SYMM_REDUCE_BUFFERS: dict[tuple[str, int, str, str, tuple[int, ...]], Tensor] =
 _SYMM_REDUCE_PROBED: set[tuple[str, int, str, str, tuple[int, ...]]] = set()
 _SYMM_REDUCE_DISABLED = False
 _DEFAULT_DECODE_STEP_MAX_BATCH = 16
+
+
+def _tp_flag(name: str, default: bool = True) -> bool:
+    return env_flag(name, default)
+
+
+def _tp_int(name: str, default: int, *, minimum: int | None = None) -> int:
+    return env_int(name, default, minimum=minimum)
+
+
+def _tp_env_set(name: str) -> bool:
+    return name in os.environ
 
 
 @dataclass(frozen=True)
@@ -102,7 +114,7 @@ class Llama3TensorParallelLayerKVCache:
         end = self.seq_len + tokens
         if end > self.max_seq_len:
             raise ValueError("KV cache capacity exceeded")
-        if keys.is_cuda and values.is_cuda and os.environ.get("TORCHINFERNO_TRITON_KV_APPEND", "1") != "0":
+        if keys.is_cuda and values.is_cuda and _tp_flag("TORCHINFERNO_TRITON_KV_APPEND"):
             try:
                 from torchinferno.kernels.triton_ops import triton_append_kv_cache
 
@@ -427,7 +439,7 @@ class _Llama3TensorParallelLayer:
         batch, tokens, _ = hidden.shape
         if attn_in is None:
             attn_in = _tp_decode_rms_norm(hidden, self.input_layernorm_weight, self.config.rms_norm_eps)
-        if os.environ.get("TORCHINFERNO_TRITON_DECODE_ROTARY_APPEND", "1") != "0":
+        if _tp_flag("TORCHINFERNO_TRITON_DECODE_ROTARY_APPEND"):
             q, k, v = self._qkv(attn_in, batch, tokens, self.config.head_dim)
             q = triton_apply_rotary_append_kv_decode(q, k, v, cache.keys, cache.values, cache_position, rotary[0], rotary[1])
         else:
@@ -440,7 +452,7 @@ class _Llama3TensorParallelLayer:
             attention_values = cache.values[:, :, :attention_block_size, :]
         if (
             self.local_attention_heads > self.local_key_value_heads
-            and os.environ.get("TORCHINFERNO_TRITON_GROUPED_DECODE_ATTENTION", "1") != "0"
+            and _tp_flag("TORCHINFERNO_TRITON_GROUPED_DECODE_ATTENTION")
         ):
             out = triton_grouped_gqa_decode_attention(q, attention_keys, attention_values, attention_length)
         else:
@@ -947,13 +959,13 @@ class _Llama3TensorParallelLayer:
         enable_gqa: bool,
     ) -> Tensor:
         if q.size(-2) == 1:
-            if q.is_cuda and k.size(-2) <= 2048 and os.environ.get("TORCHINFERNO_TRITON_DECODE_ATTENTION", "1") != "0":
+            if q.is_cuda and k.size(-2) <= 2048 and _tp_flag("TORCHINFERNO_TRITON_DECODE_ATTENTION"):
                 try:
                     from torchinferno.kernels.triton_ops import triton_dense_gqa_decode_attention
 
                     return triton_dense_gqa_decode_attention(q, k, v)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    warn_optional_failure("llama3_tensor_parallel.decode_attention", exc)
             return F.scaled_dot_product_attention(
                 q,
                 k,
@@ -983,8 +995,8 @@ class _Llama3TensorParallelLayer:
                 is_causal=False,
                 enable_gqa=enable_gqa,
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            warn_optional_failure("llama3_tensor_parallel.causal_lower_right", exc)
         key_positions = torch.arange(k.size(-2), device=device)
         allowed = key_positions[None, :] <= positions[:, None]
         return F.scaled_dot_product_attention(
@@ -1064,7 +1076,6 @@ class Llama3TensorParallelForCausalLM:
         self._prefill_logits_graphs: dict[tuple[int, int, int, tuple[int, ...]], _StaticPrefillLogitsGraphCall] = {}
         self._prefill_graph_failed = False
         self._prefill_logits_graph_failed = False
-        self._decode_graph: _StaticDecodeGraphCall | None = None
         self._decode_graphs: dict[tuple[int, int, int], _StaticDecodeGraphCall] = {}
         self._decode_logits_graphs: dict[tuple[int, int, int], _StaticDecodeLogitsGraphCall] = {}
         self._decode_graph_failed = False
@@ -1280,7 +1291,7 @@ class Llama3TensorParallelForCausalLM:
         positions = torch.arange(past_len, past_len + tokens, device=self.device)
         rotary = self._rotary_cache(past_len, tokens)
         hidden = F.embedding(input_ids.to(self.device, non_blocking=True), self.embed_tokens_weight)
-        profile_fast_prefill = os.environ.get("TORCHINFERNO_PROFILE_FAST_PREFILL", "0") != "0"
+        profile_fast_prefill = _tp_flag("TORCHINFERNO_PROFILE_FAST_PREFILL", False)
         if tokens > 1 and (profile_fast_prefill or all(layer.profile_seconds is None for layer in self.layers)):
             attn_in: Tensor | None = None
             for layer_id, layer in enumerate(self.layers):
@@ -1319,7 +1330,7 @@ class Llama3TensorParallelForCausalLM:
         temperature: float = 0.0,
     ) -> Tensor | None:
         if (
-            "TORCHINFERNO_CUDAGRAPH_PREFILL" not in os.environ
+            not _tp_env_set("TORCHINFERNO_CUDAGRAPH_PREFILL")
             and int(getattr(self.config, "hidden_size", 0)) < 1024
         ):
             return None
@@ -1328,7 +1339,8 @@ class Llama3TensorParallelForCausalLM:
         try:
             return self._run_prefill_graph(input_ids, cache)
         except Exception as exc:
-            if os.environ.get("TORCHINFERNO_CUDAGRAPH_PREFILL_DEBUG", "0") != "0":
+            warn_optional_failure("llama3_tensor_parallel.prefill_graph", exc)
+            if _tp_flag("TORCHINFERNO_CUDAGRAPH_PREFILL_DEBUG", False):
                 print(f"rank={self.rank} prefill_graph_failed={exc!r}", flush=True)
             self._prefill_graph_failed = True
             return None
@@ -1343,7 +1355,8 @@ class Llama3TensorParallelForCausalLM:
         try:
             return self._run_prefill_logits_graph(input_ids, cache)
         except Exception as exc:
-            if os.environ.get("TORCHINFERNO_CUDAGRAPH_PREFILL_DEBUG", "0") != "0":
+            warn_optional_failure("llama3_tensor_parallel.prefill_logits_graph", exc)
+            if _tp_flag("TORCHINFERNO_CUDAGRAPH_PREFILL_DEBUG", False):
                 print(f"rank={self.rank} prefill_logits_graph_failed={exc!r}", flush=True)
             self._prefill_logits_graph_failed = True
             return None
@@ -1370,7 +1383,7 @@ class Llama3TensorParallelForCausalLM:
             or captured.static_input_ids.shape != input_ids.shape
         ):
             captured = self._capture_prefill_graph(input_ids, cache)
-            max_graphs = max(1, int(os.environ.get("TORCHINFERNO_CUDAGRAPH_PREFILL_MAX_GRAPHS", "128")))
+            max_graphs = _tp_int("TORCHINFERNO_CUDAGRAPH_PREFILL_MAX_GRAPHS", 128, minimum=1)
             if key not in self._prefill_graphs and len(self._prefill_graphs) >= max_graphs:
                 self._prefill_graphs.clear()
             self._prefill_graphs[key] = captured
@@ -1436,7 +1449,7 @@ class Llama3TensorParallelForCausalLM:
             or captured.static_input_ids.shape != input_ids.shape
         ):
             captured = self._capture_prefill_logits_graph(input_ids, cache)
-            max_graphs = max(1, int(os.environ.get("TORCHINFERNO_CUDAGRAPH_PREFILL_MAX_GRAPHS", "128")))
+            max_graphs = _tp_int("TORCHINFERNO_CUDAGRAPH_PREFILL_MAX_GRAPHS", 128, minimum=1)
             if key not in self._prefill_logits_graphs and len(self._prefill_logits_graphs) >= max_graphs:
                 self._prefill_logits_graphs.clear()
             self._prefill_logits_graphs[key] = captured
@@ -1504,7 +1517,8 @@ class Llama3TensorParallelForCausalLM:
         try:
             return self._run_decode_step_graph(input_ids, cache)
         except Exception as exc:
-            if os.environ.get("TORCHINFERNO_CUDAGRAPH_DECODE_DEBUG", "0") != "0":
+            warn_optional_failure("llama3_tensor_parallel.decode_step_graph", exc)
+            if _tp_flag("TORCHINFERNO_CUDAGRAPH_DECODE_DEBUG", False):
                 print(f"rank={self.rank} decode_step_graph_failed={exc!r}", flush=True)
             self._decode_graph_failed = True
             return None
@@ -1519,7 +1533,8 @@ class Llama3TensorParallelForCausalLM:
         try:
             return self._run_decode_step_logits_graph(input_ids, cache)
         except Exception as exc:
-            if os.environ.get("TORCHINFERNO_CUDAGRAPH_DECODE_DEBUG", "0") != "0":
+            warn_optional_failure("llama3_tensor_parallel.decode_step_logits_graph", exc)
+            if _tp_flag("TORCHINFERNO_CUDAGRAPH_DECODE_DEBUG", False):
                 print(f"rank={self.rank} decode_step_logits_graph_failed={exc!r}", flush=True)
             self._decode_logits_graph_failed = True
             return None
@@ -1593,9 +1608,8 @@ class Llama3TensorParallelForCausalLM:
             )
             captured.output_token = self._sample_next_token(logits[:, -1, :], 0.0)
         captured.graph.replay()
-        self._decode_graph = captured
         key = (id(cache), input_ids.size(0), attention_block_size)
-        max_graphs = max(1, int(os.environ.get("TORCHINFERNO_CUDAGRAPH_DECODE_STEP_MAX_GRAPHS", "64")))
+        max_graphs = _tp_int("TORCHINFERNO_CUDAGRAPH_DECODE_STEP_MAX_GRAPHS", 64, minimum=1)
         if key not in self._decode_graphs and len(self._decode_graphs) >= max_graphs:
             self._decode_graphs.clear()
         self._decode_graphs[key] = captured
@@ -1673,7 +1687,7 @@ class Llama3TensorParallelForCausalLM:
             )
         captured.graph.replay()
         key = (id(cache), input_ids.size(0), attention_block_size)
-        max_graphs = max(1, int(os.environ.get("TORCHINFERNO_CUDAGRAPH_DECODE_STEP_MAX_GRAPHS", "64")))
+        max_graphs = _tp_int("TORCHINFERNO_CUDAGRAPH_DECODE_STEP_MAX_GRAPHS", 64, minimum=1)
         if key not in self._decode_logits_graphs and len(self._decode_logits_graphs) >= max_graphs:
             self._decode_logits_graphs.clear()
         self._decode_logits_graphs[key] = captured
@@ -1787,20 +1801,21 @@ class Llama3TensorParallelForCausalLM:
             return sample_next_token(logits, temperature).to(self.device)
         if temperature <= 0:
             return self._sample_next_token_greedy(logits)
-        if os.environ.get("TORCHINFERNO_TEMPERATURE_SAMPLE_GATHER", "1") != "0":
+        if _tp_flag("TORCHINFERNO_TEMPERATURE_SAMPLE_GATHER", False):
             try:
                 return self._sample_next_token_temperature_gather(logits, temperature)
-            except Exception:
-                if os.environ.get("TORCHINFERNO_TEMPERATURE_SAMPLE_GATHER_STRICT", "0") != "0":
+            except Exception as exc:
+                warn_optional_failure("llama3_tensor_parallel.temperature_sample_gather", exc)
+                if _tp_flag("TORCHINFERNO_TEMPERATURE_SAMPLE_GATHER_STRICT", False):
                     raise
         return self._sample_next_token_temperature(logits, temperature)
 
     def _sample_next_token_greedy(self, logits: Tensor) -> Tensor:
-        if os.environ.get("TORCHINFERNO_GREEDY_SAMPLE_GATHER", "1") != "0":
+        if _tp_flag("TORCHINFERNO_GREEDY_SAMPLE_GATHER"):
             try:
                 return self._sample_next_token_greedy_gather(logits)
-            except Exception:
-                pass
+            except Exception as exc:
+                warn_optional_failure("llama3_tensor_parallel.greedy_sample_gather", exc)
         local_values, local_indices = torch.max(logits.float(), dim=-1)
         global_values = local_values.clone()
         dist.all_reduce(global_values, op=dist.ReduceOp.MAX)
@@ -1929,20 +1944,20 @@ def _build_llama_rotary_cache(
 
 def _apply_rotary_cached(q: Tensor, k: Tensor, rotary: tuple[Tensor, Tensor]) -> tuple[Tensor, Tensor]:
     cos, sin = rotary
-    if q.is_cuda and k.is_cuda and os.environ.get("TORCHINFERNO_TRITON_ROTARY", "1") != "0":
+    if q.is_cuda and k.is_cuda and _tp_flag("TORCHINFERNO_TRITON_ROTARY"):
         try:
             from torchinferno.kernels.triton_ops import triton_apply_rotary_llama_inplace
 
             return triton_apply_rotary_llama_inplace(q, k, cos, sin)
-        except Exception:
-            pass
+        except Exception as exc:
+            warn_optional_failure("llama3_tensor_parallel.rotary", exc)
     cos = cos[None, None, :, :]
     sin = sin[None, None, :, :]
     return _rotate_llama(q, cos, sin), _rotate_llama(k, cos, sin)
 
 
 def _rotate_llama(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
-    if x.is_cuda and os.environ.get("TORCHINFERNO_COMPILE_ROTARY", "0") != "0":
+    if x.is_cuda and _tp_flag("TORCHINFERNO_COMPILE_ROTARY", False):
         compiled = _load_compiled_rotate_llama()
         if compiled is not None:
             try:
@@ -1987,7 +2002,7 @@ def _decode_linear(x: Tensor, weight: Tensor, weight_t: Tensor | None = None) ->
         and x.ndim == 3
         and x.size(0) == 1
         and x.size(1) == 1
-        and os.environ.get("TORCHINFERNO_DECODE_LINEAR_MV", "1") != "0"
+        and _tp_flag("TORCHINFERNO_DECODE_LINEAR_MV")
     ):
         if weight_t is not None:
             return torch.mm(x.reshape(1, -1), weight_t).view(1, 1, weight.size(0))
@@ -1998,7 +2013,7 @@ def _decode_linear(x: Tensor, weight: Tensor, weight_t: Tensor | None = None) ->
 def _maybe_decode_weight_t(weight: Tensor) -> Tensor | None:
     if (
         not weight.is_cuda
-        or os.environ.get("TORCHINFERNO_DECODE_TRANSPOSED_WEIGHTS", "1") == "0"
+        or not _tp_flag("TORCHINFERNO_DECODE_TRANSPOSED_WEIGHTS")
         or weight.ndim != 2
     ):
         return None
@@ -2010,7 +2025,7 @@ def _maybe_decode_weight_t(weight: Tensor) -> Tensor | None:
 
 
 def _tp_rms_norm(x: Tensor, weight: Tensor, eps: float) -> Tensor:
-    if x.is_cuda and weight.is_cuda and os.environ.get("TORCHINFERNO_TRITON_RMS_NORM", "0") != "0":
+    if x.is_cuda and weight.is_cuda and _tp_flag("TORCHINFERNO_TRITON_RMS_NORM", False):
         try:
             from torchinferno.kernels import rms_norm as kernel_rms_norm
 
@@ -2021,7 +2036,7 @@ def _tp_rms_norm(x: Tensor, weight: Tensor, eps: float) -> Tensor:
 
 
 def _tp_decode_rms_norm(x: Tensor, weight: Tensor, eps: float) -> Tensor:
-    if x.is_cuda and weight.is_cuda and os.environ.get("TORCHINFERNO_TRITON_DECODE_RMS_NORM", "1") != "0":
+    if x.is_cuda and weight.is_cuda and _tp_flag("TORCHINFERNO_TRITON_DECODE_RMS_NORM"):
         try:
             from torchinferno.kernels import rms_norm as kernel_rms_norm
 
@@ -2036,7 +2051,7 @@ def _tp_decode_add_rms_norm(x: Tensor, residual: Tensor, weight: Tensor, eps: fl
         x.is_cuda
         and residual.is_cuda
         and weight.is_cuda
-        and os.environ.get("TORCHINFERNO_TRITON_DECODE_ADD_RMS_NORM", "1") != "0"
+        and _tp_flag("TORCHINFERNO_TRITON_DECODE_ADD_RMS_NORM")
     ):
         try:
             from torchinferno.kernels.triton_ops import triton_add_rms_norm
@@ -2049,7 +2064,7 @@ def _tp_decode_add_rms_norm(x: Tensor, residual: Tensor, weight: Tensor, eps: fl
 
 
 def _tp_swiglu(gate: Tensor, up: Tensor) -> Tensor:
-    if gate.is_cuda and up.is_cuda and os.environ.get("TORCHINFERNO_TRITON_SWIGLU", "0") != "0":
+    if gate.is_cuda and up.is_cuda and _tp_flag("TORCHINFERNO_TRITON_SWIGLU", False):
         try:
             from torchinferno.kernels import swiglu_activation
 
@@ -2060,7 +2075,7 @@ def _tp_swiglu(gate: Tensor, up: Tensor) -> Tensor:
 
 
 def _tp_decode_swiglu(gate: Tensor, up: Tensor) -> Tensor:
-    if gate.is_cuda and up.is_cuda and os.environ.get("TORCHINFERNO_TRITON_DECODE_SWIGLU", "1") != "0":
+    if gate.is_cuda and up.is_cuda and _tp_flag("TORCHINFERNO_TRITON_DECODE_SWIGLU"):
         try:
             from torchinferno.kernels import swiglu_activation
 
@@ -2076,18 +2091,18 @@ def _should_use_mlp_project_graph(hidden: Tensor) -> bool:
         and hidden.ndim == 3
         and hidden.size(0) == 1
         and hidden.size(1) == 1
-        and os.environ.get("TORCHINFERNO_CUDAGRAPH_MLP", "1") != "0"
+        and _tp_flag("TORCHINFERNO_CUDAGRAPH_MLP")
     )
 
 
 def _should_use_qkv_rotary_graph(hidden: Tensor) -> bool:
-    prefill_tokens = hidden.size(1) > 1 and os.environ.get("TORCHINFERNO_CUDAGRAPH_PREFILL_QKV_ROTARY", "0") != "0"
+    prefill_tokens = hidden.size(1) > 1 and _tp_flag("TORCHINFERNO_CUDAGRAPH_PREFILL_QKV_ROTARY", False)
     return (
         hidden.is_cuda
         and hidden.ndim == 3
         and hidden.size(0) == 1
         and (hidden.size(1) == 1 or prefill_tokens)
-        and os.environ.get("TORCHINFERNO_CUDAGRAPH_QKV_ROTARY", "1") != "0"
+        and _tp_flag("TORCHINFERNO_CUDAGRAPH_QKV_ROTARY")
     )
 
 
@@ -2097,7 +2112,7 @@ def _should_use_prefill_gate_up_activation_graph(hidden: Tensor) -> bool:
         and hidden.ndim == 3
         and hidden.size(0) == 1
         and hidden.size(1) > 1
-        and os.environ.get("TORCHINFERNO_CUDAGRAPH_PREFILL_GATE_UP", "1") != "0"
+        and _tp_flag("TORCHINFERNO_CUDAGRAPH_PREFILL_GATE_UP")
     )
 
 
@@ -2107,12 +2122,12 @@ def _should_use_attention_o_graph(hidden: Tensor) -> bool:
         and hidden.ndim == 3
         and hidden.size(0) == 1
         and hidden.size(1) == 1
-        and os.environ.get("TORCHINFERNO_CUDAGRAPH_ATTENTION_O", "1") != "0"
+        and _tp_flag("TORCHINFERNO_CUDAGRAPH_ATTENTION_O")
     )
 
 
 def _should_graph_all_reduce() -> bool:
-    return os.environ.get("TORCHINFERNO_CUDAGRAPH_ALLREDUCE", "0") != "0"
+    return _tp_flag("TORCHINFERNO_CUDAGRAPH_ALLREDUCE", False)
 
 
 def _should_use_decode_step_graph(
@@ -2121,7 +2136,7 @@ def _should_use_decode_step_graph(
     temperature: float,
 ) -> bool:
     return (
-        os.environ.get("TORCHINFERNO_CUDAGRAPH_DECODE_STEP", "1") != "0"
+        _tp_flag("TORCHINFERNO_CUDAGRAPH_DECODE_STEP")
         and temperature <= 0.0
         and input_ids.is_cuda
         and input_ids.ndim == 2
@@ -2137,7 +2152,7 @@ def _should_use_decode_step_logits_graph(
     cache: Llama3TensorParallelCache,
 ) -> bool:
     return (
-        os.environ.get("TORCHINFERNO_CUDAGRAPH_DECODE_STEP", "1") != "0"
+        _tp_flag("TORCHINFERNO_CUDAGRAPH_DECODE_STEP")
         and input_ids.is_cuda
         and input_ids.ndim == 2
         and 1 <= input_ids.size(0) <= _decode_step_max_batch()
@@ -2148,7 +2163,7 @@ def _should_use_decode_step_logits_graph(
 
 
 def _decode_step_max_batch() -> int:
-    return int(os.environ.get("TORCHINFERNO_CUDAGRAPH_DECODE_STEP_MAX_BATCH", str(_DEFAULT_DECODE_STEP_MAX_BATCH)))
+    return _tp_int("TORCHINFERNO_CUDAGRAPH_DECODE_STEP_MAX_BATCH", _DEFAULT_DECODE_STEP_MAX_BATCH, minimum=1)
 
 
 def _should_use_prefill_graph(
@@ -2156,13 +2171,13 @@ def _should_use_prefill_graph(
     cache: Llama3TensorParallelCache,
     temperature: float,
 ) -> bool:
-    max_cache_tokens = int(os.environ.get("TORCHINFERNO_CUDAGRAPH_PREFILL_MAX_CACHE_TOKENS", "1024"))
+    max_cache_tokens = _tp_int("TORCHINFERNO_CUDAGRAPH_PREFILL_MAX_CACHE_TOKENS", 1024, minimum=1)
     return (
-        os.environ.get("TORCHINFERNO_CUDAGRAPH_PREFILL", "1") != "0"
+        _tp_flag("TORCHINFERNO_CUDAGRAPH_PREFILL")
         and temperature <= 0.0
         and input_ids.is_cuda
         and input_ids.ndim == 2
-        and 1 <= input_ids.size(0) <= int(os.environ.get("TORCHINFERNO_CUDAGRAPH_PREFILL_MAX_BATCH", "8"))
+        and 1 <= input_ids.size(0) <= _tp_int("TORCHINFERNO_CUDAGRAPH_PREFILL_MAX_BATCH", 8, minimum=1)
         and input_ids.size(1) > 1
         and bool(cache.layers)
         and cache.layers[0].keys.is_cuda
@@ -2174,12 +2189,12 @@ def _should_use_prefill_logits_graph(
     input_ids: Tensor,
     cache: Llama3TensorParallelCache,
 ) -> bool:
-    max_cache_tokens = int(os.environ.get("TORCHINFERNO_CUDAGRAPH_PREFILL_MAX_CACHE_TOKENS", "1024"))
+    max_cache_tokens = _tp_int("TORCHINFERNO_CUDAGRAPH_PREFILL_MAX_CACHE_TOKENS", 1024, minimum=1)
     return (
-        os.environ.get("TORCHINFERNO_CUDAGRAPH_PREFILL", "1") != "0"
+        _tp_flag("TORCHINFERNO_CUDAGRAPH_PREFILL")
         and input_ids.is_cuda
         and input_ids.ndim == 2
-        and 1 <= input_ids.size(0) <= int(os.environ.get("TORCHINFERNO_CUDAGRAPH_PREFILL_MAX_BATCH", "8"))
+        and 1 <= input_ids.size(0) <= _tp_int("TORCHINFERNO_CUDAGRAPH_PREFILL_MAX_BATCH", 8, minimum=1)
         and input_ids.size(1) > 1
         and bool(cache.layers)
         and cache.layers[0].keys.is_cuda
@@ -2188,7 +2203,7 @@ def _should_use_prefill_logits_graph(
 
 
 def _decode_attention_block_size(attention_length: int, max_seq_len: int) -> int:
-    if os.environ.get("TORCHINFERNO_CUDAGRAPH_DECODE_ATTENTION_BLOCKS", "1") == "0":
+    if not _tp_flag("TORCHINFERNO_CUDAGRAPH_DECODE_ATTENTION_BLOCKS"):
         return max_seq_len
     if attention_length <= 1:
         return 1
@@ -2199,7 +2214,7 @@ def _should_use_symm_mem_all_reduce(hidden: Tensor, weight: Tensor, world_size: 
     return (
         world_size > 1
         and not _SYMM_REDUCE_DISABLED
-        and os.environ.get("TORCHINFERNO_SYMM_MEM_ALLREDUCE", "1") != "0"
+        and _tp_flag("TORCHINFERNO_SYMM_MEM_ALLREDUCE")
         and hidden.is_cuda
         and weight.is_cuda
         and hidden.ndim == 3
@@ -2212,7 +2227,7 @@ def _should_use_symm_mem_prefill_all_reduce(hidden: Tensor, weight: Tensor, worl
     return (
         world_size > 1
         and not _SYMM_REDUCE_DISABLED
-        and os.environ.get("TORCHINFERNO_SYMM_MEM_PREFILL_ALLREDUCE", "0") != "0"
+        and _tp_flag("TORCHINFERNO_SYMM_MEM_PREFILL_ALLREDUCE", False)
         and hidden.is_cuda
         and weight.is_cuda
         and hidden.ndim == 3

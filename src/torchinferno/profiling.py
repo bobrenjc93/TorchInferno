@@ -1340,124 +1340,119 @@ def _offload_event_to_json(event: OffloadEvent) -> dict[str, Any]:
     return asdict(event)
 
 
-def _artifact_manifest(artifacts: ProfileRunArtifacts) -> dict[str, str | None]:
-    output_dir = artifacts.output_dir
-
+def _relative_artifact_manifest(output_dir: Path, fields: tuple[tuple[str, Path | None], ...]) -> dict[str, str | None]:
     def rel(path: Path | None) -> str | None:
         return str(path.relative_to(output_dir)) if path is not None else None
 
-    return {
-        "run_config": rel(artifacts.run_config),
-        "environment": rel(artifacts.environment),
-        "output": rel(artifacts.output),
-        "memory_profile": rel(artifacts.memory_profile),
-        "operator_profile": rel(artifacts.operator_profile),
-        "chrome_trace": rel(artifacts.chrome_trace),
-        "graph_json": rel(artifacts.graph_json),
-        "graph_text": rel(artifacts.graph_text),
-        "graph_code": rel(artifacts.graph_code),
-        "repro": rel(artifacts.repro),
-    }
+    return {name: rel(path) for name, path in fields}
+
+
+def _artifact_manifest(artifacts: ProfileRunArtifacts) -> dict[str, str | None]:
+    return _relative_artifact_manifest(
+        artifacts.output_dir,
+        (
+            ("run_config", artifacts.run_config),
+            ("environment", artifacts.environment),
+            ("output", artifacts.output),
+            ("memory_profile", artifacts.memory_profile),
+            ("operator_profile", artifacts.operator_profile),
+            ("chrome_trace", artifacts.chrome_trace),
+            ("graph_json", artifacts.graph_json),
+            ("graph_text", artifacts.graph_text),
+            ("graph_code", artifacts.graph_code),
+            ("repro", artifacts.repro),
+        ),
+    )
 
 
 def _focus_artifact_manifest(artifacts: FocusProfileArtifacts) -> dict[str, str | None]:
-    output_dir = artifacts.output_dir
-
-    def rel(path: Path | None) -> str | None:
-        return str(path.relative_to(output_dir)) if path is not None else None
-
-    return {
-        "run_config": rel(artifacts.run_config),
-        "environment": rel(artifacts.environment),
-        "output": rel(artifacts.output),
-        "memory_profile": rel(artifacts.memory_profile),
-        "operator_profile": rel(artifacts.operator_profile),
-        "chrome_trace": rel(artifacts.chrome_trace),
-        "graph_json": rel(artifacts.graph_json),
-        "graph_text": rel(artifacts.graph_text),
-        "graph_code": rel(artifacts.graph_code),
-        "repro": rel(artifacts.repro),
-    }
+    return _relative_artifact_manifest(
+        artifacts.output_dir,
+        (
+            ("run_config", artifacts.run_config),
+            ("environment", artifacts.environment),
+            ("output", artifacts.output),
+            ("memory_profile", artifacts.memory_profile),
+            ("operator_profile", artifacts.operator_profile),
+            ("chrome_trace", artifacts.chrome_trace),
+            ("graph_json", artifacts.graph_json),
+            ("graph_text", artifacts.graph_text),
+            ("graph_code", artifacts.graph_code),
+            ("repro", artifacts.repro),
+        ),
+    )
 
 
 def _pattern_artifact_manifest(artifacts: PatternProfileArtifacts) -> dict[str, str | None]:
-    output_dir = artifacts.output_dir
-
-    def rel(path: Path | None) -> str | None:
-        return str(path.relative_to(output_dir)) if path is not None else None
-
-    return {
-        "run_config": rel(artifacts.run_config),
-        "environment": rel(artifacts.environment),
-        "comparison": rel(artifacts.comparison),
-        "pass_report": rel(artifacts.pass_report),
-        "reference_profile": rel(artifacts.reference_profile),
-        "optimized_profile": rel(artifacts.optimized_profile),
-        "reference_trace": rel(artifacts.reference_trace),
-        "optimized_trace": rel(artifacts.optimized_trace),
-        "reference_graph": rel(artifacts.reference_graph),
-        "optimized_graph": rel(artifacts.optimized_graph),
-        "repro": rel(artifacts.repro),
-    }
+    return _relative_artifact_manifest(
+        artifacts.output_dir,
+        (
+            ("run_config", artifacts.run_config),
+            ("environment", artifacts.environment),
+            ("comparison", artifacts.comparison),
+            ("pass_report", artifacts.pass_report),
+            ("reference_profile", artifacts.reference_profile),
+            ("optimized_profile", artifacts.optimized_profile),
+            ("reference_trace", artifacts.reference_trace),
+            ("optimized_trace", artifacts.optimized_trace),
+            ("reference_graph", artifacts.reference_graph),
+            ("optimized_graph", artifacts.optimized_graph),
+            ("repro", artifacts.repro),
+        ),
+    )
 
 
 def _subgraph_artifact_manifest(artifacts: SubgraphProfileArtifacts) -> dict[str, str | None]:
-    output_dir = artifacts.output_dir
-
-    def rel(path: Path | None) -> str | None:
-        return str(path.relative_to(output_dir)) if path is not None else None
-
-    return {
-        "run_config": rel(artifacts.run_config),
-        "environment": rel(artifacts.environment),
-        "source_graph": rel(artifacts.source_graph),
-        "subgraph_spec": rel(artifacts.subgraph_spec),
-        "subgraph_graph": rel(artifacts.subgraph_graph),
-        "subgraph_text": rel(artifacts.subgraph_text),
-        "subgraph_code": rel(artifacts.subgraph_code),
-        "output": rel(artifacts.output),
-        "memory_profile": rel(artifacts.memory_profile),
-        "operator_profile": rel(artifacts.operator_profile),
-        "chrome_trace": rel(artifacts.chrome_trace),
-        "repro": rel(artifacts.repro),
-    }
+    return _relative_artifact_manifest(
+        artifacts.output_dir,
+        (
+            ("run_config", artifacts.run_config),
+            ("environment", artifacts.environment),
+            ("source_graph", artifacts.source_graph),
+            ("subgraph_spec", artifacts.subgraph_spec),
+            ("subgraph_graph", artifacts.subgraph_graph),
+            ("subgraph_text", artifacts.subgraph_text),
+            ("subgraph_code", artifacts.subgraph_code),
+            ("output", artifacts.output),
+            ("memory_profile", artifacts.memory_profile),
+            ("operator_profile", artifacts.operator_profile),
+            ("chrome_trace", artifacts.chrome_trace),
+            ("repro", artifacts.repro),
+        ),
+    )
 
 
 def _timeslice_artifact_manifest(artifacts: TimeSliceProfileArtifacts) -> dict[str, str | None]:
-    output_dir = artifacts.output_dir
-
-    def rel(path: Path | None) -> str | None:
-        return str(path.relative_to(output_dir)) if path is not None else None
-
-    return {
-        "run_config": rel(artifacts.run_config),
-        "environment": rel(artifacts.environment),
-        "input_ids": rel(artifacts.input_ids),
-        "representative_output": rel(artifacts.output),
-        "memory_profile": rel(artifacts.memory_profile),
-        "operator_profile": rel(artifacts.operator_profile),
-        "chrome_trace": rel(artifacts.chrome_trace),
-        "timeslice_timeline": rel(artifacts.timeline),
-        "timeslice_summary": rel(artifacts.summary),
-        "repro": rel(artifacts.repro),
-    }
+    return _relative_artifact_manifest(
+        artifacts.output_dir,
+        (
+            ("run_config", artifacts.run_config),
+            ("environment", artifacts.environment),
+            ("input_ids", artifacts.input_ids),
+            ("representative_output", artifacts.output),
+            ("memory_profile", artifacts.memory_profile),
+            ("operator_profile", artifacts.operator_profile),
+            ("chrome_trace", artifacts.chrome_trace),
+            ("timeslice_timeline", artifacts.timeline),
+            ("timeslice_summary", artifacts.summary),
+            ("repro", artifacts.repro),
+        ),
+    )
 
 
 def _offload_artifact_manifest(artifacts: OffloadProfileArtifacts) -> dict[str, str | None]:
-    output_dir = artifacts.output_dir
-
-    def rel(path: Path | None) -> str | None:
-        return str(path.relative_to(output_dir)) if path is not None else None
-
-    return {
-        "run_config": rel(artifacts.run_config),
-        "environment": rel(artifacts.environment),
-        "input_ids": rel(artifacts.input_ids),
-        "output": rel(artifacts.output),
-        "offload_events": rel(artifacts.events),
-        "offload_summary": rel(artifacts.summary),
-        "repro": rel(artifacts.repro),
-    }
+    return _relative_artifact_manifest(
+        artifacts.output_dir,
+        (
+            ("run_config", artifacts.run_config),
+            ("environment", artifacts.environment),
+            ("input_ids", artifacts.input_ids),
+            ("output", artifacts.output),
+            ("offload_events", artifacts.events),
+            ("offload_summary", artifacts.summary),
+            ("repro", artifacts.repro),
+        ),
+    )
 
 
 def _build_region_workload(
@@ -1845,18 +1840,28 @@ def _subgraph_config_to_json(config: SubgraphProfileConfig) -> dict[str, Any]:
     return payload
 
 
-def _write_region_repro(path: Path, config: RegionProfileConfig) -> None:
-    source = f'''#!/usr/bin/env python3
+def _repro_prelude(imports: tuple[str, ...] = ("argparse",)) -> str:
+    import_block = "\n".join(f"import {name}" for name in imports)
+    return f'''#!/usr/bin/env python3
 from __future__ import annotations
 
 from pathlib import Path
-import argparse
+{import_block}
 import sys
 
 REPO_ROOT = Path({str(Path.cwd())!r})
 if (REPO_ROOT / "src").exists():
     sys.path.insert(0, str(REPO_ROOT / "src"))
+'''
 
+
+def _write_executable_python(path: Path, source: str) -> None:
+    path.write_text(source)
+    path.chmod(0o755)
+
+
+def _write_region_repro(path: Path, config: RegionProfileConfig) -> None:
+    source = _repro_prelude() + f'''
 from torchinferno.profiling import RegionProfileConfig, run_region_profile_capture
 
 
@@ -1893,22 +1898,11 @@ def main() -> int:
 if __name__ == "__main__":
     raise SystemExit(main())
 '''
-    path.write_text(source)
-    path.chmod(0o755)
+    _write_executable_python(path, source)
 
 
 def _write_pattern_repro(path: Path, config: PatternProfileConfig) -> None:
-    source = f'''#!/usr/bin/env python3
-from __future__ import annotations
-
-from pathlib import Path
-import argparse
-import sys
-
-REPO_ROOT = Path({str(Path.cwd())!r})
-if (REPO_ROOT / "src").exists():
-    sys.path.insert(0, str(REPO_ROOT / "src"))
-
+    source = _repro_prelude() + f'''
 from torchinferno.profiling import PatternProfileConfig, run_pattern_profile_capture
 
 
@@ -1945,22 +1939,11 @@ def main() -> int:
 if __name__ == "__main__":
     raise SystemExit(main())
 '''
-    path.write_text(source)
-    path.chmod(0o755)
+    _write_executable_python(path, source)
 
 
 def _write_subgraph_repro(path: Path, config: SubgraphProfileConfig) -> None:
-    source = f'''#!/usr/bin/env python3
-from __future__ import annotations
-
-from pathlib import Path
-import argparse
-import sys
-
-REPO_ROOT = Path({str(Path.cwd())!r})
-if (REPO_ROOT / "src").exists():
-    sys.path.insert(0, str(REPO_ROOT / "src"))
-
+    source = _repro_prelude() + f'''
 from torchinferno.profiling import SubgraphProfileConfig, run_subgraph_profile_capture
 
 
@@ -1991,22 +1974,11 @@ def main() -> int:
 if __name__ == "__main__":
     raise SystemExit(main())
 '''
-    path.write_text(source)
-    path.chmod(0o755)
+    _write_executable_python(path, source)
 
 
 def _write_timeslice_repro(path: Path, config: TimeSliceProfileConfig) -> None:
-    source = f'''#!/usr/bin/env python3
-from __future__ import annotations
-
-from pathlib import Path
-import argparse
-import sys
-
-REPO_ROOT = Path({str(Path.cwd())!r})
-if (REPO_ROOT / "src").exists():
-    sys.path.insert(0, str(REPO_ROOT / "src"))
-
+    source = _repro_prelude() + f'''
 from torchinferno.profiling import TimeSliceProfileConfig, run_timeslice_profile_capture
 
 
@@ -2050,22 +2022,11 @@ def main() -> int:
 if __name__ == "__main__":
     raise SystemExit(main())
 '''
-    path.write_text(source)
-    path.chmod(0o755)
+    _write_executable_python(path, source)
 
 
 def _write_offload_repro(path: Path, config: OffloadProfileConfig) -> None:
-    source = f'''#!/usr/bin/env python3
-from __future__ import annotations
-
-from pathlib import Path
-import argparse
-import sys
-
-REPO_ROOT = Path({str(Path.cwd())!r})
-if (REPO_ROOT / "src").exists():
-    sys.path.insert(0, str(REPO_ROOT / "src"))
-
+    source = _repro_prelude() + f'''
 from torchinferno.profiling import OffloadProfileConfig, run_offload_profile_capture
 
 
@@ -2102,8 +2063,7 @@ def main() -> int:
 if __name__ == "__main__":
     raise SystemExit(main())
 '''
-    path.write_text(source)
-    path.chmod(0o755)
+    _write_executable_python(path, source)
 
 
 def _write_focus_readme(path: Path, kind: str, artifacts: FocusProfileArtifacts) -> None:
@@ -2177,20 +2137,8 @@ def _write_offload_readme(path: Path, artifacts: OffloadProfileArtifacts) -> Non
 
 
 def _write_repro(path: Path, config: ProfileRunConfig, input_ids: list[list[int]]) -> None:
-    source = f'''#!/usr/bin/env python3
-from __future__ import annotations
-
-from pathlib import Path
-import argparse
-import json
-import sys
-import time
-
+    source = _repro_prelude(("argparse", "json", "time")) + f'''
 import torch
-
-REPO_ROOT = Path({str(Path.cwd())!r})
-if (REPO_ROOT / "src").exists():
-    sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from torchinferno.compiler import CompileConfig, compile_forward
 from torchinferno.models.deepseek import DeepSeekV32ForCausalLM, tiny_deepseek_v32_config
@@ -2277,8 +2225,7 @@ def main() -> int:
 if __name__ == "__main__":
     raise SystemExit(main())
 '''
-    path.write_text(source)
-    path.chmod(0o755)
+    _write_executable_python(path, source)
 
 
 def _dtype_from_name(name: str) -> torch.dtype:

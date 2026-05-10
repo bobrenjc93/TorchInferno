@@ -36,6 +36,7 @@ class OpenAIServerMicrobenchConfig:
     revision: str | None = None
     cache_dir: str | None = None
     modes: tuple[str, ...] = ("non-stream", "stream")
+    prompt_mode: str = "synthetic"
     prompt_tokens: int = 8
     max_tokens: int = 2
     concurrency: int = 1
@@ -317,11 +318,29 @@ def _request_payload(
 ) -> dict[str, Any]:
     return {
         "model": config.model,
-        "messages": [{"role": "user", "content": _prompt_text(config.prompt_tokens, iteration, request_index)}],
+        "messages": _request_messages(config, iteration, request_index),
         "max_tokens": config.max_tokens,
         "temperature": config.temperature,
         "stream": stream,
     }
+
+
+def _request_messages(
+    config: OpenAIServerMicrobenchConfig,
+    iteration: int,
+    request_index: int,
+) -> list[dict[str, str]]:
+    if config.prompt_mode == "self-consistency":
+        return [
+            {
+                "role": "system",
+                "content": "You are a calculator. Respond with only the numerical answer, nothing else.",
+            },
+            {"role": "user", "content": "17 * 23 ="},
+        ]
+    if config.prompt_mode != "synthetic":
+        raise ValueError(f"unsupported prompt_mode {config.prompt_mode!r}")
+    return [{"role": "user", "content": _prompt_text(config.prompt_tokens, iteration, request_index)}]
 
 
 def _prompt_text(prompt_tokens: int, iteration: int, request_index: int) -> str:
