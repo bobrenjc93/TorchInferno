@@ -1809,7 +1809,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--scenario",
         choices=["single", "multi-turn", "long-output"],
         default="single",
-        help="Request shape to measure; multi-turn and long-output match inference-bench calculator workloads.",
+        help="Request shape to measure; multi-turn and long-output exercise chat-style calculator workloads.",
     )
     openai_microbench.add_argument("--model", default=None, help="Model id/path for --backend=model.")
     openai_microbench.add_argument("--model-kind", default="auto")
@@ -2101,7 +2101,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     openai_serve = subparsers.add_parser(
         "openai-server",
-        help="Serve TorchInferno through the OpenAI-compatible API used by inference-bench.",
+        help="Serve TorchInferno through the OpenAI-compatible chat completions API.",
     )
     openai_serve.add_argument("--model", required=True, help="Model id or local checkpoint path.")
     openai_serve.add_argument("--host", default="0.0.0.0")

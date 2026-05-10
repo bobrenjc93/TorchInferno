@@ -30,7 +30,7 @@ from torchinferno.openai_server import (
 )
 
 
-def test_openai_server_matches_inference_bench_contract() -> None:
+def test_openai_server_matches_openai_chat_contract() -> None:
     port = _free_port()
     env = {**os.environ, "PYTHONPATH": "src"}
     cmd = [
@@ -113,17 +113,6 @@ def test_openai_handler_enables_tcp_nodelay() -> None:
     _enable_tcp_nodelay(fake_socket)
 
     assert fake_socket.options == [(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)]
-
-
-def test_inference_bench_provider_adapter_points_at_openai_server() -> None:
-    provider_path = Path(__file__).resolve().parents[1] / "integrations" / "inference_bench" / "torchinferno.py"
-    provider = provider_path.read_text()
-    assert "@register(\"torchinferno\")" in provider
-    assert ".[serve]" in provider
-    assert "torchinferno.openai_server" in provider
-    assert "--tensor-parallel-size" in provider
-    assert "--single-request-admission-wait-ms" in provider
-    assert "--llama-parallelism" not in provider
 
 
 def test_openai_server_auto_launches_tensor_parallel_for_vanilla_provider(monkeypatch) -> None:

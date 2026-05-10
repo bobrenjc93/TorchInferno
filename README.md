@@ -287,10 +287,9 @@ The native suite writes vLLM-shaped `latency.json`, `throughput.json`, and
 `batch-size` controls the latency benchmark; throughput and serve use
 `max-concurrency` as the engine batch limit.
 
-## inference-bench Compatibility
+## OpenAI-Compatible Serving
 
-TorchInferno can also run behind the OpenAI-compatible API expected by
-`github.com/bobrenjc93/inference-bench`:
+TorchInferno can run behind an OpenAI-compatible chat completions API:
 
 ```bash
 PYTHONPATH=src python3 -m torchinferno.openai_server \
@@ -311,17 +310,14 @@ PYTHONPATH=src python3 -m torchinferno.openai_server \
   --device cpu
 ```
 
-The server implements `GET /v1/models` and streaming
-`POST /v1/chat/completions`, which are the endpoints used by the
-`few_shot`, `self_consistency`, `multi_turn`, and `tree_of_thought`
-benchmarks. The drop-in provider adapter lives in
-`integrations/inference_bench/torchinferno.py`.
+The server implements `GET /v1/models` and streaming or non-streaming
+`POST /v1/chat/completions`.
 
 For Llama models, the server follows vLLM/sglang-style launch behavior:
 `--tensor-parallel-size > 1` auto-launches tensor-parallel worker processes
 with `torch.distributed.run` when the command was not already started under a
-distributed launcher. The inference-bench adapter can therefore use the same
-plain OpenAI server shape as the other providers:
+distributed launcher. External benchmark providers can therefore use the same
+plain OpenAI server shape as vLLM and sglang:
 
 ```bash
 PYTHONPATH=src python3 -m torchinferno.openai_server \
@@ -348,8 +344,8 @@ PYTHONPATH=src python3 -m torchinferno.cli openai-microbench \
   --max-tokens 67
 ```
 
-On the 8xH100 Llama 70B inference-bench shape, launch the model backend under
-`torchrun` so tensor-parallel workers use the same OpenAI engine path:
+On an 8xH100 Llama 70B serving shape, launch the model backend under `torchrun`
+so tensor-parallel workers use the same OpenAI engine path:
 
 ```bash
 PYTHONPATH=src torchrun --standalone --nproc-per-node 8 \
