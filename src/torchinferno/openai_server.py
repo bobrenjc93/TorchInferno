@@ -851,6 +851,9 @@ class OpenAICompletionEngine:
     def _restore_prefix_cache(self, input_ids: Tensor, cache: object) -> int:
         if not env_flag("TORCHINFERNO_OPENAI_PREFIX_CACHE", True):
             return 0
+        if not _prefix_cache_enabled_for_model(self.model):
+            self._prefix_cache_entry = None
+            return 0
         if input_ids.size(0) != 1:
             return 0
         entry = self._prefix_cache_entry
@@ -870,6 +873,9 @@ class OpenAICompletionEngine:
 
     def _save_prefix_cache(self, input_ids: Tensor, generated_tokens: list[int], cache: object) -> None:
         if not env_flag("TORCHINFERNO_OPENAI_PREFIX_CACHE", True):
+            return
+        if not _prefix_cache_enabled_for_model(self.model):
+            self._prefix_cache_entry = None
             return
         if input_ids.size(0) != 1 or not generated_tokens:
             return
@@ -905,6 +911,9 @@ class OpenAICompletionEngine:
     def _restore_exact_prefix_cache(self, input_ids: Tensor, cache: object) -> int:
         if not env_flag("TORCHINFERNO_OPENAI_PREFIX_CACHE", True):
             return 0
+        if not _prefix_cache_enabled_for_model(self.model):
+            self._prefix_cache_entry = None
+            return 0
         if input_ids.size(0) != 1:
             return 0
         entry = self._prefix_cache_entry
@@ -933,6 +942,9 @@ class OpenAICompletionEngine:
 
     def _save_prompt_prefix_cache(self, input_ids: Tensor, cache: object) -> None:
         if not env_flag("TORCHINFERNO_OPENAI_PREFIX_CACHE", True):
+            return
+        if not _prefix_cache_enabled_for_model(self.model):
+            self._prefix_cache_entry = None
             return
         if input_ids.size(0) != 1:
             return
@@ -2014,6 +2026,10 @@ def _is_tensor_parallel_primary_model(model: object) -> bool:
 
 def _is_tensor_parallel_worker_model(model: object) -> bool:
     return _is_tensor_parallel_model(model) and _tensor_parallel_world_size(model) > 1 and int(getattr(model, "rank", 0)) != 0
+
+
+def _prefix_cache_enabled_for_model(model: object) -> bool:
+    return not (_is_tensor_parallel_model(model) and _tensor_parallel_world_size(model) > 1)
 
 
 def _broadcast_tensor_parallel_generate(

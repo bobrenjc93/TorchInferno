@@ -824,6 +824,41 @@ def test_openai_engine_batches_variable_length_shared_prefix_suffixes(monkeypatc
     ]
 
 
+def test_openai_engine_disables_prefix_cache_for_tensor_parallel(monkeypatch) -> None:
+    model = _PrefixRecordingModel()
+    engine = _cache_only_engine()
+    engine.model = model
+    engine._prefix_cache_entry = object()
+
+    monkeypatch.setattr(
+        "torchinferno.openai_server._is_tensor_parallel_model",
+        lambda candidate: candidate is model,
+    )
+    monkeypatch.setattr(
+        "torchinferno.openai_server._tensor_parallel_world_size",
+        lambda candidate: 8 if candidate is model else 1,
+    )
+
+    input_ids = torch.tensor([[10, 11]], dtype=torch.long)
+    cache = model.allocate_cache(1, 8)
+    model.forward(input_ids, cache=cache, use_cache=True)
+
+    assert engine._restore_prefix_cache(input_ids, cache) == 0
+    assert engine._prefix_cache_entry is None
+
+    engine._prefix_cache_entry = object()
+    engine._save_prefix_cache(input_ids, [2], cache)
+    assert engine._prefix_cache_entry is None
+
+    engine._prefix_cache_entry = object()
+    assert engine._restore_exact_prefix_cache(input_ids, cache) == 0
+    assert engine._prefix_cache_entry is None
+
+    engine._prefix_cache_entry = object()
+    engine._save_prompt_prefix_cache(input_ids, cache)
+    assert engine._prefix_cache_entry is None
+
+
 def test_openai_engine_cache_pool_is_bounded(monkeypatch) -> None:
     monkeypatch.setenv("TORCHINFERNO_OPENAI_CACHE_POOL_MAX_ENTRIES", "1")
     engine = _cache_only_engine()
