@@ -10,7 +10,7 @@ from torchinferno.models.llama3.tensor_parallel import (
     Llama3TensorParallelForCausalLM,
     Llama3TensorParallelLoadReport,
 )
-from torchinferno.models.llama3.model import Llama3V0ForCausalLM, tiny_llama3_v0_config
+from torchinferno.models.llama3.v0 import Llama3V0ForCausalLM, tiny_llama3_v0_config
 from torchinferno.models.llama3.v1 import Llama3V1ForCausalLM, tiny_llama3_v1_config
 
 __all__ = [

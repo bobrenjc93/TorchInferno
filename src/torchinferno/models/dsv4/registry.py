@@ -7,13 +7,13 @@ VARIANTS = (
     ModelVariantSpec(
         family="dsv4",
         variant="v0",
-        stage="raw-python-reference",
+        stage="make-fx-reference",
         parents=(),
         module="torchinferno.models.dsv4.v0",
         class_name="DSv4V0ForCausalLM",
         ops_module="torchinferno.models.dsv4.raw_ops",
         status="reference",
-        notes="Full-prefix recompute baseline; raw op module is the provenance anchor.",
+        notes="Shape-specialized make_fx graph of the traceable full-prefix DSv4 model; print_readable is available on the variant.",
     ),
     ModelVariantSpec(
         family="dsv4",

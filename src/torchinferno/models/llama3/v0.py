@@ -1,13 +1,22 @@
-"""Provenance alias for the canonical Llama3 model implementation."""
-
 from __future__ import annotations
 
-import sys as _sys
+from torchinferno.models.llama3.config import Llama3Config, tiny_llama3_config
+from torchinferno.models.llama3.traceable_model import TraceableLlama3ForCausalLM
 
-from torchinferno.models.llama3 import model as _module
-from torchinferno.models.llama3.model import *  # noqa: F401,F403
 
-_parent = _sys.modules.get(__name__.rsplit(".", 1)[0])
-if _parent is not None:
-    setattr(_parent, "v0", _module)
-_sys.modules[__name__] = _module
+class Llama3V0ForCausalLM(TraceableLlama3ForCausalLM):
+    """Llama3 v0 make_fx provenance baseline.
+
+    `model.py` owns the pure eager implementation. This v0 wrapper traces the
+    full-prefix forward through `traceable_model.py`, caches the resulting
+    make_fx graph per input shape, and exposes `print_readable()`.
+    """
+
+    provenance_variant = "llama3:v0"
+
+    def __init__(self, config: Llama3Config) -> None:
+        super().__init__(config)
+
+
+def tiny_llama3_v0_config(**overrides: int | float | bool) -> Llama3Config:
+    return tiny_llama3_config(**overrides)

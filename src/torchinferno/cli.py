@@ -1645,7 +1645,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     validate_variants = subparsers.add_parser(
         "validate-model-variants",
-        help="Compare optimized model variant logits against eager v0 references.",
+        help="Compare optimized model variant logits against make_fx v0 references.",
     )
     validate_variants.add_argument("--family", default=None, help="Filter to dsv4, dsv3.2/deepseek-v3.2, or llama3.")
     validate_variants.add_argument("--variant", default=None, help="Only validate one optimized variant, such as v1.")

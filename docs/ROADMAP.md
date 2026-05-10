@@ -36,10 +36,10 @@ provider search, and promotion happen offline as described in
 | --- | --- | --- |
 | DSv4 model family | integrated | Compact torch-native decoder-only causal LM, local checkpoint save/load, CLI smoke, tracing, serving, profiling, and conversion compatibility paths exist. |
 | DeepSeek-V3.2 model family | integrated | Torch-native config/model/cache/checkpoint path mirrors production tensor contracts. |
-| Llama3 model family | reference | Torch-native config plus raw/fused model variants exist for tiny/full planning and logit validation. |
+| Llama3 model family | reference | Torch-native config plus make_fx v0 and fused v1 variants exist for tiny/full planning and logit validation. |
 | Llama3 parallel execution adapters | bridge | Llama 70B config, pipeline and tensor-parallel safetensor loaders/generate paths, torchrun TP compatibility coverage, and optional Triton/CUDA-graph fast paths exist; production scheduler integration remains open. |
-| Model provenance variants | reference | DSv4, DeepSeek-V3.2, and Llama3 have raw/fused v0/v1 ladders and registry lineage. |
-| Eager-vs-optimized logit validation | integrated | `validate-model-variants` compares tiny eager v0 logits against optimized variants with a 1% default tolerance and optional JSON reports. |
+| Model provenance variants | reference | DSv4, DeepSeek-V3.2, and Llama3 have make_fx v0 references, traceable model wrappers, v1 variants, and registry lineage. |
+| V0-vs-optimized logit validation | integrated | `validate-model-variants` compares tiny make_fx v0 logits against optimized variants with a 1% default tolerance and optional JSON reports. |
 | Text IO and known-logit validation | integrated | Auto model loading, tokenizer-backed generation, `capture-logits`, and `validate-logits` cover checkpoint bringup without a server. |
 | Checkpoint conversion | integrated | Shape/key audit plus sharded safetensor writer; needs real-weight golden validation. |
 | Offline `torch.compile` experiments | integrated | Shared compile policy and smoke path exist for explicit experiments and comparisons, not runtime hot-path compilation. |

@@ -105,11 +105,11 @@ def run_variant_logit_validation(
     rtol: float = 1e-2,
     include_tensor_parallel: bool = False,
 ) -> VariantLogitValidationReport:
-    """Compare optimized model variants against their eager v0 logits.
+    """Compare optimized model variants against their make_fx v0 logits.
 
     The default cases are intentionally tiny and CPU-friendly so this can be run
     as part of normal optimization loops. `rtol=1e-2` encodes the "within 1% of
-    eager" contract while `atol` keeps near-zero eager logits from dominating the
+    v0" contract while `atol` keeps near-zero v0 logits from dominating the
     pass/fail decision.
     """
 

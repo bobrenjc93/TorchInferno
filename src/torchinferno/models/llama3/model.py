@@ -6,7 +6,7 @@ import torch
 from torch import Tensor, nn
 
 from torchinferno.models.llama3 import raw_ops
-from torchinferno.models.llama3.config import Llama3Config, tiny_llama3_config
+from torchinferno.models.llama3.config import Llama3Config
 from torchinferno.runtime.sampling import sample_next_token
 
 
@@ -125,13 +125,3 @@ class _Llama3ForCausalLMBase(nn.Module):
             if eos_token_id is not None and torch.all(next_token == eos_token_id):
                 break
         return output
-
-
-class Llama3V0ForCausalLM(_Llama3ForCausalLMBase):
-    provenance_variant = "llama3:v0"
-
-    def __init__(self, config: Llama3Config) -> None:
-        super().__init__(config, raw_ops)
-
-def tiny_llama3_v0_config(**overrides: int | float | bool) -> Llama3Config:
-    return tiny_llama3_config(**overrides)

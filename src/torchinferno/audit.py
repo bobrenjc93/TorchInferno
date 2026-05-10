@@ -71,7 +71,7 @@ def build_audit_report() -> TorchInfernoAudit:
             FeatureAudit(
                 "Llama3 model family",
                 "reference",
-                "Torch-native config plus raw/fused variants cover tiny/full planning and logit validation.",
+                "Torch-native config plus make_fx v0 and fused v1 variants cover tiny/full planning and logit validation.",
             ),
             FeatureAudit(
                 "Llama3 parallel execution adapters",
@@ -153,12 +153,12 @@ def build_audit_report() -> TorchInfernoAudit:
             FeatureAudit(
                 "model variant provenance",
                 "reference",
-                "DSv4, DeepSeek-V3.2, and Llama3 have v0/v1 raw/fused variant registries.",
+                "DSv4, DeepSeek-V3.2, and Llama3 have make_fx v0 references, traceable model wrappers, v1 variants, and registry lineage.",
             ),
             FeatureAudit(
-                "eager-vs-optimized logit validation",
+                "v0-vs-optimized logit validation",
                 "integrated",
-                "validate-model-variants compares tiny eager v0 logits against optimized variants with a 1% default tolerance and JSON reports for agent loops.",
+                "validate-model-variants compares tiny make_fx v0 logits against optimized variants with a 1% default tolerance and JSON reports for agent loops.",
             ),
         ),
     )

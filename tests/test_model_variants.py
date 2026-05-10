@@ -64,6 +64,34 @@ def test_model_variant_registry_tracks_families_and_ops_modules() -> None:
         assert hasattr(module, spec.class_name)
 
 
+def test_v0_variants_are_make_fx_graph_backed() -> None:
+    torch.manual_seed(49)
+    input_ids = torch.tensor([[1, 2, 3]], dtype=torch.long)
+    cases = (
+        DSv4V0ForCausalLM(tiny_dsv4_v0_config(vocab_size=32, max_seq_len=16)).eval(),
+        DeepSeekV32V0ForCausalLM(
+            tiny_deepseek_v32_v0_config(vocab_size=32, max_position_embeddings=16)
+        ).eval(),
+        Llama3V0ForCausalLM(tiny_llama3_config(vocab_size=32, max_position_embeddings=16)).eval(),
+    )
+
+    for model in cases:
+        graph = model.v0_graph(input_ids)
+        readable = model.print_readable(input_ids, print_output=False)
+        expected = model._traceable_forward(input_ids)
+        if isinstance(model, Llama3V0ForCausalLM):
+            actual = model(input_ids)
+        else:
+            actual, cache = model(input_ids, use_cache=False)
+            assert cache is None
+
+        assert isinstance(graph, torch.fx.GraphModule)
+        assert model.v0_graph(input_ids) is graph
+        assert "torch.ops.aten" in readable
+        assert not any(key.startswith("_param_constant") for key in model.state_dict())
+        torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
+
+
 def test_llama3_v0_and_v1_are_weight_compatible() -> None:
     torch.manual_seed(50)
     config = tiny_llama3_config(vocab_size=32, max_position_embeddings=16)

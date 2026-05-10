@@ -12,13 +12,17 @@ Canonical family packages:
 
 Each family package should prefer this structure:
 
-- `model.py`: readable single-device model code, config dataclasses, forward
-  contracts, cache objects, and checkpoint-facing model class.
+- `model.py`: pure readable single-device model code, config dataclasses,
+  forward contracts, cache objects, and checkpoint-facing model class.
+- `traceable_model.py`: the smallest adjustments needed for make_fx capture,
+  such as no-cache full-prefix forward wrappers and stable sample inputs.
 - `raw_ops.py`: provider-independent Python/PyTorch operation boundaries for
-  the `v0` reference.
+  the traceable reference.
 - `fused_ops.py`: checked-in promoted operation hooks that preserve the raw
   contract.
-- `v0.py`, `v1.py`, ...: provenance-tracked variants.
+- `v0.py`: make_fx-backed reference variant with `v0_graph()` and
+  `print_readable()` helpers.
+- `v1.py`, ...: provenance-tracked promoted variants.
 - `registry.py`: variant parentage, class path, ops module, status, and notes.
 - `pipeline.py` / `tensor_parallel.py`: optional family-specific execution
   adapters when a production-scale shape needs them.

@@ -7,13 +7,13 @@ VARIANTS = (
     ModelVariantSpec(
         family="llama3",
         variant="v0",
-        stage="raw-python-reference",
+        stage="make-fx-reference",
         parents=(),
         module="torchinferno.models.llama3.v0",
         class_name="Llama3V0ForCausalLM",
         ops_module="torchinferno.models.llama3.raw_ops",
         status="reference",
-        notes="Torch-native Llama3 full-prefix reference with raw Python/PyTorch ops.",
+        notes="Shape-specialized make_fx graph of the traceable full-prefix Llama3 model; print_readable is available on the variant.",
     ),
     ModelVariantSpec(
         family="llama3",

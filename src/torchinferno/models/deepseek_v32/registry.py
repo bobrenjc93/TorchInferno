@@ -7,13 +7,13 @@ VARIANTS = (
     ModelVariantSpec(
         family="deepseek-v3.2",
         variant="v0",
-        stage="raw-python-reference",
+        stage="make-fx-reference",
         parents=(),
         module="torchinferno.models.deepseek_v32.v0",
         class_name="DeepSeekV32V0ForCausalLM",
         ops_module="torchinferno.models.deepseek_v32.raw_ops",
         status="reference",
-        notes="Full-prefix recompute baseline with raw op provenance.",
+        notes="Shape-specialized make_fx graph of the traceable full-prefix DeepSeek-V3.2 model; print_readable is available on the variant.",
     ),
     ModelVariantSpec(
         family="deepseek-v3.2",
