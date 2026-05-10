@@ -1485,6 +1485,8 @@ class OpenAICompletionEngine:
     def _shared_prefix_batch_tokens(self, input_ids: Tensor) -> int:
         if not env_flag("TORCHINFERNO_OPENAI_SHARED_PREFIX_BATCH", True):
             return 0
+        if not _shared_prefix_batch_enabled_for_model(self.model):
+            return 0
         if input_ids.size(0) <= 1 or input_ids.size(1) <= 1:
             return 0
         prefix_tokens = min(_common_prefix_token_count(input_ids), input_ids.size(1) - 1)
@@ -1493,6 +1495,8 @@ class OpenAICompletionEngine:
 
     def _shared_prefix_prompt_list_tokens(self, prompts: Sequence[Sequence[int]]) -> int:
         if not env_flag("TORCHINFERNO_OPENAI_SHARED_PREFIX_BATCH", True):
+            return 0
+        if not _shared_prefix_batch_enabled_for_model(self.model):
             return 0
         if len(prompts) <= 1:
             return 0
@@ -1935,6 +1939,13 @@ def _is_tensor_parallel_worker_model(model: object) -> bool:
 
 
 def _prefix_cache_enabled_for_model(model: object) -> bool:
+    return not (_is_tensor_parallel_model(model) and _tensor_parallel_world_size(model) > 1)
+
+
+def _shared_prefix_batch_enabled_for_model(model: object) -> bool:
+    # Shared-prefix batch splitting interleaves one prefix prefill with several
+    # suffix prefills. Under TP, a request burst can leave rank 0 and worker
+    # ranks at different split points, which changes NCCL collective sizes.
     return not (_is_tensor_parallel_model(model) and _tensor_parallel_world_size(model) > 1)
 
 
