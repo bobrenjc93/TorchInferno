@@ -59,17 +59,22 @@ def build_audit_report() -> TorchInfernoAudit:
         environment=environment,
         features=(
             FeatureAudit(
-                "compact DSv4 harness",
+                "DSv4 model family",
                 "integrated",
-                "Torch-native decoder-only model covers local generation, checkpoints, tracing, serving, profiling, and conversion compatibility.",
+                "Compact torch-native decoder-only model covers local generation, checkpoints, tracing, serving, profiling, and conversion compatibility.",
             ),
             FeatureAudit(
-                "native DeepSeek-V3.2 model",
+                "DeepSeek-V3.2 model family",
                 "integrated",
                 "Native config/model/cache/checkpoint path mirrors production tensor contracts.",
             ),
             FeatureAudit(
-                "native Llama3 production-scale paths",
+                "Llama3 model family",
+                "reference",
+                "Torch-native config plus raw/fused variants cover tiny/full planning and logit validation.",
+            ),
+            FeatureAudit(
+                "Llama3 parallel execution adapters",
                 "bridge",
                 "Llama 70B config plus pipeline and tensor-parallel safetensor loaders/generate paths exist; scheduler integration remains open.",
             ),

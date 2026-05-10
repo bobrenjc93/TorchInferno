@@ -5,11 +5,14 @@ TorchInferno is a torch-native inference workbench in the spirit of
 inference systems easy to trace, optimize, simulate, and extend without booting
 a heavyweight serving stack for every experiment.
 
-The current repo has a working DSv4-style end-to-end path, a native
-DeepSeek-V3.2-style path, and focused surfaces for compiler, runtime,
-scheduling, cache, routing, serving, profiling, and research work. The
-readiness snapshot lives in [`docs/ROADMAP.md`](docs/ROADMAP.md) and is also
-available from [`torchinferno audit`](src/torchinferno/audit.py).
+The current repo is organized around torch-native model families plus shared
+workbenches for compiler, runtime, scheduling, cache, routing, serving,
+profiling, and research work. Capability maturity differs by family: DSv4 and
+native DeepSeek are the smallest CPU-friendly correctness and cache paths,
+while Llama3 currently carries the production-scale pipeline and
+tensor-parallel adapters. The readiness snapshot lives in
+[`docs/ROADMAP.md`](docs/ROADMAP.md) and is also available from
+[`torchinferno audit`](src/torchinferno/audit.py).
 
 <details>
 <summary>Documentation guide</summary>
@@ -88,9 +91,10 @@ available from [`torchinferno audit`](src/torchinferno/audit.py).
 - Eager-vs-optimized model variant logit validation with a 1% default tolerance
   and optional JSON reports for agent/research loops.
 - Minimal auto research harness for comparing scheduler/cache/routing policies.
-- Llama 3 70B architecture config plus native pipeline-sharded and
-  tensor-parallel checkpoint loader/generate paths for running production-scale
-  weights across multiple GPUs without depending on Hugging Face model classes.
+- Llama 3 70B architecture config plus family-specific pipeline-sharded and
+  tensor-parallel checkpoint loader/generate adapters for running
+  production-scale weights across multiple GPUs without depending on Hugging
+  Face model classes.
 - Tensor-parallel Llama fast paths for optional Triton rotary, KV append,
   RMSNorm, SwiGLU, dense/grouped decode attention, and decode-step CUDA graph
   capture.
@@ -107,27 +111,37 @@ available from [`torchinferno audit`](src/torchinferno/audit.py).
 
 ```mermaid
 flowchart LR
-  CLI["CLI: torchinferno.cli"] --> Models["Torch-native models"]
-  Models --> DSv4["Compact DSv4 harness"]
-  Models --> DeepSeek["Native DeepSeek V3.2 path"]
-  Models --> Llama["Llama 3 pipeline and tensor-parallel paths"]
-  CLI --> Runtime["Runtime workbenches"]
-  Runtime --> Serving["Continuous batching and OpenAI HTTP"]
-  Runtime --> Profiles["Profile artifacts, offload, and FX subgraphs"]
-  Runtime --> Kernels["Triton, Helion, and NVFP4 kernel hooks"]
-  Profiles --> Artifacts["JSON, Chrome traces, repro.py"]
-  Serving --> Benchmarks["OpenAI and vLLM-compatible benchmarks"]
+  CLI["CLI: torchinferno.cli"] --> Families["Model families"]
+  Families --> DSv4["DSv4 compact family"]
+  Families --> DeepSeek["DeepSeek V3.2 tensor-contract family"]
+  Families --> Llama["Llama3 family"]
+  Families --> Contracts["Forward, generate, cache, checkpoint contracts"]
+  CLI --> Workbenches["Execution workbenches"]
+  Contracts --> Workbenches
+  Workbenches --> Serving["Serving, batching, routing, cache policy"]
+  Workbenches --> Profiles["Profiles, offload, FX subgraphs"]
+  Workbenches --> Kernels["Graph passes and kernel hooks"]
+  Workbenches --> Parallel["Simulation, disagg, pipeline/tensor parallel"]
+  Workbenches --> Benchmarks["OpenAI and vLLM-compatible benchmarks"]
 ```
 
 </details>
+
+Read the diagram as two axes. DSv4, DeepSeek-V3.2, and Llama3 are model
+families with their own tensor contracts and provenance. Serving, profiling,
+parallelism, benchmarks, and kernel replacement are execution workbenches that
+consume those families. Some workbenches are currently wired to one family
+first, such as Llama3's production-scale pipeline and tensor-parallel adapters,
+but that does not make parallelism a Llama-only concept.
 
 ## Source Map
 
 | Surface | Primary code | Fast verification |
 | --- | --- | --- |
-| Compact DSv4 model | [`models/dsv4.py`](src/torchinferno/models/dsv4.py), [`models/dsv4_family/`](src/torchinferno/models/dsv4_family/) | `dsv4-smoke`, `dsv4-hf-smoke`, `model-variants` |
-| Native DeepSeek-V3.2-style model | [`models/deepseek.py`](src/torchinferno/models/deepseek.py), [`models/deepseek_v32_family/`](src/torchinferno/models/deepseek_v32_family/) | `deepseek-smoke`, `deepseek-hf-smoke`, `deepseek-audit` |
-| Native Llama production-scale paths | [`models/llama3_family/`](src/torchinferno/models/llama3_family/) | `llama-bench-suite`, `validate-model-variants --family llama3` |
+| DSv4 model family | [`models/dsv4.py`](src/torchinferno/models/dsv4.py), [`models/dsv4_family/`](src/torchinferno/models/dsv4_family/) | `dsv4-smoke`, `dsv4-hf-smoke`, `model-variants` |
+| DeepSeek-V3.2 model family | [`models/deepseek.py`](src/torchinferno/models/deepseek.py), [`models/deepseek_v32_family/`](src/torchinferno/models/deepseek_v32_family/) | `deepseek-smoke`, `deepseek-hf-smoke`, `deepseek-audit` |
+| Llama3 model family | [`models/llama3_family/`](src/torchinferno/models/llama3_family/) | `validate-model-variants --family llama3`, `llama-bench-suite` |
+| Parallel and distributed execution | [`runtime/`](src/torchinferno/runtime/), [`models/llama3_family/pipeline.py`](src/torchinferno/models/llama3_family/pipeline.py), [`models/llama3_family/tensor_parallel.py`](src/torchinferno/models/llama3_family/tensor_parallel.py) | `disagg-smoke`, `llama-bench-suite`, `tests/test_llama3_tensor_parallel_distributed.py` |
 | OpenAI-compatible serving | [`openai_server.py`](src/torchinferno/openai_server.py), [`openai_http.py`](src/torchinferno/openai_http.py), [`openai_warmup.py`](src/torchinferno/openai_warmup.py), [`runtime/serving.py`](src/torchinferno/runtime/serving.py) | `openai-server`, `openai-microbench`, `openai-server-microbench`, `serve-smoke` |
 | Runtime policy experiments | [`runtime/`](src/torchinferno/runtime/) | `sim-smoke`, `traffic-smoke`, `disagg-init`, `disagg-smoke` |
 | Compiler and FX graph work | [`compiler.py`](src/torchinferno/compiler.py), [`graph/`](src/torchinferno/graph/) | `trace-smoke`, `profile-pattern`, `profile-subgraph` |
@@ -234,10 +248,11 @@ PYTHONPATH=src python3 -m torchinferno.cli dsv4-smoke --device cuda
 PYTHONPATH=src python3 -m torchinferno.cli deepseek-smoke --device cuda
 ```
 
-## DSv4 End-To-End Path
+## DSv4 Model Family
 
 The compact model lives in `src/torchinferno/models/dsv4.py`. It is the fast
-local harness for compiler, cache, serving, and graph-pass experiments.
+CPU-friendly model family for compiler, cache, serving, and graph-pass
+experiments.
 
 ```python
 import torch
@@ -262,7 +277,7 @@ execution, serving, tracing, and runtime scaffolds.
 
 The native model lives in `src/torchinferno/models/deepseek.py`. It mirrors the
 production DeepSeek-style tensor contracts rather than compressing them into the
-compact DSv4 harness.
+compact DSv4 family.
 
 ```python
 import torch
@@ -310,9 +325,9 @@ initialization.
 
 Current families:
 
-- `dsv4`: compact DeepSeek-style DSv4 harness.
+- `dsv4`: compact DeepSeek-style DSv4 model family.
 - `deepseek-v3.2` / `dsv3.2`: native DeepSeek-V3.2 tensor-contract path.
-- `llama3`: torch-native Llama3 reference path.
+- `llama3`: torch-native Llama3 model family.
 
 <details>
 <summary>Current variant ladder</summary>
@@ -329,6 +344,12 @@ Current families:
 | `llama3` | `tp-v0` | experimental | Torchrun/NCCL tensor-parallel loader/generate path for production-scale comparisons. |
 
 </details>
+
+The variant ladder tracks model-family provenance. Execution modes are a
+separate axis: serving, profiling, disaggregated planning, and parallel
+sharding should consume the model families through stable contracts. Llama3 has
+`pipeline-v0` and `tp-v0` today because the 70B benchmark requires
+production-scale loading, not because parallelism belongs only to Llama3.
 
 The public Llama 3 70B shape is available as `llama3_70b_config()` for
 planning and compatibility checks without constructing the full model:
@@ -394,13 +415,13 @@ vLLM JSON results again:
 PYTHONPATH=src python3 -m torchinferno.cli vllm-bench-plot .torchinferno_runs/vllm-llama70b
 ```
 
-## Native TorchInferno Llama 70B Benchmarks
+## Llama3 Parallel Adapters And Benchmarks
 
-TorchInferno also has native Llama 70B paths that load safetensors directly.
-`pipeline-v0` keeps each decoder layer on one device and moves activations at
-layer boundaries. `tp-v0` is the closer vLLM comparison point: launch it with
-`torchrun`, shard QKV/MLP weights across ranks, use NCCL all-reduce, and keep
-decode KV cached.
+TorchInferno's shared benchmark and serving workbenches currently have
+Llama3-specific adapters for 70B safetensor checkpoints. `pipeline-v0` keeps
+each decoder layer on one device and moves activations at layer boundaries.
+`tp-v0` is the closer vLLM comparison point: launch it with `torchrun`, shard
+QKV/MLP weights across ranks, use NCCL all-reduce, and keep decode KV cached.
 
 Plan the run:
 
@@ -1037,7 +1058,7 @@ and store `torchinferno_conversion_report.json` in the output directory.
 
 Use `deepseek-audit` and `deepseek-convert` for native production architecture
 checkpoints. The older `dsv4-*` conversion path remains intentionally
-conservative for the compact DSv4 harness and still refuses tensors DSv4 cannot
+conservative for the compact DSv4 family and still refuses tensors DSv4 cannot
 represent exactly.
 
 ## Repository Layout
@@ -1066,8 +1087,8 @@ src/torchinferno/
   models/*_family/        Provenance-tracked raw/fused model variant ladders.
   models/provenance.py    Variant registry dataclasses and lineage helper.
   models/dsv4.py          DSv4-style causal LM, MoE, attention, and KV cache.
-  models/llama3_family/   Torch-native Llama3 raw/fused, pipeline, and
-                           tensor-parallel variants.
+  models/llama3_family/   Torch-native Llama3 raw/fused variants plus current
+                           family-specific pipeline and tensor-parallel adapters.
   models/variants.py      Model variant listing and lineage helpers.
   models/auto.py          Config-driven model loader.
   models/deepseek.py      Native DeepSeek-V3.2-style architecture.
@@ -1159,8 +1180,9 @@ Implemented as working code and tests:
   auto-launched Llama tensor-parallel workers.
 - OpenAI microbench prompt modes, phase-timing summaries, and model profile
   breakdown hooks for serving hot-path analysis.
-- Native Llama 3 pipeline and tensor-parallel checkpoint loading/generation,
-  plus vLLM-shaped latency, throughput, and serving benchmark suites.
+- Family-specific Llama 3 pipeline and tensor-parallel checkpoint
+  loading/generation, plus vLLM-shaped latency, throughput, and serving
+  benchmark suites.
 - Pattern-match graph replacement entry point, including a multi-node
   make_fx/ATen subgraph replacement example.
 - Native DeepSeek dense/paged cache backend selection.
@@ -1198,6 +1220,8 @@ Still intentionally future work:
 ## Development Principles
 
 - Keep model code torch-native and easy to trace.
+- Keep model families, execution workbenches, and family-specific adapters
+  documented as separate axes.
 - Put experimental runtime policy in explicit harnesses, not hidden globals.
 - Prefer simulation-first workflows over heavyweight serving bootstraps.
 - Make it easy to zoom into a layer, graph region, cache policy, or scheduler.

@@ -25,11 +25,18 @@ The CLI view is [`torchinferno audit`](../src/torchinferno/audit.py).
 
 ## Current Status
 
+The table separates model families from execution workbenches. A family owns
+the torch-native tensor contract and provenance; workbenches own serving,
+profiling, scheduling, parallelism, and kernel replacement around those
+contracts. Some workbenches are wired to one family first, but they are not
+family concepts.
+
 | Area | Status | Notes |
 | --- | --- | --- |
-| Compact DSv4 harness | integrated | Torch-native decoder-only causal LM, local checkpoint save/load, CLI smoke, tracing, serving, profiling, and conversion compatibility paths exist. |
-| Native DeepSeek-V3.2-style model | integrated | Torch-native config/model/cache/checkpoint path exists. |
-| Native Llama3 production-scale paths | bridge | Llama 70B config, pipeline and tensor-parallel safetensor loaders/generate paths, torchrun TP compatibility coverage, and optional Triton/CUDA-graph fast paths exist; production scheduler integration remains open. |
+| DSv4 model family | integrated | Compact torch-native decoder-only causal LM, local checkpoint save/load, CLI smoke, tracing, serving, profiling, and conversion compatibility paths exist. |
+| DeepSeek-V3.2 model family | integrated | Torch-native config/model/cache/checkpoint path mirrors production tensor contracts. |
+| Llama3 model family | reference | Torch-native config plus raw/fused model variants exist for tiny/full planning and logit validation. |
+| Llama3 parallel execution adapters | bridge | Llama 70B config, pipeline and tensor-parallel safetensor loaders/generate paths, torchrun TP compatibility coverage, and optional Triton/CUDA-graph fast paths exist; production scheduler integration remains open. |
 | Model provenance variants | reference | DSv4, DeepSeek-V3.2, and Llama3 have raw/fused v0/v1 ladders and registry lineage. |
 | Eager-vs-optimized logit validation | integrated | `validate-model-variants` compares tiny eager v0 logits against optimized variants with a 1% default tolerance and optional JSON reports. |
 | Text IO and known-logit validation | integrated | Auto model loading, tokenizer-backed generation, `capture-logits`, and `validate-logits` cover checkpoint bringup without a server. |
@@ -59,9 +66,10 @@ The CLI view is [`torchinferno audit`](../src/torchinferno/audit.py).
 
 | Area | Code | Verification |
 | --- | --- | --- |
-| Compact DSv4 harness | [`models/dsv4.py`](../src/torchinferno/models/dsv4.py), [`models/dsv4_family/`](../src/torchinferno/models/dsv4_family/) | `dsv4-smoke`, `dsv4-hf-smoke`, `tests/test_dsv4_e2e.py` |
-| Native DeepSeek-V3.2-style model | [`models/deepseek.py`](../src/torchinferno/models/deepseek.py), [`models/deepseek_v32_family/`](../src/torchinferno/models/deepseek_v32_family/) | `deepseek-smoke`, `deepseek-hf-smoke`, `tests/test_deepseek_native.py` |
-| Native Llama3 production-scale paths | [`models/llama3_family/`](../src/torchinferno/models/llama3_family/) | `llama-bench-suite`, `tests/test_llama3_tensor_parallel_distributed.py` |
+| DSv4 model family | [`models/dsv4.py`](../src/torchinferno/models/dsv4.py), [`models/dsv4_family/`](../src/torchinferno/models/dsv4_family/) | `dsv4-smoke`, `dsv4-hf-smoke`, `tests/test_dsv4_e2e.py` |
+| DeepSeek-V3.2 model family | [`models/deepseek.py`](../src/torchinferno/models/deepseek.py), [`models/deepseek_v32_family/`](../src/torchinferno/models/deepseek_v32_family/) | `deepseek-smoke`, `deepseek-hf-smoke`, `tests/test_deepseek_native.py` |
+| Llama3 model family | [`models/llama3_family/`](../src/torchinferno/models/llama3_family/) | `validate-model-variants --family llama3`, `tests/test_model_variants.py` |
+| Llama3 parallel execution adapters | [`models/llama3_family/pipeline.py`](../src/torchinferno/models/llama3_family/pipeline.py), [`models/llama3_family/tensor_parallel.py`](../src/torchinferno/models/llama3_family/tensor_parallel.py), [`benchmarks/torchinferno_llama.py`](../src/torchinferno/benchmarks/torchinferno_llama.py) | `llama-bench-suite`, `tests/test_llama3_tensor_parallel_distributed.py` |
 | Model provenance and validation | [`models/variants.py`](../src/torchinferno/models/variants.py), [`variant_validation.py`](../src/torchinferno/variant_validation.py) | `model-variants`, `validate-model-variants`, `tests/test_model_variants.py` |
 | Text IO and known-logit validation | [`tokenization.py`](../src/torchinferno/tokenization.py), [`validation.py`](../src/torchinferno/validation.py), [`models/auto.py`](../src/torchinferno/models/auto.py) | `text-generate`, `capture-logits`, `validate-logits`, `tests/test_production_workflows.py` |
 | Checkpoint conversion | [`models/conversion.py`](../src/torchinferno/models/conversion.py) | `dsv4-audit`, `dsv4-convert`, `deepseek-audit`, `deepseek-convert`, `tests/test_conversion_and_kernels.py` |

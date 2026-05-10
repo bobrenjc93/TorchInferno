@@ -74,6 +74,9 @@ python3 -m pytest tests/test_serving_engine.py
   `src/torchinferno/graph/`.
 - Scheduling, batching, cache, routing, and simulation policies:
   `src/torchinferno/runtime/`.
+- Parallel and distributed execution adapters: shared policy in
+  `src/torchinferno/runtime/`; family-specific checkpoint loading or sharding
+  adapters beside the affected model family.
 - Native paged-cache serving integration: `src/torchinferno/runtime/serving.py`
   and `src/torchinferno/models/deepseek.py`.
 - Feature readiness/DX status: `src/torchinferno/audit.py` and
@@ -87,6 +90,8 @@ python3 -m pytest tests/test_serving_engine.py
 ## Contribution Shape
 
 - Keep model code torch-native and easy to trace.
+- Keep model families separate from serving, profiling, parallelism, and other
+  execution workbenches in docs and APIs.
 - Add focused tests for every new scaffold or policy.
 - Prefer small APIs that can run on CPU before introducing CUDA-only code.
 - Use fake process groups and time-sliced simulation for distributed policy
