@@ -1609,7 +1609,12 @@ class OpenAICompletionEngine:
         prefix_ids = torch.tensor([length_groups[0][0][1][:prefix_tokens]], dtype=torch.long, device=self.device)
         restored_prefix_tokens = self._restore_exact_prefix_cache(prefix_ids, prefix_cache)
         if restored_prefix_tokens != prefix_tokens:
-            prefix_cache = _prefill_cache_only(model, prefix_ids, prefix_cache, allow_capture=True)
+            prefix_cache = _prefill_cache_only(
+                model,
+                prefix_ids,
+                prefix_cache,
+                allow_capture=_runtime_prefill_graph_capture_enabled(model),
+            )
             self._save_prompt_prefix_cache(prefix_ids, prefix_cache)
 
         states: list[dict[str, object]] = []
@@ -1627,7 +1632,13 @@ class OpenAICompletionEngine:
             )
             _copy_generation_cache_first_row(prefix_cache, cache, len(prompt_rows))
             suffix_ids = torch.tensor(suffix_rows, dtype=torch.long, device=self.device)
-            next_token, cache = _prefill_next_token(model, suffix_ids, cache, temperature, allow_capture=True)
+            next_token, cache = _prefill_next_token(
+                model,
+                suffix_ids,
+                cache,
+                temperature,
+                allow_capture=_runtime_prefill_graph_capture_enabled(model),
+            )
             next_token = next_token.to(self.device)
             active = [True for _ in prompt_rows]
             for offset, token_id in enumerate(next_token.detach().cpu().tolist()):
@@ -1710,7 +1721,12 @@ class OpenAICompletionEngine:
         prefix_ids = input_ids[:1, :prefix_tokens]
         restored_prefix_tokens = self._restore_exact_prefix_cache(prefix_ids, cache)
         if restored_prefix_tokens != prefix_tokens:
-            cache = _prefill_cache_only(model, prefix_ids, cache, allow_capture=True)
+            cache = _prefill_cache_only(
+                model,
+                prefix_ids,
+                cache,
+                allow_capture=_runtime_prefill_graph_capture_enabled(model),
+            )
             self._save_prompt_prefix_cache(prefix_ids, cache)
         _repeat_generation_cache_first_batch(cache, batch_size)
         next_token, cache = _prefill_next_token(
@@ -1718,7 +1734,7 @@ class OpenAICompletionEngine:
             input_ids[:, prefix_tokens:],
             cache,
             temperature,
-            allow_capture=True,
+            allow_capture=_runtime_prefill_graph_capture_enabled(model),
         )
         next_token = next_token.to(self.device)
 
@@ -1919,6 +1935,13 @@ def _is_tensor_parallel_worker_model(model: object) -> bool:
 
 
 def _prefix_cache_enabled_for_model(model: object) -> bool:
+    return not (_is_tensor_parallel_model(model) and _tensor_parallel_world_size(model) > 1)
+
+
+def _runtime_prefill_graph_capture_enabled(model: object) -> bool:
+    # TP ranks can legitimately have different graph-cache contents after a
+    # bursty serving run. Runtime capture on only a subset of ranks changes the
+    # NCCL collective stream, so TP capture is limited to coordinated warmup.
     return not (_is_tensor_parallel_model(model) and _tensor_parallel_world_size(model) > 1)
 
 

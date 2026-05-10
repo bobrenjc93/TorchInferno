@@ -675,6 +675,36 @@ def test_openai_engine_skips_runtime_prefill_graph_capture_on_miss() -> None:
     assert model.forward_inputs
 
 
+def test_openai_engine_skips_runtime_shared_prefix_capture_for_tensor_parallel(monkeypatch) -> None:
+    model = _RuntimePrefillLogitsGraphCaptureModel()
+    engine = _cache_only_engine()
+    engine.model = model
+    engine.stop_token_ids = frozenset()
+
+    monkeypatch.setattr(
+        "torchinferno.openai_server._is_tensor_parallel_model",
+        lambda candidate: candidate is model,
+    )
+    monkeypatch.setattr(
+        "torchinferno.openai_server._tensor_parallel_world_size",
+        lambda candidate: 8 if candidate is model else 1,
+    )
+
+    steps = list(
+        engine._generate_shared_prefix_prompt_list_steps(
+            [[10, 11, 12], [10, 11, 13, 14]],
+            prefix_tokens=2,
+            max_tokens=1,
+            temperature=0.0,
+        )
+    )
+
+    assert steps == [[2, 2]]
+    assert model.capture_flags == [False, False, False]
+    assert model.graph_inputs == []
+    assert model.forward_inputs == [[10, 11], [13, 14], [12]]
+
+
 def test_openai_engine_uses_decode_graph_by_default() -> None:
     model = _DecodeGraphRecordingModel()
     engine = OpenAICompletionEngine(
@@ -1262,6 +1292,29 @@ class _RuntimePrefillGraphCaptureModel(_PrefixRecordingModel):
             return None
         self.graph_inputs.append([int(token_id) for token_id in input_ids[0].tolist()])
         return torch.tensor([2], dtype=torch.long)
+
+
+class _RuntimePrefillLogitsGraphCaptureModel(_PrefixRecordingModel):
+    def __init__(self) -> None:
+        super().__init__()
+        self.capture_flags: list[bool] = []
+        self.graph_inputs: list[list[int]] = []
+
+    def try_prefill_logits_graph(
+        self,
+        input_ids: torch.Tensor,
+        cache: _PrefixRecordingCache,
+        *,
+        capture_on_miss: bool = True,
+    ) -> torch.Tensor | None:
+        del cache
+        self.capture_flags.append(capture_on_miss)
+        if not capture_on_miss:
+            return None
+        self.graph_inputs.append([int(token_id) for token_id in input_ids[0].tolist()])
+        logits = torch.zeros(input_ids.size(0), 1, self.config.vocab_size)
+        logits[..., 2] = 1.0
+        return logits
 
 
 class _DecodeGraphRecordingModel(_PrefixRecordingModel):
