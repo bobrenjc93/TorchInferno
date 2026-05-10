@@ -177,8 +177,15 @@ def test_openai_server_warmup_covers_long_output_prefill_shapes(monkeypatch) -> 
         (119, 17),
         (136, 16),
         (152, 16),
+        (111, 25),
+        (111, 33),
+        (111, 42),
+        (111, 50),
+        (111, 58),
+        (111, 67),
+        (111, 75),
     }.issubset(prefix_suffix_counts)
-    assert set(_warmup_prefix_suffix_cache_token_counts()) >= {128, 256, 1024}
+    assert set(_warmup_prefix_suffix_cache_token_counts()) >= {128, 256, 512, 1024}
     assert 55 in set(_warmup_temperature_prompt_token_counts())
     assert 8 in set(_warmup_temperature_batch_sizes())
 
@@ -578,6 +585,37 @@ def test_openai_microbench_cli_runs_multi_turn_scenario(tmp_path) -> None:
 
     assert "scenario=multi-turn" in result.stdout
     assert metrics["scenario"] == "multi-turn"
+    assert metrics["cases"]["single"]["requests"] == 8
+
+
+def test_openai_microbench_cli_runs_long_output_scenario(tmp_path) -> None:
+    root = Path(__file__).resolve().parents[1]
+    env = {**os.environ, "PYTHONPATH": "src"}
+    output = tmp_path / "long_output.json"
+    cmd = [
+        sys.executable,
+        "-m",
+        "torchinferno.cli",
+        "openai-microbench",
+        "--backend",
+        "synthetic",
+        "--scenario",
+        "long-output",
+        "--device",
+        "cpu",
+        "--warmup",
+        "0",
+        "--iters",
+        "1",
+        "--json-output",
+        str(output),
+    ]
+
+    result = subprocess.run(cmd, cwd=root, env=env, text=True, capture_output=True, check=True, timeout=30)
+    metrics = json.loads(output.read_text())
+
+    assert "scenario=long-output" in result.stdout
+    assert metrics["scenario"] == "long-output"
     assert metrics["cases"]["single"]["requests"] == 8
 
 

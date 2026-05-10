@@ -211,7 +211,7 @@ class OpenAICompletionEngine:
         default_single_request_wait_ms = (
             single_request_admission_wait_ms
             if single_request_admission_wait_ms is not None
-            else 10.0
+            else 0.0
         )
         self.single_request_admission_wait_s = max(
             0.0,
@@ -1716,14 +1716,15 @@ def _warmup_prefill_cache_token_counts() -> tuple[int, ...]:
 def _warmup_prefix_suffix_token_counts() -> tuple[tuple[int, int], ...]:
     raw = os.environ.get(
         "TORCHINFERNO_OPENAI_WARMUP_PREFIX_SUFFIX_TOKENS",
-        "55:16,71:16,87:16,103:16,119:17,136:16,152:16",
+        "55:16,71:16,87:16,103:16,119:17,136:16,152:16,"
+        "111:25,111:33,111:42,111:50,111:58,111:67,111:75",
     )
     return _parse_nonnegative_positive_int_pair_csv(raw)
 
 
 def _warmup_prefix_suffix_cache_token_counts() -> tuple[int, ...]:
     return _parse_positive_int_csv(
-        os.environ.get("TORCHINFERNO_OPENAI_WARMUP_PREFIX_SUFFIX_CACHE_TOKENS", "128,256,1024")
+        os.environ.get("TORCHINFERNO_OPENAI_WARMUP_PREFIX_SUFFIX_CACHE_TOKENS", "128,256,512,1024")
     )
 
 

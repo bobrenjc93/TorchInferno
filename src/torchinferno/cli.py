@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -480,6 +481,38 @@ _OPENAI_MULTI_TURN_EQUATIONS: tuple[tuple[str, str], ...] = (
     ("450 / 15 =", "30"),
 )
 
+_OPENAI_LONG_OUTPUT_EXAMPLES: tuple[tuple[str, str], ...] = (
+    ("1 * 12345 =", "12345"),
+    ("1 * 987654 =", "987654"),
+    ("1 * 11223344556677 =", "11223344556677"),
+)
+_OPENAI_LONG_OUTPUT_SYSTEM_PROMPT = (
+    "You are a calculator. Compute the answer to each math equation. "
+    "Respond with only the numerical answer, nothing else.\n\n"
+    "Examples:\n\n"
+    + "\n\n".join(f"Q: {question}\nA: {answer}" for question, answer in _OPENAI_LONG_OUTPUT_EXAMPLES)
+)
+
+
+def _make_openai_long_output_number(length: int, *, seed: int) -> str:
+    out: list[str] = []
+    counter = 0
+    while len(out) < length:
+        digest = hashlib.sha256(f"{seed}:{counter}".encode()).hexdigest()
+        for character in digest:
+            if character.isdigit() and len(out) < length:
+                out.append(character)
+        counter += 1
+    if out[0] == "0":
+        out[0] = "1"
+    return "".join(out)
+
+
+_OPENAI_LONG_OUTPUT_DIGITS: tuple[str, ...] = tuple(
+    _make_openai_long_output_number(length, seed=seed)
+    for seed, length in enumerate((25, 50, 75, 100, 125, 150, 175, 200))
+)
+
 
 def run_openai_microbench(args: argparse.Namespace) -> int:
     if args.phase_timings:
@@ -720,6 +753,10 @@ def _run_openai_microbench_iteration(
         metrics = _run_openai_microbench_multi_turn_iteration(engine, max_tokens, temperature)
         _sync_openai_engine(engine)
         return metrics
+    if scenario == "long-output":
+        metrics = _run_openai_microbench_long_output_iteration(engine, temperature)
+        _sync_openai_engine(engine)
+        return metrics
     if concurrency == 1:
         metrics = [_run_openai_microbench_request(engine, 0, scenario, prompt_tokens, max_tokens, temperature)]
         _sync_openai_engine(engine)
@@ -785,6 +822,23 @@ def _run_openai_microbench_multi_turn_iteration(
     return metrics
 
 
+def _run_openai_microbench_long_output_iteration(
+    engine: OpenAICompletionEngine,
+    temperature: float,
+) -> list[dict[str, float]]:
+    metrics: list[dict[str, float]] = []
+    for big_number in _OPENAI_LONG_OUTPUT_DIGITS:
+        equation = f"1 * {big_number} ="
+        messages = [
+            {"role": "system", "content": _OPENAI_LONG_OUTPUT_SYSTEM_PROMPT},
+            {"role": "user", "content": f"Q: {equation}\nA:"},
+        ]
+        max_tokens = len(big_number) // 3 + 16
+        request_metrics, _content = _run_openai_microbench_messages(engine, messages, max_tokens, temperature)
+        metrics.append(request_metrics)
+    return metrics
+
+
 def _run_openai_microbench_messages(
     engine: OpenAICompletionEngine,
     messages: list[dict[str, object]],
@@ -835,6 +889,13 @@ def _microbench_messages(scenario: str, prompt_tokens: int, request_index: int) 
         equation, _expected = _OPENAI_MULTI_TURN_EQUATIONS[turn_index]
         messages.append({"role": "user", "content": equation})
         return messages
+    if scenario == "long-output":
+        big_number = _OPENAI_LONG_OUTPUT_DIGITS[request_index % len(_OPENAI_LONG_OUTPUT_DIGITS)]
+        equation = f"1 * {big_number} ="
+        return [
+            {"role": "system", "content": _OPENAI_LONG_OUTPUT_SYSTEM_PROMPT},
+            {"role": "user", "content": f"Q: {equation}\nA:"},
+        ]
     raise ValueError(f"unsupported OpenAI microbench scenario: {scenario}")
 
 
@@ -1746,9 +1807,9 @@ def build_parser() -> argparse.ArgumentParser:
     openai_microbench.add_argument("--backend", choices=["synthetic", "model"], default="synthetic")
     openai_microbench.add_argument(
         "--scenario",
-        choices=["single", "multi-turn"],
+        choices=["single", "multi-turn", "long-output"],
         default="single",
-        help="Request shape to measure; multi-turn matches the inference-bench calculator conversation.",
+        help="Request shape to measure; multi-turn and long-output match inference-bench calculator workloads.",
     )
     openai_microbench.add_argument("--model", default=None, help="Model id/path for --backend=model.")
     openai_microbench.add_argument("--model-kind", default="auto")
