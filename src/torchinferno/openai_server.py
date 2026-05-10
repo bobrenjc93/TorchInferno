@@ -623,9 +623,9 @@ class OpenAICompletionEngine:
             deadline = time.perf_counter() + self.batch_wait_s
 
     def _run_queued_batch(self, batch: list[_QueuedGeneration]) -> None:
-        groups: dict[tuple[int, float, bool], list[_QueuedGeneration]] = {}
+        groups: dict[tuple[float, bool], list[_QueuedGeneration]] = {}
         for request in batch:
-            key = (request.max_tokens, request.temperature, request.stream)
+            key = (request.temperature, request.stream)
             groups.setdefault(key, []).append(request)
         for group in groups.values():
             is_stream = group[0].stream
@@ -644,39 +644,44 @@ class OpenAICompletionEngine:
 
     def _run_queued_stream_group(self, group: list[_QueuedGeneration]) -> None:
         prompts = [request.prompt for request in group]
+        max_tokens = max((request.max_tokens for request in group), default=0)
         if self._shared_prefix_prompt_list_tokens(prompts) > 0:
             try:
-                for step_tokens in self._generate_prompt_list_batch_steps(
+                step_iter = self._generate_prompt_list_batch_steps(
                     prompts,
-                    max_tokens=group[0].max_tokens,
+                    max_tokens=max_tokens,
                     temperature=group[0].temperature,
-                ):
+                )
+                for step, step_tokens in enumerate(step_iter):
                     for request, token_id in zip(group, step_tokens):
-                        if token_id is not None:
+                        if step < request.max_tokens and token_id is not None:
                             request.responses.put(int(token_id))
             finally:
                 _sync_tensor_parallel_command(self.model, self.device)
             return
         for same_length_group in _queued_groups_by_prompt_length(group):
+            same_length_max_tokens = max(request.max_tokens for request in same_length_group)
             input_ids = torch.tensor(
                 [request.prompt for request in same_length_group],
                 dtype=torch.long,
                 device=self.device,
             )
             try:
-                for step_tokens in self._generate_batch_steps(
+                step_iter = self._generate_batch_steps(
                     input_ids,
-                    max_tokens=same_length_group[0].max_tokens,
+                    max_tokens=same_length_max_tokens,
                     temperature=same_length_group[0].temperature,
-                ):
+                )
+                for step, step_tokens in enumerate(step_iter):
                     for request, token_id in zip(same_length_group, step_tokens):
-                        if token_id is not None:
+                        if step < request.max_tokens and token_id is not None:
                             request.responses.put(int(token_id))
             finally:
                 _sync_tensor_parallel_command(self.model, self.device)
 
     def _run_queued_completion_group(self, group: list[_QueuedGeneration]) -> None:
         for same_length_group in _queued_groups_by_prompt_length(group):
+            max_tokens = max(request.max_tokens for request in same_length_group)
             input_ids = torch.tensor(
                 [request.prompt for request in same_length_group],
                 dtype=torch.long,
@@ -684,12 +689,12 @@ class OpenAICompletionEngine:
             )
             rows = self._generate_batch_tokens(
                 input_ids,
-                max_tokens=same_length_group[0].max_tokens,
+                max_tokens=max_tokens,
                 temperature=same_length_group[0].temperature,
             )
             _sync_tensor_parallel_command(self.model, self.device)
             for request, tokens in zip(same_length_group, rows):
-                request.responses.put(_GenerationResult(tokens))
+                request.responses.put(_GenerationResult(tokens[: request.max_tokens]))
 
     @torch.inference_mode()
     def _generate_batch_tokens(

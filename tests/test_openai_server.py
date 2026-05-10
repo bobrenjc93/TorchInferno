@@ -1048,6 +1048,90 @@ def test_openai_short_tp_stream_uses_smaller_queue_batch_limit(monkeypatch) -> N
     assert engine._queued_batch_limit(short_stream) == 12
 
 
+def test_openai_queued_batch_groups_streams_with_different_max_tokens() -> None:
+    engine = _cache_only_engine()
+    captured: list[list[int]] = []
+
+    def run_stream_group(group: list[_QueuedGeneration]) -> None:
+        captured.append([request.max_tokens for request in group])
+
+    engine._run_queued_stream_group = run_stream_group  # type: ignore[method-assign]
+
+    first = _QueuedGeneration([1, 2], 1, 0.0, True, queue.Queue())
+    second = _QueuedGeneration([1, 3], 3, 0.0, True, queue.Queue())
+
+    engine._run_queued_batch([first, second])
+
+    assert captured == [[1, 3]]
+
+
+def test_openai_stream_group_respects_per_request_max_tokens() -> None:
+    engine = _cache_only_engine()
+    engine.model = object()
+    engine._shared_prefix_prompt_list_tokens = lambda prompts: 1  # type: ignore[method-assign]
+    calls: list[tuple[list[list[int]], int, float]] = []
+
+    def generate_prompt_list_batch_steps(
+        prompts: list[list[int]],
+        *,
+        max_tokens: int,
+        temperature: float,
+        broadcast_tensor_parallel: bool = True,
+    ):
+        del broadcast_tensor_parallel
+        calls.append((prompts, max_tokens, temperature))
+        yield [101, 201]
+        yield [102, 202]
+        yield [103, 203]
+
+    engine._generate_prompt_list_batch_steps = generate_prompt_list_batch_steps  # type: ignore[method-assign]
+
+    first_queue: queue.Queue[object] = queue.Queue()
+    second_queue: queue.Queue[object] = queue.Queue()
+    group = [
+        _QueuedGeneration([1, 2], 1, 0.0, True, first_queue),
+        _QueuedGeneration([1, 3], 3, 0.0, True, second_queue),
+    ]
+
+    engine._run_queued_stream_group(group)
+
+    assert calls == [([[1, 2], [1, 3]], 3, 0.0)]
+    assert _queue_items(first_queue) == [101]
+    assert _queue_items(second_queue) == [201, 202, 203]
+
+
+def test_openai_completion_group_respects_per_request_max_tokens() -> None:
+    engine = _cache_only_engine()
+    engine.model = object()
+    calls: list[tuple[list[list[int]], int, float]] = []
+
+    def generate_batch_tokens(
+        input_ids: torch.Tensor,
+        *,
+        max_tokens: int,
+        temperature: float,
+        broadcast_tensor_parallel: bool = True,
+    ) -> list[list[int]]:
+        del broadcast_tensor_parallel
+        calls.append((input_ids.tolist(), max_tokens, temperature))
+        return [[11, 12, 13], [21, 22, 23]]
+
+    engine._generate_batch_tokens = generate_batch_tokens  # type: ignore[method-assign]
+
+    first_queue: queue.Queue[object] = queue.Queue()
+    second_queue: queue.Queue[object] = queue.Queue()
+    group = [
+        _QueuedGeneration([1, 2], 1, 0.0, False, first_queue),
+        _QueuedGeneration([3, 4], 3, 0.0, False, second_queue),
+    ]
+
+    engine._run_queued_completion_group(group)
+
+    assert calls == [([[1, 2], [3, 4]], 3, 0.0)]
+    assert first_queue.get_nowait().tokens == [11]
+    assert second_queue.get_nowait().tokens == [21, 22, 23]
+
+
 def test_openai_tensor_parallel_command_sync_uses_control_group(monkeypatch) -> None:
     monkeypatch.setattr("torchinferno.openai_server._TENSOR_PARALLEL_CONTROL_GROUP", None)
     model = type("FakeTPModel", (), {"world_size": 2})()
@@ -1678,6 +1762,13 @@ def _wait_for_models(port: int, proc: subprocess.Popen[str]) -> None:
             time.sleep(0.25)
     output = proc.stdout.read() if proc.stdout is not None else ""
     raise TimeoutError(f"server did not become ready:\n{output}")
+
+
+def _queue_items(items: queue.Queue[object]) -> list[object]:
+    out: list[object] = []
+    while not items.empty():
+        out.append(items.get_nowait())
+    return out
 
 
 def _json_get(url: str) -> dict[str, object]:
