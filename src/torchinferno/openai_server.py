@@ -730,7 +730,7 @@ class OpenAICompletionEngine:
         cache_capacity = _generation_cache_capacity(model, max_seq_len)
         exact_capacity = _prefers_exact_generation_cache(model)
         key = (batch_size, cache_capacity, self.cache_backend, self.page_size, str(self.device))
-        for cached_key, cached in self._cache_pool.items():
+        for cached_key, cached in list(self._cache_pool.items()):
             cached_batch, cached_max_seq_len, cached_backend, cached_page_size, cached_device = cached_key
             capacity_matches = cached_max_seq_len == cache_capacity if exact_capacity else cached_max_seq_len >= max_seq_len
             if (
@@ -741,7 +741,11 @@ class OpenAICompletionEngine:
                 and cached_device == str(self.device)
                 and _reset_generation_cache(cached)
             ):
+                self._cache_pool.pop(cached_key, None)
+                self._cache_pool[cached_key] = cached
                 return cached
+        max_entries = _cache_pool_max_entries()
+        self._prepare_cache_pool_insert(self._cache_pool, key, max_entries)
         cache = _allocate_cache(
             model,
             batch_size,
@@ -751,7 +755,7 @@ class OpenAICompletionEngine:
             page_size=self.page_size,
         )
         if _reset_generation_cache(cache):
-            self._cache_pool[key] = cache
+            self._store_cache_pool_entry(self._cache_pool, key, cache, max_entries)
         return cache
 
     def _generation_microbatch_cache(
@@ -765,7 +769,7 @@ class OpenAICompletionEngine:
         cache_capacity = _generation_cache_capacity(model, max_seq_len)
         exact_capacity = _prefers_exact_generation_cache(model)
         key = (slot, batch_size, cache_capacity, self.cache_backend, self.page_size, str(self.device))
-        for cached_key, cached in self._microbatch_cache_pool.items():
+        for cached_key, cached in list(self._microbatch_cache_pool.items()):
             (
                 cached_slot,
                 cached_batch,
@@ -784,7 +788,12 @@ class OpenAICompletionEngine:
                 and cached_device == str(self.device)
                 and _reset_generation_cache(cached)
             ):
+                self._microbatch_cache_pool.pop(cached_key, None)
+                self._microbatch_cache_pool[cached_key] = cached
                 return cached
+        max_entries = _microbatch_cache_pool_max_entries()
+        self._evict_microbatch_slot(slot, keep_key=key)
+        self._prepare_cache_pool_insert(self._microbatch_cache_pool, key, max_entries)
         cache = _allocate_cache(
             model,
             batch_size,
@@ -794,8 +803,50 @@ class OpenAICompletionEngine:
             page_size=self.page_size,
         )
         if _reset_generation_cache(cache):
-            self._microbatch_cache_pool[key] = cache
+            self._store_cache_pool_entry(
+                self._microbatch_cache_pool,
+                key,
+                cache,
+                max_entries,
+            )
         return cache
+
+    def _evict_microbatch_slot(
+        self,
+        slot: int,
+        *,
+        keep_key: tuple[int, int, int, str, int, str],
+    ) -> None:
+        for cached_key in list(self._microbatch_cache_pool):
+            if cached_key != keep_key and cached_key[0] == slot:
+                self._microbatch_cache_pool.pop(cached_key, None)
+
+    @staticmethod
+    def _prepare_cache_pool_insert(
+        pool: dict[object, object],
+        key: object,
+        max_entries: int,
+    ) -> None:
+        pool.pop(key, None)
+        if max_entries <= 0:
+            pool.clear()
+            return
+        while len(pool) >= max_entries:
+            pool.pop(next(iter(pool)))
+
+    @staticmethod
+    def _store_cache_pool_entry(
+        pool: dict[object, object],
+        key: object,
+        cache: object,
+        max_entries: int,
+    ) -> None:
+        if max_entries <= 0:
+            return
+        pool.pop(key, None)
+        pool[key] = cache
+        while len(pool) > max_entries:
+            pool.pop(next(iter(pool)))
 
     def _restore_prefix_cache(self, input_ids: Tensor, cache: object) -> int:
         if not env_flag("TORCHINFERNO_OPENAI_PREFIX_CACHE", True):
@@ -2127,6 +2178,14 @@ def _generation_cache_capacity(model: object, requested_tokens: int) -> int:
     if _prefers_exact_generation_cache(model):
         return 1 << (max(1, requested_tokens) - 1).bit_length()
     return requested_tokens
+
+
+def _cache_pool_max_entries() -> int:
+    return env_int("TORCHINFERNO_OPENAI_CACHE_POOL_MAX_ENTRIES", 4, minimum=0)
+
+
+def _microbatch_cache_pool_max_entries() -> int:
+    return env_int("TORCHINFERNO_OPENAI_MICROBATCH_CACHE_POOL_MAX_ENTRIES", 8, minimum=0)
 
 
 def _generation_cache_seq_len(cache: object) -> int:

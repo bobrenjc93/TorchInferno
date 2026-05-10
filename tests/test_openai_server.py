@@ -824,6 +824,39 @@ def test_openai_engine_batches_variable_length_shared_prefix_suffixes(monkeypatc
     ]
 
 
+def test_openai_engine_cache_pool_is_bounded(monkeypatch) -> None:
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_CACHE_POOL_MAX_ENTRIES", "1")
+    engine = _cache_only_engine()
+    model = _BatchRecordingModel()
+
+    first = engine._generation_cache(1, 4, model=model)
+    second = engine._generation_cache(2, 4, model=model)
+
+    assert model.cache_allocations == 2
+    assert len(engine._cache_pool) == 1
+    assert list(engine._cache_pool.values()) == [second]
+    assert first not in engine._cache_pool.values()
+
+
+def test_openai_engine_microbatch_cache_pool_replaces_slots_and_caps_entries(monkeypatch) -> None:
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_MICROBATCH_CACHE_POOL_MAX_ENTRIES", "3")
+    engine = _cache_only_engine()
+    model = _BatchRecordingModel()
+
+    slot_zero_first = engine._generation_microbatch_cache(0, 1, 4, model=model)
+    slot_zero_second = engine._generation_microbatch_cache(0, 2, 4, model=model)
+    assert slot_zero_first not in engine._microbatch_cache_pool.values()
+    assert list(key[0] for key in engine._microbatch_cache_pool) == [0]
+
+    engine._generation_microbatch_cache(1, 1, 4, model=model)
+    engine._generation_microbatch_cache(2, 1, 4, model=model)
+    engine._generation_microbatch_cache(3, 1, 4, model=model)
+
+    assert len(engine._microbatch_cache_pool) == 3
+    assert list(key[0] for key in engine._microbatch_cache_pool) == [1, 2, 3]
+    assert slot_zero_second not in engine._microbatch_cache_pool.values()
+
+
 def test_openai_microbench_cli_runs_synthetic_cases() -> None:
     root = Path(__file__).resolve().parents[1]
     env = {**os.environ, "PYTHONPATH": "src"}
@@ -1311,6 +1344,16 @@ class _FakeSocket:
 
     def setsockopt(self, level: int, option: int, value: int) -> None:
         self.options.append((level, option, value))
+
+
+def _cache_only_engine() -> OpenAICompletionEngine:
+    engine = object.__new__(OpenAICompletionEngine)
+    engine.cache_backend = "dense"
+    engine.page_size = 16
+    engine.device = torch.device("cpu")
+    engine._cache_pool = {}
+    engine._microbatch_cache_pool = {}
+    return engine
 
 
 def _free_port() -> int:
