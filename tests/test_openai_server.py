@@ -948,6 +948,31 @@ def test_openai_engine_microbatch_cache_pool_replaces_slots_and_caps_entries(mon
     assert slot_zero_second not in engine._microbatch_cache_pool.values()
 
 
+def test_openai_stream_microbatch_defaults_to_smaller_cuda_tp_chunks(monkeypatch) -> None:
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_STREAM_MICROBATCH_SIZE", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_CUDAGRAPH_DECODE_STEP_MAX_BATCH", raising=False)
+    model = object()
+    engine = _cache_only_engine()
+    engine.model = model
+    engine.device = torch.device("cuda")
+
+    monkeypatch.setattr(
+        "torchinferno.openai_server._is_tensor_parallel_model",
+        lambda candidate: candidate is model,
+    )
+
+    assert engine._stream_microbatch_size(64) == 16
+    assert engine._stream_microbatch_size(8) == 8
+
+
+def test_openai_stream_microbatch_env_override_is_capped_to_batch(monkeypatch) -> None:
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_STREAM_MICROBATCH_SIZE", "128")
+    engine = _cache_only_engine()
+    engine.model = object()
+
+    assert engine._stream_microbatch_size(64) == 64
+
+
 def test_openai_microbench_cli_runs_synthetic_cases() -> None:
     root = Path(__file__).resolve().parents[1]
     env = {**os.environ, "PYTHONPATH": "src"}

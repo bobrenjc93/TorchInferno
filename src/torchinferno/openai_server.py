@@ -1406,9 +1406,9 @@ class OpenAICompletionEngine:
         if batch_size <= 1:
             return batch_size
         if "TORCHINFERNO_OPENAI_STREAM_MICROBATCH_SIZE" in os.environ:
-            return env_int("TORCHINFERNO_OPENAI_STREAM_MICROBATCH_SIZE", batch_size, minimum=1)
+            return min(batch_size, env_int("TORCHINFERNO_OPENAI_STREAM_MICROBATCH_SIZE", batch_size, minimum=1))
         if _is_tensor_parallel_model(self.model) and self.device.type == "cuda":
-            return env_int("TORCHINFERNO_CUDAGRAPH_DECODE_STEP_MAX_BATCH", 64, minimum=1)
+            return min(batch_size, env_int("TORCHINFERNO_CUDAGRAPH_DECODE_STEP_MAX_BATCH", 16, minimum=1))
         return batch_size
 
     @torch.inference_mode()
@@ -1978,8 +1978,17 @@ def _runtime_prefill_graph_capture_enabled(model: object) -> bool:
 def _sync_tensor_parallel_command(model: object, device: torch.device) -> None:
     if not _is_tensor_parallel_model(model) or _tensor_parallel_world_size(model) <= 1:
         return
+    import torch.distributed as dist
+
+    if not dist.is_available() or not dist.is_initialized():
+        return
     if device.type == "cuda":
         torch.cuda.synchronize(device)
+        device_ids = [device.index] if device.index is not None else None
+        dist.barrier(device_ids=device_ids)
+        torch.cuda.synchronize(device)
+        return
+    dist.barrier()
 
 
 def _sync_tensor_parallel_continue(model: object, should_continue: bool, device: torch.device) -> bool:
