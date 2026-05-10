@@ -1,13 +1,15 @@
 # TorchInferno
 
 TorchInferno is a torch-native inference workbench in the spirit of
-TorchTitan. The goal is to make inference systems easy to trace, optimize,
-simulate, and extend without booting a heavyweight serving stack for every
-experiment.
+[TorchTitan](https://github.com/pytorch/torchtitan). The goal is to make
+inference systems easy to trace, optimize, simulate, and extend without booting
+a heavyweight serving stack for every experiment.
 
-The current repo has a working DSv4-style end-to-end path plus scaffolding for
-the compiler, runtime, scheduling, cache, routing, and research surfaces needed
-to grow toward production-grade SOTA inference.
+The current repo has a working DSv4-style end-to-end path, a native
+DeepSeek-V3.2-style path, and focused surfaces for compiler, runtime,
+scheduling, cache, routing, serving, profiling, and research work. The
+readiness snapshot lives in [`docs/ROADMAP.md`](docs/ROADMAP.md) and is also
+available from [`torchinferno audit`](src/torchinferno/audit.py).
 
 ## What Works Today
 
@@ -32,7 +34,8 @@ to grow toward production-grade SOTA inference.
   paged cache state, and same-shape prefill/decode microbatching.
 - OpenAI-compatible serving with same-shape request microbatching, streaming,
   accurate prompt/completion token accounting, shared tensor prefix-cache reuse,
-  direct and HTTP microbench loops, and a torchrun-backed Llama tensor parallel
+  direct and HTTP microbench loops, self-consistency prompt mode, phase timing
+  reports, profile breakdowns, and a torchrun-backed Llama tensor parallel
   worker mode.
 - Deterministic time-sliced virtual GPU simulation.
 - Disaggregated prefill/decode planner with network latency modeling.
@@ -43,6 +46,8 @@ to grow toward production-grade SOTA inference.
 - Paged KV cache allocator integrated into native DeepSeek decode and available
   as a standalone kernel workbench.
 - Functional paged causal attention reference for kernel replacement work.
+- Single-request and batched paged decode attention APIs over independent
+  request page tables.
 - Radix/prefix tree, prefix-aware router, prefix cache lookup, and tensor KV
   prefix snapshot/restore helpers.
 - `torch.compile` helper and CLI smoke path.
@@ -73,6 +78,49 @@ to grow toward production-grade SOTA inference.
 - vLLM-compatible benchmark runner for Llama 70B latency, offline throughput,
   and online serving results, with JSON summaries and HTML/CSV performance
   plots.
+
+> [!TIP]
+> Every command below works either through the installed `torchinferno` console
+> script or directly from the checkout with `PYTHONPATH=src python3 -m torchinferno.cli`.
+
+## Source Map
+
+| Surface | Primary code | Fast verification |
+| --- | --- | --- |
+| Compact DSv4 model | [`models/dsv4.py`](src/torchinferno/models/dsv4.py), [`models/dsv4_family/`](src/torchinferno/models/dsv4_family/) | `dsv4-smoke`, `dsv4-hf-smoke`, `model-variants` |
+| Native DeepSeek-V3.2-style model | [`models/deepseek.py`](src/torchinferno/models/deepseek.py), [`models/deepseek_v32_family/`](src/torchinferno/models/deepseek_v32_family/) | `deepseek-smoke`, `deepseek-hf-smoke`, `deepseek-audit` |
+| Native Llama production-scale paths | [`models/llama3_family/`](src/torchinferno/models/llama3_family/) | `llama-bench-suite`, `validate-model-variants --family llama3` |
+| OpenAI-compatible serving | [`openai_server.py`](src/torchinferno/openai_server.py), [`openai_http.py`](src/torchinferno/openai_http.py), [`runtime/serving.py`](src/torchinferno/runtime/serving.py) | `openai-server`, `openai-microbench`, `openai-server-microbench`, `serve-smoke` |
+| Runtime policy experiments | [`runtime/`](src/torchinferno/runtime/) | `sim-smoke`, `traffic-smoke`, `disagg-init`, `disagg-smoke` |
+| Compiler and FX graph work | [`compiler.py`](src/torchinferno/compiler.py), [`graph/`](src/torchinferno/graph/) | `trace-smoke`, `profile-pattern`, `profile-subgraph` |
+| Kernel replacement work | [`kernels/`](src/torchinferno/kernels/) | `perf-smoke`, `helion-candidate`, `helion-search-fx`, `helion-search-region` |
+| Profile artifact loops | [`profiling.py`](src/torchinferno/profiling.py) | `profile-run`, `profile-timeslice`, `profile-offload`, `profile-region`, `profile-nodes` |
+| Text, checkpoints, validation | [`tokenization.py`](src/torchinferno/tokenization.py), [`validation.py`](src/torchinferno/validation.py), [`models/conversion.py`](src/torchinferno/models/conversion.py) | `text-generate`, `capture-logits`, `validate-logits`, `dsv4-convert`, `deepseek-convert` |
+| Benchmark comparisons | [`benchmarks/`](src/torchinferno/benchmarks/) | `vllm-bench-suite`, `vllm-bench-plot`, `llama-bench-suite` |
+
+Useful upstream references: [PyTorch `torch.compile`](https://pytorch.org/docs/stable/generated/torch.compile.html),
+[PyTorch FX](https://pytorch.org/docs/stable/fx.html),
+[Triton](https://triton-lang.org/main/index.html),
+[vLLM benchmarking](https://docs.vllm.ai/en/latest/getting_started/examples/benchmarking.html),
+[OpenAI Chat Completions](https://platform.openai.com/docs/api-reference/chat/create),
+[Hugging Face Hub](https://huggingface.co/docs/huggingface_hub/index), and
+[safetensors](https://huggingface.co/docs/safetensors/index).
+
+<details>
+<summary>CLI command map</summary>
+
+| Goal | Commands |
+| --- | --- |
+| Audit and model provenance | `audit`, `model-variants`, `validate-model-variants` |
+| Local smoke paths | `dsv4-smoke`, `deepseek-smoke`, `trace-smoke`, `sim-smoke`, `traffic-smoke`, `serve-smoke`, `perf-smoke`, `research-smoke` |
+| Checkpoint and text workflows | `dsv4-hf-smoke`, `deepseek-hf-smoke`, `text-generate`, `capture-logits`, `validate-logits`, `dsv4-audit`, `dsv4-convert`, `deepseek-audit`, `deepseek-convert` |
+| OpenAI-compatible serving | `openai-server`, `openai-microbench`, `openai-server-microbench` |
+| Profile artifacts | `profile-run`, `profile-timeslice`, `profile-offload`, `profile-region`, `profile-pattern`, `profile-subgraph`, `profile-nodes` |
+| Disaggregated experiments | `disagg-init`, `disagg-smoke` |
+| Kernel candidate loops | `helion-candidate`, `helion-search-fx`, `helion-search-region` |
+| Benchmark suites | `vllm-bench-suite`, `vllm-bench-plot`, `llama-bench-suite` |
+
+</details>
 
 ## Quickstart
 
@@ -166,8 +214,13 @@ Run a native architecture smoke:
 ```bash
 PYTHONPATH=src python3 -m torchinferno.cli deepseek-smoke --device cpu
 PYTHONPATH=src python3 -m torchinferno.cli deepseek-smoke --device cpu --no-q-lora
+PYTHONPATH=src python3 -m torchinferno.cli deepseek-smoke --device cpu --score-bias
 PYTHONPATH=src python3 -m torchinferno.cli deepseek-smoke --device cpu --cache-backend paged
 ```
+
+`--no-q-lora` switches the tiny smoke config to a direct query projection,
+`--score-bias` enables routed score correction bias, and
+`--cache-backend paged` exercises the native paged-cache path.
 
 ## Model Provenance Variants
 
@@ -385,6 +438,12 @@ The output reports TTFT, TPOT, end-to-end latency, throughput, forward-call
 count, and observed max model batch for direct single-request, forced batcher,
 and concurrent cases.
 
+Use `--prompt-mode self-consistency` for the small calculator prompt shape used
+by inference-bench style tests. `--phase-timings` records request-to-first
+forward, prefix-cache, prefill, sample, and first-token synchronization
+breakdowns; `--profile-breakdown` enables model-side timing summaries when the
+backend exposes them.
+
 To include the actual HTTP server path in the loop, use
 `openai-server-microbench`. With no `--base-url`, it launches a local
 `torchinferno.openai_server`, waits for `/v1/models`, then measures
@@ -479,7 +538,10 @@ TorchInferno keeps compiler hooks explicit:
 - `torchinferno.graph.trace_with_make_fx` wraps `make_fx` and optional fake
   tensor tracing.
 - `torchinferno.graph.PassRegistry` registers ordered FX graph passes.
+- `annotate_matching_nodes` records match metadata without changing graph
+  behavior.
 - `replace_call_function_targets` handles leaf target swaps.
+- `replace_call_module_targets` handles module-call replacements.
 - `replace_subgraph_pattern` handles multi-node symbolic FX and make_fx/ATen
   replacements for fused custom-kernel regions.
 - `torchinferno.kernels.passes.register_kernel_replacement_passes` wires
@@ -779,6 +841,8 @@ torch fallbacks:
   weighted gate/up projection, and SwiGLU with Triton CUDA and torch fallback.
 - `paged_decode_attention`: decode-token paged attention that uses Triton for
   CUDA-compatible single-token decode and falls back to the torch reference.
+- `batched_paged_decode_attention`: request-batched decode attention that
+  iterates independent page tables through the same safe backend dispatch.
 - `quantize_nvfp4`, `dequantize_nvfp4`, and `nvfp4_linear_reference`: a stable
   NVFP4 quantized-linear contract for graph passes and future fused kernels.
 
@@ -993,12 +1057,15 @@ Implemented as working code and tests:
 - OpenAI-compatible HTTP serving with streaming/non-streaming chat completions,
   same-shape request microbatching, direct and HTTP microbench loops, and
   auto-launched Llama tensor-parallel workers.
+- OpenAI microbench prompt modes, phase-timing summaries, and model profile
+  breakdown hooks for serving hot-path analysis.
 - Native Llama 3 pipeline and tensor-parallel checkpoint loading/generation,
   plus vLLM-shaped latency, throughput, and serving benchmark suites.
 - Pattern-match graph replacement entry point, including a multi-node
   make_fx/ATen subgraph replacement example.
 - Native DeepSeek dense/paged cache backend selection.
-- Paged KV allocation and paged causal attention reference.
+- Paged KV allocation plus single-request and request-batched paged causal
+  attention references.
 - Token-step continuous serving engine with prefix-hit accounting, shared
   prefix-page reuse, persistent row-assigned paged cache state, and same-shape
   prefill/decode microbatching.

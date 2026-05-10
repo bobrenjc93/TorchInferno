@@ -1,7 +1,7 @@
 # TorchInferno Roadmap
 
 This document is the working readiness map for the original TorchInferno plan.
-The CLI view is `torchinferno audit`.
+The CLI view is [`torchinferno audit`](../src/torchinferno/audit.py).
 
 ## Readiness Levels
 
@@ -40,6 +40,24 @@ The CLI view is `torchinferno audit`.
 | Helion candidate kernels | optional/experimental | `helion-search-fx` and `helion-search-region` enumerate supported FX windows and benchmark generated kernels before production promotion. |
 | NVFP4 graph passes | reference | Quantized tensor contract and graph hook exist; production fused kernel remains open. |
 | Research harness | minimal | Named experiments and metric comparison exist. |
+
+<details>
+<summary>Implementation and verification index</summary>
+
+| Area | Code | Verification |
+| --- | --- | --- |
+| Native DeepSeek-V3.2-style model | [`models/deepseek.py`](../src/torchinferno/models/deepseek.py), [`models/deepseek_v32_family/`](../src/torchinferno/models/deepseek_v32_family/) | `deepseek-smoke`, `deepseek-hf-smoke`, `tests/test_deepseek_native.py` |
+| Native Llama3 production-scale paths | [`models/llama3_family/`](../src/torchinferno/models/llama3_family/) | `llama-bench-suite`, `tests/test_llama3_tensor_parallel_distributed.py` |
+| Model provenance and validation | [`models/variants.py`](../src/torchinferno/models/variants.py), [`variant_validation.py`](../src/torchinferno/variant_validation.py) | `model-variants`, `validate-model-variants`, `tests/test_model_variants.py` |
+| Checkpoint conversion | [`models/conversion.py`](../src/torchinferno/models/conversion.py) | `dsv4-audit`, `dsv4-convert`, `deepseek-audit`, `deepseek-convert`, `tests/test_conversion_and_kernels.py` |
+| Graph and compiler hooks | [`compiler.py`](../src/torchinferno/compiler.py), [`graph/`](../src/torchinferno/graph/) | `trace-smoke`, `profile-pattern`, `tests/test_scaffolding.py` |
+| Profile artifact loops | [`profiling.py`](../src/torchinferno/profiling.py) | `profile-run`, `profile-timeslice`, `profile-offload`, `profile-region`, `profile-subgraph`, `tests/test_profile_artifacts.py` |
+| Runtime policy scaffolds | [`runtime/`](../src/torchinferno/runtime/) | `sim-smoke`, `traffic-smoke`, `serve-smoke`, `disagg-init`, `tests/test_serving_engine.py` |
+| OpenAI-compatible serving | [`openai_server.py`](../src/torchinferno/openai_server.py), [`openai_http.py`](../src/torchinferno/openai_http.py) | `openai-server`, `openai-microbench`, `openai-server-microbench`, `tests/test_openai_server.py` |
+| Kernel replacement surfaces | [`kernels/`](../src/torchinferno/kernels/) | `perf-smoke`, `helion-candidate`, `helion-search-fx`, `helion-search-region`, `tests/test_performance_specialization.py` |
+| Benchmark comparisons | [`benchmarks/`](../src/torchinferno/benchmarks/) | `vllm-bench-suite`, `vllm-bench-plot`, `llama-bench-suite`, `tests/test_vllm_benchmarks.py` |
+
+</details>
 
 ## Next Production Milestones
 
