@@ -20,16 +20,17 @@ The CLI view is [`torchinferno audit`](../src/torchinferno/audit.py).
 
 > [!NOTE]
 > The status vocabulary mirrors [`torchinferno audit`](../src/torchinferno/audit.py).
-> Optional Helion kernel work reports `experimental` when the Helion dependency
-> is installed and `optional` otherwise.
+> Optional backend-provider work reports `experimental` when the current
+> provider dependency is installed and `optional` otherwise.
 
 ## Current Status
 
 The table separates model families from execution workbenches. A family owns
 the torch-native tensor contract and provenance; workbenches own serving,
-profiling, scheduling, parallelism, and kernel replacement around those
-contracts. Some workbenches are wired to one family first, but they are not
-family concepts.
+profiling, scheduling, parallelism, and offline graph optimization around those
+contracts. Runtime consumes concrete promoted variants. Compiler, partitioning,
+provider search, and promotion happen offline as described in
+[`OFFLINE_OPTIMIZATION.md`](OFFLINE_OPTIMIZATION.md).
 
 | Area | Status | Notes |
 | --- | --- | --- |
@@ -41,8 +42,8 @@ family concepts.
 | Eager-vs-optimized logit validation | integrated | `validate-model-variants` compares tiny eager v0 logits against optimized variants with a 1% default tolerance and optional JSON reports. |
 | Text IO and known-logit validation | integrated | Auto model loading, tokenizer-backed generation, `capture-logits`, and `validate-logits` cover checkpoint bringup without a server. |
 | Checkpoint conversion | integrated | Shape/key audit plus sharded safetensor writer; needs real-weight golden validation. |
-| `torch.compile` | integrated | Shared compile policy and smoke path. |
-| `make_fx` and fake tensors | integrated | FakeTensorMode trace helper and tests. |
+| Offline `torch.compile` experiments | integrated | Shared compile policy and smoke path exist for explicit experiments and comparisons, not runtime hot-path compilation. |
+| Offline graph capture | integrated | `make_fx` plus FakeTensorMode trace helper and tests support reference graph capture. |
 | Profile artifact loop | integrated | Whole-run, time-sliced replay, CPU-offload replay, node-id subgraph, and focused-region commands write graph/profile/timeline/memory JSON, Chrome traces, and repro scripts; graph-pattern profiling adds pass reports and reference/optimized comparisons. |
 | Fake process groups | integrated | Deterministic single-process collectives. |
 | Flex attention | bridge | Dispatches to torch flex attention when available, with eager q/k/v fallback. |
@@ -56,8 +57,8 @@ family concepts.
 | Time-sliced virtual GPU profiling | integrated | Representative generation profiles can be scaled and replayed across virtual ranks on one physical device. |
 | CPU offload profiling | bridge | Module-at-a-time CPU/device staging records movement overhead separately from compute; decode-cache offload and mmap streaming remain open. |
 | Disaggregated prefill/decode | simulated | Planner models rank assignment and transfer latency. |
-| Graph pattern replacement | bridge | Leaf target swaps plus a multi-node symbolic/make_fx fused-op example exist. |
-| Helion candidate kernels | optional | `helion-candidate`, `helion-search-fx`, and `helion-search-region` benchmark supported generated kernels before production promotion; audit reports `experimental` when Helion is installed. |
+| Offline graph replacement | bridge | Leaf target swaps plus a multi-node symbolic/make_fx fused-op example exist for candidate generation before promotion. |
+| Backend candidate providers | optional | Helion search is the first optional provider; future providers can include CuteDSL/CUTLASS, Triton, custom CUDA/C++, PyTorch custom ops, or pure PyTorch rewrites under the same promotion flow. |
 | NVFP4 graph passes | reference | Quantized tensor contract and graph hook exist; production fused kernel remains open. |
 | Research harness | minimal | Named experiments and metric comparison exist. |
 
@@ -73,11 +74,11 @@ family concepts.
 | Model provenance and validation | [`models/variants.py`](../src/torchinferno/models/variants.py), [`variant_validation.py`](../src/torchinferno/variant_validation.py) | `model-variants`, `validate-model-variants`, `tests/test_model_variants.py` |
 | Text IO and known-logit validation | [`tokenization.py`](../src/torchinferno/tokenization.py), [`validation.py`](../src/torchinferno/validation.py), [`models/auto.py`](../src/torchinferno/models/auto.py) | `text-generate`, `capture-logits`, `validate-logits`, `tests/test_production_workflows.py` |
 | Checkpoint conversion | [`models/conversion.py`](../src/torchinferno/models/conversion.py) | `dsv4-audit`, `dsv4-convert`, `deepseek-audit`, `deepseek-convert`, `tests/test_conversion_and_kernels.py` |
-| Graph and compiler hooks | [`compiler.py`](../src/torchinferno/compiler.py), [`graph/`](../src/torchinferno/graph/) | `trace-smoke`, `profile-pattern`, `tests/test_scaffolding.py` |
+| Offline graph optimization | [`compiler.py`](../src/torchinferno/compiler.py), [`graph/`](../src/torchinferno/graph/), [`profiling.py`](../src/torchinferno/profiling.py), [`OFFLINE_OPTIMIZATION.md`](OFFLINE_OPTIMIZATION.md) | `trace-smoke`, `profile-pattern`, `tests/test_scaffolding.py` |
 | Profile artifact loops | [`profiling.py`](../src/torchinferno/profiling.py), [`runtime/offload.py`](../src/torchinferno/runtime/offload.py) | `profile-run`, `profile-timeslice`, `profile-offload`, `profile-region`, `profile-pattern`, `profile-subgraph`, `profile-nodes`, `tests/test_profile_artifacts.py` |
 | Runtime policy scaffolds | [`runtime/`](../src/torchinferno/runtime/) | `sim-smoke`, `traffic-smoke`, `serve-smoke`, `disagg-init`, `disagg-smoke`, `tests/test_serving_engine.py`, `tests/test_disagg_ranks.py` |
 | OpenAI-compatible serving | [`openai_server.py`](../src/torchinferno/openai_server.py), [`openai_http.py`](../src/torchinferno/openai_http.py), [`openai_warmup.py`](../src/torchinferno/openai_warmup.py) | `openai-server`, `openai-microbench`, `openai-server-microbench`, `tests/test_openai_server.py`, `tests/test_openai_server_microbench.py`, `tests/test_openai_warmup.py` |
-| Kernel replacement surfaces | [`kernels/`](../src/torchinferno/kernels/), [`research/helion.py`](../src/torchinferno/research/helion.py) | `perf-smoke`, `helion-candidate`, `helion-search-fx`, `helion-search-region`, `tests/test_performance_specialization.py` |
+| Backend replacement providers | [`kernels/`](../src/torchinferno/kernels/), [`research/helion.py`](../src/torchinferno/research/helion.py) | `perf-smoke`, `helion-candidate`, `helion-search-fx`, `helion-search-region`, `tests/test_performance_specialization.py` |
 | Benchmark comparisons | [`benchmarks/`](../src/torchinferno/benchmarks/) | `vllm-bench-suite`, `vllm-bench-plot`, `llama-bench-suite`, `tests/test_vllm_benchmarks.py` |
 
 </details>
@@ -92,5 +93,6 @@ family concepts.
    capture runner.
 4. Validate native checkpoint conversion against real production weights with
    committed logit references.
-5. Apply subgraph captures to production MLA, grouped MoE, and NVFP4 linear
-   regions with architecture/shape guards.
+5. Formalize provider-neutral candidate artifacts for graph partitions, then
+   use them to promote MLA, grouped MoE, and NVFP4 linear replacements with
+   architecture/shape guards.

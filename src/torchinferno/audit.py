@@ -78,8 +78,16 @@ def build_audit_report() -> TorchInfernoAudit:
                 "bridge",
                 "Llama 70B config plus pipeline and tensor-parallel safetensor loaders/generate paths exist; scheduler integration remains open.",
             ),
-            FeatureAudit("torch.compile", "integrated", "CompileConfig and CLI smoke cover eager-to-compiled policy."),
-            FeatureAudit("make_fx/fake tensors", "integrated", "Trace helper supports make_fx with FakeTensorMode."),
+            FeatureAudit(
+                "offline torch.compile experiments",
+                "integrated",
+                "CompileConfig and CLI smoke cover explicit compile experiments without making compilation a runtime model requirement.",
+            ),
+            FeatureAudit(
+                "offline graph capture",
+                "integrated",
+                "Trace helper supports make_fx with FakeTensorMode for offline graph capture.",
+            ),
             FeatureAudit(
                 "profile artifact loop",
                 "integrated",
@@ -105,14 +113,14 @@ def build_audit_report() -> TorchInfernoAudit:
                 "disagg-init emits editable prefill/decode rank files with local RPC wrappers.",
             ),
             FeatureAudit(
-                "graph pattern replacement",
+                "offline graph replacement",
                 "bridge",
-                "Leaf swaps and multi-node symbolic/make_fx subgraph replacement route into fused custom ops.",
+                "Leaf swaps and multi-node symbolic/make_fx subgraph replacement produce candidate optimized graphs before promotion.",
             ),
             FeatureAudit(
-                "Helion candidate kernels",
+                "backend candidate providers",
                 "experimental" if helion_available() else "optional",
-                "helion-candidate, helion-search-fx, and helion-search-region benchmark generated kernels before any production swap.",
+                "Helion search is the first optional provider; promotion flow is intended to also support Triton, CuteDSL/CUTLASS, custom CUDA/C++, PyTorch custom ops, and pure PyTorch rewrites.",
             ),
             FeatureAudit(
                 "prefix KV reuse",

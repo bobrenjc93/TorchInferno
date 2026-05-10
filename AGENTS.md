@@ -55,6 +55,25 @@ sessions.
   reference and optimized graphs, `pass_report.json`, profiler JSON for both
   callables, and `comparison.json`.
 
+## Offline Optimization Contract
+
+- Do not put compilers, graph tracers, partitioners, Helion/CuteDSL/CUTLASS
+  generators, Triton codegen, CUDA extension builds, or graph-search loops in
+  model constructors, `forward`, `generate`, serving engines, or request hot
+  paths.
+- Treat `v0` as the readable torch-native reference contract. Capture and
+  partition it offline, then compare candidates such as `candidate-v1-01`
+  against `v0` with reproducible artifacts.
+- Keep replacement providers pluggable. A candidate may come from Helion,
+  CuteDSL/CUTLASS, Triton, custom CUDA/C++, PyTorch custom ops,
+  `torch.compile` experiments, or pure PyTorch rewrites, but all providers
+  should feed the same validation and benchmark flow.
+- Promote only checked-in, validated candidates into runtime-selectable
+  variants. Runtime should load a concrete variant directly, not generate or
+  rewrite one.
+- See `docs/OFFLINE_OPTIMIZATION.md` before adding graph optimization or kernel
+  promotion workflows.
+
 For conversion or kernel changes, also run:
 
 ```bash
@@ -69,9 +88,10 @@ python3 -m pytest tests/test_serving_engine.py
 
 - Model architecture changes: `src/torchinferno/models/`.
 - Checkpoint audit/conversion work: `src/torchinferno/models/conversion.py`.
-- Custom kernels and kernel graph passes: `src/torchinferno/kernels/`.
+- Custom kernels and backend provider hooks: `src/torchinferno/kernels/`.
 - Compiler and tracing helpers: `src/torchinferno/compiler.py` and
-  `src/torchinferno/graph/`.
+  `src/torchinferno/graph/`; these are offline workbench tools, not runtime
+  model dependencies.
 - Scheduling, batching, cache, routing, and simulation policies:
   `src/torchinferno/runtime/`.
 - Parallel and distributed execution adapters: shared policy in
@@ -92,9 +112,11 @@ python3 -m pytest tests/test_serving_engine.py
 - Keep model code torch-native and easy to trace.
 - Keep model families separate from serving, profiling, parallelism, and other
   execution workbenches in docs and APIs.
+- Keep graph optimization offline: capture `v0`, generate provider-neutral
+  candidates, benchmark them, then promote concrete variants for runtime.
 - Add focused tests for every new scaffold or policy.
 - Prefer small APIs that can run on CPU before introducing CUDA-only code.
 - Use fake process groups and time-sliced simulation for distributed policy
   tests.
-- Put custom-kernel experiments behind graph passes or runtime interfaces so
-  baseline DSv4 remains readable.
+- Put custom-kernel experiments behind offline graph passes or stable kernel
+  APIs so baseline DSv4 remains readable.

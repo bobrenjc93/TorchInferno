@@ -5,12 +5,13 @@ TorchInferno is a torch-native inference workbench in the spirit of
 inference systems easy to trace, optimize, simulate, and extend without booting
 a heavyweight serving stack for every experiment.
 
-The current repo is organized around torch-native model families plus shared
-workbenches for compiler, runtime, scheduling, cache, routing, serving,
-profiling, and research work. Capability maturity differs by family: DSv4 and
-native DeepSeek are the smallest CPU-friendly correctness and cache paths,
-while Llama3 currently carries the production-scale pipeline and
-tensor-parallel adapters. The readiness snapshot lives in
+The current repo is organized around torch-native model families, runtime
+workbenches, and offline graph optimization workbenches. Runtime model paths
+execute concrete promoted variants; graph capture, partitioning, backend
+candidate generation, and promotion happen offline. Capability maturity differs
+by family: DSv4 and native DeepSeek are the smallest CPU-friendly correctness
+and cache paths, while Llama3 currently carries the production-scale pipeline
+and tensor-parallel adapters. The readiness snapshot lives in
 [`docs/ROADMAP.md`](docs/ROADMAP.md) and is also available from
 [`torchinferno audit`](src/torchinferno/audit.py).
 
@@ -21,6 +22,8 @@ tensor-parallel adapters. The readiness snapshot lives in
 - [Source Map](#source-map): code ownership, CLI checks, and upstream docs.
 - [Quickstart](#quickstart): install, smoke, and Makefile loops.
 - [Model Provenance Variants](#model-provenance-variants): raw/fused ladders.
+- [Offline Optimization Workflow](docs/OFFLINE_OPTIMIZATION.md): v0 capture,
+  partitioning, provider-neutral candidates, benchmarks, and promotion.
 - [Serving and Benchmarks](#openai-compatible-serving): OpenAI, vLLM, and Llama
   70B comparison paths.
 - [Profile Artifact Runs](#profile-artifact-runs): whole-model, region,
@@ -47,10 +50,10 @@ tensor-parallel adapters. The readiness snapshot lives in
   replay, disaggregated prefill/decode planning, editable prefill/decode rank
   files with local JSON-RPC wrappers, fake process groups, fake collectives,
   and bursty traffic modeling.
-- Compiler, graph, and kernel replacement surfaces: `torch.compile`,
-  `make_fx` with FakeTensorMode, FX graph pass registration, flex-attention and
-  CUDA graph shaped APIs, Triton fallbacks/specializations, Helion candidate
-  evaluation, and NVFP4 graph hooks.
+- Offline graph optimization and promotion workbenches: `make_fx` with
+  FakeTensorMode, FX partition/replacement helpers, `torch.compile`
+  experiments, provider-neutral backend candidate evaluation, and promoted
+  Triton/custom-op/NVFP4 hooks.
 - Profiling, research, and benchmark loops: whole-model, region, offload,
   time-sliced, pattern, and node-id subgraph profile artifacts; local
   reference-vs-specialized performance smokes; scheduler/cache/routing research
@@ -75,7 +78,7 @@ flowchart LR
   Contracts --> Workbenches
   Workbenches --> Serving["Serving, batching, routing, cache policy"]
   Workbenches --> Profiles["Profiles, offload, FX subgraphs"]
-  Workbenches --> Kernels["Graph passes and kernel hooks"]
+  Workbenches --> Kernels["Offline graph optimization"]
   Workbenches --> Parallel["Simulation, disagg, pipeline/tensor parallel"]
   Workbenches --> Benchmarks["OpenAI and vLLM-compatible benchmarks"]
 ```
@@ -89,6 +92,14 @@ consume those families. Some workbenches are currently wired to one family
 first, such as Llama3's production-scale pipeline and tensor-parallel adapters,
 but that does not make parallelism a Llama-only concept.
 
+Runtime and optimization are separate phases. Models and serving engines do not
+run compilers, tracers, partitioners, or kernel generators in the hot path.
+Offline workbenches capture `v0` graphs, try provider-specific replacements
+such as Triton, Helion, CuteDSL/CUTLASS, custom CUDA, or PyTorch custom ops,
+benchmark candidates, and promote concrete variants that runtime can load
+directly. See [`docs/OFFLINE_OPTIMIZATION.md`](docs/OFFLINE_OPTIMIZATION.md)
+for the full workflow.
+
 ## Source Map
 
 | Surface | Primary code | Fast verification |
@@ -99,8 +110,8 @@ but that does not make parallelism a Llama-only concept.
 | Parallel and distributed execution | [`runtime/`](src/torchinferno/runtime/), [`models/llama3_family/pipeline.py`](src/torchinferno/models/llama3_family/pipeline.py), [`models/llama3_family/tensor_parallel.py`](src/torchinferno/models/llama3_family/tensor_parallel.py) | `disagg-smoke`, `llama-bench-suite`, `tests/test_llama3_tensor_parallel_distributed.py` |
 | OpenAI-compatible serving | [`openai_server.py`](src/torchinferno/openai_server.py), [`openai_http.py`](src/torchinferno/openai_http.py), [`openai_warmup.py`](src/torchinferno/openai_warmup.py), [`runtime/serving.py`](src/torchinferno/runtime/serving.py) | `openai-server`, `openai-microbench`, `openai-server-microbench`, `serve-smoke` |
 | Runtime policy experiments | [`runtime/`](src/torchinferno/runtime/) | `sim-smoke`, `traffic-smoke`, `disagg-init`, `disagg-smoke` |
-| Compiler and FX graph work | [`compiler.py`](src/torchinferno/compiler.py), [`graph/`](src/torchinferno/graph/) | `trace-smoke`, `profile-pattern`, `profile-subgraph` |
-| Kernel replacement work | [`kernels/`](src/torchinferno/kernels/), [`research/helion.py`](src/torchinferno/research/helion.py) | `perf-smoke`, `helion-candidate`, `helion-search-fx`, `helion-search-region` |
+| Offline graph optimization | [`compiler.py`](src/torchinferno/compiler.py), [`graph/`](src/torchinferno/graph/), [`profiling.py`](src/torchinferno/profiling.py), [`docs/OFFLINE_OPTIMIZATION.md`](docs/OFFLINE_OPTIMIZATION.md) | `trace-smoke`, `profile-pattern`, `profile-subgraph` |
+| Backend replacement providers | [`kernels/`](src/torchinferno/kernels/), [`research/helion.py`](src/torchinferno/research/helion.py) | `perf-smoke`, `helion-candidate`, `helion-search-fx`, `helion-search-region` |
 | Profile artifact loops | [`profiling.py`](src/torchinferno/profiling.py), [`runtime/offload.py`](src/torchinferno/runtime/offload.py) | `profile-run`, `profile-timeslice`, `profile-offload`, `profile-region`, `profile-pattern`, `profile-subgraph`, `profile-nodes` |
 | Text, checkpoints, validation | [`tokenization.py`](src/torchinferno/tokenization.py), [`validation.py`](src/torchinferno/validation.py), [`models/auto.py`](src/torchinferno/models/auto.py), [`models/conversion.py`](src/torchinferno/models/conversion.py) | `text-generate`, `capture-logits`, `validate-logits`, `dsv4-hf-smoke`, `deepseek-hf-smoke`, `dsv4-audit`, `deepseek-audit`, `dsv4-convert`, `deepseek-convert` |
 | Benchmark comparisons | [`benchmarks/`](src/torchinferno/benchmarks/) | `vllm-bench-suite`, `vllm-bench-plot`, `llama-bench-suite` |
@@ -124,7 +135,7 @@ Useful upstream references: [PyTorch `torch.compile`](https://pytorch.org/docs/s
 | OpenAI-compatible serving | `openai-server`, `openai-microbench`, `openai-server-microbench` |
 | Profile artifacts | `profile-run`, `profile-timeslice`, `profile-offload`, `profile-region`, `profile-pattern`, `profile-subgraph`, `profile-nodes` |
 | Disaggregated experiments | `disagg-init`, `disagg-smoke` |
-| Kernel candidate loops | `helion-candidate`, `helion-search-fx`, `helion-search-region` |
+| Backend candidate loops | `helion-candidate`, `helion-search-fx`, `helion-search-region` |
 | Benchmark suites | `vllm-bench-suite`, `vllm-bench-plot`, `llama-bench-suite` |
 
 </details>
@@ -159,7 +170,7 @@ Optional extras are declared in [`pyproject.toml`](pyproject.toml):
 | `dev` | `pytest`, `ruff`, `pyflakes`, `vulture` | Running the local test and lint loop. |
 | `serve` / `text` | `transformers`, `tokenizers` | Loading Hub tokenizers or running the OpenAI-compatible server against real checkpoints. |
 | `kernels` | [Triton](https://triton-lang.org/main/index.html) | Exercising CUDA kernel specializations instead of torch fallbacks. |
-| `helion` | [Helion](https://github.com/pytorch-labs/helion) | Searching generated CUDA candidates before promotion. |
+| `helion` | [Helion](https://github.com/pytorch-labs/helion) | Trying one optional generated-kernel provider in the offline promotion flow. |
 
 Without installing the package:
 
@@ -265,7 +276,9 @@ PYTHONPATH=src python3 -m torchinferno.cli deepseek-smoke --device cpu --cache-b
 ## Model Provenance Variants
 
 TorchInferno keeps production model code torch-native and provenance-tracked.
-Each supported family has an explicit variant ladder:
+Each supported family has an explicit variant ladder. New optimization work
+starts from `v0`, runs through the offline graph workflow, and is promoted into
+a concrete checked-in variant only after validation and benchmark gates pass:
 
 - `raw_ops.py`: unoptimized Python/PyTorch operation definitions.
 - `fused_ops.py`: optimized operation hooks that preserve the raw contract.
@@ -305,6 +318,9 @@ separate axis: serving, profiling, disaggregated planning, and parallel
 sharding should consume the model families through stable contracts. Llama3 has
 `pipeline-v0` and `tp-v0` today because the 70B benchmark requires
 production-scale loading, not because parallelism belongs only to Llama3.
+Compiler/provider experiments are also a separate axis: they should produce
+candidate artifacts first, then become `v1`, `v2`, or a named alternative only
+after promotion.
 
 The public Llama 3 70B shape is available as `llama3_70b_config()` for
 planning and compatibility checks without constructing the full model:
@@ -594,13 +610,19 @@ OpenAI serving also has explicit environment knobs for production-shape tuning:
 - `TORCHINFERNO_OPTIONAL_WARNINGS=1` reports optional fast-path fallbacks once
   instead of silently using the torch fallback.
 
-## Compiler And Graph Work
+## Offline Graph Optimization
 
-TorchInferno keeps compiler hooks explicit:
+TorchInferno keeps compiler and graph hooks out of the runtime hot path. Models
+execute concrete variants; offline workbenches trace, partition, replace,
+benchmark, and promote candidates. The guiding document is
+[`docs/OFFLINE_OPTIMIZATION.md`](docs/OFFLINE_OPTIMIZATION.md).
 
-- `torchinferno.compiler.compile_forward` wraps `torch.compile` policy.
+Current building blocks:
+
+- `torchinferno.compiler.compile_forward` wraps `torch.compile` for explicit
+  experiments and offline comparisons.
 - `torchinferno.graph.trace_with_make_fx` wraps `make_fx` and optional fake
-  tensor tracing.
+  tensor graph capture.
 - `torchinferno.graph.PassRegistry` registers ordered FX graph passes.
 - `annotate_matching_nodes` records match metadata without changing graph
   behavior.
@@ -611,6 +633,12 @@ TorchInferno keeps compiler hooks explicit:
 - `torchinferno.kernels.passes.register_kernel_replacement_passes` wires
   reference leaf calls and example fused subgraphs to TorchInferno kernel APIs.
 
+Replacement providers are intentionally pluggable. A graph partition can be
+tested with Helion, CuteDSL/CUTLASS, Triton, handwritten CUDA/C++, PyTorch
+custom ops, `torch.compile`, or a pure PyTorch rewrite, as long as the
+candidate writes comparable artifacts and can be promoted into a concrete
+variant.
+
 Trace a DSv4 attention slice:
 
 ```bash
@@ -618,7 +646,7 @@ PYTHONPATH=src python3 -m torchinferno.cli trace-smoke --device cpu --tokens 2
 PYTHONPATH=src python3 -m torchinferno.cli trace-smoke --device cpu --tokens 2 --fake --print-graph
 ```
 
-Compile the DSv4 forward path:
+Run an explicit `torch.compile` experiment on the DSv4 forward path:
 
 ```bash
 PYTHONPATH=src python3 -m torchinferno.cli dsv4-smoke \
@@ -629,7 +657,8 @@ PYTHONPATH=src python3 -m torchinferno.cli dsv4-smoke \
   --compile
 ```
 
-First compile is expected to be much slower than eager execution.
+First compile is expected to be much slower than eager execution. This command
+is an experiment path, not a runtime model requirement.
 
 ## Profile Artifact Runs
 
@@ -917,16 +946,17 @@ torch fallbacks:
 - `quantize_nvfp4`, `dequantize_nvfp4`, and `nvfp4_linear_reference`: a stable
   NVFP4 quantized-linear contract for graph passes and future fused kernels.
 
-The DSv4 model calls these APIs from `RMSNorm` and `SwiGLUExpert`, so the model
-keeps one torch-native path while the kernel backend can evolve behind a narrow
-interface. `helion-search-fx` enumerates FX node windows, benchmarks supported
-Helion-generated candidates against the current status quo and `torch.compile`,
-and records whether a candidate should be promoted. Checked-in Helion artifacts
-keep provenance in `kernels/helion_ops.py`; production routes should only move
-after a candidate beats the best baseline by the configured threshold. Tests
-compare CUDA Triton outputs against torch references when CUDA is available.
+Models call these APIs only after a backend has been checked in or promoted.
+The offline optimization workflow is provider-neutral: a partition can be
+replaced by Helion, CuteDSL/CUTLASS, Triton, handwritten CUDA/C++, PyTorch
+custom ops, `torch.compile` experiments, or pure PyTorch rewrites. Provider
+search belongs in offline commands and should produce candidate artifacts for
+validation and benchmark comparison. Production routes should only move after a
+candidate beats the best baseline by the configured threshold and preserves a
+safe fallback. Tests compare CUDA Triton outputs against torch references when
+CUDA is available.
 
-Search FX windows and remember Helion decisions before promoting a kernel:
+Search FX windows and remember Helion decisions as one optional provider:
 
 ```bash
 PYTHONPATH=src python3 -m torchinferno.cli helion-candidate \
@@ -942,7 +972,8 @@ PYTHONPATH=src python3 -m torchinferno.cli helion-search-fx \
 ```
 
 Search real model regions the same way. The region path traces a torch-native
-CPU/fake graph for discovery and can benchmark generated candidates on CUDA:
+CPU/fake graph offline for discovery and can benchmark generated candidates on
+CUDA:
 
 ```bash
 PYTHONPATH=src python3 -m torchinferno.cli helion-search-region \
@@ -1118,9 +1149,9 @@ Implemented as working code and tests:
   JSON, Chrome trace export, and standalone repro generation.
 - Focused module-region profiling with isolated graphs/profiles/repros.
 - Arbitrary graph subgraph extraction/profile by stable node id.
-- Pattern-profile loop for comparing reference subgraphs against registered
-  kernel replacements.
-- `torch.compile` smoke path.
+- Pattern-profile loop for offline comparison of reference subgraphs against
+  registered kernel replacements.
+- `torch.compile` experiment path for explicit offline comparisons.
 - `make_fx` and fake tensor trace helper.
 - Fake process groups.
 - Time-sliced multi-rank simulation.
@@ -1138,8 +1169,8 @@ Implemented as working code and tests:
 - Family-specific Llama 3 pipeline and tensor-parallel checkpoint
   loading/generation, plus vLLM-shaped latency, throughput, and serving
   benchmark suites.
-- Pattern-match graph replacement entry point, including a multi-node
-  make_fx/ATen subgraph replacement example.
+- Pattern-match graph replacement entry point for offline candidate generation,
+  including a multi-node make_fx/ATen subgraph replacement example.
 - Native DeepSeek dense/paged cache backend selection.
 - Paged KV allocation plus single-request and request-batched paged causal
   attention references.
@@ -1177,10 +1208,14 @@ Still intentionally future work:
 - Keep model code torch-native and easy to trace.
 - Keep model families, execution workbenches, and family-specific adapters
   documented as separate axes.
+- Keep compilers, graph tracers, partitioners, and backend generators out of
+  model and serving hot paths. Promote offline candidates into concrete
+  variants before runtime uses them.
 - Put experimental runtime policy in explicit harnesses, not hidden globals.
 - Prefer simulation-first workflows over heavyweight serving bootstraps.
 - Make it easy to zoom into a layer, graph region, cache policy, or scheduler.
-- Keep graph and kernel replacement hooks explicit so SOTA paths do not make
-  baseline code hard to read.
+- Keep graph and kernel replacement hooks provider-neutral so Helion,
+  CuteDSL/CUTLASS, Triton, custom CUDA, PyTorch custom ops, and torch fallbacks
+  can compete against the same reference contracts.
 - Upstream generic PyTorch improvements where possible, and keep TorchInferno
   thin when the platform can carry the abstraction cleanly.
