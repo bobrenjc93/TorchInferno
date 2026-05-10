@@ -23,6 +23,8 @@ from torchinferno.openai_server import (
     _should_reexec_distributed_server,
     _warmup_prefill_cache_token_counts,
     _warmup_prompt_token_counts,
+    _warmup_prefix_suffix_cache_token_counts,
+    _warmup_prefix_suffix_token_counts,
     _warmup_temperature_batch_sizes,
     _warmup_temperature_prompt_token_counts,
 )
@@ -155,15 +157,28 @@ def test_openai_server_auto_launches_tensor_parallel_for_vanilla_provider(monkey
 def test_openai_server_warmup_covers_long_output_prefill_shapes(monkeypatch) -> None:
     monkeypatch.delenv("TORCHINFERNO_OPENAI_WARMUP_PROMPT_TOKEN_BUCKETS", raising=False)
     monkeypatch.delenv("TORCHINFERNO_OPENAI_WARMUP_PREFILL_CACHE_TOKENS", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_WARMUP_PREFIX_SUFFIX_TOKENS", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_WARMUP_PREFIX_SUFFIX_CACHE_TOKENS", raising=False)
     monkeypatch.delenv("TORCHINFERNO_OPENAI_WARMUP_TEMPERATURE_BATCH_SIZES", raising=False)
     monkeypatch.delenv("TORCHINFERNO_OPENAI_WARMUP_TEMPERATURE_PROMPT_TOKEN_BUCKETS", raising=False)
 
     prompt_counts = set(_warmup_prompt_token_counts(32))
+    prefix_suffix_counts = set(_warmup_prefix_suffix_token_counts())
 
     assert {55, 71, 87, 103, 119, 136, 152, 168}.issubset(prompt_counts)
     assert {128, 144, 153, 161, 169, 178, 186}.issubset(prompt_counts)
     assert 55 in prompt_counts
     assert set(_warmup_prefill_cache_token_counts()) >= {256, 512, 1024}
+    assert {
+        (55, 16),
+        (71, 16),
+        (87, 16),
+        (103, 16),
+        (119, 17),
+        (136, 16),
+        (152, 16),
+    }.issubset(prefix_suffix_counts)
+    assert set(_warmup_prefix_suffix_cache_token_counts()) >= {128, 256, 1024}
     assert 55 in set(_warmup_temperature_prompt_token_counts())
     assert 8 in set(_warmup_temperature_batch_sizes())
 

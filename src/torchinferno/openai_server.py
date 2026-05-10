@@ -749,6 +749,7 @@ class OpenAICompletionEngine:
                 ):
                     pass
             self._warmup_tensor_parallel_prefill_graphs(prompt_token_counts, vocab_size)
+            self._warmup_tensor_parallel_prefix_suffix_graphs(vocab_size)
             self._warmup_tensor_parallel_temperature_graphs(vocab_size)
             warmup_cache_tokens = max(
                 max(prompt_token_counts) + new_tokens,
@@ -774,6 +775,26 @@ class OpenAICompletionEngine:
                 if count > cache_tokens:
                     continue
                 input_ids = (torch.arange(count, device=self.device, dtype=torch.long) % vocab_size)[None, :]
+                _try_prefill_graph(self.model, input_ids, cache, 0.0)
+                _reset_generation_cache(cache)
+
+    def _warmup_tensor_parallel_prefix_suffix_graphs(self, vocab_size: int) -> None:
+        if os.environ.get("TORCHINFERNO_CUDAGRAPH_PREFILL", "1") == "0":
+            return
+        specs = _warmup_prefix_suffix_token_counts()
+        cache_token_counts = _warmup_prefix_suffix_cache_token_counts()
+        if not specs or not cache_token_counts:
+            return
+        for cache_tokens in cache_token_counts:
+            cache = self._generation_cache(1, cache_tokens, model=self.model)
+            for prefix_tokens, suffix_tokens in specs:
+                if prefix_tokens + suffix_tokens > cache_tokens:
+                    continue
+                _set_generation_cache_seq_len(cache, prefix_tokens)
+                input_ids = (
+                    (torch.arange(suffix_tokens, device=self.device, dtype=torch.long) + prefix_tokens)
+                    % vocab_size
+                )[None, :]
                 _try_prefill_graph(self.model, input_ids, cache, 0.0)
                 _reset_generation_cache(cache)
 
@@ -1692,6 +1713,20 @@ def _warmup_prefill_cache_token_counts() -> tuple[int, ...]:
     )
 
 
+def _warmup_prefix_suffix_token_counts() -> tuple[tuple[int, int], ...]:
+    raw = os.environ.get(
+        "TORCHINFERNO_OPENAI_WARMUP_PREFIX_SUFFIX_TOKENS",
+        "55:16,71:16,87:16,103:16,119:17,136:16,152:16",
+    )
+    return _parse_nonnegative_positive_int_pair_csv(raw)
+
+
+def _warmup_prefix_suffix_cache_token_counts() -> tuple[int, ...]:
+    return _parse_positive_int_csv(
+        os.environ.get("TORCHINFERNO_OPENAI_WARMUP_PREFIX_SUFFIX_CACHE_TOKENS", "128,256,1024")
+    )
+
+
 def _parse_positive_int_csv(raw: str) -> tuple[int, ...]:
     counts: list[int] = []
     for part in raw.split(","):
@@ -1700,6 +1735,33 @@ def _parse_positive_int_csv(raw: str) -> tuple[int, ...]:
             continue
         counts.append(max(1, int(stripped)))
     return tuple(dict.fromkeys(counts))
+
+
+def _parse_nonnegative_positive_int_pair_csv(raw: str) -> tuple[tuple[int, int], ...]:
+    pairs: list[tuple[int, int]] = []
+    for part in raw.split(","):
+        stripped = part.strip()
+        if not stripped:
+            continue
+        prefix, separator, suffix = stripped.partition(":")
+        if not separator:
+            raise ValueError(f"expected prefix:suffix pair, got {stripped!r}")
+        pairs.append((max(0, int(prefix.strip())), max(1, int(suffix.strip()))))
+    return tuple(dict.fromkeys(pairs))
+
+
+def _set_generation_cache_seq_len(cache: object, seq_len: int) -> None:
+    for layer in getattr(cache, "layers", ()) or ():
+        if hasattr(layer, "seq_len"):
+            try:
+                setattr(layer, "seq_len", seq_len)
+            except Exception:
+                pass
+    if hasattr(cache, "seq_len"):
+        try:
+            setattr(cache, "seq_len", seq_len)
+        except Exception:
+            pass
 
 
 def _prefers_exact_generation_cache(model: object) -> bool:
