@@ -67,9 +67,9 @@ provider search, and promotion happen offline as described in
 
 | Area | Code | Verification |
 | --- | --- | --- |
-| DSv4 model family | [`models/dsv4/`](../src/torchinferno/models/dsv4/), compatibility [`models/dsv4_family/`](../src/torchinferno/models/dsv4_family/) | `dsv4-smoke`, `dsv4-hf-smoke`, `tests/test_dsv4_e2e.py` |
+| DSv4 model family | [`models/dsv4/`](../src/torchinferno/models/dsv4/) | `dsv4-smoke`, `dsv4-hf-smoke`, `tests/test_dsv4_e2e.py` |
 | DeepSeek-V3.2 model family | [`models/deepseek_v32/`](../src/torchinferno/models/deepseek_v32/), compatibility [`models/deepseek.py`](../src/torchinferno/models/deepseek.py) | `deepseek-smoke`, `deepseek-hf-smoke`, `tests/test_deepseek_native.py` |
-| Llama3 model family | [`models/llama3/`](../src/torchinferno/models/llama3/), compatibility [`models/llama3_family/`](../src/torchinferno/models/llama3_family/) | `validate-model-variants --family llama3`, `tests/test_model_variants.py` |
+| Llama3 model family | [`models/llama3/`](../src/torchinferno/models/llama3/) | `validate-model-variants --family llama3`, `tests/test_model_variants.py` |
 | Llama3 parallel execution adapters | [`models/llama3/pipeline.py`](../src/torchinferno/models/llama3/pipeline.py), [`models/llama3/tensor_parallel.py`](../src/torchinferno/models/llama3/tensor_parallel.py), [`benchmarks/torchinferno_llama.py`](../src/torchinferno/benchmarks/torchinferno_llama.py) | `llama-bench-suite`, `tests/test_llama3_tensor_parallel_distributed.py` |
 | Model provenance and validation | [`models/variants.py`](../src/torchinferno/models/variants.py), [`variant_validation.py`](../src/torchinferno/variant_validation.py) | `model-variants`, `validate-model-variants`, `tests/test_model_variants.py` |
 | Text IO and known-logit validation | [`tokenization.py`](../src/torchinferno/tokenization.py), [`validation.py`](../src/torchinferno/validation.py), [`models/auto.py`](../src/torchinferno/models/auto.py) | `text-generate`, `capture-logits`, `validate-logits`, `tests/test_production_workflows.py` |

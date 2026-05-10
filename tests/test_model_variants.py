@@ -9,8 +9,6 @@ from safetensors.torch import save_file
 
 import torchinferno.models.deepseek as legacy_deepseek_mod
 import torchinferno.models.deepseek_v32.model as canonical_deepseek_mod
-import torchinferno.models.llama3.model as canonical_llama3_model
-import torchinferno.models.llama3_family.v0 as legacy_llama3_v0_mod
 from torchinferno.models.deepseek_v32 import (
     DeepSeekV32V0ForCausalLM,
     DeepSeekV32V1ForCausalLM,
@@ -48,21 +46,8 @@ def test_model_family_catalog_uses_canonical_packages() -> None:
     assert get_model_family("deepseek_v32").name == "deepseek-v3.2"
 
 
-def test_legacy_model_imports_alias_canonical_modules() -> None:
+def test_legacy_deepseek_import_aliases_canonical_module() -> None:
     assert legacy_deepseek_mod is canonical_deepseek_mod
-    assert legacy_llama3_v0_mod is canonical_llama3_model
-
-    legacy_dsv4_raw_ops = importlib.import_module("torchinferno.models.dsv4_family.raw_ops")
-    canonical_dsv4_raw_ops = importlib.import_module("torchinferno.models.dsv4.raw_ops")
-    legacy_deepseek_registry = importlib.import_module(
-        "torchinferno.models.deepseek_v32_family.registry"
-    )
-    canonical_deepseek_registry = importlib.import_module(
-        "torchinferno.models.deepseek_v32.registry"
-    )
-
-    assert legacy_dsv4_raw_ops is canonical_dsv4_raw_ops
-    assert legacy_deepseek_registry is canonical_deepseek_registry
 
 
 def test_model_variant_registry_tracks_families_and_ops_modules() -> None:

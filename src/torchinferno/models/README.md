@@ -25,9 +25,8 @@ Each family package should prefer this structure:
 - `state_dict_adapter.py`: optional future home for checkpoint mapping if a
   family-specific adapter grows beyond `models/conversion.py`.
 
-Compatibility packages such as `dsv4_family/`, `deepseek_v32_family/`, and
-`llama3_family/` remain as import shims. New code should import from the
-canonical family packages.
+New code should import from the canonical family packages. The older
+`deepseek.py` module remains as a compatibility alias for DeepSeek-V3.2.
 
 Model code should stay torch-native and runtime-ready. Offline graph capture,
 partitioning, backend search, and promotion live outside the model hot path; see
