@@ -579,7 +579,10 @@ OpenAI serving also has explicit environment knobs for production-shape tuning:
 - `TORCHINFERNO_OPENAI_RAGGED_DECODE_FULL_BATCH_MIN_ROWS` and
   `TORCHINFERNO_OPENAI_RAGGED_DECODE_FULL_BATCH_MIN_ACTIVE_FRACTION` keep
   larger ragged decode batches at a stable full-batch graph shape while most
-  rows are still active.
+  rows are still active. `TORCHINFERNO_OPENAI_RAGGED_DECODE_POWER2_BUCKETS=0`
+  disables power-of-two row buckets for sustained ragged decode, and
+  `TORCHINFERNO_OPENAI_RAGGED_DECODE_BUCKET_MIN_STEP` controls when those
+  buckets begin.
 - `TORCHINFERNO_OPENAI_PHASE_TIMINGS=1` records serving phase timings, and
   `TORCHINFERNO_OPENAI_PREFIX_CACHE_SHARED_SAMPLE=1` enables shared-prefix
   cache reuse for temperature sampling.

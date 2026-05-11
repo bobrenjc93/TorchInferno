@@ -2088,13 +2088,17 @@ class OpenAICompletionEngine:
             if not should_decode:
                 break
             decode_full_batch = _prefer_full_batch_ragged_decode(len(active_indices), len(active))
+            advance_row_indices: Tensor | None = None
             if len(active_indices) == len(active) or decode_full_batch:
                 decode_indices = list(range(len(active)))
                 decode_input = next_token_tensor[:, None]
                 row_indices = None
             else:
-                decode_indices = active_indices
+                decode_indices = _ragged_decode_bucket_indices(active_indices, active, step=step)
                 row_indices = torch.tensor(active_indices, dtype=torch.long, device=self.device)
+                if decode_indices != active_indices:
+                    row_indices = torch.tensor(decode_indices, dtype=torch.long, device=self.device)
+                    advance_row_indices = torch.tensor(active_indices, dtype=torch.long, device=self.device)
                 decode_input = next_token_tensor.index_select(0, row_indices)[:, None]
             next_token, cache = _decode_next_token_ragged(
                 model,
@@ -2107,6 +2111,8 @@ class OpenAICompletionEngine:
             next_token = next_token.to(self.device)
             if row_indices is None:
                 seq_lens += 1
+            elif advance_row_indices is not None:
+                seq_lens[advance_row_indices] = seq_lens.index_select(0, advance_row_indices) + 1
             else:
                 seq_lens[row_indices] = seq_lens.index_select(0, row_indices) + 1
             step_tokens: list[int | None] = [None for _ in active]
@@ -2848,6 +2854,32 @@ def _prefer_full_batch_ragged_decode(active_count: int, batch_size: int) -> bool
         minimum=0.0,
     )
     return (active_count / batch_size) >= min(1.0, min_fraction)
+
+
+def _ragged_decode_bucket_indices(active_indices: Sequence[int], active: Sequence[bool], *, step: int) -> list[int]:
+    if not env_flag("TORCHINFERNO_OPENAI_RAGGED_DECODE_POWER2_BUCKETS", True):
+        return list(active_indices)
+    min_step = env_int("TORCHINFERNO_OPENAI_RAGGED_DECODE_BUCKET_MIN_STEP", 4, minimum=1)
+    if step < min_step:
+        return list(active_indices)
+    active_count = len(active_indices)
+    batch_size = len(active)
+    if active_count <= 0 or active_count >= batch_size:
+        return list(active_indices)
+    bucket_size = min(batch_size, 1 << (active_count - 1).bit_length())
+    if bucket_size <= active_count:
+        return list(active_indices)
+    active_set = set(active_indices)
+    decode_indices = list(active_indices)
+    for index, is_active in enumerate(active):
+        if is_active or index in active_set:
+            continue
+        decode_indices.append(index)
+        if len(decode_indices) >= bucket_size:
+            break
+    if len(decode_indices) < bucket_size:
+        return list(active_indices)
+    return decode_indices
 
 
 def _tokenizer_padding_token_id(tokenizer: object | None) -> int:

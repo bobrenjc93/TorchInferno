@@ -1179,6 +1179,31 @@ def test_openai_ragged_decode_keeps_full_batch_while_most_rows_active() -> None:
     assert model.ragged_calls[1] == ([[3] for _ in range(8)], [3 for _ in range(8)], None)
 
 
+def test_openai_ragged_decode_pads_to_power_of_two_bucket(monkeypatch) -> None:
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_RAGGED_DECODE_BUCKET_MIN_STEP", "1")
+    model = _RaggedSharedPrefixRecordingModel()
+    engine = _cache_only_engine()
+    engine.model = model
+    engine.stop_token_ids = frozenset()
+    cache = model.allocate_cache(8, 5)
+
+    steps = list(
+        engine._decode_shared_prefix_prompt_list_ragged(
+            cache=cache,
+            active=[True, True, True, False, False, False, False, False],
+            prompt_lengths=[2 for _ in range(8)],
+            max_tokens=3,
+            next_tokens=[2 for _ in range(8)],
+            temperature=0.0,
+            row_max_tokens=[3, 3, 3, 1, 1, 1, 1, 1],
+        )
+    )
+
+    assert steps == [[3, 3, 3, None, None, None, None, None], [4, 4, 4, None, None, None, None, None]]
+    assert model.ragged_calls[0] == ([[2], [2], [2], [2]], [2 for _ in range(8)], [0, 1, 2, 3])
+    assert model.ragged_calls[1] == ([[3], [3], [3], [3]], [3, 3, 3, 2, 2, 2, 2, 2], [0, 1, 2, 3])
+
+
 def test_openai_batch_steps_ragged_decode_skips_finished_rows() -> None:
     model = _RaggedSharedPrefixRecordingModel()
     engine = _cache_only_engine()
