@@ -2177,6 +2177,19 @@ def _ragged_scaled_dot_product_attention(
     *,
     enable_gqa: bool,
 ) -> Tensor:
+    if (
+        q.is_cuda
+        and k.is_cuda
+        and v.is_cuda
+        and enable_gqa
+        and _tp_flag("TORCHINFERNO_TRITON_GROUPED_DECODE_ATTENTION")
+    ):
+        try:
+            from torchinferno.kernels.triton_ops import triton_grouped_gqa_decode_attention
+
+            return triton_grouped_gqa_decode_attention(q, k, v, attention_lengths.to(device=k.device))
+        except Exception as exc:
+            warn_optional_failure("llama3_tensor_parallel.ragged_decode_attention", exc)
     max_seq_len = k.size(2)
     key_positions = torch.arange(max_seq_len, device=q.device)
     mask = key_positions[None, :] < attention_lengths.to(device=q.device)[:, None]

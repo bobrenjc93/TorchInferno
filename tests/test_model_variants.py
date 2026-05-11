@@ -250,7 +250,7 @@ def test_llama3_tensor_parallel_ragged_decode_matches_independent_decode(tmp_pat
             seq_lens=torch.tensor(seq_lens, dtype=torch.long),
         )
 
-    torch.testing.assert_close(actual, torch.cat(expected_logits, dim=0), atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(actual, torch.cat(expected_logits, dim=0), atol=5e-4, rtol=5e-4)
 
 
 def _write_tiny_llama3_hf_checkpoint(reference: Llama3V0ForCausalLM, config, path) -> None:

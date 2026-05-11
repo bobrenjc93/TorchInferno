@@ -312,3 +312,19 @@ def test_triton_dense_gqa_decode_attention_matches_torch_reference() -> None:
     grouped_actual = triton_grouped_gqa_decode_attention(q, padded_k, padded_v, dynamic_seq_len)
 
     torch.testing.assert_close(grouped_actual, expected, atol=4e-2, rtol=4e-2)
+
+    row_seq_lens = torch.tensor([seq_len, seq_len - 3], device="cuda", dtype=torch.int64)
+    key_positions = torch.arange(padded_k.size(2), device="cuda")
+    row_mask = key_positions[None, :] < row_seq_lens[:, None]
+    row_expected = torch.nn.functional.scaled_dot_product_attention(
+        q,
+        padded_k,
+        padded_v,
+        attn_mask=row_mask[:, None, None, :],
+        dropout_p=0.0,
+        is_causal=False,
+        enable_gqa=True,
+    )
+    row_actual = triton_grouped_gqa_decode_attention(q, padded_k, padded_v, row_seq_lens)
+
+    torch.testing.assert_close(row_actual, row_expected, atol=4e-2, rtol=4e-2)

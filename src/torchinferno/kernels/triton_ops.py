@@ -870,6 +870,7 @@ def _grouped_gqa_decode_attention_dynamic_kernel(
     v_ptr,
     out_ptr,
     seq_len_ptr,
+    seq_len_stride: tl.constexpr,
     q_heads: tl.constexpr,
     kv_heads: tl.constexpr,
     group_size: tl.constexpr,
@@ -897,8 +898,8 @@ def _grouped_gqa_decode_attention_dynamic_kernel(
     block_d: tl.constexpr,
     block_v: tl.constexpr,
 ) -> None:
-    seq_len = tl.load(seq_len_ptr)
     batch = tl.program_id(0)
+    seq_len = tl.load(seq_len_ptr + batch * seq_len_stride)
     kv_head = tl.program_id(1)
     offs_q = tl.arange(0, block_q)
     offs_s = tl.arange(0, block_s)
@@ -948,6 +949,7 @@ def _grouped_gqa_decode_attention_streaming_kernel(
     v_ptr,
     out_ptr,
     seq_len_ptr,
+    seq_len_stride: tl.constexpr,
     cache_tokens: tl.constexpr,
     group_size: tl.constexpr,
     head_dim: tl.constexpr,
@@ -974,8 +976,8 @@ def _grouped_gqa_decode_attention_streaming_kernel(
     block_d: tl.constexpr,
     block_v: tl.constexpr,
 ) -> None:
-    seq_len = tl.load(seq_len_ptr)
     batch = tl.program_id(0)
+    seq_len = tl.load(seq_len_ptr + batch * seq_len_stride)
     kv_head = tl.program_id(1)
     offs_q = tl.arange(0, block_q)
     offs_s = tl.arange(0, block_s)
@@ -1051,8 +1053,8 @@ def triton_grouped_gqa_decode_attention(q: Tensor, k: Tensor, v: Tensor, seq_len
         raise ValueError("q and k head dimensions must match")
     if q.stride(-1) != 1 or k.stride(-1) != 1 or v.stride(-1) != 1:
         raise ValueError("q, k, and v must have contiguous head dimensions")
-    if seq_len.numel() != 1:
-        raise ValueError("dynamic decode attention sequence length must be a scalar tensor")
+    if seq_len.numel() not in {1, q.size(0)}:
+        raise ValueError("dynamic decode attention sequence length must be scalar or have shape [batch]")
     if seq_len.device != k.device:
         raise ValueError("dynamic decode attention sequence length must be on the cache device")
     batch, q_heads, _, head_dim = q.shape
@@ -1069,6 +1071,7 @@ def triton_grouped_gqa_decode_attention(q: Tensor, k: Tensor, v: Tensor, seq_len
         raise ValueError("grouped GQA decode attention supports sequence lengths up to 2048")
     if block_d > 256 or block_v > 256:
         raise ValueError("grouped GQA decode attention supports head dimensions up to 256")
+    seq_len_stride = 0 if seq_len.numel() == 1 else 1
     out = torch.empty((batch, q_heads, 1, value_dim), device=q.device, dtype=q.dtype)
     if os.environ.get("TORCHINFERNO_TRITON_STREAMING_DECODE_ATTENTION", "1") != "0":
         block_s = int(os.environ.get("TORCHINFERNO_TRITON_STREAMING_DECODE_ATTENTION_BLOCK_S", "64"))
@@ -1080,6 +1083,7 @@ def triton_grouped_gqa_decode_attention(q: Tensor, k: Tensor, v: Tensor, seq_len
             v,
             out,
             seq_len,
+            seq_len_stride,
             cache_tokens,
             group_size,
             head_dim,
@@ -1115,6 +1119,7 @@ def triton_grouped_gqa_decode_attention(q: Tensor, k: Tensor, v: Tensor, seq_len
         v,
         out,
         seq_len,
+        seq_len_stride,
         q_heads,
         kv_heads,
         group_size,
