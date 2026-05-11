@@ -2024,7 +2024,8 @@ def test_openai_effective_max_batch_size_caps_cuda_tp_by_default(monkeypatch) ->
     )
 
     assert _effective_openai_max_batch_size(model, torch.device("cuda"), 64) == 64
-    assert _effective_openai_max_batch_size(model, torch.device("cuda"), 128) == 64
+    assert _effective_openai_max_batch_size(model, torch.device("cuda"), 128) == 128
+    assert _effective_openai_max_batch_size(model, torch.device("cuda"), 256) == 128
     assert _effective_openai_max_batch_size(model, torch.device("cpu"), 64) == 64
 
 

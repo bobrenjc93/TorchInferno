@@ -74,7 +74,7 @@ class OpenAIServerConfig:
     cache_dir: str | None = None
     cache_backend: str = "dense"
     page_size: int = 16
-    max_batch_size: int = 64
+    max_batch_size: int = 128
     batch_wait_ms: float = 10.0
     single_request_admission_wait_ms: float | None = None
     llama_parallelism: str = "auto"
@@ -374,7 +374,7 @@ class OpenAICompletionEngine:
         cache_backend: str = "dense",
         page_size: int = 16,
         max_model_len: int | None = None,
-        max_batch_size: int = 64,
+        max_batch_size: int = 128,
         batch_wait_ms: float = 10.0,
         single_request_admission_wait_ms: float | None = None,
     ) -> None:
@@ -2830,7 +2830,7 @@ def _tensor_parallel_world_size(model: object) -> int:
 def _effective_openai_max_batch_size(model: object, device: torch.device, requested: int) -> int:
     max_batch_size = max(1, requested)
     if _is_tensor_parallel_model(model) and device.type == "cuda":
-        tp_default = env_int("TORCHINFERNO_OPENAI_TP_MAX_BATCH_SIZE", 64, minimum=1)
+        tp_default = env_int("TORCHINFERNO_OPENAI_TP_MAX_BATCH_SIZE", 128, minimum=1)
         return min(max_batch_size, tp_default)
     return max_batch_size
 
@@ -3854,7 +3854,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cache-dir", default=None)
     parser.add_argument("--cache-backend", choices=["dense", "paged"], default="dense")
     parser.add_argument("--page-size", type=int, default=16)
-    parser.add_argument("--max-batch-size", type=int, default=64)
+    parser.add_argument("--max-batch-size", type=int, default=128)
     parser.add_argument("--batch-wait-ms", type=float, default=10.0)
     parser.add_argument(
         "--single-request-admission-wait-ms",
