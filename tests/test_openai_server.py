@@ -26,6 +26,7 @@ from torchinferno.openai_server import (
     _prefers_exact_generation_cache,
     _should_reexec_distributed_server,
     _sync_tensor_parallel_command,
+    _sync_tensor_parallel_continue,
     _tensor_parallel_worker_loop,
     _try_decode_one_token_graph,
     _try_decode_one_token_logits_graph,
@@ -1165,6 +1166,49 @@ def test_openai_tensor_parallel_command_sync_uses_control_group(monkeypatch) -> 
         ("barrier", {"group": "control"}),
         ("sync", "cuda"),
     ]
+
+
+def test_openai_tensor_parallel_continue_sync_skips_broadcast_by_default(monkeypatch) -> None:
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_SYNC_TP_CONTINUE", raising=False)
+    model = type("FakeTPModel", (), {"world_size": 2})()
+
+    monkeypatch.setattr(
+        "torchinferno.openai_server._is_tensor_parallel_model",
+        lambda candidate: candidate is model,
+    )
+    import torch.distributed as dist
+
+    monkeypatch.setattr(dist, "is_available", lambda: True)
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(dist, "broadcast", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("broadcast")))
+
+    assert _sync_tensor_parallel_continue(model, True, torch.device("cpu")) is True
+    assert _sync_tensor_parallel_continue(model, False, torch.device("cpu")) is False
+
+
+def test_openai_tensor_parallel_continue_sync_can_be_enabled(monkeypatch) -> None:
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_SYNC_TP_CONTINUE", "1")
+    model = type("FakeTPModel", (), {"world_size": 2})()
+    calls: list[int] = []
+
+    monkeypatch.setattr(
+        "torchinferno.openai_server._is_tensor_parallel_model",
+        lambda candidate: candidate is model,
+    )
+    import torch.distributed as dist
+
+    monkeypatch.setattr(dist, "is_available", lambda: True)
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+
+    def broadcast(flag: torch.Tensor, *, src: int) -> None:
+        assert src == 0
+        calls.append(int(flag.item()))
+
+    monkeypatch.setattr(dist, "broadcast", broadcast)
+
+    assert _sync_tensor_parallel_continue(model, True, torch.device("cpu")) is True
+    assert _sync_tensor_parallel_continue(model, False, torch.device("cpu")) is False
+    assert calls == [1, 0]
 
 
 def test_openai_tensor_parallel_disables_cuda_graphs_by_default(monkeypatch) -> None:

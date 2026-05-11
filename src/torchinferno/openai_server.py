@@ -2061,6 +2061,8 @@ def _sync_tensor_parallel_command(model: object, device: torch.device) -> None:
 def _sync_tensor_parallel_continue(model: object, should_continue: bool, device: torch.device) -> bool:
     if not _is_tensor_parallel_model(model) or _tensor_parallel_world_size(model) <= 1:
         return should_continue
+    if not env_flag("TORCHINFERNO_OPENAI_SYNC_TP_CONTINUE"):
+        return should_continue
     import torch.distributed as dist
 
     if not dist.is_available() or not dist.is_initialized():
