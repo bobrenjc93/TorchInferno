@@ -110,6 +110,14 @@ class _GenerationResult:
     tokens: list[int]
 
 
+@dataclass(frozen=True)
+class _PrefixCachedPrompt:
+    index: int
+    prompt: list[int]
+    entry: TensorPrefixCacheEntry
+    prefix_tokens: int
+
+
 @runtime_checkable
 class _IncrementalGenerationModel(Protocol):
     def allocate_cache(self, batch_size: int, max_seq_len: int, **kwargs: object) -> object: ...
@@ -1090,6 +1098,92 @@ class OpenAICompletionEngine:
             page_size=self.page_size,
         ))
 
+    def _save_prompt_prefix_cache_row(
+        self,
+        tokens: Sequence[int],
+        cache: object,
+        *,
+        row: int,
+        seq_len: int,
+    ) -> None:
+        if not env_flag("TORCHINFERNO_OPENAI_PREFIX_CACHE", True):
+            return
+        if not _prefix_cache_enabled_for_model(self.model):
+            self._clear_prefix_cache()
+            return
+        token_tuple = tuple(int(token_id) for token_id in tokens)
+        max_tokens = env_int("TORCHINFERNO_OPENAI_PREFIX_CACHE_MAX_TOKENS", 1024, minimum=1)
+        if len(token_tuple) > max_tokens or seq_len < len(token_tuple):
+            return
+        self._store_prefix_cache_entry(snapshot_tensor_prefix_cache(
+            cache,
+            token_tuple,
+            seq_len=seq_len,
+            device=str(self.device),
+            backend=self.cache_backend,
+            page_size=self.page_size,
+            row=row,
+        ))
+
+    def _save_prompt_prefix_cache_rows(
+        self,
+        prompts: Sequence[Sequence[int]],
+        cache: object,
+        *,
+        row_indices: Sequence[int] | None = None,
+    ) -> None:
+        indices = range(len(prompts)) if row_indices is None else row_indices
+        for row, prompt_index in enumerate(indices):
+            prompt = prompts[int(prompt_index)]
+            self._save_prompt_prefix_cache_row(
+                prompt,
+                cache,
+                row=row,
+                seq_len=len(prompt),
+            )
+
+    def _prefix_cached_prompt_groups(
+        self,
+        prompts: Sequence[Sequence[int]],
+    ) -> list[list[_PrefixCachedPrompt]]:
+        if not env_flag("TORCHINFERNO_OPENAI_PREFIX_CACHE_BATCH_RESTORE", True):
+            return []
+        if not env_flag("TORCHINFERNO_OPENAI_PREFIX_CACHE", True):
+            return []
+        if not _prefix_cache_enabled_for_model(self.model):
+            self._clear_prefix_cache()
+            return []
+        min_prefix_tokens = env_int("TORCHINFERNO_OPENAI_PREFIX_CACHE_MIN_TOKENS", 16, minimum=1)
+        use_ragged_suffixes = _ragged_decode_enabled_for_model(self.model)
+        groups: dict[tuple[int, int], list[_PrefixCachedPrompt]] = {}
+        for index, prompt in enumerate(prompts):
+            input_tokens = tuple(int(token_id) for token_id in prompt)
+            for prefix_tokens, entry in self._prefix_cache_restore_candidates(input_tokens, min_prefix_tokens):
+                if (
+                    entry.device != str(self.device)
+                    or entry.backend != self.cache_backend
+                    or entry.page_size != self.page_size
+                ):
+                    continue
+                suffix_len = len(input_tokens) - prefix_tokens
+                if suffix_len <= 0:
+                    continue
+                suffix_key = -1 if use_ragged_suffixes else suffix_len
+                groups.setdefault((prefix_tokens, suffix_key), []).append(
+                    _PrefixCachedPrompt(index, list(prompt), entry, prefix_tokens)
+                )
+                break
+        min_rows = env_int("TORCHINFERNO_OPENAI_PREFIX_CACHE_BATCH_RESTORE_MIN_ROWS", 2, minimum=1)
+        grouped = [group for group in groups.values() if len(group) >= min_rows]
+        grouped.sort(key=lambda group: (group[0].prefix_tokens, len(group)), reverse=True)
+        if grouped and not _tensor_parallel_all_ranks_same_int(
+            self.model,
+            _prefix_cached_prompt_groups_signature(grouped),
+            self.device,
+        ):
+            return []
+        return grouped
+
     def _clear_prefix_cache(self) -> None:
         self._prefix_cache_entry = None
         entries = getattr(self, "_prefix_cache_entries", None)
@@ -1484,6 +1578,7 @@ class OpenAICompletionEngine:
         temperature: float,
         broadcast_tensor_parallel: bool = True,
         row_max_tokens: Sequence[int] | None = None,
+        prefix_cache_prompts: Sequence[Sequence[int]] | None = None,
     ) -> Iterator[list[int | None]]:
         if max_tokens <= 0:
             return
@@ -1515,6 +1610,7 @@ class OpenAICompletionEngine:
                 temperature=temperature,
                 microbatch_size=microbatch_size,
                 row_max_tokens=row_max_tokens,
+                prefix_cache_prompts=prefix_cache_prompts,
             )
             return
         if 0 < microbatch_size < input_ids.size(0):
@@ -1524,6 +1620,7 @@ class OpenAICompletionEngine:
                 temperature=temperature,
                 microbatch_size=microbatch_size,
                 row_max_tokens=row_max_tokens,
+                prefix_cache_prompts=prefix_cache_prompts,
             )
             return
         eos_token_id = self.tokenizer.eos_token_id
@@ -1569,6 +1666,8 @@ class OpenAICompletionEngine:
                 if token_id in stop_token_ids or step + 1 >= per_row_limits[row]:
                     active[row] = False
             yield step_tokens
+            if step == 0 and prefix_cache_prompts is not None:
+                self._save_prompt_prefix_cache_rows(prefix_cache_prompts, cache)
             should_continue = step + 1 < max_tokens and any(active)
             should_continue = _sync_tensor_parallel_continue(model, should_continue, next_token.device)
             if not should_continue:
@@ -1679,6 +1778,7 @@ class OpenAICompletionEngine:
         temperature: float,
         microbatch_size: int,
         row_max_tokens: Sequence[int] | None = None,
+        prefix_cache_prompts: Sequence[Sequence[int]] | None = None,
     ) -> Iterator[list[int | None]]:
         stop_token_ids = self.stop_token_ids
         model = self.model
@@ -1722,6 +1822,8 @@ class OpenAICompletionEngine:
                 }
             )
             yield step_tokens
+            if prefix_cache_prompts is not None:
+                self._save_prompt_prefix_cache_rows(prefix_cache_prompts[start:end], cache)
         for step in range(1, max_tokens):
             emitted = False
             for state in states:
@@ -1812,6 +1914,7 @@ class OpenAICompletionEngine:
         temperature: float,
         broadcast_tensor_parallel: bool = True,
         row_max_tokens: Sequence[int] | None = None,
+        allow_prefix_cache_restore: bool = True,
     ) -> Iterator[list[int | None]]:
         if max_tokens <= 0:
             return
@@ -1827,6 +1930,44 @@ class OpenAICompletionEngine:
                 row_max_tokens=row_max_tokens,
             )
         per_row_limits = _normalize_row_max_tokens(row_max_tokens, len(prompts), max_tokens)
+        if allow_prefix_cache_restore:
+            cached_groups = self._prefix_cached_prompt_groups(prompts)
+            if cached_groups:
+                cached_indices = {item.index for group in cached_groups for item in group}
+                segments: list[tuple[list[int], Iterator[list[int | None]]]] = [
+                    (
+                        [item.index for item in group],
+                        self._generate_prefix_cached_prompt_group_steps(
+                            group,
+                            max_tokens=max_tokens,
+                            temperature=temperature,
+                            row_max_tokens=[per_row_limits[item.index] for item in group],
+                        ),
+                    )
+                    for group in cached_groups
+                ]
+                remaining = [
+                    (index, prompt)
+                    for index, prompt in enumerate(prompts)
+                    if index not in cached_indices
+                ]
+                if remaining:
+                    remaining_indices = [index for index, _prompt in remaining]
+                    segments.append(
+                        (
+                            remaining_indices,
+                            self._generate_prompt_list_batch_steps(
+                                [prompt for _index, prompt in remaining],
+                                max_tokens=max_tokens,
+                                temperature=temperature,
+                                broadcast_tensor_parallel=False,
+                                row_max_tokens=[per_row_limits[index] for index in remaining_indices],
+                                allow_prefix_cache_restore=False,
+                            ),
+                        )
+                    )
+                yield from _interleave_prompt_segments(len(prompts), segments)
+                return
         prompt_lengths = {len(prompt) for prompt in prompts}
         if len(prompt_lengths) == 1:
             input_ids = torch.tensor(prompts, dtype=torch.long, device=self.device)
@@ -1836,6 +1977,7 @@ class OpenAICompletionEngine:
                 temperature=temperature,
                 broadcast_tensor_parallel=False,
                 row_max_tokens=per_row_limits,
+                prefix_cache_prompts=prompts,
             )
             return
         prefix_tokens = self._shared_prefix_prompt_list_tokens(prompts)
@@ -1861,11 +2003,143 @@ class OpenAICompletionEngine:
                 temperature=temperature,
                 broadcast_tensor_parallel=False,
                 row_max_tokens=[per_row_limits[index] for index in original_indices],
+                prefix_cache_prompts=[prompt for _index, prompt in same_length],
             ):
                 step_tokens: list[int | None] = [None for _ in prompts]
                 for original_index, token_id in zip(original_indices, group_step):
                     step_tokens[original_index] = token_id
                 yield step_tokens
+
+    @torch.inference_mode()
+    def _generate_prefix_cached_prompt_group_steps(
+        self,
+        group: Sequence[_PrefixCachedPrompt],
+        *,
+        max_tokens: int,
+        temperature: float,
+        row_max_tokens: Sequence[int] | None = None,
+    ) -> Iterator[list[int | None]]:
+        if max_tokens <= 0 or not group:
+            return
+        model = self.model
+        if not _supports_incremental_generation(model):
+            input_ids = torch.tensor([item.prompt for item in group], dtype=torch.long, device=self.device)
+            rows = _generated_rows_with_model(
+                model,
+                input_ids,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                eos_token_id=self.tokenizer.eos_token_id,
+                stop_token_ids=self.stop_token_ids,
+            )
+            yield from _iter_generated_steps(rows, max_tokens, self.stop_token_ids)
+            return
+
+        prefix_tokens = group[0].prefix_tokens
+        prompt_lengths = [len(item.prompt) for item in group]
+        suffix_rows = [item.prompt[prefix_tokens:] for item in group]
+        max_suffix_len = max((len(row) for row in suffix_rows), default=0)
+        if max_suffix_len <= 0:
+            return
+        cache = self._generation_cache(
+            len(group),
+            max(prompt_lengths) + max_tokens,
+            model=model,
+        )
+        for row, item in enumerate(group):
+            restored = restore_tensor_prefix_cache(
+                item.entry,
+                item.prompt,
+                cache,
+                min_prefix_tokens=prefix_tokens,
+                device=str(self.device),
+                backend=self.cache_backend,
+                page_size=self.page_size,
+                row=row,
+                restore_seq_len=False,
+                on_seq_len_restore_error=lambda exc: warn_optional_failure("openai.prefix_cache.seq_len_restore", exc),
+            )
+            if restored != prefix_tokens:
+                return
+        _set_generation_cache_seq_len(cache, prefix_tokens)
+
+        if min(len(row) for row in suffix_rows) == max_suffix_len:
+            suffix_ids = torch.tensor(suffix_rows, dtype=torch.long, device=self.device)
+            next_token, cache = _prefill_next_token(
+                model,
+                suffix_ids,
+                cache,
+                temperature,
+                allow_capture=_runtime_prefill_graph_capture_enabled(model, temperature, max_tokens=max_tokens),
+            )
+        else:
+            pad_token_id = _tokenizer_padding_token_id(getattr(self, "tokenizer", None))
+            suffix_ids = torch.full(
+                (len(group), max_suffix_len),
+                pad_token_id,
+                dtype=torch.long,
+                device=self.device,
+            )
+            for row, suffix in enumerate(suffix_rows):
+                suffix_ids[row, : len(suffix)] = torch.tensor(suffix, dtype=torch.long, device=self.device)
+            logits, cache = _forward_all_logits(model, suffix_ids, cache)
+            row_positions = torch.arange(len(group), dtype=torch.long, device=self.device)
+            last_positions = torch.tensor(
+                [len(suffix) - 1 for suffix in suffix_rows],
+                dtype=torch.long,
+                device=self.device,
+            )
+            next_token = _sample(model, logits[row_positions, last_positions, :], temperature)
+        next_token = next_token.to(self.device)
+
+        stop_token_ids = self.stop_token_ids
+        per_row_limits = _normalize_row_max_tokens(row_max_tokens, len(group), max_tokens)
+        first_tokens: list[int | None] = []
+        active: list[bool] = []
+        for row, token_id in enumerate(next_token.detach().cpu().tolist()):
+            if per_row_limits[row] <= 0:
+                first_tokens.append(None)
+                active.append(False)
+                continue
+            token = int(token_id)
+            first_tokens.append(token)
+            active.append(token not in stop_token_ids and per_row_limits[row] > 1)
+        yield first_tokens
+        self._save_prompt_prefix_cache_rows([item.prompt for item in group], cache)
+
+        should_continue = max_tokens > 1 and any(active)
+        should_continue = _sync_tensor_parallel_continue(model, should_continue, self.device)
+        if not should_continue:
+            return
+        if _ragged_decode_enabled_for_model(model):
+            yield from self._decode_shared_prefix_prompt_list_ragged(
+                cache=cache,
+                active=active,
+                prompt_lengths=prompt_lengths,
+                max_tokens=max_tokens,
+                next_tokens=first_tokens,
+                temperature=temperature,
+                row_max_tokens=per_row_limits,
+            )
+            return
+
+        for step in range(1, max_tokens):
+            next_token, cache = _decode_next_token(model, next_token[:, None], cache, temperature)
+            next_token = next_token.to(self.device)
+            step_tokens: list[int | None] = []
+            for row, token_id in enumerate(next_token.detach().cpu().tolist()):
+                if not active[row]:
+                    step_tokens.append(None)
+                    continue
+                token = int(token_id)
+                step_tokens.append(token)
+                if token in stop_token_ids or step + 1 >= per_row_limits[row]:
+                    active[row] = False
+            yield step_tokens
+            should_continue = step + 1 < max_tokens and any(active)
+            should_continue = _sync_tensor_parallel_continue(model, should_continue, self.device)
+            if not should_continue:
+                break
 
     @torch.inference_mode()
     def _generate_shared_prefix_prompt_list_steps(
@@ -1963,6 +2237,7 @@ class OpenAICompletionEngine:
             if padded_state is not None:
                 combined_cache, first_tokens, active = padded_state
                 yield first_tokens
+                self._save_prompt_prefix_cache_rows(prompts, combined_cache)
                 should_continue = max_tokens > 1 and any(active)
                 should_continue = _sync_tensor_parallel_continue(model, should_continue, self.device)
                 if should_continue:
@@ -2015,6 +2290,11 @@ class OpenAICompletionEngine:
                 }
             )
         yield first_tokens
+        for state in states:
+            cache = state["cache"]
+            original_indices = state["indices"]
+            if isinstance(original_indices, list):
+                self._save_prompt_prefix_cache_rows(prompts, cache, row_indices=original_indices)
         should_continue = max_tokens > 1 and any(
             isinstance(state["active"], list) and any(state["active"])
             for state in states
@@ -2298,6 +2578,7 @@ class OpenAICompletionEngine:
         temperature: float,
         microbatch_size: int,
         row_max_tokens: Sequence[int] | None = None,
+        prefix_cache_prompts: Sequence[Sequence[int]] | None = None,
     ) -> Iterator[list[int | None]]:
         stop_token_ids = self.stop_token_ids
         model = self.model
@@ -2351,6 +2632,8 @@ class OpenAICompletionEngine:
             if token_id in stop_token_ids or per_row_limits[row] <= 1:
                 active[row] = False
         yield step_tokens
+        if prefix_cache_prompts is not None:
+            self._save_prompt_prefix_cache_rows(prefix_cache_prompts, cache)
         should_continue = max_tokens > 1 and any(active)
         should_continue = _sync_tensor_parallel_continue(model, should_continue, next_token.device)
         if not should_continue:
@@ -2656,6 +2939,20 @@ def _tensor_parallel_all_ranks_true(model: object, value: bool, device: torch.de
     flag = torch.tensor([1 if value else 0], dtype=torch.int32, device=device)
     dist.all_reduce(flag, op=dist.ReduceOp.MIN)
     return bool(flag.item())
+
+
+def _tensor_parallel_all_ranks_same_int(model: object, value: int, device: torch.device) -> bool:
+    if not _is_tensor_parallel_model(model) or _tensor_parallel_world_size(model) <= 1:
+        return True
+    import torch.distributed as dist
+
+    if not dist.is_available() or not dist.is_initialized():
+        return True
+    low = torch.tensor([int(value)], dtype=torch.int64, device=device)
+    high = low.clone()
+    dist.all_reduce(low, op=dist.ReduceOp.MIN)
+    dist.all_reduce(high, op=dist.ReduceOp.MAX)
+    return bool(low.item() == high.item())
 
 
 def _broadcast_tensor_parallel_generate(
@@ -3195,6 +3492,41 @@ def _normalize_row_max_tokens(
     if len(row_max_tokens) != batch_size:
         raise ValueError("row_max_tokens must match batch size")
     return [max(0, min(max_tokens, int(value))) for value in row_max_tokens]
+
+
+def _interleave_prompt_segments(
+    prompt_count: int,
+    segments: Sequence[tuple[Sequence[int], Iterator[list[int | None]]]],
+) -> Iterator[list[int | None]]:
+    active_segments = list(segments)
+    while active_segments:
+        step_tokens: list[int | None] = [None for _ in range(prompt_count)]
+        next_segments: list[tuple[Sequence[int], Iterator[list[int | None]]]] = []
+        emitted = False
+        for indices, iterator in active_segments:
+            try:
+                segment_tokens = next(iterator)
+            except StopIteration:
+                continue
+            for index, token_id in zip(indices, segment_tokens):
+                step_tokens[int(index)] = token_id
+            next_segments.append((indices, iterator))
+            emitted = True
+        if not emitted:
+            break
+        yield step_tokens
+        active_segments = next_segments
+
+
+def _prefix_cached_prompt_groups_signature(groups: Sequence[Sequence[_PrefixCachedPrompt]]) -> int:
+    value = 17
+    for group in groups:
+        value = (value * 1_000_003 + len(group)) & 0x7FFFFFFF
+        for item in group:
+            value = (value * 1_000_003 + item.index) & 0x7FFFFFFF
+            value = (value * 1_000_003 + item.prefix_tokens) & 0x7FFFFFFF
+            value = (value * 1_000_003 + len(item.prompt)) & 0x7FFFFFFF
+    return value
 
 
 def _coerce_optional_int_sequence(value: object) -> list[int] | None:

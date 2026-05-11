@@ -879,6 +879,60 @@ def test_openai_engine_restores_older_exact_prefix_cache(monkeypatch) -> None:
     assert restore_cache.seq_len == 2
 
 
+def test_openai_prompt_list_batch_restores_cached_prefix_rows(monkeypatch) -> None:
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_PREFIX_CACHE_MIN_TOKENS", "1")
+    model = _TokenEchoSharedPrefixRecordingModel()
+    engine = _cache_only_engine()
+    engine.model = model
+    engine.stop_token_ids = frozenset()
+
+    for prompt in ([10, 11, 12], [10, 11, 13]):
+        input_ids = torch.tensor([prompt], dtype=torch.long)
+        cache = model.allocate_cache(1, 8)
+        model.forward(input_ids, cache=cache, use_cache=True)
+        engine._save_prompt_prefix_cache(input_ids, cache)
+    model.forward_inputs.clear()
+
+    steps = list(
+        engine._generate_prompt_list_batch_steps(
+            [[10, 11, 12, 4], [10, 11, 13, 5]],
+            max_tokens=1,
+            temperature=0.0,
+            broadcast_tensor_parallel=False,
+        )
+    )
+
+    assert steps == [[4, 5]]
+    assert model.forward_inputs == [[[4], [5]]]
+
+
+def test_openai_prompt_list_batch_restores_cached_prefix_rows_with_padded_suffixes(monkeypatch) -> None:
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_PREFIX_CACHE_MIN_TOKENS", "1")
+    model = _TokenEchoSharedPrefixRecordingModel()
+    engine = _cache_only_engine()
+    engine.model = model
+    engine.stop_token_ids = frozenset()
+
+    for prompt in ([10, 12], [11, 13]):
+        input_ids = torch.tensor([prompt], dtype=torch.long)
+        cache = model.allocate_cache(1, 8)
+        model.forward(input_ids, cache=cache, use_cache=True)
+        engine._save_prompt_prefix_cache(input_ids, cache)
+    model.forward_inputs.clear()
+
+    steps = list(
+        engine._generate_prompt_list_batch_steps(
+            [[10, 12, 4, 6], [11, 13, 5]],
+            max_tokens=1,
+            temperature=0.0,
+            broadcast_tensor_parallel=False,
+        )
+    )
+
+    assert steps == [[6, 5]]
+    assert model.forward_inputs == [[[4, 6], [5, 0]]]
+
+
 def test_openai_engine_uses_prefill_graph_for_prefix_suffix(monkeypatch) -> None:
     monkeypatch.setenv("TORCHINFERNO_OPENAI_PREFIX_CACHE_MIN_TOKENS", "1")
     model = _PrefixGraphRecordingModel()

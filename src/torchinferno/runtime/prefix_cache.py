@@ -134,6 +134,8 @@ def restore_tensor_prefix_cache(
     device: str,
     backend: str,
     page_size: int,
+    row: int = 0,
+    restore_seq_len: bool = True,
     on_seq_len_restore_error: Callable[[BaseException], None] | None = None,
 ) -> int:
     if entry.device != device or entry.backend != backend or entry.page_size != page_size:
@@ -160,14 +162,20 @@ def restore_tensor_prefix_cache(
         layer_values = getattr(layer, "values", None)
         if not isinstance(layer_keys, Tensor) or not isinstance(layer_values, Tensor):
             return 0
-        if layer_keys.size(0) < 1 or layer_keys.size(2) < max_prefix:
+        if (
+            layer_keys.size(0) <= row
+            or layer_values.size(0) <= row
+            or layer_keys.size(2) < max_prefix
+            or layer_values.size(2) < max_prefix
+        ):
             return 0
         layer_pairs.append((layer, layer_keys, layer_values, keys, values))
 
     for layer, layer_keys, layer_values, keys, values in layer_pairs:
-        layer_keys[:1, :, :max_prefix, :].copy_(keys[:, :, :max_prefix, :])
-        layer_values[:1, :, :max_prefix, :].copy_(values[:, :, :max_prefix, :])
-    set_cache_sequence_length(cache, max_prefix, on_error=on_seq_len_restore_error)
+        layer_keys[row : row + 1, :, :max_prefix, :].copy_(keys[:, :, :max_prefix, :])
+        layer_values[row : row + 1, :, :max_prefix, :].copy_(values[:, :, :max_prefix, :])
+    if restore_seq_len:
+        set_cache_sequence_length(cache, max_prefix, on_error=on_seq_len_restore_error)
     return max_prefix
 
 
@@ -179,6 +187,7 @@ def snapshot_tensor_prefix_cache(
     device: str,
     backend: str,
     page_size: int,
+    row: int = 0,
 ) -> TensorPrefixCacheEntry | None:
     token_tuple = tuple(int(token) for token in tokens)
     if seq_len < len(token_tuple):
@@ -192,12 +201,12 @@ def snapshot_tensor_prefix_cache(
         values = getattr(layer, "values", None)
         if not isinstance(keys, Tensor) or not isinstance(values, Tensor):
             return None
-        if keys.size(0) < 1 or keys.size(2) < seq_len:
+        if keys.size(0) <= row or values.size(0) <= row or keys.size(2) < seq_len or values.size(2) < seq_len:
             return None
         layers.append(
             (
-                keys[:1, :, :seq_len, :].detach().clone(),
-                values[:1, :, :seq_len, :].detach().clone(),
+                keys[row : row + 1, :, :seq_len, :].detach().clone(),
+                values[row : row + 1, :, :seq_len, :].detach().clone(),
             )
         )
     return TensorPrefixCacheEntry(
