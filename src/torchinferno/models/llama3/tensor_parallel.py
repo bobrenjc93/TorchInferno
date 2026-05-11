@@ -1721,6 +1721,17 @@ class Llama3TensorParallelForCausalLM:
             self._ragged_decode_logits_graph_failed = True
             return None
 
+    def release_decode_graphs_for_cache(self, cache: Llama3TensorParallelCache) -> None:
+        cache_id = id(cache)
+        for graph_map in (
+            self._decode_graphs,
+            self._decode_logits_graphs,
+            self._ragged_decode_logits_graphs,
+        ):
+            for key, captured in list(graph_map.items()):
+                if key[0] == cache_id or getattr(captured, "cache", None) is cache:
+                    graph_map.pop(key, None)
+
     def _run_decode_step_graph(self, input_ids: Tensor, cache: Llama3TensorParallelCache) -> Tensor:
         if cache.seq_len >= cache.layers[0].max_seq_len:
             raise ValueError("KV cache capacity exceeded")

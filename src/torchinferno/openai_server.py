@@ -2200,50 +2200,74 @@ class OpenAICompletionEngine:
             dtype=torch.long,
             device=self.device,
         )
-        for step in range(1, max_tokens):
-            active_indices = [index for index, is_active in enumerate(active) if is_active]
-            should_decode = _sync_tensor_parallel_continue(model, bool(active_indices), self.device)
-            if not should_decode:
-                break
-            decode_full_batch = _prefer_full_batch_ragged_decode(len(active_indices), len(active))
-            advance_row_indices: Tensor | None = None
-            if len(active_indices) == len(active) or decode_full_batch:
-                decode_indices = list(range(len(active)))
-                decode_input = next_token_tensor[:, None]
-                row_indices = None
-            else:
-                decode_indices = _ragged_decode_bucket_indices(active_indices, active, step=step)
-                row_indices = torch.tensor(active_indices, dtype=torch.long, device=self.device)
-                if decode_indices != active_indices:
-                    row_indices = torch.tensor(decode_indices, dtype=torch.long, device=self.device)
-                    advance_row_indices = torch.tensor(active_indices, dtype=torch.long, device=self.device)
-                decode_input = next_token_tensor.index_select(0, row_indices)[:, None]
-            next_token, cache = _decode_next_token_ragged(
-                model,
-                decode_input,
-                cache,
-                seq_lens,
-                row_indices,
-                temperature,
-            )
-            next_token = next_token.to(self.device)
-            if row_indices is None:
-                seq_lens += 1
-            elif advance_row_indices is not None:
-                seq_lens[advance_row_indices] = seq_lens.index_select(0, advance_row_indices) + 1
-            else:
-                seq_lens[row_indices] = seq_lens.index_select(0, row_indices) + 1
-            step_tokens: list[int | None] = [None for _ in active]
-            for offset, token_id in enumerate(next_token.detach().cpu().tolist()):
-                original_index = decode_indices[offset]
-                token_id = int(token_id)
-                next_token_tensor[original_index] = token_id
-                if not active[original_index]:
-                    continue
-                step_tokens[original_index] = token_id
-                if token_id in self.stop_token_ids or step + 1 >= per_row_limits[original_index]:
-                    active[original_index] = False
-            yield step_tokens
+        ephemeral_graph_allowed = (
+            getattr(cache, "_torchinferno_ephemeral_cache", False)
+            and env_flag("TORCHINFERNO_OPENAI_EPHEMERAL_RAGGED_CUDAGRAPH", True)
+        )
+        ephemeral_graph_min_step = env_int(
+            "TORCHINFERNO_OPENAI_EPHEMERAL_RAGGED_CUDAGRAPH_MIN_STEP",
+            4,
+            minimum=1,
+        )
+        ephemeral_graph_scope = False
+        try:
+            for step in range(1, max_tokens):
+                active_indices = [index for index, is_active in enumerate(active) if is_active]
+                should_decode = _sync_tensor_parallel_continue(model, bool(active_indices), self.device)
+                if not should_decode:
+                    break
+                decode_full_batch = _prefer_full_batch_ragged_decode(len(active_indices), len(active))
+                advance_row_indices: Tensor | None = None
+                if len(active_indices) == len(active) or decode_full_batch:
+                    decode_indices = list(range(len(active)))
+                    decode_input = next_token_tensor[:, None]
+                    row_indices = None
+                else:
+                    decode_indices = _ragged_decode_bucket_indices(active_indices, active, step=step)
+                    row_indices = torch.tensor(active_indices, dtype=torch.long, device=self.device)
+                    if decode_indices != active_indices:
+                        row_indices = torch.tensor(decode_indices, dtype=torch.long, device=self.device)
+                        advance_row_indices = torch.tensor(active_indices, dtype=torch.long, device=self.device)
+                    decode_input = next_token_tensor.index_select(0, row_indices)[:, None]
+                if ephemeral_graph_allowed and not ephemeral_graph_scope and step >= ephemeral_graph_min_step:
+                    try:
+                        setattr(cache, "_torchinferno_ephemeral_ragged_graph_scope", True)
+                        ephemeral_graph_scope = True
+                    except Exception:
+                        ephemeral_graph_allowed = False
+                next_token, cache = _decode_next_token_ragged(
+                    model,
+                    decode_input,
+                    cache,
+                    seq_lens,
+                    row_indices,
+                    temperature,
+                )
+                next_token = next_token.to(self.device)
+                if row_indices is None:
+                    seq_lens += 1
+                elif advance_row_indices is not None:
+                    seq_lens[advance_row_indices] = seq_lens.index_select(0, advance_row_indices) + 1
+                else:
+                    seq_lens[row_indices] = seq_lens.index_select(0, row_indices) + 1
+                step_tokens: list[int | None] = [None for _ in active]
+                for offset, token_id in enumerate(next_token.detach().cpu().tolist()):
+                    original_index = decode_indices[offset]
+                    token_id = int(token_id)
+                    next_token_tensor[original_index] = token_id
+                    if not active[original_index]:
+                        continue
+                    step_tokens[original_index] = token_id
+                    if token_id in self.stop_token_ids or step + 1 >= per_row_limits[original_index]:
+                        active[original_index] = False
+                yield step_tokens
+        finally:
+            if ephemeral_graph_scope:
+                try:
+                    setattr(cache, "_torchinferno_ephemeral_ragged_graph_scope", False)
+                except Exception:
+                    pass
+                _release_decode_graphs_for_cache(model, cache)
 
     @torch.inference_mode()
     def _generate_shared_prefix_batch_steps(
@@ -3346,7 +3370,11 @@ def _try_decode_ragged_logits_graph(
     seq_lens: Tensor,
     row_indices: Tensor | None,
 ) -> Tensor | None:
-    if getattr(cache, "_torchinferno_ephemeral_cache", False):
+    if getattr(cache, "_torchinferno_ephemeral_cache", False) and not getattr(
+        cache,
+        "_torchinferno_ephemeral_ragged_graph_scope",
+        False,
+    ):
         return None
     if not _openai_decode_graph_enabled(model):
         return None
@@ -3354,6 +3382,12 @@ def _try_decode_ragged_logits_graph(
     if decode_graph is None:
         return None
     return decode_graph(input_ids, cache, seq_lens=seq_lens, row_indices=row_indices)
+
+
+def _release_decode_graphs_for_cache(model: object, cache: object) -> None:
+    release = getattr(model, "release_decode_graphs_for_cache", None)
+    if callable(release):
+        release(cache)
 
 
 def _openai_decode_graph_enabled(model: object) -> bool:

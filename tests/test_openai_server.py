@@ -1473,6 +1473,55 @@ def test_openai_ephemeral_cache_skips_ragged_decode_graph() -> None:
     assert model.calls == 0
 
 
+def test_openai_ephemeral_cache_scoped_ragged_decode_releases_graphs(monkeypatch) -> None:
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_EPHEMERAL_RAGGED_CUDAGRAPH_MIN_STEP", "1")
+
+    class _GraphModel:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.released: list[object] = []
+
+        def try_decode_ragged_logits_graph(
+            self,
+            input_ids: torch.Tensor,
+            cache: object,
+            *,
+            seq_lens: torch.Tensor,
+            row_indices: torch.Tensor | None,
+        ) -> torch.Tensor:
+            del seq_lens, row_indices
+            assert getattr(cache, "_torchinferno_ephemeral_ragged_graph_scope") is True
+            self.calls += 1
+            logits = torch.zeros(input_ids.size(0), 1, 8)
+            logits[..., 3] = 1.0
+            return logits
+
+        def release_decode_graphs_for_cache(self, cache: object) -> None:
+            self.released.append(cache)
+
+    model = _GraphModel()
+    engine = _cache_only_engine()
+    engine.model = model
+    engine.stop_token_ids = frozenset()
+    cache = types.SimpleNamespace(_torchinferno_ephemeral_cache=True)
+
+    steps = list(
+        engine._decode_shared_prefix_prompt_list_ragged(
+            cache=cache,
+            active=[True, True],
+            prompt_lengths=[2, 3],
+            max_tokens=2,
+            next_tokens=[1, 1],
+            temperature=0.0,
+        )
+    )
+
+    assert steps == [[3, 3]]
+    assert model.calls == 1
+    assert model.released == [cache]
+    assert getattr(cache, "_torchinferno_ephemeral_ragged_graph_scope") is False
+
+
 def test_openai_shared_prefix_ragged_cache_requires_all_tp_ranks(monkeypatch) -> None:
     monkeypatch.setenv("TORCHINFERNO_OPENAI_PREFIX_CACHE_MIN_TOKENS", "2")
     monkeypatch.setenv("TORCHINFERNO_OPENAI_SHARED_PREFIX_PADDED_SUFFIX_PREFILL", "0")
