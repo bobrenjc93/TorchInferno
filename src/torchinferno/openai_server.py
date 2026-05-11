@@ -851,7 +851,7 @@ class OpenAICompletionEngine:
                 self._cache_pool[cached_key] = cached
                 return cached
         max_entries = _cache_pool_max_entries()
-        self._prepare_cache_pool_insert(self._cache_pool, key, max_entries)
+        self._prepare_cache_pool_insert(self._cache_pool, key, max_entries, model=model)
         cache = _allocate_cache(
             model,
             batch_size,
@@ -861,7 +861,7 @@ class OpenAICompletionEngine:
             page_size=self.page_size,
         )
         if _reset_generation_cache(cache):
-            self._store_cache_pool_entry(self._cache_pool, key, cache, max_entries)
+            self._store_cache_pool_entry(self._cache_pool, key, cache, max_entries, model=model)
         return cache
 
     def _generation_microbatch_cache(
@@ -898,8 +898,8 @@ class OpenAICompletionEngine:
                 self._microbatch_cache_pool[cached_key] = cached
                 return cached
         max_entries = _microbatch_cache_pool_max_entries()
-        self._evict_microbatch_slot(slot, keep_key=key)
-        self._prepare_cache_pool_insert(self._microbatch_cache_pool, key, max_entries)
+        self._evict_microbatch_slot(slot, keep_key=key, model=model)
+        self._prepare_cache_pool_insert(self._microbatch_cache_pool, key, max_entries, model=model)
         cache = _allocate_cache(
             model,
             batch_size,
@@ -914,6 +914,7 @@ class OpenAICompletionEngine:
                 key,
                 cache,
                 max_entries,
+                model=model,
             )
         return cache
 
@@ -922,37 +923,53 @@ class OpenAICompletionEngine:
         slot: int,
         *,
         keep_key: tuple[int, int, int, str, int, str],
+        model: object,
     ) -> None:
         for cached_key in list(self._microbatch_cache_pool):
             if cached_key != keep_key and cached_key[0] == slot:
-                self._microbatch_cache_pool.pop(cached_key, None)
+                self._evict_cache_pool_key(self._microbatch_cache_pool, cached_key, model=model)
 
-    @staticmethod
     def _prepare_cache_pool_insert(
+        self,
         pool: dict[object, object],
         key: object,
         max_entries: int,
+        *,
+        model: object,
     ) -> None:
-        pool.pop(key, None)
+        self._evict_cache_pool_key(pool, key, model=model)
         if max_entries <= 0:
-            pool.clear()
+            self._clear_cache_pool(pool, model=model)
             return
         while len(pool) >= max_entries:
-            pool.pop(next(iter(pool)))
+            self._evict_cache_pool_key(pool, next(iter(pool)), model=model)
 
-    @staticmethod
     def _store_cache_pool_entry(
+        self,
         pool: dict[object, object],
         key: object,
         cache: object,
         max_entries: int,
+        *,
+        model: object,
     ) -> None:
         if max_entries <= 0:
             return
-        pool.pop(key, None)
+        existing = pool.pop(key, None)
+        if existing is not None and existing is not cache:
+            _release_decode_graphs_for_cache(model, existing)
         pool[key] = cache
         while len(pool) > max_entries:
-            pool.pop(next(iter(pool)))
+            self._evict_cache_pool_key(pool, next(iter(pool)), model=model)
+
+    def _evict_cache_pool_key(self, pool: dict[object, object], key: object, *, model: object) -> None:
+        cache = pool.pop(key, None)
+        if cache is not None:
+            _release_decode_graphs_for_cache(model, cache)
+
+    def _clear_cache_pool(self, pool: dict[object, object], *, model: object) -> None:
+        for key in list(pool):
+            self._evict_cache_pool_key(pool, key, model=model)
 
     def _restore_prefix_cache(self, input_ids: Tensor, cache: object) -> int:
         if not env_flag("TORCHINFERNO_OPENAI_PREFIX_CACHE", True):
@@ -2149,10 +2166,12 @@ class OpenAICompletionEngine:
         max_prompt_len = max(prompt_lengths, default=0)
         if max_prompt_len <= 0:
             return None
+        pool_cache = not (_is_tensor_parallel_model(model) and _tensor_parallel_world_size(model) > 1)
         cache = self._generation_cache(
             prompt_count,
             max_prompt_len + max_tokens,
             model=model,
+            pool=pool_cache,
         )
         try:
             for state in states:

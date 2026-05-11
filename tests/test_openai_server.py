@@ -1442,6 +1442,67 @@ def test_openai_generation_cache_can_skip_pooling() -> None:
     assert engine._cache_pool == {}
 
 
+def test_openai_cache_pool_eviction_releases_graphs(monkeypatch) -> None:
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_CACHE_POOL_MAX_ENTRIES", "1")
+
+    class _ReleaseRecordingModel:
+        def __init__(self) -> None:
+            self.allocated: list[_WarmupShapeCache] = []
+            self.released: list[object] = []
+
+        def allocate_cache(self, batch_size: int, max_seq_len: int, **kwargs) -> _WarmupShapeCache:
+            del batch_size, max_seq_len, kwargs
+            cache = _WarmupShapeCache()
+            self.allocated.append(cache)
+            return cache
+
+        def release_decode_graphs_for_cache(self, cache: object) -> None:
+            self.released.append(cache)
+
+    model = _ReleaseRecordingModel()
+    engine = _cache_only_engine()
+    engine.model = model
+
+    first = engine._generation_cache(1, 8, model=model)
+    second = engine._generation_cache(2, 8, model=model)
+
+    assert model.allocated == [first, second]
+    assert model.released == [first]
+    assert list(engine._cache_pool.values()) == [second]
+
+
+def test_llama_tp_cache_release_clears_prefill_and_decode_graphs() -> None:
+    from torchinferno.models.llama3.tensor_parallel import Llama3TensorParallelForCausalLM
+
+    model = object.__new__(Llama3TensorParallelForCausalLM)
+    cache = object()
+    other_cache = object()
+    model._prefill_graphs = {
+        (id(cache), 0, 1, (1, 1)): types.SimpleNamespace(cache=cache),
+        (id(other_cache), 0, 1, (1, 1)): types.SimpleNamespace(cache=other_cache),
+    }
+    model._prefill_logits_graphs = {
+        (id(cache), 0, 1, (1, 1)): types.SimpleNamespace(cache=cache),
+    }
+    model._decode_graphs = {
+        (id(cache), 1, 8): types.SimpleNamespace(cache=cache),
+    }
+    model._decode_logits_graphs = {
+        (id(cache), 1, 8): types.SimpleNamespace(cache=cache),
+    }
+    model._ragged_decode_logits_graphs = {
+        (id(cache), 1, 8, False): types.SimpleNamespace(cache=cache),
+    }
+
+    model.release_decode_graphs_for_cache(cache)
+
+    assert list(model._prefill_graphs.values()) == [types.SimpleNamespace(cache=other_cache)]
+    assert model._prefill_logits_graphs == {}
+    assert model._decode_graphs == {}
+    assert model._decode_logits_graphs == {}
+    assert model._ragged_decode_logits_graphs == {}
+
+
 def test_openai_ephemeral_cache_skips_ragged_decode_graph() -> None:
     class _GraphModel:
         calls = 0
@@ -1471,6 +1532,61 @@ def test_openai_ephemeral_cache_skips_ragged_decode_graph() -> None:
 
     assert logits is None
     assert model.calls == 0
+
+
+def test_openai_tp_shared_prefix_ragged_cache_is_ephemeral(monkeypatch) -> None:
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_PREFIX_CACHE_MIN_TOKENS", "2")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_SHARED_PREFIX_PADDED_SUFFIX_PREFILL", "0")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_SHARED_PREFIX_RAGGED_CACHE", "1")
+
+    class _EphemeralRecordingModel(_TokenEchoSharedPrefixRecordingModel):
+        def __init__(self) -> None:
+            super().__init__()
+            self.ragged_cache_ephemeral: list[bool] = []
+
+        def decode_ragged_logits(
+            self,
+            input_ids: torch.Tensor,
+            cache: _PrefixRecordingCache,
+            *,
+            seq_lens: torch.Tensor,
+            row_indices: torch.Tensor | None = None,
+        ) -> torch.Tensor:
+            self.ragged_cache_ephemeral.append(bool(getattr(cache, "_torchinferno_ephemeral_cache", False)))
+            return super().decode_ragged_logits(
+                input_ids,
+                cache,
+                seq_lens=seq_lens,
+                row_indices=row_indices,
+            )
+
+    model = _EphemeralRecordingModel()
+    engine = _cache_only_engine()
+    engine.model = model
+    engine.stop_token_ids = frozenset()
+    engine._prefix_cache_entry = None
+
+    monkeypatch.setattr(
+        "torchinferno.openai_server._is_tensor_parallel_model",
+        lambda candidate: candidate is model,
+    )
+    monkeypatch.setattr(
+        "torchinferno.openai_server._tensor_parallel_world_size",
+        lambda candidate: 8 if candidate is model else 1,
+    )
+
+    steps = list(
+        engine._generate_prompt_list_batch_steps(
+            [[10, 11, 4, 6], [10, 11, 5]],
+            max_tokens=2,
+            temperature=0.0,
+            broadcast_tensor_parallel=False,
+        )
+    )
+
+    assert steps == [[6, 5], [3, 3]]
+    assert model.ragged_cache_ephemeral == [True]
+    assert engine._cache_pool == {}
 
 
 def test_openai_ephemeral_cache_scoped_ragged_decode_releases_graphs(monkeypatch) -> None:

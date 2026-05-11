@@ -1724,6 +1724,8 @@ class Llama3TensorParallelForCausalLM:
     def release_decode_graphs_for_cache(self, cache: Llama3TensorParallelCache) -> None:
         cache_id = id(cache)
         for graph_map in (
+            self._prefill_graphs,
+            self._prefill_logits_graphs,
             self._decode_graphs,
             self._decode_logits_graphs,
             self._ragged_decode_logits_graphs,
