@@ -1152,6 +1152,54 @@ def test_openai_engine_batches_variable_length_shared_prefix_suffixes(monkeypatc
     ]
 
 
+def test_openai_tensor_parallel_refills_prefix_when_any_rank_misses_cache(monkeypatch) -> None:
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_PREFIX_CACHE_MIN_TOKENS", "2")
+    model = _SharedPrefixRecordingModel()
+    engine = _cache_only_engine()
+    engine.model = model
+    engine.stop_token_ids = frozenset()
+
+    prefix_ids = torch.tensor([[10, 11]], dtype=torch.long)
+    cache = model.allocate_cache(1, 4)
+    model.forward(prefix_ids, cache=cache, use_cache=True)
+    engine._save_prompt_prefix_cache(prefix_ids, cache)
+    model.forward_inputs.clear()
+
+    monkeypatch.setattr(
+        "torchinferno.openai_server._is_tensor_parallel_model",
+        lambda candidate: candidate is model,
+    )
+    monkeypatch.setattr(
+        "torchinferno.openai_server._tensor_parallel_world_size",
+        lambda candidate: 8 if candidate is model else 1,
+    )
+    import torch.distributed as dist
+
+    calls: list[int] = []
+    monkeypatch.setattr(dist, "is_available", lambda: True)
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+
+    def all_reduce(flag: torch.Tensor, op: object) -> None:
+        assert op == dist.ReduceOp.MIN
+        calls.append(int(flag.item()))
+        flag.zero_()
+
+    monkeypatch.setattr(dist, "all_reduce", all_reduce)
+
+    steps = list(
+        engine._generate_shared_prefix_prompt_list_steps(
+            [[10, 11, 12], [10, 11, 13, 14]],
+            prefix_tokens=2,
+            max_tokens=1,
+            temperature=0.0,
+        )
+    )
+
+    assert steps == [[2, 2]]
+    assert calls == [1]
+    assert model.forward_inputs[0] == [[10, 11]]
+
+
 def test_openai_engine_ragged_decodes_variable_length_shared_prefix_suffixes(monkeypatch) -> None:
     monkeypatch.setenv("TORCHINFERNO_OPENAI_PREFIX_CACHE_MIN_TOKENS", "2")
     monkeypatch.setenv("TORCHINFERNO_OPENAI_SHARED_PREFIX_PADDED_SUFFIX_PREFILL", "0")

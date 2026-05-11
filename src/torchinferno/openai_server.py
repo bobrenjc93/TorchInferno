@@ -1884,7 +1884,11 @@ class OpenAICompletionEngine:
         )
         prefix_ids = torch.tensor([length_groups[0][0][1][:prefix_tokens]], dtype=torch.long, device=self.device)
         restored_prefix_tokens = self._restore_exact_prefix_cache(prefix_ids, prefix_cache)
-        if restored_prefix_tokens != prefix_tokens:
+        restored_prefix = restored_prefix_tokens == prefix_tokens
+        if _is_tensor_parallel_model(model) and _tensor_parallel_world_size(model) > 1:
+            restored_prefix = _tensor_parallel_all_ranks_true(model, restored_prefix, self.device)
+        if not restored_prefix:
+            _reset_generation_cache(prefix_cache)
             prefix_cache = _prefill_cache_only(
                 model,
                 prefix_ids,
@@ -2559,6 +2563,18 @@ def _sync_tensor_parallel_continue(model: object, should_continue: bool, device:
         return should_continue
     flag = torch.tensor([1 if should_continue else 0], dtype=torch.int32, device=device)
     dist.broadcast(flag, src=0)
+    return bool(flag.item())
+
+
+def _tensor_parallel_all_ranks_true(model: object, value: bool, device: torch.device) -> bool:
+    if not _is_tensor_parallel_model(model) or _tensor_parallel_world_size(model) <= 1:
+        return value
+    import torch.distributed as dist
+
+    if not dist.is_available() or not dist.is_initialized():
+        return value
+    flag = torch.tensor([1 if value else 0], dtype=torch.int32, device=device)
+    dist.all_reduce(flag, op=dist.ReduceOp.MIN)
     return bool(flag.item())
 
 
