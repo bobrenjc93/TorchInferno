@@ -1901,8 +1901,10 @@ class OpenAICompletionEngine:
             length_groups,
             prompt_lengths=prompt_lengths,
         )
+        tensor_parallel = _is_tensor_parallel_model(model) and _tensor_parallel_world_size(model) > 1
         use_padded_suffix_prefill = (
-            _ragged_decode_enabled_for_model(model)
+            not tensor_parallel
+            and _ragged_decode_enabled_for_model(model)
             and not prefer_dense_group_decode
             and _prefer_shared_prefix_padded_suffix_prefill(
                 length_groups,
@@ -1910,12 +1912,6 @@ class OpenAICompletionEngine:
                 prompt_lengths=prompt_lengths,
             )
         )
-        if _is_tensor_parallel_model(model) and _tensor_parallel_world_size(model) > 1:
-            use_padded_suffix_prefill = _tensor_parallel_all_ranks_true(
-                model,
-                use_padded_suffix_prefill,
-                self.device,
-            )
         if use_padded_suffix_prefill:
             padded_state = self._prefill_shared_prefix_prompt_list_padded_suffixes(
                 prompts,
