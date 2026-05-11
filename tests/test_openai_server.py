@@ -1051,6 +1051,30 @@ def test_openai_ragged_decode_skips_rows_after_per_request_max_tokens(monkeypatc
     assert model.ragged_calls[1] == ([[3]], [3, 5], [1])
 
 
+def test_openai_ragged_decode_keeps_full_batch_while_most_rows_active() -> None:
+    model = _RaggedSharedPrefixRecordingModel()
+    engine = _cache_only_engine()
+    engine.model = model
+    engine.stop_token_ids = frozenset()
+    cache = model.allocate_cache(8, 5)
+
+    steps = list(
+        engine._decode_shared_prefix_prompt_list_ragged(
+            cache=cache,
+            active=[False, True, True, True, True, True, True, True],
+            prompt_lengths=[2 for _ in range(8)],
+            max_tokens=3,
+            next_tokens=[2 for _ in range(8)],
+            temperature=0.0,
+            row_max_tokens=[1, 3, 3, 3, 3, 3, 3, 3],
+        )
+    )
+
+    assert steps == [[None, 3, 3, 3, 3, 3, 3, 3], [None, 4, 4, 4, 4, 4, 4, 4]]
+    assert model.ragged_calls[0] == ([[2] for _ in range(8)], [2 for _ in range(8)], None)
+    assert model.ragged_calls[1] == ([[3] for _ in range(8)], [3 for _ in range(8)], None)
+
+
 def test_openai_batch_steps_ragged_decode_skips_finished_rows() -> None:
     model = _RaggedSharedPrefixRecordingModel()
     engine = _cache_only_engine()

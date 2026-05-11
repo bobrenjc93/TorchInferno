@@ -1990,10 +1990,13 @@ class OpenAICompletionEngine:
             should_decode = _sync_tensor_parallel_continue(model, bool(active_indices), self.device)
             if not should_decode:
                 break
-            if len(active_indices) == len(active):
+            decode_full_batch = _prefer_full_batch_ragged_decode(len(active_indices), len(active))
+            if len(active_indices) == len(active) or decode_full_batch:
+                decode_indices = list(range(len(active)))
                 decode_input = next_token_tensor[:, None]
                 row_indices = None
             else:
+                decode_indices = active_indices
                 row_indices = torch.tensor(active_indices, dtype=torch.long, device=self.device)
                 decode_input = next_token_tensor.index_select(0, row_indices)[:, None]
             next_token, cache = _decode_next_token_ragged(
@@ -2011,9 +2014,11 @@ class OpenAICompletionEngine:
                 seq_lens[row_indices] = seq_lens.index_select(0, row_indices) + 1
             step_tokens: list[int | None] = [None for _ in active]
             for offset, token_id in enumerate(next_token.detach().cpu().tolist()):
-                original_index = active_indices[offset]
+                original_index = decode_indices[offset]
                 token_id = int(token_id)
                 next_token_tensor[original_index] = token_id
+                if not active[original_index]:
+                    continue
                 step_tokens[original_index] = token_id
                 if token_id in self.stop_token_ids or step + 1 >= per_row_limits[original_index]:
                     active[original_index] = False
@@ -2732,6 +2737,20 @@ def _prefer_shared_prefix_dense_group_decode(
         return False
     min_group_size = env_int("TORCHINFERNO_OPENAI_SHARED_PREFIX_DENSE_GROUP_MIN_SIZE", 8, minimum=1)
     return max((len(group) for group in length_groups), default=0) >= min_group_size
+
+
+def _prefer_full_batch_ragged_decode(active_count: int, batch_size: int) -> bool:
+    if active_count >= batch_size:
+        return True
+    min_batch = env_int("TORCHINFERNO_OPENAI_RAGGED_DECODE_FULL_BATCH_MIN_ROWS", 8, minimum=1)
+    if batch_size < min_batch or active_count <= 0:
+        return False
+    min_fraction = env_float(
+        "TORCHINFERNO_OPENAI_RAGGED_DECODE_FULL_BATCH_MIN_ACTIVE_FRACTION",
+        0.5,
+        minimum=0.0,
+    )
+    return (active_count / batch_size) >= min(1.0, min_fraction)
 
 
 def _tokenizer_padding_token_id(tokenizer: object | None) -> int:
