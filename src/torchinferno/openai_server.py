@@ -649,12 +649,14 @@ class OpenAICompletionEngine:
     def _run_queued_stream_group(self, group: list[_QueuedGeneration]) -> None:
         prompts = [request.prompt for request in group]
         max_tokens = max((request.max_tokens for request in group), default=0)
+        row_max_tokens = [request.max_tokens for request in group]
         if self._shared_prefix_prompt_list_tokens(prompts) > 0:
             try:
                 step_iter = self._generate_prompt_list_batch_steps(
                     prompts,
                     max_tokens=max_tokens,
                     temperature=group[0].temperature,
+                    row_max_tokens=row_max_tokens,
                 )
                 for step, step_tokens in enumerate(step_iter):
                     _emit_stream_step(group, step, step_tokens)
@@ -673,6 +675,7 @@ class OpenAICompletionEngine:
                     input_ids,
                     max_tokens=same_length_max_tokens,
                     temperature=same_length_group[0].temperature,
+                    row_max_tokens=[request.max_tokens for request in same_length_group],
                 )
                 for step, step_tokens in enumerate(step_iter):
                     _emit_stream_step(same_length_group, step, step_tokens)
@@ -1283,6 +1286,7 @@ class OpenAICompletionEngine:
         max_tokens: int,
         temperature: float,
         broadcast_tensor_parallel: bool = True,
+        row_max_tokens: Sequence[int] | None = None,
     ) -> Iterator[list[int | None]]:
         if max_tokens <= 0:
             return
@@ -1293,6 +1297,7 @@ class OpenAICompletionEngine:
                 max_tokens=max_tokens,
                 temperature=temperature,
                 stream=True,
+                row_max_tokens=row_max_tokens,
             )
         if input_ids.size(0) > 1 and _tensor_rows_are_identical(input_ids):
             yield from self._generate_identical_prompt_batch_steps(
@@ -1300,6 +1305,7 @@ class OpenAICompletionEngine:
                 batch_size=input_ids.size(0),
                 max_tokens=max_tokens,
                 temperature=temperature,
+                row_max_tokens=row_max_tokens,
             )
             return
         microbatch_size = self._stream_microbatch_size(input_ids.size(0))
@@ -1311,6 +1317,7 @@ class OpenAICompletionEngine:
                 max_tokens=max_tokens,
                 temperature=temperature,
                 microbatch_size=microbatch_size,
+                row_max_tokens=row_max_tokens,
             )
             return
         if 0 < microbatch_size < input_ids.size(0):
@@ -1319,6 +1326,7 @@ class OpenAICompletionEngine:
                 max_tokens=max_tokens,
                 temperature=temperature,
                 microbatch_size=microbatch_size,
+                row_max_tokens=row_max_tokens,
             )
             return
         eos_token_id = self.tokenizer.eos_token_id
@@ -1341,7 +1349,8 @@ class OpenAICompletionEngine:
             input_ids.size(1) + max_tokens,
             model=model,
         )
-        active = [True for _ in range(input_ids.size(0))]
+        per_row_limits = _normalize_row_max_tokens(row_max_tokens, input_ids.size(0), max_tokens)
+        active = [limit > 0 for limit in per_row_limits]
         next_token, cache = _prefill_next_token(model, input_ids, cache, temperature)
         next_token = next_token.to(self.device)
         for step in range(max_tokens):
@@ -1353,7 +1362,7 @@ class OpenAICompletionEngine:
                     continue
                 token_id = int(token_id)
                 step_tokens.append(token_id)
-                if token_id in stop_token_ids:
+                if token_id in stop_token_ids or step + 1 >= per_row_limits[row]:
                     active[row] = False
             yield step_tokens
             should_continue = step + 1 < max_tokens and any(active)
@@ -1371,6 +1380,7 @@ class OpenAICompletionEngine:
         batch_size: int,
         max_tokens: int,
         temperature: float,
+        row_max_tokens: Sequence[int] | None = None,
     ) -> Iterator[list[int | None]]:
         eos_token_id = self.tokenizer.eos_token_id
         stop_token_ids = self.stop_token_ids
@@ -1403,7 +1413,8 @@ class OpenAICompletionEngine:
         next_token = next_token.to(self.device)
         _repeat_generation_cache_first_batch(cache, batch_size)
         shared_sample = _shared_prefix_sample_enabled(temperature)
-        active = [True for _ in range(batch_size)]
+        per_row_limits = _normalize_row_max_tokens(row_max_tokens, batch_size, max_tokens)
+        active = [limit > 0 for limit in per_row_limits]
         for step in range(max_tokens):
             token_ids = next_token.detach().cpu().tolist()
             step_tokens: list[int | None] = []
@@ -1413,7 +1424,7 @@ class OpenAICompletionEngine:
                     continue
                 token_id = int(token_id)
                 step_tokens.append(token_id)
-                if token_id in stop_token_ids:
+                if token_id in stop_token_ids or step + 1 >= per_row_limits[row]:
                     active[row] = False
             yield step_tokens
             should_continue = step + 1 < max_tokens and any(active)
@@ -1444,32 +1455,45 @@ class OpenAICompletionEngine:
         max_tokens: int,
         temperature: float,
         microbatch_size: int,
+        row_max_tokens: Sequence[int] | None = None,
     ) -> Iterator[list[int | None]]:
         stop_token_ids = self.stop_token_ids
         model = self.model
         states: list[dict[str, object]] = []
         batch_size = input_ids.size(0)
+        per_row_limits = _normalize_row_max_tokens(row_max_tokens, batch_size, max_tokens)
         for slot, start in enumerate(range(0, batch_size, microbatch_size)):
             end = min(batch_size, start + microbatch_size)
             chunk_input_ids = input_ids[start:end]
+            chunk_limits = per_row_limits[start:end]
             cache = self._generation_microbatch_cache(
                 slot,
                 chunk_input_ids.size(0),
                 chunk_input_ids.size(1) + max_tokens,
                 model=model,
             )
-            active = [True for _ in range(chunk_input_ids.size(0))]
+            active = [limit > 0 for limit in chunk_limits]
             next_token, cache = _prefill_next_token(model, chunk_input_ids, cache, temperature)
             next_token = next_token.to(self.device)
             step_tokens = [None for _ in range(batch_size)]
             for offset, token_id in enumerate(next_token.detach().cpu().tolist()):
                 token_id = int(token_id)
+                if not active[offset]:
+                    continue
                 step_tokens[start + offset] = token_id
-                if token_id in stop_token_ids:
+                if token_id in stop_token_ids or chunk_limits[offset] <= 1:
                     active[offset] = False
-            states.append({"start": start, "active": active, "cache": cache, "next_token": next_token})
+            states.append(
+                {
+                    "start": start,
+                    "active": active,
+                    "cache": cache,
+                    "next_token": next_token,
+                    "row_max_tokens": chunk_limits,
+                }
+            )
             yield step_tokens
-        for _ in range(1, max_tokens):
+        for step in range(1, max_tokens):
             emitted = False
             for state in states:
                 active = state["active"]
@@ -1486,13 +1510,16 @@ class OpenAICompletionEngine:
                 state["cache"] = cache
                 state["next_token"] = next_token
                 start = int(state["start"])
+                chunk_limits = state["row_max_tokens"]
+                if not isinstance(chunk_limits, list):
+                    raise RuntimeError("invalid microbatch row limit state")
                 step_tokens = [None for _ in range(batch_size)]
                 for offset, token_id in enumerate(next_token.detach().cpu().tolist()):
                     if not active[offset]:
                         continue
                     token_id = int(token_id)
                     step_tokens[start + offset] = token_id
-                    if token_id in stop_token_ids:
+                    if token_id in stop_token_ids or step + 1 >= int(chunk_limits[offset]):
                         active[offset] = False
                 emitted = True
                 yield step_tokens
@@ -1555,6 +1582,7 @@ class OpenAICompletionEngine:
         max_tokens: int,
         temperature: float,
         broadcast_tensor_parallel: bool = True,
+        row_max_tokens: Sequence[int] | None = None,
     ) -> Iterator[list[int | None]]:
         if max_tokens <= 0:
             return
@@ -1567,7 +1595,9 @@ class OpenAICompletionEngine:
                 max_tokens=max_tokens,
                 temperature=temperature,
                 stream=True,
+                row_max_tokens=row_max_tokens,
             )
+        per_row_limits = _normalize_row_max_tokens(row_max_tokens, len(prompts), max_tokens)
         prompt_lengths = {len(prompt) for prompt in prompts}
         if len(prompt_lengths) == 1:
             input_ids = torch.tensor(prompts, dtype=torch.long, device=self.device)
@@ -1576,6 +1606,7 @@ class OpenAICompletionEngine:
                 max_tokens=max_tokens,
                 temperature=temperature,
                 broadcast_tensor_parallel=False,
+                row_max_tokens=per_row_limits,
             )
             return
         prefix_tokens = self._shared_prefix_prompt_list_tokens(prompts)
@@ -1585,6 +1616,7 @@ class OpenAICompletionEngine:
                 prefix_tokens=prefix_tokens,
                 max_tokens=max_tokens,
                 temperature=temperature,
+                row_max_tokens=per_row_limits,
             )
             return
         indexed = [
@@ -1599,6 +1631,7 @@ class OpenAICompletionEngine:
                 max_tokens=max_tokens,
                 temperature=temperature,
                 broadcast_tensor_parallel=False,
+                row_max_tokens=[per_row_limits[index] for index in original_indices],
             ):
                 step_tokens: list[int | None] = [None for _ in prompts]
                 for original_index, token_id in zip(original_indices, group_step):
@@ -1613,6 +1646,7 @@ class OpenAICompletionEngine:
         prefix_tokens: int,
         max_tokens: int,
         temperature: float,
+        row_max_tokens: Sequence[int] | None = None,
     ) -> Iterator[list[int | None]]:
         stop_token_ids = self.stop_token_ids
         model = self.model
@@ -1643,6 +1677,7 @@ class OpenAICompletionEngine:
             (index, list(prompt))
             for index, prompt in enumerate(prompts)
         ]
+        per_row_limits = _normalize_row_max_tokens(row_max_tokens, len(prompts), max_tokens)
         length_groups = _indexed_prompts_by_length(indexed)
         prefix_cache = self._generation_microbatch_cache(
             -1,
@@ -1688,7 +1723,7 @@ class OpenAICompletionEngine:
             for offset, token_id in enumerate(next_token.detach().cpu().tolist()):
                 token_id = int(token_id)
                 first_tokens[original_indices[offset]] = token_id
-                if token_id in stop_token_ids:
+                if token_id in stop_token_ids or per_row_limits[original_indices[offset]] <= 1:
                     active[offset] = False
             states.append(
                 {
@@ -1726,10 +1761,11 @@ class OpenAICompletionEngine:
                     max_tokens=max_tokens,
                     next_tokens=first_tokens,
                     temperature=temperature,
+                    row_max_tokens=per_row_limits,
                 )
                 return
 
-        for _ in range(1, max_tokens):
+        for step in range(1, max_tokens):
             step_tokens: list[int | None] = [None for _ in prompts]
             emitted = False
             for state in states:
@@ -1754,7 +1790,7 @@ class OpenAICompletionEngine:
                         continue
                     token_id = int(token_id)
                     step_tokens[int(original_indices[offset])] = token_id
-                    if token_id in stop_token_ids:
+                    if token_id in stop_token_ids or step + 1 >= per_row_limits[int(original_indices[offset])]:
                         active[offset] = False
                     emitted = True
             if not emitted:
@@ -1809,9 +1845,16 @@ class OpenAICompletionEngine:
         max_tokens: int,
         next_tokens: Sequence[int | None],
         temperature: float,
+        row_max_tokens: Sequence[int] | None = None,
     ) -> Iterator[list[int | None]]:
         model = self.model
         if max_tokens <= 1 or not any(active):
+            return
+        per_row_limits = _normalize_row_max_tokens(row_max_tokens, len(active), max_tokens)
+        for index, limit in enumerate(per_row_limits):
+            if limit <= 1:
+                active[index] = False
+        if not any(active):
             return
         seq_lens = torch.tensor(prompt_lengths, dtype=torch.long, device=self.device)
         next_token_tensor = torch.tensor(
@@ -1819,7 +1862,7 @@ class OpenAICompletionEngine:
             dtype=torch.long,
             device=self.device,
         )
-        for _ in range(1, max_tokens):
+        for step in range(1, max_tokens):
             active_indices = [index for index, is_active in enumerate(active) if is_active]
             should_decode = _sync_tensor_parallel_continue(model, bool(active_indices), self.device)
             if not should_decode:
@@ -1849,7 +1892,7 @@ class OpenAICompletionEngine:
                 token_id = int(token_id)
                 next_token_tensor[original_index] = token_id
                 step_tokens[original_index] = token_id
-                if token_id in self.stop_token_ids:
+                if token_id in self.stop_token_ids or step + 1 >= per_row_limits[original_index]:
                     active[original_index] = False
             yield step_tokens
 
@@ -1862,6 +1905,7 @@ class OpenAICompletionEngine:
         max_tokens: int,
         temperature: float,
         microbatch_size: int,
+        row_max_tokens: Sequence[int] | None = None,
     ) -> Iterator[list[int | None]]:
         stop_token_ids = self.stop_token_ids
         model = self.model
@@ -1878,6 +1922,7 @@ class OpenAICompletionEngine:
             return
 
         batch_size = input_ids.size(0)
+        per_row_limits = _normalize_row_max_tokens(row_max_tokens, batch_size, max_tokens)
         cache = self._generation_cache(
             batch_size,
             input_ids.size(1) + max_tokens,
@@ -1903,12 +1948,15 @@ class OpenAICompletionEngine:
         )
         next_token = next_token.to(self.device)
 
-        active = [True for _ in range(batch_size)]
+        active = [limit > 0 for limit in per_row_limits]
         step_tokens: list[int | None] = []
         for row, token_id in enumerate(next_token.detach().cpu().tolist()):
             token_id = int(token_id)
+            if not active[row]:
+                step_tokens.append(None)
+                continue
             step_tokens.append(token_id)
-            if token_id in stop_token_ids:
+            if token_id in stop_token_ids or per_row_limits[row] <= 1:
                 active[row] = False
         yield step_tokens
         should_continue = max_tokens > 1 and any(active)
@@ -1930,6 +1978,7 @@ class OpenAICompletionEngine:
                     max_tokens=max_tokens,
                     next_token=next_token,
                     temperature=temperature,
+                    row_max_tokens=per_row_limits,
                 )
                 return
 
@@ -1944,7 +1993,7 @@ class OpenAICompletionEngine:
                     continue
                 token_id = int(token_id)
                 step_tokens.append(token_id)
-                if token_id in stop_token_ids:
+                if token_id in stop_token_ids or step + 1 >= per_row_limits[row]:
                     active[row] = False
             yield step_tokens
             should_continue = step + 1 < max_tokens and any(active)
@@ -1962,10 +2011,12 @@ class OpenAICompletionEngine:
         max_tokens: int,
         next_token: Tensor,
         temperature: float,
+        row_max_tokens: Sequence[int] | None = None,
     ) -> Iterator[list[int | None]]:
         stop_token_ids = self.stop_token_ids
         model = self.model
         states: list[dict[str, object]] = []
+        per_row_limits = _normalize_row_max_tokens(row_max_tokens, batch_size, max_tokens)
         for slot, start in enumerate(range(0, batch_size, microbatch_size)):
             end = min(batch_size, start + microbatch_size)
             states.append(
@@ -1974,9 +2025,10 @@ class OpenAICompletionEngine:
                     "active": active[start:end],
                     "cache": cache_views[slot],
                     "next_token": next_token[start:end].contiguous(),
+                    "row_max_tokens": per_row_limits[start:end],
                 }
             )
-        for _ in range(1, max_tokens):
+        for step in range(1, max_tokens):
             emitted = False
             for state in states:
                 chunk_active = state["active"]
@@ -1993,13 +2045,16 @@ class OpenAICompletionEngine:
                 state["cache"] = cache
                 state["next_token"] = chunk_token
                 start = int(state["start"])
+                chunk_limits = state["row_max_tokens"]
+                if not isinstance(chunk_limits, list):
+                    raise RuntimeError("invalid shared-prefix row limit state")
                 step_tokens = [None for _ in range(batch_size)]
                 for offset, token_id in enumerate(chunk_token.detach().cpu().tolist()):
                     if not chunk_active[offset]:
                         continue
                     token_id = int(token_id)
                     step_tokens[start + offset] = token_id
-                    if token_id in stop_token_ids:
+                    if token_id in stop_token_ids or step + 1 >= int(chunk_limits[offset]):
                         chunk_active[offset] = False
                         active[start + offset] = False
                 emitted = True
@@ -2193,6 +2248,7 @@ def _broadcast_tensor_parallel_generate(
     max_tokens: int,
     temperature: float,
     stream: bool,
+    row_max_tokens: Sequence[int] | None = None,
 ) -> None:
     if not _is_tensor_parallel_primary_model(model):
         return
@@ -2205,6 +2261,7 @@ def _broadcast_tensor_parallel_generate(
             "op": "generate",
             "input_ids": input_ids.detach().cpu().tolist(),
             "max_tokens": int(max_tokens),
+            "row_max_tokens": None if row_max_tokens is None else [int(value) for value in row_max_tokens],
             "temperature": float(temperature),
             "stream": bool(stream),
         }
@@ -2219,6 +2276,7 @@ def _broadcast_tensor_parallel_generate_prompt_lists(
     max_tokens: int,
     temperature: float,
     stream: bool,
+    row_max_tokens: Sequence[int] | None = None,
 ) -> None:
     if not _is_tensor_parallel_primary_model(model):
         return
@@ -2231,6 +2289,7 @@ def _broadcast_tensor_parallel_generate_prompt_lists(
             "op": "generate",
             "input_id_lists": [list(prompt) for prompt in prompts],
             "max_tokens": int(max_tokens),
+            "row_max_tokens": None if row_max_tokens is None else [int(value) for value in row_max_tokens],
             "temperature": float(temperature),
             "stream": bool(stream),
         }
@@ -2271,6 +2330,7 @@ def _tensor_parallel_worker_loop(engine: OpenAICompletionEngine) -> None:
                         max_tokens=int(payload["max_tokens"]),
                         temperature=float(payload["temperature"]),
                         broadcast_tensor_parallel=False,
+                        row_max_tokens=_coerce_optional_int_sequence(payload.get("row_max_tokens")),
                     ):
                         pass
                 else:
@@ -2299,6 +2359,7 @@ def _tensor_parallel_worker_loop(engine: OpenAICompletionEngine) -> None:
                     max_tokens=int(payload["max_tokens"]),
                     temperature=float(payload["temperature"]),
                     broadcast_tensor_parallel=False,
+                    row_max_tokens=_coerce_optional_int_sequence(payload.get("row_max_tokens")),
                 ):
                     pass
             else:
@@ -2564,6 +2625,30 @@ def _finish_stream_request(request: _QueuedGeneration) -> None:
         return
     request.responses.put(_GenerationDone())
     request.done = True
+
+
+def _normalize_row_max_tokens(
+    row_max_tokens: Sequence[int] | None,
+    batch_size: int,
+    max_tokens: int,
+) -> list[int]:
+    if row_max_tokens is None:
+        return [max_tokens for _ in range(batch_size)]
+    if len(row_max_tokens) != batch_size:
+        raise ValueError("row_max_tokens must match batch size")
+    return [max(0, min(max_tokens, int(value))) for value in row_max_tokens]
+
+
+def _coerce_optional_int_sequence(value: object) -> list[int] | None:
+    if value is None:
+        return None
+    if isinstance(value, Tensor):
+        value = value.detach().cpu().tolist()
+    elif hasattr(value, "tolist") and not isinstance(value, (list, tuple, str, bytes)):
+        value = value.tolist()  # type: ignore[assignment]
+    if not isinstance(value, (list, tuple)):
+        return None
+    return [int(item) for item in value]
 
 
 def _indexed_prompts_by_length(indexed: Sequence[tuple[int, list[int]]]) -> list[list[tuple[int, list[int]]]]:

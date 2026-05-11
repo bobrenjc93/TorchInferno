@@ -970,6 +970,35 @@ def test_openai_engine_ragged_decodes_variable_length_shared_prefix_suffixes(mon
     assert second_rows is None
 
 
+def test_openai_ragged_decode_skips_rows_after_per_request_max_tokens(monkeypatch) -> None:
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_PREFIX_CACHE_MIN_TOKENS", "2")
+    model = _RaggedSharedPrefixRecordingModel()
+    engine = _cache_only_engine()
+    engine.model = model
+    engine.stop_token_ids = frozenset()
+    engine._prefix_cache_entry = None
+
+    steps = list(
+        engine._generate_prompt_list_batch_steps(
+            [[10, 11, 12], [10, 11, 13, 14]],
+            max_tokens=3,
+            temperature=0.0,
+            broadcast_tensor_parallel=False,
+            row_max_tokens=[1, 3],
+        )
+    )
+
+    assert steps == [[2, 2], [None, 3], [None, 4]]
+    assert model.forward_inputs == [
+        [[10, 11]],
+        [[13, 14]],
+        [[12]],
+    ]
+    assert len(model.ragged_calls) == 2
+    assert model.ragged_calls[0] == ([[2]], [3, 4], [1])
+    assert model.ragged_calls[1] == ([[3]], [3, 5], [1])
+
+
 def test_openai_engine_can_disable_prefix_cache_for_tensor_parallel(monkeypatch) -> None:
     model = _PrefixRecordingModel()
     engine = _cache_only_engine()
@@ -1183,8 +1212,10 @@ def test_openai_stream_group_respects_per_request_max_tokens() -> None:
         max_tokens: int,
         temperature: float,
         broadcast_tensor_parallel: bool = True,
+        row_max_tokens: list[int] | None = None,
     ):
         del broadcast_tensor_parallel
+        assert row_max_tokens == [1, 3]
         calls.append((prompts, max_tokens, temperature))
         yield [101, 201]
         assert any(isinstance(item, _GenerationDone) for item in first_queue.queue)
@@ -1595,7 +1626,9 @@ class _WorkerLoopRecordingEngine:
         max_tokens: int,
         temperature: float,
         broadcast_tensor_parallel: bool,
+        row_max_tokens: list[int] | None = None,
     ):
+        del row_max_tokens
         self.batch_calls.append(
             (
                 [[int(token_id) for token_id in row.tolist()] for row in input_ids],
