@@ -2406,7 +2406,7 @@ def _should_use_decode_step_graph(
     temperature: float,
 ) -> bool:
     return (
-        _tp_flag("TORCHINFERNO_CUDAGRAPH_DECODE_STEP")
+        _tp_flag("TORCHINFERNO_CUDAGRAPH_DECODE_STEP", True)
         and temperature <= 0.0
         and input_ids.is_cuda
         and input_ids.ndim == 2
@@ -2422,7 +2422,7 @@ def _should_use_decode_step_logits_graph(
     cache: Llama3TensorParallelCache,
 ) -> bool:
     return (
-        _tp_flag("TORCHINFERNO_CUDAGRAPH_DECODE_STEP")
+        _tp_flag("TORCHINFERNO_CUDAGRAPH_DECODE_STEP", True)
         and input_ids.is_cuda
         and input_ids.ndim == 2
         and 1 <= input_ids.size(0) <= _decode_step_max_batch()

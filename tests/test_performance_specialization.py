@@ -19,7 +19,13 @@ from torchinferno.kernels import (
 )
 from torchinferno.kernels.ops import triton_available
 from torchinferno.kernels.passes import register_kernel_replacement_passes
-from torchinferno.models.llama3.tensor_parallel import _decode_linear
+from torchinferno.models.llama3.tensor_parallel import (
+    Llama3TensorParallelCache,
+    Llama3TensorParallelLayerKVCache,
+    _decode_linear,
+    _should_use_decode_step_graph,
+    _should_use_decode_step_logits_graph,
+)
 from torchinferno.research.benchmarks import benchmark_callable
 from torchinferno.research.helion import (
     HelionCandidateConfig,
@@ -191,6 +197,33 @@ def test_decode_linear_uses_transposed_weight_layout() -> None:
     expected = F.linear(x, weight)
 
     torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
+def test_tensor_parallel_decode_graph_enabled_by_default(monkeypatch) -> None:
+    monkeypatch.delenv("TORCHINFERNO_CUDAGRAPH_DECODE_STEP", raising=False)
+    device = torch.device("cuda")
+    input_ids = torch.zeros((1, 1), device=device, dtype=torch.long)
+    cache = Llama3TensorParallelCache(
+        [
+            Llama3TensorParallelLayerKVCache(
+                1,
+                8,
+                1,
+                8,
+                device=device,
+                dtype=torch.bfloat16,
+            )
+        ]
+    )
+
+    assert _should_use_decode_step_graph(input_ids, cache, temperature=0.0)
+    assert _should_use_decode_step_logits_graph(input_ids, cache)
+
+    monkeypatch.setenv("TORCHINFERNO_CUDAGRAPH_DECODE_STEP", "0")
+
+    assert not _should_use_decode_step_graph(input_ids, cache, temperature=0.0)
+    assert not _should_use_decode_step_logits_graph(input_ids, cache)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available() or not triton_available(), reason="CUDA Triton unavailable")

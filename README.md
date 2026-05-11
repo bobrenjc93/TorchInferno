@@ -584,7 +584,9 @@ OpenAI serving also has explicit environment knobs for production-shape tuning:
   `TORCHINFERNO_CUDAGRAPH_MLP`, `TORCHINFERNO_CUDAGRAPH_ALLREDUCE`,
   `TORCHINFERNO_CUDAGRAPH_PREFILL_DEBUG`, and
   `TORCHINFERNO_CUDAGRAPH_DECODE_DEBUG`.
-  `TORCHINFERNO_CUDAGRAPH_DECODE_STEP_MAX_BATCH` defaults to `16`.
+  `TORCHINFERNO_CUDAGRAPH_DECODE_STEP` is enabled by default for CUDA tensor
+  parallel decode and can be set to `0` to use eager decode.
+  `TORCHINFERNO_CUDAGRAPH_DECODE_STEP_MAX_BATCH` defaults to `64`.
 - Tensor-parallel Llama kernel and sampling toggles include
   `TORCHINFERNO_TRITON_DECODE_ATTENTION`,
   `TORCHINFERNO_TRITON_GROUPED_DECODE_ATTENTION`,
