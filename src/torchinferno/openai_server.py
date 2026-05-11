@@ -2153,7 +2153,7 @@ def _runtime_prefill_graph_capture_enabled(model: object) -> bool:
 
 def _openai_cuda_graph_enabled_for_model(model: object) -> bool:
     if _is_tensor_parallel_model(model) and _tensor_parallel_world_size(model) > 1:
-        return env_flag("TORCHINFERNO_OPENAI_TP_CUDAGRAPH", False)
+        return env_flag("TORCHINFERNO_OPENAI_TP_CUDAGRAPH", True)
     return True
 
 
