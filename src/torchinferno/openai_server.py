@@ -2501,7 +2501,7 @@ class OpenAICompletionEngine:
         )
         ephemeral_graph_allowed = (
             getattr(cache, "_torchinferno_ephemeral_cache", False)
-            and env_flag("TORCHINFERNO_OPENAI_EPHEMERAL_RAGGED_CUDAGRAPH")
+            and env_flag("TORCHINFERNO_OPENAI_EPHEMERAL_RAGGED_CUDAGRAPH", True)
         )
         ephemeral_graph_min_step = env_int(
             "TORCHINFERNO_OPENAI_EPHEMERAL_RAGGED_CUDAGRAPH_MIN_STEP",
