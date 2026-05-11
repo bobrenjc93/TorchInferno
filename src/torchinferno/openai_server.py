@@ -697,7 +697,7 @@ class OpenAICompletionEngine:
                     row_max_tokens=row_max_tokens,
                 )
                 for step, step_tokens in enumerate(step_iter):
-                    _emit_stream_step(group, step, step_tokens)
+                    _emit_stream_step(group, step, step_tokens, getattr(self, "stop_token_ids", frozenset()))
             finally:
                 _sync_tensor_parallel_command(self.model, self.device)
             return
@@ -716,7 +716,12 @@ class OpenAICompletionEngine:
                     row_max_tokens=[request.max_tokens for request in same_length_group],
                 )
                 for step, step_tokens in enumerate(step_iter):
-                    _emit_stream_step(same_length_group, step, step_tokens)
+                    _emit_stream_step(
+                        same_length_group,
+                        step,
+                        step_tokens,
+                        getattr(self, "stop_token_ids", frozenset()),
+                    )
             finally:
                 _sync_tensor_parallel_command(self.model, self.device)
 
@@ -3030,6 +3035,7 @@ def _emit_stream_step(
     group: Sequence[_QueuedGeneration],
     step: int,
     step_tokens: Sequence[int | None],
+    stop_token_ids: frozenset[int] = frozenset(),
 ) -> None:
     for request, token_id in zip(group, step_tokens):
         if request.done:
@@ -3037,8 +3043,9 @@ def _emit_stream_step(
         if step >= request.max_tokens or token_id is None:
             _finish_stream_request(request)
             continue
-        request.responses.put(int(token_id))
-        if step + 1 >= request.max_tokens:
+        token = int(token_id)
+        request.responses.put(token)
+        if token in stop_token_ids or step + 1 >= request.max_tokens:
             _finish_stream_request(request)
 
 

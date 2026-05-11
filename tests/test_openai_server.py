@@ -1604,6 +1604,42 @@ def test_openai_stream_group_respects_per_request_max_tokens() -> None:
     assert isinstance(second_items[3], _GenerationDone)
 
 
+def test_openai_stream_group_finishes_rows_on_stop_token() -> None:
+    engine = _cache_only_engine()
+    engine.model = object()
+    engine.stop_token_ids = frozenset({99})
+    captured: list[list[bool]] = []
+
+    def generate_batch_steps(
+        input_ids: torch.Tensor,
+        *,
+        max_tokens: int,
+        temperature: float,
+        broadcast_tensor_parallel: bool = True,
+        row_max_tokens: list[int] | None = None,
+    ):
+        del input_ids, max_tokens, temperature, broadcast_tensor_parallel, row_max_tokens
+        yield [99, 201]
+        captured.append([first.done, second.done])
+        yield [None, 202]
+
+    engine._generate_batch_steps = generate_batch_steps  # type: ignore[method-assign]
+
+    first_queue: queue.Queue[object] = queue.Queue()
+    second_queue: queue.Queue[object] = queue.Queue()
+    first = _QueuedGeneration([1, 2], 3, 0.0, True, first_queue)
+    second = _QueuedGeneration([1, 3], 3, 0.0, True, second_queue)
+
+    engine._run_queued_stream_group([first, second])
+
+    first_items = _queue_items(first_queue)
+    second_items = _queue_items(second_queue)
+    assert first_items[0] == 99
+    assert isinstance(first_items[1], _GenerationDone)
+    assert second_items[:2] == [201, 202]
+    assert captured == [[True, False]]
+
+
 def test_openai_completion_group_respects_per_request_max_tokens() -> None:
     engine = _cache_only_engine()
     engine.model = object()
