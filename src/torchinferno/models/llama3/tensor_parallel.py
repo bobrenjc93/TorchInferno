@@ -1181,6 +1181,7 @@ class Llama3TensorParallelForCausalLM:
         self._decode_logits_graphs: dict[tuple[int, int, int], _StaticDecodeLogitsGraphCall] = {}
         self._decode_graph_failed = False
         self._decode_logits_graph_failed = False
+        self._temperature_gumbel_generators: dict[str, torch.Generator] = {}
 
     @classmethod
     def from_pretrained(
@@ -2040,7 +2041,9 @@ class Llama3TensorParallelForCausalLM:
 
     def _sample_next_token_temperature_gumbel(self, logits: Tensor, temperature: float) -> Tensor:
         logits_float = logits.float() / temperature
-        gumbel = -torch.empty_like(logits_float).exponential_().log()
+        gumbel = -torch.empty_like(logits_float).exponential_(
+            generator=self._temperature_gumbel_generator(logits.device)
+        ).log()
         local_values, local_indices = torch.max(logits_float + gumbel, dim=-1)
         global_values = local_values.clone()
         dist.all_reduce(global_values, op=dist.ReduceOp.MAX)
@@ -2049,6 +2052,21 @@ class Llama3TensorParallelForCausalLM:
         next_token = torch.where(local_values == global_values, local_tokens, sentinel)
         dist.all_reduce(next_token, op=dist.ReduceOp.MIN)
         return next_token
+
+    def _temperature_gumbel_generator(self, device: torch.device) -> torch.Generator:
+        generators = getattr(self, "_temperature_gumbel_generators", None)
+        if generators is None:
+            generators = {}
+            self._temperature_gumbel_generators = generators
+        key = str(device)
+        generator = generators.get(key)
+        if generator is None:
+            generator = torch.Generator(device=device)
+            rank = int(getattr(self, "rank", 0))
+            seed = (torch.initial_seed() + (rank + 1) * 0x9E3779B97F4A7C15) % ((1 << 63) - 1)
+            generator.manual_seed(seed)
+            generators[key] = generator
+        return generator
 
     def _sample_next_token_temperature(self, logits: Tensor, temperature: float) -> Tensor:
         logits_float = logits.float() / temperature

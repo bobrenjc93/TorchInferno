@@ -274,6 +274,7 @@ def test_llama3_tensor_parallel_temperature_sampling_uses_gumbel_max(monkeypatch
 
     model = object.__new__(Llama3TensorParallelForCausalLM)
     model.config = type("Config", (), {"vocab_size": 4})()
+    model.rank = 0
     model.vocab_start = 0
     model.local_vocab_size = 4
     logits = torch.tensor([[1000.0, -1000.0, -1000.0, -1000.0], [-1000.0, 1000.0, -1000.0, -1000.0]])
@@ -282,6 +283,20 @@ def test_llama3_tensor_parallel_temperature_sampling_uses_gumbel_max(monkeypatch
 
     assert sampled.tolist() == [0, 1]
     assert calls == [dist.ReduceOp.MAX, dist.ReduceOp.MIN]
+
+
+def test_llama3_tensor_parallel_temperature_gumbel_generators_are_rank_local() -> None:
+    first = object.__new__(Llama3TensorParallelForCausalLM)
+    second = object.__new__(Llama3TensorParallelForCausalLM)
+    first.rank = 0
+    second.rank = 1
+
+    first_generator = first._temperature_gumbel_generator(torch.device("cpu"))
+    second_generator = second._temperature_gumbel_generator(torch.device("cpu"))
+    first_values = torch.empty(8).exponential_(generator=first_generator)
+    second_values = torch.empty(8).exponential_(generator=second_generator)
+
+    assert not torch.equal(first_values, second_values)
 
 
 def _write_tiny_llama3_hf_checkpoint(reference: Llama3V0ForCausalLM, config, path) -> None:
