@@ -1474,6 +1474,7 @@ def test_openai_ephemeral_cache_skips_ragged_decode_graph() -> None:
 
 
 def test_openai_ephemeral_cache_scoped_ragged_decode_releases_graphs(monkeypatch) -> None:
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_EPHEMERAL_RAGGED_CUDAGRAPH", "1")
     monkeypatch.setenv("TORCHINFERNO_OPENAI_EPHEMERAL_RAGGED_CUDAGRAPH_MIN_STEP", "1")
 
     class _GraphModel:
