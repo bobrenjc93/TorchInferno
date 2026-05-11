@@ -1901,14 +1901,22 @@ class OpenAICompletionEngine:
             length_groups,
             prompt_lengths=prompt_lengths,
         )
-        if (
+        use_padded_suffix_prefill = (
             _ragged_decode_enabled_for_model(model)
             and not prefer_dense_group_decode
             and _prefer_shared_prefix_padded_suffix_prefill(
                 length_groups,
+                prefix_tokens=prefix_tokens,
                 prompt_lengths=prompt_lengths,
             )
-        ):
+        )
+        if _is_tensor_parallel_model(model) and _tensor_parallel_world_size(model) > 1:
+            use_padded_suffix_prefill = _tensor_parallel_all_ranks_true(
+                model,
+                use_padded_suffix_prefill,
+                self.device,
+            )
+        if use_padded_suffix_prefill:
             padded_state = self._prefill_shared_prefix_prompt_list_padded_suffixes(
                 prompts,
                 prefix_cache=prefix_cache,
@@ -1989,7 +1997,14 @@ class OpenAICompletionEngine:
                 max_tokens=max_tokens,
                 model=model,
             )
-            if combined_cache is not None:
+            use_combined_cache = combined_cache is not None
+            if _is_tensor_parallel_model(model) and _tensor_parallel_world_size(model) > 1:
+                use_combined_cache = _tensor_parallel_all_ranks_true(
+                    model,
+                    use_combined_cache,
+                    self.device,
+                )
+            if use_combined_cache and combined_cache is not None:
                 yield from self._decode_shared_prefix_prompt_list_ragged(
                     cache=combined_cache,
                     active=[
@@ -2064,7 +2079,11 @@ class OpenAICompletionEngine:
             _copy_generation_cache_first_row(prefix_cache, cache, prompt_count)
         except Exception as exc:
             warn_optional_failure("openai.shared_prefix_padded_suffix_cache", exc)
-            return None
+            if not _tensor_parallel_all_ranks_true(model, False, self.device):
+                return None
+        else:
+            if not _tensor_parallel_all_ranks_true(model, True, self.device):
+                return None
 
         pad_token_id = _tokenizer_padding_token_id(getattr(self, "tokenizer", None))
         suffix_ids = torch.full(
@@ -2920,6 +2939,7 @@ def _ragged_decode_enabled_for_model(model: object) -> bool:
 def _prefer_shared_prefix_padded_suffix_prefill(
     length_groups: Sequence[Sequence[tuple[int, Sequence[int]]]],
     *,
+    prefix_tokens: int,
     prompt_lengths: Sequence[int],
 ) -> bool:
     if not env_flag("TORCHINFERNO_OPENAI_SHARED_PREFIX_PADDED_SUFFIX_PREFILL", True):
@@ -2928,7 +2948,31 @@ def _prefer_shared_prefix_padded_suffix_prefill(
     if len(length_groups) < min_groups:
         return False
     min_spread = env_int("TORCHINFERNO_OPENAI_SHARED_PREFIX_PADDED_SUFFIX_MIN_SPREAD", 1, minimum=1)
-    return bool(prompt_lengths) and max(prompt_lengths) - min(prompt_lengths) >= min_spread
+    if not prompt_lengths or max(prompt_lengths) - min(prompt_lengths) < min_spread:
+        return False
+    suffix_lengths = [
+        max(0, len(prompt) - prefix_tokens)
+        for same_length in length_groups
+        for _index, prompt in same_length
+    ]
+    if not suffix_lengths or min(suffix_lengths) <= 0:
+        return False
+    real_suffix_tokens = sum(suffix_lengths)
+    padded_suffix_tokens = len(suffix_lengths) * max(suffix_lengths)
+    padding_tokens = padded_suffix_tokens - real_suffix_tokens
+    max_padding_tokens = env_int(
+        "TORCHINFERNO_OPENAI_SHARED_PREFIX_PADDED_SUFFIX_MAX_PADDING_TOKENS",
+        1024,
+        minimum=0,
+    )
+    if padding_tokens > max_padding_tokens:
+        return False
+    max_padding_ratio = env_float(
+        "TORCHINFERNO_OPENAI_SHARED_PREFIX_PADDED_SUFFIX_MAX_PADDING_RATIO",
+        1.5,
+        minimum=1.0,
+    )
+    return padded_suffix_tokens <= real_suffix_tokens * max_padding_ratio
 
 
 def _prefer_shared_prefix_dense_group_decode(

@@ -1196,7 +1196,7 @@ def test_openai_tensor_parallel_refills_prefix_when_any_rank_misses_cache(monkey
     )
 
     assert steps == [[2, 2]]
-    assert calls == [1]
+    assert calls == [1, 0]
     assert model.forward_inputs[0] == [[10, 11]]
 
 
@@ -1303,6 +1303,167 @@ def test_openai_shared_prefix_padded_suffix_prefill_uses_true_lengths(monkeypatc
         [[4, 6], [5, 0]],
     ]
     assert model.ragged_calls == []
+
+
+def test_openai_shared_prefix_padded_suffix_prefill_requires_all_tp_ranks(monkeypatch) -> None:
+    model = _TokenEchoSharedPrefixRecordingModel()
+    engine = _cache_only_engine()
+    engine.model = model
+    engine.stop_token_ids = frozenset()
+    prefix_ids = torch.tensor([[10, 11]], dtype=torch.long)
+    prefix_cache = model.allocate_cache(1, 4)
+    model.forward(prefix_ids, cache=prefix_cache, use_cache=True)
+    model.forward_inputs.clear()
+
+    monkeypatch.setattr(
+        "torchinferno.openai_server._tensor_parallel_all_ranks_true",
+        lambda candidate, value, device: False,
+    )
+
+    state = engine._prefill_shared_prefix_prompt_list_padded_suffixes(
+        [[10, 11, 4, 6], [10, 11, 5]],
+        prefix_cache=prefix_cache,
+        prefix_tokens=2,
+        max_tokens=1,
+        temperature=0.0,
+        row_max_tokens=[1, 1],
+        model=model,
+    )
+
+    assert state is None
+    assert model.forward_inputs == []
+
+
+def test_openai_shared_prefix_padded_suffix_branch_requires_all_tp_ranks(monkeypatch) -> None:
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_PREFIX_CACHE_MIN_TOKENS", "2")
+    model = _TokenEchoSharedPrefixRecordingModel()
+    engine = _cache_only_engine()
+    engine.model = model
+    engine.stop_token_ids = frozenset()
+    engine._prefix_cache_entry = None
+
+    monkeypatch.setattr(
+        "torchinferno.openai_server._is_tensor_parallel_model",
+        lambda candidate: candidate is model,
+    )
+    monkeypatch.setattr(
+        "torchinferno.openai_server._tensor_parallel_world_size",
+        lambda candidate: 8 if candidate is model else 1,
+    )
+
+    calls: list[bool] = []
+
+    def all_ranks_true(candidate: object, value: bool, device: torch.device) -> bool:
+        assert candidate is model
+        calls.append(value)
+        if len(calls) == 2:
+            return False
+        return value
+
+    monkeypatch.setattr("torchinferno.openai_server._tensor_parallel_all_ranks_true", all_ranks_true)
+
+    def fail_padded_prefill(*args, **kwargs):
+        raise AssertionError("padded suffix prefill must not run unless every TP rank selects it")
+
+    monkeypatch.setattr(engine, "_prefill_shared_prefix_prompt_list_padded_suffixes", fail_padded_prefill)
+
+    steps = list(
+        engine._generate_prompt_list_batch_steps(
+            [[10, 11, 4, 6], [10, 11, 5]],
+            max_tokens=1,
+            temperature=0.0,
+            broadcast_tensor_parallel=False,
+        )
+    )
+
+    assert steps == [[6, 5]]
+    assert calls == [False, True]
+    assert model.forward_inputs == [
+        [[10, 11]],
+        [[4, 6]],
+        [[5]],
+    ]
+
+
+def test_openai_shared_prefix_padded_suffix_prefill_skips_high_padding_waste(monkeypatch) -> None:
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_PREFIX_CACHE_MIN_TOKENS", "2")
+    model = _TokenEchoSharedPrefixRecordingModel()
+    engine = _cache_only_engine()
+    engine.model = model
+    engine.stop_token_ids = frozenset()
+    engine._prefix_cache_entry = None
+
+    def fail_padded_prefill(*args, **kwargs):
+        raise AssertionError("padded suffix prefill must not run when padding waste is high")
+
+    monkeypatch.setattr(engine, "_prefill_shared_prefix_prompt_list_padded_suffixes", fail_padded_prefill)
+
+    long_suffix = [4 for _ in range(50)]
+    steps = list(
+        engine._generate_prompt_list_batch_steps(
+            [[10, 11, *long_suffix], [10, 11, 5]],
+            max_tokens=1,
+            temperature=0.0,
+            broadcast_tensor_parallel=False,
+        )
+    )
+
+    assert steps == [[4, 5]]
+    assert model.forward_inputs == [
+        [[10, 11]],
+        [long_suffix],
+        [[5]],
+    ]
+
+
+def test_openai_shared_prefix_ragged_cache_requires_all_tp_ranks(monkeypatch) -> None:
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_PREFIX_CACHE_MIN_TOKENS", "2")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_SHARED_PREFIX_PADDED_SUFFIX_PREFILL", "0")
+    model = _TokenEchoSharedPrefixRecordingModel()
+    engine = _cache_only_engine()
+    engine.model = model
+    engine.stop_token_ids = frozenset()
+    engine._prefix_cache_entry = None
+
+    monkeypatch.setattr(
+        "torchinferno.openai_server._is_tensor_parallel_model",
+        lambda candidate: candidate is model,
+    )
+    monkeypatch.setattr(
+        "torchinferno.openai_server._tensor_parallel_world_size",
+        lambda candidate: 8 if candidate is model else 1,
+    )
+
+    calls: list[bool] = []
+
+    def all_ranks_true(candidate: object, value: bool, device: torch.device) -> bool:
+        assert candidate is model
+        calls.append(value)
+        if len(calls) == 3:
+            return False
+        return value
+
+    monkeypatch.setattr("torchinferno.openai_server._tensor_parallel_all_ranks_true", all_ranks_true)
+
+    steps = list(
+        engine._generate_prompt_list_batch_steps(
+            [[10, 11, 4, 6], [10, 11, 5]],
+            max_tokens=2,
+            temperature=0.0,
+            broadcast_tensor_parallel=False,
+        )
+    )
+
+    assert steps == [[6, 5], [6, 5]]
+    assert calls == [False, False, True]
+    assert model.ragged_calls == []
+    assert model.forward_inputs == [
+        [[10, 11]],
+        [[4, 6]],
+        [[5]],
+        [[6]],
+        [[5]],
+    ]
 
 
 def test_openai_ragged_decode_skips_rows_after_per_request_max_tokens(monkeypatch) -> None:
