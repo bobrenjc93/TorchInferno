@@ -565,6 +565,11 @@ OpenAI serving also has explicit environment knobs for production-shape tuning:
   `TORCHINFERNO_OPENAI_SINGLE_ADMISSION_WAIT_MS`, and
   `TORCHINFERNO_OPENAI_TEMPERATURE_ADMISSION_WAIT_MS` tune live request
   batching behavior.
+- `TORCHINFERNO_OPENAI_SHARED_PREFIX_DENSE_GROUP_DECODE` keeps shared-prefix
+  prefill while using dense per-length decode for low-variance prompt-length
+  groups; the group-count, length-spread, and minimum-size thresholds are
+  controlled by the matching `_MAX_GROUPS`, `_MAX_SPREAD`, and `_MIN_SIZE`
+  environment variables.
 - `TORCHINFERNO_OPENAI_PHASE_TIMINGS=1` records serving phase timings, and
   `TORCHINFERNO_OPENAI_PREFIX_CACHE_SHARED_SAMPLE=1` enables shared-prefix
   cache reuse for temperature sampling.

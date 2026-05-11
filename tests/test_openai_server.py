@@ -971,6 +971,29 @@ def test_openai_engine_ragged_decodes_variable_length_shared_prefix_suffixes(mon
     assert second_rows is None
 
 
+def test_openai_shared_prefix_uses_dense_decode_for_low_variance_length_groups(monkeypatch) -> None:
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_PREFIX_CACHE_MIN_TOKENS", "2")
+    model = _RaggedSharedPrefixRecordingModel()
+    engine = _cache_only_engine()
+    engine.model = model
+    engine.stop_token_ids = frozenset()
+    engine._prefix_cache_entry = None
+    prompts = [[10, 11, 20, 21] for _ in range(8)] + [[10, 11, 30] for _ in range(8)]
+
+    steps = list(
+        engine._generate_prompt_list_batch_steps(
+            prompts,
+            max_tokens=3,
+            temperature=0.0,
+            broadcast_tensor_parallel=False,
+        )
+    )
+
+    assert steps == [[2 for _ in prompts] for _ in range(3)]
+    assert model.ragged_calls == []
+    assert len(model.forward_inputs) == 7
+
+
 def test_openai_ragged_decode_skips_rows_after_per_request_max_tokens(monkeypatch) -> None:
     monkeypatch.setenv("TORCHINFERNO_OPENAI_PREFIX_CACHE_MIN_TOKENS", "2")
     model = _RaggedSharedPrefixRecordingModel()

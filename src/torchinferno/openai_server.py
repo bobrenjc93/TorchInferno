@@ -1761,7 +1761,10 @@ class OpenAICompletionEngine:
         if not should_continue:
             return
 
-        if _ragged_decode_enabled_for_model(model):
+        if _ragged_decode_enabled_for_model(model) and not _prefer_shared_prefix_dense_group_decode(
+            length_groups,
+            prompt_lengths=[len(prompt) for prompt in prompts],
+        ):
             combined_cache = self._shared_prefix_prompt_list_ragged_cache(
                 states,
                 prompt_lengths=[len(prompt) for prompt in prompts],
@@ -2581,6 +2584,25 @@ def _ragged_decode_enabled_for_model(model: object) -> bool:
         env_flag("TORCHINFERNO_OPENAI_RAGGED_DECODE", True)
         and callable(getattr(model, "decode_ragged_logits", None))
     )
+
+
+def _prefer_shared_prefix_dense_group_decode(
+    length_groups: Sequence[Sequence[tuple[int, Sequence[int]]]],
+    *,
+    prompt_lengths: Sequence[int],
+) -> bool:
+    if not env_flag("TORCHINFERNO_OPENAI_SHARED_PREFIX_DENSE_GROUP_DECODE", True):
+        return False
+    if len(length_groups) <= 1 or not prompt_lengths:
+        return False
+    max_groups = env_int("TORCHINFERNO_OPENAI_SHARED_PREFIX_DENSE_GROUP_MAX_GROUPS", 4, minimum=1)
+    if len(length_groups) > max_groups:
+        return False
+    max_spread = env_int("TORCHINFERNO_OPENAI_SHARED_PREFIX_DENSE_GROUP_MAX_SPREAD", 4, minimum=0)
+    if max(prompt_lengths) - min(prompt_lengths) > max_spread:
+        return False
+    min_group_size = env_int("TORCHINFERNO_OPENAI_SHARED_PREFIX_DENSE_GROUP_MIN_SIZE", 8, minimum=1)
+    return max((len(group) for group in length_groups), default=0) >= min_group_size
 
 
 def _repeat_generation_cache_first_batch(cache: object, batch_size: int) -> None:
