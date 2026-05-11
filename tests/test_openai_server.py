@@ -1062,6 +1062,7 @@ def test_openai_engine_batches_variable_length_shared_prefix_suffixes(monkeypatc
 
 def test_openai_engine_ragged_decodes_variable_length_shared_prefix_suffixes(monkeypatch) -> None:
     monkeypatch.setenv("TORCHINFERNO_OPENAI_PREFIX_CACHE_MIN_TOKENS", "2")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_SHARED_PREFIX_PADDED_SUFFIX_PREFILL", "0")
     model = _RaggedSharedPrefixRecordingModel()
     tokenizer = _SharedPrefixTokenizer(parties=2)
     engine = OpenAICompletionEngine(
@@ -1140,8 +1141,6 @@ def test_openai_shared_prefix_uses_dense_decode_for_low_variance_length_groups(m
 
 def test_openai_shared_prefix_padded_suffix_prefill_uses_true_lengths(monkeypatch) -> None:
     monkeypatch.setenv("TORCHINFERNO_OPENAI_PREFIX_CACHE_MIN_TOKENS", "2")
-    monkeypatch.setenv("TORCHINFERNO_OPENAI_SHARED_PREFIX_PADDED_SUFFIX_MIN_GROUPS", "2")
-    monkeypatch.setenv("TORCHINFERNO_OPENAI_SHARED_PREFIX_PADDED_SUFFIX_MIN_SPREAD", "1")
     model = _TokenEchoSharedPrefixRecordingModel()
     engine = _cache_only_engine()
     engine.model = model
@@ -1168,6 +1167,7 @@ def test_openai_shared_prefix_padded_suffix_prefill_uses_true_lengths(monkeypatc
 
 def test_openai_ragged_decode_skips_rows_after_per_request_max_tokens(monkeypatch) -> None:
     monkeypatch.setenv("TORCHINFERNO_OPENAI_PREFIX_CACHE_MIN_TOKENS", "2")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_SHARED_PREFIX_PADDED_SUFFIX_PREFILL", "0")
     model = _RaggedSharedPrefixRecordingModel()
     engine = _cache_only_engine()
     engine.model = model

@@ -2816,10 +2816,10 @@ def _prefer_shared_prefix_padded_suffix_prefill(
 ) -> bool:
     if not env_flag("TORCHINFERNO_OPENAI_SHARED_PREFIX_PADDED_SUFFIX_PREFILL", True):
         return False
-    min_groups = env_int("TORCHINFERNO_OPENAI_SHARED_PREFIX_PADDED_SUFFIX_MIN_GROUPS", 5, minimum=2)
+    min_groups = env_int("TORCHINFERNO_OPENAI_SHARED_PREFIX_PADDED_SUFFIX_MIN_GROUPS", 2, minimum=2)
     if len(length_groups) < min_groups:
         return False
-    min_spread = env_int("TORCHINFERNO_OPENAI_SHARED_PREFIX_PADDED_SUFFIX_MIN_SPREAD", 8, minimum=1)
+    min_spread = env_int("TORCHINFERNO_OPENAI_SHARED_PREFIX_PADDED_SUFFIX_MIN_SPREAD", 1, minimum=1)
     return bool(prompt_lengths) and max(prompt_lengths) - min(prompt_lengths) >= min_spread
 
 

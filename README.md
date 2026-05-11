@@ -575,8 +575,9 @@ OpenAI serving also has explicit environment knobs for production-shape tuning:
   controlled by the matching `_MAX_GROUPS`, `_MAX_SPREAD`, and `_MIN_SIZE`
   environment variables.
 - `TORCHINFERNO_OPENAI_SHARED_PREFIX_PADDED_SUFFIX_PREFILL` batches
-  high-variance shared-prefix suffix prefill with right padding before ragged
-  decode; `_MIN_GROUPS` and `_MIN_SPREAD` control when the padded path applies.
+  shared-prefix suffix prefill with right padding before ragged decode;
+  `_MIN_GROUPS` (default `2`) and `_MIN_SPREAD` (default `1`) control when the
+  padded path applies.
 - `TORCHINFERNO_OPENAI_RAGGED_DECODE_FULL_BATCH_MIN_ROWS` and
   `TORCHINFERNO_OPENAI_RAGGED_DECODE_FULL_BATCH_MIN_ACTIVE_FRACTION` keep
   larger ragged decode batches at a stable full-batch graph shape while most
