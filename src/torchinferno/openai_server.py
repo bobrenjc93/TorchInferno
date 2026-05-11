@@ -1698,6 +1698,7 @@ class OpenAICompletionEngine:
         ]
         per_row_limits = _normalize_row_max_tokens(row_max_tokens, len(prompts), max_tokens)
         length_groups = _indexed_prompts_by_length(indexed)
+        prompt_lengths = [len(prompt) for prompt in prompts]
         prefix_cache = self._generation_microbatch_cache(
             -1,
             1,
@@ -1714,6 +1715,44 @@ class OpenAICompletionEngine:
                 allow_capture=_runtime_prefill_graph_capture_enabled(model),
             )
             self._save_prompt_prefix_cache(prefix_ids, prefix_cache)
+
+        prefer_dense_group_decode = _prefer_shared_prefix_dense_group_decode(
+            length_groups,
+            prompt_lengths=prompt_lengths,
+        )
+        if (
+            _ragged_decode_enabled_for_model(model)
+            and not prefer_dense_group_decode
+            and _prefer_shared_prefix_padded_suffix_prefill(
+                length_groups,
+                prompt_lengths=prompt_lengths,
+            )
+        ):
+            padded_state = self._prefill_shared_prefix_prompt_list_padded_suffixes(
+                prompts,
+                prefix_cache=prefix_cache,
+                prefix_tokens=prefix_tokens,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                row_max_tokens=per_row_limits,
+                model=model,
+            )
+            if padded_state is not None:
+                combined_cache, first_tokens, active = padded_state
+                yield first_tokens
+                should_continue = max_tokens > 1 and any(active)
+                should_continue = _sync_tensor_parallel_continue(model, should_continue, self.device)
+                if should_continue:
+                    yield from self._decode_shared_prefix_prompt_list_ragged(
+                        cache=combined_cache,
+                        active=active,
+                        prompt_lengths=prompt_lengths,
+                        max_tokens=max_tokens,
+                        next_tokens=first_tokens,
+                        temperature=temperature,
+                        row_max_tokens=per_row_limits,
+                    )
+                return
 
         states: list[dict[str, object]] = []
         first_tokens: list[int | None] = [None for _ in prompts]
@@ -1761,13 +1800,10 @@ class OpenAICompletionEngine:
         if not should_continue:
             return
 
-        if _ragged_decode_enabled_for_model(model) and not _prefer_shared_prefix_dense_group_decode(
-            length_groups,
-            prompt_lengths=[len(prompt) for prompt in prompts],
-        ):
+        if _ragged_decode_enabled_for_model(model) and not prefer_dense_group_decode:
             combined_cache = self._shared_prefix_prompt_list_ragged_cache(
                 states,
-                prompt_lengths=[len(prompt) for prompt in prompts],
+                prompt_lengths=prompt_lengths,
                 prompt_count=len(prompts),
                 max_tokens=max_tokens,
                 model=model,
@@ -1779,7 +1815,7 @@ class OpenAICompletionEngine:
                         token_id is not None and int(token_id) not in stop_token_ids
                         for token_id in first_tokens
                     ],
-                    prompt_lengths=[len(prompt) for prompt in prompts],
+                    prompt_lengths=prompt_lengths,
                     max_tokens=max_tokens,
                     next_tokens=first_tokens,
                     temperature=temperature,
@@ -1818,6 +1854,71 @@ class OpenAICompletionEngine:
             if not emitted:
                 break
             yield step_tokens
+
+    def _prefill_shared_prefix_prompt_list_padded_suffixes(
+        self,
+        prompts: Sequence[Sequence[int]],
+        *,
+        prefix_cache: object,
+        prefix_tokens: int,
+        max_tokens: int,
+        temperature: float,
+        row_max_tokens: Sequence[int],
+        model: object,
+    ) -> tuple[object, list[int | None], list[bool]] | None:
+        prompt_count = len(prompts)
+        if prompt_count <= 0:
+            return None
+        suffix_rows = [list(prompt[prefix_tokens:]) for prompt in prompts]
+        max_suffix_len = max((len(row) for row in suffix_rows), default=0)
+        if max_suffix_len <= 0:
+            return None
+        max_prompt_len = max((len(prompt) for prompt in prompts), default=0)
+        cache = self._generation_cache(
+            prompt_count,
+            max_prompt_len + max_tokens,
+            model=model,
+        )
+        try:
+            _copy_generation_cache_first_row(prefix_cache, cache, prompt_count)
+        except Exception as exc:
+            warn_optional_failure("openai.shared_prefix_padded_suffix_cache", exc)
+            return None
+
+        pad_token_id = _tokenizer_padding_token_id(getattr(self, "tokenizer", None))
+        suffix_ids = torch.full(
+            (prompt_count, max_suffix_len),
+            pad_token_id,
+            dtype=torch.long,
+            device=self.device,
+        )
+        for row, suffix in enumerate(suffix_rows):
+            if not suffix:
+                return None
+            suffix_ids[row, : len(suffix)] = torch.tensor(suffix, dtype=torch.long, device=self.device)
+
+        # Right padding is safe here: real suffix-token logits never attend to
+        # future pad tokens, and later ragged decode uses true per-row lengths.
+        logits, cache = _forward_all_logits(model, suffix_ids, cache)
+        row_positions = torch.arange(prompt_count, dtype=torch.long, device=self.device)
+        last_positions = torch.tensor(
+            [len(suffix) - 1 for suffix in suffix_rows],
+            dtype=torch.long,
+            device=self.device,
+        )
+        next_token = _sample(model, logits[row_positions, last_positions, :], temperature).to(self.device)
+        stop_token_ids = self.stop_token_ids
+        first_tokens: list[int | None] = []
+        active: list[bool] = []
+        for row, token_id in enumerate(next_token.detach().cpu().tolist()):
+            if row_max_tokens[row] <= 0:
+                first_tokens.append(None)
+                active.append(False)
+                continue
+            token = int(token_id)
+            first_tokens.append(token)
+            active.append(token not in stop_token_ids and row_max_tokens[row] > 1)
+        return cache, first_tokens, active
 
     def _shared_prefix_prompt_list_ragged_cache(
         self,
@@ -2493,11 +2594,25 @@ def _warmup_tensor_parallel_decode_attention(model: object) -> None:
 
 
 def _forward(model: object, input_ids: Tensor, cache: object) -> tuple[Tensor, object]:
+    return _forward_with_logits_mode(model, input_ids, cache, return_last_logits_only=True)
+
+
+def _forward_all_logits(model: object, input_ids: Tensor, cache: object) -> tuple[Tensor, object]:
+    return _forward_with_logits_mode(model, input_ids, cache, return_last_logits_only=False)
+
+
+def _forward_with_logits_mode(
+    model: object,
+    input_ids: Tensor,
+    cache: object,
+    *,
+    return_last_logits_only: bool,
+) -> tuple[Tensor, object]:
     forward = model.forward  # type: ignore[attr-defined]
     parameters = _forward_parameter_names(type(model))
     kwargs: dict[str, object] = {"cache": cache, "use_cache": True}
     if "return_last_logits_only" in parameters:
-        kwargs["return_last_logits_only"] = True
+        kwargs["return_last_logits_only"] = return_last_logits_only
     if _is_tensor_parallel_model(model) and "return_sharded_logits" in parameters:
         kwargs["return_sharded_logits"] = True
     return forward(input_ids, **kwargs)
@@ -2586,6 +2701,20 @@ def _ragged_decode_enabled_for_model(model: object) -> bool:
     )
 
 
+def _prefer_shared_prefix_padded_suffix_prefill(
+    length_groups: Sequence[Sequence[tuple[int, Sequence[int]]]],
+    *,
+    prompt_lengths: Sequence[int],
+) -> bool:
+    if not env_flag("TORCHINFERNO_OPENAI_SHARED_PREFIX_PADDED_SUFFIX_PREFILL", True):
+        return False
+    min_groups = env_int("TORCHINFERNO_OPENAI_SHARED_PREFIX_PADDED_SUFFIX_MIN_GROUPS", 5, minimum=2)
+    if len(length_groups) < min_groups:
+        return False
+    min_spread = env_int("TORCHINFERNO_OPENAI_SHARED_PREFIX_PADDED_SUFFIX_MIN_SPREAD", 8, minimum=1)
+    return bool(prompt_lengths) and max(prompt_lengths) - min(prompt_lengths) >= min_spread
+
+
 def _prefer_shared_prefix_dense_group_decode(
     length_groups: Sequence[Sequence[tuple[int, Sequence[int]]]],
     *,
@@ -2603,6 +2732,14 @@ def _prefer_shared_prefix_dense_group_decode(
         return False
     min_group_size = env_int("TORCHINFERNO_OPENAI_SHARED_PREFIX_DENSE_GROUP_MIN_SIZE", 8, minimum=1)
     return max((len(group) for group in length_groups), default=0) >= min_group_size
+
+
+def _tokenizer_padding_token_id(tokenizer: object | None) -> int:
+    for name in ("pad_token_id", "eos_token_id"):
+        token_id = getattr(tokenizer, name, None)
+        if token_id is not None:
+            return max(0, int(token_id))
+    return 0
 
 
 def _repeat_generation_cache_first_batch(cache: object, batch_size: int) -> None:

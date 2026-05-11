@@ -570,6 +570,9 @@ OpenAI serving also has explicit environment knobs for production-shape tuning:
   groups; the group-count, length-spread, and minimum-size thresholds are
   controlled by the matching `_MAX_GROUPS`, `_MAX_SPREAD`, and `_MIN_SIZE`
   environment variables.
+- `TORCHINFERNO_OPENAI_SHARED_PREFIX_PADDED_SUFFIX_PREFILL` batches
+  high-variance shared-prefix suffix prefill with right padding before ragged
+  decode; `_MIN_GROUPS` and `_MIN_SPREAD` control when the padded path applies.
 - `TORCHINFERNO_OPENAI_PHASE_TIMINGS=1` records serving phase timings, and
   `TORCHINFERNO_OPENAI_PREFIX_CACHE_SHARED_SAMPLE=1` enables shared-prefix
   cache reuse for temperature sampling.

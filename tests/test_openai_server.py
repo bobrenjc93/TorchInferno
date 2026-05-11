@@ -994,6 +994,34 @@ def test_openai_shared_prefix_uses_dense_decode_for_low_variance_length_groups(m
     assert len(model.forward_inputs) == 7
 
 
+def test_openai_shared_prefix_padded_suffix_prefill_uses_true_lengths(monkeypatch) -> None:
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_PREFIX_CACHE_MIN_TOKENS", "2")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_SHARED_PREFIX_PADDED_SUFFIX_MIN_GROUPS", "2")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_SHARED_PREFIX_PADDED_SUFFIX_MIN_SPREAD", "1")
+    model = _TokenEchoSharedPrefixRecordingModel()
+    engine = _cache_only_engine()
+    engine.model = model
+    engine.stop_token_ids = frozenset()
+    engine._prefix_cache_entry = None
+    prompts = [[10, 11, 4, 6], [10, 11, 5]]
+
+    steps = list(
+        engine._generate_prompt_list_batch_steps(
+            prompts,
+            max_tokens=1,
+            temperature=0.0,
+            broadcast_tensor_parallel=False,
+        )
+    )
+
+    assert steps == [[6, 5]]
+    assert model.forward_inputs == [
+        [[10, 11]],
+        [[4, 6], [5, 0]],
+    ]
+    assert model.ragged_calls == []
+
+
 def test_openai_ragged_decode_skips_rows_after_per_request_max_tokens(monkeypatch) -> None:
     monkeypatch.setenv("TORCHINFERNO_OPENAI_PREFIX_CACHE_MIN_TOKENS", "2")
     model = _RaggedSharedPrefixRecordingModel()
@@ -1993,6 +2021,35 @@ class _RaggedSharedPrefixRecordingModel(_SharedPrefixRecordingModel):
         logits = torch.zeros(input_ids.size(0), 1, self.config.vocab_size)
         logits[..., token] = 1.0
         return logits
+
+
+class _TokenEchoSharedPrefixRecordingModel(_RaggedSharedPrefixRecordingModel):
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        *,
+        cache: _PrefixRecordingCache,
+        use_cache: bool,
+        return_last_logits_only: bool = False,
+    ):
+        del use_cache
+        self.forward_inputs.append([[int(token_id) for token_id in row.tolist()] for row in input_ids])
+        layer = cache.layers[0]
+        start = layer.seq_len
+        end = start + input_ids.size(1)
+        layer.keys[: input_ids.size(0), :, start:end, :].fill_(1)
+        layer.values[: input_ids.size(0), :, start:end, :].fill_(1)
+        layer.seq_len = end
+        tokens = 1 if return_last_logits_only else input_ids.size(1)
+        logits = torch.zeros(input_ids.size(0), tokens, self.config.vocab_size)
+        if return_last_logits_only:
+            for row, token_id in enumerate(input_ids[:, -1].tolist()):
+                logits[row, 0, int(token_id)] = 1.0
+        else:
+            for row in range(input_ids.size(0)):
+                for offset, token_id in enumerate(input_ids[row].tolist()):
+                    logits[row, offset, int(token_id)] = 1.0
+        return logits, cache
 
 
 class _NoBatchStepEngine(OpenAICompletionEngine):
