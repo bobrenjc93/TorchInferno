@@ -153,7 +153,12 @@ def test_openai_server_auto_launches_tensor_parallel_for_vanilla_provider(monkey
     )
 
     assert command[:3] == [sys.executable, "-m", "torch.distributed.run"]
-    assert "--standalone" in command
+    assert "--standalone" not in command
+    assert command[command.index("--rdzv-backend") + 1] == "c10d"
+    rdzv_endpoint = command[command.index("--rdzv-endpoint") + 1]
+    assert rdzv_endpoint.startswith("127.0.0.1:")
+    assert not rdzv_endpoint.endswith(":8000")
+    assert command[command.index("--rdzv-id") + 1].startswith("torchinferno-openai-")
     assert command[command.index("--nproc-per-node") + 1] == "8"
     assert command[command.index("torchinferno.openai_server") - 1] == "-m"
 

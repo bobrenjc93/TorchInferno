@@ -543,7 +543,8 @@ PYTHONPATH=src python3 -m torchinferno.cli openai-server-microbench \
 OpenAI serving also has explicit environment knobs for production-shape tuning:
 
 - `TORCHINFERNO_OPENAI_AUTO_TORCHRUN=0` disables automatic tensor-parallel
-  worker launch.
+  worker launch. `TORCHINFERNO_TORCHRUN_RDZV_ENDPOINT` overrides the loopback
+  rendezvous endpoint used by auto-launched workers.
 - `TORCHINFERNO_OPENAI_PREFIX_CACHE=0` disables the bounded OpenAI prefix KV
   cache; `TORCHINFERNO_OPENAI_PREFIX_CACHE_MIN_TOKENS`,
   `TORCHINFERNO_OPENAI_PREFIX_CACHE_MAX_TOKENS`,
