@@ -2477,6 +2477,15 @@ def _decode_linear(x: Tensor, weight: Tensor, weight_t: Tensor | None = None) ->
         if weight_t is not None:
             return torch.mm(x.reshape(1, -1), weight_t).view(1, 1, weight.size(0))
         return torch.mv(weight, x.reshape(-1)).view(1, 1, weight.size(0))
+    if (
+        x.is_cuda
+        and x.ndim == 3
+        and x.size(1) == 1
+        and weight_t is not None
+        and _tp_flag("TORCHINFERNO_DECODE_LINEAR_MM")
+        and x.size(0) <= _tp_int("TORCHINFERNO_DECODE_LINEAR_MM_MAX_BATCH", _DEFAULT_DECODE_STEP_MAX_BATCH, minimum=1)
+    ):
+        return torch.mm(x.reshape(-1, x.size(-1)), weight_t).view(x.size(0), 1, weight.size(0))
     return F.linear(x, weight)
 
 

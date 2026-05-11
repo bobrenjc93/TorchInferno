@@ -200,6 +200,20 @@ def test_decode_linear_uses_transposed_weight_layout() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
+def test_decode_linear_uses_transposed_weight_layout_for_decode_batches() -> None:
+    torch.manual_seed(48)
+    device = torch.device("cuda")
+    x = torch.randn(8, 1, 32, device=device, dtype=torch.bfloat16)
+    weight = torch.randn(48, 32, device=device, dtype=torch.bfloat16)
+    weight_t = weight.t().contiguous()
+
+    actual = _decode_linear(x, weight, weight_t)
+    expected = F.linear(x, weight)
+
+    torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
 def test_tensor_parallel_decode_graph_enabled_by_default(monkeypatch) -> None:
     monkeypatch.delenv("TORCHINFERNO_CUDAGRAPH_DECODE_STEP", raising=False)
     device = torch.device("cuda")
