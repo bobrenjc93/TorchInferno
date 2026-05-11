@@ -431,6 +431,35 @@ class _Llama3TensorParallelLayer:
         projected = self._mlp_project_decode_reduce(mlp_in)
         return _tp_decode_add_rms_norm(projected, residual, next_norm_weight, self.config.rms_norm_eps)
 
+    def forward_decode_ragged(
+        self,
+        hidden: Tensor,
+        attn_in: Tensor | None,
+        rotary: tuple[Tensor, Tensor],
+        cache: Llama3TensorParallelLayerKVCache,
+        cache_positions: Tensor,
+        row_indices: Tensor | None,
+        next_norm_weight: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        residual = hidden
+        attention = self._attention_decode_ragged(
+            hidden,
+            attn_in,
+            rotary,
+            cache,
+            cache_positions,
+            row_indices,
+        )
+        hidden, mlp_in = _tp_decode_add_rms_norm(
+            attention,
+            residual,
+            self.post_attention_layernorm_weight,
+            self.config.rms_norm_eps,
+        )
+        residual = hidden
+        projected = self._mlp_project_decode_reduce(mlp_in)
+        return _tp_decode_add_rms_norm(projected, residual, next_norm_weight, self.config.rms_norm_eps)
+
     def _attention_decode_static(
         self,
         hidden: Tensor,
@@ -469,6 +498,41 @@ class _Llama3TensorParallelLayer:
             out = triton_grouped_gqa_decode_attention(q, attention_keys, attention_values, attention_length)
         else:
             out = triton_dense_gqa_decode_attention(q, attention_keys, attention_values, seq_len=attention_length)
+        out = out.transpose(1, 2).contiguous().view(batch, tokens, self.local_hidden_size)
+        return self._decode_linear_all_reduce(out, self.o_proj_weight, "attention", self.o_proj_weight_decode)
+
+    def _attention_decode_ragged(
+        self,
+        hidden: Tensor,
+        attn_in: Tensor | None,
+        rotary: tuple[Tensor, Tensor],
+        cache: Llama3TensorParallelLayerKVCache,
+        cache_positions: Tensor,
+        row_indices: Tensor | None,
+    ) -> Tensor:
+        batch, tokens, _ = hidden.shape
+        if tokens != 1:
+            raise ValueError("ragged decode expects exactly one token")
+        if attn_in is None:
+            attn_in = _tp_decode_rms_norm(hidden, self.input_layernorm_weight, self.config.rms_norm_eps)
+        q, k, v = self._qkv(attn_in, batch, tokens, self.config.head_dim)
+        q, k = _apply_rotary_ragged(q, k, rotary)
+        _append_ragged_kv_cache(cache, k, v, cache_positions, row_indices)
+        attention_lengths = cache_positions + 1
+        if row_indices is None:
+            attention_keys = cache.keys[:batch]
+            attention_values = cache.values[:batch]
+        else:
+            attention_keys = cache.keys.index_select(0, row_indices)
+            attention_values = cache.values.index_select(0, row_indices)
+        enable_gqa = self.local_attention_heads != self.local_key_value_heads
+        out = _ragged_scaled_dot_product_attention(
+            q,
+            attention_keys,
+            attention_values,
+            attention_lengths,
+            enable_gqa=enable_gqa,
+        )
         out = out.transpose(1, 2).contiguous().view(batch, tokens, self.local_hidden_size)
         return self._decode_linear_all_reduce(out, self.o_proj_weight, "attention", self.o_proj_weight_decode)
 
@@ -1790,6 +1854,60 @@ class Llama3TensorParallelForCausalLM:
         return _decode_linear(attn_in, self.lm_head_weight, self.lm_head_weight_decode)
 
     @torch.inference_mode()
+    def decode_ragged_logits(
+        self,
+        input_ids: Tensor,
+        cache: Llama3TensorParallelCache,
+        *,
+        seq_lens: Tensor,
+        row_indices: Tensor | None = None,
+    ) -> Tensor:
+        if input_ids.ndim != 2 or input_ids.size(1) != 1:
+            raise ValueError("ragged decode expects input_ids with shape [batch, 1]")
+        if not cache.layers:
+            raise ValueError("ragged decode requires a non-empty KV cache")
+        input_ids = input_ids.to(self.device, non_blocking=True)
+        seq_lens = seq_lens.to(self.device, non_blocking=True)
+        if row_indices is not None:
+            row_indices = row_indices.to(self.device, non_blocking=True)
+            if row_indices.ndim != 1 or row_indices.numel() != input_ids.size(0):
+                raise ValueError("row_indices must have shape [batch]")
+            cache_positions = seq_lens.index_select(0, row_indices)
+        else:
+            cache_positions = seq_lens[: input_ids.size(0)]
+            if cache_positions.numel() != input_ids.size(0):
+                raise ValueError("seq_lens must cover the ragged decode batch")
+        if bool(torch.any(cache_positions < 0)):
+            raise ValueError("seq_lens must be non-negative")
+        if bool(torch.any(cache_positions >= cache.layers[0].max_seq_len)):
+            raise ValueError("KV cache capacity exceeded")
+
+        rotary = (
+            self.rotary_cos_cache.index_select(0, cache_positions),
+            self.rotary_sin_cache.index_select(0, cache_positions),
+        )
+        hidden = F.embedding(input_ids, self.embed_tokens_weight)
+        attn_in: Tensor | None = None
+        for layer_id, layer in enumerate(self.layers):
+            next_norm_weight = (
+                self.layers[layer_id + 1].input_layernorm_weight
+                if layer_id + 1 < len(self.layers)
+                else self.norm_weight
+            )
+            hidden, attn_in = layer.forward_decode_ragged(
+                hidden,
+                attn_in,
+                rotary,
+                cache.layers[layer_id],
+                cache_positions,
+                row_indices,
+                next_norm_weight,
+            )
+        if attn_in is None:
+            attn_in = _tp_decode_rms_norm(hidden, self.norm_weight, self.config.rms_norm_eps)
+        return _decode_linear(attn_in, self.lm_head_weight, self.lm_head_weight_decode)
+
+    @torch.inference_mode()
     def generate(
         self,
         input_ids: Tensor,
@@ -1986,6 +2104,13 @@ def _apply_rotary_cached(q: Tensor, k: Tensor, rotary: tuple[Tensor, Tensor]) ->
     return _rotate_llama(q, cos, sin), _rotate_llama(k, cos, sin)
 
 
+def _apply_rotary_ragged(q: Tensor, k: Tensor, rotary: tuple[Tensor, Tensor]) -> tuple[Tensor, Tensor]:
+    cos, sin = rotary
+    cos = cos[:, None, None, :]
+    sin = sin[:, None, None, :]
+    return _rotate_llama(q, cos, sin), _rotate_llama(k, cos, sin)
+
+
 def _rotate_llama(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
     if x.is_cuda and _tp_flag("TORCHINFERNO_COMPILE_ROTARY", False):
         compiled = _load_compiled_rotate_llama()
@@ -2024,6 +2149,46 @@ def _rotate_llama_eager(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
     x2 = x[..., half:]
     rotated = torch.cat((-x2, x1), dim=-1)
     return (x * cos) + (rotated * sin)
+
+
+def _append_ragged_kv_cache(
+    cache: Llama3TensorParallelLayerKVCache,
+    keys: Tensor,
+    values: Tensor,
+    positions: Tensor,
+    row_indices: Tensor | None,
+) -> None:
+    if keys.ndim != 4 or values.ndim != 4 or keys.size(2) != 1 or values.size(2) != 1:
+        raise ValueError("ragged KV append expects one token")
+    if row_indices is None:
+        rows = torch.arange(keys.size(0), device=keys.device, dtype=torch.long)
+    else:
+        rows = row_indices.to(device=keys.device, dtype=torch.long)
+    positions = positions.to(device=keys.device, dtype=torch.long)
+    cache.keys[rows, :, positions, :] = keys[:, :, 0, :]
+    cache.values[rows, :, positions, :] = values[:, :, 0, :]
+
+
+def _ragged_scaled_dot_product_attention(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    attention_lengths: Tensor,
+    *,
+    enable_gqa: bool,
+) -> Tensor:
+    max_seq_len = k.size(2)
+    key_positions = torch.arange(max_seq_len, device=q.device)
+    mask = key_positions[None, :] < attention_lengths.to(device=q.device)[:, None]
+    return F.scaled_dot_product_attention(
+        q,
+        k,
+        v,
+        attn_mask=mask[:, None, None, :],
+        dropout_p=0.0,
+        is_causal=False,
+        enable_gqa=enable_gqa,
+    )
 
 
 def _decode_linear(x: Tensor, weight: Tensor, weight_t: Tensor | None = None) -> Tensor:

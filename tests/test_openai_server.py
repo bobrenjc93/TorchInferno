@@ -916,6 +916,59 @@ def test_openai_engine_batches_variable_length_shared_prefix_suffixes(monkeypatc
     ]
 
 
+def test_openai_engine_ragged_decodes_variable_length_shared_prefix_suffixes(monkeypatch) -> None:
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_PREFIX_CACHE_MIN_TOKENS", "2")
+    model = _RaggedSharedPrefixRecordingModel()
+    tokenizer = _SharedPrefixTokenizer(parties=2)
+    engine = OpenAICompletionEngine(
+        model,
+        tokenizer,
+        model_id="tiny",
+        device=torch.device("cpu"),
+        max_batch_size=4,
+        batch_wait_ms=50.0,
+    )
+    barrier = threading.Barrier(3)
+    results: list[list[int] | None] = [None, None]
+
+    def run(index: int, content: str) -> None:
+        barrier.wait()
+        results[index] = list(
+            engine.generate_chat_tokens(
+                [{"role": "user", "content": content}],
+                max_tokens=3,
+                temperature=0.0,
+            )
+        )
+
+    threads = [
+        threading.Thread(target=run, args=(0, "left")),
+        threading.Thread(target=run, args=(1, "long")),
+    ]
+    for thread in threads:
+        thread.start()
+    barrier.wait()
+    for thread in threads:
+        thread.join(timeout=10)
+    engine.close()
+
+    assert results == [[2, 3, 4], [2, 3, 4]]
+    assert model.forward_inputs == [
+        [[10, 11]],
+        [[13, 14]],
+        [[12]],
+    ]
+    assert len(model.ragged_calls) == 2
+    first_input, first_lengths, first_rows = model.ragged_calls[0]
+    second_input, second_lengths, second_rows = model.ragged_calls[1]
+    assert first_input == [[2], [2]]
+    assert sorted(first_lengths) == [3, 4]
+    assert first_rows is None
+    assert second_input == [[3], [3]]
+    assert sorted(second_lengths) == [4, 5]
+    assert second_rows is None
+
+
 def test_openai_engine_can_disable_prefix_cache_for_tensor_parallel(monkeypatch) -> None:
     model = _PrefixRecordingModel()
     engine = _cache_only_engine()
@@ -1754,6 +1807,34 @@ class _SharedPrefixRecordingModel:
         logits = torch.zeros(input_ids.size(0), tokens, self.config.vocab_size)
         logits[..., 2] = 1.0
         return logits, cache
+
+
+class _RaggedSharedPrefixRecordingModel(_SharedPrefixRecordingModel):
+    def __init__(self) -> None:
+        super().__init__()
+        self.ragged_calls: list[tuple[list[list[int]], list[int], list[int] | None]] = []
+
+    def decode_ragged_logits(
+        self,
+        input_ids: torch.Tensor,
+        cache: _PrefixRecordingCache,
+        *,
+        seq_lens: torch.Tensor,
+        row_indices: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        del cache
+        row_list = None if row_indices is None else [int(index) for index in row_indices.tolist()]
+        self.ragged_calls.append(
+            (
+                [[int(token_id) for token_id in row.tolist()] for row in input_ids],
+                [int(seq_len) for seq_len in seq_lens.tolist()],
+                row_list,
+            )
+        )
+        token = 2 + len(self.ragged_calls)
+        logits = torch.zeros(input_ids.size(0), 1, self.config.vocab_size)
+        logits[..., token] = 1.0
+        return logits
 
 
 class _NoBatchStepEngine(OpenAICompletionEngine):

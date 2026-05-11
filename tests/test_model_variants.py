@@ -204,6 +204,91 @@ def test_llama3_pipeline_loads_hf_shaped_checkpoint_and_matches_v0(tmp_path) -> 
     assert torch.equal(tp_generated.cpu(), expected_generated)
 
 
+def test_llama3_tensor_parallel_ragged_decode_matches_independent_decode(tmp_path) -> None:
+    torch.manual_seed(1234)
+    config = tiny_llama3_config(vocab_size=32, max_position_embeddings=16)
+    reference = Llama3V0ForCausalLM(config).eval()
+    _write_tiny_llama3_hf_checkpoint(reference, config, tmp_path)
+    model = Llama3TensorParallelForCausalLM.from_pretrained(tmp_path, dtype="float32").eval()
+    prompts = (
+        torch.tensor([[1, 2, 3]], dtype=torch.long),
+        torch.tensor([[1, 2, 3, 4, 5]], dtype=torch.long),
+    )
+    decode_tokens = torch.tensor([[6], [7]], dtype=torch.long)
+    combined_cache = model.allocate_cache(2, 8)
+    expected_logits = []
+    seq_lens = []
+
+    with torch.inference_mode():
+        for row, prompt in enumerate(prompts):
+            row_cache = model.allocate_cache(1, 8)
+            _, row_cache = model.forward(
+                prompt,
+                cache=row_cache,
+                use_cache=True,
+                return_last_logits_only=True,
+                return_sharded_logits=True,
+            )
+            seq_len = prompt.size(1)
+            seq_lens.append(seq_len)
+            for source_layer, target_layer in zip(row_cache.layers, combined_cache.layers):
+                target_layer.keys[row : row + 1, :, :seq_len, :].copy_(source_layer.keys[:, :, :seq_len, :])
+                target_layer.values[row : row + 1, :, :seq_len, :].copy_(source_layer.values[:, :, :seq_len, :])
+            logits, _ = model.forward(
+                decode_tokens[row : row + 1],
+                cache=row_cache,
+                use_cache=True,
+                return_last_logits_only=True,
+                return_sharded_logits=True,
+            )
+            expected_logits.append(logits)
+        for layer in combined_cache.layers:
+            layer.seq_len = max(seq_lens)
+        actual = model.decode_ragged_logits(
+            decode_tokens,
+            combined_cache,
+            seq_lens=torch.tensor(seq_lens, dtype=torch.long),
+        )
+
+    torch.testing.assert_close(actual, torch.cat(expected_logits, dim=0), atol=1e-5, rtol=1e-5)
+
+
+def _write_tiny_llama3_hf_checkpoint(reference: Llama3V0ForCausalLM, config, path) -> None:
+    state = reference.state_dict()
+    hf_state = {
+        "model.embed_tokens.weight": state["embed_tokens.weight"],
+        "model.norm.weight": state["norm.weight"],
+        "lm_head.weight": state["lm_head.weight"],
+    }
+    for layer_id in range(config.num_hidden_layers):
+        prefix = f"layers.{layer_id}."
+        hf_prefix = f"model.layers.{layer_id}."
+        for suffix in (
+            "input_layernorm.weight",
+            "post_attention_layernorm.weight",
+            "self_attn.q_proj.weight",
+            "self_attn.k_proj.weight",
+            "self_attn.v_proj.weight",
+            "self_attn.o_proj.weight",
+            "mlp.gate_proj.weight",
+            "mlp.up_proj.weight",
+            "mlp.down_proj.weight",
+        ):
+            hf_state[hf_prefix + suffix] = state[prefix + suffix]
+
+    save_file(hf_state, path / "model-00001-of-00001.safetensors")
+    (path / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "metadata": {"total_size": sum(tensor.numel() * tensor.element_size() for tensor in hf_state.values())},
+                "weight_map": {name: "model-00001-of-00001.safetensors" for name in hf_state},
+            }
+        )
+        + "\n"
+    )
+    (path / "config.json").write_text(json.dumps(config.to_dict()) + "\n")
+
+
 def _llama_rotate_half_reference(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
     half = x.size(-1) // 2
     rotated = torch.cat((-x[..., half:], x[..., :half]), dim=-1)

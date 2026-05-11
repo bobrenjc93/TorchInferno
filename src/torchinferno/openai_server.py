@@ -1709,6 +1709,28 @@ class OpenAICompletionEngine:
         if not should_continue:
             return
 
+        if _ragged_decode_enabled_for_model(model):
+            combined_cache = self._shared_prefix_prompt_list_ragged_cache(
+                states,
+                prompt_lengths=[len(prompt) for prompt in prompts],
+                prompt_count=len(prompts),
+                max_tokens=max_tokens,
+                model=model,
+            )
+            if combined_cache is not None:
+                yield from self._decode_shared_prefix_prompt_list_ragged(
+                    cache=combined_cache,
+                    active=[
+                        token_id is not None and int(token_id) not in stop_token_ids
+                        for token_id in first_tokens
+                    ],
+                    prompt_lengths=[len(prompt) for prompt in prompts],
+                    max_tokens=max_tokens,
+                    next_tokens=first_tokens,
+                    temperature=temperature,
+                )
+                return
+
         for _ in range(1, max_tokens):
             step_tokens: list[int | None] = [None for _ in prompts]
             emitted = False
@@ -1739,6 +1761,98 @@ class OpenAICompletionEngine:
                     emitted = True
             if not emitted:
                 break
+            yield step_tokens
+
+    def _shared_prefix_prompt_list_ragged_cache(
+        self,
+        states: Sequence[Mapping[str, object]],
+        *,
+        prompt_lengths: Sequence[int],
+        prompt_count: int,
+        max_tokens: int,
+        model: object,
+    ) -> object | None:
+        if prompt_count <= 0:
+            return None
+        max_prompt_len = max(prompt_lengths, default=0)
+        if max_prompt_len <= 0:
+            return None
+        cache = self._generation_cache(
+            prompt_count,
+            max_prompt_len + max_tokens,
+            model=model,
+        )
+        try:
+            for state in states:
+                source_cache = state.get("cache")
+                indices = state.get("indices")
+                if source_cache is None or not isinstance(indices, list):
+                    return None
+                for source_row, original_index in enumerate(indices):
+                    _copy_generation_cache_row(
+                        source_cache,
+                        cache,
+                        source_row=source_row,
+                        target_row=int(original_index),
+                        seq_len=int(prompt_lengths[int(original_index)]),
+                    )
+            _set_generation_cache_seq_len(cache, max_prompt_len)
+        except Exception as exc:
+            warn_optional_failure("openai.shared_prefix_ragged_cache", exc)
+            return None
+        return cache
+
+    def _decode_shared_prefix_prompt_list_ragged(
+        self,
+        *,
+        cache: object,
+        active: list[bool],
+        prompt_lengths: Sequence[int],
+        max_tokens: int,
+        next_tokens: Sequence[int | None],
+        temperature: float,
+    ) -> Iterator[list[int | None]]:
+        model = self.model
+        if max_tokens <= 1 or not any(active):
+            return
+        seq_lens = torch.tensor(prompt_lengths, dtype=torch.long, device=self.device)
+        next_token_tensor = torch.tensor(
+            [0 if token_id is None else int(token_id) for token_id in next_tokens],
+            dtype=torch.long,
+            device=self.device,
+        )
+        for _ in range(1, max_tokens):
+            active_indices = [index for index, is_active in enumerate(active) if is_active]
+            should_decode = _sync_tensor_parallel_continue(model, bool(active_indices), self.device)
+            if not should_decode:
+                break
+            if len(active_indices) == len(active):
+                decode_input = next_token_tensor[:, None]
+                row_indices = None
+            else:
+                row_indices = torch.tensor(active_indices, dtype=torch.long, device=self.device)
+                decode_input = next_token_tensor.index_select(0, row_indices)[:, None]
+            next_token, cache = _decode_next_token_ragged(
+                model,
+                decode_input,
+                cache,
+                seq_lens,
+                row_indices,
+                temperature,
+            )
+            next_token = next_token.to(self.device)
+            if row_indices is None:
+                seq_lens += 1
+            else:
+                seq_lens[row_indices] = seq_lens.index_select(0, row_indices) + 1
+            step_tokens: list[int | None] = [None for _ in active]
+            for offset, token_id in enumerate(next_token.detach().cpu().tolist()):
+                original_index = active_indices[offset]
+                token_id = int(token_id)
+                next_token_tensor[original_index] = token_id
+                step_tokens[original_index] = token_id
+                if token_id in self.stop_token_ids:
+                    active[original_index] = False
             yield step_tokens
 
     @torch.inference_mode()
@@ -2360,6 +2474,28 @@ def _decode_next_token(
     return _sample(model, graph_logits[:, -1, :], temperature), cache
 
 
+def _decode_next_token_ragged(
+    model: object,
+    input_ids: Tensor,
+    cache: object,
+    seq_lens: Tensor,
+    row_indices: Tensor | None,
+    temperature: float,
+) -> tuple[Tensor, object]:
+    decode = getattr(model, "decode_ragged_logits", None)
+    if decode is None:
+        raise RuntimeError("model does not support ragged decode")
+    logits = decode(input_ids, cache, seq_lens=seq_lens, row_indices=row_indices)
+    return _sample(model, logits[:, -1, :], temperature), cache
+
+
+def _ragged_decode_enabled_for_model(model: object) -> bool:
+    return (
+        env_flag("TORCHINFERNO_OPENAI_RAGGED_DECODE", True)
+        and callable(getattr(model, "decode_ragged_logits", None))
+    )
+
+
 def _repeat_generation_cache_first_batch(cache: object, batch_size: int) -> None:
     if batch_size <= 1:
         return
@@ -2493,6 +2629,43 @@ def _copy_generation_cache_first_row(source: object, target: object, batch_size:
             source_values[:1, :, :seq_len, :].expand(batch_size, -1, -1, -1)
         )
         target_layer.seq_len = seq_len
+
+
+def _copy_generation_cache_row(
+    source: object,
+    target: object,
+    *,
+    source_row: int,
+    target_row: int,
+    seq_len: int,
+) -> None:
+    if seq_len <= 0:
+        return
+    for source_layer, target_layer in zip(
+        getattr(source, "layers", ()) or (),
+        getattr(target, "layers", ()) or (),
+    ):
+        source_keys = getattr(source_layer, "keys", None)
+        source_values = getattr(source_layer, "values", None)
+        target_keys = getattr(target_layer, "keys", None)
+        target_values = getattr(target_layer, "values", None)
+        if not all(isinstance(tensor, Tensor) for tensor in (source_keys, source_values, target_keys, target_values)):
+            raise RuntimeError("cannot copy ragged cache row for non-tensor KV layer")
+        if source_keys.size(0) <= source_row or source_values.size(0) <= source_row:
+            raise RuntimeError("source ragged cache row is out of range")
+        if target_keys.size(0) <= target_row or target_values.size(0) <= target_row:
+            raise RuntimeError("target ragged cache row is out of range")
+        if source_keys.size(2) < seq_len or source_values.size(2) < seq_len:
+            raise RuntimeError("source ragged cache row is shorter than requested")
+        if target_keys.size(2) < seq_len or target_values.size(2) < seq_len:
+            raise RuntimeError("target ragged cache row is shorter than requested")
+        target_keys[target_row : target_row + 1, :, :seq_len, :].copy_(
+            source_keys[source_row : source_row + 1, :, :seq_len, :]
+        )
+        target_values[target_row : target_row + 1, :, :seq_len, :].copy_(
+            source_values[source_row : source_row + 1, :, :seq_len, :]
+        )
+        target_layer.seq_len = max(int(getattr(target_layer, "seq_len", 0)), seq_len)
 
 
 def _tokens_not_in_stop(tokens: Tensor, stop_token_ids: frozenset[int]) -> Tensor:
