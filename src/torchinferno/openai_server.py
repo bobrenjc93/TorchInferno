@@ -2560,6 +2560,15 @@ def _decode_next_token_ragged(
     row_indices: Tensor | None,
     temperature: float,
 ) -> tuple[Tensor, object]:
+    graph_logits = _try_decode_ragged_logits_graph(
+        model,
+        input_ids,
+        cache,
+        seq_lens=seq_lens,
+        row_indices=row_indices,
+    )
+    if graph_logits is not None:
+        return _sample(model, graph_logits[:, -1, :], temperature), cache
     decode = getattr(model, "decode_ragged_logits", None)
     if decode is None:
         raise RuntimeError("model does not support ragged decode")
@@ -2825,6 +2834,22 @@ def _try_decode_one_token_logits_graph(
     if decode_graph is None:
         return None
     return decode_graph(input_ids, cache)
+
+
+def _try_decode_ragged_logits_graph(
+    model: object,
+    input_ids: Tensor,
+    cache: object,
+    *,
+    seq_lens: Tensor,
+    row_indices: Tensor | None,
+) -> Tensor | None:
+    if not _openai_decode_graph_enabled(model):
+        return None
+    decode_graph = getattr(model, "try_decode_ragged_logits_graph", None)
+    if decode_graph is None:
+        return None
+    return decode_graph(input_ids, cache, seq_lens=seq_lens, row_indices=row_indices)
 
 
 def _openai_decode_graph_enabled(model: object) -> bool:

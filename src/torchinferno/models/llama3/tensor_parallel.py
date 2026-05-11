@@ -180,6 +180,19 @@ class _StaticDecodeLogitsGraphCall:
 
 
 @dataclass
+class _StaticRaggedDecodeLogitsGraphCall:
+    graph: torch.cuda.CUDAGraph
+    static_input_ids: Tensor
+    static_cache_positions: Tensor
+    static_row_indices: Tensor | None
+    static_rotary_cos: Tensor
+    static_rotary_sin: Tensor
+    output_logits: Tensor
+    cache: Llama3TensorParallelCache
+    max_seq_len: int
+
+
+@dataclass
 class _StaticPrefillGraphCall:
     graph: torch.cuda.CUDAGraph
     static_input_ids: Tensor
@@ -1179,8 +1192,13 @@ class Llama3TensorParallelForCausalLM:
         self._prefill_logits_graph_failed = False
         self._decode_graphs: dict[tuple[int, int, int], _StaticDecodeGraphCall] = {}
         self._decode_logits_graphs: dict[tuple[int, int, int], _StaticDecodeLogitsGraphCall] = {}
+        self._ragged_decode_logits_graphs: dict[
+            tuple[int, int, int, bool],
+            _StaticRaggedDecodeLogitsGraphCall,
+        ] = {}
         self._decode_graph_failed = False
         self._decode_logits_graph_failed = False
+        self._ragged_decode_logits_graph_failed = False
         self._temperature_gumbel_generators: dict[str, torch.Generator] = {}
 
     @classmethod
@@ -1660,6 +1678,35 @@ class Llama3TensorParallelForCausalLM:
             self._decode_logits_graph_failed = True
             return None
 
+    def try_decode_ragged_logits_graph(
+        self,
+        input_ids: Tensor,
+        cache: Llama3TensorParallelCache,
+        *,
+        seq_lens: Tensor,
+        row_indices: Tensor | None = None,
+    ) -> Tensor | None:
+        if self._ragged_decode_logits_graph_failed or not _should_use_ragged_decode_logits_graph(
+            input_ids,
+            cache,
+            seq_lens,
+            row_indices,
+        ):
+            return None
+        try:
+            return self._run_ragged_decode_logits_graph(
+                input_ids,
+                cache,
+                seq_lens=seq_lens,
+                row_indices=row_indices,
+            )
+        except Exception as exc:
+            warn_optional_failure("llama3_tensor_parallel.ragged_decode_logits_graph", exc)
+            if _tp_flag("TORCHINFERNO_CUDAGRAPH_DECODE_DEBUG", False):
+                print(f"rank={self.rank} ragged_decode_logits_graph_failed={exc!r}", flush=True)
+            self._ragged_decode_logits_graph_failed = True
+            return None
+
     def _run_decode_step_graph(self, input_ids: Tensor, cache: Llama3TensorParallelCache) -> Tensor:
         if cache.seq_len >= cache.layers[0].max_seq_len:
             raise ValueError("KV cache capacity exceeded")
@@ -1755,6 +1802,116 @@ class Llama3TensorParallelForCausalLM:
             captured.graph.replay()
         self._advance_decode_graph_cache(cache)
         return captured.output_logits
+
+    def _run_ragged_decode_logits_graph(
+        self,
+        input_ids: Tensor,
+        cache: Llama3TensorParallelCache,
+        *,
+        seq_lens: Tensor,
+        row_indices: Tensor | None,
+    ) -> Tensor:
+        if not cache.layers:
+            raise ValueError("ragged decode requires a non-empty KV cache")
+        key = (
+            id(cache),
+            input_ids.size(0),
+            cache.layers[0].max_seq_len,
+            row_indices is not None,
+        )
+        captured = self._ragged_decode_logits_graphs.get(key)
+        if (
+            captured is None
+            or captured.cache is not cache
+            or captured.max_seq_len != cache.layers[0].max_seq_len
+            or captured.static_input_ids.shape != input_ids.shape
+            or (captured.static_row_indices is None) != (row_indices is None)
+        ):
+            captured = self._capture_ragged_decode_logits_graph(input_ids, cache, seq_lens, row_indices)
+        else:
+            self._copy_ragged_decode_graph_inputs(captured, input_ids, seq_lens, row_indices)
+            captured.graph.replay()
+        return captured.output_logits
+
+    def _capture_ragged_decode_logits_graph(
+        self,
+        input_ids: Tensor,
+        cache: Llama3TensorParallelCache,
+        seq_lens: Tensor,
+        row_indices: Tensor | None,
+    ) -> _StaticRaggedDecodeLogitsGraphCall:
+        batch = input_ids.size(0)
+        rotary_cache_dim = self.rotary_cos_cache.size(1)
+        static_row_indices = torch.empty_like(row_indices) if row_indices is not None else None
+        captured = _StaticRaggedDecodeLogitsGraphCall(
+            graph=torch.cuda.CUDAGraph(),
+            static_input_ids=torch.empty_like(input_ids),
+            static_cache_positions=torch.empty((batch,), device=self.device, dtype=torch.int64),
+            static_row_indices=static_row_indices,
+            static_rotary_cos=torch.empty((batch, rotary_cache_dim), device=self.device, dtype=self.dtype),
+            static_rotary_sin=torch.empty((batch, rotary_cache_dim), device=self.device, dtype=self.dtype),
+            output_logits=torch.empty(
+                (batch, 1, self.local_vocab_size),
+                device=self.device,
+                dtype=self.dtype,
+            ),
+            cache=cache,
+            max_seq_len=cache.layers[0].max_seq_len,
+        )
+        self._copy_ragged_decode_graph_inputs(captured, input_ids, seq_lens, row_indices)
+        stream = torch.cuda.Stream(device=self.device)
+        stream.wait_stream(torch.cuda.current_stream(self.device))
+        with torch.cuda.stream(stream):
+            self._forward_decode_ragged_static(
+                captured.static_input_ids,
+                cache,
+                captured.static_cache_positions,
+                captured.static_row_indices,
+                (captured.static_rotary_cos, captured.static_rotary_sin),
+            )
+        torch.cuda.current_stream(self.device).wait_stream(stream)
+        with torch.cuda.graph(captured.graph):
+            captured.output_logits = self._forward_decode_ragged_static(
+                captured.static_input_ids,
+                cache,
+                captured.static_cache_positions,
+                captured.static_row_indices,
+                (captured.static_rotary_cos, captured.static_rotary_sin),
+            )
+        captured.graph.replay()
+        key = (
+            id(cache),
+            input_ids.size(0),
+            cache.layers[0].max_seq_len,
+            row_indices is not None,
+        )
+        max_graphs = _tp_int("TORCHINFERNO_CUDAGRAPH_DECODE_STEP_MAX_GRAPHS", 4096, minimum=1)
+        if key not in self._ragged_decode_logits_graphs and len(self._ragged_decode_logits_graphs) >= max_graphs:
+            self._ragged_decode_logits_graphs.clear()
+        self._ragged_decode_logits_graphs[key] = captured
+        return captured
+
+    def _copy_ragged_decode_graph_inputs(
+        self,
+        captured: _StaticRaggedDecodeLogitsGraphCall,
+        input_ids: Tensor,
+        seq_lens: Tensor,
+        row_indices: Tensor | None,
+    ) -> None:
+        input_ids = input_ids.to(self.device, non_blocking=True)
+        seq_lens = seq_lens.to(self.device, non_blocking=True)
+        if row_indices is None:
+            cache_positions = seq_lens[: input_ids.size(0)]
+        else:
+            row_indices = row_indices.to(self.device, non_blocking=True)
+            if captured.static_row_indices is None:
+                raise RuntimeError("captured ragged decode graph does not accept row indices")
+            captured.static_row_indices.copy_(row_indices)
+            cache_positions = seq_lens.index_select(0, row_indices)
+        captured.static_input_ids.copy_(input_ids)
+        captured.static_cache_positions.copy_(cache_positions)
+        captured.static_rotary_cos.copy_(self.rotary_cos_cache.index_select(0, cache_positions))
+        captured.static_rotary_sin.copy_(self.rotary_sin_cache.index_select(0, cache_positions))
 
     def _capture_decode_step_logits_graph(
         self,
@@ -1873,6 +2030,35 @@ class Llama3TensorParallelForCausalLM:
                 cache_position,
                 attention_length,
                 attention_block_size,
+                next_norm_weight,
+            )
+        if attn_in is None:
+            attn_in = _tp_decode_rms_norm(hidden, self.norm_weight, self.config.rms_norm_eps)
+        return _decode_linear(attn_in, self.lm_head_weight, self.lm_head_weight_decode)
+
+    def _forward_decode_ragged_static(
+        self,
+        input_ids: Tensor,
+        cache: Llama3TensorParallelCache,
+        cache_positions: Tensor,
+        row_indices: Tensor | None,
+        rotary: tuple[Tensor, Tensor],
+    ) -> Tensor:
+        hidden = F.embedding(input_ids.to(self.device, non_blocking=True), self.embed_tokens_weight)
+        attn_in: Tensor | None = None
+        for layer_id, layer in enumerate(self.layers):
+            next_norm_weight = (
+                self.layers[layer_id + 1].input_layernorm_weight
+                if layer_id + 1 < len(self.layers)
+                else self.norm_weight
+            )
+            hidden, attn_in = layer.forward_decode_ragged(
+                hidden,
+                attn_in,
+                rotary,
+                cache.layers[layer_id],
+                cache_positions,
+                row_indices,
                 next_norm_weight,
             )
         if attn_in is None:
@@ -2427,6 +2613,26 @@ def _should_use_decode_step_logits_graph(
         and input_ids.ndim == 2
         and 1 <= input_ids.size(0) <= _decode_step_max_batch()
         and input_ids.size(1) == 1
+        and bool(cache.layers)
+        and cache.layers[0].keys.is_cuda
+    )
+
+
+def _should_use_ragged_decode_logits_graph(
+    input_ids: Tensor,
+    cache: Llama3TensorParallelCache,
+    seq_lens: Tensor,
+    row_indices: Tensor | None,
+) -> bool:
+    return (
+        _tp_flag("TORCHINFERNO_CUDAGRAPH_RAGGED_DECODE_STEP", True)
+        and input_ids.is_cuda
+        and input_ids.ndim == 2
+        and 1 <= input_ids.size(0) <= _decode_step_max_batch()
+        and input_ids.size(1) == 1
+        and seq_lens.is_cuda
+        and seq_lens.ndim == 1
+        and (row_indices is None or (row_indices.is_cuda and row_indices.shape == (input_ids.size(0),)))
         and bool(cache.layers)
         and cache.layers[0].keys.is_cuda
     )

@@ -30,6 +30,7 @@ from torchinferno.openai_server import (
     _sync_tensor_parallel_command,
     _sync_tensor_parallel_continue,
     _tensor_parallel_worker_loop,
+    _try_decode_ragged_logits_graph,
     _try_decode_one_token_graph,
     _try_decode_one_token_logits_graph,
     _try_prefill_graph,
@@ -1386,6 +1387,7 @@ def test_openai_tensor_parallel_enables_cuda_graphs_by_default(monkeypatch) -> N
         prefill_logits_graph_calls = 0
         decode_graph_calls = 0
         decode_logits_graph_calls = 0
+        ragged_decode_logits_graph_calls = 0
 
         def try_prefill_graph(self, *args, **kwargs):  # noqa: ANN002, ANN003
             self.prefill_graph_calls += 1
@@ -1403,6 +1405,10 @@ def test_openai_tensor_parallel_enables_cuda_graphs_by_default(monkeypatch) -> N
             self.decode_logits_graph_calls += 1
             return None
 
+        def try_decode_ragged_logits_graph(self, *args, **kwargs):  # noqa: ANN002, ANN003
+            self.ragged_decode_logits_graph_calls += 1
+            return None
+
     model = GraphProbeModel()
     monkeypatch.setattr(
         "torchinferno.openai_server._is_tensor_parallel_model",
@@ -1417,10 +1423,18 @@ def test_openai_tensor_parallel_enables_cuda_graphs_by_default(monkeypatch) -> N
     assert _try_prefill_logits_graph(model, input_ids, cache) is None
     assert _try_decode_one_token_graph(model, input_ids, cache, 0.0) is None
     assert _try_decode_one_token_logits_graph(model, input_ids, cache) is None
+    assert _try_decode_ragged_logits_graph(
+        model,
+        input_ids,
+        cache,
+        seq_lens=torch.tensor([1]),
+        row_indices=None,
+    ) is None
     assert model.prefill_graph_calls == 1
     assert model.prefill_logits_graph_calls == 1
     assert model.decode_graph_calls == 1
     assert model.decode_logits_graph_calls == 1
+    assert model.ragged_decode_logits_graph_calls == 1
 
 
 def test_openai_tensor_parallel_cuda_graphs_can_be_disabled(monkeypatch) -> None:
@@ -1441,6 +1455,9 @@ def test_openai_tensor_parallel_cuda_graphs_can_be_disabled(monkeypatch) -> None
         def try_decode_one_token_logits_graph(self, *args, **kwargs):  # noqa: ANN002, ANN003
             raise AssertionError("decode logits graph should be disabled for TP serving")
 
+        def try_decode_ragged_logits_graph(self, *args, **kwargs):  # noqa: ANN002, ANN003
+            raise AssertionError("ragged decode logits graph should be disabled for TP serving")
+
     model = GraphProbeModel()
     monkeypatch.setattr(
         "torchinferno.openai_server._is_tensor_parallel_model",
@@ -1455,6 +1472,13 @@ def test_openai_tensor_parallel_cuda_graphs_can_be_disabled(monkeypatch) -> None
     assert _try_prefill_logits_graph(model, input_ids, cache) is None
     assert _try_decode_one_token_graph(model, input_ids, cache, 0.0) is None
     assert _try_decode_one_token_logits_graph(model, input_ids, cache) is None
+    assert _try_decode_ragged_logits_graph(
+        model,
+        input_ids,
+        cache,
+        seq_lens=torch.tensor([1]),
+        row_indices=None,
+    ) is None
 
 
 def test_openai_microbench_cli_runs_synthetic_cases() -> None:
