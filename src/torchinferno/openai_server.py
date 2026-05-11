@@ -1063,7 +1063,7 @@ class OpenAICompletionEngine:
         entries = self._prefix_cache_entry_map()
         entries.pop(entry.tokens, None)
         entries[entry.tokens] = entry
-        max_entries = env_int("TORCHINFERNO_OPENAI_PREFIX_CACHE_MAX_ENTRIES", 64, minimum=1)
+        max_entries = env_int("TORCHINFERNO_OPENAI_PREFIX_CACHE_MAX_ENTRIES", 128, minimum=1)
         while len(entries) > max_entries:
             entries.pop(next(iter(entries)))
 
