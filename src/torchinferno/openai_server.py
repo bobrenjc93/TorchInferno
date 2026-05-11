@@ -2822,7 +2822,7 @@ def _prefer_shared_prefix_dense_group_decode(
     *,
     prompt_lengths: Sequence[int],
 ) -> bool:
-    if not env_flag("TORCHINFERNO_OPENAI_SHARED_PREFIX_DENSE_GROUP_DECODE", True):
+    if not env_flag("TORCHINFERNO_OPENAI_SHARED_PREFIX_DENSE_GROUP_DECODE"):
         return False
     if len(length_groups) <= 1 or not prompt_lengths:
         return False

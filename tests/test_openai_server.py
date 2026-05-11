@@ -1076,6 +1076,7 @@ def test_openai_engine_ragged_decodes_variable_length_shared_prefix_suffixes(mon
 
 def test_openai_shared_prefix_uses_dense_decode_for_low_variance_length_groups(monkeypatch) -> None:
     monkeypatch.setenv("TORCHINFERNO_OPENAI_PREFIX_CACHE_MIN_TOKENS", "2")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_SHARED_PREFIX_DENSE_GROUP_DECODE", "1")
     model = _RaggedSharedPrefixRecordingModel()
     engine = _cache_only_engine()
     engine.model = model
