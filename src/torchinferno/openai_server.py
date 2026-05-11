@@ -169,6 +169,7 @@ class _TransformersChatTokenizer:
         encoded = self.tokenizer.encode(text, add_special_tokens=False)  # type: ignore[attr-defined]
         return [int(token_id) for token_id in encoded] or [self.eos_token_id or 0]
 
+    @lru_cache(maxsize=8192)
     def decode_token(self, token_id: int) -> str:
         return str(self.tokenizer.decode([int(token_id)], skip_special_tokens=True))  # type: ignore[attr-defined]
 
