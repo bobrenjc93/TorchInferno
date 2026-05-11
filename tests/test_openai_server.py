@@ -180,7 +180,7 @@ def test_openai_server_warmup_uses_generic_shape_buckets(monkeypatch) -> None:
     assert prefix_suffix_counts == {(32, 16), (64, 16), (128, 32), (256, 32)}
     assert set(_warmup_prefix_suffix_cache_token_counts()) >= {128, 256, 512, 1024}
     assert set(_warmup_temperature_prompt_token_counts()) == {32, 55, 64}
-    assert 8 in set(_warmup_temperature_batch_sizes())
+    assert set(_warmup_temperature_batch_sizes()) >= {1, 8, 16, 64}
 
 
 def test_openai_temperature_warmup_uses_configured_batch_size(monkeypatch) -> None:

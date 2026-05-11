@@ -7,5 +7,5 @@ def test_temperature_warmup_covers_self_consistency_batch(monkeypatch) -> None:
     monkeypatch.delenv("TORCHINFERNO_OPENAI_WARMUP_TEMPERATURE_BATCH_SIZES", raising=False)
     monkeypatch.delenv("TORCHINFERNO_OPENAI_WARMUP_TEMPERATURE_PROMPT_TOKEN_BUCKETS", raising=False)
 
-    assert 16 in set(warmup_temperature_batch_sizes())
+    assert 64 in set(warmup_temperature_batch_sizes())
     assert 55 in set(warmup_temperature_prompt_token_counts())

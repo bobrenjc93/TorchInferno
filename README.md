@@ -563,7 +563,7 @@ OpenAI serving also has explicit environment knobs for production-shape tuning:
   `TORCHINFERNO_OPENAI_WARMUP_PREFIX_SUFFIX_CACHE_TOKENS`,
   `TORCHINFERNO_OPENAI_WARMUP_TEMPERATURE_PROMPT_TOKEN_BUCKETS`, and
   `TORCHINFERNO_OPENAI_WARMUP_TEMPERATURE_BATCH_SIZES` override graph-warmup
-  shape buckets. Temperature warmup batches cover `1`, `8`, and `16` by
+  shape buckets. Temperature warmup batches cover `1`, `8`, `16`, and `64` by
   default.
 - `TORCHINFERNO_OPENAI_STREAM_MICROBATCH_SIZE`,
   `TORCHINFERNO_OPENAI_SINGLE_ADMISSION_WAIT_MS`, and
