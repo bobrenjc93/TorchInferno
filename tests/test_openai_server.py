@@ -26,6 +26,7 @@ from torchinferno.openai_server import (
     _effective_openai_max_batch_size,
     _openai_cuda_graph_enabled_for_model,
     _prefers_exact_generation_cache,
+    _runtime_prefill_graph_capture_enabled,
     _should_reexec_distributed_server,
     _sync_tensor_parallel_command,
     _sync_tensor_parallel_continue,
@@ -938,6 +939,41 @@ def test_openai_engine_skips_runtime_prefill_graph_capture_on_miss() -> None:
     assert model.capture_flags == [False]
     assert model.graph_inputs == []
     assert model.forward_inputs
+
+
+def test_openai_tp_runtime_prefill_capture_allows_large_and_temperature_requests(monkeypatch) -> None:
+    model = object()
+    monkeypatch.setattr(
+        "torchinferno.openai_server._is_tensor_parallel_model",
+        lambda candidate: candidate is model,
+    )
+    monkeypatch.setattr(
+        "torchinferno.openai_server._tensor_parallel_world_size",
+        lambda candidate: 8 if candidate is model else 1,
+    )
+
+    assert _runtime_prefill_graph_capture_enabled(model, temperature=0.0, max_tokens=512)
+    assert _runtime_prefill_graph_capture_enabled(model, temperature=0.7, max_tokens=300)
+
+
+def test_openai_tp_runtime_prefill_capture_overrides_still_apply(monkeypatch) -> None:
+    model = object()
+    monkeypatch.setattr(
+        "torchinferno.openai_server._is_tensor_parallel_model",
+        lambda candidate: candidate is model,
+    )
+    monkeypatch.setattr(
+        "torchinferno.openai_server._tensor_parallel_world_size",
+        lambda candidate: 8 if candidate is model else 1,
+    )
+
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_RUNTIME_TEMPERATURE_PREFILL_CAPTURE", "0")
+    assert not _runtime_prefill_graph_capture_enabled(model, temperature=0.7, max_tokens=300)
+
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_RUNTIME_TEMPERATURE_PREFILL_CAPTURE", "1")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_RUNTIME_PREFILL_CAPTURE_MAX_TOKENS", "128")
+    assert not _runtime_prefill_graph_capture_enabled(model, temperature=0.0, max_tokens=512)
+    assert _runtime_prefill_graph_capture_enabled(model, temperature=0.0, max_tokens=128)
 
 
 def test_openai_engine_uses_runtime_shared_prefix_capture_for_tensor_parallel(monkeypatch) -> None:

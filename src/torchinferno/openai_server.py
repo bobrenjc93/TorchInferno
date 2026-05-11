@@ -2596,10 +2596,13 @@ def _runtime_prefill_graph_capture_enabled(
     max_tokens: int | None = None,
 ) -> bool:
     if _is_tensor_parallel_model(model) and _tensor_parallel_world_size(model) > 1:
-        if temperature > 0.0 and not env_flag("TORCHINFERNO_OPENAI_TP_RUNTIME_TEMPERATURE_PREFILL_CAPTURE"):
+        if temperature > 0.0 and not env_flag(
+            "TORCHINFERNO_OPENAI_TP_RUNTIME_TEMPERATURE_PREFILL_CAPTURE",
+            True,
+        ):
             return False
         if max_tokens is not None:
-            token_limit = env_int("TORCHINFERNO_OPENAI_TP_RUNTIME_PREFILL_CAPTURE_MAX_TOKENS", 128, minimum=1)
+            token_limit = env_int("TORCHINFERNO_OPENAI_TP_RUNTIME_PREFILL_CAPTURE_MAX_TOKENS", 1024, minimum=1)
             if max_tokens > token_limit:
                 return False
         return env_flag("TORCHINFERNO_OPENAI_TP_RUNTIME_PREFILL_CAPTURE", True)
