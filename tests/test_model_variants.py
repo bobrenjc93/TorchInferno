@@ -253,6 +253,37 @@ def test_llama3_tensor_parallel_ragged_decode_matches_independent_decode(tmp_pat
     torch.testing.assert_close(actual, torch.cat(expected_logits, dim=0), atol=5e-4, rtol=5e-4)
 
 
+def test_llama3_tensor_parallel_temperature_sampling_uses_gumbel_max(monkeypatch) -> None:
+    import torch.distributed as dist
+
+    calls: list[object] = []
+
+    def all_reduce(tensor: torch.Tensor, *, op: object) -> None:
+        del tensor
+        calls.append(op)
+
+    def fail_collective(*args, **kwargs) -> None:
+        del args, kwargs
+        raise AssertionError("gumbel temperature sampling should not gather or broadcast")
+
+    monkeypatch.setattr(dist, "is_available", lambda: True)
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(dist, "all_reduce", all_reduce)
+    monkeypatch.setattr(dist, "all_gather_into_tensor", fail_collective)
+    monkeypatch.setattr(dist, "broadcast", fail_collective)
+
+    model = object.__new__(Llama3TensorParallelForCausalLM)
+    model.config = type("Config", (), {"vocab_size": 4})()
+    model.vocab_start = 0
+    model.local_vocab_size = 4
+    logits = torch.tensor([[1000.0, -1000.0, -1000.0, -1000.0], [-1000.0, 1000.0, -1000.0, -1000.0]])
+
+    sampled = model._sample_next_token(logits, temperature=0.7)
+
+    assert sampled.tolist() == [0, 1]
+    assert calls == [dist.ReduceOp.MAX, dist.ReduceOp.MIN]
+
+
 def _write_tiny_llama3_hf_checkpoint(reference: Llama3V0ForCausalLM, config, path) -> None:
     state = reference.state_dict()
     hf_state = {

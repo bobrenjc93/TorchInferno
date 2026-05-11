@@ -1981,6 +1981,13 @@ class Llama3TensorParallelForCausalLM:
                 warn_optional_failure("llama3_tensor_parallel.temperature_sample_gather", exc)
                 if _tp_flag("TORCHINFERNO_TEMPERATURE_SAMPLE_GATHER_STRICT", False):
                     raise
+        if _tp_flag("TORCHINFERNO_TEMPERATURE_SAMPLE_GUMBEL"):
+            try:
+                return self._sample_next_token_temperature_gumbel(logits, temperature)
+            except Exception as exc:
+                warn_optional_failure("llama3_tensor_parallel.temperature_sample_gumbel", exc)
+                if _tp_flag("TORCHINFERNO_TEMPERATURE_SAMPLE_GUMBEL_STRICT", False):
+                    raise
         return self._sample_next_token_temperature(logits, temperature)
 
     def _sample_next_token_greedy(self, logits: Tensor) -> Tensor:
@@ -2029,6 +2036,18 @@ class Llama3TensorParallelForCausalLM:
             probs = torch.softmax(full_logits.float() / temperature, dim=-1)
             next_token.copy_(torch.multinomial(probs, num_samples=1).squeeze(-1))
         dist.broadcast(next_token, src=0)
+        return next_token
+
+    def _sample_next_token_temperature_gumbel(self, logits: Tensor, temperature: float) -> Tensor:
+        logits_float = logits.float() / temperature
+        gumbel = -torch.empty_like(logits_float).exponential_().log()
+        local_values, local_indices = torch.max(logits_float + gumbel, dim=-1)
+        global_values = local_values.clone()
+        dist.all_reduce(global_values, op=dist.ReduceOp.MAX)
+        sentinel = torch.full_like(local_indices, self.config.vocab_size)
+        local_tokens = local_indices + self.vocab_start
+        next_token = torch.where(local_values == global_values, local_tokens, sentinel)
+        dist.all_reduce(next_token, op=dist.ReduceOp.MIN)
         return next_token
 
     def _sample_next_token_temperature(self, logits: Tensor, temperature: float) -> Tensor:
