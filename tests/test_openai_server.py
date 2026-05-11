@@ -8,6 +8,7 @@ import subprocess
 import sys
 import threading
 import time
+import types
 import urllib.request
 from pathlib import Path
 
@@ -38,6 +39,7 @@ from torchinferno.openai_server import (
     _warmup_prefix_suffix_token_counts,
     _warmup_temperature_batch_sizes,
     _warmup_temperature_prompt_token_counts,
+    load_chat_tokenizer,
 )
 
 
@@ -205,6 +207,54 @@ def test_openai_server_pipeline_parallelism_skips_auto_launch(monkeypatch) -> No
     )
 
     assert not _should_reexec_distributed_server(config)
+
+
+def test_load_chat_tokenizer_honors_explicit_tokenizer_for_tiny_model(monkeypatch) -> None:
+    class FakeAutoTokenizer:
+        calls: list[tuple[str, dict[str, object]]] = []
+
+        @classmethod
+        def from_pretrained(cls, name: str, **kwargs: object) -> object:
+            cls.calls.append((name, kwargs))
+            return _BatchEncodingTokenizer()
+
+    monkeypatch.setitem(
+        sys.modules,
+        "transformers",
+        types.SimpleNamespace(AutoTokenizer=FakeAutoTokenizer),
+    )
+    config = OpenAIServerConfig(
+        model="tiny",
+        model_kind="tiny-deepseek",
+        tokenizer="meta-llama/Meta-Llama-3.1-70B-Instruct",
+        trust_remote_code=True,
+        token="hf-token",
+        revision="main",
+        cache_dir="/tmp/cache",
+    )
+
+    tokenizer = load_chat_tokenizer(config, vocab_size=16)
+
+    assert isinstance(tokenizer, _TransformersChatTokenizer)
+    assert FakeAutoTokenizer.calls == [
+        (
+            "meta-llama/Meta-Llama-3.1-70B-Instruct",
+            {
+                "trust_remote_code": True,
+                "token": "hf-token",
+                "revision": "main",
+                "cache_dir": "/tmp/cache",
+            },
+        )
+    ]
+
+
+def test_load_chat_tokenizer_defaults_tiny_model_to_byte_tokenizer() -> None:
+    config = OpenAIServerConfig(model="tiny", model_kind="tiny-deepseek")
+
+    tokenizer = load_chat_tokenizer(config, vocab_size=16)
+
+    assert isinstance(tokenizer, _ByteFallbackTokenizer)
 
 
 def test_chat_template_batch_encoding_input_ids_are_extracted() -> None:

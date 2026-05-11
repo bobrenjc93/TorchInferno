@@ -179,7 +179,9 @@ def load_chat_tokenizer(
     vocab_size: int,
 ) -> _ByteFallbackTokenizer | _TransformersChatTokenizer:
     tokenizer_name = config.tokenizer or config.model
-    if tokenizer_name in {"byte", "bytes", "fallback", "tiny"} or config.model_kind.startswith("tiny"):
+    if tokenizer_name in {"byte", "bytes", "fallback", "tiny"} or (
+        config.tokenizer is None and config.model_kind.startswith("tiny")
+    ):
         return _ByteFallbackTokenizer(vocab_size)
     try:
         from transformers import AutoTokenizer
