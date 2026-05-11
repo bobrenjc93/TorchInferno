@@ -677,6 +677,35 @@ def test_openai_engine_reuses_single_request_prefix_cache(monkeypatch) -> None:
     assert model.forward_inputs == [[10, 11], [2, 12]]
 
 
+def test_openai_engine_caches_encoded_chat_prompts(monkeypatch) -> None:
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_PROMPT_TOKEN_CACHE_MAX_ENTRIES", "2")
+    tokenizer = _CountingPromptTokenizer()
+    engine = _cache_only_engine()
+    engine.tokenizer = tokenizer
+    engine.max_model_len = None
+
+    messages = [{"role": "user", "content": "same"}]
+    first = engine._encode_chat_prompt(messages, max_tokens=1)
+    first.append(99)
+    second = engine._encode_chat_prompt(messages, max_tokens=1)
+
+    assert second == [4, 1]
+    assert tokenizer.calls == 1
+
+
+def test_openai_engine_prompt_token_cache_can_be_disabled(monkeypatch) -> None:
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_PROMPT_TOKEN_CACHE_MAX_ENTRIES", "0")
+    tokenizer = _CountingPromptTokenizer()
+    engine = _cache_only_engine()
+    engine.tokenizer = tokenizer
+    engine.max_model_len = None
+
+    messages = [{"role": "user", "content": "same"}]
+    assert engine._encode_chat_prompt(messages, max_tokens=1) == [4, 1]
+    assert engine._encode_chat_prompt(messages, max_tokens=1) == [4, 2]
+    assert tokenizer.calls == 2
+
+
 def test_openai_engine_uses_prefill_graph_for_prefix_suffix(monkeypatch) -> None:
     monkeypatch.setenv("TORCHINFERNO_OPENAI_PREFIX_CACHE_MIN_TOKENS", "1")
     model = _PrefixGraphRecordingModel()
@@ -831,6 +860,7 @@ def test_openai_engine_batches_shared_prefix_suffixes(monkeypatch) -> None:
         device=torch.device("cpu"),
         max_batch_size=4,
         batch_wait_ms=50.0,
+        single_request_admission_wait_ms=50.0,
     )
     barrier = threading.Barrier(3)
     results: list[list[int] | None] = [None, None]
@@ -872,6 +902,7 @@ def test_openai_engine_batches_variable_length_shared_prefix_suffixes(monkeypatc
         device=torch.device("cpu"),
         max_batch_size=4,
         batch_wait_ms=50.0,
+        single_request_admission_wait_ms=50.0,
     )
 
     def run_pair() -> list[list[int] | None]:
@@ -929,6 +960,7 @@ def test_openai_engine_ragged_decodes_variable_length_shared_prefix_suffixes(mon
         device=torch.device("cpu"),
         max_batch_size=4,
         batch_wait_ms=50.0,
+        single_request_admission_wait_ms=50.0,
     )
     barrier = threading.Barrier(3)
     results: list[list[int] | None] = [None, None]
@@ -1684,6 +1716,25 @@ class _FirstEncodeEventTokenizer(_ByteFallbackTokenizer):
         if call_index == 0:
             self.first_encoded.set()
         return tokens
+
+
+class _CountingPromptTokenizer:
+    eos_token_id = 0
+    stop_token_ids: frozenset[int] = frozenset()
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def encode_messages(self, messages: list[dict[str, object]]) -> list[int]:
+        self.calls += 1
+        content = str(messages[-1]["content"])
+        return [len(content), self.calls]
+
+    def decode_token(self, token_id: int) -> str:
+        return str(token_id)
+
+    def decode(self, token_ids: list[int]) -> str:
+        return "".join(str(token_id) for token_id in token_ids)
 
 
 class _BatchRecordingCache:

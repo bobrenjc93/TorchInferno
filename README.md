@@ -548,6 +548,8 @@ OpenAI serving also has explicit environment knobs for production-shape tuning:
   KV cache; `TORCHINFERNO_OPENAI_PREFIX_CACHE_MIN_TOKENS`,
   `TORCHINFERNO_OPENAI_PREFIX_CACHE_MAX_TOKENS`, and
   `TORCHINFERNO_OPENAI_PREFIX_CACHE_MATERIALIZE_GENERATED` tune reuse.
+- `TORCHINFERNO_OPENAI_PROMPT_TOKEN_CACHE_MAX_ENTRIES` bounds repeated chat
+  prompt tokenization reuse; set it to `0` to disable the cache.
 - `TORCHINFERNO_OPENAI_STARTUP_WARMUP=0` and
   `TORCHINFERNO_OPENAI_TOKENIZER_WARMUP=0` disable startup warmups.
 - `TORCHINFERNO_OPENAI_WARMUP_PROMPT_TOKENS`,

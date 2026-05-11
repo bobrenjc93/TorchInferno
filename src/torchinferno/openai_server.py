@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import copy
 import inspect
+import json
 import os
 import queue
 import sys
@@ -400,6 +401,8 @@ class OpenAICompletionEngine:
         self._cache_pool: dict[tuple[int, int, str, int, str], object] = {}
         self._microbatch_cache_pool: dict[tuple[int, int, int, str, int, str], object] = {}
         self._prefix_cache_entry: TensorPrefixCacheEntry | None = None
+        self._prompt_token_cache: dict[str, list[int]] = {}
+        self._prompt_token_cache_lock = threading.Lock()
         self._phase_timing_enabled = env_flag("TORCHINFERNO_OPENAI_PHASE_TIMINGS")
         self._phase_records: list[dict[str, float]] = []
         self._phase_records_lock = threading.Lock()
@@ -470,11 +473,40 @@ class OpenAICompletionEngine:
         return CompletionResult(tokens=tokens, prompt_tokens=len(prompt))
 
     def _encode_chat_prompt(self, messages: list[dict[str, object]], *, max_tokens: int) -> list[int]:
-        prompt = self.tokenizer.encode_messages(messages)
+        prompt = self._cached_encode_chat_prompt(messages)
         if self.max_model_len is not None and len(prompt) + max_tokens > self.max_model_len:
             prompt_budget = max(1, self.max_model_len - max_tokens)
             prompt = prompt[-prompt_budget:]
         return prompt
+
+    def _cached_encode_chat_prompt(self, messages: list[dict[str, object]]) -> list[int]:
+        max_entries = env_int("TORCHINFERNO_OPENAI_PROMPT_TOKEN_CACHE_MAX_ENTRIES", 4096, minimum=0)
+        if max_entries <= 0:
+            return self.tokenizer.encode_messages(messages)
+        cache_key = _chat_prompt_cache_key(messages)
+        cache = self._prompt_token_cache_map()
+        with self._prompt_token_cache_lock:
+            cached = cache.get(cache_key)
+            if cached is not None:
+                cache.pop(cache_key, None)
+                cache[cache_key] = cached
+                return list(cached)
+        prompt = self.tokenizer.encode_messages(messages)
+        with self._prompt_token_cache_lock:
+            cache.pop(cache_key, None)
+            cache[cache_key] = list(prompt)
+            while len(cache) > max_entries:
+                cache.pop(next(iter(cache)))
+        return prompt
+
+    def _prompt_token_cache_map(self) -> dict[str, list[int]]:
+        cache = getattr(self, "_prompt_token_cache", None)
+        if not isinstance(cache, dict):
+            cache = {}
+            self._prompt_token_cache = cache
+        if getattr(self, "_prompt_token_cache_lock", None) is None:
+            self._prompt_token_cache_lock = threading.Lock()
+        return cache
 
     def _submit_generation(self, prompt: list[int], *, max_tokens: int, temperature: float) -> Iterator[int]:
         if self._closed:
@@ -3112,6 +3144,10 @@ def _format_messages(messages: list[dict[str, object]]) -> str:
         parts.append(f"{role}: {content}")
     parts.append("assistant:")
     return "\n".join(parts)
+
+
+def _chat_prompt_cache_key(messages: list[dict[str, object]]) -> str:
+    return json.dumps(messages, sort_keys=True, separators=(",", ":"), default=str)
 
 
 def build_parser() -> argparse.ArgumentParser:
