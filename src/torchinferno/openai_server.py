@@ -88,6 +88,7 @@ class _QueuedGeneration:
     temperature: float
     stream: bool
     responses: "queue.Queue[object]"
+    done: bool = False
 
 
 _TENSOR_PARALLEL_CONTROL_GROUP: object | None = None
@@ -638,11 +639,12 @@ class OpenAICompletionEngine:
                     self._run_queued_completion_group(group)
             except BaseException as exc:
                 for request in group:
-                    request.responses.put(exc)
+                    if not request.done:
+                        request.responses.put(exc)
             finally:
                 if is_stream:
                     for request in group:
-                        request.responses.put(_GenerationDone())
+                        _finish_stream_request(request)
 
     def _run_queued_stream_group(self, group: list[_QueuedGeneration]) -> None:
         prompts = [request.prompt for request in group]
@@ -655,9 +657,7 @@ class OpenAICompletionEngine:
                     temperature=group[0].temperature,
                 )
                 for step, step_tokens in enumerate(step_iter):
-                    for request, token_id in zip(group, step_tokens):
-                        if step < request.max_tokens and token_id is not None:
-                            request.responses.put(int(token_id))
+                    _emit_stream_step(group, step, step_tokens)
             finally:
                 _sync_tensor_parallel_command(self.model, self.device)
             return
@@ -675,9 +675,7 @@ class OpenAICompletionEngine:
                     temperature=same_length_group[0].temperature,
                 )
                 for step, step_tokens in enumerate(step_iter):
-                    for request, token_id in zip(same_length_group, step_tokens):
-                        if step < request.max_tokens and token_id is not None:
-                            request.responses.put(int(token_id))
+                    _emit_stream_step(same_length_group, step, step_tokens)
             finally:
                 _sync_tensor_parallel_command(self.model, self.device)
 
@@ -2543,6 +2541,29 @@ def _queued_groups_by_prompt_length(group: Sequence[_QueuedGeneration]) -> list[
     for request in group:
         groups.setdefault(len(request.prompt), []).append(request)
     return list(groups.values())
+
+
+def _emit_stream_step(
+    group: Sequence[_QueuedGeneration],
+    step: int,
+    step_tokens: Sequence[int | None],
+) -> None:
+    for request, token_id in zip(group, step_tokens):
+        if request.done:
+            continue
+        if step >= request.max_tokens or token_id is None:
+            _finish_stream_request(request)
+            continue
+        request.responses.put(int(token_id))
+        if step + 1 >= request.max_tokens:
+            _finish_stream_request(request)
+
+
+def _finish_stream_request(request: _QueuedGeneration) -> None:
+    if request.done:
+        return
+    request.responses.put(_GenerationDone())
+    request.done = True
 
 
 def _indexed_prompts_by_length(indexed: Sequence[tuple[int, list[int]]]) -> list[list[tuple[int, list[int]]]]:

@@ -16,6 +16,7 @@ import torch
 
 from torchinferno.openai_http import OpenAIHandler, enable_tcp_nodelay
 from torchinferno.openai_server import (
+    _GenerationDone,
     OpenAICompletionEngine,
     OpenAIServerConfig,
     _ByteFallbackTokenizer,
@@ -1186,6 +1187,7 @@ def test_openai_stream_group_respects_per_request_max_tokens() -> None:
         del broadcast_tensor_parallel
         calls.append((prompts, max_tokens, temperature))
         yield [101, 201]
+        assert any(isinstance(item, _GenerationDone) for item in first_queue.queue)
         yield [102, 202]
         yield [103, 203]
 
@@ -1201,8 +1203,12 @@ def test_openai_stream_group_respects_per_request_max_tokens() -> None:
     engine._run_queued_stream_group(group)
 
     assert calls == [([[1, 2], [1, 3]], 3, 0.0)]
-    assert _queue_items(first_queue) == [101]
-    assert _queue_items(second_queue) == [201, 202, 203]
+    first_items = _queue_items(first_queue)
+    second_items = _queue_items(second_queue)
+    assert first_items[:1] == [101]
+    assert isinstance(first_items[1], _GenerationDone)
+    assert second_items[:3] == [201, 202, 203]
+    assert isinstance(second_items[3], _GenerationDone)
 
 
 def test_openai_completion_group_respects_per_request_max_tokens() -> None:
