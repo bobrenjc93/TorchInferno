@@ -1074,7 +1074,7 @@ def test_openai_engine_microbatch_cache_pool_replaces_slots_and_caps_entries(mon
     assert slot_zero_second not in engine._microbatch_cache_pool.values()
 
 
-def test_openai_stream_microbatch_defaults_to_smaller_cuda_tp_chunks(monkeypatch) -> None:
+def test_openai_stream_microbatch_defaults_to_decode_graph_batch_limit(monkeypatch) -> None:
     monkeypatch.delenv("TORCHINFERNO_OPENAI_STREAM_MICROBATCH_SIZE", raising=False)
     monkeypatch.delenv("TORCHINFERNO_CUDAGRAPH_DECODE_STEP_MAX_BATCH", raising=False)
     model = object()
@@ -1087,7 +1087,8 @@ def test_openai_stream_microbatch_defaults_to_smaller_cuda_tp_chunks(monkeypatch
         lambda candidate: candidate is model,
     )
 
-    assert engine._stream_microbatch_size(64) == 16
+    assert engine._stream_microbatch_size(128) == 64
+    assert engine._stream_microbatch_size(64) == 64
     assert engine._stream_microbatch_size(8) == 8
 
 

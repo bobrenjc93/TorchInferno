@@ -1435,7 +1435,7 @@ class OpenAICompletionEngine:
         if "TORCHINFERNO_OPENAI_STREAM_MICROBATCH_SIZE" in os.environ:
             return min(batch_size, env_int("TORCHINFERNO_OPENAI_STREAM_MICROBATCH_SIZE", batch_size, minimum=1))
         if _is_tensor_parallel_model(self.model) and self.device.type == "cuda":
-            return min(batch_size, env_int("TORCHINFERNO_CUDAGRAPH_DECODE_STEP_MAX_BATCH", 16, minimum=1))
+            return min(batch_size, env_int("TORCHINFERNO_CUDAGRAPH_DECODE_STEP_MAX_BATCH", 64, minimum=1))
         return batch_size
 
     @torch.inference_mode()
