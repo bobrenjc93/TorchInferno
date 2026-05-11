@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import queue
 import socket
+import threading
 import time
 import uuid
 from http import HTTPStatus
@@ -15,6 +17,7 @@ from torchinferno.server.openai_protocol import (
     model_list_response,
     parse_chat_completion_request,
 )
+from torchinferno.runtime.options import env_float
 
 
 class OpenAIHandler(BaseHTTPRequestHandler):
@@ -95,10 +98,39 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                 delta={"role": "assistant"},
             )
         )
-        for token_id in engine.generate_chat_tokens(messages, max_tokens=max_tokens, temperature=temperature):
+        token_queue: "queue.Queue[object]" = queue.Queue()
+        done = object()
+
+        def produce_tokens() -> None:
+            try:
+                for token_id in engine.generate_chat_tokens(
+                    messages,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                ):
+                    token_queue.put(int(token_id))
+            except BaseException as exc:
+                token_queue.put(exc)
+            finally:
+                token_queue.put(done)
+
+        producer = threading.Thread(target=produce_tokens, name="torchinferno-openai-stream-producer", daemon=True)
+        producer.start()
+        heartbeat_s = env_float("TORCHINFERNO_OPENAI_STREAM_HEARTBEAT_SECONDS", 15.0, minimum=0.0)
+        while True:
+            try:
+                item = token_queue.get(timeout=heartbeat_s if heartbeat_s > 0.0 else None)
+            except queue.Empty:
+                if client_open:
+                    client_open = self._try_write_sse_comment("torchinferno heartbeat")
+                continue
+            if item is done:
+                break
+            if isinstance(item, BaseException):
+                raise item
             if not client_open:
                 continue
-            content = engine.tokenizer.decode_token(token_id)
+            content = engine.tokenizer.decode_token(int(item))
             if not content:
                 continue
             client_open = self._try_write_sse(
@@ -122,6 +154,18 @@ class OpenAIHandler(BaseHTTPRequestHandler):
         if client_open:
             self._try_write_done()
         self.close_connection = True
+
+    def _write_sse_comment(self, comment: str) -> None:
+        self.wfile.write(b": " + comment.encode("utf-8") + b"\n\n")
+        self.wfile.flush()
+
+    def _try_write_sse_comment(self, comment: str) -> bool:
+        try:
+            self._write_sse_comment(comment)
+            return True
+        except OSError:
+            self.close_connection = True
+            return False
 
     def _send_json(self, payload: dict[str, object], *, status: int = 200) -> None:
         body = json.dumps(payload).encode("utf-8")

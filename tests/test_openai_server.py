@@ -126,6 +126,18 @@ def test_openai_handler_writes_sse_frame_with_single_socket_write() -> None:
     assert writer.flush_calls == 1
 
 
+def test_openai_handler_writes_sse_comment() -> None:
+    handler = object.__new__(OpenAIHandler)
+    writer = _CountingWriter()
+    handler.wfile = writer
+
+    handler._write_sse_comment("heartbeat")
+
+    assert writer.write_calls == 1
+    assert writer.payload == b": heartbeat\n\n"
+    assert writer.flush_calls == 1
+
+
 def test_openai_handler_enables_tcp_nodelay() -> None:
     fake_socket = _FakeSocket()
 
@@ -435,6 +447,23 @@ def test_openai_stream_disconnect_drains_generation() -> None:
     assert engine.drained_tokens == [1, 2, 3]
     assert handler.close_connection is True
     assert handler.wfile.write_calls == 2
+
+
+def test_openai_stream_writes_heartbeat_while_waiting(monkeypatch) -> None:
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_STREAM_HEARTBEAT_SECONDS", "0.01")
+    engine = _SlowStreamEngine(delay_s=0.03)
+    handler = object.__new__(OpenAIHandler)
+    handler.server = type("Server", (), {"engine": engine})()
+    handler.wfile = _CountingWriter()
+    handler.close_connection = False
+    handler.send_response = lambda status: None
+    handler.send_header = lambda key, value: None
+    handler.end_headers = lambda: None
+
+    handler._stream_chat([{"role": "user", "content": "hi"}], max_tokens=1, temperature=0.0)
+
+    assert b": torchinferno heartbeat\n\n" in handler.wfile.payload
+    assert b"data: [DONE]\n\n" in handler.wfile.payload
 
 
 def test_openai_engine_microbatches_same_shape_requests() -> None:
@@ -2422,6 +2451,25 @@ class _DrainRecordingEngine:
         for token_id in range(1, max_tokens + 1):
             self.drained_tokens.append(token_id)
             yield token_id
+
+
+class _SlowStreamEngine:
+    model_id = "tiny"
+    tokenizer = _ByteFallbackTokenizer(vocab_size=16)
+
+    def __init__(self, *, delay_s: float) -> None:
+        self.delay_s = delay_s
+
+    def generate_chat_tokens(
+        self,
+        messages: list[dict[str, object]],
+        *,
+        max_tokens: int,
+        temperature: float,
+    ):
+        del messages, max_tokens, temperature
+        time.sleep(self.delay_s)
+        yield 1
 
 
 class _FakeSocket:
