@@ -516,8 +516,33 @@ class _Llama3TensorParallelLayer:
         if attn_in is None:
             attn_in = _tp_decode_rms_norm(hidden, self.input_layernorm_weight, self.config.rms_norm_eps)
         q, k, v = self._qkv(attn_in, batch, tokens, self.config.head_dim)
-        q, k = _apply_rotary_ragged(q, k, rotary)
-        _append_ragged_kv_cache(cache, k, v, cache_positions, row_indices)
+        if (
+            q.is_cuda
+            and k.is_cuda
+            and v.is_cuda
+            and _tp_flag("TORCHINFERNO_TRITON_RAGGED_DECODE_ROTARY_APPEND")
+        ):
+            try:
+                from torchinferno.kernels.triton_ops import triton_apply_rotary_append_kv_ragged_decode
+
+                q = triton_apply_rotary_append_kv_ragged_decode(
+                    q,
+                    k,
+                    v,
+                    cache.keys,
+                    cache.values,
+                    cache_positions,
+                    rotary[0],
+                    rotary[1],
+                    row_indices,
+                )
+            except Exception as exc:
+                warn_optional_failure("llama3_tensor_parallel.ragged_decode_rotary_append", exc)
+                q, k = _apply_rotary_ragged(q, k, rotary)
+                _append_ragged_kv_cache(cache, k, v, cache_positions, row_indices)
+        else:
+            q, k = _apply_rotary_ragged(q, k, rotary)
+            _append_ragged_kv_cache(cache, k, v, cache_positions, row_indices)
         attention_lengths = cache_positions + 1
         if row_indices is None:
             attention_keys = cache.keys[:batch]

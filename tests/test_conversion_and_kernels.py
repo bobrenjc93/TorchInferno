@@ -279,6 +279,54 @@ def test_triton_decode_rotary_append_matches_torch_reference() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available() or not triton_available(), reason="CUDA Triton kernels unavailable")
+def test_triton_ragged_decode_rotary_append_matches_torch_reference() -> None:
+    from torchinferno.kernels.triton_ops import triton_apply_rotary_append_kv_ragged_decode
+    from torchinferno.models.llama3.tensor_parallel import _rotate_llama_eager
+
+    torch.manual_seed(20)
+    batch, q_heads, kv_heads, head_dim, max_seq_len = 3, 4, 1, 16, 12
+    q = torch.randn(batch, q_heads, 1, head_dim, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(batch, kv_heads, 1, head_dim, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(batch, kv_heads, 1, head_dim, device="cuda", dtype=torch.bfloat16)
+    cache_keys = torch.zeros(batch + 1, kv_heads, max_seq_len, head_dim, device="cuda", dtype=torch.bfloat16)
+    cache_values = torch.zeros_like(cache_keys)
+    freqs = torch.randn(batch, head_dim // 2, device="cuda")
+    cos = freqs.cos().to(torch.bfloat16)
+    sin = freqs.sin().to(torch.bfloat16)
+    positions = torch.tensor([3, 5, 4], device="cuda", dtype=torch.int64)
+    row_indices = torch.tensor([2, 0, 1], device="cuda", dtype=torch.int64)
+
+    expected_q = _rotate_llama_eager(q, cos[:, None, None, :], sin[:, None, None, :])
+    expected_k = _rotate_llama_eager(k, cos[:, None, None, :], sin[:, None, None, :])
+    expected_cache_keys = cache_keys.clone()
+    expected_cache_values = cache_values.clone()
+    for source_row, target_row in enumerate(row_indices.detach().cpu().tolist()):
+        pos = int(positions[source_row].item())
+        expected_cache_keys[target_row : target_row + 1, :, pos : pos + 1, :].copy_(
+            expected_k[source_row : source_row + 1]
+        )
+        expected_cache_values[target_row : target_row + 1, :, pos : pos + 1, :].copy_(
+            v[source_row : source_row + 1]
+        )
+
+    actual_q = triton_apply_rotary_append_kv_ragged_decode(
+        q.clone(),
+        k,
+        v,
+        cache_keys,
+        cache_values,
+        positions,
+        cos,
+        sin,
+        row_indices,
+    )
+
+    torch.testing.assert_close(actual_q, expected_q, atol=4e-2, rtol=4e-2)
+    torch.testing.assert_close(cache_keys, expected_cache_keys, atol=4e-2, rtol=4e-2)
+    torch.testing.assert_close(cache_values, expected_cache_values)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or not triton_available(), reason="CUDA Triton kernels unavailable")
 def test_triton_dense_gqa_decode_attention_matches_torch_reference() -> None:
     from torchinferno.kernels.triton_ops import triton_dense_gqa_decode_attention, triton_grouped_gqa_decode_attention
 

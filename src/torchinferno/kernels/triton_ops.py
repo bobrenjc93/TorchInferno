@@ -428,6 +428,203 @@ def triton_apply_rotary_append_kv_decode(
 
 
 @triton.jit
+def _rotary_llama_append_kv_ragged_decode_kernel(
+    q_ptr,
+    k_ptr,
+    v_ptr,
+    cache_key_ptr,
+    cache_value_ptr,
+    positions_ptr,
+    row_indices_ptr,
+    cos_ptr,
+    sin_ptr,
+    total_elements,
+    q_pairs,
+    k_pairs,
+    v_elements,
+    q_heads: tl.constexpr,
+    kv_heads: tl.constexpr,
+    head_dim: tl.constexpr,
+    half_dim: tl.constexpr,
+    cache_dim: tl.constexpr,
+    has_row_indices: tl.constexpr,
+    q_stride_batch: tl.constexpr,
+    q_stride_head: tl.constexpr,
+    q_stride_dim: tl.constexpr,
+    k_stride_batch: tl.constexpr,
+    k_stride_head: tl.constexpr,
+    k_stride_dim: tl.constexpr,
+    v_stride_batch: tl.constexpr,
+    v_stride_head: tl.constexpr,
+    v_stride_dim: tl.constexpr,
+    cache_stride_batch: tl.constexpr,
+    cache_stride_head: tl.constexpr,
+    cache_stride_token: tl.constexpr,
+    cache_stride_dim: tl.constexpr,
+    block_size: tl.constexpr,
+) -> None:
+    offsets = tl.program_id(0) * block_size + tl.arange(0, block_size)
+    mask = offsets < total_elements
+
+    q_dim = offsets % half_dim
+    q_head_batch = offsets // half_dim
+    q_head = q_head_batch % q_heads
+    q_batch = q_head_batch // q_heads
+    q_mask = mask & (offsets < q_pairs)
+    q_offset = q_batch * q_stride_batch + q_head * q_stride_head + q_dim * q_stride_dim
+    q_first = tl.load(q_ptr + q_offset, mask=q_mask, other=0.0).to(tl.float32)
+    q_second = tl.load(q_ptr + q_offset + half_dim * q_stride_dim, mask=q_mask, other=0.0).to(tl.float32)
+    q_cos = tl.load(cos_ptr + q_batch * cache_dim + q_dim, mask=q_mask, other=1.0).to(tl.float32)
+    q_sin = tl.load(sin_ptr + q_batch * cache_dim + q_dim, mask=q_mask, other=0.0).to(tl.float32)
+    tl.store(q_ptr + q_offset, q_first * q_cos - q_second * q_sin, mask=q_mask)
+    tl.store(q_ptr + q_offset + half_dim * q_stride_dim, q_second * q_cos + q_first * q_sin, mask=q_mask)
+
+    k_dim = offsets % half_dim
+    k_head_batch = offsets // half_dim
+    k_head = k_head_batch % kv_heads
+    k_batch = k_head_batch // kv_heads
+    k_mask = mask & (offsets < k_pairs)
+    k_offset = k_batch * k_stride_batch + k_head * k_stride_head + k_dim * k_stride_dim
+    k_row = k_batch
+    if has_row_indices:
+        k_row = tl.load(row_indices_ptr + k_batch, mask=k_mask, other=0)
+    k_pos = tl.load(positions_ptr + k_batch, mask=k_mask, other=0)
+    cache_k_offset = (
+        k_row * cache_stride_batch
+        + k_head * cache_stride_head
+        + k_pos * cache_stride_token
+        + k_dim * cache_stride_dim
+    )
+    k_first = tl.load(k_ptr + k_offset, mask=k_mask, other=0.0).to(tl.float32)
+    k_second = tl.load(k_ptr + k_offset + half_dim * k_stride_dim, mask=k_mask, other=0.0).to(tl.float32)
+    k_cos = tl.load(cos_ptr + k_batch * cache_dim + k_dim, mask=k_mask, other=1.0).to(tl.float32)
+    k_sin = tl.load(sin_ptr + k_batch * cache_dim + k_dim, mask=k_mask, other=0.0).to(tl.float32)
+    tl.store(cache_key_ptr + cache_k_offset, k_first * k_cos - k_second * k_sin, mask=k_mask)
+    tl.store(
+        cache_key_ptr + cache_k_offset + half_dim * cache_stride_dim,
+        k_second * k_cos + k_first * k_sin,
+        mask=k_mask,
+    )
+
+    v_dim = offsets % head_dim
+    v_head_batch = offsets // head_dim
+    v_head = v_head_batch % kv_heads
+    v_batch = v_head_batch // kv_heads
+    v_mask = mask & (offsets < v_elements)
+    v_offset = v_batch * v_stride_batch + v_head * v_stride_head + v_dim * v_stride_dim
+    v_row = v_batch
+    if has_row_indices:
+        v_row = tl.load(row_indices_ptr + v_batch, mask=v_mask, other=0)
+    v_pos = tl.load(positions_ptr + v_batch, mask=v_mask, other=0)
+    cache_v_offset = (
+        v_row * cache_stride_batch
+        + v_head * cache_stride_head
+        + v_pos * cache_stride_token
+        + v_dim * cache_stride_dim
+    )
+    tl.store(cache_value_ptr + cache_v_offset, tl.load(v_ptr + v_offset, mask=v_mask), mask=v_mask)
+
+
+def triton_apply_rotary_append_kv_ragged_decode(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    cache_keys: Tensor,
+    cache_values: Tensor,
+    positions: Tensor,
+    cos: Tensor,
+    sin: Tensor,
+    row_indices: Tensor | None = None,
+) -> Tensor:
+    """Apply per-row Llama RoPE to decode q and append rotated k/v to dense KV cache."""
+
+    if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
+        raise ValueError("q, k, and v must have shape [batch, heads, tokens, head_dim]")
+    if q.size(0) != k.size(0) or q.size(0) != v.size(0):
+        raise ValueError("q, k, and v batch dimensions must match")
+    if q.size(-2) != 1 or k.size(-2) != 1 or v.size(-2) != 1:
+        raise ValueError("ragged decode rotary append expects exactly one token")
+    if q.size(-1) != k.size(-1) or k.size(-1) != v.size(-1):
+        raise ValueError("q, k, and v head dimensions must match")
+    if q.size(-1) % 2 != 0:
+        raise ValueError("head dimension must be even")
+    if k.size(1) != v.size(1):
+        raise ValueError("k and v head counts must match")
+    if cache_keys.shape != cache_values.shape:
+        raise ValueError("cache keys and values must have the same shape")
+    if k.size(1) != cache_keys.size(1) or k.size(-1) != cache_keys.size(-1):
+        raise ValueError("cache shape is incompatible with incoming k/v")
+    batch, q_heads, _, head_dim = q.shape
+    if positions.shape != (batch,):
+        raise ValueError("ragged decode positions must have shape [batch]")
+    if positions.device != cache_keys.device:
+        raise ValueError("ragged decode positions must be on the cache device")
+    if row_indices is not None:
+        if row_indices.shape != (batch,):
+            raise ValueError("ragged decode row indices must have shape [batch]")
+        if row_indices.device != cache_keys.device:
+            raise ValueError("ragged decode row indices must be on the cache device")
+    if cos.shape != sin.shape:
+        raise ValueError("cos and sin must have the same shape")
+    half_dim = q.size(-1) // 2
+    if cos.shape not in {(batch, half_dim), (batch, head_dim)}:
+        raise ValueError("ragged decode rotary cache shape must be [batch, head_dim / 2]")
+    if q.stride(-1) != 1 or k.stride(-1) != 1 or v.stride(-1) != 1:
+        raise ValueError("q, k, and v must have contiguous head dimensions")
+    if cache_keys.stride(-1) != 1 or cache_values.stride(-1) != 1:
+        raise ValueError("cache keys and values must have contiguous head dimensions")
+    cos = cos.contiguous()
+    sin = sin.contiguous()
+    positions = positions.contiguous()
+    if row_indices is not None:
+        row_indices = row_indices.contiguous()
+    kv_heads = k.size(1)
+    q_pairs = batch * q_heads * half_dim
+    k_pairs = batch * kv_heads * half_dim
+    v_elements = batch * kv_heads * head_dim
+    total_elements = max(q_pairs, k_pairs, v_elements)
+    block_size = 256
+    grid = (triton.cdiv(total_elements, block_size),)
+    _rotary_llama_append_kv_ragged_decode_kernel[grid](
+        q,
+        k,
+        v,
+        cache_keys,
+        cache_values,
+        positions,
+        row_indices,
+        cos,
+        sin,
+        total_elements,
+        q_pairs,
+        k_pairs,
+        v_elements,
+        q_heads,
+        kv_heads,
+        head_dim,
+        half_dim,
+        cos.size(-1),
+        row_indices is not None,
+        q.stride(0),
+        q.stride(1),
+        q.stride(3),
+        k.stride(0),
+        k.stride(1),
+        k.stride(3),
+        v.stride(0),
+        v.stride(1),
+        v.stride(3),
+        cache_keys.stride(0),
+        cache_keys.stride(1),
+        cache_keys.stride(2),
+        cache_keys.stride(3),
+        block_size,
+        num_warps=4,
+    )
+    return q
+
+
+@triton.jit
 def _kv_cache_append_kernel(
     key_ptr,
     value_ptr,
