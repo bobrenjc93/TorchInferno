@@ -706,6 +706,77 @@ def test_openai_engine_prompt_token_cache_can_be_disabled(monkeypatch) -> None:
     assert tokenizer.calls == 2
 
 
+def test_openai_engine_keeps_multiple_prefix_cache_entries(monkeypatch) -> None:
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_PREFIX_CACHE_MIN_TOKENS", "1")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_PREFIX_CACHE_MAX_ENTRIES", "4")
+    model = _PrefixRecordingModel()
+    engine = _cache_only_engine()
+    engine.model = model
+
+    for tokens in ([10, 11], [20, 21]):
+        input_ids = torch.tensor([tokens], dtype=torch.long)
+        cache = model.allocate_cache(1, 8)
+        model.forward(input_ids, cache=cache, use_cache=True)
+        engine._save_prompt_prefix_cache(input_ids, cache)
+
+    restore_cache = model.allocate_cache(1, 8)
+    restored = engine._restore_prefix_cache(
+        torch.tensor([[10, 11, 2, 12]], dtype=torch.long),
+        restore_cache,
+    )
+
+    assert restored == 2
+    assert restore_cache.seq_len == 2
+
+
+def test_openai_engine_prefix_cache_max_entries_evicts_oldest(monkeypatch) -> None:
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_PREFIX_CACHE_MIN_TOKENS", "1")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_PREFIX_CACHE_MAX_ENTRIES", "1")
+    model = _PrefixRecordingModel()
+    engine = _cache_only_engine()
+    engine.model = model
+
+    for tokens in ([10, 11], [20, 21]):
+        input_ids = torch.tensor([tokens], dtype=torch.long)
+        cache = model.allocate_cache(1, 8)
+        model.forward(input_ids, cache=cache, use_cache=True)
+        engine._save_prompt_prefix_cache(input_ids, cache)
+
+    assert (
+        engine._restore_prefix_cache(
+            torch.tensor([[10, 11, 2, 12]], dtype=torch.long),
+            model.allocate_cache(1, 8),
+        )
+        == 0
+    )
+    assert (
+        engine._restore_prefix_cache(
+            torch.tensor([[20, 21, 2, 22]], dtype=torch.long),
+            model.allocate_cache(1, 8),
+        )
+        == 2
+    )
+
+
+def test_openai_engine_restores_older_exact_prefix_cache(monkeypatch) -> None:
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_PREFIX_CACHE_MAX_ENTRIES", "4")
+    model = _PrefixRecordingModel()
+    engine = _cache_only_engine()
+    engine.model = model
+
+    first_ids = torch.tensor([[10, 11]], dtype=torch.long)
+    second_ids = torch.tensor([[20, 21]], dtype=torch.long)
+    for input_ids in (first_ids, second_ids):
+        cache = model.allocate_cache(1, 8)
+        model.forward(input_ids, cache=cache, use_cache=True)
+        engine._save_prompt_prefix_cache(input_ids, cache)
+
+    restore_cache = model.allocate_cache(1, 8)
+
+    assert engine._restore_exact_prefix_cache(first_ids, restore_cache) == 2
+    assert restore_cache.seq_len == 2
+
+
 def test_openai_engine_uses_prefill_graph_for_prefix_suffix(monkeypatch) -> None:
     monkeypatch.setenv("TORCHINFERNO_OPENAI_PREFIX_CACHE_MIN_TOKENS", "1")
     model = _PrefixGraphRecordingModel()

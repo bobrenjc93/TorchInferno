@@ -401,6 +401,7 @@ class OpenAICompletionEngine:
         self._cache_pool: dict[tuple[int, int, str, int, str], object] = {}
         self._microbatch_cache_pool: dict[tuple[int, int, int, str, int, str], object] = {}
         self._prefix_cache_entry: TensorPrefixCacheEntry | None = None
+        self._prefix_cache_entries: dict[tuple[int, ...], TensorPrefixCacheEntry] = {}
         self._prompt_token_cache: dict[str, list[int]] = {}
         self._prompt_token_cache_lock = threading.Lock()
         self._phase_timing_enabled = env_flag("TORCHINFERNO_OPENAI_PHASE_TIMINGS")
@@ -925,30 +926,33 @@ class OpenAICompletionEngine:
         if not env_flag("TORCHINFERNO_OPENAI_PREFIX_CACHE", True):
             return 0
         if not _prefix_cache_enabled_for_model(self.model):
-            self._prefix_cache_entry = None
+            self._clear_prefix_cache()
             return 0
         if input_ids.size(0) != 1:
             return 0
-        entry = getattr(self, "_prefix_cache_entry", None)
-        if entry is None:
-            return 0
         input_tokens = tuple(int(token_id) for token_id in input_ids[0].detach().cpu().tolist())
-        return restore_tensor_prefix_cache(
-            entry,
-            input_tokens,
-            cache,
-            min_prefix_tokens=env_int("TORCHINFERNO_OPENAI_PREFIX_CACHE_MIN_TOKENS", 16, minimum=1),
-            device=str(self.device),
-            backend=self.cache_backend,
-            page_size=self.page_size,
-            on_seq_len_restore_error=lambda exc: warn_optional_failure("openai.prefix_cache.seq_len_restore", exc),
-        )
+        min_prefix_tokens = env_int("TORCHINFERNO_OPENAI_PREFIX_CACHE_MIN_TOKENS", 16, minimum=1)
+        for _, entry in self._prefix_cache_restore_candidates(input_tokens, min_prefix_tokens):
+            restored = restore_tensor_prefix_cache(
+                entry,
+                input_tokens,
+                cache,
+                min_prefix_tokens=min_prefix_tokens,
+                device=str(self.device),
+                backend=self.cache_backend,
+                page_size=self.page_size,
+                on_seq_len_restore_error=lambda exc: warn_optional_failure("openai.prefix_cache.seq_len_restore", exc),
+            )
+            if restored > 0:
+                self._mark_prefix_cache_entry_used(entry)
+                return restored
+        return 0
 
     def _save_prefix_cache(self, input_ids: Tensor, generated_tokens: list[int], cache: object) -> None:
         if not env_flag("TORCHINFERNO_OPENAI_PREFIX_CACHE", True):
             return
         if not _prefix_cache_enabled_for_model(self.model):
-            self._prefix_cache_entry = None
+            self._clear_prefix_cache()
             return
         if input_ids.size(0) != 1 or not generated_tokens:
             return
@@ -972,28 +976,26 @@ class OpenAICompletionEngine:
         if seq_len < len(tokens):
             self._prefix_cache_entry = None
             return
-        self._prefix_cache_entry = snapshot_tensor_prefix_cache(
+        self._store_prefix_cache_entry(snapshot_tensor_prefix_cache(
             cache,
             tokens,
             seq_len=seq_len,
             device=str(self.device),
             backend=self.cache_backend,
             page_size=self.page_size,
-        )
+        ))
 
     def _restore_exact_prefix_cache(self, input_ids: Tensor, cache: object) -> int:
         if not env_flag("TORCHINFERNO_OPENAI_PREFIX_CACHE", True):
             return 0
         if not _prefix_cache_enabled_for_model(self.model):
-            self._prefix_cache_entry = None
+            self._clear_prefix_cache()
             return 0
         if input_ids.size(0) != 1:
             return 0
-        entry = getattr(self, "_prefix_cache_entry", None)
-        if entry is None:
-            return 0
         input_tokens = tuple(int(token_id) for token_id in input_ids[0].detach().cpu().tolist())
-        if input_tokens != entry.tokens:
+        entry = self._exact_prefix_cache_entry(input_tokens)
+        if entry is None:
             return 0
         if entry.device != str(self.device) or entry.backend != self.cache_backend or entry.page_size != self.page_size:
             return 0
@@ -1011,13 +1013,14 @@ class OpenAICompletionEngine:
             layer_keys[:1, :, :seq_len, :].copy_(keys[:, :, :seq_len, :])
             layer_values[:1, :, :seq_len, :].copy_(values[:, :, :seq_len, :])
         _set_generation_cache_seq_len(cache, seq_len)
+        self._mark_prefix_cache_entry_used(entry)
         return seq_len
 
     def _save_prompt_prefix_cache(self, input_ids: Tensor, cache: object) -> None:
         if not env_flag("TORCHINFERNO_OPENAI_PREFIX_CACHE", True):
             return
         if not _prefix_cache_enabled_for_model(self.model):
-            self._prefix_cache_entry = None
+            self._clear_prefix_cache()
             return
         if input_ids.size(0) != 1:
             return
@@ -1029,14 +1032,76 @@ class OpenAICompletionEngine:
         seq_len = min(len(tokens), _generation_cache_seq_len(cache))
         if seq_len < len(tokens):
             return
-        self._prefix_cache_entry = snapshot_tensor_prefix_cache(
+        self._store_prefix_cache_entry(snapshot_tensor_prefix_cache(
             cache,
             tokens,
             seq_len=seq_len,
             device=str(self.device),
             backend=self.cache_backend,
             page_size=self.page_size,
-        )
+        ))
+
+    def _clear_prefix_cache(self) -> None:
+        self._prefix_cache_entry = None
+        entries = getattr(self, "_prefix_cache_entries", None)
+        if isinstance(entries, dict):
+            entries.clear()
+        else:
+            self._prefix_cache_entries = {}
+
+    def _prefix_cache_entry_map(self) -> dict[tuple[int, ...], TensorPrefixCacheEntry]:
+        entries = getattr(self, "_prefix_cache_entries", None)
+        if not isinstance(entries, dict):
+            entries = {}
+            self._prefix_cache_entries = entries
+        return entries
+
+    def _store_prefix_cache_entry(self, entry: TensorPrefixCacheEntry | None) -> None:
+        self._prefix_cache_entry = entry
+        if entry is None:
+            return
+        entries = self._prefix_cache_entry_map()
+        entries.pop(entry.tokens, None)
+        entries[entry.tokens] = entry
+        max_entries = env_int("TORCHINFERNO_OPENAI_PREFIX_CACHE_MAX_ENTRIES", 64, minimum=1)
+        while len(entries) > max_entries:
+            entries.pop(next(iter(entries)))
+
+    def _mark_prefix_cache_entry_used(self, entry: TensorPrefixCacheEntry) -> None:
+        self._prefix_cache_entry = entry
+        entries = self._prefix_cache_entry_map()
+        if entries.get(entry.tokens) is entry:
+            entries.pop(entry.tokens, None)
+            entries[entry.tokens] = entry
+
+    def _exact_prefix_cache_entry(self, input_tokens: tuple[int, ...]) -> TensorPrefixCacheEntry | None:
+        entry = self._prefix_cache_entry_map().get(input_tokens)
+        if entry is not None:
+            return entry
+        latest = getattr(self, "_prefix_cache_entry", None)
+        if isinstance(latest, TensorPrefixCacheEntry) and latest.tokens == input_tokens:
+            return latest
+        return None
+
+    def _prefix_cache_restore_candidates(
+        self,
+        input_tokens: tuple[int, ...],
+        min_prefix_tokens: int,
+    ) -> list[tuple[int, TensorPrefixCacheEntry]]:
+        candidates: list[tuple[int, TensorPrefixCacheEntry]] = []
+        seen: set[tuple[int, ...]] = set()
+        for entry in self._prefix_cache_entry_map().values():
+            seen.add(entry.tokens)
+            prefix_tokens = _matching_prefix_tokens(entry.tokens, input_tokens, min_prefix_tokens)
+            if prefix_tokens > 0:
+                candidates.append((prefix_tokens, entry))
+        latest = getattr(self, "_prefix_cache_entry", None)
+        if isinstance(latest, TensorPrefixCacheEntry) and latest.tokens not in seen:
+            prefix_tokens = _matching_prefix_tokens(latest.tokens, input_tokens, min_prefix_tokens)
+            if prefix_tokens > 0:
+                candidates.append((prefix_tokens, latest))
+        candidates.sort(key=lambda candidate: candidate[0], reverse=True)
+        return candidates
 
     def _materialize_generated_cache_tokens(
         self,
@@ -2894,6 +2959,20 @@ def _indexed_prompts_by_length(indexed: Sequence[tuple[int, list[int]]]) -> list
     for item in indexed:
         groups.setdefault(len(item[1]), []).append(item)
     return sorted(groups.values(), key=lambda group: len(group[0][1]), reverse=True)
+
+
+def _matching_prefix_tokens(
+    cached_tokens: Sequence[int],
+    input_tokens: Sequence[int],
+    min_prefix_tokens: int,
+) -> int:
+    if len(input_tokens) <= len(cached_tokens):
+        return 0
+    max_prefix = min(len(input_tokens) - 1, len(cached_tokens))
+    for prefix_tokens in range(max_prefix, min_prefix_tokens - 1, -1):
+        if input_tokens[:prefix_tokens] == cached_tokens[:prefix_tokens]:
+            return prefix_tokens
+    return 0
 
 
 def _common_prefix_token_count(input_ids: Tensor) -> int:

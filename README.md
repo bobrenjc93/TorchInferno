@@ -544,9 +544,10 @@ OpenAI serving also has explicit environment knobs for production-shape tuning:
 
 - `TORCHINFERNO_OPENAI_AUTO_TORCHRUN=0` disables automatic tensor-parallel
   worker launch.
-- `TORCHINFERNO_OPENAI_PREFIX_CACHE=0` disables the single-entry OpenAI prefix
-  KV cache; `TORCHINFERNO_OPENAI_PREFIX_CACHE_MIN_TOKENS`,
-  `TORCHINFERNO_OPENAI_PREFIX_CACHE_MAX_TOKENS`, and
+- `TORCHINFERNO_OPENAI_PREFIX_CACHE=0` disables the bounded OpenAI prefix KV
+  cache; `TORCHINFERNO_OPENAI_PREFIX_CACHE_MIN_TOKENS`,
+  `TORCHINFERNO_OPENAI_PREFIX_CACHE_MAX_TOKENS`,
+  `TORCHINFERNO_OPENAI_PREFIX_CACHE_MAX_ENTRIES`, and
   `TORCHINFERNO_OPENAI_PREFIX_CACHE_MATERIALIZE_GENERATED` tune reuse.
 - `TORCHINFERNO_OPENAI_PROMPT_TOKEN_CACHE_MAX_ENTRIES` bounds repeated chat
   prompt tokenization reuse; set it to `0` to disable the cache.
