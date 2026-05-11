@@ -3,6 +3,85 @@
 TorchInferno is designed so agents can make focused contributions without
 learning a serving stack first.
 
+## Project Overview
+
+TorchInferno is a torch-native inference workbench for making inference systems
+easy to inspect, trace, optimize, simulate, and serve without booting a
+heavyweight production stack for every experiment. The repo is organized around
+separate planes:
+
+- Model families in `src/torchinferno/models/` own tensor contracts,
+  checkpoint rules, cache interfaces, and readable torch-native `v0`
+  implementations.
+- Runtime code in `src/torchinferno/runtime/`, `src/torchinferno/engine/`, and
+  `src/torchinferno/server/` owns generation, batching, paged/prefix KV cache
+  policy, OpenAI-compatible serving, distributed simulation, and graph runners.
+- Offline optimization code in `src/torchinferno/compiler.py`,
+  `src/torchinferno/graph/`, `src/torchinferno/kernels/`,
+  `src/torchinferno/profiling.py`, and `src/torchinferno/research/` captures
+  reference graphs, evaluates candidate replacements, and produces evidence
+  before anything is promoted into runtime.
+- Documentation and readiness tracking live in `README.md`,
+  `docs/OFFLINE_OPTIMIZATION.md`, `docs/ROADMAP.md`, and
+  `src/torchinferno/audit.py`.
+
+Current model coverage includes compact DSv4, native DeepSeek-V3.2-style, and
+Llama3 paths. DSv4 and DeepSeek are intentionally CPU-friendly correctness and
+cache bringup surfaces; Llama3 carries the larger production-scale pipeline and
+tensor-parallel benchmark work.
+
+## Working Philosophy
+
+- Keep the readable torch-native model path as the reference contract.
+- Keep model families separate from serving, profiling, parallelism,
+  disaggregation, and backend replacement workbenches.
+- Keep runtime hot paths concrete: do not generate graphs, compile kernels, or
+  run search loops from constructors, `forward`, `generate`, serving engines, or
+  request handling.
+- Promote optimizations only after they are validated against the reference path
+  with reproducible artifacts.
+- Prefer small CPU-runnable APIs and tests first, then add CUDA-only or
+  distributed behavior behind clear interfaces.
+- Treat benchmark and profile numbers as evidence to explain, not as answers to
+  chase.
+
+## Benchmark and Evaluation Integrity
+
+Never hard-code benchmark answers, expected outputs, request shapes, prompt
+strings, token ids, fixture names, dataset identifiers, hashes, random seeds, or
+test-case positions to pass a benchmark or evaluation. Do not add logic that
+detects a benchmark harness, public test, hidden test, or known prompt and
+returns a special result.
+
+Prohibited patterns include prompt lookup tables, fixture-specific branches,
+`if benchmark_name == ...` behavior changes, request-length fingerprints, and
+shortcuts that bypass normal model/runtime logic for known eval cases.
+
+Benchmark-driven work is welcome when it improves the general implementation:
+better scheduling, cache policy, graph reuse, kernel selection, batching,
+sampling, IO, or validation. Such changes must be expressed as normal runtime or
+offline optimization behavior, must preserve correctness on unseen inputs, and
+must have focused tests or profile artifacts that explain why the improvement is
+real.
+
+If a benchmark exposes a gap, fix the underlying model, runtime, conversion,
+kernel, or measurement issue. If a benchmark itself is flawed, document the
+limitation and add a fairer check instead of training the code to the benchmark.
+
+## Tooling Snapshot
+
+- `python3 -m pytest` runs the test suite; `make test` is the shortcut.
+- `make lint` runs `pyflakes` and `ruff`; `make dead-code` runs `vulture`.
+- `torchinferno.cli audit` and `model-variants` summarize readiness and variant
+  provenance.
+- Smoke commands cover DSv4, DeepSeek, tracing, serving, simulation, traffic,
+  perf, and profiling paths.
+- Profile commands write artifacts under `.torchinferno_runs/` for whole-model,
+  time-sliced, offload, node, subgraph, region, and pattern analysis.
+- Optional extras are split in `pyproject.toml`: `serve` and `text` for
+  tokenizer-backed serving, `kernels` for Triton, `helion` for Helion
+  experiments, and `dev` for lint/test tools.
+
 ## Start Here
 
 Run the local checks before and after non-trivial changes:
