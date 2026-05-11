@@ -23,6 +23,31 @@ def warmup_temperature_batch_sizes() -> tuple[int, ...]:
     )
 
 
+def warmup_ragged_decode_batch_sizes() -> tuple[int, ...]:
+    return parse_positive_int_csv(
+        os.environ.get("TORCHINFERNO_OPENAI_WARMUP_RAGGED_DECODE_BATCH_SIZES", "64")
+    )
+
+
+def warmup_ragged_decode_row_counts() -> tuple[int, ...]:
+    return parse_positive_int_csv(
+        os.environ.get("TORCHINFERNO_OPENAI_WARMUP_RAGGED_DECODE_ROW_COUNTS", "64,32,16")
+    )
+
+
+def warmup_ragged_decode_cache_token_counts() -> tuple[int, ...]:
+    return parse_positive_int_csv(
+        os.environ.get("TORCHINFERNO_OPENAI_WARMUP_RAGGED_DECODE_CACHE_TOKENS", "256,512")
+    )
+
+
+def warmup_ragged_decode_prompt_tokens(default_prompt_tokens: int) -> int:
+    return max(
+        1,
+        int(os.environ.get("TORCHINFERNO_OPENAI_WARMUP_RAGGED_DECODE_PROMPT_TOKENS", default_prompt_tokens)),
+    )
+
+
 def warmup_prefill_cache_token_counts() -> tuple[int, ...]:
     return parse_positive_int_csv(
         os.environ.get("TORCHINFERNO_OPENAI_WARMUP_PREFILL_CACHE_TOKENS", "128,256,512,1024")

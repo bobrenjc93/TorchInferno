@@ -39,6 +39,10 @@ from torchinferno.openai_server import (
     _warmup_prompt_token_counts,
     _warmup_prefix_suffix_cache_token_counts,
     _warmup_prefix_suffix_token_counts,
+    _warmup_ragged_decode_batch_sizes,
+    _warmup_ragged_decode_cache_token_counts,
+    _warmup_ragged_decode_prompt_tokens,
+    _warmup_ragged_decode_row_counts,
     _warmup_temperature_batch_sizes,
     _warmup_temperature_prompt_token_counts,
     load_chat_tokenizer,
@@ -181,6 +185,10 @@ def test_openai_server_warmup_uses_generic_shape_buckets(monkeypatch) -> None:
     assert set(_warmup_prefix_suffix_cache_token_counts()) >= {128, 256, 512, 1024}
     assert set(_warmup_temperature_prompt_token_counts()) == {32, 55, 64}
     assert set(_warmup_temperature_batch_sizes()) >= {1, 8, 16, 64}
+    assert set(_warmup_ragged_decode_batch_sizes()) == {64}
+    assert set(_warmup_ragged_decode_row_counts()) >= {16, 32, 64}
+    assert set(_warmup_ragged_decode_cache_token_counts()) >= {256, 512}
+    assert _warmup_ragged_decode_prompt_tokens(64) == 64
 
 
 def test_openai_temperature_warmup_uses_configured_batch_size(monkeypatch) -> None:
@@ -202,6 +210,30 @@ def test_openai_temperature_warmup_uses_configured_batch_size(monkeypatch) -> No
 
     assert model.prefill_shapes == [(3, 2), (1, 2)]
     assert model.decode_shapes == [(3, 1), (3, 1)]
+
+
+def test_openai_ragged_decode_warmup_uses_configured_shapes(monkeypatch) -> None:
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_WARMUP_RAGGED_DECODE_BATCH_SIZES", "4")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_WARMUP_RAGGED_DECODE_ROW_COUNTS", "4,2")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_WARMUP_RAGGED_DECODE_CACHE_TOKENS", "8")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_WARMUP_RAGGED_DECODE_PROMPT_TOKENS", "3")
+
+    model = _WarmupShapeModel()
+    engine = object.__new__(OpenAICompletionEngine)
+    engine.model = model
+    engine.device = torch.device("cpu")
+    engine.cache_backend = "dense"
+    engine.page_size = 16
+    engine._cache_pool = {}
+    engine._microbatch_cache_pool = {}
+
+    engine._warmup_tensor_parallel_ragged_decode_graphs(vocab_size=16)
+
+    assert model.prefill_shapes == [(4, 3)]
+    assert model.ragged_shapes == [
+        (4, 1, (3, 3, 3, 3), None),
+        (2, 1, (3, 3, 3, 3), (0, 1)),
+    ]
 
 
 def test_openai_server_pipeline_parallelism_skips_auto_launch(monkeypatch) -> None:
@@ -1989,6 +2021,7 @@ class _WarmupShapeModel:
         self.config = type("Config", (), {"vocab_size": 16})()
         self.prefill_shapes: list[tuple[int, int]] = []
         self.decode_shapes: list[tuple[int, int]] = []
+        self.ragged_shapes: list[tuple[int, int, tuple[int, ...], tuple[int, ...] | None]] = []
 
     def allocate_cache(self, batch_size: int, max_seq_len: int, **kwargs) -> _WarmupShapeCache:
         return _WarmupShapeCache()
@@ -2000,6 +2033,40 @@ class _WarmupShapeModel:
     def try_decode_one_token_logits_graph(self, input_ids: torch.Tensor, cache: _WarmupShapeCache) -> torch.Tensor:
         self.decode_shapes.append((input_ids.size(0), input_ids.size(1)))
         return torch.zeros(input_ids.size(0), input_ids.size(1), self.config.vocab_size)
+
+    def try_decode_ragged_logits_graph(
+        self,
+        input_ids: torch.Tensor,
+        cache: _WarmupShapeCache,
+        *,
+        seq_lens: torch.Tensor,
+        row_indices: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        row_tuple = None if row_indices is None else tuple(int(index) for index in row_indices.tolist())
+        self.ragged_shapes.append(
+            (
+                input_ids.size(0),
+                input_ids.size(1),
+                tuple(int(seq_len) for seq_len in seq_lens.tolist()),
+                row_tuple,
+            )
+        )
+        return torch.zeros(input_ids.size(0), input_ids.size(1), self.config.vocab_size)
+
+    def decode_ragged_logits(
+        self,
+        input_ids: torch.Tensor,
+        cache: _WarmupShapeCache,
+        *,
+        seq_lens: torch.Tensor,
+        row_indices: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        return self.try_decode_ragged_logits_graph(
+            input_ids,
+            cache,
+            seq_lens=seq_lens,
+            row_indices=row_indices,
+        )
 
 
 class _PrefixTokenizer:

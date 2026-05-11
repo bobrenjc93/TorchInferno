@@ -37,6 +37,10 @@ from torchinferno.openai_warmup import (
     warmup_prefix_suffix_cache_token_counts as _warmup_prefix_suffix_cache_token_counts,
     warmup_prefix_suffix_token_counts as _warmup_prefix_suffix_token_counts,
     warmup_prompt_token_counts as _warmup_prompt_token_counts,
+    warmup_ragged_decode_batch_sizes as _warmup_ragged_decode_batch_sizes,
+    warmup_ragged_decode_cache_token_counts as _warmup_ragged_decode_cache_token_counts,
+    warmup_ragged_decode_prompt_tokens as _warmup_ragged_decode_prompt_tokens,
+    warmup_ragged_decode_row_counts as _warmup_ragged_decode_row_counts,
     warmup_temperature_batch_sizes as _warmup_temperature_batch_sizes,
     warmup_temperature_prompt_token_counts as _warmup_temperature_prompt_token_counts,
 )
@@ -1154,6 +1158,7 @@ class OpenAICompletionEngine:
             self._warmup_tensor_parallel_prefill_graphs(prompt_token_counts, vocab_size)
             self._warmup_tensor_parallel_prefix_suffix_graphs(vocab_size)
             self._warmup_tensor_parallel_temperature_graphs(vocab_size)
+            self._warmup_tensor_parallel_ragged_decode_graphs(vocab_size)
             warmup_cache_tokens = max(
                 max(prompt_token_counts) + new_tokens,
                 env_int("TORCHINFERNO_OPENAI_WARMUP_CACHE_TOKENS", 256, minimum=1),
@@ -1244,6 +1249,56 @@ class OpenAICompletionEngine:
             decode_input = next_token[:, None]
         _repeat_generation_cache_first_batch(cache, batch_size)
         _try_decode_one_token_logits_graph(self.model, decode_input, cache)
+
+    def _warmup_tensor_parallel_ragged_decode_graphs(self, vocab_size: int) -> None:
+        if not env_flag("TORCHINFERNO_CUDAGRAPH_RAGGED_DECODE_STEP", True):
+            return
+        if not _ragged_decode_enabled_for_model(self.model):
+            return
+        prompt_tokens = _warmup_ragged_decode_prompt_tokens(64)
+        batch_sizes = _warmup_ragged_decode_batch_sizes()
+        row_counts = _warmup_ragged_decode_row_counts()
+        cache_token_counts = _warmup_ragged_decode_cache_token_counts()
+        if not batch_sizes or not row_counts or not cache_token_counts:
+            return
+        for batch_size in batch_sizes:
+            for cache_tokens in cache_token_counts:
+                if prompt_tokens >= cache_tokens:
+                    continue
+                cache = self._generation_cache(batch_size, cache_tokens, model=self.model)
+                base = torch.arange(prompt_tokens, device=self.device, dtype=torch.long) % vocab_size
+                input_ids = base[None, :].expand(batch_size, prompt_tokens).contiguous()
+                next_token, cache = _prefill_next_token(
+                    self.model,
+                    input_ids,
+                    cache,
+                    0.0,
+                    allow_capture=True,
+                )
+                next_token = next_token.to(self.device)
+                seq_lens = torch.full((batch_size,), prompt_tokens, dtype=torch.long, device=self.device)
+                for row_count in row_counts:
+                    rows = min(batch_size, int(row_count))
+                    if rows <= 0:
+                        continue
+                    if rows == batch_size:
+                        _try_decode_ragged_logits_graph(
+                            self.model,
+                            next_token[:, None],
+                            cache,
+                            seq_lens=seq_lens,
+                            row_indices=None,
+                        )
+                    else:
+                        row_indices = torch.arange(rows, dtype=torch.long, device=self.device)
+                        _try_decode_ragged_logits_graph(
+                            self.model,
+                            next_token[:rows, None],
+                            cache,
+                            seq_lens=seq_lens,
+                            row_indices=row_indices,
+                        )
+                _reset_generation_cache(cache)
 
     def _generate_prompt_token_list(self, prompt: list[int], *, max_tokens: int, temperature: float) -> list[int]:
         input_ids = torch.tensor([prompt], dtype=torch.long, device=self.device)
