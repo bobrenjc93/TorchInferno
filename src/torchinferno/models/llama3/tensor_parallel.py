@@ -46,6 +46,14 @@ def _tp_env_set(name: str) -> bool:
     return name in os.environ
 
 
+def _capture_needed_on_any_rank(needs_capture: bool, device: torch.device) -> bool:
+    if not dist.is_available() or not dist.is_initialized() or dist.get_world_size() <= 1:
+        return needs_capture
+    flag = torch.tensor([1 if needs_capture else 0], dtype=torch.int32, device=device)
+    dist.all_reduce(flag, op=dist.ReduceOp.MAX)
+    return bool(flag.item())
+
+
 @dataclass(frozen=True)
 class Llama3TensorParallelLoadReport:
     checkpoint: str
@@ -1503,16 +1511,19 @@ class Llama3TensorParallelForCausalLM:
             tuple(input_ids.shape),
         )
         captured = self._prefill_graphs.get(key)
-        if (
+        needs_capture = (
             captured is None
             or captured.cache is not cache
             or captured.prompt_tokens != input_ids.size(1)
             or captured.initial_seq_len != initial_seq_len
             or captured.max_seq_len != cache.layers[0].max_seq_len
             or captured.static_input_ids.shape != input_ids.shape
-        ):
-            if not capture_on_miss:
-                return None
+        )
+        if needs_capture and not capture_on_miss:
+            return None
+        if capture_on_miss:
+            needs_capture = _capture_needed_on_any_rank(needs_capture, self.device)
+        if needs_capture:
             captured = self._capture_prefill_graph(input_ids, cache)
             max_graphs = _tp_int("TORCHINFERNO_CUDAGRAPH_PREFILL_MAX_GRAPHS", 128, minimum=1)
             if key not in self._prefill_graphs and len(self._prefill_graphs) >= max_graphs:
@@ -1577,16 +1588,19 @@ class Llama3TensorParallelForCausalLM:
             tuple(input_ids.shape),
         )
         captured = self._prefill_logits_graphs.get(key)
-        if (
+        needs_capture = (
             captured is None
             or captured.cache is not cache
             or captured.prompt_tokens != input_ids.size(1)
             or captured.initial_seq_len != initial_seq_len
             or captured.max_seq_len != cache.layers[0].max_seq_len
             or captured.static_input_ids.shape != input_ids.shape
-        ):
-            if not capture_on_miss:
-                return None
+        )
+        if needs_capture and not capture_on_miss:
+            return None
+        if capture_on_miss:
+            needs_capture = _capture_needed_on_any_rank(needs_capture, self.device)
+        if needs_capture:
             captured = self._capture_prefill_logits_graph(input_ids, cache)
             max_graphs = _tp_int("TORCHINFERNO_CUDAGRAPH_PREFILL_MAX_GRAPHS", 128, minimum=1)
             if key not in self._prefill_logits_graphs and len(self._prefill_logits_graphs) >= max_graphs:

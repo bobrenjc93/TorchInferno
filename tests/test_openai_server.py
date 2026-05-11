@@ -911,12 +911,43 @@ def test_openai_engine_skips_runtime_prefill_graph_capture_on_miss() -> None:
     assert model.forward_inputs
 
 
-def test_openai_engine_skips_runtime_shared_prefix_capture_for_tensor_parallel(monkeypatch) -> None:
+def test_openai_engine_uses_runtime_shared_prefix_capture_for_tensor_parallel(monkeypatch) -> None:
     model = _RuntimePrefillLogitsGraphCaptureModel()
     engine = _cache_only_engine()
     engine.model = model
     engine.stop_token_ids = frozenset()
 
+    monkeypatch.setattr(
+        "torchinferno.openai_server._is_tensor_parallel_model",
+        lambda candidate: candidate is model,
+    )
+    monkeypatch.setattr(
+        "torchinferno.openai_server._tensor_parallel_world_size",
+        lambda candidate: 8 if candidate is model else 1,
+    )
+
+    steps = list(
+        engine._generate_shared_prefix_prompt_list_steps(
+            [[10, 11, 12], [10, 11, 13, 14]],
+            prefix_tokens=2,
+            max_tokens=1,
+            temperature=0.0,
+        )
+    )
+
+    assert steps == [[2, 2]]
+    assert model.capture_flags == [True, True, True]
+    assert model.graph_inputs == [[10, 11], [13, 14], [12]]
+    assert model.forward_inputs == []
+
+
+def test_openai_engine_can_disable_runtime_shared_prefix_capture_for_tensor_parallel(monkeypatch) -> None:
+    model = _RuntimePrefillLogitsGraphCaptureModel()
+    engine = _cache_only_engine()
+    engine.model = model
+    engine.stop_token_ids = frozenset()
+
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_RUNTIME_PREFILL_CAPTURE", "0")
     monkeypatch.setattr(
         "torchinferno.openai_server._is_tensor_parallel_model",
         lambda candidate: candidate is model,

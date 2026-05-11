@@ -774,7 +774,13 @@ class OpenAICompletionEngine:
             input_ids.size(1) + max_tokens,
             model=model,
         )
-        next_token, cache = _prefill_next_token(model, input_ids, cache, temperature)
+        next_token, cache = _prefill_next_token(
+            model,
+            input_ids,
+            cache,
+            temperature,
+            allow_capture=_runtime_prefill_graph_capture_enabled(model, temperature, max_tokens=max_tokens),
+        )
         next_token = next_token.to(self.device)
         generated_tokens: list[Tensor] = []
         active = (
@@ -1504,7 +1510,13 @@ class OpenAICompletionEngine:
         )
         per_row_limits = _normalize_row_max_tokens(row_max_tokens, input_ids.size(0), max_tokens)
         active = [limit > 0 for limit in per_row_limits]
-        next_token, cache = _prefill_next_token(model, input_ids, cache, temperature)
+        next_token, cache = _prefill_next_token(
+            model,
+            input_ids,
+            cache,
+            temperature,
+            allow_capture=_runtime_prefill_graph_capture_enabled(model, temperature, max_tokens=max_tokens),
+        )
         next_token = next_token.to(self.device)
         seq_lens = torch.full((input_ids.size(0),), input_ids.size(1), dtype=torch.long, device=self.device)
         for step in range(max_tokens):
@@ -1581,6 +1593,7 @@ class OpenAICompletionEngine:
             cache,
             batch_size,
             temperature,
+            allow_capture=_runtime_prefill_graph_capture_enabled(model, temperature, max_tokens=max_tokens),
         )
         next_token = next_token.to(self.device)
         _repeat_generation_cache_first_batch(cache, batch_size)
@@ -1645,7 +1658,13 @@ class OpenAICompletionEngine:
                 model=model,
             )
             active = [limit > 0 for limit in chunk_limits]
-            next_token, cache = _prefill_next_token(model, chunk_input_ids, cache, temperature)
+            next_token, cache = _prefill_next_token(
+                model,
+                chunk_input_ids,
+                cache,
+                temperature,
+                allow_capture=_runtime_prefill_graph_capture_enabled(model, temperature, max_tokens=max_tokens),
+            )
             next_token = next_token.to(self.device)
             step_tokens = [None for _ in range(batch_size)]
             for offset, token_id in enumerate(next_token.detach().cpu().tolist()):
@@ -1865,7 +1884,7 @@ class OpenAICompletionEngine:
                 model,
                 prefix_ids,
                 prefix_cache,
-                allow_capture=_runtime_prefill_graph_capture_enabled(model),
+                allow_capture=_runtime_prefill_graph_capture_enabled(model, temperature, max_tokens=max_tokens),
             )
             self._save_prompt_prefix_cache(prefix_ids, prefix_cache)
 
@@ -1927,7 +1946,7 @@ class OpenAICompletionEngine:
                 suffix_ids,
                 cache,
                 temperature,
-                allow_capture=_runtime_prefill_graph_capture_enabled(model),
+                allow_capture=_runtime_prefill_graph_capture_enabled(model, temperature, max_tokens=max_tokens),
             )
             next_token = next_token.to(self.device)
             active = [True for _ in prompt_rows]
@@ -2222,7 +2241,7 @@ class OpenAICompletionEngine:
                 model,
                 prefix_ids,
                 cache,
-                allow_capture=_runtime_prefill_graph_capture_enabled(model),
+                allow_capture=_runtime_prefill_graph_capture_enabled(model, temperature, max_tokens=max_tokens),
             )
             self._save_prompt_prefix_cache(prefix_ids, cache)
         _repeat_generation_cache_first_batch(cache, batch_size)
@@ -2231,7 +2250,7 @@ class OpenAICompletionEngine:
             input_ids[:, prefix_tokens:],
             cache,
             temperature,
-            allow_capture=_runtime_prefill_graph_capture_enabled(model),
+            allow_capture=_runtime_prefill_graph_capture_enabled(model, temperature, max_tokens=max_tokens),
         )
         next_token = next_token.to(self.device)
 
@@ -2484,11 +2503,21 @@ def _shared_prefix_batch_enabled_for_model(model: object) -> bool:
     return True
 
 
-def _runtime_prefill_graph_capture_enabled(model: object) -> bool:
-    # TP ranks can legitimately have different graph-cache contents after a
-    # bursty serving run. Runtime capture on only a subset of ranks changes the
-    # NCCL collective stream, so TP capture is limited to coordinated warmup.
-    return not (_is_tensor_parallel_model(model) and _tensor_parallel_world_size(model) > 1)
+def _runtime_prefill_graph_capture_enabled(
+    model: object,
+    temperature: float = 0.0,
+    *,
+    max_tokens: int | None = None,
+) -> bool:
+    if _is_tensor_parallel_model(model) and _tensor_parallel_world_size(model) > 1:
+        if temperature > 0.0 and not env_flag("TORCHINFERNO_OPENAI_TP_RUNTIME_TEMPERATURE_PREFILL_CAPTURE"):
+            return False
+        if max_tokens is not None:
+            token_limit = env_int("TORCHINFERNO_OPENAI_TP_RUNTIME_PREFILL_CAPTURE_MAX_TOKENS", 128, minimum=1)
+            if max_tokens > token_limit:
+                return False
+        return env_flag("TORCHINFERNO_OPENAI_TP_RUNTIME_PREFILL_CAPTURE", True)
+    return True
 
 
 def _openai_cuda_graph_enabled_for_model(model: object) -> bool:
@@ -2805,11 +2834,13 @@ def _prefill_repeated_prefix_next_token(
     cache: object,
     batch_size: int,
     temperature: float,
+    *,
+    allow_capture: bool = False,
 ) -> tuple[Tensor, object]:
-    prefill_token = _try_prefill_graph(model, input_ids, cache, temperature)
+    prefill_token = _try_prefill_graph(model, input_ids, cache, temperature, allow_capture=allow_capture)
     if prefill_token is not None:
         return prefill_token.expand(batch_size).contiguous(), cache
-    prefill_logits = _try_prefill_logits_graph(model, input_ids, cache)
+    prefill_logits = _try_prefill_logits_graph(model, input_ids, cache, allow_capture=allow_capture)
     if prefill_logits is None:
         prefill_logits, cache = _forward(model, input_ids, cache)
     if _shared_prefix_sample_enabled(temperature):
