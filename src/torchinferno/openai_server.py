@@ -816,8 +816,24 @@ class OpenAICompletionEngine:
         max_seq_len: int,
         *,
         model: object,
+        pool: bool = True,
     ) -> object:
         cache_capacity = _generation_cache_capacity(model, max_seq_len)
+        if not pool:
+            cache = _allocate_cache(
+                model,
+                batch_size,
+                cache_capacity,
+                device=self.device,
+                cache_backend=self.cache_backend,
+                page_size=self.page_size,
+            )
+            try:
+                setattr(cache, "_torchinferno_ephemeral_cache", True)
+            except Exception:
+                pass
+            _reset_generation_cache(cache)
+            return cache
         exact_capacity = _prefers_exact_generation_cache(model)
         key = (batch_size, cache_capacity, self.cache_backend, self.page_size, str(self.device))
         for cached_key, cached in list(self._cache_pool.items()):
@@ -1985,7 +2001,7 @@ class OpenAICompletionEngine:
         if not should_continue:
             return
 
-        if _ragged_decode_enabled_for_model(model) and not prefer_dense_group_decode:
+        if _shared_prefix_ragged_cache_enabled_for_model(model) and not prefer_dense_group_decode:
             combined_cache = self._shared_prefix_prompt_list_ragged_cache(
                 states,
                 prompt_lengths=prompt_lengths,
@@ -2066,10 +2082,12 @@ class OpenAICompletionEngine:
         if max_suffix_len <= 0:
             return None
         max_prompt_len = max((len(prompt) for prompt in prompts), default=0)
+        pool_cache = not (_is_tensor_parallel_model(model) and _tensor_parallel_world_size(model) > 1)
         cache = self._generation_cache(
             prompt_count,
             max_prompt_len + max_tokens,
             model=model,
+            pool=pool_cache,
         )
         try:
             _copy_generation_cache_first_row(prefix_cache, cache, prompt_count)
@@ -2932,6 +2950,14 @@ def _ragged_decode_enabled_for_model(model: object) -> bool:
     )
 
 
+def _shared_prefix_ragged_cache_enabled_for_model(model: object) -> bool:
+    if not _ragged_decode_enabled_for_model(model):
+        return False
+    if _is_tensor_parallel_model(model) and _tensor_parallel_world_size(model) > 1:
+        return env_flag("TORCHINFERNO_OPENAI_TP_SHARED_PREFIX_RAGGED_CACHE", True)
+    return True
+
+
 def _prefer_shared_prefix_padded_suffix_prefill(
     length_groups: Sequence[Sequence[tuple[int, Sequence[int]]]],
     *,
@@ -3286,6 +3312,8 @@ def _try_decode_one_token_graph(
     cache: object,
     temperature: float,
 ) -> Tensor | None:
+    if getattr(cache, "_torchinferno_ephemeral_cache", False):
+        return None
     if not _openai_decode_graph_enabled(model):
         return None
     decode_graph = getattr(model, "try_decode_one_token_graph", None)
@@ -3299,6 +3327,8 @@ def _try_decode_one_token_logits_graph(
     input_ids: Tensor,
     cache: object,
 ) -> Tensor | None:
+    if getattr(cache, "_torchinferno_ephemeral_cache", False):
+        return None
     if not _openai_decode_graph_enabled(model):
         return None
     decode_graph = getattr(model, "try_decode_one_token_logits_graph", None)
@@ -3315,6 +3345,8 @@ def _try_decode_ragged_logits_graph(
     seq_lens: Tensor,
     row_indices: Tensor | None,
 ) -> Tensor | None:
+    if getattr(cache, "_torchinferno_ephemeral_cache", False):
+        return None
     if not _openai_decode_graph_enabled(model):
         return None
     decode_graph = getattr(model, "try_decode_ragged_logits_graph", None)
