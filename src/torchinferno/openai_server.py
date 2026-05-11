@@ -1353,6 +1353,7 @@ class OpenAICompletionEngine:
         active = [limit > 0 for limit in per_row_limits]
         next_token, cache = _prefill_next_token(model, input_ids, cache, temperature)
         next_token = next_token.to(self.device)
+        seq_lens = torch.full((input_ids.size(0),), input_ids.size(1), dtype=torch.long, device=self.device)
         for step in range(max_tokens):
             token_ids = next_token.detach().cpu().tolist()
             step_tokens: list[int | None] = []
@@ -1369,8 +1370,26 @@ class OpenAICompletionEngine:
             should_continue = _sync_tensor_parallel_continue(model, should_continue, next_token.device)
             if not should_continue:
                 break
-            next_token, cache = _decode_next_token(model, next_token[:, None], cache, temperature)
-            next_token = next_token.to(self.device)
+            if _ragged_decode_enabled_for_model(model) and not all(active):
+                active_indices = [index for index, is_active in enumerate(active) if is_active]
+                row_indices = torch.tensor(active_indices, dtype=torch.long, device=self.device)
+                decode_input = next_token.index_select(0, row_indices)[:, None]
+                decoded_token, cache = _decode_next_token_ragged(
+                    model,
+                    decode_input,
+                    cache,
+                    seq_lens,
+                    row_indices,
+                    temperature,
+                )
+                decoded_token = decoded_token.to(self.device)
+                next_token = next_token.clone()
+                next_token[row_indices] = decoded_token
+                seq_lens[row_indices] = seq_lens.index_select(0, row_indices) + 1
+            else:
+                next_token, cache = _decode_next_token(model, next_token[:, None], cache, temperature)
+                next_token = next_token.to(self.device)
+                seq_lens += 1
 
     @torch.inference_mode()
     def _generate_identical_prompt_batch_steps(
