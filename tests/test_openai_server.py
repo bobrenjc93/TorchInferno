@@ -2279,11 +2279,13 @@ def test_openai_short_tp_stream_uses_smaller_queue_batch_limit(monkeypatch) -> N
 
     short_stream = _QueuedGeneration([], 64, 0.0, True, queue.Queue())
     boundary_stream = _QueuedGeneration([], 256, 0.0, True, queue.Queue())
+    sampled_short_stream = _QueuedGeneration([], 64, 0.7, True, queue.Queue())
     long_stream = _QueuedGeneration([], 300, 0.0, True, queue.Queue())
     short_completion = _QueuedGeneration([], 64, 0.0, False, queue.Queue())
 
-    assert engine._queued_batch_limit(short_stream) == 48
+    assert engine._queued_batch_limit(short_stream) == 64
     assert engine._queued_batch_limit(boundary_stream) == 48
+    assert engine._queued_batch_limit(sampled_short_stream) == 48
     assert engine._queued_batch_limit(long_stream) == 64
     assert engine._queued_batch_limit(short_completion) == 64
 
