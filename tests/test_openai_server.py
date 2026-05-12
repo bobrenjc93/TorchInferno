@@ -2411,8 +2411,7 @@ def test_openai_stream_group_finishes_rows_on_stop_token() -> None:
 
     first_items = _queue_items(first_queue)
     second_items = _queue_items(second_queue)
-    assert first_items[0] == 99
-    assert isinstance(first_items[1], _GenerationDone)
+    assert isinstance(first_items[0], _GenerationDone)
     assert second_items[:2] == [201, 202]
     assert captured == [[True, False]]
 

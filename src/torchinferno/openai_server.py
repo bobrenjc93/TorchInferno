@@ -4048,8 +4048,11 @@ def _emit_stream_step(
             _finish_stream_request(request)
             continue
         token = int(token_id)
+        if token in stop_token_ids:
+            _finish_stream_request(request)
+            continue
         request.responses.put(token)
-        if token in stop_token_ids or step + 1 >= request.max_tokens:
+        if step + 1 >= request.max_tokens:
             _finish_stream_request(request)
 
 
