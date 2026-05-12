@@ -855,6 +855,7 @@ class OpenAICompletionEngine:
                 and cached_device == str(self.device)
                 and _reset_generation_cache(cached)
             ):
+                _set_ragged_decode_graph_disabled(cached, False)
                 self._cache_pool.pop(cached_key, None)
                 self._cache_pool[cached_key] = cached
                 return cached
@@ -902,6 +903,7 @@ class OpenAICompletionEngine:
                 and cached_device == str(self.device)
                 and _reset_generation_cache(cached)
             ):
+                _set_ragged_decode_graph_disabled(cached, False)
                 self._microbatch_cache_pool.pop(cached_key, None)
                 self._microbatch_cache_pool[cached_key] = cached
                 return cached
@@ -2895,6 +2897,8 @@ class OpenAICompletionEngine:
         row_max_tokens: Sequence[int] | None = None,
     ) -> Iterator[list[int | None]]:
         model = self.model
+        if _disable_tp_shared_prefix_ragged_decode_graph(model):
+            _set_ragged_decode_graph_disabled(cache, True)
         if max_tokens <= 1 or not any(active):
             return
         per_row_limits = _normalize_row_max_tokens(row_max_tokens, len(active), max_tokens)
@@ -3916,7 +3920,7 @@ def _prefer_full_batch_ragged_decode(active_count: int, batch_size: int) -> bool
         return False
     min_fraction = env_float(
         "TORCHINFERNO_OPENAI_RAGGED_DECODE_FULL_BATCH_MIN_ACTIVE_FRACTION",
-        0.5,
+        1.0,
         minimum=0.0,
     )
     return (active_count / batch_size) >= min(1.0, min_fraction)
@@ -4272,6 +4276,8 @@ def _try_decode_ragged_logits_graph(
     seq_lens: Tensor,
     row_indices: Tensor | None,
 ) -> Tensor | None:
+    if getattr(cache, "_torchinferno_disable_ragged_decode_graph", False):
+        return None
     if getattr(cache, "_torchinferno_ephemeral_cache", False) and not getattr(
         cache,
         "_torchinferno_ephemeral_ragged_graph_scope",
@@ -4284,6 +4290,21 @@ def _try_decode_ragged_logits_graph(
     if decode_graph is None:
         return None
     return decode_graph(input_ids, cache, seq_lens=seq_lens, row_indices=row_indices)
+
+
+def _disable_tp_shared_prefix_ragged_decode_graph(model: object) -> bool:
+    return (
+        _is_tensor_parallel_model(model)
+        and _tensor_parallel_world_size(model) > 1
+        and not env_flag("TORCHINFERNO_OPENAI_TP_SHARED_PREFIX_RAGGED_CUDAGRAPH", False)
+    )
+
+
+def _set_ragged_decode_graph_disabled(cache: object, disabled: bool) -> None:
+    try:
+        setattr(cache, "_torchinferno_disable_ragged_decode_graph", disabled)
+    except Exception:
+        pass
 
 
 def _release_decode_graphs_for_cache(model: object, cache: object) -> None:

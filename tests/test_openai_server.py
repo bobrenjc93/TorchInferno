@@ -1717,6 +1717,7 @@ def test_openai_tp_shared_prefix_ragged_cache_is_ephemeral(monkeypatch) -> None:
         def __init__(self) -> None:
             super().__init__()
             self.ragged_cache_ephemeral: list[bool] = []
+            self.ragged_graph_disabled: list[bool] = []
 
         def decode_ragged_logits(
             self,
@@ -1727,6 +1728,7 @@ def test_openai_tp_shared_prefix_ragged_cache_is_ephemeral(monkeypatch) -> None:
             row_indices: torch.Tensor | None = None,
         ) -> torch.Tensor:
             self.ragged_cache_ephemeral.append(bool(getattr(cache, "_torchinferno_ephemeral_cache", False)))
+            self.ragged_graph_disabled.append(bool(getattr(cache, "_torchinferno_disable_ragged_decode_graph", False)))
             return super().decode_ragged_logits(
                 input_ids,
                 cache,
@@ -1760,6 +1762,7 @@ def test_openai_tp_shared_prefix_ragged_cache_is_ephemeral(monkeypatch) -> None:
 
     assert steps == [[6, 5], [3, 3]]
     assert model.ragged_cache_ephemeral == [True]
+    assert model.ragged_graph_disabled == [True]
     assert engine._cache_pool == {}
 
 
@@ -1772,6 +1775,7 @@ def test_openai_tp_shared_prefix_ragged_cache_uses_pool_by_default(monkeypatch) 
         def __init__(self) -> None:
             super().__init__()
             self.ragged_cache_ephemeral: list[bool] = []
+            self.ragged_graph_disabled: list[bool] = []
 
         def decode_ragged_logits(
             self,
@@ -1782,6 +1786,7 @@ def test_openai_tp_shared_prefix_ragged_cache_uses_pool_by_default(monkeypatch) 
             row_indices: torch.Tensor | None = None,
         ) -> torch.Tensor:
             self.ragged_cache_ephemeral.append(bool(getattr(cache, "_torchinferno_ephemeral_cache", False)))
+            self.ragged_graph_disabled.append(bool(getattr(cache, "_torchinferno_disable_ragged_decode_graph", False)))
             return super().decode_ragged_logits(
                 input_ids,
                 cache,
@@ -1815,6 +1820,7 @@ def test_openai_tp_shared_prefix_ragged_cache_uses_pool_by_default(monkeypatch) 
 
     assert steps == [[6, 5], [3, 3]]
     assert model.ragged_cache_ephemeral == [False]
+    assert model.ragged_graph_disabled == [True]
     assert len(engine._cache_pool) == 1
 
 
@@ -1948,7 +1954,37 @@ def test_openai_ragged_decode_skips_rows_after_per_request_max_tokens(monkeypatc
     assert model.ragged_calls[1] == ([[3]], [3, 5], [1])
 
 
-def test_openai_ragged_decode_keeps_full_batch_while_most_rows_active() -> None:
+def test_openai_ragged_decode_skips_inactive_rows_by_default(monkeypatch) -> None:
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_RAGGED_DECODE_FULL_BATCH_MIN_ACTIVE_FRACTION", raising=False)
+    model = _RaggedSharedPrefixRecordingModel()
+    engine = _cache_only_engine()
+    engine.model = model
+    engine.stop_token_ids = frozenset()
+    cache = model.allocate_cache(8, 5)
+
+    steps = list(
+        engine._decode_shared_prefix_prompt_list_ragged(
+            cache=cache,
+            active=[False, True, True, True, True, True, True, True],
+            prompt_lengths=[2 for _ in range(8)],
+            max_tokens=3,
+            next_tokens=[2 for _ in range(8)],
+            temperature=0.0,
+            row_max_tokens=[1, 3, 3, 3, 3, 3, 3, 3],
+        )
+    )
+
+    assert steps == [[None, 3, 3, 3, 3, 3, 3, 3], [None, 4, 4, 4, 4, 4, 4, 4]]
+    assert model.ragged_calls[0] == ([[2] for _ in range(7)], [2 for _ in range(8)], [1, 2, 3, 4, 5, 6, 7])
+    assert model.ragged_calls[1] == (
+        [[3] for _ in range(7)],
+        [2, 3, 3, 3, 3, 3, 3, 3],
+        [1, 2, 3, 4, 5, 6, 7],
+    )
+
+
+def test_openai_ragged_decode_can_keep_full_batch_while_most_rows_active(monkeypatch) -> None:
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_RAGGED_DECODE_FULL_BATCH_MIN_ACTIVE_FRACTION", "0.5")
     model = _RaggedSharedPrefixRecordingModel()
     engine = _cache_only_engine()
     engine.model = model
