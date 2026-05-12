@@ -933,6 +933,48 @@ def test_openai_prompt_list_batch_restores_cached_prefix_rows_with_padded_suffix
     assert model.forward_inputs == [[[4, 6], [5, 0]]]
 
 
+def test_openai_prompt_list_batch_restores_cached_prefix_rows_with_suffix_buckets(monkeypatch) -> None:
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_PREFIX_CACHE_MIN_TOKENS", "1")
+    model = _TokenEchoSharedPrefixRecordingModel()
+    engine = _cache_only_engine()
+    engine.model = model
+    engine.stop_token_ids = frozenset()
+
+    for prompt in ([10, 11], [10, 12], [10, 13], [10, 14]):
+        input_ids = torch.tensor([prompt], dtype=torch.long)
+        cache = model.allocate_cache(1, 16)
+        model.forward(input_ids, cache=cache, use_cache=True)
+        engine._save_prompt_prefix_cache(input_ids, cache)
+    model.forward_inputs.clear()
+
+    steps = list(
+        engine._generate_prompt_list_batch_steps(
+            [
+                [10, 11, 4, 4, 4, 4, 4, 6],
+                [10, 12, 5, 5, 5, 5, 7],
+                [10, 13, 8],
+                [10, 14, 9],
+            ],
+            max_tokens=2,
+            temperature=0.0,
+            broadcast_tensor_parallel=False,
+        )
+    )
+
+    assert steps == [[6, 7, 8, 9], [3, 3, 3, 3]]
+    assert model.forward_inputs == [
+        [[4, 4, 4, 4, 4, 6], [5, 5, 5, 5, 7, 0]],
+        [[8], [9]],
+    ]
+    assert model.ragged_calls == [
+        (
+            [[6], [7], [8], [9]],
+            [8, 7, 3, 3],
+            None,
+        )
+    ]
+
+
 def test_openai_engine_uses_prefill_graph_for_prefix_suffix(monkeypatch) -> None:
     monkeypatch.setenv("TORCHINFERNO_OPENAI_PREFIX_CACHE_MIN_TOKENS", "1")
     model = _PrefixGraphRecordingModel()
@@ -1477,6 +1519,44 @@ def test_openai_shared_prefix_padded_suffix_prefill_skips_high_padding_waste(mon
     ]
 
 
+def test_openai_shared_prefix_padded_suffix_prefill_buckets_length_groups(monkeypatch) -> None:
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_PREFIX_CACHE_MIN_TOKENS", "2")
+    model = _TokenEchoSharedPrefixRecordingModel()
+    engine = _cache_only_engine()
+    engine.model = model
+    engine.stop_token_ids = frozenset()
+    engine._prefix_cache_entry = None
+    prompts = [
+        [10, 11, 4, 4, 4, 4, 4, 6],
+        [10, 11, 5, 5, 5, 5, 7],
+        [10, 11, 8],
+        [10, 11, 9],
+    ]
+
+    steps = list(
+        engine._generate_prompt_list_batch_steps(
+            prompts,
+            max_tokens=2,
+            temperature=0.0,
+            broadcast_tensor_parallel=False,
+        )
+    )
+
+    assert steps == [[6, 7, 8, 9], [3, 3, 3, 3]]
+    assert model.forward_inputs == [
+        [[10, 11]],
+        [[4, 4, 4, 4, 4, 6], [5, 5, 5, 5, 7, 0]],
+        [[8], [9]],
+    ]
+    assert model.ragged_calls == [
+        (
+            [[6], [7], [8], [9]],
+            [8, 7, 3, 3],
+            None,
+        )
+    ]
+
+
 def test_openai_shared_prefix_ragged_cache_can_be_disabled_for_tp(monkeypatch) -> None:
     monkeypatch.setenv("TORCHINFERNO_OPENAI_PREFIX_CACHE_MIN_TOKENS", "2")
     monkeypatch.setenv("TORCHINFERNO_OPENAI_SHARED_PREFIX_PADDED_SUFFIX_PREFILL", "0")
@@ -1628,6 +1708,7 @@ def test_openai_tp_shared_prefix_ragged_cache_is_ephemeral(monkeypatch) -> None:
     monkeypatch.setenv("TORCHINFERNO_OPENAI_PREFIX_CACHE_MIN_TOKENS", "2")
     monkeypatch.setenv("TORCHINFERNO_OPENAI_SHARED_PREFIX_PADDED_SUFFIX_PREFILL", "0")
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_SHARED_PREFIX_RAGGED_CACHE", "1")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_SHARED_PREFIX_RAGGED_CACHE_POOL", "0")
 
     class _EphemeralRecordingModel(_TokenEchoSharedPrefixRecordingModel):
         def __init__(self) -> None:
@@ -1677,6 +1758,61 @@ def test_openai_tp_shared_prefix_ragged_cache_is_ephemeral(monkeypatch) -> None:
     assert steps == [[6, 5], [3, 3]]
     assert model.ragged_cache_ephemeral == [True]
     assert engine._cache_pool == {}
+
+
+def test_openai_tp_shared_prefix_ragged_cache_uses_pool_by_default(monkeypatch) -> None:
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_PREFIX_CACHE_MIN_TOKENS", "2")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_SHARED_PREFIX_PADDED_SUFFIX_PREFILL", "0")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_SHARED_PREFIX_RAGGED_CACHE", "1")
+
+    class _PoolingRecordingModel(_TokenEchoSharedPrefixRecordingModel):
+        def __init__(self) -> None:
+            super().__init__()
+            self.ragged_cache_ephemeral: list[bool] = []
+
+        def decode_ragged_logits(
+            self,
+            input_ids: torch.Tensor,
+            cache: _PrefixRecordingCache,
+            *,
+            seq_lens: torch.Tensor,
+            row_indices: torch.Tensor | None = None,
+        ) -> torch.Tensor:
+            self.ragged_cache_ephemeral.append(bool(getattr(cache, "_torchinferno_ephemeral_cache", False)))
+            return super().decode_ragged_logits(
+                input_ids,
+                cache,
+                seq_lens=seq_lens,
+                row_indices=row_indices,
+            )
+
+    model = _PoolingRecordingModel()
+    engine = _cache_only_engine()
+    engine.model = model
+    engine.stop_token_ids = frozenset()
+    engine._prefix_cache_entry = None
+
+    monkeypatch.setattr(
+        "torchinferno.openai_server._is_tensor_parallel_model",
+        lambda candidate: candidate is model,
+    )
+    monkeypatch.setattr(
+        "torchinferno.openai_server._tensor_parallel_world_size",
+        lambda candidate: 8 if candidate is model else 1,
+    )
+
+    steps = list(
+        engine._generate_prompt_list_batch_steps(
+            [[10, 11, 4, 6], [10, 11, 5]],
+            max_tokens=2,
+            temperature=0.0,
+            broadcast_tensor_parallel=False,
+        )
+    )
+
+    assert steps == [[6, 5], [3, 3]]
+    assert model.ragged_cache_ephemeral == [False]
+    assert len(engine._cache_pool) == 1
 
 
 def test_openai_ephemeral_cache_scoped_ragged_decode_releases_graphs(monkeypatch) -> None:
