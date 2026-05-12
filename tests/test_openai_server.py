@@ -355,6 +355,7 @@ def test_transformers_chat_tokenizer_stops_on_llama_eot() -> None:
     tokenizer = _TransformersChatTokenizer(_LlamaStyleTokenizer())
 
     assert 128001 in tokenizer.stop_token_ids
+    assert 128008 in tokenizer.stop_token_ids
     assert 128009 in tokenizer.stop_token_ids
 
 
@@ -2708,11 +2709,13 @@ class _BatchEncodingTokenizer:
 class _LlamaStyleTokenizer(_BatchEncodingTokenizer):
     eos_token_id = 128001
     vocab_size = 128000
-    all_special_tokens = ("<|end_of_text|>", "<|eot_id|>")
+    all_special_tokens = ("<|end_of_text|>", "<|eom_id|>", "<|eot_id|>")
 
     def convert_tokens_to_ids(self, token: str) -> int:
         if token == "<|end_of_text|>":
             return 128001
+        if token == "<|eom_id|>":
+            return 128008
         if token == "<|eot_id|>":
             return 128009
         return 0

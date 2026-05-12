@@ -231,7 +231,7 @@ def _known_chat_terminator_ids(tokenizer: object) -> set[int]:
         return token_ids
     vocab_size = getattr(tokenizer, "vocab_size", None)
     all_special_ids = _coerce_optional_token_ids(getattr(tokenizer, "all_special_ids", None))
-    for token in ("<|eot_id|>",):
+    for token in ("<|end_of_text|>", "<|eom_id|>", "<|eot_id|>"):
         try:
             token_id = convert(token)
         except Exception:
