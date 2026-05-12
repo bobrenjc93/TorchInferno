@@ -249,6 +249,27 @@ def test_openai_ragged_decode_warmup_uses_configured_shapes(monkeypatch) -> None
     ]
 
 
+def test_openai_ragged_decode_warmup_uses_forced_full_row_indices(monkeypatch) -> None:
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_WARMUP_RAGGED_DECODE_BATCH_SIZES", "4")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_WARMUP_RAGGED_DECODE_ROW_COUNTS", "4")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_WARMUP_RAGGED_DECODE_CACHE_TOKENS", "8")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_WARMUP_RAGGED_DECODE_PROMPT_TOKENS", "3")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_RAGGED_DECODE_FORCE_ROW_INDICES", "1")
+
+    model = _WarmupShapeModel()
+    engine = object.__new__(OpenAICompletionEngine)
+    engine.model = model
+    engine.device = torch.device("cpu")
+    engine.cache_backend = "dense"
+    engine.page_size = 16
+    engine._cache_pool = {}
+    engine._microbatch_cache_pool = {}
+
+    engine._warmup_tensor_parallel_ragged_decode_graphs(vocab_size=16)
+
+    assert model.ragged_shapes == [(4, 1, (3, 3, 3, 3), (0, 1, 2, 3))]
+
+
 def test_openai_server_pipeline_parallelism_skips_auto_launch(monkeypatch) -> None:
     monkeypatch.delenv("RANK", raising=False)
     monkeypatch.delenv("WORLD_SIZE", raising=False)
