@@ -2236,6 +2236,56 @@ def test_openai_stream_microbatch_env_override_is_capped_to_batch(monkeypatch) -
     assert engine._stream_microbatch_size(64) == 64
 
 
+def test_openai_stream_microbatches_emit_full_batch_steps() -> None:
+    model = _BatchRecordingModel()
+    engine = _cache_only_engine()
+    engine.model = model
+    engine.stop_token_ids = frozenset()
+    input_ids = torch.tensor(
+        [
+            [10, 11],
+            [10, 12],
+            [10, 13],
+            [10, 14],
+        ],
+        dtype=torch.long,
+    )
+
+    steps = list(
+        engine._generate_batch_steps_microbatched(
+            input_ids,
+            max_tokens=2,
+            temperature=0.0,
+            microbatch_size=2,
+        )
+    )
+
+    assert steps == [[2, 2, 2, 2], [2, 2, 2, 2]]
+
+
+def test_openai_shared_prefix_microbatches_emit_full_batch_steps() -> None:
+    model = _BatchRecordingModel()
+    engine = _cache_only_engine()
+    engine.model = model
+    engine.stop_token_ids = frozenset()
+    active = [True, True, True, True]
+
+    steps = list(
+        engine._decode_shared_prefix_microbatches(
+            cache_views=[_BatchRecordingCache(), _BatchRecordingCache()],
+            active=active,
+            batch_size=4,
+            microbatch_size=2,
+            max_tokens=3,
+            next_token=torch.tensor([2, 2, 2, 2], dtype=torch.long),
+            temperature=0.0,
+        )
+    )
+
+    assert steps == [[2, 2, 2, 2], [2, 2, 2, 2]]
+    assert active == [False, False, False, False]
+
+
 def test_openai_effective_max_batch_size_caps_cuda_tp_by_default(monkeypatch) -> None:
     monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_MAX_BATCH_SIZE", raising=False)
     model = object()

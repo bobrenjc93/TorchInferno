@@ -1817,6 +1817,7 @@ class OpenAICompletionEngine:
         states: list[dict[str, object]] = []
         batch_size = input_ids.size(0)
         per_row_limits = _normalize_row_max_tokens(row_max_tokens, batch_size, max_tokens)
+        first_step_tokens = [None for _ in range(batch_size)]
         for slot, start in enumerate(range(0, batch_size, microbatch_size)):
             end = min(batch_size, start + microbatch_size)
             chunk_input_ids = input_ids[start:end]
@@ -1836,12 +1837,11 @@ class OpenAICompletionEngine:
                 allow_capture=_runtime_prefill_graph_capture_enabled(model, temperature, max_tokens=max_tokens),
             )
             next_token = next_token.to(self.device)
-            step_tokens = [None for _ in range(batch_size)]
             for offset, token_id in enumerate(next_token.detach().cpu().tolist()):
                 token_id = int(token_id)
                 if not active[offset]:
                     continue
-                step_tokens[start + offset] = token_id
+                first_step_tokens[start + offset] = token_id
                 if token_id in stop_token_ids or chunk_limits[offset] <= 1:
                     active[offset] = False
             states.append(
@@ -1853,11 +1853,12 @@ class OpenAICompletionEngine:
                     "row_max_tokens": chunk_limits,
                 }
             )
-            yield step_tokens
             if prefix_cache_prompts is not None:
                 self._save_prompt_prefix_cache_rows(prefix_cache_prompts[start:end], cache)
+        yield first_step_tokens
         for step in range(1, max_tokens):
             emitted = False
+            step_tokens = [None for _ in range(batch_size)]
             for state in states:
                 active = state["active"]
                 local_should_decode = isinstance(active, list) and any(active)
@@ -1876,7 +1877,6 @@ class OpenAICompletionEngine:
                 chunk_limits = state["row_max_tokens"]
                 if not isinstance(chunk_limits, list):
                     raise RuntimeError("invalid microbatch row limit state")
-                step_tokens = [None for _ in range(batch_size)]
                 for offset, token_id in enumerate(next_token.detach().cpu().tolist()):
                     if not active[offset]:
                         continue
@@ -1885,9 +1885,9 @@ class OpenAICompletionEngine:
                     if token_id in stop_token_ids or step + 1 >= int(chunk_limits[offset]):
                         active[offset] = False
                 emitted = True
-                yield step_tokens
             if not emitted:
                 break
+            yield step_tokens
 
     def _drain_closed_single_generation(
         self,
@@ -3153,6 +3153,7 @@ class OpenAICompletionEngine:
             )
         for step in range(1, max_tokens):
             emitted = False
+            step_tokens = [None for _ in range(batch_size)]
             for state in states:
                 chunk_active = state["active"]
                 local_should_decode = isinstance(chunk_active, list) and any(chunk_active)
@@ -3171,7 +3172,6 @@ class OpenAICompletionEngine:
                 chunk_limits = state["row_max_tokens"]
                 if not isinstance(chunk_limits, list):
                     raise RuntimeError("invalid shared-prefix row limit state")
-                step_tokens = [None for _ in range(batch_size)]
                 for offset, token_id in enumerate(chunk_token.detach().cpu().tolist()):
                     if not chunk_active[offset]:
                         continue
@@ -3181,9 +3181,9 @@ class OpenAICompletionEngine:
                         chunk_active[offset] = False
                         active[start + offset] = False
                 emitted = True
-                yield step_tokens
             if not emitted:
                 break
+            yield step_tokens
 
 
 def build_engine(config: OpenAIServerConfig) -> OpenAICompletionEngine:
