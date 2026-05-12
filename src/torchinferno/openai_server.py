@@ -1430,15 +1430,11 @@ class OpenAICompletionEngine:
                 )
                 next_token = next_token.to(self.device)
                 seq_lens = torch.full((batch_size,), prompt_tokens, dtype=torch.long, device=self.device)
-                force_row_indices = env_flag(
-                    "TORCHINFERNO_OPENAI_RAGGED_DECODE_FORCE_ROW_INDICES",
-                    _force_tp_shared_prefix_ragged_row_indices(self.model),
-                )
                 for row_count in row_counts:
                     rows = min(batch_size, int(row_count))
                     if rows <= 0:
                         continue
-                    if rows == batch_size and not force_row_indices:
+                    if rows == batch_size:
                         _try_decode_ragged_logits_graph(
                             self.model,
                             next_token[:, None],
