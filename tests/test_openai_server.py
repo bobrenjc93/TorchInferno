@@ -2245,6 +2245,32 @@ def test_openai_short_tp_stream_uses_smaller_queue_batch_limit(monkeypatch) -> N
     assert engine._queued_batch_limit(short_stream) == 12
 
 
+def test_openai_temperature_queue_batch_wait_uses_larger_default(monkeypatch) -> None:
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TEMPERATURE_BATCH_WAIT_MS", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TEMPERATURE_BATCH_WAIT_MAX_TOKENS", raising=False)
+    engine = _cache_only_engine()
+    engine.batch_wait_s = 0.010
+
+    greedy = _QueuedGeneration([1, 2], 4, 0.0, True, queue.Queue())
+    sampled = _QueuedGeneration([1, 2], 4, 0.7, True, queue.Queue())
+    long_sampled = _QueuedGeneration([1, 2], 300, 0.7, True, queue.Queue())
+
+    assert engine._queued_batch_wait_s(greedy) == 0.010
+    assert engine._queued_batch_wait_s(sampled) == 0.050
+    assert engine._queued_batch_wait_s(long_sampled) == 0.010
+
+
+def test_openai_temperature_queue_batch_wait_respects_env_floor(monkeypatch) -> None:
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TEMPERATURE_BATCH_WAIT_MS", "5")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TEMPERATURE_BATCH_WAIT_MAX_TOKENS", "512")
+    engine = _cache_only_engine()
+    engine.batch_wait_s = 0.010
+
+    sampled = _QueuedGeneration([1, 2], 300, 0.7, True, queue.Queue())
+
+    assert engine._queued_batch_wait_s(sampled) == 0.010
+
+
 def test_openai_queued_batch_groups_streams_with_different_max_tokens() -> None:
     engine = _cache_only_engine()
     captured: list[list[int]] = []

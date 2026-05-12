@@ -653,10 +653,11 @@ class OpenAICompletionEngine:
             batch.append(item)
 
     def _collect_batch_until_deadline(self, batch: list[_QueuedGeneration], *, limit: int | None = None) -> None:
-        if self.batch_wait_s == 0.0:
+        batch_wait_s = self._queued_batch_wait_s(batch[0]) if batch else self.batch_wait_s
+        if batch_wait_s == 0.0:
             return
         batch_limit = self.max_batch_size if limit is None else max(1, min(self.max_batch_size, limit))
-        deadline = time.perf_counter() + self.batch_wait_s
+        deadline = time.perf_counter() + batch_wait_s
         while len(batch) < batch_limit:
             timeout = max(0.0, deadline - time.perf_counter())
             if timeout == 0.0:
@@ -669,7 +670,19 @@ class OpenAICompletionEngine:
                 self._generation_queue.put(None)
                 break
             batch.append(item)
-            deadline = time.perf_counter() + self.batch_wait_s
+            deadline = time.perf_counter() + batch_wait_s
+
+    def _queued_batch_wait_s(self, first: _QueuedGeneration) -> float:
+        if first.temperature <= 0.0:
+            return self.batch_wait_s
+        max_tokens = env_int("TORCHINFERNO_OPENAI_TEMPERATURE_BATCH_WAIT_MAX_TOKENS", 256, minimum=1)
+        if first.max_tokens > max_tokens:
+            return self.batch_wait_s
+        temperature_wait_s = (
+            env_float("TORCHINFERNO_OPENAI_TEMPERATURE_BATCH_WAIT_MS", 50.0, minimum=0.0)
+            / 1000.0
+        )
+        return max(self.batch_wait_s, temperature_wait_s)
 
     def _run_queued_batch(self, batch: list[_QueuedGeneration]) -> None:
         groups: dict[tuple[float, bool], list[_QueuedGeneration]] = {}
