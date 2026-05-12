@@ -17,7 +17,7 @@ from torchinferno.server.openai_protocol import (
     model_list_response,
     parse_chat_completion_request,
 )
-from torchinferno.runtime.options import env_float
+from torchinferno.runtime.options import env_flag, env_float
 
 
 class OpenAIHandler(BaseHTTPRequestHandler):
@@ -98,6 +98,40 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                 delta={"role": "assistant"},
             )
         )
+        if _stream_inline_enabled(max_tokens=max_tokens, temperature=temperature):
+            for token_id in engine.generate_chat_tokens(
+                messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+            ):
+                if not client_open:
+                    continue
+                content = engine.tokenizer.decode_token(int(token_id))
+                if not content:
+                    continue
+                client_open = self._try_write_sse(
+                    chat_completion_chunk(
+                        completion_id=completion_id,
+                        model_id=engine.model_id,
+                        created=created,
+                        delta={"content": content},
+                    )
+                )
+            if client_open:
+                client_open = self._try_write_sse(
+                    chat_completion_chunk(
+                        completion_id=completion_id,
+                        model_id=engine.model_id,
+                        created=created,
+                        delta={},
+                        finish_reason="stop",
+                    )
+                )
+            if client_open:
+                self._try_write_done()
+            self.close_connection = True
+            return
+
         token_queue: "queue.Queue[object]" = queue.Queue()
         done = object()
 
@@ -215,3 +249,8 @@ class OpenAIHTTPServer(ThreadingHTTPServer):
     def __init__(self, server_address: tuple[str, int], engine: object) -> None:
         super().__init__(server_address, OpenAIHandler)
         self.engine = engine
+
+
+def _stream_inline_enabled(*, max_tokens: int, temperature: float) -> bool:
+    del max_tokens, temperature
+    return env_flag("TORCHINFERNO_OPENAI_STREAM_INLINE", True)

@@ -14,7 +14,7 @@ from pathlib import Path
 
 import torch
 
-from torchinferno.openai_http import OpenAIHandler, enable_tcp_nodelay
+from torchinferno.openai_http import OpenAIHandler, _stream_inline_enabled, enable_tcp_nodelay
 from torchinferno.openai_server import (
     _GenerationDone,
     OpenAICompletionEngine,
@@ -451,6 +451,7 @@ def test_openai_stream_disconnect_drains_generation() -> None:
 
 
 def test_openai_stream_writes_heartbeat_while_waiting(monkeypatch) -> None:
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_STREAM_INLINE", "0")
     monkeypatch.setenv("TORCHINFERNO_OPENAI_STREAM_HEARTBEAT_SECONDS", "0.01")
     engine = _SlowStreamEngine(delay_s=0.03)
     handler = object.__new__(OpenAIHandler)
@@ -465,6 +466,19 @@ def test_openai_stream_writes_heartbeat_while_waiting(monkeypatch) -> None:
 
     assert b": torchinferno heartbeat\n\n" in handler.wfile.payload
     assert b"data: [DONE]\n\n" in handler.wfile.payload
+
+
+def test_openai_stream_inline_defaults_on(monkeypatch) -> None:
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_STREAM_INLINE", raising=False)
+
+    assert _stream_inline_enabled(max_tokens=256, temperature=0.0)
+    assert _stream_inline_enabled(max_tokens=256, temperature=0.7)
+
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_STREAM_INLINE", "0")
+    assert not _stream_inline_enabled(max_tokens=256, temperature=0.7)
+
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_STREAM_INLINE", "1")
+    assert _stream_inline_enabled(max_tokens=1024, temperature=0.0)
 
 
 def test_openai_engine_microbatches_same_shape_requests() -> None:
@@ -1200,6 +1214,7 @@ def test_openai_engine_batches_shared_prefix_suffixes(monkeypatch) -> None:
         batch_wait_ms=50.0,
         single_request_admission_wait_ms=50.0,
     )
+    engine.single_request_fast_path = False
     barrier = threading.Barrier(3)
     results: list[list[int] | None] = [None, None]
 
@@ -1230,6 +1245,9 @@ def test_openai_engine_batches_shared_prefix_suffixes(monkeypatch) -> None:
 
 
 def test_openai_engine_batches_variable_length_shared_prefix_suffixes(monkeypatch) -> None:
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_PREFIX_CACHE", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_PREFIX_CACHE_MAX_TOKENS", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_PREFIX_CACHE_MAX_ENTRIES", raising=False)
     monkeypatch.setenv("TORCHINFERNO_OPENAI_PREFIX_CACHE_MIN_TOKENS", "2")
     model = _SharedPrefixRecordingModel()
     tokenizer = _SharedPrefixTokenizer(parties=2)
@@ -1242,6 +1260,7 @@ def test_openai_engine_batches_variable_length_shared_prefix_suffixes(monkeypatc
         batch_wait_ms=50.0,
         single_request_admission_wait_ms=50.0,
     )
+    engine.single_request_fast_path = False
 
     def run_pair() -> list[list[int] | None]:
         barrier = threading.Barrier(3)
