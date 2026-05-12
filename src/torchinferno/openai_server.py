@@ -638,7 +638,7 @@ class OpenAICompletionEngine:
             if first.max_tokens <= short_max_tokens:
                 default_short_limit = 48
                 if first.temperature > 0.0:
-                    default_short_limit = 32
+                    default_short_limit = 16
                 elif first.max_tokens <= 128:
                     default_short_limit = 64
                 short_limit = env_int(

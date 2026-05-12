@@ -2340,7 +2340,7 @@ def test_openai_short_tp_stream_uses_smaller_queue_batch_limit(monkeypatch) -> N
 
     assert engine._queued_batch_limit(short_stream) == 64
     assert engine._queued_batch_limit(boundary_stream) == 48
-    assert engine._queued_batch_limit(sampled_short_stream) == 32
+    assert engine._queued_batch_limit(sampled_short_stream) == 16
     assert engine._queued_batch_limit(medium_stream) == 64
     assert engine._queued_batch_limit(sampled_medium_stream) == 64
     assert engine._queued_batch_limit(large_stream) == 32
