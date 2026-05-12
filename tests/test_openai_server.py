@@ -2267,6 +2267,8 @@ def test_openai_effective_max_batch_size_uses_tp_env_override(monkeypatch) -> No
 def test_openai_short_tp_stream_uses_smaller_queue_batch_limit(monkeypatch) -> None:
     monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_SHORT_STREAM_MAX_BATCH_SIZE", raising=False)
     monkeypatch.delenv("TORCHINFERNO_OPENAI_SHORT_STREAM_MAX_TOKENS", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_LARGE_STREAM_MAX_BATCH_SIZE", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_LARGE_STREAM_MIN_TOKENS", raising=False)
     model = object()
     engine = _cache_only_engine()
     engine.model = model
@@ -2281,17 +2283,23 @@ def test_openai_short_tp_stream_uses_smaller_queue_batch_limit(monkeypatch) -> N
     short_stream = _QueuedGeneration([], 64, 0.0, True, queue.Queue())
     boundary_stream = _QueuedGeneration([], 256, 0.0, True, queue.Queue())
     sampled_short_stream = _QueuedGeneration([], 64, 0.7, True, queue.Queue())
-    long_stream = _QueuedGeneration([], 300, 0.0, True, queue.Queue())
+    medium_stream = _QueuedGeneration([], 300, 0.0, True, queue.Queue())
+    sampled_medium_stream = _QueuedGeneration([], 300, 0.7, True, queue.Queue())
+    large_stream = _QueuedGeneration([], 512, 0.0, True, queue.Queue())
     short_completion = _QueuedGeneration([], 64, 0.0, False, queue.Queue())
 
     assert engine._queued_batch_limit(short_stream) == 64
     assert engine._queued_batch_limit(boundary_stream) == 48
     assert engine._queued_batch_limit(sampled_short_stream) == 32
-    assert engine._queued_batch_limit(long_stream) == 64
+    assert engine._queued_batch_limit(medium_stream) == 64
+    assert engine._queued_batch_limit(sampled_medium_stream) == 64
+    assert engine._queued_batch_limit(large_stream) == 32
     assert engine._queued_batch_limit(short_completion) == 64
 
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_SHORT_STREAM_MAX_BATCH_SIZE", "12")
     assert engine._queued_batch_limit(short_stream) == 12
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_LARGE_STREAM_MAX_BATCH_SIZE", "20")
+    assert engine._queued_batch_limit(large_stream) == 20
 
 
 def test_openai_temperature_queue_batch_wait_uses_larger_default(monkeypatch) -> None:

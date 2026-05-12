@@ -633,20 +633,28 @@ class OpenAICompletionEngine:
             first.stream
             and _is_tensor_parallel_model(self.model)
             and self.device.type == "cuda"
-            and first.max_tokens
-            <= env_int("TORCHINFERNO_OPENAI_SHORT_STREAM_MAX_TOKENS", 256, minimum=1)
         ):
-            default_short_limit = 48
-            if first.temperature > 0.0:
-                default_short_limit = 32
-            elif first.max_tokens <= 128:
-                default_short_limit = 64
-            short_limit = env_int(
-                "TORCHINFERNO_OPENAI_TP_SHORT_STREAM_MAX_BATCH_SIZE",
-                min(limit, default_short_limit),
-                minimum=1,
-            )
-            return min(limit, short_limit)
+            short_max_tokens = env_int("TORCHINFERNO_OPENAI_SHORT_STREAM_MAX_TOKENS", 256, minimum=1)
+            if first.max_tokens <= short_max_tokens:
+                default_short_limit = 48
+                if first.temperature > 0.0:
+                    default_short_limit = 32
+                elif first.max_tokens <= 128:
+                    default_short_limit = 64
+                short_limit = env_int(
+                    "TORCHINFERNO_OPENAI_TP_SHORT_STREAM_MAX_BATCH_SIZE",
+                    min(limit, default_short_limit),
+                    minimum=1,
+                )
+                return min(limit, short_limit)
+            large_min_tokens = env_int("TORCHINFERNO_OPENAI_LARGE_STREAM_MIN_TOKENS", 512, minimum=1)
+            if first.temperature <= 0.0 and first.max_tokens >= large_min_tokens:
+                large_limit = env_int(
+                    "TORCHINFERNO_OPENAI_TP_LARGE_STREAM_MAX_BATCH_SIZE",
+                    min(limit, 32),
+                    minimum=1,
+                )
+                return min(limit, large_limit)
         return limit
 
     def _drain_ready_requests(self, batch: list[_QueuedGeneration], *, limit: int | None = None) -> None:
