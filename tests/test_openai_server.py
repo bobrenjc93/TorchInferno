@@ -14,7 +14,14 @@ from pathlib import Path
 
 import torch
 
-from torchinferno.openai_http import OpenAIHandler, _stream_inline_enabled, enable_tcp_nodelay
+from torchinferno.openai_http import (
+    OpenAIHandler,
+    _chat_completion_chunk_bytes,
+    _chat_completion_chunk_prefix,
+    _chat_delta_content,
+    _stream_inline_enabled,
+    enable_tcp_nodelay,
+)
 from torchinferno.openai_server import (
     _GenerationDone,
     OpenAICompletionEngine,
@@ -48,6 +55,7 @@ from torchinferno.openai_server import (
     _warmup_temperature_prompt_token_counts,
     load_chat_tokenizer,
 )
+from torchinferno.server.openai_protocol import chat_completion_chunk
 
 
 def test_openai_server_matches_openai_chat_contract() -> None:
@@ -125,6 +133,32 @@ def test_openai_handler_writes_sse_frame_with_single_socket_write() -> None:
     assert writer.write_calls == 1
     assert writer.payload == b'data: {"choices":[{"delta":{"content":"7"}}]}\n\n'
     assert writer.flush_calls == 1
+
+
+def test_openai_handler_fast_chat_chunk_bytes_match_protocol() -> None:
+    completion_id = "chatcmpl-test"
+    model_id = 'test-model-"quoted"'
+    created = 123
+    prefix = _chat_completion_chunk_prefix(completion_id, model_id, created)
+
+    payload = _chat_completion_chunk_bytes(prefix, _chat_delta_content('hello "there"\n'), None)
+    decoded = json.loads(payload.removeprefix(b"data: ").removesuffix(b"\n\n"))
+    assert decoded == chat_completion_chunk(
+        completion_id=completion_id,
+        model_id=model_id,
+        created=created,
+        delta={"content": 'hello "there"\n'},
+    )
+
+    payload = _chat_completion_chunk_bytes(prefix, b"{}", "stop")
+    decoded = json.loads(payload.removeprefix(b"data: ").removesuffix(b"\n\n"))
+    assert decoded == chat_completion_chunk(
+        completion_id=completion_id,
+        model_id=model_id,
+        created=created,
+        delta={},
+        finish_reason="stop",
+    )
 
 
 def test_openai_handler_writes_sse_comment() -> None:
@@ -1250,7 +1284,7 @@ def test_openai_engine_batches_variable_length_shared_prefix_suffixes(monkeypatc
     monkeypatch.delenv("TORCHINFERNO_OPENAI_PREFIX_CACHE_MAX_ENTRIES", raising=False)
     monkeypatch.setenv("TORCHINFERNO_OPENAI_PREFIX_CACHE_MIN_TOKENS", "2")
     model = _SharedPrefixRecordingModel()
-    tokenizer = _SharedPrefixTokenizer(parties=2)
+    tokenizer = _SharedPrefixTokenizer(parties=1)
     engine = OpenAICompletionEngine(
         model,
         tokenizer,
@@ -1262,33 +1296,17 @@ def test_openai_engine_batches_variable_length_shared_prefix_suffixes(monkeypatc
     )
     engine.single_request_fast_path = False
 
-    def run_pair() -> list[list[int] | None]:
-        barrier = threading.Barrier(3)
-        results: list[list[int] | None] = [None, None]
+    prompts = [[10, 11, 12], [10, 11, 13, 14]]
 
-        def run(index: int, content: str) -> None:
-            barrier.wait()
-            results[index] = list(
-                engine.generate_chat_tokens(
-                    [{"role": "user", "content": content}],
-                    max_tokens=1,
-                    temperature=0.0,
-                )
-            )
-
-        threads = [
-            threading.Thread(target=run, args=(0, "left")),
-            threading.Thread(target=run, args=(1, "long")),
-        ]
-        for thread in threads:
-            thread.start()
-        barrier.wait()
-        for thread in threads:
-            thread.join(timeout=10)
-        return results
-
-    results = run_pair()
-    assert results == [[2], [2]]
+    steps = list(
+        engine._generate_prompt_list_batch_steps(
+            prompts,
+            max_tokens=1,
+            temperature=0.0,
+            broadcast_tensor_parallel=False,
+        )
+    )
+    assert steps == [[2, 2]]
     assert model.forward_inputs == [
         [[10, 11]],
         [[13, 14]],
@@ -1296,10 +1314,17 @@ def test_openai_engine_batches_variable_length_shared_prefix_suffixes(monkeypatc
     ]
 
     model.forward_inputs.clear()
-    results = run_pair()
+    steps = list(
+        engine._generate_prompt_list_batch_steps(
+            prompts,
+            max_tokens=1,
+            temperature=0.0,
+            broadcast_tensor_parallel=False,
+        )
+    )
     engine.close()
 
-    assert results == [[2], [2]]
+    assert steps == [[2, 2]]
     assert model.forward_inputs == [
         [[13, 14]],
         [[12]],

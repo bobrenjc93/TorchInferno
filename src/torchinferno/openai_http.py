@@ -11,7 +11,6 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
 from torchinferno.server.openai_protocol import (
-    chat_completion_chunk,
     chat_completion_response,
     error_response,
     model_list_response,
@@ -81,6 +80,7 @@ class OpenAIHandler(BaseHTTPRequestHandler):
         engine = self._engine()
         completion_id = f"chatcmpl-{uuid.uuid4().hex}"
         created = int(time.time())
+        chunk_prefix = _chat_completion_chunk_prefix(completion_id, engine.model_id, created)
         try:
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", "text/event-stream")
@@ -90,13 +90,9 @@ class OpenAIHandler(BaseHTTPRequestHandler):
         except OSError:
             self.close_connection = True
             return
-        client_open = self._try_write_sse(
-            chat_completion_chunk(
-                completion_id=completion_id,
-                model_id=engine.model_id,
-                created=created,
-                delta={"role": "assistant"},
-            )
+        client_open = self._try_write_chat_completion_chunk(
+            chunk_prefix,
+            _CHAT_DELTA_ROLE,
         )
         if _stream_inline_enabled(max_tokens=max_tokens, temperature=temperature):
             for token_id in engine.generate_chat_tokens(
@@ -109,23 +105,15 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                 content = engine.tokenizer.decode_token(int(token_id))
                 if not content:
                     continue
-                client_open = self._try_write_sse(
-                    chat_completion_chunk(
-                        completion_id=completion_id,
-                        model_id=engine.model_id,
-                        created=created,
-                        delta={"content": content},
-                    )
+                client_open = self._try_write_chat_completion_chunk(
+                    chunk_prefix,
+                    _chat_delta_content(content),
                 )
             if client_open:
-                client_open = self._try_write_sse(
-                    chat_completion_chunk(
-                        completion_id=completion_id,
-                        model_id=engine.model_id,
-                        created=created,
-                        delta={},
-                        finish_reason="stop",
-                    )
+                client_open = self._try_write_chat_completion_chunk(
+                    chunk_prefix,
+                    _CHAT_DELTA_EMPTY,
+                    finish_reason="stop",
                 )
             if client_open:
                 self._try_write_done()
@@ -167,23 +155,15 @@ class OpenAIHandler(BaseHTTPRequestHandler):
             content = engine.tokenizer.decode_token(int(item))
             if not content:
                 continue
-            client_open = self._try_write_sse(
-                chat_completion_chunk(
-                    completion_id=completion_id,
-                    model_id=engine.model_id,
-                    created=created,
-                    delta={"content": content},
-                )
+            client_open = self._try_write_chat_completion_chunk(
+                chunk_prefix,
+                _chat_delta_content(content),
             )
         if client_open:
-            client_open = self._try_write_sse(
-                chat_completion_chunk(
-                    completion_id=completion_id,
-                    model_id=engine.model_id,
-                    created=created,
-                    delta={},
-                    finish_reason="stop",
-                )
+            client_open = self._try_write_chat_completion_chunk(
+                chunk_prefix,
+                _CHAT_DELTA_EMPTY,
+                finish_reason="stop",
             )
         if client_open:
             self._try_write_done()
@@ -217,9 +197,27 @@ class OpenAIHandler(BaseHTTPRequestHandler):
         )
         self.wfile.flush()
 
+    def _write_sse_bytes(self, payload: bytes) -> None:
+        self.wfile.write(payload)
+        self.wfile.flush()
+
     def _try_write_sse(self, payload: dict[str, object]) -> bool:
         try:
             self._write_sse(payload)
+            return True
+        except OSError:
+            self.close_connection = True
+            return False
+
+    def _try_write_chat_completion_chunk(
+        self,
+        chunk_prefix: bytes,
+        delta_json: bytes,
+        *,
+        finish_reason: str | None = None,
+    ) -> bool:
+        try:
+            self._write_sse_bytes(_chat_completion_chunk_bytes(chunk_prefix, delta_json, finish_reason))
             return True
         except OSError:
             self.close_connection = True
@@ -249,6 +247,39 @@ class OpenAIHTTPServer(ThreadingHTTPServer):
     def __init__(self, server_address: tuple[str, int], engine: object) -> None:
         super().__init__(server_address, OpenAIHandler)
         self.engine = engine
+
+
+_CHAT_DELTA_ROLE = b'{"role":"assistant"}'
+_CHAT_DELTA_EMPTY = b"{}"
+
+
+def _chat_completion_chunk_prefix(completion_id: str, model_id: str, created: int) -> bytes:
+    return (
+        b'data: {"id":'
+        + json.dumps(completion_id, separators=(",", ":")).encode("utf-8")
+        + b',"object":"chat.completion.chunk","created":'
+        + str(int(created)).encode("ascii")
+        + b',"model":'
+        + json.dumps(model_id, separators=(",", ":")).encode("utf-8")
+        + b',"choices":[{"index":0,"delta":'
+    )
+
+
+def _chat_delta_content(content: str) -> bytes:
+    return b'{"content":' + json.dumps(content, separators=(",", ":")).encode("utf-8") + b"}"
+
+
+def _chat_completion_chunk_bytes(
+    chunk_prefix: bytes,
+    delta_json: bytes,
+    finish_reason: str | None,
+) -> bytes:
+    finish_json = (
+        b"null"
+        if finish_reason is None
+        else json.dumps(finish_reason, separators=(",", ":")).encode("utf-8")
+    )
+    return chunk_prefix + delta_json + b',"finish_reason":' + finish_json + b"}]}\n\n"
 
 
 def _stream_inline_enabled(*, max_tokens: int, temperature: float) -> bool:
