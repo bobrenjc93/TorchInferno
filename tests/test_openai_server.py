@@ -1762,7 +1762,8 @@ def test_openai_tp_shared_prefix_ragged_cache_is_ephemeral(monkeypatch) -> None:
 
     assert steps == [[6, 5], [3, 3]]
     assert model.ragged_cache_ephemeral == [True]
-    assert model.ragged_graph_disabled == [True]
+    assert model.ragged_graph_disabled == [False]
+    assert model.ragged_calls[0][2] == [0, 1]
     assert engine._cache_pool == {}
 
 
@@ -1820,7 +1821,8 @@ def test_openai_tp_shared_prefix_ragged_cache_uses_pool_by_default(monkeypatch) 
 
     assert steps == [[6, 5], [3, 3]]
     assert model.ragged_cache_ephemeral == [False]
-    assert model.ragged_graph_disabled == [True]
+    assert model.ragged_graph_disabled == [False]
+    assert model.ragged_calls[0][2] == [0, 1]
     assert len(engine._cache_pool) == 1
 
 

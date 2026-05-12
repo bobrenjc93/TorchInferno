@@ -2930,8 +2930,12 @@ class OpenAICompletionEngine:
                 if not should_decode:
                     break
                 decode_full_batch = _prefer_full_batch_ragged_decode(len(active_indices), len(active))
+                force_row_indices = env_flag(
+                    "TORCHINFERNO_OPENAI_RAGGED_DECODE_FORCE_ROW_INDICES",
+                    _force_tp_shared_prefix_ragged_row_indices(model),
+                )
                 advance_row_indices: Tensor | None = None
-                if len(active_indices) == len(active) or decode_full_batch:
+                if (len(active_indices) == len(active) or decode_full_batch) and not force_row_indices:
                     decode_indices = list(range(len(active)))
                     decode_input = next_token_tensor[:, None]
                     row_indices = None
@@ -4296,8 +4300,12 @@ def _disable_tp_shared_prefix_ragged_decode_graph(model: object) -> bool:
     return (
         _is_tensor_parallel_model(model)
         and _tensor_parallel_world_size(model) > 1
-        and not env_flag("TORCHINFERNO_OPENAI_TP_SHARED_PREFIX_RAGGED_CUDAGRAPH", False)
+        and not env_flag("TORCHINFERNO_OPENAI_TP_SHARED_PREFIX_RAGGED_CUDAGRAPH", True)
     )
+
+
+def _force_tp_shared_prefix_ragged_row_indices(model: object) -> bool:
+    return _is_tensor_parallel_model(model) and _tensor_parallel_world_size(model) > 1
 
 
 def _set_ragged_decode_graph_disabled(cache: object, disabled: bool) -> None:
