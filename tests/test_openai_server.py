@@ -2299,10 +2299,12 @@ def test_openai_temperature_queue_batch_wait_uses_larger_default(monkeypatch) ->
 
     greedy = _QueuedGeneration([1, 2], 4, 0.0, True, queue.Queue())
     sampled = _QueuedGeneration([1, 2], 4, 0.7, True, queue.Queue())
-    long_sampled = _QueuedGeneration([1, 2], 300, 0.7, True, queue.Queue())
+    medium_sampled = _QueuedGeneration([1, 2], 300, 0.7, True, queue.Queue())
+    long_sampled = _QueuedGeneration([1, 2], 600, 0.7, True, queue.Queue())
 
     assert engine._queued_batch_wait_s(greedy) == 0.010
     assert engine._queued_batch_wait_s(sampled) == 0.050
+    assert engine._queued_batch_wait_s(medium_sampled) == 0.050
     assert engine._queued_batch_wait_s(long_sampled) == 0.010
 
 

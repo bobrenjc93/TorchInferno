@@ -679,7 +679,7 @@ class OpenAICompletionEngine:
     def _queued_batch_wait_s(self, first: _QueuedGeneration) -> float:
         if first.temperature <= 0.0:
             return self.batch_wait_s
-        max_tokens = env_int("TORCHINFERNO_OPENAI_TEMPERATURE_BATCH_WAIT_MAX_TOKENS", 256, minimum=1)
+        max_tokens = env_int("TORCHINFERNO_OPENAI_TEMPERATURE_BATCH_WAIT_MAX_TOKENS", 512, minimum=1)
         if first.max_tokens > max_tokens:
             return self.batch_wait_s
         temperature_wait_s = (
