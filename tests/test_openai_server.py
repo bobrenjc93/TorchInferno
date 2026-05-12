@@ -881,6 +881,7 @@ def test_openai_engine_restores_older_exact_prefix_cache(monkeypatch) -> None:
 
 def test_openai_prompt_list_batch_restores_cached_prefix_rows(monkeypatch) -> None:
     monkeypatch.setenv("TORCHINFERNO_OPENAI_PREFIX_CACHE_MIN_TOKENS", "1")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_PREFIX_CACHE_BATCH_RESTORE", "1")
     model = _TokenEchoSharedPrefixRecordingModel()
     engine = _cache_only_engine()
     engine.model = model
@@ -908,6 +909,7 @@ def test_openai_prompt_list_batch_restores_cached_prefix_rows(monkeypatch) -> No
 
 def test_openai_prompt_list_batch_restores_cached_prefix_rows_with_padded_suffixes(monkeypatch) -> None:
     monkeypatch.setenv("TORCHINFERNO_OPENAI_PREFIX_CACHE_MIN_TOKENS", "1")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_PREFIX_CACHE_BATCH_RESTORE", "1")
     model = _TokenEchoSharedPrefixRecordingModel()
     engine = _cache_only_engine()
     engine.model = model
@@ -935,6 +937,7 @@ def test_openai_prompt_list_batch_restores_cached_prefix_rows_with_padded_suffix
 
 def test_openai_prompt_list_batch_restores_cached_prefix_rows_with_suffix_buckets(monkeypatch) -> None:
     monkeypatch.setenv("TORCHINFERNO_OPENAI_PREFIX_CACHE_MIN_TOKENS", "1")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_PREFIX_CACHE_BATCH_RESTORE", "1")
     model = _TokenEchoSharedPrefixRecordingModel()
     engine = _cache_only_engine()
     engine.model = model

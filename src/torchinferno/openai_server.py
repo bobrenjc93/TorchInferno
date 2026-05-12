@@ -1146,7 +1146,7 @@ class OpenAICompletionEngine:
         self,
         prompts: Sequence[Sequence[int]],
     ) -> list[list[_PrefixCachedPrompt]]:
-        if not env_flag("TORCHINFERNO_OPENAI_PREFIX_CACHE_BATCH_RESTORE", True):
+        if not env_flag("TORCHINFERNO_OPENAI_PREFIX_CACHE_BATCH_RESTORE"):
             return []
         if not env_flag("TORCHINFERNO_OPENAI_PREFIX_CACHE", True):
             return []
