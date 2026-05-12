@@ -22,6 +22,7 @@ from torchinferno.kernels.passes import register_kernel_replacement_passes
 from torchinferno.models.llama3.tensor_parallel import (
     Llama3TensorParallelCache,
     Llama3TensorParallelLayerKVCache,
+    _decode_attention_block_size,
     _decode_linear,
     _should_use_decode_step_graph,
     _should_use_decode_step_logits_graph,
@@ -238,6 +239,17 @@ def test_tensor_parallel_decode_graph_enabled_by_default(monkeypatch) -> None:
 
     assert not _should_use_decode_step_graph(input_ids, cache, temperature=0.0)
     assert not _should_use_decode_step_logits_graph(input_ids, cache)
+
+
+def test_tensor_parallel_decode_attention_blocks_enabled_by_default(monkeypatch) -> None:
+    monkeypatch.delenv("TORCHINFERNO_CUDAGRAPH_DECODE_ATTENTION_BLOCKS", raising=False)
+
+    assert _decode_attention_block_size(33, 288) == 64
+    assert _decode_attention_block_size(1, 288) == 1
+
+    monkeypatch.setenv("TORCHINFERNO_CUDAGRAPH_DECODE_ATTENTION_BLOCKS", "0")
+
+    assert _decode_attention_block_size(33, 288) == 288
 
 
 @pytest.mark.skipif(not torch.cuda.is_available() or not triton_available(), reason="CUDA Triton unavailable")

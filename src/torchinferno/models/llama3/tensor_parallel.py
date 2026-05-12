@@ -2715,7 +2715,7 @@ def _should_use_prefill_logits_graph(
 
 
 def _decode_attention_block_size(attention_length: int, max_seq_len: int) -> int:
-    if not _tp_flag("TORCHINFERNO_CUDAGRAPH_DECODE_ATTENTION_BLOCKS"):
+    if not _tp_flag("TORCHINFERNO_CUDAGRAPH_DECODE_ATTENTION_BLOCKS", True):
         return max_seq_len
     if attention_length <= 1:
         return 1
