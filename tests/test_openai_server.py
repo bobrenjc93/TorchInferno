@@ -34,6 +34,7 @@ from torchinferno.openai_server import (
     _openai_cuda_graph_enabled_for_model,
     _prefers_exact_generation_cache,
     _runtime_prefill_graph_capture_enabled,
+    _sampled_batch_shape_bucket_size,
     _should_reexec_distributed_server,
     _sync_tensor_parallel_command,
     _sync_tensor_parallel_continue,
@@ -231,7 +232,7 @@ def test_openai_server_warmup_uses_generic_shape_buckets(monkeypatch) -> None:
     assert prefix_suffix_counts == {(32, 16), (64, 16), (128, 32), (256, 32)}
     assert set(_warmup_prefix_suffix_cache_token_counts()) >= {128, 256, 512, 1024}
     assert set(_warmup_temperature_prompt_token_counts()) == {32, 55, 64}
-    assert set(_warmup_temperature_batch_sizes()) >= {1, 8, 16, 64}
+    assert set(_warmup_temperature_batch_sizes()) >= {1, 8, 15, 16, 64}
     assert set(_warmup_ragged_decode_batch_sizes()) == {64}
     assert set(_warmup_ragged_decode_row_counts()) >= {16, 32, 64}
     assert set(_warmup_ragged_decode_cache_token_counts()) >= {256, 512}
@@ -357,6 +358,7 @@ def test_transformers_chat_tokenizer_stops_on_llama_eot() -> None:
     assert 128001 in tokenizer.stop_token_ids
     assert 128008 in tokenizer.stop_token_ids
     assert 128009 in tokenizer.stop_token_ids
+    assert 128010 in tokenizer.stop_token_ids
 
 
 def test_openai_engine_stops_generation_on_chat_terminator() -> None:
@@ -466,6 +468,76 @@ def test_tensor_parallel_worker_loop_uses_batched_stream_path(monkeypatch) -> No
 
     assert engine.single_calls == []
     assert engine.batch_calls == [([[1, 2, 3]], 1, 0.0, False)]
+
+
+def test_tensor_parallel_worker_loop_receives_tensor_stream_command(monkeypatch) -> None:
+    import torch.distributed as dist
+
+    model = type("FakeTPModel", (), {"world_size": 2, "rank": 1})()
+    payloads = [
+        torch.tensor([1, 1, 1, 3, 2, 1, 0], dtype=torch.long),
+        torch.tensor([0.25], dtype=torch.float64),
+        torch.tensor([3], dtype=torch.long),
+        torch.tensor([[1, 2, 3]], dtype=torch.long),
+        torch.tensor([2], dtype=torch.long),
+        torch.tensor([0, 0, 0, 0, 0, 0, 0], dtype=torch.long),
+    ]
+
+    def broadcast(tensor: torch.Tensor, *, src: int) -> None:
+        del src
+        tensor.copy_(payloads.pop(0).to(device=tensor.device, dtype=tensor.dtype))
+
+    monkeypatch.setattr(
+        "torchinferno.openai_server._is_tensor_parallel_model",
+        lambda candidate: candidate is model,
+    )
+    monkeypatch.setattr(dist, "is_available", lambda: True)
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(dist, "broadcast", broadcast)
+    monkeypatch.setattr(dist, "barrier", lambda: None)
+
+    engine = _WorkerLoopRecordingEngine()
+    engine.model = model
+
+    _tensor_parallel_worker_loop(engine)
+
+    assert payloads == []
+    assert engine.batch_calls == [([[1, 2, 3]], 2, 0.25, False)]
+
+
+def test_tensor_parallel_worker_loop_receives_tensor_prompt_list_command(monkeypatch) -> None:
+    import torch.distributed as dist
+
+    model = type("FakeTPModel", (), {"world_size": 2, "rank": 1})()
+    payloads = [
+        torch.tensor([2, 1, 2, 3, 4, 1, 0], dtype=torch.long),
+        torch.tensor([0.75], dtype=torch.float64),
+        torch.tensor([2, 3], dtype=torch.long),
+        torch.tensor([[1, 2, 0], [3, 4, 5]], dtype=torch.long),
+        torch.tensor([1, 4], dtype=torch.long),
+        torch.tensor([0, 0, 0, 0, 0, 0, 0], dtype=torch.long),
+    ]
+
+    def broadcast(tensor: torch.Tensor, *, src: int) -> None:
+        del src
+        tensor.copy_(payloads.pop(0).to(device=tensor.device, dtype=tensor.dtype))
+
+    monkeypatch.setattr(
+        "torchinferno.openai_server._is_tensor_parallel_model",
+        lambda candidate: candidate is model,
+    )
+    monkeypatch.setattr(dist, "is_available", lambda: True)
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(dist, "broadcast", broadcast)
+    monkeypatch.setattr(dist, "barrier", lambda: None)
+
+    engine = _WorkerLoopRecordingEngine()
+    engine.model = model
+
+    _tensor_parallel_worker_loop(engine)
+
+    assert payloads == []
+    assert engine.prompt_list_calls == [([[1, 2], [3, 4, 5]], 4, 0.75, False, [1, 4])]
 
 
 def test_openai_stream_disconnect_drains_generation() -> None:
@@ -1089,7 +1161,7 @@ def test_openai_engine_skips_runtime_prefill_graph_capture_on_miss() -> None:
     assert model.forward_inputs
 
 
-def test_openai_tp_runtime_prefill_capture_allows_large_and_temperature_requests(monkeypatch) -> None:
+def test_openai_tp_runtime_prefill_capture_defaults_off_but_env_can_enable(monkeypatch) -> None:
     model = object()
     monkeypatch.setattr(
         "torchinferno.openai_server._is_tensor_parallel_model",
@@ -1100,6 +1172,10 @@ def test_openai_tp_runtime_prefill_capture_allows_large_and_temperature_requests
         lambda candidate: 8 if candidate is model else 1,
     )
 
+    assert not _runtime_prefill_graph_capture_enabled(model, temperature=0.0, max_tokens=512)
+    assert not _runtime_prefill_graph_capture_enabled(model, temperature=0.7, max_tokens=300)
+
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_RUNTIME_PREFILL_CAPTURE", "1")
     assert _runtime_prefill_graph_capture_enabled(model, temperature=0.0, max_tokens=512)
     assert _runtime_prefill_graph_capture_enabled(model, temperature=0.7, max_tokens=300)
 
@@ -1115,6 +1191,7 @@ def test_openai_tp_runtime_prefill_capture_overrides_still_apply(monkeypatch) ->
         lambda candidate: 8 if candidate is model else 1,
     )
 
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_RUNTIME_PREFILL_CAPTURE", "1")
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_RUNTIME_TEMPERATURE_PREFILL_CAPTURE", "0")
     assert not _runtime_prefill_graph_capture_enabled(model, temperature=0.7, max_tokens=300)
 
@@ -1130,6 +1207,7 @@ def test_openai_engine_uses_runtime_shared_prefix_capture_for_tensor_parallel(mo
     engine.model = model
     engine.stop_token_ids = frozenset()
 
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_RUNTIME_PREFILL_CAPTURE", "1")
     monkeypatch.setattr(
         "torchinferno.openai_server._is_tensor_parallel_model",
         lambda candidate: candidate is model,
@@ -2380,6 +2458,117 @@ def test_openai_temperature_queue_batch_wait_respects_env_floor(monkeypatch) -> 
     assert engine._queued_batch_wait_s(sampled) == 0.010
 
 
+def test_openai_tp_sampled_stream_uses_short_initial_queue_wait(monkeypatch) -> None:
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_SAMPLED_INITIAL_BATCH_WAIT_MS", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TEMPERATURE_BATCH_WAIT_MAX_TOKENS", raising=False)
+    model = object()
+    engine = _cache_only_engine()
+    engine.model = model
+    engine.device = torch.device("cuda")
+    engine.max_batch_size = 16
+    engine.batch_wait_s = 0.010
+
+    monkeypatch.setattr(
+        "torchinferno.openai_server._is_tensor_parallel_model",
+        lambda candidate: candidate is model,
+    )
+
+    short_sampled = _QueuedGeneration([1, 2], 256, 0.7, True, queue.Queue())
+    sampled = _QueuedGeneration([1, 2], 300, 0.7, True, queue.Queue())
+    greedy = _QueuedGeneration([1, 2], 300, 0.0, True, queue.Queue())
+    completion = _QueuedGeneration([1, 2], 300, 0.7, False, queue.Queue())
+    long_sampled = _QueuedGeneration([1, 2], 600, 0.7, True, queue.Queue())
+
+    assert engine._queued_initial_batch_wait_s(short_sampled) == 0.0
+    assert engine._queued_initial_batch_wait_s(sampled) == 0.010
+    assert engine._queued_initial_batch_wait_s(greedy) == 0.0
+    assert engine._queued_initial_batch_wait_s(completion) == 0.0
+    assert engine._queued_initial_batch_wait_s(long_sampled) == 0.0
+
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_SAMPLED_INITIAL_BATCH_WAIT_MS", "2")
+    assert engine._queued_initial_batch_wait_s(sampled) == 0.002
+
+
+def test_openai_sampled_batch_shape_bucket_uses_warmed_temperature_shapes(monkeypatch) -> None:
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_SAMPLED_BATCH_SHAPE_BUCKETING", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_SAMPLED_BATCH_SHAPE_BUCKET_MAX_RATIO", raising=False)
+    model = object()
+
+    monkeypatch.setattr(
+        "torchinferno.openai_server._is_tensor_parallel_model",
+        lambda candidate: candidate is model,
+    )
+
+    assert _sampled_batch_shape_bucket_size(model, torch.device("cuda"), 7, 0.7) == 8
+    assert _sampled_batch_shape_bucket_size(model, torch.device("cuda"), 9, 0.7) == 15
+    assert _sampled_batch_shape_bucket_size(model, torch.device("cuda"), 17, 0.7) == 17
+    assert _sampled_batch_shape_bucket_size(model, torch.device("cuda"), 7, 0.0) == 7
+    assert _sampled_batch_shape_bucket_size(model, torch.device("cpu"), 7, 0.7) == 7
+
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_SAMPLED_BATCH_SHAPE_BUCKET_MAX_RATIO", "1.1")
+    assert _sampled_batch_shape_bucket_size(model, torch.device("cuda"), 9, 0.7) == 9
+
+
+def test_openai_collect_batch_stops_when_current_live_requests_are_ready() -> None:
+    engine = _cache_only_engine()
+    engine.max_batch_size = 16
+    engine.batch_wait_s = 1.0
+    engine._generation_queue = queue.Queue()
+    engine._live_request_condition = threading.Condition()
+    engine._live_requests = 2
+
+    first = _QueuedGeneration([1], 300, 0.7, True, queue.Queue())
+    second = _QueuedGeneration([2], 300, 0.7, True, queue.Queue())
+    batch = [first, second]
+
+    start = time.perf_counter()
+    engine._collect_batch_until_deadline(batch, limit=16)
+    elapsed = time.perf_counter() - start
+
+    assert batch == [first, second]
+    assert elapsed < 0.1
+
+
+def test_openai_resident_temperature_warmup_keeps_short_batch_sizes(monkeypatch) -> None:
+    engine = _cache_only_engine()
+    engine.model = object()
+    engine.device = torch.device("cpu")
+    caches: list[tuple[int, int]] = []
+    warmups: list[tuple[int, tuple[int, ...]]] = []
+
+    class _Cache:
+        seq_len = 0
+
+    def generation_cache(batch_size: int, cache_tokens: int, *, model: object) -> _Cache:
+        del model
+        caches.append((batch_size, cache_tokens))
+        return _Cache()
+
+    def warmup_temperature(input_ids: torch.Tensor, cache: object, batch_size: int) -> None:
+        del cache
+        warmups.append((batch_size, tuple(int(dim) for dim in input_ids.shape)))
+
+    monkeypatch.setattr(
+        "torchinferno.openai_server._warmup_temperature_batch_sizes",
+        lambda: (1, 8, 16, 64, 15),
+    )
+    monkeypatch.setattr(
+        "torchinferno.openai_server._warmup_temperature_prompt_token_counts",
+        lambda: (32, 55),
+    )
+    engine._generation_cache = generation_cache  # type: ignore[method-assign]
+    engine._warmup_temperature_prefill_decode_graphs = warmup_temperature  # type: ignore[method-assign]
+
+    engine._warmup_tensor_parallel_resident_temperature_graphs(vocab_size=128)
+
+    assert caches == [(1, 512), (8, 512), (16, 512), (15, 512)]
+    assert (64, (64, 32)) not in warmups
+    assert (8, (8, 55)) in warmups
+    assert (8, (1, 55)) in warmups
+    assert (15, (15, 55)) in warmups
+    assert (15, (1, 55)) in warmups
+
+
 def test_openai_queued_batch_groups_streams_with_different_max_tokens() -> None:
     engine = _cache_only_engine()
     captured: list[list[int]] = []
@@ -2449,14 +2638,14 @@ def test_openai_stream_group_finishes_rows_on_stop_token() -> None:
         input_ids: torch.Tensor,
         *,
         max_tokens: int,
-        temperature: float,
-        broadcast_tensor_parallel: bool = True,
-        row_max_tokens: list[int] | None = None,
-    ):
-        del input_ids, max_tokens, temperature, broadcast_tensor_parallel, row_max_tokens
-        yield [99, 201]
-        captured.append([first.done, second.done])
-        yield [None, 202]
+            temperature: float,
+            broadcast_tensor_parallel: bool = True,
+            row_max_tokens: list[int] | None = None,
+        ):
+            del input_ids, max_tokens, temperature, broadcast_tensor_parallel, row_max_tokens
+            yield [99, 201]
+            captured.append([first.done, second.done])
+            yield [None, 202]
 
     engine._generate_batch_steps = generate_batch_steps  # type: ignore[method-assign]
 
@@ -2534,8 +2723,16 @@ def test_openai_tensor_parallel_command_sync_uses_control_group(monkeypatch) -> 
     _sync_tensor_parallel_command(model, torch.device("cuda"))
 
     assert calls == [
-        ("sync", "cuda"),
         ("new_group", "gloo"),
+        ("barrier", {"group": "control"}),
+    ]
+
+    calls.clear()
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_COMMAND_CUDA_SYNC", "1")
+    _sync_tensor_parallel_command(model, torch.device("cuda"))
+
+    assert calls == [
+        ("sync", "cuda"),
         ("barrier", {"group": "control"}),
         ("sync", "cuda"),
     ]
@@ -2777,6 +2974,13 @@ class _LlamaStyleTokenizer(_BatchEncodingTokenizer):
             return 128009
         return 0
 
+    def get_added_vocab(self) -> dict[str, int]:
+        return {
+            "<|begin_of_text|>": 128000,
+            "<|python_tag|>": 128010,
+            "ordinary_added_token": 128011,
+        }
+
 
 class _StopTokenTokenizer:
     eos_token_id = 0
@@ -2874,6 +3078,7 @@ class _WorkerLoopRecordingEngine:
         self.device = torch.device("cpu")
         self.single_calls: list[tuple[list[list[int]], int, float, bool, bool]] = []
         self.batch_calls: list[tuple[list[list[int]], int, float, bool]] = []
+        self.prompt_list_calls: list[tuple[list[list[int]], int, float, bool, list[int] | None]] = []
 
     def _generate_single_tokens(
         self,
@@ -2914,6 +3119,26 @@ class _WorkerLoopRecordingEngine:
             )
         )
         yield [2 for _ in range(input_ids.size(0))]
+
+    def _generate_prompt_list_batch_steps(
+        self,
+        prompts: list[list[int]],
+        *,
+        max_tokens: int,
+        temperature: float,
+        broadcast_tensor_parallel: bool,
+        row_max_tokens: list[int] | None = None,
+    ):
+        self.prompt_list_calls.append(
+            (
+                [[int(token_id) for token_id in prompt] for prompt in prompts],
+                max_tokens,
+                temperature,
+                broadcast_tensor_parallel,
+                row_max_tokens,
+            )
+        )
+        yield [2 for _ in prompts]
 
 
 class _ScriptedTokenModel:

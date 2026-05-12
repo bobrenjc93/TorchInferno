@@ -221,6 +221,7 @@ def _chat_stop_token_ids(tokenizer: object) -> frozenset[int]:
     token_ids.update(_coerce_optional_token_ids(eos_token_id))
     token_ids.update(_coerce_optional_token_ids(getattr(tokenizer, "eos_token_ids", None)))
     token_ids.update(_known_chat_terminator_ids(tokenizer))
+    token_ids.update(_added_chat_control_token_ids(tokenizer))
     return frozenset(token_ids)
 
 
@@ -243,6 +244,23 @@ def _known_chat_terminator_ids(tokenizer: object) -> set[int]:
                 token_ids.add(coerced)
             elif token in getattr(tokenizer, "all_special_tokens", ()):
                 token_ids.add(coerced)
+    return token_ids
+
+
+def _added_chat_control_token_ids(tokenizer: object) -> set[int]:
+    get_added_vocab = getattr(tokenizer, "get_added_vocab", None)
+    if not callable(get_added_vocab):
+        return set()
+    try:
+        added_vocab = get_added_vocab()
+    except Exception:
+        return set()
+    if not isinstance(added_vocab, Mapping):
+        return set()
+    token_ids: set[int] = set()
+    for token, token_id in added_vocab.items():
+        if isinstance(token, str) and token.startswith("<|") and token.endswith("|>"):
+            token_ids.update(_coerce_optional_token_ids(token_id))
     return token_ids
 
 
@@ -554,6 +572,15 @@ class OpenAICompletionEngine:
                 return
             batch = [first]
             batch_limit = self._queued_batch_limit(first)
+            initial_wait_s = self._queued_initial_batch_wait_s(first)
+            if initial_wait_s > 0.0:
+                self._collect_batch_until_deadline(
+                    batch,
+                    limit=batch_limit,
+                    wait_s=initial_wait_s,
+                    reset_deadline_on_item=False,
+                    stop_when_live_batch_ready=False,
+                )
             self._drain_ready_requests(batch, limit=batch_limit)
             if len(batch) > 1 or self._has_multiple_live_requests():
                 self._collect_batch_until_deadline(batch, limit=batch_limit)
@@ -627,6 +654,11 @@ class OpenAICompletionEngine:
         with self._live_request_condition:
             return self._live_requests > 1
 
+    def _queued_batch_has_current_live_requests(self, batch_size: int, batch_limit: int) -> bool:
+        with self._live_request_condition:
+            live_requests = self._live_requests
+        return live_requests > 0 and batch_size >= min(batch_limit, live_requests)
+
     def _queued_batch_limit(self, first: _QueuedGeneration) -> int:
         limit = self.max_batch_size
         if (
@@ -667,11 +699,25 @@ class OpenAICompletionEngine:
                 return
             batch.append(item)
 
-    def _collect_batch_until_deadline(self, batch: list[_QueuedGeneration], *, limit: int | None = None) -> None:
-        batch_wait_s = self._queued_batch_wait_s(batch[0]) if batch else self.batch_wait_s
+    def _collect_batch_until_deadline(
+        self,
+        batch: list[_QueuedGeneration],
+        *,
+        limit: int | None = None,
+        wait_s: float | None = None,
+        reset_deadline_on_item: bool = True,
+        stop_when_live_batch_ready: bool = True,
+    ) -> None:
+        batch_wait_s = (
+            wait_s
+            if wait_s is not None
+            else (self._queued_batch_wait_s(batch[0]) if batch else self.batch_wait_s)
+        )
         if batch_wait_s == 0.0:
             return
         batch_limit = self.max_batch_size if limit is None else max(1, min(self.max_batch_size, limit))
+        if stop_when_live_batch_ready and self._queued_batch_has_current_live_requests(len(batch), batch_limit):
+            return
         deadline = time.perf_counter() + batch_wait_s
         while len(batch) < batch_limit:
             timeout = max(0.0, deadline - time.perf_counter())
@@ -685,7 +731,10 @@ class OpenAICompletionEngine:
                 self._generation_queue.put(None)
                 break
             batch.append(item)
-            deadline = time.perf_counter() + batch_wait_s
+            if stop_when_live_batch_ready and self._queued_batch_has_current_live_requests(len(batch), batch_limit):
+                break
+            if reset_deadline_on_item:
+                deadline = time.perf_counter() + batch_wait_s
 
     def _queued_batch_wait_s(self, first: _QueuedGeneration) -> float:
         if first.temperature <= 0.0:
@@ -698,6 +747,22 @@ class OpenAICompletionEngine:
             / 1000.0
         )
         return max(self.batch_wait_s, temperature_wait_s)
+
+    def _queued_initial_batch_wait_s(self, first: _QueuedGeneration) -> float:
+        if not first.stream or first.temperature <= 0.0 or self.max_batch_size <= 1:
+            return 0.0
+        max_temperature_tokens = env_int("TORCHINFERNO_OPENAI_TEMPERATURE_BATCH_WAIT_MAX_TOKENS", 512, minimum=1)
+        if not (
+            _is_tensor_parallel_model(self.model)
+            and self.device.type == "cuda"
+            and first.max_tokens <= max_temperature_tokens
+        ):
+            return 0.0
+        short_max_tokens = env_int("TORCHINFERNO_OPENAI_SHORT_STREAM_MAX_TOKENS", 256, minimum=1)
+        if first.max_tokens <= short_max_tokens:
+            return 0.0
+        wait_ms = env_float("TORCHINFERNO_OPENAI_TP_SAMPLED_INITIAL_BATCH_WAIT_MS", 10.0, minimum=0.0)
+        return min(self._queued_batch_wait_s(first), wait_ms / 1000.0)
 
     def _run_queued_batch(self, batch: list[_QueuedGeneration]) -> None:
         groups: dict[tuple[float, bool], list[_QueuedGeneration]] = {}
@@ -724,7 +789,11 @@ class OpenAICompletionEngine:
         prompts = [request.prompt for request in group]
         max_tokens = max((request.max_tokens for request in group), default=0)
         row_max_tokens = [request.max_tokens for request in group]
-        if self._shared_prefix_prompt_list_tokens(prompts) > 0:
+        use_prompt_list_batch = self._shared_prefix_prompt_list_tokens(prompts) > 0
+        if use_prompt_list_batch and _prefer_tensor_parallel_stream_group(prompts, self.model):
+            use_prompt_list_batch = False
+        if use_prompt_list_batch:
+            completed_steps = 0
             try:
                 step_iter = self._generate_prompt_list_batch_steps(
                     prompts,
@@ -733,9 +802,14 @@ class OpenAICompletionEngine:
                     row_max_tokens=row_max_tokens,
                 )
                 for step, step_tokens in enumerate(step_iter):
+                    completed_steps = step + 1
                     _emit_stream_step(group, step, step_tokens, getattr(self, "stop_token_ids", frozenset()))
             finally:
-                _sync_tensor_parallel_command(self.model, self.device)
+                _sync_tensor_parallel_command(
+                    self.model,
+                    self.device,
+                    cuda_sync=_tp_command_cuda_sync_for_steps(completed_steps),
+                )
             return
         for same_length_group in _queued_groups_by_prompt_length(group):
             same_length_max_tokens = max(request.max_tokens for request in same_length_group)
@@ -744,6 +818,7 @@ class OpenAICompletionEngine:
                 dtype=torch.long,
                 device=self.device,
             )
+            completed_steps = 0
             try:
                 step_iter = self._generate_batch_steps(
                     input_ids,
@@ -752,6 +827,7 @@ class OpenAICompletionEngine:
                     row_max_tokens=[request.max_tokens for request in same_length_group],
                 )
                 for step, step_tokens in enumerate(step_iter):
+                    completed_steps = step + 1
                     _emit_stream_step(
                         same_length_group,
                         step,
@@ -759,7 +835,11 @@ class OpenAICompletionEngine:
                         getattr(self, "stop_token_ids", frozenset()),
                     )
             finally:
-                _sync_tensor_parallel_command(self.model, self.device)
+                _sync_tensor_parallel_command(
+                    self.model,
+                    self.device,
+                    cuda_sync=_tp_command_cuda_sync_for_steps(completed_steps),
+                )
 
     def _run_queued_completion_group(self, group: list[_QueuedGeneration]) -> None:
         for same_length_group in _queued_groups_by_prompt_length(group):
@@ -1295,8 +1375,15 @@ class OpenAICompletionEngine:
         if not isinstance(self.tokenizer, _TransformersChatTokenizer):
             return
         try:
+            warmup_text = " ".join(f"tok{idx:02d}" for idx in range(32))
             self.tokenizer.encode_messages(
-                [{"role": "user", "content": " ".join(f"tok{idx:02d}" for idx in range(32))}]
+                [{"role": "user", "content": warmup_text}]
+            )
+            self.tokenizer.encode_messages(
+                [
+                    {"role": "system", "content": "You are a helpful assistant."},
+                    {"role": "user", "content": warmup_text},
+                ]
             )
         except Exception as exc:
             warn_optional_failure("openai.tokenizer_warmup", exc)
@@ -1333,6 +1420,7 @@ class OpenAICompletionEngine:
             )
             self._generation_cache(1, warmup_cache_tokens, model=self.model)
             _warmup_tensor_parallel_decode_attention(self.model)
+            self._warmup_tensor_parallel_resident_temperature_graphs(vocab_size)
         torch.cuda.synchronize(self.device)
 
     def _warmup_tensor_parallel_prefill_graphs(
@@ -1417,6 +1505,33 @@ class OpenAICompletionEngine:
             decode_input = next_token[:, None]
         _repeat_generation_cache_first_batch(cache, batch_size)
         _try_decode_one_token_logits_graph(self.model, decode_input, cache)
+
+    def _warmup_tensor_parallel_resident_temperature_graphs(self, vocab_size: int) -> None:
+        if not env_flag("TORCHINFERNO_OPENAI_WARMUP_RESIDENT_TEMPERATURE_GRAPHS", True):
+            return
+        if not env_flag("TORCHINFERNO_CUDAGRAPH_PREFILL", True):
+            return
+        prompt_counts = _warmup_temperature_prompt_token_counts()
+        cache_tokens = env_int("TORCHINFERNO_OPENAI_WARMUP_RESIDENT_TEMPERATURE_CACHE_TOKENS", 512, minimum=1)
+        if not prompt_counts:
+            return
+        batch_sizes = [
+            batch_size
+            for batch_size in _warmup_temperature_batch_sizes()
+            if batch_size <= env_int("TORCHINFERNO_OPENAI_WARMUP_RESIDENT_TEMPERATURE_MAX_BATCH", 16, minimum=1)
+        ]
+        for batch_size in batch_sizes:
+            cache = self._generation_cache(batch_size, cache_tokens, model=self.model)
+            for count in prompt_counts:
+                if count > cache_tokens:
+                    continue
+                base = torch.arange(count, device=self.device, dtype=torch.long) % vocab_size
+                input_ids = base[None, :].expand(batch_size, count).contiguous()
+                self._warmup_temperature_prefill_decode_graphs(input_ids, cache, batch_size)
+                if batch_size > 1:
+                    _reset_generation_cache(cache)
+                    self._warmup_temperature_prefill_decode_graphs(base[None, :], cache, batch_size)
+                _reset_generation_cache(cache)
 
     def _warmup_tensor_parallel_ragged_decode_graphs(self, vocab_size: int) -> None:
         if not env_flag("TORCHINFERNO_CUDAGRAPH_RAGGED_DECODE_STEP", True):
@@ -1749,8 +1864,14 @@ class OpenAICompletionEngine:
             yield from _iter_generated_steps(rows, max_tokens, stop_token_ids)
             return
 
-        cache = self._generation_cache(
+        decode_batch_size = _sampled_batch_shape_bucket_size(
+            model,
+            self.device,
             batch_size,
+            temperature,
+        )
+        cache = self._generation_cache(
+            decode_batch_size,
             input_ids.size(1) + max_tokens,
             model=model,
         )
@@ -1758,25 +1879,26 @@ class OpenAICompletionEngine:
             model,
             input_ids,
             cache,
-            batch_size,
+            decode_batch_size,
             temperature,
             allow_capture=_runtime_prefill_graph_capture_enabled(model, temperature, max_tokens=max_tokens),
         )
         next_token = next_token.to(self.device)
-        _repeat_generation_cache_first_batch(cache, batch_size)
+        _repeat_generation_cache_first_batch(cache, decode_batch_size)
         shared_sample = _shared_prefix_sample_enabled(temperature)
         per_row_limits = _normalize_row_max_tokens(row_max_tokens, batch_size, max_tokens)
-        active = [limit > 0 for limit in per_row_limits]
+        decode_row_limits = [*per_row_limits, *([0] * (decode_batch_size - batch_size))]
+        active = [limit > 0 for limit in decode_row_limits]
         for step in range(max_tokens):
             token_ids = next_token.detach().cpu().tolist()
             step_tokens: list[int | None] = []
-            for row, token_id in enumerate(token_ids):
+            for row, token_id in enumerate(token_ids[:batch_size]):
                 if not active[row]:
                     step_tokens.append(None)
                     continue
                 token_id = int(token_id)
                 step_tokens.append(token_id)
-                if token_id in stop_token_ids or step + 1 >= per_row_limits[row]:
+                if token_id in stop_token_ids or step + 1 >= decode_row_limits[row]:
                     active[row] = False
             yield step_tokens
             should_continue = step + 1 < max_tokens and any(active)
@@ -1786,8 +1908,8 @@ class OpenAICompletionEngine:
             decode_input = next_token[:1, None] if shared_sample else next_token[:, None]
             next_token, cache = _decode_next_token(model, decode_input, cache, temperature)
             if shared_sample:
-                next_token = next_token.expand(batch_size).contiguous()
-                _repeat_generation_cache_first_batch(cache, batch_size)
+                next_token = next_token.expand(decode_batch_size).contiguous()
+                _repeat_generation_cache_first_batch(cache, decode_batch_size)
             next_token = next_token.to(self.device)
 
     def _stream_microbatch_size(self, batch_size: int) -> int:
@@ -3318,6 +3440,24 @@ def _shared_prefix_batch_enabled_for_model(model: object) -> bool:
     return True
 
 
+def _prefer_tensor_parallel_stream_group(
+    prompts: Sequence[Sequence[int]],
+    model: object,
+) -> bool:
+    if not _tensor_parallel_tensor_commands_enabled(model):
+        return False
+    if len(prompts) <= 1:
+        return False
+    prompt_len = len(prompts[0])
+    return all(len(prompt) == prompt_len for prompt in prompts)
+
+
+_TP_COMMAND_STOP = 0
+_TP_COMMAND_GENERATE_TENSOR = 1
+_TP_COMMAND_GENERATE_PROMPT_LISTS = 2
+_TP_COMMAND_META_FIELDS = 7
+
+
 def _runtime_prefill_graph_capture_enabled(
     model: object,
     temperature: float = 0.0,
@@ -3325,6 +3465,8 @@ def _runtime_prefill_graph_capture_enabled(
     max_tokens: int | None = None,
 ) -> bool:
     if _is_tensor_parallel_model(model) and _tensor_parallel_world_size(model) > 1:
+        if not env_flag("TORCHINFERNO_OPENAI_TP_RUNTIME_PREFILL_CAPTURE"):
+            return False
         if temperature > 0.0 and not env_flag(
             "TORCHINFERNO_OPENAI_TP_RUNTIME_TEMPERATURE_PREFILL_CAPTURE",
             True,
@@ -3334,7 +3476,7 @@ def _runtime_prefill_graph_capture_enabled(
             token_limit = env_int("TORCHINFERNO_OPENAI_TP_RUNTIME_PREFILL_CAPTURE_MAX_TOKENS", 1024, minimum=1)
             if max_tokens > token_limit:
                 return False
-        return env_flag("TORCHINFERNO_OPENAI_TP_RUNTIME_PREFILL_CAPTURE", True)
+        return True
     return True
 
 
@@ -3344,7 +3486,12 @@ def _openai_cuda_graph_enabled_for_model(model: object) -> bool:
     return True
 
 
-def _sync_tensor_parallel_command(model: object, device: torch.device) -> None:
+def _sync_tensor_parallel_command(
+    model: object,
+    device: torch.device,
+    *,
+    cuda_sync: bool | None = None,
+) -> None:
     if not _is_tensor_parallel_model(model) or _tensor_parallel_world_size(model) <= 1:
         return
     import torch.distributed as dist
@@ -3352,13 +3499,23 @@ def _sync_tensor_parallel_command(model: object, device: torch.device) -> None:
     if not dist.is_available() or not dist.is_initialized():
         return
     if device.type == "cuda":
-        torch.cuda.synchronize(device)
+        sync_cuda = env_flag("TORCHINFERNO_OPENAI_TP_COMMAND_CUDA_SYNC") if cuda_sync is None else cuda_sync
+        if sync_cuda:
+            torch.cuda.synchronize(device)
         control_group = _tensor_parallel_control_group(dist)
         if control_group is not None:
             dist.barrier(group=control_group)
-        torch.cuda.synchronize(device)
+        if sync_cuda:
+            torch.cuda.synchronize(device)
         return
     dist.barrier()
+
+
+def _tp_command_cuda_sync_for_steps(completed_steps: int) -> bool:
+    if env_flag("TORCHINFERNO_OPENAI_TP_COMMAND_CUDA_SYNC"):
+        return True
+    min_steps = env_int("TORCHINFERNO_OPENAI_TP_COMMAND_CUDA_SYNC_MIN_STEPS", 8, minimum=1)
+    return completed_steps >= min_steps
 
 
 def _sync_tensor_parallel_continue(model: object, should_continue: bool, device: torch.device) -> bool:
@@ -3401,6 +3558,116 @@ def _tensor_parallel_all_ranks_same_int(model: object, value: int, device: torch
     return bool(low.item() == high.item())
 
 
+def _tensor_parallel_tensor_commands_enabled(model: object) -> bool:
+    if (
+        not _is_tensor_parallel_model(model)
+        or _tensor_parallel_world_size(model) <= 1
+        or not env_flag("TORCHINFERNO_OPENAI_TP_TENSOR_COMMANDS", True)
+    ):
+        return False
+    import torch.distributed as dist
+
+    return dist.is_available() and dist.is_initialized()
+
+
+def _tensor_parallel_command_device(device: torch.device) -> torch.device:
+    command_device = torch.device(device)
+    return command_device if command_device.type == "cuda" else torch.device("cpu")
+
+
+def _broadcast_tensor_parallel_tensor_payload(
+    model: object,
+    *,
+    command_kind: int,
+    token_rows: Tensor,
+    lengths: Tensor,
+    max_tokens: int,
+    temperature: float,
+    stream: bool,
+    row_max_tokens: Sequence[int] | None,
+) -> bool:
+    if not _tensor_parallel_tensor_commands_enabled(model):
+        return False
+    import torch.distributed as dist
+
+    if not dist.is_available() or not dist.is_initialized():
+        return False
+    command_device = token_rows.device
+    row_max = (
+        torch.tensor([int(value) for value in row_max_tokens], dtype=torch.long, device=command_device)
+        if row_max_tokens is not None
+        else torch.empty(0, dtype=torch.long, device=command_device)
+    )
+    meta = torch.tensor(
+        [
+            command_kind,
+            int(bool(stream)),
+            int(token_rows.size(0)),
+            int(token_rows.size(1)),
+            int(max_tokens),
+            int(row_max.numel() > 0),
+            0,
+        ],
+        dtype=torch.long,
+        device=command_device,
+    )
+    temp = torch.tensor([float(temperature)], dtype=torch.float64, device=command_device)
+    dist.broadcast(meta, src=0)
+    dist.broadcast(temp, src=0)
+    dist.broadcast(lengths, src=0)
+    dist.broadcast(token_rows, src=0)
+    if row_max.numel() > 0:
+        dist.broadcast(row_max, src=0)
+    return True
+
+
+def _receive_tensor_parallel_tensor_payload(engine: OpenAICompletionEngine) -> dict[str, object]:
+    import torch.distributed as dist
+
+    command_device = _tensor_parallel_command_device(engine.device)
+    meta = torch.empty(_TP_COMMAND_META_FIELDS, dtype=torch.long, device=command_device)
+    dist.broadcast(meta, src=0)
+    command_kind = int(meta[0].item())
+    if command_kind == _TP_COMMAND_STOP:
+        return {"op": "stop"}
+    if command_kind not in {_TP_COMMAND_GENERATE_TENSOR, _TP_COMMAND_GENERATE_PROMPT_LISTS}:
+        raise ValueError(f"unsupported tensor-parallel tensor command: {command_kind}")
+
+    stream = bool(meta[1].item())
+    rows = int(meta[2].item())
+    width = int(meta[3].item())
+    max_tokens = int(meta[4].item())
+    has_row_max_tokens = bool(meta[5].item())
+    temp = torch.empty(1, dtype=torch.float64, device=command_device)
+    lengths = torch.empty(rows, dtype=torch.long, device=command_device)
+    token_rows = torch.empty((rows, width), dtype=torch.long, device=command_device)
+    dist.broadcast(temp, src=0)
+    dist.broadcast(lengths, src=0)
+    dist.broadcast(token_rows, src=0)
+    row_max_tokens = None
+    if has_row_max_tokens:
+        row_max = torch.empty(rows, dtype=torch.long, device=command_device)
+        dist.broadcast(row_max, src=0)
+        row_max_tokens = [int(value) for value in row_max.detach().cpu().tolist()]
+
+    payload: dict[str, object] = {
+        "op": "generate",
+        "max_tokens": max_tokens,
+        "row_max_tokens": row_max_tokens,
+        "temperature": float(temp.item()),
+        "stream": stream,
+    }
+    if command_kind == _TP_COMMAND_GENERATE_TENSOR:
+        payload["input_ids_tensor"] = token_rows.to(engine.device, non_blocking=True)
+    else:
+        lengths_list = [int(value) for value in lengths.detach().cpu().tolist()]
+        payload["input_id_lists"] = [
+            token_rows[row, :length].detach().cpu().tolist()
+            for row, length in enumerate(lengths_list)
+        ]
+    return payload
+
+
 def _broadcast_tensor_parallel_generate(
     model: object,
     input_ids: Tensor,
@@ -3415,6 +3682,25 @@ def _broadcast_tensor_parallel_generate(
     import torch.distributed as dist
 
     if not dist.is_available() or not dist.is_initialized():
+        return
+    command_device = _tensor_parallel_command_device(input_ids.device)
+    token_rows = input_ids.detach().to(command_device, non_blocking=True).contiguous()
+    lengths = torch.full(
+        (token_rows.size(0),),
+        token_rows.size(1),
+        dtype=torch.long,
+        device=command_device,
+    )
+    if _broadcast_tensor_parallel_tensor_payload(
+        model,
+        command_kind=_TP_COMMAND_GENERATE_TENSOR,
+        token_rows=token_rows,
+        lengths=lengths,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        stream=stream,
+        row_max_tokens=row_max_tokens,
+    ):
         return
     command = [
         {
@@ -3444,6 +3730,25 @@ def _broadcast_tensor_parallel_generate_prompt_lists(
 
     if not dist.is_available() or not dist.is_initialized():
         return
+    if prompts:
+        command_device = _tensor_parallel_command_device(getattr(model, "device", torch.device("cpu")))
+        lengths = torch.tensor([len(prompt) for prompt in prompts], dtype=torch.long, device=command_device)
+        width = int(lengths.max().item()) if lengths.numel() > 0 else 0
+        token_rows = torch.zeros((len(prompts), width), dtype=torch.long, device=command_device)
+        for row, prompt in enumerate(prompts):
+            if prompt:
+                token_rows[row, : len(prompt)] = torch.tensor(prompt, dtype=torch.long, device=command_device)
+        if _broadcast_tensor_parallel_tensor_payload(
+            model,
+            command_kind=_TP_COMMAND_GENERATE_PROMPT_LISTS,
+            token_rows=token_rows,
+            lengths=lengths,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            stream=stream,
+            row_max_tokens=row_max_tokens,
+        ):
+            return
     command = [
         {
             "op": "generate",
@@ -3463,6 +3768,12 @@ def _broadcast_tensor_parallel_stop(model: object) -> None:
     import torch.distributed as dist
 
     if dist.is_available() and dist.is_initialized():
+        if _tensor_parallel_tensor_commands_enabled(model):
+            device = _tensor_parallel_command_device(getattr(model, "device", torch.device("cpu")))
+            meta = torch.zeros(_TP_COMMAND_META_FIELDS, dtype=torch.long, device=device)
+            meta[0] = _TP_COMMAND_STOP
+            dist.broadcast(meta, src=0)
+            return
         dist.broadcast_object_list([{"op": "stop"}], src=0)
 
 
@@ -3472,9 +3783,12 @@ def _tensor_parallel_worker_loop(engine: OpenAICompletionEngine) -> None:
     if not dist.is_available() or not dist.is_initialized():
         raise RuntimeError("tensor-parallel worker loop requires an initialized process group")
     while True:
-        command: list[object] = [None]
-        dist.broadcast_object_list(command, src=0)
-        payload = command[0]
+        if _tensor_parallel_tensor_commands_enabled(getattr(engine, "model", None)):
+            payload = _receive_tensor_parallel_tensor_payload(engine)
+        else:
+            command: list[object] = [None]
+            dist.broadcast_object_list(command, src=0)
+            payload = command[0]
         if not isinstance(payload, dict):
             continue
         op = payload.get("op")
@@ -3512,7 +3826,11 @@ def _tensor_parallel_worker_loop(engine: OpenAICompletionEngine) -> None:
                             broadcast_tensor_parallel=False,
                         )
                 continue
-            input_ids = torch.tensor(payload["input_ids"], dtype=torch.long, device=engine.device)
+            tensor_payload = payload.get("input_ids_tensor")
+            if isinstance(tensor_payload, Tensor):
+                input_ids = tensor_payload.to(engine.device, non_blocking=True)
+            else:
+                input_ids = torch.tensor(payload["input_ids"], dtype=torch.long, device=engine.device)
             if bool(payload.get("stream", True)):
                 for _ in engine._generate_batch_steps(
                     input_ids,
@@ -4026,6 +4344,27 @@ def _shared_prefix_sample_enabled(temperature: float) -> bool:
         temperature > 0.0
         and env_flag("TORCHINFERNO_OPENAI_PREFIX_CACHE_SHARED_SAMPLE")
     )
+
+
+def _sampled_batch_shape_bucket_size(
+    model: object,
+    device: torch.device,
+    batch_size: int,
+    temperature: float,
+) -> int:
+    if (
+        batch_size <= 1
+        or temperature <= 0.0
+        or not env_flag("TORCHINFERNO_OPENAI_SAMPLED_BATCH_SHAPE_BUCKETING", True)
+        or not _is_tensor_parallel_model(model)
+        or torch.device(device).type != "cuda"
+    ):
+        return batch_size
+    max_ratio = env_float("TORCHINFERNO_OPENAI_SAMPLED_BATCH_SHAPE_BUCKET_MAX_RATIO", 2.0, minimum=1.0)
+    for candidate in sorted(_warmup_temperature_batch_sizes()):
+        if batch_size <= candidate <= int(batch_size * max_ratio):
+            return candidate
+    return batch_size
 
 
 def _tensor_rows_are_identical(input_ids: Tensor) -> bool:
