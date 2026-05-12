@@ -2279,19 +2279,16 @@ def test_openai_short_tp_stream_uses_smaller_queue_batch_limit(monkeypatch) -> N
 
     short_stream = _QueuedGeneration([], 64, 0.0, True, queue.Queue())
     boundary_stream = _QueuedGeneration([], 256, 0.0, True, queue.Queue())
-    temperature_stream = _QueuedGeneration([], 256, 0.7, True, queue.Queue())
     long_stream = _QueuedGeneration([], 300, 0.0, True, queue.Queue())
     short_completion = _QueuedGeneration([], 64, 0.0, False, queue.Queue())
 
     assert engine._queued_batch_limit(short_stream) == 48
     assert engine._queued_batch_limit(boundary_stream) == 48
-    assert engine._queued_batch_limit(temperature_stream) == 64
     assert engine._queued_batch_limit(long_stream) == 64
     assert engine._queued_batch_limit(short_completion) == 64
 
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_SHORT_STREAM_MAX_BATCH_SIZE", "12")
     assert engine._queued_batch_limit(short_stream) == 12
-    assert engine._queued_batch_limit(temperature_stream) == 12
 
 
 def test_openai_temperature_queue_batch_wait_uses_larger_default(monkeypatch) -> None:
