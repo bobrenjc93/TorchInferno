@@ -634,9 +634,13 @@ class OpenAICompletionEngine:
             and _is_tensor_parallel_model(self.model)
             and self.device.type == "cuda"
             and first.max_tokens
-            <= env_int("TORCHINFERNO_OPENAI_SHORT_STREAM_MAX_TOKENS", 128, minimum=1)
+            <= env_int("TORCHINFERNO_OPENAI_SHORT_STREAM_MAX_TOKENS", 256, minimum=1)
         ):
-            short_limit = env_int("TORCHINFERNO_OPENAI_TP_SHORT_STREAM_MAX_BATCH_SIZE", limit, minimum=1)
+            short_limit = env_int(
+                "TORCHINFERNO_OPENAI_TP_SHORT_STREAM_MAX_BATCH_SIZE",
+                min(limit, 48),
+                minimum=1,
+            )
             return min(limit, short_limit)
         return limit
 
