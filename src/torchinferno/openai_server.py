@@ -636,11 +636,9 @@ class OpenAICompletionEngine:
         ):
             short_max_tokens = env_int("TORCHINFERNO_OPENAI_SHORT_STREAM_MAX_TOKENS", 256, minimum=1)
             if first.max_tokens <= short_max_tokens:
-                default_short_limit = 48
+                default_short_limit = 64
                 if first.temperature > 0.0:
                     default_short_limit = 16
-                elif first.max_tokens <= 128:
-                    default_short_limit = 64
                 short_limit = env_int(
                     "TORCHINFERNO_OPENAI_TP_SHORT_STREAM_MAX_BATCH_SIZE",
                     min(limit, default_short_limit),
