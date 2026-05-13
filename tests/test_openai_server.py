@@ -2750,8 +2750,8 @@ def test_openai_short_tp_stream_uses_smaller_queue_batch_limit(monkeypatch) -> N
     large_stream = _QueuedGeneration([], 512, 0.0, True, queue.Queue())
     short_completion = _QueuedGeneration([], 64, 0.0, False, queue.Queue())
 
-    assert engine._queued_batch_limit(short_stream) == 64
-    assert engine._queued_batch_limit(boundary_stream) == 64
+    assert engine._queued_batch_limit(short_stream) == 56
+    assert engine._queued_batch_limit(boundary_stream) == 56
     assert engine._queued_batch_limit(sampled_short_stream) == 64
     assert engine._queued_batch_limit(medium_stream) == 128
     assert engine._queued_batch_limit(sampled_medium_stream) == 128
@@ -3168,7 +3168,7 @@ def test_openai_tensor_parallel_short_streams_sync_after_default_window(monkeypa
     assert _tp_command_cuda_sync_for_steps(3)
 
 
-def test_openai_tensor_parallel_sampled_identical_prompt_cache_defaults_ephemeral(monkeypatch) -> None:
+def test_openai_tensor_parallel_sampled_identical_prompt_cache_defaults_pooled(monkeypatch) -> None:
     monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_IDENTICAL_PROMPT_CACHE_POOL", raising=False)
     model = type("FakeTPModel", (), {"world_size": 8})()
     monkeypatch.setattr(
@@ -3176,11 +3176,11 @@ def test_openai_tensor_parallel_sampled_identical_prompt_cache_defaults_ephemera
         lambda candidate: candidate is model,
     )
 
-    assert not _identical_prompt_cache_pool_enabled(model, 0.7)
+    assert _identical_prompt_cache_pool_enabled(model, 0.7)
     assert _identical_prompt_cache_pool_enabled(model, 0.0)
 
-    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_IDENTICAL_PROMPT_CACHE_POOL", "1")
-    assert _identical_prompt_cache_pool_enabled(model, 0.7)
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_IDENTICAL_PROMPT_CACHE_POOL", "0")
+    assert not _identical_prompt_cache_pool_enabled(model, 0.7)
 
 
 def test_openai_tensor_parallel_continue_sync_skips_broadcast_by_default(monkeypatch) -> None:

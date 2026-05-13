@@ -669,7 +669,7 @@ class OpenAICompletionEngine:
         ):
             short_max_tokens = env_int("TORCHINFERNO_OPENAI_SHORT_STREAM_MAX_TOKENS", 256, minimum=1)
             if first.max_tokens <= short_max_tokens:
-                default_short_limit = 64
+                default_short_limit = 64 if first.temperature > 0.0 else 56
                 short_limit = env_int(
                     "TORCHINFERNO_OPENAI_TP_SHORT_STREAM_MAX_BATCH_SIZE",
                     min(limit, default_short_limit),
@@ -4183,11 +4183,12 @@ def _shared_prefix_ragged_cache_pool_enabled_for_model(
 
 
 def _identical_prompt_cache_pool_enabled(model: object, temperature: float) -> bool:
+    del temperature
     if not (_is_tensor_parallel_model(model) and _tensor_parallel_world_size(model) > 1):
         return True
     if "TORCHINFERNO_OPENAI_TP_IDENTICAL_PROMPT_CACHE_POOL" in os.environ:
-        return env_flag("TORCHINFERNO_OPENAI_TP_IDENTICAL_PROMPT_CACHE_POOL", False)
-    return temperature <= 0.0
+        return env_flag("TORCHINFERNO_OPENAI_TP_IDENTICAL_PROMPT_CACHE_POOL", True)
+    return True
 
 
 def _prefer_shared_prefix_padded_suffix_prefill(
