@@ -1271,7 +1271,7 @@ def triton_grouped_gqa_decode_attention(q: Tensor, k: Tensor, v: Tensor, seq_len
     seq_len_stride = 0 if seq_len.numel() == 1 else 1
     out = torch.empty((batch, q_heads, 1, value_dim), device=q.device, dtype=q.dtype)
     if os.environ.get("TORCHINFERNO_TRITON_STREAMING_DECODE_ATTENTION", "1") != "0":
-        block_s = int(os.environ.get("TORCHINFERNO_TRITON_STREAMING_DECODE_ATTENTION_BLOCK_S", "64"))
+        block_s = _streaming_decode_attention_block_s(batch)
         if block_s <= 0 or block_s > 2048 or block_s & (block_s - 1) != 0:
             raise ValueError("streaming decode attention block size must be a power of two")
         _grouped_gqa_decode_attention_streaming_kernel[(batch, kv_heads)](
@@ -1346,6 +1346,11 @@ def triton_grouped_gqa_decode_attention(q: Tensor, k: Tensor, v: Tensor, seq_len
         num_warps=num_warps,
     )
     return out
+
+
+def _streaming_decode_attention_block_s(batch: int) -> int:
+    del batch
+    return int(os.environ.get("TORCHINFERNO_TRITON_STREAMING_DECODE_ATTENTION_BLOCK_S", "64"))
 
 
 def _triton_rotate_one_interleaved_inplace(x: Tensor, cos: Tensor, sin: Tensor) -> None:

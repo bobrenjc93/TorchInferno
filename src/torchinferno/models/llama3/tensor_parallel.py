@@ -1740,13 +1740,15 @@ class Llama3TensorParallelForCausalLM:
         attention_block_size = _decode_attention_block_size(cache.seq_len + 1, cache.layers[0].max_seq_len)
         key = (id(cache), input_ids.size(0), attention_block_size)
         captured = self._decode_graphs.get(key)
-        if (
+        needs_capture = (
             captured is None
             or captured.cache is not cache
             or captured.max_seq_len != cache.layers[0].max_seq_len
             or captured.attention_block_size != attention_block_size
             or captured.static_input_ids.shape != input_ids.shape
-        ):
+        )
+        needs_capture = _capture_needed_on_any_rank(needs_capture, self.device)
+        if needs_capture:
             captured = self._capture_decode_step_graph(input_ids, cache, attention_block_size)
         else:
             self._copy_decode_graph_inputs(captured, input_ids, cache)
@@ -1816,13 +1818,15 @@ class Llama3TensorParallelForCausalLM:
         attention_block_size = _decode_attention_block_size(cache.seq_len + 1, cache.layers[0].max_seq_len)
         key = (id(cache), input_ids.size(0), attention_block_size)
         captured = self._decode_logits_graphs.get(key)
-        if (
+        needs_capture = (
             captured is None
             or captured.cache is not cache
             or captured.max_seq_len != cache.layers[0].max_seq_len
             or captured.attention_block_size != attention_block_size
             or captured.static_input_ids.shape != input_ids.shape
-        ):
+        )
+        needs_capture = _capture_needed_on_any_rank(needs_capture, self.device)
+        if needs_capture:
             captured = self._capture_decode_step_logits_graph(input_ids, cache, attention_block_size)
         else:
             self._copy_decode_logits_graph_inputs(captured, input_ids, cache)
@@ -1847,13 +1851,15 @@ class Llama3TensorParallelForCausalLM:
             row_indices is not None,
         )
         captured = self._ragged_decode_logits_graphs.get(key)
-        if (
+        needs_capture = (
             captured is None
             or captured.cache is not cache
             or captured.max_seq_len != cache.layers[0].max_seq_len
             or captured.static_input_ids.shape != input_ids.shape
             or (captured.static_row_indices is None) != (row_indices is None)
-        ):
+        )
+        needs_capture = _capture_needed_on_any_rank(needs_capture, self.device)
+        if needs_capture:
             captured = self._capture_ragged_decode_logits_graph(input_ids, cache, seq_lens, row_indices)
         else:
             self._copy_ragged_decode_graph_inputs(captured, input_ids, seq_lens, row_indices)

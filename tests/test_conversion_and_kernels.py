@@ -41,6 +41,19 @@ def _write_native_deepseek_style_checkpoint(path, model: DSv4ForCausalLM) -> Non
     save_file(native_state, path / "model.safetensors", metadata={"format": "pt"})
 
 
+def test_streaming_decode_attention_block_size_prefers_larger_single_batch(monkeypatch) -> None:
+    from torchinferno.kernels.triton_ops import _streaming_decode_attention_block_s
+
+    monkeypatch.delenv("TORCHINFERNO_TRITON_STREAMING_DECODE_ATTENTION_BLOCK_S", raising=False)
+
+    assert _streaming_decode_attention_block_s(1) == 64
+    assert _streaming_decode_attention_block_s(2) == 64
+
+    monkeypatch.setenv("TORCHINFERNO_TRITON_STREAMING_DECODE_ATTENTION_BLOCK_S", "32")
+    assert _streaming_decode_attention_block_s(1) == 32
+    assert _streaming_decode_attention_block_s(4) == 32
+
+
 def test_deepseek_style_checkpoint_conversion_round_trip(tmp_path) -> None:
     torch.manual_seed(10)
     config = tiny_dsv4_config(vocab_size=32, max_seq_len=16)

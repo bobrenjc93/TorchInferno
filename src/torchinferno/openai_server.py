@@ -431,6 +431,7 @@ class OpenAICompletionEngine:
         self._worker: threading.Thread | None = None
         self._cache_pool: dict[tuple[int, int, str, int, str], object] = {}
         self._microbatch_cache_pool: dict[tuple[int, int, int, str, int, str], object] = {}
+        self._single_prefill_capture_seen: dict[tuple[int, int, int, int, bool, str], int] = {}
         self._prefix_cache_entry: TensorPrefixCacheEntry | None = None
         self._prefix_cache_entries: dict[tuple[int, ...], TensorPrefixCacheEntry] = {}
         self._prompt_token_cache: dict[str, list[int]] = {}
@@ -669,8 +670,6 @@ class OpenAICompletionEngine:
             short_max_tokens = env_int("TORCHINFERNO_OPENAI_SHORT_STREAM_MAX_TOKENS", 256, minimum=1)
             if first.max_tokens <= short_max_tokens:
                 default_short_limit = 64
-                if first.temperature > 0.0:
-                    default_short_limit = 16
                 short_limit = env_int(
                     "TORCHINFERNO_OPENAI_TP_SHORT_STREAM_MAX_BATCH_SIZE",
                     min(limit, default_short_limit),
@@ -742,8 +741,10 @@ class OpenAICompletionEngine:
         max_tokens = env_int("TORCHINFERNO_OPENAI_TEMPERATURE_BATCH_WAIT_MAX_TOKENS", 512, minimum=1)
         if first.max_tokens > max_tokens:
             return self.batch_wait_s
+        short_max_tokens = env_int("TORCHINFERNO_OPENAI_SHORT_STREAM_MAX_TOKENS", 256, minimum=1)
+        default_wait_ms = 10.0 if first.max_tokens <= short_max_tokens else 50.0
         temperature_wait_s = (
-            env_float("TORCHINFERNO_OPENAI_TEMPERATURE_BATCH_WAIT_MS", 50.0, minimum=0.0)
+            env_float("TORCHINFERNO_OPENAI_TEMPERATURE_BATCH_WAIT_MS", default_wait_ms, minimum=0.0)
             / 1000.0
         )
         return max(self.batch_wait_s, temperature_wait_s)
@@ -760,8 +761,13 @@ class OpenAICompletionEngine:
             return 0.0
         short_max_tokens = env_int("TORCHINFERNO_OPENAI_SHORT_STREAM_MAX_TOKENS", 256, minimum=1)
         if first.max_tokens <= short_max_tokens:
-            return 0.0
-        wait_ms = env_float("TORCHINFERNO_OPENAI_TP_SAMPLED_INITIAL_BATCH_WAIT_MS", 10.0, minimum=0.0)
+            wait_ms = env_float(
+                "TORCHINFERNO_OPENAI_TP_SHORT_SAMPLED_INITIAL_BATCH_WAIT_MS",
+                10.0,
+                minimum=0.0,
+            )
+        else:
+            wait_ms = env_float("TORCHINFERNO_OPENAI_TP_SAMPLED_INITIAL_BATCH_WAIT_MS", 10.0, minimum=0.0)
         return min(self._queued_batch_wait_s(first), wait_ms / 1000.0)
 
     def _run_queued_batch(self, batch: list[_QueuedGeneration]) -> None:
@@ -789,7 +795,7 @@ class OpenAICompletionEngine:
         prompts = [request.prompt for request in group]
         max_tokens = max((request.max_tokens for request in group), default=0)
         row_max_tokens = [request.max_tokens for request in group]
-        use_prompt_list_batch = self._shared_prefix_prompt_list_tokens(prompts) > 0
+        use_prompt_list_batch = self._should_use_prompt_list_stream_group(prompts)
         if use_prompt_list_batch and _prefer_tensor_parallel_stream_group(prompts, self.model):
             use_prompt_list_batch = False
         if use_prompt_list_batch:
@@ -840,6 +846,16 @@ class OpenAICompletionEngine:
                     self.device,
                     cuda_sync=_tp_command_cuda_sync_for_steps(completed_steps),
                 )
+
+    def _should_use_prompt_list_stream_group(self, prompts: Sequence[Sequence[int]]) -> bool:
+        if self._shared_prefix_prompt_list_tokens(prompts) > 0:
+            return True
+        return (
+            len(prompts) == 1
+            and _is_tensor_parallel_model(self.model)
+            and _prefix_cache_enabled_for_model(self.model)
+            and env_flag("TORCHINFERNO_OPENAI_TP_SINGLE_PROMPT_LIST_STREAM", False)
+        )
 
     def _run_queued_completion_group(self, group: list[_QueuedGeneration]) -> None:
         for same_length_group in _queued_groups_by_prompt_length(group):
@@ -1099,7 +1115,17 @@ class OpenAICompletionEngine:
             return 0
         input_tokens = tuple(int(token_id) for token_id in input_ids[0].detach().cpu().tolist())
         min_prefix_tokens = env_int("TORCHINFERNO_OPENAI_PREFIX_CACHE_MIN_TOKENS", 16, minimum=1)
+        min_suffix_tokens = env_int("TORCHINFERNO_OPENAI_PREFIX_CACHE_MIN_SUFFIX_TOKENS", 8, minimum=1)
+        short_suffix_max_prefix_tokens = env_int(
+            "TORCHINFERNO_OPENAI_PREFIX_CACHE_SHORT_SUFFIX_MAX_PREFIX_TOKENS",
+            256,
+            minimum=1,
+        )
         for _, entry in self._prefix_cache_restore_candidates(input_tokens, min_prefix_tokens):
+            prefix_tokens = _matching_prefix_tokens(entry.tokens, input_tokens, min_prefix_tokens)
+            suffix_tokens = len(input_tokens) - prefix_tokens
+            if suffix_tokens < min_suffix_tokens and prefix_tokens < short_suffix_max_prefix_tokens:
+                continue
             restored = restore_tensor_prefix_cache(
                 entry,
                 input_tokens,
@@ -1659,9 +1685,16 @@ class OpenAICompletionEngine:
         if phase is not None:
             phase["prefill_tokens"] = float(prefill_input_ids.size(1))
         self._mark_phase(phase, "prefill_start")
-        prefill_token = _try_prefill_graph(model, prefill_input_ids, cache, temperature)
+        allow_capture = self._single_prefill_graph_capture_enabled(
+            model,
+            prefill_input_ids,
+            cache,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+        prefill_token = _try_prefill_graph(model, prefill_input_ids, cache, temperature, allow_capture=allow_capture)
         if prefill_token is None:
-            prefill_logits = _try_prefill_logits_graph(model, prefill_input_ids, cache)
+            prefill_logits = _try_prefill_logits_graph(model, prefill_input_ids, cache, allow_capture=allow_capture)
         else:
             prefill_logits = None
         if prefill_token is None and prefill_logits is None:
@@ -1713,6 +1746,51 @@ class OpenAICompletionEngine:
             next_token = next_token.to(self.device)
         if update_prefix_cache and not drained_after_close:
             self._save_prefix_cache(input_ids, generated_tokens, cache)
+
+    def _single_prefill_graph_capture_enabled(
+        self,
+        model: object,
+        input_ids: Tensor,
+        cache: object,
+        *,
+        temperature: float,
+        max_tokens: int,
+    ) -> bool:
+        if not (_is_tensor_parallel_model(model) and _tensor_parallel_world_size(model) > 1):
+            return env_flag(
+                "TORCHINFERNO_OPENAI_SINGLE_RUNTIME_PREFILL_CAPTURE",
+                False,
+            ) and _runtime_prefill_graph_capture_enabled(model, temperature, max_tokens=max_tokens)
+        if "TORCHINFERNO_OPENAI_TP_RUNTIME_PREFILL_CAPTURE" in os.environ:
+            return _runtime_prefill_graph_capture_enabled(model, temperature, max_tokens=max_tokens)
+        if not env_flag("TORCHINFERNO_OPENAI_TP_SINGLE_RUNTIME_PREFILL_CAPTURE", False):
+            return False
+        if temperature > 0.0 and not env_flag(
+            "TORCHINFERNO_OPENAI_TP_RUNTIME_TEMPERATURE_PREFILL_CAPTURE",
+            True,
+        ):
+            return False
+        token_limit = env_int("TORCHINFERNO_OPENAI_TP_RUNTIME_PREFILL_CAPTURE_MAX_TOKENS", 1024, minimum=1)
+        if max_tokens > token_limit:
+            return False
+        layers = tuple(getattr(cache, "layers", ()) or ())
+        max_seq_len = int(getattr(layers[0], "max_seq_len", 0)) if layers else 0
+        key = (
+            int(input_ids.size(0)),
+            int(input_ids.size(1)),
+            _generation_cache_seq_len(cache),
+            max_seq_len,
+            temperature > 0.0,
+            str(self.device),
+        )
+        seen = self._single_prefill_capture_seen
+        count = seen.get(key, 0) + 1
+        seen[key] = count
+        max_entries = env_int("TORCHINFERNO_OPENAI_TP_SINGLE_RUNTIME_PREFILL_CAPTURE_MAX_ENTRIES", 256, minimum=1)
+        while len(seen) > max_entries:
+            seen.pop(next(iter(seen)))
+        min_hits = env_int("TORCHINFERNO_OPENAI_TP_SINGLE_RUNTIME_PREFILL_CAPTURE_MIN_HITS", 2, minimum=1)
+        return count >= min_hits
 
     @torch.inference_mode()
     def _generate_batch_steps(
@@ -1874,6 +1952,7 @@ class OpenAICompletionEngine:
             decode_batch_size,
             input_ids.size(1) + max_tokens,
             model=model,
+            pool=_identical_prompt_cache_pool_enabled(model, temperature),
         )
         next_token, cache = _prefill_repeated_prefix_next_token(
             model,
@@ -2082,6 +2161,26 @@ class OpenAICompletionEngine:
                 row_max_tokens=row_max_tokens,
             )
         per_row_limits = _normalize_row_max_tokens(row_max_tokens, len(prompts), max_tokens)
+        if len(prompts) == 1:
+            input_ids = torch.tensor([prompts[0]], dtype=torch.long, device=self.device)
+            for token_id in self._generate_single_tokens(
+                input_ids,
+                max_tokens=per_row_limits[0],
+                temperature=temperature,
+                broadcast_tensor_parallel=False,
+            ):
+                yield [token_id]
+            return
+        if _prompt_rows_are_identical(prompts):
+            input_ids = torch.tensor([prompts[0]], dtype=torch.long, device=self.device)
+            yield from self._generate_identical_prompt_batch_steps(
+                input_ids,
+                batch_size=len(prompts),
+                max_tokens=max_tokens,
+                temperature=temperature,
+                row_max_tokens=per_row_limits,
+            )
+            return
         if allow_prefix_cache_restore:
             cached_groups = self._prefix_cached_prompt_groups(prompts)
             if cached_groups:
@@ -2952,7 +3051,10 @@ class OpenAICompletionEngine:
             prompt_count,
             max_prompt_len + max_tokens,
             model=model,
-            pool=_shared_prefix_ragged_cache_pool_enabled_for_model(model),
+            pool=_shared_prefix_ragged_cache_pool_enabled_for_model(
+                model,
+                max_tokens=max_tokens,
+            ),
         )
         try:
             _copy_generation_cache_first_row(prefix_cache, cache, prompt_count)
@@ -3013,7 +3115,10 @@ class OpenAICompletionEngine:
             prompt_count,
             max_prompt_len + max_tokens,
             model=model,
-            pool=_shared_prefix_ragged_cache_pool_enabled_for_model(model),
+            pool=_shared_prefix_ragged_cache_pool_enabled_for_model(
+                model,
+                max_tokens=max_tokens,
+            ),
         )
         try:
             for state in states:
@@ -3047,7 +3152,7 @@ class OpenAICompletionEngine:
         row_max_tokens: Sequence[int] | None = None,
     ) -> Iterator[list[int | None]]:
         model = self.model
-        if _disable_tp_shared_prefix_ragged_decode_graph(model):
+        if _disable_tp_shared_prefix_ragged_decode_graph(model, max_tokens=max_tokens):
             _set_ragged_decode_graph_disabled(cache, True)
         if max_tokens <= 1 or not any(active):
             return
@@ -3069,7 +3174,7 @@ class OpenAICompletionEngine:
         )
         ephemeral_graph_min_step = env_int(
             "TORCHINFERNO_OPENAI_EPHEMERAL_RAGGED_CUDAGRAPH_MIN_STEP",
-            4,
+            1,
             minimum=1,
         )
         ephemeral_graph_scope = False
@@ -4066,10 +4171,23 @@ def _shared_prefix_ragged_cache_enabled_for_model(model: object) -> bool:
     return True
 
 
-def _shared_prefix_ragged_cache_pool_enabled_for_model(model: object) -> bool:
+def _shared_prefix_ragged_cache_pool_enabled_for_model(
+    model: object,
+    *,
+    max_tokens: int | None = None,
+) -> bool:
+    del max_tokens
     if _is_tensor_parallel_model(model) and _tensor_parallel_world_size(model) > 1:
         return env_flag("TORCHINFERNO_OPENAI_TP_SHARED_PREFIX_RAGGED_CACHE_POOL", True)
     return True
+
+
+def _identical_prompt_cache_pool_enabled(model: object, temperature: float) -> bool:
+    if not (_is_tensor_parallel_model(model) and _tensor_parallel_world_size(model) > 1):
+        return True
+    if "TORCHINFERNO_OPENAI_TP_IDENTICAL_PROMPT_CACHE_POOL" in os.environ:
+        return env_flag("TORCHINFERNO_OPENAI_TP_IDENTICAL_PROMPT_CACHE_POOL", False)
+    return temperature <= 0.0
 
 
 def _prefer_shared_prefix_padded_suffix_prefill(
@@ -4373,6 +4491,13 @@ def _tensor_rows_are_identical(input_ids: Tensor) -> bool:
     return bool(torch.equal(input_ids, input_ids[:1].expand_as(input_ids)))
 
 
+def _prompt_rows_are_identical(prompts: Sequence[Sequence[int]]) -> bool:
+    if len(prompts) <= 1:
+        return True
+    first = tuple(int(token_id) for token_id in prompts[0])
+    return all(tuple(int(token_id) for token_id in prompt) == first for prompt in prompts[1:])
+
+
 def _queued_groups_by_prompt_length(group: Sequence[_QueuedGeneration]) -> list[list[_QueuedGeneration]]:
     groups: dict[int, list[_QueuedGeneration]] = {}
     for request in group:
@@ -4658,7 +4783,7 @@ def _try_decode_ragged_logits_graph(
         False,
     ):
         return None
-    if not _openai_decode_graph_enabled(model):
+    if not _openai_ragged_decode_graph_enabled(model):
         return None
     decode_graph = getattr(model, "try_decode_ragged_logits_graph", None)
     if decode_graph is None:
@@ -4666,12 +4791,19 @@ def _try_decode_ragged_logits_graph(
     return decode_graph(input_ids, cache, seq_lens=seq_lens, row_indices=row_indices)
 
 
-def _disable_tp_shared_prefix_ragged_decode_graph(model: object) -> bool:
-    return (
-        _is_tensor_parallel_model(model)
-        and _tensor_parallel_world_size(model) > 1
-        and not env_flag("TORCHINFERNO_OPENAI_TP_SHARED_PREFIX_RAGGED_CUDAGRAPH", True)
+def _disable_tp_shared_prefix_ragged_decode_graph(model: object, *, max_tokens: int | None = None) -> bool:
+    if not (_is_tensor_parallel_model(model) and _tensor_parallel_world_size(model) > 1):
+        return False
+    if "TORCHINFERNO_OPENAI_TP_SHARED_PREFIX_RAGGED_CUDAGRAPH" in os.environ:
+        return not env_flag("TORCHINFERNO_OPENAI_TP_SHARED_PREFIX_RAGGED_CUDAGRAPH", True)
+    if max_tokens is None:
+        return False
+    max_graph_tokens = env_int(
+        "TORCHINFERNO_OPENAI_TP_SHARED_PREFIX_RAGGED_CUDAGRAPH_MAX_TOKENS",
+        128,
+        minimum=1,
     )
+    return max_tokens > max_graph_tokens
 
 
 def _force_tp_shared_prefix_ragged_row_indices(model: object) -> bool:
@@ -4692,10 +4824,25 @@ def _release_decode_graphs_for_cache(model: object, cache: object) -> None:
 
 
 def _openai_decode_graph_enabled(model: object) -> bool:
-    return (
-        env_flag("TORCHINFERNO_OPENAI_CUDAGRAPH_DECODE_STEP", True)
-        and _openai_cuda_graph_enabled_for_model(model)
-    )
+    if "TORCHINFERNO_OPENAI_CUDAGRAPH_DECODE_STEP" in os.environ:
+        return (
+            env_flag("TORCHINFERNO_OPENAI_CUDAGRAPH_DECODE_STEP", True)
+            and _openai_cuda_graph_enabled_for_model(model)
+        )
+    if _is_tensor_parallel_model(model) and _tensor_parallel_world_size(model) > 1:
+        return (
+            env_flag("TORCHINFERNO_OPENAI_TP_DECODE_CUDAGRAPH", True)
+            and _openai_cuda_graph_enabled_for_model(model)
+        )
+    return _openai_cuda_graph_enabled_for_model(model)
+
+
+def _openai_ragged_decode_graph_enabled(model: object) -> bool:
+    if not _openai_decode_graph_enabled(model):
+        return False
+    if "TORCHINFERNO_CUDAGRAPH_RAGGED_DECODE_STEP" in os.environ:
+        return env_flag("TORCHINFERNO_CUDAGRAPH_RAGGED_DECODE_STEP", True)
+    return True
 
 
 def _try_prefill_graph(
