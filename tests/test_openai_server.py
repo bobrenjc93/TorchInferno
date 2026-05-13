@@ -2283,6 +2283,57 @@ def test_openai_tp_shared_prefix_ragged_graph_disabled_for_large_max_tokens(monk
     assert model.ragged_graph_disabled == [True]
 
 
+def test_openai_tp_shared_prefix_ragged_graph_allowed_for_large_max_tokens(monkeypatch) -> None:
+    class _GraphFlagRecordingModel:
+        def __init__(self) -> None:
+            self.ragged_graph_disabled: list[bool] = []
+
+        def decode_ragged_logits(
+            self,
+            input_ids: torch.Tensor,
+            cache: object,
+            *,
+            seq_lens: torch.Tensor,
+            row_indices: torch.Tensor | None = None,
+        ) -> torch.Tensor:
+            del seq_lens, row_indices
+            self.ragged_graph_disabled.append(bool(getattr(cache, "_torchinferno_disable_ragged_decode_graph", False)))
+            logits = torch.zeros(input_ids.size(0), 1, 8)
+            logits[..., 3] = 1.0
+            return logits
+
+    model = _GraphFlagRecordingModel()
+    engine = _cache_only_engine()
+    engine.model = model
+    engine.stop_token_ids = frozenset()
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_SHARED_PREFIX_RAGGED_CUDAGRAPH", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_SHARED_PREFIX_RAGGED_CUDAGRAPH_MAX_TOKENS", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_SHARED_PREFIX_RAGGED_CUDAGRAPH_LARGE_MIN_TOKENS", raising=False)
+    monkeypatch.setattr(
+        "torchinferno.openai_server._is_tensor_parallel_model",
+        lambda candidate: candidate is model,
+    )
+    monkeypatch.setattr(
+        "torchinferno.openai_server._tensor_parallel_world_size",
+        lambda candidate: 8 if candidate is model else 1,
+    )
+
+    steps = list(
+        engine._decode_shared_prefix_prompt_list_ragged(
+            cache=types.SimpleNamespace(),
+            active=[True, True],
+            prompt_lengths=[2, 3],
+            max_tokens=512,
+            next_tokens=[1, 1],
+            temperature=0.0,
+            row_max_tokens=[2, 2],
+        )
+    )
+
+    assert steps == [[3, 3]]
+    assert model.ragged_graph_disabled == [False]
+
+
 def test_openai_ephemeral_cache_scoped_ragged_decode_releases_graphs(monkeypatch) -> None:
     monkeypatch.delenv("TORCHINFERNO_OPENAI_EPHEMERAL_RAGGED_CUDAGRAPH_MIN_STEP", raising=False)
 

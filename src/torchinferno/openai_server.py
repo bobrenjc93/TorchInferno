@@ -4804,7 +4804,14 @@ def _disable_tp_shared_prefix_ragged_decode_graph(model: object, *, max_tokens: 
         128,
         minimum=1,
     )
-    return max_tokens > max_graph_tokens
+    if max_tokens <= max_graph_tokens:
+        return False
+    large_graph_tokens = env_int(
+        "TORCHINFERNO_OPENAI_TP_SHARED_PREFIX_RAGGED_CUDAGRAPH_LARGE_MIN_TOKENS",
+        512,
+        minimum=max_graph_tokens + 1,
+    )
+    return max_tokens < large_graph_tokens
 
 
 def _force_tp_shared_prefix_ragged_row_indices(model: object) -> bool:
