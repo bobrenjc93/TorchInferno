@@ -4113,6 +4113,9 @@ def _prefill_repeated_prefix_next_token(
     if _shared_prefix_sample_enabled(temperature):
         token = _sample(model, prefill_logits[:, -1, :], temperature)
         return token.expand(batch_size).contiguous(), cache
+    sample_repeated = getattr(model, "sample_repeated_next_token", None)
+    if callable(sample_repeated):
+        return sample_repeated(prefill_logits[:, -1, :], batch_size, temperature), cache
     logits = prefill_logits[:, -1, :].expand(batch_size, prefill_logits.size(-1)).contiguous()
     return _sample(model, logits, temperature), cache
 
@@ -4140,6 +4143,16 @@ def _decode_next_token_ragged(
     row_indices: Tensor | None,
     temperature: float,
 ) -> tuple[Tensor, object]:
+    graph_token = _try_decode_ragged_token_graph(
+        model,
+        input_ids,
+        cache,
+        seq_lens=seq_lens,
+        row_indices=row_indices,
+        temperature=temperature,
+    )
+    if graph_token is not None:
+        return graph_token, cache
     graph_logits = _try_decode_ragged_logits_graph(
         model,
         input_ids,
@@ -4154,6 +4167,31 @@ def _decode_next_token_ragged(
         raise RuntimeError("model does not support ragged decode")
     logits = decode(input_ids, cache, seq_lens=seq_lens, row_indices=row_indices)
     return _sample(model, logits[:, -1, :], temperature), cache
+
+
+def _try_decode_ragged_token_graph(
+    model: object,
+    input_ids: Tensor,
+    cache: object,
+    *,
+    seq_lens: Tensor,
+    row_indices: Tensor | None,
+    temperature: float,
+) -> Tensor | None:
+    if getattr(cache, "_torchinferno_disable_ragged_decode_graph", False):
+        return None
+    if getattr(cache, "_torchinferno_ephemeral_cache", False) and not getattr(
+        cache,
+        "_torchinferno_ephemeral_ragged_graph_scope",
+        False,
+    ):
+        return None
+    if not _openai_ragged_decode_graph_enabled(model):
+        return None
+    decode_graph = getattr(model, "try_decode_ragged_token_graph", None)
+    if decode_graph is None:
+        return None
+    return decode_graph(input_ids, cache, seq_lens=seq_lens, row_indices=row_indices, temperature=temperature)
 
 
 def _ragged_decode_enabled_for_model(model: object) -> bool:

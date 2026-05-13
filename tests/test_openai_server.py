@@ -29,12 +29,14 @@ from torchinferno.openai_server import (
     _ByteFallbackTokenizer,
     _QueuedGeneration,
     _TransformersChatTokenizer,
+    _decode_next_token_ragged,
     _distributed_server_command,
     _effective_openai_max_batch_size,
     _identical_prompt_cache_pool_enabled,
     _openai_cuda_graph_enabled_for_model,
     _openai_decode_graph_enabled,
     _openai_ragged_decode_graph_enabled,
+    _prefill_repeated_prefix_next_token,
     _prefers_exact_generation_cache,
     _runtime_prefill_graph_capture_enabled,
     _sampled_batch_shape_bucket_size,
@@ -43,6 +45,7 @@ from torchinferno.openai_server import (
     _sync_tensor_parallel_continue,
     _tensor_parallel_worker_loop,
     _tp_command_cuda_sync_for_steps,
+    _try_decode_ragged_token_graph,
     _try_decode_ragged_logits_graph,
     _try_decode_one_token_graph,
     _try_decode_one_token_logits_graph,
@@ -1131,6 +1134,50 @@ def test_openai_prompt_list_identical_prompts_skip_prefix_cache_restore() -> Non
     assert calls == [([1, 2], 3, 4, 0.7, [1, 2, 3])]
 
 
+def test_openai_prefill_repeated_prefix_uses_repeated_sampler() -> None:
+    class _RepeatedSampleModel:
+        def __init__(self) -> None:
+            self.sample_calls: list[tuple[tuple[int, ...], int, float]] = []
+
+        def forward(
+            self,
+            input_ids: torch.Tensor,
+            *,
+            cache: object,
+            use_cache: bool,
+            return_last_logits_only: bool,
+        ) -> tuple[torch.Tensor, object]:
+            assert input_ids.tolist() == [[1, 2, 3]]
+            assert use_cache
+            assert return_last_logits_only
+            logits = torch.arange(12, dtype=torch.float32).view(1, 1, 12)
+            return logits, cache
+
+        def sample_repeated_next_token(
+            self,
+            logits: torch.Tensor,
+            batch_size: int,
+            temperature: float,
+        ) -> torch.Tensor:
+            self.sample_calls.append((tuple(logits.shape), batch_size, temperature))
+            return torch.arange(batch_size, dtype=torch.long)
+
+    model = _RepeatedSampleModel()
+    cache = object()
+
+    token, returned_cache = _prefill_repeated_prefix_next_token(
+        model,
+        torch.tensor([[1, 2, 3]], dtype=torch.long),
+        cache,
+        4,
+        0.7,
+    )
+
+    assert token.tolist() == [0, 1, 2, 3]
+    assert returned_cache is cache
+    assert model.sample_calls == [((1, 12), 4, 0.7)]
+
+
 def test_openai_prompt_list_batch_restores_cached_prefix_rows_with_padded_suffixes(monkeypatch) -> None:
     monkeypatch.setenv("TORCHINFERNO_OPENAI_PREFIX_CACHE_MIN_TOKENS", "1")
     monkeypatch.setenv("TORCHINFERNO_OPENAI_PREFIX_CACHE_BATCH_RESTORE", "1")
@@ -2086,6 +2133,19 @@ def test_openai_ephemeral_cache_skips_ragged_decode_graph() -> None:
     class _GraphModel:
         calls = 0
 
+        def try_decode_ragged_token_graph(
+            self,
+            input_ids: torch.Tensor,
+            cache: object,
+            *,
+            seq_lens: torch.Tensor,
+            row_indices: torch.Tensor | None,
+            temperature: float,
+        ) -> torch.Tensor:
+            del input_ids, cache, seq_lens, row_indices, temperature
+            self.calls += 1
+            return torch.zeros(1, dtype=torch.long)
+
         def try_decode_ragged_logits_graph(
             self,
             input_ids: torch.Tensor,
@@ -2101,6 +2161,14 @@ def test_openai_ephemeral_cache_skips_ragged_decode_graph() -> None:
     model = _GraphModel()
     cache = types.SimpleNamespace(_torchinferno_ephemeral_cache=True)
 
+    token = _try_decode_ragged_token_graph(
+        model,
+        torch.tensor([[1]], dtype=torch.long),
+        cache,
+        seq_lens=torch.tensor([1], dtype=torch.long),
+        row_indices=None,
+        temperature=0.0,
+    )
     logits = _try_decode_ragged_logits_graph(
         model,
         torch.tensor([[1]], dtype=torch.long),
@@ -2109,8 +2177,63 @@ def test_openai_ephemeral_cache_skips_ragged_decode_graph() -> None:
         row_indices=None,
     )
 
+    assert token is None
     assert logits is None
     assert model.calls == 0
+
+
+def test_openai_decode_next_token_ragged_prefers_token_graph(monkeypatch) -> None:
+    class _GraphModel:
+        world_size = 2
+        token_graph_calls = 0
+        logits_graph_calls = 0
+
+        def try_decode_ragged_token_graph(
+            self,
+            input_ids: torch.Tensor,
+            cache: object,
+            *,
+            seq_lens: torch.Tensor,
+            row_indices: torch.Tensor | None,
+            temperature: float,
+        ) -> torch.Tensor:
+            assert input_ids.tolist() == [[1]]
+            assert seq_lens.tolist() == [1]
+            assert row_indices is None
+            assert temperature == 0.0
+            self.token_graph_calls += 1
+            return torch.tensor([7], dtype=torch.long)
+
+        def try_decode_ragged_logits_graph(self, *args, **kwargs):  # noqa: ANN002, ANN003
+            self.logits_graph_calls += 1
+            raise AssertionError("ragged logits graph should not run after token graph succeeds")
+
+        def decode_ragged_logits(self, *args, **kwargs):  # noqa: ANN002, ANN003
+            raise AssertionError("eager ragged decode should not run after token graph succeeds")
+
+        def _sample_next_token(self, *args, **kwargs):  # noqa: ANN002, ANN003
+            raise AssertionError("sampling should be covered by the token graph")
+
+    model = _GraphModel()
+    monkeypatch.setattr(
+        "torchinferno.openai_server._is_tensor_parallel_model",
+        lambda candidate: candidate is model,
+    )
+    cache = object()
+
+    token, returned_cache = _decode_next_token_ragged(
+        model,
+        torch.tensor([[1]], dtype=torch.long),
+        cache,
+        torch.tensor([1], dtype=torch.long),
+        None,
+        0.0,
+    )
+
+    assert token.tolist() == [7]
+    assert returned_cache is cache
+    assert model.token_graph_calls == 1
+    assert model.logits_graph_calls == 0
 
 
 def test_openai_tp_shared_prefix_ragged_cache_can_be_ephemeral(monkeypatch) -> None:
@@ -3289,6 +3412,7 @@ def test_openai_tensor_parallel_decode_graphs_default_on(monkeypatch) -> None:
         prefill_logits_graph_calls = 0
         decode_graph_calls = 0
         decode_logits_graph_calls = 0
+        ragged_decode_graph_calls = 0
         ragged_decode_logits_graph_calls = 0
 
         def try_prefill_graph(self, *args, **kwargs):  # noqa: ANN002, ANN003
@@ -3305,6 +3429,10 @@ def test_openai_tensor_parallel_decode_graphs_default_on(monkeypatch) -> None:
 
         def try_decode_one_token_logits_graph(self, *args, **kwargs):  # noqa: ANN002, ANN003
             self.decode_logits_graph_calls += 1
+            return None
+
+        def try_decode_ragged_token_graph(self, *args, **kwargs):  # noqa: ANN002, ANN003
+            self.ragged_decode_graph_calls += 1
             return None
 
         def try_decode_ragged_logits_graph(self, *args, **kwargs):  # noqa: ANN002, ANN003
@@ -3327,6 +3455,14 @@ def test_openai_tensor_parallel_decode_graphs_default_on(monkeypatch) -> None:
     assert _try_prefill_logits_graph(model, input_ids, cache) is None
     assert _try_decode_one_token_graph(model, input_ids, cache, 0.0) is None
     assert _try_decode_one_token_logits_graph(model, input_ids, cache) is None
+    assert _try_decode_ragged_token_graph(
+        model,
+        input_ids,
+        cache,
+        seq_lens=torch.tensor([1]),
+        row_indices=None,
+        temperature=0.0,
+    ) is None
     assert _try_decode_ragged_logits_graph(
         model,
         input_ids,
@@ -3338,6 +3474,7 @@ def test_openai_tensor_parallel_decode_graphs_default_on(monkeypatch) -> None:
     assert model.prefill_logits_graph_calls == 1
     assert model.decode_graph_calls == 1
     assert model.decode_logits_graph_calls == 1
+    assert model.ragged_decode_graph_calls == 1
     assert model.ragged_decode_logits_graph_calls == 1
 
 
@@ -3347,7 +3484,12 @@ def test_openai_tensor_parallel_ragged_decode_cuda_graphs_respect_low_level_env(
 
     class GraphProbeModel:
         world_size = 2
+        ragged_decode_graph_calls = 0
         ragged_decode_logits_graph_calls = 0
+
+        def try_decode_ragged_token_graph(self, *args, **kwargs):  # noqa: ANN002, ANN003
+            self.ragged_decode_graph_calls += 1
+            return None
 
         def try_decode_ragged_logits_graph(self, *args, **kwargs):  # noqa: ANN002, ANN003
             self.ragged_decode_logits_graph_calls += 1
@@ -3363,6 +3505,14 @@ def test_openai_tensor_parallel_ragged_decode_cuda_graphs_respect_low_level_env(
 
     assert _openai_decode_graph_enabled(model)
     assert not _openai_ragged_decode_graph_enabled(model)
+    assert _try_decode_ragged_token_graph(
+        model,
+        input_ids,
+        cache,
+        seq_lens=torch.tensor([1]),
+        row_indices=None,
+        temperature=0.0,
+    ) is None
     assert _try_decode_ragged_logits_graph(
         model,
         input_ids,
@@ -3370,6 +3520,7 @@ def test_openai_tensor_parallel_ragged_decode_cuda_graphs_respect_low_level_env(
         seq_lens=torch.tensor([1]),
         row_indices=None,
     ) is None
+    assert model.ragged_decode_graph_calls == 0
     assert model.ragged_decode_logits_graph_calls == 0
 
 
@@ -3391,6 +3542,9 @@ def test_openai_tensor_parallel_cuda_graphs_can_be_disabled(monkeypatch) -> None
         def try_decode_one_token_logits_graph(self, *args, **kwargs):  # noqa: ANN002, ANN003
             raise AssertionError("decode logits graph should be disabled for TP serving")
 
+        def try_decode_ragged_token_graph(self, *args, **kwargs):  # noqa: ANN002, ANN003
+            raise AssertionError("ragged decode graph should be disabled for TP serving")
+
         def try_decode_ragged_logits_graph(self, *args, **kwargs):  # noqa: ANN002, ANN003
             raise AssertionError("ragged decode logits graph should be disabled for TP serving")
 
@@ -3408,6 +3562,14 @@ def test_openai_tensor_parallel_cuda_graphs_can_be_disabled(monkeypatch) -> None
     assert _try_prefill_logits_graph(model, input_ids, cache) is None
     assert _try_decode_one_token_graph(model, input_ids, cache, 0.0) is None
     assert _try_decode_one_token_logits_graph(model, input_ids, cache) is None
+    assert _try_decode_ragged_token_graph(
+        model,
+        input_ids,
+        cache,
+        seq_lens=torch.tensor([1]),
+        row_indices=None,
+        temperature=0.0,
+    ) is None
     assert _try_decode_ragged_logits_graph(
         model,
         input_ids,
