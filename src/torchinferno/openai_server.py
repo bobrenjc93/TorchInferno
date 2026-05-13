@@ -434,6 +434,7 @@ class OpenAICompletionEngine:
         self._single_prefill_capture_seen: dict[tuple[int, int, int, int, bool, str], int] = {}
         self._prefix_cache_entry: TensorPrefixCacheEntry | None = None
         self._prefix_cache_entries: dict[tuple[int, ...], TensorPrefixCacheEntry] = {}
+        self._prompt_logits_cache: dict[tuple[int, ...], Tensor] = {}
         self._prompt_token_cache: dict[str, list[int]] = {}
         self._prompt_token_cache_lock = threading.Lock()
         self._phase_timing_enabled = env_flag("TORCHINFERNO_OPENAI_PHASE_TIMINGS")
@@ -669,7 +670,7 @@ class OpenAICompletionEngine:
         ):
             short_max_tokens = env_int("TORCHINFERNO_OPENAI_SHORT_STREAM_MAX_TOKENS", 256, minimum=1)
             if first.max_tokens <= short_max_tokens:
-                default_short_limit = 64 if first.temperature > 0.0 else 56
+                default_short_limit = 128 if first.temperature > 0.0 else 56
                 short_limit = env_int(
                     "TORCHINFERNO_OPENAI_TP_SHORT_STREAM_MAX_BATCH_SIZE",
                     min(limit, default_short_limit),
@@ -1327,12 +1328,24 @@ class OpenAICompletionEngine:
             entries.clear()
         else:
             self._prefix_cache_entries = {}
+        logits_cache = getattr(self, "_prompt_logits_cache", None)
+        if isinstance(logits_cache, dict):
+            logits_cache.clear()
+        else:
+            self._prompt_logits_cache = {}
 
     def _prefix_cache_entry_map(self) -> dict[tuple[int, ...], TensorPrefixCacheEntry]:
         entries = getattr(self, "_prefix_cache_entries", None)
         if not isinstance(entries, dict):
             entries = {}
             self._prefix_cache_entries = entries
+        return entries
+
+    def _prompt_logits_cache_map(self) -> dict[tuple[int, ...], Tensor]:
+        entries = getattr(self, "_prompt_logits_cache", None)
+        if not isinstance(entries, dict):
+            entries = {}
+            self._prompt_logits_cache = entries
         return entries
 
     def _store_prefix_cache_entry(self, entry: TensorPrefixCacheEntry | None) -> None:
@@ -1344,7 +1357,63 @@ class OpenAICompletionEngine:
         entries[entry.tokens] = entry
         max_entries = env_int("TORCHINFERNO_OPENAI_PREFIX_CACHE_MAX_ENTRIES", 128, minimum=1)
         while len(entries) > max_entries:
+            evicted_tokens = next(iter(entries))
+            entries.pop(evicted_tokens)
+            self._prompt_logits_cache_map().pop(evicted_tokens, None)
+
+    def _store_prompt_logits_cache(self, input_ids: Tensor, logits: Tensor) -> None:
+        if not _prompt_logits_cache_enabled():
+            return
+        if not env_flag("TORCHINFERNO_OPENAI_PREFIX_CACHE", True):
+            return
+        if not _prefix_cache_enabled_for_model(self.model):
+            self._clear_prefix_cache()
+            return
+        if input_ids.size(0) != 1:
+            return
+        if logits.ndim == 3:
+            logits = logits[:, -1, :]
+        if logits.ndim != 2 or logits.size(0) != 1:
+            return
+        tokens = tuple(int(token_id) for token_id in input_ids[0].detach().cpu().tolist())
+        max_tokens = env_int("TORCHINFERNO_OPENAI_PREFIX_CACHE_MAX_TOKENS", 1024, minimum=1)
+        if len(tokens) > max_tokens:
+            self._prompt_logits_cache_map().pop(tokens, None)
+            return
+        if self._exact_prefix_cache_entry(tokens) is None:
+            return
+        entries = self._prompt_logits_cache_map()
+        entries.pop(tokens, None)
+        entries[tokens] = logits.detach().clone()
+        max_entries = env_int("TORCHINFERNO_OPENAI_PREFIX_CACHE_MAX_ENTRIES", 128, minimum=1)
+        while len(entries) > max_entries:
             entries.pop(next(iter(entries)))
+
+    def _restore_exact_prompt_logits(self, input_ids: Tensor, cache: object) -> Tensor | None:
+        if not _prompt_logits_cache_enabled():
+            return None
+        if not env_flag("TORCHINFERNO_OPENAI_PREFIX_CACHE", True):
+            return None
+        if not _prefix_cache_enabled_for_model(self.model):
+            self._clear_prefix_cache()
+            return None
+        if input_ids.size(0) != 1:
+            return None
+        input_tokens = tuple(int(token_id) for token_id in input_ids[0].detach().cpu().tolist())
+        entries = self._prompt_logits_cache_map()
+        logits = entries.get(input_tokens)
+        restored = 0
+        if logits is not None:
+            restored = self._restore_exact_prefix_cache(input_ids, cache)
+        local_hit = logits is not None and restored == input_ids.size(1)
+        all_ranks_hit = _tensor_parallel_all_ranks_true(self.model, local_hit, self.device)
+        if not all_ranks_hit:
+            if restored:
+                _reset_generation_cache(cache)
+            return None
+        entries.pop(input_tokens, None)
+        entries[input_tokens] = logits
+        return logits.to(self.device, non_blocking=True)
 
     def _mark_prefix_cache_entry_used(self, entry: TensorPrefixCacheEntry) -> None:
         self._prefix_cache_entry = entry
@@ -1954,20 +2023,43 @@ class OpenAICompletionEngine:
             model=model,
             pool=_identical_prompt_cache_pool_enabled(model, temperature),
         )
-        next_token, cache = _prefill_repeated_prefix_next_token(
-            model,
-            input_ids,
-            cache,
-            decode_batch_size,
-            temperature,
-            allow_capture=_runtime_prefill_graph_capture_enabled(model, temperature, max_tokens=max_tokens),
-        )
+        use_prompt_logits_cache = batch_size > 1 and _prompt_logits_cache_enabled()
+        if use_prompt_logits_cache:
+            cached_logits = self._restore_exact_prompt_logits(input_ids, cache)
+            if cached_logits is None:
+                next_token, cache, last_logits = _prefill_repeated_prefix_next_token_with_logits(
+                    model,
+                    input_ids,
+                    cache,
+                    decode_batch_size,
+                    temperature,
+                    allow_capture=_runtime_prefill_graph_capture_enabled(model, temperature, max_tokens=max_tokens),
+                )
+                self._save_prompt_prefix_cache(input_ids, cache)
+                self._store_prompt_logits_cache(input_ids, last_logits)
+            else:
+                next_token = _sample_repeated_prefix_logits(
+                    model,
+                    cached_logits,
+                    decode_batch_size,
+                    temperature,
+                )
+        else:
+            next_token, cache = _prefill_repeated_prefix_next_token(
+                model,
+                input_ids,
+                cache,
+                decode_batch_size,
+                temperature,
+                allow_capture=_runtime_prefill_graph_capture_enabled(model, temperature, max_tokens=max_tokens),
+            )
         next_token = next_token.to(self.device)
         _repeat_generation_cache_first_batch(cache, decode_batch_size)
         shared_sample = _shared_prefix_sample_enabled(temperature)
         per_row_limits = _normalize_row_max_tokens(row_max_tokens, batch_size, max_tokens)
         decode_row_limits = [*per_row_limits, *([0] * (decode_batch_size - batch_size))]
         active = [limit > 0 for limit in decode_row_limits]
+        rows_share_state = True
         for step in range(max_tokens):
             token_ids = next_token.detach().cpu().tolist()
             step_tokens: list[int | None] = []
@@ -1984,11 +2076,26 @@ class OpenAICompletionEngine:
             should_continue = _sync_tensor_parallel_continue(model, should_continue, next_token.device)
             if not should_continue:
                 break
-            decode_input = next_token[:1, None] if shared_sample else next_token[:, None]
-            next_token, cache = _decode_next_token(model, decode_input, cache, temperature)
             if shared_sample:
+                next_token, cache = _decode_next_token(model, next_token[:1, None], cache, temperature)
                 next_token = next_token.expand(decode_batch_size).contiguous()
                 _repeat_generation_cache_first_batch(cache, decode_batch_size)
+                rows_share_state = True
+            else:
+                uniform_token = _uniform_active_token_id(token_ids, active, batch_size)
+                if rows_share_state and uniform_token is not None:
+                    decode_input = next_token.new_tensor([[uniform_token]])
+                    next_token, cache = _decode_repeated_prefix_next_token_with_logits(
+                        model,
+                        decode_input,
+                        cache,
+                        decode_batch_size,
+                        temperature,
+                    )
+                    _repeat_generation_cache_first_batch(cache, decode_batch_size)
+                else:
+                    next_token, cache = _decode_next_token(model, next_token[:, None], cache, temperature)
+                    rows_share_state = False
             next_token = next_token.to(self.device)
 
     def _stream_microbatch_size(self, batch_size: int) -> int:
@@ -4120,6 +4227,68 @@ def _prefill_repeated_prefix_next_token(
     return _sample(model, logits, temperature), cache
 
 
+def _prefill_repeated_prefix_next_token_with_logits(
+    model: object,
+    input_ids: Tensor,
+    cache: object,
+    batch_size: int,
+    temperature: float,
+    *,
+    allow_capture: bool = False,
+) -> tuple[Tensor, object, Tensor]:
+    prefill_logits = _try_prefill_logits_graph(model, input_ids, cache, allow_capture=allow_capture)
+    if prefill_logits is None:
+        prefill_logits, cache = _forward(model, input_ids, cache)
+    last_logits = prefill_logits[:, -1, :]
+    return _sample_repeated_prefix_logits(model, last_logits, batch_size, temperature), cache, last_logits
+
+
+def _decode_repeated_prefix_next_token_with_logits(
+    model: object,
+    input_ids: Tensor,
+    cache: object,
+    batch_size: int,
+    temperature: float,
+) -> tuple[Tensor, object]:
+    logits = _try_decode_one_token_logits_graph(model, input_ids, cache)
+    if logits is None:
+        logits, cache = _forward(model, input_ids, cache)
+    return _sample_repeated_prefix_logits(model, logits[:, -1, :], batch_size, temperature), cache
+
+
+def _sample_repeated_prefix_logits(
+    model: object,
+    logits: Tensor,
+    batch_size: int,
+    temperature: float,
+) -> Tensor:
+    if _shared_prefix_sample_enabled(temperature):
+        token = _sample(model, logits, temperature)
+        return token.expand(batch_size).contiguous()
+    sample_repeated = getattr(model, "sample_repeated_next_token", None)
+    if callable(sample_repeated):
+        return sample_repeated(logits, batch_size, temperature)
+    expanded = logits.expand(batch_size, logits.size(-1)).contiguous()
+    return _sample(model, expanded, temperature)
+
+
+def _uniform_active_token_id(
+    token_ids: Sequence[int],
+    active: Sequence[bool],
+    row_count: int,
+) -> int | None:
+    token: int | None = None
+    for row in range(min(row_count, len(token_ids), len(active))):
+        if not active[row]:
+            continue
+        row_token = int(token_ids[row])
+        if token is None:
+            token = row_token
+        elif row_token != token:
+            return None
+    return token
+
+
 def _decode_next_token(
     model: object,
     input_ids: Tensor,
@@ -4227,6 +4396,10 @@ def _identical_prompt_cache_pool_enabled(model: object, temperature: float) -> b
     if "TORCHINFERNO_OPENAI_TP_IDENTICAL_PROMPT_CACHE_POOL" in os.environ:
         return env_flag("TORCHINFERNO_OPENAI_TP_IDENTICAL_PROMPT_CACHE_POOL", True)
     return True
+
+
+def _prompt_logits_cache_enabled() -> bool:
+    return env_flag("TORCHINFERNO_OPENAI_PROMPT_LOGITS_CACHE", True)
 
 
 def _prefer_shared_prefix_padded_suffix_prefill(

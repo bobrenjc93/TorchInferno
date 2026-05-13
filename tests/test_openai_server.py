@@ -729,7 +729,7 @@ def test_openai_engine_batches_request_arriving_during_single_admission_wait(mon
     assert results == [[2, 2], [2, 2]]
     assert model.calls[0][0] == 1
     assert model.calls[0][2] == "torchinferno-openai-batcher"
-    assert model.calls[1][0] == 2
+    assert model.calls[1][0] == 1
     assert model.calls[1][2] == "torchinferno-openai-batcher"
 
 
@@ -782,7 +782,7 @@ def test_openai_engine_temperature_request_keeps_short_batch_window(monkeypatch)
     assert results == [[2, 2], [2, 2]]
     assert model.calls[0][0] == 1
     assert model.calls[0][2] == "torchinferno-openai-batcher"
-    assert model.calls[1][0] == 2
+    assert model.calls[1][0] == 1
     assert model.calls[1][2] == "torchinferno-openai-batcher"
 
 
@@ -1176,6 +1176,126 @@ def test_openai_prefill_repeated_prefix_uses_repeated_sampler() -> None:
     assert token.tolist() == [0, 1, 2, 3]
     assert returned_cache is cache
     assert model.sample_calls == [((1, 12), 4, 0.7)]
+
+
+def test_openai_identical_prompt_batch_reuses_exact_prompt_logits_cache() -> None:
+    model = _PrefixRecordingModel()
+    engine = _cache_only_engine()
+    engine.model = model
+    engine.tokenizer = _PrefixTokenizer()
+    engine.stop_token_ids = frozenset()
+    input_ids = torch.tensor([[10, 11]], dtype=torch.long)
+
+    first = list(
+        engine._generate_identical_prompt_batch_steps(
+            input_ids,
+            batch_size=3,
+            max_tokens=1,
+            temperature=0.0,
+        )
+    )
+    second = list(
+        engine._generate_identical_prompt_batch_steps(
+            input_ids,
+            batch_size=3,
+            max_tokens=1,
+            temperature=0.0,
+        )
+    )
+
+    assert first == [[2, 2, 2]]
+    assert second == [[2, 2, 2]]
+    assert model.forward_inputs == [[10, 11]]
+
+
+def test_openai_identical_prompt_logits_cache_resamples_temperature_rows(monkeypatch) -> None:
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_PREFIX_CACHE_SHARED_SAMPLE", "0")
+
+    class _RepeatedSamplerModel(_PrefixRecordingModel):
+        def __init__(self) -> None:
+            super().__init__()
+            self.sample_calls: list[tuple[tuple[int, ...], int, float]] = []
+
+        def sample_repeated_next_token(
+            self,
+            logits: torch.Tensor,
+            batch_size: int,
+            temperature: float,
+        ) -> torch.Tensor:
+            self.sample_calls.append((tuple(logits.shape), batch_size, temperature))
+            start = 3 + len(self.sample_calls)
+            return torch.arange(start, start + batch_size, dtype=torch.long)
+
+    model = _RepeatedSamplerModel()
+    engine = _cache_only_engine()
+    engine.model = model
+    engine.tokenizer = _PrefixTokenizer()
+    engine.stop_token_ids = frozenset()
+    input_ids = torch.tensor([[10, 11]], dtype=torch.long)
+
+    first = list(
+        engine._generate_identical_prompt_batch_steps(
+            input_ids,
+            batch_size=3,
+            max_tokens=1,
+            temperature=0.7,
+        )
+    )
+    second = list(
+        engine._generate_identical_prompt_batch_steps(
+            input_ids,
+            batch_size=3,
+            max_tokens=1,
+            temperature=0.7,
+        )
+    )
+
+    assert first == [[4, 5, 6]]
+    assert second == [[5, 6, 7]]
+    assert model.forward_inputs == [[10, 11]]
+    assert model.sample_calls == [((1, 16), 3, 0.7), ((1, 16), 3, 0.7)]
+
+
+def test_openai_identical_prompt_batch_decodes_uniform_rows_once() -> None:
+    class _ShapeRecordingPrefixModel(_PrefixRecordingModel):
+        def __init__(self) -> None:
+            super().__init__()
+            self.forward_shapes: list[tuple[int, int]] = []
+
+        def forward(
+            self,
+            input_ids: torch.Tensor,
+            *,
+            cache: _PrefixRecordingCache,
+            use_cache: bool,
+            return_last_logits_only: bool = False,
+        ):
+            self.forward_shapes.append((input_ids.size(0), input_ids.size(1)))
+            return super().forward(
+                input_ids,
+                cache=cache,
+                use_cache=use_cache,
+                return_last_logits_only=return_last_logits_only,
+            )
+
+    model = _ShapeRecordingPrefixModel()
+    engine = _cache_only_engine()
+    engine.model = model
+    engine.tokenizer = _PrefixTokenizer()
+    engine.stop_token_ids = frozenset()
+    input_ids = torch.tensor([[10, 11]], dtype=torch.long)
+
+    steps = list(
+        engine._generate_identical_prompt_batch_steps(
+            input_ids,
+            batch_size=3,
+            max_tokens=2,
+            temperature=0.0,
+        )
+    )
+
+    assert steps == [[2, 2, 2], [2, 2, 2]]
+    assert model.forward_shapes == [(1, 2), (1, 1)]
 
 
 def test_openai_prompt_list_batch_restores_cached_prefix_rows_with_padded_suffixes(monkeypatch) -> None:
@@ -2926,7 +3046,7 @@ def test_openai_short_tp_stream_uses_smaller_queue_batch_limit(monkeypatch) -> N
 
     assert engine._queued_batch_limit(short_stream) == 56
     assert engine._queued_batch_limit(boundary_stream) == 56
-    assert engine._queued_batch_limit(sampled_short_stream) == 64
+    assert engine._queued_batch_limit(sampled_short_stream) == 128
     assert engine._queued_batch_limit(medium_stream) == 128
     assert engine._queued_batch_limit(sampled_medium_stream) == 128
     assert engine._queued_batch_limit(large_stream) == 32
