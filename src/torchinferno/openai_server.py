@@ -92,7 +92,7 @@ class _QueuedGeneration:
     max_tokens: int
     temperature: float
     stream: bool
-    responses: "queue.Queue[object]"
+    responses: "queue.Queue[object] | queue.SimpleQueue[object]"
     done: bool = False
 
 
@@ -545,7 +545,7 @@ class OpenAICompletionEngine:
     def _submit_generation(self, prompt: list[int], *, max_tokens: int, temperature: float) -> Iterator[int]:
         if self._closed:
             raise RuntimeError("OpenAI completion engine is closed")
-        responses: "queue.Queue[object]" = queue.Queue()
+        responses: "queue.SimpleQueue[object]" = queue.SimpleQueue()
         self._generation_queue.put(_QueuedGeneration(prompt, max_tokens, temperature, True, responses))
         while True:
             item = responses.get()
@@ -558,7 +558,7 @@ class OpenAICompletionEngine:
     def _submit_completion(self, prompt: list[int], *, max_tokens: int, temperature: float) -> list[int]:
         if self._closed:
             raise RuntimeError("OpenAI completion engine is closed")
-        responses: "queue.Queue[object]" = queue.Queue()
+        responses: "queue.SimpleQueue[object]" = queue.SimpleQueue()
         self._generation_queue.put(_QueuedGeneration(prompt, max_tokens, temperature, False, responses))
         item = responses.get()
         if isinstance(item, BaseException):
