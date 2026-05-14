@@ -1067,7 +1067,9 @@ def _grouped_gqa_decode_attention_dynamic_kernel(
     v_ptr,
     out_ptr,
     seq_len_ptr,
+    row_indices_ptr,
     seq_len_stride: tl.constexpr,
+    has_row_indices: tl.constexpr,
     q_heads: tl.constexpr,
     kv_heads: tl.constexpr,
     group_size: tl.constexpr,
@@ -1096,6 +1098,9 @@ def _grouped_gqa_decode_attention_dynamic_kernel(
     block_v: tl.constexpr,
 ) -> None:
     batch = tl.program_id(0)
+    cache_batch = batch
+    if has_row_indices:
+        cache_batch = tl.load(row_indices_ptr + batch)
     seq_len = tl.load(seq_len_ptr + batch * seq_len_stride)
     kv_head = tl.program_id(1)
     offs_q = tl.arange(0, block_q)
@@ -1109,7 +1114,7 @@ def _grouped_gqa_decode_attention_dynamic_kernel(
         + offs_d[None, :] * q_stride_dim
     )
     k_offsets = (
-        batch * k_stride_batch
+        cache_batch * k_stride_batch
         + kv_head * k_stride_head
         + offs_d[:, None] * k_stride_dim
         + offs_s[None, :] * k_stride_token
@@ -1124,7 +1129,7 @@ def _grouped_gqa_decode_attention_dynamic_kernel(
 
     offs_v = tl.arange(0, block_v)
     v_offsets = (
-        batch * v_stride_batch
+        cache_batch * v_stride_batch
         + kv_head * v_stride_head
         + offs_s[:, None] * v_stride_token
         + offs_v[None, :] * v_stride_dim
@@ -1146,7 +1151,9 @@ def _grouped_gqa_decode_attention_streaming_kernel(
     v_ptr,
     out_ptr,
     seq_len_ptr,
+    row_indices_ptr,
     seq_len_stride: tl.constexpr,
+    has_row_indices: tl.constexpr,
     cache_tokens: tl.constexpr,
     group_size: tl.constexpr,
     head_dim: tl.constexpr,
@@ -1174,6 +1181,9 @@ def _grouped_gqa_decode_attention_streaming_kernel(
     block_v: tl.constexpr,
 ) -> None:
     batch = tl.program_id(0)
+    cache_batch = batch
+    if has_row_indices:
+        cache_batch = tl.load(row_indices_ptr + batch)
     seq_len = tl.load(seq_len_ptr + batch * seq_len_stride)
     kv_head = tl.program_id(1)
     offs_q = tl.arange(0, block_q)
@@ -1193,7 +1203,7 @@ def _grouped_gqa_decode_attention_streaming_kernel(
     for start in range(0, cache_tokens, block_s):
         seq_offsets = start + offs_s
         k_offsets = (
-            batch * k_stride_batch
+            cache_batch * k_stride_batch
             + kv_head * k_stride_head
             + offs_d[:, None] * k_stride_dim
             + seq_offsets[None, :] * k_stride_token
@@ -1209,7 +1219,7 @@ def _grouped_gqa_decode_attention_streaming_kernel(
         probs = tl.exp(scores - next_max[:, None])
         scale_old = tl.exp(running_max - next_max)
         v_offsets = (
-            batch * v_stride_batch
+            cache_batch * v_stride_batch
             + kv_head * v_stride_head
             + seq_offsets[:, None] * v_stride_token
             + offs_v[None, :] * v_stride_dim
@@ -1231,13 +1241,26 @@ def _grouped_gqa_decode_attention_streaming_kernel(
     tl.store(out_ptr + out_offsets, out, mask=(offs_q[:, None] < group_size) & (offs_v[None, :] < value_dim))
 
 
-def triton_grouped_gqa_decode_attention(q: Tensor, k: Tensor, v: Tensor, seq_len: Tensor) -> Tensor:
+def triton_grouped_gqa_decode_attention(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    seq_len: Tensor,
+    row_indices: Tensor | None = None,
+) -> Tensor:
     """Single-token GQA decode attention that shares K/V loads across a query-head group."""
 
     if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
         raise ValueError("q, k, and v must have shape [batch, heads, tokens, dim]")
-    if q.size(0) != k.size(0) or q.size(0) != v.size(0):
+    if row_indices is None and (q.size(0) != k.size(0) or q.size(0) != v.size(0)):
         raise ValueError("q, k, and v batch dimensions must match")
+    if row_indices is not None:
+        if row_indices.shape != (q.size(0),):
+            raise ValueError("decode attention row indices must have shape [batch]")
+        if row_indices.device != k.device:
+            raise ValueError("decode attention row indices must be on the cache device")
+        if k.size(0) != v.size(0):
+            raise ValueError("k and v batch dimensions must match")
     if q.size(-2) != 1:
         raise ValueError("decode attention expects q to contain exactly one token")
     if k.size(-2) != v.size(-2):
@@ -1254,6 +1277,9 @@ def triton_grouped_gqa_decode_attention(q: Tensor, k: Tensor, v: Tensor, seq_len
         raise ValueError("dynamic decode attention sequence length must be scalar or have shape [batch]")
     if seq_len.device != k.device:
         raise ValueError("dynamic decode attention sequence length must be on the cache device")
+    if row_indices is not None:
+        row_indices = row_indices.contiguous()
+    row_indices_arg = row_indices if row_indices is not None else seq_len
     batch, q_heads, _, head_dim = q.shape
     _, kv_heads, cache_tokens, _ = k.shape
     value_dim = v.size(-1)
@@ -1280,7 +1306,9 @@ def triton_grouped_gqa_decode_attention(q: Tensor, k: Tensor, v: Tensor, seq_len
             v,
             out,
             seq_len,
+            row_indices_arg,
             seq_len_stride,
+            row_indices is not None,
             cache_tokens,
             group_size,
             head_dim,
@@ -1316,7 +1344,9 @@ def triton_grouped_gqa_decode_attention(q: Tensor, k: Tensor, v: Tensor, seq_len
         v,
         out,
         seq_len,
+        row_indices_arg,
         seq_len_stride,
+        row_indices is not None,
         q_heads,
         kv_heads,
         group_size,

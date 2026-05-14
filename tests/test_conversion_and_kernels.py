@@ -389,3 +389,19 @@ def test_triton_dense_gqa_decode_attention_matches_torch_reference() -> None:
     row_actual = triton_grouped_gqa_decode_attention(q, padded_k, padded_v, row_seq_lens)
 
     torch.testing.assert_close(row_actual, row_expected, atol=4e-2, rtol=4e-2)
+
+    cache_k = torch.randn(batch + 2, kv_heads, 32, head_dim, device="cuda", dtype=torch.bfloat16)
+    cache_v = torch.randn_like(cache_k)
+    row_indices = torch.tensor([2, 0], device="cuda", dtype=torch.int64)
+    indexed_k = cache_k.index_select(0, row_indices)
+    indexed_v = cache_v.index_select(0, row_indices)
+    indexed_expected = triton_grouped_gqa_decode_attention(q, indexed_k, indexed_v, row_seq_lens)
+    indexed_actual = triton_grouped_gqa_decode_attention(
+        q,
+        cache_k,
+        cache_v,
+        row_seq_lens,
+        row_indices=row_indices,
+    )
+
+    torch.testing.assert_close(indexed_actual, indexed_expected, atol=4e-2, rtol=4e-2)

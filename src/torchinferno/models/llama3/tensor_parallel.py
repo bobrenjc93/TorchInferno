@@ -744,14 +744,15 @@ class _Llama3TensorParallelLayer:
             attention_keys = cache.keys[:batch]
             attention_values = cache.values[:batch]
         else:
-            attention_keys = cache.keys.index_select(0, row_indices)
-            attention_values = cache.values.index_select(0, row_indices)
+            attention_keys = cache.keys
+            attention_values = cache.values
         enable_gqa = self.local_attention_heads != self.local_key_value_heads
         out = _ragged_scaled_dot_product_attention(
             q,
             attention_keys,
             attention_values,
             attention_lengths,
+            row_indices=row_indices,
             enable_gqa=enable_gqa,
         )
         out = out.transpose(1, 2).contiguous().view(batch, tokens, self.local_hidden_size)
@@ -2866,6 +2867,7 @@ def _ragged_scaled_dot_product_attention(
     v: Tensor,
     attention_lengths: Tensor,
     *,
+    row_indices: Tensor | None = None,
     enable_gqa: bool,
 ) -> Tensor:
     if (
@@ -2878,9 +2880,18 @@ def _ragged_scaled_dot_product_attention(
         try:
             from torchinferno.kernels.triton_ops import triton_grouped_gqa_decode_attention
 
-            return triton_grouped_gqa_decode_attention(q, k, v, attention_lengths.to(device=k.device))
+            return triton_grouped_gqa_decode_attention(
+                q,
+                k,
+                v,
+                attention_lengths.to(device=k.device),
+                row_indices=row_indices,
+            )
         except Exception as exc:
             warn_optional_failure("llama3_tensor_parallel.ragged_decode_attention", exc)
+    if row_indices is not None:
+        k = k.index_select(0, row_indices)
+        v = v.index_select(0, row_indices)
     max_seq_len = k.size(2)
     key_positions = torch.arange(max_seq_len, device=q.device)
     mask = key_positions[None, :] < attention_lengths.to(device=q.device)[:, None]
