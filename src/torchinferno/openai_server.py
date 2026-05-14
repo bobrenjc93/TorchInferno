@@ -2089,15 +2089,31 @@ class OpenAICompletionEngine:
             else:
                 uniform_token = _uniform_active_token_id(token_ids, active, batch_size)
                 if rows_share_state and uniform_token is not None:
-                    decode_input = next_token.new_tensor([[uniform_token]])
-                    next_token, cache = _decode_repeated_prefix_next_token_with_logits(
-                        model,
-                        decode_input,
-                        cache,
-                        decode_batch_size,
-                        temperature,
+                    extended_input_ids = torch.cat(
+                        (input_ids, input_ids.new_tensor([[uniform_token]])),
+                        dim=1,
                     )
-                    _repeat_generation_cache_first_batch(cache, decode_batch_size)
+                    cached_logits = self._restore_exact_prompt_logits(extended_input_ids, cache)
+                    if cached_logits is not None:
+                        next_token = _sample_repeated_prefix_logits(
+                            model,
+                            cached_logits,
+                            decode_batch_size,
+                            temperature,
+                        )
+                        _repeat_generation_cache_first_batch(cache, decode_batch_size)
+                    else:
+                        decode_input = next_token.new_tensor([[uniform_token]])
+                        next_token, cache, last_logits = _decode_repeated_prefix_next_token_with_logits(
+                            model,
+                            decode_input,
+                            cache,
+                            decode_batch_size,
+                            temperature,
+                        )
+                        _repeat_generation_cache_first_batch(cache, decode_batch_size)
+                        self._save_prompt_prefix_cache(extended_input_ids, cache)
+                        self._store_prompt_logits_cache(extended_input_ids, last_logits)
                 else:
                     next_token, cache = _decode_next_token(model, next_token[:, None], cache, temperature)
                     rows_share_state = False
@@ -4254,11 +4270,12 @@ def _decode_repeated_prefix_next_token_with_logits(
     cache: object,
     batch_size: int,
     temperature: float,
-) -> tuple[Tensor, object]:
+) -> tuple[Tensor, object, Tensor]:
     logits = _try_decode_one_token_logits_graph(model, input_ids, cache)
     if logits is None:
         logits, cache = _forward(model, input_ids, cache)
-    return _sample_repeated_prefix_logits(model, logits[:, -1, :], batch_size, temperature), cache
+    last_logits = logits[:, -1, :]
+    return _sample_repeated_prefix_logits(model, last_logits, batch_size, temperature), cache, last_logits
 
 
 def _sample_repeated_prefix_logits(

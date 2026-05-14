@@ -1316,6 +1316,36 @@ def test_openai_identical_prompt_batch_decodes_uniform_rows_once() -> None:
     assert model.forward_shapes == [(1, 2), (1, 1)]
 
 
+def test_openai_identical_prompt_batch_reuses_uniform_decode_logits_cache() -> None:
+    model = _PrefixRecordingModel()
+    engine = _cache_only_engine()
+    engine.model = model
+    engine.tokenizer = _PrefixTokenizer()
+    engine.stop_token_ids = frozenset()
+    input_ids = torch.tensor([[10, 11]], dtype=torch.long)
+
+    first = list(
+        engine._generate_identical_prompt_batch_steps(
+            input_ids,
+            batch_size=3,
+            max_tokens=2,
+            temperature=0.0,
+        )
+    )
+    second = list(
+        engine._generate_identical_prompt_batch_steps(
+            input_ids,
+            batch_size=3,
+            max_tokens=2,
+            temperature=0.0,
+        )
+    )
+
+    assert first == [[2, 2, 2], [2, 2, 2]]
+    assert second == [[2, 2, 2], [2, 2, 2]]
+    assert model.forward_inputs == [[10, 11], [2]]
+
+
 def test_openai_prompt_list_batch_restores_cached_prefix_rows_with_padded_suffixes(monkeypatch) -> None:
     monkeypatch.setenv("TORCHINFERNO_OPENAI_PREFIX_CACHE_MIN_TOKENS", "1")
     monkeypatch.setenv("TORCHINFERNO_OPENAI_PREFIX_CACHE_BATCH_RESTORE", "1")
