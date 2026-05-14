@@ -1250,7 +1250,12 @@ class OpenAICompletionEngine:
             return
         token_tuple = tuple(int(token_id) for token_id in tokens)
         max_tokens = env_int("TORCHINFERNO_OPENAI_PREFIX_CACHE_MAX_TOKENS", 1024, minimum=1)
-        if len(token_tuple) > max_tokens or seq_len < len(token_tuple):
+        row_max_tokens = env_int(
+            "TORCHINFERNO_OPENAI_PREFIX_CACHE_ROW_MAX_TOKENS",
+            128,
+            minimum=1,
+        )
+        if len(token_tuple) > min(max_tokens, row_max_tokens) or seq_len < len(token_tuple):
             return
         self._store_prefix_cache_entry(snapshot_tensor_prefix_cache(
             cache,
