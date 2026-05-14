@@ -19,13 +19,13 @@ def warmup_temperature_prompt_token_counts() -> tuple[int, ...]:
 
 def warmup_temperature_batch_sizes() -> tuple[int, ...]:
     return parse_positive_int_csv(
-        os.environ.get("TORCHINFERNO_OPENAI_WARMUP_TEMPERATURE_BATCH_SIZES", "1,4,8,16,64,15")
+        os.environ.get("TORCHINFERNO_OPENAI_WARMUP_TEMPERATURE_BATCH_SIZES", "1,4,8,15,16,56,64")
     )
 
 
 def warmup_ragged_decode_batch_sizes() -> tuple[int, ...]:
     return parse_positive_int_csv(
-        os.environ.get("TORCHINFERNO_OPENAI_WARMUP_RAGGED_DECODE_BATCH_SIZES", "64")
+        os.environ.get("TORCHINFERNO_OPENAI_WARMUP_RAGGED_DECODE_BATCH_SIZES", "64,56")
     )
 
 

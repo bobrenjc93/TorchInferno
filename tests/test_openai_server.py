@@ -12,6 +12,7 @@ import types
 import urllib.request
 from pathlib import Path
 
+import pytest
 import torch
 
 from torchinferno.openai_http import (
@@ -30,6 +31,9 @@ from torchinferno.openai_server import (
     _ByteFallbackTokenizer,
     _QueuedGeneration,
     _TransformersChatTokenizer,
+    _cache_row_slice,
+    _copy_generation_cache_first_row,
+    _copy_generation_cache_row,
     _decode_next_token_ragged,
     _distributed_server_command,
     _effective_openai_max_batch_size,
@@ -40,6 +44,7 @@ from torchinferno.openai_server import (
     _prefill_repeated_prefix_next_token,
     _prefers_exact_generation_cache,
     _runtime_prefill_graph_capture_enabled,
+    _repeat_generation_cache_first_batch,
     _sampled_batch_shape_bucket_size,
     _should_reexec_distributed_server,
     _sync_tensor_parallel_command,
@@ -63,6 +68,10 @@ from torchinferno.openai_server import (
     _warmup_temperature_batch_sizes,
     _warmup_temperature_prompt_token_counts,
     load_chat_tokenizer,
+)
+from torchinferno.models.llama3.tensor_parallel import (
+    Llama3TensorParallelCache,
+    Llama3TensorParallelLayerKVCache,
 )
 from torchinferno.server.openai_protocol import chat_completion_chunk
 
@@ -266,7 +275,7 @@ def test_openai_server_warmup_uses_generic_shape_buckets(monkeypatch) -> None:
     assert set(_warmup_prefix_suffix_cache_token_counts()) >= {128, 256, 512, 1024}
     assert set(_warmup_temperature_prompt_token_counts()) == {32, 55, 64}
     assert set(_warmup_temperature_batch_sizes()) >= {1, 8, 15, 16, 64}
-    assert set(_warmup_ragged_decode_batch_sizes()) == {64}
+    assert set(_warmup_ragged_decode_batch_sizes()) == {56, 64}
     assert set(_warmup_ragged_decode_row_counts()) >= {16, 32, 64}
     assert set(_warmup_ragged_decode_cache_token_counts()) >= {256, 512}
     assert _warmup_ragged_decode_prompt_tokens(64) == 64
@@ -1250,6 +1259,37 @@ def test_openai_identical_prompt_batch_reuses_exact_prompt_logits_cache() -> Non
     assert first == [[2, 2, 2]]
     assert second == [[2, 2, 2]]
     assert model.forward_inputs == [[10, 11]]
+
+
+def test_openai_identical_prompt_logits_cache_defers_kv_restore_until_decode() -> None:
+    model = _PrefixRecordingModel()
+    engine = _cache_only_engine()
+    engine.model = model
+    engine.tokenizer = _PrefixTokenizer()
+    engine.stop_token_ids = frozenset()
+    input_ids = torch.tensor([[10, 11]], dtype=torch.long)
+
+    list(
+        engine._generate_identical_prompt_batch_steps(
+            input_ids,
+            batch_size=3,
+            max_tokens=1,
+            temperature=0.0,
+        )
+    )
+    model.forward_inputs.clear()
+
+    steps = engine._generate_identical_prompt_batch_steps(
+        input_ids,
+        batch_size=3,
+        max_tokens=2,
+        temperature=0.0,
+    )
+
+    assert next(steps) == [2, 2, 2]
+    assert model.forward_inputs == []
+    assert next(steps) == [2, 2, 2]
+    assert model.forward_inputs == [[2]]
 
 
 def test_openai_identical_prompt_logits_cache_resamples_temperature_rows(monkeypatch) -> None:
@@ -2284,7 +2324,7 @@ def test_llama_tp_decode_graph_capture_uses_rank_sync(monkeypatch) -> None:
     model._capture_ragged_decode_logits_graph = types.MethodType(capture_ragged, model)
     existing_graph = types.SimpleNamespace(replay=lambda: capture_calls.append("replay"))
     attention_block_size = tp._decode_attention_block_size(cache.seq_len + 1, cache.layers[0].max_seq_len)
-    model._decode_graphs[(id(cache), 1, attention_block_size)] = types.SimpleNamespace(
+    model._decode_graphs[(id(cache), 1, attention_block_size, 0)] = types.SimpleNamespace(
         cache=cache,
         max_seq_len=cache.layers[0].max_seq_len,
         attention_block_size=attention_block_size,
@@ -2292,7 +2332,7 @@ def test_llama_tp_decode_graph_capture_uses_rank_sync(monkeypatch) -> None:
         graph=existing_graph,
         output_token=torch.tensor([1]),
     )
-    model._decode_logits_graphs[(id(cache), 1, attention_block_size)] = types.SimpleNamespace(
+    model._decode_logits_graphs[(id(cache), 1, attention_block_size, 0)] = types.SimpleNamespace(
         cache=cache,
         max_seq_len=cache.layers[0].max_seq_len,
         attention_block_size=attention_block_size,
@@ -2300,7 +2340,7 @@ def test_llama_tp_decode_graph_capture_uses_rank_sync(monkeypatch) -> None:
         graph=existing_graph,
         output_logits=logits,
     )
-    model._ragged_decode_logits_graphs[(id(cache), 1, cache.layers[0].max_seq_len, False)] = types.SimpleNamespace(
+    model._ragged_decode_logits_graphs[(id(cache), 1, cache.layers[0].max_seq_len, False, 0)] = types.SimpleNamespace(
         cache=cache,
         max_seq_len=cache.layers[0].max_seq_len,
         static_input_ids=input_ids.clone(),
@@ -3064,6 +3104,83 @@ def test_openai_shared_prefix_microbatches_emit_full_batch_steps() -> None:
 
     assert steps == [[2, 2, 2, 2], [2, 2, 2, 2]]
     assert active == [False, False, False, False]
+
+
+def test_openai_cache_row_slice_uses_physical_row_views_for_llama_tp_cache() -> None:
+    cache = _llama_tp_cache(batch_size=4, max_seq_len=8)
+    for row in range(4):
+        keys = torch.full((1, 1, 2, 2), float(row))
+        values = keys + 100
+        cache.for_rows((row,)).layers[0].append(keys, values)
+
+    view = _cache_row_slice(cache, 2, 4)
+    assert view is not None
+    view.layers[0].append(
+        torch.tensor([[[[20.0, 21.0]], [[30.0, 31.0]]]]).reshape(2, 1, 1, 2),
+        torch.tensor([[[[120.0, 121.0]], [[130.0, 131.0]]]]).reshape(2, 1, 1, 2),
+    )
+
+    assert cache.for_rows((0, 1)).seq_len == 2
+    assert cache.for_rows((2, 3)).seq_len == 3
+    torch.testing.assert_close(cache.layers[0].keys[2, :, 2:3, :], torch.tensor([[[20.0, 21.0]]]))
+    torch.testing.assert_close(cache.layers[0].keys[3, :, 2:3, :], torch.tensor([[[30.0, 31.0]]]))
+
+
+def test_openai_cache_copy_helpers_preserve_llama_tp_row_lengths() -> None:
+    source = _llama_tp_cache(batch_size=1, max_seq_len=8)
+    target = _llama_tp_cache(batch_size=3, max_seq_len=8)
+    source_keys = torch.arange(6, dtype=torch.float32).reshape(1, 1, 3, 2)
+    source_values = source_keys + 100
+    source.for_rows((0,)).layers[0].append(source_keys, source_values)
+    target.for_rows((0,)).layers[0].append(torch.ones((1, 1, 1, 2)), torch.ones((1, 1, 1, 2)))
+
+    _copy_generation_cache_row(source, target, source_row=0, target_row=2, seq_len=3)
+
+    assert target.for_rows((0,)).seq_len == 1
+    assert target.for_rows((1,)).seq_len == 0
+    assert target.for_rows((2,)).seq_len == 3
+    torch.testing.assert_close(target.layers[0].keys[2:3, :, :3, :], source_keys)
+
+    clone = _llama_tp_cache(batch_size=2, max_seq_len=8)
+    _copy_generation_cache_first_row(source, clone, batch_size=2)
+
+    assert clone.for_rows((0, 1)).seq_len == 3
+    torch.testing.assert_close(clone.layers[0].values[:2, :, :3, :], source_values.expand(2, -1, -1, -1))
+
+
+def test_openai_repeat_generation_cache_first_batch_preserves_llama_tp_row_lengths() -> None:
+    cache = _llama_tp_cache(batch_size=3, max_seq_len=8)
+    keys = torch.arange(4, dtype=torch.float32).reshape(1, 1, 2, 2)
+    values = keys + 100
+    cache.for_rows((0,)).layers[0].append(keys, values)
+
+    _repeat_generation_cache_first_batch(cache, 3)
+
+    assert cache.for_rows((0, 1, 2)).seq_len == 2
+    torch.testing.assert_close(cache.layers[0].keys[:3, :, :2, :], keys.expand(3, -1, -1, -1))
+
+
+def test_openai_prompt_prefix_cache_handles_ragged_llama_tp_cache() -> None:
+    engine = _cache_only_engine()
+    engine.model = object()
+    cache = _llama_tp_cache(batch_size=2, max_seq_len=8)
+    prompt_keys = torch.arange(12, dtype=torch.float32).reshape(2, 1, 3, 2)
+    prompt_values = prompt_keys + 100
+    cache.layers[0].append(prompt_keys, prompt_values)
+    cache.for_rows((0,)).layers[0].append(
+        torch.ones((1, 1, 1, 2)),
+        torch.ones((1, 1, 1, 2)),
+    )
+
+    with pytest.raises(ValueError):
+        _ = cache.seq_len
+
+    input_ids = torch.tensor([[10, 11, 12]], dtype=torch.long)
+    engine._save_prompt_prefix_cache(input_ids, cache)
+
+    entry = engine._exact_prefix_cache_entry((10, 11, 12))
+    assert entry is not None
+    assert entry.layers[0][0].shape == (1, 1, 3, 2)
 
 
 def test_openai_effective_max_batch_size_caps_cuda_tp_by_default(monkeypatch) -> None:
@@ -4475,6 +4592,21 @@ def _cache_only_engine() -> OpenAICompletionEngine:
     engine._microbatch_cache_pool = {}
     engine._single_prefill_capture_seen = {}
     return engine
+
+
+def _llama_tp_cache(batch_size: int, max_seq_len: int) -> Llama3TensorParallelCache:
+    return Llama3TensorParallelCache(
+        [
+            Llama3TensorParallelLayerKVCache(
+                batch_size,
+                max_seq_len,
+                1,
+                2,
+                device=torch.device("cpu"),
+                dtype=torch.float32,
+            )
+        ]
+    )
 
 
 def _free_port() -> int:

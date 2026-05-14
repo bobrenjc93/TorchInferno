@@ -10,14 +10,18 @@ import sys
 import threading
 import time
 from collections.abc import Mapping
+from contextlib import nullcontext
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Iterable, Iterator, Protocol, Sequence, runtime_checkable
+from typing import ContextManager, Iterable, Iterator, Protocol, Sequence, runtime_checkable
 
 import torch
 from torch import Tensor
 
-from torchinferno.models.llama3.tensor_parallel import Llama3TensorParallelForCausalLM
+from torchinferno.models.llama3.tensor_parallel import (
+    Llama3TensorParallelForCausalLM,
+    symm_mem_allreduce_max_batch,
+)
 from torchinferno.engine.loader import (
     distributed_env_requested as _engine_distributed_env_requested,
     distributed_server_command as _engine_distributed_server_command,
@@ -799,54 +803,60 @@ class OpenAICompletionEngine:
         use_prompt_list_batch = self._should_use_prompt_list_stream_group(prompts)
         if use_prompt_list_batch and _prefer_tensor_parallel_stream_group(prompts, self.model):
             use_prompt_list_batch = False
-        if use_prompt_list_batch:
-            completed_steps = 0
-            try:
-                step_iter = self._generate_prompt_list_batch_steps(
-                    prompts,
-                    max_tokens=max_tokens,
-                    temperature=group[0].temperature,
-                    row_max_tokens=row_max_tokens,
-                )
-                for step, step_tokens in enumerate(step_iter):
-                    completed_steps = step + 1
-                    _emit_stream_step(group, step, step_tokens, getattr(self, "stop_token_ids", frozenset()))
-            finally:
-                _sync_tensor_parallel_command(
-                    self.model,
-                    self.device,
-                    cuda_sync=_tp_command_cuda_sync_for_steps(completed_steps),
-                )
-            return
-        for same_length_group in _queued_groups_by_prompt_length(group):
-            same_length_max_tokens = max(request.max_tokens for request in same_length_group)
-            input_ids = torch.tensor(
-                [request.prompt for request in same_length_group],
-                dtype=torch.long,
-                device=self.device,
-            )
-            completed_steps = 0
-            try:
-                step_iter = self._generate_batch_steps(
-                    input_ids,
-                    max_tokens=same_length_max_tokens,
-                    temperature=same_length_group[0].temperature,
-                    row_max_tokens=[request.max_tokens for request in same_length_group],
-                )
-                for step, step_tokens in enumerate(step_iter):
-                    completed_steps = step + 1
-                    _emit_stream_step(
-                        same_length_group,
-                        step,
-                        step_tokens,
-                        getattr(self, "stop_token_ids", frozenset()),
+        with _tensor_parallel_symm_mem_allreduce_scope(
+            self.model,
+            self.device,
+            max_tokens=max_tokens,
+            temperature=group[0].temperature,
+        ):
+            if use_prompt_list_batch:
+                completed_steps = 0
+                try:
+                    step_iter = self._generate_prompt_list_batch_steps(
+                        prompts,
+                        max_tokens=max_tokens,
+                        temperature=group[0].temperature,
+                        row_max_tokens=row_max_tokens,
                     )
-            finally:
-                _sync_tensor_parallel_command(
-                    self.model,
-                    self.device,
-                    cuda_sync=_tp_command_cuda_sync_for_steps(completed_steps),
+                    for step, step_tokens in enumerate(step_iter):
+                        completed_steps = step + 1
+                        _emit_stream_step(group, step, step_tokens, getattr(self, "stop_token_ids", frozenset()))
+                finally:
+                    _sync_tensor_parallel_command(
+                        self.model,
+                        self.device,
+                        cuda_sync=_tp_command_cuda_sync_for_steps(completed_steps),
+                    )
+                return
+            for same_length_group in _queued_groups_by_prompt_length(group):
+                same_length_max_tokens = max(request.max_tokens for request in same_length_group)
+                input_ids = torch.tensor(
+                    [request.prompt for request in same_length_group],
+                    dtype=torch.long,
+                    device=self.device,
                 )
+                completed_steps = 0
+                try:
+                    step_iter = self._generate_batch_steps(
+                        input_ids,
+                        max_tokens=same_length_max_tokens,
+                        temperature=same_length_group[0].temperature,
+                        row_max_tokens=[request.max_tokens for request in same_length_group],
+                    )
+                    for step, step_tokens in enumerate(step_iter):
+                        completed_steps = step + 1
+                        _emit_stream_step(
+                            same_length_group,
+                            step,
+                            step_tokens,
+                            getattr(self, "stop_token_ids", frozenset()),
+                        )
+                finally:
+                    _sync_tensor_parallel_command(
+                        self.model,
+                        self.device,
+                        cuda_sync=_tp_command_cuda_sync_for_steps(completed_steps),
+                    )
 
     def _should_use_prompt_list_stream_group(self, prompts: Sequence[Sequence[int]]) -> bool:
         if self._shared_prefix_prompt_list_tokens(prompts) > 0:
@@ -866,12 +876,18 @@ class OpenAICompletionEngine:
                 dtype=torch.long,
                 device=self.device,
             )
-            rows = self._generate_batch_tokens(
-                input_ids,
+            with _tensor_parallel_symm_mem_allreduce_scope(
+                self.model,
+                self.device,
                 max_tokens=max_tokens,
                 temperature=same_length_group[0].temperature,
-            )
-            _sync_tensor_parallel_command(self.model, self.device)
+            ):
+                rows = self._generate_batch_tokens(
+                    input_ids,
+                    max_tokens=max_tokens,
+                    temperature=same_length_group[0].temperature,
+                )
+                _sync_tensor_parallel_command(self.model, self.device)
             for request, tokens in zip(same_length_group, rows):
                 request.responses.put(_GenerationResult(tokens[: request.max_tokens]))
 
@@ -1166,7 +1182,7 @@ class OpenAICompletionEngine:
             return
         if materialize_generated:
             self._materialize_generated_cache_tokens(input_ids, generated_tokens, cache)
-        seq_len = min(len(tokens), _generation_cache_seq_len(cache))
+        seq_len = min(len(tokens), _cache_row_seq_len(cache, 0))
         if seq_len < len(tokens):
             self._prefix_cache_entry = None
             return
@@ -1223,7 +1239,7 @@ class OpenAICompletionEngine:
         if len(tokens) > max_tokens:
             self._prefix_cache_entry = None
             return
-        seq_len = min(len(tokens), _generation_cache_seq_len(cache))
+        seq_len = min(len(tokens), _cache_row_seq_len(cache, 0))
         if seq_len < len(tokens):
             return
         self._store_prefix_cache_entry(snapshot_tensor_prefix_cache(
@@ -1394,7 +1410,13 @@ class OpenAICompletionEngine:
         while len(entries) > max_entries:
             entries.pop(next(iter(entries)))
 
-    def _restore_exact_prompt_logits(self, input_ids: Tensor, cache: object) -> Tensor | None:
+    def _restore_exact_prompt_logits(
+        self,
+        input_ids: Tensor,
+        cache: object,
+        *,
+        restore_cache: bool = True,
+    ) -> Tensor | None:
         if not _prompt_logits_cache_enabled():
             return None
         if not env_flag("TORCHINFERNO_OPENAI_PREFIX_CACHE", True):
@@ -1409,11 +1431,15 @@ class OpenAICompletionEngine:
         logits = entries.get(input_tokens)
         restored = 0
         if logits is not None:
-            restored = self._restore_exact_prefix_cache(input_ids, cache)
+            restored = (
+                self._restore_exact_prefix_cache(input_ids, cache)
+                if restore_cache
+                else input_ids.size(1)
+            )
         local_hit = logits is not None and restored == input_ids.size(1)
         all_ranks_hit = _tensor_parallel_all_ranks_true(self.model, local_hit, self.device)
         if not all_ranks_hit:
-            if restored:
+            if restore_cache and restored:
                 _reset_generation_cache(cache)
             return None
         entries.pop(input_tokens, None)
@@ -1513,7 +1539,13 @@ class OpenAICompletionEngine:
             self._warmup_tensor_parallel_prefill_graphs(prompt_token_counts, vocab_size)
             self._warmup_tensor_parallel_prefix_suffix_graphs(vocab_size)
             self._warmup_tensor_parallel_temperature_graphs(vocab_size)
-            self._warmup_tensor_parallel_ragged_decode_graphs(vocab_size)
+            with _tensor_parallel_symm_mem_allreduce_scope(
+                self.model,
+                self.device,
+                max_tokens=1,
+                temperature=0.0,
+            ):
+                self._warmup_tensor_parallel_ragged_decode_graphs(vocab_size)
             warmup_cache_tokens = max(
                 max(prompt_token_counts) + new_tokens,
                 env_int("TORCHINFERNO_OPENAI_WARMUP_CACHE_TOKENS", 256, minimum=1),
@@ -2028,9 +2060,30 @@ class OpenAICompletionEngine:
             model=model,
             pool=_identical_prompt_cache_pool_enabled(model, temperature),
         )
+        cache_materialized = True
+
+        def ensure_cache_materialized() -> None:
+            nonlocal cache, cache_materialized
+            if cache_materialized:
+                return
+            restored = self._restore_exact_prefix_cache(input_ids, cache)
+            if restored != input_ids.size(1):
+                cache = _prefill_cache_only(
+                    model,
+                    input_ids,
+                    cache,
+                    allow_capture=_runtime_prefill_graph_capture_enabled(
+                        model,
+                        temperature,
+                        max_tokens=max_tokens,
+                    ),
+                )
+            _repeat_generation_cache_first_batch(cache, decode_batch_size)
+            cache_materialized = True
+
         use_prompt_logits_cache = batch_size > 1 and _prompt_logits_cache_enabled()
         if use_prompt_logits_cache:
-            cached_logits = self._restore_exact_prompt_logits(input_ids, cache)
+            cached_logits = self._restore_exact_prompt_logits(input_ids, cache, restore_cache=False)
             if cached_logits is None:
                 next_token, cache, last_logits = _prefill_repeated_prefix_next_token_with_logits(
                     model,
@@ -2049,6 +2102,7 @@ class OpenAICompletionEngine:
                     decode_batch_size,
                     temperature,
                 )
+                cache_materialized = False
         else:
             next_token, cache = _prefill_repeated_prefix_next_token(
                 model,
@@ -2059,7 +2113,8 @@ class OpenAICompletionEngine:
                 allow_capture=_runtime_prefill_graph_capture_enabled(model, temperature, max_tokens=max_tokens),
             )
         next_token = next_token.to(self.device)
-        _repeat_generation_cache_first_batch(cache, decode_batch_size)
+        if cache_materialized:
+            _repeat_generation_cache_first_batch(cache, decode_batch_size)
         shared_sample = _shared_prefix_sample_enabled(temperature)
         per_row_limits = _normalize_row_max_tokens(row_max_tokens, batch_size, max_tokens)
         decode_row_limits = [*per_row_limits, *([0] * (decode_batch_size - batch_size))]
@@ -2082,6 +2137,7 @@ class OpenAICompletionEngine:
             if not should_continue:
                 break
             if shared_sample:
+                ensure_cache_materialized()
                 next_token, cache = _decode_next_token(model, next_token[:1, None], cache, temperature)
                 next_token = next_token.expand(decode_batch_size).contiguous()
                 _repeat_generation_cache_first_batch(cache, decode_batch_size)
@@ -2101,8 +2157,10 @@ class OpenAICompletionEngine:
                             decode_batch_size,
                             temperature,
                         )
+                        cache_materialized = True
                         _repeat_generation_cache_first_batch(cache, decode_batch_size)
                     else:
+                        ensure_cache_materialized()
                         decode_input = next_token.new_tensor([[uniform_token]])
                         next_token, cache, last_logits = _decode_repeated_prefix_next_token_with_logits(
                             model,
@@ -2115,6 +2173,7 @@ class OpenAICompletionEngine:
                         self._save_prompt_prefix_cache(extended_input_ids, cache)
                         self._store_prompt_logits_cache(extended_input_ids, last_logits)
                 else:
+                    ensure_cache_materialized()
                     next_token, cache = _decode_next_token(model, next_token[:, None], cache, temperature)
                     rows_share_state = False
             next_token = next_token.to(self.device)
@@ -3628,6 +3687,27 @@ def _tensor_parallel_world_size(model: object) -> int:
     return int(getattr(model, "world_size", 1)) if _is_tensor_parallel_model(model) else 1
 
 
+def _tensor_parallel_symm_mem_allreduce_scope(
+    model: object,
+    device: torch.device,
+    *,
+    max_tokens: int,
+    temperature: float,
+) -> ContextManager[None]:
+    if (
+        not _is_tensor_parallel_model(model)
+        or _tensor_parallel_world_size(model) <= 1
+        or device.type != "cuda"
+        or temperature > 0.0
+    ):
+        return nullcontext()
+    max_tokens_limit = env_int("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_MAX_TOKENS", 128, minimum=1)
+    if max_tokens > max_tokens_limit:
+        return nullcontext()
+    max_batch = env_int("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_MAX_BATCH", 64, minimum=1)
+    return symm_mem_allreduce_max_batch(max_batch)
+
+
 def _effective_openai_max_batch_size(model: object, device: torch.device, requested: int) -> int:
     max_batch_size = max(1, requested)
     if _is_tensor_parallel_model(model) and device.type == "cuda":
@@ -4030,56 +4110,64 @@ def _tensor_parallel_worker_loop(engine: OpenAICompletionEngine) -> None:
         if op != "generate":
             raise ValueError(f"unsupported tensor-parallel worker op: {op}")
         try:
-            if "input_id_lists" in payload:
+            max_tokens = int(payload["max_tokens"])
+            temperature = float(payload["temperature"])
+            with _tensor_parallel_symm_mem_allreduce_scope(
+                getattr(engine, "model", None),
+                getattr(engine, "device", torch.device("cpu")),
+                max_tokens=max_tokens,
+                temperature=temperature,
+            ):
+                if "input_id_lists" in payload:
+                    if bool(payload.get("stream", True)):
+                        for _ in engine._generate_prompt_list_batch_steps(
+                            payload["input_id_lists"],
+                            max_tokens=max_tokens,
+                            temperature=temperature,
+                            broadcast_tensor_parallel=False,
+                            row_max_tokens=_coerce_optional_int_sequence(payload.get("row_max_tokens")),
+                        ):
+                            pass
+                    else:
+                        for prompt_group in _indexed_prompts_by_length(
+                            [
+                                (index, list(prompt))
+                                for index, prompt in enumerate(payload["input_id_lists"])
+                            ]
+                        ):
+                            input_ids = torch.tensor(
+                                [prompt for _index, prompt in prompt_group],
+                                dtype=torch.long,
+                                device=engine.device,
+                            )
+                            engine._generate_batch_tokens(
+                                input_ids,
+                                max_tokens=max_tokens,
+                                temperature=temperature,
+                                broadcast_tensor_parallel=False,
+                            )
+                    continue
+                tensor_payload = payload.get("input_ids_tensor")
+                if isinstance(tensor_payload, Tensor):
+                    input_ids = tensor_payload.to(engine.device, non_blocking=True)
+                else:
+                    input_ids = torch.tensor(payload["input_ids"], dtype=torch.long, device=engine.device)
                 if bool(payload.get("stream", True)):
-                    for _ in engine._generate_prompt_list_batch_steps(
-                        payload["input_id_lists"],
-                        max_tokens=int(payload["max_tokens"]),
-                        temperature=float(payload["temperature"]),
+                    for _ in engine._generate_batch_steps(
+                        input_ids,
+                        max_tokens=max_tokens,
+                        temperature=temperature,
                         broadcast_tensor_parallel=False,
                         row_max_tokens=_coerce_optional_int_sequence(payload.get("row_max_tokens")),
                     ):
                         pass
                 else:
-                    for prompt_group in _indexed_prompts_by_length(
-                        [
-                            (index, list(prompt))
-                            for index, prompt in enumerate(payload["input_id_lists"])
-                        ]
-                    ):
-                        input_ids = torch.tensor(
-                            [prompt for _index, prompt in prompt_group],
-                            dtype=torch.long,
-                            device=engine.device,
-                        )
-                        engine._generate_batch_tokens(
-                            input_ids,
-                            max_tokens=int(payload["max_tokens"]),
-                            temperature=float(payload["temperature"]),
-                            broadcast_tensor_parallel=False,
-                        )
-                continue
-            tensor_payload = payload.get("input_ids_tensor")
-            if isinstance(tensor_payload, Tensor):
-                input_ids = tensor_payload.to(engine.device, non_blocking=True)
-            else:
-                input_ids = torch.tensor(payload["input_ids"], dtype=torch.long, device=engine.device)
-            if bool(payload.get("stream", True)):
-                for _ in engine._generate_batch_steps(
-                    input_ids,
-                    max_tokens=int(payload["max_tokens"]),
-                    temperature=float(payload["temperature"]),
-                    broadcast_tensor_parallel=False,
-                    row_max_tokens=_coerce_optional_int_sequence(payload.get("row_max_tokens")),
-                ):
-                    pass
-            else:
-                engine._generate_batch_tokens(
-                    input_ids,
-                    max_tokens=int(payload["max_tokens"]),
-                    temperature=float(payload["temperature"]),
-                    broadcast_tensor_parallel=False,
-                )
+                    engine._generate_batch_tokens(
+                        input_ids,
+                        max_tokens=max_tokens,
+                        temperature=temperature,
+                        broadcast_tensor_parallel=False,
+                    )
         finally:
             _sync_tensor_parallel_command(getattr(engine, "model", None), engine.device)
 
@@ -4665,16 +4753,66 @@ def _tokenizer_padding_token_id(tokenizer: object | None) -> int:
 def _repeat_generation_cache_first_batch(cache: object, batch_size: int) -> None:
     if batch_size <= 1:
         return
-    for layer in getattr(cache, "layers", ()) or ():
-        seq_len = int(getattr(layer, "seq_len", 0))
-        if seq_len <= 0:
-            continue
-        keys = getattr(layer, "keys", None)
-        values = getattr(layer, "values", None)
-        if isinstance(keys, Tensor) and keys.size(0) >= batch_size:
+    layers = tuple(getattr(cache, "layers", ()) or ())
+    if layers and all(_dense_layer_has_rows(layer, batch_size) for layer in layers):
+        for layer in layers:
+            seq_len = _layer_row_seq_len(layer, 0)
+            if seq_len <= 0:
+                continue
+            keys = getattr(layer, "keys")
+            values = getattr(layer, "values")
             keys[:batch_size, :, :seq_len, :].copy_(keys[:1, :, :seq_len, :].expand(batch_size, -1, -1, -1))
-        if isinstance(values, Tensor) and values.size(0) >= batch_size:
             values[:batch_size, :, :seq_len, :].copy_(values[:1, :, :seq_len, :].expand(batch_size, -1, -1, -1))
+            _set_layer_rows_seq_len(layer, range(batch_size), seq_len)
+        return
+    copy_prefix = getattr(cache, "copy_prefix_from", None)
+    if callable(copy_prefix):
+        seq_len = _cache_row_seq_len(cache, 0)
+        if seq_len <= 0:
+            return
+        for row in range(1, batch_size):
+            copy_prefix(cache, seq_len, source_row=0, dest_row=row)
+
+
+def _dense_layer_has_rows(layer: object, rows: int) -> bool:
+    keys = getattr(layer, "keys", None)
+    values = getattr(layer, "values", None)
+    return (
+        isinstance(keys, Tensor)
+        and isinstance(values, Tensor)
+        and keys.size(0) >= rows
+        and values.size(0) >= rows
+    )
+
+
+def _dense_cache_pair_has_rows(source: object, target: object, rows: int) -> bool:
+    source_layers = tuple(getattr(source, "layers", ()) or ())
+    target_layers = tuple(getattr(target, "layers", ()) or ())
+    return (
+        bool(source_layers)
+        and len(source_layers) == len(target_layers)
+        and all(_dense_layer_has_rows(source_layer, 1) for source_layer in source_layers)
+        and all(_dense_layer_has_rows(target_layer, rows) for target_layer in target_layers)
+    )
+
+
+def _dense_cache_pair_has_row(source: object, target: object, source_row: int, target_row: int) -> bool:
+    source_layers = tuple(getattr(source, "layers", ()) or ())
+    target_layers = tuple(getattr(target, "layers", ()) or ())
+    if not source_layers or len(source_layers) != len(target_layers):
+        return False
+    for source_layer, target_layer in zip(source_layers, target_layers):
+        source_keys = getattr(source_layer, "keys", None)
+        source_values = getattr(source_layer, "values", None)
+        target_keys = getattr(target_layer, "keys", None)
+        target_values = getattr(target_layer, "values", None)
+        if not all(isinstance(tensor, Tensor) for tensor in (source_keys, source_values, target_keys, target_values)):
+            return False
+        if source_keys.size(0) <= source_row or source_values.size(0) <= source_row:
+            return False
+        if target_keys.size(0) <= target_row or target_values.size(0) <= target_row:
+            return False
+    return True
 
 
 def _prefill_cache_only(
@@ -4877,6 +5015,12 @@ def _common_prefix_list_token_count(prompts: Sequence[Sequence[int]]) -> int:
 def _cache_row_slice(cache: object, start: int, end: int) -> object | None:
     if end <= start:
         return None
+    for_rows = getattr(cache, "for_rows", None)
+    if callable(for_rows):
+        try:
+            return for_rows(tuple(range(start, end)))
+        except (TypeError, ValueError, AttributeError):
+            pass
     layers = tuple(getattr(cache, "layers", ()) or ())
     if not layers:
         return None
@@ -4902,28 +5046,39 @@ def _cache_row_slice(cache: object, start: int, end: int) -> object | None:
 def _copy_generation_cache_first_row(source: object, target: object, batch_size: int) -> None:
     if batch_size <= 0:
         return
-    for source_layer, target_layer in zip(
-        getattr(source, "layers", ()) or (),
-        getattr(target, "layers", ()) or (),
-    ):
-        seq_len = int(getattr(source_layer, "seq_len", 0))
+    if _dense_cache_pair_has_rows(source, target, batch_size):
+        for source_layer, target_layer in zip(
+            getattr(source, "layers", ()) or (),
+            getattr(target, "layers", ()) or (),
+        ):
+            seq_len = _layer_row_seq_len(source_layer, 0)
+            if seq_len <= 0:
+                continue
+            source_keys = getattr(source_layer, "keys")
+            source_values = getattr(source_layer, "values")
+            target_keys = getattr(target_layer, "keys")
+            target_values = getattr(target_layer, "values")
+            if source_keys.size(2) < seq_len or source_values.size(2) < seq_len:
+                raise RuntimeError("source shared prefix cache row is shorter than requested")
+            if target_keys.size(2) < seq_len or target_values.size(2) < seq_len:
+                raise RuntimeError("target shared prefix cache row is shorter than requested")
+            target_keys[:batch_size, :, :seq_len, :].copy_(
+                source_keys[:1, :, :seq_len, :].expand(batch_size, -1, -1, -1)
+            )
+            target_values[:batch_size, :, :seq_len, :].copy_(
+                source_values[:1, :, :seq_len, :].expand(batch_size, -1, -1, -1)
+            )
+            _set_layer_rows_seq_len(target_layer, range(batch_size), seq_len)
+        return
+    copy_prefix = getattr(target, "copy_prefix_from", None)
+    if callable(copy_prefix):
+        seq_len = _cache_row_seq_len(source, 0)
         if seq_len <= 0:
-            continue
-        source_keys = getattr(source_layer, "keys", None)
-        source_values = getattr(source_layer, "values", None)
-        target_keys = getattr(target_layer, "keys", None)
-        target_values = getattr(target_layer, "values", None)
-        if not all(isinstance(tensor, Tensor) for tensor in (source_keys, source_values, target_keys, target_values)):
-            raise RuntimeError("cannot copy shared prefix cache for non-tensor KV layer")
-        if target_keys.size(0) < batch_size or target_values.size(0) < batch_size:
-            raise RuntimeError("shared prefix target cache batch is too small")
-        target_keys[:batch_size, :, :seq_len, :].copy_(
-            source_keys[:1, :, :seq_len, :].expand(batch_size, -1, -1, -1)
-        )
-        target_values[:batch_size, :, :seq_len, :].copy_(
-            source_values[:1, :, :seq_len, :].expand(batch_size, -1, -1, -1)
-        )
-        target_layer.seq_len = seq_len
+            return
+        for row in range(batch_size):
+            copy_prefix(source, seq_len, source_row=0, dest_row=row)
+        return
+    raise RuntimeError("cannot copy shared prefix cache for non-tensor KV layer")
 
 
 def _copy_generation_cache_row(
@@ -4936,31 +5091,83 @@ def _copy_generation_cache_row(
 ) -> None:
     if seq_len <= 0:
         return
-    for source_layer, target_layer in zip(
-        getattr(source, "layers", ()) or (),
-        getattr(target, "layers", ()) or (),
-    ):
-        source_keys = getattr(source_layer, "keys", None)
-        source_values = getattr(source_layer, "values", None)
-        target_keys = getattr(target_layer, "keys", None)
-        target_values = getattr(target_layer, "values", None)
-        if not all(isinstance(tensor, Tensor) for tensor in (source_keys, source_values, target_keys, target_values)):
-            raise RuntimeError("cannot copy ragged cache row for non-tensor KV layer")
-        if source_keys.size(0) <= source_row or source_values.size(0) <= source_row:
-            raise RuntimeError("source ragged cache row is out of range")
-        if target_keys.size(0) <= target_row or target_values.size(0) <= target_row:
-            raise RuntimeError("target ragged cache row is out of range")
-        if source_keys.size(2) < seq_len or source_values.size(2) < seq_len:
-            raise RuntimeError("source ragged cache row is shorter than requested")
-        if target_keys.size(2) < seq_len or target_values.size(2) < seq_len:
-            raise RuntimeError("target ragged cache row is shorter than requested")
-        target_keys[target_row : target_row + 1, :, :seq_len, :].copy_(
-            source_keys[source_row : source_row + 1, :, :seq_len, :]
-        )
-        target_values[target_row : target_row + 1, :, :seq_len, :].copy_(
-            source_values[source_row : source_row + 1, :, :seq_len, :]
-        )
-        target_layer.seq_len = max(int(getattr(target_layer, "seq_len", 0)), seq_len)
+    if _dense_cache_pair_has_row(source, target, source_row, target_row):
+        for source_layer, target_layer in zip(
+            getattr(source, "layers", ()) or (),
+            getattr(target, "layers", ()) or (),
+        ):
+            source_keys = getattr(source_layer, "keys")
+            source_values = getattr(source_layer, "values")
+            target_keys = getattr(target_layer, "keys")
+            target_values = getattr(target_layer, "values")
+            if source_keys.size(2) < seq_len or source_values.size(2) < seq_len:
+                raise RuntimeError("source ragged cache row is shorter than requested")
+            if target_keys.size(2) < seq_len or target_values.size(2) < seq_len:
+                raise RuntimeError("target ragged cache row is shorter than requested")
+            target_keys[target_row : target_row + 1, :, :seq_len, :].copy_(
+                source_keys[source_row : source_row + 1, :, :seq_len, :]
+            )
+            target_values[target_row : target_row + 1, :, :seq_len, :].copy_(
+                source_values[source_row : source_row + 1, :, :seq_len, :]
+            )
+            _set_layer_rows_seq_len(target_layer, (target_row,), seq_len)
+        return
+    copy_prefix = getattr(target, "copy_prefix_from", None)
+    if callable(copy_prefix):
+        copy_prefix(source, seq_len, source_row=source_row, dest_row=target_row)
+        return
+    raise RuntimeError("cannot copy ragged cache row for non-tensor KV layer")
+
+
+def _cache_row_seq_len(cache: object, row: int) -> int:
+    layers = tuple(getattr(cache, "layers", ()) or ())
+    if not layers:
+        return 0
+    return _layer_row_seq_len(layers[0], row)
+
+
+def _layer_row_seq_len(layer: object, row: int) -> int:
+    seq_len_for_rows = getattr(layer, "seq_len_for_rows", None)
+    if callable(seq_len_for_rows):
+        return int(seq_len_for_rows((row,)))
+    seq_len_for_row = getattr(layer, "seq_len_for_row", None)
+    if callable(seq_len_for_row):
+        return int(seq_len_for_row(row))
+    seq_lens = getattr(layer, "seq_lens", None)
+    if isinstance(seq_lens, list) and 0 <= row < len(seq_lens):
+        return int(seq_lens[row])
+    private_seq_lens = getattr(layer, "_seq_lens", None)
+    if isinstance(private_seq_lens, list) and 0 <= row < len(private_seq_lens):
+        return int(private_seq_lens[row])
+    return int(getattr(layer, "seq_len", 0))
+
+
+def _set_layer_rows_seq_len(layer: object, rows: Iterable[int], seq_len: int) -> None:
+    set_seq_len = getattr(layer, "set_seq_len", None)
+    if callable(set_seq_len):
+        row_tuple = tuple(int(row) for row in rows)
+        if not row_tuple:
+            return
+        for_rows = getattr(layer, "for_rows", None)
+        if callable(for_rows):
+            for_rows(row_tuple).set_seq_len(seq_len)
+        else:
+            set_seq_len(seq_len)
+        return
+    seq_lens = getattr(layer, "seq_lens", None)
+    if isinstance(seq_lens, list):
+        for row in rows:
+            seq_lens[int(row)] = seq_len
+        return
+    private_seq_lens = getattr(layer, "_seq_lens", None)
+    if isinstance(private_seq_lens, list):
+        for row in rows:
+            private_seq_lens[int(row)] = seq_len
+        return
+    try:
+        setattr(layer, "seq_len", seq_len)
+    except AttributeError:
+        pass
 
 
 def _tokens_not_in_stop(tokens: Tensor, stop_token_ids: frozenset[int]) -> Tensor:

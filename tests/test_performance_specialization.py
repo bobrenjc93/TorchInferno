@@ -200,6 +200,118 @@ def test_decode_linear_uses_transposed_weight_layout() -> None:
     torch.testing.assert_close(actual, expected)
 
 
+def test_tensor_parallel_kv_cache_row_views_support_mixed_lengths() -> None:
+    layer = Llama3TensorParallelLayerKVCache(
+        3,
+        8,
+        1,
+        2,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+    row0_keys = torch.arange(6, dtype=torch.float32).reshape(1, 1, 3, 2)
+    row0_values = row0_keys + 100
+    row1_keys = torch.arange(8, dtype=torch.float32).reshape(1, 1, 4, 2) + 10
+    row1_values = row1_keys + 100
+
+    layer.for_rows((0,)).append(row0_keys, row0_values)
+    layer.for_rows((1,)).append(row1_keys, row1_values)
+
+    assert layer.for_rows((0,)).seq_len == 3
+    assert layer.for_rows((1,)).seq_len == 4
+    assert layer.for_rows((2,)).seq_len == 0
+    with pytest.raises(ValueError, match="selected cache rows must have the same sequence length"):
+        _ = layer.for_rows((0, 1)).seq_len
+
+    final_key = torch.tensor([[[[99.0, 100.0]]]])
+    final_value = final_key + 100
+    keys, values = layer.for_rows((0,)).append(final_key, final_value)
+
+    assert layer.for_rows((0, 1)).seq_len == 4
+    torch.testing.assert_close(keys[:, :, :3, :], row0_keys)
+    torch.testing.assert_close(values[:, :, :3, :], row0_values)
+    torch.testing.assert_close(layer.keys[0:1, :, :4, :], keys)
+    torch.testing.assert_close(layer.values[0:1, :, :4, :], values)
+
+
+def test_tensor_parallel_kv_cache_row_views_copy_prefix_and_clear() -> None:
+    cache = Llama3TensorParallelCache(
+        [
+            Llama3TensorParallelLayerKVCache(
+                2,
+                8,
+                1,
+                2,
+                device=torch.device("cpu"),
+                dtype=torch.float32,
+            )
+        ]
+    )
+    keys = torch.arange(6, dtype=torch.float32).reshape(1, 1, 3, 2)
+    values = keys + 100
+
+    cache.for_rows((0,)).layers[0].append(keys, values)
+    cache.for_rows((1,)).copy_prefix_from(cache.for_rows((0,)), 2)
+
+    assert cache.for_rows((0,)).seq_len == 3
+    assert cache.for_rows((1,)).seq_len == 2
+    torch.testing.assert_close(cache.layers[0].keys[1:2, :, :2, :], keys[:, :, :2, :])
+    torch.testing.assert_close(cache.layers[0].values[1:2, :, :2, :], values[:, :, :2, :])
+
+    cache.for_rows((1,)).clear_row(0)
+
+    assert cache.for_rows((1,)).seq_len == 0
+
+
+def test_tensor_parallel_kv_cache_row_views_compose() -> None:
+    cache = Llama3TensorParallelCache(
+        [
+            Llama3TensorParallelLayerKVCache(
+                4,
+                8,
+                1,
+                2,
+                device=torch.device("cpu"),
+                dtype=torch.float32,
+            )
+        ]
+    )
+    view = cache.for_rows((2, 3))
+    nested = view.for_rows((1,))
+    keys = torch.tensor([[[[7.0, 8.0]]]])
+    values = keys + 100
+
+    nested.layers[0].append(keys, values)
+
+    assert cache.for_rows((3,)).seq_len == 1
+    assert cache.for_rows((2,)).seq_len == 0
+    torch.testing.assert_close(cache.layers[0].keys[3:4, :, :1, :], keys)
+    with pytest.raises(ValueError, match="cache row out of range"):
+        view.for_rows((2,))
+
+
+def test_tensor_parallel_kv_cache_row_views_reject_invalid_rows() -> None:
+    cache = Llama3TensorParallelCache(
+        [
+            Llama3TensorParallelLayerKVCache(
+                2,
+                8,
+                1,
+                2,
+                device=torch.device("cpu"),
+                dtype=torch.float32,
+            )
+        ]
+    )
+
+    with pytest.raises(ValueError, match="cache row out of range"):
+        cache.for_rows((-1,))
+    with pytest.raises(ValueError, match="cache row out of range"):
+        cache.for_rows((2,))
+    with pytest.raises(ValueError, match="cache row out of range"):
+        cache.copy_prefix_from(cache, 0, source_row=0, dest_row=2)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
 def test_decode_linear_uses_transposed_weight_layout_for_decode_batches() -> None:
     torch.manual_seed(48)

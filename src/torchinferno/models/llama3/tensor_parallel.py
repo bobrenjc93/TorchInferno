@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import os
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -31,7 +33,20 @@ _COMPILED_ROTATE_LLAMA_FAILED = False
 _SYMM_REDUCE_BUFFERS: dict[tuple[str, int, str, str, tuple[int, ...]], Tensor] = {}
 _SYMM_REDUCE_PROBED: set[tuple[str, int, str, str, tuple[int, ...]]] = set()
 _SYMM_REDUCE_DISABLED = False
+_SYMM_MEM_ALLREDUCE_MAX_BATCH_OVERRIDE: list[int | None] = [None]
 _DEFAULT_DECODE_STEP_MAX_BATCH = 64
+
+
+@contextmanager
+def symm_mem_allreduce_max_batch(max_batch: int | None) -> Iterator[None]:
+    if max_batch is not None and max_batch < 1:
+        raise ValueError("max_batch must be positive")
+    previous = _SYMM_MEM_ALLREDUCE_MAX_BATCH_OVERRIDE[0]
+    _SYMM_MEM_ALLREDUCE_MAX_BATCH_OVERRIDE[0] = max_batch
+    try:
+        yield
+    finally:
+        _SYMM_MEM_ALLREDUCE_MAX_BATCH_OVERRIDE[0] = previous
 
 
 def _tp_flag(name: str, default: bool = True) -> bool:
@@ -111,31 +126,158 @@ class Llama3TensorParallelLayerKVCache:
         shape = (batch_size, local_key_value_heads, max_seq_len, head_dim)
         self.keys = torch.empty(shape, device=device, dtype=dtype)
         self.values = torch.empty(shape, device=device, dtype=dtype)
-        self.seq_len = 0
         self.max_seq_len = max_seq_len
         self.batch_size = batch_size
+        self._seq_lens = [0 for _ in range(batch_size)]
+        self._uniform_seq_len: list[int | None] = [0]
+        self._row_indices: tuple[int, ...] | None = None
+
+    @property
+    def seq_len(self) -> int:
+        return self.seq_len_for_rows(self._selected_rows())
+
+    @seq_len.setter
+    def seq_len(self, seq_len: int) -> None:
+        self.set_seq_len(seq_len)
+
+    def seq_len_for_rows(self, rows: tuple[int, ...]) -> int:
+        if not rows:
+            return 0
+        if any(row < 0 or row >= len(self._seq_lens) for row in rows):
+            raise ValueError("cache row out of range")
+        uniform_seq_len = self._uniform_seq_len[0]
+        if uniform_seq_len is not None:
+            return uniform_seq_len
+        seq_len = self._seq_lens[rows[0]]
+        if any(self._seq_lens[row] != seq_len for row in rows):
+            raise ValueError("selected cache rows must have the same sequence length")
+        return seq_len
+
+    def set_seq_len(self, seq_len: int) -> None:
+        if seq_len < 0:
+            raise ValueError("seq_len must be non-negative")
+        if seq_len > self.max_seq_len:
+            raise ValueError("seq_len exceeds KV cache capacity")
+        self._set_rows_seq_len(self._selected_rows(), seq_len)
 
     def append(self, keys: Tensor, values: Tensor) -> tuple[Tensor, Tensor]:
         batch, _, tokens, _ = keys.shape
         if batch > self.batch_size:
             raise ValueError("cache batch is smaller than incoming batch")
-        end = self.seq_len + tokens
+        uniform_seq_len = self._uniform_seq_len[0]
+        if self._row_indices is None and uniform_seq_len is not None:
+            rows: tuple[int, ...] | None = None
+            start = uniform_seq_len
+        else:
+            rows = self._selected_rows(batch)
+            start = self.seq_len_for_rows(rows)
+        end = start + tokens
         if end > self.max_seq_len:
             raise ValueError("KV cache capacity exceeded")
-        if keys.is_cuda and values.is_cuda and _tp_flag("TORCHINFERNO_TRITON_KV_APPEND"):
+        if (
+            self._row_indices is None
+            and keys.is_cuda
+            and values.is_cuda
+            and _tp_flag("TORCHINFERNO_TRITON_KV_APPEND")
+        ):
             try:
                 from torchinferno.kernels.triton_ops import triton_append_kv_cache
 
-                triton_append_kv_cache(keys, values, self.keys, self.values, self.seq_len)
+                triton_append_kv_cache(keys, values, self.keys, self.values, start)
             except Exception as exc:
                 warn_optional_failure("llama3_tensor_parallel.triton_kv_append", exc)
-                self.keys[:batch, :, self.seq_len : end, :].copy_(keys)
-                self.values[:batch, :, self.seq_len : end, :].copy_(values)
+                self.keys[:batch, :, start:end, :].copy_(keys)
+                self.values[:batch, :, start:end, :].copy_(values)
         else:
-            self.keys[:batch, :, self.seq_len : end, :].copy_(keys)
-            self.values[:batch, :, self.seq_len : end, :].copy_(values)
-        self.seq_len = end
-        return self.keys[:batch, :, :end, :], self.values[:batch, :, :end, :]
+            if self._row_indices is None:
+                self.keys[:batch, :, start:end, :].copy_(keys)
+                self.values[:batch, :, start:end, :].copy_(values)
+            else:
+                if rows is None:
+                    rows = self._selected_rows(batch)
+                index = torch.tensor(rows, dtype=torch.long, device=self.keys.device)
+                self.keys[index, :, start:end, :] = keys
+                self.values[index, :, start:end, :] = values
+        if rows is None:
+            self._set_root_prefix_seq_len(batch, end)
+        else:
+            self._set_rows_seq_len(rows, end)
+        if self._row_indices is None:
+            return self.keys[:batch, :, :end, :], self.values[:batch, :, :end, :]
+        if rows is None:
+            rows = self._selected_rows(batch)
+        index = torch.tensor(rows, dtype=torch.long, device=self.keys.device)
+        return self.keys.index_select(0, index)[:, :, :end, :], self.values.index_select(0, index)[:, :, :end, :]
+
+    def for_rows(self, rows: tuple[int, ...] | list[int]) -> "Llama3TensorParallelLayerKVCache":
+        if not rows:
+            raise ValueError("row view must select at least one cache row")
+        physical_rows = tuple(self._physical_row(int(row)) for row in rows)
+        view = object.__new__(Llama3TensorParallelLayerKVCache)
+        view.keys = self.keys
+        view.values = self.values
+        view.max_seq_len = self.max_seq_len
+        view.batch_size = len(physical_rows)
+        view._seq_lens = self._seq_lens
+        view._uniform_seq_len = self._uniform_seq_len
+        view._row_indices = physical_rows
+        return view
+
+    def clear_row(self, row: int) -> None:
+        physical_row = self._physical_row(row)
+        self._seq_lens[physical_row] = 0
+
+    def copy_prefix_from(
+        self,
+        source: "Llama3TensorParallelLayerKVCache",
+        tokens: int,
+        *,
+        source_row: int = 0,
+        dest_row: int = 0,
+    ) -> None:
+        source_physical = source._physical_row(source_row)
+        dest_physical = self._physical_row(dest_row)
+        if tokens < 0:
+            raise ValueError("tokens must be non-negative")
+        if tokens > source._seq_lens[source_physical] or tokens > self.max_seq_len:
+            raise ValueError("prefix length exceeds cache row capacity")
+        self.keys[dest_physical : dest_physical + 1, :, :tokens, :].copy_(
+            source.keys[source_physical : source_physical + 1, :, :tokens, :]
+        )
+        self.values[dest_physical : dest_physical + 1, :, :tokens, :].copy_(
+            source.values[source_physical : source_physical + 1, :, :tokens, :]
+        )
+        self._set_rows_seq_len((dest_physical,), tokens)
+
+    def _selected_rows(self, batch: int | None = None) -> tuple[int, ...]:
+        if self._row_indices is None:
+            size = self.batch_size if batch is None else batch
+            return tuple(range(size))
+        if batch is None:
+            return self._row_indices
+        return self._row_indices[:batch]
+
+    def _physical_row(self, row: int) -> int:
+        if row < 0 or row >= self.batch_size:
+            raise ValueError("cache row out of range")
+        return row if self._row_indices is None else self._row_indices[row]
+
+    def _set_root_prefix_seq_len(self, batch: int, seq_len: int) -> None:
+        if batch == len(self._seq_lens):
+            self._seq_lens[:] = [seq_len] * len(self._seq_lens)
+            self._uniform_seq_len[0] = seq_len
+            return
+        self._seq_lens[:batch] = [seq_len] * batch
+        self._uniform_seq_len[0] = seq_len if all(value == seq_len for value in self._seq_lens) else None
+
+    def _set_rows_seq_len(self, rows: tuple[int, ...], seq_len: int) -> None:
+        if len(rows) == len(self._seq_lens) and set(rows) == set(range(len(self._seq_lens))):
+            self._seq_lens[:] = [seq_len] * len(self._seq_lens)
+            self._uniform_seq_len[0] = seq_len
+            return
+        for row in rows:
+            self._seq_lens[row] = seq_len
+        self._uniform_seq_len[0] = seq_len if all(value == seq_len for value in self._seq_lens) else None
 
 
 class Llama3TensorParallelCache:
@@ -153,10 +295,30 @@ class Llama3TensorParallelCache:
             if seq_len > layer.max_seq_len:
                 raise ValueError("seq_len exceeds KV cache capacity")
         for layer in self.layers:
-            layer.seq_len = seq_len
+            layer.set_seq_len(seq_len)
 
     def reset(self) -> None:
         self.set_seq_len(0)
+
+    def for_rows(self, rows: tuple[int, ...] | list[int]) -> "Llama3TensorParallelCache":
+        return Llama3TensorParallelCache([layer.for_rows(rows) for layer in self.layers])
+
+    def clear_row(self, row: int) -> None:
+        for layer in self.layers:
+            layer.clear_row(row)
+
+    def copy_prefix_from(
+        self,
+        source: "Llama3TensorParallelCache",
+        tokens: int,
+        *,
+        source_row: int = 0,
+        dest_row: int = 0,
+    ) -> None:
+        if len(self.layers) != len(source.layers):
+            raise ValueError("source cache must have the same number of layers")
+        for target_layer, source_layer in zip(self.layers, source.layers):
+            target_layer.copy_prefix_from(source_layer, tokens, source_row=source_row, dest_row=dest_row)
 
 
 @dataclass
@@ -666,12 +828,14 @@ class _Llama3TensorParallelLayer:
     ) -> Tensor:
         if _should_use_symm_mem_all_reduce(hidden, weight, self.world_size) and not self._symm_reduce_failed:
             try:
-                expected_shape = (1, 1, weight.size(0))
+                expected_shape = (*hidden.shape[:-1], weight.size(0))
                 buffer, group_name = self._symm_reduce_buffer(buffer_name, hidden, expected_shape)
+                hidden_2d = hidden.reshape(-1, hidden.size(-1))
+                output_2d = buffer.reshape(-1, weight.size(0))
                 if weight_t is not None:
-                    torch.mm(hidden.reshape(1, -1), weight_t, out=buffer.reshape(1, -1))
+                    torch.mm(hidden_2d, weight_t, out=output_2d)
                 else:
-                    torch.mv(weight, hidden.reshape(-1), out=buffer.view(-1))
+                    torch.mm(hidden_2d, weight.t(), out=output_2d)
                 torch.ops.symm_mem.multimem_all_reduce_(buffer, "sum", group_name)
                 return buffer
             except Exception:
@@ -1211,14 +1375,14 @@ class Llama3TensorParallelForCausalLM:
         self._prefill_logits_graphs: dict[tuple[int, int, int, tuple[int, ...]], _StaticPrefillLogitsGraphCall] = {}
         self._prefill_graph_failed = False
         self._prefill_logits_graph_failed = False
-        self._decode_graphs: dict[tuple[int, int, int], _StaticDecodeGraphCall] = {}
-        self._decode_logits_graphs: dict[tuple[int, int, int], _StaticDecodeLogitsGraphCall] = {}
+        self._decode_graphs: dict[tuple[int, int, int, int], _StaticDecodeGraphCall] = {}
+        self._decode_logits_graphs: dict[tuple[int, int, int, int], _StaticDecodeLogitsGraphCall] = {}
         self._ragged_decode_graphs: dict[
-            tuple[int, int, int, bool],
+            tuple[int, int, int, bool, int],
             _StaticRaggedDecodeGraphCall,
         ] = {}
         self._ragged_decode_logits_graphs: dict[
-            tuple[int, int, int, bool],
+            tuple[int, int, int, bool, int],
             _StaticRaggedDecodeLogitsGraphCall,
         ] = {}
         self._decode_graph_failed = False
@@ -1788,7 +1952,8 @@ class Llama3TensorParallelForCausalLM:
         if cache.seq_len >= cache.layers[0].max_seq_len:
             raise ValueError("KV cache capacity exceeded")
         attention_block_size = _decode_attention_block_size(cache.seq_len + 1, cache.layers[0].max_seq_len)
-        key = (id(cache), input_ids.size(0), attention_block_size)
+        symm_reduce_key = _symm_mem_allreduce_graph_key(input_ids.size(0), _model_world_size(self))
+        key = (id(cache), input_ids.size(0), attention_block_size, symm_reduce_key)
         captured = self._decode_graphs.get(key)
         needs_capture = (
             captured is None
@@ -1855,7 +2020,8 @@ class Llama3TensorParallelForCausalLM:
             )
             captured.output_token = self._sample_next_token(logits[:, -1, :], 0.0)
         captured.graph.replay()
-        key = (id(cache), input_ids.size(0), attention_block_size)
+        symm_reduce_key = _symm_mem_allreduce_graph_key(input_ids.size(0), _model_world_size(self))
+        key = (id(cache), input_ids.size(0), attention_block_size, symm_reduce_key)
         max_graphs = _tp_int("TORCHINFERNO_CUDAGRAPH_DECODE_STEP_MAX_GRAPHS", 4096, minimum=1)
         if key not in self._decode_graphs and len(self._decode_graphs) >= max_graphs:
             self._decode_graphs.clear()
@@ -1866,7 +2032,8 @@ class Llama3TensorParallelForCausalLM:
         if cache.seq_len >= cache.layers[0].max_seq_len:
             raise ValueError("KV cache capacity exceeded")
         attention_block_size = _decode_attention_block_size(cache.seq_len + 1, cache.layers[0].max_seq_len)
-        key = (id(cache), input_ids.size(0), attention_block_size)
+        symm_reduce_key = _symm_mem_allreduce_graph_key(input_ids.size(0), _model_world_size(self))
+        key = (id(cache), input_ids.size(0), attention_block_size, symm_reduce_key)
         captured = self._decode_logits_graphs.get(key)
         needs_capture = (
             captured is None
@@ -1899,6 +2066,7 @@ class Llama3TensorParallelForCausalLM:
             input_ids.size(0),
             cache.layers[0].max_seq_len,
             row_indices is not None,
+            _symm_mem_allreduce_graph_key(input_ids.size(0), _model_world_size(self)),
         )
         captured = self._ragged_decode_graphs.get(key)
         needs_capture = (
@@ -1931,6 +2099,7 @@ class Llama3TensorParallelForCausalLM:
             input_ids.size(0),
             cache.layers[0].max_seq_len,
             row_indices is not None,
+            _symm_mem_allreduce_graph_key(input_ids.size(0), _model_world_size(self)),
         )
         captured = self._ragged_decode_logits_graphs.get(key)
         needs_capture = (
@@ -1997,6 +2166,7 @@ class Llama3TensorParallelForCausalLM:
             input_ids.size(0),
             cache.layers[0].max_seq_len,
             row_indices is not None,
+            _symm_mem_allreduce_graph_key(input_ids.size(0), _model_world_size(self)),
         )
         max_graphs = _tp_int("TORCHINFERNO_CUDAGRAPH_DECODE_STEP_MAX_GRAPHS", 4096, minimum=1)
         if key not in self._ragged_decode_graphs and len(self._ragged_decode_graphs) >= max_graphs:
@@ -2055,6 +2225,7 @@ class Llama3TensorParallelForCausalLM:
             input_ids.size(0),
             cache.layers[0].max_seq_len,
             row_indices is not None,
+            _symm_mem_allreduce_graph_key(input_ids.size(0), _model_world_size(self)),
         )
         max_graphs = _tp_int("TORCHINFERNO_CUDAGRAPH_DECODE_STEP_MAX_GRAPHS", 4096, minimum=1)
         if key not in self._ragged_decode_logits_graphs and len(self._ragged_decode_logits_graphs) >= max_graphs:
@@ -2135,7 +2306,8 @@ class Llama3TensorParallelForCausalLM:
                 attention_block_size,
             )
         captured.graph.replay()
-        key = (id(cache), input_ids.size(0), attention_block_size)
+        symm_reduce_key = _symm_mem_allreduce_graph_key(input_ids.size(0), _model_world_size(self))
+        key = (id(cache), input_ids.size(0), attention_block_size, symm_reduce_key)
         max_graphs = _tp_int("TORCHINFERNO_CUDAGRAPH_DECODE_STEP_MAX_GRAPHS", 4096, minimum=1)
         if key not in self._decode_logits_graphs and len(self._decode_logits_graphs) >= max_graphs:
             self._decode_logits_graphs.clear()
@@ -2937,6 +3109,7 @@ def _decode_attention_block_size(attention_length: int, max_seq_len: int) -> int
 
 
 def _should_use_symm_mem_all_reduce(hidden: Tensor, weight: Tensor, world_size: int) -> bool:
+    max_batch = _symm_mem_allreduce_max_batch()
     return (
         world_size > 1
         and not _SYMM_REDUCE_DISABLED
@@ -2944,9 +3117,27 @@ def _should_use_symm_mem_all_reduce(hidden: Tensor, weight: Tensor, world_size: 
         and hidden.is_cuda
         and weight.is_cuda
         and hidden.ndim == 3
-        and hidden.size(0) == 1
+        and hidden.size(0) <= max_batch
         and hidden.size(1) == 1
     )
+
+
+def _symm_mem_allreduce_max_batch() -> int:
+    max_batch = _SYMM_MEM_ALLREDUCE_MAX_BATCH_OVERRIDE[0]
+    if max_batch is not None:
+        return max_batch
+    return _tp_int("TORCHINFERNO_SYMM_MEM_ALLREDUCE_MAX_BATCH", 1, minimum=1)
+
+
+def _symm_mem_allreduce_graph_key(batch_size: int, world_size: int) -> int:
+    if world_size <= 1 or _SYMM_REDUCE_DISABLED or not _tp_flag("TORCHINFERNO_SYMM_MEM_ALLREDUCE"):
+        return 0
+    max_batch = _symm_mem_allreduce_max_batch()
+    return max_batch if batch_size <= max_batch else 0
+
+
+def _model_world_size(model: object) -> int:
+    return int(getattr(model, "world_size", 1))
 
 
 def _should_use_symm_mem_prefill_all_reduce(hidden: Tensor, weight: Tensor, world_size: int) -> bool:
