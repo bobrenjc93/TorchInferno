@@ -19,6 +19,7 @@ from torchinferno.openai_http import (
     _chat_completion_chunk_bytes,
     _chat_completion_chunk_prefix,
     _chat_delta_content,
+    _chunked_stream_enabled,
     _stream_inline_enabled,
     enable_tcp_nodelay,
 )
@@ -179,6 +180,31 @@ def test_openai_handler_writes_sse_comment() -> None:
     assert writer.write_calls == 1
     assert writer.payload == b": heartbeat\n\n"
     assert writer.flush_calls == 1
+
+
+def test_openai_handler_writes_chunked_sse_frame() -> None:
+    handler = object.__new__(OpenAIHandler)
+    writer = _CountingWriter()
+    handler.wfile = writer
+    handler._chunked_sse = True
+    handler.close_connection = False
+
+    handler._write_sse_comment("heartbeat")
+    handler._try_write_done()
+    handler._finish_sse_response()
+
+    assert writer.payload == b"d\r\n: heartbeat\n\n\r\ne\r\ndata: [DONE]\n\n\r\n0\r\n\r\n"
+    assert handler.close_connection is False
+
+
+def test_openai_chunked_stream_requires_http11(monkeypatch) -> None:
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_HTTP_CHUNKED_STREAM", raising=False)
+
+    assert _chunked_stream_enabled("HTTP/1.1")
+    assert not _chunked_stream_enabled("HTTP/1.0")
+
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_HTTP_CHUNKED_STREAM", "0")
+    assert not _chunked_stream_enabled("HTTP/1.1")
 
 
 def test_openai_handler_enables_tcp_nodelay() -> None:

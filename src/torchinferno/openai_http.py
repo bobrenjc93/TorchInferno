@@ -20,6 +20,7 @@ from torchinferno.runtime.options import env_flag, env_float
 
 
 class OpenAIHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
     server_version = "TorchInfernoOpenAI/0.1"
 
     def setup(self) -> None:
@@ -85,7 +86,13 @@ class OpenAIHandler(BaseHTTPRequestHandler):
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
-            self.send_header("Connection", "close")
+            chunked_stream = _chunked_stream_enabled(getattr(self, "request_version", "HTTP/1.0"))
+            if chunked_stream:
+                self.send_header("Transfer-Encoding", "chunked")
+                self.send_header("Connection", "keep-alive")
+            else:
+                self.send_header("Connection", "close")
+            self._chunked_sse = chunked_stream
             self.end_headers()
         except OSError:
             self.close_connection = True
@@ -117,7 +124,7 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                 )
             if client_open:
                 self._try_write_done()
-            self.close_connection = True
+            self._finish_sse_response()
             return
 
         token_queue: "queue.Queue[object]" = queue.Queue()
@@ -167,11 +174,10 @@ class OpenAIHandler(BaseHTTPRequestHandler):
             )
         if client_open:
             self._try_write_done()
-        self.close_connection = True
+        self._finish_sse_response()
 
     def _write_sse_comment(self, comment: str) -> None:
-        self.wfile.write(b": " + comment.encode("utf-8") + b"\n\n")
-        self.wfile.flush()
+        self._write_sse_bytes(b": " + comment.encode("utf-8") + b"\n\n")
 
     def _try_write_sse_comment(self, comment: str) -> bool:
         try:
@@ -198,7 +204,10 @@ class OpenAIHandler(BaseHTTPRequestHandler):
         self.wfile.flush()
 
     def _write_sse_bytes(self, payload: bytes) -> None:
-        self.wfile.write(payload)
+        if getattr(self, "_chunked_sse", False):
+            self.wfile.write(f"{len(payload):x}\r\n".encode("ascii") + payload + b"\r\n")
+        else:
+            self.wfile.write(payload)
         self.wfile.flush()
 
     def _try_write_sse(self, payload: dict[str, object]) -> bool:
@@ -225,12 +234,23 @@ class OpenAIHandler(BaseHTTPRequestHandler):
 
     def _try_write_done(self) -> bool:
         try:
-            self.wfile.write(b"data: [DONE]\n\n")
-            self.wfile.flush()
+            self._write_sse_bytes(b"data: [DONE]\n\n")
             return True
         except OSError:
             self.close_connection = True
             return False
+
+    def _finish_sse_response(self) -> None:
+        if getattr(self, "_chunked_sse", False):
+            try:
+                self.wfile.write(b"0\r\n\r\n")
+                self.wfile.flush()
+            except OSError:
+                self.close_connection = True
+            finally:
+                self._chunked_sse = False
+            return
+        self.close_connection = True
 
 
 def enable_tcp_nodelay(connection: object) -> None:
@@ -285,3 +305,7 @@ def _chat_completion_chunk_bytes(
 def _stream_inline_enabled(*, max_tokens: int, temperature: float) -> bool:
     del max_tokens, temperature
     return env_flag("TORCHINFERNO_OPENAI_STREAM_INLINE", True)
+
+
+def _chunked_stream_enabled(request_version: str) -> bool:
+    return request_version == "HTTP/1.1" and env_flag("TORCHINFERNO_OPENAI_HTTP_CHUNKED_STREAM", True)
