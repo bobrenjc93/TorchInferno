@@ -6,6 +6,7 @@ import socket
 import threading
 import time
 import uuid
+from functools import lru_cache
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
@@ -285,6 +286,7 @@ def _chat_completion_chunk_prefix(completion_id: str, model_id: str, created: in
     )
 
 
+@lru_cache(maxsize=8192)
 def _chat_delta_content(content: str) -> bytes:
     return b'{"content":' + json.dumps(content, separators=(",", ":")).encode("utf-8") + b"}"
 
