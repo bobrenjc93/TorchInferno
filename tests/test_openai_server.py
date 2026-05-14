@@ -21,6 +21,7 @@ from torchinferno.openai_http import (
     _chat_completion_chunk_prefix,
     _chat_delta_content,
     _chunked_stream_enabled,
+    _stream_defer_role_enabled,
     _stream_inline_enabled,
     enable_tcp_nodelay,
 )
@@ -628,6 +629,21 @@ def test_openai_stream_inline_defaults_on(monkeypatch) -> None:
 
     monkeypatch.setenv("TORCHINFERNO_OPENAI_STREAM_INLINE", "1")
     assert _stream_inline_enabled(max_tokens=1024, temperature=0.0)
+
+
+def test_openai_stream_defer_role_defaults_to_bounded_streams(monkeypatch) -> None:
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_STREAM_DEFER_ROLE", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_STREAM_DEFER_ROLE_MAX_TOKENS", raising=False)
+
+    assert _stream_defer_role_enabled(max_tokens=256, temperature=0.0)
+    assert _stream_defer_role_enabled(max_tokens=400, temperature=0.7)
+    assert not _stream_defer_role_enabled(max_tokens=512, temperature=0.0)
+
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_STREAM_DEFER_ROLE_MAX_TOKENS", "512")
+    assert _stream_defer_role_enabled(max_tokens=512, temperature=0.0)
+
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_STREAM_DEFER_ROLE", "0")
+    assert not _stream_defer_role_enabled(max_tokens=256, temperature=0.0)
 
 
 def test_openai_engine_microbatches_same_shape_requests() -> None:

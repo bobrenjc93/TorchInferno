@@ -17,7 +17,7 @@ from torchinferno.server.openai_protocol import (
     model_list_response,
     parse_chat_completion_request,
 )
-from torchinferno.runtime.options import env_flag, env_float
+from torchinferno.runtime.options import env_flag, env_float, env_int
 
 
 class OpenAIHandler(BaseHTTPRequestHandler):
@@ -98,10 +98,15 @@ class OpenAIHandler(BaseHTTPRequestHandler):
         except OSError:
             self.close_connection = True
             return
-        client_open = self._try_write_chat_completion_chunk(
-            chunk_prefix,
-            _CHAT_DELTA_ROLE,
-        )
+        defer_role = _stream_defer_role_enabled(max_tokens=max_tokens, temperature=temperature)
+        client_open = True
+        role_sent = False
+        if not defer_role:
+            client_open = self._try_write_chat_completion_chunk(
+                chunk_prefix,
+                _CHAT_DELTA_ROLE,
+            )
+            role_sent = client_open
         if _stream_inline_enabled(max_tokens=max_tokens, temperature=temperature):
             for token_id in engine.generate_chat_tokens(
                 messages,
@@ -113,10 +118,22 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                 content = engine.tokenizer.decode_token(int(token_id))
                 if not content:
                     continue
+                delta = (
+                    _chat_delta_role_content(content)
+                    if not role_sent
+                    else _chat_delta_content(content)
+                )
+                role_sent = True
                 client_open = self._try_write_chat_completion_chunk(
                     chunk_prefix,
-                    _chat_delta_content(content),
+                    delta,
                 )
+            if client_open:
+                if not role_sent:
+                    client_open = self._try_write_chat_completion_chunk(
+                        chunk_prefix,
+                        _CHAT_DELTA_ROLE,
+                    )
             if client_open:
                 client_open = self._try_write_chat_completion_chunk(
                     chunk_prefix,
@@ -163,10 +180,22 @@ class OpenAIHandler(BaseHTTPRequestHandler):
             content = engine.tokenizer.decode_token(int(item))
             if not content:
                 continue
+            delta = (
+                _chat_delta_role_content(content)
+                if not role_sent
+                else _chat_delta_content(content)
+            )
+            role_sent = True
             client_open = self._try_write_chat_completion_chunk(
                 chunk_prefix,
-                _chat_delta_content(content),
+                delta,
             )
+        if client_open:
+            if not role_sent:
+                client_open = self._try_write_chat_completion_chunk(
+                    chunk_prefix,
+                    _CHAT_DELTA_ROLE,
+                )
         if client_open:
             client_open = self._try_write_chat_completion_chunk(
                 chunk_prefix,
@@ -291,6 +320,11 @@ def _chat_delta_content(content: str) -> bytes:
     return b'{"content":' + json.dumps(content, separators=(",", ":")).encode("utf-8") + b"}"
 
 
+@lru_cache(maxsize=8192)
+def _chat_delta_role_content(content: str) -> bytes:
+    return b'{"role":"assistant","content":' + json.dumps(content, separators=(",", ":")).encode("utf-8") + b"}"
+
+
 def _chat_completion_chunk_bytes(
     chunk_prefix: bytes,
     delta_json: bytes,
@@ -307,6 +341,14 @@ def _chat_completion_chunk_bytes(
 def _stream_inline_enabled(*, max_tokens: int, temperature: float) -> bool:
     del max_tokens, temperature
     return env_flag("TORCHINFERNO_OPENAI_STREAM_INLINE", True)
+
+
+def _stream_defer_role_enabled(*, max_tokens: int, temperature: float) -> bool:
+    del temperature
+    if not env_flag("TORCHINFERNO_OPENAI_STREAM_DEFER_ROLE", True):
+        return False
+    max_defer_tokens = env_int("TORCHINFERNO_OPENAI_STREAM_DEFER_ROLE_MAX_TOKENS", 400, minimum=1)
+    return max_tokens <= max_defer_tokens
 
 
 def _chunked_stream_enabled(request_version: str) -> bool:
