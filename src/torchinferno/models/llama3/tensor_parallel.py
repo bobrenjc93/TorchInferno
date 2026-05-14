@@ -2528,6 +2528,21 @@ class Llama3TensorParallelForCausalLM:
         if logits.size(0) != 1:
             expanded = logits.expand(batch_size, logits.size(-1)).contiguous()
             return self._sample_next_token(expanded, temperature)
+        repeated_gumbel_min_batch = _tp_int(
+            "TORCHINFERNO_TEMPERATURE_SAMPLE_REPEATED_GUMBEL_MIN_BATCH",
+            128,
+            minimum=1,
+        )
+        if (
+            batch_size >= repeated_gumbel_min_batch
+            and _tp_flag("TORCHINFERNO_TEMPERATURE_SAMPLE_REPEATED_GUMBEL", True)
+        ):
+            try:
+                return self._sample_next_token_temperature_repeated_gumbel(logits, batch_size, temperature)
+            except Exception as exc:
+                warn_optional_failure("llama3_tensor_parallel.temperature_sample_repeated_gumbel", exc)
+                if _tp_flag("TORCHINFERNO_TEMPERATURE_SAMPLE_REPEATED_GUMBEL_STRICT", False):
+                    raise
         if not dist.is_available() or not dist.is_initialized():
             cumulative = torch.cumsum(torch.softmax(logits.float() / temperature, dim=-1)[0], dim=-1).contiguous()
             threshold = torch.rand((batch_size,), dtype=cumulative.dtype, device=logits.device) * cumulative[-1]
@@ -2698,6 +2713,31 @@ class Llama3TensorParallelForCausalLM:
         )
         dist.all_reduce(local_token, op=dist.ReduceOp.SUM)
         return local_token
+
+    def _sample_next_token_temperature_repeated_gumbel(
+        self,
+        logits: Tensor,
+        batch_size: int,
+        temperature: float,
+    ) -> Tensor:
+        if not dist.is_available() or not dist.is_initialized():
+            cumulative = torch.cumsum(torch.softmax(logits.float() / temperature, dim=-1)[0], dim=-1).contiguous()
+            threshold = torch.rand((batch_size,), dtype=cumulative.dtype, device=logits.device) * cumulative[-1]
+            return torch.searchsorted(cumulative, threshold)
+        logits_float = logits.float() / temperature
+        gumbel = -torch.empty(
+            (batch_size, logits_float.size(-1)),
+            dtype=logits_float.dtype,
+            device=logits_float.device,
+        ).exponential_(generator=self._temperature_gumbel_generator(logits.device)).log()
+        local_values, local_indices = torch.max(logits_float.expand_as(gumbel) + gumbel, dim=-1)
+        global_values = local_values.clone()
+        dist.all_reduce(global_values, op=dist.ReduceOp.MAX)
+        sentinel = torch.full_like(local_indices, self.config.vocab_size)
+        local_tokens = local_indices + self.vocab_start
+        next_token = torch.where(local_values == global_values, local_tokens, sentinel)
+        dist.all_reduce(next_token, op=dist.ReduceOp.MIN)
+        return next_token
 
     def _gather_logits(self, logits: Tensor) -> Tensor:
         if not dist.is_available() or not dist.is_initialized():
