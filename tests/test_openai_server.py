@@ -22,6 +22,7 @@ from torchinferno.openai_http import (
     _chat_completion_chunk_prefix,
     _chat_delta_content,
     _chunked_stream_enabled,
+    _fast_stream_end_bytes,
     _stream_defer_role_enabled,
     _stream_inline_enabled,
     enable_tcp_nodelay,
@@ -206,6 +207,20 @@ def test_openai_handler_writes_chunked_sse_frame() -> None:
 
     assert writer.payload == b"d\r\n: heartbeat\n\n\r\ne\r\ndata: [DONE]\n\n\r\n0\r\n\r\n"
     assert handler.close_connection is False
+
+
+def test_openai_fast_stream_end_bytes_coalesce_final_frames() -> None:
+    prefix = _chat_completion_chunk_prefix("chatcmpl-test", "test-model", 123)
+
+    plain = _fast_stream_end_bytes(prefix, include_role=False, chunked=False)
+    assert plain.endswith(b'data: [DONE]\n\n')
+    assert b'"finish_reason":"stop"' in plain
+    assert b'0\r\n\r\n' not in plain
+
+    chunked = _fast_stream_end_bytes(prefix, include_role=True, chunked=True)
+    assert chunked.endswith(b'0\r\n\r\n')
+    assert b'{"role":"assistant"}' in chunked
+    assert b'data: [DONE]\n\n' in chunked
 
 
 def test_openai_chunked_stream_requires_http11(monkeypatch) -> None:

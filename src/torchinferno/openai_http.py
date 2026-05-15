@@ -531,21 +531,15 @@ def _stream_fast_chat(
         delta = _chat_delta_role_content(content) if not role_sent else _chat_delta_content(content)
         role_sent = True
         client_open = _try_send_fast_chat_chunk(connection, chunk_prefix, delta, chunked=keep_alive)
-    if client_open and not role_sent:
-        client_open = _try_send_fast_chat_chunk(connection, chunk_prefix, _CHAT_DELTA_ROLE, chunked=keep_alive)
-    if client_open:
-        client_open = _try_send_fast_chat_chunk(
-            connection,
-            chunk_prefix,
-            _CHAT_DELTA_EMPTY,
-            finish_reason="stop",
-            chunked=keep_alive,
-        )
     if client_open:
         try:
-            _send_fast_sse_bytes(connection, b"data: [DONE]\n\n", chunked=keep_alive)
-            if keep_alive:
-                connection.sendall(b"0\r\n\r\n")
+            connection.sendall(
+                _fast_stream_end_bytes(
+                    chunk_prefix,
+                    include_role=not role_sent,
+                    chunked=keep_alive,
+                )
+            )
         except OSError:
             return
 
@@ -570,10 +564,39 @@ def _try_send_fast_chat_chunk(
 
 
 def _send_fast_sse_bytes(connection: socket.socket, payload: bytes, *, chunked: bool) -> None:
+    connection.sendall(_fast_sse_bytes(payload, chunked=chunked))
+
+
+def _fast_sse_bytes(payload: bytes, *, chunked: bool) -> bytes:
     if chunked:
-        connection.sendall(f"{len(payload):x}\r\n".encode("ascii") + payload + b"\r\n")
-        return
-    connection.sendall(payload)
+        return f"{len(payload):x}\r\n".encode("ascii") + payload + b"\r\n"
+    return payload
+
+
+def _fast_stream_end_bytes(
+    chunk_prefix: bytes,
+    *,
+    include_role: bool,
+    chunked: bool,
+) -> bytes:
+    chunks: list[bytes] = []
+    if include_role:
+        chunks.append(
+            _fast_sse_bytes(
+                _chat_completion_chunk_bytes(chunk_prefix, _CHAT_DELTA_ROLE, None),
+                chunked=chunked,
+            )
+        )
+    chunks.append(
+        _fast_sse_bytes(
+            _chat_completion_chunk_bytes(chunk_prefix, _CHAT_DELTA_EMPTY, "stop"),
+            chunked=chunked,
+        )
+    )
+    chunks.append(_fast_sse_bytes(b"data: [DONE]\n\n", chunked=chunked))
+    if chunked:
+        chunks.append(b"0\r\n\r\n")
+    return b"".join(chunks)
 
 
 def _fast_response_headers(
