@@ -2071,16 +2071,17 @@ class OpenAICompletionEngine:
             pool=_identical_prompt_cache_pool_enabled(model, temperature),
         )
         cache_materialized = True
+        cache_materialized_input_ids = input_ids
 
         def ensure_cache_materialized() -> None:
             nonlocal cache, cache_materialized
             if cache_materialized:
                 return
-            restored = self._restore_exact_prefix_cache(input_ids, cache)
-            if restored != input_ids.size(1):
+            restored = self._restore_exact_prefix_cache(cache_materialized_input_ids, cache)
+            if restored != cache_materialized_input_ids.size(1):
                 cache = _prefill_cache_only(
                     model,
-                    input_ids,
+                    cache_materialized_input_ids,
                     cache,
                     allow_capture=_runtime_prefill_graph_capture_enabled(
                         model,
@@ -2113,6 +2114,7 @@ class OpenAICompletionEngine:
                     temperature,
                 )
                 cache_materialized = False
+                cache_materialized_input_ids = input_ids
         else:
             next_token, cache = _prefill_repeated_prefix_next_token(
                 model,
@@ -2159,7 +2161,7 @@ class OpenAICompletionEngine:
                         (input_ids, input_ids.new_tensor([[uniform_token]])),
                         dim=1,
                     )
-                    cached_logits = self._restore_exact_prompt_logits(extended_input_ids, cache)
+                    cached_logits = self._restore_exact_prompt_logits(extended_input_ids, cache, restore_cache=False)
                     if cached_logits is not None:
                         next_token = _sample_repeated_prefix_logits(
                             model,
@@ -2167,8 +2169,8 @@ class OpenAICompletionEngine:
                             decode_batch_size,
                             temperature,
                         )
-                        cache_materialized = True
-                        _repeat_generation_cache_first_batch(cache, decode_batch_size)
+                        cache_materialized = False
+                        cache_materialized_input_ids = extended_input_ids
                     else:
                         ensure_cache_materialized()
                         decode_input = next_token.new_tensor([[uniform_token]])
