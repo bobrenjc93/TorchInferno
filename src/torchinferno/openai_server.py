@@ -34,6 +34,7 @@ from torchinferno.engine.loader import (
     should_reexec_distributed_server as _engine_should_reexec_distributed_server,
 )
 from torchinferno.openai_http import (
+    FastOpenAIHTTPServer as _FastOpenAIServer,
     OpenAIHTTPServer as _OpenAIServer,
 )
 from torchinferno.openai_warmup import (
@@ -3630,7 +3631,8 @@ def serve(config: OpenAIServerConfig) -> None:
     if _is_tensor_parallel_worker_model(engine.model):
         _tensor_parallel_worker_loop(engine)
         return
-    server = _OpenAIServer((config.host, config.port), engine)
+    server_cls = _FastOpenAIServer if env_flag("TORCHINFERNO_OPENAI_FAST_HTTP", True) else _OpenAIServer
+    server = server_cls((config.host, config.port), engine)
     print(
         f"TorchInferno OpenAI server listening on http://{config.host}:{server.server_port}/v1 "
         f"model={config.model}",
@@ -3639,6 +3641,7 @@ def serve(config: OpenAIServerConfig) -> None:
     try:
         server.serve_forever()
     finally:
+        server.server_close()
         engine.close()
 
 

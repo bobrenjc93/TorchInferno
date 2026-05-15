@@ -3,9 +3,11 @@ from __future__ import annotations
 import json
 import queue
 import socket
+import sys
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -298,9 +300,306 @@ class OpenAIHTTPServer(ThreadingHTTPServer):
         super().__init__(server_address, OpenAIHandler)
         self.engine = engine
 
+    def handle_error(self, request: object, client_address: object) -> None:
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (BrokenPipeError, ConnectionAbortedError, ConnectionResetError, TimeoutError)):
+            return
+        super().handle_error(request, client_address)
+
+
+class FastOpenAIHTTPServer:
+    request_queue_size = 512
+
+    def __init__(self, server_address: tuple[str, int], engine: object) -> None:
+        self.engine = engine
+        self._closed = threading.Event()
+        self._executor = ThreadPoolExecutor(
+            max_workers=env_int("TORCHINFERNO_OPENAI_HTTP_WORKERS", 256, minimum=1),
+            thread_name_prefix="torchinferno-openai-http",
+        )
+        self._socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._socket.bind(server_address)
+        self._socket.listen(self.request_queue_size)
+        self._socket.settimeout(0.5)
+        self.server_address = self._socket.getsockname()
+        self.server_port = int(self.server_address[1])
+
+    def serve_forever(self) -> None:
+        while not self._closed.is_set():
+            try:
+                connection, client_address = self._socket.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                if self._closed.is_set():
+                    return
+                raise
+            self._executor.submit(self._handle_connection, connection, client_address)
+
+    def shutdown(self) -> None:
+        self._closed.set()
+        try:
+            self._socket.close()
+        except OSError:
+            pass
+
+    def server_close(self) -> None:
+        self.shutdown()
+        self._executor.shutdown(wait=True, cancel_futures=True)
+
+    def _handle_connection(self, connection: socket.socket, client_address: object) -> None:
+        del client_address
+        with connection:
+            enable_tcp_nodelay(connection)
+            connection.settimeout(
+                env_float("TORCHINFERNO_OPENAI_FAST_HTTP_IDLE_TIMEOUT_SECONDS", 0.25, minimum=0.05)
+            )
+            buffer = bytearray()
+            keepalive_enabled = env_flag("TORCHINFERNO_OPENAI_FAST_HTTP_KEEPALIVE", True)
+            while not self._closed.is_set():
+                try:
+                    request = _read_fast_http_request(connection, buffer)
+                    if request is None:
+                        return
+                    method, path, headers, body = request
+                    request_close = headers.get("connection", "").lower() == "close"
+                    keep_alive = keepalive_enabled and not request_close
+                    self._handle_request(connection, method, path, body, keep_alive=keep_alive)
+                    if not keep_alive:
+                        return
+                except socket.timeout:
+                    return
+                except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError, TimeoutError):
+                    return
+                except (ValueError, json.JSONDecodeError) as exc:
+                    _send_fast_json(connection, error_response(str(exc), exc.__class__.__name__), status=400)
+                    return
+                except Exception as exc:
+                    _send_fast_json(connection, error_response(str(exc), exc.__class__.__name__), status=500)
+                    return
+
+    def _handle_request(
+        self,
+        connection: socket.socket,
+        method: str,
+        path: str,
+        body: bytes,
+        *,
+        keep_alive: bool,
+    ) -> None:
+        route = path.partition("?")[0]
+        if method == "GET" and route == "/health":
+            _send_fast_json(connection, {"status": "ok"}, connection_close=not keep_alive)
+            return
+        if method == "GET" and route == "/v1/models":
+            _send_fast_json(connection, model_list_response(self.engine.model_id), connection_close=not keep_alive)
+            return
+        if method != "POST" or route != "/v1/chat/completions":
+            _send_fast_json(
+                connection,
+                error_response("not found", "NotFoundError"),
+                status=404,
+                connection_close=not keep_alive,
+            )
+            return
+        payload = json.loads(body.decode("utf-8"))
+        request = parse_chat_completion_request(payload)
+        if request.stream:
+            _stream_fast_chat(
+                connection,
+                self.engine,
+                request.messages,
+                max_tokens=request.max_tokens,
+                temperature=request.temperature,
+                keep_alive=keep_alive,
+            )
+            return
+        completion = self.engine.complete_chat(
+            request.messages,
+            max_tokens=request.max_tokens,
+            temperature=request.temperature,
+        )
+        content = self.engine.tokenizer.decode(completion.tokens)
+        _send_fast_json(
+            connection,
+            chat_completion_response(
+                model_id=self.engine.model_id,
+                content=content,
+                prompt_tokens=completion.prompt_tokens,
+                completion_tokens=len(completion.tokens),
+            ),
+            connection_close=not keep_alive,
+        )
+
 
 _CHAT_DELTA_ROLE = b'{"role":"assistant"}'
 _CHAT_DELTA_EMPTY = b"{}"
+
+_FAST_HEADER_LIMIT = 65536
+
+
+def _read_fast_http_request(
+    connection: socket.socket,
+    buffer: bytearray,
+) -> tuple[str, str, dict[str, str], bytes] | None:
+    while b"\r\n\r\n" not in buffer:
+        chunk = connection.recv(65536)
+        if not chunk:
+            return None
+        buffer.extend(chunk)
+        if len(buffer) > _FAST_HEADER_LIMIT and b"\r\n\r\n" not in buffer:
+            raise ValueError("HTTP request headers are too large")
+    header_end = bytes(buffer).index(b"\r\n\r\n")
+    header_bytes = bytes(buffer[:header_end])
+    del buffer[:header_end + 4]
+    lines = header_bytes.decode("iso-8859-1").split("\r\n")
+    request_line = lines[0].split()
+    if len(request_line) != 3:
+        raise ValueError("malformed HTTP request line")
+    method, path, _version = request_line
+    headers: dict[str, str] = {}
+    for line in lines[1:]:
+        name, separator, value = line.partition(":")
+        if separator:
+            headers[name.strip().lower()] = value.strip()
+    content_length = int(headers.get("content-length", "0"))
+    while len(buffer) < content_length:
+        chunk = connection.recv(min(65536, content_length - len(buffer)))
+        if not chunk:
+            raise ConnectionResetError("client disconnected before request body completed")
+        buffer.extend(chunk)
+    body = bytes(buffer[:content_length])
+    del buffer[:content_length]
+    return method, path, headers, body
+
+
+def _send_fast_json(
+    connection: socket.socket,
+    payload: dict[str, object],
+    *,
+    status: int = 200,
+    connection_close: bool = True,
+) -> None:
+    body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    headers = _fast_response_headers(
+        status,
+        "application/json",
+        content_length=len(body),
+        connection_close=connection_close,
+    )
+    connection.sendall(headers + body)
+
+
+def _stream_fast_chat(
+    connection: socket.socket,
+    engine: Any,
+    messages: list[dict[str, object]],
+    *,
+    max_tokens: int,
+    temperature: float,
+    keep_alive: bool = False,
+) -> None:
+    completion_id = f"chatcmpl-{uuid.uuid4().hex}"
+    created = int(time.time())
+    chunk_prefix = _chat_completion_chunk_prefix(completion_id, engine.model_id, created)
+    connection.sendall(
+        _fast_response_headers(
+            200,
+            "text/event-stream",
+            chunked=keep_alive,
+            extra_headers=((b"Cache-Control", b"no-cache"),),
+            connection_close=not keep_alive,
+        )
+    )
+    defer_role = _stream_defer_role_enabled(max_tokens=max_tokens, temperature=temperature)
+    client_open = True
+    role_sent = False
+    if not defer_role:
+        client_open = _try_send_fast_chat_chunk(connection, chunk_prefix, _CHAT_DELTA_ROLE, chunked=keep_alive)
+        role_sent = client_open
+    for token_id in engine.generate_chat_tokens(
+        messages,
+        max_tokens=max_tokens,
+        temperature=temperature,
+    ):
+        if not client_open:
+            continue
+        content = engine.tokenizer.decode_token(int(token_id))
+        if not content:
+            continue
+        delta = _chat_delta_role_content(content) if not role_sent else _chat_delta_content(content)
+        role_sent = True
+        client_open = _try_send_fast_chat_chunk(connection, chunk_prefix, delta, chunked=keep_alive)
+    if client_open and not role_sent:
+        client_open = _try_send_fast_chat_chunk(connection, chunk_prefix, _CHAT_DELTA_ROLE, chunked=keep_alive)
+    if client_open:
+        client_open = _try_send_fast_chat_chunk(
+            connection,
+            chunk_prefix,
+            _CHAT_DELTA_EMPTY,
+            finish_reason="stop",
+            chunked=keep_alive,
+        )
+    if client_open:
+        try:
+            _send_fast_sse_bytes(connection, b"data: [DONE]\n\n", chunked=keep_alive)
+            if keep_alive:
+                connection.sendall(b"0\r\n\r\n")
+        except OSError:
+            return
+
+
+def _try_send_fast_chat_chunk(
+    connection: socket.socket,
+    chunk_prefix: bytes,
+    delta_json: bytes,
+    *,
+    finish_reason: str | None = None,
+    chunked: bool = False,
+) -> bool:
+    try:
+        _send_fast_sse_bytes(
+            connection,
+            _chat_completion_chunk_bytes(chunk_prefix, delta_json, finish_reason),
+            chunked=chunked,
+        )
+        return True
+    except OSError:
+        return False
+
+
+def _send_fast_sse_bytes(connection: socket.socket, payload: bytes, *, chunked: bool) -> None:
+    if chunked:
+        connection.sendall(f"{len(payload):x}\r\n".encode("ascii") + payload + b"\r\n")
+        return
+    connection.sendall(payload)
+
+
+def _fast_response_headers(
+    status: int,
+    content_type: str,
+    *,
+    content_length: int | None = None,
+    chunked: bool = False,
+    extra_headers: tuple[tuple[bytes, bytes], ...] = (),
+    connection_close: bool,
+) -> bytes:
+    reason = HTTPStatus(status).phrase if status in HTTPStatus._value2member_map_ else "OK"
+    headers = [
+        f"HTTP/1.1 {status} {reason}\r\n".encode("ascii"),
+        b"Server: TorchInfernoOpenAI/0.1\r\n",
+        b"Content-Type: " + content_type.encode("ascii") + b"\r\n",
+    ]
+    if content_length is not None:
+        headers.append(b"Content-Length: " + str(content_length).encode("ascii") + b"\r\n")
+    if chunked:
+        headers.append(b"Transfer-Encoding: chunked\r\n")
+    for name, value in extra_headers:
+        headers.append(name + b": " + value + b"\r\n")
+    headers.append(b"Connection: close\r\n" if connection_close else b"Connection: keep-alive\r\n")
+    headers.append(b"\r\n")
+    return b"".join(headers)
 
 
 def _chat_completion_chunk_prefix(completion_id: str, model_id: str, created: int) -> bytes:

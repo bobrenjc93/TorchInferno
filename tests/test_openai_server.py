@@ -17,6 +17,7 @@ import torch
 
 from torchinferno.openai_http import (
     OpenAIHandler,
+    OpenAIHTTPServer,
     _chat_completion_chunk_bytes,
     _chat_completion_chunk_prefix,
     _chat_delta_content,
@@ -215,6 +216,19 @@ def test_openai_chunked_stream_requires_http11(monkeypatch) -> None:
 
     monkeypatch.setenv("TORCHINFERNO_OPENAI_HTTP_CHUNKED_STREAM", "0")
     assert not _chunked_stream_enabled("HTTP/1.1")
+
+
+def test_openai_http_server_suppresses_disconnect_tracebacks(capsys) -> None:
+    server = object.__new__(OpenAIHTTPServer)
+
+    try:
+        raise ConnectionResetError("client disconnected")
+    except ConnectionResetError:
+        server.handle_error(object(), ("127.0.0.1", 12345))
+
+    captured = capsys.readouterr()
+    assert "client disconnected" not in captured.err
+    assert "Exception occurred during processing" not in captured.err
 
 
 def test_openai_handler_enables_tcp_nodelay() -> None:
