@@ -1080,6 +1080,25 @@ def test_openai_prompt_prefix_cache_rows_respect_row_token_cap(monkeypatch) -> N
     assert engine._exact_prefix_cache_entry((10, 11, 12)) is not None
 
 
+def test_openai_prompt_prefix_cache_rows_default_to_short_row_cap(monkeypatch) -> None:
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_PREFIX_CACHE_MAX_TOKENS", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_PREFIX_CACHE_ROW_MAX_TOKENS", raising=False)
+    model = _PrefixRecordingModel()
+    engine = _cache_only_engine()
+    engine.model = model
+
+    cache = model.allocate_cache(1, 32)
+    short_prompt = list(range(16))
+    long_prompt = list(range(17))
+    model.forward(torch.tensor([long_prompt], dtype=torch.long), cache=cache, use_cache=True)
+
+    engine._save_prompt_prefix_cache_rows([short_prompt], cache)
+    assert engine._exact_prefix_cache_entry(tuple(short_prompt)) is not None
+
+    engine._save_prompt_prefix_cache_rows([long_prompt], cache)
+    assert engine._exact_prefix_cache_entry(tuple(long_prompt)) is None
+
+
 def test_openai_prompt_list_batch_restores_cached_prefix_rows(monkeypatch) -> None:
     monkeypatch.setenv("TORCHINFERNO_OPENAI_PREFIX_CACHE_MIN_TOKENS", "1")
     monkeypatch.setenv("TORCHINFERNO_OPENAI_PREFIX_CACHE_BATCH_RESTORE", "1")

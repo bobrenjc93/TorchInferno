@@ -1277,7 +1277,7 @@ class OpenAICompletionEngine:
         max_tokens = env_int("TORCHINFERNO_OPENAI_PREFIX_CACHE_MAX_TOKENS", 1024, minimum=1)
         row_max_tokens = env_int(
             "TORCHINFERNO_OPENAI_PREFIX_CACHE_ROW_MAX_TOKENS",
-            128,
+            16,
             minimum=1,
         )
         if len(token_tuple) > min(max_tokens, row_max_tokens) or seq_len < len(token_tuple):
