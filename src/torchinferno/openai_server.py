@@ -681,7 +681,7 @@ class OpenAICompletionEngine:
                     minimum=1,
                 )
                 default_short_limit = (
-                    128
+                    64
                     if first.temperature > 0.0
                     else (48 if first.max_tokens >= deterministic_high_token_min else 56)
                 )
