@@ -99,10 +99,12 @@ class _QueuedGeneration:
     stream: bool
     responses: "queue.Queue[object] | queue.SimpleQueue[object]"
     done: bool = False
+    emitted_tokens: int = 0
 
 
 _TENSOR_PARALLEL_CONTROL_GROUP: object | None = None
 _TENSOR_PARALLEL_CONTROL_GROUP_LOCK = threading.Lock()
+_STREAM_NO_TOKEN = object()
 
 
 @dataclass(frozen=True)
@@ -2911,6 +2913,11 @@ class OpenAICompletionEngine:
         if suffix_buckets:
             bucket_states: list[dict[str, object]] = []
             first_tokens: list[int | None] = [None for _ in prompts]
+            early_bucket_stream = (
+                len(suffix_buckets) > 1
+                and _early_shared_prefix_bucket_streaming_enabled(model, self.device)
+            )
+            emitted_first_tokens = False
             for slot, bucket in enumerate(suffix_buckets):
                 state = self._prefill_shared_prefix_prompt_list_suffix_bucket(
                     bucket,
@@ -2930,16 +2937,32 @@ class OpenAICompletionEngine:
                 if not isinstance(original_indices, list) or not isinstance(next_token, Tensor):
                     bucket_states = []
                     break
+                bucket_first_tokens: list[int | None | object] | None = (
+                    [_STREAM_NO_TOKEN for _ in prompts]
+                    if early_bucket_stream
+                    else None
+                )
                 for offset, token_id in enumerate(next_token.detach().cpu().tolist()):
-                    first_tokens[int(original_indices[offset])] = int(token_id)
+                    original_index = int(original_indices[offset])
+                    token = int(token_id)
+                    first_tokens[original_index] = token
+                    if bucket_first_tokens is not None:
+                        bucket_first_tokens[original_index] = token
                 bucket_states.append(state)
-            if bucket_states:
-                yield first_tokens
-                for state in bucket_states:
+                if bucket_first_tokens is not None:
+                    yield bucket_first_tokens
+                    emitted_first_tokens = True
                     cache = state["cache"]
-                    original_indices = state["indices"]
                     if isinstance(original_indices, list):
                         self._save_prompt_prefix_cache_rows(prompts, cache, row_indices=original_indices)
+            if bucket_states:
+                if not emitted_first_tokens:
+                    yield first_tokens
+                    for state in bucket_states:
+                        cache = state["cache"]
+                        original_indices = state["indices"]
+                        if isinstance(original_indices, list):
+                            self._save_prompt_prefix_cache_rows(prompts, cache, row_indices=original_indices)
                 should_continue = max_tokens > 1 and any(
                     isinstance(state["active"], list) and any(state["active"])
                     for state in bucket_states
@@ -4716,6 +4739,16 @@ def _prefer_shared_prefix_dense_group_decode(
     return max((len(group) for group in length_groups), default=0) >= min_group_size
 
 
+def _early_shared_prefix_bucket_streaming_enabled(model: object, device: torch.device) -> bool:
+    if not env_flag("TORCHINFERNO_OPENAI_SHARED_PREFIX_EARLY_BUCKET_STREAM", True):
+        return False
+    return (
+        _is_tensor_parallel_model(model)
+        and _tensor_parallel_world_size(model) > 1
+        and torch.device(device).type == "cuda"
+    )
+
+
 def _prefer_full_batch_ragged_decode(active_count: int, batch_size: int) -> bool:
     if active_count >= batch_size:
         return True
@@ -4894,13 +4927,16 @@ def _queued_groups_by_prompt_length(group: Sequence[_QueuedGeneration]) -> list[
 def _emit_stream_step(
     group: Sequence[_QueuedGeneration],
     step: int,
-    step_tokens: Sequence[int | None],
+    step_tokens: Sequence[int | None | object],
     stop_token_ids: frozenset[int] = frozenset(),
 ) -> None:
+    del step
     for request, token_id in zip(group, step_tokens):
         if request.done:
             continue
-        if step >= request.max_tokens or token_id is None:
+        if token_id is _STREAM_NO_TOKEN:
+            continue
+        if request.emitted_tokens >= request.max_tokens or token_id is None:
             _finish_stream_request(request)
             continue
         token = int(token_id)
@@ -4908,7 +4944,8 @@ def _emit_stream_step(
             _finish_stream_request(request)
             continue
         request.responses.put(token)
-        if step + 1 >= request.max_tokens:
+        request.emitted_tokens += 1
+        if request.emitted_tokens >= request.max_tokens:
             _finish_stream_request(request)
 
 

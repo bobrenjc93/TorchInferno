@@ -40,6 +40,7 @@ from torchinferno.openai_server import (
     _decode_next_token_ragged,
     _distributed_server_command,
     _effective_openai_max_batch_size,
+    _emit_stream_step,
     _identical_prompt_cache_pool_enabled,
     _openai_cuda_graph_enabled_for_model,
     _openai_decode_graph_enabled,
@@ -52,6 +53,7 @@ from torchinferno.openai_server import (
     _should_reexec_distributed_server,
     _sync_tensor_parallel_command,
     _sync_tensor_parallel_continue,
+    _STREAM_NO_TOKEN,
     _tensor_parallel_worker_loop,
     _tp_command_cuda_sync_for_steps,
     _try_decode_ragged_token_graph,
@@ -3672,6 +3674,24 @@ def test_openai_stream_group_finishes_rows_on_stop_token() -> None:
     assert isinstance(first_items[0], _GenerationDone)
     assert second_items[:2] == [201, 202]
     assert captured == [[True, False]]
+
+
+def test_openai_emit_stream_step_can_defer_rows_without_finishing() -> None:
+    first_queue: queue.Queue[object] = queue.Queue()
+    second_queue: queue.Queue[object] = queue.Queue()
+    first = _QueuedGeneration([1, 2], 2, 0.0, True, first_queue)
+    second = _QueuedGeneration([1, 3], 2, 0.0, True, second_queue)
+
+    _emit_stream_step([first, second], 0, [101, _STREAM_NO_TOKEN])
+    _emit_stream_step([first, second], 1, [102, 201])
+    _emit_stream_step([first, second], 2, [None, 202])
+
+    first_items = _queue_items(first_queue)
+    second_items = _queue_items(second_queue)
+    assert first_items[:2] == [101, 102]
+    assert isinstance(first_items[2], _GenerationDone)
+    assert second_items[:2] == [201, 202]
+    assert isinstance(second_items[2], _GenerationDone)
 
 
 def test_openai_completion_group_respects_per_request_max_tokens() -> None:
