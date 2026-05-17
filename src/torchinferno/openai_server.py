@@ -3788,7 +3788,7 @@ def _runtime_prefill_graph_capture_enabled(
     max_tokens: int | None = None,
 ) -> bool:
     if _is_tensor_parallel_model(model) and _tensor_parallel_world_size(model) > 1:
-        if not env_flag("TORCHINFERNO_OPENAI_TP_RUNTIME_PREFILL_CAPTURE"):
+        if not env_flag("TORCHINFERNO_OPENAI_TP_RUNTIME_PREFILL_CAPTURE", True):
             return False
         if temperature > 0.0 and not env_flag(
             "TORCHINFERNO_OPENAI_TP_RUNTIME_TEMPERATURE_PREFILL_CAPTURE",

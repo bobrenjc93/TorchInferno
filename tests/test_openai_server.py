@@ -1779,8 +1779,9 @@ def test_openai_tp_single_prefill_capture_explicit_env_captures_immediately(monk
     assert model.forward_inputs == []
 
 
-def test_openai_tp_runtime_prefill_capture_defaults_off_but_env_can_enable(monkeypatch) -> None:
+def test_openai_tp_runtime_prefill_capture_defaults_on_but_env_can_disable(monkeypatch) -> None:
     model = object()
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_RUNTIME_PREFILL_CAPTURE", raising=False)
     monkeypatch.setattr(
         "torchinferno.openai_server._is_tensor_parallel_model",
         lambda candidate: candidate is model,
@@ -1790,12 +1791,12 @@ def test_openai_tp_runtime_prefill_capture_defaults_off_but_env_can_enable(monke
         lambda candidate: 8 if candidate is model else 1,
     )
 
-    assert not _runtime_prefill_graph_capture_enabled(model, temperature=0.0, max_tokens=512)
-    assert not _runtime_prefill_graph_capture_enabled(model, temperature=0.7, max_tokens=300)
-
-    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_RUNTIME_PREFILL_CAPTURE", "1")
     assert _runtime_prefill_graph_capture_enabled(model, temperature=0.0, max_tokens=512)
     assert _runtime_prefill_graph_capture_enabled(model, temperature=0.7, max_tokens=300)
+
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_RUNTIME_PREFILL_CAPTURE", "0")
+    assert not _runtime_prefill_graph_capture_enabled(model, temperature=0.0, max_tokens=512)
+    assert not _runtime_prefill_graph_capture_enabled(model, temperature=0.7, max_tokens=300)
 
 
 def test_openai_tp_runtime_prefill_capture_overrides_still_apply(monkeypatch) -> None:
@@ -1809,7 +1810,7 @@ def test_openai_tp_runtime_prefill_capture_overrides_still_apply(monkeypatch) ->
         lambda candidate: 8 if candidate is model else 1,
     )
 
-    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_RUNTIME_PREFILL_CAPTURE", "1")
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_RUNTIME_PREFILL_CAPTURE", raising=False)
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_RUNTIME_TEMPERATURE_PREFILL_CAPTURE", "0")
     assert not _runtime_prefill_graph_capture_enabled(model, temperature=0.7, max_tokens=300)
 
