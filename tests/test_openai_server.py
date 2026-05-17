@@ -3426,6 +3426,35 @@ def test_openai_temperature_queue_batch_wait_uses_default_window(monkeypatch) ->
     assert engine._queued_batch_wait_s(long_sampled) == 0.010
 
 
+def test_openai_tp_greedy_medium_stream_skips_queue_batch_wait(monkeypatch) -> None:
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_GREEDY_LOW_LATENCY_MIN_TOKENS", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_GREEDY_LOW_LATENCY_MAX_TOKENS", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_GREEDY_LOW_LATENCY_BATCH_WAIT_MS", raising=False)
+    model = object()
+    engine = _cache_only_engine()
+    engine.model = model
+    engine.device = torch.device("cuda")
+    engine.batch_wait_s = 0.010
+
+    monkeypatch.setattr(
+        "torchinferno.openai_server._is_tensor_parallel_model",
+        lambda candidate: candidate is model,
+    )
+
+    short_stream = _QueuedGeneration([1, 2], 64, 0.0, True, queue.Queue())
+    medium_stream = _QueuedGeneration([1, 2], 256, 0.0, True, queue.Queue())
+    long_stream = _QueuedGeneration([1, 2], 512, 0.0, True, queue.Queue())
+    completion = _QueuedGeneration([1, 2], 256, 0.0, False, queue.Queue())
+
+    assert engine._queued_batch_wait_s(short_stream) == 0.010
+    assert engine._queued_batch_wait_s(medium_stream) == 0.0
+    assert engine._queued_batch_wait_s(long_stream) == 0.010
+    assert engine._queued_batch_wait_s(completion) == 0.010
+
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_GREEDY_LOW_LATENCY_BATCH_WAIT_MS", "3")
+    assert engine._queued_batch_wait_s(medium_stream) == 0.003
+
+
 def test_openai_temperature_queue_batch_wait_respects_env_floor(monkeypatch) -> None:
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TEMPERATURE_BATCH_WAIT_MS", "5")
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TEMPERATURE_BATCH_WAIT_MAX_TOKENS", "512")

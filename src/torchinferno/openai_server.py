@@ -752,6 +752,9 @@ class OpenAICompletionEngine:
 
     def _queued_batch_wait_s(self, first: _QueuedGeneration) -> float:
         if first.temperature <= 0.0:
+            deterministic_wait_s = self._queued_deterministic_stream_batch_wait_s(first)
+            if deterministic_wait_s is not None:
+                return deterministic_wait_s
             return self.batch_wait_s
         max_tokens = env_int("TORCHINFERNO_OPENAI_TEMPERATURE_BATCH_WAIT_MAX_TOKENS", 512, minimum=1)
         if first.max_tokens > max_tokens:
@@ -763,6 +766,28 @@ class OpenAICompletionEngine:
             / 1000.0
         )
         return max(self.batch_wait_s, temperature_wait_s)
+
+    def _queued_deterministic_stream_batch_wait_s(self, first: _QueuedGeneration) -> float | None:
+        if not (
+            first.stream
+            and _is_tensor_parallel_model(getattr(self, "model", None))
+            and getattr(self, "device", torch.device("cpu")).type == "cuda"
+        ):
+            return None
+        min_tokens = env_int(
+            "TORCHINFERNO_OPENAI_TP_GREEDY_LOW_LATENCY_MIN_TOKENS",
+            128,
+            minimum=1,
+        )
+        max_tokens = env_int(
+            "TORCHINFERNO_OPENAI_TP_GREEDY_LOW_LATENCY_MAX_TOKENS",
+            400,
+            minimum=min_tokens,
+        )
+        if not (min_tokens <= first.max_tokens <= max_tokens):
+            return None
+        wait_ms = env_float("TORCHINFERNO_OPENAI_TP_GREEDY_LOW_LATENCY_BATCH_WAIT_MS", 0.0, minimum=0.0)
+        return wait_ms / 1000.0
 
     def _queued_initial_batch_wait_s(self, first: _QueuedGeneration) -> float:
         if not first.stream or first.temperature <= 0.0 or self.max_batch_size <= 1:
