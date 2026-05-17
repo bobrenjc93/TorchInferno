@@ -2144,6 +2144,57 @@ def test_openai_shared_prefix_padded_suffix_prefill_uses_true_lengths(monkeypatc
     assert model.ragged_calls == []
 
 
+def test_openai_shared_prefix_padded_suffix_prefill_can_select_last_real_logits(monkeypatch) -> None:
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_PREFIX_CACHE_MIN_TOKENS", "2")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_SELECTED_PADDED_SUFFIX_LOGITS_MIN_SKIPPED_TOKENS", "1")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_SELECTED_PADDED_SUFFIX_LOGITS_MIN_TOTAL_TOKENS", "1")
+    model = _SelectedTokenEchoSharedPrefixRecordingModel()
+    engine = _cache_only_engine()
+    engine.model = model
+    engine.stop_token_ids = frozenset()
+    engine._prefix_cache_entry = None
+
+    steps = list(
+        engine._generate_prompt_list_batch_steps(
+            [[10, 11, 4, 6], [10, 11, 5]],
+            max_tokens=1,
+            temperature=0.0,
+            broadcast_tensor_parallel=False,
+        )
+    )
+
+    assert steps == [[6, 5]]
+    assert model.forward_inputs == [
+        [[10, 11]],
+        [[4, 6], [5, 0]],
+    ]
+    assert model.selected_logit_positions == [[1, 0]]
+
+
+def test_openai_shared_prefix_padded_suffix_selected_logits_can_be_disabled(monkeypatch) -> None:
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_PREFIX_CACHE_MIN_TOKENS", "2")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_SELECTED_PADDED_SUFFIX_LOGITS", "0")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_SELECTED_PADDED_SUFFIX_LOGITS_MIN_SKIPPED_TOKENS", "1")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_SELECTED_PADDED_SUFFIX_LOGITS_MIN_TOTAL_TOKENS", "1")
+    model = _SelectedTokenEchoSharedPrefixRecordingModel()
+    engine = _cache_only_engine()
+    engine.model = model
+    engine.stop_token_ids = frozenset()
+    engine._prefix_cache_entry = None
+
+    steps = list(
+        engine._generate_prompt_list_batch_steps(
+            [[10, 11, 4, 6], [10, 11, 5]],
+            max_tokens=1,
+            temperature=0.0,
+            broadcast_tensor_parallel=False,
+        )
+    )
+
+    assert steps == [[6, 5]]
+    assert model.selected_logit_positions == []
+
+
 def test_openai_shared_prefix_padded_suffix_branch_requires_all_tp_ranks(monkeypatch) -> None:
     monkeypatch.setenv("TORCHINFERNO_OPENAI_PREFIX_CACHE_MIN_TOKENS", "2")
     model = _TokenEchoSharedPrefixRecordingModel()
@@ -4600,6 +4651,44 @@ class _TokenEchoSharedPrefixRecordingModel(_RaggedSharedPrefixRecordingModel):
             for row in range(input_ids.size(0)):
                 for offset, token_id in enumerate(input_ids[row].tolist()):
                     logits[row, offset, int(token_id)] = 1.0
+        return logits, cache
+
+
+class _SelectedTokenEchoSharedPrefixRecordingModel(_TokenEchoSharedPrefixRecordingModel):
+    def __init__(self) -> None:
+        super().__init__()
+        self.selected_logit_positions: list[list[int]] = []
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        *,
+        cache: _PrefixRecordingCache,
+        use_cache: bool,
+        return_last_logits_only: bool = False,
+        logit_positions: torch.Tensor | None = None,
+    ):
+        if logit_positions is None:
+            return super().forward(
+                input_ids,
+                cache=cache,
+                use_cache=use_cache,
+                return_last_logits_only=return_last_logits_only,
+            )
+
+        del use_cache, return_last_logits_only
+        self.forward_inputs.append([[int(token_id) for token_id in row.tolist()] for row in input_ids])
+        positions = [int(position) for position in logit_positions.tolist()]
+        self.selected_logit_positions.append(positions)
+        layer = cache.layers[0]
+        start = layer.seq_len
+        end = start + input_ids.size(1)
+        layer.keys[: input_ids.size(0), :, start:end, :].fill_(1)
+        layer.values[: input_ids.size(0), :, start:end, :].fill_(1)
+        layer.seq_len = end
+        logits = torch.zeros(input_ids.size(0), 1, self.config.vocab_size)
+        for row, offset in enumerate(positions):
+            logits[row, 0, int(input_ids[row, offset])] = 1.0
         return logits, cache
 
 

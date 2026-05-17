@@ -1591,6 +1591,7 @@ class Llama3TensorParallelForCausalLM:
         use_cache: bool = True,
         return_last_logits_only: bool = False,
         return_sharded_logits: bool = False,
+        logit_positions: Tensor | None = None,
     ) -> tuple[Tensor, Llama3TensorParallelCache | None]:
         if input_ids.ndim != 2:
             raise ValueError("input_ids must have shape [batch, sequence]")
@@ -1624,7 +1625,13 @@ class Llama3TensorParallelForCausalLM:
             for layer_id, layer in enumerate(self.layers):
                 layer_cache = active_cache.layers[layer_id] if active_cache is not None else None
                 hidden = layer.forward(hidden, positions, rotary, layer_cache)
-        if return_last_logits_only:
+        if logit_positions is not None:
+            if logit_positions.ndim != 1 or logit_positions.numel() != batch:
+                raise ValueError("logit_positions must have shape [batch]")
+            gather_positions = logit_positions.to(self.device, non_blocking=True).view(batch, 1, 1)
+            gather_positions = gather_positions.expand(-1, 1, hidden.size(-1))
+            hidden = torch.gather(hidden, 1, gather_positions)
+        elif return_last_logits_only:
             hidden = hidden[:, -1:, :]
         hidden = _tp_rms_norm(hidden, self.norm_weight, self.config.rms_norm_eps)
         logits = F.linear(hidden, self.lm_head_weight)

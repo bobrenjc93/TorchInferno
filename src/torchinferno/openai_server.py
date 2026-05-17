@@ -2630,14 +2630,13 @@ class OpenAICompletionEngine:
             )
             for row, suffix in enumerate(suffix_rows):
                 suffix_ids[row, : len(suffix)] = torch.tensor(suffix, dtype=torch.long, device=self.device)
-            logits, cache = _forward_all_logits(model, suffix_ids, cache)
-            row_positions = torch.arange(len(group), dtype=torch.long, device=self.device)
-            last_positions = torch.tensor(
-                [len(suffix) - 1 for suffix in suffix_rows],
-                dtype=torch.long,
-                device=self.device,
+            next_token, cache = _prefill_padded_suffix_next_token(
+                model,
+                suffix_ids,
+                cache,
+                [len(suffix) for suffix in suffix_rows],
+                temperature,
             )
-            next_token = _sample(model, logits[row_positions, last_positions, :], temperature)
         next_token = next_token.to(self.device)
 
         stop_token_ids = self.stop_token_ids
@@ -2751,14 +2750,13 @@ class OpenAICompletionEngine:
             )
             for row, suffix in enumerate(suffix_rows):
                 suffix_ids[row, : len(suffix)] = torch.tensor(suffix, dtype=torch.long, device=self.device)
-            logits, cache = _forward_all_logits(model, suffix_ids, cache)
-            row_positions = torch.arange(len(bucket), dtype=torch.long, device=self.device)
-            last_positions = torch.tensor(
-                [len(suffix) - 1 for suffix in suffix_rows],
-                dtype=torch.long,
-                device=self.device,
+            next_token, cache = _prefill_padded_suffix_next_token(
+                model,
+                suffix_ids,
+                cache,
+                suffix_lengths,
+                temperature,
             )
-            next_token = _sample(model, logits[row_positions, last_positions, :], temperature)
             ragged_decode = True
         next_token = next_token.to(self.device)
 
@@ -3116,14 +3114,13 @@ class OpenAICompletionEngine:
             )
             for row, suffix in enumerate(suffix_rows):
                 suffix_ids[row, : len(suffix)] = torch.tensor(suffix, dtype=torch.long, device=self.device)
-            logits, cache = _forward_all_logits(model, suffix_ids, cache)
-            row_positions = torch.arange(len(prompt_rows), dtype=torch.long, device=self.device)
-            last_positions = torch.tensor(
-                [len(suffix) - 1 for suffix in suffix_rows],
-                dtype=torch.long,
-                device=self.device,
+            next_token, cache = _prefill_padded_suffix_next_token(
+                model,
+                suffix_ids,
+                cache,
+                suffix_lengths,
+                temperature,
             )
-            next_token = _sample(model, logits[row_positions, last_positions, :], temperature)
             ragged_decode = True
         next_token = next_token.to(self.device)
         active: list[bool] = []
@@ -3275,14 +3272,14 @@ class OpenAICompletionEngine:
 
         # Right padding is safe here: real suffix-token logits never attend to
         # future pad tokens, and later ragged decode uses true per-row lengths.
-        logits, cache = _forward_all_logits(model, suffix_ids, cache)
-        row_positions = torch.arange(prompt_count, dtype=torch.long, device=self.device)
-        last_positions = torch.tensor(
-            [len(suffix) - 1 for suffix in suffix_rows],
-            dtype=torch.long,
-            device=self.device,
+        next_token, cache = _prefill_padded_suffix_next_token(
+            model,
+            suffix_ids,
+            cache,
+            [len(suffix) for suffix in suffix_rows],
+            temperature,
         )
-        next_token = _sample(model, logits[row_positions, last_positions, :], temperature).to(self.device)
+        next_token = next_token.to(self.device)
         stop_token_ids = self.stop_token_ids
         first_tokens: list[int | None] = []
         active: list[bool] = []
@@ -4291,6 +4288,49 @@ def _forward_all_logits(model: object, input_ids: Tensor, cache: object) -> tupl
     return _forward_with_logits_mode(model, input_ids, cache, return_last_logits_only=False)
 
 
+def _forward_selected_logits(
+    model: object,
+    input_ids: Tensor,
+    cache: object,
+    logit_positions: Tensor,
+) -> tuple[Tensor, object]:
+    forward = model.forward  # type: ignore[attr-defined]
+    parameters = _forward_parameter_names(type(model))
+    if "logit_positions" not in parameters:
+        return _forward_all_logits(model, input_ids, cache)
+    kwargs: dict[str, object] = {"cache": cache, "use_cache": True, "logit_positions": logit_positions}
+    if "return_last_logits_only" in parameters:
+        kwargs["return_last_logits_only"] = False
+    if _is_tensor_parallel_model(model) and "return_sharded_logits" in parameters:
+        kwargs["return_sharded_logits"] = True
+    return forward(input_ids, **kwargs)
+
+
+def _prefill_padded_suffix_next_token(
+    model: object,
+    suffix_ids: Tensor,
+    cache: object,
+    suffix_lengths: Sequence[int],
+    temperature: float,
+) -> tuple[Tensor, object]:
+    last_positions = torch.tensor(
+        [length - 1 for length in suffix_lengths],
+        dtype=torch.long,
+        device=suffix_ids.device,
+    )
+    if _selected_padded_suffix_logits_enabled(
+        model,
+        batch_size=suffix_ids.size(0),
+        max_suffix_len=suffix_ids.size(1),
+    ):
+        logits, cache = _forward_selected_logits(model, suffix_ids, cache, last_positions)
+        return _sample(model, logits[:, -1, :], temperature), cache
+
+    logits, cache = _forward_all_logits(model, suffix_ids, cache)
+    row_positions = torch.arange(suffix_ids.size(0), dtype=torch.long, device=suffix_ids.device)
+    return _sample(model, logits[row_positions, last_positions, :], temperature), cache
+
+
 def _forward_with_logits_mode(
     model: object,
     input_ids: Tensor,
@@ -4563,6 +4603,32 @@ def _prefer_shared_prefix_padded_suffix_prefill(
         minimum=1.0,
     )
     return padded_suffix_tokens <= real_suffix_tokens * max_padding_ratio
+
+
+def _selected_padded_suffix_logits_enabled(
+    model: object,
+    *,
+    batch_size: int,
+    max_suffix_len: int,
+) -> bool:
+    if not env_flag("TORCHINFERNO_OPENAI_SELECTED_PADDED_SUFFIX_LOGITS", True):
+        return False
+    if "logit_positions" not in _forward_parameter_names(type(model)):
+        return False
+    skipped_logits = max(0, batch_size * max_suffix_len - batch_size)
+    min_skipped_logits = env_int(
+        "TORCHINFERNO_OPENAI_SELECTED_PADDED_SUFFIX_LOGITS_MIN_SKIPPED_TOKENS",
+        512,
+        minimum=0,
+    )
+    if skipped_logits < min_skipped_logits:
+        return False
+    min_total_logits = env_int(
+        "TORCHINFERNO_OPENAI_SELECTED_PADDED_SUFFIX_LOGITS_MIN_TOTAL_TOKENS",
+        128,
+        minimum=1,
+    )
+    return batch_size * max_suffix_len >= min_total_logits
 
 
 def _shared_prefix_padded_suffix_buckets(

@@ -195,12 +195,18 @@ def test_llama3_pipeline_loads_hf_shaped_checkpoint_and_matches_v0(tmp_path) -> 
         expected = reference(input_ids)
         actual, _ = pipeline.forward(input_ids, use_cache=False)
         tp_actual, _ = tensor_parallel.forward(input_ids, use_cache=False)
+        tp_selected, _ = tensor_parallel.forward(
+            input_ids,
+            use_cache=False,
+            logit_positions=torch.tensor([1], dtype=torch.long),
+        )
         expected_generated = reference.generate(input_ids, max_new_tokens=2)
         actual_generated = pipeline.generate(input_ids, max_new_tokens=2)
         tp_generated = tensor_parallel.generate(input_ids, max_new_tokens=2)
 
     torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
     torch.testing.assert_close(tp_actual.cpu(), expected, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(tp_selected.cpu(), expected[:, 1:2, :], atol=1e-5, rtol=1e-5)
     assert torch.equal(actual_generated.cpu(), expected_generated)
     assert torch.equal(tp_generated.cpu(), expected_generated)
 
