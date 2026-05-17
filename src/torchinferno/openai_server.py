@@ -2108,7 +2108,7 @@ class OpenAICompletionEngine:
                     model,
                     cache_materialized_input_ids,
                     cache,
-                    allow_capture=_runtime_prefill_graph_capture_enabled(
+                    allow_capture=_identical_prompt_prefill_graph_capture_enabled(
                         model,
                         temperature,
                         max_tokens=max_tokens,
@@ -2127,7 +2127,11 @@ class OpenAICompletionEngine:
                     cache,
                     decode_batch_size,
                     temperature,
-                    allow_capture=_runtime_prefill_graph_capture_enabled(model, temperature, max_tokens=max_tokens),
+                    allow_capture=_identical_prompt_prefill_graph_capture_enabled(
+                        model,
+                        temperature,
+                        max_tokens=max_tokens,
+                    ),
                 )
                 self._save_prompt_prefix_cache(input_ids, cache)
                 self._store_prompt_logits_cache(input_ids, last_logits)
@@ -2147,7 +2151,11 @@ class OpenAICompletionEngine:
                 cache,
                 decode_batch_size,
                 temperature,
-                allow_capture=_runtime_prefill_graph_capture_enabled(model, temperature, max_tokens=max_tokens),
+                allow_capture=_identical_prompt_prefill_graph_capture_enabled(
+                    model,
+                    temperature,
+                    max_tokens=max_tokens,
+                ),
             )
         next_token = next_token.to(self.device)
         if cache_materialized:
@@ -3796,10 +3804,34 @@ def _runtime_prefill_graph_capture_enabled(
         ):
             return False
         if max_tokens is not None:
+            short_max_tokens = env_int("TORCHINFERNO_OPENAI_SHORT_STREAM_MAX_TOKENS", 256, minimum=1)
+            if (
+                temperature > 0.0
+                and max_tokens <= short_max_tokens
+                and not env_flag("TORCHINFERNO_OPENAI_TP_SHORT_TEMPERATURE_PREFILL_CAPTURE", False)
+            ):
+                return False
             token_limit = env_int("TORCHINFERNO_OPENAI_TP_RUNTIME_PREFILL_CAPTURE_MAX_TOKENS", 1024, minimum=1)
             if max_tokens > token_limit:
                 return False
         return True
+    return True
+
+
+def _identical_prompt_prefill_graph_capture_enabled(
+    model: object,
+    temperature: float = 0.0,
+    *,
+    max_tokens: int | None = None,
+) -> bool:
+    if not _runtime_prefill_graph_capture_enabled(model, temperature, max_tokens=max_tokens):
+        return False
+    if (
+        temperature > 0.0
+        and _is_tensor_parallel_model(model)
+        and _tensor_parallel_world_size(model) > 1
+    ):
+        return env_flag("TORCHINFERNO_OPENAI_TP_IDENTICAL_TEMPERATURE_PREFILL_CAPTURE", False)
     return True
 
 
