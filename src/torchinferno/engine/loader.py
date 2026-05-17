@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import os
-import socket
 import sys
 from pathlib import Path
 from typing import Sequence
@@ -144,52 +143,42 @@ def should_reexec_distributed_server(config: object) -> bool:
 
 
 def distributed_server_command(config: object, argv: Sequence[str]) -> list[str]:
-    rdzv_endpoint = _torchrun_rdzv_endpoint(config)
-    return [
+    command = [
         sys.executable,
         "-m",
         "torch.distributed.run",
-        "--rdzv-backend",
-        "c10d",
-        "--rdzv-endpoint",
-        rdzv_endpoint,
-        "--rdzv-id",
-        _torchrun_rdzv_id(rdzv_endpoint),
-        "--nproc-per-node",
-        str(int(getattr(config, "tensor_parallel_size", 1))),
-        "-m",
-        "torchinferno.openai_server",
-        *argv,
     ]
-
-
-def _torchrun_rdzv_endpoint(config: object) -> str:
-    configured = os.environ.get("TORCHINFERNO_TORCHRUN_RDZV_ENDPOINT")
-    if configured:
-        return configured
-    excluded_ports: set[int] = set()
-    try:
-        port = int(getattr(config, "port", 0))
-    except (TypeError, ValueError):
-        port = 0
-    if port > 0:
-        excluded_ports.add(port)
-    return f"127.0.0.1:{_free_loopback_port(excluded_ports)}"
+    configured_rdzv_endpoint = os.environ.get("TORCHINFERNO_TORCHRUN_RDZV_ENDPOINT")
+    if configured_rdzv_endpoint:
+        command.extend(
+            [
+                "--rdzv-backend",
+                "c10d",
+                "--rdzv-endpoint",
+                configured_rdzv_endpoint,
+                "--rdzv-id",
+                _torchrun_rdzv_id(configured_rdzv_endpoint),
+                "--rdzv-conf",
+                "is_host=true",
+            ]
+        )
+    else:
+        command.append("--standalone")
+    command.extend(
+        [
+            "--nproc-per-node",
+            str(int(getattr(config, "tensor_parallel_size", 1))),
+            "-m",
+            "torchinferno.openai_server",
+            *argv,
+        ]
+    )
+    return command
 
 
 def _torchrun_rdzv_id(rdzv_endpoint: str) -> str:
     port = rdzv_endpoint.rsplit(":", 1)[-1]
     return f"torchinferno-openai-{os.getpid()}-{port}"
-
-
-def _free_loopback_port(excluded_ports: set[int]) -> int:
-    for _ in range(16):
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-            sock.bind(("127.0.0.1", 0))
-            port = int(sock.getsockname()[1])
-        if port not in excluded_ports:
-            return port
-    raise RuntimeError("could not allocate a torchrun rendezvous port distinct from the server port")
 
 
 def resolve_dtype(dtype: str) -> torch.dtype | None:

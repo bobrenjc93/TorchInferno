@@ -34,19 +34,23 @@ _SYMM_REDUCE_BUFFERS: dict[tuple[str, int, str, str, tuple[int, ...]], Tensor] =
 _SYMM_REDUCE_PROBED: set[tuple[str, int, str, str, tuple[int, ...]]] = set()
 _SYMM_REDUCE_DISABLED = False
 _SYMM_MEM_ALLREDUCE_MAX_BATCH_OVERRIDE: list[int | None] = [None]
+_SYMM_MEM_ALLREDUCE_ENABLED_OVERRIDE: list[bool | None] = [None]
 _DEFAULT_DECODE_STEP_MAX_BATCH = 64
 
 
 @contextmanager
-def symm_mem_allreduce_max_batch(max_batch: int | None) -> Iterator[None]:
+def symm_mem_allreduce_max_batch(max_batch: int | None, *, enabled: bool | None = None) -> Iterator[None]:
     if max_batch is not None and max_batch < 1:
         raise ValueError("max_batch must be positive")
-    previous = _SYMM_MEM_ALLREDUCE_MAX_BATCH_OVERRIDE[0]
+    previous_batch = _SYMM_MEM_ALLREDUCE_MAX_BATCH_OVERRIDE[0]
+    previous_enabled = _SYMM_MEM_ALLREDUCE_ENABLED_OVERRIDE[0]
     _SYMM_MEM_ALLREDUCE_MAX_BATCH_OVERRIDE[0] = max_batch
+    _SYMM_MEM_ALLREDUCE_ENABLED_OVERRIDE[0] = enabled
     try:
         yield
     finally:
-        _SYMM_MEM_ALLREDUCE_MAX_BATCH_OVERRIDE[0] = previous
+        _SYMM_MEM_ALLREDUCE_MAX_BATCH_OVERRIDE[0] = previous_batch
+        _SYMM_MEM_ALLREDUCE_ENABLED_OVERRIDE[0] = previous_enabled
 
 
 def _tp_flag(name: str, default: bool = True) -> bool:
@@ -3171,7 +3175,7 @@ def _should_use_symm_mem_all_reduce(hidden: Tensor, weight: Tensor, world_size: 
     return (
         world_size > 1
         and not _SYMM_REDUCE_DISABLED
-        and _tp_flag("TORCHINFERNO_SYMM_MEM_ALLREDUCE")
+        and _symm_mem_allreduce_enabled()
         and hidden.is_cuda
         and weight.is_cuda
         and hidden.ndim == 3
@@ -3187,8 +3191,15 @@ def _symm_mem_allreduce_max_batch() -> int:
     return _tp_int("TORCHINFERNO_SYMM_MEM_ALLREDUCE_MAX_BATCH", 1, minimum=1)
 
 
+def _symm_mem_allreduce_enabled() -> bool:
+    override = _SYMM_MEM_ALLREDUCE_ENABLED_OVERRIDE[0]
+    if override is not None:
+        return override
+    return _tp_flag("TORCHINFERNO_SYMM_MEM_ALLREDUCE")
+
+
 def _symm_mem_allreduce_graph_key(batch_size: int, world_size: int) -> int:
-    if world_size <= 1 or _SYMM_REDUCE_DISABLED or not _tp_flag("TORCHINFERNO_SYMM_MEM_ALLREDUCE"):
+    if world_size <= 1 or _SYMM_REDUCE_DISABLED or not _symm_mem_allreduce_enabled():
         return 0
     max_batch = _symm_mem_allreduce_max_batch()
     return max_batch if batch_size <= max_batch else 0

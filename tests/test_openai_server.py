@@ -46,12 +46,14 @@ from torchinferno.openai_server import (
     _openai_ragged_decode_graph_enabled,
     _prefill_repeated_prefix_next_token,
     _prefers_exact_generation_cache,
+    _prompt_list_tensor_payload,
     _runtime_prefill_graph_capture_enabled,
     _repeat_generation_cache_first_batch,
     _sampled_batch_shape_bucket_size,
     _should_reexec_distributed_server,
     _sync_tensor_parallel_command,
     _sync_tensor_parallel_continue,
+    _tensor_parallel_symm_mem_allreduce_scope,
     _tensor_parallel_worker_loop,
     _tp_command_cuda_sync_for_steps,
     _try_decode_ragged_token_graph,
@@ -277,14 +279,39 @@ def test_openai_server_auto_launches_tensor_parallel_for_vanilla_provider(monkey
     )
 
     assert command[:3] == [sys.executable, "-m", "torch.distributed.run"]
-    assert "--standalone" not in command
-    assert command[command.index("--rdzv-backend") + 1] == "c10d"
-    rdzv_endpoint = command[command.index("--rdzv-endpoint") + 1]
-    assert rdzv_endpoint.startswith("127.0.0.1:")
-    assert not rdzv_endpoint.endswith(":8000")
-    assert command[command.index("--rdzv-id") + 1].startswith("torchinferno-openai-")
+    assert "--standalone" in command
+    assert "--rdzv-endpoint" not in command
     assert command[command.index("--nproc-per-node") + 1] == "8"
     assert command[command.index("torchinferno.openai_server") - 1] == "-m"
+
+
+def test_openai_server_auto_launch_honors_configured_rendezvous(monkeypatch) -> None:
+    monkeypatch.delenv("RANK", raising=False)
+    monkeypatch.delenv("WORLD_SIZE", raising=False)
+    monkeypatch.setenv("TORCHINFERNO_TORCHRUN_RDZV_ENDPOINT", "127.0.0.1:29599")
+    config = OpenAIServerConfig(
+        model="meta-llama/Meta-Llama-3.1-70B-Instruct",
+        tensor_parallel_size=8,
+    )
+
+    command = _distributed_server_command(
+        config,
+        (
+            "--model",
+            config.model,
+            "--tensor-parallel-size",
+            "8",
+            "--port",
+            "8000",
+        ),
+    )
+
+    assert "--standalone" not in command
+    assert command[command.index("--rdzv-backend") + 1] == "c10d"
+    assert command[command.index("--rdzv-endpoint") + 1] == "127.0.0.1:29599"
+    assert command[command.index("--rdzv-id") + 1].startswith("torchinferno-openai-")
+    assert command[command.index("--rdzv-id") + 1].endswith("-29599")
+    assert command[command.index("--rdzv-conf") + 1] == "is_host=true"
 
 
 def test_openai_server_warmup_uses_generic_shape_buckets(monkeypatch) -> None:
@@ -610,6 +637,16 @@ def test_tensor_parallel_worker_loop_receives_tensor_prompt_list_command(monkeyp
 
     assert payloads == []
     assert engine.prompt_list_calls == [([[1, 2], [3, 4, 5]], 4, 0.75, False, [1, 4])]
+
+
+def test_prompt_list_tensor_payload_pads_rows_once() -> None:
+    token_rows, lengths = _prompt_list_tensor_payload(
+        [[1, 2], [3, 4, 5], []],
+        torch.device("cpu"),
+    )
+
+    assert lengths.tolist() == [2, 3, 0]
+    assert token_rows.tolist() == [[1, 2, 0], [3, 4, 5], [0, 0, 0]]
 
 
 def test_openai_stream_disconnect_drains_generation() -> None:
@@ -3393,7 +3430,7 @@ def test_openai_short_tp_stream_uses_smaller_queue_batch_limit(monkeypatch) -> N
     short_completion = _QueuedGeneration([], 64, 0.0, False, queue.Queue())
 
     assert engine._queued_batch_limit(short_stream) == 56
-    assert engine._queued_batch_limit(boundary_stream) == 48
+    assert engine._queued_batch_limit(boundary_stream) == 64
     assert engine._queued_batch_limit(sampled_short_stream) == 64
     assert engine._queued_batch_limit(medium_stream) == 128
     assert engine._queued_batch_limit(sampled_medium_stream) == 128
@@ -3407,6 +3444,70 @@ def test_openai_short_tp_stream_uses_smaller_queue_batch_limit(monkeypatch) -> N
     assert engine._queued_batch_limit(boundary_stream) == 56
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_LARGE_STREAM_MAX_BATCH_SIZE", "20")
     assert engine._queued_batch_limit(large_stream) == 20
+
+
+def test_openai_symm_mem_scope_enables_short_deterministic_decode(monkeypatch) -> None:
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_MAX_TOKENS", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_MAX_BATCH", raising=False)
+    model = object()
+    captured: list[tuple[int | None, bool | None]] = []
+
+    class FakeContext:
+        def __enter__(self) -> None:
+            return None
+
+        def __exit__(self, exc_type, exc, traceback) -> bool:  # noqa: ANN001
+            return False
+
+    def fake_symm_scope(max_batch: int | None, *, enabled: bool | None = None) -> FakeContext:
+        captured.append((max_batch, enabled))
+        return FakeContext()
+
+    monkeypatch.setattr("torchinferno.openai_server._is_tensor_parallel_model", lambda candidate: candidate is model)
+    monkeypatch.setattr("torchinferno.openai_server._tensor_parallel_world_size", lambda candidate: 8)
+    monkeypatch.setattr("torchinferno.openai_server.symm_mem_allreduce_max_batch", fake_symm_scope)
+
+    with _tensor_parallel_symm_mem_allreduce_scope(
+        model,
+        torch.device("cuda"),
+        max_tokens=64,
+        temperature=0.0,
+    ):
+        pass
+
+    assert captured == [(64, True)]
+
+
+def test_openai_symm_mem_scope_skips_temperature_and_long_generations(monkeypatch) -> None:
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE", raising=False)
+    model = object()
+    captured: list[tuple[int | None, bool | None]] = []
+
+    def fake_symm_scope(max_batch: int | None, *, enabled: bool | None = None):
+        captured.append((max_batch, enabled))
+        raise AssertionError("symm scope should not be entered")
+
+    monkeypatch.setattr("torchinferno.openai_server._is_tensor_parallel_model", lambda candidate: candidate is model)
+    monkeypatch.setattr("torchinferno.openai_server._tensor_parallel_world_size", lambda candidate: 8)
+    monkeypatch.setattr("torchinferno.openai_server.symm_mem_allreduce_max_batch", fake_symm_scope)
+
+    with _tensor_parallel_symm_mem_allreduce_scope(
+        model,
+        torch.device("cuda"),
+        max_tokens=64,
+        temperature=0.7,
+    ):
+        pass
+    with _tensor_parallel_symm_mem_allreduce_scope(
+        model,
+        torch.device("cuda"),
+        max_tokens=256,
+        temperature=0.0,
+    ):
+        pass
+
+    assert captured == []
 
 
 def test_openai_temperature_queue_batch_wait_uses_default_window(monkeypatch) -> None:

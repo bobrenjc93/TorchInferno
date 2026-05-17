@@ -683,7 +683,7 @@ class OpenAICompletionEngine:
                 default_short_limit = (
                     64
                     if first.temperature > 0.0
-                    else (48 if first.max_tokens >= deterministic_high_token_min else 56)
+                    else (64 if first.max_tokens >= deterministic_high_token_min else 56)
                 )
                 short_limit = env_int(
                     "TORCHINFERNO_OPENAI_TP_SHORT_STREAM_MAX_BATCH_SIZE",
@@ -2647,14 +2647,7 @@ class OpenAICompletionEngine:
             )
         else:
             pad_token_id = _tokenizer_padding_token_id(getattr(self, "tokenizer", None))
-            suffix_ids = torch.full(
-                (len(group), max_suffix_len),
-                pad_token_id,
-                dtype=torch.long,
-                device=self.device,
-            )
-            for row, suffix in enumerate(suffix_rows):
-                suffix_ids[row, : len(suffix)] = torch.tensor(suffix, dtype=torch.long, device=self.device)
+            suffix_ids = _padded_token_rows_tensor(suffix_rows, self.device, pad_token_id)
             next_token, cache = _prefill_padded_suffix_next_token(
                 model,
                 suffix_ids,
@@ -2767,14 +2760,7 @@ class OpenAICompletionEngine:
             ragged_decode = False
         else:
             pad_token_id = _tokenizer_padding_token_id(getattr(self, "tokenizer", None))
-            suffix_ids = torch.full(
-                (len(bucket), max_suffix_len),
-                pad_token_id,
-                dtype=torch.long,
-                device=self.device,
-            )
-            for row, suffix in enumerate(suffix_rows):
-                suffix_ids[row, : len(suffix)] = torch.tensor(suffix, dtype=torch.long, device=self.device)
+            suffix_ids = _padded_token_rows_tensor(suffix_rows, self.device, pad_token_id)
             next_token, cache = _prefill_padded_suffix_next_token(
                 model,
                 suffix_ids,
@@ -3131,14 +3117,7 @@ class OpenAICompletionEngine:
             ragged_decode = False
         else:
             pad_token_id = _tokenizer_padding_token_id(getattr(self, "tokenizer", None))
-            suffix_ids = torch.full(
-                (len(prompt_rows), max_suffix_len),
-                pad_token_id,
-                dtype=torch.long,
-                device=self.device,
-            )
-            for row, suffix in enumerate(suffix_rows):
-                suffix_ids[row, : len(suffix)] = torch.tensor(suffix, dtype=torch.long, device=self.device)
+            suffix_ids = _padded_token_rows_tensor(suffix_rows, self.device, pad_token_id)
             next_token, cache = _prefill_padded_suffix_next_token(
                 model,
                 suffix_ids,
@@ -3284,16 +3263,9 @@ class OpenAICompletionEngine:
             return None
 
         pad_token_id = _tokenizer_padding_token_id(getattr(self, "tokenizer", None))
-        suffix_ids = torch.full(
-            (prompt_count, max_suffix_len),
-            pad_token_id,
-            dtype=torch.long,
-            device=self.device,
-        )
-        for row, suffix in enumerate(suffix_rows):
-            if not suffix:
-                return None
-            suffix_ids[row, : len(suffix)] = torch.tensor(suffix, dtype=torch.long, device=self.device)
+        if any(not suffix for suffix in suffix_rows):
+            return None
+        suffix_ids = _padded_token_rows_tensor(suffix_rows, self.device, pad_token_id)
 
         # Right padding is safe here: real suffix-token logits never attend to
         # future pad tokens, and later ragged decode uses true per-row lengths.
@@ -3740,8 +3712,10 @@ def _tensor_parallel_symm_mem_allreduce_scope(
     max_tokens_limit = env_int("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_MAX_TOKENS", 128, minimum=1)
     if max_tokens > max_tokens_limit:
         return nullcontext()
+    if not env_flag("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE", True):
+        return nullcontext()
     max_batch = env_int("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_MAX_BATCH", 64, minimum=1)
-    return symm_mem_allreduce_max_batch(max_batch)
+    return symm_mem_allreduce_max_batch(max_batch, enabled=True)
 
 
 def _effective_openai_max_batch_size(model: object, device: torch.device, requested: int) -> int:
@@ -4010,8 +3984,9 @@ def _receive_tensor_parallel_tensor_payload(engine: OpenAICompletionEngine) -> d
         payload["input_ids_tensor"] = token_rows.to(engine.device, non_blocking=True)
     else:
         lengths_list = [int(value) for value in lengths.detach().cpu().tolist()]
+        token_rows_cpu = token_rows.detach().cpu()
         payload["input_id_lists"] = [
-            token_rows[row, :length].detach().cpu().tolist()
+            token_rows_cpu[row, :length].tolist()
             for row, length in enumerate(lengths_list)
         ]
     return payload
@@ -4081,12 +4056,7 @@ def _broadcast_tensor_parallel_generate_prompt_lists(
         return
     if prompts:
         command_device = _tensor_parallel_command_device(getattr(model, "device", torch.device("cpu")))
-        lengths = torch.tensor([len(prompt) for prompt in prompts], dtype=torch.long, device=command_device)
-        width = int(lengths.max().item()) if lengths.numel() > 0 else 0
-        token_rows = torch.zeros((len(prompts), width), dtype=torch.long, device=command_device)
-        for row, prompt in enumerate(prompts):
-            if prompt:
-                token_rows[row, : len(prompt)] = torch.tensor(prompt, dtype=torch.long, device=command_device)
+        token_rows, lengths = _prompt_list_tensor_payload(prompts, command_device)
         if _broadcast_tensor_parallel_tensor_payload(
             model,
             command_kind=_TP_COMMAND_GENERATE_PROMPT_LISTS,
@@ -4124,6 +4094,31 @@ def _broadcast_tensor_parallel_stop(model: object) -> None:
             dist.broadcast(meta, src=0)
             return
         dist.broadcast_object_list([{"op": "stop"}], src=0)
+
+
+def _prompt_list_tensor_payload(
+    prompts: Sequence[Sequence[int]],
+    device: torch.device,
+) -> tuple[Tensor, Tensor]:
+    lengths_values = [len(prompt) for prompt in prompts]
+    token_rows = _padded_token_rows_tensor(prompts, device, 0)
+    lengths = torch.tensor(lengths_values, dtype=torch.long, device=device)
+    return token_rows, lengths
+
+
+def _padded_token_rows_tensor(
+    rows: Sequence[Sequence[int]],
+    device: torch.device,
+    pad_token_id: int,
+) -> Tensor:
+    width = max((len(row) for row in rows), default=0)
+    if width == 0:
+        return torch.empty((len(rows), 0), dtype=torch.long, device=device)
+    padded = [
+        [int(token_id) for token_id in row] + [int(pad_token_id)] * (width - len(row))
+        for row in rows
+    ]
+    return torch.tensor(padded, dtype=torch.long, device=device)
 
 
 def _tensor_parallel_worker_loop(engine: OpenAICompletionEngine) -> None:
