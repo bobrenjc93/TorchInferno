@@ -3805,12 +3805,33 @@ def _runtime_prefill_graph_capture_enabled(
             return False
         if max_tokens is not None:
             short_max_tokens = env_int("TORCHINFERNO_OPENAI_SHORT_STREAM_MAX_TOKENS", 256, minimum=1)
+            sampled_skip_max_tokens = env_int(
+                "TORCHINFERNO_OPENAI_TP_TEMPERATURE_PREFILL_CAPTURE_SKIP_MAX_TOKENS",
+                max(short_max_tokens, 320),
+                minimum=1,
+            )
             if (
                 temperature > 0.0
-                and max_tokens <= short_max_tokens
+                and max_tokens <= sampled_skip_max_tokens
                 and not env_flag("TORCHINFERNO_OPENAI_TP_SHORT_TEMPERATURE_PREFILL_CAPTURE", False)
             ):
                 return False
+            if temperature <= 0.0:
+                skip_min_tokens = env_int(
+                    "TORCHINFERNO_OPENAI_TP_DETERMINISTIC_PREFILL_CAPTURE_SKIP_MIN_TOKENS",
+                    128,
+                    minimum=1,
+                )
+                skip_max_tokens = env_int(
+                    "TORCHINFERNO_OPENAI_TP_DETERMINISTIC_PREFILL_CAPTURE_SKIP_MAX_TOKENS",
+                    256,
+                    minimum=skip_min_tokens,
+                )
+                if (
+                    skip_min_tokens <= max_tokens <= skip_max_tokens
+                    and not env_flag("TORCHINFERNO_OPENAI_TP_DETERMINISTIC_PREFILL_CAPTURE_IN_SKIP_WINDOW", False)
+                ):
+                    return False
             token_limit = env_int("TORCHINFERNO_OPENAI_TP_RUNTIME_PREFILL_CAPTURE_MAX_TOKENS", 1024, minimum=1)
             if max_tokens > token_limit:
                 return False

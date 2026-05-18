@@ -1826,12 +1826,20 @@ def test_openai_tp_runtime_prefill_capture_defaults_on_but_env_can_disable(monke
     )
 
     assert _runtime_prefill_graph_capture_enabled(model, temperature=0.0, max_tokens=512)
+    assert not _runtime_prefill_graph_capture_enabled(model, temperature=0.0, max_tokens=256)
+    assert _runtime_prefill_graph_capture_enabled(model, temperature=0.0, max_tokens=96)
     assert not _runtime_prefill_graph_capture_enabled(model, temperature=0.7, max_tokens=128)
-    assert _runtime_prefill_graph_capture_enabled(model, temperature=0.7, max_tokens=300)
+    assert not _runtime_prefill_graph_capture_enabled(model, temperature=0.7, max_tokens=300)
+    assert _runtime_prefill_graph_capture_enabled(model, temperature=0.7, max_tokens=384)
 
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_SHORT_TEMPERATURE_PREFILL_CAPTURE", "1")
     assert _runtime_prefill_graph_capture_enabled(model, temperature=0.7, max_tokens=128)
+    assert _runtime_prefill_graph_capture_enabled(model, temperature=0.7, max_tokens=300)
     monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_SHORT_TEMPERATURE_PREFILL_CAPTURE", raising=False)
+
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_DETERMINISTIC_PREFILL_CAPTURE_IN_SKIP_WINDOW", "1")
+    assert _runtime_prefill_graph_capture_enabled(model, temperature=0.0, max_tokens=256)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_DETERMINISTIC_PREFILL_CAPTURE_IN_SKIP_WINDOW", raising=False)
 
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_RUNTIME_PREFILL_CAPTURE", "0")
     assert not _runtime_prefill_graph_capture_enabled(model, temperature=0.0, max_tokens=512)
@@ -1855,8 +1863,13 @@ def test_openai_tp_runtime_prefill_capture_overrides_still_apply(monkeypatch) ->
 
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_RUNTIME_TEMPERATURE_PREFILL_CAPTURE", "1")
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_RUNTIME_PREFILL_CAPTURE_MAX_TOKENS", "128")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_DETERMINISTIC_PREFILL_CAPTURE_IN_SKIP_WINDOW", "1")
     assert not _runtime_prefill_graph_capture_enabled(model, temperature=0.0, max_tokens=512)
     assert _runtime_prefill_graph_capture_enabled(model, temperature=0.0, max_tokens=128)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_DETERMINISTIC_PREFILL_CAPTURE_IN_SKIP_WINDOW", raising=False)
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_RUNTIME_PREFILL_CAPTURE_MAX_TOKENS", "512")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_TEMPERATURE_PREFILL_CAPTURE_SKIP_MAX_TOKENS", "128")
+    assert _runtime_prefill_graph_capture_enabled(model, temperature=0.7, max_tokens=300)
 
 
 def test_openai_tp_identical_temperature_prefill_capture_has_specific_override(monkeypatch) -> None:
@@ -1873,12 +1886,12 @@ def test_openai_tp_identical_temperature_prefill_capture_has_specific_override(m
         lambda candidate: 8 if candidate is model else 1,
     )
 
-    assert _runtime_prefill_graph_capture_enabled(model, temperature=0.7, max_tokens=300)
-    assert not _identical_prompt_prefill_graph_capture_enabled(model, temperature=0.7, max_tokens=300)
-    assert _identical_prompt_prefill_graph_capture_enabled(model, temperature=0.0, max_tokens=300)
+    assert _runtime_prefill_graph_capture_enabled(model, temperature=0.7, max_tokens=384)
+    assert not _identical_prompt_prefill_graph_capture_enabled(model, temperature=0.7, max_tokens=384)
+    assert _identical_prompt_prefill_graph_capture_enabled(model, temperature=0.0, max_tokens=512)
 
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_IDENTICAL_TEMPERATURE_PREFILL_CAPTURE", "1")
-    assert _identical_prompt_prefill_graph_capture_enabled(model, temperature=0.7, max_tokens=300)
+    assert _identical_prompt_prefill_graph_capture_enabled(model, temperature=0.7, max_tokens=384)
 
 
 def test_openai_engine_uses_runtime_shared_prefix_capture_for_tensor_parallel(monkeypatch) -> None:
