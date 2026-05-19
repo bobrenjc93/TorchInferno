@@ -2854,6 +2854,7 @@ class OpenAICompletionEngine:
                 allow_capture=_runtime_prefill_graph_capture_enabled(model, temperature, max_tokens=max_tokens),
             )
             self._save_prompt_prefix_cache(prefix_ids, prefix_cache)
+        _mark_generation_cache_prefix(prefix_cache, _tensor_row_tokens(prefix_ids))
 
         prefer_dense_group_decode = _prefer_shared_prefix_dense_group_decode(
             length_groups,
@@ -3485,6 +3486,7 @@ class OpenAICompletionEngine:
                 allow_capture=_runtime_prefill_graph_capture_enabled(model, temperature, max_tokens=max_tokens),
             )
             self._save_prompt_prefix_cache(prefix_ids, cache)
+        _mark_generation_cache_prefix(cache, _tensor_row_tokens(prefix_ids))
         _repeat_generation_cache_first_batch(cache, batch_size)
         next_token, cache = _prefill_next_token(
             model,
@@ -4386,6 +4388,8 @@ def _prefill_padded_suffix_next_token(
     suffix_lengths: Sequence[int],
     temperature: float,
 ) -> tuple[Tensor, object]:
+    if _generation_cache_seq_len(cache) == 0:
+        _clear_generation_cache_repeated_prefix(cache)
     last_positions = torch.tensor(
         [length - 1 for length in suffix_lengths],
         dtype=torch.long,
@@ -4411,6 +4415,8 @@ def _forward_with_logits_mode(
     *,
     return_last_logits_only: bool,
 ) -> tuple[Tensor, object]:
+    if _generation_cache_seq_len(cache) == 0:
+        _clear_generation_cache_repeated_prefix(cache)
     forward = model.forward  # type: ignore[attr-defined]
     parameters = _forward_parameter_names(type(model))
     kwargs: dict[str, object] = {"cache": cache, "use_cache": True}
@@ -4429,6 +4435,8 @@ def _prefill_next_token(
     *,
     allow_capture: bool = False,
 ) -> tuple[Tensor, object]:
+    if _generation_cache_seq_len(cache) == 0:
+        _clear_generation_cache_repeated_prefix(cache)
     prefill_token = _try_prefill_graph(model, input_ids, cache, temperature, allow_capture=allow_capture)
     if prefill_token is not None:
         return prefill_token, cache
@@ -4903,6 +4911,59 @@ def _tokenizer_padding_token_id(tokenizer: object | None) -> int:
     return 0
 
 
+def _tensor_row_tokens(input_ids: Tensor, row: int = 0) -> tuple[int, ...]:
+    return tuple(int(token_id) for token_id in input_ids[row].detach().cpu().tolist())
+
+
+def _mark_generation_cache_prefix(cache: object, tokens: Sequence[int]) -> None:
+    try:
+        setattr(cache, "_torchinferno_prefix_tokens", tuple(int(token_id) for token_id in tokens))
+    except Exception:
+        pass
+
+
+def _generation_cache_prefix_tokens(cache: object) -> tuple[int, ...] | None:
+    tokens = getattr(cache, "_torchinferno_prefix_tokens", None)
+    if not isinstance(tokens, tuple):
+        return None
+    return tuple(int(token_id) for token_id in tokens)
+
+
+def _mark_generation_cache_repeated_prefix(
+    cache: object,
+    tokens: tuple[int, ...],
+    *,
+    seq_len: int,
+    rows: int,
+) -> None:
+    try:
+        setattr(cache, "_torchinferno_repeated_prefix", (tokens, int(seq_len), int(rows)))
+    except Exception:
+        pass
+
+
+def _clear_generation_cache_repeated_prefix(cache: object) -> None:
+    try:
+        if hasattr(cache, "_torchinferno_repeated_prefix"):
+            delattr(cache, "_torchinferno_repeated_prefix")
+    except Exception:
+        pass
+
+
+def _cached_repeated_prefix_rows(cache: object, tokens: tuple[int, ...], seq_len: int) -> int:
+    marker = getattr(cache, "_torchinferno_repeated_prefix", None)
+    if not (
+        isinstance(marker, tuple)
+        and len(marker) == 3
+        and isinstance(marker[0], tuple)
+        and int(marker[1]) == int(seq_len)
+    ):
+        return 0
+    if marker[0] != tokens:
+        return 0
+    return max(0, int(marker[2]))
+
+
 def _repeat_generation_cache_first_batch(cache: object, batch_size: int) -> None:
     if batch_size <= 1:
         return
@@ -4975,6 +5036,8 @@ def _prefill_cache_only(
     *,
     allow_capture: bool = False,
 ) -> object:
+    if _generation_cache_seq_len(cache) == 0:
+        _clear_generation_cache_repeated_prefix(cache)
     prefill_logits = _try_prefill_logits_graph(model, input_ids, cache, allow_capture=allow_capture)
     if prefill_logits is not None:
         return cache
@@ -5208,6 +5271,16 @@ def _cache_row_slice(cache: object, start: int, end: int) -> object | None:
 def _copy_generation_cache_first_row(source: object, target: object, batch_size: int) -> None:
     if batch_size <= 0:
         return
+    source_tokens = _generation_cache_prefix_tokens(source)
+    source_seq_len = _cache_row_seq_len(source, 0) if source_tokens is not None else 0
+    if (
+        source_tokens is not None
+        and source_seq_len > 0
+        and _cached_repeated_prefix_rows(target, source_tokens, source_seq_len) >= batch_size
+    ):
+        for target_layer in getattr(target, "layers", ()) or ():
+            _set_layer_rows_seq_len(target_layer, range(batch_size), source_seq_len)
+        return
     if _dense_cache_pair_has_rows(source, target, batch_size):
         for source_layer, target_layer in zip(
             getattr(source, "layers", ()) or (),
@@ -5231,6 +5304,13 @@ def _copy_generation_cache_first_row(source: object, target: object, batch_size:
                 source_values[:1, :, :seq_len, :].expand(batch_size, -1, -1, -1)
             )
             _set_layer_rows_seq_len(target_layer, range(batch_size), seq_len)
+        if source_tokens is not None and source_seq_len > 0:
+            _mark_generation_cache_repeated_prefix(
+                target,
+                source_tokens,
+                seq_len=source_seq_len,
+                rows=batch_size,
+            )
         return
     copy_prefix = getattr(target, "copy_prefix_from", None)
     if callable(copy_prefix):
@@ -5239,6 +5319,13 @@ def _copy_generation_cache_first_row(source: object, target: object, batch_size:
             return
         for row in range(batch_size):
             copy_prefix(source, seq_len, source_row=0, dest_row=row)
+        if source_tokens is not None and source_seq_len > 0:
+            _mark_generation_cache_repeated_prefix(
+                target,
+                source_tokens,
+                seq_len=source_seq_len,
+                rows=batch_size,
+            )
         return
     raise RuntimeError("cannot copy shared prefix cache for non-tensor KV layer")
 

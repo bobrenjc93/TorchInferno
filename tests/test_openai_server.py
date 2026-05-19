@@ -42,6 +42,7 @@ from torchinferno.openai_server import (
     _effective_openai_max_batch_size,
     _identical_prompt_cache_pool_enabled,
     _identical_prompt_prefill_graph_capture_enabled,
+    _mark_generation_cache_prefix,
     _openai_cuda_graph_enabled_for_model,
     _openai_decode_graph_enabled,
     _openai_ragged_decode_graph_enabled,
@@ -3470,6 +3471,32 @@ def test_openai_cache_copy_helpers_preserve_llama_tp_row_lengths() -> None:
 
     assert clone.for_rows((0, 1)).seq_len == 3
     torch.testing.assert_close(clone.layers[0].values[:2, :, :3, :], source_values.expand(2, -1, -1, -1))
+
+
+def test_openai_cache_copy_skips_repeated_shared_prefix_copy() -> None:
+    source = _llama_tp_cache(batch_size=1, max_seq_len=8)
+    target = _llama_tp_cache(batch_size=3, max_seq_len=8)
+    source_keys = torch.arange(6, dtype=torch.float32).reshape(1, 1, 3, 2)
+    source_values = source_keys + 100
+    source.for_rows((0,)).layers[0].append(source_keys, source_values)
+    _mark_generation_cache_prefix(source, (10, 11, 12))
+
+    _copy_generation_cache_first_row(source, target, batch_size=2)
+    target.set_seq_len(0)
+    source.layers[0].keys[:, :, :3, :].fill_(99)
+    source.layers[0].values[:, :, :3, :].fill_(199)
+
+    _copy_generation_cache_first_row(source, target, batch_size=2)
+
+    assert target.for_rows((0, 1)).seq_len == 3
+    torch.testing.assert_close(target.layers[0].keys[:2, :, :3, :], source_keys.expand(2, -1, -1, -1))
+    torch.testing.assert_close(target.layers[0].values[:2, :, :3, :], source_values.expand(2, -1, -1, -1))
+
+    target.set_seq_len(0)
+    _mark_generation_cache_prefix(source, (20, 21, 22))
+    _copy_generation_cache_first_row(source, target, batch_size=2)
+
+    torch.testing.assert_close(target.layers[0].keys[:2, :, :3, :], torch.full((2, 1, 3, 2), 99.0))
 
 
 def test_openai_repeat_generation_cache_first_batch_preserves_llama_tp_row_lengths() -> None:
