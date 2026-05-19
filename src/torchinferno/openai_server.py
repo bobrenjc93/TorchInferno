@@ -4978,8 +4978,17 @@ def _prefill_cache_only(
     prefill_logits = _try_prefill_logits_graph(model, input_ids, cache, allow_capture=allow_capture)
     if prefill_logits is not None:
         return cache
+    prefill_cache_only = getattr(model, "prefill_cache_only", None)
+    if callable(prefill_cache_only) and input_ids.size(1) >= _model_cache_only_prefill_min_tokens(model):
+        return prefill_cache_only(input_ids, cache)
     _, cache = _forward(model, input_ids, cache)
     return cache
+
+
+def _model_cache_only_prefill_min_tokens(model: object) -> int:
+    if _is_tensor_parallel_model(model) and _tensor_parallel_world_size(model) > 1:
+        return env_int("TORCHINFERNO_OPENAI_TP_CACHE_ONLY_PREFILL_MIN_TOKENS", 96, minimum=1)
+    return env_int("TORCHINFERNO_OPENAI_CACHE_ONLY_PREFILL_MIN_TOKENS", 1, minimum=1)
 
 
 def _shared_prefix_sample_enabled(temperature: float) -> bool:

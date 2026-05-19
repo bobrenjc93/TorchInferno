@@ -45,6 +45,7 @@ from torchinferno.openai_server import (
     _openai_cuda_graph_enabled_for_model,
     _openai_decode_graph_enabled,
     _openai_ragged_decode_graph_enabled,
+    _prefill_cache_only,
     _prefill_repeated_prefix_next_token,
     _prefers_exact_generation_cache,
     _prompt_list_tensor_payload,
@@ -1693,6 +1694,61 @@ def test_openai_engine_uses_prefill_graph_for_prefix_suffix(monkeypatch) -> None
     assert second == [2]
     assert model.graph_inputs == [[10, 11], [2, 12]]
     assert model.forward_inputs == []
+
+
+def test_openai_prefill_cache_only_prefers_model_hook() -> None:
+    class _CacheOnlyModel(_PrefixRecordingModel):
+        def __init__(self) -> None:
+            super().__init__()
+            self.cache_only_inputs: list[list[int]] = []
+
+        def prefill_cache_only(self, input_ids: torch.Tensor, cache: _PrefixRecordingCache) -> _PrefixRecordingCache:
+            self.cache_only_inputs.append([int(token_id) for token_id in input_ids[0].tolist()])
+            layer = cache.layers[0]
+            start = layer.seq_len
+            end = start + input_ids.size(1)
+            layer.keys[: input_ids.size(0), :, start:end, :].fill_(2)
+            layer.values[: input_ids.size(0), :, start:end, :].fill_(2)
+            layer.seq_len = end
+            return cache
+
+    model = _CacheOnlyModel()
+    cache = model.allocate_cache(1, 4)
+
+    returned = _prefill_cache_only(model, torch.tensor([[1, 2, 3]]), cache)
+
+    assert returned is cache
+    assert model.cache_only_inputs == [[1, 2, 3]]
+    assert model.forward_inputs == []
+    assert cache.seq_len == 3
+    assert torch.equal(cache.layers[0].keys[0, 0, :3, 0], torch.tensor([2.0, 2.0, 2.0]))
+
+
+def test_openai_prefill_cache_only_keeps_short_tensor_parallel_prefixes_on_forward(monkeypatch) -> None:
+    class _CacheOnlyModel(_PrefixRecordingModel):
+        def __init__(self) -> None:
+            super().__init__()
+            self.cache_only_inputs: list[list[int]] = []
+
+        def prefill_cache_only(self, input_ids: torch.Tensor, cache: _PrefixRecordingCache) -> _PrefixRecordingCache:
+            self.cache_only_inputs.append([int(token_id) for token_id in input_ids[0].tolist()])
+            return cache
+
+    model = _CacheOnlyModel()
+    monkeypatch.setattr("torchinferno.openai_server._is_tensor_parallel_model", lambda candidate: candidate is model)
+    monkeypatch.setattr(
+        "torchinferno.openai_server._tensor_parallel_world_size",
+        lambda candidate: 8 if candidate is model else 1,
+    )
+    cache = model.allocate_cache(1, 4)
+
+    returned = _prefill_cache_only(model, torch.tensor([[1, 2, 3]]), cache)
+
+    assert returned is cache
+    assert model.cache_only_inputs == []
+    assert model.forward_inputs == [[1, 2, 3]]
+    assert cache.seq_len == 3
+    assert torch.equal(cache.layers[0].keys[0, 0, :3, 0], torch.tensor([1.0, 1.0, 1.0]))
 
 
 def test_openai_engine_skips_runtime_prefill_graph_capture_on_miss() -> None:

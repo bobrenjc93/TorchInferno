@@ -124,6 +124,44 @@ def test_llama3_70b_config_matches_public_architecture_shape() -> None:
     assert config.rope_scaling["rope_type"] == "llama3"
 
 
+def test_llama3_tensor_parallel_prefill_cache_only_matches_forward_cache(tmp_path) -> None:
+    torch.manual_seed(54)
+    config = tiny_llama3_config(vocab_size=32, max_position_embeddings=16)
+    reference = Llama3V0ForCausalLM(config).eval()
+    _write_tiny_llama3_hf_checkpoint(reference, config, tmp_path)
+    model = Llama3TensorParallelForCausalLM.from_pretrained(tmp_path, dtype="float32").eval()
+    input_ids = torch.tensor([[1, 2, 3, 4]], dtype=torch.long)
+    expected_cache = model.allocate_cache(1, 8)
+    actual_cache = model.allocate_cache(1, 8)
+
+    with torch.inference_mode():
+        _, expected_cache = model.forward(
+            input_ids,
+            cache=expected_cache,
+            use_cache=True,
+            return_last_logits_only=True,
+            return_sharded_logits=True,
+        )
+        returned_cache = model.prefill_cache_only(input_ids, actual_cache)
+
+    assert returned_cache is actual_cache
+    assert expected_cache.seq_len == actual_cache.seq_len == input_ids.size(1)
+    for expected_layer, actual_layer in zip(expected_cache.layers, actual_cache.layers):
+        assert expected_layer.seq_len == actual_layer.seq_len == input_ids.size(1)
+        torch.testing.assert_close(
+            actual_layer.keys[:, :, : input_ids.size(1), :],
+            expected_layer.keys[:, :, : input_ids.size(1), :],
+            atol=5e-5,
+            rtol=5e-5,
+        )
+        torch.testing.assert_close(
+            actual_layer.values[:, :, : input_ids.size(1), :],
+            expected_layer.values[:, :, : input_ids.size(1), :],
+            atol=5e-5,
+            rtol=5e-5,
+        )
+
+
 def test_llama3_rotary_matches_huggingface_rotate_half_layout() -> None:
     torch.manual_seed(53)
     batch, heads, tokens, head_dim = 2, 3, 4, 8

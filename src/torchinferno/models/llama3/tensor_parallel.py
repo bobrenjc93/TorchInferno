@@ -530,6 +530,27 @@ class _Llama3TensorParallelLayer:
             lambda: _tp_decode_add_rms_norm(projected, hidden, next_norm_weight, self.config.rms_norm_eps),
         )
 
+    def append_prefill_cache(
+        self,
+        hidden: Tensor,
+        attn_in: Tensor | None,
+        rotary: tuple[Tensor, Tensor],
+        cache: Llama3TensorParallelLayerKVCache,
+    ) -> None:
+        batch, tokens, _ = hidden.shape
+        head_dim = self.config.head_dim
+        if attn_in is None:
+            _, k, v = self._profile_block(
+                "cache_only_prefill.input_norm_qkv_rotary",
+                lambda: self._input_norm_qkv_rotary(hidden, batch, tokens, head_dim, rotary),
+            )
+        else:
+            _, k, v = self._profile_block(
+                "cache_only_prefill.qkv_rotary",
+                lambda: self._qkv_rotary(attn_in, batch, tokens, head_dim, rotary),
+            )
+        self._profile_block("cache_only_prefill.cache_append", lambda: cache.append(k, v))
+
     def _attention(
         self,
         hidden: Tensor,
@@ -1643,6 +1664,50 @@ class Llama3TensorParallelForCausalLM:
             return logits, active_cache
         logits = self._gather_logits(logits)
         return logits, active_cache
+
+    @torch.inference_mode()
+    def prefill_cache_only(
+        self,
+        input_ids: Tensor,
+        cache: Llama3TensorParallelCache,
+    ) -> Llama3TensorParallelCache:
+        if input_ids.ndim != 2:
+            raise ValueError("input_ids must have shape [batch, sequence]")
+        _, tokens = input_ids.shape
+        if tokens <= 0:
+            return cache
+        past_len = cache.seq_len
+        positions = torch.arange(past_len, past_len + tokens, device=self.device)
+        rotary = self._rotary_cache(past_len, tokens)
+        hidden = F.embedding(input_ids.to(self.device, non_blocking=True), self.embed_tokens_weight)
+        if tokens > 1 and all(layer.profile_seconds is None for layer in self.layers):
+            attn_in: Tensor | None = None
+            last_layer_id = len(self.layers) - 1
+            for layer_id, layer in enumerate(self.layers):
+                if layer_id == last_layer_id:
+                    layer.append_prefill_cache(hidden, attn_in, rotary, cache.layers[layer_id])
+                    break
+                next_norm_weight = (
+                    self.layers[layer_id + 1].input_layernorm_weight
+                    if layer_id + 1 < len(self.layers)
+                    else None
+                )
+                hidden, attn_in = layer.forward_prefill_fast(
+                    hidden,
+                    attn_in,
+                    positions,
+                    rotary,
+                    cache.layers[layer_id],
+                    next_norm_weight,
+                )
+        else:
+            last_layer_id = len(self.layers) - 1
+            for layer_id, layer in enumerate(self.layers):
+                if layer_id == last_layer_id:
+                    layer.append_prefill_cache(hidden, None, rotary, cache.layers[layer_id])
+                    break
+                hidden = layer.forward(hidden, positions, rotary, cache.layers[layer_id])
+        return cache
 
     def try_prefill_graph(
         self,
