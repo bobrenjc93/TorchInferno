@@ -175,6 +175,7 @@ def test_openai_startup_warmup_skips_non_dense_cache_by_default(
     monkeypatch.setenv("TORCHINFERNO_OPENAI_STARTUP_WARMUP_NON_DENSE_CACHE", "0")
 
     assert not _startup_warmup_enabled_for_cache_backend("paged")
+    assert _startup_warmup_enabled_for_cache_backend("dense")
 
 
 def test_openai_server_matches_openai_chat_contract() -> None:

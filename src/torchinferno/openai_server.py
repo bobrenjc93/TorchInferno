@@ -92,7 +92,7 @@ class OpenAIServerConfig:
     token: str | None = None
     revision: str | None = None
     cache_dir: str | None = None
-    cache_backend: str = "paged"
+    cache_backend: str = "dense"
     page_size: int = 16
     max_batch_size: int = 256
     batch_wait_ms: float = 1.0
@@ -11770,7 +11770,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--cache-backend",
         choices=["dense", "paged"],
-        default=os.environ.get("TORCHINFERNO_OPENAI_CACHE_BACKEND", "paged"),
+        default=os.environ.get("TORCHINFERNO_OPENAI_CACHE_BACKEND", "dense"),
     )
     parser.add_argument(
         "--page-size",

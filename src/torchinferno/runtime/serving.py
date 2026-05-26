@@ -1438,7 +1438,7 @@ class ContinuousBatchEngine:
             return False
         if len({state.seq_len for state in states}) <= 1 and not env_flag(
             "TORCHINFERNO_CONTINUOUS_UNIFORM_RAGGED_DECODE",
-            True,
+            False,
         ):
             return False
         return (
