@@ -1704,6 +1704,7 @@ class OpenAICompletionEngine:
             if len(batch) > 1 or self._has_multiple_live_requests():
                 self._collect_batch_until_deadline(batch, limit=batch_limit)
             with self._model_lock:
+                self._drain_ready_requests(batch, limit=batch_limit)
                 self._maybe_cleanup_runtime_after_idle()
                 self._run_queued_batch(batch)
                 self._completed_queue_batches += 1
