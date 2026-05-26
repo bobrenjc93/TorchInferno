@@ -1742,7 +1742,7 @@ class OpenAICompletionEngine:
                     self._completed_queue_batches += 1
 
     def _should_use_unified_scheduler(self) -> bool:
-        if not env_flag("TORCHINFERNO_OPENAI_UNIFIED_SCHEDULER", True):
+        if not env_flag("TORCHINFERNO_OPENAI_UNIFIED_SCHEDULER", False):
             return False
         if not _is_tensor_parallel_primary_model(self.model):
             return False
