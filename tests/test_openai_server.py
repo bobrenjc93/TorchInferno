@@ -9991,7 +9991,7 @@ def test_openai_tp_single_stream_group_defaults_to_batch_path(monkeypatch) -> No
     engine.model = model
     calls: list[tuple[list[list[int]], int, float, list[int] | None]] = []
 
-    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_SINGLE_PROMPT_LIST_STREAM", raising=False)
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_SINGLE_PROMPT_LIST_STREAM", "0")
     monkeypatch.setattr(
         "torchinferno.openai_server._is_tensor_parallel_model",
         lambda candidate: candidate is model,

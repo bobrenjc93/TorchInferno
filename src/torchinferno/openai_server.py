@@ -2484,7 +2484,8 @@ class OpenAICompletionEngine:
         row_max_tokens = [request.max_tokens for request in group]
         use_prompt_list_batch = self._should_use_prompt_list_stream_group(prompts)
         if use_prompt_list_batch and _prefer_tensor_parallel_stream_group(prompts, self.model):
-            use_prompt_list_batch = False
+            if self._shared_prefix_prompt_list_tokens(prompts) <= 0:
+                use_prompt_list_batch = False
         shared_prefix_tokens = self._shared_prefix_prompt_list_tokens(prompts) if use_prompt_list_batch else 0
         profile_queue = bool(self._queue_profile_path_value())
         with _tensor_parallel_symm_mem_allreduce_scope(
@@ -2875,7 +2876,7 @@ class OpenAICompletionEngine:
             len(prompts) == 1
             and _is_tensor_parallel_model(self.model)
             and _prefix_cache_enabled_for_model(self.model)
-            and env_flag("TORCHINFERNO_OPENAI_TP_SINGLE_PROMPT_LIST_STREAM", False)
+            and env_flag("TORCHINFERNO_OPENAI_TP_SINGLE_PROMPT_LIST_STREAM", True)
         )
 
     def _run_queued_completion_group(self, group: list[_QueuedGeneration]) -> None:
