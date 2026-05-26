@@ -383,8 +383,8 @@ class ContinuousBatchEngine:
         if not hasattr(self._cache, "for_rows"):
             raise ValueError("model cache must support row views for persistent serving")
         self._row_seq_lens = [0 for _ in range(total_rows)]
-        self._free_active_rows = list(range(self.max_active_requests))
-        self._free_prefix_rows = list(range(self.max_active_requests, total_rows))
+        self._free_active_rows = list(reversed(range(self.max_active_requests)))
+        self._free_prefix_rows = list(reversed(range(self.max_active_requests, total_rows)))
         self.stats.persistent_cache_rows = total_rows
         self.stats.queued_requests = queued_requests
         self._online_waiting = None
@@ -595,13 +595,15 @@ class ContinuousBatchEngine:
             return None
         suffixes = [request.prompt[prefix_tokens:] for _original_index, request, _hit in group]
         suffix_lengths = [len(suffix) for suffix in suffixes]
-        if not suffix_lengths or min(suffix_lengths) <= 0 or len(set(suffix_lengths)) <= 1:
+        if not suffix_lengths or min(suffix_lengths) <= 0:
             return None
         max_suffix_len = max(suffix_lengths)
-        padding_tokens = len(suffix_lengths) * max_suffix_len - sum(suffix_lengths)
+        static_batch = self._prefill_static_batch_size(len(group))
+        padded_batch_size = max(len(group), static_batch)
+        padding_tokens = padded_batch_size * max_suffix_len - sum(suffix_lengths)
         max_padding_tokens = env_int(
             "TORCHINFERNO_CONTINUOUS_PADDED_SUFFIX_MAX_PADDING_TOKENS",
-            1024,
+            4096,
             minimum=0,
         )
         if padding_tokens > max_padding_tokens:
@@ -614,17 +616,31 @@ class ContinuousBatchEngine:
                 [*suffix, *([0] * (max_suffix_len - len(suffix)))]
                 for suffix in suffixes
             ]
+            pad_rows: list[int] = []
+            if padded_batch_size > len(group):
+                dummy_suffix = padded_suffixes[0] if padded_suffixes else [0] * max_suffix_len
+                for _ in range(padded_batch_size - len(group)):
+                    pad_row = self._acquire_active_row_or_none()
+                    if pad_row is None:
+                        break
+                    pad_rows.append(pad_row)
+                    self._copy_prefix(prefix_row, pad_row, prefix_tokens)
+                    padded_suffixes.append(list(dummy_suffix))
+            all_rows = rows + pad_rows
             input_ids = torch.tensor(padded_suffixes, device=self.device, dtype=torch.long)
             logit_positions = torch.tensor(
-                [length - 1 for length in suffix_lengths],
+                [length - 1 for length in suffix_lengths]
+                + [max_suffix_len - 1] * len(pad_rows),
                 device=self.device,
                 dtype=torch.long,
             )
             logits = self._forward_selected_logits(
                 input_ids,
-                cache=self._cache_view(rows),
+                cache=self._cache_view(all_rows),
                 logit_positions=logit_positions,
             )
+            for pad_row in pad_rows:
+                self._release_active_row(pad_row)
             if logits is None:
                 for row in rows:
                     self._release_active_row(row)
@@ -1208,7 +1224,14 @@ class ContinuousBatchEngine:
     def _acquire_active_row(self) -> int:
         if not self._free_active_rows:
             raise RuntimeError("no active serving rows available")
-        row = self._free_active_rows.pop(0)
+        row = self._free_active_rows.pop()
+        self._clear_physical_row(row)
+        return row
+
+    def _acquire_active_row_or_none(self) -> int | None:
+        if not self._free_active_rows:
+            return None
+        row = self._free_active_rows.pop()
         self._clear_physical_row(row)
         return row
 
@@ -1216,13 +1239,17 @@ class ContinuousBatchEngine:
         self._clear_physical_row(row)
         if row not in self._free_active_rows:
             self._free_active_rows.append(row)
-            self._free_active_rows.sort()
+
+    def _prefill_static_batch_size(self, request_count: int) -> int:
+        target = max(1, request_count)
+        bucket = env_int("TORCHINFERNO_CONTINUOUS_PREFILL_STATIC_BATCH", self.max_active_requests, minimum=1)
+        return min(bucket, self.max_active_requests)
 
     def _acquire_prefix_row(self) -> int | None:
         if self.prefix_cache_capacity == 0:
             return None
         if self._free_prefix_rows:
-            return self._free_prefix_rows.pop(0)
+            return self._free_prefix_rows.pop()
         while self._prefix_order:
             route_id = self._prefix_order.pop(0)
             prefix = self.reusable_prefixes.pop(route_id, None)
