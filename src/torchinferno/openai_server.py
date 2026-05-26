@@ -1707,16 +1707,6 @@ class OpenAICompletionEngine:
                     self.batch_wait_s,
                 )
                 self._collect_batch_until_deadline(batch, limit=batch_limit, wait_s=secondary_wait_s)
-                with self._live_request_condition:
-                    live = self._live_requests
-                if live > len(batch) * 2 and len(batch) < batch_limit:
-                    extra_wait_ms = env_float(
-                        "TORCHINFERNO_OPENAI_TP_LOAD_BATCH_WAIT_MS", 3.0, minimum=0.0
-                    )
-                    if extra_wait_ms > 0.0:
-                        self._collect_batch_until_deadline(
-                            batch, limit=batch_limit, wait_s=extra_wait_ms / 1000.0,
-                        )
             with self._model_lock:
                 self._drain_ready_requests(batch, limit=batch_limit)
                 self._maybe_cleanup_runtime_after_idle()
@@ -1724,7 +1714,7 @@ class OpenAICompletionEngine:
                 self._completed_queue_batches += 1
 
     def _should_use_tensor_parallel_online_batcher(self, first: _QueuedGeneration) -> bool:
-        if not env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_CONTINUOUS_BATCHER", True):
+        if not env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_CONTINUOUS_BATCHER", False):
             return False
         if not first.stream:
             return False
@@ -1772,9 +1762,9 @@ class OpenAICompletionEngine:
         emitted_events = 0
         finished_events = 0
         initial_wait_s = (
-            env_float("TORCHINFERNO_OPENAI_TP_ONLINE_INITIAL_BATCH_WAIT_MS", 0.5, minimum=0.0) / 1000.0
+            env_float("TORCHINFERNO_OPENAI_TP_ONLINE_INITIAL_BATCH_WAIT_MS", 5.0, minimum=0.0) / 1000.0
         )
-        idle_wait_s = env_float("TORCHINFERNO_OPENAI_TP_ONLINE_IDLE_BATCH_WAIT_MS", 0.5, minimum=0.0) / 1000.0
+        idle_wait_s = env_float("TORCHINFERNO_OPENAI_TP_ONLINE_IDLE_BATCH_WAIT_MS", 2.0, minimum=0.0) / 1000.0
         profile_start_s = time.perf_counter()
         phase_ms: dict[str, float] = {}
 
