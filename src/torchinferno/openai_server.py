@@ -1707,6 +1707,16 @@ class OpenAICompletionEngine:
                     self.batch_wait_s,
                 )
                 self._collect_batch_until_deadline(batch, limit=batch_limit, wait_s=secondary_wait_s)
+                with self._live_request_condition:
+                    live = self._live_requests
+                if live > len(batch) * 2 and len(batch) < batch_limit:
+                    extra_wait_ms = env_float(
+                        "TORCHINFERNO_OPENAI_TP_LOAD_BATCH_WAIT_MS", 3.0, minimum=0.0
+                    )
+                    if extra_wait_ms > 0.0:
+                        self._collect_batch_until_deadline(
+                            batch, limit=batch_limit, wait_s=extra_wait_ms / 1000.0,
+                        )
             with self._model_lock:
                 self._drain_ready_requests(batch, limit=batch_limit)
                 self._maybe_cleanup_runtime_after_idle()
