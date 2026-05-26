@@ -1709,7 +1709,7 @@ class OpenAICompletionEngine:
                 self._completed_queue_batches += 1
 
     def _should_use_tensor_parallel_online_batcher(self, first: _QueuedGeneration) -> bool:
-        if not env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_CONTINUOUS_BATCHER", True):
+        if not env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_CONTINUOUS_BATCHER", False):
             return False
         if not first.stream:
             return False
@@ -2589,7 +2589,7 @@ class OpenAICompletionEngine:
                         )
 
     def _should_use_tensor_parallel_online_stream_group(self, group: Sequence[_QueuedGeneration]) -> bool:
-        if not env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_CONTINUOUS", True):
+        if not env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_CONTINUOUS", False):
             return False
         if not group or any(not request.stream for request in group):
             return False
