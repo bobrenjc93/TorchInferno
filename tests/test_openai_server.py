@@ -453,14 +453,15 @@ def test_openai_server_warmup_uses_generic_shape_buckets(monkeypatch) -> None:
 
     assert prompt_counts == {16, 32, 64, 128, 256}
     assert all(count & (count - 1) == 0 for count in prompt_counts)
-    assert set(_warmup_prefill_cache_token_counts()) >= {256, 512}
+    assert set(_warmup_prefill_cache_token_counts()) >= {128, 256, 512, 1024}
     assert prefix_suffix_counts == {(32, 16), (64, 16), (128, 32), (256, 32)}
-    assert set(_warmup_prefix_suffix_cache_token_counts()) >= {256, 512}
+    assert set(_warmup_prefix_suffix_cache_token_counts()) >= {128, 256, 512, 1024}
     assert set(_warmup_temperature_prompt_token_counts()) == {32, 55, 64}
     assert set(_warmup_temperature_batch_sizes()) >= {1, 8, 15, 16, 64}
     assert set(_warmup_ragged_decode_batch_sizes()) == {8, 64}
-    assert set(_warmup_ragged_decode_row_counts()) >= {1, 2, 4, 8, 16, 32, 64}
+    assert set(_warmup_ragged_decode_row_counts()) >= {1, 2, 3, 4, 5, 6, 7, 8, 16, 32, 56, 64}
     assert set(_warmup_ragged_decode_cache_token_counts()) >= {256, 512}
+    assert (64, 1024) in set(_warmup_ragged_decode_extra_cache_specs())
     assert _warmup_ragged_decode_prompt_tokens(64) == 64
 
 
@@ -5603,7 +5604,6 @@ def test_openai_engine_cache_pool_is_bounded(monkeypatch) -> None:
 
 
 def test_openai_tensor_parallel_generation_cache_uses_batch_buckets(monkeypatch) -> None:
-    monkeypatch.setenv("TORCHINFERNO_OPENAI_CACHE_POOL_MAX_ENTRIES", "5")
     engine = _cache_only_engine()
     model = _BatchRecordingModel()
     monkeypatch.setattr(

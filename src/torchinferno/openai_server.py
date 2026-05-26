@@ -9536,11 +9536,11 @@ def _generation_cache_batch_capacity(model: object, requested_batch: int) -> int
 
 
 def _cache_pool_max_entries() -> int:
-    return env_int("TORCHINFERNO_OPENAI_CACHE_POOL_MAX_ENTRIES", 2, minimum=0)
+    return env_int("TORCHINFERNO_OPENAI_CACHE_POOL_MAX_ENTRIES", 5, minimum=0)
 
 
 def _microbatch_cache_pool_max_entries() -> int:
-    return env_int("TORCHINFERNO_OPENAI_MICROBATCH_CACHE_POOL_MAX_ENTRIES", 2, minimum=0)
+    return env_int("TORCHINFERNO_OPENAI_MICROBATCH_CACHE_POOL_MAX_ENTRIES", 8, minimum=0)
 
 
 def _generation_cache_seq_len(cache: object) -> int:
