@@ -1741,6 +1741,33 @@ class OpenAICompletionEngine:
                     self._run_queued_batch(next_batch)
                     self._completed_queue_batches += 1
 
+    def _warmup_unified_scheduler_cache(self, vocab_size: int) -> None:
+        max_active = _effective_openai_max_batch_size(self.model, self.device, self.max_batch_size)
+        cache_batch = _generation_cache_batch_capacity(self.model, max_active)
+        max_seq_len = env_int(
+            "TORCHINFERNO_OPENAI_UNIFIED_MAX_SEQ_LEN",
+            getattr(self, "max_model_len", None) or 512,
+            minimum=64,
+        )
+        cache = self._generation_cache(
+            cache_batch,
+            max_seq_len,
+            model=self.model,
+            batch_capacity=cache_batch,
+        )
+        from torchinferno.models.llama3.tensor_parallel import _PREFILL_TOKEN_BUCKETS
+        for bucket in _PREFILL_TOKEN_BUCKETS:
+            if bucket > max_seq_len:
+                break
+            cache_view = _cache_row_slice(cache, 0, 1)
+            if cache_view is None:
+                continue
+            _reset_generation_cache(cache_view)
+            input_ids = (torch.arange(bucket, device=self.device, dtype=torch.long) % vocab_size)[None, :]
+            _try_prefill_logits_graph(self.model, input_ids, cache_view, allow_capture=True)
+            _reset_generation_cache(cache_view)
+        _reset_generation_cache(cache)
+
     def _warmup_token_budget_prefill_graphs(self, prefill_chunk_size: int) -> None:
         state = self._token_budget_step_state
         if state is None:
@@ -1764,7 +1791,7 @@ class OpenAICompletionEngine:
                 _reset_generation_cache(cache_view)
 
     def _should_use_unified_scheduler(self) -> bool:
-        if not env_flag("TORCHINFERNO_OPENAI_UNIFIED_SCHEDULER", False):
+        if not env_flag("TORCHINFERNO_OPENAI_UNIFIED_SCHEDULER", True):
             return False
         if not _is_tensor_parallel_primary_model(self.model):
             return False
@@ -3855,6 +3882,8 @@ class OpenAICompletionEngine:
             )
             self._generation_cache(1, warmup_cache_tokens, model=self.model, pool=False)
             _warmup_tensor_parallel_decode_attention(self.model)
+            if self._should_use_unified_scheduler():
+                self._warmup_unified_scheduler_cache(vocab_size)
         torch.cuda.synchronize(self.device)
 
     def _warmup_tensor_parallel_prefill_graphs(
@@ -7113,7 +7142,13 @@ class OpenAICompletionEngine:
         if cache_view is None:
             raise RuntimeError("token-budget prefill requires row-view cache")
         input_ids = torch.tensor([prompt_chunk], dtype=torch.long, device=self.device)
-        logits, _cache_view = _forward(self.model, input_ids, cache_view)
+        prefill_logits = _try_prefill_logits_graph(
+            self.model, input_ids, cache_view, allow_capture=False,
+        )
+        if prefill_logits is not None:
+            logits = prefill_logits
+        else:
+            logits, _cache_view = _forward(self.model, input_ids, cache_view)
         state.seq_lens[row] = start_token + token_count
         if not bool(chunk.get("prompt_complete", False)):
             return None
