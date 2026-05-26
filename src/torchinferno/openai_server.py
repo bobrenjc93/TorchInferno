@@ -1764,7 +1764,7 @@ class OpenAICompletionEngine:
                 continue
             _reset_generation_cache(cache_view)
             input_ids = (torch.arange(bucket, device=self.device, dtype=torch.long) % vocab_size)[None, :]
-            _try_prefill_logits_graph(self.model, input_ids, cache_view, allow_capture=True)
+            _try_prefill_graph(self.model, input_ids, cache_view, 0.0, allow_capture=True)
             _reset_generation_cache(cache_view)
         _reset_generation_cache(cache)
 
@@ -7142,13 +7142,18 @@ class OpenAICompletionEngine:
         if cache_view is None:
             raise RuntimeError("token-budget prefill requires row-view cache")
         input_ids = torch.tensor([prompt_chunk], dtype=torch.long, device=self.device)
-        prefill_logits = _try_prefill_logits_graph(
-            self.model, input_ids, cache_view, allow_capture=False,
+        prefill_token = _try_prefill_graph(
+            self.model, input_ids, cache_view, temperature, allow_capture=False,
         )
-        if prefill_logits is not None:
-            logits = prefill_logits
-        else:
-            logits, _cache_view = _forward(self.model, input_ids, cache_view)
+        if prefill_token is not None:
+            state.seq_lens[row] = start_token + token_count
+            if bool(chunk.get("prompt_complete", False)) and bool(chunk.get("emits_token", False)):
+                token_id = int(prefill_token.item())
+                state.next_token_tensor[row] = token_id
+                state.generated_tokens[row] += 1
+                return token_id
+            return None
+        logits, _cache_view = _forward(self.model, input_ids, cache_view)
         state.seq_lens[row] = start_token + token_count
         if not bool(chunk.get("prompt_complete", False)):
             return None
