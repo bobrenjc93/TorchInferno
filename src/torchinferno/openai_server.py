@@ -2361,7 +2361,7 @@ class OpenAICompletionEngine:
         if first.max_tokens > max_tokens:
             return self.batch_wait_s
         short_max_tokens = env_int("TORCHINFERNO_OPENAI_SHORT_STREAM_MAX_TOKENS", 256, minimum=1)
-        default_wait_ms = 5.0 if first.max_tokens <= short_max_tokens else 5.0
+        default_wait_ms = 1.0 if first.max_tokens <= short_max_tokens else 2.0
         temperature_wait_s = (
             env_float("TORCHINFERNO_OPENAI_TEMPERATURE_BATCH_WAIT_MS", default_wait_ms, minimum=0.0)
             / 1000.0
@@ -2438,11 +2438,11 @@ class OpenAICompletionEngine:
         if first.max_tokens <= short_max_tokens:
             wait_ms = env_float(
                 "TORCHINFERNO_OPENAI_TP_SHORT_SAMPLED_INITIAL_BATCH_WAIT_MS",
-                5.0,
+                1.0,
                 minimum=0.0,
             )
         else:
-            wait_ms = env_float("TORCHINFERNO_OPENAI_TP_SAMPLED_INITIAL_BATCH_WAIT_MS", 5.0, minimum=0.0)
+            wait_ms = env_float("TORCHINFERNO_OPENAI_TP_SAMPLED_INITIAL_BATCH_WAIT_MS", 1.0, minimum=0.0)
         return min(self._queued_batch_wait_s(first), wait_ms / 1000.0)
 
     def _run_queued_batch(self, batch: list[_QueuedGeneration]) -> None:
