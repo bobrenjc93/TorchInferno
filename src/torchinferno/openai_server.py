@@ -3732,7 +3732,7 @@ class OpenAICompletionEngine:
                 _reset_generation_cache(cache)
 
     def _warmup_tensor_parallel_batched_prefix_suffix_graphs(self, vocab_size: int) -> None:
-        if not env_flag("TORCHINFERNO_OPENAI_WARMUP_BATCHED_PREFIX_SUFFIX", True):
+        if not env_flag("TORCHINFERNO_OPENAI_WARMUP_BATCHED_PREFIX_SUFFIX", False):
             return
         if not (
             _is_tensor_parallel_model(self.model)
