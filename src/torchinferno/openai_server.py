@@ -1902,7 +1902,6 @@ class OpenAICompletionEngine:
                             payload["temperature"] = 0.0
                             _broadcast_tensor_parallel_token_budget_decode_run(self.model, payload)
                             result = self._handle_token_budget_decode_run_payload(payload)
-                            _sync_tensor_parallel_command(self.model, self.device)
                             run_finished: list[str] = []
                             for step_result in result.step_results:
                                 run_finished.extend(_emit_result(step_result))
@@ -1916,7 +1915,6 @@ class OpenAICompletionEngine:
                     payload["temperature"] = 0.0
                     _broadcast_tensor_parallel_token_budget_step(self.model, payload)
                     result = self._handle_token_budget_step_payload(payload)
-                    _sync_tensor_parallel_command(self.model, self.device)
                     finished_ids = _emit_result(result)
                     _drain_queue()
                     self._completed_queue_batches += 1
