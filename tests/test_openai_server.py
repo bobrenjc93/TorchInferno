@@ -685,6 +685,7 @@ def test_openai_engine_drains_tensor_parallel_direct_generator_on_close(monkeypa
 
 def test_openai_engine_tensor_parallel_primary_queues_single_stream_request(monkeypatch) -> None:
     monkeypatch.setattr("torchinferno.openai_server._is_tensor_parallel_primary_model", lambda model: True)
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_CONTINUOUS_BATCHER", "0")
     model = _BatchRecordingModel()
     engine = OpenAICompletionEngine(
         model,
@@ -10223,6 +10224,7 @@ def test_openai_stream_group_can_drive_tensor_parallel_online_runtime(monkeypatc
             return self.event_batches.pop(0)
 
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_CONTINUOUS", "1")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_DECODE_QUANTUM", "1")
     monkeypatch.setattr(
         "torchinferno.openai_server._is_tensor_parallel_model",
         lambda candidate: candidate is model,
@@ -10289,7 +10291,7 @@ def test_openai_stream_group_can_drive_tensor_parallel_online_runtime(monkeypatc
         ("step", 1),
         ("close", None),
     ]
-    assert syncs == ["sync", "sync", "sync", "sync", "sync"]
+    assert syncs == ["sync", "sync", "sync"]
     first_items = _queue_items(first_queue)
     second_items = _queue_items(second_queue)
     assert first_items[:2] == [101, 102]
@@ -10329,6 +10331,7 @@ def test_openai_tensor_parallel_online_batcher_drains_ready_requests(monkeypatch
             return events
 
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_CONTINUOUS_BATCHER", "1")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_DECODE_QUANTUM", "1")
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_MAX_SEQ_LEN_HEADROOM_TOKENS", "0")
     monkeypatch.setattr(
         "torchinferno.openai_server._is_tensor_parallel_model",
@@ -10378,7 +10381,7 @@ def test_openai_tensor_parallel_online_batcher_drains_ready_requests(monkeypatch
         ("step", 1),
         ("close", None),
     ]
-    assert syncs == ["sync", "sync", "sync", "sync"]
+    assert syncs == ["sync", "sync", "sync"]
     first_items = _queue_items(first_queue)
     second_items = _queue_items(second_queue)
     assert first_items[0] == 300
@@ -10416,6 +10419,7 @@ def test_openai_tensor_parallel_online_batcher_uses_queued_limit_for_default_row
             return events
 
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_CONTINUOUS_BATCHER", "1")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_DECODE_QUANTUM", "1")
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_INITIAL_BATCH_WAIT_MS", "0")
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_IDLE_BATCH_WAIT_MS", "0")
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_MAX_SEQ_LEN_HEADROOM_TOKENS", "0")
@@ -10548,6 +10552,7 @@ def test_openai_tensor_parallel_online_batcher_sizes_cache_from_initial_window(
             return events
 
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_CONTINUOUS_BATCHER", "1")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_DECODE_QUANTUM", "1")
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_INITIAL_BATCH_WAIT_MS", "0")
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_IDLE_BATCH_WAIT_MS", "0")
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_MAX_SEQ_LEN_HEADROOM_TOKENS", "0")
@@ -10649,6 +10654,7 @@ def test_openai_tensor_parallel_online_batcher_drains_after_short_step(monkeypat
             return events
 
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_CONTINUOUS_BATCHER", "1")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_DECODE_QUANTUM", "1")
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_INITIAL_BATCH_WAIT_MS", "0")
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_IDLE_BATCH_WAIT_MS", "0")
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_MAX_SEQ_LEN_HEADROOM_TOKENS", "0")
@@ -10688,7 +10694,7 @@ def test_openai_tensor_parallel_online_batcher_drains_after_short_step(monkeypat
         ("step", 1),
         ("close", None),
     ]
-    assert syncs == ["sync", "sync", "sync", "sync", "sync", "sync"]
+    assert syncs == ["sync", "sync", "sync", "sync"]
     first_items = _queue_items(first_queue)
     second_items = _queue_items(second_queue)
     assert first_items[0] == 400

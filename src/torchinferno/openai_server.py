@@ -1709,7 +1709,7 @@ class OpenAICompletionEngine:
                 self._completed_queue_batches += 1
 
     def _should_use_tensor_parallel_online_batcher(self, first: _QueuedGeneration) -> bool:
-        if not env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_CONTINUOUS_BATCHER", False):
+        if not env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_CONTINUOUS_BATCHER", True):
             return False
         if not first.stream:
             return False
@@ -1939,7 +1939,7 @@ class OpenAICompletionEngine:
                 _sync_tensor_parallel_command(self.model, self.device)
                 add_phase("start_sync_ms", start_sync_start_s)
                 submit_batch(initial_batch, arrival_step=0)
-                decode_quantum = env_int("TORCHINFERNO_OPENAI_TP_ONLINE_DECODE_QUANTUM", 1, minimum=1)
+                decode_quantum = env_int("TORCHINFERNO_OPENAI_TP_ONLINE_DECODE_QUANTUM", 8, minimum=1)
                 while True:
                     drain_ready(step)
                     if not runtime_engine.has_online_work():
@@ -1972,9 +1972,10 @@ class OpenAICompletionEngine:
                                 finished_events += 1
                         add_phase("event_emit_ms", event_emit_start_s)
                         step += 1
-                    step_sync_start_s = time.perf_counter()
-                    _sync_tensor_parallel_command(self.model, self.device)
-                    add_phase("step_sync_ms", step_sync_start_s)
+                    if env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_STEP_SYNC", False):
+                        step_sync_start_s = time.perf_counter()
+                        _sync_tensor_parallel_command(self.model, self.device)
+                        add_phase("step_sync_ms", step_sync_start_s)
         except BaseException as exc:
             for request in request_by_id.values():
                 if not request.done:
@@ -2697,7 +2698,7 @@ class OpenAICompletionEngine:
                         )
                 )
                 _sync_tensor_parallel_command(self.model, self.device)
-                decode_quantum = env_int("TORCHINFERNO_OPENAI_TP_ONLINE_DECODE_QUANTUM", 1, minimum=1)
+                decode_quantum = env_int("TORCHINFERNO_OPENAI_TP_ONLINE_DECODE_QUANTUM", 8, minimum=1)
                 while runtime_engine.has_online_work():
                     _broadcast_tensor_parallel_online_step(self.model, decode_quantum)
                     online_step_commands += 1
@@ -2719,7 +2720,8 @@ class OpenAICompletionEngine:
                                 _finish_stream_request(request)
                                 finished_events += 1
                         online_steps += 1
-                    _sync_tensor_parallel_command(self.model, self.device)
+                    if env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_STEP_SYNC", False):
+                        _sync_tensor_parallel_command(self.model, self.device)
         finally:
             self._record_runtime_engine_queue_profile(
                 "online_stream_group",
