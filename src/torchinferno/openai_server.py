@@ -1788,7 +1788,7 @@ class OpenAICompletionEngine:
         stop_token_ids = getattr(self, "stop_token_ids", frozenset())
         max_model_len = env_int(
             "TORCHINFERNO_OPENAI_UNIFIED_MAX_SEQ_LEN",
-            getattr(self, "max_model_len", None) or 1024,
+            getattr(self, "max_model_len", None) or 512,
             minimum=64,
         )
         cache_batch = _generation_cache_batch_capacity(self.model, max_active)
