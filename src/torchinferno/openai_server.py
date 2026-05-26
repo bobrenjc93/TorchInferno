@@ -1742,7 +1742,7 @@ class OpenAICompletionEngine:
                     self._completed_queue_batches += 1
 
     def _should_use_unified_scheduler(self) -> bool:
-        if not env_flag("TORCHINFERNO_OPENAI_UNIFIED_SCHEDULER", False):
+        if not env_flag("TORCHINFERNO_OPENAI_UNIFIED_SCHEDULER", True):
             return False
         if not _is_tensor_parallel_primary_model(self.model):
             return False
@@ -1751,15 +1751,11 @@ class OpenAICompletionEngine:
         return hasattr(self.model, "allocate_cache")
 
     def _unified_scheduler_worker(self) -> None:
-        from torchinferno.runtime.scheduler import (
-            TokenBudgetRequest as _TBRequest,
-            TokenBudgetScheduler as _TBScheduler,
-        )
-
         max_active = _effective_openai_max_batch_size(self.model, self.device, self.max_batch_size)
         max_tokens_per_step = env_int("TORCHINFERNO_OPENAI_UNIFIED_MAX_TOKENS", 2048, minimum=1)
         prefill_chunk = env_int("TORCHINFERNO_OPENAI_UNIFIED_PREFILL_CHUNK", 512, minimum=1)
-        scheduler = _TBScheduler(
+        decode_run_steps = env_int("TORCHINFERNO_OPENAI_UNIFIED_DECODE_RUN_STEPS", 4, minimum=1)
+        scheduler = _TokenBudgetScheduler(
             max_rows=max_active,
             max_scheduled_tokens=max_tokens_per_step,
             prefill_chunk_size=prefill_chunk,
@@ -1768,18 +1764,69 @@ class OpenAICompletionEngine:
         request_map: dict[str, _QueuedGeneration] = {}
         next_id = 0
         stop_token_ids = getattr(self, "stop_token_ids", frozenset())
-        eos_token_id = next(iter(stop_token_ids)) if len(stop_token_ids) == 1 else None
         max_model_len = getattr(self, "max_model_len", None) or 4096
         cache_batch = _generation_cache_batch_capacity(self.model, max_active)
-        state: object | None = None
+        finished_ids: tuple[str, ...] = ()
+        shutdown = False
+
+        def _drain_queue() -> bool:
+            nonlocal next_id, shutdown
+            admitted = False
+            while True:
+                try:
+                    item = self._generation_queue.get_nowait()
+                except queue.Empty:
+                    break
+                if item is None:
+                    self._generation_queue.put(None)
+                    shutdown = True
+                    break
+                if not item.stream:
+                    item.responses.put(RuntimeError("unified scheduler only supports streaming"))
+                    continue
+                rid = str(next_id)
+                next_id += 1
+                request_map[rid] = item
+                scheduler.submit(_TokenBudgetRequest(
+                    request_id=rid,
+                    prompt_tokens=len(item.prompt),
+                    max_new_tokens=max(1, item.max_tokens),
+                ))
+                admitted = True
+            return admitted
+
+        def _emit_result(result: object) -> tuple[str, ...]:
+            new_finished: list[str] = []
+            all_tokens: dict[str, int | None] = {}
+            if hasattr(result, "decode_tokens"):
+                all_tokens.update(result.decode_tokens)
+            if hasattr(result, "prefill_tokens"):
+                all_tokens.update(result.prefill_tokens)
+            if hasattr(result, "finished_request_ids"):
+                for rid in result.finished_request_ids:
+                    if rid not in new_finished:
+                        new_finished.append(rid)
+            for rid, token_id in all_tokens.items():
+                req = request_map.get(rid)
+                if req is None or req.done:
+                    continue
+                if token_id is None:
+                    continue
+                tok = int(token_id)
+                if tok in stop_token_ids:
+                    _finish_stream_request(req)
+                    if rid not in new_finished:
+                        new_finished.append(rid)
+                else:
+                    req.responses.put(tok)
+            for rid in new_finished:
+                req = request_map.pop(rid, None)
+                if req is not None and not req.done:
+                    _finish_stream_request(req)
+            return tuple(new_finished)
 
         with self._model_lock:
             try:
-                state = self._start_token_budget_step_state(
-                    cache_batch_size=cache_batch,
-                    max_seq_len=max_model_len,
-                    temperature=0.0,
-                )
                 _broadcast_tensor_parallel_token_budget_start(
                     self.model,
                     max_seq_len=max_model_len,
@@ -1787,32 +1834,16 @@ class OpenAICompletionEngine:
                     temperature=0.0,
                     max_tokens=max_tokens_per_step,
                 )
+                self._start_token_budget_step_state(
+                    cache_batch_size=cache_batch,
+                    max_seq_len=max_model_len,
+                    temperature=0.0,
+                )
                 _sync_tensor_parallel_command(self.model, self.device)
 
-                while True:
-                    changed = False
-                    while not self._generation_queue.empty():
-                        try:
-                            item = self._generation_queue.get_nowait()
-                        except queue.Empty:
-                            break
-                        if item is None:
-                            self._generation_queue.put(None)
-                            self._closed = True
-                            break
-                        rid = str(next_id)
-                        next_id += 1
-                        request_map[rid] = item
-                        scheduler.submit(_TBRequest(
-                            request_id=rid,
-                            prompt_tokens=tuple(item.prompt),
-                            max_new_tokens=item.max_tokens,
-                            temperature=item.temperature,
-                            eos_token_id=eos_token_id,
-                        ))
-                        changed = True
-
-                    if self._closed:
+                while not shutdown:
+                    _drain_queue()
+                    if shutdown:
                         break
 
                     if not scheduler.has_work():
@@ -1825,51 +1856,60 @@ class OpenAICompletionEngine:
                         rid = str(next_id)
                         next_id += 1
                         request_map[rid] = item
-                        scheduler.submit(_TBRequest(
+                        scheduler.submit(_TokenBudgetRequest(
                             request_id=rid,
-                            prompt_tokens=tuple(item.prompt),
-                            max_new_tokens=item.max_tokens,
-                            temperature=item.temperature,
-                            eos_token_id=eos_token_id,
+                            prompt_tokens=len(item.prompt),
+                            max_new_tokens=max(1, item.max_tokens),
                         ))
+                        _drain_queue()
                         continue
 
-                    finished_ids: list[str] = []
                     plan = scheduler.step(finished_request_ids=finished_ids)
-                    command = _token_budget_model_step_command(plan)
+                    finished_ids = ()
+                    if not plan.chunks:
+                        continue
 
-                    _broadcast_tensor_parallel_token_budget_step_command(
-                        self.model, command,
-                    )
-                    result = self._execute_token_budget_step_payload(
-                        command._asdict() if hasattr(command, "_asdict") else vars(command),
-                        state,
-                    )
+                    if decode_run_steps > 1 and _token_budget_plan_is_decode_only(plan):
+                        plans = [plan]
+                        while (
+                            len(plans) < decode_run_steps
+                            and not plans[-1].finished_request_ids
+                            and scheduler.has_work()
+                        ):
+                            next_plan = scheduler.step(finished_request_ids=())
+                            if not next_plan.chunks:
+                                if next_plan.finished_request_ids:
+                                    finished_ids = next_plan.finished_request_ids
+                                    break
+                                continue
+                            if not _token_budget_plan_is_decode_only(next_plan):
+                                plan = next_plan
+                                break
+                            plans.append(next_plan)
+                        else:
+                            plan = None
+                        if plans:
+                            payload = _token_budget_decode_run_payload(plans, request_map)
+                            payload["temperature"] = 0.0
+                            _broadcast_tensor_parallel_token_budget_decode_run(self.model, payload)
+                            result = self._handle_token_budget_decode_run_payload(payload)
+                            _sync_tensor_parallel_command(self.model, self.device)
+                            run_finished: list[str] = []
+                            for step_result in result.step_results:
+                                run_finished.extend(_emit_result(step_result))
+                            finished_ids = tuple(run_finished) + (finished_ids or ())
+                            _drain_queue()
+                            self._completed_queue_batches += 1
+                        if plan is None:
+                            continue
+
+                    payload = _token_budget_step_payload(plan, request_map)
+                    payload["temperature"] = 0.0
+                    _broadcast_tensor_parallel_token_budget_step(self.model, payload)
+                    result = self._handle_token_budget_step_payload(payload)
                     _sync_tensor_parallel_command(self.model, self.device)
-
-                    if result is not None:
-                        finished_ids = []
-                        for rid, token_id in result.items():
-                            req = request_map.get(rid)
-                            if req is None or req.done:
-                                continue
-                            if token_id is None:
-                                continue
-                            tok = int(token_id)
-                            if tok in stop_token_ids:
-                                _finish_stream_request(req)
-                                finished_ids.append(rid)
-                            else:
-                                req.responses.put(tok)
-                                gen = request_map[rid]
-                                gen_count = getattr(gen, "_unified_gen", 0) + 1
-                                gen._unified_gen = gen_count
-                                if gen_count >= gen.max_tokens:
-                                    _finish_stream_request(req)
-                                    finished_ids.append(rid)
-                        for rid in finished_ids:
-                            request_map.pop(rid, None)
-
+                    finished_ids = _emit_result(result)
+                    _drain_queue()
                     self._completed_queue_batches += 1
 
             except BaseException as exc:
@@ -1877,7 +1917,6 @@ class OpenAICompletionEngine:
                     if not req.done:
                         req.responses.put(exc)
                         req.done = True
-                raise
             finally:
                 handler = getattr(self, "_handle_token_budget_close_payload", None)
                 if callable(handler):

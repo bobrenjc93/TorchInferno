@@ -685,6 +685,7 @@ def test_openai_engine_drains_tensor_parallel_direct_generator_on_close(monkeypa
 
 def test_openai_engine_tensor_parallel_primary_queues_single_stream_request(monkeypatch) -> None:
     monkeypatch.setattr("torchinferno.openai_server._is_tensor_parallel_primary_model", lambda model: True)
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_UNIFIED_SCHEDULER", "0")
     model = _BatchRecordingModel()
     engine = OpenAICompletionEngine(
         model,
