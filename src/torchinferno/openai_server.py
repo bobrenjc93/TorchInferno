@@ -1735,7 +1735,7 @@ class OpenAICompletionEngine:
                     self._completed_queue_batches += 1
 
     def _should_use_tensor_parallel_online_batcher(self, first: _QueuedGeneration) -> bool:
-        if not env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_CONTINUOUS_BATCHER", False):
+        if not env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_CONTINUOUS_BATCHER", True):
             return False
         if not first.stream:
             return False
@@ -1766,7 +1766,7 @@ class OpenAICompletionEngine:
         )
         prefix_rows = env_int(
             "TORCHINFERNO_OPENAI_TP_ONLINE_PREFIX_ROWS",
-            min(4, max_active),
+            0,
             minimum=0,
         )
         prefill_budget = (
@@ -1960,7 +1960,19 @@ class OpenAICompletionEngine:
                     store_full_prompt_prefixes=store_full_prompt_prefixes,
                     max_tokens=run_max_tokens,
                 )
-                runtime_engine.start_online(max_seq_len=max_seq_len)
+                shared_cache: object | None = None
+                try:
+                    total_online_rows = max_active + prefix_rows
+                    shared_cache = self._generation_cache(
+                        total_online_rows,
+                        max_seq_len,
+                        model=self.model,
+                        batch_capacity=_generation_cache_batch_capacity(self.model, total_online_rows),
+                    )
+                    _reset_generation_cache(shared_cache)
+                except Exception:
+                    shared_cache = None
+                runtime_engine.start_online(max_seq_len=max_seq_len, external_cache=shared_cache)
                 started = True
                 _sync_tensor_parallel_command(self.model, self.device)
                 add_phase("start_sync_ms", start_sync_start_s)

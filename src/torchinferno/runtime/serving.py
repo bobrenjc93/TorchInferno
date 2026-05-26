@@ -321,10 +321,10 @@ class ContinuousBatchEngine:
                 if next_arrival_step is not None and not active and next_arrival_step > step:
                     step = next_arrival_step
 
-    def start_online(self, *, max_seq_len: int) -> None:
+    def start_online(self, *, max_seq_len: int, external_cache: object | None = None) -> None:
         if max_seq_len < 1:
             raise ValueError("max_seq_len must be positive")
-        self._reset_capacity(max_seq_len=max_seq_len, queued_requests=0)
+        self._reset_capacity(max_seq_len=max_seq_len, queued_requests=0, external_cache=external_cache)
         self._online_waiting = ServingQueue()
         self._online_active = []
         self._online_step = 0
@@ -371,7 +371,13 @@ class ContinuousBatchEngine:
         max_seq_len = max((len(request.prompt) + request.max_new_tokens for request in requests), default=1)
         self._reset_capacity(max_seq_len=max(1, max_seq_len), queued_requests=len(requests))
 
-    def _reset_capacity(self, *, max_seq_len: int, queued_requests: int) -> None:
+    def _reset_capacity(
+        self,
+        *,
+        max_seq_len: int,
+        queued_requests: int,
+        external_cache: object | None = None,
+    ) -> None:
         self.stats = ServingStats()
         self.prefix_cache = PrefixCacheIndex()
         self.reusable_prefixes = {}
@@ -379,7 +385,10 @@ class ContinuousBatchEngine:
         self._cache_views = {}
         self._reported_static_graph_miss = False
         total_rows = self.max_active_requests + self.prefix_cache_capacity
-        self._cache = self._allocate_cache(max(1, total_rows), max_seq_len)
+        if external_cache is not None:
+            self._cache = external_cache
+        else:
+            self._cache = self._allocate_cache(max(1, total_rows), max_seq_len)
         if not hasattr(self._cache, "for_rows"):
             raise ValueError("model cache must support row views for persistent serving")
         self._row_seq_lens = [0 for _ in range(total_rows)]
