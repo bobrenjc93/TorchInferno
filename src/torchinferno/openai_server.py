@@ -1735,7 +1735,7 @@ class OpenAICompletionEngine:
                     self._completed_queue_batches += 1
 
     def _should_use_tensor_parallel_online_batcher(self, first: _QueuedGeneration) -> bool:
-        if not env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_CONTINUOUS_BATCHER", False):
+        if not env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_CONTINUOUS_BATCHER", True):
             return False
         if not first.stream:
             return False
@@ -9362,7 +9362,23 @@ def _tensor_parallel_worker_loop(engine: OpenAICompletionEngine) -> None:
                     store_reusable_prefixes=bool(payload.get("store_reusable_prefixes", True)),
                     store_full_prompt_prefixes=bool(payload.get("store_full_prompt_prefixes", True)),
                 )
-                online_runtime_engine.start_online(max_seq_len=max_seq_len)
+                worker_shared_cache: object | None = None
+                try:
+                    total_rows = max_active + prefix_rows
+                    worker_shared_cache = engine._generation_cache(
+                        total_rows,
+                        max_seq_len,
+                        model=getattr(engine, "model"),
+                        batch_capacity=_generation_cache_batch_capacity(
+                            getattr(engine, "model"), total_rows,
+                        ),
+                    )
+                    _reset_generation_cache(worker_shared_cache)
+                except Exception:
+                    worker_shared_cache = None
+                online_runtime_engine.start_online(
+                    max_seq_len=max_seq_len, external_cache=worker_shared_cache,
+                )
                 online_symm_scope = _tensor_parallel_symm_mem_allreduce_scope(
                     getattr(engine, "model"),
                     getattr(engine, "device", torch.device("cpu")),
@@ -9520,11 +9536,11 @@ def _generation_cache_batch_capacity(model: object, requested_batch: int) -> int
 
 
 def _cache_pool_max_entries() -> int:
-    return env_int("TORCHINFERNO_OPENAI_CACHE_POOL_MAX_ENTRIES", 5, minimum=0)
+    return env_int("TORCHINFERNO_OPENAI_CACHE_POOL_MAX_ENTRIES", 2, minimum=0)
 
 
 def _microbatch_cache_pool_max_entries() -> int:
-    return env_int("TORCHINFERNO_OPENAI_MICROBATCH_CACHE_POOL_MAX_ENTRIES", 8, minimum=0)
+    return env_int("TORCHINFERNO_OPENAI_MICROBATCH_CACHE_POOL_MAX_ENTRIES", 2, minimum=0)
 
 
 def _generation_cache_seq_len(cache: object) -> int:
