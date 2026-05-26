@@ -117,6 +117,8 @@ class _StaticPrefillActivationGraphCall:
 
 
 class Llama3TensorParallelLayerKVCache:
+    cache_backend = "dense"
+
     def __init__(
         self,
         batch_size: int,
@@ -135,6 +137,7 @@ class Llama3TensorParallelLayerKVCache:
         self._seq_lens = [0 for _ in range(batch_size)]
         self._uniform_seq_len: list[int | None] = [0]
         self._row_indices: tuple[int, ...] | None = None
+        self._row_indices_tensor: Tensor | None = None
 
     @property
     def seq_len(self) -> int:
@@ -178,20 +181,39 @@ class Llama3TensorParallelLayerKVCache:
         end = start + tokens
         if end > self.max_seq_len:
             raise ValueError("KV cache capacity exceeded")
-        if (
-            self._row_indices is None
-            and keys.is_cuda
-            and values.is_cuda
-            and _tp_flag("TORCHINFERNO_TRITON_KV_APPEND")
-        ):
+        triton_target: tuple[Tensor, Tensor] | None = None
+        if keys.is_cuda and values.is_cuda and _tp_flag("TORCHINFERNO_TRITON_KV_APPEND"):
+            if self._row_indices is None:
+                triton_target = (self.keys, self.values)
+            else:
+                if rows is None:
+                    rows = self._selected_rows(batch)
+                span = _contiguous_row_span(rows)
+                if span is not None:
+                    row_start, row_end = span
+                    triton_target = (self.keys[row_start:row_end], self.values[row_start:row_end])
+        if triton_target is not None:
             try:
                 from torchinferno.kernels.triton_ops import triton_append_kv_cache
 
-                triton_append_kv_cache(keys, values, self.keys, self.values, start)
+                triton_append_kv_cache(keys, values, triton_target[0], triton_target[1], start)
             except Exception as exc:
                 warn_optional_failure("llama3_tensor_parallel.triton_kv_append", exc)
-                self.keys[:batch, :, start:end, :].copy_(keys)
-                self.values[:batch, :, start:end, :].copy_(values)
+                if self._row_indices is None:
+                    self.keys[:batch, :, start:end, :].copy_(keys)
+                    self.values[:batch, :, start:end, :].copy_(values)
+                else:
+                    if rows is None:
+                        rows = self._selected_rows(batch)
+                    span = _contiguous_row_span(rows)
+                    if span is not None:
+                        row_start, row_end = span
+                        self.keys[row_start:row_end, :, start:end, :].copy_(keys)
+                        self.values[row_start:row_end, :, start:end, :].copy_(values)
+                    else:
+                        index = torch.tensor(rows, dtype=torch.long, device=self.keys.device)
+                        self.keys[index, :, start:end, :] = keys
+                        self.values[index, :, start:end, :] = values
         else:
             if self._row_indices is None:
                 self.keys[:batch, :, start:end, :].copy_(keys)
@@ -199,9 +221,15 @@ class Llama3TensorParallelLayerKVCache:
             else:
                 if rows is None:
                     rows = self._selected_rows(batch)
-                index = torch.tensor(rows, dtype=torch.long, device=self.keys.device)
-                self.keys[index, :, start:end, :] = keys
-                self.values[index, :, start:end, :] = values
+                span = _contiguous_row_span(rows)
+                if span is not None:
+                    row_start, row_end = span
+                    self.keys[row_start:row_end, :, start:end, :].copy_(keys)
+                    self.values[row_start:row_end, :, start:end, :].copy_(values)
+                else:
+                    index = torch.tensor(rows, dtype=torch.long, device=self.keys.device)
+                    self.keys[index, :, start:end, :] = keys
+                    self.values[index, :, start:end, :] = values
         if rows is None:
             self._set_root_prefix_seq_len(batch, end)
         else:
@@ -210,6 +238,10 @@ class Llama3TensorParallelLayerKVCache:
             return self.keys[:batch, :, :end, :], self.values[:batch, :, :end, :]
         if rows is None:
             rows = self._selected_rows(batch)
+        span = _contiguous_row_span(rows)
+        if span is not None:
+            row_start, row_end = span
+            return self.keys[row_start:row_end, :, :end, :], self.values[row_start:row_end, :, :end, :]
         index = torch.tensor(rows, dtype=torch.long, device=self.keys.device)
         return self.keys.index_select(0, index)[:, :, :end, :], self.values.index_select(0, index)[:, :, :end, :]
 
@@ -225,6 +257,7 @@ class Llama3TensorParallelLayerKVCache:
         view._seq_lens = self._seq_lens
         view._uniform_seq_len = self._uniform_seq_len
         view._row_indices = physical_rows
+        view._row_indices_tensor = torch.tensor(physical_rows, dtype=torch.long, device=self.keys.device)
         return view
 
     def clear_row(self, row: int) -> None:
@@ -261,6 +294,21 @@ class Llama3TensorParallelLayerKVCache:
             return self._row_indices
         return self._row_indices[:batch]
 
+    def _selected_row_indices_tensor(self, batch: int | None = None) -> Tensor | None:
+        if self._row_indices_tensor is None:
+            return None
+        if batch is None:
+            return self._row_indices_tensor
+        return self._row_indices_tensor[:batch]
+
+    def _contiguous_key_value_storage(self, batch: int) -> tuple[Tensor, Tensor] | None:
+        rows = self._selected_rows(batch)
+        span = _contiguous_row_span(rows)
+        if span is None:
+            return None
+        row_start, row_end = span
+        return self.keys[row_start:row_end], self.values[row_start:row_end]
+
     def _physical_row(self, row: int) -> int:
         if row < 0 or row >= self.batch_size:
             raise ValueError("cache row out of range")
@@ -284,9 +332,311 @@ class Llama3TensorParallelLayerKVCache:
         self._uniform_seq_len[0] = seq_len if all(value == seq_len for value in self._seq_lens) else None
 
 
+class PagedLlama3TensorParallelLayerKVCache:
+    cache_backend = "paged"
+
+    def __init__(
+        self,
+        batch_size: int,
+        max_seq_len: int,
+        local_key_value_heads: int,
+        head_dim: int,
+        *,
+        page_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> None:
+        if page_size < 1:
+            raise ValueError("page_size must be positive")
+        from torchinferno.runtime.paged import PagedKVCache
+
+        pages_per_row = max(1, (max_seq_len + page_size - 1) // page_size)
+        self.pages = PagedKVCache(
+            num_pages=max(1, batch_size * pages_per_row),
+            page_size=page_size,
+            num_key_value_heads=local_key_value_heads,
+            head_dim=head_dim,
+            device=device,
+            dtype=dtype,
+        )
+        self.request_ids = tuple(f"batch-{idx}" for idx in range(batch_size))
+        self.max_seq_len = max_seq_len
+        self.batch_size = batch_size
+        self._row_indices: tuple[int, ...] | None = None
+
+    @property
+    def seq_len(self) -> int:
+        return self.seq_len_for_rows(self._selected_rows())
+
+    @seq_len.setter
+    def seq_len(self, seq_len: int) -> None:
+        self.set_seq_len(seq_len)
+
+    def seq_len_for_row(self, row: int) -> int:
+        physical_row = self._physical_row(row)
+        return self.pages.sequence_length(self.request_ids[physical_row])
+
+    def seq_len_for_rows(self, rows: tuple[int, ...]) -> int:
+        if not rows:
+            return 0
+        seq_len = self.pages.sequence_length(self.request_ids[rows[0]])
+        if any(self.pages.sequence_length(self.request_ids[row]) != seq_len for row in rows):
+            raise ValueError("selected cache rows must have the same sequence length")
+        return seq_len
+
+    def set_seq_len(self, seq_len: int) -> None:
+        if seq_len < 0:
+            raise ValueError("seq_len must be non-negative")
+        if seq_len > self.max_seq_len:
+            raise ValueError("seq_len exceeds KV cache capacity")
+        rows = self._selected_rows()
+        if all(self.pages.sequence_length(self.request_ids[row]) == seq_len for row in rows):
+            return
+        for row in rows:
+            request_id = self.request_ids[row]
+            current = self.pages.sequence_length(request_id)
+            if seq_len > current:
+                allocated = len(self.pages.sequence(request_id).page_ids) * self.pages.page_size
+                if seq_len > allocated:
+                    raise ValueError("paged Llama3 cache seq_len cannot extend missing KV state")
+            if seq_len < current:
+                self.pages.set_length(request_id, seq_len)
+            elif seq_len > current:
+                self.pages.set_length(request_id, seq_len)
+
+    def append(self, keys: Tensor, values: Tensor) -> tuple[Tensor, Tensor]:
+        rows = self._append_pages(keys, values)
+        return self.materialize(rows)
+
+    def append_and_attend(
+        self,
+        query: Tensor,
+        keys: Tensor,
+        values: Tensor,
+        positions: Tensor,
+        *,
+        enable_gqa: bool,
+    ) -> Tensor:
+        rows = self._append_pages(keys, values)
+        from torchinferno.runtime.paged_attention import batched_paged_causal_attention
+
+        return batched_paged_causal_attention(
+            query,
+            self.pages,
+            tuple(self.request_ids[row] for row in rows),
+            positions,
+            enable_gqa=enable_gqa,
+        )
+
+    def append_and_attend_ragged(
+        self,
+        query: Tensor,
+        keys: Tensor,
+        values: Tensor,
+        positions: Tensor,
+        row_indices: Tensor | None,
+        *,
+        enable_gqa: bool,
+    ) -> Tensor:
+        if keys.ndim != 4 or values.ndim != 4 or keys.size(2) != 1 or values.size(2) != 1:
+            raise ValueError("ragged paged KV append expects one token")
+        if getattr(self, "_torchinferno_paged_decode_graph_active", False):
+            page_table = getattr(self, "_torchinferno_paged_decode_page_table", None)
+            decode_seq_lens = getattr(self, "_torchinferno_paged_decode_seq_lens", None)
+            cache_tokens = getattr(self, "_torchinferno_paged_decode_cache_tokens", None)
+            if page_table is not None and decode_seq_lens is not None and cache_tokens is not None and query.is_cuda:
+                from torchinferno.kernels.triton_ops import (
+                    triton_batched_paged_gqa_decode_attention_with_table,
+                    triton_paged_append_kv_cache_ragged,
+                )
+
+                triton_paged_append_kv_cache_ragged(
+                    keys,
+                    values,
+                    self.pages.keys,
+                    self.pages.values,
+                    page_table,
+                    positions,
+                    page_size=self.pages.page_size,
+                )
+                return triton_batched_paged_gqa_decode_attention_with_table(
+                    query,
+                    self.pages.keys,
+                    self.pages.values,
+                    page_table,
+                    decode_seq_lens,
+                    page_size=self.pages.page_size,
+                    cache_tokens=int(cache_tokens),
+                    num_key_value_heads=self.pages.num_key_value_heads,
+                    value_head_dim=self.pages.value_head_dim,
+                )
+        rows = getattr(self, "_torchinferno_ragged_decode_rows", None)
+        positions_cpu = getattr(self, "_torchinferno_ragged_decode_positions", None)
+        if rows is None:
+            rows = self._selected_rows(keys.size(0)) if row_indices is None else tuple(
+                self._physical_row(int(row)) for row in row_indices.detach().cpu().tolist()
+            )
+        if positions_cpu is None:
+            positions_cpu = tuple(int(position) for position in positions.detach().cpu().tolist())
+        if len(rows) != len(positions_cpu):
+            raise ValueError("ragged paged KV positions must match batch")
+        append_rows: list[int] = []
+        append_pages: list[int] = []
+        append_offsets: list[int] = []
+        for incoming_row, (cache_row, position) in enumerate(zip(rows, positions_cpu)):
+            request_id = self.request_ids[cache_row]
+            current = self.pages.sequence_length(request_id)
+            if current == position:
+                if position + 1 > self.max_seq_len:
+                    raise ValueError("KV cache capacity exceeded")
+                seq = self.pages.sequence(request_id)
+                self.pages._ensure_capacity(seq, position + 1)
+                page_index = position // self.pages.page_size
+                page_id = self.pages._prepare_page_for_write(seq, page_index)
+                append_rows.append(incoming_row)
+                append_pages.append(page_id)
+                append_offsets.append(position % self.pages.page_size)
+                seq.length += 1
+            elif current == position + 1:
+                # Static bucket padding rows may be replayed without advancing seq_lens.
+                pass
+            else:
+                raise ValueError("paged Llama3 ragged decode position does not match row state")
+        if append_rows:
+            row_index = torch.tensor(append_rows, dtype=torch.long, device=keys.device)
+            page_index = torch.tensor(append_pages, dtype=torch.long, device=keys.device)
+            page_offsets = torch.tensor(append_offsets, dtype=torch.long, device=keys.device)
+            self.pages.keys[page_index, :, page_offsets, :] = keys.index_select(0, row_index)[:, :, 0, :]
+            self.pages.values[page_index, :, page_offsets, :] = values.index_select(0, row_index)[:, :, 0, :]
+        from torchinferno.kernels import batched_paged_decode_attention
+
+        return batched_paged_decode_attention(
+            query,
+            self.pages,
+            tuple(self.request_ids[row] for row in rows),
+            positions,
+            enable_gqa=enable_gqa,
+        )
+
+    def materialize(self, rows: tuple[int, ...]) -> tuple[Tensor, Tensor]:
+        keys = []
+        values = []
+        for row in rows:
+            row_keys, row_values = self.pages.materialize(self.request_ids[row])
+            keys.append(row_keys)
+            values.append(row_values)
+        return torch.stack(keys, dim=0), torch.stack(values, dim=0)
+
+    def materialize_row(self, row: int) -> tuple[Tensor, Tensor]:
+        physical_row = self._physical_row(row)
+        return self.pages.materialize(self.request_ids[physical_row])
+
+    def for_rows(self, rows: tuple[int, ...] | list[int]) -> "PagedLlama3TensorParallelLayerKVCache":
+        if not rows:
+            raise ValueError("row view must select at least one cache row")
+        physical_rows = tuple(self._physical_row(int(row)) for row in rows)
+        view = object.__new__(PagedLlama3TensorParallelLayerKVCache)
+        view.pages = self.pages
+        view.request_ids = self.request_ids
+        view.max_seq_len = self.max_seq_len
+        view.batch_size = len(physical_rows)
+        view._row_indices = physical_rows
+        return view
+
+    def clear_row(self, row: int) -> None:
+        physical_row = self._physical_row(row)
+        self.pages.free(self.request_ids[physical_row])
+
+    def copy_prefix_from(
+        self,
+        source: "Llama3TensorParallelLayerKVCache | PagedLlama3TensorParallelLayerKVCache",
+        tokens: int,
+        *,
+        source_row: int = 0,
+        dest_row: int = 0,
+    ) -> None:
+        if tokens < 0:
+            raise ValueError("tokens must be non-negative")
+        source_physical = source._physical_row(source_row)
+        dest_physical = self._physical_row(dest_row)
+        if tokens > self.max_seq_len:
+            raise ValueError("KV cache capacity exceeded")
+        if isinstance(source, PagedLlama3TensorParallelLayerKVCache):
+            source_len = source.pages.sequence_length(source.request_ids[source_physical])
+            if tokens > source_len:
+                raise ValueError("source cache range is invalid")
+            if source.pages is self.pages and source_physical == dest_physical:
+                return
+            self.clear_row(dest_row)
+            if tokens and source.pages is self.pages:
+                self.pages.alias_prefix(
+                    source.request_ids[source_physical],
+                    self.request_ids[dest_physical],
+                    tokens,
+                )
+                return
+            source_keys, source_values = source.pages.materialize(source.request_ids[source_physical])
+        else:
+            source_len = source._seq_lens[source_physical]
+            if tokens > source_len:
+                raise ValueError("source cache range is invalid")
+            source_keys = source.keys[source_physical, :, :tokens, :]
+            source_values = source.values[source_physical, :, :tokens, :]
+            self.clear_row(dest_row)
+        if tokens:
+            self.pages.append(
+                self.request_ids[dest_physical],
+                source_keys[:, :tokens, :],
+                source_values[:, :tokens, :],
+            )
+
+    def _append_pages(self, keys: Tensor, values: Tensor) -> tuple[int, ...]:
+        batch, _, tokens, _ = keys.shape
+        if batch > self.batch_size:
+            raise ValueError("cache batch is smaller than incoming batch")
+        rows = self._selected_rows(batch)
+        start = self.seq_len_for_rows(rows)
+        end = start + tokens
+        if end > self.max_seq_len:
+            raise ValueError("KV cache capacity exceeded")
+        for incoming_row, cache_row in enumerate(rows):
+            self.pages.append(self.request_ids[cache_row], keys[incoming_row], values[incoming_row])
+        return rows
+
+    def _selected_rows(self, batch: int | None = None) -> tuple[int, ...]:
+        if self._row_indices is None:
+            size = self.batch_size if batch is None else batch
+            return tuple(range(size))
+        if batch is None:
+            return self._row_indices
+        return self._row_indices[:batch]
+
+    def _physical_row(self, row: int) -> int:
+        if row < 0 or row >= self.batch_size:
+            raise ValueError("cache row out of range")
+        return row if self._row_indices is None else self._row_indices[row]
+
+
+def _contiguous_row_span(rows: tuple[int, ...]) -> tuple[int, int] | None:
+    if not rows:
+        return None
+    start = rows[0]
+    for offset, row in enumerate(rows):
+        if row != start + offset:
+            return None
+    return start, start + len(rows)
+
+
 class Llama3TensorParallelCache:
-    def __init__(self, layers: list[Llama3TensorParallelLayerKVCache]) -> None:
+    def __init__(
+        self,
+        layers: list[Llama3TensorParallelLayerKVCache | PagedLlama3TensorParallelLayerKVCache],
+        *,
+        cache_backend: str = "dense",
+    ) -> None:
         self.layers = layers
+        self.cache_backend = cache_backend
+        self._graph_cache_id = id(self)
 
     @property
     def seq_len(self) -> int:
@@ -305,7 +655,12 @@ class Llama3TensorParallelCache:
         self.set_seq_len(0)
 
     def for_rows(self, rows: tuple[int, ...] | list[int]) -> "Llama3TensorParallelCache":
-        return Llama3TensorParallelCache([layer.for_rows(rows) for layer in self.layers])
+        view = Llama3TensorParallelCache(
+            [layer.for_rows(rows) for layer in self.layers],
+            cache_backend=self.cache_backend,
+        )
+        view._graph_cache_id = self._graph_cache_id
+        return view
 
     def clear_row(self, row: int) -> None:
         for layer in self.layers:
@@ -325,11 +680,132 @@ class Llama3TensorParallelCache:
             target_layer.copy_prefix_from(source_layer, tokens, source_row=source_row, dest_row=dest_row)
 
 
+def _set_paged_ragged_decode_context(
+    cache: Llama3TensorParallelCache,
+    *,
+    batch: int,
+    cache_positions: Tensor,
+    row_indices: Tensor | None,
+    device: torch.device,
+) -> bool:
+    if cache.cache_backend != "paged" or _cuda_stream_is_capturing(device):
+        return False
+    positions = tuple(int(position) for position in cache_positions.detach().cpu().tolist())
+    if len(positions) != batch:
+        return False
+    row_values = None if row_indices is None else tuple(int(row) for row in row_indices.detach().cpu().tolist())
+    if row_values is not None and len(row_values) != batch:
+        return False
+    for layer in cache.layers:
+        if not isinstance(layer, PagedLlama3TensorParallelLayerKVCache):
+            continue
+        rows = layer._selected_rows(batch) if row_values is None else tuple(layer._physical_row(row) for row in row_values)
+        layer._torchinferno_ragged_decode_rows = rows
+        layer._torchinferno_ragged_decode_positions = positions
+    return True
+
+
+def _clear_paged_ragged_decode_context(cache: Llama3TensorParallelCache) -> None:
+    for layer in cache.layers:
+        if not isinstance(layer, PagedLlama3TensorParallelLayerKVCache):
+            continue
+        for attr in ("_torchinferno_ragged_decode_rows", "_torchinferno_ragged_decode_positions"):
+            if hasattr(layer, attr):
+                delattr(layer, attr)
+
+
+def _prepare_paged_ragged_decode_graph_state(
+    cache: Llama3TensorParallelCache,
+    *,
+    batch: int,
+    cache_positions: Tensor,
+    row_indices: Tensor | None,
+    device: torch.device,
+) -> None:
+    if getattr(cache, "cache_backend", "dense") != "paged":
+        return
+    positions = tuple(int(position) for position in cache_positions.detach().cpu().tolist())
+    if len(positions) != batch:
+        return
+    row_values = None if row_indices is None else tuple(int(row) for row in row_indices.detach().cpu().tolist())
+    if row_values is not None and len(row_values) != batch:
+        return
+    decode_lengths = cache_positions.to(device=device, dtype=torch.long) + 1
+    for layer in cache.layers:
+        if not isinstance(layer, PagedLlama3TensorParallelLayerKVCache):
+            continue
+        rows = layer._selected_rows(batch) if row_values is None else tuple(layer._physical_row(row) for row in row_values)
+        pages_per_row = max(1, (layer.max_seq_len + layer.pages.page_size - 1) // layer.pages.page_size)
+        page_rows: list[list[int]] = []
+        for row, position in zip(rows, positions):
+            if position < 0 or position >= layer.max_seq_len:
+                raise ValueError("KV cache capacity exceeded")
+            request_id = layer.request_ids[row]
+            seq = layer.pages.sequence(request_id)
+            layer.pages._ensure_capacity(seq, position + 1)
+            layer.pages._prepare_page_for_write(seq, position // layer.pages.page_size)
+            pages = [int(page_id) for page_id in seq.page_ids[:pages_per_row]]
+            page_rows.append(pages + [0] * (pages_per_row - len(pages)))
+        page_table = getattr(layer, "_torchinferno_paged_decode_page_table", None)
+        if not isinstance(page_table, Tensor) or page_table.shape != (batch, pages_per_row):
+            page_table = torch.empty((batch, pages_per_row), dtype=torch.long, device=device)
+            layer._torchinferno_paged_decode_page_table = page_table
+        page_table.copy_(torch.tensor(page_rows, dtype=torch.long, device=device))
+        seq_lens = getattr(layer, "_torchinferno_paged_decode_seq_lens", None)
+        if not isinstance(seq_lens, Tensor) or seq_lens.shape != (batch,):
+            seq_lens = torch.empty((batch,), dtype=torch.long, device=device)
+            layer._torchinferno_paged_decode_seq_lens = seq_lens
+        seq_lens.copy_(decode_lengths)
+        layer._torchinferno_paged_decode_cache_tokens = int(layer.max_seq_len)
+
+
+def _advance_paged_ragged_decode_cache_lengths(
+    cache: Llama3TensorParallelCache,
+    *,
+    batch: int,
+    cache_positions: Tensor,
+    row_indices: Tensor | None,
+) -> None:
+    if getattr(cache, "cache_backend", "dense") != "paged":
+        return
+    positions = tuple(int(position) for position in cache_positions.detach().cpu().tolist())
+    if len(positions) != batch:
+        return
+    row_values = None if row_indices is None else tuple(int(row) for row in row_indices.detach().cpu().tolist())
+    if row_values is not None and len(row_values) != batch:
+        return
+    for layer in cache.layers:
+        if not isinstance(layer, PagedLlama3TensorParallelLayerKVCache):
+            continue
+        rows = layer._selected_rows(batch) if row_values is None else tuple(layer._physical_row(row) for row in row_values)
+        for row, position in zip(rows, positions):
+            request_id = layer.request_ids[row]
+            seq = layer.pages.sequence(request_id)
+            if seq.length < position + 1:
+                seq.length = position + 1
+
+
+def _set_paged_ragged_decode_graph_active(cache: Llama3TensorParallelCache, active: bool) -> None:
+    if getattr(cache, "cache_backend", "dense") != "paged":
+        return
+    for layer in cache.layers:
+        if isinstance(layer, PagedLlama3TensorParallelLayerKVCache):
+            layer._torchinferno_paged_decode_graph_active = bool(active)
+
+
+def _cuda_stream_is_capturing(device: torch.device) -> bool:
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return False
+    return bool(torch.cuda.is_current_stream_capturing())
+
+
 @dataclass
 class _StaticDecodeGraphCall:
     graph: torch.cuda.CUDAGraph
     static_input_ids: Tensor
     static_cache_position: Tensor
+    static_cache_positions: Tensor | None
+    static_row_indices: Tensor | None
     static_attention_length: Tensor
     static_rotary_cos: Tensor
     static_rotary_sin: Tensor
@@ -344,6 +820,8 @@ class _StaticDecodeLogitsGraphCall:
     graph: torch.cuda.CUDAGraph
     static_input_ids: Tensor
     static_cache_position: Tensor
+    static_cache_positions: Tensor | None
+    static_row_indices: Tensor | None
     static_attention_length: Tensor
     static_rotary_cos: Tensor
     static_rotary_sin: Tensor
@@ -394,6 +872,18 @@ class _StaticPrefillGraphCall:
 class _StaticPrefillLogitsGraphCall:
     graph: torch.cuda.CUDAGraph
     static_input_ids: Tensor
+    output_logits: Tensor
+    cache: Llama3TensorParallelCache
+    prompt_tokens: int
+    initial_seq_len: int
+    max_seq_len: int
+
+
+@dataclass
+class _StaticPrefillSelectedLogitsGraphCall:
+    graph: torch.cuda.CUDAGraph
+    static_input_ids: Tensor
+    static_logit_positions: Tensor
     output_logits: Tensor
     cache: Llama3TensorParallelCache
     prompt_tokens: int
@@ -562,9 +1052,14 @@ class _Llama3TensorParallelLayer:
         head_dim = self.config.head_dim
         if self.profile_seconds is None or self.profile_counts is None:
             q, k, v = self._qkv_rotary(hidden, batch, tokens, head_dim, rotary)
-            if cache is not None:
-                k, v = cache.append(k, v)
             enable_gqa = self.local_attention_heads != self.local_key_value_heads
+            if cache is not None:
+                append_and_attend = getattr(cache, "append_and_attend", None)
+                if callable(append_and_attend):
+                    out = append_and_attend(q, k, v, positions, enable_gqa=enable_gqa)
+                    out = out.transpose(1, 2).contiguous().view(batch, tokens, self.local_hidden_size)
+                    return self._attention_o_project_reduce(out)
+                k, v = cache.append(k, v)
             out = self._scaled_dot_product(q, k, v, positions, hidden.device, enable_gqa=enable_gqa)
             out = out.transpose(1, 2).contiguous().view(batch, tokens, self.local_hidden_size)
             return self._attention_o_project_reduce(out)
@@ -574,10 +1069,20 @@ class _Llama3TensorParallelLayer:
             lambda: self._qkv(hidden, batch, tokens, head_dim),
         )
         q, k = self._profile_block("attention.rotary", lambda: _apply_rotary_cached(q, k, rotary))
+        enable_gqa = self.local_attention_heads != self.local_key_value_heads
         if cache is not None:
+            append_and_attend = getattr(cache, "append_and_attend", None)
+            if callable(append_and_attend):
+                out = self._profile_block(
+                    "attention.paged_append_attention",
+                    lambda: append_and_attend(q, k, v, positions, enable_gqa=enable_gqa),
+                )
+                out = out.transpose(1, 2).contiguous().view(batch, tokens, self.local_hidden_size)
+                projected = self._profile_block("attention.o_proj", lambda: F.linear(out, self.o_proj_weight))
+                self._profile_block("attention.all_reduce", lambda: _all_reduce(projected))
+                return projected
             k, v = self._profile_block("attention.cache_append", lambda: cache.append(k, v))
 
-        enable_gqa = self.local_attention_heads != self.local_key_value_heads
         out = self._profile_block(
             "attention.sdp",
             lambda: self._scaled_dot_product(q, k, v, positions, hidden.device, enable_gqa=enable_gqa),
@@ -608,9 +1113,20 @@ class _Llama3TensorParallelLayer:
                 "fast_prefill.attention.qkv_rotary",
                 lambda: self._qkv_rotary(attn_in, batch, tokens, head_dim, rotary),
             )
-        if cache is not None:
-            k, v = self._profile_block("fast_prefill.attention.cache_append", lambda: cache.append(k, v))
         enable_gqa = self.local_attention_heads != self.local_key_value_heads
+        if cache is not None:
+            append_and_attend = getattr(cache, "append_and_attend", None)
+            if callable(append_and_attend):
+                out = self._profile_block(
+                    "fast_prefill.attention.paged_append_attention",
+                    lambda: append_and_attend(q, k, v, positions, enable_gqa=enable_gqa),
+                )
+                out = out.transpose(1, 2).contiguous().view(batch, tokens, self.local_hidden_size)
+                return self._profile_block(
+                    "fast_prefill.attention.o_project_reduce",
+                    lambda: self._attention_o_project_reduce(out),
+                )
+            k, v = self._profile_block("fast_prefill.attention.cache_append", lambda: cache.append(k, v))
         out = self._profile_block(
             "fast_prefill.attention.sdp",
             lambda: self._scaled_dot_product(q, k, v, positions, hidden.device, enable_gqa=enable_gqa),
@@ -628,6 +1144,8 @@ class _Llama3TensorParallelLayer:
         rotary: tuple[Tensor, Tensor],
         cache: Llama3TensorParallelLayerKVCache,
         cache_position: Tensor,
+        cache_positions: Tensor | None,
+        row_indices: Tensor | None,
         attention_length: Tensor,
         attention_block_size: int | None,
         next_norm_weight: Tensor,
@@ -639,6 +1157,8 @@ class _Llama3TensorParallelLayer:
             rotary,
             cache,
             cache_position,
+            cache_positions,
+            row_indices,
             attention_length,
             attention_block_size,
         )
@@ -688,35 +1208,89 @@ class _Llama3TensorParallelLayer:
         rotary: tuple[Tensor, Tensor],
         cache: Llama3TensorParallelLayerKVCache,
         cache_position: Tensor,
+        cache_positions: Tensor | None,
+        row_indices: Tensor | None,
         attention_length: Tensor,
         attention_block_size: int | None,
     ) -> Tensor:
         from torchinferno.kernels.triton_ops import (
             triton_apply_rotary_append_kv_decode,
+            triton_apply_rotary_append_kv_ragged_decode,
             triton_append_kv_cache,
             triton_dense_gqa_decode_attention,
             triton_grouped_gqa_decode_attention,
         )
 
         batch, tokens, _ = hidden.shape
+        storage = cache._contiguous_key_value_storage(batch)
+        indexed_rows = storage is None
+        if indexed_rows:
+            if cache_positions is None or row_indices is None:
+                raise ValueError("static decode graph requires cache positions and row indices for sparse rows")
+            cache_keys = cache.keys
+            cache_values = cache.values
+        else:
+            cache_keys, cache_values = storage
         if attn_in is None:
             attn_in = _tp_decode_rms_norm(hidden, self.input_layernorm_weight, self.config.rms_norm_eps)
         if _tp_flag("TORCHINFERNO_TRITON_DECODE_ROTARY_APPEND"):
             q, k, v = self._qkv(attn_in, batch, tokens, self.config.head_dim)
-            q = triton_apply_rotary_append_kv_decode(q, k, v, cache.keys, cache.values, cache_position, rotary[0], rotary[1])
+            if indexed_rows:
+                q = triton_apply_rotary_append_kv_ragged_decode(
+                    q,
+                    k,
+                    v,
+                    cache_keys,
+                    cache_values,
+                    cache_positions,
+                    rotary[0],
+                    rotary[1],
+                    row_indices,
+                )
+            else:
+                q = triton_apply_rotary_append_kv_decode(
+                    q,
+                    k,
+                    v,
+                    cache_keys,
+                    cache_values,
+                    cache_position,
+                    rotary[0],
+                    rotary[1],
+                )
         else:
-            q, k, v = self._qkv_rotary_eager(attn_in, batch, tokens, self.config.head_dim, rotary)
-            triton_append_kv_cache(k, v, cache.keys, cache.values, cache_position)
-        attention_keys = cache.keys
-        attention_values = cache.values
-        if attention_block_size is not None and attention_block_size < cache.keys.size(2):
-            attention_keys = cache.keys[:, :, :attention_block_size, :]
-            attention_values = cache.values[:, :, :attention_block_size, :]
+            q, k, v = self._qkv(attn_in, batch, tokens, self.config.head_dim)
+            if indexed_rows:
+                q, k = _apply_rotary_ragged(q, k, rotary)
+                _append_ragged_kv_cache(cache, k, v, cache_positions, row_indices)
+            else:
+                q, k = _apply_rotary_cached(q, k, rotary)
+                triton_append_kv_cache(k, v, cache_keys, cache_values, cache_position)
+        attention_keys = cache_keys
+        attention_values = cache_values
+        if attention_block_size is not None and attention_block_size < cache_keys.size(2):
+            attention_keys = cache_keys[:, :, :attention_block_size, :]
+            attention_values = cache_values[:, :, :attention_block_size, :]
         if (
             self.local_attention_heads > self.local_key_value_heads
             and _tp_flag("TORCHINFERNO_TRITON_GROUPED_DECODE_ATTENTION")
         ):
-            out = triton_grouped_gqa_decode_attention(q, attention_keys, attention_values, attention_length)
+            out = triton_grouped_gqa_decode_attention(
+                q,
+                attention_keys,
+                attention_values,
+                attention_length,
+                row_indices=row_indices if indexed_rows else None,
+            )
+        elif indexed_rows:
+            out = _ragged_scaled_dot_product_attention(
+                q,
+                attention_keys,
+                attention_values,
+                attention_length.expand(batch),
+                row_indices=row_indices,
+                enable_gqa=False,
+            )
         else:
             out = triton_dense_gqa_decode_attention(q, attention_keys, attention_values, seq_len=attention_length)
         out = out.transpose(1, 2).contiguous().view(batch, tokens, self.local_hidden_size)
@@ -737,6 +1311,20 @@ class _Llama3TensorParallelLayer:
         if attn_in is None:
             attn_in = _tp_decode_rms_norm(hidden, self.input_layernorm_weight, self.config.rms_norm_eps)
         q, k, v = self._qkv(attn_in, batch, tokens, self.config.head_dim)
+        enable_gqa = self.local_attention_heads != self.local_key_value_heads
+        append_and_attend_ragged = getattr(cache, "append_and_attend_ragged", None)
+        if callable(append_and_attend_ragged):
+            q, k = _apply_rotary_ragged(q, k, rotary)
+            out = append_and_attend_ragged(
+                q,
+                k,
+                v,
+                cache_positions,
+                row_indices,
+                enable_gqa=enable_gqa,
+            )
+            out = out.transpose(1, 2).contiguous().view(batch, tokens, self.local_hidden_size)
+            return self._decode_linear_all_reduce(out, self.o_proj_weight, "attention", self.o_proj_weight_decode)
         if (
             q.is_cuda
             and k.is_cuda
@@ -771,7 +1359,6 @@ class _Llama3TensorParallelLayer:
         else:
             attention_keys = cache.keys
             attention_values = cache.values
-        enable_gqa = self.local_attention_heads != self.local_key_value_heads
         out = _ragged_scaled_dot_product_attention(
             q,
             attention_keys,
@@ -1397,10 +1984,15 @@ class Llama3TensorParallelForCausalLM:
         self.profile_seconds: dict[str, float] = {}
         self.profile_counts: dict[str, int] = {}
         self.training = False
-        self._prefill_graphs: dict[tuple[int, int, int, tuple[int, ...]], _StaticPrefillGraphCall] = {}
-        self._prefill_logits_graphs: dict[tuple[int, int, int, tuple[int, ...]], _StaticPrefillLogitsGraphCall] = {}
+        self._prefill_graphs: dict[tuple[object, ...], _StaticPrefillGraphCall] = {}
+        self._prefill_logits_graphs: dict[tuple[object, ...], _StaticPrefillLogitsGraphCall] = {}
+        self._prefill_selected_logits_graphs: dict[
+            tuple[object, ...],
+            _StaticPrefillSelectedLogitsGraphCall,
+        ] = {}
         self._prefill_graph_failed = False
         self._prefill_logits_graph_failed = False
+        self._prefill_selected_logits_graph_failed = False
         self._decode_graphs: dict[tuple[int, int, int, int], _StaticDecodeGraphCall] = {}
         self._decode_logits_graphs: dict[tuple[int, int, int, int], _StaticDecodeLogitsGraphCall] = {}
         self._ragged_decode_graphs: dict[
@@ -1591,20 +2183,46 @@ class Llama3TensorParallelForCausalLM:
             "counts": dict(sorted(self.profile_counts.items())),
         }
 
-    def allocate_cache(self, batch_size: int, max_seq_len: int) -> Llama3TensorParallelCache:
+    def allocate_cache(
+        self,
+        batch_size: int,
+        max_seq_len: int,
+        *,
+        cache_backend: str = "dense",
+        page_size: int = 16,
+        device: torch.device | None = None,
+    ) -> Llama3TensorParallelCache:
+        if cache_backend not in {"dense", "paged"}:
+            raise ValueError("cache_backend must be 'dense' or 'paged'")
+        if device is not None and torch.device(device) != self.device:
+            raise ValueError("Llama3 tensor-parallel cache must be allocated on the model device")
         local_kv_heads = self.config.num_key_value_heads // self.world_size
+        layer_cls = PagedLlama3TensorParallelLayerKVCache if cache_backend == "paged" else Llama3TensorParallelLayerKVCache
         return Llama3TensorParallelCache(
             [
-                Llama3TensorParallelLayerKVCache(
-                    batch_size,
-                    max_seq_len,
-                    local_kv_heads,
-                    self.config.head_dim,
-                    device=self.device,
-                    dtype=self.dtype,
+                (
+                    layer_cls(
+                        batch_size,
+                        max_seq_len,
+                        local_kv_heads,
+                        self.config.head_dim,
+                        page_size=page_size,
+                        device=self.device,
+                        dtype=self.dtype,
+                    )
+                    if layer_cls is PagedLlama3TensorParallelLayerKVCache
+                    else layer_cls(
+                        batch_size,
+                        max_seq_len,
+                        local_kv_heads,
+                        self.config.head_dim,
+                        device=self.device,
+                        dtype=self.dtype,
+                    )
                 )
                 for _ in self.layers
-            ]
+            ],
+            cache_backend=cache_backend,
         )
 
     @torch.inference_mode()
@@ -1751,6 +2369,32 @@ class Llama3TensorParallelForCausalLM:
             self._prefill_logits_graph_failed = True
             return None
 
+    def try_prefill_selected_logits_graph(
+        self,
+        input_ids: Tensor,
+        cache: Llama3TensorParallelCache,
+        *,
+        logit_positions: Tensor,
+        capture_on_miss: bool = True,
+    ) -> Tensor | None:
+        if self._prefill_selected_logits_graph_failed or not _should_use_prefill_logits_graph(input_ids, cache):
+            return None
+        if logit_positions.ndim != 1 or logit_positions.numel() != input_ids.size(0):
+            return None
+        try:
+            return self._run_prefill_selected_logits_graph(
+                input_ids,
+                cache,
+                logit_positions=logit_positions,
+                capture_on_miss=capture_on_miss,
+            )
+        except Exception as exc:
+            warn_optional_failure("llama3_tensor_parallel.prefill_selected_logits_graph", exc)
+            if _tp_flag("TORCHINFERNO_CUDAGRAPH_PREFILL_DEBUG", False):
+                print(f"rank={self.rank} prefill_selected_logits_graph_failed={exc!r}", flush=True)
+            self._prefill_selected_logits_graph_failed = True
+            return None
+
     def _run_prefill_graph(
         self,
         input_ids: Tensor,
@@ -1763,7 +2407,7 @@ class Llama3TensorParallelForCausalLM:
         if end_seq_len > cache.layers[0].max_seq_len:
             raise ValueError("KV cache capacity exceeded")
         key = (
-            id(cache),
+            *_prefill_graph_cache_key(cache, input_ids.size(0)),
             initial_seq_len,
             input_ids.size(1),
             cache.layers[0].max_seq_len,
@@ -1772,7 +2416,7 @@ class Llama3TensorParallelForCausalLM:
         captured = self._prefill_graphs.get(key)
         needs_capture = (
             captured is None
-            or captured.cache is not cache
+            or not _same_prefill_graph_cache(captured.cache, cache, input_ids.size(0))
             or captured.prompt_tokens != input_ids.size(1)
             or captured.initial_seq_len != initial_seq_len
             or captured.max_seq_len != cache.layers[0].max_seq_len
@@ -1783,7 +2427,11 @@ class Llama3TensorParallelForCausalLM:
         if capture_on_miss:
             needs_capture = _capture_needed_on_any_rank(needs_capture, self.device)
         if needs_capture:
-            captured = self._capture_prefill_graph(input_ids, cache)
+            try:
+                captured = self._capture_prefill_graph(input_ids, cache)
+            except Exception:
+                self._set_cache_seq_len(cache, initial_seq_len)
+                raise
             max_graphs = _tp_int("TORCHINFERNO_CUDAGRAPH_PREFILL_MAX_GRAPHS", 128, minimum=1)
             if key not in self._prefill_graphs and len(self._prefill_graphs) >= max_graphs:
                 self._prefill_graphs.clear()
@@ -1840,7 +2488,7 @@ class Llama3TensorParallelForCausalLM:
         if end_seq_len > cache.layers[0].max_seq_len:
             raise ValueError("KV cache capacity exceeded")
         key = (
-            id(cache),
+            *_prefill_graph_cache_key(cache, input_ids.size(0)),
             initial_seq_len,
             input_ids.size(1),
             cache.layers[0].max_seq_len,
@@ -1849,7 +2497,7 @@ class Llama3TensorParallelForCausalLM:
         captured = self._prefill_logits_graphs.get(key)
         needs_capture = (
             captured is None
-            or captured.cache is not cache
+            or not _same_prefill_graph_cache(captured.cache, cache, input_ids.size(0))
             or captured.prompt_tokens != input_ids.size(1)
             or captured.initial_seq_len != initial_seq_len
             or captured.max_seq_len != cache.layers[0].max_seq_len
@@ -1860,7 +2508,11 @@ class Llama3TensorParallelForCausalLM:
         if capture_on_miss:
             needs_capture = _capture_needed_on_any_rank(needs_capture, self.device)
         if needs_capture:
-            captured = self._capture_prefill_logits_graph(input_ids, cache)
+            try:
+                captured = self._capture_prefill_logits_graph(input_ids, cache)
+            except Exception:
+                self._set_cache_seq_len(cache, initial_seq_len)
+                raise
             max_graphs = _tp_int("TORCHINFERNO_CUDAGRAPH_PREFILL_MAX_GRAPHS", 128, minimum=1)
             if key not in self._prefill_logits_graphs and len(self._prefill_logits_graphs) >= max_graphs:
                 self._prefill_logits_graphs.clear()
@@ -1907,6 +2559,107 @@ class Llama3TensorParallelForCausalLM:
         self._set_cache_seq_len(cache, end_seq_len)
         return captured
 
+    def _run_prefill_selected_logits_graph(
+        self,
+        input_ids: Tensor,
+        cache: Llama3TensorParallelCache,
+        *,
+        logit_positions: Tensor,
+        capture_on_miss: bool = True,
+    ) -> Tensor | None:
+        initial_seq_len = cache.seq_len
+        end_seq_len = initial_seq_len + input_ids.size(1)
+        if end_seq_len > cache.layers[0].max_seq_len:
+            raise ValueError("KV cache capacity exceeded")
+        key = (
+            *_prefill_graph_cache_key(cache, input_ids.size(0)),
+            initial_seq_len,
+            cache.layers[0].max_seq_len,
+            tuple(input_ids.shape),
+            tuple(logit_positions.shape),
+        )
+        captured = self._prefill_selected_logits_graphs.get(key)
+        needs_capture = (
+            captured is None
+            or not _same_prefill_graph_cache(captured.cache, cache, input_ids.size(0))
+            or captured.prompt_tokens != input_ids.size(1)
+            or captured.initial_seq_len != initial_seq_len
+            or captured.max_seq_len != cache.layers[0].max_seq_len
+            or captured.static_input_ids.shape != input_ids.shape
+            or captured.static_logit_positions.shape != logit_positions.shape
+        )
+        if needs_capture and not capture_on_miss:
+            return None
+        if capture_on_miss:
+            needs_capture = _capture_needed_on_any_rank(needs_capture, self.device)
+        if needs_capture:
+            try:
+                captured = self._capture_prefill_selected_logits_graph(input_ids, cache, logit_positions)
+            except Exception:
+                self._set_cache_seq_len(cache, initial_seq_len)
+                raise
+            max_graphs = _tp_int("TORCHINFERNO_CUDAGRAPH_PREFILL_MAX_GRAPHS", 128, minimum=1)
+            if (
+                key not in self._prefill_selected_logits_graphs
+                and len(self._prefill_selected_logits_graphs) >= max_graphs
+            ):
+                self._prefill_selected_logits_graphs.clear()
+            self._prefill_selected_logits_graphs[key] = captured
+        else:
+            captured.static_input_ids.copy_(input_ids)
+            captured.static_logit_positions.copy_(logit_positions.to(self.device, non_blocking=True))
+            self._set_cache_seq_len(cache, captured.initial_seq_len)
+            captured.graph.replay()
+            self._set_cache_seq_len(cache, end_seq_len)
+        return captured.output_logits
+
+    def _capture_prefill_selected_logits_graph(
+        self,
+        input_ids: Tensor,
+        cache: Llama3TensorParallelCache,
+        logit_positions: Tensor,
+    ) -> _StaticPrefillSelectedLogitsGraphCall:
+        initial_seq_len = cache.seq_len
+        end_seq_len = initial_seq_len + input_ids.size(1)
+        static_input_ids = torch.empty_like(input_ids)
+        static_input_ids.copy_(input_ids)
+        static_logit_positions = torch.empty_like(logit_positions, device=self.device)
+        static_logit_positions.copy_(logit_positions.to(self.device, non_blocking=True))
+        captured = _StaticPrefillSelectedLogitsGraphCall(
+            graph=torch.cuda.CUDAGraph(),
+            static_input_ids=static_input_ids,
+            static_logit_positions=static_logit_positions,
+            output_logits=torch.empty(
+                (input_ids.size(0), 1, self.local_vocab_size),
+                device=self.device,
+                dtype=self.dtype,
+            ),
+            cache=cache,
+            prompt_tokens=input_ids.size(1),
+            initial_seq_len=initial_seq_len,
+            max_seq_len=cache.layers[0].max_seq_len,
+        )
+        stream = torch.cuda.Stream(device=self.device)
+        stream.wait_stream(torch.cuda.current_stream(self.device))
+        with torch.cuda.stream(stream):
+            self._set_cache_seq_len(cache, initial_seq_len)
+            self._forward_prefill_selected_static(
+                captured.static_input_ids,
+                cache,
+                captured.static_logit_positions,
+            )
+        torch.cuda.current_stream(self.device).wait_stream(stream)
+        self._set_cache_seq_len(cache, initial_seq_len)
+        with torch.cuda.graph(captured.graph):
+            captured.output_logits = self._forward_prefill_selected_static(
+                captured.static_input_ids,
+                cache,
+                captured.static_logit_positions,
+            )
+        captured.graph.replay()
+        self._set_cache_seq_len(cache, end_seq_len)
+        return captured
+
     def _forward_prefill_static(self, input_ids: Tensor, cache: Llama3TensorParallelCache) -> Tensor:
         logits, _ = self.forward(
             input_ids,
@@ -1917,17 +2670,34 @@ class Llama3TensorParallelForCausalLM:
         )
         return logits
 
+    def _forward_prefill_selected_static(
+        self,
+        input_ids: Tensor,
+        cache: Llama3TensorParallelCache,
+        logit_positions: Tensor,
+    ) -> Tensor:
+        logits, _ = self.forward(
+            input_ids,
+            cache=cache,
+            use_cache=True,
+            return_last_logits_only=False,
+            return_sharded_logits=True,
+            logit_positions=logit_positions,
+        )
+        return logits
+
     def try_decode_one_token_graph(
         self,
         input_ids: Tensor,
         cache: Llama3TensorParallelCache,
         *,
         temperature: float = 0.0,
+        capture_on_miss: bool = True,
     ) -> Tensor | None:
         if self._decode_graph_failed or not _should_use_decode_step_graph(input_ids, cache, temperature):
             return None
         try:
-            return self._run_decode_step_graph(input_ids, cache)
+            return self._run_decode_step_graph(input_ids, cache, capture_on_miss=capture_on_miss)
         except Exception as exc:
             warn_optional_failure("llama3_tensor_parallel.decode_step_graph", exc)
             if _tp_flag("TORCHINFERNO_CUDAGRAPH_DECODE_DEBUG", False):
@@ -1939,11 +2709,13 @@ class Llama3TensorParallelForCausalLM:
         self,
         input_ids: Tensor,
         cache: Llama3TensorParallelCache,
+        *,
+        capture_on_miss: bool = True,
     ) -> Tensor | None:
         if self._decode_logits_graph_failed or not _should_use_decode_step_logits_graph(input_ids, cache):
             return None
         try:
-            return self._run_decode_step_logits_graph(input_ids, cache)
+            return self._run_decode_step_logits_graph(input_ids, cache, capture_on_miss=capture_on_miss)
         except Exception as exc:
             warn_optional_failure("llama3_tensor_parallel.decode_step_logits_graph", exc)
             if _tp_flag("TORCHINFERNO_CUDAGRAPH_DECODE_DEBUG", False):
@@ -1958,6 +2730,7 @@ class Llama3TensorParallelForCausalLM:
         *,
         seq_lens: Tensor,
         row_indices: Tensor | None = None,
+        capture_on_miss: bool = True,
     ) -> Tensor | None:
         if self._ragged_decode_logits_graph_failed or not _should_use_ragged_decode_logits_graph(
             input_ids,
@@ -1972,6 +2745,7 @@ class Llama3TensorParallelForCausalLM:
                 cache,
                 seq_lens=seq_lens,
                 row_indices=row_indices,
+                capture_on_miss=capture_on_miss,
             )
         except Exception as exc:
             warn_optional_failure("llama3_tensor_parallel.ragged_decode_logits_graph", exc)
@@ -1988,6 +2762,7 @@ class Llama3TensorParallelForCausalLM:
         seq_lens: Tensor,
         row_indices: Tensor | None = None,
         temperature: float = 0.0,
+        capture_on_miss: bool = True,
     ) -> Tensor | None:
         if self._ragged_decode_graph_failed or not _should_use_ragged_decode_token_graph(
             input_ids,
@@ -2003,6 +2778,7 @@ class Llama3TensorParallelForCausalLM:
                 cache,
                 seq_lens=seq_lens,
                 row_indices=row_indices,
+                capture_on_miss=capture_on_miss,
             )
         except Exception as exc:
             warn_optional_failure("llama3_tensor_parallel.ragged_decode_token_graph", exc)
@@ -2012,20 +2788,27 @@ class Llama3TensorParallelForCausalLM:
             return None
 
     def release_decode_graphs_for_cache(self, cache: Llama3TensorParallelCache) -> None:
-        cache_id = id(cache)
+        cache_ids = {id(cache), _cache_graph_root_id(cache)}
         for graph_map in (
             self._prefill_graphs,
             self._prefill_logits_graphs,
+            getattr(self, "_prefill_selected_logits_graphs", {}),
             self._decode_graphs,
             self._decode_logits_graphs,
             getattr(self, "_ragged_decode_graphs", {}),
             self._ragged_decode_logits_graphs,
         ):
             for key, captured in list(graph_map.items()):
-                if key[0] == cache_id or getattr(captured, "cache", None) is cache:
+                if key[0] in cache_ids or getattr(captured, "cache", None) is cache:
                     graph_map.pop(key, None)
 
-    def _run_decode_step_graph(self, input_ids: Tensor, cache: Llama3TensorParallelCache) -> Tensor:
+    def _run_decode_step_graph(
+        self,
+        input_ids: Tensor,
+        cache: Llama3TensorParallelCache,
+        *,
+        capture_on_miss: bool = True,
+    ) -> Tensor | None:
         if cache.seq_len >= cache.layers[0].max_seq_len:
             raise ValueError("KV cache capacity exceeded")
         attention_block_size = _decode_attention_block_size(cache.seq_len + 1, cache.layers[0].max_seq_len)
@@ -2041,6 +2824,8 @@ class Llama3TensorParallelForCausalLM:
         )
         needs_capture = _capture_needed_on_any_rank(needs_capture, self.device)
         if needs_capture:
+            if not capture_on_miss:
+                return None
             captured = self._capture_decode_step_graph(input_ids, cache, attention_block_size)
         else:
             self._copy_decode_graph_inputs(captured, input_ids, cache)
@@ -2054,20 +2839,29 @@ class Llama3TensorParallelForCausalLM:
         cache: Llama3TensorParallelCache,
         attention_block_size: int,
     ) -> _StaticDecodeGraphCall:
+        batch = input_ids.size(0)
+        indexed_rows = not _static_decode_cache_rows_are_contiguous(cache, batch)
+        static_row_indices = _static_decode_row_indices(cache, batch) if indexed_rows else None
+        if indexed_rows and static_row_indices is None:
+            raise ValueError("static decode graph requires row-indexed cache views for sparse rows")
         static_input_ids = torch.empty_like(input_ids)
         static_cache_position = torch.empty((), device=self.device, dtype=torch.int64)
+        static_cache_positions = torch.empty((batch,), device=self.device, dtype=torch.int64) if indexed_rows else None
         static_attention_length = torch.empty((), device=self.device, dtype=torch.int64)
         rotary_cache_dim = self.rotary_cos_cache.size(1)
-        static_rotary_cos = torch.empty((1, rotary_cache_dim), device=self.device, dtype=self.dtype)
-        static_rotary_sin = torch.empty((1, rotary_cache_dim), device=self.device, dtype=self.dtype)
+        rotary_rows = batch if indexed_rows else 1
+        static_rotary_cos = torch.empty((rotary_rows, rotary_cache_dim), device=self.device, dtype=self.dtype)
+        static_rotary_sin = torch.empty((rotary_rows, rotary_cache_dim), device=self.device, dtype=self.dtype)
         captured = _StaticDecodeGraphCall(
             graph=torch.cuda.CUDAGraph(),
             static_input_ids=static_input_ids,
             static_cache_position=static_cache_position,
+            static_cache_positions=static_cache_positions,
+            static_row_indices=static_row_indices,
             static_attention_length=static_attention_length,
             static_rotary_cos=static_rotary_cos,
             static_rotary_sin=static_rotary_sin,
-            output_token=torch.empty((input_ids.size(0),), device=self.device, dtype=torch.long),
+            output_token=torch.empty((batch,), device=self.device, dtype=torch.long),
             cache=cache,
             max_seq_len=cache.layers[0].max_seq_len,
             attention_block_size=attention_block_size,
@@ -2080,6 +2874,8 @@ class Llama3TensorParallelForCausalLM:
                 captured.static_input_ids,
                 cache,
                 captured.static_cache_position,
+                captured.static_cache_positions,
+                captured.static_row_indices,
                 captured.static_attention_length,
                 (captured.static_rotary_cos, captured.static_rotary_sin),
                 attention_block_size,
@@ -2091,6 +2887,8 @@ class Llama3TensorParallelForCausalLM:
                 captured.static_input_ids,
                 cache,
                 captured.static_cache_position,
+                captured.static_cache_positions,
+                captured.static_row_indices,
                 captured.static_attention_length,
                 (captured.static_rotary_cos, captured.static_rotary_sin),
                 attention_block_size,
@@ -2105,7 +2903,13 @@ class Llama3TensorParallelForCausalLM:
         self._decode_graphs[key] = captured
         return captured
 
-    def _run_decode_step_logits_graph(self, input_ids: Tensor, cache: Llama3TensorParallelCache) -> Tensor:
+    def _run_decode_step_logits_graph(
+        self,
+        input_ids: Tensor,
+        cache: Llama3TensorParallelCache,
+        *,
+        capture_on_miss: bool = True,
+    ) -> Tensor | None:
         if cache.seq_len >= cache.layers[0].max_seq_len:
             raise ValueError("KV cache capacity exceeded")
         attention_block_size = _decode_attention_block_size(cache.seq_len + 1, cache.layers[0].max_seq_len)
@@ -2121,6 +2925,8 @@ class Llama3TensorParallelForCausalLM:
         )
         needs_capture = _capture_needed_on_any_rank(needs_capture, self.device)
         if needs_capture:
+            if not capture_on_miss:
+                return None
             captured = self._capture_decode_step_logits_graph(input_ids, cache, attention_block_size)
         else:
             self._copy_decode_logits_graph_inputs(captured, input_ids, cache)
@@ -2135,7 +2941,8 @@ class Llama3TensorParallelForCausalLM:
         *,
         seq_lens: Tensor,
         row_indices: Tensor | None,
-    ) -> Tensor:
+        capture_on_miss: bool = True,
+    ) -> Tensor | None:
         if not cache.layers:
             raise ValueError("ragged decode requires a non-empty KV cache")
         key = (
@@ -2155,10 +2962,18 @@ class Llama3TensorParallelForCausalLM:
         )
         needs_capture = _capture_needed_on_any_rank(needs_capture, self.device)
         if needs_capture:
+            if not capture_on_miss:
+                return None
             captured = self._capture_ragged_decode_graph(input_ids, cache, seq_lens, row_indices)
         else:
             self._copy_ragged_decode_graph_inputs(captured, input_ids, seq_lens, row_indices)
             captured.graph.replay()
+        _advance_paged_ragged_decode_cache_lengths(
+            cache,
+            batch=input_ids.size(0),
+            cache_positions=captured.static_cache_positions,
+            row_indices=captured.static_row_indices,
+        )
         return captured.output_token
 
     def _run_ragged_decode_logits_graph(
@@ -2168,7 +2983,8 @@ class Llama3TensorParallelForCausalLM:
         *,
         seq_lens: Tensor,
         row_indices: Tensor | None,
-    ) -> Tensor:
+        capture_on_miss: bool = True,
+    ) -> Tensor | None:
         if not cache.layers:
             raise ValueError("ragged decode requires a non-empty KV cache")
         key = (
@@ -2188,10 +3004,20 @@ class Llama3TensorParallelForCausalLM:
         )
         needs_capture = _capture_needed_on_any_rank(needs_capture, self.device)
         if needs_capture:
+            if not capture_on_miss:
+                return None
             captured = self._capture_ragged_decode_logits_graph(input_ids, cache, seq_lens, row_indices)
         else:
             self._copy_ragged_decode_graph_inputs(captured, input_ids, seq_lens, row_indices)
             captured.graph.replay()
+        captured_cache_positions = getattr(captured, "static_cache_positions", None)
+        if isinstance(captured_cache_positions, Tensor):
+            _advance_paged_ragged_decode_cache_lengths(
+                cache,
+                batch=input_ids.size(0),
+                cache_positions=captured_cache_positions,
+                row_indices=captured.static_row_indices,
+            )
         return captured.output_logits
 
     def _capture_ragged_decode_graph(
@@ -2218,26 +3044,30 @@ class Llama3TensorParallelForCausalLM:
         self._copy_ragged_decode_graph_inputs(captured, input_ids, seq_lens, row_indices)
         stream = torch.cuda.Stream(device=self.device)
         stream.wait_stream(torch.cuda.current_stream(self.device))
-        with torch.cuda.stream(stream):
-            logits = self._forward_decode_ragged_static(
-                captured.static_input_ids,
-                cache,
-                captured.static_cache_positions,
-                captured.static_row_indices,
-                (captured.static_rotary_cos, captured.static_rotary_sin),
-            )
-            self._sample_next_token(logits[:, -1, :], 0.0)
-        torch.cuda.current_stream(self.device).wait_stream(stream)
-        with torch.cuda.graph(captured.graph):
-            logits = self._forward_decode_ragged_static(
-                captured.static_input_ids,
-                cache,
-                captured.static_cache_positions,
-                captured.static_row_indices,
-                (captured.static_rotary_cos, captured.static_rotary_sin),
-            )
-            captured.output_token = self._sample_next_token(logits[:, -1, :], 0.0)
-        captured.graph.replay()
+        _set_paged_ragged_decode_graph_active(cache, True)
+        try:
+            with torch.cuda.stream(stream):
+                logits = self._forward_decode_ragged_static(
+                    captured.static_input_ids,
+                    cache,
+                    captured.static_cache_positions,
+                    captured.static_row_indices,
+                    (captured.static_rotary_cos, captured.static_rotary_sin),
+                )
+                self._sample_next_token(logits[:, -1, :], 0.0)
+            torch.cuda.current_stream(self.device).wait_stream(stream)
+            with torch.cuda.graph(captured.graph):
+                logits = self._forward_decode_ragged_static(
+                    captured.static_input_ids,
+                    cache,
+                    captured.static_cache_positions,
+                    captured.static_row_indices,
+                    (captured.static_rotary_cos, captured.static_rotary_sin),
+                )
+                captured.output_token = self._sample_next_token(logits[:, -1, :], 0.0)
+            captured.graph.replay()
+        finally:
+            _set_paged_ragged_decode_graph_active(cache, False)
         key = (
             id(cache),
             input_ids.size(0),
@@ -2279,24 +3109,28 @@ class Llama3TensorParallelForCausalLM:
         self._copy_ragged_decode_graph_inputs(captured, input_ids, seq_lens, row_indices)
         stream = torch.cuda.Stream(device=self.device)
         stream.wait_stream(torch.cuda.current_stream(self.device))
-        with torch.cuda.stream(stream):
-            self._forward_decode_ragged_static(
-                captured.static_input_ids,
-                cache,
-                captured.static_cache_positions,
-                captured.static_row_indices,
-                (captured.static_rotary_cos, captured.static_rotary_sin),
-            )
-        torch.cuda.current_stream(self.device).wait_stream(stream)
-        with torch.cuda.graph(captured.graph):
-            captured.output_logits = self._forward_decode_ragged_static(
-                captured.static_input_ids,
-                cache,
-                captured.static_cache_positions,
-                captured.static_row_indices,
-                (captured.static_rotary_cos, captured.static_rotary_sin),
-            )
-        captured.graph.replay()
+        _set_paged_ragged_decode_graph_active(cache, True)
+        try:
+            with torch.cuda.stream(stream):
+                self._forward_decode_ragged_static(
+                    captured.static_input_ids,
+                    cache,
+                    captured.static_cache_positions,
+                    captured.static_row_indices,
+                    (captured.static_rotary_cos, captured.static_rotary_sin),
+                )
+            torch.cuda.current_stream(self.device).wait_stream(stream)
+            with torch.cuda.graph(captured.graph):
+                captured.output_logits = self._forward_decode_ragged_static(
+                    captured.static_input_ids,
+                    cache,
+                    captured.static_cache_positions,
+                    captured.static_row_indices,
+                    (captured.static_rotary_cos, captured.static_rotary_sin),
+                )
+            captured.graph.replay()
+        finally:
+            _set_paged_ragged_decode_graph_active(cache, False)
         key = (
             id(cache),
             input_ids.size(0),
@@ -2331,6 +3165,13 @@ class Llama3TensorParallelForCausalLM:
         captured.static_cache_positions.copy_(cache_positions)
         captured.static_rotary_cos.copy_(self.rotary_cos_cache.index_select(0, cache_positions))
         captured.static_rotary_sin.copy_(self.rotary_sin_cache.index_select(0, cache_positions))
+        _prepare_paged_ragged_decode_graph_state(
+            captured.cache,
+            batch=input_ids.size(0),
+            cache_positions=captured.static_cache_positions,
+            row_indices=captured.static_row_indices,
+            device=self.device,
+        )
 
     def _capture_decode_step_logits_graph(
         self,
@@ -2338,21 +3179,30 @@ class Llama3TensorParallelForCausalLM:
         cache: Llama3TensorParallelCache,
         attention_block_size: int,
     ) -> _StaticDecodeLogitsGraphCall:
+        batch = input_ids.size(0)
+        indexed_rows = not _static_decode_cache_rows_are_contiguous(cache, batch)
+        static_row_indices = _static_decode_row_indices(cache, batch) if indexed_rows else None
+        if indexed_rows and static_row_indices is None:
+            raise ValueError("static decode graph requires row-indexed cache views for sparse rows")
         static_input_ids = torch.empty_like(input_ids)
         static_cache_position = torch.empty((), device=self.device, dtype=torch.int64)
+        static_cache_positions = torch.empty((batch,), device=self.device, dtype=torch.int64) if indexed_rows else None
         static_attention_length = torch.empty((), device=self.device, dtype=torch.int64)
         rotary_cache_dim = self.rotary_cos_cache.size(1)
-        static_rotary_cos = torch.empty((1, rotary_cache_dim), device=self.device, dtype=self.dtype)
-        static_rotary_sin = torch.empty((1, rotary_cache_dim), device=self.device, dtype=self.dtype)
+        rotary_rows = batch if indexed_rows else 1
+        static_rotary_cos = torch.empty((rotary_rows, rotary_cache_dim), device=self.device, dtype=self.dtype)
+        static_rotary_sin = torch.empty((rotary_rows, rotary_cache_dim), device=self.device, dtype=self.dtype)
         captured = _StaticDecodeLogitsGraphCall(
             graph=torch.cuda.CUDAGraph(),
             static_input_ids=static_input_ids,
             static_cache_position=static_cache_position,
+            static_cache_positions=static_cache_positions,
+            static_row_indices=static_row_indices,
             static_attention_length=static_attention_length,
             static_rotary_cos=static_rotary_cos,
             static_rotary_sin=static_rotary_sin,
             output_logits=torch.empty(
-                (input_ids.size(0), 1, self.local_vocab_size),
+                (batch, 1, self.local_vocab_size),
                 device=self.device,
                 dtype=self.dtype,
             ),
@@ -2368,6 +3218,8 @@ class Llama3TensorParallelForCausalLM:
                 captured.static_input_ids,
                 cache,
                 captured.static_cache_position,
+                captured.static_cache_positions,
+                captured.static_row_indices,
                 captured.static_attention_length,
                 (captured.static_rotary_cos, captured.static_rotary_sin),
                 attention_block_size,
@@ -2378,6 +3230,8 @@ class Llama3TensorParallelForCausalLM:
                 captured.static_input_ids,
                 cache,
                 captured.static_cache_position,
+                captured.static_cache_positions,
+                captured.static_row_indices,
                 captured.static_attention_length,
                 (captured.static_rotary_cos, captured.static_rotary_sin),
                 attention_block_size,
@@ -2400,9 +3254,15 @@ class Llama3TensorParallelForCausalLM:
         position = cache.seq_len
         captured.static_input_ids.copy_(input_ids)
         captured.static_cache_position.fill_(position)
+        if captured.static_cache_positions is not None:
+            captured.static_cache_positions.fill_(position)
         captured.static_attention_length.fill_(position + 1)
-        captured.static_rotary_cos.copy_(self.rotary_cos_cache[position : position + 1])
-        captured.static_rotary_sin.copy_(self.rotary_sin_cache[position : position + 1])
+        captured.static_rotary_cos.copy_(
+            self.rotary_cos_cache[position : position + 1].expand_as(captured.static_rotary_cos)
+        )
+        captured.static_rotary_sin.copy_(
+            self.rotary_sin_cache[position : position + 1].expand_as(captured.static_rotary_sin)
+        )
 
     def _copy_decode_logits_graph_inputs(
         self,
@@ -2413,9 +3273,15 @@ class Llama3TensorParallelForCausalLM:
         position = cache.seq_len
         captured.static_input_ids.copy_(input_ids)
         captured.static_cache_position.fill_(position)
+        if captured.static_cache_positions is not None:
+            captured.static_cache_positions.fill_(position)
         captured.static_attention_length.fill_(position + 1)
-        captured.static_rotary_cos.copy_(self.rotary_cos_cache[position : position + 1])
-        captured.static_rotary_sin.copy_(self.rotary_sin_cache[position : position + 1])
+        captured.static_rotary_cos.copy_(
+            self.rotary_cos_cache[position : position + 1].expand_as(captured.static_rotary_cos)
+        )
+        captured.static_rotary_sin.copy_(
+            self.rotary_sin_cache[position : position + 1].expand_as(captured.static_rotary_sin)
+        )
 
     def _advance_decode_graph_cache(self, cache: Llama3TensorParallelCache) -> None:
         next_seq_len = cache.seq_len + 1
@@ -2430,6 +3296,8 @@ class Llama3TensorParallelForCausalLM:
         input_ids: Tensor,
         cache: Llama3TensorParallelCache,
         cache_position: Tensor,
+        cache_positions: Tensor | None,
+        row_indices: Tensor | None,
         attention_length: Tensor,
         rotary: tuple[Tensor, Tensor],
         attention_block_size: int | None = None,
@@ -2448,6 +3316,8 @@ class Llama3TensorParallelForCausalLM:
                 rotary,
                 cache.layers[layer_id],
                 cache_position,
+                cache_positions,
+                row_indices,
                 attention_length,
                 attention_block_size,
                 next_norm_weight,
@@ -2466,21 +3336,32 @@ class Llama3TensorParallelForCausalLM:
     ) -> Tensor:
         hidden = F.embedding(input_ids.to(self.device, non_blocking=True), self.embed_tokens_weight)
         attn_in: Tensor | None = None
-        for layer_id, layer in enumerate(self.layers):
-            next_norm_weight = (
-                self.layers[layer_id + 1].input_layernorm_weight
-                if layer_id + 1 < len(self.layers)
-                else self.norm_weight
-            )
-            hidden, attn_in = layer.forward_decode_ragged(
-                hidden,
-                attn_in,
-                rotary,
-                cache.layers[layer_id],
-                cache_positions,
-                row_indices,
-                next_norm_weight,
-            )
+        context_set = _set_paged_ragged_decode_context(
+            cache,
+            batch=input_ids.size(0),
+            cache_positions=cache_positions,
+            row_indices=row_indices,
+            device=self.device,
+        )
+        try:
+            for layer_id, layer in enumerate(self.layers):
+                next_norm_weight = (
+                    self.layers[layer_id + 1].input_layernorm_weight
+                    if layer_id + 1 < len(self.layers)
+                    else self.norm_weight
+                )
+                hidden, attn_in = layer.forward_decode_ragged(
+                    hidden,
+                    attn_in,
+                    rotary,
+                    cache.layers[layer_id],
+                    cache_positions,
+                    row_indices,
+                    next_norm_weight,
+                )
+        finally:
+            if context_set:
+                _clear_paged_ragged_decode_context(cache)
         if attn_in is None:
             attn_in = _tp_decode_rms_norm(hidden, self.norm_weight, self.config.rms_norm_eps)
         return _decode_linear(attn_in, self.lm_head_weight, self.lm_head_weight_decode)
@@ -2520,21 +3401,32 @@ class Llama3TensorParallelForCausalLM:
         )
         hidden = F.embedding(input_ids, self.embed_tokens_weight)
         attn_in: Tensor | None = None
-        for layer_id, layer in enumerate(self.layers):
-            next_norm_weight = (
-                self.layers[layer_id + 1].input_layernorm_weight
-                if layer_id + 1 < len(self.layers)
-                else self.norm_weight
-            )
-            hidden, attn_in = layer.forward_decode_ragged(
-                hidden,
-                attn_in,
-                rotary,
-                cache.layers[layer_id],
-                cache_positions,
-                row_indices,
-                next_norm_weight,
-            )
+        context_set = _set_paged_ragged_decode_context(
+            cache,
+            batch=input_ids.size(0),
+            cache_positions=cache_positions,
+            row_indices=row_indices,
+            device=self.device,
+        )
+        try:
+            for layer_id, layer in enumerate(self.layers):
+                next_norm_weight = (
+                    self.layers[layer_id + 1].input_layernorm_weight
+                    if layer_id + 1 < len(self.layers)
+                    else self.norm_weight
+                )
+                hidden, attn_in = layer.forward_decode_ragged(
+                    hidden,
+                    attn_in,
+                    rotary,
+                    cache.layers[layer_id],
+                    cache_positions,
+                    row_indices,
+                    next_norm_weight,
+                )
+        finally:
+            if context_set:
+                _clear_paged_ragged_decode_context(cache)
         if attn_in is None:
             attn_in = _tp_decode_rms_norm(hidden, self.norm_weight, self.config.rms_norm_eps)
         return _decode_linear(attn_in, self.lm_head_weight, self.lm_head_weight_decode)
@@ -2968,6 +3860,11 @@ def _ragged_scaled_dot_product_attention(
     if row_indices is not None:
         k = k.index_select(0, row_indices)
         v = v.index_select(0, row_indices)
+    if not q.is_cuda:
+        max_attention_len = int(attention_lengths.max().item()) if attention_lengths.numel() else 0
+        if max_attention_len > 0:
+            k = k[:, :, :max_attention_len, :]
+            v = v[:, :, :max_attention_len, :]
     max_seq_len = k.size(2)
     key_positions = torch.arange(max_seq_len, device=q.device)
     mask = key_positions[None, :] < attention_lengths.to(device=q.device)[:, None]
@@ -3130,6 +4027,7 @@ def _should_use_decode_step_graph(
     cache: Llama3TensorParallelCache,
     temperature: float,
 ) -> bool:
+    cache_keys = getattr(cache.layers[0], "keys", None) if cache.layers else None
     return (
         _tp_flag("TORCHINFERNO_CUDAGRAPH_DECODE_STEP", True)
         and temperature <= 0.0
@@ -3137,8 +4035,12 @@ def _should_use_decode_step_graph(
         and input_ids.ndim == 2
         and 1 <= input_ids.size(0) <= _decode_step_max_batch()
         and input_ids.size(1) == 1
-        and bool(cache.layers)
-        and cache.layers[0].keys.is_cuda
+        and cache_keys is not None
+        and cache_keys.is_cuda
+        and (
+            _static_decode_cache_rows_are_contiguous(cache, input_ids.size(0))
+            or _tp_flag("TORCHINFERNO_CUDAGRAPH_DECODE_SPARSE_ROWS", False)
+        )
     )
 
 
@@ -3146,15 +4048,30 @@ def _should_use_decode_step_logits_graph(
     input_ids: Tensor,
     cache: Llama3TensorParallelCache,
 ) -> bool:
+    cache_keys = getattr(cache.layers[0], "keys", None) if cache.layers else None
     return (
         _tp_flag("TORCHINFERNO_CUDAGRAPH_DECODE_STEP", True)
         and input_ids.is_cuda
         and input_ids.ndim == 2
         and 1 <= input_ids.size(0) <= _decode_step_max_batch()
         and input_ids.size(1) == 1
-        and bool(cache.layers)
-        and cache.layers[0].keys.is_cuda
+        and cache_keys is not None
+        and cache_keys.is_cuda
+        and (
+            _static_decode_cache_rows_are_contiguous(cache, input_ids.size(0))
+            or _tp_flag("TORCHINFERNO_CUDAGRAPH_DECODE_SPARSE_ROWS", False)
+        )
     )
+
+
+def _static_decode_cache_rows_are_contiguous(cache: Llama3TensorParallelCache, batch: int) -> bool:
+    return all(_contiguous_row_span(layer._selected_rows(batch)) is not None for layer in cache.layers)
+
+
+def _static_decode_row_indices(cache: Llama3TensorParallelCache, batch: int) -> Tensor | None:
+    if not cache.layers:
+        return None
+    return cache.layers[0]._selected_row_indices_tensor(batch)
 
 
 def _should_use_ragged_decode_logits_graph(
@@ -3163,6 +4080,7 @@ def _should_use_ragged_decode_logits_graph(
     seq_lens: Tensor,
     row_indices: Tensor | None,
 ) -> bool:
+    cache_keys = _prefill_graph_cache_storage(cache)
     return (
         _tp_flag("TORCHINFERNO_CUDAGRAPH_RAGGED_DECODE_STEP", True)
         and input_ids.is_cuda
@@ -3172,8 +4090,8 @@ def _should_use_ragged_decode_logits_graph(
         and seq_lens.is_cuda
         and seq_lens.ndim == 1
         and (row_indices is None or (row_indices.is_cuda and row_indices.shape == (input_ids.size(0),)))
-        and bool(cache.layers)
-        and cache.layers[0].keys.is_cuda
+        and cache_keys is not None
+        and cache_keys.is_cuda
     )
 
 
@@ -3197,6 +4115,7 @@ def _should_use_prefill_graph(
     temperature: float,
 ) -> bool:
     max_cache_tokens = _tp_int("TORCHINFERNO_CUDAGRAPH_PREFILL_MAX_CACHE_TOKENS", 1024, minimum=1)
+    cache_keys = _prefill_graph_cache_storage(cache)
     return (
         _tp_flag("TORCHINFERNO_CUDAGRAPH_PREFILL")
         and temperature <= 0.0
@@ -3204,8 +4123,8 @@ def _should_use_prefill_graph(
         and input_ids.ndim == 2
         and 1 <= input_ids.size(0) <= _tp_int("TORCHINFERNO_CUDAGRAPH_PREFILL_MAX_BATCH", 64, minimum=1)
         and input_ids.size(1) > 1
-        and bool(cache.layers)
-        and cache.layers[0].keys.is_cuda
+        and cache_keys is not None
+        and cache_keys.is_cuda
         and cache.layers[0].max_seq_len <= max_cache_tokens
     )
 
@@ -3215,16 +4134,51 @@ def _should_use_prefill_logits_graph(
     cache: Llama3TensorParallelCache,
 ) -> bool:
     max_cache_tokens = _tp_int("TORCHINFERNO_CUDAGRAPH_PREFILL_MAX_CACHE_TOKENS", 1024, minimum=1)
+    cache_keys = _prefill_graph_cache_storage(cache)
     return (
         _tp_flag("TORCHINFERNO_CUDAGRAPH_PREFILL")
         and input_ids.is_cuda
         and input_ids.ndim == 2
         and 1 <= input_ids.size(0) <= _tp_int("TORCHINFERNO_CUDAGRAPH_PREFILL_MAX_BATCH", 64, minimum=1)
         and input_ids.size(1) > 1
-        and bool(cache.layers)
-        and cache.layers[0].keys.is_cuda
+        and cache_keys is not None
+        and cache_keys.is_cuda
         and cache.layers[0].max_seq_len <= max_cache_tokens
     )
+
+
+def _prefill_graph_cache_storage(cache: Llama3TensorParallelCache) -> Tensor | None:
+    if not cache.layers:
+        return None
+    layer = cache.layers[0]
+    cache_keys = getattr(layer, "keys", None)
+    if isinstance(cache_keys, Tensor):
+        return cache_keys
+    pages = getattr(layer, "pages", None)
+    page_keys = getattr(pages, "keys", None)
+    return page_keys if isinstance(page_keys, Tensor) else None
+
+
+def _cache_graph_root_id(cache: Llama3TensorParallelCache) -> int:
+    return int(getattr(cache, "_graph_cache_id", id(cache)))
+
+
+def _prefill_graph_cache_rows(cache: Llama3TensorParallelCache, batch: int) -> tuple[int, ...]:
+    if not cache.layers:
+        return tuple(range(batch))
+    return cache.layers[0]._selected_rows(batch)
+
+
+def _prefill_graph_cache_key(cache: Llama3TensorParallelCache, batch: int) -> tuple[int, tuple[int, ...]]:
+    return _cache_graph_root_id(cache), _prefill_graph_cache_rows(cache, batch)
+
+
+def _same_prefill_graph_cache(
+    left: Llama3TensorParallelCache,
+    right: Llama3TensorParallelCache,
+    batch: int,
+) -> bool:
+    return _prefill_graph_cache_key(left, batch) == _prefill_graph_cache_key(right, batch)
 
 
 def _decode_attention_block_size(attention_length: int, max_seq_len: int) -> int:
@@ -3275,6 +4229,7 @@ def _model_world_size(model: object) -> int:
 
 
 def _should_use_symm_mem_prefill_all_reduce(hidden: Tensor, weight: Tensor, world_size: int) -> bool:
+    max_tokens = _tp_int("TORCHINFERNO_SYMM_MEM_PREFILL_ALLREDUCE_MAX_TOKENS", 1024, minimum=1)
     return (
         world_size > 1
         and not _SYMM_REDUCE_DISABLED
@@ -3282,8 +4237,8 @@ def _should_use_symm_mem_prefill_all_reduce(hidden: Tensor, weight: Tensor, worl
         and hidden.is_cuda
         and weight.is_cuda
         and hidden.ndim == 3
-        and hidden.size(0) == 1
         and hidden.size(1) > 1
+        and hidden.size(0) * hidden.size(1) <= max_tokens
     )
 
 

@@ -1646,3 +1646,367 @@ def triton_paged_decode_attention(query: Tensor, cache, request_id: str, positio
         num_warps=4,
     )
     return out
+
+
+@triton.jit
+def _batched_paged_gqa_decode_attention_streaming_kernel(
+    q_ptr,
+    key_pages_ptr,
+    value_pages_ptr,
+    page_table_ptr,
+    seq_lens_ptr,
+    out_ptr,
+    cache_tokens: tl.constexpr,
+    page_table_stride_batch: tl.constexpr,
+    page_size: tl.constexpr,
+    group_size: tl.constexpr,
+    head_dim: tl.constexpr,
+    value_dim: tl.constexpr,
+    scale: tl.constexpr,
+    q_stride_batch: tl.constexpr,
+    q_stride_head: tl.constexpr,
+    q_stride_token: tl.constexpr,
+    q_stride_dim: tl.constexpr,
+    key_stride_page: tl.constexpr,
+    key_stride_head: tl.constexpr,
+    key_stride_token: tl.constexpr,
+    key_stride_dim: tl.constexpr,
+    value_stride_page: tl.constexpr,
+    value_stride_head: tl.constexpr,
+    value_stride_token: tl.constexpr,
+    value_stride_dim: tl.constexpr,
+    out_stride_batch: tl.constexpr,
+    out_stride_head: tl.constexpr,
+    out_stride_token: tl.constexpr,
+    out_stride_dim: tl.constexpr,
+    block_q: tl.constexpr,
+    block_s: tl.constexpr,
+    block_d: tl.constexpr,
+    block_v: tl.constexpr,
+) -> None:
+    batch = tl.program_id(0)
+    kv_head = tl.program_id(1)
+    seq_len = tl.load(seq_lens_ptr + batch)
+    offs_q = tl.arange(0, block_q)
+    offs_s = tl.arange(0, block_s)
+    offs_d = tl.arange(0, block_d)
+    offs_v = tl.arange(0, block_v)
+    q_head = kv_head * group_size + offs_q
+    q_offsets = (
+        batch * q_stride_batch
+        + q_head[:, None] * q_stride_head
+        + offs_d[None, :] * q_stride_dim
+    )
+    q = tl.load(q_ptr + q_offsets, mask=(offs_q[:, None] < group_size) & (offs_d[None, :] < head_dim), other=0.0)
+    running_max = tl.full((block_q,), -float("inf"), dtype=tl.float32)
+    running_sum = tl.zeros((block_q,), dtype=tl.float32)
+    acc = tl.zeros((block_q, block_v), dtype=tl.float32)
+    for start in range(0, cache_tokens, block_s):
+        seq_offsets = start + offs_s
+        page_slots = seq_offsets // page_size
+        page_offsets = seq_offsets - page_slots * page_size
+        page_ids = tl.load(
+            page_table_ptr + batch * page_table_stride_batch + page_slots,
+            mask=seq_offsets < seq_len,
+            other=0,
+        )
+        key_offsets = (
+            page_ids[None, :] * key_stride_page
+            + kv_head * key_stride_head
+            + page_offsets[None, :] * key_stride_token
+            + offs_d[:, None] * key_stride_dim
+        )
+        keys = tl.load(
+            key_pages_ptr + key_offsets,
+            mask=(offs_d[:, None] < head_dim) & (seq_offsets[None, :] < seq_len),
+            other=0.0,
+        )
+        scores = tl.dot(q, keys) * scale
+        scores = tl.where((offs_q[:, None] < group_size) & (seq_offsets[None, :] < seq_len), scores, -float("inf"))
+        next_max = tl.maximum(running_max, tl.max(scores, axis=1))
+        probs = tl.exp(scores - next_max[:, None])
+        scale_old = tl.exp(running_max - next_max)
+        value_offsets = (
+            page_ids[:, None] * value_stride_page
+            + kv_head * value_stride_head
+            + page_offsets[:, None] * value_stride_token
+            + offs_v[None, :] * value_stride_dim
+        )
+        values = tl.load(
+            value_pages_ptr + value_offsets,
+            mask=(seq_offsets[:, None] < seq_len) & (offs_v[None, :] < value_dim),
+            other=0.0,
+        )
+        acc = acc * scale_old[:, None] + tl.dot(probs.to(values.dtype), values)
+        running_sum = running_sum * scale_old + tl.sum(probs, axis=1)
+        running_max = next_max
+    out = acc / running_sum[:, None]
+    out_offsets = (
+        batch * out_stride_batch
+        + q_head[:, None] * out_stride_head
+        + offs_v[None, :] * out_stride_dim
+    )
+    tl.store(out_ptr + out_offsets, out, mask=(offs_q[:, None] < group_size) & (offs_v[None, :] < value_dim))
+
+
+def triton_batched_paged_gqa_decode_attention(
+    query: Tensor,
+    cache,
+    request_ids: tuple[str, ...] | list[str],
+    positions: Tensor,
+) -> Tensor:
+    """Batched single-token paged GQA decode attention over a request page table."""
+
+    if query.ndim == 3:
+        query = query[:, :, None, :]
+    if query.ndim != 4 or query.size(2) != 1:
+        raise ValueError("query must have shape [batch, heads, head_dim] or [batch, heads, 1, head_dim]")
+    if len(request_ids) != query.size(0):
+        raise ValueError("request_ids length must match query batch")
+    if query.size(1) % cache.num_key_value_heads != 0:
+        raise ValueError("query head count must be divisible by KV head count")
+    if positions.ndim == 0:
+        positions = positions.expand(len(request_ids))
+    if positions.shape != (len(request_ids),):
+        raise ValueError("positions must have shape [batch]")
+    page_table, seq_lens, cache_tokens = _batched_paged_decode_page_table(cache, request_ids, device=query.device)
+    return triton_batched_paged_gqa_decode_attention_with_table(
+        query,
+        cache.keys,
+        cache.values,
+        page_table,
+        seq_lens,
+        page_size=cache.page_size,
+        cache_tokens=cache_tokens,
+        num_key_value_heads=cache.num_key_value_heads,
+        value_head_dim=cache.value_head_dim,
+    )
+
+
+def triton_batched_paged_gqa_decode_attention_with_table(
+    query: Tensor,
+    key_pages: Tensor,
+    value_pages: Tensor,
+    page_table: Tensor,
+    seq_lens: Tensor,
+    *,
+    page_size: int,
+    cache_tokens: int,
+    num_key_value_heads: int | None = None,
+    value_head_dim: int | None = None,
+) -> Tensor:
+    """Batched single-token paged GQA decode attention over an existing device page table."""
+
+    if query.ndim == 3:
+        query = query[:, :, None, :]
+    if query.ndim != 4 or query.size(2) != 1:
+        raise ValueError("query must have shape [batch, heads, head_dim] or [batch, heads, 1, head_dim]")
+    if page_table.ndim != 2 or page_table.size(0) != query.size(0):
+        raise ValueError("page_table must have shape [batch, pages]")
+    if seq_lens.shape != (query.size(0),):
+        raise ValueError("seq_lens must have shape [batch]")
+    if cache_tokens <= 0:
+        value_dim = value_pages.size(3) if value_head_dim is None else value_head_dim
+        return query.new_zeros((query.size(0), query.size(1), 1, value_dim))
+    batch, q_heads, _tokens, head_dim = query.shape
+    kv_heads = key_pages.size(1) if num_key_value_heads is None else num_key_value_heads
+    value_dim = value_pages.size(3) if value_head_dim is None else value_head_dim
+    if q_heads % kv_heads != 0:
+        raise ValueError("query head count must be divisible by KV head count")
+    group_size = q_heads // kv_heads
+    block_q = triton.next_power_of_2(group_size)
+    block_s = _streaming_decode_attention_block_s(batch)
+    block_d = triton.next_power_of_2(head_dim)
+    block_v = triton.next_power_of_2(value_dim)
+    if block_q > 16:
+        raise ValueError("batched paged GQA decode attention supports up to 16 query heads per KV head")
+    if block_s <= 0 or block_s > 2048 or block_s & (block_s - 1) != 0:
+        raise ValueError("streaming decode attention block size must be a power of two up to 2048")
+    if block_d > 256 or block_v > 256:
+        raise ValueError("batched paged GQA decode attention supports head/value dimensions up to 256")
+    if query.stride(-1) != 1:
+        query = query.contiguous()
+    out = torch.empty((batch, q_heads, 1, value_dim), device=query.device, dtype=query.dtype)
+    _batched_paged_gqa_decode_attention_streaming_kernel[(batch, kv_heads)](
+        query,
+        key_pages,
+        value_pages,
+        page_table,
+        seq_lens,
+        out,
+        cache_tokens,
+        page_table.stride(0),
+        page_size,
+        group_size,
+        head_dim,
+        value_dim,
+        1.0 / (head_dim**0.5),
+        query.stride(0),
+        query.stride(1),
+        query.stride(2),
+        query.stride(3),
+        key_pages.stride(0),
+        key_pages.stride(1),
+        key_pages.stride(2),
+        key_pages.stride(3),
+        value_pages.stride(0),
+        value_pages.stride(1),
+        value_pages.stride(2),
+        value_pages.stride(3),
+        out.stride(0),
+        out.stride(1),
+        out.stride(2),
+        out.stride(3),
+        block_q,
+        block_s,
+        block_d,
+        block_v,
+        num_warps=4,
+    )
+    return out
+
+
+@triton.jit
+def _paged_append_kv_cache_ragged_kernel(
+    keys_ptr,
+    values_ptr,
+    key_pages_ptr,
+    value_pages_ptr,
+    page_table_ptr,
+    positions_ptr,
+    page_table_stride_batch: tl.constexpr,
+    page_size: tl.constexpr,
+    key_in_stride_batch: tl.constexpr,
+    key_in_stride_head: tl.constexpr,
+    key_in_stride_token: tl.constexpr,
+    key_in_stride_dim: tl.constexpr,
+    value_in_stride_batch: tl.constexpr,
+    value_in_stride_head: tl.constexpr,
+    value_in_stride_token: tl.constexpr,
+    value_in_stride_dim: tl.constexpr,
+    key_page_stride_page: tl.constexpr,
+    key_page_stride_head: tl.constexpr,
+    key_page_stride_token: tl.constexpr,
+    key_page_stride_dim: tl.constexpr,
+    value_page_stride_page: tl.constexpr,
+    value_page_stride_head: tl.constexpr,
+    value_page_stride_token: tl.constexpr,
+    value_page_stride_dim: tl.constexpr,
+    head_dim: tl.constexpr,
+    value_dim: tl.constexpr,
+    block_dim: tl.constexpr,
+) -> None:
+    batch = tl.program_id(0)
+    kv_head = tl.program_id(1)
+    offsets = tl.arange(0, block_dim)
+    position = tl.load(positions_ptr + batch)
+    page_slot = position // page_size
+    page_offset = position - page_slot * page_size
+    page_id = tl.load(page_table_ptr + batch * page_table_stride_batch + page_slot)
+    key_values = tl.load(
+        keys_ptr
+        + batch * key_in_stride_batch
+        + kv_head * key_in_stride_head
+        + offsets * key_in_stride_dim,
+        mask=offsets < head_dim,
+        other=0.0,
+    )
+    tl.store(
+        key_pages_ptr
+        + page_id * key_page_stride_page
+        + kv_head * key_page_stride_head
+        + page_offset * key_page_stride_token
+        + offsets * key_page_stride_dim,
+        key_values,
+        mask=offsets < head_dim,
+    )
+    value_values = tl.load(
+        values_ptr
+        + batch * value_in_stride_batch
+        + kv_head * value_in_stride_head
+        + offsets * value_in_stride_dim,
+        mask=offsets < value_dim,
+        other=0.0,
+    )
+    tl.store(
+        value_pages_ptr
+        + page_id * value_page_stride_page
+        + kv_head * value_page_stride_head
+        + page_offset * value_page_stride_token
+        + offsets * value_page_stride_dim,
+        value_values,
+        mask=offsets < value_dim,
+    )
+
+
+def triton_paged_append_kv_cache_ragged(
+    keys: Tensor,
+    values: Tensor,
+    key_pages: Tensor,
+    value_pages: Tensor,
+    page_table: Tensor,
+    positions: Tensor,
+    *,
+    page_size: int,
+) -> None:
+    """Append one ragged decode token per row using an existing device page table."""
+
+    if keys.ndim != 4 or values.ndim != 4 or keys.size(2) != 1 or values.size(2) != 1:
+        raise ValueError("paged ragged append expects keys/values with shape [batch, heads, 1, dim]")
+    if page_table.ndim != 2 or page_table.size(0) != keys.size(0):
+        raise ValueError("page_table must have shape [batch, pages]")
+    if positions.shape != (keys.size(0),):
+        raise ValueError("positions must have shape [batch]")
+    if keys.size(0) != values.size(0) or keys.size(1) != values.size(1):
+        raise ValueError("keys and values must have matching batch/head dimensions")
+    kv_heads = keys.size(1)
+    head_dim = keys.size(3)
+    value_dim = values.size(3)
+    block_dim = triton.next_power_of_2(max(head_dim, value_dim))
+    if block_dim > 256:
+        raise ValueError("paged ragged append supports head/value dimensions up to 256")
+    _paged_append_kv_cache_ragged_kernel[(keys.size(0), kv_heads)](
+        keys,
+        values,
+        key_pages,
+        value_pages,
+        page_table,
+        positions.to(device=keys.device, dtype=torch.long),
+        page_table.stride(0),
+        page_size,
+        keys.stride(0),
+        keys.stride(1),
+        keys.stride(2),
+        keys.stride(3),
+        values.stride(0),
+        values.stride(1),
+        values.stride(2),
+        values.stride(3),
+        key_pages.stride(0),
+        key_pages.stride(1),
+        key_pages.stride(2),
+        key_pages.stride(3),
+        value_pages.stride(0),
+        value_pages.stride(1),
+        value_pages.stride(2),
+        value_pages.stride(3),
+        head_dim,
+        value_dim,
+        block_dim,
+        num_warps=4,
+    )
+
+
+def _batched_paged_decode_page_table(cache, request_ids: tuple[str, ...] | list[str], *, device: torch.device):
+    lengths = [cache.sequence_length(request_id) for request_id in request_ids]
+    cache_tokens = max(lengths, default=0)
+    max_pages = max(1, (cache_tokens + cache.page_size - 1) // cache.page_size)
+    page_rows: list[list[int]] = []
+    for request_id, seq_len in zip(request_ids, lengths):
+        seq = cache.sequence(request_id)
+        required_pages = (seq_len + cache.page_size - 1) // cache.page_size if seq_len > 0 else 0
+        pages = [int(page_id) for page_id in seq.page_ids[:required_pages]]
+        page_rows.append(pages + [0] * (max_pages - len(pages)))
+    page_table = torch.tensor(page_rows, dtype=torch.long, device=device)
+    seq_lens = torch.tensor(lengths, dtype=torch.long, device=device)
+    return page_table, seq_lens, cache_tokens

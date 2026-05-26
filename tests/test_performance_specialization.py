@@ -13,6 +13,7 @@ from torchinferno.kernels import (
     dequantize_nvfp4,
     fused_rmsnorm_swiglu,
     fused_rmsnorm_swiglu_reference,
+    batched_paged_decode_attention,
     nvfp4_linear_reference,
     paged_decode_attention,
     quantize_nvfp4,
@@ -22,10 +23,14 @@ from torchinferno.kernels.passes import register_kernel_replacement_passes
 from torchinferno.models.llama3.tensor_parallel import (
     Llama3TensorParallelCache,
     Llama3TensorParallelLayerKVCache,
+    PagedLlama3TensorParallelLayerKVCache,
     _decode_attention_block_size,
     _decode_linear,
+    _prefill_graph_cache_storage,
     _should_use_decode_step_graph,
     _should_use_decode_step_logits_graph,
+    _static_decode_cache_rows_are_contiguous,
+    _static_decode_row_indices,
 )
 from torchinferno.research.benchmarks import benchmark_callable
 from torchinferno.research.helion import (
@@ -234,6 +239,72 @@ def test_tensor_parallel_kv_cache_row_views_support_mixed_lengths() -> None:
     torch.testing.assert_close(layer.values[0:1, :, :4, :], values)
 
 
+def test_paged_kv_cache_ragged_append_reuses_static_bucket_padding_rows() -> None:
+    layer = PagedLlama3TensorParallelLayerKVCache(
+        2,
+        8,
+        1,
+        2,
+        page_size=2,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+    base_keys = torch.arange(8, dtype=torch.float32).reshape(2, 1, 2, 2)
+    layer.append(base_keys, base_keys + 100)
+
+    first_query = torch.ones((2, 1, 1, 2))
+    first_keys = torch.full((2, 1, 1, 2), 10.0)
+    layer.append_and_attend_ragged(
+        first_query,
+        first_keys,
+        first_keys + 100,
+        torch.tensor([2, 2]),
+        torch.tensor([0, 1]),
+        enable_gqa=False,
+    )
+
+    second_query = torch.ones((2, 1, 1, 2))
+    second_keys = torch.full((2, 1, 1, 2), 20.0)
+    layer.append_and_attend_ragged(
+        second_query,
+        second_keys,
+        second_keys + 100,
+        torch.tensor([3, 2]),
+        torch.tensor([0, 1]),
+        enable_gqa=False,
+    )
+
+    assert layer.for_rows((0,)).seq_len == 4
+    assert layer.for_rows((1,)).seq_len == 3
+    row1_keys, _row1_values = layer.materialize_row(1)
+    torch.testing.assert_close(row1_keys[:, -1:, :], first_keys[1, :, :, :])
+
+
+def test_paged_kv_cache_seq_len_restore_keeps_graph_pages() -> None:
+    layer = PagedLlama3TensorParallelLayerKVCache(
+        1,
+        8,
+        1,
+        2,
+        page_size=2,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+    keys = torch.arange(8, dtype=torch.float32).reshape(1, 1, 4, 2)
+    values = keys + 100
+    layer.append(keys, values)
+    original_pages = tuple(layer.pages.sequence("batch-0").page_ids)
+
+    layer.set_seq_len(2)
+    layer.set_seq_len(4)
+
+    assert tuple(layer.pages.sequence("batch-0").page_ids) == original_pages
+    assert layer.seq_len == 4
+    storage = _prefill_graph_cache_storage(Llama3TensorParallelCache([layer], cache_backend="paged"))
+    assert storage is not None
+    assert storage.data_ptr() == layer.pages.keys.data_ptr()
+
+
 def test_tensor_parallel_kv_cache_row_views_copy_prefix_and_clear() -> None:
     cache = Llama3TensorParallelCache(
         [
@@ -288,6 +359,35 @@ def test_tensor_parallel_kv_cache_row_views_compose() -> None:
     torch.testing.assert_close(cache.layers[0].keys[3:4, :, :1, :], keys)
     with pytest.raises(ValueError, match="cache row out of range"):
         view.for_rows((2,))
+
+
+def test_tensor_parallel_kv_cache_static_storage_tracks_contiguous_row_views() -> None:
+    cache = Llama3TensorParallelCache(
+        [
+            Llama3TensorParallelLayerKVCache(
+                4,
+                8,
+                1,
+                2,
+                device=torch.device("cpu"),
+                dtype=torch.float32,
+            )
+        ]
+    )
+    layer = cache.layers[0]
+    contiguous = layer.for_rows((1, 2))
+    keys, values = contiguous._contiguous_key_value_storage(2)
+
+    assert keys.shape == (2, 1, 8, 2)
+    assert values.shape == (2, 1, 8, 2)
+    keys[:, :, :1, :].fill_(3.0)
+    torch.testing.assert_close(layer.keys[1:3, :, :1, :], torch.full((2, 1, 1, 2), 3.0))
+    assert _static_decode_cache_rows_are_contiguous(cache.for_rows((1, 2)), 2)
+    assert not _static_decode_cache_rows_are_contiguous(cache.for_rows((0, 2)), 2)
+    assert layer.for_rows((0, 2))._contiguous_key_value_storage(2) is None
+    sparse_indices = _static_decode_row_indices(cache.for_rows((0, 2)), 2)
+    assert sparse_indices is not None
+    torch.testing.assert_close(sparse_indices.cpu(), torch.tensor([0, 2]))
 
 
 def test_tensor_parallel_kv_cache_row_views_reject_invalid_rows() -> None:
@@ -421,6 +521,97 @@ def test_paged_decode_attention_torch_backend_matches_reference() -> None:
     torch.testing.assert_close(actual, expected)
 
 
+def test_paged_decode_attention_torch_backend_supports_grouped_query_attention() -> None:
+    torch.manual_seed(43)
+    kv_heads = 2
+    query_heads = 4
+    seq_len = 7
+    head_dim = 5
+    value_dim = 4
+    cache = PagedKVCache(
+        num_pages=4,
+        page_size=2,
+        num_key_value_heads=kv_heads,
+        head_dim=head_dim,
+        value_head_dim=value_dim,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+    keys = torch.randn(kv_heads, seq_len, head_dim)
+    values = torch.randn(kv_heads, seq_len, value_dim)
+    query = torch.randn(query_heads, 1, head_dim)
+    cache.append("req", keys, values)
+
+    actual = paged_decode_attention(
+        query,
+        cache,
+        "req",
+        seq_len - 1,
+        config=KernelConfig(backend=KernelBackend.TORCH),
+        enable_gqa=True,
+    )
+    expected = paged_causal_attention(
+        query,
+        cache,
+        "req",
+        torch.tensor([seq_len - 1]),
+        enable_gqa=True,
+    )
+
+    torch.testing.assert_close(actual, expected)
+
+
+def test_batched_paged_decode_attention_torch_backend_matches_reference() -> None:
+    torch.manual_seed(44)
+    kv_heads = 2
+    query_heads = 4
+    head_dim = 5
+    value_dim = 4
+    lengths = [3, 6, 7]
+    cache = PagedKVCache(
+        num_pages=12,
+        page_size=2,
+        num_key_value_heads=kv_heads,
+        head_dim=head_dim,
+        value_head_dim=value_dim,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+    for row, length in enumerate(lengths):
+        cache.append(
+            f"req-{row}",
+            torch.randn(kv_heads, length, head_dim),
+            torch.randn(kv_heads, length, value_dim),
+        )
+    query = torch.randn(len(lengths), query_heads, 1, head_dim)
+    request_ids = [f"req-{row}" for row in range(len(lengths))]
+    positions = torch.tensor([length - 1 for length in lengths])
+
+    actual = batched_paged_decode_attention(
+        query,
+        cache,
+        request_ids,
+        positions,
+        config=KernelConfig(backend=KernelBackend.TORCH),
+        enable_gqa=True,
+    )
+    expected = torch.stack(
+        [
+            paged_causal_attention(
+                query[row],
+                cache,
+                request_id,
+                torch.tensor([int(positions[row].item())]),
+                enable_gqa=True,
+            )
+            for row, request_id in enumerate(request_ids)
+        ],
+        dim=0,
+    )
+
+    torch.testing.assert_close(actual, expected)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available() or not triton_available(), reason="CUDA Triton unavailable")
 def test_triton_paged_decode_attention_matches_reference() -> None:
     torch.manual_seed(42)
@@ -447,6 +638,59 @@ def test_triton_paged_decode_attention_matches_reference() -> None:
     expected = paged_causal_attention(query, cache, "req", torch.tensor([seq_len - 1], device=device))
 
     torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or not triton_available(), reason="CUDA Triton unavailable")
+def test_triton_batched_paged_decode_attention_matches_reference() -> None:
+    torch.manual_seed(45)
+    device = torch.device("cuda")
+    kv_heads = 2
+    query_heads = 4
+    head_dim = 16
+    value_dim = 12
+    lengths = [5, 9, 13]
+    cache = PagedKVCache(
+        num_pages=12,
+        page_size=4,
+        num_key_value_heads=kv_heads,
+        head_dim=head_dim,
+        value_head_dim=value_dim,
+        device=device,
+        dtype=torch.float32,
+    )
+    for row, length in enumerate(lengths):
+        cache.append(
+            f"req-{row}",
+            torch.randn(kv_heads, length, head_dim, device=device),
+            torch.randn(kv_heads, length, value_dim, device=device),
+        )
+    query = torch.randn(len(lengths), query_heads, 1, head_dim, device=device)
+    request_ids = [f"req-{row}" for row in range(len(lengths))]
+    positions = torch.tensor([length - 1 for length in lengths], device=device)
+
+    actual = batched_paged_decode_attention(
+        query,
+        cache,
+        request_ids,
+        positions,
+        config=KernelConfig(backend=KernelBackend.TRITON),
+        enable_gqa=True,
+    )
+    expected = torch.stack(
+        [
+            paged_causal_attention(
+                query[row],
+                cache,
+                request_id,
+                torch.tensor([int(positions[row].item())], device=device),
+                enable_gqa=True,
+            )
+            for row, request_id in enumerate(request_ids)
+        ],
+        dim=0,
+    )
+
+    torch.testing.assert_close(actual, expected, atol=2e-3, rtol=2e-3)
 
 
 def test_benchmark_callable_and_perf_cli() -> None:

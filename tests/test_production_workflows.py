@@ -74,6 +74,39 @@ def test_paged_attention_matches_dense_attention_with_value_dim() -> None:
     torch.testing.assert_close(actual, expected)
 
 
+def test_paged_attention_supports_grouped_query_attention() -> None:
+    torch.manual_seed(32)
+    kv_heads = 2
+    query_heads = 4
+    tokens = 5
+    head_dim = 4
+    value_dim = 3
+    keys = torch.randn(kv_heads, tokens, head_dim)
+    values = torch.randn(kv_heads, tokens, value_dim)
+    query = torch.randn(query_heads, tokens, head_dim)
+    positions = torch.arange(tokens)
+    cache = PagedKVCache(
+        num_pages=4,
+        page_size=2,
+        num_key_value_heads=kv_heads,
+        head_dim=head_dim,
+        value_head_dim=value_dim,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+    cache.append("req", keys, values)
+
+    actual = paged_causal_attention(query, cache, "req", positions, enable_gqa=True)
+    expanded_keys = keys.repeat_interleave(query_heads // kv_heads, dim=0)
+    expanded_values = values.repeat_interleave(query_heads // kv_heads, dim=0)
+    scores = torch.matmul(query, expanded_keys.transpose(-1, -2)) / (head_dim**0.5)
+    allowed = torch.arange(tokens)[None, :] <= positions[:, None]
+    scores = scores.masked_fill(~allowed[None, :, :], torch.finfo(scores.dtype).min)
+    expected = torch.matmul(torch.softmax(scores, dim=-1), expanded_values)
+
+    torch.testing.assert_close(actual, expected)
+
+
 def test_prefix_cache_and_traffic_simulation() -> None:
     prefix_cache = PrefixCacheIndex()
     prefix_cache.add("prefill-a", (1, 2, 3), route_id="route-a")

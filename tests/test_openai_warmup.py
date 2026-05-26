@@ -3,6 +3,7 @@ from __future__ import annotations
 from torchinferno.openai_warmup import (
     warmup_ragged_decode_batch_sizes,
     warmup_ragged_decode_cache_token_counts,
+    warmup_ragged_decode_extra_cache_specs,
     warmup_ragged_decode_row_counts,
     warmup_temperature_batch_sizes,
     warmup_temperature_prompt_token_counts,
@@ -25,3 +26,4 @@ def test_ragged_decode_warmup_covers_high_concurrency_shapes(monkeypatch) -> Non
     assert 64 in set(warmup_ragged_decode_batch_sizes())
     assert {16, 32, 64}.issubset(set(warmup_ragged_decode_row_counts()))
     assert {256, 512}.issubset(set(warmup_ragged_decode_cache_token_counts()))
+    assert (64, 1024) in set(warmup_ragged_decode_extra_cache_specs())

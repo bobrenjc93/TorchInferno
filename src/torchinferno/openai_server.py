@@ -10,7 +10,7 @@ import sys
 import threading
 import time
 from collections.abc import Mapping
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import ContextManager, Iterable, Iterator, Protocol, Sequence, runtime_checkable
@@ -38,12 +38,14 @@ from torchinferno.openai_http import (
     OpenAIHTTPServer as _OpenAIServer,
 )
 from torchinferno.openai_warmup import (
+    parse_positive_int_csv as _parse_positive_int_csv,
     warmup_prefill_cache_token_counts as _warmup_prefill_cache_token_counts,
     warmup_prefix_suffix_cache_token_counts as _warmup_prefix_suffix_cache_token_counts,
     warmup_prefix_suffix_token_counts as _warmup_prefix_suffix_token_counts,
     warmup_prompt_token_counts as _warmup_prompt_token_counts,
     warmup_ragged_decode_batch_sizes as _warmup_ragged_decode_batch_sizes,
     warmup_ragged_decode_cache_token_counts as _warmup_ragged_decode_cache_token_counts,
+    warmup_ragged_decode_extra_cache_specs as _warmup_ragged_decode_extra_cache_specs,
     warmup_ragged_decode_prompt_tokens as _warmup_ragged_decode_prompt_tokens,
     warmup_ragged_decode_row_counts as _warmup_ragged_decode_row_counts,
     warmup_temperature_batch_sizes as _warmup_temperature_batch_sizes,
@@ -59,6 +61,19 @@ from torchinferno.runtime.prefix_cache import (
     snapshot_tensor_prefix_cache,
 )
 from torchinferno.runtime.sampling import sample_next_token
+from torchinferno.runtime.scheduler import (
+    PersistentBatchPlan as _PersistentBatchPlan,
+    PersistentBatchRequest as _PersistentBatchRequest,
+    PersistentBatchScheduler as _PersistentBatchScheduler,
+    TokenBudgetPlan as _TokenBudgetPlan,
+    TokenBudgetRequest as _TokenBudgetRequest,
+    TokenBudgetScheduler as _TokenBudgetScheduler,
+    token_budget_model_step_command as _token_budget_model_step_command,
+)
+from torchinferno.runtime.serving import (
+    ContinuousBatchEngine as _RuntimeContinuousBatchEngine,
+    ServingRequest as _RuntimeServingRequest,
+)
 
 
 @dataclass(frozen=True)
@@ -77,10 +92,10 @@ class OpenAIServerConfig:
     token: str | None = None
     revision: str | None = None
     cache_dir: str | None = None
-    cache_backend: str = "dense"
+    cache_backend: str = "paged"
     page_size: int = 16
-    max_batch_size: int = 128
-    batch_wait_ms: float = 10.0
+    max_batch_size: int = 256
+    batch_wait_ms: float = 1.0
     single_request_admission_wait_ms: float | None = None
     llama_parallelism: str = "auto"
 
@@ -91,6 +106,12 @@ class CompletionResult:
     prompt_tokens: int
 
 
+def _startup_warmup_enabled_for_cache_backend(cache_backend: str) -> bool:
+    if cache_backend.lower() == "dense":
+        return True
+    return env_flag("TORCHINFERNO_OPENAI_STARTUP_WARMUP_NON_DENSE_CACHE", True)
+
+
 @dataclass
 class _QueuedGeneration:
     prompt: list[int]
@@ -98,7 +119,1054 @@ class _QueuedGeneration:
     temperature: float
     stream: bool
     responses: "queue.Queue[object] | queue.SimpleQueue[object]"
+    queued_at_s: float = 0.0
+    queue_sequence: int = -1
     done: bool = False
+
+
+@dataclass
+class _StreamRow:
+    request_id: str
+    request: _QueuedGeneration
+    row: int
+    generated_tokens: int = 0
+
+
+class _StreamRowState:
+    def __init__(self) -> None:
+        self._rows: dict[int, _StreamRow] = {}
+        self._request_rows: dict[str, int] = {}
+
+    @property
+    def active_request_ids(self) -> tuple[str, ...]:
+        return tuple(row.request_id for _row_index, row in sorted(self._rows.items()))
+
+    def is_admitted(self, request_id: str) -> bool:
+        return str(request_id) in self._request_rows
+
+    def generated_tokens(self, request_id: str) -> int:
+        row = self._row_for_request(request_id)
+        return row.generated_tokens
+
+    def admit(
+        self,
+        request_id: str,
+        row: int,
+        request: _QueuedGeneration,
+        *,
+        generated_tokens: int = 0,
+    ) -> None:
+        request_id = str(request_id)
+        row = int(row)
+        if generated_tokens < 0:
+            raise ValueError("stream row generated_tokens must be non-negative")
+        existing_row = self._request_rows.get(request_id)
+        if existing_row is not None:
+            if existing_row != row:
+                raise ValueError("stream request is already assigned to a different row")
+            current = self._rows[existing_row]
+            if current.request is not request:
+                raise ValueError("stream request_id is already assigned to another request")
+            return
+        current = self._rows.get(row)
+        if current is not None:
+            raise ValueError("stream row is already occupied")
+        self._rows[row] = _StreamRow(
+            request_id=request_id,
+            request=request,
+            row=row,
+            generated_tokens=int(generated_tokens),
+        )
+        self._request_rows[request_id] = row
+
+    def emit(
+        self,
+        request_id: str,
+        token_id: int | None,
+        *,
+        stop_token_ids: frozenset[int] = frozenset(),
+    ) -> bool:
+        row = self._row_for_request(request_id)
+        if token_id is not None:
+            row.generated_tokens += 1
+        _emit_stream_token(
+            row.request,
+            token_id,
+            generated_tokens=row.generated_tokens,
+            stop_token_ids=stop_token_ids,
+        )
+        if row.request.done:
+            self.release(request_id)
+            return True
+        return False
+
+    def finish(self, request_id: str) -> bool:
+        row_index = self._request_rows.get(str(request_id))
+        if row_index is None:
+            return False
+        row = self._rows[row_index]
+        _finish_stream_request(row.request)
+        self.release(request_id)
+        return True
+
+    def release(self, request_id: str) -> bool:
+        request_id = str(request_id)
+        row_index = self._request_rows.pop(request_id, None)
+        if row_index is None:
+            return False
+        self._rows.pop(row_index, None)
+        return True
+
+    def _row_for_request(self, request_id: str) -> _StreamRow:
+        row_index = self._request_rows.get(str(request_id))
+        if row_index is None:
+            raise ValueError("stream request is not admitted")
+        return self._rows[row_index]
+
+
+@dataclass
+class _PersistentPromptListStepState:
+    cache: object
+    prefix_caches: Mapping[tuple[int, ...], object]
+    active: list[bool]
+    per_row_limits: list[int]
+    generated_tokens: list[int]
+    seq_lens: Tensor
+    next_token_tensor: Tensor
+    row_request_ids: list[str | None]
+    cache_batch_size: int
+    logical_cache_batch_size: int = 0
+    ephemeral_graph_allowed: bool = False
+    ephemeral_graph_scope: bool = False
+
+
+@dataclass(frozen=True)
+class _PersistentPromptListStepResult:
+    decode_tokens: dict[str, int | None]
+    prefill_tokens: dict[str, int | None]
+    finished_request_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class _PersistentPromptListDecodeRunResult:
+    step_results: tuple[_PersistentPromptListStepResult, ...]
+
+    @property
+    def finished_request_ids(self) -> tuple[str, ...]:
+        finished: list[str] = []
+        for result in self.step_results:
+            finished.extend(result.finished_request_ids)
+        return tuple(finished)
+
+
+@dataclass(frozen=True)
+class _PersistentPromptListLocalRunStats:
+    scheduler_steps: int
+    step_commands: int
+    decode_run_commands: int
+    empty_plans: int
+    decode_steps: int
+    max_decode_run_steps: int
+    prefill_admissions: int
+    emitted_tokens: int
+    finished_events: int
+    first_emit_s: float | None
+    closed: bool
+
+
+@dataclass
+class _TokenBudgetStepState:
+    cache: object
+    prefix_caches: Mapping[tuple[int, ...], object]
+    active: list[bool]
+    row_request_ids: list[str | None]
+    generated_tokens: list[int]
+    seq_lens: Tensor
+    next_token_tensor: Tensor
+    cache_batch_size: int
+
+
+@dataclass(frozen=True)
+class _TokenBudgetStepResult:
+    decode_tokens: dict[str, int | None]
+    prefill_tokens: dict[str, int | None]
+    finished_request_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class _TokenBudgetDecodeRunResult:
+    step_results: tuple[_TokenBudgetStepResult, ...]
+
+    @property
+    def finished_request_ids(self) -> tuple[str, ...]:
+        finished: list[str] = []
+        for result in self.step_results:
+            finished.extend(result.finished_request_ids)
+        return tuple(finished)
+
+
+@dataclass(frozen=True)
+class _TokenBudgetLocalRunStats:
+    scheduler_steps: int
+    step_commands: int
+    decode_run_commands: int
+    empty_plans: int
+    emitted_tokens: int
+    finished_events: int
+    max_decode_run_steps: int
+    closed: bool
+
+
+def _merge_token_budget_finished_ids(*groups: Iterable[str]) -> tuple[str, ...]:
+    seen: set[str] = set()
+    merged: list[str] = []
+    for group in groups:
+        for request_id in group:
+            request_id_text = str(request_id)
+            if request_id_text in seen:
+                continue
+            seen.add(request_id_text)
+            merged.append(request_id_text)
+    return tuple(merged)
+
+
+def _persistent_prompt_list_scheduler_for_group(
+    group: Sequence[_QueuedGeneration],
+    *,
+    max_active_rows: int,
+    prefill_token_budget: int | None = None,
+    prefix_tokens: int = 0,
+) -> _PersistentBatchScheduler:
+    scheduler = _PersistentBatchScheduler(
+        max_rows=max_active_rows,
+        prefill_token_budget=prefill_token_budget,
+    )
+    prompts = [request.prompt for request in group]
+    prefix_key: tuple[int, ...] | None = None
+    if prefix_tokens > 0 and prompts:
+        candidate = tuple(int(token_id) for token_id in prompts[0][:prefix_tokens])
+        if len(candidate) == prefix_tokens and all(tuple(prompt[:prefix_tokens]) == candidate for prompt in prompts):
+            prefix_key = candidate
+    for index, request in enumerate(group):
+        if request.max_tokens <= 0:
+            continue
+        prefix_hit_tokens = min(prefix_tokens, len(request.prompt)) if prefix_key is not None else 0
+        scheduler.submit(
+            _PersistentBatchRequest(
+                str(index),
+                prompt_tokens=len(request.prompt),
+                max_new_tokens=request.max_tokens,
+                prefix_hit_tokens=prefix_hit_tokens,
+                prefix_key=prefix_key,
+            )
+        )
+    return scheduler
+
+
+def _persistent_prompt_list_step_payload(
+    plan: _PersistentBatchPlan,
+    group: Sequence[_QueuedGeneration],
+) -> dict[str, object]:
+    admitted: list[dict[str, object]] = []
+    for admission in plan.prefill_admissions:
+        request_index = int(admission.request_id)
+        request = group[request_index]
+        prefix_tokens = int(admission.prefix_hit_tokens)
+        admitted.append(
+            {
+                "request_id": admission.request_id,
+                "row": int(admission.row),
+                "prompt": list(request.prompt),
+                "max_tokens": int(request.max_tokens),
+                "prefix_hit_tokens": prefix_tokens,
+                "prefix": list(request.prompt[:prefix_tokens]),
+                "suffix": list(request.prompt[prefix_tokens:]),
+                "prefill_tokens": int(admission.prefill_tokens),
+            }
+        )
+    request_by_id = {str(index): request for index, request in enumerate(group)}
+    prefill_groups: list[dict[str, object]] = []
+    for prefill_group in plan.prefill_groups:
+        request_ids = list(prefill_group.request_ids)
+        first_request = request_by_id.get(request_ids[0]) if request_ids else None
+        prefix_tokens = int(prefill_group.prefix_hit_tokens)
+        prefill_groups.append(
+            {
+                "request_ids": request_ids,
+                "rows": [int(row) for row in prefill_group.rows],
+                "prefix_hit_tokens": prefix_tokens,
+                "prefix": [] if first_request is None else list(first_request.prompt[:prefix_tokens]),
+                "suffix_tokens": [int(tokens) for tokens in prefill_group.suffix_tokens],
+            }
+        )
+    return {
+        "op": "persistent_prompt_list_step",
+        "step": int(plan.step),
+        "decode_request_ids": list(plan.decode_request_ids),
+        "decode_rows": list(plan.decode_rows),
+        "prefill": admitted,
+        "prefill_groups": prefill_groups,
+        "finished_after_prefill": list(plan.finished_after_prefill),
+    }
+
+
+def _persistent_prompt_list_decode_run_payload(
+    *,
+    start_step: int,
+    step_count: int,
+    temperature: float,
+    static_graph_buckets: bool = False,
+) -> dict[str, object]:
+    if step_count < 1:
+        raise ValueError("persistent prompt-list decode-run requires positive step_count")
+    payload: dict[str, object] = {
+        "op": "persistent_prompt_list_decode_run",
+        "start_step": int(start_step),
+        "step_count": int(step_count),
+        "temperature": float(temperature),
+    }
+    if static_graph_buckets:
+        payload["static_graph_buckets"] = True
+    return payload
+
+
+def _persistent_prompt_list_decode_run_tensor_payload(
+    payload: Mapping[str, object],
+    device: torch.device,
+) -> tuple[Tensor, Tensor]:
+    step_count = int(payload.get("step_count", 0))
+    if step_count < 1:
+        raise ValueError("persistent prompt-list decode-run tensor payload requires positive step_count")
+    meta = torch.zeros(_TP_COMMAND_META_FIELDS, dtype=torch.long, device=device)
+    meta[0] = _TP_COMMAND_PROMPT_LIST_PERSISTENT_DECODE_RUN
+    meta[1] = int(payload.get("start_step", 0))
+    meta[2] = step_count
+    meta[8] = int(bool(payload.get("static_graph_buckets", False)))
+    temperature = torch.tensor([float(payload.get("temperature", 0.0))], dtype=torch.float64, device=device)
+    return meta, temperature
+
+
+def _persistent_prompt_list_decode_run_payload_from_tensor_payload(
+    meta: Tensor,
+    temperature: Tensor,
+) -> dict[str, object]:
+    meta_cpu = meta.detach().cpu().to(torch.long)
+    if int(meta_cpu[0].item()) != _TP_COMMAND_PROMPT_LIST_PERSISTENT_DECODE_RUN:
+        raise ValueError("persistent prompt-list decode-run tensor payload has wrong command kind")
+    payload = _persistent_prompt_list_decode_run_payload(
+        start_step=int(meta_cpu[1].item()),
+        step_count=int(meta_cpu[2].item()),
+        temperature=float(temperature.detach().cpu().to(torch.float64).item()),
+        static_graph_buckets=bool(int(meta_cpu[8].item())),
+    )
+    return payload
+
+
+def _persistent_prompt_list_step_tensor_payload(
+    payload: Mapping[str, object],
+    device: torch.device,
+) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+    decode_ids_obj = payload.get("decode_request_ids", [])
+    decode_rows_obj = payload.get("decode_rows", [])
+    if not isinstance(decode_ids_obj, list) or not isinstance(decode_rows_obj, list):
+        raise ValueError("persistent prompt-list tensor payload requires decode lists")
+    if len(decode_ids_obj) != len(decode_rows_obj):
+        raise ValueError("persistent prompt-list tensor payload decode lists differ")
+    decode_rows = [
+        [_token_budget_request_ordinal(request_id), int(row)]
+        for request_id, row in zip(decode_ids_obj, decode_rows_obj)
+    ]
+    decode_tensor = torch.tensor(decode_rows, dtype=torch.long, device=device)
+    if not decode_rows:
+        decode_tensor = torch.empty(
+            (0, _TP_PROMPT_LIST_PERSISTENT_DECODE_FIELDS),
+            dtype=torch.long,
+            device=device,
+        )
+
+    prefill_obj = payload.get("prefill", [])
+    if not isinstance(prefill_obj, list):
+        raise ValueError("persistent prompt-list tensor payload requires prefill list")
+    prefill_rows: list[list[int]] = []
+    prompt_rows: list[list[int]] = []
+    for item in prefill_obj:
+        if not isinstance(item, Mapping):
+            raise ValueError("persistent prompt-list tensor prefill entries must be mappings")
+        prompt_obj = item.get("prompt", [])
+        if not isinstance(prompt_obj, list):
+            raise ValueError("persistent prompt-list tensor prefill prompt must be a list")
+        prompt = [int(token_id) for token_id in prompt_obj]
+        prefill_rows.append(
+            [
+                _token_budget_request_ordinal(item.get("request_id")),
+                int(item["row"]),
+                int(item["max_tokens"]),
+                int(item.get("prefix_hit_tokens", 0)),
+                int(item.get("prefill_tokens", max(1, len(prompt) - int(item.get("prefix_hit_tokens", 0))))),
+                int(item.get("start_token", item.get("prefix_hit_tokens", 0))),
+            ]
+        )
+        prompt_rows.append(prompt)
+    prefill_tensor = torch.tensor(prefill_rows, dtype=torch.long, device=device)
+    if not prefill_rows:
+        prefill_tensor = torch.empty(
+            (0, _TP_PROMPT_LIST_PERSISTENT_PREFILL_FIELDS),
+            dtype=torch.long,
+            device=device,
+        )
+    prompt_token_rows, prompt_lengths = _prompt_list_tensor_payload(prompt_rows, device)
+
+    finished_obj = payload.get("finished_after_prefill", [])
+    if not isinstance(finished_obj, list):
+        raise ValueError("persistent prompt-list tensor payload requires finished_after_prefill list")
+    finished_ids = torch.tensor(
+        [_token_budget_request_ordinal(request_id) for request_id in finished_obj],
+        dtype=torch.long,
+        device=device,
+    )
+    meta = torch.zeros(_TP_COMMAND_META_FIELDS, dtype=torch.long, device=device)
+    meta[0] = _TP_COMMAND_PROMPT_LIST_PERSISTENT_STEP
+    meta[1] = int(payload.get("step", 0))
+    meta[2] = int(decode_tensor.size(0))
+    meta[3] = int(prefill_tensor.size(0))
+    meta[4] = int(prompt_token_rows.size(1)) if prompt_token_rows.ndim == 2 else 0
+    meta[5] = int(finished_ids.numel())
+    meta[6] = _TP_PROMPT_LIST_PERSISTENT_PREFILL_FIELDS
+    meta[7] = _TP_PROMPT_LIST_PERSISTENT_DECODE_FIELDS
+    meta[8] = int(bool(payload.get("static_graph_buckets", False)))
+    temperature = torch.tensor([float(payload.get("temperature", 0.0))], dtype=torch.float64, device=device)
+    return meta, temperature, decode_tensor, prefill_tensor, prompt_lengths, prompt_token_rows, finished_ids
+
+
+def _persistent_prompt_list_step_payload_from_tensor_payload(
+    meta: Tensor,
+    temperature: Tensor,
+    decode_tensor: Tensor,
+    prefill_tensor: Tensor,
+    prompt_lengths: Tensor,
+    prompt_token_rows: Tensor,
+    finished_ids: Tensor,
+) -> dict[str, object]:
+    meta_cpu = meta.detach().cpu().to(torch.long)
+    if int(meta_cpu[0].item()) != _TP_COMMAND_PROMPT_LIST_PERSISTENT_STEP:
+        raise ValueError("persistent prompt-list tensor payload has wrong command kind")
+    if int(meta_cpu[6].item()) != _TP_PROMPT_LIST_PERSISTENT_PREFILL_FIELDS:
+        raise ValueError("persistent prompt-list tensor payload has wrong prefill width")
+    if int(meta_cpu[7].item()) != _TP_PROMPT_LIST_PERSISTENT_DECODE_FIELDS:
+        raise ValueError("persistent prompt-list tensor payload has wrong decode width")
+
+    decode_cpu = decode_tensor.detach().cpu().to(torch.long)
+    if decode_cpu.ndim != 2 or decode_cpu.size(1) != _TP_PROMPT_LIST_PERSISTENT_DECODE_FIELDS:
+        raise ValueError("persistent prompt-list tensor decode tensor has invalid shape")
+    if int(meta_cpu[2].item()) != int(decode_cpu.size(0)):
+        raise ValueError("persistent prompt-list tensor decode count mismatch")
+    prefill_cpu = prefill_tensor.detach().cpu().to(torch.long)
+    if prefill_cpu.ndim != 2 or prefill_cpu.size(1) != _TP_PROMPT_LIST_PERSISTENT_PREFILL_FIELDS:
+        raise ValueError("persistent prompt-list tensor prefill tensor has invalid shape")
+    if int(meta_cpu[3].item()) != int(prefill_cpu.size(0)):
+        raise ValueError("persistent prompt-list tensor prefill count mismatch")
+    prompt_lengths_list = [int(value) for value in prompt_lengths.detach().cpu().to(torch.long).tolist()]
+    if len(prompt_lengths_list) != int(prefill_cpu.size(0)):
+        raise ValueError("persistent prompt-list tensor prompt length count mismatch")
+    prompt_rows_cpu = prompt_token_rows.detach().cpu().to(torch.long)
+    if prompt_rows_cpu.ndim != 2:
+        raise ValueError("persistent prompt-list tensor prompt rows have invalid shape")
+    if int(meta_cpu[4].item()) != int(prompt_rows_cpu.size(1)):
+        raise ValueError("persistent prompt-list tensor prompt width mismatch")
+    finished_cpu = finished_ids.detach().cpu().to(torch.long)
+    if int(meta_cpu[5].item()) != int(finished_cpu.numel()):
+        raise ValueError("persistent prompt-list tensor finished count mismatch")
+
+    decode_request_ids = [str(int(values[0])) for values in decode_cpu.tolist()]
+    decode_rows = [int(values[1]) for values in decode_cpu.tolist()]
+    prefill_items: list[dict[str, object]] = []
+    for index, values in enumerate(prefill_cpu.tolist()):
+        prompt_len = prompt_lengths_list[index]
+        prompt = [int(token_id) for token_id in prompt_rows_cpu[index, :prompt_len].tolist()]
+        prefix_hit_tokens = int(values[3])
+        prefill_tokens = int(values[4])
+        start_token = int(values[5])
+        prompt_complete = start_token + prefill_tokens >= len(prompt)
+        prompt_chunk = prompt[start_token : start_token + prefill_tokens]
+        item = {
+            "request_id": str(int(values[0])),
+            "row": int(values[1]),
+            "prompt": prompt,
+            "max_tokens": int(values[2]),
+            "prefix_hit_tokens": prefix_hit_tokens,
+            "prefix": prompt[:prefix_hit_tokens],
+            "suffix": prompt_chunk,
+            "prefill_tokens": prefill_tokens,
+        }
+        if start_token != prefix_hit_tokens or not prompt_complete:
+            item.update(
+                {
+                    "start_token": start_token,
+                    "prompt_chunk": prompt_chunk,
+                    "prompt_complete": prompt_complete,
+                    "emits_token": prompt_complete,
+                }
+            )
+        prefill_items.append(item)
+
+    groups: dict[tuple[tuple[int, ...], int], list[dict[str, object]]] = {}
+    for item in prefill_items:
+        prompt_complete = bool(item.get("prompt_complete", True))
+        emits_token = bool(item.get("emits_token", prompt_complete))
+        if not prompt_complete or not emits_token:
+            continue
+        if int(item.get("start_token", item["prefix_hit_tokens"])) != int(item["prefix_hit_tokens"]):
+            continue
+        prefix = tuple(int(token_id) for token_id in item["prefix"])  # type: ignore[arg-type]
+        prefix_hit_tokens = int(item["prefix_hit_tokens"])
+        groups.setdefault((prefix, prefix_hit_tokens), []).append(item)
+    prefill_groups: list[dict[str, object]] = []
+    for (prefix, prefix_hit_tokens), items in groups.items():
+        prefill_groups.append(
+            {
+                "request_ids": [str(item["request_id"]) for item in items],
+                "rows": [int(item["row"]) for item in items],
+                "prefix_hit_tokens": prefix_hit_tokens,
+                "prefix": list(prefix),
+                "suffix_tokens": [max(1, int(item["prefill_tokens"])) for item in items],
+            }
+        )
+
+    result: dict[str, object] = {
+        "op": "persistent_prompt_list_step",
+        "step": int(meta_cpu[1].item()),
+        "decode_request_ids": decode_request_ids,
+        "decode_rows": decode_rows,
+        "prefill": prefill_items,
+        "prefill_groups": prefill_groups,
+        "finished_after_prefill": [str(int(value)) for value in finished_cpu.tolist()],
+        "temperature": float(temperature.detach().cpu().to(torch.float64).item()),
+    }
+    if bool(int(meta_cpu[8].item())):
+        result["static_graph_buckets"] = True
+    return result
+
+
+def _token_budget_scheduler_for_group(
+    group: Sequence[_QueuedGeneration],
+    *,
+    max_active_rows: int,
+    max_scheduled_tokens: int,
+    prefill_chunk_size: int | None = None,
+    prefix_tokens: int = 0,
+    arrival_steps: Sequence[int] | None = None,
+) -> _TokenBudgetScheduler:
+    if arrival_steps is not None and len(arrival_steps) != len(group):
+        raise ValueError("arrival_steps must match group size")
+    scheduler = _TokenBudgetScheduler(
+        max_rows=max_active_rows,
+        max_scheduled_tokens=max_scheduled_tokens,
+        prefill_chunk_size=prefill_chunk_size,
+    )
+    prompts = [request.prompt for request in group]
+    prefix_key: tuple[int, ...] | None = None
+    if prefix_tokens > 0 and prompts:
+        candidate = tuple(int(token_id) for token_id in prompts[0][:prefix_tokens])
+        if len(candidate) == prefix_tokens and all(tuple(prompt[:prefix_tokens]) == candidate for prompt in prompts):
+            prefix_key = candidate
+    for index, request in enumerate(group):
+        if request.max_tokens <= 0:
+            continue
+        prefix_hit_tokens = min(prefix_tokens, len(request.prompt)) if prefix_key is not None else 0
+        arrival_step = 0 if arrival_steps is None else int(arrival_steps[index])
+        scheduler.submit(
+            _TokenBudgetRequest(
+                str(index),
+                prompt_tokens=len(request.prompt),
+                max_new_tokens=request.max_tokens,
+                arrival_step=arrival_step,
+                prefix_hit_tokens=prefix_hit_tokens,
+                prefix_key=prefix_key,
+            )
+        )
+    return scheduler
+
+
+def _token_budget_step_payload(
+    plan: _TokenBudgetPlan,
+    request_by_id: Mapping[str, _QueuedGeneration],
+) -> dict[str, object]:
+    command = _token_budget_model_step_command(plan)
+    chunks: list[dict[str, object]] = []
+    for chunk in command.chunks:
+        request = request_by_id.get(chunk.request_id)
+        if request is None:
+            raise ValueError(f"missing token-budget request {chunk.request_id}")
+        item: dict[str, object] = {
+            "request_id": chunk.request_id,
+            "row": int(chunk.row),
+            "kind": chunk.kind,
+            "start_token": int(chunk.start_token),
+            "token_count": int(chunk.token_count),
+            "prompt_complete": bool(chunk.prompt_complete),
+            "emits_token": bool(chunk.emits_token),
+        }
+        if chunk.kind == "prefill":
+            start = int(chunk.start_token)
+            end = start + int(chunk.token_count)
+            if start < 0 or end > len(request.prompt):
+                raise ValueError("token-budget prefill chunk is outside the prompt")
+            item.update(
+                {
+                    "prompt_chunk": list(request.prompt[start:end]),
+                    "prompt_tokens": len(request.prompt),
+                    "max_tokens": int(request.max_tokens),
+                }
+            )
+            if chunk.prefix_key is not None:
+                prefix = chunk.prefix_key
+                if not isinstance(prefix, tuple) or not all(isinstance(token_id, int) for token_id in prefix):
+                    raise ValueError("token-budget prefix_key must be a tuple of token ids")
+                item["prefix"] = [int(token_id) for token_id in prefix]
+        chunks.append(item)
+    return {
+        "op": "token_budget_step",
+        "step": int(command.step),
+        "chunks": chunks,
+        "decode_rows": [int(row) for row in command.decode_rows],
+        "prefill_rows": [int(row) for row in command.prefill_rows],
+        "emit_request_ids": list(command.emit_request_ids),
+        "emit_rows": [int(row) for row in command.emit_rows],
+        "finished_request_ids": list(command.finished_request_ids),
+        "scheduled_tokens": int(command.scheduled_tokens),
+    }
+
+
+def _token_budget_plan_is_decode_only(plan: _TokenBudgetPlan) -> bool:
+    return bool(plan.chunks) and all(chunk.kind == "decode" for chunk in plan.chunks)
+
+
+def _token_budget_decode_run_payload(
+    plans: Sequence[_TokenBudgetPlan],
+    request_by_id: Mapping[str, _QueuedGeneration],
+) -> dict[str, object]:
+    if not plans:
+        raise ValueError("token-budget decode run requires at least one plan")
+    steps: list[dict[str, object]] = []
+    for plan in plans:
+        if not _token_budget_plan_is_decode_only(plan):
+            raise ValueError("token-budget decode run only accepts decode-only plans")
+        steps.append(_token_budget_step_payload(plan, request_by_id))
+    return {
+        "op": "token_budget_decode_run",
+        "steps": steps,
+        "step_count": len(steps),
+    }
+
+
+def _token_budget_prompt_list_step_payload(
+    plan: _TokenBudgetPlan,
+    request_by_id: Mapping[str, _QueuedGeneration],
+) -> dict[str, object] | None:
+    command = _token_budget_model_step_command(plan)
+    decode_request_ids: list[str] = []
+    decode_rows: list[int] = []
+    prefill_items: list[dict[str, object]] = []
+    for chunk in command.chunks:
+        request = request_by_id.get(chunk.request_id)
+        if request is None:
+            raise ValueError(f"missing token-budget request {chunk.request_id}")
+        if chunk.kind == "decode":
+            decode_request_ids.append(chunk.request_id)
+            decode_rows.append(int(chunk.row))
+            continue
+        if chunk.kind != "prefill":
+            raise ValueError(f"unsupported token-budget chunk kind: {chunk.kind}")
+        start_token = int(chunk.start_token)
+        end = start_token + int(chunk.token_count)
+        if start_token < 0 or end > len(request.prompt):
+            return None
+        prefix: tuple[int, ...] = tuple(int(token_id) for token_id in request.prompt[:start_token])
+        prefix_key = chunk.prefix_key
+        if isinstance(prefix_key, tuple) and all(isinstance(token_id, int) for token_id in prefix_key):
+            prefix = prefix_key
+        elif prefix_key is not None:
+            return None
+        prefix_tokens = len(prefix)
+        if tuple(request.prompt[:prefix_tokens]) != prefix:
+            return None
+        prompt_chunk = list(request.prompt[start_token:end])
+        if not prompt_chunk:
+            return None
+        item = {
+            "request_id": chunk.request_id,
+            "row": int(chunk.row),
+            "prompt": list(request.prompt),
+            "max_tokens": int(request.max_tokens),
+            "prefix_hit_tokens": prefix_tokens,
+            "prefix": list(prefix),
+            "suffix": prompt_chunk,
+            "prefill_tokens": int(chunk.token_count),
+        }
+        if (
+            start_token != prefix_tokens
+            or not bool(chunk.prompt_complete)
+            or not bool(chunk.emits_token)
+            or end != len(request.prompt)
+        ):
+            item.update(
+                {
+                    "start_token": start_token,
+                    "prompt_chunk": prompt_chunk,
+                    "prompt_complete": bool(chunk.prompt_complete),
+                    "emits_token": bool(chunk.emits_token),
+                }
+            )
+        prefill_items.append(item)
+
+    grouped: dict[tuple[tuple[int, ...], int], list[dict[str, object]]] = {}
+    for item in prefill_items:
+        prompt_complete = bool(item.get("prompt_complete", True))
+        emits_token = bool(item.get("emits_token", prompt_complete))
+        if not prompt_complete or not emits_token:
+            continue
+        if int(item.get("start_token", item["prefix_hit_tokens"])) != int(item["prefix_hit_tokens"]):
+            continue
+        prefix_values = item.get("prefix", [])
+        if not isinstance(prefix_values, list):
+            raise ValueError("token-budget prompt-list prefill prefix must be a list")
+        prefix = tuple(int(token_id) for token_id in prefix_values)
+        prefix_tokens = int(item["prefix_hit_tokens"])
+        grouped.setdefault((prefix, prefix_tokens), []).append(item)
+    prefill_groups: list[dict[str, object]] = []
+    for (prefix, prefix_tokens), items in grouped.items():
+        prefill_groups.append(
+            {
+                "request_ids": [str(item["request_id"]) for item in items],
+                "rows": [int(item["row"]) for item in items],
+                "prefix_hit_tokens": prefix_tokens,
+                "prefix": list(prefix),
+                "suffix_tokens": [max(1, int(item["prefill_tokens"])) for item in items],
+            }
+        )
+    return {
+        "op": "persistent_prompt_list_step",
+        "step": int(command.step),
+        "decode_request_ids": decode_request_ids,
+        "decode_rows": decode_rows,
+        "prefill": prefill_items,
+        "prefill_groups": prefill_groups,
+        "finished_after_prefill": list(command.finished_request_ids),
+    }
+
+
+def _token_budget_step_tensor_payload(
+    payload: Mapping[str, object],
+    device: torch.device,
+) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+    chunks_obj = payload.get("chunks", [])
+    if not isinstance(chunks_obj, list):
+        raise ValueError("token-budget tensor payload requires chunk list")
+    chunk_rows: list[list[int]] = []
+    prefill_chunks: list[list[int]] = []
+    emit_count = 0
+    for chunk_obj in chunks_obj:
+        if not isinstance(chunk_obj, Mapping):
+            raise ValueError("token-budget tensor payload chunk must be a mapping")
+        request_ordinal = _token_budget_request_ordinal(chunk_obj.get("request_id"))
+        kind_text = str(chunk_obj.get("kind"))
+        if kind_text == "prefill":
+            kind_id = _TP_TOKEN_BUDGET_KIND_PREFILL
+        elif kind_text == "decode":
+            kind_id = _TP_TOKEN_BUDGET_KIND_DECODE
+        else:
+            raise ValueError(f"unsupported token-budget tensor payload kind: {kind_text}")
+        prefill_index = -1
+        prompt_tokens = -1
+        max_tokens = -1
+        if kind_id == _TP_TOKEN_BUDGET_KIND_PREFILL:
+            prompt_chunk_obj = chunk_obj.get("prompt_chunk", [])
+            if not isinstance(prompt_chunk_obj, list):
+                raise ValueError("token-budget prefill tensor payload requires prompt_chunk")
+            prefill_index = len(prefill_chunks)
+            prefill_chunks.append([int(token_id) for token_id in prompt_chunk_obj])
+            prompt_tokens = int(chunk_obj.get("prompt_tokens", -1))
+            max_tokens = int(chunk_obj.get("max_tokens", -1))
+        emits_token = int(bool(chunk_obj.get("emits_token", False)))
+        emit_count += emits_token
+        chunk_rows.append(
+            [
+                request_ordinal,
+                int(chunk_obj["row"]),
+                kind_id,
+                int(chunk_obj["start_token"]),
+                int(chunk_obj["token_count"]),
+                int(bool(chunk_obj.get("prompt_complete", False))),
+                emits_token,
+                prefill_index,
+                prompt_tokens,
+                max_tokens,
+            ]
+        )
+    chunk_tensor = torch.tensor(chunk_rows, dtype=torch.long, device=device)
+    if not chunk_rows:
+        chunk_tensor = torch.empty((0, _TP_TOKEN_BUDGET_CHUNK_FIELDS), dtype=torch.long, device=device)
+    prefill_token_rows, prefill_lengths = _prompt_list_tensor_payload(prefill_chunks, device)
+    finished_obj = payload.get("finished_request_ids", [])
+    if not isinstance(finished_obj, list):
+        raise ValueError("token-budget tensor payload requires finished_request_ids list")
+    finished_ids = torch.tensor(
+        [_token_budget_request_ordinal(request_id) for request_id in finished_obj],
+        dtype=torch.long,
+        device=device,
+    )
+    meta = torch.zeros(_TP_COMMAND_META_FIELDS, dtype=torch.long, device=device)
+    meta[0] = _TP_COMMAND_TOKEN_BUDGET_STEP
+    meta[1] = int(payload.get("step", 0))
+    meta[2] = int(chunk_tensor.size(0))
+    meta[3] = _TP_TOKEN_BUDGET_CHUNK_FIELDS
+    meta[4] = int(payload.get("scheduled_tokens", int(chunk_tensor[:, 4].sum().item()) if chunk_rows else 0))
+    meta[5] = int(prefill_lengths.numel())
+    meta[6] = int(prefill_token_rows.size(1)) if prefill_token_rows.ndim == 2 else 0
+    meta[7] = emit_count
+    meta[8] = int(finished_ids.numel())
+    return meta, chunk_tensor, prefill_lengths, prefill_token_rows, finished_ids
+
+
+def _token_budget_step_payload_from_tensor_payload(
+    meta: Tensor,
+    chunk_tensor: Tensor,
+    prefill_lengths: Tensor,
+    prefill_token_rows: Tensor,
+    finished_ids: Tensor,
+) -> dict[str, object]:
+    meta_cpu = meta.detach().cpu().to(torch.long)
+    if int(meta_cpu[0].item()) != _TP_COMMAND_TOKEN_BUDGET_STEP:
+        raise ValueError("token-budget tensor payload has wrong command kind")
+    expected_fields = int(meta_cpu[3].item())
+    if expected_fields != _TP_TOKEN_BUDGET_CHUNK_FIELDS:
+        raise ValueError("token-budget tensor payload has wrong chunk width")
+    chunk_cpu = chunk_tensor.detach().cpu().to(torch.long)
+    if chunk_cpu.ndim != 2 or chunk_cpu.size(1) != _TP_TOKEN_BUDGET_CHUNK_FIELDS:
+        raise ValueError("token-budget tensor payload chunk tensor has invalid shape")
+    if int(meta_cpu[2].item()) != int(chunk_cpu.size(0)):
+        raise ValueError("token-budget tensor payload chunk count mismatch")
+    prefill_lengths_list = [int(value) for value in prefill_lengths.detach().cpu().to(torch.long).tolist()]
+    prefill_rows_cpu = prefill_token_rows.detach().cpu().to(torch.long)
+    finished_list = [str(int(value)) for value in finished_ids.detach().cpu().to(torch.long).tolist()]
+
+    chunks: list[dict[str, object]] = []
+    decode_rows: list[int] = []
+    prefill_rows: list[int] = []
+    emit_request_ids: list[str] = []
+    emit_rows: list[int] = []
+    for row_values in chunk_cpu.tolist():
+        request_id = str(int(row_values[0]))
+        row = int(row_values[1])
+        kind_id = int(row_values[2])
+        if kind_id == _TP_TOKEN_BUDGET_KIND_PREFILL:
+            kind = "prefill"
+            prefill_rows.append(row)
+        elif kind_id == _TP_TOKEN_BUDGET_KIND_DECODE:
+            kind = "decode"
+            decode_rows.append(row)
+        else:
+            raise ValueError(f"unsupported token-budget tensor payload kind id: {kind_id}")
+        item: dict[str, object] = {
+            "request_id": request_id,
+            "row": row,
+            "kind": kind,
+            "start_token": int(row_values[3]),
+            "token_count": int(row_values[4]),
+            "prompt_complete": bool(row_values[5]),
+            "emits_token": bool(row_values[6]),
+        }
+        if item["emits_token"]:
+            emit_request_ids.append(request_id)
+            emit_rows.append(row)
+        if kind == "prefill":
+            prefill_index = int(row_values[7])
+            if prefill_index < 0 or prefill_index >= len(prefill_lengths_list):
+                raise ValueError("token-budget tensor payload has invalid prefill index")
+            length = prefill_lengths_list[prefill_index]
+            item["prompt_chunk"] = prefill_rows_cpu[prefill_index, :length].tolist()
+            prompt_tokens = int(row_values[8])
+            max_tokens = int(row_values[9])
+            if prompt_tokens >= 0:
+                item["prompt_tokens"] = prompt_tokens
+            if max_tokens >= 0:
+                item["max_tokens"] = max_tokens
+        chunks.append(item)
+    return {
+        "op": "token_budget_step",
+        "step": int(meta_cpu[1].item()),
+        "chunks": chunks,
+        "decode_rows": decode_rows,
+        "prefill_rows": prefill_rows,
+        "emit_request_ids": emit_request_ids,
+        "emit_rows": emit_rows,
+        "finished_request_ids": finished_list,
+        "scheduled_tokens": int(meta_cpu[4].item()),
+    }
+
+
+def _token_budget_decode_run_tensor_payload(
+    payload: Mapping[str, object],
+    device: torch.device,
+) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    steps_obj = payload.get("steps", [])
+    if not isinstance(steps_obj, list) or not steps_obj:
+        raise ValueError("token-budget decode-run tensor payload requires non-empty steps")
+    step_rows: list[list[int]] = []
+    chunk_rows: list[list[int]] = []
+    finished_values: list[int] = []
+    for step_obj in steps_obj:
+        if not isinstance(step_obj, Mapping):
+            raise ValueError("token-budget decode-run tensor step must be a mapping")
+        chunks_obj = step_obj.get("chunks", [])
+        if not isinstance(chunks_obj, list) or not chunks_obj:
+            raise ValueError("token-budget decode-run tensor step requires chunks")
+        chunk_start = len(chunk_rows)
+        finished_start = len(finished_values)
+        for chunk_obj in chunks_obj:
+            if not isinstance(chunk_obj, Mapping):
+                raise ValueError("token-budget decode-run tensor chunk must be a mapping")
+            if str(chunk_obj.get("kind")) != "decode":
+                raise ValueError("token-budget decode-run tensor payload only accepts decode chunks")
+            request_ordinal = _token_budget_request_ordinal(chunk_obj.get("request_id"))
+            chunk_rows.append(
+                [
+                    request_ordinal,
+                    int(chunk_obj["row"]),
+                    _TP_TOKEN_BUDGET_KIND_DECODE,
+                    int(chunk_obj["start_token"]),
+                    int(chunk_obj["token_count"]),
+                    int(bool(chunk_obj.get("prompt_complete", False))),
+                    int(bool(chunk_obj.get("emits_token", False))),
+                    -1,
+                    -1,
+                    -1,
+                ]
+            )
+        finished_obj = step_obj.get("finished_request_ids", [])
+        if not isinstance(finished_obj, list):
+            raise ValueError("token-budget decode-run tensor step requires finished_request_ids list")
+        finished_values.extend(_token_budget_request_ordinal(request_id) for request_id in finished_obj)
+        step_rows.append(
+            [
+                int(step_obj.get("step", 0)),
+                chunk_start,
+                len(chunk_rows) - chunk_start,
+                finished_start,
+                len(finished_values) - finished_start,
+            ]
+        )
+    meta = torch.zeros(_TP_COMMAND_META_FIELDS, dtype=torch.long, device=device)
+    meta[0] = _TP_COMMAND_TOKEN_BUDGET_DECODE_RUN
+    meta[1] = len(step_rows)
+    meta[2] = len(chunk_rows)
+    meta[3] = _TP_TOKEN_BUDGET_CHUNK_FIELDS
+    meta[4] = len(finished_values)
+    meta[5] = _TP_TOKEN_BUDGET_DECODE_RUN_STEP_FIELDS
+    step_tensor = torch.tensor(step_rows, dtype=torch.long, device=device)
+    chunk_tensor = torch.tensor(chunk_rows, dtype=torch.long, device=device)
+    if not chunk_rows:
+        chunk_tensor = torch.empty((0, _TP_TOKEN_BUDGET_CHUNK_FIELDS), dtype=torch.long, device=device)
+    finished_ids = torch.tensor(finished_values, dtype=torch.long, device=device)
+    return meta, step_tensor, chunk_tensor, finished_ids
+
+
+def _token_budget_decode_run_payload_from_tensor_payload(
+    meta: Tensor,
+    step_tensor: Tensor,
+    chunk_tensor: Tensor,
+    finished_ids: Tensor,
+) -> dict[str, object]:
+    meta_cpu = meta.detach().cpu().to(torch.long)
+    if int(meta_cpu[0].item()) != _TP_COMMAND_TOKEN_BUDGET_DECODE_RUN:
+        raise ValueError("token-budget decode-run tensor payload has wrong command kind")
+    expected_chunk_fields = int(meta_cpu[3].item())
+    if expected_chunk_fields != _TP_TOKEN_BUDGET_CHUNK_FIELDS:
+        raise ValueError("token-budget decode-run tensor payload has wrong chunk width")
+    expected_step_fields = int(meta_cpu[5].item())
+    if expected_step_fields != _TP_TOKEN_BUDGET_DECODE_RUN_STEP_FIELDS:
+        raise ValueError("token-budget decode-run tensor payload has wrong step width")
+    step_cpu = step_tensor.detach().cpu().to(torch.long)
+    if step_cpu.ndim != 2 or step_cpu.size(1) != _TP_TOKEN_BUDGET_DECODE_RUN_STEP_FIELDS:
+        raise ValueError("token-budget decode-run tensor step tensor has invalid shape")
+    if int(meta_cpu[1].item()) != int(step_cpu.size(0)):
+        raise ValueError("token-budget decode-run tensor step count mismatch")
+    chunk_cpu = chunk_tensor.detach().cpu().to(torch.long)
+    if chunk_cpu.ndim != 2 or chunk_cpu.size(1) != _TP_TOKEN_BUDGET_CHUNK_FIELDS:
+        raise ValueError("token-budget decode-run tensor chunk tensor has invalid shape")
+    if int(meta_cpu[2].item()) != int(chunk_cpu.size(0)):
+        raise ValueError("token-budget decode-run tensor chunk count mismatch")
+    finished_cpu = finished_ids.detach().cpu().to(torch.long)
+    if int(meta_cpu[4].item()) != int(finished_cpu.numel()):
+        raise ValueError("token-budget decode-run tensor finished count mismatch")
+
+    steps: list[dict[str, object]] = []
+    for row_values in step_cpu.tolist():
+        step = int(row_values[0])
+        chunk_start = int(row_values[1])
+        chunk_count = int(row_values[2])
+        finished_start = int(row_values[3])
+        finished_count = int(row_values[4])
+        if chunk_start < 0 or chunk_count < 1 or chunk_start + chunk_count > chunk_cpu.size(0):
+            raise ValueError("token-budget decode-run tensor step has invalid chunk slice")
+        if finished_start < 0 or finished_count < 0 or finished_start + finished_count > finished_cpu.numel():
+            raise ValueError("token-budget decode-run tensor step has invalid finished slice")
+        chunks: list[dict[str, object]] = []
+        decode_rows: list[int] = []
+        emit_request_ids: list[str] = []
+        emit_rows: list[int] = []
+        scheduled_tokens = 0
+        for chunk_values in chunk_cpu[chunk_start : chunk_start + chunk_count].tolist():
+            if int(chunk_values[2]) != _TP_TOKEN_BUDGET_KIND_DECODE:
+                raise ValueError("token-budget decode-run tensor payload only supports decode chunks")
+            request_id = str(int(chunk_values[0]))
+            row = int(chunk_values[1])
+            emits_token = bool(chunk_values[6])
+            chunks.append(
+                {
+                    "request_id": request_id,
+                    "row": row,
+                    "kind": "decode",
+                    "start_token": int(chunk_values[3]),
+                    "token_count": int(chunk_values[4]),
+                    "prompt_complete": bool(chunk_values[5]),
+                    "emits_token": emits_token,
+                }
+            )
+            decode_rows.append(row)
+            scheduled_tokens += int(chunk_values[4])
+            if emits_token:
+                emit_request_ids.append(request_id)
+                emit_rows.append(row)
+        finished_slice = finished_cpu[finished_start : finished_start + finished_count]
+        steps.append(
+            {
+                "op": "token_budget_step",
+                "step": step,
+                "chunks": chunks,
+                "decode_rows": decode_rows,
+                "prefill_rows": [],
+                "emit_request_ids": emit_request_ids,
+                "emit_rows": emit_rows,
+                "finished_request_ids": [str(int(value)) for value in finished_slice.tolist()],
+                "scheduled_tokens": scheduled_tokens,
+            }
+        )
+    return {
+        "op": "token_budget_decode_run",
+        "steps": steps,
+        "step_count": len(steps),
+    }
+
+
+def _token_budget_request_ordinal(request_id: object) -> int:
+    try:
+        value = int(str(request_id))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("token-budget tensor payload requires numeric request ids") from exc
+    if value < 0:
+        raise ValueError("token-budget tensor payload request ids must be non-negative")
+    return value
 
 
 _TENSOR_PARALLEL_CONTROL_GROUP: object | None = None
@@ -437,6 +1505,10 @@ class OpenAICompletionEngine:
         self._cache_pool: dict[tuple[int, int, str, int, str], object] = {}
         self._microbatch_cache_pool: dict[tuple[int, int, int, str, int, str], object] = {}
         self._single_prefill_capture_seen: dict[tuple[int, int, int, int, bool, str], int] = {}
+        self._batched_prefill_capture_seen: dict[tuple[int, int, int, int, bool, bool, str], int] = {}
+        self._completed_queue_batches = 0
+        self._idle_since_s = time.perf_counter()
+        self._cleanup_after_idle = False
         self._prefix_cache_entry: TensorPrefixCacheEntry | None = None
         self._prefix_cache_entries: dict[tuple[int, ...], TensorPrefixCacheEntry] = {}
         self._prompt_logits_cache: dict[tuple[int, ...], Tensor] = {}
@@ -445,7 +1517,15 @@ class OpenAICompletionEngine:
         self._phase_timing_enabled = env_flag("TORCHINFERNO_OPENAI_PHASE_TIMINGS")
         self._phase_records: list[dict[str, float]] = []
         self._phase_records_lock = threading.Lock()
+        self._queue_profile_path = os.environ.get("TORCHINFERNO_OPENAI_QUEUE_PROFILE_JSONL", "")
+        self._queue_profile_lock = threading.Lock()
+        self._queue_profile_next_sequence = 0
+        self._persistent_prompt_list_step_state: _PersistentPromptListStepState | None = None
+        self._persistent_prompt_list_step_last_result: _PersistentPromptListStepResult | None = None
+        self._token_budget_step_state: _TokenBudgetStepState | None = None
+        self._token_budget_step_last_result: _TokenBudgetStepResult | None = None
         self._warmup_tokenizer()
+        self._warmup_tensor_parallel_control_group()
         self._warmup_tensor_parallel_model()
         if not _is_tensor_parallel_worker_model(model):
             self._worker = threading.Thread(target=self._batch_worker, name="torchinferno-openai-batcher", daemon=True)
@@ -551,7 +1631,20 @@ class OpenAICompletionEngine:
         if self._closed:
             raise RuntimeError("OpenAI completion engine is closed")
         responses: "queue.SimpleQueue[object]" = queue.SimpleQueue()
-        self._generation_queue.put(_QueuedGeneration(prompt, max_tokens, temperature, True, responses))
+        profile_queue = bool(self._queue_profile_path_value())
+        queued_at_s = time.perf_counter() if profile_queue else 0.0
+        queue_sequence = self._next_queue_profile_sequence() if profile_queue else -1
+        self._generation_queue.put(
+            _QueuedGeneration(
+                prompt,
+                max_tokens,
+                temperature,
+                True,
+                responses,
+                queued_at_s=queued_at_s,
+                queue_sequence=queue_sequence,
+            )
+        )
         while True:
             item = responses.get()
             if isinstance(item, _GenerationDone):
@@ -564,7 +1657,20 @@ class OpenAICompletionEngine:
         if self._closed:
             raise RuntimeError("OpenAI completion engine is closed")
         responses: "queue.SimpleQueue[object]" = queue.SimpleQueue()
-        self._generation_queue.put(_QueuedGeneration(prompt, max_tokens, temperature, False, responses))
+        profile_queue = bool(self._queue_profile_path_value())
+        queued_at_s = time.perf_counter() if profile_queue else 0.0
+        queue_sequence = self._next_queue_profile_sequence() if profile_queue else -1
+        self._generation_queue.put(
+            _QueuedGeneration(
+                prompt,
+                max_tokens,
+                temperature,
+                False,
+                responses,
+                queued_at_s=queued_at_s,
+                queue_sequence=queue_sequence,
+            )
+        )
         item = responses.get()
         if isinstance(item, BaseException):
             raise item
@@ -577,6 +1683,12 @@ class OpenAICompletionEngine:
             first = self._generation_queue.get()
             if first is None:
                 return
+            if self._should_use_tensor_parallel_online_batcher(first):
+                with self._model_lock:
+                    self._maybe_cleanup_runtime_after_idle()
+                    self._run_tensor_parallel_online_batcher(first)
+                    self._completed_queue_batches += 1
+                continue
             batch = [first]
             batch_limit = self._queued_batch_limit(first)
             initial_wait_s = self._queued_initial_batch_wait_s(first)
@@ -592,17 +1704,372 @@ class OpenAICompletionEngine:
             if len(batch) > 1 or self._has_multiple_live_requests():
                 self._collect_batch_until_deadline(batch, limit=batch_limit)
             with self._model_lock:
+                self._maybe_cleanup_runtime_after_idle()
                 self._run_queued_batch(batch)
+                self._completed_queue_batches += 1
+
+    def _should_use_tensor_parallel_online_batcher(self, first: _QueuedGeneration) -> bool:
+        if not env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_CONTINUOUS_BATCHER", True):
+            return False
+        if not first.stream:
+            return False
+        if not _is_tensor_parallel_primary_model(self.model):
+            return False
+        if len(getattr(self, "stop_token_ids", frozenset())) > 1:
+            return False
+        return hasattr(self.model, "allocate_cache")
+
+    def _run_tensor_parallel_online_batcher(self, first: _QueuedGeneration) -> None:
+        requested_max_batch = int(getattr(self, "max_batch_size", 1))
+        enable_ragged_decode = env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_RAGGED_DECODE", True)
+        store_reusable_prefixes = env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_PREFIX_CACHE_STORE", True)
+        store_full_prompt_prefixes = env_flag(
+            "TORCHINFERNO_OPENAI_TP_ONLINE_PREFIX_CACHE_STORE_FULL_PROMPTS",
+            True,
+        )
+        default_max_active = max(1, min(requested_max_batch, self._queued_batch_limit(first)))
+        if not enable_ragged_decode:
+            default_max_active = min(
+                default_max_active,
+                env_int("TORCHINFERNO_CUDAGRAPH_DECODE_STEP_MAX_BATCH", 64, minimum=1),
+            )
+        max_active = env_int(
+            "TORCHINFERNO_OPENAI_TP_ONLINE_MAX_ACTIVE",
+            default_max_active,
+            minimum=1,
+        )
+        prefix_rows = env_int(
+            "TORCHINFERNO_OPENAI_TP_ONLINE_PREFIX_ROWS",
+            min(max_active, requested_max_batch),
+            minimum=0,
+        )
+        prefill_budget = (
+            env_int("TORCHINFERNO_OPENAI_TP_ONLINE_PREFILL_TOKEN_BUDGET", 0, minimum=0)
+            if "TORCHINFERNO_OPENAI_TP_ONLINE_PREFILL_TOKEN_BUDGET" in os.environ
+            else 0
+        )
+        request_by_id: dict[str, _QueuedGeneration] = {}
+        next_request_id = 0
+        deferred: list[_QueuedGeneration] = []
+        started = False
+        step = 0
+        online_step_commands = 0
+        emitted_events = 0
+        finished_events = 0
+        initial_wait_s = (
+            env_float("TORCHINFERNO_OPENAI_TP_ONLINE_INITIAL_BATCH_WAIT_MS", 0.5, minimum=0.0) / 1000.0
+        )
+        idle_wait_s = env_float("TORCHINFERNO_OPENAI_TP_ONLINE_IDLE_BATCH_WAIT_MS", 0.5, minimum=0.0) / 1000.0
+        profile_start_s = time.perf_counter()
+        phase_ms: dict[str, float] = {}
+
+        def add_phase(name: str, started_at_s: float) -> None:
+            phase_ms[name] = phase_ms.get(name, 0.0) + (time.perf_counter() - started_at_s) * 1000.0
+
+        def same_online_class(request: _QueuedGeneration) -> bool:
+            return request.stream and request.temperature == first.temperature
+
+        initial_batch = [first]
+        initial_batch_start_s = time.perf_counter()
+
+        def drain_initial_ready() -> int:
+            admitted = 0
+            while len(initial_batch) < max_active:
+                try:
+                    item = self._generation_queue.get_nowait()
+                except queue.Empty:
+                    break
+                if item is None:
+                    self._generation_queue.put(None)
+                    break
+                if same_online_class(item):
+                    initial_batch.append(item)
+                    admitted += 1
+                else:
+                    deferred.append(item)
+            return admitted
+
+        drain_initial_ready()
+        if initial_wait_s > 0.0 and len(initial_batch) < max_active:
+            deadline = time.perf_counter() + initial_wait_s
+            while len(initial_batch) < max_active:
+                timeout = deadline - time.perf_counter()
+                if timeout <= 0.0:
+                    break
+                try:
+                    item = self._generation_queue.get(timeout=timeout)
+                except queue.Empty:
+                    break
+                if item is None:
+                    self._generation_queue.put(None)
+                    break
+                if same_online_class(item):
+                    initial_batch.append(item)
+                else:
+                    deferred.append(item)
+        add_phase("initial_batch_ms", initial_batch_start_s)
+
+        default_max_seq_len = self._tp_online_default_max_seq_len(initial_batch)
+        max_seq_len = env_int("TORCHINFERNO_OPENAI_TP_ONLINE_MAX_SEQ_LEN", default_max_seq_len, minimum=1)
+        max_seq_len = max(max_seq_len, len(first.prompt) + first.max_tokens)
+        sized_initial_batch = [
+            request
+            for request in initial_batch
+            if len(request.prompt) + request.max_tokens <= max_seq_len
+        ]
+        sized_initial_ids = {id(request) for request in sized_initial_batch}
+        for request in initial_batch:
+            if id(request) not in sized_initial_ids:
+                deferred.append(request)
+        initial_batch = sized_initial_batch or [first]
+        run_max_tokens = max(request.max_tokens for request in initial_batch)
+        stop_token_ids = getattr(self, "stop_token_ids", frozenset())
+        eos_token_id = next(iter(stop_token_ids)) if len(stop_token_ids) == 1 else None
+        engine_create_start_s = time.perf_counter()
+        runtime_engine = _RuntimeContinuousBatchEngine(
+            self.model,
+            device=self.device,
+            cache_backend=self.cache_backend,
+            page_size=self.page_size,
+            temperature=first.temperature,
+            max_active_requests=max_active,
+            prefix_cache_capacity=prefix_rows,
+            prefill_token_budget=prefill_budget if prefill_budget > 0 else None,
+            enable_ragged_decode=enable_ragged_decode,
+            store_reusable_prefixes=store_reusable_prefixes,
+            store_full_prompt_prefixes=store_full_prompt_prefixes,
+            profile_timings=bool(self._queue_profile_path_value()),
+        )
+        add_phase("engine_create_ms", engine_create_start_s)
+
+        def compatible(request: _QueuedGeneration) -> bool:
+            return same_online_class(request) and len(request.prompt) + request.max_tokens <= max_seq_len
+
+        def submit_batch(requests: Sequence[_QueuedGeneration], *, arrival_step: int) -> None:
+            nonlocal next_request_id
+            if not requests:
+                return
+            submit_start_s = time.perf_counter()
+            request_id_start = next_request_id
+            prompts = [request.prompt for request in requests]
+            row_max_tokens = [request.max_tokens for request in requests]
+            max_tokens = max(row_max_tokens, default=0)
+            _broadcast_tensor_parallel_online_submit_prompt_lists(
+                self.model,
+                prompts,
+                max_tokens=max_tokens,
+                row_max_tokens=row_max_tokens,
+                arrival_step=arrival_step,
+                eos_token_id=eos_token_id,
+                request_id_start=request_id_start,
+            )
+            for request in requests:
+                request_id = str(next_request_id)
+                next_request_id += 1
+                request_by_id[request_id] = request
+                runtime_engine.submit_online(
+                    _RuntimeServingRequest(
+                        request_id,
+                        tuple(request.prompt),
+                        request.max_tokens,
+                        arrival_step=arrival_step,
+                        eos_token_id=eos_token_id,
+                    )
+                )
+            _sync_tensor_parallel_command(self.model, self.device)
+            add_phase("submit_sync_ms", submit_start_s)
+
+        def drain_ready(arrival_step: int) -> int:
+            drain_start_s = time.perf_counter()
+            ready: list[_QueuedGeneration] = []
+            while len(ready) < max_active:
+                try:
+                    item = self._generation_queue.get_nowait()
+                except queue.Empty:
+                    break
+                if item is None:
+                    self._generation_queue.put(None)
+                    break
+                if compatible(item):
+                    ready.append(item)
+                else:
+                    deferred.append(item)
+            add_phase("drain_ready_poll_ms", drain_start_s)
+            submit_batch(ready, arrival_step=arrival_step)
+            return len(ready)
+
+        def wait_and_drain(arrival_step: int, wait_s: float) -> int:
+            wait_start_s = time.perf_counter()
+            admitted = drain_ready(arrival_step)
+            if wait_s <= 0.0 or admitted >= max_active:
+                add_phase("idle_wait_drain_ms", wait_start_s)
+                return admitted
+            deadline = time.perf_counter() + wait_s
+            while admitted < max_active:
+                remaining = deadline - time.perf_counter()
+                if remaining <= 0.0:
+                    break
+                time.sleep(min(remaining, 0.0001))
+                admitted += drain_ready(arrival_step)
+            add_phase("idle_wait_drain_ms", wait_start_s)
+            return admitted
+
+        try:
+            with _tensor_parallel_symm_mem_allreduce_scope(
+                self.model,
+                self.device,
+                max_tokens=run_max_tokens,
+                temperature=first.temperature,
+            ):
+                start_sync_start_s = time.perf_counter()
+                _broadcast_tensor_parallel_online_start(
+                    self.model,
+                    max_seq_len=max_seq_len,
+                    max_active_requests=max_active,
+                    prefix_cache_capacity=prefix_rows,
+                    prefill_token_budget=prefill_budget if prefill_budget > 0 else None,
+                    temperature=first.temperature,
+                    enable_ragged_decode=enable_ragged_decode,
+                    store_reusable_prefixes=store_reusable_prefixes,
+                    store_full_prompt_prefixes=store_full_prompt_prefixes,
+                    max_tokens=run_max_tokens,
+                )
+                runtime_engine.start_online(max_seq_len=max_seq_len)
+                started = True
+                _sync_tensor_parallel_command(self.model, self.device)
+                add_phase("start_sync_ms", start_sync_start_s)
+                submit_batch(initial_batch, arrival_step=0)
+                decode_quantum = env_int("TORCHINFERNO_OPENAI_TP_ONLINE_DECODE_QUANTUM", 1, minimum=1)
+                while True:
+                    drain_ready(step)
+                    if not runtime_engine.has_online_work():
+                        if wait_and_drain(step, idle_wait_s) == 0:
+                            break
+                        continue
+                    step_broadcast_start_s = time.perf_counter()
+                    _broadcast_tensor_parallel_online_step(self.model, decode_quantum)
+                    add_phase("step_broadcast_ms", step_broadcast_start_s)
+                    online_step_commands += 1
+                    for _ in range(decode_quantum):
+                        if not runtime_engine.has_online_work():
+                            break
+                        runtime_step_start_s = time.perf_counter()
+                        events = runtime_engine.step_online()
+                        add_phase("runtime_step_ms", runtime_step_start_s)
+                        event_emit_start_s = time.perf_counter()
+                        for event in events:
+                            emitted_events += 1
+                            request = request_by_id[event.request_id]
+                            if request.done:
+                                continue
+                            if event.token in stop_token_ids:
+                                _finish_stream_request(request)
+                                finished_events += 1
+                                continue
+                            request.responses.put(event.token)
+                            if event.finished:
+                                _finish_stream_request(request)
+                                finished_events += 1
+                        add_phase("event_emit_ms", event_emit_start_s)
+                        step += 1
+                    step_sync_start_s = time.perf_counter()
+                    _sync_tensor_parallel_command(self.model, self.device)
+                    add_phase("step_sync_ms", step_sync_start_s)
+        except BaseException as exc:
+            for request in request_by_id.values():
+                if not request.done:
+                    request.responses.put(exc)
+                    request.done = True
+            raise
+        finally:
+            add_phase("total_ms", profile_start_s)
+            phase_fields = {f"phase_{name}": round(value, 3) for name, value in phase_ms.items()}
+            self._record_runtime_engine_queue_profile(
+                "online_batcher",
+                runtime_engine,
+                submitted_requests=len(request_by_id),
+                deferred_requests=len(deferred),
+                initial_batch_size=len(initial_batch),
+                max_seq_len=max_seq_len,
+                run_max_tokens=run_max_tokens,
+                max_active=max_active,
+                prefix_rows=prefix_rows,
+                decode_quantum=env_int("TORCHINFERNO_OPENAI_TP_ONLINE_DECODE_QUANTUM", 1, minimum=1),
+                online_steps=step,
+                online_step_commands=online_step_commands,
+                emitted_events=emitted_events,
+                finished_events=finished_events,
+                **phase_fields,
+            )
+            if started:
+                _broadcast_tensor_parallel_online_close(self.model)
+                _sync_tensor_parallel_command(self.model, self.device)
+            for request in deferred:
+                self._generation_queue.put(request)
+
+    def _tp_online_default_max_seq_len(self, requests: Sequence[_QueuedGeneration]) -> int:
+        default_max_seq_len = max((len(request.prompt) + request.max_tokens for request in requests), default=1)
+        default_max_seq_len += env_int(
+            "TORCHINFERNO_OPENAI_TP_ONLINE_MAX_SEQ_LEN_HEADROOM_TOKENS",
+            0,
+            minimum=0,
+        )
+        max_model_len = getattr(self, "max_model_len", None)
+        if max_model_len is not None:
+            default_max_seq_len = min(default_max_seq_len, int(max_model_len))
+        return max(1, default_max_seq_len)
 
     def _enter_live_request(self) -> None:
         with self._live_request_condition:
+            if self._live_requests == 0 and self._completed_queue_batches > 0:
+                idle_s = time.perf_counter() - self._idle_since_s
+                min_idle_s = env_float("TORCHINFERNO_OPENAI_IDLE_CLEANUP_MIN_IDLE_MS", 250.0, minimum=0.0) / 1000.0
+                if idle_s >= min_idle_s:
+                    self._cleanup_after_idle = True
             self._live_requests += 1
             self._live_request_condition.notify_all()
 
     def _exit_live_request(self) -> None:
         with self._live_request_condition:
             self._live_requests -= 1
+            if self._live_requests <= 0:
+                self._live_requests = 0
+                self._idle_since_s = time.perf_counter()
             self._live_request_condition.notify_all()
+
+    def _maybe_cleanup_runtime_after_idle(self) -> None:
+        if not env_flag("TORCHINFERNO_OPENAI_IDLE_CLEANUP", False):
+            self._cleanup_after_idle = False
+            return
+        if not self._cleanup_after_idle:
+            return
+        self._cleanup_after_idle = False
+        self._record_queue_profile(
+            {
+                "event": "idle_cleanup",
+                "completed_queue_batches": self._completed_queue_batches,
+            }
+        )
+        _broadcast_tensor_parallel_cleanup(self.model)
+        self._clear_runtime_state_after_idle()
+        _sync_tensor_parallel_command(self.model, self.device, cuda_sync=False)
+
+    def _clear_runtime_state_after_idle(self) -> None:
+        if env_flag("TORCHINFERNO_OPENAI_IDLE_CLEANUP_CACHE_POOLS", True):
+            self._clear_cache_pool(self._cache_pool, model=self.model)
+            self._clear_cache_pool(self._microbatch_cache_pool, model=self.model)
+        self._single_prefill_capture_seen.clear()
+        self._batched_prefill_capture_seen.clear()
+        self._persistent_prompt_list_step_state = None
+        self._persistent_prompt_list_step_last_result = None
+        self._token_budget_step_state = None
+        self._token_budget_step_last_result = None
+        if env_flag("TORCHINFERNO_OPENAI_IDLE_CLEANUP_PREFIX_CACHE", False):
+            self._clear_prefix_cache()
+        if env_flag("TORCHINFERNO_OPENAI_IDLE_CLEANUP_GRAPH_CACHES", True):
+            _clear_model_graph_caches(self.model)
+        if self.device.type == "cuda" and env_flag("TORCHINFERNO_OPENAI_IDLE_CLEANUP_EMPTY_CACHE", False):
+            torch.cuda.empty_cache()
 
     def pop_phase_records(self) -> list[dict[str, float]]:
         with self._phase_records_lock:
@@ -624,6 +2091,120 @@ class OpenAICompletionEngine:
             return
         with self._phase_records_lock:
             self._phase_records.append(dict(phase))
+
+    def _queue_profile_path_value(self) -> str:
+        path = getattr(self, "_queue_profile_path", None)
+        if path is None:
+            path = os.environ.get("TORCHINFERNO_OPENAI_QUEUE_PROFILE_JSONL", "")
+            self._queue_profile_path = path
+        return str(path)
+
+    def _record_queue_profile(self, record: Mapping[str, object]) -> None:
+        profile_path = self._queue_profile_path_value()
+        if not profile_path:
+            return
+        try:
+            line = json.dumps(record, sort_keys=True) + "\n"
+            lock = getattr(self, "_queue_profile_lock", None)
+            if lock is None:
+                lock = threading.Lock()
+                self._queue_profile_lock = lock
+            with lock:
+                with open(profile_path, "a", encoding="utf-8") as profile_file:
+                    profile_file.write(line)
+        except Exception as exc:
+            warn_optional_failure("openai.queue_profile", exc)
+
+    def _next_queue_profile_sequence(self) -> int:
+        lock = getattr(self, "_queue_profile_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._queue_profile_lock = lock
+        with lock:
+            value = int(getattr(self, "_queue_profile_next_sequence", 0))
+            self._queue_profile_next_sequence = value + 1
+            return value
+
+    def _record_runtime_engine_queue_profile(
+        self,
+        event: str,
+        runtime_engine: object,
+        **fields: object,
+    ) -> None:
+        if not self._queue_profile_path_value():
+            return
+        stats = getattr(runtime_engine, "stats", None)
+        record: dict[str, object] = {"event": event, **fields}
+        for name in (
+            "prefill_model_calls",
+            "prefill_batches",
+            "prefill_tokens",
+            "decode_model_calls",
+            "decode_batches",
+            "decode_tokens",
+            "ragged_decode_batches",
+            "ragged_decode_tokens",
+            "decode_graph_hits",
+            "decode_graph_misses",
+            "prefix_reuse_requests",
+            "prefix_reuse_tokens",
+            "queued_requests",
+            "scheduler_steps",
+            "max_model_batch_size",
+            "persistent_cache_rows",
+            "prefill_admitted_requests",
+            "prefill_single_batches",
+            "prefill_plain_batches",
+            "prefill_prefix_reuse_batches",
+            "prefill_common_prefix_batches",
+            "prefill_padded_suffix_batches",
+            "prefill_graph_hits",
+            "prefill_graph_misses",
+            "prefill_wall_ms",
+            "decode_ragged_prepare_ms",
+            "decode_ragged_model_ms",
+            "decode_ragged_cpu_tokens_ms",
+            "decode_ragged_state_update_ms",
+        ):
+            value = getattr(stats, name, None)
+            if isinstance(value, (int, float)):
+                record[f"runtime_{name}"] = value
+        self._record_queue_profile(record)
+
+    def _reset_stream_group_profile_extra(self) -> None:
+        if self._queue_profile_path_value():
+            self._stream_group_profile_extra = {}
+
+    def _add_stream_group_profile_extra(self, **fields: object) -> None:
+        if not self._queue_profile_path_value():
+            return
+        extra = getattr(self, "_stream_group_profile_extra", None)
+        if not isinstance(extra, dict):
+            extra = {}
+            self._stream_group_profile_extra = extra
+        extra.update(fields)
+
+    def _stream_group_profile_start_s(self) -> float:
+        return time.perf_counter() if self._queue_profile_path_value() else 0.0
+
+    def _add_stream_group_profile_elapsed(self, field: str, start_s: float) -> None:
+        if start_s <= 0.0 or not self._queue_profile_path_value():
+            return
+        elapsed_ms = (time.perf_counter() - start_s) * 1000.0
+        self._add_stream_group_profile_value(field, elapsed_ms)
+
+    def _add_stream_group_profile_value(self, field: str, value: float) -> None:
+        if not self._queue_profile_path_value():
+            return
+        extra = getattr(self, "_stream_group_profile_extra", None)
+        if not isinstance(extra, dict):
+            extra = {}
+            self._stream_group_profile_extra = extra
+        previous = extra.get(field)
+        elapsed_ms = float(value)
+        if isinstance(previous, (int, float)):
+            elapsed_ms += float(previous)
+        extra[field] = elapsed_ms
 
     def _try_acquire_single_request_model(self, *, temperature: float = 0.0) -> bool:
         if not self.single_request_fast_path:
@@ -655,7 +2236,7 @@ class OpenAICompletionEngine:
     def _temperature_single_request_admission_wait_s(self, temperature: float) -> float:
         if temperature <= 0.0:
             return 0.0
-        return env_float("TORCHINFERNO_OPENAI_TEMPERATURE_ADMISSION_WAIT_MS", 5.0, minimum=0.0) / 1000.0
+        return env_float("TORCHINFERNO_OPENAI_TEMPERATURE_ADMISSION_WAIT_MS", 0.5, minimum=0.0) / 1000.0
 
     def _has_multiple_live_requests(self) -> bool:
         with self._live_request_condition:
@@ -674,17 +2255,37 @@ class OpenAICompletionEngine:
             and self.device.type == "cuda"
         ):
             short_max_tokens = env_int("TORCHINFERNO_OPENAI_SHORT_STREAM_MAX_TOKENS", 256, minimum=1)
-            if first.max_tokens <= short_max_tokens:
-                deterministic_high_token_min = env_int(
-                    "TORCHINFERNO_OPENAI_TP_DETERMINISTIC_SHORT_STREAM_HIGH_TOKEN_MIN",
-                    short_max_tokens,
+            long_prompt_short_max_tokens = env_int(
+                "TORCHINFERNO_OPENAI_TP_LONG_PROMPT_SHORT_STREAM_MAX_TOKENS",
+                128,
+                minimum=1,
+            )
+            long_prompt_min_tokens = env_int(
+                "TORCHINFERNO_OPENAI_TP_LONG_PROMPT_SHORT_STREAM_MIN_PROMPT_TOKENS",
+                96,
+                minimum=1,
+            )
+            if (
+                first.temperature <= 0.0
+                and first.max_tokens <= long_prompt_short_max_tokens
+                and len(first.prompt) >= long_prompt_min_tokens
+                and env_flag("TORCHINFERNO_OPENAI_TP_LONG_PROMPT_SHORT_STREAM_BATCH_CAP", False)
+            ):
+                long_prompt_limit = env_int(
+                    "TORCHINFERNO_OPENAI_TP_LONG_PROMPT_SHORT_STREAM_MAX_BATCH_SIZE",
+                    min(limit, 56),
                     minimum=1,
                 )
-                default_short_limit = (
-                    64
-                    if first.temperature > 0.0
-                    else (64 if first.max_tokens >= deterministic_high_token_min else 56)
-                )
+                return min(limit, long_prompt_limit)
+            if first.max_tokens <= short_max_tokens:
+                if first.temperature > 0.0:
+                    default_short_limit = env_int(
+                        "TORCHINFERNO_OPENAI_TP_SAMPLED_SHORT_STREAM_MAX_BATCH_SIZE",
+                        min(limit, 128),
+                        minimum=1,
+                    )
+                else:
+                    default_short_limit = 128
                 short_limit = env_int(
                     "TORCHINFERNO_OPENAI_TP_SHORT_STREAM_MAX_BATCH_SIZE",
                     min(limit, default_short_limit),
@@ -695,7 +2296,7 @@ class OpenAICompletionEngine:
             if first.temperature <= 0.0 and first.max_tokens >= large_min_tokens:
                 large_limit = env_int(
                     "TORCHINFERNO_OPENAI_TP_LARGE_STREAM_MAX_BATCH_SIZE",
-                    min(limit, 32),
+                    min(limit, 64),
                     minimum=1,
                 )
                 return min(limit, large_limit)
@@ -760,7 +2361,7 @@ class OpenAICompletionEngine:
         if first.max_tokens > max_tokens:
             return self.batch_wait_s
         short_max_tokens = env_int("TORCHINFERNO_OPENAI_SHORT_STREAM_MAX_TOKENS", 256, minimum=1)
-        default_wait_ms = 10.0 if first.max_tokens <= short_max_tokens else 50.0
+        default_wait_ms = 1.0 if first.max_tokens <= short_max_tokens else 2.0
         temperature_wait_s = (
             env_float("TORCHINFERNO_OPENAI_TEMPERATURE_BATCH_WAIT_MS", default_wait_ms, minimum=0.0)
             / 1000.0
@@ -776,12 +2377,12 @@ class OpenAICompletionEngine:
             return None
         min_tokens = env_int(
             "TORCHINFERNO_OPENAI_TP_GREEDY_LOW_LATENCY_MIN_TOKENS",
-            128,
+            1,
             minimum=1,
         )
         max_tokens = env_int(
             "TORCHINFERNO_OPENAI_TP_GREEDY_LOW_LATENCY_MAX_TOKENS",
-            400,
+            8192,
             minimum=min_tokens,
         )
         if not (min_tokens <= first.max_tokens <= max_tokens):
@@ -790,24 +2391,58 @@ class OpenAICompletionEngine:
         return wait_ms / 1000.0
 
     def _queued_initial_batch_wait_s(self, first: _QueuedGeneration) -> float:
-        if not first.stream or first.temperature <= 0.0 or self.max_batch_size <= 1:
+        if not first.stream or self.max_batch_size <= 1:
             return 0.0
-        max_temperature_tokens = env_int("TORCHINFERNO_OPENAI_TEMPERATURE_BATCH_WAIT_MAX_TOKENS", 512, minimum=1)
         if not (
             _is_tensor_parallel_model(self.model)
             and self.device.type == "cuda"
-            and first.max_tokens <= max_temperature_tokens
         ):
+            return 0.0
+        if first.temperature <= 0.0:
+            min_tokens = env_int(
+                "TORCHINFERNO_OPENAI_TP_GREEDY_LOW_LATENCY_MIN_TOKENS",
+                1,
+                minimum=1,
+            )
+            max_tokens = env_int(
+                "TORCHINFERNO_OPENAI_TP_GREEDY_LOW_LATENCY_MAX_TOKENS",
+                400,
+                minimum=min_tokens,
+            )
+            if not (min_tokens <= first.max_tokens <= max_tokens):
+                return 0.0
+            short_output_max_tokens = env_int(
+                "TORCHINFERNO_OPENAI_TP_GREEDY_SHORT_OUTPUT_INITIAL_BATCH_MAX_TOKENS",
+                128,
+                minimum=1,
+            )
+            default_wait_ms = (
+                env_float(
+                    "TORCHINFERNO_OPENAI_TP_GREEDY_SHORT_OUTPUT_INITIAL_BATCH_WAIT_MS",
+                    1.0,
+                    minimum=0.0,
+                )
+                if first.max_tokens <= short_output_max_tokens
+                else 0.5
+            )
+            wait_ms = env_float(
+                "TORCHINFERNO_OPENAI_TP_GREEDY_INITIAL_BATCH_WAIT_MS",
+                default_wait_ms,
+                minimum=0.0,
+            )
+            return min(self.batch_wait_s, wait_ms / 1000.0)
+        max_temperature_tokens = env_int("TORCHINFERNO_OPENAI_TEMPERATURE_BATCH_WAIT_MAX_TOKENS", 512, minimum=1)
+        if first.max_tokens > max_temperature_tokens:
             return 0.0
         short_max_tokens = env_int("TORCHINFERNO_OPENAI_SHORT_STREAM_MAX_TOKENS", 256, minimum=1)
         if first.max_tokens <= short_max_tokens:
             wait_ms = env_float(
                 "TORCHINFERNO_OPENAI_TP_SHORT_SAMPLED_INITIAL_BATCH_WAIT_MS",
-                10.0,
+                1.0,
                 minimum=0.0,
             )
         else:
-            wait_ms = env_float("TORCHINFERNO_OPENAI_TP_SAMPLED_INITIAL_BATCH_WAIT_MS", 10.0, minimum=0.0)
+            wait_ms = env_float("TORCHINFERNO_OPENAI_TP_SAMPLED_INITIAL_BATCH_WAIT_MS", 1.0, minimum=0.0)
         return min(self._queued_batch_wait_s(first), wait_ms / 1000.0)
 
     def _run_queued_batch(self, batch: list[_QueuedGeneration]) -> None:
@@ -832,12 +2467,20 @@ class OpenAICompletionEngine:
                         _finish_stream_request(request)
 
     def _run_queued_stream_group(self, group: list[_QueuedGeneration]) -> None:
+        if self._should_use_tensor_parallel_online_stream_group(group):
+            self._run_queued_stream_group_tensor_parallel_online(group)
+            return
+        if self._should_use_runtime_continuous_stream_group(group):
+            self._run_queued_stream_group_runtime_continuous(group)
+            return
         prompts = [request.prompt for request in group]
         max_tokens = max((request.max_tokens for request in group), default=0)
         row_max_tokens = [request.max_tokens for request in group]
         use_prompt_list_batch = self._should_use_prompt_list_stream_group(prompts)
         if use_prompt_list_batch and _prefer_tensor_parallel_stream_group(prompts, self.model):
             use_prompt_list_batch = False
+        shared_prefix_tokens = self._shared_prefix_prompt_list_tokens(prompts) if use_prompt_list_batch else 0
+        profile_queue = bool(self._queue_profile_path_value())
         with _tensor_parallel_symm_mem_allreduce_scope(
             self.model,
             self.device,
@@ -846,6 +2489,14 @@ class OpenAICompletionEngine:
         ):
             if use_prompt_list_batch:
                 completed_steps = 0
+                group_start_s = time.perf_counter() if profile_queue else 0.0
+                first_emit_s: float | None = None
+                emitted_tokens = 0
+                if profile_queue:
+                    self._reset_stream_group_profile_extra()
+                    self._add_stream_group_profile_extra(
+                        **_model_graph_cache_profile_fields(self.model, "graph_before_")
+                    )
                 try:
                     step_iter = self._generate_prompt_list_batch_steps(
                         prompts,
@@ -855,16 +2506,42 @@ class OpenAICompletionEngine:
                     )
                     for step, step_tokens in enumerate(step_iter):
                         completed_steps = step + 1
+                        if profile_queue and first_emit_s is None:
+                            first_emit_s = time.perf_counter()
+                        emitted_tokens += sum(token is not None for token in step_tokens)
+                        emit_start_s = self._stream_group_profile_start_s()
                         _emit_stream_step(group, step, step_tokens, getattr(self, "stop_token_ids", frozenset()))
+                        self._add_stream_group_profile_elapsed("stream_emit_ms", emit_start_s)
                 finally:
                     _sync_tensor_parallel_command(
                         self.model,
                         self.device,
-                        cuda_sync=_tp_command_cuda_sync_for_steps(completed_steps),
+                        cuda_sync=_tp_command_cuda_sync_for_steps(
+                            completed_steps,
+                            emitted_tokens=emitted_tokens,
+                        ),
                     )
+                    if profile_queue:
+                        self._record_stream_group_queue_profile(
+                            group,
+                            group_start_s=group_start_s,
+                            first_emit_s=first_emit_s,
+                            completed_steps=completed_steps,
+                            emitted_tokens=emitted_tokens,
+                            use_prompt_list_batch=True,
+                            group_kind="prompt_list",
+                        )
                 return
             for same_length_group in _queued_groups_by_prompt_length(group):
                 same_length_max_tokens = max(request.max_tokens for request in same_length_group)
+                group_start_s = time.perf_counter() if profile_queue else 0.0
+                first_emit_s = None
+                emitted_tokens = 0
+                if profile_queue:
+                    self._reset_stream_group_profile_extra()
+                    self._add_stream_group_profile_extra(
+                        **_model_graph_cache_profile_fields(self.model, "graph_before_")
+                    )
                 input_ids = torch.tensor(
                     [request.prompt for request in same_length_group],
                     dtype=torch.long,
@@ -880,18 +2557,309 @@ class OpenAICompletionEngine:
                     )
                     for step, step_tokens in enumerate(step_iter):
                         completed_steps = step + 1
+                        if profile_queue and first_emit_s is None:
+                            first_emit_s = time.perf_counter()
+                        emitted_tokens += sum(token is not None for token in step_tokens)
+                        emit_start_s = self._stream_group_profile_start_s()
                         _emit_stream_step(
                             same_length_group,
                             step,
                             step_tokens,
                             getattr(self, "stop_token_ids", frozenset()),
                         )
+                        self._add_stream_group_profile_elapsed("stream_emit_ms", emit_start_s)
                 finally:
                     _sync_tensor_parallel_command(
                         self.model,
                         self.device,
-                        cuda_sync=_tp_command_cuda_sync_for_steps(completed_steps),
+                        cuda_sync=_tp_command_cuda_sync_for_steps(
+                            completed_steps,
+                            emitted_tokens=emitted_tokens,
+                        ),
                     )
+                    if profile_queue:
+                        self._record_stream_group_queue_profile(
+                            same_length_group,
+                            group_start_s=group_start_s,
+                            first_emit_s=first_emit_s,
+                            completed_steps=completed_steps,
+                            emitted_tokens=emitted_tokens,
+                            use_prompt_list_batch=False,
+                            group_kind="same_length_tensor",
+                        )
+
+    def _should_use_tensor_parallel_online_stream_group(self, group: Sequence[_QueuedGeneration]) -> bool:
+        if not env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_CONTINUOUS", True):
+            return False
+        if not group or any(not request.stream for request in group):
+            return False
+        if not _is_tensor_parallel_primary_model(self.model):
+            return False
+        if len(getattr(self, "stop_token_ids", frozenset())) > 1:
+            return False
+        return hasattr(self.model, "allocate_cache")
+
+    def _run_queued_stream_group_tensor_parallel_online(self, group: Sequence[_QueuedGeneration]) -> None:
+        max_tokens = max((request.max_tokens for request in group), default=0)
+        if max_tokens <= 0:
+            return
+        enable_ragged_decode = env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_RAGGED_DECODE", True)
+        store_reusable_prefixes = env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_PREFIX_CACHE_STORE", True)
+        store_full_prompt_prefixes = env_flag(
+            "TORCHINFERNO_OPENAI_TP_ONLINE_PREFIX_CACHE_STORE_FULL_PROMPTS",
+            True,
+        )
+        default_max_active = min(max(1, len(group)), int(getattr(self, "max_batch_size", max(1, len(group)))))
+        if not enable_ragged_decode:
+            default_max_active = min(
+                default_max_active,
+                env_int("TORCHINFERNO_CUDAGRAPH_DECODE_STEP_MAX_BATCH", 64, minimum=1),
+            )
+        max_active = env_int("TORCHINFERNO_OPENAI_TP_ONLINE_MAX_ACTIVE", default_max_active, minimum=1)
+        prefix_rows = env_int(
+            "TORCHINFERNO_OPENAI_TP_ONLINE_PREFIX_ROWS",
+            min(max_active, max(0, len(group))),
+            minimum=0,
+        )
+        prefill_budget = (
+            env_int("TORCHINFERNO_OPENAI_TP_ONLINE_PREFILL_TOKEN_BUDGET", 0, minimum=0)
+            if "TORCHINFERNO_OPENAI_TP_ONLINE_PREFILL_TOKEN_BUDGET" in os.environ
+            else 0
+        )
+        max_seq_len = env_int(
+            "TORCHINFERNO_OPENAI_TP_ONLINE_MAX_SEQ_LEN",
+            max(len(request.prompt) + request.max_tokens for request in group),
+            minimum=1,
+        )
+        stop_token_ids = getattr(self, "stop_token_ids", frozenset())
+        eos_token_id = next(iter(stop_token_ids)) if len(stop_token_ids) == 1 else None
+        runtime_engine = _RuntimeContinuousBatchEngine(
+            self.model,
+            device=self.device,
+            cache_backend=self.cache_backend,
+            page_size=self.page_size,
+            temperature=group[0].temperature,
+            max_active_requests=max_active,
+            prefix_cache_capacity=prefix_rows,
+            prefill_token_budget=prefill_budget if prefill_budget > 0 else None,
+            enable_ragged_decode=enable_ragged_decode,
+            store_reusable_prefixes=store_reusable_prefixes,
+            store_full_prompt_prefixes=store_full_prompt_prefixes,
+            profile_timings=bool(self._queue_profile_path_value()),
+        )
+        request_by_id = {str(index): request for index, request in enumerate(group)}
+        row_max_tokens = [request.max_tokens for request in group]
+        prompts = [request.prompt for request in group]
+        started = False
+        online_steps = 0
+        online_step_commands = 0
+        emitted_events = 0
+        finished_events = 0
+        try:
+            with _tensor_parallel_symm_mem_allreduce_scope(
+                self.model,
+                self.device,
+                max_tokens=max_tokens,
+                temperature=group[0].temperature,
+            ):
+                _broadcast_tensor_parallel_online_start(
+                    self.model,
+                    max_seq_len=max_seq_len,
+                    max_active_requests=max_active,
+                    prefix_cache_capacity=prefix_rows,
+                    prefill_token_budget=prefill_budget if prefill_budget > 0 else None,
+                    temperature=group[0].temperature,
+                    enable_ragged_decode=enable_ragged_decode,
+                    store_reusable_prefixes=store_reusable_prefixes,
+                    store_full_prompt_prefixes=store_full_prompt_prefixes,
+                    max_tokens=max_tokens,
+                )
+                runtime_engine.start_online(max_seq_len=max_seq_len)
+                started = True
+                _sync_tensor_parallel_command(self.model, self.device)
+                _broadcast_tensor_parallel_online_submit_prompt_lists(
+                    self.model,
+                    prompts,
+                    max_tokens=max_tokens,
+                    row_max_tokens=row_max_tokens,
+                    arrival_step=0,
+                    eos_token_id=eos_token_id,
+                    request_id_start=0,
+                )
+                for index, request in enumerate(group):
+                    runtime_engine.submit_online(
+                        _RuntimeServingRequest(
+                            str(index),
+                            tuple(request.prompt),
+                            request.max_tokens,
+                            arrival_step=0,
+                            eos_token_id=eos_token_id,
+                        )
+                )
+                _sync_tensor_parallel_command(self.model, self.device)
+                decode_quantum = env_int("TORCHINFERNO_OPENAI_TP_ONLINE_DECODE_QUANTUM", 1, minimum=1)
+                while runtime_engine.has_online_work():
+                    _broadcast_tensor_parallel_online_step(self.model, decode_quantum)
+                    online_step_commands += 1
+                    for _ in range(decode_quantum):
+                        if not runtime_engine.has_online_work():
+                            break
+                        events = runtime_engine.step_online()
+                        for event in events:
+                            emitted_events += 1
+                            request = request_by_id[event.request_id]
+                            if request.done:
+                                continue
+                            if event.token in stop_token_ids:
+                                _finish_stream_request(request)
+                                finished_events += 1
+                                continue
+                            request.responses.put(event.token)
+                            if event.finished:
+                                _finish_stream_request(request)
+                                finished_events += 1
+                        online_steps += 1
+                    _sync_tensor_parallel_command(self.model, self.device)
+        finally:
+            self._record_runtime_engine_queue_profile(
+                "online_stream_group",
+                runtime_engine,
+                submitted_requests=len(group),
+                max_active=max_active,
+                prefix_rows=prefix_rows,
+                decode_quantum=env_int("TORCHINFERNO_OPENAI_TP_ONLINE_DECODE_QUANTUM", 1, minimum=1),
+                online_steps=online_steps,
+                online_step_commands=online_step_commands,
+                emitted_events=emitted_events,
+                finished_events=finished_events,
+            )
+            if started:
+                _broadcast_tensor_parallel_online_close(self.model)
+                _sync_tensor_parallel_command(self.model, self.device)
+
+    def _should_use_runtime_continuous_stream_group(self, group: Sequence[_QueuedGeneration]) -> bool:
+        if not env_flag("TORCHINFERNO_OPENAI_RUNTIME_CONTINUOUS_STREAM", False):
+            return False
+        if not group or any(not request.stream for request in group):
+            return False
+        if _is_tensor_parallel_model(self.model) and _tensor_parallel_world_size(self.model) > 1:
+            return False
+        if len(getattr(self, "stop_token_ids", frozenset())) > 1:
+            return False
+        return hasattr(self.model, "allocate_cache")
+
+    def _run_queued_stream_group_runtime_continuous(self, group: Sequence[_QueuedGeneration]) -> None:
+        max_active = env_int(
+            "TORCHINFERNO_OPENAI_RUNTIME_CONTINUOUS_MAX_ACTIVE",
+            min(max(1, len(group)), int(getattr(self, "max_batch_size", max(1, len(group))))),
+            minimum=1,
+        )
+        prefix_rows = env_int(
+            "TORCHINFERNO_OPENAI_RUNTIME_CONTINUOUS_PREFIX_ROWS",
+            min(max_active, max(0, len(group))),
+            minimum=0,
+        )
+        prefill_budget = (
+            env_int("TORCHINFERNO_OPENAI_RUNTIME_CONTINUOUS_PREFILL_TOKEN_BUDGET", 0, minimum=0)
+            if "TORCHINFERNO_OPENAI_RUNTIME_CONTINUOUS_PREFILL_TOKEN_BUDGET" in os.environ
+            else 0
+        )
+        stop_token_ids = getattr(self, "stop_token_ids", frozenset())
+        eos_token_id = next(iter(stop_token_ids)) if len(stop_token_ids) == 1 else None
+        enable_ragged_decode = env_flag("TORCHINFERNO_OPENAI_RUNTIME_CONTINUOUS_RAGGED_DECODE", True)
+        store_full_prompt_prefixes = env_flag(
+            "TORCHINFERNO_OPENAI_RUNTIME_CONTINUOUS_PREFIX_CACHE_STORE_FULL_PROMPTS",
+            True,
+        )
+        runtime_engine = _RuntimeContinuousBatchEngine(
+            self.model,
+            device=self.device,
+            cache_backend=self.cache_backend,
+            page_size=self.page_size,
+            temperature=group[0].temperature,
+            max_active_requests=max_active,
+            prefix_cache_capacity=prefix_rows,
+            prefill_token_budget=prefill_budget if prefill_budget > 0 else None,
+            enable_ragged_decode=enable_ragged_decode,
+            store_full_prompt_prefixes=store_full_prompt_prefixes,
+            profile_timings=bool(self._queue_profile_path_value()),
+        )
+        request_by_id = {str(index): request for index, request in enumerate(group)}
+        runtime_requests = [
+            _RuntimeServingRequest(
+                str(index),
+                tuple(request.prompt),
+                request.max_tokens,
+                arrival_step=0,
+                eos_token_id=eos_token_id,
+            )
+            for index, request in enumerate(group)
+        ]
+        for event in runtime_engine.iter_events(runtime_requests):
+            request = request_by_id[event.request_id]
+            if request.done:
+                continue
+            if event.token in stop_token_ids:
+                _finish_stream_request(request)
+                continue
+            request.responses.put(event.token)
+            if event.finished:
+                _finish_stream_request(request)
+
+    def _record_stream_group_queue_profile(
+        self,
+        group: Sequence[_QueuedGeneration],
+        *,
+        group_start_s: float,
+        first_emit_s: float | None,
+        completed_steps: int,
+        emitted_tokens: int,
+        use_prompt_list_batch: bool,
+        group_kind: str,
+    ) -> None:
+        if not self._queue_profile_path_value():
+            return
+        group_end_s = time.perf_counter()
+        queued_times = [request.queued_at_s for request in group if request.queued_at_s > 0.0]
+        first_queued_s = min(queued_times, default=group_start_s)
+        prompt_lengths = [len(request.prompt) for request in group]
+        row_max_tokens = [request.max_tokens for request in group]
+        queue_sequences = [request.queue_sequence for request in group if request.queue_sequence >= 0]
+        record: dict[str, object] = {
+            "event": "stream_group",
+            "group_kind": group_kind,
+            "batch_size": len(group),
+            "use_prompt_list_batch": use_prompt_list_batch,
+            "temperature": float(group[0].temperature) if group else 0.0,
+            "max_tokens": max(row_max_tokens, default=0),
+            "min_row_max_tokens": min(row_max_tokens, default=0),
+            "max_row_max_tokens": max(row_max_tokens, default=0),
+            "min_prompt_tokens": min(prompt_lengths, default=0),
+            "max_prompt_tokens": max(prompt_lengths, default=0),
+            "shared_prefix_tokens": self._shared_prefix_prompt_list_tokens(
+                [request.prompt for request in group]
+            ),
+            "queue_wait_ms": (group_start_s - first_queued_s) * 1000.0,
+            "run_to_first_emit_ms": None
+            if first_emit_s is None
+            else (first_emit_s - group_start_s) * 1000.0,
+            "queued_to_first_emit_ms": None
+            if first_emit_s is None
+            else (first_emit_s - first_queued_s) * 1000.0,
+            "group_elapsed_ms": (group_end_s - group_start_s) * 1000.0,
+            "completed_steps": completed_steps,
+            "emitted_tokens": emitted_tokens,
+        }
+        if queue_sequences:
+            record["queue_sequence_min"] = min(queue_sequences)
+            record["queue_sequence_max"] = max(queue_sequences)
+            record["queue_sequence_count"] = len(queue_sequences)
+        extra = getattr(self, "_stream_group_profile_extra", None)
+        if isinstance(extra, dict):
+            record.update(extra)
+        record.update(_model_graph_cache_profile_fields(self.model, "graph_after_"))
+        self._stream_group_profile_extra = {}
+        self._record_queue_profile(record)
 
     def _should_use_prompt_list_stream_group(self, prompts: Sequence[Sequence[int]]) -> bool:
         if self._shared_prefix_prompt_list_tokens(prompts) > 0:
@@ -900,7 +2868,7 @@ class OpenAICompletionEngine:
             len(prompts) == 1
             and _is_tensor_parallel_model(self.model)
             and _prefix_cache_enabled_for_model(self.model)
-            and env_flag("TORCHINFERNO_OPENAI_TP_SINGLE_PROMPT_LIST_STREAM", False)
+            and env_flag("TORCHINFERNO_OPENAI_TP_SINGLE_PROMPT_LIST_STREAM", True)
         )
 
     def _run_queued_completion_group(self, group: list[_QueuedGeneration]) -> None:
@@ -968,7 +2936,13 @@ class OpenAICompletionEngine:
             input_ids,
             cache,
             temperature,
-            allow_capture=_runtime_prefill_graph_capture_enabled(model, temperature, max_tokens=max_tokens),
+            allow_capture=self._batched_prefill_graph_capture_enabled(
+                model,
+                input_ids,
+                cache,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            ),
         )
         next_token = next_token.to(self.device)
         generated_tokens: list[Tensor] = []
@@ -1001,12 +2975,14 @@ class OpenAICompletionEngine:
         *,
         model: object,
         pool: bool = True,
+        batch_capacity: int | None = None,
     ) -> object:
+        cache_batch_size = max(batch_size, int(batch_capacity)) if batch_capacity is not None else batch_size
         cache_capacity = _generation_cache_capacity(model, max_seq_len)
         if not pool:
             cache = _allocate_cache(
                 model,
-                batch_size,
+                cache_batch_size,
                 cache_capacity,
                 device=self.device,
                 cache_backend=self.cache_backend,
@@ -1019,12 +2995,12 @@ class OpenAICompletionEngine:
             _reset_generation_cache(cache)
             return cache
         exact_capacity = _prefers_exact_generation_cache(model)
-        key = (batch_size, cache_capacity, self.cache_backend, self.page_size, str(self.device))
+        key = (cache_batch_size, cache_capacity, self.cache_backend, self.page_size, str(self.device))
         for cached_key, cached in list(self._cache_pool.items()):
             cached_batch, cached_max_seq_len, cached_backend, cached_page_size, cached_device = cached_key
             capacity_matches = cached_max_seq_len == cache_capacity if exact_capacity else cached_max_seq_len >= max_seq_len
             if (
-                cached_batch == batch_size
+                cached_batch == cache_batch_size
                 and capacity_matches
                 and cached_backend == self.cache_backend
                 and cached_page_size == self.page_size
@@ -1039,7 +3015,7 @@ class OpenAICompletionEngine:
         self._prepare_cache_pool_insert(self._cache_pool, key, max_entries, model=model)
         cache = _allocate_cache(
             model,
-            batch_size,
+            cache_batch_size,
             cache_capacity,
             device=self.device,
             cache_backend=self.cache_backend,
@@ -1128,7 +3104,7 @@ class OpenAICompletionEngine:
             self._clear_cache_pool(pool, model=model)
             return
         while len(pool) >= max_entries:
-            self._evict_cache_pool_key(pool, next(iter(pool)), model=model)
+            self._evict_cache_pool_key(pool, _cache_pool_eviction_key(pool, model=model), model=model)
 
     def _store_cache_pool_entry(
         self,
@@ -1146,11 +3122,17 @@ class OpenAICompletionEngine:
             _release_decode_graphs_for_cache(model, existing)
         pool[key] = cache
         while len(pool) > max_entries:
-            self._evict_cache_pool_key(pool, next(iter(pool)), model=model)
+            self._evict_cache_pool_key(pool, _cache_pool_eviction_key(pool, model=model), model=model)
 
     def _evict_cache_pool_key(self, pool: dict[object, object], key: object, *, model: object) -> None:
         cache = pool.pop(key, None)
         if cache is not None:
+            _sync_before_decode_graph_release(
+                model,
+                cache,
+                device=self.device,
+                label="openai.cache_pool.evict_graph_cache_sync",
+            )
             _release_decode_graphs_for_cache(model, cache)
 
     def _clear_cache_pool(self, pool: dict[object, object], *, model: object) -> None:
@@ -1369,11 +3351,8 @@ class OpenAICompletionEngine:
         min_rows = env_int("TORCHINFERNO_OPENAI_PREFIX_CACHE_BATCH_RESTORE_MIN_ROWS", 2, minimum=1)
         grouped = [group for group in groups.values() if len(group) >= min_rows]
         grouped.sort(key=lambda group: (group[0].prefix_tokens, len(group)), reverse=True)
-        if grouped and not _tensor_parallel_all_ranks_same_int(
-            self.model,
-            _prefix_cached_prompt_groups_signature(grouped),
-            self.device,
-        ):
+        signature = _prefix_cached_prompt_groups_signature(grouped) if grouped else 0
+        if not _tensor_parallel_all_ranks_same_int(self.model, signature, self.device):
             return []
         return grouped
 
@@ -1549,6 +3528,18 @@ class OpenAICompletionEngine:
         except Exception as exc:
             warn_optional_failure("openai.tokenizer_warmup", exc)
 
+    def _warmup_tensor_parallel_control_group(self) -> None:
+        if not (
+            _is_tensor_parallel_model(self.model)
+            and _tensor_parallel_world_size(self.model) > 1
+            and env_flag("TORCHINFERNO_OPENAI_TP_TENSOR_COMMANDS_GLOO", True)
+        ):
+            return
+        import torch.distributed as dist
+
+        if dist.is_available() and dist.is_initialized():
+            _tensor_parallel_control_group(dist)
+
     def _warmup_tensor_parallel_model(self) -> None:
         if not env_flag("TORCHINFERNO_OPENAI_STARTUP_WARMUP", True):
             return
@@ -1556,38 +3547,48 @@ class OpenAICompletionEngine:
             return
         if not hasattr(self.model, "generate"):
             return
+        if not _startup_warmup_enabled_for_cache_backend(str(getattr(self, "cache_backend", "dense"))):
+            return
         prompt_tokens = env_int("TORCHINFERNO_OPENAI_WARMUP_PROMPT_TOKENS", 32, minimum=1)
         prompt_token_counts = _warmup_prompt_token_counts(prompt_tokens)
         new_tokens = env_int("TORCHINFERNO_OPENAI_WARMUP_NEW_TOKENS", 2, minimum=1)
         vocab_size = max(1, int(getattr(getattr(self.model, "config", object()), "vocab_size", 1)))
         with torch.inference_mode():
-            for count in prompt_token_counts:
-                input_ids = (torch.arange(count, device=self.device, dtype=torch.long) % vocab_size)[None, :]
-                for _ in self._generate_single_tokens(
-                    input_ids,
-                    max_tokens=new_tokens,
-                    temperature=0.0,
-                    broadcast_tensor_parallel=False,
-                    update_prefix_cache=False,
-                ):
-                    pass
-            self._warmup_tensor_parallel_prefill_graphs(prompt_token_counts, vocab_size)
-            self._warmup_tensor_parallel_prefix_suffix_graphs(vocab_size)
-            self._warmup_tensor_parallel_temperature_graphs(vocab_size)
             with _tensor_parallel_symm_mem_allreduce_scope(
                 self.model,
                 self.device,
-                max_tokens=1,
+                max_tokens=new_tokens,
                 temperature=0.0,
             ):
-                self._warmup_tensor_parallel_ragged_decode_graphs(vocab_size)
+                for count in prompt_token_counts:
+                    input_ids = (torch.arange(count, device=self.device, dtype=torch.long) % vocab_size)[None, :]
+                    for _ in self._generate_single_tokens(
+                        input_ids,
+                        max_tokens=new_tokens,
+                        temperature=0.0,
+                        broadcast_tensor_parallel=False,
+                        update_prefix_cache=False,
+                    ):
+                        pass
+            self._warmup_tensor_parallel_prefill_graphs(prompt_token_counts, vocab_size)
+            self._warmup_tensor_parallel_prefix_suffix_graphs(vocab_size)
+            self._warmup_tensor_parallel_temperature_graphs(vocab_size)
+            self._warmup_tensor_parallel_resident_temperature_graphs(vocab_size)
+            self._warmup_tensor_parallel_ragged_decode_graphs(vocab_size)
+            if env_flag("TORCHINFERNO_OPENAI_WARMUP_RAGGED_DECODE_SYMM_GRAPHS", True):
+                with _tensor_parallel_symm_mem_allreduce_scope(
+                    self.model,
+                    self.device,
+                    max_tokens=1,
+                    temperature=0.0,
+                ):
+                    self._warmup_tensor_parallel_ragged_decode_graphs(vocab_size)
             warmup_cache_tokens = max(
                 max(prompt_token_counts) + new_tokens,
                 env_int("TORCHINFERNO_OPENAI_WARMUP_CACHE_TOKENS", 256, minimum=1),
             )
-            self._generation_cache(1, warmup_cache_tokens, model=self.model)
+            self._generation_cache(1, warmup_cache_tokens, model=self.model, pool=False)
             _warmup_tensor_parallel_decode_attention(self.model)
-            self._warmup_tensor_parallel_resident_temperature_graphs(vocab_size)
         torch.cuda.synchronize(self.device)
 
     def _warmup_tensor_parallel_prefill_graphs(
@@ -1711,44 +3712,64 @@ class OpenAICompletionEngine:
         cache_token_counts = _warmup_ragged_decode_cache_token_counts()
         if not batch_sizes or not row_counts or not cache_token_counts:
             return
-        for batch_size in batch_sizes:
-            for cache_tokens in cache_token_counts:
-                if prompt_tokens >= cache_tokens:
+        cache_specs = tuple(
+            dict.fromkeys(
+                [(batch_size, cache_tokens) for batch_size in batch_sizes for cache_tokens in cache_token_counts]
+                + list(_warmup_ragged_decode_extra_cache_specs())
+            )
+        )
+        force_row_indices = _force_tp_shared_prefix_ragged_row_indices(self.model) or env_flag(
+            "TORCHINFERNO_OPENAI_WARMUP_RAGGED_DECODE_FORCE_ROW_INDICES",
+            False,
+        )
+        for batch_size, cache_tokens in cache_specs:
+            if prompt_tokens >= cache_tokens:
+                continue
+            cache = self._generation_cache(batch_size, cache_tokens, model=self.model)
+            base = torch.arange(prompt_tokens, device=self.device, dtype=torch.long) % vocab_size
+            input_ids = base[None, :].expand(batch_size, prompt_tokens).contiguous()
+            next_token, cache = _prefill_next_token(
+                self.model,
+                input_ids,
+                cache,
+                0.0,
+                allow_capture=True,
+            )
+            next_token = next_token.to(self.device)
+            seq_lens = torch.full((batch_size,), prompt_tokens, dtype=torch.long, device=self.device)
+            seen_shapes: set[tuple[int, bool]] = set()
+            for row_count in row_counts:
+                rows = min(batch_size, int(row_count))
+                if rows <= 0:
                     continue
-                cache = self._generation_cache(batch_size, cache_tokens, model=self.model)
-                base = torch.arange(prompt_tokens, device=self.device, dtype=torch.long) % vocab_size
-                input_ids = base[None, :].expand(batch_size, prompt_tokens).contiguous()
-                next_token, cache = _prefill_next_token(
-                    self.model,
-                    input_ids,
-                    cache,
-                    0.0,
-                    allow_capture=True,
-                )
-                next_token = next_token.to(self.device)
-                seq_lens = torch.full((batch_size,), prompt_tokens, dtype=torch.long, device=self.device)
-                for row_count in row_counts:
-                    rows = min(batch_size, int(row_count))
-                    if rows <= 0:
-                        continue
-                    if rows == batch_size:
-                        _try_decode_ragged_logits_graph(
-                            self.model,
-                            next_token[:, None],
-                            cache,
-                            seq_lens=seq_lens,
-                            row_indices=None,
-                        )
-                    else:
-                        row_indices = torch.arange(rows, dtype=torch.long, device=self.device)
-                        _try_decode_ragged_logits_graph(
-                            self.model,
-                            next_token[:rows, None],
-                            cache,
-                            seq_lens=seq_lens,
-                            row_indices=row_indices,
-                        )
-                _reset_generation_cache(cache)
+                use_row_indices = force_row_indices or rows != batch_size
+                shape = (rows, use_row_indices)
+                if shape in seen_shapes:
+                    continue
+                seen_shapes.add(shape)
+                row_indices = torch.arange(rows, dtype=torch.long, device=self.device) if use_row_indices else None
+                decode_input = next_token[:rows, None] if row_indices is not None else next_token[:, None]
+                warm_token_graph = env_flag("TORCHINFERNO_OPENAI_WARMUP_RAGGED_DECODE_TOKEN_GRAPHS", True)
+                warm_logits_graph = env_flag("TORCHINFERNO_OPENAI_WARMUP_RAGGED_DECODE_LOGITS_GRAPHS", True)
+                graph_token = None
+                if warm_token_graph:
+                    graph_token = _try_decode_ragged_token_graph(
+                        self.model,
+                        decode_input,
+                        cache,
+                        seq_lens=seq_lens,
+                        row_indices=row_indices,
+                        temperature=0.0,
+                    )
+                if warm_logits_graph or (warm_token_graph and graph_token is None):
+                    _try_decode_ragged_logits_graph(
+                        self.model,
+                        decode_input,
+                        cache,
+                        seq_lens=seq_lens,
+                        row_indices=row_indices,
+                    )
+            _reset_generation_cache(cache)
 
     def _generate_prompt_token_list(self, prompt: list[int], *, max_tokens: int, temperature: float) -> list[int]:
         input_ids = torch.tensor([prompt], dtype=torch.long, device=self.device)
@@ -1933,6 +3954,99 @@ class OpenAICompletionEngine:
         min_hits = env_int("TORCHINFERNO_OPENAI_TP_SINGLE_RUNTIME_PREFILL_CAPTURE_MIN_HITS", 2, minimum=1)
         return count >= min_hits
 
+    def _batched_prefill_graph_capture_enabled(
+        self,
+        model: object,
+        input_ids: Tensor,
+        cache: object,
+        *,
+        temperature: float,
+        max_tokens: int,
+        selected_logits: bool = False,
+    ) -> bool:
+        tensor_parallel_cuda = (
+            _is_tensor_parallel_model(model)
+            and _tensor_parallel_world_size(model) > 1
+            and self.device.type == "cuda"
+        )
+        if _runtime_prefill_graph_capture_enabled(model, temperature, max_tokens=max_tokens) and not (
+            selected_logits and tensor_parallel_cuda
+        ):
+            return True
+        if not tensor_parallel_cuda:
+            return False
+        if selected_logits:
+            selected_capture_env_set = "TORCHINFERNO_OPENAI_TP_SELECTED_LOGITS_PREFILL_CAPTURE" in os.environ
+            if selected_capture_env_set:
+                if not env_flag("TORCHINFERNO_OPENAI_TP_SELECTED_LOGITS_PREFILL_CAPTURE", False):
+                    return False
+            else:
+                skip_max_tokens = env_int(
+                    "TORCHINFERNO_OPENAI_TP_SELECTED_LOGITS_PREFILL_CAPTURE_SKIP_MAX_TOKENS",
+                    128,
+                    minimum=0,
+                )
+                if max_tokens <= skip_max_tokens:
+                    return False
+                min_selected_batch = env_int(
+                    "TORCHINFERNO_OPENAI_TP_SELECTED_LOGITS_PREFILL_CAPTURE_MIN_BATCH",
+                    48,
+                    minimum=1,
+                )
+                if input_ids.size(0) < min_selected_batch:
+                    return False
+        if (
+            "TORCHINFERNO_OPENAI_TP_RUNTIME_PREFILL_CAPTURE" in os.environ
+            and not env_flag("TORCHINFERNO_OPENAI_TP_RUNTIME_PREFILL_CAPTURE", True)
+        ):
+            return False
+        if not env_flag("TORCHINFERNO_OPENAI_TP_REPEATED_RUNTIME_PREFILL_CAPTURE", True):
+            return False
+        if input_ids.ndim != 2 or input_ids.size(0) <= 1 or input_ids.size(1) <= 1:
+            return False
+        if temperature > 0.0 and not env_flag(
+            "TORCHINFERNO_OPENAI_TP_RUNTIME_TEMPERATURE_PREFILL_CAPTURE",
+            True,
+        ):
+            return False
+        token_limit = env_int("TORCHINFERNO_OPENAI_TP_RUNTIME_PREFILL_CAPTURE_MAX_TOKENS", 1024, minimum=1)
+        if max_tokens > token_limit:
+            return False
+        layers = tuple(getattr(cache, "layers", ()) or ())
+        cache_seq_len = _generation_cache_seq_len_if_uniform(cache)
+        if cache_seq_len is None:
+            sliced_cache = _cache_row_slice(cache, 0, int(input_ids.size(0)))
+            if sliced_cache is None:
+                return False
+            cache = sliced_cache
+            cache_seq_len = _generation_cache_seq_len_if_uniform(cache)
+            if cache_seq_len is None:
+                return False
+            layers = tuple(getattr(cache, "layers", ()) or ())
+        max_seq_len = int(getattr(layers[0], "max_seq_len", 0)) if layers else 0
+        if max_seq_len <= 0 or max_seq_len > token_limit:
+            return False
+        key = (
+            int(input_ids.size(0)),
+            int(input_ids.size(1)),
+            cache_seq_len,
+            max_seq_len,
+            temperature > 0.0,
+            bool(selected_logits),
+            str(self.device),
+        )
+        seen = getattr(self, "_batched_prefill_capture_seen", None)
+        if not isinstance(seen, dict):
+            seen = {}
+            self._batched_prefill_capture_seen = seen
+        count = seen.get(key, 0) + 1
+        seen[key] = count
+        max_entries = env_int("TORCHINFERNO_OPENAI_TP_BATCHED_RUNTIME_PREFILL_CAPTURE_MAX_ENTRIES", 512, minimum=1)
+        while len(seen) > max_entries:
+            seen.pop(next(iter(seen)))
+        min_hits = env_int("TORCHINFERNO_OPENAI_TP_BATCHED_RUNTIME_PREFILL_CAPTURE_MIN_HITS", 2, minimum=1)
+        return count >= min_hits
+
     @torch.inference_mode()
     def _generate_batch_steps(
         self,
@@ -2014,7 +4128,13 @@ class OpenAICompletionEngine:
             input_ids,
             cache,
             temperature,
-            allow_capture=_runtime_prefill_graph_capture_enabled(model, temperature, max_tokens=max_tokens),
+            allow_capture=self._batched_prefill_graph_capture_enabled(
+                model,
+                input_ids,
+                cache,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            ),
         )
         next_token = next_token.to(self.device)
         seq_lens = torch.full((input_ids.size(0),), input_ids.size(1), dtype=torch.long, device=self.device)
@@ -2265,7 +4385,13 @@ class OpenAICompletionEngine:
                 chunk_input_ids,
                 cache,
                 temperature,
-                allow_capture=_runtime_prefill_graph_capture_enabled(model, temperature, max_tokens=max_tokens),
+                allow_capture=self._batched_prefill_graph_capture_enabled(
+                    model,
+                    chunk_input_ids,
+                    cache,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                ),
             )
             next_token = next_token.to(self.device)
             for offset, token_id in enumerate(next_token.detach().cpu().tolist()):
@@ -2393,6 +4519,27 @@ class OpenAICompletionEngine:
                 row_max_tokens=row_max_tokens,
             )
         per_row_limits = _normalize_row_max_tokens(row_max_tokens, len(prompts), max_tokens)
+        segment_rows = self._prompt_list_segment_rows(len(prompts))
+        if 0 < segment_rows < len(prompts):
+            segments: list[tuple[Sequence[int], Iterator[list[int | None]]]] = []
+            for start in range(0, len(prompts), segment_rows):
+                end = min(len(prompts), start + segment_rows)
+                segment_indices = list(range(start, end))
+                segments.append(
+                    (
+                        segment_indices,
+                        self._generate_prompt_list_batch_steps(
+                            [prompts[index] for index in segment_indices],
+                            max_tokens=max_tokens,
+                            temperature=temperature,
+                            broadcast_tensor_parallel=False,
+                            row_max_tokens=per_row_limits[start:end],
+                            allow_prefix_cache_restore=allow_prefix_cache_restore,
+                        ),
+                    )
+                )
+            yield from _interleave_prompt_segments(len(prompts), segments)
+            return
         if len(prompts) == 1:
             input_ids = torch.tensor([prompts[0]], dtype=torch.long, device=self.device)
             for token_id in self._generate_single_tokens(
@@ -2448,7 +4595,7 @@ class OpenAICompletionEngine:
                                 allow_prefix_cache_restore=False,
                             ),
                         )
-                    )
+                )
                 yield from _interleave_prompt_segments(len(prompts), segments)
                 return
         prompt_lengths = {len(prompt) for prompt in prompts}
@@ -2492,6 +4639,20 @@ class OpenAICompletionEngine:
                 for original_index, token_id in zip(original_indices, group_step):
                     step_tokens[original_index] = token_id
                 yield step_tokens
+
+    def _prompt_list_segment_rows(self, prompt_count: int) -> int:
+        if prompt_count <= 1:
+            return prompt_count
+        if "TORCHINFERNO_OPENAI_PROMPT_LIST_SEGMENT_ROWS" in os.environ:
+            rows = env_int("TORCHINFERNO_OPENAI_PROMPT_LIST_SEGMENT_ROWS", prompt_count, minimum=0)
+            return prompt_count if rows <= 0 else min(prompt_count, rows)
+        model = getattr(self, "model", None)
+        device = getattr(self, "device", torch.device("cpu"))
+        if _is_tensor_parallel_model(model) and device.type == "cuda":
+            default_rows = env_int("TORCHINFERNO_CUDAGRAPH_DECODE_STEP_MAX_BATCH", 64, minimum=1)
+            rows = env_int("TORCHINFERNO_OPENAI_TP_PROMPT_LIST_SEGMENT_ROWS", default_rows, minimum=1)
+            return min(prompt_count, rows)
+        return prompt_count
 
     @torch.inference_mode()
     def _generate_prefix_cached_prompt_group_steps(
@@ -2651,7 +4812,13 @@ class OpenAICompletionEngine:
                 suffix_ids,
                 cache,
                 temperature,
-                allow_capture=_runtime_prefill_graph_capture_enabled(model, temperature, max_tokens=max_tokens),
+                allow_capture=self._batched_prefill_graph_capture_enabled(
+                    model,
+                    suffix_ids,
+                    cache,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                ),
             )
         else:
             pad_token_id = _tokenizer_padding_token_id(getattr(self, "tokenizer", None))
@@ -2662,6 +4829,14 @@ class OpenAICompletionEngine:
                 cache,
                 [len(suffix) for suffix in suffix_rows],
                 temperature,
+                allow_capture=self._batched_prefill_graph_capture_enabled(
+                    model,
+                    suffix_ids,
+                    cache,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    selected_logits=True,
+                ),
             )
         next_token = next_token.to(self.device)
 
@@ -2763,7 +4938,13 @@ class OpenAICompletionEngine:
                 suffix_ids,
                 cache,
                 temperature,
-                allow_capture=_runtime_prefill_graph_capture_enabled(model, temperature, max_tokens=max_tokens),
+                allow_capture=self._batched_prefill_graph_capture_enabled(
+                    model,
+                    suffix_ids,
+                    cache,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                ),
             )
             ragged_decode = False
         else:
@@ -2775,6 +4956,22 @@ class OpenAICompletionEngine:
                 cache,
                 suffix_lengths,
                 temperature,
+                allow_capture=(
+                    _shared_prefix_suffix_bucket_selected_logits_capture_enabled(
+                        model,
+                        batch_size=len(prompt_rows),
+                        max_tokens=max_tokens,
+                        device=self.device,
+                    )
+                    and self._batched_prefill_graph_capture_enabled(
+                        model,
+                        suffix_ids,
+                        cache,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        selected_logits=True,
+                    )
+                ),
             )
             ragged_decode = True
         next_token = next_token.to(self.device)
@@ -2840,6 +5037,7 @@ class OpenAICompletionEngine:
             prefix_tokens,
             model=model,
         )
+        prefix_profile_start_s = self._stream_group_profile_start_s()
         prefix_ids = torch.tensor([length_groups[0][0][1][:prefix_tokens]], dtype=torch.long, device=self.device)
         restored_prefix_tokens = self._restore_exact_prefix_cache(prefix_ids, prefix_cache)
         restored_prefix = restored_prefix_tokens == prefix_tokens
@@ -2855,6 +5053,9 @@ class OpenAICompletionEngine:
             )
             self._save_prompt_prefix_cache(prefix_ids, prefix_cache)
         _mark_generation_cache_prefix(prefix_cache, _tensor_row_tokens(prefix_ids))
+        _set_generation_cache_seq_len(prefix_cache, prefix_tokens)
+        self._add_stream_group_profile_elapsed("shared_prefix_restore_ms", prefix_profile_start_s)
+        self._add_stream_group_profile_extra(shared_prefix_restored=bool(restored_prefix))
 
         prefer_dense_group_decode = _prefer_shared_prefix_dense_group_decode(
             length_groups,
@@ -2868,6 +5069,7 @@ class OpenAICompletionEngine:
                 length_groups,
                 prefix_tokens=prefix_tokens,
                 prompt_lengths=prompt_lengths,
+                max_tokens=max_tokens,
             )
         )
         use_padded_suffix_prefill = prefer_padded_suffix_prefill
@@ -2878,6 +5080,8 @@ class OpenAICompletionEngine:
                 self.device,
             )
         if use_padded_suffix_prefill:
+            self._add_stream_group_profile_extra(prompt_list_path="padded_suffix")
+            prefill_profile_start_s = self._stream_group_profile_start_s()
             padded_state = self._prefill_shared_prefix_prompt_list_padded_suffixes(
                 prompts,
                 prefix_cache=prefix_cache,
@@ -2886,6 +5090,10 @@ class OpenAICompletionEngine:
                 temperature=temperature,
                 row_max_tokens=per_row_limits,
                 model=model,
+            )
+            self._add_stream_group_profile_elapsed(
+                "shared_prefix_padded_suffix_prefill_ms",
+                prefill_profile_start_s,
             )
             if padded_state is not None:
                 combined_cache, first_tokens, active = padded_state
@@ -2927,8 +5135,13 @@ class OpenAICompletionEngine:
             if not same_buckets:
                 suffix_buckets = []
         if suffix_buckets:
+            self._add_stream_group_profile_extra(
+                prompt_list_path="suffix_buckets",
+                suffix_bucket_count=len(suffix_buckets),
+            )
             bucket_states: list[dict[str, object]] = []
             first_tokens: list[int | None] = [None for _ in prompts]
+            prefill_profile_start_s = self._stream_group_profile_start_s()
             for slot, bucket in enumerate(suffix_buckets):
                 state = self._prefill_shared_prefix_prompt_list_suffix_bucket(
                     bucket,
@@ -2951,6 +5164,10 @@ class OpenAICompletionEngine:
                 for offset, token_id in enumerate(next_token.detach().cpu().tolist()):
                     first_tokens[int(original_indices[offset])] = int(token_id)
                 bucket_states.append(state)
+            self._add_stream_group_profile_elapsed(
+                "shared_prefix_suffix_bucket_prefill_ms",
+                prefill_profile_start_s,
+            )
             if bucket_states:
                 yield first_tokens
                 for state in bucket_states:
@@ -2964,12 +5181,17 @@ class OpenAICompletionEngine:
                 )
                 should_continue = _sync_tensor_parallel_continue(model, should_continue, self.device)
                 if should_continue:
+                    ragged_cache_profile_start_s = self._stream_group_profile_start_s()
                     combined_cache = self._shared_prefix_prompt_list_ragged_cache(
                         bucket_states,
                         prompt_lengths=prompt_lengths,
                         prompt_count=len(prompts),
                         max_tokens=max_tokens,
                         model=model,
+                    )
+                    self._add_stream_group_profile_elapsed(
+                        "shared_prefix_ragged_cache_ms",
+                        ragged_cache_profile_start_s,
                     )
                     use_combined_cache = combined_cache is not None
                     if tensor_parallel:
@@ -3004,7 +5226,12 @@ class OpenAICompletionEngine:
                 return
 
         states: list[dict[str, object]] = []
+        self._add_stream_group_profile_extra(
+            prompt_list_path="length_groups",
+            length_group_count=len(length_groups),
+        )
         first_tokens: list[int | None] = [None for _ in prompts]
+        prefill_profile_start_s = self._stream_group_profile_start_s()
         for slot, same_length in enumerate(length_groups):
             state = self._prefill_shared_prefix_prompt_list_suffix_bucket(
                 same_length,
@@ -3032,6 +5259,10 @@ class OpenAICompletionEngine:
                 token_id = int(token_id)
                 first_tokens[original_indices[offset]] = token_id
             states.append(state)
+        self._add_stream_group_profile_elapsed(
+            "shared_prefix_length_group_prefill_ms",
+            prefill_profile_start_s,
+        )
         yield first_tokens
         for state in states:
             cache = state["cache"]
@@ -3047,12 +5278,17 @@ class OpenAICompletionEngine:
             return
 
         if _shared_prefix_ragged_cache_enabled_for_model(model) and not prefer_dense_group_decode:
+            ragged_cache_profile_start_s = self._stream_group_profile_start_s()
             combined_cache = self._shared_prefix_prompt_list_ragged_cache(
                 states,
                 prompt_lengths=prompt_lengths,
                 prompt_count=len(prompts),
                 max_tokens=max_tokens,
                 model=model,
+            )
+            self._add_stream_group_profile_elapsed(
+                "shared_prefix_ragged_cache_ms",
+                ragged_cache_profile_start_s,
             )
             use_combined_cache = combined_cache is not None
             if _is_tensor_parallel_model(model) and _tensor_parallel_world_size(model) > 1:
@@ -3121,7 +5357,13 @@ class OpenAICompletionEngine:
                 suffix_ids,
                 cache,
                 temperature,
-                allow_capture=_runtime_prefill_graph_capture_enabled(model, temperature, max_tokens=max_tokens),
+                allow_capture=self._batched_prefill_graph_capture_enabled(
+                    model,
+                    suffix_ids,
+                    cache,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                ),
             )
             ragged_decode = False
         else:
@@ -3133,6 +5375,14 @@ class OpenAICompletionEngine:
                 cache,
                 suffix_lengths,
                 temperature,
+                allow_capture=self._batched_prefill_graph_capture_enabled(
+                    model,
+                    suffix_ids,
+                    cache,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    selected_logits=True,
+                ),
             )
             ragged_decode = True
         next_token = next_token.to(self.device)
@@ -3237,6 +5487,1738 @@ class OpenAICompletionEngine:
                 break
             yield step_tokens
 
+    def _prefill_shared_prefix_prompt_list_padded_suffix_rows(
+        self,
+        prompts: Sequence[Sequence[int]],
+        *,
+        prefix_cache: object,
+        target_cache: object,
+        target_rows: Sequence[int],
+        prefix_tokens: int,
+        max_tokens: int,
+        temperature: float,
+        row_max_tokens: Sequence[int],
+        model: object,
+    ) -> tuple[list[int | None], list[bool]] | None:
+        prompt_count = len(prompts)
+        if prompt_count <= 0 or len(target_rows) != prompt_count:
+            return None
+        if len(row_max_tokens) != prompt_count:
+            return None
+        suffix_rows = [list(prompt[prefix_tokens:]) for prompt in prompts]
+        if any(not suffix for suffix in suffix_rows):
+            return None
+        prefix_seq_len = _cache_row_seq_len(prefix_cache, 0)
+        if prefix_tokens <= 0 or prefix_seq_len < prefix_tokens:
+            return None
+        copy_prefix = getattr(target_cache, "copy_prefix_from", None)
+        for_rows = getattr(target_cache, "for_rows", None)
+        if not callable(copy_prefix) or not callable(for_rows):
+            return None
+        try:
+            if not _copy_generation_cache_first_row_to_rows(prefix_cache, target_cache, target_rows, prefix_tokens):
+                for target_row in target_rows:
+                    copy_prefix(prefix_cache, prefix_tokens, source_row=0, dest_row=int(target_row))
+            cache_view = for_rows(tuple(int(row) for row in target_rows))
+        except Exception as exc:
+            warn_optional_failure("openai.shared_prefix_padded_suffix_row_cache", exc)
+            return None
+
+        suffix_lengths = [len(suffix) for suffix in suffix_rows]
+        pad_token_id = _tokenizer_padding_token_id(getattr(self, "tokenizer", None))
+        suffix_ids = _padded_token_rows_tensor(suffix_rows, self.device, pad_token_id)
+        next_token, _cache_view = _prefill_padded_suffix_next_token(
+            model,
+            suffix_ids,
+            cache_view,
+            suffix_lengths,
+            temperature,
+            allow_capture=self._batched_prefill_graph_capture_enabled(
+                model,
+                suffix_ids,
+                cache_view,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                selected_logits=True,
+            ),
+        )
+        try:
+            _set_generation_cache_rows_seq_lens(
+                cache_view,
+                range(prompt_count),
+                [prefix_tokens + length for length in suffix_lengths],
+            )
+        except Exception as exc:
+            warn_optional_failure("openai.shared_prefix_padded_suffix_row_lengths", exc)
+            return None
+        next_token = next_token.to(self.device)
+        stop_token_ids = self.stop_token_ids
+        first_tokens: list[int | None] = []
+        active: list[bool] = []
+        for row, token_id in enumerate(next_token[:prompt_count].detach().cpu().tolist()):
+            if row_max_tokens[row] <= 0:
+                first_tokens.append(None)
+                active.append(False)
+                continue
+            token = int(token_id)
+            first_tokens.append(token)
+            active.append(token not in stop_token_ids and row_max_tokens[row] > 1)
+        return first_tokens, active
+
+    def _prefill_persistent_prompt_list_payload_groups(
+        self,
+        payload: Mapping[str, object],
+        *,
+        target_cache: object,
+        prefix_caches: Mapping[tuple[int, ...], object],
+        model: object,
+        temperature: float,
+    ) -> dict[str, tuple[int | None, bool]]:
+        prefill_items = payload.get("prefill", [])
+        prefill_groups = payload.get("prefill_groups", [])
+        if not isinstance(prefill_items, list) or not isinstance(prefill_groups, list):
+            raise ValueError("persistent prompt-list payload requires prefill lists")
+        item_by_id: dict[str, Mapping[str, object]] = {}
+        for item in prefill_items:
+            if not isinstance(item, Mapping):
+                raise ValueError("persistent prompt-list prefill entries must be mappings")
+            request_id = item.get("request_id")
+            if request_id is None:
+                raise ValueError("persistent prompt-list prefill entry requires request_id")
+            item_by_id[str(request_id)] = item
+
+        results: dict[str, tuple[int | None, bool]] = {}
+        for group in prefill_groups:
+            if not isinstance(group, Mapping):
+                raise ValueError("persistent prompt-list prefill groups must be mappings")
+            request_id_values = group.get("request_ids", [])
+            if not isinstance(request_id_values, list):
+                raise ValueError("persistent prompt-list prefill group request_ids must be a list")
+            request_ids = [str(request_id) for request_id in request_id_values]
+            prefix_values = group.get("prefix", [])
+            if not isinstance(prefix_values, list):
+                raise ValueError("persistent prompt-list prefill group prefix must be a list")
+            prefix = tuple(int(token_id) for token_id in prefix_values)
+            prefix_cache = prefix_caches.get(prefix)
+            if prefix_cache is None:
+                raise RuntimeError("missing persistent prompt-list prefix cache")
+            prefix_tokens = int(group.get("prefix_hit_tokens", len(prefix)))
+            prompts: list[list[int]] = []
+            target_rows: list[int] = []
+            row_max_tokens: list[int] = []
+            for request_id in request_ids:
+                item = item_by_id.get(request_id)
+                if item is None:
+                    raise ValueError(f"missing prefill entry for request {request_id}")
+                prompt = item.get("prompt", [])
+                if not isinstance(prompt, list):
+                    raise ValueError("persistent prompt-list prefill prompt must be a list")
+                prompts.append([int(token_id) for token_id in prompt])
+                target_rows.append(int(item["row"]))
+                row_max_tokens.append(int(item["max_tokens"]))
+            prefill_result = self._prefill_shared_prefix_prompt_list_padded_suffix_rows(
+                prompts,
+                prefix_cache=prefix_cache,
+                target_cache=target_cache,
+                target_rows=target_rows,
+                prefix_tokens=prefix_tokens,
+                max_tokens=max(row_max_tokens, default=0),
+                temperature=temperature,
+                row_max_tokens=row_max_tokens,
+                model=model,
+            )
+            if prefill_result is None:
+                raise RuntimeError("persistent prompt-list row-targeted prefill failed")
+            first_tokens, active_flags = prefill_result
+            for request_id, token_id, active in zip(request_ids, first_tokens, active_flags):
+                results[request_id] = (token_id, active)
+        return results
+
+    def _execute_persistent_prompt_list_prefill_item(
+        self,
+        item: Mapping[str, object],
+        state: _PersistentPromptListStepState,
+        *,
+        temperature: float,
+    ) -> tuple[int | None, bool]:
+        request_id = item.get("request_id")
+        if request_id is None:
+            raise ValueError("persistent prompt-list prefill entry requires request_id")
+        row = int(item["row"])
+        if row < 0 or row >= state.cache_batch_size:
+            raise ValueError("persistent prompt-list prefill row is out of range")
+        prompt_obj = item.get("prompt", [])
+        if not isinstance(prompt_obj, list):
+            raise ValueError("persistent prompt-list prefill prompt must be a list")
+        prompt = [int(token_id) for token_id in prompt_obj]
+        start_token = int(item.get("start_token", item.get("prefix_hit_tokens", 0)))
+        prefill_tokens = int(item.get("prefill_tokens", max(1, len(prompt) - start_token)))
+        if start_token < 0 or prefill_tokens < 1 or start_token + prefill_tokens > len(prompt):
+            raise ValueError("persistent prompt-list prefill chunk is outside the prompt")
+        request_id_text = str(request_id)
+        current_request_id = state.row_request_ids[row]
+        if current_request_id is None:
+            if start_token > 0:
+                prefix_values = item.get("prefix", prompt[:start_token])
+                if not isinstance(prefix_values, list):
+                    raise ValueError("persistent prompt-list prefill prefix must be a list")
+                prefix = tuple(int(token_id) for token_id in prefix_values)
+                if len(prefix) != start_token:
+                    raise ValueError("persistent prompt-list prefill prefix length mismatch")
+                prefix_cache = state.prefix_caches.get(prefix)
+                if prefix_cache is None:
+                    raise RuntimeError("missing persistent prompt-list prefix cache")
+                _copy_generation_cache_row(
+                    prefix_cache,
+                    state.cache,
+                    source_row=0,
+                    target_row=row,
+                    seq_len=start_token,
+                )
+            state.row_request_ids[row] = request_id_text
+            state.active[row] = False
+            state.per_row_limits[row] = int(item.get("max_tokens", 0))
+            state.generated_tokens[row] = 0
+            state.seq_lens[row] = start_token
+            state.next_token_tensor[row] = 0
+        elif current_request_id != request_id_text:
+            raise ValueError("persistent prompt-list prefill row is occupied by another request")
+        if int(state.seq_lens[row].item()) != start_token:
+            raise ValueError("persistent prompt-list prefill start_token does not match row state")
+
+        prompt_chunk = prompt[start_token : start_token + prefill_tokens]
+        cache_view = _cache_row_slice(state.cache, row, row + 1)
+        if cache_view is None:
+            raise RuntimeError("persistent prompt-list prefill requires row-view cache")
+        input_ids = torch.tensor([prompt_chunk], dtype=torch.long, device=self.device)
+        logits, _cache_view = _forward(self.model, input_ids, cache_view)
+        state.seq_lens[row] = start_token + prefill_tokens
+        prompt_complete = bool(item.get("prompt_complete", True))
+        emits_token = bool(item.get("emits_token", prompt_complete))
+        if not prompt_complete or not emits_token:
+            return None, False
+
+        next_token = _sample(self.model, logits[:, -1, :], temperature).to(self.device)
+        token_id = int(next_token.item())
+        state.generated_tokens[row] = 1
+        state.next_token_tensor[row] = token_id
+        state.per_row_limits[row] = int(item.get("max_tokens", state.per_row_limits[row]))
+        active = token_id not in self.stop_token_ids and state.per_row_limits[row] > 1
+        state.active[row] = active
+        if not active:
+            state.row_request_ids[row] = None
+        return token_id, active
+
+    def _execute_persistent_prompt_list_step_payload(
+        self,
+        payload: Mapping[str, object],
+        state: _PersistentPromptListStepState,
+        *,
+        temperature: float,
+        static_graph_buckets: bool = False,
+    ) -> _PersistentPromptListStepResult:
+        decode_rows_obj = payload.get("decode_rows", [])
+        decode_ids_obj = payload.get("decode_request_ids", [])
+        if not isinstance(decode_rows_obj, list) or not isinstance(decode_ids_obj, list):
+            raise ValueError("persistent prompt-list decode rows and ids must be lists")
+        decode_rows = [int(row) for row in decode_rows_obj]
+        decode_request_ids = [str(request_id) for request_id in decode_ids_obj]
+        if len(decode_rows) != len(decode_request_ids):
+            raise ValueError("persistent prompt-list decode rows and ids length mismatch")
+        if decode_rows:
+            active_rows = [row for row, is_active in enumerate(state.active) if is_active]
+            if decode_rows != active_rows:
+                raise ValueError("persistent prompt-list decode rows do not match active state")
+
+        decode_tokens: dict[str, int | None] = {}
+        finished_request_ids: list[str] = []
+        if decode_rows:
+            _set_shared_prefix_ragged_static_graph_bucket_mode(
+                self.model,
+                state.cache,
+                static_graph_buckets=static_graph_buckets,
+            )
+            self._ensure_persistent_prompt_list_ephemeral_graph_scope(
+                state,
+                step=int(payload.get("step", 0)),
+            )
+            step_result = self._decode_shared_prefix_prompt_list_ragged_step(
+                cache=state.cache,
+                active=state.active,
+                per_row_limits=state.per_row_limits,
+                generated_tokens=state.generated_tokens,
+                seq_lens=state.seq_lens,
+                next_token_tensor=state.next_token_tensor,
+                step=int(payload.get("step", 0)),
+                cache_batch_size=(
+                    state.cache_batch_size
+                    if static_graph_buckets
+                    else max(
+                        max(decode_rows, default=-1) + 1,
+                        state.logical_cache_batch_size,
+                    )
+                ),
+                temperature=temperature,
+                static_graph_buckets=static_graph_buckets,
+            )
+            if step_result is not None:
+                state.cache, step_tokens = step_result
+                for request_id, row in zip(decode_request_ids, decode_rows):
+                    token = step_tokens[row] if row < len(step_tokens) else None
+                    decode_tokens[request_id] = token
+                    if row < len(state.active) and not state.active[row]:
+                        state.row_request_ids[row] = None
+                        finished_request_ids.append(request_id)
+
+        prefill_tokens: dict[str, int | None] = {}
+        prefill_results = self._prefill_persistent_prompt_list_payload_groups(
+            payload,
+            target_cache=state.cache,
+            prefix_caches=state.prefix_caches,
+            model=self.model,
+            temperature=temperature,
+        )
+        prefill_items = payload.get("prefill", [])
+        if not isinstance(prefill_items, list):
+            raise ValueError("persistent prompt-list prefill entries must be a list")
+        for item in prefill_items:
+            if not isinstance(item, Mapping):
+                raise ValueError("persistent prompt-list prefill entry must be a mapping")
+            request_id = item.get("request_id")
+            if request_id is None:
+                raise ValueError("persistent prompt-list prefill entry requires request_id")
+            request_id_text = str(request_id)
+            row = int(item["row"])
+            if row < 0 or row >= len(state.active):
+                raise ValueError("persistent prompt-list prefill row is out of range")
+            state.logical_cache_batch_size = max(state.logical_cache_batch_size, row + 1)
+            prompt = item.get("prompt", [])
+            if not isinstance(prompt, list):
+                raise ValueError("persistent prompt-list prefill prompt must be a list")
+            if request_id_text in prefill_results:
+                token_id, active = prefill_results[request_id_text]
+            else:
+                token_id, active = self._execute_persistent_prompt_list_prefill_item(
+                    item,
+                    state,
+                    temperature=temperature,
+                )
+            prefill_tokens[request_id_text] = token_id
+            state.per_row_limits[row] = int(item["max_tokens"])
+            state.generated_tokens[row] = 0 if token_id is None else 1
+            if token_id is not None:
+                state.seq_lens[row] = len(prompt)
+            state.next_token_tensor[row] = 0 if token_id is None else int(token_id)
+            if token_id is not None:
+                state.active[row] = bool(active)
+                state.row_request_ids[row] = request_id_text if active else None
+            if token_id is not None and not active:
+                finished_request_ids.append(request_id_text)
+
+        explicit_finished = payload.get("finished_after_prefill", [])
+        if isinstance(explicit_finished, list):
+            for request_id in explicit_finished:
+                request_id_text = str(request_id)
+                if request_id_text not in finished_request_ids:
+                    finished_request_ids.append(request_id_text)
+        return _PersistentPromptListStepResult(
+            decode_tokens=decode_tokens,
+            prefill_tokens=prefill_tokens,
+            finished_request_ids=tuple(finished_request_ids),
+        )
+
+    def _handle_persistent_prompt_list_step_payload(
+        self,
+        payload: Mapping[str, object],
+    ) -> _PersistentPromptListStepResult:
+        state = self._persistent_prompt_list_step_state
+        if state is None:
+            raise RuntimeError("persistent prompt-list step state is not installed")
+        result = self._execute_persistent_prompt_list_step_payload(
+            payload,
+            state,
+            temperature=float(payload.get("temperature", 0.0)),
+            static_graph_buckets=bool(payload.get("static_graph_buckets", False)),
+        )
+        self._persistent_prompt_list_step_last_result = result
+        return result
+
+    def _execute_persistent_prompt_list_decode_run_payload(
+        self,
+        payload: Mapping[str, object],
+        state: _PersistentPromptListStepState,
+        *,
+        temperature: float,
+        static_graph_buckets: bool = False,
+    ) -> _PersistentPromptListDecodeRunResult:
+        step_count = int(payload.get("step_count", 0))
+        if step_count < 1:
+            raise ValueError("persistent prompt-list decode-run requires positive step_count")
+        start_step = int(payload.get("start_step", 0))
+        results: list[_PersistentPromptListStepResult] = []
+        for offset in range(step_count):
+            active_rows = [row for row, is_active in enumerate(state.active) if is_active]
+            if not active_rows:
+                break
+            decode_request_ids: list[str] = []
+            for row in active_rows:
+                request_id = state.row_request_ids[row]
+                if request_id is None:
+                    raise RuntimeError("persistent prompt-list active row is missing request id")
+                decode_request_ids.append(request_id)
+            step_payload = {
+                "op": "persistent_prompt_list_step",
+                "step": start_step + offset,
+                "decode_request_ids": decode_request_ids,
+                "decode_rows": active_rows,
+                "prefill": [],
+                "prefill_groups": [],
+                "finished_after_prefill": [],
+            }
+            results.append(
+                self._execute_persistent_prompt_list_step_payload(
+                    step_payload,
+                    state,
+                    temperature=temperature,
+                    static_graph_buckets=static_graph_buckets,
+                )
+            )
+        return _PersistentPromptListDecodeRunResult(step_results=tuple(results))
+
+    def _handle_persistent_prompt_list_decode_run_payload(
+        self,
+        payload: Mapping[str, object],
+    ) -> _PersistentPromptListDecodeRunResult:
+        state = self._persistent_prompt_list_step_state
+        if state is None:
+            raise RuntimeError("persistent prompt-list decode-run state is not installed")
+        result = self._execute_persistent_prompt_list_decode_run_payload(
+            payload,
+            state,
+            temperature=float(payload.get("temperature", 0.0)),
+            static_graph_buckets=bool(payload.get("static_graph_buckets", False)),
+        )
+        if result.step_results:
+            self._persistent_prompt_list_step_last_result = result.step_results[-1]
+        return result
+
+    def _start_persistent_prompt_list_step_state(
+        self,
+        *,
+        prefix: Sequence[int],
+        cache_batch_size: int,
+        max_seq_len: int,
+        temperature: float,
+        max_tokens: int | None = None,
+    ) -> _PersistentPromptListStepState:
+        prefix_tokens = tuple(int(token_id) for token_id in prefix)
+        if not prefix_tokens:
+            raise ValueError("persistent prompt-list state requires a non-empty prefix")
+        if cache_batch_size < 1:
+            raise ValueError("persistent prompt-list cache_batch_size must be positive")
+        if max_seq_len < len(prefix_tokens):
+            raise ValueError("persistent prompt-list max_seq_len must cover the prefix")
+        model = self.model
+        prefix_cache = self._generation_cache(
+            1,
+            len(prefix_tokens),
+            model=model,
+            pool=False,
+        )
+        prefix_ids = torch.tensor([list(prefix_tokens)], dtype=torch.long, device=self.device)
+        prefix_cache = _prefill_cache_only(
+            model,
+            prefix_ids,
+            prefix_cache,
+            allow_capture=_runtime_prefill_graph_capture_enabled(
+                model,
+                temperature,
+                max_tokens=max_seq_len - len(prefix_tokens),
+            ),
+        )
+        _mark_generation_cache_prefix(prefix_cache, prefix_tokens)
+        cache = self._generation_cache(
+            cache_batch_size,
+            max_seq_len,
+            model=model,
+            pool=False,
+            batch_capacity=cache_batch_size,
+        )
+        ragged_graph_tokens = max_tokens if max_tokens is not None else max_seq_len - len(prefix_tokens)
+        if _disable_tp_shared_prefix_ragged_decode_graph(model, max_tokens=ragged_graph_tokens):
+            _set_ragged_decode_graph_disabled(cache, True)
+        _set_runtime_ragged_decode_graph_capture(
+            cache,
+            _runtime_ragged_decode_graph_capture_allowed_for_request(
+                model,
+                max_tokens=ragged_graph_tokens,
+            ),
+        )
+        state = _PersistentPromptListStepState(
+            cache=cache,
+            prefix_caches={prefix_tokens: prefix_cache},
+            active=[False for _ in range(cache_batch_size)],
+            per_row_limits=[0 for _ in range(cache_batch_size)],
+            generated_tokens=[0 for _ in range(cache_batch_size)],
+            seq_lens=torch.zeros(cache_batch_size, dtype=torch.long, device=self.device),
+            next_token_tensor=torch.zeros(cache_batch_size, dtype=torch.long, device=self.device),
+            row_request_ids=[None for _ in range(cache_batch_size)],
+            cache_batch_size=cache_batch_size,
+            ephemeral_graph_allowed=(
+                getattr(cache, "_torchinferno_ephemeral_cache", False)
+                and env_flag("TORCHINFERNO_OPENAI_EPHEMERAL_RAGGED_CUDAGRAPH", True)
+            ),
+        )
+        self._persistent_prompt_list_step_state = state
+        self._persistent_prompt_list_step_last_result = None
+        return state
+
+    def _close_persistent_prompt_list_step_state(self) -> None:
+        state = self._persistent_prompt_list_step_state
+        if state is not None and state.ephemeral_graph_scope:
+            try:
+                setattr(state.cache, "_torchinferno_ephemeral_ragged_graph_scope", False)
+            except Exception:
+                pass
+            _release_decode_graphs_for_cache(self.model, state.cache)
+        self._persistent_prompt_list_step_state = None
+        self._persistent_prompt_list_step_last_result = None
+
+    def _ensure_persistent_prompt_list_ephemeral_graph_scope(
+        self,
+        state: _PersistentPromptListStepState,
+        *,
+        step: int,
+    ) -> None:
+        if state.ephemeral_graph_scope or not state.ephemeral_graph_allowed:
+            return
+        min_step = env_int(
+            "TORCHINFERNO_OPENAI_EPHEMERAL_RAGGED_CUDAGRAPH_MIN_STEP",
+            1,
+            minimum=1,
+        )
+        if step < min_step:
+            return
+        try:
+            setattr(state.cache, "_torchinferno_ephemeral_ragged_graph_scope", True)
+            state.ephemeral_graph_scope = True
+        except Exception:
+            state.ephemeral_graph_allowed = False
+
+    def _run_persistent_prompt_list_group_local(
+        self,
+        group: Sequence[_QueuedGeneration],
+        *,
+        max_active_rows: int,
+        prefill_token_budget: int | None = None,
+        prefix_tokens: int = 0,
+        decode_run_steps: int = 1,
+        static_graph_buckets: bool = False,
+        broadcast_tensor_parallel: bool = False,
+        sync_tensor_parallel: bool = False,
+        max_scheduler_steps: int | None = None,
+    ) -> _PersistentPromptListLocalRunStats:
+        if not group:
+            return _PersistentPromptListLocalRunStats(
+                scheduler_steps=0,
+                step_commands=0,
+                decode_run_commands=0,
+                empty_plans=0,
+                decode_steps=0,
+                max_decode_run_steps=0,
+                prefill_admissions=0,
+                emitted_tokens=0,
+                finished_events=0,
+                first_emit_s=None,
+                closed=True,
+            )
+        sync_tensor_parallel = bool(sync_tensor_parallel or broadcast_tensor_parallel)
+        if prefix_tokens <= 0:
+            raise ValueError("persistent prompt-list local runner requires a shared prefix")
+        prompts = [request.prompt for request in group]
+        prefix = tuple(int(token_id) for token_id in prompts[0][:prefix_tokens])
+        if len(prefix) != prefix_tokens or any(tuple(prompt[:prefix_tokens]) != prefix for prompt in prompts):
+            raise ValueError("persistent prompt-list local runner requires a common shared prefix")
+        scheduler = _persistent_prompt_list_scheduler_for_group(
+            group,
+            max_active_rows=max_active_rows,
+            prefill_token_budget=prefill_token_budget,
+            prefix_tokens=prefix_tokens,
+        )
+        max_seq_len = max((len(request.prompt) + request.max_tokens for request in group), default=prefix_tokens)
+        max_tokens = max((request.max_tokens for request in group), default=0)
+        started = False
+        if broadcast_tensor_parallel:
+            _broadcast_tensor_parallel_persistent_prompt_list_start(
+                self.model,
+                prefix=prefix,
+                cache_batch_size=max_active_rows,
+                max_seq_len=max_seq_len,
+                temperature=group[0].temperature,
+                max_tokens=max_tokens,
+            )
+            started = True
+        self._start_persistent_prompt_list_step_state(
+            prefix=prefix,
+            cache_batch_size=max_active_rows,
+            max_seq_len=max_seq_len,
+            temperature=group[0].temperature,
+            max_tokens=max_tokens,
+        )
+        if sync_tensor_parallel:
+            _sync_tensor_parallel_command(self.model, self.device)
+        finished_request_ids: tuple[str, ...] = ()
+        scheduler_steps = 0
+        step_commands = 0
+        decode_run_commands = 0
+        empty_plans = 0
+        decode_steps = 0
+        max_decode_run_size = 0
+        prefill_admissions = 0
+        emitted_tokens = 0
+        finished_events = 0
+        first_emit_s: float | None = None
+        stream_rows = _StreamRowState()
+        try:
+            while scheduler.has_work() or finished_request_ids:
+                plan = scheduler.step(finished_request_ids=finished_request_ids)
+                scheduler_steps += 1
+                finished_request_ids = ()
+                if max_scheduler_steps is not None and scheduler_steps > max_scheduler_steps:
+                    raise RuntimeError("persistent prompt-list local runner exceeded max_scheduler_steps")
+                if not plan.decode_request_ids and not plan.prefill_admissions:
+                    empty_plans += 1
+                    continue
+                if decode_run_steps > 1 and plan.decode_request_ids and not plan.prefill_admissions:
+                    payload = _persistent_prompt_list_decode_run_payload(
+                        start_step=plan.step,
+                        step_count=decode_run_steps,
+                        temperature=group[0].temperature,
+                        static_graph_buckets=static_graph_buckets,
+                    )
+                    if broadcast_tensor_parallel:
+                        _broadcast_tensor_parallel_persistent_prompt_list_decode_run(self.model, payload)
+                    result = self._handle_persistent_prompt_list_decode_run_payload(payload)
+                    if sync_tensor_parallel:
+                        _sync_tensor_parallel_command(self.model, self.device)
+                    emitted_finished_request_ids = self._stream_persistent_prompt_batch_decode_run_result(
+                        group,
+                        result,
+                        stream_rows=stream_rows,
+                    )
+                    decode_run_commands += 1
+                    max_decode_run_size = max(max_decode_run_size, len(result.step_results))
+                    decode_steps += len(result.step_results)
+                    new_tokens = sum(
+                        token is not None
+                        for step_result in result.step_results
+                        for token in (*step_result.decode_tokens.values(), *step_result.prefill_tokens.values())
+                    )
+                    if new_tokens and first_emit_s is None:
+                        first_emit_s = time.perf_counter()
+                    emitted_tokens += new_tokens
+                    finished_request_ids = _merge_token_budget_finished_ids(
+                        result.finished_request_ids,
+                        emitted_finished_request_ids,
+                    )
+                    finished_events += len(finished_request_ids)
+                    continue
+                payload = _persistent_prompt_list_step_payload(plan, group)
+                payload["temperature"] = float(group[0].temperature)
+                if static_graph_buckets:
+                    payload["static_graph_buckets"] = True
+                if broadcast_tensor_parallel:
+                    _broadcast_tensor_parallel_persistent_prompt_list_step(self.model, payload)
+                result = self._handle_persistent_prompt_list_step_payload(payload)
+                if sync_tensor_parallel:
+                    _sync_tensor_parallel_command(self.model, self.device)
+                emitted_finished_request_ids = self._stream_persistent_prompt_batch_step_result(
+                    group,
+                    result,
+                    payload=payload,
+                    stream_rows=stream_rows,
+                )
+                step_commands += 1
+                if plan.decode_request_ids:
+                    decode_steps += 1
+                prefill_admissions += len(plan.prefill_admissions)
+                new_tokens = sum(token is not None for token in result.decode_tokens.values())
+                new_tokens += sum(token is not None for token in result.prefill_tokens.values())
+                if new_tokens and first_emit_s is None:
+                    first_emit_s = time.perf_counter()
+                emitted_tokens += new_tokens
+                finished_request_ids = _merge_token_budget_finished_ids(
+                    result.finished_request_ids,
+                    emitted_finished_request_ids,
+                )
+                finished_events += len(finished_request_ids)
+        finally:
+            if broadcast_tensor_parallel and started:
+                _broadcast_tensor_parallel_persistent_prompt_list_close(self.model)
+                if sync_tensor_parallel:
+                    _sync_tensor_parallel_command(self.model, self.device)
+            self._close_persistent_prompt_list_step_state()
+        return _PersistentPromptListLocalRunStats(
+            scheduler_steps=scheduler_steps,
+            step_commands=step_commands,
+            decode_run_commands=decode_run_commands,
+            empty_plans=empty_plans,
+            decode_steps=decode_steps,
+            max_decode_run_steps=max_decode_run_size,
+            prefill_admissions=prefill_admissions,
+            emitted_tokens=emitted_tokens,
+            finished_events=finished_events,
+            first_emit_s=first_emit_s,
+            closed=self._persistent_prompt_list_step_state is None,
+        )
+
+    def _run_token_budget_prompt_list_group_local(
+        self,
+        group: Sequence[_QueuedGeneration],
+        *,
+        max_active_rows: int,
+        max_scheduled_tokens: int,
+        prefill_chunk_size: int | None = None,
+        prefix_tokens: int = 0,
+        decode_run_steps: int = 1,
+        static_graph_buckets: bool = False,
+        broadcast_tensor_parallel: bool = False,
+        sync_tensor_parallel: bool = False,
+        arrival_steps: Sequence[int] | None = None,
+        max_scheduler_steps: int | None = None,
+    ) -> _PersistentPromptListLocalRunStats:
+        if not group:
+            return _PersistentPromptListLocalRunStats(
+                scheduler_steps=0,
+                step_commands=0,
+                decode_run_commands=0,
+                empty_plans=0,
+                decode_steps=0,
+                max_decode_run_steps=0,
+                prefill_admissions=0,
+                emitted_tokens=0,
+                finished_events=0,
+                first_emit_s=None,
+                closed=True,
+            )
+        if prefix_tokens <= 0:
+            raise ValueError("token-budget prompt-list local runner requires a shared prefix")
+        sync_tensor_parallel = bool(sync_tensor_parallel or broadcast_tensor_parallel)
+        request_by_id = {str(index): request for index, request in enumerate(group)}
+        prompts = [request.prompt for request in group]
+        prefix = tuple(int(token_id) for token_id in prompts[0][:prefix_tokens])
+        if len(prefix) != prefix_tokens or any(tuple(prompt[:prefix_tokens]) != prefix for prompt in prompts):
+            raise ValueError("token-budget prompt-list local runner requires a common shared prefix")
+        scheduler = _token_budget_scheduler_for_group(
+            group,
+            max_active_rows=max_active_rows,
+            max_scheduled_tokens=max_scheduled_tokens,
+            prefill_chunk_size=prefill_chunk_size,
+            prefix_tokens=prefix_tokens,
+            arrival_steps=arrival_steps,
+        )
+        max_seq_len = max((len(request.prompt) + request.max_tokens for request in group), default=prefix_tokens)
+        max_tokens = max((request.max_tokens for request in group), default=0)
+        started = False
+        if broadcast_tensor_parallel:
+            _broadcast_tensor_parallel_persistent_prompt_list_start(
+                self.model,
+                prefix=prefix,
+                cache_batch_size=max_active_rows,
+                max_seq_len=max_seq_len,
+                temperature=group[0].temperature,
+                max_tokens=max_tokens,
+            )
+            started = True
+        self._start_persistent_prompt_list_step_state(
+            prefix=prefix,
+            cache_batch_size=max_active_rows,
+            max_seq_len=max_seq_len,
+            temperature=group[0].temperature,
+            max_tokens=max_tokens,
+        )
+        if sync_tensor_parallel:
+            _sync_tensor_parallel_command(self.model, self.device)
+        finished_request_ids: tuple[str, ...] = ()
+        pending_plan: _TokenBudgetPlan | None = None
+        scheduler_steps = 0
+        step_commands = 0
+        decode_run_commands = 0
+        empty_plans = 0
+        decode_steps = 0
+        max_decode_run_size = 0
+        prefill_admissions = 0
+        emitted_tokens = 0
+        finished_events = 0
+        first_emit_s: float | None = None
+        stream_rows = _StreamRowState()
+        try:
+            while scheduler.has_work() or finished_request_ids or pending_plan is not None:
+                if pending_plan is None:
+                    plan = scheduler.step(finished_request_ids=finished_request_ids)
+                    scheduler_steps += 1
+                else:
+                    plan = pending_plan
+                    pending_plan = None
+                finished_request_ids = ()
+                if max_scheduler_steps is not None and scheduler_steps > max_scheduler_steps:
+                    raise RuntimeError("token-budget prompt-list local runner exceeded max_scheduler_steps")
+                if not plan.chunks:
+                    empty_plans += 1
+                    continue
+                if decode_run_steps > 1 and _token_budget_plan_is_decode_only(plan):
+                    plans = [plan]
+                    while (
+                        len(plans) < decode_run_steps
+                        and not plans[-1].finished_request_ids
+                        and scheduler.has_work()
+                    ):
+                        next_plan = scheduler.step(finished_request_ids=())
+                        scheduler_steps += 1
+                        if max_scheduler_steps is not None and scheduler_steps > max_scheduler_steps:
+                            raise RuntimeError("token-budget prompt-list local runner exceeded max_scheduler_steps")
+                        if not next_plan.chunks:
+                            if next_plan.finished_request_ids:
+                                pending_plan = next_plan
+                                break
+                            empty_plans += 1
+                            continue
+                        if not _token_budget_plan_is_decode_only(next_plan):
+                            pending_plan = next_plan
+                            break
+                        plans.append(next_plan)
+                    payload = _persistent_prompt_list_decode_run_payload(
+                        start_step=plans[0].step,
+                        step_count=len(plans),
+                        temperature=group[0].temperature,
+                        static_graph_buckets=static_graph_buckets,
+                    )
+                    if broadcast_tensor_parallel:
+                        _broadcast_tensor_parallel_persistent_prompt_list_decode_run(self.model, payload)
+                    result = self._handle_persistent_prompt_list_decode_run_payload(payload)
+                    if sync_tensor_parallel:
+                        _sync_tensor_parallel_command(self.model, self.device)
+                    emitted_finished_request_ids = self._stream_persistent_prompt_batch_decode_run_result(
+                        group,
+                        result,
+                        stream_rows=stream_rows,
+                    )
+                    decode_run_commands += 1
+                    max_decode_run_size = max(max_decode_run_size, len(result.step_results))
+                    decode_steps += len(result.step_results)
+                    new_tokens = sum(
+                        token is not None
+                        for step_result in result.step_results
+                        for token in (*step_result.decode_tokens.values(), *step_result.prefill_tokens.values())
+                    )
+                    if new_tokens and first_emit_s is None:
+                        first_emit_s = time.perf_counter()
+                    emitted_tokens += new_tokens
+                    finished_request_ids = _merge_token_budget_finished_ids(
+                        result.finished_request_ids,
+                        emitted_finished_request_ids,
+                    )
+                    finished_events += len(finished_request_ids)
+                    continue
+                payload = _token_budget_prompt_list_step_payload(plan, request_by_id)
+                if payload is None:
+                    raise RuntimeError("token-budget prompt-list local runner requires prompt-complete prefix prefill chunks")
+                payload["temperature"] = float(group[0].temperature)
+                if static_graph_buckets:
+                    payload["static_graph_buckets"] = True
+                if broadcast_tensor_parallel:
+                    _broadcast_tensor_parallel_persistent_prompt_list_step(self.model, payload)
+                result = self._handle_persistent_prompt_list_step_payload(payload)
+                if sync_tensor_parallel:
+                    _sync_tensor_parallel_command(self.model, self.device)
+                emitted_finished_request_ids = self._stream_persistent_prompt_batch_step_result(
+                    group,
+                    result,
+                    payload=payload,
+                    stream_rows=stream_rows,
+                )
+                step_commands += 1
+                if payload.get("decode_request_ids"):
+                    decode_steps += 1
+                prefill_items = payload.get("prefill", [])
+                if isinstance(prefill_items, list):
+                    prefill_admissions += len(prefill_items)
+                new_tokens = sum(token is not None for token in result.decode_tokens.values())
+                new_tokens += sum(token is not None for token in result.prefill_tokens.values())
+                if new_tokens and first_emit_s is None:
+                    first_emit_s = time.perf_counter()
+                emitted_tokens += new_tokens
+                finished_request_ids = _merge_token_budget_finished_ids(
+                    result.finished_request_ids,
+                    emitted_finished_request_ids,
+                )
+                finished_events += len(finished_request_ids)
+        finally:
+            if broadcast_tensor_parallel and started:
+                _broadcast_tensor_parallel_persistent_prompt_list_close(self.model)
+                if sync_tensor_parallel:
+                    _sync_tensor_parallel_command(self.model, self.device)
+            self._close_persistent_prompt_list_step_state()
+        return _PersistentPromptListLocalRunStats(
+            scheduler_steps=scheduler_steps,
+            step_commands=step_commands,
+            decode_run_commands=decode_run_commands,
+            empty_plans=empty_plans,
+            decode_steps=decode_steps,
+            max_decode_run_steps=max_decode_run_size,
+            prefill_admissions=prefill_admissions,
+            emitted_tokens=emitted_tokens,
+            finished_events=finished_events,
+            first_emit_s=first_emit_s,
+            closed=self._persistent_prompt_list_step_state is None,
+        )
+
+    def _handle_token_budget_prompt_list_run_payload(
+        self,
+        payload: Mapping[str, object],
+    ) -> _PersistentPromptListLocalRunStats:
+        input_id_lists = payload.get("input_id_lists")
+        if not isinstance(input_id_lists, list):
+            raise ValueError("token-budget prompt-list run requires input_id_lists")
+        max_tokens = int(payload.get("max_tokens", 0))
+        row_max_tokens = _coerce_optional_int_sequence(payload.get("row_max_tokens"))
+        if row_max_tokens is None:
+            row_max_tokens = [max_tokens for _ in input_id_lists]
+        if len(row_max_tokens) != len(input_id_lists):
+            raise ValueError("token-budget prompt-list run row_max_tokens must match input_id_lists")
+        arrival_steps = _coerce_optional_int_sequence(payload.get("arrival_steps"))
+        if arrival_steps is None:
+            arrival_steps = [0 for _ in input_id_lists]
+        if len(arrival_steps) != len(input_id_lists):
+            raise ValueError("token-budget prompt-list run arrival_steps must match input_id_lists")
+        temperature = float(payload.get("temperature", 0.0))
+        responses: list[queue.SimpleQueue[object]] = [queue.SimpleQueue() for _ in input_id_lists]
+        group = [
+            _QueuedGeneration(
+                [int(token_id) for token_id in prompt],
+                int(row_max_tokens[index]),
+                temperature,
+                True,
+                responses[index],
+            )
+            for index, prompt in enumerate(input_id_lists)
+        ]
+        prefill_chunk_size_value = int(payload.get("prefill_chunk_size", 0) or 0)
+        return self._run_token_budget_prompt_list_group_local(
+            group,
+            max_active_rows=int(payload.get("max_active_rows", max(1, len(group)))),
+            max_scheduled_tokens=int(payload.get("max_scheduled_tokens", 8192)),
+            prefill_chunk_size=prefill_chunk_size_value if prefill_chunk_size_value > 0 else None,
+            prefix_tokens=int(payload.get("prefix_tokens", 0)),
+            decode_run_steps=int(payload.get("decode_run_steps", 1)),
+            static_graph_buckets=bool(payload.get("static_graph_buckets", False)),
+            broadcast_tensor_parallel=False,
+            sync_tensor_parallel=False,
+            arrival_steps=arrival_steps,
+        )
+
+    def _stream_persistent_prompt_batch_step_result(
+        self,
+        group: Sequence[_QueuedGeneration],
+        result: _PersistentPromptListStepResult,
+        *,
+        payload: Mapping[str, object] | None = None,
+        stream_rows: _StreamRowState | None = None,
+    ) -> tuple[str, ...]:
+        stop_token_ids = getattr(self, "stop_token_ids", frozenset())
+        finished_request_ids: list[str] = []
+        payload_rows = _persistent_prompt_list_payload_request_rows(payload)
+        for token_map in (result.decode_tokens, result.prefill_tokens):
+            for request_id, token_id in token_map.items():
+                if token_id is None:
+                    continue
+                request = group[int(request_id)]
+                if request.done:
+                    continue
+                if stream_rows is not None:
+                    row = payload_rows.get(str(request_id))
+                    if row is not None:
+                        stream_rows.admit(str(request_id), row, request)
+                    if stream_rows.emit(str(request_id), int(token_id), stop_token_ids=stop_token_ids):
+                        finished_request_ids.append(str(request_id))
+                    continue
+                if int(token_id) in stop_token_ids:
+                    _finish_stream_request(request)
+                    finished_request_ids.append(str(request_id))
+                    continue
+                request.responses.put(int(token_id))
+        for request_id in result.finished_request_ids:
+            request = group[int(request_id)]
+            if stream_rows is not None:
+                if stream_rows.finish(str(request_id)):
+                    finished_request_ids.append(str(request_id))
+                elif not request.done:
+                    _finish_stream_request(request)
+                    finished_request_ids.append(str(request_id))
+            elif not request.done:
+                _finish_stream_request(request)
+                finished_request_ids.append(str(request_id))
+        return _merge_token_budget_finished_ids(finished_request_ids)
+
+    def _stream_persistent_prompt_batch_decode_run_result(
+        self,
+        group: Sequence[_QueuedGeneration],
+        result: _PersistentPromptListDecodeRunResult,
+        *,
+        stream_rows: _StreamRowState | None = None,
+    ) -> tuple[str, ...]:
+        finished_request_ids: list[str] = []
+        for step_result in result.step_results:
+            finished_request_ids.extend(
+                self._stream_persistent_prompt_batch_step_result(
+                    group,
+                    step_result,
+                    stream_rows=stream_rows,
+                )
+            )
+        return _merge_token_budget_finished_ids(finished_request_ids)
+
+    def _start_token_budget_step_state(
+        self,
+        *,
+        cache_batch_size: int,
+        max_seq_len: int,
+        prefix: Sequence[int] = (),
+        temperature: float = 0.0,
+    ) -> _TokenBudgetStepState:
+        if cache_batch_size < 1:
+            raise ValueError("token-budget cache_batch_size must be positive")
+        if max_seq_len < 1:
+            raise ValueError("token-budget max_seq_len must be positive")
+        prefix_tokens = tuple(int(token_id) for token_id in prefix)
+        if prefix_tokens and max_seq_len < len(prefix_tokens):
+            raise ValueError("token-budget max_seq_len must cover the prefix")
+        prefix_caches: dict[tuple[int, ...], object] = {}
+        if prefix_tokens:
+            prefix_cache = self._generation_cache(
+                1,
+                len(prefix_tokens),
+                model=self.model,
+                pool=False,
+            )
+            prefix_ids = torch.tensor([list(prefix_tokens)], dtype=torch.long, device=self.device)
+            prefix_cache = _prefill_cache_only(
+                self.model,
+                prefix_ids,
+                prefix_cache,
+                allow_capture=_runtime_prefill_graph_capture_enabled(
+                    self.model,
+                    temperature,
+                    max_tokens=max_seq_len - len(prefix_tokens),
+                ),
+            )
+            _mark_generation_cache_prefix(prefix_cache, prefix_tokens)
+            prefix_caches[prefix_tokens] = prefix_cache
+        cache = self._generation_cache(
+            cache_batch_size,
+            max_seq_len,
+            model=self.model,
+            pool=False,
+            batch_capacity=cache_batch_size,
+        )
+        state = _TokenBudgetStepState(
+            cache=cache,
+            prefix_caches=prefix_caches,
+            active=[False for _ in range(cache_batch_size)],
+            row_request_ids=[None for _ in range(cache_batch_size)],
+            generated_tokens=[0 for _ in range(cache_batch_size)],
+            seq_lens=torch.zeros(cache_batch_size, dtype=torch.long, device=self.device),
+            next_token_tensor=torch.zeros(cache_batch_size, dtype=torch.long, device=self.device),
+            cache_batch_size=cache_batch_size,
+        )
+        self._token_budget_step_state = state
+        self._token_budget_step_last_result = None
+        return state
+
+    def _execute_token_budget_step_payload(
+        self,
+        payload: Mapping[str, object],
+        state: _TokenBudgetStepState,
+        *,
+        temperature: float,
+    ) -> _TokenBudgetStepResult:
+        chunks_obj = payload.get("chunks", [])
+        if not isinstance(chunks_obj, list):
+            raise ValueError("token-budget step payload requires chunk list")
+        decode_tokens: dict[str, int | None] = {}
+        prefill_tokens: dict[str, int | None] = {}
+        index = 0
+        while index < len(chunks_obj):
+            chunk = chunks_obj[index]
+            if not isinstance(chunk, Mapping):
+                raise ValueError("token-budget step chunk must be a mapping")
+            request_id = str(chunk.get("request_id"))
+            row = int(chunk["row"])
+            if row < 0 or row >= state.cache_batch_size:
+                raise ValueError("token-budget step row is out of range")
+            kind = str(chunk.get("kind"))
+            if kind == "decode":
+                decode_group: list[Mapping[str, object]] = [chunk]
+                index += 1
+                while index < len(chunks_obj):
+                    next_chunk = chunks_obj[index]
+                    if not isinstance(next_chunk, Mapping):
+                        raise ValueError("token-budget step chunk must be a mapping")
+                    if str(next_chunk.get("kind")) != "decode":
+                        break
+                    decode_group.append(next_chunk)
+                    index += 1
+                decode_tokens.update(
+                    self._execute_token_budget_decode_chunks(
+                        decode_group,
+                        state,
+                        temperature=temperature,
+                    )
+                )
+                continue
+            if kind == "prefill":
+                prefill_group: list[Mapping[str, object]] = [chunk]
+                index += 1
+                while index < len(chunks_obj):
+                    next_chunk = chunks_obj[index]
+                    if not isinstance(next_chunk, Mapping):
+                        raise ValueError("token-budget step chunk must be a mapping")
+                    if str(next_chunk.get("kind")) != "prefill":
+                        break
+                    prefill_group.append(next_chunk)
+                    index += 1
+                prefill_tokens.update(
+                    self._execute_token_budget_prefill_chunks(
+                        prefill_group,
+                        state,
+                        temperature=temperature,
+                    )
+                )
+                continue
+            raise ValueError(f"unsupported token-budget step chunk kind: {kind}")
+
+        finished_request_ids: list[str] = []
+        finished_obj = payload.get("finished_request_ids", [])
+        if isinstance(finished_obj, list):
+            for request_id_obj in finished_obj:
+                request_id = str(request_id_obj)
+                for row, row_request_id in enumerate(state.row_request_ids):
+                    if row_request_id != request_id:
+                        continue
+                    state.active[row] = False
+                    state.row_request_ids[row] = None
+                    state.generated_tokens[row] = 0
+                    finished_request_ids.append(request_id)
+                    break
+        return _TokenBudgetStepResult(
+            decode_tokens=decode_tokens,
+            prefill_tokens=prefill_tokens,
+            finished_request_ids=tuple(finished_request_ids),
+        )
+
+    def _execute_token_budget_prefill_chunks(
+        self,
+        chunks: Sequence[Mapping[str, object]],
+        state: _TokenBudgetStepState,
+        *,
+        temperature: float,
+    ) -> dict[str, int | None]:
+        tokens: dict[str, int | None] = {}
+        index = 0
+        while index < len(chunks):
+            chunk = chunks[index]
+            group_key = self._token_budget_prefill_group_key(chunk, state)
+            if group_key is None:
+                request_id = str(chunk.get("request_id"))
+                row = int(chunk["row"])
+                tokens[request_id] = self._execute_token_budget_prefill_chunk(
+                    chunk,
+                    state,
+                    request_id=request_id,
+                    row=row,
+                    temperature=temperature,
+                )
+                index += 1
+                continue
+            group: list[Mapping[str, object]] = [chunk]
+            index += 1
+            while index < len(chunks):
+                next_chunk = chunks[index]
+                if self._token_budget_prefill_group_key(next_chunk, state) != group_key:
+                    break
+                group.append(next_chunk)
+                index += 1
+            if len(group) == 1:
+                request_id = str(chunk.get("request_id"))
+                row = int(chunk["row"])
+                tokens[request_id] = self._execute_token_budget_prefill_chunk(
+                    chunk,
+                    state,
+                    request_id=request_id,
+                    row=row,
+                    temperature=temperature,
+                )
+                continue
+            grouped_tokens = self._execute_token_budget_shared_prefix_prefill_group(
+                group,
+                state,
+                prefix=group_key,
+                temperature=temperature,
+            )
+            if grouped_tokens is None:
+                for item in group:
+                    request_id = str(item.get("request_id"))
+                    row = int(item["row"])
+                    tokens[request_id] = self._execute_token_budget_prefill_chunk(
+                        item,
+                        state,
+                        request_id=request_id,
+                        row=row,
+                        temperature=temperature,
+                    )
+                continue
+            tokens.update(grouped_tokens)
+        return tokens
+
+    def _token_budget_prefill_group_key(
+        self,
+        chunk: Mapping[str, object],
+        state: _TokenBudgetStepState,
+    ) -> tuple[int, ...] | None:
+        if str(chunk.get("kind")) != "prefill":
+            return None
+        if not bool(chunk.get("prompt_complete", False)) or not bool(chunk.get("emits_token", False)):
+            return None
+        start_token = int(chunk["start_token"])
+        if start_token <= 0:
+            return None
+        row = int(chunk["row"])
+        if row < 0 or row >= state.cache_batch_size or state.row_request_ids[row] is not None:
+            return None
+        prompt_tokens = int(chunk.get("prompt_tokens", 0))
+        token_count = int(chunk["token_count"])
+        if token_count != prompt_tokens - start_token:
+            return None
+        prompt_chunk_obj = chunk.get("prompt_chunk", [])
+        if not isinstance(prompt_chunk_obj, list) or len(prompt_chunk_obj) != token_count:
+            return None
+        prefix_obj = chunk.get("prefix")
+        if prefix_obj is None:
+            matches = [prefix for prefix in state.prefix_caches if len(prefix) == start_token]
+            if len(matches) != 1:
+                return None
+            prefix = matches[0]
+        elif isinstance(prefix_obj, list):
+            prefix = tuple(int(token_id) for token_id in prefix_obj)
+        else:
+            return None
+        if len(prefix) != start_token or prefix not in state.prefix_caches:
+            return None
+        return prefix
+
+    def _execute_token_budget_shared_prefix_prefill_group(
+        self,
+        chunks: Sequence[Mapping[str, object]],
+        state: _TokenBudgetStepState,
+        *,
+        prefix: tuple[int, ...],
+        temperature: float,
+    ) -> dict[str, int | None] | None:
+        prefix_cache = state.prefix_caches.get(prefix)
+        if prefix_cache is None:
+            return None
+        request_ids: list[str] = []
+        prompts: list[list[int]] = []
+        target_rows: list[int] = []
+        row_max_tokens: list[int] = []
+        for chunk in chunks:
+            request_id = str(chunk.get("request_id"))
+            row = int(chunk["row"])
+            prompt_chunk_obj = chunk.get("prompt_chunk", [])
+            if not isinstance(prompt_chunk_obj, list):
+                return None
+            prompt_chunk = [int(token_id) for token_id in prompt_chunk_obj]
+            request_ids.append(request_id)
+            prompts.append([*prefix, *prompt_chunk])
+            target_rows.append(row)
+            row_max_tokens.append(int(chunk.get("max_tokens", 0)))
+        prefill_result = self._prefill_shared_prefix_prompt_list_padded_suffix_rows(
+            prompts,
+            prefix_cache=prefix_cache,
+            target_cache=state.cache,
+            target_rows=target_rows,
+            prefix_tokens=len(prefix),
+            max_tokens=max(row_max_tokens, default=0),
+            temperature=temperature,
+            row_max_tokens=row_max_tokens,
+            model=self.model,
+        )
+        if prefill_result is None:
+            return None
+        first_tokens, active_flags = prefill_result
+        tokens: dict[str, int | None] = {}
+        for request_id, prompt, row, max_tokens, token_id, active in zip(
+            request_ids,
+            prompts,
+            target_rows,
+            row_max_tokens,
+            first_tokens,
+            active_flags,
+        ):
+            tokens[request_id] = token_id
+            state.generated_tokens[row] = 0 if token_id is None else 1
+            state.seq_lens[row] = len(prompt)
+            state.next_token_tensor[row] = 0 if token_id is None else int(token_id)
+            state.active[row] = bool(active)
+            state.row_request_ids[row] = request_id if max_tokens > 0 else None
+        return tokens
+
+    def _execute_token_budget_prefill_chunk(
+        self,
+        chunk: Mapping[str, object],
+        state: _TokenBudgetStepState,
+        *,
+        request_id: str,
+        row: int,
+        temperature: float,
+    ) -> int | None:
+        prompt_chunk_obj = chunk.get("prompt_chunk", [])
+        if not isinstance(prompt_chunk_obj, list):
+            raise ValueError("token-budget prefill chunk requires prompt_chunk")
+        prompt_chunk = [int(token_id) for token_id in prompt_chunk_obj]
+        start_token = int(chunk["start_token"])
+        token_count = int(chunk["token_count"])
+        if token_count != len(prompt_chunk):
+            raise ValueError("token-budget prefill token_count must match prompt_chunk")
+        current_request_id = state.row_request_ids[row]
+        if current_request_id is None:
+            if start_token > 0:
+                self._copy_token_budget_prefix_for_chunk(chunk, state, row=row, prefix_tokens=start_token)
+            state.row_request_ids[row] = request_id
+            state.active[row] = True
+            state.generated_tokens[row] = 0
+            state.seq_lens[row] = start_token
+        elif current_request_id != request_id:
+            raise ValueError("token-budget prefill row is occupied by another request")
+        if int(state.seq_lens[row].item()) != start_token:
+            raise ValueError("token-budget prefill start_token does not match row state")
+        if token_count <= 0:
+            raise ValueError("token-budget prefill chunk must contain tokens")
+        cache_view = _cache_row_slice(state.cache, row, row + 1)
+        if cache_view is None:
+            raise RuntimeError("token-budget prefill requires row-view cache")
+        input_ids = torch.tensor([prompt_chunk], dtype=torch.long, device=self.device)
+        logits, _cache_view = _forward(self.model, input_ids, cache_view)
+        state.seq_lens[row] = start_token + token_count
+        if not bool(chunk.get("prompt_complete", False)):
+            return None
+        if not bool(chunk.get("emits_token", False)):
+            return None
+        next_token = _sample(self.model, logits[:, -1, :], temperature).to(self.device)
+        token_id = int(next_token.item())
+        state.next_token_tensor[row] = token_id
+        state.generated_tokens[row] += 1
+        return token_id
+
+    def _copy_token_budget_prefix_for_chunk(
+        self,
+        chunk: Mapping[str, object],
+        state: _TokenBudgetStepState,
+        *,
+        row: int,
+        prefix_tokens: int,
+    ) -> None:
+        prefix_obj = chunk.get("prefix")
+        if prefix_obj is None:
+            matches = [prefix for prefix in state.prefix_caches if len(prefix) == prefix_tokens]
+            if len(matches) != 1:
+                raise RuntimeError("token-budget prefix prefill requires a unique installed prefix")
+            prefix = matches[0]
+        else:
+            if not isinstance(prefix_obj, list):
+                raise ValueError("token-budget prefix prefill requires prefix tokens")
+            prefix = tuple(int(token_id) for token_id in prefix_obj)
+        if len(prefix) != prefix_tokens:
+            raise ValueError("token-budget prefix length does not match start_token")
+        prefix_cache = state.prefix_caches.get(prefix)
+        if prefix_cache is None:
+            raise RuntimeError("missing token-budget prefix cache")
+        _copy_generation_cache_row(
+            prefix_cache,
+            state.cache,
+            source_row=0,
+            target_row=row,
+            seq_len=prefix_tokens,
+        )
+
+    def _execute_token_budget_decode_chunks(
+        self,
+        chunks: Sequence[Mapping[str, object]],
+        state: _TokenBudgetStepState,
+        *,
+        temperature: float,
+    ) -> dict[str, int | None]:
+        if not chunks:
+            return {}
+        if len(chunks) == 1 or not callable(getattr(self.model, "decode_ragged_logits", None)):
+            tokens: dict[str, int | None] = {}
+            for chunk in chunks:
+                request_id = str(chunk.get("request_id"))
+                row = int(chunk["row"])
+                tokens[request_id] = self._execute_token_budget_decode_chunk(
+                    chunk,
+                    state,
+                    request_id=request_id,
+                    row=row,
+                    temperature=temperature,
+                )
+            return tokens
+
+        request_ids: list[str] = []
+        rows: list[int] = []
+        input_tokens: list[int] = []
+        for chunk in chunks:
+            request_id = str(chunk.get("request_id"))
+            row = int(chunk["row"])
+            if row < 0 or row >= state.cache_batch_size:
+                raise ValueError("token-budget decode row is out of range")
+            if state.row_request_ids[row] != request_id or not state.active[row]:
+                raise ValueError("token-budget decode requires an active matching row")
+            if int(chunk["token_count"]) != 1:
+                raise ValueError("token-budget decode chunk must contain one token")
+            request_ids.append(request_id)
+            rows.append(row)
+            input_tokens.append(int(state.next_token_tensor[row].item()))
+
+        input_ids = torch.tensor([[token_id] for token_id in input_tokens], dtype=torch.long, device=self.device)
+        row_indices = torch.tensor(rows, dtype=torch.long, device=self.device)
+        next_tokens, _cache = _decode_next_token_ragged(
+            self.model,
+            input_ids,
+            state.cache,
+            state.seq_lens,
+            row_indices,
+            temperature,
+        )
+        token_values = [int(token_id) for token_id in next_tokens.detach().cpu().tolist()]
+        result: dict[str, int | None] = {}
+        for request_id, row, token_id in zip(request_ids, rows, token_values):
+            state.next_token_tensor[row] = token_id
+            state.generated_tokens[row] += 1
+            state.seq_lens[row] = int(state.seq_lens[row].item()) + 1
+            result[request_id] = token_id
+        return result
+
+    def _execute_token_budget_decode_chunk(
+        self,
+        chunk: Mapping[str, object],
+        state: _TokenBudgetStepState,
+        *,
+        request_id: str,
+        row: int,
+        temperature: float,
+    ) -> int | None:
+        if state.row_request_ids[row] != request_id or not state.active[row]:
+            raise ValueError("token-budget decode requires an active matching row")
+        if int(chunk["token_count"]) != 1:
+            raise ValueError("token-budget decode chunk must contain one token")
+        cache_view = _cache_row_slice(state.cache, row, row + 1)
+        if cache_view is None:
+            raise RuntimeError("token-budget decode requires row-view cache")
+        input_ids = state.next_token_tensor[row : row + 1].view(1, 1)
+        next_token, _cache_view = _decode_next_token(self.model, input_ids, cache_view, temperature)
+        token_id = int(next_token.item())
+        state.next_token_tensor[row] = token_id
+        state.generated_tokens[row] += 1
+        state.seq_lens[row] = int(state.seq_lens[row].item()) + 1
+        return token_id
+
+    def _handle_token_budget_start_payload(self, payload: Mapping[str, object]) -> _TokenBudgetStepState:
+        prefix_obj = payload.get("prefix", [])
+        if not isinstance(prefix_obj, list):
+            raise ValueError("token-budget start prefix must be a list")
+        state = self._start_token_budget_step_state(
+            cache_batch_size=int(payload["max_active_rows"]),
+            max_seq_len=int(payload["max_seq_len"]),
+            prefix=[int(token_id) for token_id in prefix_obj],
+            temperature=float(payload.get("temperature", 0.0)),
+        )
+        return state
+
+    def _handle_token_budget_step_payload(self, payload: Mapping[str, object]) -> _TokenBudgetStepResult:
+        state = self._token_budget_step_state
+        if state is None:
+            raise RuntimeError("token-budget step state is not installed")
+        result = self._execute_token_budget_step_payload(
+            payload,
+            state,
+            temperature=float(payload.get("temperature", 0.0)),
+        )
+        self._token_budget_step_last_result = result
+        return result
+
+    def _execute_token_budget_decode_run_payload(
+        self,
+        payload: Mapping[str, object],
+        state: _TokenBudgetStepState,
+        *,
+        temperature: float,
+    ) -> _TokenBudgetDecodeRunResult:
+        steps_obj = payload.get("steps", [])
+        if not isinstance(steps_obj, list) or not steps_obj:
+            raise ValueError("token-budget decode run requires non-empty steps")
+        results: list[_TokenBudgetStepResult] = []
+        for step_payload in steps_obj:
+            if not isinstance(step_payload, Mapping):
+                raise ValueError("token-budget decode run steps must be mappings")
+            chunks = step_payload.get("chunks", [])
+            if not isinstance(chunks, list) or not chunks:
+                raise ValueError("token-budget decode run step requires chunks")
+            if any(not isinstance(chunk, Mapping) or str(chunk.get("kind")) != "decode" for chunk in chunks):
+                raise ValueError("token-budget decode run only accepts decode chunks")
+            results.append(
+                self._execute_token_budget_step_payload(
+                    step_payload,
+                    state,
+                    temperature=temperature,
+                )
+            )
+        return _TokenBudgetDecodeRunResult(step_results=tuple(results))
+
+    def _handle_token_budget_decode_run_payload(
+        self,
+        payload: Mapping[str, object],
+    ) -> _TokenBudgetDecodeRunResult:
+        state = self._token_budget_step_state
+        if state is None:
+            raise RuntimeError("token-budget decode run state is not installed")
+        result = self._execute_token_budget_decode_run_payload(
+            payload,
+            state,
+            temperature=float(payload.get("temperature", 0.0)),
+        )
+        self._token_budget_step_last_result = result.step_results[-1]
+        return result
+
+    def _handle_token_budget_close_payload(self, payload: Mapping[str, object]) -> None:
+        del payload
+        self._token_budget_step_state = None
+        self._token_budget_step_last_result = None
+
+    def _run_token_budget_group_local(
+        self,
+        group: Sequence[_QueuedGeneration],
+        *,
+        max_active_rows: int,
+        max_scheduled_tokens: int,
+        prefill_chunk_size: int | None = None,
+        prefix_tokens: int = 0,
+        decode_run_steps: int = 1,
+        max_scheduler_steps: int | None = None,
+    ) -> _TokenBudgetLocalRunStats:
+        if not group:
+            return _TokenBudgetLocalRunStats(
+                scheduler_steps=0,
+                step_commands=0,
+                decode_run_commands=0,
+                empty_plans=0,
+                emitted_tokens=0,
+                finished_events=0,
+                max_decode_run_steps=0,
+                closed=True,
+            )
+        request_by_id = {str(index): request for index, request in enumerate(group)}
+        prompts = [request.prompt for request in group]
+        prefix: tuple[int, ...] = ()
+        if prefix_tokens > 0 and prompts:
+            candidate = tuple(int(token_id) for token_id in prompts[0][:prefix_tokens])
+            if len(candidate) == prefix_tokens and all(tuple(prompt[:prefix_tokens]) == candidate for prompt in prompts):
+                prefix = candidate
+        scheduler = _token_budget_scheduler_for_group(
+            group,
+            max_active_rows=max_active_rows,
+            max_scheduled_tokens=max_scheduled_tokens,
+            prefill_chunk_size=prefill_chunk_size,
+            prefix_tokens=prefix_tokens,
+        )
+        max_seq_len = max((len(request.prompt) + request.max_tokens for request in group), default=1)
+        self._start_token_budget_step_state(
+            cache_batch_size=max_active_rows,
+            max_seq_len=max_seq_len,
+            prefix=prefix,
+            temperature=group[0].temperature,
+        )
+        finished_request_ids: tuple[str, ...] = ()
+        pending_plan: _TokenBudgetPlan | None = None
+        scheduler_steps = 0
+        step_commands = 0
+        decode_run_commands = 0
+        empty_plans = 0
+        emitted_tokens = 0
+        finished_events = 0
+        max_decode_run_size = 0
+        stream_rows = _StreamRowState()
+        try:
+            while scheduler.has_work() or finished_request_ids or pending_plan is not None:
+                if pending_plan is None:
+                    plan = scheduler.step(finished_request_ids=finished_request_ids)
+                    scheduler_steps += 1
+                else:
+                    plan = pending_plan
+                    pending_plan = None
+                finished_request_ids = ()
+                if max_scheduler_steps is not None and scheduler_steps > max_scheduler_steps:
+                    raise RuntimeError("token-budget local runner exceeded max_scheduler_steps")
+                if not plan.chunks:
+                    empty_plans += 1
+                    continue
+                if decode_run_steps > 1 and _token_budget_plan_is_decode_only(plan):
+                    plans = [plan]
+                    while (
+                        len(plans) < decode_run_steps
+                        and not plans[-1].finished_request_ids
+                        and scheduler.has_work()
+                    ):
+                        next_plan = scheduler.step(finished_request_ids=())
+                        scheduler_steps += 1
+                        if max_scheduler_steps is not None and scheduler_steps > max_scheduler_steps:
+                            raise RuntimeError("token-budget local runner exceeded max_scheduler_steps")
+                        if not next_plan.chunks:
+                            if next_plan.finished_request_ids:
+                                pending_plan = next_plan
+                                break
+                            empty_plans += 1
+                            continue
+                        if not _token_budget_plan_is_decode_only(next_plan):
+                            pending_plan = next_plan
+                            break
+                        plans.append(next_plan)
+                    payload = _token_budget_decode_run_payload(plans, request_by_id)
+                    result = self._handle_token_budget_decode_run_payload(payload)
+                    emitted_finished_request_ids = self._emit_token_budget_decode_run_result(
+                        group,
+                        payload,
+                        result,
+                        stream_rows=stream_rows,
+                    )
+                    decode_run_commands += 1
+                    max_decode_run_size = max(max_decode_run_size, len(plans))
+                    emitted_tokens += sum(
+                        token is not None
+                        for step_result in result.step_results
+                        for token in (*step_result.decode_tokens.values(), *step_result.prefill_tokens.values())
+                    )
+                    finished_request_ids = _merge_token_budget_finished_ids(
+                        result.finished_request_ids,
+                        emitted_finished_request_ids,
+                    )
+                    finished_events += len(finished_request_ids)
+                    continue
+                payload = _token_budget_step_payload(plan, request_by_id)
+                result = self._handle_token_budget_step_payload(payload)
+                emitted_finished_request_ids = self._emit_token_budget_step_result(
+                    group,
+                    payload,
+                    result,
+                    stream_rows=stream_rows,
+                )
+                step_commands += 1
+                emitted_tokens += sum(token is not None for token in result.decode_tokens.values())
+                emitted_tokens += sum(token is not None for token in result.prefill_tokens.values())
+                finished_request_ids = _merge_token_budget_finished_ids(
+                    result.finished_request_ids,
+                    emitted_finished_request_ids,
+                )
+                finished_events += len(finished_request_ids)
+        finally:
+            self._handle_token_budget_close_payload({"op": "token_budget_close"})
+        return _TokenBudgetLocalRunStats(
+            scheduler_steps=scheduler_steps,
+            step_commands=step_commands,
+            decode_run_commands=decode_run_commands,
+            empty_plans=empty_plans,
+            emitted_tokens=emitted_tokens,
+            finished_events=finished_events,
+            max_decode_run_steps=max_decode_run_size,
+            closed=self._token_budget_step_state is None,
+        )
+
+    def _emit_token_budget_decode_run_result(
+        self,
+        group: Sequence[_QueuedGeneration],
+        payload: Mapping[str, object],
+        result: _TokenBudgetDecodeRunResult,
+        *,
+        stream_rows: _StreamRowState | None = None,
+    ) -> tuple[str, ...]:
+        steps_obj = payload.get("steps", [])
+        if not isinstance(steps_obj, list):
+            raise ValueError("token-budget decode run emit requires step list")
+        if len(steps_obj) != len(result.step_results):
+            raise ValueError("token-budget decode run result length mismatch")
+        finished_request_ids: list[str] = []
+        for step_payload, step_result in zip(steps_obj, result.step_results):
+            if not isinstance(step_payload, Mapping):
+                raise ValueError("token-budget decode run emit step must be a mapping")
+            finished_request_ids.extend(
+                self._emit_token_budget_step_result(
+                    group,
+                    step_payload,
+                    step_result,
+                    stream_rows=stream_rows,
+                )
+            )
+        return _merge_token_budget_finished_ids(finished_request_ids)
+
+    def _emit_token_budget_step_result(
+        self,
+        group: Sequence[_QueuedGeneration],
+        payload: Mapping[str, object],
+        result: _TokenBudgetStepResult,
+        *,
+        stream_rows: _StreamRowState | None = None,
+    ) -> tuple[str, ...]:
+        chunks = payload.get("chunks", [])
+        if not isinstance(chunks, list):
+            raise ValueError("token-budget emit requires chunk list")
+        stop_token_ids = getattr(self, "stop_token_ids", frozenset())
+        finished_request_ids: list[str] = []
+        for chunk in chunks:
+            if not isinstance(chunk, Mapping):
+                raise ValueError("token-budget emit chunk must be a mapping")
+            request_id = str(chunk.get("request_id"))
+            token_id = result.decode_tokens.get(request_id)
+            if token_id is None and request_id in result.prefill_tokens:
+                token_id = result.prefill_tokens[request_id]
+            if token_id is None:
+                continue
+            request = group[int(request_id)]
+            if request.done:
+                continue
+            if stream_rows is not None:
+                row = int(chunk["row"])
+                stream_rows.admit(request_id, row, request)
+                if stream_rows.emit(request_id, int(token_id), stop_token_ids=stop_token_ids):
+                    finished_request_ids.append(request_id)
+                continue
+            if int(token_id) in stop_token_ids:
+                _finish_stream_request(request)
+                finished_request_ids.append(request_id)
+                continue
+            request.responses.put(int(token_id))
+        for request_id in result.finished_request_ids:
+            request = group[int(request_id)]
+            if stream_rows is not None:
+                if stream_rows.finish(str(request_id)):
+                    finished_request_ids.append(str(request_id))
+                elif not request.done:
+                    _finish_stream_request(request)
+                    finished_request_ids.append(str(request_id))
+            elif not request.done:
+                _finish_stream_request(request)
+                finished_request_ids.append(str(request_id))
+        return _merge_token_budget_finished_ids(finished_request_ids)
+
     def _prefill_shared_prefix_prompt_list_padded_suffixes(
         self,
         prompts: Sequence[Sequence[int]],
@@ -3255,18 +7237,42 @@ class OpenAICompletionEngine:
         max_suffix_len = max((len(row) for row in suffix_rows), default=0)
         if max_suffix_len <= 0:
             return None
+        padded_suffix_len = _shared_prefix_padded_suffix_bucketed_length(
+            model,
+            device=self.device,
+            prompt_count=prompt_count,
+            max_suffix_len=max_suffix_len,
+        )
         max_prompt_len = max((len(prompt) for prompt in prompts), default=0)
+        cache_batch_size = _generation_cache_batch_capacity(model, prompt_count)
         cache = self._generation_cache(
             prompt_count,
             max_prompt_len + max_tokens,
             model=model,
+            batch_capacity=cache_batch_size,
             pool=_shared_prefix_ragged_cache_pool_enabled_for_model(
                 model,
                 max_tokens=max_tokens,
             ),
         )
+        physical_batch_size = _cache_batch_size(cache) or prompt_count
+        prefill_batch_size = prompt_count
+        if _shared_prefix_padded_suffix_static_batch_enabled(
+            model,
+            prompt_count=prompt_count,
+            physical_batch_size=physical_batch_size,
+            device=self.device,
+        ):
+            prefill_batch_size = physical_batch_size
+        self._add_stream_group_profile_extra(
+            padded_suffix_physical_batch_size=physical_batch_size,
+            padded_suffix_prefill_batch_size=prefill_batch_size,
+            padded_suffix_max_suffix_len=max_suffix_len,
+            padded_suffix_bucketed_suffix_len=padded_suffix_len,
+        )
+        _set_cache_physical_rows_initialized(cache, False)
         try:
-            _copy_generation_cache_first_row(prefix_cache, cache, prompt_count)
+            _copy_generation_cache_first_row(prefix_cache, cache, prefill_batch_size)
         except Exception as exc:
             warn_optional_failure("openai.shared_prefix_padded_suffix_cache", exc)
             return None
@@ -3274,22 +7280,67 @@ class OpenAICompletionEngine:
         pad_token_id = _tokenizer_padding_token_id(getattr(self, "tokenizer", None))
         if any(not suffix for suffix in suffix_rows):
             return None
-        suffix_ids = _padded_token_rows_tensor(suffix_rows, self.device, pad_token_id)
+        suffix_lengths = [len(suffix) for suffix in suffix_rows]
+        prefill_suffix_rows = suffix_rows
+        prefill_suffix_lengths = suffix_lengths
+        if prefill_batch_size > prompt_count:
+            dummy_suffix = list(max(suffix_rows, key=len))
+            extra_rows = prefill_batch_size - prompt_count
+            prefill_suffix_rows = suffix_rows + [dummy_suffix for _ in range(extra_rows)]
+            prefill_suffix_lengths = suffix_lengths + [len(dummy_suffix) for _ in range(extra_rows)]
+        suffix_ids = _padded_token_rows_tensor(prefill_suffix_rows, self.device, pad_token_id)
+        if suffix_ids.size(1) < padded_suffix_len:
+            extra = torch.full(
+                (suffix_ids.size(0), padded_suffix_len - suffix_ids.size(1)),
+                int(pad_token_id),
+                dtype=suffix_ids.dtype,
+                device=suffix_ids.device,
+            )
+            suffix_ids = torch.cat((suffix_ids, extra), dim=1)
 
         # Right padding is safe here: real suffix-token logits never attend to
         # future pad tokens, and later ragged decode uses true per-row lengths.
+        next_token_start_s = self._stream_group_profile_start_s()
         next_token, cache = _prefill_padded_suffix_next_token(
             model,
             suffix_ids,
             cache,
-            [len(suffix) for suffix in suffix_rows],
+            prefill_suffix_lengths,
             temperature,
+            allow_capture=self._batched_prefill_graph_capture_enabled(
+                model,
+                suffix_ids,
+                cache,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                selected_logits=True,
+            ),
         )
+        self._add_stream_group_profile_elapsed(
+            "shared_prefix_padded_suffix_next_token_ms",
+            next_token_start_s,
+        )
+        seq_len_update_start_s = self._stream_group_profile_start_s()
+        try:
+            _set_generation_cache_rows_seq_lens(
+                cache,
+                range(prompt_count),
+                [prefix_tokens + length for length in suffix_lengths],
+            )
+        except Exception as exc:
+            warn_optional_failure("openai.shared_prefix_padded_suffix_lengths", exc)
+            return None
+        self._add_stream_group_profile_elapsed(
+            "shared_prefix_padded_suffix_seq_len_update_ms",
+            seq_len_update_start_s,
+        )
+        _set_cache_physical_rows_initialized(cache, prefill_batch_size >= physical_batch_size)
         next_token = next_token.to(self.device)
         stop_token_ids = self.stop_token_ids
         first_tokens: list[int | None] = []
         active: list[bool] = []
-        for row, token_id in enumerate(next_token.detach().cpu().tolist()):
+        cpu_token_start_s = self._stream_group_profile_start_s()
+        for row, token_id in enumerate(next_token[:prompt_count].detach().cpu().tolist()):
             if row_max_tokens[row] <= 0:
                 first_tokens.append(None)
                 active.append(False)
@@ -3297,6 +7348,10 @@ class OpenAICompletionEngine:
             token = int(token_id)
             first_tokens.append(token)
             active.append(token not in stop_token_ids and row_max_tokens[row] > 1)
+        self._add_stream_group_profile_elapsed(
+            "shared_prefix_padded_suffix_cpu_tokens_ms",
+            cpu_token_start_s,
+        )
         return cache, first_tokens, active
 
     def _shared_prefix_prompt_list_ragged_cache(
@@ -3313,34 +7368,191 @@ class OpenAICompletionEngine:
         max_prompt_len = max(prompt_lengths, default=0)
         if max_prompt_len <= 0:
             return None
+        cache_batch_size = _generation_cache_batch_capacity(model, prompt_count)
         cache = self._generation_cache(
             prompt_count,
             max_prompt_len + max_tokens,
             model=model,
+            batch_capacity=cache_batch_size,
             pool=_shared_prefix_ragged_cache_pool_enabled_for_model(
                 model,
                 max_tokens=max_tokens,
             ),
         )
         try:
-            for state in states:
-                source_cache = state.get("cache")
-                indices = state.get("indices")
-                if source_cache is None or not isinstance(indices, list):
-                    return None
-                for source_row, original_index in enumerate(indices):
-                    _copy_generation_cache_row(
-                        source_cache,
-                        cache,
-                        source_row=source_row,
-                        target_row=int(original_index),
-                        seq_len=int(prompt_lengths[int(original_index)]),
-                    )
+            bulk_copy_used = False
+            if _shared_prefix_ragged_cache_bulk_copy_allowed(prompt_count, max_tokens=max_tokens):
+                bulk_copy_used = _copy_generation_cache_state_rows_padded(
+                    states,
+                    cache,
+                    prompt_lengths=prompt_lengths,
+                    prompt_count=prompt_count,
+                )
+            if bulk_copy_used:
+                self._add_stream_group_profile_extra(
+                    shared_prefix_ragged_cache_bulk_copy=True,
+                    shared_prefix_ragged_cache_bulk_rows=prompt_count,
+                )
+            else:
+                for state in states:
+                    source_cache = state.get("cache")
+                    indices = state.get("indices")
+                    if source_cache is None or not isinstance(indices, list):
+                        return None
+                    for source_row, original_index in enumerate(indices):
+                        _copy_generation_cache_row(
+                            source_cache,
+                            cache,
+                            source_row=source_row,
+                            target_row=int(original_index),
+                            seq_len=int(prompt_lengths[int(original_index)]),
+                        )
             _set_generation_cache_seq_len(cache, max_prompt_len)
+            _set_cache_physical_rows_initialized(cache, (_cache_batch_size(cache) or prompt_count) <= prompt_count)
         except Exception as exc:
             warn_optional_failure("openai.shared_prefix_ragged_cache", exc)
             return None
         return cache
+
+    def _decode_shared_prefix_prompt_list_ragged_step(
+        self,
+        *,
+        cache: object,
+        active: list[bool],
+        per_row_limits: Sequence[int],
+        generated_tokens: list[int],
+        seq_lens: Tensor,
+        next_token_tensor: Tensor,
+        step: int,
+        cache_batch_size: int,
+        temperature: float,
+        static_graph_buckets: bool,
+    ) -> tuple[object, list[int | None]] | None:
+        model = self.model
+        logical_batch_size = max(1, min(int(cache_batch_size), len(active)))
+        active_for_plan = active[:logical_batch_size]
+        active_indices = [index for index, is_active in enumerate(active_for_plan) if is_active]
+        should_decode = _sync_tensor_parallel_continue(model, bool(active_indices), self.device)
+        if not should_decode:
+            return None
+        prepare_start_s = self._stream_group_profile_start_s()
+        force_row_indices = env_flag(
+            "TORCHINFERNO_OPENAI_RAGGED_DECODE_FORCE_ROW_INDICES",
+            _force_tp_shared_prefix_ragged_row_indices(model),
+        )
+        row_plan = _shared_prefix_ragged_decode_row_plan(
+            active_for_plan,
+            active_indices=active_indices,
+            step=step,
+            cache_batch_size=cache_batch_size,
+            force_row_indices=force_row_indices,
+            static_graph_buckets=static_graph_buckets,
+            prefer_full_bucket=_prefer_paged_ragged_decode_full_bucket(
+                model,
+                cache,
+                static_graph_buckets=static_graph_buckets,
+            ),
+        )
+        decode_indices = list(row_plan.decode_indices)
+        if self._queue_profile_path_value():
+            active_count = len(active_indices)
+            decode_count = len(decode_indices)
+            self._add_stream_group_profile_value("shared_prefix_ragged_active_row_steps", float(active_count))
+            self._add_stream_group_profile_value("shared_prefix_ragged_decode_row_steps", float(decode_count))
+            if decode_count > active_count:
+                self._add_stream_group_profile_value(
+                    "shared_prefix_ragged_bucket_padding_row_steps",
+                    float(decode_count - active_count),
+                )
+                self._add_stream_group_profile_value("shared_prefix_ragged_bucketed_steps", 1.0)
+            if row_plan.row_indices is not None:
+                self._add_stream_group_profile_value("shared_prefix_ragged_row_index_steps", 1.0)
+        if row_plan.row_indices is None:
+            decode_input = next_token_tensor[: len(decode_indices), None]
+            decode_seq_lens = seq_lens[: len(decode_indices)]
+            row_indices = None
+            advance_row_indices = None
+        else:
+            row_indices = torch.tensor(row_plan.row_indices, dtype=torch.long, device=self.device)
+            advance_row_indices = (
+                torch.tensor(row_plan.advance_row_indices, dtype=torch.long, device=self.device)
+                if row_plan.advance_row_indices is not None
+                else None
+            )
+            decode_input = next_token_tensor.index_select(0, row_indices)[:, None]
+            decode_seq_lens = seq_lens
+        self._add_stream_group_profile_elapsed("shared_prefix_ragged_prepare_ms", prepare_start_s)
+        model_start_s = self._stream_group_profile_start_s()
+        model_start_event: torch.cuda.Event | None = None
+        model_end_event: torch.cuda.Event | None = None
+        if model_start_s > 0.0 and self.device.type == "cuda":
+            model_start_event = torch.cuda.Event(enable_timing=True)
+            model_end_event = torch.cuda.Event(enable_timing=True)
+            model_start_event.record(torch.cuda.current_stream(self.device))
+        next_token, cache = _decode_next_token_ragged(
+            model,
+            decode_input,
+            cache,
+            decode_seq_lens,
+            row_indices,
+            temperature,
+        )
+        next_token = next_token.to(self.device)
+        if model_start_event is not None and model_end_event is not None:
+            model_end_event.record(torch.cuda.current_stream(self.device))
+            model_end_event.synchronize()
+            self._add_stream_group_profile_value(
+                "shared_prefix_ragged_model_ms",
+                model_start_event.elapsed_time(model_end_event),
+            )
+        else:
+            self._add_stream_group_profile_elapsed("shared_prefix_ragged_model_ms", model_start_s)
+        decode_token_count = min(int(next_token.numel()), len(decode_indices))
+        if decode_token_count > 0:
+            decode_next_tokens = next_token[:decode_token_count].to(
+                device=next_token_tensor.device,
+                dtype=next_token_tensor.dtype,
+            )
+            if row_indices is None:
+                next_token_tensor[:decode_token_count].copy_(decode_next_tokens)
+            elif advance_row_indices is not None:
+                logical_update_count = 0
+                for original_index in decode_indices[:decode_token_count]:
+                    if original_index >= len(active):
+                        break
+                    logical_update_count += 1
+                if logical_update_count > 0:
+                    next_token_tensor.index_copy_(
+                        0,
+                        row_indices[:logical_update_count],
+                        decode_next_tokens[:logical_update_count],
+                    )
+            else:
+                next_token_tensor.index_copy_(0, row_indices[:decode_token_count], decode_next_tokens)
+        if row_indices is None:
+            seq_lens[: len(decode_indices)] = seq_lens[: len(decode_indices)] + 1
+        elif advance_row_indices is not None:
+            seq_lens[advance_row_indices] = seq_lens.index_select(0, advance_row_indices) + 1
+        else:
+            seq_lens[row_indices] = seq_lens.index_select(0, row_indices) + 1
+        step_tokens: list[int | None] = [None for _ in active]
+        cpu_tokens_start_s = self._stream_group_profile_start_s()
+        token_ids = next_token.detach().cpu().tolist()
+        self._add_stream_group_profile_elapsed("shared_prefix_ragged_cpu_tokens_ms", cpu_tokens_start_s)
+        state_update_start_s = self._stream_group_profile_start_s()
+        for offset, token_id in enumerate(token_ids):
+            original_index = decode_indices[offset]
+            if original_index >= len(active):
+                continue
+            token_id = int(token_id)
+            if not active[original_index]:
+                continue
+            step_tokens[original_index] = token_id
+            generated_tokens[original_index] += 1
+            if token_id in self.stop_token_ids or generated_tokens[original_index] >= per_row_limits[original_index]:
+                active[original_index] = False
+        self._add_stream_group_profile_elapsed("shared_prefix_ragged_state_update_ms", state_update_start_s)
+        return cache, step_tokens
 
     def _decode_shared_prefix_prompt_list_ragged(
         self,
@@ -3356,6 +7568,10 @@ class OpenAICompletionEngine:
         model = self.model
         if _disable_tp_shared_prefix_ragged_decode_graph(model, max_tokens=max_tokens):
             _set_ragged_decode_graph_disabled(cache, True)
+        _set_runtime_ragged_decode_graph_capture(
+            cache,
+            _runtime_ragged_decode_graph_capture_allowed_for_request(model, max_tokens=max_tokens),
+        )
         if max_tokens <= 1 or not any(active):
             return
         per_row_limits = _normalize_row_max_tokens(row_max_tokens, len(active), max_tokens)
@@ -3364,12 +7580,35 @@ class OpenAICompletionEngine:
                 active[index] = False
         if not any(active):
             return
-        seq_lens = torch.tensor(prompt_lengths, dtype=torch.long, device=self.device)
-        next_token_tensor = torch.tensor(
-            [0 if token_id is None else int(token_id) for token_id in next_tokens],
-            dtype=torch.long,
-            device=self.device,
+        static_graph_bucket_capacity = (
+            _force_tp_shared_prefix_ragged_row_indices(model)
+            and not getattr(cache, "_torchinferno_disable_ragged_decode_graph", False)
+            and not _disable_tp_shared_prefix_ragged_static_buckets(model, max_tokens=max_tokens)
         )
+        cache_batch_size = len(active)
+        if static_graph_bucket_capacity:
+            physical_cache_rows = max(len(active), _cache_batch_size(cache) or 0)
+            if (
+                physical_cache_rows > len(active)
+                and (
+                    _cache_physical_rows_initialized(cache)
+                    or not _cache_requires_physical_rows_initialized(cache)
+                )
+            ):
+                cache_batch_size = physical_cache_rows
+        seq_lens = torch.empty(cache_batch_size, dtype=torch.long, device=self.device)
+        prompt_len_tensor = torch.tensor(prompt_lengths, dtype=torch.long, device=self.device)
+        seq_lens[: len(prompt_lengths)] = prompt_len_tensor
+        if cache_batch_size > len(prompt_lengths):
+            seq_lens[len(prompt_lengths) :] = max(prompt_lengths, default=0)
+        next_token_tensor = torch.zeros(cache_batch_size, dtype=torch.long, device=self.device)
+        if next_tokens:
+            next_token_tensor[: len(next_tokens)] = torch.tensor(
+                [0 if token_id is None else int(token_id) for token_id in next_tokens],
+                dtype=torch.long,
+                device=self.device,
+            )
+        generated_tokens = [1 if is_active else 0 for is_active in active]
         ephemeral_graph_allowed = (
             getattr(cache, "_torchinferno_ephemeral_cache", False)
             and env_flag("TORCHINFERNO_OPENAI_EPHEMERAL_RAGGED_CUDAGRAPH", True)
@@ -3379,63 +7618,82 @@ class OpenAICompletionEngine:
             1,
             minimum=1,
         )
+        static_graph_bucket_max_steps = env_int(
+            "TORCHINFERNO_OPENAI_TP_SHARED_PREFIX_RAGGED_STATIC_BUCKET_MAX_STEPS",
+            64,
+            minimum=0,
+        )
         ephemeral_graph_scope = False
+        decode_profile_start_s = self._stream_group_profile_start_s()
+        decoded_steps = 0
+        initial_active_rows = sum(1 for is_active in active if is_active)
+        min_active_rows = initial_active_rows
+        final_active_rows = initial_active_rows
+        active_full_steps = 0
+        active_half_step: int | None = None
+        active_row_steps = 0
         try:
             for step in range(1, max_tokens):
-                active_indices = [index for index, is_active in enumerate(active) if is_active]
-                should_decode = _sync_tensor_parallel_continue(model, bool(active_indices), self.device)
-                if not should_decode:
+                active_rows_before = sum(1 for is_active in active if is_active)
+                if active_rows_before <= 0:
                     break
-                decode_full_batch = _prefer_full_batch_ragged_decode(len(active_indices), len(active))
-                force_row_indices = env_flag(
-                    "TORCHINFERNO_OPENAI_RAGGED_DECODE_FORCE_ROW_INDICES",
-                    _force_tp_shared_prefix_ragged_row_indices(model),
+                active_row_steps += active_rows_before
+                if active_rows_before == initial_active_rows:
+                    active_full_steps += 1
+                if (
+                    active_half_step is None
+                    and initial_active_rows > 0
+                    and active_rows_before * 2 <= initial_active_rows
+                ):
+                    active_half_step = step
+                step_static_graph_buckets = bool(static_graph_bucket_capacity) and (
+                    static_graph_bucket_max_steps <= 0 or step < static_graph_bucket_max_steps
                 )
-                advance_row_indices: Tensor | None = None
-                if (len(active_indices) == len(active) or decode_full_batch) and not force_row_indices:
-                    decode_indices = list(range(len(active)))
-                    decode_input = next_token_tensor[:, None]
-                    row_indices = None
-                else:
-                    decode_indices = _ragged_decode_bucket_indices(active_indices, active, step=step)
-                    row_indices = torch.tensor(active_indices, dtype=torch.long, device=self.device)
-                    if decode_indices != active_indices:
-                        row_indices = torch.tensor(decode_indices, dtype=torch.long, device=self.device)
-                        advance_row_indices = torch.tensor(active_indices, dtype=torch.long, device=self.device)
-                    decode_input = next_token_tensor.index_select(0, row_indices)[:, None]
+                _set_shared_prefix_ragged_static_graph_bucket_mode(
+                    model,
+                    cache,
+                    static_graph_buckets=step_static_graph_buckets,
+                )
                 if ephemeral_graph_allowed and not ephemeral_graph_scope and step >= ephemeral_graph_min_step:
                     try:
                         setattr(cache, "_torchinferno_ephemeral_ragged_graph_scope", True)
                         ephemeral_graph_scope = True
                     except Exception:
                         ephemeral_graph_allowed = False
-                next_token, cache = _decode_next_token_ragged(
-                    model,
-                    decode_input,
-                    cache,
-                    seq_lens,
-                    row_indices,
-                    temperature,
+                step_result = self._decode_shared_prefix_prompt_list_ragged_step(
+                    cache=cache,
+                    active=active,
+                    per_row_limits=per_row_limits,
+                    generated_tokens=generated_tokens,
+                    seq_lens=seq_lens,
+                    next_token_tensor=next_token_tensor,
+                    step=step,
+                    cache_batch_size=cache_batch_size,
+                    temperature=temperature,
+                    static_graph_buckets=step_static_graph_buckets,
                 )
-                next_token = next_token.to(self.device)
-                if row_indices is None:
-                    seq_lens += 1
-                elif advance_row_indices is not None:
-                    seq_lens[advance_row_indices] = seq_lens.index_select(0, advance_row_indices) + 1
-                else:
-                    seq_lens[row_indices] = seq_lens.index_select(0, row_indices) + 1
-                step_tokens: list[int | None] = [None for _ in active]
-                for offset, token_id in enumerate(next_token.detach().cpu().tolist()):
-                    original_index = decode_indices[offset]
-                    token_id = int(token_id)
-                    next_token_tensor[original_index] = token_id
-                    if not active[original_index]:
-                        continue
-                    step_tokens[original_index] = token_id
-                    if token_id in self.stop_token_ids or step + 1 >= per_row_limits[original_index]:
-                        active[original_index] = False
+                if step_result is None:
+                    break
+                cache, step_tokens = step_result
+                decoded_steps += 1
+                final_active_rows = sum(1 for is_active in active if is_active)
+                min_active_rows = min(min_active_rows, final_active_rows)
                 yield step_tokens
         finally:
+            self._add_stream_group_profile_elapsed(
+                "shared_prefix_ragged_decode_ms",
+                decode_profile_start_s,
+            )
+            self._add_stream_group_profile_extra(
+                shared_prefix_ragged_decode_steps=decoded_steps,
+                shared_prefix_ragged_static_bucket_capacity=bool(static_graph_bucket_capacity),
+                shared_prefix_ragged_active_initial=initial_active_rows,
+                shared_prefix_ragged_active_min=min_active_rows,
+                shared_prefix_ragged_active_final=final_active_rows,
+                shared_prefix_ragged_active_full_steps=active_full_steps,
+                shared_prefix_ragged_active_half_step=active_half_step,
+                shared_prefix_ragged_active_row_steps_observed=active_row_steps,
+            )
             if ephemeral_graph_scope:
                 try:
                     setattr(cache, "_torchinferno_ephemeral_ragged_graph_scope", False)
@@ -3493,7 +7751,13 @@ class OpenAICompletionEngine:
             input_ids[:, prefix_tokens:],
             cache,
             temperature,
-            allow_capture=_runtime_prefill_graph_capture_enabled(model, temperature, max_tokens=max_tokens),
+            allow_capture=self._batched_prefill_graph_capture_enabled(
+                model,
+                input_ids[:, prefix_tokens:],
+                cache,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            ),
         )
         next_token = next_token.to(self.device)
 
@@ -3719,19 +7983,19 @@ def _tensor_parallel_symm_mem_allreduce_scope(
         or temperature > 0.0
     ):
         return nullcontext()
-    max_tokens_limit = env_int("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_MAX_TOKENS", 128, minimum=1)
+    max_tokens_limit = env_int("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_MAX_TOKENS", 1024, minimum=1)
     if max_tokens > max_tokens_limit:
         return nullcontext()
     if not env_flag("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE", True):
         return nullcontext()
-    max_batch = env_int("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_MAX_BATCH", 64, minimum=1)
+    max_batch = env_int("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_MAX_BATCH", 128, minimum=1)
     return symm_mem_allreduce_max_batch(max_batch, enabled=True)
 
 
 def _effective_openai_max_batch_size(model: object, device: torch.device, requested: int) -> int:
     max_batch_size = max(1, requested)
     if _is_tensor_parallel_model(model) and device.type == "cuda":
-        tp_default = env_int("TORCHINFERNO_OPENAI_TP_MAX_BATCH_SIZE", 128, minimum=1)
+        tp_default = env_int("TORCHINFERNO_OPENAI_TP_MAX_BATCH_SIZE", 256, minimum=1)
         return min(max_batch_size, tp_default)
     return max_batch_size
 
@@ -3788,7 +8052,26 @@ def _prefer_tensor_parallel_stream_group(
 _TP_COMMAND_STOP = 0
 _TP_COMMAND_GENERATE_TENSOR = 1
 _TP_COMMAND_GENERATE_PROMPT_LISTS = 2
-_TP_COMMAND_META_FIELDS = 7
+_TP_COMMAND_ONLINE_START = 3
+_TP_COMMAND_ONLINE_SUBMIT_PROMPT_LISTS = 4
+_TP_COMMAND_ONLINE_STEP = 5
+_TP_COMMAND_ONLINE_CLOSE = 6
+_TP_COMMAND_CLEANUP = 7
+_TP_COMMAND_TOKEN_BUDGET_STEP = 8
+_TP_COMMAND_TOKEN_BUDGET_START = 9
+_TP_COMMAND_TOKEN_BUDGET_CLOSE = 10
+_TP_COMMAND_TOKEN_BUDGET_DECODE_RUN = 11
+_TP_COMMAND_PROMPT_LIST_PERSISTENT_START = 12
+_TP_COMMAND_PROMPT_LIST_PERSISTENT_STEP = 13
+_TP_COMMAND_PROMPT_LIST_PERSISTENT_CLOSE = 14
+_TP_COMMAND_PROMPT_LIST_PERSISTENT_DECODE_RUN = 15
+_TP_COMMAND_META_FIELDS = 11
+_TP_TOKEN_BUDGET_CHUNK_FIELDS = 10
+_TP_TOKEN_BUDGET_DECODE_RUN_STEP_FIELDS = 5
+_TP_TOKEN_BUDGET_KIND_PREFILL = 0
+_TP_TOKEN_BUDGET_KIND_DECODE = 1
+_TP_PROMPT_LIST_PERSISTENT_DECODE_FIELDS = 2
+_TP_PROMPT_LIST_PERSISTENT_PREFILL_FIELDS = 6
 
 
 def _runtime_prefill_graph_capture_enabled(
@@ -3798,9 +8081,10 @@ def _runtime_prefill_graph_capture_enabled(
     max_tokens: int | None = None,
 ) -> bool:
     if _is_tensor_parallel_model(model) and _tensor_parallel_world_size(model) > 1:
+        capture_env_set = "TORCHINFERNO_OPENAI_TP_RUNTIME_PREFILL_CAPTURE" in os.environ
         if not env_flag("TORCHINFERNO_OPENAI_TP_RUNTIME_PREFILL_CAPTURE", True):
             return False
-        if temperature > 0.0 and not env_flag(
+        if not capture_env_set and temperature > 0.0 and not env_flag(
             "TORCHINFERNO_OPENAI_TP_RUNTIME_TEMPERATURE_PREFILL_CAPTURE",
             True,
         ):
@@ -3813,15 +8097,16 @@ def _runtime_prefill_graph_capture_enabled(
                 minimum=1,
             )
             if (
-                temperature > 0.0
+                not capture_env_set
+                and temperature > 0.0
                 and max_tokens <= sampled_skip_max_tokens
                 and not env_flag("TORCHINFERNO_OPENAI_TP_SHORT_TEMPERATURE_PREFILL_CAPTURE", False)
             ):
                 return False
-            if temperature <= 0.0:
+            if not capture_env_set and temperature <= 0.0:
                 skip_min_tokens = env_int(
                     "TORCHINFERNO_OPENAI_TP_DETERMINISTIC_PREFILL_CAPTURE_SKIP_MIN_TOKENS",
-                    128,
+                    1,
                     minimum=1,
                 )
                 skip_max_tokens = env_int(
@@ -3889,11 +8174,23 @@ def _sync_tensor_parallel_command(
     dist.barrier()
 
 
-def _tp_command_cuda_sync_for_steps(completed_steps: int) -> bool:
+def _tp_command_cuda_sync_for_steps(completed_steps: int, *, emitted_tokens: int = 0) -> bool:
     if env_flag("TORCHINFERNO_OPENAI_TP_COMMAND_CUDA_SYNC"):
         return True
     min_steps = env_int("TORCHINFERNO_OPENAI_TP_COMMAND_CUDA_SYNC_MIN_STEPS", 8, minimum=1)
-    return completed_steps >= min_steps
+    if completed_steps < min_steps:
+        return False
+    skip_emitted_tokens = env_int(
+        "TORCHINFERNO_OPENAI_TP_COMMAND_CUDA_SYNC_SKIP_MIN_EMITTED_TOKENS",
+        512,
+        minimum=1,
+    )
+    if emitted_tokens >= skip_emitted_tokens:
+        return False
+    if "TORCHINFERNO_OPENAI_TP_COMMAND_CUDA_SYNC_MAX_STEPS" in os.environ:
+        max_steps = env_int("TORCHINFERNO_OPENAI_TP_COMMAND_CUDA_SYNC_MAX_STEPS", 32, minimum=min_steps)
+        return completed_steps <= max_steps
+    return True
 
 
 def _sync_tensor_parallel_continue(model: object, should_continue: bool, device: torch.device) -> bool:
@@ -3917,6 +8214,11 @@ def _tensor_parallel_all_ranks_true(model: object, value: bool, device: torch.de
 
     if not dist.is_available() or not dist.is_initialized():
         return value
+    control_group = _tensor_parallel_control_group(dist)
+    if control_group is not None:
+        flag = torch.tensor([1 if value else 0], dtype=torch.int32)
+        dist.all_reduce(flag, op=dist.ReduceOp.MIN, group=control_group)
+        return bool(flag.item())
     flag = torch.tensor([1 if value else 0], dtype=torch.int32, device=device)
     dist.all_reduce(flag, op=dist.ReduceOp.MIN)
     return bool(flag.item())
@@ -3929,6 +8231,13 @@ def _tensor_parallel_all_ranks_same_int(model: object, value: int, device: torch
 
     if not dist.is_available() or not dist.is_initialized():
         return True
+    control_group = _tensor_parallel_control_group(dist)
+    if control_group is not None:
+        low = torch.tensor([int(value)], dtype=torch.int64)
+        high = low.clone()
+        dist.all_reduce(low, op=dist.ReduceOp.MIN, group=control_group)
+        dist.all_reduce(high, op=dist.ReduceOp.MAX, group=control_group)
+        return bool(low.item() == high.item())
     low = torch.tensor([int(value)], dtype=torch.int64, device=device)
     high = low.clone()
     dist.all_reduce(low, op=dist.ReduceOp.MIN)
@@ -3940,7 +8249,7 @@ def _tensor_parallel_tensor_commands_enabled(model: object) -> bool:
     if (
         not _is_tensor_parallel_model(model)
         or _tensor_parallel_world_size(model) <= 1
-        or not env_flag("TORCHINFERNO_OPENAI_TP_TENSOR_COMMANDS", True)
+        or not env_flag("TORCHINFERNO_OPENAI_TP_TENSOR_COMMANDS", False)
     ):
         return False
     import torch.distributed as dist
@@ -3953,6 +8262,27 @@ def _tensor_parallel_command_device(device: torch.device) -> torch.device:
     return command_device if command_device.type == "cuda" else torch.device("cpu")
 
 
+def _tensor_parallel_tensor_command_group(dist_module: object) -> object | None:
+    if not env_flag("TORCHINFERNO_OPENAI_TP_TENSOR_COMMANDS_GLOO", True):
+        return None
+    return _tensor_parallel_control_group(dist_module)
+
+
+def _tensor_parallel_tensor_command_device(device: torch.device, group: object | None) -> torch.device:
+    if group is not None:
+        return torch.device("cpu")
+    return _tensor_parallel_command_device(device)
+
+
+def _broadcast_tensor_command(tensor: Tensor, *, src: int, group: object | None) -> None:
+    import torch.distributed as dist
+
+    if group is None:
+        dist.broadcast(tensor, src=src)
+    else:
+        dist.broadcast(tensor, src=src, group=group)
+
+
 def _broadcast_tensor_parallel_tensor_payload(
     model: object,
     *,
@@ -3963,6 +8293,7 @@ def _broadcast_tensor_parallel_tensor_payload(
     temperature: float,
     stream: bool,
     row_max_tokens: Sequence[int] | None,
+    command_handle: int = 0,
 ) -> bool:
     if not _tensor_parallel_tensor_commands_enabled(model):
         return False
@@ -3970,45 +8301,179 @@ def _broadcast_tensor_parallel_tensor_payload(
 
     if not dist.is_available() or not dist.is_initialized():
         return False
-    command_device = token_rows.device
+    command_group = _tensor_parallel_tensor_command_group(dist)
+    command_device = _tensor_parallel_tensor_command_device(token_rows.device, command_group)
+    token_rows = token_rows.to(command_device, non_blocking=True).contiguous()
+    lengths = lengths.to(command_device, non_blocking=True).contiguous()
     row_max = (
         torch.tensor([int(value) for value in row_max_tokens], dtype=torch.long, device=command_device)
         if row_max_tokens is not None
         else torch.empty(0, dtype=torch.long, device=command_device)
     )
-    meta = torch.tensor(
-        [
-            command_kind,
-            int(bool(stream)),
-            int(token_rows.size(0)),
-            int(token_rows.size(1)),
-            int(max_tokens),
-            int(row_max.numel() > 0),
-            0,
-        ],
-        dtype=torch.long,
-        device=command_device,
-    )
+    meta = torch.zeros(_TP_COMMAND_META_FIELDS, dtype=torch.long, device=command_device)
+    meta[0] = int(command_kind)
+    meta[1] = int(bool(stream))
+    meta[2] = int(token_rows.size(0))
+    meta[3] = int(token_rows.size(1))
+    meta[4] = int(max_tokens)
+    meta[5] = int(row_max.numel() > 0)
+    meta[6] = int(command_handle)
     temp = torch.tensor([float(temperature)], dtype=torch.float64, device=command_device)
-    dist.broadcast(meta, src=0)
-    dist.broadcast(temp, src=0)
-    dist.broadcast(lengths, src=0)
-    dist.broadcast(token_rows, src=0)
+    _broadcast_tensor_command(meta, src=0, group=command_group)
+    _broadcast_tensor_command(temp, src=0, group=command_group)
+    _broadcast_tensor_command(lengths, src=0, group=command_group)
+    _broadcast_tensor_command(token_rows, src=0, group=command_group)
     if row_max.numel() > 0:
-        dist.broadcast(row_max, src=0)
+        _broadcast_tensor_command(row_max, src=0, group=command_group)
     return True
 
 
 def _receive_tensor_parallel_tensor_payload(engine: OpenAICompletionEngine) -> dict[str, object]:
     import torch.distributed as dist
 
-    command_device = _tensor_parallel_command_device(engine.device)
+    command_group = _tensor_parallel_tensor_command_group(dist)
+    command_device = _tensor_parallel_tensor_command_device(engine.device, command_group)
     meta = torch.empty(_TP_COMMAND_META_FIELDS, dtype=torch.long, device=command_device)
-    dist.broadcast(meta, src=0)
+    _broadcast_tensor_command(meta, src=0, group=command_group)
     command_kind = int(meta[0].item())
     if command_kind == _TP_COMMAND_STOP:
         return {"op": "stop"}
-    if command_kind not in {_TP_COMMAND_GENERATE_TENSOR, _TP_COMMAND_GENERATE_PROMPT_LISTS}:
+    if command_kind == _TP_COMMAND_ONLINE_STEP:
+        return {"op": "online_step", "steps": max(1, int(meta[4].item()))}
+    if command_kind == _TP_COMMAND_ONLINE_CLOSE:
+        return {"op": "online_close"}
+    if command_kind == _TP_COMMAND_CLEANUP:
+        return {"op": "cleanup"}
+    if command_kind == _TP_COMMAND_PROMPT_LIST_PERSISTENT_CLOSE:
+        return {"op": "persistent_prompt_list_close"}
+    if command_kind == _TP_COMMAND_TOKEN_BUDGET_CLOSE:
+        return {"op": "token_budget_close"}
+    if command_kind == _TP_COMMAND_ONLINE_START:
+        temp = torch.empty(1, dtype=torch.float64, device=command_device)
+        _broadcast_tensor_command(temp, src=0, group=command_group)
+        prefill_budget = int(meta[9].item())
+        return {
+            "op": "online_start",
+            "max_seq_len": int(meta[6].item()),
+            "max_active_requests": int(meta[7].item()),
+            "prefix_cache_capacity": int(meta[8].item()),
+            "prefill_token_budget": prefill_budget,
+            "temperature": float(temp.item()),
+            "enable_ragged_decode": bool(int(meta[5].item())),
+            "store_reusable_prefixes": bool(int(meta[10].item())),
+            "store_full_prompt_prefixes": bool(int(meta[3].item())),
+            "max_tokens": int(meta[4].item()),
+        }
+    if command_kind == _TP_COMMAND_TOKEN_BUDGET_START:
+        temp = torch.empty(1, dtype=torch.float64, device=command_device)
+        _broadcast_tensor_command(temp, src=0, group=command_group)
+        prefix_len = int(meta[5].item())
+        prefix: list[int] = []
+        if prefix_len > 0:
+            prefix_tensor = torch.empty(prefix_len, dtype=torch.long, device=command_device)
+            _broadcast_tensor_command(prefix_tensor, src=0, group=command_group)
+            prefix = [int(token_id) for token_id in prefix_tensor.cpu().tolist()]
+        return {
+            "op": "token_budget_start",
+            "max_seq_len": int(meta[6].item()),
+            "max_active_rows": int(meta[7].item()),
+            "temperature": float(temp.item()),
+            "max_tokens": int(meta[4].item()),
+            "prefix": prefix,
+        }
+    if command_kind == _TP_COMMAND_PROMPT_LIST_PERSISTENT_START:
+        temp = torch.empty(1, dtype=torch.float64, device=command_device)
+        _broadcast_tensor_command(temp, src=0, group=command_group)
+        prefix_len = int(meta[5].item())
+        prefix: list[int] = []
+        if prefix_len > 0:
+            prefix_tensor = torch.empty(prefix_len, dtype=torch.long, device=command_device)
+            _broadcast_tensor_command(prefix_tensor, src=0, group=command_group)
+            prefix = [int(token_id) for token_id in prefix_tensor.cpu().tolist()]
+        return {
+            "op": "persistent_prompt_list_start",
+            "prefix": prefix,
+            "cache_batch_size": int(meta[7].item()),
+            "max_seq_len": int(meta[6].item()),
+            "temperature": float(temp.item()),
+            "max_tokens": int(meta[4].item()),
+        }
+    if command_kind == _TP_COMMAND_PROMPT_LIST_PERSISTENT_STEP:
+        decode_count = int(meta[2].item())
+        prefill_count = int(meta[3].item())
+        prompt_width = int(meta[4].item())
+        finished_count = int(meta[5].item())
+        decode_width = int(meta[7].item())
+        prefill_width = int(meta[6].item())
+        temp = torch.empty(1, dtype=torch.float64, device=command_device)
+        decode_tensor = torch.empty((decode_count, decode_width), dtype=torch.long, device=command_device)
+        prefill_tensor = torch.empty((prefill_count, prefill_width), dtype=torch.long, device=command_device)
+        prompt_lengths = torch.empty(prefill_count, dtype=torch.long, device=command_device)
+        prompt_rows = torch.empty((prefill_count, prompt_width), dtype=torch.long, device=command_device)
+        finished_ids = torch.empty(finished_count, dtype=torch.long, device=command_device)
+        _broadcast_tensor_command(temp, src=0, group=command_group)
+        _broadcast_tensor_command(decode_tensor, src=0, group=command_group)
+        _broadcast_tensor_command(prefill_tensor, src=0, group=command_group)
+        _broadcast_tensor_command(prompt_lengths, src=0, group=command_group)
+        _broadcast_tensor_command(prompt_rows, src=0, group=command_group)
+        _broadcast_tensor_command(finished_ids, src=0, group=command_group)
+        return _persistent_prompt_list_step_payload_from_tensor_payload(
+            meta,
+            temp,
+            decode_tensor,
+            prefill_tensor,
+            prompt_lengths,
+            prompt_rows,
+            finished_ids,
+        )
+    if command_kind == _TP_COMMAND_PROMPT_LIST_PERSISTENT_DECODE_RUN:
+        temp = torch.empty(1, dtype=torch.float64, device=command_device)
+        _broadcast_tensor_command(temp, src=0, group=command_group)
+        return _persistent_prompt_list_decode_run_payload_from_tensor_payload(meta, temp)
+    if command_kind == _TP_COMMAND_TOKEN_BUDGET_STEP:
+        rows = int(meta[2].item())
+        width = int(meta[3].item())
+        prefill_count = int(meta[5].item())
+        prefill_width = int(meta[6].item())
+        finished_count = int(meta[8].item())
+        chunk_tensor = torch.empty((rows, width), dtype=torch.long, device=command_device)
+        prefill_lengths = torch.empty(prefill_count, dtype=torch.long, device=command_device)
+        prefill_token_rows = torch.empty((prefill_count, prefill_width), dtype=torch.long, device=command_device)
+        finished_ids = torch.empty(finished_count, dtype=torch.long, device=command_device)
+        _broadcast_tensor_command(chunk_tensor, src=0, group=command_group)
+        _broadcast_tensor_command(prefill_lengths, src=0, group=command_group)
+        _broadcast_tensor_command(prefill_token_rows, src=0, group=command_group)
+        _broadcast_tensor_command(finished_ids, src=0, group=command_group)
+        return _token_budget_step_payload_from_tensor_payload(
+            meta,
+            chunk_tensor,
+            prefill_lengths,
+            prefill_token_rows,
+            finished_ids,
+        )
+    if command_kind == _TP_COMMAND_TOKEN_BUDGET_DECODE_RUN:
+        step_count = int(meta[1].item())
+        rows = int(meta[2].item())
+        width = int(meta[3].item())
+        finished_count = int(meta[4].item())
+        step_width = int(meta[5].item())
+        step_tensor = torch.empty((step_count, step_width), dtype=torch.long, device=command_device)
+        chunk_tensor = torch.empty((rows, width), dtype=torch.long, device=command_device)
+        finished_ids = torch.empty(finished_count, dtype=torch.long, device=command_device)
+        _broadcast_tensor_command(step_tensor, src=0, group=command_group)
+        _broadcast_tensor_command(chunk_tensor, src=0, group=command_group)
+        _broadcast_tensor_command(finished_ids, src=0, group=command_group)
+        return _token_budget_decode_run_payload_from_tensor_payload(
+            meta,
+            step_tensor,
+            chunk_tensor,
+            finished_ids,
+        )
+    if command_kind not in {
+        _TP_COMMAND_GENERATE_TENSOR,
+        _TP_COMMAND_GENERATE_PROMPT_LISTS,
+        _TP_COMMAND_ONLINE_SUBMIT_PROMPT_LISTS,
+    }:
         raise ValueError(f"unsupported tensor-parallel tensor command: {command_kind}")
 
     stream = bool(meta[1].item())
@@ -4019,14 +8484,31 @@ def _receive_tensor_parallel_tensor_payload(engine: OpenAICompletionEngine) -> d
     temp = torch.empty(1, dtype=torch.float64, device=command_device)
     lengths = torch.empty(rows, dtype=torch.long, device=command_device)
     token_rows = torch.empty((rows, width), dtype=torch.long, device=command_device)
-    dist.broadcast(temp, src=0)
-    dist.broadcast(lengths, src=0)
-    dist.broadcast(token_rows, src=0)
+    _broadcast_tensor_command(temp, src=0, group=command_group)
+    _broadcast_tensor_command(lengths, src=0, group=command_group)
+    _broadcast_tensor_command(token_rows, src=0, group=command_group)
     row_max_tokens = None
     if has_row_max_tokens:
         row_max = torch.empty(rows, dtype=torch.long, device=command_device)
-        dist.broadcast(row_max, src=0)
+        _broadcast_tensor_command(row_max, src=0, group=command_group)
         row_max_tokens = [int(value) for value in row_max.detach().cpu().tolist()]
+
+    if command_kind == _TP_COMMAND_ONLINE_SUBMIT_PROMPT_LISTS:
+        lengths_list = [int(value) for value in lengths.detach().cpu().tolist()]
+        token_rows_cpu = token_rows.detach().cpu()
+        eos_token_id = int(meta[7].item())
+        return {
+            "op": "online_submit",
+            "input_id_lists": [
+                token_rows_cpu[row, :length].tolist()
+                for row, length in enumerate(lengths_list)
+            ],
+            "max_tokens": max_tokens,
+            "row_max_tokens": row_max_tokens,
+            "arrival_step": int(meta[6].item()),
+            "eos_token_id": None if eos_token_id < 0 else eos_token_id,
+            "request_id_start": int(meta[8].item()),
+        }
 
     payload: dict[str, object] = {
         "op": "generate",
@@ -4062,13 +8544,12 @@ def _broadcast_tensor_parallel_generate(
 
     if not dist.is_available() or not dist.is_initialized():
         return
-    command_device = _tensor_parallel_command_device(input_ids.device)
-    token_rows = input_ids.detach().to(command_device, non_blocking=True).contiguous()
+    token_rows = input_ids.detach().contiguous()
     lengths = torch.full(
         (token_rows.size(0),),
         token_rows.size(1),
         dtype=torch.long,
-        device=command_device,
+        device=token_rows.device,
     )
     if _broadcast_tensor_parallel_tensor_payload(
         model,
@@ -4110,8 +8591,7 @@ def _broadcast_tensor_parallel_generate_prompt_lists(
     if not dist.is_available() or not dist.is_initialized():
         return
     if prompts:
-        command_device = _tensor_parallel_command_device(getattr(model, "device", torch.device("cpu")))
-        token_rows, lengths = _prompt_list_tensor_payload(prompts, command_device)
+        token_rows, lengths = _prompt_list_tensor_payload(prompts, torch.device("cpu"))
         if _broadcast_tensor_parallel_tensor_payload(
             model,
             command_kind=_TP_COMMAND_GENERATE_PROMPT_LISTS,
@@ -4136,6 +8616,454 @@ def _broadcast_tensor_parallel_generate_prompt_lists(
     dist.broadcast_object_list(command, src=0)
 
 
+def _broadcast_tensor_parallel_token_budget_prompt_list_run(
+    model: object,
+    prompts: Sequence[Sequence[int]],
+    *,
+    max_tokens: int,
+    temperature: float,
+    row_max_tokens: Sequence[int] | None,
+    prefix_tokens: int,
+    max_active_rows: int,
+    max_scheduled_tokens: int,
+    prefill_chunk_size: int | None = None,
+    decode_run_steps: int = 1,
+    arrival_steps: Sequence[int] | None = None,
+    static_graph_buckets: bool = False,
+) -> None:
+    if not _is_tensor_parallel_primary_model(model):
+        return
+    import torch.distributed as dist
+
+    if not dist.is_available() or not dist.is_initialized():
+        return
+    command = [
+        {
+            "op": "token_budget_prompt_list_run",
+            "input_id_lists": [list(prompt) for prompt in prompts],
+            "max_tokens": int(max_tokens),
+            "row_max_tokens": None if row_max_tokens is None else [int(value) for value in row_max_tokens],
+            "temperature": float(temperature),
+            "prefix_tokens": int(prefix_tokens),
+            "max_active_rows": int(max_active_rows),
+            "max_scheduled_tokens": int(max_scheduled_tokens),
+            "prefill_chunk_size": 0 if prefill_chunk_size is None else int(prefill_chunk_size),
+            "decode_run_steps": int(decode_run_steps),
+            "arrival_steps": None if arrival_steps is None else [int(value) for value in arrival_steps],
+            "static_graph_buckets": bool(static_graph_buckets),
+        }
+    ]
+    dist.broadcast_object_list(command, src=0)
+
+
+def _broadcast_tensor_parallel_persistent_prompt_list_step(
+    model: object,
+    payload: Mapping[str, object],
+) -> None:
+    if not _is_tensor_parallel_primary_model(model):
+        return
+    import torch.distributed as dist
+
+    if not dist.is_available() or not dist.is_initialized():
+        return
+    if _tensor_parallel_tensor_commands_enabled(model):
+        command_group = _tensor_parallel_tensor_command_group(dist)
+        command_device = _tensor_parallel_tensor_command_device(
+            getattr(model, "device", torch.device("cpu")),
+            command_group,
+        )
+        meta, temp, decode_rows, prefill_rows, prompt_lengths, prompt_token_rows, finished_ids = (
+            _persistent_prompt_list_step_tensor_payload(payload, command_device)
+        )
+        _broadcast_tensor_command(meta, src=0, group=command_group)
+        _broadcast_tensor_command(temp, src=0, group=command_group)
+        _broadcast_tensor_command(decode_rows, src=0, group=command_group)
+        _broadcast_tensor_command(prefill_rows, src=0, group=command_group)
+        _broadcast_tensor_command(prompt_lengths, src=0, group=command_group)
+        _broadcast_tensor_command(prompt_token_rows, src=0, group=command_group)
+        _broadcast_tensor_command(finished_ids, src=0, group=command_group)
+        return
+    command = dict(payload)
+    command["op"] = "persistent_prompt_list_step"
+    dist.broadcast_object_list([command], src=0)
+
+
+def _broadcast_tensor_parallel_persistent_prompt_list_decode_run(
+    model: object,
+    payload: Mapping[str, object],
+) -> None:
+    if not _is_tensor_parallel_primary_model(model):
+        return
+    import torch.distributed as dist
+
+    if not dist.is_available() or not dist.is_initialized():
+        return
+    if _tensor_parallel_tensor_commands_enabled(model):
+        command_group = _tensor_parallel_tensor_command_group(dist)
+        command_device = _tensor_parallel_tensor_command_device(
+            getattr(model, "device", torch.device("cpu")),
+            command_group,
+        )
+        meta, temp = _persistent_prompt_list_decode_run_tensor_payload(payload, command_device)
+        _broadcast_tensor_command(meta, src=0, group=command_group)
+        _broadcast_tensor_command(temp, src=0, group=command_group)
+        return
+    command = dict(payload)
+    command["op"] = "persistent_prompt_list_decode_run"
+    dist.broadcast_object_list([command], src=0)
+
+
+def _broadcast_tensor_parallel_persistent_prompt_list_start(
+    model: object,
+    *,
+    prefix: Sequence[int],
+    cache_batch_size: int,
+    max_seq_len: int,
+    temperature: float,
+    max_tokens: int = 0,
+) -> None:
+    if not _is_tensor_parallel_primary_model(model):
+        return
+    import torch.distributed as dist
+
+    if not dist.is_available() or not dist.is_initialized():
+        return
+    if _tensor_parallel_tensor_commands_enabled(model):
+        command_group = _tensor_parallel_tensor_command_group(dist)
+        command_device = _tensor_parallel_tensor_command_device(
+            getattr(model, "device", torch.device("cpu")),
+            command_group,
+        )
+        prefix_tensor = torch.tensor([int(token_id) for token_id in prefix], dtype=torch.long, device=command_device)
+        meta = torch.zeros(_TP_COMMAND_META_FIELDS, dtype=torch.long, device=command_device)
+        meta[0] = _TP_COMMAND_PROMPT_LIST_PERSISTENT_START
+        meta[4] = int(max_tokens)
+        meta[5] = int(prefix_tensor.numel())
+        meta[6] = int(max_seq_len)
+        meta[7] = int(cache_batch_size)
+        temp = torch.tensor([float(temperature)], dtype=torch.float64, device=command_device)
+        _broadcast_tensor_command(meta, src=0, group=command_group)
+        _broadcast_tensor_command(temp, src=0, group=command_group)
+        if prefix_tensor.numel() > 0:
+            _broadcast_tensor_command(prefix_tensor, src=0, group=command_group)
+        return
+    dist.broadcast_object_list(
+        [
+            {
+                "op": "persistent_prompt_list_start",
+                "prefix": [int(token_id) for token_id in prefix],
+                "cache_batch_size": int(cache_batch_size),
+                "max_seq_len": int(max_seq_len),
+                "temperature": float(temperature),
+                "max_tokens": int(max_tokens),
+            }
+        ],
+        src=0,
+    )
+
+
+def _broadcast_tensor_parallel_persistent_prompt_list_close(model: object) -> None:
+    if not _is_tensor_parallel_primary_model(model):
+        return
+    import torch.distributed as dist
+
+    if not dist.is_available() or not dist.is_initialized():
+        return
+    if _tensor_parallel_tensor_commands_enabled(model):
+        command_group = _tensor_parallel_tensor_command_group(dist)
+        command_device = _tensor_parallel_tensor_command_device(
+            getattr(model, "device", torch.device("cpu")),
+            command_group,
+        )
+        meta = torch.zeros(_TP_COMMAND_META_FIELDS, dtype=torch.long, device=command_device)
+        meta[0] = _TP_COMMAND_PROMPT_LIST_PERSISTENT_CLOSE
+        _broadcast_tensor_command(meta, src=0, group=command_group)
+        return
+    dist.broadcast_object_list([{"op": "persistent_prompt_list_close"}], src=0)
+
+
+def _broadcast_tensor_parallel_online_start(
+    model: object,
+    *,
+    max_seq_len: int,
+    max_active_requests: int,
+    prefix_cache_capacity: int,
+    prefill_token_budget: int | None,
+    temperature: float,
+    enable_ragged_decode: bool = True,
+    store_reusable_prefixes: bool = True,
+    store_full_prompt_prefixes: bool = True,
+    max_tokens: int = 0,
+) -> None:
+    _broadcast_tensor_parallel_online_command(
+        model,
+        {
+            "op": "online_start",
+            "max_seq_len": int(max_seq_len),
+            "max_active_requests": int(max_active_requests),
+            "prefix_cache_capacity": int(prefix_cache_capacity),
+            "prefill_token_budget": 0 if prefill_token_budget is None else int(prefill_token_budget),
+            "temperature": float(temperature),
+            "enable_ragged_decode": bool(enable_ragged_decode),
+            "store_reusable_prefixes": bool(store_reusable_prefixes),
+            "store_full_prompt_prefixes": bool(store_full_prompt_prefixes),
+            "max_tokens": int(max_tokens),
+        },
+    )
+
+
+def _broadcast_tensor_parallel_online_submit_prompt_lists(
+    model: object,
+    prompts: Sequence[Sequence[int]],
+    *,
+    max_tokens: int,
+    row_max_tokens: Sequence[int] | None,
+    arrival_step: int,
+    eos_token_id: int | None,
+    request_id_start: int = 0,
+) -> None:
+    _broadcast_tensor_parallel_online_command(
+        model,
+        {
+            "op": "online_submit",
+            "input_id_lists": [list(prompt) for prompt in prompts],
+            "max_tokens": int(max_tokens),
+            "row_max_tokens": None if row_max_tokens is None else [int(value) for value in row_max_tokens],
+            "arrival_step": int(arrival_step),
+            "eos_token_id": eos_token_id,
+            "request_id_start": int(request_id_start),
+        },
+    )
+
+
+def _broadcast_tensor_parallel_online_step(model: object, steps: int = 1) -> None:
+    payload: dict[str, object] = {"op": "online_step"}
+    if steps != 1:
+        payload["steps"] = int(steps)
+    _broadcast_tensor_parallel_online_command(model, payload)
+
+
+def _broadcast_tensor_parallel_online_close(model: object) -> None:
+    _broadcast_tensor_parallel_online_command(model, {"op": "online_close"})
+
+
+def _broadcast_tensor_parallel_token_budget_start(
+    model: object,
+    *,
+    max_seq_len: int,
+    max_active_rows: int,
+    temperature: float,
+    max_tokens: int = 0,
+    prefix: Sequence[int] = (),
+) -> None:
+    if not _is_tensor_parallel_primary_model(model):
+        return
+    import torch.distributed as dist
+
+    if not dist.is_available() or not dist.is_initialized():
+        return
+    payload = {
+        "op": "token_budget_start",
+        "max_seq_len": int(max_seq_len),
+        "max_active_rows": int(max_active_rows),
+        "temperature": float(temperature),
+        "max_tokens": int(max_tokens),
+        "prefix": [int(token_id) for token_id in prefix],
+    }
+    if _tensor_parallel_tensor_commands_enabled(model):
+        command_group = _tensor_parallel_tensor_command_group(dist)
+        command_device = _tensor_parallel_tensor_command_device(
+            getattr(model, "device", torch.device("cpu")),
+            command_group,
+        )
+        prefix_tensor = torch.tensor([int(token_id) for token_id in prefix], dtype=torch.long, device=command_device)
+        meta = torch.zeros(_TP_COMMAND_META_FIELDS, dtype=torch.long, device=command_device)
+        meta[0] = _TP_COMMAND_TOKEN_BUDGET_START
+        meta[4] = int(max_tokens)
+        meta[5] = int(prefix_tensor.numel())
+        meta[6] = int(max_seq_len)
+        meta[7] = int(max_active_rows)
+        temp = torch.tensor([float(temperature)], dtype=torch.float64, device=command_device)
+        _broadcast_tensor_command(meta, src=0, group=command_group)
+        _broadcast_tensor_command(temp, src=0, group=command_group)
+        if prefix_tensor.numel() > 0:
+            _broadcast_tensor_command(prefix_tensor, src=0, group=command_group)
+        return
+    dist.broadcast_object_list([payload], src=0)
+
+
+def _broadcast_tensor_parallel_token_budget_close(model: object) -> None:
+    if not _is_tensor_parallel_primary_model(model):
+        return
+    import torch.distributed as dist
+
+    if not dist.is_available() or not dist.is_initialized():
+        return
+    if _tensor_parallel_tensor_commands_enabled(model):
+        command_group = _tensor_parallel_tensor_command_group(dist)
+        command_device = _tensor_parallel_tensor_command_device(
+            getattr(model, "device", torch.device("cpu")),
+            command_group,
+        )
+        meta = torch.zeros(_TP_COMMAND_META_FIELDS, dtype=torch.long, device=command_device)
+        meta[0] = _TP_COMMAND_TOKEN_BUDGET_CLOSE
+        _broadcast_tensor_command(meta, src=0, group=command_group)
+        return
+    dist.broadcast_object_list([{"op": "token_budget_close"}], src=0)
+
+
+@contextmanager
+def _tensor_parallel_token_budget_lifecycle(
+    model: object,
+    *,
+    max_seq_len: int,
+    max_active_rows: int,
+    temperature: float,
+    max_tokens: int = 0,
+    prefix: Sequence[int] = (),
+) -> Iterator[None]:
+    _broadcast_tensor_parallel_token_budget_start(
+        model,
+        max_seq_len=max_seq_len,
+        max_active_rows=max_active_rows,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        prefix=prefix,
+    )
+    try:
+        yield
+    finally:
+        _broadcast_tensor_parallel_token_budget_close(model)
+
+
+def _broadcast_tensor_parallel_token_budget_step(model: object, payload: Mapping[str, object]) -> None:
+    if not _is_tensor_parallel_primary_model(model):
+        return
+    import torch.distributed as dist
+
+    if not dist.is_available() or not dist.is_initialized():
+        return
+    if _tensor_parallel_tensor_commands_enabled(model):
+        command_group = _tensor_parallel_tensor_command_group(dist)
+        command_device = _tensor_parallel_tensor_command_device(
+            getattr(model, "device", torch.device("cpu")),
+            command_group,
+        )
+        meta, chunks, prefill_lengths, prefill_token_rows, finished_ids = _token_budget_step_tensor_payload(
+            payload,
+            command_device,
+        )
+        _broadcast_tensor_command(meta, src=0, group=command_group)
+        _broadcast_tensor_command(chunks, src=0, group=command_group)
+        _broadcast_tensor_command(prefill_lengths, src=0, group=command_group)
+        _broadcast_tensor_command(prefill_token_rows, src=0, group=command_group)
+        _broadcast_tensor_command(finished_ids, src=0, group=command_group)
+        return
+    dist.broadcast_object_list([dict(payload)], src=0)
+
+
+def _broadcast_tensor_parallel_token_budget_decode_run(model: object, payload: Mapping[str, object]) -> None:
+    if not _is_tensor_parallel_primary_model(model):
+        return
+    import torch.distributed as dist
+
+    if not dist.is_available() or not dist.is_initialized():
+        return
+    if _tensor_parallel_tensor_commands_enabled(model):
+        command_group = _tensor_parallel_tensor_command_group(dist)
+        command_device = _tensor_parallel_tensor_command_device(
+            getattr(model, "device", torch.device("cpu")),
+            command_group,
+        )
+        meta, step_tensor, chunk_tensor, finished_ids = _token_budget_decode_run_tensor_payload(
+            payload,
+            command_device,
+        )
+        _broadcast_tensor_command(meta, src=0, group=command_group)
+        _broadcast_tensor_command(step_tensor, src=0, group=command_group)
+        _broadcast_tensor_command(chunk_tensor, src=0, group=command_group)
+        _broadcast_tensor_command(finished_ids, src=0, group=command_group)
+        return
+    dist.broadcast_object_list([dict(payload)], src=0)
+
+
+def _broadcast_tensor_parallel_online_command(model: object, payload: Mapping[str, object]) -> None:
+    if not _is_tensor_parallel_primary_model(model):
+        return
+    import torch.distributed as dist
+
+    if not dist.is_available() or not dist.is_initialized():
+        return
+    if _tensor_parallel_tensor_commands_enabled(model):
+        command_group = _tensor_parallel_tensor_command_group(dist)
+        command_device = _tensor_parallel_tensor_command_device(
+            getattr(model, "device", torch.device("cpu")),
+            command_group,
+        )
+        op = payload.get("op")
+        if op == "online_start":
+            meta = torch.zeros(_TP_COMMAND_META_FIELDS, dtype=torch.long, device=command_device)
+            meta[0] = _TP_COMMAND_ONLINE_START
+            meta[3] = int(bool(payload.get("store_full_prompt_prefixes", True)))
+            meta[4] = int(payload.get("max_tokens", 0))
+            meta[5] = int(bool(payload.get("enable_ragged_decode", True)))
+            meta[6] = int(payload["max_seq_len"])
+            meta[7] = int(payload["max_active_requests"])
+            meta[8] = int(payload["prefix_cache_capacity"])
+            meta[9] = int(payload.get("prefill_token_budget") or 0)
+            meta[10] = int(bool(payload.get("store_reusable_prefixes", True)))
+            temp = torch.tensor([float(payload.get("temperature", 0.0))], dtype=torch.float64, device=command_device)
+            _broadcast_tensor_command(meta, src=0, group=command_group)
+            _broadcast_tensor_command(temp, src=0, group=command_group)
+            return
+        if op == "online_step":
+            meta = torch.zeros(_TP_COMMAND_META_FIELDS, dtype=torch.long, device=command_device)
+            meta[0] = _TP_COMMAND_ONLINE_STEP
+            meta[4] = max(1, int(payload.get("steps", 1)))
+            _broadcast_tensor_command(meta, src=0, group=command_group)
+            return
+        if op == "online_close":
+            meta = torch.zeros(_TP_COMMAND_META_FIELDS, dtype=torch.long, device=command_device)
+            meta[0] = _TP_COMMAND_ONLINE_CLOSE
+            _broadcast_tensor_command(meta, src=0, group=command_group)
+            return
+        if op == "online_submit":
+            prompts = payload.get("input_id_lists")
+            if isinstance(prompts, list):
+                token_rows, lengths = _prompt_list_tensor_payload(prompts, command_device)
+                row_max = _coerce_optional_int_sequence(payload.get("row_max_tokens"))
+                row_max_tensor = (
+                    torch.tensor(row_max, dtype=torch.long, device=command_device)
+                    if row_max is not None
+                    else torch.empty(0, dtype=torch.long, device=command_device)
+                )
+                meta = torch.tensor(
+                    [
+                        _TP_COMMAND_ONLINE_SUBMIT_PROMPT_LISTS,
+                        1,
+                        int(token_rows.size(0)),
+                        int(token_rows.size(1)),
+                        int(payload.get("max_tokens", 0)),
+                        int(row_max_tensor.numel() > 0),
+                        int(payload.get("arrival_step", 0)),
+                        -1 if payload.get("eos_token_id") is None else int(payload["eos_token_id"]),
+                        int(payload.get("request_id_start", 0)),
+                        0,
+                    ],
+                    dtype=torch.long,
+                    device=command_device,
+                )
+                temp = torch.zeros(1, dtype=torch.float64, device=command_device)
+                _broadcast_tensor_command(meta, src=0, group=command_group)
+                _broadcast_tensor_command(temp, src=0, group=command_group)
+                _broadcast_tensor_command(lengths, src=0, group=command_group)
+                _broadcast_tensor_command(token_rows, src=0, group=command_group)
+                if row_max_tensor.numel() > 0:
+                    _broadcast_tensor_command(row_max_tensor, src=0, group=command_group)
+                return
+    dist.broadcast_object_list([dict(payload)], src=0)
+
+
 def _broadcast_tensor_parallel_stop(model: object) -> None:
     if not _is_tensor_parallel_primary_model(model):
         return
@@ -4143,12 +9071,36 @@ def _broadcast_tensor_parallel_stop(model: object) -> None:
 
     if dist.is_available() and dist.is_initialized():
         if _tensor_parallel_tensor_commands_enabled(model):
-            device = _tensor_parallel_command_device(getattr(model, "device", torch.device("cpu")))
+            command_group = _tensor_parallel_tensor_command_group(dist)
+            device = _tensor_parallel_tensor_command_device(
+                getattr(model, "device", torch.device("cpu")),
+                command_group,
+            )
             meta = torch.zeros(_TP_COMMAND_META_FIELDS, dtype=torch.long, device=device)
             meta[0] = _TP_COMMAND_STOP
-            dist.broadcast(meta, src=0)
+            _broadcast_tensor_command(meta, src=0, group=command_group)
             return
         dist.broadcast_object_list([{"op": "stop"}], src=0)
+
+
+def _broadcast_tensor_parallel_cleanup(model: object) -> None:
+    if not _is_tensor_parallel_primary_model(model):
+        return
+    import torch.distributed as dist
+
+    if not (dist.is_available() and dist.is_initialized()):
+        return
+    if _tensor_parallel_tensor_commands_enabled(model):
+        command_group = _tensor_parallel_tensor_command_group(dist)
+        device = _tensor_parallel_tensor_command_device(
+            getattr(model, "device", torch.device("cpu")),
+            command_group,
+        )
+        meta = torch.zeros(_TP_COMMAND_META_FIELDS, dtype=torch.long, device=device)
+        meta[0] = _TP_COMMAND_CLEANUP
+        _broadcast_tensor_command(meta, src=0, group=command_group)
+        return
+    dist.broadcast_object_list([{"op": "cleanup"}], src=0)
 
 
 def _prompt_list_tensor_payload(
@@ -4181,7 +9133,12 @@ def _tensor_parallel_worker_loop(engine: OpenAICompletionEngine) -> None:
 
     if not dist.is_available() or not dist.is_initialized():
         raise RuntimeError("tensor-parallel worker loop requires an initialized process group")
+    online_runtime_engine: _RuntimeContinuousBatchEngine | None = None
+    online_symm_scope: ContextManager[None] | None = None
+    persistent_prompt_list_symm_scope: ContextManager[None] | None = None
+    token_budget_symm_scope: ContextManager[None] | None = None
     while True:
+        cuda_sync: bool | None = None
         if _tensor_parallel_tensor_commands_enabled(getattr(engine, "model", None)):
             payload = _receive_tensor_parallel_tensor_payload(engine)
         else:
@@ -4192,10 +9149,186 @@ def _tensor_parallel_worker_loop(engine: OpenAICompletionEngine) -> None:
             continue
         op = payload.get("op")
         if op == "stop":
+            if online_symm_scope is not None:
+                online_symm_scope.__exit__(None, None, None)
+            if persistent_prompt_list_symm_scope is not None:
+                persistent_prompt_list_symm_scope.__exit__(None, None, None)
+            if token_budget_symm_scope is not None:
+                token_budget_symm_scope.__exit__(None, None, None)
             return
-        if op != "generate":
-            raise ValueError(f"unsupported tensor-parallel worker op: {op}")
+        cuda_sync_value = payload.get("cuda_sync")
+        if isinstance(cuda_sync_value, bool):
+            cuda_sync = cuda_sync_value
         try:
+            if op == "cleanup":
+                engine._clear_runtime_state_after_idle()
+                continue
+            if op == "persistent_prompt_list_start":
+                if persistent_prompt_list_symm_scope is not None:
+                    persistent_prompt_list_symm_scope.__exit__(None, None, None)
+                    persistent_prompt_list_symm_scope = None
+                prefix = payload.get("prefix", [])
+                if not isinstance(prefix, list):
+                    raise ValueError("persistent prompt-list start requires prefix")
+                max_seq_len = int(payload["max_seq_len"])
+                temperature = float(payload.get("temperature", 0.0))
+                engine._start_persistent_prompt_list_step_state(
+                    prefix=[int(token_id) for token_id in prefix],
+                    cache_batch_size=int(payload["cache_batch_size"]),
+                    max_seq_len=max_seq_len,
+                    temperature=temperature,
+                    max_tokens=int(payload.get("max_tokens", max(0, max_seq_len - len(prefix)))),
+                )
+                max_tokens = int(payload.get("max_tokens", max(0, max_seq_len - len(prefix))))
+                persistent_prompt_list_symm_scope = _tensor_parallel_symm_mem_allreduce_scope(
+                    getattr(engine, "model", None),
+                    getattr(engine, "device", torch.device("cpu")),
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                )
+                persistent_prompt_list_symm_scope.__enter__()
+                continue
+            if op == "token_budget_start":
+                if token_budget_symm_scope is not None:
+                    token_budget_symm_scope.__exit__(None, None, None)
+                    token_budget_symm_scope = None
+                handler = getattr(engine, "_handle_token_budget_start_payload", None)
+                if not callable(handler):
+                    raise RuntimeError("token-budget start handler is not installed")
+                handler(payload)
+                temperature = float(payload.get("temperature", 0.0))
+                token_budget_symm_scope = _tensor_parallel_symm_mem_allreduce_scope(
+                    getattr(engine, "model", None),
+                    getattr(engine, "device", torch.device("cpu")),
+                    max_tokens=int(payload.get("max_tokens", 0)),
+                    temperature=temperature,
+                )
+                token_budget_symm_scope.__enter__()
+                continue
+            if op == "persistent_prompt_list_step":
+                handler = getattr(engine, "_handle_persistent_prompt_list_step_payload", None)
+                if not callable(handler):
+                    raise RuntimeError("persistent prompt-list step handler is not installed")
+                handler(payload)
+                continue
+            if op == "persistent_prompt_list_decode_run":
+                handler = getattr(engine, "_handle_persistent_prompt_list_decode_run_payload", None)
+                if not callable(handler):
+                    raise RuntimeError("persistent prompt-list decode-run handler is not installed")
+                handler(payload)
+                continue
+            if op == "token_budget_step":
+                handler = getattr(engine, "_handle_token_budget_step_payload", None)
+                if not callable(handler):
+                    raise RuntimeError("token-budget step handler is not installed")
+                handler(payload)
+                continue
+            if op == "token_budget_decode_run":
+                handler = getattr(engine, "_handle_token_budget_decode_run_payload", None)
+                if not callable(handler):
+                    raise RuntimeError("token-budget decode-run handler is not installed")
+                handler(payload)
+                continue
+            if op == "token_budget_prompt_list_run":
+                handler = getattr(engine, "_handle_token_budget_prompt_list_run_payload", None)
+                if not callable(handler):
+                    raise RuntimeError("token-budget prompt-list run handler is not installed")
+                temperature = float(payload.get("temperature", 0.0))
+                with _tensor_parallel_symm_mem_allreduce_scope(
+                    getattr(engine, "model", None),
+                    getattr(engine, "device", torch.device("cpu")),
+                    max_tokens=int(payload.get("max_tokens", 0)),
+                    temperature=temperature,
+                ):
+                    handler(payload)
+                continue
+            if op == "persistent_prompt_list_close":
+                engine._close_persistent_prompt_list_step_state()
+                if persistent_prompt_list_symm_scope is not None:
+                    persistent_prompt_list_symm_scope.__exit__(None, None, None)
+                    persistent_prompt_list_symm_scope = None
+                continue
+            if op == "token_budget_close":
+                handler = getattr(engine, "_handle_token_budget_close_payload", None)
+                if not callable(handler):
+                    raise RuntimeError("token-budget close handler is not installed")
+                handler(payload)
+                if token_budget_symm_scope is not None:
+                    token_budget_symm_scope.__exit__(None, None, None)
+                    token_budget_symm_scope = None
+                continue
+            if op == "online_start":
+                if online_symm_scope is not None:
+                    online_symm_scope.__exit__(None, None, None)
+                    online_symm_scope = None
+                online_runtime_engine = None
+                max_seq_len = int(payload["max_seq_len"])
+                max_active = int(payload.get("max_active_requests", 1))
+                prefix_rows = int(payload.get("prefix_cache_capacity", 0))
+                prefill_budget_value = int(payload.get("prefill_token_budget", 0))
+                temperature = float(payload.get("temperature", 0.0))
+                online_runtime_engine = _RuntimeContinuousBatchEngine(
+                    getattr(engine, "model"),
+                    device=getattr(engine, "device", torch.device("cpu")),
+                    cache_backend=str(getattr(engine, "cache_backend", "dense")),
+                    page_size=int(getattr(engine, "page_size", 16)),
+                    temperature=temperature,
+                    max_active_requests=max_active,
+                    prefix_cache_capacity=prefix_rows,
+                    prefill_token_budget=prefill_budget_value if prefill_budget_value > 0 else None,
+                    enable_ragged_decode=bool(payload.get("enable_ragged_decode", True)),
+                    store_reusable_prefixes=bool(payload.get("store_reusable_prefixes", True)),
+                    store_full_prompt_prefixes=bool(payload.get("store_full_prompt_prefixes", True)),
+                )
+                online_runtime_engine.start_online(max_seq_len=max_seq_len)
+                online_symm_scope = _tensor_parallel_symm_mem_allreduce_scope(
+                    getattr(engine, "model"),
+                    getattr(engine, "device", torch.device("cpu")),
+                    max_tokens=int(payload.get("max_tokens", 0)),
+                    temperature=temperature,
+                )
+                online_symm_scope.__enter__()
+                continue
+            if op == "online_submit":
+                input_id_lists = payload.get("input_id_lists")
+                if not isinstance(input_id_lists, list):
+                    raise ValueError("online_submit requires input_id_lists")
+                row_max_tokens = _coerce_optional_int_sequence(payload.get("row_max_tokens"))
+                if row_max_tokens is None:
+                    default_max_tokens = int(payload.get("max_tokens", 0))
+                    row_max_tokens = [default_max_tokens for _ in input_id_lists]
+                eos_token_id = payload.get("eos_token_id")
+                eos = int(eos_token_id) if isinstance(eos_token_id, int) else None
+                arrival_step = int(payload.get("arrival_step", 0))
+                request_id_start = int(payload.get("request_id_start", 0))
+                if online_runtime_engine is None:
+                    raise RuntimeError("online tensor-parallel worker engine has not been started")
+                for index, prompt in enumerate(input_id_lists):
+                    online_runtime_engine.submit_online(
+                        _RuntimeServingRequest(
+                            str(request_id_start + index),
+                            tuple(int(token_id) for token_id in prompt),
+                            int(row_max_tokens[index]),
+                            arrival_step=arrival_step,
+                            eos_token_id=eos,
+                        )
+                    )
+                continue
+            if op == "online_step":
+                if online_runtime_engine is None:
+                    raise RuntimeError("online tensor-parallel worker engine has not been started")
+                for _ in range(max(1, int(payload.get("steps", 1)))):
+                    for _event in online_runtime_engine.step_online():
+                        pass
+                continue
+            if op == "online_close":
+                online_runtime_engine = None
+                if online_symm_scope is not None:
+                    online_symm_scope.__exit__(None, None, None)
+                    online_symm_scope = None
+                continue
+            if op != "generate":
+                raise ValueError(f"unsupported tensor-parallel worker op: {op}")
             max_tokens = int(payload["max_tokens"])
             temperature = float(payload["temperature"])
             with _tensor_parallel_symm_mem_allreduce_scope(
@@ -4206,13 +9339,14 @@ def _tensor_parallel_worker_loop(engine: OpenAICompletionEngine) -> None:
             ):
                 if "input_id_lists" in payload:
                     if bool(payload.get("stream", True)):
-                        for _ in engine._generate_prompt_list_batch_steps(
+                        iterator = engine._generate_prompt_list_batch_steps(
                             payload["input_id_lists"],
                             max_tokens=max_tokens,
                             temperature=temperature,
                             broadcast_tensor_parallel=False,
                             row_max_tokens=_coerce_optional_int_sequence(payload.get("row_max_tokens")),
-                        ):
+                        )
+                        for _ in iterator:
                             pass
                     else:
                         for prompt_group in _indexed_prompts_by_length(
@@ -4239,13 +9373,14 @@ def _tensor_parallel_worker_loop(engine: OpenAICompletionEngine) -> None:
                 else:
                     input_ids = torch.tensor(payload["input_ids"], dtype=torch.long, device=engine.device)
                 if bool(payload.get("stream", True)):
-                    for _ in engine._generate_batch_steps(
+                    iterator = engine._generate_batch_steps(
                         input_ids,
                         max_tokens=max_tokens,
                         temperature=temperature,
                         broadcast_tensor_parallel=False,
                         row_max_tokens=_coerce_optional_int_sequence(payload.get("row_max_tokens")),
-                    ):
+                    )
+                    for _ in iterator:
                         pass
                 else:
                     engine._generate_batch_tokens(
@@ -4255,7 +9390,7 @@ def _tensor_parallel_worker_loop(engine: OpenAICompletionEngine) -> None:
                         broadcast_tensor_parallel=False,
                     )
         finally:
-            _sync_tensor_parallel_command(getattr(engine, "model", None), engine.device)
+            _sync_tensor_parallel_command(getattr(engine, "model", None), engine.device, cuda_sync=cuda_sync)
 
 
 def _allocate_cache(
@@ -4289,8 +9424,21 @@ def _generation_cache_capacity(model: object, requested_tokens: int) -> int:
     return requested_tokens
 
 
+def _generation_cache_batch_capacity(model: object, requested_batch: int) -> int:
+    requested_batch = max(1, int(requested_batch))
+    if not _prefers_exact_generation_cache(model):
+        return requested_batch
+    if not env_flag("TORCHINFERNO_OPENAI_TP_CACHE_BATCH_BUCKETING", True):
+        return requested_batch
+    buckets = tuple(sorted(_parse_positive_int_csv(os.environ.get("TORCHINFERNO_OPENAI_TP_CACHE_BATCH_BUCKETS", "8,64"))))
+    for bucket in buckets:
+        if requested_batch <= bucket:
+            return bucket
+    return requested_batch
+
+
 def _cache_pool_max_entries() -> int:
-    return env_int("TORCHINFERNO_OPENAI_CACHE_POOL_MAX_ENTRIES", 4, minimum=0)
+    return env_int("TORCHINFERNO_OPENAI_CACHE_POOL_MAX_ENTRIES", 5, minimum=0)
 
 
 def _microbatch_cache_pool_max_entries() -> int:
@@ -4301,12 +9449,35 @@ def _generation_cache_seq_len(cache: object) -> int:
     return cache_sequence_length(cache)
 
 
+def _generation_cache_seq_len_if_uniform(cache: object) -> int | None:
+    try:
+        return _generation_cache_seq_len(cache)
+    except ValueError as exc:
+        if "same sequence length" in str(exc):
+            return None
+        raise
+
+
+def _clear_generation_cache_repeated_prefix_if_empty(cache: object) -> None:
+    if _generation_cache_seq_len_if_uniform(cache) == 0:
+        _clear_generation_cache_repeated_prefix(cache)
+
+
 def _set_generation_cache_seq_len(cache: object, seq_len: int) -> None:
     set_cache_sequence_length(
         cache,
         seq_len,
         on_error=lambda exc: warn_optional_failure("openai.generation_cache.seq_len", exc),
     )
+
+
+def _set_generation_cache_rows_seq_lens(cache: object, rows: Iterable[int], seq_lens: Sequence[int]) -> None:
+    row_tuple = tuple(int(row) for row in rows)
+    seq_tuple = tuple(int(seq_len) for seq_len in seq_lens)
+    if len(row_tuple) != len(seq_tuple):
+        raise ValueError("rows and seq_lens must have the same length")
+    for layer in getattr(cache, "layers", ()) or ():
+        _set_layer_rows_seq_lens(layer, row_tuple, seq_tuple)
 
 
 def _prefers_exact_generation_cache(model: object) -> bool:
@@ -4317,10 +9488,13 @@ def _prefers_exact_generation_cache(model: object) -> bool:
 
 
 def _reset_generation_cache(cache: object) -> bool:
-    return reset_cache_sequence(
+    reset = reset_cache_sequence(
         cache,
         on_error=lambda exc: warn_optional_failure("openai.generation_cache.reset", exc),
     )
+    if reset:
+        _set_cache_physical_rows_initialized(cache, False)
+    return reset
 
 
 def _warmup_tensor_parallel_decode_attention(model: object) -> None:
@@ -4368,7 +9542,18 @@ def _forward_selected_logits(
     input_ids: Tensor,
     cache: object,
     logit_positions: Tensor,
+    *,
+    allow_capture: bool = False,
 ) -> tuple[Tensor, object]:
+    graph_logits = _try_prefill_selected_logits_graph(
+        model,
+        input_ids,
+        cache,
+        logit_positions=logit_positions,
+        allow_capture=allow_capture,
+    )
+    if graph_logits is not None:
+        return graph_logits, cache
     forward = model.forward  # type: ignore[attr-defined]
     parameters = _forward_parameter_names(type(model))
     if "logit_positions" not in parameters:
@@ -4387,9 +9572,13 @@ def _prefill_padded_suffix_next_token(
     cache: object,
     suffix_lengths: Sequence[int],
     temperature: float,
+    *,
+    allow_capture: bool = False,
 ) -> tuple[Tensor, object]:
-    if _generation_cache_seq_len(cache) == 0:
-        _clear_generation_cache_repeated_prefix(cache)
+    _clear_generation_cache_repeated_prefix_if_empty(cache)
+    active_cache = cache
+    if _generation_cache_seq_len_if_uniform(cache) is None:
+        active_cache = _cache_row_slice(cache, 0, suffix_ids.size(0)) or cache
     last_positions = torch.tensor(
         [length - 1 for length in suffix_lengths],
         dtype=torch.long,
@@ -4400,10 +9589,16 @@ def _prefill_padded_suffix_next_token(
         batch_size=suffix_ids.size(0),
         max_suffix_len=suffix_ids.size(1),
     ):
-        logits, cache = _forward_selected_logits(model, suffix_ids, cache, last_positions)
+        logits, _ = _forward_selected_logits(
+            model,
+            suffix_ids,
+            active_cache,
+            last_positions,
+            allow_capture=allow_capture,
+        )
         return _sample(model, logits[:, -1, :], temperature), cache
 
-    logits, cache = _forward_all_logits(model, suffix_ids, cache)
+    logits, _ = _forward_all_logits(model, suffix_ids, active_cache)
     row_positions = torch.arange(suffix_ids.size(0), dtype=torch.long, device=suffix_ids.device)
     return _sample(model, logits[row_positions, last_positions, :], temperature), cache
 
@@ -4415,8 +9610,7 @@ def _forward_with_logits_mode(
     *,
     return_last_logits_only: bool,
 ) -> tuple[Tensor, object]:
-    if _generation_cache_seq_len(cache) == 0:
-        _clear_generation_cache_repeated_prefix(cache)
+    _clear_generation_cache_repeated_prefix_if_empty(cache)
     forward = model.forward  # type: ignore[attr-defined]
     parameters = _forward_parameter_names(type(model))
     kwargs: dict[str, object] = {"cache": cache, "use_cache": True}
@@ -4435,8 +9629,7 @@ def _prefill_next_token(
     *,
     allow_capture: bool = False,
 ) -> tuple[Tensor, object]:
-    if _generation_cache_seq_len(cache) == 0:
-        _clear_generation_cache_repeated_prefix(cache)
+    _clear_generation_cache_repeated_prefix_if_empty(cache)
     prefill_token = _try_prefill_graph(model, input_ids, cache, temperature, allow_capture=allow_capture)
     if prefill_token is not None:
         return prefill_token, cache
@@ -4540,10 +9733,11 @@ def _decode_next_token(
     cache: object,
     temperature: float,
 ) -> tuple[Tensor, object]:
-    graph_token = _try_decode_one_token_graph(model, input_ids, cache, temperature)
+    allow_graph_capture = _runtime_decode_graph_capture_enabled(model)
+    graph_token = _try_decode_one_token_graph(model, input_ids, cache, temperature, allow_capture=allow_graph_capture)
     if graph_token is not None:
         return graph_token, cache
-    graph_logits = _try_decode_one_token_logits_graph(model, input_ids, cache)
+    graph_logits = _try_decode_one_token_logits_graph(model, input_ids, cache, allow_capture=allow_graph_capture)
     if graph_logits is None:
         graph_logits, cache = _forward(model, input_ids, cache)
     return _sample(model, graph_logits[:, -1, :], temperature), cache
@@ -4557,6 +9751,9 @@ def _decode_next_token_ragged(
     row_indices: Tensor | None,
     temperature: float,
 ) -> tuple[Tensor, object]:
+    profile_path = _openai_decode_profile_path_for_model(model)
+    profile_start_s = time.perf_counter() if profile_path else 0.0
+    allow_graph_capture = _runtime_ragged_decode_graph_capture_enabled(model, cache)
     graph_token = _try_decode_ragged_token_graph(
         model,
         input_ids,
@@ -4564,8 +9761,19 @@ def _decode_next_token_ragged(
         seq_lens=seq_lens,
         row_indices=row_indices,
         temperature=temperature,
+        allow_capture=allow_graph_capture,
     )
     if graph_token is not None:
+        _record_openai_decode_profile(
+            profile_path,
+            model,
+            input_ids,
+            cache,
+            row_indices,
+            mode="token_graph",
+            start_s=profile_start_s,
+            allow_capture=allow_graph_capture,
+        )
         return graph_token, cache
     graph_logits = _try_decode_ragged_logits_graph(
         model,
@@ -4573,14 +9781,132 @@ def _decode_next_token_ragged(
         cache,
         seq_lens=seq_lens,
         row_indices=row_indices,
+        allow_capture=allow_graph_capture,
     )
     if graph_logits is not None:
-        return _sample(model, graph_logits[:, -1, :], temperature), cache
+        next_token = _sample(model, graph_logits[:, -1, :], temperature)
+        _record_openai_decode_profile(
+            profile_path,
+            model,
+            input_ids,
+            cache,
+            row_indices,
+            mode="logits_graph",
+            start_s=profile_start_s,
+            allow_capture=allow_graph_capture,
+        )
+        return next_token, cache
     decode = getattr(model, "decode_ragged_logits", None)
     if decode is None:
         raise RuntimeError("model does not support ragged decode")
     logits = decode(input_ids, cache, seq_lens=seq_lens, row_indices=row_indices)
-    return _sample(model, logits[:, -1, :], temperature), cache
+    next_token = _sample(model, logits[:, -1, :], temperature)
+    _record_openai_decode_profile(
+        profile_path,
+        model,
+        input_ids,
+        cache,
+        row_indices,
+        mode="eager",
+        start_s=profile_start_s,
+        allow_capture=allow_graph_capture,
+    )
+    return next_token, cache
+
+
+def _openai_decode_profile_path_for_model(model: object) -> str:
+    path = os.environ.get("TORCHINFERNO_OPENAI_DECODE_PROFILE_JSONL", "")
+    if not path:
+        return ""
+    rank = _model_rank(model)
+    if not env_flag("TORCHINFERNO_OPENAI_DECODE_PROFILE_ALL_RANKS", False):
+        target_rank = env_int("TORCHINFERNO_OPENAI_DECODE_PROFILE_RANK", 0, minimum=0)
+        if rank != target_rank:
+            return ""
+    return path
+
+
+def _model_rank(model: object) -> int:
+    try:
+        return int(getattr(model, "rank", 0))
+    except Exception:
+        return 0
+
+
+def _model_graph_cache_profile_fields(model: object, prefix: str) -> dict[str, int]:
+    fields: dict[str, int] = {}
+    for name in (
+        "_prefill_graphs",
+        "_prefill_logits_graphs",
+        "_prefill_selected_logits_graphs",
+        "_decode_graphs",
+        "_decode_logits_graphs",
+        "_ragged_decode_graphs",
+        "_ragged_decode_logits_graphs",
+    ):
+        graphs = getattr(model, name, None)
+        if isinstance(graphs, dict):
+            fields[f"{prefix}{name.removeprefix('_')}"] = len(graphs)
+    return fields
+
+
+def _record_openai_decode_profile(
+    profile_path: str,
+    model: object,
+    input_ids: Tensor,
+    cache: object,
+    row_indices: Tensor | None,
+    *,
+    mode: str,
+    start_s: float,
+    allow_capture: bool,
+) -> None:
+    if not profile_path:
+        return
+    cuda_sync = env_flag("TORCHINFERNO_OPENAI_DECODE_PROFILE_SYNC", False)
+    try:
+        if cuda_sync and input_ids.is_cuda:
+            torch.cuda.synchronize(input_ids.device)
+        cache_layers = tuple(getattr(cache, "layers", ()) or ())
+        first_layer = cache_layers[0] if cache_layers else None
+        cache_max_seq_len = getattr(first_layer, "max_seq_len", None) if first_layer is not None else None
+        cache_batch_size = _cache_batch_size(cache)
+        cache_id = id(cache)
+        ragged_graphs = getattr(model, "_ragged_decode_graphs", None)
+        ragged_logits_graphs = getattr(model, "_ragged_decode_logits_graphs", None)
+        token_graphs_for_cache = (
+            sum(1 for key in ragged_graphs if isinstance(key, tuple) and key and key[0] == cache_id)
+            if isinstance(ragged_graphs, dict)
+            else None
+        )
+        logits_graphs_for_cache = (
+            sum(1 for key in ragged_logits_graphs if isinstance(key, tuple) and key and key[0] == cache_id)
+            if isinstance(ragged_logits_graphs, dict)
+            else None
+        )
+        record = {
+            "event": "ragged_decode_step",
+            "mode": mode,
+            "rank": _model_rank(model),
+            "batch_size": int(input_ids.size(0)),
+            "tokens": int(input_ids.size(1)) if input_ids.ndim > 1 else 1,
+            "row_indices": row_indices is not None,
+            "allow_capture": bool(allow_capture),
+            "cache_batch_size": cache_batch_size,
+            "cache_id": cache_id,
+            "cache_max_seq_len": None if cache_max_seq_len is None else int(cache_max_seq_len),
+            "cache_graph_disabled": bool(getattr(cache, "_torchinferno_disable_ragged_decode_graph", False)),
+            "cache_ephemeral": bool(getattr(cache, "_torchinferno_ephemeral_cache", False)),
+            "runtime_capture": getattr(cache, "_torchinferno_runtime_ragged_decode_capture", None),
+            "token_graphs_for_cache": token_graphs_for_cache,
+            "logits_graphs_for_cache": logits_graphs_for_cache,
+            "elapsed_ms": (time.perf_counter() - start_s) * 1000.0,
+            "cuda_sync": cuda_sync,
+        }
+        with open(profile_path, "a", encoding="utf-8") as profile_file:
+            profile_file.write(json.dumps(record, sort_keys=True) + "\n")
+    except Exception as exc:
+        warn_optional_failure("openai.decode_profile", exc)
 
 
 def _try_decode_ragged_token_graph(
@@ -4591,6 +9917,7 @@ def _try_decode_ragged_token_graph(
     seq_lens: Tensor,
     row_indices: Tensor | None,
     temperature: float,
+    allow_capture: bool = True,
 ) -> Tensor | None:
     if getattr(cache, "_torchinferno_disable_ragged_decode_graph", False):
         return None
@@ -4605,6 +9932,15 @@ def _try_decode_ragged_token_graph(
     decode_graph = getattr(model, "try_decode_ragged_token_graph", None)
     if decode_graph is None:
         return None
+    if _callable_accepts_keyword(decode_graph, "capture_on_miss"):
+        return decode_graph(
+            input_ids,
+            cache,
+            seq_lens=seq_lens,
+            row_indices=row_indices,
+            temperature=temperature,
+            capture_on_miss=allow_capture,
+        )
     return decode_graph(input_ids, cache, seq_lens=seq_lens, row_indices=row_indices, temperature=temperature)
 
 
@@ -4652,6 +9988,7 @@ def _prefer_shared_prefix_padded_suffix_prefill(
     *,
     prefix_tokens: int,
     prompt_lengths: Sequence[int],
+    max_tokens: int | None = None,
 ) -> bool:
     if not env_flag("TORCHINFERNO_OPENAI_SHARED_PREFIX_PADDED_SUFFIX_PREFILL", True):
         return False
@@ -4666,24 +10003,117 @@ def _prefer_shared_prefix_padded_suffix_prefill(
         for same_length in length_groups
         for _index, prompt in same_length
     ]
+    return _shared_prefix_padded_suffix_padding_allowed(
+        suffix_lengths,
+        prefix_tokens=prefix_tokens,
+    ) or _short_output_shared_prefix_padded_suffix_padding_allowed(
+        suffix_lengths,
+        prefix_tokens=prefix_tokens,
+        max_tokens=max_tokens,
+    )
+
+
+def _short_output_shared_prefix_padded_suffix_padding_allowed(
+    suffix_lengths: Sequence[int],
+    *,
+    prefix_tokens: int,
+    max_tokens: int | None,
+) -> bool:
+    if not env_flag("TORCHINFERNO_OPENAI_SHORT_OUTPUT_PADDED_SUFFIX_PREFILL", True):
+        return False
+    if max_tokens is None:
+        return False
+    max_output_tokens = env_int(
+        "TORCHINFERNO_OPENAI_SHORT_OUTPUT_PADDED_SUFFIX_MAX_TOKENS",
+        128,
+        minimum=1,
+    )
+    if max_tokens > max_output_tokens:
+        return False
+    min_rows = env_int(
+        "TORCHINFERNO_OPENAI_SHORT_OUTPUT_PADDED_SUFFIX_MIN_ROWS",
+        48,
+        minimum=1,
+    )
+    if len(suffix_lengths) < min_rows:
+        return False
+    min_prefix_tokens = env_int(
+        "TORCHINFERNO_OPENAI_SHORT_OUTPUT_PADDED_SUFFIX_MIN_PREFIX_TOKENS",
+        64,
+        minimum=0,
+    )
+    if prefix_tokens < min_prefix_tokens:
+        return False
     if not suffix_lengths or min(suffix_lengths) <= 0:
+        return False
+    max_suffix_tokens = env_int(
+        "TORCHINFERNO_OPENAI_SHORT_OUTPUT_PADDED_SUFFIX_MAX_SUFFIX_TOKENS",
+        96,
+        minimum=1,
+    )
+    if max(suffix_lengths) > max_suffix_tokens:
         return False
     real_suffix_tokens = sum(suffix_lengths)
     padded_suffix_tokens = len(suffix_lengths) * max(suffix_lengths)
     padding_tokens = padded_suffix_tokens - real_suffix_tokens
     max_padding_tokens = env_int(
-        "TORCHINFERNO_OPENAI_SHARED_PREFIX_PADDED_SUFFIX_MAX_PADDING_TOKENS",
-        1024,
+        "TORCHINFERNO_OPENAI_SHORT_OUTPUT_PADDED_SUFFIX_MAX_PADDING_TOKENS",
+        4096,
         minimum=0,
     )
     if padding_tokens > max_padding_tokens:
         return False
     max_padding_ratio = env_float(
-        "TORCHINFERNO_OPENAI_SHARED_PREFIX_PADDED_SUFFIX_MAX_PADDING_RATIO",
-        1.5,
+        "TORCHINFERNO_OPENAI_SHORT_OUTPUT_PADDED_SUFFIX_MAX_PADDING_RATIO",
+        1.75,
         minimum=1.0,
     )
     return padded_suffix_tokens <= real_suffix_tokens * max_padding_ratio
+
+
+def _shared_prefix_padded_suffix_static_batch_enabled(
+    model: object,
+    *,
+    prompt_count: int,
+    physical_batch_size: int,
+    device: torch.device,
+) -> bool:
+    if physical_batch_size <= prompt_count:
+        return False
+    if "TORCHINFERNO_OPENAI_SHARED_PREFIX_PADDED_SUFFIX_STATIC_BATCH" in os.environ:
+        return env_flag("TORCHINFERNO_OPENAI_SHARED_PREFIX_PADDED_SUFFIX_STATIC_BATCH", True)
+    if device.type != "cuda":
+        return False
+    if not (_is_tensor_parallel_model(model) and _tensor_parallel_world_size(model) > 1):
+        return False
+    min_rows = env_int(
+        "TORCHINFERNO_OPENAI_SHARED_PREFIX_PADDED_SUFFIX_STATIC_BATCH_MIN_ROWS",
+        16,
+        minimum=1,
+    )
+    if prompt_count < min_rows:
+        return False
+    min_occupancy = env_float(
+        "TORCHINFERNO_OPENAI_SHARED_PREFIX_PADDED_SUFFIX_STATIC_BATCH_MIN_OCCUPANCY",
+        0.75,
+        minimum=0.0,
+    )
+    if min_occupancy > 0.0 and (prompt_count / physical_batch_size) < min_occupancy:
+        return False
+    return env_flag("TORCHINFERNO_OPENAI_TP_CACHE_BATCH_BUCKETING", True)
+
+
+def _shared_prefix_suffix_bucket_selected_logits_capture_enabled(
+    model: object,
+    *,
+    batch_size: int,
+    max_tokens: int,
+    device: torch.device,
+) -> bool:
+    del batch_size, max_tokens, device
+    if not (_is_tensor_parallel_model(model) and _tensor_parallel_world_size(model) > 1):
+        return False
+    return env_flag("TORCHINFERNO_OPENAI_SHARED_PREFIX_SUFFIX_BUCKET_SELECTED_LOGITS_PREFILL_CAPTURE", False)
 
 
 def _selected_padded_suffix_logits_enabled(
@@ -4710,6 +10140,47 @@ def _selected_padded_suffix_logits_enabled(
         minimum=1,
     )
     return batch_size * max_suffix_len >= min_total_logits
+
+
+def _shared_prefix_padded_suffix_bucketed_length(
+    model: object,
+    *,
+    device: torch.device,
+    prompt_count: int,
+    max_suffix_len: int,
+) -> int:
+    max_suffix_len = max(1, int(max_suffix_len))
+    if not env_flag("TORCHINFERNO_OPENAI_SHARED_PREFIX_PADDED_SUFFIX_LENGTH_BUCKETS", False):
+        return max_suffix_len
+    if not (_is_tensor_parallel_model(model) and _tensor_parallel_world_size(model) > 1 and device.type == "cuda"):
+        return max_suffix_len
+    raw_buckets = os.environ.get(
+        "TORCHINFERNO_OPENAI_SHARED_PREFIX_PADDED_SUFFIX_LENGTH_BUCKET_VALUES",
+        "16,32,48,64,80,96,128,160,192,256",
+    )
+    buckets = tuple(sorted(set(_parse_positive_int_csv(raw_buckets))))
+    if not buckets:
+        return max_suffix_len
+    max_extra_tokens = env_int(
+        "TORCHINFERNO_OPENAI_SHARED_PREFIX_PADDED_SUFFIX_LENGTH_BUCKET_MAX_EXTRA_TOKENS",
+        1024,
+        minimum=0,
+    )
+    max_ratio = env_float(
+        "TORCHINFERNO_OPENAI_SHARED_PREFIX_PADDED_SUFFIX_LENGTH_BUCKET_MAX_RATIO",
+        1.25,
+        minimum=1.0,
+    )
+    for bucket in buckets:
+        if bucket < max_suffix_len:
+            continue
+        extra_tokens = (bucket - max_suffix_len) * max(1, int(prompt_count))
+        if extra_tokens > max_extra_tokens:
+            continue
+        if float(bucket) / float(max_suffix_len) > max_ratio:
+            continue
+        return bucket
+    return max_suffix_len
 
 
 def _shared_prefix_padded_suffix_buckets(
@@ -4763,6 +10234,17 @@ def _shared_prefix_padded_suffix_bucket_allowed(
         for group in groups
         for _index, prompt in group
     ]
+    return _shared_prefix_padded_suffix_padding_allowed(
+        suffix_lengths,
+        prefix_tokens=prefix_tokens,
+    )
+
+
+def _shared_prefix_padded_suffix_padding_allowed(
+    suffix_lengths: Sequence[int],
+    *,
+    prefix_tokens: int,
+) -> bool:
     if not suffix_lengths or min(suffix_lengths) <= 0:
         return False
     real_suffix_tokens = sum(suffix_lengths)
@@ -4773,13 +10255,13 @@ def _shared_prefix_padded_suffix_bucket_allowed(
         1024,
         minimum=0,
     )
-    if padding_tokens > max_padding_tokens:
-        return False
     max_padding_ratio = env_float(
         "TORCHINFERNO_OPENAI_SHARED_PREFIX_PADDED_SUFFIX_MAX_PADDING_RATIO",
         1.5,
         minimum=1.0,
     )
+    if padding_tokens > max_padding_tokens:
+        return False
     return padded_suffix_tokens <= real_suffix_tokens * max_padding_ratio
 
 
@@ -4877,17 +10359,91 @@ def _prefer_full_batch_ragged_decode(active_count: int, batch_size: int) -> bool
     return (active_count / batch_size) >= min(1.0, min_fraction)
 
 
-def _ragged_decode_bucket_indices(active_indices: Sequence[int], active: Sequence[bool], *, step: int) -> list[int]:
+@dataclass(frozen=True)
+class _RaggedDecodeRowPlan:
+    active_indices: tuple[int, ...]
+    decode_indices: tuple[int, ...]
+    row_indices: tuple[int, ...] | None
+    advance_row_indices: tuple[int, ...] | None
+
+
+def _shared_prefix_ragged_decode_row_plan(
+    active: Sequence[bool],
+    *,
+    active_indices: Sequence[int] | None = None,
+    step: int,
+    cache_batch_size: int,
+    force_row_indices: bool,
+    static_graph_buckets: bool,
+    prefer_full_bucket: bool = False,
+) -> _RaggedDecodeRowPlan:
+    active_tuple = tuple(
+        int(index)
+        for index in (
+            active_indices
+            if active_indices is not None
+            else [index for index, is_active in enumerate(active) if is_active]
+        )
+    )
+    decode_full_batch = _prefer_full_batch_ragged_decode(len(active_tuple), len(active))
+    if (len(active_tuple) == len(active) or decode_full_batch) and not force_row_indices:
+        return _RaggedDecodeRowPlan(
+            active_indices=active_tuple,
+            decode_indices=tuple(range(len(active))),
+            row_indices=None,
+            advance_row_indices=None,
+        )
+    decode_indices = tuple(
+        _ragged_decode_bucket_indices(
+            active_tuple,
+            active,
+            step=step,
+            batch_capacity=cache_batch_size,
+            static_graph_buckets=static_graph_buckets,
+            prefer_full_bucket=prefer_full_bucket,
+        )
+    )
+    if decode_indices != active_tuple:
+        return _RaggedDecodeRowPlan(
+            active_indices=active_tuple,
+            decode_indices=decode_indices,
+            row_indices=decode_indices,
+            advance_row_indices=active_tuple,
+        )
+    return _RaggedDecodeRowPlan(
+        active_indices=active_tuple,
+        decode_indices=decode_indices,
+        row_indices=active_tuple,
+        advance_row_indices=None,
+    )
+
+
+def _ragged_decode_bucket_indices(
+    active_indices: Sequence[int],
+    active: Sequence[bool],
+    *,
+    step: int,
+    batch_capacity: int | None = None,
+    static_graph_buckets: bool = False,
+    prefer_full_bucket: bool = False,
+) -> list[int]:
     if not env_flag("TORCHINFERNO_OPENAI_RAGGED_DECODE_POWER2_BUCKETS", True):
         return list(active_indices)
-    min_step = env_int("TORCHINFERNO_OPENAI_RAGGED_DECODE_BUCKET_MIN_STEP", 4, minimum=1)
+    default_min_step = 1 if static_graph_buckets else 4
+    min_step = env_int("TORCHINFERNO_OPENAI_RAGGED_DECODE_BUCKET_MIN_STEP", default_min_step, minimum=1)
     if step < min_step:
         return list(active_indices)
     active_count = len(active_indices)
-    batch_size = len(active)
-    if active_count <= 0 or active_count >= batch_size:
+    logical_batch_size = len(active)
+    capacity = max(logical_batch_size, int(batch_capacity or 0))
+    if active_count <= 0 or active_count >= capacity:
         return list(active_indices)
-    bucket_size = min(batch_size, 1 << (active_count - 1).bit_length())
+    bucket_size = _ragged_decode_bucket_size(
+        active_count,
+        capacity,
+        static_graph_buckets=static_graph_buckets,
+        prefer_full_bucket=prefer_full_bucket,
+    )
     if bucket_size <= active_count:
         return list(active_indices)
     active_set = set(active_indices)
@@ -4898,9 +10454,49 @@ def _ragged_decode_bucket_indices(active_indices: Sequence[int], active: Sequenc
         decode_indices.append(index)
         if len(decode_indices) >= bucket_size:
             break
+    for index in range(logical_batch_size, capacity):
+        if len(decode_indices) >= bucket_size:
+            break
+        decode_indices.append(index)
     if len(decode_indices) < bucket_size:
         return list(active_indices)
     return decode_indices
+
+
+def _ragged_decode_bucket_size(
+    active_count: int,
+    capacity: int,
+    *,
+    static_graph_buckets: bool,
+    prefer_full_bucket: bool = False,
+) -> int:
+    if prefer_full_bucket:
+        return capacity
+    if static_graph_buckets:
+        raw_sizes = os.environ.get("TORCHINFERNO_OPENAI_RAGGED_DECODE_BUCKET_SIZES")
+        bucket_sizes = _parse_positive_int_csv(raw_sizes) if raw_sizes is not None else _warmup_ragged_decode_row_counts()
+        for bucket_size in sorted(set(bucket_sizes)):
+            if active_count <= bucket_size <= capacity:
+                return int(bucket_size)
+    return min(capacity, 1 << (active_count - 1).bit_length())
+
+
+def _prefer_paged_ragged_decode_full_bucket(
+    model: object,
+    cache: object,
+    *,
+    static_graph_buckets: bool,
+) -> bool:
+    if "TORCHINFERNO_OPENAI_PAGED_RAGGED_DECODE_FULL_BUCKET" in os.environ:
+        return env_flag("TORCHINFERNO_OPENAI_PAGED_RAGGED_DECODE_FULL_BUCKET", True)
+    if "TORCHINFERNO_OPENAI_RAGGED_DECODE_BUCKET_SIZES" in os.environ:
+        return False
+    return (
+        static_graph_buckets
+        and getattr(cache, "cache_backend", None) == "paged"
+        and not getattr(cache, "_torchinferno_disable_ragged_decode_graph", False)
+        and _openai_ragged_decode_graph_enabled(model)
+    )
 
 
 def _tokenizer_padding_token_id(tokenizer: object | None) -> int:
@@ -5036,8 +10632,7 @@ def _prefill_cache_only(
     *,
     allow_capture: bool = False,
 ) -> object:
-    if _generation_cache_seq_len(cache) == 0:
-        _clear_generation_cache_repeated_prefix(cache)
+    _clear_generation_cache_repeated_prefix_if_empty(cache)
     prefill_logits = _try_prefill_logits_graph(model, input_ids, cache, allow_capture=allow_capture)
     if prefill_logits is not None:
         return cache
@@ -5102,6 +10697,29 @@ def _queued_groups_by_prompt_length(group: Sequence[_QueuedGeneration]) -> list[
     return list(groups.values())
 
 
+def _persistent_prompt_list_payload_request_rows(
+    payload: Mapping[str, object] | None,
+) -> dict[str, int]:
+    if payload is None:
+        return {}
+    request_rows: dict[str, int] = {}
+    decode_ids_obj = payload.get("decode_request_ids", [])
+    decode_rows_obj = payload.get("decode_rows", [])
+    if isinstance(decode_ids_obj, list) and isinstance(decode_rows_obj, list):
+        for request_id, row in zip(decode_ids_obj, decode_rows_obj):
+            request_rows[str(request_id)] = int(row)
+    prefill_items = payload.get("prefill", [])
+    if isinstance(prefill_items, list):
+        for item in prefill_items:
+            if not isinstance(item, Mapping):
+                continue
+            request_id = item.get("request_id")
+            if request_id is None or "row" not in item:
+                continue
+            request_rows[str(request_id)] = int(item["row"])
+    return request_rows
+
+
 def _emit_stream_step(
     group: Sequence[_QueuedGeneration],
     step: int,
@@ -5109,25 +10727,45 @@ def _emit_stream_step(
     stop_token_ids: frozenset[int] = frozenset(),
 ) -> None:
     for request, token_id in zip(group, step_tokens):
-        if request.done:
-            continue
-        if step >= request.max_tokens or token_id is None:
-            _finish_stream_request(request)
-            continue
-        token = int(token_id)
-        if token in stop_token_ids:
-            _finish_stream_request(request)
-            continue
-        request.responses.put(token)
-        if step + 1 >= request.max_tokens:
-            _finish_stream_request(request)
+        _emit_stream_token(
+            request,
+            token_id,
+            generated_tokens=step + 1,
+            stop_token_ids=stop_token_ids,
+        )
 
+
+def _emit_stream_token(
+    request: _QueuedGeneration,
+    token_id: int | None,
+    *,
+    generated_tokens: int,
+    stop_token_ids: frozenset[int] = frozenset(),
+) -> None:
+    if request.done:
+        return
+    if token_id is None or generated_tokens > request.max_tokens:
+        _finish_stream_request(request)
+        return
+    token = int(token_id)
+    if token in stop_token_ids:
+        _finish_stream_request(request)
+        return
+    request.responses.put(token)
+    if generated_tokens >= request.max_tokens:
+        _finish_stream_request(request)
 
 def _finish_stream_request(request: _QueuedGeneration) -> None:
     if request.done:
         return
     request.responses.put(_GenerationDone())
     request.done = True
+
+
+def _fail_stream_request(request: _QueuedGeneration, exc: BaseException) -> None:
+    if not request.done:
+        request.responses.put(exc)
+    _finish_stream_request(request)
 
 
 def _normalize_row_max_tokens(
@@ -5268,6 +10906,41 @@ def _cache_row_slice(cache: object, start: int, end: int) -> object | None:
     return cache_view
 
 
+def _cache_batch_size(cache: object) -> int | None:
+    layers = tuple(getattr(cache, "layers", ()) or ())
+    if not layers:
+        return None
+    first_layer = layers[0]
+    batch_size = getattr(first_layer, "batch_size", None)
+    if batch_size is not None:
+        try:
+            return int(batch_size)
+        except (TypeError, ValueError):
+            pass
+    keys = getattr(first_layer, "keys", None)
+    if isinstance(keys, Tensor) and keys.ndim >= 1:
+        return int(keys.size(0))
+    return None
+
+
+def _set_cache_physical_rows_initialized(cache: object, initialized: bool) -> None:
+    try:
+        setattr(cache, "_torchinferno_physical_rows_initialized", bool(initialized))
+    except Exception:
+        pass
+
+
+def _cache_physical_rows_initialized(cache: object) -> bool:
+    return bool(getattr(cache, "_torchinferno_physical_rows_initialized", False))
+
+
+def _cache_requires_physical_rows_initialized(cache: object) -> bool:
+    layers = tuple(getattr(cache, "layers", ()) or ())
+    if not layers:
+        return False
+    return hasattr(layers[0], "batch_size")
+
+
 def _copy_generation_cache_first_row(source: object, target: object, batch_size: int) -> None:
     if batch_size <= 0:
         return
@@ -5330,6 +11003,70 @@ def _copy_generation_cache_first_row(source: object, target: object, batch_size:
     raise RuntimeError("cannot copy shared prefix cache for non-tensor KV layer")
 
 
+def _copy_generation_cache_first_row_to_rows(
+    source: object,
+    target: object,
+    rows: Sequence[int],
+    seq_len: int,
+) -> bool:
+    target_rows = tuple(int(row) for row in rows)
+    if not target_rows:
+        return True
+    if seq_len <= 0:
+        return False
+    if target_rows == tuple(range(len(target_rows))):
+        _copy_generation_cache_first_row(source, target, len(target_rows))
+        return True
+    source_layers = tuple(getattr(source, "layers", ()) or ())
+    target_layers = tuple(getattr(target, "layers", ()) or ())
+    if not source_layers or len(source_layers) != len(target_layers):
+        return False
+    max_target_row = max(target_rows)
+    for source_layer, target_layer in zip(source_layers, target_layers):
+        source_keys = getattr(source_layer, "keys", None)
+        source_values = getattr(source_layer, "values", None)
+        target_keys = getattr(target_layer, "keys", None)
+        target_values = getattr(target_layer, "values", None)
+        if not all(isinstance(tensor, Tensor) for tensor in (source_keys, source_values, target_keys, target_values)):
+            return False
+        if source_keys.size(0) < 1 or source_values.size(0) < 1:
+            return False
+        if target_keys.size(0) <= max_target_row or target_values.size(0) <= max_target_row:
+            return False
+        if source_keys.size(2) < seq_len or source_values.size(2) < seq_len:
+            return False
+        if target_keys.size(2) < seq_len or target_values.size(2) < seq_len:
+            return False
+        if (
+            source_keys.size(1) != target_keys.size(1)
+            or source_values.size(1) != target_values.size(1)
+            or source_keys.size(3) != target_keys.size(3)
+            or source_values.size(3) != target_values.size(3)
+        ):
+            return False
+    target_span = _contiguous_int_span(target_rows)
+    for source_layer, target_layer in zip(source_layers, target_layers):
+        source_keys = getattr(source_layer, "keys")
+        source_values = getattr(source_layer, "values")
+        target_keys = getattr(target_layer, "keys")
+        target_values = getattr(target_layer, "values")
+        expanded_keys = source_keys[:1, :, :seq_len, :].expand(len(target_rows), -1, -1, -1)
+        expanded_values = source_values[:1, :, :seq_len, :].expand(len(target_rows), -1, -1, -1)
+        if target_span is not None:
+            start, end = target_span
+            target_keys[start:end, :, :seq_len, :].copy_(expanded_keys)
+            target_values[start:end, :, :seq_len, :].copy_(expanded_values)
+        else:
+            target_index = torch.tensor(target_rows, dtype=torch.long, device=target_keys.device)
+            target_keys[:, :, :seq_len, :].index_copy_(0, target_index, expanded_keys)
+            target_values[:, :, :seq_len, :].index_copy_(0, target_index, expanded_values)
+        _set_layer_rows_seq_len(target_layer, target_rows, seq_len)
+    source_tokens = _generation_cache_prefix_tokens(source)
+    if source_tokens is not None and target_rows == tuple(range(len(target_rows))):
+        _mark_generation_cache_repeated_prefix(target, source_tokens, seq_len=seq_len, rows=len(target_rows))
+    return True
+
+
 def _copy_generation_cache_row(
     source: object,
     target: object,
@@ -5368,6 +11105,126 @@ def _copy_generation_cache_row(
     raise RuntimeError("cannot copy ragged cache row for non-tensor KV layer")
 
 
+def _shared_prefix_ragged_cache_bulk_copy_allowed(prompt_count: int, *, max_tokens: int) -> bool:
+    if not env_flag("TORCHINFERNO_OPENAI_SHARED_PREFIX_RAGGED_CACHE_BULK_COPY", True):
+        return False
+    min_rows = env_int("TORCHINFERNO_OPENAI_SHARED_PREFIX_RAGGED_CACHE_BULK_MIN_ROWS", 48, minimum=1)
+    if prompt_count < min_rows:
+        return False
+    max_copy_tokens = env_int(
+        "TORCHINFERNO_OPENAI_SHARED_PREFIX_RAGGED_CACHE_BULK_MAX_TOKENS",
+        128,
+        minimum=0,
+    )
+    return max_copy_tokens <= 0 or max_tokens <= max_copy_tokens
+
+
+def _copy_generation_cache_state_rows_padded(
+    states: Sequence[Mapping[str, object]],
+    target: object,
+    *,
+    prompt_lengths: Sequence[int],
+    prompt_count: int,
+) -> bool:
+    prepared: list[tuple[object, tuple[int, ...], tuple[int, ...], int]] = []
+    target_rows_seen: set[int] = set()
+    for state in states:
+        source = state.get("cache")
+        indices = state.get("indices")
+        if source is None or not isinstance(indices, list):
+            return False
+        target_rows = tuple(int(index) for index in indices)
+        if not target_rows:
+            continue
+        if any(row < 0 or row >= prompt_count or row >= len(prompt_lengths) for row in target_rows):
+            return False
+        if target_rows_seen.intersection(target_rows):
+            return False
+        target_rows_seen.update(target_rows)
+        seq_lens = tuple(int(prompt_lengths[row]) for row in target_rows)
+        max_seq_len = max(seq_lens, default=0)
+        if max_seq_len <= 0:
+            return False
+        prepared.append((source, target_rows, seq_lens, max_seq_len))
+    if len(target_rows_seen) != prompt_count or target_rows_seen != set(range(prompt_count)):
+        return False
+    target_layers = tuple(getattr(target, "layers", ()) or ())
+    if not target_layers:
+        return False
+    for source, target_rows, seq_lens, max_seq_len in prepared:
+        source_layers = tuple(getattr(source, "layers", ()) or ())
+        if not source_layers or len(source_layers) != len(target_layers):
+            return False
+        row_count = len(target_rows)
+        max_target_row = max(target_rows)
+        for source_layer, target_layer in zip(source_layers, target_layers):
+            source_keys = getattr(source_layer, "keys", None)
+            source_values = getattr(source_layer, "values", None)
+            target_keys = getattr(target_layer, "keys", None)
+            target_values = getattr(target_layer, "values", None)
+            if not all(isinstance(tensor, Tensor) for tensor in (source_keys, source_values, target_keys, target_values)):
+                return False
+            if source_keys.size(0) < row_count or source_values.size(0) < row_count:
+                return False
+            if target_keys.size(0) <= max_target_row or target_values.size(0) <= max_target_row:
+                return False
+            if source_keys.size(2) < max_seq_len or source_values.size(2) < max_seq_len:
+                return False
+            if target_keys.size(2) < max_seq_len or target_values.size(2) < max_seq_len:
+                return False
+            if (
+                source_keys.size(1) != target_keys.size(1)
+                or source_values.size(1) != target_values.size(1)
+                or source_keys.size(3) != target_keys.size(3)
+                or source_values.size(3) != target_values.size(3)
+            ):
+                return False
+    for source, target_rows, seq_lens, max_seq_len in prepared:
+        row_count = len(target_rows)
+        for source_layer, target_layer in zip(
+            getattr(source, "layers", ()) or (),
+            target_layers,
+        ):
+            source_keys = getattr(source_layer, "keys")
+            source_values = getattr(source_layer, "values")
+            target_keys = getattr(target_layer, "keys")
+            target_values = getattr(target_layer, "values")
+            target_span = _contiguous_int_span(target_rows)
+            if target_span is not None:
+                start, end = target_span
+                target_keys[start:end, :, :max_seq_len, :].copy_(
+                    source_keys[:row_count, :, :max_seq_len, :]
+                )
+                target_values[start:end, :, :max_seq_len, :].copy_(
+                    source_values[:row_count, :, :max_seq_len, :]
+                )
+            else:
+                target_index = torch.tensor(target_rows, dtype=torch.long, device=target_keys.device)
+                target_keys[:, :, :max_seq_len, :].index_copy_(
+                    0,
+                    target_index,
+                    source_keys[:row_count, :, :max_seq_len, :],
+                )
+                target_values[:, :, :max_seq_len, :].index_copy_(
+                    0,
+                    target_index,
+                    source_values[:row_count, :, :max_seq_len, :],
+                )
+            _set_layer_rows_seq_len(target_layer, target_rows, max_seq_len)
+        _set_generation_cache_rows_seq_lens(target, target_rows, seq_lens)
+    return True
+
+
+def _contiguous_int_span(values: Sequence[int]) -> tuple[int, int] | None:
+    if not values:
+        return None
+    start = int(values[0])
+    for offset, value in enumerate(values):
+        if int(value) != start + offset:
+            return None
+    return start, start + len(values)
+
+
 def _cache_row_seq_len(cache: object, row: int) -> int:
     layers = tuple(getattr(cache, "layers", ()) or ())
     if not layers:
@@ -5391,12 +11248,50 @@ def _layer_row_seq_len(layer: object, row: int) -> int:
     return int(getattr(layer, "seq_len", 0))
 
 
+def _layer_physical_row(layer: object, row: int) -> int:
+    physical_row = getattr(layer, "_physical_row", None)
+    if callable(physical_row):
+        try:
+            return int(physical_row(int(row)))
+        except Exception:
+            return int(row)
+    return int(row)
+
+
+def _set_layer_rows_seq_lens_direct(
+    layer: object,
+    rows: Sequence[int],
+    seq_lens: Sequence[int],
+) -> bool:
+    row_tuple = tuple(int(row) for row in rows)
+    seq_tuple = tuple(int(seq_len) for seq_len in seq_lens)
+    if not row_tuple or len(row_tuple) != len(seq_tuple):
+        return False
+    target = getattr(layer, "_seq_lens", None)
+    if not isinstance(target, list):
+        target = getattr(layer, "seq_lens", None)
+    if not isinstance(target, list):
+        return False
+    physical_rows = tuple(_layer_physical_row(layer, row) for row in row_tuple)
+    if any(row < 0 or row >= len(target) for row in physical_rows):
+        return False
+    for row, seq_len in zip(physical_rows, seq_tuple):
+        target[row] = seq_len
+    uniform = getattr(layer, "_uniform_seq_len", None)
+    if isinstance(uniform, list) and uniform:
+        first = target[0] if target else 0
+        uniform[0] = first if all(value == first for value in target) else None
+    return True
+
+
 def _set_layer_rows_seq_len(layer: object, rows: Iterable[int], seq_len: int) -> None:
+    row_tuple = tuple(int(row) for row in rows)
+    if not row_tuple:
+        return
+    if _set_layer_rows_seq_lens_direct(layer, row_tuple, [int(seq_len)] * len(row_tuple)):
+        return
     set_seq_len = getattr(layer, "set_seq_len", None)
     if callable(set_seq_len):
-        row_tuple = tuple(int(row) for row in rows)
-        if not row_tuple:
-            return
         for_rows = getattr(layer, "for_rows", None)
         if callable(for_rows):
             for_rows(row_tuple).set_seq_len(seq_len)
@@ -5405,18 +11300,32 @@ def _set_layer_rows_seq_len(layer: object, rows: Iterable[int], seq_len: int) ->
         return
     seq_lens = getattr(layer, "seq_lens", None)
     if isinstance(seq_lens, list):
-        for row in rows:
+        for row in row_tuple:
             seq_lens[int(row)] = seq_len
         return
     private_seq_lens = getattr(layer, "_seq_lens", None)
     if isinstance(private_seq_lens, list):
-        for row in rows:
+        for row in row_tuple:
             private_seq_lens[int(row)] = seq_len
         return
     try:
         setattr(layer, "seq_len", seq_len)
     except AttributeError:
         pass
+
+
+def _set_layer_rows_seq_lens(layer: object, rows: Sequence[int], seq_lens: Sequence[int]) -> None:
+    row_tuple = tuple(int(row) for row in rows)
+    seq_tuple = tuple(int(seq_len) for seq_len in seq_lens)
+    if not row_tuple or len(row_tuple) != len(seq_tuple):
+        return
+    if _set_layer_rows_seq_lens_direct(layer, row_tuple, seq_tuple):
+        return
+    if len(set(seq_tuple)) == 1:
+        _set_layer_rows_seq_len(layer, row_tuple, seq_tuple[0])
+        return
+    for row, seq_len in zip(row_tuple, seq_tuple):
+        _set_layer_rows_seq_len(layer, (row,), seq_len)
 
 
 def _tokens_not_in_stop(tokens: Tensor, stop_token_ids: frozenset[int]) -> Tensor:
@@ -5431,6 +11340,8 @@ def _try_decode_one_token_graph(
     input_ids: Tensor,
     cache: object,
     temperature: float,
+    *,
+    allow_capture: bool = True,
 ) -> Tensor | None:
     if getattr(cache, "_torchinferno_ephemeral_cache", False):
         return None
@@ -5439,6 +11350,8 @@ def _try_decode_one_token_graph(
     decode_graph = getattr(model, "try_decode_one_token_graph", None)
     if decode_graph is None:
         return None
+    if _callable_accepts_keyword(decode_graph, "capture_on_miss"):
+        return decode_graph(input_ids, cache, temperature=temperature, capture_on_miss=allow_capture)
     return decode_graph(input_ids, cache, temperature=temperature)
 
 
@@ -5446,6 +11359,8 @@ def _try_decode_one_token_logits_graph(
     model: object,
     input_ids: Tensor,
     cache: object,
+    *,
+    allow_capture: bool = True,
 ) -> Tensor | None:
     if getattr(cache, "_torchinferno_ephemeral_cache", False):
         return None
@@ -5454,6 +11369,8 @@ def _try_decode_one_token_logits_graph(
     decode_graph = getattr(model, "try_decode_one_token_logits_graph", None)
     if decode_graph is None:
         return None
+    if _callable_accepts_keyword(decode_graph, "capture_on_miss"):
+        return decode_graph(input_ids, cache, capture_on_miss=allow_capture)
     return decode_graph(input_ids, cache)
 
 
@@ -5464,6 +11381,7 @@ def _try_decode_ragged_logits_graph(
     *,
     seq_lens: Tensor,
     row_indices: Tensor | None,
+    allow_capture: bool = True,
 ) -> Tensor | None:
     if getattr(cache, "_torchinferno_disable_ragged_decode_graph", False):
         return None
@@ -5478,6 +11396,14 @@ def _try_decode_ragged_logits_graph(
     decode_graph = getattr(model, "try_decode_ragged_logits_graph", None)
     if decode_graph is None:
         return None
+    if _callable_accepts_keyword(decode_graph, "capture_on_miss"):
+        return decode_graph(
+            input_ids,
+            cache,
+            seq_lens=seq_lens,
+            row_indices=row_indices,
+            capture_on_miss=allow_capture,
+        )
     return decode_graph(input_ids, cache, seq_lens=seq_lens, row_indices=row_indices)
 
 
@@ -5488,19 +11414,80 @@ def _disable_tp_shared_prefix_ragged_decode_graph(model: object, *, max_tokens: 
         return not env_flag("TORCHINFERNO_OPENAI_TP_SHARED_PREFIX_RAGGED_CUDAGRAPH", True)
     if max_tokens is None:
         return False
-    max_graph_tokens = env_int(
-        "TORCHINFERNO_OPENAI_TP_SHARED_PREFIX_RAGGED_CUDAGRAPH_MAX_TOKENS",
-        128,
-        minimum=1,
+    if "TORCHINFERNO_OPENAI_TP_SHARED_PREFIX_RAGGED_CUDAGRAPH_MAX_TOKENS" in os.environ:
+        max_graph_tokens = env_int(
+            "TORCHINFERNO_OPENAI_TP_SHARED_PREFIX_RAGGED_CUDAGRAPH_MAX_TOKENS",
+            128,
+            minimum=1,
+        )
+        return max_tokens > max_graph_tokens
+    disable_min_tokens = env_int(
+        "TORCHINFERNO_OPENAI_TP_SHARED_PREFIX_RAGGED_CUDAGRAPH_DISABLE_MIN_TOKENS",
+        0,
+        minimum=0,
     )
-    if max_tokens <= max_graph_tokens:
+    return disable_min_tokens > 0 and max_tokens >= disable_min_tokens
+
+
+def _disable_tp_shared_prefix_ragged_static_buckets(model: object, *, max_tokens: int | None = None) -> bool:
+    if not (_is_tensor_parallel_model(model) and _tensor_parallel_world_size(model) > 1):
         return False
-    large_graph_tokens = env_int(
-        "TORCHINFERNO_OPENAI_TP_SHARED_PREFIX_RAGGED_CUDAGRAPH_LARGE_MIN_TOKENS",
-        512,
-        minimum=max_graph_tokens + 1,
+    if "TORCHINFERNO_OPENAI_TP_SHARED_PREFIX_RAGGED_STATIC_BUCKETS" in os.environ:
+        return not env_flag("TORCHINFERNO_OPENAI_TP_SHARED_PREFIX_RAGGED_STATIC_BUCKETS", True)
+    if max_tokens is None:
+        return False
+    if "TORCHINFERNO_OPENAI_TP_SHARED_PREFIX_RAGGED_STATIC_BUCKET_MAX_TOKENS" in os.environ:
+        max_bucket_tokens = env_int(
+            "TORCHINFERNO_OPENAI_TP_SHARED_PREFIX_RAGGED_STATIC_BUCKET_MAX_TOKENS",
+            128,
+            minimum=1,
+        )
+        return max_tokens > max_bucket_tokens
+    disable_min_tokens = env_int(
+        "TORCHINFERNO_OPENAI_TP_SHARED_PREFIX_RAGGED_STATIC_BUCKET_DISABLE_MIN_TOKENS",
+        80,
+        minimum=0,
     )
-    return max_tokens < large_graph_tokens
+    disable_max_tokens = env_int(
+        "TORCHINFERNO_OPENAI_TP_SHARED_PREFIX_RAGGED_STATIC_BUCKET_DISABLE_MAX_TOKENS",
+        128,
+        minimum=0,
+    )
+    return (
+        disable_min_tokens > 0
+        and max_tokens >= disable_min_tokens
+        and (disable_max_tokens <= 0 or max_tokens <= disable_max_tokens)
+    )
+
+
+def _set_shared_prefix_ragged_static_graph_bucket_mode(
+    model: object,
+    cache: object,
+    *,
+    static_graph_buckets: bool,
+) -> None:
+    if not (_is_tensor_parallel_model(model) and _tensor_parallel_world_size(model) > 1):
+        return
+    attr = "_torchinferno_shared_prefix_ragged_static_graph_buckets"
+    nonstatic_released_attr = "_torchinferno_shared_prefix_ragged_nonstatic_graphs_released"
+    try:
+        previous_static = bool(getattr(cache, attr, False))
+        already_released = bool(getattr(cache, nonstatic_released_attr, False))
+        static_graph_buckets = bool(static_graph_buckets)
+        setattr(cache, attr, static_graph_buckets)
+        if static_graph_buckets:
+            setattr(cache, nonstatic_released_attr, False)
+        else:
+            if previous_static and not already_released:
+                _sync_before_decode_graph_release(
+                    model,
+                    cache,
+                    label="openai.shared_prefix_ragged.static_bucket_graph_release_sync",
+                )
+                _release_decode_graphs_for_cache(model, cache)
+            setattr(cache, nonstatic_released_attr, True)
+    except Exception:
+        pass
 
 
 def _force_tp_shared_prefix_ragged_row_indices(model: object) -> bool:
@@ -5518,6 +11505,76 @@ def _release_decode_graphs_for_cache(model: object, cache: object) -> None:
     release = getattr(model, "release_decode_graphs_for_cache", None)
     if callable(release):
         release(cache)
+
+
+def _sync_before_decode_graph_release(
+    model: object,
+    cache: object,
+    *,
+    device: torch.device | str | None = None,
+    label: str,
+) -> None:
+    if _cache_graph_ref_count(model, cache) <= 0:
+        return
+    sync_device = torch.device(device if device is not None else getattr(model, "device", torch.device("cpu")))
+    if sync_device.type != "cuda":
+        return
+    try:
+        torch.cuda.synchronize(sync_device)
+    except Exception as exc:
+        warn_optional_failure(label, exc)
+
+
+def _clear_model_graph_caches(model: object) -> None:
+    for attr in (
+        "_prefill_graphs",
+        "_prefill_logits_graphs",
+        "_prefill_selected_logits_graphs",
+        "_decode_graphs",
+        "_decode_logits_graphs",
+        "_ragged_decode_graphs",
+        "_ragged_decode_logits_graphs",
+    ):
+        graph_map = getattr(model, attr, None)
+        if isinstance(graph_map, dict):
+            graph_map.clear()
+
+
+def _cache_pool_eviction_key(pool: Mapping[object, object], *, model: object) -> object:
+    fallback_key: object | None = None
+    fallback_refs: int | None = None
+    for key, cache in pool.items():
+        refs = _cache_graph_ref_count(model, cache)
+        if refs == 0:
+            return key
+        if fallback_refs is None or refs < fallback_refs:
+            fallback_key = key
+            fallback_refs = refs
+    return next(iter(pool)) if fallback_key is None else fallback_key
+
+
+def _cache_graph_ref_count(model: object, cache: object) -> int:
+    cache_id = id(cache)
+    refs = 0
+    for attr in (
+        "_prefill_graphs",
+        "_prefill_logits_graphs",
+        "_prefill_selected_logits_graphs",
+        "_decode_graphs",
+        "_decode_logits_graphs",
+        "_ragged_decode_graphs",
+        "_ragged_decode_logits_graphs",
+    ):
+        graph_map = getattr(model, attr, None)
+        if not isinstance(graph_map, dict):
+            continue
+        for key, captured in graph_map.items():
+            if (
+                (isinstance(key, tuple) and bool(key) and key[0] == cache_id)
+                or getattr(captured, "cache", None) is cache
+            ):
+                refs += 1
+    return refs
 
 
 def _openai_decode_graph_enabled(model: object) -> bool:
@@ -5540,6 +11597,50 @@ def _openai_ragged_decode_graph_enabled(model: object) -> bool:
     if "TORCHINFERNO_CUDAGRAPH_RAGGED_DECODE_STEP" in os.environ:
         return env_flag("TORCHINFERNO_CUDAGRAPH_RAGGED_DECODE_STEP", True)
     return True
+
+
+def _runtime_decode_graph_capture_enabled(model: object) -> bool:
+    if "TORCHINFERNO_OPENAI_RUNTIME_DECODE_CAPTURE" in os.environ:
+        return env_flag("TORCHINFERNO_OPENAI_RUNTIME_DECODE_CAPTURE", False)
+    if _is_tensor_parallel_model(model) and _tensor_parallel_world_size(model) > 1:
+        return False
+    return True
+
+
+def _runtime_ragged_decode_graph_capture_enabled(model: object, cache: object) -> bool:
+    if "TORCHINFERNO_OPENAI_RUNTIME_RAGGED_DECODE_CAPTURE" in os.environ:
+        return env_flag("TORCHINFERNO_OPENAI_RUNTIME_RAGGED_DECODE_CAPTURE", False)
+    cache_capture = getattr(cache, "_torchinferno_runtime_ragged_decode_capture", None)
+    if cache_capture is not None:
+        return bool(cache_capture)
+    if _is_tensor_parallel_model(model) and _tensor_parallel_world_size(model) > 1:
+        return False
+    return True
+
+
+def _runtime_ragged_decode_graph_capture_allowed_for_request(model: object, *, max_tokens: int) -> bool:
+    if not (_is_tensor_parallel_model(model) and _tensor_parallel_world_size(model) > 1):
+        return True
+    max_capture_tokens = env_int(
+        "TORCHINFERNO_OPENAI_RUNTIME_RAGGED_DECODE_CAPTURE_MAX_TOKENS",
+        128,
+        minimum=0,
+    )
+    if max_capture_tokens > 0 and max_tokens <= max_capture_tokens:
+        return True
+    min_capture_tokens = env_int(
+        "TORCHINFERNO_OPENAI_RUNTIME_RAGGED_DECODE_CAPTURE_MIN_TOKENS",
+        512,
+        minimum=0,
+    )
+    return min_capture_tokens > 0 and max_tokens >= min_capture_tokens
+
+
+def _set_runtime_ragged_decode_graph_capture(cache: object, allow_capture: bool) -> None:
+    try:
+        setattr(cache, "_torchinferno_runtime_ragged_decode_capture", bool(allow_capture))
+    except Exception:
+        pass
 
 
 def _try_prefill_graph(
@@ -5575,6 +11676,29 @@ def _try_prefill_logits_graph(
     if _callable_accepts_keyword(prefill_graph, "capture_on_miss"):
         return prefill_graph(input_ids, cache, capture_on_miss=allow_capture)
     return prefill_graph(input_ids, cache)
+
+
+def _try_prefill_selected_logits_graph(
+    model: object,
+    input_ids: Tensor,
+    cache: object,
+    *,
+    logit_positions: Tensor,
+    allow_capture: bool = False,
+) -> Tensor | None:
+    if not _openai_cuda_graph_enabled_for_model(model):
+        return None
+    prefill_graph = getattr(model, "try_prefill_selected_logits_graph", None)
+    if prefill_graph is None:
+        return None
+    if _callable_accepts_keyword(prefill_graph, "capture_on_miss"):
+        return prefill_graph(
+            input_ids,
+            cache,
+            logit_positions=logit_positions,
+            capture_on_miss=allow_capture,
+        )
+    return prefill_graph(input_ids, cache, logit_positions=logit_positions)
 
 
 def _callable_accepts_keyword(callable_obj: object, keyword: str) -> bool:
@@ -5643,10 +11767,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--token", default=None)
     parser.add_argument("--revision", default=None)
     parser.add_argument("--cache-dir", default=None)
-    parser.add_argument("--cache-backend", choices=["dense", "paged"], default="dense")
-    parser.add_argument("--page-size", type=int, default=16)
-    parser.add_argument("--max-batch-size", type=int, default=128)
-    parser.add_argument("--batch-wait-ms", type=float, default=10.0)
+    parser.add_argument(
+        "--cache-backend",
+        choices=["dense", "paged"],
+        default=os.environ.get("TORCHINFERNO_OPENAI_CACHE_BACKEND", "paged"),
+    )
+    parser.add_argument(
+        "--page-size",
+        type=int,
+        default=env_int("TORCHINFERNO_OPENAI_PAGE_SIZE", 16, minimum=1),
+    )
+    parser.add_argument("--max-batch-size", type=int, default=256)
+    parser.add_argument("--batch-wait-ms", type=float, default=1.0)
     parser.add_argument(
         "--single-request-admission-wait-ms",
         type=float,

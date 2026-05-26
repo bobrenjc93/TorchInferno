@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import queue
 import socket
 import sys
@@ -353,7 +354,7 @@ class FastOpenAIHTTPServer:
         with connection:
             enable_tcp_nodelay(connection)
             connection.settimeout(
-                env_float("TORCHINFERNO_OPENAI_FAST_HTTP_IDLE_TIMEOUT_SECONDS", 0.25, minimum=0.05)
+                env_float("TORCHINFERNO_OPENAI_FAST_HTTP_IDLE_TIMEOUT_SECONDS", 5.0, minimum=0.05)
             )
             buffer = bytearray()
             keepalive_enabled = env_flag("TORCHINFERNO_OPENAI_FAST_HTTP_KEEPALIVE", True)
@@ -365,7 +366,14 @@ class FastOpenAIHTTPServer:
                     method, path, headers, body = request
                     request_close = headers.get("connection", "").lower() == "close"
                     keep_alive = keepalive_enabled and not request_close
-                    self._handle_request(connection, method, path, body, keep_alive=keep_alive)
+                    self._handle_request(
+                        connection,
+                        method,
+                        path,
+                        body,
+                        keep_alive=keep_alive,
+                        request_ready_s=time.perf_counter(),
+                    )
                     if not keep_alive:
                         return
                 except socket.timeout:
@@ -387,6 +395,7 @@ class FastOpenAIHTTPServer:
         body: bytes,
         *,
         keep_alive: bool,
+        request_ready_s: float,
     ) -> None:
         route = path.partition("?")[0]
         if method == "GET" and route == "/health":
@@ -403,8 +412,10 @@ class FastOpenAIHTTPServer:
                 connection_close=not keep_alive,
             )
             return
+        parse_start_s = time.perf_counter()
         payload = json.loads(body.decode("utf-8"))
         request = parse_chat_completion_request(payload)
+        parsed_s = time.perf_counter()
         if request.stream:
             _stream_fast_chat(
                 connection,
@@ -413,6 +424,8 @@ class FastOpenAIHTTPServer:
                 max_tokens=request.max_tokens,
                 temperature=request.temperature,
                 keep_alive=keep_alive,
+                request_ready_s=request_ready_s,
+                parse_ms=(parsed_s - parse_start_s) * 1000.0,
             )
             return
         completion = self.engine.complete_chat(
@@ -499,10 +512,20 @@ def _stream_fast_chat(
     max_tokens: int,
     temperature: float,
     keep_alive: bool = False,
+    request_ready_s: float | None = None,
+    parse_ms: float = 0.0,
 ) -> None:
+    profile = _new_fast_http_stream_profile(
+        max_tokens=max_tokens,
+        temperature=temperature,
+        keep_alive=keep_alive,
+        request_ready_s=request_ready_s,
+        parse_ms=parse_ms,
+    )
     completion_id = f"chatcmpl-{uuid.uuid4().hex}"
     created = int(time.time())
     chunk_prefix = _chat_completion_chunk_prefix(completion_id, engine.model_id, created)
+    header_start_s = time.perf_counter()
     connection.sendall(
         _fast_response_headers(
             200,
@@ -512,36 +535,129 @@ def _stream_fast_chat(
             connection_close=not keep_alive,
         )
     )
+    _mark_fast_http_elapsed(profile, "headers_ms", header_start_s)
+    _mark_fast_http_since_start(profile, "headers_sent_ms")
     defer_role = _stream_defer_role_enabled(max_tokens=max_tokens, temperature=temperature)
     client_open = True
     role_sent = False
-    if not defer_role:
-        client_open = _try_send_fast_chat_chunk(connection, chunk_prefix, _CHAT_DELTA_ROLE, chunked=keep_alive)
-        role_sent = client_open
-    for token_id in engine.generate_chat_tokens(
-        messages,
-        max_tokens=max_tokens,
-        temperature=temperature,
-    ):
-        if not client_open:
-            continue
-        content = engine.tokenizer.decode_token(int(token_id))
-        if not content:
-            continue
-        delta = _chat_delta_role_content(content) if not role_sent else _chat_delta_content(content)
-        role_sent = True
-        client_open = _try_send_fast_chat_chunk(connection, chunk_prefix, delta, chunked=keep_alive)
-    if client_open:
-        try:
-            connection.sendall(
-                _fast_stream_end_bytes(
-                    chunk_prefix,
-                    include_role=not role_sent,
-                    chunked=keep_alive,
+    content_chunks = 0
+    engine_tokens = 0
+    empty_tokens = 0
+    try:
+        if not defer_role:
+            role_start_s = time.perf_counter()
+            client_open = _try_send_fast_chat_chunk(connection, chunk_prefix, _CHAT_DELTA_ROLE, chunked=keep_alive)
+            role_sent = client_open
+            _mark_fast_http_elapsed(profile, "role_send_ms", role_start_s)
+        generate_start_s = time.perf_counter()
+        for token_id in engine.generate_chat_tokens(
+            messages,
+            max_tokens=max_tokens,
+            temperature=temperature,
+        ):
+            engine_tokens += 1
+            if engine_tokens == 1:
+                _mark_fast_http_elapsed(profile, "engine_first_token_ms", generate_start_s)
+                _mark_fast_http_since_start(profile, "first_engine_token_ms")
+            if not client_open:
+                continue
+            decode_start_s = time.perf_counter()
+            content = engine.tokenizer.decode_token(int(token_id))
+            _add_fast_http_elapsed(profile, "decode_token_ms", decode_start_s)
+            if not content:
+                empty_tokens += 1
+                continue
+            delta = _chat_delta_role_content(content) if not role_sent else _chat_delta_content(content)
+            role_sent = True
+            send_start_s = time.perf_counter()
+            client_open = _try_send_fast_chat_chunk(connection, chunk_prefix, delta, chunked=keep_alive)
+            _add_fast_http_elapsed(profile, "content_send_ms", send_start_s)
+            content_chunks += 1
+            if content_chunks == 1:
+                _mark_fast_http_since_start(profile, "first_content_sent_ms")
+        if client_open:
+            try:
+                end_start_s = time.perf_counter()
+                connection.sendall(
+                    _fast_stream_end_bytes(
+                        chunk_prefix,
+                        include_role=not role_sent,
+                        chunked=keep_alive,
+                    )
                 )
-            )
-        except OSError:
-            return
+                _mark_fast_http_elapsed(profile, "finish_send_ms", end_start_s)
+            except OSError:
+                client_open = False
+                return
+    finally:
+        if profile is not None:
+            profile["engine_tokens"] = engine_tokens
+            profile["content_chunks"] = content_chunks
+            profile["empty_tokens"] = empty_tokens
+            profile["client_open"] = bool(client_open)
+            _record_fast_http_profile(profile)
+
+
+_FAST_HTTP_PROFILE_LOCK = threading.Lock()
+
+
+def _new_fast_http_stream_profile(
+    *,
+    max_tokens: int,
+    temperature: float,
+    keep_alive: bool,
+    request_ready_s: float | None,
+    parse_ms: float,
+) -> dict[str, object] | None:
+    if not _fast_http_profile_path():
+        return None
+    start_s = request_ready_s if request_ready_s is not None else time.perf_counter()
+    return {
+        "event": "fast_http_stream",
+        "_start_s": start_s,
+        "max_tokens": int(max_tokens),
+        "temperature": float(temperature),
+        "keep_alive": bool(keep_alive),
+        "parse_ms": float(parse_ms),
+    }
+
+
+def _mark_fast_http_elapsed(profile: dict[str, object] | None, field: str, start_s: float) -> None:
+    if profile is not None:
+        profile[field] = (time.perf_counter() - start_s) * 1000.0
+
+
+def _add_fast_http_elapsed(profile: dict[str, object] | None, field: str, start_s: float) -> None:
+    if profile is not None:
+        profile[field] = float(profile.get(field, 0.0)) + (time.perf_counter() - start_s) * 1000.0
+
+
+def _mark_fast_http_since_start(profile: dict[str, object] | None, field: str) -> None:
+    if profile is None:
+        return
+    start_s = profile.get("_start_s")
+    if isinstance(start_s, float):
+        profile[field] = (time.perf_counter() - start_s) * 1000.0
+
+
+def _fast_http_profile_path() -> str:
+    return os.environ.get("TORCHINFERNO_OPENAI_FAST_HTTP_PROFILE_JSONL", "")
+
+
+def _record_fast_http_profile(profile: dict[str, object]) -> None:
+    path = _fast_http_profile_path()
+    if not path:
+        return
+    start_s = profile.pop("_start_s", None)
+    if isinstance(start_s, float):
+        profile["total_ms"] = (time.perf_counter() - start_s) * 1000.0
+    line = json.dumps(profile, sort_keys=True, separators=(",", ":")) + "\n"
+    try:
+        with _FAST_HTTP_PROFILE_LOCK:
+            with open(path, "a", encoding="utf-8") as profile_file:
+                profile_file.write(line)
+    except OSError:
+        return
 
 
 def _try_send_fast_chat_chunk(

@@ -11,16 +11,23 @@ from torchinferno.kernels.ops import (
 from torchinferno.kernels.nvfp4 import NVFP4Tensor, dequantize_nvfp4, nvfp4_linear_reference, quantize_nvfp4
 
 
-def paged_decode_attention(query, cache, request_id, position, *, config=None):
+def paged_decode_attention(query, cache, request_id, position, *, config=None, enable_gqa=False):
     from torchinferno.kernels.paged_attention import paged_decode_attention as _paged_decode_attention
 
-    return _paged_decode_attention(query, cache, request_id, position, config=config)
+    return _paged_decode_attention(query, cache, request_id, position, config=config, enable_gqa=enable_gqa)
 
 
-def batched_paged_decode_attention(query, cache, request_ids, positions, *, config=None):
+def batched_paged_decode_attention(query, cache, request_ids, positions, *, config=None, enable_gqa=False):
     from torchinferno.kernels.paged_attention import batched_paged_decode_attention as _batched_paged_decode_attention
 
-    return _batched_paged_decode_attention(query, cache, request_ids, positions, config=config)
+    return _batched_paged_decode_attention(
+        query,
+        cache,
+        request_ids,
+        positions,
+        config=config,
+        enable_gqa=enable_gqa,
+    )
 
 
 __all__ = [

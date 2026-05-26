@@ -63,6 +63,35 @@ def test_llama3_tensor_parallel_greedy_sampler_all_reduce_opt_out(monkeypatch) -
     assert sampled.tolist() == [5]
 
 
+def test_llama3_tensor_parallel_paged_cache_matches_dense_forward(tmp_path, monkeypatch) -> None:
+    torch.manual_seed(9002)
+    config = tiny_llama3_config(vocab_size=32, max_position_embeddings=16)
+    reference = Llama3V0ForCausalLM(config).eval()
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    _write_hf_checkpoint(reference, config, checkpoint)
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    model = Llama3TensorParallelForCausalLM.from_pretrained(checkpoint, dtype="float32").eval()
+    input_ids = torch.tensor([[1, 2, 3, 4]], dtype=torch.long, device=model.device)
+
+    with torch.inference_mode():
+        dense_cache = model.allocate_cache(1, max_seq_len=8, cache_backend="dense")
+        dense_logits, _ = model.forward(input_ids, cache=dense_cache, use_cache=True)
+
+        paged_cache = model.allocate_cache(1, max_seq_len=8, cache_backend="paged", page_size=2)
+        paged_logits, _ = model.forward(input_ids, cache=paged_cache, use_cache=True)
+
+        decode_token = torch.tensor([[5]], dtype=torch.long, device=model.device)
+        seq_lens = torch.tensor([input_ids.size(1)], dtype=torch.long, device=model.device)
+        dense_decode_logits = model.decode_ragged_logits(decode_token, dense_cache, seq_lens=seq_lens)
+        paged_decode_logits = model.decode_ragged_logits(decode_token, paged_cache, seq_lens=seq_lens)
+
+    assert paged_cache.cache_backend == "paged"
+    torch.testing.assert_close(paged_logits, dense_logits, atol=2e-5, rtol=2e-5)
+    torch.testing.assert_close(paged_decode_logits, dense_decode_logits, atol=2e-5, rtol=2e-5)
+
+
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires at least two CUDA devices")
 def test_llama3_tensor_parallel_matches_reference_under_torchrun(tmp_path) -> None:
     torch.manual_seed(9001)

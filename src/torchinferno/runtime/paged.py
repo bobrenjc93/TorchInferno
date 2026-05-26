@@ -45,13 +45,13 @@ class PagedKVCache:
             device=device,
             dtype=dtype,
         )
-        self._free_pages = list(range(num_pages))
+        self._free_pages = list(reversed(range(num_pages)))
         self._page_refcounts = [0 for _ in range(num_pages)]
         self._sequences: dict[str, PagedSequence] = {}
 
     @property
     def free_pages(self) -> tuple[int, ...]:
-        return tuple(self._free_pages)
+        return tuple(sorted(self._free_pages))
 
     @property
     def active_request_ids(self) -> tuple[str, ...]:
@@ -66,6 +66,28 @@ class PagedKVCache:
     def sequence(self, request_id: str) -> PagedSequence:
         return self._sequences.setdefault(request_id, PagedSequence(request_id))
 
+    def truncate(self, request_id: str, tokens: int) -> PagedSequence:
+        return self.set_length(request_id, tokens, release_pages=True)
+
+    def set_length(self, request_id: str, tokens: int, *, release_pages: bool = False) -> PagedSequence:
+        if tokens < 0:
+            raise ValueError("tokens must be non-negative")
+        if tokens == 0 and release_pages:
+            self.free(request_id)
+            return self.sequence(request_id)
+        seq = self.sequence(request_id) if tokens == 0 else self._sequences.get(request_id)
+        if seq is None:
+            raise KeyError(request_id)
+        if tokens > seq.length and tokens > len(seq.page_ids) * self.page_size:
+            raise ValueError("cannot extend a paged sequence beyond allocated pages")
+        required_pages = math.ceil(tokens / self.page_size)
+        if release_pages:
+            for page_id in seq.page_ids[required_pages:]:
+                self._release_page(page_id)
+            del seq.page_ids[required_pages:]
+        seq.length = tokens
+        return seq
+
     def append(self, request_id: str, keys: Tensor, values: Tensor) -> PagedSequence:
         if keys.ndim != 3 or values.ndim != 3:
             raise ValueError("keys and values must have shape [kv_heads, tokens, head_dim]")
@@ -79,13 +101,20 @@ class PagedKVCache:
         seq = self.sequence(request_id)
         tokens = keys.size(1)
         self._ensure_capacity(seq, seq.length + tokens)
-        for token in range(tokens):
-            position = seq.length + token
+        token_offset = 0
+        while token_offset < tokens:
+            position = seq.length + token_offset
             page_index = position // self.page_size
             page_id = self._prepare_page_for_write(seq, page_index)
-            offset = position % self.page_size
-            self.keys[page_id, :, offset, :].copy_(keys[:, token, :])
-            self.values[page_id, :, offset, :].copy_(values[:, token, :])
+            page_offset = position % self.page_size
+            take = min(self.page_size - page_offset, tokens - token_offset)
+            self.keys[page_id, :, page_offset : page_offset + take, :].copy_(
+                keys[:, token_offset : token_offset + take, :]
+            )
+            self.values[page_id, :, page_offset : page_offset + take, :].copy_(
+                values[:, token_offset : token_offset + take, :]
+            )
+            token_offset += take
         seq.length += tokens
         return seq
 
@@ -157,7 +186,7 @@ class PagedKVCache:
     def _allocate_page(self) -> int:
         if not self._free_pages:
             raise RuntimeError("paged KV cache is out of pages")
-        page_id = self._free_pages.pop(0)
+        page_id = self._free_pages.pop()
         self._page_refcounts[page_id] = 1
         return page_id
 
@@ -167,4 +196,3 @@ class PagedKVCache:
             raise RuntimeError("paged KV cache page refcount went negative")
         if self._page_refcounts[page_id] == 0:
             self._free_pages.append(page_id)
-            self._free_pages.sort()

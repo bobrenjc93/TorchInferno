@@ -371,6 +371,90 @@ def test_llama3_tensor_parallel_ragged_decode_graph_matches_eager(tmp_path) -> N
     torch.testing.assert_close(actual_indexed, expected_indexed, atol=5e-4, rtol=5e-4)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
+def test_llama3_tensor_parallel_ragged_decode_graph_replays_after_indexed_row_reuse(tmp_path) -> None:
+    torch.manual_seed(1236)
+    config = tiny_llama3_config(
+        vocab_size=128,
+        hidden_size=512,
+        intermediate_size=1024,
+        num_hidden_layers=1,
+        num_attention_heads=64,
+        num_key_value_heads=8,
+        max_position_embeddings=16,
+    )
+    reference = Llama3V0ForCausalLM(config).eval()
+    _write_tiny_llama3_hf_checkpoint(reference, config, tmp_path)
+    model = Llama3TensorParallelForCausalLM.from_pretrained(tmp_path, dtype="float32").eval()
+    eager_cache = model.allocate_cache(64, 10)
+    graph_cache = model.allocate_cache(64, 10)
+    seq_lens = torch.zeros(64, dtype=torch.long, device=model.device)
+
+    def load_prompt(caches, row: int, prompt: torch.Tensor) -> None:
+        row_cache = model.allocate_cache(1, 10)
+        _, row_cache = model.forward(
+            prompt,
+            cache=row_cache,
+            use_cache=True,
+            return_last_logits_only=True,
+            return_sharded_logits=True,
+        )
+        for cache in caches:
+            cache.copy_prefix_from(row_cache, prompt.size(1), dest_row=row)
+
+    prompts = (
+        torch.tensor([[1, 2, 3]], dtype=torch.long, device=model.device),
+        torch.tensor([[4, 5, 6, 7]], dtype=torch.long, device=model.device),
+        torch.tensor([[8, 9]], dtype=torch.long, device=model.device),
+        torch.tensor([[10, 11, 12]], dtype=torch.long, device=model.device),
+    )
+    with torch.inference_mode():
+        for row, prompt in enumerate(prompts):
+            load_prompt((eager_cache, graph_cache), row, prompt)
+            seq_lens[row] = prompt.size(1)
+        for cache in (eager_cache, graph_cache):
+            for layer in cache.layers:
+                layer.seq_len = int(seq_lens.max().item())
+
+        first_rows = torch.tensor([0, 2], dtype=torch.long, device=model.device)
+        first_tokens = torch.tensor([[13], [14]], dtype=torch.long, device=model.device)
+        expected_first = model.decode_ragged_logits(first_tokens, eager_cache, seq_lens=seq_lens, row_indices=first_rows)
+        actual_first = model.try_decode_ragged_logits_graph(
+            first_tokens,
+            graph_cache,
+            seq_lens=seq_lens,
+            row_indices=first_rows,
+        )
+        assert actual_first is not None
+        # Graph replay returns a static output buffer; the second replay below reuses it.
+        actual_first = actual_first.clone()
+        seq_lens[first_rows] = seq_lens.index_select(0, first_rows) + 1
+
+        replacement_prompt = torch.tensor([[15, 16, 17, 18]], dtype=torch.long, device=model.device)
+        load_prompt((eager_cache, graph_cache), 2, replacement_prompt)
+        seq_lens[2] = replacement_prompt.size(1)
+
+        second_rows = torch.tensor([2, 1], dtype=torch.long, device=model.device)
+        second_tokens = torch.tensor([[19], [20]], dtype=torch.long, device=model.device)
+        expected_second = model.decode_ragged_logits(
+            second_tokens,
+            eager_cache,
+            seq_lens=seq_lens,
+            row_indices=second_rows,
+        )
+        actual_second = model.try_decode_ragged_logits_graph(
+            second_tokens,
+            graph_cache,
+            seq_lens=seq_lens,
+            row_indices=second_rows,
+        )
+
+    assert actual_second is not None
+    assert len(model._ragged_decode_logits_graphs) == 1
+    torch.testing.assert_close(actual_first, expected_first, atol=5e-4, rtol=5e-4)
+    torch.testing.assert_close(actual_second, expected_second, atol=5e-4, rtol=5e-4)
+
+
 def test_llama3_tensor_parallel_temperature_sampling_uses_gumbel_max(monkeypatch) -> None:
     import torch.distributed as dist
 
