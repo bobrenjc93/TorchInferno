@@ -4013,7 +4013,7 @@ class OpenAICompletionEngine:
             ) and _runtime_prefill_graph_capture_enabled(model, temperature, max_tokens=max_tokens)
         if "TORCHINFERNO_OPENAI_TP_RUNTIME_PREFILL_CAPTURE" in os.environ:
             return _runtime_prefill_graph_capture_enabled(model, temperature, max_tokens=max_tokens)
-        if not env_flag("TORCHINFERNO_OPENAI_TP_SINGLE_RUNTIME_PREFILL_CAPTURE", False):
+        if not env_flag("TORCHINFERNO_OPENAI_TP_SINGLE_RUNTIME_PREFILL_CAPTURE", True):
             return False
         if temperature > 0.0 and not env_flag(
             "TORCHINFERNO_OPENAI_TP_RUNTIME_TEMPERATURE_PREFILL_CAPTURE",
