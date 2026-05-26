@@ -1862,7 +1862,6 @@ class OpenAICompletionEngine:
                     temperature=0.0,
                 )
                 _sync_tensor_parallel_command(self.model, self.device)
-                self._warmup_token_budget_prefill_graphs(prefill_chunk)
 
                 while not shutdown:
                     _drain_queue()
