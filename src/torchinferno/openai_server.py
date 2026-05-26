@@ -6824,7 +6824,6 @@ class OpenAICompletionEngine:
             cache_batch_size,
             max_seq_len,
             model=self.model,
-            pool=False,
             batch_capacity=cache_batch_size,
         )
         state = _TokenBudgetStepState(
@@ -7114,13 +7113,7 @@ class OpenAICompletionEngine:
         if cache_view is None:
             raise RuntimeError("token-budget prefill requires row-view cache")
         input_ids = torch.tensor([prompt_chunk], dtype=torch.long, device=self.device)
-        prefill_logits = _try_prefill_logits_graph(
-            self.model, input_ids, cache_view, allow_capture=True,
-        )
-        if prefill_logits is not None:
-            logits = prefill_logits
-        else:
-            logits, _cache_view = _forward(self.model, input_ids, cache_view)
+        logits, _cache_view = _forward(self.model, input_ids, cache_view)
         state.seq_lens[row] = start_token + token_count
         if not bool(chunk.get("prompt_complete", False)):
             return None
