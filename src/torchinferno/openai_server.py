@@ -3612,6 +3612,7 @@ class OpenAICompletionEngine:
                     temperature=0.0,
                 ):
                     self._warmup_tensor_parallel_ragged_decode_graphs(vocab_size)
+            self._warmup_tensor_parallel_batched_prefix_suffix_graphs(vocab_size)
             warmup_cache_tokens = max(
                 max(prompt_token_counts) + new_tokens,
                 env_int("TORCHINFERNO_OPENAI_WARMUP_CACHE_TOKENS", 256, minimum=1),
@@ -3728,6 +3729,45 @@ class OpenAICompletionEngine:
                 if batch_size > 1:
                     _reset_generation_cache(cache)
                     self._warmup_temperature_prefill_decode_graphs(base[None, :], cache, batch_size)
+                _reset_generation_cache(cache)
+
+    def _warmup_tensor_parallel_batched_prefix_suffix_graphs(self, vocab_size: int) -> None:
+        if not env_flag("TORCHINFERNO_OPENAI_WARMUP_BATCHED_PREFIX_SUFFIX", True):
+            return
+        if not (
+            _is_tensor_parallel_model(self.model)
+            and _tensor_parallel_world_size(self.model) > 1
+            and self.device.type == "cuda"
+        ):
+            return
+        batch_size = _generation_cache_batch_capacity(self.model, self.max_batch_size)
+        if batch_size <= 1:
+            return
+        for prefix_tokens, suffix_tokens in _warmup_prefix_suffix_token_counts():
+            cache_tokens = prefix_tokens + suffix_tokens + 16
+            try:
+                cache = self._generation_cache(
+                    batch_size, cache_tokens, model=self.model, pool=False,
+                    batch_capacity=batch_size,
+                )
+            except Exception:
+                continue
+            try:
+                _set_generation_cache_seq_len(cache, prefix_tokens)
+                input_ids = (
+                    torch.arange(suffix_tokens, device=self.device, dtype=torch.long) % vocab_size
+                )[None, :].expand(batch_size, -1).contiguous()
+                logit_positions = torch.full(
+                    (batch_size,), suffix_tokens - 1,
+                    dtype=torch.long, device=self.device,
+                )
+                _forward_selected_logits(
+                    self.model, input_ids, cache, logit_positions,
+                    allow_capture=True,
+                )
+            except Exception:
+                pass
+            finally:
                 _reset_generation_cache(cache)
 
     def _warmup_tensor_parallel_ragged_decode_graphs(self, vocab_size: int) -> None:
