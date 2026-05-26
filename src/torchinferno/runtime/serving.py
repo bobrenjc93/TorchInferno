@@ -1241,9 +1241,9 @@ class ContinuousBatchEngine:
             self._free_active_rows.append(row)
 
     def _prefill_static_batch_size(self, request_count: int) -> int:
-        target = max(1, request_count)
         bucket = env_int("TORCHINFERNO_CONTINUOUS_PREFILL_STATIC_BATCH", self.max_active_requests, minimum=1)
-        return min(bucket, self.max_active_requests)
+        available = request_count + len(self._free_active_rows)
+        return min(bucket, self.max_active_requests, available)
 
     def _acquire_prefix_row(self) -> int | None:
         if self.prefix_cache_capacity == 0:

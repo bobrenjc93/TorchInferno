@@ -1745,7 +1745,7 @@ class OpenAICompletionEngine:
         )
         prefix_rows = env_int(
             "TORCHINFERNO_OPENAI_TP_ONLINE_PREFIX_ROWS",
-            min(max_active, requested_max_batch),
+            min(4, max_active),
             minimum=0,
         )
         prefill_budget = (
