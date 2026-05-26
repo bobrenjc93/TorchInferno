@@ -1766,7 +1766,7 @@ class OpenAICompletionEngine:
         )
         prefix_rows = env_int(
             "TORCHINFERNO_OPENAI_TP_ONLINE_PREFIX_ROWS",
-            0,
+            1,
             minimum=0,
         )
         prefill_budget = (
@@ -9528,7 +9528,7 @@ def _generation_cache_batch_capacity(model: object, requested_batch: int) -> int
         return requested_batch
     if not env_flag("TORCHINFERNO_OPENAI_TP_CACHE_BATCH_BUCKETING", True):
         return requested_batch
-    buckets = tuple(sorted(_parse_positive_int_csv(os.environ.get("TORCHINFERNO_OPENAI_TP_CACHE_BATCH_BUCKETS", "8,64"))))
+    buckets = tuple(sorted(_parse_positive_int_csv(os.environ.get("TORCHINFERNO_OPENAI_TP_CACHE_BATCH_BUCKETS", "8,64,65"))))
     for bucket in buckets:
         if requested_batch <= bucket:
             return bucket

@@ -10376,7 +10376,7 @@ def test_openai_tensor_parallel_online_batcher_drains_ready_requests(monkeypatch
     assert len(instances) == 1
     assert instances[0].started == 3
     assert commands == [
-        ("start", {"max_seq_len": 3, "max_active_requests": 4, "prefix_cache_capacity": 0, "prefill_token_budget": None, "temperature": 0.0, "enable_ragged_decode": True, "store_reusable_prefixes": True, "store_full_prompt_prefixes": True, "max_tokens": 1}),
+        ("start", {"max_seq_len": 3, "max_active_requests": 4, "prefix_cache_capacity": 1, "prefill_token_budget": None, "temperature": 0.0, "enable_ragged_decode": True, "store_reusable_prefixes": True, "store_full_prompt_prefixes": True, "max_tokens": 1}),
         ("submit", ([[1, 2], [3, 4]], {"max_tokens": 1, "row_max_tokens": [1, 1], "arrival_step": 0, "eos_token_id": None, "request_id_start": 0})),
         ("step", 1),
         ("close", None),
@@ -10469,7 +10469,7 @@ def test_openai_tensor_parallel_online_batcher_uses_queued_limit_for_default_row
         {
             "max_seq_len": 164,
             "max_active_requests": 64,
-            "prefix_cache_capacity": 0,
+            "prefix_cache_capacity": 1,
             "prefill_token_budget": None,
             "temperature": 0.0,
             "enable_ragged_decode": True,
@@ -10602,7 +10602,7 @@ def test_openai_tensor_parallel_online_batcher_sizes_cache_from_initial_window(
 
     assert started == [6]
     assert commands[:2] == [
-        ("start", {"max_seq_len": 6, "max_active_requests": 4, "prefix_cache_capacity": 0, "prefill_token_budget": None, "temperature": 0.0, "enable_ragged_decode": True, "store_reusable_prefixes": True, "store_full_prompt_prefixes": True, "max_tokens": 2}),
+        ("start", {"max_seq_len": 6, "max_active_requests": 4, "prefix_cache_capacity": 1, "prefill_token_budget": None, "temperature": 0.0, "enable_ragged_decode": True, "store_reusable_prefixes": True, "store_full_prompt_prefixes": True, "max_tokens": 2}),
         ("submit", ([[1, 2], [3, 4, 5, 6]], {"max_tokens": 2, "row_max_tokens": [1, 2], "arrival_step": 0, "eos_token_id": None, "request_id_start": 0})),
     ]
     assert first_queue.get_nowait() == 600
@@ -10687,7 +10687,7 @@ def test_openai_tensor_parallel_online_batcher_drains_after_short_step(monkeypat
     engine._run_tensor_parallel_online_batcher(first)
 
     assert commands == [
-        ("start", {"max_seq_len": 3, "max_active_requests": 4, "prefix_cache_capacity": 0, "prefill_token_budget": None, "temperature": 0.0, "enable_ragged_decode": True, "store_reusable_prefixes": True, "store_full_prompt_prefixes": True, "max_tokens": 1}),
+        ("start", {"max_seq_len": 3, "max_active_requests": 4, "prefix_cache_capacity": 1, "prefill_token_budget": None, "temperature": 0.0, "enable_ragged_decode": True, "store_reusable_prefixes": True, "store_full_prompt_prefixes": True, "max_tokens": 1}),
         ("submit", [[1, 2]]),
         ("step", 1),
         ("submit", [[3, 4]]),
