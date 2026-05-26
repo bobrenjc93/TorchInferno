@@ -7221,8 +7221,7 @@ def test_openai_effective_max_batch_size_caps_cuda_tp_by_default(monkeypatch) ->
 
     assert _effective_openai_max_batch_size(model, torch.device("cuda"), 64) == 64
     assert _effective_openai_max_batch_size(model, torch.device("cuda"), 128) == 128
-    assert _effective_openai_max_batch_size(model, torch.device("cuda"), 256) == 256
-    assert _effective_openai_max_batch_size(model, torch.device("cuda"), 512) == 256
+    assert _effective_openai_max_batch_size(model, torch.device("cuda"), 256) == 128
     assert _effective_openai_max_batch_size(model, torch.device("cpu"), 64) == 64
 
 
@@ -7265,12 +7264,12 @@ def test_openai_short_tp_stream_uses_smaller_queue_batch_limit(monkeypatch) -> N
     large_stream = _QueuedGeneration([], 512, 0.0, True, queue.Queue())
     short_completion = _QueuedGeneration([], 64, 0.0, False, queue.Queue())
 
-    assert engine._queued_batch_limit(short_stream) == 128
-    assert engine._queued_batch_limit(boundary_stream) == 128
-    assert engine._queued_batch_limit(sampled_short_stream) == 128
+    assert engine._queued_batch_limit(short_stream) == 64
+    assert engine._queued_batch_limit(boundary_stream) == 64
+    assert engine._queued_batch_limit(sampled_short_stream) == 64
     assert engine._queued_batch_limit(medium_stream) == 128
     assert engine._queued_batch_limit(sampled_medium_stream) == 128
-    assert engine._queued_batch_limit(large_stream) == 64
+    assert engine._queued_batch_limit(large_stream) == 32
     assert engine._queued_batch_limit(short_completion) == 128
 
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_SHORT_STREAM_MAX_BATCH_SIZE", "12")
@@ -7281,7 +7280,7 @@ def test_openai_short_tp_stream_uses_smaller_queue_batch_limit(monkeypatch) -> N
     assert engine._queued_batch_limit(sampled_short_stream) == 96
     monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_SAMPLED_SHORT_STREAM_MAX_BATCH_SIZE", raising=False)
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_DETERMINISTIC_SHORT_STREAM_HIGH_TOKEN_MIN", "300")
-    assert engine._queued_batch_limit(boundary_stream) == 128
+    assert engine._queued_batch_limit(boundary_stream) == 64
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_LARGE_STREAM_MAX_BATCH_SIZE", "20")
     assert engine._queued_batch_limit(large_stream) == 20
 
@@ -7316,7 +7315,7 @@ def test_openai_symm_mem_scope_enables_short_deterministic_decode(monkeypatch) -
     ):
         pass
 
-    assert captured == [(128, True)]
+    assert captured == [(64, True)]
 
 
 def test_openai_symm_mem_scope_skips_temperature_and_long_generations(monkeypatch) -> None:
@@ -7342,7 +7341,7 @@ def test_openai_symm_mem_scope_skips_temperature_and_long_generations(monkeypatc
     with _tensor_parallel_symm_mem_allreduce_scope(
         model,
         torch.device("cuda"),
-        max_tokens=2048,
+        max_tokens=256,
         temperature=0.0,
     ):
         pass
@@ -7389,7 +7388,7 @@ def test_openai_tp_greedy_stream_skips_queue_batch_wait(monkeypatch) -> None:
 
     assert engine._queued_batch_wait_s(short_stream) == 0.0
     assert engine._queued_batch_wait_s(medium_stream) == 0.0
-    assert engine._queued_batch_wait_s(long_stream) == 0.0
+    assert engine._queued_batch_wait_s(long_stream) == 0.010
     assert engine._queued_batch_wait_s(completion) == 0.010
 
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_GREEDY_LOW_LATENCY_BATCH_WAIT_MS", "3")
@@ -9992,7 +9991,7 @@ def test_openai_tp_single_stream_group_defaults_to_batch_path(monkeypatch) -> No
     engine.model = model
     calls: list[tuple[list[list[int]], int, float, list[int] | None]] = []
 
-    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_SINGLE_PROMPT_LIST_STREAM", "0")
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_SINGLE_PROMPT_LIST_STREAM", raising=False)
     monkeypatch.setattr(
         "torchinferno.openai_server._is_tensor_parallel_model",
         lambda candidate: candidate is model,
@@ -10465,8 +10464,8 @@ def test_openai_tensor_parallel_online_batcher_uses_queued_limit_for_default_row
         "start",
         {
             "max_seq_len": 164,
-            "max_active_requests": 128,
-            "prefix_cache_capacity": 128,
+            "max_active_requests": 64,
+            "prefix_cache_capacity": 64,
             "prefill_token_budget": None,
             "temperature": 0.0,
             "enable_ragged_decode": True,
@@ -10494,7 +10493,7 @@ def test_openai_tensor_parallel_long_prompt_short_stream_cap_is_opt_in(
     request = _QueuedGeneration([1] * 120, 44, 0.0, True, queue.Queue())
 
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_DETERMINISTIC_SHORT_STREAM_HIGH_TOKEN_MIN", "1")
-    assert engine._queued_batch_limit(request) == 128
+    assert engine._queued_batch_limit(request) == 64
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_LONG_PROMPT_SHORT_STREAM_BATCH_CAP", "1")
     assert engine._queued_batch_limit(request) == 56
 

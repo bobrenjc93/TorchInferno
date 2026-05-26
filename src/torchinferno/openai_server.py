@@ -94,8 +94,8 @@ class OpenAIServerConfig:
     cache_dir: str | None = None
     cache_backend: str = "dense"
     page_size: int = 16
-    max_batch_size: int = 256
-    batch_wait_ms: float = 1.0
+    max_batch_size: int = 128
+    batch_wait_ms: float = 0.0
     single_request_admission_wait_ms: float | None = None
     llama_parallelism: str = "auto"
 
@@ -2281,11 +2281,11 @@ class OpenAICompletionEngine:
                 if first.temperature > 0.0:
                     default_short_limit = env_int(
                         "TORCHINFERNO_OPENAI_TP_SAMPLED_SHORT_STREAM_MAX_BATCH_SIZE",
-                        min(limit, 128),
+                        min(limit, 64),
                         minimum=1,
                     )
                 else:
-                    default_short_limit = 128
+                    default_short_limit = 64
                 short_limit = env_int(
                     "TORCHINFERNO_OPENAI_TP_SHORT_STREAM_MAX_BATCH_SIZE",
                     min(limit, default_short_limit),
@@ -2296,7 +2296,7 @@ class OpenAICompletionEngine:
             if first.temperature <= 0.0 and first.max_tokens >= large_min_tokens:
                 large_limit = env_int(
                     "TORCHINFERNO_OPENAI_TP_LARGE_STREAM_MAX_BATCH_SIZE",
-                    min(limit, 64),
+                    min(limit, 32),
                     minimum=1,
                 )
                 return min(limit, large_limit)
@@ -2382,7 +2382,7 @@ class OpenAICompletionEngine:
         )
         max_tokens = env_int(
             "TORCHINFERNO_OPENAI_TP_GREEDY_LOW_LATENCY_MAX_TOKENS",
-            8192,
+            400,
             minimum=min_tokens,
         )
         if not (min_tokens <= first.max_tokens <= max_tokens):
@@ -2868,7 +2868,7 @@ class OpenAICompletionEngine:
             len(prompts) == 1
             and _is_tensor_parallel_model(self.model)
             and _prefix_cache_enabled_for_model(self.model)
-            and env_flag("TORCHINFERNO_OPENAI_TP_SINGLE_PROMPT_LIST_STREAM", True)
+            and env_flag("TORCHINFERNO_OPENAI_TP_SINGLE_PROMPT_LIST_STREAM", False)
         )
 
     def _run_queued_completion_group(self, group: list[_QueuedGeneration]) -> None:
@@ -7983,19 +7983,19 @@ def _tensor_parallel_symm_mem_allreduce_scope(
         or temperature > 0.0
     ):
         return nullcontext()
-    max_tokens_limit = env_int("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_MAX_TOKENS", 1024, minimum=1)
+    max_tokens_limit = env_int("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_MAX_TOKENS", 128, minimum=1)
     if max_tokens > max_tokens_limit:
         return nullcontext()
     if not env_flag("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE", True):
         return nullcontext()
-    max_batch = env_int("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_MAX_BATCH", 128, minimum=1)
+    max_batch = env_int("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_MAX_BATCH", 64, minimum=1)
     return symm_mem_allreduce_max_batch(max_batch, enabled=True)
 
 
 def _effective_openai_max_batch_size(model: object, device: torch.device, requested: int) -> int:
     max_batch_size = max(1, requested)
     if _is_tensor_parallel_model(model) and device.type == "cuda":
-        tp_default = env_int("TORCHINFERNO_OPENAI_TP_MAX_BATCH_SIZE", 256, minimum=1)
+        tp_default = env_int("TORCHINFERNO_OPENAI_TP_MAX_BATCH_SIZE", 128, minimum=1)
         return min(max_batch_size, tp_default)
     return max_batch_size
 
@@ -11777,8 +11777,8 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=env_int("TORCHINFERNO_OPENAI_PAGE_SIZE", 16, minimum=1),
     )
-    parser.add_argument("--max-batch-size", type=int, default=256)
-    parser.add_argument("--batch-wait-ms", type=float, default=1.0)
+    parser.add_argument("--max-batch-size", type=int, default=128)
+    parser.add_argument("--batch-wait-ms", type=float, default=0.0)
     parser.add_argument(
         "--single-request-admission-wait-ms",
         type=float,
