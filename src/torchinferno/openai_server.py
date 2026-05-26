@@ -1741,8 +1741,30 @@ class OpenAICompletionEngine:
                     self._run_queued_batch(next_batch)
                     self._completed_queue_batches += 1
 
+    def _warmup_token_budget_prefill_graphs(self, prefill_chunk_size: int) -> None:
+        state = self._token_budget_step_state
+        if state is None:
+            return
+        vocab_size = max(1, int(getattr(getattr(self.model, "config", object()), "vocab_size", 1)))
+        from torchinferno.models.llama3.tensor_parallel import _PREFILL_TOKEN_BUCKETS
+        buckets = [b for b in _PREFILL_TOKEN_BUCKETS if b <= max(prefill_chunk_size, 256)]
+        if not buckets:
+            return
+        with torch.inference_mode():
+            for bucket in buckets:
+                cache_view = _cache_row_slice(state.cache, 0, 1)
+                if cache_view is None:
+                    continue
+                _reset_generation_cache(cache_view)
+                input_ids = (torch.arange(bucket, device=self.device, dtype=torch.long) % vocab_size)[None, :]
+                try:
+                    _try_prefill_logits_graph(self.model, input_ids, cache_view, allow_capture=True)
+                except Exception:
+                    pass
+                _reset_generation_cache(cache_view)
+
     def _should_use_unified_scheduler(self) -> bool:
-        if not env_flag("TORCHINFERNO_OPENAI_UNIFIED_SCHEDULER", False):
+        if not env_flag("TORCHINFERNO_OPENAI_UNIFIED_SCHEDULER", True):
             return False
         if not _is_tensor_parallel_primary_model(self.model):
             return False
@@ -1840,6 +1862,7 @@ class OpenAICompletionEngine:
                     temperature=0.0,
                 )
                 _sync_tensor_parallel_command(self.model, self.device)
+                self._warmup_token_budget_prefill_graphs(prefill_chunk)
 
                 while not shutdown:
                     _drain_queue()
@@ -7088,7 +7111,13 @@ class OpenAICompletionEngine:
         if cache_view is None:
             raise RuntimeError("token-budget prefill requires row-view cache")
         input_ids = torch.tensor([prompt_chunk], dtype=torch.long, device=self.device)
-        logits, _cache_view = _forward(self.model, input_ids, cache_view)
+        prefill_logits = _try_prefill_logits_graph(
+            self.model, input_ids, cache_view, allow_capture=True,
+        )
+        if prefill_logits is not None:
+            logits = prefill_logits
+        else:
+            logits, _cache_view = _forward(self.model, input_ids, cache_view)
         state.seq_lens[row] = start_token + token_count
         if not bool(chunk.get("prompt_complete", False)):
             return None
