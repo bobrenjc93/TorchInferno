@@ -3942,11 +3942,10 @@ class OpenAICompletionEngine:
             temperature=temperature,
             max_tokens=max_tokens,
         )
-        prefill_token = _try_prefill_graph(model, prefill_input_ids, cache, temperature, allow_capture=allow_capture)
-        if prefill_token is None:
-            prefill_logits = _try_prefill_logits_graph(model, prefill_input_ids, cache, allow_capture=allow_capture)
-        else:
-            prefill_logits = None
+        prefill_token = None
+        prefill_logits = _try_prefill_logits_graph(model, prefill_input_ids, cache, allow_capture=allow_capture)
+        if prefill_logits is None:
+            prefill_token = _try_prefill_graph(model, prefill_input_ids, cache, temperature, allow_capture=allow_capture)
         if prefill_token is None and prefill_logits is None:
             self._mark_phase(phase, "first_forward_start")
             logits, cache = _forward(model, prefill_input_ids, cache)
