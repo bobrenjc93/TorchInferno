@@ -2818,7 +2818,7 @@ def test_openai_tp_single_prefill_capture_defaults_off(monkeypatch) -> None:
 
     assert first == [2]
     assert second == [2]
-    assert any(model.capture_flags)
+    assert not any(model.capture_flags)
 
 
 def test_openai_tp_single_prefill_capture_waits_for_repeated_shape(monkeypatch) -> None:
