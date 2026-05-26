@@ -1712,6 +1712,23 @@ class OpenAICompletionEngine:
                 self._maybe_cleanup_runtime_after_idle()
                 self._run_queued_batch(batch)
                 self._completed_queue_batches += 1
+                while self._has_multiple_live_requests() or not self._generation_queue.empty():
+                    next_batch: list[_QueuedGeneration] = []
+                    self._drain_ready_requests(next_batch, limit=batch_limit)
+                    if not next_batch:
+                        try:
+                            item = self._generation_queue.get(timeout=self.batch_wait_s)
+                        except queue.Empty:
+                            break
+                        if item is None:
+                            self._generation_queue.put(None)
+                            break
+                        next_batch.append(item)
+                        self._drain_ready_requests(next_batch, limit=batch_limit)
+                    if not next_batch:
+                        break
+                    self._run_queued_batch(next_batch)
+                    self._completed_queue_batches += 1
 
     def _should_use_tensor_parallel_online_batcher(self, first: _QueuedGeneration) -> bool:
         if not env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_CONTINUOUS_BATCHER", False):
