@@ -3739,10 +3739,13 @@ class OpenAICompletionEngine:
             and _tensor_parallel_world_size(self.model) > 1
             and self.device.type == "cuda"
         ):
+            print("warmup batched prefix-suffix: skipping (not TP CUDA)", flush=True)
             return
         batch_size = _generation_cache_batch_capacity(self.model, self.max_batch_size)
         if batch_size <= 1:
+            print(f"warmup batched prefix-suffix: skipping (batch_size={batch_size})", flush=True)
             return
+        print(f"warmup batched prefix-suffix: batch_size={batch_size}", flush=True)
         for prefix_tokens, suffix_tokens in _warmup_prefix_suffix_token_counts():
             cache_tokens = prefix_tokens + suffix_tokens + 16
             try:
@@ -3761,12 +3764,18 @@ class OpenAICompletionEngine:
                     (batch_size,), suffix_tokens - 1,
                     dtype=torch.long, device=self.device,
                 )
-                _forward_selected_logits(
+                result = _forward_selected_logits(
                     self.model, input_ids, cache, logit_positions,
                     allow_capture=True,
                 )
-            except Exception:
-                pass
+                print(
+                    f"warmup batched prefix-suffix: batch={batch_size} "
+                    f"prefix={prefix_tokens} suffix={suffix_tokens} "
+                    f"graph={'hit' if isinstance(result, tuple) and result[0] is not None else 'miss'}",
+                    flush=True,
+                )
+            except Exception as exc:
+                print(f"warmup batched prefix-suffix failed: {exc!r}", flush=True)
             finally:
                 _reset_generation_cache(cache)
 
