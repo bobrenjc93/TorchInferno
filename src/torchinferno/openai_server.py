@@ -1786,7 +1786,11 @@ class OpenAICompletionEngine:
         request_map: dict[str, _QueuedGeneration] = {}
         next_id = 0
         stop_token_ids = getattr(self, "stop_token_ids", frozenset())
-        max_model_len = getattr(self, "max_model_len", None) or 4096
+        max_model_len = env_int(
+            "TORCHINFERNO_OPENAI_UNIFIED_MAX_SEQ_LEN",
+            getattr(self, "max_model_len", None) or 1024,
+            minimum=64,
+        )
         cache_batch = _generation_cache_batch_capacity(self.model, max_active)
         finished_ids: tuple[str, ...] = ()
         shutdown = False

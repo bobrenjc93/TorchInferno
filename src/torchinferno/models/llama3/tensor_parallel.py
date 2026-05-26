@@ -4147,7 +4147,7 @@ def _should_use_prefill_graph(
     cache: Llama3TensorParallelCache,
     temperature: float,
 ) -> bool:
-    max_cache_tokens = _tp_int("TORCHINFERNO_CUDAGRAPH_PREFILL_MAX_CACHE_TOKENS", 1024, minimum=1)
+    max_cache_tokens = _tp_int("TORCHINFERNO_CUDAGRAPH_PREFILL_MAX_CACHE_TOKENS", 8192, minimum=1)
     cache_keys = _prefill_graph_cache_storage(cache)
     return (
         _tp_flag("TORCHINFERNO_CUDAGRAPH_PREFILL")
@@ -4166,7 +4166,7 @@ def _should_use_prefill_logits_graph(
     input_ids: Tensor,
     cache: Llama3TensorParallelCache,
 ) -> bool:
-    max_cache_tokens = _tp_int("TORCHINFERNO_CUDAGRAPH_PREFILL_MAX_CACHE_TOKENS", 1024, minimum=1)
+    max_cache_tokens = _tp_int("TORCHINFERNO_CUDAGRAPH_PREFILL_MAX_CACHE_TOKENS", 8192, minimum=1)
     cache_keys = _prefill_graph_cache_storage(cache)
     return (
         _tp_flag("TORCHINFERNO_CUDAGRAPH_PREFILL")
