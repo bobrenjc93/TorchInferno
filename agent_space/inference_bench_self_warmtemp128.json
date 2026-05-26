@@ -1,0 +1,16 @@
+{
+  "metrics": {
+    "correctness_rate": 1.0,
+    "e2e_median_ms": 722.9608045890927,
+    "e2e_p99_ms": 2086.047451943159,
+    "num_requests": 1000,
+    "throughput_median_tps": 1.3832039613382523,
+    "total_output_tokens": 1000,
+    "tpot_median_ms": 0.0,
+    "tpot_p99_ms": 0.0,
+    "ttft_median_ms": 406.3385743647814,
+    "ttft_p99_ms": 1738.1220338866115,
+    "unique_final_answers": 1
+  },
+  "num_requests": 1000
+}

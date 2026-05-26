@@ -1724,7 +1724,7 @@ class OpenAICompletionEngine:
                 self._completed_queue_batches += 1
 
     def _should_use_tensor_parallel_online_batcher(self, first: _QueuedGeneration) -> bool:
-        if not env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_CONTINUOUS_BATCHER", False):
+        if not env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_CONTINUOUS_BATCHER", True):
             return False
         if not first.stream:
             return False
@@ -1987,7 +1987,7 @@ class OpenAICompletionEngine:
                                 finished_events += 1
                         add_phase("event_emit_ms", event_emit_start_s)
                         step += 1
-                    if env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_STEP_SYNC", False):
+                    if env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_STEP_SYNC", True):
                         step_sync_start_s = time.perf_counter()
                         _sync_tensor_parallel_command(self.model, self.device)
                         add_phase("step_sync_ms", step_sync_start_s)
@@ -2736,7 +2736,7 @@ class OpenAICompletionEngine:
                                 _finish_stream_request(request)
                                 finished_events += 1
                         online_steps += 1
-                    if env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_STEP_SYNC", False):
+                    if env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_STEP_SYNC", True):
                         _sync_tensor_parallel_command(self.model, self.device)
         finally:
             self._record_runtime_engine_queue_profile(

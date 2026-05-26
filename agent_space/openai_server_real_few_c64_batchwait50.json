@@ -1,0 +1,65 @@
+{
+  "base_url": "http://127.0.0.1:8022/v1",
+  "config": {
+    "base_url": "http://127.0.0.1:8022/v1",
+    "batch_wait_ms": 10.0,
+    "cache_backend": "dense",
+    "cache_dir": null,
+    "concurrency": 64,
+    "device": "cpu",
+    "dtype": "float32",
+    "host": "127.0.0.1",
+    "iters": 5,
+    "json_output": "agent_space/openai_server_real_few_c64_batchwait50.json",
+    "llama_parallelism": "auto",
+    "max_batch_size": 64,
+    "max_model_len": 64,
+    "max_tokens": 8,
+    "model": "tiny",
+    "model_kind": "tiny-deepseek",
+    "modes": [
+      "stream"
+    ],
+    "page_size": 16,
+    "port": 0,
+    "prompt_mode": "few-shot",
+    "prompt_tokens": 8,
+    "python": "/home/bobren/local/d/pytorch-env/bin/python",
+    "ready_timeout_s": 30.0,
+    "request_timeout_s": 300.0,
+    "revision": null,
+    "temperature": 0.0,
+    "tensor_parallel_size": 1,
+    "token": null,
+    "tokenizer": "byte",
+    "trust_remote_code": false,
+    "warmup": 8
+  },
+  "results": {
+    "stream": {
+      "completed": 320,
+      "concurrency": 64,
+      "duration_s": 7.8039052449166775,
+      "latency_mean_ms": 1482.414313868503,
+      "latency_p50_ms": 1604.2248411104083,
+      "latency_p99_ms": 1624.8097039852291,
+      "output_token_throughput": 76.37201904626195,
+      "output_tokens": 596,
+      "prompt_tokens": 2560,
+      "request_throughput": 41.00511089732185,
+      "total_token_throughput": 404.4129062248368,
+      "tpot_mean_ms": 897.3341100896453,
+      "tpot_p50_ms": 902.1035726182163,
+      "tpot_p99_ms": 916.483188746497,
+      "ttft_mean_ms": 327.40520569786895,
+      "ttft_p50_ms": 328.5002214834094,
+      "ttft_p99_ms": 351.85707812197506
+    }
+  },
+  "server": {
+    "command": null,
+    "port": 40631
+  },
+  "started_server": false,
+  "startup_ms": 2.772035077214241
+}

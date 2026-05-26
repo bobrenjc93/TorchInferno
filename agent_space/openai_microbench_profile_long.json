@@ -1,0 +1,66 @@
+{
+  "backend": "model",
+  "batch_wait_ms": 10.0,
+  "cases": {
+    "single": {
+      "e2e_p50_ms": 1537.593451794237,
+      "e2e_p99_ms": 2020.7521356642246,
+      "max_model_batch": 0,
+      "model_forward_calls": 0,
+      "output_tokens_p50": 64.0,
+      "raw_requests": [
+        {
+          "e2e_ms": 2020.7521356642246,
+          "output_tokens": 64.0,
+          "throughput_tps": 31.671375657837963,
+          "tpot_ms": 12.449991741468983,
+          "ttft_ms": 1236.3855699077249
+        },
+        {
+          "e2e_ms": 1054.4347679242492,
+          "output_tokens": 64.0,
+          "throughput_tps": 60.69602591537249,
+          "tpot_ms": 12.454311452096416,
+          "ttft_ms": 269.7982843965292
+        }
+      ],
+      "requests": 2,
+      "throughput_p50_tps": 46.18370078660523,
+      "tpot_p50_ms": 12.452151596782699,
+      "tpot_p99_ms": 12.454311452096416,
+      "ttft_p50_ms": 753.091927152127,
+      "ttft_p99_ms": 1236.3855699077249
+    }
+  },
+  "device": "cuda:0",
+  "max_tokens": 64,
+  "profile_summary": {
+    "counts": {
+      "fast_prefill.attention": 320,
+      "fast_prefill.attention.cache_append": 320,
+      "fast_prefill.attention.input_norm_qkv_rotary": 4,
+      "fast_prefill.attention.o_project_reduce": 320,
+      "fast_prefill.attention.qkv_rotary": 316,
+      "fast_prefill.attention.sdp": 320,
+      "fast_prefill.mlp_project": 320,
+      "fast_prefill.next_input_add_norm": 316,
+      "fast_prefill.post_attention_add_norm": 320
+    },
+    "rank": 0,
+    "seconds": {
+      "fast_prefill.attention": 0.6748535437509418,
+      "fast_prefill.attention.cache_append": 0.07656009402126074,
+      "fast_prefill.attention.input_norm_qkv_rotary": 0.003712328150868416,
+      "fast_prefill.attention.o_project_reduce": 0.14572171587496996,
+      "fast_prefill.attention.qkv_rotary": 0.1059394059702754,
+      "fast_prefill.attention.sdp": 0.07872047368437052,
+      "fast_prefill.mlp_project": 0.15172102116048336,
+      "fast_prefill.next_input_add_norm": 0.0803072601556778,
+      "fast_prefill.post_attention_add_norm": 0.08080267813056707
+    },
+    "world_size": 8
+  },
+  "prompt_mode": "synthetic",
+  "prompt_tokens": 64,
+  "skipped_single_batcher": false
+}

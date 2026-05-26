@@ -1,0 +1,87 @@
+{
+  "backend": "model",
+  "batch_wait_ms": 10.0,
+  "cases": {
+    "single": {
+      "e2e_p50_ms": 159.4662293791771,
+      "e2e_p99_ms": 501.1745234951377,
+      "max_model_batch": 0,
+      "model_forward_calls": 0,
+      "output_tokens_p50": 1.0,
+      "raw_requests": [
+        {
+          "e2e_ms": 501.1745234951377,
+          "output_tokens": 1.0,
+          "throughput_tps": 1.9953129161995438,
+          "tpot_ms": 0.0,
+          "ttft_ms": 488.2960896939039
+        },
+        {
+          "e2e_ms": 182.9786580055952,
+          "output_tokens": 1.0,
+          "throughput_tps": 5.465118232364681,
+          "tpot_ms": 0.0,
+          "ttft_ms": 170.21364718675613
+        },
+        {
+          "e2e_ms": 159.4662293791771,
+          "output_tokens": 1.0,
+          "throughput_tps": 6.270920206072037,
+          "tpot_ms": 0.0,
+          "ttft_ms": 146.91119641065598
+        },
+        {
+          "e2e_ms": 139.48206696659327,
+          "output_tokens": 1.0,
+          "throughput_tps": 7.169380421065208,
+          "tpot_ms": 0.0,
+          "ttft_ms": 126.98213662952185
+        },
+        {
+          "e2e_ms": 138.95335886627436,
+          "output_tokens": 1.0,
+          "throughput_tps": 7.196659427012325,
+          "tpot_ms": 0.0,
+          "ttft_ms": 126.41941662877798
+        }
+      ],
+      "requests": 5,
+      "throughput_p50_tps": 6.270920206072037,
+      "tpot_p50_ms": 0.0,
+      "tpot_p99_ms": 0.0,
+      "ttft_p50_ms": 146.91119641065598,
+      "ttft_p99_ms": 488.2960896939039
+    }
+  },
+  "device": "cuda:0",
+  "max_tokens": 256,
+  "profile_summary": {
+    "counts": {
+      "fast_prefill.attention": 400,
+      "fast_prefill.attention.cache_append": 400,
+      "fast_prefill.attention.input_norm_qkv_rotary": 5,
+      "fast_prefill.attention.o_project_reduce": 400,
+      "fast_prefill.attention.qkv_rotary": 395,
+      "fast_prefill.attention.sdp": 400,
+      "fast_prefill.mlp_project": 400,
+      "fast_prefill.next_input_add_norm": 395,
+      "fast_prefill.post_attention_add_norm": 400
+    },
+    "rank": 0,
+    "seconds": {
+      "fast_prefill.attention": 0.4083090340718627,
+      "fast_prefill.attention.cache_append": 0.04260995890945196,
+      "fast_prefill.attention.input_norm_qkv_rotary": 0.0019523045048117638,
+      "fast_prefill.attention.o_project_reduce": 0.1556446636095643,
+      "fast_prefill.attention.qkv_rotary": 0.06652805954217911,
+      "fast_prefill.attention.sdp": 0.04092388693243265,
+      "fast_prefill.mlp_project": 0.1498045278713107,
+      "fast_prefill.next_input_add_norm": 0.0457674590870738,
+      "fast_prefill.post_attention_add_norm": 0.04680921230465174
+    },
+    "world_size": 8
+  },
+  "prompt_mode": "few-shot",
+  "prompt_tokens": 32,
+  "skipped_single_batcher": false
+}

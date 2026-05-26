@@ -1,0 +1,80 @@
+{
+  "backend": "model",
+  "batch_wait_ms": 10.0,
+  "cases": {
+    "single": {
+      "e2e_p50_ms": 177.48260917142034,
+      "e2e_p99_ms": 179.07615471631289,
+      "max_model_batch": 0,
+      "model_forward_calls": 0,
+      "output_tokens_p50": 1.0,
+      "raw_requests": [
+        {
+          "e2e_ms": 177.41553205996752,
+          "output_tokens": 1.0,
+          "throughput_tps": 5.636485083290194,
+          "tpot_ms": 0.0,
+          "ttft_ms": 164.6355725824833
+        },
+        {
+          "e2e_ms": 177.54968628287315,
+          "output_tokens": 1.0,
+          "throughput_tps": 5.632226228813463,
+          "tpot_ms": 0.0,
+          "ttft_ms": 164.6357337012887
+        },
+        {
+          "e2e_ms": 172.63464722782373,
+          "output_tokens": 1.0,
+          "throughput_tps": 5.792579971970011,
+          "tpot_ms": 0.0,
+          "ttft_ms": 159.91435945034027
+        },
+        {
+          "e2e_ms": 179.07615471631289,
+          "output_tokens": 1.0,
+          "throughput_tps": 5.584216399911927,
+          "tpot_ms": 0.0,
+          "ttft_ms": 166.28604102879763
+        }
+      ],
+      "requests": 4,
+      "throughput_p50_tps": 5.634355656051828,
+      "tpot_p50_ms": 0.0,
+      "tpot_p99_ms": 0.0,
+      "ttft_p50_ms": 164.635653141886,
+      "ttft_p99_ms": 166.28604102879763
+    }
+  },
+  "device": "cuda:0",
+  "max_tokens": 256,
+  "profile_summary": {
+    "counts": {
+      "fast_prefill.attention": 320,
+      "fast_prefill.attention.cache_append": 320,
+      "fast_prefill.attention.input_norm_qkv_rotary": 4,
+      "fast_prefill.attention.o_project_reduce": 320,
+      "fast_prefill.attention.qkv_rotary": 316,
+      "fast_prefill.attention.sdp": 320,
+      "fast_prefill.mlp_project": 320,
+      "fast_prefill.next_input_add_norm": 316,
+      "fast_prefill.post_attention_add_norm": 320
+    },
+    "rank": 0,
+    "seconds": {
+      "fast_prefill.attention": 0.35979422833770514,
+      "fast_prefill.attention.cache_append": 0.04229564405977726,
+      "fast_prefill.attention.input_norm_qkv_rotary": 0.0013912543654441833,
+      "fast_prefill.attention.o_project_reduce": 0.08302401751279831,
+      "fast_prefill.attention.qkv_rotary": 0.06112294923514128,
+      "fast_prefill.attention.sdp": 0.041832804679870605,
+      "fast_prefill.mlp_project": 0.09432433266192675,
+      "fast_prefill.next_input_add_norm": 0.04488795716315508,
+      "fast_prefill.post_attention_add_norm": 0.04568873904645443
+    },
+    "world_size": 8
+  },
+  "prompt_mode": "few-shot",
+  "prompt_tokens": 32,
+  "skipped_single_batcher": false
+}

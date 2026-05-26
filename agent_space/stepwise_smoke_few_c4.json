@@ -1,0 +1,76 @@
+{
+  "backend": "model",
+  "batch_wait_ms": 10.0,
+  "cases": {
+    "concurrent-4": {
+      "e2e_p50_ms": 962.9059471189976,
+      "e2e_p99_ms": 963.4065488353372,
+      "max_model_batch": 0,
+      "model_forward_calls": 0,
+      "output_tokens_p50": 1.0,
+      "raw_requests": [
+        {
+          "e2e_ms": 962.76097279042,
+          "output_tokens": 1.0,
+          "throughput_tps": 1.0386794108423902,
+          "tpot_ms": 0.0,
+          "ttft_ms": 401.0482933372259
+        },
+        {
+          "e2e_ms": 963.4065488353372,
+          "output_tokens": 1.0,
+          "throughput_tps": 1.037983394662306,
+          "tpot_ms": 0.0,
+          "ttft_ms": 401.7459284514189
+        },
+        {
+          "e2e_ms": 963.0509214475751,
+          "output_tokens": 1.0,
+          "throughput_tps": 1.0383666924869208,
+          "tpot_ms": 0.0,
+          "ttft_ms": 401.39584988355637
+        },
+        {
+          "e2e_ms": 962.6896632835269,
+          "output_tokens": 1.0,
+          "throughput_tps": 1.0387563491532834,
+          "tpot_ms": 0.0,
+          "ttft_ms": 400.80754831433296
+        }
+      ],
+      "requests": 4,
+      "throughput_p50_tps": 1.0385230516646555,
+      "tpot_p50_ms": 0.0,
+      "tpot_p99_ms": 0.0,
+      "ttft_p50_ms": 401.22207161039114,
+      "ttft_p99_ms": 401.7459284514189
+    },
+    "single": {
+      "e2e_p50_ms": 926.3398833572865,
+      "e2e_p99_ms": 926.3398833572865,
+      "max_model_batch": 0,
+      "model_forward_calls": 0,
+      "output_tokens_p50": 1.0,
+      "raw_requests": [
+        {
+          "e2e_ms": 926.3398833572865,
+          "output_tokens": 1.0,
+          "throughput_tps": 1.0795173758207959,
+          "tpot_ms": 0.0,
+          "ttft_ms": 177.8053669258952
+        }
+      ],
+      "requests": 1,
+      "throughput_p50_tps": 1.0795173758207959,
+      "tpot_p50_ms": 0.0,
+      "tpot_p99_ms": 0.0,
+      "ttft_p50_ms": 177.8053669258952,
+      "ttft_p99_ms": 177.8053669258952
+    }
+  },
+  "device": "cuda:0",
+  "max_tokens": 8,
+  "prompt_mode": "few-shot",
+  "prompt_tokens": 32,
+  "skipped_single_batcher": false
+}

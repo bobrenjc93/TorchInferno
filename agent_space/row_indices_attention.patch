@@ -1,0 +1,224 @@
+diff --git a/src/torchinferno/kernels/triton_ops.py b/src/torchinferno/kernels/triton_ops.py
+index b8672eb..f4c9fff 100644
+--- a/src/torchinferno/kernels/triton_ops.py
++++ b/src/torchinferno/kernels/triton_ops.py
+@@ -1067,7 +1067,9 @@ def _grouped_gqa_decode_attention_dynamic_kernel(
+     v_ptr,
+     out_ptr,
+     seq_len_ptr,
++    row_indices_ptr,
+     seq_len_stride: tl.constexpr,
++    has_row_indices: tl.constexpr,
+     q_heads: tl.constexpr,
+     kv_heads: tl.constexpr,
+     group_size: tl.constexpr,
+@@ -1097,6 +1099,9 @@ def _grouped_gqa_decode_attention_dynamic_kernel(
+ ) -> None:
+     batch = tl.program_id(0)
+     seq_len = tl.load(seq_len_ptr + batch * seq_len_stride)
++    kv_batch = batch
++    if has_row_indices:
++        kv_batch = tl.load(row_indices_ptr + batch)
+     kv_head = tl.program_id(1)
+     offs_q = tl.arange(0, block_q)
+     offs_s = tl.arange(0, block_s)
+@@ -1109,7 +1114,7 @@ def _grouped_gqa_decode_attention_dynamic_kernel(
+         + offs_d[None, :] * q_stride_dim
+     )
+     k_offsets = (
+-        batch * k_stride_batch
++        kv_batch * k_stride_batch
+         + kv_head * k_stride_head
+         + offs_d[:, None] * k_stride_dim
+         + offs_s[None, :] * k_stride_token
+@@ -1124,7 +1129,7 @@ def _grouped_gqa_decode_attention_dynamic_kernel(
+ 
+     offs_v = tl.arange(0, block_v)
+     v_offsets = (
+-        batch * v_stride_batch
++        kv_batch * v_stride_batch
+         + kv_head * v_stride_head
+         + offs_s[:, None] * v_stride_token
+         + offs_v[None, :] * v_stride_dim
+@@ -1146,7 +1151,9 @@ def _grouped_gqa_decode_attention_streaming_kernel(
+     v_ptr,
+     out_ptr,
+     seq_len_ptr,
++    row_indices_ptr,
+     seq_len_stride: tl.constexpr,
++    has_row_indices: tl.constexpr,
+     cache_tokens: tl.constexpr,
+     group_size: tl.constexpr,
+     head_dim: tl.constexpr,
+@@ -1175,6 +1182,9 @@ def _grouped_gqa_decode_attention_streaming_kernel(
+ ) -> None:
+     batch = tl.program_id(0)
+     seq_len = tl.load(seq_len_ptr + batch * seq_len_stride)
++    kv_batch = batch
++    if has_row_indices:
++        kv_batch = tl.load(row_indices_ptr + batch)
+     kv_head = tl.program_id(1)
+     offs_q = tl.arange(0, block_q)
+     offs_s = tl.arange(0, block_s)
+@@ -1193,7 +1203,7 @@ def _grouped_gqa_decode_attention_streaming_kernel(
+     for start in range(0, cache_tokens, block_s):
+         seq_offsets = start + offs_s
+         k_offsets = (
+-            batch * k_stride_batch
++            kv_batch * k_stride_batch
+             + kv_head * k_stride_head
+             + offs_d[:, None] * k_stride_dim
+             + seq_offsets[None, :] * k_stride_token
+@@ -1209,7 +1219,7 @@ def _grouped_gqa_decode_attention_streaming_kernel(
+         probs = tl.exp(scores - next_max[:, None])
+         scale_old = tl.exp(running_max - next_max)
+         v_offsets = (
+-            batch * v_stride_batch
++            kv_batch * v_stride_batch
+             + kv_head * v_stride_head
+             + seq_offsets[:, None] * v_stride_token
+             + offs_v[None, :] * v_stride_dim
+@@ -1231,13 +1241,24 @@ def _grouped_gqa_decode_attention_streaming_kernel(
+     tl.store(out_ptr + out_offsets, out, mask=(offs_q[:, None] < group_size) & (offs_v[None, :] < value_dim))
+ 
+ 
+-def triton_grouped_gqa_decode_attention(q: Tensor, k: Tensor, v: Tensor, seq_len: Tensor) -> Tensor:
++def triton_grouped_gqa_decode_attention(
++    q: Tensor,
++    k: Tensor,
++    v: Tensor,
++    seq_len: Tensor,
++    row_indices: Tensor | None = None,
++) -> Tensor:
+     """Single-token GQA decode attention that shares K/V loads across a query-head group."""
+ 
+     if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
+         raise ValueError("q, k, and v must have shape [batch, heads, tokens, dim]")
+-    if q.size(0) != k.size(0) or q.size(0) != v.size(0):
++    if row_indices is None and (q.size(0) != k.size(0) or q.size(0) != v.size(0)):
+         raise ValueError("q, k, and v batch dimensions must match")
++    if row_indices is not None:
++        if row_indices.shape != (q.size(0),):
++            raise ValueError("decode attention row indices must have shape [batch]")
++        if row_indices.device != k.device:
++            raise ValueError("decode attention row indices must be on the cache device")
+     if q.size(-2) != 1:
+         raise ValueError("decode attention expects q to contain exactly one token")
+     if k.size(-2) != v.size(-2):
+@@ -1254,6 +1275,8 @@ def triton_grouped_gqa_decode_attention(q: Tensor, k: Tensor, v: Tensor, seq_len
+         raise ValueError("dynamic decode attention sequence length must be scalar or have shape [batch]")
+     if seq_len.device != k.device:
+         raise ValueError("dynamic decode attention sequence length must be on the cache device")
++    if row_indices is not None:
++        row_indices = row_indices.contiguous()
+     batch, q_heads, _, head_dim = q.shape
+     _, kv_heads, cache_tokens, _ = k.shape
+     value_dim = v.size(-1)
+@@ -1280,7 +1303,9 @@ def triton_grouped_gqa_decode_attention(q: Tensor, k: Tensor, v: Tensor, seq_len
+             v,
+             out,
+             seq_len,
++            row_indices,
+             seq_len_stride,
++            row_indices is not None,
+             cache_tokens,
+             group_size,
+             head_dim,
+@@ -1316,7 +1341,9 @@ def triton_grouped_gqa_decode_attention(q: Tensor, k: Tensor, v: Tensor, seq_len
+         v,
+         out,
+         seq_len,
++        row_indices,
+         seq_len_stride,
++        row_indices is not None,
+         q_heads,
+         kv_heads,
+         group_size,
+diff --git a/src/torchinferno/models/llama3/tensor_parallel.py b/src/torchinferno/models/llama3/tensor_parallel.py
+index 9267de3..f395a38 100644
+--- a/src/torchinferno/models/llama3/tensor_parallel.py
++++ b/src/torchinferno/models/llama3/tensor_parallel.py
+@@ -569,14 +569,15 @@ class _Llama3TensorParallelLayer:
+             attention_keys = cache.keys[:batch]
+             attention_values = cache.values[:batch]
+         else:
+-            attention_keys = cache.keys.index_select(0, row_indices)
+-            attention_values = cache.values.index_select(0, row_indices)
++            attention_keys = cache.keys
++            attention_values = cache.values
+         enable_gqa = self.local_attention_heads != self.local_key_value_heads
+         out = _ragged_scaled_dot_product_attention(
+             q,
+             attention_keys,
+             attention_values,
+             attention_lengths,
++            row_indices=row_indices,
+             enable_gqa=enable_gqa,
+         )
+         out = out.transpose(1, 2).contiguous().view(batch, tokens, self.local_hidden_size)
+@@ -2450,6 +2451,7 @@ def _ragged_scaled_dot_product_attention(
+     v: Tensor,
+     attention_lengths: Tensor,
+     *,
++    row_indices: Tensor | None = None,
+     enable_gqa: bool,
+ ) -> Tensor:
+     if (
+@@ -2462,9 +2464,19 @@ def _ragged_scaled_dot_product_attention(
+         try:
+             from torchinferno.kernels.triton_ops import triton_grouped_gqa_decode_attention
+ 
+-            return triton_grouped_gqa_decode_attention(q, k, v, attention_lengths.to(device=k.device))
++            return triton_grouped_gqa_decode_attention(
++                q,
++                k,
++                v,
++                attention_lengths.to(device=k.device),
++                row_indices=row_indices,
++            )
+         except Exception as exc:
+             warn_optional_failure("llama3_tensor_parallel.ragged_decode_attention", exc)
++    if row_indices is not None:
++        rows = row_indices.to(device=k.device, dtype=torch.long)
++        k = k.index_select(0, rows)
++        v = v.index_select(0, rows)
+     max_seq_len = k.size(2)
+     key_positions = torch.arange(max_seq_len, device=q.device)
+     mask = key_positions[None, :] < attention_lengths.to(device=q.device)[:, None]
+diff --git a/tests/test_conversion_and_kernels.py b/tests/test_conversion_and_kernels.py
+index 98d2b62..cd38b8b 100644
+--- a/tests/test_conversion_and_kernels.py
++++ b/tests/test_conversion_and_kernels.py
+@@ -376,3 +376,32 @@ def test_triton_dense_gqa_decode_attention_matches_torch_reference() -> None:
+     row_actual = triton_grouped_gqa_decode_attention(q, padded_k, padded_v, row_seq_lens)
+ 
+     torch.testing.assert_close(row_actual, row_expected, atol=4e-2, rtol=4e-2)
++
++    cache_batch = 3
++    active_batch = 2
++    cache_k = torch.randn(cache_batch, kv_heads, 32, head_dim, device="cuda", dtype=torch.bfloat16)
++    cache_v = torch.randn(cache_batch, kv_heads, 32, head_dim, device="cuda", dtype=torch.bfloat16)
++    active_q = torch.randn(active_batch, q_heads, 1, head_dim, device="cuda", dtype=torch.bfloat16)
++    row_indices = torch.tensor([2, 0], device="cuda", dtype=torch.int64)
++    selected_seq_lens = torch.tensor([seq_len - 2, seq_len], device="cuda", dtype=torch.int64)
++    selected_k = cache_k.index_select(0, row_indices)
++    selected_v = cache_v.index_select(0, row_indices)
++    selected_mask = key_positions[None, :] < selected_seq_lens[:, None]
++    selected_expected = torch.nn.functional.scaled_dot_product_attention(
++        active_q,
++        selected_k,
++        selected_v,
++        attn_mask=selected_mask[:, None, None, :],
++        dropout_p=0.0,
++        is_causal=False,
++        enable_gqa=True,
++    )
++    selected_actual = triton_grouped_gqa_decode_attention(
++        active_q,
++        cache_k,
++        cache_v,
++        selected_seq_lens,
++        row_indices=row_indices,
++    )
++
++    torch.testing.assert_close(selected_actual, selected_expected, atol=4e-2, rtol=4e-2)

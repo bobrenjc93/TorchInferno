@@ -1,0 +1,76 @@
+{
+  "backend": "model",
+  "batch_wait_ms": 10.0,
+  "cases": {
+    "single": {
+      "e2e_p50_ms": 1271.630244795233,
+      "e2e_p99_ms": 1367.0359207317233,
+      "max_model_batch": 0,
+      "model_forward_calls": 0,
+      "output_tokens_p50": 80.0,
+      "raw_requests": [
+        {
+          "e2e_ms": 1367.0359207317233,
+          "output_tokens": 80.0,
+          "throughput_tps": 58.52077387782099,
+          "tpot_ms": 12.884228337037413,
+          "ttft_ms": 349.16617907583714
+        },
+        {
+          "e2e_ms": 1176.2245688587427,
+          "output_tokens": 80.0,
+          "throughput_tps": 68.0142228942061,
+          "tpot_ms": 12.793424338856829,
+          "ttft_ms": 165.53118731826544
+        }
+      ],
+      "requests": 2,
+      "throughput_p50_tps": 63.26749838601354,
+      "tpot_p50_ms": 12.838826337947122,
+      "tpot_p99_ms": 12.884228337037413,
+      "ttft_p50_ms": 257.3486831970513,
+      "ttft_p99_ms": 349.16617907583714
+    }
+  },
+  "device": "cuda:0",
+  "max_tokens": 80,
+  "profile_summary": {
+    "counts": {
+      "fast_prefill.attention": 160,
+      "fast_prefill.attention-prefill.all_reduce": 160,
+      "fast_prefill.attention-prefill.mm": 160,
+      "fast_prefill.attention.cache_append": 160,
+      "fast_prefill.attention.input_norm_qkv_rotary": 2,
+      "fast_prefill.attention.o_project_reduce": 160,
+      "fast_prefill.attention.qkv_rotary": 158,
+      "fast_prefill.attention.sdp": 160,
+      "fast_prefill.mlp-prefill.all_reduce": 160,
+      "fast_prefill.mlp-prefill.mm": 160,
+      "fast_prefill.mlp_prefill.gate_up_activation": 160,
+      "fast_prefill.mlp_project": 160,
+      "fast_prefill.next_input_add_norm": 158,
+      "fast_prefill.post_attention_add_norm": 160
+    },
+    "rank": 0,
+    "seconds": {
+      "fast_prefill.attention": 0.19163094367831945,
+      "fast_prefill.attention-prefill.all_reduce": 0.043181173503398895,
+      "fast_prefill.attention-prefill.mm": 0.015248466283082962,
+      "fast_prefill.attention.cache_append": 0.017739000730216503,
+      "fast_prefill.attention.input_norm_qkv_rotary": 0.0012997360900044441,
+      "fast_prefill.attention.o_project_reduce": 0.08600988704711199,
+      "fast_prefill.attention.qkv_rotary": 0.025655023753643036,
+      "fast_prefill.attention.sdp": 0.017887660302221775,
+      "fast_prefill.mlp-prefill.all_reduce": 0.03301813453435898,
+      "fast_prefill.mlp-prefill.mm": 0.014005293138325214,
+      "fast_prefill.mlp_prefill.gate_up_activation": 0.02380512561649084,
+      "fast_prefill.mlp_project": 0.10780156869441271,
+      "fast_prefill.next_input_add_norm": 0.018122906796634197,
+      "fast_prefill.post_attention_add_norm": 0.01874258555471897
+    },
+    "world_size": 8
+  },
+  "prompt_mode": "synthetic",
+  "prompt_tokens": 160,
+  "skipped_single_batcher": false
+}
