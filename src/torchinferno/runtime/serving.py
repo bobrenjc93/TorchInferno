@@ -591,7 +591,7 @@ class ContinuousBatchEngine:
         step: int,
         events: list[ServingTokenEvent] | None = None,
     ) -> list[_ActiveRequest] | None:
-        if not env_flag("TORCHINFERNO_CONTINUOUS_PADDED_SUFFIX_PREFILL", True):
+        if not env_flag("TORCHINFERNO_CONTINUOUS_PADDED_SUFFIX_PREFILL", False):
             return None
         suffixes = [request.prompt[prefix_tokens:] for _original_index, request, _hit in group]
         suffix_lengths = [len(suffix) for suffix in suffixes]
@@ -739,7 +739,7 @@ class ContinuousBatchEngine:
         *,
         events: list[ServingTokenEvent] | None = None,
     ) -> list[_ActiveRequest] | None:
-        if not env_flag("TORCHINFERNO_CONTINUOUS_PADDED_SUFFIX_PREFILL", True):
+        if not env_flag("TORCHINFERNO_CONTINUOUS_PADDED_SUFFIX_PREFILL", False):
             return None
         suffixes = [request.prompt[prefix_hit_tokens:] for _index, request, prefix_hit_tokens, _reusable in group]
         suffix_lengths = [len(suffix) for suffix in suffixes]
