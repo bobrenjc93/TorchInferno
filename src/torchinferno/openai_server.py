@@ -1864,6 +1864,15 @@ class OpenAICompletionEngine:
                         _drain_queue()
                         continue
 
+                    tb_state = self._token_budget_step_state
+                    if tb_state is not None and finished_ids:
+                        for rid in finished_ids:
+                            for row, row_rid in enumerate(tb_state.row_request_ids):
+                                if row_rid == rid:
+                                    tb_state.active[row] = False
+                                    tb_state.row_request_ids[row] = None
+                                    tb_state.generated_tokens[row] = 0
+                                    break
                     plan = scheduler.step(finished_request_ids=finished_ids)
                     finished_ids = ()
                     if not plan.chunks:
@@ -6818,22 +6827,6 @@ class OpenAICompletionEngine:
         chunks_obj = payload.get("chunks", [])
         if not isinstance(chunks_obj, list):
             raise ValueError("token-budget step payload requires chunk list")
-        chunk_request_ids = set()
-        for chunk_obj in chunks_obj:
-            if isinstance(chunk_obj, Mapping):
-                chunk_request_ids.add(str(chunk_obj.get("request_id", "")))
-        pre_finished_obj = payload.get("finished_request_ids", [])
-        if isinstance(pre_finished_obj, list):
-            for request_id_obj in pre_finished_obj:
-                request_id = str(request_id_obj)
-                if request_id in chunk_request_ids:
-                    continue
-                for row, row_request_id in enumerate(state.row_request_ids):
-                    if row_request_id == request_id:
-                        state.active[row] = False
-                        state.row_request_ids[row] = None
-                        state.generated_tokens[row] = 0
-                        break
         decode_tokens: dict[str, int | None] = {}
         prefill_tokens: dict[str, int | None] = {}
         index = 0
