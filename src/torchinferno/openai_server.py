@@ -1729,6 +1729,27 @@ class OpenAICompletionEngine:
                         self._collect_batch_until_deadline(
                             next_batch, limit=batch_limit, wait_s=self.batch_wait_s,
                         )
+                    with self._live_request_condition:
+                        live = self._live_requests
+                    min_batch = env_int(
+                        "TORCHINFERNO_OPENAI_TP_MIN_BATCH_UNDER_LOAD",
+                        max(1, batch_limit // 4),
+                        minimum=1,
+                    )
+                    if (
+                        len(next_batch) < min_batch
+                        and live > min_batch * 2
+                        and len(next_batch) < batch_limit
+                    ):
+                        self._collect_batch_until_deadline(
+                            next_batch,
+                            limit=batch_limit,
+                            wait_s=env_float(
+                                "TORCHINFERNO_OPENAI_TP_MIN_BATCH_WAIT_MS",
+                                5.0,
+                                minimum=0.0,
+                            ) / 1000.0,
+                        )
                     if not next_batch:
                         break
                     self._run_queued_batch(next_batch)
