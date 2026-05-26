@@ -95,7 +95,7 @@ class OpenAIServerConfig:
     cache_backend: str = "dense"
     page_size: int = 16
     max_batch_size: int = 128
-    batch_wait_ms: float = 1.0
+    batch_wait_ms: float = 2.0
     single_request_admission_wait_ms: float | None = None
     llama_parallelism: str = "auto"
 
@@ -2420,11 +2420,11 @@ class OpenAICompletionEngine:
             default_wait_ms = (
                 env_float(
                     "TORCHINFERNO_OPENAI_TP_GREEDY_SHORT_OUTPUT_INITIAL_BATCH_WAIT_MS",
-                    1.0,
+                    3.0,
                     minimum=0.0,
                 )
                 if first.max_tokens <= short_output_max_tokens
-                else 0.5
+                else 2.0
             )
             wait_ms = env_float(
                 "TORCHINFERNO_OPENAI_TP_GREEDY_INITIAL_BATCH_WAIT_MS",
@@ -11780,7 +11780,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=env_int("TORCHINFERNO_OPENAI_PAGE_SIZE", 16, minimum=1),
     )
     parser.add_argument("--max-batch-size", type=int, default=128)
-    parser.add_argument("--batch-wait-ms", type=float, default=1.0)
+    parser.add_argument("--batch-wait-ms", type=float, default=2.0)
     parser.add_argument(
         "--single-request-admission-wait-ms",
         type=float,
