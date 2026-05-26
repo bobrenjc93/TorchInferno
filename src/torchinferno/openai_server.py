@@ -1724,7 +1724,11 @@ class OpenAICompletionEngine:
                             self._generation_queue.put(None)
                             break
                         next_batch.append(item)
-                        self._drain_ready_requests(next_batch, limit=batch_limit)
+                    self._drain_ready_requests(next_batch, limit=batch_limit)
+                    if self._has_multiple_live_requests() and len(next_batch) < batch_limit:
+                        self._collect_batch_until_deadline(
+                            next_batch, limit=batch_limit, wait_s=self.batch_wait_s,
+                        )
                     if not next_batch:
                         break
                     self._run_queued_batch(next_batch)
