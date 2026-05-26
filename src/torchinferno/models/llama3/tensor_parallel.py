@@ -2484,9 +2484,21 @@ class Llama3TensorParallelForCausalLM:
         capture_on_miss: bool = True,
     ) -> Tensor | None:
         initial_seq_len = cache.seq_len
+        prompt_tokens = input_ids.size(1)
+        bucket = _prefill_bucket_size(prompt_tokens) if _tp_flag(
+            "TORCHINFERNO_CUDAGRAPH_PREFILL_BUCKETING", True
+        ) else None
+        if bucket is not None and bucket > prompt_tokens:
+            pad_len = bucket - prompt_tokens
+            input_ids = torch.nn.functional.pad(input_ids, (0, pad_len), value=0)
         end_seq_len = initial_seq_len + input_ids.size(1)
         if end_seq_len > cache.layers[0].max_seq_len:
-            raise ValueError("KV cache capacity exceeded")
+            if bucket is not None:
+                input_ids = input_ids[:, :prompt_tokens]
+                end_seq_len = initial_seq_len + prompt_tokens
+                bucket = None
+            if end_seq_len > cache.layers[0].max_seq_len:
+                raise ValueError("KV cache capacity exceeded")
         key = (
             *_prefill_graph_cache_key(cache, input_ids.size(0)),
             initial_seq_len,
@@ -2513,6 +2525,8 @@ class Llama3TensorParallelForCausalLM:
             except Exception:
                 self._set_cache_seq_len(cache, initial_seq_len)
                 raise
+            real_end = initial_seq_len + prompt_tokens
+            self._set_cache_seq_len(cache, real_end)
             max_graphs = _tp_int("TORCHINFERNO_CUDAGRAPH_PREFILL_MAX_GRAPHS", 128, minimum=1)
             if key not in self._prefill_logits_graphs and len(self._prefill_logits_graphs) >= max_graphs:
                 self._prefill_logits_graphs.clear()
@@ -2521,8 +2535,12 @@ class Llama3TensorParallelForCausalLM:
             captured.static_input_ids.copy_(input_ids)
             self._set_cache_seq_len(cache, captured.initial_seq_len)
             captured.graph.replay()
-            self._set_cache_seq_len(cache, end_seq_len)
-        return captured.output_logits
+            real_end = initial_seq_len + prompt_tokens
+            self._set_cache_seq_len(cache, real_end)
+        logits = captured.output_logits
+        if bucket is not None and bucket > prompt_tokens:
+            logits = logits[:, :prompt_tokens, :]
+        return logits
 
     def _capture_prefill_logits_graph(
         self,
@@ -2568,9 +2586,21 @@ class Llama3TensorParallelForCausalLM:
         capture_on_miss: bool = True,
     ) -> Tensor | None:
         initial_seq_len = cache.seq_len
+        prompt_tokens = input_ids.size(1)
+        bucket = _prefill_bucket_size(prompt_tokens) if _tp_flag(
+            "TORCHINFERNO_CUDAGRAPH_PREFILL_BUCKETING", True
+        ) else None
+        if bucket is not None and bucket > prompt_tokens:
+            pad_len = bucket - prompt_tokens
+            input_ids = torch.nn.functional.pad(input_ids, (0, pad_len), value=0)
         end_seq_len = initial_seq_len + input_ids.size(1)
         if end_seq_len > cache.layers[0].max_seq_len:
-            raise ValueError("KV cache capacity exceeded")
+            if bucket is not None:
+                input_ids = input_ids[:, :prompt_tokens]
+                end_seq_len = initial_seq_len + prompt_tokens
+                bucket = None
+            if end_seq_len > cache.layers[0].max_seq_len:
+                raise ValueError("KV cache capacity exceeded")
         key = (
             *_prefill_graph_cache_key(cache, input_ids.size(0)),
             initial_seq_len,
@@ -2598,6 +2628,8 @@ class Llama3TensorParallelForCausalLM:
             except Exception:
                 self._set_cache_seq_len(cache, initial_seq_len)
                 raise
+            real_end = initial_seq_len + prompt_tokens
+            self._set_cache_seq_len(cache, real_end)
             max_graphs = _tp_int("TORCHINFERNO_CUDAGRAPH_PREFILL_MAX_GRAPHS", 128, minimum=1)
             if (
                 key not in self._prefill_selected_logits_graphs
@@ -2610,7 +2642,8 @@ class Llama3TensorParallelForCausalLM:
             captured.static_logit_positions.copy_(logit_positions.to(self.device, non_blocking=True))
             self._set_cache_seq_len(cache, captured.initial_seq_len)
             captured.graph.replay()
-            self._set_cache_seq_len(cache, end_seq_len)
+            real_end = initial_seq_len + prompt_tokens
+            self._set_cache_seq_len(cache, real_end)
         return captured.output_logits
 
     def _capture_prefill_selected_logits_graph(
@@ -4145,6 +4178,16 @@ def _should_use_prefill_logits_graph(
         and cache_keys.is_cuda
         and cache.layers[0].max_seq_len <= max_cache_tokens
     )
+
+
+_PREFILL_TOKEN_BUCKETS = (16, 32, 64, 128, 256, 512, 1024)
+
+
+def _prefill_bucket_size(prompt_tokens: int) -> int | None:
+    for bucket in _PREFILL_TOKEN_BUCKETS:
+        if prompt_tokens <= bucket:
+            return bucket
+    return None
 
 
 def _prefill_graph_cache_storage(cache: Llama3TensorParallelCache) -> Tensor | None:
