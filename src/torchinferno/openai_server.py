@@ -6818,6 +6818,22 @@ class OpenAICompletionEngine:
         chunks_obj = payload.get("chunks", [])
         if not isinstance(chunks_obj, list):
             raise ValueError("token-budget step payload requires chunk list")
+        chunk_request_ids = set()
+        for chunk_obj in chunks_obj:
+            if isinstance(chunk_obj, Mapping):
+                chunk_request_ids.add(str(chunk_obj.get("request_id", "")))
+        pre_finished_obj = payload.get("finished_request_ids", [])
+        if isinstance(pre_finished_obj, list):
+            for request_id_obj in pre_finished_obj:
+                request_id = str(request_id_obj)
+                if request_id in chunk_request_ids:
+                    continue
+                for row, row_request_id in enumerate(state.row_request_ids):
+                    if row_request_id == request_id:
+                        state.active[row] = False
+                        state.row_request_ids[row] = None
+                        state.generated_tokens[row] = 0
+                        break
         decode_tokens: dict[str, int | None] = {}
         prefill_tokens: dict[str, int | None] = {}
         index = 0
