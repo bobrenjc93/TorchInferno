@@ -1805,7 +1805,7 @@ class OpenAICompletionEngine:
         return hasattr(self.model, "allocate_cache")
 
     def _unified_scheduler_worker(self) -> None:
-        max_active = _effective_openai_max_batch_size(self.model, self.device, self.max_batch_size)
+        max_active = min(64, _effective_openai_max_batch_size(self.model, self.device, self.max_batch_size))
         max_tokens_per_step = env_int("TORCHINFERNO_OPENAI_UNIFIED_MAX_TOKENS", 2048, minimum=1)
         prefill_chunk = env_int("TORCHINFERNO_OPENAI_UNIFIED_PREFILL_CHUNK", 512, minimum=1)
         decode_run_steps = env_int("TORCHINFERNO_OPENAI_UNIFIED_DECODE_RUN_STEPS", 8, minimum=1)
@@ -1951,6 +1951,8 @@ class OpenAICompletionEngine:
                             payload["temperature"] = 0.0
                             _broadcast_tensor_parallel_token_budget_decode_run(self.model, payload)
                             result = self._handle_token_budget_decode_run_payload(payload)
+                            if self.device.type == "cuda":
+                                torch.cuda.synchronize(self.device)
                             run_finished: list[str] = []
                             for step_result in result.step_results:
                                 run_finished.extend(_emit_result(step_result))
@@ -1964,6 +1966,8 @@ class OpenAICompletionEngine:
                     payload["temperature"] = 0.0
                     _broadcast_tensor_parallel_token_budget_step(self.model, payload)
                     result = self._handle_token_budget_step_payload(payload)
+                    if self.device.type == "cuda":
+                        torch.cuda.synchronize(self.device)
                     finished_ids = _emit_result(result)
                     _drain_queue()
                     self._completed_queue_batches += 1
@@ -7170,17 +7174,6 @@ class OpenAICompletionEngine:
         if cache_view is None:
             raise RuntimeError("token-budget prefill requires row-view cache")
         input_ids = torch.tensor([prompt_chunk], dtype=torch.long, device=self.device)
-        prefill_token = _try_prefill_graph(
-            self.model, input_ids, cache_view, temperature, allow_capture=False,
-        )
-        if prefill_token is not None:
-            state.seq_lens[row] = start_token + token_count
-            if bool(chunk.get("prompt_complete", False)) and bool(chunk.get("emits_token", False)):
-                token_id = int(prefill_token.item())
-                state.next_token_tensor[row] = token_id
-                state.generated_tokens[row] += 1
-                return token_id
-            return None
         logits, _cache_view = _forward(self.model, input_ids, cache_view)
         state.seq_lens[row] = start_token + token_count
         if not bool(chunk.get("prompt_complete", False)):
@@ -7265,14 +7258,19 @@ class OpenAICompletionEngine:
 
         input_ids = torch.tensor([[token_id] for token_id in input_tokens], dtype=torch.long, device=self.device)
         row_indices = torch.tensor(rows, dtype=torch.long, device=self.device)
-        next_tokens, _cache = _decode_next_token_ragged(
-            self.model,
-            input_ids,
-            state.cache,
-            state.seq_lens,
-            row_indices,
-            temperature,
-        )
+        decode_ragged = getattr(self.model, "decode_ragged_logits", None)
+        if callable(decode_ragged):
+            logits = decode_ragged(input_ids, state.cache, seq_lens=state.seq_lens, row_indices=row_indices)
+            next_tokens = _sample(self.model, logits[:, -1, :], temperature).to(self.device)
+        else:
+            next_tokens, _cache = _decode_next_token_ragged(
+                self.model,
+                input_ids,
+                state.cache,
+                state.seq_lens,
+                row_indices,
+                temperature,
+            )
         token_values = [int(token_id) for token_id in next_tokens.detach().cpu().tolist()]
         result: dict[str, int | None] = {}
         for request_id, row, token_id in zip(request_ids, rows, token_values):
