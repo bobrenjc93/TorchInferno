@@ -1766,6 +1766,10 @@ class OpenAICompletionEngine:
             _try_prefill_graph(self.model, input_ids, cache_view, 0.0, allow_capture=True)
             _reset_generation_cache(cache_view)
         _reset_generation_cache(cache)
+        try:
+            cache._skip_capture_sync = True
+        except Exception:
+            pass
         self._persistent_serving_cache = cache
 
     def _warmup_token_budget_prefill_graphs(self, prefill_chunk_size: int) -> None:

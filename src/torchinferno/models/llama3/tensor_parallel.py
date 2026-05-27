@@ -2855,7 +2855,8 @@ class Llama3TensorParallelForCausalLM:
             or captured.attention_block_size != attention_block_size
             or captured.static_input_ids.shape != input_ids.shape
         )
-        needs_capture = _capture_needed_on_any_rank(needs_capture, self.device)
+        if not getattr(cache, "_skip_capture_sync", False):
+            needs_capture = _capture_needed_on_any_rank(needs_capture, self.device)
         if needs_capture:
             if not capture_on_miss:
                 return None
@@ -2956,7 +2957,7 @@ class Llama3TensorParallelForCausalLM:
             or captured.attention_block_size != attention_block_size
             or captured.static_input_ids.shape != input_ids.shape
         )
-        needs_capture = _capture_needed_on_any_rank(needs_capture, self.device)
+        needs_capture = _capture_needed_on_any_rank(needs_capture, self.device) if not getattr(cache, "_skip_capture_sync", False) else needs_capture
         if needs_capture:
             if not capture_on_miss:
                 return None
@@ -2993,7 +2994,7 @@ class Llama3TensorParallelForCausalLM:
             or captured.static_input_ids.shape != input_ids.shape
             or (captured.static_row_indices is None) != (row_indices is None)
         )
-        needs_capture = _capture_needed_on_any_rank(needs_capture, self.device)
+        needs_capture = _capture_needed_on_any_rank(needs_capture, self.device) if not getattr(cache, "_skip_capture_sync", False) else needs_capture
         if needs_capture:
             if not capture_on_miss:
                 return None
@@ -3035,7 +3036,7 @@ class Llama3TensorParallelForCausalLM:
             or captured.static_input_ids.shape != input_ids.shape
             or (captured.static_row_indices is None) != (row_indices is None)
         )
-        needs_capture = _capture_needed_on_any_rank(needs_capture, self.device)
+        needs_capture = _capture_needed_on_any_rank(needs_capture, self.device) if not getattr(cache, "_skip_capture_sync", False) else needs_capture
         if needs_capture:
             if not capture_on_miss:
                 return None
