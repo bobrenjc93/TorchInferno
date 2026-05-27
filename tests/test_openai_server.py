@@ -5626,10 +5626,10 @@ def test_openai_tensor_parallel_generation_cache_uses_batch_buckets(monkeypatch)
         batch_capacity=_generation_cache_batch_capacity(model, 56),
     )
 
-    assert model.allocated_shapes == [(1, 32), (64, 32), (64, 256)]
+    assert model.allocated_shapes == [(1, 32), (8, 32), (64, 256)]
     assert list(engine._cache_pool) == [
         (1, 32, "dense", 16, "cpu"),
-        (64, 32, "dense", 16, "cpu"),
+        (8, 32, "dense", 16, "cpu"),
         (64, 256, "dense", 16, "cpu"),
     ]
     assert dense in engine._cache_pool.values()
@@ -7436,8 +7436,8 @@ def test_openai_tp_sampled_stream_uses_short_initial_queue_wait(monkeypatch) -> 
 
     assert engine._queued_initial_batch_wait_s(short_sampled) == 0.001
     assert engine._queued_initial_batch_wait_s(sampled) == 0.001
-    assert engine._queued_initial_batch_wait_s(short_greedy) == 0.005
-    assert engine._queued_initial_batch_wait_s(greedy) == 0.005
+    assert engine._queued_initial_batch_wait_s(short_greedy) == 0.002
+    assert engine._queued_initial_batch_wait_s(greedy) == 0.002
     assert engine._queued_initial_batch_wait_s(completion) == 0.0
     assert engine._queued_initial_batch_wait_s(long_sampled) == 0.0
 
