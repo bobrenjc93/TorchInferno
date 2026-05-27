@@ -1892,12 +1892,10 @@ class OpenAICompletionEngine:
                     temperature=0.0,
                     max_tokens=max_tokens_per_step,
                 )
-                persistent = getattr(self, "_persistent_serving_cache", None)
                 self._start_token_budget_step_state(
                     cache_batch_size=cache_batch,
                     max_seq_len=max_model_len,
                     temperature=0.0,
-                    external_cache=persistent,
                 )
                 _sync_tensor_parallel_command(self.model, self.device)
 
@@ -6871,6 +6869,10 @@ class OpenAICompletionEngine:
             next_token_tensor=torch.zeros(cache_batch_size, dtype=torch.long, device=self.device),
             cache_batch_size=cache_batch_size,
         )
+        try:
+            cache._skip_capture_sync = True
+        except Exception:
+            pass
         self._token_budget_step_state = state
         self._token_budget_step_last_result = None
         return state
@@ -7308,13 +7310,11 @@ class OpenAICompletionEngine:
         prefix_obj = payload.get("prefix", [])
         if not isinstance(prefix_obj, list):
             raise ValueError("token-budget start prefix must be a list")
-        persistent = getattr(self, "_persistent_serving_cache", None)
         state = self._start_token_budget_step_state(
             cache_batch_size=int(payload["max_active_rows"]),
             max_seq_len=int(payload["max_seq_len"]),
             prefix=[int(token_id) for token_id in prefix_obj],
             temperature=float(payload.get("temperature", 0.0)),
-            external_cache=persistent,
         )
         return state
 
