@@ -1742,7 +1742,31 @@ class OpenAICompletionEngine:
                     self._completed_queue_batches += 1
 
     def _warmup_unified_scheduler_cache(self, vocab_size: int) -> None:
-        pass
+        max_active = _effective_openai_max_batch_size(self.model, self.device, self.max_batch_size)
+        cache_batch = _generation_cache_batch_capacity(self.model, max_active)
+        max_seq_len = env_int(
+            "TORCHINFERNO_OPENAI_UNIFIED_MAX_SEQ_LEN",
+            getattr(self, "max_model_len", None) or 512,
+            minimum=64,
+        )
+        cache = _allocate_cache(
+            self.model, cache_batch, _generation_cache_capacity(self.model, max_seq_len),
+            device=self.device, cache_backend=self.cache_backend, page_size=self.page_size,
+        )
+        _reset_generation_cache(cache)
+        from torchinferno.models.llama3.tensor_parallel import _PREFILL_TOKEN_BUCKETS
+        for bucket in _PREFILL_TOKEN_BUCKETS:
+            if bucket >= max_seq_len:
+                break
+            cache_view = _cache_row_slice(cache, 0, 1)
+            if cache_view is None:
+                continue
+            _reset_generation_cache(cache_view)
+            input_ids = (torch.arange(bucket, device=self.device, dtype=torch.long) % vocab_size)[None, :]
+            _try_prefill_graph(self.model, input_ids, cache_view, 0.0, allow_capture=True)
+            _reset_generation_cache(cache_view)
+        _reset_generation_cache(cache)
+        self._persistent_serving_cache = cache
 
     def _warmup_token_budget_prefill_graphs(self, prefill_chunk_size: int) -> None:
         state = self._token_budget_step_state
@@ -1767,7 +1791,7 @@ class OpenAICompletionEngine:
                 _reset_generation_cache(cache_view)
 
     def _should_use_unified_scheduler(self) -> bool:
-        if not env_flag("TORCHINFERNO_OPENAI_UNIFIED_SCHEDULER", False):
+        if not env_flag("TORCHINFERNO_OPENAI_UNIFIED_SCHEDULER", True):
             return False
         if not _is_tensor_parallel_primary_model(self.model):
             return False
@@ -1863,10 +1887,12 @@ class OpenAICompletionEngine:
                     temperature=0.0,
                     max_tokens=max_tokens_per_step,
                 )
+                persistent = getattr(self, "_persistent_serving_cache", None)
                 self._start_token_budget_step_state(
                     cache_batch_size=cache_batch,
                     max_seq_len=max_model_len,
                     temperature=0.0,
+                    external_cache=persistent,
                 )
                 _sync_tensor_parallel_command(self.model, self.device)
 
@@ -6796,6 +6822,7 @@ class OpenAICompletionEngine:
         max_seq_len: int,
         prefix: Sequence[int] = (),
         temperature: float = 0.0,
+        external_cache: object | None = None,
     ) -> _TokenBudgetStepState:
         if cache_batch_size < 1:
             raise ValueError("token-budget cache_batch_size must be positive")
@@ -6825,12 +6852,16 @@ class OpenAICompletionEngine:
             )
             _mark_generation_cache_prefix(prefix_cache, prefix_tokens)
             prefix_caches[prefix_tokens] = prefix_cache
-        cache = self._generation_cache(
-            cache_batch_size,
-            max_seq_len,
-            model=self.model,
-            batch_capacity=cache_batch_size,
-        )
+        if external_cache is not None:
+            cache = external_cache
+            _reset_generation_cache(cache)
+        else:
+            cache = self._generation_cache(
+                cache_batch_size,
+                max_seq_len,
+                model=self.model,
+                batch_capacity=cache_batch_size,
+            )
         state = _TokenBudgetStepState(
             cache=cache,
             prefix_caches=prefix_caches,
@@ -7118,6 +7149,17 @@ class OpenAICompletionEngine:
         if cache_view is None:
             raise RuntimeError("token-budget prefill requires row-view cache")
         input_ids = torch.tensor([prompt_chunk], dtype=torch.long, device=self.device)
+        prefill_token = _try_prefill_graph(
+            self.model, input_ids, cache_view, temperature, allow_capture=False,
+        )
+        if prefill_token is not None:
+            state.seq_lens[row] = start_token + token_count
+            if bool(chunk.get("prompt_complete", False)) and bool(chunk.get("emits_token", False)):
+                token_id = int(prefill_token.item())
+                state.next_token_tensor[row] = token_id
+                state.generated_tokens[row] += 1
+                return token_id
+            return None
         logits, _cache_view = _forward(self.model, input_ids, cache_view)
         state.seq_lens[row] = start_token + token_count
         if not bool(chunk.get("prompt_complete", False)):
@@ -7247,11 +7289,13 @@ class OpenAICompletionEngine:
         prefix_obj = payload.get("prefix", [])
         if not isinstance(prefix_obj, list):
             raise ValueError("token-budget start prefix must be a list")
+        persistent = getattr(self, "_persistent_serving_cache", None)
         state = self._start_token_budget_step_state(
             cache_batch_size=int(payload["max_active_rows"]),
             max_seq_len=int(payload["max_seq_len"]),
             prefix=[int(token_id) for token_id in prefix_obj],
             temperature=float(payload.get("temperature", 0.0)),
+            external_cache=persistent,
         )
         return state
 
