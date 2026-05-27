@@ -8353,10 +8353,9 @@ def _tensor_parallel_symm_mem_allreduce_scope(
         not _is_tensor_parallel_model(model)
         or _tensor_parallel_world_size(model) <= 1
         or device.type != "cuda"
-        or temperature > 0.0
     ):
         return nullcontext()
-    max_tokens_limit = env_int("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_MAX_TOKENS", 128, minimum=1)
+    max_tokens_limit = env_int("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_MAX_TOKENS", 1024, minimum=1)
     if max_tokens > max_tokens_limit:
         return nullcontext()
     if not env_flag("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE", True):

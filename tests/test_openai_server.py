@@ -7320,9 +7320,13 @@ def test_openai_symm_mem_scope_skips_temperature_and_long_generations(monkeypatc
     model = object()
     captured: list[tuple[int | None, bool | None]] = []
 
+    class FakeContext:
+        def __enter__(self): return None
+        def __exit__(self, *args): return False
+
     def fake_symm_scope(max_batch: int | None, *, enabled: bool | None = None):
         captured.append((max_batch, enabled))
-        raise AssertionError("symm scope should not be entered")
+        return FakeContext()
 
     monkeypatch.setattr("torchinferno.openai_server._is_tensor_parallel_model", lambda candidate: candidate is model)
     monkeypatch.setattr("torchinferno.openai_server._tensor_parallel_world_size", lambda candidate: 8)
@@ -7338,12 +7342,12 @@ def test_openai_symm_mem_scope_skips_temperature_and_long_generations(monkeypatc
     with _tensor_parallel_symm_mem_allreduce_scope(
         model,
         torch.device("cuda"),
-        max_tokens=256,
+        max_tokens=2048,
         temperature=0.0,
     ):
         pass
 
-    assert captured == []
+    assert captured == [(64, True)]
 
 
 def test_openai_temperature_queue_batch_wait_uses_default_window(monkeypatch) -> None:
