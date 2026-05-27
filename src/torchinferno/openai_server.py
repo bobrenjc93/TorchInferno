@@ -10641,12 +10641,12 @@ def _shared_prefix_padded_suffix_padding_allowed(
     padding_tokens = padded_suffix_tokens - real_suffix_tokens
     max_padding_tokens = env_int(
         "TORCHINFERNO_OPENAI_SHARED_PREFIX_PADDED_SUFFIX_MAX_PADDING_TOKENS",
-        1024,
+        4096,
         minimum=0,
     )
     max_padding_ratio = env_float(
         "TORCHINFERNO_OPENAI_SHARED_PREFIX_PADDED_SUFFIX_MAX_PADDING_RATIO",
-        1.5,
+        3.0,
         minimum=1.0,
     )
     if padding_tokens > max_padding_tokens:
