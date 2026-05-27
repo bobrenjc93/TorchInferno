@@ -95,7 +95,7 @@ class OpenAIServerConfig:
     cache_backend: str = "dense"
     page_size: int = 16
     max_batch_size: int = 128
-    batch_wait_ms: float = 1.0
+    batch_wait_ms: float = 2.0
     single_request_admission_wait_ms: float | None = None
     llama_parallelism: str = "auto"
 
@@ -2707,11 +2707,11 @@ class OpenAICompletionEngine:
             default_wait_ms = (
                 env_float(
                     "TORCHINFERNO_OPENAI_TP_GREEDY_SHORT_OUTPUT_INITIAL_BATCH_WAIT_MS",
-                    2.0,
+                    5.0,
                     minimum=0.0,
                 )
                 if first.max_tokens <= short_output_max_tokens
-                else 2.0
+                else 5.0
             )
             wait_ms = env_float(
                 "TORCHINFERNO_OPENAI_TP_GREEDY_INITIAL_BATCH_WAIT_MS",
@@ -9818,7 +9818,7 @@ def _generation_cache_batch_capacity(model: object, requested_batch: int) -> int
         return requested_batch
     if not env_flag("TORCHINFERNO_OPENAI_TP_CACHE_BATCH_BUCKETING", True):
         return requested_batch
-    buckets = tuple(sorted(_parse_positive_int_csv(os.environ.get("TORCHINFERNO_OPENAI_TP_CACHE_BATCH_BUCKETS", "8,64"))))
+    buckets = tuple(sorted(_parse_positive_int_csv(os.environ.get("TORCHINFERNO_OPENAI_TP_CACHE_BATCH_BUCKETS", "64"))))
     for bucket in buckets:
         if requested_batch <= bucket:
             return bucket
@@ -10476,14 +10476,14 @@ def _shared_prefix_padded_suffix_static_batch_enabled(
         return False
     min_rows = env_int(
         "TORCHINFERNO_OPENAI_SHARED_PREFIX_PADDED_SUFFIX_STATIC_BATCH_MIN_ROWS",
-        8,
+        1,
         minimum=1,
     )
     if prompt_count < min_rows:
         return False
     min_occupancy = env_float(
         "TORCHINFERNO_OPENAI_SHARED_PREFIX_PADDED_SUFFIX_STATIC_BATCH_MIN_OCCUPANCY",
-        0.5,
+        0.0,
         minimum=0.0,
     )
     if min_occupancy > 0.0 and (prompt_count / physical_batch_size) < min_occupancy:
@@ -12166,7 +12166,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=env_int("TORCHINFERNO_OPENAI_PAGE_SIZE", 16, minimum=1),
     )
     parser.add_argument("--max-batch-size", type=int, default=128)
-    parser.add_argument("--batch-wait-ms", type=float, default=1.0)
+    parser.add_argument("--batch-wait-ms", type=float, default=2.0)
     parser.add_argument(
         "--single-request-admission-wait-ms",
         type=float,
