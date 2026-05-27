@@ -660,6 +660,8 @@ class Llama3TensorParallelCache:
             cache_backend=self.cache_backend,
         )
         view._graph_cache_id = self._graph_cache_id
+        if getattr(self, "_skip_capture_sync", False):
+            view._skip_capture_sync = True
         return view
 
     def clear_row(self, row: int) -> None:
