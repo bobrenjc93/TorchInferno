@@ -1796,7 +1796,7 @@ class OpenAICompletionEngine:
                 _reset_generation_cache(cache_view)
 
     def _should_use_unified_scheduler(self) -> bool:
-        if not env_flag("TORCHINFERNO_OPENAI_UNIFIED_SCHEDULER", False):
+        if not env_flag("TORCHINFERNO_OPENAI_UNIFIED_SCHEDULER", True):
             return False
         if not _is_tensor_parallel_primary_model(self.model):
             return False
@@ -3880,7 +3880,7 @@ class OpenAICompletionEngine:
             )
             self._generation_cache(1, warmup_cache_tokens, model=self.model, pool=False)
             _warmup_tensor_parallel_decode_attention(self.model)
-            if env_flag("TORCHINFERNO_OPENAI_UNIFIED_SCHEDULER", False) and hasattr(self.model, "allocate_cache"):
+            if env_flag("TORCHINFERNO_OPENAI_UNIFIED_SCHEDULER", True) and hasattr(self.model, "allocate_cache"):
                 self._warmup_unified_scheduler_cache(vocab_size)
         torch.cuda.synchronize(self.device)
 
@@ -9569,6 +9569,10 @@ def _tensor_parallel_worker_loop(engine: OpenAICompletionEngine) -> None:
                     temperature=temperature,
                 )
                 token_budget_symm_scope.__enter__()
+                _sync_tensor_parallel_command(
+                    getattr(engine, "model", None),
+                    getattr(engine, "device", torch.device("cpu")),
+                )
                 continue
             if op == "persistent_prompt_list_step":
                 handler = getattr(engine, "_handle_persistent_prompt_list_step_payload", None)
