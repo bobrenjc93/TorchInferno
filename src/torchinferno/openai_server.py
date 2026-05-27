@@ -3895,7 +3895,10 @@ class OpenAICompletionEngine:
             )
             self._generation_cache(1, warmup_cache_tokens, model=self.model, pool=False)
             _warmup_tensor_parallel_decode_attention(self.model)
-            if env_flag("TORCHINFERNO_OPENAI_UNIFIED_SCHEDULER", True) and hasattr(self.model, "allocate_cache"):
+            if env_flag("TORCHINFERNO_OPENAI_UNIFIED_SCHEDULER", False) and hasattr(self.model, "allocate_cache"):
+                self._clear_cache_pool(self._cache_pool, model=self.model)
+                self._clear_cache_pool(self._microbatch_cache_pool, model=self.model)
+                torch.cuda.empty_cache()
                 self._warmup_unified_scheduler_cache(vocab_size)
         torch.cuda.synchronize(self.device)
 
