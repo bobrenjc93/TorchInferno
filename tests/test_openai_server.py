@@ -5603,6 +5603,7 @@ def test_openai_engine_cache_pool_is_bounded(monkeypatch) -> None:
 
 
 def test_openai_tensor_parallel_generation_cache_uses_batch_buckets(monkeypatch) -> None:
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_CACHE_POOL_MAX_ENTRIES", "5")
     engine = _cache_only_engine()
     model = _BatchRecordingModel()
     monkeypatch.setattr(

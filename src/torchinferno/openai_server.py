@@ -1779,7 +1779,7 @@ class OpenAICompletionEngine:
         max_active = _effective_openai_max_batch_size(self.model, self.device, self.max_batch_size)
         max_tokens_per_step = env_int("TORCHINFERNO_OPENAI_UNIFIED_MAX_TOKENS", 2048, minimum=1)
         prefill_chunk = env_int("TORCHINFERNO_OPENAI_UNIFIED_PREFILL_CHUNK", 512, minimum=1)
-        decode_run_steps = env_int("TORCHINFERNO_OPENAI_UNIFIED_DECODE_RUN_STEPS", 4, minimum=1)
+        decode_run_steps = env_int("TORCHINFERNO_OPENAI_UNIFIED_DECODE_RUN_STEPS", 8, minimum=1)
         scheduler = _TokenBudgetScheduler(
             max_rows=max_active,
             max_scheduled_tokens=max_tokens_per_step,
@@ -9764,11 +9764,11 @@ def _generation_cache_batch_capacity(model: object, requested_batch: int) -> int
 
 
 def _cache_pool_max_entries() -> int:
-    return env_int("TORCHINFERNO_OPENAI_CACHE_POOL_MAX_ENTRIES", 5, minimum=0)
+    return env_int("TORCHINFERNO_OPENAI_CACHE_POOL_MAX_ENTRIES", 2, minimum=0)
 
 
 def _microbatch_cache_pool_max_entries() -> int:
-    return env_int("TORCHINFERNO_OPENAI_MICROBATCH_CACHE_POOL_MAX_ENTRIES", 8, minimum=0)
+    return env_int("TORCHINFERNO_OPENAI_MICROBATCH_CACHE_POOL_MAX_ENTRIES", 2, minimum=0)
 
 
 def _generation_cache_seq_len(cache: object) -> int:
