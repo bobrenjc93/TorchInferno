@@ -2707,11 +2707,11 @@ class OpenAICompletionEngine:
             default_wait_ms = (
                 env_float(
                     "TORCHINFERNO_OPENAI_TP_GREEDY_SHORT_OUTPUT_INITIAL_BATCH_WAIT_MS",
-                    3.0,
+                    5.0,
                     minimum=0.0,
                 )
                 if first.max_tokens <= short_output_max_tokens
-                else 2.0
+                else 5.0
             )
             wait_ms = env_float(
                 "TORCHINFERNO_OPENAI_TP_GREEDY_INITIAL_BATCH_WAIT_MS",

@@ -7432,8 +7432,8 @@ def test_openai_tp_sampled_stream_uses_short_initial_queue_wait(monkeypatch) -> 
 
     assert engine._queued_initial_batch_wait_s(short_sampled) == 0.001
     assert engine._queued_initial_batch_wait_s(sampled) == 0.001
-    assert engine._queued_initial_batch_wait_s(short_greedy) == 0.003
-    assert engine._queued_initial_batch_wait_s(greedy) == 0.002
+    assert engine._queued_initial_batch_wait_s(short_greedy) == 0.005
+    assert engine._queued_initial_batch_wait_s(greedy) == 0.005
     assert engine._queued_initial_batch_wait_s(completion) == 0.0
     assert engine._queued_initial_batch_wait_s(long_sampled) == 0.0
 
