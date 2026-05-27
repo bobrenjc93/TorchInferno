@@ -1754,33 +1754,18 @@ class OpenAICompletionEngine:
             device=self.device, cache_backend=self.cache_backend, page_size=self.page_size,
         )
         _reset_generation_cache(cache)
-        from torchinferno.models.llama3.tensor_parallel import _PREFILL_TOKEN_BUCKETS
-        for bucket in _PREFILL_TOKEN_BUCKETS:
-            if bucket >= max_seq_len:
-                break
-            cache_view = _cache_row_slice(cache, 0, 1)
-            if cache_view is None:
-                continue
-            _reset_generation_cache(cache_view)
-            input_ids = (torch.arange(bucket, device=self.device, dtype=torch.long) % vocab_size)[None, :]
-            _try_prefill_graph(self.model, input_ids, cache_view, 0.0, allow_capture=True)
-            _reset_generation_cache(cache_view)
         prompt_tokens = env_int("TORCHINFERNO_OPENAI_WARMUP_PROMPT_TOKENS", 32, minimum=1)
         _set_generation_cache_seq_len(cache, prompt_tokens)
-        for row_count in _warmup_ragged_decode_batch_sizes():
-            if row_count > cache_batch:
-                continue
-            rows = list(range(row_count))
-            decode_input_ids = torch.zeros(row_count, 1, dtype=torch.long, device=self.device)
-            row_indices = torch.tensor(rows, dtype=torch.long, device=self.device)
-            seq_lens_tensor = torch.full((cache_batch,), prompt_tokens, dtype=torch.long, device=self.device)
-            try:
-                _try_decode_ragged_token_graph(
-                    self.model, decode_input_ids, cache, seq_lens=seq_lens_tensor,
-                    row_indices=row_indices, temperature=0.0, allow_capture=True,
-                )
-            except Exception:
-                pass
+        decode_input_ids = torch.zeros(cache_batch, 1, dtype=torch.long, device=self.device)
+        row_indices = torch.arange(cache_batch, dtype=torch.long, device=self.device)
+        seq_lens_tensor = torch.full((cache_batch,), prompt_tokens, dtype=torch.long, device=self.device)
+        try:
+            _try_decode_ragged_token_graph(
+                self.model, decode_input_ids, cache, seq_lens=seq_lens_tensor,
+                row_indices=row_indices, temperature=0.0, allow_capture=True,
+            )
+        except Exception:
+            pass
         _reset_generation_cache(cache)
         try:
             cache._skip_capture_sync = True
