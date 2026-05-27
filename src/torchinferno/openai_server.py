@@ -1919,15 +1919,6 @@ class OpenAICompletionEngine:
                         _drain_queue()
                         continue
 
-                    tb_state = self._token_budget_step_state
-                    if tb_state is not None and finished_ids:
-                        for rid in finished_ids:
-                            for row, row_rid in enumerate(tb_state.row_request_ids):
-                                if row_rid == rid:
-                                    tb_state.active[row] = False
-                                    tb_state.row_request_ids[row] = None
-                                    tb_state.generated_tokens[row] = 0
-                                    break
                     plan = scheduler.step(finished_request_ids=finished_ids)
                     finished_ids = ()
                     if not plan.chunks:
@@ -6886,6 +6877,26 @@ class OpenAICompletionEngine:
         chunks_obj = payload.get("chunks", [])
         if not isinstance(chunks_obj, list):
             raise ValueError("token-budget step payload requires chunk list")
+        chunk_rids = {str(c.get("request_id", "")) for c in chunks_obj if isinstance(c, Mapping)}
+        pre_fin = payload.get("finished_request_ids", [])
+        if isinstance(pre_fin, list):
+            for rid_obj in pre_fin:
+                rid = str(rid_obj)
+                if rid in chunk_rids:
+                    continue
+                for row, row_rid in enumerate(state.row_request_ids):
+                    if row_rid == rid:
+                        state.active[row] = False
+                        state.row_request_ids[row] = None
+                        state.generated_tokens[row] = 0
+                        state.seq_lens[row] = 0
+                        try:
+                            view = _cache_row_slice(state.cache, row, row + 1)
+                            if view is not None:
+                                _reset_generation_cache(view)
+                        except Exception:
+                            pass
+                        break
         decode_tokens: dict[str, int | None] = {}
         prefill_tokens: dict[str, int | None] = {}
         index = 0
