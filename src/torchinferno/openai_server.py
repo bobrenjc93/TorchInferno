@@ -9819,7 +9819,7 @@ def _generation_cache_batch_capacity(model: object, requested_batch: int) -> int
         return requested_batch
     if not env_flag("TORCHINFERNO_OPENAI_TP_CACHE_BATCH_BUCKETING", True):
         return requested_batch
-    buckets = tuple(sorted(_parse_positive_int_csv(os.environ.get("TORCHINFERNO_OPENAI_TP_CACHE_BATCH_BUCKETS", "8,64,65"))))
+    buckets = tuple(sorted(_parse_positive_int_csv(os.environ.get("TORCHINFERNO_OPENAI_TP_CACHE_BATCH_BUCKETS", "64"))))
     for bucket in buckets:
         if requested_batch <= bucket:
             return bucket
@@ -10477,14 +10477,14 @@ def _shared_prefix_padded_suffix_static_batch_enabled(
         return False
     min_rows = env_int(
         "TORCHINFERNO_OPENAI_SHARED_PREFIX_PADDED_SUFFIX_STATIC_BATCH_MIN_ROWS",
-        16,
+        1,
         minimum=1,
     )
     if prompt_count < min_rows:
         return False
     min_occupancy = env_float(
         "TORCHINFERNO_OPENAI_SHARED_PREFIX_PADDED_SUFFIX_STATIC_BATCH_MIN_OCCUPANCY",
-        0.75,
+        0.0,
         minimum=0.0,
     )
     if min_occupancy > 0.0 and (prompt_count / physical_batch_size) < min_occupancy:

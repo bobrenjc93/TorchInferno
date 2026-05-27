@@ -5628,10 +5628,10 @@ def test_openai_tensor_parallel_generation_cache_uses_batch_buckets(monkeypatch)
         batch_capacity=_generation_cache_batch_capacity(model, 56),
     )
 
-    assert model.allocated_shapes == [(1, 32), (8, 32), (64, 256)]
+    assert model.allocated_shapes == [(1, 32), (64, 32), (64, 256)]
     assert list(engine._cache_pool) == [
         (1, 32, "dense", 16, "cpu"),
-        (8, 32, "dense", 16, "cpu"),
+        (64, 32, "dense", 16, "cpu"),
         (64, 256, "dense", 16, "cpu"),
     ]
     assert dense in engine._cache_pool.values()
