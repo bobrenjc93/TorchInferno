@@ -1951,8 +1951,7 @@ class OpenAICompletionEngine:
                             payload["temperature"] = 0.0
                             _broadcast_tensor_parallel_token_budget_decode_run(self.model, payload)
                             result = self._handle_token_budget_decode_run_payload(payload)
-                            if self.device.type == "cuda":
-                                torch.cuda.synchronize(self.device)
+                            torch.cuda.synchronize(self.device)
                             run_finished: list[str] = []
                             for step_result in result.step_results:
                                 run_finished.extend(_emit_result(step_result))
@@ -1966,8 +1965,7 @@ class OpenAICompletionEngine:
                     payload["temperature"] = 0.0
                     _broadcast_tensor_parallel_token_budget_step(self.model, payload)
                     result = self._handle_token_budget_step_payload(payload)
-                    if self.device.type == "cuda":
-                        torch.cuda.synchronize(self.device)
+                    torch.cuda.synchronize(self.device)
                     finished_ids = _emit_result(result)
                     _drain_queue()
                     self._completed_queue_batches += 1
@@ -3883,9 +3881,6 @@ class OpenAICompletionEngine:
             self._generation_cache(1, warmup_cache_tokens, model=self.model, pool=False)
             _warmup_tensor_parallel_decode_attention(self.model)
             if env_flag("TORCHINFERNO_OPENAI_UNIFIED_SCHEDULER", False) and hasattr(self.model, "allocate_cache"):
-                self._clear_cache_pool(self._cache_pool, model=self.model)
-                self._clear_cache_pool(self._microbatch_cache_pool, model=self.model)
-                torch.cuda.empty_cache()
                 self._warmup_unified_scheduler_cache(vocab_size)
         torch.cuda.synchronize(self.device)
 
@@ -9592,12 +9587,16 @@ def _tensor_parallel_worker_loop(engine: OpenAICompletionEngine) -> None:
                 if not callable(handler):
                     raise RuntimeError("token-budget step handler is not installed")
                 handler(payload)
+                if getattr(engine, "device", torch.device("cpu")).type == "cuda":
+                    torch.cuda.synchronize(getattr(engine, "device"))
                 continue
             if op == "token_budget_decode_run":
                 handler = getattr(engine, "_handle_token_budget_decode_run_payload", None)
                 if not callable(handler):
                     raise RuntimeError("token-budget decode-run handler is not installed")
                 handler(payload)
+                if getattr(engine, "device", torch.device("cpu")).type == "cuda":
+                    torch.cuda.synchronize(getattr(engine, "device"))
                 continue
             if op == "token_budget_prompt_list_run":
                 handler = getattr(engine, "_handle_token_budget_prompt_list_run_payload", None)
