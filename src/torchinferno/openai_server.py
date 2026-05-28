@@ -1773,8 +1773,9 @@ class OpenAICompletionEngine:
                         self.model, decode_input_ids, cache, seq_lens=seq_lens_tensor,
                         row_indices=row_indices, temperature=0.0, allow_capture=True,
                     )
-                except Exception:
-                    pass
+                except Exception as _warmup_exc:
+                    import sys as _wsys
+                    print(f"[WARMUP] graph capture failed bs={bs}: {_warmup_exc}", file=_wsys.stderr, flush=True)
                 _reset_generation_cache(cache)
         self._persistent_serving_cache = cache
 
@@ -2010,7 +2011,7 @@ class OpenAICompletionEngine:
 
     def _should_use_tensor_parallel_online_batcher(self, first: _QueuedGeneration) -> bool:
         explicit = "TORCHINFERNO_OPENAI_TP_ONLINE_CONTINUOUS_BATCHER" in os.environ
-        if not env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_CONTINUOUS_BATCHER", False):
+        if not env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_CONTINUOUS_BATCHER", True):
             return False
         if not first.stream:
             return False
@@ -2125,7 +2126,7 @@ class OpenAICompletionEngine:
         initial_batch = sized_initial_batch or [first]
         run_max_tokens = max(request.max_tokens for request in initial_batch)
         stop_token_ids = getattr(self, "stop_token_ids", frozenset())
-        eos_token_id = next(iter(stop_token_ids)) if len(stop_token_ids) == 1 else None
+        eos_token_id = next(iter(stop_token_ids)) if stop_token_ids else None
         engine_create_start_s = time.perf_counter()
         runtime_engine = _RuntimeContinuousBatchEngine(
             self.model,
@@ -2948,7 +2949,7 @@ class OpenAICompletionEngine:
             minimum=1,
         )
         stop_token_ids = getattr(self, "stop_token_ids", frozenset())
-        eos_token_id = next(iter(stop_token_ids)) if len(stop_token_ids) == 1 else None
+        eos_token_id = next(iter(stop_token_ids)) if stop_token_ids else None
         runtime_engine = _RuntimeContinuousBatchEngine(
             self.model,
             device=self.device,
@@ -3082,7 +3083,7 @@ class OpenAICompletionEngine:
             else 0
         )
         stop_token_ids = getattr(self, "stop_token_ids", frozenset())
-        eos_token_id = next(iter(stop_token_ids)) if len(stop_token_ids) == 1 else None
+        eos_token_id = next(iter(stop_token_ids)) if stop_token_ids else None
         enable_ragged_decode = env_flag("TORCHINFERNO_OPENAI_RUNTIME_CONTINUOUS_RAGGED_DECODE", True)
         store_full_prompt_prefixes = env_flag(
             "TORCHINFERNO_OPENAI_RUNTIME_CONTINUOUS_PREFIX_CACHE_STORE_FULL_PROMPTS",
