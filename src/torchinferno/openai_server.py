@@ -1755,18 +1755,20 @@ class OpenAICompletionEngine:
         )
         _reset_generation_cache(cache)
         prompt_tokens = env_int("TORCHINFERNO_OPENAI_WARMUP_PROMPT_TOKENS", 32, minimum=1)
-        _set_generation_cache_seq_len(cache, prompt_tokens)
-        decode_input_ids = torch.zeros(cache_batch, 1, dtype=torch.long, device=self.device)
-        row_indices = torch.arange(cache_batch, dtype=torch.long, device=self.device)
-        seq_lens_tensor = torch.full((cache_batch,), prompt_tokens, dtype=torch.long, device=self.device)
-        try:
-            _try_decode_ragged_token_graph(
-                self.model, decode_input_ids, cache, seq_lens=seq_lens_tensor,
-                row_indices=row_indices, temperature=0.0, allow_capture=True,
-            )
-        except Exception:
-            pass
-        _reset_generation_cache(cache)
+        batch_sizes = sorted({1, 2, 4, 8, 16, 32, 48, 64, cache_batch} & set(range(1, cache_batch + 1)))
+        for bs in batch_sizes:
+            _set_generation_cache_seq_len(cache, prompt_tokens)
+            decode_input_ids = torch.zeros(bs, 1, dtype=torch.long, device=self.device)
+            row_indices = torch.arange(bs, dtype=torch.long, device=self.device)
+            seq_lens_tensor = torch.full((bs,), prompt_tokens, dtype=torch.long, device=self.device)
+            try:
+                _try_decode_ragged_token_graph(
+                    self.model, decode_input_ids, cache, seq_lens=seq_lens_tensor,
+                    row_indices=row_indices, temperature=0.0, allow_capture=True,
+                )
+            except Exception:
+                pass
+            _reset_generation_cache(cache)
         try:
             cache._skip_capture_sync = True
         except Exception:
@@ -7287,16 +7289,29 @@ class OpenAICompletionEngine:
             rows.append(row)
             input_tokens.append(int(state.next_token_tensor[row].item()))
 
-        input_ids = torch.tensor([[token_id] for token_id in input_tokens], dtype=torch.long, device=self.device)
-        row_indices = torch.tensor(rows, dtype=torch.long, device=self.device)
+        actual_batch = len(input_tokens)
+        padded_batch = _decode_graph_padded_batch(actual_batch, state.cache_batch_size)
+        if padded_batch > actual_batch:
+            pad_row = rows[0]
+            pad_token = input_tokens[0]
+            input_tokens_padded = input_tokens + [pad_token] * (padded_batch - actual_batch)
+            rows_padded = rows + [pad_row] * (padded_batch - actual_batch)
+        else:
+            input_tokens_padded = input_tokens
+            rows_padded = rows
+        input_ids = torch.tensor([[token_id] for token_id in input_tokens_padded], dtype=torch.long, device=self.device)
+        row_indices = torch.tensor(rows_padded, dtype=torch.long, device=self.device)
         graph_token = _try_decode_ragged_token_graph(
             self.model, input_ids, state.cache,
             seq_lens=state.seq_lens, row_indices=row_indices,
             temperature=temperature, allow_capture=False,
         )
         if graph_token is not None:
-            next_tokens = graph_token
+            next_tokens = graph_token[:actual_batch]
         else:
+            if padded_batch > actual_batch:
+                input_ids = input_ids[:actual_batch]
+                row_indices = row_indices[:actual_batch]
             decode_ragged = getattr(self.model, "decode_ragged_logits", None)
             if callable(decode_ragged):
                 logits = decode_ragged(input_ids, state.cache, seq_lens=state.seq_lens, row_indices=row_indices)
@@ -10342,6 +10357,16 @@ def _record_openai_decode_profile(
             profile_file.write(json.dumps(record, sort_keys=True) + "\n")
     except Exception as exc:
         warn_optional_failure("openai.decode_profile", exc)
+
+
+_DECODE_GRAPH_BUCKETS = (1, 2, 4, 8, 16, 32, 48, 64)
+
+
+def _decode_graph_padded_batch(actual: int, max_batch: int) -> int:
+    for bucket in _DECODE_GRAPH_BUCKETS:
+        if bucket >= actual:
+            return min(bucket, max_batch)
+    return min(actual, max_batch)
 
 
 def _try_decode_ragged_token_graph(
