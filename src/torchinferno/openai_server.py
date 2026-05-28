@@ -1796,7 +1796,7 @@ class OpenAICompletionEngine:
                 _reset_generation_cache(cache_view)
 
     def _should_use_unified_scheduler(self) -> bool:
-        if not env_flag("TORCHINFERNO_OPENAI_UNIFIED_SCHEDULER", False):
+        if not env_flag("TORCHINFERNO_OPENAI_UNIFIED_SCHEDULER", True):
             return False
         if not _is_tensor_parallel_primary_model(self.model):
             return False
@@ -1897,6 +1897,13 @@ class OpenAICompletionEngine:
                     max_seq_len=max_model_len,
                     temperature=0.0,
                 )
+                symm_scope = _tensor_parallel_symm_mem_allreduce_scope(
+                    self.model,
+                    self.device,
+                    max_tokens=max_tokens_per_step,
+                    temperature=0.0,
+                )
+                symm_scope.__enter__()
                 _sync_tensor_parallel_command(self.model, self.device)
 
                 while not shutdown:
@@ -1976,6 +1983,7 @@ class OpenAICompletionEngine:
                         req.responses.put(exc)
                         req.done = True
             finally:
+                symm_scope.__exit__(None, None, None)
                 handler = getattr(self, "_handle_token_budget_close_payload", None)
                 if callable(handler):
                     handler({})
@@ -3880,7 +3888,7 @@ class OpenAICompletionEngine:
             )
             self._generation_cache(1, warmup_cache_tokens, model=self.model, pool=False)
             _warmup_tensor_parallel_decode_attention(self.model)
-            if env_flag("TORCHINFERNO_OPENAI_UNIFIED_SCHEDULER", False) and hasattr(self.model, "allocate_cache"):
+            if env_flag("TORCHINFERNO_OPENAI_UNIFIED_SCHEDULER", True) and hasattr(self.model, "allocate_cache"):
                 self._warmup_unified_scheduler_cache(vocab_size)
         torch.cuda.synchronize(self.device)
 
