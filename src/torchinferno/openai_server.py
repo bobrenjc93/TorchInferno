@@ -9722,20 +9722,21 @@ def _tensor_parallel_worker_loop(engine: OpenAICompletionEngine) -> None:
                     store_reusable_prefixes=bool(payload.get("store_reusable_prefixes", True)),
                     store_full_prompt_prefixes=bool(payload.get("store_full_prompt_prefixes", True)),
                 )
-                worker_shared_cache: object | None = None
-                try:
-                    total_rows = max_active + prefix_rows
-                    worker_shared_cache = engine._generation_cache(
-                        total_rows,
-                        max_seq_len,
-                        model=getattr(engine, "model"),
-                        batch_capacity=_generation_cache_batch_capacity(
-                            getattr(engine, "model"), total_rows,
-                        ),
-                    )
-                    _reset_generation_cache(worker_shared_cache)
-                except Exception:
-                    worker_shared_cache = None
+                worker_shared_cache = getattr(engine, "_persistent_serving_cache", None)
+                if worker_shared_cache is None:
+                    try:
+                        total_rows = max_active + prefix_rows
+                        worker_shared_cache = engine._generation_cache(
+                            total_rows,
+                            max_seq_len,
+                            model=getattr(engine, "model"),
+                            batch_capacity=_generation_cache_batch_capacity(
+                                getattr(engine, "model"), total_rows,
+                            ),
+                        )
+                        _reset_generation_cache(worker_shared_cache)
+                    except Exception:
+                        worker_shared_cache = None
                 online_runtime_engine.start_online(
                     max_seq_len=max_seq_len, external_cache=worker_shared_cache,
                 )
