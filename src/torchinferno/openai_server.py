@@ -2007,7 +2007,7 @@ class OpenAICompletionEngine:
 
     def _should_use_tensor_parallel_online_batcher(self, first: _QueuedGeneration) -> bool:
         explicit = "TORCHINFERNO_OPENAI_TP_ONLINE_CONTINUOUS_BATCHER" in os.environ
-        if not env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_CONTINUOUS_BATCHER", False):
+        if not env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_CONTINUOUS_BATCHER", True):
             return False
         if not first.stream:
             return False
@@ -2043,6 +2043,8 @@ class OpenAICompletionEngine:
             1,
             minimum=0,
         )
+        if getattr(self, "_persistent_serving_cache", None) is not None:
+            prefix_rows = 0
         prefill_budget = (
             env_int("TORCHINFERNO_OPENAI_TP_ONLINE_PREFILL_TOKEN_BUDGET", 0, minimum=0)
             if "TORCHINFERNO_OPENAI_TP_ONLINE_PREFILL_TOKEN_BUDGET" in os.environ
@@ -3906,7 +3908,10 @@ class OpenAICompletionEngine:
             )
             self._generation_cache(1, warmup_cache_tokens, model=self.model, pool=False)
             _warmup_tensor_parallel_decode_attention(self.model)
-            if env_flag("TORCHINFERNO_OPENAI_UNIFIED_SCHEDULER", False) and hasattr(self.model, "allocate_cache"):
+            if (
+                env_flag("TORCHINFERNO_OPENAI_UNIFIED_SCHEDULER", False)
+                or env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_CONTINUOUS_BATCHER", True)
+            ) and hasattr(self.model, "allocate_cache"):
                 self._warmup_unified_scheduler_cache(vocab_size)
         torch.cuda.synchronize(self.device)
 
