@@ -1759,7 +1759,7 @@ class OpenAICompletionEngine:
         except Exception:
             pass
         prompt_tokens = env_int("TORCHINFERNO_OPENAI_WARMUP_PROMPT_TOKENS", 32, minimum=1)
-        batch_sizes = sorted({1, 2, 4, 8, 16, 32, 48, 64, cache_batch} & set(range(1, cache_batch + 1)))
+        batch_sizes = sorted({1, cache_batch} & set(range(1, cache_batch + 1)))
         for bs in batch_sizes:
             _set_generation_cache_seq_len(cache, prompt_tokens)
             decode_input_ids = torch.zeros(bs, 1, dtype=torch.long, device=self.device)
