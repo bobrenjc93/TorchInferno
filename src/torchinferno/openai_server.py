@@ -1929,6 +1929,7 @@ class OpenAICompletionEngine:
                         _drain_queue()
                         continue
 
+                    prior_finished = finished_ids
                     plan = scheduler.step(finished_request_ids=finished_ids)
                     finished_ids = ()
                     if not plan.chunks:
@@ -1956,6 +1957,13 @@ class OpenAICompletionEngine:
                         if plans:
                             payload = _token_budget_decode_run_payload(plans, request_map)
                             payload["temperature"] = 0.0
+                            if prior_finished:
+                                steps = payload.get("steps", [])
+                                if steps and isinstance(steps[0], dict):
+                                    existing = list(steps[0].get("finished_request_ids", []))
+                                    existing.extend(prior_finished)
+                                    steps[0]["finished_request_ids"] = existing
+                                prior_finished = ()
                             _broadcast_tensor_parallel_token_budget_decode_run(self.model, payload)
                             result = self._handle_token_budget_decode_run_payload(payload)
                             torch.cuda.synchronize(self.device)
@@ -1970,6 +1978,10 @@ class OpenAICompletionEngine:
 
                     payload = _token_budget_step_payload(plan, request_map)
                     payload["temperature"] = 0.0
+                    if prior_finished:
+                        existing = list(payload.get("finished_request_ids", []))
+                        existing.extend(prior_finished)
+                        payload["finished_request_ids"] = existing
                     _broadcast_tensor_parallel_token_budget_step(self.model, payload)
                     result = self._handle_token_budget_step_payload(payload)
                     torch.cuda.synchronize(self.device)
