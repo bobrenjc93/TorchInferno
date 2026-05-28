@@ -1760,19 +1760,22 @@ class OpenAICompletionEngine:
             pass
         prompt_tokens = env_int("TORCHINFERNO_OPENAI_WARMUP_PROMPT_TOKENS", 32, minimum=1)
         batch_sizes = sorted({1, cache_batch} & set(range(1, cache_batch + 1)))
-        for bs in batch_sizes:
-            _set_generation_cache_seq_len(cache, prompt_tokens)
-            decode_input_ids = torch.zeros(bs, 1, dtype=torch.long, device=self.device)
-            row_indices = torch.arange(bs, dtype=torch.long, device=self.device)
-            seq_lens_tensor = torch.full((bs,), prompt_tokens, dtype=torch.long, device=self.device)
-            try:
-                _try_decode_ragged_token_graph(
-                    self.model, decode_input_ids, cache, seq_lens=seq_lens_tensor,
-                    row_indices=row_indices, temperature=0.0, allow_capture=True,
-                )
-            except Exception:
-                pass
-            _reset_generation_cache(cache)
+        with _tensor_parallel_symm_mem_allreduce_scope(
+            self.model, self.device, max_tokens=1, temperature=0.0,
+        ):
+            for bs in batch_sizes:
+                _set_generation_cache_seq_len(cache, prompt_tokens)
+                decode_input_ids = torch.zeros(bs, 1, dtype=torch.long, device=self.device)
+                row_indices = torch.arange(bs, dtype=torch.long, device=self.device)
+                seq_lens_tensor = torch.full((bs,), prompt_tokens, dtype=torch.long, device=self.device)
+                try:
+                    _try_decode_ragged_token_graph(
+                        self.model, decode_input_ids, cache, seq_lens=seq_lens_tensor,
+                        row_indices=row_indices, temperature=0.0, allow_capture=True,
+                    )
+                except Exception:
+                    pass
+                _reset_generation_cache(cache)
         self._persistent_serving_cache = cache
 
     def _warmup_token_budget_prefill_graphs(self, prefill_chunk_size: int) -> None:
@@ -2007,7 +2010,7 @@ class OpenAICompletionEngine:
 
     def _should_use_tensor_parallel_online_batcher(self, first: _QueuedGeneration) -> bool:
         explicit = "TORCHINFERNO_OPENAI_TP_ONLINE_CONTINUOUS_BATCHER" in os.environ
-        if not env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_CONTINUOUS_BATCHER", False):
+        if not env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_CONTINUOUS_BATCHER", True):
             return False
         if not first.stream:
             return False
