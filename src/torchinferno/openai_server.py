@@ -6870,6 +6870,8 @@ class OpenAICompletionEngine:
             )
             _mark_generation_cache_prefix(prefix_cache, prefix_tokens)
             prefix_caches[prefix_tokens] = prefix_cache
+        if external_cache is None:
+            external_cache = getattr(self, "_persistent_serving_cache", None)
         if external_cache is not None:
             cache = external_cache
             _reset_generation_cache(cache)
