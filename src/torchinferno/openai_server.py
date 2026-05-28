@@ -1892,10 +1892,12 @@ class OpenAICompletionEngine:
                     temperature=0.0,
                     max_tokens=max_tokens_per_step,
                 )
+                ext_cache = getattr(self, "_persistent_serving_cache", None)
                 self._start_token_budget_step_state(
                     cache_batch_size=cache_batch,
                     max_seq_len=max_model_len,
                     temperature=0.0,
+                    external_cache=ext_cache,
                 )
                 symm_scope = _tensor_parallel_symm_mem_allreduce_scope(
                     self.model,
@@ -7189,7 +7191,11 @@ class OpenAICompletionEngine:
         if cache_view is None:
             raise RuntimeError("token-budget prefill requires row-view cache")
         input_ids = torch.tensor([prompt_chunk], dtype=torch.long, device=self.device)
-        logits, _cache_view = _forward(self.model, input_ids, cache_view)
+        graph_logits = _try_prefill_logits_graph(self.model, input_ids, cache_view, allow_capture=False)
+        if graph_logits is not None:
+            logits = graph_logits
+        else:
+            logits, _cache_view = _forward(self.model, input_ids, cache_view)
         state.seq_lens[row] = start_token + token_count
         if not bool(chunk.get("prompt_complete", False)):
             return None
@@ -7273,19 +7279,27 @@ class OpenAICompletionEngine:
 
         input_ids = torch.tensor([[token_id] for token_id in input_tokens], dtype=torch.long, device=self.device)
         row_indices = torch.tensor(rows, dtype=torch.long, device=self.device)
-        decode_ragged = getattr(self.model, "decode_ragged_logits", None)
-        if callable(decode_ragged):
-            logits = decode_ragged(input_ids, state.cache, seq_lens=state.seq_lens, row_indices=row_indices)
-            next_tokens = _sample(self.model, logits[:, -1, :], temperature).to(self.device)
+        graph_token = _try_decode_ragged_token_graph(
+            self.model, input_ids, state.cache,
+            seq_lens=state.seq_lens, row_indices=row_indices,
+            temperature=temperature, allow_capture=False,
+        )
+        if graph_token is not None:
+            next_tokens = graph_token
         else:
-            next_tokens, _cache = _decode_next_token_ragged(
-                self.model,
-                input_ids,
-                state.cache,
-                state.seq_lens,
-                row_indices,
-                temperature,
-            )
+            decode_ragged = getattr(self.model, "decode_ragged_logits", None)
+            if callable(decode_ragged):
+                logits = decode_ragged(input_ids, state.cache, seq_lens=state.seq_lens, row_indices=row_indices)
+                next_tokens = _sample(self.model, logits[:, -1, :], temperature).to(self.device)
+            else:
+                next_tokens, _cache = _decode_next_token_ragged(
+                    self.model,
+                    input_ids,
+                    state.cache,
+                    state.seq_lens,
+                    row_indices,
+                    temperature,
+                )
         token_values = [int(token_id) for token_id in next_tokens.detach().cpu().tolist()]
         result: dict[str, int | None] = {}
         for request_id, row, token_id in zip(request_ids, rows, token_values):
