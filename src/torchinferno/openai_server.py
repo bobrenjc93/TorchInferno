@@ -1746,7 +1746,7 @@ class OpenAICompletionEngine:
         cache_batch = _generation_cache_batch_capacity(self.model, max_active)
         max_seq_len = env_int(
             "TORCHINFERNO_OPENAI_UNIFIED_MAX_SEQ_LEN",
-            getattr(self, "max_model_len", None) or 512,
+            getattr(self, "max_model_len", None) or 1024,
             minimum=64,
         )
         cache = _allocate_cache(
@@ -2006,9 +2006,12 @@ class OpenAICompletionEngine:
                 self._token_budget_step_state = None
 
     def _should_use_tensor_parallel_online_batcher(self, first: _QueuedGeneration) -> bool:
-        if not env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_CONTINUOUS_BATCHER", False):
+        explicit = "TORCHINFERNO_OPENAI_TP_ONLINE_CONTINUOUS_BATCHER" in os.environ
+        if not env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_CONTINUOUS_BATCHER", True):
             return False
         if not first.stream:
+            return False
+        if self.device.type != "cuda" and not explicit:
             return False
         if not _is_tensor_parallel_primary_model(self.model):
             return False
@@ -2231,18 +2234,19 @@ class OpenAICompletionEngine:
                     store_full_prompt_prefixes=store_full_prompt_prefixes,
                     max_tokens=run_max_tokens,
                 )
-                shared_cache: object | None = None
-                try:
-                    total_online_rows = max_active + prefix_rows
-                    shared_cache = self._generation_cache(
-                        total_online_rows,
-                        max_seq_len,
-                        model=self.model,
-                        batch_capacity=_generation_cache_batch_capacity(self.model, total_online_rows),
-                    )
-                    _reset_generation_cache(shared_cache)
-                except Exception:
-                    shared_cache = None
+                shared_cache = getattr(self, "_persistent_serving_cache", None)
+                if shared_cache is None:
+                    try:
+                        total_online_rows = max_active + prefix_rows
+                        shared_cache = self._generation_cache(
+                            total_online_rows,
+                            max_seq_len,
+                            model=self.model,
+                            batch_capacity=_generation_cache_batch_capacity(self.model, total_online_rows),
+                        )
+                        _reset_generation_cache(shared_cache)
+                    except Exception:
+                        shared_cache = None
                 runtime_engine.start_online(max_seq_len=max_seq_len, external_cache=shared_cache)
                 started = True
                 _sync_tensor_parallel_command(self.model, self.device)
