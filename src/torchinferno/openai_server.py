@@ -2048,11 +2048,7 @@ class OpenAICompletionEngine:
         )
         if getattr(self, "_persistent_serving_cache", None) is not None:
             prefix_rows = 0
-        prefill_budget = (
-            env_int("TORCHINFERNO_OPENAI_TP_ONLINE_PREFILL_TOKEN_BUDGET", 0, minimum=0)
-            if "TORCHINFERNO_OPENAI_TP_ONLINE_PREFILL_TOKEN_BUDGET" in os.environ
-            else 0
-        )
+        prefill_budget = env_int("TORCHINFERNO_OPENAI_TP_ONLINE_PREFILL_TOKEN_BUDGET", 2048, minimum=0)
         request_by_id: dict[str, _QueuedGeneration] = {}
         next_request_id = 0
         deferred: list[_QueuedGeneration] = []
