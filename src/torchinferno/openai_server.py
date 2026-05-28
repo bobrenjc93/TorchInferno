@@ -9510,8 +9510,10 @@ def _tensor_parallel_worker_loop(engine: OpenAICompletionEngine) -> None:
     online_symm_scope: ContextManager[None] | None = None
     persistent_prompt_list_symm_scope: ContextManager[None] | None = None
     token_budget_symm_scope: ContextManager[None] | None = None
+    _skip_finally_sync = False
     while True:
         cuda_sync: bool | None = None
+        _skip_finally_sync = False
         if _tensor_parallel_tensor_commands_enabled(getattr(engine, "model", None)):
             payload = _receive_tensor_parallel_tensor_payload(engine)
         else:
@@ -9562,6 +9564,7 @@ def _tensor_parallel_worker_loop(engine: OpenAICompletionEngine) -> None:
                 persistent_prompt_list_symm_scope.__enter__()
                 continue
             if op == "token_budget_start":
+                _skip_finally_sync = True
                 if token_budget_symm_scope is not None:
                     token_budget_symm_scope.__exit__(None, None, None)
                     token_budget_symm_scope = None
@@ -9595,6 +9598,7 @@ def _tensor_parallel_worker_loop(engine: OpenAICompletionEngine) -> None:
                 handler(payload)
                 continue
             if op == "token_budget_step":
+                _skip_finally_sync = True
                 handler = getattr(engine, "_handle_token_budget_step_payload", None)
                 if not callable(handler):
                     raise RuntimeError("token-budget step handler is not installed")
@@ -9603,6 +9607,7 @@ def _tensor_parallel_worker_loop(engine: OpenAICompletionEngine) -> None:
                     torch.cuda.synchronize(getattr(engine, "device"))
                 continue
             if op == "token_budget_decode_run":
+                _skip_finally_sync = True
                 handler = getattr(engine, "_handle_token_budget_decode_run_payload", None)
                 if not callable(handler):
                     raise RuntimeError("token-budget decode-run handler is not installed")
@@ -9787,7 +9792,8 @@ def _tensor_parallel_worker_loop(engine: OpenAICompletionEngine) -> None:
                         broadcast_tensor_parallel=False,
                     )
         finally:
-            _sync_tensor_parallel_command(getattr(engine, "model", None), engine.device, cuda_sync=cuda_sync)
+            if not _skip_finally_sync:
+                _sync_tensor_parallel_command(getattr(engine, "model", None), engine.device, cuda_sync=cuda_sync)
 
 
 def _allocate_cache(
