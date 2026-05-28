@@ -10171,6 +10171,7 @@ def test_openai_stream_group_can_use_runtime_continuous_engine(monkeypatch: pyte
             return logits, cache
 
     monkeypatch.setenv("TORCHINFERNO_OPENAI_RUNTIME_CONTINUOUS_STREAM", "1")
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PADDED_BATCH_PREFILL", "0")
     engine = _cache_only_engine()
     engine.model = RuntimeModel()
     engine.stop_token_ids = frozenset()

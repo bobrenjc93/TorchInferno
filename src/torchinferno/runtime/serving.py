@@ -484,6 +484,8 @@ class ContinuousBatchEngine:
         shared_prefix_active = self._prefill_common_prefix_batch(plain_group, step, events=events)
         if shared_prefix_active is not None:
             active.extend(shared_prefix_active)
+        elif len(plain_group) > 1 and self._can_padded_batch_prefill(plain_group):
+            active.extend(self._prefill_padded_batch(plain_group, step, events=events))
         else:
             for group in batchable.values():
                 if len(group) == 1:
@@ -850,6 +852,74 @@ class ContinuousBatchEngine:
             row = rows[row_index]
             seq_len = self._refresh_row_seq_len_from_cache(row, len(request.prompt))
             self._store_reusable_prefix(request.request_id, request.prompt, row, logits[row_index : row_index + 1])
+            next_token = int(next_tokens[row_index])
+            state = _ActiveRequest(
+                original_index=original_index,
+                request=request,
+                tokens=[*request.prompt, next_token],
+                generated=1,
+                row=row,
+                last_token=next_token,
+                seq_len=seq_len,
+                prefix_hit_tokens=prefix_hit_tokens,
+                started_step=step,
+            )
+            self._record_token_event(events, state, next_token, step, finished=self._should_finish_before_decode(state))
+            active.append(state)
+        return active
+
+    def _can_padded_batch_prefill(self, group: list[tuple[int, ServingRequest, int]]) -> bool:
+        if not env_flag("TORCHINFERNO_CONTINUOUS_PADDED_BATCH_PREFILL", True):
+            return False
+        if not callable(getattr(self.model, "forward", None)):
+            return False
+        lengths = [len(request.prompt) for _, request, _ in group]
+        max_len = max(lengths)
+        min_len = min(lengths)
+        return max_len > 0 and min_len >= max_len * 0.5
+
+    def _prefill_padded_batch(
+        self,
+        group: list[tuple[int, ServingRequest, int]],
+        step: int,
+        *,
+        events: list[ServingTokenEvent] | None = None,
+    ) -> list[_ActiveRequest]:
+        self.stats.prefill_plain_batches += 1
+        rows = [self._acquire_active_row() for _ in group]
+        lengths = [len(request.prompt) for _, request, _ in group]
+        max_len = max(lengths)
+        padded = []
+        logit_positions = []
+        for i, (_, request, _) in enumerate(group):
+            prompt = list(request.prompt)
+            logit_positions.append(i * max_len + len(prompt) - 1)
+            prompt.extend([0] * (max_len - len(prompt)))
+            padded.append(prompt)
+        input_ids = torch.tensor(padded, device=self.device, dtype=torch.long)
+        logit_pos_tensor = torch.tensor(logit_positions, device=self.device, dtype=torch.long)
+        cache_view = self._cache_view(rows)
+        selected_logits = self._forward_selected_logits(
+            input_ids, cache=cache_view, logit_positions=logit_pos_tensor,
+        )
+        if selected_logits is not None:
+            logits = selected_logits
+        else:
+            full_logits, _ = self._prefill_logits(input_ids, cache=cache_view)
+            logits = full_logits[
+                torch.arange(len(group), device=self.device),
+                torch.tensor([l - 1 for l in lengths], device=self.device),
+            ].unsqueeze(1)
+        self._record_model_call("prefill", len(group), tokens=input_ids.numel())
+        next_tokens = self._sample_logits(logits[:, -1, :]).detach().cpu().tolist()
+
+        for row_index, (_, request, _) in enumerate(group):
+            self._set_cache_row_seq_len(rows[row_index], len(request.prompt))
+
+        active = []
+        for row_index, (original_index, request, prefix_hit_tokens) in enumerate(group):
+            row = rows[row_index]
+            seq_len = len(request.prompt)
             next_token = int(next_tokens[row_index])
             state = _ActiveRequest(
                 original_index=original_index,
