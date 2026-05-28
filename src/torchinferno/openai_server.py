@@ -1796,7 +1796,7 @@ class OpenAICompletionEngine:
                 _reset_generation_cache(cache_view)
 
     def _should_use_unified_scheduler(self) -> bool:
-        if not env_flag("TORCHINFERNO_OPENAI_UNIFIED_SCHEDULER", False):
+        if not env_flag("TORCHINFERNO_OPENAI_UNIFIED_SCHEDULER", True):
             return False
         if not _is_tensor_parallel_primary_model(self.model):
             return False
@@ -1968,7 +1968,6 @@ class OpenAICompletionEngine:
                                 prior_finished = ()
                             _broadcast_tensor_parallel_token_budget_decode_run(self.model, payload)
                             result = self._handle_token_budget_decode_run_payload(payload)
-                            torch.cuda.synchronize(self.device)
                             run_finished: list[str] = []
                             for step_result in result.step_results:
                                 run_finished.extend(_emit_result(step_result))
@@ -1986,7 +1985,6 @@ class OpenAICompletionEngine:
                         payload["finished_request_ids"] = existing
                     _broadcast_tensor_parallel_token_budget_step(self.model, payload)
                     result = self._handle_token_budget_step_payload(payload)
-                    torch.cuda.synchronize(self.device)
                     finished_ids = _emit_result(result)
                     _drain_queue()
                     self._completed_queue_batches += 1
@@ -3902,7 +3900,7 @@ class OpenAICompletionEngine:
             )
             self._generation_cache(1, warmup_cache_tokens, model=self.model, pool=False)
             _warmup_tensor_parallel_decode_attention(self.model)
-            if env_flag("TORCHINFERNO_OPENAI_UNIFIED_SCHEDULER", False) and hasattr(self.model, "allocate_cache"):
+            if env_flag("TORCHINFERNO_OPENAI_UNIFIED_SCHEDULER", True) and hasattr(self.model, "allocate_cache"):
                 self._warmup_unified_scheduler_cache(vocab_size)
         torch.cuda.synchronize(self.device)
 
@@ -7176,6 +7174,18 @@ class OpenAICompletionEngine:
         if token_count != len(prompt_chunk):
             raise ValueError("token-budget prefill token_count must match prompt_chunk")
         current_request_id = state.row_request_ids[row]
+        if current_request_id is not None and current_request_id != request_id:
+            state.active[row] = False
+            state.row_request_ids[row] = None
+            state.generated_tokens[row] = 0
+            state.seq_lens[row] = 0
+            try:
+                view = _cache_row_slice(state.cache, row, row + 1)
+                if view is not None:
+                    _reset_generation_cache(view)
+            except Exception:
+                pass
+            current_request_id = None
         if current_request_id is None:
             if start_token > 0:
                 self._copy_token_budget_prefix_for_chunk(chunk, state, row=row, prefix_tokens=start_token)
@@ -7183,8 +7193,6 @@ class OpenAICompletionEngine:
             state.active[row] = True
             state.generated_tokens[row] = 0
             state.seq_lens[row] = start_token
-        elif current_request_id != request_id:
-            raise ValueError("token-budget prefill row is occupied by another request")
         if int(state.seq_lens[row].item()) != start_token:
             raise ValueError("token-budget prefill start_token does not match row state")
         if token_count <= 0:
@@ -8650,7 +8658,7 @@ def _tensor_parallel_tensor_commands_enabled(model: object) -> bool:
     if (
         not _is_tensor_parallel_model(model)
         or _tensor_parallel_world_size(model) <= 1
-        or not env_flag("TORCHINFERNO_OPENAI_TP_TENSOR_COMMANDS", False)
+        or not env_flag("TORCHINFERNO_OPENAI_TP_TENSOR_COMMANDS", True)
     ):
         return False
     import torch.distributed as dist
@@ -9631,8 +9639,6 @@ def _tensor_parallel_worker_loop(engine: OpenAICompletionEngine) -> None:
                 if not callable(handler):
                     raise RuntimeError("token-budget step handler is not installed")
                 handler(payload)
-                if getattr(engine, "device", torch.device("cpu")).type == "cuda":
-                    torch.cuda.synchronize(getattr(engine, "device"))
                 continue
             if op == "token_budget_decode_run":
                 _skip_finally_sync = True
@@ -9640,8 +9646,6 @@ def _tensor_parallel_worker_loop(engine: OpenAICompletionEngine) -> None:
                 if not callable(handler):
                     raise RuntimeError("token-budget decode-run handler is not installed")
                 handler(payload)
-                if getattr(engine, "device", torch.device("cpu")).type == "cuda":
-                    torch.cuda.synchronize(getattr(engine, "device"))
                 continue
             if op == "token_budget_prompt_list_run":
                 handler = getattr(engine, "_handle_token_budget_prompt_list_run_payload", None)
