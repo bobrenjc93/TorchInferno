@@ -1754,6 +1754,10 @@ class OpenAICompletionEngine:
             device=self.device, cache_backend=self.cache_backend, page_size=self.page_size,
         )
         _reset_generation_cache(cache)
+        try:
+            cache._skip_capture_sync = True
+        except Exception:
+            pass
         prompt_tokens = env_int("TORCHINFERNO_OPENAI_WARMUP_PROMPT_TOKENS", 32, minimum=1)
         batch_sizes = sorted({1, 2, 4, 8, 16, 32, 48, 64, cache_batch} & set(range(1, cache_batch + 1)))
         for bs in batch_sizes:
@@ -1769,10 +1773,6 @@ class OpenAICompletionEngine:
             except Exception:
                 pass
             _reset_generation_cache(cache)
-        try:
-            cache._skip_capture_sync = True
-        except Exception:
-            pass
         self._persistent_serving_cache = cache
 
     def _warmup_token_budget_prefill_graphs(self, prefill_chunk_size: int) -> None:
