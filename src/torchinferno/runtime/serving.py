@@ -891,9 +891,9 @@ class ContinuousBatchEngine:
         max_len = max(lengths)
         padded = []
         logit_positions = []
-        for i, (_, request, _) in enumerate(group):
+        for _i, (_, request, _) in enumerate(group):
             prompt = list(request.prompt)
-            logit_positions.append(i * max_len + len(prompt) - 1)
+            logit_positions.append(len(prompt) - 1)
             prompt.extend([0] * (max_len - len(prompt)))
             padded.append(prompt)
         input_ids = torch.tensor(padded, device=self.device, dtype=torch.long)
@@ -906,10 +906,13 @@ class ContinuousBatchEngine:
             logits = selected_logits
         else:
             full_logits, _ = self._prefill_logits(input_ids, cache=cache_view)
-            logits = full_logits[
-                torch.arange(len(group), device=self.device),
-                torch.tensor([l - 1 for l in lengths], device=self.device),
-            ].unsqueeze(1)
+            if full_logits.size(1) == 1:
+                logits = full_logits
+            else:
+                logits = full_logits[
+                    torch.arange(len(group), device=self.device),
+                    torch.tensor([length - 1 for length in lengths], device=self.device),
+                ].unsqueeze(1)
         self._record_model_call("prefill", len(group), tokens=input_ids.numel())
         next_tokens = self._sample_logits(logits[:, -1, :]).detach().cpu().tolist()
 

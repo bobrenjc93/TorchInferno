@@ -1742,11 +1742,11 @@ class OpenAICompletionEngine:
                     self._completed_queue_batches += 1
 
     def _warmup_unified_scheduler_cache(self, vocab_size: int) -> None:
-        max_active = _effective_openai_max_batch_size(self.model, self.device, self.max_batch_size)
+        max_active = self._online_serving_max_active()
         cache_batch = _generation_cache_batch_capacity(self.model, max_active)
         max_seq_len = env_int(
             "TORCHINFERNO_OPENAI_UNIFIED_MAX_SEQ_LEN",
-            getattr(self, "max_model_len", None) or 1024,
+            getattr(self, "max_model_len", None) or 768,
             minimum=64,
         )
         cache = _allocate_cache(
@@ -2009,6 +2009,11 @@ class OpenAICompletionEngine:
                 _sync_tensor_parallel_command(self.model, self.device)
                 self._token_budget_step_state = None
 
+    def _online_serving_max_active(self) -> int:
+        cap = env_int("TORCHINFERNO_OPENAI_TP_ONLINE_MAX_ACTIVE", 64, minimum=1)
+        effective = _effective_openai_max_batch_size(self.model, self.device, self.max_batch_size)
+        return max(1, min(cap, effective))
+
     def _should_use_tensor_parallel_online_batcher(self, first: _QueuedGeneration) -> bool:
         explicit = "TORCHINFERNO_OPENAI_TP_ONLINE_CONTINUOUS_BATCHER" in os.environ
         if not env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_CONTINUOUS_BATCHER", False):
@@ -2018,8 +2023,6 @@ class OpenAICompletionEngine:
         if self.device.type != "cuda" and not explicit:
             return False
         if not _is_tensor_parallel_primary_model(self.model):
-            return False
-        if len(getattr(self, "stop_token_ids", frozenset())) > 1:
             return False
         return hasattr(self.model, "allocate_cache")
 
@@ -2031,17 +2034,7 @@ class OpenAICompletionEngine:
             "TORCHINFERNO_OPENAI_TP_ONLINE_PREFIX_CACHE_STORE_FULL_PROMPTS",
             True,
         )
-        default_max_active = max(1, min(requested_max_batch, self._queued_batch_limit(first)))
-        if not enable_ragged_decode:
-            default_max_active = min(
-                default_max_active,
-                env_int("TORCHINFERNO_CUDAGRAPH_DECODE_STEP_MAX_BATCH", 64, minimum=1),
-            )
-        max_active = env_int(
-            "TORCHINFERNO_OPENAI_TP_ONLINE_MAX_ACTIVE",
-            default_max_active,
-            minimum=1,
-        )
+        max_active = self._online_serving_max_active()
         prefix_rows = env_int(
             "TORCHINFERNO_OPENAI_TP_ONLINE_PREFIX_ROWS",
             1,
@@ -3910,7 +3903,7 @@ class OpenAICompletionEngine:
             _warmup_tensor_parallel_decode_attention(self.model)
             if (
                 env_flag("TORCHINFERNO_OPENAI_UNIFIED_SCHEDULER", False)
-                or env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_CONTINUOUS_BATCHER", True)
+                or env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_CONTINUOUS_BATCHER", False)
             ) and hasattr(self.model, "allocate_cache"):
                 self._warmup_unified_scheduler_cache(vocab_size)
         torch.cuda.synchronize(self.device)
