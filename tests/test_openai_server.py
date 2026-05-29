@@ -2292,6 +2292,7 @@ def test_openai_prompt_list_identical_prompts_skip_prefix_cache_restore() -> Non
         max_tokens: int,
         temperature: float,
         row_max_tokens: list[int] | None = None,
+        **_kw: object,
     ):
         calls.append((input_ids[0].tolist(), batch_size, max_tokens, temperature, row_max_tokens))
         yield [11, 11, 11]
@@ -7554,7 +7555,8 @@ def test_openai_queued_batch_groups_streams_with_different_max_tokens() -> None:
     assert captured == [[1, 3]]
 
 
-def test_openai_stream_group_respects_per_request_max_tokens() -> None:
+def test_openai_stream_group_respects_per_request_max_tokens(monkeypatch) -> None:
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_BATCH_EARLY_RESTART", "0")
     engine = _cache_only_engine()
     engine.model = object()
     engine._shared_prefix_prompt_list_tokens = lambda prompts: 1  # type: ignore[method-assign]
@@ -7567,6 +7569,7 @@ def test_openai_stream_group_respects_per_request_max_tokens() -> None:
         temperature: float,
         broadcast_tensor_parallel: bool = True,
         row_max_tokens: list[int] | None = None,
+        **_kw: object,
     ):
         del broadcast_tensor_parallel
         assert row_max_tokens == [1, 3]
@@ -9829,6 +9832,7 @@ def test_openai_token_budget_local_group_runner_releases_stop_finished_rows() ->
 
 
 def test_openai_queue_profile_records_stream_group(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_BATCH_EARLY_RESTART", "0")
     profile_path = tmp_path / "queue-profile.jsonl"
     monkeypatch.setenv("TORCHINFERNO_OPENAI_QUEUE_PROFILE_JSONL", str(profile_path))
     engine = _cache_only_engine()
@@ -9842,6 +9846,7 @@ def test_openai_queue_profile_records_stream_group(tmp_path: Path, monkeypatch: 
         temperature: float,
         broadcast_tensor_parallel: bool = True,
         row_max_tokens: list[int] | None = None,
+        **_kw: object,
     ):
         del prompts, max_tokens, temperature, broadcast_tensor_parallel, row_max_tokens
         yield [101, 201]
@@ -9955,6 +9960,7 @@ def test_openai_queue_profile_records_runtime_engine_stats(
 
 
 def test_openai_stream_group_sync_policy_uses_emitted_tokens(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_BATCH_EARLY_RESTART", "0")
     monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_COMMAND_CUDA_SYNC", raising=False)
     monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_COMMAND_CUDA_SYNC_MIN_STEPS", raising=False)
     monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_COMMAND_CUDA_SYNC_MAX_STEPS", raising=False)
@@ -9976,6 +9982,7 @@ def test_openai_stream_group_sync_policy_uses_emitted_tokens(monkeypatch: pytest
         temperature: float,
         broadcast_tensor_parallel: bool = True,
         row_max_tokens: list[int] | None = None,
+        **_kw: object,
     ):
         del max_tokens, temperature, broadcast_tensor_parallel, row_max_tokens
         for _ in range(8):
@@ -10014,6 +10021,7 @@ def test_openai_tp_single_stream_group_defaults_to_batch_path(monkeypatch) -> No
         max_tokens: int,
         temperature: float,
         row_max_tokens: list[int] | None = None,
+        **_kw: object,
     ):
         calls.append((input_ids.cpu().tolist(), max_tokens, temperature, row_max_tokens))
         yield [101]
@@ -10033,6 +10041,7 @@ def test_openai_tp_single_stream_group_defaults_to_batch_path(monkeypatch) -> No
 
 
 def test_openai_tp_single_stream_group_uses_prompt_list_path(monkeypatch) -> None:
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_BATCH_EARLY_RESTART", "0")
     engine = _cache_only_engine()
     model = object()
     engine.model = model
@@ -10051,6 +10060,7 @@ def test_openai_tp_single_stream_group_uses_prompt_list_path(monkeypatch) -> Non
         temperature: float,
         broadcast_tensor_parallel: bool = True,
         row_max_tokens: list[int] | None = None,
+        **_kw: object,
     ):
         del broadcast_tensor_parallel
         calls.append((prompts, max_tokens, temperature, row_max_tokens))
@@ -11306,6 +11316,7 @@ class _WorkerLoopRecordingEngine:
         temperature: float,
         broadcast_tensor_parallel: bool,
         row_max_tokens: list[int] | None = None,
+        **_kw: object,
     ):
         del row_max_tokens
         self.batch_calls.append(
@@ -11326,6 +11337,7 @@ class _WorkerLoopRecordingEngine:
         temperature: float,
         broadcast_tensor_parallel: bool,
         row_max_tokens: list[int] | None = None,
+        **_kw: object,
     ):
         self.prompt_list_calls.append(
             (

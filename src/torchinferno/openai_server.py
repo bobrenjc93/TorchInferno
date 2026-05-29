@@ -2824,11 +2824,15 @@ class OpenAICompletionEngine:
                         **_model_graph_cache_profile_fields(self.model, "graph_before_")
                     )
                 try:
+                    early_restart = (lambda: True) if env_flag(
+                        "TORCHINFERNO_OPENAI_BATCH_EARLY_RESTART", True
+                    ) else None
                     step_iter = self._generate_prompt_list_batch_steps(
                         prompts,
                         max_tokens=max_tokens,
                         temperature=group[0].temperature,
                         row_max_tokens=row_max_tokens,
+                        early_restart_check=early_restart,
                     )
                     for step, step_tokens in enumerate(step_iter):
                         completed_steps = step + 1
@@ -3921,10 +3925,7 @@ class OpenAICompletionEngine:
             )
             self._generation_cache(1, warmup_cache_tokens, model=self.model, pool=False)
             _warmup_tensor_parallel_decode_attention(self.model)
-            if (
-                env_flag("TORCHINFERNO_OPENAI_UNIFIED_SCHEDULER", False)
-                or env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_CONTINUOUS_BATCHER", False)
-            ) and hasattr(self.model, "allocate_cache"):
+            if hasattr(self.model, "allocate_cache"):
                 self._warmup_unified_scheduler_cache(vocab_size)
         torch.cuda.synchronize(self.device)
 
@@ -4881,6 +4882,7 @@ class OpenAICompletionEngine:
         broadcast_tensor_parallel: bool = True,
         row_max_tokens: Sequence[int] | None = None,
         allow_prefix_cache_restore: bool = True,
+        early_restart_check: object = None,
     ) -> Iterator[list[int | None]]:
         if max_tokens <= 0:
             return
@@ -4995,6 +4997,7 @@ class OpenAICompletionEngine:
                 max_tokens=max_tokens,
                 temperature=temperature,
                 row_max_tokens=per_row_limits,
+                early_restart_check=early_restart_check,
             )
             return
         indexed = [
@@ -5375,6 +5378,7 @@ class OpenAICompletionEngine:
         max_tokens: int,
         temperature: float,
         row_max_tokens: Sequence[int] | None = None,
+        early_restart_check: object = None,
     ) -> Iterator[list[int | None]]:
         stop_token_ids = self.stop_token_ids
         model = self.model
@@ -5487,6 +5491,7 @@ class OpenAICompletionEngine:
                         next_tokens=first_tokens,
                         temperature=temperature,
                         row_max_tokens=per_row_limits,
+                        early_restart_check=early_restart_check,
                 )
                 return
 
@@ -7692,16 +7697,29 @@ class OpenAICompletionEngine:
         )
         max_prompt_len = max((len(prompt) for prompt in prompts), default=0)
         cache_batch_size = _generation_cache_batch_capacity(model, prompt_count)
-        cache = self._generation_cache(
-            prompt_count,
-            max_prompt_len + max_tokens,
-            model=model,
-            batch_capacity=cache_batch_size,
-            pool=_shared_prefix_ragged_cache_pool_enabled_for_model(
-                model,
-                max_tokens=max_tokens,
-            ),
-        )
+        persistent = getattr(self, "_persistent_serving_cache", None)
+        if (
+            persistent is not None
+            and _cache_batch_size(persistent) is not None
+            and int(_cache_batch_size(persistent) or 0) >= prompt_count
+            and hasattr(persistent, "layers")
+            and persistent.layers
+            and persistent.layers[0].max_seq_len >= max_prompt_len + max_tokens
+        ):
+            cache = persistent
+            cache_batch_size = int(_cache_batch_size(persistent) or prompt_count)
+            _reset_generation_cache(cache)
+        else:
+            cache = self._generation_cache(
+                prompt_count,
+                max_prompt_len + max_tokens,
+                model=model,
+                batch_capacity=cache_batch_size,
+                pool=_shared_prefix_ragged_cache_pool_enabled_for_model(
+                    model,
+                    max_tokens=max_tokens,
+                ),
+            )
         physical_batch_size = _cache_batch_size(cache) or prompt_count
         prefill_batch_size = prompt_count
         if _shared_prefix_padded_suffix_static_batch_enabled(
@@ -8011,6 +8029,7 @@ class OpenAICompletionEngine:
         next_tokens: Sequence[int | None],
         temperature: float,
         row_max_tokens: Sequence[int] | None = None,
+        early_restart_check: object = None,
     ) -> Iterator[list[int | None]]:
         model = self.model
         if _disable_tp_shared_prefix_ragged_decode_graph(model, max_tokens=max_tokens):
@@ -8126,6 +8145,20 @@ class OpenAICompletionEngine:
                 final_active_rows = sum(1 for is_active in active if is_active)
                 min_active_rows = min(min_active_rows, final_active_rows)
                 yield step_tokens
+                # Mid-batch early restart: when at least half the initial batch
+                # has finished, break so the batch worker can restart with the
+                # remaining live rows + new arrivals. TP-safe: active[] is
+                # derived from NCCL-synchronized tokens, so primary and workers
+                # see the same counts and break at the same step. No extra
+                # dist.broadcast (which caused NCCL desync in earlier attempts).
+                if (
+                    early_restart_check is not None
+                    and initial_active_rows > 1
+                    and final_active_rows * 2 <= initial_active_rows
+                    and callable(early_restart_check)
+                    and early_restart_check()
+                ):
+                    break
         finally:
             self._add_stream_group_profile_elapsed(
                 "shared_prefix_ragged_decode_ms",
@@ -9814,12 +9847,16 @@ def _tensor_parallel_worker_loop(engine: OpenAICompletionEngine) -> None:
             ):
                 if "input_id_lists" in payload:
                     if bool(payload.get("stream", True)):
+                        worker_early_restart = (lambda: True) if env_flag(
+                            "TORCHINFERNO_OPENAI_BATCH_EARLY_RESTART", True
+                        ) else None
                         iterator = engine._generate_prompt_list_batch_steps(
                             payload["input_id_lists"],
                             max_tokens=max_tokens,
                             temperature=temperature,
                             broadcast_tensor_parallel=False,
                             row_max_tokens=_coerce_optional_int_sequence(payload.get("row_max_tokens")),
+                            early_restart_check=worker_early_restart,
                         )
                         for _ in iterator:
                             pass
