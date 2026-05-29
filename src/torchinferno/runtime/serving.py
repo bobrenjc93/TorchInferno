@@ -243,14 +243,11 @@ class ContinuousBatchEngine:
         # prefix in the radix tree (preventing cross-batch reuse).
         self.pin_shared_prefix = pin_shared_prefix
         # When graph_prefill is on, suffix prefills route through the model's
-        # selected-logits CUDA-graph path with the batch padded to a power-of-two
-        # bucket so (batch, suffix_bucket, prefix_len) shapes repeat across
-        # batches. NOTE: effective only once the model exposes a row_indices-based
-        # prefill graph (like the decode ragged graph). The current selected-
-        # logits graph binds to a contiguous for_rows cache view, so capture
-        # fails / cannot replay across the scattered dynamic rows the continuous
-        # batcher allocates; until then this falls back to eager and is off by
-        # default. The engine-side bucketing/grouping here is the ready half.
+        # row_indices ragged-prefill LOGITS graph (try_prefill_ragged_logits_graph):
+        # the suffix KV is scatter-written into the (scattered) active rows and
+        # one logit row per request is gathered, replaying the graph across
+        # changing row sets. Batch and suffix are padded to power-of-two buckets
+        # so graph shapes repeat. Per-row start positions handle mixed prefixes.
         self.graph_prefill = graph_prefill
         self.profile_timings = profile_timings
         self.prefix_cache = PrefixCacheIndex()
@@ -721,6 +718,13 @@ class ContinuousBatchEngine:
         bucket = 1 << (count - 1).bit_length()
         return min(bucket, self.max_active_requests)
 
+    def _suffix_bucket(self, length: int) -> int:
+        # Pad the suffix length to a power of two so the ragged-prefill graph key
+        # (batch, suffix_bucket, ...) repeats across batches and replays.
+        if length <= 1:
+            return 1
+        return 1 << (length - 1).bit_length()
+
     def _prefill_prefix_graph_batch(
         self,
         group: list[tuple[int, ServingRequest, int, _ReusablePrefix]],
@@ -728,52 +732,58 @@ class ContinuousBatchEngine:
         *,
         events: list[ServingTokenEvent] | None = None,
     ) -> list[_ActiveRequest] | None:
-        # Route suffix prefill through the model's selected-logits CUDA graph.
-        # Requires a uniform prefix length: the model reads cache.seq_len as one
-        # scalar start position for every row and the graph key binds to it, so
-        # mixed prefixes (rare; only with multiple distinct cached prefixes in a
-        # batch) fall back to the eager path below.
-        prefix_lengths = {prefix_hit_tokens for _i, _req, prefix_hit_tokens, _reusable in group}
-        if len(prefix_lengths) != 1:
-            return None
-        prefix_hit = next(iter(prefix_lengths))
-        suffixes = [request.prompt[prefix_hit:] for _i, request, _h, _reusable in group]
+        # Route suffix prefill through the model's row_indices ragged-prefill
+        # LOGITS graph. The shared prefix KV is copied into each (scattered) row,
+        # then the suffix is scatter-written and one logit row per request is
+        # gathered. Per-row start positions handle MIXED prefix lengths, and the
+        # graph replays across changing scattered row sets (unlike the old
+        # contiguous for_rows selected-logits path). Batch and suffix are padded
+        # to power-of-two buckets so graph shapes repeat.
+        prefix_hits = [prefix_hit_tokens for _i, _req, prefix_hit_tokens, _r in group]
+        suffixes = [request.prompt[prefix_hits[i]:] for i, (_idx, request, _h, _r) in enumerate(group)]
         suffix_lengths = [len(suffix) for suffix in suffixes]
         if not suffix_lengths or min(suffix_lengths) <= 0:
             return None
-        max_suffix_len = max(suffix_lengths)
+        suffix_bucket = self._suffix_bucket(max(suffix_lengths))
         count = len(group)
-        bucket = self._prefill_batch_bucket(count)
+        batch_bucket = self._prefill_batch_bucket(count)
         rows = [self._acquire_active_row() for _ in group]
         pad_rows: list[int] = []
         try:
             self._copy_reusable_prefixes_to_rows(rows, group)
             padded_suffixes = [
-                [*suffix, *([0] * (max_suffix_len - len(suffix)))]
+                [*suffix, *([0] * (suffix_bucket - len(suffix)))]
                 for suffix in suffixes
             ]
-            source_prefix_row = group[0][3].row
-            if bucket > count:
+            start_lens = list(prefix_hits)
+            if batch_bucket > count:
                 dummy_suffix = padded_suffixes[0]
-                for _ in range(bucket - count):
+                dummy_prefix_row = group[0][3].row
+                dummy_prefix_len = prefix_hits[0]
+                for _ in range(batch_bucket - count):
                     pad_row = self._acquire_active_row_or_none()
                     if pad_row is None:
                         break
                     pad_rows.append(pad_row)
-                    self._copy_prefix(source_prefix_row, pad_row, prefix_hit)
+                    self._copy_prefix(dummy_prefix_row, pad_row, dummy_prefix_len)
                     padded_suffixes.append(list(dummy_suffix))
+                    start_lens.append(dummy_prefix_len)
             all_rows = rows + pad_rows
             input_ids = torch.tensor(padded_suffixes, device=self.device, dtype=torch.long)
+            row_indices = torch.tensor(all_rows, device=self.device, dtype=torch.long)
+            required = max(all_rows) + 1
+            seq_lens_list = [0] * required
+            for physical_row, start_len in zip(all_rows, start_lens):
+                seq_lens_list[physical_row] = start_len
+            seq_lens = torch.tensor(seq_lens_list, device=self.device, dtype=torch.long)
             logit_positions = torch.tensor(
-                [length - 1 for length in suffix_lengths] + [max_suffix_len - 1] * len(pad_rows),
+                [length - 1 for length in suffix_lengths] + [0] * len(pad_rows),
                 device=self.device,
                 dtype=torch.long,
             )
-            logits = self._forward_selected_logits(
-                input_ids,
-                cache=self._cache_view(all_rows),
-                logit_positions=logit_positions,
-            )
+            logits = self._try_ragged_prefill_logits(input_ids, seq_lens, row_indices, logit_positions)
+            if logits is None:
+                logits = self._ragged_prefill_logits_eager(input_ids, seq_lens, row_indices, logit_positions)
             for pad_row in pad_rows:
                 self._release_active_row(pad_row)
             pad_rows = []
@@ -781,7 +791,7 @@ class ContinuousBatchEngine:
                 for row in rows:
                     self._release_active_row(row)
                 return None
-            self._record_model_call("prefill", count, tokens=input_ids.numel())
+            self._record_model_call("prefill", count, tokens=count * max(suffix_lengths))
             self.stats.prefill_prefix_reuse_batches += 1
             self.stats.prefill_padded_suffix_batches += 1
             next_tokens = self._sample_logits(logits[:, -1, :]).detach().cpu().tolist()
@@ -811,6 +821,47 @@ class ContinuousBatchEngine:
             for row in rows:
                 self._release_active_row(row)
             raise
+
+    def _try_ragged_prefill_logits(
+        self,
+        input_ids: Tensor,
+        seq_lens: Tensor,
+        row_indices: Tensor,
+        logit_positions: Tensor,
+    ) -> Tensor | None:
+        graph = getattr(self.model, "try_prefill_ragged_logits_graph", None)
+        if graph is None:
+            return None
+        logits = graph(
+            input_ids,
+            self._require_cache(),
+            seq_lens=seq_lens,
+            row_indices=row_indices,
+            logit_positions=logit_positions,
+        )
+        if logits is None:
+            self.stats.prefill_graph_misses += 1
+            return None
+        self.stats.prefill_graph_hits += 1
+        return logits
+
+    def _ragged_prefill_logits_eager(
+        self,
+        input_ids: Tensor,
+        seq_lens: Tensor,
+        row_indices: Tensor,
+        logit_positions: Tensor,
+    ) -> Tensor | None:
+        eager = getattr(self.model, "prefill_ragged_logits", None)
+        if eager is None:
+            return None
+        return eager(
+            input_ids,
+            self._require_cache(),
+            seq_lens=seq_lens,
+            row_indices=row_indices,
+            logit_positions=logit_positions,
+        )
 
     def _prefill_prefix_batch(
         self,

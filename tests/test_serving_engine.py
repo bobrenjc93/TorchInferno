@@ -169,6 +169,24 @@ class _SelectedLogitsToyModel(_RaggedGraphToyModel):
         row_indices = torch.arange(input_ids.size(0), device=input_ids.device)
         return self._logits(input_ids[row_indices, positions] + 1), cache
 
+    def _ragged_prefill_compute(self, input_ids, logit_positions):
+        positions = logit_positions.to(input_ids.device)
+        self.selected_positions.append(positions.detach().cpu().tolist())
+        idx = torch.arange(input_ids.size(0), device=input_ids.device)
+        return self._logits(input_ids[idx, positions] + 1)
+
+    def try_prefill_ragged_logits_graph(
+        self, input_ids, cache, *, seq_lens, row_indices, logit_positions, capture_on_miss=True
+    ):
+        del seq_lens, capture_on_miss
+        cache.advance_rows(row_indices.detach().cpu().tolist(), input_ids.size(1))
+        return self._ragged_prefill_compute(input_ids, logit_positions)
+
+    def prefill_ragged_logits(self, input_ids, cache, *, seq_lens, row_indices, logit_positions):
+        del seq_lens
+        cache.advance_rows(row_indices.detach().cpu().tolist(), input_ids.size(1))
+        return self._ragged_prefill_compute(input_ids, logit_positions)
+
 
 class _PrefillLogitsGraphToyModel(_RaggedGraphToyModel):
     def __init__(self, vocab_size: int = 64) -> None:
@@ -733,14 +751,14 @@ def test_continuous_batch_engine_reuses_common_prefix_for_padded_refill(monkeypa
 
 
 def test_continuous_batch_engine_graph_prefill_buckets_batch_and_matches() -> None:
-    # graph_prefill routes suffix prefill through the model's selected-logits
-    # CUDA-graph entrypoint with the batch padded to a power of two so graph
-    # shapes repeat across batches. A reuse batch of three differently-sized
+    # graph_prefill routes suffix prefill through the model's row_indices
+    # ragged-prefill LOGITS graph with the batch padded to a power of two so
+    # graph shapes repeat across batches. A reuse batch of three differently-sized
     # suffixes is bucketed up to four rows (one dummy padding row); outputs must
-    # equal the toy model's selected-logits contract and the graph path must be
-    # called with capture_on_miss enabled by graph_prefill.
+    # equal the toy model's selected-token contract and the ragged graph path
+    # must be taken (prefill_graph_hits incremented).
     shared = tuple(range(16))
-    model = _SelectedLogitsGraphToyModel()
+    model = _SelectedLogitsToyModel()
     engine = ContinuousBatchEngine(
         model,
         device=torch.device("cpu"),
@@ -765,12 +783,12 @@ def test_continuous_batch_engine_graph_prefill_buckets_batch_and_matches() -> No
     assert by_id["late-b"].tokens[-1] == 34
     assert by_id["late-c"].tokens[-1] == 37
     assert by_id["late-a"].prefix_hit_tokens == 16
-    # The reuse batch of three was bucketed up to four rows in the graph call
-    # (three real logit positions 0/1/2 plus one dummy padding row at max-1=2).
+    # The reuse batch of three was bucketed up to four rows in the ragged graph
+    # call (three real logit positions 0/1/2 plus one dummy padding row at 0).
     assert len(model.selected_positions[-1]) == 4
-    assert sorted(model.selected_positions[-1]) == [0, 1, 2, 2]
-    # Graph path was taken with capture-on-miss enabled by graph_prefill.
-    assert model.selected_capture_flags and all(model.selected_capture_flags)
+    assert sorted(model.selected_positions[-1]) == [0, 0, 1, 2]
+    # The ragged-prefill graph path was taken (not the eager fallback).
+    assert engine.stats.prefill_graph_hits >= 1
     assert engine.stats.prefill_prefix_reuse_batches >= 1
     assert engine.stats.prefill_padded_suffix_batches >= 1
     assert engine.stats.prefix_reuse_requests >= 3
