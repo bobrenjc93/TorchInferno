@@ -7567,6 +7567,7 @@ def test_openai_stream_group_respects_per_request_max_tokens() -> None:
         temperature: float,
         broadcast_tensor_parallel: bool = True,
         row_max_tokens: list[int] | None = None,
+        **_kw: object,
     ):
         del broadcast_tensor_parallel
         assert row_max_tokens == [1, 3]
@@ -9842,6 +9843,7 @@ def test_openai_queue_profile_records_stream_group(tmp_path: Path, monkeypatch: 
         temperature: float,
         broadcast_tensor_parallel: bool = True,
         row_max_tokens: list[int] | None = None,
+        **_kw: object,
     ):
         del prompts, max_tokens, temperature, broadcast_tensor_parallel, row_max_tokens
         yield [101, 201]
@@ -9976,6 +9978,7 @@ def test_openai_stream_group_sync_policy_uses_emitted_tokens(monkeypatch: pytest
         temperature: float,
         broadcast_tensor_parallel: bool = True,
         row_max_tokens: list[int] | None = None,
+        **_kw: object,
     ):
         del max_tokens, temperature, broadcast_tensor_parallel, row_max_tokens
         for _ in range(8):
@@ -10051,6 +10054,7 @@ def test_openai_tp_single_stream_group_uses_prompt_list_path(monkeypatch) -> Non
         temperature: float,
         broadcast_tensor_parallel: bool = True,
         row_max_tokens: list[int] | None = None,
+        **_kw: object,
     ):
         del broadcast_tensor_parallel
         calls.append((prompts, max_tokens, temperature, row_max_tokens))
@@ -11326,6 +11330,7 @@ class _WorkerLoopRecordingEngine:
         temperature: float,
         broadcast_tensor_parallel: bool,
         row_max_tokens: list[int] | None = None,
+        **_kw: object,
     ):
         self.prompt_list_calls.append(
             (
