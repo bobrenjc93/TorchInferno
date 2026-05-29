@@ -732,6 +732,50 @@ def test_continuous_batch_engine_reuses_common_prefix_for_padded_refill(monkeypa
     assert engine.stats.prefix_reuse_tokens == 32
 
 
+def test_continuous_batch_engine_graph_prefill_buckets_batch_and_matches() -> None:
+    # graph_prefill routes suffix prefill through the model's selected-logits
+    # CUDA-graph entrypoint with the batch padded to a power of two so graph
+    # shapes repeat across batches. A reuse batch of three differently-sized
+    # suffixes is bucketed up to four rows (one dummy padding row); outputs must
+    # equal the toy model's selected-logits contract and the graph path must be
+    # called with capture_on_miss enabled by graph_prefill.
+    shared = tuple(range(16))
+    model = _SelectedLogitsGraphToyModel()
+    engine = ContinuousBatchEngine(
+        model,
+        device=torch.device("cpu"),
+        max_active_requests=8,
+        prefix_cache_capacity=8,
+        pin_shared_prefix=True,
+        graph_prefill=True,
+    )
+    requests = [
+        ServingRequest("warm-a", (*shared, 21), 1, arrival_step=0),
+        ServingRequest("warm-b", (*shared, 22), 1, arrival_step=0),
+        ServingRequest("late-a", (*shared, 31), 1, arrival_step=1),
+        ServingRequest("late-b", (*shared, 32, 33), 1, arrival_step=1),
+        ServingRequest("late-c", (*shared, 34, 35, 36), 1, arrival_step=1),
+    ]
+
+    results = engine.run(requests)
+    by_id = {result.request_id: result for result in results}
+
+    # Toy contract: next token = (selected real last prompt token) + 1.
+    assert by_id["late-a"].tokens[-1] == 32
+    assert by_id["late-b"].tokens[-1] == 34
+    assert by_id["late-c"].tokens[-1] == 37
+    assert by_id["late-a"].prefix_hit_tokens == 16
+    # The reuse batch of three was bucketed up to four rows in the graph call
+    # (three real logit positions 0/1/2 plus one dummy padding row at max-1=2).
+    assert len(model.selected_positions[-1]) == 4
+    assert sorted(model.selected_positions[-1]) == [0, 1, 2, 2]
+    # Graph path was taken with capture-on-miss enabled by graph_prefill.
+    assert model.selected_capture_flags and all(model.selected_capture_flags)
+    assert engine.stats.prefill_prefix_reuse_batches >= 1
+    assert engine.stats.prefill_padded_suffix_batches >= 1
+    assert engine.stats.prefix_reuse_requests >= 3
+
+
 def test_continuous_batch_engine_can_keep_common_prefix_without_full_prompt_entries(
     monkeypatch,
 ) -> None:

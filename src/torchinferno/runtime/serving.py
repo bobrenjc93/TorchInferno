@@ -210,6 +210,7 @@ class ContinuousBatchEngine:
         store_reusable_prefixes: bool = True,
         store_full_prompt_prefixes: bool = True,
         pin_shared_prefix: bool = False,
+        graph_prefill: bool = False,
         profile_timings: bool = False,
     ) -> None:
         if max_active_requests < 1:
@@ -241,6 +242,16 @@ class ContinuousBatchEngine:
         # that would otherwise starve the prefix-row pool and shadow the shared
         # prefix in the radix tree (preventing cross-batch reuse).
         self.pin_shared_prefix = pin_shared_prefix
+        # When graph_prefill is on, suffix prefills route through the model's
+        # selected-logits CUDA-graph path with the batch padded to a power-of-two
+        # bucket so (batch, suffix_bucket, prefix_len) shapes repeat across
+        # batches. NOTE: effective only once the model exposes a row_indices-based
+        # prefill graph (like the decode ragged graph). The current selected-
+        # logits graph binds to a contiguous for_rows cache view, so capture
+        # fails / cannot replay across the scattered dynamic rows the continuous
+        # batcher allocates; until then this falls back to eager and is off by
+        # default. The engine-side bucketing/grouping here is the ready half.
+        self.graph_prefill = graph_prefill
         self.profile_timings = profile_timings
         self.prefix_cache = PrefixCacheIndex()
         self.reusable_prefixes: dict[Hashable, _ReusablePrefix] = {}
@@ -453,7 +464,11 @@ class ContinuousBatchEngine:
         active: list[_ActiveRequest] = []
         batchable: dict[int, list[tuple[int, ServingRequest, int]]] = defaultdict(list)
         prefix_batchable: dict[tuple[int, int], list[tuple[int, ServingRequest, int, _ReusablePrefix]]] = defaultdict(list)
-        pad_prefix_suffixes = env_flag("TORCHINFERNO_CONTINUOUS_PADDED_SUFFIX_PREFILL", False)
+        # graph_prefill pads suffixes to a common length and buckets the batch,
+        # so reuse requests must be grouped by prefix alone (suffix key -1)
+        # rather than split per suffix length -- otherwise each suffix length
+        # reaches the graph path as its own tiny batch and never amortizes.
+        pad_prefix_suffixes = env_flag("TORCHINFERNO_CONTINUOUS_PADDED_SUFFIX_PREFILL", False) or self.graph_prefill
 
         for original_index, request in indexed_requests:
             if not request.prompt:
@@ -696,6 +711,107 @@ class ContinuousBatchEngine:
                 self._release_active_row(row)
             raise
 
+    def _prefill_batch_bucket(self, count: int) -> int:
+        # Pad the prefill batch to a power of two so the model's prefill graph
+        # key -- (batch, suffix_bucket, prefix_len) -- repeats across batches and
+        # replays instead of recapturing on every differently-sized batch. Cap
+        # at the active-row capacity so dummy padding rows never exceed the cache.
+        if count <= 1:
+            return 1
+        bucket = 1 << (count - 1).bit_length()
+        return min(bucket, self.max_active_requests)
+
+    def _prefill_prefix_graph_batch(
+        self,
+        group: list[tuple[int, ServingRequest, int, _ReusablePrefix]],
+        step: int,
+        *,
+        events: list[ServingTokenEvent] | None = None,
+    ) -> list[_ActiveRequest] | None:
+        # Route suffix prefill through the model's selected-logits CUDA graph.
+        # Requires a uniform prefix length: the model reads cache.seq_len as one
+        # scalar start position for every row and the graph key binds to it, so
+        # mixed prefixes (rare; only with multiple distinct cached prefixes in a
+        # batch) fall back to the eager path below.
+        prefix_lengths = {prefix_hit_tokens for _i, _req, prefix_hit_tokens, _reusable in group}
+        if len(prefix_lengths) != 1:
+            return None
+        prefix_hit = next(iter(prefix_lengths))
+        suffixes = [request.prompt[prefix_hit:] for _i, request, _h, _reusable in group]
+        suffix_lengths = [len(suffix) for suffix in suffixes]
+        if not suffix_lengths or min(suffix_lengths) <= 0:
+            return None
+        max_suffix_len = max(suffix_lengths)
+        count = len(group)
+        bucket = self._prefill_batch_bucket(count)
+        rows = [self._acquire_active_row() for _ in group]
+        pad_rows: list[int] = []
+        try:
+            self._copy_reusable_prefixes_to_rows(rows, group)
+            padded_suffixes = [
+                [*suffix, *([0] * (max_suffix_len - len(suffix)))]
+                for suffix in suffixes
+            ]
+            source_prefix_row = group[0][3].row
+            if bucket > count:
+                dummy_suffix = padded_suffixes[0]
+                for _ in range(bucket - count):
+                    pad_row = self._acquire_active_row_or_none()
+                    if pad_row is None:
+                        break
+                    pad_rows.append(pad_row)
+                    self._copy_prefix(source_prefix_row, pad_row, prefix_hit)
+                    padded_suffixes.append(list(dummy_suffix))
+            all_rows = rows + pad_rows
+            input_ids = torch.tensor(padded_suffixes, device=self.device, dtype=torch.long)
+            logit_positions = torch.tensor(
+                [length - 1 for length in suffix_lengths] + [max_suffix_len - 1] * len(pad_rows),
+                device=self.device,
+                dtype=torch.long,
+            )
+            logits = self._forward_selected_logits(
+                input_ids,
+                cache=self._cache_view(all_rows),
+                logit_positions=logit_positions,
+            )
+            for pad_row in pad_rows:
+                self._release_active_row(pad_row)
+            pad_rows = []
+            if logits is None:
+                for row in rows:
+                    self._release_active_row(row)
+                return None
+            self._record_model_call("prefill", count, tokens=input_ids.numel())
+            self.stats.prefill_prefix_reuse_batches += 1
+            self.stats.prefill_padded_suffix_batches += 1
+            next_tokens = self._sample_logits(logits[:, -1, :]).detach().cpu().tolist()
+            active: list[_ActiveRequest] = []
+            for row_index, (original_index, request, prefix_hit_tokens, _reusable) in enumerate(group):
+                row = rows[row_index]
+                self._set_cache_row_seq_len(row, len(request.prompt))
+                self._store_reusable_prefix(request.request_id, request.prompt, row, logits[row_index : row_index + 1])
+                next_token = int(next_tokens[row_index])
+                state = _ActiveRequest(
+                    original_index=original_index,
+                    request=request,
+                    tokens=[*request.prompt, next_token],
+                    generated=1,
+                    row=row,
+                    last_token=next_token,
+                    seq_len=self._cache_row_seq_len(row, len(request.prompt)),
+                    prefix_hit_tokens=prefix_hit_tokens,
+                    started_step=step,
+                )
+                self._record_token_event(events, state, next_token, step, finished=self._should_finish_before_decode(state))
+                active.append(state)
+            return active
+        except Exception:
+            for pad_row in pad_rows:
+                self._release_active_row(pad_row)
+            for row in rows:
+                self._release_active_row(row)
+            raise
+
     def _prefill_prefix_batch(
         self,
         group: list[tuple[int, ServingRequest, int, _ReusablePrefix]],
@@ -703,6 +819,10 @@ class ContinuousBatchEngine:
         *,
         events: list[ServingTokenEvent] | None = None,
     ) -> list[_ActiveRequest]:
+        if self.graph_prefill:
+            graph_active = self._prefill_prefix_graph_batch(group, step, events=events)
+            if graph_active is not None:
+                return graph_active
         suffix_lengths = [len(request.prompt) - prefix_hit_tokens for _index, request, prefix_hit_tokens, _reusable in group]
         if len(set(suffix_lengths)) > 1:
             padded_active = self._prefill_prefix_padded_suffix_batch(group, step, events=events)
@@ -1511,7 +1631,7 @@ class ContinuousBatchEngine:
             return None
         capture_on_miss = env_flag(
             "TORCHINFERNO_CONTINUOUS_SELECTED_PREFILL_CAPTURE",
-            env_flag("TORCHINFERNO_CONTINUOUS_PREFILL_CAPTURE", False),
+            env_flag("TORCHINFERNO_CONTINUOUS_PREFILL_CAPTURE", self.graph_prefill),
         )
         logits = self._call_prefill_graph(
             graph,
