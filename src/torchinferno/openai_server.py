@@ -1743,7 +1743,10 @@ class OpenAICompletionEngine:
 
     def _warmup_unified_scheduler_cache(self, vocab_size: int) -> None:
         max_active = self._online_serving_max_active()
-        cache_batch = _generation_cache_batch_capacity(self.model, max_active)
+        # Persistent cache holds active rows plus extra rows for shared prompt
+        # prefixes, so the continuous batcher can prefill only suffixes.
+        total_rows = max_active + self._online_serving_prefix_rows()
+        cache_batch = total_rows
         max_seq_len = env_int(
             "TORCHINFERNO_OPENAI_UNIFIED_MAX_SEQ_LEN",
             getattr(self, "max_model_len", None) or 768,
@@ -1759,7 +1762,9 @@ class OpenAICompletionEngine:
         except Exception:
             pass
         prompt_tokens = env_int("TORCHINFERNO_OPENAI_WARMUP_PROMPT_TOKENS", 32, minimum=1)
-        batch_sizes = sorted({1, cache_batch} & set(range(1, cache_batch + 1)))
+        # Decode touches only active rows (<= max_active), addressed via row
+        # indices, so warm the active-range buckets, not the full cache size.
+        batch_sizes = sorted({1, max_active} & set(range(1, cache_batch + 1)))
         with _tensor_parallel_symm_mem_allreduce_scope(
             self.model, self.device, max_tokens=1, temperature=0.0,
         ):
@@ -2014,6 +2019,12 @@ class OpenAICompletionEngine:
         effective = _effective_openai_max_batch_size(self.model, self.device, self.max_batch_size)
         return max(1, min(cap, effective))
 
+    def _online_serving_prefix_rows(self) -> int:
+        # Extra persistent-cache rows that hold shared prompt prefixes so the
+        # continuous batcher prefills only per-request suffixes (like the batch
+        # worker), instead of re-prefilling the full prompt each time.
+        return env_int("TORCHINFERNO_OPENAI_TP_ONLINE_PREFIX_ROWS", 8, minimum=0)
+
     def _should_use_tensor_parallel_online_batcher(self, first: _QueuedGeneration) -> bool:
         explicit = "TORCHINFERNO_OPENAI_TP_ONLINE_CONTINUOUS_BATCHER" in os.environ
         if not env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_CONTINUOUS_BATCHER", False):
@@ -2035,13 +2046,7 @@ class OpenAICompletionEngine:
             True,
         )
         max_active = self._online_serving_max_active()
-        prefix_rows = env_int(
-            "TORCHINFERNO_OPENAI_TP_ONLINE_PREFIX_ROWS",
-            1,
-            minimum=0,
-        )
-        if getattr(self, "_persistent_serving_cache", None) is not None:
-            prefix_rows = 0
+        prefix_rows = self._online_serving_prefix_rows()
         prefill_budget = env_int("TORCHINFERNO_OPENAI_TP_ONLINE_PREFILL_TOKEN_BUDGET", 2048, minimum=0)
         request_by_id: dict[str, _QueuedGeneration] = {}
         next_request_id = 0
