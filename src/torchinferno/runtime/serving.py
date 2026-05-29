@@ -1342,7 +1342,13 @@ class ContinuousBatchEngine:
         return row
 
     def _release_active_row(self, row: int) -> None:
-        self._clear_physical_row(row)
+        # Skip the GPU KV zero on release: _acquire_active_row already clears a
+        # row before any reuse, so clearing here too is a redundant second pass
+        # that runs inside the hot decode state-update loop (once per finishing
+        # request). Only the seq_len reset is needed for correctness -- a free
+        # row reused as decode-bucket padding has seq_len 0 so attention never
+        # reads its stale KV, and its bucket output is discarded regardless.
+        self._remember_row_seq_len(row, 0)
         if row not in self._free_active_rows:
             self._free_active_rows.append(row)
 
@@ -1394,7 +1400,7 @@ class ContinuousBatchEngine:
         return self._online_waiting
 
     def _clear_physical_row(self, row: int) -> None:
-        self._require_cache().for_rows((row,)).clear_row(0)  # type: ignore[attr-defined]
+        self._cache_view([row]).clear_row(0)  # type: ignore[attr-defined]
         self._remember_row_seq_len(row, 0)
 
     def _allocate_cache(self, batch_size: int, max_seq_len: int) -> object:
