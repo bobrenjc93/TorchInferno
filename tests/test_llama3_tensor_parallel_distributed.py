@@ -204,11 +204,15 @@ def test_llama3_tensor_parallel_ragged_prefill_graph_replays_across_rows(tmp_pat
 
         cache = model.allocate_cache(4, max_seq_len=64, cache_backend="dense")
 
+        # context_len = uniform prefix (0, fresh) + suffix bucket -> exercises the
+        # flash causal_lower_right path used in serving (not the boolean mask).
+        context_len = bucket
+
         def run(rows):
             row_indices = torch.tensor(rows, dtype=torch.long, device=device)
             return model.try_prefill_ragged_logits_graph(
                 input_ids, cache, seq_lens=seq_lens, row_indices=row_indices,
-                logit_positions=logit_positions, capture_on_miss=True,
+                logit_positions=logit_positions, context_len=context_len, capture_on_miss=True,
             )
 
         out_a = run([3, 1, 2])   # captures

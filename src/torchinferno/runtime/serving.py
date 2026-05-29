@@ -740,11 +740,23 @@ class ContinuousBatchEngine:
         # contiguous for_rows selected-logits path). Batch and suffix are padded
         # to power-of-two buckets so graph shapes repeat.
         prefix_hits = [prefix_hit_tokens for _i, _req, prefix_hit_tokens, _r in group]
+        # _prefill_many groups reuse requests by prefix length, so the prefix is
+        # uniform here; that lets the suffix attention use a flash causal_lower_right
+        # over a static context_len (prefix + suffix_bucket) instead of a boolean
+        # mask (which OOMs at large suffix x context). A non-uniform group (rare)
+        # falls back to the eager per-suffix-length path.
+        if len(set(prefix_hits)) != 1:
+            return None
+        prefix_hit = prefix_hits[0]
         suffixes = [request.prompt[prefix_hits[i]:] for i, (_idx, request, _h, _r) in enumerate(group)]
         suffix_lengths = [len(suffix) for suffix in suffixes]
         if not suffix_lengths or min(suffix_lengths) <= 0:
             return None
+        cache_max_seq = self._cache_max_seq_len()
         suffix_bucket = self._suffix_bucket(max(suffix_lengths))
+        if cache_max_seq is not None:
+            suffix_bucket = min(suffix_bucket, max(1, cache_max_seq - prefix_hit))
+        context_len = prefix_hit + suffix_bucket
         count = len(group)
         batch_bucket = self._prefill_batch_bucket(count)
         rows = [self._acquire_active_row() for _ in group]
@@ -781,9 +793,13 @@ class ContinuousBatchEngine:
                 device=self.device,
                 dtype=torch.long,
             )
-            logits = self._try_ragged_prefill_logits(input_ids, seq_lens, row_indices, logit_positions)
+            logits = self._try_ragged_prefill_logits(
+                input_ids, seq_lens, row_indices, logit_positions, context_len
+            )
             if logits is None:
-                logits = self._ragged_prefill_logits_eager(input_ids, seq_lens, row_indices, logit_positions)
+                logits = self._ragged_prefill_logits_eager(
+                    input_ids, seq_lens, row_indices, logit_positions, context_len
+                )
             for pad_row in pad_rows:
                 self._release_active_row(pad_row)
             pad_rows = []
@@ -822,12 +838,20 @@ class ContinuousBatchEngine:
                 self._release_active_row(row)
             raise
 
+    def _cache_max_seq_len(self) -> int | None:
+        cache = self._require_cache()
+        layers = tuple(getattr(cache, "layers", ()) or ())
+        if not layers:
+            return None
+        return getattr(layers[0], "max_seq_len", None)
+
     def _try_ragged_prefill_logits(
         self,
         input_ids: Tensor,
         seq_lens: Tensor,
         row_indices: Tensor,
         logit_positions: Tensor,
+        context_len: int | None = None,
     ) -> Tensor | None:
         graph = getattr(self.model, "try_prefill_ragged_logits_graph", None)
         if graph is None:
@@ -838,6 +862,7 @@ class ContinuousBatchEngine:
             seq_lens=seq_lens,
             row_indices=row_indices,
             logit_positions=logit_positions,
+            context_len=context_len,
         )
         if logits is None:
             self.stats.prefill_graph_misses += 1
@@ -851,6 +876,7 @@ class ContinuousBatchEngine:
         seq_lens: Tensor,
         row_indices: Tensor,
         logit_positions: Tensor,
+        context_len: int | None = None,
     ) -> Tensor | None:
         eager = getattr(self.model, "prefill_ragged_logits", None)
         if eager is None:
@@ -861,6 +887,7 @@ class ContinuousBatchEngine:
             seq_lens=seq_lens,
             row_indices=row_indices,
             logit_positions=logit_positions,
+            context_len=context_len,
         )
 
     def _prefill_prefix_batch(

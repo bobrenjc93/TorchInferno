@@ -886,6 +886,7 @@ class _StaticRaggedPrefillLogitsGraphCall:
     cache: Llama3TensorParallelCache
     max_seq_len: int
     suffix_bucket: int
+    context_len: int | None
 
 
 @dataclass
@@ -1411,6 +1412,7 @@ class _Llama3TensorParallelLayer:
         write_positions: Tensor,
         row_indices: Tensor | None,
         next_norm_weight: Tensor,
+        context_len: int | None = None,
     ) -> tuple[Tensor, Tensor]:
         residual = hidden
         attention = self._attention_prefill_ragged(
@@ -1421,6 +1423,7 @@ class _Llama3TensorParallelLayer:
             start_positions,
             write_positions,
             row_indices,
+            context_len,
         )
         hidden, mlp_in = _tp_decode_add_rms_norm(
             attention,
@@ -1441,10 +1444,11 @@ class _Llama3TensorParallelLayer:
         start_positions: Tensor,
         write_positions: Tensor,
         row_indices: Tensor | None,
+        context_len: int | None = None,
     ) -> Tensor:
         # Multi-token ragged prefill of a suffix into scattered cache rows. Mirror
         # of _attention_decode_ragged but for T query tokens with per-token rotary
-        # and a per-row offset-causal attention mask. Dense backend only.
+        # and offset-causal attention (flash via context_len). Dense backend only.
         batch, tokens, _ = hidden.shape
         if attn_in is None:
             attn_in = _tp_decode_rms_norm(hidden, self.input_layernorm_weight, self.config.rms_norm_eps)
@@ -1460,6 +1464,7 @@ class _Llama3TensorParallelLayer:
             suffix_tokens=tokens,
             row_indices=row_indices,
             enable_gqa=enable_gqa,
+            context_len=context_len,
         )
         out = out.transpose(1, 2).contiguous().view(batch, tokens, self.local_hidden_size)
         return self._decode_linear_all_reduce(out, self.o_proj_weight, "attention", self.o_proj_weight_decode)
@@ -3573,6 +3578,7 @@ class Llama3TensorParallelForCausalLM:
         row_indices: Tensor | None,
         rotary: tuple[Tensor, Tensor],
         logit_positions: Tensor,
+        context_len: int | None = None,
     ) -> Tensor:
         batch = input_ids.size(0)
         hidden = F.embedding(input_ids.to(self.device, non_blocking=True), self.embed_tokens_weight)
@@ -3592,6 +3598,7 @@ class Llama3TensorParallelForCausalLM:
                 write_positions,
                 row_indices,
                 next_norm_weight,
+                context_len,
             )
         if attn_in is None:
             attn_in = _tp_decode_rms_norm(hidden, self.norm_weight, self.config.rms_norm_eps)
@@ -3608,6 +3615,7 @@ class Llama3TensorParallelForCausalLM:
         seq_lens: Tensor,
         row_indices: Tensor | None = None,
         logit_positions: Tensor,
+        context_len: int | None = None,
     ) -> Tensor:
         # Eager reference for the ragged-prefill graph: prefill a [batch, suffix]
         # block of tokens into scattered cache rows with per-row prefix offsets,
@@ -3651,6 +3659,7 @@ class Llama3TensorParallelForCausalLM:
             row_indices,
             rotary,
             logit_positions,
+            context_len,
         )
 
     def try_prefill_ragged_logits_graph(
@@ -3661,6 +3670,7 @@ class Llama3TensorParallelForCausalLM:
         seq_lens: Tensor,
         row_indices: Tensor | None = None,
         logit_positions: Tensor,
+        context_len: int | None = None,
         capture_on_miss: bool = True,
     ) -> Tensor | None:
         if self._ragged_prefill_logits_graph_failed or not _should_use_ragged_prefill_logits_graph(
@@ -3678,6 +3688,7 @@ class Llama3TensorParallelForCausalLM:
                 seq_lens=seq_lens,
                 row_indices=row_indices,
                 logit_positions=logit_positions,
+                context_len=context_len,
                 capture_on_miss=capture_on_miss,
             )
         except Exception as exc:
@@ -3695,6 +3706,7 @@ class Llama3TensorParallelForCausalLM:
         seq_lens: Tensor,
         row_indices: Tensor | None,
         logit_positions: Tensor,
+        context_len: int | None = None,
         capture_on_miss: bool = True,
     ) -> Tensor | None:
         if not cache.layers:
@@ -3705,6 +3717,7 @@ class Llama3TensorParallelForCausalLM:
             input_ids.size(1),
             cache.layers[0].max_seq_len,
             row_indices is not None,
+            context_len if context_len is not None else -1,
             _symm_mem_allreduce_graph_key(input_ids.size(0), _model_world_size(self)),
         )
         captured = self._ragged_prefill_logits_graphs.get(key)
@@ -3714,6 +3727,7 @@ class Llama3TensorParallelForCausalLM:
             or captured.max_seq_len != cache.layers[0].max_seq_len
             or captured.static_input_ids.shape != input_ids.shape
             or (captured.static_row_indices is None) != (row_indices is None)
+            or captured.context_len != context_len
         )
         skip_sync = bool(getattr(cache, "_skip_capture_sync", False))
         needs_capture = needs_capture if skip_sync else _capture_needed_on_any_rank(needs_capture, self.device)
@@ -3724,7 +3738,7 @@ class Llama3TensorParallelForCausalLM:
             new_captured: _StaticRaggedPrefillLogitsGraphCall | None = None
             try:
                 new_captured = self._capture_ragged_prefill_logits_graph(
-                    input_ids, cache, seq_lens, row_indices, logit_positions,
+                    input_ids, cache, seq_lens, row_indices, logit_positions, context_len,
                 )
             except Exception:
                 succeeded = False
@@ -3749,6 +3763,7 @@ class Llama3TensorParallelForCausalLM:
         seq_lens: Tensor,
         row_indices: Tensor | None,
         logit_positions: Tensor,
+        context_len: int | None = None,
     ) -> _StaticRaggedPrefillLogitsGraphCall:
         batch, suffix = input_ids.shape
         rotary_cache_dim = self.rotary_cos_cache.size(1)
@@ -3766,6 +3781,7 @@ class Llama3TensorParallelForCausalLM:
             cache=cache,
             max_seq_len=cache.layers[0].max_seq_len,
             suffix_bucket=suffix,
+            context_len=context_len,
         )
         self._copy_ragged_prefill_graph_inputs(captured, input_ids, seq_lens, row_indices, logit_positions)
         stream = torch.cuda.Stream(device=self.device)
@@ -3779,6 +3795,7 @@ class Llama3TensorParallelForCausalLM:
                 captured.static_row_indices,
                 (captured.static_rotary_cos, captured.static_rotary_sin),
                 captured.static_logit_positions,
+                context_len,
             )
         torch.cuda.current_stream(self.device).wait_stream(stream)
         with torch.cuda.graph(captured.graph):
@@ -3790,6 +3807,7 @@ class Llama3TensorParallelForCausalLM:
                 captured.static_row_indices,
                 (captured.static_rotary_cos, captured.static_rotary_sin),
                 captured.static_logit_positions,
+                context_len,
             )
         captured.graph.replay()
         return captured
@@ -4324,27 +4342,60 @@ def _ragged_prefill_scaled_dot_product_attention(
     suffix_tokens: int,
     row_indices: Tensor | None,
     enable_gqa: bool,
+    context_len: int | None = None,
 ) -> Tensor:
-    # Per-row offset-causal attention for a ragged prefill suffix. Query token j
-    # of row r sits at absolute position start[r]+j and attends keys [0,
-    # start[r]+j]. Because the mask is causal, a real query never attends KV at
-    # columns >= start[r]+real_suffix, so bucket-padded suffix columns (whose KV
-    # writes land past the real suffix) cannot leak into real-token logits. Pad
-    # QUERY rows (j >= real_suffix) still compute but are dropped downstream via
-    # logit_positions. The mask is [batch,1,T,max_seq]; for the short suffixes
-    # this batcher prefills it is cheap (a varlen kernel would avoid it for very
-    # long contexts -- an optional follow-up).
+    # Attention for a ragged prefill suffix on scattered cache rows.
+    #
+    # FAST PATH (context_len given, uniform prefix): keys [0:context_len] hold
+    # prefix+suffix for every row, so causal_lower_right(T, context_len) (query j
+    # attends keys [0, context_len - T + j] = [0, start + j]) is exactly the
+    # offset-causal mask AND uses a flash kernel with NO materialized
+    # [batch,heads,T,context_len] attention matrix -- essential because the
+    # boolean-mask math backend OOMs at large suffix x context. This is how the
+    # batch worker prefills fast; here we keep it with scattered rows.
+    #
+    # FALLBACK (context_len None, possibly MIXED per-row prefixes -- the eager
+    # CPU oracle): explicit per-row offset-causal boolean mask over the full
+    # cache. Correct for mixed starts; only used off the hot serving path.
     if row_indices is not None:
         k = cache_keys.index_select(0, row_indices)
         v = cache_values.index_select(0, row_indices)
     else:
         k = cache_keys[: q.size(0)]
         v = cache_values[: q.size(0)]
-    max_seq = k.size(2)
-    key_positions = torch.arange(max_seq, device=q.device)
+    if context_len is not None:
+        k = k[:, :, :context_len, :]
+        v = v[:, :, :context_len, :]
+        from torch.nn.attention.bias import causal_lower_right
+
+        return F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=causal_lower_right(suffix_tokens, context_len),
+            dropout_p=0.0,
+            is_causal=False,
+            enable_gqa=enable_gqa,
+        )
+    # Eager mask path only (never inside a graph -- the graph path always passes
+    # context_len). Supports MIXED per-row prefixes. Replace every key/value that
+    # a row has not written (column >= start+suffix) with zero via torch.where so
+    # the masked math-backend SDPA cannot propagate NaN out of uninitialized
+    # cache memory -- multiply-by-mask fails because NaN*0 == NaN, and the
+    # additive -inf bias fails because NaN + -inf == NaN.
+    start_positions = start_positions.to(device=q.device)
+    eff_len = int((start_positions + suffix_tokens).max().item())
+    eff_len = max(1, min(eff_len, k.size(2)))
+    k = k[:, :, :eff_len, :]
+    v = v[:, :, :eff_len, :]
+    key_positions = torch.arange(eff_len, device=q.device)
     query_offsets = torch.arange(suffix_tokens, device=q.device)
-    q_abs = start_positions.to(device=q.device)[:, None] + query_offsets[None, :]  # [batch, T]
-    mask = key_positions[None, None, :] <= q_abs[:, :, None]  # [batch, T, max_seq]
+    written = key_positions[None, :] < (start_positions[:, None] + suffix_tokens)  # [batch, eff_len]
+    zero = torch.zeros((), dtype=k.dtype, device=k.device)
+    k = torch.where(written[:, None, :, None], k, zero)
+    v = torch.where(written[:, None, :, None], v, zero)
+    q_abs = start_positions[:, None] + query_offsets[None, :]  # [batch, T]
+    mask = key_positions[None, None, :] <= q_abs[:, :, None]  # [batch, T, eff_len]
     return F.scaled_dot_product_attention(
         q,
         k,
