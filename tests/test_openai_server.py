@@ -684,12 +684,9 @@ def test_openai_engine_drains_tensor_parallel_direct_generator_on_close(monkeypa
 
 
 def test_openai_engine_tensor_parallel_primary_queues_single_stream_request(monkeypatch) -> None:
-    # This test exercises the batch-worker TP prompt-list path with a mocked
-    # primary model (no real dist workers). The online batcher is now the
-    # default for real TP, but it requires dist.is_initialized() so the mock
-    # falls through to the prompt-list path.
     monkeypatch.setattr("torchinferno.openai_server._is_tensor_parallel_primary_model", lambda model: True)
     monkeypatch.setenv("TORCHINFERNO_OPENAI_UNIFIED_SCHEDULER", "0")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_CONTINUOUS_BATCHER", "0")
     model = _BatchRecordingModel()
     engine = OpenAICompletionEngine(
         model,
@@ -10341,11 +10338,9 @@ def test_openai_tensor_parallel_online_batcher_drains_ready_requests(monkeypatch
             self.pending.clear()
             return events
 
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_CONTINUOUS_BATCHER", "1")
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_DECODE_QUANTUM", "1")
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_PREFIX_ROWS", "1")
-    import torch.distributed as _dist
-    monkeypatch.setattr(_dist, "is_initialized", lambda: True)
-    monkeypatch.setattr(_dist, "is_available", lambda: True)
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_MAX_SEQ_LEN_HEADROOM_TOKENS", "0")
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_PREFILL_TOKEN_BUDGET", "0")
     monkeypatch.setattr(
@@ -10433,9 +10428,7 @@ def test_openai_tensor_parallel_online_batcher_uses_queued_limit_for_default_row
             self.pending.clear()
             return events
 
-    import torch.distributed as _dist
-    monkeypatch.setattr(_dist, "is_initialized", lambda: True)
-    monkeypatch.setattr(_dist, "is_available", lambda: True)
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_CONTINUOUS_BATCHER", "1")
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_DECODE_QUANTUM", "1")
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_INITIAL_BATCH_WAIT_MS", "0")
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_IDLE_BATCH_WAIT_MS", "0")
@@ -10570,9 +10563,7 @@ def test_openai_tensor_parallel_online_batcher_sizes_cache_from_initial_window(
             self.pending.clear()
             return events
 
-    import torch.distributed as _dist
-    monkeypatch.setattr(_dist, "is_initialized", lambda: True)
-    monkeypatch.setattr(_dist, "is_available", lambda: True)
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_CONTINUOUS_BATCHER", "1")
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_DECODE_QUANTUM", "1")
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_INITIAL_BATCH_WAIT_MS", "0")
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_IDLE_BATCH_WAIT_MS", "0")
@@ -10676,9 +10667,7 @@ def test_openai_tensor_parallel_online_batcher_drains_after_short_step(monkeypat
                 engine._generation_queue.put(second)
             return events
 
-    import torch.distributed as _dist
-    monkeypatch.setattr(_dist, "is_initialized", lambda: True)
-    monkeypatch.setattr(_dist, "is_available", lambda: True)
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_CONTINUOUS_BATCHER", "1")
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_DECODE_QUANTUM", "1")
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_INITIAL_BATCH_WAIT_MS", "0")
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_IDLE_BATCH_WAIT_MS", "0")
