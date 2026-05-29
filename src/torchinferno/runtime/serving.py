@@ -69,6 +69,8 @@ class ServingStats:
     prefill_graph_hits: int = 0
     prefill_graph_misses: int = 0
     prefill_wall_ms: float = 0.0
+    prefill_copy_ms: float = 0.0
+    prefill_forward_ms: float = 0.0
     decode_ragged_prepare_ms: float = 0.0
     decode_ragged_model_ms: float = 0.0
     decode_ragged_cpu_tokens_ms: float = 0.0
@@ -762,6 +764,7 @@ class ContinuousBatchEngine:
         rows = [self._acquire_active_row() for _ in group]
         pad_rows: list[int] = []
         try:
+            copy_start_s = time.perf_counter() if self.profile_timings else 0.0
             self._copy_reusable_prefixes_to_rows(rows, group)
             padded_suffixes = [
                 [*suffix, *([0] * (suffix_bucket - len(suffix)))]
@@ -780,6 +783,8 @@ class ContinuousBatchEngine:
                     self._copy_prefix(dummy_prefix_row, pad_row, dummy_prefix_len)
                     padded_suffixes.append(list(dummy_suffix))
                     start_lens.append(dummy_prefix_len)
+            if self.profile_timings:
+                self.stats.prefill_copy_ms += (time.perf_counter() - copy_start_s) * 1000.0
             all_rows = rows + pad_rows
             input_ids = torch.tensor(padded_suffixes, device=self.device, dtype=torch.long)
             row_indices = torch.tensor(all_rows, device=self.device, dtype=torch.long)
@@ -793,6 +798,7 @@ class ContinuousBatchEngine:
                 device=self.device,
                 dtype=torch.long,
             )
+            forward_start_s = time.perf_counter() if self.profile_timings else 0.0
             logits = self._try_ragged_prefill_logits(
                 input_ids, seq_lens, row_indices, logit_positions, context_len
             )
@@ -800,6 +806,10 @@ class ContinuousBatchEngine:
                 logits = self._ragged_prefill_logits_eager(
                     input_ids, seq_lens, row_indices, logit_positions, context_len
                 )
+            if self.profile_timings and logits is not None:
+                # force the prefill graph/forward to complete for honest timing
+                torch.cuda.synchronize(self.device) if self.device.type == "cuda" else None
+                self.stats.prefill_forward_ms += (time.perf_counter() - forward_start_s) * 1000.0
             for pad_row in pad_rows:
                 self._release_active_row(pad_row)
             pad_rows = []

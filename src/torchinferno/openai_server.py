@@ -2477,6 +2477,8 @@ class OpenAICompletionEngine:
             "prefill_graph_hits",
             "prefill_graph_misses",
             "prefill_wall_ms",
+            "prefill_copy_ms",
+            "prefill_forward_ms",
             "decode_ragged_prepare_ms",
             "decode_ragged_model_ms",
             "decode_ragged_cpu_tokens_ms",
