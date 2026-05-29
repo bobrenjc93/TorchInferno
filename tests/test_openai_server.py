@@ -859,6 +859,7 @@ def test_tensor_parallel_worker_loop_handles_online_runtime_commands(monkeypatch
             enable_ragged_decode: bool = True,
             store_reusable_prefixes: bool = True,
             store_full_prompt_prefixes: bool = True,
+            pin_shared_prefix: bool = False,
         ) -> None:
             self.init_args = (
                 model,
@@ -951,6 +952,7 @@ def test_tensor_parallel_worker_loop_receives_online_tensor_commands(monkeypatch
             enable_ragged_decode: bool = True,
             store_reusable_prefixes: bool = True,
             store_full_prompt_prefixes: bool = True,
+            pin_shared_prefix: bool = False,
         ) -> None:
             self.init_args = (
                 model,

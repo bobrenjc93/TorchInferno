@@ -2138,6 +2138,7 @@ class OpenAICompletionEngine:
             enable_ragged_decode=enable_ragged_decode,
             store_reusable_prefixes=store_reusable_prefixes,
             store_full_prompt_prefixes=store_full_prompt_prefixes,
+            pin_shared_prefix=env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_PIN_SHARED_PREFIX", True),
             profile_timings=bool(self._queue_profile_path_value()),
         )
         add_phase("engine_create_ms", engine_create_start_s)
@@ -9719,6 +9720,7 @@ def _tensor_parallel_worker_loop(engine: OpenAICompletionEngine) -> None:
                     enable_ragged_decode=bool(payload.get("enable_ragged_decode", True)),
                     store_reusable_prefixes=bool(payload.get("store_reusable_prefixes", True)),
                     store_full_prompt_prefixes=bool(payload.get("store_full_prompt_prefixes", True)),
+                    pin_shared_prefix=env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_PIN_SHARED_PREFIX", True),
                 )
                 worker_shared_cache = getattr(engine, "_persistent_serving_cache", None)
                 if worker_shared_cache is None:

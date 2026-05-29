@@ -209,6 +209,7 @@ class ContinuousBatchEngine:
         enable_ragged_decode: bool = True,
         store_reusable_prefixes: bool = True,
         store_full_prompt_prefixes: bool = True,
+        pin_shared_prefix: bool = False,
         profile_timings: bool = False,
     ) -> None:
         if max_active_requests < 1:
@@ -235,9 +236,15 @@ class ContinuousBatchEngine:
         self.enable_ragged_decode = enable_ragged_decode
         self.store_reusable_prefixes = store_reusable_prefixes
         self.store_full_prompt_prefixes = store_full_prompt_prefixes
+        # When pinning is on, the engine caches ONLY shared common prefixes and
+        # pins them against eviction, skipping per-request full-prompt stores
+        # that would otherwise starve the prefix-row pool and shadow the shared
+        # prefix in the radix tree (preventing cross-batch reuse).
+        self.pin_shared_prefix = pin_shared_prefix
         self.profile_timings = profile_timings
         self.prefix_cache = PrefixCacheIndex()
         self.reusable_prefixes: dict[Hashable, _ReusablePrefix] = {}
+        self._pinned_prefix_routes: set[Hashable] = set()
         self.stats = ServingStats()
         self._cache: object | None = None
         self._cache_views: dict[tuple[int, ...], object] = {}
@@ -382,6 +389,7 @@ class ContinuousBatchEngine:
         self.prefix_cache = PrefixCacheIndex()
         self.reusable_prefixes = {}
         self._prefix_order = []
+        self._pinned_prefix_routes = set()
         self._cache_views = {}
         self._reported_static_graph_miss = False
         total_rows = self.max_active_requests + self.prefix_cache_capacity
@@ -533,13 +541,16 @@ class ContinuousBatchEngine:
             self._record_model_call("prefill", 1, tokens=prefix_ids.numel())
             self.stats.prefill_common_prefix_batches += 1
             prefix_tuple = tuple(group[0][1].prompt[:prefix_tokens])
+            common_route = ("common_prefix", prefix_tuple)
             self._store_reusable_prefix_tokens(
-                ("common_prefix", prefix_tuple),
+                common_route,
                 "__common_prefix__",
                 prefix_tuple,
                 prefix_row,
                 prefix_logits,
             )
+            if self.pin_shared_prefix and common_route in self.reusable_prefixes:
+                self._pinned_prefix_routes.add(common_route)
 
             padded_active = self._prefill_common_prefix_padded_suffix_batch(
                 group,
@@ -869,7 +880,12 @@ class ContinuousBatchEngine:
         return active
 
     def _can_padded_batch_prefill(self, group: list[tuple[int, ServingRequest, int]]) -> bool:
-        if not env_flag("TORCHINFERNO_CONTINUOUS_PADDED_BATCH_PREFILL", True):
+        # Off by default: it forces seq_len=len(prompt) and changes prefill
+        # grouping, which differs from _prefill_batch for skewed-seq-len models.
+        # The shared-prefix workloads we care about use the common-prefix path
+        # (and cross-batch prefix pinning) instead. Available via env when a
+        # workload has no shared prefix but similar suffix lengths.
+        if not env_flag("TORCHINFERNO_CONTINUOUS_PADDED_BATCH_PREFILL", False):
             return False
         if not callable(getattr(self.model, "forward", None)):
             return False
@@ -923,6 +939,7 @@ class ContinuousBatchEngine:
         for row_index, (original_index, request, prefix_hit_tokens) in enumerate(group):
             row = rows[row_index]
             seq_len = len(request.prompt)
+            self._store_reusable_prefix(request.request_id, request.prompt, row, logits[row_index : row_index + 1])
             next_token = int(next_tokens[row_index])
             state = _ActiveRequest(
                 original_index=original_index,
@@ -1201,6 +1218,11 @@ class ContinuousBatchEngine:
     def _store_reusable_prefix(self, request_id: str, tokens: tuple[int, ...], source_row: int, logits: Tensor) -> None:
         if not self.store_full_prompt_prefixes:
             return
+        if self.pin_shared_prefix:
+            # Per-request full-prompt stores would starve the prefix-row pool and
+            # shadow the pinned shared prefix in the radix tree, defeating
+            # cross-batch reuse. Skip them; only shared common prefixes are cached.
+            return
         self._store_reusable_prefix_tokens(None, request_id, tokens, source_row, logits)
 
     def _store_reusable_prefix_tokens(
@@ -1221,6 +1243,8 @@ class ContinuousBatchEngine:
                 self._prefix_order.remove(entry.route_id)
             self._free_prefix_rows.append(old_prefix.row)
             self._free_prefix_rows.sort()
+        # Drop any stale pin; the caller re-pins after a successful re-store.
+        self._pinned_prefix_routes.discard(entry.route_id)
         prefix_row = self._acquire_prefix_row()
         if prefix_row is None:
             return
@@ -1332,12 +1356,17 @@ class ContinuousBatchEngine:
             return None
         if self._free_prefix_rows:
             return self._free_prefix_rows.pop()
-        while self._prefix_order:
-            route_id = self._prefix_order.pop(0)
+        # Evict the oldest UNPINNED reusable prefix. Pinned routes (the active
+        # shared prefix) are skipped so their KV stays a valid copy source.
+        for index, route_id in enumerate(self._prefix_order):
+            if route_id in self._pinned_prefix_routes:
+                continue
+            self._prefix_order.pop(index)
             prefix = self.reusable_prefixes.pop(route_id, None)
             if prefix is not None:
                 self._clear_physical_row(prefix.row)
                 return prefix.row
+            return self._acquire_prefix_row()
         return None
 
     def _release_prefix_row(self, row: int) -> None:

@@ -439,6 +439,53 @@ def test_continuous_batch_engine_prefix_reuse_matches_full_prefill() -> None:
     assert reuse_engine.stats.prefix_reuse_tokens == 3
 
 
+def test_continuous_batch_engine_pins_shared_prefix_across_batches() -> None:
+    # With pin_shared_prefix, a recurring shared prompt prefix is prefilled once
+    # and reused across separate scheduler batches (the online-batcher case),
+    # while producing the same tokens as a full per-request prefill.
+    torch.manual_seed(56)
+    config = tiny_deepseek_v32_config(vocab_size=64, max_position_embeddings=64)
+    model = DeepSeekV32ForCausalLM(config).eval()
+    shared = tuple(range(1, 17))  # 16-token shared prefix (>= min_prefix_tokens)
+    pinned = ContinuousBatchEngine(
+        model,
+        device=torch.device("cpu"),
+        cache_backend="paged",
+        page_size=4,
+        max_active_requests=4,
+        prefix_cache_capacity=8,
+        pin_shared_prefix=True,
+    )
+    # Batch 0 (arrival_step 0) establishes the shared prefix; batch 1
+    # (arrival_step 1) must reuse it rather than re-prefill it.
+    results = pinned.run(
+        [
+            ServingRequest("b0-a", (*shared, 20), 1, arrival_step=0),
+            ServingRequest("b0-b", (*shared, 21), 1, arrival_step=0),
+            ServingRequest("b1-a", (*shared, 22), 1, arrival_step=1),
+            ServingRequest("b1-b", (*shared, 23), 1, arrival_step=1),
+        ]
+    )
+    by_id = {r.request_id: r for r in results}
+    # The second-batch requests reuse the pinned 16-token prefix.
+    assert by_id["b1-a"].prefix_hit_tokens == len(shared)
+    assert by_id["b1-b"].prefix_hit_tokens == len(shared)
+    assert pinned.stats.prefix_reuse_requests >= 2
+    # The shared prefix is prefilled exactly once across both batches.
+    assert pinned.stats.prefill_common_prefix_batches == 1
+
+    # Outputs match a full per-request prefill (no reuse) baseline.
+    baseline = ContinuousBatchEngine(
+        model,
+        device=torch.device("cpu"),
+        cache_backend="paged",
+        page_size=4,
+        max_active_requests=1,
+    )
+    base = baseline.run([ServingRequest("b1-a", (*shared, 22), 1, arrival_step=0)])
+    assert by_id["b1-a"].tokens == base[0].tokens
+
+
 def test_continuous_batch_engine_does_not_report_hit_without_prefix_storage() -> None:
     torch.manual_seed(55)
     config = tiny_deepseek_v32_config(vocab_size=32, max_position_embeddings=16)
