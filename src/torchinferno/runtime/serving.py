@@ -71,6 +71,9 @@ class ServingStats:
     prefill_wall_ms: float = 0.0
     prefill_copy_ms: float = 0.0
     prefill_forward_ms: float = 0.0
+    prefill_setup_ms: float = 0.0
+    prefill_sample_ms: float = 0.0
+    prefill_state_ms: float = 0.0
     decode_ragged_prepare_ms: float = 0.0
     decode_ragged_model_ms: float = 0.0
     decode_ragged_cpu_tokens_ms: float = 0.0
@@ -785,6 +788,7 @@ class ContinuousBatchEngine:
                     start_lens.append(dummy_prefix_len)
             if self.profile_timings:
                 self.stats.prefill_copy_ms += (time.perf_counter() - copy_start_s) * 1000.0
+            setup_start_s = time.perf_counter() if self.profile_timings else 0.0
             all_rows = rows + pad_rows
             input_ids = torch.tensor(padded_suffixes, device=self.device, dtype=torch.long)
             row_indices = torch.tensor(all_rows, device=self.device, dtype=torch.long)
@@ -798,6 +802,8 @@ class ContinuousBatchEngine:
                 device=self.device,
                 dtype=torch.long,
             )
+            if self.profile_timings:
+                self.stats.prefill_setup_ms += (time.perf_counter() - setup_start_s) * 1000.0
             forward_start_s = time.perf_counter() if self.profile_timings else 0.0
             logits = self._try_ragged_prefill_logits(
                 input_ids, seq_lens, row_indices, logit_positions, context_len
@@ -820,7 +826,11 @@ class ContinuousBatchEngine:
             self._record_model_call("prefill", count, tokens=count * max(suffix_lengths))
             self.stats.prefill_prefix_reuse_batches += 1
             self.stats.prefill_padded_suffix_batches += 1
+            sample_start_s = time.perf_counter() if self.profile_timings else 0.0
             next_tokens = self._sample_logits(logits[:, -1, :]).detach().cpu().tolist()
+            if self.profile_timings:
+                self.stats.prefill_sample_ms += (time.perf_counter() - sample_start_s) * 1000.0
+            state_start_s = time.perf_counter() if self.profile_timings else 0.0
             active: list[_ActiveRequest] = []
             for row_index, (original_index, request, prefix_hit_tokens, _reusable) in enumerate(group):
                 row = rows[row_index]
@@ -840,6 +850,8 @@ class ContinuousBatchEngine:
                 )
                 self._record_token_event(events, state, next_token, step, finished=self._should_finish_before_decode(state))
                 active.append(state)
+            if self.profile_timings:
+                self.stats.prefill_state_ms += (time.perf_counter() - state_start_s) * 1000.0
             return active
         except Exception:
             for pad_row in pad_rows:
@@ -1866,16 +1878,13 @@ class ContinuousBatchEngine:
     def _set_cache_row_seq_len(self, row: int, seq_len: int) -> None:
         self._remember_row_seq_len(row, seq_len)
         cache = self._require_cache()
-        cache_view = getattr(cache, "for_rows", None)
-        if callable(cache_view):
-            try:
-                view = cache_view((row,))
-                setter = getattr(view, "set_seq_len", None)
-                if callable(setter):
-                    setter(int(seq_len))
-                    return
-            except Exception:
-                pass
+        # Cheap path FIRST: set the per-layer seq_len list (and per-layer setter)
+        # directly. The for_rows-view path below builds an UNCACHED view with a
+        # fresh GPU index tensor on every call -- when run once per row in the
+        # prefill/decode state loops that allocation dominated wall time (~49% of
+        # prefill). The direct list write is pure Python and equivalent for the
+        # dense cache; the view path stays as a fallback for backends (e.g.
+        # paged) that manage seq_len behind a view.
         layers = tuple(getattr(cache, "layers", ()) or ())
         changed = False
         for layer in layers:
@@ -1896,6 +1905,16 @@ class ContinuousBatchEngine:
                 changed = True
         if changed:
             return
+        cache_view = getattr(cache, "for_rows", None)
+        if callable(cache_view):
+            try:
+                view = self._cache_view([row])
+                setter = getattr(view, "set_seq_len", None)
+                if callable(setter):
+                    setter(int(seq_len))
+                    return
+            except Exception:
+                pass
         seq_lens = getattr(cache, "_seq_lens", None)
         if isinstance(seq_lens, list) and 0 <= row < len(seq_lens):
             seq_lens[row] = int(seq_len)
