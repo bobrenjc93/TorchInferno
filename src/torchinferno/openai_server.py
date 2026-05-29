@@ -2825,7 +2825,7 @@ class OpenAICompletionEngine:
                     )
                 try:
                     early_restart = (lambda: True) if env_flag(
-                        "TORCHINFERNO_OPENAI_BATCH_EARLY_RESTART", True
+                        "TORCHINFERNO_OPENAI_BATCH_EARLY_RESTART", False
                     ) else None
                     step_iter = self._generate_prompt_list_batch_steps(
                         prompts,
@@ -9848,7 +9848,7 @@ def _tensor_parallel_worker_loop(engine: OpenAICompletionEngine) -> None:
                 if "input_id_lists" in payload:
                     if bool(payload.get("stream", True)):
                         worker_early_restart = (lambda: True) if env_flag(
-                            "TORCHINFERNO_OPENAI_BATCH_EARLY_RESTART", True
+                            "TORCHINFERNO_OPENAI_BATCH_EARLY_RESTART", False
                         ) else None
                         iterator = engine._generate_prompt_list_batch_steps(
                             payload["input_id_lists"],
