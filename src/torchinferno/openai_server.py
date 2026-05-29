@@ -2835,18 +2835,6 @@ class OpenAICompletionEngine:
                         emit_start_s = self._stream_group_profile_start_s()
                         _emit_stream_step(group, step, step_tokens, getattr(self, "stop_token_ids", frozenset()))
                         self._add_stream_group_profile_elapsed("stream_emit_ms", emit_start_s)
-                        # Mid-batch early restart: when a request hits a stop token
-                        # and new requests are waiting, break the decode loop so
-                        # the batch worker's outer loop can restart with the
-                        # remaining live requests plus new arrivals. This bounds
-                        # queue-wait to the time until the first batch completion
-                        # rather than the time until ALL requests finish.
-                        if (
-                            env_flag("TORCHINFERNO_OPENAI_BATCH_EARLY_RESTART", False)
-                            and not self._generation_queue.empty()
-                            and any(request.done for request in group)
-                        ):
-                            break
                 finally:
                     _sync_tensor_parallel_command(
                         self.model,
