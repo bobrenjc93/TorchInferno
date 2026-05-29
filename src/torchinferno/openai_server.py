@@ -1764,7 +1764,10 @@ class OpenAICompletionEngine:
         prompt_tokens = env_int("TORCHINFERNO_OPENAI_WARMUP_PROMPT_TOKENS", 32, minimum=1)
         # Decode touches only active rows (<= max_active), addressed via row
         # indices, so warm the active-range buckets, not the full cache size.
-        batch_sizes = sorted({1, max_active} & set(range(1, cache_batch + 1)))
+        batch_sizes = sorted(
+            {1, 2, 4, 8, 16, 32, 48, 64, max_active, cache_batch}
+            & set(range(1, cache_batch + 1))
+        )
         with _tensor_parallel_symm_mem_allreduce_scope(
             self.model, self.device, max_tokens=1, temperature=0.0,
         ):
