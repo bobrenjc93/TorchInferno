@@ -797,6 +797,40 @@ def test_continuous_batch_engine_graph_prefill_buckets_batch_and_matches() -> No
     assert engine.stats.prefix_reuse_requests >= 3
 
 
+def test_continuous_batch_engine_chunked_prefill_matches_one_shot() -> None:
+    # Chunked prefill (prefill_chunk_size) advances a prompt in bounded chunks
+    # across online steps; it must produce identical tokens to one-shot prefill.
+    shared = tuple(range(16))
+    prompt = (*shared, 20, 21, 22, 23, 24, 25, 26)  # long suffix -> several chunks
+
+    def run_online(chunk: int | None) -> list[int]:
+        model = _SelectedLogitsToyModel()
+        engine = ContinuousBatchEngine(
+            model,
+            device=torch.device("cpu"),
+            max_active_requests=4,
+            prefix_cache_capacity=4,
+            pin_shared_prefix=True,
+            graph_prefill=True,
+            prefill_chunk_size=chunk,
+        )
+        engine.start_online(max_seq_len=64)
+        engine.submit_online(ServingRequest("a", prompt, 3, arrival_step=0))
+        tokens: list[int] = []
+        steps = 0
+        while engine.has_online_work() and steps < 200:
+            for event in engine.step_online():
+                if event.request_id == "a":
+                    tokens.append(event.token)
+            steps += 1
+        return tokens
+
+    one_shot = run_online(None)
+    chunked = run_online(3)
+    assert len(one_shot) == 3
+    assert chunked == one_shot
+
+
 def test_continuous_batch_engine_can_keep_common_prefix_without_full_prompt_entries(
     monkeypatch,
 ) -> None:

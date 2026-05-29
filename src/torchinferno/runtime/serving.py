@@ -106,6 +106,14 @@ class _ActiveRequest:
     seq_len: int
     prefix_hit_tokens: int
     started_step: int
+    # Chunked prefill: a request stays in the 'prefilling' phase, advancing
+    # prompt_cursor by a bounded chunk each step (so a long prompt does not stall
+    # decode in one shot), until prompt_cursor == len(prompt), then it samples its
+    # first token and flips to 'decoding'. Default 'decoding' preserves the
+    # one-shot-prefill path when chunking is off.
+    phase: str = "decoding"
+    prompt_cursor: int = 0
+    prefix_source_row: int = -1  # reusable-prefix source row (first chunk folds its copy)
 
 
 def _contiguous_int_span(values: tuple[int, ...]) -> tuple[int, int] | None:
@@ -210,6 +218,7 @@ class ContinuousBatchEngine:
         max_active_requests: int = 16,
         prefix_cache_capacity: int | None = None,
         prefill_token_budget: int | None = None,
+        prefill_chunk_size: int | None = None,
         decode_first: bool = True,
         enable_ragged_decode: bool = True,
         store_reusable_prefixes: bool = True,
@@ -238,6 +247,11 @@ class ContinuousBatchEngine:
         self.max_active_requests = max_active_requests
         self.prefix_cache_capacity = max_active_requests if prefix_cache_capacity is None else prefix_cache_capacity
         self.prefill_token_budget = prefill_token_budget
+        # Chunked prefill: when set, an admitted request prefills its suffix in
+        # bounded chunks of this many tokens across steps (interleaved with
+        # decode) instead of in one shot, bounding how long a long prompt's
+        # prefill stalls the active decode batch. None preserves one-shot prefill.
+        self.prefill_chunk_size = prefill_chunk_size
         self.decode_first = decode_first
         self.enable_ragged_decode = enable_ragged_decode
         self.store_reusable_prefixes = store_reusable_prefixes
@@ -268,6 +282,7 @@ class ContinuousBatchEngine:
         self._prefix_order: list[Hashable] = []
         self._online_waiting: ServingQueue | None = None
         self._online_active: list[_ActiveRequest] = []
+        self._online_prefilling: list[_ActiveRequest] = []
         self._online_step = 0
         self._online_next_index = 0
 
@@ -358,12 +373,12 @@ class ContinuousBatchEngine:
 
     def has_online_work(self) -> bool:
         waiting = self._online_waiting
-        return bool(waiting) or bool(self._online_active)
+        return bool(waiting) or bool(self._online_active) or bool(self._online_prefilling)
 
     @torch.inference_mode()
     def step_online(self) -> list[ServingTokenEvent]:
         waiting = self._require_online_waiting()
-        if not waiting and not self._online_active:
+        if not waiting and not self._online_active and not self._online_prefilling:
             return []
         events: list[ServingTokenEvent] = []
         step = self._online_step
@@ -372,10 +387,21 @@ class ContinuousBatchEngine:
         if self.decode_first and active:
             _decoded_results, active = self._decode_active(active, step, events=events)
 
-        admitted = self._admit_ready_requests(waiting, step, len(active))
+        # Advance in-flight chunked prefills by one bounded chunk; rows that
+        # complete their prompt sample a first token and join the decode set. A
+        # long prompt therefore stalls the decode batch by at most one chunk per
+        # step instead of its whole suffix in one shot.
+        if self.prefill_chunk_size and self._online_prefilling:
+            active.extend(self._advance_prefilling(step, events=events))
+
+        occupied = len(active) + len(self._online_prefilling)
+        admitted = self._admit_ready_requests(waiting, step, occupied)
         if admitted:
-            _admitted_results, admitted_active = self._prefill_many(admitted, step, events=events)
-            active.extend(admitted_active)
+            if self.prefill_chunk_size:
+                self._admit_to_prefilling(admitted, step)
+            else:
+                _admitted_results, admitted_active = self._prefill_many(admitted, step, events=events)
+                active.extend(admitted_active)
 
         if not self.decode_first and active:
             _decoded_results, active = self._decode_active(active, step + 1, events=events)
@@ -383,9 +409,121 @@ class ContinuousBatchEngine:
         self._online_step = step + 1
 
         next_arrival_step = waiting.next_arrival_step()
-        if next_arrival_step is not None and not active and next_arrival_step > self._online_step:
+        idle = not active and not self._online_prefilling
+        if next_arrival_step is not None and idle and next_arrival_step > self._online_step:
             self._online_step = next_arrival_step
         return events
+
+    def _admit_to_prefilling(self, admitted: list[tuple[int, ServingRequest]], step: int) -> None:
+        # Create a 'prefilling' state per admitted request without running any
+        # model forward; the chunk advance does the prefill incrementally. The
+        # shared-prefix KV copy is deferred to (and folded into) the first chunk.
+        for original_index, request in admitted:
+            if request.max_new_tokens == 0:
+                continue
+            match, entry = self.prefix_cache.lookup(request.prompt)
+            reusable = self.reusable_prefixes.get(entry.route_id) if entry is not None else None
+            prefix_hit = match.depth if (reusable is not None and match.depth > 0) else 0
+            source_row = reusable.row if (reusable is not None and prefix_hit > 0) else -1
+            if prefix_hit >= len(request.prompt):
+                prefix_hit = max(0, len(request.prompt) - 1)
+            row = self._acquire_active_row()
+            if prefix_hit > 0:
+                self.stats.prefix_reuse_requests += 1
+                self.stats.prefix_reuse_tokens += prefix_hit
+            state = _ActiveRequest(
+                original_index=original_index,
+                request=request,
+                tokens=list(request.prompt),
+                generated=0,
+                row=row,
+                last_token=request.prompt[-1],
+                seq_len=prefix_hit,
+                prefix_hit_tokens=prefix_hit,
+                started_step=step,
+                phase="prefilling",
+                prompt_cursor=prefix_hit,
+                prefix_source_row=source_row,
+            )
+            self._online_prefilling.append(state)
+
+    def _advance_prefilling(self, step: int, events: list[ServingTokenEvent] | None) -> list[_ActiveRequest]:
+        chunk = int(self.prefill_chunk_size or 0)
+        if chunk <= 0 or not self._online_prefilling:
+            return []
+        # Group by (prefix length, cursor, prefix source) so every row in a group
+        # shares one absolute start -> the flash context_len path applies, and the
+        # first chunk of a group folds the shared-prefix copy from one source row.
+        groups: dict[tuple[int, int, int], list[_ActiveRequest]] = defaultdict(list)
+        for state in self._online_prefilling:
+            groups[(state.prefix_hit_tokens, state.prompt_cursor, state.prefix_source_row)].append(state)
+        newly_decoding: list[_ActiveRequest] = []
+        still_prefilling: list[_ActiveRequest] = []
+        for (prefix_hit, cursor, source_row), states in groups.items():
+            finished, pending = self._prefill_chunk_group(states, cursor, source_row, chunk, step, events)
+            newly_decoding.extend(finished)
+            still_prefilling.extend(pending)
+        self._online_prefilling = still_prefilling
+        return newly_decoding
+
+    def _prefill_chunk_group(
+        self,
+        states: list[_ActiveRequest],
+        cursor: int,
+        source_row: int,
+        chunk: int,
+        step: int,
+        events: list[ServingTokenEvent] | None,
+    ) -> tuple[list[_ActiveRequest], list[_ActiveRequest]]:
+        chunk_lens = [min(chunk, len(s.request.prompt) - cursor) for s in states]
+        chunk_bucket = self._suffix_bucket(max(chunk_lens))
+        cache_max_seq = self._cache_max_seq_len()
+        if cache_max_seq is not None:
+            chunk_bucket = min(chunk_bucket, max(1, cache_max_seq - cursor))
+        context_len = cursor + chunk_bucket
+        chunks = [s.request.prompt[cursor : cursor + n] for s, n in zip(states, chunk_lens)]
+        padded = [[*c, *([0] * (chunk_bucket - len(c)))] for c in chunks]
+        rows = [s.row for s in states]
+        input_ids = torch.tensor(padded, device=self.device, dtype=torch.long)
+        row_indices = torch.tensor(rows, device=self.device, dtype=torch.long)
+        required = max(rows + ([source_row] if source_row >= 0 else [0])) + 1
+        seq_lens_list = [0] * required
+        for row in rows:
+            seq_lens_list[row] = cursor
+        seq_lens = torch.tensor(seq_lens_list, device=self.device, dtype=torch.long)
+        logit_positions = torch.tensor([n - 1 for n in chunk_lens], device=self.device, dtype=torch.long)
+        # Fold the prefix copy only on the FIRST chunk of a reused prefix.
+        src_prefix_row = None
+        if source_row >= 0 and cursor == states[0].prefix_hit_tokens and cursor > 0:
+            src_prefix_row = torch.tensor([source_row], device=self.device, dtype=torch.long)
+        logits = self._try_ragged_prefill_logits(
+            input_ids, seq_lens, row_indices, logit_positions, context_len, src_prefix_row
+        )
+        if logits is None:
+            logits = self._ragged_prefill_logits_eager(
+                input_ids, seq_lens, row_indices, logit_positions, context_len, src_prefix_row
+            )
+        self._record_model_call("prefill", len(states), tokens=sum(chunk_lens))
+        self.stats.prefill_prefix_reuse_batches += 1
+        next_tokens = self._sample_logits(logits[:, -1, :]).detach().cpu().tolist()
+        finished: list[_ActiveRequest] = []
+        pending: list[_ActiveRequest] = []
+        for index, state in enumerate(states):
+            new_cursor = cursor + chunk_lens[index]
+            state.prompt_cursor = new_cursor
+            self._set_cache_row_seq_len(state.row, new_cursor)
+            state.seq_len = new_cursor
+            if new_cursor >= len(state.request.prompt):
+                next_token = int(next_tokens[index])
+                state.tokens.append(next_token)
+                state.generated = 1
+                state.last_token = next_token
+                state.phase = "decoding"
+                self._record_token_event(events, state, next_token, step, finished=self._should_finish_before_decode(state))
+                finished.append(state)
+            else:
+                pending.append(state)
+        return finished, pending
 
     def _reset_run_state(self, requests: list[ServingRequest]) -> None:
         max_seq_len = max((len(request.prompt) + request.max_new_tokens for request in requests), default=1)
@@ -419,6 +557,7 @@ class ContinuousBatchEngine:
         self.stats.queued_requests = queued_requests
         self._online_waiting = None
         self._online_active = []
+        self._online_prefilling = []
         self._online_step = 0
         self._online_next_index = 0
 

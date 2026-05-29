@@ -861,6 +861,7 @@ def test_tensor_parallel_worker_loop_handles_online_runtime_commands(monkeypatch
             store_full_prompt_prefixes: bool = True,
             pin_shared_prefix: bool = False,
             graph_prefill: bool = False,
+            prefill_chunk_size: int | None = None,
         ) -> None:
             self.init_args = (
                 model,
@@ -955,6 +956,7 @@ def test_tensor_parallel_worker_loop_receives_online_tensor_commands(monkeypatch
             store_full_prompt_prefixes: bool = True,
             pin_shared_prefix: bool = False,
             graph_prefill: bool = False,
+            prefill_chunk_size: int | None = None,
         ) -> None:
             self.init_args = (
                 model,
