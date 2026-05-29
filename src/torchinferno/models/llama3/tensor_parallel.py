@@ -882,6 +882,7 @@ class _StaticRaggedPrefillLogitsGraphCall:
     static_rotary_cos: Tensor  # [batch, suffix_bucket, rotary_dim]
     static_rotary_sin: Tensor  # [batch, suffix_bucket, rotary_dim]
     static_logit_positions: Tensor  # [batch] real last-token index per row
+    static_src_prefix_row: Tensor | None  # [1] shared-prefix source row (folded copy)
     output_logits: Tensor  # [batch, 1, local_vocab_size]
     cache: Llama3TensorParallelCache
     max_seq_len: int
@@ -3579,8 +3580,27 @@ class Llama3TensorParallelForCausalLM:
         rotary: tuple[Tensor, Tensor],
         logit_positions: Tensor,
         context_len: int | None = None,
+        src_prefix_row: Tensor | None = None,
     ) -> Tensor:
         batch = input_ids.size(0)
+        # Fold the shared-prefix KV broadcast INTO the graph: copy the prefix
+        # [0:prefix_len] from one source row into every active row, per layer,
+        # via advanced indexing. Captured once, replayed in one launch -- removes
+        # the ~80 per-layer index_copy launches/batch (the dominant remaining
+        # prefill cost) that the engine used to issue eagerly. src_prefix_row is
+        # a copied-in [1] device tensor so replay re-targets a new prefix row;
+        # row_indices re-targets new dest rows. When None (eager oracle), the
+        # prefix is assumed already resident and no copy is done.
+        if src_prefix_row is not None and row_indices is not None and context_len is not None:
+            prefix_len = context_len - input_ids.size(1)
+            if prefix_len > 0:
+                for layer in cache.layers:
+                    layer.keys[row_indices, :, :prefix_len, :] = layer.keys.index_select(
+                        0, src_prefix_row
+                    )[:, :, :prefix_len, :]
+                    layer.values[row_indices, :, :prefix_len, :] = layer.values.index_select(
+                        0, src_prefix_row
+                    )[:, :, :prefix_len, :]
         hidden = F.embedding(input_ids.to(self.device, non_blocking=True), self.embed_tokens_weight)
         attn_in: Tensor | None = None
         for layer_id, layer in enumerate(self.layers):
@@ -3616,6 +3636,7 @@ class Llama3TensorParallelForCausalLM:
         row_indices: Tensor | None = None,
         logit_positions: Tensor,
         context_len: int | None = None,
+        src_prefix_row: Tensor | None = None,
     ) -> Tensor:
         # Eager reference for the ragged-prefill graph: prefill a [batch, suffix]
         # block of tokens into scattered cache rows with per-row prefix offsets,
@@ -3651,6 +3672,8 @@ class Llama3TensorParallelForCausalLM:
             self.rotary_cos_cache.index_select(0, write_positions.reshape(-1)).view(batch, suffix, -1),
             self.rotary_sin_cache.index_select(0, write_positions.reshape(-1)).view(batch, suffix, -1),
         )
+        if src_prefix_row is not None:
+            src_prefix_row = src_prefix_row.to(self.device, non_blocking=True)
         return self._forward_prefill_ragged_static(
             input_ids,
             cache,
@@ -3660,6 +3683,7 @@ class Llama3TensorParallelForCausalLM:
             rotary,
             logit_positions,
             context_len,
+            src_prefix_row,
         )
 
     def try_prefill_ragged_logits_graph(
@@ -3671,6 +3695,7 @@ class Llama3TensorParallelForCausalLM:
         row_indices: Tensor | None = None,
         logit_positions: Tensor,
         context_len: int | None = None,
+        src_prefix_row: Tensor | None = None,
         capture_on_miss: bool = True,
     ) -> Tensor | None:
         if self._ragged_prefill_logits_graph_failed or not _should_use_ragged_prefill_logits_graph(
@@ -3689,6 +3714,7 @@ class Llama3TensorParallelForCausalLM:
                 row_indices=row_indices,
                 logit_positions=logit_positions,
                 context_len=context_len,
+                src_prefix_row=src_prefix_row,
                 capture_on_miss=capture_on_miss,
             )
         except Exception as exc:
@@ -3707,6 +3733,7 @@ class Llama3TensorParallelForCausalLM:
         row_indices: Tensor | None,
         logit_positions: Tensor,
         context_len: int | None = None,
+        src_prefix_row: Tensor | None = None,
         capture_on_miss: bool = True,
     ) -> Tensor | None:
         if not cache.layers:
@@ -3718,6 +3745,7 @@ class Llama3TensorParallelForCausalLM:
             cache.layers[0].max_seq_len,
             row_indices is not None,
             context_len if context_len is not None else -1,
+            src_prefix_row is not None,
             _symm_mem_allreduce_graph_key(input_ids.size(0), _model_world_size(self)),
         )
         captured = self._ragged_prefill_logits_graphs.get(key)
@@ -3728,6 +3756,7 @@ class Llama3TensorParallelForCausalLM:
             or captured.static_input_ids.shape != input_ids.shape
             or (captured.static_row_indices is None) != (row_indices is None)
             or captured.context_len != context_len
+            or (captured.static_src_prefix_row is None) != (src_prefix_row is None)
         )
         skip_sync = bool(getattr(cache, "_skip_capture_sync", False))
         needs_capture = needs_capture if skip_sync else _capture_needed_on_any_rank(needs_capture, self.device)
@@ -3738,7 +3767,7 @@ class Llama3TensorParallelForCausalLM:
             new_captured: _StaticRaggedPrefillLogitsGraphCall | None = None
             try:
                 new_captured = self._capture_ragged_prefill_logits_graph(
-                    input_ids, cache, seq_lens, row_indices, logit_positions, context_len,
+                    input_ids, cache, seq_lens, row_indices, logit_positions, context_len, src_prefix_row,
                 )
             except Exception:
                 succeeded = False
@@ -3752,7 +3781,9 @@ class Llama3TensorParallelForCausalLM:
             self._ragged_prefill_logits_graphs[key] = new_captured
             captured = new_captured
         else:
-            self._copy_ragged_prefill_graph_inputs(captured, input_ids, seq_lens, row_indices, logit_positions)
+            self._copy_ragged_prefill_graph_inputs(
+                captured, input_ids, seq_lens, row_indices, logit_positions, src_prefix_row
+            )
             captured.graph.replay()
         return captured.output_logits
 
@@ -3764,10 +3795,14 @@ class Llama3TensorParallelForCausalLM:
         row_indices: Tensor | None,
         logit_positions: Tensor,
         context_len: int | None = None,
+        src_prefix_row: Tensor | None = None,
     ) -> _StaticRaggedPrefillLogitsGraphCall:
         batch, suffix = input_ids.shape
         rotary_cache_dim = self.rotary_cos_cache.size(1)
         static_row_indices = torch.empty_like(row_indices) if row_indices is not None else None
+        static_src_prefix_row = (
+            torch.empty((1,), device=self.device, dtype=torch.long) if src_prefix_row is not None else None
+        )
         captured = _StaticRaggedPrefillLogitsGraphCall(
             graph=torch.cuda.CUDAGraph(),
             static_input_ids=torch.empty_like(input_ids),
@@ -3777,13 +3812,16 @@ class Llama3TensorParallelForCausalLM:
             static_rotary_cos=torch.empty((batch, suffix, rotary_cache_dim), device=self.device, dtype=self.dtype),
             static_rotary_sin=torch.empty((batch, suffix, rotary_cache_dim), device=self.device, dtype=self.dtype),
             static_logit_positions=torch.empty((batch,), device=self.device, dtype=torch.int64),
+            static_src_prefix_row=static_src_prefix_row,
             output_logits=torch.empty((batch, 1, self.local_vocab_size), device=self.device, dtype=self.dtype),
             cache=cache,
             max_seq_len=cache.layers[0].max_seq_len,
             suffix_bucket=suffix,
             context_len=context_len,
         )
-        self._copy_ragged_prefill_graph_inputs(captured, input_ids, seq_lens, row_indices, logit_positions)
+        self._copy_ragged_prefill_graph_inputs(
+            captured, input_ids, seq_lens, row_indices, logit_positions, src_prefix_row
+        )
         stream = torch.cuda.Stream(device=self.device)
         stream.wait_stream(torch.cuda.current_stream(self.device))
         with torch.cuda.stream(stream):
@@ -3796,6 +3834,7 @@ class Llama3TensorParallelForCausalLM:
                 (captured.static_rotary_cos, captured.static_rotary_sin),
                 captured.static_logit_positions,
                 context_len,
+                captured.static_src_prefix_row,
             )
         torch.cuda.current_stream(self.device).wait_stream(stream)
         with torch.cuda.graph(captured.graph):
@@ -3808,6 +3847,7 @@ class Llama3TensorParallelForCausalLM:
                 (captured.static_rotary_cos, captured.static_rotary_sin),
                 captured.static_logit_positions,
                 context_len,
+                captured.static_src_prefix_row,
             )
         captured.graph.replay()
         return captured
@@ -3819,11 +3859,14 @@ class Llama3TensorParallelForCausalLM:
         seq_lens: Tensor,
         row_indices: Tensor | None,
         logit_positions: Tensor,
+        src_prefix_row: Tensor | None = None,
     ) -> None:
         batch, suffix = input_ids.shape
         input_ids = input_ids.to(self.device, non_blocking=True)
         seq_lens = seq_lens.to(self.device, non_blocking=True)
         logit_positions = logit_positions.to(self.device, non_blocking=True)
+        if captured.static_src_prefix_row is not None and src_prefix_row is not None:
+            captured.static_src_prefix_row.copy_(src_prefix_row.to(self.device, non_blocking=True))
         if row_indices is None:
             start_positions = seq_lens[:batch]
         else:

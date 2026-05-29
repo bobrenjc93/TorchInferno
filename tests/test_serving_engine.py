@@ -176,14 +176,17 @@ class _SelectedLogitsToyModel(_RaggedGraphToyModel):
         return self._logits(input_ids[idx, positions] + 1)
 
     def try_prefill_ragged_logits_graph(
-        self, input_ids, cache, *, seq_lens, row_indices, logit_positions, context_len=None, capture_on_miss=True
+        self, input_ids, cache, *, seq_lens, row_indices, logit_positions,
+        context_len=None, src_prefix_row=None, capture_on_miss=True,
     ):
-        del seq_lens, context_len, capture_on_miss
+        del seq_lens, context_len, src_prefix_row, capture_on_miss
         cache.advance_rows(row_indices.detach().cpu().tolist(), input_ids.size(1))
         return self._ragged_prefill_compute(input_ids, logit_positions)
 
-    def prefill_ragged_logits(self, input_ids, cache, *, seq_lens, row_indices, logit_positions, context_len=None):
-        del seq_lens, context_len
+    def prefill_ragged_logits(
+        self, input_ids, cache, *, seq_lens, row_indices, logit_positions, context_len=None, src_prefix_row=None
+    ):
+        del seq_lens, context_len, src_prefix_row
         cache.advance_rows(row_indices.detach().cpu().tolist(), input_ids.size(1))
         return self._ragged_prefill_compute(input_ids, logit_positions)
 

@@ -767,8 +767,15 @@ class ContinuousBatchEngine:
         rows = [self._acquire_active_row() for _ in group]
         pad_rows: list[int] = []
         try:
+            # The shared-prefix KV broadcast is FOLDED INTO the prefill graph
+            # (copy from src_prefix_row to every active row in one captured pass),
+            # so the engine no longer issues ~80 per-layer index_copy launches per
+            # batch here -- it only records reuse accounting and the source row.
             copy_start_s = time.perf_counter() if self.profile_timings else 0.0
-            self._copy_reusable_prefixes_to_rows(rows, group)
+            source_prefix_row = group[0][3].row
+            for _index, _request, prefix_hit_tokens, _reusable in group:
+                self.stats.prefix_reuse_requests += 1
+                self.stats.prefix_reuse_tokens += prefix_hit_tokens
             padded_suffixes = [
                 [*suffix, *([0] * (suffix_bucket - len(suffix)))]
                 for suffix in suffixes
@@ -776,23 +783,21 @@ class ContinuousBatchEngine:
             start_lens = list(prefix_hits)
             if batch_bucket > count:
                 dummy_suffix = padded_suffixes[0]
-                dummy_prefix_row = group[0][3].row
-                dummy_prefix_len = prefix_hits[0]
                 for _ in range(batch_bucket - count):
                     pad_row = self._acquire_active_row_or_none()
                     if pad_row is None:
                         break
                     pad_rows.append(pad_row)
-                    self._copy_prefix(dummy_prefix_row, pad_row, dummy_prefix_len)
                     padded_suffixes.append(list(dummy_suffix))
-                    start_lens.append(dummy_prefix_len)
+                    start_lens.append(prefix_hit)
             if self.profile_timings:
                 self.stats.prefill_copy_ms += (time.perf_counter() - copy_start_s) * 1000.0
             setup_start_s = time.perf_counter() if self.profile_timings else 0.0
             all_rows = rows + pad_rows
             input_ids = torch.tensor(padded_suffixes, device=self.device, dtype=torch.long)
             row_indices = torch.tensor(all_rows, device=self.device, dtype=torch.long)
-            required = max(all_rows) + 1
+            src_prefix_row = torch.tensor([source_prefix_row], device=self.device, dtype=torch.long)
+            required = max(all_rows + [source_prefix_row]) + 1
             seq_lens_list = [0] * required
             for physical_row, start_len in zip(all_rows, start_lens):
                 seq_lens_list[physical_row] = start_len
@@ -806,11 +811,11 @@ class ContinuousBatchEngine:
                 self.stats.prefill_setup_ms += (time.perf_counter() - setup_start_s) * 1000.0
             forward_start_s = time.perf_counter() if self.profile_timings else 0.0
             logits = self._try_ragged_prefill_logits(
-                input_ids, seq_lens, row_indices, logit_positions, context_len
+                input_ids, seq_lens, row_indices, logit_positions, context_len, src_prefix_row
             )
             if logits is None:
                 logits = self._ragged_prefill_logits_eager(
-                    input_ids, seq_lens, row_indices, logit_positions, context_len
+                    input_ids, seq_lens, row_indices, logit_positions, context_len, src_prefix_row
                 )
             if self.profile_timings and logits is not None:
                 # force the prefill graph/forward to complete for honest timing
@@ -874,6 +879,7 @@ class ContinuousBatchEngine:
         row_indices: Tensor,
         logit_positions: Tensor,
         context_len: int | None = None,
+        src_prefix_row: Tensor | None = None,
     ) -> Tensor | None:
         graph = getattr(self.model, "try_prefill_ragged_logits_graph", None)
         if graph is None:
@@ -885,6 +891,7 @@ class ContinuousBatchEngine:
             row_indices=row_indices,
             logit_positions=logit_positions,
             context_len=context_len,
+            src_prefix_row=src_prefix_row,
         )
         if logits is None:
             self.stats.prefill_graph_misses += 1
@@ -899,6 +906,7 @@ class ContinuousBatchEngine:
         row_indices: Tensor,
         logit_positions: Tensor,
         context_len: int | None = None,
+        src_prefix_row: Tensor | None = None,
     ) -> Tensor | None:
         eager = getattr(self.model, "prefill_ragged_logits", None)
         if eager is None:
@@ -910,6 +918,7 @@ class ContinuousBatchEngine:
             row_indices=row_indices,
             logit_positions=logit_positions,
             context_len=context_len,
+            src_prefix_row=src_prefix_row,
         )
 
     def _prefill_prefix_batch(
