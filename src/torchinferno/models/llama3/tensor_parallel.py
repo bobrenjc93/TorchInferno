@@ -1581,22 +1581,28 @@ class _Llama3TensorParallelLayer:
         write_positions: Tensor,
         flashinfer_wrapper: object,
         next_norm_weight: Tensor,
+        *,
+        row_indices: Tensor | None = None,
+        q_lens: Tensor | None = None,
     ) -> tuple[Tensor, Tensor]:
-        # Fused prefill+decode layer forward using FlashInfer attention.
-        # QKV + rotary + KV append use existing code; attention uses FlashInfer.
         residual = hidden
         batch, tokens, _ = hidden.shape
         if attn_in is None:
             attn_in = _tp_decode_rms_norm(hidden, self.input_layernorm_weight, self.config.rms_norm_eps)
         q, k, v = self._qkv(attn_in, batch, tokens, self.config.head_dim)
         q, k = _apply_rotary_ragged_prefill(q, k, rotary)
-        # Append KV to the FlashInfer cache (writes via the BHSD view)
-        _append_ragged_kv_prefill(cache, k, v, write_positions, None)
-        # FlashInfer attention: q is [batch, heads, tokens, dim], need [total_q, heads, dim]
-        q_packed = q.permute(0, 2, 1, 3).reshape(-1, self.local_attention_heads, self.config.head_dim)
-        out = flashinfer_wrapper.run(q_packed, cache.paged_kv)
-        # Reshape back: [total_q, heads, dim] → [batch, tokens, hidden]
-        out = out.view(batch, tokens, self.local_hidden_size)
+        _append_ragged_kv_prefill(cache, k, v, write_positions, row_indices)
+        q_permuted = q.permute(0, 2, 1, 3)
+        if q_lens is not None and not (q_lens == tokens).all():
+            valid_mask = torch.arange(tokens, device=q.device).unsqueeze(0) < q_lens.unsqueeze(1)
+            q_packed = q_permuted[valid_mask]
+            out_packed = flashinfer_wrapper.run(q_packed, cache.paged_kv)
+            out = torch.zeros(batch, tokens, self.local_hidden_size, device=q.device, dtype=q.dtype)
+            out[valid_mask] = out_packed.view(-1, self.local_hidden_size)
+        else:
+            q_packed = q_permuted.reshape(-1, self.local_attention_heads, self.config.head_dim)
+            out_packed = flashinfer_wrapper.run(q_packed, cache.paged_kv)
+            out = out_packed.view(batch, tokens, self.local_hidden_size)
         attention = self._decode_linear_all_reduce(
             out, self.o_proj_weight, "attention", self.o_proj_weight_decode
         )
@@ -3767,35 +3773,23 @@ class Llama3TensorParallelForCausalLM:
         q_lens: Tensor,
         write_positions: Tensor,
         logit_positions: Tensor,
+        row_indices: Tensor | None = None,
     ) -> Tensor:
-        # One fused prefill+decode step using FlashInfer attention.
-        # input_ids: [batch, max_q_len] (padded; each row has q_lens[i] real tokens)
-        # seq_lens: [batch] per-row KV length BEFORE this step
-        # q_lens: [batch] per-row query length (1 for decode, N for prefill)
-        # write_positions: [batch, max_q_len] absolute KV write positions
-        # logit_positions: [batch] which query position's logit to return
         import flashinfer
 
         batch = input_ids.size(0)
         max_q_len = input_ids.size(1)
         total_q = int(q_lens.sum().item())
 
-        if self.rank == 0:
-            import sys
-            print(
-                f"[FI] batch={batch} max_q_len={max_q_len} total_q={total_q} "
-                f"seq_lens={seq_lens[:batch].tolist()} q_lens={q_lens[:batch].tolist()}",
-                file=sys.stderr, flush=True,
-            )
-
-        # Build FlashInfer plan (paged KV, 1 page per row, page_size=max_seq)
         max_seq = cache.layers[0].max_seq_len
         qo_indptr = torch.zeros(batch + 1, dtype=torch.int32, device=self.device)
         qo_indptr[1:] = q_lens.to(torch.int32).cumsum(0)
 
         paged_kv_indptr = torch.arange(batch + 1, dtype=torch.int32, device=self.device)
-        paged_kv_indices = torch.arange(batch, dtype=torch.int32, device=self.device)
-        # KV length AFTER this step = seq_lens + q_lens (append then attend)
+        if row_indices is not None:
+            paged_kv_indices = row_indices.to(dtype=torch.int32, device=self.device)
+        else:
+            paged_kv_indices = torch.arange(batch, dtype=torch.int32, device=self.device)
         paged_kv_last_page_len = (seq_lens + q_lens).to(torch.int32)
 
         workspace = getattr(self, '_flashinfer_workspace', None)
@@ -3820,12 +3814,11 @@ class Llama3TensorParallelForCausalLM:
             q_data_type=self.dtype,
         )
 
-        # Barrier after FlashInfer plan (which triggers JIT compilation on first use).
-        # Without this, rank 0 may finish JIT first and start the layer forward
-        # (NCCL allreduce) while other ranks are still compiling → NCCL deadlock.
-        import torch.distributed as _dist
-        if _dist.is_available() and _dist.is_initialized() and _dist.get_world_size() > 1:
-            _dist.barrier()
+        if not getattr(self, '_flashinfer_jit_warmed', False):
+            import torch.distributed as _dist
+            if _dist.is_available() and _dist.is_initialized() and _dist.get_world_size() > 1:
+                _dist.barrier()
+            self._flashinfer_jit_warmed = True
 
         # Build per-token rotary embeddings
         flat_positions = write_positions.reshape(-1).clamp(0, self.rotary_cos_cache.size(0) - 1)
@@ -3838,7 +3831,6 @@ class Llama3TensorParallelForCausalLM:
         hidden = F.embedding(input_ids.to(self.device, non_blocking=True), self.embed_tokens_weight)
         attn_in: Tensor | None = None
 
-        # Layer loop
         for layer_id, layer in enumerate(self.layers):
             next_norm_weight = (
                 self.layers[layer_id + 1].input_layernorm_weight
@@ -3852,6 +3844,8 @@ class Llama3TensorParallelForCausalLM:
                     write_positions,
                     wrapper,
                     next_norm_weight,
+                    row_indices=row_indices,
+                    q_lens=q_lens,
                 )
             except Exception as exc:
                 import sys
