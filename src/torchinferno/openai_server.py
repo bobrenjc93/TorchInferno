@@ -2059,7 +2059,7 @@ class OpenAICompletionEngine:
         initial_wait_s = (
             env_float("TORCHINFERNO_OPENAI_TP_ONLINE_INITIAL_BATCH_WAIT_MS", 5.0, minimum=0.0) / 1000.0
         )
-        idle_wait_s = env_float("TORCHINFERNO_OPENAI_TP_ONLINE_IDLE_BATCH_WAIT_MS", 50.0, minimum=0.0) / 1000.0
+        idle_wait_s = env_float("TORCHINFERNO_OPENAI_TP_ONLINE_IDLE_BATCH_WAIT_MS", 2.0, minimum=0.0) / 1000.0
         profile_start_s = time.perf_counter()
         phase_ms: dict[str, float] = {}
 
