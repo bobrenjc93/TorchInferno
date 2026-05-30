@@ -3103,7 +3103,7 @@ class OpenAICompletionEngine:
         )
         max_seq_len = env_int("TORCHINFERNO_OPENAI_FLASHINFER_MAX_SEQ_LEN", 512, minimum=64)
 
-        # Broadcast "flashinfer_start" to workers so they allocate the same cache
+        # Broadcast "flashinfer_start" to workers
         if dist.is_available() and dist.is_initialized():
             dist.broadcast_object_list([{
                 "op": "flashinfer_start",
@@ -3193,13 +3193,11 @@ class OpenAICompletionEngine:
                 # We need to remap step_rows to physical cache rows.
                 # For simplicity, use row indices directly (the cache has max_batch rows).
 
-                # Broadcast step tensors to workers
+                # Broadcast step meta + tensors to workers via raw CUDA broadcasts
                 if dist.is_available() and dist.is_initialized():
-                    dist.broadcast_object_list([{
-                        "op": "flashinfer_step",
-                        "batch": batch,
-                        "max_q_len": max_q_len,
-                    }], src=0)
+                    # meta[0] = 0 (step), meta[1] = batch, meta[2] = max_q_len
+                    fi_meta = torch.tensor([0, batch, max_q_len, 0, 0], dtype=torch.long, device=self.device)
+                    dist.broadcast(fi_meta, src=0)
                     dist.broadcast(input_ids, src=0)
                     dist.broadcast(q_lens, src=0)
                     dist.broadcast(write_positions, src=0)
@@ -3266,9 +3264,10 @@ class OpenAICompletionEngine:
                     row = free_rows.pop(0)
                     prompts_to_prefill.append((row, new_request))
 
-        # Tell workers the FlashInfer session is done
+        # Tell workers the FlashInfer session is done (meta[0] = 1 = close)
         if dist.is_available() and dist.is_initialized():
-            dist.broadcast_object_list([{"op": "flashinfer_close"}], src=0)
+            fi_meta = torch.tensor([1, 0, 0, 0, 0], dtype=torch.long, device=self.device)
+            dist.broadcast(fi_meta, src=0)
 
         # Finish any remaining active rows
         for row, (request, _, _, _) in active.items():
@@ -9877,20 +9876,17 @@ def _tensor_parallel_worker_loop(engine: OpenAICompletionEngine) -> None:
                     temperature=fi_temperature,
                 )
                 fi_symm_scope.__enter__()
-                # Loop receiving FlashInfer step commands
+                # Loop receiving FlashInfer step commands via raw tensor broadcasts
+                device = getattr(engine, "device", torch.device("cpu"))
+                fi_step_meta = torch.empty(5, dtype=torch.long, device=device)
                 while True:
-                    step_cmd: list[object] = [None]
-                    dist.broadcast_object_list(step_cmd, src=0)
-                    step_payload = step_cmd[0]
-                    if not isinstance(step_payload, dict):
-                        continue
-                    step_op = step_payload.get("op")
-                    if step_op == "flashinfer_close":
+                    dist.broadcast(fi_step_meta, src=0)
+                    cmd_type = int(fi_step_meta[0].item())
+                    if cmd_type == 1:  # close
                         break
-                    if step_op == "flashinfer_step":
-                        batch_sz = int(step_payload["batch"])
-                        max_q_len = int(step_payload["max_q_len"])
-                        device = getattr(engine, "device", torch.device("cpu"))
+                    if cmd_type == 0:  # step
+                        batch_sz = int(fi_step_meta[1].item())
+                        max_q_len = int(fi_step_meta[2].item())
                         input_ids = torch.empty(batch_sz, max_q_len, dtype=torch.long, device=device)
                         q_lens = torch.empty(batch_sz, dtype=torch.long, device=device)
                         write_positions = torch.empty(batch_sz, max_q_len, dtype=torch.long, device=device)
