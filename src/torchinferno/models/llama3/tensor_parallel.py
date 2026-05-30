@@ -3821,7 +3821,7 @@ class Llama3TensorParallelForCausalLM:
         )
 
         # Build per-token rotary embeddings
-        flat_positions = write_positions.reshape(-1)
+        flat_positions = write_positions.reshape(-1).clamp(0, self.rotary_cos_cache.size(0) - 1)
         rotary = (
             self.rotary_cos_cache.index_select(0, flat_positions).view(batch, max_q_len, -1),
             self.rotary_sin_cache.index_select(0, flat_positions).view(batch, max_q_len, -1),
@@ -3838,13 +3838,20 @@ class Llama3TensorParallelForCausalLM:
                 if layer_id + 1 < len(self.layers)
                 else self.norm_weight
             )
-            hidden, attn_in = layer.forward_flashinfer(
-                hidden, attn_in, rotary,
-                cache.layers[layer_id],
-                write_positions,
-                wrapper,
-                next_norm_weight,
-            )
+            try:
+                hidden, attn_in = layer.forward_flashinfer(
+                    hidden, attn_in, rotary,
+                    cache.layers[layer_id],
+                    write_positions,
+                    wrapper,
+                    next_norm_weight,
+                )
+            except Exception as exc:
+                import sys
+                print(f"[FI] layer {layer_id} CRASHED: {exc!r}", file=sys.stderr, flush=True)
+                import traceback
+                traceback.print_exc(file=sys.stderr)
+                raise
 
         # Gather output logits at logit_positions
         if attn_in is None:
