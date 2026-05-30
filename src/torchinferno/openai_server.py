@@ -1765,7 +1765,7 @@ class OpenAICompletionEngine:
         # Decode touches only active rows (<= max_active), addressed via row
         # indices, so warm the active-range buckets, not the full cache size.
         batch_sizes = sorted(
-            {1, 2, 4, 8, 16, 32, 48, 64, max_active, cache_batch}
+            {1, 2, 4, 8, 16, 32, max_active, cache_batch}
             & set(range(1, cache_batch + 1))
         )
         with _tensor_parallel_symm_mem_allreduce_scope(
@@ -2059,7 +2059,7 @@ class OpenAICompletionEngine:
         initial_wait_s = (
             env_float("TORCHINFERNO_OPENAI_TP_ONLINE_INITIAL_BATCH_WAIT_MS", 5.0, minimum=0.0) / 1000.0
         )
-        idle_wait_s = env_float("TORCHINFERNO_OPENAI_TP_ONLINE_IDLE_BATCH_WAIT_MS", 2.0, minimum=0.0) / 1000.0
+        idle_wait_s = env_float("TORCHINFERNO_OPENAI_TP_ONLINE_IDLE_BATCH_WAIT_MS", 50.0, minimum=0.0) / 1000.0
         profile_start_s = time.perf_counter()
         phase_ms: dict[str, float] = {}
 
