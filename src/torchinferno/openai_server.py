@@ -1509,7 +1509,6 @@ class OpenAICompletionEngine:
         self._completed_queue_batches = 0
         self._idle_since_s = time.perf_counter()
         self._cleanup_after_idle = False
-        self._early_restart_live: list[tuple[_QueuedGeneration, int, int, int]] = []
         self._prefix_cache_entry: TensorPrefixCacheEntry | None = None
         self._prefix_cache_entries: dict[tuple[int, ...], TensorPrefixCacheEntry] = {}
         self._prompt_logits_cache: dict[tuple[int, ...], Tensor] = {}
@@ -3343,14 +3342,6 @@ class OpenAICompletionEngine:
                 and cached_device == str(self.device)
                 and _reset_generation_cache(cached)
             ):
-                # After reset, restore the shared-prefix row's seq_len so the
-                # prefix KV (still physically in the cache — reset only zeroes
-                # the seq_len counter, not the KV data) can be reused by the
-                # next batch without re-copying. This saves ~12ms/batch for
-                # shared-prefix workloads.
-                prefix_tokens = _generation_cache_prefix_tokens(cached)
-                if prefix_tokens:
-                    _restore_cache_prefix_seq_len(cached, len(prefix_tokens))
                 _set_ragged_decode_graph_disabled(cached, False)
                 self._cache_pool.pop(cached_key, None)
                 self._cache_pool[cached_key] = cached
@@ -5492,10 +5483,6 @@ class OpenAICompletionEngine:
                 combined_cache, first_tokens, active = padded_state
                 yield first_tokens
                 self._save_prompt_prefix_cache_rows(prompts, combined_cache)
-                _mark_generation_cache_prefix(
-                    combined_cache,
-                    list(prompts[0][:prefix_tokens]) if prompts else [],
-                )
                 should_continue = max_tokens > 1 and any(active)
                 should_continue = _sync_tensor_parallel_continue(model, should_continue, self.device)
                 if should_continue:
@@ -7739,26 +7726,11 @@ class OpenAICompletionEngine:
             padded_suffix_bucketed_suffix_len=padded_suffix_len,
         )
         _set_cache_physical_rows_initialized(cache, False)
-        # Skip the prefix KV copy if the batch cache already has the prefix
-        # from a previous batch (pool reuse + seq_len preservation). The dense
-        # cache reset only zeroes seq_lens, not KV data, so the prefix KV
-        # survives if we avoid resetting row 0 (handled by the pool partial
-        # reset or prefix mark logic).
-        prefix_already_in_cache = False
         try:
-            batch_layers = getattr(cache, "layers", None)
-            if batch_layers and hasattr(batch_layers[0], "_seq_lens"):
-                row0_seq_len = batch_layers[0]._seq_lens[0]
-                if row0_seq_len == prefix_tokens and prefix_tokens > 0:
-                    prefix_already_in_cache = True
-        except Exception:
-            pass
-        if not prefix_already_in_cache:
-            try:
-                _copy_generation_cache_first_row(prefix_cache, cache, prefill_batch_size)
-            except Exception as exc:
-                warn_optional_failure("openai.shared_prefix_padded_suffix_cache", exc)
-                return None
+            _copy_generation_cache_first_row(prefix_cache, cache, prefill_batch_size)
+        except Exception as exc:
+            warn_optional_failure("openai.shared_prefix_padded_suffix_cache", exc)
+            return None
 
         pad_token_id = _tokenizer_padding_token_id(getattr(self, "tokenizer", None))
         if any(not suffix for suffix in suffix_rows):
@@ -11050,20 +11022,6 @@ def _tokenizer_padding_token_id(tokenizer: object | None) -> int:
 
 def _tensor_row_tokens(input_ids: Tensor, row: int = 0) -> tuple[int, ...]:
     return tuple(int(token_id) for token_id in input_ids[row].detach().cpu().tolist())
-
-
-def _restore_cache_prefix_seq_len(cache: object, prefix_len: int) -> None:
-    # After a cache reset (which zeroes all seq_lens), restore row 0's seq_len
-    # to prefix_len so the shared-prefix KV data (still physically in the cache)
-    # is visible to attention. This avoids re-copying the prefix each batch.
-    layers = tuple(getattr(cache, "layers", ()) or ())
-    for layer in layers:
-        seq_lens = getattr(layer, "_seq_lens", None)
-        if isinstance(seq_lens, list) and len(seq_lens) > 0:
-            seq_lens[0] = prefix_len
-            uniform = getattr(layer, "_uniform_seq_len", None)
-            if isinstance(uniform, list) and uniform:
-                uniform[0] = None
 
 
 def _mark_generation_cache_prefix(cache: object, tokens: Sequence[int]) -> None:
