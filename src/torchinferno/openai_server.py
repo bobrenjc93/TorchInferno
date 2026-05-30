@@ -3925,7 +3925,10 @@ class OpenAICompletionEngine:
             )
             self._generation_cache(1, warmup_cache_tokens, model=self.model, pool=False)
             _warmup_tensor_parallel_decode_attention(self.model)
-            if hasattr(self.model, "allocate_cache"):
+            if (
+                env_flag("TORCHINFERNO_OPENAI_UNIFIED_SCHEDULER", False)
+                or env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_CONTINUOUS_BATCHER", False)
+            ) and hasattr(self.model, "allocate_cache"):
                 self._warmup_unified_scheduler_cache(vocab_size)
         torch.cuda.synchronize(self.device)
 
@@ -7697,25 +7700,12 @@ class OpenAICompletionEngine:
         )
         max_prompt_len = max((len(prompt) for prompt in prompts), default=0)
         cache_batch_size = _generation_cache_batch_capacity(model, prompt_count)
-        persistent = getattr(self, "_persistent_serving_cache", None)
-        if (
-            persistent is not None
-            and _cache_batch_size(persistent) is not None
-            and int(_cache_batch_size(persistent) or 0) >= prompt_count
-            and hasattr(persistent, "layers")
-            and persistent.layers
-            and persistent.layers[0].max_seq_len >= max_prompt_len + max_tokens
-        ):
-            cache = persistent
-            cache_batch_size = int(_cache_batch_size(persistent) or prompt_count)
-            _reset_generation_cache(cache)
-        else:
-            cache = self._generation_cache(
-                prompt_count,
-                max_prompt_len + max_tokens,
-                model=model,
-                batch_capacity=cache_batch_size,
-                pool=_shared_prefix_ragged_cache_pool_enabled_for_model(
+        cache = self._generation_cache(
+            prompt_count,
+            max_prompt_len + max_tokens,
+            model=model,
+            batch_capacity=cache_batch_size,
+            pool=_shared_prefix_ragged_cache_pool_enabled_for_model(
                     model,
                     max_tokens=max_tokens,
                 ),
