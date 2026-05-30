@@ -1718,11 +1718,7 @@ class OpenAICompletionEngine:
                     self._drain_ready_requests(next_batch, limit=batch_limit)
                     if not next_batch:
                         try:
-                            # Use a shorter wait in the inner loop under high load:
-                            # requests arrive continuously so the 2ms wait just adds
-                            # unnecessary latency between consecutive batches.
-                            inner_wait = 0.0 if self._has_multiple_live_requests() else self.batch_wait_s
-                            item = self._generation_queue.get(timeout=inner_wait)
+                            item = self._generation_queue.get(timeout=self.batch_wait_s)
                         except queue.Empty:
                             break
                         if item is None:
@@ -1730,7 +1726,7 @@ class OpenAICompletionEngine:
                             break
                         next_batch.append(item)
                     self._drain_ready_requests(next_batch, limit=batch_limit)
-                    if self._has_multiple_live_requests() and len(next_batch) < batch_limit and not next_batch:
+                    if self._has_multiple_live_requests() and len(next_batch) < batch_limit:
                         self._collect_batch_until_deadline(
                             next_batch, limit=batch_limit, wait_s=self.batch_wait_s,
                         )
