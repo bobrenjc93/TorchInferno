@@ -3780,6 +3780,14 @@ class Llama3TensorParallelForCausalLM:
         max_q_len = input_ids.size(1)
         total_q = int(q_lens.sum().item())
 
+        if self.rank == 0:
+            import sys
+            print(
+                f"[FI] batch={batch} max_q_len={max_q_len} total_q={total_q} "
+                f"seq_lens={seq_lens[:batch].tolist()} q_lens={q_lens[:batch].tolist()}",
+                file=sys.stderr, flush=True,
+            )
+
         # Build FlashInfer plan (paged KV, 1 page per row, page_size=max_seq)
         max_seq = cache.layers[0].max_seq_len
         qo_indptr = torch.zeros(batch + 1, dtype=torch.int32, device=self.device)

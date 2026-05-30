@@ -3099,9 +3099,9 @@ class OpenAICompletionEngine:
         stop_token_ids = getattr(self, "stop_token_ids", frozenset())
         max_batch = min(
             int(getattr(self, "max_batch_size", 64)),
-            env_int("TORCHINFERNO_OPENAI_FLASHINFER_MAX_BATCH", 64, minimum=1),
+            env_int("TORCHINFERNO_OPENAI_FLASHINFER_MAX_BATCH", 32, minimum=1),
         )
-        max_seq_len = env_int("TORCHINFERNO_OPENAI_FLASHINFER_MAX_SEQ_LEN", 768, minimum=64)
+        max_seq_len = env_int("TORCHINFERNO_OPENAI_FLASHINFER_MAX_SEQ_LEN", 512, minimum=64)
 
         # Broadcast "flashinfer_start" to workers so they allocate the same cache
         if dist.is_available() and dist.is_initialized():
