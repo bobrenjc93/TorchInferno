@@ -345,6 +345,108 @@ class Llama3TensorParallelLayerKVCache:
         self._uniform_seq_len[0] = seq_len if all(value == seq_len for value in self._seq_lens) else None
 
 
+class FlashInferLayerKVCache:
+    """KV cache stored in FlashInfer's paged format for fused attention.
+
+    Physical layout: [batch, 2, max_seq, kv_heads, head_dim] (NHD paged).
+    Provides .keys/.values views in [batch, kv_heads, max_seq, head_dim] (BHSD)
+    so existing model code (QKV projection, rotary, MLP) works unchanged.
+    FlashInfer's attention kernel reads the paged tensor directly.
+    """
+    cache_backend = "flashinfer"
+
+    def __init__(
+        self,
+        batch_size: int,
+        max_seq_len: int,
+        local_key_value_heads: int,
+        head_dim: int,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> None:
+        self.paged_kv = torch.zeros(
+            batch_size, 2, max_seq_len, local_key_value_heads, head_dim,
+            device=device, dtype=dtype,
+        )
+        self.max_seq_len = max_seq_len
+        self.batch_size = batch_size
+        self._seq_lens = [0 for _ in range(batch_size)]
+        self._uniform_seq_len: list[int | None] = [0]
+
+    @property
+    def keys(self) -> Tensor:
+        # [batch, max_seq, kv_heads, head_dim] → [batch, kv_heads, max_seq, head_dim]
+        return self.paged_kv[:, 0].transpose(1, 2)
+
+    @property
+    def values(self) -> Tensor:
+        return self.paged_kv[:, 1].transpose(1, 2)
+
+    @keys.setter
+    def keys(self, value: Tensor) -> None:
+        self.paged_kv[:, 0] = value.transpose(1, 2)
+
+    @values.setter
+    def values(self, value: Tensor) -> None:
+        self.paged_kv[:, 1] = value.transpose(1, 2)
+
+    @property
+    def seq_len(self) -> int:
+        u = self._uniform_seq_len[0]
+        if u is not None:
+            return int(u)
+        if not self._seq_lens:
+            return 0
+        first = self._seq_lens[0]
+        if all(s == first for s in self._seq_lens):
+            return first
+        raise ValueError("seq_len is not uniform across rows")
+
+    @seq_len.setter
+    def seq_len(self, seq_len: int) -> None:
+        self.set_seq_len(seq_len)
+
+    def set_seq_len(self, seq_len: int) -> None:
+        self._seq_lens[:] = [seq_len] * len(self._seq_lens)
+        self._uniform_seq_len[0] = seq_len
+
+    def reset(self) -> None:
+        self.set_seq_len(0)
+
+    def clear_row(self, row: int) -> None:
+        if 0 <= row < len(self._seq_lens):
+            self._seq_lens[row] = 0
+
+    def append(self, k: Tensor, v: Tensor) -> tuple[Tensor, Tensor]:
+        seq_len = self.seq_len
+        tokens = k.size(2)
+        end = seq_len + tokens
+        if end > self.max_seq_len:
+            raise ValueError("KV cache capacity exceeded")
+        batch = min(k.size(0), self.batch_size)
+        self.keys[:batch, :, seq_len:end, :] = k[:batch]
+        self.values[:batch, :, seq_len:end, :] = v[:batch]
+        self.set_seq_len(end)
+        return self.keys[:batch, :, :end, :], self.values[:batch, :, :end, :]
+
+    def for_rows(self, rows: tuple[int, ...] | list[int]) -> "Llama3TensorParallelLayerKVCache":
+        # Fall back to dense cache view for compatibility with existing code
+        # that uses for_rows (e.g., prefix copy, non-FlashInfer attention paths)
+        dense = Llama3TensorParallelLayerKVCache(
+            len(rows), self.max_seq_len,
+            self.paged_kv.size(3), self.paged_kv.size(4),
+            device=self.paged_kv.device, dtype=self.paged_kv.dtype,
+        )
+        for i, row in enumerate(rows):
+            dense.keys[i] = self.keys[row]
+            dense.values[i] = self.values[row]
+            if 0 <= row < len(self._seq_lens):
+                dense._seq_lens[i] = self._seq_lens[row]
+        dense._uniform_seq_len[0] = None
+        return dense
+
+
 class PagedLlama3TensorParallelLayerKVCache:
     cache_backend = "paged"
 
@@ -1470,6 +1572,42 @@ class _Llama3TensorParallelLayer:
         out = out.transpose(1, 2).contiguous().view(batch, tokens, self.local_hidden_size)
         return self._decode_linear_all_reduce(out, self.o_proj_weight, "attention", self.o_proj_weight_decode)
 
+    def forward_flashinfer(
+        self,
+        hidden: Tensor,
+        attn_in: Tensor | None,
+        rotary: tuple[Tensor, Tensor],
+        cache: FlashInferLayerKVCache,
+        write_positions: Tensor,
+        flashinfer_wrapper: object,
+        next_norm_weight: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        # Fused prefill+decode layer forward using FlashInfer attention.
+        # QKV + rotary + KV append use existing code; attention uses FlashInfer.
+        residual = hidden
+        batch, tokens, _ = hidden.shape
+        if attn_in is None:
+            attn_in = _tp_decode_rms_norm(hidden, self.input_layernorm_weight, self.config.rms_norm_eps)
+        q, k, v = self._qkv(attn_in, batch, tokens, self.config.head_dim)
+        q, k = _apply_rotary_ragged_prefill(q, k, rotary)
+        # Append KV to the FlashInfer cache (writes via the BHSD view)
+        _append_ragged_kv_prefill(cache, k, v, write_positions, None)
+        # FlashInfer attention: q is [batch, heads, tokens, dim], need [total_q, heads, dim]
+        q_packed = q.permute(0, 2, 1, 3).reshape(-1, self.local_attention_heads, self.config.head_dim)
+        out = flashinfer_wrapper.run(q_packed, cache.paged_kv)
+        # Reshape back: [total_q, heads, dim] → [batch, tokens, hidden]
+        out = out.view(batch, tokens, self.local_hidden_size)
+        attention = self._decode_linear_all_reduce(
+            out, self.o_proj_weight, "attention", self.o_proj_weight_decode
+        )
+        hidden, mlp_in = _tp_decode_add_rms_norm(
+            attention, residual,
+            self.post_attention_layernorm_weight, self.config.rms_norm_eps,
+        )
+        residual = hidden
+        projected = self._mlp_project_decode_reduce(mlp_in)
+        return _tp_decode_add_rms_norm(projected, residual, next_norm_weight, self.config.rms_norm_eps)
+
     def _mlp_project_decode_reduce(self, hidden: Tensor) -> Tensor:
         gate, up = _decode_linear(hidden, self.gate_up_proj_weight, self.gate_up_proj_weight_decode).split(
             (self.local_intermediate_size, self.local_intermediate_size),
@@ -2297,36 +2435,29 @@ class Llama3TensorParallelForCausalLM:
         page_size: int = 16,
         device: torch.device | None = None,
     ) -> Llama3TensorParallelCache:
-        if cache_backend not in {"dense", "paged"}:
-            raise ValueError("cache_backend must be 'dense' or 'paged'")
+        if cache_backend not in {"dense", "paged", "flashinfer"}:
+            raise ValueError("cache_backend must be 'dense', 'paged', or 'flashinfer'")
         if device is not None and torch.device(device) != self.device:
             raise ValueError("Llama3 tensor-parallel cache must be allocated on the model device")
         local_kv_heads = self.config.num_key_value_heads // self.world_size
-        layer_cls = PagedLlama3TensorParallelLayerKVCache if cache_backend == "paged" else Llama3TensorParallelLayerKVCache
-        return Llama3TensorParallelCache(
-            [
-                (
-                    layer_cls(
-                        batch_size,
-                        max_seq_len,
-                        local_kv_heads,
-                        self.config.head_dim,
-                        page_size=page_size,
-                        device=self.device,
-                        dtype=self.dtype,
-                    )
-                    if layer_cls is PagedLlama3TensorParallelLayerKVCache
-                    else layer_cls(
-                        batch_size,
-                        max_seq_len,
-                        local_kv_heads,
-                        self.config.head_dim,
-                        device=self.device,
-                        dtype=self.dtype,
-                    )
+        if cache_backend == "flashinfer":
+            layer_cls = FlashInferLayerKVCache
+        elif cache_backend == "paged":
+            layer_cls = PagedLlama3TensorParallelLayerKVCache
+        else:
+            layer_cls = Llama3TensorParallelLayerKVCache
+        def _make_layer_cache():
+            if layer_cls is PagedLlama3TensorParallelLayerKVCache:
+                return layer_cls(
+                    batch_size, max_seq_len, local_kv_heads, self.config.head_dim,
+                    page_size=page_size, device=self.device, dtype=self.dtype,
                 )
-                for _ in self.layers
-            ],
+            return layer_cls(
+                batch_size, max_seq_len, local_kv_heads, self.config.head_dim,
+                device=self.device, dtype=self.dtype,
+            )
+        return Llama3TensorParallelCache(
+            [_make_layer_cache() for _ in self.layers],
             cache_backend=cache_backend,
         )
 
@@ -3620,6 +3751,94 @@ class Llama3TensorParallelForCausalLM:
                 next_norm_weight,
                 context_len,
             )
+        if attn_in is None:
+            attn_in = _tp_decode_rms_norm(hidden, self.norm_weight, self.config.rms_norm_eps)
+        gather_positions = logit_positions.view(batch, 1, 1).expand(-1, 1, attn_in.size(-1))
+        gathered = torch.gather(attn_in, 1, gather_positions)
+        return _decode_linear(gathered, self.lm_head_weight, self.lm_head_weight_decode)
+
+    @torch.inference_mode()
+    def forward_step_flashinfer(
+        self,
+        input_ids: Tensor,
+        cache: Llama3TensorParallelCache,
+        *,
+        seq_lens: Tensor,
+        q_lens: Tensor,
+        write_positions: Tensor,
+        logit_positions: Tensor,
+    ) -> Tensor:
+        # One fused prefill+decode step using FlashInfer attention.
+        # input_ids: [batch, max_q_len] (padded; each row has q_lens[i] real tokens)
+        # seq_lens: [batch] per-row KV length BEFORE this step
+        # q_lens: [batch] per-row query length (1 for decode, N for prefill)
+        # write_positions: [batch, max_q_len] absolute KV write positions
+        # logit_positions: [batch] which query position's logit to return
+        import flashinfer
+
+        batch = input_ids.size(0)
+        max_q_len = input_ids.size(1)
+        total_q = int(q_lens.sum().item())
+
+        # Build FlashInfer plan (paged KV, 1 page per row, page_size=max_seq)
+        max_seq = cache.layers[0].max_seq_len
+        qo_indptr = torch.zeros(batch + 1, dtype=torch.int32, device=self.device)
+        qo_indptr[1:] = q_lens.to(torch.int32).cumsum(0)
+
+        paged_kv_indptr = torch.arange(batch + 1, dtype=torch.int32, device=self.device)
+        paged_kv_indices = torch.arange(batch, dtype=torch.int32, device=self.device)
+        # KV length AFTER this step = seq_lens + q_lens (append then attend)
+        paged_kv_last_page_len = (seq_lens + q_lens).to(torch.int32)
+
+        workspace = getattr(self, '_flashinfer_workspace', None)
+        if workspace is None:
+            workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=self.device)
+            self._flashinfer_workspace = workspace
+        wrapper = getattr(self, '_flashinfer_wrapper', None)
+        if wrapper is None:
+            wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(workspace, kv_layout='NHD')
+            self._flashinfer_wrapper = wrapper
+
+        wrapper.plan(
+            qo_indptr=qo_indptr,
+            paged_kv_indptr=paged_kv_indptr,
+            paged_kv_indices=paged_kv_indices,
+            paged_kv_last_page_len=paged_kv_last_page_len,
+            num_qo_heads=self.layers[0].local_attention_heads,
+            num_kv_heads=self.layers[0].local_key_value_heads,
+            head_dim_qk=self.config.head_dim,
+            page_size=max_seq,
+            causal=True,
+            q_data_type=self.dtype,
+        )
+
+        # Build per-token rotary embeddings
+        flat_positions = write_positions.reshape(-1)
+        rotary = (
+            self.rotary_cos_cache.index_select(0, flat_positions).view(batch, max_q_len, -1),
+            self.rotary_sin_cache.index_select(0, flat_positions).view(batch, max_q_len, -1),
+        )
+
+        # Embedding
+        hidden = F.embedding(input_ids.to(self.device, non_blocking=True), self.embed_tokens_weight)
+        attn_in: Tensor | None = None
+
+        # Layer loop
+        for layer_id, layer in enumerate(self.layers):
+            next_norm_weight = (
+                self.layers[layer_id + 1].input_layernorm_weight
+                if layer_id + 1 < len(self.layers)
+                else self.norm_weight
+            )
+            hidden, attn_in = layer.forward_flashinfer(
+                hidden, attn_in, rotary,
+                cache.layers[layer_id],
+                write_positions,
+                wrapper,
+                next_norm_weight,
+            )
+
+        # Gather output logits at logit_positions
         if attn_in is None:
             attn_in = _tp_decode_rms_norm(hidden, self.norm_weight, self.config.rms_norm_eps)
         gather_positions = logit_positions.view(batch, 1, 1).expand(-1, 1, attn_in.size(-1))

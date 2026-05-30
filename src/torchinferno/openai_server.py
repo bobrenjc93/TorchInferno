@@ -2798,6 +2798,9 @@ class OpenAICompletionEngine:
         if self._should_use_runtime_continuous_stream_group(group):
             self._run_queued_stream_group_runtime_continuous(group)
             return
+        if self._should_use_flashinfer_stream_group(group):
+            self._run_flashinfer_stream_group(group)
+            return
         prompts = [request.prompt for request in group]
         max_tokens = max((request.max_tokens for request in group), default=0)
         row_max_tokens = [request.max_tokens for request in group]
@@ -3069,6 +3072,178 @@ class OpenAICompletionEngine:
             if started:
                 _broadcast_tensor_parallel_online_close(self.model)
                 _sync_tensor_parallel_command(self.model, self.device)
+
+    def _should_use_flashinfer_stream_group(self, group: Sequence[_QueuedGeneration]) -> bool:
+        if not env_flag("TORCHINFERNO_OPENAI_FLASHINFER", False):
+            return False
+        if not group or any(not request.stream for request in group):
+            return False
+        if not _is_tensor_parallel_primary_model(self.model):
+            return False
+        if self.device.type != "cuda":
+            return False
+        try:
+            import flashinfer  # noqa: F401
+        except ImportError:
+            return False
+        return hasattr(self.model, "forward_step_flashinfer") and hasattr(self.model, "allocate_cache")
+
+    def _run_flashinfer_stream_group(self, group: Sequence[_QueuedGeneration]) -> None:
+        # Step-at-a-time scheduler using FlashInfer for fused prefill+decode.
+        # Each step: prefill new + decode active in ONE model forward.
+        import torch
+        model = self.model
+        stop_token_ids = getattr(self, "stop_token_ids", frozenset())
+        max_batch = min(
+            int(getattr(self, "max_batch_size", 64)),
+            env_int("TORCHINFERNO_OPENAI_FLASHINFER_MAX_BATCH", 64, minimum=1),
+        )
+        max_seq_len = env_int("TORCHINFERNO_OPENAI_FLASHINFER_MAX_SEQ_LEN", 768, minimum=64)
+
+        # Allocate FlashInfer cache
+        cache = model.allocate_cache(max_batch, max_seq_len, cache_backend="flashinfer")
+
+        # Active rows: row_index → (request, seq_len, generated, last_token)
+        active: dict[int, tuple[_QueuedGeneration, int, int, int]] = {}
+        free_rows = list(range(max_batch))
+
+        # Admit initial group
+        prompts_to_prefill: list[tuple[int, _QueuedGeneration]] = []
+        for request in group:
+            if not free_rows:
+                break
+            row = free_rows.pop(0)
+            prompts_to_prefill.append((row, request))
+
+        with _tensor_parallel_symm_mem_allreduce_scope(
+            model, self.device,
+            max_tokens=max((r.max_tokens for r in group), default=1),
+            temperature=group[0].temperature,
+        ):
+            # Main step loop
+            while prompts_to_prefill or active:
+                # Build step tensors
+                step_rows = []
+                step_q_lens = []
+                step_input_ids_list = []
+                step_write_positions_list = []
+                step_logit_positions = []
+                max_q_len = 1
+
+                # Decode active rows (1 query token each)
+                for row, (request, seq_len, generated, last_token) in active.items():
+                    step_rows.append(row)
+                    step_q_lens.append(1)
+                    step_input_ids_list.append([last_token])
+                    step_write_positions_list.append([seq_len])
+                    step_logit_positions.append(0)
+
+                # Prefill new rows (variable query tokens)
+                for row, request in prompts_to_prefill:
+                    prompt = request.prompt
+                    suffix_len = len(prompt)
+                    step_rows.append(row)
+                    step_q_lens.append(suffix_len)
+                    step_input_ids_list.append(list(prompt))
+                    step_write_positions_list.append(list(range(suffix_len)))
+                    step_logit_positions.append(suffix_len - 1)
+                    max_q_len = max(max_q_len, suffix_len)
+                    active[row] = (request, 0, 0, 0)  # will be updated after forward
+
+                batch = len(step_rows)
+                if batch == 0:
+                    break
+
+                # Pad to max_q_len
+                for i in range(len(step_input_ids_list)):
+                    while len(step_input_ids_list[i]) < max_q_len:
+                        step_input_ids_list[i].append(0)
+                    while len(step_write_positions_list[i]) < max_q_len:
+                        step_write_positions_list[i].append(0)
+
+                # Build tensors
+                input_ids = torch.tensor(step_input_ids_list, device=self.device, dtype=torch.long)
+                q_lens = torch.tensor(step_q_lens, device=self.device, dtype=torch.long)
+                write_positions = torch.tensor(step_write_positions_list, device=self.device, dtype=torch.long)
+                logit_positions = torch.tensor(step_logit_positions, device=self.device, dtype=torch.long)
+
+                # Set seq_lens on the cache (FlashInfer needs them)
+                seq_lens_list = [0] * max_batch
+                for i, row in enumerate(step_rows):
+                    req, sl, gen, lt = active[row]
+                    seq_lens_list[row] = sl
+                seq_lens = torch.tensor(seq_lens_list[:batch], device=self.device, dtype=torch.long)
+
+                # Reorder cache rows to match step order
+                # Actually, FlashInfer's paged API handles this via paged_kv_indices.
+                # But our forward_step_flashinfer uses rows 0..batch-1 contiguously.
+                # We need to remap step_rows to physical cache rows.
+                # For simplicity, use row indices directly (the cache has max_batch rows).
+
+                # Forward
+                logits = model.forward_step_flashinfer(
+                    input_ids, cache,
+                    seq_lens=seq_lens,
+                    q_lens=q_lens,
+                    write_positions=write_positions,
+                    logit_positions=logit_positions,
+                )
+
+                # Sample
+                next_tokens = model._sample_next_token(logits[:, -1, :], group[0].temperature)
+                next_tokens_cpu = next_tokens.detach().cpu().tolist()
+
+                # Process results
+                prompts_to_prefill = []
+                finished_rows = []
+                for i, row in enumerate(step_rows):
+                    request, seq_len, generated, last_token = active[row]
+                    next_token = int(next_tokens_cpu[i])
+                    new_seq_len = seq_len + step_q_lens[i]
+                    new_generated = generated + 1
+
+                    # Emit token (skip for prefill first token if it's a stop token)
+                    if next_token in stop_token_ids:
+                        _finish_stream_request(request)
+                        finished_rows.append(row)
+                    elif new_generated > request.max_tokens:
+                        _finish_stream_request(request)
+                        finished_rows.append(row)
+                    else:
+                        if not request.done:
+                            request.responses.put(next_token)
+                        if new_generated >= request.max_tokens:
+                            _finish_stream_request(request)
+                            finished_rows.append(row)
+                        else:
+                            active[row] = (request, new_seq_len, new_generated, next_token)
+
+                # Free finished rows and check queue for new requests
+                for row in finished_rows:
+                    if row in active:
+                        del active[row]
+                    free_rows.append(row)
+                    # Set cache seq_len to 0 for freed row
+                    for layer in cache.layers:
+                        if 0 <= row < len(layer._seq_lens):
+                            layer._seq_lens[row] = 0
+
+                # Admit new requests from queue
+                while free_rows and not self._generation_queue.empty():
+                    try:
+                        new_request = self._generation_queue.get_nowait()
+                    except Exception:
+                        break
+                    if new_request is None:
+                        self._generation_queue.put(None)
+                        break
+                    row = free_rows.pop(0)
+                    prompts_to_prefill.append((row, new_request))
+
+        # Finish any remaining active rows
+        for row, (request, _, _, _) in active.items():
+            if not request.done:
+                _finish_stream_request(request)
 
     def _should_use_runtime_continuous_stream_group(self, group: Sequence[_QueuedGeneration]) -> bool:
         if not env_flag("TORCHINFERNO_OPENAI_RUNTIME_CONTINUOUS_STREAM", False):
