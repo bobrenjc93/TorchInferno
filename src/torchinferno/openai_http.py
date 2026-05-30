@@ -55,6 +55,9 @@ class OpenAIHandler(BaseHTTPRequestHandler):
         except (ValueError, json.JSONDecodeError) as exc:
             self._send_json(error_response(str(exc), exc.__class__.__name__), status=400)
         except Exception as exc:
+            import sys, traceback as _tb
+            print(f"[HTTP 500] {exc!r}", file=sys.stderr, flush=True)
+            _tb.print_exc(file=sys.stderr)
             self._send_json(error_response(str(exc), exc.__class__.__name__), status=500)
 
     def log_message(self, format: str, *args: object) -> None:
@@ -384,6 +387,9 @@ class FastOpenAIHTTPServer:
                     _send_fast_json(connection, error_response(str(exc), exc.__class__.__name__), status=400)
                     return
                 except Exception as exc:
+                    import sys, traceback as _tb
+                    print(f"[FAST HTTP 500] {exc!r}", file=sys.stderr, flush=True)
+                    _tb.print_exc(file=sys.stderr)
                     _send_fast_json(connection, error_response(str(exc), exc.__class__.__name__), status=500)
                     return
 

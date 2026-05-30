@@ -8899,7 +8899,7 @@ def _sync_tensor_parallel_continue(model: object, should_continue: bool, device:
     if not dist.is_available() or not dist.is_initialized():
         return should_continue
     flag = torch.tensor([1 if should_continue else 0], dtype=torch.int32, device=device)
-    dist.broadcast(flag, src=0, device=torch.device("cpu"))
+    dist.broadcast(flag, src=0)
     return bool(flag.item())
 
 
@@ -9896,8 +9896,8 @@ def _tensor_parallel_worker_loop(engine: OpenAICompletionEngine) -> None:
                         write_positions = torch.empty(batch_sz, max_q_len, dtype=torch.long, device=device)
                         seq_lens = torch.empty(batch_sz, dtype=torch.long, device=device)
                         logit_positions = torch.empty(batch_sz, dtype=torch.long, device=device)
-                        dist.broadcast(input_ids, src=0, device=torch.device("cpu"))
-                        dist.broadcast(q_lens, src=0, device=torch.device("cpu"))
+                        dist.broadcast(input_ids, src=0)
+                        dist.broadcast(q_lens, src=0)
                         dist.broadcast(write_positions, src=0)
                         dist.broadcast(seq_lens, src=0)
                         dist.broadcast(logit_positions, src=0)
