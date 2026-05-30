@@ -3074,13 +3074,17 @@ class OpenAICompletionEngine:
                 _sync_tensor_parallel_command(self.model, self.device)
 
     def _should_use_flashinfer_stream_group(self, group: Sequence[_QueuedGeneration]) -> bool:
-        if not env_flag("TORCHINFERNO_OPENAI_FLASHINFER", False):
+        if not env_flag("TORCHINFERNO_OPENAI_FLASHINFER", True):
             return False
         if not group or any(not request.stream for request in group):
             return False
         if not _is_tensor_parallel_primary_model(self.model):
             return False
         if self.device.type != "cuda":
+            return False
+        # FlashInfer uses broadcast_object_list for the start command, which
+        # requires the worker to be in object-list mode (not tensor mode).
+        if _tensor_parallel_tensor_commands_enabled(self.model):
             return False
         try:
             import flashinfer  # noqa: F401

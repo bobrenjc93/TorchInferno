@@ -3820,6 +3820,13 @@ class Llama3TensorParallelForCausalLM:
             q_data_type=self.dtype,
         )
 
+        # Barrier after FlashInfer plan (which triggers JIT compilation on first use).
+        # Without this, rank 0 may finish JIT first and start the layer forward
+        # (NCCL allreduce) while other ranks are still compiling → NCCL deadlock.
+        import torch.distributed as _dist
+        if _dist.is_available() and _dist.is_initialized() and _dist.get_world_size() > 1:
+            _dist.barrier()
+
         # Build per-token rotary embeddings
         flat_positions = write_positions.reshape(-1).clamp(0, self.rotary_cos_cache.size(0) - 1)
         rotary = (
