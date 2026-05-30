@@ -122,7 +122,6 @@ class _QueuedGeneration:
     queued_at_s: float = 0.0
     queue_sequence: int = -1
     done: bool = False
-    skip_steps: int = 0
 
 
 @dataclass
@@ -1510,8 +1509,6 @@ class OpenAICompletionEngine:
         self._completed_queue_batches = 0
         self._idle_since_s = time.perf_counter()
         self._cleanup_after_idle = False
-        self._live_rows: dict[int, _QueuedGeneration] = {}
-        self._live_row_cache: object | None = None
         self._prefix_cache_entry: TensorPrefixCacheEntry | None = None
         self._prefix_cache_entries: dict[tuple[int, ...], TensorPrefixCacheEntry] = {}
         self._prompt_logits_cache: dict[tuple[int, ...], Tensor] = {}
@@ -2828,7 +2825,7 @@ class OpenAICompletionEngine:
                     )
                 try:
                     early_restart = (lambda: True) if env_flag(
-                        "TORCHINFERNO_OPENAI_BATCH_EARLY_RESTART", True
+                        "TORCHINFERNO_OPENAI_BATCH_EARLY_RESTART", False
                     ) else None
                     step_iter = self._generate_prompt_list_batch_steps(
                         prompts,
@@ -2845,16 +2842,6 @@ class OpenAICompletionEngine:
                         emit_start_s = self._stream_group_profile_start_s()
                         _emit_stream_step(group, step, step_tokens, getattr(self, "stop_token_ids", frozenset()))
                         self._add_stream_group_profile_elapsed("stream_emit_ms", emit_start_s)
-                    # After the generator exits (naturally or via early restart),
-                    # save live (unfinished) requests so the batch worker loop
-                    # re-submits them with skip_steps set to avoid duplicate
-                    # token emission. This allows the next batch to include them
-                    # without waiting for the ENTIRE current batch to finish.
-                    if early_restart is not None:
-                        for request in group:
-                            if not request.done:
-                                request.skip_steps = completed_steps
-                                self._generation_queue.put(request)
                 finally:
                     _sync_tensor_parallel_command(
                         self.model,
@@ -9851,7 +9838,7 @@ def _tensor_parallel_worker_loop(engine: OpenAICompletionEngine) -> None:
                 if "input_id_lists" in payload:
                     if bool(payload.get("stream", True)):
                         worker_early_restart = (lambda: True) if env_flag(
-                            "TORCHINFERNO_OPENAI_BATCH_EARLY_RESTART", True
+                            "TORCHINFERNO_OPENAI_BATCH_EARLY_RESTART", False
                         ) else None
                         iterator = engine._generate_prompt_list_batch_steps(
                             payload["input_id_lists"],
@@ -11272,13 +11259,6 @@ def _emit_stream_token(
         return
     if token_id is None or generated_tokens > request.max_tokens:
         _finish_stream_request(request)
-        return
-    # Mid-batch restart: skip tokens already emitted by the previous batch.
-    # The request was re-prefilled from scratch (deterministic greedy) and
-    # generates the same token sequence, so we suppress the duplicates.
-    if request.skip_steps > 0 and generated_tokens <= request.skip_steps:
-        if generated_tokens == request.skip_steps:
-            request.skip_steps = 0
         return
     token = int(token_id)
     if token in stop_token_ids:
