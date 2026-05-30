@@ -3091,7 +3091,10 @@ class OpenAICompletionEngine:
     def _run_flashinfer_stream_group(self, group: Sequence[_QueuedGeneration]) -> None:
         # Step-at-a-time scheduler using FlashInfer for fused prefill+decode.
         # Each step: prefill new + decode active in ONE model forward.
+        # TP coordination: broadcast step tensors to workers via dist.broadcast_object_list
+        # before each forward. Workers receive and run the same forward_step_flashinfer.
         import torch
+        import torch.distributed as dist
         model = self.model
         stop_token_ids = getattr(self, "stop_token_ids", frozenset())
         max_batch = min(
@@ -3099,6 +3102,16 @@ class OpenAICompletionEngine:
             env_int("TORCHINFERNO_OPENAI_FLASHINFER_MAX_BATCH", 64, minimum=1),
         )
         max_seq_len = env_int("TORCHINFERNO_OPENAI_FLASHINFER_MAX_SEQ_LEN", 768, minimum=64)
+
+        # Broadcast "flashinfer_start" to workers so they allocate the same cache
+        if dist.is_available() and dist.is_initialized():
+            dist.broadcast_object_list([{
+                "op": "flashinfer_start",
+                "max_batch": max_batch,
+                "max_seq_len": max_seq_len,
+                "temperature": float(group[0].temperature),
+                "max_tokens": max((r.max_tokens for r in group), default=1),
+            }], src=0)
 
         # Allocate FlashInfer cache
         cache = model.allocate_cache(max_batch, max_seq_len, cache_backend="flashinfer")
@@ -3180,7 +3193,20 @@ class OpenAICompletionEngine:
                 # We need to remap step_rows to physical cache rows.
                 # For simplicity, use row indices directly (the cache has max_batch rows).
 
-                # Forward
+                # Broadcast step tensors to workers
+                if dist.is_available() and dist.is_initialized():
+                    dist.broadcast_object_list([{
+                        "op": "flashinfer_step",
+                        "batch": batch,
+                        "max_q_len": max_q_len,
+                    }], src=0)
+                    dist.broadcast(input_ids, src=0)
+                    dist.broadcast(q_lens, src=0)
+                    dist.broadcast(write_positions, src=0)
+                    dist.broadcast(seq_lens, src=0)
+                    dist.broadcast(logit_positions, src=0)
+
+                # Forward (all ranks run this in lockstep via NCCL)
                 logits = model.forward_step_flashinfer(
                     input_ids, cache,
                     seq_lens=seq_lens,
@@ -3239,6 +3265,10 @@ class OpenAICompletionEngine:
                         break
                     row = free_rows.pop(0)
                     prompts_to_prefill.append((row, new_request))
+
+        # Tell workers the FlashInfer session is done
+        if dist.is_available() and dist.is_initialized():
+            dist.broadcast_object_list([{"op": "flashinfer_close"}], src=0)
 
         # Finish any remaining active rows
         for row, (request, _, _, _) in active.items():
@@ -9830,6 +9860,54 @@ def _tensor_parallel_worker_loop(engine: OpenAICompletionEngine) -> None:
         try:
             if op == "cleanup":
                 engine._clear_runtime_state_after_idle()
+                continue
+            if op == "flashinfer_start":
+                _skip_finally_sync = True
+                fi_max_batch = int(payload.get("max_batch", 64))
+                fi_max_seq_len = int(payload.get("max_seq_len", 768))
+                fi_temperature = float(payload.get("temperature", 0.0))
+                fi_max_tokens = int(payload.get("max_tokens", 1))
+                fi_cache = getattr(engine, "model").allocate_cache(
+                    fi_max_batch, fi_max_seq_len, cache_backend="flashinfer"
+                )
+                fi_symm_scope = _tensor_parallel_symm_mem_allreduce_scope(
+                    getattr(engine, "model", None),
+                    getattr(engine, "device", torch.device("cpu")),
+                    max_tokens=fi_max_tokens,
+                    temperature=fi_temperature,
+                )
+                fi_symm_scope.__enter__()
+                # Loop receiving FlashInfer step commands
+                while True:
+                    step_cmd: list[object] = [None]
+                    dist.broadcast_object_list(step_cmd, src=0)
+                    step_payload = step_cmd[0]
+                    if not isinstance(step_payload, dict):
+                        continue
+                    step_op = step_payload.get("op")
+                    if step_op == "flashinfer_close":
+                        break
+                    if step_op == "flashinfer_step":
+                        batch_sz = int(step_payload["batch"])
+                        max_q_len = int(step_payload["max_q_len"])
+                        device = getattr(engine, "device", torch.device("cpu"))
+                        input_ids = torch.empty(batch_sz, max_q_len, dtype=torch.long, device=device)
+                        q_lens = torch.empty(batch_sz, dtype=torch.long, device=device)
+                        write_positions = torch.empty(batch_sz, max_q_len, dtype=torch.long, device=device)
+                        seq_lens = torch.empty(batch_sz, dtype=torch.long, device=device)
+                        logit_positions = torch.empty(batch_sz, dtype=torch.long, device=device)
+                        dist.broadcast(input_ids, src=0)
+                        dist.broadcast(q_lens, src=0)
+                        dist.broadcast(write_positions, src=0)
+                        dist.broadcast(seq_lens, src=0)
+                        dist.broadcast(logit_positions, src=0)
+                        getattr(engine, "model").forward_step_flashinfer(
+                            input_ids, fi_cache,
+                            seq_lens=seq_lens, q_lens=q_lens,
+                            write_positions=write_positions,
+                            logit_positions=logit_positions,
+                        )
+                fi_symm_scope.__exit__(None, None, None)
                 continue
             if op == "persistent_prompt_list_start":
                 if persistent_prompt_list_symm_scope is not None:
