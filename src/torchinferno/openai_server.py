@@ -3111,7 +3111,7 @@ class OpenAICompletionEngine:
                 "max_seq_len": max_seq_len,
                 "temperature": float(group[0].temperature),
                 "max_tokens": max((r.max_tokens for r in group), default=1),
-            }], src=0, device=torch.device("cpu"))
+            }], src=0)
 
         # Allocate FlashInfer cache
         cache = model.allocate_cache(max_batch, max_seq_len, cache_backend="flashinfer")
@@ -3199,7 +3199,7 @@ class OpenAICompletionEngine:
                         "op": "flashinfer_step",
                         "batch": batch,
                         "max_q_len": max_q_len,
-                    }], src=0, device=torch.device("cpu"))
+                    }], src=0)
                     dist.broadcast(input_ids, src=0)
                     dist.broadcast(q_lens, src=0)
                     dist.broadcast(write_positions, src=0)
@@ -3268,7 +3268,7 @@ class OpenAICompletionEngine:
 
         # Tell workers the FlashInfer session is done
         if dist.is_available() and dist.is_initialized():
-            dist.broadcast_object_list([{"op": "flashinfer_close"}], src=0, device=torch.device("cpu"))
+            dist.broadcast_object_list([{"op": "flashinfer_close"}], src=0)
 
         # Finish any remaining active rows
         for row, (request, _, _, _) in active.items():
@@ -9880,7 +9880,7 @@ def _tensor_parallel_worker_loop(engine: OpenAICompletionEngine) -> None:
                 # Loop receiving FlashInfer step commands
                 while True:
                     step_cmd: list[object] = [None]
-                    dist.broadcast_object_list(step_cmd, src=0, device=torch.device("cpu"))
+                    dist.broadcast_object_list(step_cmd, src=0)
                     step_payload = step_cmd[0]
                     if not isinstance(step_payload, dict):
                         continue
