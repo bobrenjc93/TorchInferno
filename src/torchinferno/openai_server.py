@@ -1778,22 +1778,23 @@ class OpenAICompletionEngine:
         with _tensor_parallel_symm_mem_allreduce_scope(
             self.model, self.device, max_tokens=1, temperature=0.0,
         ):
-            for bs in batch_sizes:
-                _set_generation_cache_seq_len(cache, prompt_tokens)
-                decode_input_ids = torch.zeros(bs, 1, dtype=torch.long, device=self.device)
-                row_indices = torch.arange(bs, dtype=torch.long, device=self.device)
-                seq_lens_tensor = torch.full((bs,), prompt_tokens, dtype=torch.long, device=self.device)
-                try:
-                    _try_decode_ragged_token_graph(
-                        self.model, decode_input_ids, cache, seq_lens=seq_lens_tensor,
-                        row_indices=row_indices, temperature=0.0, allow_capture=True,
-                    )
-                except Exception as _warmup_exc:
-                    import sys as _wsys
-                    print(f"[WARMUP] graph capture failed bs={bs}: {_warmup_exc}", file=_wsys.stderr, flush=True)
-                _reset_generation_cache(cache)
             if fi_available and hasattr(self.model, "forward_decode_flashinfer"):
                 self._warmup_flashinfer_decode_graphs(cache, batch_sizes)
+            else:
+                for bs in batch_sizes:
+                    _set_generation_cache_seq_len(cache, prompt_tokens)
+                    decode_input_ids = torch.zeros(bs, 1, dtype=torch.long, device=self.device)
+                    row_indices = torch.arange(bs, dtype=torch.long, device=self.device)
+                    seq_lens_tensor = torch.full((bs,), prompt_tokens, dtype=torch.long, device=self.device)
+                    try:
+                        _try_decode_ragged_token_graph(
+                            self.model, decode_input_ids, cache, seq_lens=seq_lens_tensor,
+                            row_indices=row_indices, temperature=0.0, allow_capture=True,
+                        )
+                    except Exception as _warmup_exc:
+                        import sys as _wsys
+                        print(f"[WARMUP] graph capture failed bs={bs}: {_warmup_exc}", file=_wsys.stderr, flush=True)
+                    _reset_generation_cache(cache)
         self._persistent_serving_cache = cache
 
     def _warmup_flashinfer_decode_graphs(self, cache: object, batch_sizes: list[int]) -> None:
