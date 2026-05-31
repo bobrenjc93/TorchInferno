@@ -1752,20 +1752,10 @@ class OpenAICompletionEngine:
             getattr(self, "max_model_len", None) or 768,
             minimum=64,
         )
-        fi_cache = hasattr(self.model, "forward_decode_flashinfer")
-        if fi_cache:
-            try:
-                import flashinfer  # noqa: F401
-            except ImportError:
-                fi_cache = False
-        backend = self.cache_backend
         cache = _allocate_cache(
             self.model, cache_batch, _generation_cache_capacity(self.model, max_seq_len),
-            device=self.device, cache_backend=backend, page_size=self.page_size,
+            device=self.device, cache_backend=self.cache_backend, page_size=self.page_size,
         )
-        import sys as _warmup_sys
-        _layer_type = type(cache.layers[0]).__name__ if hasattr(cache, 'layers') and cache.layers else 'unknown'
-        print(f"[WARMUP] cache backend={backend} layer_type={_layer_type} batch={cache_batch}", file=_warmup_sys.stderr, flush=True)
         _reset_generation_cache(cache)
         try:
             cache._skip_capture_sync = True
