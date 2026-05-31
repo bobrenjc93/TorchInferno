@@ -1,20 +1,0 @@
-
-*****************************************
-Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. 
-*****************************************
-Fetching 36 files:   0%|          | 0/36 [00:00<?, ?it/s]Fetching 36 files: 100%|██████████| 36/36 [00:00<00:00, 8046.20it/s]
-Fetching 36 files:   0%|          | 0/36 [00:00<?, ?it/s]Fetching 36 files: 100%|██████████| 36/36 [00:00<00:00, 9050.83it/s]
-Fetching 36 files:   0%|          | 0/36 [00:00<?, ?it/s]Fetching 36 files: 100%|██████████| 36/36 [00:00<00:00, 7228.10it/s]
-Fetching 36 files:   0%|          | 0/36 [00:00<?, ?it/s]Fetching 36 files: 100%|██████████| 36/36 [00:00<00:00, 8770.11it/s]
-Fetching 36 files:   0%|          | 0/36 [00:00<?, ?it/s]Fetching 36 files: 100%|██████████| 36/36 [00:00<00:00, 8494.79it/s]
-Fetching 36 files:   0%|          | 0/36 [00:00<?, ?it/s]Fetching 36 files:   0%|          | 0/36 [00:00<?, ?it/s]Fetching 36 files: 100%|██████████| 36/36 [00:00<00:00, 8266.45it/s]
-Fetching 36 files: 100%|██████████| 36/36 [00:00<00:00, 10821.68it/s]
-Fetching 36 files:   0%|          | 0/36 [00:00<?, ?it/s]Fetching 36 files: 100%|██████████| 36/36 [00:00<00:00, 6454.98it/s]
-[WARMUP_DEBUG] has _warmup_flashinfer_decode_graphs: True file=/data/users/bobren/d/TorchInferno/src/torchinferno/openai_server.py
-[WARMUP_DEBUG] has _warmup_flashinfer_decode_graphs: True file=/data/users/bobren/d/TorchInferno/src/torchinferno/openai_server.py[WARMUP_DEBUG] has _warmup_flashinfer_decode_graphs: True file=/data/users/bobren/d/TorchInferno/src/torchinferno/openai_server.py
-[WARMUP_DEBUG] has _warmup_flashinfer_decode_graphs: True file=/data/users/bobren/d/TorchInferno/src/torchinferno/openai_server.py[WARMUP_DEBUG] has _warmup_flashinfer_decode_graphs: True file=/data/users/bobren/d/TorchInferno/src/torchinferno/openai_server.py
-[WARMUP_DEBUG] has _warmup_flashinfer_decode_graphs: True file=/data/users/bobren/d/TorchInferno/src/torchinferno/openai_server.py
-
-
-[WARMUP_DEBUG] has _warmup_flashinfer_decode_graphs: True file=/data/users/bobren/d/TorchInferno/src/torchinferno/openai_server.py
-[WARMUP_DEBUG] has _warmup_flashinfer_decode_graphs: True file=/data/users/bobren/d/TorchInferno/src/torchinferno/openai_server.py

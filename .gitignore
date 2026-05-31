@@ -14,3 +14,5 @@ dist/
 .venv/
 venv/
 .DS_Store
+srv.*
+test_output.txt
