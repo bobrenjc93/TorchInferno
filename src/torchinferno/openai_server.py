@@ -1768,102 +1768,52 @@ class OpenAICompletionEngine:
             {1, 2, 4, 8, 16, 32, max_active, cache_batch}
             & set(range(1, cache_batch + 1))
         )
-        fi_decode = hasattr(self.model, "forward_decode_flashinfer")
         with _tensor_parallel_symm_mem_allreduce_scope(
             self.model, self.device, max_tokens=1, temperature=0.0,
         ):
-            if fi_decode:
+            for bs in batch_sizes:
+                _set_generation_cache_seq_len(cache, prompt_tokens)
+                decode_input_ids = torch.zeros(bs, 1, dtype=torch.long, device=self.device)
+                row_indices = torch.arange(bs, dtype=torch.long, device=self.device)
+                seq_lens_tensor = torch.full((bs,), prompt_tokens, dtype=torch.long, device=self.device)
                 try:
-                    self._warmup_flashinfer_decode_graphs(cache, batch_sizes)
-                except Exception as _fi_exc:
-                    import sys as _fi_sys
-                    print(f"[WARMUP] FlashInfer graph warmup failed: {_fi_exc}", file=_fi_sys.stderr, flush=True)
-            else:
-                for bs in batch_sizes:
-                    _set_generation_cache_seq_len(cache, prompt_tokens)
-                    decode_input_ids = torch.zeros(bs, 1, dtype=torch.long, device=self.device)
-                    row_indices = torch.arange(bs, dtype=torch.long, device=self.device)
-                    seq_lens_tensor = torch.full((bs,), prompt_tokens, dtype=torch.long, device=self.device)
-                    try:
-                        _try_decode_ragged_token_graph(
-                            self.model, decode_input_ids, cache, seq_lens=seq_lens_tensor,
-                            row_indices=row_indices, temperature=0.0, allow_capture=True,
-                        )
-                    except Exception as _warmup_exc:
-                        import sys as _wsys
-                        print(f"[WARMUP] graph capture failed bs={bs}: {_warmup_exc}", file=_wsys.stderr, flush=True)
-                    _reset_generation_cache(cache)
+                    _try_decode_ragged_token_graph(
+                        self.model, decode_input_ids, cache, seq_lens=seq_lens_tensor,
+                        row_indices=row_indices, temperature=0.0, allow_capture=True,
+                    )
+                except Exception as _warmup_exc:
+                    import sys as _wsys
+                    print(f"[WARMUP] graph capture failed bs={bs}: {_warmup_exc}", file=_wsys.stderr, flush=True)
+                _reset_generation_cache(cache)
+            prefill_chunk = env_int("TORCHINFERNO_OPENAI_TP_ONLINE_PREFILL_CHUNK", 256, minimum=0)
+            if prefill_chunk > 0:
+                ragged_prefill_graph = getattr(self.model, "try_prefill_ragged_logits_graph", None)
+                if ragged_prefill_graph is not None:
+                    suffix_buckets = [b for b in [32, 64, 128, 256] if b <= prefill_chunk]
+                    prefill_batch_sizes = sorted(
+                        {1, 2, 4, 8, 16, 32, max_active}
+                        & set(range(1, cache_batch + 1))
+                    )
+                    for sb in suffix_buckets:
+                        for pbs in prefill_batch_sizes:
+                            _reset_generation_cache(cache)
+                            _set_generation_cache_seq_len(cache, 0)
+                            p_input = torch.zeros(pbs, sb, dtype=torch.long, device=self.device)
+                            p_rows = torch.arange(pbs, dtype=torch.long, device=self.device)
+                            p_seq = torch.zeros(pbs, dtype=torch.long, device=self.device)
+                            p_logit = torch.full((pbs,), sb - 1, dtype=torch.long, device=self.device)
+                            try:
+                                ragged_prefill_graph(
+                                    p_input, cache,
+                                    seq_lens=p_seq, row_indices=p_rows,
+                                    logit_positions=p_logit,
+                                    context_len=sb,
+                                )
+                            except Exception as _pexc:
+                                import sys as _psys
+                                print(f"[WARMUP] prefill graph bs={pbs} sb={sb}: {_pexc}", file=_psys.stderr, flush=True)
+                            _reset_generation_cache(cache)
         self._persistent_serving_cache = cache
-
-    def _warmup_flashinfer_decode_graphs(self, cache: object, batch_sizes: list[int]) -> None:
-        import flashinfer
-        model = self.model
-        device = self.device
-        max_seq = cache.layers[0].max_seq_len
-        num_qo = model.layers[0].local_attention_heads
-        num_kv = model.layers[0].local_key_value_heads
-        head_dim = model.config.head_dim
-        q_dtype = model.dtype
-        fi_graphs: dict[int, object] = {}
-
-        for bs in batch_sizes:
-            _reset_generation_cache(cache)
-            try:
-                ws = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device)
-                ind_buf = torch.empty(bs + 1, dtype=torch.int32, device=device)
-                idx_buf = torch.empty(bs, dtype=torch.int32, device=device)
-                lp_buf = torch.empty(bs, dtype=torch.int32, device=device)
-                dw = flashinfer.CUDAGraphBatchDecodeWithPagedKVCacheWrapper(
-                    ws, ind_buf, idx_buf, lp_buf, kv_layout='NHD',
-                )
-                s_ids = torch.zeros(bs, 1, dtype=torch.long, device=device)
-                s_wp = torch.zeros(bs, 1, dtype=torch.long, device=device)
-                s_ri = torch.arange(bs, dtype=torch.long, device=device)
-
-                def do_plan():
-                    paged_kv_indptr = torch.arange(bs + 1, dtype=torch.int32, device=device)
-                    paged_kv_indices = s_ri.to(dtype=torch.int32)
-                    paged_kv_last_page_len = torch.ones(bs, dtype=torch.int32, device=device)
-                    dw.plan(
-                        indptr=paged_kv_indptr, indices=paged_kv_indices,
-                        last_page_len=paged_kv_last_page_len,
-                        num_qo_heads=num_qo, num_kv_heads=num_kv,
-                        head_dim=head_dim, page_size=max_seq, q_data_type=q_dtype,
-                    )
-
-                do_plan()
-                model.forward_decode_flashinfer(
-                    s_ids, cache, write_positions=s_wp,
-                    row_indices=s_ri, decode_wrapper=dw,
-                )
-                torch.cuda.synchronize()
-
-                stream = torch.cuda.Stream(device=device)
-                stream.wait_stream(torch.cuda.current_stream(device))
-                do_plan()
-                with torch.cuda.stream(stream):
-                    model.forward_decode_flashinfer(
-                        s_ids, cache, write_positions=s_wp,
-                        row_indices=s_ri, decode_wrapper=dw,
-                    )
-                torch.cuda.current_stream(device).wait_stream(stream)
-                torch.cuda.synchronize()
-
-                graph = torch.cuda.CUDAGraph()
-                do_plan()
-                with torch.cuda.graph(graph, stream=stream):
-                    s_logits = model.forward_decode_flashinfer(
-                        s_ids, cache, write_positions=s_wp,
-                        row_indices=s_ri, decode_wrapper=dw,
-                    )
-
-                fi_graphs[bs] = (graph, dw, s_ids, s_wp, s_ri, s_logits, num_qo, num_kv, head_dim, max_seq, q_dtype)
-            except Exception as exc:
-                import sys as _fi_sys
-                print(f"[WARMUP] FlashInfer graph capture failed bs={bs}: {exc}", file=_fi_sys.stderr, flush=True)
-            _reset_generation_cache(cache)
-
-        model._fi_decode_graphs = fi_graphs
 
     def _warmup_token_budget_prefill_graphs(self, prefill_chunk_size: int) -> None:
         state = self._token_budget_step_state
@@ -3157,6 +3107,8 @@ class OpenAICompletionEngine:
             return False
         if self.device.type != "cuda":
             return False
+        # FlashInfer uses broadcast_object_list for the start command, which
+        # requires the worker to be in object-list mode (not tensor mode).
         if _tensor_parallel_tensor_commands_enabled(self.model):
             return False
         try:
@@ -11476,8 +11428,6 @@ def _flashinfer_step_loop(
     *,
     requests: list[_QueuedGeneration] | None = None,
 ) -> None:
-    import flashinfer
-
     active: dict[int, tuple[int, int, int, int, object]] = {}
     free_rows = list(range(max_batch))
     next_prompt_idx = 0
@@ -11488,188 +11438,61 @@ def _flashinfer_step_loop(
         prompts_to_prefill.append((row, next_prompt_idx))
         next_prompt_idx += 1
 
-    workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device)
-    max_seq = getattr(cache, "layers", [None])[0].max_seq_len if hasattr(cache, "layers") and cache.layers else 512
-    num_qo = model.layers[0].local_attention_heads
-    num_kv = model.layers[0].local_key_value_heads
-    head_dim = model.config.head_dim
-    dtype = model.dtype
-    decode_graphs: dict[int, tuple[object, object, Tensor, Tensor, Tensor, Tensor]] = {}
-
-    def _get_decode_graph(bs: int) -> tuple[object, object, Tensor, Tensor, Tensor, Tensor] | None:
-        if bs in decode_graphs:
-            return decode_graphs[bs]
-        if not hasattr(model, "forward_decode_flashinfer"):
-            return None
-        try:
-            ind_buf = torch.empty(bs + 1, dtype=torch.int32, device=device)
-            idx_buf = torch.empty(bs, dtype=torch.int32, device=device)
-            lp_buf = torch.empty(bs, dtype=torch.int32, device=device)
-            dw = flashinfer.CUDAGraphBatchDecodeWithPagedKVCacheWrapper(
-                workspace, ind_buf, idx_buf, lp_buf, kv_layout='NHD',
-            )
-            s_ids = torch.zeros(bs, 1, dtype=torch.long, device=device)
-            s_wp = torch.zeros(bs, 1, dtype=torch.long, device=device)
-            s_ri = torch.arange(bs, dtype=torch.long, device=device)
-
-            paged_kv_indptr = torch.arange(bs + 1, dtype=torch.int32, device=device)
-            paged_kv_indices = s_ri.to(dtype=torch.int32)
-            paged_kv_last_page_len = torch.ones(bs, dtype=torch.int32, device=device)
-            dw.plan(
-                indptr=paged_kv_indptr, indices=paged_kv_indices,
-                last_page_len=paged_kv_last_page_len,
-                num_qo_heads=num_qo, num_kv_heads=num_kv,
-                head_dim=head_dim, page_size=max_seq, q_data_type=dtype,
-            )
-            model.forward_decode_flashinfer(
-                s_ids, cache, write_positions=s_wp,
-                row_indices=s_ri, decode_wrapper=dw,
-            )
-            torch.cuda.synchronize()
-
-            stream = torch.cuda.Stream(device=device)
-            stream.wait_stream(torch.cuda.current_stream(device))
-            dw.plan(
-                indptr=paged_kv_indptr, indices=paged_kv_indices,
-                last_page_len=paged_kv_last_page_len,
-                num_qo_heads=num_qo, num_kv_heads=num_kv,
-                head_dim=head_dim, page_size=max_seq, q_data_type=dtype,
-            )
-            with torch.cuda.stream(stream):
-                model.forward_decode_flashinfer(
-                    s_ids, cache, write_positions=s_wp,
-                    row_indices=s_ri, decode_wrapper=dw,
-                )
-            torch.cuda.current_stream(device).wait_stream(stream)
-            torch.cuda.synchronize()
-
-            graph = torch.cuda.CUDAGraph()
-            dw.plan(
-                indptr=paged_kv_indptr, indices=paged_kv_indices,
-                last_page_len=paged_kv_last_page_len,
-                num_qo_heads=num_qo, num_kv_heads=num_kv,
-                head_dim=head_dim, page_size=max_seq, q_data_type=dtype,
-            )
-            with torch.cuda.graph(graph, stream=stream):
-                s_logits = model.forward_decode_flashinfer(
-                    s_ids, cache, write_positions=s_wp,
-                    row_indices=s_ri, decode_wrapper=dw,
-                )
-            decode_graphs[bs] = (graph, dw, s_ids, s_wp, s_ri, s_logits)
-            return decode_graphs[bs]
-        except Exception:
-            decode_graphs[bs] = None
-            return None
-
     while prompts_to_prefill or active:
-        if prompts_to_prefill:
-            step_rows = []
-            step_q_lens = []
-            step_input_ids_list = []
-            step_write_positions_list = []
-            step_logit_positions = []
-            step_seq_lens = []
-            max_q_len = 1
+        step_rows = []
+        step_q_lens = []
+        step_input_ids_list = []
+        step_write_positions_list = []
+        step_logit_positions = []
+        step_seq_lens = []
+        max_q_len = 1
 
-            for row, (pidx, sl, gen, lt, req) in active.items():
-                step_rows.append(row)
-                step_q_lens.append(1)
-                step_input_ids_list.append([lt])
-                step_write_positions_list.append([sl])
-                step_logit_positions.append(0)
-                step_seq_lens.append(sl)
+        for row, (pidx, sl, gen, lt, req) in active.items():
+            step_rows.append(row)
+            step_q_lens.append(1)
+            step_input_ids_list.append([lt])
+            step_write_positions_list.append([sl])
+            step_logit_positions.append(0)
+            step_seq_lens.append(sl)
 
-            for row, pidx in prompts_to_prefill:
-                prompt = prompts[pidx]
-                step_rows.append(row)
-                step_q_lens.append(len(prompt))
-                step_input_ids_list.append(list(prompt))
-                step_write_positions_list.append(list(range(len(prompt))))
-                step_logit_positions.append(len(prompt) - 1)
-                step_seq_lens.append(0)
-                max_q_len = max(max_q_len, len(prompt))
-                req = requests[pidx] if requests else None
-                active[row] = (pidx, 0, 0, 0, req)
+        for row, pidx in prompts_to_prefill:
+            prompt = prompts[pidx]
+            step_rows.append(row)
+            step_q_lens.append(len(prompt))
+            step_input_ids_list.append(list(prompt))
+            step_write_positions_list.append(list(range(len(prompt))))
+            step_logit_positions.append(len(prompt) - 1)
+            step_seq_lens.append(0)
+            max_q_len = max(max_q_len, len(prompt))
+            req = requests[pidx] if requests else None
+            active[row] = (pidx, 0, 0, 0, req)
 
-            batch = len(step_rows)
-            if batch == 0:
-                break
+        batch = len(step_rows)
+        if batch == 0:
+            break
 
-            for i in range(len(step_input_ids_list)):
-                while len(step_input_ids_list[i]) < max_q_len:
-                    step_input_ids_list[i].append(0)
-                while len(step_write_positions_list[i]) < max_q_len:
-                    step_write_positions_list[i].append(0)
+        for i in range(len(step_input_ids_list)):
+            while len(step_input_ids_list[i]) < max_q_len:
+                step_input_ids_list[i].append(0)
+            while len(step_write_positions_list[i]) < max_q_len:
+                step_write_positions_list[i].append(0)
 
-            input_ids = torch.tensor(step_input_ids_list, device=device, dtype=torch.long)
-            q_lens_t = torch.tensor(step_q_lens, device=device, dtype=torch.long)
-            write_positions = torch.tensor(step_write_positions_list, device=device, dtype=torch.long)
-            logit_positions = torch.tensor(step_logit_positions, device=device, dtype=torch.long)
-            seq_lens = torch.tensor(step_seq_lens, device=device, dtype=torch.long)
-            row_indices = torch.tensor(step_rows, device=device, dtype=torch.long)
+        input_ids = torch.tensor(step_input_ids_list, device=device, dtype=torch.long)
+        q_lens_t = torch.tensor(step_q_lens, device=device, dtype=torch.long)
+        write_positions = torch.tensor(step_write_positions_list, device=device, dtype=torch.long)
+        logit_positions = torch.tensor(step_logit_positions, device=device, dtype=torch.long)
+        seq_lens = torch.tensor(step_seq_lens, device=device, dtype=torch.long)
+        row_indices = torch.tensor(step_rows, device=device, dtype=torch.long)
 
-            logits = model.forward_step_flashinfer(
-                input_ids, cache,
-                seq_lens=seq_lens, q_lens=q_lens_t,
-                write_positions=write_positions, logit_positions=logit_positions,
-                row_indices=row_indices,
-            )
-        else:
-            step_rows = list(active.keys())
-            batch = len(step_rows)
-            if batch == 0:
-                break
-            step_q_lens = [1] * batch
-
-            bucket = 1 << (batch - 1).bit_length() if batch > 1 else 1
-            graph_entry = _get_decode_graph(bucket)
-            if graph_entry is not None:
-                graph_obj, dw, s_ids, s_wp, s_ri, s_logits = graph_entry
-                for i, row in enumerate(step_rows):
-                    pidx, sl, gen, lt, req = active[row]
-                    s_ids[i, 0] = lt
-                    s_wp[i, 0] = sl
-                    s_ri[i] = row
-                for i in range(batch, bucket):
-                    s_ids[i, 0] = 0
-                    s_wp[i, 0] = 0
-                    s_ri[i] = 0
-
-                paged_kv_indptr = torch.arange(bucket + 1, dtype=torch.int32, device=device)
-                paged_kv_indices = s_ri.to(dtype=torch.int32)
-                paged_kv_last_page_len = torch.ones(bucket, dtype=torch.int32, device=device)
-                for i, row in enumerate(step_rows):
-                    pidx, sl, gen, lt, req = active[row]
-                    paged_kv_last_page_len[i] = sl + 1
-
-                dw.plan(
-                    indptr=paged_kv_indptr, indices=paged_kv_indices,
-                    last_page_len=paged_kv_last_page_len,
-                    num_qo_heads=num_qo, num_kv_heads=num_kv,
-                    head_dim=head_dim, page_size=max_seq, q_data_type=dtype,
-                )
-                graph_obj.replay()
-                logits = s_logits
-            else:
-                step_seq_lens = []
-                for row in step_rows:
-                    pidx, sl, gen, lt, req = active[row]
-                    step_seq_lens.append(sl)
-                input_ids = torch.tensor([[active[r][3]] for r in step_rows], device=device, dtype=torch.long)
-                q_lens_t = torch.ones(batch, dtype=torch.long, device=device)
-                write_positions = torch.tensor([[active[r][1]] for r in step_rows], device=device, dtype=torch.long)
-                logit_positions = torch.zeros(batch, dtype=torch.long, device=device)
-                seq_lens = torch.tensor(step_seq_lens, device=device, dtype=torch.long)
-                row_indices = torch.tensor(step_rows, device=device, dtype=torch.long)
-                logits = model.forward_step_flashinfer(
-                    input_ids, cache,
-                    seq_lens=seq_lens, q_lens=q_lens_t,
-                    write_positions=write_positions, logit_positions=logit_positions,
-                    row_indices=row_indices,
-                )
+        logits = model.forward_step_flashinfer(
+            input_ids, cache,
+            seq_lens=seq_lens, q_lens=q_lens_t,
+            write_positions=write_positions, logit_positions=logit_positions,
+            row_indices=row_indices,
+        )
 
         next_tokens = model._sample_next_token(logits[:, -1, :], temperature)
-        next_tokens_cpu = next_tokens[:batch].detach().cpu().tolist()
+        next_tokens_cpu = next_tokens.detach().cpu().tolist()
 
         prompts_to_prefill = []
         finished_rows = []

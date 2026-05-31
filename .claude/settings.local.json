@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(rm -rf /tmp/claude-bobren/claude-65617/-data-users-bobren-d-TorchInferno/5cbbcb02-0a10-4c6c-879a-21e2ced7f20a/tasks/*)",
+      "Bash(pkill -9 -f torchinferno)",
+      "Bash(pkill -9 -f openai_server)",
+      "Read(//tmp/inference-bench/.git/**)"
+    ]
+  }
+}
