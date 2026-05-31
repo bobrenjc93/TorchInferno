@@ -2140,7 +2140,7 @@ class OpenAICompletionEngine:
             store_full_prompt_prefixes=store_full_prompt_prefixes,
             pin_shared_prefix=env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_PIN_SHARED_PREFIX", True),
             graph_prefill=env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_GRAPH_PREFILL", True),
-            prefill_chunk_size=(env_int("TORCHINFERNO_OPENAI_TP_ONLINE_PREFILL_CHUNK", 256, minimum=0) or None),
+            prefill_chunk_size=(env_int("TORCHINFERNO_OPENAI_TP_ONLINE_PREFILL_CHUNK", 0, minimum=0) or None),
             profile_timings=bool(self._queue_profile_path_value()),
         )
         add_phase("engine_create_ms", engine_create_start_s)
@@ -2976,7 +2976,7 @@ class OpenAICompletionEngine:
             store_reusable_prefixes=store_reusable_prefixes,
             store_full_prompt_prefixes=store_full_prompt_prefixes,
             graph_prefill=env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_GRAPH_PREFILL", True),
-            prefill_chunk_size=(env_int("TORCHINFERNO_OPENAI_TP_ONLINE_PREFILL_CHUNK", 256, minimum=0) or None),
+            prefill_chunk_size=(env_int("TORCHINFERNO_OPENAI_TP_ONLINE_PREFILL_CHUNK", 0, minimum=0) or None),
             profile_timings=bool(self._queue_profile_path_value()),
         )
         request_by_id = {str(index): request for index, request in enumerate(group)}
@@ -3190,7 +3190,7 @@ class OpenAICompletionEngine:
             enable_ragged_decode=enable_ragged_decode,
             store_full_prompt_prefixes=store_full_prompt_prefixes,
             graph_prefill=env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_GRAPH_PREFILL", True),
-            prefill_chunk_size=(env_int("TORCHINFERNO_OPENAI_TP_ONLINE_PREFILL_CHUNK", 256, minimum=0) or None),
+            prefill_chunk_size=(env_int("TORCHINFERNO_OPENAI_TP_ONLINE_PREFILL_CHUNK", 0, minimum=0) or None),
             profile_timings=bool(self._queue_profile_path_value()),
         )
         request_by_id = {str(index): request for index, request in enumerate(group)}
@@ -9877,7 +9877,7 @@ def _tensor_parallel_worker_loop(engine: OpenAICompletionEngine) -> None:
                     store_full_prompt_prefixes=bool(payload.get("store_full_prompt_prefixes", True)),
                     pin_shared_prefix=env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_PIN_SHARED_PREFIX", True),
                     graph_prefill=env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_GRAPH_PREFILL", True),
-            prefill_chunk_size=(env_int("TORCHINFERNO_OPENAI_TP_ONLINE_PREFILL_CHUNK", 256, minimum=0) or None),
+            prefill_chunk_size=(env_int("TORCHINFERNO_OPENAI_TP_ONLINE_PREFILL_CHUNK", 0, minimum=0) or None),
                 )
                 worker_shared_cache = getattr(engine, "_persistent_serving_cache", None)
                 if worker_shared_cache is None:
