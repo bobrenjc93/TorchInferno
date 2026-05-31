@@ -804,6 +804,8 @@ class Llama3TensorParallelCache:
         view._graph_cache_id = self._graph_cache_id
         if getattr(self, "_skip_capture_sync", False):
             view._skip_capture_sync = True
+        if getattr(self, "_block_new_graph_captures", False):
+            view._block_new_graph_captures = True
         return view
 
     def clear_row(self, row: int) -> None:
@@ -2618,6 +2620,8 @@ class Llama3TensorParallelForCausalLM:
         temperature: float = 0.0,
         capture_on_miss: bool = True,
     ) -> Tensor | None:
+        if getattr(cache, "_block_new_graph_captures", False):
+            capture_on_miss = False
         if (
             not _tp_env_set("TORCHINFERNO_CUDAGRAPH_PREFILL")
             and int(getattr(self.config, "hidden_size", 0)) < 1024
@@ -2641,6 +2645,8 @@ class Llama3TensorParallelForCausalLM:
         *,
         capture_on_miss: bool = True,
     ) -> Tensor | None:
+        if getattr(cache, "_block_new_graph_captures", False):
+            capture_on_miss = False
         if self._prefill_logits_graph_failed or not _should_use_prefill_logits_graph(input_ids, cache):
             return None
         try:
@@ -3010,6 +3016,8 @@ class Llama3TensorParallelForCausalLM:
         temperature: float = 0.0,
         capture_on_miss: bool = True,
     ) -> Tensor | None:
+        if getattr(cache, "_block_new_graph_captures", False):
+            capture_on_miss = False
         if self._decode_graph_failed or not _should_use_decode_step_graph(input_ids, cache, temperature):
             return None
         try:
@@ -3080,6 +3088,8 @@ class Llama3TensorParallelForCausalLM:
         temperature: float = 0.0,
         capture_on_miss: bool = True,
     ) -> Tensor | None:
+        if getattr(cache, "_block_new_graph_captures", False):
+            capture_on_miss = False
         if self._ragged_decode_graph_failed or not _should_use_ragged_decode_token_graph(
             input_ids,
             cache,
@@ -4013,6 +4023,8 @@ class Llama3TensorParallelForCausalLM:
         src_prefix_row: Tensor | None = None,
         capture_on_miss: bool = True,
     ) -> Tensor | None:
+        if getattr(cache, "_block_new_graph_captures", False):
+            capture_on_miss = False
         if self._ragged_prefill_logits_graph_failed or not _should_use_ragged_prefill_logits_graph(
             input_ids,
             cache,

@@ -1752,9 +1752,16 @@ class OpenAICompletionEngine:
             getattr(self, "max_model_len", None) or 768,
             minimum=64,
         )
+        fi_cache = hasattr(self.model, "forward_decode_flashinfer")
+        if fi_cache:
+            try:
+                import flashinfer  # noqa: F401
+            except ImportError:
+                fi_cache = False
+        backend = "flashinfer" if fi_cache else self.cache_backend
         cache = _allocate_cache(
             self.model, cache_batch, _generation_cache_capacity(self.model, max_seq_len),
-            device=self.device, cache_backend=self.cache_backend, page_size=self.page_size,
+            device=self.device, cache_backend=backend, page_size=self.page_size,
         )
         _reset_generation_cache(cache)
         try:
@@ -1813,6 +1820,10 @@ class OpenAICompletionEngine:
                                 import sys as _psys
                                 print(f"[WARMUP] prefill graph bs={pbs} sb={sb}: {_pexc}", file=_psys.stderr, flush=True)
                             _reset_generation_cache(cache)
+        try:
+            cache._block_new_graph_captures = True
+        except Exception:
+            pass
         self._persistent_serving_cache = cache
 
     def _warmup_token_budget_prefill_graphs(self, prefill_chunk_size: int) -> None:
