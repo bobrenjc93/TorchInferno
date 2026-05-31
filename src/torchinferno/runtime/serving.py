@@ -2073,9 +2073,6 @@ class ContinuousBatchEngine:
         seq_lens: Tensor,
         row_indices: Tensor,
     ) -> Tensor | None:
-        fi_token = self._try_flashinfer_decode_graph(input_ids, seq_lens, row_indices)
-        if fi_token is not None:
-            return fi_token
         decode_graph = getattr(self.model, "try_decode_ragged_token_graph", None)
         if decode_graph is None:
             return None
@@ -2089,50 +2086,6 @@ class ContinuousBatchEngine:
         if token is None:
             self.stats.decode_graph_misses += 1
         return token
-
-    def _try_flashinfer_decode_graph(
-        self,
-        input_ids: Tensor,
-        seq_lens: Tensor,
-        row_indices: Tensor,
-    ) -> Tensor | None:
-        fi_graphs = getattr(self.model, "_fi_decode_graphs", None)
-        if not fi_graphs:
-            return None
-
-        batch = input_ids.size(0)
-        bucket = 1 << (batch - 1).bit_length() if batch > 1 else 1
-        entry = fi_graphs.get(bucket)
-        if entry is None:
-            return None
-
-        graph, dw, s_ids, s_wp, s_ri, s_logits, num_qo, num_kv, head_dim, max_seq, q_dtype = entry
-
-        s_ids[:batch].copy_(input_ids)
-        s_ri[:batch].copy_(row_indices)
-        if batch < bucket:
-            s_ids[batch:] = 0
-            s_ri[batch:] = 0
-
-        paged_kv_indptr = torch.arange(bucket + 1, dtype=torch.int32, device=self.device)
-        paged_kv_indices = s_ri.to(dtype=torch.int32)
-        paged_kv_last_page_len = torch.ones(bucket, dtype=torch.int32, device=self.device)
-        row_sl = seq_lens[row_indices[:batch].long()]
-        s_wp[:batch, 0].copy_(row_sl)
-        paged_kv_last_page_len[:batch] = (row_sl + 1).to(torch.int32)
-        if batch < bucket:
-            s_wp[batch:] = 0
-
-        dw.plan(
-            indptr=paged_kv_indptr, indices=paged_kv_indices,
-            last_page_len=paged_kv_last_page_len,
-            num_qo_heads=num_qo, num_kv_heads=num_kv,
-            head_dim=head_dim, page_size=max_seq, q_data_type=q_dtype,
-        )
-        graph.replay()
-
-        next_tokens = self._sample_logits(s_logits[:batch, -1, :])
-        return next_tokens
 
     def _try_static_token_graph(self, input_ids: Tensor, cache: object) -> Tensor | None:
         decode_graph = getattr(self.model, "try_decode_one_token_graph", None)
