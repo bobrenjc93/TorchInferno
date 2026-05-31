@@ -1833,6 +1833,75 @@ class OpenAICompletionEngine:
                 pass
         self._persistent_serving_cache = cache
 
+    def _warmup_flashinfer_decode_graphs(self, cache: object, batch_sizes: list[int]) -> None:
+        import flashinfer
+        model = self.model
+        device = self.device
+        max_seq = cache.layers[0].max_seq_len
+        num_qo = model.layers[0].local_attention_heads
+        num_kv = model.layers[0].local_key_value_heads
+        head_dim = model.config.head_dim
+        q_dtype = model.dtype
+        fi_graphs: dict[int, object] = {}
+
+        for bs in batch_sizes:
+            _reset_generation_cache(cache)
+            try:
+                ws = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device)
+                ind_buf = torch.empty(bs + 1, dtype=torch.int32, device=device)
+                idx_buf = torch.empty(bs, dtype=torch.int32, device=device)
+                lp_buf = torch.empty(bs, dtype=torch.int32, device=device)
+                dw = flashinfer.CUDAGraphBatchDecodeWithPagedKVCacheWrapper(
+                    ws, ind_buf, idx_buf, lp_buf, kv_layout='NHD',
+                )
+                s_ids = torch.zeros(bs, 1, dtype=torch.long, device=device)
+                s_wp = torch.zeros(bs, 1, dtype=torch.long, device=device)
+                s_ri = torch.arange(bs, dtype=torch.long, device=device)
+
+                def do_plan(dw_ref=dw, ri_ref=s_ri, bs_ref=bs):
+                    indptr = torch.arange(bs_ref + 1, dtype=torch.int32, device=device)
+                    indices = ri_ref.to(dtype=torch.int32)
+                    last_page = torch.ones(bs_ref, dtype=torch.int32, device=device)
+                    dw_ref.plan(
+                        indptr=indptr, indices=indices, last_page_len=last_page,
+                        num_qo_heads=num_qo, num_kv_heads=num_kv,
+                        head_dim=head_dim, page_size=max_seq, q_data_type=q_dtype,
+                    )
+
+                do_plan()
+                model.forward_decode_flashinfer(
+                    s_ids, cache, write_positions=s_wp,
+                    row_indices=s_ri, decode_wrapper=dw,
+                )
+                torch.cuda.synchronize()
+
+                stream = torch.cuda.Stream(device=device)
+                stream.wait_stream(torch.cuda.current_stream(device))
+                do_plan()
+                with torch.cuda.stream(stream):
+                    model.forward_decode_flashinfer(
+                        s_ids, cache, write_positions=s_wp,
+                        row_indices=s_ri, decode_wrapper=dw,
+                    )
+                torch.cuda.current_stream(device).wait_stream(stream)
+                torch.cuda.synchronize()
+
+                graph = torch.cuda.CUDAGraph()
+                do_plan()
+                with torch.cuda.graph(graph, stream=stream):
+                    s_logits = model.forward_decode_flashinfer(
+                        s_ids, cache, write_positions=s_wp,
+                        row_indices=s_ri, decode_wrapper=dw,
+                    )
+
+                fi_graphs[bs] = (graph, dw, s_ids, s_wp, s_ri, s_logits, num_qo, num_kv, head_dim, max_seq, q_dtype)
+            except Exception as exc:
+                import sys as _fi_sys
+                print(f"[WARMUP] FlashInfer graph bs={bs}: {exc}", file=_fi_sys.stderr, flush=True)
+            _reset_generation_cache(cache)
+
+        model._fi_decode_graphs = fi_graphs
+
     def _warmup_token_budget_prefill_graphs(self, prefill_chunk_size: int) -> None:
         state = self._token_budget_step_state
         if state is None:
