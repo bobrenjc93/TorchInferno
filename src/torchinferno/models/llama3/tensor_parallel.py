@@ -463,15 +463,116 @@ class FlashInferLayerKVCache:
         first = self._seq_lens[rows[0]] if rows[0] < len(self._seq_lens) else 0
         return first
 
-    def for_rows(self, rows: tuple[int, ...] | list[int]) -> "FlashInferLayerKVCache":
+    def for_rows(self, rows: tuple[int, ...] | list[int]) -> "_FlashInferLayerKVCacheView":
         rows = tuple(rows) if not isinstance(rows, tuple) else rows
-        view = object.__new__(FlashInferLayerKVCache)
-        view.paged_kv = self.paged_kv[list(rows)]
-        view.max_seq_len = self.max_seq_len
-        view.batch_size = len(rows)
-        view._seq_lens = [self._seq_lens[r] if 0 <= r < len(self._seq_lens) else 0 for r in rows]
-        view._uniform_seq_len = [None]
-        return view
+        return _FlashInferLayerKVCacheView(self, rows)
+
+
+class _FlashInferLayerKVCacheView:
+    cache_backend = "flashinfer"
+
+    def __init__(self, parent: FlashInferLayerKVCache, rows: tuple[int, ...]) -> None:
+        self._parent = parent
+        self._rows = rows
+        self._row_list = list(rows)
+        self.max_seq_len = parent.max_seq_len
+        self.batch_size = len(rows)
+        self._uniform_seq_len: list[int | None] = [None]
+
+    @property
+    def paged_kv(self) -> Tensor:
+        return self._parent.paged_kv[self._row_list]
+
+    @property
+    def _seq_lens(self) -> list[int]:
+        return [self._parent._seq_lens[r] if 0 <= r < len(self._parent._seq_lens) else 0 for r in self._rows]
+
+    @property
+    def keys(self) -> Tensor:
+        return self._parent.paged_kv[self._row_list, 0].transpose(1, 2)
+
+    @keys.setter
+    def keys(self, value: Tensor) -> None:
+        self._parent.paged_kv[self._row_list, 0] = value.transpose(1, 2)
+
+    @property
+    def values(self) -> Tensor:
+        return self._parent.paged_kv[self._row_list, 1].transpose(1, 2)
+
+    @values.setter
+    def values(self, value: Tensor) -> None:
+        self._parent.paged_kv[self._row_list, 1] = value.transpose(1, 2)
+
+    @property
+    def seq_len(self) -> int:
+        sl = self._seq_lens
+        if not sl:
+            return 0
+        first = sl[0]
+        if all(s == first for s in sl):
+            return first
+        raise ValueError("seq_len is not uniform across rows")
+
+    @seq_len.setter
+    def seq_len(self, seq_len: int) -> None:
+        self.set_seq_len(seq_len)
+
+    def set_seq_len(self, seq_len: int) -> None:
+        for r in self._rows:
+            if 0 <= r < len(self._parent._seq_lens):
+                self._parent._seq_lens[r] = seq_len
+        self._parent._uniform_seq_len[0] = None
+
+    def reset(self) -> None:
+        self.set_seq_len(0)
+
+    def clear_row(self, row: int) -> None:
+        if 0 <= row < len(self._rows):
+            physical = self._rows[row]
+            if 0 <= physical < len(self._parent._seq_lens):
+                self._parent._seq_lens[physical] = 0
+            self._parent._uniform_seq_len[0] = None
+
+    def _selected_rows(self, batch: int | None = None) -> tuple[int, ...]:
+        size = self.batch_size if batch is None else batch
+        return tuple(range(size))
+
+    def _physical_row(self, row: int) -> int:
+        return row
+
+    def _selected_row_indices_tensor(self, batch: int | None = None) -> Tensor | None:
+        return None
+
+    def seq_len_for_rows(self, rows: tuple[int, ...]) -> int:
+        sl = self._seq_lens
+        if not rows:
+            return 0
+        return sl[rows[0]] if rows[0] < len(sl) else 0
+
+    def append(self, k: Tensor, v: Tensor) -> tuple[Tensor, Tensor]:
+        sl = self._seq_lens
+        seq_len = sl[0] if sl else 0
+        tokens = k.size(2)
+        end = seq_len + tokens
+        self.keys[:, :, seq_len:end, :] = k
+        self.values[:, :, seq_len:end, :] = v
+        self.set_seq_len(end)
+        return self.keys[:self.batch_size, :, :end, :], self.values[:self.batch_size, :, :end, :]
+
+    def copy_prefix_from(
+        self,
+        source: "FlashInferLayerKVCache | _FlashInferLayerKVCacheView",
+        tokens: int,
+        *,
+        source_row: int = 0,
+        dest_row: int = 0,
+    ) -> None:
+        if tokens <= 0:
+            return
+        src_parent = source._parent if isinstance(source, _FlashInferLayerKVCacheView) else source
+        src_physical = source._rows[source_row] if isinstance(source, _FlashInferLayerKVCacheView) else source_row
+        dst_physical = self._rows[dest_row]
+        self._parent.paged_kv[dst_physical, :, :tokens, :, :] = src_parent.paged_kv[src_physical, :, :tokens, :, :]
 
 
 class PagedLlama3TensorParallelLayerKVCache:
