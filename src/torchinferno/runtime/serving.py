@@ -1023,14 +1023,17 @@ class ContinuousBatchEngine:
         graph = getattr(self.model, "try_prefill_ragged_logits_graph", None)
         if graph is None:
             return None
+        cache = self._require_cache()
+        no_capture = getattr(cache, "_skip_capture_sync", False)
         logits = graph(
             input_ids,
-            self._require_cache(),
+            cache,
             seq_lens=seq_lens,
             row_indices=row_indices,
             logit_positions=logit_positions,
             context_len=context_len,
             src_prefix_row=src_prefix_row,
+            capture_on_miss=not no_capture,
         )
         if logits is None:
             self.stats.prefill_graph_misses += 1
@@ -2076,12 +2079,15 @@ class ContinuousBatchEngine:
         decode_graph = getattr(self.model, "try_decode_ragged_token_graph", None)
         if decode_graph is None:
             return None
+        cache = self._require_cache()
+        no_capture = getattr(cache, "_skip_capture_sync", False)
         token = decode_graph(
             input_ids,
-            self._require_cache(),
+            cache,
             seq_lens=seq_lens,
             row_indices=row_indices,
             temperature=self.temperature,
+            capture_on_miss=not no_capture,
         )
         if token is None:
             self.stats.decode_graph_misses += 1

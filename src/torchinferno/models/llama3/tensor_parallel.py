@@ -447,21 +447,31 @@ class FlashInferLayerKVCache:
         self.set_seq_len(end)
         return self.keys[:batch, :, :end, :], self.values[:batch, :, :end, :]
 
-    def for_rows(self, rows: tuple[int, ...] | list[int]) -> "Llama3TensorParallelLayerKVCache":
-        # Fall back to dense cache view for compatibility with existing code
-        # that uses for_rows (e.g., prefix copy, non-FlashInfer attention paths)
-        dense = Llama3TensorParallelLayerKVCache(
-            len(rows), self.max_seq_len,
-            self.paged_kv.size(3), self.paged_kv.size(4),
-            device=self.paged_kv.device, dtype=self.paged_kv.dtype,
-        )
-        for i, row in enumerate(rows):
-            dense.keys[i] = self.keys[row]
-            dense.values[i] = self.values[row]
-            if 0 <= row < len(self._seq_lens):
-                dense._seq_lens[i] = self._seq_lens[row]
-        dense._uniform_seq_len[0] = None
-        return dense
+    def _selected_rows(self, batch: int | None = None) -> tuple[int, ...]:
+        size = self.batch_size if batch is None else batch
+        return tuple(range(size))
+
+    def _physical_row(self, row: int) -> int:
+        return row
+
+    def _selected_row_indices_tensor(self, batch: int | None = None) -> Tensor | None:
+        return None
+
+    def seq_len_for_rows(self, rows: tuple[int, ...]) -> int:
+        if not rows:
+            return 0
+        first = self._seq_lens[rows[0]] if rows[0] < len(self._seq_lens) else 0
+        return first
+
+    def for_rows(self, rows: tuple[int, ...] | list[int]) -> "FlashInferLayerKVCache":
+        rows = tuple(rows) if not isinstance(rows, tuple) else rows
+        view = object.__new__(FlashInferLayerKVCache)
+        view.paged_kv = self.paged_kv[list(rows)]
+        view.max_seq_len = self.max_seq_len
+        view.batch_size = len(rows)
+        view._seq_lens = [self._seq_lens[r] if 0 <= r < len(self._seq_lens) else 0 for r in rows]
+        view._uniform_seq_len = [None]
+        return view
 
 
 class PagedLlama3TensorParallelLayerKVCache:
@@ -4941,6 +4951,9 @@ def _should_use_decode_step_logits_graph(
 
 
 def _static_decode_cache_rows_are_contiguous(cache: Llama3TensorParallelCache, batch: int) -> bool:
+    for layer in cache.layers:
+        if not hasattr(layer, '_selected_rows'):
+            return False
     return all(_contiguous_row_span(layer._selected_rows(batch)) is not None for layer in cache.layers)
 
 

@@ -1752,10 +1752,20 @@ class OpenAICompletionEngine:
             getattr(self, "max_model_len", None) or 768,
             minimum=64,
         )
+        fi_cache = hasattr(self.model, "forward_decode_flashinfer")
+        if fi_cache:
+            try:
+                import flashinfer  # noqa: F401
+            except ImportError:
+                fi_cache = False
+        backend = self.cache_backend
         cache = _allocate_cache(
             self.model, cache_batch, _generation_cache_capacity(self.model, max_seq_len),
-            device=self.device, cache_backend=self.cache_backend, page_size=self.page_size,
+            device=self.device, cache_backend=backend, page_size=self.page_size,
         )
+        import sys as _warmup_sys
+        _layer_type = type(cache.layers[0]).__name__ if hasattr(cache, 'layers') and cache.layers else 'unknown'
+        print(f"[WARMUP] cache backend={backend} layer_type={_layer_type} batch={cache_batch}", file=_warmup_sys.stderr, flush=True)
         _reset_generation_cache(cache)
         try:
             cache._skip_capture_sync = True
@@ -2266,6 +2276,8 @@ class OpenAICompletionEngine:
                     max_tokens=run_max_tokens,
                 )
                 shared_cache = getattr(self, "_persistent_serving_cache", None)
+                if shared_cache is not None:
+                    _reset_generation_cache(shared_cache)
                 if shared_cache is None:
                     try:
                         total_online_rows = max_active + prefix_rows
@@ -2321,6 +2333,11 @@ class OpenAICompletionEngine:
                         _sync_tensor_parallel_command(self.model, self.device)
                         add_phase("step_sync_ms", step_sync_start_s)
         except BaseException as exc:
+            import sys as _exc_sys, traceback as _exc_tb
+            _ob_cache = getattr(runtime_engine, '_cache', None)
+            _ob_layer_type = type(_ob_cache.layers[0]).__name__ if hasattr(_ob_cache, 'layers') and _ob_cache.layers else 'unknown'
+            print(f"[ONLINE_BATCHER] CRASHED: {exc!r} cache_layer={_ob_layer_type}", file=_exc_sys.stderr, flush=True)
+            _exc_tb.print_exc(file=_exc_sys.stderr)
             for request in request_by_id.values():
                 if not request.done:
                     request.responses.put(exc)
