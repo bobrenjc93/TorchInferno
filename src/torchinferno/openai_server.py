@@ -1743,8 +1743,6 @@ class OpenAICompletionEngine:
 
     def _warmup_unified_scheduler_cache(self, vocab_size: int) -> None:
         max_active = self._online_serving_max_active()
-        # Persistent cache holds active rows plus extra rows for shared prompt
-        # prefixes, so the continuous batcher can prefill only suffixes.
         total_rows = max_active + self._online_serving_prefix_rows()
         cache_batch = total_rows
         max_seq_len = env_int(

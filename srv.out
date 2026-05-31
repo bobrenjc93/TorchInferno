@@ -1,0 +1,18 @@
+NCCL version 2.29.7+cuda12.6
+
+[2026-05-31 16:33:37] devgpu006:2731665:2731665 [2] misc/ibvwrap.cc:173 NCCL WARN lib wrapper not initialized.
+
+[2026-05-31 16:33:37] devgpu006:2731662:2731662 [0] misc/ibvwrap.cc:173 NCCL WARN lib wrapper not initialized.
+
+[2026-05-31 16:33:37] devgpu006:2731676:2731676 [7] misc/ibvwrap.cc:173 NCCL WARN lib wrapper not initialized.
+
+[2026-05-31 16:33:37] devgpu006:2731672:2731672 [4] misc/ibvwrap.cc:173 NCCL WARN lib wrapper not initialized.
+
+[2026-05-31 16:33:37] devgpu006:2731668:2731668 [3] misc/ibvwrap.cc:173 NCCL WARN lib wrapper not initialized.
+
+[2026-05-31 16:33:38] devgpu006:2731675:2731675 [6] misc/ibvwrap.cc:173 NCCL WARN lib wrapper not initialized.
+
+[2026-05-31 16:33:38] devgpu006:2731664:2731664 [1] misc/ibvwrap.cc:173 NCCL WARN lib wrapper not initialized.
+
+[2026-05-31 16:33:38] devgpu006:2731674:2731674 [5] misc/ibvwrap.cc:173 NCCL WARN lib wrapper not initialized.
+TorchInferno OpenAI server listening on http://0.0.0.0:8001/v1 model=meta-llama/Meta-Llama-3.1-70B-Instruct
