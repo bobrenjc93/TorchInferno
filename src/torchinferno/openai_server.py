@@ -1768,29 +1768,31 @@ class OpenAICompletionEngine:
             {1, 2, 4, 8, 16, 32, max_active, cache_batch}
             & set(range(1, cache_batch + 1))
         )
+        fi_decode = hasattr(self.model, "forward_decode_flashinfer")
         with _tensor_parallel_symm_mem_allreduce_scope(
             self.model, self.device, max_tokens=1, temperature=0.0,
         ):
-            for bs in batch_sizes:
-                _set_generation_cache_seq_len(cache, prompt_tokens)
-                decode_input_ids = torch.zeros(bs, 1, dtype=torch.long, device=self.device)
-                row_indices = torch.arange(bs, dtype=torch.long, device=self.device)
-                seq_lens_tensor = torch.full((bs,), prompt_tokens, dtype=torch.long, device=self.device)
-                try:
-                    _try_decode_ragged_token_graph(
-                        self.model, decode_input_ids, cache, seq_lens=seq_lens_tensor,
-                        row_indices=row_indices, temperature=0.0, allow_capture=True,
-                    )
-                except Exception as _warmup_exc:
-                    import sys as _wsys
-                    print(f"[WARMUP] graph capture failed bs={bs}: {_warmup_exc}", file=_wsys.stderr, flush=True)
-                _reset_generation_cache(cache)
-            if hasattr(self.model, "forward_decode_flashinfer"):
+            if fi_decode:
                 try:
                     self._warmup_flashinfer_decode_graphs(cache, batch_sizes)
                 except Exception as _fi_exc:
                     import sys as _fi_sys
                     print(f"[WARMUP] FlashInfer graph warmup failed: {_fi_exc}", file=_fi_sys.stderr, flush=True)
+            else:
+                for bs in batch_sizes:
+                    _set_generation_cache_seq_len(cache, prompt_tokens)
+                    decode_input_ids = torch.zeros(bs, 1, dtype=torch.long, device=self.device)
+                    row_indices = torch.arange(bs, dtype=torch.long, device=self.device)
+                    seq_lens_tensor = torch.full((bs,), prompt_tokens, dtype=torch.long, device=self.device)
+                    try:
+                        _try_decode_ragged_token_graph(
+                            self.model, decode_input_ids, cache, seq_lens=seq_lens_tensor,
+                            row_indices=row_indices, temperature=0.0, allow_capture=True,
+                        )
+                    except Exception as _warmup_exc:
+                        import sys as _wsys
+                        print(f"[WARMUP] graph capture failed bs={bs}: {_warmup_exc}", file=_wsys.stderr, flush=True)
+                    _reset_generation_cache(cache)
         self._persistent_serving_cache = cache
 
     def _warmup_flashinfer_decode_graphs(self, cache: object, batch_sizes: list[int]) -> None:
