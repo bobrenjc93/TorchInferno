@@ -1749,7 +1749,7 @@ class OpenAICompletionEngine:
         cache_batch = total_rows
         max_seq_len = env_int(
             "TORCHINFERNO_OPENAI_UNIFIED_MAX_SEQ_LEN",
-            getattr(self, "max_model_len", None) or 768,
+            getattr(self, "max_model_len", None) or 896,
             minimum=64,
         )
         cache = _allocate_cache(
