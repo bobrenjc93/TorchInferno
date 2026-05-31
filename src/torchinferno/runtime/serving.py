@@ -1425,14 +1425,21 @@ class ContinuousBatchEngine:
             self._set_cache_row_seq_len(state.row, state.seq_len)
         rows = [state.row for state in states]
         input_ids = torch.tensor([[state.last_token] for state in states], device=self.device, dtype=torch.long)
-        cache_view = self._cache_view(rows)
-        graph_token = self._try_static_token_graph(input_ids, cache_view)
-        if graph_token is not None:
-            next_token_tensor = graph_token.to(self.device)
+        row_indices_t = torch.tensor(rows, dtype=torch.long, device=self.device)
+        seq_lens_t = self._seq_lens_tensor(states, rows=rows)
+        fi_token = self._try_flashinfer_decode_graph(input_ids, seq_lens_t, row_indices_t)
+        if fi_token is not None:
+            next_token_tensor = fi_token.to(self.device)
             self.stats.decode_graph_hits += 1
         else:
-            logits = self._static_decode_logits(input_ids, cache_view)
-            next_token_tensor = self._sample_logits(logits[:, -1, :])
+            cache_view = self._cache_view(rows)
+            graph_token = self._try_static_token_graph(input_ids, cache_view)
+            if graph_token is not None:
+                next_token_tensor = graph_token.to(self.device)
+                self.stats.decode_graph_hits += 1
+            else:
+                logits = self._static_decode_logits(input_ids, cache_view)
+                next_token_tensor = self._sample_logits(logits[:, -1, :])
         self._record_model_call("decode", len(states), tokens=len(states))
         next_tokens = next_token_tensor.detach().cpu().tolist()
 
@@ -1462,14 +1469,21 @@ class ContinuousBatchEngine:
     ) -> _ActiveRequest | ServingResult:
         self._set_cache_row_seq_len(state.row, state.seq_len)
         input_ids = torch.tensor([[state.last_token]], device=self.device, dtype=torch.long)
-        cache_view = self._cache_view([state.row])
-        graph_token = self._try_static_token_graph(input_ids, cache_view)
-        if graph_token is not None:
-            next_token_tensor = graph_token.to(self.device)
+        row_indices_t = torch.tensor([state.row], dtype=torch.long, device=self.device)
+        seq_lens_t = self._seq_lens_tensor([state], rows=[state.row])
+        fi_token = self._try_flashinfer_decode_graph(input_ids, seq_lens_t, row_indices_t)
+        if fi_token is not None:
+            next_token_tensor = fi_token.to(self.device)
             self.stats.decode_graph_hits += 1
         else:
-            logits = self._static_decode_logits(input_ids, cache_view)
-            next_token_tensor = self._sample_logits(logits[:, -1, :])
+            cache_view = self._cache_view([state.row])
+            graph_token = self._try_static_token_graph(input_ids, cache_view)
+            if graph_token is not None:
+                next_token_tensor = graph_token.to(self.device)
+                self.stats.decode_graph_hits += 1
+            else:
+                logits = self._static_decode_logits(input_ids, cache_view)
+                next_token_tensor = self._sample_logits(logits[:, -1, :])
         self._record_model_call("decode", 1, tokens=1)
         next_token = int(next_token_tensor.item())
         state.tokens.append(next_token)
