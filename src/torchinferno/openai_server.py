@@ -2067,6 +2067,8 @@ class OpenAICompletionEngine:
         explicit = "TORCHINFERNO_OPENAI_TP_ONLINE_CONTINUOUS_BATCHER" in os.environ
         if not env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_CONTINUOUS_BATCHER", True):
             return False
+        if self._should_use_flashinfer_stream_group([first]):
+            return False
         if not first.stream:
             return False
         if not _is_tensor_parallel_primary_model(self.model):
@@ -4066,7 +4068,11 @@ class OpenAICompletionEngine:
             )
             self._generation_cache(1, warmup_cache_tokens, model=self.model, pool=False)
             _warmup_tensor_parallel_decode_attention(self.model)
-            if (
+            fi_sched = (
+                env_flag("TORCHINFERNO_OPENAI_FLASHINFER", True)
+                and not _tensor_parallel_tensor_commands_enabled(self.model)
+            )
+            if not fi_sched and (
                 env_flag("TORCHINFERNO_OPENAI_UNIFIED_SCHEDULER", False)
                 or env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_CONTINUOUS_BATCHER", True)
             ) and hasattr(self.model, "allocate_cache"):
