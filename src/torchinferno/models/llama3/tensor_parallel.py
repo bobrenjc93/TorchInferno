@@ -418,6 +418,23 @@ class FlashInferLayerKVCache:
         if 0 <= row < len(self._seq_lens):
             self._seq_lens[row] = 0
 
+    def copy_prefix_from(
+        self,
+        source: "FlashInferLayerKVCache",
+        tokens: int,
+        *,
+        source_row: int = 0,
+        dest_row: int = 0,
+    ) -> None:
+        if tokens <= 0:
+            return
+        self.keys[dest_row : dest_row + 1, :, :tokens, :].copy_(
+            source.keys[source_row : source_row + 1, :, :tokens, :]
+        )
+        self.values[dest_row : dest_row + 1, :, :tokens, :].copy_(
+            source.values[source_row : source_row + 1, :, :tokens, :]
+        )
+
     def append(self, k: Tensor, v: Tensor) -> tuple[Tensor, Tensor]:
         seq_len = self.seq_len
         tokens = k.size(2)
@@ -3860,6 +3877,45 @@ class Llama3TensorParallelForCausalLM:
         gather_positions = logit_positions.view(batch, 1, 1).expand(-1, 1, attn_in.size(-1))
         gathered = torch.gather(attn_in, 1, gather_positions)
         return _decode_linear(gathered, self.lm_head_weight, self.lm_head_weight_decode)
+
+    def forward_decode_flashinfer(
+        self,
+        input_ids: Tensor,
+        cache: Llama3TensorParallelCache,
+        *,
+        write_positions: Tensor,
+        row_indices: Tensor,
+        decode_wrapper: object,
+    ) -> Tensor:
+        batch = input_ids.size(0)
+
+        flat_positions = write_positions.reshape(-1).clamp(0, self.rotary_cos_cache.size(0) - 1)
+        rotary = (
+            self.rotary_cos_cache.index_select(0, flat_positions).view(batch, 1, -1),
+            self.rotary_sin_cache.index_select(0, flat_positions).view(batch, 1, -1),
+        )
+
+        hidden = F.embedding(input_ids, self.embed_tokens_weight)
+        attn_in: Tensor | None = None
+
+        for layer_id, layer in enumerate(self.layers):
+            next_norm_weight = (
+                self.layers[layer_id + 1].input_layernorm_weight
+                if layer_id + 1 < len(self.layers)
+                else self.norm_weight
+            )
+            hidden, attn_in = layer.forward_flashinfer(
+                hidden, attn_in, rotary,
+                cache.layers[layer_id],
+                write_positions,
+                decode_wrapper,
+                next_norm_weight,
+                row_indices=row_indices,
+            )
+
+        if attn_in is None:
+            attn_in = _tp_decode_rms_norm(hidden, self.norm_weight, self.config.rms_norm_eps)
+        return _decode_linear(attn_in, self.lm_head_weight, self.lm_head_weight_decode)
 
     @torch.inference_mode()
     def prefill_ragged_logits(
