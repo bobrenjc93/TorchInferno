@@ -1821,6 +1821,12 @@ class OpenAICompletionEngine:
                                 print(f"[WARMUP] prefill graph bs={pbs} sb={sb}: {_pexc}", file=_psys.stderr, flush=True)
                             _reset_generation_cache(cache)
         if fi_cache:
+            if hasattr(self.model, "forward_decode_flashinfer"):
+                try:
+                    self._warmup_flashinfer_decode_graphs(cache, batch_sizes)
+                except Exception as _fi_exc:
+                    import sys as _fi_sys
+                    print(f"[WARMUP] FlashInfer decode graphs failed: {_fi_exc}", file=_fi_sys.stderr, flush=True)
             try:
                 cache._block_new_graph_captures = True
             except Exception:
