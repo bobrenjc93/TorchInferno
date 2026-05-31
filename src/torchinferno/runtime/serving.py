@@ -2112,17 +2112,19 @@ class ContinuousBatchEngine:
         graph, dw, s_ids, s_wp, s_ri, s_logits, num_qo, num_kv, head_dim, max_seq, q_dtype = entry
 
         s_ids[:batch].copy_(input_ids)
-        s_wp[:batch, 0].copy_(seq_lens)
         s_ri[:batch].copy_(row_indices)
         if batch < bucket:
             s_ids[batch:] = 0
-            s_wp[batch:] = 0
             s_ri[batch:] = 0
 
         paged_kv_indptr = torch.arange(bucket + 1, dtype=torch.int32, device=self.device)
         paged_kv_indices = s_ri.to(dtype=torch.int32)
         paged_kv_last_page_len = torch.ones(bucket, dtype=torch.int32, device=self.device)
-        paged_kv_last_page_len[:batch] = (seq_lens + 1).to(torch.int32)
+        row_sl = seq_lens[row_indices[:batch].long()]
+        s_wp[:batch, 0].copy_(row_sl)
+        paged_kv_last_page_len[:batch] = (row_sl + 1).to(torch.int32)
+        if batch < bucket:
+            s_wp[batch:] = 0
 
         dw.plan(
             indptr=paged_kv_indptr, indices=paged_kv_indices,
