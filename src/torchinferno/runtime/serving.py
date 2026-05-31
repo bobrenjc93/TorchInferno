@@ -2073,6 +2073,9 @@ class ContinuousBatchEngine:
         seq_lens: Tensor,
         row_indices: Tensor,
     ) -> Tensor | None:
+        fi_token = self._try_flashinfer_decode_graph(input_ids, seq_lens, row_indices)
+        if fi_token is not None:
+            return fi_token
         decode_graph = getattr(self.model, "try_decode_ragged_token_graph", None)
         if decode_graph is None:
             return None

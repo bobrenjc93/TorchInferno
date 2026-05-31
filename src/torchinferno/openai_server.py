@@ -1785,6 +1785,12 @@ class OpenAICompletionEngine:
                     import sys as _wsys
                     print(f"[WARMUP] graph capture failed bs={bs}: {_warmup_exc}", file=_wsys.stderr, flush=True)
                 _reset_generation_cache(cache)
+            if hasattr(self.model, "forward_decode_flashinfer"):
+                try:
+                    self._warmup_flashinfer_decode_graphs(cache, batch_sizes)
+                except Exception as _fi_exc:
+                    import sys as _fi_sys
+                    print(f"[WARMUP] FlashInfer graph warmup failed: {_fi_exc}", file=_fi_sys.stderr, flush=True)
         self._persistent_serving_cache = cache
 
     def _warmup_flashinfer_decode_graphs(self, cache: object, batch_sizes: list[int]) -> None:
