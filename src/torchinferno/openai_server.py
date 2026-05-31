@@ -2140,16 +2140,9 @@ class OpenAICompletionEngine:
         default_max_seq_len = self._tp_online_default_max_seq_len(initial_batch)
         max_seq_len = env_int("TORCHINFERNO_OPENAI_TP_ONLINE_MAX_SEQ_LEN", default_max_seq_len, minimum=1)
         max_seq_len = max(max_seq_len, len(first.prompt) + first.max_tokens)
-        sized_initial_batch = [
-            request
-            for request in initial_batch
-            if len(request.prompt) + request.max_tokens <= max_seq_len
-        ]
-        sized_initial_ids = {id(request) for request in sized_initial_batch}
         for request in initial_batch:
-            if id(request) not in sized_initial_ids:
-                deferred.append(request)
-        initial_batch = sized_initial_batch or [first]
+            if len(request.prompt) + request.max_tokens > max_seq_len:
+                request.max_tokens = max(1, max_seq_len - len(request.prompt))
         run_max_tokens = max(request.max_tokens for request in initial_batch)
         stop_token_ids = getattr(self, "stop_token_ids", frozenset())
         eos_token_id = next(iter(stop_token_ids)) if stop_token_ids else None
@@ -2174,7 +2167,11 @@ class OpenAICompletionEngine:
         add_phase("engine_create_ms", engine_create_start_s)
 
         def compatible(request: _QueuedGeneration) -> bool:
-            return same_online_class(request) and len(request.prompt) + request.max_tokens <= max_seq_len
+            if not same_online_class(request):
+                return False
+            if len(request.prompt) + request.max_tokens > max_seq_len:
+                request.max_tokens = max(1, max_seq_len - len(request.prompt))
+            return len(request.prompt) < max_seq_len
 
         def submit_batch(requests: Sequence[_QueuedGeneration], *, arrival_step: int) -> None:
             nonlocal next_request_id
