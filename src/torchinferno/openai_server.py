@@ -1785,34 +1785,6 @@ class OpenAICompletionEngine:
                     import sys as _wsys
                     print(f"[WARMUP] graph capture failed bs={bs}: {_warmup_exc}", file=_wsys.stderr, flush=True)
                 _reset_generation_cache(cache)
-            prefill_chunk = env_int("TORCHINFERNO_OPENAI_TP_ONLINE_PREFILL_CHUNK", 256, minimum=0)
-            if prefill_chunk > 0:
-                ragged_prefill_graph = getattr(self.model, "try_prefill_ragged_logits_graph", None)
-                if ragged_prefill_graph is not None:
-                    suffix_buckets = [b for b in [32, 64, 128, 256] if b <= prefill_chunk]
-                    prefill_batch_sizes = sorted(
-                        {1, 2, 4, 8, 16, 32, max_active}
-                        & set(range(1, cache_batch + 1))
-                    )
-                    for sb in suffix_buckets:
-                        for pbs in prefill_batch_sizes:
-                            _reset_generation_cache(cache)
-                            _set_generation_cache_seq_len(cache, 0)
-                            p_input = torch.zeros(pbs, sb, dtype=torch.long, device=self.device)
-                            p_rows = torch.arange(pbs, dtype=torch.long, device=self.device)
-                            p_seq = torch.zeros(pbs, dtype=torch.long, device=self.device)
-                            p_logit = torch.full((pbs,), sb - 1, dtype=torch.long, device=self.device)
-                            try:
-                                ragged_prefill_graph(
-                                    p_input, cache,
-                                    seq_lens=p_seq, row_indices=p_rows,
-                                    logit_positions=p_logit,
-                                    context_len=sb,
-                                )
-                            except Exception as _pexc:
-                                import sys as _psys
-                                print(f"[WARMUP] prefill graph bs={pbs} sb={sb}: {_pexc}", file=_psys.stderr, flush=True)
-                            _reset_generation_cache(cache)
         self._persistent_serving_cache = cache
 
     def _warmup_token_budget_prefill_graphs(self, prefill_chunk_size: int) -> None:
@@ -2140,17 +2112,15 @@ class OpenAICompletionEngine:
         default_max_seq_len = self._tp_online_default_max_seq_len(initial_batch)
         max_seq_len = env_int("TORCHINFERNO_OPENAI_TP_ONLINE_MAX_SEQ_LEN", default_max_seq_len, minimum=1)
         max_seq_len = max(max_seq_len, len(first.prompt) + first.max_tokens)
-        sized_initial_batch = []
+        sized_initial_batch = [
+            request
+            for request in initial_batch
+            if len(request.prompt) + request.max_tokens <= max_seq_len
+        ]
+        sized_initial_ids = {id(request) for request in sized_initial_batch}
         for request in initial_batch:
-            if len(request.prompt) + request.max_tokens > max_seq_len:
-                capped = max_seq_len - len(request.prompt)
-                if capped >= max(1, request.max_tokens // 2):
-                    request.max_tokens = capped
-                    sized_initial_batch.append(request)
-                else:
-                    deferred.append(request)
-            else:
-                sized_initial_batch.append(request)
+            if id(request) not in sized_initial_ids:
+                deferred.append(request)
         initial_batch = sized_initial_batch or [first]
         run_max_tokens = max(request.max_tokens for request in initial_batch)
         stop_token_ids = getattr(self, "stop_token_ids", frozenset())
@@ -2176,15 +2146,7 @@ class OpenAICompletionEngine:
         add_phase("engine_create_ms", engine_create_start_s)
 
         def compatible(request: _QueuedGeneration) -> bool:
-            if not same_online_class(request):
-                return False
-            if len(request.prompt) + request.max_tokens > max_seq_len:
-                capped = max_seq_len - len(request.prompt)
-                if capped >= max(1, request.max_tokens // 2):
-                    request.max_tokens = capped
-                else:
-                    return False
-            return len(request.prompt) < max_seq_len
+            return same_online_class(request) and len(request.prompt) + request.max_tokens <= max_seq_len
 
         def submit_batch(requests: Sequence[_QueuedGeneration], *, arrival_step: int) -> None:
             nonlocal next_request_id
