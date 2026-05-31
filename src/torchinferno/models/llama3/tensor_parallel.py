@@ -1609,16 +1609,30 @@ class _Llama3TensorParallelLayer:
         q, k, v = self._qkv(attn_in, batch, tokens, self.config.head_dim)
         q, k = _apply_rotary_ragged_prefill(q, k, rotary)
         _append_ragged_kv_prefill(cache, k, v, write_positions, row_indices)
+        if hasattr(cache, 'paged_kv'):
+            paged_kv = cache.paged_kv
+        else:
+            _fi_buf = getattr(cache, '_fi_paged_kv', None)
+            if _fi_buf is None:
+                _fi_buf = torch.empty(
+                    cache.keys.size(0), 2, cache.keys.size(2),
+                    cache.keys.size(1), cache.keys.size(3),
+                    device=cache.keys.device, dtype=cache.keys.dtype,
+                )
+                cache._fi_paged_kv = _fi_buf
+            _fi_buf[:, 0].copy_(cache.keys.transpose(1, 2))
+            _fi_buf[:, 1].copy_(cache.values.transpose(1, 2))
+            paged_kv = _fi_buf
         q_permuted = q.permute(0, 2, 1, 3)
         if q_lens is not None and not (q_lens == tokens).all():
             valid_mask = torch.arange(tokens, device=q.device).unsqueeze(0) < q_lens.unsqueeze(1)
             q_packed = q_permuted[valid_mask]
-            out_packed = flashinfer_wrapper.run(q_packed, cache.paged_kv)
+            out_packed = flashinfer_wrapper.run(q_packed, paged_kv)
             out = torch.zeros(batch, tokens, self.local_hidden_size, device=q.device, dtype=q.dtype)
             out[valid_mask] = out_packed.view(-1, self.local_hidden_size)
         else:
             q_packed = q_permuted.reshape(-1, self.local_attention_heads, self.config.head_dim)
-            out_packed = flashinfer_wrapper.run(q_packed, cache.paged_kv)
+            out_packed = flashinfer_wrapper.run(q_packed, paged_kv)
             out = out_packed.view(batch, tokens, self.local_hidden_size)
         attention = self._decode_linear_all_reduce(
             out, self.o_proj_weight, "attention", self.o_proj_weight_decode
