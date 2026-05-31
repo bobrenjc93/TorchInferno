@@ -3116,7 +3116,7 @@ class OpenAICompletionEngine:
                 _sync_tensor_parallel_command(self.model, self.device)
 
     def _should_use_flashinfer_stream_group(self, group: Sequence[_QueuedGeneration]) -> bool:
-        if not env_flag("TORCHINFERNO_OPENAI_FLASHINFER", True):
+        if not env_flag("TORCHINFERNO_OPENAI_FLASHINFER", False):
             return False
         if not group or any(not request.stream for request in group):
             return False
@@ -8559,15 +8559,6 @@ def _distributed_server_command(config: OpenAIServerConfig, argv: Sequence[str])
 
 
 def _reexec_distributed_server(config: OpenAIServerConfig, argv: Sequence[str]) -> None:
-    if (
-        env_flag("TORCHINFERNO_OPENAI_FLASHINFER", True)
-        and "TORCHINFERNO_OPENAI_TP_TENSOR_COMMANDS" not in os.environ
-    ):
-        try:
-            import flashinfer  # noqa: F401
-            os.environ["TORCHINFERNO_OPENAI_TP_TENSOR_COMMANDS"] = "0"
-        except ImportError:
-            pass
     command = _distributed_server_command(config, argv)
     print(
         "TorchInferno OpenAI server auto-launching tensor-parallel workers: "
