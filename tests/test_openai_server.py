@@ -891,6 +891,9 @@ def test_tensor_parallel_worker_loop_handles_online_runtime_commands(monkeypatch
             self.steps += 1
             return []
 
+        def has_online_work(self) -> bool:
+            return True
+
     def broadcast_object_list(payload: list[object], *, src: int) -> None:
         del src
         payload[0] = commands.pop(0)
@@ -985,6 +988,9 @@ def test_tensor_parallel_worker_loop_receives_online_tensor_commands(monkeypatch
         def step_online(self) -> list[object]:
             self.steps += 1
             return []
+
+        def has_online_work(self) -> bool:
+            return True
 
     def broadcast(tensor: torch.Tensor, *, src: int) -> None:
         del src
@@ -10490,7 +10496,7 @@ def test_openai_tensor_parallel_online_batcher_uses_queued_limit_for_default_row
         "start",
         {
             "max_seq_len": 164,
-            "max_active_requests": 64,
+            "max_active_requests": 32,
             "prefix_cache_capacity": 1,
             "prefill_token_budget": None,
             "temperature": 0.0,

@@ -1785,6 +1785,34 @@ class OpenAICompletionEngine:
                     import sys as _wsys
                     print(f"[WARMUP] graph capture failed bs={bs}: {_warmup_exc}", file=_wsys.stderr, flush=True)
                 _reset_generation_cache(cache)
+            prefill_chunk = env_int("TORCHINFERNO_OPENAI_TP_ONLINE_PREFILL_CHUNK", 256, minimum=0)
+            if prefill_chunk > 0:
+                ragged_prefill_graph = getattr(self.model, "try_prefill_ragged_logits_graph", None)
+                if ragged_prefill_graph is not None:
+                    suffix_buckets = [b for b in [32, 64, 128, 256] if b <= prefill_chunk]
+                    prefill_batch_sizes = sorted(
+                        {1, 2, 4, 8, 16, 32, max_active}
+                        & set(range(1, cache_batch + 1))
+                    )
+                    for sb in suffix_buckets:
+                        for pbs in prefill_batch_sizes:
+                            _reset_generation_cache(cache)
+                            _set_generation_cache_seq_len(cache, 0)
+                            p_input = torch.zeros(pbs, sb, dtype=torch.long, device=self.device)
+                            p_rows = torch.arange(pbs, dtype=torch.long, device=self.device)
+                            p_seq = torch.zeros(pbs, dtype=torch.long, device=self.device)
+                            p_logit = torch.full((pbs,), sb - 1, dtype=torch.long, device=self.device)
+                            try:
+                                ragged_prefill_graph(
+                                    p_input, cache,
+                                    seq_lens=p_seq, row_indices=p_rows,
+                                    logit_positions=p_logit,
+                                    context_len=sb,
+                                )
+                            except Exception as _pexc:
+                                import sys as _psys
+                                print(f"[WARMUP] prefill graph bs={pbs} sb={sb}: {_pexc}", file=_psys.stderr, flush=True)
+                            _reset_generation_cache(cache)
         self._persistent_serving_cache = cache
 
     def _warmup_token_budget_prefill_graphs(self, prefill_chunk_size: int) -> None:
