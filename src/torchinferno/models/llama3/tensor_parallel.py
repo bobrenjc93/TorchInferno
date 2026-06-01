@@ -2728,6 +2728,8 @@ class Llama3TensorParallelForCausalLM:
         temperature: float = 0.0,
         capture_on_miss: bool = True,
     ) -> Tensor | None:
+        if getattr(cache, "_skip_capture_sync", False):
+            capture_on_miss = False
         if (
             not _tp_env_set("TORCHINFERNO_CUDAGRAPH_PREFILL")
             and int(getattr(self.config, "hidden_size", 0)) < 1024
@@ -2751,6 +2753,8 @@ class Llama3TensorParallelForCausalLM:
         *,
         capture_on_miss: bool = True,
     ) -> Tensor | None:
+        if getattr(cache, "_skip_capture_sync", False):
+            capture_on_miss = False
         if self._prefill_logits_graph_failed or not _should_use_prefill_logits_graph(input_ids, cache):
             return None
         try:
