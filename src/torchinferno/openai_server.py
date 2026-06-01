@@ -2360,7 +2360,7 @@ class OpenAICompletionEngine:
         default_max_seq_len = max((len(request.prompt) + request.max_tokens for request in requests), default=1)
         default_max_seq_len += env_int(
             "TORCHINFERNO_OPENAI_TP_ONLINE_MAX_SEQ_LEN_HEADROOM_TOKENS",
-            128,
+            0,
             minimum=0,
         )
         max_model_len = getattr(self, "max_model_len", None)
