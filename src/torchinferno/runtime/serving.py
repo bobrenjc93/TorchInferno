@@ -1423,7 +1423,11 @@ class ContinuousBatchEngine:
         rows = [state.row for state in states]
         input_ids = torch.tensor([[state.last_token] for state in states], device=self.device, dtype=torch.long)
         if not hasattr(self, "_has_fi_decode"):
-            self._has_fi_decode = bool(getattr(self.model, "_fi_decode_graphs", None))
+            fi_dict = getattr(self.model, "_fi_decode_graphs", None)
+            self._has_fi_decode = bool(fi_dict)
+            if self._has_fi_decode:
+                import sys as _fid
+                print(f"[FI_INIT] _has_fi_decode=True keys={list(fi_dict.keys())}", file=_fid.stderr, flush=True)
         if self._has_fi_decode:
             row_indices_t = torch.tensor(rows, dtype=torch.long, device=self.device)
             seq_lens_t = self._seq_lens_tensor(states, rows=rows)
@@ -2124,6 +2128,11 @@ class ContinuousBatchEngine:
                 dw.plan(indptr=indptr, indices=indices, last_page_len=lpl,
                         num_qo_heads=nqo, num_kv_heads=nkv, head_dim=hd, page_size=ms, q_data_type=qd)
                 graph.replay()
+                fi_hits = getattr(self, "_fi_decode_hits", 0) + 1
+                self._fi_decode_hits = fi_hits
+                if fi_hits <= 3:
+                    import sys as _fi_rt
+                    print(f"[FI_DECODE] hit bucket={bucket} batch={batch}", file=_fi_rt.stderr, flush=True)
                 return self._sample_logits(s_logits[:batch, -1, :])
         decode_graph = getattr(self.model, "try_decode_ragged_token_graph", None)
         if decode_graph is None:
