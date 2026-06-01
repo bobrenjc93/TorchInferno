@@ -11857,6 +11857,7 @@ class _FakeSocket:
 
 
 def _cache_only_engine() -> OpenAICompletionEngine:
+    import threading
     engine = object.__new__(OpenAICompletionEngine)
     engine.cache_backend = "dense"
     engine.page_size = 16
@@ -11865,6 +11866,7 @@ def _cache_only_engine() -> OpenAICompletionEngine:
     engine._microbatch_cache_pool = {}
     engine._single_prefill_capture_seen = {}
     engine._batched_prefill_capture_seen = {}
+    engine._model_lock = threading.Lock()
     return engine
 
 
