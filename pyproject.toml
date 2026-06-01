@@ -14,7 +14,7 @@ dependencies = ["huggingface-hub", "safetensors", "torch"]
 dev = ["pyflakes", "pytest", "ruff", "vulture"]
 helion = ["helion"]
 kernels = ["triton"]
-serve = ["flashinfer", "tokenizers", "transformers"]
+serve = ["tokenizers", "transformers"]
 text = ["tokenizers", "transformers"]
 
 [project.scripts]
