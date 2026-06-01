@@ -1785,19 +1785,6 @@ class OpenAICompletionEngine:
                     import sys as _wsys
                     print(f"[WARMUP] graph capture failed bs={bs}: {_warmup_exc}", file=_wsys.stderr, flush=True)
                 _reset_generation_cache(cache)
-            vocab_size_val = max(1, vocab_size)
-            prefill_token_buckets = [16, 32, 64, 128, 256]
-            prefill_bs_list = sorted({1, 2, 4, 8, 16, 32, max_active} & set(range(1, cache_batch + 1)))
-            for ptb in prefill_token_buckets:
-                for pbs in prefill_bs_list:
-                    _reset_generation_cache(cache)
-                    p_ids = (torch.arange(ptb, device=self.device, dtype=torch.long) % vocab_size_val)[None, :].expand(pbs, -1)
-                    view = cache.for_rows(tuple(range(pbs)))
-                    try:
-                        self.model.forward(p_ids, cache=view, use_cache=True)
-                    except Exception:
-                        pass
-                    _reset_generation_cache(cache)
             prefill_chunk = env_int("TORCHINFERNO_OPENAI_TP_ONLINE_PREFILL_CHUNK", 256, minimum=0)
             if prefill_chunk > 0:
                 ragged_prefill_graph = getattr(self.model, "try_prefill_ragged_logits_graph", None)
