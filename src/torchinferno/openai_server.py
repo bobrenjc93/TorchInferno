@@ -1743,6 +1743,8 @@ class OpenAICompletionEngine:
 
     def _warmup_unified_scheduler_cache(self, vocab_size: int) -> None:
         max_active = self._online_serving_max_active()
+        # Persistent cache holds active rows plus extra rows for shared prompt
+        # prefixes, so the continuous batcher can prefill only suffixes.
         total_rows = max_active + self._online_serving_prefix_rows()
         cache_batch = total_rows
         max_seq_len = env_int(
@@ -1750,19 +1752,9 @@ class OpenAICompletionEngine:
             getattr(self, "max_model_len", None) or 768,
             minimum=64,
         )
-        fi_cache = (
-            hasattr(self.model, "forward_decode_flashinfer")
-            and env_flag("TORCHINFERNO_OPENAI_FLASHINFER_CACHE", False)
-        )
-        if fi_cache:
-            try:
-                import flashinfer  # noqa: F401
-            except ImportError:
-                fi_cache = False
-        backend = "flashinfer" if fi_cache else self.cache_backend
         cache = _allocate_cache(
             self.model, cache_batch, _generation_cache_capacity(self.model, max_seq_len),
-            device=self.device, cache_backend=backend, page_size=self.page_size,
+            device=self.device, cache_backend=self.cache_backend, page_size=self.page_size,
         )
         _reset_generation_cache(cache)
         try:
@@ -1821,93 +1813,7 @@ class OpenAICompletionEngine:
                                 import sys as _psys
                                 print(f"[WARMUP] prefill graph bs={pbs} sb={sb}: {_pexc}", file=_psys.stderr, flush=True)
                             _reset_generation_cache(cache)
-        fi_decode_available = hasattr(self.model, "forward_decode_flashinfer")
-        if fi_decode_available:
-            try:
-                import flashinfer  # noqa: F401
-            except ImportError:
-                fi_decode_available = False
-        if fi_decode_available:
-            try:
-                self._warmup_flashinfer_decode_graphs(cache, batch_sizes)
-            except Exception as _fi_exc:
-                import sys as _fi_sys
-                print(f"[WARMUP] FlashInfer decode graphs failed: {_fi_exc}", file=_fi_sys.stderr, flush=True)
-        if fi_cache and not fi_decode_available:
-            try:
-                cache._block_decode_graph_captures = True
-            except Exception:
-                pass
         self._persistent_serving_cache = cache
-
-    def _warmup_flashinfer_decode_graphs(self, cache: object, batch_sizes: list[int]) -> None:
-        import flashinfer
-        model = self.model
-        device = self.device
-        max_seq = cache.layers[0].max_seq_len
-        num_qo = model.layers[0].local_attention_heads
-        num_kv = model.layers[0].local_key_value_heads
-        head_dim = model.config.head_dim
-        q_dtype = model.dtype
-        fi_graphs: dict[int, object] = {}
-
-        for bs in batch_sizes:
-            _reset_generation_cache(cache)
-            try:
-                ws = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device)
-                ind_buf = torch.empty(bs + 1, dtype=torch.int32, device=device)
-                idx_buf = torch.empty(bs, dtype=torch.int32, device=device)
-                lp_buf = torch.empty(bs, dtype=torch.int32, device=device)
-                dw = flashinfer.CUDAGraphBatchDecodeWithPagedKVCacheWrapper(
-                    ws, ind_buf, idx_buf, lp_buf, kv_layout='NHD',
-                )
-                s_ids = torch.zeros(bs, 1, dtype=torch.long, device=device)
-                s_wp = torch.zeros(bs, 1, dtype=torch.long, device=device)
-                s_ri = torch.arange(bs, dtype=torch.long, device=device)
-
-                def do_plan(dw_ref=dw, ri_ref=s_ri, bs_ref=bs):
-                    indptr = torch.arange(bs_ref + 1, dtype=torch.int32, device=device)
-                    indices = ri_ref.to(dtype=torch.int32)
-                    last_page = torch.ones(bs_ref, dtype=torch.int32, device=device)
-                    dw_ref.plan(
-                        indptr=indptr, indices=indices, last_page_len=last_page,
-                        num_qo_heads=num_qo, num_kv_heads=num_kv,
-                        head_dim=head_dim, page_size=max_seq, q_data_type=q_dtype,
-                    )
-
-                do_plan()
-                model.forward_decode_flashinfer(
-                    s_ids, cache, write_positions=s_wp,
-                    row_indices=s_ri, decode_wrapper=dw,
-                )
-                torch.cuda.synchronize()
-
-                stream = torch.cuda.Stream(device=device)
-                stream.wait_stream(torch.cuda.current_stream(device))
-                do_plan()
-                with torch.cuda.stream(stream):
-                    model.forward_decode_flashinfer(
-                        s_ids, cache, write_positions=s_wp,
-                        row_indices=s_ri, decode_wrapper=dw,
-                    )
-                torch.cuda.current_stream(device).wait_stream(stream)
-                torch.cuda.synchronize()
-
-                graph = torch.cuda.CUDAGraph()
-                do_plan()
-                with torch.cuda.graph(graph, stream=stream):
-                    s_logits = model.forward_decode_flashinfer(
-                        s_ids, cache, write_positions=s_wp,
-                        row_indices=s_ri, decode_wrapper=dw,
-                    )
-
-                fi_graphs[bs] = (graph, dw, s_ids, s_wp, s_ri, s_logits, num_qo, num_kv, head_dim, max_seq, q_dtype)
-            except Exception as exc:
-                import sys as _fi_sys
-                print(f"[WARMUP] FlashInfer graph bs={bs}: {exc}", file=_fi_sys.stderr, flush=True)
-            _reset_generation_cache(cache)
-
-        model._fi_decode_graphs = fi_graphs
 
     def _warmup_token_budget_prefill_graphs(self, prefill_chunk_size: int) -> None:
         state = self._token_budget_step_state
@@ -2360,8 +2266,6 @@ class OpenAICompletionEngine:
                     max_tokens=run_max_tokens,
                 )
                 shared_cache = getattr(self, "_persistent_serving_cache", None)
-                if shared_cache is not None:
-                    _reset_generation_cache(shared_cache)
                 if shared_cache is None:
                     try:
                         total_online_rows = max_active + prefix_rows
@@ -2417,11 +2321,6 @@ class OpenAICompletionEngine:
                         _sync_tensor_parallel_command(self.model, self.device)
                         add_phase("step_sync_ms", step_sync_start_s)
         except BaseException as exc:
-            import sys as _exc_sys, traceback as _exc_tb
-            _ob_cache = getattr(runtime_engine, '_cache', None)
-            _ob_layer_type = type(_ob_cache.layers[0]).__name__ if hasattr(_ob_cache, 'layers') and _ob_cache.layers else 'unknown'
-            print(f"[ONLINE_BATCHER] CRASHED: {exc!r} cache_layer={_ob_layer_type}", file=_exc_sys.stderr, flush=True)
-            _exc_tb.print_exc(file=_exc_sys.stderr)
             for request in request_by_id.values():
                 if not request.done:
                     request.responses.put(exc)
