@@ -1425,9 +1425,13 @@ class ContinuousBatchEngine:
             self._set_cache_row_seq_len(state.row, state.seq_len)
         rows = [state.row for state in states]
         input_ids = torch.tensor([[state.last_token] for state in states], device=self.device, dtype=torch.long)
-        row_indices_t = torch.tensor(rows, dtype=torch.long, device=self.device)
-        seq_lens_t = self._seq_lens_tensor(states, rows=rows)
-        fi_token = self._try_flashinfer_decode_graph(input_ids, seq_lens_t, row_indices_t)
+        fi_graphs = getattr(self.model, "_fi_decode_graphs", None)
+        if fi_graphs:
+            row_indices_t = torch.tensor(rows, dtype=torch.long, device=self.device)
+            seq_lens_t = self._seq_lens_tensor(states, rows=rows)
+            fi_token = self._try_flashinfer_decode_graph(input_ids, seq_lens_t, row_indices_t)
+        else:
+            fi_token = None
         if fi_token is not None:
             next_token_tensor = fi_token.to(self.device)
             self.stats.decode_graph_hits += 1
@@ -1469,9 +1473,13 @@ class ContinuousBatchEngine:
     ) -> _ActiveRequest | ServingResult:
         self._set_cache_row_seq_len(state.row, state.seq_len)
         input_ids = torch.tensor([[state.last_token]], device=self.device, dtype=torch.long)
-        row_indices_t = torch.tensor([state.row], dtype=torch.long, device=self.device)
-        seq_lens_t = self._seq_lens_tensor([state], rows=[state.row])
-        fi_token = self._try_flashinfer_decode_graph(input_ids, seq_lens_t, row_indices_t)
+        fi_graphs = getattr(self.model, "_fi_decode_graphs", None)
+        if fi_graphs:
+            row_indices_t = torch.tensor([state.row], dtype=torch.long, device=self.device)
+            seq_lens_t = self._seq_lens_tensor([state], rows=[state.row])
+            fi_token = self._try_flashinfer_decode_graph(input_ids, seq_lens_t, row_indices_t)
+        else:
+            fi_token = None
         if fi_token is not None:
             next_token_tensor = fi_token.to(self.device)
             self.stats.decode_graph_hits += 1
