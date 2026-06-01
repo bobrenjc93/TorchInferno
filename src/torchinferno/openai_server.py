@@ -1828,6 +1828,11 @@ class OpenAICompletionEngine:
                 except Exception as _fi_exc:
                     import sys as _fi_sys
                     print(f"[WARMUP] FlashInfer decode graphs failed: {_fi_exc}", file=_fi_sys.stderr, flush=True)
+        if fi_cache:
+            try:
+                cache._block_decode_graph_captures = True
+            except Exception:
+                pass
         self._persistent_serving_cache = cache
 
     def _warmup_flashinfer_decode_graphs(self, cache: object, batch_sizes: list[int]) -> None:
