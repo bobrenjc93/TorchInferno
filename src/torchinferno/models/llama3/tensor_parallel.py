@@ -2728,6 +2728,8 @@ class Llama3TensorParallelForCausalLM:
         temperature: float = 0.0,
         capture_on_miss: bool = True,
     ) -> Tensor | None:
+        if getattr(cache, "_skip_capture_sync", False):
+            capture_on_miss = False
         if (
             not _tp_env_set("TORCHINFERNO_CUDAGRAPH_PREFILL")
             and int(getattr(self.config, "hidden_size", 0)) < 1024
@@ -2751,6 +2753,8 @@ class Llama3TensorParallelForCausalLM:
         *,
         capture_on_miss: bool = True,
     ) -> Tensor | None:
+        if getattr(cache, "_skip_capture_sync", False):
+            capture_on_miss = False
         if self._prefill_logits_graph_failed or not _should_use_prefill_logits_graph(input_ids, cache):
             return None
         try:
@@ -3243,7 +3247,7 @@ class Llama3TensorParallelForCausalLM:
             raise ValueError("KV cache capacity exceeded")
         attention_block_size = _decode_attention_block_size(cache.seq_len + 1, cache.layers[0].max_seq_len)
         symm_reduce_key = _symm_mem_allreduce_graph_key(input_ids.size(0), _model_world_size(self))
-        key = (id(cache), input_ids.size(0), attention_block_size, symm_reduce_key)
+        key = (_cache_graph_root_id(cache), input_ids.size(0), attention_block_size, symm_reduce_key)
         captured = self._decode_graphs.get(key)
         needs_capture = (
             captured is None
@@ -3327,7 +3331,7 @@ class Llama3TensorParallelForCausalLM:
             captured.output_token = self._sample_next_token(logits[:, -1, :], 0.0)
         captured.graph.replay()
         symm_reduce_key = _symm_mem_allreduce_graph_key(input_ids.size(0), _model_world_size(self))
-        key = (id(cache), input_ids.size(0), attention_block_size, symm_reduce_key)
+        key = (_cache_graph_root_id(cache), input_ids.size(0), attention_block_size, symm_reduce_key)
         max_graphs = _tp_int("TORCHINFERNO_CUDAGRAPH_DECODE_STEP_MAX_GRAPHS", 4096, minimum=1)
         if key not in self._decode_graphs and len(self._decode_graphs) >= max_graphs:
             self._decode_graphs.clear()
@@ -3345,7 +3349,7 @@ class Llama3TensorParallelForCausalLM:
             raise ValueError("KV cache capacity exceeded")
         attention_block_size = _decode_attention_block_size(cache.seq_len + 1, cache.layers[0].max_seq_len)
         symm_reduce_key = _symm_mem_allreduce_graph_key(input_ids.size(0), _model_world_size(self))
-        key = (id(cache), input_ids.size(0), attention_block_size, symm_reduce_key)
+        key = (_cache_graph_root_id(cache), input_ids.size(0), attention_block_size, symm_reduce_key)
         captured = self._decode_logits_graphs.get(key)
         needs_capture = (
             captured is None
@@ -3669,7 +3673,7 @@ class Llama3TensorParallelForCausalLM:
             )
         captured.graph.replay()
         symm_reduce_key = _symm_mem_allreduce_graph_key(input_ids.size(0), _model_world_size(self))
-        key = (id(cache), input_ids.size(0), attention_block_size, symm_reduce_key)
+        key = (_cache_graph_root_id(cache), input_ids.size(0), attention_block_size, symm_reduce_key)
         max_graphs = _tp_int("TORCHINFERNO_CUDAGRAPH_DECODE_STEP_MAX_GRAPHS", 4096, minimum=1)
         if key not in self._decode_logits_graphs and len(self._decode_logits_graphs) >= max_graphs:
             self._decode_logits_graphs.clear()
