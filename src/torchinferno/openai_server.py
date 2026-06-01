@@ -2046,7 +2046,7 @@ class OpenAICompletionEngine:
                 self._token_budget_step_state = None
 
     def _online_serving_max_active(self) -> int:
-        cap = env_int("TORCHINFERNO_OPENAI_TP_ONLINE_MAX_ACTIVE", 32, minimum=1)
+        cap = env_int("TORCHINFERNO_OPENAI_TP_ONLINE_MAX_ACTIVE", 64, minimum=1)
         effective = _effective_openai_max_batch_size(self.model, self.device, self.max_batch_size)
         return max(1, min(cap, effective))
 
@@ -2063,7 +2063,11 @@ class OpenAICompletionEngine:
             return False
         if self.device.type != "cuda" and not explicit:
             return False
-        return hasattr(self.model, "allocate_cache")
+        result = hasattr(self.model, "allocate_cache")
+        if not result:
+            import sys as _obr
+            print(f"[ONLINE_BATCHER] skipped: no allocate_cache", file=_obr.stderr, flush=True)
+        return result
 
     def _run_tensor_parallel_online_batcher(self, first: _QueuedGeneration) -> None:
         requested_max_batch = int(getattr(self, "max_batch_size", 1))
@@ -2356,7 +2360,7 @@ class OpenAICompletionEngine:
         default_max_seq_len = max((len(request.prompt) + request.max_tokens for request in requests), default=1)
         default_max_seq_len += env_int(
             "TORCHINFERNO_OPENAI_TP_ONLINE_MAX_SEQ_LEN_HEADROOM_TOKENS",
-            0,
+            128,
             minimum=0,
         )
         max_model_len = getattr(self, "max_model_len", None)

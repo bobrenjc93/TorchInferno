@@ -10496,7 +10496,7 @@ def test_openai_tensor_parallel_online_batcher_uses_queued_limit_for_default_row
         "start",
         {
             "max_seq_len": 164,
-            "max_active_requests": 32,
+            "max_active_requests": 64,
             "prefix_cache_capacity": 1,
             "prefill_token_budget": None,
             "temperature": 0.0,
@@ -10538,7 +10538,7 @@ def test_openai_tensor_parallel_online_default_max_seq_len_adds_headroom(
     second = _QueuedGeneration([1, 2, 3, 4], 5, 0.0, True, queue.Queue())
 
     monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_MAX_SEQ_LEN_HEADROOM_TOKENS", raising=False)
-    assert engine._tp_online_default_max_seq_len([first, second]) == 9
+    assert engine._tp_online_default_max_seq_len([first, second]) == 137
 
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_MAX_SEQ_LEN_HEADROOM_TOKENS", "128")
     assert engine._tp_online_default_max_seq_len([first, second]) == 137
