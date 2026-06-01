@@ -1,0 +1,11 @@
+Ready 240s
+
+64 concurrent:
+  TTFT: p50=1306ms p90=1349ms
+  Per-req tput: 1.5 tps
+  Sys tput: 85 tok/s
+
+200 concurrent:
+  TTFT: p50=721ms p90=879ms
+  Per-req tput: 3.0 tps
+  Sys tput: 162 tok/s

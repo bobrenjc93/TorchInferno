@@ -1520,6 +1520,9 @@ class OpenAICompletionEngine:
         self._queue_profile_path = os.environ.get("TORCHINFERNO_OPENAI_QUEUE_PROFILE_JSONL", "")
         self._queue_profile_lock = threading.Lock()
         self._queue_profile_next_sequence = 0
+        self._online_queue: "queue.Queue[_QueuedGeneration | None]" = queue.Queue()
+        self._online_engine_thread: threading.Thread | None = None
+        self._online_engine_started = False
         self._persistent_prompt_list_step_state: _PersistentPromptListStepState | None = None
         self._persistent_prompt_list_step_last_result: _PersistentPromptListStepResult | None = None
         self._token_budget_step_state: _TokenBudgetStepState | None = None
@@ -1536,6 +1539,9 @@ class OpenAICompletionEngine:
         if self._closed:
             return
         self._closed = True
+        if self._online_engine_thread is not None:
+            self._online_queue.put(None)
+            self._online_engine_thread.join(timeout=10)
         if self._worker is not None:
             self._generation_queue.put(None)
             self._worker.join(timeout=10)
@@ -1685,6 +1691,17 @@ class OpenAICompletionEngine:
             if first is None:
                 return
             if self._should_use_tensor_parallel_online_batcher(first):
+                if not self._online_engine_started:
+                    with self._model_lock:
+                        if not self._online_engine_started:
+                            try:
+                                self._start_persistent_online_engine()
+                            except Exception:
+                                pass
+                if self._online_engine_started:
+                    self._online_queue.put(first)
+                    self._completed_queue_batches += 1
+                    continue
                 with self._model_lock:
                     self._maybe_cleanup_runtime_after_idle()
                     self._run_tensor_parallel_online_batcher(first)
@@ -2414,6 +2431,133 @@ class OpenAICompletionEngine:
                 _sync_tensor_parallel_command(self.model, self.device)
             for request in deferred:
                 self._generation_queue.put(request)
+
+    def _start_persistent_online_engine(self) -> None:
+        if not _is_tensor_parallel_primary_model(self.model) or self.device.type != "cuda":
+            return
+        if not hasattr(self.model, "allocate_cache"):
+            return
+        max_active = self._online_serving_max_active()
+        prefix_rows = self._online_serving_prefix_rows()
+        prefill_budget = env_int("TORCHINFERNO_OPENAI_TP_ONLINE_PREFILL_TOKEN_BUDGET", 2048, minimum=0)
+        enable_ragged = env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_RAGGED_DECODE", True)
+        store_reusable = env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_PREFIX_CACHE_STORE", True)
+        store_full = env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_PREFIX_CACHE_STORE_FULL_PROMPTS", True)
+        shared_cache = getattr(self, "_persistent_serving_cache", None)
+        if shared_cache is None:
+            return
+        max_seq_len = shared_cache.layers[0].max_seq_len if hasattr(shared_cache, "layers") and shared_cache.layers else 768
+        runtime_engine = _RuntimeContinuousBatchEngine(
+            self.model, device=self.device, cache_backend=self.cache_backend,
+            page_size=self.page_size, temperature=0.0,
+            max_active_requests=max_active, prefix_cache_capacity=prefix_rows,
+            prefill_token_budget=prefill_budget if prefill_budget > 0 else None,
+            enable_ragged_decode=enable_ragged, store_reusable_prefixes=store_reusable,
+            store_full_prompt_prefixes=store_full,
+            pin_shared_prefix=env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_PIN_SHARED_PREFIX", True),
+            graph_prefill=env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_GRAPH_PREFILL", True),
+            prefill_chunk_size=(env_int("TORCHINFERNO_OPENAI_TP_ONLINE_PREFILL_CHUNK", 0, minimum=0) or None),
+        )
+        _broadcast_tensor_parallel_online_start(
+            self.model, max_seq_len=max_seq_len, max_active_requests=max_active,
+            prefix_cache_capacity=prefix_rows,
+            prefill_token_budget=prefill_budget if prefill_budget > 0 else None,
+            temperature=0.0, enable_ragged_decode=enable_ragged,
+            store_reusable_prefixes=store_reusable, store_full_prompt_prefixes=store_full,
+            max_tokens=0,
+        )
+        _reset_generation_cache(shared_cache)
+        runtime_engine.start_online(max_seq_len=max_seq_len, external_cache=shared_cache)
+        _sync_tensor_parallel_command(self.model, self.device)
+        stop_token_ids = getattr(self, "stop_token_ids", frozenset())
+        decode_quantum = env_int("TORCHINFERNO_OPENAI_TP_ONLINE_DECODE_QUANTUM", 8, minimum=1)
+
+        def engine_loop() -> None:
+            request_by_id: dict[str, _QueuedGeneration] = {}
+            next_request_id = 0
+            step = 0
+            compat_max_seq = max_seq_len
+
+            def submit_requests(requests: list[_QueuedGeneration]) -> None:
+                nonlocal next_request_id
+                if not requests:
+                    return
+                prompts = [r.prompt for r in requests]
+                row_max_tokens = [r.max_tokens for r in requests]
+                _broadcast_tensor_parallel_online_submit_prompt_lists(
+                    self.model, prompts, max_tokens=max(row_max_tokens, default=0),
+                    row_max_tokens=row_max_tokens, arrival_step=step,
+                    eos_token_id=next(iter(stop_token_ids)) if stop_token_ids else None,
+                    request_id_start=next_request_id,
+                )
+                for r in requests:
+                    rid = str(next_request_id)
+                    next_request_id += 1
+                    request_by_id[rid] = r
+                    runtime_engine.submit_online(
+                        _RuntimeServingRequest(rid, tuple(r.prompt), r.max_tokens,
+                            arrival_step=step,
+                            eos_token_id=next(iter(stop_token_ids)) if stop_token_ids else None),
+                    )
+                _sync_tensor_parallel_command(self.model, self.device)
+
+            with _tensor_parallel_symm_mem_allreduce_scope(
+                self.model, self.device, max_tokens=1, temperature=0.0,
+            ):
+                while not self._closed:
+                    batch: list[_QueuedGeneration] = []
+                    while len(batch) < max_active:
+                        try:
+                            item = self._online_queue.get_nowait()
+                        except queue.Empty:
+                            break
+                        if item is None:
+                            return
+                        if len(item.prompt) + item.max_tokens <= compat_max_seq:
+                            batch.append(item)
+                        else:
+                            self._generation_queue.put(item)
+                    if batch:
+                        submit_requests(batch)
+
+                    if not runtime_engine.has_online_work():
+                        try:
+                            item = self._online_queue.get(timeout=0.1)
+                        except queue.Empty:
+                            continue
+                        if item is None:
+                            return
+                        if len(item.prompt) + item.max_tokens <= compat_max_seq:
+                            submit_requests([item])
+                        else:
+                            self._generation_queue.put(item)
+                        continue
+
+                    _broadcast_tensor_parallel_online_step(self.model, decode_quantum)
+                    for _ in range(decode_quantum):
+                        if not runtime_engine.has_online_work():
+                            break
+                        events = runtime_engine.step_online()
+                        for event in events:
+                            request = request_by_id.get(event.request_id)
+                            if request is None or request.done:
+                                continue
+                            if event.token in stop_token_ids:
+                                _finish_stream_request(request)
+                                continue
+                            request.responses.put(event.token)
+                            if event.finished:
+                                _finish_stream_request(request)
+                        step += 1
+                    _sync_tensor_parallel_command(self.model, self.device)
+
+        self._online_engine_thread = threading.Thread(
+            target=engine_loop, name="torchinferno-online-engine", daemon=True,
+        )
+        self._online_engine_thread.start()
+        self._online_engine_started = True
+        import sys as _pes
+        print("[PERSISTENT] online engine started", file=_pes.stderr, flush=True)
 
     def _tp_online_default_max_seq_len(self, requests: Sequence[_QueuedGeneration]) -> int:
         default_max_seq_len = max((len(request.prompt) + request.max_tokens for request in requests), default=1)

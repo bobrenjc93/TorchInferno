@@ -1,0 +1,4 @@
+16 conversations × 4 turns = 64 requests:
+  TTFT: p50=853ms p90=940ms
+  Wall: 4372ms
+  Avg per-turn: 630ms
