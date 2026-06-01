@@ -554,8 +554,9 @@ class _FlashInferLayerKVCacheView:
         seq_len = sl[0] if sl else 0
         tokens = k.size(2)
         end = seq_len + tokens
-        self.keys[:, :, seq_len:end, :] = k
-        self.values[:, :, seq_len:end, :] = v
+        rl = self._row_list
+        self._parent.paged_kv[rl, 0, seq_len:end, :, :] = k.permute(0, 2, 1, 3)
+        self._parent.paged_kv[rl, 1, seq_len:end, :, :] = v.permute(0, 2, 1, 3)
         self.set_seq_len(end)
         return self.keys[:self.batch_size, :, :end, :], self.values[:self.batch_size, :, :end, :]
 
@@ -4800,8 +4801,19 @@ def _append_ragged_kv_prefill(
         rows = row_indices.to(device=keys.device, dtype=torch.long)
     positions = positions.to(device=keys.device, dtype=torch.long)
     row_idx = rows[:, None].expand(batch, tokens)
-    cache.keys[row_idx, :, positions, :] = keys.permute(0, 2, 1, 3)
-    cache.values[row_idx, :, positions, :] = values.permute(0, 2, 1, 3)
+    paged_kv = getattr(cache, 'paged_kv', None)
+    _parent = getattr(cache, '_parent', None)
+    if _parent is not None:
+        physical_rows = torch.tensor(cache._row_list, device=keys.device, dtype=torch.long)
+        phys_row_idx = physical_rows[row_idx]
+        _parent.paged_kv[phys_row_idx, 0, positions, :, :] = keys.permute(0, 2, 1, 3)
+        _parent.paged_kv[phys_row_idx, 1, positions, :, :] = values.permute(0, 2, 1, 3)
+    elif paged_kv is not None:
+        paged_kv[row_idx, 0, positions, :, :] = keys.permute(0, 2, 1, 3)
+        paged_kv[row_idx, 1, positions, :, :] = values.permute(0, 2, 1, 3)
+    else:
+        cache.keys[row_idx, :, positions, :] = keys.permute(0, 2, 1, 3)
+        cache.values[row_idx, :, positions, :] = values.permute(0, 2, 1, 3)
 
 
 def _ragged_prefill_scaled_dot_product_attention(
