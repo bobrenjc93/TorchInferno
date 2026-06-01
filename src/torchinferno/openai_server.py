@@ -1750,7 +1750,10 @@ class OpenAICompletionEngine:
             getattr(self, "max_model_len", None) or 768,
             minimum=64,
         )
-        fi_cache = hasattr(self.model, "forward_decode_flashinfer")
+        fi_cache = (
+            hasattr(self.model, "forward_decode_flashinfer")
+            and env_flag("TORCHINFERNO_OPENAI_FLASHINFER_CACHE", False)
+        )
         if fi_cache:
             try:
                 import flashinfer  # noqa: F401
