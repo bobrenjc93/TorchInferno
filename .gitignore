@@ -17,3 +17,7 @@ venv/
 srv.*
 test_output.txt
 bench_final.txt
+quick_*.py
+quick_*.txt
+multi_out.txt
+srv.err
