@@ -1752,7 +1752,7 @@ class OpenAICompletionEngine:
         )
         fi_cache = (
             hasattr(self.model, "forward_decode_flashinfer")
-            and env_flag("TORCHINFERNO_OPENAI_FLASHINFER_CACHE", False)
+            and env_flag("TORCHINFERNO_OPENAI_FLASHINFER_CACHE", True)
         )
         if fi_cache:
             try:

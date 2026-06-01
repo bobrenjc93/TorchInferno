@@ -434,6 +434,9 @@ class FlashInferLayerKVCache:
         self.values[dest_row : dest_row + 1, :, :tokens, :].copy_(
             source.values[source_row : source_row + 1, :, :tokens, :]
         )
+        if 0 <= dest_row < len(self._seq_lens):
+            self._seq_lens[dest_row] = tokens
+            self._uniform_seq_len[0] = None
 
     def append(self, k: Tensor, v: Tensor) -> tuple[Tensor, Tensor]:
         seq_len = self.seq_len
@@ -574,6 +577,9 @@ class _FlashInferLayerKVCacheView:
         src_physical = source._rows[source_row] if isinstance(source, _FlashInferLayerKVCacheView) else source_row
         dst_physical = self._rows[dest_row]
         self._parent.paged_kv[dst_physical, :, :tokens, :, :] = src_parent.paged_kv[src_physical, :, :tokens, :, :]
+        if 0 <= dst_physical < len(self._parent._seq_lens):
+            self._parent._seq_lens[dst_physical] = tokens
+            self._parent._uniform_seq_len[0] = None
 
 
 class PagedLlama3TensorParallelLayerKVCache:
@@ -4711,8 +4717,19 @@ def _append_ragged_kv_cache(
     else:
         rows = row_indices.to(device=keys.device, dtype=torch.long)
     positions = positions.to(device=keys.device, dtype=torch.long)
-    cache.keys[rows, :, positions, :] = keys[:, :, 0, :]
-    cache.values[rows, :, positions, :] = values[:, :, 0, :]
+    _parent = getattr(cache, '_parent', None)
+    paged_kv = getattr(cache, 'paged_kv', None)
+    if _parent is not None:
+        physical_rows = torch.tensor(cache._row_list, device=keys.device, dtype=torch.long)
+        phys_rows = physical_rows[rows]
+        _parent.paged_kv[phys_rows, 0, positions, :, :] = keys[:, :, 0, :]
+        _parent.paged_kv[phys_rows, 1, positions, :, :] = values[:, :, 0, :]
+    elif paged_kv is not None:
+        paged_kv[rows, 0, positions, :, :] = keys[:, :, 0, :]
+        paged_kv[rows, 1, positions, :, :] = values[:, :, 0, :]
+    else:
+        cache.keys[rows, :, positions, :] = keys[:, :, 0, :]
+        cache.values[rows, :, positions, :] = values[:, :, 0, :]
 
 
 def _ragged_scaled_dot_product_attention(
