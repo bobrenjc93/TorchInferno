@@ -2142,6 +2142,9 @@ class OpenAICompletionEngine:
         add_phase("initial_batch_ms", initial_batch_start_s)
 
         default_max_seq_len = self._tp_online_default_max_seq_len(initial_batch)
+        persistent_cache = getattr(self, "_persistent_serving_cache", None)
+        if persistent_cache is not None and hasattr(persistent_cache, "layers") and persistent_cache.layers:
+            default_max_seq_len = max(default_max_seq_len, persistent_cache.layers[0].max_seq_len)
         max_seq_len = env_int("TORCHINFERNO_OPENAI_TP_ONLINE_MAX_SEQ_LEN", default_max_seq_len, minimum=1)
         max_seq_len = max(max_seq_len, len(first.prompt) + first.max_tokens)
         sized_initial_batch = [
