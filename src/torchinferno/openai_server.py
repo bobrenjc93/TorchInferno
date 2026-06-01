@@ -1817,8 +1817,12 @@ class OpenAICompletionEngine:
             try:
                 import flashinfer  # noqa: F401
                 self._warmup_flashinfer_decode_graphs(cache, batch_sizes)
-            except Exception:
-                pass
+                fi_count = len(getattr(self.model, "_fi_decode_graphs", {}))
+                import sys as _fi_sys
+                print(f"[WARMUP] FlashInfer decode graphs: {fi_count} captured", file=_fi_sys.stderr, flush=True)
+            except Exception as _fi_exc:
+                import sys as _fi_sys
+                print(f"[WARMUP] FlashInfer unavailable: {_fi_exc}", file=_fi_sys.stderr, flush=True)
         self._persistent_serving_cache = cache
 
     def _warmup_flashinfer_decode_graphs(self, cache: object, batch_sizes: list[int]) -> None:
