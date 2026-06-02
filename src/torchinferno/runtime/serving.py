@@ -652,27 +652,32 @@ class ContinuousBatchEngine:
             active.extend(self._prefill_prefix_batch(group, step, events=events))
 
         plain_group = [item for group in batchable.values() for item in group]
-        shared_prefix_active = self._prefill_common_prefix_batch(plain_group, step, events=events)
-        if shared_prefix_active is not None:
-            active.extend(shared_prefix_active)
-        elif len(plain_group) > 1 and self._can_padded_batch_prefill(plain_group):
-            active.extend(self._prefill_padded_batch(plain_group, step, events=events))
+        fi_requests = [(idx, req, hit, None) for idx, req, hit in plain_group]
+        fi_active = self._try_flashinfer_prefill(fi_requests, step, events=events) if fi_requests else None
+        if fi_active is not None:
+            active.extend(fi_active)
         else:
-            for group in batchable.values():
-                if len(group) == 1:
-                    original_index, request, prefix_hit_tokens = group[0]
-                    active.append(
-                        self._prefill_one(
-                            original_index,
-                            request,
-                            step,
-                            prefix_hit_tokens,
-                            None,
-                            events=events,
+            shared_prefix_active = self._prefill_common_prefix_batch(plain_group, step, events=events)
+            if shared_prefix_active is not None:
+                active.extend(shared_prefix_active)
+            elif len(plain_group) > 1 and self._can_padded_batch_prefill(plain_group):
+                active.extend(self._prefill_padded_batch(plain_group, step, events=events))
+            else:
+                for group in batchable.values():
+                    if len(group) == 1:
+                        original_index, request, prefix_hit_tokens = group[0]
+                        active.append(
+                            self._prefill_one(
+                                original_index,
+                                request,
+                                step,
+                                prefix_hit_tokens,
+                                None,
+                                events=events,
+                            )
                         )
-                    )
-                else:
-                    active.extend(self._prefill_batch(group, step, events=events))
+                    else:
+                        active.extend(self._prefill_batch(group, step, events=events))
         if self.profile_timings:
             self.stats.prefill_wall_ms += (time.perf_counter() - timing_start_s) * 1000.0
         return indexed_results, active
@@ -1547,14 +1552,14 @@ class ContinuousBatchEngine:
         if self.profile_timings:
             self.stats.decode_ragged_prepare_ms += (time.perf_counter() - prepare_start_s) * 1000.0
         model_start_s = time.perf_counter() if self.profile_timings else 0.0
-        graph_token = self._try_ragged_token_graph(input_ids[:n_padded], seq_lens, row_indices)
+        graph_token = self._try_ragged_token_graph(input_ids, seq_lens, row_indices)
         if graph_token is not None:
             next_token_tensor = graph_token.to(self.device)
             self.stats.decode_graph_hits += 1
         else:
-            logits = self._ragged_decode_logits(input_ids[:n_padded], seq_lens, row_indices)
+            logits = self._ragged_decode_logits(input_ids, seq_lens, row_indices)
             next_token_tensor = self._sample_logits(logits[:, -1, :])
-        self._record_model_call("decode", n_padded, tokens=n_padded, ragged=True)
+        self._record_model_call("decode", len(decode_rows), tokens=len(decode_rows), ragged=True)
         if self.profile_timings:
             self.stats.decode_ragged_model_ms += (time.perf_counter() - model_start_s) * 1000.0
         cpu_tokens_start_s = time.perf_counter() if self.profile_timings else 0.0
@@ -1868,6 +1873,94 @@ class ContinuousBatchEngine:
         if graph_logits is not None:
             return graph_logits, cache
         return self._forward_model(input_ids, cache=cache, use_cache=True)
+
+    def _try_flashinfer_prefill(
+        self,
+        requests: list[tuple[int, "ServingRequest", int, "_ReusablePrefix | None"]],
+        step: int,
+        *,
+        events: list["ServingTokenEvent"] | None = None,
+    ) -> list["_ActiveRequest"] | None:
+        forward_fi = getattr(self.model, "forward_step_flashinfer", None)
+        if forward_fi is None:
+            return None
+        try:
+            import flashinfer  # noqa: F401
+        except ImportError:
+            return None
+        cache = self._require_cache()
+        active: list[_ActiveRequest] = []
+        rows = []
+        suffixes = []
+        prefix_hits = []
+        orig_indices = []
+        full_prompts = []
+        for original_index, request, prefix_hit_tokens, reusable in requests:
+            row = self._acquire_active_row()
+            rows.append(row)
+            suffix = request.prompt
+            if reusable is not None and prefix_hit_tokens > 0:
+                self._copy_prefix(reusable.row, row, prefix_hit_tokens)
+                suffix = request.prompt[prefix_hit_tokens:]
+                self.stats.prefix_reuse_requests += 1
+                self.stats.prefix_reuse_tokens += prefix_hit_tokens
+            suffixes.append(suffix)
+            prefix_hits.append(prefix_hit_tokens)
+            orig_indices.append(original_index)
+            full_prompts.append(request.prompt)
+
+        if not suffixes or not any(suffixes):
+            return None
+
+        max_suffix_len = max(len(s) for s in suffixes)
+        batch = len(suffixes)
+        padded = [list(s) + [0] * (max_suffix_len - len(s)) for s in suffixes]
+        input_ids = torch.tensor(padded, dtype=torch.long, device=self.device)
+        q_lens = torch.tensor([len(s) for s in suffixes], dtype=torch.long, device=self.device)
+        seq_lens = torch.tensor(prefix_hits, dtype=torch.long, device=self.device)
+        row_indices = torch.tensor(rows, dtype=torch.long, device=self.device)
+        positions = []
+        for i in range(batch):
+            start = prefix_hits[i]
+            positions.append([start + j for j in range(max_suffix_len)])
+        write_positions = torch.tensor(positions, dtype=torch.long, device=self.device)
+        logit_positions = torch.tensor(
+            [len(s) - 1 for s in suffixes], dtype=torch.long, device=self.device,
+        )
+        try:
+            logits = forward_fi(
+                input_ids, cache,
+                seq_lens=seq_lens, q_lens=q_lens,
+                write_positions=write_positions,
+                logit_positions=logit_positions,
+                row_indices=row_indices,
+            )
+        except Exception:
+            for row in rows:
+                self._release_active_row(row)
+            return None
+        self._record_model_call("prefill", batch, tokens=int(q_lens.sum().item()))
+        next_tokens = self._sample_logits(logits[:, -1, :]).detach().cpu().tolist()
+        for i, (original_index, request, prefix_hit_tokens, reusable) in enumerate(requests):
+            row = rows[i]
+            next_token = int(next_tokens[i])
+            prompt_len = len(request.prompt)
+            seq_len = self._refresh_row_seq_len_from_cache(row, prompt_len)
+            self._store_reusable_prefix(request.request_id, request.prompt, row, logits[i:i+1])
+            state = _ActiveRequest(
+                original_index=original_index,
+                request=request,
+                tokens=[*request.prompt, next_token],
+                generated=1,
+                row=row,
+                last_token=next_token,
+                seq_len=seq_len,
+                prefix_hit_tokens=prefix_hit_tokens,
+                started_step=step,
+            )
+            self._record_token_event(events, state, next_token, step, finished=self._should_finish_before_decode(state))
+            active.append(state)
+        return active
 
     def _try_prefill_logits_graph(self, input_ids: Tensor, cache: object) -> Tensor | None:
         graph = getattr(self.model, "try_prefill_logits_graph", None)
