@@ -653,7 +653,7 @@ class ContinuousBatchEngine:
 
         plain_group = [item for group in batchable.values() for item in group]
         fi_active = None
-        if env_flag("TORCHINFERNO_CONTINUOUS_FLASHINFER_PREFILL", False) and fi_requests:
+        if env_flag("TORCHINFERNO_CONTINUOUS_FLASHINFER_PREFILL", False) and plain_group:
             fi_requests = [(idx, req, hit, None) for idx, req, hit in plain_group]
             fi_active = self._try_flashinfer_prefill(fi_requests, step, events=events)
         if fi_active is not None:
@@ -1943,11 +1943,14 @@ class ContinuousBatchEngine:
             return None
         self._record_model_call("prefill", batch, tokens=int(q_lens.sum().item()))
         next_tokens = self._sample_logits(logits[:, -1, :]).detach().cpu().tolist()
+        for i in range(batch):
+            self._set_cache_row_seq_len(rows[i], len(requests[i][1].prompt))
         for i, (original_index, request, prefix_hit_tokens, reusable) in enumerate(requests):
             row = rows[i]
             next_token = int(next_tokens[i])
             prompt_len = len(request.prompt)
-            seq_len = self._refresh_row_seq_len_from_cache(row, prompt_len)
+            seq_len = prompt_len
+            self._remember_row_seq_len(row, seq_len)
             self._store_reusable_prefix(request.request_id, request.prompt, row, logits[i:i+1])
             state = _ActiveRequest(
                 original_index=original_index,
