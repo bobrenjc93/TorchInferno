@@ -1830,6 +1830,10 @@ class OpenAICompletionEngine:
             except Exception as _fi_exc:
                 import sys as _fi_sys
                 print(f"[WARMUP] FlashInfer unavailable: {_fi_exc}", file=_fi_sys.stderr, flush=True)
+        try:
+            cache._compiled_prefill_ready = True
+        except Exception:
+            pass
         self._persistent_serving_cache = cache
 
     def _warmup_flashinfer_decode_graphs(self, cache: object, batch_sizes: list[int]) -> None:

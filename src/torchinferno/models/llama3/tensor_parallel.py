@@ -2641,15 +2641,20 @@ class Llama3TensorParallelForCausalLM:
         hidden = F.embedding(input_ids.to(self.device, non_blocking=True), self.embed_tokens_weight)
         profile_fast_prefill = _tp_flag("TORCHINFERNO_PROFILE_FAST_PREFILL", False)
         if tokens > 1 and (profile_fast_prefill or all(layer.profile_seconds is None for layer in self.layers)):
-            self._ensure_compiled_prefill()
-            compiled = getattr(self, "_compiled_forward_prefill", None)
-            if compiled is not None and active_cache is not None:
-                try:
-                    hidden = compiled(hidden, positions, rotary, active_cache)
-                except Exception:
-                    self._compiled_forward_prefill = None
-                    compiled = None
-            if compiled is None:
+            use_compiled = False
+            if (
+                active_cache is not None
+                and getattr(active_cache, "_compiled_prefill_ready", False)
+            ):
+                self._ensure_compiled_prefill()
+                compiled = getattr(self, "_compiled_forward_prefill", None)
+                if compiled is not None:
+                    try:
+                        hidden = compiled(hidden, positions, rotary, active_cache)
+                        use_compiled = True
+                    except Exception:
+                        self._compiled_forward_prefill = None
+            if not use_compiled:
                 attn_in: Tensor | None = None
                 for layer_id, layer in enumerate(self.layers):
                     layer_cache = active_cache.layers[layer_id] if active_cache is not None else None
