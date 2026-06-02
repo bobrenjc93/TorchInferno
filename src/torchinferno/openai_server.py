@@ -2361,11 +2361,23 @@ class OpenAICompletionEngine:
                             if next_item is None:
                                 self._generation_queue.put(None)
                                 break
-                            if compatible(next_item):
-                                submit_batch([next_item], arrival_step=step)
-                            else:
+                            if not compatible(next_item):
                                 deferred.append(next_item)
                                 break
+                            idle_batch = [next_item]
+                            while len(idle_batch) < max_active:
+                                try:
+                                    more = self._generation_queue.get_nowait()
+                                except queue.Empty:
+                                    break
+                                if more is None:
+                                    self._generation_queue.put(None)
+                                    break
+                                if compatible(more):
+                                    idle_batch.append(more)
+                                else:
+                                    deferred.append(more)
+                            submit_batch(idle_batch, arrival_step=step)
                         continue
                     step_broadcast_start_s = time.perf_counter()
                     _broadcast_tensor_parallel_online_step(self.model, decode_quantum)
