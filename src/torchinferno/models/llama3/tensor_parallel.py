@@ -3986,7 +3986,7 @@ class Llama3TensorParallelForCausalLM:
         if (
             getattr(cache, "_compiled_prefill_ready", False)
             and not hasattr(self, "_compiled_step_flashinfer")
-            and env_flag("TORCHINFERNO_COMPILED_UNIFIED_FORWARD", True)
+            and env_flag("TORCHINFERNO_COMPILED_UNIFIED_FORWARD", False)
         ):
             try:
                 self._compiled_step_flashinfer = torch.compile(
