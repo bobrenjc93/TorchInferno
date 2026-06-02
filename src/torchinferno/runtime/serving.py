@@ -535,10 +535,11 @@ class ContinuousBatchEngine:
 
             n = len(batch_rows)
             for i in range(n):
+                last_wp = batch_write_pos[i][-1] if batch_write_pos[i] else 0
                 while len(batch_input_ids[i]) < max_q:
                     batch_input_ids[i].append(0)
                 while len(batch_write_pos[i]) < max_q:
-                    batch_write_pos[i].append(0)
+                    batch_write_pos[i].append(last_wp)
 
             input_ids = torch.tensor(batch_input_ids, device=self.device, dtype=torch.long)
             q_lens_t = torch.tensor(batch_q_lens, device=self.device, dtype=torch.long)
