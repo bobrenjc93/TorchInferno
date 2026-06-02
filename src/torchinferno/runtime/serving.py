@@ -652,8 +652,10 @@ class ContinuousBatchEngine:
             active.extend(self._prefill_prefix_batch(group, step, events=events))
 
         plain_group = [item for group in batchable.values() for item in group]
-        fi_requests = [(idx, req, hit, None) for idx, req, hit in plain_group]
-        fi_active = self._try_flashinfer_prefill(fi_requests, step, events=events) if fi_requests else None
+        fi_active = None
+        if env_flag("TORCHINFERNO_CONTINUOUS_FLASHINFER_PREFILL", False) and fi_requests:
+            fi_requests = [(idx, req, hit, None) for idx, req, hit in plain_group]
+            fi_active = self._try_flashinfer_prefill(fi_requests, step, events=events)
         if fi_active is not None:
             active.extend(fi_active)
         else:
