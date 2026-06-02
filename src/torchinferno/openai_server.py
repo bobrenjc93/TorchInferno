@@ -2418,8 +2418,8 @@ class OpenAICompletionEngine:
                         event_emit_start_s = time.perf_counter()
                         for event in events:
                             emitted_events += 1
-                            request = request_by_id[event.request_id]
-                            if request.done:
+                            request = request_by_id.get(event.request_id)
+                            if request is None or request.done:
                                 continue
                             if event.token in stop_token_ids:
                                 _finish_stream_request(request)
@@ -2630,6 +2630,11 @@ class OpenAICompletionEngine:
             "decode_ragged_model_ms",
             "decode_ragged_cpu_tokens_ms",
             "decode_ragged_state_update_ms",
+            "_decode_active_ms",
+            "_admit_ms",
+            "_da_filter_ms",
+            "_da_group_ms",
+            "_da_collect_ms",
         ):
             value = getattr(stats, name, None)
             if isinstance(value, (int, float)):

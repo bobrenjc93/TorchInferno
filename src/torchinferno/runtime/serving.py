@@ -385,7 +385,10 @@ class ContinuousBatchEngine:
         active = self._online_active
         self.stats.scheduler_steps += 1
         if self.decode_first and active:
+            _da_start = time.perf_counter() if self.profile_timings else 0.0
             _decoded_results, active = self._decode_active(active, step, events=events)
+            if self.profile_timings:
+                self.stats._decode_active_ms = getattr(self.stats, '_decode_active_ms', 0.0) + (time.perf_counter() - _da_start) * 1000.0
 
         # Advance in-flight chunked prefills by one bounded chunk; rows that
         # complete their prompt sample a first token and join the decode set. A
@@ -394,8 +397,11 @@ class ContinuousBatchEngine:
         if self.prefill_chunk_size and self._online_prefilling:
             active.extend(self._advance_prefilling(step, events=events))
 
+        _admit_start = time.perf_counter() if self.profile_timings else 0.0
         occupied = len(active) + len(self._online_prefilling)
         admitted = self._admit_ready_requests(waiting, step, occupied)
+        if self.profile_timings:
+            self.stats._admit_ms = getattr(self.stats, '_admit_ms', 0.0) + (time.perf_counter() - _admit_start) * 1000.0
         if admitted:
             if self.prefill_chunk_size:
                 self._admit_to_prefilling(admitted, step)
@@ -413,6 +419,7 @@ class ContinuousBatchEngine:
         if next_arrival_step is not None and idle and next_arrival_step > self._online_step:
             self._online_step = next_arrival_step
         return events
+
 
     def _admit_to_prefilling(self, admitted: list[tuple[int, ServingRequest]], step: int) -> None:
         # Create a 'prefilling' state per admitted request without running any
@@ -1377,6 +1384,8 @@ class ContinuousBatchEngine:
         *,
         events: list[ServingTokenEvent] | None = None,
     ) -> tuple[list[tuple[int, ServingResult]], list[_ActiveRequest]]:
+        _p = self.profile_timings
+        _t0 = time.perf_counter() if _p else 0.0
         indexed_results: list[tuple[int, ServingResult]] = []
         live: list[_ActiveRequest] = []
         for state in active:
@@ -1385,9 +1394,14 @@ class ContinuousBatchEngine:
                 indexed_results.append((state.original_index, self._finish_and_release(state, step)))
             else:
                 live.append(state)
+        if _p:
+            self.stats._da_filter_ms = getattr(self.stats, '_da_filter_ms', 0.0) + (time.perf_counter() - _t0) * 1000.0
 
+        _t1 = time.perf_counter() if _p else 0.0
         next_active: list[_ActiveRequest] = []
         groups = [live] if self._can_decode_ragged(live) else self._decode_groups(live)
+        if _p:
+            self.stats._da_group_ms = getattr(self.stats, '_da_group_ms', 0.0) + (time.perf_counter() - _t1) * 1000.0
         for group in groups:
             if self._can_decode_ragged(group):
                 decoded = self._decode_ragged_batch(group, step, events=events)
@@ -1397,11 +1411,14 @@ class ContinuousBatchEngine:
                     if len(group) > 1
                     else [self._decode_one(group[0], step, events=events)]
                 )
+            _t2 = time.perf_counter() if _p else 0.0
             for item, state in zip(decoded, group):
                 if isinstance(item, ServingResult):
                     indexed_results.append((state.original_index, item))
                 else:
                     next_active.append(item)
+            if _p:
+                self.stats._da_collect_ms = getattr(self.stats, '_da_collect_ms', 0.0) + (time.perf_counter() - _t2) * 1000.0
         return indexed_results, next_active
 
     def _decode_groups(self, states: list[_ActiveRequest]) -> list[list[_ActiveRequest]]:
@@ -1530,14 +1547,14 @@ class ContinuousBatchEngine:
         if self.profile_timings:
             self.stats.decode_ragged_prepare_ms += (time.perf_counter() - prepare_start_s) * 1000.0
         model_start_s = time.perf_counter() if self.profile_timings else 0.0
-        graph_token = self._try_ragged_token_graph(input_ids, seq_lens, row_indices)
+        graph_token = self._try_ragged_token_graph(input_ids[:n_padded], seq_lens, row_indices)
         if graph_token is not None:
             next_token_tensor = graph_token.to(self.device)
             self.stats.decode_graph_hits += 1
         else:
-            logits = self._ragged_decode_logits(input_ids, seq_lens, row_indices)
+            logits = self._ragged_decode_logits(input_ids[:n_padded], seq_lens, row_indices)
             next_token_tensor = self._sample_logits(logits[:, -1, :])
-        self._record_model_call("decode", len(decode_rows), tokens=len(decode_rows), ragged=True)
+        self._record_model_call("decode", n_padded, tokens=n_padded, ragged=True)
         if self.profile_timings:
             self.stats.decode_ragged_model_ms += (time.perf_counter() - model_start_s) * 1000.0
         cpu_tokens_start_s = time.perf_counter() if self.profile_timings else 0.0
@@ -2113,9 +2130,16 @@ class ContinuousBatchEngine:
                 if batch < bucket:
                     s_ids[batch:] = 0
                     s_ri[batch:] = 0
-                indptr = torch.arange(bucket + 1, dtype=torch.int32, device=self.device)
+                fi_bufs = getattr(self, "_fi_bufs", {})
+                if bucket not in fi_bufs:
+                    fi_bufs[bucket] = (
+                        torch.arange(bucket + 1, dtype=torch.int32, device=self.device),
+                        torch.ones(bucket, dtype=torch.int32, device=self.device),
+                    )
+                    self._fi_bufs = fi_bufs
+                indptr, lpl = fi_bufs[bucket]
+                lpl.fill_(1)
                 indices = s_ri.to(dtype=torch.int32)
-                lpl = torch.ones(bucket, dtype=torch.int32, device=self.device)
                 row_sl = seq_lens[row_indices[:batch].long()]
                 s_wp[:batch, 0].copy_(row_sl)
                 lpl[:batch] = (row_sl + 1).to(torch.int32)
