@@ -3983,6 +3983,47 @@ class Llama3TensorParallelForCausalLM:
         logit_positions: Tensor,
         row_indices: Tensor | None = None,
     ) -> Tensor:
+        if (
+            getattr(cache, "_compiled_prefill_ready", False)
+            and not hasattr(self, "_compiled_step_flashinfer")
+            and env_flag("TORCHINFERNO_COMPILED_UNIFIED_FORWARD", True)
+        ):
+            try:
+                self._compiled_step_flashinfer = torch.compile(
+                    self._forward_step_flashinfer_body,
+                    mode="max-autotune",
+                    fullgraph=False,
+                )
+            except Exception:
+                self._compiled_step_flashinfer = None
+        compiled = getattr(self, "_compiled_step_flashinfer", None)
+        if compiled is not None:
+            return compiled(
+                input_ids, cache,
+                seq_lens=seq_lens, q_lens=q_lens,
+                write_positions=write_positions,
+                logit_positions=logit_positions,
+                row_indices=row_indices,
+            )
+        return self._forward_step_flashinfer_body(
+            input_ids, cache,
+            seq_lens=seq_lens, q_lens=q_lens,
+            write_positions=write_positions,
+            logit_positions=logit_positions,
+            row_indices=row_indices,
+        )
+
+    def _forward_step_flashinfer_body(
+        self,
+        input_ids: Tensor,
+        cache: Llama3TensorParallelCache,
+        *,
+        seq_lens: Tensor,
+        q_lens: Tensor,
+        write_positions: Tensor,
+        logit_positions: Tensor,
+        row_indices: Tensor | None = None,
+    ) -> Tensor:
         import flashinfer
 
         batch = input_ids.size(0)

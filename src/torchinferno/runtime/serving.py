@@ -270,7 +270,7 @@ class ContinuousBatchEngine:
         self.graph_prefill = graph_prefill
         self.profile_timings = profile_timings
         self.unified_forward = bool(
-            env_flag("TORCHINFERNO_CONTINUOUS_UNIFIED_FORWARD", False)
+            env_flag("TORCHINFERNO_CONTINUOUS_UNIFIED_FORWARD", True)
             and hasattr(model, "forward_step_flashinfer")
         )
         self.prefix_cache = PrefixCacheIndex()
