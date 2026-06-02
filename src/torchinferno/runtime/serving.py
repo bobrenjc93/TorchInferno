@@ -579,7 +579,7 @@ class ContinuousBatchEngine:
         if active_count > 0 and capacity < min(min_free_rows, self.max_active_requests):
             return []
         per_step_cap = env_int("TORCHINFERNO_CONTINUOUS_ADMIT_PER_STEP_CAP", 4, minimum=0)
-        if per_step_cap > 0 and active_count > 0:
+        if per_step_cap > 0 and active_count >= per_step_cap:
             capacity = min(capacity, per_step_cap)
         min_ready_requests = env_int("TORCHINFERNO_CONTINUOUS_ADMIT_MIN_READY_REQUESTS", 1, minimum=1)
         if active_count > 0 and min_ready_requests > 1:
