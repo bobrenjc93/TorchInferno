@@ -1752,9 +1752,16 @@ class OpenAICompletionEngine:
             getattr(self, "max_model_len", None) or 768,
             minimum=64,
         )
+        unified_cache_backend = self.cache_backend
+        if hasattr(self.model, "forward_step_flashinfer"):
+            try:
+                import flashinfer  # noqa: F401
+                unified_cache_backend = "flashinfer"
+            except ImportError:
+                pass
         cache = _allocate_cache(
             self.model, cache_batch, _generation_cache_capacity(self.model, max_seq_len),
-            device=self.device, cache_backend=self.cache_backend, page_size=self.page_size,
+            device=self.device, cache_backend=unified_cache_backend, page_size=self.page_size,
         )
         _reset_generation_cache(cache)
         try:
@@ -10031,13 +10038,20 @@ def _tensor_parallel_worker_loop(engine: OpenAICompletionEngine) -> None:
                 if worker_shared_cache is None:
                     try:
                         total_rows = max_active + prefix_rows
-                        worker_shared_cache = engine._generation_cache(
-                            total_rows,
-                            max_seq_len,
-                            model=getattr(engine, "model"),
-                            batch_capacity=_generation_cache_batch_capacity(
-                                getattr(engine, "model"), total_rows,
-                            ),
+                        worker_model = getattr(engine, "model")
+                        worker_cache_backend = str(getattr(engine, "cache_backend", "dense"))
+                        if hasattr(worker_model, "forward_step_flashinfer"):
+                            try:
+                                import flashinfer as _fi_check  # noqa: F401
+                                worker_cache_backend = "flashinfer"
+                            except ImportError:
+                                pass
+                        worker_shared_cache = _allocate_cache(
+                            worker_model, total_rows,
+                            _generation_cache_capacity(worker_model, max_seq_len),
+                            device=getattr(engine, "device", torch.device("cpu")),
+                            cache_backend=worker_cache_backend,
+                            page_size=int(getattr(engine, "page_size", 16)),
                         )
                         _reset_generation_cache(worker_shared_cache)
                     except Exception:

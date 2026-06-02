@@ -4,7 +4,9 @@
       "Bash(rm -rf /tmp/claude-bobren/claude-65617/-data-users-bobren-d-TorchInferno/5cbbcb02-0a10-4c6c-879a-21e2ced7f20a/tasks/*)",
       "Bash(pkill -9 -f torchinferno)",
       "Bash(pkill -9 -f openai_server)",
-      "Read(//tmp/inference-bench/.git/**)"
+      "Read(//tmp/inference-bench/.git/**)",
+      "Bash(rm -rf /tmp/claude-bobren/claude-65617/-data-users-bobren-d-TorchInferno/e64be3a1-6f3b-4753-9f8b-0765e4607df4/tasks/*)",
+      "Bash(timeout 20 curl -s http://localhost:8199/v1/chat/completions -H 'Content-Type: application/json' -d '{\"model\":\"meta-llama/Meta-Llama-3.1-70B-Instruct\",\"messages\":[{\"role\":\"user\",\"content\":\"Hi\"}],\"max_tokens\":5,\"stream\":true}')"
     ]
   }
 }

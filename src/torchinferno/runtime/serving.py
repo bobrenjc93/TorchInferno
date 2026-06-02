@@ -269,6 +269,10 @@ class ContinuousBatchEngine:
         # so graph shapes repeat. Per-row start positions handle mixed prefixes.
         self.graph_prefill = graph_prefill
         self.profile_timings = profile_timings
+        self.unified_forward = bool(
+            env_flag("TORCHINFERNO_CONTINUOUS_UNIFIED_FORWARD", True)
+            and hasattr(model, "forward_step_flashinfer")
+        )
         self.prefix_cache = PrefixCacheIndex()
         self.reusable_prefixes: dict[Hashable, _ReusablePrefix] = {}
         self._pinned_prefix_routes: set[Hashable] = set()
@@ -377,6 +381,8 @@ class ContinuousBatchEngine:
 
     @torch.inference_mode()
     def step_online(self) -> list[ServingTokenEvent]:
+        if self.unified_forward:
+            return self._step_online_unified()
         waiting = self._require_online_waiting()
         if not waiting and not self._online_active and not self._online_prefilling:
             return []
@@ -390,10 +396,6 @@ class ContinuousBatchEngine:
             if self.profile_timings:
                 self.stats._decode_active_ms = getattr(self.stats, '_decode_active_ms', 0.0) + (time.perf_counter() - _da_start) * 1000.0
 
-        # Advance in-flight chunked prefills by one bounded chunk; rows that
-        # complete their prompt sample a first token and join the decode set. A
-        # long prompt therefore stalls the decode batch by at most one chunk per
-        # step instead of its whole suffix in one shot.
         if self.prefill_chunk_size and self._online_prefilling:
             active.extend(self._advance_prefilling(step, events=events))
 
@@ -416,6 +418,212 @@ class ContinuousBatchEngine:
 
         next_arrival_step = waiting.next_arrival_step()
         idle = not active and not self._online_prefilling
+        if next_arrival_step is not None and idle and next_arrival_step > self._online_step:
+            self._online_step = next_arrival_step
+        return events
+
+    @torch.inference_mode()
+    def _step_online_unified(self) -> list[ServingTokenEvent]:
+        waiting = self._require_online_waiting()
+        if not waiting and not self._online_active and not self._online_prefilling:
+            return []
+        if not hasattr(self, '_unified_logged'):
+            import sys as _us
+            rank = getattr(self.model, 'rank', -1)
+            print(f"[UNIFIED] rank={rank} entering _step_online_unified", file=_us.stderr, flush=True)
+            self._unified_logged = True
+        events: list[ServingTokenEvent] = []
+        step = self._online_step
+        self.stats.scheduler_steps += 1
+        cache = self._require_cache()
+
+        decode_states: list[_ActiveRequest] = []
+        for state in self._online_active:
+            state.seq_len = self._cache_row_seq_len(state.row, state.seq_len)
+            if self._should_finish_before_decode(state):
+                self._finish_and_release(state, step)
+                self._record_token_event(events, state, state.last_token, step, finished=True)
+            else:
+                decode_states.append(state)
+
+        occupied = len(decode_states) + len(self._online_prefilling)
+        admitted = self._admit_ready_requests(waiting, step, occupied)
+
+        prefill_states: list[_ActiveRequest] = []
+        for original_index, request in admitted:
+            row = self._acquire_active_row()
+            match, entry = self.prefix_cache.lookup(request.prompt)
+            reusable = self.reusable_prefixes.get(entry.route_id) if entry is not None else None
+            prefix_hit = match.depth if (reusable is not None and match.depth > 0) else 0
+            if prefix_hit >= len(request.prompt):
+                prefix_hit = max(0, len(request.prompt) - 1)
+            if reusable is not None and prefix_hit > 0:
+                self._copy_prefix(reusable.row, row, prefix_hit)
+                self.stats.prefix_reuse_requests += 1
+                self.stats.prefix_reuse_tokens += prefix_hit
+            suffix = request.prompt[prefix_hit:]
+            state = _ActiveRequest(
+                original_index=original_index,
+                request=request,
+                tokens=list(request.prompt),
+                generated=0,
+                row=row,
+                last_token=request.prompt[-1] if request.prompt else 0,
+                seq_len=prefix_hit,
+                prefix_hit_tokens=prefix_hit,
+                started_step=step,
+            )
+            state._prefill_suffix = suffix
+            prefill_states.append(state)
+        self.stats.prefill_admitted_requests += len(prefill_states)
+
+        if not decode_states and not prefill_states and not self._online_prefilling:
+            self._online_active = []
+            self._online_step = step + 1
+            return events
+
+        if prefill_states or self._online_prefilling:
+            all_prefilling = list(self._online_prefilling) + prefill_states
+            batch_rows = []
+            batch_q_lens = []
+            batch_input_ids: list[list[int]] = []
+            batch_write_pos: list[list[int]] = []
+            batch_logit_pos = []
+            batch_seq_lens = []
+            max_q = 1
+            batch_is_decode: list[bool] = []
+            batch_states: list[_ActiveRequest] = []
+
+            for state in decode_states:
+                batch_rows.append(state.row)
+                batch_q_lens.append(1)
+                batch_input_ids.append([state.last_token])
+                batch_write_pos.append([state.seq_len])
+                batch_logit_pos.append(0)
+                batch_seq_lens.append(state.seq_len)
+                batch_is_decode.append(True)
+                batch_states.append(state)
+
+            chunk = self.prefill_chunk_size
+            still_prefilling: list[_ActiveRequest] = []
+            for state in all_prefilling:
+                suffix = getattr(state, '_prefill_suffix', None)
+                if suffix is None:
+                    suffix = state.request.prompt[state.seq_len:]
+                if chunk and len(suffix) > chunk:
+                    cur_suffix = suffix[:chunk]
+                    state._prefill_suffix = suffix[chunk:]
+                    still_prefilling.append(state)
+                else:
+                    cur_suffix = suffix
+                    state._prefill_suffix = None
+                cursor = state.seq_len
+                q_len = len(cur_suffix)
+                if q_len == 0:
+                    continue
+                batch_rows.append(state.row)
+                batch_q_lens.append(q_len)
+                batch_input_ids.append(list(cur_suffix))
+                batch_write_pos.append(list(range(cursor, cursor + q_len)))
+                batch_logit_pos.append(q_len - 1)
+                batch_seq_lens.append(cursor)
+                batch_is_decode.append(False)
+                batch_states.append(state)
+                max_q = max(max_q, q_len)
+
+            if not batch_rows:
+                self._online_active = decode_states
+                self._online_prefilling = still_prefilling
+                self._online_step = step + 1
+                return events
+
+            n = len(batch_rows)
+            for i in range(n):
+                while len(batch_input_ids[i]) < max_q:
+                    batch_input_ids[i].append(0)
+                while len(batch_write_pos[i]) < max_q:
+                    batch_write_pos[i].append(0)
+
+            input_ids = torch.tensor(batch_input_ids, device=self.device, dtype=torch.long)
+            q_lens_t = torch.tensor(batch_q_lens, device=self.device, dtype=torch.long)
+            write_positions = torch.tensor(batch_write_pos, device=self.device, dtype=torch.long)
+            logit_positions = torch.tensor(batch_logit_pos, device=self.device, dtype=torch.long)
+            seq_lens_t = torch.tensor(batch_seq_lens, device=self.device, dtype=torch.long)
+            row_indices = torch.tensor(batch_rows, device=self.device, dtype=torch.long)
+
+            _rank = getattr(self.model, 'rank', -1)
+            import sys as _dbg
+            print(f"[UNIFIED] rank={_rank} batch={n} decode={sum(batch_is_decode)} prefill={n-sum(batch_is_decode)} max_q={max_q} rows={batch_rows[:4]}...", file=_dbg.stderr, flush=True)
+            logits = self.model.forward_step_flashinfer(
+                input_ids, cache,
+                seq_lens=seq_lens_t, q_lens=q_lens_t,
+                write_positions=write_positions,
+                logit_positions=logit_positions,
+                row_indices=row_indices,
+            )
+            print(f"[UNIFIED] rank={_rank} forward done", file=_dbg.stderr, flush=True)
+            self._record_model_call("unified", n, tokens=int(q_lens_t.sum().item()))
+            next_tokens_cpu = self._sample_logits(logits[:, -1, :]).detach().cpu().tolist()
+            print(f"[UNIFIED] rank={_rank} sampled ok, decoding={sum(batch_is_decode)} prefilling={n-sum(batch_is_decode)}", file=_dbg.stderr, flush=True)
+
+            next_active: list[_ActiveRequest] = []
+            for i, state in enumerate(batch_states):
+                tok = int(next_tokens_cpu[i])
+                if batch_is_decode[i]:
+                    state.tokens.append(tok)
+                    state.generated += 1
+                    state.last_token = tok
+                    state.seq_len += 1
+                    self._remember_row_seq_len(state.row, state.seq_len)
+                    finished = self._should_finish_after_decode(state)
+                    self._record_token_event(events, state, tok, step, finished=finished)
+                    if finished:
+                        self._finish_and_release(state, step)
+                    else:
+                        next_active.append(state)
+                else:
+                    q_len = batch_q_lens[i]
+                    new_seq_len = batch_seq_lens[i] + q_len
+                    self._set_cache_row_seq_len(state.row, new_seq_len)
+                    self._remember_row_seq_len(state.row, new_seq_len)
+                    state.seq_len = new_seq_len
+                    if state._prefill_suffix is None or len(state._prefill_suffix) == 0:
+                        state.tokens.append(tok)
+                        state.generated = 1
+                        state.last_token = tok
+                        state._prefill_suffix = None
+                        self._store_reusable_prefix(
+                            state.request.request_id, state.request.prompt,
+                            state.row, logits[i:i+1],
+                        )
+                        finished = self._should_finish_after_decode(state)
+                        self._record_token_event(events, state, tok, step, finished=finished)
+                        if finished:
+                            self._finish_and_release(state, step)
+                        else:
+                            next_active.append(state)
+                    else:
+                        still_prefilling.append(state)
+
+            self._online_active = next_active
+            self._online_prefilling = still_prefilling
+        else:
+            decoded = self._decode_ragged_batch(decode_states, step, events=events) \
+                if self._can_decode_ragged(decode_states) \
+                else (self._decode_batch(decode_states, step, events=events)
+                      if len(decode_states) > 1
+                      else [self._decode_one(decode_states[0], step, events=events)])
+            next_active = []
+            for item, state in zip(decoded, decode_states):
+                if isinstance(item, ServingResult):
+                    pass
+                else:
+                    next_active.append(item)
+            self._online_active = next_active
+
+        self._online_step = step + 1
+        next_arrival_step = waiting.next_arrival_step()
+        idle = not self._online_active and not self._online_prefilling
         if next_arrival_step is not None and idle and next_arrival_step > self._online_step:
             self._online_step = next_arrival_step
         return events
