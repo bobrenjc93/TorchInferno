@@ -2297,10 +2297,9 @@ class ContinuousBatchEngine:
             return False
         if len(states) <= 1:
             return False
-        if len({state.seq_len for state in states}) <= 1 and not env_flag(
-            "TORCHINFERNO_CONTINUOUS_UNIFORM_RAGGED_DECODE",
-            False,
-        ):
+        if not hasattr(self, "_uniform_ragged"):
+            self._uniform_ragged = env_flag("TORCHINFERNO_CONTINUOUS_UNIFORM_RAGGED_DECODE", False)
+        if len({state.seq_len for state in states}) <= 1 and not self._uniform_ragged:
             return False
         return (
             hasattr(self.model, "decode_ragged_logits")
