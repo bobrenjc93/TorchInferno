@@ -10325,6 +10325,7 @@ def test_openai_stream_group_can_drive_tensor_parallel_online_runtime(monkeypatc
 
 
 def test_openai_tensor_parallel_online_batcher_drains_ready_requests(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_PERSISTENT", "0")
     model = type("FakeTPModel", (), {"world_size": 2, "rank": 0, "allocate_cache": lambda self: None})()
     commands: list[tuple[str, object]] = []
     syncs: list[str] = []
@@ -10419,6 +10420,7 @@ def test_openai_tensor_parallel_online_batcher_drains_ready_requests(monkeypatch
 def test_openai_tensor_parallel_online_batcher_uses_queued_limit_for_default_rows(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_PERSISTENT", "0")
     model = type("FakeTPModel", (), {"world_size": 2, "rank": 0, "allocate_cache": lambda self: None})()
     commands: list[tuple[str, object]] = []
 
@@ -10553,6 +10555,7 @@ def test_openai_tensor_parallel_online_default_max_seq_len_adds_headroom(
 def test_openai_tensor_parallel_online_batcher_sizes_cache_from_initial_window(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_PERSISTENT", "0")
     model = type("FakeTPModel", (), {"world_size": 2, "rank": 0, "allocate_cache": lambda self: None})()
     commands: list[tuple[str, object]] = []
     started: list[int] = []
@@ -10642,6 +10645,7 @@ def test_openai_tensor_parallel_online_batcher_sizes_cache_from_initial_window(
 
 
 def test_openai_tensor_parallel_online_batcher_drains_after_short_step(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_PERSISTENT", "0")
     model = type("FakeTPModel", (), {"world_size": 2, "rank": 0, "allocate_cache": lambda self: None})()
     commands: list[tuple[str, object]] = []
     syncs: list[str] = []
