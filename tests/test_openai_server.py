@@ -10498,7 +10498,7 @@ def test_openai_tensor_parallel_online_batcher_uses_queued_limit_for_default_row
         "start",
         {
             "max_seq_len": 164,
-            "max_active_requests": 64,
+            "max_active_requests": 48,
             "prefix_cache_capacity": 1,
             "prefill_token_budget": None,
             "temperature": 0.0,
