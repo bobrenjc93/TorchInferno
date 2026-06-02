@@ -2347,6 +2347,7 @@ class OpenAICompletionEngine:
                 add_phase("start_sync_ms", start_sync_start_s)
                 submit_batch(initial_batch, arrival_step=0)
                 decode_quantum = env_int("TORCHINFERNO_OPENAI_TP_ONLINE_DECODE_QUANTUM", 8, minimum=1)
+                persistent = env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_PERSISTENT", True)
                 persistent_idle_s = env_float(
                     "TORCHINFERNO_OPENAI_TP_ONLINE_PERSISTENT_IDLE_MS", 10.0, minimum=0.0
                 ) / 1000.0
@@ -2354,18 +2355,55 @@ class OpenAICompletionEngine:
                     drain_ready(step)
                     if not runtime_engine.has_online_work():
                         if wait_and_drain(step, idle_wait_s) == 0:
-                            try:
-                                next_item = self._generation_queue.get(timeout=persistent_idle_s)
-                            except queue.Empty:
-                                break
-                            if next_item is None:
-                                self._generation_queue.put(None)
-                                break
-                            if compatible(next_item):
-                                submit_batch([next_item], arrival_step=step)
+                            if persistent:
+                                next_item = self._generation_queue.get()
                             else:
+                                try:
+                                    next_item = self._generation_queue.get(timeout=persistent_idle_s)
+                                except queue.Empty:
+                                    break
+                            if next_item is None:
+                                break
+                            if not compatible(next_item):
                                 deferred.append(next_item)
                                 break
+                            idle_batch = [next_item]
+                            if persistent:
+                                time.sleep(initial_wait_s)
+                                while len(idle_batch) < max_active:
+                                    try:
+                                        more = self._generation_queue.get_nowait()
+                                    except queue.Empty:
+                                        break
+                                    if more is None:
+                                        self._generation_queue.put(None)
+                                        break
+                                    if compatible(more):
+                                        idle_batch.append(more)
+                                    else:
+                                        deferred.append(more)
+                                _broadcast_tensor_parallel_online_start(
+                                    self.model,
+                                    max_seq_len=max_seq_len,
+                                    max_active_requests=max_active,
+                                    prefix_cache_capacity=prefix_rows,
+                                    prefill_token_budget=prefill_budget if prefill_budget > 0 else None,
+                                    temperature=first.temperature,
+                                    enable_ragged_decode=enable_ragged_decode,
+                                    store_reusable_prefixes=store_reusable_prefixes,
+                                    store_full_prompt_prefixes=store_full_prompt_prefixes,
+                                    max_tokens=run_max_tokens,
+                                )
+                                _reset_generation_cache(shared_cache)
+                                runtime_engine.start_online(
+                                    max_seq_len=max_seq_len,
+                                    external_cache=shared_cache,
+                                )
+                                _sync_tensor_parallel_command(self.model, self.device)
+                                request_by_id.clear()
+                                next_request_id = 0
+                                step = 0
+                            submit_batch(idle_batch, arrival_step=step)
                         continue
                     step_broadcast_start_s = time.perf_counter()
                     _broadcast_tensor_parallel_online_step(self.model, decode_quantum)
