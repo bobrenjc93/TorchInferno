@@ -427,11 +427,7 @@ class ContinuousBatchEngine:
         waiting = self._require_online_waiting()
         if not waiting and not self._online_active and not self._online_prefilling:
             return []
-        if not hasattr(self, '_unified_logged'):
-            import sys as _us
-            rank = getattr(self.model, 'rank', -1)
-            print(f"[UNIFIED] rank={rank} entering _step_online_unified", file=_us.stderr, flush=True)
-            self._unified_logged = True
+        pass
         events: list[ServingTokenEvent] = []
         step = self._online_step
         self.stats.scheduler_steps += 1
@@ -551,9 +547,6 @@ class ContinuousBatchEngine:
             seq_lens_t = torch.tensor(batch_seq_lens, device=self.device, dtype=torch.long)
             row_indices = torch.tensor(batch_rows, device=self.device, dtype=torch.long)
 
-            _rank = getattr(self.model, 'rank', -1)
-            import sys as _dbg
-            print(f"[UNIFIED] rank={_rank} batch={n} decode={sum(batch_is_decode)} prefill={n-sum(batch_is_decode)} max_q={max_q} rows={batch_rows[:4]}...", file=_dbg.stderr, flush=True)
             logits = self.model.forward_step_flashinfer(
                 input_ids, cache,
                 seq_lens=seq_lens_t, q_lens=q_lens_t,
@@ -561,10 +554,8 @@ class ContinuousBatchEngine:
                 logit_positions=logit_positions,
                 row_indices=row_indices,
             )
-            print(f"[UNIFIED] rank={_rank} forward done", file=_dbg.stderr, flush=True)
             self._record_model_call("unified", n, tokens=int(q_lens_t.sum().item()))
             next_tokens_cpu = self._sample_logits(logits[:, -1, :]).detach().cpu().tolist()
-            print(f"[UNIFIED] rank={_rank} sampled ok, decoding={sum(batch_is_decode)} prefilling={n-sum(batch_is_decode)}", file=_dbg.stderr, flush=True)
 
             next_active: list[_ActiveRequest] = []
             for i, state in enumerate(batch_states):
@@ -2293,8 +2284,11 @@ class ContinuousBatchEngine:
             if ragged:
                 self.stats.ragged_decode_batches += 1
                 self.stats.ragged_decode_tokens += tokens
-        else:
-            raise ValueError(f"unknown model call kind: {kind}")
+        elif kind == "unified":
+            self.stats.prefill_model_calls += 1
+            self.stats.decode_model_calls += 1
+            self.stats.prefill_tokens += tokens
+            self.stats.decode_tokens += tokens
         self.stats.max_model_batch_size = max(self.stats.max_model_batch_size, batch_size)
 
     def _can_decode_ragged(self, states: list[_ActiveRequest]) -> bool:

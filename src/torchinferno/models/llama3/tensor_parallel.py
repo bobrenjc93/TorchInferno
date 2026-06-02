@@ -1734,20 +1734,14 @@ class _Llama3TensorParallelLayer:
         else:
             _fi_buf = getattr(cache, '_fi_paged_kv', None)
             if _fi_buf is None:
-                n_pages = cache.keys.size(0)
-                seq_len = cache.keys.size(2)
-                n_heads = cache.keys.size(1)
-                head_dim = cache.keys.size(3)
                 _fi_buf = torch.empty(
-                    n_pages, 2, seq_len, n_heads, head_dim,
+                    cache.keys.size(0), 2, cache.keys.size(2),
+                    cache.keys.size(1), cache.keys.size(3),
                     device=cache.keys.device, dtype=cache.keys.dtype,
                 )
                 cache._fi_paged_kv = _fi_buf
-                cache._fi_paged_kv_dirty = True
-            if getattr(cache, '_fi_paged_kv_dirty', True):
-                _fi_buf[:, 0].copy_(cache.keys.transpose(1, 2))
-                _fi_buf[:, 1].copy_(cache.values.transpose(1, 2))
-                cache._fi_paged_kv_dirty = False
+            _fi_buf[:, 0].copy_(cache.keys.transpose(1, 2))
+            _fi_buf[:, 1].copy_(cache.values.transpose(1, 2))
             paged_kv = _fi_buf
         q_permuted = q.permute(0, 2, 1, 3)
         if q_lens is not None and not (q_lens == tokens).all():
