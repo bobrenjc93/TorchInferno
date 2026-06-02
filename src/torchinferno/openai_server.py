@@ -2348,7 +2348,7 @@ class OpenAICompletionEngine:
                 submit_batch(initial_batch, arrival_step=0)
                 decode_quantum = env_int("TORCHINFERNO_OPENAI_TP_ONLINE_DECODE_QUANTUM", 8, minimum=1)
                 persistent_idle_s = env_float(
-                    "TORCHINFERNO_OPENAI_TP_ONLINE_PERSISTENT_IDLE_MS", 100.0, minimum=0.0
+                    "TORCHINFERNO_OPENAI_TP_ONLINE_PERSISTENT_IDLE_MS", 10.0, minimum=0.0
                 ) / 1000.0
                 while True:
                     drain_ready(step)
