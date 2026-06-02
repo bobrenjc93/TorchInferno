@@ -2351,6 +2351,8 @@ class OpenAICompletionEngine:
                 persistent_idle_s = env_float(
                     "TORCHINFERNO_OPENAI_TP_ONLINE_PERSISTENT_IDLE_MS", 10.0, minimum=0.0
                 ) / 1000.0
+                _session_count = [0]
+                _session_count[0] += 1
                 while True:
                     drain_ready(step)
                     if not runtime_engine.has_online_work():
@@ -2364,11 +2366,24 @@ class OpenAICompletionEngine:
                                     break
                             if next_item is None:
                                 break
-                            if compatible(next_item):
-                                submit_batch([next_item], arrival_step=step)
-                            else:
+                            if not compatible(next_item):
                                 deferred.append(next_item)
                                 break
+                            idle_batch = [next_item]
+                            time.sleep(initial_wait_s)
+                            while len(idle_batch) < max_active:
+                                try:
+                                    more = self._generation_queue.get_nowait()
+                                except queue.Empty:
+                                    break
+                                if more is None:
+                                    self._generation_queue.put(None)
+                                    break
+                                if compatible(more):
+                                    idle_batch.append(more)
+                                else:
+                                    deferred.append(more)
+                            submit_batch(idle_batch, arrival_step=step)
                         continue
                     step_broadcast_start_s = time.perf_counter()
                     _broadcast_tensor_parallel_online_step(self.model, decode_quantum)
