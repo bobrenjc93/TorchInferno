@@ -2641,22 +2641,31 @@ class Llama3TensorParallelForCausalLM:
         hidden = F.embedding(input_ids.to(self.device, non_blocking=True), self.embed_tokens_weight)
         profile_fast_prefill = _tp_flag("TORCHINFERNO_PROFILE_FAST_PREFILL", False)
         if tokens > 1 and (profile_fast_prefill or all(layer.profile_seconds is None for layer in self.layers)):
-            attn_in: Tensor | None = None
-            for layer_id, layer in enumerate(self.layers):
-                layer_cache = active_cache.layers[layer_id] if active_cache is not None else None
-                next_norm_weight = (
-                    self.layers[layer_id + 1].input_layernorm_weight
-                    if layer_id + 1 < len(self.layers)
-                    else None
-                )
-                hidden, attn_in = layer.forward_prefill_fast(
-                    hidden,
-                    attn_in,
-                    positions,
-                    rotary,
-                    layer_cache,
-                    next_norm_weight,
-                )
+            self._ensure_compiled_prefill()
+            compiled = getattr(self, "_compiled_forward_prefill", None)
+            if compiled is not None and active_cache is not None:
+                try:
+                    hidden = compiled(hidden, positions, rotary, active_cache)
+                except Exception:
+                    self._compiled_forward_prefill = None
+                    compiled = None
+            if compiled is None:
+                attn_in: Tensor | None = None
+                for layer_id, layer in enumerate(self.layers):
+                    layer_cache = active_cache.layers[layer_id] if active_cache is not None else None
+                    next_norm_weight = (
+                        self.layers[layer_id + 1].input_layernorm_weight
+                        if layer_id + 1 < len(self.layers)
+                        else None
+                    )
+                    hidden, attn_in = layer.forward_prefill_fast(
+                        hidden,
+                        attn_in,
+                        positions,
+                        rotary,
+                        layer_cache,
+                        next_norm_weight,
+                    )
         else:
             for layer_id, layer in enumerate(self.layers):
                 layer_cache = active_cache.layers[layer_id] if active_cache is not None else None
@@ -2675,6 +2684,41 @@ class Llama3TensorParallelForCausalLM:
             return logits, active_cache
         logits = self._gather_logits(logits)
         return logits, active_cache
+
+    def _ensure_compiled_prefill(self) -> None:
+        if hasattr(self, "_compiled_forward_prefill"):
+            return
+        if not env_flag("TORCHINFERNO_COMPILED_PREFILL", True):
+            self._compiled_forward_prefill = None
+            return
+        try:
+            self._compiled_forward_prefill = torch.compile(
+                self._forward_prefill_body,
+                mode="max-autotune",
+                fullgraph=False,
+            )
+        except Exception:
+            self._compiled_forward_prefill = None
+
+    def _forward_prefill_body(
+        self,
+        hidden: Tensor,
+        positions: Tensor,
+        rotary: tuple[Tensor, Tensor],
+        cache: "Llama3TensorParallelCache",
+    ) -> Tensor:
+        attn_in: Tensor | None = None
+        for layer_id, layer in enumerate(self.layers):
+            layer_cache = cache.layers[layer_id]
+            next_norm_weight = (
+                self.layers[layer_id + 1].input_layernorm_weight
+                if layer_id + 1 < len(self.layers)
+                else None
+            )
+            hidden, attn_in = layer.forward_prefill_fast(
+                hidden, attn_in, positions, rotary, layer_cache, next_norm_weight,
+            )
+        return hidden
 
     @torch.inference_mode()
     def prefill_cache_only(
