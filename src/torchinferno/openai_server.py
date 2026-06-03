@@ -2481,15 +2481,11 @@ class OpenAICompletionEngine:
                     _broadcast_tensor_parallel_online_step(self.model, decode_quantum)
                     add_phase("step_broadcast_ms", step_broadcast_start_s)
                     online_step_commands += 1
-                    has_decode_only = hasattr(runtime_engine, "step_decode_only")
-                    for qi in range(decode_quantum):
+                    for _ in range(decode_quantum):
                         if not runtime_engine.has_online_work():
                             break
                         runtime_step_start_s = time.perf_counter()
-                        if has_decode_only and qi < decode_quantum - 1 and runtime_engine._online_active:
-                            events = runtime_engine.step_decode_only()
-                        else:
-                            events = runtime_engine.step_online()
+                        events = runtime_engine.step_online()
                         add_phase("runtime_step_ms", runtime_step_start_s)
                         event_emit_start_s = time.perf_counter()
                         for event in events:
