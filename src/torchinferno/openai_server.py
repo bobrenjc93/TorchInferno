@@ -10127,6 +10127,9 @@ def _tensor_parallel_worker_loop(engine: OpenAICompletionEngine) -> None:
                 online_runtime_engine.start_online(
                     max_seq_len=max_seq_len, external_cache=worker_shared_cache,
                 )
+                worker_decode_runner = getattr(engine, "_decode_graph_runner", None)
+                if worker_decode_runner is not None:
+                    online_runtime_engine._decode_runner = worker_decode_runner
                 online_symm_scope = _tensor_parallel_symm_mem_allreduce_scope(
                     getattr(engine, "model"),
                     getattr(engine, "device", torch.device("cpu")),

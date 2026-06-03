@@ -1691,7 +1691,7 @@ class ContinuousBatchEngine:
         events: list[ServingTokenEvent] | None = None,
     ) -> tuple[list[tuple[int, ServingResult]], list[_ActiveRequest]]:
         runner = getattr(self, "_decode_runner", None)
-        if runner is not None and len(active) > 1 and int(getattr(self.model, "world_size", 1)) <= 1:
+        if runner is not None and len(active) > 1:
             return self._decode_active_with_runner(runner, active, step, events=events)
         _p = self.profile_timings
         _t0 = time.perf_counter() if _p else 0.0
