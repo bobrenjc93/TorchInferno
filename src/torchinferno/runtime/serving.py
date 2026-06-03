@@ -1947,12 +1947,7 @@ class ContinuousBatchEngine:
             finished = self._should_finish_after_decode(state)
             self._record_token_event(events, state, next_token, step, finished=finished)
             if finished:
-                decoded.append(self._finish_and_release(state, step))
-            else:
-                decoded.append(state)
-        if self.profile_timings:
-            self.stats.decode_ragged_state_update_ms += (time.perf_counter() - state_update_start_s) * 1000.0
-        return decoded
+                self._finish_and_release(state, step)
 
     def _ragged_decode_bucket_rows(self, rows: list[int]) -> list[int]:
         if not env_flag("TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_BUCKETS", True):
