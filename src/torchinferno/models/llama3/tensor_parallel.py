@@ -914,6 +914,8 @@ class Llama3TensorParallelCache:
             view._skip_capture_sync = True
         if getattr(self, "_block_decode_graph_captures", False):
             view._block_decode_graph_captures = True
+        if getattr(self, "_compiled_prefill_ready", False):
+            view._compiled_prefill_ready = True
         return view
 
     def clear_row(self, row: int) -> None:
@@ -2642,10 +2644,11 @@ class Llama3TensorParallelForCausalLM:
         profile_fast_prefill = _tp_flag("TORCHINFERNO_PROFILE_FAST_PREFILL", False)
         if tokens > 1 and (profile_fast_prefill or all(layer.profile_seconds is None for layer in self.layers)):
             use_compiled = False
-            if (
-                active_cache is not None
-                and getattr(active_cache, "_compiled_prefill_ready", False)
-            ):
+            cache_ready = (
+                getattr(active_cache, "_compiled_prefill_ready", False)
+                or getattr(getattr(active_cache, "_parent_cache", None), "_compiled_prefill_ready", False)
+            )
+            if active_cache is not None and cache_ready:
                 self._ensure_compiled_prefill()
                 compiled = getattr(self, "_compiled_forward_prefill", None)
                 if compiled is not None:
@@ -2699,7 +2702,7 @@ class Llama3TensorParallelForCausalLM:
         try:
             self._compiled_forward_prefill = torch.compile(
                 self._forward_prefill_body,
-                mode="max-autotune",
+                dynamic=True,
                 fullgraph=False,
             )
         except Exception:
