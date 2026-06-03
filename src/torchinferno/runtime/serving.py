@@ -855,7 +855,7 @@ class ContinuousBatchEngine:
             active.extend(self._prefill_prefix_batch(group, step, events=events))
 
         plain_group = [item for group in batchable.values() for item in group]
-        if False and plain_group and self.graph_prefill and len(plain_group) > 1:
+        if plain_group and self.graph_prefill and len(plain_group) > 1:
             ragged_active = self._prefill_ragged_graph_batch(plain_group, step, events=events)
             if ragged_active is not None:
                 active.extend(ragged_active)
@@ -1481,6 +1481,9 @@ class ContinuousBatchEngine:
         if ragged_graph is None:
             return None
         rows = [self._acquire_active_row() for _ in group]
+        cache = self._require_cache()
+        for row in rows:
+            cache.clear_row(row)
         lengths = [len(request.prompt) for _, request, _ in group]
         max_len = max(lengths)
         suffix_bucket = self._suffix_bucket(max_len)
