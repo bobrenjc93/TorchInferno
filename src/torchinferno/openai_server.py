@@ -4258,16 +4258,14 @@ class OpenAICompletionEngine:
         cache_token_counts = _warmup_prefill_cache_token_counts()
         if not cache_token_counts:
             return
-        prefill_batch_sizes = sorted({1, 2, 4, 8, 16} & set(range(1, max(1, int(getattr(self, "max_batch_size", 16))) + 1)))
         for cache_tokens in cache_token_counts:
-            for pbs in prefill_batch_sizes:
-                cache = self._generation_cache(pbs, cache_tokens, model=self.model)
-                for count in prompt_token_counts:
-                    if count > cache_tokens:
-                        continue
-                    input_ids = (torch.arange(count, device=self.device, dtype=torch.long) % vocab_size).unsqueeze(0).expand(pbs, -1)
-                    _try_prefill_graph(self.model, input_ids, cache, 0.0, allow_capture=True)
-                    _reset_generation_cache(cache)
+            cache = self._generation_cache(1, cache_tokens, model=self.model)
+            for count in prompt_token_counts:
+                if count > cache_tokens:
+                    continue
+                input_ids = (torch.arange(count, device=self.device, dtype=torch.long) % vocab_size)[None, :]
+                _try_prefill_graph(self.model, input_ids, cache, 0.0, allow_capture=True)
+                _reset_generation_cache(cache)
 
     def _warmup_tensor_parallel_prefix_suffix_graphs(self, vocab_size: int) -> None:
         if not env_flag("TORCHINFERNO_CUDAGRAPH_PREFILL", True):
