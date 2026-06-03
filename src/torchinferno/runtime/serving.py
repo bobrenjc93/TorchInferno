@@ -855,34 +855,40 @@ class ContinuousBatchEngine:
             active.extend(self._prefill_prefix_batch(group, step, events=events))
 
         plain_group = [item for group in batchable.values() for item in group]
-        fi_active = None
-        if env_flag("TORCHINFERNO_CONTINUOUS_FLASHINFER_PREFILL", False) and plain_group:
-            fi_requests = [(idx, req, hit, None) for idx, req, hit in plain_group]
-            fi_active = self._try_flashinfer_prefill(fi_requests, step, events=events)
-        if fi_active is not None:
-            active.extend(fi_active)
-        else:
-            shared_prefix_active = self._prefill_common_prefix_batch(plain_group, step, events=events)
-            if shared_prefix_active is not None:
-                active.extend(shared_prefix_active)
-            elif len(plain_group) > 1 and self._can_padded_batch_prefill(plain_group):
-                active.extend(self._prefill_padded_batch(plain_group, step, events=events))
+        if plain_group and self.graph_prefill and len(plain_group) > 1:
+            ragged_active = self._prefill_ragged_graph_batch(plain_group, step, events=events)
+            if ragged_active is not None:
+                active.extend(ragged_active)
+                plain_group = []
+        if plain_group:
+            fi_active = None
+            if env_flag("TORCHINFERNO_CONTINUOUS_FLASHINFER_PREFILL", False):
+                fi_requests = [(idx, req, hit, None) for idx, req, hit in plain_group]
+                fi_active = self._try_flashinfer_prefill(fi_requests, step, events=events)
+            if fi_active is not None:
+                active.extend(fi_active)
             else:
-                for group in batchable.values():
-                    if len(group) == 1:
-                        original_index, request, prefix_hit_tokens = group[0]
-                        active.append(
-                            self._prefill_one(
-                                original_index,
-                                request,
-                                step,
-                                prefix_hit_tokens,
-                                None,
-                                events=events,
+                shared_prefix_active = self._prefill_common_prefix_batch(plain_group, step, events=events)
+                if shared_prefix_active is not None:
+                    active.extend(shared_prefix_active)
+                elif len(plain_group) > 1 and self._can_padded_batch_prefill(plain_group):
+                    active.extend(self._prefill_padded_batch(plain_group, step, events=events))
+                else:
+                    for group in batchable.values():
+                        if len(group) == 1:
+                            original_index, request, prefix_hit_tokens = group[0]
+                            active.append(
+                                self._prefill_one(
+                                    original_index,
+                                    request,
+                                    step,
+                                    prefix_hit_tokens,
+                                    None,
+                                    events=events,
+                                )
                             )
-                        )
-                    else:
-                        active.extend(self._prefill_batch(group, step, events=events))
+                        else:
+                            active.extend(self._prefill_batch(group, step, events=events))
         if self.profile_timings:
             self.stats.prefill_wall_ms += (time.perf_counter() - timing_start_s) * 1000.0
         return indexed_results, active
@@ -1449,6 +1455,77 @@ class ContinuousBatchEngine:
             seq_len = self._refresh_row_seq_len_from_cache(row, len(request.prompt))
             self._store_reusable_prefix(request.request_id, request.prompt, row, logits[row_index : row_index + 1])
             next_token = int(next_tokens[row_index])
+            state = _ActiveRequest(
+                original_index=original_index,
+                request=request,
+                tokens=[*request.prompt, next_token],
+                generated=1,
+                row=row,
+                last_token=next_token,
+                seq_len=seq_len,
+                prefix_hit_tokens=prefix_hit_tokens,
+                started_step=step,
+            )
+            self._record_token_event(events, state, next_token, step, finished=self._should_finish_before_decode(state))
+            active.append(state)
+        return active
+
+    def _prefill_ragged_graph_batch(
+        self,
+        group: list[tuple[int, ServingRequest, int]],
+        step: int,
+        *,
+        events: list[ServingTokenEvent] | None = None,
+    ) -> list[_ActiveRequest] | None:
+        ragged_graph = getattr(self.model, "try_prefill_ragged_logits_graph", None)
+        if ragged_graph is None:
+            return None
+        rows = [self._acquire_active_row() for _ in group]
+        lengths = [len(request.prompt) for _, request, _ in group]
+        max_len = max(lengths)
+        suffix_bucket = self._suffix_bucket(max_len)
+        batch_bucket = self._prefill_batch_bucket(len(group))
+        padded = []
+        for _, request, _ in group:
+            prompt = list(request.prompt)
+            prompt.extend([0] * (suffix_bucket - len(prompt)))
+            padded.append(prompt)
+        while len(padded) < batch_bucket:
+            padded.append([0] * suffix_bucket)
+        input_ids = torch.tensor(padded, device=self.device, dtype=torch.long)
+        row_indices_list = list(rows)
+        while len(row_indices_list) < batch_bucket:
+            row_indices_list.append(rows[0])
+        row_indices = torch.tensor(row_indices_list, device=self.device, dtype=torch.long)
+        seq_lens_list = [0] * (max(row_indices_list) + 1)
+        seq_lens = torch.tensor(seq_lens_list, device=self.device, dtype=torch.long)
+        logit_pos = [l - 1 for l in lengths]
+        while len(logit_pos) < batch_bucket:
+            logit_pos.append(0)
+        logit_positions = torch.tensor(logit_pos, device=self.device, dtype=torch.long)
+        try:
+            logits = ragged_graph(
+                input_ids, self._require_cache(),
+                seq_lens=seq_lens, row_indices=row_indices,
+                logit_positions=logit_positions,
+                context_len=suffix_bucket,
+            )
+        except Exception:
+            for row in rows:
+                self._release_active_row(row)
+            return None
+        n = len(group)
+        logits = logits[:n]
+        self._record_model_call("prefill", n, tokens=sum(lengths))
+        next_tokens = self._sample_logits(logits[:, -1, :]).detach().cpu().tolist()
+        for i, (_, request, _) in enumerate(group):
+            self._set_cache_row_seq_len(rows[i], len(request.prompt))
+        active = []
+        for i, (original_index, request, prefix_hit_tokens) in enumerate(group):
+            row = rows[i]
+            seq_len = len(request.prompt)
+            self._store_reusable_prefix(request.request_id, request.prompt, row, logits[i:i+1])
+            next_token = int(next_tokens[i])
             state = _ActiveRequest(
                 original_index=original_index,
                 request=request,
