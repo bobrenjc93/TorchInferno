@@ -1841,7 +1841,7 @@ class OpenAICompletionEngine:
             self._warmup_compiled_post_attention()
         if env_flag("TORCHINFERNO_COMPILED_PREFILL", False):
             self._warmup_compiled_prefill(cache, prompt_tokens)
-        if env_flag("TORCHINFERNO_DECODE_GRAPH_RUNNER", True) and hasattr(self.model, "forward_decode_flashinfer"):
+        if env_flag("TORCHINFERNO_DECODE_GRAPH_RUNNER", False) and hasattr(self.model, "forward_decode_flashinfer"):
             try:
                 from torchinferno.runtime.decode_runner import DecodeGraphRunner
                 import sys as _dgr
