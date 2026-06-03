@@ -855,7 +855,7 @@ class ContinuousBatchEngine:
             active.extend(self._prefill_prefix_batch(group, step, events=events))
 
         plain_group = [item for group in batchable.values() for item in group]
-        if plain_group and self.graph_prefill and len(plain_group) > 1:
+        if env_flag("TORCHINFERNO_CONTINUOUS_RAGGED_GRAPH_PREFILL", False) and plain_group and self.graph_prefill and len(plain_group) > 1:
             ragged_active = self._prefill_ragged_graph_batch(plain_group, step, events=events)
             if ragged_active is not None:
                 active.extend(ragged_active)
