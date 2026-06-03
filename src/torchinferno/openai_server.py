@@ -1837,7 +1837,7 @@ class OpenAICompletionEngine:
             cache._compiled_prefill_ready = True
         except Exception:
             pass
-        if env_flag("TORCHINFERNO_COMPILED_POST_ATTENTION", True):
+        if env_flag("TORCHINFERNO_COMPILED_POST_ATTENTION", False):
             self._warmup_compiled_post_attention()
         if env_flag("TORCHINFERNO_COMPILED_PREFILL", False):
             self._warmup_compiled_prefill(cache, prompt_tokens)
