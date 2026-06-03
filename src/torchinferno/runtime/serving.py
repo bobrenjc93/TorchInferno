@@ -1912,12 +1912,8 @@ class ContinuousBatchEngine:
             state.generated += 1
             state.last_token = next_token
             next_seq_len = state.seq_len + 1
-            if sync_cache_seq_lens:
-                self._set_cache_row_seq_len(state.row, next_seq_len)
-                state.seq_len = self._cache_row_seq_len(state.row, next_seq_len)
-            else:
-                self._remember_row_seq_len(state.row, next_seq_len)
-                state.seq_len = next_seq_len
+            self._remember_row_seq_len(state.row, next_seq_len)
+            state.seq_len = next_seq_len
             finished = self._should_finish_after_decode(state)
             self._record_token_event(events, state, next_token, step, finished=finished)
             if finished:
