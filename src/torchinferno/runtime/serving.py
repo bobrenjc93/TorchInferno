@@ -376,6 +376,8 @@ class ContinuousBatchEngine:
         self.stats.queued_requests += 1
 
     def has_online_work(self) -> bool:
+        if getattr(self, "_pending_decode", None) is not None:
+            return True
         waiting = self._online_waiting
         return bool(waiting) or bool(self._online_active) or bool(self._online_prefilling)
 
@@ -1671,6 +1673,16 @@ class ContinuousBatchEngine:
         self._record_token_event(events, state, next_token, step, finished=self._should_finish_before_decode(state))
         return state
 
+    def _flush_pending_decode(self, events: list[ServingTokenEvent] | None = None) -> None:
+        pending = getattr(self, "_pending_decode", None)
+        if pending is not None:
+            cpu_buf, event, states, step, pending_events = pending
+            event.synchronize()
+            tokens = cpu_buf[:len(states)].tolist()
+            target_events = events if events is not None else pending_events
+            self._finalize_decode(tokens, states, step, target_events)
+            self._pending_decode = None
+
     def _decode_active(
         self,
         active: list[_ActiveRequest],
@@ -1678,6 +1690,7 @@ class ContinuousBatchEngine:
         *,
         events: list[ServingTokenEvent] | None = None,
     ) -> tuple[list[tuple[int, ServingResult]], list[_ActiveRequest]]:
+        self._flush_pending_decode(events)
         _p = self.profile_timings
         _t0 = time.perf_counter() if _p else 0.0
         indexed_results: list[tuple[int, ServingResult]] = []
@@ -1755,25 +1768,48 @@ class ContinuousBatchEngine:
             else:
                 logits = self._static_decode_logits(input_ids, cache_view)
                 next_token_tensor = self._sample_logits(logits[:, -1, :])
-        self._record_model_call("decode", len(states), tokens=len(states))
-        next_tokens = next_token_tensor.detach().cpu().tolist()
+        self._record_model_call("decode", len(decode_rows), tokens=len(decode_rows))
+        if self.profile_timings:
+            self.stats.decode_ragged_model_ms += (time.perf_counter() - model_start_s) * 1000.0
+        cpu_tokens_start_s = time.perf_counter() if self.profile_timings else 0.0
+        n_states = len(states)
+        pending = getattr(self, "_pending_decode", None)
+        if pending is not None:
+            prev_cpu_buf, prev_event, prev_states, prev_step, prev_events = pending
+            prev_event.synchronize()
+            prev_tokens = prev_cpu_buf[:len(prev_states)].tolist()
+            self._finalize_decode(prev_tokens, prev_states, prev_step, prev_events)
+        cpu_buf = getattr(self, "_decode_cpu_buf", None)
+        if cpu_buf is None or cpu_buf.size(0) < n_states:
+            cpu_buf = torch.empty(max(n_states, self.max_active_requests), dtype=next_token_tensor.dtype).pin_memory()
+            self._decode_cpu_buf = cpu_buf
+        cpu_buf[:n_states].copy_(next_token_tensor[:n_states], non_blocking=True)
+        copy_event = torch.cuda.Event()
+        copy_event.record()
+        self._pending_decode = (cpu_buf, copy_event, list(states), step, events)
+        if self.profile_timings:
+            self.stats.decode_ragged_cpu_tokens_ms += (time.perf_counter() - cpu_tokens_start_s) * 1000.0
+        return list(states)
 
-        decoded: list[_ActiveRequest | ServingResult] = []
+    def _finalize_decode(
+        self,
+        next_tokens: list[int],
+        states: list[_ActiveRequest],
+        step: int,
+        events: list[ServingTokenEvent] | None,
+    ) -> None:
         for row_index, state in enumerate(states):
             next_token = int(next_tokens[row_index])
             state.tokens.append(next_token)
             state.generated += 1
             state.last_token = next_token
             next_seq_len = state.seq_len + 1
-            self._set_cache_row_seq_len(state.row, next_seq_len)
-            state.seq_len = self._cache_row_seq_len(state.row, next_seq_len)
+            self._remember_row_seq_len(state.row, next_seq_len)
+            state.seq_len = next_seq_len
             finished = self._should_finish_after_decode(state)
             self._record_token_event(events, state, next_token, step, finished=finished)
             if finished:
-                decoded.append(self._finish_and_release(state, step))
-            else:
-                decoded.append(state)
-        return decoded
+                self._finish_and_release(state, step)
 
     def _decode_one(
         self,
