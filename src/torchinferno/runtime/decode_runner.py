@@ -80,12 +80,17 @@ class DecodeGraphRunner:
         buckets = sorted({1, 2, 4, 8, 16, 32, max_batch} & set(range(1, max_batch + 1)))
         self._graphs: dict[int, _CapturedDecodeGraph] = {}
 
+        import torch.distributed as dist
         for bs in buckets:
+            if dist.is_available() and dist.is_initialized():
+                dist.barrier()
             self._capture_one(
                 bs, num_qo, num_kv, head_dim, max_seq, q_dtype, flashinfer,
             )
+            torch.cuda.synchronize(device)
 
-        torch.cuda.synchronize(device)
+        if dist.is_available() and dist.is_initialized():
+            dist.barrier()
 
     def _capture_one(
         self,
