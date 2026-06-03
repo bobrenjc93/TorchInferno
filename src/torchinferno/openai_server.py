@@ -1753,7 +1753,10 @@ class OpenAICompletionEngine:
             minimum=64,
         )
         unified_cache_backend = self.cache_backend
-        if hasattr(self.model, "forward_step_flashinfer"):
+        if (
+            env_flag("TORCHINFERNO_CONTINUOUS_UNIFIED_FORWARD", False)
+            and hasattr(self.model, "forward_step_flashinfer")
+        ):
             try:
                 import flashinfer  # noqa: F401
                 unified_cache_backend = "flashinfer"
@@ -10044,7 +10047,10 @@ def _tensor_parallel_worker_loop(engine: OpenAICompletionEngine) -> None:
                         total_rows = max_active + prefix_rows
                         worker_model = getattr(engine, "model")
                         worker_cache_backend = str(getattr(engine, "cache_backend", "dense"))
-                        if hasattr(worker_model, "forward_step_flashinfer"):
+                        if (
+                            env_flag("TORCHINFERNO_CONTINUOUS_UNIFIED_FORWARD", False)
+                            and hasattr(worker_model, "forward_step_flashinfer")
+                        ):
                             try:
                                 import flashinfer as _fi_check  # noqa: F401
                                 worker_cache_backend = "flashinfer"
