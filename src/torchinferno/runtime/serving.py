@@ -1567,7 +1567,7 @@ class ContinuousBatchEngine:
         # The shared-prefix workloads we care about use the common-prefix path
         # (and cross-batch prefix pinning) instead. Available via env when a
         # workload has no shared prefix but similar suffix lengths.
-        if not env_flag("TORCHINFERNO_CONTINUOUS_PADDED_BATCH_PREFILL", False):
+        if not env_flag("TORCHINFERNO_CONTINUOUS_PADDED_BATCH_PREFILL", True):
             return False
         if not callable(getattr(self.model, "forward", None)):
             return False
