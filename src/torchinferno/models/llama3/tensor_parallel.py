@@ -2696,7 +2696,7 @@ class Llama3TensorParallelForCausalLM:
     def _ensure_compiled_prefill(self) -> None:
         if hasattr(self, "_compiled_forward_prefill"):
             return
-        if not env_flag("TORCHINFERNO_COMPILED_PREFILL", True):
+        if not env_flag("TORCHINFERNO_COMPILED_PREFILL", False):
             self._compiled_forward_prefill = None
             return
         try:
