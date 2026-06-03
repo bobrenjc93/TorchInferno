@@ -855,8 +855,7 @@ class ContinuousBatchEngine:
             active.extend(self._prefill_prefix_batch(group, step, events=events))
 
         plain_group = [item for group in batchable.values() for item in group]
-        max_prompt_len = max((len(r.prompt) for _, r, _ in plain_group), default=0) if plain_group else 0
-        if plain_group and self.graph_prefill and len(plain_group) > 1 and max_prompt_len <= 256:
+        if False and plain_group and self.graph_prefill and len(plain_group) > 1:
             ragged_active = self._prefill_ragged_graph_batch(plain_group, step, events=events)
             if ragged_active is not None:
                 active.extend(ragged_active)
