@@ -1265,34 +1265,37 @@ class _Llama3TensorParallelLayer:
         next_norm_weight: Tensor | None,
     ) -> tuple[Tensor, Tensor | None]:
         residual = hidden
-        attention = self._profile_block(
-            "fast_prefill.attention",
-            lambda: self._attention_from_hidden(hidden, positions, rotary, cache, attn_in=attn_in),
-        )
-        hidden, mlp_in = self._profile_block(
-            "fast_prefill.post_attention_add_norm",
-            lambda: _tp_decode_add_rms_norm(
-                attention,
-                residual,
-                self.post_attention_layernorm_weight,
-                self.config.rms_norm_eps,
-            ),
+        attention = self._attention_from_hidden(hidden, positions, rotary, cache, attn_in=attn_in)
+        return self._post_attention_forward(
+            attention, residual, next_norm_weight,
         )
 
-        def project_mlp() -> Tensor:
-            projected = self._mlp_project_prefill_reduce(mlp_in)
-            if projected is None:
-                projected = self._mlp_project_eager(mlp_in)
-                _all_reduce(projected)
-            return projected
+    def _post_attention_forward(
+        self,
+        attention: Tensor,
+        residual: Tensor,
+        next_norm_weight: Tensor | None,
+    ) -> tuple[Tensor, Tensor | None]:
+        compiled = getattr(self, "_compiled_post_attn", None)
+        if compiled is not None:
+            return compiled(attention, residual, next_norm_weight)
+        return self._post_attention_forward_impl(attention, residual, next_norm_weight)
 
-        projected = self._profile_block("fast_prefill.mlp_project", project_mlp)
+    def _post_attention_forward_impl(
+        self,
+        attention: Tensor,
+        residual: Tensor,
+        next_norm_weight: Tensor | None,
+    ) -> tuple[Tensor, Tensor | None]:
+        hidden, mlp_in = _tp_decode_add_rms_norm(
+            attention, residual,
+            self.post_attention_layernorm_weight, self.config.rms_norm_eps,
+        )
+        projected = self._mlp_project_eager(mlp_in)
+        _all_reduce(projected)
         if next_norm_weight is None:
             return hidden + projected, None
-        return self._profile_block(
-            "fast_prefill.next_input_add_norm",
-            lambda: _tp_decode_add_rms_norm(projected, hidden, next_norm_weight, self.config.rms_norm_eps),
-        )
+        return _tp_decode_add_rms_norm(projected, hidden, next_norm_weight, self.config.rms_norm_eps)
 
     def append_prefill_cache(
         self,

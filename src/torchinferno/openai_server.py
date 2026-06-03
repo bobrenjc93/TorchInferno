@@ -1837,9 +1837,29 @@ class OpenAICompletionEngine:
             cache._compiled_prefill_ready = True
         except Exception:
             pass
-        if env_flag("TORCHINFERNO_COMPILED_PREFILL", True):
+        if env_flag("TORCHINFERNO_COMPILED_POST_ATTENTION", True):
+            self._warmup_compiled_post_attention()
+        if env_flag("TORCHINFERNO_COMPILED_PREFILL", False):
             self._warmup_compiled_prefill(cache, prompt_tokens)
         self._persistent_serving_cache = cache
+
+    def _warmup_compiled_post_attention(self) -> None:
+        if not hasattr(self.model, "layers"):
+            return
+        try:
+            import sys as _cpa
+            print("[WARMUP] Compiling post-attention (torch.compile)...", file=_cpa.stderr, flush=True)
+            for layer in self.model.layers:
+                if hasattr(layer, "_post_attention_forward_impl"):
+                    layer._compiled_post_attn = torch.compile(
+                        layer._post_attention_forward_impl,
+                        dynamic=True,
+                        fullgraph=False,
+                    )
+            print(f"[WARMUP] Compiled {len(self.model.layers)} layer post-attention ops", file=_cpa.stderr, flush=True)
+        except Exception as exc:
+            import sys as _cpa
+            print(f"[WARMUP] Post-attention compile failed: {exc}", file=_cpa.stderr, flush=True)
 
     def _warmup_compiled_prefill(self, cache: object, prompt_tokens: int) -> None:
         if not hasattr(self.model, "_ensure_compiled_prefill"):
