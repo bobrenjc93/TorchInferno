@@ -855,7 +855,8 @@ class ContinuousBatchEngine:
             active.extend(self._prefill_prefix_batch(group, step, events=events))
 
         plain_group = [item for group in batchable.values() for item in group]
-        if plain_group and self.graph_prefill and len(plain_group) > 1:
+        max_prompt_len = max((len(r.prompt) for _, r, _ in plain_group), default=0) if plain_group else 0
+        if plain_group and self.graph_prefill and len(plain_group) > 1 and max_prompt_len <= 256:
             ragged_active = self._prefill_ragged_graph_batch(plain_group, step, events=events)
             if ragged_active is not None:
                 active.extend(ragged_active)
@@ -1494,8 +1495,9 @@ class ContinuousBatchEngine:
             padded.append([0] * suffix_bucket)
         input_ids = torch.tensor(padded, device=self.device, dtype=torch.long)
         row_indices_list = list(rows)
+        pad_row = self._free_active_rows[-1] if self._free_active_rows else rows[0]
         while len(row_indices_list) < batch_bucket:
-            row_indices_list.append(rows[0])
+            row_indices_list.append(pad_row)
         row_indices = torch.tensor(row_indices_list, device=self.device, dtype=torch.long)
         seq_lens_list = [0] * (max(row_indices_list) + 1)
         seq_lens = torch.tensor(seq_lens_list, device=self.device, dtype=torch.long)
