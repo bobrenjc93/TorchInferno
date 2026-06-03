@@ -1837,7 +1837,29 @@ class OpenAICompletionEngine:
             cache._compiled_prefill_ready = True
         except Exception:
             pass
+        if env_flag("TORCHINFERNO_COMPILED_PREFILL", True):
+            self._warmup_compiled_prefill(cache, prompt_tokens)
         self._persistent_serving_cache = cache
+
+    def _warmup_compiled_prefill(self, cache: object, prompt_tokens: int) -> None:
+        if not hasattr(self.model, "_ensure_compiled_prefill"):
+            return
+        try:
+            self.model._ensure_compiled_prefill()
+            if getattr(self.model, "_compiled_forward_prefill", None) is None:
+                return
+            vocab_size = max(1, int(getattr(getattr(self.model, "config", object()), "vocab_size", 1)))
+            input_ids = (torch.arange(prompt_tokens, device=self.device, dtype=torch.long) % vocab_size)[None, :]
+            _reset_generation_cache(cache)
+            import sys as _cps
+            print("[WARMUP] Compiling prefill (torch.compile)...", file=_cps.stderr, flush=True)
+            with torch.inference_mode():
+                self.model.forward(input_ids, cache=cache, use_cache=True)
+            _reset_generation_cache(cache)
+            print("[WARMUP] Compiled prefill ready", file=_cps.stderr, flush=True)
+        except Exception as exc:
+            import sys as _cps
+            print(f"[WARMUP] Compiled prefill failed: {exc}", file=_cps.stderr, flush=True)
 
     def _warmup_flashinfer_decode_graphs(self, cache: object, batch_sizes: list[int]) -> None:
         import flashinfer
