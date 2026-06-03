@@ -376,8 +376,6 @@ class ContinuousBatchEngine:
         self.stats.queued_requests += 1
 
     def has_online_work(self) -> bool:
-        if getattr(self, "_pending_decode", None) is not None:
-            return True
         waiting = self._online_waiting
         return bool(waiting) or bool(self._online_active) or bool(self._online_prefilling)
 
@@ -1695,7 +1693,6 @@ class ContinuousBatchEngine:
         *,
         events: list[ServingTokenEvent] | None = None,
     ) -> tuple[list[tuple[int, ServingResult]], list[_ActiveRequest]]:
-        self._flush_pending_decode(events)
         _p = self.profile_timings
         _t0 = time.perf_counter() if _p else 0.0
         indexed_results: list[tuple[int, ServingResult]] = []
@@ -1908,23 +1905,36 @@ class ContinuousBatchEngine:
         if self.profile_timings:
             self.stats.decode_ragged_model_ms += (time.perf_counter() - model_start_s) * 1000.0
         cpu_tokens_start_s = time.perf_counter() if self.profile_timings else 0.0
-        pending = getattr(self, "_pending_decode", None)
-        if pending is not None:
-            prev_cpu_buf, prev_event, prev_states, prev_step, prev_events = pending
-            prev_event.synchronize()
-            prev_tokens = prev_cpu_buf[:len(prev_states)].tolist()
-            self._finalize_decode(prev_tokens, prev_states, prev_step, prev_events)
-        cpu_buf = getattr(self, "_decode_cpu_buf", None)
-        if cpu_buf is None or cpu_buf.size(0) < n_active:
-            cpu_buf = torch.empty(max(n_active, self.max_active_requests), dtype=next_token_tensor.dtype).pin_memory()
-            self._decode_cpu_buf = cpu_buf
-        cpu_buf[:n_active].copy_(next_token_tensor[:n_active], non_blocking=True)
-        copy_event = torch.cuda.Event()
-        copy_event.record()
-        self._pending_decode = (cpu_buf, copy_event, list(states), step, events)
+        next_tokens = next_token_tensor[:n_active].detach().cpu().tolist()
         if self.profile_timings:
             self.stats.decode_ragged_cpu_tokens_ms += (time.perf_counter() - cpu_tokens_start_s) * 1000.0
-        return list(states)
+        sync_cache_seq_lens = getattr(self, '_sync_cache_seq_lens', None)
+        if sync_cache_seq_lens is None:
+            sync_cache_seq_lens = env_flag("TORCHINFERNO_CONTINUOUS_RAGGED_SYNC_CACHE_SEQ_LENS", False)
+            self._sync_cache_seq_lens = sync_cache_seq_lens
+        state_update_start_s = time.perf_counter() if self.profile_timings else 0.0
+        decoded: list[_ActiveRequest | ServingResult] = []
+        for row_index, state in enumerate(states):
+            next_token = int(next_tokens[row_index])
+            state.tokens.append(next_token)
+            state.generated += 1
+            state.last_token = next_token
+            next_seq_len = state.seq_len + 1
+            if sync_cache_seq_lens:
+                self._set_cache_row_seq_len(state.row, next_seq_len)
+                state.seq_len = self._cache_row_seq_len(state.row, next_seq_len)
+            else:
+                self._remember_row_seq_len(state.row, next_seq_len)
+                state.seq_len = next_seq_len
+            finished = self._should_finish_after_decode(state)
+            self._record_token_event(events, state, next_token, step, finished=finished)
+            if finished:
+                decoded.append(self._finish_and_release(state, step))
+            else:
+                decoded.append(state)
+        if self.profile_timings:
+            self.stats.decode_ragged_state_update_ms += (time.perf_counter() - state_update_start_s) * 1000.0
+        return decoded
 
     def _finalize_decode(
         self,
