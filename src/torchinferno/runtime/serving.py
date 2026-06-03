@@ -1747,17 +1747,11 @@ class ContinuousBatchEngine:
         for state in states:
             self._set_cache_row_seq_len(state.row, state.seq_len)
         rows = [state.row for state in states]
-        gpu_buf = getattr(self, "_gpu_last_tokens", None)
-        if gpu_buf is not None:
-            row_indices_t = torch.tensor(rows, dtype=torch.long, device=self.device)
-            input_ids = gpu_buf[row_indices_t].unsqueeze(1)
-        else:
-            input_ids = torch.tensor([[state.last_token] for state in states], device=self.device, dtype=torch.long)
+        input_ids = torch.tensor([[state.last_token] for state in states], device=self.device, dtype=torch.long)
         if not hasattr(self, "_has_fi_decode"):
             self._has_fi_decode = bool(getattr(self.model, "_fi_decode_graphs", None))
         if self._has_fi_decode:
-            if gpu_buf is None:
-                row_indices_t = torch.tensor(rows, dtype=torch.long, device=self.device)
+            row_indices_t = torch.tensor(rows, dtype=torch.long, device=self.device)
             seq_lens_t = self._seq_lens_tensor(states, rows=rows)
             fi_token = self._try_ragged_token_graph(input_ids, seq_lens_t, row_indices_t)
             if fi_token is not None:
@@ -1777,8 +1771,6 @@ class ContinuousBatchEngine:
                 logits = self._static_decode_logits(input_ids, cache_view)
                 next_token_tensor = self._sample_logits(logits[:, -1, :])
         self._record_model_call("decode", len(states), tokens=len(states))
-        if gpu_buf is not None:
-            gpu_buf[row_indices_t] = next_token_tensor[:len(states)]
         next_tokens = next_token_tensor.detach().cpu().tolist()
 
         decoded: list[_ActiveRequest | ServingResult] = []
@@ -1886,9 +1878,13 @@ class ContinuousBatchEngine:
         decode_rows = self._ragged_decode_bucket_rows(rows)
         n_active = len(states)
         n_padded = len(decode_rows)
-        gpu_buf = self._ensure_gpu_token_buf()
+        pad_token = states[0].last_token
+        input_tokens = [
+            states[index].last_token if index < n_active else pad_token
+            for index, _row in enumerate(decode_rows)
+        ]
+        input_ids = torch.tensor([[token] for token in input_tokens], device=self.device, dtype=torch.long)
         row_indices = torch.tensor(decode_rows, dtype=torch.long, device=self.device)
-        input_ids = gpu_buf[row_indices].unsqueeze(1)
         seq_lens = self._seq_lens_tensor(states, rows=decode_rows)
         if self.profile_timings:
             self.stats.decode_ragged_prepare_ms += (time.perf_counter() - prepare_start_s) * 1000.0
@@ -1901,7 +1897,6 @@ class ContinuousBatchEngine:
             logits = self._ragged_decode_logits(input_ids, seq_lens, row_indices)
             next_token_tensor = self._sample_logits(logits[:, -1, :])
         self._record_model_call("decode", n_padded, tokens=n_padded, ragged=True)
-        gpu_buf[row_indices[:n_active]] = next_token_tensor[:n_active]
         if self.profile_timings:
             self.stats.decode_ragged_model_ms += (time.perf_counter() - model_start_s) * 1000.0
         cpu_tokens_start_s = time.perf_counter() if self.profile_timings else 0.0
