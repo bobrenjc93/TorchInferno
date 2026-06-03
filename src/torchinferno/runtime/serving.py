@@ -725,9 +725,6 @@ class ContinuousBatchEngine:
                 state.tokens.append(next_token)
                 state.generated = 1
                 state.last_token = next_token
-                _gbuf = getattr(self, "_gpu_last_tokens", None)
-                if _gbuf is not None and state.row < _gbuf.size(0):
-                    _gbuf[state.row] = torch.tensor(next_token, device=self.device, dtype=torch.long)
                 state.phase = "decoding"
                 self._record_token_event(events, state, next_token, step, finished=self._should_finish_before_decode(state))
                 finished.append(state)
@@ -1661,8 +1658,7 @@ class ContinuousBatchEngine:
         next_token = int(next_token_t.item())
         seq_len = self._refresh_row_seq_len_from_cache(row, len(request.prompt))
         self._store_reusable_prefix(request.request_id, request.prompt, row, logits)
-        gpu_buf = self._ensure_gpu_token_buf()
-        gpu_buf[row] = next_token_t.view(-1)[0]
+        pass
         state = _ActiveRequest(
             original_index=original_index,
             request=request,
@@ -1772,9 +1768,6 @@ class ContinuousBatchEngine:
                 logits = self._static_decode_logits(input_ids, cache_view)
                 next_token_tensor = self._sample_logits(logits[:, -1, :])
         self._record_model_call("decode", len(states), tokens=len(states))
-        gpu_buf = getattr(self, "_gpu_last_tokens", None)
-        if gpu_buf is not None:
-            gpu_buf.scatter_(0, row_indices_t[:len(states)], next_token_tensor[:len(states)])
         next_tokens = next_token_tensor.detach().cpu().tolist()
 
         decoded: list[_ActiveRequest | ServingResult] = []
@@ -1847,9 +1840,7 @@ class ContinuousBatchEngine:
                 next_token_tensor = self._sample_logits(logits[:, -1, :])
         self._record_model_call("decode", 1, tokens=1)
         next_token = int(next_token_tensor.item())
-        gpu_buf = getattr(self, "_gpu_last_tokens", None)
-        if gpu_buf is not None and state.row < gpu_buf.size(0):
-            gpu_buf[state.row] = next_token_tensor.view(-1)[0]
+        pass
         state.tokens.append(next_token)
         state.generated += 1
         state.last_token = next_token
@@ -1882,9 +1873,13 @@ class ContinuousBatchEngine:
         decode_rows = self._ragged_decode_bucket_rows(rows)
         n_active = len(states)
         n_padded = len(decode_rows)
-        gpu_buf = self._ensure_gpu_token_buf()
+        pad_token = states[0].last_token
+        input_tokens = [
+            states[index].last_token if index < n_active else pad_token
+            for index, _row in enumerate(decode_rows)
+        ]
+        input_ids = torch.tensor([[token] for token in input_tokens], device=self.device, dtype=torch.long)
         row_indices = torch.tensor(decode_rows, dtype=torch.long, device=self.device)
-        input_ids = gpu_buf[row_indices].unsqueeze(1)
         seq_lens = self._seq_lens_tensor(states, rows=decode_rows)
         if self.profile_timings:
             self.stats.decode_ragged_prepare_ms += (time.perf_counter() - prepare_start_s) * 1000.0
@@ -1896,7 +1891,7 @@ class ContinuousBatchEngine:
         else:
             logits = self._ragged_decode_logits(input_ids, seq_lens, row_indices)
             next_token_tensor = self._sample_logits(logits[:, -1, :])
-        gpu_buf.scatter_(0, row_indices[:n_active], next_token_tensor[:n_active])
+        pass
         self._record_model_call("decode", n_padded, tokens=n_padded, ragged=True)
         if self.profile_timings:
             self.stats.decode_ragged_model_ms += (time.perf_counter() - model_start_s) * 1000.0
