@@ -1484,6 +1484,9 @@ class ContinuousBatchEngine:
         cache = self._require_cache()
         for row in rows:
             cache.clear_row(row)
+            for layer_cache in cache.layers:
+                layer_cache.keys[row].zero_()
+                layer_cache.values[row].zero_()
         lengths = [len(request.prompt) for _, request, _ in group]
         max_len = max(lengths)
         suffix_bucket = self._suffix_bucket(max_len)
