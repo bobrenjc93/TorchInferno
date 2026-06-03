@@ -727,6 +727,9 @@ class ContinuousBatchEngine:
                 state.tokens.append(next_token)
                 state.generated = 1
                 state.last_token = next_token
+                _gbuf = getattr(self, "_gpu_last_tokens", None)
+                if _gbuf is not None and state.row < _gbuf.size(0):
+                    _gbuf[state.row] = next_token
                 state.phase = "decoding"
                 self._record_token_event(events, state, next_token, step, finished=self._should_finish_before_decode(state))
                 finished.append(state)
@@ -1659,6 +1662,8 @@ class ContinuousBatchEngine:
         next_token = int(self._sample_logits(logits[:, -1, :]).item())
         seq_len = self._refresh_row_seq_len_from_cache(row, len(request.prompt))
         self._store_reusable_prefix(request.request_id, request.prompt, row, logits)
+        gpu_buf = self._ensure_gpu_token_buf()
+        gpu_buf[row] = next_token
         state = _ActiveRequest(
             original_index=original_index,
             request=request,
@@ -1745,11 +1750,17 @@ class ContinuousBatchEngine:
         for state in states:
             self._set_cache_row_seq_len(state.row, state.seq_len)
         rows = [state.row for state in states]
-        input_ids = torch.tensor([[state.last_token] for state in states], device=self.device, dtype=torch.long)
+        gpu_buf = getattr(self, "_gpu_last_tokens", None)
+        if gpu_buf is not None:
+            row_indices_t = torch.tensor(rows, dtype=torch.long, device=self.device)
+            input_ids = gpu_buf[row_indices_t].unsqueeze(1)
+        else:
+            input_ids = torch.tensor([[state.last_token] for state in states], device=self.device, dtype=torch.long)
         if not hasattr(self, "_has_fi_decode"):
             self._has_fi_decode = bool(getattr(self.model, "_fi_decode_graphs", None))
         if self._has_fi_decode:
-            row_indices_t = torch.tensor(rows, dtype=torch.long, device=self.device)
+            if gpu_buf is None:
+                row_indices_t = torch.tensor(rows, dtype=torch.long, device=self.device)
             seq_lens_t = self._seq_lens_tensor(states, rows=rows)
             fi_token = self._try_ragged_token_graph(input_ids, seq_lens_t, row_indices_t)
             if fi_token is not None:
@@ -1769,6 +1780,8 @@ class ContinuousBatchEngine:
                 logits = self._static_decode_logits(input_ids, cache_view)
                 next_token_tensor = self._sample_logits(logits[:, -1, :])
         self._record_model_call("decode", len(states), tokens=len(states))
+        if gpu_buf is not None:
+            gpu_buf[row_indices_t] = next_token_tensor[:len(states)]
         next_tokens = next_token_tensor.detach().cpu().tolist()
 
         decoded: list[_ActiveRequest | ServingResult] = []
@@ -1841,6 +1854,9 @@ class ContinuousBatchEngine:
                 next_token_tensor = self._sample_logits(logits[:, -1, :])
         self._record_model_call("decode", 1, tokens=1)
         next_token = int(next_token_tensor.item())
+        gpu_buf = getattr(self, "_gpu_last_tokens", None)
+        if gpu_buf is not None and state.row < gpu_buf.size(0):
+            gpu_buf[state.row] = next_token
         state.tokens.append(next_token)
         state.generated += 1
         state.last_token = next_token
@@ -1853,6 +1869,14 @@ class ContinuousBatchEngine:
             return self._finish_and_release(state, step)
         return state
 
+    def _ensure_gpu_token_buf(self) -> Tensor:
+        buf = getattr(self, "_gpu_last_tokens", None)
+        total = self.max_active_requests + (getattr(self, "prefix_cache_capacity", 0) or 0) + 2
+        if buf is None or buf.size(0) < total:
+            buf = torch.zeros(total, dtype=torch.long, device=self.device)
+            self._gpu_last_tokens = buf
+        return buf
+
     def _decode_ragged_batch(
         self,
         states: list[_ActiveRequest],
@@ -1863,13 +1887,11 @@ class ContinuousBatchEngine:
         prepare_start_s = time.perf_counter() if self.profile_timings else 0.0
         rows = [state.row for state in states]
         decode_rows = self._ragged_decode_bucket_rows(rows)
-        pad_token = states[0].last_token
-        input_tokens = [
-            states[index].last_token if index < len(states) else pad_token
-            for index, _row in enumerate(decode_rows)
-        ]
-        input_ids = torch.tensor([[token] for token in input_tokens], device=self.device, dtype=torch.long)
+        n_active = len(states)
+        n_padded = len(decode_rows)
+        gpu_buf = self._ensure_gpu_token_buf()
         row_indices = torch.tensor(decode_rows, dtype=torch.long, device=self.device)
+        input_ids = gpu_buf[row_indices].unsqueeze(1)
         seq_lens = self._seq_lens_tensor(states, rows=decode_rows)
         if self.profile_timings:
             self.stats.decode_ragged_prepare_ms += (time.perf_counter() - prepare_start_s) * 1000.0
@@ -1881,29 +1903,47 @@ class ContinuousBatchEngine:
         else:
             logits = self._ragged_decode_logits(input_ids, seq_lens, row_indices)
             next_token_tensor = self._sample_logits(logits[:, -1, :])
-        self._record_model_call("decode", len(decode_rows), tokens=len(decode_rows), ragged=True)
+        self._record_model_call("decode", n_padded, tokens=n_padded, ragged=True)
+        gpu_buf[row_indices[:n_active]] = next_token_tensor[:n_active]
         if self.profile_timings:
             self.stats.decode_ragged_model_ms += (time.perf_counter() - model_start_s) * 1000.0
         cpu_tokens_start_s = time.perf_counter() if self.profile_timings else 0.0
-        next_tokens = next_token_tensor[: len(states)].detach().cpu().tolist()
+        pending = getattr(self, "_pending_decode", None)
+        if pending is not None:
+            prev_cpu_buf, prev_event, prev_states, prev_step, prev_events = pending
+            prev_event.synchronize()
+            prev_tokens = prev_cpu_buf[:len(prev_states)].tolist()
+            self._finalize_decode(prev_tokens, prev_states, prev_step, prev_events)
+        cpu_buf = getattr(self, "_decode_cpu_buf", None)
+        if cpu_buf is None or cpu_buf.size(0) < n_active:
+            cpu_buf = torch.empty(max(n_active, self.max_active_requests), dtype=next_token_tensor.dtype).pin_memory()
+            self._decode_cpu_buf = cpu_buf
+        cpu_buf[:n_active].copy_(next_token_tensor[:n_active], non_blocking=True)
+        copy_event = torch.cuda.Event()
+        copy_event.record()
+        self._pending_decode = (cpu_buf, copy_event, list(states), step, events)
         if self.profile_timings:
             self.stats.decode_ragged_cpu_tokens_ms += (time.perf_counter() - cpu_tokens_start_s) * 1000.0
-        sync_cache_seq_lens = env_flag("TORCHINFERNO_CONTINUOUS_RAGGED_SYNC_CACHE_SEQ_LENS", False)
+        return list(states)
 
-        state_update_start_s = time.perf_counter() if self.profile_timings else 0.0
-        decoded: list[_ActiveRequest | ServingResult] = []
+    def _finalize_decode(
+        self,
+        next_tokens: list[int],
+        states: list[_ActiveRequest],
+        step: int,
+        events: list[ServingTokenEvent] | None,
+    ) -> None:
+        gpu_buf = getattr(self, "_gpu_last_tokens", None)
         for row_index, state in enumerate(states):
             next_token = int(next_tokens[row_index])
             state.tokens.append(next_token)
             state.generated += 1
             state.last_token = next_token
+            if gpu_buf is not None and state.row < gpu_buf.size(0):
+                gpu_buf[state.row] = next_token
             next_seq_len = state.seq_len + 1
-            if sync_cache_seq_lens:
-                self._set_cache_row_seq_len(state.row, next_seq_len)
-                state.seq_len = self._cache_row_seq_len(state.row, next_seq_len)
-            else:
-                self._remember_row_seq_len(state.row, next_seq_len)
-                state.seq_len = next_seq_len
+            self._remember_row_seq_len(state.row, next_seq_len)
+            state.seq_len = next_seq_len
             finished = self._should_finish_after_decode(state)
             self._record_token_event(events, state, next_token, step, finished=finished)
             if finished:
