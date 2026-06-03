@@ -1690,6 +1690,9 @@ class ContinuousBatchEngine:
         *,
         events: list[ServingTokenEvent] | None = None,
     ) -> tuple[list[tuple[int, ServingResult]], list[_ActiveRequest]]:
+        runner = getattr(self, "_decode_runner", None)
+        if runner is not None and len(active) > 1:
+            return self._decode_active_with_runner(runner, active, step, events=events)
         _p = self.profile_timings
         _t0 = time.perf_counter() if _p else 0.0
         indexed_results: list[tuple[int, ServingResult]] = []
@@ -1725,6 +1728,53 @@ class ContinuousBatchEngine:
                     next_active.append(item)
             if _p:
                 self.stats._da_collect_ms = getattr(self.stats, '_da_collect_ms', 0.0) + (time.perf_counter() - _t2) * 1000.0
+        return indexed_results, next_active
+
+    def _decode_active_with_runner(
+        self,
+        runner: object,
+        active: list[_ActiveRequest],
+        step: int,
+        *,
+        events: list[ServingTokenEvent] | None = None,
+    ) -> tuple[list[tuple[int, ServingResult]], list[_ActiveRequest]]:
+        indexed_results: list[tuple[int, ServingResult]] = []
+        live: list[_ActiveRequest] = []
+        for state in active:
+            state.seq_len = self._cache_row_seq_len(state.row, state.seq_len)
+            if self._should_finish_before_decode(state):
+                indexed_results.append((state.original_index, self._finish_and_release(state, step)))
+            else:
+                live.append(state)
+        if not live:
+            return indexed_results, []
+        rows = [s.row for s in live]
+        if runner.n_active != len(live) or runner.active_rows != rows:
+            runner.set_active(rows, [s.last_token for s in live], [s.seq_len for s in live])
+        runner.step()
+        tokens = runner.get_cpu_tokens()
+        next_active: list[_ActiveRequest] = []
+        any_finished = False
+        for i, state in enumerate(live):
+            tok = int(tokens[i]) if i < len(tokens) else 0
+            state.tokens.append(tok)
+            state.generated += 1
+            state.last_token = tok
+            state.seq_len += 1
+            self._remember_row_seq_len(state.row, state.seq_len)
+            finished = self._should_finish_after_decode(state)
+            self._record_token_event(events, state, tok, step, finished=finished)
+            if finished:
+                self._finish_and_release(state, step)
+                any_finished = True
+            else:
+                next_active.append(state)
+        if any_finished:
+            runner.set_active(
+                [s.row for s in next_active],
+                [s.last_token for s in next_active],
+                [s.seq_len for s in next_active],
+            )
         return indexed_results, next_active
 
     def _decode_groups(self, states: list[_ActiveRequest]) -> list[list[_ActiveRequest]]:

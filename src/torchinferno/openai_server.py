@@ -1841,6 +1841,19 @@ class OpenAICompletionEngine:
             self._warmup_compiled_post_attention()
         if env_flag("TORCHINFERNO_COMPILED_PREFILL", False):
             self._warmup_compiled_prefill(cache, prompt_tokens)
+        if env_flag("TORCHINFERNO_DECODE_GRAPH_RUNNER", True) and hasattr(self.model, "forward_decode_flashinfer"):
+            try:
+                from torchinferno.runtime.decode_runner import DecodeGraphRunner
+                import sys as _dgr
+                print("[WARMUP] Capturing DecodeGraphRunner CUDA graphs...", file=_dgr.stderr, flush=True)
+                self._decode_graph_runner = DecodeGraphRunner(
+                    self.model, cache, self.device, max_batch=max_active,
+                )
+                print(f"[WARMUP] DecodeGraphRunner ready: {len(self._decode_graph_runner._graphs)} graphs", file=_dgr.stderr, flush=True)
+            except Exception as exc:
+                import sys as _dgr
+                print(f"[WARMUP] DecodeGraphRunner failed: {exc}", file=_dgr.stderr, flush=True)
+                self._decode_graph_runner = None
         self._persistent_serving_cache = cache
 
     def _warmup_compiled_post_attention(self) -> None:
@@ -2290,6 +2303,9 @@ class OpenAICompletionEngine:
             prefill_chunk_size=(env_int("TORCHINFERNO_OPENAI_TP_ONLINE_PREFILL_CHUNK", 0, minimum=0) or None),
             profile_timings=bool(self._queue_profile_path_value()),
         )
+        decode_runner = getattr(self, "_decode_graph_runner", None)
+        if decode_runner is not None:
+            runtime_engine._decode_runner = decode_runner
         add_phase("engine_create_ms", engine_create_start_s)
 
         def compatible(request: _QueuedGeneration) -> bool:
