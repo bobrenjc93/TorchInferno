@@ -375,6 +375,19 @@ class ContinuousBatchEngine:
         self._online_next_index += 1
         self.stats.queued_requests += 1
 
+    @torch.inference_mode()
+    def step_decode_only(self) -> list[ServingTokenEvent]:
+        if not self._online_active:
+            return []
+        events: list[ServingTokenEvent] = []
+        step = self._online_step
+        active = self._online_active
+        self.stats.scheduler_steps += 1
+        _decoded_results, active = self._decode_active(active, step, events=events)
+        self._online_active = active
+        self._online_step = step + 1
+        return events
+
     def has_online_work(self) -> bool:
         waiting = self._online_waiting
         return bool(waiting) or bool(self._online_active) or bool(self._online_prefilling)
