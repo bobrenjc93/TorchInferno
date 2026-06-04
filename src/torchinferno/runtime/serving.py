@@ -2310,8 +2310,9 @@ class ContinuousBatchEngine:
                     row_indices=row_indices,
                 )
                 return logits, cache
-            except Exception:
-                pass
+            except Exception as _fi_exc:
+                import sys as _fis
+                print(f"[FI_PREFILL_FALLBACK] failed: {_fi_exc!r}", file=_fis.stderr, flush=True)
         return self._forward_model(input_ids, cache=cache, use_cache=True)
 
     def _try_flashinfer_prefill(

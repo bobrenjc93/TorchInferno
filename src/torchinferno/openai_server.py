@@ -1827,6 +1827,7 @@ class OpenAICompletionEngine:
             try:
                 import flashinfer  # noqa: F401
                 self._warmup_flashinfer_decode_graphs(cache, batch_sizes)
+                self.model._flashinfer_jit_warmed = True
                 fi_count = len(getattr(self.model, "_fi_decode_graphs", {}))
                 import sys as _fi_sys
                 print(f"[WARMUP] FlashInfer decode graphs: {fi_count} captured", file=_fi_sys.stderr, flush=True)
