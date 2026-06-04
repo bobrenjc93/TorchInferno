@@ -868,7 +868,7 @@ class ContinuousBatchEngine:
             active.extend(self._prefill_prefix_batch(group, step, events=events))
 
         plain_group = [item for group in batchable.values() for item in group]
-        if env_flag("TORCHINFERNO_CONTINUOUS_RAGGED_GRAPH_PREFILL", False) and plain_group and self.graph_prefill and len(plain_group) > 1:
+        if env_flag("TORCHINFERNO_CONTINUOUS_RAGGED_GRAPH_PREFILL", True) and plain_group and self.graph_prefill and len(plain_group) > 1:
             ragged_active = self._prefill_ragged_graph_batch(plain_group, step, events=events)
             if ragged_active is not None:
                 active.extend(ragged_active)
@@ -1511,16 +1511,19 @@ class ContinuousBatchEngine:
             padded.append(prompt)
         pad_rows_acquired = []
         while len(padded) < batch_bucket:
-            padded.append([0] * suffix_bucket)
             pr = self._acquire_active_row_or_none()
-            if pr is not None:
-                cache.clear_row(pr)
-                for layer_cache in cache.layers:
-                    layer_cache.keys[pr].zero_()
-                    layer_cache.values[pr].zero_()
-                pad_rows_acquired.append(pr)
-            else:
-                pad_rows_acquired.append(rows[0])
+            if pr is None:
+                for pr2 in pad_rows_acquired:
+                    self._release_active_row(pr2)
+                for row in rows:
+                    self._release_active_row(row)
+                return None
+            cache.clear_row(pr)
+            for layer_cache in cache.layers:
+                layer_cache.keys[pr].zero_()
+                layer_cache.values[pr].zero_()
+            pad_rows_acquired.append(pr)
+            padded.append([0] * suffix_bucket)
         input_ids = torch.tensor(padded, device=self.device, dtype=torch.long)
         row_indices_list = list(rows) + pad_rows_acquired
         row_indices = torch.tensor(row_indices_list[:batch_bucket], device=self.device, dtype=torch.long)
