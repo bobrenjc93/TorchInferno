@@ -3302,7 +3302,7 @@ class Llama3TensorParallelForCausalLM:
             raise ValueError("KV cache capacity exceeded")
         attention_block_size = _decode_attention_block_size(cache.seq_len + 1, cache.layers[0].max_seq_len)
         symm_reduce_key = _symm_mem_allreduce_graph_key(input_ids.size(0), _model_world_size(self))
-        key = (id(cache), input_ids.size(0), attention_block_size, symm_reduce_key)
+        key = (_cache_graph_root_id(cache), input_ids.size(0), attention_block_size, symm_reduce_key)
         captured = self._decode_graphs.get(key)
         needs_capture = (
             captured is None
@@ -3386,7 +3386,7 @@ class Llama3TensorParallelForCausalLM:
             captured.output_token = self._sample_next_token(logits[:, -1, :], 0.0)
         captured.graph.replay()
         symm_reduce_key = _symm_mem_allreduce_graph_key(input_ids.size(0), _model_world_size(self))
-        key = (id(cache), input_ids.size(0), attention_block_size, symm_reduce_key)
+        key = (_cache_graph_root_id(cache), input_ids.size(0), attention_block_size, symm_reduce_key)
         max_graphs = _tp_int("TORCHINFERNO_CUDAGRAPH_DECODE_STEP_MAX_GRAPHS", 4096, minimum=1)
         if key not in self._decode_graphs and len(self._decode_graphs) >= max_graphs:
             self._decode_graphs.clear()
@@ -3404,7 +3404,7 @@ class Llama3TensorParallelForCausalLM:
             raise ValueError("KV cache capacity exceeded")
         attention_block_size = _decode_attention_block_size(cache.seq_len + 1, cache.layers[0].max_seq_len)
         symm_reduce_key = _symm_mem_allreduce_graph_key(input_ids.size(0), _model_world_size(self))
-        key = (id(cache), input_ids.size(0), attention_block_size, symm_reduce_key)
+        key = (_cache_graph_root_id(cache), input_ids.size(0), attention_block_size, symm_reduce_key)
         captured = self._decode_logits_graphs.get(key)
         needs_capture = (
             captured is None
@@ -3436,7 +3436,7 @@ class Llama3TensorParallelForCausalLM:
         if not cache.layers:
             raise ValueError("ragged decode requires a non-empty KV cache")
         key = (
-            id(cache),
+            _cache_graph_root_id(cache),
             input_ids.size(0),
             cache.layers[0].max_seq_len,
             row_indices is not None,
@@ -3478,7 +3478,7 @@ class Llama3TensorParallelForCausalLM:
         if not cache.layers:
             raise ValueError("ragged decode requires a non-empty KV cache")
         key = (
-            id(cache),
+            _cache_graph_root_id(cache),
             input_ids.size(0),
             cache.layers[0].max_seq_len,
             row_indices is not None,
@@ -3559,7 +3559,7 @@ class Llama3TensorParallelForCausalLM:
         finally:
             _set_paged_ragged_decode_graph_active(cache, False)
         key = (
-            id(cache),
+            _cache_graph_root_id(cache),
             input_ids.size(0),
             cache.layers[0].max_seq_len,
             row_indices is not None,
@@ -3622,7 +3622,7 @@ class Llama3TensorParallelForCausalLM:
         finally:
             _set_paged_ragged_decode_graph_active(cache, False)
         key = (
-            id(cache),
+            _cache_graph_root_id(cache),
             input_ids.size(0),
             cache.layers[0].max_seq_len,
             row_indices is not None,
@@ -3728,7 +3728,7 @@ class Llama3TensorParallelForCausalLM:
             )
         captured.graph.replay()
         symm_reduce_key = _symm_mem_allreduce_graph_key(input_ids.size(0), _model_world_size(self))
-        key = (id(cache), input_ids.size(0), attention_block_size, symm_reduce_key)
+        key = (_cache_graph_root_id(cache), input_ids.size(0), attention_block_size, symm_reduce_key)
         max_graphs = _tp_int("TORCHINFERNO_CUDAGRAPH_DECODE_STEP_MAX_GRAPHS", 4096, minimum=1)
         if key not in self._decode_logits_graphs and len(self._decode_logits_graphs) >= max_graphs:
             self._decode_logits_graphs.clear()
@@ -4265,7 +4265,7 @@ class Llama3TensorParallelForCausalLM:
         if not cache.layers:
             raise ValueError("ragged prefill requires a non-empty KV cache")
         key = (
-            id(cache),
+            _cache_graph_root_id(cache),
             input_ids.size(0),
             input_ids.size(1),
             cache.layers[0].max_seq_len,
