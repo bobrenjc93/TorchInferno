@@ -2351,41 +2351,29 @@ class ContinuousBatchEngine:
         cache = self._require_cache()
         active: list[_ActiveRequest] = []
         rows = []
-        suffixes = []
-        prefix_hits = []
-        orig_indices = []
-        full_prompts = []
+        prompts: list[tuple[int, ...]] = []
         for original_index, request, prefix_hit_tokens, reusable in requests:
             row = self._acquire_active_row()
             rows.append(row)
-            suffix = request.prompt
-            if reusable is not None and prefix_hit_tokens > 0:
-                self._copy_prefix(reusable.row, row, prefix_hit_tokens)
-                suffix = request.prompt[prefix_hit_tokens:]
-                self.stats.prefix_reuse_requests += 1
-                self.stats.prefix_reuse_tokens += prefix_hit_tokens
-            suffixes.append(suffix)
-            prefix_hits.append(prefix_hit_tokens)
-            orig_indices.append(original_index)
-            full_prompts.append(request.prompt)
+            prompts.append(request.prompt)
 
-        if not suffixes or not any(suffixes):
+        if not prompts:
             return None
 
-        max_suffix_len = max(len(s) for s in suffixes)
-        batch = len(suffixes)
-        padded = [list(s) + [0] * (max_suffix_len - len(s)) for s in suffixes]
+        prompt_lens = [len(p) for p in prompts]
+        max_prompt_len = max(prompt_lens)
+        batch = len(prompts)
+        padded = [list(p) + [0] * (max_prompt_len - len(p)) for p in prompts]
         input_ids = torch.tensor(padded, dtype=torch.long, device=self.device)
-        q_lens = torch.tensor([len(s) for s in suffixes], dtype=torch.long, device=self.device)
-        seq_lens = torch.tensor(prefix_hits, dtype=torch.long, device=self.device)
+        q_lens = torch.tensor(prompt_lens, dtype=torch.long, device=self.device)
+        seq_lens = torch.zeros(batch, dtype=torch.long, device=self.device)
         row_indices = torch.tensor(rows, dtype=torch.long, device=self.device)
         positions = []
         for i in range(batch):
-            start = prefix_hits[i]
-            positions.append([start + j for j in range(max_suffix_len)])
+            positions.append(list(range(max_prompt_len)))
         write_positions = torch.tensor(positions, dtype=torch.long, device=self.device)
         logit_positions = torch.tensor(
-            [len(s) - 1 for s in suffixes], dtype=torch.long, device=self.device,
+            [plen - 1 for plen in prompt_lens], dtype=torch.long, device=self.device,
         )
         try:
             logits = forward_fi(
