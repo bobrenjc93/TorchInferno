@@ -868,7 +868,7 @@ class ContinuousBatchEngine:
             active.extend(self._prefill_prefix_batch(group, step, events=events))
 
         plain_group = [item for group in batchable.values() for item in group]
-        if env_flag("TORCHINFERNO_CONTINUOUS_RAGGED_GRAPH_PREFILL", False) and plain_group and self.graph_prefill and len(plain_group) > 1:
+        if plain_group and self.graph_prefill and len(plain_group) > 1:
             ragged_active = self._prefill_ragged_graph_batch(plain_group, step, events=events)
             if ragged_active is not None:
                 active.extend(ragged_active)
@@ -1509,15 +1509,22 @@ class ContinuousBatchEngine:
             prompt = list(request.prompt)
             prompt.extend([0] * (suffix_bucket - len(prompt)))
             padded.append(prompt)
+        pad_rows_acquired = []
         while len(padded) < batch_bucket:
             padded.append([0] * suffix_bucket)
+            pr = self._acquire_active_row_or_none()
+            if pr is not None:
+                cache.clear_row(pr)
+                for layer_cache in cache.layers:
+                    layer_cache.keys[pr].zero_()
+                    layer_cache.values[pr].zero_()
+                pad_rows_acquired.append(pr)
+            else:
+                pad_rows_acquired.append(rows[0])
         input_ids = torch.tensor(padded, device=self.device, dtype=torch.long)
-        row_indices_list = list(rows)
-        pad_row = self._free_active_rows[-1] if self._free_active_rows else rows[0]
-        while len(row_indices_list) < batch_bucket:
-            row_indices_list.append(pad_row)
-        row_indices = torch.tensor(row_indices_list, device=self.device, dtype=torch.long)
-        seq_lens_list = [0] * (max(row_indices_list) + 1)
+        row_indices_list = list(rows) + pad_rows_acquired
+        row_indices = torch.tensor(row_indices_list[:batch_bucket], device=self.device, dtype=torch.long)
+        seq_lens_list = [0] * (max(row_indices_list[:batch_bucket]) + 1)
         seq_lens = torch.tensor(seq_lens_list, device=self.device, dtype=torch.long)
         logit_pos = [l - 1 for l in lengths]
         while len(logit_pos) < batch_bucket:
@@ -1533,7 +1540,13 @@ class ContinuousBatchEngine:
         except Exception:
             for row in rows:
                 self._release_active_row(row)
+            for pr in pad_rows_acquired:
+                if pr not in rows:
+                    self._release_active_row(pr)
             return None
+        for pr in pad_rows_acquired:
+            if pr not in rows:
+                self._release_active_row(pr)
         n = len(group)
         logits = logits[:n]
         self._record_model_call("prefill", n, tokens=sum(lengths))
