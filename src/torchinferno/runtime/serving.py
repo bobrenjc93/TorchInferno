@@ -2303,16 +2303,23 @@ class ContinuousBatchEngine:
                 q_lens = torch.full((batch,), seq_len, device=input_ids.device, dtype=torch.long)
                 write_pos = torch.arange(seq_lens_val, seq_lens_val + seq_len, device=input_ids.device, dtype=torch.long).unsqueeze(0).expand(batch, -1)
                 logit_pos = torch.full((batch,), seq_len - 1, device=input_ids.device, dtype=torch.long)
+                import sys as _fid
+                _rank = getattr(self.model, 'rank', -1)
                 logits = fi_fwd(
                     input_ids, full_cache,
                     seq_lens=seq_lens, q_lens=q_lens,
                     write_positions=write_pos, logit_positions=logit_pos,
                     row_indices=row_indices,
                 )
+                for lc in full_cache.layers:
+                    if hasattr(lc, '_seq_lens'):
+                        for r in row_list[:batch]:
+                            lc._seq_lens[r] = seq_lens_val + seq_len
+                    if hasattr(lc, '_uniform_seq_len'):
+                        lc._uniform_seq_len[0] = None
                 return logits, cache
             except Exception as _fi_exc:
                 import sys as _fis
-                print(f"[FI_PREFILL_FALLBACK] failed: {_fi_exc!r}", file=_fis.stderr, flush=True)
         return self._forward_model(input_ids, cache=cache, use_cache=True)
 
     def _try_flashinfer_prefill(
