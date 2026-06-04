@@ -4072,9 +4072,6 @@ class Llama3TensorParallelForCausalLM:
         )
 
         if not getattr(self, '_flashinfer_jit_warmed', False):
-            import torch.distributed as _dist
-            if _dist.is_available() and _dist.is_initialized() and _dist.get_world_size() > 1:
-                _dist.barrier()
             self._flashinfer_jit_warmed = True
 
         # Build per-token rotary embeddings

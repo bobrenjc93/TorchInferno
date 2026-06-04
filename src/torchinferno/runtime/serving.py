@@ -2281,7 +2281,8 @@ class ContinuousBatchEngine:
         if graph_logits is not None:
             return graph_logits, cache
         fi_fwd = getattr(self.model, "forward_step_flashinfer", None)
-        if fi_fwd is not None and input_ids.device.type == "cuda":
+        fi_ready = getattr(self.model, "_flashinfer_jit_warmed", False)
+        if fi_fwd is not None and fi_ready and input_ids.device.type == "cuda":
             try:
                 batch, seq_len = input_ids.shape
                 full_cache = self._require_cache()
