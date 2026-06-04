@@ -21,6 +21,11 @@ class ServingRequest:
     max_new_tokens: int
     arrival_step: int = 0
     eos_token_id: Optional[int] = None
+    prompt_len: int = -1
+
+    def __post_init__(self) -> None:
+        if self.prompt_len < 0:
+            object.__setattr__(self, "prompt_len", len(self.prompt))
 
 
 @dataclass(frozen=True)
@@ -868,7 +873,8 @@ class ContinuousBatchEngine:
             active.extend(self._prefill_prefix_batch(group, step, events=events))
 
         plain_group = [item for group in batchable.values() for item in group]
-        if env_flag("TORCHINFERNO_CONTINUOUS_RAGGED_GRAPH_PREFILL", False) and plain_group and self.graph_prefill and len(plain_group) > 1:
+        max_pl = max((r.prompt_len for _, r, _ in plain_group), default=0) if plain_group else 0
+        if plain_group and self.graph_prefill and len(plain_group) > 1 and max_pl <= 256:
             ragged_active = self._prefill_ragged_graph_batch(plain_group, step, events=events)
             if ragged_active is not None:
                 active.extend(ragged_active)
