@@ -791,7 +791,7 @@ class ContinuousBatchEngine:
         min_free_rows = env_int("TORCHINFERNO_CONTINUOUS_ADMIT_MIN_FREE_ROWS", 1, minimum=1)
         if active_count > 0 and capacity < min(min_free_rows, self.max_active_requests):
             return []
-        per_step_cap = env_int("TORCHINFERNO_CONTINUOUS_ADMIT_PER_STEP_CAP", 4, minimum=0)
+        per_step_cap = env_int("TORCHINFERNO_CONTINUOUS_ADMIT_PER_STEP_CAP", 16, minimum=0)
         if per_step_cap > 0 and active_count >= per_step_cap:
             capacity = min(capacity, per_step_cap)
         min_ready_requests = env_int("TORCHINFERNO_CONTINUOUS_ADMIT_MIN_READY_REQUESTS", 1, minimum=1)
@@ -864,44 +864,54 @@ class ContinuousBatchEngine:
             else:
                 batchable[len(request.prompt)].append((original_index, request, 0))
 
+        plain_group = [item for group in batchable.values() for item in group]
+
+        all_fi_requests: list[tuple[int, ServingRequest, int, _ReusablePrefix | None]] = []
+        if not env_flag("TORCHINFERNO_CONTINUOUS_FLASHINFER_PREFILL_DISABLE", False):
+            for group in prefix_batchable.values():
+                for idx, req, hit, reusable in group:
+                    all_fi_requests.append((idx, req, hit, reusable))
+            for idx, req, hit in plain_group:
+                all_fi_requests.append((idx, req, hit, None))
+
+        if all_fi_requests:
+            fi_active = self._try_flashinfer_prefill(all_fi_requests, step, events=events)
+            if fi_active is not None:
+                active.extend(fi_active)
+                if self.profile_timings:
+                    self.stats.prefill_wall_ms += (time.perf_counter() - timing_start_s) * 1000.0
+                return indexed_results, active
+
         for group in prefix_batchable.values():
             active.extend(self._prefill_prefix_batch(group, step, events=events))
 
-        plain_group = [item for group in batchable.values() for item in group]
         if env_flag("TORCHINFERNO_CONTINUOUS_RAGGED_GRAPH_PREFILL", False) and plain_group and self.graph_prefill and len(plain_group) > 1:
             ragged_active = self._prefill_ragged_graph_batch(plain_group, step, events=events)
             if ragged_active is not None:
                 active.extend(ragged_active)
                 plain_group = []
         if plain_group:
-            fi_active = None
-            if env_flag("TORCHINFERNO_CONTINUOUS_FLASHINFER_PREFILL", False):
-                fi_requests = [(idx, req, hit, None) for idx, req, hit in plain_group]
-                fi_active = self._try_flashinfer_prefill(fi_requests, step, events=events)
-            if fi_active is not None:
-                active.extend(fi_active)
+            shared_prefix_active = self._prefill_common_prefix_batch(plain_group, step, events=events)
+            if shared_prefix_active is not None:
+                active.extend(shared_prefix_active)
+            elif len(plain_group) > 1 and self._can_padded_batch_prefill(plain_group):
+                active.extend(self._prefill_padded_batch(plain_group, step, events=events))
             else:
-                shared_prefix_active = self._prefill_common_prefix_batch(plain_group, step, events=events)
-                if shared_prefix_active is not None:
-                    active.extend(shared_prefix_active)
-                elif len(plain_group) > 1 and self._can_padded_batch_prefill(plain_group):
-                    active.extend(self._prefill_padded_batch(plain_group, step, events=events))
-                else:
-                    for group in batchable.values():
-                        if len(group) == 1:
-                            original_index, request, prefix_hit_tokens = group[0]
-                            active.append(
-                                self._prefill_one(
-                                    original_index,
-                                    request,
-                                    step,
-                                    prefix_hit_tokens,
-                                    None,
-                                    events=events,
-                                )
+                for group in batchable.values():
+                    if len(group) == 1:
+                        original_index, request, prefix_hit_tokens = group[0]
+                        active.append(
+                            self._prefill_one(
+                                original_index,
+                                request,
+                                step,
+                                prefix_hit_tokens,
+                                None,
+                                events=events,
                             )
-                        else:
-                            active.extend(self._prefill_batch(group, step, events=events))
+                        )
+                    else:
+                        active.extend(self._prefill_batch(group, step, events=events))
         if self.profile_timings:
             self.stats.prefill_wall_ms += (time.perf_counter() - timing_start_s) * 1000.0
         return indexed_results, active

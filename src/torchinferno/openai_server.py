@@ -2213,7 +2213,7 @@ class OpenAICompletionEngine:
         emitted_events = 0
         finished_events = 0
         initial_wait_s = (
-            env_float("TORCHINFERNO_OPENAI_TP_ONLINE_INITIAL_BATCH_WAIT_MS", 5.0, minimum=0.0) / 1000.0
+            env_float("TORCHINFERNO_OPENAI_TP_ONLINE_INITIAL_BATCH_WAIT_MS", 1.0, minimum=0.0) / 1000.0
         )
         idle_wait_s = env_float("TORCHINFERNO_OPENAI_TP_ONLINE_IDLE_BATCH_WAIT_MS", 2.0, minimum=0.0) / 1000.0
         profile_start_s = time.perf_counter()
@@ -2419,7 +2419,7 @@ class OpenAICompletionEngine:
                 add_phase("start_sync_ms", start_sync_start_s)
                 submit_batch(initial_batch, arrival_step=0)
                 decode_quantum = env_int("TORCHINFERNO_OPENAI_TP_ONLINE_DECODE_QUANTUM", 16, minimum=1)
-                persistent = env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_PERSISTENT", False)
+                persistent = env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_PERSISTENT", True)
                 persistent_idle_s = env_float(
                     "TORCHINFERNO_OPENAI_TP_ONLINE_PERSISTENT_IDLE_MS", 10.0, minimum=0.0
                 ) / 1000.0
