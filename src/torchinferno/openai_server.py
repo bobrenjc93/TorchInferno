@@ -10077,28 +10077,28 @@ def _tensor_parallel_worker_loop(engine: OpenAICompletionEngine) -> None:
                 if online_symm_scope is not None:
                     online_symm_scope.__exit__(None, None, None)
                     online_symm_scope = None
-                online_runtime_engine = None
                 max_seq_len = int(payload["max_seq_len"])
                 max_active = int(payload.get("max_active_requests", 1))
                 prefix_rows = int(payload.get("prefix_cache_capacity", 0))
                 prefill_budget_value = int(payload.get("prefill_token_budget", 0))
                 temperature = float(payload.get("temperature", 0.0))
-                online_runtime_engine = _RuntimeContinuousBatchEngine(
-                    getattr(engine, "model"),
-                    device=getattr(engine, "device", torch.device("cpu")),
-                    cache_backend=str(getattr(engine, "cache_backend", "dense")),
-                    page_size=int(getattr(engine, "page_size", 16)),
-                    temperature=temperature,
-                    max_active_requests=max_active,
-                    prefix_cache_capacity=prefix_rows,
-                    prefill_token_budget=prefill_budget_value if prefill_budget_value > 0 else None,
-                    enable_ragged_decode=bool(payload.get("enable_ragged_decode", True)),
-                    store_reusable_prefixes=bool(payload.get("store_reusable_prefixes", True)),
-                    store_full_prompt_prefixes=bool(payload.get("store_full_prompt_prefixes", True)),
-                    pin_shared_prefix=env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_PIN_SHARED_PREFIX", True),
-                    graph_prefill=env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_GRAPH_PREFILL", True),
-            prefill_chunk_size=(env_int("TORCHINFERNO_OPENAI_TP_ONLINE_PREFILL_CHUNK", 0, minimum=0) or None),
-                )
+                if online_runtime_engine is None:
+                    online_runtime_engine = _RuntimeContinuousBatchEngine(
+                        getattr(engine, "model"),
+                        device=getattr(engine, "device", torch.device("cpu")),
+                        cache_backend=str(getattr(engine, "cache_backend", "dense")),
+                        page_size=int(getattr(engine, "page_size", 16)),
+                        temperature=temperature,
+                        max_active_requests=max_active,
+                        prefix_cache_capacity=prefix_rows,
+                        prefill_token_budget=prefill_budget_value if prefill_budget_value > 0 else None,
+                        enable_ragged_decode=bool(payload.get("enable_ragged_decode", True)),
+                        store_reusable_prefixes=bool(payload.get("store_reusable_prefixes", True)),
+                        store_full_prompt_prefixes=bool(payload.get("store_full_prompt_prefixes", True)),
+                        pin_shared_prefix=env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_PIN_SHARED_PREFIX", True),
+                        graph_prefill=env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_GRAPH_PREFILL", True),
+                        prefill_chunk_size=(env_int("TORCHINFERNO_OPENAI_TP_ONLINE_PREFILL_CHUNK", 0, minimum=0) or None),
+                    )
                 worker_shared_cache = getattr(engine, "_persistent_serving_cache", None)
                 if worker_shared_cache is None:
                     try:
