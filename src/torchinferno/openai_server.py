@@ -2311,7 +2311,7 @@ class OpenAICompletionEngine:
         def compatible(request: _QueuedGeneration) -> bool:
             return same_online_class(request) and len(request.prompt) + request.max_tokens <= compat_max_seq_len
 
-        def submit_batch(requests: Sequence[_QueuedGeneration], *, arrival_step: int) -> None:
+        def submit_batch(requests: Sequence[_QueuedGeneration], *, arrival_step: int, sync: bool = True) -> None:
             nonlocal next_request_id
             if not requests:
                 return
@@ -2342,7 +2342,8 @@ class OpenAICompletionEngine:
                         eos_token_id=eos_token_id,
                     )
                 )
-            _sync_tensor_parallel_command(self.model, self.device)
+            if sync:
+                _sync_tensor_parallel_command(self.model, self.device)
             add_phase("submit_sync_ms", submit_start_s)
 
         def drain_ready(arrival_step: int) -> int:
@@ -2361,7 +2362,7 @@ class OpenAICompletionEngine:
                 else:
                     deferred.append(item)
             add_phase("drain_ready_poll_ms", drain_start_s)
-            submit_batch(ready, arrival_step=arrival_step)
+            submit_batch(ready, arrival_step=arrival_step, sync=False)
             return len(ready)
 
         def wait_and_drain(arrival_step: int, wait_s: float) -> int:
