@@ -2282,7 +2282,9 @@ class ContinuousBatchEngine:
             return graph_logits, cache
         fi_fwd = getattr(self.model, "forward_step_flashinfer", None)
         fi_ready = getattr(self.model, "_flashinfer_jit_warmed", False)
-        if fi_fwd is not None and fi_ready and input_ids.device.type == "cuda":
+        cache_layers = getattr(self._require_cache(), "layers", None)
+        has_paged = cache_layers and hasattr(cache_layers[0], "paged_kv")
+        if fi_fwd is not None and fi_ready and has_paged and input_ids.device.type == "cuda":
             try:
                 batch, seq_len = input_ids.shape
                 full_cache = self._require_cache()
