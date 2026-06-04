@@ -910,6 +910,8 @@ class Llama3TensorParallelCache:
             cache_backend=self.cache_backend,
         )
         view._graph_cache_id = self._graph_cache_id
+        view._parent_cache = self
+        view._rows = tuple(rows)
         if getattr(self, "_skip_capture_sync", False):
             view._skip_capture_sync = True
         if getattr(self, "_block_decode_graph_captures", False):
