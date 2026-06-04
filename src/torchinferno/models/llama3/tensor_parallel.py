@@ -4265,7 +4265,7 @@ class Llama3TensorParallelForCausalLM:
         if not cache.layers:
             raise ValueError("ragged prefill requires a non-empty KV cache")
         key = (
-            _cache_graph_root_id(cache),
+            id(cache),
             input_ids.size(0),
             input_ids.size(1),
             cache.layers[0].max_seq_len,

@@ -868,10 +868,7 @@ class ContinuousBatchEngine:
             active.extend(self._prefill_prefix_batch(group, step, events=events))
 
         plain_group = [item for group in batchable.values() for item in group]
-        max_prompt_len = max((len(r.prompt) for _, r, _ in plain_group), default=0) if plain_group else 0
-        n_pad_needed = self._prefill_batch_bucket(len(plain_group)) - len(plain_group) if plain_group else 0
-        if (plain_group and self.graph_prefill and len(plain_group) > 1
-                and max_prompt_len <= 256 and len(self._free_active_rows) >= len(plain_group) + n_pad_needed):
+        if env_flag("TORCHINFERNO_CONTINUOUS_RAGGED_GRAPH_PREFILL", False) and plain_group and self.graph_prefill and len(plain_group) > 1:
             ragged_active = self._prefill_ragged_graph_batch(plain_group, step, events=events)
             if ragged_active is not None:
                 active.extend(ragged_active)
@@ -1512,23 +1509,13 @@ class ContinuousBatchEngine:
             prompt = list(request.prompt)
             prompt.extend([0] * (suffix_bucket - len(prompt)))
             padded.append(prompt)
-        pad_rows = []
         while len(padded) < batch_bucket:
-            pr = self._acquire_active_row_or_none()
-            if pr is None:
-                for p in pad_rows:
-                    self._release_active_row(p)
-                for r in rows:
-                    self._release_active_row(r)
-                return None
-            cache.clear_row(pr)
-            for lc in cache.layers:
-                lc.keys[pr].zero_()
-                lc.values[pr].zero_()
-            pad_rows.append(pr)
             padded.append([0] * suffix_bucket)
         input_ids = torch.tensor(padded, device=self.device, dtype=torch.long)
-        row_indices_list = list(rows) + pad_rows
+        row_indices_list = list(rows)
+        pad_row = self._free_active_rows[-1] if self._free_active_rows else rows[0]
+        while len(row_indices_list) < batch_bucket:
+            row_indices_list.append(pad_row)
         row_indices = torch.tensor(row_indices_list, device=self.device, dtype=torch.long)
         seq_lens_list = [0] * (max(row_indices_list) + 1)
         seq_lens = torch.tensor(seq_lens_list, device=self.device, dtype=torch.long)
@@ -1546,11 +1533,7 @@ class ContinuousBatchEngine:
         except Exception:
             for row in rows:
                 self._release_active_row(row)
-            for pr in pad_rows:
-                self._release_active_row(pr)
             return None
-        for pr in pad_rows:
-            self._release_active_row(pr)
         n = len(group)
         logits = logits[:n]
         self._record_model_call("prefill", n, tokens=sum(lengths))
