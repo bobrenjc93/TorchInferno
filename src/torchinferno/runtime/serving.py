@@ -2280,6 +2280,37 @@ class ContinuousBatchEngine:
         graph_logits = self._try_prefill_logits_graph(input_ids, cache)
         if graph_logits is not None:
             return graph_logits, cache
+        fi_fwd = getattr(self.model, "forward_step_flashinfer", None)
+        if fi_fwd is not None and input_ids.device.type == "cuda":
+            try:
+                batch, seq_len = input_ids.shape
+                full_cache = self._require_cache()
+                parent = getattr(cache, "_parent_cache", None)
+                rows_attr = getattr(cache, "_rows", None) or getattr(cache, "_row_list", None)
+                if rows_attr is not None and parent is not None:
+                    row_list = list(rows_attr) if not isinstance(rows_attr, list) else rows_attr
+                else:
+                    row_list = list(range(batch))
+                    full_cache = cache
+                seq_lens_val = 0
+                try:
+                    seq_lens_val = int(cache.seq_len)
+                except Exception:
+                    pass
+                row_indices = torch.tensor(row_list[:batch], device=input_ids.device, dtype=torch.long)
+                seq_lens = torch.full((batch,), seq_lens_val, device=input_ids.device, dtype=torch.long)
+                q_lens = torch.full((batch,), seq_len, device=input_ids.device, dtype=torch.long)
+                write_pos = torch.arange(seq_lens_val, seq_lens_val + seq_len, device=input_ids.device, dtype=torch.long).unsqueeze(0).expand(batch, -1)
+                logit_pos = torch.full((batch,), seq_len - 1, device=input_ids.device, dtype=torch.long)
+                logits = fi_fwd(
+                    input_ids, full_cache,
+                    seq_lens=seq_lens, q_lens=q_lens,
+                    write_positions=write_pos, logit_positions=logit_pos,
+                    row_indices=row_indices,
+                )
+                return logits, cache
+            except Exception:
+                pass
         return self._forward_model(input_ids, cache=cache, use_cache=True)
 
     def _try_flashinfer_prefill(
