@@ -3997,9 +3997,12 @@ class Llama3TensorParallelForCausalLM:
             and env_flag("TORCHINFERNO_COMPILED_UNIFIED_FORWARD", False)
         ):
             try:
+                _compile_mode = "reduce-overhead" if env_flag(
+                    "TORCHINFERNO_COMPILED_UNIFIED_REDUCE_OVERHEAD", True
+                ) else "max-autotune"
                 self._compiled_step_flashinfer = torch.compile(
                     self._forward_step_flashinfer_body,
-                    mode="max-autotune",
+                    mode=_compile_mode,
                     fullgraph=False,
                 )
             except Exception:
@@ -4058,6 +4061,12 @@ class Llama3TensorParallelForCausalLM:
             wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(workspace, kv_layout='NHD')
             self._flashinfer_wrapper = wrapper
 
+        _fi_prof = env_flag("TORCHINFERNO_FI_PREFILL_PROFILE", False)
+        if _fi_prof:
+            torch.cuda.synchronize(self.device)
+            import time as _pt
+            _p0 = _pt.perf_counter()
+
         wrapper.plan(
             qo_indptr=qo_indptr,
             paged_kv_indptr=paged_kv_indptr,
@@ -4070,6 +4079,11 @@ class Llama3TensorParallelForCausalLM:
             causal=True,
             q_data_type=self.dtype,
         )
+
+        if _fi_prof:
+            torch.cuda.synchronize(self.device)
+            import time as _pt
+            _p1 = _pt.perf_counter()
 
         if not getattr(self, '_flashinfer_jit_warmed', False):
             self._flashinfer_jit_warmed = True
@@ -4107,6 +4121,17 @@ class Llama3TensorParallelForCausalLM:
                 import traceback
                 traceback.print_exc(file=sys.stderr)
                 raise
+
+        if _fi_prof:
+            torch.cuda.synchronize(self.device)
+            import time as _pt, sys as _ps
+            _p2 = _pt.perf_counter()
+            if getattr(self, "rank", 0) == 0:
+                print(
+                    f"[FI_PROF] batch={batch} q={max_q_len} total_q={total_q} "
+                    f"plan={(_p1-_p0)*1000:.1f}ms layers={(_p2-_p1)*1000:.1f}ms",
+                    file=_ps.stderr, flush=True,
+                )
 
         # Gather output logits at logit_positions
         if attn_in is None:
