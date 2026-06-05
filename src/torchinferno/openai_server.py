@@ -1839,8 +1839,15 @@ class OpenAICompletionEngine:
             except Exception as _fip_exc:
                 import sys as _fip_sys
                 print(f"[WARMUP] FlashInfer prefill warmup failed: {_fip_exc}", file=_fip_sys.stderr, flush=True)
+        # OFF by default: the per-rank capture loop uses a free-memory guard to
+        # stop before OOM, but ranks can have slightly different free memory and
+        # stop at different bucket counts. Divergent captured-graph sets across
+        # TP ranks make an in-graph allreduce on one rank wait forever on a
+        # partner that never replays -> NCCL deadlock -> server never ready.
+        # Re-enabling requires a collective agreement on exactly which buckets
+        # every rank captures. See try_prefill_flashinfer_graph.
         if hasattr(self.model, "capture_flashinfer_prefill_graph") and env_flag(
-            "TORCHINFERNO_FI_PREFILL_GRAPH", True
+            "TORCHINFERNO_FI_PREFILL_GRAPH", False
         ):
             try:
                 self._warmup_flashinfer_prefill_graphs(cache, max_active)
