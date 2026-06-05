@@ -875,25 +875,26 @@ class ContinuousBatchEngine:
                 all_fi_requests.append((idx, req, hit, None))
 
         if len(all_fi_requests) > 1:
-            import sys as _fpm
-            _fi_t0 = time.perf_counter()
+            _fi_debug = env_flag("TORCHINFERNO_FI_PREFILL_PROFILE", False)
+            _fi_t0 = time.perf_counter() if _fi_debug else 0.0
             fi_active = self._try_flashinfer_prefill(all_fi_requests, step, events=events)
-            _fi_t1 = time.perf_counter()
             if fi_active is not None:
-                print(
-                    f"[FI_PREFILL] OK batch={len(all_fi_requests)} active={len(fi_active)} "
-                    f"time={(_fi_t1-_fi_t0)*1000:.1f}ms",
-                    file=_fpm.stderr, flush=True,
-                )
+                if _fi_debug:
+                    import sys as _fpm
+                    print(
+                        f"[FI_PREFILL] OK batch={len(all_fi_requests)} active={len(fi_active)} "
+                        f"time={(time.perf_counter()-_fi_t0)*1000:.1f}ms",
+                        file=_fpm.stderr, flush=True,
+                    )
                 active.extend(fi_active)
                 if self.profile_timings:
                     self.stats.prefill_wall_ms += (time.perf_counter() - timing_start_s) * 1000.0
                 return indexed_results, active
-            else:
+            elif _fi_debug:
+                import sys as _fpm
                 print(
                     f"[FI_PREFILL] FALLBACK batch={len(all_fi_requests)} "
-                    f"prefix_batchable={len(prefix_batchable)} plain={len(plain_group)} "
-                    f"time={(_fi_t1-_fi_t0)*1000:.1f}ms",
+                    f"prefix_batchable={len(prefix_batchable)} plain={len(plain_group)}",
                     file=_fpm.stderr, flush=True,
                 )
 
@@ -2391,13 +2392,24 @@ class ContinuousBatchEngine:
             [plen - 1 for plen in prompt_lens], dtype=torch.long, device=self.device,
         )
         try:
-            logits = forward_fi(
-                input_ids, cache,
-                seq_lens=seq_lens, q_lens=q_lens,
-                write_positions=write_positions,
-                logit_positions=logit_positions,
-                row_indices=row_indices,
-            )
+            logits = None
+            graph_fn = getattr(self.model, "try_prefill_flashinfer_graph", None)
+            if graph_fn is not None:
+                logits = graph_fn(
+                    input_ids, cache,
+                    seq_lens=seq_lens, q_lens=q_lens,
+                    write_positions=write_positions,
+                    logit_positions=logit_positions,
+                    row_indices=row_indices,
+                )
+            if logits is None:
+                logits = forward_fi(
+                    input_ids, cache,
+                    seq_lens=seq_lens, q_lens=q_lens,
+                    write_positions=write_positions,
+                    logit_positions=logit_positions,
+                    row_indices=row_indices,
+                )
         except Exception as _fi_prefill_exc:
             import sys as _fps
             import traceback as _fptb

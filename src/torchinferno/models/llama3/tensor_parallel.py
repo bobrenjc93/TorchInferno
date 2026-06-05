@@ -4024,34 +4024,8 @@ class Llama3TensorParallelForCausalLM:
             row_indices=row_indices,
         )
 
-    def _forward_step_flashinfer_body(
-        self,
-        input_ids: Tensor,
-        cache: Llama3TensorParallelCache,
-        *,
-        seq_lens: Tensor,
-        q_lens: Tensor,
-        write_positions: Tensor,
-        logit_positions: Tensor,
-        row_indices: Tensor | None = None,
-    ) -> Tensor:
+    def _flashinfer_prefill_wrapper(self) -> object:
         import flashinfer
-
-        batch = input_ids.size(0)
-        max_q_len = input_ids.size(1)
-        total_q = int(q_lens.sum().item())
-
-        max_seq = cache.layers[0].max_seq_len
-        qo_indptr = torch.zeros(batch + 1, dtype=torch.int32, device=self.device)
-        qo_indptr[1:] = q_lens.to(torch.int32).cumsum(0)
-
-        paged_kv_indptr = torch.arange(batch + 1, dtype=torch.int32, device=self.device)
-        if row_indices is not None:
-            paged_kv_indices = row_indices.to(dtype=torch.int32, device=self.device)
-        else:
-            paged_kv_indices = torch.arange(batch, dtype=torch.int32, device=self.device)
-        paged_kv_last_page_len = (seq_lens + q_lens).to(torch.int32)
-
         workspace = getattr(self, '_flashinfer_workspace', None)
         if workspace is None:
             workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=self.device)
@@ -4060,13 +4034,28 @@ class Llama3TensorParallelForCausalLM:
         if wrapper is None:
             wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(workspace, kv_layout='NHD')
             self._flashinfer_wrapper = wrapper
+        return wrapper
 
-        _fi_prof = env_flag("TORCHINFERNO_FI_PREFILL_PROFILE", False)
-        if _fi_prof:
-            torch.cuda.synchronize(self.device)
-            import time as _pt
-            _p0 = _pt.perf_counter()
-
+    def _plan_flashinfer_prefill(
+        self,
+        wrapper: object,
+        cache: Llama3TensorParallelCache,
+        *,
+        seq_lens: Tensor,
+        q_lens: Tensor,
+        row_indices: Tensor | None,
+    ) -> None:
+        # Host-side scheduling. Must run OUTSIDE any CUDA graph capture/replay.
+        batch = q_lens.size(0)
+        max_seq = cache.layers[0].max_seq_len
+        qo_indptr = torch.zeros(batch + 1, dtype=torch.int32, device=self.device)
+        qo_indptr[1:] = q_lens.to(torch.int32).cumsum(0)
+        paged_kv_indptr = torch.arange(batch + 1, dtype=torch.int32, device=self.device)
+        if row_indices is not None:
+            paged_kv_indices = row_indices.to(dtype=torch.int32, device=self.device)
+        else:
+            paged_kv_indices = torch.arange(batch, dtype=torch.int32, device=self.device)
+        paged_kv_last_page_len = (seq_lens + q_lens).to(torch.int32)
         wrapper.plan(
             qo_indptr=qo_indptr,
             paged_kv_indptr=paged_kv_indptr,
@@ -4080,65 +4069,214 @@ class Llama3TensorParallelForCausalLM:
             q_data_type=self.dtype,
         )
 
-        if _fi_prof:
-            torch.cuda.synchronize(self.device)
-            import time as _pt
-            _p1 = _pt.perf_counter()
-
-        if not getattr(self, '_flashinfer_jit_warmed', False):
-            self._flashinfer_jit_warmed = True
-
-        # Build per-token rotary embeddings
+    def _forward_step_flashinfer_compute(
+        self,
+        input_ids: Tensor,
+        cache: Llama3TensorParallelCache,
+        wrapper: object,
+        *,
+        q_lens: Tensor | None,
+        write_positions: Tensor,
+        logit_positions: Tensor,
+        row_indices: Tensor | None = None,
+    ) -> Tensor:
+        # The graphable portion of the FlashInfer prefill forward: embedding,
+        # the 80-layer stack (with FlashInfer attention against the already-
+        # planned wrapper), and the per-request logit gather. No host-side
+        # scheduling here, so this whole region can be captured into a CUDA
+        # graph to eliminate per-layer kernel-launch overhead.
+        #
+        # q_lens=None selects the uniform (non-ragged) attention path in the
+        # layer, which avoids the `(q_lens == tokens).all()` tensor->bool host
+        # sync that is illegal during CUDA graph capture. The graph path always
+        # pads to a uniform q bucket, so None is correct there; the eager body
+        # passes real per-request q_lens for the ragged path.
+        batch = input_ids.size(0)
+        max_q_len = input_ids.size(1)
         flat_positions = write_positions.reshape(-1).clamp(0, self.rotary_cos_cache.size(0) - 1)
         rotary = (
             self.rotary_cos_cache.index_select(0, flat_positions).view(batch, max_q_len, -1),
             self.rotary_sin_cache.index_select(0, flat_positions).view(batch, max_q_len, -1),
         )
-
-        # Embedding
         hidden = F.embedding(input_ids.to(self.device, non_blocking=True), self.embed_tokens_weight)
         attn_in: Tensor | None = None
-
         for layer_id, layer in enumerate(self.layers):
             next_norm_weight = (
                 self.layers[layer_id + 1].input_layernorm_weight
                 if layer_id + 1 < len(self.layers)
                 else self.norm_weight
             )
-            try:
-                hidden, attn_in = layer.forward_flashinfer(
-                    hidden, attn_in, rotary,
-                    cache.layers[layer_id],
-                    write_positions,
-                    wrapper,
-                    next_norm_weight,
-                    row_indices=row_indices,
-                    q_lens=q_lens,
-                )
-            except Exception as exc:
-                import sys
-                print(f"[FI] layer {layer_id} CRASHED: {exc!r}", file=sys.stderr, flush=True)
-                import traceback
-                traceback.print_exc(file=sys.stderr)
-                raise
-
-        if _fi_prof:
-            torch.cuda.synchronize(self.device)
-            import time as _pt, sys as _ps
-            _p2 = _pt.perf_counter()
-            if getattr(self, "rank", 0) == 0:
-                print(
-                    f"[FI_PROF] batch={batch} q={max_q_len} total_q={total_q} "
-                    f"plan={(_p1-_p0)*1000:.1f}ms layers={(_p2-_p1)*1000:.1f}ms",
-                    file=_ps.stderr, flush=True,
-                )
-
-        # Gather output logits at logit_positions
+            hidden, attn_in = layer.forward_flashinfer(
+                hidden, attn_in, rotary,
+                cache.layers[layer_id],
+                write_positions,
+                wrapper,
+                next_norm_weight,
+                row_indices=row_indices,
+                q_lens=q_lens,
+            )
         if attn_in is None:
             attn_in = _tp_decode_rms_norm(hidden, self.norm_weight, self.config.rms_norm_eps)
         gather_positions = logit_positions.view(batch, 1, 1).expand(-1, 1, attn_in.size(-1))
         gathered = torch.gather(attn_in, 1, gather_positions)
         return _decode_linear(gathered, self.lm_head_weight, self.lm_head_weight_decode)
+
+    def _forward_step_flashinfer_body(
+        self,
+        input_ids: Tensor,
+        cache: Llama3TensorParallelCache,
+        *,
+        seq_lens: Tensor,
+        q_lens: Tensor,
+        write_positions: Tensor,
+        logit_positions: Tensor,
+        row_indices: Tensor | None = None,
+    ) -> Tensor:
+        wrapper = self._flashinfer_prefill_wrapper()
+        self._plan_flashinfer_prefill(
+            wrapper, cache, seq_lens=seq_lens, q_lens=q_lens, row_indices=row_indices,
+        )
+        if not getattr(self, '_flashinfer_jit_warmed', False):
+            self._flashinfer_jit_warmed = True
+        return self._forward_step_flashinfer_compute(
+            input_ids, cache, wrapper,
+            q_lens=q_lens, write_positions=write_positions,
+            logit_positions=logit_positions, row_indices=row_indices,
+        )
+
+    def capture_flashinfer_prefill_graph(
+        self,
+        cache: Llama3TensorParallelCache,
+        batch: int,
+        q_len: int,
+    ) -> bool:
+        # Capture a CUDA graph of the FlashInfer prefill compute at a fixed
+        # (batch, q_len) bucket. plan() runs OUTSIDE the graph; only the
+        # embedding + 80-layer stack + logit gather are captured, eliminating
+        # the ~245ms of per-layer kernel-launch overhead measured in the eager
+        # path. KV writes target the static row buffer, so replays can retarget
+        # arbitrary cache rows by updating it before replay.
+        import flashinfer
+
+        device = self.device
+        max_seq = cache.layers[0].max_seq_len
+        graphs = getattr(self, "_fi_prefill_graphs", None)
+        if graphs is None:
+            graphs = {}
+            self._fi_prefill_graphs = graphs
+
+        ws = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device)
+        qo_buf = torch.empty(batch + 1, dtype=torch.int32, device=device)
+        kv_indptr_buf = torch.empty(batch + 1, dtype=torch.int32, device=device)
+        kv_indices_buf = torch.empty(batch, dtype=torch.int32, device=device)
+        kv_lpl_buf = torch.empty(batch, dtype=torch.int32, device=device)
+        wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+            ws, kv_layout="NHD", use_cuda_graph=True,
+            qo_indptr_buf=qo_buf, paged_kv_indptr_buf=kv_indptr_buf,
+            paged_kv_indices_buf=kv_indices_buf, paged_kv_last_page_len_buf=kv_lpl_buf,
+        )
+
+        s_ids = torch.zeros(batch, q_len, dtype=torch.long, device=device)
+        s_wp = torch.arange(q_len, dtype=torch.long, device=device).unsqueeze(0).expand(batch, -1).contiguous()
+        s_ri = torch.arange(batch, dtype=torch.long, device=device)
+        s_qlens = torch.full((batch,), q_len, dtype=torch.long, device=device)
+        s_seq = torch.zeros(batch, dtype=torch.long, device=device)
+        s_logit = torch.full((batch,), q_len - 1, dtype=torch.long, device=device)
+
+        def plan() -> None:
+            self._plan_flashinfer_prefill(
+                wrapper, cache, seq_lens=s_seq, q_lens=s_qlens, row_indices=s_ri,
+            )
+
+        try:
+            plan()
+            self._forward_step_flashinfer_compute(
+                s_ids, cache, wrapper, q_lens=None, write_positions=s_wp,
+                logit_positions=s_logit, row_indices=s_ri,
+            )
+            torch.cuda.synchronize(device)
+            stream = torch.cuda.Stream(device=device)
+            stream.wait_stream(torch.cuda.current_stream(device))
+            with torch.cuda.stream(stream):
+                plan()
+                self._forward_step_flashinfer_compute(
+                    s_ids, cache, wrapper, q_lens=None, write_positions=s_wp,
+                    logit_positions=s_logit, row_indices=s_ri,
+                )
+            torch.cuda.current_stream(device).wait_stream(stream)
+            torch.cuda.synchronize(device)
+            graph = torch.cuda.CUDAGraph()
+            plan()
+            with torch.cuda.graph(graph, stream=stream):
+                s_out = self._forward_step_flashinfer_compute(
+                    s_ids, cache, wrapper, q_lens=None, write_positions=s_wp,
+                    logit_positions=s_logit, row_indices=s_ri,
+                )
+        except Exception as _cap_exc:
+            if getattr(self, "rank", 0) == 0:
+                import sys as _cs, traceback as _ct
+                print(f"[FI_PREFILL_GRAPH] capture bs={batch} q={q_len} failed: {_cap_exc!r}", file=_cs.stderr, flush=True)
+                _ct.print_exc(file=_cs.stderr)
+            return False
+
+        graphs[(batch, q_len)] = (
+            graph, wrapper, s_ids, s_wp, s_ri, s_seq, s_qlens, s_logit, s_out,
+        )
+        return True
+
+    def try_prefill_flashinfer_graph(
+        self,
+        input_ids: Tensor,
+        cache: Llama3TensorParallelCache,
+        *,
+        seq_lens: Tensor,
+        q_lens: Tensor,
+        write_positions: Tensor,
+        logit_positions: Tensor,
+        row_indices: Tensor,
+    ) -> Tensor | None:
+        # Replay a captured prefill graph if a (batch_bucket, q_bucket) covers
+        # this request batch. Requests are right-padded to the q bucket and run
+        # with uniform q (the graphable attention path); per-request logits are
+        # gathered at the real last-token position so padding never corrupts the
+        # sampled token. Returns sharded logits [batch, 1, vocab] or None.
+        graphs = getattr(self, "_fi_prefill_graphs", None)
+        if not graphs:
+            return None
+        n = input_ids.size(0)
+        real_q = int(input_ids.size(1))
+        # Pick the captured (batch_bucket, q_bucket) that covers this request with
+        # the LEAST padded compute (batch_bucket * q_bucket). Power-of-two batch
+        # padding wastes more compute than the launch overhead it saves, so the
+        # capture set is fine-grained and we choose the minimal-area fit.
+        batch_bucket = None
+        q_bucket = None
+        best_area = None
+        for (b, q) in graphs:
+            if b >= n and q >= real_q:
+                area = b * q
+                if best_area is None or area < best_area:
+                    best_area = area
+                    batch_bucket = b
+                    q_bucket = q
+        if batch_bucket is None:
+            return None
+        entry = graphs.get((batch_bucket, q_bucket))
+        if entry is None:
+            return None
+        graph, wrapper, s_ids, s_wp, s_ri, s_seq, s_qlens, s_logit, s_out = entry
+
+        s_ids.zero_()
+        s_ids[:n, :real_q].copy_(input_ids)
+        s_ri[:n].copy_(row_indices.to(torch.long))
+        if n < batch_bucket:
+            s_ri[n:] = s_ri[0]
+        s_logit[:n].copy_(logit_positions.to(torch.long))
+        self._plan_flashinfer_prefill(
+            wrapper, cache, seq_lens=s_seq, q_lens=s_qlens, row_indices=s_ri,
+        )
+        graph.replay()
+        return s_out[:n]
 
     def forward_decode_flashinfer(
         self,

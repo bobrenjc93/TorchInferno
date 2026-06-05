@@ -1839,6 +1839,14 @@ class OpenAICompletionEngine:
             except Exception as _fip_exc:
                 import sys as _fip_sys
                 print(f"[WARMUP] FlashInfer prefill warmup failed: {_fip_exc}", file=_fip_sys.stderr, flush=True)
+        if hasattr(self.model, "capture_flashinfer_prefill_graph") and env_flag(
+            "TORCHINFERNO_FI_PREFILL_GRAPH", True
+        ):
+            try:
+                self._warmup_flashinfer_prefill_graphs(cache, max_active)
+            except Exception as _fipg_exc:
+                import sys as _fipg_sys
+                print(f"[WARMUP] FlashInfer prefill graph warmup failed: {_fipg_exc}", file=_fipg_sys.stderr, flush=True)
         try:
             cache._compiled_prefill_ready = True
         except Exception:
@@ -1991,6 +1999,68 @@ class OpenAICompletionEngine:
                 _reset_generation_cache(cache)
         _dt = (_wft.perf_counter() - _t0) * 1000.0
         print(f"[WARMUP] FlashInfer prefill: {warmed} configs warmed in {_dt:.0f}ms", file=_wfp.stderr, flush=True)
+
+    def _warmup_flashinfer_prefill_graphs(self, cache: object, max_active: int) -> None:
+        """Capture CUDA graphs of the FlashInfer prefill forward at fixed
+        (batch, q_len) buckets to eliminate per-layer launch overhead.
+
+        Captures conservatively, watching free GPU memory and stopping before
+        exhausting it -- each full-forward graph holds a working set, so a naive
+        full cross product OOMs. Buckets are chosen to cover typical online
+        batch sizes and prompt lengths; replay right-pads to the q bucket.
+        """
+        import sys as _g
+        import time as _gt
+        capture = getattr(self.model, "capture_flashinfer_prefill_graph", None)
+        if capture is None:
+            return
+        _t0 = _gt.perf_counter()
+        # KV writes scatter into positions [0, q-1] of the paged cache, so q must
+        # never exceed the cache's max_seq_len or the index kernel asserts OOB.
+        layer0 = cache.layers[0] if getattr(cache, "layers", None) else None
+        max_seq = int(getattr(layer0, "max_seq_len", 0)) if layer0 is not None else 0
+        n_rows = len(getattr(layer0, "_seq_lens", [])) if layer0 is not None else max_active
+        if n_rows <= 0:
+            n_rows = max_active
+        # Every-integer batch buckets up to a cap: replay picks the smallest
+        # captured bucket >= the request batch, so per-integer steps eliminate
+        # batch-padding compute waste (full-forward prefill is partly compute-
+        # bound, and even rounding 6->8 wastes more than the launch overhead it
+        # saves). Capped at existing cache rows and a configurable max.
+        cap = min(max_active, n_rows, env_int("TORCHINFERNO_FI_PREFILL_GRAPH_MAX_BATCH", 16, minimum=1))
+        batch_buckets = list(range(1, cap + 1))
+        q_buckets = [
+            int(x) for x in os.environ.get(
+                "TORCHINFERNO_FI_PREFILL_GRAPH_Q_BUCKETS", "512,768"
+            ).split(",") if x.strip()
+        ]
+        if max_seq > 0:
+            q_buckets = [q for q in q_buckets if q <= max_seq]
+        min_free_gb = env_float("TORCHINFERNO_FI_PREFILL_GRAPH_MIN_FREE_GB", 8.0, minimum=0.0)
+        captured = 0
+        for q in sorted(set(q_buckets), reverse=True):
+            for b in sorted(set(batch_buckets)):
+                free_b, _total_b = torch.cuda.mem_get_info(self.device)
+                if free_b / 1e9 < min_free_gb:
+                    print(
+                        f"[WARMUP] FI prefill graph: stopping at free={free_b/1e9:.1f}GB "
+                        f"(captured {captured})", file=_g.stderr, flush=True,
+                    )
+                    print(f"[WARMUP] FlashInfer prefill graphs: {captured} captured", file=_g.stderr, flush=True)
+                    self._fi_prefill_graph_count = captured
+                    return
+                _reset_generation_cache(cache)
+                ok = False
+                try:
+                    ok = bool(capture(cache, b, q))
+                except Exception as _ce:
+                    print(f"[WARMUP] FI prefill graph capture bs={b} q={q}: {_ce}", file=_g.stderr, flush=True)
+                _reset_generation_cache(cache)
+                if ok:
+                    captured += 1
+        _dt = (_gt.perf_counter() - _t0) * 1000.0
+        print(f"[WARMUP] FlashInfer prefill graphs: {captured} captured in {_dt:.0f}ms", file=_g.stderr, flush=True)
+        self._fi_prefill_graph_count = captured
 
     def _warmup_token_budget_prefill_graphs(self, prefill_chunk_size: int) -> None:
         state = self._token_budget_step_state
