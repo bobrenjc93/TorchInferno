@@ -1959,8 +1959,12 @@ class OpenAICompletionEngine:
         forward_fi = getattr(self.model, "forward_step_flashinfer", None)
         if forward_fi is None:
             return
-        prompt_buckets = sorted({32, 64, 128, 256, prompt_tokens} & set(range(1, 1025)))
-        prefill_batch_sizes = sorted({1, 2, 4, 8, 16} & set(range(1, max(batch_sizes) + 1)))
+        max_cache_seq = getattr(cache.layers[0], "max_seq_len", 1024) if hasattr(cache, "layers") and cache.layers else 1024
+        prompt_buckets = sorted(
+            {32, 64, 128, 256, 512, 768, prompt_tokens}
+            & set(range(1, min(max_cache_seq, 1025)))
+        )
+        prefill_batch_sizes = sorted({1, 2, 4, 8, 16, 32, 48} & set(range(1, max(batch_sizes) + 1)))
         warmed = 0
         for pbs in prefill_batch_sizes:
             for pt in prompt_buckets:
