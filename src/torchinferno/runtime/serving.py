@@ -874,7 +874,7 @@ class ContinuousBatchEngine:
             for idx, req, hit in plain_group:
                 all_fi_requests.append((idx, req, hit, None))
 
-        if all_fi_requests:
+        if len(all_fi_requests) > 1:
             import sys as _fpm
             _fi_t0 = time.perf_counter()
             fi_active = self._try_flashinfer_prefill(all_fi_requests, step, events=events)
