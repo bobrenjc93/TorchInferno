@@ -2256,7 +2256,7 @@ class OpenAICompletionEngine:
         )
         max_active = self._online_serving_max_active()
         prefix_rows = self._online_serving_prefix_rows()
-        prefill_budget = env_int("TORCHINFERNO_OPENAI_TP_ONLINE_PREFILL_TOKEN_BUDGET", 2048, minimum=0)
+        prefill_budget = env_int("TORCHINFERNO_OPENAI_TP_ONLINE_PREFILL_TOKEN_BUDGET", 32768, minimum=0)
         request_by_id: dict[str, _QueuedGeneration] = {}
         next_request_id = 0
         deferred: list[_QueuedGeneration] = []
