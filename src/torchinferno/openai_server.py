@@ -1833,6 +1833,12 @@ class OpenAICompletionEngine:
             except Exception as _fi_exc:
                 import sys as _fi_sys
                 print(f"[WARMUP] FlashInfer unavailable: {_fi_exc}", file=_fi_sys.stderr, flush=True)
+        if hasattr(self.model, "forward_step_flashinfer"):
+            try:
+                self._warmup_flashinfer_prefill(cache, batch_sizes, prompt_tokens)
+            except Exception as _fip_exc:
+                import sys as _fip_sys
+                print(f"[WARMUP] FlashInfer prefill warmup failed: {_fip_exc}", file=_fip_sys.stderr, flush=True)
         try:
             cache._compiled_prefill_ready = True
         except Exception:
@@ -1938,6 +1944,49 @@ class OpenAICompletionEngine:
                 pass
             _reset_generation_cache(cache)
         model._fi_decode_graphs = fi_graphs
+
+    def _warmup_flashinfer_prefill(self, cache: object, batch_sizes: list[int], prompt_tokens: int) -> None:
+        """JIT-compile FlashInfer prefill kernels during warmup.
+
+        FlashInfer's BatchPrefillWithPagedKVCacheWrapper compiles CUDA
+        kernels on first call for each configuration. Running warmup
+        calls moves this ~200-500ms cost from the first real request
+        to server startup.
+        """
+        import sys as _wfp
+        import time as _wft
+        _t0 = _wft.perf_counter()
+        forward_fi = getattr(self.model, "forward_step_flashinfer", None)
+        if forward_fi is None:
+            return
+        prompt_buckets = sorted({32, 64, 128, 256, prompt_tokens} & set(range(1, 1025)))
+        prefill_batch_sizes = sorted({1, 2, 4, 8, 16} & set(range(1, max(batch_sizes) + 1)))
+        warmed = 0
+        for pbs in prefill_batch_sizes:
+            for pt in prompt_buckets:
+                _reset_generation_cache(cache)
+                _set_generation_cache_seq_len(cache, 0)
+                try:
+                    input_ids = torch.zeros(pbs, pt, dtype=torch.long, device=self.device)
+                    q_lens = torch.full((pbs,), pt, dtype=torch.long, device=self.device)
+                    seq_lens = torch.zeros(pbs, dtype=torch.long, device=self.device)
+                    row_indices = torch.arange(pbs, dtype=torch.long, device=self.device)
+                    write_positions = torch.arange(pt, dtype=torch.long, device=self.device).unsqueeze(0).expand(pbs, -1).contiguous()
+                    logit_positions = torch.full((pbs,), pt - 1, dtype=torch.long, device=self.device)
+                    with torch.inference_mode():
+                        forward_fi(
+                            input_ids, cache,
+                            seq_lens=seq_lens, q_lens=q_lens,
+                            write_positions=write_positions,
+                            logit_positions=logit_positions,
+                            row_indices=row_indices,
+                        )
+                    warmed += 1
+                except Exception as _wfp_exc:
+                    print(f"[WARMUP] FlashInfer prefill warmup bs={pbs} pt={pt}: {_wfp_exc}", file=_wfp.stderr, flush=True)
+                _reset_generation_cache(cache)
+        _dt = (_wft.perf_counter() - _t0) * 1000.0
+        print(f"[WARMUP] FlashInfer prefill: {warmed} configs warmed in {_dt:.0f}ms", file=_wfp.stderr, flush=True)
 
     def _warmup_token_budget_prefill_graphs(self, prefill_chunk_size: int) -> None:
         state = self._token_budget_step_state
