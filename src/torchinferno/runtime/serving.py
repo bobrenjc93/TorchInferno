@@ -875,12 +875,27 @@ class ContinuousBatchEngine:
                 all_fi_requests.append((idx, req, hit, None))
 
         if all_fi_requests:
+            import sys as _fpm
+            _fi_t0 = time.perf_counter()
             fi_active = self._try_flashinfer_prefill(all_fi_requests, step, events=events)
+            _fi_t1 = time.perf_counter()
             if fi_active is not None:
+                print(
+                    f"[FI_PREFILL] OK batch={len(all_fi_requests)} active={len(fi_active)} "
+                    f"time={(_fi_t1-_fi_t0)*1000:.1f}ms",
+                    file=_fpm.stderr, flush=True,
+                )
                 active.extend(fi_active)
                 if self.profile_timings:
                     self.stats.prefill_wall_ms += (time.perf_counter() - timing_start_s) * 1000.0
                 return indexed_results, active
+            else:
+                print(
+                    f"[FI_PREFILL] FALLBACK batch={len(all_fi_requests)} "
+                    f"prefix_batchable={len(prefix_batchable)} plain={len(plain_group)} "
+                    f"time={(_fi_t1-_fi_t0)*1000:.1f}ms",
+                    file=_fpm.stderr, flush=True,
+                )
 
         for group in prefix_batchable.values():
             active.extend(self._prefill_prefix_batch(group, step, events=events))
@@ -2383,7 +2398,14 @@ class ContinuousBatchEngine:
                 logit_positions=logit_positions,
                 row_indices=row_indices,
             )
-        except Exception:
+        except Exception as _fi_prefill_exc:
+            import sys as _fps
+            import traceback as _fptb
+            print(
+                f"[FI_PREFILL] FlashInfer prefill failed batch={batch}: {_fi_prefill_exc}",
+                file=_fps.stderr, flush=True,
+            )
+            _fptb.print_exc(file=_fps.stderr)
             for row in rows:
                 self._release_active_row(row)
             return None
