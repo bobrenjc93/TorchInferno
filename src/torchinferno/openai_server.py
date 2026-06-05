@@ -1794,11 +1794,11 @@ class OpenAICompletionEngine:
                     import sys as _wsys
                     print(f"[WARMUP] graph capture failed bs={bs}: {_warmup_exc}", file=_wsys.stderr, flush=True)
                 _reset_generation_cache(cache)
-            prefill_chunk = env_int("TORCHINFERNO_OPENAI_TP_ONLINE_PREFILL_CHUNK", 256, minimum=0)
+            prefill_chunk = env_int("TORCHINFERNO_OPENAI_TP_ONLINE_PREFILL_CHUNK", 1024, minimum=0)
             if prefill_chunk > 0:
                 ragged_prefill_graph = getattr(self.model, "try_prefill_ragged_logits_graph", None)
                 if ragged_prefill_graph is not None:
-                    suffix_buckets = [b for b in [32, 64, 128, 256] if b <= prefill_chunk]
+                    suffix_buckets = [b for b in [32, 64, 128, 256, 512, 768, 1024] if b <= prefill_chunk]
                     prefill_batch_sizes = sorted(
                         {1, 2, 4, 8, 16, 32, max_active}
                         & set(range(1, cache_batch + 1))
