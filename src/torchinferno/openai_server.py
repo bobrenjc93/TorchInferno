@@ -1839,15 +1839,13 @@ class OpenAICompletionEngine:
             except Exception as _fip_exc:
                 import sys as _fip_sys
                 print(f"[WARMUP] FlashInfer prefill warmup failed: {_fip_exc}", file=_fip_sys.stderr, flush=True)
-        # OFF by default: the per-rank capture loop uses a free-memory guard to
-        # stop before OOM, but ranks can have slightly different free memory and
-        # stop at different bucket counts. Divergent captured-graph sets across
-        # TP ranks make an in-graph allreduce on one rank wait forever on a
-        # partner that never replays -> NCCL deadlock -> server never ready.
-        # Re-enabling requires a collective agreement on exactly which buckets
-        # every rank captures. See try_prefill_flashinfer_graph.
+        # The capture loop forces an IDENTICAL bucket set on every TP rank via
+        # collective MIN-reduce on both the free-memory stop check and the
+        # per-bucket success flag (see _warmup_flashinfer_prefill_graphs), so the
+        # in-graph allreduces always have matching partners across ranks. Safe to
+        # enable by default; set the flag to 0 to fall back to eager prefill.
         if hasattr(self.model, "capture_flashinfer_prefill_graph") and env_flag(
-            "TORCHINFERNO_FI_PREFILL_GRAPH", False
+            "TORCHINFERNO_FI_PREFILL_GRAPH", True
         ):
             try:
                 self._warmup_flashinfer_prefill_graphs(cache, max_active)
@@ -2011,16 +2009,25 @@ class OpenAICompletionEngine:
         """Capture CUDA graphs of the FlashInfer prefill forward at fixed
         (batch, q_len) buckets to eliminate per-layer launch overhead.
 
-        Captures conservatively, watching free GPU memory and stopping before
-        exhausting it -- each full-forward graph holds a working set, so a naive
-        full cross product OOMs. Buckets are chosen to cover typical online
-        batch sizes and prompt lengths; replay right-pads to the q bucket.
+        TP-safe: the set of captured buckets is forced IDENTICAL across all
+        tensor-parallel ranks. Each prefill graph contains an allreduce, so if
+        ranks captured different bucket sets, a replay on one rank would have no
+        partner on another -> NCCL deadlock. Two collective barriers guarantee
+        agreement: (1) the free-memory stop check uses the cross-rank MIN, so
+        every rank stops at the same bucket; (2) after each capture every rank
+        MIN-reduces its success flag and drops the graph everywhere if any rank
+        failed. Bucket lists themselves are derived from values that are equal
+        on every rank (max_active, cache rows, max_seq), so iteration order is
+        deterministic.
         """
         import sys as _g
         import time as _gt
+        import torch.distributed as dist
         capture = getattr(self.model, "capture_flashinfer_prefill_graph", None)
         if capture is None:
             return
+        graphs = getattr(self.model, "_fi_prefill_graphs", None)
+        device = self.device
         _t0 = _gt.perf_counter()
         # KV writes scatter into positions [0, q-1] of the paged cache, so q must
         # never exceed the cache's max_seq_len or the index kernel asserts OOB.
@@ -2035,7 +2042,7 @@ class OpenAICompletionEngine:
         # bound, and even rounding 6->8 wastes more than the launch overhead it
         # saves). Capped at existing cache rows and a configurable max.
         cap = min(max_active, n_rows, env_int("TORCHINFERNO_FI_PREFILL_GRAPH_MAX_BATCH", 16, minimum=1))
-        batch_buckets = list(range(1, cap + 1))
+        batch_buckets = sorted(set(range(1, cap + 1)))
         q_buckets = [
             int(x) for x in os.environ.get(
                 "TORCHINFERNO_FI_PREFILL_GRAPH_Q_BUCKETS", "512,768"
@@ -2043,28 +2050,53 @@ class OpenAICompletionEngine:
         ]
         if max_seq > 0:
             q_buckets = [q for q in q_buckets if q <= max_seq]
+        q_buckets = sorted(set(q_buckets), reverse=True)
         min_free_gb = env_float("TORCHINFERNO_FI_PREFILL_GRAPH_MIN_FREE_GB", 8.0, minimum=0.0)
+        world = dist.get_world_size() if (dist.is_available() and dist.is_initialized()) else 1
+
+        def agreed_free_gb() -> float:
+            free_b, _total_b = torch.cuda.mem_get_info(device)
+            if world <= 1:
+                return free_b / 1e9
+            t = torch.tensor([float(free_b)], dtype=torch.float64, device=device)
+            dist.all_reduce(t, op=dist.ReduceOp.MIN)
+            return float(t.item()) / 1e9
+
+        def agreed_ok(local_ok: bool) -> bool:
+            if world <= 1:
+                return local_ok
+            flag = torch.tensor([1 if local_ok else 0], dtype=torch.int32, device=device)
+            dist.all_reduce(flag, op=dist.ReduceOp.MIN)
+            return bool(flag.item())
+
         captured = 0
-        for q in sorted(set(q_buckets), reverse=True):
-            for b in sorted(set(batch_buckets)):
-                free_b, _total_b = torch.cuda.mem_get_info(self.device)
-                if free_b / 1e9 < min_free_gb:
+        stop = False
+        for q in q_buckets:
+            if stop:
+                break
+            for b in batch_buckets:
+                # Collective stop check: identical decision on every rank.
+                if agreed_free_gb() < min_free_gb:
+                    stop = True
                     print(
-                        f"[WARMUP] FI prefill graph: stopping at free={free_b/1e9:.1f}GB "
-                        f"(captured {captured})", file=_g.stderr, flush=True,
+                        f"[WARMUP] FI prefill graph: stopping (low free mem) after {captured}",
+                        file=_g.stderr, flush=True,
                     )
-                    print(f"[WARMUP] FlashInfer prefill graphs: {captured} captured", file=_g.stderr, flush=True)
-                    self._fi_prefill_graph_count = captured
-                    return
+                    break
                 _reset_generation_cache(cache)
-                ok = False
+                local_ok = False
                 try:
-                    ok = bool(capture(cache, b, q))
+                    local_ok = bool(capture(cache, b, q))
                 except Exception as _ce:
                     print(f"[WARMUP] FI prefill graph capture bs={b} q={q}: {_ce}", file=_g.stderr, flush=True)
+                    local_ok = False
                 _reset_generation_cache(cache)
-                if ok:
+                # Collective success check: keep the graph only if EVERY rank
+                # captured it, else drop it everywhere so the sets stay identical.
+                if agreed_ok(local_ok):
                     captured += 1
+                elif graphs is not None:
+                    graphs.pop((b, q), None)
         _dt = (_gt.perf_counter() - _t0) * 1000.0
         print(f"[WARMUP] FlashInfer prefill graphs: {captured} captured in {_dt:.0f}ms", file=_g.stderr, flush=True)
         self._fi_prefill_graph_count = captured
