@@ -1794,11 +1794,11 @@ class OpenAICompletionEngine:
                     import sys as _wsys
                     print(f"[WARMUP] graph capture failed bs={bs}: {_warmup_exc}", file=_wsys.stderr, flush=True)
                 _reset_generation_cache(cache)
-            prefill_chunk = env_int("TORCHINFERNO_OPENAI_TP_ONLINE_PREFILL_CHUNK", 1024, minimum=0)
+            prefill_chunk = env_int("TORCHINFERNO_OPENAI_TP_ONLINE_PREFILL_CHUNK", 0, minimum=0)
             if prefill_chunk > 0:
                 ragged_prefill_graph = getattr(self.model, "try_prefill_ragged_logits_graph", None)
                 if ragged_prefill_graph is not None:
-                    suffix_buckets = [b for b in [32, 64, 128, 256, 512, 768, 1024] if b <= prefill_chunk]
+                    suffix_buckets = [b for b in [32, 64, 128, 256] if b <= prefill_chunk]
                     prefill_batch_sizes = sorted(
                         {1, 2, 4, 8, 16, 32, max_active}
                         & set(range(1, cache_batch + 1))
@@ -1959,12 +1959,12 @@ class OpenAICompletionEngine:
         forward_fi = getattr(self.model, "forward_step_flashinfer", None)
         if forward_fi is None:
             return
-        max_cache_seq = getattr(cache.layers[0], "max_seq_len", 1024) if hasattr(cache, "layers") and cache.layers else 1024
-        prompt_buckets = sorted(
-            {32, 64, 128, 256, 512, 768, prompt_tokens}
-            & set(range(1, min(max_cache_seq, 1025)))
-        )
-        prefill_batch_sizes = sorted({1, 2, 4, 8, 16, 32, 48} & set(range(1, max(batch_sizes) + 1)))
+        # JIT-warm a few representative shapes only. FlashInfer reuses the same
+        # compiled kernel across shapes, so a couple of calls is enough to move
+        # JIT cost off the request path. Capturing many large shapes here is
+        # memory-prohibitive (eager activations for batch*seq tokens).
+        prompt_buckets = [64, 256]
+        prefill_batch_sizes = sorted({1, max(batch_sizes)} & set(range(1, max(batch_sizes) + 1)))
         warmed = 0
         for pbs in prefill_batch_sizes:
             for pt in prompt_buckets:
@@ -2415,7 +2415,7 @@ class OpenAICompletionEngine:
                 else:
                     deferred.append(item)
             add_phase("drain_ready_poll_ms", drain_start_s)
-            submit_batch(ready, arrival_step=arrival_step, sync=False)
+            submit_batch(ready, arrival_step=arrival_step, sync=True)
             return len(ready)
 
         def wait_and_drain(arrival_step: int, wait_s: float) -> int:
@@ -2473,7 +2473,7 @@ class OpenAICompletionEngine:
                 add_phase("start_sync_ms", start_sync_start_s)
                 submit_batch(initial_batch, arrival_step=0)
                 decode_quantum = env_int("TORCHINFERNO_OPENAI_TP_ONLINE_DECODE_QUANTUM", 16, minimum=1)
-                persistent = env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_PERSISTENT", True)
+                persistent = env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_PERSISTENT", False)
                 persistent_idle_s = env_float(
                     "TORCHINFERNO_OPENAI_TP_ONLINE_PERSISTENT_IDLE_MS", 10.0, minimum=0.0
                 ) / 1000.0
