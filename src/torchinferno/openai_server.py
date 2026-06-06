@@ -2351,13 +2351,15 @@ class OpenAICompletionEngine:
                 self._token_budget_step_state = None
 
     def _online_serving_max_active(self) -> int:
-        # Decode is memory-bound (reads all weights every step regardless of
-        # batch), so throughput scales with the number of concurrently-decoding
-        # rows. 128 rows lets high-concurrency decode benchmarks (long_output,
-        # multi_turn, self_consistency) run a much larger decode batch than the
-        # old 48. Prefill batch is decoupled and stays bounded by the per-step
-        # admission cap so prefill graphs/compute don't blow up.
-        cap = env_int("TORCHINFERNO_OPENAI_TP_ONLINE_MAX_ACTIVE", 128, minimum=1)
+        # 48, restored after a benchmark regression. max_active=128 was tried
+        # (commit 28f62c1) on the theory that memory-bound decode throughput
+        # scales with concurrent rows. inference-bench run 20260606_220710
+        # (commit e2056aa) showed it is a NET LOSS: TPOT 36.6 -> 59.8 ms and the
+        # score dropped 1/20 -> 0/20. A 128-row decode step is KV-read-bound for
+        # long-context workloads (multi_turn/few_shot/tree TPOT ~doubled); only
+        # short-context long_output improved (30.7 -> 23.4). 48 is the better
+        # default; revisit with a KV-token-bounded decode batch, not a row cap.
+        cap = env_int("TORCHINFERNO_OPENAI_TP_ONLINE_MAX_ACTIVE", 48, minimum=1)
         effective = _effective_openai_max_batch_size(self.model, self.device, self.max_batch_size)
         return max(1, min(cap, effective))
 
