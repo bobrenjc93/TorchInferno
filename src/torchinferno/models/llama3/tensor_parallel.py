@@ -32,6 +32,8 @@ _COMPILED_ROTATE_LLAMA_CHECKED = False
 _COMPILED_ROTATE_LLAMA_FAILED = False
 _SYMM_REDUCE_BUFFERS: dict[tuple[str, int, str, str, tuple[int, ...]], Tensor] = {}
 _SYMM_REDUCE_PROBED: set[tuple[str, int, str, str, tuple[int, ...]]] = set()
+# Distinct eager-prefill symm-mem allreduce shapes seen, to bound buffer memory.
+_SYMM_PREFILL_SHAPES: set[tuple[str, tuple[int, ...], int]] = set()
 _SYMM_REDUCE_DISABLED = False
 _SYMM_MEM_ALLREDUCE_MAX_BATCH_OVERRIDE: list[int | None] = [None]
 _SYMM_MEM_ALLREDUCE_ENABLED_OVERRIDE: list[bool | None] = [None]
@@ -1841,10 +1843,23 @@ class _Llama3TensorParallelLayer:
         buffer_name: str,
         weight_t: Tensor | None = None,
     ) -> Tensor:
-        if _should_use_symm_mem_all_reduce(hidden, weight, self.world_size) and not self._symm_reduce_failed:
+        use_sm = _should_use_symm_mem_all_reduce(hidden, weight, self.world_size)
+        sm_name = buffer_name
+        if not use_sm and _should_use_symm_mem_prefill_all_reduce(hidden, weight, self.world_size):
+            # Eager prefill: bound distinct prefill shapes so per-shape ~0.5GB
+            # symm-mem buffers cannot churn into OOM; new shapes past the cap fall
+            # back to NCCL. few_shot's shape repeats, so it stays cached.
+            sm_name = f"{buffer_name}-pf"
+            cap = _tp_int("TORCHINFERNO_SYMM_MEM_PREFILL_MAX_BUFFERS", 6, minimum=1)
+            shape_key = (sm_name, tuple(hidden.shape[:-1]), int(weight.size(0)))
+            if shape_key in _SYMM_PREFILL_SHAPES or len(_SYMM_PREFILL_SHAPES) < cap:
+                use_sm = True
+        if use_sm and not self._symm_reduce_failed:
             try:
                 expected_shape = (*hidden.shape[:-1], weight.size(0))
-                buffer, group_name = self._symm_reduce_buffer(buffer_name, hidden, expected_shape)
+                buffer, group_name = self._symm_reduce_buffer(sm_name, hidden, expected_shape)
+                if sm_name != buffer_name:
+                    _SYMM_PREFILL_SHAPES.add((sm_name, tuple(hidden.shape[:-1]), int(weight.size(0))))
                 hidden_2d = hidden.reshape(-1, hidden.size(-1))
                 output_2d = buffer.reshape(-1, weight.size(0))
                 if weight_t is not None:
@@ -5576,16 +5591,24 @@ def _model_world_size(model: object) -> int:
 
 
 def _should_use_symm_mem_prefill_all_reduce(hidden: Tensor, weight: Tensor, world_size: int) -> bool:
-    max_tokens = _tp_int("TORCHINFERNO_SYMM_MEM_PREFILL_ALLREDUCE_MAX_TOKENS", 1024, minimum=1)
+    # symm-mem multimem_all_reduce beats NCCL ring 1.38-3.16x on 8xH100 for
+    # prefill-sized [tokens, hidden] bf16 (scripts/bench_allreduce.py). Allreduce
+    # is ~31% of prefill (profiled), so this is the top prefill lever. ON by
+    # default. Restricted to EAGER execution: during CUDA-graph capture the
+    # per-shape symm-mem buffer would need a rendezvous (a collective) inside the
+    # graph, which is illegal -- so captured (bucketed) prefill stays on NCCL and
+    # only the eager path (e.g. few_shot's 48x640 graph-miss) uses symm-mem.
+    max_tokens = _tp_int("TORCHINFERNO_SYMM_MEM_PREFILL_ALLREDUCE_MAX_TOKENS", 40960, minimum=1)
     return (
         world_size > 1
         and not _SYMM_REDUCE_DISABLED
-        and _tp_flag("TORCHINFERNO_SYMM_MEM_PREFILL_ALLREDUCE", False)
+        and _tp_flag("TORCHINFERNO_SYMM_MEM_PREFILL_ALLREDUCE", True)
         and hidden.is_cuda
         and weight.is_cuda
         and hidden.ndim == 3
         and hidden.size(1) > 1
         and hidden.size(0) * hidden.size(1) <= max_tokens
+        and not torch.cuda.is_current_stream_capturing()
     )
 
 
