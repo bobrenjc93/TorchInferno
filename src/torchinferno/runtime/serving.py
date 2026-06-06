@@ -874,10 +874,18 @@ class ContinuousBatchEngine:
             for idx, req, hit in plain_group:
                 all_fi_requests.append((idx, req, hit, None))
 
-        if len(all_fi_requests) > 1:
+        if all_fi_requests:
             _fi_debug = env_flag("TORCHINFERNO_FI_PREFILL_PROFILE", False)
             _fi_t0 = time.perf_counter() if _fi_debug else 0.0
-            fi_active = self._try_flashinfer_prefill(all_fi_requests, step, events=events)
+            # For a single request, eager FlashInfer is launch-overhead bound
+            # (~245ms regardless of prompt length), worse than the SDPA single
+            # path. So batch=1 uses the prefill CUDA graph ONLY (a captured
+            # batch=1 graph replays in ~25ms even padded to the q bucket, since
+            # batch=1 compute is tiny); a graph miss falls through to _prefill_one.
+            graph_only = len(all_fi_requests) == 1
+            fi_active = self._try_flashinfer_prefill(
+                all_fi_requests, step, events=events, graph_only=graph_only
+            )
             if fi_active is not None:
                 if _fi_debug:
                     import sys as _fpm
@@ -2356,6 +2364,7 @@ class ContinuousBatchEngine:
         step: int,
         *,
         events: list["ServingTokenEvent"] | None = None,
+        graph_only: bool = False,
     ) -> list["_ActiveRequest"] | None:
         forward_fi = getattr(self.model, "forward_step_flashinfer", None)
         if forward_fi is None:
@@ -2402,6 +2411,13 @@ class ContinuousBatchEngine:
                     logit_positions=logit_positions,
                     row_indices=row_indices,
                 )
+            if logits is None and graph_only:
+                # Graph missed and the caller (single-request path) does not want
+                # the launch-bound eager FlashInfer fallback; release rows so the
+                # normal _prefill_one/SDPA path can handle this request instead.
+                for row in rows:
+                    self._release_active_row(row)
+                return None
             if logits is None:
                 logits = forward_fi(
                     input_ids, cache,
