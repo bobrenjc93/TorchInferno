@@ -21,3 +21,4 @@ quick_*.py
 quick_*.txt
 multi_out.txt
 srv.err
+.claude/
