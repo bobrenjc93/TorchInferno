@@ -886,6 +886,16 @@ class ContinuousBatchEngine:
         # multi-rank collective-divergence bug that needs a dedicated instrumented
         # 8-GPU session, not incremental loop runs. Enable via the env flag +
         # pin_shared_prefix=False once that divergence is found.
+        #
+        # IMPORTANT value caveat (8-GPU REUSE_DEBUG trace): with persistent=False
+        # every request burst starts a fresh online session and start_online ->
+        # _reset_capacity WIPES reusable_prefixes/prefix_cache. So cross-burst
+        # reuse never triggers (each _prefill_many logs cached_prefixes=0 at
+        # step=0) -- e.g. multi_turn's per-turn requests are separate bursts and
+        # get no reuse. Only WITHIN-session reuse fires (and that is the case that
+        # hangs on TP). Making reuse actually pay off therefore ALSO needs a
+        # persistent engine whose prefix cache survives across bursts -- a larger
+        # change than the reuse path itself.
         _reuse_dbg = env_flag("TORCHINFERNO_REUSE_DEBUG", False)
         _reuse_handled = 0
         if env_flag("TORCHINFERNO_CONTINUOUS_FI_REUSE", False) and prefix_batchable:
