@@ -5566,10 +5566,17 @@ def _should_use_symm_mem_all_reduce(hidden: Tensor, weight: Tensor, world_size: 
 
 
 def _symm_mem_allreduce_max_batch() -> int:
+    # 256 (was 1): apply symm-mem multimem_all_reduce to BATCHED decode, not just
+    # single-row. Decode does 160 small allreduces/step (2/layer x 80); symm-mem
+    # is ~3x faster than NCCL ring for these latency-bound sizes. Measured on
+    # 8xH100: 16-concurrent decode TPOT 38 -> 27 ms (-29%), 32-conc 29 -> 26 ms,
+    # correct output, decode graphs still capture. The per-shape symm-mem buffer
+    # is [batch, hidden] (tiny), so a high cap costs ~nothing; 256 covers any
+    # realistic decode batch (cache rows).
     max_batch = _SYMM_MEM_ALLREDUCE_MAX_BATCH_OVERRIDE[0]
     if max_batch is not None:
         return max_batch
-    return _tp_int("TORCHINFERNO_SYMM_MEM_ALLREDUCE_MAX_BATCH", 1, minimum=1)
+    return _tp_int("TORCHINFERNO_SYMM_MEM_ALLREDUCE_MAX_BATCH", 256, minimum=1)
 
 
 def _symm_mem_allreduce_enabled() -> bool:
