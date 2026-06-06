@@ -2361,6 +2361,21 @@ class ContinuousBatchEngine:
                 return logits, cache
             except Exception as _fi_exc:
                 import sys as _fis
+                print(
+                    f"[PREFILL] FlashInfer eager prefill failed: {_fi_exc!r}",
+                    file=_fis.stderr, flush=True,
+                )
+        if has_paged:
+            # The SDPA dense _forward_model below indexes the cache as a contiguous
+            # [batch, ...] tensor, which CUDA index-asserts against the paged
+            # FlashInfer cache and takes down EVERY tensor-parallel rank (an
+            # unrecoverable device-side assert, not a Python exception). When the
+            # cache is paged, fail THIS request with a catchable error instead so
+            # the engine degrades one request rather than crashing the server.
+            raise RuntimeError(
+                "paged-cache prefill requires a FlashInfer graph/eager path; "
+                "refusing to fall back to the SDPA dense forward"
+            )
         return self._forward_model(input_ids, cache=cache, use_cache=True)
 
     def _try_flashinfer_prefill(
