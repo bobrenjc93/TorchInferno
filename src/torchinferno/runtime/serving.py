@@ -876,21 +876,38 @@ class ContinuousBatchEngine:
         # OFF by default. The reuse LOGIC is verified correct in isolation --
         # scripts/debug_reuse_engine.py reproduces the full engine path (prefill
         # graphs + online stepping + reuse) single-GPU and PASSES. Enabling it on
-        # the 8-rank server still CUDA-index-asserts, and a graphs-OFF diagnostic
-        # confirmed it is reuse-vs-TP, NOT the graphs: a request reaches the
-        # single-request fallback (_prefill_many -> _prefill_one -> _prefill_logits
-        # FI-eager) with row/seq_len state that indexes out of bounds across
-        # ranks. Next step: 8-GPU debug of that fallback's per-rank row/seq_len
-        # state. Enable via the env flag + pin_shared_prefix=False once fixed.
+        # the 8-rank server hangs/CUDA-asserts. Narrowed via env-gated diagnostics
+        # (TORCHINFERNO_REUSE_DEBUG): it is reuse-vs-TP, NOT the graphs. Ruled out:
+        # reuse-OFF + graphs-OFF + a single large request works fine on 8 ranks
+        # (so the _prefill_one -> _prefill_logits FI-eager fallback is sound). The
+        # hang appears ONLY with the reuse config (FI_REUSE=1 + pin_shared_prefix
+        # =False + prefix_rows>2) and resists single-GPU repro -- the standalone
+        # engine harness (scripts/debug_reuse_engine.py) PASSES. This is a subtle
+        # multi-rank collective-divergence bug that needs a dedicated instrumented
+        # 8-GPU session, not incremental loop runs. Enable via the env flag +
+        # pin_shared_prefix=False once that divergence is found.
+        _reuse_dbg = env_flag("TORCHINFERNO_REUSE_DEBUG", False)
+        _reuse_handled = 0
         if env_flag("TORCHINFERNO_CONTINUOUS_FI_REUSE", False) and prefix_batchable:
             unhandled: dict[tuple[int, int], list[tuple[int, ServingRequest, int, _ReusablePrefix]]] = {}
             for key, group in prefix_batchable.items():
                 reuse_active = self._prefill_flashinfer_reuse(group, step, events=events)
                 if reuse_active is not None:
                     active.extend(reuse_active)
+                    _reuse_handled += len(reuse_active)
                 else:
                     unhandled[key] = group
             prefix_batchable = unhandled
+        if _reuse_dbg:
+            import sys as _rdbg
+            _rk = getattr(self.model, "rank", 0)
+            _n_pref = sum(len(g) for g in prefix_batchable.values())
+            print(
+                f"[REUSE_DBG] rank={_rk} step={step} reuse_handled={_reuse_handled} "
+                f"unhandled_prefix={_n_pref} plain={len(plain_group)} "
+                f"cached_prefixes={len(self.reusable_prefixes)}",
+                file=_rdbg.stderr, flush=True,
+            )
 
         all_fi_requests: list[tuple[int, ServingRequest, int, _ReusablePrefix | None]] = []
         if not env_flag("TORCHINFERNO_CONTINUOUS_FLASHINFER_PREFILL_DISABLE", False):
@@ -2130,6 +2147,15 @@ class ContinuousBatchEngine:
         # Drop any stale pin; the caller re-pins after a successful re-store.
         self._pinned_prefix_routes.discard(entry.route_id)
         prefix_row = self._acquire_prefix_row()
+        if env_flag("TORCHINFERNO_REUSE_DEBUG", False):
+            import sys as _sd
+            print(
+                f"[STORE_DBG] rank={getattr(self.model, 'rank', 0)} "
+                f"store={'SKIP(no_row)' if prefix_row is None else prefix_row} "
+                f"ntoks={len(tokens)} free_prefix_rows={len(self._free_prefix_rows)} "
+                f"cached={len(self.reusable_prefixes)}",
+                file=_sd.stderr, flush=True,
+            )
         if prefix_row is None:
             return
         self._copy_prefix(source_row, prefix_row, len(tokens))
