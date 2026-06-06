@@ -4138,6 +4138,32 @@ class Llama3TensorParallelForCausalLM:
         )
         if not getattr(self, '_flashinfer_jit_warmed', False):
             self._flashinfer_jit_warmed = True
+        # One-shot op-level profile of a batched prefill to locate the prefill
+        # MFU sink (GEMMs vs FlashInfer attention vs allreduce). Gated; rank 0
+        # only; fires once for batch>1 so it does not perturb steady state.
+        if (
+            env_flag("TORCHINFERNO_PROFILE_PREFILL_ONCE", False)
+            and input_ids.size(0) > 1
+            and not getattr(self, "_prefill_profiled", False)
+            and getattr(self, "rank", 0) == 0
+        ):
+            self._prefill_profiled = True
+            import sys as _pp
+            from torch.profiler import profile as _tprof, ProfilerActivity as _PA
+            torch.cuda.synchronize(self.device)
+            with _tprof(activities=[_PA.CPU, _PA.CUDA]) as _prof:
+                _out = self._forward_step_flashinfer_compute(
+                    input_ids, cache, wrapper,
+                    q_lens=q_lens, write_positions=write_positions,
+                    logit_positions=logit_positions, row_indices=row_indices,
+                )
+                torch.cuda.synchronize(self.device)
+            print(
+                f"[PREFILL_PROF] batch={input_ids.size(0)} q={input_ids.size(1)}\n"
+                + _prof.key_averages().table(sort_by="cuda_time_total", row_limit=18),
+                file=_pp.stderr, flush=True,
+            )
+            return _out
         return self._forward_step_flashinfer_compute(
             input_ids, cache, wrapper,
             q_lens=q_lens, write_positions=write_positions,

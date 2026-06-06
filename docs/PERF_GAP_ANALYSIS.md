@@ -32,10 +32,30 @@ Ruled out as quick fixes (tested locally):
 - Joint (batch,q) prefill CUDA graphs already remove per-layer launch overhead
   (the 315ms is a graph replay = pure compute at 34% MFU).
 
-Real fix (deep): raise prefill MFU — fused QKV / fused gate-up GEMMs, better
-tiling for the TP-sharded dims (per-rank K/N are small, hurting efficiency), and
-true chunked prefill that interleaves with decode so early requests return their
-first token without waiting for the whole burst.
+Op-level profile (TORCHINFERNO_PROFILE_PREFILL_ONCE, one batched prefill,
+torch.profiler sorted by CUDA time) CORRECTS the earlier "raise GEMM MFU"
+framing — the sinks are:
+
+| component                       | CUDA time | %    |
+| :------------------------------ | --------: | ---: |
+| GEMMs (aten::mm, cuBLAS nvjet)  |    91.5ms | 52%  |
+| TP allreduce (NCCL ring, 160x)  |    53.9ms | 31%  |
+| add_rms_norm                    |    15.4ms |  9%  |
+| FlashInfer attention            |     2.0ms | 1.2% |
+
+Attention is NOT the sink (1.2%). Two real levers:
+- GEMMs (52%): already cuBLAS; QKV and gate-up are ALREADY fused (one GEMM
+  each). The MFU loss is the TP-sharded dims (per-rank K/N smaller). Limited
+  headroom without a different parallelism layout.
+- Allreduce (31%): runs as ncclDevKernel_AllReduce_Sum_bf16_RING_LL -- plain
+  NCCL ring, NOT the symm-mem one-shot allreduce the decode graphs use. On
+  8xH100 NVLink, symm-mem one/two-shot is typically faster than ring for these
+  sizes. ROUTING PREFILL ALLREDUCE THROUGH SYMM-MEM is the most actionable
+  single lever (2 allreduces/layer x 80 layers = 160 calls). This is the next
+  data-driven change after feaebc7 (max_active revert) validates.
+
+Also still: true chunked prefill interleaved with decode so early requests
+return their first token without waiting for the whole burst.
 
 ## Issue 2 — decode is memory-bound; throughput scales with batch
 
