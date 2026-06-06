@@ -1961,7 +1961,6 @@ class ContinuousBatchEngine:
                 next_token_tensor = self._sample_logits(logits[:, -1, :])
         self._record_model_call("decode", 1, tokens=1)
         next_token = int(next_token_tensor.item())
-        pass
         state.tokens.append(next_token)
         state.generated += 1
         state.last_token = next_token
@@ -2012,7 +2011,6 @@ class ContinuousBatchEngine:
         else:
             logits = self._ragged_decode_logits(input_ids, seq_lens, row_indices)
             next_token_tensor = self._sample_logits(logits[:, -1, :])
-        pass
         self._record_model_call("decode", n_padded, tokens=n_padded, ragged=True)
         if self.profile_timings:
             self.stats.decode_ragged_model_ms += (time.perf_counter() - model_start_s) * 1000.0
@@ -2375,8 +2373,6 @@ class ContinuousBatchEngine:
                 q_lens = torch.full((batch,), seq_len, device=input_ids.device, dtype=torch.long)
                 write_pos = torch.arange(seq_lens_val, seq_lens_val + seq_len, device=input_ids.device, dtype=torch.long).unsqueeze(0).expand(batch, -1)
                 logit_pos = torch.full((batch,), seq_len - 1, device=input_ids.device, dtype=torch.long)
-                import sys as _fid
-                _rank = getattr(self.model, 'rank', -1)
                 logits = fi_fwd(
                     input_ids, full_cache,
                     seq_lens=seq_lens, q_lens=q_lens,
