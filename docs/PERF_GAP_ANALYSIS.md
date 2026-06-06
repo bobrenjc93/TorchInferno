@@ -65,14 +65,23 @@ time is ~fixed and throughput ∝ concurrent rows. Profiling: decode_model launc
 2.3ms, but the blocking `next_token_tensor.cpu().tolist()` exposes ~18ms of
 GPU decode per step.
 
-Partial fix already in flight (commit `28f62c1`, UNVALIDATED): `max_active`
-48 → 128 decode rows + decode/prefill batch decoupling. Local: 64-concurrent
-aggregate throughput 623 → 1204 tok/s; 96-concurrent 1775 tok/s. Needs the
-benchmark to confirm.
+RESOLVED — symm-mem allreduce for batched decode (commit `c60e0bd`). Decode does
+160 small allreduces/step; on `max_batch=1` these fell back to NCCL ring. Raising
+to 256 routes them through symm-mem (~3x faster, latency-bound). A/B on 8xH100,
+max_active=48: 16-conc TPOT 38 → 27 ms (-29%), 32-conc 29 → 26 ms. 27ms is BELOW
+vllm's 32.5ms cross-benchmark TPOT.
 
-Remaining: the ~18ms per-step CPU sync is the GPU decode time exposed; cutting
-TPOT further needs async overlap (GPU token stash — keep sampled tokens on GPU,
-read back lagging) which has been correctness-fragile at scale.
+max_active SETTLED at 48 (commit `feaebc7`), re-confirmed AFTER symm-mem decode:
+max_active=128 + symm-mem still gives 45ms TPOT at 64-conc (loses to vllm 32.5),
+vs 48's 27ms (wins). The TPOT penalty of 128 is KV-read scaling with active rows,
+which symm-mem does NOT fix. 128 buys throughput (96-conc 2019 vs ~1200 tok/s)
+but at a TPOT loss -> net benchmark loss (it scored 0/20). Keep 48: winning TPOT
+beats chasing throughput. The throughput gap needs a different lever (chunked
+prefill, or KV-token-bounded admission), not a bigger fixed row cap.
+
+Remaining decode lever: the ~18ms per-step CPU sync is the GPU decode time
+exposed; cutting TPOT further needs async overlap (GPU token stash — keep sampled
+tokens on GPU, read back lagging) which has been correctness-fragile at scale.
 
 ## Issue 3 — prefix reuse is session-limited AND TP-buggy (low ROI)
 
