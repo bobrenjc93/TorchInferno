@@ -791,8 +791,13 @@ class ContinuousBatchEngine:
         min_free_rows = env_int("TORCHINFERNO_CONTINUOUS_ADMIT_MIN_FREE_ROWS", 1, minimum=1)
         if active_count > 0 and capacity < min(min_free_rows, self.max_active_requests):
             return []
-        per_step_cap = env_int("TORCHINFERNO_CONTINUOUS_ADMIT_PER_STEP_CAP", 16, minimum=0)
-        if per_step_cap > 0 and active_count >= per_step_cap:
+        # Always cap NEW admissions per step at per_step_cap. This decouples the
+        # prefill batch size (<= per_step_cap, where the prefill CUDA graphs live)
+        # from the decode batch size (active rows can grow to max_active across
+        # several steps). A larger decode batch lifts memory-bound decode
+        # throughput without forcing a giant single-step prefill.
+        per_step_cap = env_int("TORCHINFERNO_CONTINUOUS_ADMIT_PER_STEP_CAP", 48, minimum=0)
+        if per_step_cap > 0:
             capacity = min(capacity, per_step_cap)
         min_ready_requests = env_int("TORCHINFERNO_CONTINUOUS_ADMIT_MIN_READY_REQUESTS", 1, minimum=1)
         if active_count > 0 and min_ready_requests > 1:

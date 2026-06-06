@@ -1773,8 +1773,16 @@ class OpenAICompletionEngine:
         prompt_tokens = env_int("TORCHINFERNO_OPENAI_WARMUP_PROMPT_TOKENS", 32, minimum=1)
         # Decode touches only active rows (<= max_active), addressed via row
         # indices, so warm the active-range buckets, not the full cache size.
+        # Include EVERY power of two up to the cache size: the ragged decode path
+        # rounds the active count up to the next pow2 bucket, so a missing pow2
+        # (e.g. 64 when max_active=128) drops that range to eager decode.
+        _pow2 = set()
+        _p = 1
+        while _p <= cache_batch:
+            _pow2.add(_p)
+            _p *= 2
         batch_sizes = sorted(
-            {1, 2, 4, 8, 16, 32, max_active, cache_batch}
+            (_pow2 | {max_active, cache_batch})
             & set(range(1, cache_batch + 1))
         )
         with _tensor_parallel_symm_mem_allreduce_scope(
@@ -2343,7 +2351,13 @@ class OpenAICompletionEngine:
                 self._token_budget_step_state = None
 
     def _online_serving_max_active(self) -> int:
-        cap = env_int("TORCHINFERNO_OPENAI_TP_ONLINE_MAX_ACTIVE", 48, minimum=1)
+        # Decode is memory-bound (reads all weights every step regardless of
+        # batch), so throughput scales with the number of concurrently-decoding
+        # rows. 128 rows lets high-concurrency decode benchmarks (long_output,
+        # multi_turn, self_consistency) run a much larger decode batch than the
+        # old 48. Prefill batch is decoupled and stays bounded by the per-step
+        # admission cap so prefill graphs/compute don't blow up.
+        cap = env_int("TORCHINFERNO_OPENAI_TP_ONLINE_MAX_ACTIVE", 128, minimum=1)
         effective = _effective_openai_max_batch_size(self.model, self.device, self.max_batch_size)
         return max(1, min(cap, effective))
 
