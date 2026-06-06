@@ -2036,25 +2036,37 @@ class OpenAICompletionEngine:
         n_rows = len(getattr(layer0, "_seq_lens", [])) if layer0 is not None else max_active
         if n_rows <= 0:
             n_rows = max_active
-        # Every-integer batch buckets up to a cap: replay picks the smallest
-        # captured bucket >= the request batch, so per-integer steps eliminate
-        # batch-padding compute waste (full-forward prefill is partly compute-
-        # bound, and even rounding 6->8 wastes more than the launch overhead it
-        # saves). Capped at existing cache rows and a configurable max.
-        cap = min(max_active, n_rows, env_int("TORCHINFERNO_FI_PREFILL_GRAPH_MAX_BATCH", 16, minimum=1))
-        batch_buckets = sorted(set(range(1, cap + 1)))
-        # Two q buckets keep the graph count at ~32 (the count proven to fit
-        # alongside weights+KV on 8xH100; doubling it OOMs a rank during capture).
-        # 256 covers short prompts (a tiny prompt at batch=16 pads to 4096 tokens
-        # vs 8192 at q=512), 768 covers long prompts; replay picks the smaller.
-        q_buckets = [
+        # Joint (batch, q) bucketing under a token budget. A full-forward prefill
+        # graph's cost is ~ batch*q tokens, so the useful graphs live on the
+        # hyperbola batch*q <= budget: LARGE batch + SMALL q (tiny prompts at high
+        # concurrency, e.g. long_output's 64x ~20-token requests) and SMALL batch
+        # + LARGE q (long prompts at lower per-prefill concurrency, e.g. few_shot).
+        # The explosive corner (large batch AND large q, e.g. 48x768=36864 tokens)
+        # is excluded -- it neither fits memory nor finishes fast. Replay picks
+        # the minimal-area captured (b,q) covering the request; misses fall back
+        # to eager. All inputs (cap, max_seq, env) are rank-invariant so every
+        # rank builds the identical pair list.
+        cap = min(max_active, n_rows, env_int("TORCHINFERNO_FI_PREFILL_GRAPH_MAX_BATCH", 48, minimum=1))
+        batch_candidates = [b for b in (1, 2, 4, 8, 16, 24, 32, 48) if b <= cap]
+        if cap not in batch_candidates:
+            batch_candidates.append(cap)
+        batch_candidates = sorted(set(batch_candidates))
+        q_candidates = [
             int(x) for x in os.environ.get(
-                "TORCHINFERNO_FI_PREFILL_GRAPH_Q_BUCKETS", "256,768"
+                "TORCHINFERNO_FI_PREFILL_GRAPH_Q_BUCKETS", "64,256,768"
             ).split(",") if x.strip()
         ]
         if max_seq > 0:
-            q_buckets = [q for q in q_buckets if q <= max_seq]
-        q_buckets = sorted(set(q_buckets), reverse=True)
+            q_candidates = [q for q in q_candidates if q <= max_seq]
+        q_candidates = sorted(set(q_candidates))
+        token_budget = env_int("TORCHINFERNO_FI_PREFILL_GRAPH_TOKEN_BUDGET", 8192, minimum=1)
+        # Build the (b, q) pairs to capture. Iterate q descending so the largest,
+        # most memory-hungry graphs are attempted first under the memory guard.
+        pairs: list[tuple[int, int]] = []
+        for q in sorted(q_candidates, reverse=True):
+            for b in batch_candidates:
+                if b * q <= token_budget:
+                    pairs.append((b, q))
         min_free_gb = env_float("TORCHINFERNO_FI_PREFILL_GRAPH_MIN_FREE_GB", 8.0, minimum=0.0)
         world = dist.get_world_size() if (dist.is_available() and dist.is_initialized()) else 1
 
@@ -2074,33 +2086,28 @@ class OpenAICompletionEngine:
             return bool(flag.item())
 
         captured = 0
-        stop = False
-        for q in q_buckets:
-            if stop:
+        for b, q in pairs:
+            # Collective stop check: identical decision on every rank.
+            if agreed_free_gb() < min_free_gb:
+                print(
+                    f"[WARMUP] FI prefill graph: stopping (low free mem) after {captured}",
+                    file=_g.stderr, flush=True,
+                )
                 break
-            for b in batch_buckets:
-                # Collective stop check: identical decision on every rank.
-                if agreed_free_gb() < min_free_gb:
-                    stop = True
-                    print(
-                        f"[WARMUP] FI prefill graph: stopping (low free mem) after {captured}",
-                        file=_g.stderr, flush=True,
-                    )
-                    break
-                _reset_generation_cache(cache)
+            _reset_generation_cache(cache)
+            local_ok = False
+            try:
+                local_ok = bool(capture(cache, b, q))
+            except Exception as _ce:
+                print(f"[WARMUP] FI prefill graph capture bs={b} q={q}: {_ce}", file=_g.stderr, flush=True)
                 local_ok = False
-                try:
-                    local_ok = bool(capture(cache, b, q))
-                except Exception as _ce:
-                    print(f"[WARMUP] FI prefill graph capture bs={b} q={q}: {_ce}", file=_g.stderr, flush=True)
-                    local_ok = False
-                _reset_generation_cache(cache)
-                # Collective success check: keep the graph only if EVERY rank
-                # captured it, else drop it everywhere so the sets stay identical.
-                if agreed_ok(local_ok):
-                    captured += 1
-                elif graphs is not None:
-                    graphs.pop((b, q), None)
+            _reset_generation_cache(cache)
+            # Collective success check: keep the graph only if EVERY rank
+            # captured it, else drop it everywhere so the sets stay identical.
+            if agreed_ok(local_ok):
+                captured += 1
+            elif graphs is not None:
+                graphs.pop((b, q), None)
         _dt = (_gt.perf_counter() - _t0) * 1000.0
         print(f"[WARMUP] FlashInfer prefill graphs: {captured} captured in {_dt:.0f}ms", file=_g.stderr, flush=True)
         self._fi_prefill_graph_count = captured
