@@ -2043,9 +2043,13 @@ class OpenAICompletionEngine:
         # saves). Capped at existing cache rows and a configurable max.
         cap = min(max_active, n_rows, env_int("TORCHINFERNO_FI_PREFILL_GRAPH_MAX_BATCH", 16, minimum=1))
         batch_buckets = sorted(set(range(1, cap + 1)))
+        # Two q buckets keep the graph count at ~32 (the count proven to fit
+        # alongside weights+KV on 8xH100; doubling it OOMs a rank during capture).
+        # 256 covers short prompts (a tiny prompt at batch=16 pads to 4096 tokens
+        # vs 8192 at q=512), 768 covers long prompts; replay picks the smaller.
         q_buckets = [
             int(x) for x in os.environ.get(
-                "TORCHINFERNO_FI_PREFILL_GRAPH_Q_BUCKETS", "512,768"
+                "TORCHINFERNO_FI_PREFILL_GRAPH_Q_BUCKETS", "256,768"
             ).split(",") if x.strip()
         ]
         if max_seq > 0:
