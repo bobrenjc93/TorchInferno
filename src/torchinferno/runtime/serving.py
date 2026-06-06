@@ -871,6 +871,23 @@ class ContinuousBatchEngine:
 
         plain_group = [item for group in batchable.values() for item in group]
 
+        # FlashInfer-native prefix reuse for cached-prefix hits; on failure the
+        # group falls back into the full-prompt path below (returns None).
+        # OFF by default: the reuse LOGIC is verified correct in isolation
+        # (scripts/debug_reuse_engine.py), but enabling it server-side hit a
+        # CUDA index assert in the prefill-graph/TP interaction that has not yet
+        # been reproduced in the standalone harness. Enable with the env flag
+        # plus pin_shared_prefix=False once that interaction is debugged.
+        if env_flag("TORCHINFERNO_CONTINUOUS_FI_REUSE", False) and prefix_batchable:
+            unhandled: dict[tuple[int, int], list[tuple[int, ServingRequest, int, _ReusablePrefix]]] = {}
+            for key, group in prefix_batchable.items():
+                reuse_active = self._prefill_flashinfer_reuse(group, step, events=events)
+                if reuse_active is not None:
+                    active.extend(reuse_active)
+                else:
+                    unhandled[key] = group
+            prefix_batchable = unhandled
+
         all_fi_requests: list[tuple[int, ServingRequest, int, _ReusablePrefix | None]] = []
         if not env_flag("TORCHINFERNO_CONTINUOUS_FLASHINFER_PREFILL_DISABLE", False):
             for group in prefix_batchable.values():
@@ -2476,6 +2493,107 @@ class ContinuousBatchEngine:
                 row=row,
                 last_token=next_token,
                 seq_len=seq_len,
+                prefix_hit_tokens=prefix_hit_tokens,
+                started_step=step,
+            )
+            self._record_token_event(events, state, next_token, step, finished=self._should_finish_before_decode(state))
+            active.append(state)
+        return active
+
+    def _prefill_flashinfer_reuse(
+        self,
+        group: list[tuple[int, "ServingRequest", int, "_ReusablePrefix"]],
+        step: int,
+        *,
+        events: list["ServingTokenEvent"] | None = None,
+    ) -> list["_ActiveRequest"] | None:
+        # FlashInfer-native prefix reuse: copy cached prefix KV into each row,
+        # then prefill only the suffix (seq_lens=prefix_len). Empty suffix (whole
+        # prompt cached) just samples the cached logits. FlashInfer-cache-safe.
+        forward_fi = getattr(self.model, "forward_step_flashinfer", None)
+        if forward_fi is None:
+            return None
+        try:
+            import flashinfer  # noqa: F401
+        except ImportError:
+            return None
+        max_seq = self._cache_max_seq_len()
+        for _idx, request, hit, reusable in group:
+            if reusable is None or hit <= 0 or hit > len(request.prompt):
+                return None
+            if max_seq is not None and len(request.prompt) > max_seq:
+                return None
+            if reusable.row < 0:
+                return None
+        cache = self._require_cache()
+        rows: list[int] = []
+        try:
+            for _idx, request, hit, reusable in group:
+                row = self._acquire_active_row()
+                self._copy_prefix(reusable.row, row, hit)
+                rows.append(row)
+                self.stats.prefix_reuse_requests += 1
+                self.stats.prefix_reuse_tokens += hit
+        except Exception:
+            for row in rows:
+                self._release_active_row(row)
+            return None
+
+        n = len(group)
+        next_tokens: list[int | None] = [None] * n
+        out_logits: list[Tensor | None] = [None] * n
+        suffix_idx = [i for i, (_x, req, hit, _r) in enumerate(group) if len(req.prompt) > hit]
+        full_idx = [i for i, (_x, req, hit, _r) in enumerate(group) if len(req.prompt) <= hit]
+        try:
+            if suffix_idx:
+                suffixes = [list(group[i][1].prompt[group[i][2]:]) for i in suffix_idx]
+                msl = max(len(s) for s in suffixes)
+                padded = [s + [0] * (msl - len(s)) for s in suffixes]
+                b = len(suffix_idx)
+                input_ids = torch.tensor(padded, dtype=torch.long, device=self.device)
+                q_lens = torch.tensor([len(s) for s in suffixes], dtype=torch.long, device=self.device)
+                seq_lens = torch.tensor([group[i][2] for i in suffix_idx], dtype=torch.long, device=self.device)
+                ris = torch.tensor([rows[i] for i in suffix_idx], dtype=torch.long, device=self.device)
+                wpos = torch.tensor(
+                    [[group[i][2] + j for j in range(msl)] for i in suffix_idx],
+                    dtype=torch.long, device=self.device,
+                )
+                lpos = torch.tensor([len(s) - 1 for s in suffixes], dtype=torch.long, device=self.device)
+                logits = forward_fi(
+                    input_ids, cache, seq_lens=seq_lens, q_lens=q_lens,
+                    write_positions=wpos, logit_positions=lpos, row_indices=ris,
+                )
+                self._record_model_call("prefill", b, tokens=int(q_lens.sum().item()))
+                toks = self._sample_logits(logits[:, -1, :]).detach().cpu().tolist()
+                for k, i in enumerate(suffix_idx):
+                    next_tokens[i] = int(toks[k])
+                    out_logits[i] = logits[k:k + 1]
+            for i in full_idx:
+                cached = group[i][3].logits.to(self.device)
+                next_tokens[i] = int(self._sample_logits(cached[:, -1, :]).item())
+                out_logits[i] = cached
+        except Exception:
+            for row in rows:
+                self._release_active_row(row)
+            return None
+
+        self.stats.prefill_prefix_reuse_batches += 1
+        active: list[_ActiveRequest] = []
+        for i, (original_index, request, prefix_hit_tokens, _reusable) in enumerate(group):
+            row = rows[i]
+            self._set_cache_row_seq_len(row, len(request.prompt))
+            self._remember_row_seq_len(row, len(request.prompt))
+            next_token = int(next_tokens[i])
+            if out_logits[i] is not None:
+                self._store_reusable_prefix(request.request_id, request.prompt, row, out_logits[i])
+            state = _ActiveRequest(
+                original_index=original_index,
+                request=request,
+                tokens=[*request.prompt, next_token],
+                generated=1,
+                row=row,
+                last_token=next_token,
+                seq_len=len(request.prompt),
                 prefix_hit_tokens=prefix_hit_tokens,
                 started_step=step,
             )
