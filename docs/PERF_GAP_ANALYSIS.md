@@ -25,12 +25,24 @@ HEAD: min TTFT 146ms (≈ vllm), but **median 2135ms** — 63 of 64 requests bun
 prefill graph does 6144 tokens in **315ms ≈ 34% MFU**. vllm prefills the same
 64x640 with ~145ms median TTFT — roughly **2x better GEMM MFU plus chunking**.
 
-Ruled out as quick fixes (tested locally):
-- Lowering `prefill_token_budget` 32768 → 5120: median TTFT unchanged (~2117ms),
-  throughput WORSE (557 → 463 tok/s). Total prefill compute is the floor;
-  splitting it just adds overhead. **Do not lower the budget.**
+Ruled out as quick fixes (tested locally — ALL scheduling/admission knobs):
+- Lowering `prefill_token_budget` 32768 → 5120 (burst): median TTFT unchanged
+  (~2117ms), throughput WORSE (557 → 463). Total prefill compute is the floor.
+- `prefill_token_budget` 32768 → 1280 (~2 reqs/step, STREAMING 64-conc 640-tok):
+  much WORSE — TTFT p50 1855 → 4843ms, throughput 126 → 75. Small prefill
+  batches lose GEMM efficiency; staggering does not beat batching. **Do not
+  lower the budget.**
+- max_active 48 vs 128 (streaming few_shot): 48 is better/tied on TTFT
+  (1855 vs 1927) AND much better TPOT (44 vs 96). Row cap is not the TTFT lever.
 - Joint (batch,q) prefill CUDA graphs already remove per-layer launch overhead
   (the 315ms is a graph replay = pure compute at 34% MFU).
+
+Net: NO scheduling/config knob improves few_shot TTFT. It is bounded by prefill
+compute (MFU ~34%, ~2x vllm) serialized through the single GPU pipeline for the
+whole arriving batch. The only real levers are (a) higher prefill MFU -- and QKV
+/ gate-up GEMMs are ALREADY fused, so this means FP8 GEMMs or a different
+parallelism layout, both major; or (b) prefix caching to shrink the prefill,
+which is session-wiped today (needs a persistent engine). Both are deep.
 
 Op-level profile (TORCHINFERNO_PROFILE_PREFILL_ONCE, one batched prefill,
 torch.profiler sorted by CUDA time) CORRECTS the earlier "raise GEMM MFU"
