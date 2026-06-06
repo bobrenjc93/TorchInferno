@@ -873,11 +873,15 @@ class ContinuousBatchEngine:
 
         # FlashInfer-native prefix reuse for cached-prefix hits; on failure the
         # group falls back into the full-prompt path below (returns None).
-        # OFF by default: the reuse LOGIC is verified correct in isolation
-        # (scripts/debug_reuse_engine.py), but enabling it server-side hit a
-        # CUDA index assert in the prefill-graph/TP interaction that has not yet
-        # been reproduced in the standalone harness. Enable with the env flag
-        # plus pin_shared_prefix=False once that interaction is debugged.
+        # OFF by default. The reuse LOGIC is verified correct in isolation --
+        # scripts/debug_reuse_engine.py reproduces the full engine path (prefill
+        # graphs + online stepping + reuse) single-GPU and PASSES. Enabling it on
+        # the 8-rank server still CUDA-index-asserts, and a graphs-OFF diagnostic
+        # confirmed it is reuse-vs-TP, NOT the graphs: a request reaches the
+        # single-request fallback (_prefill_many -> _prefill_one -> _prefill_logits
+        # FI-eager) with row/seq_len state that indexes out of bounds across
+        # ranks. Next step: 8-GPU debug of that fallback's per-rank row/seq_len
+        # state. Enable via the env flag + pin_shared_prefix=False once fixed.
         if env_flag("TORCHINFERNO_CONTINUOUS_FI_REUSE", False) and prefix_batchable:
             unhandled: dict[tuple[int, int], list[tuple[int, ServingRequest, int, _ReusablePrefix]]] = {}
             for key, group in prefix_batchable.items():
@@ -2356,6 +2360,16 @@ class ContinuousBatchEngine:
                     seq_lens_val = int(cache.seq_len)
                 except Exception:
                     pass
+                # Reject writes past the row capacity BEFORE launching the kernel:
+                # a KV scatter at columns [seq_lens_val, seq_lens_val+seq_len) that
+                # exceeds max_seq is a device-side index assert that kills every TP
+                # rank. Raise a catchable error so one request fails instead.
+                _ms = self._cache_max_seq_len()
+                if _ms is not None and seq_lens_val + seq_len > _ms:
+                    raise RuntimeError(
+                        f"prefill write past cache: seq_lens={seq_lens_val} + "
+                        f"q={seq_len} > max_seq={_ms}"
+                    )
                 row_indices = torch.tensor(row_list[:batch], device=input_ids.device, dtype=torch.long)
                 seq_lens = torch.full((batch,), seq_lens_val, device=input_ids.device, dtype=torch.long)
                 q_lens = torch.full((batch,), seq_len, device=input_ids.device, dtype=torch.long)
