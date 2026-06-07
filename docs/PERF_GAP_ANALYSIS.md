@@ -1,5 +1,18 @@
 # TorchInferno vs vLLM/sglang — Performance Gap Analysis (Llama-3.1-70B, 8xH100)
 
+## LATEST RUN 20260607_101328 (built 73aa664, BEFORE rope+KV-bounded): 1/20
+
+Dropped 2/20 -> 1/20, NOT from our regression: vllm IMPROVED multi_turn TPOT
+67.6 -> 43.5 (a moving target; likely FP8-KV / paged long-context decode) and took
+that cell. Our only remaining cell is few_shot TPOT (52.9 vs vllm 53.6 -- razor-thin
+0.7ms). Closest unflipped: self_consistency TTFT (250 vs 200, 1.25x) and E2E
+(350 vs 219). The build is one commit behind my rope fusion (c3ec55c) -- so rope
+(secures few_shot TPOT, +~2.5ms margin) and KV-bounded concurrency (targets
+self_consistency TTFT, A/B showed ~2x) are QUEUED and should land next run.
+multi_turn TPOT (now 20ms behind vllm) and long_output TPOT (32 vs 15) need
+FP8-KV / paged long-context decode -- deep. The TTFT/throughput rows (3-9x) remain
+the architectural (paged-KV concurrency + FP8 prefill) gap.
+
 ## EXECUTIVE SUMMARY (state of the gap, distilled)
 
 Score: stable 2/20 (vllm 15-16/20) across THREE consecutive runs (_021340,
