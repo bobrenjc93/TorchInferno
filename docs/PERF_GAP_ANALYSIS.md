@@ -31,6 +31,27 @@ version of this; paged KV is required for the long-context (multi_turn/long_outp
 cells. This is THE prioritized deep lever (one change addresses TTFT + TPOT +
 throughput simultaneously).
 
+PAGED-KV FEASIBILITY FULLY DE-RISKED (2026-06-07, foundation built + validated,
+NOT yet wired into serving):
+- runtime/paged.py LayeredPagedKVCache: multi-layer pool, ONE block table per
+  request shared across all layers, per-layer NHD storage
+  [num_pages, 2, page_size, kv_heads, head_dim]; reserve/extend/write_layer/
+  flashinfer_page_table/free. (vLLM-standard layout.)
+- CORRECTNESS: GPU test feeds it through flashinfer.BatchDecodeWithPagedKVCacheWrapper
+  and matches a dense SDPA reference across page-crossing lengths
+  (test_layered_paged_kv_cache_flashinfer_decode_matches_dense).
+- CONCURRENCY VIABILITY (scripts/bench_paged_decode_concurrency.py): paged decode
+  ATTENTION is sub-linear in row count -- 48->512 rows @2048-tok ctx costs only
+  3.95x attention time (per-row 2.66->0.99us), staying ~5% of the GEMM-bound step;
+  512 long-context rows fit in ~43GB/GPU. No attention wall at high concurrency.
+- CUDA-graph: CUDAGraphBatchDecodeWithPagedKVCacheWrapper (decode_runner.py)
+  already supports paged page-tables as graph inputs -- no graph blocker.
+REMAINING (focused multi-day integration, now de-risked): TP-shard the pool at
+serving start -> route the FI decode/prefill plan through flashinfer_page_table +
+layer_kv with small page_size -> scheduler admission by free pages (not the 48-row
+cap) -> dynamic page-tables as decode-graph inputs. Default path stays dense behind
+a flag until benchmark-validated.
+
 ## EXECUTIVE SUMMARY (state of the gap, distilled)
 
 Score: stable 2/20 (vllm 15-16/20) across THREE consecutive runs (_021340,
