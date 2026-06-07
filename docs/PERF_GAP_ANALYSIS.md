@@ -208,9 +208,25 @@ calls for is a KV-TOKEN-BOUNDED decode batch: allow many rows when contexts are
 short (long_output -> big batch, weight-bound, TPOT-safe) and few rows when
 contexts are long (multi_turn -> avoid KV-bound TPOT blowup). That needs a real
 admission change AND resolves the median-vs-tail question only on the live
-benchmark. Per-request TTFT FLOOR is ~500ms even with no queue (vllm 66ms) --
-that floor is admission/scheduling overhead (decode_quantum drain + batcher),
-a separate gap from queueing.
+benchmark. Per-request TTFT FLOOR is ~500ms even with no queue (vllm 66ms).
+
+ADAPTIVE DECODE QUANTUM TESTED + REVERTED (2026-06-07). The ~500ms floor was
+hypothesized to be the decode_quantum drain (drain_ready admits arrivals only
+between 16-step quanta, so a mid-quantum arrival waits ~16 steps ~= 480ms). Built
+an adaptive quantum (short while arrivals flow, full 16 once the queue dries;
+quantum is broadcast so TP stays in lockstep) behind
+TORCHINFERNO_OPENAI_TP_ONLINE_ADAPTIVE_QUANTUM and tested on the live 8xH100.
+RESULT: with ramp_quantum=1 the batcher admits EVERY step, yet warm-server TTFT
+stayed 648-657ms across 3 runs (48-conc, short prompts; TPOT fine at 17ms). So
+the quantum is NOT the bottleneck -- the floor is effective concurrency /
+row-turnaround: max_active=48 caps concurrent decodes, the 1000-req queue drains
+only as rows finish, and at capacity drain_ready admits 0 so the ramp signal
+never fires. The variant that WOULD help row-turnaround (ramp while the queue is
+non-empty) keeps the quantum short for the whole benchmark -> tanks TPOT (our
+cells). CONCLUSION: quantum tuning, fixed or adaptive, cannot win TTFT; the only
+lever is KV-token-bounded admission (above) to raise effective concurrency
+WITHOUT raising per-step cost, exactly what vllm's paged KV gives it for free
+(TTFT 66-205, throughput 18 vs our 6). Code reverted; no flag left behind.
 
 ## BREAKTHROUGH: Marlin int4 decode kernel works via vLLM (scripts/bench_marlin_int4.py)
 
