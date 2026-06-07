@@ -91,6 +91,59 @@ def test_paged_kv_cache_flashinfer_page_table() -> None:
     torch.testing.assert_close(last_page_len, torch.tensor([1, 4, 3], dtype=torch.int32))
 
 
+def test_layered_paged_kv_cache_shared_block_table_and_writes() -> None:
+    from torchinferno.runtime.paged import LayeredPagedKVCache
+
+    cache = LayeredPagedKVCache(
+        num_layers=3,
+        num_pages=8,
+        page_size=4,
+        num_key_value_heads=2,
+        head_dim=2,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+    # Reserve 6 tokens for req "a" -> 2 pages (shared by all 3 layers).
+    start = cache.extend("a", 6)
+    assert start == 0
+    assert cache.sequence_length("a") == 6
+    seq_pages = cache._sequences["a"].page_ids
+    assert len(seq_pages) == 2  # ceil(6/4)
+
+    # Distinct K/V per layer; verify per-layer round-trip across the page boundary.
+    for layer in range(3):
+        keys = torch.arange(6 * 2 * 2, dtype=torch.float32).view(6, 2, 2) + layer * 1000
+        values = keys + 500
+        cache.write_layer(layer, "a", keys, values, start=0)
+        mk, mv = cache.materialize_layer(layer, "a")
+        torch.testing.assert_close(mk, keys)
+        torch.testing.assert_close(mv, values)
+
+    # Second request shares the pool; page table is layer-independent.
+    cache.extend("b", 3)  # 1 page
+    indptr, indices, last_page_len = cache.flashinfer_page_table(["a", "b"])
+    torch.testing.assert_close(indptr, torch.tensor([0, 2, 3], dtype=torch.int32))
+    torch.testing.assert_close(last_page_len, torch.tensor([2, 3], dtype=torch.int32))
+    assert indices.tolist() == cache._sequences["a"].page_ids + cache._sequences["b"].page_ids
+
+    # Free returns pages to the pool for reuse.
+    free_before = len(cache.free_pages)
+    cache.free("a")
+    assert len(cache.free_pages) == free_before + 2
+
+
+def test_layered_paged_kv_cache_out_of_pages_raises() -> None:
+    from torchinferno.runtime.paged import LayeredPagedKVCache
+
+    cache = LayeredPagedKVCache(
+        num_layers=1, num_pages=2, page_size=4, num_key_value_heads=1,
+        head_dim=1, device=torch.device("cpu"), dtype=torch.float32,
+    )
+    cache.extend("a", 8)  # exactly 2 pages
+    with pytest.raises(RuntimeError, match="out of pages"):
+        cache.extend("b", 1)
+
+
 def test_paged_kv_cache_alias_prefix_is_copy_on_write() -> None:
     cache = PagedKVCache(
         num_pages=4,
