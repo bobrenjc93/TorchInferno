@@ -141,3 +141,20 @@ one. (Decode throughput vs concurrency is in the same script but needs free GPUs
 a co-tenant 8-GPU job took the machine; the concurrency win is already kernel-benched
 in bench_paged_decode_concurrency.py.) The model-side paged forward is now
 real-model-validated; only the serving-engine wiring remains.
+
+## UPDATE 2026-06-07 (later): real-70B THROUGHPUT win demonstrated (8.7x)
+
+scripts/bench_paged_serving_70b.py completed on the real Llama-3.1-70B TP8:
+- correctness: paged decode == dense, rel=0.0118 (bf16-level).
+- decode throughput vs concurrency (paged):
+    N= 48: 330  tok/s (145.7 ms/step)   <- the dense cache's ~48-row cap
+    N=128: 817  tok/s (156.6 ms/step)   2.5x
+    N=256: 1698 tok/s (150.8 ms/step)   5.1x
+    N=512: 2880 tok/s (177.8 ms/step)   8.7x
+So 10.7x concurrency -> 8.7x decode throughput with step time only +22% (nearly
+flat = weight-bound, as predicted). The dense cache caps at ~48 rows; paging unlocks
+512 long-context rows at ~8.7x throughput. This is the capstone validation of the
+paged-KV thesis ON THE REAL MODEL -- the queueing-bound throughput/TTFT cells
+(long_output throughput 20 vs vllm 58, multi_turn/tree TTFT, etc.) are exactly what
+this unlocks. The model-side paged forward is fully validated (correctness + the
+concurrency win) on the actual 70B; only the serving-engine wiring remains.
