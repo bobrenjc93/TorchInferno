@@ -6,14 +6,25 @@ includes ALL current functional work; the 4 commits after it on main are
 docs/harness only). Local measurements are from `scripts/test_stream.py`
 (benchmark-faithful closed-loop streaming) against the current online batcher.
 
-## Headline gaps (cross-benchmark medians, run 20260607_000945)
+## Headline gaps (cross-benchmark medians, run 20260607_021340)
 
 | Metric | torchinferno | vllm | sglang |
 | :-- | --: | --: | --: |
-| TTFT median (ms) | 440.7 | 131.0 | 139.1 |
-| TPOT median (ms) | 34.3 | 30.0 | 47.9 |
-| throughput (tok/s) | 6.5 | 18.1 | 12.4 |
-| **score** | **1/20** | **16/20** | **2/20** |
+| TTFT median (ms) | 515.1 | 127.8 | 133.6 |
+| TPOT median (ms) | 36.5 | 33.8 | 48.1 |
+| throughput (tok/s) | 6.1 | 18.3 | 12.8 |
+| **score** | **2/20** | **15/20** | **2/20** |
+
+BENCHMARK VARIANCE WARNING. The score moved 1/20 -> 2/20 between runs
+20260607_000945 and _021340 with our code FUNCTIONALLY UNCHANGED (build 7d2331a
+differs from the 1/20 build c60e0bd only by docs/flag-off commits). The new cell
+is multi_turn TPOT: us 63.3 vs vllm 67.9 -- but vllm's multi_turn TPOT was 52.5
+the prior run, i.e. it WOBBLED UP ~15ms. We did not get faster; vllm's number
+rose above ours. Run-to-run TPOT variance is ~±15ms. Our three TPOT contests are
+all WITHIN that noise band: few_shot 54.8 vs 57.8 (3ms), multi_turn 63.3 vs 67.9
+(4.6ms), tree_of_thought 32.1 vs 28.4 (3.7ms BEHIND). So the score will fluctuate
+~1-3/20 on noise alone, and a real/ROBUST TPOT-cell win needs margin beyond the
+noise (~15ms) -- which needs the kernel-blocked decode speedup, not tuning.
 
 ## Benchmark metric definitions (inference_bench/benchmarks/base.py) -- READ
 
