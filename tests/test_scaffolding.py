@@ -132,6 +132,58 @@ def test_layered_paged_kv_cache_shared_block_table_and_writes() -> None:
     assert len(cache.free_pages) == free_before + 2
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="FlashInfer paged decode needs CUDA")
+def test_layered_paged_kv_cache_flashinfer_decode_matches_dense() -> None:
+    # End-to-end de-risk of the paged-KV foundation: prove LayeredPagedKVCache's
+    # NHD storage (layer_kv) + flashinfer_page_table feed FlashInfer paged decode
+    # and match a dense per-sequence SDPA reference, across varied lengths that
+    # cross page boundaries. This validates the layout the eventual llama3-TP
+    # migration will rely on -- before any serving-path wiring.
+    import math as _math
+
+    flashinfer = pytest.importorskip("flashinfer")
+    from torchinferno.runtime.paged import LayeredPagedKVCache
+
+    dev = torch.device("cuda")
+    torch.manual_seed(0)
+    nqo, nkv, hd, page_size = 8, 2, 64, 16  # GQA 8/2, head_dim 64
+    cache = LayeredPagedKVCache(
+        num_layers=1, num_pages=64, page_size=page_size,
+        num_key_value_heads=nkv, head_dim=hd, device=dev, dtype=torch.bfloat16,
+    )
+    lengths = {"a": 20, "b": 33, "c": 7}  # pages: 2, 3, 1 (last pages partial)
+    refs: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+    for rid, n in lengths.items():
+        cache.extend(rid, n)
+        k = torch.randn(n, nkv, hd, device=dev, dtype=torch.bfloat16)
+        v = torch.randn(n, nkv, hd, device=dev, dtype=torch.bfloat16)
+        cache.write_layer(0, rid, k, v, start=0)
+        refs[rid] = (k, v)
+
+    rids = ["a", "b", "c"]
+    indptr, indices, last_page_len = cache.flashinfer_page_table(rids)
+    workspace = torch.empty(64 * 1024 * 1024, dtype=torch.uint8, device=dev)
+    dw = flashinfer.BatchDecodeWithPagedKVCacheWrapper(workspace, kv_layout="NHD")
+    dw.plan(
+        indptr=indptr, indices=indices, last_page_len=last_page_len,
+        num_qo_heads=nqo, num_kv_heads=nkv, head_dim=hd, page_size=page_size,
+        q_data_type=torch.bfloat16,
+    )
+    q = torch.randn(len(rids), nqo, hd, device=dev, dtype=torch.bfloat16)
+    out = dw.run(q, cache.layer_kv(0))  # [batch, nqo, hd]
+
+    scale = 1.0 / _math.sqrt(hd)
+    rep = nqo // nkv
+    for i, rid in enumerate(rids):
+        k, v = refs[rid]
+        kx = k.repeat_interleave(rep, dim=1).float()  # [n, nqo, hd]
+        vx = v.repeat_interleave(rep, dim=1).float()
+        qi = q[i].float()  # [nqo, hd]
+        scores = torch.einsum("hd,nhd->hn", qi, kx) * scale
+        ref = torch.einsum("hn,nhd->hd", scores.softmax(-1), vx)
+        torch.testing.assert_close(out[i].float(), ref, atol=3e-2, rtol=3e-2)
+
+
 def test_layered_paged_kv_cache_out_of_pages_raises() -> None:
     from torchinferno.runtime.paged import LayeredPagedKVCache
 
