@@ -153,6 +153,15 @@ Implications:
   TPOT cells (tree 2.6ms, multi_turn 7.4ms) are unreachable by quantization
   without a custom dequant-GEMM kernel OR a torchao rebuild against our PyTorch.
   Decode stays bf16-GPU-bound (~15ms/step).
+  W4A16 int4 (_weight_int4pack_mm, gpt-fast tinygemm) checked too -- it reveals
+  WHY quant cannot help us: it is tuned for M=1 single-stream decode. gate_up
+  speedup vs M: M<=8 ~1.0x, M=16 0.67x, M=48 0.24x. Our server decodes at batch
+  16-64, where the weight read is ALREADY amortized across the batch (decode is
+  weight-bound only at M=1; at M=48 the 5.2ms weight read serves 48 tokens), so
+  M=1-tuned quant kernels just add dequant overhead and LOSE. Only a Marlin-style
+  kernel (efficient to M~64) could help batched decode -- needs the torchao
+  cutlass build fixed or a custom kernel. NO available quantization path improves
+  our batched decode.
 - FP8 PREFILL is the viable lever for the DOMINANT TTFT gap. Prefill GEMMs are
   52% of prefill at 34% MFU; at M>=2048 (few_shot is 48x640=30720 tokens) FP8 is
   ~1.8x on that portion -> ~23% prefill reduction -> few_shot TTFT ~317->~244
