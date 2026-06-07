@@ -228,6 +228,43 @@ lever is KV-token-bounded admission (above) to raise effective concurrency
 WITHOUT raising per-step cost, exactly what vllm's paged KV gives it for free
 (TTFT 66-205, throughput 18 vs our 6). Code reverted; no flag left behind.
 
+## Concurrency lever fully mapped (2026-06-07, current code w/ rope fused)
+
+DECISIVE microbench (scripts/bench_decode_batch_scaling.py, per-GPU TP8 decode
+GEMMs in a CUDA graph): decode GEMMs are WEIGHT-BOUND -- 32->256 rows (8x the
+batch) costs only +15% GEMM time; per-row cost falls 3.62us -> 0.52us. Per-layer
+GEMM ~120us x 80 layers ~= 9.6ms matches the live decode profile, so the bench is
+faithful. This OVERTURNS the long-held "high row count = TPOT blowup": the GEMMs
+(69% of the step) are flat; only allreduce (~linear with rows, 13% at 48) and
+power-of-2 bucket padding scale. So high concurrency is GEMM-cheap.
+
+Live A/B (closed-loop steady-state, /tmp/closed_loop_load.py, max_active 48 vs 128):
+| workload (harness)        | metric    | ma=48  | ma=128 |
+| long_output-like 96-conc  | TTFT p50  | 2628ms | 858ms (3x) |
+|                           | agg tput  | 2740   | 3488 (+27%) |
+|                           | TPOT      | 20.4   | 24.7 |
+| few_shot-like 64-conc     | TPOT      | 51.5   | 34.0 |
+|                           | TTFT      | 938ms  | 1829ms (worse) |
+| multi_turn-like 125-conc  | TPOT      | 59.8   | 59.8 (context-bound) |
+
+Findings: (1) our benchmark few_shot TPOT (51.6) is QUEUEING-INFLATED -- 64-conc >
+max_active=48 interleaves prefills into decode; at matched capacity it's ~34ms.
+(2) multi_turn TPOT (59.8) is CONTEXT-bound (long 8-turn ctx -> attention
+dominates), unaffected by max_active -- my harness reproduced the benchmark's
+exact 59.8. (3) raising max_active is a real throughput+TTFT win for
+queueing-bound long_output, but HURTS few_shot TTFT (bigger prefill batches) and
+costs TPOT on long_output.
+
+CONCLUSION: flat max_active up does NOT flip any cell -- the long_output gaps are
+3-9x (TTFT 8.8x, tput 2.9x) and +27%/3x falls far short; vllm runs even higher
+concurrency AND a faster per-request decode (long_output TPOT 15 vs our 33). It
+also risks KV-OOM at long seq and a few_shot-TTFT regression, so it is NOT a safe
+default change. The principled KV-token-bounded admission (high cap for short-ctx,
+low for long-ctx) is the right lever, but to actually WIN long_output it must be
+PAIRED with a faster per-request decode (int4/fp8: TPOT 33 -> ~15). Harness note:
+closed-loop steady-state (warm batcher) is REQUIRED; one-shot bursts are
+setup-dominated (~500ms) and mislead.
+
 ## BREAKTHROUGH: Marlin int4 decode kernel works via vLLM (scripts/bench_marlin_int4.py)
 
 The long-cited "no fast batched-int4 decode kernel available" conclusion is
