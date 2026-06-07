@@ -1,5 +1,41 @@
 # TorchInferno vs vLLM/sglang — Performance Gap Analysis (Llama-3.1-70B, 8xH100)
 
+## EXECUTIVE SUMMARY (state of the gap, distilled)
+
+Score: stable 2/20 (vllm 15-16/20). We win exactly the two cells we contend on:
+few_shot TPOT and multi_turn TPOT -- both close races, but holding across runs.
+TPOT cross-avg ~35ms (vllm ~34, sglang ~48) -- competitive. The deficits are TTFT
+(~3.4x), E2E (~2.7x), throughput (~2.9x), all driven by two root causes below.
+Scoring is best-in-row, so a cell flips only by beating BOTH competitors.
+
+RULED OUT (measured, do not re-chase):
+- int4/marlin decode weights: WORKS + accurate + graph-safe, but TPOT-NEUTRAL
+  (+2.6%). Decode at batch 48 is not weight-bound; isolated GEMM 1.52x does not
+  translate (graph-critical-path bound). Marlin module kept flag-off (good for M=1).
+- Faster decode allreduce: our symm-mem multimem (38us) already BEATS vllm
+  custom_ar (66us) at [48,8192]. Allreduce is NOT the gap. one_shot/two_shot worse.
+- decode_quantum (16 optimal), unified/chunked prefill (worse), max_active
+  (tradeoff/queueing, no flip), FP8 W8A8 decode (slower at M=48), W8A16/tinygemm
+  (M=1-tuned), torchao int4 (needs fbcode-only mslk), custom triton int4 (0.8x floor).
+
+THE TWO REAL GAPS (both DEEP, multi-week, no drop-in):
+1. DECODE TPOT (21 vs vllm 15ms; gates tree/multi_turn TPOT + throughput): after
+   ruling out allreduce + weight, the remainder is vllm's kernel FUSION (fewer ops
+   on the residual-serialized critical path) + attention kernel. Needs structural
+   decode work (fused mega-kernels / shorter critical path), not op-by-op.
+2. PREFILL MFU / TTFT (few_shot 303 vs 159; dominant): prefill GEMMs ~34% MFU
+   (~2x vllm). FP8 prefill (_scaled_mm 1.8x at large M, WORKS) would narrow
+   few_shot ~23% but NOT flip (vllm 159 too far) and is accuracy-gated. Short-prompt
+   TTFT (long_output/tree/multi_turn) is admission/queueing-bound, not prefill, and
+   capped by the ~2x decode behind it -- also no flip without the decode fix.
+
+SHIPPED WINS (this whole effort): symm-mem TPOT parity (scored; beats vllm's AR),
+3 NaN correctness fixes + regression tests, validated marlin module (flag-off),
+benchmark-faithful streaming harness, full diagnosis. Net: no single-iteration
+change closes the gap; both real levers are dedicated multi-week structural work.
+
+---
+
 Consolidated findings from extended profiling. Benchmark numbers are from
 inference-bench run `20260607_000945` (torchinferno commit `c60e0bd` -- which
 includes ALL current functional work; the 4 commits after it on main are
