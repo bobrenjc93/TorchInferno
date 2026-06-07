@@ -22,17 +22,37 @@ N = int(os.environ.get("N", "64"))
 MAX_TOKENS = int(os.environ.get("MAX_TOKENS", "256"))
 PROMPT_TOKENS = int(os.environ.get("PROMPT_TOKENS", "200"))
 TEMPERATURE = float(os.environ.get("TEMPERATURE", "0.0"))
+# PIPELINE mode: keep N workers busy, each looping over requests until TOTAL are
+# done -- mimics inference-bench's ThreadPoolExecutor(max_workers=N) draining a
+# request stream, which keeps prefill continuously interleaved with decode (the
+# regime where TPOT regressions show up). Default off = single thundering-herd.
+PIPELINE = os.environ.get("PIPELINE", "0") == "1"
+TOTAL = int(os.environ.get("TOTAL", "256"))
+# VARLEN: jitter prompt + output length per request so the decode batch holds
+# MIXED sequence lengths -> exercises the RAGGED decode path (the regime few_shot/
+# tree hit, unlike uniform-length bursts which decode in lockstep via the graph).
+VARLEN = os.environ.get("VARLEN", "0") == "1"
+
+
+def _lens(req_id):
+    if not VARLEN:
+        return PROMPT_TOKENS, MAX_TOKENS
+    # deterministic per-id jitter (no Date/random needed): spread over a range.
+    p = PROMPT_TOKENS // 2 + (req_id * 37) % max(1, PROMPT_TOKENS)
+    m = max(8, MAX_TOKENS // 4 + (req_id * 53) % max(1, MAX_TOKENS))
+    return p, m
 
 
 def make_body(req_id: int) -> dict:
-    filler = " ".join(f"word{i}" for i in range(max(1, PROMPT_TOKENS // 2)))
+    p_tokens, m_tokens = _lens(req_id)
+    filler = " ".join(f"word{i}" for i in range(max(1, p_tokens // 2)))
     return {
         "model": MODEL,
         "messages": [
             {"role": "system", "content": "You are a helpful assistant."},
             {"role": "user", "content": f"Request {req_id}. {filler}\n\nWrite a long detailed story."},
         ],
-        "max_tokens": MAX_TOKENS,
+        "max_tokens": m_tokens,
         "temperature": TEMPERATURE,
         "stream": True,
     }
@@ -73,14 +93,32 @@ def pct(xs, p):
     return xs[min(len(xs) - 1, int(p * len(xs)))]
 
 
+async def pipeline_worker(s, wid, counter, results):
+    while True:
+        i = counter[0]
+        if i >= TOTAL:
+            return
+        counter[0] += 1
+        results.append(await send(s, i, 0))
+
+
 async def main():
-    print(f"N={N} MAX_TOKENS={MAX_TOKENS} PROMPT_TOKENS={PROMPT_TOKENS} temp={TEMPERATURE}", flush=True)
+    mode = "PIPELINE" if PIPELINE else "BURST"
+    print(f"[{mode}] N={N} MAX_TOKENS={MAX_TOKENS} PROMPT_TOKENS={PROMPT_TOKENS} temp={TEMPERATURE}"
+          + (f" TOTAL={TOTAL}" if PIPELINE else ""), flush=True)
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=600)) as s:
         w = await send(s, -1, 0)
         print(f"warmup: TTFT={w['ttft']:.0f}ms total={w['total']:.0f}ms tok={w['tok']}", flush=True)
-        t0 = time.perf_counter()
-        res = await asyncio.gather(*[send(s, i, t0) for i in range(N)])
-        wall = (time.perf_counter() - t0) * 1000
+        if PIPELINE:
+            counter = [0]
+            res = []
+            t0 = time.perf_counter()
+            await asyncio.gather(*[pipeline_worker(s, wid, counter, res) for wid in range(N)])
+            wall = (time.perf_counter() - t0) * 1000
+        else:
+            t0 = time.perf_counter()
+            res = await asyncio.gather(*[send(s, i, t0) for i in range(N)])
+            wall = (time.perf_counter() - t0) * 1000
     ttfts = [r["ttft"] for r in res]
     tpots = [r["tpot"] for r in res if r["tpot"] > 0]
     toks = sum(r["tok"] for r in res)
