@@ -4453,6 +4453,72 @@ class Llama3TensorParallelForCausalLM:
         return _decode_linear(attn_in, self.lm_head_weight, self.lm_head_weight_decode)
 
     @torch.inference_mode()
+    def forward_decode_paged(
+        self,
+        input_ids: Tensor,
+        paged_cache: object,
+        *,
+        request_ids: list[str],
+        positions: Tensor,
+        decode_wrapper: object,
+    ) -> Tensor:
+        # TRUE paged-KV decode (WIP, feature branch): same GEMM/rope/norm flow as
+        # _forward_decode_flashinfer_body, but the KV write goes to a small-page
+        # pool via slot_mapping()+scatter_write() and attention reads the pool via
+        # layer_kv() -- instead of the dense [rows, 2, max_seq, ...] cache. This is
+        # the model-side half of the paged-KV migration (the lever for the
+        # queueing-bound multi_turn/long_output/TTFT/throughput cells); the serving
+        # loop owns admission-by-pages + the decode_wrapper plan (built once per
+        # step from paged_cache.flashinfer_page_table(request_ids), shared by all
+        # layers). input_ids: [batch, 1]; positions: [batch] absolute position of
+        # each decoded token (its pages must already be reserved).
+        batch = input_ids.size(0)
+        head_dim = self.config.head_dim
+        rms_eps = self.config.rms_norm_eps
+        flat_positions = positions.reshape(-1).clamp(0, self.rotary_cos_cache.size(0) - 1)
+        cos = self.rotary_cos_cache.index_select(0, flat_positions).view(batch, 1, -1)
+        sin = self.rotary_sin_cache.index_select(0, flat_positions).view(batch, 1, -1)
+        if cos.size(-1) * 2 == head_dim:
+            cos = torch.cat((cos, cos), dim=-1)
+            sin = torch.cat((sin, sin), dim=-1)
+        rotary = (cos, sin)
+        slots = paged_cache.slot_mapping(request_ids, [int(p) for p in positions.tolist()])
+
+        hidden = F.embedding(input_ids, self.embed_tokens_weight)
+        attn_in: Tensor | None = None
+        for layer_id, layer in enumerate(self.layers):
+            next_norm_weight = (
+                self.layers[layer_id + 1].input_layernorm_weight
+                if layer_id + 1 < len(self.layers)
+                else self.norm_weight
+            )
+            residual = hidden
+            if attn_in is None:
+                attn_in = _tp_decode_rms_norm(hidden, layer.input_layernorm_weight, rms_eps)
+            q, k, v = layer._qkv(attn_in, batch, 1, head_dim)
+            q, k = _apply_rotary_ragged_prefill(q, k, rotary)
+            # paged write: k/v are [batch, kv_heads, 1, head_dim] -> NHD [batch, kv_heads, head_dim]
+            paged_cache.scatter_write(
+                layer_id, slots, k[:, :, 0, :].contiguous(), v[:, :, 0, :].contiguous()
+            )
+            q_packed = q.permute(0, 2, 1, 3).reshape(-1, layer.local_attention_heads, head_dim)
+            out_packed = decode_wrapper.run(q_packed, paged_cache.layer_kv(layer_id))
+            out = out_packed.view(batch, 1, layer.local_hidden_size)
+            attention = layer._decode_linear_all_reduce(
+                out, layer.o_proj_weight, "attention", layer.o_proj_weight_decode
+            )
+            hidden, mlp_in = _tp_decode_add_rms_norm(
+                attention, residual, layer.post_attention_layernorm_weight, rms_eps
+            )
+            residual = hidden
+            projected = layer._mlp_project_decode_reduce(mlp_in)
+            hidden, attn_in = _tp_decode_add_rms_norm(projected, residual, next_norm_weight, rms_eps)
+
+        if attn_in is None:
+            attn_in = _tp_decode_rms_norm(hidden, self.norm_weight, rms_eps)
+        return _decode_linear(attn_in, self.lm_head_weight, self.lm_head_weight_decode)
+
+    @torch.inference_mode()
     def prefill_ragged_logits(
         self,
         input_ids: Tensor,
