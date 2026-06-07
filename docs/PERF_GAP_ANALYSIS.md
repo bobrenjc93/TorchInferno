@@ -220,6 +220,29 @@ validated groundwork (useful for single-stream/M=1 or if allreduce/attention are
 fixed first). The real decode lever is reducing the 160-allreduce + attention +
 kernel-launch overhead, not int4 weights.
 
+## Decode-step composition (8xH100, batch 48) — WHY int4 was neutral + the real lever
+
+Measured the 160-per-step allreduce directly (8-GPU torchrun, [48,8192] bf16):
+single allreduce nccl=214us, symm-mem multimem=39-55us; one_shot=99us (slower),
+two_shot=absent. So multimem (current choice) is the best available symm-mem op.
+x160 allreduces/step = ~6-9ms. Decode step ~21ms breaks down roughly:
+  - 160 allreduces (symm-mem multimem): ~6ms  (~30%)
+  - GEMM weight read (qkv+o+gate_up+down): ~5ms (~24%)
+  - attention + norms + swiglu + per-op kernel time: ~10ms (~46%)
+
+This explains the int4 NEUTRAL result: int4 cuts only the GEMM slice (~24%) and
+only partially, so it can't move TPOT. The biggest single chunk is the ALLREDUCE
+(~30%), but symm-mem multimem is already optimal -- beating it needs vLLM's custom
+one-shot allreduce (lower latency for small msgs, but requires cross-rank CUDA-IPC
+buffer registration -- a real distributed-setup effort, not a drop-in op) OR
+fewer allreduces (the 2/layer are serialized by the residual stream -- attention-
+out reduce and MLP-down reduce can't be fused/overlapped without re-architecting
+TP, e.g. sequence parallelism which only converts AR->RS+AG at the same total).
+The remaining ~46% (attention + many small kernels) is where vLLM likely also
+wins via kernel fusion. Net: the decode TPOT gap to vllm (21 vs 15) is the SUM of
+allreduce-latency + kernel-fusion advantages, each a deep effort; no single
+drop-in change closes it.
+
 ## FP8 characterization (scripts/bench_fp8_decode.py) — redirects the FP8 effort
 
 Microbenchmarked torch._scaled_mm (FP8 e4m3, W8A8) vs bf16 mm at exact Llama3-70B
