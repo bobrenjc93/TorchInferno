@@ -4419,10 +4419,16 @@ class Llama3TensorParallelForCausalLM:
         batch = input_ids.size(0)
 
         flat_positions = write_positions.reshape(-1).clamp(0, self.rotary_cos_cache.size(0) - 1)
-        rotary = (
-            self.rotary_cos_cache.index_select(0, flat_positions).view(batch, 1, -1),
-            self.rotary_sin_cache.index_select(0, flat_positions).view(batch, 1, -1),
-        )
+        cos = self.rotary_cos_cache.index_select(0, flat_positions).view(batch, 1, -1)
+        sin = self.rotary_sin_cache.index_select(0, flat_positions).view(batch, 1, -1)
+        # Pre-expand half-dim cos/sin to full head_dim ONCE here instead of inside
+        # _rotate_llama_eager every layer x {q,k}: rotary is identical across all 80
+        # layers, so this hoists ~320 redundant cat()s out of the decode step
+        # (profile: rope cat/neg/mul were ~2.6ms of the step). Exact -- same math.
+        if cos.size(-1) * 2 == self.config.head_dim:
+            cos = torch.cat((cos, cos), dim=-1)
+            sin = torch.cat((sin, sin), dim=-1)
+        rotary = (cos, sin)
 
         hidden = F.embedding(input_ids, self.embed_tokens_weight)
         attn_in: Tensor | None = None
