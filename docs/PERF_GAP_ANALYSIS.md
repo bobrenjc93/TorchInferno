@@ -95,6 +95,38 @@ applies. Net: the runner is not the lever. Decode is GPU-compute-bound (~15ms);
 FP8 decode weights (halve it) remain the real throughput/TPOT lever. The wiring
 stays (flag off, validated) as a foundation if FP8 or a stable-decode path lands.
 
+## max_active / queueing — validated with the new ignore_eos harness
+
+Added TORCHINFERNO_OPENAI_IGNORE_EOS (test-only, default off): forces generation
+to max_tokens so scripts/test_stream.py reproduces the real long_output dynamics
+(huge outputs keep rows occupied; arrivals beyond max_active queue). Without it,
+synthetic prompts hit EOS at ~30 tokens and the queueing never appears.
+
+A/B with TRUE long outputs (long_output 16/256, closed-loop 64-conc, n=256):
+
+| metric    | max_active=48 | max_active=64 |
+| :-------- | ------------: | ------------: |
+| TTFT p50  |          511  |          538  |
+| TTFT p90  |         4780  |          636  |
+| TTFT p99  |         5116  |          639  |
+| TPOT p50  |           21  |           26  |
+| agg tput  |         1949  |         2251  |
+
+max_active >= concurrency ELIMINATES the TTFT tail (no request ever queues in
+closed-loop). BUT: (1) MEDIAN TTFT is unchanged -- the median request isn't the
+queued one -- and the benchmark scores MEDIAN, so this does not move the
+long_output TTFT cell; (2) TPOT rises (21->26 here; few_shot TPOT 68->95 in a
+separate run) -- risking our ONE won cell (few_shot TPOT). This is the same
+lesson as the reverted max_active=128 (KV/compute-bound at high row counts).
+Flat max_active is NOT the lever. The principled fix the code comment already
+calls for is a KV-TOKEN-BOUNDED decode batch: allow many rows when contexts are
+short (long_output -> big batch, weight-bound, TPOT-safe) and few rows when
+contexts are long (multi_turn -> avoid KV-bound TPOT blowup). That needs a real
+admission change AND resolves the median-vs-tail question only on the live
+benchmark. Per-request TTFT FLOOR is ~500ms even with no queue (vllm 66ms) --
+that floor is admission/scheduling overhead (decode_quantum drain + batcher),
+a separate gap from queueing.
+
 ## FP8 characterization (scripts/bench_fp8_decode.py) — redirects the FP8 effort
 
 Microbenchmarked torch._scaled_mm (FP8 e4m3, W8A8) vs bf16 mm at exact Llama3-70B

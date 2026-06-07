@@ -2474,6 +2474,13 @@ class OpenAICompletionEngine:
         run_max_tokens = max(request.max_tokens for request in initial_batch)
         stop_token_ids = getattr(self, "stop_token_ids", frozenset())
         eos_token_id = next(iter(stop_token_ids)) if stop_token_ids else None
+        # Test-only: force every request to generate exactly max_tokens (ignore EOS),
+        # so scripts/test_stream.py can reproduce the real long_output benchmark's
+        # "huge output -> rows stay occupied -> arrivals queue" dynamics that drive
+        # the TTFT/throughput gaps. Off by default; no production effect.
+        if env_flag("TORCHINFERNO_OPENAI_IGNORE_EOS", False):
+            stop_token_ids = frozenset()
+            eos_token_id = None
         engine_create_start_s = time.perf_counter()
         runtime_engine = _RuntimeContinuousBatchEngine(
             self.model,
