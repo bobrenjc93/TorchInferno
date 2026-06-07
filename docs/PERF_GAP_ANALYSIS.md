@@ -281,6 +281,37 @@ gate_up test was inconclusive). NEXT: extend marlin to all 4 GEMMs + drop the
 bf16<->fp16 conversions, then re-measure TPOT carefully. The profiler hook
 (forward_decode_flashinfer, gated, batch>=32) makes this reproducible.
 
+ROPE FUSION (SHIPPED, default-on, the EXACT lever that int4 is not) -- run
+20260607. The decode rope was plain aten: _rotate_llama_eager does cat(cos,cos)
++ cat(sin,sin) + cat(-x2,x1) + neg + 2 mul per layer per {q,k}. Two shipped
+commits remove ~2.5ms of it:
+  1. c3ec55c: the cos/sin tables are identical across all 80 layers, so their
+     per-layer cat()s (~320 of 480) were redundant -- hoisted to once. (~1.3ms)
+  2. 2636a66: a per-(batch,token) triton kernel
+     (triton_apply_rotary_llama_batched_inplace) fuses the whole rotate-half into
+     ONE in-place launch; wired into _apply_rotary_ragged_prefill (FI decode +
+     ragged suffix) and _apply_rotary_ragged under the existing
+     TORCHINFERNO_TRITON_ROTARY flag (default on). The pre-existing fused kernel
+     (triton_apply_rotary_llama_inplace, used by _apply_rotary_cached for uniform
+     prefill) could NOT be reused -- its cos is shared across the batch; decode
+     positions vary per row.
+Offline (scripts/bench_fused_rope.py, in CUDA graph): aten rope 1.32ms/step ->
+fused 0.10ms/step = 13.5x. Correctness rel ~3e-3 vs the aten ref (fp32 accumulate,
+MORE accurate than bf16). graph-vs-eager stays bit-identical (both call the same
+kernel) -- so unlike int4, this is default-on SAFE, full suite green, regression
+test test_triton_rotary_llama_batched_inplace_matches_torch_reference.
+IN-SITU CONFIRMED (TORCHINFERNO_PROFILE_DECODE_ONCE on the live 8xH100 server,
+48-conc, batch>=32): _rotary_llama_qk_batched_inplace_kernel fires 80 calls
+(1/layer) at 178.9us TOTAL = 1.27% of the 14.145ms decode step; NO aten
+cat/neg/mul rope ops remain in the profile. Decode is now cleanly GEMM-dominated
+(aten::mm 9.81ms = 69%, allreduce 1.90ms = 13%, index_put 0.87ms, rope 0.18ms).
+EXPECTED score effect (next run >2636a66): tree_of_thought TPOT 31.7->~29 flips
+vs vllm 29.5; widens the few_shot (52.9 vs 58.3) and multi_turn (64.7 vs 67.6)
+TPOT margins against the +-15ms run-to-run variance. Caveat (int4 lesson): a real
+engine GPU saving can be partly masked in benchmark TPOT; confirm on the live run.
+With rope fused, the ONLY remaining big decode lever is the GEMMs (int4 marlin,
+above) -- everything else (allreduce, attention, norms, KV write) is small.
+
 ## Decode-step composition (8xH100, batch 48) — WHY int4 was neutral + the real lever
 
 Measured the 160-per-step allreduce directly (8-GPU torchrun, [48,8192] bf16):
