@@ -145,7 +145,14 @@ Implications:
   cuBLAS FP8 is tuned for large-M training/prefill, not skinny decode). Faster
   decode would need W8A16 weight-only (FP8 weights, bf16 activations, fused
   dequant) -- a custom Marlin/torchao/triton kernel, deep. This saves a large
-  wasted W8A8-decode implementation.
+  wasted W8A8-decode implementation. W8A16 via available tools is ALSO not
+  feasible (checked): torch._weight_int8pack_mm is 0.01-0.16x at decode shapes
+  (naive kernel, time grows with N -- gate_up M=48: 9.7ms vs bf16 81us, 100x
+  SLOWER), and torchao's optimized cutlass kernels fail to load here
+  (_C_cutlass_90a.abi3.so ABI-mismatches our custom PyTorch build). So the decode
+  TPOT cells (tree 2.6ms, multi_turn 7.4ms) are unreachable by quantization
+  without a custom dequant-GEMM kernel OR a torchao rebuild against our PyTorch.
+  Decode stays bf16-GPU-bound (~15ms/step).
 - FP8 PREFILL is the viable lever for the DOMINANT TTFT gap. Prefill GEMMs are
   52% of prefill at 34% MFU; at M>=2048 (few_shot is 48x640=30720 tokens) FP8 is
   ~1.8x on that portion -> ~23% prefill reduction -> few_shot TTFT ~317->~244
