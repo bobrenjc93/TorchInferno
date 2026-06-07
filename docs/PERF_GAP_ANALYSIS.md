@@ -10,8 +10,26 @@ that cell. Our only remaining cell is few_shot TPOT (52.9 vs vllm 53.6 -- razor-
 (secures few_shot TPOT, +~2.5ms margin) and KV-bounded concurrency (targets
 self_consistency TTFT, A/B showed ~2x) are QUEUED and should land next run.
 multi_turn TPOT (now 20ms behind vllm) and long_output TPOT (32 vs 15) need
-FP8-KV / paged long-context decode -- deep. The TTFT/throughput rows (3-9x) remain
+paged long-context decode -- deep. The TTFT/throughput rows (3-9x) remain
 the architectural (paged-KV concurrency + FP8 prefill) gap.
+
+LONG-CONTEXT DECODE PROFILED (2026-06-07, TORCHINFERNO_PROFILE_DECODE_ONCE,
+batch=32 @ ~1500-tok context): decode is STILL GEMM-bound, NOT attention-bound --
+aten::mm 69%, allreduce 13%, index_put (KV write) 6%, add_rms_norm 4%, and
+FlashInfer paged decode attention only ~4.6% (411us decode + 237us merge) EVEN at
+long context (FlashInfer paged decode is very efficient). The decode STEP is
+~14ms, but multi_turn's benchmark TPOT is 63.8ms (~4.5x inflated) -- that
+inflation is QUEUEING / prefill-interleaving (125-conc >> 48 max_active -> constant
+admission interleaves prefills into decode). CORRECTION to the prior "FP8-KV for
+multi_turn TPOT" idea: attention is negligible, so FP8-KV's value is NOT
+attention speed -- it is the MEMORY halving (-> ~2x concurrent rows -> less
+queueing). So the single lever behind multi_turn TPOT + the whole TTFT/throughput
+complex is HIGHER EFFECTIVE CONCURRENCY for long contexts = PAGED KV (pack by
+actual tokens, not dense max_seq x rows). FP8-KV helps only via that same
+memory->rows path. KV-bounded concurrency (shipped) is the short-context-only
+version of this; paged KV is required for the long-context (multi_turn/long_output)
+cells. This is THE prioritized deep lever (one change addresses TTFT + TPOT +
+throughput simultaneously).
 
 ## EXECUTIVE SUMMARY (state of the gap, distilled)
 
