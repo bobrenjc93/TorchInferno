@@ -173,6 +173,39 @@ benchmark. Per-request TTFT FLOOR is ~500ms even with no queue (vllm 66ms) --
 that floor is admission/scheduling overhead (decode_quantum drain + batcher),
 a separate gap from queueing.
 
+## BREAKTHROUGH: Marlin int4 decode kernel works via vLLM (scripts/bench_marlin_int4.py)
+
+The long-cited "no fast batched-int4 decode kernel available" conclusion is
+SUPERSEDED. vLLM's `_C` is built against torch's STABLE libtorch ABI, so a full
+`import vllm` registers `torch.ops._C.marlin_gemm` and it RUNS correctly with our
+custom torch 2.13.0a0 -- NO rebuild needed (unlike torchao 0.17 cutlass .so =
+CUDA13-ABI fail; torchao 0.18 int4 = fbcode-only `mslk` dep). Earlier probes
+missed it because `import vllm._C` alone doesn't register ops; the full `import
+vllm` does (one libstdc++ LD_PRELOAD works around a soxr CXXABI clash in vllm's
+transformers import chain).
+
+CUDA-graph FLOOR (M=48), marlin int4 vs fp16:
+| GEMM    | K x N      | fp16   | marlin | speedup |
+| qkv     | 8192x1280  | 12.2us | 28.3us | 0.43x   |
+| o_proj  | 1024x8192  |  8.4us | 11.6us | 0.72x   |
+| gate_up | 8192x7168  | 65.5us | 43.0us | 1.52x   |
+| down    | 3584x8192  | 32.9us | 22.9us | 1.44x   |
+Marlin WINS the big, K-large GEMMs (gate_up 1.52x, down 1.44x) and loses the tiny
+ones (fixed overhead vs a ~10us bf16 GEMM). All-4 total 1.13x; a HYBRID (marlin
+for gate_up+down, bf16 for qkv/o_proj/lm_head) is ~1.38x on the decode projection
+GEMMs. lm_head (N=16032) is not marlin-eligible (N must be % 64). Correctness
+maxdiff ~0.008 vs fp16 (RTN int4 quant error).
+
+This is the path to ROBUST TPOT-cell wins (flip tree_of_thought, widen
+few_shot/multi_turn margins) and decode-throughput. INTEGRATION (next, multi-step,
+NOT yet done -- keeps the stable 2/20 safe until validated):
+1. Quantize Llama3-TP gate_up+down weights to marlin int4 at load (gptq quantize
+   + marlin pack); keep qkv/o_proj/lm_head bf16 (hybrid).
+2. Route those decode GEMMs through ops.marlin_gemm; handle the vllm-op import
+   (need torch.ops._C.marlin_gemm registered without the heavy vllm import chain).
+3. GATE on accuracy: RTN int4 may not hold the 98% benchmark correctness bar;
+   likely needs GPTQ/AWQ calibration. Validate end-to-end before enabling.
+
 ## FP8 characterization (scripts/bench_fp8_decode.py) — redirects the FP8 effort
 
 Microbenchmarked torch._scaled_mm (FP8 e4m3, W8A8) vs bf16 mm at exact Llama3-70B
