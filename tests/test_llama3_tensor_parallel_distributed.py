@@ -416,6 +416,49 @@ def test_llama3_tensor_parallel_forward_prefill_paged_matches_dense(tmp_path) ->
     torch.testing.assert_close(got, ref, atol=6e-2, rtol=6e-2)
 
 
+def test_generate_paged_matches_dense_greedy(tmp_path) -> None:
+    # End-to-end paged SERVING-logic check: greedy generate_paged (chained paged
+    # prefill -> decode loop over a page pool) must produce the same token sequence
+    # as a dense forward-greedy reference. Validates the prefill->decode chaining +
+    # page management the serving engine will use.
+    pytest.importorskip("flashinfer")
+    from torchinferno.runtime.paged_serving import generate_paged
+
+    torch.manual_seed(31337)
+    config = tiny_llama3_config(
+        vocab_size=32, max_position_embeddings=64,
+        hidden_size=128, num_attention_heads=2, num_key_value_heads=1,  # head_dim 64 for FI prefill
+    )
+    reference = Llama3V0ForCausalLM(config).eval()
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    _write_hf_checkpoint(reference, config, checkpoint)
+    model = Llama3TensorParallelForCausalLM.from_pretrained(checkpoint, dtype="bfloat16").eval()
+    dev = model.device
+    if dev.type != "cuda":
+        pytest.skip("paged serving needs CUDA")
+
+    prompts = [[1, 5, 9, 13, 2, 6], [3, 7, 11, 4, 8, 10]]
+    new_tokens = 6
+
+    # dense forward-greedy reference (re-prefill the growing sequence each step).
+    ref_out: list[list[int]] = []
+    with torch.inference_mode():
+        for prompt in prompts:
+            seq = list(prompt)
+            gen: list[int] = []
+            for _ in range(new_tokens):
+                c = model.allocate_cache(1, max_seq_len=64, cache_backend="dense")
+                logits, _ = model.forward(torch.tensor([seq], dtype=torch.long, device=dev), cache=c, use_cache=True)
+                nxt = int(logits[0, -1, :].argmax())
+                gen.append(nxt)
+                seq.append(nxt)
+            ref_out.append(gen)
+
+    got = generate_paged(model, prompts, max_new_tokens=new_tokens, page_size=4)
+    assert got == ref_out, f"paged greedy {got} != dense greedy {ref_out}"
+
+
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires at least two CUDA devices")
 def test_llama3_tensor_parallel_matches_reference_under_torchrun(tmp_path) -> None:
     torch.manual_seed(9001)
