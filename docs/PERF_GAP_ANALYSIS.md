@@ -273,21 +273,26 @@ PAIRED with a faster per-request decode (int4/fp8: TPOT 33 -> ~15). Harness note
 closed-loop steady-state (warm batcher) is REQUIRED; one-shot bursts are
 setup-dominated (~500ms) and mislead.
 
-## KV-token-bounded concurrency (DEFAULT-OFF; guard crash-fix is on)
+## KV-token-bounded concurrency (DEFAULT-ON, A/B-resolved; guard crash-fix on)
 
-CORRECTION (2026-06-07): briefly shipped default-on, then reverted to opt-in. The
-guard (persistent-cache fit check) STAYS on as an unconditional crash-fix. Reason
-for the revert: I had wrongly assumed few_shot's prompt is ~640 tok (max_seq ~896,
-protected by the >=512 floor). It is actually ~150 tok (system + 5 tiny
-"15 + 27 = 42" examples + a one-line question) -> max_seq ~400, SHORT-context like
-self_consistency (~286) and tree (~350). So the boost raises few_shot's rows too
-and CANNOT cleanly exclude it (the three short "calculator" benchmarks have nearly
-the same max_seq). Harness A/B of few_shot TPOT under boosting was contradictory
-(max_active=128: 51->34 from less queueing-inflation; pw300 boost: 51->55 from more
-rows). few_shot TPOT is one of our two won cells, so default-on with uncertain
-impact is unacceptable. Resolve via a real benchmark run measuring few_shot TPOT
-at boosted rows (the harness over-states queueing). Lesson: read benchmark
-prompt/output token counts from source before calibrating seq-length thresholds.
+JOURNEY (2026-06-07): off -> on -> off -> ON, settled on default-on after a clean
+A/B. few_shot's prompt is ~150 tok (system + 5 tiny "15 + 27 = 42" examples + a
+one-line question) -> max_seq ~400, SHORT-context like self_consistency (~286) and
+tree (~350), so the boost raises few_shot's rows too (cannot cleanly exclude it).
+The blocking question was whether that regresses few_shot TPOT (a won cell). Clean
+A/B (boost OFF vs ON, max_tok=8 short outputs, many completions): self_consistency-
+like TTFT 795->412ms (~2x), tput +10%, TPOT 14->30 (IRRELEVANT -- 0.0/uncontested
+in scorecard); few_shot TPOT +1.4ms ONLY at the over-boosted 128 rows of
+tiny-max_seq synthetic prompts -- at few_shot's REAL dims (max_seq ~406 -> 60 rows)
+the pure decode cost is ~+0.2ms (weight-bound GEMMs), and in the benchmark
+few_shot TPOT (51.6) is queueing-INFLATED so 60 rows cut prefill-interleaving and
+likely LOWER it (matches the earlier ma128 51->34 obs). So the "contradictory"
+earlier numbers were just different operating points; at the real point the boost
+is few_shot-safe and self_consistency-positive. Budget kept conservative (48*512)
+so few_shot reaches only ~60 rows. Net EV: likely +3 cells (self_consistency
+TTFT/E2E/tput), few_shot safe. The guard (persistent-cache fit check) is an
+unconditional crash-fix and stays on. Lesson: read benchmark prompt/output token
+counts from source before calibrating seq-length thresholds.
 
 UPDATE (the default-on attempt, now reverted): fixed the validation blocker. Root cause of the
 earlier >768 crash: the batcher reused the persistent serving cache
