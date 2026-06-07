@@ -4519,6 +4519,83 @@ class Llama3TensorParallelForCausalLM:
         return _decode_linear(attn_in, self.lm_head_weight, self.lm_head_weight_decode)
 
     @torch.inference_mode()
+    def forward_prefill_paged(
+        self,
+        input_ids: Tensor,
+        paged_cache: object,
+        *,
+        request_ids: list[str],
+        prefill_wrapper: object,
+    ) -> Tensor:
+        # TRUE paged-KV prefill (WIP, feature branch): fresh-sequence prefill of a
+        # uniform [batch, T] prompt block into the small-page pool. Same per-layer
+        # GEMM/rope/norm flow as the FlashInfer prefill (forward_flashinfer's
+        # prefill branch), but writes all T tokens' K/V via slot_mapping()+
+        # scatter_write() and attends via a paged FlashInfer PREFILL wrapper over
+        # layer_kv(). Each request must be reserved with length T; prefill_wrapper
+        # is pre-planned with qo_indptr (T per request), paged_cache's
+        # flashinfer_page_table(request_ids), and causal=True. Returns logits for
+        # every position [batch, T, vocab]. This is the prefill half that populates
+        # the pool so forward_decode_paged can extend each sequence.
+        batch, tokens = input_ids.shape
+        head_dim = self.config.head_dim
+        rms_eps = self.config.rms_norm_eps
+        positions = torch.arange(tokens, device=self.device).unsqueeze(0).expand(batch, tokens)
+        flat = positions.reshape(-1)
+        cos = self.rotary_cos_cache.index_select(0, flat).view(batch, tokens, -1)
+        sin = self.rotary_sin_cache.index_select(0, flat).view(batch, tokens, -1)
+        if cos.size(-1) * 2 == head_dim:
+            cos = torch.cat((cos, cos), dim=-1)
+            sin = torch.cat((sin, sin), dim=-1)
+        rotary = (cos, sin)
+        ids: list[str] = []
+        pos: list[int] = []
+        for request_id in request_ids:
+            ids.extend([request_id] * tokens)
+            pos.extend(range(tokens))
+        slots = paged_cache.slot_mapping(ids, pos)  # [batch*T], row-major (request, position)
+
+        hidden = F.embedding(input_ids, self.embed_tokens_weight)
+        attn_in: Tensor | None = None
+        for layer_id, layer in enumerate(self.layers):
+            next_norm_weight = (
+                self.layers[layer_id + 1].input_layernorm_weight
+                if layer_id + 1 < len(self.layers)
+                else self.norm_weight
+            )
+            residual = hidden
+            if attn_in is None:
+                attn_in = _tp_decode_rms_norm(hidden, layer.input_layernorm_weight, rms_eps)
+            q, k, v = layer._qkv(attn_in, batch, tokens, head_dim)
+            q, k = _apply_rotary_ragged_prefill(q, k, rotary)
+            # paged write: k/v [batch, kv_heads, T, head_dim] -> NHD [batch*T, kv_heads, head_dim]
+            k_nhd = k.permute(0, 2, 1, 3).reshape(
+                batch * tokens, layer.local_key_value_heads, head_dim
+            ).contiguous()
+            v_nhd = v.permute(0, 2, 1, 3).reshape(
+                batch * tokens, layer.local_key_value_heads, head_dim
+            ).contiguous()
+            paged_cache.scatter_write(layer_id, slots, k_nhd, v_nhd)
+            q_packed = q.permute(0, 2, 1, 3).reshape(
+                batch * tokens, layer.local_attention_heads, head_dim
+            )
+            out_packed = prefill_wrapper.run(q_packed, paged_cache.layer_kv(layer_id))
+            out = out_packed.view(batch, tokens, layer.local_hidden_size)
+            attention = layer._decode_linear_all_reduce(
+                out, layer.o_proj_weight, "attention", layer.o_proj_weight_decode
+            )
+            hidden, mlp_in = _tp_decode_add_rms_norm(
+                attention, residual, layer.post_attention_layernorm_weight, rms_eps
+            )
+            residual = hidden
+            projected = layer._mlp_project_decode_reduce(mlp_in)
+            hidden, attn_in = _tp_decode_add_rms_norm(projected, residual, next_norm_weight, rms_eps)
+
+        if attn_in is None:
+            attn_in = _tp_decode_rms_norm(hidden, self.norm_weight, rms_eps)
+        return _decode_linear(attn_in, self.lm_head_weight, self.lm_head_weight_decode)
+
+    @torch.inference_mode()
     def prefill_ragged_logits(
         self,
         input_ids: Tensor,

@@ -355,6 +355,67 @@ def test_llama3_tensor_parallel_forward_decode_paged_matches_dense(tmp_path) -> 
     torch.testing.assert_close(got, ref, atol=5e-2, rtol=5e-2)
 
 
+def test_llama3_tensor_parallel_forward_prefill_paged_matches_dense(tmp_path) -> None:
+    # Validate the WIP FlashInfer-paged prefill (forward_prefill_paged): prefill a
+    # fresh prompt into the small-page pool and confirm per-position logits match a
+    # dense forward. Together with the decode test this proves the model-side paged
+    # forward (prefill + decode) is correct end-to-end on a real model.
+    flashinfer = pytest.importorskip("flashinfer")
+    from torchinferno.runtime.paged import LayeredPagedKVCache
+
+    torch.manual_seed(7777)
+    # FlashInfer's prefill (hopper) kernel only supports head_dim in {64,128,256},
+    # so use head_dim=64 (hidden=128, 2 q heads, 1 kv head) rather than the default
+    # tiny head_dim=16 (which the decode wrapper accepts but prefill does not).
+    config = tiny_llama3_config(
+        vocab_size=32, max_position_embeddings=64,
+        hidden_size=128, num_attention_heads=2, num_key_value_heads=1,  # head_dim = 128/2 = 64
+    )
+    reference = Llama3V0ForCausalLM(config).eval()
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    _write_hf_checkpoint(reference, config, checkpoint)
+    model = Llama3TensorParallelForCausalLM.from_pretrained(checkpoint, dtype="bfloat16").eval()
+    dev = model.device
+    if dev.type != "cuda":
+        pytest.skip("paged prefill needs CUDA")
+
+    prompt = [1, 5, 9, 13, 2, 6]
+    T = len(prompt)
+    with torch.inference_mode():
+        ref_cache = model.allocate_cache(1, max_seq_len=64, cache_backend="dense")
+        ref_logits, _ = model.forward(
+            torch.tensor([prompt], dtype=torch.long, device=dev), cache=ref_cache, use_cache=True
+        )
+        ref = ref_logits[0].float()  # [T, vocab]
+
+        nkv = model.layers[0].local_key_value_heads
+        nqo = model.layers[0].local_attention_heads
+        hd = config.head_dim
+        nl = len(model.layers)
+        paged = LayeredPagedKVCache(
+            num_layers=nl, num_pages=64, page_size=4, num_key_value_heads=nkv,
+            head_dim=hd, device=dev, dtype=torch.bfloat16,
+        )
+        paged.reserve("r", T)
+        paged._sequences["r"].length = T
+        indptr, indices, lpl = paged.flashinfer_page_table(["r"])
+        ws = torch.empty(64 * 1024 * 1024, dtype=torch.uint8, device=dev)
+        pw = flashinfer.BatchPrefillWithPagedKVCacheWrapper(ws, kv_layout="NHD")
+        qo_indptr = torch.tensor([0, T], dtype=torch.int32, device=dev)
+        pw.plan(
+            qo_indptr=qo_indptr, paged_kv_indptr=indptr, paged_kv_indices=indices,
+            paged_kv_last_page_len=lpl, num_qo_heads=nqo, num_kv_heads=nkv,
+            head_dim_qk=hd, page_size=4, causal=True, q_data_type=torch.bfloat16,
+        )
+        out = model.forward_prefill_paged(
+            torch.tensor([prompt], dtype=torch.long, device=dev),
+            paged, request_ids=["r"], prefill_wrapper=pw,
+        )
+    got = out[0].float()  # [T, vocab]
+    torch.testing.assert_close(got, ref, atol=6e-2, rtol=6e-2)
+
+
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires at least two CUDA devices")
 def test_llama3_tensor_parallel_matches_reference_under_torchrun(tmp_path) -> None:
     torch.manual_seed(9001)
