@@ -195,14 +195,20 @@ Implications:
   torch (2.13.0a0) would likely fail on API drift. vllm is importable but its _C
   marlin ops aren't registered (same ABI class). So unlocking a batched-M quant
   kernel needs a from-source torchao/vllm build (API-compat fixes) or a custom
-  triton Marlin -- a multi-day effort, not a loop iteration. CONFIRMED by attempt:
-  a naive Triton W4A16 kernel (scripts/bench_triton_int4.py, packed int4 +
-  groupwise dequant, BLOCK_M tuned for M=16-64) runs 0.03-0.74x vs cuBLAS bf16 --
-  10-25x off. cuBLAS bf16 is highly tuned; a competitive int4 GEMM (Marlin-class:
-  cp.async pipelining, tensor-core scheduling, tuned tiling) is an expert
-  multi-week effort. Triton is unblocked in AVAILABILITY but not in EFFORT. Net
-  across ALL angles (PyTorch M=1 kernels, torchao/vllm ABI, custom triton):
-  faster batched-decode quant is not reachable with available tools/effort.
+  triton Marlin -- a multi-day effort, not a loop iteration. CONFIRMED by two
+  rounds of attempt (scripts/bench_triton_int4.py, packed int4 + groupwise
+  dequant): a naive kernel is 0.03-0.74x; a rewritten one (even/odd nibble split
+  = two clean tl.dots, BLOCK_K=group, autotuned BLOCK_M/N + num_stages) reaches
+  0.54-0.99x EAGER. But the decisive CUDA-GRAPH (floor-level, no launch overhead)
+  comparison at M=48: bf16 gate_up 64.9us / int4 143.9us = 0.45x; lm_head 0.56x.
+  The int4 kernel reads 4x LESS memory yet is SLOWER -- it sustains only ~0.2
+  TB/s vs cuBLAS bf16's ~1.8 TB/s. It is dequant/tl.dot-overhead-bound, NOT
+  memory-bound: the int4 byte savings are entirely eaten by un-hidden unpack+
+  dequant and poor small-M tensor-core utilization. Beating bf16 needs
+  Marlin-class engineering (dequant fused into the MMA pipeline, async cp.async
+  weight prefetch) -- expert multi-month work. DEFINITIVE across ALL angles
+  (PyTorch M=1 kernels, torchao/vllm ABI, custom triton at the HW floor): faster
+  batched-decode quant is not reachable with available tools/effort.
 - FP8 PREFILL is the viable lever for the DOMINANT TTFT gap. Prefill GEMMs are
   52% of prefill at 34% MFU; at M>=2048 (few_shot is 48x640=30720 tokens) FP8 is
   ~1.8x on that portion -> ~23% prefill reduction -> few_shot TTFT ~317->~244
