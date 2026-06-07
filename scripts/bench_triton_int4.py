@@ -12,6 +12,10 @@ high) reconstructs the full K-order weight tile so a SINGLE tl.dot per K-block
 runs (one big dot beats two half-K dots on tensor-core utilization). A
 multi-group-per-block variant was tried and REVERTED: the per-column scale
 gather it needs costs more memory traffic than the loop overhead it saves.
+Two more tweaks ruled out: deferring the scale to the [BLOCK_M,BLOCK_N] dot
+result regresses (0.74x -- breaks clean dot-accumulation); a pure-bf16 dequant
+(no fp32 round-trip) fails to COMPILE in triton 3.7 (ttgir PassManager error on
+the bf16 interleave). The fp32-dequant single-dot below is the triton optimum.
 
 Status (CUDA-graph floor, M=48): lm_head 1.03x (beats bf16), gate_up 0.83x,
 down 0.88x, tiny qkv 0.22x. Remaining gap = small-M (M=48) tl.dot efficiency +
