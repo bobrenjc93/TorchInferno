@@ -243,6 +243,19 @@ wins via kernel fusion. Net: the decode TPOT gap to vllm (21 vs 15) is the SUM o
 allreduce-latency + kernel-fusion advantages, each a deep effort; no single
 drop-in change closes it.
 
+STRATEGIC CORRECTION (isolated op speedups do NOT translate end-to-end). Per-layer
+decode COMPUTE in isolation (4 GEMMs + 2 norms + swiglu, CUDA-graph, M=48) = 169us
+x80 = 13.5ms; + measured allreduce ~6ms ~= the 21ms step. By that the GEMMs look
+large, so int4 "should" help ~8% -- but the EMPIRICAL int4 gate_up result was only
++2.6% (TPOT-neutral). So isolated microbenchmarks (marlin 1.52x on the GEMM)
+OVERPREDICT the end-to-end gain: the real decode is bound by the GRAPH-LEVEL
+critical path (per-op execution serialized through the residual stream + the
+allreduces), not by any single op's weight-read. Shrinking one GEMM barely moves
+the chain. CONSEQUENCE: optimize the decode at the GRAPH level (fewer ops / fused
+ops / fewer-or-faster allreduces / a shorter critical path), NOT op-by-op weight
+compression. This is why every per-op lever (int4, symm-mem-already-applied) nets
+small, and why matching vllm's 15ms needs structural decode changes (deep).
+
 ## FP8 characterization (scripts/bench_fp8_decode.py) — redirects the FP8 effort
 
 Microbenchmarked torch._scaled_mm (FP8 e4m3, W8A8) vs bf16 mm at exact Llama3-70B
