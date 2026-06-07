@@ -202,6 +202,14 @@ def batched_paged_decode_attention_reference(
         return query_rows.new_zeros((query_rows.size(0), query_rows.size(1), 1, cache.value_head_dim))
     keys, values = _materialize_batch(cache, request_ids, seq_lens, max_seq_len, device=query_rows.device, dtype=query_rows.dtype)
     mask = torch.arange(max_seq_len, device=query_rows.device)[None, :] < seq_lens.to(device=query_rows.device)[:, None]
+    # Padding slots (position >= seq_len) are gathered from unused cache rows that
+    # may hold uninitialized memory. SDPA masks their attention weight to zero, but
+    # 0 * NaN = NaN, so a stale NaN in a padded KV slot poisons the output even
+    # though it is logically masked out. Zero the masked positions so the masked
+    # weighted sum stays finite (padding contributes nothing either way).
+    kv_keep = mask[:, None, :, None]
+    keys = torch.where(kv_keep, keys, keys.new_zeros(()))
+    values = torch.where(kv_keep, values, values.new_zeros(()))
     return F.scaled_dot_product_attention(
         query_rows,
         keys,
