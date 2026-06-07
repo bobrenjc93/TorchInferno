@@ -1756,82 +1756,6 @@ class OpenAICompletionEngine:
         effective = _effective_openai_max_batch_size(self.model, self.device, self.max_batch_size)
         return max(base, min(cap, effective))
 
-    def _kv_bytes_per_row_per_token(self) -> int:
-        # Per-rank KV-cache bytes for ONE row advancing ONE token: K and V across
-        # all layers, using this rank's LOCAL (tensor-parallel-sharded) kv-head
-        # count. Used to translate a free-memory budget into an admissible row
-        # count. Returns 0 when the model shape is unavailable (caller falls back).
-        model = self.model
-        cfg = getattr(model, "config", None)
-        layers = getattr(model, "layers", None)
-        layer0 = layers[0] if layers else None
-        local_kv = getattr(layer0, "local_key_value_heads", None) or getattr(
-            cfg, "num_key_value_heads", None
-        )
-        head_dim = getattr(cfg, "head_dim", None)
-        num_layers = len(layers) if layers else getattr(cfg, "num_hidden_layers", 0)
-        dtype = getattr(model, "dtype", None) or torch.bfloat16
-        try:
-            bytes_per_elem = torch.finfo(dtype).bits // 8
-        except Exception:
-            bytes_per_elem = 2
-        if not (local_kv and head_dim and num_layers):
-            return 0
-        return 2 * int(local_kv) * int(head_dim) * bytes_per_elem * int(num_layers)
-
-    def _kv_memory_bounded_max_active(self, max_seq_len: int, base: int) -> int:
-        # Admission cap that actually uses the KV capacity we paid for. The old
-        # fixed token budget (48*512) divided by the FULL sequence length (prompt
-        # + max_tokens) and floored almost every real workload back to 48 -- even
-        # self_consistency (~542 tokens -> 24576//542 = 45), the short-context case
-        # the boost was meant to help. Two regimes:
-        #   1. Workload fits the already-allocated persistent cache -> its rows are
-        #      already resident, so admit the full cap for free (no new memory).
-        #   2. A fresh cache will be allocated -> admit as many rows as fit in free
-        #      GPU memory minus a reserve for activations/prefill workspaces, so we
-        #      raise concurrency for long-context workloads without risking OOM.
-        if not env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_KV_BOUNDED_CONCURRENCY", True):
-            return base
-        cap = self._kv_bounded_concurrency_cap()
-        prefix_rows = self._online_serving_prefix_rows()
-        persistent = getattr(self, "_persistent_serving_cache", None)
-        if persistent is not None and getattr(persistent, "layers", None):
-            pl = persistent.layers[0]
-            pmax = getattr(pl, "max_seq_len", None)
-            prows = getattr(pl, "batch_size", None)
-            if prows is None and hasattr(pl, "keys"):
-                prows = pl.keys.size(0)
-            if (
-                pmax is not None
-                and prows is not None
-                and pmax >= max_seq_len
-                and prows >= cap + prefix_rows
-            ):
-                return max(base, cap)
-        per_row_token_bytes = self._kv_bytes_per_row_per_token()
-        if per_row_token_bytes <= 0 or self.device.type != "cuda":
-            return base
-        try:
-            free_bytes, _total = torch.cuda.mem_get_info(self.device)
-        except Exception:
-            return base
-        # Reserve covers more than the resident model+cache: a fresh-cache
-        # workload also incurs a large transient PREFILL ACTIVATION spike (the
-        # 32768-token prefill burst measured ~11GB extra on the 70B). Sizing the
-        # reserve to cover that spike plus fragmentation headroom keeps the worst
-        # case (long-context fresh cache at high concurrency) well under the device
-        # limit -- a multi_turn-shaped load peaked at 89.5/97.8GB with a 12GB
-        # reserve, so the default is intentionally conservative.
-        reserve = env_int(
-            "TORCHINFERNO_OPENAI_TP_ONLINE_KV_MEM_RESERVE_BYTES", 24 * 1024**3, minimum=0
-        )
-        usable = max(0, int(free_bytes) - reserve)
-        mem_rows = usable // (per_row_token_bytes * max(1, int(max_seq_len)))
-        mem_rows = int(mem_rows) - prefix_rows
-        if mem_rows <= base:
-            return base
-        return max(base, min(cap, mem_rows))
-
     def _warmup_unified_scheduler_cache(self, vocab_size: int) -> None:
         max_active = self._kv_bounded_concurrency_cap()
         # Persistent cache holds active rows plus extra rows for shared prompt
@@ -2548,19 +2472,29 @@ class OpenAICompletionEngine:
         default_max_seq_len = self._tp_online_default_max_seq_len(initial_batch)
         max_seq_len = env_int("TORCHINFERNO_OPENAI_TP_ONLINE_MAX_SEQ_LEN", default_max_seq_len, minimum=1)
         max_seq_len = max(max_seq_len, len(first.prompt) + first.max_tokens)
-        # Memory-aware concurrency: admit as many rows as the KV cache we paid for
-        # (or free GPU memory) actually supports, instead of flooring back to 48.
-        # The old fixed budget (48*512 // max_seq_len) divided by the FULL sequence
-        # length and capped EVERY real benchmark at the 48-row base -- including
-        # self_consistency (128 client concurrency, ~542 tokens -> 24576//542 = 45),
-        # the short-context case the boost was meant to fix. The persistent cache is
-        # already sized for the full cap (128 rows), so short/medium-context
-        # workloads can use it for free; long-context workloads get a fresh cache
-        # bounded by free memory. See scripts/bench_ttft_concurrency.py: lifting the
-        # 48-row floor on a 64-concurrent long-decode load cut TTFT p90 6825->1186ms
-        # and raised throughput 1411->2494 tok/s with TPOT flat (decode is
-        # weight-bound, so extra rows are nearly free).
-        max_active = self._kv_memory_bounded_max_active(max_seq_len, max_active)
+        # KV-token-bounded concurrency boost: raise the admission cap for
+        # SHORT-context workloads so high client concurrency stops queueing
+        # against the base 48-row cap (e.g. self_consistency: ~286-token seqs at
+        # 128 concurrency). budget // max_seq_len floors back to the base for
+        # long-context workloads (few_shot/multi_turn/long_output unchanged),
+        # bounding total KV memory; the cap matches the rows the persistent cache
+        # was warmed for (_kv_bounded_concurrency_cap). Decode GEMMs are
+        # weight-bound so the extra short rows are ~free (scripts/bench_decode_batch_scaling.py).
+        if env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_KV_BOUNDED_CONCURRENCY", True):
+            kv_token_budget = env_int(
+                # 48*512. At real benchmark dims: self_consistency (~286) -> 85 rows,
+                # tree (~350) -> 70, few_shot (~406) -> 60; multi_turn (~2k) /
+                # long_output (large) stay 48. Clean A/B (2026-06-07): boost cut
+                # self_consistency-like TTFT ~2x (+10% tput; its TPOT is 0.0/
+                # uncontested), and few_shot's pure decode cost at 60 rows is only
+                # ~+0.2ms (weight-bound GEMMs) -- and in the benchmark, where
+                # few_shot TPOT (51.6) is queueing-INFLATED, more rows cut
+                # prefill-interleaving and likely LOWER it. Budget kept conservative
+                # so few_shot only reaches ~60 rows (the +1.4ms seen in the A/B was
+                # at the over-boosted 128 rows of tiny-max_seq synthetic prompts).
+                "TORCHINFERNO_OPENAI_TP_ONLINE_KV_TOKEN_BUDGET", 48 * 512, minimum=1
+            )
+            max_active = max(max_active, min(self._kv_bounded_concurrency_cap(), kv_token_budget // max_seq_len))
         persistent_cache = getattr(self, "_persistent_serving_cache", None)
         compat_max_seq_len = max_seq_len
         if persistent_cache is not None and hasattr(persistent_cache, "layers") and persistent_cache.layers:
