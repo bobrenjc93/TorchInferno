@@ -322,6 +322,30 @@ class PagedEngine:
             request_ids=[rid], prefill_wrapper=self._prefill_wrapper,
         )
 
+    def _prefill_batch(self, rids, prompts):
+        # Batched (uniform-length) prefill: ONE forward_prefill_paged for all rids
+        # of the same prompt length T, instead of one call per request -- the fix for
+        # the sequential-prefill TTFT bottleneck. qo_indptr = [0,T,2T,...,B*T].
+        import flashinfer
+
+        if len(rids) == 1:
+            return self._prefill(rids[0], prompts[0])
+        if self._prefill_ws is None:
+            self._prefill_ws = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=self.dev)
+            self._prefill_wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(self._prefill_ws, kv_layout="NHD")
+        B, T = len(rids), len(prompts[0])
+        indptr, indices, lpl = self.cache.flashinfer_page_table(rids)
+        qo = torch.arange(0, (B + 1) * T, T, dtype=torch.int32, device=self.dev)
+        self._prefill_wrapper.plan(
+            qo_indptr=qo, paged_kv_indptr=indptr, paged_kv_indices=indices, paged_kv_last_page_len=lpl,
+            num_qo_heads=self.nqo, num_kv_heads=self.nkv, head_dim_qk=self.hd, page_size=self.page_size,
+            causal=True, q_data_type=self.cache.kv.dtype,
+        )
+        return self.model.forward_prefill_paged(
+            torch.tensor(prompts, dtype=torch.long, device=self.dev), self.cache,
+            request_ids=rids, prefill_wrapper=self._prefill_wrapper,
+        )
+
     def submit(self, request_id, prompt: list[int], max_new_tokens: int, eos_token_id=None) -> None:
         self._pending.append((request_id, list(prompt), max_new_tokens, eos_token_id))
 
@@ -334,8 +358,13 @@ class PagedEngine:
 
         events: list[tuple] = []
         with torch.inference_mode():
-            # admit + prefill new arrivals (emit their first token)
-            while len(self._active) < self.max_active and self._pending:
+            # admit new arrivals (reserve pages), then BATCHED prefill grouped by
+            # prompt length (forward_prefill_paged is uniform-length, so one call per
+            # length-group instead of one per request -- avoids serializing a herd,
+            # which dominated TTFT). Deterministic across TP ranks (same pending +
+            # free pages -> same admits + grouping -> matching collectives).
+            admitted: list[dict] = []
+            while len(self._active) + len(admitted) < self.max_active and self._pending:
                 ext_id, prompt, max_new, eos = self._pending[0]
                 need = math.ceil((len(prompt) + max_new) / self.page_size)
                 if len(self.cache.free_pages) < need:
@@ -345,15 +374,27 @@ class PagedEngine:
                 self._next_rid += 1
                 self.cache.reserve(rid, len(prompt) + max_new)
                 self.cache._sequences[rid].length = len(prompt)
-                logits = self._prefill(rid, prompt)
-                tok = int(_greedy_tokens(self.model, logits[:, -1, :])[0])
-                a = {"ext": ext_id, "rid": rid, "plen": len(prompt), "gen": [tok], "max_new": max_new, "last": tok, "eos": eos}
-                fin = len(a["gen"]) >= max_new or tok == eos
-                events.append((ext_id, tok, fin))
-                if fin:
-                    self.cache.free(rid)
-                else:
-                    self._active.append(a)
+                admitted.append({"ext": ext_id, "rid": rid, "prompt": prompt, "max_new": max_new, "eos": eos})
+            if admitted:
+                groups: dict[int, list[dict]] = {}
+                for a in admitted:
+                    groups.setdefault(len(a["prompt"]), []).append(a)
+                for _T, grp in groups.items():
+                    rids = [a["rid"] for a in grp]
+                    prompts = [a["prompt"] for a in grp]
+                    logits = self._prefill_batch(rids, prompts)  # [B, T, vocab]
+                    toks = _greedy_tokens(self.model, logits[:, -1, :])  # [B]
+                    for i, a in enumerate(grp):
+                        tok = int(toks[i])
+                        fin = 1 >= a["max_new"] or tok == a["eos"]
+                        events.append((a["ext"], tok, fin))
+                        if fin:
+                            self.cache.free(a["rid"])
+                        else:
+                            self._active.append({
+                                "ext": a["ext"], "rid": a["rid"], "plen": len(a["prompt"]),
+                                "gen": [tok], "max_new": a["max_new"], "last": tok, "eos": a["eos"],
+                            })
             if not self._active:
                 return events
             # decode the active set one token
