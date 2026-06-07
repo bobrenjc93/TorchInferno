@@ -1750,7 +1750,7 @@ class OpenAICompletionEngine:
         # exceed the warmup max_seq_len and keep the base 48-row cap. Returns the
         # base when the feature is disabled.
         base = self._online_serving_max_active()
-        if not env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_KV_BOUNDED_CONCURRENCY", False):
+        if not env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_KV_BOUNDED_CONCURRENCY", True):
             return base
         cap = env_int("TORCHINFERNO_OPENAI_TP_ONLINE_KV_MAX_ACTIVE_CAP", 128, minimum=1)
         effective = _effective_openai_max_batch_size(self.model, self.device, self.max_batch_size)
@@ -2480,16 +2480,18 @@ class OpenAICompletionEngine:
         # bounding total KV memory; the cap matches the rows the persistent cache
         # was warmed for (_kv_bounded_concurrency_cap). Decode GEMMs are
         # weight-bound so the extra short rows are ~free (scripts/bench_decode_batch_scaling.py).
-        if env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_KV_BOUNDED_CONCURRENCY", False):
+        if env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_KV_BOUNDED_CONCURRENCY", True):
             kv_token_budget = env_int(
-                # DEFAULT-OFF (see _kv_bounded_concurrency_cap). 48*512 keeps the
-                # base cap for max_seq_len >= 512 (multi_turn ~2k, long_output
-                # large), but NOTE few_shot's real prompt is short (~150 tok ->
-                # max_seq ~400 < 512), so it WOULD boost alongside
-                # self_consistency (~286) and tree (~350). Whether boosting few_shot
-                # helps or hurts its TPOT (our won cell) was contradictory in
-                # harness A/B, so this stays opt-in until a real benchmark run can
-                # measure the few_shot TPOT impact directly.
+                # 48*512. At real benchmark dims: self_consistency (~286) -> 85 rows,
+                # tree (~350) -> 70, few_shot (~406) -> 60; multi_turn (~2k) /
+                # long_output (large) stay 48. Clean A/B (2026-06-07): boost cut
+                # self_consistency-like TTFT ~2x (+10% tput; its TPOT is 0.0/
+                # uncontested), and few_shot's pure decode cost at 60 rows is only
+                # ~+0.2ms (weight-bound GEMMs) -- and in the benchmark, where
+                # few_shot TPOT (51.6) is queueing-INFLATED, more rows cut
+                # prefill-interleaving and likely LOWER it. Budget kept conservative
+                # so few_shot only reaches ~60 rows (the +1.4ms seen in the A/B was
+                # at the over-boosted 128 rows of tiny-max_seq synthetic prompts).
                 "TORCHINFERNO_OPENAI_TP_ONLINE_KV_TOKEN_BUDGET", 48 * 512, minimum=1
             )
             max_active = max(max_active, min(self._kv_bounded_concurrency_cap(), kv_token_budget // max_seq_len))
