@@ -4482,7 +4482,12 @@ class Llama3TensorParallelForCausalLM:
             cos = torch.cat((cos, cos), dim=-1)
             sin = torch.cat((sin, sin), dim=-1)
         rotary = (cos, sin)
-        slots = paged_cache.slot_mapping(request_ids, [int(p) for p in positions.tolist()])
+        # On-device slot computation (no positions.tolist() host sync) so this
+        # decode step is a step closer to CUDA-graph capture -- the requirement for
+        # paged decode to match the dense graphed ~21ms instead of the eager ~146ms
+        # (scripts/bench_decode_context_scaling.py). slot_mapping_device matches the
+        # host slot_mapping exactly (tests/test_scaffolding.py).
+        slots = paged_cache.slot_mapping_device(request_ids, positions)
 
         hidden = F.embedding(input_ids, self.embed_tokens_weight)
         attn_in: Tensor | None = None
