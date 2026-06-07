@@ -1750,7 +1750,7 @@ class OpenAICompletionEngine:
         # exceed the warmup max_seq_len and keep the base 48-row cap. Returns the
         # base when the feature is disabled.
         base = self._online_serving_max_active()
-        if not env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_KV_BOUNDED_CONCURRENCY", False):
+        if not env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_KV_BOUNDED_CONCURRENCY", True):
             return base
         cap = env_int("TORCHINFERNO_OPENAI_TP_ONLINE_KV_MAX_ACTIVE_CAP", 128, minimum=1)
         effective = _effective_openai_max_batch_size(self.model, self.device, self.max_batch_size)
@@ -2480,7 +2480,7 @@ class OpenAICompletionEngine:
         # bounding total KV memory; the cap matches the rows the persistent cache
         # was warmed for (_kv_bounded_concurrency_cap). Decode GEMMs are
         # weight-bound so the extra short rows are ~free (scripts/bench_decode_batch_scaling.py).
-        if env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_KV_BOUNDED_CONCURRENCY", False):
+        if env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_KV_BOUNDED_CONCURRENCY", True):
             kv_token_budget = env_int(
                 # 48 * 512: keeps the base 48-row cap for any workload with
                 # max_seq_len >= 512 (few_shot ~896, multi_turn ~2k, long_output
@@ -2631,6 +2631,21 @@ class OpenAICompletionEngine:
                     max_tokens=run_max_tokens,
                 )
                 shared_cache = getattr(self, "_persistent_serving_cache", None)
+                # The persistent cache must be at least as long as this workload's
+                # sequences AND have enough rows for the (possibly KV-bounded
+                # boosted) active set; otherwise reusing it overruns its bounds at
+                # runtime (index-out-of-bounds device assert). Fall through to a
+                # fresh, correctly-sized allocation when it does not fit.
+                if shared_cache is not None and hasattr(shared_cache, "layers") and shared_cache.layers:
+                    _player = shared_cache.layers[0]
+                    persistent_max_seq = getattr(_player, "max_seq_len", None)
+                    persistent_rows = getattr(_player, "batch_size", None)
+                    if persistent_rows is None and hasattr(_player, "keys"):
+                        persistent_rows = _player.keys.size(0)
+                    if (persistent_max_seq is not None and persistent_max_seq < max_seq_len) or (
+                        persistent_rows is not None and persistent_rows < max_active + prefix_rows
+                    ):
+                        shared_cache = None
                 if shared_cache is None:
                     try:
                         total_online_rows = max_active + prefix_rows
