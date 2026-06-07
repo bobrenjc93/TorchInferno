@@ -184,6 +184,69 @@ def test_layered_paged_kv_cache_flashinfer_decode_matches_dense() -> None:
         torch.testing.assert_close(out[i].float(), ref, atol=3e-2, rtol=3e-2)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="FlashInfer paged decode needs CUDA")
+def test_layered_paged_kv_cache_scatter_write_flashinfer_matches_dense() -> None:
+    # Same end-to-end check as above but the KV is written via the PRODUCTION
+    # hot-path primitives slot_mapping() + scatter_write() (single batched scatter
+    # over all (request, token) pairs) rather than the per-request write_layer()
+    # loop. Confirms the exact write path the paged decode serving will use is
+    # FlashInfer-correct vs a dense SDPA reference.
+    import math as _math
+
+    flashinfer = pytest.importorskip("flashinfer")
+    from torchinferno.runtime.paged import LayeredPagedKVCache
+
+    dev = torch.device("cuda")
+    torch.manual_seed(1)
+    nqo, nkv, hd, page_size = 8, 2, 64, 16
+    cache = LayeredPagedKVCache(
+        num_layers=1, num_pages=64, page_size=page_size,
+        num_key_value_heads=nkv, head_dim=hd, device=dev, dtype=torch.bfloat16,
+    )
+    lengths = {"a": 20, "b": 33, "c": 7}
+    refs: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+    # Reserve pages first, then build one flat batched scatter over every token.
+    all_ids: list[str] = []
+    all_pos: list[int] = []
+    all_k: list[torch.Tensor] = []
+    all_v: list[torch.Tensor] = []
+    for rid, n in lengths.items():
+        cache.reserve(rid, n)
+        cache._sequences[rid].length = n  # mark filled (scatter_write sets storage)
+        k = torch.randn(n, nkv, hd, device=dev, dtype=torch.bfloat16)
+        v = torch.randn(n, nkv, hd, device=dev, dtype=torch.bfloat16)
+        refs[rid] = (k, v)
+        all_ids += [rid] * n
+        all_pos += list(range(n))
+        all_k.append(k)
+        all_v.append(v)
+    slots = cache.slot_mapping(all_ids, all_pos)
+    cache.scatter_write(0, slots, torch.cat(all_k, 0), torch.cat(all_v, 0))
+
+    rids = ["a", "b", "c"]
+    indptr, indices, last_page_len = cache.flashinfer_page_table(rids)
+    workspace = torch.empty(64 * 1024 * 1024, dtype=torch.uint8, device=dev)
+    dw = flashinfer.BatchDecodeWithPagedKVCacheWrapper(workspace, kv_layout="NHD")
+    dw.plan(
+        indptr=indptr, indices=indices, last_page_len=last_page_len,
+        num_qo_heads=nqo, num_kv_heads=nkv, head_dim=hd, page_size=page_size,
+        q_data_type=torch.bfloat16,
+    )
+    q = torch.randn(len(rids), nqo, hd, device=dev, dtype=torch.bfloat16)
+    out = dw.run(q, cache.layer_kv(0))
+
+    scale = 1.0 / _math.sqrt(hd)
+    rep = nqo // nkv
+    for i, rid in enumerate(rids):
+        k, v = refs[rid]
+        kx = k.repeat_interleave(rep, dim=1).float()
+        vx = v.repeat_interleave(rep, dim=1).float()
+        qi = q[i].float()
+        scores = torch.einsum("hd,nhd->hn", qi, kx) * scale
+        ref = torch.einsum("hn,nhd->hd", scores.softmax(-1), vx)
+        torch.testing.assert_close(out[i].float(), ref, atol=3e-2, rtol=3e-2)
+
+
 def test_layered_paged_kv_cache_slot_mapping_scatter_write() -> None:
     from torchinferno.runtime.paged import LayeredPagedKVCache
 
