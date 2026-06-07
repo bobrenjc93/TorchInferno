@@ -208,14 +208,21 @@ Implications:
   kernel (efficient to M~64) could help batched decode -- needs the torchao
   cutlass build fixed or a custom kernel. NO available quantization path improves
   our batched decode.
-  Build infra is also blocked (checked): torchao 0.17.0's cutlass .so was built
-  for CUDA 13 / a stable torch ABI and won't load against our CUDA-12.6 custom
-  torch 2.13.0a0; rebuilding from source is impractical here -- the reachable pip
-  index only has torchao 0.0.1-0.1, and a github build against a future-versioned
-  torch (2.13.0a0) would likely fail on API drift. vllm is importable but its _C
-  marlin ops aren't registered (same ABI class). So unlocking a batched-M quant
-  kernel needs a from-source torchao/vllm build (API-compat fixes) or a custom
-  triton Marlin -- a multi-day effort, not a loop iteration. CONFIRMED by two
+  Build infra UPDATE (RESOLVED the ABI block, but int4 still unavailable):
+  torchao 0.17.0's prebuilt cutlass .so was built for CUDA 13 / a stable torch
+  ABI and would not load against our CUDA-12.6 custom torch 2.13.0a0. Rebuilding
+  torchao 0.18 FROM GITHUB SOURCE against our torch WORKS (scripts/build_torchao.sh):
+  the resulting _C_cutlass_90a.abi3.so loads cleanly (ctypes.CDLL OK) and its
+  torch.ops.torchao cutlass ops are live -- the long-cited ABI block is gone.
+  BUT this does NOT hand us an int4 decode kernel: torchao 0.18's cutlass kernels
+  are FP8-SPARSE (rowwise_scaled_linear_sparse_cutlass_f8f8; no marlin_qqq_gemm),
+  and its default Int4WeightOnlyConfig now requires a separate `mslk>=1.0.0`
+  dependency (ImportError, not installed); the only built-in int4 path is the
+  M=1-tuned tinygemm (_weight_int4pack_mm, already shown 0.24x at M=48). vllm's
+  _C marlin ops also don't register (same prebuilt-ABI class). So the int4
+  batched decode kernel still needs either the `mslk` lib built/installed, a
+  Marlin-class custom kernel (triton plateaus at ~0.8x), or a vllm from-source
+  rebuild. The ABI groundwork is done and reproducible; the kernel itself is not. CONFIRMED by two
   rounds of attempt (scripts/bench_triton_int4.py, packed int4 + groupwise
   dequant): a naive kernel is 0.03-0.74x; a rewritten one (even/odd nibble split
   = two clean tl.dots, BLOCK_K=group, autotuned BLOCK_M/N + num_stages) reaches
