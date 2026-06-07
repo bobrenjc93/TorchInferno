@@ -10492,6 +10492,9 @@ def test_openai_tensor_parallel_online_batcher_uses_queued_limit_for_default_row
     first_queue: queue.Queue[object] = queue.Queue()
     first = _QueuedGeneration([1] * 120, 44, 0.0, True, first_queue)
 
+    # Pin the BASE admission sizing; the KV-bounded concurrency boost (which would
+    # raise max_active for this short 164-token seq) has its own test below.
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_KV_BOUNDED_CONCURRENCY", "0")
     engine._run_tensor_parallel_online_batcher(first)
 
     assert commands[0] == (
@@ -10510,6 +10513,31 @@ def test_openai_tensor_parallel_online_batcher_uses_queued_limit_for_default_row
     )
     assert first_queue.get_nowait() == 500
     assert isinstance(first_queue.get_nowait(), _GenerationDone)
+
+
+def test_kv_bounded_concurrency_cap(monkeypatch: pytest.MonkeyPatch) -> None:
+    model = type("FakeTPModel", (), {"world_size": 8, "rank": 0})()
+    monkeypatch.setattr(
+        "torchinferno.openai_server._is_tensor_parallel_model",
+        lambda candidate: candidate is model,
+    )
+    monkeypatch.setattr(
+        "torchinferno.openai_server._effective_openai_max_batch_size",
+        lambda *args, **kwargs: 256,
+    )
+    engine = _cache_only_engine()
+    engine.model = model
+    engine.device = torch.device("cuda")
+    engine.max_batch_size = 256
+    # Disabled: cap == base (no boosting).
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_KV_BOUNDED_CONCURRENCY", "0")
+    base = engine._online_serving_max_active()
+    assert engine._kv_bounded_concurrency_cap() == base
+    # Enabled: cap rises to the configured ceiling (clamped by effective batch).
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_KV_BOUNDED_CONCURRENCY", "1")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_KV_MAX_ACTIVE_CAP", "128")
+    assert engine._kv_bounded_concurrency_cap() == 128
+    assert engine._kv_bounded_concurrency_cap() >= base
 
 
 def test_openai_tensor_parallel_long_prompt_short_stream_cap_is_opt_in(

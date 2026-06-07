@@ -1741,8 +1741,23 @@ class OpenAICompletionEngine:
                     self._run_queued_batch(next_batch)
                     self._completed_queue_batches += 1
 
+    def _kv_bounded_concurrency_cap(self) -> int:
+        # Upper bound on KV-token-bounded concurrency boosting. The persistent
+        # serving cache is sized for this many rows so SHORT-context workloads
+        # (self_consistency/tree: tiny prompts + early EOS, run at 128 client
+        # concurrency against a 48-row cap = pure queueing) can be admitted at
+        # higher concurrency without per-run reallocation. Long-context workloads
+        # exceed the warmup max_seq_len and keep the base 48-row cap. Returns the
+        # base when the feature is disabled.
+        base = self._online_serving_max_active()
+        if not env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_KV_BOUNDED_CONCURRENCY", False):
+            return base
+        cap = env_int("TORCHINFERNO_OPENAI_TP_ONLINE_KV_MAX_ACTIVE_CAP", 128, minimum=1)
+        effective = _effective_openai_max_batch_size(self.model, self.device, self.max_batch_size)
+        return max(base, min(cap, effective))
+
     def _warmup_unified_scheduler_cache(self, vocab_size: int) -> None:
-        max_active = self._online_serving_max_active()
+        max_active = self._kv_bounded_concurrency_cap()
         # Persistent cache holds active rows plus extra rows for shared prompt
         # prefixes, so the continuous batcher can prefill only suffixes.
         total_rows = max_active + self._online_serving_prefix_rows()
@@ -2457,6 +2472,24 @@ class OpenAICompletionEngine:
         default_max_seq_len = self._tp_online_default_max_seq_len(initial_batch)
         max_seq_len = env_int("TORCHINFERNO_OPENAI_TP_ONLINE_MAX_SEQ_LEN", default_max_seq_len, minimum=1)
         max_seq_len = max(max_seq_len, len(first.prompt) + first.max_tokens)
+        # KV-token-bounded concurrency boost: raise the admission cap for
+        # SHORT-context workloads so high client concurrency stops queueing
+        # against the base 48-row cap (e.g. self_consistency: ~286-token seqs at
+        # 128 concurrency). budget // max_seq_len floors back to the base for
+        # long-context workloads (few_shot/multi_turn/long_output unchanged),
+        # bounding total KV memory; the cap matches the rows the persistent cache
+        # was warmed for (_kv_bounded_concurrency_cap). Decode GEMMs are
+        # weight-bound so the extra short rows are ~free (scripts/bench_decode_batch_scaling.py).
+        if env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_KV_BOUNDED_CONCURRENCY", False):
+            kv_token_budget = env_int(
+                # 48 * 512: keeps the base 48-row cap for any workload with
+                # max_seq_len >= 512 (few_shot ~896, multi_turn ~2k, long_output
+                # large all stay 48 -> no TPOT regression on our contested cells),
+                # and only boosts genuinely short-context workloads
+                # (self_consistency ~286 -> ~85, tree_of_thought ~350 -> ~70).
+                "TORCHINFERNO_OPENAI_TP_ONLINE_KV_TOKEN_BUDGET", 48 * 512, minimum=1
+            )
+            max_active = max(max_active, min(self._kv_bounded_concurrency_cap(), kv_token_budget // max_seq_len))
         persistent_cache = getattr(self, "_persistent_serving_cache", None)
         compat_max_seq_len = max_seq_len
         if persistent_cache is not None and hasattr(persistent_cache, "layers") and persistent_cache.layers:
