@@ -19,7 +19,7 @@ from torchinferno.runtime.offload import (
     run_offloaded_generate_recompute,
     summarize_offload_events,
 )
-from torchinferno.runtime.paged import PagedKVCache, PagedSequence
+from torchinferno.runtime.paged import LayeredPagedKVCache, PagedKVCache, PagedSequence
 from torchinferno.runtime.paged_attention import paged_causal_attention
 from torchinferno.runtime.prefix import PrefixAwareRouter, PrefixMatch, RadixPrefixTree
 from torchinferno.runtime.prefix_cache import (
@@ -80,6 +80,7 @@ __all__ = [
     "JsonRankClient",
     "OffloadEvent",
     "OffloadRunResult",
+    "LayeredPagedKVCache",
     "PagedKVCache",
     "PagedSequence",
     "PersistentBatchPlan",
