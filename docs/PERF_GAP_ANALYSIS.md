@@ -169,7 +169,14 @@ Implications:
   torch (2.13.0a0) would likely fail on API drift. vllm is importable but its _C
   marlin ops aren't registered (same ABI class). So unlocking a batched-M quant
   kernel needs a from-source torchao/vllm build (API-compat fixes) or a custom
-  triton Marlin -- a multi-day effort, not a loop iteration.
+  triton Marlin -- a multi-day effort, not a loop iteration. CONFIRMED by attempt:
+  a naive Triton W4A16 kernel (scripts/bench_triton_int4.py, packed int4 +
+  groupwise dequant, BLOCK_M tuned for M=16-64) runs 0.03-0.74x vs cuBLAS bf16 --
+  10-25x off. cuBLAS bf16 is highly tuned; a competitive int4 GEMM (Marlin-class:
+  cp.async pipelining, tensor-core scheduling, tuned tiling) is an expert
+  multi-week effort. Triton is unblocked in AVAILABILITY but not in EFFORT. Net
+  across ALL angles (PyTorch M=1 kernels, torchao/vllm ABI, custom triton):
+  faster batched-decode quant is not reachable with available tools/effort.
 - FP8 PREFILL is the viable lever for the DOMINANT TTFT gap. Prefill GEMMs are
   52% of prefill at 34% MFU; at M>=2048 (few_shot is 48x640=30720 tokens) FP8 is
   ~1.8x on that portion -> ~23% prefill reduction -> few_shot TTFT ~317->~244
