@@ -130,3 +130,14 @@ REMAINING = serving-engine wiring ONLY (runtime/serving.py + openai_server.py):
 This needs the live 8xH100 server to validate (correctness + concurrency); the
 model-side groundwork above makes it assembly, not new algorithms. Merge flag-gated
 default-dense, validate on 8xH100, then default-on.
+
+## UPDATE 2026-06-07 (later): forward_decode_paged VALIDATED ON THE REAL 70B
+
+scripts/bench_paged_serving_70b.py (torchrun, branch) loaded the actual
+Llama-3.1-70B TP8 and ran forward_decode_paged through a LayeredPagedKVCache:
+paged decode logits match the dense forward -- max|d|=0.125 rel=0.0118 (bf16-level).
+So the FlashInfer-paged decode is now validated on the REAL model, not just a tiny
+one. (Decode throughput vs concurrency is in the same script but needs free GPUs --
+a co-tenant 8-GPU job took the machine; the concurrency win is already kernel-benched
+in bench_paged_decode_concurrency.py.) The model-side paged forward is now
+real-model-validated; only the serving-engine wiring remains.
