@@ -230,6 +230,37 @@ def test_triton_rotary_llama_inplace_matches_torch_reference() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available() or not triton_available(), reason="CUDA Triton kernels unavailable")
+def test_triton_rotary_llama_batched_inplace_matches_torch_reference() -> None:
+    # Per-(batch,token) variant used by the decode / ragged-suffix rope: each row
+    # carries its OWN positions (cos/sin are [batch, tokens, dim]), unlike the
+    # shared-across-batch kernel above. Validates it matches _rotate_llama_eager.
+    from torchinferno.kernels.triton_ops import triton_apply_rotary_llama_batched_inplace
+    from torchinferno.models.llama3.tensor_parallel import _rotate_llama_eager
+
+    torch.manual_seed(17)
+    batch, tokens, q_heads, kv_heads, head_dim = 4, 1, 8, 1, 128
+    packed = torch.randn(
+        batch, tokens, (q_heads + kv_heads + kv_heads) * head_dim,
+        device="cuda", dtype=torch.bfloat16,
+    )
+    q, k, _ = packed.split((q_heads * head_dim, kv_heads * head_dim, kv_heads * head_dim), dim=-1)
+    q = q.view(batch, tokens, q_heads, head_dim).transpose(1, 2)
+    k = k.view(batch, tokens, kv_heads, head_dim).transpose(1, 2)
+    freqs = torch.randn(batch, tokens, head_dim // 2, device="cuda")
+    cos_half = freqs.cos().to(torch.bfloat16)
+    sin_half = freqs.sin().to(torch.bfloat16)
+    cos_full = torch.cat((cos_half, cos_half), dim=-1)
+    sin_full = torch.cat((sin_half, sin_half), dim=-1)
+    expected_q = _rotate_llama_eager(q, cos_full[:, None, :, :], sin_full[:, None, :, :])
+    expected_k = _rotate_llama_eager(k, cos_full[:, None, :, :], sin_full[:, None, :, :])
+
+    actual_q, actual_k = triton_apply_rotary_llama_batched_inplace(q.clone(), k.clone(), cos_full, sin_full)
+
+    torch.testing.assert_close(actual_q, expected_q, atol=4e-2, rtol=4e-2)
+    torch.testing.assert_close(actual_k, expected_k, atol=4e-2, rtol=4e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or not triton_available(), reason="CUDA Triton kernels unavailable")
 def test_triton_kv_cache_append_matches_torch_reference() -> None:
     from torchinferno.kernels.triton_ops import triton_append_kv_cache
 

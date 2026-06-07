@@ -251,6 +251,147 @@ def triton_apply_rotary_llama_inplace(
 
 
 @triton.jit
+def _rotary_llama_qk_batched_inplace_kernel(
+    q_ptr,
+    k_ptr,
+    cos_ptr,
+    sin_ptr,
+    total_elements,
+    total_q,
+    total_k,
+    q_heads: tl.constexpr,
+    k_heads: tl.constexpr,
+    tokens: tl.constexpr,
+    half_dim: tl.constexpr,
+    cache_dim: tl.constexpr,
+    q_stride_batch: tl.constexpr,
+    q_stride_head: tl.constexpr,
+    q_stride_token: tl.constexpr,
+    q_stride_dim: tl.constexpr,
+    k_stride_batch: tl.constexpr,
+    k_stride_head: tl.constexpr,
+    k_stride_token: tl.constexpr,
+    k_stride_dim: tl.constexpr,
+    cos_stride_batch: tl.constexpr,
+    cos_stride_token: tl.constexpr,
+    block_size: tl.constexpr,
+) -> None:
+    # Fused Llama rotate-half RoPE for q/k where the rotary tables vary PER
+    # (batch_row, token) -- the decode/ragged-suffix case, unlike the prefill
+    # kernel above whose positions are shared across the batch. cos/sin are
+    # indexed [batch, token, dim]; q/k broadcast it over their head dim. Math is
+    # identical to _rotate_llama_eager (q_first*cos - q_second*sin in the low
+    # half, q_second*cos + q_first*sin in the high half).
+    offsets = tl.program_id(0) * block_size + tl.arange(0, block_size)
+    mask = offsets < total_elements
+    rotary_dim = offsets % half_dim
+    token_head_batch = offsets // half_dim
+
+    q_token = token_head_batch % tokens
+    q_head_batch = token_head_batch // tokens
+    q_head = q_head_batch % q_heads
+    q_batch = q_head_batch // q_heads
+    q_offset = (
+        q_batch * q_stride_batch
+        + q_head * q_stride_head
+        + q_token * q_stride_token
+        + rotary_dim * q_stride_dim
+    )
+    q_cos_offset = q_batch * cos_stride_batch + q_token * cos_stride_token + rotary_dim
+    q_mask = mask & (offsets < total_q)
+    q_first = tl.load(q_ptr + q_offset, mask=q_mask, other=0.0).to(tl.float32)
+    q_second = tl.load(q_ptr + q_offset + half_dim * q_stride_dim, mask=q_mask, other=0.0).to(tl.float32)
+    q_cos = tl.load(cos_ptr + q_cos_offset, mask=q_mask, other=1.0).to(tl.float32)
+    q_sin = tl.load(sin_ptr + q_cos_offset, mask=q_mask, other=0.0).to(tl.float32)
+    tl.store(q_ptr + q_offset, q_first * q_cos - q_second * q_sin, mask=q_mask)
+    tl.store(q_ptr + q_offset + half_dim * q_stride_dim, q_second * q_cos + q_first * q_sin, mask=q_mask)
+
+    k_token = token_head_batch % tokens
+    k_head_batch = token_head_batch // tokens
+    k_head = k_head_batch % k_heads
+    k_batch = k_head_batch // k_heads
+    k_offset = (
+        k_batch * k_stride_batch
+        + k_head * k_stride_head
+        + k_token * k_stride_token
+        + rotary_dim * k_stride_dim
+    )
+    k_cos_offset = k_batch * cos_stride_batch + k_token * cos_stride_token + rotary_dim
+    k_mask = mask & (offsets < total_k)
+    k_first = tl.load(k_ptr + k_offset, mask=k_mask, other=0.0).to(tl.float32)
+    k_second = tl.load(k_ptr + k_offset + half_dim * k_stride_dim, mask=k_mask, other=0.0).to(tl.float32)
+    k_cos = tl.load(cos_ptr + k_cos_offset, mask=k_mask, other=1.0).to(tl.float32)
+    k_sin = tl.load(sin_ptr + k_cos_offset, mask=k_mask, other=0.0).to(tl.float32)
+    tl.store(k_ptr + k_offset, k_first * k_cos - k_second * k_sin, mask=k_mask)
+    tl.store(k_ptr + k_offset + half_dim * k_stride_dim, k_second * k_cos + k_first * k_sin, mask=k_mask)
+
+
+def triton_apply_rotary_llama_batched_inplace(
+    q: Tensor,
+    k: Tensor,
+    cos: Tensor,
+    sin: Tensor,
+) -> tuple[Tensor, Tensor]:
+    """Per-(batch,token) Llama rotate-half RoPE on q/k views, in place.
+
+    q/k: [batch, heads, tokens, head_dim] (any strides, contiguous head dim).
+    cos/sin: [batch, tokens, head_dim] or [batch, tokens, head_dim/2]. This is the
+    decode / ragged-suffix analogue of triton_apply_rotary_llama_inplace (whose
+    rotary tables are shared across the batch). Fuses the rotate-half cat/neg/mul
+    that _rotate_llama_eager otherwise spends ~2.6ms on across the decode step.
+    """
+    if q.ndim != 4 or k.ndim != 4:
+        raise ValueError("q and k must have shape [batch, heads, tokens, head_dim]")
+    if q.size(0) != k.size(0) or q.size(-1) != k.size(-1) or q.size(-2) != k.size(-2):
+        raise ValueError("q and k must share batch, token, and head dimensions")
+    if q.size(-1) % 2 != 0:
+        raise ValueError("head dimension must be even")
+    if q.stride(-1) != 1 or k.stride(-1) != 1:
+        raise ValueError("q and k must have contiguous head dimensions")
+    if cos.shape != sin.shape:
+        raise ValueError("cos and sin must have the same shape")
+    batch, q_heads, tokens, head_dim = q.shape
+    half_dim = head_dim // 2
+    if cos.shape not in {(batch, tokens, head_dim), (batch, tokens, half_dim)}:
+        raise ValueError("rotary cache must be [batch, tokens, head_dim] or [..., head_dim/2]")
+    cos = cos.contiguous()
+    sin = sin.contiguous()
+    k_heads = k.size(1)
+    total_q = batch * q_heads * tokens * half_dim
+    total_k = batch * k_heads * tokens * half_dim
+    total_elements = max(total_q, total_k)
+    block_size = 256
+    grid = (triton.cdiv(total_elements, block_size),)
+    _rotary_llama_qk_batched_inplace_kernel[grid](
+        q,
+        k,
+        cos,
+        sin,
+        total_elements,
+        total_q,
+        total_k,
+        q_heads,
+        k_heads,
+        tokens,
+        half_dim,
+        cos.size(-1),
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        q.stride(3),
+        k.stride(0),
+        k.stride(1),
+        k.stride(2),
+        k.stride(3),
+        cos.stride(0),
+        cos.stride(1),
+        block_size,
+        num_warps=4,
+    )
+    return q, k
+
+
+@triton.jit
 def _rotary_llama_append_kv_decode_kernel(
     q_ptr,
     k_ptr,

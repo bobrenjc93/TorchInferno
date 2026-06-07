@@ -5049,6 +5049,20 @@ def _apply_rotary_cached(q: Tensor, k: Tensor, rotary: tuple[Tensor, Tensor]) ->
 
 def _apply_rotary_ragged(q: Tensor, k: Tensor, rotary: tuple[Tensor, Tensor]) -> tuple[Tensor, Tensor]:
     cos, sin = rotary
+    # Same fused-kernel fast path as _apply_rotary_ragged_prefill; here cos/sin
+    # are [batch, rotary_dim] (one position per row), reshaped to [batch, 1, dim]
+    # for the per-(batch,token) kernel.
+    if q.is_cuda and k.is_cuda and _tp_flag("TORCHINFERNO_TRITON_ROTARY"):
+        try:
+            from torchinferno.kernels.triton_ops import (
+                triton_apply_rotary_llama_batched_inplace,
+            )
+
+            return triton_apply_rotary_llama_batched_inplace(
+                q, k, cos.unsqueeze(1), sin.unsqueeze(1)
+            )
+        except Exception as exc:
+            warn_optional_failure("llama3_tensor_parallel.rotary_ragged", exc)
     cos = cos[:, None, None, :]
     sin = sin[:, None, None, :]
     return _rotate_llama(q, cos, sin), _rotate_llama(k, cos, sin)
@@ -5190,6 +5204,21 @@ def _apply_rotary_ragged_prefill(
     # positions, unlike decode's single position per row); broadcast over the
     # head dim. _rotate_llama handles the half-width cos/sin via a cat.
     cos, sin = rotary
+    # Fused-kernel fast path: the aten rotate-half below is cat/neg/mul that the
+    # decode profiler showed at ~1.3ms/step (after the cos/sin pre-expand hoist);
+    # the batched triton kernel does it in one in-place launch (~0.1ms/step, 13x).
+    # Used by BOTH the graph-captured and eager decode, so graph-vs-eager stays
+    # bit-identical (same kernel both sides). Same flag as the uniform-prefill
+    # fused rope in _apply_rotary_cached.
+    if q.is_cuda and k.is_cuda and _tp_flag("TORCHINFERNO_TRITON_ROTARY"):
+        try:
+            from torchinferno.kernels.triton_ops import (
+                triton_apply_rotary_llama_batched_inplace,
+            )
+
+            return triton_apply_rotary_llama_batched_inplace(q, k, cos, sin)
+        except Exception as exc:
+            warn_optional_failure("llama3_tensor_parallel.rotary_ragged_prefill", exc)
     cos = cos[:, None, :, :]
     sin = sin[:, None, :, :]
     return _rotate_llama(q, cos, sin), _rotate_llama(k, cos, sin)
