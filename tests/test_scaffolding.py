@@ -184,6 +184,43 @@ def test_layered_paged_kv_cache_flashinfer_decode_matches_dense() -> None:
         torch.testing.assert_close(out[i].float(), ref, atol=3e-2, rtol=3e-2)
 
 
+def test_layered_paged_kv_cache_slot_mapping_scatter_write() -> None:
+    from torchinferno.runtime.paged import LayeredPagedKVCache
+
+    cache = LayeredPagedKVCache(
+        num_layers=2, num_pages=16, page_size=4, num_key_value_heads=2,
+        head_dim=3, device=torch.device("cpu"), dtype=torch.float32,
+    )
+    # Two requests; reserve enough pages for the positions we will write.
+    cache.reserve("a", 8)  # 2 pages
+    cache.reserve("b", 8)  # 2 pages
+    # Write one token per request at a batch of positions spanning page boundaries
+    # (pos 5 is page 1 offset 1 for "a"; pos 3 is page 0 offset 3 for "b"), via the
+    # batched slot-mapping scatter, and confirm it lands where write_layer would.
+    rids = ["a", "b", "a", "b"]
+    positions = [0, 0, 5, 3]
+    slots = cache.slot_mapping(rids, positions)
+    # Expected flat slots: a.page0*4+0, b.page0*4+0, a.page1*4+1, b.page0*4+3.
+    exp = [
+        cache._sequences["a"].page_ids[0] * 4 + 0,
+        cache._sequences["b"].page_ids[0] * 4 + 0,
+        cache._sequences["a"].page_ids[1] * 4 + 1,
+        cache._sequences["b"].page_ids[0] * 4 + 3,
+    ]
+    assert slots.tolist() == exp
+
+    for layer in range(2):
+        keys = torch.arange(4 * 2 * 3, dtype=torch.float32).view(4, 2, 3) + layer * 100
+        values = keys + 50
+        cache.scatter_write(layer, slots, keys, values)
+        # Read back each written slot directly from storage and compare.
+        for i, (rid, pos) in enumerate(zip(rids, positions)):
+            page = cache._sequences[rid].page_ids[pos // 4]
+            off = pos % 4
+            torch.testing.assert_close(cache.kv[layer, page, 0, off], keys[i])
+            torch.testing.assert_close(cache.kv[layer, page, 1, off], values[i])
+
+
 def test_layered_paged_kv_cache_out_of_pages_raises() -> None:
     from torchinferno.runtime.paged import LayeredPagedKVCache
 

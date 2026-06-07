@@ -358,6 +358,43 @@ class LayeredPagedKVCache:
             return empty, empty.clone()
         return torch.cat(keys, dim=0), torch.cat(values, dim=0)
 
+    def slot_mapping(
+        self, request_ids: list[str], positions: list[int]
+    ) -> Tensor:
+        """vLLM-style flat KV-write slots for a batch of (request, position) pairs.
+
+        Returns an int64 tensor of `page_id * page_size + page_offset` -- the slot
+        each token's K/V occupies in a layer's `[num_pages, page_size, ...]` storage
+        flattened over (page, offset). This is the hot-path paged-write primitive:
+        the model computes it once per step (block table is layer-independent) and
+        every layer does a SINGLE batched scatter via scatter_write(), instead of
+        the per-request Python loop in write_layer() -- graph-friendly and fast.
+        """
+        if len(request_ids) != len(positions):
+            raise ValueError("request_ids and positions must be the same length")
+        slots: list[int] = []
+        for request_id, position in zip(request_ids, positions):
+            seq = self._sequences[request_id]
+            if position >= len(seq.page_ids) * self.page_size:
+                raise ValueError("position exceeds reserved pages; call extend/reserve first")
+            page_id = seq.page_ids[position // self.page_size]
+            slots.append(page_id * self.page_size + position % self.page_size)
+        return torch.tensor(slots, dtype=torch.long, device=self.kv.device)
+
+    def scatter_write(self, layer: int, slots: Tensor, keys: Tensor, values: Tensor) -> None:
+        """Single batched paged KV write for one layer via a slot_mapping().
+
+        keys/values are NHD ``[num_slots, kv_heads, head_dim]``; `slots` are the
+        flat (page*page_size+offset) indices from slot_mapping(). One advanced-index
+        scatter (no Python loop), which is what the captured decode graph needs.
+        """
+        if keys.ndim != 3 or values.ndim != 3:
+            raise ValueError("keys/values must be [num_slots, kv_heads, head_dim] (NHD)")
+        pages = slots // self.page_size
+        offsets = slots % self.page_size
+        self.kv[layer, pages, 0, offsets] = keys
+        self.kv[layer, pages, 1, offsets] = values
+
     def flashinfer_page_table(
         self, request_ids: list[str]
     ) -> tuple[Tensor, Tensor, Tensor]:
