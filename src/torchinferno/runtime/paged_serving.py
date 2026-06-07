@@ -296,6 +296,31 @@ class PagedEngine:
         self._active: list[dict] = []
         self._next_rid = 0
         self._step_no = 0
+        self._prefill_ws = None       # persistent prefill workspace (avoid per-call 128MB alloc)
+        self._prefill_wrapper = None  # persistent prefill wrapper (re-plan, no realloc)
+
+    def _prefill(self, rid, prompt):
+        # Persistent-workspace prefill: re-plan the cached BatchPrefill wrapper per
+        # request instead of allocating a fresh 128MB workspace + wrapper each time
+        # (the per-call alloc dominated TTFT at concurrency). Returns last-token logits.
+        import flashinfer
+
+        if self._prefill_ws is None:
+            self._prefill_ws = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=self.dev)
+            self._prefill_wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(self._prefill_ws, kv_layout="NHD")
+        T = len(prompt)
+        indptr, indices, lpl = self.cache.flashinfer_page_table([rid])
+        qo = torch.zeros(2, dtype=torch.int32, device=self.dev)
+        qo[1] = T
+        self._prefill_wrapper.plan(
+            qo_indptr=qo, paged_kv_indptr=indptr, paged_kv_indices=indices, paged_kv_last_page_len=lpl,
+            num_qo_heads=self.nqo, num_kv_heads=self.nkv, head_dim_qk=self.hd, page_size=self.page_size,
+            causal=True, q_data_type=self.cache.kv.dtype,
+        )
+        return self.model.forward_prefill_paged(
+            torch.tensor([prompt], dtype=torch.long, device=self.dev), self.cache,
+            request_ids=[rid], prefill_wrapper=self._prefill_wrapper,
+        )
 
     def submit(self, request_id, prompt: list[int], max_new_tokens: int, eos_token_id=None) -> None:
         self._pending.append((request_id, list(prompt), max_new_tokens, eos_token_id))
@@ -320,11 +345,7 @@ class PagedEngine:
                 self._next_rid += 1
                 self.cache.reserve(rid, len(prompt) + max_new)
                 self.cache._sequences[rid].length = len(prompt)
-                pw = _plan_prefill(flashinfer, self.cache, [rid], [len(prompt)], self.nqo, self.nkv, self.hd, self.page_size)
-                logits = self.model.forward_prefill_paged(
-                    torch.tensor([prompt], dtype=torch.long, device=self.dev), self.cache,
-                    request_ids=[rid], prefill_wrapper=pw,
-                )
+                logits = self._prefill(rid, prompt)
                 tok = int(_greedy_tokens(self.model, logits[:, -1, :])[0])
                 a = {"ext": ext_id, "rid": rid, "plen": len(prompt), "gen": [tok], "max_new": max_new, "last": tok, "eos": eos}
                 fin = len(a["gen"]) >= max_new or tok == eos
