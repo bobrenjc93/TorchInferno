@@ -245,19 +245,27 @@ long_output, 64-conc):
   marlin inside (8 graphs).
 - TPOT: 21ms -> 21ms (NEUTRAL); throughput 1956 -> 2007 (+2.6% only).
 
-KEY FINDING (supersedes the "int4 flips cells" hope): decode at batch 48 is NOT
-weight-read-bound -- TPOT 21ms vs the 5.2ms weight-read floor means ~75% of the
-step is attention + the 160 per-step allreduces + kernel/launch overhead. The
-gate_up GEMM (~25% of step) being 1.52x in ISOLATION barely moves the total.
-This is the "weight-only quant helps M=1, not batched M=48" lesson confirmed
-END-TO-END: the microbench 1.52x is real for the GEMM, but the GEMM is not the
-decode bottleneck. So int4 marlin decode -- though working + accurate + graph-safe
--- does NOT flip cells. The decode TPOT gap to vllm (21 vs 15) is allreduce /
-attention / per-op latency, NOT weight compression. Adding down would add maybe
-+2-3% more (smaller GEMM); not a flip. The marlin integration stays (flag off) as
-validated groundwork (useful for single-stream/M=1 or if allreduce/attention are
-fixed first). The real decode lever is reducing the 160-allreduce + attention +
-kernel-launch overhead, not int4 weights.
+CORRECTED FINDING (per-kernel torch.profiler of the real decode, TORCHINFERNO_
+PROFILE_DECODE_ONCE; supersedes the earlier "int4 neutral/dead" call which was
+based on ONE noisy end-to-end TPOT test): at batch=32 the GEMMs DOMINATE the
+decode step -- aten::mm = 9.82ms = 58% of GPU time; allreduce only 1.93ms (11%);
+flashinfer attention 0.40ms (2.4%); cat/mul/neg (rope) ~2.6ms; index_put (KV
+write) 0.87ms; norms 0.54ms. gate_up alone = 4.657ms (nvjet_128x32, 58us/call,
+weight-read-bound: 117MB/58us = 2 TB/s). With marlin ON, the SAME decode profile
+shows gate_up -> _C::marlin_gemm = 2.952ms (36.9us/call) = 1.58x, saving 1.9ms of
+real GPU time (the GEMM total drops 9.82 -> 7.93ms). So int4 marlin DOES cut decode
+GPU time (profile-PROVEN), contradicting the earlier neutral read. The earlier
+end-to-end "21->21" was measurement imprecision / engine+network TPOT overhead
+masking a ~1-2ms GPU saving (throughput did rise +2.6%).
+
+REVIVED LEVER: a FULL int4 decode (all 4 GEMMs: qkv+o+gate_up+down, lm_head stays
+bf16 -- N=16032 not %64) should save ~3ms of the 9.8ms GEMM GPU time -> decode
+GPU ~17->14ms -> could flip tree_of_thought TPOT (31.7 vs 29.5, 2.2ms gap) and
+lift throughput. OPEN QUESTION to resolve next: does the GPU saving translate to
+serving TPOT, or is TPOT engine/network-bound above the GPU step? (the one
+gate_up test was inconclusive). NEXT: extend marlin to all 4 GEMMs + drop the
+bf16<->fp16 conversions, then re-measure TPOT carefully. The profiler hook
+(forward_decode_flashinfer, gated, batch>=32) makes this reproducible.
 
 ## Decode-step composition (8xH100, batch 48) — WHY int4 was neutral + the real lever
 

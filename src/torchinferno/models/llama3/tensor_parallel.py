@@ -4367,6 +4367,43 @@ class Llama3TensorParallelForCausalLM:
         row_indices: Tensor,
         decode_wrapper: object,
     ) -> Tensor:
+        # One-shot op-level profile of a full decode step (per-kernel CUDA time:
+        # GEMMs vs FlashInfer attention vs allreduce vs norms). Gated; rank 0;
+        # fires once on the eager call (before graph capture) so it does not
+        # perturb steady state. Locates the decode-step bottleneck definitively.
+        if (
+            env_flag("TORCHINFERNO_PROFILE_DECODE_ONCE", False)
+            and input_ids.size(0) >= 32  # serving-representative batch, not the bs=1 warmup
+            and not getattr(self, "_decode_profiled", False)
+            and getattr(self, "rank", 0) == 0
+        ):
+            self._decode_profiled = True
+            import sys as _dp
+            from torch.profiler import profile as _tprof, ProfilerActivity as _PA
+            torch.cuda.synchronize(self.device)
+            with _tprof(activities=[_PA.CPU, _PA.CUDA]) as _prof:
+                _out = self._forward_decode_flashinfer_body(
+                    input_ids, cache, write_positions, row_indices, decode_wrapper,
+                )
+                torch.cuda.synchronize(self.device)
+            print(
+                f"[DECODE_PROF] batch={input_ids.size(0)}\n"
+                + _prof.key_averages().table(sort_by="cuda_time_total", row_limit=22),
+                file=_dp.stderr, flush=True,
+            )
+            return _out
+        return self._forward_decode_flashinfer_body(
+            input_ids, cache, write_positions, row_indices, decode_wrapper,
+        )
+
+    def _forward_decode_flashinfer_body(
+        self,
+        input_ids: Tensor,
+        cache: Llama3TensorParallelCache,
+        write_positions: Tensor,
+        row_indices: Tensor,
+        decode_wrapper: object,
+    ) -> Tensor:
         batch = input_ids.size(0)
 
         flat_positions = write_positions.reshape(-1).clamp(0, self.rotary_cos_cache.size(0) - 1)
