@@ -2417,7 +2417,7 @@ class OpenAICompletionEngine:
         return PagedEngine(
             self.model, page_size=page_size, max_active=int(max_active),
             max_seq=int(max_seq_len),
-            use_graph=env_flag("TORCHINFERNO_OPENAI_PAGED_KV_GRAPH", False),
+            use_graph=env_flag("TORCHINFERNO_OPENAI_PAGED_KV_GRAPH", True),
         )
 
     def _run_tensor_parallel_online_batcher(self, first: _QueuedGeneration) -> None:
@@ -9098,7 +9098,7 @@ def _paged_kv_active_for(model: object, max_seq_len: int) -> bool:
     # cache). So restrict paged to long-ctx workloads (multi_turn) -> short-ctx cells
     # (few_shot/self_consistency/tree) stay on the unchanged dense path = zero
     # regression risk; long-ctx gets the validated paged win. Default threshold 1024.
-    if not env_flag("TORCHINFERNO_OPENAI_PAGED_KV", False):
+    if not env_flag("TORCHINFERNO_OPENAI_PAGED_KV", True):
         return False
     if not hasattr(model, "forward_decode_paged"):
         return False
@@ -10389,7 +10389,7 @@ def _tensor_parallel_worker_loop(engine: OpenAICompletionEngine) -> None:
                         getattr(engine, "model"),
                         page_size=int(getattr(engine, "page_size", 16)) or 16,
                         max_active=max_active, max_seq=max_seq_len,
-                        use_graph=env_flag("TORCHINFERNO_OPENAI_PAGED_KV_GRAPH", False),
+                        use_graph=env_flag("TORCHINFERNO_OPENAI_PAGED_KV_GRAPH", True),
                     )
                 elif online_runtime_engine is None:
                     online_runtime_engine = _RuntimeContinuousBatchEngine(
