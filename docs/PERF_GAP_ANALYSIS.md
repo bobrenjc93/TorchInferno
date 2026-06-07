@@ -265,7 +265,25 @@ PAIRED with a faster per-request decode (int4/fp8: TPOT 33 -> ~15). Harness note
 closed-loop steady-state (warm batcher) is REQUIRED; one-shot bursts are
 setup-dominated (~500ms) and mislead.
 
-## KV-token-bounded concurrency (implemented, flag-gated, DEFAULT-OFF, 2026-06-07)
+## KV-token-bounded concurrency (DEFAULT-ON as of 2026-06-07; was off, now validated)
+
+UPDATE: shipped default-on after fixing the validation blocker. Root cause of the
+earlier >768 crash: the batcher reused the persistent serving cache
+UNCONDITIONALLY with no check that its max_seq_len/rows cover the workload (a
+pre-existing bug the benchmark dodges via a large max_model_len). Fix: a guard
+that reuses the persistent cache only when persistent_max_seq >= max_seq_len AND
+persistent_rows >= max_active+prefix, else allocates a fresh correctly-sized
+cache. Live-validated on 8xH100: >768 workload serves with NO crash;
+self_consistency-like 128-conc boosts to 128 rows; few_shot-range (max_seq>=512)
+TPOT 49.4 ~= baseline 51 (floored to 48, no regression). Default-on is safe
+because the boost has NO cell-regression risk: protected cells (few_shot/multi_turn
+TPOT) are arithmetically floored to 48, and the boosted short-context workloads
+(self_consistency, tree) currently lose all four metrics, so more rows only help.
+Open question for the next benchmark run: does self_consistency TTFT (274) drop
+below vllm's 195 (the harness over-states its queueing vs real early-EOS outputs).
+Original analysis below.
+
+## KV-token-bounded concurrency (implemented, flag-gated, 2026-06-07)
 
 Targets the closest flippable cell: self_consistency TTFT (274 vs vllm 195, only
 1.4x). self_consistency is 1k IDENTICAL short prompts (~286 tok) with early-EOS
