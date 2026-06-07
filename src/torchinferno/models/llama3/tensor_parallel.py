@@ -5068,6 +5068,13 @@ def _ragged_scaled_dot_product_attention(
     max_seq_len = k.size(2)
     key_positions = torch.arange(max_seq_len, device=q.device)
     mask = key_positions[None, :] < attention_lengths.to(device=q.device)[:, None]
+    # Cache rows beyond attention_lengths are unwritten (torch.empty) and may hold
+    # NaN; SDPA masks their weight to zero but NaN*0 == NaN poisons the output.
+    # Zero the masked keys/values first, matching the guard in the ragged-prefill
+    # fallback above. (Padding contributes nothing either way.)
+    zero = torch.zeros((), dtype=k.dtype, device=k.device)
+    k = torch.where(mask[:, None, :, None], k, zero)
+    v = torch.where(mask[:, None, :, None], v, zero)
     return F.scaled_dot_product_attention(
         q,
         k,
