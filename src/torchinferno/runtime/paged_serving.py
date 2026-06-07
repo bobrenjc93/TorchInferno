@@ -250,6 +250,107 @@ def generate_paged_continuous(
     return [r if r is not None else [] for r in results]
 
 
+class PagedEngine:
+    """Incremental (submit/step) paged continuous-batching engine -- the bridge the
+    OpenAI online batcher needs (it streams per-token events, so it drives a stepper,
+    not a batch run()). One step() = one iteration of the validated
+    generate_paged_continuous loop: admit+prefill new arrivals by free pages, decode
+    the active set one token via the graphed runner, retire finished (freeing pages).
+    Each step returns (request_id, token, finished) events to stream. Same logic as
+    generate_paged_continuous, so it inherits its bf16-vs-dense correctness; a
+    step-driven run is token-identical to the batch driver (tests).
+    """
+
+    def __init__(self, model, *, page_size=16, max_active=8, max_seq=2048, use_graph=True):
+        self.model = model
+        self.page_size = page_size
+        self.max_active = max_active
+        dev = model.device
+        self.dev = dev
+        layer0 = model.layers[0]
+        self.nqo = layer0.local_attention_heads
+        self.nkv = layer0.local_key_value_heads
+        self.hd = model.config.head_dim
+        pages_per = math.ceil(max_seq / page_size)
+        self.pages_per = pages_per
+        self.cache = LayeredPagedKVCache(
+            num_layers=len(model.layers), num_pages=max_active * pages_per + 8, page_size=page_size,
+            num_key_value_heads=self.nkv, head_dim=self.hd, device=dev, dtype=model.dtype,
+        )
+        self.runner = (
+            PagedDecodeGraphRunner(model, self.cache, batch=max_active, max_pages=pages_per)
+            if use_graph else None
+        )
+        self._pending: list[tuple] = []  # (request_id, prompt, max_new)
+        self._active: list[dict] = []
+        self._next_rid = 0
+
+    def submit(self, request_id, prompt: list[int], max_new_tokens: int) -> None:
+        self._pending.append((request_id, list(prompt), max_new_tokens))
+
+    def has_work(self) -> bool:
+        return bool(self._pending or self._active)
+
+    def step(self) -> list[tuple]:
+        """One continuous-batching iteration. Returns [(request_id, token, finished)]."""
+        import flashinfer
+
+        events: list[tuple] = []
+        with torch.inference_mode():
+            # admit + prefill new arrivals (emit their first token)
+            while len(self._active) < self.max_active and self._pending:
+                ext_id, prompt, max_new = self._pending[0]
+                need = math.ceil((len(prompt) + max_new) / self.page_size)
+                if len(self.cache.free_pages) < need:
+                    break
+                self._pending.pop(0)
+                rid = f"p{self._next_rid}"
+                self._next_rid += 1
+                self.cache.reserve(rid, len(prompt) + max_new)
+                self.cache._sequences[rid].length = len(prompt)
+                pw = _plan_prefill(flashinfer, self.cache, [rid], [len(prompt)], self.nqo, self.nkv, self.hd, self.page_size)
+                logits = self.model.forward_prefill_paged(
+                    torch.tensor([prompt], dtype=torch.long, device=self.dev), self.cache,
+                    request_ids=[rid], prefill_wrapper=pw,
+                )
+                tok = int(logits[0, -1, :].argmax())
+                a = {"ext": ext_id, "rid": rid, "plen": len(prompt), "gen": [tok], "max_new": max_new, "last": tok}
+                fin = len(a["gen"]) >= max_new
+                events.append((ext_id, tok, fin))
+                if fin:
+                    self.cache.free(rid)
+                else:
+                    self._active.append(a)
+            if not self._active:
+                return events
+            # decode the active set one token
+            for a in self._active:
+                self.cache._sequences[a["rid"]].length = a["plen"] + len(a["gen"])
+            tokens = torch.tensor([[a["last"]] for a in self._active], dtype=torch.long, device=self.dev)
+            positions = torch.tensor([a["plen"] + len(a["gen"]) - 1 for a in self._active], dtype=torch.long, device=self.dev)
+            rids_active = [a["rid"] for a in self._active]
+            if self.runner is not None:
+                logits = self.runner.step(tokens, positions, rids_active)
+            else:
+                dw = _plan_decode(flashinfer, self.cache, rids_active, self.nqo, self.nkv, self.hd, self.page_size)
+                logits = self.model.forward_decode_paged(
+                    tokens, self.cache, request_ids=rids_active, positions=positions, decode_wrapper=dw)
+            nxt = logits[:, -1, :].argmax(-1)
+            still = []
+            for i, a in enumerate(self._active):
+                t = int(nxt[i])
+                a["gen"].append(t)
+                a["last"] = t
+                fin = len(a["gen"]) >= a["max_new"]
+                events.append((a["ext"], t, fin))
+                if fin:
+                    self.cache.free(a["rid"])
+                else:
+                    still.append(a)
+            self._active = still
+        return events
+
+
 def generate_paged(
     model: object,
     prompts: list[list[int]],

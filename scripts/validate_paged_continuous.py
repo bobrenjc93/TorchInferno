@@ -16,7 +16,7 @@ import torch
 import torch.distributed as dist
 
 from torchinferno.models.llama3.tensor_parallel import Llama3TensorParallelForCausalLM
-from torchinferno.runtime.paged_serving import generate_paged, generate_paged_continuous
+from torchinferno.runtime.paged_serving import PagedEngine, generate_paged, generate_paged_continuous
 
 
 def log(rank, *a):
@@ -78,6 +78,22 @@ def main():
         log(rank, f"[isolation] continuous(1 req, max_active=1) == dense: {one == [ref[1]]}")
         if rank == 0 and one != [ref[1]]:
             print(f"    one={one[0]}\n    ref={ref[1]}", flush=True)
+
+        # ISOLATION 3: incremental PagedEngine (submit/step) == batch generate_paged_continuous
+        eng = PagedEngine(model, page_size=16, max_active=3, max_seq=64, use_graph=True)
+        for i, (prompt, max_new) in enumerate(requests):
+            eng.submit(i, prompt, max_new)
+        eng_out: list[list[int]] = [[] for _ in requests]
+        guard = 0
+        while eng.has_work() and guard < 10000:
+            for ext_id, tok, _fin in eng.step():
+                eng_out[ext_id].append(tok)
+            guard += 1
+        log(rank, f"[isolation] PagedEngine(submit/step) == generate_paged_continuous: {eng_out == got}")
+        if rank == 0 and eng_out != got:
+            for i, (e, g) in enumerate(zip(eng_out, got)):
+                if e != g:
+                    print(f"    req {i}: engine={e}\n            batch ={g}", flush=True)
 
     log(rank, f"[continuous] eager-decode  == dense: {got_eager == ref}")
     log(rank, f"[continuous] graphed-decode == dense: {got == ref}")
