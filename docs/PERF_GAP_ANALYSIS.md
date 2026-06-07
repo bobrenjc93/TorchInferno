@@ -31,6 +31,14 @@ THE TWO REAL GAPS (both DEEP, multi-week, no drop-in):
    few_shot ~23% but NOT flip (vllm 159 too far) and is accuracy-gated. Short-prompt
    TTFT (long_output/tree/multi_turn) is admission/queueing-bound, not prefill, and
    capped by the ~2x decode behind it -- also no flip without the decode fix.
+   PREFILL PROFILED (2026-06-07, TORCHINFERNO_PROFILE_PREFILL_ONCE, batch=50 q=64
+   = 3200 tok, 150ms CUDA): aten::mm 90.8ms = 60.5% (the FP8 lever), allreduce
+   (symm-mem multimem) 37ms = 24.7%, _add_rms_norm 15ms = 10% (already fused),
+   FlashInfer attn 2.0ms = 1.3%, swiglu/index_put <2%. So prefill has NO
+   low-hanging fruit: GEMMs need FP8; allreduce is ALREADY OPTIMAL (scripts/
+   bench_allreduce.py: multimem beats NCCL ring 1.38-2.74x at every prefill size
+   1024-30720 tok), norms/attn already fused/tiny. The only prefill levers are FP8
+   (GEMMs) and compute/comm overlap (the 25% allreduce) -- both deep.
 
 SHIPPED WINS (this whole effort): symm-mem TPOT parity (scored; beats vllm's AR),
 3 NaN correctness fixes + regression tests, validated marlin module (flag-off),
