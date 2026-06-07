@@ -4458,9 +4458,10 @@ class Llama3TensorParallelForCausalLM:
         input_ids: Tensor,
         paged_cache: object,
         *,
-        request_ids: list[str],
+        request_ids: list[str] | None = None,
         positions: Tensor,
         decode_wrapper: object,
+        block_table: Tensor | None = None,
     ) -> Tensor:
         # TRUE paged-KV decode (WIP, feature branch): same GEMM/rope/norm flow as
         # _forward_decode_flashinfer_body, but the KV write goes to a small-page
@@ -4482,12 +4483,21 @@ class Llama3TensorParallelForCausalLM:
             cos = torch.cat((cos, cos), dim=-1)
             sin = torch.cat((sin, sin), dim=-1)
         rotary = (cos, sin)
-        # On-device slot computation (no positions.tolist() host sync) so this
-        # decode step is a step closer to CUDA-graph capture -- the requirement for
-        # paged decode to match the dense graphed ~21ms instead of the eager ~146ms
-        # (scripts/bench_decode_context_scaling.py). slot_mapping_device matches the
-        # host slot_mapping exactly (tests/test_scaffolding.py).
-        slots = paged_cache.slot_mapping_device(request_ids, positions)
+        # Slot computation. The GRAPHABLE path takes a pre-built block_table tensor
+        # (static buffer the serving loop fills outside the graph) and computes slots
+        # ENTIRELY on-device via slots_from_block_table -- no host work inside the
+        # captured region, so paged decode can hit the dense graphed ~21ms instead of
+        # the eager ~146ms (scripts/bench_decode_context_scaling.py). The eager path
+        # (request_ids given) builds the table inline; both match the host
+        # slot_mapping exactly (tests/test_scaffolding.py).
+        if block_table is not None:
+            slots = type(paged_cache).slots_from_block_table(
+                block_table, positions, paged_cache.page_size
+            )
+        elif request_ids is not None:
+            slots = paged_cache.slot_mapping_device(request_ids, positions)
+        else:
+            raise ValueError("forward_decode_paged needs request_ids or block_table")
 
         hidden = F.embedding(input_ids, self.embed_tokens_weight)
         attn_in: Tensor | None = None
