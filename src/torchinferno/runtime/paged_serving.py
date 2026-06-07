@@ -96,6 +96,23 @@ class PagedDecodeGraphRunner:
             page_size=self.page_size, q_data_type=self.cache.kv.dtype,
         )
 
+    def _pad(self, tokens, positions, request_ids):
+        # Pad an ACTIVE set (active <= batch) up to the captured batch by repeating
+        # the last active row -- the dummy rows redo a valid (already-reserved)
+        # request's work, so their slots/page-table are valid and their output is
+        # simply ignored (step() slices to active). This lets ONE captured graph
+        # serve any active count <= batch, the continuous-batching requirement.
+        active = len(request_ids)
+        if active == self.batch:
+            return tokens, positions, request_ids, active
+        if active == 0 or active > self.batch:
+            raise ValueError(f"active {active} must be in 1..{self.batch}")
+        pad = self.batch - active
+        tokens_b = torch.cat([tokens.view(active, 1), tokens.view(active, 1)[-1:].expand(pad, 1)], 0)
+        positions_b = torch.cat([positions, positions[-1:].expand(pad)], 0)
+        request_ids_b = list(request_ids) + [request_ids[-1]] * pad
+        return tokens_b, positions_b, request_ids_b, active
+
     def _fill(self, tokens, positions, request_ids):
         self.s_ids.copy_(tokens.view(self.batch, 1))
         self.s_pos.copy_(positions)
@@ -129,19 +146,21 @@ class PagedDecodeGraphRunner:
         self._stream = stream
 
     def step(self, tokens, positions, request_ids):
-        """Replay the captured graph for the current step; returns its logits.
+        """Replay the captured graph for the current step; returns logits[:active].
 
-        ALWAYS replays (even right after capture): the output buffer is only
-        guaranteed valid after a replay, not from the capture-time execution -- the
-        same pattern the dense decode warmup uses. (Reading self.out straight from
-        capture silently diverges from eager.)
+        Accepts an ACTIVE set of any size 1..batch (padded internally to the
+        captured batch). ALWAYS replays (even right after capture): the output
+        buffer is only valid after a replay, not from the capture-time execution --
+        the same pattern the dense decode warmup uses. (Reading self.out straight
+        from capture silently diverges from eager.)
         """
+        tokens, positions, request_ids, active = self._pad(tokens, positions, request_ids)
         if self.graph is None:
             self.capture(tokens, positions, request_ids)
         self._fill(tokens, positions, request_ids)
         self._plan(request_ids)
         self.graph.replay()
-        return self.out
+        return self.out[:active]
 
 
 def generate_paged(
