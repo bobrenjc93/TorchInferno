@@ -162,10 +162,24 @@ Implications:
   kernel (efficient to M~64) could help batched decode -- needs the torchao
   cutlass build fixed or a custom kernel. NO available quantization path improves
   our batched decode.
+  Build infra is also blocked (checked): torchao 0.17.0's cutlass .so was built
+  for CUDA 13 / a stable torch ABI and won't load against our CUDA-12.6 custom
+  torch 2.13.0a0; rebuilding from source is impractical here -- the reachable pip
+  index only has torchao 0.0.1-0.1, and a github build against a future-versioned
+  torch (2.13.0a0) would likely fail on API drift. vllm is importable but its _C
+  marlin ops aren't registered (same ABI class). So unlocking a batched-M quant
+  kernel needs a from-source torchao/vllm build (API-compat fixes) or a custom
+  triton Marlin -- a multi-day effort, not a loop iteration.
 - FP8 PREFILL is the viable lever for the DOMINANT TTFT gap. Prefill GEMMs are
   52% of prefill at 34% MFU; at M>=2048 (few_shot is 48x640=30720 tokens) FP8 is
   ~1.8x on that portion -> ~23% prefill reduction -> few_shot TTFT ~317->~244
   (vllm 159: narrows, does not yet flip). Standard _scaled_mm, well-supported.
+  ACCURACY probe (RTN e4m3, LLM-like activations w/ outliers, M=2048): per-GEMM
+  rel-err ~3.6-3.8% (per-tensor AND row-wise -- error is e4m3 mantissa-bound, not
+  scale-bound), vs bf16's 0.14%. That is the UNCERTAIN zone: ~25x worse than bf16
+  per GEMM, compounding over 80 layers -- may or may not hold the >=98% correctness
+  bar; only a full impl + benchmark settles it. So FP8 prefill is mechanically
+  ready (1.8x) but accuracy-gated and does not flip a cell -- modest, risky.
   NEXT STEP: quantize prefill weights to FP8 + dynamic activation quant in the
   prefill GEMM path; the hard part is keeping benchmark correctness >=98% (FP8
   prefill accuracy) and FP8 quant ops inside the captured prefill graph. Note it
