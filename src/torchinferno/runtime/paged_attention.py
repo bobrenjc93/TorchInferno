@@ -118,6 +118,13 @@ def batched_paged_causal_attention(
         seq_lens_tensor = torch.tensor(seq_lens, dtype=torch.long, device=query.device)
         length_mask = key_positions[None, None, :] < seq_lens_tensor[:, None, None]
         attn_mask = causal_mask & length_mask
+        # Per-row padding (key_pos >= seq_len) is gathered from unwritten cache
+        # slots that may hold NaN; SDPA masks it but NaN*0 == NaN poisons the
+        # output. Zero the padded keys/values first (they contribute nothing).
+        written = (key_positions[None, :] < seq_lens_tensor[:, None])[:, None, :, None]
+        zero = torch.zeros((), dtype=keys.dtype, device=keys.device)
+        keys = torch.where(written, keys, zero)
+        values = torch.where(written, values, zero)
     sdp_kwargs: dict[str, object] = {
         "attn_mask": attn_mask[:, None, :, :],
         "dropout_p": 0.0,
