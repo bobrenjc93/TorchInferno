@@ -37,12 +37,53 @@ Ruled out as quick fixes (tested locally — ALL scheduling/admission knobs):
 - Joint (batch,q) prefill CUDA graphs already remove per-layer launch overhead
   (the 315ms is a graph replay = pure compute at 34% MFU).
 
-Net: NO scheduling/config knob improves few_shot TTFT. It is bounded by prefill
-compute (MFU ~34%, ~2x vllm) serialized through the single GPU pipeline for the
-whole arriving batch. The only real levers are (a) higher prefill MFU -- and QKV
-/ gate-up GEMMs are ALREADY fused, so this means FP8 GEMMs or a different
-parallelism layout, both major; or (b) prefix caching to shrink the prefill,
-which is session-wiped today (needs a persistent engine). Both are deep.
+Architecture levers tested (streaming harness, 64-conc; baseline = default
+DQ=16, big batched prefill, graphed decode):
+- `decode_quantum` sweep (admit/drain every N steps; controls how often new
+  arrivals enter the engine). Full data, 64-conc streaming:
+    | metric            | DQ=16 (def) | DQ=8 | DQ=4 |
+    | few_shot   TTFT   | 1881        | 1657 | 1282 |
+    | few_shot   tput   | 101         | 153  | 157  |
+    | few_shot   TPOT   | 64          | 175  | 224  |
+    | long_out   TTFT   | 493         | 384  | 375  |
+    | long_out   tput   | --          | 855  | 766  |
+    | long_out   TPOT   | 22          | 40   | 41   |
+  Pure TTFT/throughput <-> TPOT tradeoff. A small quantum admits new arrivals
+  promptly (low TTFT, high throughput) but interrupts graphed decode with a
+  separate prefill forward more often (high TPOT). CRITICAL: the TPOT
+  regression is STEEP and hits at ANY DQ<16 -- long_output TPOT 22->40 even at
+  DQ=8 -- because decode no longer runs in long uninterrupted bursts. DQ=16 is
+  the knee. Below it, TPOT ~doubles for a 12-30% TTFT gain. NOT a clean win;
+  net benchmark impact unmeasurable while frozen. Default stays 16.
+  STRATEGIC NOTE: vllm AND sglang both have higher throughput than us, and
+  sglang ACCEPTS worse TPOT (50.7ms vs our 36) to get it. We are the outlier
+  over-optimizing TPOT (already ~matched) while 2.8x behind on throughput.
+  Lowering DQ moves us toward the vllm/sglang operating point. This is the #1
+  A/B to run the MOMENT the benchmark unfreezes -- the data above says DQ=8
+  buys ~+50% throughput and lower TTFT for a TPOT hit that sglang shows is
+  survivable. It is a scoring-weight call that only the live benchmark settles.
+- `TORCHINFERNO_CONTINUOUS_UNIFIED_FORWARD=1` (mix prefill+decode in ONE
+  forward_step_flashinfer): MUCH worse -- few_shot TPOT 1560ms, long_output
+  TPOT 83ms. The mixed batch composition varies every step so it canNOT use a
+  captured decode graph; eager decode dominates. Off for good.
+- `prefill_chunk_size=256` + DQ=4 (vllm-style chunked prefill, graphed): MUCH
+  worse -- few_shot TTFT 5937ms, tput 36; long_output TTFT 1131, TPOT 101.
+  Chunking fragments the high-MFU batched prefill into small low-MFU pieces and
+  multiplies attention recompute over growing context. Same MFU-floor failure
+  as a small token budget. Off for good.
+
+Net: the baseline (big batched prefill + graphed decode) sits near this
+architecture's Pareto frontier -- throughput and TPOT are coupled (prefill and
+decode are separate forwards, so admitting/prefilling more aggressively for
+throughput necessarily interrupts decode and costs TPOT), and that coupling
+cannot be broken cheaply (unified and chunked both lose, above). NO
+scheduling/config knob is a clean win. The only real levers are (a) higher
+prefill MFU -- and QKV/gate-up GEMMs are ALREADY fused, so this means FP8 GEMMs
+or a different parallelism layout, both major; or (b) prefix caching to shrink
+the prefill, which is session-wiped today (needs a persistent engine); or (c)
+a decode path that stays graphed WHILE absorbing a bounded prefill (e.g. a
+captured mixed-shape graph per (decode_n, prefill_bucket) pair), which neither
+existing unified nor chunked path provides. All three are deep.
 
 Op-level profile (TORCHINFERNO_PROFILE_PREFILL_ONCE, one batched prefill,
 torch.profiler sorted by CUDA time) CORRECTS the earlier "raise GEMM MFU"
