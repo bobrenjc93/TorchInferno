@@ -258,6 +258,20 @@ GPU time (profile-PROVEN), contradicting the earlier neutral read. The earlier
 end-to-end "21->21" was measurement imprecision / engine+network TPOT overhead
 masking a ~1-2ms GPU saving (throughput did rise +2.6%).
 
+INT4 ARC OUTCOME (validated, but flag-off): gate_up int4 is ACCURATE (10/10 diverse
+greedy prompts == bf16) and saves 1.74ms/decode-step (network-free _decode_active:
+bf16 17.676 -> 15.938). qkv int4 REGRESSED (small GEMM, marlin overhead loses) ->
+hybrid = big GEMMs only. BUT kept DEFAULT-OFF: (a) default-on broke graph-vs-eager
+exact-match tests (int4 numerics != bf16) and the lazy-quantize-before-capture
+ordering is fragile off the server path; (b) benchmark-TPOT translation is UNCERTAIN
+-- my streaming harness showed TPOT 21->21 (network/SSE-masked) despite the 1.74ms
+engine saving, and whether the benchmark client is engine- or network-bound is
+unknown; (c) even if it translates, gate_up alone (~1.7ms) -> tree 31.7->~30 does
+NOT flip vllm 29.5; gate_up+down (~2.1ms) -> ~29.6 only MARGINALLY. So int4 is a
+real engine-decode win (flag TORCHINFERNO_MARLIN_INT4_DECODE=1, CUDA-only, graceful
+bf16 fallback if vLLM .so absent) but its benchmark-score payoff is marginal+
+uncertain and default-on is destabilizing -- not shipped.
+
 REVIVED LEVER: a FULL int4 decode (all 4 GEMMs: qkv+o+gate_up+down, lm_head stays
 bf16 -- N=16032 not %64) should save ~3ms of the 9.8ms GEMM GPU time -> decode
 GPU ~17->14ms -> could flip tree_of_thought TPOT (31.7 vs 29.5, 2.2ms gap) and

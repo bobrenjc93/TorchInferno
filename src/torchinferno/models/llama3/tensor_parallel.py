@@ -1780,7 +1780,14 @@ class _Llama3TensorParallelLayer:
         # BEFORE any decode CUDA-graph capture), caches per `key` on self, then runs
         # marlin_int4_mm. hidden is bf16; marlin scales are bf16 (quantize default)
         # so NO fp16 conversion. Returns [..., N] or None (caller falls back to bf16).
+        # Flag-OFF default: validated (gate_up int4 saves 1.74ms/decode-step measured
+        # network-free; 10/10 greedy prompts correct) but kept opt-in -- default-on
+        # changed decode numerics (int4 != bf16) which broke graph-vs-eager exact
+        # match tests, and the lazy-quantize-before-graph-capture ordering is fragile
+        # in non-server paths. Enable with TORCHINFERNO_MARLIN_INT4_DECODE=1.
         if not _tp_flag("TORCHINFERNO_MARLIN_INT4_DECODE", False):
+            return None
+        if not hidden.is_cuda:  # marlin_gemm is CUDA-only; CPU falls back to bf16
             return None
         if getattr(self, f"_marlin_{key}_failed", False):
             return None
