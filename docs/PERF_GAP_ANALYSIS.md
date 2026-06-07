@@ -15,6 +15,32 @@ docs/harness only). Local measurements are from `scripts/test_stream.py`
 | throughput (tok/s) | 6.5 | 18.1 | 12.4 |
 | **score** | **1/20** | **16/20** | **2/20** |
 
+## Benchmark metric definitions (inference_bench/benchmarks/base.py) -- READ
+
+Per request, from the streaming client:
+- `ttft_ms` = time to first streamed token (INCLUDES admission + queue wait).
+- `tpot_ms` = (e2e - ttft) / (output_tokens - 1) = pure inter-token decode rate
+  (queueing-INDEPENDENT; the only pure-compute metric).
+- `e2e_latency_ms` = full request wall time.
+- `throughput_tps` = output_tokens / (e2e_latency_ms/1000) -- i.e. output /
+  (ttft + decode), so it is DRAGGED DOWN by ttft/queueing too.
+Reported = MEDIAN over requests; winner = beats BOTH others; higher-is-better
+for throughput.
+
+CONSEQUENCE (corrects the earlier "throughput ~= 1/TPOT" note): THREE of four
+metrics (ttft, e2e, throughput) are queueing-coupled; only TPOT is pure decode.
+So reducing queueing (max_active >= concurrency for short-context, or prefix
+reuse) improves ttft+e2e+throughput together. BUT this does not flip cells:
+even with ZERO queueing, long_output throughput -> ~1000/tpot ~= 31 tps (vllm
+58.9) -- still a loss, because our decode is too slow. vllm is 2-8x ahead on
+every queueing-coupled metric for long_output/multi_turn/tree, so no amount of
+scheduling closes them. self_consistency is the CLOSEST (ttft 247 vs 193, e2e
+346 vs 257, tput 2.9 vs 3.9 -- all ~1.3x; TPOT is 0.0 for everyone = tiny
+outputs), but its gap is 1000-way-concurrency queueing + prefill efficiency
+(max_active 48 << 1000), needing much larger batch / working TP prefix reuse /
+FP8 prefill -- all deep. Net: still no single-iteration cell flip; the only
+reachable cells remain tree/multi_turn TPOT (decode kernel, blocked).
+
 ## Scoring strategy (READ THIS FIRST -- it inverts naive tuning)
 
 The scorecard is BEST-IN-ROW: a cell is won only by beating BOTH competitors on
