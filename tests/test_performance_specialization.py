@@ -42,7 +42,13 @@ from torchinferno.research.helion import (
     run_helion_region_search,
 )
 from torchinferno.runtime.paged import PagedKVCache
-from torchinferno.runtime.paged_attention import paged_causal_attention
+from torchinferno.runtime.paged_attention import (
+    batched_paged_causal_attention,
+    paged_causal_attention,
+)
+from torchinferno.models.llama3.tensor_parallel import (
+    _ragged_scaled_dot_product_attention,
+)
 
 
 def _reference_rmsnorm_swiglu_region(
@@ -610,6 +616,80 @@ def test_batched_paged_decode_attention_torch_backend_matches_reference() -> Non
     )
 
     torch.testing.assert_close(actual, expected)
+
+
+def _poisoned_ragged_cache(kv_heads, head_dim, value_dim, lengths):
+    """A paged cache whose UNWRITTEN slots are NaN (simulating uninitialized
+    torch.empty memory), with valid ragged KV appended for each request."""
+    cache = PagedKVCache(
+        num_pages=64,
+        page_size=2,
+        num_key_value_heads=kv_heads,
+        head_dim=head_dim,
+        value_head_dim=value_dim,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+    cache.keys.fill_(float("nan"))
+    cache.values.fill_(float("nan"))
+    for row, length in enumerate(lengths):
+        cache.append(
+            f"req-{row}",
+            torch.randn(kv_heads, length, head_dim),
+            torch.randn(kv_heads, length, value_dim),
+        )
+    return cache
+
+
+def test_batched_paged_decode_attention_no_nan_from_unwritten_padding() -> None:
+    # Regression: masked padding KV gathered from unwritten (NaN) cache slots used
+    # to poison the output via NaN*0 == NaN. Output must be finite.
+    torch.manual_seed(1)
+    lengths = [3, 6, 7]
+    cache = _poisoned_ragged_cache(2, 5, 4, lengths)
+    query = torch.randn(len(lengths), 4, 1, 5)
+    out = batched_paged_decode_attention(
+        query,
+        cache,
+        [f"req-{r}" for r in range(len(lengths))],
+        torch.tensor([length - 1 for length in lengths]),
+        config=KernelConfig(backend=KernelBackend.TORCH),
+        enable_gqa=True,
+    )
+    assert torch.isfinite(out).all()
+
+
+def test_batched_paged_causal_attention_no_nan_from_unwritten_padding() -> None:
+    # Regression: ragged length_mask over unwritten (NaN) padding poisoned the
+    # output via NaN*0. Output must be finite for mixed-length requests.
+    torch.manual_seed(2)
+    lengths = [3, 6, 8]
+    cache = _poisoned_ragged_cache(2, 5, 4, lengths)
+    query = torch.randn(len(lengths), 4, 1, 5)
+    out = batched_paged_causal_attention(
+        query,
+        cache,
+        [f"req-{r}" for r in range(len(lengths))],
+        torch.tensor([[length - 1] for length in lengths]),
+        enable_gqa=True,
+    )
+    assert torch.isfinite(out).all()
+
+
+def test_ragged_scaled_dot_product_attention_no_nan_from_unwritten_padding() -> None:
+    # Regression: cache rows beyond attention_lengths are unwritten (NaN); SDPA
+    # masks them but NaN*0 poisoned the output. Output must be finite.
+    torch.manual_seed(3)
+    batch, q_heads, kv_heads, head_dim, max_seq = 3, 4, 2, 8, 10
+    lengths = torch.tensor([3, 6, 9])
+    q = torch.randn(batch, q_heads, 1, head_dim)
+    k = torch.randn(batch, kv_heads, max_seq, head_dim)
+    v = torch.randn(batch, kv_heads, max_seq, head_dim)
+    for row, length in enumerate(lengths.tolist()):
+        k[row, :, length:, :] = float("nan")
+        v[row, :, length:, :] = float("nan")
+    out = _ragged_scaled_dot_product_attention(q, k, v, lengths, enable_gqa=True)
+    assert torch.isfinite(out).all()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available() or not triton_available(), reason="CUDA Triton unavailable")
