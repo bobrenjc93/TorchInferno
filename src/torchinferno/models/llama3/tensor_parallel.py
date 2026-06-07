@@ -1807,11 +1807,13 @@ class _Llama3TensorParallelLayer:
     def _mlp_project_decode_reduce(self, hidden: Tensor) -> Tensor:
         if _tp_flag("TORCHINFERNO_MARLIN_INT4_DECODE", False) and self._ensure_marlin_gate_up():
             from torchinferno.kernels import marlin as _marlin
-            x2d = hidden.reshape(-1, self._marlin_gu_k).to(torch.float16)
+            # hidden is bf16; marlin scales are bf16 and output is bf16 -- NO fp16
+            # conversion (bf16-a + fp16-scales would be garbage). 2D contiguous in.
+            x2d = hidden.reshape(-1, self._marlin_gu_k).contiguous()
             gu = _marlin.marlin_int4_mm(
                 x2d, self._marlin_gu_q, self._marlin_gu_s, self._marlin_gu_ws,
                 self._marlin_gu_n, self._marlin_gu_k,
-            ).to(hidden.dtype).reshape(*hidden.shape[:-1], self._marlin_gu_n)
+            ).reshape(*hidden.shape[:-1], self._marlin_gu_n)
             gate, up = gu.split((self.local_intermediate_size, self.local_intermediate_size), dim=-1)
         else:
             gate, up = _decode_linear(hidden, self.gate_up_proj_weight, self.gate_up_proj_weight_decode).split(

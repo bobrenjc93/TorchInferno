@@ -105,10 +105,14 @@ def _marlin_permute_scales(s: Tensor, size_k: int, size_n: int, group_size: int)
     return s.reshape((-1, size_n)).contiguous()
 
 
-def quantize_to_marlin_int4(weight_kn: Tensor, group_size: int = 128):
+def quantize_to_marlin_int4(weight_kn: Tensor, group_size: int = 128,
+                            scale_dtype: torch.dtype = torch.bfloat16):
     """bf16/fp16 weight [K, N] -> (marlin-packed q_weight, marlin-permuted scales).
 
     Symmetric int4 (uint4b8: stored 0..15, dequant = (q-8)*scale), groupwise.
+    IMPORTANT: marlin requires the scale dtype to MATCH the activation dtype passed
+    to marlin_int4_mm (bf16-a + fp16-scales gives garbage). scale_dtype defaults to
+    bf16 (the model dtype) so activations need no fp16 conversion.
     """
     w = weight_kn.to(torch.float16)
     size_k, size_n = w.shape
@@ -121,7 +125,7 @@ def quantize_to_marlin_int4(weight_kn: Tensor, group_size: int = 128):
     w_q = torch.round(wg / w_s).clamp(-8, 7).int() + 8  # 0..15
     # restore [K, N]
     w_q = w_q.reshape((gs, -1, size_n)).permute(1, 0, 2).reshape((size_k, size_n)).contiguous()
-    w_s = w_s.reshape((-1, size_n)).contiguous().to(torch.float16)
+    w_s = w_s.reshape((-1, size_n)).contiguous().to(scale_dtype)
     q_marlin = _marlin_weights(w_q, size_k, size_n, _get_weight_perm().to(w.device))
     s_marlin = _marlin_permute_scales(w_s, size_k, size_n, gs)
     return q_marlin, s_marlin
@@ -137,7 +141,8 @@ _EMPTY = None
 
 def marlin_int4_mm(a: Tensor, q_weight: Tensor, scales: Tensor, workspace: Tensor,
                    size_n: int, size_k: int) -> Tensor:
-    """a [M, K] (fp16) @ int4 weight -> [M, N] (fp16). a must be 2D contiguous."""
+    """a [M, K] @ int4 weight -> [M, N], same dtype as a. a must be 2D contiguous;
+    a.dtype must match the scale dtype used in quantize_to_marlin_int4 (default bf16)."""
     global _EMPTY
     if _EMPTY is None or _EMPTY.device != a.device:
         _EMPTY = torch.empty(0, dtype=torch.int, device=a.device)

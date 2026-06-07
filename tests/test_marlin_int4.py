@@ -33,8 +33,8 @@ def test_marlin_int4_mm_matches_dequant_reference():
     # gate_up and down shapes (N % 64 == 0, K % 16 == 0)
     for N, K in [(7168, 8192), (8192, 3584)]:
         assert marlin.marlin_supports_shape(N, K)
-        w = torch.randn(K, N, device=dev, dtype=torch.float16) * 0.02
-        a = torch.randn(48, K, device=dev, dtype=torch.float16)
+        w = torch.randn(K, N, device=dev, dtype=torch.bfloat16) * 0.02
+        a = torch.randn(48, K, device=dev, dtype=torch.bfloat16)
         q, s = marlin.quantize_to_marlin_int4(w, 128)
         ws = marlin.make_workspace(N, dev)
         out = marlin.marlin_int4_mm(a, q, s, ws, N, K)
