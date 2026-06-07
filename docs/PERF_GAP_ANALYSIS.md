@@ -65,6 +65,36 @@ depends on that readback). The two real decode levers:
      long_output TPOT (31.8->~17, near vllm 15.1) AND its throughput. Deep
      (FP8 weights + scales + accuracy validation).
 
+## GPU-resident decode runner (DecodeGraphRunner) — wired + correctness-proven, NOT a win
+
+The async GPU-resident decode runner (token stash + async D2H, sglang-style) was
+already BUILT (`runtime/decode_runner.py`) but dead-wired (never called) and not
+pipelined. This iteration: verified TP-safety (both greedy all-gather and
+gumbel-temperature sampling contain the cross-rank collective, so all ranks hold
+the IDENTICAL token on GPU -- the GPU->GPU feed needs no CPU barrier), wired it
+into `_decode_active` behind `TORCHINFERNO_DECODE_GRAPH_RUNNER` (default off), and
+validated greedy output is BIT-IDENTICAL to baseline on 8-rank TP.
+
+But the SYNCHRONOUS path (harvest immediately after step) is shape-dependent and
+NOT shippable -- clean same-session A/B (64-conc streaming):
+
+| shape                | TPOT base -> runner | tput base -> runner |
+| :------------------- | ------------------: | ------------------: |
+| long_output (16/256) | 24 -> 30  (worse)   | 703 -> 688          |
+| tree-like   (128/64) | 57 -> 68  (worse)   | 516 -> 496          |
+| few_shot    (640/32) | 68 -> 29  (better)  | 109 -> 158          |
+
+It helps prefill-heavy few_shot but HURTS decode-bound long_output and tree --
+and tree_of_thought TPOT is our single best flip target (2.6ms), so this moves
+the wrong way. The true win needs PIPELINING (double-buffer the readback + lagged
+harvest so decode replays run back-to-back and the .cpu() overlaps GPU compute).
+BUT pipelining only helps CONSECUTIVE same-active-set steps: under realistic
+varied-length load requests finish at different steps, forcing a pipeline flush
+(one sync) on every active-set change, so the recoverable ~2-4ms/step rarely
+applies. Net: the runner is not the lever. Decode is GPU-compute-bound (~15ms);
+FP8 decode weights (halve it) remain the real throughput/TPOT lever. The wiring
+stays (flag off, validated) as a foundation if FP8 or a stable-decode path lands.
+
 ## (historical) Issue 1 — prefill kernel MFU (~2x), the dominant TTFT gap
 
 ## Issue 1 — prefill kernel MFU (~2x), the dominant TTFT gap

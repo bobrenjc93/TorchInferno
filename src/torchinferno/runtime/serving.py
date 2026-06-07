@@ -1790,7 +1790,19 @@ class ContinuousBatchEngine:
         *,
         events: list[ServingTokenEvent] | None = None,
     ) -> tuple[list[tuple[int, ServingResult]], list[_ActiveRequest]]:
-        pass
+        # GPU-resident decode runner (token stash + async D2H). Gated by
+        # TORCHINFERNO_DECODE_GRAPH_RUNNER (default off; the runner is only built when on),
+        # handed to the engine via _decode_runner. Correctness is validated (greedy output
+        # is bit-identical to the baseline path on 8-rank TP -- sampling collectives already
+        # sync the token across ranks, so the GPU->GPU feed is TP-safe). The path is still
+        # SYNCHRONOUS (get_cpu_tokens harvests immediately after step), so it does NOT yet
+        # win: shape-dependent in A/B -- helps prefill-heavy few_shot (TPOT 68->29) but
+        # hurts decode-bound long_output (24->30) and tree (57->68). The actual win needs
+        # PIPELINING (double-buffer the readback + lagged harvest so decode replays run
+        # back-to-back and the .cpu() sync overlaps GPU compute); see docs/PERF_GAP_ANALYSIS.
+        runner = getattr(self, "_decode_runner", None)
+        if runner is not None and active:
+            return self._decode_active_with_runner(runner, active, step, events=events)
         _p = self.profile_timings
         _t0 = time.perf_counter() if _p else 0.0
         indexed_results: list[tuple[int, ServingResult]] = []
