@@ -243,6 +243,16 @@ wins via kernel fusion. Net: the decode TPOT gap to vllm (21 vs 15) is the SUM o
 allreduce-latency + kernel-fusion advantages, each a deep effort; no single
 drop-in change closes it.
 
+ALLREDUCE IS NOT THE GAP (measured, overturns the "allreduce 30%" framing). vLLM's
+custom one-shot allreduce (torch.ops._C_custom_ar, via CustomAllreduce) at [48,8192]
+= 66us vs our symm-mem multimem = 38us -- we are 1.7x FASTER (NVLS hardware
+multicast beats vllm's P2P one-shot for 768KB). So although the allreduce is ~30%
+of OUR decode step, it is already faster than vllm's; the decode TPOT gap to vllm
+(21 vs 15) is NOT the allreduce. This saved a pointless custom_ar integration. The
+gap is the COMPUTE/attention/fusion path -- where int4 was neutral and the GEMMs
+are already cuBLAS -- i.e. likely vllm's kernel fusion (fewer ops on the critical
+path) and/or attention kernel, both deep and not drop-in replicable here.
+
 STRATEGIC CORRECTION (isolated op speedups do NOT translate end-to-end). Per-layer
 decode COMPUTE in isolation (4 GEMMs + 2 norms + swiglu, CUDA-graph, M=48) = 169us
 x80 = 13.5ms; + measured allreduce ~6ms ~= the 21ms step. By that the GEMMs look
