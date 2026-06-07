@@ -163,6 +163,93 @@ class PagedDecodeGraphRunner:
         return self.out[:active]
 
 
+def generate_paged_continuous(
+    model: object,
+    requests: list[tuple[list[int], int]],
+    *,
+    page_size: int = 16,
+    max_active: int = 8,
+    use_graph: bool = True,
+) -> list[list[int]]:
+    """Continuous-batching paged greedy generation -- the full paged serving loop.
+
+    requests: list of (prompt_token_ids, max_new_tokens). Admits up to max_active
+    concurrent requests bounded by FREE PAGES (no fixed row cap), prefills each
+    arrival (batch=1, eager), decodes the active set via a graphed
+    PagedDecodeGraphRunner (padded to max_active), and FREES a request's pages on
+    completion so a waiting one can be admitted. Returns generated tokens per
+    request in input order. This composes every validated paged piece into the
+    engine logic the OpenAI online batcher will wrap (queue + TP protocol on top).
+    """
+    import flashinfer
+
+    if not requests:
+        return []
+    dev = model.device
+    layer0 = model.layers[0]
+    nqo, nkv, hd = layer0.local_attention_heads, layer0.local_key_value_heads, model.config.head_dim
+    max_seq = max(len(p) + n for p, n in requests)
+    pages_per = math.ceil(max_seq / page_size)
+    cache = LayeredPagedKVCache(
+        num_layers=len(model.layers), num_pages=max_active * pages_per + 8, page_size=page_size,
+        num_key_value_heads=nkv, head_dim=hd, device=dev, dtype=model.dtype,
+    )
+    runner = PagedDecodeGraphRunner(model, cache, batch=max_active, max_pages=pages_per) if use_graph else None
+
+    results: list[list[int] | None] = [None] * len(requests)
+    pending = list(range(len(requests)))
+    active: list[dict] = []
+    next_rid = 0
+
+    with torch.inference_mode():
+        while pending or active:
+            # admit by free pages (replaces the dense 48-row cap)
+            while len(active) < max_active and pending:
+                idx = pending[0]
+                prompt, max_new = requests[idx]
+                need = math.ceil((len(prompt) + max_new) / page_size)
+                if len(cache.free_pages) < need:
+                    break
+                pending.pop(0)
+                rid = f"r{next_rid}"
+                next_rid += 1
+                cache.reserve(rid, len(prompt) + max_new)
+                cache._sequences[rid].length = len(prompt)
+                pw = _plan_prefill(flashinfer, cache, [rid], [len(prompt)], nqo, nkv, hd, page_size)
+                logits = model.forward_prefill_paged(
+                    torch.tensor([prompt], dtype=torch.long, device=dev), cache,
+                    request_ids=[rid], prefill_wrapper=pw,
+                )
+                tok = int(logits[0, -1, :].argmax())
+                active.append({"idx": idx, "rid": rid, "plen": len(prompt), "gen": [tok], "max_new": max_new, "last": tok})
+            # retire finished requests (free their pages)
+            finished = [a for a in active if len(a["gen"]) >= a["max_new"]]
+            for a in finished:
+                results[a["idx"]] = a["gen"]
+                cache.free(a["rid"])
+            active = [a for a in active if len(a["gen"]) < a["max_new"]]
+            if not active:
+                continue
+            # graphed paged decode of the active set (one token each)
+            for a in active:
+                cache._sequences[a["rid"]].length = a["plen"] + len(a["gen"])
+            tokens = torch.tensor([[a["last"]] for a in active], dtype=torch.long, device=dev)
+            positions = torch.tensor([a["plen"] + len(a["gen"]) - 1 for a in active], dtype=torch.long, device=dev)
+            rids_active = [a["rid"] for a in active]
+            if runner is not None:
+                logits = runner.step(tokens, positions, rids_active)
+            else:
+                dw = _plan_decode(flashinfer, cache, rids_active, nqo, nkv, hd, page_size)
+                logits = model.forward_decode_paged(
+                    tokens, cache, request_ids=rids_active, positions=positions, decode_wrapper=dw)
+            nxt = logits[:, -1, :].argmax(-1)
+            for i, a in enumerate(active):
+                t = int(nxt[i])
+                a["gen"].append(t)
+                a["last"] = t
+    return [r if r is not None else [] for r in results]
+
+
 def generate_paged(
     model: object,
     prompts: list[list[int]],
