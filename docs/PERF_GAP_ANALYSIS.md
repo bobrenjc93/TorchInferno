@@ -265,9 +265,23 @@ PAIRED with a faster per-request decode (int4/fp8: TPOT 33 -> ~15). Harness note
 closed-loop steady-state (warm batcher) is REQUIRED; one-shot bursts are
 setup-dominated (~500ms) and mislead.
 
-## KV-token-bounded concurrency (DEFAULT-ON as of 2026-06-07; was off, now validated)
+## KV-token-bounded concurrency (DEFAULT-OFF; guard crash-fix is on)
 
-UPDATE: shipped default-on after fixing the validation blocker. Root cause of the
+CORRECTION (2026-06-07): briefly shipped default-on, then reverted to opt-in. The
+guard (persistent-cache fit check) STAYS on as an unconditional crash-fix. Reason
+for the revert: I had wrongly assumed few_shot's prompt is ~640 tok (max_seq ~896,
+protected by the >=512 floor). It is actually ~150 tok (system + 5 tiny
+"15 + 27 = 42" examples + a one-line question) -> max_seq ~400, SHORT-context like
+self_consistency (~286) and tree (~350). So the boost raises few_shot's rows too
+and CANNOT cleanly exclude it (the three short "calculator" benchmarks have nearly
+the same max_seq). Harness A/B of few_shot TPOT under boosting was contradictory
+(max_active=128: 51->34 from less queueing-inflation; pw300 boost: 51->55 from more
+rows). few_shot TPOT is one of our two won cells, so default-on with uncertain
+impact is unacceptable. Resolve via a real benchmark run measuring few_shot TPOT
+at boosted rows (the harness over-states queueing). Lesson: read benchmark
+prompt/output token counts from source before calibrating seq-length thresholds.
+
+UPDATE (the default-on attempt, now reverted): fixed the validation blocker. Root cause of the
 earlier >768 crash: the batcher reused the persistent serving cache
 UNCONDITIONALLY with no check that its max_seq_len/rows cover the workload (a
 pre-existing bug the benchmark dodges via a large max_model_len). Fix: a guard
