@@ -1,20 +1,71 @@
 # TorchInferno vs vLLM/sglang — Performance Gap Analysis (Llama-3.1-70B, 8xH100)
 
 Consolidated findings from extended profiling. Benchmark numbers are from
-inference-bench run `20260606_201227` (torchinferno commit `25260c0`); local
-measurements are from `scripts/test_ttft.py` / `test_long_output.py` against the
-current online batcher.
+inference-bench run `20260607_000945` (torchinferno commit `c60e0bd` -- which
+includes ALL current functional work; the 4 commits after it on main are
+docs/harness only). Local measurements are from `scripts/test_stream.py`
+(benchmark-faithful closed-loop streaming) against the current online batcher.
 
-## Headline gaps (cross-benchmark medians)
+## Headline gaps (cross-benchmark medians, run 20260607_000945)
 
 | Metric | torchinferno | vllm | sglang |
 | :-- | --: | --: | --: |
-| TTFT median (ms) | 454 | 136 | 134 |
-| TPOT median (ms) | 36.6 | 32.4 | 50.7 |
-| throughput (tok/s) | 6.5 | 18.1 | 12.5 |
+| TTFT median (ms) | 440.7 | 131.0 | 139.1 |
+| TPOT median (ms) | 34.3 | 30.0 | 47.9 |
+| throughput (tok/s) | 6.5 | 18.1 | 12.4 |
+| **score** | **1/20** | **16/20** | **2/20** |
 
-TPOT is already competitive (we beat sglang, ~within 12% of vllm). **The deficit
-is TTFT and throughput**, and both decompose into two deep issues below.
+## Scoring strategy (READ THIS FIRST -- it inverts naive tuning)
+
+The scorecard is BEST-IN-ROW: a cell is won only by beating BOTH competitors on
+that metric. We win exactly ONE cell: few_shot TPOT (49.1 < vllm 54.2 < sglang
+70.1). TPOT is the ONLY surface we contend on -- cross-TPOT 34.3 BEATS sglang
+(47.9) and is within 14% of vllm (30.0). On TTFT (3.4x) and throughput (2.8x)
+we are too far back to reach best-in-row by tuning.
+
+CONSEQUENCE: do NOT trade TPOT for TTFT/throughput. The decode_quantum lever
+(lowering it) does exactly that and would forfeit our only points -- correctly
+NOT shipped. The realistically flippable cells are all TPOT near-misses:
+  - tree_of_thought TPOT 30.8 vs vllm 28.2  -> 2.6ms away (BEST TARGET)
+  - multi_turn      TPOT 59.9 vs vllm 52.5  -> 7.4ms away
+And because "throughput median (tok/s)" is ~= 1000/TPOT (per-request decode
+rate), any decode TPOT win also lifts throughput cells. Decode speed is the
+master lever.
+
+## decode_quantum is fully swept -- 16 (default) is optimal
+
+local long_output TPOT by quantum: DQ=4 41ms, DQ=8 40ms, DQ=16 22ms, DQ=64 31ms.
+Non-monotonic; 16 is the knee (decode runs in long uninterrupted bursts). Lower
+trades TPOT for TTFT/throughput (loses our metric); higher hurts everything
+(bigger, longer prefill interruptions). Leave at 16.
+
+## Decode-step profile (DQ=16, ~48 active rows, per step) -- where TPOT goes
+
+| component                        | per-step |
+| :------------------------------- | -------: |
+| GPU decode launch (graph replay) |   1.79ms |
+| `.cpu().tolist()` readback sync  |  15.04ms |
+| prepare (build input tensors)    |   0.65ms |
+| state update + emit              |   0.05ms |
+
+The 15ms readback is the CPU BLOCKING on the GPU decode to finish (weight-read
+floor 17.5GB/GPU / 3.35TB/s = 5.2ms, plus KV + 160 allreduces + GEMMs -> ~15ms
+REAL GPU compute). So per-step decode is GPU-COMPUTE-BOUND, not overhead-bound.
+Only ~2-4ms is recoverable CPU-exposure (GPU idles while the CPU reads the token
+back and builds the next step's input, because the autoregressive next input
+depends on that readback). The two real decode levers:
+  1. Async GPU-resident decode: feed the sampled token GPU->GPU (no per-step
+     .cpu() sync) and lag the readback for emission. Recovers the ~2-4ms ->
+     could flip tree_of_thought TPOT (needs 2.6ms) and lift throughput. BUT
+     TP-RISKY: at temp>0 (self_consistency/tree_of_thought) all ranks must
+     sample the SAME token without a CPU barrier -- the same multi-rank
+     divergence class as the reuse saga. Needs a dedicated instrumented 8-GPU
+     session, not a loop iteration.
+  2. FP8 decode weights: ~2x the GPU decode compute (15->~8ms) -> would flip
+     long_output TPOT (31.8->~17, near vllm 15.1) AND its throughput. Deep
+     (FP8 weights + scales + accuracy validation).
+
+## (historical) Issue 1 — prefill kernel MFU (~2x), the dominant TTFT gap
 
 ## Issue 1 — prefill kernel MFU (~2x), the dominant TTFT gap
 
