@@ -7,8 +7,16 @@ beat cuBLAS bf16 here. If so, it is the unblocked path to faster batched decode
 (no torchao/vllm cutlass ABI dependency) -> flips tree/multi_turn TPOT.
 
 Design: BLOCK_K == group (one scale per block). Weight byte holds two int4 along
-K: low nibble = even-K column, high nibble = odd-K column. So split A into
-even/odd K halves and do TWO tl.dot()s -- no per-element nibble branching.
+K: low nibble = even-K column, high nibble = odd-K column. tl.interleave(low,
+high) reconstructs the full K-order weight tile so a SINGLE tl.dot per K-block
+runs (one big dot beats two half-K dots on tensor-core utilization). A
+multi-group-per-block variant was tried and REVERTED: the per-column scale
+gather it needs costs more memory traffic than the loop overhead it saves.
+
+Status (CUDA-graph floor, M=48): lm_head 1.03x (beats bf16), gate_up 0.83x,
+down 0.88x, tiny qkv 0.22x. Remaining gap = small-M (M=48) tl.dot efficiency +
+dequant overhead (~0.4 TB/s vs cuBLAS bf16's 1.8); a Marlin-class kernel
+(dequant fused into the MMA pipeline) is needed to clear it.
 
   python scripts/bench_triton_int4.py
 """
