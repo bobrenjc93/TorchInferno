@@ -21,6 +21,17 @@ from torch import Tensor
 from torchinferno.runtime.paged import LayeredPagedKVCache
 
 
+def _greedy_tokens(model, logits_2d):
+    """Greedy next-token from [batch, vocab] logits. On TP the logits are VOCAB-
+    SHARDED, so a plain argmax gives a per-rank LOCAL index -> every rank picks a
+    different token -> desync/garbage. Use the model's TP-aware greedy sampler
+    (all-reduce to the consistent GLOBAL token) when sharded; plain argmax for
+    world_size==1 (full vocab)."""
+    if getattr(model, "world_size", 1) > 1 and hasattr(model, "_sample_next_token_greedy"):
+        return model._sample_next_token_greedy(logits_2d)
+    return logits_2d.argmax(-1)
+
+
 def _plan_decode(flashinfer, cache, request_ids, nqo, nkv, hd, page_size):
     indptr, indices, lpl = cache.flashinfer_page_table(request_ids)
     ws = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=cache.kv.device)
@@ -220,7 +231,7 @@ def generate_paged_continuous(
                     torch.tensor([prompt], dtype=torch.long, device=dev), cache,
                     request_ids=[rid], prefill_wrapper=pw,
                 )
-                tok = int(logits[0, -1, :].argmax())
+                tok = int(_greedy_tokens(model, logits[:, -1, :])[0])
                 active.append({"idx": idx, "rid": rid, "plen": len(prompt), "gen": [tok], "max_new": max_new, "last": tok})
             # retire finished requests (free their pages)
             finished = [a for a in active if len(a["gen"]) >= a["max_new"]]
@@ -242,7 +253,7 @@ def generate_paged_continuous(
                 dw = _plan_decode(flashinfer, cache, rids_active, nqo, nkv, hd, page_size)
                 logits = model.forward_decode_paged(
                     tokens, cache, request_ids=rids_active, positions=positions, decode_wrapper=dw)
-            nxt = logits[:, -1, :].argmax(-1)
+            nxt = _greedy_tokens(model, logits[:, -1, :])
             for i, a in enumerate(active):
                 t = int(nxt[i])
                 a["gen"].append(t)
@@ -314,7 +325,7 @@ class PagedEngine:
                     torch.tensor([prompt], dtype=torch.long, device=self.dev), self.cache,
                     request_ids=[rid], prefill_wrapper=pw,
                 )
-                tok = int(logits[0, -1, :].argmax())
+                tok = int(_greedy_tokens(self.model, logits[:, -1, :])[0])
                 a = {"ext": ext_id, "rid": rid, "plen": len(prompt), "gen": [tok], "max_new": max_new, "last": tok, "eos": eos}
                 fin = len(a["gen"]) >= max_new or tok == eos
                 events.append((ext_id, tok, fin))
@@ -336,7 +347,7 @@ class PagedEngine:
                 dw = _plan_decode(flashinfer, self.cache, rids_active, self.nqo, self.nkv, self.hd, self.page_size)
                 logits = self.model.forward_decode_paged(
                     tokens, self.cache, request_ids=rids_active, positions=positions, decode_wrapper=dw)
-            nxt = logits[:, -1, :].argmax(-1)
+            nxt = _greedy_tokens(self.model, logits[:, -1, :])
             still = []
             for i, a in enumerate(self._active):
                 t = int(nxt[i])
@@ -441,7 +452,7 @@ def generate_paged(
             torch.tensor(prompts, dtype=torch.long, device=dev), cache,
             request_ids=rids, prefill_wrapper=pw,
         )  # [batch, T, vocab]
-        tok = logits[:, -1, :].argmax(-1)  # [batch]
+        tok = _greedy_tokens(model, logits[:, -1, :])  # [batch]
         for i in range(batch):
             out[i].append(int(tok[i]))
 
@@ -463,7 +474,7 @@ def generate_paged(
                     tok.view(batch, 1), cache, request_ids=rids,
                     positions=positions, decode_wrapper=dw,
                 )  # [batch, 1, vocab]
-            tok = logits[:, -1, :].argmax(-1)
+            tok = _greedy_tokens(model, logits[:, -1, :])
             for i in range(batch):
                 out[i].append(int(tok[i]))
     return out
