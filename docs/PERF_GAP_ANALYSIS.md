@@ -6,14 +6,23 @@ includes ALL current functional work; the 4 commits after it on main are
 docs/harness only). Local measurements are from `scripts/test_stream.py`
 (benchmark-faithful closed-loop streaming) against the current online batcher.
 
-## Headline gaps (cross-benchmark medians, run 20260607_021340)
+## Headline gaps (cross-benchmark medians, run 20260607_042000)
 
 | Metric | torchinferno | vllm | sglang |
 | :-- | --: | --: | --: |
-| TTFT median (ms) | 515.1 | 127.8 | 133.6 |
-| TPOT median (ms) | 36.5 | 33.8 | 48.1 |
-| throughput (tok/s) | 6.1 | 18.3 | 12.8 |
+| TTFT median (ms) | 449.7 | 132.7 | 137.3 |
+| TPOT median (ms) | 35.2 | 33.5 | 55.3 |
+| throughput (tok/s) | 6.3 | 18.0 | 12.3 |
 | **score** | **2/20** | **15/20** | **2/20** |
+
+Stable at 2/20 across runs _021340 and _042000 (builds 7d2331a, 5bb4303 -- both
+differ from the 1/20 build c60e0bd only by docs/flag-off/reference-path commits,
+so serving behavior is unchanged). Our two won cells are BOTH TPOT and now look
+robust (not pure noise): few_shot TPOT 50.6 vs vllm 56.2, multi_turn TPOT 59.8
+vs vllm 67.2 (vllm ~67ms two runs running, vs our consistent ~60-63). The next
+TPOT target is tree_of_thought 32.9 vs vllm 29.3 (3.6ms behind). Everything else
+(TTFT 3.4x, E2E 2.7x, throughput 2.9x) is queueing+decode-kernel bound and not
+flippable by tuning -- see the analysis below.
 
 BENCHMARK VARIANCE WARNING. The score moved 1/20 -> 2/20 between runs
 20260607_000945 and _021340 with our code FUNCTIONALLY UNCHANGED (build 7d2331a
