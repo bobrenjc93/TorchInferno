@@ -265,6 +265,33 @@ PAIRED with a faster per-request decode (int4/fp8: TPOT 33 -> ~15). Harness note
 closed-loop steady-state (warm batcher) is REQUIRED; one-shot bursts are
 setup-dominated (~500ms) and mislead.
 
+## KV-token-bounded concurrency (implemented, flag-gated, DEFAULT-OFF, 2026-06-07)
+
+Targets the closest flippable cell: self_consistency TTFT (274 vs vllm 195, only
+1.4x). self_consistency is 1k IDENTICAL short prompts (~286 tok) with early-EOS
+tiny outputs at 128 client concurrency -> pure queueing against the 48-row cap.
+Flag TORCHINFERNO_OPENAI_TP_ONLINE_KV_BOUNDED_CONCURRENCY:
+_kv_bounded_concurrency_cap() sizes the persistent serving cache for a higher row
+cap (128) at warmup; the batcher then sets
+max_active = max(48, min(cap, KV_TOKEN_BUDGET // max_seq_len)), budget 48*512.
+SHORT-context workloads admit more rows (self_consistency ~85, tree ~70); any
+max_seq_len >= 512 floors to 48 so few_shot (~896)/multi_turn (~2k)/long_output
+(large) are UNCHANGED -- the two TPOT cells are protected by arithmetic, and
+decode GEMMs are weight-bound (above) so the extra short rows are ~free.
+
+Live-validated WIN case (budget 30720): long_output-like 96-conc TTFT 2628->955ms
+(2.75x), throughput +15%; self_consistency-like runs at 128 rows. Kept
+DEFAULT-OFF: the no-regression A/B was blocked because the test server left
+max_model_len unset -> persistent/warmup cache max_seq defaulted to 768 -> ANY
+>768-token request (multi_turn 826, few_shot 896) hits an index-out-of-bounds
+device assert at pos 769 that poisons the CUDA context. This crash is ORTHOGONAL
+to the boost (the 768 cache vs >768 seq would crash the baseline too) and the
+REAL benchmark configures max_model_len large (it serves multi_turn fine), so
+default-on is likely safe there but UNVALIDATED. To ship: restart with
+--max-model-len / TORCHINFERNO_OPENAI_UNIFIED_MAX_SEQ_LEN >= 4096, re-run the
+closed-loop A/B (few_shot/multi_turn TPOT must stay ~48-row baseline AND
+self_consistency TTFT must drop below 195), then flip the default.
+
 ## BREAKTHROUGH: Marlin int4 decode kernel works via vLLM (scripts/bench_marlin_int4.py)
 
 The long-cited "no fast batched-int4 decode kernel available" conclusion is
