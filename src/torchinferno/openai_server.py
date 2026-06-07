@@ -2397,6 +2397,29 @@ class OpenAICompletionEngine:
             print(f"[ONLINE_BATCHER] skipped: no allocate_cache", file=_obr.stderr, flush=True)
         return result
 
+    def _maybe_build_paged_online_engine(self, *, max_active: int, max_seq_len: int):
+        # Flag-gated (default OFF) paged-KV online engine. When on, the online
+        # batcher + its TP worker both construct a PagedEngine instead of the dense
+        # _RuntimeContinuousBatchEngine -- a validated drop-in (same start_online/
+        # submit_online/has_online_work/step_online interface) backed by the paged
+        # KV pool (context-flat, graph-capable decode; the dense giant-page decode is
+        # 1.5-3x slower at long ctx). Both ranks build it identically + are driven by
+        # the same submit/step command protocol, so the deterministic page allocator
+        # keeps block tables in sync without extra broadcast. Returns None (-> dense)
+        # when off or the model lacks the paged forward.
+        if not _paged_kv_active_for(self.model, max_seq_len):
+            return None
+        try:
+            from torchinferno.runtime.paged_serving import PagedEngine
+        except Exception:
+            return None
+        page_size = int(getattr(self, "page_size", 16) or 16)
+        return PagedEngine(
+            self.model, page_size=page_size, max_active=int(max_active),
+            max_seq=int(max_seq_len),
+            use_graph=env_flag("TORCHINFERNO_OPENAI_PAGED_KV_GRAPH", False),
+        )
+
     def _run_tensor_parallel_online_batcher(self, first: _QueuedGeneration) -> None:
         requested_max_batch = int(getattr(self, "max_batch_size", 1))
         enable_ragged_decode = env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_RAGGED_DECODE", True)
@@ -2520,23 +2543,26 @@ class OpenAICompletionEngine:
             stop_token_ids = frozenset()
             eos_token_id = None
         engine_create_start_s = time.perf_counter()
-        runtime_engine = _RuntimeContinuousBatchEngine(
-            self.model,
-            device=self.device,
-            cache_backend=self.cache_backend,
-            page_size=self.page_size,
-            temperature=first.temperature,
-            max_active_requests=max_active,
-            prefix_cache_capacity=prefix_rows,
-            prefill_token_budget=prefill_budget if prefill_budget > 0 else None,
-            enable_ragged_decode=enable_ragged_decode,
-            store_reusable_prefixes=store_reusable_prefixes,
-            store_full_prompt_prefixes=store_full_prompt_prefixes,
-            pin_shared_prefix=env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_PIN_SHARED_PREFIX", True),
-            graph_prefill=env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_GRAPH_PREFILL", True),
-            prefill_chunk_size=(env_int("TORCHINFERNO_OPENAI_TP_ONLINE_PREFILL_CHUNK", 0, minimum=0) or None),
-            profile_timings=bool(self._queue_profile_path_value()),
-        )
+        runtime_engine = self._maybe_build_paged_online_engine(max_active=max_active, max_seq_len=max_seq_len)
+        use_paged_engine = runtime_engine is not None
+        if not use_paged_engine:
+            runtime_engine = _RuntimeContinuousBatchEngine(
+                self.model,
+                device=self.device,
+                cache_backend=self.cache_backend,
+                page_size=self.page_size,
+                temperature=first.temperature,
+                max_active_requests=max_active,
+                prefix_cache_capacity=prefix_rows,
+                prefill_token_budget=prefill_budget if prefill_budget > 0 else None,
+                enable_ragged_decode=enable_ragged_decode,
+                store_reusable_prefixes=store_reusable_prefixes,
+                store_full_prompt_prefixes=store_full_prompt_prefixes,
+                pin_shared_prefix=env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_PIN_SHARED_PREFIX", True),
+                graph_prefill=env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_GRAPH_PREFILL", True),
+                prefill_chunk_size=(env_int("TORCHINFERNO_OPENAI_TP_ONLINE_PREFILL_CHUNK", 0, minimum=0) or None),
+                profile_timings=bool(self._queue_profile_path_value()),
+            )
         decode_runner = getattr(self, "_decode_graph_runner", None)
         if decode_runner is not None:
             runtime_engine._decode_runner = decode_runner
@@ -2635,34 +2661,37 @@ class OpenAICompletionEngine:
                     store_full_prompt_prefixes=store_full_prompt_prefixes,
                     max_tokens=run_max_tokens,
                 )
-                shared_cache = getattr(self, "_persistent_serving_cache", None)
-                # The persistent cache must be at least as long as this workload's
-                # sequences AND have enough rows for the (possibly KV-bounded
-                # boosted) active set; otherwise reusing it overruns its bounds at
-                # runtime (index-out-of-bounds device assert). Fall through to a
-                # fresh, correctly-sized allocation when it does not fit.
-                if shared_cache is not None and hasattr(shared_cache, "layers") and shared_cache.layers:
-                    _player = shared_cache.layers[0]
-                    persistent_max_seq = getattr(_player, "max_seq_len", None)
-                    persistent_rows = getattr(_player, "batch_size", None)
-                    if persistent_rows is None and hasattr(_player, "keys"):
-                        persistent_rows = _player.keys.size(0)
-                    if (persistent_max_seq is not None and persistent_max_seq < max_seq_len) or (
-                        persistent_rows is not None and persistent_rows < max_active + prefix_rows
-                    ):
-                        shared_cache = None
-                if shared_cache is None:
-                    try:
-                        total_online_rows = max_active + prefix_rows
-                        shared_cache = self._generation_cache(
-                            total_online_rows,
-                            max_seq_len,
-                            model=self.model,
-                            batch_capacity=_generation_cache_batch_capacity(self.model, total_online_rows),
-                        )
-                        _reset_generation_cache(shared_cache)
-                    except Exception:
-                        shared_cache = None
+                if use_paged_engine:
+                    shared_cache = None  # PagedEngine owns its own paged KV pool
+                else:
+                    shared_cache = getattr(self, "_persistent_serving_cache", None)
+                    # The persistent cache must be at least as long as this workload's
+                    # sequences AND have enough rows for the (possibly KV-bounded
+                    # boosted) active set; otherwise reusing it overruns its bounds at
+                    # runtime (index-out-of-bounds device assert). Fall through to a
+                    # fresh, correctly-sized allocation when it does not fit.
+                    if shared_cache is not None and hasattr(shared_cache, "layers") and shared_cache.layers:
+                        _player = shared_cache.layers[0]
+                        persistent_max_seq = getattr(_player, "max_seq_len", None)
+                        persistent_rows = getattr(_player, "batch_size", None)
+                        if persistent_rows is None and hasattr(_player, "keys"):
+                            persistent_rows = _player.keys.size(0)
+                        if (persistent_max_seq is not None and persistent_max_seq < max_seq_len) or (
+                            persistent_rows is not None and persistent_rows < max_active + prefix_rows
+                        ):
+                            shared_cache = None
+                    if shared_cache is None:
+                        try:
+                            total_online_rows = max_active + prefix_rows
+                            shared_cache = self._generation_cache(
+                                total_online_rows,
+                                max_seq_len,
+                                model=self.model,
+                                batch_capacity=_generation_cache_batch_capacity(self.model, total_online_rows),
+                            )
+                            _reset_generation_cache(shared_cache)
+                        except Exception:
+                            shared_cache = None
                 runtime_engine.start_online(max_seq_len=max_seq_len, external_cache=shared_cache)
                 started = True
                 _sync_tensor_parallel_command(self.model, self.device)
@@ -9060,6 +9089,23 @@ def _is_tensor_parallel_worker_model(model: object) -> bool:
     return _is_tensor_parallel_model(model) and _tensor_parallel_world_size(model) > 1 and int(getattr(model, "rank", 0)) != 0
 
 
+def _paged_kv_active_for(model: object, max_seq_len: int) -> bool:
+    # Shared paged-KV decision (primary + TP worker MUST agree, so both call this
+    # with the same broadcast max_seq_len). Gated by the flag, the model having the
+    # paged forward, AND a LONG-CONTEXT threshold: paged decode only beats dense
+    # giant-page decode at long ctx (kernel bench: tie at <=1024, 1.5-3x at >=2048),
+    # while the dense path is the optimized one for short ctx (prefill graphs, prefix
+    # cache). So restrict paged to long-ctx workloads (multi_turn) -> short-ctx cells
+    # (few_shot/self_consistency/tree) stay on the unchanged dense path = zero
+    # regression risk; long-ctx gets the validated paged win. Default threshold 1024.
+    if not env_flag("TORCHINFERNO_OPENAI_PAGED_KV", False):
+        return False
+    if not hasattr(model, "forward_decode_paged"):
+        return False
+    min_seq = env_int("TORCHINFERNO_OPENAI_PAGED_KV_MIN_SEQ", 1024, minimum=1)
+    return int(max_seq_len) >= min_seq
+
+
 def _prefix_cache_enabled_for_model(model: object) -> bool:
     if _is_tensor_parallel_model(model) and _tensor_parallel_world_size(model) > 1:
         return env_flag("TORCHINFERNO_OPENAI_TP_PREFIX_CACHE", True)
@@ -10332,7 +10378,20 @@ def _tensor_parallel_worker_loop(engine: OpenAICompletionEngine) -> None:
                 prefix_rows = int(payload.get("prefix_cache_capacity", 0))
                 prefill_budget_value = int(payload.get("prefill_token_budget", 0))
                 temperature = float(payload.get("temperature", 0.0))
-                if online_runtime_engine is None:
+                # Flag-gated paged-KV worker engine -- MUST match the primary's choice
+                # (both build a PagedEngine identically + are driven by the same
+                # submit/step commands, so the deterministic page allocator keeps
+                # block tables in sync across ranks).
+                worker_use_paged = _paged_kv_active_for(getattr(engine, "model", None), max_seq_len)
+                if online_runtime_engine is None and worker_use_paged:
+                    from torchinferno.runtime.paged_serving import PagedEngine
+                    online_runtime_engine = PagedEngine(
+                        getattr(engine, "model"),
+                        page_size=int(getattr(engine, "page_size", 16)) or 16,
+                        max_active=max_active, max_seq=max_seq_len,
+                        use_graph=env_flag("TORCHINFERNO_OPENAI_PAGED_KV_GRAPH", False),
+                    )
+                elif online_runtime_engine is None:
                     online_runtime_engine = _RuntimeContinuousBatchEngine(
                         getattr(engine, "model"),
                         device=getattr(engine, "device", torch.device("cpu")),
@@ -10349,28 +10408,31 @@ def _tensor_parallel_worker_loop(engine: OpenAICompletionEngine) -> None:
                         graph_prefill=env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_GRAPH_PREFILL", True),
                         prefill_chunk_size=(env_int("TORCHINFERNO_OPENAI_TP_ONLINE_PREFILL_CHUNK", 0, minimum=0) or None),
                     )
-                worker_shared_cache = getattr(engine, "_persistent_serving_cache", None)
-                if worker_shared_cache is None:
-                    try:
-                        total_rows = max_active + prefix_rows
-                        worker_model = getattr(engine, "model")
-                        worker_cache_backend = str(getattr(engine, "cache_backend", "dense"))
-                        if hasattr(worker_model, "forward_step_flashinfer"):
-                            try:
-                                import flashinfer as _fi_check  # noqa: F401
-                                worker_cache_backend = "flashinfer"
-                            except ImportError:
-                                pass
-                        worker_shared_cache = _allocate_cache(
-                            worker_model, total_rows,
-                            _generation_cache_capacity(worker_model, max_seq_len),
-                            device=getattr(engine, "device", torch.device("cpu")),
-                            cache_backend=worker_cache_backend,
-                            page_size=int(getattr(engine, "page_size", 16)),
-                        )
-                        _reset_generation_cache(worker_shared_cache)
-                    except Exception:
-                        worker_shared_cache = None
+                if worker_use_paged:
+                    worker_shared_cache = None  # PagedEngine owns its own paged KV pool
+                else:
+                    worker_shared_cache = getattr(engine, "_persistent_serving_cache", None)
+                    if worker_shared_cache is None:
+                        try:
+                            total_rows = max_active + prefix_rows
+                            worker_model = getattr(engine, "model")
+                            worker_cache_backend = str(getattr(engine, "cache_backend", "dense"))
+                            if hasattr(worker_model, "forward_step_flashinfer"):
+                                try:
+                                    import flashinfer as _fi_check  # noqa: F401
+                                    worker_cache_backend = "flashinfer"
+                                except ImportError:
+                                    pass
+                            worker_shared_cache = _allocate_cache(
+                                worker_model, total_rows,
+                                _generation_cache_capacity(worker_model, max_seq_len),
+                                device=getattr(engine, "device", torch.device("cpu")),
+                                cache_backend=worker_cache_backend,
+                                page_size=int(getattr(engine, "page_size", 16)),
+                            )
+                            _reset_generation_cache(worker_shared_cache)
+                        except Exception:
+                            worker_shared_cache = None
                 online_runtime_engine.start_online(
                     max_seq_len=max_seq_len, external_cache=worker_shared_cache,
                 )

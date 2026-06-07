@@ -381,6 +381,53 @@ class LayeredPagedKVCache:
             slots.append(page_id * self.page_size + position % self.page_size)
         return torch.tensor(slots, dtype=torch.long, device=self.kv.device)
 
+    def block_table(
+        self, request_ids: list[str], *, max_pages: int | None = None
+    ) -> Tensor:
+        """[batch, max_pages] int64 block table: row i = request i's page ids,
+        zero-padded. Built once per step from the Python block tables (a small
+        per-REQUEST loop, not per-token). Feeds the on-device, CUDA-graph-capturable
+        slot computation in slots_from_block_table() -- so the graphed decode path
+        never needs the host sync (`positions.tolist()`) that the per-token
+        slot_mapping() above does.
+        """
+        rows = [self._sequences[rid].page_ids for rid in request_ids]
+        width = max_pages if max_pages is not None else max((len(r) for r in rows), default=0)
+        width = max(1, width)
+        table = torch.zeros(len(rows), width, dtype=torch.long, device=self.kv.device)
+        for i, page_ids in enumerate(rows):
+            if page_ids:
+                table[i, : len(page_ids)] = torch.tensor(
+                    page_ids, dtype=torch.long, device=self.kv.device
+                )
+        return table
+
+    @staticmethod
+    def slots_from_block_table(
+        block_table: Tensor, positions: Tensor, page_size: int
+    ) -> Tensor:
+        """Flat KV-write slots computed ENTIRELY on-device -- CUDA-graph-capturable.
+
+        block_table: [batch, max_pages] int64 (see block_table()); positions: [batch]
+        int64 absolute token positions. Returns [batch] int64 of
+        page_id * page_size + offset, identical to slot_mapping() but with no host
+        sync, so it can run inside a captured decode graph. The serving loop keeps
+        block_table/positions as static buffers and copies fresh contents in before
+        each replay.
+        """
+        page_slot = torch.div(positions, page_size, rounding_mode="floor")
+        page_id = block_table.gather(1, page_slot.unsqueeze(1)).squeeze(1)
+        return page_id * page_size + (positions - page_slot * page_size)
+
+    def slot_mapping_device(
+        self, request_ids: list[str], positions: Tensor
+    ) -> Tensor:
+        """Graph-friendly slot_mapping: same result as slot_mapping() but the
+        per-token math runs on-device via slots_from_block_table(), avoiding the
+        host sync. positions is a [batch] int64 tensor."""
+        table = self.block_table(request_ids)
+        return self.slots_from_block_table(table, positions, self.page_size)
+
     def scatter_write(self, layer: int, slots: Tensor, keys: Tensor, values: Tensor) -> None:
         """Single batched paged KV write for one layer via a slot_mapping().
 

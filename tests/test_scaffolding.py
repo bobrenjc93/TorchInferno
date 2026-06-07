@@ -284,6 +284,38 @@ def test_layered_paged_kv_cache_slot_mapping_scatter_write() -> None:
             torch.testing.assert_close(cache.kv[layer, page, 1, off], values[i])
 
 
+def test_layered_paged_kv_cache_slot_mapping_device_matches_host() -> None:
+    # The on-device, CUDA-graph-capturable slot computation (block_table +
+    # slots_from_block_table / slot_mapping_device) must produce EXACTLY the same
+    # slots as the host-loop slot_mapping() -- it is the graph-friendly replacement
+    # that removes the positions.tolist() host sync from the paged decode step.
+    import torch as _t
+    from torchinferno.runtime.paged import LayeredPagedKVCache
+
+    cache = LayeredPagedKVCache(
+        num_layers=1, num_pages=32, page_size=4, num_key_value_heads=1,
+        head_dim=1, device=_t.device("cpu"), dtype=_t.float32,
+    )
+    cache.reserve("a", 12)  # 3 pages
+    cache.reserve("b", 8)   # 2 pages
+    cache.reserve("c", 16)  # 4 pages
+    rids = ["a", "b", "c", "a", "c"]
+    positions = [0, 5, 9, 11, 3]  # span page boundaries within each request
+    host = cache.slot_mapping(rids, positions)
+    dev = cache.slot_mapping_device(rids, _t.tensor(positions, dtype=_t.long))
+    assert dev.tolist() == host.tolist()
+
+    # block_table rows must be the zero-padded page-id lists.
+    table = cache.block_table(rids)
+    assert table.shape[0] == len(rids)
+    assert table[0, :3].tolist() == cache._sequences["a"].page_ids[:3]
+    # explicit slots_from_block_table call (the in-graph primitive).
+    direct = LayeredPagedKVCache.slots_from_block_table(
+        table, _t.tensor(positions, dtype=_t.long), cache.page_size
+    )
+    assert direct.tolist() == host.tolist()
+
+
 def test_layered_paged_kv_cache_out_of_pages_raises() -> None:
     from torchinferno.runtime.paged import LayeredPagedKVCache
 
