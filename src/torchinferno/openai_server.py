@@ -1750,7 +1750,7 @@ class OpenAICompletionEngine:
         # exceed the warmup max_seq_len and keep the base 48-row cap. Returns the
         # base when the feature is disabled.
         base = self._online_serving_max_active()
-        if not env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_KV_BOUNDED_CONCURRENCY", True):
+        if not env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_KV_BOUNDED_CONCURRENCY", False):
             return base
         cap = env_int("TORCHINFERNO_OPENAI_TP_ONLINE_KV_MAX_ACTIVE_CAP", 128, minimum=1)
         effective = _effective_openai_max_batch_size(self.model, self.device, self.max_batch_size)
@@ -2480,13 +2480,16 @@ class OpenAICompletionEngine:
         # bounding total KV memory; the cap matches the rows the persistent cache
         # was warmed for (_kv_bounded_concurrency_cap). Decode GEMMs are
         # weight-bound so the extra short rows are ~free (scripts/bench_decode_batch_scaling.py).
-        if env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_KV_BOUNDED_CONCURRENCY", True):
+        if env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_KV_BOUNDED_CONCURRENCY", False):
             kv_token_budget = env_int(
-                # 48 * 512: keeps the base 48-row cap for any workload with
-                # max_seq_len >= 512 (few_shot ~896, multi_turn ~2k, long_output
-                # large all stay 48 -> no TPOT regression on our contested cells),
-                # and only boosts genuinely short-context workloads
-                # (self_consistency ~286 -> ~85, tree_of_thought ~350 -> ~70).
+                # DEFAULT-OFF (see _kv_bounded_concurrency_cap). 48*512 keeps the
+                # base cap for max_seq_len >= 512 (multi_turn ~2k, long_output
+                # large), but NOTE few_shot's real prompt is short (~150 tok ->
+                # max_seq ~400 < 512), so it WOULD boost alongside
+                # self_consistency (~286) and tree (~350). Whether boosting few_shot
+                # helps or hurts its TPOT (our won cell) was contradictory in
+                # harness A/B, so this stays opt-in until a real benchmark run can
+                # measure the few_shot TPOT impact directly.
                 "TORCHINFERNO_OPENAI_TP_ONLINE_KV_TOKEN_BUDGET", 48 * 512, minimum=1
             )
             max_active = max(max_active, min(self._kv_bounded_concurrency_cap(), kv_token_budget // max_seq_len))
