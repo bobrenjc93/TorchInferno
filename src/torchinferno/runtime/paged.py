@@ -166,6 +166,40 @@ class PagedKVCache:
         for page_id in seq.page_ids:
             self._release_page(page_id)
 
+    def flashinfer_page_table(
+        self, request_ids: list[str]
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """Build the FlashInfer paged-KV plan tensors for a batch of sequences.
+
+        Returns ``(kv_indptr, kv_indices, kv_last_page_len)`` as int32 tensors on
+        the cache device, exactly the CSR layout
+        ``BatchDecodeWithPagedKVCacheWrapper.plan`` expects: ``kv_indptr`` is the
+        ``[B+1]`` cumulative per-request page count, ``kv_indices`` concatenates
+        each request's page ids in order, and ``kv_last_page_len[i]`` is the number
+        of valid tokens in request i's final page (1..page_size; 0 for an empty
+        sequence). This is the bridge from the page pool to FlashInfer paged
+        attention -- the missing piece for migrating the dense llama3-TP KV cache
+        to true paged allocation (higher long-context concurrency).
+        """
+        indptr: list[int] = [0]
+        indices: list[int] = []
+        last_page_len: list[int] = []
+        for request_id in request_ids:
+            seq = self._sequences[request_id]
+            num_pages = math.ceil(seq.length / self.page_size) if seq.length else 0
+            indices.extend(seq.page_ids[:num_pages])
+            indptr.append(indptr[-1] + num_pages)
+            if seq.length == 0:
+                last_page_len.append(0)
+            else:
+                last_page_len.append(seq.length - (num_pages - 1) * self.page_size)
+        device = self.keys.device
+        return (
+            torch.tensor(indptr, dtype=torch.int32, device=device),
+            torch.tensor(indices, dtype=torch.int32, device=device),
+            torch.tensor(last_page_len, dtype=torch.int32, device=device),
+        )
+
     def _ensure_capacity(self, seq: PagedSequence, tokens: int) -> None:
         required_pages = math.ceil(tokens / self.page_size)
         while len(seq.page_ids) < required_pages:

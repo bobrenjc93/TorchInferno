@@ -64,6 +64,33 @@ def test_paged_kv_cache_materializes_request_tokens() -> None:
     assert cache.free_pages == (0, 1, 2)
 
 
+def test_paged_kv_cache_flashinfer_page_table() -> None:
+    cache = PagedKVCache(
+        num_pages=8,
+        page_size=4,
+        num_key_value_heads=1,
+        head_dim=2,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+    # req_a: 5 tokens -> 2 pages (last page holds 1 token);
+    # req_b: 8 tokens -> 2 pages (last page full = page_size);
+    # req_c: 3 tokens -> 1 page (last page holds 3).
+    cache.append("a", torch.zeros(1, 5, 2), torch.zeros(1, 5, 2))
+    cache.append("b", torch.zeros(1, 8, 2), torch.zeros(1, 8, 2))
+    cache.append("c", torch.zeros(1, 3, 2), torch.zeros(1, 3, 2))
+
+    indptr, indices, last_page_len = cache.flashinfer_page_table(["a", "b", "c"])
+
+    # CSR page counts: a=2, b=2, c=1 -> indptr cumulative.
+    torch.testing.assert_close(indptr, torch.tensor([0, 2, 4, 5], dtype=torch.int32))
+    # indices concatenate each request's actual page ids in order.
+    expected_pages = cache.sequence("a").page_ids[:2] + cache.sequence("b").page_ids[:2] + cache.sequence("c").page_ids[:1]
+    torch.testing.assert_close(indices, torch.tensor(expected_pages, dtype=torch.int32))
+    # last-page valid token counts: a=1, b=4 (full), c=3.
+    torch.testing.assert_close(last_page_len, torch.tensor([1, 4, 3], dtype=torch.int32))
+
+
 def test_paged_kv_cache_alias_prefix_is_copy_on_write() -> None:
     cache = PagedKVCache(
         num_pages=4,
