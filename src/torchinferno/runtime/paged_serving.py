@@ -281,12 +281,13 @@ class PagedEngine:
             PagedDecodeGraphRunner(model, self.cache, batch=max_active, max_pages=pages_per)
             if use_graph else None
         )
-        self._pending: list[tuple] = []  # (request_id, prompt, max_new)
+        self._pending: list[tuple] = []  # (request_id, prompt, max_new, eos)
         self._active: list[dict] = []
         self._next_rid = 0
+        self._step_no = 0
 
-    def submit(self, request_id, prompt: list[int], max_new_tokens: int) -> None:
-        self._pending.append((request_id, list(prompt), max_new_tokens))
+    def submit(self, request_id, prompt: list[int], max_new_tokens: int, eos_token_id=None) -> None:
+        self._pending.append((request_id, list(prompt), max_new_tokens, eos_token_id))
 
     def has_work(self) -> bool:
         return bool(self._pending or self._active)
@@ -299,7 +300,7 @@ class PagedEngine:
         with torch.inference_mode():
             # admit + prefill new arrivals (emit their first token)
             while len(self._active) < self.max_active and self._pending:
-                ext_id, prompt, max_new = self._pending[0]
+                ext_id, prompt, max_new, eos = self._pending[0]
                 need = math.ceil((len(prompt) + max_new) / self.page_size)
                 if len(self.cache.free_pages) < need:
                     break
@@ -314,8 +315,8 @@ class PagedEngine:
                     request_ids=[rid], prefill_wrapper=pw,
                 )
                 tok = int(logits[0, -1, :].argmax())
-                a = {"ext": ext_id, "rid": rid, "plen": len(prompt), "gen": [tok], "max_new": max_new, "last": tok}
-                fin = len(a["gen"]) >= max_new
+                a = {"ext": ext_id, "rid": rid, "plen": len(prompt), "gen": [tok], "max_new": max_new, "last": tok, "eos": eos}
+                fin = len(a["gen"]) >= max_new or tok == eos
                 events.append((ext_id, tok, fin))
                 if fin:
                     self.cache.free(rid)
@@ -341,13 +342,52 @@ class PagedEngine:
                 t = int(nxt[i])
                 a["gen"].append(t)
                 a["last"] = t
-                fin = len(a["gen"]) >= a["max_new"]
+                fin = len(a["gen"]) >= a["max_new"] or t == a["eos"]
                 events.append((a["ext"], t, fin))
                 if fin:
                     self.cache.free(a["rid"])
                 else:
                     still.append(a)
             self._active = still
+        return events
+
+    # --- ContinuousBatchEngine-compatible interface (drop-in for the OpenAI online
+    # batcher, which drives start_online / submit_online / has_online_work /
+    # step_online -> ServingTokenEvent). Lets the batcher swap the dense engine for
+    # this paged one behind a flag without changing its queue/streaming/TP loop. ---
+
+    def start_online(self, *, max_seq_len: int, external_cache=None) -> None:
+        # Reset per-run state. The cache/runner are sized at construction (max_seq);
+        # an external paged cache may be adopted (e.g. a persistent TP-shared pool).
+        if external_cache is not None:
+            self.cache = external_cache
+            if self.runner is not None:
+                self.runner.cache = external_cache
+        self._pending = []
+        self._active = []
+        self._next_rid = 0
+        self._step_no = 0
+
+    def submit_online(self, request) -> None:
+        self.submit(request.request_id, list(request.prompt), request.max_new_tokens, request.eos_token_id)
+
+    def has_online_work(self) -> bool:
+        return self.has_work()
+
+    def step_online(self) -> list:
+        from torchinferno.runtime.serving import ServingTokenEvent
+
+        raw = self.step()
+        gen_count: dict = getattr(self, "_gen_count", {})
+        self._gen_count = gen_count
+        events = []
+        for ext_id, tok, fin in raw:
+            gen_count[ext_id] = gen_count.get(ext_id, 0) + 1
+            events.append(ServingTokenEvent(
+                request_id=str(ext_id), token=int(tok), step=self._step_no,
+                generated=gen_count[ext_id], finished=bool(fin),
+            ))
+        self._step_no += 1
         return events
 
 

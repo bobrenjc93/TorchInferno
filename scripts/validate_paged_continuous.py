@@ -95,6 +95,36 @@ def main():
                 if e != g:
                     print(f"    req {i}: engine={e}\n            batch ={g}", flush=True)
 
+        # ISOLATION 4: ContinuousBatchEngine-compatible interface (start_online /
+        # submit_online(ServingRequest) / step_online -> ServingTokenEvent) == direct
+        # submit/step. This is the drop-in the OpenAI online batcher will use.
+        from torchinferno.runtime.serving import ServingRequest
+        eng2 = PagedEngine(model, page_size=16, max_active=3, max_seq=64, use_graph=True)
+        eng2.start_online(max_seq_len=64)
+        for i, (prompt, max_new) in enumerate(requests):
+            eng2.submit_online(ServingRequest(request_id=str(i), prompt=tuple(prompt), max_new_tokens=max_new))
+        iface_out: list[list[int]] = [[] for _ in requests]
+        guard = 0
+        while eng2.has_online_work() and guard < 10000:
+            for ev in eng2.step_online():
+                iface_out[int(ev.request_id)].append(ev.token)
+            guard += 1
+        log(rank, f"[isolation] PagedEngine engine-INTERFACE (step_online/ServingTokenEvent) == submit/step: {iface_out == eng_out}")
+
+        # ISOLATION 5: eos stops generation early (request finishes on eos token)
+        eos_tok = ref[1][0]  # force-stop req on its own first generated token
+        eng3 = PagedEngine(model, page_size=16, max_active=1, max_seq=64, use_graph=False)
+        eng3.start_online(max_seq_len=64)
+        eng3.submit_online(ServingRequest(request_id="x", prompt=tuple(requests[1][0]), max_new_tokens=20, eos_token_id=eos_tok))
+        eos_out = []
+        guard = 0
+        while eng3.has_online_work() and guard < 100:
+            for ev in eng3.step_online():
+                eos_out.append((ev.token, ev.finished))
+            guard += 1
+        # first token == eos_tok -> should finish immediately (len 1, finished True)
+        log(rank, f"[isolation] eos stop: emitted={len(eos_out)} first={eos_out[0] if eos_out else None} (expect 1 token, finished=True)")
+
     log(rank, f"[continuous] eager-decode  == dense: {got_eager == ref}")
     log(rank, f"[continuous] graphed-decode == dense: {got == ref}")
     log(rank, f"[continuous] eager == graphed: {got_eager == got}")
