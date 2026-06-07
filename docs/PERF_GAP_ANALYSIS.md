@@ -95,6 +95,36 @@ applies. Net: the runner is not the lever. Decode is GPU-compute-bound (~15ms);
 FP8 decode weights (halve it) remain the real throughput/TPOT lever. The wiring
 stays (flag off, validated) as a foundation if FP8 or a stable-decode path lands.
 
+## FP8 characterization (scripts/bench_fp8_decode.py) — redirects the FP8 effort
+
+Microbenchmarked torch._scaled_mm (FP8 e4m3, W8A8) vs bf16 mm at exact Llama3-70B
+TP8 GEMM shapes, swept M. _scaled_mm has a high FIXED kernel overhead (~128us flat
+for skinny GEMMs), so it CROSSES OVER with M:
+
+| M (tokens)        | gate_up speedup |
+| :---------------- | --------------: |
+| 48   (decode)     | 0.61x (SLOWER)  |
+| 512               | 0.80x           |
+| 2048 (prefill)    | 1.80x           |
+| 8192 (big prefill)| 1.84x           |
+
+Implications:
+- FP8 DECODE is RULED OUT via _scaled_mm (decode M<=64 is 0.55-0.67x SLOWER --
+  cuBLAS FP8 is tuned for large-M training/prefill, not skinny decode). Faster
+  decode would need W8A16 weight-only (FP8 weights, bf16 activations, fused
+  dequant) -- a custom Marlin/torchao/triton kernel, deep. This saves a large
+  wasted W8A8-decode implementation.
+- FP8 PREFILL is the viable lever for the DOMINANT TTFT gap. Prefill GEMMs are
+  52% of prefill at 34% MFU; at M>=2048 (few_shot is 48x640=30720 tokens) FP8 is
+  ~1.8x on that portion -> ~23% prefill reduction -> few_shot TTFT ~317->~244
+  (vllm 159: narrows, does not yet flip). Standard _scaled_mm, well-supported.
+  NEXT STEP: quantize prefill weights to FP8 + dynamic activation quant in the
+  prefill GEMM path; the hard part is keeping benchmark correctness >=98% (FP8
+  prefill accuracy) and FP8 quant ops inside the captured prefill graph. Note it
+  only helps LONG-prompt benchmarks (few_shot); multi_turn/tree/long_output have
+  short prompts (small-M prefill, FP8 neutral/negative) and are TTFT-bound by
+  ADMISSION latency, not prefill compute.
+
 ## (historical) Issue 1 — prefill kernel MFU (~2x), the dominant TTFT gap
 
 ## Issue 1 — prefill kernel MFU (~2x), the dominant TTFT gap
