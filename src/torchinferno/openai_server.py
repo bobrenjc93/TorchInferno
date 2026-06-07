@@ -2407,9 +2407,7 @@ class OpenAICompletionEngine:
         # the same submit/step command protocol, so the deterministic page allocator
         # keeps block tables in sync without extra broadcast. Returns None (-> dense)
         # when off or the model lacks the paged forward.
-        if not env_flag("TORCHINFERNO_OPENAI_PAGED_KV", False):
-            return None
-        if not hasattr(self.model, "forward_decode_paged"):
+        if not _paged_kv_active_for(self.model, max_seq_len):
             return None
         try:
             from torchinferno.runtime.paged_serving import PagedEngine
@@ -9091,6 +9089,23 @@ def _is_tensor_parallel_worker_model(model: object) -> bool:
     return _is_tensor_parallel_model(model) and _tensor_parallel_world_size(model) > 1 and int(getattr(model, "rank", 0)) != 0
 
 
+def _paged_kv_active_for(model: object, max_seq_len: int) -> bool:
+    # Shared paged-KV decision (primary + TP worker MUST agree, so both call this
+    # with the same broadcast max_seq_len). Gated by the flag, the model having the
+    # paged forward, AND a LONG-CONTEXT threshold: paged decode only beats dense
+    # giant-page decode at long ctx (kernel bench: tie at <=1024, 1.5-3x at >=2048),
+    # while the dense path is the optimized one for short ctx (prefill graphs, prefix
+    # cache). So restrict paged to long-ctx workloads (multi_turn) -> short-ctx cells
+    # (few_shot/self_consistency/tree) stay on the unchanged dense path = zero
+    # regression risk; long-ctx gets the validated paged win. Default threshold 1024.
+    if not env_flag("TORCHINFERNO_OPENAI_PAGED_KV", False):
+        return False
+    if not hasattr(model, "forward_decode_paged"):
+        return False
+    min_seq = env_int("TORCHINFERNO_OPENAI_PAGED_KV_MIN_SEQ", 1024, minimum=1)
+    return int(max_seq_len) >= min_seq
+
+
 def _prefix_cache_enabled_for_model(model: object) -> bool:
     if _is_tensor_parallel_model(model) and _tensor_parallel_world_size(model) > 1:
         return env_flag("TORCHINFERNO_OPENAI_TP_PREFIX_CACHE", True)
@@ -10367,10 +10382,7 @@ def _tensor_parallel_worker_loop(engine: OpenAICompletionEngine) -> None:
                 # (both build a PagedEngine identically + are driven by the same
                 # submit/step commands, so the deterministic page allocator keeps
                 # block tables in sync across ranks).
-                worker_use_paged = (
-                    env_flag("TORCHINFERNO_OPENAI_PAGED_KV", False)
-                    and hasattr(getattr(engine, "model", None), "forward_decode_paged")
-                )
+                worker_use_paged = _paged_kv_active_for(getattr(engine, "model", None), max_seq_len)
                 if online_runtime_engine is None and worker_use_paged:
                     from torchinferno.runtime.paged_serving import PagedEngine
                     online_runtime_engine = PagedEngine(
