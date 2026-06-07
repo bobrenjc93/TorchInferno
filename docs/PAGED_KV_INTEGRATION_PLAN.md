@@ -76,3 +76,28 @@ Flag-gated (default dense) -> zero risk to the benchmarked path until validated.
 Each step above is independently testable. The hard part is step 4 (graph buffer
 sizing for variable page counts); if it stalls, an eager paged decode path
 validates 1-3+5 correctness first, then add the graph.
+
+## UPDATE 2026-06-07: existing paged backend (oracle) + FlashInfer-paged decode built
+
+DISCOVERY: the model ALREADY has a true-paged backend --
+`allocate_cache(cache_backend="paged", page_size=N)` ->
+`PagedLlama3TensorParallelLayerKVCache` (uses PagedKVCache + torch-SDPA
+`append_and_attend_ragged`), validated against dense by
+test_llama3_tensor_parallel_paged_cache_matches_dense_forward. BUT it uses torch
+SDPA (no FlashInfer, no decode graph) -> slow decode, and serving uses the
+FlashInfer dense-as-paged backend instead. So it's a correctness ORACLE + proves
+paged prefill/decode plumbing, but is not the fast serving path.
+
+PROGRESS (branch `paged-kv-decode-wiring`, commit eeddd9e): built + validated the
+FlashInfer-paged decode -- `Llama3TensorParallelForCausalLM.forward_decode_paged`
+(slot_mapping+scatter_write write, layer_kv+flashinfer_page_table read), matches the
+dense full-forward reference on a tiny model
+(test_llama3_tensor_parallel_forward_decode_paged_matches_dense). This is the
+FAST (FlashInfer) true-paged decode the serving needs, distinct from the existing
+torch-SDPA "paged" backend.
+
+REMAINING (branch): serving wiring -- allocate the NHD LayeredPagedKVCache pool at
+start, admission-by-free-pages (replace the 48-row cap), per-step
+flashinfer_page_table + wrapper plan, paged prefill (can mirror the existing paged
+backend's prefill or extend the ragged prefill), dynamic page-tables as
+decode-graph inputs. Then merge, flag-gated default-dense, 8xH100 validate, default-on.
