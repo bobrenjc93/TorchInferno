@@ -1,0 +1,78 @@
+# Paged KV Integration Plan (llama3 TP serving)
+
+Status: foundation built + fully de-risked this session; integration NOT yet wired.
+This is the actionable, file-level plan for the focused effort.
+
+## Why (the one lever for the most cells)
+
+Profiling (docs/PERF_GAP_ANALYSIS.md) showed the multi_turn/long_output TPOT gaps
+AND the TTFT/throughput rows (3-9x, ~13 of the 18 lost cells) are all
+QUEUEING-bound: the dense per-layer cache caps concurrent rows at ~48 for long
+contexts, so 64-125 client-concurrent benchmarks queue heavily, which inflates
+TTFT and (via prefill-interleaving) TPOT. Decode itself is GEMM-bound and
+weight-bound (flat to 256 rows), and paged decode ATTENTION is sub-linear at high
+concurrency (bench_paged_decode_concurrency.py: 48->512 rows @2048 ctx = 3.95x
+attention, ~5% of the step). So packing more concurrent rows via paging is a pure
+win with no hidden wall.
+
+## Key structural insight (makes this tractable, not a rewrite)
+
+`Llama3TensorParallelLayerKVCache.paged_kv` is ALREADY in FlashInfer NHD paged
+format: `[batch, 2, max_seq_len, kv_heads, head_dim]` -- i.e. "dense-as-paged"
+(batch pages, each of size max_seq). The FI decode (`wrapper.run(q, cache.paged_kv)`)
+and the CUDA-graph path (serving.py ~2940, decode_runner.py) ALREADY consume the
+paged format with the page table (`indptr`/`indices`/`last_page_len`) as graph
+inputs. So the consumer side is DONE. The migration is: swap the dense-as-paged
+buffer for a real small-page pool + block tables + admission-by-pages.
+
+## Foundation already in place (this session, tested)
+
+- `runtime/paged.py::LayeredPagedKVCache` -- multi-layer pool, ONE block table per
+  request shared across layers, per-layer NHD `[num_pages,2,page_size,kv_heads,head_dim]`,
+  `reserve/extend/write_layer/layer_kv/flashinfer_page_table/free`.
+- Validated FlashInfer-correct vs dense SDPA
+  (tests/test_scaffolding.py::test_layered_paged_kv_cache_flashinfer_decode_matches_dense).
+- Concurrency-viable + no CUDA-graph blocker (CUDAGraphBatchDecodeWithPagedKVCacheWrapper).
+
+## Integration steps (ordered; flag-gated, default dense, validate each on 8xH100)
+
+1. CACHE: add a paged mode to the llama3 TP cache (or a sibling class) backed by a
+   per-layer page pool `[num_pages, 2, page_size, kv_heads, head_dim]` (small
+   page_size, e.g. 16) + a shared block table per row. `num_pages` from a KV-token
+   budget (TP-sharded: local kv_heads). Keep the dense path as default behind a flag
+   (TORCHINFERNO_OPENAI_TP_ONLINE_PAGED_KV).
+2. KV WRITE: replace `paged_kv[row, :, seq_len:end]` writes (model.py ~563 and the
+   ragged-append paths) with block-table scatter (extend the row's pages, write to
+   the new page slots). Reuse LayeredPagedKVCache.write_layer logic.
+3. PAGE TABLE per step: build `(indptr, indices, last_page_len)` from the active
+   rows' block tables (LayeredPagedKVCache.flashinfer_page_table) and feed the FI
+   plan -- replacing the current (arange, row_indices, seq_len+1, page_size=max_seq).
+   Keep it GPU-resident / minimal-CPU; it's shared across all 80 layers per step.
+4. GRAPH BUFFERS: the captured decode graph's `indices` buffer must size to
+   max-total-pages (active_rows * max_pages_per_row) instead of `bs`; update before
+   replay. indptr/last_page_len already updated per replay.
+5. ADMISSION: change `_admit_ready_requests` (runtime/serving.py) to admit by FREE
+   PAGES (cache.free_pages >= ceil(ctx/page_size)) instead of the row cap. This is
+   what unlocks high concurrency for short/growing contexts. The shipped KV-bounded
+   concurrency is the dense-cache approximation of this; paged makes it exact +
+   long-context-capable.
+6. PREFILL: prefill also writes KV -> page-allocate the prompt span, write suffix to
+   pages (ragged prefill graph already exists; route its KV write through pages).
+7. EVICTION/preemption when the pool is full (start simple: reject admission when
+   no free pages, like today's row cap; add preemption later).
+
+## Validation (self, on 8xH100, before default-on)
+
+- Correctness: greedy output of paged path == dense path on a few prompts.
+- Concurrency: closed-loop long_output/multi_turn-like load -> confirm many more
+  concurrent rows admitted, TTFT down, throughput up, TPOT not regressed beyond the
+  allreduce-scaling (which is the only batch-scaling cost; GEMMs flat).
+- Then default-on; the live benchmark scores TTFT/E2E/throughput across
+  multi_turn/long_output/tree/few_shot/self_consistency.
+
+## Risk control
+
+Flag-gated (default dense) -> zero risk to the benchmarked path until validated.
+Each step above is independently testable. The hard part is step 4 (graph buffer
+sizing for variable page counts); if it stalls, an eager paged decode path
+validates 1-3+5 correctness first, then add the graph.
