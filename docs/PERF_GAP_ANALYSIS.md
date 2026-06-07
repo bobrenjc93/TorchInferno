@@ -2,8 +2,11 @@
 
 ## EXECUTIVE SUMMARY (state of the gap, distilled)
 
-Score: stable 2/20 (vllm 15-16/20). We win exactly the two cells we contend on:
-few_shot TPOT and multi_turn TPOT -- both close races, but holding across runs.
+Score: stable 2/20 (vllm 15-16/20) across THREE consecutive runs (_021340,
+_042000, _061657). We win exactly the two cells we contend on: few_shot TPOT
+(52.9 vs vllm 58.3) and multi_turn TPOT (64.7 vs 67.6) -- both now CONFIRMED
+robust (held 3 runs), not noise. Closest unflipped cell: tree_of_thought TPOT
+(31.7 vs vllm 29.5), a consistent ~2-3ms gap (needs the deep decode-fusion lever).
 TPOT cross-avg ~35ms (vllm ~34, sglang ~48) -- competitive. The deficits are TTFT
 (~3.4x), E2E (~2.7x), throughput (~2.9x), all driven by two root causes below.
 Scoring is best-in-row, so a cell flips only by beating BOTH competitors.
