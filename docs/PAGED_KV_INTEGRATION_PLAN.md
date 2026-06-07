@@ -101,3 +101,32 @@ start, admission-by-free-pages (replace the 48-row cap), per-step
 flashinfer_page_table + wrapper plan, paged prefill (can mirror the existing paged
 backend's prefill or extend the ragged prefill), dynamic page-tables as
 decode-graph inputs. Then merge, flag-gated default-dense, 8xH100 validate, default-on.
+
+## UPDATE 2026-06-07 (later): MODEL-SIDE PAGED FORWARD COMPLETE + VALIDATED
+
+Branch `paged-kv-decode-wiring` now has BOTH halves of the FlashInfer-paged model
+forward, each validated vs a dense reference on a real tiny model:
+- forward_decode_paged (commit eeddd9e) -- test_..._forward_decode_paged_matches_dense
+- forward_prefill_paged (commit 0d924a8) -- test_..._forward_prefill_paged_matches_dense
+  (note: FlashInfer's PREFILL hopper kernel requires head_dim in {64,128,256}; the
+   DECODE wrapper accepts smaller -- the prefill test uses a head_dim=64 config.)
+
+Both use slot_mapping()+scatter_write() to write the NHD pool and a paged FlashInfer
+wrapper (decode/prefill) over layer_kv(); the GEMM/rope/norm flow is identical to the
+dense path. So paged KV is de-risked end to end at the model level: pool/block-table,
+write (CPU+GPU validated), read (FlashInfer-correct), and now the FULL forward
+(prefill+decode match dense on a real model). An independent torch-SDPA "paged"
+backend remains as a cross-check oracle.
+
+REMAINING = serving-engine wiring ONLY (runtime/serving.py + openai_server.py):
+1. allocate a TP-sharded LayeredPagedKVCache pool at serving start (size by KV-token
+   budget; small page_size).
+2. online-batcher step: build page table once/step (flashinfer_page_table) + plan the
+   decode/prefill wrappers; call forward_prefill_paged on admit, forward_decode_paged
+   on step; extend()/reserve() per sequence; free() on finish.
+3. admission by FREE PAGES (replace the 48-row cap) -- the actual concurrency win.
+4. decode CUDA graph with the page table as graph inputs (CUDAGraphBatchDecode...
+   already supports it; size the indices buffer to max-total-pages).
+This needs the live 8xH100 server to validate (correctness + concurrency); the
+model-side groundwork above makes it assembly, not new algorithms. Merge flag-gated
+default-dense, validate on 8xH100, then default-on.
