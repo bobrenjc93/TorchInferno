@@ -1774,11 +1774,50 @@ class _Llama3TensorParallelLayer:
         projected = self._mlp_project_decode_reduce(mlp_in)
         return _tp_decode_add_rms_norm(projected, residual, next_norm_weight, self.config.rms_norm_eps)
 
+    def _ensure_marlin_gate_up(self) -> bool:
+        # Lazily quantize the gate_up projection to Marlin int4 (one-time, eager,
+        # must run BEFORE any decode CUDA-graph capture). gate_up is column-parallel
+        # (output sharded, NO allreduce), so it is the simplest + biggest decode
+        # GEMM to offload (CUDA-graph floor 1.52x vs bf16). Returns True if usable.
+        if getattr(self, "_marlin_gu_failed", False):
+            return False
+        if getattr(self, "_marlin_gu_q", None) is not None:
+            return True
+        try:
+            from torchinferno.kernels import marlin as _marlin
+            if not _marlin.load_marlin_ops():
+                self._marlin_gu_failed = True
+                return False
+            w = self.gate_up_proj_weight  # [N, K] = [2*local_inter, hidden]
+            n, k = int(w.size(0)), int(w.size(1))
+            if not _marlin.marlin_supports_shape(n, k):
+                self._marlin_gu_failed = True
+                return False
+            q, s = _marlin.quantize_to_marlin_int4(w.t().contiguous(), 128)  # [K,N]
+            self._marlin_gu_q = q
+            self._marlin_gu_s = s
+            self._marlin_gu_ws = _marlin.make_workspace(n, w.device)
+            self._marlin_gu_n, self._marlin_gu_k = n, k
+            return True
+        except Exception as exc:
+            warn_optional_failure("llama3_tensor_parallel.marlin_gate_up", exc)
+            self._marlin_gu_failed = True
+            return False
+
     def _mlp_project_decode_reduce(self, hidden: Tensor) -> Tensor:
-        gate, up = _decode_linear(hidden, self.gate_up_proj_weight, self.gate_up_proj_weight_decode).split(
-            (self.local_intermediate_size, self.local_intermediate_size),
-            dim=-1,
-        )
+        if _tp_flag("TORCHINFERNO_MARLIN_INT4_DECODE", False) and self._ensure_marlin_gate_up():
+            from torchinferno.kernels import marlin as _marlin
+            x2d = hidden.reshape(-1, self._marlin_gu_k).to(torch.float16)
+            gu = _marlin.marlin_int4_mm(
+                x2d, self._marlin_gu_q, self._marlin_gu_s, self._marlin_gu_ws,
+                self._marlin_gu_n, self._marlin_gu_k,
+            ).to(hidden.dtype).reshape(*hidden.shape[:-1], self._marlin_gu_n)
+            gate, up = gu.split((self.local_intermediate_size, self.local_intermediate_size), dim=-1)
+        else:
+            gate, up = _decode_linear(hidden, self.gate_up_proj_weight, self.gate_up_proj_weight_decode).split(
+                (self.local_intermediate_size, self.local_intermediate_size),
+                dim=-1,
+            )
         activated = _tp_decode_swiglu(gate, up)
         return self._decode_linear_all_reduce(activated, self.down_proj_weight, "mlp", self.down_proj_weight_decode)
 

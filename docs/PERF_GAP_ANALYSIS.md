@@ -196,15 +196,29 @@ for gate_up+down, bf16 for qkv/o_proj/lm_head) is ~1.38x on the decode projectio
 GEMMs. lm_head (N=16032) is not marlin-eligible (N must be % 64). Correctness
 maxdiff ~0.008 vs fp16 (RTN int4 quant error).
 
-This is the path to ROBUST TPOT-cell wins (flip tree_of_thought, widen
-few_shot/multi_turn margins) and decode-throughput. INTEGRATION (next, multi-step,
-NOT yet done -- keeps the stable 2/20 safe until validated):
-1. Quantize Llama3-TP gate_up+down weights to marlin int4 at load (gptq quantize
-   + marlin pack); keep qkv/o_proj/lm_head bf16 (hybrid).
-2. Route those decode GEMMs through ops.marlin_gemm; handle the vllm-op import
-   (need torch.ops._C.marlin_gemm registered without the heavy vllm import chain).
-3. GATE on accuracy: RTN int4 may not hold the 98% benchmark correctness bar;
-   likely needs GPTQ/AWQ calibration. Validate end-to-end before enabling.
+INTEGRATED + MEASURED (gate_up, flag TORCHINFERNO_MARLIN_INT4_DECODE, default off):
+torchinferno/kernels/marlin.py + tensor_parallel._mlp_project_decode_reduce now
+route the gate_up decode GEMM through marlin int4 (op via torch.ops.load_library
+on vllm _C, no vllm python import). Results (8xH100, ignore_eos steady-state
+long_output, 64-conc):
+- ACCURACY: greedy output BIT-IDENTICAL to bf16 (Paris./primes/gravity match).
+  int4 gate_up holds correctness. FI decode CUDA graph captures cleanly WITH
+  marlin inside (8 graphs).
+- TPOT: 21ms -> 21ms (NEUTRAL); throughput 1956 -> 2007 (+2.6% only).
+
+KEY FINDING (supersedes the "int4 flips cells" hope): decode at batch 48 is NOT
+weight-read-bound -- TPOT 21ms vs the 5.2ms weight-read floor means ~75% of the
+step is attention + the 160 per-step allreduces + kernel/launch overhead. The
+gate_up GEMM (~25% of step) being 1.52x in ISOLATION barely moves the total.
+This is the "weight-only quant helps M=1, not batched M=48" lesson confirmed
+END-TO-END: the microbench 1.52x is real for the GEMM, but the GEMM is not the
+decode bottleneck. So int4 marlin decode -- though working + accurate + graph-safe
+-- does NOT flip cells. The decode TPOT gap to vllm (21 vs 15) is allreduce /
+attention / per-op latency, NOT weight compression. Adding down would add maybe
++2-3% more (smaller GEMM); not a flip. The marlin integration stays (flag off) as
+validated groundwork (useful for single-stream/M=1 or if allreduce/attention are
+fixed first). The real decode lever is reducing the 160-allreduce + attention +
+kernel-launch overhead, not int4 weights.
 
 ## FP8 characterization (scripts/bench_fp8_decode.py) — redirects the FP8 effort
 
