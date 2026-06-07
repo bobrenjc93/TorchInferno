@@ -46,29 +46,28 @@ def _w4a16_kernel(
     pid_n = tl.program_id(1)
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    offs_h = tl.arange(0, HALF)        # half-K index within a block
+    offs_h = tl.arange(0, HALF)        # half-K (byte) index within a block
+    offs_k = tl.arange(0, BLOCK_K)     # full-K index within a block
     m_mask = offs_m[:, None] < M
     n_mask = offs_n[:, None] < N
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     n_blocks = tl.cdiv(K, BLOCK_K)
     for kb in range(0, n_blocks):
-        k_even = kb * BLOCK_K + 2 * offs_h            # even K columns
-        k_odd = k_even + 1
-        a_even = tl.load(a_ptr + offs_m[:, None] * stride_am + k_even[None, :] * stride_ak,
-                         mask=m_mask & (k_even[None, :] < K), other=0.0)
-        a_odd = tl.load(a_ptr + offs_m[:, None] * stride_am + k_odd[None, :] * stride_ak,
-                        mask=m_mask & (k_odd[None, :] < K), other=0.0)
+        # one contiguous activation tile [BLOCK_M, BLOCK_K]
+        kcol = kb * BLOCK_K + offs_k
+        a = tl.load(a_ptr + offs_m[:, None] * stride_am + kcol[None, :] * stride_ak,
+                    mask=m_mask & (kcol[None, :] < K), other=0.0)
+        # packed weight byte holds K=2j (low nibble) and K=2j+1 (high nibble);
+        # interleave(low, high) reconstructs full K-order [BLOCK_N, BLOCK_K].
         byte_col = kb * HALF + offs_h
         wb = tl.load(wq_ptr + offs_n[:, None] * stride_wn + byte_col[None, :] * stride_wk,
                      mask=n_mask & (byte_col[None, :] < (K // 2)), other=0).to(tl.int32)
-        low = ((wb & 0xF) - 8).to(tl.float32)         # even-K weights [BLOCK_N, HALF]
-        high = (((wb >> 4) & 0xF) - 8).to(tl.float32)  # odd-K weights
+        low = ((wb & 0xF) - 8).to(tl.float32)
+        high = (((wb >> 4) & 0xF) - 8).to(tl.float32)
         sc = tl.load(s_ptr + offs_n[:, None] * stride_sn + kb * stride_sg,
                      mask=n_mask, other=0.0).to(tl.float32)  # [BLOCK_N,1] one group/block
-        low = (low * sc).to(tl.bfloat16)
-        high = (high * sc).to(tl.bfloat16)
-        acc += tl.dot(a_even, low.trans(), allow_tf32=False)
-        acc += tl.dot(a_odd, high.trans(), allow_tf32=False)
+        w = tl.interleave(low * sc, high * sc).to(tl.bfloat16)  # [BLOCK_N, BLOCK_K]
+        acc += tl.dot(a, w.trans(), allow_tf32=False)           # single dot per K-block
     c = acc.to(tl.bfloat16)
     tl.store(c_ptr + offs_m[:, None] * N + offs_n[None, :], c,
              mask=m_mask & (offs_n[None, :] < N))
