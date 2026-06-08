@@ -1831,8 +1831,53 @@ class _Llama3TensorParallelLayer:
         )
         return out.reshape(*hidden.shape[:-1], n)
 
+    def _fp8_proj(self, hidden: Tensor, key: str, weight: Tensor) -> Tensor | None:
+        # FP8 e4m3 W8A8 GEMM for COMPUTE-bound PREFILL (LARGE M). The complement of
+        # _marlin_proj: marlin (int4, weight-read-bound) wins SMALL-M decode; fp8 (tensor
+        # cores) wins LARGE-M prefill. M-gated to M > FP8_PREFILL_MIN_M (256) so it ONLY
+        # touches prefill -- decode (small M) stays bf16/marlin (fp8 there is slower AND
+        # fp8 decode is lossy). FP8 prefill is greedy-EXACT vs bf16
+        # (validate_fp8_prefill_correctness.py); the fused-quant kernel gives 1.4-2x on
+        # the big GEMMs (bench_fp8_prefill.py). Lazily tensorwise-quantizes the weight to
+        # fp8 (one-time, in EAGER context only -- guarded vs graph capture so the alloc
+        # never lands inside a CUDA graph; callers run fp8 prefill eager). Default OFF
+        # until cron-measured. Returns [..,N] or None (caller falls back to bf16).
+        if not _tp_flag("TORCHINFERNO_FP8_PREFILL", False):
+            return None
+        if not hidden.is_cuda:
+            return None
+        m = hidden.numel() // hidden.size(-1)
+        if m <= _tp_int("TORCHINFERNO_FP8_PREFILL_MIN_M", 256, minimum=1):
+            return None  # small-M (decode): fp8 loses + is lossy -> bf16/marlin
+        if getattr(self, f"_fp8_{key}_failed", False):
+            return None
+        if getattr(self, f"_fp8_{key}_wq", None) is None:
+            if _cuda_stream_is_capturing(hidden.device):
+                return None  # never quantize (alloc) inside a graph capture; bf16 this call
+            try:
+                from torchinferno.kernels import fp8 as _fp8
+                if not _fp8.fp8_available():
+                    setattr(self, f"_fp8_{key}_failed", True)
+                    return None
+                wq, sb = _fp8.quantize_weight_fp8(weight)
+                setattr(self, f"_fp8_{key}_wq", wq)
+                setattr(self, f"_fp8_{key}_sb", sb)
+            except Exception as exc:
+                warn_optional_failure(f"llama3_tensor_parallel.fp8_{key}", exc)
+                setattr(self, f"_fp8_{key}_failed", True)
+                return None
+        from torchinferno.kernels import fp8 as _fp8
+        return _fp8.fp8_prefill_linear(
+            hidden, getattr(self, f"_fp8_{key}_wq"), getattr(self, f"_fp8_{key}_sb")
+        )
+
     def _mlp_project_decode_reduce(self, hidden: Tensor) -> Tensor:
+        # This path serves BOTH decode (small M) and paged PREFILL (large M, via
+        # forward_prefill_paged). marlin wins small-M; fp8 wins large-M (M-gates are
+        # complementary, so at most one fires).
         gu = self._marlin_proj(hidden, "gu", self.gate_up_proj_weight)
+        if gu is None:
+            gu = self._fp8_proj(hidden, "gu", self.gate_up_proj_weight)
         if gu is not None:
             gate, up = gu.split((self.local_intermediate_size, self.local_intermediate_size), dim=-1)
         else:
@@ -1852,7 +1897,8 @@ class _Llama3TensorParallelLayer:
         # are 7-9ms). Wiring kept behind the flag for future calibrated (GPTQ/AWQ) quant.
         down_key = "down" if _tp_flag("TORCHINFERNO_MARLIN_INT4_DOWN", False) else None
         return self._decode_linear_all_reduce(
-            activated, self.down_proj_weight, "mlp", self.down_proj_weight_decode, marlin_key=down_key
+            activated, self.down_proj_weight, "mlp", self.down_proj_weight_decode,
+            marlin_key=down_key, fp8_key="down",
         )
 
     def _mlp_project_prefill_reduce(self, hidden: Tensor) -> Tensor | None:
@@ -1862,9 +1908,17 @@ class _Llama3TensorParallelLayer:
             "fast_prefill.mlp_prefill.gate_up_activation",
             lambda: self._prefill_gate_up_activation(hidden),
         )
-        return self._prefill_linear_all_reduce(activated, self.down_proj_weight, "mlp-prefill")
+        return self._prefill_linear_all_reduce(activated, self.down_proj_weight, "mlp-prefill", fp8_key="down")
 
     def _prefill_gate_up_activation(self, hidden: Tensor) -> Tensor:
+        # FP8 prefill (large-M, compute-bound) runs EAGER: the fused-quant fp8 GEMM win
+        # (1.4-2x) exceeds the activation-graph's launch-overhead savings, and running
+        # eager keeps the lazy weight-quant out of any graph capture. Falls through to
+        # the bf16 graph/eager path when fp8 is off or the M-gate declines.
+        gu = self._fp8_proj(hidden, "gu", self.gate_up_proj_weight)
+        if gu is not None:
+            gate, up = gu.split((self.local_intermediate_size, self.local_intermediate_size), dim=-1)
+            return _tp_swiglu(gate, up)
         if (
             self.world_size > 1
             and _should_use_prefill_gate_up_activation_graph(hidden)
@@ -1916,12 +1970,16 @@ class _Llama3TensorParallelLayer:
         buffer_name: str,
         weight_t: Tensor | None = None,
         marlin_key: str | None = None,
+        fp8_key: str | None = None,
     ) -> Tensor:
-        # marlin_key set => try int4 GEMM for this row-parallel proj (down_proj). The
-        # marlin kernel is reduce-agnostic; we just all-reduce its output afterward.
-        # marlin returns its own buffer, so for the symm-mem fast path we copy it into
-        # the symm buffer (small [M,N] copy) then multimem-all-reduce in place.
+        # marlin_key/fp8_key set => try a quantized GEMM for this row-parallel proj
+        # (down_proj). Both kernels are reduce-agnostic; we all-reduce the output after.
+        # marlin (int4) wins small-M decode; fp8 wins large-M prefill (M-gates are
+        # complementary). The op returns its own tensor, so for the symm-mem fast path we
+        # copy it into the symm buffer (small [M,N] copy) then multimem-all-reduce.
         marlin_out = self._marlin_proj(hidden, marlin_key, weight) if marlin_key is not None else None
+        if marlin_out is None and fp8_key is not None:
+            marlin_out = self._fp8_proj(hidden, fp8_key, weight)
         use_sm = _should_use_symm_mem_all_reduce(hidden, weight, self.world_size)
         sm_name = buffer_name
         if not use_sm and _should_use_symm_mem_prefill_all_reduce(hidden, weight, self.world_size):
@@ -1959,16 +2017,25 @@ class _Llama3TensorParallelLayer:
         _all_reduce(projected)
         return projected
 
-    def _prefill_linear_all_reduce(self, hidden: Tensor, weight: Tensor, buffer_name: str) -> Tensor | None:
+    def _prefill_linear_all_reduce(
+        self, hidden: Tensor, weight: Tensor, buffer_name: str, fp8_key: str | None = None
+    ) -> Tensor | None:
         if not _should_use_symm_mem_prefill_all_reduce(hidden, weight, self.world_size):
             return None
+        # fp8_key set => large-M prefill down_proj via fp8 (reduce-agnostic GEMM); copy
+        # its output into the symm buffer then multimem-all-reduce. None on the small-M
+        # gate -> bf16 mm into the buffer.
+        fp8_out = self._fp8_proj(hidden, fp8_key, weight) if fp8_key is not None else None
         try:
             expected_shape = (*hidden.shape[:-1], weight.size(0))
             buffer, group_name = self._symm_reduce_buffer(buffer_name, hidden, expected_shape)
-            self._profile_block(
-                f"fast_prefill.{buffer_name}.mm",
-                lambda: torch.mm(hidden.reshape(-1, hidden.size(-1)), weight.t(), out=buffer.reshape(-1, weight.size(0))),
-            )
+            if fp8_out is not None:
+                buffer.reshape(-1, weight.size(0)).copy_(fp8_out.reshape(-1, weight.size(0)))
+            else:
+                self._profile_block(
+                    f"fast_prefill.{buffer_name}.mm",
+                    lambda: torch.mm(hidden.reshape(-1, hidden.size(-1)), weight.t(), out=buffer.reshape(-1, weight.size(0))),
+                )
             self._profile_block(
                 f"fast_prefill.{buffer_name}.all_reduce",
                 lambda: torch.ops.symm_mem.multimem_all_reduce_(buffer, "sum", group_name),
