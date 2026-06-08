@@ -388,6 +388,110 @@ class PagedPrefillGraphRunner:
         return self.out
 
 
+class PagedSpecGraphRunner:
+    """CUDA-graphed SPECULATIVE-decode verify step: forward_prefill_paged of T=1+K
+    tokens per request at PER-REQUEST start positions (the requests are desynced --
+    each accepted a different number of drafts last step). Mirrors PagedPrefillGraphRunner
+    but (a) feeds a [batch] start_position tensor, (b) uses the FULL block table (the T
+    query tokens attend to the whole prefix via the paged-kv page table -- causal aligns
+    them as the last T of each request's kv). Eager spec is ~220ms (80-layer launch floor);
+    graphed is ~29ms -> with ~3x fewer steps a ~2x decode win on echo workloads. The page
+    table + start grow each step (context extends) -> static buffers re-planned/refilled
+    OUTSIDE the graph, captured region = embedding + 80-layer stack + lm_head.
+    """
+
+    def __init__(self, model, cache, *, batch, T, max_pages, workspace_bytes=128 * 1024 * 1024):
+        import flashinfer
+
+        self.model = model
+        self.cache = cache
+        self.batch = batch
+        self.T = T
+        self.max_pages = max_pages
+        dev = cache.kv.device
+        self.dev = dev
+        layer0 = model.layers[0]
+        self.nqo = layer0.local_attention_heads
+        self.nkv = layer0.local_key_value_heads
+        self.hd = model.config.head_dim
+        self.page_size = cache.page_size
+        self.s_ids = torch.zeros(batch, T, dtype=torch.long, device=dev)
+        self.s_start = torch.zeros(batch, dtype=torch.long, device=dev)
+        self.s_bt = torch.zeros(batch, max_pages, dtype=torch.long, device=dev)
+        self._ws = torch.empty(workspace_bytes, dtype=torch.uint8, device=dev)
+        self._qo = torch.empty(batch + 1, dtype=torch.int32, device=dev)
+        self._kv_indptr = torch.empty(batch + 1, dtype=torch.int32, device=dev)
+        self._kv_indices = torch.empty(batch * max_pages, dtype=torch.int32, device=dev)
+        self._kv_lpl = torch.empty(batch, dtype=torch.int32, device=dev)
+        self.pw = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+            self._ws, kv_layout="NHD", use_cuda_graph=True,
+            qo_indptr_buf=self._qo, paged_kv_indptr_buf=self._kv_indptr,
+            paged_kv_indices_buf=self._kv_indices, paged_kv_last_page_len_buf=self._kv_lpl,
+        )
+        self.graph = None
+        self.out = None
+
+    def _plan(self, request_ids):
+        indptr, indices, lpl = self.cache.flashinfer_page_table(request_ids)
+        qo_indptr = torch.zeros(self.batch + 1, dtype=torch.int32, device=self.dev)
+        qo_indptr[1:] = torch.full((self.batch,), self.T, dtype=torch.int32, device=self.dev).cumsum(0)
+        self.pw.plan(
+            qo_indptr=qo_indptr, paged_kv_indptr=indptr, paged_kv_indices=indices,
+            paged_kv_last_page_len=lpl, num_qo_heads=self.nqo, num_kv_heads=self.nkv,
+            head_dim_qk=self.hd, page_size=self.page_size, causal=True,
+            q_data_type=self.cache.kv.dtype,
+        )
+
+    def _pad(self, input_ids, starts, request_ids):
+        active = len(request_ids)
+        if active == self.batch:
+            return input_ids, starts, request_ids, active
+        if active == 0 or active > self.batch:
+            raise ValueError(f"active {active} must be in 1..{self.batch}")
+        pad = self.batch - active
+        ids_b = torch.cat([input_ids.view(active, self.T), input_ids.view(active, self.T)[-1:].expand(pad, self.T)], 0)
+        starts_b = torch.cat([starts, starts[-1:].expand(pad)], 0)
+        rids_b = list(request_ids) + [request_ids[-1]] * pad
+        return ids_b, starts_b, rids_b, active
+
+    def _fill(self, input_ids, starts, request_ids):
+        self.s_ids.copy_(input_ids.view(self.batch, self.T))
+        self.s_start.copy_(starts)
+        self.s_bt.zero_()
+        bt = self.cache.block_table(request_ids, max_pages=self.max_pages)
+        self.s_bt[:, : bt.size(1)].copy_(bt)
+
+    def capture(self, input_ids, starts, request_ids):
+        self._fill(input_ids, starts, request_ids)
+        self._plan(request_ids)
+        fwd = lambda: self.model.forward_prefill_paged(
+            self.s_ids, self.cache, request_ids=request_ids,
+            prefill_wrapper=self.pw, block_table=self.s_bt, start_position=self.s_start)
+        fwd()
+        torch.cuda.synchronize(self.dev)
+        stream = torch.cuda.Stream(device=self.dev)
+        stream.wait_stream(torch.cuda.current_stream(self.dev))
+        self._plan(request_ids)
+        with torch.cuda.stream(stream):
+            fwd()
+        torch.cuda.current_stream(self.dev).wait_stream(stream)
+        torch.cuda.synchronize(self.dev)
+        self.graph = torch.cuda.CUDAGraph()
+        self._plan(request_ids)
+        with torch.cuda.graph(self.graph, stream=stream):
+            self.out = fwd()
+        self._stream = stream
+
+    def step(self, input_ids, starts, request_ids):
+        input_ids, starts, request_ids, active = self._pad(input_ids, starts, request_ids)
+        if self.graph is None:
+            self.capture(input_ids, starts, request_ids)
+        self._fill(input_ids, starts, request_ids)
+        self._plan(request_ids)
+        self.graph.replay()
+        return self.out[:active]
+
+
 def generate_paged_continuous(
     model: object,
     requests: list[tuple[list[int], int]],
@@ -781,13 +885,25 @@ class PagedEngine:
         for i, a in enumerate(act):
             self.cache.reserve(a["rid"], starts[i] + 1 + k)
             self.cache._sequences[a["rid"]].length = starts[i] + 1 + k
-        bt = self.cache.block_table(rids)  # actual max page width (reqs reserved to plen+max_new)
-        pw = _plan_prefill(flashinfer, self.cache, rids, [1 + k] * n, self.nqo, self.nkv, self.hd, self.page_size)
-        out = self.model.forward_prefill_paged(
-            torch.tensor(inp, dtype=torch.long, device=self.dev), self.cache,
-            request_ids=rids, prefill_wrapper=pw, block_table=bt,
-            start_position=torch.tensor(starts, dtype=torch.long, device=self.dev),
-        )
+        inp_t = torch.tensor(inp, dtype=torch.long, device=self.dev)
+        starts_t = torch.tensor(starts, dtype=torch.long, device=self.dev)
+        # GRAPHED spec verify (PagedSpecGraphRunner) is the wall-win: eager forward is
+        # ~220ms (80-layer launch floor) vs ~29ms graphed. Eager fallback for A/B / no-graph.
+        # GRAPH path is WIP: PagedSpecGraphRunner runs ~29ms (vs eager ~220ms) but currently
+        # produces WRONG logits via the FlashInfer CUDAGraph prefill wrapper (MATCH=False) --
+        # default OFF until the graph correctness is debugged; eager path is greedy-EXACT.
+        if self.runner is not None and env_flag("TORCHINFERNO_PAGED_SPEC_GRAPH", False):
+            sr = getattr(self, "_spec_runner", None)
+            if sr is None or sr.T != 1 + k:
+                mp = math.ceil(self.max_seq / self.page_size) + 1
+                sr = PagedSpecGraphRunner(self.model, self.cache, batch=self.max_active, T=1 + k, max_pages=mp)
+                self._spec_runner = sr
+            out = sr.step(inp_t, starts_t, rids)  # [n, 1+k, vocab]
+        else:
+            bt = self.cache.block_table(rids)
+            pw = _plan_prefill(flashinfer, self.cache, rids, [1 + k] * n, self.nqo, self.nkv, self.hd, self.page_size)
+            out = self.model.forward_prefill_paged(
+                inp_t, self.cache, request_ids=rids, prefill_wrapper=pw, block_table=bt, start_position=starts_t)
         # TP-aware greedy: logits are VOCAB-SHARDED across ranks, so a plain argmax gives
         # a per-rank LOCAL index -> divergent tokens -> collective DESYNC. Use
         # _greedy_tokens (all-reduces to the global token) for ALL N*(1+K) positions.
@@ -839,6 +955,7 @@ class PagedEngine:
         self._active = []
         self._next_rid = 0
         self._step_no = 0
+        self._spec_runner = None  # rebuilt lazily (cache may have been swapped above)
 
     def submit_online(self, request) -> None:
         self.submit(request.request_id, list(request.prompt), request.max_new_tokens, request.eos_token_id)
