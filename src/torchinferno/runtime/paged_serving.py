@@ -714,6 +714,9 @@ class PagedEngine:
                         _retire_or_activate(a, int(toks[i]))
             if not self._active:
                 return events
+            if env_flag("TORCHINFERNO_PAGED_SPEC_DECODE", False):
+                self._decode_spec(events)
+                return events
             # decode the active set one token
             for a in self._active:
                 self.cache._sequences[a["rid"]].length = a["plen"] + len(a["gen"])
@@ -744,6 +747,77 @@ class PagedEngine:
                     still.append(a)
             self._active = still
         return events
+
+    @staticmethod
+    def _propose_ngram(seq: list[int], ng: int, k: int) -> list[int]:
+        # Prompt-lookup proposal: find the most recent earlier occurrence of the last
+        # `ng` tokens, propose the `k` tokens that followed it (pad to k with 0 = a
+        # non-match the verifier rejects -> 0 accepted, normal decode). No draft model.
+        if len(seq) < ng:
+            return [0] * k
+        last = tuple(seq[-ng:])
+        for i in range(len(seq) - ng - 1, -1, -1):
+            if tuple(seq[i:i + ng]) == last:
+                m = seq[i + ng:i + ng + k]
+                return list(m) + [0] * (k - len(m))
+        return [0] * k
+
+    def _decode_spec(self, events: list[tuple]) -> None:
+        # Batched prompt-lookup speculative decode of the active set. Each request
+        # proposes K tokens (n-gram), we forward [N, 1+K] (last_token + props) at the
+        # per-request position (start_position tensor), verify per-row (argmax chain),
+        # accept the matching prefix, and emit accepted+1 tokens in ONE forward.
+        # Greedy-EXACT (verification) -- validate vs the 1-token path. Default OFF.
+        import flashinfer
+
+        act = self._active
+        n = len(act)
+        k = env_int("TORCHINFERNO_PAGED_SPEC_K", 8, minimum=1)
+        ng = env_int("TORCHINFERNO_PAGED_SPEC_NGRAM", 3, minimum=1)
+        props = [self._propose_ngram(list(a["prompt"]) + list(a["gen"]), ng, k) for a in act]
+        starts = [a["plen"] + len(a["gen"]) - 1 for a in act]
+        inp = [[act[i]["last"]] + props[i] for i in range(n)]  # [N, 1+K]
+        rids = [a["rid"] for a in act]
+        for i, a in enumerate(act):
+            self.cache.reserve(a["rid"], starts[i] + 1 + k)
+            self.cache._sequences[a["rid"]].length = starts[i] + 1 + k
+        bt = self.cache.block_table(rids)  # actual max page width (reqs reserved to plen+max_new)
+        pw = _plan_prefill(flashinfer, self.cache, rids, [1 + k] * n, self.nqo, self.nkv, self.hd, self.page_size)
+        out = self.model.forward_prefill_paged(
+            torch.tensor(inp, dtype=torch.long, device=self.dev), self.cache,
+            request_ids=rids, prefill_wrapper=pw, block_table=bt,
+            start_position=torch.tensor(starts, dtype=torch.long, device=self.dev),
+        )
+        preds = out.float().argmax(-1)  # [N, 1+K]; preds[i,m] = real token after inp[i,m]
+        still = []
+        for i, a in enumerate(act):
+            p = [int(x) for x in preds[i]]
+            prop = props[i]
+            emit = [p[0]]  # the real next token (always)
+            j = 0
+            while j < k and prop[j] == p[j]:  # draft j matched -> p[j+1] is the next real token
+                emit.append(p[j + 1])
+                j += 1
+            finished = False
+            for t in emit:
+                a["gen"].append(t)
+                a["last"] = t
+                fin = len(a["gen"]) >= a["max_new"] or t == a["eos"]
+                events.append((a["ext"], t, fin))
+                if fin:
+                    finished = True
+                    break
+            # KV valid up to the second-to-last emitted token; the last emitted token's
+            # KV (written at a rejected/unverified slot) is rewritten next step. Set
+            # length = plen + gen - 1 (mirrors the validated single-request prototype).
+            self.cache._sequences[a["rid"]].length = a["plen"] + len(a["gen"]) - 1
+            if finished:
+                if self.prefix_cache is not None and "prompt" in a:
+                    self.prefix_cache.remember(a["rid"], list(a["prompt"]) + list(a["gen"]))
+                self.cache.free(a["rid"])
+            else:
+                still.append(a)
+        self._active = still
 
     # --- ContinuousBatchEngine-compatible interface (drop-in for the OpenAI online
     # batcher, which drives start_online / submit_online / has_online_work /
