@@ -1841,7 +1841,19 @@ class _Llama3TensorParallelLayer:
                 dim=-1,
             )
         activated = _tp_decode_swiglu(gate, up)
-        return self._decode_linear_all_reduce(activated, self.down_proj_weight, "mlp", self.down_proj_weight_decode)
+        # down_proj is the OTHER big MLP GEMM (N=hidden 8192, K=local_intermediate);
+        # at decode M it is weight-read/memory-bound where marlin int4 wins the GEMM
+        # (~1.44x, bench_marlin_int4). BUT default-OFF: unlike gate_up (greedy-EXACT vs
+        # bf16) its output lands straight in the residual, so RTN-int4 error accumulates
+        # across 80 layers and FLIPS the greedy argmax from the FIRST decode token
+        # (validate_marlin_down: down=0 -> 128009..., down=1 -> 27... both coherent but
+        # divergent) -- too lossy for the tight 98-100% bench correctness bar. And its
+        # ~1ms TPOT saving cannot flip a cell anyway (long_output/multi_turn TPOT gaps
+        # are 7-9ms). Wiring kept behind the flag for future calibrated (GPTQ/AWQ) quant.
+        down_key = "down" if _tp_flag("TORCHINFERNO_MARLIN_INT4_DOWN", False) else None
+        return self._decode_linear_all_reduce(
+            activated, self.down_proj_weight, "mlp", self.down_proj_weight_decode, marlin_key=down_key
+        )
 
     def _mlp_project_prefill_reduce(self, hidden: Tensor) -> Tensor | None:
         if not _should_use_symm_mem_prefill_all_reduce(hidden, self.down_proj_weight, self.world_size):
@@ -1903,7 +1915,13 @@ class _Llama3TensorParallelLayer:
         weight: Tensor,
         buffer_name: str,
         weight_t: Tensor | None = None,
+        marlin_key: str | None = None,
     ) -> Tensor:
+        # marlin_key set => try int4 GEMM for this row-parallel proj (down_proj). The
+        # marlin kernel is reduce-agnostic; we just all-reduce its output afterward.
+        # marlin returns its own buffer, so for the symm-mem fast path we copy it into
+        # the symm buffer (small [M,N] copy) then multimem-all-reduce in place.
+        marlin_out = self._marlin_proj(hidden, marlin_key, weight) if marlin_key is not None else None
         use_sm = _should_use_symm_mem_all_reduce(hidden, weight, self.world_size)
         sm_name = buffer_name
         if not use_sm and _should_use_symm_mem_prefill_all_reduce(hidden, weight, self.world_size):
@@ -1923,7 +1941,9 @@ class _Llama3TensorParallelLayer:
                     _SYMM_PREFILL_SHAPES.add((sm_name, tuple(hidden.shape[:-1]), int(weight.size(0))))
                 hidden_2d = hidden.reshape(-1, hidden.size(-1))
                 output_2d = buffer.reshape(-1, weight.size(0))
-                if weight_t is not None:
+                if marlin_out is not None:
+                    output_2d.copy_(marlin_out.reshape(-1, weight.size(0)))
+                elif weight_t is not None:
                     torch.mm(hidden_2d, weight_t, out=output_2d)
                 else:
                     torch.mm(hidden_2d, weight.t(), out=output_2d)
@@ -1932,6 +1952,9 @@ class _Llama3TensorParallelLayer:
             except Exception:
                 self._symm_reduce_failed = True
                 _disable_symm_reduce()
+        if marlin_out is not None:
+            _all_reduce(marlin_out)
+            return marlin_out
         projected = _decode_linear(hidden, weight, weight_t)
         _all_reduce(projected)
         return projected
