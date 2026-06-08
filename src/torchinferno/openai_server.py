@@ -2425,11 +2425,21 @@ class OpenAICompletionEngine:
         # (without it the primary rebuilds per session, which is fine -- empty pools).
         if env_flag("TORCHINFERNO_PAGED_PREFIX_CACHE", False):
             eng = getattr(self, "_persistent_paged_engine", None)
-            if eng is not None:
+            # Reuse if the persistent engine FITS this burst; else rebuild bigger.
+            # MONOTONIC growth (never shrink) + a floor so the size stabilizes after the
+            # early growth phase -> the prefix cache then persists (no more rebuilds).
+            # Identical (deterministic) sizing on primary + worker -> TP-consistent.
+            # Without this, a later larger request than the first burst would crash the
+            # paged pool ("out of pages"). Capped at max_model_len.
+            if eng is not None and eng.max_seq >= max_seq_len and eng.max_active >= max_active:
                 return eng
+            floor = env_int("TORCHINFERNO_PAGED_PERSIST_FLOOR_SEQ", 2048, minimum=1)
+            cap = int(getattr(self, "max_model_len", None) or (1 << 20))
+            target_seq = min(cap, max(int(max_seq_len), floor, eng.max_seq if eng else 0))
+            target_active = max(int(max_active), eng.max_active if eng else 0)
             eng = PagedEngine(
-                self.model, page_size=page_size, max_active=int(max_active),
-                max_seq=int(max_seq_len),
+                self.model, page_size=page_size, max_active=target_active,
+                max_seq=target_seq,
                 use_graph=env_flag("TORCHINFERNO_OPENAI_PAGED_KV_GRAPH", True),
             )
             self._persistent_paged_engine = eng
@@ -10403,12 +10413,29 @@ def _tensor_parallel_worker_loop(engine: OpenAICompletionEngine) -> None:
                 # submit/step commands, so the deterministic page allocator keeps
                 # block tables in sync across ranks).
                 worker_use_paged = _paged_kv_active_for(getattr(engine, "model", None), max_seq_len)
-                if online_runtime_engine is None and worker_use_paged:
+                # Rebuild the worker's paged engine if it does not FIT this burst, with
+                # the SAME monotonic-growth sizing as the primary (_maybe_build_paged_
+                # online_engine) so both ranks size identically -> consistent paged pool
+                # + prefix cache. Persist (prefix cache on) keeps the engine across
+                # bursts; otherwise the original build-once-if-None behavior holds.
+                _persist_paged = env_flag("TORCHINFERNO_PAGED_PREFIX_CACHE", False)
+                _paged_needs_build = worker_use_paged and (
+                    online_runtime_engine is None
+                    or (_persist_paged and (
+                        getattr(online_runtime_engine, "max_seq", 0) < max_seq_len
+                        or getattr(online_runtime_engine, "max_active", 0) < max_active))
+                )
+                if _paged_needs_build:
                     from torchinferno.runtime.paged_serving import PagedEngine
+                    _prev = online_runtime_engine if _persist_paged else None
+                    _floor = env_int("TORCHINFERNO_PAGED_PERSIST_FLOOR_SEQ", 2048, minimum=1)
+                    _cap = int(getattr(engine, "max_model_len", None) or (1 << 20))
+                    _t_seq = min(_cap, max(int(max_seq_len), _floor, getattr(_prev, "max_seq", 0)))
+                    _t_active = max(int(max_active), getattr(_prev, "max_active", 0))
                     online_runtime_engine = PagedEngine(
                         getattr(engine, "model"),
                         page_size=int(getattr(engine, "page_size", 16)) or 16,
-                        max_active=max_active, max_seq=max_seq_len,
+                        max_active=_t_active, max_seq=_t_seq,
                         use_graph=env_flag("TORCHINFERNO_OPENAI_PAGED_KV_GRAPH", True),
                     )
                 elif online_runtime_engine is None:

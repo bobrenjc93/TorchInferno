@@ -490,6 +490,7 @@ class PagedEngine:
         self.model = model
         self.page_size = page_size
         self.max_active = max_active
+        self.max_seq = max_seq  # exposed for persistent-engine fit/rebuild checks
         dev = model.device
         self.dev = dev
         layer0 = model.layers[0]
