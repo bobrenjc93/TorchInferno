@@ -919,6 +919,28 @@ class ContinuousBatchEngine:
                 file=_rdbg.stderr, flush=True,
             )
 
+        # Common-prefix fast path (BEFORE FlashInfer per-request prefill): if the
+        # uncached plain group shares a long prefix (self_consistency's identical
+        # prompts; few_shot's shared shots), prefill the shared prefix ONCE via
+        # _prefill_common_prefix_batch + pin it, instead of FI prefilling the shared
+        # prefix N times. Without this, the first burst (nothing cached yet) goes
+        # straight to full per-request FI prefill and the common-prefix path is never
+        # reached (IDENTICAL ~= DIFFERENT TTFT). Gated on a real shared prefix across
+        # >=2 requests; distinct-prompt groups (e.g. tree) fall through to FI.
+        if (
+            env_flag("TORCHINFERNO_CONTINUOUS_COMMON_PREFIX_PREFILL", True)
+            and len(plain_group) > 1
+            and self.prefix_cache_capacity > 0
+        ):
+            cp_tokens = _common_prefix_token_count([req.prompt for _i, req, _h in plain_group])
+            if cp_tokens >= 16:
+                shared_active = self._prefill_common_prefix_batch(
+                    [(idx, req, 0) for idx, req, _h in plain_group], step, events=events
+                )
+                if shared_active is not None:
+                    active.extend(shared_active)
+                    plain_group = []
+
         all_fi_requests: list[tuple[int, ServingRequest, int, _ReusablePrefix | None]] = []
         if not env_flag("TORCHINFERNO_CONTINUOUS_FLASHINFER_PREFILL_DISABLE", False):
             for group in prefix_batchable.values():
