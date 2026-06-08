@@ -431,8 +431,24 @@ class PagedSpecGraphRunner:
         self.graph = None
         self.out = None
 
-    def _plan(self, request_ids):
+    def _plan(self, request_ids, max_kv=False):
+        # max_kv=True (CAPTURE only): plan the attention schedule for each request's MAX
+        # reserved kv (all allocated pages, last page full) so the captured kernel covers
+        # ALL of growing context; step() re-plans with the ACTUAL (smaller) length. Without
+        # this the kernel is sized for the small capture-time kv -> wrong as context grows
+        # (the FlashInfer prefill CUDAGraph wrapper, unlike the decode one, bakes the kv
+        # schedule at capture).
+        if max_kv:
+            saved = {}
+            for rid in request_ids:
+                seq = self.cache._sequences[rid]
+                if rid not in saved:
+                    saved[rid] = seq.length
+                seq.length = len(seq.page_ids) * self.page_size
         indptr, indices, lpl = self.cache.flashinfer_page_table(request_ids)
+        if max_kv:
+            for rid, length in saved.items():
+                self.cache._sequences[rid].length = length
         qo_indptr = torch.zeros(self.batch + 1, dtype=torch.int32, device=self.dev)
         qo_indptr[1:] = torch.full((self.batch,), self.T, dtype=torch.int32, device=self.dev).cumsum(0)
         self.pw.plan(
@@ -462,8 +478,9 @@ class PagedSpecGraphRunner:
         self.s_bt[:, : bt.size(1)].copy_(bt)
 
     def capture(self, input_ids, starts, request_ids):
+        # capture the kernel sized for MAX kv (max_kv=True) so growing context is covered.
         self._fill(input_ids, starts, request_ids)
-        self._plan(request_ids)
+        self._plan(request_ids, max_kv=True)
         fwd = lambda: self.model.forward_prefill_paged(
             self.s_ids, self.cache, request_ids=request_ids,
             prefill_wrapper=self.pw, block_table=self.s_bt, start_position=self.s_start)
@@ -471,13 +488,13 @@ class PagedSpecGraphRunner:
         torch.cuda.synchronize(self.dev)
         stream = torch.cuda.Stream(device=self.dev)
         stream.wait_stream(torch.cuda.current_stream(self.dev))
-        self._plan(request_ids)
+        self._plan(request_ids, max_kv=True)
         with torch.cuda.stream(stream):
             fwd()
         torch.cuda.current_stream(self.dev).wait_stream(stream)
         torch.cuda.synchronize(self.dev)
         self.graph = torch.cuda.CUDAGraph()
-        self._plan(request_ids)
+        self._plan(request_ids, max_kv=True)
         with torch.cuda.graph(self.graph, stream=stream):
             self.out = fwd()
         self._stream = stream
