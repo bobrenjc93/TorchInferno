@@ -415,11 +415,16 @@ class PagedEngine:
         self._step_no = 0
         self._prefill_ws = None       # persistent prefill workspace (avoid per-call 128MB alloc)
         self._prefill_wrapper = None  # persistent prefill wrapper (re-plan, no realloc)
-        # CUDA-graphed prefill: cache one PagedPrefillGraphRunner per (batch, T) shape
-        # (LRU-bounded). The graph eliminates the eager per-layer-allreduce launch
-        # floor (~2.5x at low batch -- the launch-bound regime concurrent multi_turn
-        # arrivals hit). Gated default-off until benchmark-measured.
-        self._use_prefill_graph = use_graph and env_flag("TORCHINFERNO_PAGED_PREFILL_GRAPH", True)
+        # CUDA-graphed prefill: cache one PagedPrefillGraphRunner per (batch, T) shape.
+        # DEFAULT-OFF: local A/B (real 70B TP8, VARLEN ~1500-tok 32-conc PIPELINE)
+        # showed default-on is a REGRESSION on the varied-length high-concurrency load
+        # (= multi_turn): TTFT 8.7s->21.2s, tput 144->66. Cause: exact-T keying + inline
+        # capture means ~16 distinct shapes each capture (~500ms) BLOCKING in the
+        # serving loop while concurrent requests queue (capture-thrash). The graph IS
+        # 1.5-2.5x when shapes RECUR (few distinct lengths), but varied-length multi_turn
+        # never reaches steady reuse. Needs T-BUCKETING (round T to coarse buckets + pad,
+        # logits read at real_len-1) before it can be default-on.
+        self._use_prefill_graph = use_graph and env_flag("TORCHINFERNO_PAGED_PREFILL_GRAPH", False)
         self._prefill_runners: dict[tuple, PagedPrefillGraphRunner] = {}
         self._prefill_runner_cap = env_int("TORCHINFERNO_PAGED_PREFILL_GRAPH_MAX", 16, minimum=1)
         self._prefill_graph_max_t = env_int("TORCHINFERNO_PAGED_PREFILL_GRAPH_MAX_T", 4096, minimum=1)
