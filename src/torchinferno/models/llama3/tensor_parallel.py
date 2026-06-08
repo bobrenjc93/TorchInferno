@@ -4555,6 +4555,7 @@ class Llama3TensorParallelForCausalLM:
         request_ids: list[str],
         prefill_wrapper: object,
         block_table: Tensor | None = None,
+        start_position: int = 0,
     ) -> Tensor:
         # TRUE paged-KV prefill (WIP, feature branch): fresh-sequence prefill of a
         # uniform [batch, T] prompt block into the small-page pool. Same per-layer
@@ -4569,7 +4570,17 @@ class Llama3TensorParallelForCausalLM:
         batch, tokens = input_ids.shape
         head_dim = self.config.head_dim
         rms_eps = self.config.rms_norm_eps
-        positions = torch.arange(tokens, device=self.device).unsqueeze(0).expand(batch, tokens)
+        # start_position > 0 = SUFFIX prefill over a shared/cached prefix (COW prefix
+        # reuse): these `tokens` query positions are [start, start+tokens), their KV is
+        # written at those absolute slots, and rotary uses the absolute positions. The
+        # caller plans prefill_wrapper with qo=suffix over the FULL paged_kv (shared
+        # prefix pages + new suffix pages), seq_lens=start, causal -> attention reads
+        # the shared prefix for free.
+        positions = (
+            torch.arange(start_position, start_position + tokens, device=self.device)
+            .unsqueeze(0)
+            .expand(batch, tokens)
+        )
         flat = positions.reshape(-1)
         cos = self.rotary_cos_cache.index_select(0, flat).view(batch, tokens, -1)
         sin = self.rotary_sin_cache.index_select(0, flat).view(batch, tokens, -1)
@@ -4592,7 +4603,7 @@ class Llama3TensorParallelForCausalLM:
             pos: list[int] = []
             for request_id in request_ids:
                 ids.extend([request_id] * tokens)
-                pos.extend(range(tokens))
+                pos.extend(range(start_position, start_position + tokens))
             slots = paged_cache.slot_mapping(ids, pos)  # [batch*T], row-major (request, position)
 
         hidden = F.embedding(input_ids, self.embed_tokens_weight)
