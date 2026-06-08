@@ -176,6 +176,47 @@ def test_layered_paged_kv_cache_share_prefix_zero_copy_refcount() -> None:
     assert len(cache.free_pages) == free_before + 3
 
 
+def test_paged_prefix_cache_zero_copy_share_and_evict() -> None:
+    from torchinferno.runtime.paged import LayeredPagedKVCache
+    from torchinferno.runtime.paged_serving import PagedPrefixCache
+
+    cache = LayeredPagedKVCache(
+        num_layers=1, num_pages=32, page_size=4,
+        num_key_value_heads=1, head_dim=2,
+        device=torch.device("cpu"), dtype=torch.float32,
+    )
+    pc = PagedPrefixCache(cache, capacity=2)
+
+    # "a": 12-token prompt (3 pages). Remember it, then FREE the request -- the cache
+    # must RETAIN a's pages (the prefix cache holds refs).
+    toks_a = list(range(12))
+    cache.reserve("a", 12); cache._sequences["a"].length = 12
+    a_pages = list(cache._sequences["a"].page_ids)
+    pc.remember("a", toks_a)
+    free_pages_before = len(cache.free_pages)
+    cache.free("a")
+    assert len(cache.free_pages) == free_pages_before  # retained -> none released
+
+    # "b" shares a's first 8 tokens (2 pages) + a divergent suffix -> zero-copy share.
+    toks_b = toks_a[:8] + [99, 99, 99, 99]
+    shared = pc.share_into("b", toks_b)
+    assert shared == 8                                  # 2 full shared pages
+    assert cache._sequences["b"].page_ids == a_pages[:2]  # ZERO-COPY same pages
+    assert cache.page_refcount(a_pages[0]) == 2         # retained(1) + b(1)
+
+    # No prefix match -> no share.
+    assert pc.share_into("c", [7, 7, 7, 7, 7, 7, 7, 7]) == 0
+
+    # LRU eviction: remember 2 more (capacity=2) -> "a" evicted -> its now-unreferenced
+    # page (a_pages[2], the unshared one) returns to the pool; a_pages[:2] still held by b.
+    for name, base in (("d", 200), ("e", 300)):
+        t = list(range(base, base + 8))
+        cache.reserve(name, 8); cache._sequences[name].length = 8
+        pc.remember(name, t)
+    assert cache.page_refcount(a_pages[2]) == 0
+    assert cache.page_refcount(a_pages[0]) == 1         # b still holds it
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="FlashInfer paged decode needs CUDA")
 def test_layered_paged_kv_cache_flashinfer_decode_matches_dense() -> None:
     # End-to-end de-risk of the paged-KV foundation: prove LayeredPagedKVCache's

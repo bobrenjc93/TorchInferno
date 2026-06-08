@@ -292,6 +292,21 @@ class LayeredPagedKVCache:
     def page_refcount(self, page_id: int) -> int:
         return self._page_refcount[page_id]
 
+    def retain_page(self, page_id: int) -> None:
+        """Hold an extra reference on a page (e.g. a prefix cache retaining a
+        completed sequence's KV pages so they survive free() and can be shared)."""
+        self._page_refcount[page_id] += 1
+
+    def release_page_ref(self, page_id: int) -> None:
+        """Drop one reference; return the page to the pool at refcount 0. The mirror
+        of retain_page (used when a prefix cache evicts a retained sequence)."""
+        rc = self._page_refcount[page_id]
+        if rc <= 1:
+            self._page_refcount[page_id] = 0
+            self._free_pages.append(page_id)
+        else:
+            self._page_refcount[page_id] = rc - 1
+
     @property
     def active_request_ids(self) -> tuple[str, ...]:
         return tuple(self._sequences)

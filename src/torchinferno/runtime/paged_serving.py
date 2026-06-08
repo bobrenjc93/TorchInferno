@@ -19,7 +19,104 @@ import torch
 from torch import Tensor
 
 from torchinferno.runtime.options import env_flag, env_int
-from torchinferno.runtime.paged import LayeredPagedKVCache
+from torchinferno.runtime.paged import LayeredPagedKVCache, PagedSequence
+from torchinferno.runtime.prefix import PrefixAwareRouter
+
+
+class PagedPrefixCache:
+    """Zero-copy block-level prefix cache over a LayeredPagedKVCache (vllm-style).
+
+    remember(rid, tokens) RETAINS a completed sequence's page-aligned KV pages (holds
+    an extra refcount so the cache's free() won't release them) and indexes its tokens
+    in a radix router. share_into(new_rid, tokens) finds the longest cached
+    PAGE-ALIGNED prefix of the new prompt and shares those pages ZERO-COPY into the new
+    request (refcount++), returning the shared token count -- so the engine prefills
+    ONLY the suffix. LRU-bounded; eviction releases the retained refs (and rebuilds the
+    router, which has no remove). This is the cross-request KV reuse that closes the
+    multi_turn TTFT gap (turn k shares turns 1..k-1's pages instead of re-prefilling).
+    Collective-safe on TP: every rank runs the same deterministic remember/match on the
+    same broadcast tokens -> identical share decisions -> identical page tables.
+    """
+
+    def __init__(self, cache: LayeredPagedKVCache, *, capacity: int) -> None:
+        self.cache = cache
+        self.page_size = cache.page_size
+        self.capacity = max(0, int(capacity))
+        self._router = PrefixAwareRouter(default_route=None)
+        self._entries: dict[str, tuple[tuple[int, ...], list[int]]] = {}
+        self._lru: list[str] = []
+
+    def remember(self, request_id: str, tokens) -> None:
+        if self.capacity <= 0 or request_id in self._entries:
+            if request_id in self._entries:
+                self._touch(request_id)
+            return
+        seq = self.cache._sequences.get(request_id)
+        if seq is None:
+            return
+        full_pages = min(len(seq.page_ids), len(tokens) // self.page_size)
+        if full_pages <= 0:
+            return
+        keep = list(seq.page_ids[:full_pages])
+        for pid in keep:
+            self.cache.retain_page(pid)
+        toks = tuple(int(t) for t in tokens[: full_pages * self.page_size])
+        self._entries[request_id] = (toks, keep)
+        self._index_entry(request_id, toks)
+        self._lru.append(request_id)
+        self._evict()
+
+    def _index_entry(self, request_id: str, toks: tuple[int, ...]) -> None:
+        # Insert a route endpoint at EVERY page boundary so a query that shares only a
+        # LEADING run of pages (then diverges) still matches that run -- the radix
+        # router matches an inserted sequence only when it is a full prefix of the
+        # query. A boundary shared by two sequences maps to whichever was indexed last;
+        # that is correct because identical leading tokens have identical KV, so either
+        # sequence's pages for that prefix are interchangeable.
+        for p in range(1, len(toks) // self.page_size + 1):
+            self._router.add_prefix(toks[: p * self.page_size], request_id)
+
+    def share_into(self, new_request_id: str, tokens) -> int:
+        if not self._entries:
+            return 0
+        match = self._router.route(tokens)
+        rid = match.route_id
+        if rid is None or rid not in self._entries:
+            return 0
+        depth = (match.depth // self.page_size) * self.page_size
+        if depth < self.page_size:
+            return 0
+        _toks, ent_pages = self._entries[rid]
+        n_pages = depth // self.page_size
+        dst = self.cache._sequences.setdefault(new_request_id, PagedSequence(new_request_id))
+        if dst.page_ids:
+            return 0  # target must be fresh
+        for pid in ent_pages[:n_pages]:
+            dst.page_ids.append(pid)
+            self.cache.retain_page(pid)
+        dst.length = max(dst.length, depth)
+        self._touch(rid)
+        return depth
+
+    def _touch(self, request_id: str) -> None:
+        if request_id in self._lru:
+            self._lru.remove(request_id)
+            self._lru.append(request_id)
+
+    def _evict(self) -> None:
+        while len(self._lru) > self.capacity:
+            rid = self._lru.pop(0)
+            _toks, pages = self._entries.pop(rid)
+            for pid in pages:
+                self.cache.release_page_ref(pid)
+            self._rebuild_router()
+
+    def _rebuild_router(self) -> None:
+        # PrefixAwareRouter has no remove(); rebuild from the surviving entries
+        # (eviction is rare and capacity is bounded).
+        self._router = PrefixAwareRouter(default_route=None)
+        for rid, (toks, _pages) in self._entries.items():
+            self._index_entry(rid, toks)
 
 
 def _greedy_tokens(model, logits_2d):
