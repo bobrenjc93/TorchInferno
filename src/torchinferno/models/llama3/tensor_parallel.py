@@ -1785,6 +1785,13 @@ class _Llama3TensorParallelLayer:
         # changed decode numerics (int4 != bf16) which broke graph-vs-eager exact
         # match tests, and the lazy-quantize-before-graph-capture ordering is fragile
         # in non-server paths. Enable with TORCHINFERNO_MARLIN_INT4_DECODE=1.
+        # marlin int4 is a WEIGHT-ONLY-quant kernel (int4 dequant + bf16 compute): it
+        # wins at SMALL M (decode, weight-read/memory-bound) but LOSES at LARGE M
+        # (prefill, compute-bound -- bf16 tensor cores run full-throughput and the
+        # dequant is pure overhead). Measured on the real 70B TP8: marlin-prefill
+        # REGRESSED few_shot-shaped TTFT 1080->1404ms (1.3x worse) despite 5/5 greedy
+        # correctness. So marlin is decode-only; the prefill GEMM lever is FP8
+        # _scaled_mm (FP8 tensor cores, ~1.8x at large M), which has no infra yet.
         if not _tp_flag("TORCHINFERNO_MARLIN_INT4_DECODE", False):
             return None
         if not hidden.is_cuda:  # marlin_gemm is CUDA-only; CPU falls back to bf16
