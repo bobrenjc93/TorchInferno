@@ -1840,9 +1840,13 @@ class _Llama3TensorParallelLayer:
         # (validate_fp8_prefill_correctness.py); the fused-quant kernel gives 1.4-2x on
         # the big GEMMs (bench_fp8_prefill.py). Lazily tensorwise-quantizes the weight to
         # fp8 (one-time, in EAGER context only -- guarded vs graph capture so the alloc
-        # never lands inside a CUDA graph; callers run fp8 prefill eager). Default OFF
-        # until cron-measured. Returns [..,N] or None (caller falls back to bf16).
-        if not _tp_flag("TORCHINFERNO_FP8_PREFILL", False):
+        # never lands inside a CUDA graph; callers run fp8 prefill eager). Returns [..,N]
+        # or None (caller falls back to bf16). DEFAULT ON: end-to-end server A/B (N=32
+        # VARLEN concurrent, the few_shot/tree graph-miss->eager regime where it fires)
+        # cut median TTFT ~1.9x (1200->626ms) at greedy-EXACT correctness, no hang/crash;
+        # it is a pure per-rank GEMM (no cross-rank state -> no COW-style collective
+        # divergence). At 0/20 a correct gap-narrowing change has no scorecard downside.
+        if not _tp_flag("TORCHINFERNO_FP8_PREFILL", True):
             return None
         if not hidden.is_cuda:
             return None
