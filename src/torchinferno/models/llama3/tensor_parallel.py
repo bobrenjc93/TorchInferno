@@ -1841,12 +1841,18 @@ class _Llama3TensorParallelLayer:
         # the big GEMMs (bench_fp8_prefill.py). Lazily tensorwise-quantizes the weight to
         # fp8 (one-time, in EAGER context only -- guarded vs graph capture so the alloc
         # never lands inside a CUDA graph; callers run fp8 prefill eager). Returns [..,N]
-        # or None (caller falls back to bf16). DEFAULT ON: end-to-end server A/B (N=32
-        # VARLEN concurrent, the few_shot/tree graph-miss->eager regime where it fires)
-        # cut median TTFT ~1.9x (1200->626ms) at greedy-EXACT correctness, no hang/crash;
-        # it is a pure per-rank GEMM (no cross-rank state -> no COW-style collective
-        # divergence). At 0/20 a correct gap-narrowing change has no scorecard downside.
-        if not _tp_flag("TORCHINFERNO_FP8_PREFILL", True):
+        # or None (caller falls back to bf16). DEFAULT OFF -- REVERTED after a measured
+        # benchmark REGRESSION: cron run 20260608_121124 (built 0c65c8b, fp8 on) showed
+        # few_shot TTFT 288.9->515.4ms (+78%), E2E 384->600, tput 3.0->2.4; other cells
+        # within noise. CAUSE: fp8 adds ~44ms/forward of LAUNCH-BOUND quant overhead
+        # (abs+amax fixed ~235us x 160 calls); at few_shot's HIGH-CONCURRENCY SMALL
+        # prefills that overhead EXCEEDS the GEMM savings -> net slower. My local A/B that
+        # justified default-on used 400-tok prompts (larger M, where fp8 wins) and MISSED
+        # few_shot's small-prefill regime. The cron OVERRIDES the local A/B. To re-enable:
+        # fuse the absmax into the rms_norm/swiglu epilogue (kill the quant overhead) AND
+        # raise the M-gate so fp8 fires only where GEMM savings >> overhead, validated on
+        # a live cron. Revert=this flag default False (= TORCHINFERNO_FP8_PREFILL unset).
+        if not _tp_flag("TORCHINFERNO_FP8_PREFILL", False):
             return None
         if not hidden.is_cuda:
             return None
