@@ -919,16 +919,21 @@ class ContinuousBatchEngine:
                 file=_rdbg.stderr, flush=True,
             )
 
-        # Common-prefix fast path (BEFORE FlashInfer per-request prefill): if the
-        # uncached plain group shares a long prefix (self_consistency's identical
-        # prompts; few_shot's shared shots), prefill the shared prefix ONCE via
-        # _prefill_common_prefix_batch + pin it, instead of FI prefilling the shared
-        # prefix N times. Without this, the first burst (nothing cached yet) goes
-        # straight to full per-request FI prefill and the common-prefix path is never
-        # reached (IDENTICAL ~= DIFFERENT TTFT). Gated on a real shared prefix across
-        # >=2 requests; distinct-prompt groups (e.g. tree) fall through to FI.
+        # Common-prefix fast path: prefill a shared prefix ONCE then per-request
+        # suffixes. DISABLED by default -- live A/B on the real 70B (TP8) showed it
+        # is a regression in EVERY regime, including the identical-prompt
+        # self_consistency case it was built for. Cause: it routes the burst through
+        # the EAGER _prefill_logits path (launch-overhead bound, ~245ms/call on TP8
+        # because per-layer allreduces are not graph-amortized), bypassing the
+        # graph-backed _try_flashinfer_prefill below (try_prefill_flashinfer_graph,
+        # the warmup-captured _fi_prefill_graphs). Worse, the online batcher admits
+        # in waves (initial_batch_size=1), so each wave pays its own ~245ms eager
+        # prefix prefill. Measured TTFT (identical / distinct), ON vs OFF: N=8
+        # 603/737 -> 122/124; N=64 1549/2378 -> 999/949 (3-7x at low N, ~2x at high
+        # N, ~2x throughput). The graph-FI path handles identical and distinct
+        # equally fast, so this path only wins if eager prefill is ever fixed.
         if (
-            env_flag("TORCHINFERNO_CONTINUOUS_COMMON_PREFIX_PREFILL", True)
+            env_flag("TORCHINFERNO_CONTINUOUS_COMMON_PREFIX_PREFILL", False)
             and len(plain_group) > 1
             and self.prefix_cache_capacity > 0
         ):
