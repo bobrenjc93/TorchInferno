@@ -43,14 +43,25 @@ def _lens(req_id):
     return p, m
 
 
+IDENTICAL = os.environ.get("IDENTICAL", "0") == "1"
+
+
 def make_body(req_id: int) -> dict:
     p_tokens, m_tokens = _lens(req_id)
-    filler = " ".join(f"word{i}" for i in range(max(1, p_tokens // 2)))
+    if IDENTICAL:
+        # All requests SAME content (self_consistency-style) -> exercises prefix
+        # caching: the shared prompt should prefill once and be reused.
+        filler = " ".join(f"word{i}" for i in range(max(1, PROMPT_TOKENS // 2)))
+        content = f"{filler}\n\nWrite a long detailed story."
+        m_tokens = MAX_TOKENS
+    else:
+        filler = " ".join(f"word{i}" for i in range(max(1, p_tokens // 2)))
+        content = f"Request {req_id}. {filler}\n\nWrite a long detailed story."
     return {
         "model": MODEL,
         "messages": [
             {"role": "system", "content": "You are a helpful assistant."},
-            {"role": "user", "content": f"Request {req_id}. {filler}\n\nWrite a long detailed story."},
+            {"role": "user", "content": content},
         ],
         "max_tokens": m_tokens,
         "temperature": TEMPERATURE,
