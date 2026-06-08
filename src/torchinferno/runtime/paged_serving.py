@@ -906,10 +906,12 @@ class PagedEngine:
         starts_t = torch.tensor(starts, dtype=torch.long, device=self.dev)
         # GRAPHED spec verify (PagedSpecGraphRunner) is the wall-win: eager forward is
         # ~220ms (80-layer launch floor) vs ~29ms graphed. Eager fallback for A/B / no-graph.
-        # GRAPH path is WIP: PagedSpecGraphRunner runs ~29ms (vs eager ~220ms) but currently
-        # produces WRONG logits via the FlashInfer CUDAGraph prefill wrapper (MATCH=False) --
-        # default OFF until the graph correctness is debugged; eager path is greedy-EXACT.
-        if self.runner is not None and env_flag("TORCHINFERNO_PAGED_SPEC_GRAPH", False):
+        # GRAPH path (default ON): PagedSpecGraphRunner runs ~29ms vs eager ~165ms (eager
+        # is launch-bound). VALIDATED greedy-EXACT: graph==eager argmax for all requests over
+        # 60 steps incl padding to max_active (dbg_div). [The earlier "MATCH=False" was spec-
+        # verify-vs-baseline-decode near-tie flips -- the inherent spec numerical property,
+        # not a graph bug.] capture-at-max sizes the kernel for the full kv (growing context).
+        if self.runner is not None and env_flag("TORCHINFERNO_PAGED_SPEC_GRAPH", True):
             sr = getattr(self, "_spec_runner", None)
             if sr is None or sr.T != 1 + k:
                 mp = math.ceil(self.max_seq / self.page_size) + 1
