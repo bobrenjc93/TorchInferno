@@ -4541,6 +4541,7 @@ class Llama3TensorParallelForCausalLM:
         *,
         request_ids: list[str],
         prefill_wrapper: object,
+        block_table: Tensor | None = None,
     ) -> Tensor:
         # TRUE paged-KV prefill (WIP, feature branch): fresh-sequence prefill of a
         # uniform [batch, T] prompt block into the small-page pool. Same per-layer
@@ -4563,12 +4564,23 @@ class Llama3TensorParallelForCausalLM:
             cos = torch.cat((cos, cos), dim=-1)
             sin = torch.cat((sin, sin), dim=-1)
         rotary = (cos, sin)
-        ids: list[str] = []
-        pos: list[int] = []
-        for request_id in request_ids:
-            ids.extend([request_id] * tokens)
-            pos.extend(range(tokens))
-        slots = paged_cache.slot_mapping(ids, pos)  # [batch*T], row-major (request, position)
+        if block_table is not None:
+            # On-device, CUDA-graph-capturable slots (no host loop): for a fresh
+            # [batch, T] prefill the token at (request i, position j) writes slot
+            # block_table[i, j//page_size]*page_size + j%page_size. positions is the
+            # [batch, T] absolute-position grid (arange(T) per row, since prefill
+            # starts at 0); flatten row-major to match the [batch*T] scatter.
+            page_size = paged_cache.page_size
+            page_slot = torch.div(positions, page_size, rounding_mode="floor")
+            page_id = block_table.gather(1, page_slot)
+            slots = (page_id * page_size + (positions - page_slot * page_size)).reshape(-1)
+        else:
+            ids: list[str] = []
+            pos: list[int] = []
+            for request_id in request_ids:
+                ids.extend([request_id] * tokens)
+                pos.extend(range(tokens))
+            slots = paged_cache.slot_mapping(ids, pos)  # [batch*T], row-major (request, position)
 
         hidden = F.embedding(input_ids, self.embed_tokens_weight)
         attn_in: Tensor | None = None
