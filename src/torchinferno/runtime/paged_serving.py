@@ -18,6 +18,7 @@ import math
 import torch
 from torch import Tensor
 
+from torchinferno.runtime.options import env_flag, env_int
 from torchinferno.runtime.paged import LayeredPagedKVCache
 
 
@@ -414,6 +415,14 @@ class PagedEngine:
         self._step_no = 0
         self._prefill_ws = None       # persistent prefill workspace (avoid per-call 128MB alloc)
         self._prefill_wrapper = None  # persistent prefill wrapper (re-plan, no realloc)
+        # CUDA-graphed prefill: cache one PagedPrefillGraphRunner per (batch, T) shape
+        # (LRU-bounded). The graph eliminates the eager per-layer-allreduce launch
+        # floor (~2.5x at low batch -- the launch-bound regime concurrent multi_turn
+        # arrivals hit). Gated default-off until benchmark-measured.
+        self._use_prefill_graph = use_graph and env_flag("TORCHINFERNO_PAGED_PREFILL_GRAPH", True)
+        self._prefill_runners: dict[tuple, PagedPrefillGraphRunner] = {}
+        self._prefill_runner_cap = env_int("TORCHINFERNO_PAGED_PREFILL_GRAPH_MAX", 16, minimum=1)
+        self._prefill_graph_max_t = env_int("TORCHINFERNO_PAGED_PREFILL_GRAPH_MAX_T", 4096, minimum=1)
 
     def _prefill(self, rid, prompt):
         # Persistent-workspace prefill: re-plan the cached BatchPrefill wrapper per
@@ -438,11 +447,46 @@ class PagedEngine:
             request_ids=[rid], prefill_wrapper=self._prefill_wrapper,
         )
 
+    def _graphed_prefill(self, rids, prompts):
+        # Replay (or capture-then-replay) a CUDA-graphed prefill for this exact
+        # (batch, T) shape. Drop-in for forward_prefill_paged: same [B,T] input,
+        # same [B,T,vocab] output, so the caller's logits[:, -1, :] is unchanged.
+        # Exact-T keying means no padding -> the last-token logit position is correct
+        # by construction (no garbage-token risk). NO-EVICT policy: once the cache is
+        # full a NEW shape returns None so the caller stays EAGER -- this bounds total
+        # captures + memory and guarantees no capture-thrash regression vs all-eager
+        # if the workload cycles through many shapes.
+        B, T = len(rids), len(prompts[0])
+        key = (B, T)
+        runner = self._prefill_runners.get(key)
+        if runner is None:
+            if len(self._prefill_runners) >= self._prefill_runner_cap:
+                return None
+            runner = PagedPrefillGraphRunner(self.model, self.cache, batch=B, T=T)
+            self._prefill_runners[key] = runner
+        input_ids = torch.tensor(prompts, dtype=torch.long, device=self.dev)
+        return runner.step(input_ids, rids)
+
     def _prefill_batch(self, rids, prompts):
         # Batched (uniform-length) prefill: ONE forward_prefill_paged for all rids
         # of the same prompt length T, instead of one call per request -- the fix for
         # the sequential-prefill TTFT bottleneck. qo_indptr = [0,T,2T,...,B*T].
         import flashinfer
+
+        # Graphed fast path for the LAUNCH-BOUND regime (small batch): the eager TP
+        # prefill is ~2.5x slower here (per-layer allreduces not amortized). Large
+        # batches are compute-bound, so the graph is skipped (B>4) -- it would only
+        # add capture cost. Same-length group only (uniform T).
+        T0 = len(prompts[0])
+        if (
+            self._use_prefill_graph
+            and len(rids) <= 4
+            and T0 <= self._prefill_graph_max_t
+            and all(len(p) == T0 for p in prompts)
+        ):
+            graphed = self._graphed_prefill(rids, prompts)
+            if graphed is not None:
+                return graphed
 
         if len(rids) == 1:
             return self._prefill(rids[0], prompts[0])
