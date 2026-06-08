@@ -10529,7 +10529,14 @@ def _tensor_parallel_worker_loop(engine: OpenAICompletionEngine) -> None:
                         pass
                 continue
             if op == "online_close":
-                online_runtime_engine = None
+                # When COW prefix caching is on, KEEP the worker's engine across
+                # sessions so its PagedPrefixCache + paged pool persist -- matching the
+                # primary's self._persistent_paged_engine. Otherwise the worker would
+                # rebuild a FRESH (empty-cache) engine each session while the primary
+                # kept its populated one -> divergent share decisions -> collective
+                # deadlock (the high-conc COW hang). The symm scope is still per-session.
+                if not env_flag("TORCHINFERNO_PAGED_PREFIX_CACHE", False):
+                    online_runtime_engine = None
                 if online_symm_scope is not None:
                     online_symm_scope.__exit__(None, None, None)
                     online_symm_scope = None
