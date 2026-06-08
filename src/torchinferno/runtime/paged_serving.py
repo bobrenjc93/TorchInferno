@@ -525,6 +525,14 @@ class PagedEngine:
         self._prefill_runners: dict[tuple, PagedPrefillGraphRunner] = {}
         self._prefill_runner_cap = env_int("TORCHINFERNO_PAGED_PREFILL_GRAPH_MAX", 16, minimum=1)
         self._prefill_graph_max_t = env_int("TORCHINFERNO_PAGED_PREFILL_GRAPH_MAX_T", 4096, minimum=1)
+        # Zero-copy COW prefix cache (default-off until end-to-end validated): a new
+        # request shares the longest cached page-aligned prefix and prefills only its
+        # suffix (the multi_turn TTFT lever -- reuse prior turns' KV). Gated +
+        # capacity-bounded. Persistence across bursts is increment 4.
+        self.prefix_cache = (
+            PagedPrefixCache(self.cache, capacity=env_int("TORCHINFERNO_PAGED_PREFIX_CACHE_CAP", 256, minimum=1))
+            if env_flag("TORCHINFERNO_PAGED_PREFIX_CACHE", False) else None
+        )
 
     def _prefill(self, rid, prompt):
         # Persistent-workspace prefill: re-plan the cached BatchPrefill wrapper per
@@ -608,6 +616,31 @@ class PagedEngine:
             request_ids=rids, prefill_wrapper=self._prefill_wrapper,
         )
 
+    def _prefill_suffix(self, rid, prompt, shared):
+        # COW suffix prefill: rid already holds the shared prefix pages (positions
+        # 0..shared-1 KV present); prefill ONLY prompt[shared:] at start_position=shared
+        # over the FULL page table (prefix + suffix pages), causal -> attention reads
+        # the shared prefix for free. Returns [1, suffix_len, vocab]. Mirrors the
+        # GPU-validated scripts/validate_paged_suffix_prefill.py path.
+        import flashinfer
+
+        if self._prefill_ws is None:
+            self._prefill_ws = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=self.dev)
+            self._prefill_wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(self._prefill_ws, kv_layout="NHD")
+        suffix = prompt[shared:]
+        indptr, indices, lpl = self.cache.flashinfer_page_table([rid])
+        qo = torch.zeros(2, dtype=torch.int32, device=self.dev)
+        qo[1] = len(suffix)
+        self._prefill_wrapper.plan(
+            qo_indptr=qo, paged_kv_indptr=indptr, paged_kv_indices=indices, paged_kv_last_page_len=lpl,
+            num_qo_heads=self.nqo, num_kv_heads=self.nkv, head_dim_qk=self.hd, page_size=self.page_size,
+            causal=True, q_data_type=self.cache.kv.dtype,
+        )
+        return self.model.forward_prefill_paged(
+            torch.tensor([suffix], dtype=torch.long, device=self.dev), self.cache,
+            request_ids=[rid], prefill_wrapper=self._prefill_wrapper, start_position=shared,
+        )
+
     def submit(self, request_id, prompt: list[int], max_new_tokens: int, eos_token_id=None) -> None:
         self._pending.append((request_id, list(prompt), max_new_tokens, eos_token_id))
 
@@ -634,12 +667,42 @@ class PagedEngine:
                 self._pending.pop(0)
                 rid = f"p{self._next_rid}"
                 self._next_rid += 1
+                # COW: share the longest cached page-aligned prefix (zero-copy) so we
+                # prefill only the suffix. Deterministic across TP ranks (same cache +
+                # tokens -> same share), keeping per-request prefill collectives aligned.
+                shared = self.prefix_cache.share_into(rid, prompt) if self.prefix_cache is not None else 0
+                if shared >= len(prompt):  # whole prompt cached -> keep >=1 token to prefill
+                    shared = max(0, (len(prompt) - 1) // self.page_size * self.page_size)
                 self.cache.reserve(rid, len(prompt) + max_new)
                 self.cache._sequences[rid].length = len(prompt)
-                admitted.append({"ext": ext_id, "rid": rid, "prompt": prompt, "max_new": max_new, "eos": eos})
+                admitted.append({"ext": ext_id, "rid": rid, "prompt": prompt,
+                                 "max_new": max_new, "eos": eos, "shared": shared})
+
+            def _retire_or_activate(a, tok):
+                fin = 1 >= a["max_new"] or tok == a["eos"]
+                events.append((a["ext"], tok, fin))
+                if fin:
+                    if self.prefix_cache is not None:
+                        self.prefix_cache.remember(a["rid"], list(a["prompt"]) + [tok])
+                    self.cache.free(a["rid"])
+                else:
+                    self._active.append({
+                        "ext": a["ext"], "rid": a["rid"], "plen": len(a["prompt"]),
+                        "prompt": a["prompt"], "gen": [tok], "max_new": a["max_new"],
+                        "last": tok, "eos": a["eos"],
+                    })
+
             if admitted:
+                # COW-shared requests prefill ONLY their suffix (variable length) -> one
+                # call each (multi_turn admits ~1/step); non-shared go through the
+                # length-batched path. Order is deterministic -> TP collectives aligned.
+                for a in (x for x in admitted if x["shared"] > 0):
+                    logits = self._prefill_suffix(a["rid"], a["prompt"], a["shared"])
+                    tok = int(_greedy_tokens(self.model, logits[:, -1, :])[0])
+                    _retire_or_activate(a, tok)
+                plain = [x for x in admitted if x["shared"] == 0]
                 groups: dict[int, list[dict]] = {}
-                for a in admitted:
+                for a in plain:
                     groups.setdefault(len(a["prompt"]), []).append(a)
                 for _T, grp in groups.items():
                     rids = [a["rid"] for a in grp]
@@ -647,16 +710,7 @@ class PagedEngine:
                     logits = self._prefill_batch(rids, prompts)  # [B, T, vocab]
                     toks = _greedy_tokens(self.model, logits[:, -1, :])  # [B]
                     for i, a in enumerate(grp):
-                        tok = int(toks[i])
-                        fin = 1 >= a["max_new"] or tok == a["eos"]
-                        events.append((a["ext"], tok, fin))
-                        if fin:
-                            self.cache.free(a["rid"])
-                        else:
-                            self._active.append({
-                                "ext": a["ext"], "rid": a["rid"], "plen": len(a["prompt"]),
-                                "gen": [tok], "max_new": a["max_new"], "last": tok, "eos": a["eos"],
-                            })
+                        _retire_or_activate(a, int(toks[i]))
             if not self._active:
                 return events
             # decode the active set one token
@@ -680,6 +734,10 @@ class PagedEngine:
                 fin = len(a["gen"]) >= a["max_new"] or t == a["eos"]
                 events.append((a["ext"], t, fin))
                 if fin:
+                    # Remember the full prompt+generated sequence so a later request
+                    # (e.g. the next conversation turn) can share this turn's KV pages.
+                    if self.prefix_cache is not None and "prompt" in a:
+                        self.prefix_cache.remember(a["rid"], list(a["prompt"]) + list(a["gen"]))
                     self.cache.free(a["rid"])
                 else:
                     still.append(a)
