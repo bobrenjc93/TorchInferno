@@ -275,10 +275,22 @@ class LayeredPagedKVCache:
         )
         self._free_pages = list(reversed(range(num_pages)))
         self._sequences: dict[str, PagedSequence] = {}
+        # Per-page reference count for ZERO-COPY prefix sharing (COW prefix caching):
+        # a page may be referenced by several sequences (a shared read-only prefix);
+        # free() returns it to the pool only when the last referrer frees it. 0 means
+        # the page is in the free pool. The sharer only ever WRITES its private
+        # suffix/decode pages (never the shared prefix), so no copy-on-write is needed
+        # -- the prefix pages are read-only for attention. This is vllm's block-level
+        # prefix caching: turn k of a conversation shares turns 1..k-1's KV pages and
+        # prefills only the new turn (the multi_turn TTFT lever).
+        self._page_refcount: list[int] = [0] * num_pages
 
     @property
     def free_pages(self) -> tuple[int, ...]:
         return tuple(sorted(self._free_pages))
+
+    def page_refcount(self, page_id: int) -> int:
+        return self._page_refcount[page_id]
 
     @property
     def active_request_ids(self) -> tuple[str, ...]:
@@ -301,8 +313,38 @@ class LayeredPagedKVCache:
         while len(seq.page_ids) < required_pages:
             if not self._free_pages:
                 raise RuntimeError("LayeredPagedKVCache is out of pages")
-            seq.page_ids.append(self._free_pages.pop())
+            pid = self._free_pages.pop()
+            self._page_refcount[pid] = 1  # freshly owned by this sequence
+            seq.page_ids.append(pid)
         return seq
+
+    def share_prefix(self, source_request_id: str, target_request_id: str, num_tokens: int) -> int:
+        """ZERO-COPY share source's leading FULL pages with target (refcount++), so
+        target reuses source's KV for the shared prefix and need only prefill its
+        suffix. Shares floor(num_tokens/page_size) pages (block granularity -- a
+        partial final page is NOT shared; the caller prefills from that boundary).
+        target must have no pages yet. Returns the number of TOKENS shared (a multiple
+        of page_size). The shared pages are read-only for target (it writes only its
+        own suffix/decode pages), so no copy is needed."""
+        src = self._sequences.get(source_request_id)
+        if src is None:
+            return 0
+        shared_pages = min(num_tokens // self.page_size, len(src.page_ids))
+        if shared_pages <= 0:
+            return 0
+        dst = self._sequences.setdefault(target_request_id, PagedSequence(target_request_id))
+        if dst.page_ids:
+            raise ValueError("share_prefix target must have no pages yet")
+        for i in range(shared_pages):
+            pid = src.page_ids[i]
+            dst.page_ids.append(pid)
+            self._page_refcount[pid] += 1
+        shared_tokens = shared_pages * self.page_size
+        # The shared prefix is valid KV for the target; its length covers it. The
+        # caller then extend()s for the suffix (new private pages) and prefills only
+        # those positions.
+        dst.length = max(dst.length, shared_tokens)
+        return shared_tokens
 
     def extend(self, request_id: str, num_new_tokens: int) -> int:
         """Advance the sequence length by `num_new_tokens` (allocating pages),
@@ -471,4 +513,12 @@ class LayeredPagedKVCache:
         if seq is None:
             return
         for page_id in seq.page_ids:
-            self._free_pages.append(page_id)
+            # Refcount-aware free: a shared (prefix) page returns to the pool only
+            # when its LAST referrer frees it. dedupe-by-id within this sequence is
+            # unnecessary (a sequence never lists the same page twice).
+            rc = self._page_refcount[page_id]
+            if rc <= 1:
+                self._page_refcount[page_id] = 0
+                self._free_pages.append(page_id)
+            else:
+                self._page_refcount[page_id] = rc - 1

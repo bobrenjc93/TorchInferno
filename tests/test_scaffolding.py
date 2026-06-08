@@ -132,6 +132,50 @@ def test_layered_paged_kv_cache_shared_block_table_and_writes() -> None:
     assert len(cache.free_pages) == free_before + 2
 
 
+def test_layered_paged_kv_cache_share_prefix_zero_copy_refcount() -> None:
+    from torchinferno.runtime.paged import LayeredPagedKVCache
+
+    cache = LayeredPagedKVCache(
+        num_layers=2, num_pages=16, page_size=4,
+        num_key_value_heads=2, head_dim=2,
+        device=torch.device("cpu"), dtype=torch.float32,
+    )
+    # Source "a": 10 tokens -> 3 pages; write distinct KV so we can verify the shared
+    # prefix is the SAME storage (zero-copy), not a copy.
+    cache.extend("a", 10)
+    a_pages = list(cache._sequences["a"].page_ids)
+    assert len(a_pages) == 3
+    for layer in range(2):
+        keys = torch.arange(10 * 2 * 2, dtype=torch.float32).view(10, 2, 2) + layer * 100
+        cache.write_layer(layer, "a", keys, keys + 7, start=0)
+
+    free_after_a = len(cache.free_pages)
+    # Share the first 8 tokens (2 full pages) with "b"; the partial 3rd page is NOT shared.
+    shared = cache.share_prefix("a", "b", 8)
+    assert shared == 8  # 2 pages * page_size 4
+    b_pages = cache._sequences["b"].page_ids
+    assert b_pages == a_pages[:2]                 # ZERO-COPY: same page ids
+    assert len(cache.free_pages) == free_after_a  # sharing allocated NO new pages
+    assert cache.page_refcount(a_pages[0]) == 2   # refcounted
+    assert cache.page_refcount(a_pages[2]) == 1   # unshared page unchanged
+
+    # The shared pages carry a's KV (b reads a's prefix for free).
+    for layer in range(2):
+        mk, _ = cache.materialize_layer(layer, "a")
+        bk, _ = cache.materialize_layer(layer, "b")
+        torch.testing.assert_close(bk, mk[:8])  # b's 8 shared tokens == a's first 8
+
+    # Freeing "b" must NOT release the shared pages (still referenced by "a").
+    free_before = len(cache.free_pages)
+    cache.free("b")
+    assert len(cache.free_pages) == free_before   # 0 pages returned (all shared)
+    assert cache.page_refcount(a_pages[0]) == 1   # decremented back
+
+    # Freeing "a" now releases all 3 of its pages.
+    cache.free("a")
+    assert len(cache.free_pages) == free_before + 3
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="FlashInfer paged decode needs CUDA")
 def test_layered_paged_kv_cache_flashinfer_decode_matches_dense() -> None:
     # End-to-end de-risk of the paged-KV foundation: prove LayeredPagedKVCache's
