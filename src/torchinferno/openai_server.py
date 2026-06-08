@@ -2414,6 +2414,26 @@ class OpenAICompletionEngine:
         except Exception:
             return None
         page_size = int(getattr(self, "page_size", 16) or 16)
+        # COW prefix caching needs the engine (its paged pool + PagedPrefixCache +
+        # retained pages) to PERSIST across batcher sessions, so multi_turn's per-turn
+        # requests -- which arrive in separate bursts -- reuse the conversation's KV.
+        # The TP WORKER already persists its engine (online_runtime_engine, reused if
+        # not None), so the primary MUST persist too or the two ranks' prefix caches
+        # diverge -> different share decisions -> collective mismatch. Both build at the
+        # first burst with the same broadcast (max_active, max_seq) -> consistent; both
+        # then reuse. Gated on the prefix-cache flag so default behavior is unchanged
+        # (without it the primary rebuilds per session, which is fine -- empty pools).
+        if env_flag("TORCHINFERNO_PAGED_PREFIX_CACHE", False):
+            eng = getattr(self, "_persistent_paged_engine", None)
+            if eng is not None:
+                return eng
+            eng = PagedEngine(
+                self.model, page_size=page_size, max_active=int(max_active),
+                max_seq=int(max_seq_len),
+                use_graph=env_flag("TORCHINFERNO_OPENAI_PAGED_KV_GRAPH", True),
+            )
+            self._persistent_paged_engine = eng
+            return eng
         return PagedEngine(
             self.model, page_size=page_size, max_active=int(max_active),
             max_seq=int(max_seq_len),
