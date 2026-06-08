@@ -788,7 +788,11 @@ class PagedEngine:
             request_ids=rids, prefill_wrapper=pw, block_table=bt,
             start_position=torch.tensor(starts, dtype=torch.long, device=self.dev),
         )
-        preds = out.float().argmax(-1)  # [N, 1+K]; preds[i,m] = real token after inp[i,m]
+        # TP-aware greedy: logits are VOCAB-SHARDED across ranks, so a plain argmax gives
+        # a per-rank LOCAL index -> divergent tokens -> collective DESYNC. Use
+        # _greedy_tokens (all-reduces to the global token) for ALL N*(1+K) positions.
+        flat = _greedy_tokens(self.model, out.reshape(-1, out.size(-1)).float())  # [N*(1+K)]
+        preds = flat.reshape(n, -1)  # [N, 1+K] global argmax
         still = []
         for i, a in enumerate(act):
             p = [int(x) for x in preds[i]]
