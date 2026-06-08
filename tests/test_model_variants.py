@@ -299,7 +299,12 @@ def test_llama3_tensor_parallel_ragged_decode_matches_independent_decode(tmp_pat
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
-def test_llama3_tensor_parallel_ragged_decode_graph_matches_eager(tmp_path) -> None:
+def test_llama3_tensor_parallel_ragged_decode_graph_matches_eager(tmp_path, monkeypatch) -> None:
+    # This test verifies STRUCTURAL graph==eager decode equivalence in fp32; marlin
+    # int4 (now default-on for decode) is orthogonal and would fail allclose (int4 !=
+    # fp32 on this tiny model). Pin it off -- marlin's graph/eager + greedy correctness
+    # is validated separately on the real 70B (decode-only M-gate, 4/4+5/5 greedy).
+    monkeypatch.setenv("TORCHINFERNO_MARLIN_INT4_DECODE", "0")
     torch.manual_seed(1235)
     config = tiny_llama3_config(
         vocab_size=128,
@@ -372,7 +377,10 @@ def test_llama3_tensor_parallel_ragged_decode_graph_matches_eager(tmp_path) -> N
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
-def test_llama3_tensor_parallel_ragged_decode_graph_replays_after_indexed_row_reuse(tmp_path) -> None:
+def test_llama3_tensor_parallel_ragged_decode_graph_replays_after_indexed_row_reuse(tmp_path, monkeypatch) -> None:
+    # Pin marlin int4 off: this verifies fp32 structural graph==eager (int4 != fp32 on
+    # the tiny model). See the sibling test above.
+    monkeypatch.setenv("TORCHINFERNO_MARLIN_INT4_DECODE", "0")
     torch.manual_seed(1236)
     config = tiny_llama3_config(
         vocab_size=128,

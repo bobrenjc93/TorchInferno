@@ -1786,16 +1786,22 @@ class _Llama3TensorParallelLayer:
         # match tests, and the lazy-quantize-before-graph-capture ordering is fragile
         # in non-server paths. Enable with TORCHINFERNO_MARLIN_INT4_DECODE=1.
         # marlin int4 is a WEIGHT-ONLY-quant kernel (int4 dequant + bf16 compute): it
-        # wins at SMALL M (decode, weight-read/memory-bound) but LOSES at LARGE M
-        # (prefill, compute-bound -- bf16 tensor cores run full-throughput and the
-        # dequant is pure overhead). Measured on the real 70B TP8: marlin-prefill
-        # REGRESSED few_shot-shaped TTFT 1080->1404ms (1.3x worse) despite 5/5 greedy
-        # correctness. So marlin is decode-only; the prefill GEMM lever is FP8
-        # _scaled_mm (FP8 tensor cores, ~1.8x at large M), which has no infra yet.
-        if not _tp_flag("TORCHINFERNO_MARLIN_INT4_DECODE", False):
+        # WINS at SMALL M (decode, weight-read/memory-bound: 1.52x at M=48, ~2ms/step)
+        # but LOSES at LARGE M (prefill, compute-bound -- bf16 tensor cores run
+        # full-throughput, dequant is pure overhead; measured real 70B: marlin-prefill
+        # REGRESSED few_shot TTFT 1080->1404ms, and MARLIN_INT4_DECODE=1 without the
+        # M-gate slowed multi_turn-shaped wall 22.9->25.8s via the shared prefill GEMM
+        # path _mlp_project_decode_reduce). So it MUST be M-CONDITIONAL: engage only at
+        # small M (decode); skip large M (prefill) -> bf16. Decode M = rows (<=~128);
+        # prefill M = rows*prompt (thousands), so MAX_M=256 cleanly separates them.
+        # gate_up int4 is greedy-EXACT vs bf16 (5/5 short + 4/4 long-ctx paged). The
+        # large-M prefill GEMM lever is separately FP8 _scaled_mm (no infra yet).
+        if not _tp_flag("TORCHINFERNO_MARLIN_INT4_DECODE", True):
             return None
         if not hidden.is_cuda:  # marlin_gemm is CUDA-only; CPU falls back to bf16
             return None
+        if hidden.numel() // hidden.size(-1) > _tp_int("TORCHINFERNO_MARLIN_INT4_MAX_M", 256, minimum=1):
+            return None  # large-M (prefill): marlin loses -> stay bf16
         if getattr(self, f"_marlin_{key}_failed", False):
             return None
         if getattr(self, f"_marlin_{key}_q", None) is None:
