@@ -4655,7 +4655,7 @@ class Llama3TensorParallelForCausalLM:
         request_ids: list[str],
         prefill_wrapper: object,
         block_table: Tensor | None = None,
-        start_position: int = 0,
+        start_position: int | Tensor = 0,
     ) -> Tensor:
         # TRUE paged-KV prefill (WIP, feature branch): fresh-sequence prefill of a
         # uniform [batch, T] prompt block into the small-page pool. Same per-layer
@@ -4676,11 +4676,19 @@ class Llama3TensorParallelForCausalLM:
         # caller plans prefill_wrapper with qo=suffix over the FULL paged_kv (shared
         # prefix pages + new suffix pages), seq_lens=start, causal -> attention reads
         # the shared prefix for free.
-        positions = (
-            torch.arange(start_position, start_position + tokens, device=self.device)
-            .unsqueeze(0)
-            .expand(batch, tokens)
-        )
+        # start_position is a SCALAR (all rows share a start -- fresh/COW-suffix prefill)
+        # OR a [batch] int64 tensor of PER-REQUEST starts (batched speculative-decode
+        # verify, where desynced requests sit at different positions). Per-row:
+        # positions[i, j] = start[i] + j.
+        if isinstance(start_position, Tensor):
+            start_col = start_position.to(self.device).view(batch, 1)
+            positions = start_col + torch.arange(tokens, device=self.device).view(1, tokens)
+        else:
+            positions = (
+                torch.arange(start_position, start_position + tokens, device=self.device)
+                .unsqueeze(0)
+                .expand(batch, tokens)
+            )
         flat = positions.reshape(-1)
         cos = self.rotary_cos_cache.index_select(0, flat).view(batch, tokens, -1)
         sin = self.rotary_sin_cache.index_select(0, flat).view(batch, tokens, -1)
@@ -4700,10 +4708,10 @@ class Llama3TensorParallelForCausalLM:
             slots = (page_id * page_size + (positions - page_slot * page_size)).reshape(-1)
         else:
             ids: list[str] = []
-            pos: list[int] = []
+            row_pos = positions.tolist()  # per-row absolute positions (scalar or per-request start)
             for request_id in request_ids:
                 ids.extend([request_id] * tokens)
-                pos.extend(range(start_position, start_position + tokens))
+            pos = [p for row in row_pos for p in row]
             slots = paged_cache.slot_mapping(ids, pos)  # [batch*T], row-major (request, position)
 
         hidden = F.embedding(input_ids, self.embed_tokens_weight)
