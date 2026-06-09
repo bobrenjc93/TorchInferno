@@ -14,7 +14,18 @@ dependencies = ["huggingface-hub", "safetensors", "torch"]
 dev = ["pyflakes", "pytest", "ruff", "vulture"]
 helion = ["helion"]
 kernels = ["triton"]
-serve = ["tokenizers", "transformers"]
+# flashinfer enables the GRAPHED paged-KV decode (PagedEngine) for long-context
+# serving -- context-flat decode that fixes the dense-decode-scales-with-context
+# TPOT gap (multi_turn/long_output). It does NOT auto-select the regressive
+# flashinfer FORWARD backend: that is gated off by default now
+# (TORCHINFERNO_OPENAI_FLASHINFER_FORWARD=0), so the dense short-context forward
+# stays dense (no few_shot 64-conc regression) while long-context gets paged.
+serve = [
+    "tokenizers",
+    "transformers",
+    "flashinfer-python==0.6.8.post1",
+    "flashinfer-cubin==0.6.8.post1",
+]
 text = ["tokenizers", "transformers"]
 
 [project.scripts]

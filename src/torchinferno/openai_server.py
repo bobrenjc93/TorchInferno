@@ -1768,8 +1768,16 @@ class OpenAICompletionEngine:
             minimum=64,
         )
         unified_cache_backend = self.cache_backend
+        # Auto-selecting the flashinfer FORWARD backend for the dense short-context
+        # engine REGRESSES at 64-conc (TI's flashinfer forward wrapper is naive:
+        # few_shot TPOT 81->206). It is SEPARATE from the long-context graphed paged
+        # decode (PagedEngine), which is the validated win. Gate it (default on for
+        # back-compat) so flashinfer can be installed FOR the paged decode while the
+        # dense forward stays dense. Only override an explicitly-dense backend.
         if (
-            hasattr(self.model, "forward_step_flashinfer")
+            self.cache_backend == "dense"
+            and env_flag("TORCHINFERNO_OPENAI_FLASHINFER_FORWARD", False)
+            and hasattr(self.model, "forward_step_flashinfer")
         ):
             try:
                 import flashinfer  # noqa: F401
