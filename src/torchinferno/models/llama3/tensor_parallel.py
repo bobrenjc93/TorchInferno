@@ -1494,6 +1494,14 @@ class _Llama3TensorParallelLayer:
         attention_length: Tensor,
         attention_block_size: int | None,
     ) -> Tensor:
+        # Paged caches (cache_backend=paged) have no dense `keys`/`values` tensors --
+        # the static decode body below assumes the dense [rows, 2, max_seq, ...] layout
+        # and crashes with AttributeError('...no attribute keys'). The online batcher's
+        # eager decode for paged reaches here; route it to the paged-aware ragged decode
+        # (triton append_and_attend_ragged). cache_positions/row_indices are required for
+        # the paged path and are always provided in the indexed-rows (paged) case.
+        if callable(getattr(cache, "append_and_attend_ragged", None)) and cache_positions is not None:
+            return self._attention_decode_ragged(hidden, attn_in, rotary, cache, cache_positions, row_indices)
         from torchinferno.kernels.triton_ops import (
             triton_apply_rotary_append_kv_decode,
             triton_apply_rotary_append_kv_ragged_decode,
