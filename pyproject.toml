@@ -14,17 +14,7 @@ dependencies = ["huggingface-hub", "safetensors", "torch"]
 dev = ["pyflakes", "pytest", "ruff", "vulture"]
 helion = ["helion"]
 kernels = ["triton"]
-# flashinfer is the fast paged prefill/decode path: the online batcher
-# auto-selects the flashinfer cache backend whenever the package imports, and
-# without it serving silently falls back to eager prefill (~4x worse TTFT on
-# real 70B TP8). Pinned to the validated build; runtime degrades gracefully if
-# absent, so this only affects installs that opt into the serve extra.
-serve = [
-    "tokenizers",
-    "transformers",
-    "flashinfer-python==0.6.8.post1",
-    "flashinfer-cubin==0.6.8.post1",
-]
+serve = ["tokenizers", "transformers"]
 text = ["tokenizers", "transformers"]
 
 [project.scripts]
