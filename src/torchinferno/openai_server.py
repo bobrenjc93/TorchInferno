@@ -2746,6 +2746,23 @@ class OpenAICompletionEngine:
                 add_phase("start_sync_ms", start_sync_start_s)
                 submit_batch(initial_batch, arrival_step=0)
                 decode_quantum = env_int("TORCHINFERNO_OPENAI_TP_ONLINE_DECODE_QUANTUM", 16, minimum=1)
+                # Short-generation requests are admission-latency sensitive: the online
+                # batcher drains/admits new requests only once per decode_quantum-step
+                # burst, so for short outputs that admission wait is a large fraction of
+                # the request's lifetime and inflates TTFT under concurrency (measured:
+                # ~50-tok gen at 64-conc, TTFT 678ms at quantum 16 vs 271ms at quantum 4).
+                # Long-generation requests amortize the wait and prefer the larger quantum
+                # (fewer broadcasts -> lower TPOT). Pick a smaller quantum when the run's
+                # max output is short. General policy keyed on max_tokens, not a workload.
+                short_gen_max_tokens = env_int(
+                    "TORCHINFERNO_OPENAI_TP_ONLINE_SHORT_GEN_MAX_TOKENS", 128, minimum=1
+                )
+                if run_max_tokens <= short_gen_max_tokens:
+                    decode_quantum = env_int(
+                        "TORCHINFERNO_OPENAI_TP_ONLINE_SHORT_GEN_DECODE_QUANTUM",
+                        min(decode_quantum, 4),
+                        minimum=1,
+                    )
                 persistent = env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_PERSISTENT", False)
                 persistent_idle_s = env_float(
                     "TORCHINFERNO_OPENAI_TP_ONLINE_PERSISTENT_IDLE_MS", 10.0, minimum=0.0
