@@ -6015,7 +6015,16 @@ def _symm_mem_allreduce_enabled() -> bool:
     override = _SYMM_MEM_ALLREDUCE_ENABLED_OVERRIDE[0]
     if override is not None:
         return override
-    return _tp_flag("TORCHINFERNO_SYMM_MEM_ALLREDUCE")
+    # DEFAULT OFF: the runtime fallback (_disable_symm_reduce on a caught symm-mem
+    # exception) is PER-RANK, not collective. When multicast init fails on only a
+    # subset of ranks (observed: "init_multicast_for_block: CUDA driver error" on
+    # rank6 of a fresh remote host), those ranks fall back to NCCL while the others
+    # keep calling multimem_all_reduce_ -> mismatched collectives -> deadlock ->
+    # the server never finishes warmup -> "did not become ready within 1800s". This
+    # is torchinferno-specific (vllm uses NCCL) and host-dependent, matching the
+    # inference-bench dash runs. NCCL allreduce is the safe default; re-enable with
+    # the env flag only on hosts where symm-mem multicast is known good.
+    return _tp_flag("TORCHINFERNO_SYMM_MEM_ALLREDUCE", False)
 
 
 def _symm_mem_allreduce_graph_key(batch_size: int, world_size: int) -> int:
@@ -6041,7 +6050,10 @@ def _should_use_symm_mem_prefill_all_reduce(hidden: Tensor, weight: Tensor, worl
     return (
         world_size > 1
         and not _SYMM_REDUCE_DISABLED
-        and _tp_flag("TORCHINFERNO_SYMM_MEM_PREFILL_ALLREDUCE", True)
+        # DEFAULT OFF for the same per-rank-fallback divergence-deadlock reason as
+        # the decode path (see _symm_mem_allreduce_enabled): a subset-rank multicast
+        # init failure on a fresh remote host hangs warmup -> bench dash runs.
+        and _tp_flag("TORCHINFERNO_SYMM_MEM_PREFILL_ALLREDUCE", False)
         and hidden.is_cuda
         and weight.is_cuda
         and hidden.ndim == 3
