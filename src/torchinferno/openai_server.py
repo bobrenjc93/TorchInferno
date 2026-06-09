@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import importlib.util
 import inspect
 import json
 import os
@@ -2420,6 +2421,15 @@ class OpenAICompletionEngine:
         try:
             from torchinferno.runtime.paged_serving import PagedEngine
         except Exception:
+            return None
+        # PagedEngine's graphed decode (PagedDecodeGraphRunner) hard-requires
+        # flashinfer. The inference-bench environment does NOT install flashinfer,
+        # so building PagedEngine there raises ModuleNotFoundError mid-batcher and
+        # wedges paged serving. When flashinfer is absent, return None so the online
+        # batcher falls back to the dense _RuntimeContinuousBatchEngine driving the
+        # paged cache through the flashinfer-FREE triton append_and_attend_ragged
+        # decode (the same path the single-request solo route already uses correctly).
+        if importlib.util.find_spec("flashinfer") is None:
             return None
         page_size = int(getattr(self, "page_size", 16) or 16)
         # COW prefix caching needs the engine (its paged pool + PagedPrefixCache +
