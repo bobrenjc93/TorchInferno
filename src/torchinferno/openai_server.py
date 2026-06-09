@@ -4549,6 +4549,17 @@ class OpenAICompletionEngine:
             return
         if not _is_tensor_parallel_model(self.model) or self.device.type != "cuda":
             return
+        # Collective symm-mem handshake BEFORE the primary-only generate check, so
+        # primary + workers (synchronized here after the control-group warmup) vote
+        # together: any rank that cannot init multicast disables symm-mem on ALL ranks
+        # (no mismatched-collective deadlock). No-op when symm-mem is off.
+        try:
+            from torchinferno.models.llama3.tensor_parallel import (
+                validate_symm_mem_allreduce_collective as _validate_symm,
+            )
+            _validate_symm(self.model, self.device)
+        except Exception as exc:
+            warn_optional_failure("openai.symm_mem.collective_validate", exc)
         if not hasattr(self.model, "generate"):
             return
         if not _startup_warmup_enabled_for_cache_backend(str(getattr(self, "cache_backend", "dense"))):

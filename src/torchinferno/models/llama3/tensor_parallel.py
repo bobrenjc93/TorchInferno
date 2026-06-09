@@ -6023,16 +6023,18 @@ def _symm_mem_allreduce_enabled() -> bool:
     override = _SYMM_MEM_ALLREDUCE_ENABLED_OVERRIDE[0]
     if override is not None:
         return override
-    # DEFAULT OFF: the runtime fallback (_disable_symm_reduce on a caught symm-mem
-    # exception) is PER-RANK, not collective. When multicast init fails on only a
-    # subset of ranks (observed: "init_multicast_for_block: CUDA driver error" on
-    # rank6 of a fresh remote host), those ranks fall back to NCCL while the others
-    # keep calling multimem_all_reduce_ -> mismatched collectives -> deadlock ->
-    # the server never finishes warmup -> "did not become ready within 1800s". This
-    # is torchinferno-specific (vllm uses NCCL) and host-dependent, matching the
-    # inference-bench dash runs. NCCL allreduce is the safe default; re-enable with
-    # the env flag only on hosts where symm-mem multicast is known good.
-    return _tp_flag("TORCHINFERNO_SYMM_MEM_ALLREDUCE", False)
+    # DEFAULT ON, made safe by validate_symm_mem_allreduce_collective() at warmup.
+    # History: the per-rank runtime fallback could deadlock when multicast init failed
+    # on a subset of ranks (rank6 "CUDA driver error" -> some ranks NCCL, others
+    # multimem -> mismatched collectives -> 1800s warmup timeout = the e211b4b dash
+    # cause). The warmup handshake now votes COLLECTIVELY: any rank that cannot init
+    # multicast (a clean exception) makes ALL ranks disable symm-mem together, so there
+    # is no divergence. Good hosts keep the measured allreduce wins (same-session full
+    # bench A/B 2026-06-09: few_shot ttft -20% / tpot -7%, self_consistency ttft -6%,
+    # multi_turn tpot -7%, all correct -- the earlier "symm-mem breaks few_shot" was the
+    # SEPARATE cross-benchmark cache bug, fixed in e9d8299). Force off with the env flag
+    # set to 0 if a host HANGS (rather than cleanly errors) in symm_mem.rendezvous.
+    return _tp_flag("TORCHINFERNO_SYMM_MEM_ALLREDUCE", True)
 
 
 def _symm_mem_allreduce_graph_key(batch_size: int, world_size: int) -> int:
@@ -6074,6 +6076,40 @@ def _should_use_symm_mem_prefill_all_reduce(hidden: Tensor, weight: Tensor, worl
 def _disable_symm_reduce() -> None:
     global _SYMM_REDUCE_DISABLED
     _SYMM_REDUCE_DISABLED = True
+
+
+def validate_symm_mem_allreduce_collective(model: object, device: object) -> None:
+    # COLLECTIVE handshake (all ranks must call): probe symm-mem multicast once at
+    # warmup, then NCCL-vote so that if ANY rank cannot init multicast (the observed
+    # "init_multicast_for_block: CUDA driver error" on a fresh remote host, a clean
+    # exception), ALL ranks disable symm-mem together and fall back to NCCL. This
+    # makes symm-mem safe to default-ON: good hosts get the measured allreduce wins
+    # (few_shot ttft -20%), bad hosts fall back collectively with no mismatched-
+    # collective deadlock (the e211b4b dash cause). No-op if symm-mem is off / TP=1.
+    import torch.distributed as dist
+
+    world = _model_world_size(model)
+    if world <= 1 or not dist.is_available() or not dist.is_initialized():
+        return
+    if _SYMM_REDUCE_DISABLED or not _symm_mem_allreduce_enabled():
+        return
+    ok = 1
+    try:
+        import torch.distributed._symmetric_memory as symm_mem
+
+        group_name = dist.group.WORLD.group_name
+        hidden = int(getattr(getattr(model, "config", object()), "hidden_size", 0)) or 8192
+        buffer = symm_mem.empty((1, hidden), device=device, dtype=torch.bfloat16)
+        symm_mem.rendezvous(buffer, group_name)
+        buffer.zero_()
+        torch.ops.symm_mem.multimem_all_reduce_(buffer, "sum", group_name)
+        torch.cuda.synchronize(device)
+    except Exception:
+        ok = 0
+    flag = torch.tensor([ok], device=device, dtype=torch.int32)
+    dist.all_reduce(flag, op=dist.ReduceOp.MIN)
+    if int(flag.item()) == 0:
+        _disable_symm_reduce()
 
 
 def _rotate_interleaved_eager(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
