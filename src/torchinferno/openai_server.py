@@ -2740,6 +2740,15 @@ class OpenAICompletionEngine:
                             _reset_generation_cache(shared_cache)
                         except Exception:
                             shared_cache = None
+                    elif shared_cache is not None:
+                        # REUSED persistent cache: it still holds the PREVIOUS benchmark's
+                        # seq_len/KV. start_online -> _reset_capacity zeroes the engine's
+                        # row-seq-len tracking but NOT the external cache's content, so the
+                        # first batch of the next benchmark reads stale rows -> garbage
+                        # (observed: first few_shot run after long_output = 0/1000 correct,
+                        # subsequent runs fine). Reset the reused cache to match the engine's
+                        # fresh state. TP-symmetric: the worker does the same on its cache.
+                        _reset_generation_cache(shared_cache)
                 runtime_engine.start_online(max_seq_len=max_seq_len, external_cache=shared_cache)
                 started = True
                 _sync_tensor_parallel_command(self.model, self.device)
@@ -10515,6 +10524,11 @@ def _tensor_parallel_worker_loop(engine: OpenAICompletionEngine) -> None:
                             _reset_generation_cache(worker_shared_cache)
                         except Exception:
                             worker_shared_cache = None
+                    elif worker_shared_cache is not None:
+                        # Mirror the primary: reset the REUSED persistent cache so its
+                        # stale (previous-benchmark) seq_len/KV does not corrupt the next
+                        # benchmark's first batch. Must match the primary exactly (TP).
+                        _reset_generation_cache(worker_shared_cache)
                 online_runtime_engine.start_online(
                     max_seq_len=max_seq_len, external_cache=worker_shared_cache,
                 )
