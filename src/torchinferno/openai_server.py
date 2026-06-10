@@ -2388,7 +2388,14 @@ class OpenAICompletionEngine:
         return max(1, min(cap, effective))
 
     def _online_serving_prefix_rows(self) -> int:
-        return env_int("TORCHINFERNO_OPENAI_TP_ONLINE_PREFIX_ROWS", 2, minimum=0)
+        # 16, raised from 2. MEASURED 2026-06-10 (local 70B TP8 A/B): multi_turn
+        # (125 concurrent 8-turn conversations) thrashed a 2-slot prefix cache --
+        # each conversation's growing cross-turn prefix evicted the others, forcing
+        # re-prefill. 16 slots let many conversation prefixes stay cached: multi_turn
+        # ttft 797->716 (-10%), tput 1.4->1.7 (+23%), e2e -9%. tree/few_shot/
+        # self_consistency reuse a single in-burst common prefix so they are
+        # unaffected (prefix rows only cache prefill KV; decode is untouched).
+        return env_int("TORCHINFERNO_OPENAI_TP_ONLINE_PREFIX_ROWS", 16, minimum=0)
 
     def _should_use_tensor_parallel_online_batcher(self, first: _QueuedGeneration) -> bool:
         explicit = "TORCHINFERNO_OPENAI_TP_ONLINE_CONTINUOUS_BATCHER" in os.environ
