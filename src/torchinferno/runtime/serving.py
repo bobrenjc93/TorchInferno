@@ -947,7 +947,16 @@ class ContinuousBatchEngine:
                     plain_group = []
 
         all_fi_requests: list[tuple[int, ServingRequest, int, _ReusablePrefix | None]] = []
-        if not env_flag("TORCHINFERNO_CONTINUOUS_FLASHINFER_PREFILL_DISABLE", False):
+        # FlashInfer prefill defaults OFF. MEASURED 2026-06-10 on the real 70B TP8
+        # local full bench at 64-conc: FI-prefill ON regressed few_shot ttft
+        # 216->759ms (3.5x), tpot 73->247ms, tput 4.1->1.1 vs identical config with
+        # FI-prefill OFF. The bench's prefills are small, so FlashInfer's varlen
+        # advantage does not apply and its per-wave plan/launch overhead dominates;
+        # TI's graphed ragged prefill is already GEMM-bound and faster here. The
+        # gate was default-ON, a footgun: it auto-enables whenever flashinfer is
+        # importable, so installing flashinfer (e.g. for paged decode) would
+        # silently regress serving 3.5x. Set the flag to 0 to opt back in.
+        if not env_flag("TORCHINFERNO_CONTINUOUS_FLASHINFER_PREFILL_DISABLE", True):
             for group in prefix_batchable.values():
                 for idx, req, hit, reusable in group:
                     all_fi_requests.append((idx, req, hit, reusable))
