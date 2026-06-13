@@ -84,6 +84,8 @@ from torchinferno.openai_server import (
     _identical_prompt_cache_pool_enabled,
     _identical_prompt_prefill_graph_capture_enabled,
     _mark_generation_cache_prefix,
+    _online_common_prefix_prefill_warmup_rows,
+    _online_common_prefix_prefill_warmup_tokens,
     _online_decode_quantum,
     _online_persistent_idle_ms,
     _online_refill_min_ready_requests,
@@ -7442,6 +7444,20 @@ def test_openai_online_persistent_idle_respects_env_overrides(monkeypatch) -> No
     monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_PERSISTENT_IDLE_MS", raising=False)
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_SHORT_IDLE_MAX_TOKENS", "300")
     assert _online_persistent_idle_ms(temperature=0.7, max_tokens=300) == 100.0
+
+
+def test_online_common_prefix_prefill_warmup_filters_shapes(monkeypatch) -> None:
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_WARMUP_ONLINE_COMMON_PREFIX_ROWS", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_WARMUP_ONLINE_COMMON_PREFIX_TOKENS", raising=False)
+
+    assert _online_common_prefix_prefill_warmup_rows(69) == (53, 68)
+    assert _online_common_prefix_prefill_warmup_rows(70) == (53, 68, 69)
+    assert _online_common_prefix_prefill_warmup_tokens(64) == (45,)
+
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_WARMUP_ONLINE_COMMON_PREFIX_ROWS", "53,96,128")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_WARMUP_ONLINE_COMMON_PREFIX_TOKENS", "32,128,256")
+    assert _online_common_prefix_prefill_warmup_rows(128) == (53, 96)
+    assert _online_common_prefix_prefill_warmup_tokens(128) == (32, 128)
 
 
 def test_openai_temperature_queue_batch_wait_uses_default_window(monkeypatch) -> None:

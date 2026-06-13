@@ -183,6 +183,41 @@ def _online_persistent_idle_ms(*, temperature: float, max_tokens: int) -> float:
     )
 
 
+def _online_common_prefix_prefill_warmup_rows(cache_rows: int) -> tuple[int, ...]:
+    if cache_rows <= 0:
+        return ()
+    rows = _parse_positive_int_csv(
+        os.environ.get("TORCHINFERNO_OPENAI_WARMUP_ONLINE_COMMON_PREFIX_ROWS", "53,68,69")
+    )
+    return tuple(row for row in rows if row < cache_rows)
+
+
+def _online_common_prefix_prefill_warmup_tokens(max_seq_len: int) -> tuple[int, ...]:
+    if max_seq_len <= 0:
+        return ()
+    tokens = _parse_positive_int_csv(
+        os.environ.get("TORCHINFERNO_OPENAI_WARMUP_ONLINE_COMMON_PREFIX_TOKENS", "45")
+    )
+    return tuple(token_count for token_count in tokens if token_count <= max_seq_len)
+
+
+@contextmanager
+def _allow_prefill_graph_capture_for_cache(cache: object) -> Iterator[None]:
+    sentinel = object()
+    previous = getattr(cache, "_skip_capture_sync", sentinel)
+    try:
+        setattr(cache, "_skip_capture_sync", False)
+        yield
+    finally:
+        if previous is sentinel:
+            try:
+                delattr(cache, "_skip_capture_sync")
+            except AttributeError:
+                pass
+        else:
+            setattr(cache, "_skip_capture_sync", previous)
+
+
 @dataclass
 class _QueuedGeneration:
     prompt: list[int]
@@ -1896,6 +1931,34 @@ class OpenAICompletionEngine:
                     import sys as _wsys
                     print(f"[WARMUP] graph capture failed bs={bs}: {_warmup_exc}", file=_wsys.stderr, flush=True)
                 _reset_generation_cache(cache)
+            if env_flag("TORCHINFERNO_OPENAI_WARMUP_ONLINE_COMMON_PREFIX_PREFILL", True):
+                common_prefix_rows = _online_common_prefix_prefill_warmup_rows(cache_batch)
+                common_prefix_tokens = _online_common_prefix_prefill_warmup_tokens(max_seq_len)
+                for row in common_prefix_rows:
+                    row_cache = cache.for_rows([row])
+                    for token_count in common_prefix_tokens:
+                        _reset_generation_cache(cache)
+                        _set_generation_cache_seq_len(row_cache, 0)
+                        input_ids = (
+                            torch.arange(token_count, device=self.device, dtype=torch.long)
+                            % vocab_size
+                        )[None, :]
+                        try:
+                            with _allow_prefill_graph_capture_for_cache(row_cache):
+                                _try_prefill_logits_graph(
+                                    self.model,
+                                    input_ids,
+                                    row_cache,
+                                    allow_capture=True,
+                                )
+                        except Exception as _cpexc:
+                            import sys as _cpsys
+                            print(
+                                f"[WARMUP] online common-prefix graph row={row} tokens={token_count}: {_cpexc}",
+                                file=_cpsys.stderr,
+                                flush=True,
+                            )
+                        _reset_generation_cache(cache)
             prefill_chunk = env_int("TORCHINFERNO_OPENAI_TP_ONLINE_PREFILL_CHUNK", 0, minimum=0)
             if prefill_chunk > 0:
                 ragged_prefill_graph = getattr(self.model, "try_prefill_ragged_logits_graph", None)
