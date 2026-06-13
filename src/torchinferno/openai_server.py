@@ -116,6 +116,9 @@ def _startup_warmup_enabled_for_cache_backend(cache_backend: str) -> bool:
 def _online_refill_min_ready_requests(*, temperature: float, max_tokens: int) -> int | None:
     if "TORCHINFERNO_CONTINUOUS_ADMIT_MIN_READY_REQUESTS" in os.environ:
         return None
+    min_ready_env = "TORCHINFERNO_OPENAI_TP_ONLINE_REFILL_MIN_READY_REQUESTS"
+    if min_ready_env not in os.environ:
+        return None
     if max_tokens < 1:
         return None
     if temperature > 0.0:
@@ -127,9 +130,39 @@ def _online_refill_min_ready_requests(*, temperature: float, max_tokens: int) ->
     )
     if max_tokens > refill_max_tokens:
         return None
+    return env_int(min_ready_env, 16, minimum=1)
+
+
+def _online_decode_quantum(*, temperature: float, max_tokens: int) -> int:
+    decode_quantum = env_int("TORCHINFERNO_OPENAI_TP_ONLINE_DECODE_QUANTUM", 16, minimum=1)
+    if max_tokens < 1:
+        return decode_quantum
+    short_gen_max_tokens = env_int(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_SHORT_GEN_MAX_TOKENS",
+        400,
+        minimum=1,
+    )
+    if max_tokens > short_gen_max_tokens:
+        return decode_quantum
+    default_short_quantum = min(decode_quantum, 4)
+    if temperature <= 0.0:
+        greedy_mid_min_tokens = env_int(
+            "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_MID_GEN_MIN_TOKENS",
+            128,
+            minimum=1,
+        )
+        if max_tokens > greedy_mid_min_tokens:
+            default_short_quantum = min(
+                decode_quantum,
+                env_int(
+                    "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_MID_GEN_DECODE_QUANTUM",
+                    5,
+                    minimum=1,
+                ),
+            )
     return env_int(
-        "TORCHINFERNO_OPENAI_TP_ONLINE_REFILL_MIN_READY_REQUESTS",
-        16,
+        "TORCHINFERNO_OPENAI_TP_ONLINE_SHORT_GEN_DECODE_QUANTUM",
+        default_short_quantum,
         minimum=1,
     )
 
@@ -2806,22 +2839,10 @@ class OpenAICompletionEngine:
                 _sync_tensor_parallel_command(self.model, self.device)
                 add_phase("start_sync_ms", start_sync_start_s)
                 submit_batch(initial_batch, arrival_step=0)
-                decode_quantum = env_int("TORCHINFERNO_OPENAI_TP_ONLINE_DECODE_QUANTUM", 16, minimum=1)
-                # Short-generation requests are admission-latency sensitive: the online
-                # batcher drains/admits new requests only once per decode_quantum-step
-                # burst, so for short outputs that admission wait is a large fraction of
-                # the request's lifetime and inflates TTFT under concurrency. A 400-token
-                # cap still covers conservative short-output caps while excluding longer
-                # multi-turn contexts that prefer fewer scheduler interruptions.
-                short_gen_max_tokens = env_int(
-                    "TORCHINFERNO_OPENAI_TP_ONLINE_SHORT_GEN_MAX_TOKENS", 400, minimum=1
+                decode_quantum = _online_decode_quantum(
+                    temperature=first.temperature,
+                    max_tokens=run_max_tokens,
                 )
-                if run_max_tokens <= short_gen_max_tokens:
-                    decode_quantum = env_int(
-                        "TORCHINFERNO_OPENAI_TP_ONLINE_SHORT_GEN_DECODE_QUANTUM",
-                        min(decode_quantum, 4),
-                        minimum=1,
-                    )
                 persistent = env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_PERSISTENT", False)
                 persistent_idle_s = env_float(
                     "TORCHINFERNO_OPENAI_TP_ONLINE_PERSISTENT_IDLE_MS", 10.0, minimum=0.0
@@ -3656,7 +3677,10 @@ class OpenAICompletionEngine:
                         )
                 )
                 _sync_tensor_parallel_command(self.model, self.device)
-                decode_quantum = env_int("TORCHINFERNO_OPENAI_TP_ONLINE_DECODE_QUANTUM", 16, minimum=1)
+                decode_quantum = _online_decode_quantum(
+                    temperature=group[0].temperature,
+                    max_tokens=max_tokens,
+                )
                 while runtime_engine.has_online_work():
                     _broadcast_tensor_parallel_online_step(self.model, decode_quantum)
                     online_step_commands += 1
