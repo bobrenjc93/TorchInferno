@@ -1888,7 +1888,8 @@ class OpenAICompletionEngine:
                 print(f"[WARMUP] FlashInfer unavailable: {_fi_exc}", file=_fi_sys.stderr, flush=True)
         elif hasattr(self.model, "_fi_decode_graphs"):
             self.model._fi_decode_graphs = {}
-        if hasattr(self.model, "forward_step_flashinfer"):
+        flashinfer_available = importlib.util.find_spec("flashinfer") is not None
+        if hasattr(self.model, "forward_step_flashinfer") and flashinfer_available:
             try:
                 self._warmup_flashinfer_prefill(cache, batch_sizes, prompt_tokens)
             except Exception as _fip_exc:
@@ -1899,7 +1900,7 @@ class OpenAICompletionEngine:
         # per-bucket success flag (see _warmup_flashinfer_prefill_graphs), so the
         # in-graph allreduces always have matching partners across ranks. Safe to
         # enable by default; set the flag to 0 to fall back to eager prefill.
-        if hasattr(self.model, "capture_flashinfer_prefill_graph") and env_flag(
+        if flashinfer_available and hasattr(self.model, "capture_flashinfer_prefill_graph") and env_flag(
             "TORCHINFERNO_FI_PREFILL_GRAPH", True
         ):
             try:
