@@ -10520,9 +10520,15 @@ def test_openai_tensor_parallel_online_default_prefix_rows(monkeypatch: pytest.M
 
     monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_PREFIX_ROWS", raising=False)
     assert engine._online_serving_prefix_rows() == 64
+    assert engine._online_serving_effective_prefix_rows(48) == 64
+    assert engine._online_serving_effective_prefix_rows(128) == 16
 
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_PREFIX_ROWS", "7")
     assert engine._online_serving_prefix_rows() == 7
+    assert engine._online_serving_effective_prefix_rows(140) == 4
+
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_TOTAL_ROWS_BUDGET", "0")
+    assert engine._online_serving_effective_prefix_rows(140) == 7
 
 
 def test_kv_bounded_concurrency_cap(monkeypatch: pytest.MonkeyPatch) -> None:

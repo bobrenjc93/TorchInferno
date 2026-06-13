@@ -1761,7 +1761,7 @@ class OpenAICompletionEngine:
         max_active = self._kv_bounded_concurrency_cap()
         # Persistent cache holds active rows plus extra rows for shared prompt
         # prefixes, so the continuous batcher can prefill only suffixes.
-        total_rows = max_active + self._online_serving_prefix_rows()
+        total_rows = max_active + self._online_serving_effective_prefix_rows(max_active)
         cache_batch = total_rows
         max_seq_len = env_int(
             "TORCHINFERNO_OPENAI_UNIFIED_MAX_SEQ_LEN",
@@ -2396,6 +2396,23 @@ class OpenAICompletionEngine:
         # this adds reusable prefill KV capacity without changing decode policy.
         return env_int("TORCHINFERNO_OPENAI_TP_ONLINE_PREFIX_ROWS", 64, minimum=0)
 
+    def _online_serving_effective_prefix_rows(self, max_active: int) -> int:
+        prefix_rows = self._online_serving_prefix_rows()
+        # Keep startup/runtime dense KV under the older, known-good 144-row memory
+        # envelope by default. KV-bounded long_output can raise max_active to 128;
+        # carrying 64 prefix rows on top pushes the 70B TP8 server close to H100
+        # memory limits during startup graph warmup. The cap only trims prefix rows
+        # when high active-row concurrency needs the memory; few/self/tree/multi
+        # still keep the 64-row prefix cache under their lower active caps.
+        total_budget = env_int(
+            "TORCHINFERNO_OPENAI_TP_ONLINE_TOTAL_ROWS_BUDGET",
+            144,
+            minimum=0,
+        )
+        if total_budget <= 0:
+            return prefix_rows
+        return min(prefix_rows, max(0, total_budget - int(max_active)))
+
     def _should_use_tensor_parallel_online_batcher(self, first: _QueuedGeneration) -> bool:
         explicit = "TORCHINFERNO_OPENAI_TP_ONLINE_CONTINUOUS_BATCHER" in os.environ
         if not env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_CONTINUOUS_BATCHER", True):
@@ -2572,6 +2589,7 @@ class OpenAICompletionEngine:
                 "TORCHINFERNO_OPENAI_TP_ONLINE_KV_TOKEN_BUDGET", 48 * 512, minimum=1
             )
             max_active = max(max_active, min(self._kv_bounded_concurrency_cap(), kv_token_budget // max_seq_len))
+        prefix_rows = self._online_serving_effective_prefix_rows(max_active)
         persistent_cache = getattr(self, "_persistent_serving_cache", None)
         compat_max_seq_len = max_seq_len
         if persistent_cache is not None and hasattr(persistent_cache, "layers") and persistent_cache.layers:
