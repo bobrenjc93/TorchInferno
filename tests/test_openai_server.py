@@ -7406,10 +7406,12 @@ def test_openai_online_decode_quantum_uses_greedy_mid_cap_default(monkeypatch) -
     monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_DECODE_QUANTUM", raising=False)
     monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_SHORT_GEN_MAX_TOKENS", raising=False)
     monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_SHORT_GEN_DECODE_QUANTUM", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_GEN_MAX_TOKENS", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_GEN_DECODE_QUANTUM", raising=False)
     monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_MID_GEN_MIN_TOKENS", raising=False)
     monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_MID_GEN_DECODE_QUANTUM", raising=False)
 
-    assert _online_decode_quantum(temperature=0.0, max_tokens=64) == 4
+    assert _online_decode_quantum(temperature=0.0, max_tokens=64) == 8
     assert _online_decode_quantum(temperature=0.0, max_tokens=256) == 5
     assert _online_decode_quantum(temperature=0.7, max_tokens=256) == 4
     assert _online_decode_quantum(temperature=0.0, max_tokens=512) == 16
@@ -7421,6 +7423,9 @@ def test_openai_online_decode_quantum_respects_env_overrides(monkeypatch) -> Non
     assert _online_decode_quantum(temperature=0.0, max_tokens=256) == 3
 
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_DECODE_QUANTUM", "16")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_GEN_DECODE_QUANTUM", "7")
+    assert _online_decode_quantum(temperature=0.0, max_tokens=64) == 7
+
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_MID_GEN_DECODE_QUANTUM", "6")
     assert _online_decode_quantum(temperature=0.0, max_tokens=256) == 6
 

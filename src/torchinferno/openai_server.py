@@ -144,6 +144,20 @@ def _online_decode_quantum(*, temperature: float, max_tokens: int) -> int:
         return decode_quantum
     default_short_quantum = min(decode_quantum, 4)
     if temperature <= 0.0:
+        greedy_short_max_tokens = env_int(
+            "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_GEN_MAX_TOKENS",
+            128,
+            minimum=1,
+        )
+        if max_tokens <= greedy_short_max_tokens:
+            default_short_quantum = min(
+                decode_quantum,
+                env_int(
+                    "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_GEN_DECODE_QUANTUM",
+                    8,
+                    minimum=1,
+                ),
+            )
         greedy_mid_min_tokens = env_int(
             "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_MID_GEN_MIN_TOKENS",
             128,
