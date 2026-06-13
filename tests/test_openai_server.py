@@ -10515,6 +10515,16 @@ def test_openai_tensor_parallel_online_batcher_uses_queued_limit_for_default_row
     assert isinstance(first_queue.get_nowait(), _GenerationDone)
 
 
+def test_openai_tensor_parallel_online_default_prefix_rows(monkeypatch: pytest.MonkeyPatch) -> None:
+    engine = _cache_only_engine()
+
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_PREFIX_ROWS", raising=False)
+    assert engine._online_serving_prefix_rows() == 64
+
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_PREFIX_ROWS", "7")
+    assert engine._online_serving_prefix_rows() == 7
+
+
 def test_kv_bounded_concurrency_cap(monkeypatch: pytest.MonkeyPatch) -> None:
     model = type("FakeTPModel", (), {"world_size": 8, "rank": 0})()
     monkeypatch.setattr(
