@@ -769,6 +769,23 @@ class PagedEngine:
     def has_work(self) -> bool:
         return bool(self._pending or self._active)
 
+    def _ensure_decode_runner_capacity(self, request_ids: list[str]) -> None:
+        if self.runner is None:
+            return
+        required_pages = max(
+            (len(self.cache._sequences[rid].page_ids) for rid in request_ids),
+            default=1,
+        )
+        if required_pages <= self.runner.max_pages:
+            return
+        target_pages = max(required_pages, self.runner.max_pages * 2)
+        self.runner = PagedDecodeGraphRunner(
+            self.model,
+            self.cache,
+            batch=self.max_active,
+            max_pages=target_pages,
+        )
+
     def step(self) -> list[tuple]:
         """One continuous-batching iteration. Returns [(request_id, token, finished)]."""
         import flashinfer
@@ -845,6 +862,7 @@ class PagedEngine:
             positions = torch.tensor([a["plen"] + len(a["gen"]) - 1 for a in self._active], dtype=torch.long, device=self.dev)
             rids_active = [a["rid"] for a in self._active]
             if self.runner is not None:
+                self._ensure_decode_runner_capacity(rids_active)
                 logits = self.runner.step(tokens, positions, rids_active)
             else:
                 dw = _plan_decode(flashinfer, self.cache, rids_active, self.nqo, self.nkv, self.hd, self.page_size)
