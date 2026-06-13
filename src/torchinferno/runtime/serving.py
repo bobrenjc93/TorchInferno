@@ -2974,7 +2974,11 @@ class ContinuousBatchEngine:
         seq_lens: Tensor,
         row_indices: Tensor,
     ) -> Tensor | None:
-        fi_graphs = getattr(self.model, "_fi_decode_graphs", None)
+        fi_graphs = (
+            getattr(self.model, "_fi_decode_graphs", None)
+            if env_flag("TORCHINFERNO_FI_DECODE_GRAPH", False)
+            else None
+        )
         if fi_graphs:
             batch = input_ids.size(0)
             bucket = 1 << (batch - 1).bit_length() if batch > 1 else 1

@@ -1854,7 +1854,7 @@ class OpenAICompletionEngine:
                                 import sys as _psys
                                 print(f"[WARMUP] prefill graph bs={pbs} sb={sb}: {_pexc}", file=_psys.stderr, flush=True)
                             _reset_generation_cache(cache)
-        if hasattr(self.model, "forward_decode_flashinfer"):
+        if hasattr(self.model, "forward_decode_flashinfer") and env_flag("TORCHINFERNO_FI_DECODE_GRAPH", False):
             try:
                 import flashinfer  # noqa: F401
                 self._warmup_flashinfer_decode_graphs(cache, batch_sizes)
@@ -1865,6 +1865,8 @@ class OpenAICompletionEngine:
             except Exception as _fi_exc:
                 import sys as _fi_sys
                 print(f"[WARMUP] FlashInfer unavailable: {_fi_exc}", file=_fi_sys.stderr, flush=True)
+        elif hasattr(self.model, "_fi_decode_graphs"):
+            self.model._fi_decode_graphs = {}
         if hasattr(self.model, "forward_step_flashinfer"):
             try:
                 self._warmup_flashinfer_prefill(cache, batch_sizes, prompt_tokens)

@@ -103,6 +103,19 @@ class _StaticDecodeGraphToyModel(_RaggedGraphToyModel):
         return torch.argmax(self._logits(input_ids[:, -1] + 1)[:, -1, :], dim=-1)
 
 
+class _FiDecodeGraphFallbackToyModel(_RaggedGraphToyModel):
+    def __init__(self, vocab_size: int = 64) -> None:
+        super().__init__(vocab_size)
+        self._fi_decode_graphs = {2: object()}
+        self.ragged_token_graph_calls = 0
+
+    def try_decode_ragged_token_graph(self, input_ids, cache, *, seq_lens, row_indices, temperature=0.0):
+        del seq_lens, temperature
+        self.ragged_token_graph_calls += 1
+        cache.advance_rows(row_indices.detach().cpu().tolist(), 1)
+        return torch.argmax(self._logits(input_ids[:, -1] + 1)[:, -1, :], dim=-1)
+
+
 class _SeqLenCheckingSkewedToyModel(_RaggedGraphToyModel):
     def forward(self, input_ids, *, cache, use_cache=False):
         del use_cache
@@ -1220,6 +1233,28 @@ def test_continuous_batch_engine_dispatches_bucketed_decode_graphs() -> None:
     assert model.static_token_graph_calls == 2
     assert engine.stats.decode_graph_hits == 2
     assert engine.stats.decode_model_calls == 2
+
+
+def test_continuous_batch_engine_keeps_flashinfer_decode_graphs_opt_in(monkeypatch) -> None:
+    monkeypatch.delenv("TORCHINFERNO_FI_DECODE_GRAPH", raising=False)
+    model = _FiDecodeGraphFallbackToyModel()
+    engine = ContinuousBatchEngine(
+        model,
+        device=torch.device("cpu"),
+        max_active_requests=2,
+        prefix_cache_capacity=0,
+    )
+
+    results = engine.run(
+        [
+            ServingRequest("short", (1, 2), 3, arrival_step=0),
+            ServingRequest("long", (6, 7, 8), 3, arrival_step=0),
+        ]
+    )
+
+    assert [len(result.tokens) for result in results] == [5, 6]
+    assert model.ragged_token_graph_calls == 2
+    assert engine.stats.decode_graph_hits == 2
 
 
 def test_continuous_batch_engine_accepts_device_resident_model_wrapper() -> None:
