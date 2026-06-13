@@ -238,6 +238,7 @@ class ContinuousBatchEngine:
         pin_shared_prefix: bool = False,
         graph_prefill: bool = False,
         profile_timings: bool = False,
+        admit_min_ready_requests: int | None = None,
     ) -> None:
         if max_active_requests < 1:
             raise ValueError("max_active_requests must be positive")
@@ -281,6 +282,7 @@ class ContinuousBatchEngine:
         # so graph shapes repeat. Per-row start positions handle mixed prefixes.
         self.graph_prefill = graph_prefill
         self.profile_timings = profile_timings
+        self.admit_min_ready_requests = admit_min_ready_requests
         self.unified_forward = bool(
             env_flag("TORCHINFERNO_CONTINUOUS_UNIFIED_FORWARD", False)
             and hasattr(model, "forward_step_flashinfer")
@@ -811,7 +813,14 @@ class ContinuousBatchEngine:
         per_step_cap = env_int("TORCHINFERNO_CONTINUOUS_ADMIT_PER_STEP_CAP", 48, minimum=0)
         if per_step_cap > 0:
             capacity = min(capacity, per_step_cap)
-        min_ready_requests = env_int("TORCHINFERNO_CONTINUOUS_ADMIT_MIN_READY_REQUESTS", 1, minimum=1)
+        default_min_ready_requests = self.admit_min_ready_requests
+        if default_min_ready_requests is None:
+            default_min_ready_requests = 1
+        min_ready_requests = env_int(
+            "TORCHINFERNO_CONTINUOUS_ADMIT_MIN_READY_REQUESTS",
+            int(default_min_ready_requests),
+            minimum=1,
+        )
         if active_count > 0 and min_ready_requests > 1:
             min_ready_requests = min(min_ready_requests, capacity)
             if waiting.ready_count(step=step) < min_ready_requests:

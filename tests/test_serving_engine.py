@@ -690,6 +690,28 @@ def test_continuous_batch_engine_prefers_ready_prefix_hits() -> None:
     assert engine.stats.prefix_reuse_tokens == 3
 
 
+def test_continuous_batch_engine_can_wait_for_refill_batch() -> None:
+    model = _RaggedGraphToyModel()
+    engine = ContinuousBatchEngine(
+        model,
+        device=torch.device("cpu"),
+        max_active_requests=3,
+        admit_min_ready_requests=2,
+    )
+
+    results = engine.run(
+        [
+            ServingRequest("long", (1,), 4, arrival_step=0),
+            ServingRequest("first-refill", (2,), 1, arrival_step=1),
+            ServingRequest("second-refill", (3,), 1, arrival_step=2),
+        ]
+    )
+    by_id = {result.request_id: result for result in results}
+
+    assert by_id["first-refill"].started_step == 2
+    assert by_id["second-refill"].started_step == 2
+
+
 def test_continuous_batch_engine_batches_prefix_hit_suffix_prefill() -> None:
     model = _RaggedGraphToyModel()
     engine = ContinuousBatchEngine(

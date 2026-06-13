@@ -113,6 +113,27 @@ def _startup_warmup_enabled_for_cache_backend(cache_backend: str) -> bool:
     return env_flag("TORCHINFERNO_OPENAI_STARTUP_WARMUP_NON_DENSE_CACHE", True)
 
 
+def _online_refill_min_ready_requests(*, temperature: float, max_tokens: int) -> int | None:
+    if "TORCHINFERNO_CONTINUOUS_ADMIT_MIN_READY_REQUESTS" in os.environ:
+        return None
+    if max_tokens < 1:
+        return None
+    if temperature > 0.0:
+        return None
+    refill_max_tokens = env_int(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_REFILL_BATCH_MAX_TOKENS",
+        64,
+        minimum=1,
+    )
+    if max_tokens > refill_max_tokens:
+        return None
+    return env_int(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_REFILL_MIN_READY_REQUESTS",
+        16,
+        minimum=1,
+    )
+
+
 @dataclass
 class _QueuedGeneration:
     prompt: list[int]
@@ -2636,6 +2657,10 @@ class OpenAICompletionEngine:
                 graph_prefill=env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_GRAPH_PREFILL", True),
                 prefill_chunk_size=(env_int("TORCHINFERNO_OPENAI_TP_ONLINE_PREFILL_CHUNK", 0, minimum=0) or None),
                 profile_timings=bool(self._queue_profile_path_value()),
+                admit_min_ready_requests=_online_refill_min_ready_requests(
+                    temperature=first.temperature,
+                    max_tokens=run_max_tokens,
+                ),
             )
         decode_runner = getattr(self, "_decode_graph_runner", None)
         if decode_runner is not None:
@@ -3575,6 +3600,10 @@ class OpenAICompletionEngine:
             graph_prefill=env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_GRAPH_PREFILL", True),
             prefill_chunk_size=(env_int("TORCHINFERNO_OPENAI_TP_ONLINE_PREFILL_CHUNK", 0, minimum=0) or None),
             profile_timings=bool(self._queue_profile_path_value()),
+            admit_min_ready_requests=_online_refill_min_ready_requests(
+                temperature=group[0].temperature,
+                max_tokens=max_tokens,
+            ),
         )
         request_by_id = {str(index): request for index, request in enumerate(group)}
         row_max_tokens = [request.max_tokens for request in group]
@@ -10498,6 +10527,11 @@ def _tensor_parallel_worker_loop(engine: OpenAICompletionEngine) -> None:
                 prefix_rows = int(payload.get("prefix_cache_capacity", 0))
                 prefill_budget_value = int(payload.get("prefill_token_budget", 0))
                 temperature = float(payload.get("temperature", 0.0))
+                max_tokens = int(payload.get("max_tokens", 0))
+                admit_min_ready_requests = _online_refill_min_ready_requests(
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                )
                 # Flag-gated paged-KV worker engine -- MUST match the primary's choice
                 # (both build a PagedEngine identically + are driven by the same
                 # submit/step commands, so the deterministic page allocator keeps
@@ -10544,6 +10578,7 @@ def _tensor_parallel_worker_loop(engine: OpenAICompletionEngine) -> None:
                         pin_shared_prefix=env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_PIN_SHARED_PREFIX", True),
                         graph_prefill=env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_GRAPH_PREFILL", True),
                         prefill_chunk_size=(env_int("TORCHINFERNO_OPENAI_TP_ONLINE_PREFILL_CHUNK", 0, minimum=0) or None),
+                        admit_min_ready_requests=admit_min_ready_requests,
                     )
                 if worker_use_paged:
                     worker_shared_cache = None  # PagedEngine owns its own paged KV pool
@@ -10578,6 +10613,8 @@ def _tensor_parallel_worker_loop(engine: OpenAICompletionEngine) -> None:
                 online_runtime_engine.start_online(
                     max_seq_len=max_seq_len, external_cache=worker_shared_cache,
                 )
+                if hasattr(online_runtime_engine, "admit_min_ready_requests"):
+                    online_runtime_engine.admit_min_ready_requests = admit_min_ready_requests
                 worker_decode_runner = getattr(engine, "_decode_graph_runner", None)
                 if worker_decode_runner is not None:
                     online_runtime_engine._decode_runner = worker_decode_runner

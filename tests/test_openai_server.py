@@ -84,6 +84,7 @@ from torchinferno.openai_server import (
     _identical_prompt_cache_pool_enabled,
     _identical_prompt_prefill_graph_capture_enabled,
     _mark_generation_cache_prefix,
+    _online_refill_min_ready_requests,
     _openai_cuda_graph_enabled_for_model,
     _openai_decode_graph_enabled,
     _openai_ragged_decode_graph_enabled,
@@ -862,6 +863,7 @@ def test_tensor_parallel_worker_loop_handles_online_runtime_commands(monkeypatch
             pin_shared_prefix: bool = False,
             graph_prefill: bool = False,
             prefill_chunk_size: int | None = None,
+            admit_min_ready_requests: int | None = None,
         ) -> None:
             self.init_args = (
                 model,
@@ -875,6 +877,7 @@ def test_tensor_parallel_worker_loop_handles_online_runtime_commands(monkeypatch
                 enable_ragged_decode,
                 store_reusable_prefixes,
                 store_full_prompt_prefixes,
+                admit_min_ready_requests,
             )
             self.started: int | None = None
             self.submitted: list[object] = []
@@ -915,7 +918,7 @@ def test_tensor_parallel_worker_loop_handles_online_runtime_commands(monkeypatch
     runtime = instances[0]
     assert runtime.started == 16
     assert runtime.steps == 4
-    assert runtime.init_args[2:] == ("paged", 2, 0.25, 4, 2, 8, True, True, True)
+    assert runtime.init_args[2:] == ("paged", 2, 0.25, 4, 2, 8, True, True, True, None)
     assert [(request.prompt, request.max_new_tokens, request.arrival_step, request.eos_token_id) for request in runtime.submitted] == [
         ((1, 2), 5, 7, 0),
         ((3,), 6, 7, 0),
@@ -960,6 +963,7 @@ def test_tensor_parallel_worker_loop_receives_online_tensor_commands(monkeypatch
             pin_shared_prefix: bool = False,
             graph_prefill: bool = False,
             prefill_chunk_size: int | None = None,
+            admit_min_ready_requests: int | None = None,
         ) -> None:
             self.init_args = (
                 model,
@@ -973,6 +977,7 @@ def test_tensor_parallel_worker_loop_receives_online_tensor_commands(monkeypatch
                 enable_ragged_decode,
                 store_reusable_prefixes,
                 store_full_prompt_prefixes,
+                admit_min_ready_requests,
             )
             self.started: int | None = None
             self.submitted: list[object] = []
@@ -1018,7 +1023,7 @@ def test_tensor_parallel_worker_loop_receives_online_tensor_commands(monkeypatch
     runtime = instances[0]
     assert runtime.started == 16
     assert runtime.steps == 3
-    assert runtime.init_args[2:] == ("paged", 2, 0.25, 4, 2, 8, True, True, False)
+    assert runtime.init_args[2:] == ("paged", 2, 0.25, 4, 2, 8, True, True, False, None)
     assert [(request.request_id, request.prompt, request.max_new_tokens) for request in runtime.submitted] == [
         ("10", (1, 2), 5),
         ("11", (3,), 6),
@@ -7362,6 +7367,31 @@ def test_openai_symm_mem_scope_skips_temperature_and_long_generations(monkeypatc
         pass
 
     assert captured == [(64, True)]
+
+
+def test_openai_refill_min_ready_requests_targets_tiny_greedy_caps(monkeypatch) -> None:
+    monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_ADMIT_MIN_READY_REQUESTS", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_REFILL_BATCH_MAX_TOKENS", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_REFILL_MIN_READY_REQUESTS", raising=False)
+
+    assert _online_refill_min_ready_requests(temperature=0.0, max_tokens=45) == 16
+    assert _online_refill_min_ready_requests(temperature=0.0, max_tokens=256) is None
+    assert _online_refill_min_ready_requests(temperature=0.7, max_tokens=45) is None
+    assert _online_refill_min_ready_requests(temperature=0.0, max_tokens=0) is None
+
+
+def test_openai_refill_min_ready_requests_respects_env_overrides(monkeypatch) -> None:
+    monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_ADMIT_MIN_READY_REQUESTS", raising=False)
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_REFILL_BATCH_MAX_TOKENS", "32")
+
+    assert _online_refill_min_ready_requests(temperature=0.0, max_tokens=45) is None
+
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_REFILL_BATCH_MAX_TOKENS", "64")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_REFILL_MIN_READY_REQUESTS", "8")
+    assert _online_refill_min_ready_requests(temperature=0.0, max_tokens=45) == 8
+
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_ADMIT_MIN_READY_REQUESTS", "4")
+    assert _online_refill_min_ready_requests(temperature=0.0, max_tokens=45) is None
 
 
 def test_openai_temperature_queue_batch_wait_uses_default_window(monkeypatch) -> None:
