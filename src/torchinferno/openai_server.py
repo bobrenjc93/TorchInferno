@@ -2784,13 +2784,11 @@ class OpenAICompletionEngine:
                 # Short-generation requests are admission-latency sensitive: the online
                 # batcher drains/admits new requests only once per decode_quantum-step
                 # burst, so for short outputs that admission wait is a large fraction of
-                # the request's lifetime and inflates TTFT under concurrency (measured:
-                # ~50-tok gen at 64-conc, TTFT 678ms at quantum 16 vs 271ms at quantum 4).
-                # Long-generation requests amortize the wait and prefer the larger quantum
-                # (fewer broadcasts -> lower TPOT). Pick a smaller quantum when the run's
-                # max output is short. General policy keyed on max_tokens, not a workload.
+                # the request's lifetime and inflates TTFT under concurrency. A 400-token
+                # cap still covers conservative short-output caps while excluding longer
+                # multi-turn contexts that prefer fewer scheduler interruptions.
                 short_gen_max_tokens = env_int(
-                    "TORCHINFERNO_OPENAI_TP_ONLINE_SHORT_GEN_MAX_TOKENS", 128, minimum=1
+                    "TORCHINFERNO_OPENAI_TP_ONLINE_SHORT_GEN_MAX_TOKENS", 400, minimum=1
                 )
                 if run_max_tokens <= short_gen_max_tokens:
                     decode_quantum = env_int(
