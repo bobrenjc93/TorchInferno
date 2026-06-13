@@ -165,6 +165,24 @@ def _online_decode_quantum(*, temperature: float, max_tokens: int) -> int:
     )
 
 
+def _online_persistent_idle_ms(*, temperature: float, max_tokens: int) -> float:
+    default_idle_ms = 10.0
+    if temperature > 0.0 and 0 < max_tokens <= env_int(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_SHORT_IDLE_MAX_TOKENS",
+        256,
+        minimum=1,
+    ):
+        # Short sampled bursts often arrive in small waves from client worker
+        # pools. Keeping the online session open briefly preserves the prefix
+        # cache across those waves without raising prefill/decode batch sizes.
+        default_idle_ms = 100.0
+    return env_float(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_PERSISTENT_IDLE_MS",
+        default_idle_ms,
+        minimum=0.0,
+    )
+
+
 @dataclass
 class _QueuedGeneration:
     prompt: list[int]
@@ -2842,8 +2860,9 @@ class OpenAICompletionEngine:
                     max_tokens=run_max_tokens,
                 )
                 persistent = env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_PERSISTENT", False)
-                persistent_idle_s = env_float(
-                    "TORCHINFERNO_OPENAI_TP_ONLINE_PERSISTENT_IDLE_MS", 10.0, minimum=0.0
+                persistent_idle_s = _online_persistent_idle_ms(
+                    temperature=first.temperature,
+                    max_tokens=run_max_tokens,
                 ) / 1000.0
                 while True:
                     drain_ready(step)
