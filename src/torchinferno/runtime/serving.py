@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import time
 from collections import defaultdict
 from dataclasses import dataclass
@@ -12,6 +13,17 @@ from torch import Tensor
 from torchinferno.runtime.options import env_flag, env_int
 from torchinferno.runtime.prefix_cache import PrefixCacheIndex
 from torchinferno.runtime.sampling import sample_next_token
+
+
+def _fi_decode_graph_mode() -> str:
+    raw = os.environ.get("TORCHINFERNO_FI_DECODE_GRAPH", "sampled").strip().lower()
+    if raw in {"1", "true", "yes", "on", "always"}:
+        return "always"
+    if raw in {"0", "false", "no", "off", "never", ""}:
+        return "off"
+    if raw in {"sample", "sampled", "auto"}:
+        return "sampled"
+    return "off"
 
 
 @dataclass(frozen=True)
@@ -2974,9 +2986,13 @@ class ContinuousBatchEngine:
         seq_lens: Tensor,
         row_indices: Tensor,
     ) -> Tensor | None:
+        fi_decode_mode = _fi_decode_graph_mode()
+        use_fi_decode = fi_decode_mode == "always" or (
+            fi_decode_mode == "sampled" and float(self.temperature) > 0.0
+        )
         fi_graphs = (
             getattr(self.model, "_fi_decode_graphs", None)
-            if env_flag("TORCHINFERNO_FI_DECODE_GRAPH", False)
+            if use_fi_decode
             else None
         )
         if fi_graphs:

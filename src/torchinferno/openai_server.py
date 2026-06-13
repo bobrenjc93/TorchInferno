@@ -1854,7 +1854,7 @@ class OpenAICompletionEngine:
                                 import sys as _psys
                                 print(f"[WARMUP] prefill graph bs={pbs} sb={sb}: {_pexc}", file=_psys.stderr, flush=True)
                             _reset_generation_cache(cache)
-        if hasattr(self.model, "forward_decode_flashinfer") and env_flag("TORCHINFERNO_FI_DECODE_GRAPH", False):
+        if hasattr(self.model, "forward_decode_flashinfer") and _fi_decode_graph_mode() != "off":
             try:
                 import flashinfer  # noqa: F401
                 self._warmup_flashinfer_decode_graphs(cache, batch_sizes)
@@ -9165,6 +9165,17 @@ def _tensor_parallel_symm_mem_allreduce_scope(
         return nullcontext()
     max_batch = env_int("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_MAX_BATCH", 64, minimum=1)
     return symm_mem_allreduce_max_batch(max_batch, enabled=True)
+
+
+def _fi_decode_graph_mode() -> str:
+    raw = os.environ.get("TORCHINFERNO_FI_DECODE_GRAPH", "sampled").strip().lower()
+    if raw in {"1", "true", "yes", "on", "always"}:
+        return "always"
+    if raw in {"0", "false", "no", "off", "never", ""}:
+        return "off"
+    if raw in {"sample", "sampled", "auto"}:
+        return "sampled"
+    return "off"
 
 
 def _effective_openai_max_batch_size(model: object, device: torch.device, requested: int) -> int:
