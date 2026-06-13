@@ -1064,8 +1064,35 @@ class ContinuousBatchEngine:
                 prefix_row,
                 prefix_logits,
             )
+            reusable = self.reusable_prefixes.get(common_route)
             if self.pin_shared_prefix and common_route in self.reusable_prefixes:
                 self._pinned_prefix_routes.add(common_route)
+
+            # Folding the common-prefix KV copy into the ragged suffix graph wins
+            # for short shared prefixes, but long shared prefixes are copy-heavy
+            # enough that the older cache-view path is faster.
+            max_ragged_prefix_tokens = env_int(
+                "TORCHINFERNO_CONTINUOUS_COMMON_PREFIX_RAGGED_SUFFIX_MAX_PREFIX_TOKENS",
+                64,
+                minimum=0,
+            )
+            if (
+                self.graph_prefill
+                and reusable is not None
+                and max_ragged_prefix_tokens > 0
+                and prefix_tokens <= max_ragged_prefix_tokens
+                and all(len(request.prompt) > prefix_tokens for _index, request, _hit in group)
+            ):
+                graph_active = self._prefill_prefix_graph_batch(
+                    [
+                        (original_index, request, prefix_tokens, reusable)
+                        for original_index, request, _prefix_hit_tokens in group
+                    ],
+                    step,
+                    events=events,
+                )
+                if graph_active is not None:
+                    return graph_active
 
             padded_active = self._prefill_common_prefix_padded_suffix_batch(
                 group,

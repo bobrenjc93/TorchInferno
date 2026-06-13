@@ -723,6 +723,67 @@ def test_continuous_batch_engine_can_pad_common_prefix_suffix_prefill(monkeypatc
     assert engine.stats.max_model_batch_size == 3
 
 
+def test_continuous_batch_engine_graphs_initial_common_prefix_suffixes() -> None:
+    shared = tuple(range(16))
+    model = _SelectedLogitsToyModel()
+    engine = ContinuousBatchEngine(
+        model,
+        device=torch.device("cpu"),
+        max_active_requests=4,
+        prefix_cache_capacity=4,
+        graph_prefill=True,
+    )
+    requests = [
+        ServingRequest("a", (*shared, 21), 1, arrival_step=0),
+        ServingRequest("b", (*shared, 22, 23, 24), 1, arrival_step=0),
+        ServingRequest("c", (*shared, 25, 26), 1, arrival_step=0),
+    ]
+
+    results = engine.run(requests)
+
+    assert [result.tokens[-1] for result in results] == [22, 25, 27]
+    assert sorted(model.selected_positions[-1]) == [0, 0, 1, 2]
+    assert engine.stats.prefill_common_prefix_batches == 1
+    assert engine.stats.prefill_prefix_reuse_batches == 1
+    assert engine.stats.prefill_padded_suffix_batches == 1
+    assert engine.stats.prefill_graph_hits == 1
+    assert engine.stats.prefill_model_calls == 2
+    assert engine.stats.prefill_tokens == 25
+    assert engine.stats.prefix_reuse_requests == 3
+    assert engine.stats.prefix_reuse_tokens == 48
+
+
+def test_continuous_batch_engine_respects_common_prefix_ragged_suffix_threshold(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv(
+        "TORCHINFERNO_CONTINUOUS_COMMON_PREFIX_RAGGED_SUFFIX_MAX_PREFIX_TOKENS",
+        "8",
+    )
+    shared = tuple(range(16))
+    model = _SelectedLogitsToyModel()
+    engine = ContinuousBatchEngine(
+        model,
+        device=torch.device("cpu"),
+        max_active_requests=3,
+        prefix_cache_capacity=4,
+        graph_prefill=True,
+    )
+    requests = [
+        ServingRequest("a", (*shared, 21), 1, arrival_step=0),
+        ServingRequest("b", (*shared, 22, 23, 24), 1, arrival_step=0),
+        ServingRequest("c", (*shared, 25, 26), 1, arrival_step=0),
+    ]
+
+    results = engine.run(requests)
+
+    assert [result.tokens[-1] for result in results] == [22, 25, 27]
+    assert engine.stats.prefill_common_prefix_batches == 1
+    assert engine.stats.prefill_prefix_reuse_batches == 0
+    assert engine.stats.prefill_graph_hits == 0
+    assert engine.stats.prefix_reuse_requests == 0
+
+
 def test_continuous_batch_engine_reuses_common_prefix_for_padded_refill(monkeypatch) -> None:
     monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PADDED_SUFFIX_PREFILL", "1")
     shared = tuple(range(16))
