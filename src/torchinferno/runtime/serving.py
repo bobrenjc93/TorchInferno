@@ -1111,10 +1111,11 @@ class ContinuousBatchEngine:
                 suffix_groups[len(request.prompt) - prefix_tokens].append((original_index, request, 0))
             for suffix_group in suffix_groups.values():
                 rows = [self._acquire_active_row() for _ in suffix_group]
-                suffixes = []
-                for row, (_original_index, request, _prefix_hit_tokens) in zip(rows, suffix_group):
-                    self._copy_prefix(prefix_row, row, prefix_tokens)
-                    suffixes.append(request.prompt[prefix_tokens:])
+                self._copy_prefix_to_rows(prefix_row, rows, prefix_tokens)
+                suffixes = [
+                    request.prompt[prefix_tokens:]
+                    for _original_index, request, _prefix_hit_tokens in suffix_group
+                ]
 
                 if not suffixes or not suffixes[0]:
                     logits = prefix_logits.expand(len(suffix_group), -1, -1)

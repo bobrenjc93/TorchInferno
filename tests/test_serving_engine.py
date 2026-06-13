@@ -666,7 +666,7 @@ def test_continuous_batch_engine_splits_prefix_hit_suffixes_by_prefix_length() -
     assert engine.stats.prefix_reuse_tokens == 8
 
 
-def test_continuous_batch_engine_batches_common_prefix_prefill() -> None:
+def test_continuous_batch_engine_batches_common_prefix_prefill(monkeypatch) -> None:
     shared = tuple(range(16))
     model = _RaggedGraphToyModel()
     engine = ContinuousBatchEngine(
@@ -675,6 +675,18 @@ def test_continuous_batch_engine_batches_common_prefix_prefill() -> None:
         max_active_requests=3,
         prefix_cache_capacity=4,
     )
+    copied_prefix_groups: list[tuple[int, int]] = []
+    original_copy_prefix_to_rows = engine._copy_prefix_to_rows
+
+    def record_copy_prefix_to_rows(
+        source_row: int,
+        dest_rows: list[int],
+        tokens: int,
+    ) -> None:
+        copied_prefix_groups.append((len(dest_rows), tokens))
+        original_copy_prefix_to_rows(source_row, dest_rows, tokens)
+
+    monkeypatch.setattr(engine, "_copy_prefix_to_rows", record_copy_prefix_to_rows)
     baseline_model = _RaggedGraphToyModel()
     baseline = ContinuousBatchEngine(
         baseline_model,
@@ -696,6 +708,7 @@ def test_continuous_batch_engine_batches_common_prefix_prefill() -> None:
     assert engine.stats.prefill_model_calls == 2
     assert engine.stats.prefill_tokens == 19
     assert engine.stats.max_model_batch_size == 3
+    assert copied_prefix_groups == [(3, len(shared))]
 
 
 def test_continuous_batch_engine_can_pad_common_prefix_suffix_prefill(monkeypatch) -> None:
