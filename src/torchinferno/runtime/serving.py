@@ -3107,7 +3107,7 @@ def _common_prefix_token_count(prompts: list[tuple[int, ...]]) -> int:
     if min_len <= 1:
         return 0
     prefix_tokens = 0
-    for offset in range(min_len - 1):
+    for offset in range(min_len):
         token = prompts[0][offset]
         if any(prompt[offset] != token for prompt in prompts[1:]):
             break

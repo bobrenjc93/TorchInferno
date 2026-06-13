@@ -797,6 +797,39 @@ def test_continuous_batch_engine_graph_prefill_buckets_batch_and_matches() -> No
     assert engine.stats.prefix_reuse_requests >= 3
 
 
+def test_continuous_batch_engine_reuses_exact_common_prompt_without_suffix_prefill() -> None:
+    prompt = tuple(range(1, 18))
+    model = _SelectedLogitsToyModel()
+    engine = ContinuousBatchEngine(
+        model,
+        device=torch.device("cpu"),
+        max_active_requests=2,
+        prefix_cache_capacity=4,
+        pin_shared_prefix=True,
+        graph_prefill=True,
+    )
+
+    results = engine.run(
+        [
+            ServingRequest("warm-a", prompt, 1, arrival_step=0),
+            ServingRequest("warm-b", prompt, 1, arrival_step=0),
+            ServingRequest("late-a", prompt, 1, arrival_step=1),
+            ServingRequest("late-b", prompt, 1, arrival_step=1),
+        ]
+    )
+    by_id = {result.request_id: result for result in results}
+
+    assert [result.tokens[-1] for result in results] == [18, 18, 18, 18]
+    assert by_id["late-a"].prefix_hit_tokens == len(prompt)
+    assert by_id["late-b"].prefix_hit_tokens == len(prompt)
+    assert engine.stats.prefill_common_prefix_batches == 1
+    assert engine.stats.prefill_prefix_reuse_batches == 1
+    assert engine.stats.prefill_model_calls == 1
+    assert engine.stats.prefill_tokens == len(prompt)
+    assert engine.stats.prefix_reuse_requests == 2
+    assert engine.stats.prefix_reuse_tokens == 2 * len(prompt)
+
+
 def test_continuous_batch_engine_chunked_prefill_matches_one_shot() -> None:
     # Chunked prefill (prefill_chunk_size) advances a prompt in bounded chunks
     # across online steps; it must produce identical tokens to one-shot prefill.
