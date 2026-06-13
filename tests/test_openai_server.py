@@ -7370,12 +7370,13 @@ def test_openai_symm_mem_scope_skips_temperature_and_long_generations(monkeypatc
     assert captured == [(64, True)]
 
 
-def test_openai_refill_min_ready_requests_is_opt_in_for_tiny_greedy_caps(monkeypatch) -> None:
+def test_openai_refill_min_ready_requests_defaults_for_short_greedy_caps(monkeypatch) -> None:
     monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_ADMIT_MIN_READY_REQUESTS", raising=False)
     monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_REFILL_BATCH_MAX_TOKENS", raising=False)
     monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_REFILL_MIN_READY_REQUESTS", raising=False)
 
-    assert _online_refill_min_ready_requests(temperature=0.0, max_tokens=45) is None
+    assert _online_refill_min_ready_requests(temperature=0.0, max_tokens=45) == 8
+    assert _online_refill_min_ready_requests(temperature=0.0, max_tokens=128) == 8
 
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_REFILL_MIN_READY_REQUESTS", "16")
     assert _online_refill_min_ready_requests(temperature=0.0, max_tokens=45) == 16

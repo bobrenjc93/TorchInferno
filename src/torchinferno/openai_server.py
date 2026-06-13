@@ -117,20 +117,18 @@ def _online_refill_min_ready_requests(*, temperature: float, max_tokens: int) ->
     if "TORCHINFERNO_CONTINUOUS_ADMIT_MIN_READY_REQUESTS" in os.environ:
         return None
     min_ready_env = "TORCHINFERNO_OPENAI_TP_ONLINE_REFILL_MIN_READY_REQUESTS"
-    if min_ready_env not in os.environ:
-        return None
     if max_tokens < 1:
         return None
     if temperature > 0.0:
         return None
     refill_max_tokens = env_int(
         "TORCHINFERNO_OPENAI_TP_ONLINE_REFILL_BATCH_MAX_TOKENS",
-        64,
+        128,
         minimum=1,
     )
     if max_tokens > refill_max_tokens:
         return None
-    return env_int(min_ready_env, 16, minimum=1)
+    return env_int(min_ready_env, 8, minimum=1)
 
 
 def _online_decode_quantum(*, temperature: float, max_tokens: int) -> int:
