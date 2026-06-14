@@ -49,11 +49,25 @@ class PrefixCacheIndex:
         self._router.add_prefix(token_tuple, actual_route)
         return entry
 
+    def remove(self, route_id: Hashable) -> bool:
+        entry = self._entries.get(route_id)
+        if entry is None:
+            return False
+        removed = self._router.remove_prefix(entry.tokens, route_id)
+        if removed:
+            self._entries.pop(route_id, None)
+        return removed
+
     def lookup(self, tokens: Iterable[int]) -> tuple[PrefixMatch, PrefixCacheEntry | None]:
-        match = self._router.route(tokens)
-        if match.route_id is None:
-            return match, None
-        return match, self._entries[match.route_id]
+        token_tuple = tuple(int(token) for token in tokens)
+        match = self._router.route(token_tuple)
+        while match.route_id is not None:
+            entry = self._entries.get(match.route_id)
+            if entry is not None:
+                return match, entry
+            self._router.remove_prefix(match.matched_tokens, match.route_id)
+            match = self._router.route(token_tuple)
+        return match, None
 
 
 def cache_sequence_length(cache: object) -> int:

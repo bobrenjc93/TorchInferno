@@ -63,6 +63,99 @@ def test_llama3_tensor_parallel_greedy_sampler_all_reduce_opt_out(monkeypatch) -
     assert sampled.tolist() == [5]
 
 
+def test_tensor_parallel_remote_checkpoint_resolves_on_rank_zero(tmp_path, monkeypatch) -> None:
+    snapshot = tmp_path / "snapshot"
+    cache_dir = tmp_path / "cache"
+    calls: list[tuple[object, object, object, object]] = []
+
+    monkeypatch.setattr(tensor_parallel_module.dist, "is_available", lambda: True)
+    monkeypatch.setattr(tensor_parallel_module.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(tensor_parallel_module.dist, "get_world_size", lambda: 2)
+    monkeypatch.setattr(tensor_parallel_module.dist, "get_rank", lambda: 0)
+
+    def resolve(checkpoint: object, *, token: object, revision: object, cache_dir: object) -> Path:
+        calls.append((checkpoint, token, revision, cache_dir))
+        return snapshot
+
+    def broadcast(objects: list[object], *, src: int, device: torch.device) -> None:
+        assert src == 0
+        assert device == torch.device("cpu")
+        assert objects == [str(snapshot)]
+
+    monkeypatch.setattr(tensor_parallel_module, "resolve_llama3_checkpoint", resolve)
+    monkeypatch.setattr(tensor_parallel_module, "_broadcast_object_list", broadcast)
+
+    root = tensor_parallel_module._resolve_tensor_parallel_checkpoint(
+        "org/model",
+        token="hf-token",
+        revision="main",
+        cache_dir=cache_dir,
+        device=torch.device("cpu"),
+    )
+
+    assert root == snapshot
+    assert calls == [("org/model", "hf-token", "main", cache_dir)]
+
+
+def test_tensor_parallel_remote_checkpoint_nonzero_rank_waits_for_broadcast(tmp_path, monkeypatch) -> None:
+    snapshot = tmp_path / "snapshot"
+
+    monkeypatch.setattr(tensor_parallel_module.dist, "is_available", lambda: True)
+    monkeypatch.setattr(tensor_parallel_module.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(tensor_parallel_module.dist, "get_world_size", lambda: 2)
+    monkeypatch.setattr(tensor_parallel_module.dist, "get_rank", lambda: 1)
+
+    def resolve(*args: object, **kwargs: object) -> Path:
+        raise AssertionError("nonzero ranks should not resolve remote checkpoints")
+
+    def broadcast(objects: list[object], *, src: int, device: torch.device) -> None:
+        assert src == 0
+        objects[0] = str(snapshot)
+
+    monkeypatch.setattr(tensor_parallel_module, "resolve_llama3_checkpoint", resolve)
+    monkeypatch.setattr(tensor_parallel_module, "_broadcast_object_list", broadcast)
+
+    root = tensor_parallel_module._resolve_tensor_parallel_checkpoint(
+        "org/model",
+        token=None,
+        revision=None,
+        cache_dir=None,
+        device=torch.device("cpu"),
+    )
+
+    assert root == snapshot
+
+
+def test_tensor_parallel_local_checkpoint_bypasses_distributed_broadcast(tmp_path, monkeypatch) -> None:
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+
+    monkeypatch.setattr(tensor_parallel_module.dist, "is_available", lambda: True)
+    monkeypatch.setattr(tensor_parallel_module.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(tensor_parallel_module.dist, "get_world_size", lambda: 2)
+    monkeypatch.setattr(tensor_parallel_module.dist, "get_rank", lambda: 1)
+    monkeypatch.setattr(
+        tensor_parallel_module,
+        "resolve_llama3_checkpoint",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("local path should not resolve")),
+    )
+    monkeypatch.setattr(
+        tensor_parallel_module,
+        "_broadcast_object_list",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("local path should not broadcast")),
+    )
+
+    root = tensor_parallel_module._resolve_tensor_parallel_checkpoint(
+        checkpoint,
+        token=None,
+        revision=None,
+        cache_dir=None,
+        device=torch.device("cpu"),
+    )
+
+    assert root == checkpoint
+
+
 def test_llama3_tensor_parallel_paged_cache_matches_dense_forward(tmp_path, monkeypatch) -> None:
     torch.manual_seed(9002)
     config = tiny_llama3_config(vocab_size=32, max_position_embeddings=16)

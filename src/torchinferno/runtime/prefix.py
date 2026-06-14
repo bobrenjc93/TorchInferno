@@ -32,6 +32,20 @@ class RadixPrefixTree:
             node = node.children.setdefault(int(token), _RadixNode())
         node.route_id = route_id
 
+    def remove(self, tokens: Iterable[int], route_id: Hashable | None = None) -> bool:
+        node = self._root
+        for token in tokens:
+            token = int(token)
+            if token not in node.children:
+                return False
+            node = node.children[token]
+        if route_id is not None and node.route_id != route_id:
+            return False
+        if node.route_id is None:
+            return False
+        node.route_id = None
+        return True
+
     def longest_prefix(self, tokens: Iterable[int]) -> PrefixMatch:
         node = self._root
         best_route = node.route_id
@@ -56,6 +70,9 @@ class PrefixAwareRouter:
 
     def add_prefix(self, tokens: Iterable[int], route_id: Hashable) -> None:
         self._tree.insert(tokens, route_id)
+
+    def remove_prefix(self, tokens: Iterable[int], route_id: Hashable | None = None) -> bool:
+        return self._tree.remove(tokens, route_id)
 
     def route(self, prompt: Iterable[int]) -> PrefixMatch:
         match = self._tree.longest_prefix(prompt)

@@ -113,6 +113,21 @@ def _startup_warmup_enabled_for_cache_backend(cache_backend: str) -> bool:
     return env_flag("TORCHINFERNO_OPENAI_STARTUP_WARMUP_NON_DENSE_CACHE", True)
 
 
+def _flashinfer_prefill_warmup_batch_sizes(batch_sizes: Sequence[int]) -> tuple[int, ...]:
+    if not batch_sizes:
+        return ()
+    max_batch = max(int(batch) for batch in batch_sizes)
+    if max_batch <= 0:
+        return ()
+    cap = env_int("TORCHINFERNO_OPENAI_WARMUP_FLASHINFER_PREFILL_MAX_BATCH", 8, minimum=1)
+    capped_batch = min(max_batch, cap)
+    return tuple(sorted({1, capped_batch}))
+
+
+def _flashinfer_prefill_runtime_enabled() -> bool:
+    return not env_flag("TORCHINFERNO_CONTINUOUS_FLASHINFER_PREFILL_DISABLE", True)
+
+
 def _online_refill_min_ready_requests(*, temperature: float, max_tokens: int) -> int | None:
     if "TORCHINFERNO_CONTINUOUS_ADMIT_MIN_READY_REQUESTS" in os.environ:
         return None
@@ -123,12 +138,46 @@ def _online_refill_min_ready_requests(*, temperature: float, max_tokens: int) ->
         return None
     refill_max_tokens = env_int(
         "TORCHINFERNO_OPENAI_TP_ONLINE_REFILL_BATCH_MAX_TOKENS",
-        128,
+        512,
         minimum=1,
     )
     if max_tokens > refill_max_tokens:
         return None
     return env_int(min_ready_env, 8, minimum=1)
+
+
+def _online_kv_bounded_concurrency_enabled(*, temperature: float, max_tokens: int) -> bool:
+    if not env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_KV_BOUNDED_CONCURRENCY", True):
+        return False
+    if max_tokens < 1:
+        return False
+    if temperature > 0.0:
+        if not env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_KV_BOUNDED_ALLOW_SAMPLED", True):
+            return False
+        sampled_max_tokens = env_int(
+            "TORCHINFERNO_OPENAI_TP_ONLINE_KV_BOUNDED_SAMPLED_MAX_TOKENS",
+            256,
+            minimum=1,
+        )
+        return max_tokens <= sampled_max_tokens
+    greedy_max_tokens = env_int(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_KV_BOUNDED_GREEDY_MAX_TOKENS",
+        128,
+        minimum=1,
+    )
+    return max_tokens <= greedy_max_tokens
+
+
+def _online_kv_bounded_max_active_cap(*, temperature: float, base_cap: int) -> int:
+    cap = max(1, int(base_cap))
+    if temperature > 0.0:
+        return cap
+    greedy_cap_env = "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_KV_MAX_ACTIVE_CAP"
+    if greedy_cap_env in os.environ:
+        return min(cap, env_int(greedy_cap_env, cap, minimum=1))
+    if "TORCHINFERNO_OPENAI_TP_ONLINE_KV_MAX_ACTIVE_CAP" in os.environ:
+        return cap
+    return min(cap, env_int(greedy_cap_env, 96, minimum=1))
 
 
 def _online_decode_quantum(*, temperature: float, max_tokens: int) -> int:
@@ -179,6 +228,10 @@ def _online_decode_quantum(*, temperature: float, max_tokens: int) -> int:
     )
 
 
+def _online_step_sync_enabled() -> bool:
+    return env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_STEP_SYNC", True)
+
+
 def _online_persistent_idle_ms(*, temperature: float, max_tokens: int) -> float:
     default_idle_ms = 10.0
     if temperature > 0.0 and 0 < max_tokens <= env_int(
@@ -197,12 +250,43 @@ def _online_persistent_idle_ms(*, temperature: float, max_tokens: int) -> float:
     )
 
 
-def _online_common_prefix_prefill_warmup_rows(cache_rows: int) -> tuple[int, ...]:
+def _online_initial_batch_wait_ms(*, temperature: float, max_tokens: int) -> float:
+    global_env = "TORCHINFERNO_OPENAI_TP_ONLINE_INITIAL_BATCH_WAIT_MS"
+    if global_env in os.environ:
+        return env_float(global_env, 1.0, minimum=0.0)
+    default_wait_ms = 1.0
+    if temperature > 0.0 and 0 < max_tokens <= env_int(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_SHORT_INITIAL_BATCH_WAIT_MAX_TOKENS",
+        400,
+        minimum=1,
+    ):
+        default_wait_ms = env_float(
+            "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_SHORT_INITIAL_BATCH_WAIT_MS",
+            25.0,
+            minimum=0.0,
+        )
+    elif temperature <= 0.0 and 0 < max_tokens <= env_int(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_INITIAL_BATCH_WAIT_MAX_TOKENS",
+        128,
+        minimum=1,
+    ):
+        default_wait_ms = env_float(
+            "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_INITIAL_BATCH_WAIT_MS",
+            1.0,
+            minimum=0.0,
+        )
+    return default_wait_ms
+
+
+def _online_common_prefix_prefill_warmup_rows(cache_rows: int, max_active: int | None = None) -> tuple[int, ...]:
     if cache_rows <= 0:
         return ()
+    configured = os.environ.get("TORCHINFERNO_OPENAI_WARMUP_ONLINE_COMMON_PREFIX_ROWS")
     rows = _parse_positive_int_csv(
-        os.environ.get("TORCHINFERNO_OPENAI_WARMUP_ONLINE_COMMON_PREFIX_ROWS", "53,68,69")
+        configured if configured is not None else "48,53,68,69"
     )
+    if configured is None and max_active is not None and 0 < max_active < cache_rows:
+        rows = tuple(sorted({*rows, int(max_active)}))
     return tuple(row for row in rows if row < cache_rows)
 
 
@@ -213,6 +297,32 @@ def _online_common_prefix_prefill_warmup_tokens(max_seq_len: int) -> tuple[int, 
         os.environ.get("TORCHINFERNO_OPENAI_WARMUP_ONLINE_COMMON_PREFIX_TOKENS", "45")
     )
     return tuple(token_count for token_count in tokens if token_count <= max_seq_len)
+
+
+def _online_common_prefix_suffix_prefill_warmup_tokens(max_seq_len: int) -> tuple[int, ...]:
+    if max_seq_len <= 0:
+        return ()
+    tokens = _parse_positive_int_csv(
+        os.environ.get("TORCHINFERNO_OPENAI_WARMUP_ONLINE_COMMON_PREFIX_SUFFIX_TOKENS", "16")
+    )
+    return tuple(token_count for token_count in tokens if token_count <= max_seq_len)
+
+
+def _online_common_prefix_suffix_prefill_warmup_batches(cache_rows: int, max_active: int) -> tuple[int, ...]:
+    if cache_rows <= 0 or max_active <= 0:
+        return ()
+    configured = os.environ.get("TORCHINFERNO_OPENAI_WARMUP_ONLINE_COMMON_PREFIX_SUFFIX_BATCHES")
+    if configured is not None:
+        batches = _parse_positive_int_csv(configured)
+    else:
+        batches_set = {max_active}
+        batch = 1
+        while batch < max_active:
+            batches_set.add(batch)
+            batch *= 2
+        batches = tuple(sorted(batches_set))
+    limit = min(cache_rows, max_active)
+    return tuple(batch for batch in batches if 0 < batch <= limit)
 
 
 @contextmanager
@@ -1946,8 +2056,22 @@ class OpenAICompletionEngine:
                     print(f"[WARMUP] graph capture failed bs={bs}: {_warmup_exc}", file=_wsys.stderr, flush=True)
                 _reset_generation_cache(cache)
             if env_flag("TORCHINFERNO_OPENAI_WARMUP_ONLINE_COMMON_PREFIX_PREFILL", True):
-                common_prefix_rows = _online_common_prefix_prefill_warmup_rows(cache_batch)
+                common_prefix_rows = _online_common_prefix_prefill_warmup_rows(cache_batch, max_active)
                 common_prefix_tokens = _online_common_prefix_prefill_warmup_tokens(max_seq_len)
+                warm_suffix_prefill = env_flag(
+                    "TORCHINFERNO_OPENAI_WARMUP_ONLINE_COMMON_PREFIX_SUFFIX_PREFILL",
+                    True,
+                )
+                ragged_prefill_graph = (
+                    getattr(self.model, "try_prefill_ragged_logits_graph", None)
+                    if warm_suffix_prefill
+                    else None
+                )
+                common_prefix_suffix_tokens = _online_common_prefix_suffix_prefill_warmup_tokens(max_seq_len)
+                common_prefix_suffix_batches = _online_common_prefix_suffix_prefill_warmup_batches(
+                    cache_batch,
+                    max_active,
+                )
                 for row in common_prefix_rows:
                     row_cache = cache.for_rows([row])
                     for token_count in common_prefix_tokens:
@@ -1965,6 +2089,7 @@ class OpenAICompletionEngine:
                                     row_cache,
                                     allow_capture=True,
                                 )
+                            _set_generation_cache_seq_len(row_cache, token_count)
                         except Exception as _cpexc:
                             import sys as _cpsys
                             print(
@@ -1972,6 +2097,51 @@ class OpenAICompletionEngine:
                                 file=_cpsys.stderr,
                                 flush=True,
                             )
+                            continue
+                        if ragged_prefill_graph is not None:
+                            for suffix_tokens in common_prefix_suffix_tokens:
+                                if token_count + suffix_tokens > max_seq_len:
+                                    continue
+                                for batch_size in common_prefix_suffix_batches:
+                                    if batch_size > row:
+                                        continue
+                                    suffix_ids = torch.zeros(
+                                        batch_size,
+                                        suffix_tokens,
+                                        dtype=torch.long,
+                                        device=self.device,
+                                    )
+                                    row_indices = torch.arange(batch_size, dtype=torch.long, device=self.device)
+                                    required = max(row, batch_size - 1) + 1
+                                    seq_lens = torch.zeros(required, dtype=torch.long, device=self.device)
+                                    seq_lens[row_indices] = token_count
+                                    seq_lens[row] = token_count
+                                    logit_positions = torch.full(
+                                        (batch_size,),
+                                        suffix_tokens - 1,
+                                        dtype=torch.long,
+                                        device=self.device,
+                                    )
+                                    src_prefix_row = torch.tensor([row], dtype=torch.long, device=self.device)
+                                    try:
+                                        ragged_prefill_graph(
+                                            suffix_ids,
+                                            cache,
+                                            seq_lens=seq_lens,
+                                            row_indices=row_indices,
+                                            logit_positions=logit_positions,
+                                            context_len=token_count + suffix_tokens,
+                                            src_prefix_row=src_prefix_row,
+                                        )
+                                    except Exception as _sp_exc:
+                                        import sys as _spsys
+                                        print(
+                                            f"[WARMUP] online common-prefix suffix graph "
+                                            f"row={row} prefix={token_count} suffix={suffix_tokens} "
+                                            f"batch={batch_size}: {_sp_exc}",
+                                            file=_spsys.stderr,
+                                            flush=True,
+                                        )
                         _reset_generation_cache(cache)
             prefill_chunk = env_int("TORCHINFERNO_OPENAI_TP_ONLINE_PREFILL_CHUNK", 0, minimum=0)
             if prefill_chunk > 0:
@@ -2015,7 +2185,8 @@ class OpenAICompletionEngine:
         elif hasattr(self.model, "_fi_decode_graphs"):
             self.model._fi_decode_graphs = {}
         flashinfer_available = importlib.util.find_spec("flashinfer") is not None
-        if hasattr(self.model, "forward_step_flashinfer") and flashinfer_available:
+        flashinfer_prefill_enabled = _flashinfer_prefill_runtime_enabled()
+        if flashinfer_prefill_enabled and hasattr(self.model, "forward_step_flashinfer") and flashinfer_available:
             try:
                 self._warmup_flashinfer_prefill(cache, batch_sizes, prompt_tokens)
             except Exception as _fip_exc:
@@ -2026,14 +2197,19 @@ class OpenAICompletionEngine:
         # per-bucket success flag (see _warmup_flashinfer_prefill_graphs), so the
         # in-graph allreduces always have matching partners across ranks. Safe to
         # enable by default; set the flag to 0 to fall back to eager prefill.
-        if flashinfer_available and hasattr(self.model, "capture_flashinfer_prefill_graph") and env_flag(
-            "TORCHINFERNO_FI_PREFILL_GRAPH", True
+        if (
+            flashinfer_prefill_enabled
+            and flashinfer_available
+            and hasattr(self.model, "capture_flashinfer_prefill_graph")
+            and env_flag("TORCHINFERNO_FI_PREFILL_GRAPH", True)
         ):
             try:
                 self._warmup_flashinfer_prefill_graphs(cache, max_active)
             except Exception as _fipg_exc:
                 import sys as _fipg_sys
                 print(f"[WARMUP] FlashInfer prefill graph warmup failed: {_fipg_exc}", file=_fipg_sys.stderr, flush=True)
+        elif hasattr(self.model, "_fi_prefill_graphs"):
+            self.model._fi_prefill_graphs = {}
         try:
             cache._compiled_prefill_ready = True
         except Exception:
@@ -2159,7 +2335,7 @@ class OpenAICompletionEngine:
         # JIT cost off the request path. Capturing many large shapes here is
         # memory-prohibitive (eager activations for batch*seq tokens).
         prompt_buckets = [64, 256]
-        prefill_batch_sizes = sorted({1, max(batch_sizes)} & set(range(1, max(batch_sizes) + 1)))
+        prefill_batch_sizes = _flashinfer_prefill_warmup_batch_sizes(batch_sizes)
         warmed = 0
         for pbs in prefill_batch_sizes:
             for pt in prompt_buckets:
@@ -2661,7 +2837,11 @@ class OpenAICompletionEngine:
         emitted_events = 0
         finished_events = 0
         initial_wait_s = (
-            env_float("TORCHINFERNO_OPENAI_TP_ONLINE_INITIAL_BATCH_WAIT_MS", 1.0, minimum=0.0) / 1000.0
+            _online_initial_batch_wait_ms(
+                temperature=first.temperature,
+                max_tokens=first.max_tokens,
+            )
+            / 1000.0
         )
         idle_wait_s = env_float("TORCHINFERNO_OPENAI_TP_ONLINE_IDLE_BATCH_WAIT_MS", 2.0, minimum=0.0) / 1000.0
         profile_start_s = time.perf_counter()
@@ -2716,34 +2896,6 @@ class OpenAICompletionEngine:
         default_max_seq_len = self._tp_online_default_max_seq_len(initial_batch)
         max_seq_len = env_int("TORCHINFERNO_OPENAI_TP_ONLINE_MAX_SEQ_LEN", default_max_seq_len, minimum=1)
         max_seq_len = max(max_seq_len, len(first.prompt) + first.max_tokens)
-        # KV-token-bounded concurrency boost: raise the admission cap for
-        # SHORT-context workloads so high client concurrency stops queueing
-        # against the base 48-row cap (e.g. self_consistency: ~286-token seqs at
-        # 128 concurrency). budget // max_seq_len floors back to the base for
-        # long-context workloads (few_shot/multi_turn/long_output unchanged),
-        # bounding total KV memory; the cap matches the rows the persistent cache
-        # was warmed for (_kv_bounded_concurrency_cap). Decode GEMMs are
-        # weight-bound so the extra short rows are ~free (scripts/bench_decode_batch_scaling.py).
-        if env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_KV_BOUNDED_CONCURRENCY", True):
-            kv_token_budget = env_int(
-                # 48*512. At real benchmark dims: self_consistency (~286) -> 85 rows,
-                # tree (~350) -> 70, few_shot (~406) -> 60; multi_turn (~2k) /
-                # long_output (large) stay 48. Clean A/B (2026-06-07): boost cut
-                # self_consistency-like TTFT ~2x (+10% tput; its TPOT is 0.0/
-                # uncontested), and few_shot's pure decode cost at 60 rows is only
-                # ~+0.2ms (weight-bound GEMMs) -- and in the benchmark, where
-                # few_shot TPOT (51.6) is queueing-INFLATED, more rows cut
-                # prefill-interleaving and likely LOWER it. Budget kept conservative
-                # so few_shot only reaches ~60 rows (the +1.4ms seen in the A/B was
-                # at the over-boosted 128 rows of tiny-max_seq synthetic prompts).
-                "TORCHINFERNO_OPENAI_TP_ONLINE_KV_TOKEN_BUDGET", 48 * 512, minimum=1
-            )
-            max_active = max(max_active, min(self._kv_bounded_concurrency_cap(), kv_token_budget // max_seq_len))
-        prefix_rows = self._online_serving_effective_prefix_rows(max_active)
-        persistent_cache = getattr(self, "_persistent_serving_cache", None)
-        compat_max_seq_len = max_seq_len
-        if persistent_cache is not None and hasattr(persistent_cache, "layers") and persistent_cache.layers:
-            compat_max_seq_len = persistent_cache.layers[0].max_seq_len
         sized_initial_batch = [
             request
             for request in initial_batch
@@ -2755,6 +2907,27 @@ class OpenAICompletionEngine:
                 deferred.append(request)
         initial_batch = sized_initial_batch or [first]
         run_max_tokens = max(request.max_tokens for request in initial_batch)
+        # KV-token-bounded concurrency boost: raise the admission cap for short
+        # greedy/self-style sampled workloads, where extra rows cut queueing
+        # without forcing larger few-shot/tree decode batches. Keep longer
+        # generations on the base cap unless explicitly opted in.
+        if _online_kv_bounded_concurrency_enabled(
+            temperature=first.temperature,
+            max_tokens=run_max_tokens,
+        ):
+            kv_token_budget = env_int(
+                "TORCHINFERNO_OPENAI_TP_ONLINE_KV_TOKEN_BUDGET", 64 * 512, minimum=1
+            )
+            kv_max_active_cap = _online_kv_bounded_max_active_cap(
+                temperature=first.temperature,
+                base_cap=self._kv_bounded_concurrency_cap(),
+            )
+            max_active = max(max_active, min(kv_max_active_cap, kv_token_budget // max_seq_len))
+        prefix_rows = self._online_serving_effective_prefix_rows(max_active)
+        persistent_cache = getattr(self, "_persistent_serving_cache", None)
+        compat_max_seq_len = max_seq_len
+        if persistent_cache is not None and hasattr(persistent_cache, "layers") and persistent_cache.layers:
+            compat_max_seq_len = persistent_cache.layers[0].max_seq_len
         stop_token_ids = getattr(self, "stop_token_ids", frozenset())
         eos_token_id = next(iter(stop_token_ids)) if stop_token_ids else None
         # Test-only: force every request to generate exactly max_tokens (ignore EOS),
@@ -2764,10 +2937,15 @@ class OpenAICompletionEngine:
         if env_flag("TORCHINFERNO_OPENAI_IGNORE_EOS", False):
             stop_token_ids = frozenset()
             eos_token_id = None
+        profile_queue = bool(self._queue_profile_path_value())
         engine_create_start_s = time.perf_counter()
         runtime_engine = self._maybe_build_paged_online_engine(max_active=max_active, max_seq_len=max_seq_len)
         use_paged_engine = runtime_engine is not None
         if not use_paged_engine:
+            normalized_prefill_budget = prefill_budget if prefill_budget > 0 else None
+            graph_prefill = env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_GRAPH_PREFILL", True)
+            prefill_chunk_size = env_int("TORCHINFERNO_OPENAI_TP_ONLINE_PREFILL_CHUNK", 0, minimum=0) or None
+            pin_shared_prefix = env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_PIN_SHARED_PREFIX", True)
             runtime_engine = _RuntimeContinuousBatchEngine(
                 self.model,
                 device=self.device,
@@ -2776,14 +2954,14 @@ class OpenAICompletionEngine:
                 temperature=first.temperature,
                 max_active_requests=max_active,
                 prefix_cache_capacity=prefix_rows,
-                prefill_token_budget=prefill_budget if prefill_budget > 0 else None,
+                prefill_token_budget=normalized_prefill_budget,
                 enable_ragged_decode=enable_ragged_decode,
                 store_reusable_prefixes=store_reusable_prefixes,
                 store_full_prompt_prefixes=store_full_prompt_prefixes,
-                pin_shared_prefix=env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_PIN_SHARED_PREFIX", True),
-                graph_prefill=env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_GRAPH_PREFILL", True),
-                prefill_chunk_size=(env_int("TORCHINFERNO_OPENAI_TP_ONLINE_PREFILL_CHUNK", 0, minimum=0) or None),
-                profile_timings=bool(self._queue_profile_path_value()),
+                pin_shared_prefix=pin_shared_prefix,
+                graph_prefill=graph_prefill,
+                prefill_chunk_size=prefill_chunk_size,
+                profile_timings=profile_queue,
                 admit_min_ready_requests=_online_refill_min_ready_requests(
                     temperature=first.temperature,
                     max_tokens=run_max_tokens,
@@ -2793,6 +2971,50 @@ class OpenAICompletionEngine:
         if decode_runner is not None:
             runtime_engine._decode_runner = decode_runner
         add_phase("engine_create_ms", engine_create_start_s)
+        decode_quantum = _online_decode_quantum(
+            temperature=first.temperature,
+            max_tokens=run_max_tokens,
+        )
+        use_decode_many = env_flag("TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY", False)
+        profile_snapshot_commands = (
+            env_int("TORCHINFERNO_OPENAI_TP_ONLINE_PROFILE_SNAPSHOT_COMMANDS", 8, minimum=0)
+            if profile_queue
+            else 0
+        )
+        profile_snapshots = 0
+        last_quiescent_profile_commands = -1
+
+        def record_online_profile(event: str) -> None:
+            nonlocal profile_snapshots
+            if not profile_queue:
+                return
+            is_progress = event == "online_batcher_progress"
+            if is_progress:
+                profile_snapshots += 1
+            phase_fields = {f"phase_{name}": round(value, 3) for name, value in phase_ms.items()}
+            extra_fields: dict[str, object] = {}
+            if is_progress:
+                extra_fields["profile_snapshot_index"] = profile_snapshots
+            else:
+                extra_fields["profile_snapshots"] = profile_snapshots
+            self._record_runtime_engine_queue_profile(
+                event,
+                runtime_engine,
+                submitted_requests=len(request_by_id),
+                deferred_requests=len(deferred),
+                initial_batch_size=len(initial_batch),
+                max_seq_len=max_seq_len,
+                run_max_tokens=run_max_tokens,
+                max_active=max_active,
+                prefix_rows=prefix_rows,
+                decode_quantum=decode_quantum,
+                online_steps=step,
+                online_step_commands=online_step_commands,
+                emitted_events=emitted_events,
+                finished_events=finished_events,
+                **extra_fields,
+                **phase_fields,
+            )
 
         def compatible(request: _QueuedGeneration) -> bool:
             return same_online_class(request) and len(request.prompt) + request.max_tokens <= compat_max_seq_len
@@ -2916,6 +3138,7 @@ class OpenAICompletionEngine:
                                 batch_capacity=_generation_cache_batch_capacity(self.model, total_online_rows),
                             )
                             _reset_generation_cache(shared_cache)
+                            self._persistent_serving_cache = shared_cache
                         except Exception:
                             shared_cache = None
                     elif shared_cache is not None:
@@ -2932,10 +3155,6 @@ class OpenAICompletionEngine:
                 _sync_tensor_parallel_command(self.model, self.device)
                 add_phase("start_sync_ms", start_sync_start_s)
                 submit_batch(initial_batch, arrival_step=0)
-                decode_quantum = _online_decode_quantum(
-                    temperature=first.temperature,
-                    max_tokens=run_max_tokens,
-                )
                 persistent = env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_PERSISTENT", False)
                 persistent_idle_s = _online_persistent_idle_ms(
                     temperature=first.temperature,
@@ -2944,6 +3163,14 @@ class OpenAICompletionEngine:
                 while True:
                     drain_ready(step)
                     if not runtime_engine.has_online_work():
+                        if (
+                            profile_snapshot_commands > 0
+                            and online_step_commands != last_quiescent_profile_commands
+                            and request_by_id
+                            and finished_events >= len(request_by_id)
+                        ):
+                            record_online_profile("online_batcher_progress")
+                            last_quiescent_profile_commands = online_step_commands
                         if wait_and_drain(step, idle_wait_s) == 0:
                             if persistent:
                                 next_item = self._generation_queue.get()
@@ -2999,11 +3226,19 @@ class OpenAICompletionEngine:
                     _broadcast_tensor_parallel_online_step(self.model, decode_quantum)
                     add_phase("step_broadcast_ms", step_broadcast_start_s)
                     online_step_commands += 1
-                    for _ in range(decode_quantum):
+                    remaining_steps = decode_quantum
+                    while remaining_steps > 0:
                         if not runtime_engine.has_online_work():
                             break
                         runtime_step_start_s = time.perf_counter()
-                        events = runtime_engine.step_online()
+                        step_many = getattr(runtime_engine, "step_online_many", None) if use_decode_many else None
+                        if step_many is not None and callable(step_many):
+                            events, ran_steps = step_many(remaining_steps)
+                        else:
+                            events = runtime_engine.step_online()
+                            ran_steps = 1
+                        if ran_steps <= 0:
+                            break
                         add_phase("runtime_step_ms", runtime_step_start_s)
                         event_emit_start_s = time.perf_counter()
                         for event in events:
@@ -3020,11 +3255,17 @@ class OpenAICompletionEngine:
                                 _finish_stream_request(request)
                                 finished_events += 1
                         add_phase("event_emit_ms", event_emit_start_s)
-                        step += 1
-                    if env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_STEP_SYNC", True):
+                        step += ran_steps
+                        remaining_steps -= ran_steps
+                    if _online_step_sync_enabled():
                         step_sync_start_s = time.perf_counter()
                         _sync_tensor_parallel_command(self.model, self.device)
                         add_phase("step_sync_ms", step_sync_start_s)
+                    if (
+                        profile_snapshot_commands > 0
+                        and online_step_commands % profile_snapshot_commands == 0
+                    ):
+                        record_online_profile("online_batcher_progress")
         except BaseException as exc:
             for request in request_by_id.values():
                 if not request.done:
@@ -3033,24 +3274,7 @@ class OpenAICompletionEngine:
             raise
         finally:
             add_phase("total_ms", profile_start_s)
-            phase_fields = {f"phase_{name}": round(value, 3) for name, value in phase_ms.items()}
-            self._record_runtime_engine_queue_profile(
-                "online_batcher",
-                runtime_engine,
-                submitted_requests=len(request_by_id),
-                deferred_requests=len(deferred),
-                initial_batch_size=len(initial_batch),
-                max_seq_len=max_seq_len,
-                run_max_tokens=run_max_tokens,
-                max_active=max_active,
-                prefix_rows=prefix_rows,
-                decode_quantum=decode_quantum,
-                online_steps=step,
-                online_step_commands=online_step_commands,
-                emitted_events=emitted_events,
-                finished_events=finished_events,
-                **phase_fields,
-            )
+            record_online_profile("online_batcher")
             if started:
                 _broadcast_tensor_parallel_online_close(self.model)
                 _sync_tensor_parallel_command(self.model, self.device)
@@ -3220,6 +3444,13 @@ class OpenAICompletionEngine:
             "decode_ragged_model_ms",
             "decode_ragged_cpu_tokens_ms",
             "decode_ragged_state_update_ms",
+            "prompt_lookup_batches",
+            "prompt_lookup_requests",
+            "prompt_lookup_proposed_tokens",
+            "prompt_lookup_accepted_tokens",
+            "generated_prefix_store_requests",
+            "generated_prefix_reuse_requests",
+            "generated_prefix_reuse_tokens",
             "_decode_active_ms",
             "_admit_ms",
             "_da_filter_ms",
@@ -3778,10 +4009,19 @@ class OpenAICompletionEngine:
                 while runtime_engine.has_online_work():
                     _broadcast_tensor_parallel_online_step(self.model, decode_quantum)
                     online_step_commands += 1
-                    for _ in range(decode_quantum):
+                    use_decode_many = env_flag("TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY", False)
+                    remaining_steps = decode_quantum
+                    while remaining_steps > 0:
                         if not runtime_engine.has_online_work():
                             break
-                        events = runtime_engine.step_online()
+                        step_many = getattr(runtime_engine, "step_online_many", None) if use_decode_many else None
+                        if step_many is not None and callable(step_many):
+                            events, ran_steps = step_many(remaining_steps)
+                        else:
+                            events = runtime_engine.step_online()
+                            ran_steps = 1
+                        if ran_steps <= 0:
+                            break
                         for event in events:
                             emitted_events += 1
                             request = request_by_id[event.request_id]
@@ -3795,8 +4035,9 @@ class OpenAICompletionEngine:
                             if event.finished:
                                 _finish_stream_request(request)
                                 finished_events += 1
-                        online_steps += 1
-                    if env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_STEP_SYNC", True):
+                        online_steps += ran_steps
+                        remaining_steps -= ran_steps
+                    if _online_step_sync_enabled():
                         _sync_tensor_parallel_command(self.model, self.device)
         finally:
             self._record_runtime_engine_queue_profile(
@@ -10662,6 +10903,10 @@ def _tensor_parallel_worker_loop(engine: OpenAICompletionEngine) -> None:
                 # + prefix cache. Persist (prefix cache on) keeps the engine across
                 # bursts; otherwise the original build-once-if-None behavior holds.
                 _persist_paged = env_flag("TORCHINFERNO_PAGED_PREFIX_CACHE", False)
+                if worker_use_paged and online_runtime_engine is not None and not hasattr(online_runtime_engine, "max_seq"):
+                    online_runtime_engine = None
+                if (not worker_use_paged) and online_runtime_engine is not None and hasattr(online_runtime_engine, "max_seq"):
+                    online_runtime_engine = None
                 _paged_needs_build = worker_use_paged and (
                     online_runtime_engine is None
                     or (_persist_paged and (
@@ -10722,6 +10967,7 @@ def _tensor_parallel_worker_loop(engine: OpenAICompletionEngine) -> None:
                                 page_size=int(getattr(engine, "page_size", 16)),
                             )
                             _reset_generation_cache(worker_shared_cache)
+                            engine._persistent_serving_cache = worker_shared_cache
                         except Exception:
                             worker_shared_cache = None
                     elif worker_shared_cache is not None:
@@ -10729,9 +10975,16 @@ def _tensor_parallel_worker_loop(engine: OpenAICompletionEngine) -> None:
                         # stale (previous-benchmark) seq_len/KV does not corrupt the next
                         # benchmark's first batch. Must match the primary exactly (TP).
                         _reset_generation_cache(worker_shared_cache)
-                online_runtime_engine.start_online(
-                    max_seq_len=max_seq_len, external_cache=worker_shared_cache,
-                )
+                if worker_use_paged:
+                    online_runtime_engine.start_online(
+                        max_seq_len=max_seq_len,
+                        external_cache=worker_shared_cache,
+                    )
+                else:
+                    online_runtime_engine.start_online(
+                        max_seq_len=max_seq_len,
+                        external_cache=worker_shared_cache,
+                    )
                 if hasattr(online_runtime_engine, "admit_min_ready_requests"):
                     online_runtime_engine.admit_min_ready_requests = admit_min_ready_requests
                 worker_decode_runner = getattr(engine, "_decode_graph_runner", None)
@@ -10773,11 +11026,22 @@ def _tensor_parallel_worker_loop(engine: OpenAICompletionEngine) -> None:
             if op == "online_step":
                 if online_runtime_engine is None:
                     raise RuntimeError("online tensor-parallel worker engine has not been started")
-                for _ in range(max(1, int(payload.get("steps", 1)))):
+                if not _online_step_sync_enabled():
+                    _skip_finally_sync = True
+                use_decode_many = env_flag("TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY", False)
+                remaining_steps = max(1, int(payload.get("steps", 1)))
+                while remaining_steps > 0:
                     if not online_runtime_engine.has_online_work():
                         break
-                    for _event in online_runtime_engine.step_online():
-                        pass
+                    step_many = getattr(online_runtime_engine, "step_online_many", None) if use_decode_many else None
+                    if step_many is not None and callable(step_many):
+                        ran_steps = step_many(remaining_steps)[1]
+                    else:
+                        online_runtime_engine.step_online()
+                        ran_steps = 1
+                    if ran_steps <= 0:
+                        break
+                    remaining_steps -= ran_steps
                 continue
             if op == "online_close":
                 # When COW prefix caching is on, KEEP the worker's engine across

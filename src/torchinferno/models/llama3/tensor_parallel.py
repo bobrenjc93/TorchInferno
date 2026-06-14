@@ -2621,7 +2621,13 @@ class Llama3TensorParallelForCausalLM:
         rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
         world_size = dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
 
-        root = resolve_llama3_checkpoint(checkpoint, token=token, revision=revision, cache_dir=cache_dir)
+        root = _resolve_tensor_parallel_checkpoint(
+            checkpoint,
+            token=token,
+            revision=revision,
+            cache_dir=cache_dir,
+            device=device,
+        )
         config = Llama3Config.from_dict(json.loads((root / HF_CONFIG_NAME).read_text()))
         torch_dtype = _resolve_dtype(dtype, root)
         loader = _CheckpointTensorLoader(root)
@@ -4123,24 +4129,50 @@ class Llama3TensorParallelForCausalLM:
         src_prefix_row: Tensor | None = None,
     ) -> Tensor:
         batch = input_ids.size(0)
-        # Fold the shared-prefix KV broadcast INTO the graph: copy the prefix
-        # [0:prefix_len] from one source row into every active row, per layer,
-        # via advanced indexing. Captured once, replayed in one launch -- removes
-        # the ~80 per-layer index_copy launches/batch (the dominant remaining
-        # prefill cost) that the engine used to issue eagerly. src_prefix_row is
-        # a copied-in [1] device tensor so replay re-targets a new prefix row;
-        # row_indices re-targets new dest rows. When None (eager oracle), the
-        # prefix is assumed already resident and no copy is done.
-        if src_prefix_row is not None and row_indices is not None and context_len is not None:
-            prefix_len = context_len - input_ids.size(1)
-            if prefix_len > 0:
-                for layer in cache.layers:
-                    layer.keys[row_indices, :, :prefix_len, :] = layer.keys.index_select(
-                        0, src_prefix_row
-                    )[:, :, :prefix_len, :]
-                    layer.values[row_indices, :, :prefix_len, :] = layer.values.index_select(
-                        0, src_prefix_row
-                    )[:, :, :prefix_len, :]
+        # Fold the prefix KV broadcast INTO the graph: copy [0:prefix_len] from
+        # each source row into its active row, per layer, via advanced indexing.
+        # Captured once, replayed in one launch -- removes the ~80 per-layer
+        # index_copy launches/batch that the engine used to issue eagerly.
+        # src_prefix_row is a copied-in device tensor so replay re-targets source
+        # rows; row_indices re-targets dest rows. A single source row broadcasts
+        # for common-prefix reuse, and one source per request handles full-prompt
+        # reuse with equal prefix lengths.
+        if src_prefix_row is not None and row_indices is not None:
+            if context_len is not None:
+                prefix_len = context_len - input_ids.size(1)
+                if prefix_len > 0:
+                    for layer in cache.layers:
+                        layer.keys[row_indices, :, :prefix_len, :] = layer.keys.index_select(
+                            0, src_prefix_row
+                        )[:, :, :prefix_len, :]
+                        layer.values[row_indices, :, :prefix_len, :] = layer.values.index_select(
+                            0, src_prefix_row
+                        )[:, :, :prefix_len, :]
+            else:
+                prefix_len = int(start_positions.max().item()) if start_positions.numel() else 0
+                if prefix_len > 0:
+                    source_rows = src_prefix_row
+                    if source_rows.numel() == 1 and row_indices.numel() > 1:
+                        source_rows = source_rows.expand(row_indices.numel())
+                    mask = (
+                        torch.arange(prefix_len, device=self.device)[None, :]
+                        < start_positions[:, None]
+                    )
+                    for layer in cache.layers:
+                        source_keys = layer.keys.index_select(0, source_rows)[:, :, :prefix_len, :]
+                        source_values = layer.values.index_select(0, source_rows)[:, :, :prefix_len, :]
+                        zero_key = torch.zeros((), dtype=source_keys.dtype, device=source_keys.device)
+                        zero_value = torch.zeros((), dtype=source_values.dtype, device=source_values.device)
+                        layer.keys[row_indices, :, :prefix_len, :] = torch.where(
+                            mask[:, None, :, None],
+                            source_keys,
+                            zero_key,
+                        )
+                        layer.values[row_indices, :, :prefix_len, :] = torch.where(
+                            mask[:, None, :, None],
+                            source_values,
+                            zero_value,
+                        )
         hidden = F.embedding(input_ids.to(self.device, non_blocking=True), self.embed_tokens_weight)
         attn_in: Tensor | None = None
         for layer_id, layer in enumerate(self.layers):
@@ -4874,6 +4906,7 @@ class Llama3TensorParallelForCausalLM:
     ) -> Tensor | None:
         if not cache.layers:
             raise ValueError("ragged prefill requires a non-empty KV cache")
+        src_prefix_rows = int(src_prefix_row.numel()) if src_prefix_row is not None else 0
         key = (
             id(cache),
             input_ids.size(0),
@@ -4881,7 +4914,7 @@ class Llama3TensorParallelForCausalLM:
             cache.layers[0].max_seq_len,
             row_indices is not None,
             context_len if context_len is not None else -1,
-            src_prefix_row is not None,
+            src_prefix_rows,
             _symm_mem_allreduce_graph_key(input_ids.size(0), _model_world_size(self)),
         )
         captured = self._ragged_prefill_logits_graphs.get(key)
@@ -4893,6 +4926,11 @@ class Llama3TensorParallelForCausalLM:
             or (captured.static_row_indices is None) != (row_indices is None)
             or captured.context_len != context_len
             or (captured.static_src_prefix_row is None) != (src_prefix_row is None)
+            or (
+                captured.static_src_prefix_row is not None
+                and src_prefix_row is not None
+                and captured.static_src_prefix_row.shape != src_prefix_row.shape
+            )
         )
         skip_sync = bool(getattr(cache, "_skip_capture_sync", False))
         needs_capture = needs_capture if skip_sync else _capture_needed_on_any_rank(needs_capture, self.device)
@@ -4936,9 +4974,7 @@ class Llama3TensorParallelForCausalLM:
         batch, suffix = input_ids.shape
         rotary_cache_dim = self.rotary_cos_cache.size(1)
         static_row_indices = torch.empty_like(row_indices) if row_indices is not None else None
-        static_src_prefix_row = (
-            torch.empty((1,), device=self.device, dtype=torch.long) if src_prefix_row is not None else None
-        )
+        static_src_prefix_row = torch.empty_like(src_prefix_row) if src_prefix_row is not None else None
         captured = _StaticRaggedPrefillLogitsGraphCall(
             graph=torch.cuda.CUDAGraph(),
             static_input_ids=torch.empty_like(input_ids),
@@ -5324,6 +5360,42 @@ def _init_distributed_if_needed() -> None:
         return
     backend = "nccl" if torch.cuda.is_available() else "gloo"
     dist.init_process_group(backend=backend)
+
+
+def _resolve_tensor_parallel_checkpoint(
+    checkpoint: str | Path,
+    *,
+    token: str | None,
+    revision: str | None,
+    cache_dir: str | Path | None,
+    device: torch.device,
+) -> Path:
+    candidate = Path(checkpoint).expanduser()
+    if candidate.exists():
+        return candidate
+    if not dist.is_available() or not dist.is_initialized() or dist.get_world_size() <= 1:
+        return resolve_llama3_checkpoint(checkpoint, token=token, revision=revision, cache_dir=cache_dir)
+
+    rank = dist.get_rank()
+    resolved = [""]
+    if rank == 0:
+        print(f"[Llama3TP] resolving checkpoint {checkpoint}", flush=True)
+        resolved[0] = str(resolve_llama3_checkpoint(checkpoint, token=token, revision=revision, cache_dir=cache_dir))
+        print(f"[Llama3TP] resolved checkpoint {resolved[0]}", flush=True)
+    _broadcast_object_list(resolved, src=0, device=device)
+    if not resolved[0]:
+        raise RuntimeError("rank 0 did not broadcast a resolved checkpoint path")
+    return Path(resolved[0])
+
+
+def _broadcast_object_list(objects: list[object], *, src: int, device: torch.device) -> None:
+    if device.type == "cuda":
+        try:
+            dist.broadcast_object_list(objects, src=src, device=device)
+            return
+        except TypeError:
+            pass
+    dist.broadcast_object_list(objects, src=src)
 
 
 def _all_reduce(tensor: Tensor) -> None:

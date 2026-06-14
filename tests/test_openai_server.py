@@ -80,15 +80,23 @@ from torchinferno.openai_server import (
     _distributed_server_command,
     _effective_openai_max_batch_size,
     _emit_stream_token,
+    _flashinfer_prefill_runtime_enabled,
+    _flashinfer_prefill_warmup_batch_sizes,
     _generation_cache_batch_capacity,
     _identical_prompt_cache_pool_enabled,
     _identical_prompt_prefill_graph_capture_enabled,
     _mark_generation_cache_prefix,
     _online_common_prefix_prefill_warmup_rows,
     _online_common_prefix_prefill_warmup_tokens,
+    _online_common_prefix_suffix_prefill_warmup_batches,
+    _online_common_prefix_suffix_prefill_warmup_tokens,
     _online_decode_quantum,
+    _online_initial_batch_wait_ms,
+    _online_kv_bounded_concurrency_enabled,
+    _online_kv_bounded_max_active_cap,
     _online_persistent_idle_ms,
     _online_refill_min_ready_requests,
+    _online_step_sync_enabled,
     _openai_cuda_graph_enabled_for_model,
     _openai_decode_graph_enabled,
     _openai_ragged_decode_graph_enabled,
@@ -181,6 +189,31 @@ def test_openai_startup_warmup_skips_non_dense_cache_by_default(
 
     assert not _startup_warmup_enabled_for_cache_backend("paged")
     assert _startup_warmup_enabled_for_cache_backend("dense")
+
+
+def test_flashinfer_prefill_warmup_batches_are_capped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_WARMUP_FLASHINFER_PREFILL_MAX_BATCH", raising=False)
+
+    assert _flashinfer_prefill_warmup_batch_sizes([1, 2, 4, 64, 144]) == (1, 8)
+
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_WARMUP_FLASHINFER_PREFILL_MAX_BATCH", "16")
+
+    assert _flashinfer_prefill_warmup_batch_sizes([1, 2, 4, 64, 144]) == (1, 16)
+    assert _flashinfer_prefill_warmup_batch_sizes([1, 2, 4]) == (1, 4)
+
+
+def test_flashinfer_prefill_runtime_is_opt_in_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_FLASHINFER_PREFILL_DISABLE", raising=False)
+
+    assert not _flashinfer_prefill_runtime_enabled()
+
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_FLASHINFER_PREFILL_DISABLE", "0")
+
+    assert _flashinfer_prefill_runtime_enabled()
 
 
 def test_openai_server_matches_openai_chat_contract() -> None:
@@ -928,6 +961,61 @@ def test_tensor_parallel_worker_loop_handles_online_runtime_commands(monkeypatch
         ((3,), 6, 7, 0),
     ]
     assert [request.request_id for request in runtime.submitted] == ["10", "11"]
+
+
+def test_tensor_parallel_worker_loop_skips_online_step_barrier_when_disabled(monkeypatch) -> None:
+    import torch.distributed as dist
+
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_STEP_SYNC", "0")
+    commands: list[dict[str, object]] = [
+        {
+            "op": "online_start",
+            "max_seq_len": 16,
+            "max_active_requests": 4,
+            "prefix_cache_capacity": 2,
+            "prefill_token_budget": 8,
+            "temperature": 0.0,
+            "max_tokens": 6,
+        },
+        {"op": "online_step"},
+        {"op": "stop"},
+    ]
+    syncs: list[str] = []
+
+    class RuntimeEngine:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            del args, kwargs
+
+        def start_online(self, *, max_seq_len: int, external_cache: object | None = None) -> None:
+            del max_seq_len, external_cache
+
+        def has_online_work(self) -> bool:
+            return False
+
+    def broadcast_object_list(payload: list[object], *, src: int) -> None:
+        del src
+        payload[0] = commands.pop(0)
+
+    monkeypatch.setattr(dist, "is_available", lambda: True)
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(dist, "broadcast_object_list", broadcast_object_list)
+    monkeypatch.setattr("torchinferno.openai_server._RuntimeContinuousBatchEngine", RuntimeEngine)
+    monkeypatch.setattr(
+        "torchinferno.openai_server._tensor_parallel_symm_mem_allreduce_scope",
+        lambda *args, **kwargs: nullcontext(),
+    )
+    monkeypatch.setattr(
+        "torchinferno.openai_server._sync_tensor_parallel_command",
+        lambda model, device, **kwargs: syncs.append("sync"),
+    )
+
+    engine = _WorkerLoopRecordingEngine()
+    engine.model = object()
+
+    _tensor_parallel_worker_loop(engine)
+
+    assert commands == []
+    assert syncs == ["sync"]
 
 
 def test_tensor_parallel_worker_loop_receives_online_tensor_commands(monkeypatch) -> None:
@@ -7380,10 +7468,15 @@ def test_openai_refill_min_ready_requests_defaults_for_short_greedy_caps(monkeyp
 
     assert _online_refill_min_ready_requests(temperature=0.0, max_tokens=45) == 8
     assert _online_refill_min_ready_requests(temperature=0.0, max_tokens=128) == 8
+    assert _online_refill_min_ready_requests(temperature=0.0, max_tokens=256) == 8
+    assert _online_refill_min_ready_requests(temperature=0.0, max_tokens=512) == 8
+    assert _online_refill_min_ready_requests(temperature=0.0, max_tokens=1024) is None
 
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_REFILL_MIN_READY_REQUESTS", "16")
     assert _online_refill_min_ready_requests(temperature=0.0, max_tokens=45) == 16
-    assert _online_refill_min_ready_requests(temperature=0.0, max_tokens=256) is None
+    assert _online_refill_min_ready_requests(temperature=0.0, max_tokens=256) == 16
+    assert _online_refill_min_ready_requests(temperature=0.0, max_tokens=512) == 16
+    assert _online_refill_min_ready_requests(temperature=0.0, max_tokens=1024) is None
     assert _online_refill_min_ready_requests(temperature=0.7, max_tokens=45) is None
     assert _online_refill_min_ready_requests(temperature=0.0, max_tokens=0) is None
 
@@ -7433,6 +7526,50 @@ def test_openai_online_decode_quantum_respects_env_overrides(monkeypatch) -> Non
     assert _online_decode_quantum(temperature=0.0, max_tokens=256) == 2
 
 
+def test_online_step_sync_enabled_defaults_on(monkeypatch) -> None:
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_STEP_SYNC", raising=False)
+    assert _online_step_sync_enabled()
+
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_STEP_SYNC", "0")
+    assert not _online_step_sync_enabled()
+
+
+def test_online_kv_bounded_concurrency_defaults_to_short_outputs(monkeypatch) -> None:
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_KV_BOUNDED_CONCURRENCY", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_KV_BOUNDED_ALLOW_SAMPLED", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_KV_BOUNDED_GREEDY_MAX_TOKENS", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_KV_BOUNDED_SAMPLED_MAX_TOKENS", raising=False)
+
+    assert _online_kv_bounded_concurrency_enabled(temperature=0.0, max_tokens=64)
+    assert _online_kv_bounded_concurrency_enabled(temperature=0.0, max_tokens=128)
+    assert not _online_kv_bounded_concurrency_enabled(temperature=0.0, max_tokens=256)
+    assert _online_kv_bounded_concurrency_enabled(temperature=0.7, max_tokens=64)
+    assert _online_kv_bounded_concurrency_enabled(temperature=0.7, max_tokens=256)
+    assert not _online_kv_bounded_concurrency_enabled(temperature=0.7, max_tokens=300)
+
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_KV_BOUNDED_ALLOW_SAMPLED", "0")
+    assert not _online_kv_bounded_concurrency_enabled(temperature=0.7, max_tokens=64)
+
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_KV_BOUNDED_CONCURRENCY", "0")
+    assert not _online_kv_bounded_concurrency_enabled(temperature=0.0, max_tokens=64)
+
+
+def test_online_kv_bounded_max_active_cap_targets_greedy(monkeypatch) -> None:
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_KV_MAX_ACTIVE_CAP", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_KV_MAX_ACTIVE_CAP", raising=False)
+
+    assert _online_kv_bounded_max_active_cap(temperature=0.0, base_cap=128) == 96
+    assert _online_kv_bounded_max_active_cap(temperature=0.7, base_cap=128) == 128
+    assert _online_kv_bounded_max_active_cap(temperature=0.0, base_cap=80) == 80
+
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_KV_MAX_ACTIVE_CAP", "112")
+    assert _online_kv_bounded_max_active_cap(temperature=0.0, base_cap=128) == 112
+
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_KV_MAX_ACTIVE_CAP", raising=False)
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_KV_MAX_ACTIVE_CAP", "128")
+    assert _online_kv_bounded_max_active_cap(temperature=0.0, base_cap=128) == 128
+
+
 def test_openai_online_persistent_idle_uses_sampled_short_default(monkeypatch) -> None:
     monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_PERSISTENT_IDLE_MS", raising=False)
     monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_SHORT_IDLE_MAX_TOKENS", raising=False)
@@ -7451,18 +7588,88 @@ def test_openai_online_persistent_idle_respects_env_overrides(monkeypatch) -> No
     assert _online_persistent_idle_ms(temperature=0.7, max_tokens=300) == 100.0
 
 
+def test_openai_online_initial_batch_wait_uses_sampled_short_default(monkeypatch) -> None:
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_INITIAL_BATCH_WAIT_MS", raising=False)
+    monkeypatch.delenv(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_SHORT_INITIAL_BATCH_WAIT_MS",
+        raising=False,
+    )
+    monkeypatch.delenv(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_SHORT_INITIAL_BATCH_WAIT_MAX_TOKENS",
+        raising=False,
+    )
+    monkeypatch.delenv(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_INITIAL_BATCH_WAIT_MS",
+        raising=False,
+    )
+    monkeypatch.delenv(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_INITIAL_BATCH_WAIT_MAX_TOKENS",
+        raising=False,
+    )
+
+    assert _online_initial_batch_wait_ms(temperature=0.7, max_tokens=256) == 25.0
+    assert _online_initial_batch_wait_ms(temperature=0.0, max_tokens=64) == 1.0
+    assert _online_initial_batch_wait_ms(temperature=0.0, max_tokens=128) == 1.0
+    assert _online_initial_batch_wait_ms(temperature=0.0, max_tokens=256) == 1.0
+    assert _online_initial_batch_wait_ms(temperature=0.7, max_tokens=300) == 25.0
+    assert _online_initial_batch_wait_ms(temperature=0.7, max_tokens=401) == 1.0
+
+
+def test_openai_online_initial_batch_wait_respects_env_overrides(monkeypatch) -> None:
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_INITIAL_BATCH_WAIT_MS", "5")
+    assert _online_initial_batch_wait_ms(temperature=0.7, max_tokens=256) == 5.0
+
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_INITIAL_BATCH_WAIT_MS", raising=False)
+    monkeypatch.setenv(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_SHORT_INITIAL_BATCH_WAIT_MS",
+        "7",
+    )
+    assert _online_initial_batch_wait_ms(temperature=0.7, max_tokens=256) == 7.0
+    monkeypatch.setenv(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_SHORT_INITIAL_BATCH_WAIT_MAX_TOKENS",
+        "300",
+    )
+    assert _online_initial_batch_wait_ms(temperature=0.7, max_tokens=300) == 7.0
+    monkeypatch.setenv(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_INITIAL_BATCH_WAIT_MS",
+        "9",
+    )
+    monkeypatch.setenv(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_INITIAL_BATCH_WAIT_MAX_TOKENS",
+        "160",
+    )
+    assert _online_initial_batch_wait_ms(temperature=0.0, max_tokens=160) == 9.0
+    assert _online_initial_batch_wait_ms(temperature=0.0, max_tokens=161) == 1.0
+
+
 def test_online_common_prefix_prefill_warmup_filters_shapes(monkeypatch) -> None:
     monkeypatch.delenv("TORCHINFERNO_OPENAI_WARMUP_ONLINE_COMMON_PREFIX_ROWS", raising=False)
     monkeypatch.delenv("TORCHINFERNO_OPENAI_WARMUP_ONLINE_COMMON_PREFIX_TOKENS", raising=False)
 
-    assert _online_common_prefix_prefill_warmup_rows(69) == (53, 68)
-    assert _online_common_prefix_prefill_warmup_rows(70) == (53, 68, 69)
+    assert _online_common_prefix_prefill_warmup_rows(49) == (48,)
+    assert _online_common_prefix_prefill_warmup_rows(69) == (48, 53, 68)
+    assert _online_common_prefix_prefill_warmup_rows(70) == (48, 53, 68, 69)
+    assert _online_common_prefix_prefill_warmup_rows(144, 128) == (48, 53, 68, 69, 128)
     assert _online_common_prefix_prefill_warmup_tokens(64) == (45,)
+    assert _online_common_prefix_suffix_prefill_warmup_tokens(64) == (16,)
+    assert _online_common_prefix_suffix_prefill_warmup_batches(49, 48) == (
+        1,
+        2,
+        4,
+        8,
+        16,
+        32,
+        48,
+    )
 
     monkeypatch.setenv("TORCHINFERNO_OPENAI_WARMUP_ONLINE_COMMON_PREFIX_ROWS", "53,96,128")
     monkeypatch.setenv("TORCHINFERNO_OPENAI_WARMUP_ONLINE_COMMON_PREFIX_TOKENS", "32,128,256")
-    assert _online_common_prefix_prefill_warmup_rows(128) == (53, 96)
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_WARMUP_ONLINE_COMMON_PREFIX_SUFFIX_TOKENS", "8,16,256")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_WARMUP_ONLINE_COMMON_PREFIX_SUFFIX_BATCHES", "8,48,96")
+    assert _online_common_prefix_prefill_warmup_rows(128, 64) == (53, 96)
     assert _online_common_prefix_prefill_warmup_tokens(128) == (32, 128)
+    assert _online_common_prefix_suffix_prefill_warmup_tokens(128) == (8, 16)
+    assert _online_common_prefix_suffix_prefill_warmup_batches(64, 128) == (8, 48)
 
 
 def test_openai_temperature_queue_batch_wait_uses_default_window(monkeypatch) -> None:
@@ -10614,6 +10821,234 @@ def test_openai_tensor_parallel_online_batcher_uses_queued_limit_for_default_row
     )
     assert first_queue.get_nowait() == 500
     assert isinstance(first_queue.get_nowait(), _GenerationDone)
+
+
+def test_openai_tensor_parallel_online_batcher_boost_uses_admitted_max_tokens(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_PERSISTENT", "0")
+    model = type("FakeTPModel", (), {"world_size": 8, "rank": 0, "allocate_cache": lambda self: None})()
+    commands: list[tuple[str, object]] = []
+
+    class RuntimeEngine:
+        def __init__(self, *args, **kwargs) -> None:  # noqa: ANN002, ANN003
+            del args, kwargs
+            self.pending: list[object] = []
+
+        def start_online(self, *, max_seq_len: int, external_cache: object | None = None) -> None:
+            del max_seq_len, external_cache
+
+        def submit_online(self, request: object) -> None:
+            self.pending.append(request)
+
+        def has_online_work(self) -> bool:
+            return bool(self.pending)
+
+        def step_online(self) -> list[object]:
+            events = [
+                types.SimpleNamespace(request_id=getattr(request, "request_id"), token=700 + index, finished=True)
+                for index, request in enumerate(self.pending)
+            ]
+            self.pending.clear()
+            return events
+
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_CONTINUOUS_BATCHER", "1")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_DECODE_QUANTUM", "1")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_INITIAL_BATCH_WAIT_MS", "0")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_IDLE_BATCH_WAIT_MS", "0")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_PREFIX_ROWS", "1")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_MAX_SEQ_LEN", "311")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_PREFILL_TOKEN_BUDGET", "0")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_KV_BOUNDED_CONCURRENCY", "1")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_KV_MAX_ACTIVE_CAP", "128")
+    monkeypatch.setattr(
+        "torchinferno.openai_server._is_tensor_parallel_model",
+        lambda candidate: candidate is model,
+    )
+    monkeypatch.setattr(
+        "torchinferno.openai_server._effective_openai_max_batch_size",
+        lambda *args, **kwargs: 256,
+    )
+    monkeypatch.setattr(
+        "torchinferno.openai_server._tensor_parallel_symm_mem_allreduce_scope",
+        lambda *args, **kwargs: nullcontext(),
+    )
+    monkeypatch.setattr("torchinferno.openai_server._RuntimeContinuousBatchEngine", RuntimeEngine)
+    monkeypatch.setattr(
+        "torchinferno.openai_server._broadcast_tensor_parallel_online_start",
+        lambda model, **kwargs: commands.append(("start", kwargs)),
+    )
+    monkeypatch.setattr(
+        "torchinferno.openai_server._broadcast_tensor_parallel_online_submit_prompt_lists",
+        lambda model, prompts, **kwargs: commands.append(("submit", (prompts, kwargs))),
+    )
+    monkeypatch.setattr(
+        "torchinferno.openai_server._broadcast_tensor_parallel_online_step",
+        lambda model, steps=1: commands.append(("step", steps)),
+    )
+    monkeypatch.setattr(
+        "torchinferno.openai_server._broadcast_tensor_parallel_online_close",
+        lambda model: commands.append(("close", None)),
+    )
+    monkeypatch.setattr(
+        "torchinferno.openai_server._sync_tensor_parallel_command",
+        lambda model, device, **kwargs: None,
+    )
+
+    engine = _cache_only_engine()
+    engine.model = model
+    engine.device = torch.device("cuda")
+    engine.stop_token_ids = frozenset()
+    engine.max_batch_size = 256
+    engine._generation_queue = queue.Queue()
+    first_queue: queue.Queue[object] = queue.Queue()
+    first = _QueuedGeneration([1] * 36, 64, 0.0, True, first_queue)
+    too_long = _QueuedGeneration([2] * 100, 256, 0.0, True, queue.Queue())
+    engine._generation_queue.put(too_long)
+
+    engine._run_tensor_parallel_online_batcher(first)
+
+    assert commands[0] == (
+        "start",
+        {
+            "max_seq_len": 311,
+            "max_active_requests": 105,
+            "prefix_cache_capacity": 1,
+            "prefill_token_budget": None,
+            "temperature": 0.0,
+            "enable_ragged_decode": True,
+            "store_reusable_prefixes": True,
+            "store_full_prompt_prefixes": True,
+            "max_tokens": 64,
+        },
+    )
+    assert commands[1] == (
+        "submit",
+        (
+            [[1] * 36],
+            {
+                "max_tokens": 64,
+                "row_max_tokens": [64],
+                "arrival_step": 0,
+                "eos_token_id": None,
+                "request_id_start": 0,
+            },
+        ),
+    )
+    assert first_queue.get_nowait() == 700
+    assert isinstance(first_queue.get_nowait(), _GenerationDone)
+    assert engine._generation_queue.get_nowait() is too_long
+
+
+def test_openai_tensor_parallel_online_batcher_records_profile_snapshots(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile_path = tmp_path / "queue-profile.jsonl"
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_QUEUE_PROFILE_JSONL", str(profile_path))
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_PROFILE_SNAPSHOT_COMMANDS", "2")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_PERSISTENT", "0")
+    model = type("FakeTPModel", (), {"world_size": 2, "rank": 0, "allocate_cache": lambda self: None})()
+
+    class RuntimeEngine:
+        def __init__(self, *args, **kwargs) -> None:  # noqa: ANN002, ANN003
+            del args, kwargs
+            self.request_id: str | None = None
+            self.steps = 0
+            self.stats = types.SimpleNamespace(
+                decode_tokens=0,
+                scheduler_steps=0,
+                queued_requests=0,
+            )
+
+        def start_online(self, *, max_seq_len: int, external_cache: object | None = None) -> None:
+            del max_seq_len, external_cache
+
+        def submit_online(self, request: object) -> None:
+            self.request_id = str(getattr(request, "request_id"))
+            self.stats.queued_requests += 1
+
+        def has_online_work(self) -> bool:
+            return self.request_id is not None
+
+        def step_online(self) -> list[object]:
+            assert self.request_id is not None
+            self.steps += 1
+            self.stats.scheduler_steps += 1
+            self.stats.decode_tokens += 1
+            finished = self.steps >= 3
+            event = types.SimpleNamespace(
+                request_id=self.request_id,
+                token=800 + self.steps,
+                finished=finished,
+            )
+            if finished:
+                self.request_id = None
+            return [event]
+
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_CONTINUOUS_BATCHER", "1")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_DECODE_QUANTUM", "1")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_INITIAL_BATCH_WAIT_MS", "0")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_IDLE_BATCH_WAIT_MS", "0")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_PREFIX_ROWS", "1")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_MAX_SEQ_LEN_HEADROOM_TOKENS", "0")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_PREFILL_TOKEN_BUDGET", "0")
+    monkeypatch.setattr(
+        "torchinferno.openai_server._is_tensor_parallel_model",
+        lambda candidate: candidate is model,
+    )
+    monkeypatch.setattr("torchinferno.openai_server._RuntimeContinuousBatchEngine", RuntimeEngine)
+    monkeypatch.setattr(
+        "torchinferno.openai_server._tensor_parallel_symm_mem_allreduce_scope",
+        lambda *args, **kwargs: nullcontext(),
+    )
+    monkeypatch.setattr(
+        "torchinferno.openai_server._broadcast_tensor_parallel_online_start",
+        lambda model, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        "torchinferno.openai_server._broadcast_tensor_parallel_online_submit_prompt_lists",
+        lambda model, prompts, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        "torchinferno.openai_server._broadcast_tensor_parallel_online_step",
+        lambda model, steps=1: None,
+    )
+    monkeypatch.setattr(
+        "torchinferno.openai_server._broadcast_tensor_parallel_online_close",
+        lambda model: None,
+    )
+    monkeypatch.setattr(
+        "torchinferno.openai_server._sync_tensor_parallel_command",
+        lambda model, device, **kwargs: None,
+    )
+
+    engine = _cache_only_engine()
+    engine.model = model
+    engine.stop_token_ids = frozenset()
+    engine.max_batch_size = 4
+    engine._generation_queue = queue.Queue()
+    first_queue: queue.Queue[object] = queue.Queue()
+    first = _QueuedGeneration([1, 2], 3, 0.0, True, first_queue)
+
+    engine._run_tensor_parallel_online_batcher(first)
+
+    assert _queue_items(first_queue) == [801, 802, 803, _GenerationDone()]
+    records = [json.loads(line) for line in profile_path.read_text().splitlines()]
+    assert [record["event"] for record in records] == [
+        "online_batcher_progress",
+        "online_batcher_progress",
+        "online_batcher",
+    ]
+    assert records[0]["profile_snapshot_index"] == 1
+    assert records[0]["online_step_commands"] == 2
+    assert records[0]["runtime_decode_tokens"] == 2
+    assert records[1]["profile_snapshot_index"] == 2
+    assert records[1]["online_step_commands"] == 3
+    assert records[1]["runtime_decode_tokens"] == 3
+    assert records[2]["profile_snapshots"] == 2
+    assert records[2]["online_step_commands"] == 3
+    assert records[2]["runtime_decode_tokens"] == 3
 
 
 def test_openai_tensor_parallel_online_default_prefix_rows(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -128,6 +128,23 @@ def test_prefix_cache_and_traffic_simulation() -> None:
     assert traffic.requests_per_second > 0
 
 
+def test_prefix_cache_remove_falls_back_to_shorter_prefix() -> None:
+    prefix_cache = PrefixCacheIndex()
+    prefix_cache.add("shared", (1, 2), route_id="shared")
+    prefix_cache.add("conversation", (1, 2, 3, 4), route_id="conversation")
+
+    match, entry = prefix_cache.lookup((1, 2, 3, 4, 5))
+    assert match.matched_tokens == (1, 2, 3, 4)
+    assert entry is not None and entry.route_id == "conversation"
+
+    assert prefix_cache.remove("conversation")
+    assert not prefix_cache.remove("missing")
+
+    match, entry = prefix_cache.lookup((1, 2, 3, 4, 5))
+    assert match.matched_tokens == (1, 2)
+    assert entry is not None and entry.route_id == "shared"
+
+
 def test_production_cli_workflows(tmp_path) -> None:
     torch.manual_seed(32)
     model = DeepSeekV32ForCausalLM(tiny_deepseek_v32_config(vocab_size=32, max_position_embeddings=16)).eval()
