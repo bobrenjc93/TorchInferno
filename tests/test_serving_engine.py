@@ -1339,6 +1339,7 @@ def test_continuous_batch_engine_chunked_online_continues_exact_prompt_on_second
     prefill_calls = engine.stats.prefill_model_calls
     decode_calls = engine.stats.decode_model_calls
     reuse_tokens = engine.stats.prefix_reuse_tokens
+    routes_before = set(engine.reusable_prefixes)
     engine.submit_online(ServingRequest("late", prompt, 2, arrival_step=0))
 
     first_events = engine.step_online()
@@ -1350,6 +1351,7 @@ def test_continuous_batch_engine_chunked_online_continues_exact_prompt_on_second
     assert engine.stats.prefill_model_calls == prefill_calls
     assert engine.stats.decode_model_calls == decode_calls
     assert engine.stats.prefix_reuse_tokens == reuse_tokens + len(prompt)
+    assert set(engine.reusable_prefixes) == routes_before
 
     second_events = engine.step_online()
 
@@ -1517,6 +1519,59 @@ def test_continuous_batch_engine_finished_prefix_cache_reuses_kv_without_logits(
     ]
     assert engine.stats.prefill_model_calls == prefill_calls + 1
     assert engine.stats.prefix_reuse_tokens >= reuse_tokens + len(finished_prefix)
+
+
+def test_continuous_batch_engine_exact_no_logits_prefix_falls_back_to_shorter() -> None:
+    prompt = tuple(range(1, 18))
+    shared = prompt[:8]
+    model = _StaticDecodeGraphToyModel(vocab_size=256)
+    engine = ContinuousBatchEngine(
+        model,
+        device=torch.device("cpu"),
+        max_active_requests=2,
+        prefix_cache_capacity=4,
+        pin_shared_prefix=True,
+        graph_prefill=True,
+    )
+    engine.start_online(max_seq_len=64)
+
+    shared_row = engine._acquire_active_row()
+    shared_ids = torch.tensor([shared], device=torch.device("cpu"), dtype=torch.long)
+    shared_logits, _ = engine._prefill_logits(
+        shared_ids,
+        cache=engine._cache_view([shared_row]),
+    )
+    engine._store_reusable_prefix_tokens(
+        ("shared", shared),
+        "shared",
+        shared,
+        shared_row,
+        shared_logits,
+    )
+    engine._release_active_row(shared_row)
+
+    full_row = engine._acquire_active_row()
+    full_ids = torch.tensor([prompt], device=torch.device("cpu"), dtype=torch.long)
+    full_logits, _ = engine._prefill_logits(full_ids, cache=engine._cache_view([full_row]))
+    engine._store_reusable_prefix_tokens(
+        ("full-no-logits", prompt),
+        "full",
+        prompt,
+        full_row,
+        full_logits,
+        store_logits=False,
+    )
+    engine._release_active_row(full_row)
+
+    exact_hit_tokens, exact_reusable = engine._lookup_prompt_reusable_prefix(prompt)
+    assert exact_hit_tokens == len(shared)
+    assert exact_reusable is not None and exact_reusable.tokens == shared
+
+    continued_hit_tokens, continued_reusable = engine._lookup_prompt_reusable_prefix(
+        (*prompt, 99)
+    )
+    assert continued_hit_tokens == len(prompt)
+    assert continued_reusable is not None and continued_reusable.tokens == prompt
 
 
 def test_continuous_batch_engine_unified_online_continues_exact_prompt_on_second_token(

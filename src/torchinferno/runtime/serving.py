@@ -606,9 +606,7 @@ class ContinuousBatchEngine:
         prefill_states: list[_ActiveRequest] = []
         exact_reuse_group: list[tuple[int, ServingRequest, int, _ReusablePrefix]] = []
         for original_index, request in admitted:
-            match, entry = self.prefix_cache.lookup(request.prompt)
-            reusable = self.reusable_prefixes.get(entry.route_id) if entry is not None else None
-            prefix_hit = match.depth if (reusable is not None and match.depth > 0) else 0
+            prefix_hit, reusable = self._lookup_prompt_reusable_prefix(request.prompt)
             if reusable is not None and prefix_hit >= len(request.prompt) and reusable.logits is not None:
                 exact_reuse_group.append((original_index, request, prefix_hit, reusable))
                 continue
@@ -819,9 +817,7 @@ class ContinuousBatchEngine:
         for original_index, request in admitted:
             if request.max_new_tokens == 0:
                 continue
-            match, entry = self.prefix_cache.lookup(request.prompt)
-            reusable = self.reusable_prefixes.get(entry.route_id) if entry is not None else None
-            prefix_hit = match.depth if (reusable is not None and match.depth > 0) else 0
+            prefix_hit, reusable = self._lookup_prompt_reusable_prefix(request.prompt)
             source_row = reusable.row if (reusable is not None and prefix_hit > 0) else -1
             if reusable is not None and prefix_hit >= len(request.prompt) and reusable.logits is not None:
                 exact_reuse_group.append((original_index, request, prefix_hit, reusable))
@@ -1038,9 +1034,7 @@ class ContinuousBatchEngine:
         for original_index, request in indexed_requests:
             if not request.prompt:
                 raise ValueError("request prompt must contain at least one token")
-            match, entry = self.prefix_cache.lookup(request.prompt)
-            reusable = self.reusable_prefixes.get(entry.route_id) if entry is not None else None
-            reusable_prefix_tokens = match.depth if reusable is not None else 0
+            reusable_prefix_tokens, reusable = self._lookup_prompt_reusable_prefix(request.prompt)
             if request.max_new_tokens == 0:
                 indexed_results.append(
                     (
@@ -1072,7 +1066,7 @@ class ContinuousBatchEngine:
                 ):
                     reusable_prefix_tokens = -1
                 prefix_batchable[(reusable_prefix_tokens, batch_suffix_len)].append(
-                    (original_index, request, match.depth, reusable)
+                    (original_index, request, len(reusable.tokens), reusable)
                 )
             else:
                 batchable[len(request.prompt)].append((original_index, request, 0))
@@ -1769,7 +1763,7 @@ class ContinuousBatchEngine:
                 prefix_hit_tokens for _original_index, _request, prefix_hit_tokens, _reusable in group
             )
 
-            active_items: list[tuple[_ActiveRequest, int, int]] = []
+            active_items: list[tuple[_ActiveRequest, int, int, _ReusablePrefix]] = []
             copy_groups: dict[tuple[int, int], list[int]] = defaultdict(list)
             continuation_reuse_groups: dict[Hashable, list[int]] = defaultdict(list)
             continuation_reuse: dict[int, _ReusablePrefix] = {}
@@ -1891,19 +1885,23 @@ class ContinuousBatchEngine:
                     started_step=step,
                 )
                 copy_groups[(_reusable.row, prefix_hit_tokens)].append(row)
-                active_items.append((state, row_index, row))
+                active_items.append((state, row_index, row, _reusable))
 
             for (source_row, prefix_hit_tokens), dest_rows in copy_groups.items():
                 self._copy_prefix_to_rows(source_row, dest_rows, prefix_hit_tokens)
-            for state, row_index, row in active_items:
+            for state, row_index, row, reusable in active_items:
                 state.seq_len = self._cache_row_seq_len(row, len(state.request.prompt))
-                self._store_reusable_prefix(
-                    state.request.request_id,
-                    state.request.prompt,
-                    row,
-                    logits_by_index[row_index],
-                    allow_pinned=self._allow_pinned_full_prompt_store(state.request),
-                )
+                if not (
+                    reusable.tokens == state.request.prompt
+                    and reusable.logits is not None
+                ):
+                    self._store_reusable_prefix(
+                        state.request.request_id,
+                        state.request.prompt,
+                        row,
+                        logits_by_index[row_index],
+                        allow_pinned=self._allow_pinned_full_prompt_store(state.request),
+                    )
                 active.append(state)
             return active
         except Exception:
@@ -3248,11 +3246,39 @@ class ContinuousBatchEngine:
             self._free_active_rows.append(replacement_active_row)
         return True
 
-    def _reusable_prefix_hit_tokens(self, prompt: tuple[int, ...]) -> int:
+    def _lookup_prompt_reusable_prefix(
+        self,
+        prompt: tuple[int, ...],
+    ) -> tuple[int, _ReusablePrefix | None]:
         match, entry = self.prefix_cache.lookup(prompt)
-        if entry is None or entry.route_id not in self.reusable_prefixes:
-            return 0
-        return match.depth
+        if entry is None or match.depth <= 0:
+            return 0, None
+        reusable = self.reusable_prefixes.get(entry.route_id)
+        if reusable is not None and (
+            match.depth < len(prompt) or reusable.logits is not None
+        ):
+            return match.depth, reusable
+
+        # A full-prompt prefix without logits cannot produce the first sampled
+        # token for the same exact prompt, but it is still useful for longer
+        # continuation prompts. Fall back to the deepest shorter live prefix.
+        best_depth = 0
+        best_prefix: _ReusablePrefix | None = None
+        for reusable in self.reusable_prefixes.values():
+            depth = len(reusable.tokens)
+            if depth <= best_depth or depth > len(prompt):
+                continue
+            if prompt[:depth] != reusable.tokens:
+                continue
+            if depth >= len(prompt) and reusable.logits is None:
+                continue
+            best_depth = depth
+            best_prefix = reusable
+        return best_depth, best_prefix
+
+    def _reusable_prefix_hit_tokens(self, prompt: tuple[int, ...]) -> int:
+        prefix_hit_tokens, _reusable = self._lookup_prompt_reusable_prefix(prompt)
+        return prefix_hit_tokens
 
     def _copy_prefix(self, source_row: int, dest_row: int, tokens: int) -> None:
         cache = self._require_cache()
