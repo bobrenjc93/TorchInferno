@@ -7,6 +7,8 @@ import inspect
 import json
 import os
 import queue
+import signal
+import subprocess
 import sys
 import threading
 import time
@@ -9551,6 +9553,7 @@ def _distributed_server_command(config: OpenAIServerConfig, argv: Sequence[str])
 
 
 def _reexec_distributed_server(config: OpenAIServerConfig, argv: Sequence[str]) -> None:
+    _prepare_tensor_parallel_symm_mem_allreduce_auto(config)
     command = _distributed_server_command(config, argv)
     print(
         "TorchInferno OpenAI server auto-launching tensor-parallel workers: "
@@ -9578,10 +9581,106 @@ def _openai_tp_symm_mem_allreduce_enabled() -> bool:
         return False
     openai_env = "TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE"
     if openai_env in os.environ:
+        raw = os.environ[openai_env].strip().lower()
+        if raw in {"auto", "probe"}:
+            return False
         return env_flag(openai_env, False)
     if global_env in os.environ:
+        raw = os.environ[global_env].strip().lower()
+        if raw in {"auto", "probe"}:
+            return False
         return env_flag(global_env, False)
     return False
+
+
+def _prepare_tensor_parallel_symm_mem_allreduce_auto(config: OpenAIServerConfig) -> None:
+    openai_env = "TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE"
+    global_env = "TORCHINFERNO_SYMM_MEM_ALLREDUCE"
+    raw_openai = os.environ.get(openai_env)
+    raw_global = os.environ.get(global_env)
+    if raw_global is not None and raw_global.strip().lower() not in {"auto", "probe"}:
+        return
+    if raw_openai is not None and raw_openai.strip().lower() not in {"auto", "probe"}:
+        return
+    if not env_flag("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_AUTO_PROBE", True):
+        os.environ[openai_env] = "0"
+        return
+    if int(getattr(config, "tensor_parallel_size", 1)) <= 1:
+        return
+    if _infer_model_kind(config) != "llama3":
+        return
+    if str(getattr(config, "llama_parallelism", "auto")).lower() == "pipeline":
+        return
+    if not torch.cuda.is_available():
+        os.environ[openai_env] = "0"
+        return
+    print(
+        "TorchInferno OpenAI server probing tensor-parallel symmetric-memory allreduce",
+        flush=True,
+    )
+    enabled = _run_tensor_parallel_symm_mem_allreduce_probe(config)
+    os.environ[openai_env] = "1" if enabled else "0"
+    print(
+        "TorchInferno OpenAI server symmetric-memory allreduce "
+        + ("enabled after probe" if enabled else "disabled after probe"),
+        flush=True,
+    )
+
+
+def _tensor_parallel_symm_mem_allreduce_probe_command(config: OpenAIServerConfig) -> list[str]:
+    return [
+        sys.executable,
+        "-m",
+        "torch.distributed.run",
+        "--standalone",
+        "--nproc-per-node",
+        str(int(getattr(config, "tensor_parallel_size", 1))),
+        "-m",
+        "torchinferno.openai_server",
+    ]
+
+
+def _run_tensor_parallel_symm_mem_allreduce_probe(config: OpenAIServerConfig) -> bool:
+    timeout_s = env_float("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_PROBE_TIMEOUT_S", 30.0, minimum=1.0)
+    env = os.environ.copy()
+    env["TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_PROBE"] = "1"
+    env["TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE"] = "1"
+    command = _tensor_parallel_symm_mem_allreduce_probe_command(config)
+    proc = subprocess.Popen(
+        command,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    try:
+        _stdout, stderr = proc.communicate(timeout=timeout_s)
+    except subprocess.TimeoutExpired:
+        _terminate_process_group(proc)
+        return False
+    if proc.returncode == 0:
+        return True
+    if env_flag("TORCHINFERNO_OPTIONAL_WARNINGS", False) and stderr:
+        print(stderr[-4000:], file=sys.stderr, flush=True)
+    return False
+
+
+def _terminate_process_group(proc: subprocess.Popen[str]) -> None:
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    try:
+        proc.wait(timeout=5.0)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return
+    proc.wait(timeout=5.0)
 
 
 def _tensor_parallel_symm_mem_allreduce_scope(
@@ -13741,7 +13840,32 @@ def config_from_args(args: argparse.Namespace) -> OpenAIServerConfig:
     )
 
 
+def _run_tensor_parallel_symm_mem_allreduce_probe_worker() -> int:
+    if not torch.cuda.is_available():
+        return 1
+    import torch.distributed as dist
+    import torch.distributed._symmetric_memory as symm_mem
+
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    torch.cuda.set_device(local_rank)
+    device = torch.device("cuda", local_rank)
+    dist.init_process_group("nccl")
+    try:
+        group_name = dist.group.WORLD.group_name
+        hidden = env_int("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_PROBE_HIDDEN", 8192, minimum=1)
+        buffer = symm_mem.empty((1, hidden), device=device, dtype=torch.bfloat16)
+        symm_mem.rendezvous(buffer, group_name)
+        buffer.zero_()
+        torch.ops.symm_mem.multimem_all_reduce_(buffer, "sum", group_name)
+        torch.cuda.synchronize(device)
+        return 0
+    finally:
+        dist.destroy_process_group()
+
+
 def main(argv: Sequence[str] | None = None) -> int:
+    if os.environ.get("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_PROBE") == "1":
+        return _run_tensor_parallel_symm_mem_allreduce_probe_worker()
     parser = build_parser()
     args = parser.parse_args(argv)
     config = config_from_args(args)
