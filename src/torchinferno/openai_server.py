@@ -290,7 +290,7 @@ def _online_initial_batch_wait_ms(*, temperature: float, max_tokens: int) -> flo
     ):
         default_wait_ms = env_float(
             "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_SHORT_INITIAL_BATCH_WAIT_MS",
-            25.0,
+            10.0,
             minimum=0.0,
         )
     elif temperature <= 0.0 and 0 < max_tokens <= env_int(
