@@ -246,6 +246,7 @@ class ContinuousBatchEngine:
         graph_prefill: bool = False,
         profile_timings: bool = False,
         admit_min_ready_requests: int | None = None,
+        admit_per_step_cap: int | None = None,
     ) -> None:
         if max_active_requests < 1:
             raise ValueError("max_active_requests must be positive")
@@ -290,6 +291,7 @@ class ContinuousBatchEngine:
         self.graph_prefill = graph_prefill
         self.profile_timings = profile_timings
         self.admit_min_ready_requests = admit_min_ready_requests
+        self.admit_per_step_cap = admit_per_step_cap
         self.unified_forward = bool(
             env_flag("TORCHINFERNO_CONTINUOUS_UNIFIED_FORWARD", False)
             and hasattr(model, "forward_step_flashinfer")
@@ -985,7 +987,9 @@ class ContinuousBatchEngine:
         # from the decode batch size (active rows can grow to max_active across
         # several steps). A larger decode batch lifts memory-bound decode
         # throughput without forcing a giant single-step prefill.
-        per_step_cap = env_int("TORCHINFERNO_CONTINUOUS_ADMIT_PER_STEP_CAP", 48, minimum=0)
+        per_step_cap = self.admit_per_step_cap
+        if per_step_cap is None:
+            per_step_cap = env_int("TORCHINFERNO_CONTINUOUS_ADMIT_PER_STEP_CAP", 48, minimum=0)
         if per_step_cap > 0:
             capacity = min(capacity, per_step_cap)
         default_min_ready_requests = self.admit_min_ready_requests

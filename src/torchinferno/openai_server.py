@@ -146,6 +146,32 @@ def _online_refill_min_ready_requests(*, temperature: float, max_tokens: int) ->
     return env_int(min_ready_env, 8, minimum=1)
 
 
+def _online_admit_per_step_cap(*, temperature: float, max_tokens: int) -> int | None:
+    runtime_env = "TORCHINFERNO_CONTINUOUS_ADMIT_PER_STEP_CAP"
+    if runtime_env in os.environ:
+        return env_int(runtime_env, 48, minimum=0)
+    default_cap = 48
+    if temperature <= 0.0 and max_tokens > env_int(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_MID_ADMIT_MIN_TOKENS",
+        128,
+        minimum=1,
+    ) and max_tokens <= env_int(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_MID_ADMIT_MAX_TOKENS",
+        300,
+        minimum=1,
+    ):
+        default_cap = env_int(
+            "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_MID_ADMIT_PER_STEP_CAP",
+            64,
+            minimum=0,
+        )
+    return env_int(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_ADMIT_PER_STEP_CAP",
+        default_cap,
+        minimum=0,
+    )
+
+
 def _online_kv_bounded_concurrency_enabled(*, temperature: float, max_tokens: int) -> bool:
     if not env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_KV_BOUNDED_CONCURRENCY", True):
         return False
@@ -2966,6 +2992,10 @@ class OpenAICompletionEngine:
                     temperature=first.temperature,
                     max_tokens=run_max_tokens,
                 ),
+                admit_per_step_cap=_online_admit_per_step_cap(
+                    temperature=first.temperature,
+                    max_tokens=run_max_tokens,
+                ),
             )
         decode_runner = getattr(self, "_decode_graph_runner", None)
         if decode_runner is not None:
@@ -3951,6 +3981,10 @@ class OpenAICompletionEngine:
                 temperature=group[0].temperature,
                 max_tokens=max_tokens,
             ),
+            admit_per_step_cap=_online_admit_per_step_cap(
+                temperature=group[0].temperature,
+                max_tokens=max_tokens,
+            ),
         )
         request_by_id = {str(index): request for index, request in enumerate(group)}
         row_max_tokens = [request.max_tokens for request in group]
@@ -4164,6 +4198,7 @@ class OpenAICompletionEngine:
             "TORCHINFERNO_OPENAI_RUNTIME_CONTINUOUS_PREFIX_CACHE_STORE_FULL_PROMPTS",
             True,
         )
+        max_tokens = max((request.max_tokens for request in group), default=0)
         runtime_engine = _RuntimeContinuousBatchEngine(
             self.model,
             device=self.device,
@@ -4178,6 +4213,10 @@ class OpenAICompletionEngine:
             graph_prefill=env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_GRAPH_PREFILL", True),
             prefill_chunk_size=(env_int("TORCHINFERNO_OPENAI_TP_ONLINE_PREFILL_CHUNK", 0, minimum=0) or None),
             profile_timings=bool(self._queue_profile_path_value()),
+            admit_per_step_cap=_online_admit_per_step_cap(
+                temperature=group[0].temperature,
+                max_tokens=max_tokens,
+            ),
         )
         request_by_id = {str(index): request for index, request in enumerate(group)}
         runtime_requests = [
@@ -10905,6 +10944,10 @@ def _tensor_parallel_worker_loop(engine: OpenAICompletionEngine) -> None:
                     temperature=temperature,
                     max_tokens=max_tokens,
                 )
+                admit_per_step_cap = _online_admit_per_step_cap(
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                )
                 # Flag-gated paged-KV worker engine -- MUST match the primary's choice
                 # (both build a PagedEngine identically + are driven by the same
                 # submit/step commands, so the deterministic page allocator keeps
@@ -10956,6 +10999,7 @@ def _tensor_parallel_worker_loop(engine: OpenAICompletionEngine) -> None:
                         graph_prefill=env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_GRAPH_PREFILL", True),
                         prefill_chunk_size=(env_int("TORCHINFERNO_OPENAI_TP_ONLINE_PREFILL_CHUNK", 0, minimum=0) or None),
                         admit_min_ready_requests=admit_min_ready_requests,
+                        admit_per_step_cap=admit_per_step_cap,
                     )
                 if worker_use_paged:
                     worker_shared_cache = None  # PagedEngine owns its own paged KV pool
@@ -11000,6 +11044,8 @@ def _tensor_parallel_worker_loop(engine: OpenAICompletionEngine) -> None:
                     )
                 if hasattr(online_runtime_engine, "admit_min_ready_requests"):
                     online_runtime_engine.admit_min_ready_requests = admit_min_ready_requests
+                if hasattr(online_runtime_engine, "admit_per_step_cap"):
+                    online_runtime_engine.admit_per_step_cap = admit_per_step_cap
                 worker_decode_runner = getattr(engine, "_decode_graph_runner", None)
                 if worker_decode_runner is not None:
                     online_runtime_engine._decode_runner = worker_decode_runner

@@ -90,6 +90,7 @@ from torchinferno.openai_server import (
     _online_common_prefix_prefill_warmup_tokens,
     _online_common_prefix_suffix_prefill_warmup_batches,
     _online_common_prefix_suffix_prefill_warmup_tokens,
+    _online_admit_per_step_cap,
     _online_decode_quantum,
     _online_initial_batch_wait_ms,
     _online_kv_bounded_concurrency_enabled,
@@ -901,6 +902,7 @@ def test_tensor_parallel_worker_loop_handles_online_runtime_commands(monkeypatch
             graph_prefill: bool = False,
             prefill_chunk_size: int | None = None,
             admit_min_ready_requests: int | None = None,
+            admit_per_step_cap: int | None = None,
         ) -> None:
             self.init_args = (
                 model,
@@ -915,6 +917,7 @@ def test_tensor_parallel_worker_loop_handles_online_runtime_commands(monkeypatch
                 store_reusable_prefixes,
                 store_full_prompt_prefixes,
                 admit_min_ready_requests,
+                admit_per_step_cap,
             )
             self.started: int | None = None
             self.submitted: list[object] = []
@@ -955,7 +958,7 @@ def test_tensor_parallel_worker_loop_handles_online_runtime_commands(monkeypatch
     runtime = instances[0]
     assert runtime.started == 16
     assert runtime.steps == 4
-    assert runtime.init_args[2:] == ("paged", 2, 0.25, 4, 2, 8, True, True, True, None)
+    assert runtime.init_args[2:] == ("paged", 2, 0.25, 4, 2, 8, True, True, True, None, 48)
     assert [(request.prompt, request.max_new_tokens, request.arrival_step, request.eos_token_id) for request in runtime.submitted] == [
         ((1, 2), 5, 7, 0),
         ((3,), 6, 7, 0),
@@ -1056,6 +1059,7 @@ def test_tensor_parallel_worker_loop_receives_online_tensor_commands(monkeypatch
             graph_prefill: bool = False,
             prefill_chunk_size: int | None = None,
             admit_min_ready_requests: int | None = None,
+            admit_per_step_cap: int | None = None,
         ) -> None:
             self.init_args = (
                 model,
@@ -1070,6 +1074,7 @@ def test_tensor_parallel_worker_loop_receives_online_tensor_commands(monkeypatch
                 store_reusable_prefixes,
                 store_full_prompt_prefixes,
                 admit_min_ready_requests,
+                admit_per_step_cap,
             )
             self.started: int | None = None
             self.submitted: list[object] = []
@@ -1115,7 +1120,7 @@ def test_tensor_parallel_worker_loop_receives_online_tensor_commands(monkeypatch
     runtime = instances[0]
     assert runtime.started == 16
     assert runtime.steps == 3
-    assert runtime.init_args[2:] == ("paged", 2, 0.25, 4, 2, 8, True, True, False, None)
+    assert runtime.init_args[2:] == ("paged", 2, 0.25, 4, 2, 8, True, True, False, None, 48)
     assert [(request.request_id, request.prompt, request.max_new_tokens) for request in runtime.submitted] == [
         ("10", (1, 2), 5),
         ("11", (3,), 6),
@@ -7559,6 +7564,30 @@ def test_openai_refill_min_ready_requests_respects_env_overrides(monkeypatch) ->
 
     monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_ADMIT_MIN_READY_REQUESTS", "4")
     assert _online_refill_min_ready_requests(temperature=0.0, max_tokens=45) is None
+
+
+def test_openai_online_admit_per_step_cap_uses_greedy_mid_default(monkeypatch) -> None:
+    monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_ADMIT_PER_STEP_CAP", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_ADMIT_PER_STEP_CAP", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_MID_ADMIT_PER_STEP_CAP", raising=False)
+
+    assert _online_admit_per_step_cap(temperature=0.0, max_tokens=64) == 48
+    assert _online_admit_per_step_cap(temperature=0.0, max_tokens=256) == 64
+    assert _online_admit_per_step_cap(temperature=0.7, max_tokens=256) == 48
+    assert _online_admit_per_step_cap(temperature=0.0, max_tokens=512) == 48
+
+
+def test_openai_online_admit_per_step_cap_respects_env_overrides(monkeypatch) -> None:
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_ADMIT_PER_STEP_CAP", "12")
+    assert _online_admit_per_step_cap(temperature=0.0, max_tokens=256) == 12
+
+    monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_ADMIT_PER_STEP_CAP", raising=False)
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_ADMIT_PER_STEP_CAP", "20")
+    assert _online_admit_per_step_cap(temperature=0.0, max_tokens=256) == 20
+
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_ADMIT_PER_STEP_CAP", raising=False)
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_MID_ADMIT_PER_STEP_CAP", "32")
+    assert _online_admit_per_step_cap(temperature=0.0, max_tokens=256) == 32
 
 
 def test_openai_online_decode_quantum_uses_greedy_mid_cap_default(monkeypatch) -> None:

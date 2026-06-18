@@ -840,6 +840,29 @@ def test_continuous_batch_engine_can_wait_for_refill_batch() -> None:
     assert by_id["second-refill"].started_step == 2
 
 
+def test_continuous_batch_engine_respects_admit_per_step_cap() -> None:
+    model = _RaggedGraphToyModel()
+    engine = ContinuousBatchEngine(
+        model,
+        device=torch.device("cpu"),
+        max_active_requests=3,
+        admit_per_step_cap=1,
+    )
+
+    results = engine.run(
+        [
+            ServingRequest("first", (1,), 2, arrival_step=0),
+            ServingRequest("second", (2,), 2, arrival_step=0),
+            ServingRequest("third", (3,), 2, arrival_step=0),
+        ]
+    )
+    by_id = {result.request_id: result for result in results}
+
+    assert by_id["first"].started_step == 0
+    assert by_id["second"].started_step == 1
+    assert by_id["third"].started_step == 2
+
+
 def test_continuous_batch_engine_batches_prefix_hit_suffix_prefill() -> None:
     model = _RaggedGraphToyModel()
     engine = ContinuousBatchEngine(
