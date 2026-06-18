@@ -4962,17 +4962,18 @@ class OpenAICompletionEngine:
             return
         if not _is_tensor_parallel_model(self.model) or self.device.type != "cuda":
             return
-        # Collective symm-mem handshake BEFORE the primary-only generate check, so
-        # primary + workers (synchronized here after the control-group warmup) vote
-        # together: any rank that cannot init multicast disables symm-mem on ALL ranks
-        # (no mismatched-collective deadlock). No-op when symm-mem is off.
-        try:
-            from torchinferno.models.llama3.tensor_parallel import (
-                validate_symm_mem_allreduce_collective as _validate_symm,
-            )
-            _validate_symm(self.model, self.device)
-        except Exception as exc:
-            warn_optional_failure("openai.symm_mem.collective_validate", exc)
+        if _openai_tp_symm_mem_allreduce_enabled():
+            # Collective symm-mem handshake BEFORE the primary-only generate check,
+            # so primary + workers (synchronized here after the control-group warmup)
+            # vote together. It is opt-in for OpenAI serving because some hosts hang
+            # inside symm_mem.rendezvous instead of raising a clean multicast error.
+            try:
+                from torchinferno.models.llama3.tensor_parallel import (
+                    validate_symm_mem_allreduce_collective as _validate_symm,
+                )
+                _validate_symm(self.model, self.device)
+            except Exception as exc:
+                warn_optional_failure("openai.symm_mem.collective_validate", exc)
         if not hasattr(self.model, "generate"):
             return
         if not _startup_warmup_enabled_for_cache_backend(str(getattr(self, "cache_backend", "dense"))):
@@ -4998,31 +4999,31 @@ class OpenAICompletionEngine:
                         update_prefix_cache=False,
                     ):
                         pass
-            self._warmup_tensor_parallel_prefill_graphs(prompt_token_counts, vocab_size)
-            self._warmup_tensor_parallel_prefix_suffix_graphs(vocab_size)
-            self._warmup_tensor_parallel_temperature_graphs(vocab_size)
-            self._warmup_tensor_parallel_resident_temperature_graphs(vocab_size)
-            self._warmup_tensor_parallel_ragged_decode_graphs(vocab_size)
-            if env_flag("TORCHINFERNO_OPENAI_WARMUP_RAGGED_DECODE_SYMM_GRAPHS", True):
-                with _tensor_parallel_symm_mem_allreduce_scope(
-                    self.model,
-                    self.device,
-                    max_tokens=1,
-                    temperature=0.0,
-                ):
-                    self._warmup_tensor_parallel_ragged_decode_graphs(vocab_size)
-            self._warmup_tensor_parallel_batched_prefix_suffix_graphs(vocab_size)
-            warmup_cache_tokens = max(
-                max(prompt_token_counts) + new_tokens,
-                env_int("TORCHINFERNO_OPENAI_WARMUP_CACHE_TOKENS", 256, minimum=1),
-            )
-            self._generation_cache(1, warmup_cache_tokens, model=self.model, pool=False)
-            _warmup_tensor_parallel_decode_attention(self.model)
-            if (
-                env_flag("TORCHINFERNO_OPENAI_UNIFIED_SCHEDULER", False)
-                or env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_CONTINUOUS_BATCHER", True)
-            ) and hasattr(self.model, "allocate_cache"):
-                self._warmup_unified_scheduler_cache(vocab_size)
+                self._warmup_tensor_parallel_prefill_graphs(prompt_token_counts, vocab_size)
+                self._warmup_tensor_parallel_prefix_suffix_graphs(vocab_size)
+                self._warmup_tensor_parallel_temperature_graphs(vocab_size)
+                self._warmup_tensor_parallel_resident_temperature_graphs(vocab_size)
+                self._warmup_tensor_parallel_ragged_decode_graphs(vocab_size)
+                if env_flag("TORCHINFERNO_OPENAI_WARMUP_RAGGED_DECODE_SYMM_GRAPHS", True):
+                    with _tensor_parallel_symm_mem_allreduce_scope(
+                        self.model,
+                        self.device,
+                        max_tokens=1,
+                        temperature=0.0,
+                    ):
+                        self._warmup_tensor_parallel_ragged_decode_graphs(vocab_size)
+                self._warmup_tensor_parallel_batched_prefix_suffix_graphs(vocab_size)
+                warmup_cache_tokens = max(
+                    max(prompt_token_counts) + new_tokens,
+                    env_int("TORCHINFERNO_OPENAI_WARMUP_CACHE_TOKENS", 256, minimum=1),
+                )
+                self._generation_cache(1, warmup_cache_tokens, model=self.model, pool=False)
+                _warmup_tensor_parallel_decode_attention(self.model)
+                if (
+                    env_flag("TORCHINFERNO_OPENAI_UNIFIED_SCHEDULER", False)
+                    or env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_CONTINUOUS_BATCHER", True)
+                ) and hasattr(self.model, "allocate_cache"):
+                    self._warmup_unified_scheduler_cache(vocab_size)
         torch.cuda.synchronize(self.device)
 
     def _warmup_tensor_parallel_prefill_graphs(
@@ -9532,6 +9533,18 @@ def _tensor_parallel_world_size(model: object) -> int:
     return int(getattr(model, "world_size", 1)) if _is_tensor_parallel_model(model) else 1
 
 
+def _openai_tp_symm_mem_allreduce_enabled() -> bool:
+    global_env = "TORCHINFERNO_SYMM_MEM_ALLREDUCE"
+    if global_env in os.environ and not env_flag(global_env, False):
+        return False
+    openai_env = "TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE"
+    if openai_env in os.environ:
+        return env_flag(openai_env, False)
+    if global_env in os.environ:
+        return env_flag(global_env, False)
+    return False
+
+
 def _tensor_parallel_symm_mem_allreduce_scope(
     model: object,
     device: torch.device,
@@ -9547,9 +9560,9 @@ def _tensor_parallel_symm_mem_allreduce_scope(
         return nullcontext()
     max_tokens_limit = env_int("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_MAX_TOKENS", 1024, minimum=1)
     if max_tokens > max_tokens_limit:
-        return nullcontext()
-    if not env_flag("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE", True):
-        return nullcontext()
+        return symm_mem_allreduce_max_batch(None, enabled=False)
+    if not _openai_tp_symm_mem_allreduce_enabled():
+        return symm_mem_allreduce_max_batch(None, enabled=False)
     max_batch = env_int("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_MAX_BATCH", 64, minimum=1)
     return symm_mem_allreduce_max_batch(max_batch, enabled=True)
 
