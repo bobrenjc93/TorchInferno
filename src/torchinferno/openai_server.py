@@ -167,16 +167,6 @@ def _online_admit_per_step_cap(*, temperature: float, max_tokens: int) -> int | 
             64,
             minimum=0,
         )
-    elif temperature <= 0.0 and max_tokens > env_int(
-        "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LONG_ADMIT_MIN_TOKENS",
-        400,
-        minimum=1,
-    ):
-        default_cap = env_int(
-            "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LONG_ADMIT_PER_STEP_CAP",
-            32,
-            minimum=0,
-        )
     return env_int(
         "TORCHINFERNO_OPENAI_TP_ONLINE_ADMIT_PER_STEP_CAP",
         default_cap,
