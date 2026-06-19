@@ -208,6 +208,46 @@ def _online_kv_bounded_max_active_cap(*, temperature: float, base_cap: int) -> i
     return min(cap, env_int(greedy_cap_env, 96, minimum=1))
 
 
+def _online_persistent_session_enabled(*, temperature: float, max_tokens: int) -> bool:
+    env_name = "TORCHINFERNO_OPENAI_TP_ONLINE_PERSISTENT"
+    if env_name in os.environ:
+        return env_flag(env_name, False)
+    if temperature > 0.0 or max_tokens < 1:
+        return False
+    min_tokens = env_int(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_PERSISTENT_GREEDY_MIN_MAX_TOKENS",
+        384,
+        minimum=1,
+    )
+    max_limit = env_int(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_PERSISTENT_GREEDY_MAX_MAX_TOKENS",
+        768,
+        minimum=1,
+    )
+    return min_tokens <= max_tokens <= max_limit
+
+
+def _online_finished_prefix_cache_override(
+    *,
+    temperature: float,
+    max_tokens: int,
+    persistent: bool,
+) -> bool | None:
+    env_name = "TORCHINFERNO_OPENAI_TP_ONLINE_FINISHED_PREFIX_CACHE"
+    if env_name in os.environ:
+        return env_flag(env_name, False)
+    if "TORCHINFERNO_CONTINUOUS_FINISHED_PREFIX_CACHE" in os.environ:
+        return None
+    if not persistent or temperature > 0.0 or max_tokens < 1:
+        return None
+    max_limit = env_int(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_FINISHED_PREFIX_CACHE_MAX_MAX_TOKENS",
+        512,
+        minimum=1,
+    )
+    return True if max_tokens <= max_limit else None
+
+
 def _online_decode_quantum(*, temperature: float, max_tokens: int) -> int:
     decode_quantum = env_int("TORCHINFERNO_OPENAI_TP_ONLINE_DECODE_QUANTUM", 16, minimum=1)
     if max_tokens < 1:
@@ -2974,36 +3014,47 @@ class OpenAICompletionEngine:
         engine_create_start_s = time.perf_counter()
         runtime_engine = self._maybe_build_paged_online_engine(max_active=max_active, max_seq_len=max_seq_len)
         use_paged_engine = runtime_engine is not None
+        persistent = _online_persistent_session_enabled(
+            temperature=first.temperature,
+            max_tokens=run_max_tokens,
+        )
+        store_finished_prefixes = _online_finished_prefix_cache_override(
+            temperature=first.temperature,
+            max_tokens=run_max_tokens,
+            persistent=persistent,
+        )
         if not use_paged_engine:
             normalized_prefill_budget = prefill_budget if prefill_budget > 0 else None
             graph_prefill = env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_GRAPH_PREFILL", True)
             prefill_chunk_size = env_int("TORCHINFERNO_OPENAI_TP_ONLINE_PREFILL_CHUNK", 0, minimum=0) or None
             pin_shared_prefix = env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_PIN_SHARED_PREFIX", True)
-            runtime_engine = _RuntimeContinuousBatchEngine(
-                self.model,
-                device=self.device,
-                cache_backend=self.cache_backend,
-                page_size=self.page_size,
-                temperature=first.temperature,
-                max_active_requests=max_active,
-                prefix_cache_capacity=prefix_rows,
-                prefill_token_budget=normalized_prefill_budget,
-                enable_ragged_decode=enable_ragged_decode,
-                store_reusable_prefixes=store_reusable_prefixes,
-                store_full_prompt_prefixes=store_full_prompt_prefixes,
-                pin_shared_prefix=pin_shared_prefix,
-                graph_prefill=graph_prefill,
-                prefill_chunk_size=prefill_chunk_size,
-                profile_timings=profile_queue,
-                admit_min_ready_requests=_online_refill_min_ready_requests(
+            runtime_kwargs: dict[str, object] = {
+                "device": self.device,
+                "cache_backend": self.cache_backend,
+                "page_size": self.page_size,
+                "temperature": first.temperature,
+                "max_active_requests": max_active,
+                "prefix_cache_capacity": prefix_rows,
+                "prefill_token_budget": normalized_prefill_budget,
+                "enable_ragged_decode": enable_ragged_decode,
+                "store_reusable_prefixes": store_reusable_prefixes,
+                "store_full_prompt_prefixes": store_full_prompt_prefixes,
+                "pin_shared_prefix": pin_shared_prefix,
+                "graph_prefill": graph_prefill,
+                "prefill_chunk_size": prefill_chunk_size,
+                "profile_timings": profile_queue,
+                "admit_min_ready_requests": _online_refill_min_ready_requests(
                     temperature=first.temperature,
                     max_tokens=run_max_tokens,
                 ),
-                admit_per_step_cap=_online_admit_per_step_cap(
+                "admit_per_step_cap": _online_admit_per_step_cap(
                     temperature=first.temperature,
                     max_tokens=run_max_tokens,
                 ),
-            )
+            }
+            if store_finished_prefixes is not None:
+                runtime_kwargs["store_finished_prefixes"] = store_finished_prefixes
+            runtime_engine = _RuntimeContinuousBatchEngine(self.model, **runtime_kwargs)
         decode_runner = getattr(self, "_decode_graph_runner", None)
         if decode_runner is not None:
             runtime_engine._decode_runner = decode_runner
@@ -3192,7 +3243,6 @@ class OpenAICompletionEngine:
                 _sync_tensor_parallel_command(self.model, self.device)
                 add_phase("start_sync_ms", start_sync_start_s)
                 submit_batch(initial_batch, arrival_step=0)
-                persistent = env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_PERSISTENT", False)
                 persistent_idle_s = _online_persistent_idle_ms(
                     temperature=first.temperature,
                     max_tokens=run_max_tokens,
@@ -3236,27 +3286,6 @@ class OpenAICompletionEngine:
                                         idle_batch.append(more)
                                     else:
                                         deferred.append(more)
-                                _broadcast_tensor_parallel_online_start(
-                                    self.model,
-                                    max_seq_len=max_seq_len,
-                                    max_active_requests=max_active,
-                                    prefix_cache_capacity=prefix_rows,
-                                    prefill_token_budget=prefill_budget if prefill_budget > 0 else None,
-                                    temperature=first.temperature,
-                                    enable_ragged_decode=enable_ragged_decode,
-                                    store_reusable_prefixes=store_reusable_prefixes,
-                                    store_full_prompt_prefixes=store_full_prompt_prefixes,
-                                    max_tokens=run_max_tokens,
-                                )
-                                _reset_generation_cache(shared_cache)
-                                runtime_engine.start_online(
-                                    max_seq_len=max_seq_len,
-                                    external_cache=shared_cache,
-                                )
-                                _sync_tensor_parallel_command(self.model, self.device)
-                                request_by_id.clear()
-                                next_request_id = 0
-                                step = 0
                             submit_batch(idle_batch, arrival_step=step)
                         continue
                     step_broadcast_start_s = time.perf_counter()
@@ -11052,6 +11081,15 @@ def _tensor_parallel_worker_loop(engine: OpenAICompletionEngine) -> None:
                     temperature=temperature,
                     max_tokens=max_tokens,
                 )
+                persistent = _online_persistent_session_enabled(
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                )
+                store_finished_prefixes = _online_finished_prefix_cache_override(
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    persistent=persistent,
+                )
                 # Flag-gated paged-KV worker engine -- MUST match the primary's choice
                 # (both build a PagedEngine identically + are driven by the same
                 # submit/step commands, so the deterministic page allocator keeps
@@ -11087,23 +11125,30 @@ def _tensor_parallel_worker_loop(engine: OpenAICompletionEngine) -> None:
                         use_graph=env_flag("TORCHINFERNO_OPENAI_PAGED_KV_GRAPH", True),
                     )
                 elif online_runtime_engine is None:
+                    runtime_kwargs: dict[str, object] = {
+                        "device": getattr(engine, "device", torch.device("cpu")),
+                        "cache_backend": str(getattr(engine, "cache_backend", "dense")),
+                        "page_size": int(getattr(engine, "page_size", 16)),
+                        "temperature": temperature,
+                        "max_active_requests": max_active,
+                        "prefix_cache_capacity": prefix_rows,
+                        "prefill_token_budget": prefill_budget_value if prefill_budget_value > 0 else None,
+                        "enable_ragged_decode": bool(payload.get("enable_ragged_decode", True)),
+                        "store_reusable_prefixes": bool(payload.get("store_reusable_prefixes", True)),
+                        "store_full_prompt_prefixes": bool(payload.get("store_full_prompt_prefixes", True)),
+                        "pin_shared_prefix": env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_PIN_SHARED_PREFIX", True),
+                        "graph_prefill": env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_GRAPH_PREFILL", True),
+                        "prefill_chunk_size": (
+                            env_int("TORCHINFERNO_OPENAI_TP_ONLINE_PREFILL_CHUNK", 0, minimum=0) or None
+                        ),
+                        "admit_min_ready_requests": admit_min_ready_requests,
+                        "admit_per_step_cap": admit_per_step_cap,
+                    }
+                    if store_finished_prefixes is not None:
+                        runtime_kwargs["store_finished_prefixes"] = store_finished_prefixes
                     online_runtime_engine = _RuntimeContinuousBatchEngine(
                         getattr(engine, "model"),
-                        device=getattr(engine, "device", torch.device("cpu")),
-                        cache_backend=str(getattr(engine, "cache_backend", "dense")),
-                        page_size=int(getattr(engine, "page_size", 16)),
-                        temperature=temperature,
-                        max_active_requests=max_active,
-                        prefix_cache_capacity=prefix_rows,
-                        prefill_token_budget=prefill_budget_value if prefill_budget_value > 0 else None,
-                        enable_ragged_decode=bool(payload.get("enable_ragged_decode", True)),
-                        store_reusable_prefixes=bool(payload.get("store_reusable_prefixes", True)),
-                        store_full_prompt_prefixes=bool(payload.get("store_full_prompt_prefixes", True)),
-                        pin_shared_prefix=env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_PIN_SHARED_PREFIX", True),
-                        graph_prefill=env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_GRAPH_PREFILL", True),
-                        prefill_chunk_size=(env_int("TORCHINFERNO_OPENAI_TP_ONLINE_PREFILL_CHUNK", 0, minimum=0) or None),
-                        admit_min_ready_requests=admit_min_ready_requests,
-                        admit_per_step_cap=admit_per_step_cap,
+                        **runtime_kwargs,
                     )
                 if worker_use_paged:
                     worker_shared_cache = None  # PagedEngine owns its own paged KV pool
