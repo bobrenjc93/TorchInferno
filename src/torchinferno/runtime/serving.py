@@ -242,7 +242,6 @@ class ContinuousBatchEngine:
         enable_ragged_decode: bool = True,
         store_reusable_prefixes: bool = True,
         store_full_prompt_prefixes: bool = True,
-        store_finished_prefixes: bool | None = None,
         pin_shared_prefix: bool = False,
         graph_prefill: bool = False,
         profile_timings: bool = False,
@@ -278,11 +277,6 @@ class ContinuousBatchEngine:
         self.enable_ragged_decode = enable_ragged_decode
         self.store_reusable_prefixes = store_reusable_prefixes
         self.store_full_prompt_prefixes = store_full_prompt_prefixes
-        self.store_finished_prefixes = (
-            env_flag("TORCHINFERNO_CONTINUOUS_FINISHED_PREFIX_CACHE", False)
-            if store_finished_prefixes is None
-            else bool(store_finished_prefixes)
-        )
         # When pinning is on, the engine caches ONLY shared common prefixes and
         # pins them against eviction, skipping per-request full-prompt stores
         # that would otherwise starve the prefix-row pool and shadow the shared
@@ -3047,7 +3041,7 @@ class ContinuousBatchEngine:
             self.prefix_cache_capacity > 0
             and self.store_reusable_prefixes
             and self.store_full_prompt_prefixes
-            and self.store_finished_prefixes
+            and env_flag("TORCHINFERNO_CONTINUOUS_FINISHED_PREFIX_CACHE", False)
         )
 
     @staticmethod
