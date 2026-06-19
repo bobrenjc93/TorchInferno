@@ -642,6 +642,7 @@ def test_continuous_batch_engine_pins_shared_prefix_across_batches() -> None:
 
 def test_continuous_batch_engine_can_opt_in_full_prompt_store_while_pinned(monkeypatch) -> None:
     monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PINNED_FULL_PROMPT_STORE_MIN_MAX_TOKENS", "2")
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_NON_COMMON_PREFIX_GRAPH_PREFILL", "1")
     shared = tuple(range(1, 17))
     model = _SelectedLogitsToyModel()
     engine = ContinuousBatchEngine(
@@ -673,9 +674,41 @@ def test_continuous_batch_engine_can_opt_in_full_prompt_store_while_pinned(monke
     assert any(rows is not None and len(rows) == 4 for rows in model.prefill_src_prefix_rows)
 
 
+def test_continuous_batch_engine_keeps_non_common_prefix_graph_opt_in(monkeypatch) -> None:
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PINNED_FULL_PROMPT_STORE_MIN_MAX_TOKENS", "2")
+    shared = tuple(range(1, 17))
+    model = _SelectedLogitsToyModel()
+    engine = ContinuousBatchEngine(
+        model,
+        device=torch.device("cpu"),
+        max_active_requests=4,
+        prefix_cache_capacity=5,
+        pin_shared_prefix=True,
+        graph_prefill=True,
+    )
+
+    results = engine.run(
+        [
+            ServingRequest("turn0-a", (*shared, 21), 2, arrival_step=0),
+            ServingRequest("turn0-b", (*shared, 22), 2, arrival_step=0),
+            ServingRequest("turn0-c", (*shared, 23), 2, arrival_step=0),
+            ServingRequest("turn1-a", (*shared, 21, 31), 2, arrival_step=2),
+            ServingRequest("turn1-b", (*shared, 22, 32), 2, arrival_step=2),
+            ServingRequest("turn1-c", (*shared, 23, 33), 2, arrival_step=2),
+        ]
+    )
+    by_id = {result.request_id: result for result in results}
+
+    assert by_id["turn1-a"].prefix_hit_tokens == len(shared) + 1
+    assert by_id["turn1-b"].prefix_hit_tokens == len(shared) + 1
+    assert by_id["turn1-c"].prefix_hit_tokens == len(shared) + 1
+    assert not any(rows is not None and len(rows) >= 3 for rows in model.prefill_src_prefix_rows)
+
+
 def test_continuous_batch_engine_can_batch_mixed_prefix_hits(monkeypatch) -> None:
     monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PINNED_FULL_PROMPT_STORE_MIN_MAX_TOKENS", "2")
     monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_MIXED_PREFIX_PREFILL", "1")
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_NON_COMMON_PREFIX_GRAPH_PREFILL", "1")
     shared = tuple(range(1, 17))
     model = _SelectedLogitsToyModel()
     engine = ContinuousBatchEngine(
@@ -2177,6 +2210,34 @@ def test_continuous_batch_engine_online_many_keeps_decode_tokens_ordered(monkeyp
     ]
     assert not engine.has_online_work()
     assert model.ragged_logits_graph_calls == 3
+
+
+def test_continuous_batch_engine_online_many_falls_back_with_eos(monkeypatch) -> None:
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY", "1")
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_UNIFORM_RAGGED_DECODE", "1")
+    model = _RaggedGraphToyModel(vocab_size=128)
+    engine = ContinuousBatchEngine(
+        model,
+        device=torch.device("cpu"),
+        max_active_requests=2,
+        prefix_cache_capacity=0,
+        enable_ragged_decode=True,
+        store_reusable_prefixes=False,
+    )
+    engine.start_online(max_seq_len=16)
+    engine.submit_online(ServingRequest("a", (1, 2, 3), 4, arrival_step=0, eos_token_id=5))
+
+    first = engine.step_online()
+    events, steps = engine.step_online_many(8)
+
+    assert [(event.request_id, event.token, event.generated, event.finished) for event in first] == [
+        ("a", 4, 1, False),
+    ]
+    assert steps == 1
+    assert [(event.request_id, event.token, event.generated, event.finished) for event in events] == [
+        ("a", 5, 2, True),
+    ]
+    assert not engine.has_online_work()
 
 
 def test_continuous_batch_engine_online_refill_can_wait_for_free_rows(monkeypatch) -> None:

@@ -449,6 +449,8 @@ class ContinuousBatchEngine:
             return False
         if self.unified_forward or not self.decode_first or self.temperature > 0.0:
             return False
+        if any(state.request.eos_token_id is not None for state in self._online_active):
+            return False
         if self._generated_prefix_cache_enabled() or self._prompt_lookup_decode_enabled():
             return False
         return self._can_decode_ragged(self._online_active)
@@ -1507,6 +1509,11 @@ class ContinuousBatchEngine:
         suffix_lengths = [len(suffix) for suffix in suffixes]
         if not suffix_lengths or min(suffix_lengths) <= 0:
             return None
+        if not env_flag("TORCHINFERNO_CONTINUOUS_NON_COMMON_PREFIX_GRAPH_PREFILL", False):
+            for _index, _request, _prefix_hit_tokens, reusable in group:
+                route_id = reusable.route_id
+                if not (isinstance(route_id, tuple) and route_id[:1] == ("common_prefix",)):
+                    return None
         cache_max_seq = self._cache_max_seq_len()
         suffix_bucket = self._suffix_bucket(max(suffix_lengths))
         if cache_max_seq is not None:
