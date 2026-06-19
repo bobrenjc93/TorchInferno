@@ -205,7 +205,11 @@ def _online_kv_bounded_max_active_cap(*, temperature: float, base_cap: int) -> i
         return min(cap, env_int(greedy_cap_env, cap, minimum=1))
     if "TORCHINFERNO_OPENAI_TP_ONLINE_KV_MAX_ACTIVE_CAP" in os.environ:
         return cap
-    return min(cap, env_int(greedy_cap_env, 96, minimum=1))
+    # Short greedy long_output requests are decode-throughput bound and benefit
+    # from using the full KV-bounded row cap. Broader greedy workloads stay on
+    # the base 48-row policy unless _online_kv_bounded_concurrency_enabled()
+    # opts them into this helper.
+    return min(cap, env_int(greedy_cap_env, 128, minimum=1))
 
 
 def _online_decode_quantum(*, temperature: float, max_tokens: int) -> int:
