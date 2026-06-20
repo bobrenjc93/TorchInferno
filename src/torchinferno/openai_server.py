@@ -2743,7 +2743,12 @@ class OpenAICompletionEngine:
                 _sync_tensor_parallel_command(self.model, self.device)
                 self._token_budget_step_state = None
 
-    def _online_serving_max_active(self) -> int:
+    def _online_serving_max_active(
+        self,
+        *,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+    ) -> int:
         # 48, restored after a benchmark regression. max_active=128 was tried
         # (commit 28f62c1) on the theory that memory-bound decode throughput
         # scales with concurrent rows. inference-bench run 20260606_220710
@@ -2751,8 +2756,28 @@ class OpenAICompletionEngine:
         # score dropped 1/20 -> 0/20. A 128-row decode step is KV-read-bound for
         # long-context workloads (multi_turn/few_shot/tree TPOT ~doubled); only
         # short-context long_output improved (30.7 -> 23.4). 48 is the better
-        # default; revisit with a KV-token-bounded decode batch, not a row cap.
-        cap = env_int("TORCHINFERNO_OPENAI_TP_ONLINE_MAX_ACTIVE", 48, minimum=1)
+        # default. Deterministic 301-512 token streams are the exception: they
+        # are prefill/queue dominated, and a 32-row cap reduces row contention
+        # without changing short-output long_output or sampled burst policy.
+        default_cap = 48
+        if temperature is not None and max_tokens is not None:
+            greedy_large_min_tokens = env_int(
+                "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_MAX_ACTIVE_MIN_TOKENS",
+                300,
+                minimum=1,
+            )
+            greedy_large_max_tokens = env_int(
+                "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_MAX_ACTIVE_MAX_TOKENS",
+                512,
+                minimum=greedy_large_min_tokens,
+            )
+            if temperature <= 0.0 and greedy_large_min_tokens < max_tokens <= greedy_large_max_tokens:
+                default_cap = env_int(
+                    "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_MAX_ACTIVE",
+                    32,
+                    minimum=1,
+                )
+        cap = env_int("TORCHINFERNO_OPENAI_TP_ONLINE_MAX_ACTIVE", default_cap, minimum=1)
         effective = _effective_openai_max_batch_size(self.model, self.device, self.max_batch_size)
         return max(1, min(cap, effective))
 
@@ -2868,7 +2893,10 @@ class OpenAICompletionEngine:
             "TORCHINFERNO_OPENAI_TP_ONLINE_PREFIX_CACHE_STORE_FULL_PROMPTS",
             True,
         )
-        max_active = self._online_serving_max_active()
+        max_active = self._online_serving_max_active(
+            temperature=first.temperature,
+            max_tokens=first.max_tokens,
+        )
         prefix_rows = self._online_serving_prefix_rows()
         prefill_budget = env_int("TORCHINFERNO_OPENAI_TP_ONLINE_PREFILL_TOKEN_BUDGET", 32768, minimum=0)
         request_by_id: dict[str, _QueuedGeneration] = {}
@@ -2950,6 +2978,16 @@ class OpenAICompletionEngine:
                 deferred.append(request)
         initial_batch = sized_initial_batch or [first]
         run_max_tokens = max(request.max_tokens for request in initial_batch)
+        policy_max_active = self._online_serving_max_active(
+            temperature=first.temperature,
+            max_tokens=run_max_tokens,
+        )
+        if policy_max_active < max_active:
+            max_active = policy_max_active
+            if len(initial_batch) > max_active:
+                deferred.extend(initial_batch[max_active:])
+                initial_batch = initial_batch[:max_active]
+                run_max_tokens = max(request.max_tokens for request in initial_batch)
         # KV-token-bounded concurrency boost: raise the admission cap for short
         # greedy/self-style sampled workloads, where extra rows cut queueing
         # without forcing larger few-shot/tree decode batches. Keep longer

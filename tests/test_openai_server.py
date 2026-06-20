@@ -11227,6 +11227,41 @@ def test_openai_tensor_parallel_online_default_prefix_rows(monkeypatch: pytest.M
     assert engine._online_serving_effective_prefix_rows(140) == 7
 
 
+def test_openai_tensor_parallel_online_max_active_uses_greedy_large_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_MAX_ACTIVE", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_MAX_ACTIVE", raising=False)
+    monkeypatch.delenv(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_MAX_ACTIVE_MIN_TOKENS",
+        raising=False,
+    )
+    monkeypatch.delenv(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_MAX_ACTIVE_MAX_TOKENS",
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "torchinferno.openai_server._effective_openai_max_batch_size",
+        lambda *args, **kwargs: 256,
+    )
+    engine = _cache_only_engine()
+    engine.model = object()
+    engine.max_batch_size = 256
+
+    assert engine._online_serving_max_active() == 48
+    assert engine._online_serving_max_active(temperature=0.0, max_tokens=300) == 48
+    assert engine._online_serving_max_active(temperature=0.0, max_tokens=301) == 32
+    assert engine._online_serving_max_active(temperature=0.0, max_tokens=512) == 32
+    assert engine._online_serving_max_active(temperature=0.0, max_tokens=513) == 48
+    assert engine._online_serving_max_active(temperature=0.7, max_tokens=512) == 48
+
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_MAX_ACTIVE", "24")
+    assert engine._online_serving_max_active(temperature=0.0, max_tokens=512) == 24
+
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_MAX_ACTIVE", "40")
+    assert engine._online_serving_max_active(temperature=0.0, max_tokens=512) == 40
+
+
 def test_kv_bounded_concurrency_cap(monkeypatch: pytest.MonkeyPatch) -> None:
     model = type("FakeTPModel", (), {"world_size": 8, "rank": 0})()
     monkeypatch.setattr(
