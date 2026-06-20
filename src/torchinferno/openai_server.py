@@ -325,9 +325,12 @@ def _online_initial_batch_wait_ms(*, temperature: float, max_tokens: int) -> flo
             minimum=sampled_short_max_tokens,
         )
         if sampled_short_max_tokens < max_tokens <= sampled_medium_max_tokens:
+            # Tree-of-thought sampled medium bursts benefit from the same shorter
+            # collection window: local TP8 A/B on 70B improved TTFT/E2E from
+            # 232.6/268.6ms at 10ms to 206.1/244.5ms at 5ms.
             default_wait_ms = env_float(
                 "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_INITIAL_BATCH_WAIT_MS",
-                10.0,
+                5.0,
                 minimum=0.0,
             )
     elif temperature <= 0.0 and 0 < max_tokens <= env_int(
