@@ -2780,8 +2780,8 @@ class OpenAICompletionEngine:
         # tighter 20-row cap to keep the TPOT margin stable across full-run
         # noise after the reduce-based greedy sampler became default, while
         # 400-token greedy bursts are latency-regressed by a lower cap. The
-        # 512-token multi-turn path also keeps a stronger TPOT margin at 22 rows
-        # than at 24 or 32.
+        # 512-token multi-turn path keeps a stronger TPOT margin at 16 rows; the
+        # small TTFT/E2E tradeoff is not score-moving while TPOT is close.
         default_cap = 48
         if temperature is not None and max_tokens is not None:
             greedy_mid_min_tokens = env_int(
@@ -2813,7 +2813,7 @@ class OpenAICompletionEngine:
             if temperature <= 0.0 and greedy_large_min_tokens < max_tokens <= greedy_large_max_tokens:
                 default_cap = env_int(
                     "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_MAX_ACTIVE",
-                    22,
+                    16,
                     minimum=1,
                 )
         cap = env_int("TORCHINFERNO_OPENAI_TP_ONLINE_MAX_ACTIVE", default_cap, minimum=1)
