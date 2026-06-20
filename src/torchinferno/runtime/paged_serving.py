@@ -772,10 +772,7 @@ class PagedEngine:
     def _ensure_decode_runner_capacity(self, request_ids: list[str]) -> None:
         if self.runner is None:
             return
-        required_pages = max(
-            (len(self.cache._sequences[rid].page_ids) for rid in request_ids),
-            default=1,
-        )
+        required_pages = self._required_pages_for(request_ids)
         if required_pages <= self.runner.max_pages:
             return
         target_pages = max(required_pages, self.runner.max_pages * 2)
@@ -785,6 +782,30 @@ class PagedEngine:
             batch=self.max_active,
             max_pages=target_pages,
         )
+
+    def _required_pages_for(self, request_ids: list[str]) -> int:
+        return max(
+            (len(self.cache._sequences[rid].page_ids) for rid in request_ids),
+            default=1,
+        )
+
+    def _ensure_spec_runner_capacity(self, request_ids: list[str], T: int) -> object:
+        required_pages = self._required_pages_for(request_ids)
+        runner = getattr(self, "_spec_runner", None)
+        if runner is not None and runner.T == T and required_pages <= runner.max_pages:
+            return runner
+        base_pages = math.ceil(self.max_seq / self.page_size) + 1
+        previous_pages = runner.max_pages if runner is not None and runner.T == T else 0
+        target_pages = max(required_pages, base_pages, previous_pages * 2)
+        runner = PagedSpecGraphRunner(
+            self.model,
+            self.cache,
+            batch=self.max_active,
+            T=T,
+            max_pages=target_pages,
+        )
+        self._spec_runner = runner
+        return runner
 
     def step(self) -> list[tuple]:
         """One continuous-batching iteration. Returns [(request_id, token, finished)]."""
@@ -930,11 +951,7 @@ class PagedEngine:
         # verify-vs-baseline-decode near-tie flips -- the inherent spec numerical property,
         # not a graph bug.] capture-at-max sizes the kernel for the full kv (growing context).
         if self.runner is not None and env_flag("TORCHINFERNO_PAGED_SPEC_GRAPH", True):
-            sr = getattr(self, "_spec_runner", None)
-            if sr is None or sr.T != 1 + k:
-                mp = math.ceil(self.max_seq / self.page_size) + 1
-                sr = PagedSpecGraphRunner(self.model, self.cache, batch=self.max_active, T=1 + k, max_pages=mp)
-                self._spec_runner = sr
+            sr = self._ensure_spec_runner_capacity(rids, 1 + k)
             out = sr.step(inp_t, starts_t, rids)  # [n, 1+k, vocab]
         else:
             bt = self.cache.block_table(rids)

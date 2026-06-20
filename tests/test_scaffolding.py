@@ -253,11 +253,61 @@ def test_paged_engine_resizes_decode_runner_for_wider_page_tables(monkeypatch) -
 
     engine.cache.reserve("short", 8)
     engine._ensure_decode_runner_capacity(["short"])
-    engine.cache.reserve("wide", 12)
+    engine.cache.reserve("wide", 16)
     engine._ensure_decode_runner_capacity(["wide"])
 
     assert created_max_pages == [2, 4]
     assert engine.runner.max_pages == 4
+
+
+def test_paged_engine_resizes_spec_runner_for_wider_page_tables(monkeypatch) -> None:
+    import torch as _t
+    import torchinferno.runtime.paged_serving as paged_serving
+
+    created_specs: list[tuple[int, int]] = []
+
+    class _FakeDecodeRunner:
+        def __init__(self, model, cache, *, batch, max_pages):
+            del model, cache, batch
+            self.max_pages = max_pages
+
+    class _FakeSpecRunner:
+        def __init__(self, model, cache, *, batch, T, max_pages):
+            del model, cache, batch
+            self.T = T
+            self.max_pages = max_pages
+            created_specs.append((T, max_pages))
+
+    class _FakeLayer:
+        local_attention_heads = 1
+        local_key_value_heads = 1
+
+    class _FakeConfig:
+        head_dim = 1
+
+    class _FakeModel:
+        device = _t.device("cpu")
+        dtype = _t.float32
+        layers = [_FakeLayer()]
+        config = _FakeConfig()
+
+    monkeypatch.setattr(paged_serving, "PagedDecodeGraphRunner", _FakeDecodeRunner)
+    monkeypatch.setattr(paged_serving, "PagedSpecGraphRunner", _FakeSpecRunner)
+    engine = paged_serving.PagedEngine(
+        _FakeModel(),
+        page_size=4,
+        max_active=2,
+        max_seq=8,
+        use_graph=True,
+    )
+
+    engine.cache.reserve("short", 8)
+    engine._ensure_spec_runner_capacity(["short"], 3)
+    engine.cache.reserve("wide", 16)
+    engine._ensure_spec_runner_capacity(["wide"], 3)
+
+    assert created_specs == [(3, 3), (3, 6)]
+    assert engine._spec_runner.max_pages == 6
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="FlashInfer paged decode needs CUDA")
