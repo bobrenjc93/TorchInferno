@@ -5148,7 +5148,7 @@ class Llama3TensorParallelForCausalLM:
         return self._sample_next_token_temperature_repeated(logits, batch_size, temperature)
 
     def _sample_next_token_greedy(self, logits: Tensor) -> Tensor:
-        if _tp_flag("TORCHINFERNO_GREEDY_SAMPLE_GATHER", True):
+        if _tp_flag("TORCHINFERNO_GREEDY_SAMPLE_GATHER", False):
             try:
                 return self._sample_next_token_greedy_gather(logits)
             except Exception as exc:

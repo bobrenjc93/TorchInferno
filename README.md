@@ -422,10 +422,10 @@ The native suite writes vLLM-shaped `latency.json`, `throughput.json`, and
 `batch-size` controls the latency benchmark; throughput and serve use
 `max-concurrency` as the engine batch limit.
 
-The tensor-parallel Llama sampler gathers greedy samples across ranks by
+The tensor-parallel Llama sampler uses the greedy distributed reduce path by
 default so every worker observes the same token. Set
-`TORCHINFERNO_GREEDY_SAMPLE_GATHER=0` to use the greedy distributed reduce
-path. Temperature sampling uses the distributed path by default; set
+`TORCHINFERNO_GREEDY_SAMPLE_GATHER=1` to try the gather-based greedy path.
+Temperature sampling uses the distributed path by default; set
 `TORCHINFERNO_TEMPERATURE_SAMPLE_GATHER=1` to try gather-based sampling and
 `TORCHINFERNO_TEMPERATURE_SAMPLE_GATHER_STRICT=1` to fail instead of falling
 back if that gather path errors.

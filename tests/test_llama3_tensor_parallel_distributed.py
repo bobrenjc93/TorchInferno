@@ -19,46 +19,46 @@ from torchinferno.models.llama3 import (
 from torchinferno.models.llama3 import tensor_parallel as tensor_parallel_module
 
 
-def test_llama3_tensor_parallel_greedy_sampler_uses_gather_by_default(monkeypatch) -> None:
-    model = object.__new__(Llama3TensorParallelForCausalLM)
-    model.device = torch.device("cpu")
-    model.rank = 0
-    model.world_size = 2
-    model.vocab_start = 0
-    model.config = type("Config", (), {"vocab_size": 8})()
-    monkeypatch.delenv("TORCHINFERNO_GREEDY_SAMPLE_GATHER", raising=False)
-
-    def gather(logits: torch.Tensor) -> torch.Tensor:
-        assert logits.shape == (1, 2)
-        return torch.tensor([5])
-
-    def all_reduce(*args, **kwargs) -> None:
-        raise AssertionError("default greedy sampling should use the gather path")
-
-    monkeypatch.setattr(model, "_sample_next_token_greedy_gather", gather)
-    monkeypatch.setattr(tensor_parallel_module.dist, "all_reduce", all_reduce)
-
-    sampled = model._sample_next_token_greedy(torch.zeros(1, 2))
-
-    assert sampled.tolist() == [5]
-
-
-def test_llama3_tensor_parallel_greedy_sampler_all_reduce_opt_out(monkeypatch) -> None:
+def test_llama3_tensor_parallel_greedy_sampler_uses_all_reduce_by_default(monkeypatch) -> None:
     model = object.__new__(Llama3TensorParallelForCausalLM)
     model.device = torch.device("cpu")
     model.rank = 0
     model.world_size = 2
     model.vocab_start = 4
     model.config = type("Config", (), {"vocab_size": 8})()
-    monkeypatch.setenv("TORCHINFERNO_GREEDY_SAMPLE_GATHER", "0")
+    monkeypatch.delenv("TORCHINFERNO_GREEDY_SAMPLE_GATHER", raising=False)
 
     def gather(logits: torch.Tensor) -> torch.Tensor:
-        raise AssertionError("greedy gather should respect the env opt-out")
+        raise AssertionError("default greedy sampling should use the all-reduce path")
 
     monkeypatch.setattr(model, "_sample_next_token_greedy_gather", gather)
     monkeypatch.setattr(tensor_parallel_module.dist, "all_reduce", lambda *args, **kwargs: None)
 
     sampled = model._sample_next_token_greedy(torch.tensor([[0.0, 3.0, 1.0]]))
+
+    assert sampled.tolist() == [5]
+
+
+def test_llama3_tensor_parallel_greedy_sampler_gather_opt_in(monkeypatch) -> None:
+    model = object.__new__(Llama3TensorParallelForCausalLM)
+    model.device = torch.device("cpu")
+    model.rank = 0
+    model.world_size = 2
+    model.vocab_start = 0
+    model.config = type("Config", (), {"vocab_size": 8})()
+    monkeypatch.setenv("TORCHINFERNO_GREEDY_SAMPLE_GATHER", "1")
+
+    def gather(logits: torch.Tensor) -> torch.Tensor:
+        assert logits.shape == (1, 2)
+        return torch.tensor([5])
+
+    def all_reduce(*args, **kwargs) -> None:
+        raise AssertionError("greedy gather opt-in should not use the all-reduce path")
+
+    monkeypatch.setattr(model, "_sample_next_token_greedy_gather", gather)
+    monkeypatch.setattr(tensor_parallel_module.dist, "all_reduce", all_reduce)
+
+    sampled = model._sample_next_token_greedy(torch.zeros(1, 2))
 
     assert sampled.tolist() == [5]
 
