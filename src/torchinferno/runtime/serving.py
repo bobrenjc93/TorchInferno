@@ -441,8 +441,7 @@ class ContinuousBatchEngine:
             events.extend(step_events)
             steps_run += 1
             steps_left -= 1
-            if step_events:
-                break
+            break
         return events, steps_run
 
     def _can_step_decode_many(self, max_steps: int) -> bool:

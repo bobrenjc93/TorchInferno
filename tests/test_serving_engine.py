@@ -2243,6 +2243,27 @@ def test_continuous_batch_engine_online_many_keeps_decode_tokens_ordered(monkeyp
     assert model.ragged_logits_graph_calls == 3
 
 
+def test_continuous_batch_engine_online_many_preserves_non_decode_pacing(monkeypatch) -> None:
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_UNIFORM_RAGGED_DECODE", "1")
+    engine = ContinuousBatchEngine(
+        _RaggedGraphToyModel(vocab_size=128),
+        device=torch.device("cpu"),
+        max_active_requests=2,
+        prefix_cache_capacity=0,
+        enable_ragged_decode=True,
+        store_reusable_prefixes=False,
+        enable_decode_many=True,
+    )
+    engine.start_online(max_seq_len=16)
+    engine.submit_online(ServingRequest("late", (1, 2, 3), 2, arrival_step=5))
+
+    events, steps = engine.step_online_many(8)
+
+    assert events == []
+    assert steps == 1
+    assert engine.has_online_work()
+
+
 def test_continuous_batch_engine_online_many_falls_back_with_eos(monkeypatch) -> None:
     monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY", "1")
     monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_UNIFORM_RAGGED_DECODE", "1")
