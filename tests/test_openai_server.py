@@ -11293,8 +11293,8 @@ def test_openai_tensor_parallel_online_max_active_uses_greedy_large_default(
     assert engine._online_serving_max_active(temperature=0.0, max_tokens=300) == 22
     assert engine._online_serving_max_active(temperature=0.0, max_tokens=301) == 48
     assert engine._online_serving_max_active(temperature=0.0, max_tokens=400) == 48
-    assert engine._online_serving_max_active(temperature=0.0, max_tokens=401) == 24
-    assert engine._online_serving_max_active(temperature=0.0, max_tokens=512) == 24
+    assert engine._online_serving_max_active(temperature=0.0, max_tokens=401) == 22
+    assert engine._online_serving_max_active(temperature=0.0, max_tokens=512) == 22
     assert engine._online_serving_max_active(temperature=0.0, max_tokens=513) == 48
     assert engine._online_serving_max_active(temperature=0.7, max_tokens=256) == 48
     assert engine._online_serving_max_active(temperature=0.7, max_tokens=512) == 48

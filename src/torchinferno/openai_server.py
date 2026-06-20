@@ -2778,8 +2778,8 @@ class OpenAICompletionEngine:
         # contention without changing short-output long_output or sampled burst
         # policy. Local TP8 A/B showed 256-token few-shot streams regain the
         # TPOT cell at 22 rows, while 400-token greedy bursts are
-        # latency-regressed by a lower cap. The 512-token multi-turn path keeps
-        # a stronger TPOT margin at 24 rows than at 32.
+        # latency-regressed by a lower cap. The 512-token multi-turn path also
+        # keeps a stronger TPOT margin at 22 rows than at 24 or 32.
         default_cap = 48
         if temperature is not None and max_tokens is not None:
             greedy_mid_min_tokens = env_int(
@@ -2811,7 +2811,7 @@ class OpenAICompletionEngine:
             if temperature <= 0.0 and greedy_large_min_tokens < max_tokens <= greedy_large_max_tokens:
                 default_cap = env_int(
                     "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_MAX_ACTIVE",
-                    24,
+                    22,
                     minimum=1,
                 )
         cap = env_int("TORCHINFERNO_OPENAI_TP_ONLINE_MAX_ACTIVE", default_cap, minimum=1)
