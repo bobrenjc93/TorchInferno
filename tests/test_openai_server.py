@@ -11288,9 +11288,9 @@ def test_openai_tensor_parallel_online_max_active_uses_greedy_large_default(
 
     assert engine._online_serving_max_active() == 48
     assert engine._online_serving_max_active(temperature=0.0, max_tokens=128) == 48
-    assert engine._online_serving_max_active(temperature=0.0, max_tokens=129) == 20
-    assert engine._online_serving_max_active(temperature=0.0, max_tokens=256) == 20
-    assert engine._online_serving_max_active(temperature=0.0, max_tokens=300) == 20
+    assert engine._online_serving_max_active(temperature=0.0, max_tokens=129) == 28
+    assert engine._online_serving_max_active(temperature=0.0, max_tokens=256) == 28
+    assert engine._online_serving_max_active(temperature=0.0, max_tokens=300) == 28
     assert engine._online_serving_max_active(temperature=0.0, max_tokens=301) == 48
     assert engine._online_serving_max_active(temperature=0.0, max_tokens=400) == 48
     assert engine._online_serving_max_active(temperature=0.0, max_tokens=401) == 16
@@ -11299,8 +11299,8 @@ def test_openai_tensor_parallel_online_max_active_uses_greedy_large_default(
     assert engine._online_serving_max_active(temperature=0.7, max_tokens=256) == 48
     assert engine._online_serving_max_active(temperature=0.7, max_tokens=512) == 48
 
-    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_MID_MAX_ACTIVE", "28")
-    assert engine._online_serving_max_active(temperature=0.0, max_tokens=256) == 28
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_MID_MAX_ACTIVE", "32")
+    assert engine._online_serving_max_active(temperature=0.0, max_tokens=256) == 32
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_MAX_ACTIVE", "24")
     assert engine._online_serving_max_active(temperature=0.0, max_tokens=512) == 24
 
