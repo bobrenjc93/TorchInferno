@@ -260,7 +260,7 @@ def _online_decode_quantum(*, temperature: float, max_tokens: int) -> int:
                 decode_quantum,
                 env_int(
                     "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_MID_GEN_DECODE_QUANTUM",
-                    5,
+                    8,
                     minimum=1,
                 ),
             )
