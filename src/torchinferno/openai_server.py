@@ -145,7 +145,18 @@ def _online_refill_min_ready_requests(*, temperature: float, max_tokens: int) ->
     )
     if max_tokens > refill_max_tokens:
         return None
-    return env_int(min_ready_env, 8, minimum=1)
+    default_min_ready = 8
+    if max_tokens > env_int(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_REFILL_MIN_TOKENS",
+        300,
+        minimum=1,
+    ):
+        default_min_ready = env_int(
+            "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_REFILL_MIN_READY_REQUESTS",
+            32,
+            minimum=1,
+        )
+    return env_int(min_ready_env, default_min_ready, minimum=1)
 
 
 def _online_admit_per_step_cap(*, temperature: float, max_tokens: int) -> int | None:

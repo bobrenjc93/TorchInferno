@@ -7596,7 +7596,9 @@ def test_openai_refill_min_ready_requests_defaults_for_short_greedy_caps(monkeyp
     assert _online_refill_min_ready_requests(temperature=0.0, max_tokens=45) == 8
     assert _online_refill_min_ready_requests(temperature=0.0, max_tokens=128) == 8
     assert _online_refill_min_ready_requests(temperature=0.0, max_tokens=256) == 8
-    assert _online_refill_min_ready_requests(temperature=0.0, max_tokens=512) == 8
+    assert _online_refill_min_ready_requests(temperature=0.0, max_tokens=300) == 8
+    assert _online_refill_min_ready_requests(temperature=0.0, max_tokens=301) == 32
+    assert _online_refill_min_ready_requests(temperature=0.0, max_tokens=512) == 32
     assert _online_refill_min_ready_requests(temperature=0.0, max_tokens=1024) is None
 
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_REFILL_MIN_READY_REQUESTS", "16")
@@ -7606,6 +7608,13 @@ def test_openai_refill_min_ready_requests_defaults_for_short_greedy_caps(monkeyp
     assert _online_refill_min_ready_requests(temperature=0.0, max_tokens=1024) is None
     assert _online_refill_min_ready_requests(temperature=0.7, max_tokens=45) is None
     assert _online_refill_min_ready_requests(temperature=0.0, max_tokens=0) is None
+
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_REFILL_MIN_READY_REQUESTS", raising=False)
+    monkeypatch.setenv(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_REFILL_MIN_READY_REQUESTS",
+        "24",
+    )
+    assert _online_refill_min_ready_requests(temperature=0.0, max_tokens=512) == 24
 
 
 def test_openai_refill_min_ready_requests_respects_env_overrides(monkeypatch) -> None:
