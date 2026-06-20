@@ -164,6 +164,19 @@ def _online_admit_per_step_cap(*, temperature: float, max_tokens: int) -> int | 
     if runtime_env in os.environ:
         return env_int(runtime_env, 48, minimum=0)
     default_cap = 48
+    if temperature <= 0.0 and 0 < max_tokens <= env_int(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_ADMIT_MAX_TOKENS",
+        128,
+        minimum=1,
+    ):
+        # Long-output-style greedy short streams are prefill/admission sensitive
+        # but still decode with the same active-row cap. Local TP8 A/B on 70B:
+        # 64 cut long_output TTFT/E2E to 311.6/1374.3ms while 96 regressed.
+        default_cap = env_int(
+            "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_ADMIT_PER_STEP_CAP",
+            64,
+            minimum=0,
+        )
     if temperature <= 0.0 and max_tokens > env_int(
         "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_MID_ADMIT_MIN_TOKENS",
         128,

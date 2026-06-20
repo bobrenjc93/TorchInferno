@@ -7634,9 +7634,10 @@ def test_openai_refill_min_ready_requests_respects_env_overrides(monkeypatch) ->
 def test_openai_online_admit_per_step_cap_uses_greedy_mid_default(monkeypatch) -> None:
     monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_ADMIT_PER_STEP_CAP", raising=False)
     monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_ADMIT_PER_STEP_CAP", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_ADMIT_PER_STEP_CAP", raising=False)
     monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_MID_ADMIT_PER_STEP_CAP", raising=False)
 
-    assert _online_admit_per_step_cap(temperature=0.0, max_tokens=64) == 48
+    assert _online_admit_per_step_cap(temperature=0.0, max_tokens=64) == 64
     assert _online_admit_per_step_cap(temperature=0.0, max_tokens=256) == 64
     assert _online_admit_per_step_cap(temperature=0.7, max_tokens=256) == 48
     assert _online_admit_per_step_cap(temperature=0.0, max_tokens=512) == 48
@@ -7651,6 +7652,10 @@ def test_openai_online_admit_per_step_cap_respects_env_overrides(monkeypatch) ->
     assert _online_admit_per_step_cap(temperature=0.0, max_tokens=256) == 20
 
     monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_ADMIT_PER_STEP_CAP", raising=False)
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_ADMIT_PER_STEP_CAP", "40")
+    assert _online_admit_per_step_cap(temperature=0.0, max_tokens=64) == 40
+
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_ADMIT_PER_STEP_CAP", raising=False)
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_MID_ADMIT_PER_STEP_CAP", "32")
     assert _online_admit_per_step_cap(temperature=0.0, max_tokens=256) == 32
 
