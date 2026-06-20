@@ -284,6 +284,21 @@ def _online_decode_quantum(*, temperature: float, max_tokens: int) -> int:
     )
 
 
+def _online_decode_many_enabled(*, temperature: float, max_tokens: int) -> bool:
+    if "TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY" in os.environ:
+        return env_flag("TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY", False)
+    if temperature > 0.0 or max_tokens < 1:
+        return False
+    greedy_short_max_tokens = env_int(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_GEN_MAX_TOKENS",
+        128,
+        minimum=1,
+    )
+    if max_tokens > greedy_short_max_tokens:
+        return False
+    return env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_DECODE_MANY", True)
+
+
 def _online_step_sync_enabled() -> bool:
     return env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_STEP_SYNC", True)
 
@@ -3079,6 +3094,10 @@ class OpenAICompletionEngine:
             stop_token_ids = frozenset()
             eos_token_id = None
         profile_queue = bool(self._queue_profile_path_value())
+        use_decode_many = _online_decode_many_enabled(
+            temperature=first.temperature,
+            max_tokens=run_max_tokens,
+        )
         engine_create_start_s = time.perf_counter()
         runtime_engine = self._maybe_build_paged_online_engine(max_active=max_active, max_seq_len=max_seq_len)
         use_paged_engine = runtime_engine is not None
@@ -3111,6 +3130,7 @@ class OpenAICompletionEngine:
                     temperature=first.temperature,
                     max_tokens=run_max_tokens,
                 ),
+                enable_decode_many=use_decode_many,
             )
         decode_runner = getattr(self, "_decode_graph_runner", None)
         if decode_runner is not None:
@@ -3120,7 +3140,7 @@ class OpenAICompletionEngine:
             temperature=first.temperature,
             max_tokens=run_max_tokens,
         )
-        use_decode_many = env_flag("TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY", False)
+        use_decode_many = bool(getattr(runtime_engine, "enable_decode_many", use_decode_many))
         profile_snapshot_commands = (
             env_int("TORCHINFERNO_OPENAI_TP_ONLINE_PROFILE_SNAPSHOT_COMMANDS", 8, minimum=0)
             if profile_queue
@@ -4077,6 +4097,10 @@ class OpenAICompletionEngine:
         )
         stop_token_ids = getattr(self, "stop_token_ids", frozenset())
         eos_token_id = next(iter(stop_token_ids)) if stop_token_ids else None
+        use_decode_many = _online_decode_many_enabled(
+            temperature=group[0].temperature,
+            max_tokens=max_tokens,
+        )
         runtime_engine = _RuntimeContinuousBatchEngine(
             self.model,
             device=self.device,
@@ -4100,6 +4124,7 @@ class OpenAICompletionEngine:
                 temperature=group[0].temperature,
                 max_tokens=max_tokens,
             ),
+            enable_decode_many=use_decode_many,
         )
         request_by_id = {str(index): request for index, request in enumerate(group)}
         row_max_tokens = [request.max_tokens for request in group]
@@ -4158,7 +4183,7 @@ class OpenAICompletionEngine:
                 while runtime_engine.has_online_work():
                     _broadcast_tensor_parallel_online_step(self.model, decode_quantum)
                     online_step_commands += 1
-                    use_decode_many = env_flag("TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY", False)
+                    use_decode_many = bool(getattr(runtime_engine, "enable_decode_many", use_decode_many))
                     remaining_steps = decode_quantum
                     while remaining_steps > 0:
                         if not runtime_engine.has_online_work():
@@ -4314,6 +4339,10 @@ class OpenAICompletionEngine:
             True,
         )
         max_tokens = max((request.max_tokens for request in group), default=0)
+        use_decode_many = _online_decode_many_enabled(
+            temperature=group[0].temperature,
+            max_tokens=max_tokens,
+        )
         runtime_engine = _RuntimeContinuousBatchEngine(
             self.model,
             device=self.device,
@@ -4332,6 +4361,7 @@ class OpenAICompletionEngine:
                 temperature=group[0].temperature,
                 max_tokens=max_tokens,
             ),
+            enable_decode_many=use_decode_many,
         )
         request_by_id = {str(index): request for index, request in enumerate(group)}
         runtime_requests = [
@@ -11212,6 +11242,10 @@ def _tensor_parallel_worker_loop(engine: OpenAICompletionEngine) -> None:
                         prefill_chunk_size=(env_int("TORCHINFERNO_OPENAI_TP_ONLINE_PREFILL_CHUNK", 0, minimum=0) or None),
                         admit_min_ready_requests=admit_min_ready_requests,
                         admit_per_step_cap=admit_per_step_cap,
+                        enable_decode_many=_online_decode_many_enabled(
+                            temperature=temperature,
+                            max_tokens=int(payload.get("max_tokens", 0)),
+                        ),
                     )
                 if worker_use_paged:
                     worker_shared_cache = None  # PagedEngine owns its own paged KV pool
@@ -11299,7 +11333,7 @@ def _tensor_parallel_worker_loop(engine: OpenAICompletionEngine) -> None:
                     raise RuntimeError("online tensor-parallel worker engine has not been started")
                 if not _online_step_sync_enabled():
                     _skip_finally_sync = True
-                use_decode_many = env_flag("TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY", False)
+                use_decode_many = bool(getattr(online_runtime_engine, "enable_decode_many", False))
                 remaining_steps = max(1, int(payload.get("steps", 1)))
                 while remaining_steps > 0:
                     if not online_runtime_engine.has_online_work():

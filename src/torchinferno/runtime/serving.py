@@ -247,6 +247,7 @@ class ContinuousBatchEngine:
         profile_timings: bool = False,
         admit_min_ready_requests: int | None = None,
         admit_per_step_cap: int | None = None,
+        enable_decode_many: bool | None = None,
     ) -> None:
         if max_active_requests < 1:
             raise ValueError("max_active_requests must be positive")
@@ -292,6 +293,11 @@ class ContinuousBatchEngine:
         self.profile_timings = profile_timings
         self.admit_min_ready_requests = admit_min_ready_requests
         self.admit_per_step_cap = admit_per_step_cap
+        self.enable_decode_many = (
+            env_flag("TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY", False)
+            if enable_decode_many is None
+            else bool(enable_decode_many)
+        )
         self.unified_forward = bool(
             env_flag("TORCHINFERNO_CONTINUOUS_UNIFIED_FORWARD", False)
             and hasattr(model, "forward_step_flashinfer")
@@ -442,7 +448,7 @@ class ContinuousBatchEngine:
     def _can_step_decode_many(self, max_steps: int) -> bool:
         if max_steps <= 1:
             return False
-        if not env_flag("TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY", False):
+        if not self.enable_decode_many:
             return False
         waiting = self._online_waiting
         if waiting or self._online_prefilling or not self._online_active:
