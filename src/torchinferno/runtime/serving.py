@@ -3062,6 +3062,10 @@ class ContinuousBatchEngine:
     def _lookup_exact_reusable_prefix(self, tokens: tuple[int, ...]) -> _ReusablePrefix | None:
         if not self._generated_prefix_cache_enabled():
             return None
+        route_id = self._generated_prefix_route_id(tokens)
+        reusable = self.reusable_prefixes.get(route_id)
+        if reusable is not None and reusable.tokens == tokens:
+            return reusable
         match, entry = self.prefix_cache.lookup(tokens)
         if entry is None or match.depth != len(tokens):
             return None

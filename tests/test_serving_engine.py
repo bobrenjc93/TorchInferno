@@ -1527,6 +1527,37 @@ def test_continuous_batch_engine_generated_prefix_store_updates_source_seq_len(
     assert engine._lookup_exact_reusable_prefix((*prompt, 18)) is not None
 
 
+def test_continuous_batch_engine_exact_generated_prefix_lookup_uses_live_route(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_GENERATED_PREFIX_CACHE", "1")
+    prompt = tuple(range(1, 18))
+    tokens = (*prompt, 18)
+    model = _StaticDecodeGraphToyModel()
+    engine = ContinuousBatchEngine(
+        model,
+        device=torch.device("cpu"),
+        max_active_requests=2,
+        prefix_cache_capacity=4,
+        pin_shared_prefix=True,
+        graph_prefill=True,
+    )
+    engine.start_online(max_seq_len=64)
+    row = engine._acquire_active_row()
+    engine._set_cache_row_seq_len(row, len(tokens))
+    engine._store_generated_reusable_prefix(
+        "req-a",
+        tokens,
+        row,
+        torch.zeros(1, 32),
+    )
+    route_id = engine._generated_prefix_route_id(tokens)
+    reusable = engine.reusable_prefixes[route_id]
+    engine.prefix_cache.remove(route_id)
+
+    assert engine._lookup_exact_reusable_prefix(tokens) is reusable
+
+
 def test_continuous_batch_engine_finished_prefix_cache_reuses_kv_without_logits(
     monkeypatch,
 ) -> None:
