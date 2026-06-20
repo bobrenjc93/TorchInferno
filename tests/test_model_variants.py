@@ -495,6 +495,90 @@ def test_llama3_tensor_parallel_temperature_sampling_uses_gumbel_max(monkeypatch
     assert calls == [dist.ReduceOp.MAX, dist.ReduceOp.MIN]
 
 
+def test_llama3_tensor_parallel_temperature_sampling_combines_broadcast(monkeypatch) -> None:
+    import torch.distributed as dist
+
+    calls: list[tuple[str, object]] = []
+
+    def all_reduce(tensor: torch.Tensor, *, op: object) -> None:
+        del tensor
+        calls.append(("all_reduce", op))
+
+    def all_gather_into_tensor(output: torch.Tensor, input_tensor: torch.Tensor) -> None:
+        output[0].copy_(input_tensor)
+        calls.append(("all_gather", tuple(output.shape)))
+
+    def broadcast(tensor: torch.Tensor, *, src: int) -> None:
+        del src
+        calls.append(("broadcast", tuple(tensor.shape)))
+
+    monkeypatch.setattr(dist, "is_available", lambda: True)
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(dist, "all_reduce", all_reduce)
+    monkeypatch.setattr(dist, "all_gather_into_tensor", all_gather_into_tensor)
+    monkeypatch.setattr(dist, "broadcast", broadcast)
+
+    model = object.__new__(Llama3TensorParallelForCausalLM)
+    model.world_size = 1
+    model.rank = 0
+    model.device = torch.device("cpu")
+    model.vocab_start = 0
+    model.local_vocab_size = 4
+    logits = torch.tensor([[1000.0, -1000.0, -1000.0, -1000.0], [-1000.0, 1000.0, -1000.0, -1000.0]])
+
+    sampled = model._sample_next_token_temperature(logits, temperature=0.7)
+
+    assert sampled.tolist() == [0, 1]
+    assert calls == [
+        ("all_reduce", dist.ReduceOp.MAX),
+        ("all_gather", (1, 2)),
+        ("broadcast", (2, 2)),
+        ("all_reduce", dist.ReduceOp.SUM),
+    ]
+
+
+def test_llama3_tensor_parallel_repeated_temperature_sampling_combines_broadcast(monkeypatch) -> None:
+    import torch.distributed as dist
+
+    calls: list[tuple[str, object]] = []
+
+    def all_reduce(tensor: torch.Tensor, *, op: object) -> None:
+        del tensor
+        calls.append(("all_reduce", op))
+
+    def all_gather_into_tensor(output: torch.Tensor, input_tensor: torch.Tensor) -> None:
+        output[0].copy_(input_tensor)
+        calls.append(("all_gather", tuple(output.shape)))
+
+    def broadcast(tensor: torch.Tensor, *, src: int) -> None:
+        del src
+        calls.append(("broadcast", tuple(tensor.shape)))
+
+    monkeypatch.setattr(dist, "is_available", lambda: True)
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(dist, "all_reduce", all_reduce)
+    monkeypatch.setattr(dist, "all_gather_into_tensor", all_gather_into_tensor)
+    monkeypatch.setattr(dist, "broadcast", broadcast)
+
+    model = object.__new__(Llama3TensorParallelForCausalLM)
+    model.world_size = 1
+    model.rank = 0
+    model.device = torch.device("cpu")
+    model.vocab_start = 0
+    model.local_vocab_size = 4
+    logits = torch.tensor([[1000.0, -1000.0, -1000.0, -1000.0]])
+
+    sampled = model._sample_next_token_temperature_repeated(logits, batch_size=3, temperature=0.7)
+
+    assert sampled.tolist() == [0, 0, 0]
+    assert calls == [
+        ("all_reduce", dist.ReduceOp.MAX),
+        ("all_gather", (1, 1)),
+        ("broadcast", (2, 3)),
+        ("all_reduce", dist.ReduceOp.SUM),
+    ]
+
+
 def test_llama3_tensor_parallel_temperature_gumbel_generators_are_rank_local() -> None:
     first = object.__new__(Llama3TensorParallelForCausalLM)
     second = object.__new__(Llama3TensorParallelForCausalLM)

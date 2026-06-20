@@ -5238,20 +5238,21 @@ class Llama3TensorParallelForCausalLM:
         )
         dist.all_gather_into_tensor(gathered_sums, local_sum.contiguous())
 
-        selected_rank = torch.empty(logits.size(0), dtype=torch.long, device=self.device)
-        local_threshold = torch.empty(logits.size(0), dtype=torch.float32, device=self.device)
+        sample_payload = torch.empty((2, logits.size(0)), dtype=torch.float32, device=self.device)
         if self.is_primary:
             cumulative = torch.cumsum(gathered_sums, dim=0)
             total = cumulative[-1]
             target = torch.rand_like(total) * total
-            selected_rank.copy_((cumulative < target[None, :]).sum(dim=0).to(torch.long))
+            selected_rank = (cumulative < target[None, :]).sum(dim=0).to(torch.long)
             row = torch.arange(logits.size(0), device=self.device)
             previous = torch.zeros_like(target)
             has_previous = selected_rank > 0
             previous[has_previous] = cumulative[selected_rank[has_previous] - 1, row[has_previous]]
-            local_threshold.copy_(target - previous)
-        dist.broadcast(selected_rank, src=0)
-        dist.broadcast(local_threshold, src=0)
+            sample_payload[0].copy_(selected_rank.to(sample_payload.dtype))
+            sample_payload[1].copy_(target - previous)
+        dist.broadcast(sample_payload, src=0)
+        selected_rank = sample_payload[0].to(torch.long)
+        local_threshold = sample_payload[1]
 
         cumulative_local = torch.cumsum(weights, dim=-1)
         local_threshold = torch.minimum(local_threshold, cumulative_local[:, -1])
@@ -5285,19 +5286,20 @@ class Llama3TensorParallelForCausalLM:
         )
         dist.all_gather_into_tensor(gathered_sums, local_sum.contiguous())
 
-        selected_rank = torch.empty(batch_size, dtype=torch.long, device=self.device)
-        local_threshold = torch.empty(batch_size, dtype=torch.float32, device=self.device)
+        sample_payload = torch.empty((2, batch_size), dtype=torch.float32, device=self.device)
         if self.is_primary:
             cumulative = torch.cumsum(gathered_sums[:, 0], dim=0)
             total = cumulative[-1]
             target = torch.rand((batch_size,), dtype=cumulative.dtype, device=self.device) * total
-            selected_rank.copy_((cumulative[:, None] < target[None, :]).sum(dim=0).to(torch.long))
+            selected_rank = (cumulative[:, None] < target[None, :]).sum(dim=0).to(torch.long)
             previous = torch.zeros_like(target)
             has_previous = selected_rank > 0
             previous[has_previous] = cumulative[selected_rank[has_previous] - 1]
-            local_threshold.copy_(target - previous)
-        dist.broadcast(selected_rank, src=0)
-        dist.broadcast(local_threshold, src=0)
+            sample_payload[0].copy_(selected_rank.to(sample_payload.dtype))
+            sample_payload[1].copy_(target - previous)
+        dist.broadcast(sample_payload, src=0)
+        selected_rank = sample_payload[0].to(torch.long)
+        local_threshold = sample_payload[1]
 
         cumulative_local = torch.cumsum(weights[0], dim=-1).contiguous()
         local_threshold = torch.minimum(local_threshold, cumulative_local[-1].expand_as(local_threshold))
