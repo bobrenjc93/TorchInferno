@@ -7694,16 +7694,20 @@ def test_openai_online_decode_quantum_respects_env_overrides(monkeypatch) -> Non
     assert _online_decode_quantum(temperature=0.0, max_tokens=256) == 2
 
 
-def test_openai_online_decode_many_defaults_to_short_greedy(monkeypatch) -> None:
+def test_openai_online_decode_many_defaults_off_for_short_greedy(monkeypatch) -> None:
     monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY", raising=False)
     monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_DECODE_MANY", raising=False)
     monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_GEN_MAX_TOKENS", raising=False)
 
-    assert _online_decode_many_enabled(temperature=0.0, max_tokens=64)
-    assert _online_decode_many_enabled(temperature=0.0, max_tokens=128)
+    assert not _online_decode_many_enabled(temperature=0.0, max_tokens=64)
+    assert not _online_decode_many_enabled(temperature=0.0, max_tokens=128)
     assert not _online_decode_many_enabled(temperature=0.0, max_tokens=256)
     assert not _online_decode_many_enabled(temperature=0.7, max_tokens=64)
     assert not _online_decode_many_enabled(temperature=0.0, max_tokens=0)
+
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_DECODE_MANY", "1")
+    assert _online_decode_many_enabled(temperature=0.0, max_tokens=64)
+    assert _online_decode_many_enabled(temperature=0.0, max_tokens=128)
 
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_GEN_MAX_TOKENS", "256")
     assert _online_decode_many_enabled(temperature=0.0, max_tokens=256)

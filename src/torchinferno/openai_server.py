@@ -296,7 +296,7 @@ def _online_decode_many_enabled(*, temperature: float, max_tokens: int) -> bool:
     )
     if max_tokens > greedy_short_max_tokens:
         return False
-    return env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_DECODE_MANY", True)
+    return env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_DECODE_MANY", False)
 
 
 def _online_step_sync_enabled() -> bool:
