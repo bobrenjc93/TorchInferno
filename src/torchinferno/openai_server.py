@@ -2776,10 +2776,10 @@ class OpenAICompletionEngine:
         # default. Deterministic medium/large max-token streams are the exception:
         # they are prefill/queue dominated, and lower row caps reduce row
         # contention without changing short-output long_output or sampled burst
-        # policy. Keep the large-generation cap above 400 tokens: local TP8
-        # A/B showed 400-token greedy bursts are latency-regressed by a lower
-        # cap, while the 512-token multi-turn path keeps a stronger TPOT margin
-        # at 24 rows than at 32.
+        # policy. Local TP8 A/B showed 256-token few-shot streams regain the
+        # TPOT cell at 22 rows, while 400-token greedy bursts are
+        # latency-regressed by a lower cap. The 512-token multi-turn path keeps
+        # a stronger TPOT margin at 24 rows than at 32.
         default_cap = 48
         if temperature is not None and max_tokens is not None:
             greedy_mid_min_tokens = env_int(
@@ -2795,7 +2795,7 @@ class OpenAICompletionEngine:
             if temperature <= 0.0 and greedy_mid_min_tokens < max_tokens <= greedy_mid_max_tokens:
                 default_cap = env_int(
                     "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_MID_MAX_ACTIVE",
-                    32,
+                    22,
                     minimum=1,
                 )
             greedy_large_min_tokens = env_int(
