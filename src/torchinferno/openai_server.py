@@ -2756,15 +2756,32 @@ class OpenAICompletionEngine:
         # score dropped 1/20 -> 0/20. A 128-row decode step is KV-read-bound for
         # long-context workloads (multi_turn/few_shot/tree TPOT ~doubled); only
         # short-context long_output improved (30.7 -> 23.4). 48 is the better
-        # default. Deterministic 301-512 token streams are the exception: they
-        # are prefill/queue dominated, and a 32-row cap reduces row contention
-        # without changing short-output long_output or sampled burst policy.
+        # default. Deterministic medium/large max-token streams are the exception:
+        # they are prefill/queue dominated, and a 32-row cap reduces row
+        # contention without changing short-output long_output or sampled burst
+        # policy.
         default_cap = 48
         if temperature is not None and max_tokens is not None:
+            greedy_mid_min_tokens = env_int(
+                "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_MID_MAX_ACTIVE_MIN_TOKENS",
+                128,
+                minimum=1,
+            )
+            greedy_mid_max_tokens = env_int(
+                "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_MID_MAX_ACTIVE_MAX_TOKENS",
+                300,
+                minimum=greedy_mid_min_tokens,
+            )
+            if temperature <= 0.0 and greedy_mid_min_tokens < max_tokens <= greedy_mid_max_tokens:
+                default_cap = env_int(
+                    "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_MID_MAX_ACTIVE",
+                    32,
+                    minimum=1,
+                )
             greedy_large_min_tokens = env_int(
                 "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_MAX_ACTIVE_MIN_TOKENS",
-                300,
-                minimum=1,
+                greedy_mid_max_tokens,
+                minimum=greedy_mid_max_tokens,
             )
             greedy_large_max_tokens = env_int(
                 "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_MAX_ACTIVE_MAX_TOKENS",

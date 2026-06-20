@@ -11231,6 +11231,15 @@ def test_openai_tensor_parallel_online_max_active_uses_greedy_large_default(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_MAX_ACTIVE", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_MID_MAX_ACTIVE", raising=False)
+    monkeypatch.delenv(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_MID_MAX_ACTIVE_MIN_TOKENS",
+        raising=False,
+    )
+    monkeypatch.delenv(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_MID_MAX_ACTIVE_MAX_TOKENS",
+        raising=False,
+    )
     monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_MAX_ACTIVE", raising=False)
     monkeypatch.delenv(
         "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_MAX_ACTIVE_MIN_TOKENS",
@@ -11249,12 +11258,18 @@ def test_openai_tensor_parallel_online_max_active_uses_greedy_large_default(
     engine.max_batch_size = 256
 
     assert engine._online_serving_max_active() == 48
-    assert engine._online_serving_max_active(temperature=0.0, max_tokens=300) == 48
+    assert engine._online_serving_max_active(temperature=0.0, max_tokens=128) == 48
+    assert engine._online_serving_max_active(temperature=0.0, max_tokens=129) == 32
+    assert engine._online_serving_max_active(temperature=0.0, max_tokens=256) == 32
+    assert engine._online_serving_max_active(temperature=0.0, max_tokens=300) == 32
     assert engine._online_serving_max_active(temperature=0.0, max_tokens=301) == 32
     assert engine._online_serving_max_active(temperature=0.0, max_tokens=512) == 32
     assert engine._online_serving_max_active(temperature=0.0, max_tokens=513) == 48
+    assert engine._online_serving_max_active(temperature=0.7, max_tokens=256) == 48
     assert engine._online_serving_max_active(temperature=0.7, max_tokens=512) == 48
 
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_MID_MAX_ACTIVE", "28")
+    assert engine._online_serving_max_active(temperature=0.0, max_tokens=256) == 28
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_MAX_ACTIVE", "24")
     assert engine._online_serving_max_active(temperature=0.0, max_tokens=512) == 24
 
