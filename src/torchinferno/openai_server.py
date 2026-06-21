@@ -236,6 +236,27 @@ def _online_kv_bounded_max_active_cap(*, temperature: float, base_cap: int) -> i
     return min(cap, env_int(greedy_cap_env, 128, minimum=1))
 
 
+def _online_kv_token_budget(*, temperature: float, max_tokens: int) -> int:
+    if "TORCHINFERNO_OPENAI_TP_ONLINE_KV_TOKEN_BUDGET" in os.environ:
+        return env_int("TORCHINFERNO_OPENAI_TP_ONLINE_KV_TOKEN_BUDGET", 64 * 512, minimum=1)
+    if temperature > 0.0 and max_tokens > 0:
+        sampled_max_tokens = env_int(
+            "TORCHINFERNO_OPENAI_TP_ONLINE_KV_BOUNDED_SAMPLED_MAX_TOKENS",
+            256,
+            minimum=1,
+        )
+        if max_tokens <= sampled_max_tokens:
+            # Self-consistency-style sampled bursts are wave-scheduling bound.
+            # Allowing 128 active rows under the fixed 144-row cache envelope
+            # cuts E2E/throughput without touching greedy long-output policy.
+            return env_int(
+                "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_KV_TOKEN_BUDGET",
+                128 * 512,
+                minimum=1,
+            )
+    return env_int("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_KV_TOKEN_BUDGET", 64 * 512, minimum=1)
+
+
 def _online_decode_quantum(*, temperature: float, max_tokens: int) -> int:
     decode_quantum = env_int("TORCHINFERNO_OPENAI_TP_ONLINE_DECODE_QUANTUM", 16, minimum=1)
     if max_tokens < 1:
@@ -3076,8 +3097,9 @@ class OpenAICompletionEngine:
             temperature=first.temperature,
             max_tokens=run_max_tokens,
         ):
-            kv_token_budget = env_int(
-                "TORCHINFERNO_OPENAI_TP_ONLINE_KV_TOKEN_BUDGET", 64 * 512, minimum=1
+            kv_token_budget = _online_kv_token_budget(
+                temperature=first.temperature,
+                max_tokens=run_max_tokens,
             )
             kv_max_active_cap = _online_kv_bounded_max_active_cap(
                 temperature=first.temperature,

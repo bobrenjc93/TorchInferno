@@ -96,6 +96,7 @@ from torchinferno.openai_server import (
     _online_initial_batch_wait_ms,
     _online_kv_bounded_concurrency_enabled,
     _online_kv_bounded_max_active_cap,
+    _online_kv_token_budget,
     _online_persistent_idle_ms,
     _online_refill_min_ready_requests,
     _online_step_sync_enabled,
@@ -7803,6 +7804,23 @@ def test_online_kv_bounded_max_active_cap_targets_greedy(monkeypatch) -> None:
     monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_KV_MAX_ACTIVE_CAP", raising=False)
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_KV_MAX_ACTIVE_CAP", "128")
     assert _online_kv_bounded_max_active_cap(temperature=0.0, base_cap=128) == 128
+
+
+def test_online_kv_token_budget_uses_sampled_short_default(monkeypatch) -> None:
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_KV_TOKEN_BUDGET", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_KV_TOKEN_BUDGET", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_KV_TOKEN_BUDGET", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_KV_BOUNDED_SAMPLED_MAX_TOKENS", raising=False)
+
+    assert _online_kv_token_budget(temperature=0.7, max_tokens=256) == 128 * 512
+    assert _online_kv_token_budget(temperature=0.7, max_tokens=300) == 64 * 512
+    assert _online_kv_token_budget(temperature=0.0, max_tokens=64) == 64 * 512
+
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_KV_TOKEN_BUDGET", "49152")
+    assert _online_kv_token_budget(temperature=0.7, max_tokens=256) == 49152
+
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_KV_TOKEN_BUDGET", "32768")
+    assert _online_kv_token_budget(temperature=0.7, max_tokens=256) == 32768
 
 
 def test_openai_online_persistent_idle_uses_sampled_short_default(monkeypatch) -> None:

@@ -21,6 +21,16 @@ prefill batches, 39 decode batches, prefill_wall_ms=1919, decode_active_ms=1199.
 So the gap is not classic inter-token TPOT; it is wave scheduling plus the
 mandatory stop-token decode.
 
+SELF sampled KV budget (2026-06-21, bd61b32/7aa3845 local focused A/B): the
+default sampled-short path used a 64*512 KV-token budget, which admitted 105
+active rows for max_seq_len=311. Raising only the sampled-short budget to
+128*512 admits the full 128-client wave while the 144-row total cache envelope
+keeps 16 prefix rows. Local 70B TP8 self_consistency improved from the current
+profiled 234.7 ms TTFT / 362.7 ms E2E / 2.8 tok/s to 243.4 / 293.0 ms /
+3.4 tok/s with 100% correctness. This should not affect tree_of_thought
+(sampled max_tokens=300 is outside the sampled KV-bounded range) or greedy
+long_output (separate greedy budget remains 64*512).
+
 SELF_CONSISTENCY RULED OUT (do not re-chase without a new hypothesis):
 - Uniform ragged decode (`TORCHINFERNO_CONTINUOUS_UNIFORM_RAGGED_DECODE=1`)
   regressed to 245.6 ms TTFT / 368.4 ms E2E / 2.7 tok/s.
