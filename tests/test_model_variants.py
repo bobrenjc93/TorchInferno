@@ -463,6 +463,52 @@ def test_llama3_tensor_parallel_ragged_decode_graph_replays_after_indexed_row_re
     torch.testing.assert_close(actual_second, expected_second, atol=5e-4, rtol=5e-4)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
+def test_llama3_tensor_parallel_prefill_logits_graph_replays_bucketed_real_last_logits(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("TORCHINFERNO_CUDAGRAPH_PREFILL", "1")
+    monkeypatch.setenv("TORCHINFERNO_CUDAGRAPH_PREFILL_BUCKETING", "1")
+    torch.manual_seed(1237)
+    config = tiny_llama3_config(
+        vocab_size=128,
+        hidden_size=512,
+        intermediate_size=1024,
+        num_hidden_layers=1,
+        num_attention_heads=64,
+        num_key_value_heads=8,
+        max_position_embeddings=32,
+    )
+    reference = Llama3V0ForCausalLM(config).eval()
+    _write_tiny_llama3_hf_checkpoint(reference, config, tmp_path)
+    model = Llama3TensorParallelForCausalLM.from_pretrained(tmp_path, dtype="float32").eval()
+    graph_cache = model.allocate_cache(1, 32)
+    capture_prompt = torch.arange(1, 17, dtype=torch.long, device=model.device).unsqueeze(0)
+    replay_prompt = torch.tensor([[5, 6, 7]], dtype=torch.long, device=model.device)
+
+    with torch.inference_mode():
+        captured = model.try_prefill_logits_graph(capture_prompt, graph_cache, capture_on_miss=True)
+        assert captured is not None
+        assert len(model._prefill_logits_graphs) == 1
+
+        graph_cache.reset()
+        actual = model.try_prefill_logits_graph(replay_prompt, graph_cache, capture_on_miss=True)
+        assert actual is not None
+        assert len(model._prefill_logits_graphs) == 1
+
+        eager_cache = model.allocate_cache(1, 32)
+        expected, _ = model.forward(
+            replay_prompt,
+            cache=eager_cache,
+            use_cache=True,
+            return_last_logits_only=True,
+            return_sharded_logits=True,
+        )
+
+    torch.testing.assert_close(actual, expected, atol=5e-4, rtol=5e-4)
+
+
 def test_llama3_tensor_parallel_temperature_sampling_uses_gumbel_max(monkeypatch) -> None:
     import torch.distributed as dist
 

@@ -1150,6 +1150,7 @@ class _StaticPrefillGraphCall:
 class _StaticPrefillLogitsGraphCall:
     graph: torch.cuda.CUDAGraph
     static_input_ids: Tensor
+    static_logit_positions: Tensor
     output_logits: Tensor
     cache: Llama3TensorParallelCache
     prompt_tokens: int
@@ -3132,6 +3133,12 @@ class Llama3TensorParallelForCausalLM:
     ) -> Tensor | None:
         initial_seq_len = cache.seq_len
         prompt_tokens = input_ids.size(1)
+        logit_positions = torch.full(
+            (input_ids.size(0),),
+            prompt_tokens - 1,
+            device=self.device,
+            dtype=torch.long,
+        )
         bucket = _prefill_bucket_size(prompt_tokens) if _tp_flag(
             "TORCHINFERNO_CUDAGRAPH_PREFILL_BUCKETING", True
         ) else None
@@ -3161,6 +3168,7 @@ class Llama3TensorParallelForCausalLM:
             or captured.initial_seq_len != initial_seq_len
             or captured.max_seq_len != cache.layers[0].max_seq_len
             or captured.static_input_ids.shape != input_ids.shape
+            or captured.static_logit_positions.shape != logit_positions.shape
         )
         if needs_capture and not capture_on_miss:
             return None
@@ -3168,7 +3176,7 @@ class Llama3TensorParallelForCausalLM:
             needs_capture = _capture_needed_on_any_rank(needs_capture, self.device)
         if needs_capture:
             try:
-                captured = self._capture_prefill_logits_graph(input_ids, cache)
+                captured = self._capture_prefill_logits_graph(input_ids, cache, logit_positions)
             except Exception:
                 self._set_cache_seq_len(cache, initial_seq_len)
                 raise
@@ -3180,27 +3188,29 @@ class Llama3TensorParallelForCausalLM:
             self._prefill_logits_graphs[key] = captured
         else:
             captured.static_input_ids.copy_(input_ids)
+            captured.static_logit_positions.copy_(logit_positions)
             self._set_cache_seq_len(cache, captured.initial_seq_len)
             captured.graph.replay()
             real_end = initial_seq_len + prompt_tokens
             self._set_cache_seq_len(cache, real_end)
-        logits = captured.output_logits
-        if bucket is not None and bucket > prompt_tokens:
-            logits = logits[:, :prompt_tokens, :]
-        return logits
+        return captured.output_logits
 
     def _capture_prefill_logits_graph(
         self,
         input_ids: Tensor,
         cache: Llama3TensorParallelCache,
+        logit_positions: Tensor,
     ) -> _StaticPrefillLogitsGraphCall:
         initial_seq_len = cache.seq_len
         end_seq_len = initial_seq_len + input_ids.size(1)
         static_input_ids = torch.empty_like(input_ids)
         static_input_ids.copy_(input_ids)
+        static_logit_positions = torch.empty_like(logit_positions, device=self.device)
+        static_logit_positions.copy_(logit_positions)
         captured = _StaticPrefillLogitsGraphCall(
             graph=torch.cuda.CUDAGraph(),
             static_input_ids=static_input_ids,
+            static_logit_positions=static_logit_positions,
             output_logits=torch.empty(
                 (input_ids.size(0), 1, self.local_vocab_size),
                 device=self.device,
@@ -3215,11 +3225,19 @@ class Llama3TensorParallelForCausalLM:
         stream.wait_stream(torch.cuda.current_stream(self.device))
         with torch.cuda.stream(stream):
             self._set_cache_seq_len(cache, initial_seq_len)
-            self._forward_prefill_static(captured.static_input_ids, cache)
+            self._forward_prefill_selected_static(
+                captured.static_input_ids,
+                cache,
+                captured.static_logit_positions,
+            )
         torch.cuda.current_stream(self.device).wait_stream(stream)
         self._set_cache_seq_len(cache, initial_seq_len)
         with torch.cuda.graph(captured.graph):
-            captured.output_logits = self._forward_prefill_static(captured.static_input_ids, cache)
+            captured.output_logits = self._forward_prefill_selected_static(
+                captured.static_input_ids,
+                cache,
+                captured.static_logit_positions,
+            )
         captured.graph.replay()
         self._set_cache_seq_len(cache, end_seq_len)
         return captured
