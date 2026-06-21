@@ -121,6 +121,21 @@ The issue is not simply too many CPU readbacks; speculative readback deferral
 still increases queue-visible latency unless decode and readback are actually
 pipelined.
 
+PROMPT-LOOKUP DECODE RECHECK (2026-06-21, 28d7c7c local slices): prompt lookup
+is still not a defaultable long_output lever. The old verifier used a full
+prefill over `[last_token, proposal...]` and was catastrophic (hundreds of
+seconds of runtime step time). A graph-decode verifier that grouped by
+`(seq_len, proposal_len)` accepted drafts but fragmented into 3733 decode graph
+calls after only 8 online commands: runtime step was already 50.9s with
+40.1s in decode model time. Regrouping mixed sequence lengths by proposal
+length cut the full run to 204 online steps and accepted 29.5k draft tokens, but
+it still regressed score metrics to 925.4 ms TTFT / 25.7 ms TPOT / 1728.1 ms
+E2E / 18.8 tok/s (100% correct). Queue profile: 1366 decode calls,
+16.9s decode model time, 3.0s CPU token readback. Conclusion: prompt lookup can
+move readback cost down, but it does not reduce autoregressive GPU decode work
+unless verification is fused into a cheaper multi-token kernel/prefill path.
+Keep it off by default.
+
 TREE TPOT PUBLIC/LOCAL DISCREPANCY (2026-06-21): public runs 20260621_175526
 and 20260621_215200 reported TorchInferno tree_of_thought TPOT 31.2-31.9 ms at
 commits 96c9b54 and 9452794, but a same-commit 96c9b54 local repro with the same
