@@ -131,7 +131,10 @@ responses), so do not bisect current commits for the public 31 ms value without
 first finding the environment/runtime difference that makes it reproducible. A
 sampled decode-many experiment with two-step EOS overcompute also regressed the
 local tree slice to 297.9 / 76.5 / 346.9 ms and 3.8 tok/s, so keep sampled
-decode-many disabled.
+decode-many disabled. Extending sampled KV-bounded eligibility to tree's
+max_tokens=300 after the sampled KV-budget change also failed locally:
+232.9 / 53.4 / 272.7 ms and 4.2 tok/s with 958/992 correct, despite sampled
+bursts reaching max_active=128. Keep the default sampled KV range capped at 256.
 
 ## LATEST RUN 20260607_101328 (built 73aa664, BEFORE rope+KV-bounded): 1/20
 
