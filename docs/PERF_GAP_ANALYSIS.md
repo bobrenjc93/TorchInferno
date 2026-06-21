@@ -95,6 +95,27 @@ but shifted the sync into decode timing (`decode_ragged_model_ms` about 0.88s ->
 ms, 24.3 tok/s). Keep decode-many gated until readback can be genuinely
 pipelined rather than just moved between timing buckets.
 
+LONG_OUTPUT CURRENT RECHECKS (2026-06-21, bd61b32 local slices): two narrower
+variants also failed. Raising greedy-short decode quantum from the default 8 to
+16 regressed to 534.1 ms TTFT / 25.2 ms TPOT / 1525.5 ms E2E / 23.3 tok/s. A
+bounded EOS-overcompute experiment that allowed only two decode-many steps kept
+100% correctness but still regressed to 387.1 / 29.1 / 1565.8 ms and 24.4 tok/s.
+The issue is not simply too many CPU readbacks; speculative readback deferral
+still increases queue-visible latency unless decode and readback are actually
+pipelined.
+
+TREE TPOT PUBLIC/LOCAL DISCREPANCY (2026-06-21): public runs 20260621_175526
+and 20260621_215200 reported TorchInferno tree_of_thought TPOT 31.2-31.9 ms at
+commits 96c9b54 and 9452794, but a same-commit 96c9b54 local repro with the same
+benchmark shape landed at 232.2 / 52.2 / 272.6 ms (TTFT/TPOT/E2E), matching
+current bd61b32 local repro at 234.1 / 51.8 / 276.9 ms. The raw output-token mix
+is effectively identical (about 560 one-token responses and about 408 two-token
+responses), so do not bisect current commits for the public 31 ms value without
+first finding the environment/runtime difference that makes it reproducible. A
+sampled decode-many experiment with two-step EOS overcompute also regressed the
+local tree slice to 297.9 / 76.5 / 346.9 ms and 3.8 tok/s, so keep sampled
+decode-many disabled.
+
 ## LATEST RUN 20260607_101328 (built 73aa664, BEFORE rope+KV-bounded): 1/20
 
 Dropped 2/20 -> 1/20, NOT from our regression: vllm IMPROVED multi_turn TPOT
