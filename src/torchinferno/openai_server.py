@@ -390,7 +390,7 @@ def _online_common_prefix_prefill_warmup_tokens(max_seq_len: int) -> tuple[int, 
     if max_seq_len <= 0:
         return ()
     tokens = _parse_positive_int_csv(
-        os.environ.get("TORCHINFERNO_OPENAI_WARMUP_ONLINE_COMMON_PREFIX_TOKENS", "64,128")
+        os.environ.get("TORCHINFERNO_OPENAI_WARMUP_ONLINE_COMMON_PREFIX_TOKENS", "45,64,128")
     )
     return tuple(token_count for token_count in tokens if token_count <= max_seq_len)
 

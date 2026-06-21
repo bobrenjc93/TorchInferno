@@ -806,6 +806,27 @@ Attention is NOT the sink (1.2%). Two real levers:
 Also still: true chunked prefill interleaved with decode so early requests
 return their first token without waiting for the whole burst.
 
+Common-prefix graph warmup A/B (2026-06-21, current `776cdb2`):
+- Restoring the legacy short common-prefix slot alongside the newer 64/128
+  warmups (`45,64,128`) fixes the tree_of_thought cold suffix-graph stall:
+  local tree TTFT/E2E/throughput moved `434.1/475.8/3.6` to
+  `219.2/259.5/4.6`. Queue profile: first sampled 256-request session prefill
+  forward dropped `3011ms -> 1008ms`.
+- It is not a universal win: the same warmup set slightly regressed the local
+  self/few slice vs `64,128` (`self` TTFT `320 -> 347`, `few` TTFT
+  `156 -> 166`). The tree regression without the short slot is much larger, so
+  the default keeps the short slot until the live full benchmark says otherwise.
+- Rejected alternatives:
+  - Disable ragged suffix graph capture on misses and fall back to eager:
+    tree regressed to `624.2ms` TTFT / `1.8 tok/s`; repeated eager suffix
+    prefills are worse than a cold capture.
+  - Dense `32..64` short-prefix sweep for only max-active suffix batch:
+    weak result (`413.1ms` TTFT) because the first session still captured
+    smaller suffix batch shapes.
+  - Narrow `40..48` band with all suffix batch buckets and one prefix row:
+    partial recovery (`280.7ms` TTFT) but worse than the legacy short slot and
+    higher startup (`261.5s`).
+
 ## Issue 2 — decode is memory-bound; throughput scales with batch
 
 long_output (tiny prompt, huge output, 64 concurrent): TPOT 30.7 vs vllm 15.1,
