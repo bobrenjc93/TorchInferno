@@ -103,6 +103,7 @@ from torchinferno.openai_server import (
     _openai_decode_graph_enabled,
     _openai_ragged_decode_graph_enabled,
     _prepare_tensor_parallel_symm_mem_allreduce_auto,
+    _run_tensor_parallel_symm_mem_allreduce_probe,
     _prefill_cache_only,
     _persistent_prompt_list_scheduler_for_group,
     _persistent_prompt_list_decode_run_payload_from_tensor_payload,
@@ -7473,6 +7474,41 @@ def test_openai_symm_mem_auto_probe_sets_worker_env_on_failure(monkeypatch) -> N
 
     assert calls == [8]
     assert os.environ["TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE"] == "0"
+
+
+@pytest.mark.parametrize(("env_timeout", "expected_timeout"), [(None, 90.0), ("12.5", 12.5)])
+def test_openai_symm_mem_probe_timeout_default_and_override(
+    monkeypatch: pytest.MonkeyPatch,
+    env_timeout: str | None,
+    expected_timeout: float,
+) -> None:
+    if env_timeout is None:
+        monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_PROBE_TIMEOUT_S", raising=False)
+    else:
+        monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_PROBE_TIMEOUT_S", env_timeout)
+
+    observed_timeouts: list[float | None] = []
+
+    class FakeProbeProcess:
+        pid = 12345
+        returncode = 0
+
+        def communicate(self, timeout: float | None = None) -> tuple[str, str]:
+            observed_timeouts.append(timeout)
+            return "", ""
+
+    def fake_popen(command, **kwargs):
+        assert command[-1] == "torchinferno.openai_server"
+        assert kwargs["env"]["TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_PROBE"] == "1"
+        assert kwargs["env"]["TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE"] == "1"
+        assert kwargs["start_new_session"] is True
+        return FakeProbeProcess()
+
+    monkeypatch.setattr("torchinferno.openai_server.subprocess.Popen", fake_popen)
+
+    config = OpenAIServerConfig(model="meta-llama/Llama-3.1", tensor_parallel_size=8)
+    assert _run_tensor_parallel_symm_mem_allreduce_probe(config) is True
+    assert observed_timeouts == [expected_timeout]
 
 
 def test_openai_symm_mem_auto_probe_honors_explicit_env(monkeypatch) -> None:

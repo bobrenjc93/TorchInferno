@@ -9784,7 +9784,7 @@ def _tensor_parallel_symm_mem_allreduce_probe_command(config: OpenAIServerConfig
 
 
 def _run_tensor_parallel_symm_mem_allreduce_probe(config: OpenAIServerConfig) -> bool:
-    timeout_s = env_float("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_PROBE_TIMEOUT_S", 30.0, minimum=1.0)
+    timeout_s = env_float("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_PROBE_TIMEOUT_S", 90.0, minimum=1.0)
     env = os.environ.copy()
     env["TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_PROBE"] = "1"
     env["TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE"] = "1"
