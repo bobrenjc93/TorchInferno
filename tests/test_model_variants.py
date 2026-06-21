@@ -26,7 +26,10 @@ from torchinferno.models.llama3 import (
     tiny_llama3_config,
 )
 from torchinferno.models.llama3.pipeline import _apply_rotary as _pipeline_apply_rotary
-from torchinferno.models.llama3.tensor_parallel import _apply_rotary_cached as _tp_apply_rotary
+from torchinferno.models.llama3.tensor_parallel import (
+    Llama3TensorParallelLayerKVCache,
+    _apply_rotary_cached as _tp_apply_rotary,
+)
 from torchinferno.models.catalog import get_model_family, list_model_families
 from torchinferno.models.variants import (
     get_model_variant,
@@ -91,6 +94,39 @@ def test_v0_variants_are_make_fx_graph_backed() -> None:
         assert "torch.ops.aten" in readable
         assert not any(key.startswith("_param_constant") for key in model.state_dict())
         torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
+
+
+def test_llama3_tp_cache_partial_seq_len_updates_invalidate_uniform_state() -> None:
+    cache = Llama3TensorParallelLayerKVCache(
+        4,
+        8,
+        1,
+        2,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+
+    cache._set_rows_seq_len((0, 1), 3)
+
+    assert cache._seq_lens == [3, 3, 0, 0]
+    assert cache._uniform_seq_len == [None]
+    with pytest.raises(ValueError):
+        _ = cache.seq_len
+
+    cache._set_rows_seq_len((0, 1, 2, 3), 3)
+    assert cache._seq_lens == [3, 3, 3, 3]
+    assert cache._uniform_seq_len == [3]
+    assert cache.seq_len == 3
+
+    cache._set_rows_seq_len((0, 2), 3)
+    assert cache._uniform_seq_len == [3]
+    assert cache.seq_len_for_rows((1, 3)) == 3
+
+    cache._set_rows_seq_len((0,), 4)
+    assert cache._seq_lens == [4, 3, 3, 3]
+    assert cache._uniform_seq_len == [None]
+    with pytest.raises(ValueError):
+        cache.seq_len_for_rows((0, 1))
 
 
 def test_llama3_v0_and_v1_are_weight_compatible() -> None:

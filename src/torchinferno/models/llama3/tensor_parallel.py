@@ -334,17 +334,19 @@ class Llama3TensorParallelLayerKVCache:
             self._seq_lens[:] = [seq_len] * len(self._seq_lens)
             self._uniform_seq_len[0] = seq_len
             return
+        prior_uniform = self._uniform_seq_len[0]
         self._seq_lens[:batch] = [seq_len] * batch
-        self._uniform_seq_len[0] = seq_len if all(value == seq_len for value in self._seq_lens) else None
+        self._uniform_seq_len[0] = seq_len if prior_uniform == seq_len else None
 
     def _set_rows_seq_len(self, rows: tuple[int, ...], seq_len: int) -> None:
         if len(rows) == len(self._seq_lens) and set(rows) == set(range(len(self._seq_lens))):
             self._seq_lens[:] = [seq_len] * len(self._seq_lens)
             self._uniform_seq_len[0] = seq_len
             return
+        prior_uniform = self._uniform_seq_len[0]
         for row in rows:
             self._seq_lens[row] = seq_len
-        self._uniform_seq_len[0] = seq_len if all(value == seq_len for value in self._seq_lens) else None
+        self._uniform_seq_len[0] = seq_len if prior_uniform == seq_len else None
 
 
 class FlashInferLayerKVCache:

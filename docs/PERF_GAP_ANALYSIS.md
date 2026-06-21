@@ -38,6 +38,22 @@ tree_of_thought from 249.8 / 53.2 / 295.2 ms to 272.1 / 51.7 / 304.6 ms. That
 does hint at a possible narrow tree TPOT lever, but it trades away TTFT/E2E and
 is not strong enough to ship as a default.
 
+GENERATED-PREFIX REUSE RE-CHECKED (2026-06-21, current 340ffe0 + env flag):
+`TORCHINFERNO_CONTINUOUS_GENERATED_PREFIX_CACHE=1` on self_consistency produced
+260.5 ms TTFT / 386.7 ms E2E / 2.6 tok/s. It stored one generated prefix but
+reused zero (`generated_prefix_store_requests=1`, reuse=0), and decode-active
+profile time rose to 1473 ms versus 1191 ms in the comparable full-run profile.
+Do not enable it by default without a new reuse-hit hypothesis.
+
+SEQ-LEN PARTIAL-ROW FASTPATH (2026-06-21): the Llama3 TP dense cache no longer
+rescans every cache row after a partial `_set_rows_seq_len` update just to
+recompute global uniformity; it preserves the uniform marker only when the prior
+state was already uniform at that seq_len, otherwise invalidates it
+conservatively. CPU microbench for 32-row updates in a 144-row cache improved the
+setter loop 2.8x. Focused few_shot/tree run was mixed but safe:
+few_shot 159.2 / 50.6 / 200.2 ms, tree_of_thought 224.5 / 52.2 / 266.6 ms. Keep
+as hot-path overhead cleanup, not a claimed score flip.
+
 ## LATEST RUN 20260607_101328 (built 73aa664, BEFORE rope+KV-bounded): 1/20
 
 Dropped 2/20 -> 1/20, NOT from our regression: vllm IMPROVED multi_turn TPOT
