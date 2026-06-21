@@ -640,6 +640,33 @@ def test_continuous_batch_engine_pins_shared_prefix_across_batches() -> None:
     assert by_id["b1-a"].tokens == base[0].tokens
 
 
+def test_continuous_batch_engine_prefers_warmed_prefix_rows(monkeypatch) -> None:
+    monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_PREFERRED_PREFIX_ROWS", raising=False)
+    engine = ContinuousBatchEngine(
+        _RaggedGraphToyModel(),
+        device=torch.device("cpu"),
+        max_active_requests=105,
+        prefix_cache_capacity=39,
+    )
+    engine.start_online(max_seq_len=8)
+
+    assert engine._acquire_prefix_row() == 128
+
+
+def test_continuous_batch_engine_preferred_prefix_rows_can_be_overridden(monkeypatch) -> None:
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PREFERRED_PREFIX_ROWS", "12,7,12,bad")
+    engine = ContinuousBatchEngine(
+        _RaggedGraphToyModel(),
+        device=torch.device("cpu"),
+        max_active_requests=10,
+        prefix_cache_capacity=5,
+    )
+    engine.start_online(max_seq_len=8)
+
+    assert engine._acquire_prefix_row() == 12
+    assert engine._acquire_prefix_row() == 10
+
+
 def test_continuous_batch_engine_can_opt_in_full_prompt_store_while_pinned(monkeypatch) -> None:
     monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PINNED_FULL_PROMPT_STORE_MIN_MAX_TOKENS", "2")
     monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_NON_COMMON_PREFIX_GRAPH_PREFILL", "1")

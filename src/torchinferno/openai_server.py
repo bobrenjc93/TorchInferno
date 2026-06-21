@@ -2327,6 +2327,11 @@ class OpenAICompletionEngine:
                 import sys as _dgr
                 print(f"[WARMUP] DecodeGraphRunner failed: {exc}", file=_dgr.stderr, flush=True)
                 self._decode_graph_runner = None
+        _reset_generation_cache(cache)
+        try:
+            delattr(cache, "_skip_capture_sync")
+        except Exception:
+            pass
         self._persistent_serving_cache = cache
 
     def _warmup_compiled_post_attention(self) -> None:

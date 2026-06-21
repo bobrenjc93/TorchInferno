@@ -26,6 +26,25 @@ def _fi_decode_graph_mode() -> str:
     return "off"
 
 
+def _preferred_prefix_rows() -> tuple[int, ...]:
+    raw = os.environ.get("TORCHINFERNO_CONTINUOUS_PREFERRED_PREFIX_ROWS", "48,53,68,69,128")
+    rows: list[int] = []
+    seen: set[int] = set()
+    for part in raw.split(","):
+        token = part.strip()
+        if not token:
+            continue
+        try:
+            row = int(token)
+        except ValueError:
+            continue
+        if row < 0 or row in seen:
+            continue
+        rows.append(row)
+        seen.add(row)
+    return tuple(rows)
+
+
 @dataclass(frozen=True)
 class ServingRequest:
     request_id: str
@@ -3386,6 +3405,10 @@ class ContinuousBatchEngine:
         if self.prefix_cache_capacity == 0:
             return None
         if self._free_prefix_rows:
+            for row in _preferred_prefix_rows():
+                if row in self._free_prefix_rows:
+                    self._free_prefix_rows.remove(row)
+                    return row
             return self._free_prefix_rows.pop()
         # Evict the oldest UNPINNED reusable prefix. Pinned routes (the active
         # shared prefix) are skipped so their KV stays a valid copy source.

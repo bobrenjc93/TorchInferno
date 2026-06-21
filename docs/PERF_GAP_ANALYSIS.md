@@ -58,6 +58,19 @@ was rejected because it made the setter loop slower than the original scan.
 Follow-up long_output validation completed 1000/1000 correct without the earlier
 stall at 371.6 / 27.7 / 1485.3 ms.
 
+SELF COMMON-PREFIX PREFILL MISS (2026-06-21): local b5efff4 full-run queue
+profiles showed self_consistency spent ~1.3s of wall time in the first
+common-prefix prefill per online session even though only one 55-token shared
+prefix was materialized. The root cause was row mismatch: startup warms
+common-prefix prefill graphs on stable rows such as 128, while runtime prefix
+allocation for the self shape (105 active + 39 prefix rows) selected row 105
+first, forcing a real-request graph capture (`prefill_graph_misses=1`). Runtime
+prefix allocation now prefers the warmed rows when they are free and then falls
+back to the existing row order. Focused CPU tests cover the default row choice
+and env override. A local 70B benchmark rerun could not complete because the
+machine entered a GPU-driver `D`-state during server startup with an unrelated
+process already occupying GPU 7; do not treat that as benchmark evidence.
+
 ## LATEST RUN 20260607_101328 (built 73aa664, BEFORE rope+KV-bounded): 1/20
 
 Dropped 2/20 -> 1/20, NOT from our regression: vllm IMPROVED multi_turn TPOT
