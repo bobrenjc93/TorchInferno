@@ -78,6 +78,23 @@ bucket through a 45-token sample. Default common-prefix warmup now captures both
 64- and 128-token buckets. This is still an env-overridable startup cost, not
 benchmark-specific prompt matching.
 
+PREFILL SYMM-MEM ALLREDUCE RECHECK (2026-06-21, e4f8de7 few_shot local slice):
+`TORCHINFERNO_SYMM_MEM_PREFILL_ALLREDUCE=1` regressed few_shot from
+156.6 / 49.0 / 198.5 ms to 173.5 / 52.1 / 223.3 ms (TTFT/TPOT/E2E). Queue
+profile showed prefill_forward_ms rising from 1286 ms to 1618 ms for the first
+few_shot online session. Keep prefill symm-mem allreduce default-off unless a
+new implementation avoids this forward-time regression.
+
+LONG_OUTPUT DECODE-MANY RECHECK (2026-06-21, e4f8de7 local slices): enabling
+`TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_DECODE_MANY=1` did not produce a
+defaultable win. The stock guard never engaged on benchmark traffic because the
+requests carry an EOS id. A temporary EOS-overcompute variant reduced the
+deferred readback counter (`decode_ragged_cpu_tokens_ms` about 10.6s -> 4.25s),
+but shifted the sync into decode timing (`decode_ragged_model_ms` about 0.88s ->
+8.81s) and did not improve score-facing throughput/E2E (371.4 / 27.4 / 1686.9
+ms, 24.3 tok/s). Keep decode-many gated until readback can be genuinely
+pipelined rather than just moved between timing buckets.
+
 ## LATEST RUN 20260607_101328 (built 73aa664, BEFORE rope+KV-bounded): 1/20
 
 Dropped 2/20 -> 1/20, NOT from our regression: vllm IMPROVED multi_turn TPOT
