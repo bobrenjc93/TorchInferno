@@ -930,12 +930,24 @@ Multi-turn A/B refresh (2026-06-21, current `82d814d`):
 - Baseline remains prefill dominated: local multi_turn `601.2ms` TTFT,
   `42.1ms` TPOT, `641.2ms` E2E, `1.9 tok/s`; queue profile ended at
   `10026ms` prefill wall vs `2160ms` decode active with `max_active=16`.
+- Current `d8846b1` recheck is the same shape: `604.0ms` TTFT,
+  `43.3ms` TPOT, `648.7ms` E2E, `1.9 tok/s`; queue profile ended at
+  `10203ms` prefill wall / `9741ms` prefill forward vs `2070ms` decode
+  active, with `65` prefill batches and no generated/finished-prefix stores.
 - Raising the greedy-large row cap to 24 is rejected again:
   `656.9ms` TTFT, `57.1ms` TPOT, `698.6ms` E2E, worse p99. The extra active
   rows cost TPOT without relieving enough prefill queueing.
 - Lowering `TORCHINFERNO_OPENAI_PAGED_KV_MIN_SEQ` to 512 is not ready:
   the server built FlashInfer decode graphs and listened, then hung before
   writing queue progress or result files on multi_turn. Keep the 1024 threshold.
+- Finished-prefix reuse with non-common 16-token prefix buckets is also
+  rejected (experimental code backed out): it cut prefill tokens
+  `81431 -> 27937` and stored `1000` finished prefixes, but fragmented into
+  `175` prefill graph calls and regressed to `2638.9ms` TTFT, `43.8ms` TPOT,
+  `2677.7ms` E2E, `0.5 tok/s`. Queue profile ended at `44780ms` prefill wall /
+  `43646ms` prefill forward. Coarser reuse is still more expensive than the
+  baseline shared-prefix path unless non-common suffixes can be fused into much
+  fewer graph shapes.
 
 Self-consistency sampled-short wait A/B (2026-06-21, current `9452794`):
 - Clean local full run with the 5ms sampled-short initial wait:
