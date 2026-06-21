@@ -277,7 +277,7 @@ class Llama3TensorParallelLayerKVCache:
 
     def clear_row(self, row: int) -> None:
         physical_row = self._physical_row(row)
-        self._seq_lens[physical_row] = 0
+        self._set_rows_seq_len((physical_row,), 0)
 
     def copy_prefix_from(
         self,
@@ -336,7 +336,11 @@ class Llama3TensorParallelLayerKVCache:
             return
         prior_uniform = self._uniform_seq_len[0]
         self._seq_lens[:batch] = [seq_len] * batch
-        self._uniform_seq_len[0] = seq_len if prior_uniform == seq_len else None
+        self._uniform_seq_len[0] = self._partial_update_uniform_seq_len(
+            seq_len,
+            updated_rows=batch,
+            prior_uniform=prior_uniform,
+        )
 
     def _set_rows_seq_len(self, rows: tuple[int, ...], seq_len: int) -> None:
         if len(rows) == len(self._seq_lens) and set(rows) == set(range(len(self._seq_lens))):
@@ -346,7 +350,24 @@ class Llama3TensorParallelLayerKVCache:
         prior_uniform = self._uniform_seq_len[0]
         for row in rows:
             self._seq_lens[row] = seq_len
-        self._uniform_seq_len[0] = seq_len if prior_uniform == seq_len else None
+        self._uniform_seq_len[0] = self._partial_update_uniform_seq_len(
+            seq_len,
+            updated_rows=len(rows),
+            prior_uniform=prior_uniform,
+        )
+
+    def _partial_update_uniform_seq_len(
+        self,
+        seq_len: int,
+        *,
+        updated_rows: int,
+        prior_uniform: int | None,
+    ) -> int | None:
+        if prior_uniform == seq_len:
+            return seq_len
+        if updated_rows * 2 >= len(self._seq_lens):
+            return seq_len if all(value == seq_len for value in self._seq_lens) else None
+        return None
 
 
 class FlashInferLayerKVCache:

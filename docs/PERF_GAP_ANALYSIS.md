@@ -45,14 +45,18 @@ reused zero (`generated_prefix_store_requests=1`, reuse=0), and decode-active
 profile time rose to 1473 ms versus 1191 ms in the comparable full-run profile.
 Do not enable it by default without a new reuse-hit hypothesis.
 
-SEQ-LEN PARTIAL-ROW FASTPATH (2026-06-21): the Llama3 TP dense cache no longer
-rescans every cache row after a partial `_set_rows_seq_len` update just to
-recompute global uniformity; it preserves the uniform marker only when the prior
-state was already uniform at that seq_len, otherwise invalidates it
-conservatively. CPU microbench for 32-row updates in a 144-row cache improved the
-setter loop 2.8x. Focused few_shot/tree run was mixed but safe:
+SEQ-LEN PARTIAL-ROW FASTPATH (2026-06-21): the Llama3 TP dense cache now uses a
+hybrid uniform-marker policy. Small partial `_set_rows_seq_len` updates skip the
+full row scan and conservatively invalidate the marker; large partial updates
+still rescan so high-row long-output batches can recover the fast global append
+path. CPU microbench for 32-row updates in a 144-row cache improved the setter
+loop about 2.0x while 128-row updates stayed even with the original scan.
+Focused few_shot/tree run was mixed but safe:
 few_shot 159.2 / 50.6 / 200.2 ms, tree_of_thought 224.5 / 52.2 / 266.6 ms. Keep
-as hot-path overhead cleanup, not a claimed score flip.
+as hot-path overhead cleanup, not a claimed score flip. A count-tracking version
+was rejected because it made the setter loop slower than the original scan.
+Follow-up long_output validation completed 1000/1000 correct without the earlier
+stall at 371.6 / 27.7 / 1485.3 ms.
 
 ## LATEST RUN 20260607_101328 (built 73aa664, BEFORE rope+KV-bounded): 1/20
 

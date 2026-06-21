@@ -128,6 +128,15 @@ def test_llama3_tp_cache_partial_seq_len_updates_invalidate_uniform_state() -> N
     with pytest.raises(ValueError):
         cache.seq_len_for_rows((0, 1))
 
+    cache._set_rows_seq_len((0,), 3)
+    assert cache._seq_lens == [3, 3, 3, 3]
+    assert cache._uniform_seq_len == [None]
+    assert cache.seq_len == 3
+
+    cache._set_rows_seq_len((0, 1), 3)
+    assert cache._uniform_seq_len == [3]
+    assert cache.seq_len == 3
+
 
 def test_llama3_v0_and_v1_are_weight_compatible() -> None:
     torch.manual_seed(50)
