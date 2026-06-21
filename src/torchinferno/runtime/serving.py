@@ -2446,9 +2446,14 @@ class ContinuousBatchEngine:
         *,
         events: list[ServingTokenEvent] | None = None,
     ) -> list[_ActiveRequest | ServingResult]:
-        for state in states:
-            self._set_cache_row_seq_len(state.row, state.seq_len)
         rows = [state.row for state in states]
+        if states:
+            seq_len = states[0].seq_len
+            if all(state.seq_len == seq_len for state in states):
+                self._set_cache_rows_seq_len(rows, seq_len)
+            else:
+                for state in states:
+                    self._set_cache_row_seq_len(state.row, state.seq_len)
         input_ids = torch.tensor([[state.last_token] for state in states], device=self.device, dtype=torch.long)
         reuse_logits: Tensor | None = None
         need_generated_prefix_logits = self._needs_generated_prefix_logits(states)
@@ -2488,14 +2493,23 @@ class ContinuousBatchEngine:
         self._store_decoded_reusable_prefixes(states, reuse_logits)
 
         decoded: list[_ActiveRequest | ServingResult] = []
+        batched_next_seq_len: int | None = None
+        if states:
+            candidate_next_seq_len = states[0].seq_len + 1
+            if all(state.seq_len + 1 == candidate_next_seq_len for state in states):
+                self._set_cache_rows_seq_len(rows, candidate_next_seq_len)
+                batched_next_seq_len = candidate_next_seq_len
         for row_index, state in enumerate(states):
             next_token = int(next_tokens[row_index])
             state.tokens.append(next_token)
             state.generated += 1
             state.last_token = next_token
-            next_seq_len = state.seq_len + 1
-            self._set_cache_row_seq_len(state.row, next_seq_len)
-            state.seq_len = self._cache_row_seq_len(state.row, next_seq_len)
+            if batched_next_seq_len is None:
+                next_seq_len = state.seq_len + 1
+                self._set_cache_row_seq_len(state.row, next_seq_len)
+                state.seq_len = self._cache_row_seq_len(state.row, next_seq_len)
+            else:
+                state.seq_len = batched_next_seq_len
             finished = self._should_finish_after_decode(state)
             self._record_token_event(events, state, next_token, step, finished=finished)
             if finished:
@@ -4013,6 +4027,52 @@ class ContinuousBatchEngine:
         seq_lens = getattr(cache, "_seq_lens", None)
         if isinstance(seq_lens, list) and 0 <= row < len(seq_lens):
             seq_lens[row] = int(seq_len)
+
+    def _set_cache_rows_seq_len(self, rows: list[int], seq_len: int) -> None:
+        if not rows:
+            return
+        seq_len = int(seq_len)
+        for row in rows:
+            self._remember_row_seq_len(row, seq_len)
+        cache = self._require_cache()
+        row_tuple = tuple(int(row) for row in rows)
+        layers = tuple(getattr(cache, "layers", ()) or ())
+        changed = False
+        for layer in layers:
+            setter = getattr(layer, "_set_rows_seq_len", None)
+            if callable(setter):
+                try:
+                    setter(row_tuple, seq_len)
+                    changed = True
+                    continue
+                except Exception:
+                    pass
+            seq_lens = getattr(layer, "_seq_lens", None)
+            if isinstance(seq_lens, list):
+                for row in row_tuple:
+                    if 0 <= row < len(seq_lens):
+                        seq_lens[row] = seq_len
+                        changed = True
+                uniform = getattr(layer, "_uniform_seq_len", None)
+                if isinstance(uniform, list) and uniform:
+                    uniform[0] = seq_len if all(value == seq_len for value in seq_lens) else None
+        if changed:
+            return
+        cache_view = getattr(cache, "for_rows", None)
+        if callable(cache_view):
+            try:
+                view = self._cache_view(row_tuple)
+                setter = getattr(view, "set_seq_len", None)
+                if callable(setter):
+                    setter(seq_len)
+                    return
+            except Exception:
+                pass
+        seq_lens = getattr(cache, "_seq_lens", None)
+        if isinstance(seq_lens, list):
+            for row in row_tuple:
+                if 0 <= row < len(seq_lens):
+                    seq_lens[row] = seq_len
 
     def _try_ragged_token_graph(
         self,
