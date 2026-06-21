@@ -71,6 +71,13 @@ and env override. A local 70B benchmark rerun could not complete because the
 machine entered a GPU-driver `D`-state during server startup with an unrelated
 process already occupying GPU 7; do not treat that as benchmark evidence.
 
+FOLLOW-UP COMMON-PREFIX BUCKET COVERAGE: the same queue profiles showed
+few_shot and long_output reuse around the 128-token prefill bucket (roughly
+120 and 111 shared tokens/request), while startup only warmed the 64-token
+bucket through a 45-token sample. Default common-prefix warmup now captures both
+64- and 128-token buckets. This is still an env-overridable startup cost, not
+benchmark-specific prompt matching.
+
 ## LATEST RUN 20260607_101328 (built 73aa664, BEFORE rope+KV-bounded): 1/20
 
 Dropped 2/20 -> 1/20, NOT from our regression: vllm IMPROVED multi_turn TPOT
