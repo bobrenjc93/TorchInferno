@@ -870,6 +870,17 @@ So a useful reuse needs BOTH the TP fix AND a persistent engine whose cache
 survives bursts (persistent=True previously deadlocked). Larger than the reuse
 path itself. Gated OFF (`TORCHINFERNO_CONTINUOUS_FI_REUSE=0`).
 
+Multi-turn A/B refresh (2026-06-21, current `82d814d`):
+- Baseline remains prefill dominated: local multi_turn `601.2ms` TTFT,
+  `42.1ms` TPOT, `641.2ms` E2E, `1.9 tok/s`; queue profile ended at
+  `10026ms` prefill wall vs `2160ms` decode active with `max_active=16`.
+- Raising the greedy-large row cap to 24 is rejected again:
+  `656.9ms` TTFT, `57.1ms` TPOT, `698.6ms` E2E, worse p99. The extra active
+  rows cost TPOT without relieving enough prefill queueing.
+- Lowering `TORCHINFERNO_OPENAI_PAGED_KV_MIN_SEQ` to 512 is not ready:
+  the server built FlashInfer decode graphs and listened, then hung before
+  writing queue progress or result files on multi_turn. Keep the 1024 threshold.
+
 ## In-flight, validated-locally-but-NOT-benchmarked commits
 
 The inference-bench harness has been frozen on `25260c0` for many hours, so these
