@@ -1,5 +1,43 @@
 # TorchInferno vs vLLM/sglang — Performance Gap Analysis (Llama-3.1-70B, 8xH100)
 
+## LATEST RUN 20260621_155659 (built a7e5516): 4/20
+
+TorchInferno improved to 4/20 (vLLM 13/20, SGLang 2/20). The few_shot row is
+now a real bright spot: TorchInferno wins TTFT, TPOT, and E2E (136.4 / 45.2 /
+179.4 ms) and only trails throughput (6.6 vs vLLM 7.7 tok/s). The score-moving
+near miss is tree_of_thought TPOT: 30.3 ms vs vLLM 29.7 ms, a 0.6 ms gap. The
+big remaining queueing rows are unchanged: self_consistency E2E/throughput
+(433.7 ms / 2.3 tok/s vs vLLM 220.0 ms / 4.5 tok/s), multi_turn TTFT/E2E, and
+long_output decode throughput.
+
+SELF_CONSISTENCY PROFILED AND TUNED (2026-06-21, local focused runs on the same
+a7e5516 build): the benchmark is 1000 identical sampled requests at
+temperature=0.7 and max_tokens=256. Each request emits the visible answer token
+from prefill, then needs one decode step to produce the stop token; TPOT reports
+0.0 because only one content token is streamed. Baseline local metrics were
+TTFT/E2E/throughput = 223.4 ms / 361.3 ms / 2.8 tok/s. Queue profile at the final
+snapshot: initial_batch_size=8, max_active=105, 1000 admitted, 38 prefix-reuse
+prefill batches, 39 decode batches, prefill_wall_ms=1919, decode_active_ms=1199.
+So the gap is not classic inter-token TPOT; it is wave scheduling plus the
+mandatory stop-token decode.
+
+SELF_CONSISTENCY RULED OUT (do not re-chase without a new hypothesis):
+- Uniform ragged decode (`TORCHINFERNO_CONTINUOUS_UNIFORM_RAGGED_DECODE=1`)
+  regressed to 245.6 ms TTFT / 368.4 ms E2E / 2.7 tok/s.
+- Larger sampled-short admission
+  (`TORCHINFERNO_OPENAI_TP_ONLINE_ADMIT_PER_STEP_CAP=64`) regressed to
+  359.1 ms TTFT / 437.4 ms E2E / 2.3 tok/s. Bigger waves raised head-of-line
+  prefill/decode work more than they reduced queueing.
+- Unified online forward (`TORCHINFERNO_CONTINUOUS_UNIFIED_FORWARD=1`) regressed
+  hard to 811.7 ms TTFT / 1117.5 ms E2E / 0.9 tok/s.
+
+FEW/TREE UNIFORM-RAGGED A/B (2026-06-21): global uniform ragged decode was also
+not a broad default. On the local focused run it moved few_shot from
+157.3 / 49.3 / 201.6 ms (TTFT/TPOT/E2E) to 157.5 / 50.0 / 200.6 ms, and moved
+tree_of_thought from 249.8 / 53.2 / 295.2 ms to 272.1 / 51.7 / 304.6 ms. That
+does hint at a possible narrow tree TPOT lever, but it trades away TTFT/E2E and
+is not strong enough to ship as a default.
+
 ## LATEST RUN 20260607_101328 (built 73aa664, BEFORE rope+KV-bounded): 1/20
 
 Dropped 2/20 -> 1/20, NOT from our regression: vllm IMPROVED multi_turn TPOT
