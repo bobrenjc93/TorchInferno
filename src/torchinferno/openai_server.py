@@ -337,10 +337,10 @@ def _online_initial_batch_wait_ms(*, temperature: float, max_tokens: int) -> flo
         else:
             # Self-consistency style sampled short bursts need enough collection
             # time for prefix-cache reuse, but longer waits over-wait after the
-            # first client wave. Local TP8 A/B on 70B: 5ms improved
-            # self-consistency TTFT/E2E to 232.5/344.9ms with 100% correctness;
-            # 0ms regressed to 331.2/412.9ms.
-            default_wait_ms = 5.0
+            # first client wave. Local TP8 A/B on 70B: 10ms improved current
+            # self-consistency TTFT/E2E to 255.7/384.1ms with 100% correctness;
+            # 5ms in the current full run sat at 358.2/427.3ms.
+            default_wait_ms = 10.0
     elif temperature > 0.0 and max_tokens > 0:
         sampled_short_max_tokens = env_int(
             "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_SHORT_INITIAL_BATCH_WAIT_MAX_TOKENS",

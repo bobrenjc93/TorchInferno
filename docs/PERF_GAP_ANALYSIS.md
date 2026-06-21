@@ -881,6 +881,15 @@ Multi-turn A/B refresh (2026-06-21, current `82d814d`):
   the server built FlashInfer decode graphs and listened, then hung before
   writing queue progress or result files on multi_turn. Keep the 1024 threshold.
 
+Self-consistency sampled-short wait A/B (2026-06-21, current `9452794`):
+- Clean local full run with the 5ms sampled-short initial wait:
+  `358.2ms` TTFT, `427.3ms` E2E, `2.3 tok/s`.
+- Re-running self_consistency with
+  `TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_SHORT_INITIAL_BATCH_WAIT_MS=10`
+  improved to `255.7ms` TTFT, `384.1ms` E2E, `2.6 tok/s`, correctness 100%.
+  This policy only covers sampled short requests (`max_tokens<=256`), so tree's
+  sampled medium path remains on its separate 5ms default.
+
 ## In-flight, validated-locally-but-NOT-benchmarked commits
 
 The inference-bench harness has been frozen on `25260c0` for many hours, so these
