@@ -55,6 +55,21 @@ tree_of_thought from 249.8 / 53.2 / 295.2 ms to 272.1 / 51.7 / 304.6 ms. That
 does hint at a possible narrow tree TPOT lever, but it trades away TTFT/E2E and
 is not strong enough to ship as a default.
 
+FEW_SHOT CURRENT RECHECK (2026-06-21, current `1a5d759`): the latest local
+few_shot control is materially better than the frozen public row:
+`152.8ms` TTFT, `50.5ms` TPOT, `193.7ms` E2E, `6.1 tok/s`, 976/1000 raw
+correct. Queue profile used the default greedy-mid policy (`max_active=32`,
+`decode_quantum=16`) and split into two online sessions; the combined shape is
+still prefill/decode interleaving rather than one missing cache feature.
+
+FEW_SHOT RULED OUT (2026-06-21, current `1a5d759`):
+- Raising the initial collection wait to 5ms gathered the full workload into one
+  online session but regressed all score-facing metrics: `154.7ms` TTFT,
+  `51.2ms` TPOT, `194.9ms` E2E, `6.0 tok/s`.
+- Lowering greedy-mid decode quantum to 8 did not buy throughput; it regressed to
+  `161.0ms` TTFT, `52.7ms` TPOT, `204.9ms` E2E, `5.8 tok/s`. Queue profile ended
+  at `3904ms` prefill wall and `1206ms` decode active, worse than the default.
+
 GENERATED-PREFIX REUSE RE-CHECKED (2026-06-21, current 340ffe0 + env flag):
 `TORCHINFERNO_CONTINUOUS_GENERATED_PREFIX_CACHE=1` on self_consistency produced
 260.5 ms TTFT / 386.7 ms E2E / 2.6 tok/s. It stored one generated prefix but
