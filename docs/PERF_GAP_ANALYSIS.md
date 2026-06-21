@@ -37,7 +37,9 @@ SELF_CONSISTENCY RULED OUT (do not re-chase without a new hypothesis):
 - Larger sampled-short admission
   (`TORCHINFERNO_OPENAI_TP_ONLINE_ADMIT_PER_STEP_CAP=64`) regressed to
   359.1 ms TTFT / 437.4 ms E2E / 2.3 tok/s. Bigger waves raised head-of-line
-  prefill/decode work more than they reduced queueing.
+  prefill/decode work more than they reduced queueing. Rechecking cap=64 after
+  the sampled KV-budget increase still regressed to 270.0 ms TTFT /
+  376.8 ms E2E / 2.7 tok/s, despite reducing scheduler/decode batches.
 - After raising the sampled-short KV budget, reducing the sampled initial wait
   back to 5ms still regressed: b2dc983 local 70B TP8 self_consistency moved from
   243.4 ms TTFT / 293.0 ms E2E / 3.4 tok/s at the 10ms default to
