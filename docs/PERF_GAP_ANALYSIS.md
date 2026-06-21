@@ -38,6 +38,11 @@ SELF_CONSISTENCY RULED OUT (do not re-chase without a new hypothesis):
   (`TORCHINFERNO_OPENAI_TP_ONLINE_ADMIT_PER_STEP_CAP=64`) regressed to
   359.1 ms TTFT / 437.4 ms E2E / 2.3 tok/s. Bigger waves raised head-of-line
   prefill/decode work more than they reduced queueing.
+- After raising the sampled-short KV budget, reducing the sampled initial wait
+  back to 5ms still regressed: b2dc983 local 70B TP8 self_consistency moved from
+  243.4 ms TTFT / 293.0 ms E2E / 3.4 tok/s at the 10ms default to
+  279.7 / 417.7 ms / 2.4 tok/s. The shorter wait under-collected the first wave
+  (`initial_batch_size=4` vs `7`) and increased scheduler/decode batches.
 - Unified online forward (`TORCHINFERNO_CONTINUOUS_UNIFIED_FORWARD=1`) regressed
   hard to 811.7 ms TTFT / 1117.5 ms E2E / 0.9 tok/s.
 
