@@ -99,7 +99,21 @@ to 10ms for sampled-short bursts improved a no-profile run from the comparable
 too long and is rejected: 375.2 / 0.0 / 457.8 ms. The default patch scopes the
 10ms wait to sampled requests with `max_tokens <= 256`, so tree_of_thought's
 sampled 300-token branches and greedy rows stay on the 2ms idle drain. The
-post-patch no-env guard landed at 287.7 / 0.0 / 399.6 ms, 1000/1000 correct.
+first post-patch no-env guard landed at 287.7 / 0.0 / 399.6 ms, 1000/1000
+correct. Adding a bounded post-arrival collection window for the case where the
+next wave arrives just after the idle drain expires validated better:
+self_consistency landed at 235.1 / 0.0 / 352.3 ms, 2.8 tok/s, 1000/1000
+correct.
+
+ADDITIONAL SCHEDULER REJECTIONS (2026-06-22, current 30992b1 no-profile):
+multi_turn does not benefit from simply keeping the online session open longer;
+`TORCHINFERNO_OPENAI_TP_ONLINE_PERSISTENT_IDLE_MS=100` landed at 600.6 / 42.7 /
+643.5 ms, 1.9 tok/s, matching the prior prefill-dominated band. few_shot also
+does not want a global 5ms initial wait:
+`TORCHINFERNO_OPENAI_TP_ONLINE_INITIAL_BATCH_WAIT_MS=5` landed at 152.9 / 50.1 /
+195.1 ms, 6.2 tok/s, worse than the current few_shot band. Keep multi_turn on
+the default persistent-idle policy and keep greedy few_shot's initial collection
+window short.
 
 FULL CURRENT LOCAL REFRESH (2026-06-22, current 51fba66 no-profile,
 TorchInferno-only): the pushed default stack landed at few_shot 149.3 / 50.2 /

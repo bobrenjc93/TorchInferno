@@ -3464,6 +3464,23 @@ class OpenAICompletionEngine:
                                 request_by_id.clear()
                                 next_request_id = 0
                                 step = 0
+                            elif idle_wait_s > 0.0:
+                                deadline = time.perf_counter() + idle_wait_s
+                                while len(idle_batch) < max_active:
+                                    timeout = deadline - time.perf_counter()
+                                    if timeout <= 0.0:
+                                        break
+                                    try:
+                                        more = self._generation_queue.get(timeout=timeout)
+                                    except queue.Empty:
+                                        break
+                                    if more is None:
+                                        self._generation_queue.put(None)
+                                        break
+                                    if compatible(more):
+                                        idle_batch.append(more)
+                                    else:
+                                        deferred.append(more)
                             submit_batch(idle_batch, arrival_step=step)
                         continue
                     step_broadcast_start_s = time.perf_counter()
