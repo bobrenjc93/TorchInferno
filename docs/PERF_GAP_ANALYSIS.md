@@ -101,6 +101,16 @@ full 128-worker wave, further self work needs to reduce wave count or overlap th
 mandatory stop-token decode; raising the active cap cannot help this client
 shape.
 
+SELF CURRENT SAME-NODE RECHECK (2026-06-21, current `2b2b839`): a provider
+comparison on the same host reproduced the self gap but also showed significant
+run-to-run variance: vLLM landed at 238.2 ms TTFT / 334.5 ms E2E / 3.0 tok/s,
+SGLang at 224.0 / 399.2 ms / 2.5 tok/s, and TorchInferno at 387.3 /
+449.7 ms / 2.2 tok/s, all 1000/1000 correct with one visible output token per
+request. A TorchInferno-only queue profile on the same code landed at 354.2 /
+424.0 ms / 2.4 tok/s with `max_active=128`, `prefix_rows=16`, 44 exact-prefix
+reuse prefill batches, and 45 decode batches. The remaining self work is wave
+formation plus the mandatory stop-token decode, not row-cap starvation.
+
 SELF_CONSISTENCY RULED OUT (do not re-chase without a new hypothesis):
 - Uniform ragged decode (`TORCHINFERNO_CONTINUOUS_UNIFORM_RAGGED_DECODE=1`)
   regressed to 245.6 ms TTFT / 368.4 ms E2E / 2.7 tok/s.
@@ -121,6 +131,18 @@ SELF_CONSISTENCY RULED OUT (do not re-chase without a new hypothesis):
   (`TORCHINFERNO_OPENAI_TP_ONLINE_STEP_SYNC=0`) is also a regression on current
   `56060b2`: 388.1 ms TTFT / 454.0 ms E2E / 2.2 tok/s, 100% correct. The sync
   is not the self bottleneck in isolation.
+- Rechecking generated-prefix reuse on current `2b2b839` still produced zero
+  reuse hits: 347.6 ms TTFT / 424.0 ms E2E / 2.4 tok/s, one generated-prefix
+  store, zero generated-prefix reuses, and decode-active time rising to 1896 ms
+  versus 1182 ms in the comparable default profile. This path is not useful
+  unless waiting requests can actually hit the stored generated prefix.
+- Raising the sampled-short initial wait to 20ms regressed to 381.6 ms TTFT /
+  466.2 ms E2E / 2.1 tok/s. It buys larger waves by adding too much direct
+  queue-visible delay.
+- A sampled-short idle drain wait of 10ms was not robust. An env-only run looked
+  mildly better at 337.1 ms TTFT / 424.1 ms E2E / 2.4 tok/s, but making that
+  scoped default regressed to 377.4 / 447.4 ms / 2.2 tok/s. Do not promote idle
+  drain waits without a more stable admission rule.
 
 FEW/TREE UNIFORM-RAGGED A/B (2026-06-21): global uniform ragged decode was also
 not a broad default. On the local focused run it moved few_shot from
