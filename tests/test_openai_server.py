@@ -876,6 +876,7 @@ def test_tensor_parallel_worker_loop_handles_online_runtime_commands(monkeypatch
             "input_id_lists": [[1, 2], [3]],
             "row_max_tokens": [5, 6],
             "eos_token_id": 0,
+            "stop_token_ids": [0, 9],
             "arrival_step": 7,
             "request_id_start": 10,
         },
@@ -963,9 +964,18 @@ def test_tensor_parallel_worker_loop_handles_online_runtime_commands(monkeypatch
     assert runtime.started == 16
     assert runtime.steps == 4
     assert runtime.init_args[2:] == ("paged", 2, 0.25, 4, 2, 8, True, True, True, None, 48)
-    assert [(request.prompt, request.max_new_tokens, request.arrival_step, request.eos_token_id) for request in runtime.submitted] == [
-        ((1, 2), 5, 7, 0),
-        ((3,), 6, 7, 0),
+    assert [
+        (
+            request.prompt,
+            request.max_new_tokens,
+            request.arrival_step,
+            request.eos_token_id,
+            request.stop_token_ids,
+        )
+        for request in runtime.submitted
+    ] == [
+        ((1, 2), 5, 7, 0, (0, 9)),
+        ((3,), 6, 7, 0, (0, 9)),
     ]
     assert [request.request_id for request in runtime.submitted] == ["10", "11"]
 
@@ -1347,6 +1357,7 @@ def test_tensor_parallel_online_broadcast_helpers(monkeypatch) -> None:
         row_max_tokens=[5, 6],
         arrival_step=7,
         eos_token_id=0,
+        stop_token_ids=[0, 9],
     )
     _broadcast_tensor_parallel_online_step(model)
     _broadcast_tensor_parallel_online_step(model, 4)
@@ -1372,6 +1383,7 @@ def test_tensor_parallel_online_broadcast_helpers(monkeypatch) -> None:
             "row_max_tokens": [5, 6],
             "arrival_step": 7,
             "eos_token_id": 0,
+            "stop_token_ids": [0, 9],
             "request_id_start": 0,
         },
         {"op": "online_step"},
@@ -10900,7 +10912,7 @@ def test_openai_stream_group_can_drive_tensor_parallel_online_runtime(monkeypatc
                 "max_tokens": 2,
             },
         ),
-        ("submit", ([[1, 2], [3, 4]], {"max_tokens": 2, "row_max_tokens": [2, 1], "arrival_step": 0, "eos_token_id": None, "request_id_start": 0})),
+        ("submit", ([[1, 2], [3, 4]], {"max_tokens": 2, "row_max_tokens": [2, 1], "arrival_step": 0, "eos_token_id": None, "stop_token_ids": [], "request_id_start": 0})),
         ("step", 1),
         ("step", 1),
         ("close", None),
@@ -10994,7 +11006,7 @@ def test_openai_tensor_parallel_online_batcher_drains_ready_requests(monkeypatch
     assert instances[0].started == 3
     assert commands == [
         ("start", {"max_seq_len": 3, "max_active_requests": 4, "prefix_cache_capacity": 1, "prefill_token_budget": None, "temperature": 0.0, "enable_ragged_decode": True, "store_reusable_prefixes": True, "store_full_prompt_prefixes": True, "max_tokens": 1}),
-        ("submit", ([[1, 2], [3, 4]], {"max_tokens": 1, "row_max_tokens": [1, 1], "arrival_step": 0, "eos_token_id": None, "request_id_start": 0})),
+        ("submit", ([[1, 2], [3, 4]], {"max_tokens": 1, "row_max_tokens": [1, 1], "arrival_step": 0, "eos_token_id": None, "stop_token_ids": [], "request_id_start": 0})),
         ("step", 1),
         ("close", None),
     ]
@@ -11213,6 +11225,7 @@ def test_openai_tensor_parallel_online_batcher_boost_uses_admitted_max_tokens(
                 "row_max_tokens": [64],
                 "arrival_step": 0,
                 "eos_token_id": None,
+                "stop_token_ids": [],
                 "request_id_start": 0,
             },
         ),
@@ -11550,7 +11563,7 @@ def test_openai_tensor_parallel_online_batcher_sizes_cache_from_initial_window(
     assert started == [6]
     assert commands[:2] == [
         ("start", {"max_seq_len": 6, "max_active_requests": 4, "prefix_cache_capacity": 1, "prefill_token_budget": None, "temperature": 0.0, "enable_ragged_decode": True, "store_reusable_prefixes": True, "store_full_prompt_prefixes": True, "max_tokens": 2}),
-        ("submit", ([[1, 2], [3, 4, 5, 6]], {"max_tokens": 2, "row_max_tokens": [1, 2], "arrival_step": 0, "eos_token_id": None, "request_id_start": 0})),
+        ("submit", ([[1, 2], [3, 4, 5, 6]], {"max_tokens": 2, "row_max_tokens": [1, 2], "arrival_step": 0, "eos_token_id": None, "stop_token_ids": [], "request_id_start": 0})),
     ]
     assert first_queue.get_nowait() == 600
     assert isinstance(first_queue.get_nowait(), _GenerationDone)

@@ -628,7 +628,7 @@ class PagedEngine:
             PagedDecodeGraphRunner(model, self.cache, batch=max_active, max_pages=pages_per)
             if use_graph else None
         )
-        self._pending: list[tuple] = []  # (request_id, prompt, max_new, eos)
+        self._pending: list[tuple] = []  # (request_id, prompt, max_new, eos, stop_ids)
         self._active: list[dict] = []
         self._next_rid = 0
         self._step_no = 0
@@ -763,8 +763,18 @@ class PagedEngine:
             request_ids=[rid], prefill_wrapper=self._prefill_wrapper, start_position=shared,
         )
 
-    def submit(self, request_id, prompt: list[int], max_new_tokens: int, eos_token_id=None) -> None:
-        self._pending.append((request_id, list(prompt), max_new_tokens, eos_token_id))
+    def submit(
+        self,
+        request_id,
+        prompt: list[int],
+        max_new_tokens: int,
+        eos_token_id=None,
+        stop_token_ids=(),
+    ) -> None:
+        stop_ids = {int(token_id) for token_id in stop_token_ids if int(token_id) >= 0}
+        if eos_token_id is not None and int(eos_token_id) >= 0:
+            stop_ids.add(int(eos_token_id))
+        self._pending.append((request_id, list(prompt), max_new_tokens, eos_token_id, tuple(sorted(stop_ids))))
 
     def has_work(self) -> bool:
         return bool(self._pending or self._active)
@@ -820,7 +830,7 @@ class PagedEngine:
             # free pages -> same admits + grouping -> matching collectives).
             admitted: list[dict] = []
             while len(self._active) + len(admitted) < self.max_active and self._pending:
-                ext_id, prompt, max_new, eos = self._pending[0]
+                ext_id, prompt, max_new, eos, stop_ids = self._pending[0]
                 need = math.ceil((len(prompt) + max_new) / self.page_size)
                 if len(self.cache.free_pages) < need:
                     break
@@ -836,10 +846,10 @@ class PagedEngine:
                 self.cache.reserve(rid, len(prompt) + max_new)
                 self.cache._sequences[rid].length = len(prompt)
                 admitted.append({"ext": ext_id, "rid": rid, "prompt": prompt,
-                                 "max_new": max_new, "eos": eos, "shared": shared})
+                                 "max_new": max_new, "eos": eos, "stop": stop_ids, "shared": shared})
 
             def _retire_or_activate(a, tok):
-                fin = 1 >= a["max_new"] or tok == a["eos"]
+                fin = 1 >= a["max_new"] or tok in a["stop"]
                 events.append((a["ext"], tok, fin))
                 if fin:
                     if self.prefix_cache is not None:
@@ -849,7 +859,7 @@ class PagedEngine:
                     self._active.append({
                         "ext": a["ext"], "rid": a["rid"], "plen": len(a["prompt"]),
                         "prompt": a["prompt"], "gen": [tok], "max_new": a["max_new"],
-                        "last": tok, "eos": a["eos"],
+                        "last": tok, "eos": a["eos"], "stop": a["stop"],
                     })
 
             if admitted:
@@ -895,7 +905,7 @@ class PagedEngine:
                 t = int(nxt[i])
                 a["gen"].append(t)
                 a["last"] = t
-                fin = len(a["gen"]) >= a["max_new"] or t == a["eos"]
+                fin = len(a["gen"]) >= a["max_new"] or t in a["stop"]
                 events.append((a["ext"], t, fin))
                 if fin:
                     # Remember the full prompt+generated sequence so a later request
@@ -976,7 +986,7 @@ class PagedEngine:
             for t in emit:
                 a["gen"].append(t)
                 a["last"] = t
-                fin = len(a["gen"]) >= a["max_new"] or t == a["eos"]
+                fin = len(a["gen"]) >= a["max_new"] or t in a["stop"]
                 events.append((a["ext"], t, fin))
                 if fin:
                     finished = True
@@ -1012,7 +1022,13 @@ class PagedEngine:
         self._spec_runner = None  # rebuilt lazily (cache may have been swapped above)
 
     def submit_online(self, request) -> None:
-        self.submit(request.request_id, list(request.prompt), request.max_new_tokens, request.eos_token_id)
+        self.submit(
+            request.request_id,
+            list(request.prompt),
+            request.max_new_tokens,
+            request.eos_token_id,
+            request.stop_token_ids,
+        )
 
     def has_online_work(self) -> bool:
         return self.has_work()

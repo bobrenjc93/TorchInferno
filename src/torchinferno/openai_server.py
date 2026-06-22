@@ -3250,6 +3250,7 @@ class OpenAICompletionEngine:
                 row_max_tokens=row_max_tokens,
                 arrival_step=arrival_step,
                 eos_token_id=eos_token_id,
+                stop_token_ids=list(stop_token_ids),
                 request_id_start=request_id_start,
             )
             for request in requests:
@@ -3263,6 +3264,7 @@ class OpenAICompletionEngine:
                         request.max_tokens,
                         arrival_step=arrival_step,
                         eos_token_id=eos_token_id,
+                        stop_token_ids=tuple(stop_token_ids),
                     )
                 )
             if sync:
@@ -4213,6 +4215,7 @@ class OpenAICompletionEngine:
                     row_max_tokens=row_max_tokens,
                     arrival_step=0,
                     eos_token_id=eos_token_id,
+                    stop_token_ids=list(stop_token_ids),
                     request_id_start=0,
                 )
                 for index, request in enumerate(group):
@@ -4223,6 +4226,7 @@ class OpenAICompletionEngine:
                             request.max_tokens,
                             arrival_step=0,
                             eos_token_id=eos_token_id,
+                            stop_token_ids=tuple(stop_token_ids),
                         )
                 )
                 _sync_tensor_parallel_command(self.model, self.device)
@@ -4421,6 +4425,7 @@ class OpenAICompletionEngine:
                 request.max_tokens,
                 arrival_step=0,
                 eos_token_id=eos_token_id,
+                stop_token_ids=tuple(stop_token_ids),
             )
             for index, request in enumerate(group)
         ]
@@ -10431,6 +10436,12 @@ def _receive_tensor_parallel_tensor_payload(engine: OpenAICompletionEngine) -> d
         lengths_list = [int(value) for value in lengths.detach().cpu().tolist()]
         token_rows_cpu = token_rows.detach().cpu()
         eos_token_id = int(meta[7].item())
+        stop_count = int(meta[9].item())
+        stop_token_ids: list[int] = []
+        if stop_count > 0:
+            stop_tensor = torch.empty(stop_count, dtype=torch.long, device=command_device)
+            _broadcast_tensor_command(stop_tensor, src=0, group=command_group)
+            stop_token_ids = [int(value) for value in stop_tensor.detach().cpu().tolist()]
         return {
             "op": "online_submit",
             "input_id_lists": [
@@ -10441,6 +10452,7 @@ def _receive_tensor_parallel_tensor_payload(engine: OpenAICompletionEngine) -> d
             "row_max_tokens": row_max_tokens,
             "arrival_step": int(meta[6].item()),
             "eos_token_id": None if eos_token_id < 0 else eos_token_id,
+            "stop_token_ids": stop_token_ids,
             "request_id_start": int(meta[8].item()),
         }
 
@@ -10754,6 +10766,7 @@ def _broadcast_tensor_parallel_online_submit_prompt_lists(
     row_max_tokens: Sequence[int] | None,
     arrival_step: int,
     eos_token_id: int | None,
+    stop_token_ids: Sequence[int] = (),
     request_id_start: int = 0,
 ) -> None:
     _broadcast_tensor_parallel_online_command(
@@ -10765,6 +10778,7 @@ def _broadcast_tensor_parallel_online_submit_prompt_lists(
             "row_max_tokens": None if row_max_tokens is None else [int(value) for value in row_max_tokens],
             "arrival_step": int(arrival_step),
             "eos_token_id": eos_token_id,
+            "stop_token_ids": [int(token_id) for token_id in stop_token_ids],
             "request_id_start": int(request_id_start),
         },
     )
@@ -10966,11 +10980,13 @@ def _broadcast_tensor_parallel_online_command(model: object, payload: Mapping[st
             if isinstance(prompts, list):
                 token_rows, lengths = _prompt_list_tensor_payload(prompts, command_device)
                 row_max = _coerce_optional_int_sequence(payload.get("row_max_tokens"))
+                stop_token_ids = _coerce_optional_int_sequence(payload.get("stop_token_ids")) or ()
                 row_max_tensor = (
                     torch.tensor(row_max, dtype=torch.long, device=command_device)
                     if row_max is not None
                     else torch.empty(0, dtype=torch.long, device=command_device)
                 )
+                stop_tensor = torch.tensor(stop_token_ids, dtype=torch.long, device=command_device)
                 meta = torch.tensor(
                     [
                         _TP_COMMAND_ONLINE_SUBMIT_PROMPT_LISTS,
@@ -10982,6 +10998,7 @@ def _broadcast_tensor_parallel_online_command(model: object, payload: Mapping[st
                         int(payload.get("arrival_step", 0)),
                         -1 if payload.get("eos_token_id") is None else int(payload["eos_token_id"]),
                         int(payload.get("request_id_start", 0)),
+                        int(stop_tensor.numel()),
                         0,
                     ],
                     dtype=torch.long,
@@ -10994,6 +11011,8 @@ def _broadcast_tensor_parallel_online_command(model: object, payload: Mapping[st
                 _broadcast_tensor_command(token_rows, src=0, group=command_group)
                 if row_max_tensor.numel() > 0:
                     _broadcast_tensor_command(row_max_tensor, src=0, group=command_group)
+                if stop_tensor.numel() > 0:
+                    _broadcast_tensor_command(stop_tensor, src=0, group=command_group)
                 return
     dist.broadcast_object_list([dict(payload)], src=0)
 
@@ -11363,6 +11382,7 @@ def _tensor_parallel_worker_loop(engine: OpenAICompletionEngine) -> None:
                     row_max_tokens = [default_max_tokens for _ in input_id_lists]
                 eos_token_id = payload.get("eos_token_id")
                 eos = int(eos_token_id) if isinstance(eos_token_id, int) else None
+                stop_token_ids = _coerce_optional_int_sequence(payload.get("stop_token_ids")) or ()
                 arrival_step = int(payload.get("arrival_step", 0))
                 request_id_start = int(payload.get("request_id_start", 0))
                 if online_runtime_engine is None:
@@ -11375,6 +11395,7 @@ def _tensor_parallel_worker_loop(engine: OpenAICompletionEngine) -> None:
                             int(row_max_tokens[index]),
                             arrival_step=arrival_step,
                             eos_token_id=eos,
+                            stop_token_ids=tuple(stop_token_ids),
                         )
                     )
                 continue

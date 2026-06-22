@@ -310,6 +310,40 @@ def test_paged_engine_resizes_spec_runner_for_wider_page_tables(monkeypatch) -> 
     assert engine._spec_runner.max_pages == 6
 
 
+def test_paged_engine_submit_tracks_stop_token_ids() -> None:
+    import torch as _t
+    import torchinferno.runtime.paged_serving as paged_serving
+    from torchinferno.runtime.serving import ServingRequest
+
+    class _FakeLayer:
+        local_attention_heads = 1
+        local_key_value_heads = 1
+
+    class _FakeConfig:
+        head_dim = 1
+
+    class _FakeModel:
+        device = _t.device("cpu")
+        dtype = _t.float32
+        layers = [_FakeLayer()]
+        config = _FakeConfig()
+
+    engine = paged_serving.PagedEngine(
+        _FakeModel(),
+        page_size=4,
+        max_active=2,
+        max_seq=8,
+        use_graph=False,
+    )
+
+    engine.submit("r", [1, 2], 3, eos_token_id=0, stop_token_ids=(9, 0, -1))
+    assert engine._pending == [("r", [1, 2], 3, 0, (0, 9))]
+
+    engine._pending.clear()
+    engine.submit_online(ServingRequest("s", (3, 4), 2, eos_token_id=5, stop_token_ids=(6,)))
+    assert engine._pending == [("s", [3, 4], 2, 5, (5, 6))]
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="FlashInfer paged decode needs CUDA")
 def test_layered_paged_kv_cache_flashinfer_decode_matches_dense() -> None:
     # End-to-end de-risk of the paged-KV foundation: prove LayeredPagedKVCache's

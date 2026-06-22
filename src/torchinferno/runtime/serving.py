@@ -52,6 +52,19 @@ class ServingRequest:
     max_new_tokens: int
     arrival_step: int = 0
     eos_token_id: Optional[int] = None
+    stop_token_ids: tuple[int, ...] = ()
+
+    def __post_init__(self) -> None:
+        stop_ids = {int(token_id) for token_id in self.stop_token_ids if int(token_id) >= 0}
+        if self.eos_token_id is not None:
+            eos_token_id = int(self.eos_token_id)
+            object.__setattr__(self, "eos_token_id", eos_token_id)
+            if eos_token_id >= 0:
+                stop_ids.add(eos_token_id)
+        object.__setattr__(self, "stop_token_ids", tuple(sorted(stop_ids)))
+
+    def is_stop_token(self, token_id: int) -> bool:
+        return int(token_id) in self.stop_token_ids
 
 
 @dataclass(frozen=True)
@@ -473,7 +486,7 @@ class ContinuousBatchEngine:
             return False
         if self.unified_forward or not self.decode_first or self.temperature > 0.0:
             return False
-        if any(state.request.eos_token_id is not None for state in self._online_active):
+        if any(state.request.stop_token_ids for state in self._online_active):
             return False
         if self._generated_prefix_cache_enabled() or self._prompt_lookup_decode_enabled():
             return False
@@ -543,8 +556,7 @@ class ContinuousBatchEngine:
                 token = int(token_value)
                 state.tokens.append(token)
                 state.last_token = token
-                eos_finished = state.request.eos_token_id is not None and token == state.request.eos_token_id
-                finished = bool(limit_finished or eos_finished)
+                finished = bool(limit_finished or state.request.is_stop_token(token))
                 events.append(
                     ServingTokenEvent(
                         request_id=state.request.request_id,
@@ -600,6 +612,8 @@ class ContinuousBatchEngine:
 
         if not self.decode_first and active:
             _decoded_results, active = self._decode_active(active, step + 1, events=events)
+        if self.decode_first and active:
+            active = self._release_online_prefill_finished(active, step)
         self._online_active = active
         self._online_step = step + 1
 
@@ -954,8 +968,12 @@ class ContinuousBatchEngine:
                 state.generated = 1
                 state.last_token = next_token
                 state.phase = "decoding"
-                self._record_token_event(events, state, next_token, step, finished=self._should_finish_before_decode(state))
-                finished.append(state)
+                request_finished = self._should_finish_before_decode(state)
+                self._record_token_event(events, state, next_token, step, finished=request_finished)
+                if request_finished:
+                    self._finish_and_release(state, step)
+                else:
+                    finished.append(state)
             else:
                 pending.append(state)
         return finished, pending
@@ -1845,9 +1863,7 @@ class ContinuousBatchEngine:
             for row_index, (original_index, request, prefix_hit_tokens, _reusable) in enumerate(group):
                 next_token = int(next_tokens[row_index])
                 generated = 1
-                finished = (
-                    request.eos_token_id is not None and next_token == request.eos_token_id
-                ) or generated >= request.max_new_tokens
+                finished = request.is_stop_token(next_token) or generated >= request.max_new_tokens
                 if finished:
                     if events is not None:
                         events.append(
@@ -1902,9 +1918,7 @@ class ContinuousBatchEngine:
                 self.stats.prefix_reuse_tokens += generated_prefix_len
                 self.stats.generated_prefix_reuse_requests += 1
                 self.stats.generated_prefix_reuse_tokens += generated_prefix_len
-                finished = (
-                    request.eos_token_id is not None and second_token == request.eos_token_id
-                ) or generated >= request.max_new_tokens
+                finished = request.is_stop_token(second_token) or generated >= request.max_new_tokens
                 if events is not None:
                     events.append(
                         ServingTokenEvent(
@@ -4286,15 +4300,28 @@ class ContinuousBatchEngine:
             )
         )
 
+    def _release_online_prefill_finished(
+        self,
+        active: list[_ActiveRequest],
+        step: int,
+    ) -> list[_ActiveRequest]:
+        live: list[_ActiveRequest] = []
+        for state in active:
+            if self._should_finish_before_decode(state):
+                self._finish_and_release(state, step)
+            else:
+                live.append(state)
+        return live
+
     @staticmethod
     def _should_finish_before_decode(state: _ActiveRequest) -> bool:
-        if state.request.eos_token_id is not None and state.last_token == state.request.eos_token_id:
+        if state.request.is_stop_token(state.last_token):
             return True
         return state.generated >= state.request.max_new_tokens
 
     @staticmethod
     def _should_finish_after_decode(state: _ActiveRequest) -> bool:
-        if state.request.eos_token_id is not None and state.last_token == state.request.eos_token_id:
+        if state.request.is_stop_token(state.last_token):
             return True
         return state.generated >= state.request.max_new_tokens
 
