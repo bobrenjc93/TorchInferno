@@ -144,6 +144,13 @@ experiment that shrank the command when an active row was near completion still
 landed at 448.8 / 24.5 / 1411.9 ms with lower throughput, so that simple
 remaining-token heuristic is also rejected.
 
+FEW ROW-CAP REJECTION (2026-06-22, current d3608c6 no-profile): lowering
+greedy-mid active rows to 24
+(`TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_MID_MAX_ACTIVE=24`) improves the
+few_shot TPOT cell to 44.5ms, but it regresses the rest of the row badly:
+202.5ms TTFT, 237.8ms E2E, 5.4 tok/s, and worse p99. Do not default a
+single-cell TPOT tradeoff that hurts the actual request latency shape.
+
 FULL CURRENT LOCAL REFRESH (2026-06-22, current 51fba66 no-profile,
 TorchInferno-only): the pushed default stack landed at few_shot 149.3 / 50.2 /
 189.8 ms, self_consistency 313.4 / 0.0 / 388.7 ms, multi_turn 595.8 / 41.4 /
