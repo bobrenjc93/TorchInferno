@@ -83,6 +83,7 @@ from torchinferno.openai_server import (
     _flashinfer_prefill_runtime_enabled,
     _flashinfer_prefill_warmup_batch_sizes,
     _generation_cache_batch_capacity,
+    _generation_cache_fits_shape,
     _identical_prompt_cache_pool_enabled,
     _identical_prompt_prefill_graph_capture_enabled,
     _mark_generation_cache_prefix,
@@ -980,6 +981,79 @@ def test_tensor_parallel_worker_loop_handles_online_runtime_commands(monkeypatch
         ((3,), 6, 7, 0, (0, 9)),
     ]
     assert [request.request_id for request in runtime.submitted] == ["10", "11"]
+
+
+def test_tensor_parallel_worker_loop_rebuilds_incompatible_online_cache(monkeypatch) -> None:
+    import torch.distributed as dist
+
+    commands: list[dict[str, object]] = [
+        {
+            "op": "online_start",
+            "max_seq_len": 16,
+            "max_active_requests": 4,
+            "prefix_cache_capacity": 2,
+            "prefill_token_budget": 8,
+            "temperature": 0.0,
+            "max_tokens": 6,
+        },
+        {"op": "stop"},
+    ]
+    started_caches: list[object | None] = []
+
+    class Layer:
+        def __init__(self, *, max_seq_len: int, batch_size: int) -> None:
+            self.max_seq_len = max_seq_len
+            self.batch_size = batch_size
+
+    class Cache:
+        def __init__(self, *, max_seq_len: int, batch_size: int) -> None:
+            self.layers = [Layer(max_seq_len=max_seq_len, batch_size=batch_size)]
+
+    class Model:
+        def __init__(self) -> None:
+            self.allocated_shapes: list[tuple[int, int]] = []
+
+        def allocate_cache(self, batch_size: int, max_seq_len: int, **kwargs: object) -> Cache:
+            del kwargs
+            self.allocated_shapes.append((batch_size, max_seq_len))
+            return Cache(max_seq_len=max_seq_len, batch_size=batch_size)
+
+    class RuntimeEngine:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            del args, kwargs
+
+        def start_online(self, *, max_seq_len: int, external_cache: object | None = None) -> None:
+            del max_seq_len
+            started_caches.append(external_cache)
+
+    def broadcast_object_list(payload: list[object], *, src: int) -> None:
+        del src
+        payload[0] = commands.pop(0)
+
+    monkeypatch.setattr(dist, "is_available", lambda: True)
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(dist, "broadcast_object_list", broadcast_object_list)
+    monkeypatch.setattr("torchinferno.openai_server._RuntimeContinuousBatchEngine", RuntimeEngine)
+    monkeypatch.setattr("torchinferno.openai_server._reset_generation_cache", lambda cache: True)
+    monkeypatch.setattr(
+        "torchinferno.openai_server._tensor_parallel_symm_mem_allreduce_scope",
+        lambda *args, **kwargs: nullcontext(),
+    )
+
+    model = Model()
+    stale_cache = Cache(max_seq_len=8, batch_size=3)
+    engine = _WorkerLoopRecordingEngine()
+    engine.model = model
+    engine.cache_backend = "dense"
+    engine.page_size = 16
+    engine._persistent_serving_cache = stale_cache
+
+    _tensor_parallel_worker_loop(engine)
+
+    assert commands == []
+    assert model.allocated_shapes == [(6, 16)]
+    assert started_caches == [engine._persistent_serving_cache]
+    assert engine._persistent_serving_cache is not stale_cache
 
 
 def test_tensor_parallel_worker_loop_skips_online_step_barrier_when_disabled(monkeypatch) -> None:
@@ -5770,6 +5844,40 @@ def test_openai_tensor_parallel_generation_cache_uses_batch_buckets(monkeypatch)
     assert dense in engine._cache_pool.values()
     assert small in engine._cache_pool.values()
     assert large in engine._cache_pool.values()
+
+
+def test_generation_cache_fits_shape_checks_seq_len_and_rows() -> None:
+    class Layer:
+        def __init__(self, *, max_seq_len: int, batch_size: int | None = None) -> None:
+            self.max_seq_len = max_seq_len
+            if batch_size is not None:
+                self.batch_size = batch_size
+
+    class Cache:
+        def __init__(self, layer: object) -> None:
+            self.layers = [layer]
+
+    assert _generation_cache_fits_shape(
+        Cache(Layer(max_seq_len=16, batch_size=6)),
+        max_seq_len=16,
+        total_rows=6,
+    )
+    assert not _generation_cache_fits_shape(
+        Cache(Layer(max_seq_len=15, batch_size=6)),
+        max_seq_len=16,
+        total_rows=6,
+    )
+    assert not _generation_cache_fits_shape(
+        Cache(Layer(max_seq_len=16, batch_size=5)),
+        max_seq_len=16,
+        total_rows=6,
+    )
+    assert _generation_cache_fits_shape(Cache(Layer(max_seq_len=16)), max_seq_len=16, total_rows=6)
+
+    key_backed_layer = Layer(max_seq_len=16)
+    key_backed_layer.keys = torch.empty(7, 1, 16, 1)
+    assert _generation_cache_fits_shape(Cache(key_backed_layer), max_seq_len=16, total_rows=7)
+    assert not _generation_cache_fits_shape(Cache(key_backed_layer), max_seq_len=16, total_rows=8)
 
 
 def test_openai_engine_microbatch_cache_pool_replaces_slots_and_caps_entries(monkeypatch) -> None:

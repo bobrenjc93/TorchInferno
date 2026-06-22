@@ -3162,10 +3162,17 @@ class OpenAICompletionEngine:
             )
             max_active = max(max_active, min(kv_max_active_cap, kv_token_budget // max_seq_len))
         prefix_rows = self._online_serving_effective_prefix_rows(max_active)
+        total_online_rows = max_active + prefix_rows
         persistent_cache = getattr(self, "_persistent_serving_cache", None)
         compat_max_seq_len = max_seq_len
-        if persistent_cache is not None and hasattr(persistent_cache, "layers") and persistent_cache.layers:
-            compat_max_seq_len = persistent_cache.layers[0].max_seq_len
+        if persistent_cache is not None and _generation_cache_fits_shape(
+            persistent_cache,
+            max_seq_len=max_seq_len,
+            total_rows=total_online_rows,
+        ):
+            persistent_max_seq_len, _persistent_rows = _generation_cache_shape_limits(persistent_cache)
+            if persistent_max_seq_len is not None:
+                compat_max_seq_len = max(max_seq_len, persistent_max_seq_len)
         stop_token_ids = getattr(self, "stop_token_ids", frozenset())
         eos_token_id = _runtime_eos_token_id(getattr(self, "tokenizer", None), stop_token_ids)
         # Test-only: force every request to generate exactly max_tokens (ignore EOS),
@@ -3366,24 +3373,15 @@ class OpenAICompletionEngine:
                     shared_cache = None  # PagedEngine owns its own paged KV pool
                 else:
                     shared_cache = getattr(self, "_persistent_serving_cache", None)
-                    # The persistent cache must be at least as long as this workload's
-                    # sequences AND have enough rows for the (possibly KV-bounded
-                    # boosted) active set; otherwise reusing it overruns its bounds at
-                    # runtime (index-out-of-bounds device assert). Fall through to a
-                    # fresh, correctly-sized allocation when it does not fit.
-                    if shared_cache is not None and hasattr(shared_cache, "layers") and shared_cache.layers:
-                        _player = shared_cache.layers[0]
-                        persistent_max_seq = getattr(_player, "max_seq_len", None)
-                        persistent_rows = getattr(_player, "batch_size", None)
-                        if persistent_rows is None and hasattr(_player, "keys"):
-                            persistent_rows = _player.keys.size(0)
-                        if (persistent_max_seq is not None and persistent_max_seq < max_seq_len) or (
-                            persistent_rows is not None and persistent_rows < max_active + prefix_rows
-                        ):
-                            shared_cache = None
+                    if shared_cache is not None and not _generation_cache_fits_shape(
+                        shared_cache,
+                        max_seq_len=max_seq_len,
+                        total_rows=total_online_rows,
+                    ):
+                        self._persistent_serving_cache = None
+                        shared_cache = None
                     if shared_cache is None:
                         try:
-                            total_online_rows = max_active + prefix_rows
                             shared_cache = self._generation_cache(
                                 total_online_rows,
                                 max_seq_len,
@@ -11376,10 +11374,17 @@ def _tensor_parallel_worker_loop(engine: OpenAICompletionEngine) -> None:
                 if worker_use_paged:
                     worker_shared_cache = None  # PagedEngine owns its own paged KV pool
                 else:
+                    total_rows = max_active + prefix_rows
                     worker_shared_cache = getattr(engine, "_persistent_serving_cache", None)
+                    if worker_shared_cache is not None and not _generation_cache_fits_shape(
+                        worker_shared_cache,
+                        max_seq_len=max_seq_len,
+                        total_rows=total_rows,
+                    ):
+                        engine._persistent_serving_cache = None
+                        worker_shared_cache = None
                     if worker_shared_cache is None:
                         try:
-                            total_rows = max_active + prefix_rows
                             worker_model = getattr(engine, "model")
                             worker_cache_backend = str(getattr(engine, "cache_backend", "dense"))
                             if hasattr(worker_model, "forward_step_flashinfer"):
@@ -11602,6 +11607,44 @@ def _generation_cache_batch_capacity(model: object, requested_batch: int) -> int
         if requested_batch <= bucket:
             return bucket
     return requested_batch
+
+
+def _generation_cache_shape_limits(cache: object) -> tuple[int | None, int | None]:
+    layers = getattr(cache, "layers", ()) or ()
+    try:
+        layer = layers[0]
+    except (IndexError, TypeError):
+        return None, None
+
+    max_seq_len_value = getattr(layer, "max_seq_len", None)
+    try:
+        max_seq_len = None if max_seq_len_value is None else int(max_seq_len_value)
+    except (TypeError, ValueError):
+        max_seq_len = None
+
+    rows_value = getattr(layer, "batch_size", None)
+    if rows_value is None:
+        keys = getattr(layer, "keys", None)
+        size = getattr(keys, "size", None)
+        if callable(size):
+            try:
+                rows_value = size(0)
+            except Exception:
+                rows_value = None
+    try:
+        rows = None if rows_value is None else int(rows_value)
+    except (TypeError, ValueError):
+        rows = None
+    return max_seq_len, rows
+
+
+def _generation_cache_fits_shape(cache: object, *, max_seq_len: int, total_rows: int) -> bool:
+    cache_max_seq_len, cache_rows = _generation_cache_shape_limits(cache)
+    if cache_max_seq_len is not None and cache_max_seq_len < int(max_seq_len):
+        return False
+    if cache_rows is not None and cache_rows < int(total_rows):
+        return False
+    return True
 
 
 def _cache_pool_max_entries() -> int:

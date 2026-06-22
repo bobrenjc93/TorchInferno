@@ -47,6 +47,22 @@ versus vLLM 183.5 / 239.2 ms / 5.8 tok/s, tree_of_thought is 428.8 / 50.5 /
 1482.6 ms versus vLLM 71.1 / 18.7 / 759.3 ms. The gate is a small default-path
 cleanup, not a score-shape change.
 
+ONLINE CACHE-FIT ORDER GUARD (2026-06-22, current 84b3594 + local patch):
+the weak full-run tree rows were traced to stale dense persistent-cache shape
+metadata being consulted before deciding whether the cache fit the next online
+session. A previous short sampled session could cap the compatibility window for
+the next tree session even though the batcher later allocated a larger cache;
+the TP worker also reset/reused its persistent cache without the primary's fit
+check. The patch centralizes the cache shape test and applies it before both
+admission and primary/worker reuse. Focused self_consistency -> tree_of_thought
+landed at self 368.6 / 0.0 / 455.2 ms and tree 228.0 / 53.2 / 266.9 ms
+(`20260622_075219`). A full TorchInferno-only guard landed at few_shot
+154.5 / 53.3 / 197.9 ms, self_consistency 359.5 / 0.0 / 446.6 ms, multi_turn
+581.0 / 42.4 / 621.6 ms, tree_of_thought 246.0 / 53.8 / 317.3 ms, and
+long_output 346.1 / 28.5 / 1568.2 ms (`20260622_075841`). This is a tree/order
+stability fix; the remaining score-facing gaps are still self median latency,
+multi_turn TTFT/E2E/throughput, and long_output decode/queueing.
+
 CLEAN NO-PROFILE TREE REPRO (2026-06-21, current 33a2eb3): rerunning
 tree_of_thought locally with no queue profiling did not reproduce the public
 `30.2ms` TPOT row. The latest inference-bench checkout, `--skip-build`, and the
