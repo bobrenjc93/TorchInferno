@@ -143,7 +143,9 @@ current 8-step short-greedy quantum until a dynamic policy can raise quantum
 only when it will not delay newly arrived requests. A temporary dynamic-q16
 experiment that shrank the command when an active row was near completion still
 landed at 448.8 / 24.5 / 1411.9 ms with lower throughput, so that simple
-remaining-token heuristic is also rejected.
+remaining-token heuristic is also rejected. Disabling the per-command online
+step sync for long_output (`TORCHINFERNO_OPENAI_TP_ONLINE_STEP_SYNC=0`) also
+does not help: 309.7 / 27.8 / 1533.2 ms with worse p99.
 
 FEW ROW-CAP REJECTION (2026-06-22, current d3608c6 no-profile): lowering
 greedy-mid active rows to 24
