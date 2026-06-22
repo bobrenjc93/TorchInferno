@@ -13,6 +13,19 @@ decode work (`21.4ms` TPOT vs vLLM `14.8ms`). This public run predates the
 common-prefix no-logits cleanup (`d3421c2`) and the later chat stop-id runtime
 propagation (`fb7fdf0`).
 
+FULL SAME-NODE BASELINE (2026-06-22, current 4746555,
+inference-bench `20260622_063441`): with all three providers on the same host,
+TorchInferno scores 3/20: few_shot TPOT (52.9ms) and E2E (199.8ms), plus
+multi_turn TPOT (42.2ms). vLLM scores 19/20 and SGLang scores 3/20. The current
+actionable gaps are not few-shot median latency; TorchInferno already beats vLLM
+there locally except throughput/p99. The large remaining gaps are self median
+latency (TorchInferno 324.7 / 439.3 ms vs vLLM 167.2 / 280.0 ms), multi_turn
+TTFT/E2E/tput (597.6 / 640.0 ms / 2.0 tok/s vs vLLM 179.7 / 232.1 ms /
+5.9 tok/s), tree_of_thought (222.5 / 52.2 / 265.0 ms vs vLLM 71.9 / 34.8 /
+97.6 ms), and long_output decode/queueing (340.8 / 27.5 / 1591.6 ms vs vLLM
+71.3 / 18.8 / 753.7 ms). SGLang is useful as a TTFT reference in few/tree/multi
+but is not a self-consistency tail target: p99 E2E was 58.4s.
+
 CLEAN NO-PROFILE TREE REPRO (2026-06-21, current 33a2eb3): rerunning
 tree_of_thought locally with no queue profiling did not reproduce the public
 `30.2ms` TPOT row. The latest inference-bench checkout, `--skip-build`, and the
