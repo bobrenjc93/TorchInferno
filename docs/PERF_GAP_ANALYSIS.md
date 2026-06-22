@@ -190,6 +190,23 @@ correct. The sampled-medium branch sessions stay in the local 52ms TPOT band,
 while the broader override also weakens TTFT/E2E. Do not scope a sampled-medium
 quantum default from this result.
 
+FEW/MULTI SAME-NODE PROVIDER COMPARISON (2026-06-22, current ddc00a7,
+inference-bench `20260622_061445`): TorchInferno is locally ahead of vLLM on the
+few_shot latency row: vLLM 160.9 / 61.3 / 217.8 ms, 7.0 tok/s, versus
+TorchInferno 155.4 / 52.5 / 200.9 ms, 5.9 tok/s. The remaining few gap is
+throughput and p99, not median TTFT/TPOT/E2E. Multi_turn still has the expected
+shape: TorchInferno wins TPOT (42.7ms vs vLLM 65.3ms), but loses TTFT/E2E/tput
+badly (588.0 / 627.0 ms, 2.0 tok/s, with last-turn TTFT 951.4ms, versus vLLM
+184.9 / 239.6 ms, 5.7 tok/s, last-turn TTFT 169.8ms). This points back to
+cross-turn prefix/session reuse, not decode speed.
+
+MULTI IDLE-DRAIN REJECTION (2026-06-22, current ddc00a7 no-profile): a broader
+greedy idle collection window via `TORCHINFERNO_OPENAI_TP_ONLINE_IDLE_BATCH_WAIT_MS=10`
+does not improve multi_turn. It landed at 594.8 / 43.7 / 639.3 ms, 1.8 tok/s,
+with first-turn TTFT 933.6ms and last-turn TTFT 1059.8ms. The extra wait
+slightly flattens turn growth but adds too much head latency; keep greedy-large
+idle collection at the current default.
+
 FEW ROW-CAP REJECTION (2026-06-22, current d3608c6 no-profile): lowering
 greedy-mid active rows to 24
 (`TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_MID_MAX_ACTIVE=24`) improves the
