@@ -486,7 +486,10 @@ class ContinuousBatchEngine:
             return False
         if self.unified_forward or not self.decode_first or self.temperature > 0.0:
             return False
-        if any(state.request.stop_token_ids for state in self._online_active):
+        if (
+            any(state.request.stop_token_ids for state in self._online_active)
+            and not env_flag("TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY_ALLOW_STOP", False)
+        ):
             return False
         if self._generated_prefix_cache_enabled() or self._prompt_lookup_decode_enabled():
             return False

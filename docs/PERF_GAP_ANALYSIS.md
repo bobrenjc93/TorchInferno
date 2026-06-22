@@ -344,7 +344,10 @@ deferred readback counter (`decode_ragged_cpu_tokens_ms` about 10.6s -> 4.25s),
 but shifted the sync into decode timing (`decode_ragged_model_ms` about 0.88s ->
 8.81s) and did not improve score-facing throughput/E2E (371.4 / 27.4 / 1686.9
 ms, 24.3 tok/s). Keep decode-many gated until readback can be genuinely
-pipelined rather than just moved between timing buckets.
+pipelined rather than just moved between timing buckets. The stop-token
+overcompute variant is now reproducible without local patches via
+`TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY_ALLOW_STOP=1`, but it remains
+explicitly default-off.
 
 LONG_OUTPUT CURRENT RECHECKS (2026-06-21, bd61b32 local slices): two narrower
 variants also failed. Raising greedy-short decode quantum from the default 8 to

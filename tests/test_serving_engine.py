@@ -2470,6 +2470,41 @@ def test_continuous_batch_engine_online_many_falls_back_with_eos(monkeypatch) ->
     assert not engine.has_online_work()
 
 
+def test_continuous_batch_engine_online_many_can_overcompute_stop_tokens(monkeypatch) -> None:
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY", "1")
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY_ALLOW_STOP", "1")
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_UNIFORM_RAGGED_DECODE", "1")
+    model = _RaggedGraphToyModel(vocab_size=128)
+    engine = ContinuousBatchEngine(
+        model,
+        device=torch.device("cpu"),
+        max_active_requests=2,
+        prefix_cache_capacity=0,
+        enable_ragged_decode=True,
+        store_reusable_prefixes=False,
+    )
+    engine.start_online(max_seq_len=16)
+    engine.submit_online(ServingRequest("a", (1, 2, 3), 4, arrival_step=0, eos_token_id=5))
+    engine.submit_online(ServingRequest("b", (3, 4, 5), 4, arrival_step=0))
+
+    first = engine.step_online()
+    events, steps = engine.step_online_many(8)
+
+    assert [(event.request_id, event.token, event.generated, event.finished) for event in first] == [
+        ("a", 4, 1, False),
+        ("b", 6, 1, False),
+    ]
+    assert steps == 3
+    assert [(event.request_id, event.token, event.generated, event.finished) for event in events] == [
+        ("a", 5, 2, True),
+        ("b", 7, 2, False),
+        ("b", 8, 3, False),
+        ("b", 9, 4, True),
+    ]
+    assert not engine.has_online_work()
+    assert model.ragged_logits_graph_calls == 3
+
+
 def test_continuous_batch_engine_online_finishes_on_stop_token_ids() -> None:
     model = _RaggedGraphToyModel(vocab_size=128)
     engine = ContinuousBatchEngine(
