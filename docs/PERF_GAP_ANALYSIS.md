@@ -63,6 +63,29 @@ long_output 346.1 / 28.5 / 1568.2 ms (`20260622_075841`). This is a tree/order
 stability fix; the remaining score-facing gaps are still self median latency,
 multi_turn TTFT/E2E/throughput, and long_output decode/queueing.
 
+POST-CACHE-FIT PROVIDER COMPARISON (2026-06-22, current addfef4,
+inference-bench `20260622_081355`): the same-node provider comparison after the
+cache-fit guard landed at vLLM 20 wins, SGLang 3, TorchInferno 2. TorchInferno
+kept few_shot TPOT (56.0ms) and multi_turn TPOT (45.0ms), but few_shot E2E did
+not hold in this run (227.1ms versus vLLM 205.1ms). tree_of_thought improved
+from the prior provider outlier (428.8 / 468.0 ms TTFT/E2E) to 356.7 / 385.4 ms
+but remained far behind vLLM's 73.0 / 100.8 ms. self_consistency also remains a
+large median gap at 405.5 / 521.2 ms versus vLLM 177.1 / 239.7 ms, and
+long_output remains decode/queue-bound at 399.1 / 27.3 / 1630.9 ms versus vLLM
+71.2 / 19.0 / 764.3 ms. Treat the cache-fit guard as correctness/stability; the
+next score work needs self wave formation and long-output decode/queueing.
+
+SELF INITIAL-WAIT RECHECK (2026-06-22, current addfef4 + local patch): the
+current self_consistency queue profile (`20260622_081944`) still admitted only
+9 requests in the initial wave, then processed 1000 requests through 44
+exact-prefix reuse batches. Runtime totals were about 1926ms in prefix-reuse
+prefill work and 1207ms in decode-active work. Raising only the sampled-short
+initial collection default from 10ms to 20ms improved focused self_consistency
+to 304.5 / 0.0 / 382.3 ms, 2.6 tok/s, 1000/1000 correct
+(`20260622_082535`). This is narrower than the previously rejected idle-wait
+knobs and remains scoped to sampled short requests (`max_tokens <= 256`), so it
+does not apply to few_shot, tree_of_thought, multi_turn, or long_output.
+
 CLEAN NO-PROFILE TREE REPRO (2026-06-21, current 33a2eb3): rerunning
 tree_of_thought locally with no queue profiling did not reproduce the public
 `30.2ms` TPOT row. The latest inference-bench checkout, `--skip-build`, and the
