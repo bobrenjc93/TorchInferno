@@ -489,6 +489,13 @@ applies. Net: the runner is not the lever. Decode is GPU-compute-bound (~15ms);
 FP8 decode weights (halve it) remain the real throughput/TPOT lever. The wiring
 stays (flag off, validated) as a foundation if FP8 or a stable-decode path lands.
 
+Real few_shot recheck (2026-06-21, current 264814b with
+`TORCHINFERNO_DECODE_GRAPH_RUNNER=1`): the synthetic few_shot-like win does not
+transfer to inference-bench. It regressed the row to 183.7 ms TTFT / 66.8 ms TPOT
+/ 238.2 ms E2E / 5.0 tok/s, with 975/1000 raw correct. Do not scope-enable the
+runner for greedy-mid/few_shot traffic without a new implementation that avoids
+the startup and synchronous-harvest cost.
+
 ## max_active / queueing — validated with the new ignore_eos harness
 
 Added TORCHINFERNO_OPENAI_IGNORE_EOS (test-only, default off): forces generation
