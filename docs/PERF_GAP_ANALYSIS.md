@@ -1138,7 +1138,26 @@ Self-consistency sampled-short wait A/B (2026-06-21, current `9452794`):
   `TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_SHORT_INITIAL_BATCH_WAIT_MS=10`
   improved to `255.7ms` TTFT, `384.1ms` E2E, `2.6 tok/s`, correctness 100%.
   This policy only covers sampled short requests (`max_tokens<=256`), so tree's
-  sampled medium path remains on its separate 5ms default.
+  sampled medium path remains on its separate default.
+
+Tree sampled-medium wait refresh (2026-06-21, current `0ec0ce5`): rechecking
+the older 1ms wait A/B on the current branch is not defaultable. With queue
+profiling enabled, tree_of_thought moved from the current profiled control
+`248.2ms` TTFT / `52.1ms` TPOT / `306.7ms` E2E / `4.0 tok/s`, 962/992 raw
+correct, to `225.9ms` TTFT / `53.1ms` TPOT / `269.0ms` E2E / `4.3 tok/s`,
+960/992 raw correct. The first sampled-medium online session admitted more work
+(`221 -> 237`) while prefill wall dropped `1835ms -> 1326ms`. But the
+score-comparable default run was mixed: `243.1ms` TTFT / `50.8ms` TPOT /
+`278.0ms` E2E / `4.4 tok/s`, 959/992 raw correct, versus the unprofiled control
+at `230.6ms` TTFT / `52.7ms` TPOT / `269.8ms` E2E / `4.3 tok/s`. Keep the 5ms
+sampled-medium default.
+
+Long-output greedy-short wait refresh (2026-06-21, current `0ec0ce5`): raising
+`TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_INITIAL_BATCH_WAIT_MS` from 1ms to
+5ms is rejected. It only moved `initial_batch_size` from 2 to 3, kept the same
+60 prefill batches and 55/5 graph hit/miss split, and regressed score-facing
+TTFT/TPOT to `355.2ms` / `28.9ms`. Keep greedy-short long_output on the 1ms
+default.
 
 ## In-flight, validated-locally-but-NOT-benchmarked commits
 
