@@ -329,6 +329,26 @@ prefill wall `13243ms -> 11800ms`, and improved score-facing E2E/TPOT to
 (`329.9ms -> 332.4ms`), so this is an E2E/prefill cleanup rather than a TTFT
 fix. Focused CPU tests cover the short-vs-mid threshold split.
 
+Long-output refresh after the common-prefix no-logits cleanup (2026-06-21,
+current `778e185`): local profiled long_output landed at `343.7ms` TTFT,
+`26.9ms` TPOT, `1528.3ms` E2E, `25.9 tok/s`, 1000/1000 correct. Queue profile
+remained decode/readback dominated: `728` decode batches for `44347` decode
+tokens, `13348.8ms` decode-active, and `10891.3ms` synchronous CPU token
+readback. Prefill stayed material (`55` batches, `13141.5ms` wall /
+`12161.0ms` forward) despite all common-prefix suffix prefills hitting graph
+replay. The no-logits cleanup is not a stable long_output lever.
+
+Ragged decode GPU-token input buffer rejected (2026-06-21, current `778e185` +
+temporary patch, backed out): reusing `_gpu_last_tokens` and cached row-index
+tensors for the normal ragged decode input path did not validate. The run landed
+at `343.8ms` TTFT, `27.6ms` TPOT, `1455.7ms` E2E, `25.4 tok/s`, 1000/1000
+correct. The apparent E2E shift came with prefill variance (`55 -> 51` batches,
+`13141.5ms -> 11765.2ms` wall), not a decode mechanism win. Decode-active
+worsened (`13348.8ms -> 13605.4ms`), CPU readback was flat
+(`10891.3ms -> 10871.1ms`), and ragged prepare time regressed
+(`1086.2ms -> 1408.2ms`). Keep the simple per-step tensor construction until a
+true lagged readback/GPU-token pipeline exists.
+
 PROMPT-LOOKUP DECODE RECHECK (2026-06-21, 28d7c7c local slices): prompt lookup
 is still not a defaultable long_output lever. The old verifier used a full
 prefill over `[last_token, proposal...]` and was catastrophic (hundreds of
