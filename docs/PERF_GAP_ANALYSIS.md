@@ -88,6 +88,19 @@ Disabling repeated-prefix Gumbel sampling
 405.8 / 0.0 / 472.6 ms, 2.1 tok/s. Keep repeated-prefix Gumbel enabled at the
 current threshold and leave the alternate samplers opt-in.
 
+SELF IDLE-DRAIN BATCHING (2026-06-22, current bccf781 + local patch): a default
+queue-profiled self_consistency run showed the remaining gap was wave
+fragmentation, not sampling: the server collected only 9 requests initially and
+processed 1000 requests through 43 exact-prefix prefill-reuse batches plus 44
+decode batches. Runtime totals were 1949ms in prefill/exact-prefix work and
+1186ms in decode-active time. Raising only the online idle drain wait from 2ms
+to 10ms for sampled-short bursts improved a no-profile run from the comparable
+317.6 / 0.0 / 407.5 ms profile row to 232.4 / 0.0 / 369.4 ms. A 20ms wait was
+too long and is rejected: 375.2 / 0.0 / 457.8 ms. The default patch scopes the
+10ms wait to sampled requests with `max_tokens <= 256`, so tree_of_thought's
+sampled 300-token branches and greedy rows stay on the 2ms idle drain. The
+post-patch no-env guard landed at 287.7 / 0.0 / 399.6 ms, 1000/1000 correct.
+
 FULL CURRENT LOCAL REFRESH (2026-06-22, current 51fba66 no-profile,
 TorchInferno-only): the pushed default stack landed at few_shot 149.3 / 50.2 /
 189.8 ms, self_consistency 313.4 / 0.0 / 388.7 ms, multi_turn 595.8 / 41.4 /

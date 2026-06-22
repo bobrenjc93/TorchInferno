@@ -342,6 +342,27 @@ def _online_persistent_idle_ms(*, temperature: float, max_tokens: int) -> float:
     )
 
 
+def _online_idle_batch_wait_ms(*, temperature: float, max_tokens: int) -> float:
+    global_env = "TORCHINFERNO_OPENAI_TP_ONLINE_IDLE_BATCH_WAIT_MS"
+    if global_env in os.environ:
+        return env_float(global_env, 2.0, minimum=0.0)
+    default_wait_ms = 2.0
+    if temperature > 0.0 and 0 < max_tokens <= env_int(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_SHORT_IDLE_BATCH_WAIT_MAX_TOKENS",
+        256,
+        minimum=1,
+    ):
+        # Self-consistency-style sampled bursts arrive from a 128-worker client
+        # pool in waves. A short idle drain window batches those follow-on
+        # requests instead of running dozens of tiny exact-prefix/decode waves.
+        default_wait_ms = env_float(
+            "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_SHORT_IDLE_BATCH_WAIT_MS",
+            10.0,
+            minimum=0.0,
+        )
+    return default_wait_ms
+
+
 def _online_initial_batch_wait_ms(*, temperature: float, max_tokens: int) -> float:
     global_env = "TORCHINFERNO_OPENAI_TP_ONLINE_INITIAL_BATCH_WAIT_MS"
     if global_env in os.environ:
@@ -3038,7 +3059,13 @@ class OpenAICompletionEngine:
             )
             / 1000.0
         )
-        idle_wait_s = env_float("TORCHINFERNO_OPENAI_TP_ONLINE_IDLE_BATCH_WAIT_MS", 2.0, minimum=0.0) / 1000.0
+        idle_wait_s = (
+            _online_idle_batch_wait_ms(
+                temperature=first.temperature,
+                max_tokens=first.max_tokens,
+            )
+            / 1000.0
+        )
         profile_start_s = time.perf_counter()
         phase_ms: dict[str, float] = {}
 
