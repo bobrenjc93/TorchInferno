@@ -10536,6 +10536,7 @@ def test_openai_queue_profile_records_runtime_engine_stats(
         decode_model_calls = 5
         decode_batches = 5
         decode_tokens = 31
+        decode_ragged_model_gpu_ms = 12.5
         ragged_decode_batches = 4
         ragged_decode_tokens = 29
         decode_graph_hits = 3
@@ -10566,6 +10567,7 @@ def test_openai_queue_profile_records_runtime_engine_stats(
             "runtime_decode_graph_hits": 3,
             "runtime_decode_graph_misses": 1,
             "runtime_decode_model_calls": 5,
+            "runtime_decode_ragged_model_gpu_ms": 12.5,
             "runtime_decode_tokens": 31,
             "runtime_max_model_batch_size": 8,
             "runtime_persistent_cache_rows": 12,

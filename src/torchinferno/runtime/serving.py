@@ -120,6 +120,7 @@ class ServingStats:
     prefill_state_ms: float = 0.0
     decode_ragged_prepare_ms: float = 0.0
     decode_ragged_model_ms: float = 0.0
+    decode_ragged_model_gpu_ms: float = 0.0
     decode_ragged_cpu_tokens_ms: float = 0.0
     decode_ragged_state_update_ms: float = 0.0
     prompt_lookup_batches: int = 0
@@ -351,6 +352,7 @@ class ContinuousBatchEngine:
         self._online_prefilling: list[_ActiveRequest] = []
         self._online_step = 0
         self._online_next_index = 0
+        self._pending_decode_ragged_model_events: list[tuple[object, object]] = []
 
     @torch.inference_mode()
     def run(self, requests: list[ServingRequest]) -> list[ServingResult]:
@@ -540,6 +542,7 @@ class ContinuousBatchEngine:
         flat_tokens = torch.cat(token_parts).detach().cpu().tolist()
         if self.profile_timings:
             self.stats.decode_ragged_cpu_tokens_ms += (time.perf_counter() - cpu_tokens_start_s) * 1000.0
+            self._flush_decode_ragged_model_gpu_timers()
 
         events: list[ServingTokenEvent] = []
         terminated: set[int] = set()
@@ -1018,6 +1021,7 @@ class ContinuousBatchEngine:
         self._online_prefilling = []
         self._online_step = 0
         self._online_next_index = 0
+        self._pending_decode_ragged_model_events = []
 
     def _admit_ready_requests(
         self,
@@ -2663,6 +2667,41 @@ class ContinuousBatchEngine:
             return self._finish_and_release(state, step)
         return state
 
+    def _start_decode_ragged_model_gpu_timer(self) -> tuple[object, object] | None:
+        if not self.profile_timings or self.device.type != "cuda":
+            return None
+        try:
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record(torch.cuda.current_stream(self.device))
+            return start, end
+        except Exception:
+            return None
+
+    def _stop_decode_ragged_model_gpu_timer(self, events: tuple[object, object] | None) -> None:
+        if events is None:
+            return
+        try:
+            _start, end = events
+            end.record(torch.cuda.current_stream(self.device))
+        except Exception:
+            return
+        self._pending_decode_ragged_model_events.append(events)
+
+    def _flush_decode_ragged_model_gpu_timers(self) -> None:
+        pending = getattr(self, "_pending_decode_ragged_model_events", [])
+        if not pending:
+            return
+        remaining: list[tuple[object, object]] = []
+        for start, end in pending:
+            try:
+                self.stats.decode_ragged_model_gpu_ms += float(start.elapsed_time(end))
+            except RuntimeError:
+                remaining.append((start, end))
+            except Exception:
+                continue
+        self._pending_decode_ragged_model_events = remaining
+
     def _ensure_gpu_token_buf(self) -> Tensor:
         buf = getattr(self, "_gpu_last_tokens", None)
         total = self.max_active_requests + (getattr(self, "prefix_cache_capacity", 0) or 0) + 2
@@ -2867,7 +2906,9 @@ class ContinuousBatchEngine:
             self._set_cache_row_seq_len(state.row, state.seq_len)
 
         model_start_s = time.perf_counter() if self.profile_timings else 0.0
+        gpu_model_events = self._start_decode_ragged_model_gpu_timer()
         logits, _ = self._prefill_full_logits(input_ids, cache=self._cache_view(rows))
+        self._stop_decode_ragged_model_gpu_timer(gpu_model_events)
         if self.profile_timings:
             self.stats.decode_ragged_model_ms += (time.perf_counter() - model_start_s) * 1000.0
 
@@ -2892,6 +2933,7 @@ class ContinuousBatchEngine:
         predicted_tokens = predicted.detach().cpu().tolist()
         if self.profile_timings:
             self.stats.decode_ragged_cpu_tokens_ms += (time.perf_counter() - cpu_tokens_start_s) * 1000.0
+            self._flush_decode_ragged_model_gpu_timers()
 
         decoded: list[_ActiveRequest | ServingResult] = []
         state_update_start_s = time.perf_counter() if self.profile_timings else 0.0
@@ -2954,6 +2996,7 @@ class ContinuousBatchEngine:
         if self.profile_timings:
             self.stats.decode_ragged_prepare_ms += (time.perf_counter() - prepare_start_s) * 1000.0
         model_start_s = time.perf_counter() if self.profile_timings else 0.0
+        gpu_model_events = self._start_decode_ragged_model_gpu_timer()
         self._last_ragged_decode_logits = None
         reuse_logits: Tensor | None = None
         need_generated_prefix_logits = self._needs_generated_prefix_logits(states)
@@ -2966,6 +3009,7 @@ class ContinuousBatchEngine:
             logits = self._ragged_decode_logits(input_ids, seq_lens, row_indices)
             reuse_logits = logits[:, -1, :]
             next_token_tensor = self._sample_logits(logits[:, -1, :])
+        self._stop_decode_ragged_model_gpu_timer(gpu_model_events)
         self._record_model_call("decode", n_padded, tokens=n_padded, ragged=True)
         if self.profile_timings:
             self.stats.decode_ragged_model_ms += (time.perf_counter() - model_start_s) * 1000.0
@@ -2973,6 +3017,7 @@ class ContinuousBatchEngine:
         next_tokens = next_token_tensor[:n_active].detach().cpu().tolist()
         if self.profile_timings:
             self.stats.decode_ragged_cpu_tokens_ms += (time.perf_counter() - cpu_tokens_start_s) * 1000.0
+            self._flush_decode_ragged_model_gpu_timers()
         self._store_decoded_reusable_prefixes(
             states,
             None if reuse_logits is None else reuse_logits[:n_active],
@@ -2992,6 +3037,7 @@ class ContinuousBatchEngine:
             self.stats.decode_ragged_prepare_ms += (time.perf_counter() - prepare_start_s) * 1000.0
 
         model_start_s = time.perf_counter() if self.profile_timings else 0.0
+        gpu_model_events = self._start_decode_ragged_model_gpu_timer()
         self._last_ragged_decode_logits = None
         graph_token = self._try_ragged_token_graph(input_ids, seq_lens, row_indices)
         if graph_token is not None:
@@ -3000,6 +3046,7 @@ class ContinuousBatchEngine:
         else:
             logits = self._ragged_decode_logits(input_ids, seq_lens, row_indices)
             next_token_tensor = self._sample_logits(logits[:, -1, :])
+        self._stop_decode_ragged_model_gpu_timer(gpu_model_events)
         self._record_model_call("decode", n_padded, tokens=n_padded, ragged=True)
         active_row_indices = row_indices[:n_active]
         self._ensure_gpu_token_buf().index_copy_(0, active_row_indices, next_token_tensor[:n_active])

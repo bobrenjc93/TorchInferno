@@ -3662,6 +3662,7 @@ class OpenAICompletionEngine:
             "prefill_state_ms",
             "decode_ragged_prepare_ms",
             "decode_ragged_model_ms",
+            "decode_ragged_model_gpu_ms",
             "decode_ragged_cpu_tokens_ms",
             "decode_ragged_state_update_ms",
             "prompt_lookup_batches",
