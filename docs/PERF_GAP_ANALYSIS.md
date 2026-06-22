@@ -107,6 +107,14 @@ correct. Lowering the sampled-short idle drain to 8ms was too short and is
 rejected: 379.9 / 0.0 / 451.1 ms, 2.2 tok/s. Raising it to 12ms is also
 rejected: 380.8 / 0.0 / 456.5 ms, 2.2 tok/s. Keep the 10ms default.
 
+SELF SAME-NODE PROVIDER COMPARISON (2026-06-22, current fc084b0,
+inference-bench `20260622_051934`): with the existing local vLLM/SGLang builds,
+vLLM still leads the self_consistency median row: vLLM 183.7 / 0.0 / 341.7 ms,
+2.9 tok/s; SGLang 218.6 / 0.0 / 389.6 ms, 2.6 tok/s; TorchInferno 300.7 / 0.0 /
+391.3 ms, 2.6 tok/s. TorchInferno's p99 E2E was the best of the three
+(1035.8ms vs vLLM 1056ms and SGLang's pathological 58889.6ms), so the remaining
+self gap is median wave latency/throughput rather than tail stability.
+
 SELF STOP-LOOKAHEAD REJECTED (2026-06-22, current 76b24e4 + temporary patch):
 an env-gated one-row exact-prefix lookahead decoded the sampled first token once
 and finished the whole reuse group only if all sampled second tokens were stop
