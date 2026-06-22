@@ -96,6 +96,16 @@ This is narrower than the rejected global 5ms initial-wait experiment: it only
 applies to greedy requests with `max_tokens <= 128`, while few_shot uses
 `max_tokens=256` and stays on its existing path.
 
+INITIAL-WAIT FULL GUARD (2026-06-22, current 9e08add TorchInferno-only): the
+combined cache-fit, sampled-short 20ms initial wait, and greedy-short 5ms
+initial wait defaults landed at few_shot 152.5 / 51.6 / 195.0 ms,
+self_consistency 318.7 / 0.0 / 396.9 ms, multi_turn 587.1 / 41.0 / 625.8 ms,
+tree_of_thought 267.3 / 51.1 / 293.2 ms, and long_output 281.0 / 28.5 /
+1526.7 ms (`20260622_084712`). Correctness stayed in family: few 976/1000,
+self 1000/1000, multi 980/1000, tree 960/992, long 1000/1000. The self row is
+the main default-path improvement; long TTFT improved but TPOT remains in the
+same 27-28ms local band.
+
 CLEAN NO-PROFILE TREE REPRO (2026-06-21, current 33a2eb3): rerunning
 tree_of_thought locally with no queue profiling did not reproduce the public
 `30.2ms` TPOT row. The latest inference-bench checkout, `--skip-build`, and the
