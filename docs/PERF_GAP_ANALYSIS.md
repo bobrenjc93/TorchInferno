@@ -124,6 +124,16 @@ self 1000/1000, multi 980/1000, tree 959/992, long 1000/1000. The self row is
 the real movement from the idle-drain work; the other rows remain in their local
 variance bands and still need separate levers.
 
+TREE/LONG SCHEDULER REJECTIONS (2026-06-22, current b380546 no-profile): a
+global 10ms idle drain for tree_of_thought
+(`TORCHINFERNO_OPENAI_TP_ONLINE_IDLE_BATCH_WAIT_MS=10`) landed at 227.1 / 52.2 /
+265.8 ms, 4.3 tok/s, so TPOT stayed in the local 52ms band and the setting is
+not score-facing. Larger long_output greedy-short decode quanta expose the
+expected admission tradeoff. Quantum 16 improved TPOT to 23.7ms but regressed
+TTFT to 472.3ms; quantum 12 landed at 413.1 / 25.8 / 1542.5 ms. Keep the
+current 8-step short-greedy quantum until a dynamic policy can raise quantum
+only when it will not delay newly arrived requests.
+
 FULL CURRENT LOCAL REFRESH (2026-06-22, current 51fba66 no-profile,
 TorchInferno-only): the pushed default stack landed at few_shot 149.3 / 50.2 /
 189.8 ms, self_consistency 313.4 / 0.0 / 388.7 ms, multi_turn 595.8 / 41.4 /
