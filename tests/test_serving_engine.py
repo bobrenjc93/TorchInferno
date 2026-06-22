@@ -1975,6 +1975,7 @@ def test_continuous_batch_engine_prefix_reuse_does_not_capture_ragged_graph_on_m
     monkeypatch,
 ) -> None:
     monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PADDED_SUFFIX_PREFILL", "1")
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_CAPTURE_ON_MISS", "0")
     shared = tuple(range(16))
     model = _SelectedRaggedGraphMissToyModel()
     engine = ContinuousBatchEngine(
@@ -1999,6 +2000,22 @@ def test_continuous_batch_engine_prefix_reuse_does_not_capture_ragged_graph_on_m
     assert engine.stats.prefill_graph_misses == 2
     assert engine.stats.prefill_prefix_reuse_batches == 2
     assert engine.stats.prefix_reuse_requests == 4
+
+
+def test_continuous_batch_engine_clears_external_cache_capture_skip() -> None:
+    model = _RaggedGraphToyModel()
+    cache = model.allocate_cache(2, max_seq_len=16)
+    cache._skip_capture_sync = True
+    engine = ContinuousBatchEngine(
+        model,
+        device=torch.device("cpu"),
+        max_active_requests=1,
+        prefix_cache_capacity=1,
+    )
+
+    engine.start_online(max_seq_len=16, external_cache=cache)
+
+    assert not hasattr(cache, "_skip_capture_sync")
 
 
 def test_continuous_batch_engine_can_use_prefill_logits_graph(monkeypatch) -> None:

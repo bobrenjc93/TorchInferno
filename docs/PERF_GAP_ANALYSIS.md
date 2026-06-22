@@ -123,16 +123,19 @@ this as a self wave-formation cleanup; it is intentionally scoped away from
 tree_of_thought's sampled-medium path and greedy workloads.
 
 PREFIX-REUSE GRAPH CAPTURE DIVERGENCE FIX (2026-06-22, current 519188d + local
-patch): the first same-node provider recheck on `519188d` wedged during
+patches): the first same-node provider recheck on `519188d` wedged during
 TorchInferno long_output after few/self/multi/tree had completed. `py-spy`
 showed a collective-order mismatch in prefix-reuse prefill: rank 0 had fallen
 through to eager ragged prefill and was in a tensor-parallel all-reduce, while a
 worker rank was still in ragged prefill graph-capture success synchronization.
-Runtime prefix-reuse prefill now passes `capture_on_miss=False` by default, so
-warm graphs can replay but an uncaptured shape falls back to eager on every rank
-instead of attempting a late capture in the serving path. The opt-in escape hatch
-is `TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_CAPTURE_ON_MISS=1`; the default keeps
-runtime graph generation out of the hot path.
+Disabling prefix-reuse capture-on-miss avoided the wedge and completed the
+provider run (`20260622_102029`, vLLM 17 / SGLang 6 / TorchInferno 2), but it
+over-serialized prefix reuse and ballooned few_shot/multi_turn TTFT. The
+narrower follow-up keeps prefix graph capture enabled by default and instead
+clears stale `_skip_capture_sync` markers whenever the online runtime adopts an
+external persistent cache, so primary and worker ranks make the same
+capture/replay decision. `TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_CAPTURE_ON_MISS=0`
+remains an escape hatch for diagnosing future capture-order issues.
 
 CLEAN NO-PROFILE TREE REPRO (2026-06-21, current 33a2eb3): rerunning
 tree_of_thought locally with no queue profiling did not reproduce the public

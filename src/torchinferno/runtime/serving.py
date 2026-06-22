@@ -45,6 +45,15 @@ def _preferred_prefix_rows() -> tuple[int, ...]:
     return tuple(rows)
 
 
+def _enable_runtime_cache_capture_sync(cache: object) -> None:
+    try:
+        delattr(cache, "_skip_capture_sync")
+    except AttributeError:
+        pass
+    except Exception:
+        pass
+
+
 @dataclass(frozen=True)
 class ServingRequest:
     request_id: str
@@ -1005,6 +1014,7 @@ class ContinuousBatchEngine:
         total_rows = self.max_active_requests + self.prefix_cache_capacity
         if external_cache is not None:
             self._cache = external_cache
+            _enable_runtime_cache_capture_sync(self._cache)
         else:
             self._cache = self._allocate_cache(max(1, total_rows), max_seq_len)
         if not hasattr(self._cache, "for_rows"):
@@ -1661,7 +1671,7 @@ class ContinuousBatchEngine:
                     logit_positions,
                     context_len,
                     src_prefix_row,
-                    capture_on_miss=env_flag("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_CAPTURE_ON_MISS", False),
+                    capture_on_miss=env_flag("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_CAPTURE_ON_MISS", True),
                 )
             if logits is None:
                 logits = self._ragged_prefill_logits_eager(
