@@ -151,6 +151,13 @@ few_shot TPOT cell to 44.5ms, but it regresses the rest of the row badly:
 202.5ms TTFT, 237.8ms E2E, 5.4 tok/s, and worse p99. Do not default a
 single-cell TPOT tradeoff that hurts the actual request latency shape.
 
+FLASHINFER PREFILL REJECTION (2026-06-22, current 0d1273c no-profile): enabling
+the experimental continuous FlashInfer prefill path
+(`TORCHINFERNO_CONTINUOUS_FLASHINFER_PREFILL_DISABLE=0`) is not correct or fast
+enough for few_shot. The run landed at 1201.5 / 135.5 / 1360.9 ms, 1.2 tok/s,
+and only 891/1000 correct. Keep this path default-disabled until it has a
+separate correctness fix and shape-specific evidence.
+
 FULL CURRENT LOCAL REFRESH (2026-06-22, current 51fba66 no-profile,
 TorchInferno-only): the pushed default stack landed at few_shot 149.3 / 50.2 /
 189.8 ms, self_consistency 313.4 / 0.0 / 388.7 ms, multi_turn 595.8 / 41.4 /
