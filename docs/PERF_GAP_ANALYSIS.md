@@ -386,6 +386,13 @@ The issue is not simply too many CPU readbacks; speculative readback deferral
 still increases queue-visible latency unless decode and readback are actually
 pipelined.
 
+Tail-only decode quantum 16 is rejected too (2026-06-22, current 0116ef1 +
+local patch). The patch kept the default 8-step quantum while the HTTP queue was
+non-empty, then switched to 16 only after queued submissions drained. It improved
+long_output TPOT to 26.0 ms, but TTFT/E2E/throughput regressed to 402.2 /
+1528.3 ms / 25.3 tok/s with 1000/1000 correct. The fixed-DQ16 conclusion still
+holds: the TPOT gain is not worth the queue-visible latency.
+
 LONG_OUTPUT ADMISSION RECHECK (2026-06-21, current `1f51273` unprofiled):
 lowering the greedy-short admit cap from the default 64 to 32 improved local
 TTFT but regressed every decode-throughput-facing metric: `291.4ms` TTFT,
