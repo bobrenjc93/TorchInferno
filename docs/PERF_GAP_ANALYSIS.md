@@ -858,7 +858,9 @@ for gate_up+down, bf16 for qkv/o_proj/lm_head) is ~1.38x on the decode projectio
 GEMMs. lm_head (N=16032) is not marlin-eligible (N must be % 64). Correctness
 maxdiff ~0.008 vs fp16 (RTN int4 quant error).
 
-INTEGRATED + MEASURED (gate_up, flag TORCHINFERNO_MARLIN_INT4_DECODE, default off):
+HISTORICAL INTEGRATION (gate_up, flag TORCHINFERNO_MARLIN_INT4_DECODE,
+default off at the time; current code later made the M-gated decode path
+default-on, see the Marlin gate recheck near the top of this file):
 torchinferno/kernels/marlin.py + tensor_parallel._mlp_project_decode_reduce now
 route the gate_up decode GEMM through marlin int4 (op via torch.ops.load_library
 on vllm _C, no vllm python import). Results (8xH100, ignore_eos steady-state
@@ -881,19 +883,20 @@ GPU time (profile-PROVEN), contradicting the earlier neutral read. The earlier
 end-to-end "21->21" was measurement imprecision / engine+network TPOT overhead
 masking a ~1-2ms GPU saving (throughput did rise +2.6%).
 
-INT4 ARC OUTCOME (validated, but flag-off): gate_up int4 is ACCURATE (10/10 diverse
-greedy prompts == bf16) and saves 1.74ms/decode-step (network-free _decode_active:
+INT4 ARC OUTCOME AT THAT POINT: gate_up int4 is ACCURATE (10/10 diverse greedy
+prompts == bf16) and saves 1.74ms/decode-step (network-free _decode_active:
 bf16 17.676 -> 15.938). qkv int4 REGRESSED (small GEMM, marlin overhead loses) ->
-hybrid = big GEMMs only. BUT kept DEFAULT-OFF: (a) default-on broke graph-vs-eager
-exact-match tests (int4 numerics != bf16) and the lazy-quantize-before-capture
-ordering is fragile off the server path; (b) benchmark-TPOT translation is UNCERTAIN
--- my streaming harness showed TPOT 21->21 (network/SSE-masked) despite the 1.74ms
-engine saving, and whether the benchmark client is engine- or network-bound is
-unknown; (c) even if it translates, gate_up alone (~1.7ms) -> tree 31.7->~30 does
-NOT flip vllm 29.5; gate_up+down (~2.1ms) -> ~29.6 only MARGINALLY. So int4 is a
-real engine-decode win (flag TORCHINFERNO_MARLIN_INT4_DECODE=1, CUDA-only, graceful
-bf16 fallback if vLLM .so absent) but its benchmark-score payoff is marginal+
-uncertain and default-on is destabilizing -- not shipped.
+hybrid = big GEMMs only. It stayed DEFAULT-OFF in that iteration because (a)
+default-on broke graph-vs-eager exact-match tests (int4 numerics != bf16) and
+the lazy-quantize-before-capture ordering was fragile off the server path; (b)
+benchmark-TPOT translation was UNCERTAIN -- my streaming harness showed TPOT
+21->21 (network/SSE-masked) despite the 1.74ms engine saving, and whether the
+benchmark client was engine- or network-bound was unknown; (c) even if it
+translated, gate_up alone (~1.7ms) -> tree 31.7->~30 did NOT flip vllm 29.5;
+gate_up+down (~2.1ms) -> ~29.6 only MARGINALLY. The current serving code keeps
+the decode-sized gate default-on with bf16 fallback and an M cap; the latest
+self/tree recheck above rejects only a broader self-only policy change, not the
+existing short-row default.
 
 REVIVED LEVER: a FULL int4 decode (all 4 GEMMs: qkv+o+gate_up+down, lm_head stays
 bf16 -- N=16032 not %64) should save ~3ms of the 9.8ms GEMM GPU time -> decode

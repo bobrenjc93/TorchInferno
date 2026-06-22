@@ -1812,11 +1812,10 @@ class _Llama3TensorParallelLayer:
         # BEFORE any decode CUDA-graph capture), caches per `key` on self, then runs
         # marlin_int4_mm. hidden is bf16; marlin scales are bf16 (quantize default)
         # so NO fp16 conversion. Returns [..., N] or None (caller falls back to bf16).
-        # Flag-OFF default: validated (gate_up int4 saves 1.74ms/decode-step measured
-        # network-free; 10/10 greedy prompts correct) but kept opt-in -- default-on
-        # changed decode numerics (int4 != bf16) which broke graph-vs-eager exact
-        # match tests, and the lazy-quantize-before-graph-capture ordering is fragile
-        # in non-server paths. Enable with TORCHINFERNO_MARLIN_INT4_DECODE=1.
+        # Default-on for decode-sized M: gate_up int4 saves decode wall time on
+        # short-row serving paths, while structural graph-vs-eager tests pin it
+        # off because int4 != fp32/bf16 exactness on tiny fixtures. Disable with
+        # TORCHINFERNO_MARLIN_INT4_DECODE=0 when comparing pure bf16 paths.
         # marlin int4 is a WEIGHT-ONLY-quant kernel (int4 dequant + bf16 compute): it
         # WINS at SMALL M (decode, weight-read/memory-bound: 1.52x at M=48, ~2ms/step)
         # but LOSES at LARGE M (prefill, compute-bound -- bf16 tensor cores run
