@@ -11,6 +11,18 @@ vLLM 28.8 ms. long_output TPOT improved to 21.0 ms, but vLLM remains at
 another queue knob. self_consistency remains wave-scheduling-bound at
 274.1 ms TTFT / 388.6 ms E2E / 2.6 tok/s despite the sampled KV-budget change.
 
+TREE SCHEDULER KNOB RECHECKS (2026-06-21, current 60802a local no-profile A/B):
+three more tree_of_thought knobs are rejected. Raising the sampled-medium online
+idle window from the 10ms default to 100ms landed at 231.5 / 52.8 / 273.4 ms
+(TTFT/TPOT/E2E), 4.3 tok/s, and 960/992 raw correct; keeping the engine open
+between waves does not recover the vLLM gap. Lowering the sampled-medium initial
+collection wait from 5ms to 1ms was only a marginal local shift, 224.3 / 52.6 /
+269.8 ms and 4.6 tok/s, while raw correctness slipped to 959/992 and p99s got
+worse. Raising `TORCHINFERNO_OPENAI_TP_ONLINE_MAX_ACTIVE` to 64 is a clear
+regression: 309.8 / 53.3 / 372.9 ms, 3.9 tok/s, and 958/992 raw correct. Keep
+tree on the 5ms sampled-medium wait, 10ms idle window, and 48-row cap until the
+next hypothesis changes the prefill/decode pipeline itself.
+
 TREE LOCAL REPRO/PROVIDER COMPARISON (2026-06-21, current aa22fa0): warm-server
 ordering does not explain the public/local tree discrepancy. A no-profile
 few_shot -> self_consistency -> multi_turn -> tree_of_thought sequence landed
