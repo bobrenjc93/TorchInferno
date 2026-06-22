@@ -104,7 +104,8 @@ correct. Adding a bounded post-arrival collection window for the case where the
 next wave arrives just after the idle drain expires validated better:
 self_consistency landed at 235.1 / 0.0 / 352.3 ms, 2.8 tok/s, 1000/1000
 correct. Lowering the sampled-short idle drain to 8ms was too short and is
-rejected: 379.9 / 0.0 / 451.1 ms, 2.2 tok/s. Keep the 10ms default.
+rejected: 379.9 / 0.0 / 451.1 ms, 2.2 tok/s. Raising it to 12ms is also
+rejected: 380.8 / 0.0 / 456.5 ms, 2.2 tok/s. Keep the 10ms default.
 
 SELF STOP-LOOKAHEAD REJECTED (2026-06-22, current 76b24e4 + temporary patch):
 an env-gated one-row exact-prefix lookahead decoded the sampled first token once
