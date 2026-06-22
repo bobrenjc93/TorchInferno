@@ -203,6 +203,17 @@ tree_of_thought from 249.8 / 53.2 / 295.2 ms to 272.1 / 51.7 / 304.6 ms. That
 does hint at a possible narrow tree TPOT lever, but it trades away TTFT/E2E and
 is not strong enough to ship as a default.
 
+Scoped sampled-medium uniform-ragged decode is also rejected after the latest
+public run made tree TPOT a 1ms target. A temporary patch enabled uniform ragged
+only for sampled-medium online requests (`temperature>0`, `256 < max_tokens <=
+300`) so self_consistency, few_shot, long_output, and multi_turn stayed on the
+old policy. The focused tree run landed at `219.0ms` TTFT, `51.9ms` TPOT,
+`257.9ms` E2E, `4.6 tok/s`, 961/992 raw correct. Against the common-prefix
+no-logits tree profile, decode-active improved (`2551.9ms -> 2419.1ms`) but
+CPU token readback rose (`1586.2ms -> 1660.3ms`) and prefill wall regressed
+(`5529.2ms -> 5632.6ms`). TPOT stayed flat (`51.8ms -> 51.9ms`), so the scoped
+default was backed out.
+
 FEW_SHOT CURRENT RECHECK (2026-06-21, current `1a5d759`): the latest local
 few_shot control is materially better than the frozen public row:
 `152.8ms` TTFT, `50.5ms` TPOT, `193.7ms` E2E, `6.1 tok/s`, 976/1000 raw
