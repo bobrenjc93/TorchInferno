@@ -1,5 +1,25 @@
 # TorchInferno vs vLLM/sglang — Performance Gap Analysis (Llama-3.1-70B, 8xH100)
 
+## LATEST RUN 20260621_235425 (built 28d7c7c): 3/20
+
+TorchInferno is now 3/20 (vLLM 13/20, SGLang 3/20). The stable wins are
+few_shot TPOT/E2E and multi_turn TPOT. few_shot is close on TTFT but SGLang
+kept that cell by 2.9 ms (147.7 vs 150.6), while vLLM keeps throughput. The
+score-moving near miss is again tree_of_thought TPOT: TorchInferno 32.1 ms vs
+vLLM 28.8 ms. long_output TPOT improved to 21.0 ms, but vLLM remains at
+15.0 ms; the row still needs real decode pipeline/fusion work rather than
+another queue knob. self_consistency remains wave-scheduling-bound at
+274.1 ms TTFT / 388.6 ms E2E / 2.6 tok/s despite the sampled KV-budget change.
+
+TREE SAMPLED ROW CAP RECHECK (2026-06-21, current c636428 local focused A/B):
+lowering `TORCHINFERNO_OPENAI_TP_ONLINE_MAX_ACTIVE` to 32 is not defaultable.
+With queue profiling enabled it improved the profiled current control from
+248.2 / 52.1 / 306.7 ms (TTFT/TPOT/E2E) to 230.7 / 50.3 / 273.2 ms, but raw
+correctness moved 962/992 -> 958/992. The score-comparable unprofiled run then
+landed at 240.4 / 51.8 / 288.1 ms and 4.7 tok/s, worse than the public default
+tree row above. Keep sampled tree at the 48-row default unless a new hypothesis
+targets the actual TPOT gap without trading away E2E/throughput.
+
 ## LATEST RUN 20260621_155659 (built a7e5516): 4/20
 
 TorchInferno improved to 4/20 (vLLM 13/20, SGLang 2/20). The few_shot row is
