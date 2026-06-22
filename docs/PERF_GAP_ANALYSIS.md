@@ -10,7 +10,8 @@ cross-benchmark TPOT is 0.6 ms behind (`26.9ms` vs `26.3ms`). TTFT/E2E remain
 queue/prefill dominated: multi_turn is `584.7ms` TTFT vs vLLM `158.3ms`,
 self_consistency is `272.6ms` vs `206.2ms`, and long_output still needs real
 decode work (`21.4ms` TPOT vs vLLM `14.8ms`). This public run predates the
-common-prefix no-logits cleanup (`d3421c2`) and later doc-only rejections.
+common-prefix no-logits cleanup (`d3421c2`) and the later chat stop-id runtime
+propagation (`fb7fdf0`).
 
 CLEAN NO-PROFILE TREE REPRO (2026-06-21, current 33a2eb3): rerunning
 tree_of_thought locally with no queue profiling did not reproduce the public
@@ -48,6 +49,17 @@ earlier full local current guard, self_consistency TTFT/E2E improved and tree
 TPOT stayed in family, but few_shot and long_output TPOT did not improve. Treat
 the change as the right Llama chat-row retirement behavior, not as a confirmed
 full-score speedup.
+
+MARLIN GATE RECHECK (2026-06-22, current fb7fdf0 local no-profile A/B): the
+default gate-up Marlin int4 decode path is not a clean self_consistency lever.
+Default current landed at 327.7 / 0.0 / 412.4 ms and 2.4 tok/s; disabling
+`TORCHINFERNO_MARLIN_INT4_DECODE` improved self_consistency to 309.1 / 0.0 /
+388.0 ms and 2.6 tok/s with 100% correctness, but the same global disable
+regressed tree_of_thought to 238.9 / 57.5 / 291.4 ms and 4.1 tok/s. Lowering
+`TORCHINFERNO_MARLIN_INT4_MAX_M` from 256 to 96 was also rejected: self worsened
+to 356.3 / 0.0 / 433.5 ms and 2.3 tok/s. Keep Marlin enabled for the short-row
+decode workloads for now; a future self-only disable would need an explicit
+request-shape policy rather than a model-wide default.
 
 TREE SCHEDULER KNOB RECHECKS (2026-06-21, current 60802a local no-profile A/B):
 three more tree_of_thought knobs are rejected. Raising the sampled-medium online
