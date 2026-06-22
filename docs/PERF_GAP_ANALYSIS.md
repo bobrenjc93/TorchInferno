@@ -1,15 +1,16 @@
 # TorchInferno vs vLLM/sglang — Performance Gap Analysis (Llama-3.1-70B, 8xH100)
 
-## LATEST RUN 20260621_235425 (built 28d7c7c): 3/20
+## LATEST RUN 20260622_060431 (built bc3b9ea): 1/20
 
-TorchInferno is now 3/20 (vLLM 13/20, SGLang 3/20). The stable wins are
-few_shot TPOT/E2E and multi_turn TPOT. few_shot is close on TTFT but SGLang
-kept that cell by 2.9 ms (147.7 vs 150.6), while vLLM keeps throughput. The
-score-moving near miss is again tree_of_thought TPOT: TorchInferno 32.1 ms vs
-vLLM 28.8 ms. long_output TPOT improved to 21.0 ms, but vLLM remains at
-15.0 ms; the row still needs real decode pipeline/fusion work rather than
-another queue knob. self_consistency remains wave-scheduling-bound at
-274.1 ms TTFT / 388.6 ms E2E / 2.6 tok/s despite the sampled KV-budget change.
+TorchInferno fell to 1/20 (vLLM 18/20, SGLang 0/20). The only public win is
+multi_turn TPOT: TorchInferno 37.5 ms vs vLLM 43.0 ms. The score-moving near
+misses are now TPOT cells: tree_of_thought is only 1.0 ms behind vLLM
+(`30.2ms` vs `29.2ms`), few_shot is 1.2 ms behind (`45.7ms` vs `44.5ms`), and
+cross-benchmark TPOT is 0.6 ms behind (`26.9ms` vs `26.3ms`). TTFT/E2E remain
+queue/prefill dominated: multi_turn is `584.7ms` TTFT vs vLLM `158.3ms`,
+self_consistency is `272.6ms` vs `206.2ms`, and long_output still needs real
+decode work (`21.4ms` TPOT vs vLLM `14.8ms`). This public run predates the
+common-prefix no-logits cleanup (`d3421c2`) and later doc-only rejections.
 
 TREE SCHEDULER KNOB RECHECKS (2026-06-21, current 60802a local no-profile A/B):
 three more tree_of_thought knobs are rejected. Raising the sampled-medium online
@@ -542,19 +543,18 @@ reachable cells remain tree/multi_turn TPOT (decode kernel, blocked).
 ## Scoring strategy (READ THIS FIRST -- it inverts naive tuning)
 
 The scorecard is BEST-IN-ROW: a cell is won only by beating BOTH competitors on
-that metric. We win exactly ONE cell: few_shot TPOT (49.1 < vllm 54.2 < sglang
-70.1). TPOT is the ONLY surface we contend on -- cross-TPOT 34.3 BEATS sglang
-(47.9) and is within 14% of vllm (30.0). On TTFT (3.4x) and throughput (2.8x)
-we are too far back to reach best-in-row by tuning.
+that metric. In the latest public run we win exactly ONE cell: multi_turn TPOT
+(`37.5ms` < vLLM `43.0ms` < SGLang `96.3ms`). TPOT remains the only reachable
+surface: cross-TPOT is `26.9ms`, only 0.6 ms behind vLLM `26.3ms`, while
+TTFT/E2E/throughput are still too far back for scheduler-only tuning to flip.
 
-CONSEQUENCE: do NOT trade TPOT for TTFT/throughput. The decode_quantum lever
-(lowering it) does exactly that and would forfeit our only points -- correctly
-NOT shipped. The realistically flippable cells are all TPOT near-misses:
-  - tree_of_thought TPOT 30.8 vs vllm 28.2  -> 2.6ms away (BEST TARGET)
-  - multi_turn      TPOT 59.9 vs vllm 52.5  -> 7.4ms away
-And because "throughput median (tok/s)" is ~= 1000/TPOT (per-request decode
-rate), any decode TPOT win also lifts throughput cells. Decode speed is the
-master lever.
+CONSEQUENCE: do NOT trade TPOT away for queue metrics. The realistically
+flippable cells are all TPOT near-misses:
+  - tree_of_thought TPOT 30.2 vs vllm 29.2  -> 1.0ms away (BEST TARGET)
+  - few_shot        TPOT 45.7 vs vllm 44.5  -> 1.2ms away
+  - cross-bench     TPOT 26.9 vs vllm 26.3  -> 0.6ms away
+Long_output still needs a deeper decode-compute lever (`21.4ms` vs `14.8ms`).
+Decode speed and avoiding extra decode overhead are the master levers.
 
 ## decode_quantum is fully swept -- 16 (default) is optimal
 
@@ -1203,6 +1203,16 @@ Rejected follow-ups on the same code:
   misses. It regressed catastrophically to `8530.9ms` TTFT / `8571.1ms` E2E.
   The useful direction is not simply longer prefix hits; it needs a fused
   non-common-prefix prefill path with stable graph shapes.
+- Combining pinned full-prompt stores (`max_tokens>=512`) with the existing
+  non-common-prefix graph path
+  (`TORCHINFERNO_CONTINUOUS_NON_COMMON_PREFIX_GRAPH_PREFILL=1`) is also rejected.
+  It reduced raw prefill tokens but made fragmentation worse and then crashed:
+  by the last queue snapshot the run had admitted only `515` requests, emitted
+  `499`, and already spent `73834.9ms` in prefill wall (`68385.5ms` forward)
+  across `198` prefill batches / `199` graph hits. The server then hit a CUDA
+  illegal memory access in `_prefill_prefix_graph_batch` during the synchronized
+  non-common graph prefill. Do not enable this path for multi_turn without a
+  new mixed-prefix graph-safety fix and a much coarser batching policy.
 - Rechecking multi_turn after the common-prefix no-logits cleanup (`c6be9e0`)
   did not move the shape: `598.6ms` TTFT, `41.4ms` TPOT, `638.6ms` E2E,
   `1.9 tok/s`, 981/1000 raw correct. Queue profile stayed at `65` prefill
