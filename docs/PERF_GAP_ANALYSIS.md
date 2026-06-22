@@ -377,6 +377,18 @@ long_output): `TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY=1` plus
 the current default long-output band and still does not move TPOT/E2E enough to
 default decode-many with stop-token overcompute.
 
+Long-output GPU decode timing refresh (2026-06-22, current a001d3e queue
+profile): the queue profile now records CUDA-event decode time separately as
+`runtime_decode_ragged_model_gpu_ms`. A focused long_output run landed at
+279.4 / 27.3 / 1423.1 ms, 27.3 tok/s, 1000/1000 correct. The last completed
+profile snapshot had all 1000 requests finished and showed 13.6s decode-active,
+11.4s GPU ragged-decode model time across 703 ragged decode batches
+(~16.2ms/batch), 10.5s token-readback sync, and 11.4s prefill wall. The old
+`decode_ragged_cpu_tokens_ms` counter was mostly exposing GPU decode completion,
+not pure host copy overhead. Do not re-chase synchronous readback or simple
+pinned-buffer tweaks for long_output; the remaining gap is decode compute/pipeline
+plus material prefill wall.
+
 LONG_OUTPUT CURRENT RECHECKS (2026-06-21, bd61b32 local slices): two narrower
 variants also failed. Raising greedy-short decode quantum from the default 8 to
 16 regressed to 534.1 ms TTFT / 25.2 ms TPOT / 1525.5 ms E2E / 23.3 tok/s. A
