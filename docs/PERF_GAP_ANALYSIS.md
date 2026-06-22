@@ -91,6 +91,9 @@ FEW_SHOT RULED OUT (2026-06-21, current `1a5d759`):
 - Raising the initial collection wait to 5ms gathered the full workload into one
   online session but regressed all score-facing metrics: `154.7ms` TTFT,
   `51.2ms` TPOT, `194.9ms` E2E, `6.0 tok/s`.
+- Dropping the initial collection wait to 0ms is also bad on an unprofiled
+  current `2e2f1df` run: `158.0ms` TTFT, `54.7ms` TPOT, `201.1ms` E2E,
+  `5.8 tok/s`. The default 1ms wait remains the knee for few_shot.
 - Lowering greedy-mid decode quantum to 8 did not buy throughput; it regressed to
   `161.0ms` TTFT, `52.7ms` TPOT, `204.9ms` E2E, `5.8 tok/s`. Queue profile ended
   at `3904ms` prefill wall and `1206ms` decode active, worse than the default.
