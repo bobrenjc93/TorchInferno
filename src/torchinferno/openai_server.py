@@ -3596,6 +3596,9 @@ class OpenAICompletionEngine:
             return
         try:
             line = json.dumps(record, sort_keys=True) + "\n"
+            profile_dir = os.path.dirname(profile_path)
+            if profile_dir:
+                os.makedirs(profile_dir, exist_ok=True)
             lock = getattr(self, "_queue_profile_lock", None)
             if lock is None:
                 lock = threading.Lock()

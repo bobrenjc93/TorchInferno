@@ -10505,6 +10505,22 @@ def test_openai_queue_profile_records_stream_group(tmp_path: Path, monkeypatch: 
     assert record["stream_emit_ms"] >= 0.0
 
 
+def test_openai_queue_profile_creates_parent_directories(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile_path = tmp_path / "missing" / "nested" / "queue-profile.jsonl"
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_QUEUE_PROFILE_JSONL", str(profile_path))
+    engine = _cache_only_engine()
+
+    engine._record_queue_profile({"event": "online_batcher", "submitted_requests": 3})
+
+    assert json.loads(profile_path.read_text()) == {
+        "event": "online_batcher",
+        "submitted_requests": 3,
+    }
+
+
 def test_openai_queue_profile_records_runtime_engine_stats(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
