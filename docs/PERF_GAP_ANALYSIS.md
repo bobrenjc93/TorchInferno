@@ -23,6 +23,18 @@ regression: 309.8 / 53.3 / 372.9 ms, 3.9 tok/s, and 958/992 raw correct. Keep
 tree on the 5ms sampled-medium wait, 10ms idle window, and 48-row cap until the
 next hypothesis changes the prefill/decode pipeline itself.
 
+TREE SESSION CAP REJECTED (2026-06-21, current bc3b9ea + temporary env-gated
+patch): capping each online session at 128 requests was meant to reduce
+cross-temperature head-of-line blocking between sampled branch requests and
+greedy eval requests. It was a clear regression: profiled tree moved from the
+current control's 248.2 / 52.1 / 306.7 ms (TTFT/TPOT/E2E), 4.0 tok/s, 962/992
+raw correct, to 453.5 / 51.7 / 491.1 ms, 3.5 tok/s, 962/992 raw correct. Queue
+counters explain the loss: deferred requests fell 122 -> 77, but sampled prefill
+was fragmented into more graph batches; aggregate prefill wall rose 6050.8 ->
+6813.3 ms and total online-session time rose 8977.9 -> 9786.6 ms. Do not cap
+tree sessions without a mechanism that preserves or reuses prefill work across
+the added session boundaries.
+
 TREE PINNED READBACK REJECTED (2026-06-21, local 570917f + temporary patch): a
 reusable pinned CPU token buffer for ragged decode readback looked promising in
 one no-profile run (218.0 / 52.0 / 252.9 ms, 4.5 tok/s, 963/992 raw correct),
