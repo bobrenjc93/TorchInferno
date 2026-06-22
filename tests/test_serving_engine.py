@@ -1101,6 +1101,80 @@ def test_continuous_batch_engine_respects_common_prefix_ragged_suffix_threshold(
     assert engine.stats.prefix_reuse_requests == 0
 
 
+def test_continuous_batch_engine_raises_common_prefix_ragged_suffix_threshold_for_greedy_short(
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv(
+        "TORCHINFERNO_CONTINUOUS_COMMON_PREFIX_RAGGED_SUFFIX_MAX_PREFIX_TOKENS",
+        raising=False,
+    )
+    monkeypatch.delenv(
+        "TORCHINFERNO_CONTINUOUS_COMMON_PREFIX_RAGGED_SUFFIX_GREEDY_SHORT_MAX_TOKENS",
+        raising=False,
+    )
+    shared = tuple(range(80))
+    model = _SelectedLogitsToyModel(vocab_size=512)
+    engine = ContinuousBatchEngine(
+        model,
+        device=torch.device("cpu"),
+        max_active_requests=4,
+        prefix_cache_capacity=4,
+        graph_prefill=True,
+    )
+    requests = [
+        ServingRequest("a", (*shared, 201), 64, arrival_step=0),
+        ServingRequest("b", (*shared, 202, 203, 204), 64, arrival_step=0),
+        ServingRequest("c", (*shared, 205, 206), 64, arrival_step=0),
+    ]
+
+    results = engine.run(requests)
+
+    first_generated = [
+        result.tokens[len(request.prompt)]
+        for result, request in zip(results, requests)
+    ]
+    assert first_generated == [202, 205, 207]
+    assert engine.stats.prefill_common_prefix_batches == 1
+    assert engine.stats.prefill_prefix_reuse_batches == 1
+    assert engine.stats.prefill_graph_hits == 1
+    assert model.prefill_src_prefix_rows[-1] is not None
+
+
+def test_continuous_batch_engine_keeps_common_prefix_ragged_suffix_threshold_low_for_greedy_mid(
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv(
+        "TORCHINFERNO_CONTINUOUS_COMMON_PREFIX_RAGGED_SUFFIX_MAX_PREFIX_TOKENS",
+        raising=False,
+    )
+    shared = tuple(range(80))
+    model = _SelectedLogitsToyModel(vocab_size=512)
+    engine = ContinuousBatchEngine(
+        model,
+        device=torch.device("cpu"),
+        max_active_requests=4,
+        prefix_cache_capacity=4,
+        graph_prefill=True,
+    )
+    requests = [
+        ServingRequest("a", (*shared, 201), 256, arrival_step=0),
+        ServingRequest("b", (*shared, 202, 203, 204), 256, arrival_step=0),
+        ServingRequest("c", (*shared, 205, 206), 256, arrival_step=0),
+    ]
+
+    results = engine.run(requests)
+
+    first_generated = [
+        result.tokens[len(request.prompt)]
+        for result, request in zip(results, requests)
+    ]
+    assert first_generated == [202, 205, 207]
+    assert engine.stats.prefill_common_prefix_batches == 1
+    assert engine.stats.prefill_prefix_reuse_batches == 0
+    assert engine.stats.prefill_graph_hits == 0
+    assert model.prefill_src_prefix_rows == []
+
+
 def test_continuous_batch_engine_reuses_common_prefix_for_padded_refill(monkeypatch) -> None:
     monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PADDED_SUFFIX_PREFILL", "1")
     shared = tuple(range(16))

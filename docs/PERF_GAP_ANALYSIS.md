@@ -276,6 +276,25 @@ Two more decode-shape knobs are not defaultable:
   TTFT / `28.5ms` TPOT / `1496.3ms` E2E and raised readback/prepare time. Keep
   uniform ragged disabled for long_output too.
 
+Scoped common-prefix ragged suffix threshold (2026-06-21, current `27b8381` +
+patch): raising
+`TORCHINFERNO_CONTINUOUS_COMMON_PREFIX_RAGGED_SUFFIX_MAX_PREFIX_TOKENS=128`
+globally validated the long_output mechanism but regressed few_shot. Long_output
+with the broad env moved to `279.5ms` TTFT / `28.3ms` TPOT / `1511.7ms` E2E and
+zeroed prefill graph misses (`55/5 -> 60/0` hits/misses), while prefill wall
+dropped `13243ms -> 12329ms`. The few_shot guard with the same broad threshold
+regressed to `158.8ms` TTFT / `53.5ms` TPOT / `203.5ms` E2E because it also has
+a ~120-token shared prefix but uses `max_tokens=256`.
+
+Promoted narrower behavior: without an explicit env override, deterministic
+short-output requests (`max_new_tokens<=128`) may use the 128-token common-prefix
+ragged suffix cutoff; other traffic keeps the old 64-token cutoff. The no-env
+long_output confirmation removed the same graph misses (`55/5 -> 57/0`), reduced
+prefill wall `13243ms -> 11800ms`, and improved score-facing E2E/TPOT to
+`1475.4ms` / `27.9ms` with 100% correctness. TTFT was neutral/noisy
+(`329.9ms -> 332.4ms`), so this is an E2E/prefill cleanup rather than a TTFT
+fix. Focused CPU tests cover the short-vs-mid threshold split.
+
 PROMPT-LOOKUP DECODE RECHECK (2026-06-21, 28d7c7c local slices): prompt lookup
 is still not a defaultable long_output lever. The old verifier used a full
 prefill over `[last_token, proposal...]` and was catastrophic (hundreds of

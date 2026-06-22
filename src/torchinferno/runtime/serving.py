@@ -1306,14 +1306,11 @@ class ContinuousBatchEngine:
             if self.pin_shared_prefix and common_route in self.reusable_prefixes:
                 self._pinned_prefix_routes.add(common_route)
 
-            # Folding the common-prefix KV copy into the ragged suffix graph wins
-            # for short shared prefixes, but long shared prefixes are copy-heavy
-            # enough that the older cache-view path is faster.
-            max_ragged_prefix_tokens = env_int(
-                "TORCHINFERNO_CONTINUOUS_COMMON_PREFIX_RAGGED_SUFFIX_MAX_PREFIX_TOKENS",
-                64,
-                minimum=0,
-            )
+            # Folding the common-prefix KV copy into the ragged suffix graph is
+            # profitable for short greedy streams, where it removes one-off
+            # prefill graph misses. Greedy-mid workloads such as few_shot stay on
+            # the lower cutoff because the extra ragged suffix work regresses TPOT.
+            max_ragged_prefix_tokens = self._common_prefix_ragged_suffix_max_prefix_tokens(group)
             if (
                 self.graph_prefill
                 and reusable is not None
@@ -1390,6 +1387,34 @@ class ContinuousBatchEngine:
             return active
         finally:
             self._release_prefix_row(prefix_row)
+
+    def _common_prefix_ragged_suffix_max_prefix_tokens(
+        self,
+        group: list[tuple[int, ServingRequest, int]],
+    ) -> int:
+        configured = os.environ.get(
+            "TORCHINFERNO_CONTINUOUS_COMMON_PREFIX_RAGGED_SUFFIX_MAX_PREFIX_TOKENS"
+        )
+        if configured is not None:
+            return env_int(
+                "TORCHINFERNO_CONTINUOUS_COMMON_PREFIX_RAGGED_SUFFIX_MAX_PREFIX_TOKENS",
+                64,
+                minimum=0,
+            )
+        if self.temperature <= 0.0 and group:
+            max_new_tokens = max(request.max_new_tokens for _index, request, _hit in group)
+            greedy_short_max = env_int(
+                "TORCHINFERNO_CONTINUOUS_COMMON_PREFIX_RAGGED_SUFFIX_GREEDY_SHORT_MAX_TOKENS",
+                128,
+                minimum=1,
+            )
+            if 0 < max_new_tokens <= greedy_short_max:
+                return env_int(
+                    "TORCHINFERNO_CONTINUOUS_COMMON_PREFIX_RAGGED_SUFFIX_GREEDY_SHORT_PREFIX_TOKENS",
+                    128,
+                    minimum=0,
+                )
+        return 64
 
     def _prefill_common_prefix_padded_suffix_batch(
         self,
