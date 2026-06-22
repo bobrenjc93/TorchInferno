@@ -1295,12 +1295,17 @@ class ContinuousBatchEngine:
             self.stats.prefill_common_prefix_batches += 1
             prefix_tuple = tuple(group[0][1].prompt[:prefix_tokens])
             common_route = ("common_prefix", prefix_tuple)
+            store_common_prefix_logits = any(
+                len(request.prompt) <= prefix_tokens
+                for _index, request, _hit in group
+            )
             self._store_reusable_prefix_tokens(
                 common_route,
                 "__common_prefix__",
                 prefix_tuple,
                 prefix_row,
-                prefix_logits,
+                prefix_logits if store_common_prefix_logits else None,
+                store_logits=store_common_prefix_logits,
             )
             reusable = self.reusable_prefixes.get(common_route)
             if self.pin_shared_prefix and common_route in self.reusable_prefixes:

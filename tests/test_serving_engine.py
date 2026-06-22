@@ -1048,6 +1048,7 @@ def test_continuous_batch_engine_graphs_initial_common_prefix_suffixes() -> None
         device=torch.device("cpu"),
         max_active_requests=4,
         prefix_cache_capacity=4,
+        pin_shared_prefix=True,
         graph_prefill=True,
     )
     requests = [
@@ -1068,6 +1069,33 @@ def test_continuous_batch_engine_graphs_initial_common_prefix_suffixes() -> None
     assert engine.stats.prefill_tokens == 25
     assert engine.stats.prefix_reuse_requests == 3
     assert engine.stats.prefix_reuse_tokens == 48
+    common_route = ("common_prefix", shared)
+    assert engine.reusable_prefixes[common_route].logits is None
+
+
+def test_continuous_batch_engine_keeps_common_prefix_logits_for_exact_prompt() -> None:
+    shared = tuple(range(16))
+    model = _SelectedLogitsToyModel()
+    engine = ContinuousBatchEngine(
+        model,
+        device=torch.device("cpu"),
+        max_active_requests=3,
+        prefix_cache_capacity=4,
+        pin_shared_prefix=True,
+        graph_prefill=True,
+    )
+    requests = [
+        ServingRequest("exact", shared, 1, arrival_step=0),
+        ServingRequest("suffix", (*shared, 21), 1, arrival_step=0),
+    ]
+
+    results = engine.run(requests)
+
+    assert [result.tokens[-1] for result in results] == [16, 22]
+    common_route = ("common_prefix", shared)
+    reusable = engine.reusable_prefixes[common_route]
+    assert reusable.logits is not None
+    assert reusable.logits.shape[-1] == model.vocab_size
 
 
 def test_continuous_batch_engine_respects_common_prefix_ragged_suffix_threshold(

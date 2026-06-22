@@ -35,6 +35,19 @@ was fragmented into more graph batches; aggregate prefill wall rose 6050.8 ->
 tree sessions without a mechanism that preserves or reuses prefill work across
 the added session boundaries.
 
+COMMON-PREFIX LOGITS STORE CLEANUP (2026-06-21, current a9699a4 + local patch):
+shared common-prefix rows no longer clone cached logits back to CPU when every
+request in the group has a non-empty suffix. The prefix-suffix graph only needs
+the KV row; exact-prefix groups still keep logits. This removes an avoidable
+sync from common-prefix storage. Profiled tree_of_thought improved from the
+current control's 248.2 / 52.1 / 306.7 ms (TTFT/TPOT/E2E), 4.0 tok/s, 962/992
+raw correct, to 216.7 / 51.8 / 255.6 ms, 4.6 tok/s, 962/992 raw correct. Queue
+counters showed the same 50 prefill batches, while aggregate prefill wall fell
+6050.8 -> 5529.2 ms and total online-session time fell 8977.9 -> 8520.1 ms.
+No-profile guard (`few_shot` then `tree_of_thought`) stayed in family: few_shot
+153.2 / 51.4 / 197.9 ms, 977/1000 raw correct; tree 231.4 / 51.9 / 277.3 ms,
+963/992 raw correct. Treat this as prefill-sync cleanup, not a score-flip claim.
+
 TREE PINNED READBACK REJECTED (2026-06-21, local 570917f + temporary patch): a
 reusable pinned CPU token buffer for ragged decode readback looked promising in
 one no-profile run (218.0 / 52.0 / 252.9 ms, 4.5 tok/s, 963/992 raw correct),
