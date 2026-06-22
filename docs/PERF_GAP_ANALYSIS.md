@@ -132,7 +132,10 @@ not score-facing. Larger long_output greedy-short decode quanta expose the
 expected admission tradeoff. Quantum 16 improved TPOT to 23.7ms but regressed
 TTFT to 472.3ms; quantum 12 landed at 413.1 / 25.8 / 1542.5 ms. Keep the
 current 8-step short-greedy quantum until a dynamic policy can raise quantum
-only when it will not delay newly arrived requests.
+only when it will not delay newly arrived requests. A temporary dynamic-q16
+experiment that shrank the command when an active row was near completion still
+landed at 448.8 / 24.5 / 1411.9 ms with lower throughput, so that simple
+remaining-token heuristic is also rejected.
 
 FULL CURRENT LOCAL REFRESH (2026-06-22, current 51fba66 no-profile,
 TorchInferno-only): the pushed default stack landed at few_shot 149.3 / 50.2 /
