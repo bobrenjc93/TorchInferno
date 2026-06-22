@@ -12,6 +12,16 @@ self_consistency is `272.6ms` vs `206.2ms`, and long_output still needs real
 decode work (`21.4ms` TPOT vs vLLM `14.8ms`). This public run predates the
 common-prefix no-logits cleanup (`d3421c2`) and later doc-only rejections.
 
+CLEAN NO-PROFILE TREE REPRO (2026-06-21, current 33a2eb3): rerunning
+tree_of_thought locally with no queue profiling did not reproduce the public
+`30.2ms` TPOT row. The latest inference-bench checkout, `--skip-build`, and the
+current TorchInferno worktree landed at 293.5 / 53.6 / 317.3 ms
+(TTFT/TPOT/E2E), 4.2 tok/s, and 959/992 raw correct. That is worse than the
+recent local no-logits guard while the public run still shows ~30ms TPOT. Treat
+local tree TPOT as an environment-sensitive diagnostic for now; do not default a
+change solely because it moves the local 52-54ms TPOT band unless same-node vLLM
+or a counter profile explains the public/local delta.
+
 TREE SCHEDULER KNOB RECHECKS (2026-06-21, current 60802a local no-profile A/B):
 three more tree_of_thought knobs are rejected. Raising the sampled-medium online
 idle window from the 10ms default to 100ms landed at 231.5 / 52.8 / 273.4 ms
