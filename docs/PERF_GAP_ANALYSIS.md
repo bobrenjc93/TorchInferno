@@ -48,6 +48,15 @@ No-profile guard (`few_shot` then `tree_of_thought`) stayed in family: few_shot
 153.2 / 51.4 / 197.9 ms, 977/1000 raw correct; tree 231.4 / 51.9 / 277.3 ms,
 963/992 raw correct. Treat this as prefill-sync cleanup, not a score-flip claim.
 
+COMMON-PREFIX GPU LOGITS STORE REJECTED (2026-06-21, current d3421c2 + local
+patch): keeping exact common-prefix logits on GPU instead of cloning them to CPU
+did not validate on self_consistency. The run landed at 344.9 ms TTFT /
+423.1 ms E2E / 2.4 tok/s, 1000/1000 raw correct. Queue snapshots showed
+prefill wall essentially unchanged versus a comparable current profile
+(1922.2 -> 1917.9 ms) and decode-active slightly worse (1181.6 -> 1223.1 ms).
+Do not retain GPU logits for exact common prefixes without a clearer hit-rate or
+latency win.
+
 TREE PINNED READBACK REJECTED (2026-06-21, local 570917f + temporary patch): a
 reusable pinned CPU token buffer for ragged decode readback looked promising in
 one no-profile run (218.0 / 52.0 / 252.9 ms, 4.5 tok/s, 963/992 raw correct),
