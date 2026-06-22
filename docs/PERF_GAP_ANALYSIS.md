@@ -77,6 +77,17 @@ regressed to 375.1 / 1557.8 ms / 26.6 tok/s. few_shot regressed more clearly:
 159.9 / 52.0 / 204.7 ms and 5.8 tok/s, 976/1000 raw correct. Keep the gather
 sampler opt-in.
 
+SELF SAMPLER RECHECKS (2026-06-22, current 787006d no-profile): the recent
+temperature-sampling knobs are rejected for self_consistency. Capping decode
+linear `mm` use at batch 128 (`TORCHINFERNO_DECODE_LINEAR_MM_MAX_BATCH=128`)
+landed at 372.9 / 0.0 / 445.8 ms, 2.2 tok/s. Enabling the gathered temperature
+sampler (`TORCHINFERNO_TEMPERATURE_SAMPLE_GATHER=1`) landed at 325.9 / 0.0 /
+391.8 ms, 2.6 tok/s, which is only local noise versus the current self band.
+Disabling repeated-prefix Gumbel sampling
+(`TORCHINFERNO_TEMPERATURE_SAMPLE_REPEATED_GUMBEL=0`) was a clear regression:
+405.8 / 0.0 / 472.6 ms, 2.1 tok/s. Keep repeated-prefix Gumbel enabled at the
+current threshold and leave the alternate samplers opt-in.
+
 FULL CURRENT LOCAL REFRESH (2026-06-22, current 51fba66 no-profile,
 TorchInferno-only): the pushed default stack landed at few_shot 149.3 / 50.2 /
 189.8 ms, self_consistency 313.4 / 0.0 / 388.7 ms, multi_turn 595.8 / 41.4 /
