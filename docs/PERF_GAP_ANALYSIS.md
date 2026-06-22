@@ -56,6 +56,14 @@ profiled 234.7 ms TTFT / 362.7 ms E2E / 2.8 tok/s to 243.4 / 293.0 ms /
 (sampled max_tokens=300 is outside the sampled KV-bounded range) or greedy
 long_output (separate greedy budget remains 64*512).
 
+SELF CURRENT UNPROFILED RECHECK (2026-06-21, current `c3ec2cb`): a focused
+no-profile run landed at 245.3 ms TTFT / 362.1 ms E2E / 2.8 tok/s, 100% correct.
+That is better than the latest public self row (274.1 / 388.6 ms) but still far
+from vLLM's 208.9 / 235.6 ms. Since the sampled KV budget already admits the
+full 128-worker wave, further self work needs to reduce wave count or overlap the
+mandatory stop-token decode; raising the active cap cannot help this client
+shape.
+
 SELF_CONSISTENCY RULED OUT (do not re-chase without a new hypothesis):
 - Uniform ragged decode (`TORCHINFERNO_CONTINUOUS_UNIFORM_RAGGED_DECODE=1`)
   regressed to 245.6 ms TTFT / 368.4 ms E2E / 2.7 tok/s.
