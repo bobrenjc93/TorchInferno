@@ -69,6 +69,16 @@ correctness were worse than the recent default tree controls. Keep down-proj
 Marlin off unless a later calibrated variant proves math correctness and a
 score-facing latency win.
 
+FULL CURRENT LOCAL REFRESH (2026-06-22, current 51fba66 no-profile,
+TorchInferno-only): the pushed default stack landed at few_shot 149.3 / 50.2 /
+189.8 ms, self_consistency 313.4 / 0.0 / 388.7 ms, multi_turn 595.8 / 41.4 /
+633.3 ms, tree_of_thought 218.7 / 51.0 / 256.4 ms, and long_output 309.9 /
+27.7 / 1494.1 ms (TTFT/TPOT/E2E). Correctness stayed in family: few 976/1000,
+self 1000/1000, multi 981/1000, tree 957/992, long 1000/1000. This confirms
+the public run is still stale with respect to the stop-id runtime work, but it
+also confirms the local tree TPOT discrepancy remains: default local tree is
+still ~51ms TPOT while public bc3b9ea reported ~30ms.
+
 TREE SCHEDULER KNOB RECHECKS (2026-06-21, current 60802a local no-profile A/B):
 three more tree_of_thought knobs are rejected. Raising the sampled-medium online
 idle window from the 10ms default to 100ms landed at 231.5 / 52.8 / 273.4 ms
