@@ -7996,12 +7996,28 @@ def test_openai_online_idle_batch_wait_respects_env_overrides(monkeypatch) -> No
     assert _online_idle_batch_wait_ms(temperature=0.7, max_tokens=300) == 6.0
 
 
-def test_openai_online_collect_idle_arrivals_is_opt_in(monkeypatch) -> None:
+def test_openai_online_collect_idle_arrivals_uses_sampled_short_default(monkeypatch) -> None:
     monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_COLLECT_IDLE_ARRIVALS", raising=False)
+    monkeypatch.delenv(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_SHORT_IDLE_BATCH_WAIT_MAX_TOKENS",
+        raising=False,
+    )
+
+    assert _online_collect_idle_arrivals_enabled(temperature=0.7, max_tokens=256)
+    assert not _online_collect_idle_arrivals_enabled(temperature=0.7, max_tokens=257)
+    assert not _online_collect_idle_arrivals_enabled(temperature=0.0, max_tokens=256)
+
+    monkeypatch.setenv(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_SHORT_IDLE_BATCH_WAIT_MAX_TOKENS",
+        "300",
+    )
+    assert _online_collect_idle_arrivals_enabled(temperature=0.7, max_tokens=300)
+
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_COLLECT_IDLE_ARRIVALS", "0")
     assert not _online_collect_idle_arrivals_enabled(temperature=0.7, max_tokens=256)
 
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_COLLECT_IDLE_ARRIVALS", "1")
-    assert _online_collect_idle_arrivals_enabled(temperature=0.7, max_tokens=256)
+    assert _online_collect_idle_arrivals_enabled(temperature=0.0, max_tokens=256)
 
 
 def test_openai_online_initial_batch_wait_uses_sampled_short_default(monkeypatch) -> None:
@@ -8031,7 +8047,7 @@ def test_openai_online_initial_batch_wait_uses_sampled_short_default(monkeypatch
         raising=False,
     )
 
-    assert _online_initial_batch_wait_ms(temperature=0.7, max_tokens=256) == 20.0
+    assert _online_initial_batch_wait_ms(temperature=0.7, max_tokens=256) == 10.0
     assert _online_initial_batch_wait_ms(temperature=0.0, max_tokens=64) == 5.0
     assert _online_initial_batch_wait_ms(temperature=0.0, max_tokens=128) == 5.0
     assert _online_initial_batch_wait_ms(temperature=0.0, max_tokens=256) == 1.0
@@ -8071,7 +8087,7 @@ def test_openai_online_initial_batch_wait_respects_env_overrides(monkeypatch) ->
         "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_INITIAL_BATCH_WAIT_MAX_TOKENS",
         "320",
     )
-    assert _online_initial_batch_wait_ms(temperature=0.7, max_tokens=256) == 20.0
+    assert _online_initial_batch_wait_ms(temperature=0.7, max_tokens=256) == 10.0
     assert _online_initial_batch_wait_ms(temperature=0.7, max_tokens=300) == 12.0
     assert _online_initial_batch_wait_ms(temperature=0.7, max_tokens=320) == 12.0
     assert _online_initial_batch_wait_ms(temperature=0.7, max_tokens=321) == 1.0

@@ -364,8 +364,14 @@ def _online_idle_batch_wait_ms(*, temperature: float, max_tokens: int) -> float:
 
 
 def _online_collect_idle_arrivals_enabled(*, temperature: float, max_tokens: int) -> bool:
-    del temperature, max_tokens
-    return env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_COLLECT_IDLE_ARRIVALS", False)
+    global_env = "TORCHINFERNO_OPENAI_TP_ONLINE_COLLECT_IDLE_ARRIVALS"
+    if global_env in os.environ:
+        return env_flag(global_env, False)
+    return temperature > 0.0 and 0 < max_tokens <= env_int(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_SHORT_IDLE_BATCH_WAIT_MAX_TOKENS",
+        256,
+        minimum=1,
+    )
 
 
 def _online_initial_batch_wait_ms(*, temperature: float, max_tokens: int) -> float:
@@ -385,11 +391,10 @@ def _online_initial_batch_wait_ms(*, temperature: float, max_tokens: int) -> flo
             # Self-consistency style sampled short bursts need enough collection
             # time for prefix-cache reuse, but longer waits over-wait after the
             # first client wave. Local TP8 A/B on 70B: 10ms improved current
-            # self-consistency, and the addfef4 queue profile still admitted
-            # only 9 initial rows at 10ms. Rechecking the narrower initial wait
-            # at 20ms improved focused self to 304.5/382.3ms with 100%
-            # correctness, without touching greedy or sampled-medium workloads.
-            default_wait_ms = 20.0
+            # self-consistency to 255.7/384.1ms; a later 20ms recheck admitted
+            # more initial rows but kept the same prefix-reuse batch count and
+            # regressed the focused profile.
+            default_wait_ms = 10.0
     elif temperature > 0.0 and max_tokens > 0:
         sampled_short_max_tokens = env_int(
             "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_SHORT_INITIAL_BATCH_WAIT_MAX_TOKENS",

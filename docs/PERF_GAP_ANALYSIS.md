@@ -106,6 +106,22 @@ self 1000/1000, multi 980/1000, tree 960/992, long 1000/1000. The self row is
 the main default-path improvement; long TTFT improved but TPOT remains in the
 same 27-28ms local band.
 
+SAMPLED-SHORT IDLE COLLECTION DEFAULT (2026-06-22, current 3b298c0 + local
+patch): the first same-node provider recheck after the 20ms sampled initial wait
+did not hold the focused win. Provider run `20260622_090138` scored vLLM 19,
+SGLang 5, TorchInferno 1; TorchInferno kept only multi_turn TPOT, and
+self_consistency was 384.7 / 0.0 / 539.1 ms. A corrected queue profile with the
+20ms default admitted 17 initial rows but still needed 44 exact-prefix reuse
+batches and regressed focused self to 357.7 / 422.2 ms. Reverting sampled-short
+initial collection to 10ms and enabling post-idle collection only for sampled
+short requests improved the focused no-env self run to 254.8 / 0.0 / 392.5 ms
+with 1000/1000 correct (`20260622_092731`). The full TorchInferno-only guard
+landed at few_shot 153.3 / 47.9 / 193.2 ms, self_consistency 329.8 / 0.0 /
+402.0 ms, multi_turn 600.2 / 40.8 / 644.6 ms, tree_of_thought 247.4 / 53.3 /
+293.3 ms, and long_output 289.3 / 27.7 / 1425.7 ms (`20260622_093338`). Treat
+this as a self wave-formation cleanup; it is intentionally scoped away from
+tree_of_thought's sampled-medium path and greedy workloads.
+
 CLEAN NO-PROFILE TREE REPRO (2026-06-21, current 33a2eb3): rerunning
 tree_of_thought locally with no queue profiling did not reproduce the public
 `30.2ms` TPOT row. The latest inference-bench checkout, `--skip-build`, and the
