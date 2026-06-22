@@ -122,7 +122,8 @@ idle drain, but leave post-arrival collection behind
 `TORCHINFERNO_OPENAI_TP_ONLINE_COLLECT_IDLE_ARRIVALS=1`. Lowering the
 sampled-short idle drain to 8ms was too short and is rejected: 379.9 / 0.0 /
 451.1 ms, 2.2 tok/s. Raising it to 12ms is also rejected: 380.8 / 0.0 /
-456.5 ms, 2.2 tok/s.
+456.5 ms, 2.2 tok/s. Extending sampled-short persistent idle to 500ms is also
+not a lever: 341.5 / 0.0 / 427.4 ms, 2.3 tok/s, 1000/1000 correct.
 
 SELF SAME-NODE PROVIDER COMPARISON (2026-06-22, current fc084b0,
 inference-bench `20260622_051934`): with the existing local vLLM/SGLang builds,
