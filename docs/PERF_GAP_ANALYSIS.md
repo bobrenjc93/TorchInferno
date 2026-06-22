@@ -349,6 +349,13 @@ overcompute variant is now reproducible without local patches via
 `TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY_ALLOW_STOP=1`, but it remains
 explicitly default-off.
 
+Current flag-backed confirmation (2026-06-22, current 8696a2a no-profile
+long_output): `TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY=1` plus
+`TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY_ALLOW_STOP=1` landed at 350.0 /
+27.3 / 1519.4 ms, 26.2 tok/s, and 1000/1000 raw correct. That is in family with
+the current default long-output band and still does not move TPOT/E2E enough to
+default decode-many with stop-token overcompute.
+
 LONG_OUTPUT CURRENT RECHECKS (2026-06-21, bd61b32 local slices): two narrower
 variants also failed. Raising greedy-short decode quantum from the default 8 to
 16 regressed to 534.1 ms TTFT / 25.2 ms TPOT / 1525.5 ms E2E / 23.3 tok/s. A
