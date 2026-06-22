@@ -1728,6 +1728,8 @@ class ContinuousBatchEngine:
             if graph_active is not None:
                 return graph_active
         suffix_lengths = [len(request.prompt) - prefix_hit_tokens for _index, request, prefix_hit_tokens, _reusable in group]
+        if events is not None and suffix_lengths and max(suffix_lengths) == 0:
+            return self._prefill_exact_prefix_batch(group, step, events=events)
         if len(set(suffix_lengths)) > 1:
             padded_active = self._prefill_prefix_padded_suffix_batch(group, step, events=events)
             if padded_active is not None:

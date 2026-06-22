@@ -111,6 +111,18 @@ request. A TorchInferno-only queue profile on the same code landed at 354.2 /
 reuse prefill batches, and 45 decode batches. The remaining self work is wave
 formation plus the mandatory stop-token decode, not row-cap starvation.
 
+SELF EXACT-PREFIX ONLINE ROUTE (2026-06-21, current `3153672` + local patch):
+the default OpenAI online engine now routes suffix-empty exact-prefix hits
+through the same evented exact-prefix helper that chunked online serving already
+used. This preserves the non-stream batch path, but avoids the heavier generic
+prefix-suffix branch for repeated online prompts. A profiled self_consistency
+rerun improved to 217.8 ms TTFT / 340.6 ms E2E / 2.9 tok/s, 100% correct.
+Queue counters moved from the earlier current profile's 44 prefix-reuse batches
+/ 45 decode batches / 1182 ms decode-active to 37 / 38 / 1045 ms, with
+prefill_wall_ms also down from 1922 to 1823 ms. This is a real default-path win,
+but E2E still trails vLLM because the mandatory stop-token decode still happens
+in many small waves.
+
 SELF_CONSISTENCY RULED OUT (do not re-chase without a new hypothesis):
 - Uniform ragged decode (`TORCHINFERNO_CONTINUOUS_UNIFORM_RAGGED_DECODE=1`)
   regressed to 245.6 ms TTFT / 368.4 ms E2E / 2.7 tok/s.
@@ -136,6 +148,11 @@ SELF_CONSISTENCY RULED OUT (do not re-chase without a new hypothesis):
   store, zero generated-prefix reuses, and decode-active time rising to 1896 ms
   versus 1182 ms in the comparable default profile. This path is not useful
   unless waiting requests can actually hit the stored generated prefix.
+- After the non-chunked exact-prefix path was wired to the generated-prefix
+  continuation lookup, enabling `TORCHINFERNO_CONTINUOUS_GENERATED_PREFIX_CACHE=1`
+  was still a hard reject: 888.4 ms TTFT / 949.4 ms E2E / 1.1 tok/s, 100%
+  correct. The extra logits collection and continuation work dominate; keep the
+  cache default-off unless a narrower hit-rate/cost model is proven.
 - Raising the sampled-short initial wait to 20ms regressed to 381.6 ms TTFT /
   466.2 ms E2E / 2.1 tok/s. It buys larger waves by adding too much direct
   queue-visible delay.
