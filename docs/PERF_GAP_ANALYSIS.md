@@ -80,6 +80,10 @@ SELF_CONSISTENCY RULED OUT (do not re-chase without a new hypothesis):
   (`initial_batch_size=4` vs `7`) and increased scheduler/decode batches.
 - Unified online forward (`TORCHINFERNO_CONTINUOUS_UNIFIED_FORWARD=1`) regressed
   hard to 811.7 ms TTFT / 1117.5 ms E2E / 0.9 tok/s.
+- Disabling the online post-step TP sync
+  (`TORCHINFERNO_OPENAI_TP_ONLINE_STEP_SYNC=0`) is also a regression on current
+  `56060b2`: 388.1 ms TTFT / 454.0 ms E2E / 2.2 tok/s, 100% correct. The sync
+  is not the self bottleneck in isolation.
 
 FEW/TREE UNIFORM-RAGGED A/B (2026-06-21): global uniform ragged decode was also
 not a broad default. On the local focused run it moved few_shot from
