@@ -91,6 +91,7 @@ from torchinferno.openai_server import (
     _online_common_prefix_suffix_prefill_warmup_batches,
     _online_common_prefix_suffix_prefill_warmup_tokens,
     _online_admit_per_step_cap,
+    _online_collect_idle_arrivals_enabled,
     _online_decode_many_enabled,
     _online_decode_quantum,
     _online_idle_batch_wait_ms,
@@ -7887,6 +7888,14 @@ def test_openai_online_idle_batch_wait_respects_env_overrides(monkeypatch) -> No
     assert _online_idle_batch_wait_ms(temperature=0.7, max_tokens=300) == 6.0
 
 
+def test_openai_online_collect_idle_arrivals_is_opt_in(monkeypatch) -> None:
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_COLLECT_IDLE_ARRIVALS", raising=False)
+    assert not _online_collect_idle_arrivals_enabled(temperature=0.7, max_tokens=256)
+
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_COLLECT_IDLE_ARRIVALS", "1")
+    assert _online_collect_idle_arrivals_enabled(temperature=0.7, max_tokens=256)
+
+
 def test_openai_online_initial_batch_wait_uses_sampled_short_default(monkeypatch) -> None:
     monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_INITIAL_BATCH_WAIT_MS", raising=False)
     monkeypatch.delenv(
@@ -11080,6 +11089,7 @@ def test_openai_tensor_parallel_online_batcher_collects_idle_arrivals(
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_DECODE_QUANTUM", "1")
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_INITIAL_BATCH_WAIT_MS", "0")
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_IDLE_BATCH_WAIT_MS", "5")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_COLLECT_IDLE_ARRIVALS", "1")
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_PREFIX_ROWS", "1")
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_MAX_SEQ_LEN_HEADROOM_TOKENS", "0")
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_PREFILL_TOKEN_BUDGET", "0")

@@ -363,6 +363,11 @@ def _online_idle_batch_wait_ms(*, temperature: float, max_tokens: int) -> float:
     return default_wait_ms
 
 
+def _online_collect_idle_arrivals_enabled(*, temperature: float, max_tokens: int) -> bool:
+    del temperature, max_tokens
+    return env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_COLLECT_IDLE_ARRIVALS", False)
+
+
 def _online_initial_batch_wait_ms(*, temperature: float, max_tokens: int) -> float:
     global_env = "TORCHINFERNO_OPENAI_TP_ONLINE_INITIAL_BATCH_WAIT_MS"
     if global_env in os.environ:
@@ -3217,6 +3222,10 @@ class OpenAICompletionEngine:
             temperature=first.temperature,
             max_tokens=run_max_tokens,
         )
+        collect_idle_arrivals = _online_collect_idle_arrivals_enabled(
+            temperature=first.temperature,
+            max_tokens=run_max_tokens,
+        )
         use_decode_many = bool(getattr(runtime_engine, "enable_decode_many", use_decode_many))
         profile_snapshot_commands = (
             env_int("TORCHINFERNO_OPENAI_TP_ONLINE_PROFILE_SNAPSHOT_COMMANDS", 8, minimum=0)
@@ -3464,7 +3473,7 @@ class OpenAICompletionEngine:
                                 request_by_id.clear()
                                 next_request_id = 0
                                 step = 0
-                            elif idle_wait_s > 0.0:
+                            elif collect_idle_arrivals and idle_wait_s > 0.0:
                                 deadline = time.perf_counter() + idle_wait_s
                                 while len(idle_batch) < max_active:
                                     timeout = deadline - time.perf_counter()

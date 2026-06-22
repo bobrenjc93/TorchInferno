@@ -113,12 +113,16 @@ too long and is rejected: 375.2 / 0.0 / 457.8 ms. The default patch scopes the
 10ms wait to sampled requests with `max_tokens <= 256`, so tree_of_thought's
 sampled 300-token branches and greedy rows stay on the 2ms idle drain. The
 first post-patch no-env guard landed at 287.7 / 0.0 / 399.6 ms, 1000/1000
-correct. Adding a bounded post-arrival collection window for the case where the
-next wave arrives just after the idle drain expires validated better:
-self_consistency landed at 235.1 / 0.0 / 352.3 ms, 2.8 tok/s, 1000/1000
-correct. Lowering the sampled-short idle drain to 8ms was too short and is
-rejected: 379.9 / 0.0 / 451.1 ms, 2.2 tok/s. Raising it to 12ms is also
-rejected: 380.8 / 0.0 / 456.5 ms, 2.2 tok/s. Keep the 10ms default.
+correct. A single bounded post-arrival collection run later landed at 235.1 /
+0.0 / 352.3 ms, 2.8 tok/s, 1000/1000 correct, but follow-up rechecks did not
+hold that win: current default with post-arrival collection reproduced 381.4 /
+0.0 / 434.1 ms, while gating post-arrival collection back to opt-in improved
+the same current checkout to 343.7 / 0.0 / 411.7 ms. Keep the 10ms sampled-short
+idle drain, but leave post-arrival collection behind
+`TORCHINFERNO_OPENAI_TP_ONLINE_COLLECT_IDLE_ARRIVALS=1`. Lowering the
+sampled-short idle drain to 8ms was too short and is rejected: 379.9 / 0.0 /
+451.1 ms, 2.2 tok/s. Raising it to 12ms is also rejected: 380.8 / 0.0 /
+456.5 ms, 2.2 tok/s.
 
 SELF SAME-NODE PROVIDER COMPARISON (2026-06-22, current fc084b0,
 inference-bench `20260622_051934`): with the existing local vLLM/SGLang builds,
