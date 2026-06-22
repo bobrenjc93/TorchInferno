@@ -122,6 +122,18 @@ landed at few_shot 153.3 / 47.9 / 193.2 ms, self_consistency 329.8 / 0.0 /
 this as a self wave-formation cleanup; it is intentionally scoped away from
 tree_of_thought's sampled-medium path and greedy workloads.
 
+PREFIX-REUSE GRAPH CAPTURE DIVERGENCE FIX (2026-06-22, current 519188d + local
+patch): the first same-node provider recheck on `519188d` wedged during
+TorchInferno long_output after few/self/multi/tree had completed. `py-spy`
+showed a collective-order mismatch in prefix-reuse prefill: rank 0 had fallen
+through to eager ragged prefill and was in a tensor-parallel all-reduce, while a
+worker rank was still in ragged prefill graph-capture success synchronization.
+Runtime prefix-reuse prefill now passes `capture_on_miss=False` by default, so
+warm graphs can replay but an uncaptured shape falls back to eager on every rank
+instead of attempting a late capture in the serving path. The opt-in escape hatch
+is `TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_CAPTURE_ON_MISS=1`; the default keeps
+runtime graph generation out of the hot path.
+
 CLEAN NO-PROFILE TREE REPRO (2026-06-21, current 33a2eb3): rerunning
 tree_of_thought locally with no queue profiling did not reproduce the public
 `30.2ms` TPOT row. The latest inference-bench checkout, `--skip-build`, and the

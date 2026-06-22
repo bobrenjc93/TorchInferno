@@ -1655,7 +1655,13 @@ class ContinuousBatchEngine:
             logits = None
             if not mixed_prefixes or env_flag("TORCHINFERNO_CONTINUOUS_MIXED_PREFIX_PREFILL_GRAPH", False):
                 logits = self._try_ragged_prefill_logits(
-                    input_ids, seq_lens, row_indices, logit_positions, context_len, src_prefix_row
+                    input_ids,
+                    seq_lens,
+                    row_indices,
+                    logit_positions,
+                    context_len,
+                    src_prefix_row,
+                    capture_on_miss=env_flag("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_CAPTURE_ON_MISS", False),
                 )
             if logits is None:
                 logits = self._ragged_prefill_logits_eager(
@@ -1730,6 +1736,8 @@ class ContinuousBatchEngine:
         logit_positions: Tensor,
         context_len: int | None = None,
         src_prefix_row: Tensor | None = None,
+        *,
+        capture_on_miss: bool = True,
     ) -> Tensor | None:
         graph = getattr(self.model, "try_prefill_ragged_logits_graph", None)
         if graph is None:
@@ -1742,6 +1750,7 @@ class ContinuousBatchEngine:
             logit_positions=logit_positions,
             context_len=context_len,
             src_prefix_row=src_prefix_row,
+            capture_on_miss=capture_on_miss,
         )
         if logits is None:
             self.stats.prefill_graph_misses += 1

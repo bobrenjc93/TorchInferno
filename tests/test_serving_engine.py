@@ -220,6 +220,7 @@ class _SelectedLogitsToyModel(_RaggedGraphToyModel):
         super().__init__(vocab_size)
         self.selected_positions: list[list[int]] = []
         self.prefill_src_prefix_rows: list[list[int] | None] = []
+        self.prefill_capture_flags: list[bool] = []
 
     def forward(
         self,
@@ -251,7 +252,8 @@ class _SelectedLogitsToyModel(_RaggedGraphToyModel):
         self, input_ids, cache, *, seq_lens, row_indices, logit_positions,
         context_len=None, src_prefix_row=None, capture_on_miss=True,
     ):
-        del seq_lens, context_len, capture_on_miss
+        del seq_lens, context_len
+        self.prefill_capture_flags.append(bool(capture_on_miss))
         self.prefill_src_prefix_rows.append(
             None if src_prefix_row is None else src_prefix_row.detach().cpu().tolist()
         )
@@ -262,6 +264,30 @@ class _SelectedLogitsToyModel(_RaggedGraphToyModel):
         self, input_ids, cache, *, seq_lens, row_indices, logit_positions, context_len=None, src_prefix_row=None
     ):
         del seq_lens, context_len
+        self.prefill_src_prefix_rows.append(
+            None if src_prefix_row is None else src_prefix_row.detach().cpu().tolist()
+        )
+        cache.advance_rows(row_indices.detach().cpu().tolist(), input_ids.size(1))
+        return self._ragged_prefill_compute(input_ids, logit_positions)
+
+
+class _SelectedRaggedGraphMissToyModel(_SelectedLogitsToyModel):
+    def try_prefill_ragged_logits_graph(
+        self,
+        input_ids,
+        cache,
+        *,
+        seq_lens,
+        row_indices,
+        logit_positions,
+        context_len=None,
+        src_prefix_row=None,
+        capture_on_miss=True,
+    ):
+        del seq_lens, context_len
+        self.prefill_capture_flags.append(bool(capture_on_miss))
+        if not capture_on_miss:
+            return None
         self.prefill_src_prefix_rows.append(
             None if src_prefix_row is None else src_prefix_row.detach().cpu().tolist()
         )
@@ -1943,6 +1969,36 @@ def test_continuous_batch_engine_can_keep_common_prefix_without_full_prompt_entr
     assert engine.stats.prefill_prefix_reuse_batches == 1
     assert engine.stats.prefix_reuse_requests == 2
     assert engine.stats.prefix_reuse_tokens == 32
+
+
+def test_continuous_batch_engine_prefix_reuse_does_not_capture_ragged_graph_on_miss(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PADDED_SUFFIX_PREFILL", "1")
+    shared = tuple(range(16))
+    model = _SelectedRaggedGraphMissToyModel()
+    engine = ContinuousBatchEngine(
+        model,
+        device=torch.device("cpu"),
+        max_active_requests=2,
+        prefix_cache_capacity=2,
+        store_full_prompt_prefixes=False,
+        graph_prefill=True,
+    )
+    requests = [
+        ServingRequest("warm-a", (*shared, 21), 1, arrival_step=0),
+        ServingRequest("warm-b", (*shared, 22, 23), 1, arrival_step=0),
+        ServingRequest("late-a", (*shared, 31), 1, arrival_step=1),
+        ServingRequest("late-b", (*shared, 32, 33), 1, arrival_step=1),
+    ]
+
+    results = engine.run(requests)
+
+    assert [result.prefix_hit_tokens for result in results] == [16, 16, 16, 16]
+    assert model.prefill_capture_flags == [False, False]
+    assert engine.stats.prefill_graph_misses == 2
+    assert engine.stats.prefill_prefix_reuse_batches == 2
+    assert engine.stats.prefix_reuse_requests == 4
 
 
 def test_continuous_batch_engine_can_use_prefill_logits_graph(monkeypatch) -> None:
