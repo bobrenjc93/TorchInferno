@@ -22,6 +22,23 @@ local tree TPOT as an environment-sensitive diagnostic for now; do not default a
 change solely because it moves the local 52-54ms TPOT band unless same-node vLLM
 or a counter profile explains the public/local delta.
 
+LLAMA CHAT STOP-ID CLEANUP (2026-06-21, current bd0e430 + local patch): the
+Transformers chat tokenizer path was treating every added `<|...|>` control
+token as a stop id. For Llama-3.1-70B-Instruct that produced 256 stop ids, while
+the continuous runtime accepts one `eos_token_id`. The server could finish an
+HTTP request on `<|eot_id|>` while the runtime row kept decoding until max tokens
+or an arbitrary control id. Narrowing chat stop ids to the known terminators
+(`<|end_of_text|>`, `<|eom_id|>`, `<|eot_id|>`) and preferring `<|eot_id|>` for
+runtime EOS changed the real tokenizer from 256 stop ids to 3 with runtime EOS
+128009. The no-profile tree_of_thought guard improved the local TPOT band from
+the clean current run's 293.5 / 53.6 / 317.3 ms to 216.6 / 51.8 / 254.7 ms,
+4.4 tok/s, and 964/992 raw correct. The HTTP-only profile from the preceding
+control showed response framing was not the 52ms TPOT source: p50 content send
+was 0.94ms, p50 finish send was 0.58ms, and server-side reconstructed positive
+TPOT was still 53.5ms. Keep the stop-id cleanup; it is general row-retirement
+correctness and a small tree TPOT win, but it does not explain the public/local
+30ms vs 52ms discrepancy by itself.
+
 TREE SCHEDULER KNOB RECHECKS (2026-06-21, current 60802a local no-profile A/B):
 three more tree_of_thought knobs are rejected. Raising the sampled-medium online
 idle window from the 10ms default to 100ms landed at 231.5 / 52.8 / 273.4 ms

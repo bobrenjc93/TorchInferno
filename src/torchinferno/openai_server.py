@@ -1641,8 +1641,12 @@ def _chat_stop_token_ids(tokenizer: object) -> frozenset[int]:
     token_ids.update(_coerce_optional_token_ids(eos_token_id))
     token_ids.update(_coerce_optional_token_ids(getattr(tokenizer, "eos_token_ids", None)))
     token_ids.update(_known_chat_terminator_ids(tokenizer))
-    token_ids.update(_added_chat_control_token_ids(tokenizer))
+    token_ids.update(_added_chat_terminator_token_ids(tokenizer))
     return frozenset(token_ids)
+
+
+_CHAT_TERMINATOR_TOKENS = ("<|end_of_text|>", "<|eom_id|>", "<|eot_id|>")
+_RUNTIME_EOS_TOKEN_PREFERENCE = ("<|eot_id|>", "<|eom_id|>", "<|end_of_text|>")
 
 
 def _known_chat_terminator_ids(tokenizer: object) -> set[int]:
@@ -1652,7 +1656,7 @@ def _known_chat_terminator_ids(tokenizer: object) -> set[int]:
         return token_ids
     vocab_size = getattr(tokenizer, "vocab_size", None)
     all_special_ids = _coerce_optional_token_ids(getattr(tokenizer, "all_special_ids", None))
-    for token in ("<|end_of_text|>", "<|eom_id|>", "<|eot_id|>"):
+    for token in _CHAT_TERMINATOR_TOKENS:
         try:
             token_id = convert(token)
         except Exception:
@@ -1667,7 +1671,7 @@ def _known_chat_terminator_ids(tokenizer: object) -> set[int]:
     return token_ids
 
 
-def _added_chat_control_token_ids(tokenizer: object) -> set[int]:
+def _added_chat_terminator_token_ids(tokenizer: object) -> set[int]:
     get_added_vocab = getattr(tokenizer, "get_added_vocab", None)
     if not callable(get_added_vocab):
         return set()
@@ -1679,9 +1683,28 @@ def _added_chat_control_token_ids(tokenizer: object) -> set[int]:
         return set()
     token_ids: set[int] = set()
     for token, token_id in added_vocab.items():
-        if isinstance(token, str) and token.startswith("<|") and token.endswith("|>"):
+        if token in _CHAT_TERMINATOR_TOKENS:
             token_ids.update(_coerce_optional_token_ids(token_id))
     return token_ids
+
+
+def _runtime_eos_token_id(tokenizer: object, stop_token_ids: frozenset[int]) -> int | None:
+    if not stop_token_ids:
+        return None
+    convert = getattr(tokenizer, "convert_tokens_to_ids", None)
+    if callable(convert):
+        for token in _RUNTIME_EOS_TOKEN_PREFERENCE:
+            try:
+                token_id = convert(token)
+            except Exception:
+                continue
+            for coerced in _coerce_optional_token_ids(token_id):
+                if coerced in stop_token_ids:
+                    return coerced
+    for token_id in _coerce_optional_token_ids(getattr(tokenizer, "eos_token_id", None)):
+        if token_id in stop_token_ids:
+            return token_id
+    return min(stop_token_ids)
 
 
 def _coerce_optional_token_ids(value: object) -> set[int]:
@@ -3112,7 +3135,7 @@ class OpenAICompletionEngine:
         if persistent_cache is not None and hasattr(persistent_cache, "layers") and persistent_cache.layers:
             compat_max_seq_len = persistent_cache.layers[0].max_seq_len
         stop_token_ids = getattr(self, "stop_token_ids", frozenset())
-        eos_token_id = next(iter(stop_token_ids)) if stop_token_ids else None
+        eos_token_id = _runtime_eos_token_id(getattr(self, "tokenizer", None), stop_token_ids)
         # Test-only: force every request to generate exactly max_tokens (ignore EOS),
         # so scripts/test_stream.py can reproduce the real long_output benchmark's
         # "huge output -> rows stay occupied -> arrivals queue" dynamics that drive
@@ -4123,7 +4146,7 @@ class OpenAICompletionEngine:
             minimum=1,
         )
         stop_token_ids = getattr(self, "stop_token_ids", frozenset())
-        eos_token_id = next(iter(stop_token_ids)) if stop_token_ids else None
+        eos_token_id = _runtime_eos_token_id(getattr(self, "tokenizer", None), stop_token_ids)
         use_decode_many = _online_decode_many_enabled(
             temperature=group[0].temperature,
             max_tokens=max_tokens,
@@ -4359,7 +4382,7 @@ class OpenAICompletionEngine:
             else 0
         )
         stop_token_ids = getattr(self, "stop_token_ids", frozenset())
-        eos_token_id = next(iter(stop_token_ids)) if stop_token_ids else None
+        eos_token_id = _runtime_eos_token_id(getattr(self, "tokenizer", None), stop_token_ids)
         enable_ragged_decode = env_flag("TORCHINFERNO_OPENAI_RUNTIME_CONTINUOUS_RAGGED_DECODE", True)
         store_full_prompt_prefixes = env_flag(
             "TORCHINFERNO_OPENAI_RUNTIME_CONTINUOUS_PREFIX_CACHE_STORE_FULL_PROMPTS",

@@ -118,6 +118,7 @@ from torchinferno.openai_server import (
     _prompt_list_tensor_payload,
     _runtime_ragged_decode_graph_capture_allowed_for_request,
     _runtime_prefill_graph_capture_enabled,
+    _runtime_eos_token_id,
     _repeat_generation_cache_first_batch,
     _sampled_batch_shape_bucket_size,
     _set_generation_cache_rows_seq_lens,
@@ -666,13 +667,11 @@ def test_chat_template_batch_encoding_input_ids_are_extracted() -> None:
     assert encoded == [7, 8, 9]
 
 
-def test_transformers_chat_tokenizer_stops_on_llama_eot() -> None:
+def test_transformers_chat_tokenizer_stops_on_llama_terminators_only() -> None:
     tokenizer = _TransformersChatTokenizer(_LlamaStyleTokenizer())
 
-    assert 128001 in tokenizer.stop_token_ids
-    assert 128008 in tokenizer.stop_token_ids
-    assert 128009 in tokenizer.stop_token_ids
-    assert 128010 in tokenizer.stop_token_ids
+    assert tokenizer.stop_token_ids == frozenset({128001, 128008, 128009})
+    assert _runtime_eos_token_id(tokenizer.tokenizer, tokenizer.stop_token_ids) == 128009
 
 
 def test_openai_engine_stops_generation_on_chat_terminator() -> None:
