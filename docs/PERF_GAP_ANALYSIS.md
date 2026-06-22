@@ -11,6 +11,21 @@ vLLM 28.8 ms. long_output TPOT improved to 21.0 ms, but vLLM remains at
 another queue knob. self_consistency remains wave-scheduling-bound at
 274.1 ms TTFT / 388.6 ms E2E / 2.6 tok/s despite the sampled KV-budget change.
 
+TREE LOCAL REPRO/PROVIDER COMPARISON (2026-06-21, current aa22fa0): warm-server
+ordering does not explain the public/local tree discrepancy. A no-profile
+few_shot -> self_consistency -> multi_turn -> tree_of_thought sequence landed
+tree at 242.6 / 51.6 / 279.1 ms (TTFT/TPOT/E2E) and 4.2 tok/s. A fresh clone
+and wheel build of the same commit also did not close the gap: 250.1 / 53.6 /
+300.2 ms and 4.0 tok/s. Same-node provider comparison is the cleaner next
+tree baseline: vLLM was 75.4 / 36.5 / 103.5 ms and 11.6 tok/s, SGLang was
+72.3 / 77.5 / 170.3 ms and 7.9 tok/s, and TorchInferno was 215.1 / 52.2 /
+254.1 ms and 4.7 tok/s. The public/local variance affects at least vLLM and
+TorchInferno, but the same-node gap is still real: TorchInferno is roughly
+15.7 ms slower than vLLM on TPOT and roughly 150 ms slower on TTFT. vLLM's
+local server enabled chunked prefill, prefix caching, FlashAttention, and decode
+graph capture sizes up to 512; use vLLM as the next tree comparator when testing
+TorchInferno scheduler changes.
+
 TREE SAMPLED ROW CAP RECHECK (2026-06-21, current c636428 local focused A/B):
 lowering `TORCHINFERNO_OPENAI_TP_ONLINE_MAX_ACTIVE` to 32 is not defaultable.
 With queue profiling enabled it improved the profiled current control from
