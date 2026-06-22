@@ -69,6 +69,14 @@ correctness were worse than the recent default tree controls. Keep down-proj
 Marlin off unless a later calibrated variant proves math correctness and a
 score-facing latency win.
 
+GREEDY SAMPLE-GATHER RECHECK (2026-06-22, current 26752a8 no-profile): replacing
+greedy token selection's two tiny all-reduces with the one-collective gather path
+(`TORCHINFERNO_GREEDY_SAMPLE_GATHER=1`) is not defaultable. long_output TPOT
+improved within the local band (27-28 ms -> 25.8 ms), but TTFT/E2E/throughput
+regressed to 375.1 / 1557.8 ms / 26.6 tok/s. few_shot regressed more clearly:
+159.9 / 52.0 / 204.7 ms and 5.8 tok/s, 976/1000 raw correct. Keep the gather
+sampler opt-in.
+
 FULL CURRENT LOCAL REFRESH (2026-06-22, current 51fba66 no-profile,
 TorchInferno-only): the pushed default stack landed at few_shot 149.3 / 50.2 /
 189.8 ms, self_consistency 313.4 / 0.0 / 388.7 ms, multi_turn 595.8 / 41.4 /
@@ -101,6 +109,14 @@ worse. Raising `TORCHINFERNO_OPENAI_TP_ONLINE_MAX_ACTIVE` to 64 is a clear
 regression: 309.8 / 53.3 / 372.9 ms, 3.9 tok/s, and 958/992 raw correct. Keep
 tree on the 5ms sampled-medium wait, 10ms idle window, and 48-row cap until the
 next hypothesis changes the prefill/decode pipeline itself.
+
+TREE FULL-DRAIN REFILL RECHECK (2026-06-22, current 26752a8 queue-profiled):
+forcing refill admission to wait until all 48 active rows were free
+(`TORCHINFERNO_CONTINUOUS_ADMIT_MIN_FREE_ROWS=48`) is rejected. It landed at
+239.5 / 54.0 / 279.5 ms, 4.1 tok/s, 957/992 raw correct. The counters moved the
+wrong way versus the comparable profiled control: total runtime step time
+8.48s -> 8.77s, prefill wall 5.62s -> 5.75s, and decode active 2.83s -> 2.99s.
+Holding refills back removes interleaving but costs batching efficiency.
 
 TREE SESSION CAP REJECTED (2026-06-21, current bc3b9ea + temporary env-gated
 patch): capping each online session at 128 requests was meant to reduce
@@ -388,6 +404,15 @@ profile snapshot had all 1000 requests finished and showed 13.6s decode-active,
 not pure host copy overhead. Do not re-chase synchronous readback or simple
 pinned-buffer tweaks for long_output; the remaining gap is decode compute/pipeline
 plus material prefill wall.
+
+Long-output unified-scheduler recheck (2026-06-22, current 26752a8): the
+default-off token-budget unified scheduler
+(`TORCHINFERNO_OPENAI_UNIFIED_SCHEDULER=1`,
+`TORCHINFERNO_OPENAI_UNIFIED_MAX_SEQ_LEN=1024`) is rejected for the benchmark
+path. The server started and accepted long_output traffic, but several minutes
+of saturated GPU execution produced no completion where the default online
+batcher normally finishes quickly; the run was manually terminated. Keep the
+continuous online batcher as the serving default.
 
 LONG_OUTPUT CURRENT RECHECKS (2026-06-21, bd61b32 local slices): two narrower
 variants also failed. Raising greedy-short decode quantum from the default 8 to
@@ -1295,7 +1320,10 @@ Multi-turn A/B refresh (2026-06-21, current `82d814d`):
   rows cost TPOT without relieving enough prefill queueing.
 - Lowering `TORCHINFERNO_OPENAI_PAGED_KV_MIN_SEQ` to 512 is not ready:
   the server built FlashInfer decode graphs and listened, then hung before
-  writing queue progress or result files on multi_turn. Keep the 1024 threshold.
+  writing queue progress or result files on multi_turn. Retried on current
+  26752a8 after stop-id/runtime cleanup: the server reached traffic and saturated
+  all GPUs, but still produced no 100-conversation milestone after several
+  minutes and was manually terminated. Keep the 1024 threshold.
 - Finished-prefix reuse with non-common 16-token prefix buckets is also
   rejected (experimental code backed out): it cut prefill tokens
   `81431 -> 27937` and stored `1000` finished prefixes, but fragmented into
