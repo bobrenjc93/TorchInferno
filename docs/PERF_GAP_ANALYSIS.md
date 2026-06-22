@@ -174,6 +174,22 @@ fragmentation, but the queueing cost lands directly in score-facing latency.
 Keep greedy-short refills on the current default until a policy can prove it
 only waits when client arrivals are already exhausted.
 
+TREE SAME-NODE PROVIDER COMPARISON (2026-06-22, current 9b90df2,
+inference-bench `20260622_060104`): the local tree_of_thought TPOT band is real
+on this host. vLLM landed at 73.7 / 35.3 / 99.9 ms, 12.1 tok/s, 963/992 raw
+correct; TorchInferno landed at 204.1 / 52.4 / 240.5 ms, 5.0 tok/s, 962/992 raw
+correct. This differs from the stale public run where TorchInferno showed
+~30ms TPOT, so keep treating public/local tree deltas as environment-sensitive
+until a fresh public run lands on the pushed stop-id and idle-drain stack.
+
+TREE DECODE-QUANTUM REJECTION (2026-06-22, current 9b90df2 no-profile): raising
+the broad short-generation quantum to 8 via
+`TORCHINFERNO_OPENAI_TP_ONLINE_SHORT_GEN_DECODE_QUANTUM=8` does not move tree
+TPOT and regresses latency: 229.4 / 52.6 / 273.3 ms, 4.6 tok/s, 956/992 raw
+correct. The sampled-medium branch sessions stay in the local 52ms TPOT band,
+while the broader override also weakens TTFT/E2E. Do not scope a sampled-medium
+quantum default from this result.
+
 FEW ROW-CAP REJECTION (2026-06-22, current d3608c6 no-profile): lowering
 greedy-mid active rows to 24
 (`TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_MID_MAX_ACTIVE=24`) improves the
