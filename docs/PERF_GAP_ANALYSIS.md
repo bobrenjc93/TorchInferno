@@ -156,6 +156,24 @@ remaining-token heuristic is also rejected. Disabling the per-command online
 step sync for long_output (`TORCHINFERNO_OPENAI_TP_ONLINE_STEP_SYNC=0`) also
 does not help: 309.7 / 27.8 / 1533.2 ms with worse p99.
 
+LONG SAME-NODE PROVIDER COMPARISON (2026-06-22, current a72825d,
+inference-bench `20260622_053240`): vLLM still owns the long_output row on the
+same host and harness: vLLM 82.2 / 18.8 / 815.5 ms, 47.4 tok/s, versus
+TorchInferno 333.2 / 27.8 / 1485.1 ms, 23.6 tok/s. Both providers were
+1000/1000 correct. TorchInferno's p99 is also behind here (TTFT 1902.7ms and
+E2E 3668.1ms versus vLLM 805.2ms and 1313.3ms), so the remaining long gap is
+not just a median decode issue; queue/admission tail behavior is still material.
+
+LONG REFILL-READINESS REJECTIONS (2026-06-22, current a72825d no-profile): the
+refill batching mechanism is real but not defaultable. Raising
+`TORCHINFERNO_OPENAI_TP_ONLINE_REFILL_MIN_READY_REQUESTS` to 32 cut median TPOT
+to 20.6ms, but TTFT/E2E regressed to 520.7 / 1521.7 ms and p99 TPOT worsened to
+89.2ms. The middle point at 16 was also worse than default: 377.1 / 26.1 /
+1571.2 ms with 80.8ms p99 TPOT. Larger refill groups reduce suffix-prefill
+fragmentation, but the queueing cost lands directly in score-facing latency.
+Keep greedy-short refills on the current default until a policy can prove it
+only waits when client arrivals are already exhausted.
+
 FEW ROW-CAP REJECTION (2026-06-22, current d3608c6 no-profile): lowering
 greedy-mid active rows to 24
 (`TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_MID_MAX_ACTIVE=24`) improves the
