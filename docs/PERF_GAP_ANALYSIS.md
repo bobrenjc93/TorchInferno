@@ -1093,6 +1093,26 @@ Multi-turn A/B refresh (2026-06-21, current `82d814d`):
   baseline shared-prefix path unless non-common suffixes can be fused into much
   fewer graph shapes.
 
+Multi-turn refresh after the exact-prefix online route (2026-06-21, current
+`fa088ca`): the shape is unchanged and still prefill dominated. Current profiled
+multi_turn landed at `594.9ms` TTFT, `41.9ms` TPOT, `635.7ms` E2E,
+`2.0 tok/s`, 980/1000 raw correct. Queue profile ended at `10056ms` prefill wall
+/ `9570ms` prefill forward vs `2123ms` decode active, with `65` prefill batches,
+`154` decode batches, `80135` prefill tokens, and `45000` reused prefix tokens.
+Rejected follow-ups on the same code:
+- A global 5ms initial batch wait did not fill the first wave and slightly
+  regressed: `598.1ms` TTFT, `42.1ms` TPOT, `637.9ms` E2E. Final profile had
+  `initial_batch_size=2`, `64` prefill batches, and `9504ms` prefill wall.
+- Raising online prefix rows from 64 to 96 did not increase reuse. Reuse tokens
+  stayed at `45000`, prefill tokens rose to `82499`, and metrics regressed to
+  `604.3ms` TTFT / `644.5ms` E2E.
+- Enabling pinned full-prompt stores for `max_tokens>=512` cut prefill tokens
+  (`80135 -> 19222`) and increased reused prefix tokens (`45000 -> 95611`), but
+  fragmented the graph path into `632` prefill batches and `575` prefill graph
+  misses. It regressed catastrophically to `8530.9ms` TTFT / `8571.1ms` E2E.
+  The useful direction is not simply longer prefix hits; it needs a fused
+  non-common-prefix prefill path with stable graph shapes.
+
 Self-consistency sampled-short wait A/B (2026-06-21, current `9452794`):
 - Clean local full run with the 5ms sampled-short initial wait:
   `358.2ms` TTFT, `427.3ms` E2E, `2.3 tok/s`.
