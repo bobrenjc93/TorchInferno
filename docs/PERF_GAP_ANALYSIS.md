@@ -105,6 +105,13 @@ next wave arrives just after the idle drain expires validated better:
 self_consistency landed at 235.1 / 0.0 / 352.3 ms, 2.8 tok/s, 1000/1000
 correct.
 
+SELF STOP-LOOKAHEAD REJECTED (2026-06-22, current 76b24e4 + temporary patch):
+an env-gated one-row exact-prefix lookahead decoded the sampled first token once
+and finished the whole reuse group only if all sampled second tokens were stop
+tokens. It preserved correctness but serialized too much work: self_consistency
+regressed to 550.0 / 0.0 / 597.6 ms, 1.7 tok/s. Do not revisit without a
+batched or graph-captured verification path.
+
 ADDITIONAL SCHEDULER REJECTIONS (2026-06-22, current 30992b1 no-profile):
 multi_turn does not benefit from simply keeping the online session open longer;
 `TORCHINFERNO_OPENAI_TP_ONLINE_PERSISTENT_IDLE_MS=100` landed at 600.6 / 42.7 /
