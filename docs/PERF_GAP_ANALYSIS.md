@@ -136,6 +136,12 @@ clears stale `_skip_capture_sync` markers whenever the online runtime adopts an
 external persistent cache, so primary and worker ranks make the same
 capture/replay decision. `TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_CAPTURE_ON_MISS=0`
 remains an escape hatch for diagnosing future capture-order issues.
+The follow-up provider run on `5a1bd23` completed without the long_output wedge
+and restored the expected score shape: vLLM 21 wins, TorchInferno 3, SGLang 1
+(`20260622_103746`). TorchInferno wins are few_shot TPOT/E2E (51.7ms /
+197.2ms) and multi_turn TPOT (41.3ms). Long_output completed at
+300.8 / 27.2 / 1486.1 ms, back in the pre-guard latency band instead of the
+no-capture guard's 427.5 / 31.7 / 1714.4 ms.
 
 CLEAN NO-PROFILE TREE REPRO (2026-06-21, current 33a2eb3): rerunning
 tree_of_thought locally with no queue profiling did not reproduce the public
