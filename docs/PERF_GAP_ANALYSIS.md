@@ -1183,6 +1183,12 @@ Rejected follow-ups on the same code:
   misses. It regressed catastrophically to `8530.9ms` TTFT / `8571.1ms` E2E.
   The useful direction is not simply longer prefix hits; it needs a fused
   non-common-prefix prefill path with stable graph shapes.
+- Rechecking multi_turn after the common-prefix no-logits cleanup (`c6be9e0`)
+  did not move the shape: `598.6ms` TTFT, `41.4ms` TPOT, `638.6ms` E2E,
+  `1.9 tok/s`, 981/1000 raw correct. Queue profile stayed at `65` prefill
+  batches and `10107ms` prefill wall (`9643ms` forward). Multi still needs the
+  fused non-common-prefix path or persistent TP-safe reuse; removing common-prefix
+  logits sync is not enough.
 
 Self-consistency sampled-short wait A/B (2026-06-21, current `9452794`):
 - Clean local full run with the 5ms sampled-short initial wait:
