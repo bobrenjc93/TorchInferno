@@ -26,6 +26,16 @@ TTFT/E2E/tput (597.6 / 640.0 ms / 2.0 tok/s vs vLLM 179.7 / 232.1 ms /
 71.3 / 18.8 / 753.7 ms). SGLang is useful as a TTFT reference in few/tree/multi
 but is not a self-consistency tail target: p99 E2E was 58.4s.
 
+POST-IDLE GATE FULL GUARD (2026-06-22, current e15935c TorchInferno-only):
+after making post-idle arrival collection opt-in, the full local guard landed at
+few_shot 149.4 / 50.5 / 190.1 ms, self_consistency 312.8 / 0.0 / 389.7 ms,
+multi_turn 598.6 / 40.6 / 639.0 ms, tree_of_thought 300.7 / 52.2 / 330.6 ms,
+and long_output 283.5 / 28.5 / 1442.5 ms (TTFT/TPOT/E2E). The self row improved
+against the prior full same-node TorchInferno row, few stayed strong, and
+multi/long stayed in family. The weak full-run tree row was order/variance:
+a focused e15935c tree recheck landed at 219.4 / 51.3 / 258.3 ms with 955/992
+raw correct.
+
 CLEAN NO-PROFILE TREE REPRO (2026-06-21, current 33a2eb3): rerunning
 tree_of_thought locally with no queue profiling did not reproduce the public
 `30.2ms` TPOT row. The latest inference-bench checkout, `--skip-build`, and the
