@@ -23,6 +23,16 @@ regression: 309.8 / 53.3 / 372.9 ms, 3.9 tok/s, and 958/992 raw correct. Keep
 tree on the 5ms sampled-medium wait, 10ms idle window, and 48-row cap until the
 next hypothesis changes the prefill/decode pipeline itself.
 
+TREE PINNED READBACK REJECTED (2026-06-21, local 570917f + temporary patch): a
+reusable pinned CPU token buffer for ragged decode readback looked promising in
+one no-profile run (218.0 / 52.0 / 252.9 ms, 4.5 tok/s, 963/992 raw correct),
+but the profiled counter did not validate the mechanism. Baseline profiled
+sampled-medium tree spent 1415.5 ms in `decode_ragged_cpu_tokens_ms` across
+67 ragged decode batches; the pinned-buffer patch spent 1467.9 ms across
+70 ragged decode batches, with total sampled-medium profiled time moving
+7790.6 -> 8003.2 ms. The patch was backed out. The readback gap needs real
+lagged/asynchronous token harvesting, not just a pinned synchronous copy.
+
 TREE LOCAL REPRO/PROVIDER COMPARISON (2026-06-21, current aa22fa0): warm-server
 ordering does not explain the public/local tree discrepancy. A no-profile
 few_shot -> self_consistency -> multi_turn -> tree_of_thought sequence landed
