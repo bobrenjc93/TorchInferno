@@ -39,6 +39,16 @@ TPOT was still 53.5ms. Keep the stop-id cleanup; it is general row-retirement
 correctness and a small tree TPOT win, but it does not explain the public/local
 30ms vs 52ms discrepancy by itself.
 
+FULL STOP-ID GUARD (2026-06-21, current cadbeb8 local no-profile): a
+TorchInferno-only full pass after the stop-id cleanup landed at few_shot
+156.3 / 52.7 / 200.3 ms, self_consistency 287.8 / 0.0 / 401.1 ms,
+multi_turn 584.3 / 42.8 / 621.5 ms, tree_of_thought 231.3 / 51.8 / 263.8 ms,
+and long_output 339.5 / 28.1 / 1441.6 ms (TTFT/TPOT/E2E). Compared with the
+earlier full local current guard, self_consistency TTFT/E2E improved and tree
+TPOT stayed in family, but few_shot and long_output TPOT did not improve. Treat
+the change as the right Llama chat-row retirement behavior, not as a confirmed
+full-score speedup.
+
 TREE SCHEDULER KNOB RECHECKS (2026-06-21, current 60802a local no-profile A/B):
 three more tree_of_thought knobs are rejected. Raising the sampled-medium online
 idle window from the 10ms default to 100ms landed at 231.5 / 52.8 / 273.4 ms
