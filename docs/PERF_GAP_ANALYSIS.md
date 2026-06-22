@@ -258,6 +258,24 @@ TTFT but regressed every decode-throughput-facing metric: `291.4ms` TTFT,
 `28.5ms` TPOT, `1555.8ms` E2E, `25.2 tok/s`, 100% correct. The default 64-admit
 policy remains the better score tradeoff for long_output.
 
+LONG_OUTPUT CURRENT REFRESH (2026-06-21, current `5069d82`): local profiled
+long_output is still decode/readback bound and behind the public row:
+`329.9ms` TTFT, `28.1ms` TPOT, `1544.9ms` E2E, `25.2 tok/s`, 100% correct.
+Queue profile ended at `760` decode batches for `43314` decode tokens,
+`13558ms` decode-active, and `10621ms` synchronous CPU token readback. Prefill is
+also material at `13243ms` wall / `11355ms` forward across `60` batches.
+Two more decode-shape knobs are not defaultable:
+- Setting `TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_BUCKET_CAPACITY=128` looked
+  modestly better on score metrics (`306.8ms` TTFT / `27.8ms` TPOT /
+  `1421.3ms` E2E / `27 tok/s`), but the profile did not validate the intended
+  mechanism: max model batch stayed `64`, ragged batches stayed effectively the
+  same (`711 -> 719`), and CPU readback slightly increased. Treat as noise or
+  secondary scheduling variance, not a shippable lever.
+- Forcing uniform batches through ragged decode
+  (`TORCHINFERNO_CONTINUOUS_UNIFORM_RAGGED_DECODE=1`) regressed to `343.9ms`
+  TTFT / `28.5ms` TPOT / `1496.3ms` E2E and raised readback/prepare time. Keep
+  uniform ragged disabled for long_output too.
+
 PROMPT-LOOKUP DECODE RECHECK (2026-06-21, 28d7c7c local slices): prompt lookup
 is still not a defaultable long_output lever. The old verifier used a full
 prefill over `[last_token, proposal...]` and was catastrophic (hundreds of
