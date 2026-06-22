@@ -61,6 +61,14 @@ to 356.3 / 0.0 / 433.5 ms and 2.3 tok/s. Keep Marlin enabled for the short-row
 decode workloads for now; a future self-only disable would need an explicit
 request-shape policy rather than a model-wide default.
 
+MARLIN DOWN-PROJECTION RECHECK (2026-06-22, current b823758 local no-profile
+tree slice): enabling `TORCHINFERNO_MARLIN_INT4_DOWN=1` is not defaultable. The
+tree_of_thought run landed at 288.0 / 51.4 / 317.3 ms, 4.1 tok/s, and 952/992
+raw correct. TPOT moved only inside the local 51-53 ms band, while TTFT/E2E and
+correctness were worse than the recent default tree controls. Keep down-proj
+Marlin off unless a later calibrated variant proves math correctness and a
+score-facing latency win.
+
 TREE SCHEDULER KNOB RECHECKS (2026-06-21, current 60802a local no-profile A/B):
 three more tree_of_thought knobs are rejected. Raising the sampled-medium online
 idle window from the 10ms default to 100ms landed at 231.5 / 52.8 / 273.4 ms
