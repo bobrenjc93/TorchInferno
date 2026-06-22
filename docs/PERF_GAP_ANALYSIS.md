@@ -172,6 +172,12 @@ The issue is not simply too many CPU readbacks; speculative readback deferral
 still increases queue-visible latency unless decode and readback are actually
 pipelined.
 
+LONG_OUTPUT ADMISSION RECHECK (2026-06-21, current `1f51273` unprofiled):
+lowering the greedy-short admit cap from the default 64 to 32 improved local
+TTFT but regressed every decode-throughput-facing metric: `291.4ms` TTFT,
+`28.5ms` TPOT, `1555.8ms` E2E, `25.2 tok/s`, 100% correct. The default 64-admit
+policy remains the better score tradeoff for long_output.
+
 PROMPT-LOOKUP DECODE RECHECK (2026-06-21, 28d7c7c local slices): prompt lookup
 is still not a defaultable long_output lever. The old verifier used a full
 prefill over `[last_token, proposal...]` and was catastrophic (hundreds of
