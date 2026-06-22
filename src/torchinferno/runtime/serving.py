@@ -3122,13 +3122,53 @@ class ContinuousBatchEngine:
             store_logits=store_logits,
         )
 
-    def _generated_prefix_cache_enabled(self) -> bool:
+    def _generated_prefix_cache_base_enabled(self) -> bool:
         return (
             self.prefix_cache_capacity > 0
             and self.store_reusable_prefixes
             and self.store_full_prompt_prefixes
-            and env_flag("TORCHINFERNO_CONTINUOUS_GENERATED_PREFIX_CACHE", False)
         )
+
+    def _generated_prefix_cache_enabled(self) -> bool:
+        if not self._generated_prefix_cache_base_enabled():
+            return False
+        if env_flag("TORCHINFERNO_CONTINUOUS_GENERATED_PREFIX_CACHE", False):
+            return True
+        if not env_flag("TORCHINFERNO_CONTINUOUS_ADAPTIVE_GENERATED_PREFIX_CACHE", False):
+            return False
+        return any(
+            isinstance(route_id, tuple) and route_id[:1] == ("generated_prefix",)
+            for route_id in self.reusable_prefixes
+        )
+
+    def _should_collect_generated_prefix_logits(self, states: list[_ActiveRequest]) -> bool:
+        if not states or not self._generated_prefix_cache_base_enabled():
+            return False
+        if env_flag("TORCHINFERNO_CONTINUOUS_GENERATED_PREFIX_CACHE", False):
+            return True
+        if not env_flag("TORCHINFERNO_CONTINUOUS_ADAPTIVE_GENERATED_PREFIX_CACHE", False):
+            return False
+        waiting = self._online_waiting
+        if waiting is None or not bool(waiting):
+            return False
+        candidate_prompts = {
+            state.request.prompt
+            for state in states
+            if state.generated > 0 and self._state_has_full_prompt_kv(state)
+        }
+        if not candidate_prompts:
+            return False
+        pending_exact = sum(
+            1
+            for item in waiting._items
+            if item.request.prompt in candidate_prompts
+        )
+        min_pending = env_int(
+            "TORCHINFERNO_CONTINUOUS_ADAPTIVE_GENERATED_PREFIX_MIN_PENDING",
+            16,
+            minimum=1,
+        )
+        return pending_exact >= min_pending
 
     def _finished_prefix_cache_enabled(self) -> bool:
         return (
@@ -3168,7 +3208,7 @@ class ContinuousBatchEngine:
         source_row: int,
         logits: Tensor,
     ) -> None:
-        if not self._generated_prefix_cache_enabled():
+        if not self._generated_prefix_cache_base_enabled():
             return
         max_tokens = env_int("TORCHINFERNO_CONTINUOUS_GENERATED_PREFIX_CACHE_MAX_TOKENS", 1024, minimum=1)
         if len(tokens) <= 0 or len(tokens) > max_tokens:
@@ -3236,7 +3276,7 @@ class ContinuousBatchEngine:
         states: list[_ActiveRequest],
         logits: Tensor | None,
     ) -> None:
-        if logits is None or not states or not self._generated_prefix_cache_enabled():
+        if logits is None or not states or not self._should_collect_generated_prefix_logits(states):
             return
         seen: set[tuple[str, tuple[int, ...]]] = set()
         for row_index, state in enumerate(states):
@@ -3263,7 +3303,7 @@ class ContinuousBatchEngine:
         return state.prefix_hit_tokens >= prompt_len or state.seq_len >= prompt_len
 
     def _needs_generated_prefix_logits(self, states: list[_ActiveRequest]) -> bool:
-        if not states or not self._generated_prefix_cache_enabled():
+        if not states or not self._should_collect_generated_prefix_logits(states):
             return False
         max_tokens = env_int("TORCHINFERNO_CONTINUOUS_GENERATED_PREFIX_CACHE_MAX_TOKENS", 1024, minimum=1)
         for state in states:

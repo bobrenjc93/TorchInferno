@@ -1674,6 +1674,56 @@ def test_continuous_batch_engine_common_prompt_stores_generated_prefix(monkeypat
     assert engine.stats.generated_prefix_store_requests == 1
 
 
+def test_continuous_batch_engine_adaptively_reuses_generated_prefix(
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_GENERATED_PREFIX_CACHE", raising=False)
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_ADAPTIVE_GENERATED_PREFIX_CACHE", "1")
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_ADAPTIVE_GENERATED_PREFIX_MIN_PENDING", "1")
+    prompt = tuple(range(1, 18))
+    model = _StaticDecodeGraphToyModel()
+    engine = ContinuousBatchEngine(
+        model,
+        device=torch.device("cpu"),
+        max_active_requests=2,
+        prefix_cache_capacity=4,
+        pin_shared_prefix=True,
+        graph_prefill=True,
+    )
+    engine.start_online(max_seq_len=64)
+    _indexed, warm_active = engine._prefill_many(
+        [
+            (0, ServingRequest("warm-a", prompt, 1, arrival_step=0)),
+            (1, ServingRequest("warm-b", prompt, 1, arrival_step=0)),
+        ],
+        0,
+        events=[],
+    )
+    for state in warm_active:
+        engine._finish_and_release(state, 0)
+
+    engine.submit_online(ServingRequest("late-a", prompt, 2, arrival_step=0))
+    engine.submit_online(ServingRequest("late-b", prompt, 2, arrival_step=0))
+    engine.submit_online(ServingRequest("late-c", prompt, 2, arrival_step=0))
+
+    assert [(event.request_id, event.token, event.finished) for event in engine.step_online()] == [
+        ("late-a", 18, False),
+        ("late-b", 18, False),
+    ]
+    decode_calls_before = engine.stats.decode_model_calls
+    second_events = engine.step_online()
+    assert [(event.request_id, event.token, event.finished) for event in second_events] == [
+        ("late-a", 19, True),
+        ("late-b", 19, True),
+        ("late-c", 18, False),
+        ("late-c", 19, True),
+    ]
+    assert engine.stats.generated_prefix_store_requests == 1
+    assert engine.stats.decode_model_calls == decode_calls_before + 1
+    assert engine.stats.generated_prefix_reuse_requests == 1
+    assert engine.stats.generated_prefix_reuse_tokens == len(prompt) + 1
+
+
 def test_continuous_batch_engine_generated_prefix_store_updates_source_seq_len(
     monkeypatch,
 ) -> None:

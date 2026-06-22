@@ -79,6 +79,17 @@ the public run is still stale with respect to the stop-id runtime work, but it
 also confirms the local tree TPOT discrepancy remains: default local tree is
 still ~51ms TPOT while public bc3b9ea reported ~30ms.
 
+ADAPTIVE GENERATED-PREFIX CACHE REJECTED (2026-06-22, current 4186466 + local
+patch): making generated-prefix continuation caching automatic for online rows
+with queued exact-prompt reuse is not defaultable. The intended mechanism was to
+pay one logits decode for a repeated prompt, store `prompt + first_token`, and
+let later exact-prefix hits emit both the first token and likely stop token in
+the same scheduler step. A self_consistency run with that adaptive behavior
+enabled landed at 643.4 / 0.0 / 728.9 ms, 1.4 tok/s, 1000/1000 correct, far
+worse than the current local self band. Keep this behind
+`TORCHINFERNO_CONTINUOUS_ADAPTIVE_GENERATED_PREFIX_CACHE=1`; the broad
+`TORCHINFERNO_CONTINUOUS_GENERATED_PREFIX_CACHE=1` rejection still stands.
+
 TREE SCHEDULER KNOB RECHECKS (2026-06-21, current 60802a local no-profile A/B):
 three more tree_of_thought knobs are rejected. Raising the sampled-medium online
 idle window from the 10ms default to 100ms landed at 231.5 / 52.8 / 273.4 ms
