@@ -180,6 +180,10 @@ greedy-mid active rows to 24
 few_shot TPOT cell to 44.5ms, but it regresses the rest of the row badly:
 202.5ms TTFT, 237.8ms E2E, 5.4 tok/s, and worse p99. Do not default a
 single-cell TPOT tradeoff that hurts the actual request latency shape.
+The less aggressive 28-row midpoint is also rejected on current a72825d:
+165.7 / 49.7 / 209.6 ms, 5.8 tok/s, and 976/1000 raw correct. That preserves
+correctness and trims only noise-level TPOT while still worsening TTFT/E2E, so
+the row-cap curve has no score-facing midpoint between 32 and 24.
 
 FLASHINFER PREFILL REJECTION (2026-06-22, current 0d1273c no-profile): enabling
 the experimental continuous FlashInfer prefill path
