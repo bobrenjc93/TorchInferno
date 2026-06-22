@@ -86,6 +86,16 @@ to 304.5 / 0.0 / 382.3 ms, 2.6 tok/s, 1000/1000 correct
 knobs and remains scoped to sampled short requests (`max_tokens <= 256`), so it
 does not apply to few_shot, tree_of_thought, multi_turn, or long_output.
 
+LONG GREEDY-SHORT INITIAL-WAIT RECHECK (2026-06-22, current 35a3304 + local
+patch): the current long_output queue profile (`20260622_083311`) admitted only
+one request in the initial wave, then spread 1000 requests across 59 prefill
+batches and 728 decode batches. Raising only the greedy-short initial wait from
+1ms to 5ms improved focused long_output from 342.0 / 28.5 / 1459.7 ms to
+326.4 / 27.6 / 1429.1 ms, 26.0 tok/s, 1000/1000 correct (`20260622_083907`).
+This is narrower than the rejected global 5ms initial-wait experiment: it only
+applies to greedy requests with `max_tokens <= 128`, while few_shot uses
+`max_tokens=256` and stays on its existing path.
+
 CLEAN NO-PROFILE TREE REPRO (2026-06-21, current 33a2eb3): rerunning
 tree_of_thought locally with no queue profiling did not reproduce the public
 `30.2ms` TPOT row. The latest inference-bench checkout, `--skip-build`, and the
