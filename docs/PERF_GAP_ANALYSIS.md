@@ -36,6 +36,17 @@ multi/long stayed in family. The weak full-run tree row was order/variance:
 a focused e15935c tree recheck landed at 219.4 / 51.3 / 258.3 ms with 955/992
 raw correct.
 
+POST-IDLE GATE PROVIDER COMPARISON (2026-06-22, current c6073ca,
+inference-bench `20260622_073810`): the fresh same-node provider run keeps the
+same score shape: vLLM 16 metric wins, SGLang 6, TorchInferno 3. TorchInferno's
+wins are few_shot TPOT/E2E (51.9ms / 200.7ms) and multi_turn TPOT (42.3ms).
+The large remaining gaps are unchanged: self_consistency is 353.7 / 457.0 ms
+versus vLLM 198.4 / 236.3 ms, multi_turn is 586.1 / 627.1 ms / 2.1 tok/s
+versus vLLM 183.5 / 239.2 ms / 5.8 tok/s, tree_of_thought is 428.8 / 50.5 /
+468.0 ms versus vLLM 71.3 / 35.5 / 98.0 ms, and long_output is 371.9 / 26.7 /
+1482.6 ms versus vLLM 71.1 / 18.7 / 759.3 ms. The gate is a small default-path
+cleanup, not a score-shape change.
+
 CLEAN NO-PROFILE TREE REPRO (2026-06-21, current 33a2eb3): rerunning
 tree_of_thought locally with no queue profiling did not reproduce the public
 `30.2ms` TPOT row. The latest inference-bench checkout, `--skip-build`, and the
