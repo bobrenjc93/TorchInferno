@@ -115,6 +115,15 @@ does not want a global 5ms initial wait:
 the default persistent-idle policy and keep greedy few_shot's initial collection
 window short.
 
+FULL POST-IDLE LOCAL REFRESH (2026-06-22, current b7bf3d2 no-profile,
+TorchInferno-only): the pushed idle-drain stack landed at few_shot 154.3 / 49.8 /
+196.5 ms, self_consistency 244.9 / 0.0 / 365.6 ms, multi_turn 578.8 / 40.6 /
+618.8 ms, tree_of_thought 282.8 / 51.9 / 307.4 ms, and long_output 316.8 /
+28.2 / 1442.6 ms (TTFT/TPOT/E2E). Correctness stayed in family: few 976/1000,
+self 1000/1000, multi 980/1000, tree 959/992, long 1000/1000. The self row is
+the real movement from the idle-drain work; the other rows remain in their local
+variance bands and still need separate levers.
+
 FULL CURRENT LOCAL REFRESH (2026-06-22, current 51fba66 no-profile,
 TorchInferno-only): the pushed default stack landed at few_shot 149.3 / 50.2 /
 189.8 ms, self_consistency 313.4 / 0.0 / 388.7 ms, multi_turn 595.8 / 41.4 /
