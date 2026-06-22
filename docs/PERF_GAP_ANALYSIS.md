@@ -16,9 +16,14 @@ lowering `TORCHINFERNO_OPENAI_TP_ONLINE_MAX_ACTIVE` to 32 is not defaultable.
 With queue profiling enabled it improved the profiled current control from
 248.2 / 52.1 / 306.7 ms (TTFT/TPOT/E2E) to 230.7 / 50.3 / 273.2 ms, but raw
 correctness moved 962/992 -> 958/992. The score-comparable unprofiled run then
-landed at 240.4 / 51.8 / 288.1 ms and 4.7 tok/s, worse than the public default
-tree row above. Keep sampled tree at the 48-row default unless a new hypothesis
-targets the actual TPOT gap without trading away E2E/throughput.
+landed at 240.4 / 51.8 / 288.1 ms and 4.7 tok/s; the unprofiled current default
+control was 230.6 / 52.7 / 269.8 ms and 4.3 tok/s. Disabling continuous ragged
+decode buckets improved local TTFT/E2E to 217.6 / 260.3 ms but regressed TPOT to
+54.0 ms, throughput to 4.3 tok/s, and TPOT p99 to 612.5 ms. Keep sampled tree at
+the 48-row/default bucket policy unless a new hypothesis targets the actual
+public TPOT gap without trading away E2E/throughput. The public/local tree TPOT
+discrepancy remains real: c636428 differs from public 28d7c7c only by docs, yet
+local unprofiled TPOT is still ~52-54 ms while the public row reports 32.1 ms.
 
 ## LATEST RUN 20260621_155659 (built a7e5516): 4/20
 
