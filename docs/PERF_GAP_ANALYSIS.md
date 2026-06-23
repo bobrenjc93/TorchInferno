@@ -1,5 +1,16 @@
 # TorchInferno vs vLLM/sglang — Performance Gap Analysis (Llama-3.1-70B, 8xH100)
 
+## LONG-OUTPUT GREEDY-SHORT INITIAL WAIT (2026-06-23)
+
+The robust symm-off baseline still shows long_output queue/pipeline pressure:
+301.7ms TTFT, 31.8ms TPOT, 1674.9ms E2E, and 23.8 tok/s. The prior focused
+10ms greedy-short initial-wait run completed 1000/1000 correct and improved the
+score-facing decode/E2E/throughput cells versus the 5ms-style baseline
+(27.4ms TPOT, 1456.9ms E2E, 28.4 tok/s), at the cost of a small median TTFT
+increase. Promote the 10ms default only for deterministic max_tokens<=128
+online sessions; sampled self/tree, few_shot, and multi_turn stay on their
+existing policies.
+
 ## OPENAI TP STARTUP RECHECK (2026-06-23, current 684af9b)
 
 Public run `20260623_160941` still used stale TorchInferno bits and failed
