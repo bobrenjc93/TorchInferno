@@ -10015,31 +10015,41 @@ def _tensor_parallel_symm_mem_allreduce_probe_command(config: OpenAIServerConfig
 
 def _run_tensor_parallel_symm_mem_allreduce_probe(config: OpenAIServerConfig) -> bool:
     timeout_s = env_float("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_PROBE_TIMEOUT_S", 90.0, minimum=1.0)
-    env = os.environ.copy()
-    env["TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_PROBE"] = "1"
-    env["TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE"] = "1"
-    env.setdefault(
-        "TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_PROBE_MAX_BATCH",
-        str(env_int("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_MAX_BATCH", 64, minimum=1)),
+    attempts = env_int("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_PROBE_ATTEMPTS", 2, minimum=1)
+    retry_delay_s = env_float(
+        "TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_PROBE_RETRY_DELAY_S",
+        2.0,
+        minimum=0.0,
     )
     command = _tensor_parallel_symm_mem_allreduce_probe_command(config)
-    proc = subprocess.Popen(
-        command,
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        start_new_session=True,
-    )
-    try:
-        _stdout, stderr = proc.communicate(timeout=timeout_s)
-    except subprocess.TimeoutExpired:
-        _terminate_process_group(proc)
-        return False
-    if proc.returncode == 0:
-        return True
-    if env_flag("TORCHINFERNO_OPTIONAL_WARNINGS", False) and stderr:
-        print(stderr[-4000:], file=sys.stderr, flush=True)
+    for attempt in range(attempts):
+        env = os.environ.copy()
+        env["TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_PROBE"] = "1"
+        env["TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE"] = "1"
+        env.setdefault(
+            "TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_PROBE_MAX_BATCH",
+            str(env_int("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_MAX_BATCH", 64, minimum=1)),
+        )
+        proc = subprocess.Popen(
+            command,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+        try:
+            _stdout, stderr = proc.communicate(timeout=timeout_s)
+        except subprocess.TimeoutExpired:
+            _terminate_process_group(proc)
+            stderr = ""
+        else:
+            if proc.returncode == 0:
+                return True
+            if env_flag("TORCHINFERNO_OPTIONAL_WARNINGS", False) and stderr:
+                print(stderr[-4000:], file=sys.stderr, flush=True)
+        if attempt + 1 < attempts and retry_delay_s > 0.0:
+            time.sleep(retry_delay_s)
     return False
 
 

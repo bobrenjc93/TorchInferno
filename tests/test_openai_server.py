@@ -7725,6 +7725,37 @@ def test_openai_symm_mem_probe_timeout_default_and_override(
     assert observed_timeouts == [expected_timeout]
 
 
+def test_openai_symm_mem_probe_retries_transient_failure(monkeypatch) -> None:
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_PROBE_ATTEMPTS", "2")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_PROBE_RETRY_DELAY_S", "0")
+    returncodes = [1, 0]
+    observed_envs: list[dict[str, str]] = []
+
+    class FakeProbeProcess:
+        pid = 12345
+
+        def __init__(self, returncode: int) -> None:
+            self.returncode = returncode
+
+        def communicate(self, timeout: float | None = None) -> tuple[str, str]:
+            return "", "transient probe failure"
+
+    def fake_popen(command, **kwargs):
+        assert command[-1] == "torchinferno.openai_server"
+        observed_envs.append(kwargs["env"])
+        return FakeProbeProcess(returncodes.pop(0))
+
+    monkeypatch.setattr("torchinferno.openai_server.subprocess.Popen", fake_popen)
+
+    config = OpenAIServerConfig(model="meta-llama/Llama-3.1", tensor_parallel_size=8)
+    assert _run_tensor_parallel_symm_mem_allreduce_probe(config) is True
+    assert len(observed_envs) == 2
+    assert not returncodes
+    for env in observed_envs:
+        assert env["TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_PROBE"] == "1"
+        assert env["TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE"] == "1"
+
+
 def test_openai_symm_mem_probe_batches_cover_warmup_rows(monkeypatch) -> None:
     monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_PROBE_BATCHES", raising=False)
     batches = _tensor_parallel_symm_mem_allreduce_probe_batches(64)
