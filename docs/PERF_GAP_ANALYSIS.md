@@ -1,5 +1,21 @@
 # TorchInferno vs vLLM/sglang — Performance Gap Analysis (Llama-3.1-70B, 8xH100)
 
+## LOCAL MULTI-TURN LARGE-CAP RECHECK (2026-06-23, current 0d8749e + env)
+
+The public `20260623_142642` run is still stale with respect to the pushed
+NCCL CUMEM startup guard and symm-mem probe retry: TorchInferno failed to become
+ready there. Local repeated TP8 startup on the current tree succeeds with
+`NCCL_CUMEM_ENABLE=0` and symmetric-memory allreduce enabled after the probe.
+
+For the remaining multi_turn gap, the 512-token greedy path was rechecked with
+`TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_MAX_ACTIVE=32`. Current `0d8749e`
+landed at 464.8ms TTFT, 64.6ms TPOT, 531.3ms E2E, and 2.2 tok/s, 979/1000 raw
+correct. That matches the two earlier focused rechecks (464.7 / 65.2 / 530.7
+and 478.0 / 64.7 / 548.3) and improves over the default 16-row band from recent
+full/local runs (about 594-614ms TTFT and 631-659ms E2E). Promote 32 rows for
+deterministic 401-512 token online sessions; it is scoped away from sampled
+self/tree and short greedy long_output.
+
 ## LATEST RUN 20260622_060431 (built bc3b9ea): 1/20
 
 TorchInferno fell to 1/20 (vLLM 18/20, SGLang 0/20). The only public win is
