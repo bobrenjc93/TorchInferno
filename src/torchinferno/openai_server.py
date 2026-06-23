@@ -9939,10 +9939,10 @@ def _prepare_tensor_parallel_symm_mem_allreduce_auto(config: OpenAIServerConfig)
         return
     if raw_openai is not None and raw_openai.strip().lower() not in {"auto", "probe"}:
         return
-    # Symmetric-memory allreduce can hang inside rendezvous on some TP hosts even
-    # after a standalone probe succeeds. Keep OpenAI serving on the NCCL path
-    # unless callers explicitly opt into the probe or force the feature on.
-    if not env_flag("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_AUTO_PROBE", False):
+    # Symmetric-memory allreduce can hang inside rendezvous on some TP hosts.
+    # Keep the serving process itself on NCCL if the preflight probe hangs or
+    # fails, but default to probing so healthy hosts keep the decode allreduce win.
+    if not env_flag("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_AUTO_PROBE", True):
         os.environ[openai_env] = "0"
         return
     if int(getattr(config, "tensor_parallel_size", 1)) <= 1:
@@ -9985,6 +9985,10 @@ def _run_tensor_parallel_symm_mem_allreduce_probe(config: OpenAIServerConfig) ->
     env = os.environ.copy()
     env["TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_PROBE"] = "1"
     env["TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE"] = "1"
+    env.setdefault(
+        "TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_PROBE_MAX_BATCH",
+        str(env_int("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_MAX_BATCH", 64, minimum=1)),
+    )
     command = _tensor_parallel_symm_mem_allreduce_probe_command(config)
     proc = subprocess.Popen(
         command,
@@ -14239,6 +14243,20 @@ def config_from_args(args: argparse.Namespace) -> OpenAIServerConfig:
     )
 
 
+def _tensor_parallel_symm_mem_allreduce_probe_batches(max_batch: int) -> tuple[int, ...]:
+    configured = os.environ.get("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_PROBE_BATCHES")
+    if configured is not None:
+        requested = _parse_positive_int_csv(configured)
+    else:
+        requested = (
+            *_warmup_ragged_decode_row_counts(),
+            *_warmup_ragged_decode_batch_sizes(),
+            max_batch,
+        )
+    batches = sorted({int(batch) for batch in requested if 1 <= int(batch) <= max_batch})
+    return tuple(batches) or (1,)
+
+
 def _run_tensor_parallel_symm_mem_allreduce_probe_worker() -> int:
     if not torch.cuda.is_available():
         return 1
@@ -14252,11 +14270,34 @@ def _run_tensor_parallel_symm_mem_allreduce_probe_worker() -> int:
     try:
         group_name = dist.group.WORLD.group_name
         hidden = env_int("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_PROBE_HIDDEN", 8192, minimum=1)
-        buffer = symm_mem.empty((1, hidden), device=device, dtype=torch.bfloat16)
-        symm_mem.rendezvous(buffer, group_name)
-        buffer.zero_()
-        torch.ops.symm_mem.multimem_all_reduce_(buffer, "sum", group_name)
-        torch.cuda.synchronize(device)
+        max_batch = env_int("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_PROBE_MAX_BATCH", 64, minimum=1)
+        rank_value = float(dist.get_rank() + 1)
+        expected = float(dist.get_world_size() * (dist.get_world_size() + 1) // 2)
+        capture_graph = env_flag("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_PROBE_GRAPH", True)
+        buffers: list[Tensor] = []
+        graphs: list[torch.cuda.CUDAGraph] = []
+        for batch in _tensor_parallel_symm_mem_allreduce_probe_batches(max_batch):
+            for _name in ("attention", "mlp"):
+                buffer = symm_mem.empty((batch, 1, hidden), device=device, dtype=torch.bfloat16)
+                buffers.append(buffer)
+                symm_mem.rendezvous(buffer, group_name)
+                buffer.fill_(rank_value)
+                torch.ops.symm_mem.multimem_all_reduce_(buffer, "sum", group_name)
+                torch.cuda.synchronize(device)
+                if float(buffer.flatten()[0].item()) != expected:
+                    return 1
+                if capture_graph:
+                    buffer.fill_(rank_value)
+                    torch.cuda.synchronize(device)
+                    graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(graph):
+                        torch.ops.symm_mem.multimem_all_reduce_(buffer, "sum", group_name)
+                    graphs.append(graph)
+                    graph.replay()
+                    torch.cuda.synchronize(device)
+                    if float(buffer.flatten()[0].item()) != expected:
+                        return 1
+        dist.barrier(device_ids=[local_rank])
         return 0
     finally:
         dist.destroy_process_group()

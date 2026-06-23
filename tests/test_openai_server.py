@@ -136,6 +136,7 @@ from torchinferno.openai_server import (
     _shared_prefix_padded_suffix_bucketed_length,
     _shared_prefix_ragged_decode_row_plan,
     _tensor_parallel_symm_mem_allreduce_scope,
+    _tensor_parallel_symm_mem_allreduce_probe_batches,
     _tensor_parallel_token_budget_lifecycle,
     _token_budget_scheduler_for_group,
     _token_budget_decode_run_payload,
@@ -7608,10 +7609,30 @@ def test_openai_symm_mem_auto_probe_sets_worker_env_on_failure(monkeypatch) -> N
     assert os.environ["TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE"] == "0"
 
 
-def test_openai_symm_mem_auto_probe_defaults_off(monkeypatch) -> None:
+def test_openai_symm_mem_auto_probe_defaults_on(monkeypatch) -> None:
     monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE", raising=False)
     monkeypatch.delenv("TORCHINFERNO_SYMM_MEM_ALLREDUCE", raising=False)
     monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_AUTO_PROBE", raising=False)
+    calls: list[int] = []
+
+    def fake_probe(config: OpenAIServerConfig) -> bool:
+        calls.append(config.tensor_parallel_size)
+        return True
+
+    monkeypatch.setattr("torch.cuda.is_available", lambda: True)
+    monkeypatch.setattr("torchinferno.openai_server._run_tensor_parallel_symm_mem_allreduce_probe", fake_probe)
+
+    config = OpenAIServerConfig(model="meta-llama/Llama-3.1", tensor_parallel_size=8)
+    _prepare_tensor_parallel_symm_mem_allreduce_auto(config)
+
+    assert calls == [8]
+    assert os.environ["TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE"] == "1"
+
+
+def test_openai_symm_mem_auto_probe_can_be_disabled(monkeypatch) -> None:
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_SYMM_MEM_ALLREDUCE", raising=False)
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_AUTO_PROBE", "0")
     calls: list[int] = []
 
     def fake_probe(config: OpenAIServerConfig) -> bool:
@@ -7653,6 +7674,7 @@ def test_openai_symm_mem_probe_timeout_default_and_override(
         assert command[-1] == "torchinferno.openai_server"
         assert kwargs["env"]["TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_PROBE"] == "1"
         assert kwargs["env"]["TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE"] == "1"
+        assert kwargs["env"]["TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_PROBE_MAX_BATCH"] == "64"
         assert kwargs["start_new_session"] is True
         return FakeProbeProcess()
 
@@ -7661,6 +7683,16 @@ def test_openai_symm_mem_probe_timeout_default_and_override(
     config = OpenAIServerConfig(model="meta-llama/Llama-3.1", tensor_parallel_size=8)
     assert _run_tensor_parallel_symm_mem_allreduce_probe(config) is True
     assert observed_timeouts == [expected_timeout]
+
+
+def test_openai_symm_mem_probe_batches_cover_warmup_rows(monkeypatch) -> None:
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_PROBE_BATCHES", raising=False)
+    batches = _tensor_parallel_symm_mem_allreduce_probe_batches(64)
+
+    assert batches == (1, 2, 3, 4, 5, 6, 7, 8, 16, 24, 32, 40, 48, 56, 64)
+
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_PROBE_BATCHES", "4,128,2,4")
+    assert _tensor_parallel_symm_mem_allreduce_probe_batches(64) == (2, 4)
 
 
 def test_openai_symm_mem_auto_probe_honors_explicit_env(monkeypatch) -> None:
