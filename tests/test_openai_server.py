@@ -56,6 +56,7 @@ from torchinferno.openai_server import (
     _TP_COMMAND_TOKEN_BUDGET_STEP,
     _TransformersChatTokenizer,
     _StreamRowState,
+    build_engine,
     _broadcast_tensor_parallel_generate,
     _broadcast_tensor_parallel_generate_prompt_lists,
     _broadcast_tensor_parallel_online_close,
@@ -704,6 +705,23 @@ def test_load_chat_tokenizer_defaults_tiny_model_to_byte_tokenizer() -> None:
     tokenizer = load_chat_tokenizer(config, vocab_size=16)
 
     assert isinstance(tokenizer, _ByteFallbackTokenizer)
+
+
+def test_build_engine_skips_transformers_tokenizer_on_tensor_parallel_workers(monkeypatch) -> None:
+    model = types.SimpleNamespace(config=types.SimpleNamespace(vocab_size=32))
+
+    monkeypatch.setattr("torchinferno.openai_server._load_model", lambda config: (model, torch.device("cpu")))
+    monkeypatch.setattr("torchinferno.openai_server._is_tensor_parallel_worker_model", lambda candidate: candidate is model)
+
+    def fail_load_chat_tokenizer(config: OpenAIServerConfig, vocab_size: int) -> object:
+        raise AssertionError("worker ranks should not load the text tokenizer")
+
+    monkeypatch.setattr("torchinferno.openai_server.load_chat_tokenizer", fail_load_chat_tokenizer)
+
+    engine = build_engine(OpenAIServerConfig(model="meta-llama/Meta-Llama-3.1-70B-Instruct"))
+
+    assert isinstance(engine.tokenizer, _ByteFallbackTokenizer)
+    assert engine.tokenizer.vocab_size == 32
 
 
 def test_chat_template_batch_encoding_input_ids_are_extracted() -> None:

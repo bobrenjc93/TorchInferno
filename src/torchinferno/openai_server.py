@@ -9841,7 +9841,11 @@ class OpenAICompletionEngine:
 def build_engine(config: OpenAIServerConfig) -> OpenAICompletionEngine:
     model, device = _load_model(config)
     vocab_size = int(getattr(getattr(model, "config", object()), "vocab_size", 256))
-    tokenizer = load_chat_tokenizer(config, vocab_size)
+    tokenizer = (
+        _ByteFallbackTokenizer(vocab_size)
+        if _is_tensor_parallel_worker_model(model)
+        else load_chat_tokenizer(config, vocab_size)
+    )
     return OpenAICompletionEngine(
         model,
         tokenizer,
