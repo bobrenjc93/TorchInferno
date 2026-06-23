@@ -351,9 +351,11 @@ def _online_persistent_idle_ms(*, temperature: float, max_tokens: int) -> float:
         minimum=1,
     ):
         # Short sampled bursts often arrive in small waves from client worker
-        # pools. Keeping the online session open briefly preserves the prefix
-        # cache across those waves without raising prefill/decode batch sizes.
-        default_idle_ms = 100.0
+        # pools. Keeping the online session open across those gaps preserves the
+        # prefix cache and avoids restarting the online batcher for each wave.
+        # Local TP8 70B self-consistency A/B: 500ms cut median TTFT/E2E from
+        # 448.2/538.8ms to 319.8/430.1ms while preserving correctness.
+        default_idle_ms = 500.0
     return env_float(
         "TORCHINFERNO_OPENAI_TP_ONLINE_PERSISTENT_IDLE_MS",
         default_idle_ms,
