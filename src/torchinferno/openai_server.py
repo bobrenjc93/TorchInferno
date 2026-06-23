@@ -255,12 +255,11 @@ def _online_kv_token_budget(*, temperature: float, max_tokens: int) -> int:
                 minimum=1,
             )
         return env_int("TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_LONG_KV_TOKEN_BUDGET", 64 * 512, minimum=1)
-    # Greedy short-output bursts such as long_output only use 64 client workers,
-    # but the continuous batcher still benefits from the full 128-row KV-bounded
-    # cap as scratch/padding capacity for suffix prefill. The persistent startup
-    # cache is already sized for this cap, so the higher token budget changes
-    # admission policy without increasing the resident cache allocation.
-    return env_int("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_KV_TOKEN_BUDGET", 128 * 512, minimum=1)
+    # Greedy short-output bursts benefit from a KV-token cap above the base
+    # 48-row policy, but local TP8 rechecks showed the full 128-row cap adds
+    # decode pressure without a stable prefill win. Keep the steadier 32K budget
+    # as the default and leave larger caps as explicit env overrides.
+    return env_int("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_KV_TOKEN_BUDGET", 64 * 512, minimum=1)
 
 
 def _online_decode_quantum(*, temperature: float, max_tokens: int) -> int:

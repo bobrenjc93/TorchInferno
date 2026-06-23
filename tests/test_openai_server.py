@@ -7944,7 +7944,7 @@ def test_online_kv_token_budget_uses_sampled_short_default(monkeypatch) -> None:
 
     assert _online_kv_token_budget(temperature=0.7, max_tokens=256) == 128 * 512
     assert _online_kv_token_budget(temperature=0.7, max_tokens=300) == 64 * 512
-    assert _online_kv_token_budget(temperature=0.0, max_tokens=64) == 128 * 512
+    assert _online_kv_token_budget(temperature=0.0, max_tokens=64) == 64 * 512
 
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_KV_TOKEN_BUDGET", "49152")
     assert _online_kv_token_budget(temperature=0.7, max_tokens=256) == 49152
@@ -11537,7 +11537,7 @@ def test_openai_tensor_parallel_online_batcher_boost_uses_admitted_max_tokens(
         "start",
         {
             "max_seq_len": 311,
-            "max_active_requests": 128,
+            "max_active_requests": 105,
             "prefix_cache_capacity": 1,
             "prefill_token_budget": None,
             "temperature": 0.0,
