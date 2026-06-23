@@ -11472,12 +11472,6 @@ def _tensor_parallel_worker_loop(engine: OpenAICompletionEngine) -> None:
                         try:
                             worker_model = getattr(engine, "model")
                             worker_cache_backend = str(getattr(engine, "cache_backend", "dense"))
-                            if hasattr(worker_model, "forward_step_flashinfer"):
-                                try:
-                                    import flashinfer as _fi_check  # noqa: F401
-                                    worker_cache_backend = "flashinfer"
-                                except ImportError:
-                                    pass
                             worker_shared_cache = _allocate_cache(
                                 worker_model, total_rows,
                                 _generation_cache_capacity(worker_model, max_seq_len),

@@ -1015,11 +1015,15 @@ def test_tensor_parallel_worker_loop_rebuilds_incompatible_online_cache(monkeypa
     class Model:
         def __init__(self) -> None:
             self.allocated_shapes: list[tuple[int, int]] = []
+            self.allocated_backends: list[object] = []
 
         def allocate_cache(self, batch_size: int, max_seq_len: int, **kwargs: object) -> Cache:
-            del kwargs
             self.allocated_shapes.append((batch_size, max_seq_len))
+            self.allocated_backends.append(kwargs.get("cache_backend"))
             return Cache(max_seq_len=max_seq_len, batch_size=batch_size)
+
+        def forward_step_flashinfer(self, *args: object, **kwargs: object) -> object:
+            raise AssertionError("cache allocation must not depend on flashinfer decode support")
 
     class RuntimeEngine:
         def __init__(self, *args: object, **kwargs: object) -> None:
@@ -1036,6 +1040,7 @@ def test_tensor_parallel_worker_loop_rebuilds_incompatible_online_cache(monkeypa
     monkeypatch.setattr(dist, "is_available", lambda: True)
     monkeypatch.setattr(dist, "is_initialized", lambda: True)
     monkeypatch.setattr(dist, "broadcast_object_list", broadcast_object_list)
+    monkeypatch.setitem(sys.modules, "flashinfer", types.SimpleNamespace())
     monkeypatch.setattr("torchinferno.openai_server._RuntimeContinuousBatchEngine", RuntimeEngine)
     monkeypatch.setattr("torchinferno.openai_server._reset_generation_cache", lambda cache: True)
     monkeypatch.setattr(
@@ -1055,6 +1060,7 @@ def test_tensor_parallel_worker_loop_rebuilds_incompatible_online_cache(monkeypa
 
     assert commands == []
     assert model.allocated_shapes == [(6, 16)]
+    assert model.allocated_backends == ["dense"]
     assert started_caches == [engine._persistent_serving_cache]
     assert engine._persistent_serving_cache is not stale_cache
 
