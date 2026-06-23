@@ -95,6 +95,7 @@ from torchinferno.openai_server import (
     _online_common_prefix_suffix_prefill_warmup_tokens,
     _online_admit_per_step_cap,
     _online_collect_idle_arrivals_enabled,
+    _online_decode_warmup_batch_sizes,
     _online_decode_many_enabled,
     _online_decode_quantum,
     _online_idle_batch_wait_ms,
@@ -555,6 +556,37 @@ def test_openai_server_warmup_uses_generic_shape_buckets(monkeypatch) -> None:
     assert set(_warmup_ragged_decode_cache_token_counts()) >= {256, 512}
     assert (64, 1024) in set(_warmup_ragged_decode_extra_cache_specs())
     assert _warmup_ragged_decode_prompt_tokens(64) == 64
+
+
+def test_openai_decode_warmup_excludes_prefix_cache_rows() -> None:
+    assert _online_decode_warmup_batch_sizes(max_active=128, cache_batch=144) == (
+        1,
+        2,
+        4,
+        8,
+        16,
+        32,
+        64,
+        128,
+    )
+    assert _online_decode_warmup_batch_sizes(max_active=48, cache_batch=112) == (
+        1,
+        2,
+        4,
+        8,
+        16,
+        32,
+        48,
+    )
+    assert _online_decode_warmup_batch_sizes(max_active=128, cache_batch=64) == (
+        1,
+        2,
+        4,
+        8,
+        16,
+        32,
+        64,
+    )
 
 
 def test_openai_temperature_warmup_uses_configured_batch_size(monkeypatch) -> None:

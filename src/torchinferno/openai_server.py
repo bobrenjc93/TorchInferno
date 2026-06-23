@@ -126,6 +126,16 @@ def _flashinfer_prefill_warmup_batch_sizes(batch_sizes: Sequence[int]) -> tuple[
     return tuple(sorted({1, capped_batch}))
 
 
+def _online_decode_warmup_batch_sizes(*, max_active: int, cache_batch: int) -> tuple[int, ...]:
+    active_limit = min(max(1, int(max_active)), max(1, int(cache_batch)))
+    batch_sizes = {active_limit}
+    bucket = 1
+    while bucket <= active_limit:
+        batch_sizes.add(bucket)
+        bucket *= 2
+    return tuple(sorted(batch_sizes))
+
+
 def _flashinfer_prefill_runtime_enabled() -> bool:
     return not env_flag("TORCHINFERNO_CONTINUOUS_FLASHINFER_PREFILL_DISABLE", True)
 
@@ -2280,19 +2290,17 @@ class OpenAICompletionEngine:
             pass
         prompt_tokens = env_int("TORCHINFERNO_OPENAI_WARMUP_PROMPT_TOKENS", 32, minimum=1)
         # Decode touches only active rows (<= max_active), addressed via row
-        # indices, so warm the active-range buckets, not the full cache size.
-        # Include EVERY power of two up to the cache size: the ragged decode path
+        # indices, so warm the active-range buckets, not prefix-cache rows.
+        # Include EVERY power of two up to the active cap: the ragged decode path
         # rounds the active count up to the next pow2 bucket, so a missing pow2
-        # (e.g. 64 when max_active=128) drops that range to eager decode.
-        _pow2 = set()
-        _p = 1
-        while _p <= cache_batch:
-            _pow2.add(_p)
-            _p *= 2
-        batch_sizes = sorted(
-            (_pow2 | {max_active, cache_batch})
-            & set(range(1, cache_batch + 1))
-        )
+        # (e.g. 64 when max_active=128) drops that range to eager decode. Prefix
+        # rows are only copied during prefill; warming cache_batch would capture a
+        # 144-row decode graph under the default 128 active + 16 prefix envelope
+        # even though no decode step can use it.
+        batch_sizes = list(_online_decode_warmup_batch_sizes(
+            max_active=max_active,
+            cache_batch=cache_batch,
+        ))
         with _tensor_parallel_symm_mem_allreduce_scope(
             self.model, self.device, max_tokens=1, temperature=0.0,
         ):
