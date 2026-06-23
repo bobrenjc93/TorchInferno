@@ -11979,6 +11979,15 @@ def test_openai_tensor_parallel_online_max_active_uses_greedy_large_default(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_MAX_ACTIVE", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_MAX_ACTIVE", raising=False)
+    monkeypatch.delenv(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_MAX_ACTIVE_MIN_TOKENS",
+        raising=False,
+    )
+    monkeypatch.delenv(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_MAX_ACTIVE_MAX_TOKENS",
+        raising=False,
+    )
     monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_MID_MAX_ACTIVE", raising=False)
     monkeypatch.delenv(
         "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_MID_MAX_ACTIVE_MIN_TOKENS",
@@ -12016,8 +12025,13 @@ def test_openai_tensor_parallel_online_max_active_uses_greedy_large_default(
     assert engine._online_serving_max_active(temperature=0.0, max_tokens=512) == 32
     assert engine._online_serving_max_active(temperature=0.0, max_tokens=513) == 48
     assert engine._online_serving_max_active(temperature=0.7, max_tokens=256) == 48
+    assert engine._online_serving_max_active(temperature=0.7, max_tokens=300) == 32
+    assert engine._online_serving_max_active(temperature=0.7, max_tokens=301) == 48
     assert engine._online_serving_max_active(temperature=0.7, max_tokens=512) == 48
 
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_MAX_ACTIVE", "36")
+    assert engine._online_serving_max_active(temperature=0.7, max_tokens=300) == 36
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_MAX_ACTIVE", raising=False)
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_MID_MAX_ACTIVE", "32")
     assert engine._online_serving_max_active(temperature=0.0, max_tokens=256) == 32
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_MAX_ACTIVE", "24")

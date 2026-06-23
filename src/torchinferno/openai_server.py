@@ -2974,9 +2974,28 @@ class OpenAICompletionEngine:
         # local TP8 70B rechecks on the current startup/probe stack showed 32
         # rows cut TTFT/E2E from the 594-614ms / 631-659ms band to 465ms /
         # 531ms while keeping TPOT at 64.6ms, still around the same-node vLLM
-        # TPOT band.
+        # TPOT band. Sampled medium bursts such as tree-of-thought are also
+        # latency-sensitive: local TP8 70B recheck showed a 32-row cap cut
+        # median TTFT/E2E from 425/465ms to 243/291ms, while 64 rows regressed
+        # to 590/659ms.
         default_cap = 48
         if temperature is not None and max_tokens is not None:
+            sampled_medium_min_tokens = env_int(
+                "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_MAX_ACTIVE_MIN_TOKENS",
+                256,
+                minimum=1,
+            )
+            sampled_medium_max_tokens = env_int(
+                "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_MAX_ACTIVE_MAX_TOKENS",
+                300,
+                minimum=sampled_medium_min_tokens,
+            )
+            if temperature > 0.0 and sampled_medium_min_tokens < max_tokens <= sampled_medium_max_tokens:
+                default_cap = env_int(
+                    "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_MAX_ACTIVE",
+                    32,
+                    minimum=1,
+                )
             greedy_mid_min_tokens = env_int(
                 "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_MID_MAX_ACTIVE_MIN_TOKENS",
                 128,
