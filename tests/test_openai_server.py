@@ -8260,11 +8260,27 @@ def test_openai_online_initial_batch_wait_uses_sampled_short_default(monkeypatch
         "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_INITIAL_BATCH_WAIT_MAX_TOKENS",
         raising=False,
     )
+    monkeypatch.delenv(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_INITIAL_BATCH_WAIT_MS",
+        raising=False,
+    )
+    monkeypatch.delenv(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_INITIAL_BATCH_WAIT_MIN_TOKENS",
+        raising=False,
+    )
+    monkeypatch.delenv(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_INITIAL_BATCH_WAIT_MAX_TOKENS",
+        raising=False,
+    )
 
     assert _online_initial_batch_wait_ms(temperature=0.7, max_tokens=256) == 10.0
     assert _online_initial_batch_wait_ms(temperature=0.0, max_tokens=64) == 10.0
     assert _online_initial_batch_wait_ms(temperature=0.0, max_tokens=128) == 10.0
     assert _online_initial_batch_wait_ms(temperature=0.0, max_tokens=256) == 1.0
+    assert _online_initial_batch_wait_ms(temperature=0.0, max_tokens=400) == 1.0
+    assert _online_initial_batch_wait_ms(temperature=0.0, max_tokens=401) == 5.0
+    assert _online_initial_batch_wait_ms(temperature=0.0, max_tokens=512) == 5.0
+    assert _online_initial_batch_wait_ms(temperature=0.0, max_tokens=513) == 1.0
     assert _online_initial_batch_wait_ms(temperature=0.7, max_tokens=257) == 10.0
     assert _online_initial_batch_wait_ms(temperature=0.7, max_tokens=300) == 10.0
     assert _online_initial_batch_wait_ms(temperature=0.7, max_tokens=301) == 1.0
@@ -8315,6 +8331,22 @@ def test_openai_online_initial_batch_wait_respects_env_overrides(monkeypatch) ->
     )
     assert _online_initial_batch_wait_ms(temperature=0.0, max_tokens=160) == 9.0
     assert _online_initial_batch_wait_ms(temperature=0.0, max_tokens=161) == 1.0
+    monkeypatch.setenv(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_INITIAL_BATCH_WAIT_MS",
+        "8",
+    )
+    monkeypatch.setenv(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_INITIAL_BATCH_WAIT_MIN_TOKENS",
+        "300",
+    )
+    monkeypatch.setenv(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_INITIAL_BATCH_WAIT_MAX_TOKENS",
+        "512",
+    )
+    assert _online_initial_batch_wait_ms(temperature=0.0, max_tokens=300) == 1.0
+    assert _online_initial_batch_wait_ms(temperature=0.0, max_tokens=301) == 8.0
+    assert _online_initial_batch_wait_ms(temperature=0.0, max_tokens=512) == 8.0
+    assert _online_initial_batch_wait_ms(temperature=0.0, max_tokens=513) == 1.0
 
 
 def test_online_common_prefix_prefill_warmup_filters_shapes(monkeypatch) -> None:
