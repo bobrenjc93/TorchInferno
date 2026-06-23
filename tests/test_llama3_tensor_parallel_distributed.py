@@ -5,6 +5,7 @@ import os
 import subprocess
 import sys
 import textwrap
+from datetime import timedelta
 from pathlib import Path
 
 import pytest
@@ -154,6 +155,39 @@ def test_tensor_parallel_local_checkpoint_bypasses_distributed_broadcast(tmp_pat
     )
 
     assert root == checkpoint
+
+
+def test_tensor_parallel_checkpoint_tensor_broadcast_is_opt_in(monkeypatch) -> None:
+    monkeypatch.setattr(tensor_parallel_module.dist, "is_available", lambda: True)
+    monkeypatch.setattr(tensor_parallel_module.dist, "is_initialized", lambda: True)
+    monkeypatch.delenv("TORCHINFERNO_TP_RANK0_CHECKPOINT_BROADCAST", raising=False)
+
+    assert not tensor_parallel_module._rank0_checkpoint_broadcast_enabled(
+        device=torch.device("cuda"),
+        world_size=2,
+        dtype=torch.bfloat16,
+    )
+
+    monkeypatch.setenv("TORCHINFERNO_TP_RANK0_CHECKPOINT_BROADCAST", "1")
+    assert tensor_parallel_module._rank0_checkpoint_broadcast_enabled(
+        device=torch.device("cuda"),
+        world_size=2,
+        dtype=torch.bfloat16,
+    )
+
+    assert not tensor_parallel_module._rank0_checkpoint_broadcast_enabled(
+        device=torch.device("cpu"),
+        world_size=2,
+        dtype=torch.bfloat16,
+    )
+
+
+def test_tensor_parallel_process_group_timeout_is_configurable(monkeypatch) -> None:
+    monkeypatch.delenv("TORCHINFERNO_TP_PROCESS_GROUP_TIMEOUT_S", raising=False)
+    assert tensor_parallel_module._tensor_parallel_process_group_timeout() == timedelta(seconds=1800)
+
+    monkeypatch.setenv("TORCHINFERNO_TP_PROCESS_GROUP_TIMEOUT_S", "2400")
+    assert tensor_parallel_module._tensor_parallel_process_group_timeout() == timedelta(seconds=2400)
 
 
 def test_llama3_tensor_parallel_paged_cache_matches_dense_forward(tmp_path, monkeypatch) -> None:

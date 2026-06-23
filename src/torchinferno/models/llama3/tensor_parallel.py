@@ -6,6 +6,7 @@ import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import timedelta
 from pathlib import Path
 
 import torch
@@ -5450,7 +5451,11 @@ def _init_distributed_if_needed() -> None:
     if "RANK" not in os.environ or "WORLD_SIZE" not in os.environ:
         return
     backend = "nccl" if torch.cuda.is_available() else "gloo"
-    dist.init_process_group(backend=backend)
+    dist.init_process_group(backend=backend, timeout=_tensor_parallel_process_group_timeout())
+
+
+def _tensor_parallel_process_group_timeout() -> timedelta:
+    return timedelta(seconds=_tp_int("TORCHINFERNO_TP_PROCESS_GROUP_TIMEOUT_S", 1800, minimum=1))
 
 
 def _resolve_tensor_parallel_checkpoint(
@@ -5491,7 +5496,10 @@ def _rank0_checkpoint_broadcast_enabled(
         return False
     if not dist.is_available() or not dist.is_initialized():
         return False
-    return _tp_flag("TORCHINFERNO_TP_RANK0_CHECKPOINT_BROADCAST", True)
+    # Rank-0 tensor broadcast is fast on hot local checkpoints, but on cold or
+    # slow-backed snapshots nonzero ranks enter a giant NCCL broadcast while rank
+    # 0 is still loading the tensor and can trip the watchdog. Keep it opt-in.
+    return _tp_flag("TORCHINFERNO_TP_RANK0_CHECKPOINT_BROADCAST", False)
 
 
 def _load_checkpoint_tensor(
