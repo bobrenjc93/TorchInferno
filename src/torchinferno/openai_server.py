@@ -353,10 +353,11 @@ def _online_persistent_idle_ms(*, temperature: float, max_tokens: int) -> float:
         # Short sampled bursts often arrive in small waves from client worker
         # pools. Keeping the online session open across those gaps preserves the
         # prefix cache and avoids restarting the online batcher for each wave.
-        # Local TP8 70B self-consistency A/B: 1000ms cut median TTFT/E2E from
-        # 383.9/457.6ms to 279.9/428.9ms while preserving correctness. The
-        # sampled few-shot path kept median TTFT flat at 166.7ms.
-        default_idle_ms = 1000.0
+        # Local TP8 70B self-consistency A/B: 750ms cut median TTFT/E2E from
+        # 383.9/457.6ms to 256.5/399.4ms while preserving correctness. The
+        # sampled few-shot path stayed flat at 1000ms, so keep this in the same
+        # conservative range without stretching idle cleanup further.
+        default_idle_ms = 750.0
     return env_float(
         "TORCHINFERNO_OPENAI_TP_ONLINE_PERSISTENT_IDLE_MS",
         default_idle_ms,

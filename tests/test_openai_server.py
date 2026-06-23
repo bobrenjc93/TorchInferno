@@ -8130,7 +8130,7 @@ def test_openai_online_persistent_idle_uses_sampled_short_default(monkeypatch) -
     monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_PERSISTENT_IDLE_MS", raising=False)
     monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_SHORT_IDLE_MAX_TOKENS", raising=False)
 
-    assert _online_persistent_idle_ms(temperature=0.7, max_tokens=256) == 1000.0
+    assert _online_persistent_idle_ms(temperature=0.7, max_tokens=256) == 750.0
     assert _online_persistent_idle_ms(temperature=0.0, max_tokens=256) == 10.0
     assert _online_persistent_idle_ms(temperature=0.7, max_tokens=300) == 10.0
 
@@ -8141,7 +8141,7 @@ def test_openai_online_persistent_idle_respects_env_overrides(monkeypatch) -> No
 
     monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_PERSISTENT_IDLE_MS", raising=False)
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_SHORT_IDLE_MAX_TOKENS", "300")
-    assert _online_persistent_idle_ms(temperature=0.7, max_tokens=300) == 1000.0
+    assert _online_persistent_idle_ms(temperature=0.7, max_tokens=300) == 750.0
 
 
 def test_openai_online_idle_batch_wait_uses_sampled_short_default(monkeypatch) -> None:
