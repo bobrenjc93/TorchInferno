@@ -1,5 +1,21 @@
 # TorchInferno vs vLLM/sglang — Performance Gap Analysis (Llama-3.1-70B, 8xH100)
 
+## OPENAI TP STARTUP RECHECK (2026-06-23, current 684af9b)
+
+Public run `20260623_160941` still used stale TorchInferno bits and failed
+readiness after NCCL init. A local focused run reproduced a related startup
+stall after the symm-mem probe had passed: `py-spy` showed rank 0 blocked in
+`torch.distributed._symmetric_memory.rendezvous` / `cuMulticastBindMem` during
+ragged decode graph warmup. Because the serving process cannot safely recover
+from that in-process CUDA rendezvous hang, OpenAI TP now keeps symm-mem
+allreduce default-off and requires explicit opt-in with
+`TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_AUTO_PROBE=1` or
+`TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE=1`. This gives up a measured decode
+TPOT optimization on stable hosts but should move public runs from startup dash
+back to benchmarkable NCCL behavior. Local validation with the patched default
+reached readiness in 231.1s and completed long_output at 100% correctness
+(301.7ms TTFT, 31.8ms TPOT, 1674.9ms E2E).
+
 ## LOCAL MULTI-TURN LARGE-CAP RECHECK (2026-06-23, current 0d8749e + env)
 
 The public `20260623_142642` run is still stale with respect to the pushed

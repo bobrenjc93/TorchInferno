@@ -9974,10 +9974,13 @@ def _prepare_tensor_parallel_symm_mem_allreduce_auto(config: OpenAIServerConfig)
         return
     if raw_openai is not None and raw_openai.strip().lower() not in {"auto", "probe"}:
         return
-    # Symmetric-memory allreduce can hang inside rendezvous on some TP hosts.
-    # Keep the serving process itself on NCCL if the preflight probe hangs or
-    # fails, but default to probing so healthy hosts keep the decode allreduce win.
-    if not env_flag("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_AUTO_PROBE", True):
+    # Symmetric-memory allreduce can hang inside CUDA multicast rendezvous on
+    # some TP hosts. A short preflight probe is not enough: local TP8 repros have
+    # passed the probe and then hung later during ragged decode graph warmup.
+    # Keep the OpenAI server on NCCL by default; operators can still opt in with
+    # TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_AUTO_PROBE=1 or an explicit
+    # TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE=1 after validating their host.
+    if not env_flag("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_AUTO_PROBE", False):
         os.environ[openai_env] = "0"
         return
     if int(getattr(config, "tensor_parallel_size", 1)) <= 1:
