@@ -9890,6 +9890,7 @@ def _distributed_server_command(config: OpenAIServerConfig, argv: Sequence[str])
 
 
 def _reexec_distributed_server(config: OpenAIServerConfig, argv: Sequence[str]) -> None:
+    _prepare_tensor_parallel_nccl_runtime_env(config)
     _prepare_tensor_parallel_symm_mem_allreduce_auto(config)
     command = _distributed_server_command(config, argv)
     print(
@@ -9910,6 +9911,24 @@ def _is_tensor_parallel_model(model: object) -> bool:
 
 def _tensor_parallel_world_size(model: object) -> int:
     return int(getattr(model, "world_size", 1)) if _is_tensor_parallel_model(model) else 1
+
+
+def _prepare_tensor_parallel_nccl_runtime_env(config: OpenAIServerConfig) -> None:
+    if int(getattr(config, "tensor_parallel_size", 1)) <= 1:
+        return
+    if _infer_model_kind(config) != "llama3":
+        return
+    if str(getattr(config, "llama_parallelism", "auto")).lower() == "pipeline":
+        return
+    if not env_flag("TORCHINFERNO_OPENAI_TP_NCCL_CUMEM_DISABLE", True):
+        return
+    if "NCCL_CUMEM_ENABLE" in os.environ:
+        return
+    os.environ["NCCL_CUMEM_ENABLE"] = "0"
+    print(
+        "TorchInferno OpenAI server set NCCL_CUMEM_ENABLE=0 for tensor-parallel startup",
+        flush=True,
+    )
 
 
 def _openai_tp_symm_mem_allreduce_enabled() -> bool:

@@ -109,6 +109,7 @@ from torchinferno.openai_server import (
     _openai_cuda_graph_enabled_for_model,
     _openai_decode_graph_enabled,
     _openai_ragged_decode_graph_enabled,
+    _prepare_tensor_parallel_nccl_runtime_env,
     _prepare_tensor_parallel_symm_mem_allreduce_auto,
     _run_tensor_parallel_symm_mem_allreduce_probe,
     _prefill_cache_only,
@@ -489,6 +490,45 @@ def test_openai_server_auto_launch_honors_configured_rendezvous(monkeypatch) -> 
     assert command[command.index("--rdzv-id") + 1].startswith("torchinferno-openai-")
     assert command[command.index("--rdzv-id") + 1].endswith("-29599")
     assert command[command.index("--rdzv-conf") + 1] == "is_host=true"
+
+
+def test_openai_tensor_parallel_defaults_nccl_cumem_off(monkeypatch) -> None:
+    monkeypatch.delenv("NCCL_CUMEM_ENABLE", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_NCCL_CUMEM_DISABLE", raising=False)
+    config = OpenAIServerConfig(
+        model="meta-llama/Meta-Llama-3.1-70B-Instruct",
+        tensor_parallel_size=8,
+    )
+
+    _prepare_tensor_parallel_nccl_runtime_env(config)
+
+    assert os.environ["NCCL_CUMEM_ENABLE"] == "0"
+
+
+def test_openai_tensor_parallel_nccl_cumem_env_is_explicit(monkeypatch) -> None:
+    monkeypatch.setenv("NCCL_CUMEM_ENABLE", "1")
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_NCCL_CUMEM_DISABLE", raising=False)
+    config = OpenAIServerConfig(
+        model="meta-llama/Meta-Llama-3.1-70B-Instruct",
+        tensor_parallel_size=8,
+    )
+
+    _prepare_tensor_parallel_nccl_runtime_env(config)
+
+    assert os.environ["NCCL_CUMEM_ENABLE"] == "1"
+
+
+def test_openai_tensor_parallel_nccl_cumem_guard_can_be_disabled(monkeypatch) -> None:
+    monkeypatch.delenv("NCCL_CUMEM_ENABLE", raising=False)
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_NCCL_CUMEM_DISABLE", "0")
+    config = OpenAIServerConfig(
+        model="meta-llama/Meta-Llama-3.1-70B-Instruct",
+        tensor_parallel_size=8,
+    )
+
+    _prepare_tensor_parallel_nccl_runtime_env(config)
+
+    assert "NCCL_CUMEM_ENABLE" not in os.environ
 
 
 def test_openai_server_warmup_uses_generic_shape_buckets(monkeypatch) -> None:
