@@ -342,6 +342,51 @@ def _online_persistent_idle_ms(*, temperature: float, max_tokens: int) -> float:
     )
 
 
+def _online_session_max_tokens(*, temperature: float, max_tokens: int) -> int:
+    max_tokens = max(0, int(max_tokens))
+    if max_tokens < 1 or temperature > 0.0:
+        return max_tokens
+    greedy_session_tokens = env_int(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_SESSION_MAX_TOKENS",
+        128,
+        minimum=0,
+    )
+    if greedy_session_tokens <= 0:
+        return max_tokens
+    greedy_min_tokens = env_int(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_SESSION_MIN_TOKENS",
+        16,
+        minimum=1,
+    )
+    if greedy_min_tokens <= max_tokens <= greedy_session_tokens:
+        return greedy_session_tokens
+    return max_tokens
+
+
+def _online_session_prompt_headroom_tokens(*, temperature: float, max_tokens: int) -> int:
+    if max_tokens < 1 or temperature > 0.0:
+        return 0
+    greedy_session_tokens = env_int(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_SESSION_MAX_TOKENS",
+        128,
+        minimum=0,
+    )
+    if greedy_session_tokens <= 0:
+        return 0
+    greedy_min_tokens = env_int(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_SESSION_MIN_TOKENS",
+        16,
+        minimum=1,
+    )
+    if greedy_min_tokens <= max_tokens <= greedy_session_tokens:
+        return env_int(
+            "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_SESSION_PROMPT_HEADROOM_TOKENS",
+            32,
+            minimum=0,
+        )
+    return 0
+
+
 def _online_idle_batch_wait_ms(*, temperature: float, max_tokens: int) -> float:
     global_env = "TORCHINFERNO_OPENAI_TP_ONLINE_IDLE_BATCH_WAIT_MS"
     if global_env in os.environ:
@@ -3130,9 +3175,25 @@ class OpenAICompletionEngine:
                     deferred.append(item)
         add_phase("initial_batch_ms", initial_batch_start_s)
 
+        initial_max_tokens = max(request.max_tokens for request in initial_batch)
+        run_max_tokens = _online_session_max_tokens(
+            temperature=first.temperature,
+            max_tokens=initial_max_tokens,
+        )
         default_max_seq_len = self._tp_online_default_max_seq_len(initial_batch)
+        explicit_max_seq_len = "TORCHINFERNO_OPENAI_TP_ONLINE_MAX_SEQ_LEN" in os.environ
         max_seq_len = env_int("TORCHINFERNO_OPENAI_TP_ONLINE_MAX_SEQ_LEN", default_max_seq_len, minimum=1)
         max_seq_len = max(max_seq_len, len(first.prompt) + first.max_tokens)
+        if not explicit_max_seq_len:
+            prompt_headroom = _online_session_prompt_headroom_tokens(
+                temperature=first.temperature,
+                max_tokens=initial_max_tokens,
+            )
+            session_prompt_len = max((len(request.prompt) for request in initial_batch), default=len(first.prompt))
+            max_seq_len = max(max_seq_len, session_prompt_len + run_max_tokens + prompt_headroom)
+            max_model_len = getattr(self, "max_model_len", None)
+            if max_model_len is not None:
+                max_seq_len = min(max_seq_len, int(max_model_len))
         sized_initial_batch = [
             request
             for request in initial_batch
@@ -3143,7 +3204,11 @@ class OpenAICompletionEngine:
             if id(request) not in sized_initial_ids:
                 deferred.append(request)
         initial_batch = sized_initial_batch or [first]
-        run_max_tokens = max(request.max_tokens for request in initial_batch)
+        initial_max_tokens = max(request.max_tokens for request in initial_batch)
+        run_max_tokens = _online_session_max_tokens(
+            temperature=first.temperature,
+            max_tokens=initial_max_tokens,
+        )
         policy_max_active = self._online_serving_max_active(
             temperature=first.temperature,
             max_tokens=run_max_tokens,
