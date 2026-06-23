@@ -2654,9 +2654,37 @@ class Llama3TensorParallelForCausalLM:
         config = Llama3Config.from_dict(json.loads((root / HF_CONFIG_NAME).read_text()))
         torch_dtype = _resolve_dtype(dtype, root)
         loader = _CheckpointTensorLoader(root)
-        embed_tokens_weight = loader.get_tensor("model.embed_tokens.weight", device=device, dtype=torch_dtype)
-        norm_weight = loader.get_tensor("model.norm.weight", device=device, dtype=torch_dtype)
-        lm_head_weight = loader.get_tensor_shard(
+        load_start = time.perf_counter()
+        checkpoint_broadcast = _rank0_checkpoint_broadcast_enabled(
+            device=device,
+            world_size=world_size,
+            dtype=torch_dtype,
+        )
+        if rank == 0:
+            print(
+                "[Llama3TP] loading checkpoint tensors "
+                f"world_size={world_size} dtype={str(torch_dtype).replace('torch.', '')} "
+                f"rank0_broadcast={int(checkpoint_broadcast)}",
+                flush=True,
+            )
+        embed_tokens_weight = _load_checkpoint_tensor(
+            loader,
+            "model.embed_tokens.weight",
+            device=device,
+            dtype=torch_dtype,
+            rank=rank,
+            world_size=world_size,
+        )
+        norm_weight = _load_checkpoint_tensor(
+            loader,
+            "model.norm.weight",
+            device=device,
+            dtype=torch_dtype,
+            rank=rank,
+            world_size=world_size,
+        )
+        lm_head_weight = _load_checkpoint_tensor_shard(
+            loader,
             "lm_head.weight",
             dim=0,
             rank=rank,
@@ -2668,7 +2696,8 @@ class Llama3TensorParallelForCausalLM:
         layers: list[_Llama3TensorParallelLayer] = []
         for layer_id in range(config.num_hidden_layers):
             prefix = f"model.layers.{layer_id}."
-            q_proj_weight = loader.get_tensor_shard(
+            q_proj_weight = _load_checkpoint_tensor_shard(
+                loader,
                 prefix + "self_attn.q_proj.weight",
                 dim=0,
                 rank=rank,
@@ -2676,7 +2705,8 @@ class Llama3TensorParallelForCausalLM:
                 device=device,
                 dtype=torch_dtype,
             )
-            k_proj_weight = loader.get_tensor_shard(
+            k_proj_weight = _load_checkpoint_tensor_shard(
+                loader,
                 prefix + "self_attn.k_proj.weight",
                 dim=0,
                 rank=rank,
@@ -2684,7 +2714,8 @@ class Llama3TensorParallelForCausalLM:
                 device=device,
                 dtype=torch_dtype,
             )
-            v_proj_weight = loader.get_tensor_shard(
+            v_proj_weight = _load_checkpoint_tensor_shard(
+                loader,
                 prefix + "self_attn.v_proj.weight",
                 dim=0,
                 rank=rank,
@@ -2692,7 +2723,8 @@ class Llama3TensorParallelForCausalLM:
                 device=device,
                 dtype=torch_dtype,
             )
-            gate_proj_weight = loader.get_tensor_shard(
+            gate_proj_weight = _load_checkpoint_tensor_shard(
+                loader,
                 prefix + "mlp.gate_proj.weight",
                 dim=0,
                 rank=rank,
@@ -2700,7 +2732,8 @@ class Llama3TensorParallelForCausalLM:
                 device=device,
                 dtype=torch_dtype,
             )
-            up_proj_weight = loader.get_tensor_shard(
+            up_proj_weight = _load_checkpoint_tensor_shard(
+                loader,
                 prefix + "mlp.up_proj.weight",
                 dim=0,
                 rank=rank,
@@ -2709,21 +2742,28 @@ class Llama3TensorParallelForCausalLM:
                 dtype=torch_dtype,
             )
             weights = {
-                "input_layernorm.weight": loader.get_tensor(
+                "input_layernorm.weight": _load_checkpoint_tensor(
+                    loader,
                     prefix + "input_layernorm.weight",
                     device=device,
                     dtype=torch_dtype,
+                    rank=rank,
+                    world_size=world_size,
                 ),
-                "post_attention_layernorm.weight": loader.get_tensor(
+                "post_attention_layernorm.weight": _load_checkpoint_tensor(
+                    loader,
                     prefix + "post_attention_layernorm.weight",
                     device=device,
                     dtype=torch_dtype,
+                    rank=rank,
+                    world_size=world_size,
                 ),
                 "self_attn.qkv_proj.weight": torch.cat(
                     (q_proj_weight, k_proj_weight, v_proj_weight),
                     dim=0,
                 ).contiguous(),
-                "self_attn.o_proj.weight": loader.get_tensor_shard(
+                "self_attn.o_proj.weight": _load_checkpoint_tensor_shard(
+                    loader,
                     prefix + "self_attn.o_proj.weight",
                     dim=1,
                     rank=rank,
@@ -2732,7 +2772,8 @@ class Llama3TensorParallelForCausalLM:
                     dtype=torch_dtype,
                 ),
                 "mlp.gate_up_proj.weight": torch.cat((gate_proj_weight, up_proj_weight), dim=0).contiguous(),
-                "mlp.down_proj.weight": loader.get_tensor_shard(
+                "mlp.down_proj.weight": _load_checkpoint_tensor_shard(
+                    loader,
                     prefix + "mlp.down_proj.weight",
                     dim=1,
                     rank=rank,
@@ -2751,6 +2792,12 @@ class Llama3TensorParallelForCausalLM:
                     weights=weights,
                 )
             )
+            if rank == 0 and ((layer_id + 1) % 10 == 0 or layer_id + 1 == config.num_hidden_layers):
+                print(
+                    f"[Llama3TP] loaded {layer_id + 1}/{config.num_hidden_layers} layers "
+                    f"in {time.perf_counter() - load_start:.1f}s",
+                    flush=True,
+                )
         model = cls(
             config,
             embed_tokens_weight=embed_tokens_weight,
@@ -2771,6 +2818,8 @@ class Llama3TensorParallelForCausalLM:
             rank=rank,
             world_size=world_size,
         )
+        if rank == 0:
+            print(f"[Llama3TP] checkpoint load complete in {time.perf_counter() - load_start:.1f}s", flush=True)
         _barrier()
         return model
 
@@ -5428,6 +5477,73 @@ def _resolve_tensor_parallel_checkpoint(
     if not resolved[0]:
         raise RuntimeError("rank 0 did not broadcast a resolved checkpoint path")
     return Path(resolved[0])
+
+
+def _rank0_checkpoint_broadcast_enabled(
+    *,
+    device: torch.device,
+    world_size: int,
+    dtype: torch.dtype | None,
+) -> bool:
+    if world_size <= 1 or dtype is None:
+        return False
+    if device.type != "cuda":
+        return False
+    if not dist.is_available() or not dist.is_initialized():
+        return False
+    return _tp_flag("TORCHINFERNO_TP_RANK0_CHECKPOINT_BROADCAST", True)
+
+
+def _load_checkpoint_tensor(
+    loader: _CheckpointTensorLoader,
+    name: str,
+    *,
+    device: torch.device,
+    dtype: torch.dtype | None,
+    rank: int,
+    world_size: int,
+) -> Tensor:
+    if not _rank0_checkpoint_broadcast_enabled(device=device, world_size=world_size, dtype=dtype):
+        return loader.get_tensor(name, device=device, dtype=dtype)
+    shape = loader.get_tensor_shape(name)
+    if rank == 0:
+        tensor = loader.get_tensor(name, device=device, dtype=dtype)
+    else:
+        tensor = torch.empty(shape, device=device, dtype=dtype)
+    dist.broadcast(tensor, src=0)
+    return tensor
+
+
+def _load_checkpoint_tensor_shard(
+    loader: _CheckpointTensorLoader,
+    name: str,
+    *,
+    dim: int,
+    rank: int,
+    world_size: int,
+    device: torch.device,
+    dtype: torch.dtype | None,
+) -> Tensor:
+    if not _rank0_checkpoint_broadcast_enabled(device=device, world_size=world_size, dtype=dtype):
+        return loader.get_tensor_shard(
+            name,
+            dim=dim,
+            rank=rank,
+            world_size=world_size,
+            device=device,
+            dtype=dtype,
+        )
+    shape = loader.get_tensor_shape(name)
+    if shape[dim] % world_size != 0:
+        raise ValueError(f"cannot shard {name} shape={shape} dim={dim} across {world_size} ranks")
+    if rank == 0:
+        tensor = loader.get_tensor(name, device=device, dtype=dtype)
+    else:
+        tensor = torch.empty(shape, device=device, dtype=dtype)
+    dist.broadcast(tensor, src=0)
+    shard = shape[dim] // world_size
+    start = rank * shard
+    return tensor.narrow(dim, start, shard).clone(memory_format=torch.contiguous_format)
 
 
 def _broadcast_object_list(objects: list[object], *, src: int, device: torch.device) -> None:

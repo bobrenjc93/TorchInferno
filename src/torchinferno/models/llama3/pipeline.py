@@ -84,6 +84,20 @@ class _CheckpointTensorLoader:
             raise FileNotFoundError(f"no {SAFETENSORS_INDEX_NAME} found in {self.root}")
         index = json.loads(index_path.read_text())
         self.weight_map: dict[str, str] = dict(index["weight_map"])
+        self._shape_cache: dict[str, tuple[int, ...]] = {}
+
+    def get_tensor_shape(self, name: str) -> tuple[int, ...]:
+        cached = self._shape_cache.get(name)
+        if cached is not None:
+            return cached
+        filename = self.weight_map.get(name)
+        if filename is None:
+            raise KeyError(f"checkpoint tensor not found: {name}")
+        path = self.root / filename
+        with safe_open(path, framework="pt", device="cpu") as handle:
+            shape = tuple(handle.get_slice(name).get_shape())
+        self._shape_cache[name] = shape
+        return shape
 
     def get_tensor(self, name: str, *, device: torch.device, dtype: torch.dtype | None) -> Tensor:
         filename = self.weight_map.get(name)
@@ -92,9 +106,7 @@ class _CheckpointTensorLoader:
         path = self.root / filename
         with safe_open(path, framework="pt", device="cpu") as handle:
             tensor = handle.get_tensor(name)
-        if dtype is not None and tensor.is_floating_point():
-            tensor = tensor.to(dtype=dtype)
-        return tensor.to(device=device, non_blocking=True).contiguous()
+        return _finish_checkpoint_tensor(tensor, device=device, dtype=dtype)
 
     def get_tensor_shard(
         self,
@@ -121,9 +133,16 @@ class _CheckpointTensorLoader:
             index = [slice(None)] * len(shape)
             index[dim] = slice(start, end)
             tensor = tensor_slice[tuple(index)]
-        if dtype is not None and tensor.is_floating_point():
-            tensor = tensor.to(dtype=dtype)
-        return tensor.to(device=device, non_blocking=True).contiguous()
+        return _finish_checkpoint_tensor(tensor, device=device, dtype=dtype)
+
+
+def _finish_checkpoint_tensor(tensor: Tensor, *, device: torch.device, dtype: torch.dtype | None) -> Tensor:
+    if not tensor.is_contiguous():
+        tensor = tensor.contiguous()
+    if dtype is not None and tensor.is_floating_point() and tensor.dtype != dtype:
+        tensor = tensor.to(dtype=dtype)
+    tensor = tensor.to(device=device, non_blocking=True)
+    return tensor if tensor.is_contiguous() else tensor.contiguous()
 
 
 class _Llama3PipelineLayer:

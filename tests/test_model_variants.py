@@ -25,7 +25,10 @@ from torchinferno.models.llama3 import (
     llama3_70b_config,
     tiny_llama3_config,
 )
-from torchinferno.models.llama3.pipeline import _apply_rotary as _pipeline_apply_rotary
+from torchinferno.models.llama3.pipeline import (
+    _CheckpointTensorLoader,
+    _apply_rotary as _pipeline_apply_rotary,
+)
 from torchinferno.models.llama3.tensor_parallel import (
     Llama3TensorParallelLayerKVCache,
     _apply_rotary_cached as _tp_apply_rotary,
@@ -52,6 +55,33 @@ def test_model_family_catalog_uses_canonical_packages() -> None:
 
 def test_legacy_deepseek_import_aliases_canonical_module() -> None:
     assert legacy_deepseek_mod is canonical_deepseek_mod
+
+
+def test_checkpoint_tensor_loader_returns_contiguous_column_shards(tmp_path) -> None:
+    weight = torch.arange(24, dtype=torch.float32).reshape(4, 6)
+    save_file({"weight": weight}, tmp_path / "model-00001-of-00001.safetensors")
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "metadata": {"total_size": weight.numel() * weight.element_size()},
+                "weight_map": {"weight": "model-00001-of-00001.safetensors"},
+            }
+        )
+        + "\n"
+    )
+
+    loader = _CheckpointTensorLoader(tmp_path)
+    shard = loader.get_tensor_shard(
+        "weight",
+        dim=1,
+        rank=1,
+        world_size=3,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+
+    assert shard.is_contiguous()
+    torch.testing.assert_close(shard, weight[:, 2:4].contiguous())
 
 
 def test_model_variant_registry_tracks_families_and_ops_modules() -> None:
