@@ -9939,7 +9939,10 @@ def _prepare_tensor_parallel_symm_mem_allreduce_auto(config: OpenAIServerConfig)
         return
     if raw_openai is not None and raw_openai.strip().lower() not in {"auto", "probe"}:
         return
-    if not env_flag("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_AUTO_PROBE", True):
+    # Symmetric-memory allreduce can hang inside rendezvous on some TP hosts even
+    # after a standalone probe succeeds. Keep OpenAI serving on the NCCL path
+    # unless callers explicitly opt into the probe or force the feature on.
+    if not env_flag("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_AUTO_PROBE", False):
         os.environ[openai_env] = "0"
         return
     if int(getattr(config, "tensor_parallel_size", 1)) <= 1:
