@@ -529,6 +529,13 @@ def _online_common_prefix_suffix_prefill_warmup_batches(cache_rows: int, max_act
     return tuple(batch for batch in batches if 0 < batch <= limit)
 
 
+def _online_common_prefix_suffix_prefill_warmup_enabled() -> bool:
+    # Long-output measurements show this captures many startup-only suffix
+    # graphs without improving steady-state median latency. Keep it available
+    # for targeted experiments, but do not spend public-run startup budget on it.
+    return env_flag("TORCHINFERNO_OPENAI_WARMUP_ONLINE_COMMON_PREFIX_SUFFIX_PREFILL", False)
+
+
 @contextmanager
 def _allow_prefill_graph_capture_for_cache(cache: object) -> Iterator[None]:
     sentinel = object()
@@ -2285,10 +2292,7 @@ class OpenAICompletionEngine:
             if env_flag("TORCHINFERNO_OPENAI_WARMUP_ONLINE_COMMON_PREFIX_PREFILL", True):
                 common_prefix_rows = _online_common_prefix_prefill_warmup_rows(cache_batch, max_active)
                 common_prefix_tokens = _online_common_prefix_prefill_warmup_tokens(max_seq_len)
-                warm_suffix_prefill = env_flag(
-                    "TORCHINFERNO_OPENAI_WARMUP_ONLINE_COMMON_PREFIX_SUFFIX_PREFILL",
-                    True,
-                )
+                warm_suffix_prefill = _online_common_prefix_suffix_prefill_warmup_enabled()
                 ragged_prefill_graph = (
                     getattr(self.model, "try_prefill_ragged_logits_graph", None)
                     if warm_suffix_prefill

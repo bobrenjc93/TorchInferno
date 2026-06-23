@@ -89,6 +89,7 @@ from torchinferno.openai_server import (
     _mark_generation_cache_prefix,
     _online_common_prefix_prefill_warmup_rows,
     _online_common_prefix_prefill_warmup_tokens,
+    _online_common_prefix_suffix_prefill_warmup_enabled,
     _online_common_prefix_suffix_prefill_warmup_batches,
     _online_common_prefix_suffix_prefill_warmup_tokens,
     _online_admit_per_step_cap,
@@ -8133,6 +8134,7 @@ def test_openai_online_initial_batch_wait_respects_env_overrides(monkeypatch) ->
 def test_online_common_prefix_prefill_warmup_filters_shapes(monkeypatch) -> None:
     monkeypatch.delenv("TORCHINFERNO_OPENAI_WARMUP_ONLINE_COMMON_PREFIX_ROWS", raising=False)
     monkeypatch.delenv("TORCHINFERNO_OPENAI_WARMUP_ONLINE_COMMON_PREFIX_TOKENS", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_WARMUP_ONLINE_COMMON_PREFIX_SUFFIX_PREFILL", raising=False)
 
     assert _online_common_prefix_prefill_warmup_rows(49) == (48,)
     assert _online_common_prefix_prefill_warmup_rows(69) == (48, 53, 68)
@@ -8140,6 +8142,7 @@ def test_online_common_prefix_prefill_warmup_filters_shapes(monkeypatch) -> None
     assert _online_common_prefix_prefill_warmup_rows(144, 128) == (48, 53, 68, 69, 128)
     assert _online_common_prefix_prefill_warmup_tokens(64) == (45, 64)
     assert _online_common_prefix_prefill_warmup_tokens(128) == (45, 64, 128)
+    assert not _online_common_prefix_suffix_prefill_warmup_enabled()
     assert _online_common_prefix_suffix_prefill_warmup_tokens(64) == (16,)
     assert _online_common_prefix_suffix_prefill_warmup_batches(49, 48) == (
         1,
@@ -8153,10 +8156,12 @@ def test_online_common_prefix_prefill_warmup_filters_shapes(monkeypatch) -> None
 
     monkeypatch.setenv("TORCHINFERNO_OPENAI_WARMUP_ONLINE_COMMON_PREFIX_ROWS", "53,96,128")
     monkeypatch.setenv("TORCHINFERNO_OPENAI_WARMUP_ONLINE_COMMON_PREFIX_TOKENS", "32,128,256")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_WARMUP_ONLINE_COMMON_PREFIX_SUFFIX_PREFILL", "1")
     monkeypatch.setenv("TORCHINFERNO_OPENAI_WARMUP_ONLINE_COMMON_PREFIX_SUFFIX_TOKENS", "8,16,256")
     monkeypatch.setenv("TORCHINFERNO_OPENAI_WARMUP_ONLINE_COMMON_PREFIX_SUFFIX_BATCHES", "8,48,96")
     assert _online_common_prefix_prefill_warmup_rows(128, 64) == (53, 96)
     assert _online_common_prefix_prefill_warmup_tokens(128) == (32, 128)
+    assert _online_common_prefix_suffix_prefill_warmup_enabled()
     assert _online_common_prefix_suffix_prefill_warmup_tokens(128) == (8, 16)
     assert _online_common_prefix_suffix_prefill_warmup_batches(64, 128) == (8, 48)
 
