@@ -164,6 +164,20 @@ def _online_admit_per_step_cap(*, temperature: float, max_tokens: int) -> int | 
     if runtime_env in os.environ:
         return env_int(runtime_env, 48, minimum=0)
     default_cap = 48
+    if temperature > 0.0 and 0 < max_tokens <= env_int(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_SHORT_ADMIT_MAX_TOKENS",
+        256,
+        minimum=1,
+    ):
+        # Self-consistency-style sampled bursts already use the KV-bounded
+        # 128-row cache, but a 48/request admission cap still fragments decode
+        # into small waves. Local TP8 A/B on 70B with a 128 cap improved median
+        # TTFT 319.8 -> 248.9ms with 100% correctness.
+        default_cap = env_int(
+            "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_SHORT_ADMIT_PER_STEP_CAP",
+            128,
+            minimum=0,
+        )
     if temperature <= 0.0 and 0 < max_tokens <= env_int(
         "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_ADMIT_MAX_TOKENS",
         128,
