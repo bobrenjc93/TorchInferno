@@ -126,6 +126,10 @@ intended shape: `run_max_tokens=96`, `max_active=123`, `prefix_rows=21`,
 `57` prefill batches, and `28.08s` total phase time. This keeps per-token
 streaming intact, unlike decode_many, while reducing refill fragmentation versus
 the prior 128-token bucket / no-prefix-floor shape.
+A follow-up 20ms initial-wait recheck on `74173a1` remains rejected:
+`288.4 / 32.7 / 1682.5ms`, p99 E2E `5057ms`. The larger wait collected a
+15-request first wave but still used 59 prefill batches and regressed prefill
+wall time to `13.39s`, so keep the greedy-short initial wait at 10ms.
 
 Long-output greedy-short KV active cap 64 is rejected on current `aa7a9a9`.
 The hypothesis was that 64 client workers could not use the default 112 active
