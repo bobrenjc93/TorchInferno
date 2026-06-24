@@ -1,5 +1,26 @@
 # TorchInferno vs vLLM/sglang — Performance Gap Analysis (Llama-3.1-70B, 8xH100)
 
+## CURRENT SAME-HOST REFRESH AFTER SAMPLED-MEDIUM IDLE (2026-06-24, current 6059831)
+
+Same-host inference-bench run `20260624_015224` with vLLM `8dd1b702f27e`,
+SGLang `c65f4ea692dd`, and TorchInferno `6059831` landed at vLLM 16 metric
+wins, SGLang 5, TorchInferno 4. TorchInferno still wins few_shot TPOT locally
+(`58.1ms` vs vLLM `59.6ms`) but remains behind on queue-facing medians:
+few_shot `168.0 / 58.1 / 217.4ms`, self_consistency
+`305.0 / 0.0 / 419.8ms`, multi_turn `455.4 / 68.1 / 532.9ms`,
+tree_of_thought `275.9 / 57.4 / 313.2ms`, and long_output
+`322.6 / 33.3 / 1727.4ms` (TTFT/TPOT/E2E).
+
+The same run keeps the stale public TorchInferno `_server` row out of the
+latency discussion: local TorchInferno reaches readiness and completes all five
+benchmarks with 100% benchmark correctness rates. The largest current same-host
+gaps are still long_output decode/readback throughput (vLLM
+`90.8 / 18.8 / 766.1ms`), multi_turn prefill/session reuse (vLLM
+`186.5 / 61.2 / 237.8ms`), and tree TTFT/pipeline latency (vLLM
+`73.9 / 35.9 / 101.3ms`). The sampled-medium persistent-idle promotion improved
+focused tree medians, but the full-run tree row is still a prefill/decode
+pipeline gap rather than a wait-knob gap.
+
 ## CURRENT SAME-HOST REFRESH AFTER FP8 GATE (2026-06-23, current 15e19b8)
 
 A fresh same-host run with vLLM `8dd1b702f27e`, SGLang `c65f4ea692dd`, and
