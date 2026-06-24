@@ -83,13 +83,22 @@ wall time nearly doubled (`12956ms -> 25058ms`) and prefill batches rose
 extra active rows reduce queue-facing prefill pressure even when the final decode
 batch size does not exceed 64.
 
-Self-consistency sampled row-cap recheck is also not defaultable. An env-only
-run with `TORCHINFERNO_OPENAI_TP_ONLINE_KV_MAX_ACTIVE_CAP=256` and a matching
-sampled token budget improved median self TTFT/E2E to `268.9 / 410.1ms`, but
-the TP server max-batch limit still held `max_active=128`, the profile showed
-40 decode batches versus 37 in the full-run default, and p99 worsened to
-`1545.5 / 1651.5ms`. Do not add a sampled 256-row policy without first changing
-and validating the effective TP max-batch limit.
+Self-consistency sampled row-cap rechecks above 128 rows are still rejected. On
+current `ebfae5b`, the same-host default was `373.4 / 0.0 / 442.4ms`, p99 E2E
+`1672.8ms`. Raising true active rows to 256 without raising the total row budget
+removed prefix rows (`prefix_rows=0`), forced 18 plain prefill batches over 55k
+tokens, and regressed to `623.3 / 0.0 / 730.0ms`. Restoring 64 prefix rows at
+256 active rows fixed the plain-prefill failure (`prefill_tokens=55`, `988`
+prefix-reuse requests) but still landed at `324.4 / 0.0 / 465.0ms`. A 160-row
+variant improved TTFT and p99 but not median E2E (`315.9 / 0.0 / 447.2ms`).
+The 192-row, 64-prefix-row variant looked score-positive in isolation
+(`286.0 / 0.0 / 409.0ms`, `2.4 tok/s`) and a broad no-env default reproduced
+`282.4 / 0.0 / 393.6ms`, but it regressed focused tree_of_thought to
+`312.8 / 71.8 / 361.2ms`. Forcing the old 128-row startup/batch ceiling
+recovered tree to `230.1 / 56.3 / 272.1ms`, and a narrower runtime-only
+192-row lift crashed self/tree with CUDA device-side asserts. Keep sampled-short
+KV-bounded admission at 128 until a design can raise self concurrency without
+changing tree startup/cache behavior or runtime allocation shape.
 
 Self-consistency uniform-ragged decode is rejected. Forcing
 `TORCHINFERNO_CONTINUOUS_UNIFORM_RAGGED_DECODE=1` moved sampled self from static
