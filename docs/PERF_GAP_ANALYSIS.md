@@ -137,6 +137,15 @@ are small (`96` requests, `1.07s` prefill wall). Do not change sampled-medium
 admission from this isolated noisy row; the durable tree gap is still prefill
 pipeline cost versus vLLM's much lower TTFT/E2E.
 
+Current-head refresh `0777c3e` keeps the same conclusion with a better focused
+row: `265.9 / 52.1 / 314.1ms`, 961/992 correct. Queue totals split by online
+session show sampled `temperature=0.7, max_tokens=300` traffic still dominates
+(`896` submitted requests, `45` prefill batches, `6.08s` prefill wall,
+`2.32s` decode-active), while greedy eval traffic is much smaller
+(`80` submitted requests, `10` prefill batches, `1.54s` prefill wall). The next
+tree improvement needs to reduce sampled-medium prefill pipeline cost; the
+greedy eval path is not the primary limiter.
+
 Tree sampled-medium row-cap refresh is rejected on the current startup/symm
 stack. The 32-row focused baseline on `a180fbb` landed at
 `280.5 / 52.2 / 321.6ms` (TTFT/TPOT/E2E), with `55` prefill batches,
