@@ -392,12 +392,17 @@ def _set_tensor_parallel_runtime_fp8_prefill(model: object, *, enabled: bool, mi
 
 
 def _online_persistent_idle_ms(*, temperature: float, max_tokens: int) -> float:
+    global_env = "TORCHINFERNO_OPENAI_TP_ONLINE_PERSISTENT_IDLE_MS"
+    if global_env in os.environ:
+        return env_float(global_env, 10.0, minimum=0.0)
+
     default_idle_ms = 10.0
-    if temperature > 0.0 and 0 < max_tokens <= env_int(
+    sampled_short_max_tokens = env_int(
         "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_SHORT_IDLE_MAX_TOKENS",
         256,
         minimum=1,
-    ):
+    )
+    if temperature > 0.0 and 0 < max_tokens <= sampled_short_max_tokens:
         # Short sampled bursts often arrive in small waves from client worker
         # pools. Keeping the online session open across those gaps preserves the
         # prefix cache and avoids restarting the online batcher for each wave.
@@ -406,11 +411,23 @@ def _online_persistent_idle_ms(*, temperature: float, max_tokens: int) -> float:
         # sampled few-shot path stayed flat at 1000ms, so keep this in the same
         # conservative range without stretching idle cleanup further.
         default_idle_ms = 750.0
-    return env_float(
-        "TORCHINFERNO_OPENAI_TP_ONLINE_PERSISTENT_IDLE_MS",
-        default_idle_ms,
-        minimum=0.0,
-    )
+    elif temperature > 0.0 and max_tokens > 0:
+        sampled_medium_max_tokens = env_int(
+            "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_IDLE_MAX_TOKENS",
+            300,
+            minimum=sampled_short_max_tokens,
+        )
+        if sampled_short_max_tokens < max_tokens <= sampled_medium_max_tokens:
+            # Tree-style sampled medium bursts can arrive as separate worker
+            # waves with the same short common prefix. A modest idle window lets
+            # the online batcher keep the prefix cache warm across those gaps
+            # without applying the long sampled-short self-consistency window.
+            default_idle_ms = env_float(
+                "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_IDLE_MS",
+                100.0,
+                minimum=0.0,
+            )
+    return default_idle_ms
 
 
 def _online_session_max_tokens(*, temperature: float, max_tokens: int) -> int:

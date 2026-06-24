@@ -239,7 +239,20 @@ and 954/992 raw correct. Raising the online idle drain globally to 10ms landed
 at 313.9 / 56.4 / 347.4ms and 962/992 raw correct. Both are worse than the
 same-run default tree row and do not change the local 56-57ms TPOT band. Keep
 tree on the current sampled-medium wait and idle-drain defaults; the next tree
-work needs a pipeline/prefill mechanism rather than another wait knob.
+work needs a pipeline/prefill mechanism rather than another initial-collection
+or idle-drain knob.
+
+Sampled-medium persistent idle was promoted separately (2026-06-24, current
+`97b6db2` + default patch). The shape-count control landed at
+`333.6 / 56.3 / 377.1ms`, 957/992 raw correct, with 8 sampled-medium online
+sessions and `7.46s` sampled prefill wall. A global
+`TORCHINFERNO_OPENAI_TP_ONLINE_PERSISTENT_IDLE_MS=100` probe improved that to
+`312.3 / 56.7 / 345.0ms`, 958/992, reducing sampled-medium sessions to 6 and
+sampled prefill wall to `6.50s`. The scoped default, limited to sampled
+requests above the sampled-short range and up to 300 max tokens, landed at
+`290.6 / 57.4 / 337.9ms`, 952/992, with `5.83s` sampled prefill wall. This is a
+median prefill/session-reuse win, not a tail fix: p99 E2E was still `2342ms`,
+so tree tail work remains in the scheduler/pipeline bucket.
 
 Down-projection Marlin remains rejected for long_output too. A current
 TorchInferno-only recheck with `TORCHINFERNO_MARLIN_INT4_DOWN=1` completed
