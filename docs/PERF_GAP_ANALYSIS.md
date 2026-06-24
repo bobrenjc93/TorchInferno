@@ -69,6 +69,14 @@ FP8 prefill gate to `512` for multi_turn was neutral-to-worse
 (`431.2 / 66.9 / 502.9ms`, `10.63s` prefill wall), so keep the `2048` runtime
 M gate.
 
+Disabling the greedy-large online FP8 prefill path entirely is not a promotion
+either. With `TORCHINFERNO_OPENAI_TP_ONLINE_FP8_PREFILL=0`, current `b46a056`
+landed at `472.5 / 66.6 / 544.0ms`, with `35` prefill batches,
+`79.9K` prefill tokens, and `10.75s` prefill wall. That is better than the
+noisy public `205205` multi_turn E2E but worse than the focused nearby baseline
+(`433.2 / 63.2 / 501.4ms`, `9.88s` prefill wall), so keep the default FP8
+prefill policy enabled for this path.
+
 Greedy generated-prefix caching is also rejected for multi_turn on current
 `29c4791`. Enabling `TORCHINFERNO_CONTINUOUS_GENERATED_PREFIX_CACHE=1` reduced
 raw prefill tokens (`79.2K -> 46.2K`) but fragmented the run into `331` prefill
