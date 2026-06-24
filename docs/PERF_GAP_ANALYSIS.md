@@ -57,6 +57,28 @@ TTFT (`353.1ms`) but raised prefill fragmentation (`56` prefill batches) and
 did not clearly improve E2E/TPOT (`27.5 / 1523.0ms`); keep the current
 16-request refill floor.
 
+Self-consistency sampled-short rechecks are also rejected on `27d3d7d`. The
+focused no-env profile landed at `377.8 / 0.0 / 404.8ms`; internally it already
+used the intended shortcut shape: one common-prefix prefill, one decode batch,
+`987` generated-prefix reuses, and `1000/1000` correctness. Disabling generated
+prefix caching improved TTFT to `292.0ms` but regressed E2E/throughput to
+`425.4ms` / `2.4 tok/s` and required `45` decode batches. Raising the
+sampled-short idle drain window to `25ms` regressed to
+`430.8 / 0.0 / 460.6ms`. Disabling TP online step sync was promising as a pure
+env run (`215.4 / 0.0 / 339.1ms`, p99 E2E `1358.4ms`), but the no-env default
+guard did not reproduce (`392.1 / 0.0 / 422.8ms`) even though the profile
+confirmed step sync was absent. Keep step sync on by default; this path needs a
+less noisy reduction in submit/runtime-step overhead before promotion.
+
+A focused tree_of_thought profile on `27d3d7d` is retained as diagnostic
+evidence, not as a tuning target. The isolated row regressed relative to the
+public full run at `335.3 / 52.7 / 373.4ms`; queue counters show the sampled
+medium branch dominates aggregate work (`896` sampled requests, `6.95s` prefill
+wall, `48` prefill batches, `2.54s` decode-active) while greedy eval requests
+are small (`96` requests, `1.07s` prefill wall). Do not change sampled-medium
+admission from this isolated noisy row; the durable tree gap is still prefill
+pipeline cost versus vLLM's much lower TTFT/E2E.
+
 Tree sampled-medium row-cap refresh is rejected on the current startup/symm
 stack. The 32-row focused baseline on `a180fbb` landed at
 `280.5 / 52.2 / 321.6ms` (TTFT/TPOT/E2E), with `55` prefill batches,
