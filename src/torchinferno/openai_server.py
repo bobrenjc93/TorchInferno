@@ -3117,9 +3117,9 @@ class OpenAICompletionEngine:
         # TPOT band. Sampled medium bursts such as tree-of-thought are also
         # latency-sensitive: local TP8 70B recheck showed a 32-row cap cut
         # median TTFT/E2E from 425/465ms to 243/291ms, while 64 rows regressed
-        # to 590/659ms. On the current startup/symm stack, a narrower tree A/B
-        # found 40 rows is the knee: 32 rows landed at 280.5/321.6ms, 40 rows
-        # improved to 256.4/310.4ms, and 48 rows regressed to 362.8/396.4ms.
+        # to 590/659ms. A current-stack 40-row result looked promising once, but
+        # no-env repeats regressed to about 310/346ms, so keep the stable
+        # 32-row cap.
         default_cap = 48
         if temperature is not None and max_tokens is not None:
             sampled_medium_min_tokens = env_int(
@@ -3135,7 +3135,7 @@ class OpenAICompletionEngine:
             if temperature > 0.0 and sampled_medium_min_tokens < max_tokens <= sampled_medium_max_tokens:
                 default_cap = env_int(
                     "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_MAX_ACTIVE",
-                    40,
+                    32,
                     minimum=1,
                 )
             greedy_mid_min_tokens = env_int(
