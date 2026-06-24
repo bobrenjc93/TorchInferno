@@ -40,6 +40,15 @@ the TP server max-batch limit still held `max_active=128`, the profile showed
 `1545.5 / 1651.5ms`. Do not add a sampled 256-row policy without first changing
 and validating the effective TP max-batch limit.
 
+Self-consistency uniform-ragged decode is rejected. Forcing
+`TORCHINFERNO_CONTINUOUS_UNIFORM_RAGGED_DECODE=1` moved sampled self from static
+decode graphs into ragged decode (`31` ragged batches, max model batch `128`),
+but padded decode work to `1419` tokens for 1000 one-token completions and
+increased decode-active time. The live row regressed to
+`353.5 / 0.0 / 437.1ms`, `2.3 tok/s`, with p99 E2E `1602.8ms`, versus the
+same-host default self row at `321.4 / 0.0 / 424.7ms` and p99 E2E `904.4ms`.
+Keep uniform-ragged decode off for sampled identical-prompt traffic.
+
 Few-shot startup/knob rechecks on current `b5cdbfc` are rejected. A 2ms initial
 collection wait landed at `173.6 / 59.2 / 222.5ms`, worse than the nearby guard
 run (`162.0 / 54.8 / 205.9ms`). Broad model-level FP8 with
