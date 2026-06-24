@@ -65,6 +65,17 @@ run on `6b1ae7e` landed at `358.2 / 0.0 / 450.6ms`, `2.2 tok/s`, p99 E2E
 profiles for diagnosis; the self gap needs scheduling/decode work, not less
 instrumentation.
 
+Self-consistency sampled post-arrival collection should stay default-on for now.
+An apples-to-apples current `1b60135` recheck with
+`TORCHINFERNO_OPENAI_TP_ONLINE_COLLECT_IDLE_ARRIVALS=0` landed at
+`332.7 / 0.0 / 411.0ms`, `2.4 tok/s`, p99 E2E `1703.7ms`. The no-env default
+on the same checkout and host landed at `258.0 / 0.0 / 394.0ms`, `2.5 tok/s`,
+p99 E2E `1548.3ms`. The disabled variant admitted a larger model batch
+(`107` vs `84`) and two fewer decode batches (`39` vs `41`), but spent more
+prefill wall time (`2324ms` vs `2204ms`) and more total batcher time
+(`4830ms` vs `4575ms`). Do not flip collection off by default from the older
+rejection note without a stronger scheduler change.
+
 Self-consistency global Marlin-int4 decode disable is rejected on current
 `9750616`. Rechecking with `TORCHINFERNO_MARLIN_INT4_DECODE=0` landed at
 `347.2 / 0.0 / 433.6ms`, `2.3 tok/s`, p99 E2E `1571.3ms`, worse than the
