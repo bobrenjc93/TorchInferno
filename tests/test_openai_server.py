@@ -98,6 +98,8 @@ from torchinferno.openai_server import (
     _online_decode_warmup_batch_sizes,
     _online_decode_many_enabled,
     _online_decode_quantum,
+    _online_fp8_prefill_enabled,
+    _online_fp8_prefill_min_m,
     _online_idle_batch_wait_ms,
     _online_initial_batch_wait_ms,
     _online_kv_bounded_concurrency_enabled,
@@ -131,6 +133,7 @@ from torchinferno.openai_server import (
     _repeat_generation_cache_first_batch,
     _sampled_batch_shape_bucket_size,
     _set_generation_cache_rows_seq_lens,
+    _set_tensor_parallel_runtime_fp8_prefill,
     _should_reexec_distributed_server,
     _startup_warmup_enabled_for_cache_backend,
     _sync_tensor_parallel_command,
@@ -1060,7 +1063,7 @@ def test_tensor_parallel_worker_loop_handles_online_runtime_commands(monkeypatch
     runtime = instances[0]
     assert runtime.started == 16
     assert runtime.steps == 4
-    assert runtime.init_args[2:] == ("paged", 2, 0.25, 4, 2, 8, True, True, True, None, 48)
+    assert runtime.init_args[2:] == ("paged", 2, 0.25, 4, 2, 8, True, True, True, None, 128)
     assert [
         (
             request.prompt,
@@ -1311,7 +1314,7 @@ def test_tensor_parallel_worker_loop_receives_online_tensor_commands(monkeypatch
     runtime = instances[0]
     assert runtime.started == 16
     assert runtime.steps == 3
-    assert runtime.init_args[2:] == ("paged", 2, 0.25, 4, 2, 8, True, True, False, None, 48)
+    assert runtime.init_args[2:] == ("paged", 2, 0.25, 4, 2, 8, True, True, False, None, 128)
     assert [(request.request_id, request.prompt, request.max_new_tokens) for request in runtime.submitted] == [
         ("10", (1, 2), 5),
         ("11", (3,), 6),
@@ -8078,6 +8081,49 @@ def test_online_step_sync_enabled_defaults_on(monkeypatch) -> None:
 
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_STEP_SYNC", "0")
     assert not _online_step_sync_enabled()
+
+
+def test_online_fp8_prefill_defaults_to_greedy_large_only(monkeypatch) -> None:
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_FP8_PREFILL", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_FP8_PREFILL", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_FP8_PREFILL_MIN_TOKENS", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_FP8_PREFILL_MAX_TOKENS", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_FP8_PREFILL_MIN_M", raising=False)
+
+    assert not _online_fp8_prefill_enabled(temperature=0.7, max_tokens=512)
+    assert not _online_fp8_prefill_enabled(temperature=0.0, max_tokens=400)
+    assert _online_fp8_prefill_enabled(temperature=0.0, max_tokens=401)
+    assert _online_fp8_prefill_enabled(temperature=0.0, max_tokens=512)
+    assert not _online_fp8_prefill_enabled(temperature=0.0, max_tokens=513)
+    assert _online_fp8_prefill_min_m(temperature=0.0, max_tokens=512) == 2048
+
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_FP8_PREFILL", "0")
+    assert not _online_fp8_prefill_enabled(temperature=0.0, max_tokens=512)
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_FP8_PREFILL", "1")
+    assert _online_fp8_prefill_enabled(temperature=0.7, max_tokens=128)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_FP8_PREFILL", raising=False)
+
+    monkeypatch.setenv("TORCHINFERNO_FP8_PREFILL", "1")
+    assert not _online_fp8_prefill_enabled(temperature=0.0, max_tokens=512)
+    monkeypatch.delenv("TORCHINFERNO_FP8_PREFILL", raising=False)
+
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_FP8_PREFILL_MIN_M", "4096")
+    assert _online_fp8_prefill_min_m(temperature=0.0, max_tokens=512) == 4096
+
+
+def test_set_tensor_parallel_runtime_fp8_prefill_updates_layers() -> None:
+    layers = [types.SimpleNamespace(), types.SimpleNamespace()]
+    model = types.SimpleNamespace(layers=layers)
+
+    _set_tensor_parallel_runtime_fp8_prefill(model, enabled=True, min_m=4096)
+
+    assert [layer._runtime_fp8_prefill_enabled for layer in layers] == [True, True]
+    assert [layer._runtime_fp8_prefill_min_m for layer in layers] == [4096, 4096]
+
+    _set_tensor_parallel_runtime_fp8_prefill(model, enabled=False, min_m=1)
+
+    assert [layer._runtime_fp8_prefill_enabled for layer in layers] == [False, False]
+    assert [layer._runtime_fp8_prefill_min_m for layer in layers] == [1, 1]
 
 
 def test_online_kv_bounded_concurrency_defaults_to_short_outputs(monkeypatch) -> None:

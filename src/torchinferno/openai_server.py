@@ -353,6 +353,44 @@ def _online_step_sync_enabled() -> bool:
     return env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_STEP_SYNC", True)
 
 
+def _online_fp8_prefill_enabled(*, temperature: float, max_tokens: int) -> bool:
+    global_env = "TORCHINFERNO_OPENAI_TP_ONLINE_FP8_PREFILL"
+    if global_env in os.environ:
+        return env_flag(global_env, False)
+    if "TORCHINFERNO_FP8_PREFILL" in os.environ:
+        # The model-level flag is an explicit broad override; do not layer an
+        # online auto policy on top of it.
+        return False
+    if temperature > 0.0 or max_tokens < 1:
+        return False
+    min_tokens = env_int(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_FP8_PREFILL_MIN_TOKENS",
+        400,
+        minimum=1,
+    )
+    max_tokens_limit = env_int(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_FP8_PREFILL_MAX_TOKENS",
+        512,
+        minimum=min_tokens,
+    )
+    return min_tokens < max_tokens <= max_tokens_limit
+
+
+def _online_fp8_prefill_min_m(*, temperature: float, max_tokens: int) -> int:
+    del temperature, max_tokens
+    return env_int("TORCHINFERNO_OPENAI_TP_ONLINE_FP8_PREFILL_MIN_M", 2048, minimum=1)
+
+
+def _set_tensor_parallel_runtime_fp8_prefill(model: object, *, enabled: bool, min_m: int) -> None:
+    setter = getattr(model, "set_runtime_fp8_prefill", None)
+    if callable(setter):
+        setter(bool(enabled), min_m=max(1, int(min_m)))
+        return
+    for layer in getattr(model, "layers", ()) or ():
+        setattr(layer, "_runtime_fp8_prefill_enabled", bool(enabled))
+        setattr(layer, "_runtime_fp8_prefill_min_m", max(1, int(min_m)))
+
+
 def _online_persistent_idle_ms(*, temperature: float, max_tokens: int) -> float:
     default_idle_ms = 10.0
     if temperature > 0.0 and 0 < max_tokens <= env_int(
@@ -3344,6 +3382,14 @@ class OpenAICompletionEngine:
             temperature=first.temperature,
             max_tokens=run_max_tokens,
         )
+        fp8_prefill_enabled = _online_fp8_prefill_enabled(
+            temperature=first.temperature,
+            max_tokens=run_max_tokens,
+        )
+        fp8_prefill_min_m = _online_fp8_prefill_min_m(
+            temperature=first.temperature,
+            max_tokens=run_max_tokens,
+        )
         engine_create_start_s = time.perf_counter()
         runtime_engine = self._maybe_build_paged_online_engine(max_active=max_active, max_seq_len=max_seq_len)
         use_paged_engine = runtime_engine is not None
@@ -3430,6 +3476,8 @@ class OpenAICompletionEngine:
                 max_active=max_active,
                 prefix_rows=prefix_rows,
                 decode_quantum=decode_quantum,
+                fp8_prefill_enabled=fp8_prefill_enabled,
+                fp8_prefill_min_m=fp8_prefill_min_m,
                 online_steps=step,
                 online_step_commands=online_step_commands,
                 emitted_events=emitted_events,
@@ -3514,6 +3562,11 @@ class OpenAICompletionEngine:
             return admitted
 
         try:
+            _set_tensor_parallel_runtime_fp8_prefill(
+                self.model,
+                enabled=fp8_prefill_enabled,
+                min_m=fp8_prefill_min_m,
+            )
             with _tensor_parallel_symm_mem_allreduce_scope(
                 self.model,
                 self.device,
@@ -3707,6 +3760,11 @@ class OpenAICompletionEngine:
         finally:
             add_phase("total_ms", profile_start_s)
             record_online_profile("online_batcher")
+            _set_tensor_parallel_runtime_fp8_prefill(
+                self.model,
+                enabled=False,
+                min_m=fp8_prefill_min_m,
+            )
             if started:
                 _broadcast_tensor_parallel_online_close(self.model)
                 _sync_tensor_parallel_command(self.model, self.device)
@@ -11513,6 +11571,19 @@ def _tensor_parallel_worker_loop(engine: OpenAICompletionEngine) -> None:
                 prefill_budget_value = int(payload.get("prefill_token_budget", 0))
                 temperature = float(payload.get("temperature", 0.0))
                 max_tokens = int(payload.get("max_tokens", 0))
+                fp8_prefill_enabled = _online_fp8_prefill_enabled(
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                )
+                fp8_prefill_min_m = _online_fp8_prefill_min_m(
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                )
+                _set_tensor_parallel_runtime_fp8_prefill(
+                    getattr(engine, "model", None),
+                    enabled=fp8_prefill_enabled,
+                    min_m=fp8_prefill_min_m,
+                )
                 admit_min_ready_requests = _online_refill_min_ready_requests(
                     temperature=temperature,
                     max_tokens=max_tokens,
@@ -11683,6 +11754,11 @@ def _tensor_parallel_worker_loop(engine: OpenAICompletionEngine) -> None:
                     remaining_steps -= ran_steps
                 continue
             if op == "online_close":
+                _set_tensor_parallel_runtime_fp8_prefill(
+                    getattr(engine, "model", None),
+                    enabled=False,
+                    min_m=2048,
+                )
                 # When COW prefix caching is on, KEEP the worker's engine across
                 # sessions so its PagedPrefixCache + paged pool persist -- matching the
                 # primary's self._persistent_paged_engine. Otherwise the worker would

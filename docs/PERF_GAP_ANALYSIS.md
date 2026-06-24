@@ -1,5 +1,23 @@
 # TorchInferno vs vLLM/sglang — Performance Gap Analysis (Llama-3.1-70B, 8xH100)
 
+## MULTI-TURN RUNTIME FP8 PREFILL GATE (2026-06-23)
+
+Global `TORCHINFERNO_FP8_PREFILL=1` remains rejected because it previously
+regressed few_shot. A narrower online runtime policy is now validated for
+deterministic greedy-large sessions only (`400 < max_tokens <= 512`) with a
+higher prefill M gate (`min_m=2048`). The no-env live run on current local
+TorchInferno enabled FP8 only through this runtime path and moved multi_turn
+from the same-host `504.6 / 70.2 / 583.6ms` band to `451.4 / 73.4 / 542.8ms`,
+`2.2 tok/s`, with 982/1000 raw correct. The queue profile confirmed
+`fp8_prefill_enabled=true`, `fp8_prefill_min_m=2048`, `run_max_tokens=512`,
+34 prefill batches, and 83.5k prefill tokens.
+
+The live few_shot guard stayed out of the policy: it recorded
+`fp8_prefill_enabled=false`, `run_max_tokens=256`, and landed at
+`162.0 / 54.8 / 205.9ms`, 976/1000 raw correct. Keep the model-level FP8 env as
+an explicit broad override; the default path should only use the runtime setter
+for greedy-large online sessions.
+
 ## CURRENT SAME-HOST REFRESH AND TREE WAIT RECHECKS (2026-06-23)
 
 After the greedy-large initial-wait patch, a current same-host four-row

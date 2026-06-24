@@ -1233,6 +1233,8 @@ class _Llama3TensorParallelLayer:
         self.down_proj_weight_decode = _maybe_decode_weight_t(self.down_proj_weight)
         self.inv_freq = _build_inv_freq(config, device)
         self.profile_seconds: dict[str, float] | None = None
+        self._runtime_fp8_prefill_enabled = False
+        self._runtime_fp8_prefill_min_m = 2048
         self.profile_counts: dict[str, int] | None = None
         self._mlp_project_graph: _StaticCudaGraphCall | None = None
         self._mlp_project_graph_failed = False
@@ -1880,16 +1882,26 @@ class _Llama3TensorParallelLayer:
         # (abs+amax fixed ~235us x 160 calls); at few_shot's HIGH-CONCURRENCY SMALL
         # prefills that overhead EXCEEDS the GEMM savings -> net slower. My local A/B that
         # justified default-on used 400-tok prompts (larger M, where fp8 wins) and MISSED
-        # few_shot's small-prefill regime. The cron OVERRIDES the local A/B. To re-enable:
-        # fuse the absmax into the rms_norm/swiglu epilogue (kill the quant overhead) AND
-        # raise the M-gate so fp8 fires only where GEMM savings >> overhead, validated on
-        # a live cron. Revert=this flag default False (= TORCHINFERNO_FP8_PREFILL unset).
-        if not _tp_flag("TORCHINFERNO_FP8_PREFILL", False):
+        # few_shot's small-prefill regime. The broad env flag stays default-off. The
+        # online server may opt in for deterministic 401-512 token sessions with a
+        # higher runtime M-gate after live few_shot and multi_turn guards.
+        env_configured = _tp_env_set("TORCHINFERNO_FP8_PREFILL")
+        env_enabled = _tp_flag("TORCHINFERNO_FP8_PREFILL", False) if env_configured else False
+        runtime_enabled = bool(getattr(self, "_runtime_fp8_prefill_enabled", False))
+        if env_configured and not env_enabled:
+            runtime_enabled = False
+        if not env_enabled and not runtime_enabled:
             return None
         if not hidden.is_cuda:
             return None
         m = hidden.numel() // hidden.size(-1)
-        if m <= _tp_int("TORCHINFERNO_FP8_PREFILL_MIN_M", 256, minimum=1):
+        if _tp_env_set("TORCHINFERNO_FP8_PREFILL_MIN_M"):
+            min_m = _tp_int("TORCHINFERNO_FP8_PREFILL_MIN_M", 256, minimum=1)
+        elif runtime_enabled and not env_enabled:
+            min_m = int(getattr(self, "_runtime_fp8_prefill_min_m", 2048))
+        else:
+            min_m = 256
+        if m <= max(1, min_m):
             return None  # small-M (decode): fp8 loses + is lossy -> bf16/marlin
         if getattr(self, f"_fp8_{key}_failed", False):
             return None
@@ -2626,6 +2638,12 @@ class Llama3TensorParallelForCausalLM:
         ] = {}
         self._ragged_prefill_logits_graph_failed = False
         self._temperature_gumbel_generators: dict[str, torch.Generator] = {}
+
+    def set_runtime_fp8_prefill(self, enabled: bool, *, min_m: int = 2048) -> None:
+        min_m = max(1, int(min_m))
+        for layer in self.layers:
+            setattr(layer, "_runtime_fp8_prefill_enabled", bool(enabled))
+            setattr(layer, "_runtime_fp8_prefill_min_m", min_m)
 
     @classmethod
     def from_pretrained(
