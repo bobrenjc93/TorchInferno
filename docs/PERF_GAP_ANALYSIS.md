@@ -32,6 +32,17 @@ public failure. Queue counters show the sampled-medium branch path dominates:
 896 requests with `max_active=32`, `decode_quantum=4`, and about `7116ms`
 prefill wall plus `2602ms` decode-active time.
 
+Sampled-medium chunked prefill is rejected on current `f3db1fc`. Enabling
+`TORCHINFERNO_OPENAI_TP_ONLINE_PREFILL_CHUNK=128` for a focused
+tree_of_thought run preserved correctness in-family (957/992 raw correct) but
+regressed badly to `586.3 / 59.0 / 650.6ms`, p99 E2E `2230.8ms`, versus the
+nearby non-chunked tree evidence around `230.1 / 56.3 / 272.1ms`. Queue
+counters explain the loss: the sampled-medium sessions still used max model
+batch `32`, but chunking spread work across `45` prefill batches, about `54k`
+prefill tokens, `171` scheduler steps, and `15.8s` aggregate batcher wall.
+Keep online prefill chunking opt-in for sampled tree traffic; this path
+fragments the high-MFU prefill waves without improving decode interleaving.
+
 Sampled-medium post-idle arrival collection is rejected. Forcing
 `TORCHINFERNO_OPENAI_TP_ONLINE_COLLECT_IDLE_ARRIVALS=1` reduced aggregate
 sampled-medium prefill wall (`7116ms -> 6024ms`) and prefill batches
