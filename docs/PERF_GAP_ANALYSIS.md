@@ -69,6 +69,18 @@ FP8 prefill gate to `512` for multi_turn was neutral-to-worse
 (`431.2 / 66.9 / 502.9ms`, `10.63s` prefill wall), so keep the `2048` runtime
 M gate.
 
+Greedy generated-prefix caching is also rejected for multi_turn on current
+`29c4791`. Enabling `TORCHINFERNO_CONTINUOUS_GENERATED_PREFIX_CACHE=1` reduced
+raw prefill tokens (`79.2K -> 46.2K`) but fragmented the run into `331` prefill
+batches with `298` graph misses, stored `1452` generated prefixes, recorded zero
+exact generated-prefix continuations, and regressed the row to
+`6151.9 / 630.2 / 6591.8ms`. Adding
+`TORCHINFERNO_CONTINUOUS_NON_COMMON_PREFIX_GRAPH_PREFILL=1` to route those
+generated prefixes through the graph path did not recover it: after readiness it
+created no queue-profile records, grew workers to about `64GB` each, and was
+terminated. Generated-prefix reuse needs coarser grouping before it can help the
+multi-turn suffix-prefill gap.
+
 Long-output rechecks also did not produce a clean promotion. The focused
 baseline landed at `405.1 / 27.0 / 1461.9ms`, with `40` prefill graph batches,
 `11.98s` prefill wall, and `14.81s` active decode. Enabling greedy-short
