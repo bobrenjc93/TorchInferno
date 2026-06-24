@@ -157,11 +157,18 @@ def test_tensor_parallel_local_checkpoint_bypasses_distributed_broadcast(tmp_pat
     assert root == checkpoint
 
 
-def test_tensor_parallel_checkpoint_tensor_broadcast_is_opt_in(monkeypatch) -> None:
+def test_tensor_parallel_checkpoint_tensor_broadcast_defaults_on_for_cuda_tp(monkeypatch) -> None:
     monkeypatch.setattr(tensor_parallel_module.dist, "is_available", lambda: True)
     monkeypatch.setattr(tensor_parallel_module.dist, "is_initialized", lambda: True)
     monkeypatch.delenv("TORCHINFERNO_TP_RANK0_CHECKPOINT_BROADCAST", raising=False)
 
+    assert tensor_parallel_module._rank0_checkpoint_broadcast_enabled(
+        device=torch.device("cuda"),
+        world_size=2,
+        dtype=torch.bfloat16,
+    )
+
+    monkeypatch.setenv("TORCHINFERNO_TP_RANK0_CHECKPOINT_BROADCAST", "0")
     assert not tensor_parallel_module._rank0_checkpoint_broadcast_enabled(
         device=torch.device("cuda"),
         world_size=2,
@@ -169,12 +176,6 @@ def test_tensor_parallel_checkpoint_tensor_broadcast_is_opt_in(monkeypatch) -> N
     )
 
     monkeypatch.setenv("TORCHINFERNO_TP_RANK0_CHECKPOINT_BROADCAST", "1")
-    assert tensor_parallel_module._rank0_checkpoint_broadcast_enabled(
-        device=torch.device("cuda"),
-        world_size=2,
-        dtype=torch.bfloat16,
-    )
-
     assert not tensor_parallel_module._rank0_checkpoint_broadcast_enabled(
         device=torch.device("cpu"),
         world_size=2,

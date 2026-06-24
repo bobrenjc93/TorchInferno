@@ -5514,10 +5514,10 @@ def _rank0_checkpoint_broadcast_enabled(
         return False
     if not dist.is_available() or not dist.is_initialized():
         return False
-    # Rank-0 tensor broadcast is fast on hot local checkpoints, but on cold or
-    # slow-backed snapshots nonzero ranks enter a giant NCCL broadcast while rank
-    # 0 is still loading the tensor and can trip the watchdog. Keep it opt-in.
-    return _tp_flag("TORCHINFERNO_TP_RANK0_CHECKPOINT_BROADCAST", False)
+    # Rank-0 tensor broadcast avoids every TP rank independently streaming the
+    # same checkpoint from shared storage. Operators can still disable it for
+    # environments where the one-rank load plus NCCL broadcast is undesirable.
+    return _tp_flag("TORCHINFERNO_TP_RANK0_CHECKPOINT_BROADCAST", True)
 
 
 def _load_checkpoint_tensor(

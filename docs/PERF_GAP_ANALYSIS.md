@@ -1,5 +1,23 @@
 # TorchInferno vs vLLM/sglang — Performance Gap Analysis (Llama-3.1-70B, 8xH100)
 
+## PUBLIC STARTUP REGRESSION: SLOW SHARED CHECKPOINT READS (2026-06-24)
+
+Public inference-bench run `20260624_160928` failed before latency measurement:
+TorchInferno reached NCCL init, then loaded only `70/80` layers in `1745.0s`
+with `rank0_broadcast=0` before the 1800s readiness timeout killed the server.
+The same all-rank-read path is storage-sensitive: public run `20260624_100730`
+barely completed checkpoint loading in `1661.8s`, while same-host cached runs
+finish the same path in seconds.
+
+Rank-0 checkpoint tensor broadcast is promoted back to the default for CUDA TP
+startup. It avoids every rank independently streaming the same checkpoint from
+slow shared storage while leaving `TORCHINFERNO_TP_RANK0_CHECKPOINT_BROADCAST=0`
+as an explicit opt-out. Local startup smoke with the promoted path reached
+readiness in `231s` and loaded all `80/80` layers in `25.3s`
+(`rank0_broadcast=1`, symm-memory allreduce disabled for the startup check).
+The inference-bench TorchInferno provider should no longer force
+`TORCHINFERNO_TP_RANK0_CHECKPOINT_BROADCAST=0`.
+
 ## CURRENT SAME-HOST REFRESH AFTER OPENAI SYMM-MEM PROBE (2026-06-24, baseline f0c333d)
 
 Same-host public-style inference-bench run `20260624_055652` with TorchInferno
@@ -99,8 +117,8 @@ for the multi_turn queueing gap.
 The public `20260623_221253` TorchInferno `_server` row is stale with respect
 to later startup fixes. It failed in a 600s NCCL `BROADCAST` watchdog while
 broadcasting a 234M-element checkpoint tensor from rank 0 at TorchInferno
-`5ad5429`. Current main is past `9da03cc`, where TP rank-0 checkpoint tensor
-broadcast became opt-in, and inference-bench main now also defaults
+`5ad5429`. Current main is past the startup fixes where TP rank-0 checkpoint
+tensor broadcast is configurable and inference-bench defaults
 `NCCL_CUMEM_ENABLE=0` for TorchInferno. Treat that public row as a startup
 integration failure from an old commit, not as evidence about current runtime
 latency.
