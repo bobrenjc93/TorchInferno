@@ -28,6 +28,15 @@ one promising row at `256.4 / 52.5 / 310.4ms`, but after promotion to
 `310.4 / 53.2 / 344.1ms`. A 48-row check was worse at
 `362.8 / 53.3 / 396.4ms`. Keep the stable 32-row sampled-medium cap.
 
+Long-output greedy-short refill `24` is rejected on current `a261de3`. The
+focused baseline landed at `406.1 / 26.1 / 1454.3ms`, 1000/1000 correct, with
+`38` prefill batches, `11.35s` prefill wall, `13.68s` decode-active time, and
+`10.95s` CPU token copy. Raising only
+`TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_REFILL_MIN_READY_REQUESTS` to `24`
+improved median TPOT to `24.4ms` but regressed TTFT/E2E to
+`495.1 / 1610.1ms`. Keep the current 16-request refill floor; this path needs a
+streaming readback or decode-loop improvement, not a larger refill wait.
+
 ## CURRENT SAME-HOST REFRESH AFTER OPENAI SYMM-MEM PROBE (2026-06-24, baseline f0c333d)
 
 Same-host public-style inference-bench run `20260624_055652` with TorchInferno
