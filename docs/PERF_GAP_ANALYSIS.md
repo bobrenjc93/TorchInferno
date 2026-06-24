@@ -22,6 +22,26 @@ broadcast became opt-in, and inference-bench main now also defaults
 integration failure from an old commit, not as evidence about current runtime
 latency.
 
+Tree-of-thought remains a real same-host gap on current `4be4712`, and the
+public/local TPOT discrepancy is still not reproducible locally. A focused
+three-provider run with inference-bench `20260623_214401` landed at vLLM
+`73.9 / 36.2 / 101.0ms`, SGLang `71.1 / 75.1 / 168.0ms`, and TorchInferno
+`263.9 / 57.3 / 321.4ms` (TTFT/TPOT/E2E). TorchInferno reached readiness in
+226s with `rank0_broadcast=0`, confirming the startup path is past the stale
+public failure. Queue counters show the sampled-medium branch path dominates:
+896 requests with `max_active=32`, `decode_quantum=4`, and about `7116ms`
+prefill wall plus `2602ms` decode-active time.
+
+Sampled-medium post-idle arrival collection is rejected. Forcing
+`TORCHINFERNO_OPENAI_TP_ONLINE_COLLECT_IDLE_ARRIVALS=1` reduced aggregate
+sampled-medium prefill wall (`7116ms -> 6024ms`) and prefill batches
+(`47 -> 45`), but the score row only moved to `262.0 / 57.8 / 317.2ms` while
+p99 E2E regressed badly (`1721ms -> 3217ms`). Cutting the global idle collection
+window to 1ms reduced aggregate prefill further (`5697ms`, `43` batches) but
+regressed the row to `308.3 / 57.1 / 343.3ms`. Do not enable sampled-medium idle
+collection without a tail-safe admission rule; the current tree gap still needs
+a prefill/decode pipeline change rather than another wait knob.
+
 Paged-KV multi_turn remains rejected on current `2fd31a9`. Rechecking
 `TORCHINFERNO_OPENAI_PAGED_KV_MIN_SEQ=512` with
 `TORCHINFERNO_PAGED_PREFIX_CACHE=1` no longer failed readiness (server ready in
