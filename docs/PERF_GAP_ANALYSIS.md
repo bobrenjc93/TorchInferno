@@ -39,6 +39,29 @@ The greedy-large first-batch wait is also still rejected. Raising
 default 5ms to 10ms preserved correctness but regressed multi_turn to
 `447.8 / 77.3 / 535.0ms` with worse p99. Keep the current 5ms default.
 
+A narrower long_output refill floor is promoted on current `6e2cc27`.
+The no-env focused long_output control with queue profiling landed at
+`327.5 / 27.9 / 1565.1ms` (TTFT/TPOT/E2E), 1000/1000 correct, with only
+`11` requests in the first wave, `53` graph-hit suffix prefill batches, and
+`11435.9ms` prefill wall. Raising the deterministic short-output refill floor
+to `16` requests preserved correctness and shifted the same run to
+`351.7 / 26.6 / 1392.2ms`, cutting suffix prefill to `41` batches and
+`9931.0ms` prefill wall. The promoted no-env default reproduced the refill
+floor (`admit_min_ready_requests=16`) and landed at
+`394.8 / 26.4 / 1447.6ms`, 1000/1000 correct, with `39` suffix prefill batches.
+TTFT moved the wrong way, but E2E/TPOT and p99 E2E improved versus the profiled
+control, and the policy is scoped to greedy `max_tokens<=128`, leaving
+few_shot's 256-token path and multi_turn's 512-token path on their existing
+defaults.
+
+Prompt-lookup decode is rejected for this long_output shape. Enabling
+`TORCHINFERNO_CONTINUOUS_PROMPT_LOOKUP_DECODE=1` made the server spend minutes
+of active GPU time without emitting the first 1000-request progress line or a
+queue-profile snapshot, while the no-env baseline completed the full request
+wave in about `25.8s` after readiness. The existing prompt-lookup grouping is
+too fragmented by per-request sequence length for this traffic; keep it opt-in
+until it has a coarser batching design.
+
 ## CURRENT SAME-HOST REFRESH AFTER SAMPLED-MEDIUM IDLE (2026-06-24, current 6059831)
 
 Same-host inference-bench run `20260624_015224` with vLLM `8dd1b702f27e`,
