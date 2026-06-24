@@ -82,6 +82,19 @@ TTFT (`353.1ms`) but raised prefill fragmentation (`56` prefill batches) and
 did not clearly improve E2E/TPOT (`27.5 / 1523.0ms`); keep the current
 16-request refill floor.
 
+Current `75f9a0f` long-output decode-loop A/Bs are also rejected. Raising only
+`TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_GEN_DECODE_QUANTUM` from `8` to
+`16` cut online step commands (`95 -> 52`) but did not reduce runtime decode
+model calls and regressed TTFT (`377.9 -> 484.9ms`) while leaving E2E roughly
+flat (`1544.9 -> 1537.0ms`). An experimental full-active decode_many gate
+(`TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_DECODE_MANY=1`,
+`TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY_WHEN_FULL=1`, and
+`TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY_ALLOW_STOP=1`) preserved
+correctness but still issued `831` decode model calls, overcomputed decode
+tokens (`45.8K`), and regressed TTFT/p99 (`442.1ms` median TTFT, `136ms` p99
+TPOT). Revert the experimental gate; the durable gap remains GPU decode work and
+streaming readback, not online-step command count.
+
 Self-consistency sampled-short rechecks are also rejected on `27d3d7d`. The
 focused no-env profile landed at `377.8 / 0.0 / 404.8ms`; internally it already
 used the intended shortcut shape: one common-prefix prefill, one decode batch,
