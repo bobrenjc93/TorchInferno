@@ -18,6 +18,45 @@ readiness in `231s` and loaded all `80/80` layers in `25.3s`
 The inference-bench TorchInferno provider should no longer force
 `TORCHINFERNO_TP_RANK0_CHECKPOINT_BROADCAST=0`.
 
+Public run `20260624_185427` supersedes the later-sorting stale
+`20260624_183253` failure. It used TorchInferno `76107de`, vLLM `1cd3e0e`,
+and SGLang `4a4f063`; all providers completed all five benchmarks. Scorecard
+wins were vLLM `17/20`, TorchInferno `1/20`, and SGLang `1/20`. TorchInferno's
+current public rows are few_shot `152.1 / 51.3 / 195.9ms`, self_consistency
+`349.9 / 0.0 / 378.4ms`, multi_turn `432.0 / 64.7 / 498.3ms`,
+tree_of_thought `240.0 / 51.3 / 288.3ms`, and long_output
+`382.4 / 26.9 / 1561.1ms` (TTFT/TPOT/E2E). The same run confirms the startup
+fixes: TorchInferno reached readiness and completed with 100% benchmark-level
+correctness instead of timing out in checkpoint load.
+
+Several current-loop A/Bs are rejected on `76107de`. Runtime FlashInfer prefill
+for multi_turn (`TORCHINFERNO_CONTINUOUS_FLASHINFER_PREFILL_DISABLE=0`)
+regressed badly to `1253.5 / 89.4 / 1422.5ms` and only `1.1 tok/s`, versus the
+nearby dense baseline around `433.2 / 63.2 / 501.4ms`; the queue profile showed
+`134.4s` aggregate phase time. Finished-prefix caching still needs a batching
+redesign: enabling `TORCHINFERNO_CONTINUOUS_FINISHED_PREFIX_CACHE=1` cut
+prefill tokens but fragmented into hundreds of tiny batches
+(`485` prefill batches, `463` graph misses, `101.99s` prefill wall), and adding
+mixed-prefix graph grouping with
+`TORCHINFERNO_CONTINUOUS_MIXED_PREFIX_PREFILL{,_GRAPH}=1` stalled after only
+`68` submitted / `36` finished requests and was terminated. Lowering the online
+FP8 prefill gate to `512` for multi_turn was neutral-to-worse
+(`431.2 / 66.9 / 502.9ms`, `10.63s` prefill wall), so keep the `2048` runtime
+M gate.
+
+Long-output rechecks also did not produce a clean promotion. The focused
+baseline landed at `405.1 / 27.0 / 1461.9ms`, with `40` prefill graph batches,
+`11.98s` prefill wall, and `14.81s` active decode. Enabling greedy-short
+decode_many slightly improved TPOT but regressed TTFT/E2E
+(`436.1 / 26.2 / 1647.8ms`) and left active decode essentially unchanged
+(`14.77s`). Forcing the paged online engine on this short-context shape with
+`TORCHINFERNO_OPENAI_PAGED_KV_MIN_SEQ=1` is a clear regression
+(`1642.4 / 146.4 / 7015.1ms`, `5.3 tok/s`), validating the current long-context
+threshold. Lowering the greedy-short refill floor from `16` to `8` improved
+TTFT (`353.1ms`) but raised prefill fragmentation (`56` prefill batches) and
+did not clearly improve E2E/TPOT (`27.5 / 1523.0ms`); keep the current
+16-request refill floor.
+
 Tree sampled-medium row-cap refresh is rejected on the current startup/symm
 stack. The 32-row focused baseline on `a180fbb` landed at
 `280.5 / 52.2 / 321.6ms` (TTFT/TPOT/E2E), with `55` prefill batches,
