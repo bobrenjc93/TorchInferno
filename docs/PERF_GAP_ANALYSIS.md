@@ -202,7 +202,10 @@ rose (`45.0k -> 97.7k`), but prefill wall jumped (`11.3s -> 28.1s`) and
 prefill forward rose (`10.8s -> 15.8s`) because the mixed-prefix path hit only
 four prefill graphs. Forcing mixed-prefix graph capture did not fix it: the row
 landed at `1740.4 / 80.2 / 1813.2ms`, p99 E2E `4565.8ms`, with `31` prefill
-graph misses and `28.5s` prefill wall. Keep this path opt-in until
+graph misses and `28.5s` prefill wall. An experimental static prefix-prefill
+batch bucket did not change the graph-miss pattern (`3` hits / `31` misses) and
+still landed at `1726.2 / 69.9 / 1790.9ms` with `27.4s` prefill wall, so that
+code was backed out. Keep this path opt-in until
 mixed-prefix reuse can stay on stable captured graph shapes.
 
 ## CURRENT SAME-HOST REFRESH AND TREE WAIT RECHECKS (2026-06-23)
