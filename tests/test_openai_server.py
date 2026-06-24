@@ -7707,7 +7707,7 @@ def test_openai_symm_mem_auto_probe_sets_worker_env_on_failure(monkeypatch) -> N
     assert os.environ["TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE"] == "0"
 
 
-def test_openai_symm_mem_auto_probe_defaults_off(monkeypatch) -> None:
+def test_openai_symm_mem_auto_probe_defaults_on(monkeypatch) -> None:
     monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE", raising=False)
     monkeypatch.delenv("TORCHINFERNO_SYMM_MEM_ALLREDUCE", raising=False)
     monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_AUTO_PROBE", raising=False)
@@ -7723,8 +7723,8 @@ def test_openai_symm_mem_auto_probe_defaults_off(monkeypatch) -> None:
     config = OpenAIServerConfig(model="meta-llama/Llama-3.1", tensor_parallel_size=8)
     _prepare_tensor_parallel_symm_mem_allreduce_auto(config)
 
-    assert calls == []
-    assert os.environ["TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE"] == "0"
+    assert calls == [8]
+    assert os.environ["TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE"] == "1"
 
 
 def test_openai_symm_mem_auto_probe_can_be_disabled(monkeypatch) -> None:
@@ -7772,7 +7772,7 @@ def test_openai_symm_mem_probe_timeout_default_and_override(
         assert command[-1] == "torchinferno.openai_server"
         assert kwargs["env"]["TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_PROBE"] == "1"
         assert kwargs["env"]["TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE"] == "1"
-        assert kwargs["env"]["TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_PROBE_MAX_BATCH"] == "64"
+        assert kwargs["env"]["TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_PROBE_MAX_BATCH"] == "128"
         assert kwargs["start_new_session"] is True
         return FakeProbeProcess()
 
@@ -7871,7 +7871,7 @@ def test_openai_symm_mem_scope_enables_explicit_short_deterministic_decode(monke
     ):
         pass
 
-    assert captured == [(64, True)]
+    assert captured == [(128, True)]
 
 
 def test_openai_symm_mem_scope_disables_long_generations(monkeypatch) -> None:
@@ -7907,7 +7907,7 @@ def test_openai_symm_mem_scope_disables_long_generations(monkeypatch) -> None:
     ):
         pass
 
-    assert captured == [(64, True), (None, False)]
+    assert captured == [(128, True), (None, False)]
 
 
 def test_openai_symm_mem_validation_is_openai_opt_in(monkeypatch) -> None:

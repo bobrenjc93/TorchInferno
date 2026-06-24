@@ -1,5 +1,44 @@
 # TorchInferno vs vLLM/sglang — Performance Gap Analysis (Llama-3.1-70B, 8xH100)
 
+## CURRENT SAME-HOST REFRESH AFTER OPENAI SYMM-MEM PROBE (2026-06-24, baseline f0c333d)
+
+Same-host public-style inference-bench run `20260624_055652` with TorchInferno
+`f0c333d`, vLLM `d4448b5`, and SGLang `84a7a84` landed at vLLM 14 scorecard
+wins, SGLang 3, and TorchInferno 2. TorchInferno's two scorecard wins remain
+few_shot TPOT/E2E (`54.5 / 214.1ms`), while the remaining same-host gaps are
+self_consistency E2E (`377.1ms` vs vLLM `326.0ms`), multi_turn E2E
+(`512.4ms` vs `242.0ms`), tree_of_thought E2E (`333.0ms` vs `101.8ms`), and
+long_output decode/E2E (`32.2 / 1543.2ms` vs vLLM `18.8 / 771.6ms`).
+
+Opting the OpenAI TP path into symmetric-memory decode allreduce is broadly
+positive on this host. A TorchInferno-only all-row probe with explicit
+`TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE=1` and a 256-row cap preserved
+correctness and moved the rows to few_shot `152.9 / 52.3 / 194.9ms`,
+self_consistency `218.5 / 0.0 / 356.7ms`, multi_turn `428.2 / 66.2 / 502.3ms`,
+tree_of_thought `291.0 / 52.0 / 326.3ms`, and long_output
+`297.5 / 28.6 / 1438.6ms` (TTFT/TPOT/E2E). The promoted no-env default path
+runs the existing graph-aware symm-memory probe and enables decode symm only
+after a successful collective probe. With the default 128-row cap, the
+score-facing no-env check preserved correctness and landed at few_shot
+`151.8 / 50.4 / 193.6ms`, self_consistency `312.8 / 0.0 / 381.8ms`,
+multi_turn `429.9 / 62.9 / 499.1ms`, tree_of_thought
+`216.4 / 50.7 / 254.0ms`, and long_output `334.7 / 27.6 / 1503.9ms`.
+Self-consistency was noisy and not improved in that broad run, but the other
+score-facing rows narrowed without changing benchmark semantics.
+
+Two follow-ups are rejected. Enabling eager prefill symm-mem alongside decode
+symm regressed few_shot p99 and did not help median TTFT (`155.3 / 51.6 /
+199.7ms`), and the same prefill setting on long_output regressed TTFT
+(`336.9 / 27.9 / 1512.3ms`). Combining decode symm with the long_output
+`decode_many` path improved TTFT (`249.6ms`) but lost TPOT/E2E versus decode-only
+symm (`29.2 / 1464.3ms` vs `28.6 / 1438.6ms`). Keep prefill symm and
+`decode_many` opt-in.
+
+The greedy-large first-batch wait is also still rejected. Raising
+`TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_INITIAL_BATCH_WAIT_MS` from the
+default 5ms to 10ms preserved correctness but regressed multi_turn to
+`447.8 / 77.3 / 535.0ms` with worse p99. Keep the current 5ms default.
+
 ## CURRENT SAME-HOST REFRESH AFTER SAMPLED-MEDIUM IDLE (2026-06-24, current 6059831)
 
 Same-host inference-bench run `20260624_015224` with vLLM `8dd1b702f27e`,

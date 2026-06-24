@@ -10193,13 +10193,12 @@ def _prepare_tensor_parallel_symm_mem_allreduce_auto(config: OpenAIServerConfig)
         return
     if raw_openai is not None and raw_openai.strip().lower() not in {"auto", "probe"}:
         return
-    # Symmetric-memory allreduce can hang inside CUDA multicast rendezvous on
-    # some TP hosts. A short preflight probe is not enough: local TP8 repros have
-    # passed the probe and then hung later during ragged decode graph warmup.
-    # Keep the OpenAI server on NCCL by default; operators can still opt in with
-    # TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_AUTO_PROBE=1 or an explicit
-    # TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE=1 after validating their host.
-    if not env_flag("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_AUTO_PROBE", False):
+    # Symmetric-memory allreduce is a measurable TP decode win on 8xH100, but
+    # multicast support is host-dependent. Probe by default and propagate a
+    # concrete worker env value so all ranks either use symm-mem together or stay
+    # on NCCL together. Operators can still force it off with the auto-probe env
+    # or explicit TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE=0.
+    if not env_flag("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_AUTO_PROBE", True):
         os.environ[openai_env] = "0"
         return
     if int(getattr(config, "tensor_parallel_size", 1)) <= 1:
@@ -10252,7 +10251,7 @@ def _run_tensor_parallel_symm_mem_allreduce_probe(config: OpenAIServerConfig) ->
         env["TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE"] = "1"
         env.setdefault(
             "TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_PROBE_MAX_BATCH",
-            str(env_int("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_MAX_BATCH", 64, minimum=1)),
+            str(env_int("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_MAX_BATCH", 128, minimum=1)),
         )
         proc = subprocess.Popen(
             command,
@@ -10312,7 +10311,7 @@ def _tensor_parallel_symm_mem_allreduce_scope(
         return symm_mem_allreduce_max_batch(None, enabled=False)
     if not _openai_tp_symm_mem_allreduce_enabled():
         return symm_mem_allreduce_max_batch(None, enabled=False)
-    max_batch = env_int("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_MAX_BATCH", 64, minimum=1)
+    max_batch = env_int("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_MAX_BATCH", 128, minimum=1)
     return symm_mem_allreduce_max_batch(max_batch, enabled=True)
 
 
