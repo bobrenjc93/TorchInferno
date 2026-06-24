@@ -43,6 +43,17 @@ validation kept startup healthy: 8-GPU NCCL `reduce_scatter_tensor` smoke passed
 and a real Llama server on port 8090 loaded all `80/80` layers in `27.6s` and
 reached `/health`.
 
+Follow-up full local inference-bench run `20260624_205205` on TorchInferno
+`2af6f8f` completed all providers and supersedes the failed startup row for
+local comparison. Scorecard wins were TorchInferno `4/20`, vLLM `15/20`, and
+SGLang `0/20`. TorchInferno won few_shot TTFT/TPOT/E2E
+(`154.6 / 51.2 / 197.6ms`) and multi_turn TPOT (`67.5ms`), but still trails
+vLLM on self_consistency E2E (`370.4ms` vs `352.5ms`), tree TTFT/E2E
+(`285.4 / 330.4ms` vs `73.9 / 101.2ms`), and long_output decode/e2e
+(`24.8 / 1387.3ms` vs `18.8 / 768.1ms`). The checkpoint scatter change is a
+startup hardening fix; it does not materially close the runtime prefill/decode
+gaps.
+
 Several current-loop A/Bs are rejected on `76107de`. Runtime FlashInfer prefill
 for multi_turn (`TORCHINFERNO_CONTINUOUS_FLASHINFER_PREFILL_DISABLE=0`)
 regressed badly to `1253.5 / 89.4 / 1422.5ms` and only `1.1 tok/s`, versus the
