@@ -29,6 +29,19 @@ the TP server max-batch limit still held `max_active=128`, the profile showed
 `1545.5 / 1651.5ms`. Do not add a sampled 256-row policy without first changing
 and validating the effective TP max-batch limit.
 
+Few-shot startup/knob rechecks on current `b5cdbfc` are rejected. A 2ms initial
+collection wait landed at `173.6 / 59.2 / 222.5ms`, worse than the nearby guard
+run (`162.0 / 54.8 / 205.9ms`). Broad model-level FP8 with
+`TORCHINFERNO_FP8_PREFILL=1` and `TORCHINFERNO_FP8_PREFILL_MIN_M=1024` landed at
+`163.6 / 53.7 / 208.7ms`: a small TPOT move, but median E2E and throughput did
+not beat the no-FP8 guard, so keep few_shot out of the default FP8 policy.
+Common-prefix suffix prefill warmup is also not defaultable. The broad suffix
+warmup (`16,32,64,128,256`) needed 331.4s to reach readiness before any request
+was served. A narrowed `suffix_tokens=16,batches=32` run still needed 231.1s
+startup, regressed p99 TTFT/E2E to `2186.0 / 2242.1ms`, and did not remove
+runtime prefill graph misses in the queue profile. Keep suffix-prefill warmup
+opt-in only; the few_shot gap is not a startup graph-capture issue.
+
 ## MULTI-TURN RUNTIME FP8 PREFILL GATE (2026-06-23)
 
 Global `TORCHINFERNO_FP8_PREFILL=1` remains rejected because it previously
