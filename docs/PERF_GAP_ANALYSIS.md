@@ -49,6 +49,12 @@ increased decode-active time. The live row regressed to
 same-host default self row at `321.4 / 0.0 / 424.7ms` and p99 E2E `904.4ms`.
 Keep uniform-ragged decode off for sampled identical-prompt traffic.
 
+Self-consistency is not a queue-profile overhead artifact. A no-profile default
+run on `6b1ae7e` landed at `358.2 / 0.0 / 450.6ms`, `2.2 tok/s`, p99 E2E
+`1703.5ms`, worse than the profiled same-host full-run row. Keep using queue
+profiles for diagnosis; the self gap needs scheduling/decode work, not less
+instrumentation.
+
 Few-shot startup/knob rechecks on current `b5cdbfc` are rejected. A 2ms initial
 collection wait landed at `173.6 / 59.2 / 222.5ms`, worse than the nearby guard
 run (`162.0 / 54.8 / 205.9ms`). Broad model-level FP8 with
