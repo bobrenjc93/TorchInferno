@@ -323,6 +323,15 @@ Raising the sampled-medium persistent idle above that default is rejected.
 work waves and increased score-facing median latency versus the current 100ms
 default/full-run band. Keep sampled-medium persistent idle at 100ms.
 
+Sampled-medium row-cap midpoints remain non-defaultable on current `bb744e1`.
+The no-profile 32-row control was `291.9 / 57.0 / 331.3ms`, 957/992 raw
+correct. Raising only `TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_MAX_ACTIVE`
+to 40 improved TTFT/E2E to `250.8 / 60.3 / 308.4ms`, 960/992, but regressed
+TPOT, throughput, and p99s. The 36-row midpoint was worse outright at
+`336.4 / 58.5 / 381.3ms`, 961/992. Keep the current 32-row sampled-medium cap
+until a prefill/decode pipeline change can improve queue latency without adding
+decode pressure.
+
 Down-projection Marlin remains rejected for long_output too. A current
 TorchInferno-only recheck with `TORCHINFERNO_MARLIN_INT4_DOWN=1` completed
 1000/1000 correct but landed at 315.5 / 32.7 / 1677.1ms and 21.4 tok/s, worse
