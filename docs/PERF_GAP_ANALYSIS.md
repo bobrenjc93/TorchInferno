@@ -13,6 +13,15 @@ remains real, but the full sequential run is noisier and still far from vLLM's
 `184.1 / 57.4 / 235.5ms` multi_turn row; do not treat FP8 prefill as sufficient
 for the multi_turn queueing gap.
 
+The public `20260623_221253` TorchInferno `_server` row is stale with respect
+to later startup fixes. It failed in a 600s NCCL `BROADCAST` watchdog while
+broadcasting a 234M-element checkpoint tensor from rank 0 at TorchInferno
+`5ad5429`. Current main is past `9da03cc`, where TP rank-0 checkpoint tensor
+broadcast became opt-in, and inference-bench main now also defaults
+`NCCL_CUMEM_ENABLE=0` for TorchInferno. Treat that public row as a startup
+integration failure from an old commit, not as evidence about current runtime
+latency.
+
 Paged-KV multi_turn remains rejected on current `2fd31a9`. Rechecking
 `TORCHINFERNO_OPENAI_PAGED_KV_MIN_SEQ=512` with
 `TORCHINFERNO_PAGED_PREFIX_CACHE=1` no longer failed readiness (server ready in
