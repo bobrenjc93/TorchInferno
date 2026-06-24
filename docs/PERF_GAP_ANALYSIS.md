@@ -65,6 +65,14 @@ run on `6b1ae7e` landed at `358.2 / 0.0 / 450.6ms`, `2.2 tok/s`, p99 E2E
 profiles for diagnosis; the self gap needs scheduling/decode work, not less
 instrumentation.
 
+Self-consistency global Marlin-int4 decode disable is rejected on current
+`9750616`. Rechecking with `TORCHINFERNO_MARLIN_INT4_DECODE=0` landed at
+`347.2 / 0.0 / 433.6ms`, `2.3 tok/s`, p99 E2E `1571.3ms`, worse than the
+same-host default self row at `321.4 / 0.0 / 424.7ms`. The queue profile also
+regressed from the default's `37` decode batches and about `4602ms` batcher wall
+time to `39` decode batches and `4696ms`. Keep Marlin decode enabled for the
+sampled short-row path; disabling it is not a current self-consistency lever.
+
 Few-shot startup/knob rechecks on current `b5cdbfc` are rejected. A 2ms initial
 collection wait landed at `173.6 / 59.2 / 222.5ms`, worse than the nearby guard
 run (`162.0 / 54.8 / 205.9ms`). Broad model-level FP8 with
