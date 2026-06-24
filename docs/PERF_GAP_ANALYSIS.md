@@ -93,6 +93,14 @@ generated-prefix reuse stayed at `0`; the adopted rows fragmented prefill into
 mostly single-prefix work instead of producing reusable conversation-session
 batches. Keep this cache path opt-in until it has a row budget and batching
 policy that can reuse finished prefixes without destroying prefill shape.
+Greedy-large idle-arrival collection is rejected on current `b15b006`.
+`TORCHINFERNO_OPENAI_TP_ONLINE_COLLECT_IDLE_ARRIVALS=1` completed multi_turn
+with 100% benchmark correctness and medians of `442.2 / 74.0 / 527.7ms`, but
+the profile moved the wrong way: total batcher time `13452ms`, prefill wall
+`11583ms`, and `35` prefill batches versus the nearby dense baseline around
+`12185ms` total / `10327ms` prefill wall / `34` prefill batches. The slightly
+lower TTFT does not justify the TPOT and aggregate prefill regression; leave
+idle collection scoped to sampled-short traffic.
 
 Long-output decode-quantum rechecks are rejected. Current default `8` in the
 full run landed at `294.0 / 33.2 / 1674.3ms`, `24.5 tok/s`. Focused env-only
