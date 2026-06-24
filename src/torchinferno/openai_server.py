@@ -3390,11 +3390,22 @@ class OpenAICompletionEngine:
             temperature=first.temperature,
             max_tokens=run_max_tokens,
         )
+        admit_min_ready_requests = _online_refill_min_ready_requests(
+            temperature=first.temperature,
+            max_tokens=run_max_tokens,
+        )
+        admit_per_step_cap = _online_admit_per_step_cap(
+            temperature=first.temperature,
+            max_tokens=run_max_tokens,
+        )
         engine_create_start_s = time.perf_counter()
         runtime_engine = self._maybe_build_paged_online_engine(max_active=max_active, max_seq_len=max_seq_len)
         use_paged_engine = runtime_engine is not None
+        normalized_prefill_budget = prefill_budget if prefill_budget > 0 else None
+        graph_prefill = False
+        prefill_chunk_size: int | None = None
+        pin_shared_prefix = False
         if not use_paged_engine:
-            normalized_prefill_budget = prefill_budget if prefill_budget > 0 else None
             graph_prefill = env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_GRAPH_PREFILL", True)
             prefill_chunk_size = env_int("TORCHINFERNO_OPENAI_TP_ONLINE_PREFILL_CHUNK", 0, minimum=0) or None
             pin_shared_prefix = env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_PIN_SHARED_PREFIX", True)
@@ -3414,14 +3425,8 @@ class OpenAICompletionEngine:
                 graph_prefill=graph_prefill,
                 prefill_chunk_size=prefill_chunk_size,
                 profile_timings=profile_queue,
-                admit_min_ready_requests=_online_refill_min_ready_requests(
-                    temperature=first.temperature,
-                    max_tokens=run_max_tokens,
-                ),
-                admit_per_step_cap=_online_admit_per_step_cap(
-                    temperature=first.temperature,
-                    max_tokens=run_max_tokens,
-                ),
+                admit_min_ready_requests=admit_min_ready_requests,
+                admit_per_step_cap=admit_per_step_cap,
                 enable_decode_many=use_decode_many,
             )
         decode_runner = getattr(self, "_decode_graph_runner", None)
@@ -3476,6 +3481,21 @@ class OpenAICompletionEngine:
                 max_active=max_active,
                 prefix_rows=prefix_rows,
                 decode_quantum=decode_quantum,
+                requested_max_batch=requested_max_batch,
+                initial_wait_ms=round(initial_wait_s * 1000.0, 3),
+                idle_batch_wait_ms=round(idle_wait_s * 1000.0, 3),
+                collect_idle_arrivals=collect_idle_arrivals,
+                admit_min_ready_requests=admit_min_ready_requests,
+                admit_per_step_cap=admit_per_step_cap,
+                prefill_token_budget=normalized_prefill_budget or 0,
+                enable_ragged_decode=enable_ragged_decode,
+                use_decode_many=use_decode_many,
+                use_paged_engine=use_paged_engine,
+                graph_prefill=graph_prefill,
+                prefill_chunk_size=prefill_chunk_size or 0,
+                pin_shared_prefix=pin_shared_prefix,
+                store_reusable_prefixes=store_reusable_prefixes,
+                store_full_prompt_prefixes=store_full_prompt_prefixes,
                 fp8_prefill_enabled=fp8_prefill_enabled,
                 fp8_prefill_min_m=fp8_prefill_min_m,
                 online_steps=step,

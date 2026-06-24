@@ -12070,6 +12070,21 @@ def test_openai_tensor_parallel_online_batcher_records_profile_snapshots(
     assert records[2]["profile_snapshots"] == 2
     assert records[2]["online_step_commands"] == 3
     assert records[2]["runtime_decode_tokens"] == 3
+    assert records[2]["requested_max_batch"] == 4
+    assert records[2]["initial_wait_ms"] == 0.0
+    assert records[2]["idle_batch_wait_ms"] == 0.0
+    assert records[2]["collect_idle_arrivals"] is False
+    assert records[2]["admit_min_ready_requests"] == 8
+    assert records[2]["admit_per_step_cap"] == 64
+    assert records[2]["prefill_token_budget"] == 0
+    assert records[2]["enable_ragged_decode"] is True
+    assert records[2]["use_decode_many"] is False
+    assert records[2]["use_paged_engine"] is False
+    assert records[2]["graph_prefill"] is True
+    assert records[2]["prefill_chunk_size"] == 0
+    assert records[2]["pin_shared_prefix"] is True
+    assert records[2]["store_reusable_prefixes"] is True
+    assert records[2]["store_full_prompt_prefixes"] is True
 
 
 def test_openai_tensor_parallel_online_default_prefix_rows(monkeypatch: pytest.MonkeyPatch) -> None:
