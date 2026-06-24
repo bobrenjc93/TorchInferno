@@ -18,6 +18,17 @@ readiness in `231s` and loaded all `80/80` layers in `25.3s`
 The inference-bench TorchInferno provider should no longer force
 `TORCHINFERNO_TP_RANK0_CHECKPOINT_BROADCAST=0`.
 
+Tree sampled-medium row-cap refresh on `a180fbb`: focused tree_of_thought queue
+profiles kept the same correctness envelope and showed the current 32-row cap is
+slightly under-filled. The 32-row baseline landed at `280.5 / 52.2 / 321.6ms`
+(TTFT/TPOT/E2E), with `55` prefill batches, `4373.8ms` prefill forward, `114`
+decode batches, and `150` scheduler steps. Raising only
+`TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_MAX_ACTIVE` to `40` improved the
+same focused row to `256.4 / 52.5 / 310.4ms`, while reducing prefill batches to
+`50`, prefill forward to `3877.7ms`, decode batches to `99`, and scheduler steps
+to `136`. A 48-row check regressed to `362.8 / 53.3 / 396.4ms`, so promote 40
+as the sampled-medium knee and keep larger row caps rejected.
+
 ## CURRENT SAME-HOST REFRESH AFTER OPENAI SYMM-MEM PROBE (2026-06-24, baseline f0c333d)
 
 Same-host public-style inference-bench run `20260624_055652` with TorchInferno
