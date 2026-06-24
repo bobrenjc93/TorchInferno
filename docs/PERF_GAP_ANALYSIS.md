@@ -182,6 +182,16 @@ The live few_shot guard stayed out of the policy: it recorded
 an explicit broad override; the default path should only use the runtime setter
 for greedy-large online sessions.
 
+Lowering the online FP8 prefill M gate to 1024 is rejected on current
+`4a812bc`. A same-commit multi_turn control with the default 2048 gate landed at
+`440.7 / 67.8 / 512.1ms`, p99 E2E `2752.6ms`, with 982/1000 raw correct. The
+1024-gated run preserved correctness and slightly moved TTFT to `439.2ms`, but
+regressed TPOT/E2E to `73.7 / 517.6ms` and worsened p99 TPOT
+(`124.6ms -> 164.8ms`). Queue profiles showed the same 34 prefill batches,
+about 79k prefill tokens, and 86 decode batches in both runs; the lower gate's
+smaller aggregate batcher wall did not translate to client-observed latency.
+Keep the scoped greedy-large runtime FP8 gate at `min_m=2048`.
+
 ## CURRENT SAME-HOST REFRESH AND TREE WAIT RECHECKS (2026-06-23)
 
 After the greedy-large initial-wait patch, a current same-host four-row
