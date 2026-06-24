@@ -208,6 +208,19 @@ still landed at `1726.2 / 69.9 / 1790.9ms` with `27.4s` prefill wall, so that
 code was backed out. Keep this path opt-in until
 mixed-prefix reuse can stay on stable captured graph shapes.
 
+Multi-turn prefix-suffix bucket splitting is rejected on current `cc727c2` +
+instrumentation. The new queue-profile shape histograms showed the default
+multi_turn path was not missing graphs: it had 34 prefill graph hits, zero
+misses, one 45-token common prefix, and 33 graph-backed prefix-reuse suffix
+waves under the same source prefix. Splitting prefix-reuse groups by suffix
+bucket reduced padded prefill tokens only slightly (`79.3k -> 75.7k`) but
+fragmented the run into 53 prefill batches and doubled prefill wall
+(`10.3s -> 21.6s`, forward `9.8s -> 21.1s`). The live row regressed from the
+nearby control `439.8 / 71.3 / 506.1ms` to
+`1491.8 / 72.0 / 1543.3ms`, with p99 E2E `3073.4ms` and 980/1000 raw correct.
+Keep common-prefix reuse batched by prefix; the useful direction is fewer
+prefill waves or faster large-bucket prefill, not splitting suffix buckets.
+
 ## CURRENT SAME-HOST REFRESH AND TREE WAIT RECHECKS (2026-06-23)
 
 After the greedy-large initial-wait patch, a current same-host four-row

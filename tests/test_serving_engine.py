@@ -1155,6 +1155,33 @@ def test_continuous_batch_engine_respects_common_prefix_ragged_suffix_threshold(
     assert engine.stats.prefix_reuse_requests == 0
 
 
+def test_continuous_batch_engine_records_profile_shape_counts() -> None:
+    shared = tuple(range(16))
+    model = _SelectedLogitsToyModel()
+    engine = ContinuousBatchEngine(
+        model,
+        device=torch.device("cpu"),
+        max_active_requests=4,
+        prefix_cache_capacity=4,
+        graph_prefill=True,
+        profile_timings=True,
+    )
+    requests = [
+        ServingRequest("a", (*shared, 21), 2, arrival_step=0),
+        ServingRequest("b", (*shared, 22, 23, 24), 2, arrival_step=0),
+        ServingRequest("c", (*shared, 25, 26), 2, arrival_step=0),
+    ]
+
+    results = engine.run(requests)
+
+    assert len(results) == 3
+    assert engine.stats.prefill_shape_counts["common_prefix:b1:t16"] == 1
+    assert engine.stats.prefill_shape_counts[
+        "prefix_graph:b4:s4:p16-16:src1:mixed0"
+    ] == 1
+    assert any(key.startswith("ragged:b3/") for key in engine.stats.decode_shape_counts)
+
+
 def test_continuous_batch_engine_raises_common_prefix_ragged_suffix_threshold_for_greedy_short(
     monkeypatch,
 ) -> None:

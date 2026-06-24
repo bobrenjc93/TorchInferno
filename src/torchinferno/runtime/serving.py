@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import time
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from inspect import signature
 from typing import Callable, Hashable, Iterator, Optional
 
@@ -139,6 +139,8 @@ class ServingStats:
     generated_prefix_store_requests: int = 0
     generated_prefix_reuse_requests: int = 0
     generated_prefix_reuse_tokens: int = 0
+    prefill_shape_counts: dict[str, int] = field(default_factory=dict)
+    decode_shape_counts: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -1327,6 +1329,7 @@ class ContinuousBatchEngine:
             prefix_logits, _ = self._prefill_logits(prefix_ids, cache=self._cache_view([prefix_row]))
             self._refresh_row_seq_len_from_cache(prefix_row, prefix_tokens)
             self._record_model_call("prefill", 1, tokens=prefix_ids.numel())
+            self._record_shape_count(self.stats.prefill_shape_counts, f"common_prefix:b1:t{prefix_tokens}")
             self.stats.prefill_common_prefix_batches += 1
             prefix_tuple = tuple(group[0][1].prompt[:prefix_tokens])
             common_route = ("common_prefix", prefix_tuple)
@@ -1642,6 +1645,15 @@ class ContinuousBatchEngine:
                     source_prefix_rows.append(source_prefix_rows[0])
             if not mixed_prefixes and len(set(source_prefix_rows)) == 1:
                 source_prefix_rows = [source_prefix_rows[0]]
+            self._record_shape_count(
+                self.stats.prefill_shape_counts,
+                "prefix_graph:"
+                f"b{batch_bucket}:"
+                f"s{suffix_bucket}:"
+                f"p{min(prefix_hits)}-{max(prefix_hits)}:"
+                f"src{len(source_prefix_rows)}:"
+                f"mixed{int(mixed_prefixes)}",
+            )
             if self.profile_timings:
                 self.stats.prefill_copy_ms += (time.perf_counter() - copy_start_s) * 1000.0
             setup_start_s = time.perf_counter() if self.profile_timings else 0.0
@@ -2157,6 +2169,7 @@ class ContinuousBatchEngine:
         self.stats.prefill_plain_batches += 1
         rows = [self._acquire_active_row() for _ in group]
         prompts = torch.tensor([request.prompt for _, request, _ in group], device=self.device, dtype=torch.long)
+        self._record_shape_count(self.stats.prefill_shape_counts, f"plain:b{len(group)}:t{prompts.size(1)}")
         cache_view = self._cache_view(rows)
         logits, _ = self._prefill_logits(prompts, cache=cache_view)
         self._record_model_call("prefill", len(group), tokens=prompts.numel())
@@ -2210,6 +2223,10 @@ class ContinuousBatchEngine:
         max_len = max(lengths)
         suffix_bucket = self._suffix_bucket(max_len)
         batch_bucket = self._prefill_batch_bucket(len(group))
+        self._record_shape_count(
+            self.stats.prefill_shape_counts,
+            f"ragged_graph:b{batch_bucket}:t{suffix_bucket}",
+        )
         padded = []
         for _, request, _ in group:
             prompt = list(request.prompt)
@@ -2299,6 +2316,10 @@ class ContinuousBatchEngine:
         rows = [self._acquire_active_row() for _ in group]
         lengths = [len(request.prompt) for _, request, _ in group]
         max_len = max(lengths)
+        self._record_shape_count(
+            self.stats.prefill_shape_counts,
+            f"padded_plain:b{len(group)}:t{min(lengths)}-{max_len}",
+        )
         padded = []
         logit_positions = []
         for _i, (_, request, _) in enumerate(group):
@@ -2378,6 +2399,7 @@ class ContinuousBatchEngine:
 
         if suffix:
             input_ids = torch.tensor([suffix], device=self.device, dtype=torch.long)
+            self._record_shape_count(self.stats.prefill_shape_counts, f"single:b1:t{input_ids.size(1)}")
             logits, _ = self._prefill_logits(input_ids, cache=self._cache_view([row]))
             self._record_model_call("prefill", 1, tokens=input_ids.numel())
         elif reusable is not None and reusable.logits is not None:
@@ -2942,6 +2964,10 @@ class ContinuousBatchEngine:
             tokens=len(states) * (proposal_len + 1),
             ragged=True,
         )
+        self._record_shape_count(
+            self.stats.decode_shape_counts,
+            f"prompt_lookup:b{len(states)}:proposal{proposal_len}",
+        )
         self.stats.prompt_lookup_batches += 1
         self.stats.prompt_lookup_requests += len(states)
         self.stats.prompt_lookup_proposed_tokens += sum(len(proposal) for proposal in proposals)
@@ -3004,6 +3030,10 @@ class ContinuousBatchEngine:
         decode_rows = self._ragged_decode_bucket_rows(rows)
         n_active = len(states)
         n_padded = len(decode_rows)
+        self._record_shape_count(
+            self.stats.decode_shape_counts,
+            f"ragged:b{n_active}/{n_padded}",
+        )
         pad_token = states[0].last_token
         input_tokens = [
             states[index].last_token if index < n_active else pad_token
@@ -4082,6 +4112,11 @@ class ContinuousBatchEngine:
             self.stats.prefill_tokens += tokens
             self.stats.decode_tokens += tokens
         self.stats.max_model_batch_size = max(self.stats.max_model_batch_size, batch_size)
+
+    def _record_shape_count(self, counts: dict[str, int], key: str) -> None:
+        if not self.profile_timings:
+            return
+        counts[key] = counts.get(key, 0) + 1
 
     def _can_decode_ragged(self, states: list[_ActiveRequest]) -> bool:
         if not self.enable_ragged_decode:

@@ -11011,6 +11011,11 @@ def test_openai_queue_profile_records_runtime_engine_stats(
         scheduler_steps = 6
         max_model_batch_size = 8
         persistent_cache_rows = 12
+        prefill_shape_counts = {
+            "prefix_graph:b8:s16:p45-45:src1:mixed0": 3,
+            "common_prefix:b1:t45": 1,
+        }
+        decode_shape_counts = {"ragged:b8/8": 5}
 
     class RuntimeEngine:
         stats = Stats()
@@ -11038,7 +11043,12 @@ def test_openai_queue_profile_records_runtime_engine_stats(
             "runtime_persistent_cache_rows": 12,
             "runtime_prefill_batches": 2,
             "runtime_prefill_model_calls": 2,
+            "runtime_prefill_shape_counts": {
+                "prefix_graph:b8:s16:p45-45:src1:mixed0": 3,
+                "common_prefix:b1:t45": 1,
+            },
             "runtime_prefill_tokens": 17,
+            "runtime_decode_shape_counts": {"ragged:b8/8": 5},
             "runtime_prefix_reuse_requests": 7,
             "runtime_prefix_reuse_tokens": 53,
             "runtime_queued_requests": 11,

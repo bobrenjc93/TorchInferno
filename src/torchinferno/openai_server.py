@@ -3974,6 +3974,14 @@ class OpenAICompletionEngine:
             value = getattr(stats, name, None)
             if isinstance(value, (int, float)):
                 record[f"runtime_{name}"] = value
+        for name in ("prefill_shape_counts", "decode_shape_counts"):
+            value = getattr(stats, name, None)
+            if isinstance(value, Mapping):
+                top_counts = sorted(
+                    value.items(),
+                    key=lambda item: (-int(item[1]), str(item[0])),
+                )[:32]
+                record[f"runtime_{name}"] = {str(key): int(count) for key, count in top_counts}
         self._record_queue_profile(record)
 
     def _reset_stream_group_profile_extra(self) -> None:
