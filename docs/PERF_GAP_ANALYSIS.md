@@ -132,6 +132,15 @@ run on `6b1ae7e` landed at `358.2 / 0.0 / 450.6ms`, `2.2 tok/s`, p99 E2E
 profiles for diagnosis; the self gap needs scheduling/decode work, not less
 instrumentation.
 
+Self-consistency sampled-short decode quantum 8 is rejected on current
+`fe6b77e`. The shape-count profiled default used `decode_quantum=4` and landed
+at `273.5 / 0.0 / 407.2ms`, 1000/1000 correct, with one common-prefix prefill,
+37 decode batches, and 74 scheduler steps. The env-only
+`TORCHINFERNO_OPENAI_TP_ONLINE_SHORT_GEN_DECODE_QUANTUM=8` run reduced internal
+work only slightly (35 decode batches, 70 scheduler steps) and landed at
+`307.3 / 0.0 / 402.0ms`. The small E2E movement does not justify a scoped
+sampled-short default while median TTFT regresses.
+
 Self-consistency sampled post-arrival collection should stay default-on for now.
 An apples-to-apples current `1b60135` recheck with
 `TORCHINFERNO_OPENAI_TP_ONLINE_COLLECT_IDLE_ARRIVALS=0` landed at
