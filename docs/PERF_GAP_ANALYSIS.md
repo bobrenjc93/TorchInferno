@@ -245,7 +245,10 @@ broaden the generated-prefix threshold to tree without a separate mechanism:
 `TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_SHORT_GENERATED_PREFIX_CACHE_MAX_TOKENS=300`
 did not enable tree hits because the online session rounded to
 `run_max_tokens=400`, and the profiled row was a hard regression
-(`758.8 / 560.5 / 1262.0ms`, zero generated-prefix stores/reuses).
+(`758.8 / 560.5 / 1262.0ms`, zero generated-prefix stores/reuses). Actually
+enabling the threshold at 400 was worse: the no-profile tree row landed at
+`832.0 / 573.3 / 1405.5ms`, so generated-prefix collection must stay out of
+sampled-medium tree traffic.
 
 Self-consistency sampled post-arrival collection should stay default-on for now.
 An apples-to-apples current `1b60135` recheck with
