@@ -233,6 +233,19 @@ generated prefix stored, `983` generated-prefix reuses, and decode batches
 dropping from the prior `37` waves to `1`. Scope the default to sampled
 `max_tokens<=256` traffic so tree's sampled-medium path stays unchanged, and
 preserve the runtime env overrides for manual disable/adaptive experiments.
+Post-promotion validation on `6995c69` confirms the default wiring after a
+preceding few_shot row: the final self profile stored one generated prefix and
+reused it `990` times (`1980` emitted events, `1` prefill batch, `1` decode
+batch), landing at `261.3 / 0.0 / 391.0ms`. The remaining self gap is wave
+formation and TP command overhead, not a missed generated-prefix hit. A
+submit-barrier removal probe (`TORCHINFERNO_OPENAI_TP_ONLINE_SUBMIT_SYNC=0`,
+local patch only) is rejected because the first few_shot row stopped making
+progress after readiness; keep online submit synchronization intact. Do not
+broaden the generated-prefix threshold to tree without a separate mechanism:
+`TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_SHORT_GENERATED_PREFIX_CACHE_MAX_TOKENS=300`
+did not enable tree hits because the online session rounded to
+`run_max_tokens=400`, and the profiled row was a hard regression
+(`758.8 / 560.5 / 1262.0ms`, zero generated-prefix stores/reuses).
 
 Self-consistency sampled post-arrival collection should stay default-on for now.
 An apples-to-apples current `1b60135` recheck with
@@ -432,6 +445,14 @@ support a prefill win: prefill wall regressed versus the focused default
 (`12.26s -> 13.06s`) and p99 E2E rose to `4794ms`. Keep FP8 prefill scoped to
 the existing greedy-large multi_turn path until the FP8 graph path produces a
 clear prefill-wall reduction for short greedy traffic.
+
+Current `6995c69` long_output profile remains in the same dense decode/prefill
+band: `326.4 / 32.0 / 1777.7ms`, `22.9 tok/s`, 1000/1000 correct. The queue
+profile shows `52` prefill batches (`11.64s` prefill wall, `50.1k` prefill
+tokens) and `712` decode graph hits (`16.65s` decode-active, `14.21s` decode
+GPU event time, `13.06s` synchronous token readback exposure). This refresh
+does not reopen the rejected decode-many, FP8-prefill, or larger-wait knobs; the
+remaining long_output gap still needs a real decode/prefill pipeline change.
 
 ## OPENAI TP STARTUP RECHECK (2026-06-23, current 684af9b)
 
