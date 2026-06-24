@@ -200,8 +200,10 @@ illegal-memory crash, but regressed badly to `1769.4 / 78.7 / 1842.4ms`,
 the tradeoff: prefill tokens fell (`79.4k -> 45.3k`) and reused prefix tokens
 rose (`45.0k -> 97.7k`), but prefill wall jumped (`11.3s -> 28.1s`) and
 prefill forward rose (`10.8s -> 15.8s`) because the mixed-prefix path hit only
-four prefill graphs. Keep this path opt-in until mixed-prefix reuse can stay on
-stable captured graph shapes.
+four prefill graphs. Forcing mixed-prefix graph capture did not fix it: the row
+landed at `1740.4 / 80.2 / 1813.2ms`, p99 E2E `4565.8ms`, with `31` prefill
+graph misses and `28.5s` prefill wall. Keep this path opt-in until
+mixed-prefix reuse can stay on stable captured graph shapes.
 
 ## CURRENT SAME-HOST REFRESH AND TREE WAIT RECHECKS (2026-06-23)
 
