@@ -8,7 +8,7 @@ from typing import Sequence
 
 import torch
 import torch.nn.functional as F
-from huggingface_hub import snapshot_download
+from huggingface_hub import snapshot_download, try_to_load_from_cache
 from safetensors import safe_open
 from torch import Tensor
 
@@ -418,6 +418,13 @@ def resolve_llama3_checkpoint(
     candidate = Path(checkpoint).expanduser()
     if candidate.exists():
         return candidate
+    cached = _resolve_cached_llama3_checkpoint(
+        str(checkpoint),
+        revision=revision,
+        cache_dir=cache_dir,
+    )
+    if cached is not None:
+        return cached
     snapshot = snapshot_download(
         repo_id=str(checkpoint),
         revision=revision,
@@ -434,6 +441,32 @@ def resolve_llama3_checkpoint(
         ],
     )
     return Path(snapshot)
+
+
+def _resolve_cached_llama3_checkpoint(
+    repo_id: str,
+    *,
+    revision: str | None,
+    cache_dir: str | Path | None,
+) -> Path | None:
+    cached_files: list[Path] = []
+    for filename in (HF_CONFIG_NAME, SAFETENSORS_INDEX_NAME):
+        cached = try_to_load_from_cache(
+            repo_id=repo_id,
+            filename=filename,
+            revision=revision,
+            cache_dir=str(cache_dir) if cache_dir is not None else None,
+        )
+        if not isinstance(cached, str):
+            return None
+        cached_files.append(Path(cached))
+
+    snapshot = cached_files[0].parent
+    if all(path.parent == snapshot for path in cached_files) and all(
+        (snapshot / filename).exists() for filename in (HF_CONFIG_NAME, SAFETENSORS_INDEX_NAME)
+    ):
+        return snapshot
+    return None
 
 
 def _resolve_devices(devices: Sequence[str | torch.device] | None) -> tuple[torch.device, ...]:
