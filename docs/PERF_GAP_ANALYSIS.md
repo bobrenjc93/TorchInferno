@@ -111,6 +111,13 @@ correctness and improved TTFT to `198.3ms`, but regressed TPOT/E2E to
 89 batches, so the one- or two-step overcompute family is not the current
 long_output lever.
 
+Long-output online step-sync-off remains rejected on current `1338fe5`.
+`TORCHINFERNO_OPENAI_TP_ONLINE_STEP_SYNC=0` preserved correctness and landed at
+`283.7 / 33.3 / 1616.4ms`, which looks like a median E2E improvement, but the
+queue profile regressed total phase time (`29.46s -> 30.21s` versus the current
+focused baseline), prefill batches (`63 -> 67`), and p99 E2E (`5318ms`). The
+removed `154ms` step-sync accounting was not the long_output bottleneck.
+
 Long-output greedy-short KV active cap 64 is rejected on current `aa7a9a9`.
 The hypothesis was that 64 client workers could not use the default 112 active
 rows, so capping `TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_KV_MAX_ACTIVE_CAP=64`
