@@ -10974,6 +10974,7 @@ def test_openai_queue_profile_records_runtime_engine_stats(
         RuntimeEngine(),
         submitted_requests=11,
         decode_quantum=4,
+        temperature=0.7,
     )
 
     records = [json.loads(line) for line in profile_path.read_text().splitlines()]
@@ -10999,6 +11000,7 @@ def test_openai_queue_profile_records_runtime_engine_stats(
             "runtime_ragged_decode_tokens": 29,
             "runtime_scheduler_steps": 6,
             "submitted_requests": 11,
+            "temperature": 0.7,
         }
     ]
 

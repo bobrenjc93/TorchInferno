@@ -3420,6 +3420,7 @@ class OpenAICompletionEngine:
                 initial_batch_size=len(initial_batch),
                 max_seq_len=max_seq_len,
                 run_max_tokens=run_max_tokens,
+                temperature=first.temperature,
                 max_active=max_active,
                 prefix_rows=prefix_rows,
                 decode_quantum=decode_quantum,
