@@ -42,6 +42,18 @@ the profile confirming `decode_many_enabled=true` and `decode_quantum=4`. Do not
 promote decode_many without a safer streaming/stop-token design; the current
 path can reduce CPU synchronization while still hurting client-observed E2E.
 
+Long-output greedy-short KV active cap 64 is rejected on current `aa7a9a9`.
+The hypothesis was that 64 client workers could not use the default 112 active
+rows, so capping `TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_KV_MAX_ACTIVE_CAP=64`
+would restore prefix rows (`32 -> 64`) without losing decode concurrency. The
+run preserved correctness but regressed badly to `710.1 / 54.9 / 2591.2ms`,
+`14.7 tok/s`, versus the no-env current profile at `309.9 / 32.5 / 1740.6ms`,
+`23.1 tok/s`. The profile showed why: max model batch stayed `64`, but prefill
+wall time nearly doubled (`12956ms -> 25058ms`) and prefill batches rose
+(`58 -> 64`). Keep the greedy-short KV cap above the client-worker count; the
+extra active rows reduce queue-facing prefill pressure even when the final decode
+batch size does not exceed 64.
+
 Self-consistency sampled row-cap recheck is also not defaultable. An env-only
 run with `TORCHINFERNO_OPENAI_TP_ONLINE_KV_MAX_ACTIVE_CAP=256` and a matching
 sampled token budget improved median self TTFT/E2E to `268.9 / 410.1ms`, but
