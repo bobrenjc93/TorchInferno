@@ -337,6 +337,14 @@ time, but the score row was `276.6 / 32.0 / 1689.3ms` and throughput fell to
 24.1 tok/s. The long_output gap needs pipeline/readback work rather than a
 larger initial collection window.
 
+Greedy-short runtime FP8 prefill is also rejected for long_output on current
+`0afa3a4`. Forcing `TORCHINFERNO_OPENAI_TP_ONLINE_FP8_PREFILL=1` preserved
+correctness and landed at `309.2 / 31.9 / 1644.3ms`, but the profile did not
+support a prefill win: prefill wall regressed versus the focused default
+(`12.26s -> 13.06s`) and p99 E2E rose to `4794ms`. Keep FP8 prefill scoped to
+the existing greedy-large multi_turn path until the FP8 graph path produces a
+clear prefill-wall reduction for short greedy traffic.
+
 ## OPENAI TP STARTUP RECHECK (2026-06-23, current 684af9b)
 
 Public run `20260623_160941` still used stale TorchInferno bits and failed
