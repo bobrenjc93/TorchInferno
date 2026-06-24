@@ -254,10 +254,18 @@ def _online_kv_bounded_max_active_cap(*, temperature: float, base_cap: int) -> i
     if "TORCHINFERNO_OPENAI_TP_ONLINE_KV_MAX_ACTIVE_CAP" in os.environ:
         return cap
     # Short greedy long_output requests are decode-throughput bound and benefit
-    # from using the full KV-bounded row cap. Broader greedy workloads stay on
-    # the base 48-row policy unless _online_kv_bounded_concurrency_enabled()
-    # opts them into this helper.
-    return min(cap, env_int(greedy_cap_env, 128, minimum=1))
+    # from using most of the KV-bounded row cap, but keeping a small prefix floor
+    # under the 144-row dense cache envelope reduces refill fragmentation.
+    total_budget = env_int("TORCHINFERNO_OPENAI_TP_ONLINE_TOTAL_ROWS_BUDGET", 144, minimum=0)
+    min_prefix_rows = env_int(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_KV_MIN_PREFIX_ROWS",
+        21,
+        minimum=0,
+    )
+    default_greedy_cap = cap
+    if total_budget > min_prefix_rows:
+        default_greedy_cap = min(cap, max(1, total_budget - min_prefix_rows))
+    return min(cap, env_int(greedy_cap_env, default_greedy_cap, minimum=1))
 
 
 def _online_kv_token_budget(*, temperature: float, max_tokens: int) -> int:
@@ -430,48 +438,58 @@ def _online_persistent_idle_ms(*, temperature: float, max_tokens: int) -> float:
     return default_idle_ms
 
 
-def _online_session_max_tokens(*, temperature: float, max_tokens: int) -> int:
-    max_tokens = max(0, int(max_tokens))
-    if max_tokens < 1 or temperature > 0.0:
-        return max_tokens
+def _online_greedy_session_buckets() -> tuple[tuple[int, int], ...]:
     greedy_session_tokens = env_int(
         "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_SESSION_MAX_TOKENS",
         128,
         minimum=0,
     )
     if greedy_session_tokens <= 0:
-        return max_tokens
+        return ()
     greedy_min_tokens = env_int(
         "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_SESSION_MIN_TOKENS",
         16,
         minimum=1,
     )
-    if greedy_min_tokens <= max_tokens <= greedy_session_tokens:
-        return greedy_session_tokens
+    small_session_tokens = min(
+        greedy_session_tokens,
+        env_int(
+            "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SMALL_SESSION_MAX_TOKENS",
+            96,
+            minimum=0,
+        ),
+    )
+    buckets: list[tuple[int, int]] = []
+    if small_session_tokens > 0 and greedy_min_tokens <= small_session_tokens:
+        buckets.append((greedy_min_tokens, small_session_tokens))
+    if greedy_session_tokens > small_session_tokens:
+        buckets.append((
+            max(greedy_min_tokens, small_session_tokens + 1),
+            greedy_session_tokens,
+        ))
+    return tuple(buckets)
+
+
+def _online_session_max_tokens(*, temperature: float, max_tokens: int) -> int:
+    max_tokens = max(0, int(max_tokens))
+    if max_tokens < 1 or temperature > 0.0:
+        return max_tokens
+    for min_tokens, bucket_tokens in _online_greedy_session_buckets():
+        if min_tokens <= max_tokens <= bucket_tokens:
+            return bucket_tokens
     return max_tokens
 
 
 def _online_session_prompt_headroom_tokens(*, temperature: float, max_tokens: int) -> int:
     if max_tokens < 1 or temperature > 0.0:
         return 0
-    greedy_session_tokens = env_int(
-        "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_SESSION_MAX_TOKENS",
-        128,
-        minimum=0,
-    )
-    if greedy_session_tokens <= 0:
-        return 0
-    greedy_min_tokens = env_int(
-        "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_SESSION_MIN_TOKENS",
-        16,
-        minimum=1,
-    )
-    if greedy_min_tokens <= max_tokens <= greedy_session_tokens:
-        return env_int(
-            "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_SESSION_PROMPT_HEADROOM_TOKENS",
-            32,
-            minimum=0,
-        )
+    for min_tokens, bucket_tokens in _online_greedy_session_buckets():
+        if min_tokens <= max_tokens <= bucket_tokens:
+            return env_int(
+                "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_SESSION_PROMPT_HEADROOM_TOKENS",
+                32,
+                minimum=0,
+            )
     return 0
 
 

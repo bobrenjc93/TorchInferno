@@ -8149,8 +8149,10 @@ def test_online_kv_bounded_concurrency_defaults_to_short_outputs(monkeypatch) ->
 def test_online_kv_bounded_max_active_cap_targets_greedy(monkeypatch) -> None:
     monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_KV_MAX_ACTIVE_CAP", raising=False)
     monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_KV_MAX_ACTIVE_CAP", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_TOTAL_ROWS_BUDGET", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_KV_MIN_PREFIX_ROWS", raising=False)
 
-    assert _online_kv_bounded_max_active_cap(temperature=0.0, base_cap=128) == 128
+    assert _online_kv_bounded_max_active_cap(temperature=0.0, base_cap=128) == 123
     assert _online_kv_bounded_max_active_cap(temperature=0.7, base_cap=128) == 128
     assert _online_kv_bounded_max_active_cap(temperature=0.0, base_cap=80) == 80
 
@@ -8159,6 +8161,10 @@ def test_online_kv_bounded_max_active_cap_targets_greedy(monkeypatch) -> None:
 
     monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_KV_MAX_ACTIVE_CAP", raising=False)
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_KV_MAX_ACTIVE_CAP", "128")
+    assert _online_kv_bounded_max_active_cap(temperature=0.0, base_cap=128) == 128
+
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_KV_MAX_ACTIVE_CAP", raising=False)
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_TOTAL_ROWS_BUDGET", "0")
     assert _online_kv_bounded_max_active_cap(temperature=0.0, base_cap=128) == 128
 
 
@@ -8181,6 +8187,7 @@ def test_online_kv_token_budget_uses_sampled_short_default(monkeypatch) -> None:
 
 def test_online_session_max_tokens_buckets_greedy_short_by_default(monkeypatch) -> None:
     monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_SESSION_MAX_TOKENS", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SMALL_SESSION_MAX_TOKENS", raising=False)
     monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_SESSION_MIN_TOKENS", raising=False)
     monkeypatch.delenv(
         "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_SESSION_PROMPT_HEADROOM_TOKENS",
@@ -8188,8 +8195,10 @@ def test_online_session_max_tokens_buckets_greedy_short_by_default(monkeypatch) 
     )
 
     assert _online_session_max_tokens(temperature=0.0, max_tokens=15) == 15
-    assert _online_session_max_tokens(temperature=0.0, max_tokens=16) == 128
-    assert _online_session_max_tokens(temperature=0.0, max_tokens=82) == 128
+    assert _online_session_max_tokens(temperature=0.0, max_tokens=16) == 96
+    assert _online_session_max_tokens(temperature=0.0, max_tokens=82) == 96
+    assert _online_session_max_tokens(temperature=0.0, max_tokens=97) == 128
+    assert _online_session_max_tokens(temperature=0.0, max_tokens=128) == 128
     assert _online_session_max_tokens(temperature=0.0, max_tokens=129) == 129
     assert _online_session_max_tokens(temperature=0.7, max_tokens=82) == 82
     assert _online_session_prompt_headroom_tokens(temperature=0.0, max_tokens=82) == 32
@@ -8201,7 +8210,12 @@ def test_online_session_max_tokens_buckets_greedy_short_by_default(monkeypatch) 
 
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_SESSION_MAX_TOKENS", "96")
     assert _online_session_max_tokens(temperature=0.0, max_tokens=82) == 96
+    assert _online_session_max_tokens(temperature=0.0, max_tokens=97) == 97
     assert _online_session_prompt_headroom_tokens(temperature=0.0, max_tokens=82) == 32
+
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_SESSION_MAX_TOKENS", "128")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SMALL_SESSION_MAX_TOKENS", "0")
+    assert _online_session_max_tokens(temperature=0.0, max_tokens=82) == 128
 
 
 def test_openai_online_persistent_idle_uses_sampled_short_default(monkeypatch) -> None:
@@ -11714,7 +11728,7 @@ def test_openai_tensor_parallel_online_batcher_uses_queued_limit_for_default_row
     assert commands[0] == (
         "start",
         {
-            "max_seq_len": 280,
+            "max_seq_len": 248,
             "max_active_requests": 48,
             "prefix_cache_capacity": 1,
             "prefill_token_budget": None,
@@ -11722,7 +11736,7 @@ def test_openai_tensor_parallel_online_batcher_uses_queued_limit_for_default_row
             "enable_ragged_decode": True,
             "store_reusable_prefixes": True,
             "store_full_prompt_prefixes": True,
-            "max_tokens": 128,
+            "max_tokens": 96,
         },
     )
     assert first_queue.get_nowait() == 500
@@ -11825,7 +11839,7 @@ def test_openai_tensor_parallel_online_batcher_boost_uses_admitted_max_tokens(
             "enable_ragged_decode": True,
             "store_reusable_prefixes": True,
             "store_full_prompt_prefixes": True,
-            "max_tokens": 128,
+            "max_tokens": 96,
         },
     )
     assert commands[1] == (
@@ -11934,7 +11948,7 @@ def test_openai_tensor_parallel_online_batcher_buckets_greedy_short_sessions(
         (
             "start",
             {
-                "max_seq_len": 162,
+                "max_seq_len": 130,
                 "max_active_requests": 4,
                 "prefix_cache_capacity": 1,
                 "prefill_token_budget": None,
@@ -11942,7 +11956,7 @@ def test_openai_tensor_parallel_online_batcher_buckets_greedy_short_sessions(
                 "enable_ragged_decode": True,
                 "store_reusable_prefixes": True,
                 "store_full_prompt_prefixes": True,
-                "max_tokens": 128,
+                "max_tokens": 96,
             },
         ),
         (

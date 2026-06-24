@@ -118,6 +118,15 @@ queue profile regressed total phase time (`29.46s -> 30.21s` versus the current
 focused baseline), prefill batches (`63 -> 67`), and p99 E2E (`5318ms`). The
 removed `154ms` step-sync accounting was not the long_output bottleneck.
 
+Long-output greedy-small session bucketing is promoted after the current local
+recheck. The final no-env default check with a 96-token greedy-small session
+bucket plus a 21-row greedy KV prefix floor landed at
+`307.1 / 31.2 / 1546.8ms`, 1000/1000 correct. The queue profile shows the
+intended shape: `run_max_tokens=96`, `max_active=123`, `prefix_rows=21`,
+`57` prefill batches, and `28.08s` total phase time. This keeps per-token
+streaming intact, unlike decode_many, while reducing refill fragmentation versus
+the prior 128-token bucket / no-prefix-floor shape.
+
 Long-output greedy-short KV active cap 64 is rejected on current `aa7a9a9`.
 The hypothesis was that 64 client workers could not use the default 112 active
 rows, so capping `TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_KV_MAX_ACTIVE_CAP=64`
