@@ -96,9 +96,13 @@ The 192-row, 64-prefix-row variant looked score-positive in isolation
 `282.4 / 0.0 / 393.6ms`, but it regressed focused tree_of_thought to
 `312.8 / 71.8 / 361.2ms`. Forcing the old 128-row startup/batch ceiling
 recovered tree to `230.1 / 56.3 / 272.1ms`, and a narrower runtime-only
-192-row lift crashed self/tree with CUDA device-side asserts. Keep sampled-short
-KV-bounded admission at 128 until a design can raise self concurrency without
-changing tree startup/cache behavior or runtime allocation shape.
+192-row lift crashed self/tree with CUDA device-side asserts. Prewarming 192
+rows while keeping the request batch ceiling at 128 avoided the crash and
+improved self to `234.5 / 0.0 / 372.6ms`, but still regressed tree to
+`246.8 / 70.5 / 356.5ms`, isolating the tree cost to the larger warmed/persistent
+cache shape. Keep sampled-short KV-bounded admission at 128 until a design can
+raise self concurrency without changing tree startup/cache behavior or runtime
+allocation shape.
 
 Self-consistency uniform-ragged decode is rejected. Forcing
 `TORCHINFERNO_CONTINUOUS_UNIFORM_RAGGED_DECODE=1` moved sampled self from static
