@@ -21,6 +21,17 @@ DQ=12 `383.7 / 30.3 / 1594.7ms`, and DQ=16
 TPOT, and still do not beat vLLM (`18.8ms`) or SGLang (`27.2ms`) on TPOT. Keep
 the greedy-short default at 8.
 
+Long-output `decode_many` also stays opt-in. Enabling the existing greedy-short
+multi-step decode path with stop-token overcompute and the default 8-step
+quantum cut queue-profile CPU token-copy time from about 12.9s to 5.0s, but
+regressed the score row to `375.3 / 32.7 / 1726.1ms`, `23.0 tok/s`. A 4-step
+variant looked better as an env-only run (`290.6 / 32.2 / 1575.1ms`,
+`25.1 tok/s`) but worsened p99 and did not reproduce as a no-env default guard:
+the patched default landed at `246.2 / 33.8 / 1852.9ms`, `23.6 tok/s`, despite
+the profile confirming `decode_many_enabled=true` and `decode_quantum=4`. Do not
+promote decode_many without a safer streaming/stop-token design; the current
+path can reduce CPU synchronization while still hurting client-observed E2E.
+
 Self-consistency sampled row-cap recheck is also not defaultable. An env-only
 run with `TORCHINFERNO_OPENAI_TP_ONLINE_KV_MAX_ACTIVE_CAP=256` and a matching
 sampled token budget improved median self TTFT/E2E to `268.9 / 410.1ms`, but
