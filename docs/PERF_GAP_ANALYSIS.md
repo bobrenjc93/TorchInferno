@@ -115,6 +115,22 @@ tokens (`45.8K`), and regressed TTFT/p99 (`442.1ms` median TTFT, `136ms` p99
 TPOT). Revert the experimental gate; the durable gap remains GPU decode work and
 streaming readback, not online-step command count.
 
+Current `89f239a` long-output decode-readback probes keep the same conclusion.
+`TORCHINFERNO_GREEDY_SAMPLE_GATHER=1` is rejected: it preserved correctness but
+regressed the row to `418.5 / 27.7 / 1600.7ms`, with no meaningful reduction in
+decode GPU/readback totals (`12.72s` GPU, `11.65s` CPU-token wait). A bounded
+two-step decode_many experiment that only ran when admission was blocked
+(`TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_DECODE_MANY=1`,
+`TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY_WHEN_ADMISSION_BLOCKED=1`,
+`TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY_ALLOW_STOP=1`,
+`TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY_MAX_STEPS=2`) cut the profiled
+phase total to `24.95s` and token-harvest wait to `6.10s`, but overcomputed
+decode tokens (`45.9K`) and worsened streaming tails (`126.1ms` p99 TPOT,
+`4298.7ms` p99 E2E). The no-profile public-style check was not promotable at
+`378.8 / 26.5 / 1423.6ms`, with `125.1ms` p99 TPOT. Keep decode_many off by
+default; the next viable long-output improvement needs true pipelined token
+readback or lower GPU decode work without bursty streaming emission.
+
 Self-consistency sampled-short rechecks are also rejected on `27d3d7d`. The
 focused no-env profile landed at `377.8 / 0.0 / 404.8ms`; internally it already
 used the intended shortcut shape: one common-prefix prefill, one decode batch,
