@@ -305,6 +305,16 @@ TPOT, 557.5ms E2E, 2.1 tok/s, with the same 979/1000 correctness. Promote the
 5ms initial-wait rejection intact for few_shot and other greedy traffic; it
 regressed few_shot latency in earlier guards.
 
+A later current recheck with
+`TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_INITIAL_BATCH_WAIT_MS=10` is not
+defaultable. On current `5abb3b5`, the full-run 5ms profile had initial batch 4,
+35 prefill batches, `11.31s` prefill wall, and a score row of
+`455.4 / 68.1 / 532.9ms`. The 10ms focused run admitted 6 initial requests and
+reduced internal work slightly (34 prefill batches, `10.94s` prefill wall), but
+landed at `448.4 / 72.4 / 523.5ms` and still does not beat the best focused
+5ms band. Keep the deterministic 401-512 token default at 5ms until a prefill
+pipeline/reuse change gives a clearer median and TPOT win.
+
 ## LONG-OUTPUT GREEDY-SHORT INITIAL WAIT (2026-06-23)
 
 The robust symm-off baseline still shows long_output queue/pipeline pressure:
