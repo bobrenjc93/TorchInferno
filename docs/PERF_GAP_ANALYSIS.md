@@ -284,6 +284,13 @@ requests above the sampled-short range and up to 300 max tokens, landed at
 median prefill/session-reuse win, not a tail fix: p99 E2E was still `2342ms`,
 so tree tail work remains in the scheduler/pipeline bucket.
 
+Raising the sampled-medium persistent idle above that default is rejected.
+`TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_IDLE_MS=200` on current
+`8f638ae` landed at `305.0 / 56.6 / 339.1ms`, 960/992 raw correct, with p99 E2E
+`2397ms`. The larger idle window did not consolidate the tree into fewer useful
+work waves and increased score-facing median latency versus the current 100ms
+default/full-run band. Keep sampled-medium persistent idle at 100ms.
+
 Down-projection Marlin remains rejected for long_output too. A current
 TorchInferno-only recheck with `TORCHINFERNO_MARLIN_INT4_DOWN=1` completed
 1000/1000 correct but landed at 315.5 / 32.7 / 1677.1ms and 21.4 tok/s, worse
