@@ -100,9 +100,11 @@ recovered tree to `230.1 / 56.3 / 272.1ms`, and a narrower runtime-only
 rows while keeping the request batch ceiling at 128 avoided the crash and
 improved self to `234.5 / 0.0 / 372.6ms`, but still regressed tree to
 `246.8 / 70.5 / 356.5ms`, isolating the tree cost to the larger warmed/persistent
-cache shape. Keep sampled-short KV-bounded admission at 128 until a design can
-raise self concurrency without changing tree startup/cache behavior or runtime
-allocation shape.
+cache shape. Rebuilding smaller dense caches before tree did not recover it; the
+self/tree sequence hung before tree emitted queue-profile records. Keep
+sampled-short KV-bounded admission at 128 until a design can raise self
+concurrency without changing tree startup/cache behavior or runtime allocation
+shape.
 
 Self-consistency uniform-ragged decode is rejected. Forcing
 `TORCHINFERNO_CONTINUOUS_UNIFORM_RAGGED_DECODE=1` moved sampled self from static
