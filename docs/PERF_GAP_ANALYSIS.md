@@ -1,5 +1,25 @@
 # TorchInferno vs vLLM/sglang — Performance Gap Analysis (Llama-3.1-70B, 8xH100)
 
+## CURRENT SAME-HOST REFRESH AND TREE WAIT RECHECKS (2026-06-23)
+
+After the greedy-large initial-wait patch, a current same-host four-row
+comparison using vLLM `8dd1b702f27e`, SGLang `c65f4ea692dd`, and TorchInferno
+`42ad0f0` still has the expected score shape: TorchInferno wins only
+multi_turn TPOT. vLLM/SGLang remain much faster on queue-facing rows:
+tree_of_thought is 71.4 / 35.9 / 98.0ms for vLLM versus 276.8 / 56.8 /
+336.7ms for TorchInferno, and long_output is 84.1 / 18.8 / 749.3ms for vLLM
+versus 275.5 / 32.9 / 1754.0ms for TorchInferno (TTFT/TPOT/E2E). Multi-turn is
+still prefill-dominated: TorchInferno is 504.6 / 70.2 / 583.6ms versus vLLM's
+189.5 / 75.0 / 250.8ms.
+
+Two current tree_of_thought wait rechecks are rejected. Lowering only the
+sampled-medium initial collection wait to 5ms landed at 315.2 / 57.0 / 350.3ms
+and 954/992 raw correct. Raising the online idle drain globally to 10ms landed
+at 313.9 / 56.4 / 347.4ms and 962/992 raw correct. Both are worse than the
+same-run default tree row and do not change the local 56-57ms TPOT band. Keep
+tree on the current sampled-medium wait and idle-drain defaults; the next tree
+work needs a pipeline/prefill mechanism rather than another wait knob.
+
 ## MULTI-TURN GREEDY-LARGE INITIAL WAIT (2026-06-23)
 
 After the 32-row greedy-large cap, current `30bc24a` still showed multi_turn
