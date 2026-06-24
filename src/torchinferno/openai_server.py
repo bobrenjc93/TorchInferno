@@ -357,6 +357,24 @@ def _online_decode_many_enabled(*, temperature: float, max_tokens: int) -> bool:
     return env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_DECODE_MANY", False)
 
 
+def _online_generated_prefix_cache_enabled(*, temperature: float, max_tokens: int) -> bool | None:
+    if (
+        "TORCHINFERNO_CONTINUOUS_GENERATED_PREFIX_CACHE" in os.environ
+        or "TORCHINFERNO_CONTINUOUS_ADAPTIVE_GENERATED_PREFIX_CACHE" in os.environ
+    ):
+        return None
+    if temperature <= 0.0 or max_tokens < 1:
+        return None
+    sampled_short_max_tokens = env_int(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_SHORT_GENERATED_PREFIX_CACHE_MAX_TOKENS",
+        256,
+        minimum=1,
+    )
+    if max_tokens <= sampled_short_max_tokens:
+        return True
+    return None
+
+
 def _online_step_sync_enabled() -> bool:
     return env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_STEP_SYNC", True)
 
@@ -3463,6 +3481,10 @@ class OpenAICompletionEngine:
                 admit_min_ready_requests=admit_min_ready_requests,
                 admit_per_step_cap=admit_per_step_cap,
                 enable_decode_many=use_decode_many,
+                generated_prefix_cache=_online_generated_prefix_cache_enabled(
+                    temperature=first.temperature,
+                    max_tokens=run_max_tokens,
+                ),
             )
         decode_runner = getattr(self, "_decode_graph_runner", None)
         if decode_runner is not None:
@@ -4517,6 +4539,10 @@ class OpenAICompletionEngine:
                 max_tokens=max_tokens,
             ),
             enable_decode_many=use_decode_many,
+            generated_prefix_cache=_online_generated_prefix_cache_enabled(
+                temperature=group[0].temperature,
+                max_tokens=max_tokens,
+            ),
         )
         request_by_id = {str(index): request for index, request in enumerate(group)}
         row_max_tokens = [request.max_tokens for request in group]
@@ -4756,6 +4782,10 @@ class OpenAICompletionEngine:
                 max_tokens=max_tokens,
             ),
             enable_decode_many=use_decode_many,
+            generated_prefix_cache=_online_generated_prefix_cache_enabled(
+                temperature=group[0].temperature,
+                max_tokens=max_tokens,
+            ),
         )
         request_by_id = {str(index): request for index, request in enumerate(group)}
         runtime_requests = [
@@ -11708,6 +11738,10 @@ def _tensor_parallel_worker_loop(engine: OpenAICompletionEngine) -> None:
                         admit_min_ready_requests=admit_min_ready_requests,
                         admit_per_step_cap=admit_per_step_cap,
                         enable_decode_many=_online_decode_many_enabled(
+                            temperature=temperature,
+                            max_tokens=int(payload.get("max_tokens", 0)),
+                        ),
+                        generated_prefix_cache=_online_generated_prefix_cache_enabled(
                             temperature=temperature,
                             max_tokens=int(payload.get("max_tokens", 0)),
                         ),

@@ -100,6 +100,7 @@ from torchinferno.openai_server import (
     _online_decode_quantum,
     _online_fp8_prefill_enabled,
     _online_fp8_prefill_min_m,
+    _online_generated_prefix_cache_enabled,
     _online_idle_batch_wait_ms,
     _online_initial_batch_wait_ms,
     _online_kv_bounded_concurrency_enabled,
@@ -1008,6 +1009,7 @@ def test_tensor_parallel_worker_loop_handles_online_runtime_commands(monkeypatch
             admit_min_ready_requests: int | None = None,
             admit_per_step_cap: int | None = None,
             enable_decode_many: bool | None = None,
+            generated_prefix_cache: bool | None = None,
         ) -> None:
             self.init_args = (
                 model,
@@ -1023,6 +1025,7 @@ def test_tensor_parallel_worker_loop_handles_online_runtime_commands(monkeypatch
                 store_full_prompt_prefixes,
                 admit_min_ready_requests,
                 admit_per_step_cap,
+                generated_prefix_cache,
             )
             self.started: int | None = None
             self.submitted: list[object] = []
@@ -1063,7 +1066,7 @@ def test_tensor_parallel_worker_loop_handles_online_runtime_commands(monkeypatch
     runtime = instances[0]
     assert runtime.started == 16
     assert runtime.steps == 4
-    assert runtime.init_args[2:] == ("paged", 2, 0.25, 4, 2, 8, True, True, True, None, 128)
+    assert runtime.init_args[2:] == ("paged", 2, 0.25, 4, 2, 8, True, True, True, None, 128, True)
     assert [
         (
             request.prompt,
@@ -1254,6 +1257,7 @@ def test_tensor_parallel_worker_loop_receives_online_tensor_commands(monkeypatch
             admit_min_ready_requests: int | None = None,
             admit_per_step_cap: int | None = None,
             enable_decode_many: bool | None = None,
+            generated_prefix_cache: bool | None = None,
         ) -> None:
             self.init_args = (
                 model,
@@ -1269,6 +1273,7 @@ def test_tensor_parallel_worker_loop_receives_online_tensor_commands(monkeypatch
                 store_full_prompt_prefixes,
                 admit_min_ready_requests,
                 admit_per_step_cap,
+                generated_prefix_cache,
             )
             self.started: int | None = None
             self.submitted: list[object] = []
@@ -1314,7 +1319,7 @@ def test_tensor_parallel_worker_loop_receives_online_tensor_commands(monkeypatch
     runtime = instances[0]
     assert runtime.started == 16
     assert runtime.steps == 3
-    assert runtime.init_args[2:] == ("paged", 2, 0.25, 4, 2, 8, True, True, False, None, 128)
+    assert runtime.init_args[2:] == ("paged", 2, 0.25, 4, 2, 8, True, True, False, None, 128, True)
     assert [(request.request_id, request.prompt, request.max_new_tokens) for request in runtime.submitted] == [
         ("10", (1, 2), 5),
         ("11", (3,), 6),
@@ -8073,6 +8078,34 @@ def test_openai_online_decode_many_respects_env_overrides(monkeypatch) -> None:
     monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY", raising=False)
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_DECODE_MANY", "0")
     assert not _online_decode_many_enabled(temperature=0.0, max_tokens=64)
+
+
+def test_openai_online_generated_prefix_cache_defaults_to_sampled_short(monkeypatch) -> None:
+    monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_GENERATED_PREFIX_CACHE", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_ADAPTIVE_GENERATED_PREFIX_CACHE", raising=False)
+    monkeypatch.delenv(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_SHORT_GENERATED_PREFIX_CACHE_MAX_TOKENS",
+        raising=False,
+    )
+
+    assert _online_generated_prefix_cache_enabled(temperature=0.7, max_tokens=1) is True
+    assert _online_generated_prefix_cache_enabled(temperature=0.7, max_tokens=256) is True
+    assert _online_generated_prefix_cache_enabled(temperature=0.7, max_tokens=257) is None
+    assert _online_generated_prefix_cache_enabled(temperature=0.0, max_tokens=256) is None
+    assert _online_generated_prefix_cache_enabled(temperature=0.7, max_tokens=0) is None
+
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_SHORT_GENERATED_PREFIX_CACHE_MAX_TOKENS", "128")
+    assert _online_generated_prefix_cache_enabled(temperature=0.7, max_tokens=128) is True
+    assert _online_generated_prefix_cache_enabled(temperature=0.7, max_tokens=129) is None
+
+
+def test_openai_online_generated_prefix_cache_preserves_runtime_env_overrides(monkeypatch) -> None:
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_GENERATED_PREFIX_CACHE", "0")
+    assert _online_generated_prefix_cache_enabled(temperature=0.7, max_tokens=256) is None
+
+    monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_GENERATED_PREFIX_CACHE", raising=False)
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_ADAPTIVE_GENERATED_PREFIX_CACHE", "1")
+    assert _online_generated_prefix_cache_enabled(temperature=0.7, max_tokens=256) is None
 
 
 def test_online_step_sync_enabled_defaults_on(monkeypatch) -> None:

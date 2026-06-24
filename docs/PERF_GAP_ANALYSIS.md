@@ -225,6 +225,15 @@ work only slightly (35 decode batches, 70 scheduler steps) and landed at
 `307.3 / 0.0 / 402.0ms`. The small E2E movement does not justify a scoped
 sampled-short default while median TTFT regresses.
 
+Self-consistency sampled-short generated-prefix caching is promoted on current
+`959b094`. Enabling the existing generated-prefix cache preserved 1000/1000
+correctness and landed at `191.3 / 0.0 / 335.7ms`, `3.0 tok/s`. The queue
+profile shows the intended general mechanism: one shared prompt prefill, one
+generated prefix stored, `983` generated-prefix reuses, and decode batches
+dropping from the prior `37` waves to `1`. Scope the default to sampled
+`max_tokens<=256` traffic so tree's sampled-medium path stays unchanged, and
+preserve the runtime env overrides for manual disable/adaptive experiments.
+
 Self-consistency sampled post-arrival collection should stay default-on for now.
 An apples-to-apples current `1b60135` recheck with
 `TORCHINFERNO_OPENAI_TP_ONLINE_COLLECT_IDLE_ARRIVALS=0` landed at

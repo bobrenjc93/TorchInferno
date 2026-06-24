@@ -292,6 +292,7 @@ class ContinuousBatchEngine:
         admit_min_ready_requests: int | None = None,
         admit_per_step_cap: int | None = None,
         enable_decode_many: bool | None = None,
+        generated_prefix_cache: bool | None = None,
     ) -> None:
         if max_active_requests < 1:
             raise ValueError("max_active_requests must be positive")
@@ -337,6 +338,7 @@ class ContinuousBatchEngine:
         self.profile_timings = profile_timings
         self.admit_min_ready_requests = admit_min_ready_requests
         self.admit_per_step_cap = admit_per_step_cap
+        self.generated_prefix_cache = generated_prefix_cache
         self.enable_decode_many = (
             env_flag("TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY", False)
             if enable_decode_many is None
@@ -3228,6 +3230,9 @@ class ContinuousBatchEngine:
     def _generated_prefix_cache_enabled(self) -> bool:
         if not self._generated_prefix_cache_base_enabled():
             return False
+        configured = self.generated_prefix_cache
+        if configured is not None:
+            return bool(configured)
         if env_flag("TORCHINFERNO_CONTINUOUS_GENERATED_PREFIX_CACHE", False):
             return True
         if not env_flag("TORCHINFERNO_CONTINUOUS_ADAPTIVE_GENERATED_PREFIX_CACHE", False):
@@ -3240,6 +3245,9 @@ class ContinuousBatchEngine:
     def _should_collect_generated_prefix_logits(self, states: list[_ActiveRequest]) -> bool:
         if not states or not self._generated_prefix_cache_base_enabled():
             return False
+        configured = self.generated_prefix_cache
+        if configured is not None:
+            return bool(configured)
         if env_flag("TORCHINFERNO_CONTINUOUS_GENERATED_PREFIX_CACHE", False):
             return True
         if not env_flag("TORCHINFERNO_CONTINUOUS_ADAPTIVE_GENERATED_PREFIX_CACHE", False):
