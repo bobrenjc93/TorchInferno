@@ -286,6 +286,17 @@ increase. Promote the 10ms default only for deterministic max_tokens<=128
 online sessions; sampled self/tree, few_shot, and multi_turn stay on their
 existing policies.
 
+Raising that scoped greedy-short initial wait to 20ms is not defaultable on
+current `6dbdaaa`. The shape-count profiled default landed at
+`297.5 / 32.4 / 1682.4ms`, 1000/1000 correct, with initial batch 7, 63 prefill
+batches, 743 decode batches, `12.26s` prefill wall, `13.40s` CPU token readback,
+and `14.51s` decode GPU time. The 20ms run admitted more of the first wave
+(initial batch 13) and reduced aggregate work to 60 prefill batches, 696 decode
+batches, `12.09s` prefill wall, `12.78s` CPU readback, and `13.87s` decode GPU
+time, but the score row was `276.6 / 32.0 / 1689.3ms` and throughput fell to
+24.1 tok/s. The long_output gap needs pipeline/readback work rather than a
+larger initial collection window.
+
 ## OPENAI TP STARTUP RECHECK (2026-06-23, current 684af9b)
 
 Public run `20260623_160941` still used stale TorchInferno bits and failed
