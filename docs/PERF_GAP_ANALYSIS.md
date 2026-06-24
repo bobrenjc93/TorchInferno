@@ -102,6 +102,14 @@ the patched default landed at `246.2 / 33.8 / 1852.9ms`, `23.6 tok/s`, despite
 the profile confirming `decode_many_enabled=true` and `decode_quantum=4`. Do not
 promote decode_many without a safer streaming/stop-token design; the current
 path can reduce CPU synchronization while still hurting client-observed E2E.
+A narrower q2 recheck on current `65eb78b` is rejected too:
+`TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_DECODE_MANY=1` with
+`TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_GEN_DECODE_QUANTUM=2` preserved
+correctness and improved TTFT to `198.3ms`, but regressed TPOT/E2E to
+`35.9 / 1707.7ms`. Queue profile showed no real readback win
+(`12.89s` CPU token copy, `14.03s` decode GPU) and prefill fragmented to
+89 batches, so the one- or two-step overcompute family is not the current
+long_output lever.
 
 Long-output greedy-short KV active cap 64 is rejected on current `aa7a9a9`.
 The hypothesis was that 64 client workers could not use the default 112 active
