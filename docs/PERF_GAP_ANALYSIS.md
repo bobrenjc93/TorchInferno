@@ -13,6 +13,16 @@ remains real, but the full sequential run is noisier and still far from vLLM's
 `184.1 / 57.4 / 235.5ms` multi_turn row; do not treat FP8 prefill as sufficient
 for the multi_turn queueing gap.
 
+Paged-KV multi_turn remains rejected on current `2fd31a9`. Rechecking
+`TORCHINFERNO_OPENAI_PAGED_KV_MIN_SEQ=512` with
+`TORCHINFERNO_PAGED_PREFIX_CACHE=1` no longer failed readiness (server ready in
+231.1s), but the runtime path was dominated by paged-engine work: the first
+queue snapshot finished only `241` requests after `45660ms`
+(`phase_runtime_step_ms=45566ms`). Dense current multi_turn finishes all 1000
+requests in about `13883ms` profiled. The run was manually terminated before
+completion; do not lower the paged threshold or enable paged prefix caching for
+this 569-token-session shape without a substantially faster paged prefill path.
+
 Long-output decode-quantum rechecks are rejected. Current default `8` in the
 full run landed at `294.0 / 33.2 / 1674.3ms`, `24.5 tok/s`. Focused env-only
 rechecks with the current tree landed at DQ=10 `325.1 / 33.2 / 1638.1ms`,
