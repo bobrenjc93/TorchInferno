@@ -183,6 +183,82 @@ def test_tensor_parallel_checkpoint_tensor_broadcast_defaults_on_for_cuda_tp(mon
     )
 
 
+def test_tensor_parallel_rank0_checkpoint_scatter_packs_dim1_shards(monkeypatch) -> None:
+    full = torch.tensor([[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]])
+    calls: list[str] = []
+
+    class Loader:
+        def get_tensor_shape(self, name: str) -> tuple[int, ...]:
+            assert name == "weight"
+            return tuple(full.shape)
+
+        def get_tensor(self, name: str, *, device: torch.device, dtype: torch.dtype | None) -> torch.Tensor:
+            calls.append(name)
+            return full.to(device=device, dtype=dtype)
+
+        def get_tensor_shard(self, *args: object, **kwargs: object) -> torch.Tensor:
+            raise AssertionError("scatter path should not read per-rank checkpoint shards")
+
+    def reduce_scatter(output: torch.Tensor, input_tensor: torch.Tensor, **kwargs: object) -> None:
+        assert kwargs["op"] == tensor_parallel_module.dist.ReduceOp.SUM
+        torch.testing.assert_close(
+            input_tensor,
+            torch.tensor([[1.0, 2.0], [5.0, 6.0], [3.0, 4.0], [7.0, 8.0]]),
+        )
+        output.copy_(input_tensor[: output.size(0)])
+
+    monkeypatch.setattr(tensor_parallel_module, "_rank0_checkpoint_broadcast_enabled", lambda **kwargs: True)
+    monkeypatch.setattr(tensor_parallel_module.dist, "reduce_scatter_tensor", reduce_scatter)
+    monkeypatch.delenv("TORCHINFERNO_TP_RANK0_CHECKPOINT_SCATTER", raising=False)
+
+    shard = tensor_parallel_module._load_checkpoint_tensor_shard(
+        Loader(),
+        "weight",
+        dim=1,
+        rank=0,
+        world_size=2,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+
+    assert calls == ["weight"]
+    torch.testing.assert_close(shard, torch.tensor([[1.0, 2.0], [5.0, 6.0]]))
+
+
+def test_tensor_parallel_checkpoint_scatter_nonzero_rank_avoids_checkpoint_read(monkeypatch) -> None:
+    class Loader:
+        def get_tensor_shape(self, name: str) -> tuple[int, ...]:
+            assert name == "weight"
+            return (2, 4)
+
+        def get_tensor(self, *args: object, **kwargs: object) -> torch.Tensor:
+            raise AssertionError("nonzero ranks should receive their shard from the collective")
+
+        def get_tensor_shard(self, *args: object, **kwargs: object) -> torch.Tensor:
+            raise AssertionError("rank-0 broadcast path should not read per-rank checkpoint shards")
+
+    def reduce_scatter(output: torch.Tensor, input_tensor: torch.Tensor, **kwargs: object) -> None:
+        assert input_tensor.shape == (4, 2)
+        torch.testing.assert_close(input_tensor, torch.zeros(4, 2))
+        output.copy_(torch.tensor([[3.0, 4.0], [7.0, 8.0]]))
+
+    monkeypatch.setattr(tensor_parallel_module, "_rank0_checkpoint_broadcast_enabled", lambda **kwargs: True)
+    monkeypatch.setattr(tensor_parallel_module.dist, "reduce_scatter_tensor", reduce_scatter)
+    monkeypatch.delenv("TORCHINFERNO_TP_RANK0_CHECKPOINT_SCATTER", raising=False)
+
+    shard = tensor_parallel_module._load_checkpoint_tensor_shard(
+        Loader(),
+        "weight",
+        dim=1,
+        rank=1,
+        world_size=2,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+
+    torch.testing.assert_close(shard, torch.tensor([[3.0, 4.0], [7.0, 8.0]]))
+
+
 def test_tensor_parallel_process_group_timeout_is_configurable(monkeypatch) -> None:
     monkeypatch.delenv("TORCHINFERNO_TP_PROCESS_GROUP_TIMEOUT_S", raising=False)
     assert tensor_parallel_module._tensor_parallel_process_group_timeout() == timedelta(seconds=1800)

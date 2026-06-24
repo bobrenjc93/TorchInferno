@@ -5520,6 +5520,10 @@ def _rank0_checkpoint_broadcast_enabled(
     return _tp_flag("TORCHINFERNO_TP_RANK0_CHECKPOINT_BROADCAST", True)
 
 
+def _rank0_checkpoint_scatter_enabled() -> bool:
+    return _tp_flag("TORCHINFERNO_TP_RANK0_CHECKPOINT_SCATTER", True)
+
+
 def _load_checkpoint_tensor(
     loader: _CheckpointTensorLoader,
     name: str,
@@ -5562,6 +5566,17 @@ def _load_checkpoint_tensor_shard(
     shape = loader.get_tensor_shape(name)
     if shape[dim] % world_size != 0:
         raise ValueError(f"cannot shard {name} shape={shape} dim={dim} across {world_size} ranks")
+    if _rank0_checkpoint_scatter_enabled() and hasattr(dist, "reduce_scatter_tensor"):
+        return _load_checkpoint_tensor_shard_scatter(
+            loader,
+            name,
+            shape=shape,
+            dim=dim,
+            rank=rank,
+            world_size=world_size,
+            device=device,
+            dtype=dtype,
+        )
     if rank == 0:
         tensor = loader.get_tensor(name, device=device, dtype=dtype)
     else:
@@ -5570,6 +5585,39 @@ def _load_checkpoint_tensor_shard(
     shard = shape[dim] // world_size
     start = rank * shard
     return tensor.narrow(dim, start, shard).clone(memory_format=torch.contiguous_format)
+
+
+def _load_checkpoint_tensor_shard_scatter(
+    loader: _CheckpointTensorLoader,
+    name: str,
+    *,
+    shape: tuple[int, ...],
+    dim: int,
+    rank: int,
+    world_size: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> Tensor:
+    shard = shape[dim] // world_size
+    output_shape = list(shape)
+    output_shape[dim] = shard
+    output = torch.empty(tuple(output_shape), device=device, dtype=dtype)
+
+    if rank == 0:
+        tensor = loader.get_tensor(name, device=device, dtype=dtype)
+        if dim == 0:
+            scatter_input = tensor.contiguous()
+        else:
+            chunks = tensor.split(shard, dim=dim)
+            scatter_input = torch.cat([chunk.contiguous() for chunk in chunks], dim=0).contiguous()
+    else:
+        input_shape = list(shape)
+        if dim != 0:
+            input_shape[0] *= world_size
+            input_shape[dim] = shard
+        scatter_input = torch.zeros(tuple(input_shape), device=device, dtype=dtype)
+    dist.reduce_scatter_tensor(output, scatter_input, op=dist.ReduceOp.SUM)
+    return output if output.is_contiguous() else output.contiguous()
 
 
 def _broadcast_object_list(objects: list[object], *, src: int, device: torch.device) -> None:

@@ -29,6 +29,20 @@ tree_of_thought `240.0 / 51.3 / 288.3ms`, and long_output
 fixes: TorchInferno reached readiness and completed with 100% benchmark-level
 correctness instead of timing out in checkpoint load.
 
+The later public run `20260624_190316` is a startup failure at the same
+TorchInferno commit, not a latency result. It ran on a different submit host
+with Python 3.13 / CUDA 13.2, spent minutes in NCCL OFI initialization before
+falling back to Socket, and then never reached the first
+`[Llama3TP] loaded 10/80 layers` checkpoint progress line before the 1800s
+readiness timeout. The rank-0 checkpoint path was still broadcasting each full
+sharded tensor to every rank and slicing locally. That is too much collective
+traffic on a weak NCCL path, so sharded checkpoint loads now use
+`reduce_scatter_tensor` when available: rank 0 packs rank shards, nonzero ranks
+avoid checkpoint reads, and each rank receives only its shard. Same-host
+validation kept startup healthy: 8-GPU NCCL `reduce_scatter_tensor` smoke passed,
+and a real Llama server on port 8090 loaded all `80/80` layers in `27.6s` and
+reached `/health`.
+
 Several current-loop A/Bs are rejected on `76107de`. Runtime FlashInfer prefill
 for multi_turn (`TORCHINFERNO_CONTINUOUS_FLASHINFER_PREFILL_DISABLE=0`)
 regressed badly to `1253.5 / 89.4 / 1422.5ms` and only `1.1 tok/s`, versus the
