@@ -1,5 +1,34 @@
 # TorchInferno vs vLLM/sglang — Performance Gap Analysis (Llama-3.1-70B, 8xH100)
 
+## CURRENT SAME-HOST REFRESH AFTER FP8 GATE (2026-06-23, current 15e19b8)
+
+A fresh same-host run with vLLM `8dd1b702f27e`, SGLang `c65f4ea692dd`, and
+TorchInferno `15e19b8` landed at vLLM 20 wins, SGLang 4, TorchInferno 1. The
+only TorchInferno win is still few_shot TPOT: `55.6ms` vs vLLM `57.5ms`.
+TorchInferno rows were few_shot `168.8 / 55.6 / 216.0ms`, self_consistency
+`321.4 / 0.0 / 424.7ms`, multi_turn `619.4 / 70.2 / 674.3ms`,
+tree_of_thought `301.5 / 56.7 / 322.9ms`, and long_output
+`294.0 / 33.2 / 1674.3ms` (TTFT/TPOT/E2E). The isolated multi_turn FP8 win
+remains real, but the full sequential run is noisier and still far from vLLM's
+`184.1 / 57.4 / 235.5ms` multi_turn row; do not treat FP8 prefill as sufficient
+for the multi_turn queueing gap.
+
+Long-output decode-quantum rechecks are rejected. Current default `8` in the
+full run landed at `294.0 / 33.2 / 1674.3ms`, `24.5 tok/s`. Focused env-only
+rechecks with the current tree landed at DQ=10 `325.1 / 33.2 / 1638.1ms`,
+DQ=12 `383.7 / 30.3 / 1594.7ms`, and DQ=16
+`493.4 / 28.0 / 1882.7ms`. Larger quanta trade away TTFT and throughput for
+TPOT, and still do not beat vLLM (`18.8ms`) or SGLang (`27.2ms`) on TPOT. Keep
+the greedy-short default at 8.
+
+Self-consistency sampled row-cap recheck is also not defaultable. An env-only
+run with `TORCHINFERNO_OPENAI_TP_ONLINE_KV_MAX_ACTIVE_CAP=256` and a matching
+sampled token budget improved median self TTFT/E2E to `268.9 / 410.1ms`, but
+the TP server max-batch limit still held `max_active=128`, the profile showed
+40 decode batches versus 37 in the full-run default, and p99 worsened to
+`1545.5 / 1651.5ms`. Do not add a sampled 256-row policy without first changing
+and validating the effective TP max-batch limit.
+
 ## MULTI-TURN RUNTIME FP8 PREFILL GATE (2026-06-23)
 
 Global `TORCHINFERNO_FP8_PREFILL=1` remains rejected because it previously
