@@ -705,7 +705,12 @@ sampler (`TORCHINFERNO_TEMPERATURE_SAMPLE_GATHER=1`) landed at 325.9 / 0.0 /
 Disabling repeated-prefix Gumbel sampling
 (`TORCHINFERNO_TEMPERATURE_SAMPLE_REPEATED_GUMBEL=0`) was a clear regression:
 405.8 / 0.0 / 472.6 ms, 2.1 tok/s. Keep repeated-prefix Gumbel enabled at the
-current threshold and leave the alternate samplers opt-in.
+current threshold and leave the alternate samplers opt-in. Lowering the
+threshold to force Gumbel on small repeated-prefix waves is also rejected:
+`TORCHINFERNO_TEMPERATURE_SAMPLE_REPEATED_GUMBEL_MIN_BATCH=1` preserved
+generated-prefix reuse (`985` reuses, one decode batch) but landed at
+`379.2 / 0.0 / 400.2ms` with more online commands (`283`) and higher submit-sync
+time (`959ms`), so the self gap is not solved by changing the repeated sampler.
 
 SELF IDLE-DRAIN BATCHING (2026-06-22, current bccf781 + local patch): a default
 queue-profiled self_consistency run showed the remaining gap was wave
