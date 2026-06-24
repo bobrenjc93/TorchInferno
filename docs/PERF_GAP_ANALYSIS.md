@@ -146,6 +146,13 @@ A no-profile long_output probe with ragged decode buckets disabled
 `359.8 / 38.8 / 2135.3ms`, with p99 E2E `10508ms`. Keep bucketed ragged decode
 for greedy-short long_output; the padding cost is lower than the graph/shape
 instability from exact active-row decode shapes.
+A guarded streaming-decode GPU-buffer reuse path is rejected on current
+`d09fda1`. It reused device-side last-token/seq-len buffers between streamed
+ragged decode steps, but the focused long_output run landed at
+`303.4 / 31.8 / 1575.4ms` and the profile did not reduce prepare cost
+(`decode_ragged_prepare_ms=1201ms`, with `12419ms` prefill wall). The extra
+indexing/sync bookkeeping traded one small allocation path for another, so the
+code was removed instead of keeping another opt-in knob.
 A follow-up 20ms initial-wait recheck on `74173a1` remains rejected:
 `288.4 / 32.7 / 1682.5ms`, p99 E2E `5057ms`. The larger wait collected a
 15-request first wave but still used 59 prefill batches and regressed prefill
