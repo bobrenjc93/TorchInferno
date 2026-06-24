@@ -1,5 +1,17 @@
 # TorchInferno vs vLLM/sglang — Performance Gap Analysis (Llama-3.1-70B, 8xH100)
 
+## MULTI-TURN GREEDY-LARGE INITIAL WAIT (2026-06-23)
+
+After the 32-row greedy-large cap, current `30bc24a` still showed multi_turn
+dominated by prefix/suffix prefill waves: 493.2ms TTFT, 76.4ms TPOT, 571.8ms
+E2E, 2.0 tok/s, and 979/1000 raw correct. A scoped recheck with
+`TORCHINFERNO_OPENAI_TP_ONLINE_INITIAL_BATCH_WAIT_MS=5` admitted more of the
+first client wave (initial batch 1 -> 4) and improved to 482.1ms TTFT, 69.6ms
+TPOT, 557.5ms E2E, 2.1 tok/s, with the same 979/1000 correctness. Promote the
+5ms wait only for deterministic 401-512 token online sessions. Keep the global
+5ms initial-wait rejection intact for few_shot and other greedy traffic; it
+regressed few_shot latency in earlier guards.
+
 ## LONG-OUTPUT GREEDY-SHORT INITIAL WAIT (2026-06-23)
 
 The robust symm-off baseline still shows long_output queue/pipeline pressure:
