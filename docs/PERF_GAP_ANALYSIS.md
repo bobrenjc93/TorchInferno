@@ -130,6 +130,12 @@ A score-facing no-profile A/B on `9056eac` also kept the new shape ahead:
 current defaults landed at `293.0 / 31.9 / 1683.1ms`, while restoring the old
 128-token bucket and no greedy prefix floor via env regressed to
 `356.5 / 33.2 / 1706.6ms`.
+A no-profile long_output probe with ragged decode buckets disabled
+(`TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_BUCKETS=0`) is also rejected on
+`3675f6a`: it preserved correctness but regressed to
+`359.8 / 38.8 / 2135.3ms`, with p99 E2E `10508ms`. Keep bucketed ragged decode
+for greedy-short long_output; the padding cost is lower than the graph/shape
+instability from exact active-row decode shapes.
 A follow-up 20ms initial-wait recheck on `74173a1` remains rejected:
 `288.4 / 32.7 / 1682.5ms`, p99 E2E `5057ms`. The larger wait collected a
 15-request first wave but still used 59 prefill batches and regressed prefill
