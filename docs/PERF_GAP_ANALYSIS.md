@@ -20,6 +20,15 @@ same-run default tree row and do not change the local 56-57ms TPOT band. Keep
 tree on the current sampled-medium wait and idle-drain defaults; the next tree
 work needs a pipeline/prefill mechanism rather than another wait knob.
 
+Down-projection Marlin remains rejected for long_output too. A current
+TorchInferno-only recheck with `TORCHINFERNO_MARLIN_INT4_DOWN=1` completed
+1000/1000 correct but landed at 315.5 / 32.7 / 1677.1ms and 21.4 tok/s, worse
+than the nearby default long rows on TTFT and throughput while leaving TPOT in
+the same band. Queue snapshots showed no GPU decode win: final progress was
+about 13.9s ragged-decode GPU time and 12.7s token-readback time across 712
+decode batches. Keep down-proj Marlin opt-in until calibrated weights or a
+broader fused decode path proves a real serving win.
+
 ## MULTI-TURN GREEDY-LARGE INITIAL WAIT (2026-06-23)
 
 After the 32-row greedy-large cap, current `30bc24a` still showed multi_turn

@@ -3408,8 +3408,14 @@ class OpenAICompletionEngine:
                 profile_snapshots += 1
             phase_fields = {f"phase_{name}": round(value, 3) for name, value in phase_ms.items()}
             extra_fields: dict[str, object] = {}
+            all_submitted_finished = bool(request_by_id) and finished_events >= len(request_by_id)
             if is_progress:
                 extra_fields["profile_snapshot_index"] = profile_snapshots
+                if all_submitted_finished:
+                    extra_fields["phase_total_ms"] = round(
+                        (time.perf_counter() - profile_start_s) * 1000.0,
+                        3,
+                    )
             else:
                 extra_fields["profile_snapshots"] = profile_snapshots
             self._record_runtime_engine_queue_profile(

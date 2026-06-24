@@ -12020,6 +12020,7 @@ def test_openai_tensor_parallel_online_batcher_records_profile_snapshots(
     assert records[1]["profile_snapshot_index"] == 2
     assert records[1]["online_step_commands"] == 3
     assert records[1]["runtime_decode_tokens"] == 3
+    assert records[1]["phase_total_ms"] >= 0.0
     assert records[2]["profile_snapshots"] == 2
     assert records[2]["online_step_commands"] == 3
     assert records[2]["runtime_decode_tokens"] == 3
