@@ -84,6 +84,16 @@ requests in about `13883ms` profiled. The run was manually terminated before
 completion; do not lower the paged threshold or enable paged prefix caching for
 this 569-token-session shape without a substantially faster paged prefill path.
 
+Finished-prefix row adoption is also rejected for multi_turn on current
+`4ea5e98`. Enabling `TORCHINFERNO_CONTINUOUS_FINISHED_PREFIX_CACHE=1` completed
+1000/1000 requests but took `96311.6ms` in the batcher profile, with
+`93926.4ms` prefill wall across `453` prefill batches. It stored `1000`
+generated prefixes and raised total prefix reuse tokens to `99781`, but exact
+generated-prefix reuse stayed at `0`; the adopted rows fragmented prefill into
+mostly single-prefix work instead of producing reusable conversation-session
+batches. Keep this cache path opt-in until it has a row budget and batching
+policy that can reuse finished prefixes without destroying prefill shape.
+
 Long-output decode-quantum rechecks are rejected. Current default `8` in the
 full run landed at `294.0 / 33.2 / 1674.3ms`, `24.5 tok/s`. Focused env-only
 rechecks with the current tree landed at DQ=10 `325.1 / 33.2 / 1638.1ms`,
