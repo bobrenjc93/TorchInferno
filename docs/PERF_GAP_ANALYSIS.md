@@ -192,6 +192,17 @@ about 79k prefill tokens, and 86 decode batches in both runs; the lower gate's
 smaller aggregate batcher wall did not translate to client-observed latency.
 Keep the scoped greedy-large runtime FP8 gate at `min_m=2048`.
 
+Full-prompt mixed-prefix reuse is still rejected for multi_turn on current
+`a9666ff`. Enabling pinned full-prompt stores for 512-token sessions with
+non-common-prefix graph prefill and mixed-prefix batching avoided the old CUDA
+illegal-memory crash, but regressed badly to `1769.4 / 78.7 / 1842.4ms`,
+`0.6 tok/s`, p99 E2E `3496.8ms`, with 982/1000 raw correct. The profile shows
+the tradeoff: prefill tokens fell (`79.4k -> 45.3k`) and reused prefix tokens
+rose (`45.0k -> 97.7k`), but prefill wall jumped (`11.3s -> 28.1s`) and
+prefill forward rose (`10.8s -> 15.8s`) because the mixed-prefix path hit only
+four prefill graphs. Keep this path opt-in until mixed-prefix reuse can stay on
+stable captured graph shapes.
+
 ## CURRENT SAME-HOST REFRESH AND TREE WAIT RECHECKS (2026-06-23)
 
 After the greedy-large initial-wait patch, a current same-host four-row
