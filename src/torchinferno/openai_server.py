@@ -10528,12 +10528,15 @@ def _prepare_tensor_parallel_symm_mem_allreduce_auto(config: OpenAIServerConfig)
         return
     if raw_openai is not None and raw_openai.strip().lower() not in {"auto", "probe"}:
         return
+    auto_requested = (
+        (raw_openai is not None and raw_openai.strip().lower() in {"auto", "probe"})
+        or (raw_global is not None and raw_global.strip().lower() in {"auto", "probe"})
+    )
     # Symmetric-memory allreduce is a measurable TP decode win on 8xH100, but
-    # multicast support is host-dependent. Probe by default and propagate a
-    # concrete worker env value so all ranks either use symm-mem together or stay
-    # on NCCL together. Operators can still force it off with the auto-probe env
-    # or explicit TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE=0.
-    if not env_flag("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_AUTO_PROBE", True):
+    # public runs have shown hosts can pass the probe and then hang before
+    # readiness during startup. Keep the probe opt-in and propagate a concrete
+    # worker env value so all ranks either use symm-mem together or stay on NCCL.
+    if not env_flag("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_AUTO_PROBE", auto_requested):
         os.environ[openai_env] = "0"
         return
     if int(getattr(config, "tensor_parallel_size", 1)) <= 1:

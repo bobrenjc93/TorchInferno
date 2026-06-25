@@ -970,6 +970,15 @@ back to benchmarkable NCCL behavior. Local validation with the patched default
 reached readiness in 231.1s and completed long_output at 100% correctness
 (301.7ms TTFT, 31.8ms TPOT, 1674.9ms E2E).
 
+The public `20260625_130348` run confirms that leaving this probe default-on is
+still unsafe on the benchmark host. It built TorchInferno `de2d6f1` with the
+provider-level NCCL socket defaults, reported `symmetric-memory allreduce
+enabled after probe`, completed NCCL init, then never bound `/health` before the
+1800s readiness timeout killed torchrun. The current patch restores the intended
+opt-in default: no probe unless
+`TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_AUTO_PROBE=1` or an explicit
+`TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE=auto/probe` requests it.
+
 ## LOCAL MULTI-TURN LARGE-CAP RECHECK (2026-06-23, current 0d8749e + env)
 
 The public `20260623_142642` run is still stale with respect to the pushed
