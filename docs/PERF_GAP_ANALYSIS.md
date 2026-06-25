@@ -370,6 +370,22 @@ multi_turn `451.0 / 66.0 / 522.3ms`, and tree_of_thought
 only applied to the long_output session (`run_max_tokens=96`,
 `admit_min_ready_requests=12`).
 
+A same-host focused tree refresh on pushed `8ac97c6` (`20260625_172238`) keeps
+the tree gap unchanged: vLLM/SGLang/TorchInferno medians were
+`73.4 / 35.1 / 100.0ms`, `78.7 / 62.9 / 167.7ms`, and
+`297.6 / 58.1 / 335.3ms` (TTFT/TPOT/E2E). TorchInferno's sampled branch
+submitted 896 requests across 7 online sessions and spent `10.08s` in prefill
+wall / `8.28s` prefill forward across 46 prefill batches; greedy eval was much
+smaller at 96 requests. Two current tree probes are rejected. Raising only the
+sampled-medium initial wait to `20ms` (`20260625_173430`) consolidated one fewer
+sampled session but regressed the row to `337.9 / 59.8 / 386.8ms`; the first
+sampled session alone took `5.77s` profiled phase time. Lowering the
+sampled-medium runtime FP8 prefill gate to `M>=128` (`20260625_173950`) reduced
+aggregate sampled prefill wall (`10.08s -> 8.94s`) but still regressed
+score-facing latency to `326.1 / 58.8 / 377.6ms`. Do not promote either knob;
+tree still needs a prefill/session pipeline change rather than another
+collection-wait or tiny-FP8 gate tweak.
+
 Long-output row-budget A/Bs on the same pushed code are not defaultable yet.
 Raising `TORCHINFERNO_OPENAI_TP_ONLINE_TOTAL_ROWS_BUDGET` to `160` improved the
 profiled long-output engine phase (`26.34s -> 25.65s`) and moved the focused row
