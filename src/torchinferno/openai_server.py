@@ -10226,15 +10226,27 @@ def _prepare_tensor_parallel_nccl_runtime_env(config: OpenAIServerConfig) -> Non
         return
     if str(getattr(config, "llama_parallelism", "auto")).lower() == "pipeline":
         return
-    if not env_flag("TORCHINFERNO_OPENAI_TP_NCCL_CUMEM_DISABLE", True):
-        return
-    if "NCCL_CUMEM_ENABLE" in os.environ:
-        return
-    os.environ["NCCL_CUMEM_ENABLE"] = "0"
-    print(
-        "TorchInferno OpenAI server set NCCL_CUMEM_ENABLE=0 for tensor-parallel startup",
-        flush=True,
-    )
+    if (
+        env_flag("TORCHINFERNO_OPENAI_TP_NCCL_CUMEM_DISABLE", True)
+        and "NCCL_CUMEM_ENABLE" not in os.environ
+    ):
+        os.environ["NCCL_CUMEM_ENABLE"] = "0"
+        print(
+            "TorchInferno OpenAI server set NCCL_CUMEM_ENABLE=0 for tensor-parallel startup",
+            flush=True,
+        )
+    # The implicit torchrun path is single-node. Avoid slow cloud OFI plugin
+    # startup there while preserving explicit rendezvous and NCCL_NET settings.
+    if (
+        env_flag("TORCHINFERNO_OPENAI_TP_NCCL_SOCKET_DEFAULT", True)
+        and "TORCHINFERNO_TORCHRUN_RDZV_ENDPOINT" not in os.environ
+        and "NCCL_NET" not in os.environ
+    ):
+        os.environ["NCCL_NET"] = "Socket"
+        print(
+            "TorchInferno OpenAI server set NCCL_NET=Socket for standalone tensor-parallel startup",
+            flush=True,
+        )
 
 
 def _openai_tp_symm_mem_allreduce_enabled() -> bool:

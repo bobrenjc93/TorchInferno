@@ -538,6 +538,48 @@ def test_openai_tensor_parallel_nccl_cumem_guard_can_be_disabled(monkeypatch) ->
     assert "NCCL_CUMEM_ENABLE" not in os.environ
 
 
+def test_openai_tensor_parallel_defaults_nccl_net_socket_for_standalone(monkeypatch) -> None:
+    monkeypatch.delenv("NCCL_NET", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_TORCHRUN_RDZV_ENDPOINT", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_NCCL_SOCKET_DEFAULT", raising=False)
+    config = OpenAIServerConfig(
+        model="meta-llama/Meta-Llama-3.1-70B-Instruct",
+        tensor_parallel_size=8,
+    )
+
+    _prepare_tensor_parallel_nccl_runtime_env(config)
+
+    assert os.environ["NCCL_NET"] == "Socket"
+
+
+def test_openai_tensor_parallel_nccl_net_env_is_explicit(monkeypatch) -> None:
+    monkeypatch.setenv("NCCL_NET", "OFI")
+    monkeypatch.delenv("TORCHINFERNO_TORCHRUN_RDZV_ENDPOINT", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_NCCL_SOCKET_DEFAULT", raising=False)
+    config = OpenAIServerConfig(
+        model="meta-llama/Meta-Llama-3.1-70B-Instruct",
+        tensor_parallel_size=8,
+    )
+
+    _prepare_tensor_parallel_nccl_runtime_env(config)
+
+    assert os.environ["NCCL_NET"] == "OFI"
+
+
+def test_openai_tensor_parallel_nccl_net_socket_default_skips_rendezvous(monkeypatch) -> None:
+    monkeypatch.delenv("NCCL_NET", raising=False)
+    monkeypatch.setenv("TORCHINFERNO_TORCHRUN_RDZV_ENDPOINT", "127.0.0.1:29599")
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_NCCL_SOCKET_DEFAULT", raising=False)
+    config = OpenAIServerConfig(
+        model="meta-llama/Meta-Llama-3.1-70B-Instruct",
+        tensor_parallel_size=8,
+    )
+
+    _prepare_tensor_parallel_nccl_runtime_env(config)
+
+    assert "NCCL_NET" not in os.environ
+
+
 def test_openai_server_warmup_uses_generic_shape_buckets(monkeypatch) -> None:
     monkeypatch.delenv("TORCHINFERNO_OPENAI_WARMUP_PROMPT_TOKEN_BUCKETS", raising=False)
     monkeypatch.delenv("TORCHINFERNO_OPENAI_WARMUP_PREFILL_CACHE_TOKENS", raising=False)
