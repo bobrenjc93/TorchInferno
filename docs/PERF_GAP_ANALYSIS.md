@@ -237,6 +237,16 @@ broader experiments. A post-push no-env validation on `80279ef` with symm-mem
 probing default-off reached readiness in `100.5s` and completed
 self_consistency at `276.2 / 0.0 / 409.9ms`, 1000/1000 correct.
 
+A full no-env TorchInferno-only validation after both patches (`f963719`,
+`20260625_145417`) also reached readiness in `100.5s` and completed all rows:
+few_shot `163.0 / 53.3 / 205.6ms`, self_consistency
+`281.5 / 0.0 / 305.3ms`, multi_turn `445.8 / 65.7 / 512.2ms`,
+tree_of_thought `325.6 / 58.0 / 379.3ms`, and long_output
+`328.0 / 31.2 / 1579.2ms`. This is the expected public-readiness tradeoff:
+self improves materially from sampled submit+step, while tree/long decode TPOT
+give back the symm-memory optimization until the public host can safely opt into
+`TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_AUTO_PROBE=1`.
+
 After landing the startup/runtime fixes as TorchInferno `de2d6f1`, a same-host
 skip-build provider comparison (`20260625_125255`) confirmed the readiness fix
 inside the normal provider harness: TorchInferno bound `/health` in `125.6s`.
