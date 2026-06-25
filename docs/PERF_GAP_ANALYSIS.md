@@ -257,6 +257,25 @@ long-output TTFT tail blow-up (`691.3ms` median, `32.5s` p99). The viable path
 is a real dual-cache or shape-specific warmup design; do not promote a flat
 larger row budget.
 
+Current `def840e` follow-up probes reject three narrower queue/cache knobs.
+For multi_turn, enabling pinned full-prompt stores for greedy-large requests
+with non-common mixed-prefix grouping and graph capture-on-miss disabled
+completed correctly (`982/1000`) but regressed to `1743.2 / 76.3 / 1804.4ms`.
+The profile cut raw prefill tokens (`~80K -> 45.3K`) and raised prefix reuse
+tokens to `97.7K`, but prefill wall grew to `27.9s`; mixed-prefix eager prefill
+spent `16.0s` in forward and `11.5s` in state/prefix-store work. For
+self_consistency, forcing `TORCHINFERNO_OPENAI_TP_ONLINE_COLLECT_IDLE_ARRIVALS=0`
+preserved correctness but did not reduce internal work: phase total moved
+`4.47s -> 4.58s`, generated-prefix reuses dropped `994 -> 981`, and the focused
+row landed at `322.2 / 0.0 / 429.7ms`. For few_shot, extending greedy
+KV-bounded admission to 256 max tokens raised active rows to `84` and improved
+median E2E in one focused run (`170.6 / 54.5 / 214.6ms`) but worsened TPOT,
+p99, and profiled phase time (`6.34s -> 6.58s`). Capping that path at 64 active
+rows was worse: without a longer idle timeout it split into `9` online sessions
+and regressed to `933.8 / 83.7 / 999.0ms`; with a `200ms` idle timeout it stayed
+in one session but still regressed to `256.8 / 60.1 / 319.8ms`. Keep the
+current few_shot 32-row greedy-mid policy and do not promote these env knobs.
+
 The same counters on dense multi_turn (`20260625_101513`) show the opposite:
 submission cadence is not the limiter there. The run landed at
 `437.5 / 65.3 / 510.4ms`, 981/1000 raw correct, with `34` submit batches; `24`
