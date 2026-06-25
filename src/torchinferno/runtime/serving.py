@@ -292,6 +292,7 @@ class ContinuousBatchEngine:
         admit_min_ready_requests: int | None = None,
         admit_per_step_cap: int | None = None,
         enable_decode_many: bool | None = None,
+        decode_many_allow_stop: bool | None = None,
         generated_prefix_cache: bool | None = None,
     ) -> None:
         if max_active_requests < 1:
@@ -343,6 +344,11 @@ class ContinuousBatchEngine:
             env_flag("TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY", False)
             if enable_decode_many is None
             else bool(enable_decode_many)
+        )
+        self.decode_many_allow_stop = (
+            env_flag("TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY_ALLOW_STOP", False)
+            if decode_many_allow_stop is None
+            else bool(decode_many_allow_stop)
         )
         self.unified_forward = bool(
             env_flag("TORCHINFERNO_CONTINUOUS_UNIFIED_FORWARD", False)
@@ -503,7 +509,7 @@ class ContinuousBatchEngine:
             return False
         if (
             any(state.request.stop_token_ids for state in self._online_active)
-            and not env_flag("TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY_ALLOW_STOP", False)
+            and not self.decode_many_allow_stop
         ):
             return False
         if self._generated_prefix_cache_enabled() or self._prompt_lookup_decode_enabled():

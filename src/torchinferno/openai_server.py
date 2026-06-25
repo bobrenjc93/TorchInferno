@@ -326,11 +326,18 @@ def _online_decode_quantum(*, temperature: float, max_tokens: int) -> int:
             minimum=1,
         )
         if max_tokens <= greedy_short_max_tokens:
+            # Decode-many already batches several token steps before surfacing
+            # events. Keep the command quantum small enough that queued short
+            # greedy streams do not sit behind a long decode burst.
+            decode_many_quantum = 4 if _online_decode_many_enabled(
+                temperature=temperature,
+                max_tokens=max_tokens,
+            ) else 8
             default_short_quantum = min(
                 decode_quantum,
                 env_int(
                     "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_GEN_DECODE_QUANTUM",
-                    8,
+                    decode_many_quantum,
                     minimum=1,
                 ),
             )
@@ -367,7 +374,22 @@ def _online_decode_many_enabled(*, temperature: float, max_tokens: int) -> bool:
     )
     if max_tokens > greedy_short_max_tokens:
         return False
-    return env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_DECODE_MANY", False)
+    return env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_DECODE_MANY", True)
+
+
+def _online_decode_many_allow_stop_enabled(*, temperature: float, max_tokens: int) -> bool:
+    if "TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY_ALLOW_STOP" in os.environ:
+        return env_flag("TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY_ALLOW_STOP", False)
+    if not _online_decode_many_enabled(temperature=temperature, max_tokens=max_tokens):
+        return False
+    greedy_short_max_tokens = env_int(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_GEN_MAX_TOKENS",
+        128,
+        minimum=1,
+    )
+    if temperature > 0.0 or max_tokens > greedy_short_max_tokens:
+        return False
+    return env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_DECODE_MANY_ALLOW_STOP", True)
 
 
 def _online_generated_prefix_cache_enabled(*, temperature: float, max_tokens: int) -> bool | None:
@@ -3450,6 +3472,10 @@ class OpenAICompletionEngine:
             temperature=first.temperature,
             max_tokens=run_max_tokens,
         )
+        decode_many_allow_stop = _online_decode_many_allow_stop_enabled(
+            temperature=first.temperature,
+            max_tokens=run_max_tokens,
+        )
         fp8_prefill_enabled = _online_fp8_prefill_enabled(
             temperature=first.temperature,
             max_tokens=run_max_tokens,
@@ -3496,6 +3522,7 @@ class OpenAICompletionEngine:
                 admit_min_ready_requests=admit_min_ready_requests,
                 admit_per_step_cap=admit_per_step_cap,
                 enable_decode_many=use_decode_many,
+                decode_many_allow_stop=decode_many_allow_stop,
                 generated_prefix_cache=_online_generated_prefix_cache_enabled(
                     temperature=first.temperature,
                     max_tokens=run_max_tokens,
@@ -3562,6 +3589,7 @@ class OpenAICompletionEngine:
                 prefill_token_budget=normalized_prefill_budget or 0,
                 enable_ragged_decode=enable_ragged_decode,
                 use_decode_many=use_decode_many,
+                decode_many_allow_stop=decode_many_allow_stop,
                 use_paged_engine=use_paged_engine,
                 graph_prefill=graph_prefill,
                 prefill_chunk_size=prefill_chunk_size or 0,
@@ -11699,6 +11727,14 @@ def _tensor_parallel_worker_loop(engine: OpenAICompletionEngine) -> None:
                     temperature=temperature,
                     max_tokens=max_tokens,
                 )
+                enable_decode_many = _online_decode_many_enabled(
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                )
+                decode_many_allow_stop = _online_decode_many_allow_stop_enabled(
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                )
                 # Flag-gated paged-KV worker engine -- MUST match the primary's choice
                 # (both build a PagedEngine identically + are driven by the same
                 # submit/step commands, so the deterministic page allocator keeps
@@ -11751,13 +11787,11 @@ def _tensor_parallel_worker_loop(engine: OpenAICompletionEngine) -> None:
                         prefill_chunk_size=(env_int("TORCHINFERNO_OPENAI_TP_ONLINE_PREFILL_CHUNK", 0, minimum=0) or None),
                         admit_min_ready_requests=admit_min_ready_requests,
                         admit_per_step_cap=admit_per_step_cap,
-                        enable_decode_many=_online_decode_many_enabled(
-                            temperature=temperature,
-                            max_tokens=int(payload.get("max_tokens", 0)),
-                        ),
+                        enable_decode_many=enable_decode_many,
+                        decode_many_allow_stop=decode_many_allow_stop,
                         generated_prefix_cache=_online_generated_prefix_cache_enabled(
                             temperature=temperature,
-                            max_tokens=int(payload.get("max_tokens", 0)),
+                            max_tokens=max_tokens,
                         ),
                     )
                 if worker_use_paged:
@@ -11806,6 +11840,10 @@ def _tensor_parallel_worker_loop(engine: OpenAICompletionEngine) -> None:
                     online_runtime_engine.admit_min_ready_requests = admit_min_ready_requests
                 if hasattr(online_runtime_engine, "admit_per_step_cap"):
                     online_runtime_engine.admit_per_step_cap = admit_per_step_cap
+                if hasattr(online_runtime_engine, "enable_decode_many"):
+                    online_runtime_engine.enable_decode_many = enable_decode_many
+                if hasattr(online_runtime_engine, "decode_many_allow_stop"):
+                    online_runtime_engine.decode_many_allow_stop = decode_many_allow_stop
                 worker_decode_runner = getattr(engine, "_decode_graph_runner", None)
                 if worker_decode_runner is not None:
                     online_runtime_engine._decode_runner = worker_decode_runner

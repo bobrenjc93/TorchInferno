@@ -96,6 +96,7 @@ from torchinferno.openai_server import (
     _online_admit_per_step_cap,
     _online_collect_idle_arrivals_enabled,
     _online_decode_warmup_batch_sizes,
+    _online_decode_many_allow_stop_enabled,
     _online_decode_many_enabled,
     _online_decode_quantum,
     _online_fp8_prefill_enabled,
@@ -1009,6 +1010,7 @@ def test_tensor_parallel_worker_loop_handles_online_runtime_commands(monkeypatch
             admit_min_ready_requests: int | None = None,
             admit_per_step_cap: int | None = None,
             enable_decode_many: bool | None = None,
+            decode_many_allow_stop: bool | None = None,
             generated_prefix_cache: bool | None = None,
         ) -> None:
             self.init_args = (
@@ -1025,6 +1027,8 @@ def test_tensor_parallel_worker_loop_handles_online_runtime_commands(monkeypatch
                 store_full_prompt_prefixes,
                 admit_min_ready_requests,
                 admit_per_step_cap,
+                enable_decode_many,
+                decode_many_allow_stop,
                 generated_prefix_cache,
             )
             self.started: int | None = None
@@ -1066,7 +1070,22 @@ def test_tensor_parallel_worker_loop_handles_online_runtime_commands(monkeypatch
     runtime = instances[0]
     assert runtime.started == 16
     assert runtime.steps == 4
-    assert runtime.init_args[2:] == ("paged", 2, 0.25, 4, 2, 8, True, True, True, None, 128, True)
+    assert runtime.init_args[2:] == (
+        "paged",
+        2,
+        0.25,
+        4,
+        2,
+        8,
+        True,
+        True,
+        True,
+        None,
+        128,
+        False,
+        False,
+        True,
+    )
     assert [
         (
             request.prompt,
@@ -1257,6 +1276,7 @@ def test_tensor_parallel_worker_loop_receives_online_tensor_commands(monkeypatch
             admit_min_ready_requests: int | None = None,
             admit_per_step_cap: int | None = None,
             enable_decode_many: bool | None = None,
+            decode_many_allow_stop: bool | None = None,
             generated_prefix_cache: bool | None = None,
         ) -> None:
             self.init_args = (
@@ -1273,6 +1293,8 @@ def test_tensor_parallel_worker_loop_receives_online_tensor_commands(monkeypatch
                 store_full_prompt_prefixes,
                 admit_min_ready_requests,
                 admit_per_step_cap,
+                enable_decode_many,
+                decode_many_allow_stop,
                 generated_prefix_cache,
             )
             self.started: int | None = None
@@ -8033,10 +8055,12 @@ def test_openai_online_decode_quantum_uses_greedy_mid_cap_default(monkeypatch) -
     monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_MID_GEN_MIN_TOKENS", raising=False)
     monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_MID_GEN_DECODE_QUANTUM", raising=False)
 
-    assert _online_decode_quantum(temperature=0.0, max_tokens=64) == 8
+    assert _online_decode_quantum(temperature=0.0, max_tokens=64) == 4
     assert _online_decode_quantum(temperature=0.0, max_tokens=256) == 16
     assert _online_decode_quantum(temperature=0.7, max_tokens=256) == 4
     assert _online_decode_quantum(temperature=0.0, max_tokens=512) == 16
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_DECODE_MANY", "0")
+    assert _online_decode_quantum(temperature=0.0, max_tokens=64) == 8
 
 
 def test_openai_online_decode_quantum_respects_env_overrides(monkeypatch) -> None:
@@ -8055,23 +8079,31 @@ def test_openai_online_decode_quantum_respects_env_overrides(monkeypatch) -> Non
     assert _online_decode_quantum(temperature=0.0, max_tokens=256) == 2
 
 
-def test_openai_online_decode_many_defaults_off_for_short_greedy(monkeypatch) -> None:
+def test_openai_online_decode_many_defaults_on_for_short_greedy(monkeypatch) -> None:
     monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY", raising=False)
     monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_DECODE_MANY", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_DECODE_MANY_ALLOW_STOP", raising=False)
     monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_GEN_MAX_TOKENS", raising=False)
 
-    assert not _online_decode_many_enabled(temperature=0.0, max_tokens=64)
-    assert not _online_decode_many_enabled(temperature=0.0, max_tokens=128)
+    assert _online_decode_many_enabled(temperature=0.0, max_tokens=64)
+    assert _online_decode_many_enabled(temperature=0.0, max_tokens=128)
     assert not _online_decode_many_enabled(temperature=0.0, max_tokens=256)
     assert not _online_decode_many_enabled(temperature=0.7, max_tokens=64)
     assert not _online_decode_many_enabled(temperature=0.0, max_tokens=0)
+    assert _online_decode_many_allow_stop_enabled(temperature=0.0, max_tokens=64)
+
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_DECODE_MANY", "0")
+    assert not _online_decode_many_enabled(temperature=0.0, max_tokens=64)
+    assert not _online_decode_many_allow_stop_enabled(temperature=0.0, max_tokens=64)
 
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_DECODE_MANY", "1")
-    assert _online_decode_many_enabled(temperature=0.0, max_tokens=64)
-    assert _online_decode_many_enabled(temperature=0.0, max_tokens=128)
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_DECODE_MANY_ALLOW_STOP", "0")
+    assert not _online_decode_many_allow_stop_enabled(temperature=0.0, max_tokens=64)
 
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_GEN_MAX_TOKENS", "256")
     assert _online_decode_many_enabled(temperature=0.0, max_tokens=256)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_DECODE_MANY_ALLOW_STOP", raising=False)
+    assert _online_decode_many_allow_stop_enabled(temperature=0.0, max_tokens=256)
 
 
 def test_openai_online_decode_many_respects_env_overrides(monkeypatch) -> None:
@@ -12152,7 +12184,8 @@ def test_openai_tensor_parallel_online_batcher_records_profile_snapshots(
     assert records[2]["admit_per_step_cap"] == 64
     assert records[2]["prefill_token_budget"] == 0
     assert records[2]["enable_ragged_decode"] is True
-    assert records[2]["use_decode_many"] is False
+    assert records[2]["use_decode_many"] is True
+    assert records[2]["decode_many_allow_stop"] is True
     assert records[2]["use_paged_engine"] is False
     assert records[2]["graph_prefill"] is True
     assert records[2]["prefill_chunk_size"] == 0
