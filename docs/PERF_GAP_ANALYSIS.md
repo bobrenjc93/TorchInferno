@@ -316,6 +316,11 @@ Rechecking long_output with the new deterministic runtime-symm scope and
 median TPOT to `26.3ms`, but decode GPU time rose to `16.31s`, total profiled
 phase rose to `30.88s`, and score-facing TTFT/E2E regressed to
 `418.9 / 1686.1ms`. Keep the default greedy-short decode quantum at `4`.
+An attempted side-stream async D2H readback inside `step_online_many` is also
+rejected (`20260625_160230`): score-facing long_output stayed flat at
+`379.4 / 27.3 / 1610.2ms`, while the profile moved the wrong way
+(`30.64s` phase, `15.78s` decode GPU, `7.75s` readback). Revert the prototype;
+readback needs a real pipelined runner rather than a small copy scheduling shim.
 
 Long-output row-budget A/Bs on the same pushed code are not defaultable yet.
 Raising `TORCHINFERNO_OPENAI_TP_ONLINE_TOTAL_ROWS_BUDGET` to `160` improved the
