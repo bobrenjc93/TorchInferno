@@ -321,6 +321,14 @@ rejected (`20260625_160230`): score-facing long_output stayed flat at
 `379.4 / 27.3 / 1610.2ms`, while the profile moved the wrong way
 (`30.64s` phase, `15.78s` decode GPU, `7.75s` readback). Revert the prototype;
 readback needs a real pipelined runner rather than a small copy scheduling shim.
+Forcing the combined submit+step TP command on deterministic long_output is also
+rejected. The focused row (`20260625_162846`) improved score-facing
+TTFT/E2E/throughput to `342.8 / 1455.8ms / 26.5 tok/s` versus the paired no-env
+control (`20260625_163244`) at `486.0 / 1681.6ms / 23.0 tok/s`, but it regressed
+TPOT (`27.9ms` vs `25.9ms`) and the queue profile did not show a real engine win:
+phase total was flat-to-worse (`30.96s` vs `30.81s`), submit batches increased
+`95 -> 117`, runtime step calls increased `544 -> 611`, and decode/readback
+exposure rose. Keep combined submit+step defaulted only for sampled-short.
 
 Long-output row-budget A/Bs on the same pushed code are not defaultable yet.
 Raising `TORCHINFERNO_OPENAI_TP_ONLINE_TOTAL_ROWS_BUDGET` to `160` improved the
