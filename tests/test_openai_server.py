@@ -8161,12 +8161,12 @@ def test_openai_online_generated_prefix_cache_preserves_runtime_env_overrides(mo
     assert _online_generated_prefix_cache_enabled(temperature=0.7, max_tokens=256) is None
 
 
-def test_online_step_sync_enabled_defaults_off(monkeypatch) -> None:
+def test_online_step_sync_enabled_defaults_on(monkeypatch) -> None:
     monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_STEP_SYNC", raising=False)
-    assert not _online_step_sync_enabled()
-
-    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_STEP_SYNC", "1")
     assert _online_step_sync_enabled()
+
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_STEP_SYNC", "0")
+    assert not _online_step_sync_enabled()
 
 
 def test_online_fp8_prefill_defaults_to_greedy_large_and_sampled_medium(monkeypatch) -> None:
@@ -11540,7 +11540,7 @@ def test_openai_stream_group_can_drive_tensor_parallel_online_runtime(monkeypatc
         ("step", 1),
         ("close", None),
     ]
-    assert syncs == ["sync", "sync", "sync"]
+    assert syncs == ["sync", "sync", "sync", "sync", "sync"]
     first_items = _queue_items(first_queue)
     second_items = _queue_items(second_queue)
     assert first_items[:2] == [101, 102]
@@ -11633,7 +11633,7 @@ def test_openai_tensor_parallel_online_batcher_drains_ready_requests(monkeypatch
         ("step", 1),
         ("close", None),
     ]
-    assert syncs == ["sync", "sync", "sync"]
+    assert syncs == ["sync", "sync", "sync", "sync"]
     first_items = _queue_items(first_queue)
     second_items = _queue_items(second_queue)
     assert first_items[0] == 300
@@ -12552,7 +12552,7 @@ def test_openai_tensor_parallel_online_batcher_drains_after_short_step(monkeypat
         ("step", 1),
         ("close", None),
     ]
-    assert len(syncs) >= 4
+    assert len(syncs) >= 5
     first_items = _queue_items(first_queue)
     second_items = _queue_items(second_queue)
     assert first_items[0] == 400
