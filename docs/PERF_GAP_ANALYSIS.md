@@ -1,6 +1,14 @@
 # TorchInferno vs vLLM/sglang — Performance Gap Analysis (Llama-3.1-70B, 8xH100)
 
-## PUBLIC STARTUP REGRESSION: SLOW SHARED CHECKPOINT READS (2026-06-24)
+## PUBLIC STARTUP REGRESSION: CHECKPOINT LOAD/BROADCAST VARIABILITY (2026-06-24)
+
+Update `2026-06-25`: public run `20260624_230255` showed the opposite failure
+mode. TorchInferno printed `rank0_broadcast=1`, initialized NCCL successfully,
+then spent the full 1800s readiness window in the first checkpoint tensor
+broadcast and was killed before `/health` could bind. Same-host validation with
+`TORCHINFERNO_TP_RANK0_CHECKPOINT_BROADCAST=0` loaded all `80/80` layers in
+`23.6s` after the probe and reached `/health`, so rank-0 checkpoint tensor
+broadcast is now an explicit opt-in instead of the default.
 
 Public inference-bench run `20260624_160928` failed before latency measurement:
 TorchInferno reached NCCL init, then loaded only `70/80` layers in `1745.0s`
@@ -9,14 +17,14 @@ The same all-rank-read path is storage-sensitive: public run `20260624_100730`
 barely completed checkpoint loading in `1661.8s`, while same-host cached runs
 finish the same path in seconds.
 
-Rank-0 checkpoint tensor broadcast is promoted back to the default for CUDA TP
-startup. It avoids every rank independently streaming the same checkpoint from
-slow shared storage while leaving `TORCHINFERNO_TP_RANK0_CHECKPOINT_BROADCAST=0`
-as an explicit opt-out. Local startup smoke with the promoted path reached
+Rank-0 checkpoint tensor broadcast remains useful on hosts where it is known to
+be healthy because it avoids every rank independently streaming the same
+checkpoint from slow shared storage. Local startup smoke with that path reached
 readiness in `231s` and loaded all `80/80` layers in `25.3s`
 (`rank0_broadcast=1`, symm-memory allreduce disabled for the startup check).
-The inference-bench TorchInferno provider should no longer force
-`TORCHINFERNO_TP_RANK0_CHECKPOINT_BROADCAST=0`.
+Given the public NCCL broadcast stalls above, the inference-bench TorchInferno
+provider should leave `TORCHINFERNO_TP_RANK0_CHECKPOINT_BROADCAST` unset unless
+a run explicitly opts in.
 
 Public run `20260624_185427` supersedes the later-sorting stale
 `20260624_183253` failure. It used TorchInferno `76107de`, vLLM `1cd3e0e`,

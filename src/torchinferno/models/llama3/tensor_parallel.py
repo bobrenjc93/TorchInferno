@@ -5514,10 +5514,11 @@ def _rank0_checkpoint_broadcast_enabled(
         return False
     if not dist.is_available() or not dist.is_initialized():
         return False
-    # Rank-0 tensor broadcast avoids every TP rank independently streaming the
-    # same checkpoint from shared storage. Operators can still disable it for
-    # environments where the one-rank load plus NCCL broadcast is undesirable.
-    return _tp_flag("TORCHINFERNO_TP_RANK0_CHECKPOINT_BROADCAST", True)
+    # Rank-0 tensor broadcast can reduce shared-storage pressure, but very
+    # large startup broadcasts are brittle across NCCL/CUDA/host environments.
+    # Keep the portable per-rank checkpoint reader as the default and let
+    # operators opt into broadcast where it is known to be healthy.
+    return _tp_flag("TORCHINFERNO_TP_RANK0_CHECKPOINT_BROADCAST", False)
 
 
 def _rank0_checkpoint_scatter_enabled() -> bool:
