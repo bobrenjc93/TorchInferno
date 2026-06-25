@@ -233,7 +233,9 @@ batches `248 -> 212`, runtime step calls `220 -> 201`, phase total
 `3772ms -> 3591ms`, submit-sync `683ms -> 599ms`, and idle wait/drain
 `264ms -> 127ms`. Promote combined submit+step only for sampled-short online
 sessions (`temperature > 0`, `max_tokens <= 256`) and leave the env override for
-broader experiments.
+broader experiments. A post-push no-env validation on `80279ef` with symm-mem
+probing default-off reached readiness in `100.5s` and completed
+self_consistency at `276.2 / 0.0 / 409.9ms`, 1000/1000 correct.
 
 After landing the startup/runtime fixes as TorchInferno `de2d6f1`, a same-host
 skip-build provider comparison (`20260625_125255`) confirmed the readiness fix
@@ -977,7 +979,9 @@ enabled after probe`, completed NCCL init, then never bound `/health` before the
 1800s readiness timeout killed torchrun. The current patch restores the intended
 opt-in default: no probe unless
 `TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_AUTO_PROBE=1` or an explicit
-`TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE=auto/probe` requests it.
+`TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE=auto/probe` requests it. A local
+no-env provider check on `80279ef` showed no symm-probe log, reached readiness
+in `100.5s`, and completed self_consistency 1000/1000 correct.
 
 ## LOCAL MULTI-TURN LARGE-CAP RECHECK (2026-06-23, current 0d8749e + env)
 
