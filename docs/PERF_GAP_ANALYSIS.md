@@ -295,6 +295,21 @@ control to `12.89s / 7.57s`, while sampled self/tree stayed on the NCCL scope.
 Self_consistency remains arrival-shape sensitive (`268` submit batches in that
 run), so do not treat runtime symm as a sampled-traffic fix.
 
+The pushed `a74ce3f` same-host provider comparison (`20260625_154001`) confirms
+the score impact. TorchInferno reached readiness in `125.6s`, logged
+`symmetric-memory allreduce enabled after probe (runtime scope)`, and won two
+TPOT cells: few_shot `55.4ms` versus vLLM `56.2ms`, and multi_turn `65.4ms`
+versus vLLM `71.9ms`. Overall wins were vLLM `22`, TorchInferno `2`, and SGLang
+`1`. The remaining score-facing gaps are still TTFT/E2E: few_shot
+`182.7 / 238.4ms` vs vLLM `144.2 / 194.7ms`, self_consistency
+`265.7 / 411.7ms` vs `215.6 / 246.1ms`, multi_turn
+`532.9 / 582.9ms` vs `175.1 / 235.3ms`, tree_of_thought
+`288.9 / 335.7ms` vs `74.7 / 101.1ms`, and long_output
+`389.7 / 1631.5ms` vs `78.9 / 768.8ms`. The long queue profile still spends
+`11.92s` in prefill wall and `13.09s / 7.32s` in decode GPU/readback exposure,
+so runtime symm is only a partial decode fix; the next real lever remains
+prefill scheduling plus token readback/pipelining.
+
 Long-output row-budget A/Bs on the same pushed code are not defaultable yet.
 Raising `TORCHINFERNO_OPENAI_TP_ONLINE_TOTAL_ROWS_BUDGET` to `160` improved the
 profiled long-output engine phase (`26.34s -> 25.65s`) and moved the focused row
