@@ -35,6 +35,20 @@ hammering shared storage for every layer shard. Explicit
 `TORCHINFERNO_TP_RANK0_CHECKPOINT_BROADCAST=0` keeps the old all-rank-read path,
 and `TORCHINFERNO_TP_RANK0_CHECKPOINT_SHARD_SCATTER=0` disables the hybrid.
 
+Public run `20260625_090252` reached NCCL initialization and checkpoint loading
+but never bound `/health` before the 1800s readiness timeout; the process was
+killed with SIGTERM and no TorchInferno benchmark rows were produced. vLLM and
+SGLang completed the same run, so this was a TorchInferno startup warmup
+regression rather than a harness-wide failure. Local profiling found the server
+burning startup CPU inside broad graph warmups (`ragged_decode`, then
+temperature prefill/decode graph capture through Marlin quantization). Broad
+startup graph sweeps are now opt-in via `TORCHINFERNO_OPENAI_STARTUP_GRAPH_WARMUP`,
+with ragged decode separately opt-in. The narrower online scheduler cache/decode
+warmup remains default-on because it recovered runtime graph coverage while
+still reaching readiness in `120-126s`, well below the public timeout.
+Public run `20260625_110248` repeated the same failure on TorchInferno
+`c7ff2ca`; it does not include these local startup changes.
+
 Public run `20260624_185427` supersedes the later-sorting stale
 `20260624_183253` failure. It used TorchInferno `76107de`, vLLM `1cd3e0e`,
 and SGLang `4a4f063`; all providers completed all five benchmarks. Scorecard
@@ -85,6 +99,146 @@ mixed-prefix graph grouping with
 FP8 prefill gate to `512` for multi_turn was neutral-to-worse
 (`431.2 / 66.9 / 502.9ms`, `10.63s` prefill wall), so keep the `2048` runtime
 M gate.
+
+Follow-up local profiling on `c7ff2ca` kept the same runtime shape. The full
+TorchInferno baseline (`20260625_073446`) landed at few_shot
+`154.7 / 49.7 / 195.9ms`, self_consistency `357.5 / 0.0 / 386.1ms`,
+multi_turn `437.6 / 66.8 / 508.5ms`, tree_of_thought
+`328.1 / 51.6 / 363.6ms`, and long_output `343.1 / 27.3 / 1371.1ms`.
+Multi-turn is still dense prefill dominated: the queue profile spent
+`10.17s` in prefill wall time versus `1.31s` in active decode, with one
+45-token common-prefix prefill and `33` graph-backed suffix waves.
+
+Two more current-loop A/Bs are rejected on top of that baseline. A temporary
+batched COW suffix-prefill patch for the paged prefix-cache path improved the
+first paged queue snapshot (`240` requests finished at `12.5s`, versus the
+older first snapshot around `241` at `45.7s`), but the final paged multi_turn
+run (`20260625_094415`) was still unusable: `7832.5 / 745.3 / 8243.2ms`,
+`0.2 tok/s`, and `121.8s` batcher time. Dense multi_turn finishes the same
+profile shape in about `11.8s`, so the paged model/cache path remains the
+bottleneck; the patch was reverted. Rechecking sampled-medium tree with
+`TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_MAX_ACTIVE=40` also regressed:
+focused tree (`20260625_095527`) moved to `389.5 / 52.2 / 426.9ms` from the
+baseline `328.1 / 51.6 / 363.6ms`. Keep the sampled-medium default at `32`.
+
+Self-consistency was re-profiled with additional queue-shape counters
+(`20260625_100730`). The row stayed in family at `329.3 / 0.0 / 384.3ms`,
+1000/1000 correct, and confirmed generated-prefix reuse is not the missing
+piece: `985` generated-prefix reuse hits, one prefill batch, and one decode
+batch. The queue shape is the limiter: 1000 requests arrived as `232` submit
+batches, including `69` single-request submits, `38` two-request submits, and
+only one large `113`-request submit. This matches the earlier rejected
+post-arrival collection family; keep the new profile counters, but do not
+default another idle collection change without a fresh mechanism that avoids the
+previous TTFT/E2E regression.
+
+The startup fix initially exposed a first-request graph miss. With broad startup
+graph sweeps disabled and no replacement warmup (`20260625_105038`), readiness
+was healthy (`75.4s`) but self_consistency regressed to
+`369.6 / 0.0 / 417.3ms`; the profile showed the common-prefix prefill and static
+decode paths both missing their graphs (`prefill_graph_hits=0/misses=1`,
+`decode_graph_hits=0/misses=1`) and prefill wall rose to `2.80s`. A narrow
+online common-prefix startup warmup now allocates the persistent serving cache
+and captures only the default common-prefix prefill bucket, leaving the broad
+temperature/ragged graph zoo off by default. That restored the prefill hit
+without reintroducing the readiness timeout.
+
+Two adjacent A/Bs are rejected. Combining online submit and step into one TP
+command (`20260625_104126`) did restore graph hits when the full scheduler
+warmup was still enabled, but it did not reduce submit-sync time
+(`644ms` versus the nearby `623ms` baseline) and regressed self_consistency to
+`371.6 / 0.0 / 413.7ms`; keep the protocol support behind
+`TORCHINFERNO_OPENAI_TP_ONLINE_SUBMIT_STEP_COMMAND=1` rather than defaulting it.
+The first narrow-prefill run without a hot-path decode guard (`20260625_110200`)
+captured a static decode graph inside request handling, producing a `42.3s`
+decode-active stall and `43.2s` p99 TTFT/E2E tails. Continuous serving decode
+now passes `capture_on_miss=False` only when generated-prefix caching is active
+(the sampled-short self_consistency path that produced the 42s tail);
+`TORCHINFERNO_CONTINUOUS_DECODE_CAPTURE` remains the explicit override.
+
+With narrow startup prefill warmup plus hot-path decode capture disabled
+(`20260625_110829`), focused self_consistency improved to
+`234.5 / 0.0 / 368.0ms`, `1000/1000` correct, with readiness still `75.4s`.
+The queue profile now has the intended shape: one common-prefix prefill graph
+hit and no prefill miss, one decode graph miss falling back to eager decode,
+`1.77s` prefill wall, `222ms` decode-active, and `3.18s` profiled online
+batcher phase total. This does not close the vLLM public self_consistency gap
+(`189.2 / 0.0 / 213.4ms` in `20260625_090252`), but it fixes the public
+readiness failure and removes the first-request graph-miss regression without
+benchmark-specific output logic.
+
+The full-run recheck showed the decode guard must be scoped. Disabling runtime
+decode capture for every continuous-serving session recovered self but regressed
+few_shot/multi/tree/long because those rows still depend on decode graph capture
+or pre-warmed decode graphs after startup. With default-on scheduler warmup and
+broad graph sweeps still off, the full local TorchInferno run `20260625_113317`
+reached readiness in `125.6s` and landed at few_shot
+`153.1 / 50.4 / 194.8ms`, self_consistency `288.1 / 0.0 / 364.2ms`,
+multi_turn `429.7 / 65.3 / 497.9ms`, tree_of_thought
+`279.8 / 51.2 / 345.6ms`, and long_output `370.5 / 27.8 / 1618.9ms`.
+The follow-up no-env run `20260625_114015` confirmed the default path reaches
+the same startup band (`125.6s`) and stays in family: few_shot
+`155.5 / 50.2 / 195.5ms`, self_consistency `254.6 / 0.0 / 393.5ms`,
+multi_turn `453.4 / 69.0 / 538.2ms`, tree_of_thought
+`368.6 / 51.1 / 410.1ms`, and long_output `374.0 / 26.9 / 1492.5ms`. This
+keeps public startup safe and restores the earlier runtime family except for
+long_output E2E, which remains decode/readback dominated.
+
+A narrow runtime FP8 prefill startup warmup is accepted for the sampled-medium
+tree path. Focused tree with the warmup enabled (`20260625_121445`) reached
+readiness in `120.6s` and landed at `230.1 / 51.5 / 270.1ms`; disabling only
+`TORCHINFERNO_OPENAI_STARTUP_RUNTIME_FP8_PREFILL_WARMUP` in the paired run
+(`20260625_121827`) kept readiness at `120.6s` but regressed to
+`329.6 / 51.7 / 374.6ms`. The first sampled-medium 256-request phase still has
+cold cost, but the warmup cut it from `4.84s` phase / `3.96s` prefill wall to
+`3.60s` phase / `2.91s` prefill wall without restoring the broad startup graph
+sweeps. The pass is disabled when runtime FP8 prefill is explicitly disabled.
+
+A follow-up long_output decode-many quantum A/B is rejected. Letting the upper
+end of the greedy-short decode-many window use the full `16`-step command
+quantum cut step broadcasts sharply (`191` in the prior profile family to `58`)
+but regressed the row to `520.6 / 25.2 / 1765.9ms` in `20260625_120420`.
+The middle `8`-step quantum was also worse (`20260625_122518`:
+`488.8 / 26.0 / 1609.7ms`), even though it cut step broadcasts to `102` and
+readback time to `6.29s`. The queue profile still spent `26.7s` in runtime
+steps, with `13.0s` decode GPU time and `12.1s` prefill wall, so fewer host
+commands did not offset the larger queueing/prefill waves. Keep the default
+`decode_quantum=4` for decode-many short greedy sessions until there is a real
+pipelined readback or scheduler change.
+
+The final default TorchInferno-only full pass for this loop (`20260625_122927`)
+reached readiness in `120.6s` and completed all rows: few_shot
+`157.7 / 50.1 / 201.9ms`, self_consistency `379.0 / 0.0 / 406.4ms`,
+multi_turn `436.4 / 66.5 / 507.6ms`, tree_of_thought
+`281.0 / 51.5 / 345.5ms`, and long_output `359.6 / 27.2 / 1504.2ms`.
+Tree stayed improved versus the no-FP8-warmup paired run, while long remained in
+the default quantum-4 family. Self-consistency is still arrival-shape sensitive:
+the final full run landed slower than the focused `20260625_110829` row but
+kept the same one-prefill/one-decode generated-prefix shape and 1000/1000
+correctness.
+
+Two current self_consistency queueing A/Bs are rejected. Forcing
+`TORCHINFERNO_CONTINUOUS_ADMIT_MIN_READY_REQUESTS=16` did not consolidate the
+runtime reuse waves; it increased submit/reuse fragmentation (`297` submit
+batches, `261` prefix-reuse batches) and regressed the row to
+`400.0 / 0.0 / 461.8ms` in `20260625_123743`. Retesting the combined
+submit+step TP command on the current code also regressed to
+`411.3 / 0.0 / 436.8ms` in `20260625_124132`; keep it opt-in.
+
+The same counters on dense multi_turn (`20260625_101513`) show the opposite:
+submission cadence is not the limiter there. The run landed at
+`437.5 / 65.3 / 510.4ms`, 981/1000 raw correct, with `34` submit batches; `24`
+were full 32-request batches and submit-sync time was only `168ms`. Runtime was
+again prefill dominated: `10.15s` prefill wall, `9.65s` prefill forward, `34`
+prefill graph hits, and `1.33s` decode-active. Multi-turn still needs a faster
+or less fragmented conversation-prefix/suffix prefill path; batching HTTP
+arrivals is not the missing lever for this row.
+
+Lowering the runtime FP8 prefill `M` gate for the same row is also rejected on
+current code. `TORCHINFERNO_OPENAI_TP_ONLINE_FP8_PREFILL_MIN_M=512`
+(`20260625_124613`) landed at `436.5 / 65.0 / 507.2ms`, essentially neutral on
+median latency, while the profile worsened prefill forward time to `10.88s`
+from the default full-run `10.12s`. Keep the greedy-large FP8 gate at `2048`.
 
 Disabling the greedy-large online FP8 prefill path entirely is not a promotion
 either. With `TORCHINFERNO_OPENAI_TP_ONLINE_FP8_PREFILL=0`, current `b46a056`

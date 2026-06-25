@@ -103,6 +103,41 @@ class _StaticDecodeGraphToyModel(_RaggedGraphToyModel):
         return torch.argmax(self._logits(input_ids[:, -1] + 1)[:, -1, :], dim=-1)
 
 
+class _CaptureAwareStaticDecodeGraphToyModel(_StaticDecodeGraphToyModel):
+    def __init__(self, vocab_size: int = 64) -> None:
+        super().__init__(vocab_size)
+        self.capture_flags: list[bool] = []
+        self.static_logits_graph_calls = 0
+
+    def try_decode_one_token_graph(
+        self,
+        input_ids,
+        cache,
+        *,
+        temperature=0.0,
+        capture_on_miss: bool = True,
+    ):
+        self.capture_flags.append(capture_on_miss)
+        if not capture_on_miss:
+            return None
+        return super().try_decode_one_token_graph(input_ids, cache, temperature=temperature)
+
+    def try_decode_one_token_logits_graph(
+        self,
+        input_ids,
+        cache,
+        *,
+        capture_on_miss: bool = True,
+    ):
+        self.capture_flags.append(capture_on_miss)
+        if not capture_on_miss:
+            return None
+        self.static_logits_graph_calls += 1
+        rows = list(cache._rows[: input_ids.size(0)])
+        cache.advance_rows(rows, 1)
+        return self._logits(input_ids[:, -1] + 1)
+
+
 class _FiDecodeGraphFallbackToyModel(_RaggedGraphToyModel):
     def __init__(self, vocab_size: int = 64) -> None:
         super().__init__(vocab_size)
@@ -2357,6 +2392,62 @@ def test_continuous_batch_engine_dispatches_bucketed_decode_graphs() -> None:
     assert model.static_token_graph_calls == 2
     assert engine.stats.decode_graph_hits == 2
     assert engine.stats.decode_model_calls == 2
+
+
+def test_continuous_batch_engine_skips_decode_capture_for_generated_prefix_cache(
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_DECODE_CAPTURE", raising=False)
+    model = _CaptureAwareStaticDecodeGraphToyModel()
+    engine = ContinuousBatchEngine(
+        model,
+        device=torch.device("cpu"),
+        max_active_requests=2,
+        prefix_cache_capacity=1,
+        enable_ragged_decode=False,
+        generated_prefix_cache=True,
+    )
+
+    results = engine.run(
+        [
+            ServingRequest("a", (1, 2), 3, arrival_step=0),
+            ServingRequest("b", (3, 4), 3, arrival_step=0),
+        ]
+    )
+
+    assert [len(result.tokens) for result in results] == [5, 5]
+    assert model.capture_flags == [False, False]
+    assert model.static_token_graph_calls == 0
+    assert model.static_logits_graph_calls == 0
+    assert engine.stats.decode_graph_hits == 0
+    assert engine.stats.decode_graph_misses == 2
+    assert engine.stats.decode_model_calls == 2
+
+
+def test_continuous_batch_engine_can_capture_decode_graphs_with_env(monkeypatch) -> None:
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_DECODE_CAPTURE", "1")
+    model = _CaptureAwareStaticDecodeGraphToyModel()
+    engine = ContinuousBatchEngine(
+        model,
+        device=torch.device("cpu"),
+        max_active_requests=2,
+        prefix_cache_capacity=1,
+        enable_ragged_decode=False,
+        generated_prefix_cache=True,
+    )
+
+    results = engine.run(
+        [
+            ServingRequest("a", (1, 2), 3, arrival_step=0),
+            ServingRequest("b", (3, 4), 3, arrival_step=0),
+        ]
+    )
+
+    assert [len(result.tokens) for result in results] == [5, 5]
+    assert model.capture_flags == [True, True]
+    assert model.static_token_graph_calls == 0
+    assert model.static_logits_graph_calls == 2
+    assert engine.stats.decode_graph_hits == 2
 
 
 def test_continuous_batch_engine_uses_dense_token_graph_for_greedy_sampled_default(monkeypatch) -> None:

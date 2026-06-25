@@ -4351,12 +4351,14 @@ class ContinuousBatchEngine:
         decode_graph = getattr(self.model, "try_decode_ragged_token_graph", None)
         if decode_graph is None:
             return None
-        token = decode_graph(
+        token = self._call_decode_graph(
+            decode_graph,
             input_ids,
             self._require_cache(),
             seq_lens=seq_lens,
             row_indices=row_indices,
             temperature=self.temperature,
+            capture_on_miss=self._decode_capture_on_miss(),
         )
         if token is None:
             self.stats.decode_graph_misses += 1
@@ -4367,7 +4369,13 @@ class ContinuousBatchEngine:
         if decode_graph is None:
             self._report_static_graph_miss(input_ids, cache, "no_token_graph")
             return None
-        token = decode_graph(input_ids, cache, temperature=self.temperature)
+        token = self._call_decode_graph(
+            decode_graph,
+            input_ids,
+            cache,
+            temperature=self.temperature,
+            capture_on_miss=self._decode_capture_on_miss(),
+        )
         if token is None:
             self.stats.decode_graph_misses += 1
             self._report_static_graph_miss(input_ids, cache, "token_graph_returned_none")
@@ -4376,7 +4384,12 @@ class ContinuousBatchEngine:
     def _static_decode_logits(self, input_ids: Tensor, cache: object) -> Tensor:
         decode_graph = getattr(self.model, "try_decode_one_token_logits_graph", None)
         if decode_graph is not None:
-            logits = decode_graph(input_ids, cache)
+            logits = self._call_decode_graph(
+                decode_graph,
+                input_ids,
+                cache,
+                capture_on_miss=self._decode_capture_on_miss(),
+            )
             if logits is not None:
                 self.stats.decode_graph_hits += 1
                 return logits
@@ -4416,11 +4429,13 @@ class ContinuousBatchEngine:
     ) -> Tensor:
         decode_graph = getattr(self.model, "try_decode_ragged_logits_graph", None)
         if decode_graph is not None:
-            logits = decode_graph(
+            logits = self._call_decode_graph(
+                decode_graph,
                 input_ids,
                 self._require_cache(),
                 seq_lens=seq_lens,
                 row_indices=row_indices,
+                capture_on_miss=self._decode_capture_on_miss(),
             )
             if logits is not None:
                 self.stats.decode_graph_hits += 1
@@ -4436,6 +4451,38 @@ class ContinuousBatchEngine:
         if callable(sampler):
             return sampler(logits, self.temperature).to(self.device)
         return sample_next_token(logits, self.temperature).to(self.device)
+
+    def _decode_capture_on_miss(self) -> bool:
+        if "TORCHINFERNO_CONTINUOUS_DECODE_CAPTURE" in os.environ:
+            return env_flag("TORCHINFERNO_CONTINUOUS_DECODE_CAPTURE", False)
+        if self._generated_prefix_cache_enabled():
+            return False
+        return True
+
+    @staticmethod
+    def _call_decode_graph(
+        graph: Callable[..., Tensor | None],
+        input_ids: Tensor,
+        cache: object,
+        *,
+        capture_on_miss: bool,
+        temperature: float | None = None,
+        seq_lens: Tensor | None = None,
+        row_indices: Tensor | None = None,
+    ) -> Tensor | None:
+        try:
+            parameters = signature(graph).parameters
+        except (TypeError, ValueError):
+            parameters = {}
+        kwargs: dict[str, object] = {}
+        if temperature is not None:
+            kwargs["temperature"] = temperature
+        if seq_lens is not None:
+            kwargs["seq_lens"] = seq_lens
+            kwargs["row_indices"] = row_indices
+        if "capture_on_miss" in parameters:
+            kwargs["capture_on_miss"] = capture_on_miss
+        return graph(input_ids, cache, **kwargs)
 
     @staticmethod
     def _record_token_event(
