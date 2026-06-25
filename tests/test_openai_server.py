@@ -541,6 +541,7 @@ def test_openai_tensor_parallel_nccl_cumem_guard_can_be_disabled(monkeypatch) ->
 def test_openai_tensor_parallel_defaults_nccl_net_socket_for_standalone(monkeypatch) -> None:
     monkeypatch.delenv("NCCL_NET", raising=False)
     monkeypatch.delenv("NCCL_NET_PLUGIN", raising=False)
+    monkeypatch.delenv("NCCL_IB_DISABLE", raising=False)
     monkeypatch.delenv("TORCHINFERNO_TORCHRUN_RDZV_ENDPOINT", raising=False)
     monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_NCCL_SOCKET_DEFAULT", raising=False)
     config = OpenAIServerConfig(
@@ -552,11 +553,13 @@ def test_openai_tensor_parallel_defaults_nccl_net_socket_for_standalone(monkeypa
 
     assert os.environ["NCCL_NET"] == "Socket"
     assert os.environ["NCCL_NET_PLUGIN"] == "none"
+    assert os.environ["NCCL_IB_DISABLE"] == "1"
 
 
 def test_openai_tensor_parallel_nccl_net_env_is_explicit(monkeypatch) -> None:
     monkeypatch.setenv("NCCL_NET", "OFI")
     monkeypatch.setenv("NCCL_NET_PLUGIN", "aws")
+    monkeypatch.setenv("NCCL_IB_DISABLE", "0")
     monkeypatch.delenv("TORCHINFERNO_TORCHRUN_RDZV_ENDPOINT", raising=False)
     monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_NCCL_SOCKET_DEFAULT", raising=False)
     config = OpenAIServerConfig(
@@ -568,11 +571,13 @@ def test_openai_tensor_parallel_nccl_net_env_is_explicit(monkeypatch) -> None:
 
     assert os.environ["NCCL_NET"] == "OFI"
     assert os.environ["NCCL_NET_PLUGIN"] == "aws"
+    assert os.environ["NCCL_IB_DISABLE"] == "0"
 
 
 def test_openai_tensor_parallel_nccl_net_socket_default_skips_rendezvous(monkeypatch) -> None:
     monkeypatch.delenv("NCCL_NET", raising=False)
     monkeypatch.delenv("NCCL_NET_PLUGIN", raising=False)
+    monkeypatch.delenv("NCCL_IB_DISABLE", raising=False)
     monkeypatch.setenv("TORCHINFERNO_TORCHRUN_RDZV_ENDPOINT", "127.0.0.1:29599")
     monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_NCCL_SOCKET_DEFAULT", raising=False)
     config = OpenAIServerConfig(
@@ -584,6 +589,7 @@ def test_openai_tensor_parallel_nccl_net_socket_default_skips_rendezvous(monkeyp
 
     assert "NCCL_NET" not in os.environ
     assert "NCCL_NET_PLUGIN" not in os.environ
+    assert "NCCL_IB_DISABLE" not in os.environ
 
 
 def test_openai_server_warmup_uses_generic_shape_buckets(monkeypatch) -> None:

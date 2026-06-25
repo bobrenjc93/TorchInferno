@@ -10253,6 +10253,12 @@ def _prepare_tensor_parallel_nccl_runtime_env(config: OpenAIServerConfig) -> Non
                 "TorchInferno OpenAI server set NCCL_NET_PLUGIN=none for standalone tensor-parallel startup",
                 flush=True,
             )
+        if "NCCL_IB_DISABLE" not in os.environ:
+            os.environ["NCCL_IB_DISABLE"] = "1"
+            print(
+                "TorchInferno OpenAI server set NCCL_IB_DISABLE=1 for standalone tensor-parallel startup",
+                flush=True,
+            )
 
 
 def _openai_tp_symm_mem_allreduce_enabled() -> bool:
