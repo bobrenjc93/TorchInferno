@@ -411,7 +411,7 @@ def _online_generated_prefix_cache_enabled(*, temperature: float, max_tokens: in
 
 
 def _online_step_sync_enabled() -> bool:
-    return env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_STEP_SYNC", True)
+    return env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_STEP_SYNC", False)
 
 
 def _online_fp8_prefill_enabled(*, temperature: float, max_tokens: int) -> bool:

@@ -26,6 +26,15 @@ Given the public NCCL broadcast stalls above, the inference-bench TorchInferno
 provider should leave `TORCHINFERNO_TP_RANK0_CHECKPOINT_BROADCAST` unset unless
 a run explicitly opts in.
 
+Public run `20260625_030321` failed again on the all-rank-read path with
+`rank0_broadcast=0`, loading only `70/80` layers by `1757.4s`. The startup
+policy is now hybrid by default when the broadcast env is unset: replicated
+tensors still use per-rank reads so the giant embedding table is not broadcast,
+while sharded tensors use rank-0 scatter/reduce-scatter to avoid eight ranks
+hammering shared storage for every layer shard. Explicit
+`TORCHINFERNO_TP_RANK0_CHECKPOINT_BROADCAST=0` keeps the old all-rank-read path,
+and `TORCHINFERNO_TP_RANK0_CHECKPOINT_SHARD_SCATTER=0` disables the hybrid.
+
 Public run `20260624_185427` supersedes the later-sorting stale
 `20260624_183253` failure. It used TorchInferno `76107de`, vLLM `1cd3e0e`,
 and SGLang `4a4f063`; all providers completed all five benchmarks. Scorecard

@@ -2679,11 +2679,17 @@ class Llama3TensorParallelForCausalLM:
             world_size=world_size,
             dtype=torch_dtype,
         )
+        checkpoint_shard_scatter = _rank0_checkpoint_shard_scatter_enabled(
+            device=device,
+            world_size=world_size,
+            dtype=torch_dtype,
+        )
         if rank == 0:
             print(
                 "[Llama3TP] loading checkpoint tensors "
                 f"world_size={world_size} dtype={str(torch_dtype).replace('torch.', '')} "
-                f"rank0_broadcast={int(checkpoint_broadcast)}",
+                f"rank0_broadcast={int(checkpoint_broadcast)} "
+                f"rank0_shard_scatter={int(checkpoint_shard_scatter)}",
                 flush=True,
             )
         embed_tokens_weight = _load_checkpoint_tensor(
@@ -5521,6 +5527,27 @@ def _rank0_checkpoint_broadcast_enabled(
     return _tp_flag("TORCHINFERNO_TP_RANK0_CHECKPOINT_BROADCAST", False)
 
 
+def _rank0_checkpoint_shard_scatter_enabled(
+    *,
+    device: torch.device,
+    world_size: int,
+    dtype: torch.dtype | None,
+) -> bool:
+    if world_size <= 1 or dtype is None:
+        return False
+    if device.type != "cuda":
+        return False
+    if not dist.is_available() or not dist.is_initialized():
+        return False
+    if "TORCHINFERNO_TP_RANK0_CHECKPOINT_BROADCAST" in os.environ:
+        return _rank0_checkpoint_broadcast_enabled(
+            device=device,
+            world_size=world_size,
+            dtype=dtype,
+        )
+    return _tp_flag("TORCHINFERNO_TP_RANK0_CHECKPOINT_SHARD_SCATTER", True)
+
+
 def _rank0_checkpoint_scatter_enabled() -> bool:
     return _tp_flag("TORCHINFERNO_TP_RANK0_CHECKPOINT_SCATTER", True)
 
@@ -5555,7 +5582,17 @@ def _load_checkpoint_tensor_shard(
     device: torch.device,
     dtype: torch.dtype | None,
 ) -> Tensor:
-    if not _rank0_checkpoint_broadcast_enabled(device=device, world_size=world_size, dtype=dtype):
+    rank0_broadcast = _rank0_checkpoint_broadcast_enabled(
+        device=device,
+        world_size=world_size,
+        dtype=dtype,
+    )
+    rank0_shard_scatter = _rank0_checkpoint_shard_scatter_enabled(
+        device=device,
+        world_size=world_size,
+        dtype=dtype,
+    )
+    if not rank0_broadcast and not rank0_shard_scatter:
         return loader.get_tensor_shard(
             name,
             dim=dim,
@@ -5567,11 +5604,24 @@ def _load_checkpoint_tensor_shard(
     shape = loader.get_tensor_shape(name)
     if shape[dim] % world_size != 0:
         raise ValueError(f"cannot shard {name} shape={shape} dim={dim} across {world_size} ranks")
-    if _rank0_checkpoint_scatter_enabled() and hasattr(dist, "reduce_scatter_tensor"):
+    if (
+        (rank0_broadcast or rank0_shard_scatter)
+        and _rank0_checkpoint_scatter_enabled()
+        and hasattr(dist, "reduce_scatter_tensor")
+    ):
         return _load_checkpoint_tensor_shard_scatter(
             loader,
             name,
             shape=shape,
+            dim=dim,
+            rank=rank,
+            world_size=world_size,
+            device=device,
+            dtype=dtype,
+        )
+    if not rank0_broadcast:
+        return loader.get_tensor_shard(
+            name,
             dim=dim,
             rank=rank,
             world_size=world_size,

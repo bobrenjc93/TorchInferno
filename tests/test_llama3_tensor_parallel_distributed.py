@@ -193,6 +193,40 @@ def test_tensor_parallel_checkpoint_tensor_broadcast_defaults_off_for_cuda_tp(mo
     )
 
 
+def test_tensor_parallel_checkpoint_shard_scatter_defaults_on_when_broadcast_unset(monkeypatch) -> None:
+    monkeypatch.setattr(tensor_parallel_module.dist, "is_available", lambda: True)
+    monkeypatch.setattr(tensor_parallel_module.dist, "is_initialized", lambda: True)
+    monkeypatch.delenv("TORCHINFERNO_TP_RANK0_CHECKPOINT_BROADCAST", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_TP_RANK0_CHECKPOINT_SHARD_SCATTER", raising=False)
+
+    assert tensor_parallel_module._rank0_checkpoint_shard_scatter_enabled(
+        device=torch.device("cuda"),
+        world_size=2,
+        dtype=torch.bfloat16,
+    )
+
+    monkeypatch.setenv("TORCHINFERNO_TP_RANK0_CHECKPOINT_SHARD_SCATTER", "0")
+    assert not tensor_parallel_module._rank0_checkpoint_shard_scatter_enabled(
+        device=torch.device("cuda"),
+        world_size=2,
+        dtype=torch.bfloat16,
+    )
+
+    monkeypatch.setenv("TORCHINFERNO_TP_RANK0_CHECKPOINT_BROADCAST", "0")
+    assert not tensor_parallel_module._rank0_checkpoint_shard_scatter_enabled(
+        device=torch.device("cuda"),
+        world_size=2,
+        dtype=torch.bfloat16,
+    )
+
+    monkeypatch.setenv("TORCHINFERNO_TP_RANK0_CHECKPOINT_BROADCAST", "1")
+    assert tensor_parallel_module._rank0_checkpoint_shard_scatter_enabled(
+        device=torch.device("cuda"),
+        world_size=2,
+        dtype=torch.bfloat16,
+    )
+
+
 def test_tensor_parallel_rank0_checkpoint_scatter_packs_dim1_shards(monkeypatch) -> None:
     full = torch.tensor([[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]])
     calls: list[str] = []
@@ -218,6 +252,7 @@ def test_tensor_parallel_rank0_checkpoint_scatter_packs_dim1_shards(monkeypatch)
         output.copy_(input_tensor[: output.size(0)])
 
     monkeypatch.setattr(tensor_parallel_module, "_rank0_checkpoint_broadcast_enabled", lambda **kwargs: True)
+    monkeypatch.setattr(tensor_parallel_module, "_rank0_checkpoint_shard_scatter_enabled", lambda **kwargs: True)
     monkeypatch.setattr(tensor_parallel_module.dist, "reduce_scatter_tensor", reduce_scatter)
     monkeypatch.delenv("TORCHINFERNO_TP_RANK0_CHECKPOINT_SCATTER", raising=False)
 
@@ -253,6 +288,7 @@ def test_tensor_parallel_checkpoint_scatter_nonzero_rank_avoids_checkpoint_read(
         output.copy_(torch.tensor([[3.0, 4.0], [7.0, 8.0]]))
 
     monkeypatch.setattr(tensor_parallel_module, "_rank0_checkpoint_broadcast_enabled", lambda **kwargs: True)
+    monkeypatch.setattr(tensor_parallel_module, "_rank0_checkpoint_shard_scatter_enabled", lambda **kwargs: True)
     monkeypatch.setattr(tensor_parallel_module.dist, "reduce_scatter_tensor", reduce_scatter)
     monkeypatch.delenv("TORCHINFERNO_TP_RANK0_CHECKPOINT_SCATTER", raising=False)
 
