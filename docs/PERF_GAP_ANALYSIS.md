@@ -338,9 +338,15 @@ strong focused long row (`336.5 / 26.8 / 1361.6ms`) but regressed the full-suite
 shape, especially few_shot and multi_turn (`200.1 / 52.5 / 242.9ms` and
 `644.6 / 68.6 / 691.9ms` in `20260625_134508`). Warming only the old 144-row
 cache while allocating the larger greedy-short cache at runtime caused a
-long-output TTFT tail blow-up (`691.3ms` median, `32.5s` p99). The viable path
-is a real dual-cache or shape-specific warmup design; do not promote a flat
-larger row budget.
+long-output TTFT tail blow-up (`691.3ms` median, `32.5s` p99). A follow-up
+dual-cache prototype on the runtime-symm stack is also rejected: the default
+192-row greedy-short cache (`20260625_161437`) landed at
+`379.9 / 27.6 / 1487.9ms` but worsened the profiled phase to `32.97s`
+(`13.34s` prefill wall, `16.51s` decode GPU, `7.23s` readback) with a bad p99
+tail, and a 160-row scoped variant (`20260625_161848`) was not cleaner at
+`360.0 / 27.3 / 1508.7ms` with `31.59s` phase. Do not promote a flat larger row
+budget or the tested cache split; the viable path needs a more fundamental
+shape-specific scheduler/warmup change.
 
 Current `def840e` follow-up probes reject three narrower queue/cache knobs.
 For multi_turn, enabling pinned full-prompt stores for greedy-large requests
