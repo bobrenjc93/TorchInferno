@@ -7829,7 +7829,7 @@ def test_openai_symm_mem_auto_probe_sets_worker_env_on_success(monkeypatch) -> N
     _prepare_tensor_parallel_symm_mem_allreduce_auto(config)
 
     assert calls == [8]
-    assert os.environ["TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE"] == "1"
+    assert os.environ["TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE"] == "runtime"
 
 
 def test_openai_symm_mem_auto_probe_sets_worker_env_on_failure(monkeypatch) -> None:
@@ -7852,7 +7852,7 @@ def test_openai_symm_mem_auto_probe_sets_worker_env_on_failure(monkeypatch) -> N
     assert os.environ["TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE"] == "0"
 
 
-def test_openai_symm_mem_auto_probe_defaults_off(monkeypatch) -> None:
+def test_openai_symm_mem_auto_probe_defaults_to_runtime_scope(monkeypatch) -> None:
     monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE", raising=False)
     monkeypatch.delenv("TORCHINFERNO_SYMM_MEM_ALLREDUCE", raising=False)
     monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_AUTO_PROBE", raising=False)
@@ -7868,14 +7868,35 @@ def test_openai_symm_mem_auto_probe_defaults_off(monkeypatch) -> None:
     config = OpenAIServerConfig(model="meta-llama/Llama-3.1", tensor_parallel_size=8)
     _prepare_tensor_parallel_symm_mem_allreduce_auto(config)
 
-    assert calls == []
-    assert os.environ["TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE"] == "0"
+    assert calls == [8]
+    assert os.environ["TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE"] == "runtime"
 
 
 def test_openai_symm_mem_auto_probe_honors_auto_value(monkeypatch) -> None:
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE", "auto")
     monkeypatch.delenv("TORCHINFERNO_SYMM_MEM_ALLREDUCE", raising=False)
     monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_AUTO_PROBE", raising=False)
+    calls: list[int] = []
+
+    def fake_probe(config: OpenAIServerConfig) -> bool:
+        calls.append(config.tensor_parallel_size)
+        return True
+
+    monkeypatch.setattr("torch.cuda.is_available", lambda: True)
+    monkeypatch.setattr("torchinferno.openai_server._run_tensor_parallel_symm_mem_allreduce_probe", fake_probe)
+
+    config = OpenAIServerConfig(model="meta-llama/Llama-3.1", tensor_parallel_size=8)
+    _prepare_tensor_parallel_symm_mem_allreduce_auto(config)
+
+    assert calls == [8]
+    assert os.environ["TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE"] == "runtime"
+
+
+def test_openai_symm_mem_auto_probe_can_enable_all_scopes(monkeypatch) -> None:
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_SYMM_MEM_ALLREDUCE", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_AUTO_PROBE", raising=False)
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_AUTO_SCOPE", "all")
     calls: list[int] = []
 
     def fake_probe(config: OpenAIServerConfig) -> bool:
@@ -8039,9 +8060,53 @@ def test_openai_symm_mem_scope_enables_explicit_short_deterministic_decode(monke
     assert captured == [(128, True)]
 
 
-def test_openai_symm_mem_scope_disables_long_generations(monkeypatch) -> None:
+def test_openai_symm_mem_scope_runtime_mode_skips_startup(monkeypatch) -> None:
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE", "runtime")
+    monkeypatch.delenv("TORCHINFERNO_SYMM_MEM_ALLREDUCE", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_MAX_TOKENS", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_MAX_BATCH", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_STARTUP", raising=False)
+    model = object()
+    captured: list[tuple[int | None, bool | None]] = []
+
+    class FakeContext:
+        def __enter__(self) -> None:
+            return None
+
+        def __exit__(self, exc_type, exc, traceback) -> bool:  # noqa: ANN001
+            return False
+
+    def fake_symm_scope(max_batch: int | None, *, enabled: bool | None = None) -> FakeContext:
+        captured.append((max_batch, enabled))
+        return FakeContext()
+
+    monkeypatch.setattr("torchinferno.openai_server._is_tensor_parallel_model", lambda candidate: candidate is model)
+    monkeypatch.setattr("torchinferno.openai_server._tensor_parallel_world_size", lambda candidate: 8)
+    monkeypatch.setattr("torchinferno.openai_server.symm_mem_allreduce_max_batch", fake_symm_scope)
+
+    with _tensor_parallel_symm_mem_allreduce_scope(
+        model,
+        torch.device("cuda"),
+        max_tokens=64,
+        temperature=0.0,
+    ):
+        pass
+    with _tensor_parallel_symm_mem_allreduce_scope(
+        model,
+        torch.device("cuda"),
+        max_tokens=64,
+        temperature=0.0,
+        startup=True,
+    ):
+        pass
+
+    assert captured == [(128, True), (None, False)]
+
+
+def test_openai_symm_mem_scope_disables_sampled_and_long_generations(monkeypatch) -> None:
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE", "1")
     monkeypatch.delenv("TORCHINFERNO_SYMM_MEM_ALLREDUCE", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_MAX_TEMPERATURE", raising=False)
     model = object()
     captured: list[tuple[int | None, bool | None]] = []
 
@@ -8072,7 +8137,37 @@ def test_openai_symm_mem_scope_disables_long_generations(monkeypatch) -> None:
     ):
         pass
 
-    assert captured == [(128, True), (None, False)]
+    assert captured == [(None, False), (None, False)]
+
+
+def test_openai_symm_mem_scope_can_enable_sampled_generations(monkeypatch) -> None:
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE", "1")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_MAX_TEMPERATURE", "1.0")
+    monkeypatch.delenv("TORCHINFERNO_SYMM_MEM_ALLREDUCE", raising=False)
+    model = object()
+    captured: list[tuple[int | None, bool | None]] = []
+
+    class FakeContext:
+        def __enter__(self): return None
+        def __exit__(self, *args): return False
+
+    def fake_symm_scope(max_batch: int | None, *, enabled: bool | None = None):
+        captured.append((max_batch, enabled))
+        return FakeContext()
+
+    monkeypatch.setattr("torchinferno.openai_server._is_tensor_parallel_model", lambda candidate: candidate is model)
+    monkeypatch.setattr("torchinferno.openai_server._tensor_parallel_world_size", lambda candidate: 8)
+    monkeypatch.setattr("torchinferno.openai_server.symm_mem_allreduce_max_batch", fake_symm_scope)
+
+    with _tensor_parallel_symm_mem_allreduce_scope(
+        model,
+        torch.device("cuda"),
+        max_tokens=64,
+        temperature=0.7,
+    ):
+        pass
+
+    assert captured == [(128, True)]
 
 
 def test_openai_symm_mem_validation_is_openai_opt_in(monkeypatch) -> None:
@@ -8097,6 +8192,10 @@ def test_openai_symm_mem_validation_is_openai_opt_in(monkeypatch) -> None:
     engine.device = torch.device("cuda")
     engine.cache_backend = "dense"
 
+    OpenAICompletionEngine._warmup_tensor_parallel_model(engine)
+    assert calls == []
+
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE", "runtime")
     OpenAICompletionEngine._warmup_tensor_parallel_model(engine)
     assert calls == []
 

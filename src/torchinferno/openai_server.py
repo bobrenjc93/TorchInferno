@@ -2581,7 +2581,7 @@ class OpenAICompletionEngine:
             cache_batch=cache_batch,
         ))
         with _tensor_parallel_symm_mem_allreduce_scope(
-            self.model, self.device, max_tokens=1, temperature=0.0,
+            self.model, self.device, max_tokens=1, temperature=0.0, startup=True,
         ):
             for bs in batch_sizes:
                 _set_generation_cache_seq_len(cache, prompt_tokens)
@@ -5866,7 +5866,7 @@ class OpenAICompletionEngine:
             return
         if not _is_tensor_parallel_model(self.model) or self.device.type != "cuda":
             return
-        if _openai_tp_symm_mem_allreduce_enabled():
+        if _openai_tp_symm_mem_allreduce_enabled(startup=True):
             # Collective symm-mem handshake BEFORE the primary-only generate check,
             # so primary + workers (synchronized here after the control-group warmup)
             # vote together. It is opt-in for OpenAI serving because some hosts hang
@@ -5892,6 +5892,7 @@ class OpenAICompletionEngine:
                 self.device,
                 max_tokens=new_tokens,
                 temperature=0.0,
+                startup=True,
             ):
                 for count in prompt_token_counts:
                     input_ids = (torch.arange(count, device=self.device, dtype=torch.long) % vocab_size)[None, :]
@@ -5916,6 +5917,7 @@ class OpenAICompletionEngine:
                                 self.device,
                                 max_tokens=1,
                                 temperature=0.0,
+                                startup=True,
                             ):
                                 self._warmup_tensor_parallel_ragged_decode_graphs(vocab_size)
                     self._warmup_tensor_parallel_batched_prefix_suffix_graphs(vocab_size)
@@ -10501,22 +10503,38 @@ def _prepare_tensor_parallel_nccl_runtime_env(config: OpenAIServerConfig) -> Non
             )
 
 
-def _openai_tp_symm_mem_allreduce_enabled() -> bool:
+def _openai_tp_symm_mem_allreduce_mode() -> str:
     global_env = "TORCHINFERNO_SYMM_MEM_ALLREDUCE"
     if global_env in os.environ and not env_flag(global_env, False):
-        return False
+        return "off"
     openai_env = "TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE"
     if openai_env in os.environ:
         raw = os.environ[openai_env].strip().lower()
         if raw in {"auto", "probe"}:
-            return False
-        return env_flag(openai_env, False)
+            return "off"
+        if raw in {"runtime", "runtime-only", "online", "decode"}:
+            return "runtime"
+        return "all" if env_flag(openai_env, False) else "off"
     if global_env in os.environ:
         raw = os.environ[global_env].strip().lower()
         if raw in {"auto", "probe"}:
-            return False
-        return env_flag(global_env, False)
-    return False
+            return "off"
+        if raw in {"runtime", "runtime-only", "online", "decode"}:
+            return "runtime"
+        return "all" if env_flag(global_env, False) else "off"
+    return "off"
+
+
+def _openai_tp_symm_mem_allreduce_enabled(*, startup: bool = False) -> bool:
+    mode = _openai_tp_symm_mem_allreduce_mode()
+    if mode == "off":
+        return False
+    if startup:
+        startup_env = "TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_STARTUP"
+        if startup_env in os.environ:
+            return env_flag(startup_env, False)
+        return mode == "all"
+    return mode in {"all", "runtime"}
 
 
 def _prepare_tensor_parallel_symm_mem_allreduce_auto(config: OpenAIServerConfig) -> None:
@@ -10528,15 +10546,12 @@ def _prepare_tensor_parallel_symm_mem_allreduce_auto(config: OpenAIServerConfig)
         return
     if raw_openai is not None and raw_openai.strip().lower() not in {"auto", "probe"}:
         return
-    auto_requested = (
-        (raw_openai is not None and raw_openai.strip().lower() in {"auto", "probe"})
-        or (raw_global is not None and raw_global.strip().lower() in {"auto", "probe"})
-    )
     # Symmetric-memory allreduce is a measurable TP decode win on 8xH100, but
     # public runs have shown hosts can pass the probe and then hang before
-    # readiness during startup. Keep the probe opt-in and propagate a concrete
-    # worker env value so all ranks either use symm-mem together or stay on NCCL.
-    if not env_flag("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_AUTO_PROBE", auto_requested):
+    # readiness during startup warmups. Probe by default, but only enable runtime
+    # request scopes after success unless an explicit all-scope override asks for
+    # startup symm-mem too.
+    if not env_flag("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_AUTO_PROBE", True):
         os.environ[openai_env] = "0"
         return
     if int(getattr(config, "tensor_parallel_size", 1)) <= 1:
@@ -10553,10 +10568,22 @@ def _prepare_tensor_parallel_symm_mem_allreduce_auto(config: OpenAIServerConfig)
         flush=True,
     )
     enabled = _run_tensor_parallel_symm_mem_allreduce_probe(config)
-    os.environ[openai_env] = "1" if enabled else "0"
+    if enabled:
+        auto_scope = os.environ.get(
+            "TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_AUTO_SCOPE",
+            "runtime",
+        ).strip().lower()
+        os.environ[openai_env] = "1" if auto_scope in {"all", "both", "startup"} else "runtime"
+    else:
+        os.environ[openai_env] = "0"
+    enabled_scope = "all" if os.environ.get(openai_env) == "1" else os.environ.get(openai_env, "0")
     print(
         "TorchInferno OpenAI server symmetric-memory allreduce "
-        + ("enabled after probe" if enabled else "disabled after probe"),
+        + (
+            f"enabled after probe ({enabled_scope} scope)"
+            if enabled
+            else "disabled after probe"
+        ),
         flush=True,
     )
 
@@ -10637,6 +10664,7 @@ def _tensor_parallel_symm_mem_allreduce_scope(
     *,
     max_tokens: int,
     temperature: float,
+    startup: bool = False,
 ) -> ContextManager[None]:
     if (
         not _is_tensor_parallel_model(model)
@@ -10644,10 +10672,17 @@ def _tensor_parallel_symm_mem_allreduce_scope(
         or device.type != "cuda"
     ):
         return nullcontext()
+    max_temperature = env_float(
+        "TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_MAX_TEMPERATURE",
+        0.0,
+        minimum=0.0,
+    )
+    if float(temperature) > max_temperature:
+        return symm_mem_allreduce_max_batch(None, enabled=False)
     max_tokens_limit = env_int("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_MAX_TOKENS", 1024, minimum=1)
     if max_tokens > max_tokens_limit:
         return symm_mem_allreduce_max_batch(None, enabled=False)
-    if not _openai_tp_symm_mem_allreduce_enabled():
+    if not _openai_tp_symm_mem_allreduce_enabled(startup=startup):
         return symm_mem_allreduce_max_batch(None, enabled=False)
     max_batch = env_int("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_MAX_BATCH", 128, minimum=1)
     return symm_mem_allreduce_max_batch(max_batch, enabled=True)

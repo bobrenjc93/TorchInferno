@@ -244,8 +244,8 @@ few_shot `163.0 / 53.3 / 205.6ms`, self_consistency
 tree_of_thought `325.6 / 58.0 / 379.3ms`, and long_output
 `328.0 / 31.2 / 1579.2ms`. This is the expected public-readiness tradeoff:
 self improves materially from sampled submit+step, while tree/long decode TPOT
-give back the symm-memory optimization until the public host can safely opt into
-`TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_AUTO_PROBE=1`.
+give back the symm-memory optimization until the startup/runtime symm scopes are
+split.
 
 After landing the startup/runtime fixes as TorchInferno `de2d6f1`, a same-host
 skip-build provider comparison (`20260625_125255`) confirmed the readiness fix
@@ -258,6 +258,42 @@ tree_of_thought `99.7 / 171.4 / 400.5ms`, and long_output
 (`53.8ms` versus vLLM `59.7ms` and SGLang `82.1ms`), so the next score work
 should target conversation-prefix prefill and long-output row turnaround rather
 than more startup fixes.
+
+The current pushed default (`754cc36`) was re-run in a same-host provider
+comparison (`20260625_150106`) after keeping symm-memory probing opt-in and
+defaulting sampled-short submit+step. TorchInferno again reached readiness and
+won only the few_shot TPOT cell. Provider medians were:
+few_shot vLLM/SGLang/TorchInferno `201.3 / 223.2 / 227.8ms` E2E,
+self_consistency `267.9 / 393.0 / 372.1ms`, multi_turn
+`214.0 / 282.0 / 541.5ms`, tree_of_thought `99.7 / 163.2 / 313.6ms`, and
+long_output `738.9 / 1004.0 / 1694.0ms`. The queue profile shows the remaining
+work split by traffic shape: self_consistency still has `218` submit batches,
+`200` step calls, `604ms` submit-sync, and `248ms` idle drain despite
+submit+step; multi_turn spends `10.14s` prefill wall / `9.65s` prefill forward
+across `34` submit batches; long_output spends `11.58s` prefill wall plus
+`14.52s` decode GPU time and `9.15s` synchronous token readback exposure across
+`558` step calls. This keeps the priority unchanged: close dense prefill and
+long-output decode/readback gaps before another broad queue knob.
+
+A follow-up split restores the safe part of symm-memory allreduce without
+putting startup back on the failing path. A successful auto-probe now writes
+`TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE=runtime`, startup warmups/validation
+stay on NCCL unless `TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_STARTUP=1`, and
+runtime symm is default-gated to deterministic traffic
+(`TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_MAX_TEMPERATURE=0.0`). The broad
+runtime version (`20260625_152053`) proved readiness-safe (`125.6s`) and
+improved long_output to `379.2 / 27.0 / 1512.6ms`, but it was not worth using
+for sampled rows. The paired probe-off control (`20260625_152626`) landed at
+few_shot `167.9 / 60.3 / 216.0ms`, self_consistency
+`91.6 / 0.0 / 120.2ms`, multi_turn `441.3 / 67.8 / 516.7ms`,
+tree_of_thought `294.7 / 56.7 / 349.7ms`, and long_output
+`359.3 / 31.3 / 1606.9ms`. With the deterministic gate
+(`20260625_153150`), readiness remained healthy (`120.6s`) and long_output
+kept the useful decode win at `381.1 / 27.0 / 1396.2ms`; the queue profile moved
+long decode GPU/readback exposure from `15.09s / 9.84s` in the probe-off
+control to `12.89s / 7.57s`, while sampled self/tree stayed on the NCCL scope.
+Self_consistency remains arrival-shape sensitive (`268` submit batches in that
+run), so do not treat runtime symm as a sampled-traffic fix.
 
 Long-output row-budget A/Bs on the same pushed code are not defaultable yet.
 Raising `TORCHINFERNO_OPENAI_TP_ONLINE_TOTAL_ROWS_BUDGET` to `160` improved the
@@ -973,8 +1009,8 @@ readiness after NCCL init. A local focused run reproduced a related startup
 stall after the symm-mem probe had passed: `py-spy` showed rank 0 blocked in
 `torch.distributed._symmetric_memory.rendezvous` / `cuMulticastBindMem` during
 ragged decode graph warmup. Because the serving process cannot safely recover
-from that in-process CUDA rendezvous hang, OpenAI TP now keeps symm-mem
-allreduce default-off and requires explicit opt-in with
+from that in-process CUDA rendezvous hang, the immediate mitigation kept OpenAI
+TP symm-mem allreduce default-off and required explicit opt-in with
 `TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_AUTO_PROBE=1` or
 `TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE=1`. This gives up a measured decode
 TPOT optimization on stable hosts but should move public runs from startup dash
@@ -986,12 +1022,14 @@ The public `20260625_130348` run confirms that leaving this probe default-on is
 still unsafe on the benchmark host. It built TorchInferno `de2d6f1` with the
 provider-level NCCL socket defaults, reported `symmetric-memory allreduce
 enabled after probe`, completed NCCL init, then never bound `/health` before the
-1800s readiness timeout killed torchrun. The current patch restores the intended
-opt-in default: no probe unless
+1800s readiness timeout killed torchrun. The `80279ef` mitigation restored an
+opt-in default with no probe unless
 `TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_AUTO_PROBE=1` or an explicit
-`TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE=auto/probe` requests it. A local
-no-env provider check on `80279ef` showed no symm-probe log, reached readiness
-in `100.5s`, and completed self_consistency 1000/1000 correct.
+`TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE=auto/probe` requested it; a local
+no-env provider check on that commit showed no symm-probe log, reached readiness
+in `100.5s`, and completed self_consistency 1000/1000 correct. The later
+runtime-only split re-enables the auto-probe for default deterministic decode,
+but startup warmups still stay off the symm scope.
 
 ## LOCAL MULTI-TURN LARGE-CAP RECHECK (2026-06-23, current 0d8749e + env)
 
