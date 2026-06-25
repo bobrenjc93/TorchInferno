@@ -361,7 +361,14 @@ prefill wall dropped `12.54s -> 11.20s`, decode GPU exposure
 change narrowly scoped to deterministic `max_tokens<=128` traffic. The patched
 no-env default reproduced the setting (`admit_min_ready_requests=12`) and landed
 at `285.5 / 28.2 / 1389.3ms`, `26.7 tok/s`, with a lower profiled phase
-(`29.89s`) and 1000/1000 correctness.
+(`29.89s`) and 1000/1000 correctness. A full TorchInferno-only no-env pass on
+the pushed default (`fdbe848`, `20260625_171504`) kept long_output in the
+improved family at `344.5 / 28.3 / 1388.7ms`, with few_shot
+`164.2 / 55.1 / 208.8ms`, self_consistency `173.9 / 0.0 / 299.4ms`,
+multi_turn `451.0 / 66.0 / 522.3ms`, and tree_of_thought
+`345.9 / 56.0 / 409.7ms`. Tree was noisy/slower, but the changed refill policy
+only applied to the long_output session (`run_max_tokens=96`,
+`admit_min_ready_requests=12`).
 
 Long-output row-budget A/Bs on the same pushed code are not defaultable yet.
 Raising `TORCHINFERNO_OPENAI_TP_ONLINE_TOTAL_ROWS_BUDGET` to `160` improved the
