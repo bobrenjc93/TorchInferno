@@ -10236,17 +10236,23 @@ def _prepare_tensor_parallel_nccl_runtime_env(config: OpenAIServerConfig) -> Non
             flush=True,
         )
     # The implicit torchrun path is single-node. Avoid slow cloud OFI plugin
-    # startup there while preserving explicit rendezvous and NCCL_NET settings.
+    # startup there while preserving explicit rendezvous and NCCL settings.
     if (
         env_flag("TORCHINFERNO_OPENAI_TP_NCCL_SOCKET_DEFAULT", True)
         and "TORCHINFERNO_TORCHRUN_RDZV_ENDPOINT" not in os.environ
-        and "NCCL_NET" not in os.environ
     ):
-        os.environ["NCCL_NET"] = "Socket"
-        print(
-            "TorchInferno OpenAI server set NCCL_NET=Socket for standalone tensor-parallel startup",
-            flush=True,
-        )
+        if "NCCL_NET" not in os.environ:
+            os.environ["NCCL_NET"] = "Socket"
+            print(
+                "TorchInferno OpenAI server set NCCL_NET=Socket for standalone tensor-parallel startup",
+                flush=True,
+            )
+        if "NCCL_NET_PLUGIN" not in os.environ:
+            os.environ["NCCL_NET_PLUGIN"] = "none"
+            print(
+                "TorchInferno OpenAI server set NCCL_NET_PLUGIN=none for standalone tensor-parallel startup",
+                flush=True,
+            )
 
 
 def _openai_tp_symm_mem_allreduce_enabled() -> bool:
