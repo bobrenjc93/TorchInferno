@@ -225,6 +225,18 @@ batches, `261` prefix-reuse batches) and regressed the row to
 submit+step TP command on the current code also regressed to
 `411.3 / 0.0 / 436.8ms` in `20260625_124132`; keep it opt-in.
 
+After landing the startup/runtime fixes as TorchInferno `de2d6f1`, a same-host
+skip-build provider comparison (`20260625_125255`) confirmed the readiness fix
+inside the normal provider harness: TorchInferno bound `/health` in `125.6s`.
+Runtime gaps remain large. vLLM/SGLang/TorchInferno medians were few_shot
+`211.2 / 222.0 / 233.7ms` E2E, self_consistency
+`275.9 / 414.3 / 506.7ms`, multi_turn `247.3 / 295.5 / 654.5ms`,
+tree_of_thought `99.7 / 171.4 / 400.5ms`, and long_output
+`773.7 / 1050.8 / 1539.6ms`. TorchInferno kept only the few_shot TPOT cell
+(`53.8ms` versus vLLM `59.7ms` and SGLang `82.1ms`), so the next score work
+should target conversation-prefix prefill and long-output row turnaround rather
+than more startup fixes.
+
 The same counters on dense multi_turn (`20260625_101513`) show the opposite:
 submission cadence is not the limiter there. The run landed at
 `437.5 / 65.3 / 510.4ms`, 981/1000 raw correct, with `34` submit batches; `24`
