@@ -8362,7 +8362,7 @@ def test_openai_online_idle_batch_wait_uses_sampled_short_default(monkeypatch) -
         raising=False,
     )
 
-    assert _online_idle_batch_wait_ms(temperature=0.7, max_tokens=256) == 10.0
+    assert _online_idle_batch_wait_ms(temperature=0.7, max_tokens=256) == 20.0
     assert _online_idle_batch_wait_ms(temperature=0.0, max_tokens=256) == 2.0
     assert _online_idle_batch_wait_ms(temperature=0.7, max_tokens=300) == 2.0
 
