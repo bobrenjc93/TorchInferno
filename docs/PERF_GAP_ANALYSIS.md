@@ -386,6 +386,17 @@ score-facing latency to `326.1 / 58.8 / 377.6ms`. Do not promote either knob;
 tree still needs a prefill/session pipeline change rather than another
 collection-wait or tiny-FP8 gate tweak.
 
+Greedy-large refill `16` is rejected for current multi_turn. The env run
+(`TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_REFILL_MIN_READY_REQUESTS=16`,
+`20260625_174457`) moved medians to `436.6 / 67.4 / 507.0ms` versus the paired
+no-env control (`20260625_174845`) at `447.4 / 70.5 / 518.6ms`, both 981/1000
+raw correct, but the profile did not show a real scheduling change: submit
+batches stayed at `34`, runtime steps at `119`, decode batches at `86`, and
+profiled phase was flat (`15.41s` vs `15.40s`). The refill-16 run also worsened
+p99 TPOT (`1308ms` vs `689ms`). Keep the deterministic 401-512 token refill
+floor at `32`; multi_turn still needs fewer or faster prefix/suffix prefill
+waves, not a lower ready-request floor.
+
 Long-output row-budget A/Bs on the same pushed code are not defaultable yet.
 Raising `TORCHINFERNO_OPENAI_TP_ONLINE_TOTAL_ROWS_BUDGET` to `160` improved the
 profiled long-output engine phase (`26.34s -> 25.65s`) and moved the focused row
