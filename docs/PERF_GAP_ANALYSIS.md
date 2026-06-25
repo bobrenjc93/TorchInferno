@@ -339,6 +339,15 @@ TPOT (`27.9ms` vs `25.9ms`) and the queue profile did not show a real engine win
 phase total was flat-to-worse (`30.96s` vs `30.81s`), submit batches increased
 `95 -> 117`, runtime step calls increased `544 -> 611`, and decode/readback
 exposure rose. Keep combined submit+step defaulted only for sampled-short.
+Disabling greedy-short decode-many on current `71b979d` is also rejected
+(`TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_DECODE_MANY=0`,
+`20260625_164757`). The row preserved correctness but landed at
+`374.2 / 28.8 / 1692.2ms`, with `278.5ms` p99 TPOT. Internally it reduced
+step commands (`192 -> 92`) and runtime step calls became one-per-step, but CPU
+token readback exposure rose from the nearby default `7.96s` to `10.93s`, p99
+streaming worsened, and profiled phase total stayed flat (`30.69s`). Keep the
+current decode-many default for this shape; turning it off does not remove the
+long-output decode/readback bottleneck.
 
 Long-output row-budget A/Bs on the same pushed code are not defaultable yet.
 Raising `TORCHINFERNO_OPENAI_TP_ONLINE_TOTAL_ROWS_BUDGET` to `160` improved the
