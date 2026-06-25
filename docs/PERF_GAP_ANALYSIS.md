@@ -561,6 +561,28 @@ about 79k prefill tokens, and 86 decode batches in both runs; the lower gate's
 smaller aggregate batcher wall did not translate to client-observed latency.
 Keep the scoped greedy-large runtime FP8 gate at `min_m=2048`.
 
+## TREE SAMPLED-MEDIUM RUNTIME FP8 PREFILL GATE (2026-06-25)
+
+Tree-of-thought is prefill-heavy enough to benefit from the runtime FP8 prefill
+path, but only in its sampled-medium request bucket. A same-host TP8 A/B on
+current `bf0a31d` with an unrelated GPU0 process present compared explicit
+BF16 (`TORCHINFERNO_OPENAI_TP_ONLINE_FP8_PREFILL=0`) against explicit FP8
+(`TORCHINFERNO_OPENAI_TP_ONLINE_FP8_PREFILL=1`,
+`TORCHINFERNO_OPENAI_TP_ONLINE_FP8_PREFILL_MIN_M=256`), with sampled idle
+collection forced off in both runs. BF16 landed at `349.7 / 51.6 / 388.5ms`,
+`4.0 tok/s`; FP8 landed at `302.8 / 51.5 / 330.7ms`, `4.4 tok/s`, preserving
+benchmark correctness. The no-override implementation run landed at
+`310.2 / 52.3 / 343.1ms`, `4.2 tok/s`.
+
+Promote this as a narrow online policy only for sampled requests with
+`256 < max_tokens <= 300`, using `min_m=256`. Keep sampled-short
+self-consistency/few-shot (`max_tokens<=256`), longer sampled traffic, greedy
+short long_output, and the broad model-level `TORCHINFERNO_FP8_PREFILL` path out
+of the default. The noisy validation regressed tree p99 TTFT/E2E, so this is a
+scorecard-median improvement rather than a tail-latency fix; leave the
+sampled-medium idle-arrival collection experiment rejected until there is a
+tail-safe scheduler change.
+
 Full-prompt mixed-prefix reuse is still rejected for multi_turn on current
 `a9666ff`. Enabling pinned full-prompt stores for 512-token sessions with
 non-common-prefix graph prefill and mixed-prefix batching avoided the old CUDA

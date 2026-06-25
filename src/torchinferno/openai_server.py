@@ -422,7 +422,11 @@ def _online_fp8_prefill_enabled(*, temperature: float, max_tokens: int) -> bool:
         # The model-level flag is an explicit broad override; do not layer an
         # online auto policy on top of it.
         return False
-    if temperature > 0.0 or max_tokens < 1:
+    if max_tokens < 1:
+        return False
+    if _online_sampled_medium_fp8_prefill_enabled(temperature=temperature, max_tokens=max_tokens):
+        return True
+    if temperature > 0.0:
         return False
     min_tokens = env_int(
         "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_FP8_PREFILL_MIN_TOKENS",
@@ -437,9 +441,33 @@ def _online_fp8_prefill_enabled(*, temperature: float, max_tokens: int) -> bool:
     return min_tokens < max_tokens <= max_tokens_limit
 
 
+def _online_sampled_medium_fp8_prefill_enabled(*, temperature: float, max_tokens: int) -> bool:
+    if temperature <= 0.0 or max_tokens < 1:
+        return False
+    min_tokens = env_int(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_FP8_PREFILL_MIN_TOKENS",
+        256,
+        minimum=1,
+    )
+    max_tokens_limit = env_int(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_FP8_PREFILL_MAX_TOKENS",
+        300,
+        minimum=min_tokens,
+    )
+    return min_tokens < max_tokens <= max_tokens_limit
+
+
 def _online_fp8_prefill_min_m(*, temperature: float, max_tokens: int) -> int:
-    del temperature, max_tokens
-    return env_int("TORCHINFERNO_OPENAI_TP_ONLINE_FP8_PREFILL_MIN_M", 2048, minimum=1)
+    global_env = "TORCHINFERNO_OPENAI_TP_ONLINE_FP8_PREFILL_MIN_M"
+    if global_env in os.environ:
+        return env_int(global_env, 2048, minimum=1)
+    if _online_sampled_medium_fp8_prefill_enabled(temperature=temperature, max_tokens=max_tokens):
+        return env_int(
+            "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_FP8_PREFILL_MIN_M",
+            256,
+            minimum=1,
+        )
+    return 2048
 
 
 def _set_tensor_parallel_runtime_fp8_prefill(model: object, *, enabled: bool, min_m: int) -> None:

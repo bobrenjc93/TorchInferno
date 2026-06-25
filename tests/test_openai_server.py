@@ -1341,7 +1341,22 @@ def test_tensor_parallel_worker_loop_receives_online_tensor_commands(monkeypatch
     runtime = instances[0]
     assert runtime.started == 16
     assert runtime.steps == 3
-    assert runtime.init_args[2:] == ("paged", 2, 0.25, 4, 2, 8, True, True, False, None, 128, True)
+    assert runtime.init_args[2:] == (
+        "paged",
+        2,
+        0.25,
+        4,
+        2,
+        8,
+        True,
+        True,
+        False,
+        None,
+        128,
+        False,
+        False,
+        True,
+    )
     assert [(request.request_id, request.prompt, request.max_new_tokens) for request in runtime.submitted] == [
         ("10", (1, 2), 5),
         ("11", (3,), 6),
@@ -8154,22 +8169,39 @@ def test_online_step_sync_enabled_defaults_on(monkeypatch) -> None:
     assert not _online_step_sync_enabled()
 
 
-def test_online_fp8_prefill_defaults_to_greedy_large_only(monkeypatch) -> None:
+def test_online_fp8_prefill_defaults_to_greedy_large_and_sampled_medium(monkeypatch) -> None:
     monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_FP8_PREFILL", raising=False)
     monkeypatch.delenv("TORCHINFERNO_FP8_PREFILL", raising=False)
     monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_FP8_PREFILL_MIN_TOKENS", raising=False)
     monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_FP8_PREFILL_MAX_TOKENS", raising=False)
     monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_FP8_PREFILL_MIN_M", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_FP8_PREFILL_MIN_TOKENS", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_FP8_PREFILL_MAX_TOKENS", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_FP8_PREFILL_MIN_M", raising=False)
 
     assert not _online_fp8_prefill_enabled(temperature=0.7, max_tokens=512)
+    assert not _online_fp8_prefill_enabled(temperature=0.7, max_tokens=256)
+    assert _online_fp8_prefill_enabled(temperature=0.7, max_tokens=257)
+    assert _online_fp8_prefill_enabled(temperature=0.7, max_tokens=300)
+    assert not _online_fp8_prefill_enabled(temperature=0.7, max_tokens=301)
     assert not _online_fp8_prefill_enabled(temperature=0.0, max_tokens=400)
     assert _online_fp8_prefill_enabled(temperature=0.0, max_tokens=401)
     assert _online_fp8_prefill_enabled(temperature=0.0, max_tokens=512)
     assert not _online_fp8_prefill_enabled(temperature=0.0, max_tokens=513)
     assert _online_fp8_prefill_min_m(temperature=0.0, max_tokens=512) == 2048
+    assert _online_fp8_prefill_min_m(temperature=0.7, max_tokens=300) == 256
+
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_FP8_PREFILL_MAX_TOKENS", "320")
+    assert _online_fp8_prefill_enabled(temperature=0.7, max_tokens=320)
+    assert not _online_fp8_prefill_enabled(temperature=0.7, max_tokens=321)
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_FP8_PREFILL_MIN_M", "384")
+    assert _online_fp8_prefill_min_m(temperature=0.7, max_tokens=300) == 384
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_FP8_PREFILL_MAX_TOKENS", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_FP8_PREFILL_MIN_M", raising=False)
 
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_FP8_PREFILL", "0")
     assert not _online_fp8_prefill_enabled(temperature=0.0, max_tokens=512)
+    assert not _online_fp8_prefill_enabled(temperature=0.7, max_tokens=300)
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_FP8_PREFILL", "1")
     assert _online_fp8_prefill_enabled(temperature=0.7, max_tokens=128)
     monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_FP8_PREFILL", raising=False)
@@ -8180,6 +8212,7 @@ def test_online_fp8_prefill_defaults_to_greedy_large_only(monkeypatch) -> None:
 
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_FP8_PREFILL_MIN_M", "4096")
     assert _online_fp8_prefill_min_m(temperature=0.0, max_tokens=512) == 4096
+    assert _online_fp8_prefill_min_m(temperature=0.7, max_tokens=300) == 4096
 
 
 def test_set_tensor_parallel_runtime_fp8_prefill_updates_layers() -> None:
