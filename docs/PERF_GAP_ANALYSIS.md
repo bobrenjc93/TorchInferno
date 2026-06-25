@@ -310,6 +310,13 @@ versus vLLM `71.9ms`. Overall wins were vLLM `22`, TorchInferno `2`, and SGLang
 so runtime symm is only a partial decode fix; the next real lever remains
 prefill scheduling plus token readback/pipelining.
 
+Rechecking long_output with the new deterministic runtime-symm scope and
+`TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_GEN_DECODE_QUANTUM=8`
+(`20260625_155605`) is rejected. It reduced readback exposure to `5.37s` and
+median TPOT to `26.3ms`, but decode GPU time rose to `16.31s`, total profiled
+phase rose to `30.88s`, and score-facing TTFT/E2E regressed to
+`418.9 / 1686.1ms`. Keep the default greedy-short decode quantum at `4`.
+
 Long-output row-budget A/Bs on the same pushed code are not defaultable yet.
 Raising `TORCHINFERNO_OPENAI_TP_ONLINE_TOTAL_ROWS_BUDGET` to `160` improved the
 profiled long-output engine phase (`26.34s -> 25.65s`) and moved the focused row
