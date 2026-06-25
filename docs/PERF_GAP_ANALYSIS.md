@@ -349,6 +349,20 @@ streaming worsened, and profiled phase total stayed flat (`30.69s`). Keep the
 current decode-many default for this shape; turning it off does not remove the
 long-output decode/readback bottleneck.
 
+Lowering the greedy-short refill floor from `16` to `12` is accepted on current
+`ee29a4f`. The env-backed run (`20260625_170033`) landed at
+`321.6 / 28.1 / 1421.1ms`, `27.4 tok/s`, 1000/1000 correct, versus the paired
+no-env control (`20260625_170458`) at `366.8 / 28.0 / 1565.7ms`,
+`24.1 tok/s`, also 1000/1000 correct. The profile supports the median move:
+prefill wall dropped `12.54s -> 11.20s`, decode GPU exposure
+`14.66s -> 14.19s`, token readback `8.20s -> 7.48s`, and runtime step calls
+`602 -> 500`; total profiled phase was only modestly better
+(`30.97s -> 30.63s`) and p99 TPOT worsened (`225.8ms -> 273.8ms`), so keep the
+change narrowly scoped to deterministic `max_tokens<=128` traffic. The patched
+no-env default reproduced the setting (`admit_min_ready_requests=12`) and landed
+at `285.5 / 28.2 / 1389.3ms`, `26.7 tok/s`, with a lower profiled phase
+(`29.89s`) and 1000/1000 correctness.
+
 Long-output row-budget A/Bs on the same pushed code are not defaultable yet.
 Raising `TORCHINFERNO_OPENAI_TP_ONLINE_TOTAL_ROWS_BUDGET` to `160` improved the
 profiled long-output engine phase (`26.34s -> 25.65s`) and moved the focused row

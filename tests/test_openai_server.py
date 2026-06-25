@@ -8211,8 +8211,8 @@ def test_openai_refill_min_ready_requests_defaults_for_short_greedy_caps(monkeyp
     monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_REFILL_MAX_TOKENS", raising=False)
     monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_REFILL_MIN_READY_REQUESTS", raising=False)
 
-    assert _online_refill_min_ready_requests(temperature=0.0, max_tokens=45) == 16
-    assert _online_refill_min_ready_requests(temperature=0.0, max_tokens=128) == 16
+    assert _online_refill_min_ready_requests(temperature=0.0, max_tokens=45) == 12
+    assert _online_refill_min_ready_requests(temperature=0.0, max_tokens=128) == 12
     assert _online_refill_min_ready_requests(temperature=0.0, max_tokens=256) == 8
     assert _online_refill_min_ready_requests(temperature=0.0, max_tokens=300) == 8
     assert _online_refill_min_ready_requests(temperature=0.0, max_tokens=301) == 32
@@ -12625,7 +12625,7 @@ def test_openai_tensor_parallel_online_batcher_records_profile_snapshots(
     assert records[2]["initial_wait_ms"] == 0.0
     assert records[2]["idle_batch_wait_ms"] == 0.0
     assert records[2]["collect_idle_arrivals"] is False
-    assert records[2]["admit_min_ready_requests"] == 16
+    assert records[2]["admit_min_ready_requests"] == 12
     assert records[2]["admit_per_step_cap"] == 64
     assert records[2]["prefill_token_budget"] == 0
     assert records[2]["enable_ragged_decode"] is True

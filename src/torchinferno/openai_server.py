@@ -162,11 +162,11 @@ def _online_refill_min_ready_requests(*, temperature: float, max_tokens: int) ->
         minimum=1,
     ):
         # Long-output-style short greedy streams are suffix-prefill fragmented
-        # after the small first client wave. A 16-request refill floor reduces
-        # graph-hit suffix waves without changing the 256-token few-shot path.
+        # after the small first client wave. A 12-request refill floor reduces
+        # queue-facing turnaround without changing the 256-token few-shot path.
         default_min_ready = env_int(
             "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_REFILL_MIN_READY_REQUESTS",
-            16,
+            12,
             minimum=1,
         )
     if max_tokens > env_int(
