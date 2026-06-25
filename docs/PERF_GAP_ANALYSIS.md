@@ -237,6 +237,26 @@ tree_of_thought `99.7 / 171.4 / 400.5ms`, and long_output
 should target conversation-prefix prefill and long-output row turnaround rather
 than more startup fixes.
 
+Long-output row-budget A/Bs on the same pushed code are not defaultable yet.
+Raising `TORCHINFERNO_OPENAI_TP_ONLINE_TOTAL_ROWS_BUDGET` to `160` improved the
+profiled long-output engine phase (`26.34s -> 25.65s`) and moved the focused row
+to `382.9 / 27.3 / 1537.4ms`, but TPOT worsened and E2E was flat. A larger
+`192`-row budget reproduced a better long-output median both with profiling
+(`352.7 / 27.0 / 1441.6ms`, `20260625_131454`) and without profiling
+(`351.0 / 27.8 / 1403.2ms`, `20260625_132047`) versus the paired no-env control
+(`378.0 / 26.8 / 1445.9ms`, `20260625_132431`). The global knob also changes
+sampled-short cache shape: self_consistency improved median TTFT but left E2E
+flat and worsened p99 (`303.7 / 0.0 / 444.1ms`, p99 `1587.9/1639.5ms`, versus
+the no-env control `416.5 / 0.0 / 443.9ms`, p99 `1304.6/1360.0ms`). A scoped
+code patch was rejected too. Keeping a warmed 192-row persistent cache gave a
+strong focused long row (`336.5 / 26.8 / 1361.6ms`) but regressed the full-suite
+shape, especially few_shot and multi_turn (`200.1 / 52.5 / 242.9ms` and
+`644.6 / 68.6 / 691.9ms` in `20260625_134508`). Warming only the old 144-row
+cache while allocating the larger greedy-short cache at runtime caused a
+long-output TTFT tail blow-up (`691.3ms` median, `32.5s` p99). The viable path
+is a real dual-cache or shape-specific warmup design; do not promote a flat
+larger row budget.
+
 The same counters on dense multi_turn (`20260625_101513`) show the opposite:
 submission cadence is not the limiter there. The run landed at
 `437.5 / 65.3 / 510.4ms`, 981/1000 raw correct, with `34` submit batches; `24`
