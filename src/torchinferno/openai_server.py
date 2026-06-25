@@ -414,8 +414,18 @@ def _online_step_sync_enabled() -> bool:
     return env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_STEP_SYNC", True)
 
 
-def _online_submit_step_command_enabled() -> bool:
-    return env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_SUBMIT_STEP_COMMAND", False)
+def _online_submit_step_command_enabled(*, temperature: float, max_tokens: int) -> bool:
+    global_env = "TORCHINFERNO_OPENAI_TP_ONLINE_SUBMIT_STEP_COMMAND"
+    if global_env in os.environ:
+        return env_flag(global_env, False)
+    if temperature <= 0.0 or max_tokens < 1:
+        return False
+    sampled_short_max_tokens = env_int(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_SHORT_SUBMIT_STEP_MAX_TOKENS",
+        256,
+        minimum=1,
+    )
+    return max_tokens <= sampled_short_max_tokens
 
 
 def _startup_graph_warmup_enabled() -> bool:
@@ -3979,7 +3989,11 @@ class OpenAICompletionEngine:
                     had_work_before_drain = runtime_engine.has_online_work()
                     steps_after_submit = (
                         decode_quantum
-                        if had_work_before_drain and _online_submit_step_command_enabled()
+                        if had_work_before_drain
+                        and _online_submit_step_command_enabled(
+                            temperature=first.temperature,
+                            max_tokens=run_max_tokens,
+                        )
                         else 0
                     )
                     ready_count = drain_ready(step, steps_after_submit=steps_after_submit)

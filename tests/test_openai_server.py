@@ -112,6 +112,7 @@ from torchinferno.openai_server import (
     _online_session_max_tokens,
     _online_session_prompt_headroom_tokens,
     _online_step_sync_enabled,
+    _online_submit_step_command_enabled,
     _openai_cuda_graph_enabled_for_model,
     _openai_decode_graph_enabled,
     _openai_ragged_decode_graph_enabled,
@@ -8266,6 +8267,28 @@ def test_openai_online_generated_prefix_cache_preserves_runtime_env_overrides(mo
     monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_GENERATED_PREFIX_CACHE", raising=False)
     monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_ADAPTIVE_GENERATED_PREFIX_CACHE", "1")
     assert _online_generated_prefix_cache_enabled(temperature=0.7, max_tokens=256) is None
+
+
+def test_openai_online_submit_step_defaults_to_sampled_short(monkeypatch) -> None:
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_SUBMIT_STEP_COMMAND", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_SHORT_SUBMIT_STEP_MAX_TOKENS", raising=False)
+
+    assert _online_submit_step_command_enabled(temperature=0.7, max_tokens=256) is True
+    assert _online_submit_step_command_enabled(temperature=0.7, max_tokens=257) is False
+    assert _online_submit_step_command_enabled(temperature=0.0, max_tokens=256) is False
+    assert _online_submit_step_command_enabled(temperature=0.7, max_tokens=0) is False
+
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_SHORT_SUBMIT_STEP_MAX_TOKENS", "128")
+    assert _online_submit_step_command_enabled(temperature=0.7, max_tokens=128) is True
+    assert _online_submit_step_command_enabled(temperature=0.7, max_tokens=129) is False
+
+
+def test_openai_online_submit_step_respects_env_override(monkeypatch) -> None:
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_SUBMIT_STEP_COMMAND", "0")
+    assert _online_submit_step_command_enabled(temperature=0.7, max_tokens=256) is False
+
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_SUBMIT_STEP_COMMAND", "1")
+    assert _online_submit_step_command_enabled(temperature=0.0, max_tokens=512) is True
 
 
 def test_online_step_sync_enabled_defaults_on(monkeypatch) -> None:

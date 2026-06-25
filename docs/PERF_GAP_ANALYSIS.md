@@ -217,13 +217,23 @@ the final full run landed slower than the focused `20260625_110829` row but
 kept the same one-prefill/one-decode generated-prefix shape and 1000/1000
 correctness.
 
-Two current self_consistency queueing A/Bs are rejected. Forcing
+Two current self_consistency queueing A/Bs were checked. Forcing
 `TORCHINFERNO_CONTINUOUS_ADMIT_MIN_READY_REQUESTS=16` did not consolidate the
 runtime reuse waves; it increased submit/reuse fragmentation (`297` submit
 batches, `261` prefix-reuse batches) and regressed the row to
-`400.0 / 0.0 / 461.8ms` in `20260625_123743`. Retesting the combined
-submit+step TP command on the current code also regressed to
-`411.3 / 0.0 / 436.8ms` in `20260625_124132`; keep it opt-in.
+`400.0 / 0.0 / 461.8ms` in `20260625_123743`. The older unscoped combined
+submit+step TP command retest also regressed to `411.3 / 0.0 / 436.8ms` in
+`20260625_124132`, but a matched sampled-short recheck on current `418f9da`
+showed the useful scope. Enabling
+`TORCHINFERNO_OPENAI_TP_ONLINE_SUBMIT_STEP_COMMAND=1` for self_consistency
+(`20260625_143349`) landed at `241.9 / 0.0 / 385.4ms`, 1000/1000 correct,
+versus the paired no-env control (`20260625_143735`) at
+`390.6 / 0.0 / 418.0ms`, also 1000/1000 correct. The profile moved submit
+batches `248 -> 212`, runtime step calls `220 -> 201`, phase total
+`3772ms -> 3591ms`, submit-sync `683ms -> 599ms`, and idle wait/drain
+`264ms -> 127ms`. Promote combined submit+step only for sampled-short online
+sessions (`temperature > 0`, `max_tokens <= 256`) and leave the env override for
+broader experiments.
 
 After landing the startup/runtime fixes as TorchInferno `de2d6f1`, a same-host
 skip-build provider comparison (`20260625_125255`) confirmed the readiness fix
