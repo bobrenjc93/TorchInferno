@@ -587,12 +587,9 @@ def _online_idle_batch_wait_ms(*, temperature: float, max_tokens: int) -> float:
         # Self-consistency-style sampled bursts arrive from a 128-worker client
         # pool in waves. A short idle drain window batches those follow-on
         # requests instead of running dozens of tiny exact-prefix/decode waves.
-        # Local TP8 70B standalone A/B on 2026-06-24: 20ms cut median
-        # self_consistency TTFT/E2E from 246.2/381.5ms to 204.7/314.5ms with
-        # correctness unchanged.
         default_wait_ms = env_float(
             "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_SHORT_IDLE_BATCH_WAIT_MS",
-            20.0,
+            10.0,
             minimum=0.0,
         )
     return default_wait_ms
