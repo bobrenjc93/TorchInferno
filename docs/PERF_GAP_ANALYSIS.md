@@ -49,6 +49,16 @@ still reaching readiness in `120-126s`, well below the public timeout.
 Public run `20260625_110248` repeated the same failure on TorchInferno
 `c7ff2ca`; it does not include these local startup changes.
 
+Public run `20260625_150258` failed before benchmark rows on stale
+TorchInferno `754cc36`. It reached distributed startup with
+`rank0_broadcast=0` and `rank0_shard_scatter=1`, but the log was dominated by
+inherited `NCCL_DEBUG=INFO` output for most of the readiness window and never
+showed a `loaded 10/80 layers` progress line before SIGTERM at 1800s. The
+inference-bench TorchInferno provider now forces `NCCL_DEBUG=WARN` by default
+and drops the deprecated `NCCL_ASYNC_ERROR_HANDLING` env, while preserving an
+explicit `INFERENCE_BENCH_TORCHINFERNO_NCCL_DEBUG=INFO` escape hatch for
+transport debugging. This is harness hardening, not a runtime latency fix.
+
 Public run `20260624_185427` supersedes the later-sorting stale
 `20260624_183253` failure. It used TorchInferno `76107de`, vLLM `1cd3e0e`,
 and SGLang `4a4f063`; all providers completed all five benchmarks. Scorecard
