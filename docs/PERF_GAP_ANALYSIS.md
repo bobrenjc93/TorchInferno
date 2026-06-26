@@ -87,6 +87,20 @@ under queue profiling and regressed the unprofiled score to
 mid-length sessions; the existing sampled-short opt-in/default remains the
 only promoted submit+step path.
 
+A current self_consistency profile on pushed TorchInferno `1810bb5` separated
+server work from benchmark-client admission. With the old inference-bench
+OpenAI client defaults, the row was `333.3 / 0.0 / 393.4ms`, but TorchInferno's
+fast HTTP profile showed server-side first content at only `18.5ms` p50. The
+missing time was before the request handler profile started, consistent with
+HTTPX connection-pool contention under the benchmark's `128` worker threads.
+Raising the inference-bench client pool to `512` connections for every provider
+cut TorchInferno's focused self row to `230.4 / 0.0 / 379.0ms` without changing
+correctness, and a fair three-provider self-only check landed at
+vLLM/SGLang/TorchInferno `210.7 / 222.7 / 244.1ms` TTFT and
+`386.0 / 402.1 / 357.4ms` E2E. Inference-bench `60edbfa6` carries that fair
+client-pool default; the remaining self gap is provider/server scheduling, not
+the old client pool ceiling.
+
 A focused multi_turn profile on the same stack reproduced the public gap at
 `437.1 / 72.2 / 512.3ms`, with HTTP first-content p50 `351.3ms` and runtime
 prefill wall `10.64s` versus decode GPU event time `3.33s`. The online engine
