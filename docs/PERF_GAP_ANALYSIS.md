@@ -76,6 +76,17 @@ kept as host-path cleanup, but it is not a score-facing lever; the remaining
 gaps still sit in runtime prefill/session scheduling, sampled arrival
 fragmentation, and long-output decode/readback.
 
+A focused few_shot reprofile on current `4c58b4d` kept the public shape at
+`165.8 / 53.9 / 210.1ms`, with `36` submit batches, `4.70s` prefill wall, and
+`75` decode batches for only `1.6k` decode tokens. A deterministic-mid
+submit+step A/B initially looked promising (`159.6 / 54.4 / 203.2ms`) and cut
+batcher phase time from `11.18s` to `8.40s`, but it was not robust. The same
+scoped policy in a no-env patched run returned to `165.3 / 56.6 / 211.1ms`
+under queue profiling and regressed the unprofiled score to
+`172.3 / 57.9 / 224.9ms`. Keep submit+step default-off for deterministic
+mid-length sessions; the existing sampled-short opt-in/default remains the
+only promoted submit+step path.
+
 A focused multi_turn profile on the same stack reproduced the public gap at
 `437.1 / 72.2 / 512.3ms`, with HTTP first-content p50 `351.3ms` and runtime
 prefill wall `10.64s` versus decode GPU event time `3.33s`. The online engine
