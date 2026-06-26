@@ -2,9 +2,9 @@
 
 ## Latest public refresh and greedy-mid idle retention (2026-06-26)
 
-Public run `20260626_181444` is the current fair same-host comparison after the
-TorchInferno startup fixes. All providers completed. Scorecard wins were vLLM
-`20`, TorchInferno `4`, and SGLang `1`. TorchInferno rows were few_shot
+Public run `20260626_181444` was the fair same-host comparison before the
+greedy-mid idle-retention patch. All providers completed. Console metric wins
+were vLLM `20`, TorchInferno `4`, and SGLang `1`. TorchInferno rows were few_shot
 `171.8 / 54.2 / 220.6ms`, self_consistency `155.5 / 0.0 / 334.5ms`,
 multi_turn `484.7 / 68.5 / 541.5ms`, tree_of_thought
 `309.3 / 57.0 / 342.8ms`, and long_output `296.5 / 28.1 / 1466.5ms`
@@ -39,6 +39,18 @@ deterministic mid-length online sessions (`128 < max_tokens <= 300`). This does
 not change initial collection, active rows, refill floor, or decode quantum, and
 avoids reopening the rejected global initial-wait and greedy-large persistent-idle
 experiments.
+
+The full provider recheck on pushed TorchInferno `876c18c` is public as
+inference-bench run `20260626_185834` (`63043e6b`). It confirmed the scoped
+few_shot movement inside the normal full-suite sequence: TorchInferno few_shot
+improved to `167.3 / 55.2 / 214.8ms` from the prior public
+`171.8 / 54.2 / 220.6ms`, preserving the TPOT win. vLLM also moved faster in the
+same run (`152.3 / 57.0 / 199.6ms`), so this did not add a scorecard cell.
+Summary scorecard wins were vLLM `16/20`, TorchInferno `2/20`, and SGLang
+`1/20`; TorchInferno's wins were few_shot TPOT and self_consistency TTFT.
+Multi_turn TPOT moved back to vLLM in this run (`60.2ms` vs TorchInferno
+`67.1ms`), matching the known TPOT variance band rather than a code-path change
+from the few_shot-scoped idle policy.
 
 ## PUBLIC STARTUP REGRESSION: CHECKPOINT LOAD/BROADCAST VARIABILITY (2026-06-24)
 
