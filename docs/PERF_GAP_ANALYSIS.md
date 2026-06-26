@@ -464,6 +464,19 @@ tail, and a 160-row scoped variant (`20260625_161848`) was not cleaner at
 budget or the tested cache split; the viable path needs a more fundamental
 shape-specific scheduler/warmup change.
 
+Current `8e55b6e` long-output profiling keeps the same decode/readback shape.
+The focused default (`20260626_155550`) landed at
+`313.8 / 27.0 / 1488.3ms`, 1000/1000 correct, with `48` prefill graph batches,
+`11.90s` prefill wall, `724` decode batches, `13.66s` ragged-decode GPU event
+time, and `6.74s` CPU token wait. Raising
+`TORCHINFERNO_CUDAGRAPH_DECODE_STEP_MAX_BATCH`,
+`TORCHINFERNO_DECODE_LINEAR_MM_MAX_BATCH`, and ragged decode buckets to include
+`128` is rejected (`20260626_160131`): score-facing latency regressed to
+`318.6 / 28.3 / 1573.2ms`, throughput fell to `25.5 tok/s`, and the profile
+still capped max model batch at `64` with `724` decode batches. The current long
+gap is not a missing 128-row ragged graph; it remains a decode/readback pipeline
+issue.
+
 Current `def840e` follow-up probes reject three narrower queue/cache knobs.
 For multi_turn, enabling pinned full-prompt stores for greedy-large requests
 with non-common mixed-prefix grouping and graph capture-on-miss disabled
