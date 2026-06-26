@@ -80,7 +80,13 @@ load stall. Same-host inference-bench validation with this default
 (`20260626_154324`, `self_consistency` only) showed the intended startup shape:
 initial embedding/norm/head tensors loaded in `3.8s`, all `80/80` layers loaded
 in `52.0s`, `/health` was ready in `150.8s`, and the row completed at
-`240.2 / 0.0 / 379.9ms` with 1000/1000 correctness.
+`240.2 / 0.0 / 379.9ms` with 1000/1000 correctness. A follow-up full
+TorchInferno-only pass on pushed `c230138` (`20260626_154946`) reproduced the
+startup path more quickly (`80/80` layers in `28.9s`, `/health` in `130.6s`)
+and completed all rows in the expected runtime band: few_shot
+`166.4 / 53.3 / 219.0ms`, self_consistency `198.1 / 0.0 / 283.6ms`,
+multi_turn `467.4 / 72.5 / 548.3ms`, tree_of_thought
+`287.1 / 55.9 / 336.1ms`, and long_output `326.9 / 27.4 / 1361.2ms`.
 
 Public run `20260624_185427` supersedes the later-sorting stale
 `20260624_183253` failure. It used TorchInferno `76107de`, vLLM `1cd3e0e`,
