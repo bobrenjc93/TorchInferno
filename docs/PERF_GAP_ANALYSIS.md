@@ -52,6 +52,17 @@ Multi_turn TPOT moved back to vLLM in this run (`60.2ms` vs TorchInferno
 `67.1ms`), matching the known TPOT variance band rather than a code-path change
 from the few_shot-scoped idle policy.
 
+Two follow-up self_consistency profiles on pushed `d1f213e` kept the known
+arrival-fragmentation shape. A clean rerun landed at `267.3 / 0.0 / 395.4ms`,
+with `228` submit batches, `204` exact-prefix reuse waves, `1.74s` prefill
+wall, and `1000/1000` correctness. An opt-in device-logits experiment that
+cached reusable prefix logits on GPU regressed to `461.4 / 0.0 / 489.3ms`:
+the run fragmented further (`303` submit batches, `261` exact-prefix waves,
+`1.99s` prefill wall) while preserving correctness. Do not promote a
+device-resident logits cache as the self_consistency lever; the row is still
+dominated by client arrival batching and repeated exact-prefix scheduling, not
+CPU-to-GPU logits copies.
+
 ## PUBLIC STARTUP REGRESSION: CHECKPOINT LOAD/BROADCAST VARIABILITY (2026-06-24)
 
 Update `2026-06-25`: public run `20260624_230255` showed the opposite failure
