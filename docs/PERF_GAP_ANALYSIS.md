@@ -141,6 +141,21 @@ by deferring opposite-temperature requests. It fired (`39` incompatible skips)
 but regressed the tree row to `358.3 / 59.9 / 419.4ms`, so do not promote queue
 scanning across incompatible sampling classes.
 
+A refreshed tree_of_thought profile on current `46be80d` landed at
+`242.9 / 61.2 / 291.8ms`, with the same dominant split: sampled
+`temperature=0.7`, `max_tokens=300` traffic spent `8.88s` in prefill wall and
+`2.59s` in decode-active time, while the greedy eval side spent `1.74s` in
+prefill wall and `2.72s` in decode-active time. Expanding the runtime
+symmetric-memory allreduce scope to sampled traffic
+(`TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE=runtime`,
+`..._MAX_TEMPERATURE=0.7`) is rejected. It improved the smaller greedy eval
+HTTP p50 (`428.4 / 502.6ms` first-content/E2E to `383.9 / 423.2ms`) and cut
+greedy prefill wall to `1.25s`, but it regressed the sampled p50
+(`210.8 / 260.3ms` to `234.8 / 297.4ms`) and raised sampled prefill wall to
+`9.34s`. The full row moved backward to `271.9 / 60.5 / 347.8ms`. Keep runtime
+symmetric-memory allreduce scoped to deterministic/greedy traffic; it is not a
+general sampled tree lever.
+
 A current long_output profile on `738bef5` landed at
 `290.9 / 28.0 / 1435.2ms`, with `11.95s` prefill wall, `15.37s` decode GPU
 event time, and `7.03s` CPU token readback across `763` decode batches. Raising
