@@ -1898,10 +1898,12 @@ def test_continuous_batch_engine_finished_prefix_cache_reuses_kv_without_logits(
         ("turn-1", 19, True)
     ]
 
-    finished_prefix = (*prompt, 18, 19)
+    unsafe_finished_tokens = (*prompt, 18, 19)
+    finished_prefix = (*prompt, 18)
     continued_prompt = (*finished_prefix, 99)
     assert model.static_token_graph_calls == 1
     assert engine.stats.generated_prefix_store_requests == 1
+    assert engine._reusable_prefix_hit_tokens(unsafe_finished_tokens) == len(finished_prefix)
     assert engine._reusable_prefix_hit_tokens(continued_prompt) == len(finished_prefix)
     reusable = engine.reusable_prefixes[
         engine._finished_prefix_route_id(finished_prefix)
@@ -1947,7 +1949,7 @@ def test_continuous_batch_engine_finished_prefix_skips_non_common_graph_by_defau
         ("turn-1", 19, True)
     ]
 
-    finished_prefix = (*prompt, 18, 19)
+    finished_prefix = (*prompt, 18)
     continued_prompt = (*finished_prefix, 99)
     assert engine._reusable_prefix_hit_tokens(continued_prompt) == len(finished_prefix)
 

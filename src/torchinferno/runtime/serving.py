@@ -3347,7 +3347,11 @@ class ContinuousBatchEngine:
             return False
         if state.generated <= 0 or not self._state_has_full_prompt_kv(state):
             return False
-        tokens = tuple(state.tokens)
+        kv_token_count = min(
+            self._cache_row_seq_len(state.row, state.seq_len),
+            len(state.tokens),
+        )
+        tokens = tuple(state.tokens[:kv_token_count])
         if len(tokens) <= len(state.request.prompt):
             return False
         max_tokens = env_int("TORCHINFERNO_CONTINUOUS_FINISHED_PREFIX_CACHE_MAX_TOKENS", 1024, minimum=1)

@@ -76,6 +76,21 @@ kept as host-path cleanup, but it is not a score-facing lever; the remaining
 gaps still sit in runtime prefill/session scheduling, sampled arrival
 fragmentation, and long-output decode/readback.
 
+A focused multi_turn profile on the same stack reproduced the public gap at
+`437.1 / 72.2 / 512.3ms`, with HTTP first-content p50 `351.3ms` and runtime
+prefill wall `10.64s` versus decode GPU event time `3.33s`. The online engine
+reused only the 45-token system/common prefix across the 1000 turns. Enabling
+the opt-in finished-prefix cache exposed an unsafe row-adoption bug: finished
+states advertised the whole emitted token list even though the newest sampled
+token is not KV-backed until a later decode consumes it. The cache now stores
+only `state.tokens[:state.seq_len]` for finished prefixes, which fixed the
+device-assert crash under the flag, but the safe version is still a hard
+performance rejection. It raised prefix reuse to about `99k` tokens, but
+fragmented suffix prefill into `470` batches with `450` graph misses and pushed
+HTTP first-content p50 to `6485ms`. Keep finished-prefix caching disabled by
+default until non-common finished-prefix suffix prefill can use a graph-safe
+batched path.
+
 ## PUBLIC STARTUP REGRESSION: CHECKPOINT LOAD/BROADCAST VARIABILITY (2026-06-24)
 
 Update `2026-06-25`: public run `20260624_230255` showed the opposite failure
