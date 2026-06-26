@@ -975,7 +975,13 @@ greedy-short policy to `max_tokens=256` is a hard rejection
 (`TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_GEN_MAX_TOKENS=256`,
 `20260626_161211`): the row regressed to `323.1 / 238.0 / 559.0ms`, while
 decode-many overcomputed to `481` decode batches and `15.0K` decode tokens for
-only `2454` emitted events. Keep few_shot out of greedy-short decode-many.
+only `2454` emitted events. Keep few_shot out of greedy-short decode-many. A
+same-host provider comparison (`20260626_161634`) shows few_shot median is not
+the current local priority: vLLM/SGLang/TorchInferno landed at
+`160.9 / 61.1 / 214.3ms`, `144.2 / 75.1 / 218.3ms`, and
+`156.5 / 50.5 / 198.8ms`. TorchInferno still has a bad p99 tail, but it wins
+the local median TPOT/E2E cells; do not trade that away for public-run median
+noise without a tail-safe graph/pipeline change.
 
 ## MULTI-TURN RUNTIME FP8 PREFILL GATE (2026-06-23)
 
