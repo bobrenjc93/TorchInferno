@@ -112,7 +112,9 @@ A current long_output profile on `738bef5` landed at
 event time, and `7.03s` CPU token readback across `763` decode batches. Raising
 the short-greedy refill floor from `12` to `24` cut prefill batches (`57 -> 33`)
 and improved TPOT (`28.0 -> 24.9ms`), but it delayed admission enough to regress
-TTFT/E2E to `539.9 / 1782.6ms` and increased CPU token wait to `9.04s`. Keep the
+TTFT/E2E to `539.9 / 1782.6ms` and increased CPU token wait to `9.04s`. A
+smaller `16` floor had the same tradeoff in milder form (`382.6 / 26.7 /
+1515.4ms`) while raising decode token work to `45.6k` bucketed tokens. Keep the
 default refill floor; it is the better latency/throughput tradeoff for the
 scorecard.
 
