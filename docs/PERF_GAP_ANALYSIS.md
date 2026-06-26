@@ -99,7 +99,11 @@ correctness, and a fair three-provider self-only check landed at
 vLLM/SGLang/TorchInferno `210.7 / 222.7 / 244.1ms` TTFT and
 `386.0 / 402.1 / 357.4ms` E2E. Inference-bench `60edbfa6` carries that fair
 client-pool default; the remaining self gap is provider/server scheduling, not
-the old client pool ceiling.
+the old client pool ceiling. A follow-up no-keepalive A/B
+(`INFERENCE_BENCH_HTTP_MAX_KEEPALIVE_CONNECTIONS=0`) is rejected: a fair
+self-only run shifted the row to vLLM/SGLang/TorchInferno
+`421.0 / 212.9 / 254.1ms` TTFT and `461.3 / 381.2 / 390.9ms` E2E, so keep the
+`512/512` connection/keepalive default.
 
 A focused multi_turn profile on the same stack reproduced the public gap at
 `437.1 / 72.2 / 512.3ms`, with HTTP first-content p50 `351.3ms` and runtime
