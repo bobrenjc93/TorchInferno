@@ -1,5 +1,45 @@
 # TorchInferno vs vLLM/sglang — Performance Gap Analysis (Llama-3.1-70B, 8xH100)
 
+## Latest public refresh and greedy-mid idle retention (2026-06-26)
+
+Public run `20260626_181444` is the current fair same-host comparison after the
+TorchInferno startup fixes. All providers completed. Scorecard wins were vLLM
+`20`, TorchInferno `4`, and SGLang `1`. TorchInferno rows were few_shot
+`171.8 / 54.2 / 220.6ms`, self_consistency `155.5 / 0.0 / 334.5ms`,
+multi_turn `484.7 / 68.5 / 541.5ms`, tree_of_thought
+`309.3 / 57.0 / 342.8ms`, and long_output `296.5 / 28.1 / 1466.5ms`
+(TTFT/TPOT/E2E). TorchInferno wins few_shot TPOT, self_consistency TTFT,
+multi_turn TPOT, and multi_turn correctness, but still trails vLLM on most
+queue-facing latency and throughput cells.
+
+Current long_output profiling on `b068e8b` keeps the known split: `12.37s`
+prefill wall, `18.18s` ragged decode GPU event time, and `7.78s` CPU token
+wait across `780` decode batches. The run used `max_active=123` and
+`prefix_rows=21`, but the first client wave only admitted `8` requests and the
+provider submitted `1000` requests across `109` batches. This does not reopen
+the already rejected long-output knobs: 20ms greedy-short initial wait, larger
+row budgets, 128 decode graphs, non-power-of-two decode buckets, submit+step
+commands, and synchronous decode-runner/readback shims all failed to produce a
+clean default.
+
+The narrower few_shot gap exposed a useful untried scheduler shape. Default
+queue profiling on current `b068e8b` split few_shot into two online sessions
+(`344` then `656` requests) because the gap between client waves exceeded the
+10ms post-drain idle timeout. That forced the second wave to rebuild the online
+session and common-prefix cache, landing at `176.2 / 55.3 / 228.9ms` with
+`6.42s` combined prefill wall across the two sessions. Raising only
+`TORCHINFERNO_OPENAI_TP_ONLINE_PERSISTENT_IDLE_MS=100` kept all `1000` requests
+in one session, reduced profiled phase time from roughly `12.2s` to `10.6s`,
+and cut prefill wall to `4.93s`. The profiled score row improved modestly to
+`170.0 / 55.6 / 222.2ms`; the no-profile confirmation landed at
+`165.6 / 54.7 / 210.1ms`, 975/1000 raw correct. The patched no-env default
+reproduced the setting at `163.7 / 55.9 / 208.6ms`, 976/1000 raw correct, with
+normal `115.6s` readiness. Promote the 100ms idle-retention window only for
+deterministic mid-length online sessions (`128 < max_tokens <= 300`). This does
+not change initial collection, active rows, refill floor, or decode quantum, and
+avoids reopening the rejected global initial-wait and greedy-large persistent-idle
+experiments.
+
 ## PUBLIC STARTUP REGRESSION: CHECKPOINT LOAD/BROADCAST VARIABILITY (2026-06-24)
 
 Update `2026-06-25`: public run `20260624_230255` showed the opposite failure

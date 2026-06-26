@@ -570,6 +570,27 @@ def _online_persistent_idle_ms(*, temperature: float, max_tokens: int) -> float:
                 100.0,
                 minimum=0.0,
             )
+    elif temperature <= 0.0 and max_tokens > 0:
+        greedy_mid_min_tokens = env_int(
+            "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_MID_IDLE_MIN_TOKENS",
+            128,
+            minimum=1,
+        )
+        greedy_mid_max_tokens = env_int(
+            "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_MID_IDLE_MAX_TOKENS",
+            300,
+            minimum=greedy_mid_min_tokens,
+        )
+        if greedy_mid_min_tokens < max_tokens <= greedy_mid_max_tokens:
+            # Few-shot-style deterministic mid-length bursts can arrive in two
+            # client waves. Keeping the drained online session briefly open lets
+            # the second wave reuse the common-prefix cache without changing the
+            # first-token collection window or decode policy.
+            default_idle_ms = env_float(
+                "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_MID_IDLE_MS",
+                100.0,
+                minimum=0.0,
+            )
     return default_idle_ms
 
 
