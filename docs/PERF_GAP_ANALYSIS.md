@@ -477,6 +477,17 @@ still capped max model batch at `64` with `724` decode batches. The current long
 gap is not a missing 128-row ragged graph; it remains a decode/readback pipeline
 issue.
 
+A follow-up local exploratory patch made continuous-serving ragged decode use
+configured non-power-of-two buckets (`32,40,48,56,64`) instead of the default
+power-of-two padding. This did exercise the intended shapes
+(`b33-40/40`, `b41-48/48`, `b49-56/56`), reducing padded decode tokens
+(`44.7K -> 40.9K`), but it regressed the focused long row to
+`335.8 / 27.0 / 1514.7ms` (`20260626_165151`). Decode batches rose
+`724 -> 779`, ragged GPU time rose `13.66s -> 15.33s`, and CPU token wait rose
+`6.74s -> 7.43s`. Do not promote configurable continuous decode buckets from
+this result; the power-of-two graph replay shape is faster despite extra padded
+rows.
+
 Current `def840e` follow-up probes reject three narrower queue/cache knobs.
 For multi_turn, enabling pinned full-prompt stores for greedy-large requests
 with non-common mixed-prefix grouping and graph capture-on-miss disabled
