@@ -59,6 +59,29 @@ and drops the deprecated `NCCL_ASYNC_ERROR_HANDLING` env, while preserving an
 explicit `INFERENCE_BENCH_TORCHINFERNO_NCCL_DEBUG=INFO` escape hatch for
 transport debugging. This is harness hardening, not a runtime latency fix.
 
+Public runs after that harness change (`20260625_190425` through latest
+`20260626_130303`) still failed TorchInferno readiness on current `ca2ea3d`
+before any benchmark rows, while vLLM and SGLang completed. The latest log is
+now quiet enough to isolate the next stall: after symmetric-memory allreduce
+probing it prints `rank0_broadcast=0` and `rank0_shard_scatter=1`, then no
+`loaded 10/80 layers` progress line before SIGTERM. That leaves the initial
+replicated tensors or first sharded scatter as the likely startup bottleneck.
+Current startup now defaults replicated checkpoint tensors to rank-0 chunked
+broadcast via `TORCHINFERNO_TP_RANK0_REPLICATED_CHECKPOINT_BROADCAST=1`,
+independent of the broader full-checkpoint broadcast knob. Chunks default to
+`TORCHINFERNO_TP_RANK0_CHECKPOINT_BROADCAST_CHUNK_BYTES=268435456`, so the
+giant embedding/norm tensors avoid eight-rank shared-storage reads without
+restoring the old single full-tensor NCCL broadcast. Explicit
+`TORCHINFERNO_TP_RANK0_REPLICATED_CHECKPOINT_BROADCAST=0` or
+`TORCHINFERNO_TP_RANK0_CHECKPOINT_BROADCAST=0` keeps the old all-rank-read
+path. The server also prints an initial embedding/norm/head progress line so
+the next public failure can distinguish an initial-tensor stall from a layer
+load stall. Same-host inference-bench validation with this default
+(`20260626_154324`, `self_consistency` only) showed the intended startup shape:
+initial embedding/norm/head tensors loaded in `3.8s`, all `80/80` layers loaded
+in `52.0s`, `/health` was ready in `150.8s`, and the row completed at
+`240.2 / 0.0 / 379.9ms` with 1000/1000 correctness.
+
 Public run `20260624_185427` supersedes the later-sorting stale
 `20260624_183253` failure. It used TorchInferno `76107de`, vLLM `1cd3e0e`,
 and SGLang `4a4f063`; all providers completed all five benchmarks. Scorecard
@@ -396,6 +419,18 @@ profiled phase was flat (`15.41s` vs `15.40s`). The refill-16 run also worsened
 p99 TPOT (`1308ms` vs `689ms`). Keep the deterministic 401-512 token refill
 floor at `32`; multi_turn still needs fewer or faster prefix/suffix prefill
 waves, not a lower ready-request floor.
+
+Greedy-large active-row increases are also rejected for current multi_turn.
+Raising `TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_MAX_ACTIVE` to `48`
+(`20260625_180435`) regressed hard to `887.3 / 77.6 / 956.9ms`, `1.35 tok/s`,
+with p99 E2E `5821ms`. The profile showed why: `max_active=48` increased
+prefill wall to `16.75s`, prefill forward to `16.15s`, and decode GPU exposure
+to `4.70s`, while prefix reuse stayed limited to the shared 45-token system
+prefix. The intermediate `40`-row probe (`20260625_180843`) reproduced the same
+failure family at `846.7 / 72.8 / 896.1ms`, `1.31 tok/s`, with `15.83s`
+prefill wall and `4.69s` decode GPU. Keep the default `32` active rows for this
+512-token greedy path; larger decode waves add KV/decode cost and make the
+suffix-prefill queue worse without creating useful conversation-prefix reuse.
 
 Long-output row-budget A/Bs on the same pushed code are not defaultable yet.
 Raising `TORCHINFERNO_OPENAI_TP_ONLINE_TOTAL_ROWS_BUDGET` to `160` improved the

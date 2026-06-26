@@ -2679,6 +2679,11 @@ class Llama3TensorParallelForCausalLM:
             world_size=world_size,
             dtype=torch_dtype,
         )
+        checkpoint_replicated_broadcast = _rank0_replicated_checkpoint_broadcast_enabled(
+            device=device,
+            world_size=world_size,
+            dtype=torch_dtype,
+        )
         checkpoint_shard_scatter = _rank0_checkpoint_shard_scatter_enabled(
             device=device,
             world_size=world_size,
@@ -2689,9 +2694,11 @@ class Llama3TensorParallelForCausalLM:
                 "[Llama3TP] loading checkpoint tensors "
                 f"world_size={world_size} dtype={str(torch_dtype).replace('torch.', '')} "
                 f"rank0_broadcast={int(checkpoint_broadcast)} "
+                f"rank0_replicated_broadcast={int(checkpoint_replicated_broadcast)} "
                 f"rank0_shard_scatter={int(checkpoint_shard_scatter)}",
                 flush=True,
             )
+            print("[Llama3TP] loading initial embedding/norm/head tensors", flush=True)
         embed_tokens_weight = _load_checkpoint_tensor(
             loader,
             "model.embed_tokens.weight",
@@ -2717,6 +2724,12 @@ class Llama3TensorParallelForCausalLM:
             device=device,
             dtype=torch_dtype,
         )
+        if rank == 0:
+            print(
+                f"[Llama3TP] loaded initial embedding/norm/head tensors "
+                f"in {time.perf_counter() - load_start:.1f}s",
+                flush=True,
+            )
 
         layers: list[_Llama3TensorParallelLayer] = []
         for layer_id in range(config.num_hidden_layers):
@@ -5527,6 +5540,33 @@ def _rank0_checkpoint_broadcast_enabled(
     return _tp_flag("TORCHINFERNO_TP_RANK0_CHECKPOINT_BROADCAST", False)
 
 
+def _rank0_replicated_checkpoint_broadcast_enabled(
+    *,
+    device: torch.device,
+    world_size: int,
+    dtype: torch.dtype | None,
+) -> bool:
+    if world_size <= 1 or dtype is None:
+        return False
+    if device.type != "cuda":
+        return False
+    if not dist.is_available() or not dist.is_initialized():
+        return False
+    if "TORCHINFERNO_TP_RANK0_CHECKPOINT_BROADCAST" in os.environ:
+        checkpoint_broadcast = _rank0_checkpoint_broadcast_enabled(
+            device=device,
+            world_size=world_size,
+            dtype=dtype,
+        )
+        if not checkpoint_broadcast:
+            return False
+        if "TORCHINFERNO_TP_RANK0_REPLICATED_CHECKPOINT_BROADCAST" not in os.environ:
+            return True
+    if "TORCHINFERNO_TP_RANK0_REPLICATED_CHECKPOINT_BROADCAST" in os.environ:
+        return _tp_flag("TORCHINFERNO_TP_RANK0_REPLICATED_CHECKPOINT_BROADCAST", True)
+    return True
+
+
 def _rank0_checkpoint_shard_scatter_enabled(
     *,
     device: torch.device,
@@ -5552,6 +5592,31 @@ def _rank0_checkpoint_scatter_enabled() -> bool:
     return _tp_flag("TORCHINFERNO_TP_RANK0_CHECKPOINT_SCATTER", True)
 
 
+def _checkpoint_broadcast_chunk_bytes() -> int:
+    return _tp_int(
+        "TORCHINFERNO_TP_RANK0_CHECKPOINT_BROADCAST_CHUNK_BYTES",
+        256 * 1024 * 1024,
+        minimum=1,
+    )
+
+
+def _broadcast_tensor_in_chunks(tensor: Tensor, *, src: int) -> Tensor:
+    if not tensor.is_contiguous():
+        tensor = tensor.contiguous()
+    flat = tensor.view(-1)
+    if flat.numel() == 0:
+        return tensor
+    max_chunk_bytes = _checkpoint_broadcast_chunk_bytes()
+    elems_per_chunk = max(1, max_chunk_bytes // tensor.element_size())
+    if flat.numel() <= elems_per_chunk:
+        dist.broadcast(flat, src=src)
+        return tensor
+    for start in range(0, flat.numel(), elems_per_chunk):
+        length = min(elems_per_chunk, flat.numel() - start)
+        dist.broadcast(flat.narrow(0, start, length), src=src)
+    return tensor
+
+
 def _load_checkpoint_tensor(
     loader: _CheckpointTensorLoader,
     name: str,
@@ -5561,15 +5626,18 @@ def _load_checkpoint_tensor(
     rank: int,
     world_size: int,
 ) -> Tensor:
-    if not _rank0_checkpoint_broadcast_enabled(device=device, world_size=world_size, dtype=dtype):
+    if not _rank0_replicated_checkpoint_broadcast_enabled(
+        device=device,
+        world_size=world_size,
+        dtype=dtype,
+    ):
         return loader.get_tensor(name, device=device, dtype=dtype)
     shape = loader.get_tensor_shape(name)
     if rank == 0:
         tensor = loader.get_tensor(name, device=device, dtype=dtype)
     else:
         tensor = torch.empty(shape, device=device, dtype=dtype)
-    dist.broadcast(tensor, src=0)
-    return tensor
+    return _broadcast_tensor_in_chunks(tensor, src=0)
 
 
 def _load_checkpoint_tensor_shard(
