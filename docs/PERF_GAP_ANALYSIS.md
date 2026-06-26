@@ -488,6 +488,15 @@ power-of-two padding. This did exercise the intended shapes
 this result; the power-of-two graph replay shape is faster despite extra padded
 rows.
 
+A same-host long-output provider refresh on current TorchInferno `4fb4065`
+(`20260626_170958`, isolation monitor disabled because an unrelated small GPU
+process tripped the guard in the first attempt) confirms the local gap:
+vLLM/SGLang/TorchInferno landed at `80.2 / 19.2 / 853.3ms`,
+`82.0 / 28.4 / 1077.5ms`, and `291.0 / 27.8 / 1460.7ms`. TorchInferno preserves
+correctness and is near SGLang TPOT, but vLLM still wins every score-facing
+long-output latency/throughput metric locally. Treat the remaining long row as
+a true decode/streaming pipeline gap, not public-run noise.
+
 Current `def840e` follow-up probes reject three narrower queue/cache knobs.
 For multi_turn, enabling pinned full-prompt stores for greedy-large requests
 with non-common mixed-prefix grouping and graph capture-on-miss disabled
