@@ -107,6 +107,15 @@ by deferring opposite-temperature requests. It fired (`39` incompatible skips)
 but regressed the tree row to `358.3 / 59.9 / 419.4ms`, so do not promote queue
 scanning across incompatible sampling classes.
 
+A current long_output profile on `738bef5` landed at
+`290.9 / 28.0 / 1435.2ms`, with `11.95s` prefill wall, `15.37s` decode GPU
+event time, and `7.03s` CPU token readback across `763` decode batches. Raising
+the short-greedy refill floor from `12` to `24` cut prefill batches (`57 -> 33`)
+and improved TPOT (`28.0 -> 24.9ms`), but it delayed admission enough to regress
+TTFT/E2E to `539.9 / 1782.6ms` and increased CPU token wait to `9.04s`. Keep the
+default refill floor; it is the better latency/throughput tradeoff for the
+scorecard.
+
 ## PUBLIC STARTUP REGRESSION: CHECKPOINT LOAD/BROADCAST VARIABILITY (2026-06-24)
 
 Update `2026-06-25`: public run `20260624_230255` showed the opposite failure
