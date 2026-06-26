@@ -967,6 +967,16 @@ startup, regressed p99 TTFT/E2E to `2186.0 / 2242.1ms`, and did not remove
 runtime prefill graph misses in the queue profile. Keep suffix-prefill warmup
 opt-in only; the few_shot gap is not a startup graph-capture issue.
 
+Current `1c78b71` few_shot profiling keeps the same greedy-mid shape. The
+focused default (`20260626_160731`) landed at `169.6 / 52.9 / 218.6ms`,
+976/1000 raw correct, with `39` prefill batches, `78` decode batches,
+`5.48s` prefill wall, and `3.09s` ragged-decode GPU time. Extending the
+greedy-short policy to `max_tokens=256` is a hard rejection
+(`TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_GEN_MAX_TOKENS=256`,
+`20260626_161211`): the row regressed to `323.1 / 238.0 / 559.0ms`, while
+decode-many overcomputed to `481` decode batches and `15.0K` decode tokens for
+only `2454` emitted events. Keep few_shot out of greedy-short decode-many.
+
 ## MULTI-TURN RUNTIME FP8 PREFILL GATE (2026-06-23)
 
 Global `TORCHINFERNO_FP8_PREFILL=1` remains rejected because it previously
