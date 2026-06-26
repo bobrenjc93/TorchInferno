@@ -946,6 +946,18 @@ enabling the threshold at 400 was worse: the no-profile tree row landed at
 `832.0 / 573.3 / 1405.5ms`, so generated-prefix collection must stay out of
 sampled-medium tree traffic.
 
+Current `6e73a7d` self-consistency profiling keeps that diagnosis. The focused
+row (`20260626_165921`) landed at `195.8 / 0.0 / 328.8ms`, 1000/1000 correct.
+The last complete progress snapshot shows the generated-prefix path is healthy:
+one common-prefix prefill (`common_prefix:b1:t55`), one decode model call, one
+generated-prefix store, `984` generated-prefix reuses, and `109224`
+prefix-reuse tokens. The remaining server-side phase was `2.97s`, dominated by
+`1.57s` prefix-reuse/prefill wall, `517ms` submit-sync, and `143ms` step-sync
+across `171` submit batches and `160` runtime steps. This is still
+arrival-fragmentation and TP command overhead after reuse is working; do not
+reopen the rejected sampled-short initial-wait, idle-wait, min-ready, or
+decode-quantum knobs without a different batching mechanism.
+
 Self-consistency sampled post-arrival collection should stay default-on for now.
 An apples-to-apples current `1b60135` recheck with
 `TORCHINFERNO_OPENAI_TP_ONLINE_COLLECT_IDLE_ARRIVALS=0` landed at
