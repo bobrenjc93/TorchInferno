@@ -511,6 +511,21 @@ decode GPU time rose (`15.25s -> 15.89s`), CPU token wait rose
 traffic; long-output still needs lower decode/readback cost rather than fewer
 control-plane commands.
 
+Finished-prefix reuse through the non-common graph prefill path remains unsafe
+on current `7e67e71`. Enabling
+`TORCHINFERNO_CONTINUOUS_FINISHED_PREFIX_CACHE=1` plus
+`TORCHINFERNO_CONTINUOUS_NON_COMMON_PREFIX_GRAPH_PREFILL=1` reached readiness
+for `multi_turn`, then failed the benchmark with an incomplete streamed body
+and a CUDA `vectorized_gather_kernel index out of bounds` device assert before
+writing a queue profile. Disabling active-row adoption with
+`TORCHINFERNO_CONTINUOUS_FINISHED_PREFIX_CACHE_ADOPT_ROWS=0` changed the failure
+mode but not the conclusion: it admitted only `136` requests, emitted `294`
+events, wrote one profile snapshot (`15.5s` phase total, `10.3s` prefill wall,
+`20` prefill graph hits, `19` prefix-reuse graph batches), then failed with an
+HTTP 500 after a CUDA device-side assert surfaced during decode token readback.
+Keep the non-common finished-prefix graph path out of default multi-turn; the
+row-lifetime variant is not the only issue.
+
 Current `def840e` follow-up probes reject three narrower queue/cache knobs.
 For multi_turn, enabling pinned full-prompt stores for greedy-large requests
 with non-common mixed-prefix grouping and graph capture-on-miss disabled
