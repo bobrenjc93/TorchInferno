@@ -156,6 +156,19 @@ greedy prefill wall to `1.25s`, but it regressed the sampled p50
 symmetric-memory allreduce scoped to deterministic/greedy traffic; it is not a
 general sampled tree lever.
 
+The weak full-suite tree row was partly a harness sequencing artifact after
+the larger client-pool change. Reproducing only `multi_turn -> tree_of_thought`
+on TorchInferno `656a4d9` gave tree `344.2 / 57.8 / 385.0ms`, matching the
+public full-suite row and much slower than focused tree. Closing each
+benchmark's OpenAI/httpx client before the next benchmark (`inference-bench`
+`f9fda409`) improved the same sequence to `304.8 / 58.2 / 357.5ms`; sampled
+tree HTTP p50 moved from `283.6 / 330.3ms` first-content/E2E to
+`263.2 / 324.8ms`, and greedy eval moved from `465.4 / 490.9ms` to
+`358.9 / 375.8ms`. This is provider-neutral cleanup for stale keepalive pools,
+not a TorchInferno runtime win. Focused tree still remains faster
+(`242.9 / 61.2 / 291.8ms`), so the remaining full-suite tree gap is still in
+request-wave timing and runtime prefill/session scheduling.
+
 A current long_output profile on `738bef5` landed at
 `290.9 / 28.0 / 1435.2ms`, with `11.95s` prefill wall, `15.37s` decode GPU
 event time, and `7.03s` CPU token readback across `763` decode batches. Raising
