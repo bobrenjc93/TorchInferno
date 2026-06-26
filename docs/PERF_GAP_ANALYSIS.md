@@ -175,12 +175,13 @@ scorecard is vLLM `16/20`, TorchInferno `3/20`, and SGLang `0/20`.
 TorchInferno's wins are few_shot TPOT (`53.1ms`), self_consistency TTFT
 (`150.8ms`), and multi_turn TPOT (`66.1ms`). The tree sequence cleanup carried
 into the full run: TorchInferno tree moved from the previous public
-`342.5 / 55.7 / 371.6ms` to `296.7 / 55.4 / 332.1ms`. The same run exposed
-a new full-suite ordering problem for multi_turn: focused/paired sequence runs
-stay in the `438-447ms` TTFT band, but the five-benchmark public sequence
-landed at `593.2 / 66.1 / 647.3ms`. The next multi_turn work should isolate the
-few_shot/self_consistency -> multi_turn transition before changing runtime
-policy.
+`342.5 / 55.7 / 371.6ms` to `296.7 / 55.4 / 332.1ms`. The same run showed a
+weak multi_turn row (`593.2 / 66.1 / 647.3ms`), but targeted follow-ups did not
+reproduce it. `few_shot -> self_consistency -> multi_turn` with queue profiling
+kept multi_turn at `443.2 / 67.5 / 516.7ms`, and the same first-three sequence
+without profiling landed at `438.1 / 68.5 / 512.2ms`. Do not tune runtime policy
+against the single public multi_turn spike until a repeat full all-provider run
+or a provider-cleanup artifact makes it reproducible.
 
 A current long_output profile on `738bef5` landed at
 `290.9 / 28.0 / 1435.2ms`, with `11.95s` prefill wall, `15.37s` decode GPU
