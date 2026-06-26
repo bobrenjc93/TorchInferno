@@ -12,7 +12,7 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import Mapping
+from collections.abc import Hashable, Mapping
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from functools import lru_cache
@@ -2258,7 +2258,7 @@ class OpenAICompletionEngine:
         self._prefix_cache_entry: TensorPrefixCacheEntry | None = None
         self._prefix_cache_entries: dict[tuple[int, ...], TensorPrefixCacheEntry] = {}
         self._prompt_logits_cache: dict[tuple[int, ...], Tensor] = {}
-        self._prompt_token_cache: dict[str, list[int]] = {}
+        self._prompt_token_cache: dict[tuple[tuple[str, Hashable], ...], list[int]] = {}
         self._prompt_token_cache_lock = threading.Lock()
         self._phase_timing_enabled = env_flag("TORCHINFERNO_OPENAI_PHASE_TIMINGS")
         self._phase_records: list[dict[str, float]] = []
@@ -2365,7 +2365,7 @@ class OpenAICompletionEngine:
                 cache.pop(next(iter(cache)))
         return prompt
 
-    def _prompt_token_cache_map(self) -> dict[str, list[int]]:
+    def _prompt_token_cache_map(self) -> dict[tuple[tuple[str, Hashable], ...], list[int]]:
         cache = getattr(self, "_prompt_token_cache", None)
         if not isinstance(cache, dict):
             cache = {}
@@ -14862,8 +14862,24 @@ def _format_messages(messages: list[dict[str, object]]) -> str:
     return "\n".join(parts)
 
 
-def _chat_prompt_cache_key(messages: list[dict[str, object]]) -> str:
-    return json.dumps(messages, sort_keys=True, separators=(",", ":"), default=str)
+def _chat_prompt_cache_key(messages: list[dict[str, object]]) -> tuple[tuple[str, Hashable], ...]:
+    return tuple(
+        (
+            str(message.get("role", "user")),
+            _chat_message_content_cache_key(message.get("content", "")),
+        )
+        for message in messages
+    )
+
+
+def _chat_message_content_cache_key(content: object) -> Hashable:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, (int, float, bool, type(None))):
+        return content
+    if isinstance(content, Hashable):
+        return content
+    return json.dumps(content, sort_keys=True, separators=(",", ":"), default=str)
 
 
 def build_parser() -> argparse.ArgumentParser:
