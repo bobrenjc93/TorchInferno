@@ -63,6 +63,19 @@ device-resident logits cache as the self_consistency lever; the row is still
 dominated by client arrival batching and repeated exact-prefix scheduling, not
 CPU-to-GPU logits copies.
 
+The full same-host provider refresh on TorchInferno `36eae02` is public as
+inference-bench run `20260626_195035` (`45d890b3`). It updated the branch after
+the small tuple-key prompt-cache cleanup, but the scorecard stayed runtime
+dominated: vLLM won `20` metric cells, SGLang `4`, and TorchInferno `1`.
+TorchInferno's only cell win was few_shot TPOT (`54.3ms` vs vLLM `59.2ms`).
+TorchInferno medians were few_shot `167.5 / 54.3 / 217.7ms`,
+self_consistency `328.4 / 0.0 / 354.8ms`, multi_turn
+`432.3 / 69.9 / 504.6ms`, tree_of_thought `352.6 / 56.1 / 408.2ms`, and
+long_output `350.1 / 27.3 / 1418.1ms` (TTFT/TPOT/E2E). The tuple cache key is
+kept as host-path cleanup, but it is not a score-facing lever; the remaining
+gaps still sit in runtime prefill/session scheduling, sampled arrival
+fragmentation, and long-output decode/readback.
+
 ## PUBLIC STARTUP REGRESSION: CHECKPOINT LOAD/BROADCAST VARIABILITY (2026-06-24)
 
 Update `2026-06-25`: public run `20260624_230255` showed the opposite failure
