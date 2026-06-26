@@ -983,6 +983,34 @@ the current local priority: vLLM/SGLang/TorchInferno landed at
 the local median TPOT/E2E cells; do not trade that away for public-run median
 noise without a tail-safe graph/pipeline change.
 
+Current `016ea32` tree profiling keeps the sampled-medium diagnosis. The
+focused default (`20260626_162641`) landed at `320.1 / 57.9 / 370.6ms`,
+964/992 raw correct, with a p99 E2E tail of `3015.5ms`. The sampled branch
+submitted `896` requests across six sampled sessions and spent `10.76s` in
+profiled phase time, including `7.81s` prefill wall, `6.06s` prefill forward,
+`43` prefill graph-hit batches, and only `1.87s` ragged-decode GPU time. The
+greedy eval branch was much smaller at `96` requests, `4.46s` phase time,
+`1.56s` prefill wall, and `2.03s` ragged-decode GPU time. The worst sampled
+session was the first 256-request wave at `4.09s` phase and `3.31s` prefill
+wall despite graph hits, while a later 256-request wave was lower at `2.83s`
+phase and `1.88s` prefill wall. That points to sampled-medium prefill/session
+pipeline overhead and cold lower-level FP8 work, not a missing prefill graph or
+a decode row bucket. Keep the rejected sampled-medium wait, idle collection,
+larger active-row, and lower-FP8-gate knobs rejected until a mechanism can
+reduce the first-wave prefill cost without worsening the tail.
+
+Narrow common-prefix suffix warmups are also rejected on the same tree profile
+shape. Warming only row `53`, prefix `45`, suffix `16`, and batches
+`4,16,32` reached readiness in `125.6s` and cut aggregate sampled prefill wall
+from `7.81s` to `6.17s`, but the row regressed to
+`355.3 / 58.6 / 388.6ms` with six suffix-graph misses. Adding `b1` still missed
+one suffix graph per sampled session and regressed further to
+`382.8 / 58.2 / 427.7ms`; warming every power-of-two batch through `32` reached
+readiness in `120.6s` but was worse again at `405.7 / 59.4 / 452.4ms`.
+Startup suffix warmup can move internal counters, but it does not improve the
+client-observed tree median or correctness band. Keep
+`TORCHINFERNO_OPENAI_WARMUP_ONLINE_COMMON_PREFIX_SUFFIX_PREFILL` opt-in.
+
 ## MULTI-TURN RUNTIME FP8 PREFILL GATE (2026-06-23)
 
 Global `TORCHINFERNO_FP8_PREFILL=1` remains rejected because it previously
