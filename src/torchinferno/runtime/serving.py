@@ -1609,10 +1609,16 @@ class ContinuousBatchEngine:
         suffix_lengths = [len(suffix) for suffix in suffixes]
         if not suffix_lengths or min(suffix_lengths) <= 0:
             return None
-        if not env_flag("TORCHINFERNO_CONTINUOUS_NON_COMMON_PREFIX_GRAPH_PREFILL", False):
+        non_common_graph_prefill = env_flag("TORCHINFERNO_CONTINUOUS_NON_COMMON_PREFIX_GRAPH_PREFILL", False)
+        if not non_common_graph_prefill:
             for _index, _request, _prefix_hit_tokens, reusable in group:
                 route_id = reusable.route_id
                 if not (isinstance(route_id, tuple) and route_id[:1] == ("common_prefix",)):
+                    return None
+        elif not env_flag("TORCHINFERNO_CONTINUOUS_FINISHED_PREFIX_GRAPH_PREFILL", False):
+            for _index, _request, _prefix_hit_tokens, reusable in group:
+                route_id = reusable.route_id
+                if isinstance(route_id, tuple) and route_id[:1] == ("finished_prefix",):
                     return None
         cache_max_seq = self._cache_max_seq_len()
         suffix_bucket = self._suffix_bucket(max(suffix_lengths))

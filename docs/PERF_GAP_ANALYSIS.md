@@ -524,7 +524,9 @@ events, wrote one profile snapshot (`15.5s` phase total, `10.3s` prefill wall,
 `20` prefill graph hits, `19` prefix-reuse graph batches), then failed with an
 HTTP 500 after a CUDA device-side assert surfaced during decode token readback.
 Keep the non-common finished-prefix graph path out of default multi-turn; the
-row-lifetime variant is not the only issue.
+row-lifetime variant is not the only issue. The graph route is now additionally
+guarded behind `TORCHINFERNO_CONTINUOUS_FINISHED_PREFIX_GRAPH_PREFILL=1` so the
+broad non-common graph env cannot select it accidentally.
 
 Current `def840e` follow-up probes reject three narrower queue/cache knobs.
 For multi_turn, enabling pinned full-prompt stores for greedy-large requests

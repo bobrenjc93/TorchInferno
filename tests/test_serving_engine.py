@@ -1922,6 +1922,44 @@ def test_continuous_batch_engine_finished_prefix_cache_reuses_kv_without_logits(
     assert engine.stats.prefix_reuse_tokens >= reuse_tokens + len(finished_prefix)
 
 
+def test_continuous_batch_engine_finished_prefix_skips_non_common_graph_by_default(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_FINISHED_PREFIX_CACHE", "1")
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_NON_COMMON_PREFIX_GRAPH_PREFILL", "1")
+    prompt = tuple(range(1, 18))
+    model = _SelectedLogitsToyModel(vocab_size=256)
+    engine = ContinuousBatchEngine(
+        model,
+        device=torch.device("cpu"),
+        max_active_requests=2,
+        prefix_cache_capacity=4,
+        pin_shared_prefix=True,
+        graph_prefill=True,
+    )
+    engine.start_online(max_seq_len=64)
+    engine.submit_online(ServingRequest("turn-1", prompt, 2, arrival_step=0))
+
+    assert [(event.request_id, event.token, event.finished) for event in engine.step_online()] == [
+        ("turn-1", 18, False)
+    ]
+    assert [(event.request_id, event.token, event.finished) for event in engine.step_online()] == [
+        ("turn-1", 19, True)
+    ]
+
+    finished_prefix = (*prompt, 18, 19)
+    continued_prompt = (*finished_prefix, 99)
+    assert engine._reusable_prefix_hit_tokens(continued_prompt) == len(finished_prefix)
+
+    prefill_src_rows = len(model.prefill_src_prefix_rows)
+    engine.submit_online(ServingRequest("turn-2", continued_prompt, 1, arrival_step=0))
+
+    assert [(event.request_id, event.token, event.finished) for event in engine.step_online()] == [
+        ("turn-2", 100, True)
+    ]
+    assert model.prefill_src_prefix_rows[prefill_src_rows:] == []
+
+
 def test_continuous_batch_engine_unified_online_continues_exact_prompt_on_second_token(
     monkeypatch,
 ) -> None:
