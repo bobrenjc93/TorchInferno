@@ -104,6 +104,11 @@ the old client pool ceiling. A follow-up no-keepalive A/B
 self-only run shifted the row to vLLM/SGLang/TorchInferno
 `421.0 / 212.9 / 254.1ms` TTFT and `461.3 / 381.2 / 390.9ms` E2E, so keep the
 `512/512` connection/keepalive default.
+Raising TorchInferno's fast HTTP worker pool is also rejected for this path.
+`TORCHINFERNO_OPENAI_HTTP_WORKERS=512` improved focused TTFT to `198.1ms` but
+left E2E at `381.2ms`, and `1024` workers regressed to
+`422.7 / 0.0 / 469.9ms`. The remaining self-consistency work is not solved by
+more handler threads.
 
 A focused multi_turn profile on the same stack reproduced the public gap at
 `437.1 / 72.2 / 512.3ms`, with HTTP first-content p50 `351.3ms` and runtime
