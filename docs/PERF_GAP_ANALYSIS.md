@@ -169,6 +169,19 @@ not a TorchInferno runtime win. Focused tree still remains faster
 (`242.9 / 61.2 / 291.8ms`), so the remaining full-suite tree gap is still in
 request-wave timing and runtime prefill/session scheduling.
 
+The full same-host public refresh with that harness fix is inference-bench
+`113e45c1`, run `20260626_225903`, against TorchInferno `b7a4735`. The markdown
+scorecard is vLLM `16/20`, TorchInferno `3/20`, and SGLang `0/20`.
+TorchInferno's wins are few_shot TPOT (`53.1ms`), self_consistency TTFT
+(`150.8ms`), and multi_turn TPOT (`66.1ms`). The tree sequence cleanup carried
+into the full run: TorchInferno tree moved from the previous public
+`342.5 / 55.7 / 371.6ms` to `296.7 / 55.4 / 332.1ms`. The same run exposed
+a new full-suite ordering problem for multi_turn: focused/paired sequence runs
+stay in the `438-447ms` TTFT band, but the five-benchmark public sequence
+landed at `593.2 / 66.1 / 647.3ms`. The next multi_turn work should isolate the
+few_shot/self_consistency -> multi_turn transition before changing runtime
+policy.
+
 A current long_output profile on `738bef5` landed at
 `290.9 / 28.0 / 1435.2ms`, with `11.95s` prefill wall, `15.37s` decode GPU
 event time, and `7.03s` CPU token readback across `763` decode batches. Raising
