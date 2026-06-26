@@ -497,6 +497,20 @@ correctness and is near SGLang TPOT, but vLLM still wins every score-facing
 long-output latency/throughput metric locally. Treat the remaining long row as
 a true decode/streaming pipeline gap, not public-run noise.
 
+A current paired submit+step TP-command recheck on `bf71a37` keeps that policy
+out of deterministic long-output. Forcing
+`TORCHINFERNO_OPENAI_TP_ONLINE_SUBMIT_STEP_COMMAND=1` completed 1000/1000
+correct and improved score-facing medians versus the paired no-env control
+(`283.7 / 27.3 / 1381.3ms` vs `301.8 / 28.1 / 1491.2ms`), but the queue profile
+did not show an engine win. Submit/step command overhead fell
+(`579ms -> 397ms` across submit sync plus step broadcast), while phase total
+worsened (`29.38s -> 30.06s`), decode batches rose (`759 -> 763`), ragged
+decode GPU time rose (`15.25s -> 15.89s`), CPU token wait rose
+(`7.30s -> 7.73s`), and p99 TPOT/E2E regressed (`175.1 / 6365.9ms` to
+`268.5 / 6832.8ms`). Keep combined submit+step scoped to sampled-short
+traffic; long-output still needs lower decode/readback cost rather than fewer
+control-plane commands.
+
 Current `def840e` follow-up probes reject three narrower queue/cache knobs.
 For multi_turn, enabling pinned full-prompt stores for greedy-large requests
 with non-common mixed-prefix grouping and graph capture-on-miss disabled
