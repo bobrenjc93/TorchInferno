@@ -88,8 +88,13 @@ device-assert crash under the flag, but the safe version is still a hard
 performance rejection. It raised prefix reuse to about `99k` tokens, but
 fragmented suffix prefill into `470` batches with `450` graph misses and pushed
 HTTP first-content p50 to `6485ms`. Keep finished-prefix caching disabled by
-default until non-common finished-prefix suffix prefill can use a graph-safe
-batched path.
+default. Re-enabling the guarded non-common finished-prefix graph path after
+the KV-span fix did not recover the idea: an interrupted retry reached only
+`581` submitted requests, had `160` graph-prefill hits and `0` misses, but spent
+`73.2s` in graph prefill forward across `32` distinct prefix/suffix/source-row
+shapes and pushed HTTP first-content p50 to `8234ms`. The missing piece is not
+just graph safety; it needs shape consolidation or a different finished-prefix
+reuse design.
 
 ## PUBLIC STARTUP REGRESSION: CHECKPOINT LOAD/BROADCAST VARIABILITY (2026-06-24)
 
