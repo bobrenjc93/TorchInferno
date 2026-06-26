@@ -96,6 +96,17 @@ shapes and pushed HTTP first-content p50 to `8234ms`. The missing piece is not
 just graph safety; it needs shape consolidation or a different finished-prefix
 reuse design.
 
+A focused tree_of_thought profile on `9376f70` landed at
+`309.1 / 59.0 / 370.0ms`, better than the public row but still TTFT-bound versus
+vLLM. The sampled `temperature=0.7`, `max_tokens=300` traffic accounted for
+`896` requests across six online sessions, spending `8.93s` in prefill wall and
+`1.92s` in decode GPU event time; deterministic eval requests accounted for the
+remaining `96` requests and `4.08s` decode GPU event time. A bounded
+skip-incompatible-idle experiment tried to keep same-temperature sessions open
+by deferring opposite-temperature requests. It fired (`39` incompatible skips)
+but regressed the tree row to `358.3 / 59.9 / 419.4ms`, so do not promote queue
+scanning across incompatible sampling classes.
+
 ## PUBLIC STARTUP REGRESSION: CHECKPOINT LOAD/BROADCAST VARIABILITY (2026-06-24)
 
 Update `2026-06-25`: public run `20260624_230255` showed the opposite failure
