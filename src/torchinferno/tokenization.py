@@ -30,7 +30,16 @@ class TransformersAdapter:
         return list(self.tokenizer.encode(text, add_special_tokens=False))  # type: ignore[attr-defined]
 
     def decode(self, token_ids: list[int]) -> str:
-        return str(self.tokenizer.decode(token_ids, skip_special_tokens=True))  # type: ignore[attr-defined]
+        try:
+            return str(
+                self.tokenizer.decode(  # type: ignore[attr-defined]
+                    token_ids,
+                    skip_special_tokens=True,
+                    clean_up_tokenization_spaces=False,
+                )
+            )
+        except TypeError:
+            return str(self.tokenizer.decode(token_ids, skip_special_tokens=True))  # type: ignore[attr-defined]
 
 
 def load_text_tokenizer(tokenizer_name_or_path: str | Path, *, trust_remote_code: bool = False) -> TextTokenizer:

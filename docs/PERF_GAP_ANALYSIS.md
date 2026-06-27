@@ -3350,6 +3350,32 @@ run with the same env had long_output `238.0ms` / `24.9ms` / `1180.6ms` with
 1000/1000 correctness. Make `3` the greedy-short decode-many default while
 keeping env overrides for score/throughput tradeoffs.
 
+Post-`019ce7b` public run and scheduler A/B refresh (2026-06-27): public
+`20260627_170254` still shows TorchInferno at 1/20 metric wins versus vLLM's
+16/20, with the largest median gaps in tree (`286.1ms` TTFT vs vLLM `60.7ms`),
+long_output (`304.6ms` vs `70.7ms`), and multi_turn (`375.7ms` vs `166.2ms`).
+Local follow-ups on the same checkout rejected these knobs:
+- `TORCHINFERNO_CONTINUOUS_GENERATED_PREFIX_CACHE=1` on multi_turn is
+  catastrophic: `5931.0ms` TTFT / `777.0ms` TPOT / `6558.9ms` E2E. The extra
+  generated-prefix logits/cache work overwhelms any later-turn reuse benefit.
+- Raising multi_turn greedy-large `max_active` to `48` regressed to
+  `887.8ms` TTFT / `79.1ms` TPOT / `975.6ms` E2E. The earlier 32-row default
+  remains the stable point; the 24-row TPOT tradeoff also remains rejected for
+  latency.
+- Lowering multi_turn greedy-large refill min-ready to `1` landed at
+  `382.1ms` TTFT / `59.5ms` TPOT / `453.0ms` E2E, a small TPOT move with worse
+  TTFT/E2E than the current local baseline (`375.4ms` / `62.1ms` / `446.5ms`).
+- Raising self-consistency sampled active rows while preserving prefix rows
+  improved TTFT but broke one-token E2E: 160 rows landed at
+  `219.9ms` TTFT / `329.1ms` E2E, and 144 rows landed at
+  `246.3ms` / `355.6ms`. Keep the 128-row sampled-short KV cap until the HTTP
+  finish path or scheduler event emission is changed.
+
+The public TorchInferno log also emitted 12 Transformers BPE cleanup warnings
+immediately after readiness. Those are not a median-latency lever, but decode
+calls should pass `clean_up_tokenization_spaces=False` so the server does not
+write warning noise on BPE tokenizers.
+
 ## In-flight, validated-locally-but-NOT-benchmarked commits
 
 The inference-bench harness has been frozen on `25260c0` for many hours, so these

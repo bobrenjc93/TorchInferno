@@ -1985,10 +1985,29 @@ class _TransformersChatTokenizer:
 
     @lru_cache(maxsize=8192)
     def decode_token(self, token_id: int) -> str:
-        return str(self.tokenizer.decode([int(token_id)], skip_special_tokens=True))  # type: ignore[attr-defined]
+        try:
+            return str(
+                self.tokenizer.decode(  # type: ignore[attr-defined]
+                    [int(token_id)],
+                    skip_special_tokens=True,
+                    clean_up_tokenization_spaces=False,
+                )
+            )
+        except TypeError:
+            return str(self.tokenizer.decode([int(token_id)], skip_special_tokens=True))  # type: ignore[attr-defined]
 
     def decode(self, token_ids: Iterable[int]) -> str:
-        return str(self.tokenizer.decode(list(token_ids), skip_special_tokens=True))  # type: ignore[attr-defined]
+        token_list = list(token_ids)
+        try:
+            return str(
+                self.tokenizer.decode(  # type: ignore[attr-defined]
+                    token_list,
+                    skip_special_tokens=True,
+                    clean_up_tokenization_spaces=False,
+                )
+            )
+        except TypeError:
+            return str(self.tokenizer.decode(token_list, skip_special_tokens=True))  # type: ignore[attr-defined]
 
 
 def load_chat_tokenizer(

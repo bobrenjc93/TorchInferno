@@ -860,6 +860,26 @@ def test_chat_template_batch_encoding_input_ids_are_extracted() -> None:
     assert encoded == [7, 8, 9]
 
 
+def test_transformers_chat_tokenizer_disables_bpe_cleanup_on_decode() -> None:
+    class RecordingTokenizer(_BatchEncodingTokenizer):
+        def __init__(self) -> None:
+            self.decode_kwargs: list[dict[str, object]] = []
+
+        def decode(self, token_ids: list[int], **kwargs: object) -> str:
+            self.decode_kwargs.append(kwargs)
+            return "|".join(str(token_id) for token_id in token_ids)
+
+    raw = RecordingTokenizer()
+    tokenizer = _TransformersChatTokenizer(raw)
+
+    assert tokenizer.decode_token(7) == "7"
+    assert tokenizer.decode([8, 9]) == "8|9"
+    assert raw.decode_kwargs == [
+        {"skip_special_tokens": True, "clean_up_tokenization_spaces": False},
+        {"skip_special_tokens": True, "clean_up_tokenization_spaces": False},
+    ]
+
+
 def test_transformers_chat_tokenizer_stops_on_llama_terminators_only() -> None:
     tokenizer = _TransformersChatTokenizer(_LlamaStyleTokenizer())
 
