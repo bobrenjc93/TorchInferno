@@ -3376,6 +3376,55 @@ immediately after readiness. Those are not a median-latency lever, but decode
 calls should pass `clean_up_tokenization_spaces=False` so the server does not
 write warning noise on BPE tokenizers.
 
+Public `20260627_190305` is a newer same-host comparison, but it still measured
+TorchInferno `019ce7b` rather than the pushed cleanup commit. vLLM moved to
+`35e3850` and won 17/20 metric cells; TorchInferno kept only few_shot TPOT.
+TorchInferno medians were few_shot `253.7 / 47.5 / 299.6ms`,
+self_consistency `273.3 / 0.0 / 293.2ms`, multi_turn
+`492.2 / 59.7 / 544.7ms`, tree_of_thought `268.8 / 42.9 / 309.5ms`, and
+long_output `325.9 / 21.3 / 1130.4ms` (TTFT/TPOT/E2E). Local post-cleanup
+full-suite rechecks on `876fb5e` were substantially better on few_shot
+(`145.6 / 47.5 / 187.6ms`) but still noisy on sampled self and unchanged on the
+structural multi/long gaps.
+
+The next control-plane lever is a shared-memory TP command ring. Full shared
+memory for every command is rejected as a default despite improving
+self/tree/long: it regressed few_shot to `171.4 / 42.4 / 206.7ms` and
+multi_turn to `376.1 / 61.7 / 459.1ms`. Moving only online step commands is
+also too broad: it gave self_consistency `182.5 / 0.0 / 243.5ms`, but regressed
+few_shot to `192.4 / 49.1 / 233.0ms` and long_output to
+`273.9 / 23.8 / 1284.3ms`. The promoted shape is narrower: enable the POSIX
+shared-memory transport by default only on CUDA tensor-parallel models and use
+it for sampled online start/step/close commands (`temperature > 0`,
+`max_tokens <= 300`), while prompt submissions and greedy sessions fall back to
+the existing tensor command protocol. The full local A/B with
+`sampled_online_step` landed at few_shot `140.9 / 49.0 / 181.4ms`,
+self_consistency `256.6 / 0.0 / 274.2ms`, multi_turn
+`369.6 / 61.0 / 441.0ms`, tree_of_thought `227.8 / 48.2 / 271.3ms`, and
+long_output `276.3 / 24.0 / 1210.8ms`, all with 100% normalized correctness.
+A no-env focused confirmation after making that the CUDA TP default reproduced
+the few_shot row at `140.4 / 48.0 / 180.6ms`; self remained noisy
+(`293.2 / 0.0 / 326.7ms`). The expected public score movement is therefore
+few_shot TTFT/TPOT/E2E first, not a solved self or long-output row.
+
+Rejected follow-ups in this loop:
+- Multi_turn generated-prefix cache remains catastrophic
+  (`5931.0 / 777.0 / 6558.9ms`), even though correctness is preserved.
+- Multi_turn `max_active=48` (`887.8 / 79.1 / 975.6ms`) and refill floor `1`
+  (`382.1 / 59.5 / 453.0ms`) do not beat the current latency tradeoff.
+- Self sampled active caps `144` and `160` improve TTFT at the cost of one-token
+  E2E/throughput.
+- Prompt-lookup decode for long_output is catastrophic
+  (`3923.8 / 388.5 / 18135.1ms`) because verification overcomputes without the
+  needed graph/pipeline path.
+- Forcing submit+step commands on long_output regressed to
+  `274.6 / 24.2 / 1302.7ms`.
+- Sampled-short `TORCHINFERNO_OPENAI_TP_ONLINE_STEP_SYNC=0` with shared-memory
+  commands lowered self TTFT but regressed E2E/tail (`224.8 / 0.0 / 336.0ms`,
+  p99 over 1s).
+- Reducing sampled-short initial wait to 5ms is rejected:
+  `233.2 / 0.0 / 356.7ms` with the same high tail.
+
 ## In-flight, validated-locally-but-NOT-benchmarked commits
 
 The inference-bench harness has been frozen on `25260c0` for many hours, so these

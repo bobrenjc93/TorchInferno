@@ -1746,6 +1746,274 @@ def test_tensor_parallel_online_broadcast_helpers(monkeypatch) -> None:
     ]
 
 
+def _reset_openai_server_shm_state() -> None:
+    import torchinferno.openai_server as openai_server
+
+    for name in (
+        "_TENSOR_PARALLEL_SHM_BUFFER",
+        "_TENSOR_PARALLEL_SHM_WRITER",
+        "_TENSOR_PARALLEL_SHM_READER_BUFFER",
+        "_TENSOR_PARALLEL_SHM_READER",
+    ):
+        value = getattr(openai_server, name, None)
+        close = getattr(value, "close", None)
+        if callable(close):
+            close()
+        setattr(openai_server, name, None)
+    openai_server._TENSOR_PARALLEL_SHM_SETUP_DONE = False
+    openai_server._TENSOR_PARALLEL_SHM_DISABLED = False
+    openai_server._TENSOR_PARALLEL_SHM_READER_SETUP_DONE = False
+    openai_server._TENSOR_PARALLEL_SHM_ONLINE_STEP_ACTIVE = False
+
+
+def test_tensor_parallel_online_command_uses_shm_when_enabled(monkeypatch) -> None:
+    import torch.distributed as dist
+    import torchinferno.openai_server as openai_server
+    from torchinferno.runtime.shm_broadcast import ShmReader, ShmRingBuffer, pickle_loads
+
+    _reset_openai_server_shm_state()
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_SHM_COMMANDS", "1")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_SHM_COMMAND_MODE", "all")
+    model = type("FakeTPModel", (), {"world_size": 2, "rank": 0})()
+    setup_messages: list[dict[str, object]] = []
+
+    def broadcast_object_list(payload: list[object], *, src: int) -> None:
+        del src
+        setup_messages.append(dict(payload[0]))  # type: ignore[arg-type]
+
+    monkeypatch.setattr(
+        "torchinferno.openai_server._is_tensor_parallel_model",
+        lambda candidate: candidate is model,
+    )
+    monkeypatch.setattr(dist, "is_available", lambda: True)
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(dist, "broadcast_object_list", broadcast_object_list)
+
+    try:
+        _broadcast_tensor_parallel_online_step(model, 4)
+
+        assert len(setup_messages) == 1
+        setup = setup_messages[0]
+        assert setup["op"] == openai_server._TP_SHM_SETUP_OP
+        assert setup["enabled"] is True
+        reader_buffer = ShmRingBuffer.from_handle(setup["handle"])  # type: ignore[arg-type]
+        try:
+            payload = pickle_loads(ShmReader(reader_buffer, 0).dequeue(timeout=1.0))
+        finally:
+            reader_buffer.close()
+        assert payload == {"op": "online_step", "steps": 4}
+    finally:
+        _reset_openai_server_shm_state()
+
+
+def test_tensor_parallel_shm_command_falls_back_when_payload_is_too_large(monkeypatch) -> None:
+    import torch.distributed as dist
+    import torchinferno.openai_server as openai_server
+    from torchinferno.runtime.shm_broadcast import ShmReader, ShmRingBuffer, pickle_loads
+
+    _reset_openai_server_shm_state()
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_SHM_COMMANDS", "1")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_TENSOR_COMMANDS", "0")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_SHM_COMMAND_MAX_BYTES", "512")
+    model = type("FakeTPModel", (), {"world_size": 2, "rank": 0})()
+    captured: list[dict[str, object]] = []
+
+    def broadcast_object_list(payload: list[object], *, src: int) -> None:
+        del src
+        captured.append(dict(payload[0]))  # type: ignore[arg-type]
+
+    monkeypatch.setattr(
+        "torchinferno.openai_server._is_tensor_parallel_model",
+        lambda candidate: candidate is model,
+    )
+    monkeypatch.setattr(dist, "is_available", lambda: True)
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(dist, "broadcast_object_list", broadcast_object_list)
+
+    try:
+        _broadcast_tensor_parallel_online_submit_prompt_lists(
+            model,
+            [list(range(5000))],
+            max_tokens=6,
+            row_max_tokens=[6],
+            arrival_step=2,
+            eos_token_id=None,
+        )
+
+        assert len(captured) == 2
+        setup = captured[0]
+        assert setup["op"] == openai_server._TP_SHM_SETUP_OP
+        assert captured[1]["op"] == "online_submit"
+        reader_buffer = ShmRingBuffer.from_handle(setup["handle"])  # type: ignore[arg-type]
+        try:
+            marker = pickle_loads(ShmReader(reader_buffer, 0).dequeue(timeout=1.0))
+        finally:
+            reader_buffer.close()
+        assert marker == {"op": openai_server._TP_SHM_FALLBACK_OP}
+    finally:
+        _reset_openai_server_shm_state()
+
+
+def test_tensor_parallel_shm_step_mode_falls_back_for_submit(monkeypatch) -> None:
+    import torch.distributed as dist
+    import torchinferno.openai_server as openai_server
+    from torchinferno.runtime.shm_broadcast import ShmReader, ShmRingBuffer, pickle_loads
+
+    _reset_openai_server_shm_state()
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_SHM_COMMANDS", "1")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_SHM_COMMAND_MODE", "online_step")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_TENSOR_COMMANDS", "0")
+    model = type("FakeTPModel", (), {"world_size": 2, "rank": 0})()
+    captured: list[dict[str, object]] = []
+
+    def broadcast_object_list(payload: list[object], *, src: int) -> None:
+        del src
+        captured.append(dict(payload[0]))  # type: ignore[arg-type]
+
+    monkeypatch.setattr(
+        "torchinferno.openai_server._is_tensor_parallel_model",
+        lambda candidate: candidate is model,
+    )
+    monkeypatch.setattr(dist, "is_available", lambda: True)
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(dist, "broadcast_object_list", broadcast_object_list)
+
+    try:
+        _broadcast_tensor_parallel_online_submit_prompt_lists(
+            model,
+            [[1, 2]],
+            max_tokens=6,
+            row_max_tokens=[6],
+            arrival_step=2,
+            eos_token_id=None,
+        )
+        _broadcast_tensor_parallel_online_step(model, 2)
+
+        assert len(captured) == 2
+        setup = captured[0]
+        assert captured[1]["op"] == "online_submit"
+        reader_buffer = ShmRingBuffer.from_handle(setup["handle"])  # type: ignore[arg-type]
+        try:
+            reader = ShmReader(reader_buffer, 0)
+            marker = pickle_loads(reader.dequeue(timeout=1.0))
+            step_payload = pickle_loads(reader.dequeue(timeout=1.0))
+        finally:
+            reader_buffer.close()
+        assert marker == {"op": openai_server._TP_SHM_FALLBACK_OP}
+        assert step_payload == {"op": "online_step", "steps": 2}
+    finally:
+        _reset_openai_server_shm_state()
+
+
+def test_tensor_parallel_shm_sampled_step_mode_only_uses_steps_for_sampled_sessions(monkeypatch) -> None:
+    import torch.distributed as dist
+    import torchinferno.openai_server as openai_server
+    from torchinferno.runtime.shm_broadcast import ShmReader, ShmRingBuffer, pickle_loads
+
+    _reset_openai_server_shm_state()
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_SHM_COMMANDS", "1")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_SHM_COMMAND_MODE", "sampled_online_step")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_TENSOR_COMMANDS", "0")
+    model = type("FakeTPModel", (), {"world_size": 2, "rank": 0})()
+    captured: list[dict[str, object]] = []
+
+    def broadcast_object_list(payload: list[object], *, src: int) -> None:
+        del src
+        captured.append(dict(payload[0]))  # type: ignore[arg-type]
+
+    monkeypatch.setattr(
+        "torchinferno.openai_server._is_tensor_parallel_model",
+        lambda candidate: candidate is model,
+    )
+    monkeypatch.setattr(dist, "is_available", lambda: True)
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(dist, "broadcast_object_list", broadcast_object_list)
+
+    try:
+        _broadcast_tensor_parallel_online_start(
+            model,
+            max_seq_len=16,
+            max_active_requests=4,
+            prefix_cache_capacity=2,
+            prefill_token_budget=None,
+            temperature=0.0,
+            max_tokens=128,
+        )
+        _broadcast_tensor_parallel_online_step(model, 2)
+        _broadcast_tensor_parallel_online_start(
+            model,
+            max_seq_len=16,
+            max_active_requests=4,
+            prefix_cache_capacity=2,
+            prefill_token_budget=None,
+            temperature=0.7,
+            max_tokens=256,
+        )
+        _broadcast_tensor_parallel_online_step(model, 3)
+
+        assert len(captured) == 3
+        setup = captured[0]
+        assert captured[1]["op"] == "online_start"
+        assert captured[2]["op"] == "online_step"
+        reader_buffer = ShmRingBuffer.from_handle(setup["handle"])  # type: ignore[arg-type]
+        try:
+            reader = ShmReader(reader_buffer, 0)
+            greedy_start_marker = pickle_loads(reader.dequeue(timeout=1.0))
+            greedy_step_marker = pickle_loads(reader.dequeue(timeout=1.0))
+            sampled_start_payload = pickle_loads(reader.dequeue(timeout=1.0))
+            sampled_step_payload = pickle_loads(reader.dequeue(timeout=1.0))
+        finally:
+            reader_buffer.close()
+        assert greedy_start_marker == {"op": openai_server._TP_SHM_FALLBACK_OP}
+        assert greedy_step_marker == {"op": openai_server._TP_SHM_FALLBACK_OP}
+        assert sampled_start_payload["op"] == "online_start"
+        assert sampled_step_payload == {"op": "online_step", "steps": 3}
+    finally:
+        _reset_openai_server_shm_state()
+
+
+def test_tensor_parallel_worker_command_receive_reads_shm_payload(monkeypatch) -> None:
+    import torch.distributed as dist
+    import torchinferno.openai_server as openai_server
+    from torchinferno.runtime.shm_broadcast import ShmRingBuffer, ShmWriter, pickle_dumps
+
+    _reset_openai_server_shm_state()
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_SHM_COMMANDS", "1")
+    model = type("FakeTPModel", (), {"world_size": 2, "rank": 1})()
+    buffer = ShmRingBuffer(n_reader=1, max_chunk_bytes=4096, max_chunks=4)
+    writer = ShmWriter(buffer)
+    writer.enqueue(pickle_dumps({"op": "online_step", "steps": 3}))
+
+    def broadcast_object_list(payload: list[object], *, src: int) -> None:
+        del src
+        payload[0] = {
+            "op": openai_server._TP_SHM_SETUP_OP,
+            "enabled": True,
+            "handle": buffer.handle(),
+        }
+
+    monkeypatch.setattr(
+        "torchinferno.openai_server._is_tensor_parallel_model",
+        lambda candidate: candidate is model,
+    )
+    monkeypatch.setattr(dist, "is_available", lambda: True)
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(dist, "broadcast_object_list", broadcast_object_list)
+
+    class Engine:
+        def __init__(self) -> None:
+            self.model = model
+
+    try:
+        assert openai_server._receive_tensor_parallel_command_payload(Engine()) == {
+            "op": "online_step",
+            "steps": 3,
+        }
+    finally:
+        buffer.close()
+        _reset_openai_server_shm_state()
+
+
 def test_tensor_parallel_token_budget_prompt_list_run_broadcast_helper(monkeypatch) -> None:
     import torch.distributed as dist
 

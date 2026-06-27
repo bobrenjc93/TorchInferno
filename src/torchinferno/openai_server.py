@@ -1900,6 +1900,16 @@ def _token_budget_request_ordinal(request_id: object) -> int:
 
 _TENSOR_PARALLEL_CONTROL_GROUP: object | None = None
 _TENSOR_PARALLEL_CONTROL_GROUP_LOCK = threading.Lock()
+_TENSOR_PARALLEL_SHM_SETUP_DONE = False
+_TENSOR_PARALLEL_SHM_DISABLED = False
+_TENSOR_PARALLEL_SHM_BUFFER: object | None = None
+_TENSOR_PARALLEL_SHM_WRITER: object | None = None
+_TENSOR_PARALLEL_SHM_READER_BUFFER: object | None = None
+_TENSOR_PARALLEL_SHM_READER: object | None = None
+_TENSOR_PARALLEL_SHM_READER_SETUP_DONE = False
+_TENSOR_PARALLEL_SHM_ONLINE_STEP_ACTIVE = False
+_TP_SHM_SETUP_OP = "__torchinferno_tp_shm_setup__"
+_TP_SHM_FALLBACK_OP = "__torchinferno_tp_shm_fallback__"
 
 
 @dataclass(frozen=True)
@@ -11164,6 +11174,227 @@ def _tensor_parallel_tensor_commands_enabled(model: object) -> bool:
     return dist.is_available() and dist.is_initialized()
 
 
+def _tensor_parallel_shm_commands_enabled(model: object) -> bool:
+    if "TORCHINFERNO_OPENAI_TP_SHM_COMMANDS" in os.environ:
+        enabled = env_flag("TORCHINFERNO_OPENAI_TP_SHM_COMMANDS", False)
+    else:
+        model_device = getattr(model, "device", None)
+        try:
+            enabled = model_device is not None and torch.device(model_device).type == "cuda"
+        except (TypeError, RuntimeError):
+            enabled = False
+    if (
+        not _is_tensor_parallel_model(model)
+        or _tensor_parallel_world_size(model) <= 1
+        or not enabled
+    ):
+        return False
+    if os.name != "posix":
+        return False
+    import torch.distributed as dist
+
+    return dist.is_available() and dist.is_initialized()
+
+
+def _tensor_parallel_shm_max_chunk_bytes() -> int:
+    return env_int("TORCHINFERNO_OPENAI_TP_SHM_COMMAND_MAX_BYTES", 4 * 1024 * 1024, minimum=4096)
+
+
+def _tensor_parallel_shm_max_chunks() -> int:
+    return env_int("TORCHINFERNO_OPENAI_TP_SHM_COMMAND_CHUNKS", 32, minimum=2)
+
+
+def _tensor_parallel_shm_command_mode() -> str:
+    return os.environ.get("TORCHINFERNO_OPENAI_TP_SHM_COMMAND_MODE", "sampled_online_step").strip().lower()
+
+
+def _tensor_parallel_shm_note_payload(payload: Mapping[str, object]) -> None:
+    global _TENSOR_PARALLEL_SHM_ONLINE_STEP_ACTIVE
+
+    if str(payload.get("op", "")) != "online_start":
+        return
+    mode = _tensor_parallel_shm_command_mode()
+    if mode not in {"sampled_online_step", "sampled_step", "sampled_steps"}:
+        return
+    try:
+        temperature = float(payload.get("temperature", 0.0))
+        max_tokens = int(payload.get("max_tokens", 0))
+    except (TypeError, ValueError):
+        _TENSOR_PARALLEL_SHM_ONLINE_STEP_ACTIVE = False
+        return
+    sampled_max_tokens = env_int(
+        "TORCHINFERNO_OPENAI_TP_SHM_SAMPLED_STEP_MAX_TOKENS",
+        300,
+        minimum=1,
+    )
+    _TENSOR_PARALLEL_SHM_ONLINE_STEP_ACTIVE = temperature > 0.0 and 0 < max_tokens <= sampled_max_tokens
+
+
+def _tensor_parallel_shm_payload_allowed(payload: Mapping[str, object]) -> bool:
+    mode = _tensor_parallel_shm_command_mode()
+    if mode in {"", "1", "true", "yes", "all"}:
+        return True
+    op = str(payload.get("op", ""))
+    if mode in {"online_step", "step", "steps"}:
+        return op in {"online_step", "online_close", "stop", "cleanup"}
+    if mode in {"online"}:
+        return op.startswith("online_") or op in {"stop", "cleanup"}
+    if mode in {"sampled_online_step", "sampled_step", "sampled_steps"}:
+        if op == "online_start":
+            return _TENSOR_PARALLEL_SHM_ONLINE_STEP_ACTIVE
+        if op in {"online_step", "online_close"}:
+            return _TENSOR_PARALLEL_SHM_ONLINE_STEP_ACTIVE
+        return op in {"stop", "cleanup"}
+    if mode in {"decode"}:
+        return op in {
+            "online_step",
+            "token_budget_step",
+            "token_budget_decode_run",
+            "persistent_prompt_list_step",
+            "persistent_prompt_list_decode_run",
+            "stop",
+            "cleanup",
+        }
+    return False
+
+
+def _tensor_parallel_shm_writer(model: object) -> object | None:
+    global _TENSOR_PARALLEL_SHM_SETUP_DONE
+    global _TENSOR_PARALLEL_SHM_DISABLED
+    global _TENSOR_PARALLEL_SHM_BUFFER
+    global _TENSOR_PARALLEL_SHM_WRITER
+
+    if not _tensor_parallel_shm_commands_enabled(model):
+        return None
+    if _TENSOR_PARALLEL_SHM_WRITER is not None:
+        return _TENSOR_PARALLEL_SHM_WRITER
+    if _TENSOR_PARALLEL_SHM_SETUP_DONE:
+        return None
+
+    import torch.distributed as dist
+
+    setup: dict[str, object]
+    try:
+        from torchinferno.runtime.shm_broadcast import ShmRingBuffer, ShmWriter
+
+        world_size = _tensor_parallel_world_size(model)
+        buffer = ShmRingBuffer(
+            n_reader=world_size - 1,
+            max_chunk_bytes=_tensor_parallel_shm_max_chunk_bytes(),
+            max_chunks=_tensor_parallel_shm_max_chunks(),
+        )
+        writer = ShmWriter(buffer)
+        _TENSOR_PARALLEL_SHM_BUFFER = buffer
+        _TENSOR_PARALLEL_SHM_WRITER = writer
+        _TENSOR_PARALLEL_SHM_DISABLED = False
+        setup = {
+            "op": _TP_SHM_SETUP_OP,
+            "enabled": True,
+            "handle": buffer.handle(),
+        }
+    except Exception as exc:
+        warn_optional_failure("tensor-parallel shm command setup", exc)
+        _TENSOR_PARALLEL_SHM_DISABLED = True
+        setup = {"op": _TP_SHM_SETUP_OP, "enabled": False}
+    dist.broadcast_object_list([setup], src=0)
+    _TENSOR_PARALLEL_SHM_SETUP_DONE = True
+    return None if _TENSOR_PARALLEL_SHM_DISABLED else _TENSOR_PARALLEL_SHM_WRITER
+
+
+def _broadcast_tensor_parallel_shm_fallback(writer: object) -> None:
+    from torchinferno.runtime.shm_broadcast import pickle_dumps
+
+    getattr(writer, "enqueue")(pickle_dumps({"op": _TP_SHM_FALLBACK_OP}))
+
+
+def _broadcast_tensor_parallel_shm_payload(model: object, payload: Mapping[str, object]) -> bool:
+    writer = _tensor_parallel_shm_writer(model)
+    if writer is None:
+        return False
+    try:
+        from torchinferno.runtime.shm_broadcast import pickle_dumps
+
+        _tensor_parallel_shm_note_payload(payload)
+        if not _tensor_parallel_shm_payload_allowed(payload):
+            _broadcast_tensor_parallel_shm_fallback(writer)
+            return False
+        encoded = pickle_dumps(dict(payload))
+        enqueue = getattr(writer, "enqueue")
+        if enqueue(encoded):
+            return True
+        _broadcast_tensor_parallel_shm_fallback(writer)
+        return False
+    except Exception as exc:
+        try:
+            _broadcast_tensor_parallel_shm_fallback(writer)
+        except Exception:
+            pass
+        warn_optional_failure("tensor-parallel shm command broadcast", exc)
+        return False
+
+
+def _tensor_parallel_shm_reader(engine: OpenAICompletionEngine) -> object | None:
+    global _TENSOR_PARALLEL_SHM_READER_SETUP_DONE
+    global _TENSOR_PARALLEL_SHM_READER_BUFFER
+    global _TENSOR_PARALLEL_SHM_READER
+
+    model = getattr(engine, "model", None)
+    if not _tensor_parallel_shm_commands_enabled(model):
+        return None
+    if _TENSOR_PARALLEL_SHM_READER is not None:
+        return _TENSOR_PARALLEL_SHM_READER
+    if _TENSOR_PARALLEL_SHM_READER_SETUP_DONE:
+        return None
+
+    import torch.distributed as dist
+
+    command: list[object] = [None]
+    dist.broadcast_object_list(command, src=0)
+    setup = command[0]
+    _TENSOR_PARALLEL_SHM_READER_SETUP_DONE = True
+    if not isinstance(setup, Mapping) or setup.get("op") != _TP_SHM_SETUP_OP:
+        raise RuntimeError("tensor-parallel shm command setup was not broadcast")
+    if not bool(setup.get("enabled", False)):
+        return None
+    handle = setup.get("handle")
+    if not isinstance(handle, tuple):
+        raise RuntimeError("tensor-parallel shm command setup has invalid handle")
+    from torchinferno.runtime.shm_broadcast import ShmReader, ShmRingBuffer
+
+    buffer = ShmRingBuffer.from_handle(handle)  # type: ignore[arg-type]
+    rank = int(getattr(model, "rank", 0))
+    reader = ShmReader(buffer, rank - 1)
+    _TENSOR_PARALLEL_SHM_READER_BUFFER = buffer
+    _TENSOR_PARALLEL_SHM_READER = reader
+    return reader
+
+
+def _receive_tensor_parallel_dist_payload(engine: OpenAICompletionEngine) -> object:
+    import torch.distributed as dist
+
+    if _tensor_parallel_tensor_commands_enabled(getattr(engine, "model", None)):
+        return _receive_tensor_parallel_tensor_payload(engine)
+    command: list[object] = [None]
+    dist.broadcast_object_list(command, src=0)
+    return command[0]
+
+
+def _receive_tensor_parallel_command_payload(engine: OpenAICompletionEngine) -> object:
+    reader = _tensor_parallel_shm_reader(engine)
+    if reader is None:
+        return _receive_tensor_parallel_dist_payload(engine)
+    try:
+        from torchinferno.runtime.shm_broadcast import pickle_loads
+
+        payload = pickle_loads(getattr(reader, "dequeue")())
+    except Exception as exc:
+        warn_optional_failure("tensor-parallel shm command receive", exc)
+        return _receive_tensor_parallel_dist_payload(engine)
+    if isinstance(payload, Mapping) and payload.get("op") == _TP_SHM_FALLBACK_OP:
+        return _receive_tensor_parallel_dist_payload(engine)
+    return payload
+
+
 def _tensor_parallel_command_device(device: torch.device) -> torch.device:
     command_device = torch.device(device)
     return command_device if command_device.type == "cuda" else torch.device("cpu")
@@ -11466,6 +11697,16 @@ def _broadcast_tensor_parallel_generate(
         dtype=torch.long,
         device=token_rows.device,
     )
+    command = {
+        "op": "generate",
+        "input_ids": input_ids.detach().cpu().tolist(),
+        "max_tokens": int(max_tokens),
+        "row_max_tokens": None if row_max_tokens is None else [int(value) for value in row_max_tokens],
+        "temperature": float(temperature),
+        "stream": bool(stream),
+    }
+    if _broadcast_tensor_parallel_shm_payload(model, command):
+        return
     if _broadcast_tensor_parallel_tensor_payload(
         model,
         command_kind=_TP_COMMAND_GENERATE_TENSOR,
@@ -11477,17 +11718,7 @@ def _broadcast_tensor_parallel_generate(
         row_max_tokens=row_max_tokens,
     ):
         return
-    command = [
-        {
-            "op": "generate",
-            "input_ids": input_ids.detach().cpu().tolist(),
-            "max_tokens": int(max_tokens),
-            "row_max_tokens": None if row_max_tokens is None else [int(value) for value in row_max_tokens],
-            "temperature": float(temperature),
-            "stream": bool(stream),
-        }
-    ]
-    dist.broadcast_object_list(command, src=0)
+    dist.broadcast_object_list([command], src=0)
 
 
 def _broadcast_tensor_parallel_generate_prompt_lists(
@@ -11505,6 +11736,16 @@ def _broadcast_tensor_parallel_generate_prompt_lists(
 
     if not dist.is_available() or not dist.is_initialized():
         return
+    command = {
+        "op": "generate",
+        "input_id_lists": [list(prompt) for prompt in prompts],
+        "max_tokens": int(max_tokens),
+        "row_max_tokens": None if row_max_tokens is None else [int(value) for value in row_max_tokens],
+        "temperature": float(temperature),
+        "stream": bool(stream),
+    }
+    if _broadcast_tensor_parallel_shm_payload(model, command):
+        return
     if prompts:
         token_rows, lengths = _prompt_list_tensor_payload(prompts, torch.device("cpu"))
         if _broadcast_tensor_parallel_tensor_payload(
@@ -11518,17 +11759,7 @@ def _broadcast_tensor_parallel_generate_prompt_lists(
             row_max_tokens=row_max_tokens,
         ):
             return
-    command = [
-        {
-            "op": "generate",
-            "input_id_lists": [list(prompt) for prompt in prompts],
-            "max_tokens": int(max_tokens),
-            "row_max_tokens": None if row_max_tokens is None else [int(value) for value in row_max_tokens],
-            "temperature": float(temperature),
-            "stream": bool(stream),
-        }
-    ]
-    dist.broadcast_object_list(command, src=0)
+    dist.broadcast_object_list([command], src=0)
 
 
 def _broadcast_tensor_parallel_token_budget_prompt_list_run(
@@ -11552,23 +11783,23 @@ def _broadcast_tensor_parallel_token_budget_prompt_list_run(
 
     if not dist.is_available() or not dist.is_initialized():
         return
-    command = [
-        {
-            "op": "token_budget_prompt_list_run",
-            "input_id_lists": [list(prompt) for prompt in prompts],
-            "max_tokens": int(max_tokens),
-            "row_max_tokens": None if row_max_tokens is None else [int(value) for value in row_max_tokens],
-            "temperature": float(temperature),
-            "prefix_tokens": int(prefix_tokens),
-            "max_active_rows": int(max_active_rows),
-            "max_scheduled_tokens": int(max_scheduled_tokens),
-            "prefill_chunk_size": 0 if prefill_chunk_size is None else int(prefill_chunk_size),
-            "decode_run_steps": int(decode_run_steps),
-            "arrival_steps": None if arrival_steps is None else [int(value) for value in arrival_steps],
-            "static_graph_buckets": bool(static_graph_buckets),
-        }
-    ]
-    dist.broadcast_object_list(command, src=0)
+    command = {
+        "op": "token_budget_prompt_list_run",
+        "input_id_lists": [list(prompt) for prompt in prompts],
+        "max_tokens": int(max_tokens),
+        "row_max_tokens": None if row_max_tokens is None else [int(value) for value in row_max_tokens],
+        "temperature": float(temperature),
+        "prefix_tokens": int(prefix_tokens),
+        "max_active_rows": int(max_active_rows),
+        "max_scheduled_tokens": int(max_scheduled_tokens),
+        "prefill_chunk_size": 0 if prefill_chunk_size is None else int(prefill_chunk_size),
+        "decode_run_steps": int(decode_run_steps),
+        "arrival_steps": None if arrival_steps is None else [int(value) for value in arrival_steps],
+        "static_graph_buckets": bool(static_graph_buckets),
+    }
+    if _broadcast_tensor_parallel_shm_payload(model, command):
+        return
+    dist.broadcast_object_list([command], src=0)
 
 
 def _broadcast_tensor_parallel_persistent_prompt_list_step(
@@ -11580,6 +11811,8 @@ def _broadcast_tensor_parallel_persistent_prompt_list_step(
     import torch.distributed as dist
 
     if not dist.is_available() or not dist.is_initialized():
+        return
+    if _broadcast_tensor_parallel_shm_payload(model, dict(payload)):
         return
     if _tensor_parallel_tensor_commands_enabled(model):
         command_group = _tensor_parallel_tensor_command_group(dist)
@@ -11613,6 +11846,8 @@ def _broadcast_tensor_parallel_persistent_prompt_list_decode_run(
 
     if not dist.is_available() or not dist.is_initialized():
         return
+    if _broadcast_tensor_parallel_shm_payload(model, dict(payload)):
+        return
     if _tensor_parallel_tensor_commands_enabled(model):
         command_group = _tensor_parallel_tensor_command_group(dist)
         command_device = _tensor_parallel_tensor_command_device(
@@ -11643,6 +11878,16 @@ def _broadcast_tensor_parallel_persistent_prompt_list_start(
 
     if not dist.is_available() or not dist.is_initialized():
         return
+    payload = {
+        "op": "persistent_prompt_list_start",
+        "prefix": [int(token_id) for token_id in prefix],
+        "cache_batch_size": int(cache_batch_size),
+        "max_seq_len": int(max_seq_len),
+        "temperature": float(temperature),
+        "max_tokens": int(max_tokens),
+    }
+    if _broadcast_tensor_parallel_shm_payload(model, payload):
+        return
     if _tensor_parallel_tensor_commands_enabled(model):
         command_group = _tensor_parallel_tensor_command_group(dist)
         command_device = _tensor_parallel_tensor_command_device(
@@ -11662,19 +11907,7 @@ def _broadcast_tensor_parallel_persistent_prompt_list_start(
         if prefix_tensor.numel() > 0:
             _broadcast_tensor_command(prefix_tensor, src=0, group=command_group)
         return
-    dist.broadcast_object_list(
-        [
-            {
-                "op": "persistent_prompt_list_start",
-                "prefix": [int(token_id) for token_id in prefix],
-                "cache_batch_size": int(cache_batch_size),
-                "max_seq_len": int(max_seq_len),
-                "temperature": float(temperature),
-                "max_tokens": int(max_tokens),
-            }
-        ],
-        src=0,
-    )
+    dist.broadcast_object_list([payload], src=0)
 
 
 def _broadcast_tensor_parallel_persistent_prompt_list_close(model: object) -> None:
@@ -11683,6 +11916,8 @@ def _broadcast_tensor_parallel_persistent_prompt_list_close(model: object) -> No
     import torch.distributed as dist
 
     if not dist.is_available() or not dist.is_initialized():
+        return
+    if _broadcast_tensor_parallel_shm_payload(model, {"op": "persistent_prompt_list_close"}):
         return
     if _tensor_parallel_tensor_commands_enabled(model):
         command_group = _tensor_parallel_tensor_command_group(dist)
@@ -11788,6 +12023,8 @@ def _broadcast_tensor_parallel_token_budget_start(
         "max_tokens": int(max_tokens),
         "prefix": [int(token_id) for token_id in prefix],
     }
+    if _broadcast_tensor_parallel_shm_payload(model, payload):
+        return
     if _tensor_parallel_tensor_commands_enabled(model):
         command_group = _tensor_parallel_tensor_command_group(dist)
         command_device = _tensor_parallel_tensor_command_device(
@@ -11816,6 +12053,8 @@ def _broadcast_tensor_parallel_token_budget_close(model: object) -> None:
     import torch.distributed as dist
 
     if not dist.is_available() or not dist.is_initialized():
+        return
+    if _broadcast_tensor_parallel_shm_payload(model, {"op": "token_budget_close"}):
         return
     if _tensor_parallel_tensor_commands_enabled(model):
         command_group = _tensor_parallel_tensor_command_group(dist)
@@ -11861,6 +12100,8 @@ def _broadcast_tensor_parallel_token_budget_step(model: object, payload: Mapping
 
     if not dist.is_available() or not dist.is_initialized():
         return
+    if _broadcast_tensor_parallel_shm_payload(model, dict(payload)):
+        return
     if _tensor_parallel_tensor_commands_enabled(model):
         command_group = _tensor_parallel_tensor_command_group(dist)
         command_device = _tensor_parallel_tensor_command_device(
@@ -11887,6 +12128,8 @@ def _broadcast_tensor_parallel_token_budget_decode_run(model: object, payload: M
 
     if not dist.is_available() or not dist.is_initialized():
         return
+    if _broadcast_tensor_parallel_shm_payload(model, dict(payload)):
+        return
     if _tensor_parallel_tensor_commands_enabled(model):
         command_group = _tensor_parallel_tensor_command_group(dist)
         command_device = _tensor_parallel_tensor_command_device(
@@ -11911,6 +12154,8 @@ def _broadcast_tensor_parallel_online_command(model: object, payload: Mapping[st
     import torch.distributed as dist
 
     if not dist.is_available() or not dist.is_initialized():
+        return
+    if _broadcast_tensor_parallel_shm_payload(model, dict(payload)):
         return
     if _tensor_parallel_tensor_commands_enabled(model):
         command_group = _tensor_parallel_tensor_command_group(dist)
@@ -11993,6 +12238,8 @@ def _broadcast_tensor_parallel_stop(model: object) -> None:
     import torch.distributed as dist
 
     if dist.is_available() and dist.is_initialized():
+        if _broadcast_tensor_parallel_shm_payload(model, {"op": "stop"}):
+            return
         if _tensor_parallel_tensor_commands_enabled(model):
             command_group = _tensor_parallel_tensor_command_group(dist)
             device = _tensor_parallel_tensor_command_device(
@@ -12012,6 +12259,8 @@ def _broadcast_tensor_parallel_cleanup(model: object) -> None:
     import torch.distributed as dist
 
     if not (dist.is_available() and dist.is_initialized()):
+        return
+    if _broadcast_tensor_parallel_shm_payload(model, {"op": "cleanup"}):
         return
     if _tensor_parallel_tensor_commands_enabled(model):
         command_group = _tensor_parallel_tensor_command_group(dist)
@@ -12084,12 +12333,7 @@ def _tensor_parallel_worker_loop(engine: OpenAICompletionEngine) -> None:
     while True:
         cuda_sync: bool | None = None
         _skip_finally_sync = False
-        if _tensor_parallel_tensor_commands_enabled(getattr(engine, "model", None)):
-            payload = _receive_tensor_parallel_tensor_payload(engine)
-        else:
-            command: list[object] = [None]
-            dist.broadcast_object_list(command, src=0)
-            payload = command[0]
+        payload = _receive_tensor_parallel_command_payload(engine)
         if not isinstance(payload, dict):
             continue
         op = payload.get("op")
