@@ -210,6 +210,25 @@ smaller `16` floor had the same tradeoff in milder form (`382.6 / 26.7 /
 default refill floor; it is the better latency/throughput tradeoff for the
 scorecard.
 
+A delayed inference-bench commit (`23ffc116`, run `20260626_230301`) added an
+older public result after the cleaner `20260627_000710` refresh. It is not a
+current runtime datapoint: TorchInferno was still on `b7a4735` there and never
+became ready within 1800s, stalling during checkpoint load after the initial
+embedding/norm/head tensors. Keep using `20260627_000710` as the latest complete
+same-host comparison for scorecard decisions.
+
+A current focused tree_of_thought repro on pushed `21ed3d8` landed at
+`328.5 / 60.3 / 394.5ms`, 956/992 raw correct. Queue profiling kept the same
+split as the public row: sampled-medium traffic accounted for `896` requests
+across six online sessions and spent `8.54s` in prefill wall time, while the
+small greedy eval side accounted for `96` HTTP requests and drove some high-tail
+decode GPU time. The first sampled 256-request session was still the outlier
+(`5.66s` phase, `4.80s` prefill wall) despite zero prefill graph misses, whereas
+a later 256-request session was much cheaper (`1.71s` phase, `0.76s` prefill
+wall). This keeps tree in the known sampled-medium prefill/cold-capture bucket;
+do not reopen the rejected sampled-medium wait, idle, row-cap, suffix-warmup, or
+capture-on-miss knobs without a different prefill pipeline mechanism.
+
 ## PUBLIC STARTUP REGRESSION: CHECKPOINT LOAD/BROADCAST VARIABILITY (2026-06-24)
 
 Update `2026-06-25`: public run `20260624_230255` showed the opposite failure
