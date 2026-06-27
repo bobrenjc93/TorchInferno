@@ -377,6 +377,26 @@ broadcast and shard scatter remain available through explicit
 `TORCHINFERNO_TP_RANK0_CHECKPOINT_SHARD_SCATTER=1` opt-ins when a host is known
 to handle those large collectives.
 
+Same-host validation after the default flip (`9a22e75`) confirmed the harness
+startup path: inference-bench built the editable TorchInferno package in `7.6s`,
+loaded all `80/80` Llama layers in `18-21s`, and reached `/health` in `110.5s`.
+A full TorchInferno-only local baseline completed all five rows: few_shot
+`167.9 / 48.8 / 215.0ms`, self_consistency `286.4 / 0.0 / 313.2ms`,
+multi_turn `377.6 / 62.4 / 449.9ms`, tree_of_thought
+`197.6 / 47.5 / 235.1ms`, and long_output `282.0 / 23.2 / 1173.1ms`
+(TTFT/TPOT/E2E). Correctness stayed at 98-100% depending on row.
+
+Focused long_output profiling on the same code keeps the remaining runtime gap
+decode/prefill bound rather than startup-bound. The queue profile ended at
+`26.4s` total phase time with `60` prefill batches, `10.1s` prefill wall
+(`9.2s` forward), `8` runtime prefill graph captures (`4.9s`), `787` decode
+batches, `9.4s` decode-active time, and `7.0s` CPU-token readback time. Two
+existing knobs were rejected: enabling common-prefix suffix warmup moved one
+capture out of the request path but regressed score-facing long_output to
+`282.4 / 24.1 / 1353.6ms`; forcing greedy-short decode quantum `8` improved
+TPOT to `21.0ms` but regressed TTFT/E2E/throughput to
+`466.2ms / 1423.4ms / 25.5 tok/s`. Keep both defaults unchanged.
+
 Public run `20260624_185427` supersedes the later-sorting stale
 `20260624_183253` failure. It used TorchInferno `76107de`, vLLM `1cd3e0e`,
 and SGLang `4a4f063`; all providers completed all five benchmarks. Scorecard
