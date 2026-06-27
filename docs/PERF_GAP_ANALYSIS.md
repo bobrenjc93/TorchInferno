@@ -230,6 +230,12 @@ do not reopen the rejected sampled-medium wait, idle, row-cap, suffix-warmup, or
 capture-on-miss knobs without a different prefill pipeline mechanism. Follow-up
 instrumentation now separates ragged prefill graph captures from graph replays
 in queue profiles, so future "graph hit" counts will not hide cold-capture cost.
+The first verification run on `8b530a4` proved the point: focused tree landed at
+`255.9 / 60.4 / 304.5ms`, 957/992 raw correct, and sampled-medium prefill showed
+`45` graph successes split into `8` cold captures and `31` replays. The captures
+alone took `5.80s`, mostly in the first three sampled sessions; later replay-only
+sessions had much lower prefill wall. The next tree lever is therefore shape
+pre-capture/pipeline cost, not another admission wait.
 
 ## PUBLIC STARTUP REGRESSION: CHECKPOINT LOAD/BROADCAST VARIABILITY (2026-06-24)
 
