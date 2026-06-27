@@ -251,6 +251,16 @@ capture time in the first sampled session) instead of reusing prior
 greedy-large captures. The remaining first-wave cost is still cold capture and
 prefill pipeline work.
 
+Rechecking the existing common-prefix suffix warmup knob after the precision-key
+fix is not defaultable. With
+`TORCHINFERNO_OPENAI_WARMUP_ONLINE_COMMON_PREFIX_SUFFIX_PREFILL=1`, focused tree
+started in `130.6s` and landed at `269.1 / 59.8 / 311.0ms`, 955/992 raw
+correct. The first sampled session still spent `2.19s` in prefill wall and
+captured two graphs (`1.54s` capture time) because the warmup does not remove
+the sampled FP8 suffix-capture path. Keep suffix warmup opt-in until a
+precision-aware pre-capture path beats the focused control without trading away
+startup or correctness.
+
 ## PUBLIC STARTUP REGRESSION: CHECKPOINT LOAD/BROADCAST VARIABILITY (2026-06-24)
 
 Update `2026-06-25`: public run `20260624_230255` showed the opposite failure
