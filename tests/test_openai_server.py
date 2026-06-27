@@ -139,6 +139,7 @@ from torchinferno.openai_server import (
     _startup_online_common_prefix_prefill_warmup_rows,
     _startup_online_common_prefix_prefill_warmup_tokens,
     _startup_ragged_decode_warmup_enabled,
+    _startup_runtime_fp8_ragged_prefill_warmup_enabled,
     _startup_runtime_fp8_prefill_warmup_enabled,
     _startup_scheduler_warmup_enabled,
     _sampled_batch_shape_bucket_size,
@@ -750,22 +751,26 @@ def test_openai_startup_ragged_decode_warmup_is_opt_in(monkeypatch) -> None:
     monkeypatch.delenv("TORCHINFERNO_OPENAI_STARTUP_GRAPH_WARMUP", raising=False)
     monkeypatch.delenv("TORCHINFERNO_OPENAI_STARTUP_ONLINE_COMMON_PREFIX_PREFILL_WARMUP", raising=False)
     monkeypatch.delenv("TORCHINFERNO_OPENAI_STARTUP_RUNTIME_FP8_PREFILL_WARMUP", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_STARTUP_RUNTIME_FP8_RAGGED_PREFILL_WARMUP", raising=False)
     monkeypatch.delenv("TORCHINFERNO_OPENAI_STARTUP_SCHEDULER_WARMUP", raising=False)
     monkeypatch.delenv("TORCHINFERNO_OPENAI_WARMUP_RAGGED_DECODE_STARTUP", raising=False)
     assert not _startup_graph_warmup_enabled()
     assert _startup_online_common_prefix_prefill_warmup_enabled()
     assert _startup_runtime_fp8_prefill_warmup_enabled()
+    assert _startup_runtime_fp8_ragged_prefill_warmup_enabled()
     assert not _startup_ragged_decode_warmup_enabled()
     assert _startup_scheduler_warmup_enabled()
 
     monkeypatch.setenv("TORCHINFERNO_OPENAI_STARTUP_GRAPH_WARMUP", "1")
     monkeypatch.setenv("TORCHINFERNO_OPENAI_STARTUP_ONLINE_COMMON_PREFIX_PREFILL_WARMUP", "0")
     monkeypatch.setenv("TORCHINFERNO_OPENAI_STARTUP_RUNTIME_FP8_PREFILL_WARMUP", "0")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_STARTUP_RUNTIME_FP8_RAGGED_PREFILL_WARMUP", "0")
     monkeypatch.setenv("TORCHINFERNO_OPENAI_STARTUP_SCHEDULER_WARMUP", "0")
     monkeypatch.setenv("TORCHINFERNO_OPENAI_WARMUP_RAGGED_DECODE_STARTUP", "1")
     assert _startup_graph_warmup_enabled()
     assert not _startup_online_common_prefix_prefill_warmup_enabled()
     assert not _startup_runtime_fp8_prefill_warmup_enabled()
+    assert not _startup_runtime_fp8_ragged_prefill_warmup_enabled()
     assert _startup_ragged_decode_warmup_enabled()
     assert not _startup_scheduler_warmup_enabled()
 
@@ -8981,6 +8986,123 @@ def test_openai_startup_runtime_fp8_prefill_warmup_toggles_and_restores(monkeypa
         max_seq_len=32,
     )
     assert disabled_model.fp8_calls == []
+
+
+def test_openai_startup_runtime_fp8_ragged_prefill_warmup_captures_policy_graphs(monkeypatch) -> None:
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_FP8_PREFILL", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_FP8_PREFILL", raising=False)
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_WARMUP_ONLINE_COMMON_PREFIX_ROWS", "8")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_STARTUP_RUNTIME_FP8_RAGGED_PREFILL_BATCHES", "2,4")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_STARTUP_RUNTIME_FP8_RAGGED_PREFILL_PREFIX_TOKENS", "5")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_STARTUP_RUNTIME_FP8_RAGGED_PREFILL_SUFFIX_TOKENS", "3")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_STARTUP_RUNTIME_FP8_RAGGED_PREFILL_MIN_M", "128")
+
+    class RuntimeFP8RaggedWarmupCache:
+        def __init__(self, rows: tuple[int, ...] = tuple(range(12))) -> None:
+            self.rows = rows
+            self.seq_len = 0
+            self.reset_count = 0
+
+        def for_rows(self, rows: list[int]) -> "RuntimeFP8RaggedWarmupCache":
+            return RuntimeFP8RaggedWarmupCache(tuple(rows))
+
+        def set_seq_len(self, seq_len: int) -> None:
+            self.seq_len = seq_len
+
+        def reset(self) -> None:
+            self.reset_count += 1
+            self.seq_len = 0
+
+    class RuntimeFP8RaggedWarmupModel:
+        def __init__(self) -> None:
+            self.fp8_calls: list[tuple[bool, int]] = []
+            self.prefix_calls: list[tuple[tuple[int, ...], tuple[int, int], bool]] = []
+            self.ragged_calls: list[tuple[tuple[int, int], int, int, tuple[int, ...]]] = []
+
+        def set_runtime_fp8_prefill(self, enabled: bool, *, min_m: int) -> None:
+            self.fp8_calls.append((enabled, min_m))
+
+        def try_prefill_logits_graph(
+            self,
+            input_ids: torch.Tensor,
+            cache: RuntimeFP8RaggedWarmupCache,
+            *,
+            capture_on_miss: bool = False,
+        ) -> torch.Tensor:
+            self.prefix_calls.append((cache.rows, (input_ids.size(0), input_ids.size(1)), capture_on_miss))
+            return torch.zeros(input_ids.size(0), input_ids.size(1), 1)
+
+        def try_prefill_ragged_logits_graph(
+            self,
+            input_ids: torch.Tensor,
+            cache: RuntimeFP8RaggedWarmupCache,
+            *,
+            seq_lens: torch.Tensor,
+            row_indices: torch.Tensor | None = None,
+            logit_positions: torch.Tensor,
+            context_len: int | None = None,
+            src_prefix_row: torch.Tensor | None = None,
+        ) -> torch.Tensor:
+            del cache, row_indices, logit_positions
+            self.ragged_calls.append(
+                (
+                    (input_ids.size(0), input_ids.size(1)),
+                    int(context_len or 0),
+                    int(src_prefix_row[0].item()) if src_prefix_row is not None else -1,
+                    tuple(int(value) for value in seq_lens.tolist()),
+                )
+            )
+            return torch.zeros(input_ids.size(0), 1, 1)
+
+    original_arange = torch.arange
+    original_zeros = torch.zeros
+    original_full = torch.full
+    original_tensor = torch.tensor
+
+    def cpu_arange(*args, **kwargs) -> torch.Tensor:  # noqa: ANN002, ANN003
+        kwargs.pop("device", None)
+        return original_arange(*args, **kwargs)
+
+    def cpu_zeros(*args, **kwargs) -> torch.Tensor:  # noqa: ANN002, ANN003
+        kwargs.pop("device", None)
+        return original_zeros(*args, **kwargs)
+
+    def cpu_full(*args, **kwargs) -> torch.Tensor:  # noqa: ANN002, ANN003
+        kwargs.pop("device", None)
+        return original_full(*args, **kwargs)
+
+    def cpu_tensor(*args, **kwargs) -> torch.Tensor:  # noqa: ANN002, ANN003
+        kwargs.pop("device", None)
+        return original_tensor(*args, **kwargs)
+
+    monkeypatch.setattr("torchinferno.openai_server.torch.arange", cpu_arange)
+    monkeypatch.setattr("torchinferno.openai_server.torch.zeros", cpu_zeros)
+    monkeypatch.setattr("torchinferno.openai_server.torch.full", cpu_full)
+    monkeypatch.setattr("torchinferno.openai_server.torch.tensor", cpu_tensor)
+
+    model = RuntimeFP8RaggedWarmupModel()
+    cache = RuntimeFP8RaggedWarmupCache()
+    engine = object.__new__(OpenAICompletionEngine)
+    engine.model = model
+    engine.device = torch.device("cuda")
+
+    engine._warmup_tensor_parallel_runtime_fp8_ragged_prefill_graphs(
+        cache,
+        vocab_size=17,
+        cache_rows=12,
+        max_active=8,
+        max_seq_len=64,
+    )
+
+    assert model.prefix_calls == [((8,), (1, 5), True)]
+    assert model.fp8_calls == [(True, 128), (False, 2048)]
+    assert [call[:3] for call in model.ragged_calls] == [
+        ((2, 3), 8, 8),
+        ((4, 3), 8, 8),
+    ]
+    assert model.ragged_calls[0][3][0:3] == (5, 5, 0)
+    assert model.ragged_calls[0][3][8] == 5
+    assert cache.reset_count == 3
 
 
 def test_openai_temperature_queue_batch_wait_uses_default_window(monkeypatch) -> None:

@@ -261,6 +261,20 @@ the sampled FP8 suffix-capture path. Keep suffix warmup opt-in until a
 precision-aware pre-capture path beats the focused control without trading away
 startup or correctness.
 
+Runtime-FP8 ragged prefill graph warmup is the narrower precision-aware version
+of that idea. The current full local all-provider run (`20260627_012328`,
+TorchInferno `14ba05d`) showed the order-dependent tree regression clearly:
+TorchInferno kept few_shot TPOT/E2E wins but tree fell to
+`381.5 / 56.7 / 436.3ms`; the first sampled tree session paid `5` FP8 ragged
+prefill captures (`2.98s` capture time). Adding startup capture for the
+sampled-medium runtime-FP8 ragged suffix buckets raised readiness to `125.6s`
+in a TorchInferno-only `few_shot -> self_consistency -> multi_turn ->
+tree_of_thought` sequence, but tree recovered to `295.6 / 57.3 / 341.6ms` with
+955/992 raw correct and p99 E2E `1.01s`. Queue profiling confirmed the mechanism:
+the first sampled session dropped to `1` FP8 ragged prefill capture (`720ms`) and
+`10` replays. This keeps startup work generic to runtime FP8/suffix graph policy
+while removing most of the request-path cold-capture tail.
+
 ## PUBLIC STARTUP REGRESSION: CHECKPOINT LOAD/BROADCAST VARIABILITY (2026-06-24)
 
 Update `2026-06-25`: public run `20260624_230255` showed the opposite failure

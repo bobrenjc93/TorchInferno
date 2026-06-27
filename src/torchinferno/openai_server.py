@@ -444,6 +444,10 @@ def _startup_runtime_fp8_prefill_warmup_enabled() -> bool:
     return env_flag("TORCHINFERNO_OPENAI_STARTUP_RUNTIME_FP8_PREFILL_WARMUP", True)
 
 
+def _startup_runtime_fp8_ragged_prefill_warmup_enabled() -> bool:
+    return env_flag("TORCHINFERNO_OPENAI_STARTUP_RUNTIME_FP8_RAGGED_PREFILL_WARMUP", True)
+
+
 def _startup_online_common_prefix_prefill_warmup_enabled() -> bool:
     return env_flag("TORCHINFERNO_OPENAI_STARTUP_ONLINE_COMMON_PREFIX_PREFILL_WARMUP", True)
 
@@ -2738,6 +2742,14 @@ class OpenAICompletionEngine:
                     max_active=max_active,
                     max_seq_len=max_seq_len,
                 )
+            if _startup_runtime_fp8_ragged_prefill_warmup_enabled():
+                self._warmup_tensor_parallel_runtime_fp8_ragged_prefill_graphs(
+                    cache,
+                    vocab_size,
+                    cache_rows=cache_batch,
+                    max_active=max_active,
+                    max_seq_len=max_seq_len,
+                )
         if hasattr(self.model, "forward_decode_flashinfer") and _fi_decode_graph_mode() != "off":
             try:
                 import flashinfer  # noqa: F401
@@ -2848,6 +2860,131 @@ class OpenAICompletionEngine:
         except Exception as exc:
             import sys as _fp8sys
             print(f"[WARMUP] runtime FP8 prefill warmup failed: {exc}", file=_fp8sys.stderr, flush=True)
+        finally:
+            _set_tensor_parallel_runtime_fp8_prefill(self.model, enabled=False, min_m=2048)
+            _reset_generation_cache(cache)
+
+    def _warmup_tensor_parallel_runtime_fp8_ragged_prefill_graphs(
+        self,
+        cache: object,
+        vocab_size: int,
+        *,
+        cache_rows: int,
+        max_active: int,
+        max_seq_len: int,
+    ) -> None:
+        if self.device.type != "cuda":
+            return
+        if "TORCHINFERNO_OPENAI_TP_ONLINE_FP8_PREFILL" in os.environ and not env_flag(
+            "TORCHINFERNO_OPENAI_TP_ONLINE_FP8_PREFILL",
+            False,
+        ):
+            return
+        if "TORCHINFERNO_FP8_PREFILL" in os.environ and not env_flag("TORCHINFERNO_FP8_PREFILL", False):
+            return
+        if not hasattr(self.model, "set_runtime_fp8_prefill"):
+            return
+        ragged_prefill_graph = getattr(self.model, "try_prefill_ragged_logits_graph", None)
+        if ragged_prefill_graph is None:
+            return
+        prefix_graph = getattr(self.model, "try_prefill_logits_graph", None)
+        if prefix_graph is None:
+            return
+        prefix_rows = _online_common_prefix_prefill_warmup_rows(cache_rows, max_active)
+        if not prefix_rows:
+            return
+        max_batch = min(max_active, cache_rows)
+        batch_sizes = _parse_positive_int_csv(
+            os.environ.get(
+                "TORCHINFERNO_OPENAI_STARTUP_RUNTIME_FP8_RAGGED_PREFILL_BATCHES",
+                "1,2,4,8,16,32",
+            )
+        )
+        batch_sizes = tuple(batch for batch in batch_sizes if 0 < batch <= max_batch)
+        if not batch_sizes:
+            return
+        prefix_tokens = _parse_positive_int_csv(
+            os.environ.get("TORCHINFERNO_OPENAI_STARTUP_RUNTIME_FP8_RAGGED_PREFILL_PREFIX_TOKENS", "45")
+        )
+        suffix_tokens = _parse_positive_int_csv(
+            os.environ.get("TORCHINFERNO_OPENAI_STARTUP_RUNTIME_FP8_RAGGED_PREFILL_SUFFIX_TOKENS", "16")
+        )
+        prefix_tokens = tuple(token_count for token_count in prefix_tokens if 0 < token_count <= max_seq_len)
+        suffix_tokens = tuple(token_count for token_count in suffix_tokens if 0 < token_count <= max_seq_len)
+        if not prefix_tokens or not suffix_tokens:
+            return
+        min_m = env_int(
+            "TORCHINFERNO_OPENAI_STARTUP_RUNTIME_FP8_RAGGED_PREFILL_MIN_M",
+            _online_fp8_prefill_min_m(temperature=0.7, max_tokens=300),
+            minimum=1,
+        )
+        row = next((candidate for candidate in prefix_rows if candidate >= max(batch_sizes)), None)
+        if row is None:
+            return
+        try:
+            for prefix_count in prefix_tokens:
+                row_cache = cache.for_rows([row]) if hasattr(cache, "for_rows") else cache
+                _reset_generation_cache(cache)
+                _set_generation_cache_seq_len(row_cache, 0)
+                prefix_ids = (
+                    torch.arange(prefix_count, device=self.device, dtype=torch.long)
+                    .remainder(max(1, int(vocab_size)))
+                    .view(1, prefix_count)
+                )
+                with _allow_prefill_graph_capture_for_cache(row_cache):
+                    _try_prefill_logits_graph(
+                        self.model,
+                        prefix_ids,
+                        row_cache,
+                        allow_capture=True,
+                    )
+                _set_generation_cache_seq_len(row_cache, prefix_count)
+                _set_tensor_parallel_runtime_fp8_prefill(self.model, enabled=True, min_m=min_m)
+                for suffix_count in suffix_tokens:
+                    if prefix_count + suffix_count > max_seq_len:
+                        continue
+                    for batch_size in batch_sizes:
+                        suffix_ids = torch.zeros(
+                            batch_size,
+                            suffix_count,
+                            dtype=torch.long,
+                            device=self.device,
+                        )
+                        row_indices = torch.arange(batch_size, dtype=torch.long, device=self.device)
+                        required = max(row, batch_size - 1) + 1
+                        seq_lens = torch.zeros(required, dtype=torch.long, device=self.device)
+                        seq_lens[row_indices] = prefix_count
+                        seq_lens[row] = prefix_count
+                        logit_positions = torch.full(
+                            (batch_size,),
+                            suffix_count - 1,
+                            dtype=torch.long,
+                            device=self.device,
+                        )
+                        src_prefix_row = torch.tensor([row], dtype=torch.long, device=self.device)
+                        try:
+                            ragged_prefill_graph(
+                                suffix_ids,
+                                cache,
+                                seq_lens=seq_lens,
+                                row_indices=row_indices,
+                                logit_positions=logit_positions,
+                                context_len=prefix_count + suffix_count,
+                                src_prefix_row=src_prefix_row,
+                            )
+                        except Exception as exc:
+                            import sys as _fp8raggedsys
+                            print(
+                                f"[WARMUP] runtime FP8 ragged prefill graph "
+                                f"prefix={prefix_count} suffix={suffix_count} "
+                                f"batch={batch_size}: {exc}",
+                                file=_fp8raggedsys.stderr,
+                                flush=True,
+                            )
+                _reset_generation_cache(cache)
+        except Exception as exc:
+            import sys as _fp8raggedsys
+            print(f"[WARMUP] runtime FP8 ragged prefill warmup failed: {exc}", file=_fp8raggedsys.stderr, flush=True)
         finally:
             _set_tensor_parallel_runtime_fp8_prefill(self.model, enabled=False, min_m=2048)
             _reset_generation_cache(cache)
