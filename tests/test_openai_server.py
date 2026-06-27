@@ -94,6 +94,11 @@ from torchinferno.openai_server import (
     _online_common_prefix_suffix_prefill_warmup_enabled,
     _online_common_prefix_suffix_prefill_warmup_batches,
     _online_common_prefix_suffix_prefill_warmup_tokens,
+    _online_greedy_common_prefix_suffix_prefill_warmup_batches,
+    _online_greedy_common_prefix_suffix_prefill_warmup_enabled,
+    _online_greedy_common_prefix_suffix_prefill_warmup_max_tokens,
+    _online_greedy_common_prefix_suffix_prefill_warmup_prefix_tokens,
+    _online_greedy_common_prefix_suffix_prefill_warmup_suffix_tokens,
     _online_admit_per_step_cap,
     _online_collect_idle_arrivals_enabled,
     _online_decode_warmup_batch_sizes,
@@ -9101,6 +9106,11 @@ def test_online_common_prefix_prefill_warmup_filters_shapes(monkeypatch) -> None
     monkeypatch.delenv("TORCHINFERNO_OPENAI_WARMUP_ONLINE_COMMON_PREFIX_ROWS", raising=False)
     monkeypatch.delenv("TORCHINFERNO_OPENAI_WARMUP_ONLINE_COMMON_PREFIX_TOKENS", raising=False)
     monkeypatch.delenv("TORCHINFERNO_OPENAI_WARMUP_ONLINE_COMMON_PREFIX_SUFFIX_PREFILL", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_WARMUP_ONLINE_GREEDY_COMMON_PREFIX_SUFFIX_PREFILL", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_WARMUP_ONLINE_GREEDY_COMMON_PREFIX_MAX_TOKENS", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_WARMUP_ONLINE_GREEDY_COMMON_PREFIX_TOKENS", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_WARMUP_ONLINE_GREEDY_COMMON_PREFIX_SUFFIX_TOKENS", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_WARMUP_ONLINE_GREEDY_COMMON_PREFIX_SUFFIX_BATCHES", raising=False)
     monkeypatch.delenv("TORCHINFERNO_OPENAI_STARTUP_ONLINE_COMMON_PREFIX_PREFILL_ROWS", raising=False)
     monkeypatch.delenv("TORCHINFERNO_OPENAI_STARTUP_ONLINE_COMMON_PREFIX_PREFILL_TOKENS", raising=False)
 
@@ -9123,12 +9133,22 @@ def test_online_common_prefix_prefill_warmup_filters_shapes(monkeypatch) -> None
         32,
         48,
     )
+    assert _online_greedy_common_prefix_suffix_prefill_warmup_enabled()
+    assert _online_greedy_common_prefix_suffix_prefill_warmup_max_tokens() == 512
+    assert _online_greedy_common_prefix_suffix_prefill_warmup_prefix_tokens(64) == (45,)
+    assert _online_greedy_common_prefix_suffix_prefill_warmup_suffix_tokens(128) == (16, 32, 64, 128)
+    assert _online_greedy_common_prefix_suffix_prefill_warmup_batches(64, 48) == (8, 16, 32)
 
     monkeypatch.setenv("TORCHINFERNO_OPENAI_WARMUP_ONLINE_COMMON_PREFIX_ROWS", "53,96,128")
     monkeypatch.setenv("TORCHINFERNO_OPENAI_WARMUP_ONLINE_COMMON_PREFIX_TOKENS", "32,128,256")
     monkeypatch.setenv("TORCHINFERNO_OPENAI_WARMUP_ONLINE_COMMON_PREFIX_SUFFIX_PREFILL", "1")
     monkeypatch.setenv("TORCHINFERNO_OPENAI_WARMUP_ONLINE_COMMON_PREFIX_SUFFIX_TOKENS", "8,16,256")
     monkeypatch.setenv("TORCHINFERNO_OPENAI_WARMUP_ONLINE_COMMON_PREFIX_SUFFIX_BATCHES", "8,48,96")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_WARMUP_ONLINE_GREEDY_COMMON_PREFIX_SUFFIX_PREFILL", "0")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_WARMUP_ONLINE_GREEDY_COMMON_PREFIX_MAX_TOKENS", "256")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_WARMUP_ONLINE_GREEDY_COMMON_PREFIX_TOKENS", "8,256")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_WARMUP_ONLINE_GREEDY_COMMON_PREFIX_SUFFIX_TOKENS", "4,8,256")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_WARMUP_ONLINE_GREEDY_COMMON_PREFIX_SUFFIX_BATCHES", "4,64")
     monkeypatch.setenv("TORCHINFERNO_OPENAI_STARTUP_ONLINE_COMMON_PREFIX_PREFILL_ROWS", "2,64,256")
     monkeypatch.setenv("TORCHINFERNO_OPENAI_STARTUP_ONLINE_COMMON_PREFIX_PREFILL_TOKENS", "32,256")
     assert _online_common_prefix_prefill_warmup_rows(128, 64) == (53, 96)
@@ -9138,6 +9158,11 @@ def test_online_common_prefix_prefill_warmup_filters_shapes(monkeypatch) -> None
     assert _online_common_prefix_suffix_prefill_warmup_enabled()
     assert _online_common_prefix_suffix_prefill_warmup_tokens(128) == (8, 16)
     assert _online_common_prefix_suffix_prefill_warmup_batches(64, 128) == (8, 48)
+    assert not _online_greedy_common_prefix_suffix_prefill_warmup_enabled()
+    assert _online_greedy_common_prefix_suffix_prefill_warmup_max_tokens() == 256
+    assert _online_greedy_common_prefix_suffix_prefill_warmup_prefix_tokens(128) == (8,)
+    assert _online_greedy_common_prefix_suffix_prefill_warmup_suffix_tokens(128) == (4, 8)
+    assert _online_greedy_common_prefix_suffix_prefill_warmup_batches(64, 128) == (4, 64)
 
 
 def test_openai_startup_common_prefix_warmup_installs_persistent_cache(monkeypatch) -> None:
@@ -9219,6 +9244,125 @@ def test_openai_startup_common_prefix_warmup_installs_persistent_cache(monkeypat
     ]
     assert engine._persistent_serving_cache.rows == (0, 1, 2, 3, 4, 5)
     assert not hasattr(engine._persistent_serving_cache, "_skip_capture_sync")
+
+
+def test_openai_greedy_common_prefix_suffix_warmup_captures_target_shapes(monkeypatch) -> None:
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_WARMUP_ONLINE_COMMON_PREFIX_ROWS", "8")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_WARMUP_ONLINE_GREEDY_COMMON_PREFIX_TOKENS", "5")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_WARMUP_ONLINE_GREEDY_COMMON_PREFIX_SUFFIX_TOKENS", "3,7")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_WARMUP_ONLINE_GREEDY_COMMON_PREFIX_SUFFIX_BATCHES", "2,4")
+
+    class GreedyPrefixSuffixWarmupCache:
+        def __init__(self, rows: tuple[int, ...] = tuple(range(12))) -> None:
+            self.rows = rows
+            self.seq_len = 0
+            self.reset_count = 0
+
+        def for_rows(self, rows: list[int]) -> "GreedyPrefixSuffixWarmupCache":
+            view = GreedyPrefixSuffixWarmupCache(tuple(rows))
+            if getattr(self, "_skip_capture_sync", False):
+                view._skip_capture_sync = True
+            return view
+
+        def set_seq_len(self, seq_len: int) -> None:
+            self.seq_len = seq_len
+
+        def reset(self) -> None:
+            self.reset_count += 1
+            self.seq_len = 0
+
+    class GreedyPrefixSuffixWarmupModel:
+        def __init__(self) -> None:
+            self.fp8_calls: list[tuple[bool, int]] = []
+            self.prefix_calls: list[tuple[tuple[int, ...], tuple[int, int], bool]] = []
+            self.ragged_calls: list[tuple[tuple[int, int], int, int, tuple[int, ...]]] = []
+
+        def set_runtime_fp8_prefill(self, enabled: bool, *, min_m: int) -> None:
+            self.fp8_calls.append((enabled, min_m))
+
+        def try_prefill_logits_graph(
+            self,
+            input_ids: torch.Tensor,
+            cache: GreedyPrefixSuffixWarmupCache,
+            *,
+            capture_on_miss: bool = False,
+        ) -> torch.Tensor:
+            self.prefix_calls.append((cache.rows, (input_ids.size(0), input_ids.size(1)), capture_on_miss))
+            return torch.zeros(input_ids.size(0), input_ids.size(1), 1)
+
+        def try_prefill_ragged_logits_graph(
+            self,
+            input_ids: torch.Tensor,
+            cache: GreedyPrefixSuffixWarmupCache,
+            *,
+            seq_lens: torch.Tensor,
+            row_indices: torch.Tensor | None = None,
+            logit_positions: torch.Tensor,
+            context_len: int | None = None,
+            src_prefix_row: torch.Tensor | None = None,
+        ) -> torch.Tensor:
+            del cache, row_indices, logit_positions
+            self.ragged_calls.append(
+                (
+                    (input_ids.size(0), input_ids.size(1)),
+                    int(context_len or 0),
+                    int(src_prefix_row[0].item()) if src_prefix_row is not None else -1,
+                    tuple(int(value) for value in seq_lens.tolist()),
+                )
+            )
+            return torch.zeros(input_ids.size(0), 1, 1)
+
+    original_arange = torch.arange
+    original_zeros = torch.zeros
+    original_full = torch.full
+    original_tensor = torch.tensor
+
+    def cpu_arange(*args, **kwargs) -> torch.Tensor:  # noqa: ANN002, ANN003
+        kwargs.pop("device", None)
+        return original_arange(*args, **kwargs)
+
+    def cpu_zeros(*args, **kwargs) -> torch.Tensor:  # noqa: ANN002, ANN003
+        kwargs.pop("device", None)
+        return original_zeros(*args, **kwargs)
+
+    def cpu_full(*args, **kwargs) -> torch.Tensor:  # noqa: ANN002, ANN003
+        kwargs.pop("device", None)
+        return original_full(*args, **kwargs)
+
+    def cpu_tensor(*args, **kwargs) -> torch.Tensor:  # noqa: ANN002, ANN003
+        kwargs.pop("device", None)
+        return original_tensor(*args, **kwargs)
+
+    monkeypatch.setattr("torchinferno.openai_server.torch.arange", cpu_arange)
+    monkeypatch.setattr("torchinferno.openai_server.torch.zeros", cpu_zeros)
+    monkeypatch.setattr("torchinferno.openai_server.torch.full", cpu_full)
+    monkeypatch.setattr("torchinferno.openai_server.torch.tensor", cpu_tensor)
+
+    model = GreedyPrefixSuffixWarmupModel()
+    cache = GreedyPrefixSuffixWarmupCache()
+    engine = object.__new__(OpenAICompletionEngine)
+    engine.model = model
+    engine.device = torch.device("cuda")
+
+    engine._warmup_online_greedy_common_prefix_suffix_prefill_graphs(
+        cache,
+        vocab_size=17,
+        cache_rows=12,
+        max_active=8,
+        max_seq_len=16,
+    )
+
+    assert model.fp8_calls == [(True, 2048), (False, 2048)]
+    assert model.prefix_calls == [((8,), (1, 5), True)]
+    assert [call[:3] for call in model.ragged_calls] == [
+        ((2, 3), 8, 8),
+        ((4, 3), 8, 8),
+        ((2, 7), 12, 8),
+        ((4, 7), 12, 8),
+    ]
+    assert model.ragged_calls[0][3][0:3] == (5, 5, 0)
+    assert model.ragged_calls[0][3][8] == 5
+    assert cache.reset_count == 3
 
 
 def test_openai_startup_runtime_fp8_prefill_warmup_toggles_and_restores(monkeypatch) -> None:

@@ -828,6 +828,48 @@ def _online_common_prefix_suffix_prefill_warmup_enabled() -> bool:
     return env_flag("TORCHINFERNO_OPENAI_WARMUP_ONLINE_COMMON_PREFIX_SUFFIX_PREFILL", False)
 
 
+def _online_greedy_common_prefix_suffix_prefill_warmup_enabled() -> bool:
+    return env_flag("TORCHINFERNO_OPENAI_WARMUP_ONLINE_GREEDY_COMMON_PREFIX_SUFFIX_PREFILL", True)
+
+
+def _online_greedy_common_prefix_suffix_prefill_warmup_max_tokens() -> int:
+    return env_int("TORCHINFERNO_OPENAI_WARMUP_ONLINE_GREEDY_COMMON_PREFIX_MAX_TOKENS", 512, minimum=1)
+
+
+def _online_greedy_common_prefix_suffix_prefill_warmup_prefix_tokens(max_seq_len: int) -> tuple[int, ...]:
+    if max_seq_len <= 0:
+        return ()
+    tokens = _parse_positive_int_csv(
+        os.environ.get("TORCHINFERNO_OPENAI_WARMUP_ONLINE_GREEDY_COMMON_PREFIX_TOKENS", "45")
+    )
+    return tuple(token_count for token_count in tokens if token_count <= max_seq_len)
+
+
+def _online_greedy_common_prefix_suffix_prefill_warmup_suffix_tokens(max_seq_len: int) -> tuple[int, ...]:
+    if max_seq_len <= 0:
+        return ()
+    tokens = _parse_positive_int_csv(
+        os.environ.get(
+            "TORCHINFERNO_OPENAI_WARMUP_ONLINE_GREEDY_COMMON_PREFIX_SUFFIX_TOKENS",
+            "16,32,64,128,256",
+        )
+    )
+    return tuple(token_count for token_count in tokens if token_count <= max_seq_len)
+
+
+def _online_greedy_common_prefix_suffix_prefill_warmup_batches(
+    cache_rows: int,
+    max_active: int,
+) -> tuple[int, ...]:
+    if cache_rows <= 0 or max_active <= 0:
+        return ()
+    batches = _parse_positive_int_csv(
+        os.environ.get("TORCHINFERNO_OPENAI_WARMUP_ONLINE_GREEDY_COMMON_PREFIX_SUFFIX_BATCHES", "8,16,32")
+    )
+    limit = min(cache_rows, max_active)
+    return tuple(batch for batch in batches if 0 < batch <= limit)
+
+
 @contextmanager
 def _allow_prefill_graph_capture_for_cache(cache: object) -> Iterator[None]:
     sentinel = object()
@@ -2792,6 +2834,23 @@ class OpenAICompletionEngine:
                                             flush=True,
                                         )
                         _reset_generation_cache(cache)
+                greedy_suffix_warmup_max_tokens = (
+                    _online_greedy_common_prefix_suffix_prefill_warmup_max_tokens()
+                )
+                with _tensor_parallel_symm_mem_allreduce_scope(
+                    self.model,
+                    self.device,
+                    max_tokens=greedy_suffix_warmup_max_tokens,
+                    temperature=0.0,
+                ):
+                    self._warmup_online_greedy_common_prefix_suffix_prefill_graphs(
+                        cache,
+                        vocab_size,
+                        cache_rows=cache_batch,
+                        max_active=max_active,
+                        max_seq_len=max_seq_len,
+                        warmup_max_tokens=greedy_suffix_warmup_max_tokens,
+                    )
             prefill_chunk = env_int("TORCHINFERNO_OPENAI_TP_ONLINE_PREFILL_CHUNK", 0, minimum=0)
             if prefill_chunk > 0:
                 ragged_prefill_graph = getattr(self.model, "try_prefill_ragged_logits_graph", None)
@@ -2945,6 +3004,125 @@ class OpenAICompletionEngine:
         except Exception as exc:
             import sys as _fp8sys
             print(f"[WARMUP] runtime FP8 prefill warmup failed: {exc}", file=_fp8sys.stderr, flush=True)
+        finally:
+            _set_tensor_parallel_runtime_fp8_prefill(self.model, enabled=False, min_m=2048)
+            _reset_generation_cache(cache)
+
+    def _warmup_online_greedy_common_prefix_suffix_prefill_graphs(
+        self,
+        cache: object,
+        vocab_size: int,
+        *,
+        cache_rows: int,
+        max_active: int,
+        max_seq_len: int,
+        warmup_max_tokens: int | None = None,
+    ) -> None:
+        if not _online_greedy_common_prefix_suffix_prefill_warmup_enabled():
+            return
+        ragged_prefill_graph = getattr(self.model, "try_prefill_ragged_logits_graph", None)
+        if ragged_prefill_graph is None:
+            return
+        prefix_graph = getattr(self.model, "try_prefill_logits_graph", None)
+        if prefix_graph is None:
+            return
+        prefix_tokens = _online_greedy_common_prefix_suffix_prefill_warmup_prefix_tokens(max_seq_len)
+        suffix_tokens = _online_greedy_common_prefix_suffix_prefill_warmup_suffix_tokens(max_seq_len)
+        batch_sizes = _online_greedy_common_prefix_suffix_prefill_warmup_batches(cache_rows, max_active)
+        if not prefix_tokens or not suffix_tokens or not batch_sizes:
+            return
+        prefix_rows = _online_common_prefix_prefill_warmup_rows(cache_rows, max_active)
+        row = next((candidate for candidate in prefix_rows if candidate >= max(batch_sizes)), None)
+        if row is None and max(batch_sizes) < cache_rows:
+            row = max(batch_sizes)
+        if row is None:
+            return
+        if warmup_max_tokens is None:
+            warmup_max_tokens = _online_greedy_common_prefix_suffix_prefill_warmup_max_tokens()
+        fp8_prefill_enabled = _online_fp8_prefill_enabled(temperature=0.0, max_tokens=warmup_max_tokens)
+        fp8_prefill_min_m = env_int(
+            "TORCHINFERNO_OPENAI_WARMUP_ONLINE_GREEDY_COMMON_PREFIX_FP8_MIN_M",
+            _online_fp8_prefill_min_m(temperature=0.0, max_tokens=warmup_max_tokens),
+            minimum=1,
+        )
+        try:
+            _set_tensor_parallel_runtime_fp8_prefill(
+                self.model,
+                enabled=fp8_prefill_enabled,
+                min_m=fp8_prefill_min_m,
+            )
+            for prefix_count in prefix_tokens:
+                row_cache = cache.for_rows([row]) if hasattr(cache, "for_rows") else cache
+                _reset_generation_cache(cache)
+                _set_generation_cache_seq_len(row_cache, 0)
+                prefix_ids = (
+                    torch.arange(prefix_count, device=self.device, dtype=torch.long)
+                    .remainder(max(1, int(vocab_size)))
+                    .view(1, prefix_count)
+                )
+                try:
+                    with _allow_prefill_graph_capture_for_cache(row_cache):
+                        _try_prefill_logits_graph(
+                            self.model,
+                            prefix_ids,
+                            row_cache,
+                            allow_capture=True,
+                        )
+                    _set_generation_cache_seq_len(row_cache, prefix_count)
+                except Exception as exc:
+                    import sys as _gpsys
+                    print(
+                        f"[WARMUP] greedy common-prefix graph "
+                        f"row={row} tokens={prefix_count}: {exc}",
+                        file=_gpsys.stderr,
+                        flush=True,
+                    )
+                    continue
+                for suffix_count in suffix_tokens:
+                    if prefix_count + suffix_count > max_seq_len:
+                        continue
+                    for batch_size in batch_sizes:
+                        suffix_ids = torch.zeros(
+                            batch_size,
+                            suffix_count,
+                            dtype=torch.long,
+                            device=self.device,
+                        )
+                        row_indices = torch.arange(batch_size, dtype=torch.long, device=self.device)
+                        required = max(row, batch_size - 1) + 1
+                        seq_lens = torch.zeros(required, dtype=torch.long, device=self.device)
+                        seq_lens[row_indices] = prefix_count
+                        seq_lens[row] = prefix_count
+                        logit_positions = torch.full(
+                            (batch_size,),
+                            suffix_count - 1,
+                            dtype=torch.long,
+                            device=self.device,
+                        )
+                        src_prefix_row = torch.tensor([row], dtype=torch.long, device=self.device)
+                        try:
+                            ragged_prefill_graph(
+                                suffix_ids,
+                                cache,
+                                seq_lens=seq_lens,
+                                row_indices=row_indices,
+                                logit_positions=logit_positions,
+                                context_len=prefix_count + suffix_count,
+                                src_prefix_row=src_prefix_row,
+                            )
+                        except Exception as exc:
+                            import sys as _gpsys
+                            print(
+                                f"[WARMUP] greedy common-prefix suffix graph "
+                                f"row={row} prefix={prefix_count} suffix={suffix_count} "
+                                f"batch={batch_size}: {exc}",
+                                file=_gpsys.stderr,
+                                flush=True,
+                            )
+                _reset_generation_cache(cache)
+        except Exception as exc:
+            import sys as _gpsys
+            print(f"[WARMUP] greedy common-prefix suffix warmup failed: {exc}", file=_gpsys.stderr, flush=True)
         finally:
             _set_tensor_parallel_runtime_fp8_prefill(self.model, enabled=False, min_m=2048)
             _reset_generation_cache(cache)

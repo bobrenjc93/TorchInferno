@@ -68,6 +68,29 @@ confirmation landed at `227.2 / 48.6 / 273.8ms` with p99 E2E down to `1.67s`.
 This removes a startup-warmup bug, but it does not close the vLLM tree gap;
 remaining tree work is still sampled prefill/session scheduling.
 
+A fresh same-host all-provider comparison after `4896405` moves the active
+gap from stale public `019ce7b` numbers to current local behavior. TorchInferno
+now scores `1/20` metric wins against vLLM `14/20` and SGLang `4/20`. The
+largest median gaps are still multi_turn (`371.9 / 60.1 / 441.2ms` vs vLLM
+`169.2 / 55.0 / 226.4ms`) and tree (`253.0 / 48.0 / 292.4ms` vs vLLM
+`63.7 / 31.7 / 87.2ms`). Multi_turn profiling showed one long greedy online
+session with `7` request-path shared-prefix suffix CUDA graph captures totaling
+`5.16s`; the shapes were the deterministic `p45` suffix buckets used by the
+8-turn calculator prompts. Those graphs were not covered by the sampled FP8
+warmup, and generic common-prefix suffix warmup remains too broad for default
+startup.
+
+The multi_turn startup path now captures only the measured greedy common-prefix
+suffix buckets (`p45`, suffix `16/32/64/128/256`, batches `8/16/32`) under the
+same runtime symmetric-memory allreduce scope and greedy FP8 prefill policy used
+by the online session. The mechanism is confirmed in queue profiles:
+request-path prefill captures dropped from `7` / `5.16s` to `0` / `0.0s`, and
+prefill wall dropped from `9.58s` to `5.42s`. Startup ready time increases from
+about `105.5s` to `115.5s`, but benchmark request latency improves materially
+in the tail: profiled multi_turn p99 TTFT moved `4.70s -> 2.68s`, and a
+no-profile confirmation landed at `381.1 / 62.5 / 455.5ms` with p99 TTFT
+`2.69s`, first-turn average `1.19s`, and 100% benchmark-level correctness.
+
 ## Latest public refresh and greedy-mid idle retention (2026-06-26)
 
 Public run `20260626_181444` was the fair same-host comparison before the
