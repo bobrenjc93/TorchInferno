@@ -363,6 +363,20 @@ and completed all rows in the expected runtime band: few_shot
 multi_turn `467.4 / 72.5 / 548.3ms`, tree_of_thought
 `287.1 / 55.9 / 336.1ms`, and long_output `326.9 / 27.4 / 1361.2ms`.
 
+Public runs from `20260627_010324` through `20260627_130258` invalidated that
+hybrid default on the CUDA 13.2 submit hosts. TorchInferno repeatedly printed
+`rank0_broadcast=0 rank0_replicated_broadcast=1 rank0_shard_scatter=1`, spent
+`487-603s` just loading the initial embedding/norm/head tensors, and never
+reached the first `loaded 10/80 layers` progress line before the 1800s
+readiness timeout. Same-host local validation still loads this path quickly, so
+the issue is environment-sensitive NCCL collective throughput during startup,
+not model correctness. The portable per-rank checkpoint reader is now the
+default again for both replicated tensors and sharded tensors. Rank-0 replicated
+broadcast and shard scatter remain available through explicit
+`TORCHINFERNO_TP_RANK0_REPLICATED_CHECKPOINT_BROADCAST=1` and
+`TORCHINFERNO_TP_RANK0_CHECKPOINT_SHARD_SCATTER=1` opt-ins when a host is known
+to handle those large collectives.
+
 Public run `20260624_185427` supersedes the later-sorting stale
 `20260624_183253` failure. It used TorchInferno `76107de`, vLLM `1cd3e0e`,
 and SGLang `4a4f063`; all providers completed all five benchmarks. Scorecard

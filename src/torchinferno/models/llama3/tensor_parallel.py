@@ -5609,7 +5609,11 @@ def _rank0_replicated_checkpoint_broadcast_enabled(
             return True
     if "TORCHINFERNO_TP_RANK0_REPLICATED_CHECKPOINT_BROADCAST" in os.environ:
         return _tp_flag("TORCHINFERNO_TP_RANK0_REPLICATED_CHECKPOINT_BROADCAST", True)
-    return True
+    # Public CUDA 13 benchmark hosts have repeatedly made large startup NCCL
+    # checkpoint collectives much slower than direct per-rank safetensor reads.
+    # Keep the portable path as the default; operators can still opt in where
+    # rank-0 loading is known to be healthy.
+    return False
 
 
 def _rank0_checkpoint_shard_scatter_enabled(
@@ -5630,7 +5634,7 @@ def _rank0_checkpoint_shard_scatter_enabled(
             world_size=world_size,
             dtype=dtype,
         )
-    return _tp_flag("TORCHINFERNO_TP_RANK0_CHECKPOINT_SHARD_SCATTER", True)
+    return _tp_flag("TORCHINFERNO_TP_RANK0_CHECKPOINT_SHARD_SCATTER", False)
 
 
 def _rank0_checkpoint_scatter_enabled() -> bool:
