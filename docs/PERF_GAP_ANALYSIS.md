@@ -2319,6 +2319,16 @@ Two more decode-shape knobs are not defaultable:
   TTFT / `28.5ms` TPOT / `1496.3ms` E2E and raised readback/prepare time. Keep
   uniform ragged disabled for long_output too.
 
+Long-output refresh on current `fff4c37` keeps the same shape. Focused profiled
+long_output landed at `345.3 / 27.8 / 1529.8ms`, 1000/1000 correct. The last
+queue-profile record ended at `11.61s` prefill wall (`10.74s` forward), `744`
+decode model calls for `44.65K` bucketed decode tokens, `14.56s` decode GPU
+event time, and `7.48s` in the token-harvest/synchronization bucket. Max model
+batch stayed at `64` with most ragged decode shapes padded into the `64` bucket.
+This does not reopen the rejected decode-many, exact-row decode, or refill-floor
+knobs; the next long-output lever still has to reduce decode GPU work or overlap
+streaming token harvest with model execution.
+
 Scoped common-prefix ragged suffix threshold (2026-06-21, current `27b8381` +
 patch): raising
 `TORCHINFERNO_CONTINUOUS_COMMON_PREFIX_RAGGED_SUFFIX_MAX_PREFIX_TOKENS=128`
