@@ -3320,6 +3320,36 @@ Long-output greedy-short wait refresh (2026-06-21, current `0ec0ce5`): raising
 TTFT/TPOT to `355.2ms` / `28.9ms`. Keep greedy-short long_output on the 1ms
 default.
 
+Post-startup long_output refresh (2026-06-27, current `cc7e4e9`): after
+switching TP checkpoint loading back to per-rank reads, local TorchInferno
+server startup reached readiness in `~110s` and long_output completed 1000/1000
+correct. Same-host vLLM/SGLang comparison still shows a TTFT/E2E gap:
+TorchInferno `316.8ms` TTFT / `23.2ms` TPOT / `1317.6ms` E2E, vLLM
+`65.6ms` / `16.9ms` / `675.0ms`, SGLang `62.2ms` / `24.3ms` / `937.1ms`.
+Queue profiling points at online prefill graph capture plus decode admission:
+`~10.1s` prefill wall with `8` ragged-prefix graph captures and `~9.4s`
+decode active. Rejected follow-ups:
+- Raising greedy-short initial wait to 50ms filled the first batch
+  (`initial_batch_size=37`) but did not improve score-facing latency:
+  `317.0ms` TTFT / `22.8ms` TPOT / `1317.2ms` E2E.
+- Disabling graph prefill was catastrophic: by an interrupted partial run,
+  prefill wall was already `~89s`.
+- Disabling capture-on-miss for common-prefix ragged prefill removed capture
+  time but regressed eager prefill: `464.4ms` TTFT / `29.2ms` TPOT /
+  `1775.8ms` E2E.
+- Deferring capture until a shape had five observations cut captures from `8`
+  to `4`, but prefill wall still grew to `~11.7s`; reject shape-deferral
+  capture policy.
+
+Greedy-short decode quantum refresh (2026-06-27): for decode-many-enabled
+short greedy traffic, quantum `8` improved TPOT but over-held the decode loop and
+regressed TTFT/E2E. Quantum `2` improved TTFT but raised decode sync overhead.
+Quantum `3` is the best tested balance: long_output recheck landed at
+`263.2ms` TTFT / `24.4ms` TPOT / `1206.8ms` E2E, and a full TorchInferno-only
+run with the same env had long_output `238.0ms` / `24.9ms` / `1180.6ms` with
+1000/1000 correctness. Make `3` the greedy-short decode-many default while
+keeping env overrides for score/throughput tradeoffs.
+
 ## In-flight, validated-locally-but-NOT-benchmarked commits
 
 The inference-bench harness has been frozen on `25260c0` for many hours, so these
