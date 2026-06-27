@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import os
 import time
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import timedelta
@@ -66,6 +66,43 @@ def _tp_int(name: str, default: int, *, minimum: int | None = None) -> int:
 
 def _tp_env_set(name: str) -> bool:
     return name in os.environ
+
+
+def _ragged_prefill_precision_graph_key(
+    token_count: int,
+    *,
+    is_cuda: bool,
+    layers: Sequence[object],
+) -> tuple[bool, ...]:
+    if not is_cuda:
+        return (False,)
+    env_configured = _tp_env_set("TORCHINFERNO_FP8_PREFILL")
+    env_enabled = _tp_flag("TORCHINFERNO_FP8_PREFILL", False) if env_configured else False
+    if env_configured and not env_enabled:
+        return (False,)
+    env_min_m = (
+        _tp_int("TORCHINFERNO_FP8_PREFILL_MIN_M", 256, minimum=1)
+        if _tp_env_set("TORCHINFERNO_FP8_PREFILL_MIN_M")
+        else None
+    )
+    layer_modes: list[bool] = []
+    for layer in layers:
+        runtime_enabled = bool(getattr(layer, "_runtime_fp8_prefill_enabled", False))
+        if not env_enabled and not runtime_enabled:
+            layer_modes.append(False)
+            continue
+        if env_min_m is not None:
+            min_m = env_min_m
+        elif runtime_enabled and not env_enabled:
+            min_m = int(getattr(layer, "_runtime_fp8_prefill_min_m", 2048))
+        else:
+            min_m = 256
+        layer_modes.append(token_count > max(1, min_m))
+    if not layer_modes or not any(layer_modes):
+        return (False,)
+    if all(layer_modes):
+        return (True,)
+    return tuple(layer_modes)
 
 
 def _capture_needed_on_any_rank(needs_capture: bool, device: torch.device) -> bool:
@@ -2633,7 +2670,7 @@ class Llama3TensorParallelForCausalLM:
         self._ragged_decode_graph_failed = False
         self._ragged_decode_logits_graph_failed = False
         self._ragged_prefill_logits_graphs: dict[
-            tuple[int, int, int, int, bool, int],
+            tuple[int, int, int, int, bool, int, int, tuple[bool, ...], int],
             _StaticRaggedPrefillLogitsGraphCall,
         ] = {}
         self._ragged_prefill_logits_graph_failed = False
@@ -5035,6 +5072,11 @@ class Llama3TensorParallelForCausalLM:
         if not cache.layers:
             raise ValueError("ragged prefill requires a non-empty KV cache")
         src_prefix_rows = int(src_prefix_row.numel()) if src_prefix_row is not None else 0
+        precision_key = _ragged_prefill_precision_graph_key(
+            input_ids.numel(),
+            is_cuda=input_ids.is_cuda,
+            layers=self.layers,
+        )
         key = (
             id(cache),
             input_ids.size(0),
@@ -5043,6 +5085,7 @@ class Llama3TensorParallelForCausalLM:
             row_indices is not None,
             context_len if context_len is not None else -1,
             src_prefix_rows,
+            precision_key,
             _symm_mem_allreduce_graph_key(input_ids.size(0), _model_world_size(self)),
         )
         captured = self._ragged_prefill_logits_graphs.get(key)

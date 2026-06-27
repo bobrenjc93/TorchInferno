@@ -32,6 +32,7 @@ from torchinferno.models.llama3.pipeline import (
 from torchinferno.models.llama3.tensor_parallel import (
     Llama3TensorParallelLayerKVCache,
     _apply_rotary_cached as _tp_apply_rotary,
+    _ragged_prefill_precision_graph_key,
 )
 from torchinferno.models.catalog import get_model_family, list_model_families
 from torchinferno.models.variants import (
@@ -582,6 +583,44 @@ def test_llama3_tensor_parallel_prefill_logits_graph_replays_bucketed_real_last_
         )
 
     torch.testing.assert_close(actual, expected, atol=5e-4, rtol=5e-4)
+
+
+class _RuntimeFp8PrefillLayer:
+    def __init__(self, enabled: bool, min_m: int = 2048) -> None:
+        self._runtime_fp8_prefill_enabled = enabled
+        self._runtime_fp8_prefill_min_m = min_m
+
+
+def test_ragged_prefill_precision_graph_key_tracks_runtime_fp8_policy(monkeypatch) -> None:
+    monkeypatch.delenv("TORCHINFERNO_FP8_PREFILL", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_FP8_PREFILL_MIN_M", raising=False)
+    layers = [_RuntimeFp8PrefillLayer(False), _RuntimeFp8PrefillLayer(False)]
+
+    assert _ragged_prefill_precision_graph_key(1024, is_cuda=True, layers=layers) == (False,)
+
+    for layer in layers:
+        layer._runtime_fp8_prefill_enabled = True
+        layer._runtime_fp8_prefill_min_m = 256
+    assert _ragged_prefill_precision_graph_key(1024, is_cuda=True, layers=layers) == (True,)
+    assert _ragged_prefill_precision_graph_key(128, is_cuda=True, layers=layers) == (False,)
+    assert _ragged_prefill_precision_graph_key(1024, is_cuda=False, layers=layers) == (False,)
+
+    layers[1]._runtime_fp8_prefill_enabled = False
+    assert _ragged_prefill_precision_graph_key(1024, is_cuda=True, layers=layers) == (True, False)
+
+    monkeypatch.setenv("TORCHINFERNO_FP8_PREFILL", "0")
+    assert _ragged_prefill_precision_graph_key(1024, is_cuda=True, layers=layers) == (False,)
+
+
+def test_ragged_prefill_precision_graph_key_tracks_global_fp8_env(monkeypatch) -> None:
+    monkeypatch.setenv("TORCHINFERNO_FP8_PREFILL", "1")
+    monkeypatch.delenv("TORCHINFERNO_FP8_PREFILL_MIN_M", raising=False)
+    layers = [_RuntimeFp8PrefillLayer(False), _RuntimeFp8PrefillLayer(False)]
+
+    assert _ragged_prefill_precision_graph_key(512, is_cuda=True, layers=layers) == (True,)
+
+    monkeypatch.setenv("TORCHINFERNO_FP8_PREFILL_MIN_M", "1024")
+    assert _ragged_prefill_precision_graph_key(512, is_cuda=True, layers=layers) == (False,)
 
 
 def test_llama3_tensor_parallel_temperature_sampling_uses_gumbel_max(monkeypatch) -> None:

@@ -237,6 +237,20 @@ alone took `5.80s`, mostly in the first three sampled sessions; later replay-onl
 sessions had much lower prefill wall. The next tree lever is therefore shape
 pre-capture/pipeline cost, not another admission wait.
 
+A follow-up graph-cache fix adds the effective ragged prefill precision mode to
+the CUDA graph key. Without it, a graph captured for greedy-large runtime FP8
+policy (`min_m=2048`, BF16 for small suffix shapes) could be replayed by
+sampled-medium policy (`min_m=256`, FP8 for those same shapes), or vice versa.
+This is a normal runtime-policy key, not benchmark-shape detection. A local
+`multi_turn -> tree_of_thought` validation with the fix landed multi_turn at
+`448.9 / 69.8 / 532.8ms` and tree at `287.6 / 58.4 / 334.2ms`, improving the
+public full-suite tree row while preserving correctness (962/992 raw tree
+correct). Queue profiling confirmed sampled tree (`fp8_prefill_min_m=256`)
+captured its own first-wave graphs after multi_turn (`4` captures, `2.63s`
+capture time in the first sampled session) instead of reusing prior
+greedy-large captures. The remaining first-wave cost is still cold capture and
+prefill pipeline work.
+
 ## PUBLIC STARTUP REGRESSION: CHECKPOINT LOAD/BROADCAST VARIABILITY (2026-06-24)
 
 Update `2026-06-25`: public run `20260624_230255` showed the opposite failure
