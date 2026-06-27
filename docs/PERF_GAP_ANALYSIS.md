@@ -227,7 +227,9 @@ decode GPU time. The first sampled 256-request session was still the outlier
 a later 256-request session was much cheaper (`1.71s` phase, `0.76s` prefill
 wall). This keeps tree in the known sampled-medium prefill/cold-capture bucket;
 do not reopen the rejected sampled-medium wait, idle, row-cap, suffix-warmup, or
-capture-on-miss knobs without a different prefill pipeline mechanism.
+capture-on-miss knobs without a different prefill pipeline mechanism. Follow-up
+instrumentation now separates ragged prefill graph captures from graph replays
+in queue profiles, so future "graph hit" counts will not hide cold-capture cost.
 
 ## PUBLIC STARTUP REGRESSION: CHECKPOINT LOAD/BROADCAST VARIABILITY (2026-06-24)
 

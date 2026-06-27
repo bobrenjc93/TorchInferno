@@ -11558,6 +11558,10 @@ def test_openai_queue_profile_records_runtime_engine_stats(
         ragged_decode_tokens = 29
         decode_graph_hits = 3
         decode_graph_misses = 1
+        prefill_graph_captures = 1
+        prefill_graph_replays = 2
+        prefill_graph_capture_ms = 9.5
+        prefill_graph_replay_ms = 1.25
         prefix_reuse_requests = 7
         prefix_reuse_tokens = 53
         queued_requests = 11
@@ -11595,6 +11599,10 @@ def test_openai_queue_profile_records_runtime_engine_stats(
             "runtime_max_model_batch_size": 8,
             "runtime_persistent_cache_rows": 12,
             "runtime_prefill_batches": 2,
+            "runtime_prefill_graph_capture_ms": 9.5,
+            "runtime_prefill_graph_captures": 1,
+            "runtime_prefill_graph_replay_ms": 1.25,
+            "runtime_prefill_graph_replays": 2,
             "runtime_prefill_model_calls": 2,
             "runtime_prefill_shape_counts": {
                 "prefix_graph:b8:s16:p45-45:src1:mixed0": 3,

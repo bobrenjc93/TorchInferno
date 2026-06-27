@@ -4993,6 +4993,7 @@ class Llama3TensorParallelForCausalLM:
         src_prefix_row: Tensor | None = None,
         capture_on_miss: bool = True,
     ) -> Tensor | None:
+        self._last_ragged_prefill_graph_captured = False
         if self._ragged_prefill_logits_graph_failed or not _should_use_ragged_prefill_logits_graph(
             input_ids,
             cache,
@@ -5081,6 +5082,7 @@ class Llama3TensorParallelForCausalLM:
                 self._ragged_prefill_logits_graphs.clear()
             self._ragged_prefill_logits_graphs[key] = new_captured
             captured = new_captured
+            self._last_ragged_prefill_graph_captured = True
         else:
             self._copy_ragged_prefill_graph_inputs(
                 captured, input_ids, seq_lens, row_indices, logit_positions, src_prefix_row

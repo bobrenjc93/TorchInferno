@@ -330,6 +330,39 @@ class _SelectedRaggedGraphMissToyModel(_SelectedLogitsToyModel):
         return self._ragged_prefill_compute(input_ids, logit_positions)
 
 
+class _CaptureReportingSelectedLogitsToyModel(_SelectedLogitsToyModel):
+    def __init__(self, capture_reports: list[bool], vocab_size: int = 64) -> None:
+        super().__init__(vocab_size)
+        self.capture_reports = list(capture_reports)
+
+    def try_prefill_ragged_logits_graph(
+        self,
+        input_ids,
+        cache,
+        *,
+        seq_lens,
+        row_indices,
+        logit_positions,
+        context_len=None,
+        src_prefix_row=None,
+        capture_on_miss=True,
+    ):
+        logits = super().try_prefill_ragged_logits_graph(
+            input_ids,
+            cache,
+            seq_lens=seq_lens,
+            row_indices=row_indices,
+            logit_positions=logit_positions,
+            context_len=context_len,
+            src_prefix_row=src_prefix_row,
+            capture_on_miss=capture_on_miss,
+        )
+        self._last_ragged_prefill_graph_captured = (
+            self.capture_reports.pop(0) if self.capture_reports else False
+        )
+        return logits
+
+
 class _PromptLookupToyModel(_RaggedGraphToyModel):
     def __init__(self, vocab_size: int = 128) -> None:
         super().__init__(vocab_size)
@@ -1132,6 +1165,42 @@ def test_continuous_batch_engine_graphs_initial_common_prefix_suffixes() -> None
     assert engine.stats.prefix_reuse_tokens == 48
     common_route = ("common_prefix", shared)
     assert engine.reusable_prefixes[common_route].logits is None
+
+
+def test_continuous_batch_engine_counts_ragged_prefill_captures() -> None:
+    model = _CaptureReportingSelectedLogitsToyModel([True, False])
+    engine = ContinuousBatchEngine(
+        model,
+        device=torch.device("cpu"),
+        max_active_requests=2,
+        prefix_cache_capacity=0,
+        profile_timings=True,
+    )
+    engine.start_online(max_seq_len=8)
+    input_ids = torch.tensor([[1, 2], [3, 4]], dtype=torch.long)
+    seq_lens = torch.zeros(2, dtype=torch.long)
+    row_indices = torch.tensor([0, 1], dtype=torch.long)
+    logit_positions = torch.tensor([1, 1], dtype=torch.long)
+
+    engine._try_ragged_prefill_logits(
+        input_ids,
+        seq_lens,
+        row_indices,
+        logit_positions,
+    )
+    engine._try_ragged_prefill_logits(
+        input_ids,
+        seq_lens,
+        row_indices,
+        logit_positions,
+    )
+
+    assert engine.stats.prefill_graph_hits == 2
+    assert engine.stats.prefill_graph_misses == 0
+    assert engine.stats.prefill_graph_captures == 1
+    assert engine.stats.prefill_graph_replays == 1
+    assert engine.stats.prefill_graph_capture_ms >= 0.0
+    assert engine.stats.prefill_graph_replay_ms >= 0.0
 
 
 def test_continuous_batch_engine_keeps_common_prefix_logits_for_exact_prompt() -> None:

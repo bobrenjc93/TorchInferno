@@ -121,9 +121,13 @@ class ServingStats:
     prefill_padded_suffix_batches: int = 0
     prefill_graph_hits: int = 0
     prefill_graph_misses: int = 0
+    prefill_graph_captures: int = 0
+    prefill_graph_replays: int = 0
     prefill_wall_ms: float = 0.0
     prefill_copy_ms: float = 0.0
     prefill_forward_ms: float = 0.0
+    prefill_graph_capture_ms: float = 0.0
+    prefill_graph_replay_ms: float = 0.0
     prefill_setup_ms: float = 0.0
     prefill_sample_ms: float = 0.0
     prefill_state_ms: float = 0.0
@@ -1778,6 +1782,7 @@ class ContinuousBatchEngine:
         graph = getattr(self.model, "try_prefill_ragged_logits_graph", None)
         if graph is None:
             return None
+        graph_start_s = time.perf_counter() if self.profile_timings else 0.0
         logits = graph(
             input_ids,
             self._require_cache(),
@@ -1792,6 +1797,15 @@ class ContinuousBatchEngine:
             self.stats.prefill_graph_misses += 1
             return None
         self.stats.prefill_graph_hits += 1
+        captured = getattr(self.model, "_last_ragged_prefill_graph_captured", None)
+        if isinstance(captured, bool):
+            elapsed_ms = (time.perf_counter() - graph_start_s) * 1000.0 if self.profile_timings else 0.0
+            if captured:
+                self.stats.prefill_graph_captures += 1
+                self.stats.prefill_graph_capture_ms += elapsed_ms
+            else:
+                self.stats.prefill_graph_replays += 1
+                self.stats.prefill_graph_replay_ms += elapsed_ms
         return logits
 
     def _ragged_prefill_logits_eager(
