@@ -186,6 +186,19 @@ without profiling landed at `438.1 / 68.5 / 512.2ms`. Do not tune runtime policy
 against the single public multi_turn spike until a repeat full all-provider run
 or a provider-cleanup artifact makes it reproducible.
 
+The next full same-host refresh is inference-bench `508927d6`, run
+`20260627_000710`, against TorchInferno `89bb0d3` (docs-only relative to the
+runtime). It confirms the multi_turn spike was not stable: the row improved from
+`593.2 / 66.1 / 647.3ms` to `502.5 / 66.2 / 552.6ms`, still far behind vLLM/SGLang
+on TTFT and E2E. TorchInferno wins are back to two cells: few_shot TPOT
+(`54.6ms`) and self_consistency TTFT (`164.3ms`). Other TorchInferno rows were
+few_shot `162.9 / 54.6 / 211.5ms`, self_consistency `164.3 / 0.0 / 339.6ms`,
+tree_of_thought `318.1 / 57.3 / 362.4ms`, and long_output
+`306.9 / 27.4 / 1406.6ms`. Treat this as a cleaner baseline for the next gap:
+multi_turn remains persistent-prefix/prefill scheduling bound, tree remains
+sampled-medium prefill/session bound, and long_output remains decode/readback
+bound.
+
 A current long_output profile on `738bef5` landed at
 `290.9 / 28.0 / 1435.2ms`, with `11.95s` prefill wall, `15.37s` decode GPU
 event time, and `7.03s` CPU token readback across `763` decode batches. Raising
