@@ -108,7 +108,10 @@ Raising TorchInferno's fast HTTP worker pool is also rejected for this path.
 `TORCHINFERNO_OPENAI_HTTP_WORKERS=512` improved focused TTFT to `198.1ms` but
 left E2E at `381.2ms`, and `1024` workers regressed to
 `422.7 / 0.0 / 469.9ms`. The remaining self-consistency work is not solved by
-more handler threads.
+more handler threads. A follow-up four-acceptor fast-HTTP prototype is rejected
+too: the focused self row regressed to `413.6 / 0.0 / 436.2ms`, fragmented into
+`285` submit batches, and left server-side p50 first-content at `18.8ms`, so
+parallel accept did not address the benchmark-client admission delay.
 
 A focused multi_turn profile on the same stack reproduced the public gap at
 `437.1 / 72.2 / 512.3ms`, with HTTP first-content p50 `351.3ms` and runtime
