@@ -1,5 +1,49 @@
 # TorchInferno vs vLLM/sglang — Performance Gap Analysis (Llama-3.1-70B, 8xH100)
 
+## Latest public refresh and streaming send batching (2026-06-27)
+
+The latest public result while profiling this loop is still
+`20260627_190305`, so it predates the current TorchInferno head. It used
+TorchInferno `019ce7b`, vLLM `35e3850`, and SGLang `592f6c8`; scorecard wins
+were vLLM `17/20`, TorchInferno `1/20`, and SGLang `1/20`. TorchInferno rows
+were few_shot `253.7 / 47.5 / 299.6ms`, self_consistency
+`273.3 / 0.0 / 293.2ms`, multi_turn `492.2 / 59.7 / 544.7ms`,
+tree_of_thought `268.8 / 42.9 / 309.5ms`, and long_output
+`325.9 / 21.3 / 1130.4ms` (TTFT/TPOT/E2E). The run does not include the later
+BPE-cleanup suppression or sampled tensor-parallel shared-memory command
+transport.
+
+Focused local long_output profiling on current `ccb13de` kept the gap
+decode/readback bound: `25.39s` queue phase time, `9.61s` prefill wall,
+`4.51s` prefill graph capture, `12.43s` ragged-decode GPU event time, and
+`7.17s` CPU token readback across `725` ragged decode batches. Forcing greedy
+short decode quantum `4` is still rejected on this code: TPOT improved slightly
+to `22.9ms`, but TTFT/E2E regressed to `279.4 / 1304.4ms` versus the nearby
+default at `254.8 / 1149.2ms`. Keep the short greedy decode-many quantum at
+`3`.
+
+Fast-HTTP profiling showed an independent host-side cost: the server wrote one
+socket frame per content token even when the online scheduler had already
+produced a small decode-many burst for that request. Streaming now keeps one
+OpenAI content delta per generated token, but `OpenAICompletionEngine` exposes a
+batched token iterator so the fast HTTP path can pack multiple already-ready
+SSE events into one `sendall`. This preserves the benchmark's chunk/token
+accounting. In a focused long_output A/B, summed content-send time dropped from
+`26.35s` to `20.70s` across request threads while keeping `36,715` content
+chunks, and queue phase time dropped from `25.39s` to `24.07s`. Full
+TorchInferno-only validation with the patch completed all rows at few_shot
+`146.5 / 47.4 / 188.9ms`, self_consistency `289.0 / 0.0 / 324.8ms`,
+multi_turn `363.8 / 59.6 / 430.2ms`, tree_of_thought
+`217.1 / 47.4 / 263.9ms`, and long_output `262.7 / 24.5 / 1215.8ms`, all with
+100% benchmark-level correctness.
+
+A decode-many GPU staging-buffer rewrite is rejected. Replacing the existing
+per-step token clones plus final `torch.cat(...).cpu()` with a reusable flat GPU
+token buffer increased long_output CPU-token readback from `6.78s` to `7.44s`
+and queue phase time from `24.07s` to `26.45s`. The current clone/cat path is
+therefore the better default until CPU readback can be overlapped or removed by
+a different event-delivery design.
+
 ## Latest public refresh and greedy-mid idle retention (2026-06-26)
 
 Public run `20260626_181444` was the fair same-host comparison before the

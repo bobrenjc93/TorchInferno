@@ -394,6 +394,10 @@ def _online_decode_many_allow_stop_enabled(*, temperature: float, max_tokens: in
     return env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_DECODE_MANY_ALLOW_STOP", True)
 
 
+def _stream_token_batch_max() -> int:
+    return env_int("TORCHINFERNO_OPENAI_STREAM_TOKEN_BATCH_MAX", 8, minimum=1)
+
+
 def _online_generated_prefix_cache_enabled(*, temperature: float, max_tokens: int) -> bool | None:
     if (
         "TORCHINFERNO_CONTINUOUS_GENERATED_PREFIX_CACHE" in os.environ
@@ -2329,6 +2333,21 @@ class OpenAICompletionEngine:
         max_tokens: int,
         temperature: float,
     ) -> Iterator[int]:
+        for batch in self.generate_chat_token_batches(
+            messages,
+            max_tokens=max_tokens,
+            temperature=temperature,
+        ):
+            for token in batch:
+                yield token
+
+    def generate_chat_token_batches(
+        self,
+        messages: list[dict[str, object]],
+        *,
+        max_tokens: int,
+        temperature: float,
+    ) -> Iterator[list[int]]:
         phase = self._new_phase_record()
         self._enter_live_request()
         try:
@@ -2338,17 +2357,22 @@ class OpenAICompletionEngine:
             if self._try_acquire_single_request_model(temperature=temperature):
                 try:
                     self._mark_phase(phase, "acquired_model")
-                    yield from self._generate_prompt_tokens_with_phase(
+                    for token in self._generate_prompt_tokens_with_phase(
                         prompt,
                         max_tokens=max_tokens,
                         temperature=temperature,
                         phase=phase,
-                    )
+                    ):
+                        yield [int(token)]
                 finally:
                     self._model_lock.release()
             else:
                 self._mark_phase(phase, "queued_generation")
-                yield from self._submit_generation(prompt, max_tokens=max_tokens, temperature=temperature)
+                yield from self._submit_generation_batches(
+                    prompt,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                )
         finally:
             self._exit_live_request()
 
@@ -2410,6 +2434,17 @@ class OpenAICompletionEngine:
         return cache
 
     def _submit_generation(self, prompt: list[int], *, max_tokens: int, temperature: float) -> Iterator[int]:
+        for batch in self._submit_generation_batches(prompt, max_tokens=max_tokens, temperature=temperature):
+            for token in batch:
+                yield token
+
+    def _submit_generation_batches(
+        self,
+        prompt: list[int],
+        *,
+        max_tokens: int,
+        temperature: float,
+    ) -> Iterator[list[int]]:
         if self._closed:
             raise RuntimeError("OpenAI completion engine is closed")
         responses: "queue.SimpleQueue[object]" = queue.SimpleQueue()
@@ -2427,13 +2462,32 @@ class OpenAICompletionEngine:
                 queue_sequence=queue_sequence,
             )
         )
+        max_batch = _stream_token_batch_max()
         while True:
             item = responses.get()
             if isinstance(item, _GenerationDone):
                 break
             if isinstance(item, BaseException):
                 raise item
-            yield int(item)
+            batch = [int(item)]
+            terminal: object | None = None
+            while len(batch) < max_batch:
+                try:
+                    next_item = responses.get_nowait()
+                except queue.Empty:
+                    break
+                if isinstance(next_item, _GenerationDone):
+                    terminal = next_item
+                    break
+                if isinstance(next_item, BaseException):
+                    terminal = next_item
+                    break
+                batch.append(int(next_item))
+            yield batch
+            if isinstance(terminal, _GenerationDone):
+                break
+            if isinstance(terminal, BaseException):
+                raise terminal
 
     def _submit_completion(self, prompt: list[int], *, max_tokens: int, temperature: float) -> list[int]:
         if self._closed:

@@ -8,6 +8,7 @@ import sys
 import threading
 import time
 import uuid
+from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
 from http import HTTPStatus
@@ -547,6 +548,7 @@ def _stream_fast_chat(
     client_open = True
     role_sent = False
     content_chunks = 0
+    content_send_calls = 0
     engine_tokens = 0
     empty_tokens = 0
     try:
@@ -556,30 +558,44 @@ def _stream_fast_chat(
             role_sent = client_open
             _mark_fast_http_elapsed(profile, "role_send_ms", role_start_s)
         generate_start_s = time.perf_counter()
-        for token_id in engine.generate_chat_tokens(
+        for token_batch in _iter_engine_chat_token_batches(
+            engine,
             messages,
             max_tokens=max_tokens,
             temperature=temperature,
         ):
-            engine_tokens += 1
-            if engine_tokens == 1:
+            if not token_batch:
+                continue
+            if engine_tokens == 0:
                 _mark_fast_http_elapsed(profile, "engine_first_token_ms", generate_start_s)
                 _mark_fast_http_since_start(profile, "first_engine_token_ms")
+            engine_tokens += len(token_batch)
             if not client_open:
                 continue
-            decode_start_s = time.perf_counter()
-            content = engine.tokenizer.decode_token(int(token_id))
-            _add_fast_http_elapsed(profile, "decode_token_ms", decode_start_s)
-            if not content:
-                empty_tokens += 1
+            content_payloads: list[bytes] = []
+            previous_content_chunks = content_chunks
+            for token_id in token_batch:
+                decode_start_s = time.perf_counter()
+                content = engine.tokenizer.decode_token(int(token_id))
+                _add_fast_http_elapsed(profile, "decode_token_ms", decode_start_s)
+                if not content:
+                    empty_tokens += 1
+                    continue
+                delta = _chat_delta_role_content(content) if not role_sent else _chat_delta_content(content)
+                role_sent = True
+                content_payloads.append(_chat_completion_chunk_bytes(chunk_prefix, delta, None))
+                content_chunks += 1
+            if not content_payloads:
                 continue
-            delta = _chat_delta_role_content(content) if not role_sent else _chat_delta_content(content)
-            role_sent = True
             send_start_s = time.perf_counter()
-            client_open = _try_send_fast_chat_chunk(connection, chunk_prefix, delta, chunked=keep_alive)
+            client_open = _try_send_fast_sse_payload(
+                connection,
+                b"".join(content_payloads),
+                chunked=keep_alive,
+            )
             _add_fast_http_elapsed(profile, "content_send_ms", send_start_s)
-            content_chunks += 1
-            if content_chunks == 1:
+            content_send_calls += 1
+            if previous_content_chunks == 0 and content_chunks > 0:
                 _mark_fast_http_since_start(profile, "first_content_sent_ms")
         if client_open:
             try:
@@ -599,6 +615,7 @@ def _stream_fast_chat(
         if profile is not None:
             profile["engine_tokens"] = engine_tokens
             profile["content_chunks"] = content_chunks
+            profile["content_send_calls"] = content_send_calls
             profile["empty_tokens"] = empty_tokens
             profile["client_open"] = bool(client_open)
             _record_fast_http_profile(profile)
@@ -680,6 +697,39 @@ def _try_send_fast_chat_chunk(
             _chat_completion_chunk_bytes(chunk_prefix, delta_json, finish_reason),
             chunked=chunked,
         )
+        return True
+    except OSError:
+        return False
+
+
+def _iter_engine_chat_token_batches(
+    engine: Any,
+    messages: list[dict[str, object]],
+    *,
+    max_tokens: int,
+    temperature: float,
+) -> Iterator[list[int]]:
+    generate_batches = getattr(engine, "generate_chat_token_batches", None)
+    if callable(generate_batches):
+        for batch in generate_batches(messages, max_tokens=max_tokens, temperature=temperature):
+            yield [int(token_id) for token_id in batch]
+        return
+    for token_id in engine.generate_chat_tokens(
+        messages,
+        max_tokens=max_tokens,
+        temperature=temperature,
+    ):
+        yield [int(token_id)]
+
+
+def _try_send_fast_sse_payload(
+    connection: socket.socket,
+    payload: bytes,
+    *,
+    chunked: bool = False,
+) -> bool:
+    try:
+        _send_fast_sse_bytes(connection, payload, chunked=chunked)
         return True
     except OSError:
         return False

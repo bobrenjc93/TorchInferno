@@ -26,6 +26,7 @@ from torchinferno.openai_http import (
     _fast_stream_end_bytes,
     _new_fast_http_stream_profile,
     _record_fast_http_profile,
+    _stream_fast_chat,
     _stream_defer_role_enabled,
     _stream_inline_enabled,
     enable_tcp_nodelay,
@@ -388,6 +389,24 @@ def test_openai_fast_stream_end_bytes_coalesce_final_frames() -> None:
     assert chunked.endswith(b'0\r\n\r\n')
     assert b'{"role":"assistant"}' in chunked
     assert b'data: [DONE]\n\n' in chunked
+
+
+def test_openai_fast_stream_coalesces_ready_token_batches() -> None:
+    connection = _RecordingConnection()
+
+    _stream_fast_chat(
+        connection,  # type: ignore[arg-type]
+        _BatchStreamEngine(),
+        [{"role": "user", "content": "hello"}],
+        max_tokens=3,
+        temperature=0.0,
+    )
+
+    assert len(connection.payloads) == 3
+    content_payload = connection.payloads[1]
+    assert content_payload.count(b"chat.completion.chunk") == 3
+    assert content_payload.count(b'"content"') == 3
+    assert connection.payloads[2].endswith(b"data: [DONE]\n\n")
 
 
 def test_openai_fast_http_profile_writes_jsonl(monkeypatch, tmp_path) -> None:
@@ -14672,12 +14691,50 @@ class _SlowStreamEngine:
         yield 1
 
 
+class _BatchStreamEngine:
+    model_id = "tiny"
+
+    class _Tokenizer:
+        def decode_token(self, token_id: int) -> str:
+            return str(token_id)
+
+    tokenizer = _Tokenizer()
+
+    def generate_chat_token_batches(
+        self,
+        messages: list[dict[str, object]],
+        *,
+        max_tokens: int,
+        temperature: float,
+    ):
+        del messages, max_tokens, temperature
+        yield [1, 2, 3]
+
+    def generate_chat_tokens(
+        self,
+        messages: list[dict[str, object]],
+        *,
+        max_tokens: int,
+        temperature: float,
+    ):
+        del messages, max_tokens, temperature
+        raise AssertionError("fast stream should use token batches when available")
+
+
 class _FakeSocket:
     def __init__(self) -> None:
         self.options: list[tuple[int, int, int]] = []
 
     def setsockopt(self, level: int, option: int, value: int) -> None:
         self.options.append((level, option, value))
+
+
+class _RecordingConnection:
+    def __init__(self) -> None:
+        self.payloads: list[bytes] = []
+
+    def sendall(self, payload: bytes) -> None:
+        self.payloads.append(payload)
 
 
 def _cache_only_engine() -> OpenAICompletionEngine:
