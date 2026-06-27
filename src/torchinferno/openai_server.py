@@ -3003,70 +3003,86 @@ class OpenAICompletionEngine:
             _online_fp8_prefill_min_m(temperature=0.7, max_tokens=300),
             minimum=1,
         )
+        warmup_temperature = env_float(
+            "TORCHINFERNO_OPENAI_STARTUP_RUNTIME_FP8_RAGGED_PREFILL_TEMPERATURE",
+            0.7,
+            minimum=0.0,
+        )
+        warmup_max_tokens = env_int(
+            "TORCHINFERNO_OPENAI_STARTUP_RUNTIME_FP8_RAGGED_PREFILL_MAX_TOKENS",
+            300,
+            minimum=1,
+        )
         row = next((candidate for candidate in prefix_rows if candidate >= max(batch_sizes)), None)
         if row is None:
             return
         try:
-            for prefix_count in prefix_tokens:
-                row_cache = cache.for_rows([row]) if hasattr(cache, "for_rows") else cache
-                _reset_generation_cache(cache)
-                _set_generation_cache_seq_len(row_cache, 0)
-                prefix_ids = (
-                    torch.arange(prefix_count, device=self.device, dtype=torch.long)
-                    .remainder(max(1, int(vocab_size)))
-                    .view(1, prefix_count)
-                )
-                with _allow_prefill_graph_capture_for_cache(row_cache):
-                    _try_prefill_logits_graph(
-                        self.model,
-                        prefix_ids,
-                        row_cache,
-                        allow_capture=True,
+            with _tensor_parallel_symm_mem_allreduce_scope(
+                self.model,
+                self.device,
+                max_tokens=warmup_max_tokens,
+                temperature=warmup_temperature,
+            ):
+                for prefix_count in prefix_tokens:
+                    row_cache = cache.for_rows([row]) if hasattr(cache, "for_rows") else cache
+                    _reset_generation_cache(cache)
+                    _set_generation_cache_seq_len(row_cache, 0)
+                    prefix_ids = (
+                        torch.arange(prefix_count, device=self.device, dtype=torch.long)
+                        .remainder(max(1, int(vocab_size)))
+                        .view(1, prefix_count)
                     )
-                _set_generation_cache_seq_len(row_cache, prefix_count)
-                _set_tensor_parallel_runtime_fp8_prefill(self.model, enabled=True, min_m=min_m)
-                for suffix_count in suffix_tokens:
-                    if prefix_count + suffix_count > max_seq_len:
-                        continue
-                    for batch_size in batch_sizes:
-                        suffix_ids = torch.zeros(
-                            batch_size,
-                            suffix_count,
-                            dtype=torch.long,
-                            device=self.device,
+                    with _allow_prefill_graph_capture_for_cache(row_cache):
+                        _try_prefill_logits_graph(
+                            self.model,
+                            prefix_ids,
+                            row_cache,
+                            allow_capture=True,
                         )
-                        row_indices = torch.arange(batch_size, dtype=torch.long, device=self.device)
-                        required = max(row, batch_size - 1) + 1
-                        seq_lens = torch.zeros(required, dtype=torch.long, device=self.device)
-                        seq_lens[row_indices] = prefix_count
-                        seq_lens[row] = prefix_count
-                        logit_positions = torch.full(
-                            (batch_size,),
-                            suffix_count - 1,
-                            dtype=torch.long,
-                            device=self.device,
-                        )
-                        src_prefix_row = torch.tensor([row], dtype=torch.long, device=self.device)
-                        try:
-                            ragged_prefill_graph(
-                                suffix_ids,
-                                cache,
-                                seq_lens=seq_lens,
-                                row_indices=row_indices,
-                                logit_positions=logit_positions,
-                                context_len=prefix_count + suffix_count,
-                                src_prefix_row=src_prefix_row,
+                    _set_generation_cache_seq_len(row_cache, prefix_count)
+                    _set_tensor_parallel_runtime_fp8_prefill(self.model, enabled=True, min_m=min_m)
+                    for suffix_count in suffix_tokens:
+                        if prefix_count + suffix_count > max_seq_len:
+                            continue
+                        for batch_size in batch_sizes:
+                            suffix_ids = torch.zeros(
+                                batch_size,
+                                suffix_count,
+                                dtype=torch.long,
+                                device=self.device,
                             )
-                        except Exception as exc:
-                            import sys as _fp8raggedsys
-                            print(
-                                f"[WARMUP] runtime FP8 ragged prefill graph "
-                                f"prefix={prefix_count} suffix={suffix_count} "
-                                f"batch={batch_size}: {exc}",
-                                file=_fp8raggedsys.stderr,
-                                flush=True,
+                            row_indices = torch.arange(batch_size, dtype=torch.long, device=self.device)
+                            required = max(row, batch_size - 1) + 1
+                            seq_lens = torch.zeros(required, dtype=torch.long, device=self.device)
+                            seq_lens[row_indices] = prefix_count
+                            seq_lens[row] = prefix_count
+                            logit_positions = torch.full(
+                                (batch_size,),
+                                suffix_count - 1,
+                                dtype=torch.long,
+                                device=self.device,
                             )
-                _reset_generation_cache(cache)
+                            src_prefix_row = torch.tensor([row], dtype=torch.long, device=self.device)
+                            try:
+                                ragged_prefill_graph(
+                                    suffix_ids,
+                                    cache,
+                                    seq_lens=seq_lens,
+                                    row_indices=row_indices,
+                                    logit_positions=logit_positions,
+                                    context_len=prefix_count + suffix_count,
+                                    src_prefix_row=src_prefix_row,
+                                )
+                            except Exception as exc:
+                                import sys as _fp8raggedsys
+                                print(
+                                    f"[WARMUP] runtime FP8 ragged prefill graph "
+                                    f"prefix={prefix_count} suffix={suffix_count} "
+                                    f"batch={batch_size}: {exc}",
+                                    file=_fp8raggedsys.stderr,
+                                    flush=True,
+                                )
+                    _reset_generation_cache(cache)
         except Exception as exc:
             import sys as _fp8raggedsys
             print(f"[WARMUP] runtime FP8 ragged prefill warmup failed: {exc}", file=_fp8raggedsys.stderr, flush=True)
@@ -4517,6 +4533,13 @@ class OpenAICompletionEngine:
             return
         stats = getattr(runtime_engine, "stats", None)
         record: dict[str, object] = {"event": event, **fields}
+        cache = getattr(runtime_engine, "_cache", None)
+        if cache is not None:
+            cache_max_seq_len, cache_rows = _generation_cache_shape_limits(cache)
+            if cache_max_seq_len is not None:
+                record["runtime_cache_max_seq_len"] = cache_max_seq_len
+            if cache_rows is not None:
+                record["runtime_cache_rows"] = cache_rows
         for name in (
             "prefill_model_calls",
             "prefill_batches",

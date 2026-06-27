@@ -44,6 +44,30 @@ and queue phase time from `24.07s` to `26.45s`. The current clone/cat path is
 therefore the better default until CPU readback can be overlapped or removed by
 a different event-delivery design.
 
+The current same-host tree-only provider comparison on TorchInferno `961c30c`
+still shows the largest short-context TTFT/E2E gap: TorchInferno
+`228.4 / 48.9 / 279.3ms`, vLLM `66.4 / 33.2 / 92.3ms`, and SGLang
+`61.4 / 74.2 / 153.2ms` (TTFT/TPOT/E2E), all 100% benchmark-level correct.
+TorchInferno's fast-HTTP profile is not the limiter here: sampled tree median
+first-content was `206.8ms` and median content-send cost was only `1.2ms`.
+The first sampled batcher session instead spent `1.49s` in prefill wall,
+including one `706ms` FP8 ragged-prefill graph capture.
+
+The sampled-medium startup FP8 ragged-prefill warmup was capturing under the
+startup symmetric-memory allreduce scope (`temperature=0.0`), while sampled
+tree runtime disables that path (`temperature=0.7` by default). Since the CUDA
+graph key includes the allreduce mode, those startup graphs did not match the
+first sampled tree session. The warmup now enters the same sampled-medium
+allreduce policy it is meant to serve, and queue profiles also record the
+physical runtime cache shape to make future warmup mismatches visible. The
+mechanism is confirmed: first sampled session captures dropped from `1` to `0`
+and prefill wall dropped from `1.49s` to `0.79s` on the shared `144x1024` cache.
+Score-facing tree movement is modest but positive: profiled
+`230.1 / 51.1 / 275.9ms` improved to `215.5 / 49.7 / 256.9ms`; a no-profile
+confirmation landed at `227.2 / 48.6 / 273.8ms` with p99 E2E down to `1.67s`.
+This removes a startup-warmup bug, but it does not close the vLLM tree gap;
+remaining tree work is still sampled prefill/session scheduling.
+
 ## Latest public refresh and greedy-mid idle retention (2026-06-26)
 
 Public run `20260626_181444` was the fair same-host comparison before the
