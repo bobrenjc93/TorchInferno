@@ -3516,6 +3516,28 @@ Rejected follow-ups in this loop:
 - Reducing sampled-short initial wait to 5ms is rejected:
   `233.2 / 0.0 / 356.7ms` with the same high tail.
 
+Post-`d3131f4` local refresh (2026-06-27): the public run is still stale at
+TorchInferno `ccb13de`, but the current no-profile TorchInferno-only stack
+landed at few_shot `141.6 / 46.7 / 182.5ms`, self_consistency
+`195.5 / 0.0 / 234.8ms`, multi_turn `346.5 / 60.6 / 410.3ms`,
+tree_of_thought `229.6 / 46.8 / 271.4ms`, and long_output
+`255.4 / 24.1 / 1231.9ms` with in-family correctness. Focused tree follow-ups
+rejected sampled-medium `max_active=40` repeat (`280.2 / 48.3 / 325.1ms`),
+capture-on-miss disable (`280.1 / 50.0 / 325.1ms`), and sampled-medium idle
+arrival collection (`242.6 / 50.0 / 289.7ms`) against the same-control
+`220.8 / 49.4 / 281.2ms`.
+
+Multi_turn still had request-path greedy common-prefix suffix graph captures on
+the current stack. The queued tail shapes included `prefix_graph:b4:s128:p45-45`
+and, on repeat, `prefix_graph:b1:s128:p45-45`; the startup warmup captured only
+batch `8/16/32`. Adding batches `1,4` to
+`TORCHINFERNO_OPENAI_WARMUP_ONLINE_GREEDY_COMMON_PREFIX_SUFFIX_BATCHES` removed
+request-path captures (`1 -> 0`) and moved the profiled multi row from
+`375.3 / 62.9 / 438.7ms` to `365.1 / 58.8 / 423.3ms`. Queue counters improved
+phase total `11.4s -> 9.34s`, prefill wall `6010.8ms -> 5473.1ms`, and decode
+active `5087.1ms -> 3575.2ms`. Promote the extra startup batches; startup moved
+from about `110.5s` to `125.5s`, which is not score-facing.
+
 ## In-flight, validated-locally-but-NOT-benchmarked commits
 
 The inference-bench harness has been frozen on `25260c0` for many hours, so these
