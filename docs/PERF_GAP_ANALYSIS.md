@@ -56,6 +56,18 @@ it improved TTFT to `152.9ms` but regressed TPOT/E2E/throughput to
 Promote the `1ms` greedy-short first-batch wait only; this bucket stays below
 few_shot's `256`-token cap and targets long_output.
 
+Self_consistency on current `6ce94f1` is now mostly a control-plane/finish-path
+gap, not a model-kernel gap. A same-host provider comparison landed at
+TorchInferno `274.1 / 0.0 / 350.8ms`, vLLM `274.7 / 0.0 / 327.4ms`, and SGLang
+`210.3 / 0.0 / 398.7ms`. The queue profile had one common-prefix prefill, one
+decode, but `260` submit batches, `685.6ms` submit sync, and `262.4ms` idle
+drain. Rechecking sampled-short initial wait `20ms` is rejected on this stack:
+it admitted more initially (`7 -> 16`) but regressed to
+`287.1 / 0.0 / 351.0ms`, raised phase total (`3.01s -> 3.17s`), and worsened
+tail latency. Keep sampled-short initial wait at `10ms`; the next self lever is
+reducing submit/finish churn without broadening the already-rejected shared
+memory command scopes.
+
 ## Public run 20260628_190318 and finished-prefix reuse rejection (2026-06-28)
 
 Public run `20260628_190318` measured TorchInferno `4000a03`, vLLM `c2127a2`,
