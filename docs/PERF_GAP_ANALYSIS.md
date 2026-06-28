@@ -1,5 +1,32 @@
 # TorchInferno vs vLLM/sglang — Performance Gap Analysis (Llama-3.1-70B, 8xH100)
 
+## Current `564783b` refresh and rejected tree capture bypass (2026-06-28)
+
+The latest public v1 run is still `20260628_030309`, which measures
+TorchInferno `5680b84`, vLLM `11a1230`, and SGLang `4a76699`. It predates the
+batch-2 sampled suffix warmup and the 10ms greedy-large initial collection
+default. Public scorecard wins are vLLM `15/20`, TorchInferno `2/20`, and
+SGLang `2/20`. TorchInferno rows are few_shot
+`139.1 / 45.9 / 177.3ms`, self_consistency `248.8 / 0.0 / 265.5ms`,
+multi_turn `411.7 / 57.6 / 466.0ms`, tree_of_thought
+`295.2 / 42.4 / 360.6ms`, and long_output `310.2 / 22.3 / 1190.1ms`
+(TTFT/TPOT/E2E).
+
+A full local TorchInferno-only pass on pushed `564783b` completed all rows with
+the expected correctness band: few_shot `162.7 / 49.4 / 204.0ms`,
+self_consistency `314.9 / 0.0 / 345.2ms`, multi_turn
+`358.0 / 62.7 / 423.4ms`, tree_of_thought `307.0 / 47.9 / 332.4ms`, and
+long_output `267.6 / 24.5 / 1224.5ms`. The multi-turn initial-wait change
+carried into the full sequence and cut p99 TTFT/E2E to about `996/1055ms`.
+Self and tree still show focused/full-run order noise; do not use the slower
+full-run self/tree medians alone as proof of a new runtime regression.
+
+Disabling request-path common-prefix suffix graph capture remains rejected for
+tree. With `TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_CAPTURE_ON_MISS=0`, the
+focused tree row regressed to `342.4 / 49.5 / 396.3ms`. Queue counters showed
+zero captures but four prefill graph misses; the eager miss path was more
+score-visible than the rare captures it avoided.
+
 ## Current `578e117` refresh and rejected follow-ups (2026-06-28)
 
 The latest public v1 run is `20260628_010307`, which measures TorchInferno
