@@ -72,6 +72,13 @@ regressions did not reproduce the win (`233.2 / 49.6 / 283.2ms`, with a worse
 p99). The env-gated prototype was reverted; keep the default sampled
 start/step/close shared-memory scope unchanged.
 
+The sampled-medium FP8 prefill boundary is also rejected for tree. Lowering only
+`TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_FP8_PREFILL_MIN_M` from `256` to
+`255` makes the exact `b16 x s16 = 256` suffix-prefill bucket use FP8, but the
+focused row landed at `225.3 / 50.4 / 265.1ms`. Queue profiles still showed two
+request-path prefill graph captures and worse TPOT/throughput, so the current
+`M > 256` default remains the safer tradeoff.
+
 ## Direct rank-0 shard scatter (2026-06-28)
 
 The old rank-0 shard-scatter checkpoint path used `reduce_scatter_tensor`,
