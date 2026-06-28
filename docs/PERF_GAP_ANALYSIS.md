@@ -33,6 +33,53 @@ focused few_shot row completed at `161.5 / 46.7 / 200.8ms` with 98%
 correctness, matching the expected latency band while removing the public
 SCATTER startup failure mode.
 
+## Current same-host refresh and tree graph probes (2026-06-28)
+
+The public stream is still stalled at `20260628_110307`, so the current score
+shape comes from same-host skip-build runs on pushed `6425184`. The all-provider
+run `20260628_150944` reached `/health` in `145.6s` for TorchInferno and
+`90.4s` for SGLang; local vLLM failed only because the host `/lib64/libstdc++`
+is missing `CXXABI_1.3.15`, and a separate vLLM rerun with the conda
+`libstdc++.so.6.0.34` preload reached `/health` in `115.5s`. Combining those
+rows, SGLang still leads most TTFT/E2E/throughput cells while TorchInferno keeps
+competitive TPOT: TorchInferno rows were few_shot
+`162.2 / 46.5 / 201.4ms`, self_consistency `293.3 / 0.0 / 324.0ms`,
+multi_turn `344.1 / 60.4 / 404.4ms`, tree_of_thought
+`284.4 / 47.9 / 317.2ms`, and long_output `237.7 / 25.4 / 1204.4ms`.
+The local SGLang rows were `118.9 / 78.5 / 199.2ms`,
+`229.5 / 0.0 / 385.7ms`, `150.4 / 114.1 / 266.4ms`,
+`62.9 / 72.2 / 148.7ms`, and `66.8 / 24.6 / 907.0ms`.
+The local vLLM preload rows were `231.9 / 86.8 / 314.4ms`,
+`240.1 / 0.0 / 294.3ms`, `298.4 / 108.7 / 394.8ms`,
+`123.3 / 83.0 / 186.3ms`, and `109.5 / 28.7 / 1125.3ms`.
+
+A current public-order TorchInferno profile over
+few_shot/self_consistency/multi_turn/tree_of_thought landed at
+`166.6 / 47.4 / 205.0ms`, `276.3 / 0.0 / 302.1ms`,
+`343.0 / 58.1 / 402.2ms`, and `266.6 / 48.9 / 307.3ms`.
+The tree sampled-medium sessions handled `896` requests, spent `8.21s` in
+online phase time and `5.58s` in prefill wall, and still paid two request-path
+ragged-prefill graph captures totaling `1.96s`. That confirms the remaining
+tree gap is still the sampled prefix/suffix prefill path plus burst scheduling,
+not the public startup failure.
+
+Three adjacent tree graph probes are rejected on this current stack. Lowering
+only the sampled common-prefix warmup FP8 M gate with
+`TORCHINFERNO_OPENAI_WARMUP_ONLINE_SAMPLED_COMMON_PREFIX_FP8_MIN_M=1` captured
+the wrong precision-key family for small suffix buckets and regressed tree to
+`354.8 / 47.6 / 391.3ms`; sampled request-path captures rose from `2` to `6`
+and capture time from `1.96s` to `5.48s`. Raising
+`TORCHINFERNO_CUDAGRAPH_PREFILL_MAX_GRAPHS=256` reduced sampled captures to
+one and sampled phase time to `7.33s`, but retained graph memory rose to roughly
+`66GB/GPU` during startup and self_consistency regressed from
+`276.3 / 302.1ms` to `291.6 / 313.2ms`, so the broad cache increase is not a
+default. A source patch that moved sampled common-prefix suffix warmup after the
+runtime FP8 ragged warmup also reduced sampled captures to one and phase time
+to `7.32s`, but it regressed score-facing tree to `283.6 / 48.4 / 324.3ms` and
+self_consistency to `288.3 / 313.0ms`; the patch was reverted. Do not promote
+more startup graph retention or reorder sampled warmup without a score-facing
+win.
+
 ## Current long-output admission profile (2026-06-28)
 
 On pushed `5c67607`, same-host focused long_output control completed at
