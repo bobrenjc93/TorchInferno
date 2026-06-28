@@ -1,5 +1,44 @@
 # TorchInferno vs vLLM/sglang — Performance Gap Analysis (Llama-3.1-70B, 8xH100)
 
+## Published local refresh and rejected follow-ups (2026-06-28)
+
+The public result stream stalled after `20260628_050325`, so a same-host
+skip-build all-provider run was published as inference-bench
+`20260628_093044` after preloading the conda `libstdc++` needed by the local
+vLLM import path. This is the current public artifact for local comparison:
+SGLang won `14/20` metric cells, TorchInferno won `3/20`, and vLLM won `2/20`.
+TorchInferno's rows were few_shot `165.3 / 51.1 / 207.1ms`,
+self_consistency `245.0 / 0.0 / 329.0ms`, multi_turn
+`348.1 / 61.2 / 408.1ms`, tree_of_thought `238.2 / 48.6 / 281.2ms`, and
+long_output `301.9 / 25.5 / 1154.4ms` (TTFT/TPOT/E2E). The shape is unchanged:
+TorchInferno's decode TPOT is competitive, but SGLang and vLLM still win most
+TTFT/E2E/throughput cells through lower prefill and scheduling overhead.
+
+Three follow-ups on top of current `467c3c3` are rejected. First, a mixed-prefix
+context-bucket prototype made the opt-in finished-prefix graph path unit-correct,
+but the real multi_turn route was still unsafe. With
+`TORCHINFERNO_CONTINUOUS_FINISHED_PREFIX_CACHE=1`,
+`TORCHINFERNO_CONTINUOUS_NON_COMMON_PREFIX_GRAPH_PREFILL=1`,
+`TORCHINFERNO_CONTINUOUS_MIXED_PREFIX_PREFILL=1`, and
+`TORCHINFERNO_CONTINUOUS_MIXED_PREFIX_PREFILL_GRAPH=1`, the 8-GPU run wrote only
+one queue record (`81` submitted, `49` finished), then sat at 0% GPU utilization
+until manual termination. The prototype was reverted; finished/generated prefix
+reuse still needs a batching policy that cannot strand live requests.
+
+Second, raising sampled-short idle batch wait to `20ms` regressed the close
+self_consistency row on the current stack. The focused few_shot/self run landed
+at few_shot `163.8 / 49.6 / 202.9ms` and self_consistency
+`260.5 / 0.0 / 345.1ms`; the queue profile spent about `344ms` in idle drain
+and ended with `252` submit batches. Keep the existing `10ms` sampled-short
+idle wait.
+
+Third, decoupling prefill/admission capacity from decode width is not a quick
+tree fix. An opt-in prototype with `max_active=64` and a 32-row decode limit
+preserved correctness but regressed focused tree_of_thought to
+`382.8 / 52.8 / 443.5ms`. Extra prefill/admission capacity introduced more
+prefill and graph-shape pressure than it saved in queueing, so the scaffold was
+reverted.
+
 ## Direct rank-0 shard scatter (2026-06-28)
 
 The old rank-0 shard-scatter checkpoint path used `reduce_scatter_tensor`,
