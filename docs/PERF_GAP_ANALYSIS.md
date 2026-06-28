@@ -21,6 +21,16 @@ therefore keeps the multi_turn TPOT cell locally but still trails on TTFT/E2E;
 the next lever remains first-token scheduling or lower-overhead conversation
 prefix reuse, not broader suffix graph warmup alone.
 
+The adjacent greedy-mid row-cap idea is rejected. A focused few_shot run with
+`TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_MID_MAX_ACTIVE=48` and matching
+`b48` greedy suffix warmup regressed from the current full-pass default
+`169.3 / 51.5 / 213.3ms` to `190.0 / 52.6 / 234.5ms`, with throughput falling
+from `5.3` to `4.8 tok/s`. The profile introduced `b48` decode shapes, three
+prefix-graph misses, and raised phase time from `8.14s` to `9.09s`
+(`2.96s -> 3.35s` prefill wall). Keep greedy-mid active rows at `32`; larger
+row caps need a separate decode/prefill shape improvement before they are useful
+for few_shot.
+
 ## FlashInfer packaging and no-FI decode A/B (2026-06-28)
 
 Public provider logs for `20260628_190318` showed vLLM and SGLang running with
