@@ -23,6 +23,15 @@ is still the right public-run fairness fix, but long_output remains dominated by
 decode GPU time plus token readback/CPU sampling overhead rather than by the
 FlashInfer decode-graph warmup alone.
 
+Self_consistency sampled-prefix sampling also rejected a low-threshold repeated
+Gumbel sampler. Forcing
+`TORCHINFERNO_TEMPERATURE_SAMPLE_REPEATED_GUMBEL_MIN_BATCH=1` on `03a2cee`
+completed correctly but regressed the row to `311.3 / 0.0 / 331.4ms` versus the
+current self control at `212.7 / 0.0 / 331.2ms`. The queue profile showed more
+fragmented arrivals (`367` submit batches, `271` prefix-reuse batches,
+`572.5ms` idle-drain wait) rather than a clean sampler win, so keep the
+repeated-Gumbel threshold at `128`.
+
 ## Public run 20260628_190318 and finished-prefix reuse rejection (2026-06-28)
 
 Public run `20260628_190318` measured TorchInferno `4000a03`, vLLM `c2127a2`,
