@@ -161,6 +161,21 @@ decode/TPOT cell locally, but still trails on TTFT, E2E, and throughput; the
 next multi_turn lever is still first-token queueing/prefix scheduling, not
 decode throughput.
 
+Four same-host multi_turn follow-ups on current `0f0a0a7` are rejected. Enabling
+only `TORCHINFERNO_CONTINUOUS_FINISHED_PREFIX_CACHE=1` did find more reusable
+conversation tokens, but it routed the safe non-graph fallback into tiny suffix
+prefills and regressed to `6471.0 / 65.6 / 6529.9ms`; queue counters showed
+`488` prefill batches and `94.7s` prefill wall versus the default `34` batches
+and roughly `5.6s`, so do not enable finished-prefix cache without a batched
+graph-safe suffix path. Raising the greedy-large active cap to `48` regressed
+score-facing latency to `447.1 / 67.4 / 519.4ms`, so the current `32`-row cap
+remains the better default. Lowering the greedy-large FP8 prefill min-M from
+`512` to `256` landed at `370.1 / 60.6 / 432.8ms`, not better than the default
+band. Lowering the greedy-large refill floor from `32` to `16` also stayed in
+the same median band, `370.1 / 62.6 / 432.4ms`, while worsening tails. Keep the
+current `512` FP8 gate and `32` refill floor until a different scheduling path
+improves both medians and tails.
+
 ## Current long-output admission profile (2026-06-28)
 
 On pushed `5c67607`, same-host focused long_output control completed at
@@ -201,6 +216,13 @@ still rejected on the current stack. The unprofiled candidate completed
 worsened p99 TTFT/E2E to `2973.8/3562.5ms`. Keep the sampled warmup temperature
 default at `1.0`; current tree work should avoid retesting this knob and focus
 on a different prefill/session pipeline change.
+
+Lowering the sampled-medium FP8 prefill min-M is also rejected on current
+`0f0a0a7`. With
+`TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_FP8_PREFILL_MIN_M=128`,
+tree_of_thought completed `959/992` raw correct at `232.9 / 49.6 / 288.2ms`,
+but the paired no-env run immediately after completed `961/992` at
+`218.3 / 48.8 / 262.0ms`. Keep the sampled-medium FP8 min-M at `256`.
 
 ## Current multi-turn admission refresh (2026-06-28)
 
