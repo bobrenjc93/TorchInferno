@@ -738,6 +738,99 @@ def test_continuous_batch_engine_prefix_reuse_matches_full_prefill() -> None:
     assert reuse_engine.stats.prefix_reuse_tokens == 3
 
 
+def test_paged_online_engine_batches_shared_suffix_prefill(monkeypatch) -> None:
+    from types import SimpleNamespace
+
+    from torchinferno.runtime.paged_serving import PagedEngine
+
+    plans: list[dict[str, object]] = []
+
+    class _FakePrefillWrapper:
+        def __init__(self, *args, **kwargs) -> None:
+            del args, kwargs
+
+        def plan(self, **kwargs) -> None:
+            plans.append(
+                {
+                    key: value.detach().cpu().tolist() if isinstance(value, torch.Tensor) else value
+                    for key, value in kwargs.items()
+                }
+            )
+
+    monkeypatch.setitem(
+        sys.modules,
+        "flashinfer",
+        SimpleNamespace(BatchPrefillWithPagedKVCacheWrapper=_FakePrefillWrapper),
+    )
+
+    class _FakeLayer:
+        local_attention_heads = 1
+        local_key_value_heads = 1
+
+    class _FakePagedModel:
+        def __init__(self) -> None:
+            self.device = torch.device("cpu")
+            self.dtype = torch.float32
+            self.config = SimpleNamespace(head_dim=2)
+            self.layers = [_FakeLayer()]
+            self.prefill_calls: list[dict[str, object]] = []
+
+        def forward_prefill_paged(
+            self,
+            input_ids,
+            paged_cache,
+            *,
+            request_ids,
+            prefill_wrapper,
+            start_position=0,
+            **kwargs,
+        ):
+            del paged_cache, prefill_wrapper, kwargs
+            starts = (
+                start_position.detach().cpu().tolist()
+                if isinstance(start_position, torch.Tensor)
+                else start_position
+            )
+            self.prefill_calls.append(
+                {
+                    "input_ids": input_ids.detach().cpu().tolist(),
+                    "request_ids": list(request_ids),
+                    "start_position": starts,
+                }
+            )
+            batch, tokens = input_ids.shape
+            logits = torch.zeros(batch, tokens, 16)
+            for row in range(batch):
+                logits[row, -1, 7 + row] = 1.0
+            return logits
+
+    class _FakePrefixCache:
+        def __init__(self) -> None:
+            self.remembered: list[tuple[str, tuple[int, ...]]] = []
+
+        def share_into(self, new_request_id: str, tokens) -> int:
+            del new_request_id, tokens
+            return 2
+
+        def remember(self, request_id: str, tokens) -> None:
+            self.remembered.append((request_id, tuple(tokens)))
+
+    model = _FakePagedModel()
+    engine = PagedEngine(model, page_size=2, max_active=4, max_seq=8, use_graph=False)
+    engine.prefix_cache = _FakePrefixCache()
+    engine.submit("a", [1, 2, 3, 4], 1)
+    engine.submit("b", [5, 6, 7, 8], 1)
+
+    events = engine.step()
+
+    assert events == [("a", 7, True), ("b", 8, True)]
+    assert len(model.prefill_calls) == 1
+    assert model.prefill_calls[0]["input_ids"] == [[3, 4], [7, 8]]
+    assert model.prefill_calls[0]["request_ids"] == ["p0", "p1"]
+    assert model.prefill_calls[0]["start_position"] == 2
+    assert plans[0]["qo_indptr"] == [0, 2, 4]
+
+
 def test_continuous_batch_engine_pins_shared_prefix_across_batches() -> None:
     # With pin_shared_prefix, a recurring shared prompt prefix is prefilled once
     # and reused across separate scheduler batches (the online-batcher case),

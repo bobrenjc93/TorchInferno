@@ -1908,6 +1908,16 @@ queue snapshot finished only `241` requests after `45660ms`
 requests in about `13883ms` profiled. The run was manually terminated before
 completion; do not lower the paged threshold or enable paged prefix caching for
 this 569-token-session shape without a substantially faster paged prefill path.
+A later working-tree patch batched COW shared suffix prefills by uniform suffix
+length, avoiding the obvious one-FlashInfer-prefill-per-shared-request
+serialization in `PagedEngine`. That fixes a real paged-engine structure, but
+it is still not enough for the score path: the focused `multi_turn` A/B with
+`TORCHINFERNO_OPENAI_PAGED_KV_MIN_SEQ=512` and
+`TORCHINFERNO_PAGED_PREFIX_CACHE=1` completed at
+`6176.1 / 708.1 / 6285.0ms`, p99 E2E `10660.6ms`, with 100% normalized
+correctness. Keep the default threshold unchanged; the paged path still needs a
+larger prefill/decode pipeline redesign before it can replace dense for the
+current benchmark shape.
 
 Finished-prefix row adoption is also rejected for multi_turn on current
 `4ea5e98`. Enabling `TORCHINFERNO_CONTINUOUS_FINISHED_PREFIX_CACHE=1` completed

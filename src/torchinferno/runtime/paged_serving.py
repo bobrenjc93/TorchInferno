@@ -739,6 +739,9 @@ class PagedEngine:
         )
 
     def _prefill_suffix(self, rid, prompt, shared):
+        return self._prefill_suffix_batch([rid], [prompt], [shared])
+
+    def _prefill_suffix_batch(self, rids, prompts, shared_tokens):
         # COW suffix prefill: rid already holds the shared prefix pages (positions
         # 0..shared-1 KV present); prefill ONLY prompt[shared:] at start_position=shared
         # over the FULL page table (prefix + suffix pages), causal -> attention reads
@@ -749,18 +752,30 @@ class PagedEngine:
         if self._prefill_ws is None:
             self._prefill_ws = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=self.dev)
             self._prefill_wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(self._prefill_ws, kv_layout="NHD")
-        suffix = prompt[shared:]
-        indptr, indices, lpl = self.cache.flashinfer_page_table([rid])
-        qo = torch.zeros(2, dtype=torch.int32, device=self.dev)
-        qo[1] = len(suffix)
+        if len(rids) != len(prompts) or len(rids) != len(shared_tokens):
+            raise ValueError("paged suffix prefill batch inputs must have matching lengths")
+        suffixes = [
+            list(prompt[int(shared):])
+            for prompt, shared in zip(prompts, shared_tokens)
+        ]
+        suffix_lens = {len(suffix) for suffix in suffixes}
+        if not suffix_lens or min(suffix_lens) <= 0:
+            raise ValueError("paged suffix prefill requires non-empty suffixes")
+        if len(suffix_lens) != 1:
+            raise ValueError("paged suffix prefill batch requires uniform suffix length")
+        suffix_len = suffix_lens.pop()
+        indptr, indices, lpl = self.cache.flashinfer_page_table(list(rids))
+        qo = torch.arange(0, (len(rids) + 1) * suffix_len, suffix_len, dtype=torch.int32, device=self.dev)
         self._prefill_wrapper.plan(
             qo_indptr=qo, paged_kv_indptr=indptr, paged_kv_indices=indices, paged_kv_last_page_len=lpl,
             num_qo_heads=self.nqo, num_kv_heads=self.nkv, head_dim_qk=self.hd, page_size=self.page_size,
             causal=True, q_data_type=self.cache.kv.dtype,
         )
+        starts = [int(shared) for shared in shared_tokens]
+        start_position = starts[0] if len(set(starts)) == 1 else torch.tensor(starts, dtype=torch.long, device=self.dev)
         return self.model.forward_prefill_paged(
-            torch.tensor([suffix], dtype=torch.long, device=self.dev), self.cache,
-            request_ids=[rid], prefill_wrapper=self._prefill_wrapper, start_position=shared,
+            torch.tensor(suffixes, dtype=torch.long, device=self.dev), self.cache,
+            request_ids=list(rids), prefill_wrapper=self._prefill_wrapper, start_position=start_position,
         )
 
     def submit(
@@ -863,13 +878,20 @@ class PagedEngine:
                     })
 
             if admitted:
-                # COW-shared requests prefill ONLY their suffix (variable length) -> one
-                # call each (multi_turn admits ~1/step); non-shared go through the
-                # length-batched path. Order is deterministic -> TP collectives aligned.
+                # COW-shared requests prefill ONLY their suffix. Group uniform
+                # suffix lengths so a turn wave reuses prefix pages without
+                # serializing one FlashInfer prefill per request.
+                shared_groups: dict[int, list[dict]] = {}
                 for a in (x for x in admitted if x["shared"] > 0):
-                    logits = self._prefill_suffix(a["rid"], a["prompt"], a["shared"])
-                    tok = int(_greedy_tokens(self.model, logits[:, -1, :])[0])
-                    _retire_or_activate(a, tok)
+                    shared_groups.setdefault(len(a["prompt"]) - int(a["shared"]), []).append(a)
+                for _suffix_len, grp in shared_groups.items():
+                    rids = [a["rid"] for a in grp]
+                    prompts = [a["prompt"] for a in grp]
+                    starts = [int(a["shared"]) for a in grp]
+                    logits = self._prefill_suffix_batch(rids, prompts, starts)
+                    toks = _greedy_tokens(self.model, logits[:, -1, :])
+                    for i, a in enumerate(grp):
+                        _retire_or_activate(a, int(toks[i]))
                 plain = [x for x in admitted if x["shared"] == 0]
                 groups: dict[int, list[dict]] = {}
                 for a in plain:
