@@ -10,6 +10,7 @@ from safetensors.torch import save_file
 
 import torchinferno.models.deepseek as legacy_deepseek_mod
 import torchinferno.models.deepseek_v32.model as canonical_deepseek_mod
+import torchinferno.models.llama3.pipeline as llama3_pipeline
 from torchinferno.models.deepseek_v32 import (
     DeepSeekV32V0ForCausalLM,
     DeepSeekV32V1ForCausalLM,
@@ -82,6 +83,47 @@ def test_checkpoint_tensor_loader_returns_contiguous_column_shards(tmp_path) -> 
     )
 
     assert shard.is_contiguous()
+    torch.testing.assert_close(shard, weight[:, 2:4].contiguous())
+
+
+def test_checkpoint_tensor_loader_reuses_safetensor_handles(tmp_path, monkeypatch) -> None:
+    from safetensors import safe_open as real_safe_open
+
+    weight = torch.arange(24, dtype=torch.float32).reshape(4, 6)
+    save_file({"weight": weight}, tmp_path / "model-00001-of-00001.safetensors")
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "metadata": {"total_size": weight.numel() * weight.element_size()},
+                "weight_map": {"weight": "model-00001-of-00001.safetensors"},
+            }
+        )
+        + "\n"
+    )
+    opened = []
+
+    def counting_safe_open(*args, **kwargs):
+        opened.append(args[0])
+        return real_safe_open(*args, **kwargs)
+
+    monkeypatch.setattr(llama3_pipeline, "safe_open", counting_safe_open)
+
+    with llama3_pipeline._CheckpointTensorLoader(tmp_path) as loader:
+        assert loader.get_tensor_shape("weight") == (4, 6)
+        torch.testing.assert_close(
+            loader.get_tensor("weight", device=torch.device("cpu"), dtype=torch.float32),
+            weight,
+        )
+        shard = loader.get_tensor_shard(
+            "weight",
+            dim=1,
+            rank=1,
+            world_size=3,
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+        )
+
+    assert len(opened) == 1
     torch.testing.assert_close(shard, weight[:, 2:4].contiguous())
 
 

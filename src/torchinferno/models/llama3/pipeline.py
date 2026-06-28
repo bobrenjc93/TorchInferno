@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
@@ -85,6 +86,33 @@ class _CheckpointTensorLoader:
         index = json.loads(index_path.read_text())
         self.weight_map: dict[str, str] = dict(index["weight_map"])
         self._shape_cache: dict[str, tuple[int, ...]] = {}
+        self._handle_stack = ExitStack()
+        self._handles: dict[str, object] = {}
+
+    def close(self) -> None:
+        self._handles.clear()
+        self._handle_stack.close()
+
+    def __enter__(self) -> "_CheckpointTensorLoader":
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+        self.close()
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    def _handle(self, filename: str) -> object:
+        handle = self._handles.get(filename)
+        if handle is None:
+            handle = self._handle_stack.enter_context(
+                safe_open(self.root / filename, framework="pt", device="cpu")
+            )
+            self._handles[filename] = handle
+        return handle
 
     def get_tensor_shape(self, name: str) -> tuple[int, ...]:
         cached = self._shape_cache.get(name)
@@ -93,9 +121,8 @@ class _CheckpointTensorLoader:
         filename = self.weight_map.get(name)
         if filename is None:
             raise KeyError(f"checkpoint tensor not found: {name}")
-        path = self.root / filename
-        with safe_open(path, framework="pt", device="cpu") as handle:
-            shape = tuple(handle.get_slice(name).get_shape())
+        handle = self._handle(filename)
+        shape = tuple(handle.get_slice(name).get_shape())
         self._shape_cache[name] = shape
         return shape
 
@@ -103,9 +130,8 @@ class _CheckpointTensorLoader:
         filename = self.weight_map.get(name)
         if filename is None:
             raise KeyError(f"checkpoint tensor not found: {name}")
-        path = self.root / filename
-        with safe_open(path, framework="pt", device="cpu") as handle:
-            tensor = handle.get_tensor(name)
+        handle = self._handle(filename)
+        tensor = handle.get_tensor(name)
         return _finish_checkpoint_tensor(tensor, device=device, dtype=dtype)
 
     def get_tensor_shard(
@@ -121,18 +147,17 @@ class _CheckpointTensorLoader:
         filename = self.weight_map.get(name)
         if filename is None:
             raise KeyError(f"checkpoint tensor not found: {name}")
-        path = self.root / filename
-        with safe_open(path, framework="pt", device="cpu") as handle:
-            tensor_slice = handle.get_slice(name)
-            shape = tuple(tensor_slice.get_shape())
-            if shape[dim] % world_size != 0:
-                raise ValueError(f"cannot shard {name} shape={shape} dim={dim} across {world_size} ranks")
-            shard = shape[dim] // world_size
-            start = rank * shard
-            end = start + shard
-            index = [slice(None)] * len(shape)
-            index[dim] = slice(start, end)
-            tensor = tensor_slice[tuple(index)]
+        handle = self._handle(filename)
+        tensor_slice = handle.get_slice(name)
+        shape = tuple(tensor_slice.get_shape())
+        if shape[dim] % world_size != 0:
+            raise ValueError(f"cannot shard {name} shape={shape} dim={dim} across {world_size} ranks")
+        shard = shape[dim] // world_size
+        start = rank * shard
+        end = start + shard
+        index = [slice(None)] * len(shape)
+        index[dim] = slice(start, end)
+        tensor = tensor_slice[tuple(index)]
         return _finish_checkpoint_tensor(tensor, device=device, dtype=dtype)
 
 
