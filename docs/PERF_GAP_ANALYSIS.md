@@ -44,6 +44,18 @@ control `227.5 / 49.7 / 268.1ms` to `242.9 / 49.1 / 289.3ms` and then
 padding route unless it improves tree median TTFT/E2E/throughput, not just
 aggregate prefill capture time.
 
+Long_output refreshed the greedy-short first-batch wait. A same-host comparison
+on `8b0dde3` showed TorchInferno already wins local median TPOT against vLLM and
+SGLang (`24.9ms` vs `28.4ms` and `25.1ms`) but still loses TTFT/E2E/throughput
+(`284.3 / 1263.8ms` vs SGLang `61.3 / 948.6ms`). Lowering only
+`TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_INITIAL_BATCH_WAIT_MS` from `10` to
+`1` preserved TPOT and improved the row to `262.2 / 24.8 / 1193.6ms`, with
+phase total `24.73s -> 24.11s`. Lowering the refill floor to `1` is rejected:
+it improved TTFT to `152.9ms` but regressed TPOT/E2E/throughput to
+`32.6ms / 1380.0ms / 27.9 tok/s` by fragmenting into `190` prefill batches.
+Promote the `1ms` greedy-short first-batch wait only; this bucket stays below
+few_shot's `256`-token cap and targets long_output.
+
 ## Public run 20260628_190318 and finished-prefix reuse rejection (2026-06-28)
 
 Public run `20260628_190318` measured TorchInferno `4000a03`, vLLM `c2127a2`,

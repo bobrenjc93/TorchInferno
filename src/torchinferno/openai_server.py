@@ -775,14 +775,12 @@ def _online_initial_batch_wait_ms(*, temperature: float, max_tokens: int) -> flo
         128,
         minimum=1,
     ):
-        # Long-output-style short greedy requests arrive from a 64-worker client
-        # pool; short waits frequently admit tiny first waves, fragmenting suffix
-        # prefill and decode. Local TP8 A/B on 70B improved long_output E2E and
-        # throughput at 10ms versus 5ms while staying below few_shot's 256-token
-        # cap.
+        # Long-output-style short greedy requests are decode-throughput bound.
+        # Current TP8 A/B keeps the shorter first wait: it preserves TPOT while
+        # reducing TTFT/E2E, and this bucket stays below few_shot's 256-token cap.
         default_wait_ms = env_float(
             "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_INITIAL_BATCH_WAIT_MS",
-            10.0,
+            1.0,
             minimum=0.0,
         )
     elif temperature <= 0.0 and max_tokens > 0:
