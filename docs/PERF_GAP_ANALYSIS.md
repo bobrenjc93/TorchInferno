@@ -236,6 +236,17 @@ in online phase time, `5.56s` in prefill wall, and paid two request-path
 ragged-prefill captures totaling `2.00s`; deterministic eval sessions handled
 the other `80` requests and were mostly decode-GPU bound.
 
+A later queue-profile refresh on `7edb9e8` added capture-shape counters and
+showed the remaining sampled captures were not the warmed `b32` bucket, but
+unpaddable active-row shapes: `ragged_prefill:b31:s16:rows1:ctx-256:src1` and
+`ragged_prefill:b20:s16:rows1:ctx-256:src1`. Splitting those unpaddable groups
+into power-of-two sub-batches removed request-path captures and cut aggregate
+profiled phase time (`11.90s -> 9.10s`) plus p99 E2E, but regressed the
+score-facing focused tree row to `266.0 / 50.1 / 317.1ms` by increasing median
+first-token delay. The patch was reverted; do not promote power-of-two
+sub-batching unless it preserves median TTFT/E2E, not just aggregate phase time
+or p99.
+
 Rechecking sampled common-prefix warmup alignment with
 `TORCHINFERNO_OPENAI_WARMUP_ONLINE_SAMPLED_COMMON_PREFIX_TEMPERATURE=0.7` is
 still rejected on the current stack. The unprofiled candidate completed
