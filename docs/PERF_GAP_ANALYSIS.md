@@ -1,5 +1,30 @@
 # TorchInferno vs vLLM/sglang — Performance Gap Analysis (Llama-3.1-70B, 8xH100)
 
+## Direct rank-0 shard scatter (2026-06-28)
+
+The old rank-0 shard-scatter checkpoint path used `reduce_scatter_tensor`,
+which forced every nonzero rank to allocate and collectively reduce a full-size
+zero tensor for each checkpoint weight. That explains why the earlier
+`rank0_shard_scatter=1` default was brittle on public hosts: it removed shared
+storage reads but replaced them with very large unnecessary collective inputs.
+
+The shard path now defaults to direct `dist.scatter` when available. Rank 0
+loads each full sharded tensor once, builds equal-sized contiguous shards, and
+scatters those shards directly; nonzero ranks no longer read checkpoint shards
+or allocate full zero inputs. Explicit
+`TORCHINFERNO_TP_RANK0_CHECKPOINT_SHARD_SCATTER=0` still keeps the portable
+per-rank reader, and
+`TORCHINFERNO_TP_RANK0_CHECKPOINT_DIRECT_SCATTER=0` falls back to the old
+reduce-scatter implementation only when shard scatter is explicitly enabled.
+
+Same-host validation on current `e7c7acb` plus this patch selected
+`rank0_direct_scatter=1 rank0_shard_scatter=1` with no provider env override.
+Checkpoint load fell to `16.4s` versus roughly `20s` on the replicated
+page-cache-warm all-rank-shard path; an opt-in run just before the default
+change loaded in `15.8s` and completed self_consistency with 1000/1000
+correctness. This is a startup/shared-storage fix, not a runtime scheduling
+change.
+
 ## Current `564783b` refresh and rejected tree capture bypass (2026-06-28)
 
 The latest public v1 run is still `20260628_030309`, which measures

@@ -2726,6 +2726,7 @@ class Llama3TensorParallelForCausalLM:
             world_size=world_size,
             dtype=torch_dtype,
         )
+        checkpoint_direct_scatter = _rank0_checkpoint_direct_scatter_enabled()
         checkpoint_shard_scatter = _rank0_checkpoint_shard_scatter_enabled(
             device=device,
             world_size=world_size,
@@ -2738,6 +2739,7 @@ class Llama3TensorParallelForCausalLM:
                 f"rank0_broadcast={int(checkpoint_broadcast)} "
                 f"rank0_replicated_broadcast={int(checkpoint_replicated_broadcast)} "
                 f"rank0_replicated_page_cache_warm={int(checkpoint_replicated_page_cache_warm)} "
+                f"rank0_direct_scatter={int(checkpoint_direct_scatter)} "
                 f"rank0_shard_scatter={int(checkpoint_shard_scatter)}",
                 flush=True,
             )
@@ -5665,11 +5667,20 @@ def _rank0_checkpoint_shard_scatter_enabled(
             world_size=world_size,
             dtype=dtype,
         )
-    return _tp_flag("TORCHINFERNO_TP_RANK0_CHECKPOINT_SHARD_SCATTER", False)
+    return _tp_flag(
+        "TORCHINFERNO_TP_RANK0_CHECKPOINT_SHARD_SCATTER",
+        _rank0_checkpoint_direct_scatter_enabled(),
+    )
 
 
 def _rank0_checkpoint_scatter_enabled() -> bool:
     return _tp_flag("TORCHINFERNO_TP_RANK0_CHECKPOINT_SCATTER", True)
+
+
+def _rank0_checkpoint_direct_scatter_enabled() -> bool:
+    if not hasattr(dist, "scatter"):
+        return False
+    return _tp_flag("TORCHINFERNO_TP_RANK0_CHECKPOINT_DIRECT_SCATTER", True)
 
 
 def _checkpoint_broadcast_chunk_bytes() -> int:
@@ -5832,6 +5843,18 @@ def _load_checkpoint_tensor_shard_scatter(
     output_shape = list(shape)
     output_shape[dim] = shard
     output = torch.empty(tuple(output_shape), device=device, dtype=dtype)
+
+    if _rank0_checkpoint_direct_scatter_enabled():
+        scatter_list = None
+        if rank == 0:
+            tensor = loader.get_tensor(name, device=device, dtype=dtype)
+            scatter_list = [
+                chunk if chunk.is_contiguous() else chunk.contiguous()
+                for chunk in tensor.split(shard, dim=dim)
+            ]
+            del tensor
+        dist.scatter(output, scatter_list=scatter_list, src=0)
+        return output if output.is_contiguous() else output.contiguous()
 
     if rank == 0:
         tensor = loader.get_tensor(name, device=device, dtype=dtype)
