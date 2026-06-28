@@ -32,6 +32,18 @@ fragmented arrivals (`367` submit batches, `271` prefix-reuse batches,
 `572.5ms` idle-drain wait) rather than a clean sampler win, so keep the
 repeated-Gumbel threshold at `128`.
 
+Tree sampled-prefix padding with free prefix-cache rows is also rejected on
+current `d0093e5`. The working-tree patch let odd common-prefix suffix batches
+borrow unused prefix-cache rows so they could replay warmed bucket graphs instead
+of capturing request-path shapes. Queue profiles confirmed the intended internal
+effect: the two focused tree runs eliminated the prior `b17`/`b31` suffix graph
+captures and cut profiled prefill wall from the current control's `6.67s` to
+about `4.6s`. The score-facing medians still regressed from the same-host
+control `227.5 / 49.7 / 268.1ms` to `242.9 / 49.1 / 289.3ms` and then
+`238.5 / 51.0 / 282.8ms`, so the code patch was reverted. Do not reopen this
+padding route unless it improves tree median TTFT/E2E/throughput, not just
+aggregate prefill capture time.
+
 ## Public run 20260628_190318 and finished-prefix reuse rejection (2026-06-28)
 
 Public run `20260628_190318` measured TorchInferno `4000a03`, vLLM `c2127a2`,
