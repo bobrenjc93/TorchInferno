@@ -31,6 +31,16 @@ prefix-graph misses, and raised phase time from `8.14s` to `9.09s`
 row caps need a separate decode/prefill shape improvement before they are useful
 for few_shot.
 
+Rechecking the greedy-large initial collection window after the suffix-bucket
+change is also rejected. Forcing
+`TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_INITIAL_BATCH_WAIT_MS=5` on current
+`8d1085d` completed multi_turn at `327.6 / 64.9 / 390.9ms`, which looks better
+than the focused no-env E2E but gives back TPOT. The queue counters do not
+support it as a real server-side win: the initial batch stayed at `5`, phase
+time rose to `9.94s` versus the no-env confirmation's `9.22s`, and both prefill
+wall and decode-active time were higher. Keep the `10ms` greedy-large first
+collection default; the suffix-bucket change did not reopen the old 5ms tradeoff.
+
 ## FlashInfer packaging and no-FI decode A/B (2026-06-28)
 
 Public provider logs for `20260628_190318` showed vLLM and SGLang running with
