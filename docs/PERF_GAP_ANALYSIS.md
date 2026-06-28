@@ -236,6 +236,15 @@ initial/idle wait, min-ready, decode-quantum, or HTTP worker-prestart knobs from
 this evidence; the next self lever needs a batching/command-cadence change that
 improves no-profile medians and full-order behavior together.
 
+An active-arrival coalescing prototype is rejected on current `5320caf`. The
+patch added an opt-in sampled-short active drain window and the 2ms A/B landed
+at `229.6 / 0.0 / 340.1ms`, which improved isolated TTFT but left E2E flat and
+moved queue counters the wrong way versus the paired profile (`2.85s -> 2.92s`
+phase time, `198 -> 202` runtime steps, `196 -> 200` prefix-reuse batches, and
+`1.59s -> 1.65s` prefill wall). The prototype was reverted. Do not add an
+active wait in front of live sampled-short submissions without a throughput/E2E
+win.
+
 ## Published local refresh and rejected follow-ups (2026-06-28)
 
 The public result stream stalled after `20260628_050325`, so a same-host
