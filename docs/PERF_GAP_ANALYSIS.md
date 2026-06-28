@@ -1,5 +1,40 @@
 # TorchInferno vs vLLM/sglang — Performance Gap Analysis (Llama-3.1-70B, 8xH100)
 
+## Public run 20260628_190318 and finished-prefix reuse rejection (2026-06-28)
+
+Public run `20260628_190318` measured TorchInferno `4000a03`, vLLM `c2127a2`,
+and SGLang `ad30a99`. The scorecard moved to vLLM `16/20`, SGLang `2/20`,
+TorchInferno `1/20`. TorchInferno kept only the few_shot TPOT cell
+(`46.8ms` vs vLLM `47.4ms`), while public medians stayed behind on
+self_consistency (`280.7 / 300.7ms` TTFT/E2E vs vLLM `186.9 / 211.4ms`),
+multi_turn (`414.2 / 58.5 / 470.7ms` vs vLLM `163.3 / 51.0 / 206.4ms`),
+tree_of_thought (`264.2 / 42.6 / 310.0ms` vs vLLM
+`64.5 / 32.7 / 89.2ms`), and long_output
+(`288.3 / 21.5 / 1060.7ms` vs vLLM `79.1 / 14.8 / 638.6ms`). This public row
+still predates the later pushed queue-profile/capture-shape docs and code
+through `8ee6cb8`.
+
+A current same-host multi_turn control on `8ee6cb8` landed at
+`360.0 / 61.5 / 423.8ms`, with no request-path prefill graph captures,
+`5.39s` prefill wall, and `78.8k` prefill tokens across `34` prefix-graph
+batches. Finished-prefix KV reuse remains rejected even when routed through the
+non-common graph path. Enabling finished-prefix cache plus non-common finished
+prefix graph prefill cut prefill tokens to `16.6k`, but fragmented into
+`303` prefix-reuse batches, paid `84` graph captures (`48.1s`), and regressed
+the row to `3524.4 / 66.8 / 3588.8ms`. Grouping mixed prefix lengths together
+without a graphable context bucket avoided the capture storm but missed the
+prefill graph (`31` misses), spent `17.2s` in prefill wall, and landed at
+`1069.2 / 64.8 / 1137.7ms`.
+
+A source prototype then forced mixed-prefix graph prefill through a static
+negative context bucket instead of `context_len=None`. It did turn the path into
+graph hits, but the cold run still landed at `450.2 / 69.7 / 518.0ms` with
+`9.7s` capture time, and a same-server warm second pass was still slower than
+the default at `400.1 / 62.2 / 447.9ms`. The patch was reverted. Do not enable
+finished-prefix cache, mixed-prefix prefill, mixed-prefix graph prefill, or
+startup warmups for those mixed source-row shapes unless a new implementation
+beats the default median TTFT/E2E as well as aggregate phase time.
+
 ## Public direct-scatter startup regression (2026-06-28)
 
 Public submit run `20260628_110307` failed before any TorchInferno benchmark
