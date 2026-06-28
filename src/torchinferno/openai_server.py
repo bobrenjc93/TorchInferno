@@ -832,8 +832,14 @@ def _online_greedy_common_prefix_suffix_prefill_warmup_enabled() -> bool:
     return env_flag("TORCHINFERNO_OPENAI_WARMUP_ONLINE_GREEDY_COMMON_PREFIX_SUFFIX_PREFILL", True)
 
 
+def _online_greedy_common_prefix_suffix_prefill_warmup_max_token_values() -> tuple[int, ...]:
+    configured = os.environ.get("TORCHINFERNO_OPENAI_WARMUP_ONLINE_GREEDY_COMMON_PREFIX_MAX_TOKENS")
+    values = _parse_positive_int_csv(configured if configured is not None else "128,512")
+    return values or (512,)
+
+
 def _online_greedy_common_prefix_suffix_prefill_warmup_max_tokens() -> int:
-    return env_int("TORCHINFERNO_OPENAI_WARMUP_ONLINE_GREEDY_COMMON_PREFIX_MAX_TOKENS", 512, minimum=1)
+    return _online_greedy_common_prefix_suffix_prefill_warmup_max_token_values()[-1]
 
 
 def _online_greedy_common_prefix_suffix_prefill_warmup_prefix_tokens(max_seq_len: int) -> tuple[int, ...]:
@@ -2834,23 +2840,23 @@ class OpenAICompletionEngine:
                                             flush=True,
                                         )
                         _reset_generation_cache(cache)
-                greedy_suffix_warmup_max_tokens = (
-                    _online_greedy_common_prefix_suffix_prefill_warmup_max_tokens()
-                )
-                with _tensor_parallel_symm_mem_allreduce_scope(
-                    self.model,
-                    self.device,
-                    max_tokens=greedy_suffix_warmup_max_tokens,
-                    temperature=0.0,
+                for greedy_suffix_warmup_max_tokens in (
+                    _online_greedy_common_prefix_suffix_prefill_warmup_max_token_values()
                 ):
-                    self._warmup_online_greedy_common_prefix_suffix_prefill_graphs(
-                        cache,
-                        vocab_size,
-                        cache_rows=cache_batch,
-                        max_active=max_active,
-                        max_seq_len=max_seq_len,
-                        warmup_max_tokens=greedy_suffix_warmup_max_tokens,
-                    )
+                    with _tensor_parallel_symm_mem_allreduce_scope(
+                        self.model,
+                        self.device,
+                        max_tokens=greedy_suffix_warmup_max_tokens,
+                        temperature=0.0,
+                    ):
+                        self._warmup_online_greedy_common_prefix_suffix_prefill_graphs(
+                            cache,
+                            vocab_size,
+                            cache_rows=cache_batch,
+                            max_active=max_active,
+                            max_seq_len=max_seq_len,
+                            warmup_max_tokens=greedy_suffix_warmup_max_tokens,
+                        )
             prefill_chunk = env_int("TORCHINFERNO_OPENAI_TP_ONLINE_PREFILL_CHUNK", 0, minimum=0)
             if prefill_chunk > 0:
                 ragged_prefill_graph = getattr(self.model, "try_prefill_ragged_logits_graph", None)

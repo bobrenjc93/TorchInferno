@@ -3516,11 +3516,17 @@ Rejected follow-ups in this loop:
 - Reducing sampled-short initial wait to 5ms is rejected:
   `233.2 / 0.0 / 356.7ms` with the same high tail.
 
-Post-`d3131f4` local refresh (2026-06-27): the public run is still stale at
-TorchInferno `ccb13de`, but the current no-profile TorchInferno-only stack
-landed at few_shot `141.6 / 46.7 / 182.5ms`, self_consistency
-`195.5 / 0.0 / 234.8ms`, multi_turn `346.5 / 60.6 / 410.3ms`,
-tree_of_thought `229.6 / 46.8 / 271.4ms`, and long_output
+Post-`d3131f4` local refresh (2026-06-27): public run `20260627_230306`
+measured TorchInferno `d3131f4`, so it still predates the later `1c52093`
+small-batch greedy suffix warmup. The public row kept only the few_shot TPOT
+cell and showed TorchInferno at few_shot `249.6 / 49.0 / 298.7ms`,
+self_consistency `281.9 / 0.0 / 303.1ms`, multi_turn
+`366.3 / 60.2 / 428.5ms`, tree_of_thought `262.1 / 43.0 / 310.7ms`, and
+long_output `321.8 / 21.5 / 1127.0ms`. The current no-profile
+TorchInferno-only stack landed at few_shot `141.6 / 46.7 / 182.5ms`,
+self_consistency `195.5 / 0.0 / 234.8ms`, multi_turn
+`346.5 / 60.6 / 410.3ms`, tree_of_thought `229.6 / 46.8 / 271.4ms`, and
+long_output
 `255.4 / 24.1 / 1231.9ms` with in-family correctness. Focused tree follow-ups
 rejected sampled-medium `max_active=40` repeat (`280.2 / 48.3 / 325.1ms`),
 capture-on-miss disable (`280.1 / 50.0 / 325.1ms`), and sampled-medium idle
@@ -3537,6 +3543,28 @@ request-path captures (`1 -> 0`) and moved the profiled multi row from
 phase total `11.4s -> 9.34s`, prefill wall `6010.8ms -> 5473.1ms`, and decode
 active `5087.1ms -> 3575.2ms`. Promote the extra startup batches; startup moved
 from about `110.5s` to `125.5s`, which is not score-facing.
+
+The greedy suffix warmup also had a precision-policy mismatch: it captured under
+a 512-token greedy policy, while short greedy sessions such as long_output run
+with FP8 prefill disabled. A targeted env-only long_output run that warmed the
+same configured suffix graphs under the short greedy policy eliminated request
+path prefill captures (`8 -> 0`) and cut the profiled row to
+`239.4 / 23.7 / 1139.1ms`, with prefill wall `9979.7ms -> 5874.1ms`. Promote
+the policy part only: startup greedy suffix warmup now covers both short and
+large greedy max-token policies (`128,512`) for whatever prefix/suffix shapes
+are already configured. Exact additional prefix-token warmups remain env-only
+until there is a general dynamic-prefix graph path.
+
+Rejected follow-ups after the public `d3131f4` refresh:
+- Prompt-lookup decode for long_output accepted copied prompt tokens but routed
+  verification through expensive eager multi-token forwards; an interrupted run
+  had only `340` submitted requests after `93.5s` of runtime step time.
+- Extending sampled submit+step to tree's 300-token sampled-medium branch
+  landed at `235.7 / 51.1 / 283.5ms`, slightly worse than the nearby control,
+  with queue phase time essentially unchanged.
+- Disabling common-prefix prefill capture-on-miss for few_shot removed the cold
+  capture cost but made every suffix prefill eager and regressed the row to
+  `534.3 / 46.9 / 573.0ms`.
 
 ## In-flight, validated-locally-but-NOT-benchmarked commits
 
