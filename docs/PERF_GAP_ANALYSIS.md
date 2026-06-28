@@ -46,7 +46,34 @@ self_consistency `248.2 / 0.0 / 267.6ms` versus vLLM
 `161.5 / 52.1 / 203.1ms`, tree_of_thought `278.6 / 41.5 / 318.2ms` versus
 vLLM `63.1 / 31.6 / 86.4ms`, and long_output `256.9 / 21.6 / 1102.9ms` versus
 vLLM `70.1 / 14.8 / 590.7ms` (TTFT/TPOT/E2E). Latest `main` through `f431d1c`
-is docs-only after `3f37307`, so these are current-code gaps.
+is no longer represented by this public row: it predates the later greedy-large
+FP8 prefill gate, sampled-short online step-sync skip, and validation-only docs
+through `56129eb`.
+
+A same-host skip-build comparison on pushed `56129eb` refreshed the local
+provider gap with current TorchInferno code. The run intentionally covered
+self_consistency, multi_turn, tree_of_thought, and long_output, so the
+self_consistency row is colder than the full public-order TorchInferno pass
+that runs few_shot first. Local rows were:
+
+- self_consistency: TorchInferno `303.8 / 0.0 / 328.0ms`, vLLM
+  `256.0 / 0.0 / 318.5ms`, SGLang `192.7 / 0.0 / 356.7ms`.
+- multi_turn: TorchInferno `372.6 / 60.8 / 440.3ms`, vLLM
+  `288.7 / 116.5 / 393.6ms`, SGLang `149.3 / 106.8 / 260.2ms`.
+- tree_of_thought: TorchInferno `210.9 / 47.7 / 246.0ms`, vLLM
+  `123.5 / 82.7 / 185.7ms`, SGLang `63.6 / 69.4 / 152.6ms`.
+- long_output: TorchInferno `268.3 / 24.7 / 1136.6ms`, vLLM
+  `90.2 / 26.6 / 1038.7ms`, SGLang `64.3 / 24.4 / 919.6ms`.
+
+This confirms the same shape as the public gap after the latest local source
+changes: TorchInferno is still competitive on deterministic TPOT, but TTFT and
+p99 E2E remain dominated by first-token prefill/admission and decode/readback
+tails. The competitor logs show vLLM and SGLang both relying on broad
+piecewise/chunked prefill graph coverage and large paged KV pools; previously
+rejected local probes already cover the nearby TorchInferno knobs
+(larger suffix warmup, lower refill floors, no-step-sync for deterministic
+traffic, paged KV at the 569-token multi_turn shape, and naive chunked/unified
+prefill).
 
 The same-host skip-build comparison on pushed `6425184` remains useful for local
 A/Bs, but no longer replaces public evidence. The local all-provider run
