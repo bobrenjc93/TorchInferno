@@ -58,6 +58,15 @@ prefill graph capture and `1.87s` prefill wall, and later waves still fragmented
 into small prefill/decode groups. Keep the sampled-medium `10ms` first collection
 window; shortening it does not recover the tree TTFT/E2E gap.
 
+A pinned CPU readback buffer for decode-many is rejected. An opt-in patch reused
+a pinned host tensor for the post-quantum token harvest instead of allocating via
+`.cpu()` each time. The focused long_output run preserved correctness and landed
+near the median E2E band (`294.9 / 25.3 / 1205.9ms`), but TTFT/tails worsened
+and the counters did not improve: `runtime_decode_ragged_cpu_tokens_ms` stayed
+at about `6.9s`, while total online phase rose to `22.86s`. The patch was
+reverted; the long_output gap needs fewer/smarter decode harvests or real
+overlap, not just pinned-memory reuse for the same synchronous copy.
+
 ## FlashInfer packaging and no-FI decode A/B (2026-06-28)
 
 Public provider logs for `20260628_190318` showed vLLM and SGLang running with
