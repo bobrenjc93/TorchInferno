@@ -130,6 +130,22 @@ phase total `8.88s -> 8.04s`, prefill wall `6.24s -> 5.45s`, prefill forward
 `4.61s -> 3.81s`, and request-path captures `3 -> 2`. This is only one extra
 startup graph shape per suffix/policy and does not alter runtime scheduling.
 
+Raising the greedy-large online initial collection window to `10ms` is
+promoted for the 512-token multi-turn path. On current `55475d1`, the focused
+default landed at `378.6 / 65.1 / 445.7ms` with an initial batch of `2`,
+`10.97s` total online phase time, `5.93s` prefill wall, and no request-path
+prefill captures. Setting
+`TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_INITIAL_BATCH_WAIT_MS=10` admitted
+`9` initial requests, kept captures at zero, and moved the focused row to
+`363.0 / 59.2 / 421.3ms` with `9.27s` phase time and `5.53s` prefill wall.
+A source-default confirmation with the code change landed at
+`372.9 / 61.6 / 440.0ms`, still at zero request-path captures and `9.51s`
+phase time. The adjacent `15ms` check was worse at
+`369.9 / 62.2 / 432.7ms`, so keep the new default at `10ms`. Raising the active
+cap to `48` remains rejected: it regressed to `592.7 / 65.6 / 665.3ms`,
+introduced four request-path prefill captures, and pushed prefill wall to
+`9.66s`.
+
 Current multi_turn on pushed `6659e61` is still prefill dominated:
 `366.8 / 62.8 / 426.0ms`, with `5.52s` prefill wall, `3.54s` decode active,
 and only common-prefix reuse (`45,000` reused prefix tokens). A mixed-prefix

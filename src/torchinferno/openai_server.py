@@ -763,13 +763,12 @@ def _online_initial_batch_wait_ms(*, temperature: float, max_tokens: int) -> flo
         )
         if greedy_large_min_tokens < max_tokens <= greedy_large_max_tokens:
             # Multi-turn 512-token greedy traffic is dominated by prefix/suffix
-            # prefill waves. A short first collection window admitted more of the
-            # initial client wave and cut local TP8 70B multi_turn from
-            # 493.2/76.4/571.8ms to 482.1/69.6/557.5ms (TTFT/TPOT/E2E), without
-            # affecting few_shot or short greedy long_output.
+            # prefill waves. A 10ms first collection window admits more of the
+            # initial client wave and reduces prefill/decode fragmentation, while
+            # staying scoped above few_shot and short greedy long_output.
             default_wait_ms = env_float(
                 "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_INITIAL_BATCH_WAIT_MS",
-                5.0,
+                10.0,
                 minimum=0.0,
             )
     return default_wait_ms
