@@ -51,6 +51,19 @@ is rejected: it made long_output faster internally but regressed multi_turn to
 `433.9 / 60.7 / 493.6ms`. The scoped version kept multi_turn in band at
 `364.7 / 62.3 / 423.6ms` with zero prefill captures.
 
+A full local TorchInferno-only pass on pushed `f1114b6` completed with the
+expected correctness band: few_shot `160.4 / 49.1 / 199.3ms`,
+self_consistency `302.7 / 0.0 / 329.8ms`, multi_turn
+`339.0 / 58.3 / 400.5ms`, tree_of_thought `230.5 / 46.7 / 277.5ms`, and
+long_output `257.5 / 25.0 / 1231.0ms`. The remaining local self-consistency
+issue is row-order/client-wave sensitive: a focused self-only profile on the
+same code landed at `199.6 / 0.0 / 345.2ms`, while the fast HTTP handler's
+server-side median total was only `16.5ms` after request read. Raising
+`TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_SHORT_IDLE_BATCH_WAIT_MS` from `10` to
+`20` is rejected for now: it improved self E2E/throughput to
+`317.0ms`/`3.2 tok/s`, but regressed TTFT to `296.7ms` and barely moved queue
+phase time (`2.97s -> 2.90s`).
+
 ## Current `578e117` refresh and rejected follow-ups (2026-06-28)
 
 The latest public v1 run is `20260628_010307`, which measures TorchInferno
