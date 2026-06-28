@@ -533,6 +533,22 @@ def _online_fp8_prefill_min_m(*, temperature: float, max_tokens: int) -> int:
             256,
             minimum=1,
         )
+    greedy_large_min_tokens = env_int(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_FP8_PREFILL_MIN_TOKENS",
+        400,
+        minimum=1,
+    )
+    greedy_large_max_tokens = env_int(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_FP8_PREFILL_MAX_TOKENS",
+        512,
+        minimum=greedy_large_min_tokens,
+    )
+    if temperature <= 0.0 and greedy_large_min_tokens < max_tokens <= greedy_large_max_tokens:
+        return env_int(
+            "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_FP8_PREFILL_MIN_M",
+            512,
+            minimum=1,
+        )
     return 2048
 
 

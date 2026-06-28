@@ -135,6 +135,20 @@ not produce a sampled tree win: default tree_of_thought landed at
 dense ragged token graph and do not add a FlashInfer decode-append branch
 without a clear sampled score-facing gain.
 
+A current multi_turn recheck on pushed `c1ac1b1` showed the greedy-large
+512-token path is still prefill dominated: the default focused row landed at
+`379.9 / 64.4 / 451.1ms`, with `5.81s` prefill wall and `5.35s` prefill
+forward across `34` graph-backed prefix/suffix batches. Lowering only the
+online greedy-large FP8 prefill M gate from `2048` to `512` improved the row to
+`359.4 / 59.5 / 420.3ms` in the explicit-env A/B and `366.5 / 62.0 /
+432.5ms` after making it the no-env default in the working tree. The default
+confirmation profile recorded `fp8_prefill_min_m=512`, `5.63s` prefill wall,
+and `5.18s` prefill forward, preserving the same `34` prefill batches and
+1000/1000 finished events. Promote the `512` gate only for the existing
+deterministic greedy-large online FP8 policy (`400 < max_tokens <= 512`);
+sampled-medium keeps its separate `256` gate, and non-FP8 traffic remains out
+of this policy.
+
 ## Current long-output admission profile (2026-06-28)
 
 On pushed `5c67607`, same-host focused long_output control completed at
