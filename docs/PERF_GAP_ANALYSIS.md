@@ -74,6 +74,28 @@ worsened p99 TTFT/E2E to `2973.8/3562.5ms`. Keep the sampled warmup temperature
 default at `1.0`; current tree work should avoid retesting this knob and focus
 on a different prefill/session pipeline change.
 
+## Current multi-turn admission refresh (2026-06-28)
+
+Current pushed `0db61a5` keeps focused multi_turn in the recent band but still
+well behind vLLM/SGLang on queue-facing latency. The no-profile control reached
+`/health` in `145.6s` and completed `981/1000` raw requests correct at
+`354.4 / 62.5 / 414.3ms`, with p99 TTFT/E2E `3393.6/3430.4ms`. The queue
+profile landed nearby at `373.7 / 65.7 / 440.2ms` and shows the current
+mechanism clearly: `34/34` prefill graph hits, zero request-path prefill
+captures, `5.78s` prefill wall (`5.31s` forward), `45,000` reused common-prefix
+tokens, `82,874` raw prefill tokens, `4.12s` decode-active, and
+`704ms` CPU token harvest. The remaining gap is not startup graph coverage; it
+is the dense conversation-prefix/suffix prefill floor plus decode interleaving.
+
+Two first-wave admission follow-ups are rejected. Raising the fixed
+`TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_INITIAL_BATCH_WAIT_MS` to `20`
+improved p99 TTFT/E2E to `2178.5/2249.0ms`, but regressed score-facing median to
+`364.8 / 63.5 / 429.1ms`. A bounded reset-on-arrival prototype with the same
+`20ms` cap also regressed median to `373.6 / 62.3 / 433.6ms` and did not keep
+the fixed-wait tail win (`3064.8/3086.6ms` p99). Keep the greedy-large initial
+wait at `10ms`; multi_turn needs a lower-overhead conversation-prefix reuse or
+prefill pipeline change rather than another first-wave wait knob.
+
 ## Published local refresh and rejected follow-ups (2026-06-28)
 
 The public result stream stalled after `20260628_050325`, so a same-host
