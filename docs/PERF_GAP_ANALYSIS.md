@@ -91,6 +91,26 @@ captures, and `7.82s` to `9.13s` aggregate sampled phase time. The patch was
 reverted; the remaining tree gap is still suffix-prefill capture/phase
 fragmentation plus decode, not common-prefix row registration.
 
+Two later cache/transport probes are also rejected. Persisting common-prefix
+rows across online sessions worked mechanically (`restored_common_prefixes=1`
+after the first session and later sessions skipped the `common_prefix:b1:t45`
+prefill), but the focused tree row regressed to `256.5 / 50.6 / 305.6ms`.
+Sampled sessions gained an extra request-path capture and moved from `7.82s`
+to `9.09s` aggregate phase time, so the code was backed out. A primary-only
+generated-prefix fast-answer path is unsafe for TP: cached-logit sampling enters
+the Llama3 tensor-parallel sampler, which uses distributed collectives, so rank
+0 cannot sample without matching worker participation. The self_consistency run
+with that prototype hung before writing a queue profile; do not reintroduce it
+without a symmetric worker command.
+
+Fast-HTTP keepalive is not a broad latency fix. With queue and HTTP profiling
+enabled, disabling streaming keepalive improved self_consistency modestly
+(`250.2 / 0.0 / 341.2ms` to `240.6 / 0.0 / 326.4ms`), but tree_of_thought
+regressed to `281.0 / 51.2 / 322.6ms` with a much worse p99. Keep the fast HTTP
+default on; the self row's server-side first-content median is already around
+`18ms` after request read, so the remaining gap is not a simple SSE write or
+keepalive setting.
+
 Current multi_turn on pushed `6659e61` is still prefill dominated:
 `366.8 / 62.8 / 426.0ms`, with `5.52s` prefill wall, `3.54s` decode active,
 and only common-prefix reuse (`45,000` reused prefix tokens). A mixed-prefix
