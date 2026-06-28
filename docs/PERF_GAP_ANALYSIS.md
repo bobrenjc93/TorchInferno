@@ -147,7 +147,11 @@ and `5.18s` prefill forward, preserving the same `34` prefill batches and
 1000/1000 finished events. Promote the `512` gate only for the existing
 deterministic greedy-large online FP8 policy (`400 < max_tokens <= 512`);
 sampled-medium keeps its separate `256` gate, and non-FP8 traffic remains out
-of this policy.
+of this policy. A post-push TorchInferno-only five-benchmark pass on `ddbad82`
+kept the scoped behavior: few_shot `160.6 / 49.9 / 201.3ms`,
+self_consistency `306.9 / 0.0 / 338.4ms`, multi_turn
+`341.8 / 60.3 / 401.4ms`, tree_of_thought `249.5 / 47.8 / 284.9ms`, and
+long_output `280.9 / 24.2 / 1307.6ms`.
 
 ## Current long-output admission profile (2026-06-28)
 
