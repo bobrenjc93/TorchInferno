@@ -79,6 +79,31 @@ focused row landed at `225.3 / 50.4 / 265.1ms`. Queue profiles still showed two
 request-path prefill graph captures and worse TPOT/throughput, so the current
 `M > 256` default remains the safer tradeoff.
 
+Two HTTP/client-side follow-ups are rejected on the current public-order shape.
+A focused self_consistency run with TorchInferno fast-HTTP and queue profiling
+landed at `336.4 / 0.0 / 353.1ms` with 100% correctness, while the server-side
+fast-HTTP profile showed p50 first content at only `17.9ms`. The queue profile
+showed the expected generated-prefix path (`1` store, `983` reuses), so the gap
+is still outside the token send/decode loop and mostly in request admission,
+batching, and command cadence rather than SSE serialization.
+
+An inference-bench thread-local OpenAI/httpx client prototype is not a fair
+default promotion. It preserved correctness and moved the focused TorchInferno
+self row to `307.7 / 0.0 / 327.7ms`, but TTFT was worse than the current public
+row and the E2E/throughput movement was too small and noisy to justify changing
+the harness. The prototype was reverted.
+
+Prestarting TorchInferno's fast-HTTP `ThreadPoolExecutor` workers is also
+rejected as a default. When self_consistency ran first with
+`TORCHINFERNO_OPENAI_HTTP_PRESTART_WORKERS=256`, the focused row improved to
+`181.1 / 0.0 / 287.9ms`, but that is not the public benchmark order. In a
+TorchInferno-only full-order pass with the same setting, few_shot landed at
+`165.9 / 48.3 / 205.8ms`, self at `286.7 / 0.0 / 335.1ms`, multi_turn at
+`335.5 / 61.0 / 397.4ms`, tree at `261.7 / 47.4 / 303.9ms`, and long_output at
+`283.6 / 24.4 / 1159.0ms`. The mixed movement did not create a clear
+score-facing win, and tree/self E2E regressed versus the current public row, so
+the prototype was reverted.
+
 ## Direct rank-0 shard scatter (2026-06-28)
 
 The old rank-0 shard-scatter checkpoint path used `reduce_scatter_tensor`,
