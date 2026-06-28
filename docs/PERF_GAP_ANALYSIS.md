@@ -35,6 +35,15 @@ before one TP submit reduced internal work (`243 -> 196` submit batches and
 Reject both policies; benchmark median TTFT, not only internal phase time, moved
 the wrong way.
 
+An adjacent sampled-short scheduler patch that also used the existing
+submit+step TP command for idle-arrival batches is rejected. The focused
+self_consistency row on current `39e1975` landed at `316.7 / 0.0 / 339.1ms`,
+1000/1000 correct. It trimmed the final queue profile only slightly
+(`243 -> 237` submit batches, `218 -> 212` runtime steps, and about
+`3.18s -> 3.07s` online phase time) while pushing median TTFT substantially
+worse. Keep submit+step combination limited to submissions made while online
+work is already active.
+
 Current long_output remains decode/readback dominated. The focused profile
 (`233.9 / 24.7 / 1251.7ms`) recorded `9.48s` prefill wall, `4.42s` request-path
 prefill graph capture across seven exact-context suffix shapes, `12.48s`
