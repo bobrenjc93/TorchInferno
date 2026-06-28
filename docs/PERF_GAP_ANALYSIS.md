@@ -14,7 +14,7 @@ long_output `301.9 / 25.5 / 1154.4ms` (TTFT/TPOT/E2E). The shape is unchanged:
 TorchInferno's decode TPOT is competitive, but SGLang and vLLM still win most
 TTFT/E2E/throughput cells through lower prefill and scheduling overhead.
 
-Three follow-ups on top of current `467c3c3` are rejected. First, a mixed-prefix
+Several follow-ups on top of current `467c3c3` are rejected. First, a mixed-prefix
 context-bucket prototype made the opt-in finished-prefix graph path unit-correct,
 but the real multi_turn route was still unsafe. With
 `TORCHINFERNO_CONTINUOUS_FINISHED_PREFIX_CACHE=1`,
@@ -38,6 +38,22 @@ preserved correctness but regressed focused tree_of_thought to
 `382.8 / 52.8 / 443.5ms`. Extra prefill/admission capacity introduced more
 prefill and graph-shape pressure than it saved in queueing, so the scaffold was
 reverted.
+
+Two later long_output follow-ups on the same runtime shape are also rejected.
+Forcing deterministic short-generation submit+step commands with
+`TORCHINFERNO_OPENAI_TP_ONLINE_SUBMIT_STEP_COMMAND=1` completed correctly but
+regressed the focused row to `262.0 / 25.0 / 1344.8ms`. It reduced submit-sync
+time, but queue phase still rose to `25.9s` and ragged decode GPU time rose to
+`15.2s`, so command coalescing is still not the limiting factor for long_output.
+
+Adding batch `64` to greedy common-prefix suffix warmup removed the remaining
+request-path long_output prefill capture (`1 -> 0`) and cut the profiled queue
+phase (`24.05s -> 22.78s`), but it did not improve score-facing latency. The
+broad env override regressed the no-profile row to `274.3 / 25.4 / 1322.8ms`,
+and a narrower source patch that warmed only the short-greedy `b64/s64` shape
+also regressed under profiling to `298.2 / 25.1 / 1380.1ms`. Do not promote more
+startup suffix graphs for this row without a score-facing win; the remaining gap
+is still decode/readback and streaming tails, not that single prefill capture.
 
 ## Direct rank-0 shard scatter (2026-06-28)
 
