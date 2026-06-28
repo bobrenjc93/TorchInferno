@@ -104,6 +104,14 @@ TorchInferno-only full-order pass with the same setting, few_shot landed at
 score-facing win, and tree/self E2E regressed versus the current public row, so
 the prototype was reverted.
 
+Extending fast-HTTP assistant-role deferral through 512-token streams is rejected
+for multi_turn. The existing default defers the role frame for streams up to 400
+tokens, so multi_turn's `max_tokens=512` path still sends a standalone role SSE
+chunk before the first content chunk. Raising only
+`TORCHINFERNO_OPENAI_STREAM_DEFER_ROLE_MAX_TOKENS=512` preserved correctness but
+landed at `353.1 / 62.6 / 416.6ms` with a large p99 tail, worse than the current
+public multi_turn row. Keep the role-deferral bound at 400.
+
 ## Direct rank-0 shard scatter (2026-06-28)
 
 The old rank-0 shard-scatter checkpoint path used `reduce_scatter_tensor`,
