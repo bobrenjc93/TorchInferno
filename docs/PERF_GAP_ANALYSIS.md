@@ -3568,6 +3568,14 @@ env-forced dynamic run on long_output is rejected (`263.9 / 25.5 / 1220.7ms`):
 the larger `s32/s64/s128` boolean-mask bucket path slows prefill forward enough
 that those suffixes should stay on the exact flash `context_len` path.
 
+Tree_of_thought exposed the same suffix graph precision mismatch on sampled
+medium traffic (`temperature > 0`, `max_tokens=300`): a profiled run on
+`886ad79` spent `10906.7ms` in 12 request-path prefill graph captures and
+landed at `265.6 / 50.1 / 305.0ms`. Warm the existing common-prefix suffix
+shape set under the sampled-medium FP8 policy as well, but default its sampled
+suffix list to `16` so startup does not capture the larger rejected suffix
+buckets. The local tree rerun moved to `230.3 / 49.4 / 275.3ms`.
+
 Rejected follow-ups after the public `d3131f4` refresh:
 - Prompt-lookup decode for long_output accepted copied prompt tokens but routed
   verification through expensive eager multi-token forwards; an interrupted run

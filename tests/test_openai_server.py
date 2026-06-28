@@ -9369,6 +9369,29 @@ def test_openai_greedy_common_prefix_suffix_warmup_captures_target_shapes(monkey
     assert model.ragged_calls[0][3][8] == 5
     assert cache.reset_count == 3
 
+    model.fp8_calls.clear()
+    model.prefix_calls.clear()
+    model.ragged_calls.clear()
+    cache.reset_count = 0
+    engine._warmup_online_greedy_common_prefix_suffix_prefill_graphs(
+        cache,
+        vocab_size=17,
+        cache_rows=12,
+        max_active=8,
+        max_seq_len=16,
+        warmup_max_tokens=300,
+        warmup_temperature=1.0,
+        warmup_label="sampled",
+    )
+    assert model.fp8_calls == [(True, 256), (False, 2048)]
+    assert model.prefix_calls == [((8,), (1, 5), True)]
+    assert [call[:3] for call in model.ragged_calls] == [
+        ((2, 3), -16, 8),
+        ((4, 3), -16, 8),
+        ((2, 7), -16, 8),
+        ((4, 7), -16, 8),
+    ]
+
 
 def test_openai_startup_runtime_fp8_prefill_warmup_toggles_and_restores(monkeypatch) -> None:
     monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_FP8_PREFILL", raising=False)

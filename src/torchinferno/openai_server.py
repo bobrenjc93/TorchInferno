@@ -843,6 +843,34 @@ def _online_greedy_common_prefix_suffix_prefill_warmup_max_tokens() -> int:
     return _online_greedy_common_prefix_suffix_prefill_warmup_max_token_values()[-1]
 
 
+def _online_sampled_common_prefix_suffix_prefill_warmup_enabled() -> bool:
+    return env_flag("TORCHINFERNO_OPENAI_WARMUP_ONLINE_SAMPLED_COMMON_PREFIX_SUFFIX_PREFILL", True)
+
+
+def _online_sampled_common_prefix_suffix_prefill_warmup_temperature() -> float:
+    return env_float("TORCHINFERNO_OPENAI_WARMUP_ONLINE_SAMPLED_COMMON_PREFIX_TEMPERATURE", 1.0, minimum=0.0)
+
+
+def _online_sampled_common_prefix_suffix_prefill_warmup_max_token_values() -> tuple[int, ...]:
+    configured = os.environ.get("TORCHINFERNO_OPENAI_WARMUP_ONLINE_SAMPLED_COMMON_PREFIX_MAX_TOKENS")
+    default_max = env_int(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_FP8_PREFILL_MAX_TOKENS",
+        300,
+        minimum=1,
+    )
+    values = _parse_positive_int_csv(configured if configured is not None else str(default_max))
+    return values or (default_max,)
+
+
+def _online_sampled_common_prefix_suffix_prefill_warmup_suffix_tokens(max_seq_len: int) -> tuple[int, ...]:
+    if max_seq_len <= 0:
+        return ()
+    tokens = _parse_positive_int_csv(
+        os.environ.get("TORCHINFERNO_OPENAI_WARMUP_ONLINE_SAMPLED_COMMON_PREFIX_SUFFIX_TOKENS", "16")
+    )
+    return tuple(token_count for token_count in tokens if token_count <= max_seq_len)
+
+
 def _online_greedy_common_prefix_suffix_prefill_warmup_prefix_tokens(max_seq_len: int) -> tuple[int, ...]:
     if max_seq_len <= 0:
         return ()
@@ -2858,6 +2886,34 @@ class OpenAICompletionEngine:
                             max_seq_len=max_seq_len,
                             warmup_max_tokens=greedy_suffix_warmup_max_tokens,
                         )
+                if _online_sampled_common_prefix_suffix_prefill_warmup_enabled():
+                    sampled_warmup_temperature = (
+                        _online_sampled_common_prefix_suffix_prefill_warmup_temperature()
+                    )
+                    sampled_suffix_tokens = (
+                        _online_sampled_common_prefix_suffix_prefill_warmup_suffix_tokens(max_seq_len)
+                    )
+                    if sampled_warmup_temperature > 0.0 and sampled_suffix_tokens:
+                        for sampled_suffix_warmup_max_tokens in (
+                            _online_sampled_common_prefix_suffix_prefill_warmup_max_token_values()
+                        ):
+                            with _tensor_parallel_symm_mem_allreduce_scope(
+                                self.model,
+                                self.device,
+                                max_tokens=sampled_suffix_warmup_max_tokens,
+                                temperature=sampled_warmup_temperature,
+                            ):
+                                self._warmup_online_greedy_common_prefix_suffix_prefill_graphs(
+                                    cache,
+                                    vocab_size,
+                                    cache_rows=cache_batch,
+                                    max_active=max_active,
+                                    max_seq_len=max_seq_len,
+                                    warmup_max_tokens=sampled_suffix_warmup_max_tokens,
+                                    warmup_temperature=sampled_warmup_temperature,
+                                    warmup_label="sampled",
+                                    suffix_tokens_override=sampled_suffix_tokens,
+                                )
             prefill_chunk = env_int("TORCHINFERNO_OPENAI_TP_ONLINE_PREFILL_CHUNK", 0, minimum=0)
             if prefill_chunk > 0:
                 ragged_prefill_graph = getattr(self.model, "try_prefill_ragged_logits_graph", None)
@@ -3024,6 +3080,9 @@ class OpenAICompletionEngine:
         max_active: int,
         max_seq_len: int,
         warmup_max_tokens: int | None = None,
+        warmup_temperature: float = 0.0,
+        warmup_label: str = "greedy",
+        suffix_tokens_override: tuple[int, ...] | None = None,
     ) -> None:
         if not _online_greedy_common_prefix_suffix_prefill_warmup_enabled():
             return
@@ -3034,7 +3093,11 @@ class OpenAICompletionEngine:
         if prefix_graph is None:
             return
         prefix_tokens = _online_greedy_common_prefix_suffix_prefill_warmup_prefix_tokens(max_seq_len)
-        suffix_tokens = _online_greedy_common_prefix_suffix_prefill_warmup_suffix_tokens(max_seq_len)
+        suffix_tokens = (
+            suffix_tokens_override
+            if suffix_tokens_override is not None
+            else _online_greedy_common_prefix_suffix_prefill_warmup_suffix_tokens(max_seq_len)
+        )
         batch_sizes = _online_greedy_common_prefix_suffix_prefill_warmup_batches(cache_rows, max_active)
         if not prefix_tokens or not suffix_tokens or not batch_sizes:
             return
@@ -3046,10 +3109,21 @@ class OpenAICompletionEngine:
             return
         if warmup_max_tokens is None:
             warmup_max_tokens = _online_greedy_common_prefix_suffix_prefill_warmup_max_tokens()
-        fp8_prefill_enabled = _online_fp8_prefill_enabled(temperature=0.0, max_tokens=warmup_max_tokens)
+        fp8_prefill_enabled = _online_fp8_prefill_enabled(
+            temperature=warmup_temperature,
+            max_tokens=warmup_max_tokens,
+        )
+        fp8_min_m_env = (
+            "TORCHINFERNO_OPENAI_WARMUP_ONLINE_SAMPLED_COMMON_PREFIX_FP8_MIN_M"
+            if warmup_temperature > 0.0
+            else "TORCHINFERNO_OPENAI_WARMUP_ONLINE_GREEDY_COMMON_PREFIX_FP8_MIN_M"
+        )
         fp8_prefill_min_m = env_int(
-            "TORCHINFERNO_OPENAI_WARMUP_ONLINE_GREEDY_COMMON_PREFIX_FP8_MIN_M",
-            _online_fp8_prefill_min_m(temperature=0.0, max_tokens=warmup_max_tokens),
+            fp8_min_m_env,
+            _online_fp8_prefill_min_m(
+                temperature=warmup_temperature,
+                max_tokens=warmup_max_tokens,
+            ),
             minimum=1,
         )
         try:
@@ -3079,7 +3153,7 @@ class OpenAICompletionEngine:
                 except Exception as exc:
                     import sys as _gpsys
                     print(
-                        f"[WARMUP] greedy common-prefix graph "
+                        f"[WARMUP] {warmup_label} common-prefix graph "
                         f"row={row} tokens={prefix_count}: {exc}",
                         file=_gpsys.stderr,
                         flush=True,
@@ -3124,7 +3198,7 @@ class OpenAICompletionEngine:
                         except Exception as exc:
                             import sys as _gpsys
                             print(
-                                f"[WARMUP] greedy common-prefix suffix graph "
+                                f"[WARMUP] {warmup_label} common-prefix suffix graph "
                                 f"row={row} prefix={prefix_count} suffix={suffix_count} "
                                 f"batch={batch_size}: {exc}",
                                 file=_gpsys.stderr,
@@ -3133,7 +3207,11 @@ class OpenAICompletionEngine:
                 _reset_generation_cache(cache)
         except Exception as exc:
             import sys as _gpsys
-            print(f"[WARMUP] greedy common-prefix suffix warmup failed: {exc}", file=_gpsys.stderr, flush=True)
+            print(
+                f"[WARMUP] {warmup_label} common-prefix suffix warmup failed: {exc}",
+                file=_gpsys.stderr,
+                flush=True,
+            )
         finally:
             _set_tensor_parallel_runtime_fp8_prefill(self.model, enabled=False, min_m=2048)
             _reset_generation_cache(cache)
