@@ -53,6 +53,27 @@ from `1938.6/3261.5ms` p99 TTFT/E2E to `2915.6/4125.9ms`. Lowering only
 arrival collection disabled for greedy short streams until a policy preserves
 tail latency while improving median admission.
 
+## Current tree-of-thought sampled-medium refresh (2026-06-28)
+
+Current pushed `f59602e` keeps the score-facing focused tree row in the expected
+band. The no-profile control reached `/health` in `145.7s` and completed
+`959/992` raw requests correct at `224.9 / 49.4 / 265.3ms`, with p99 TTFT/E2E
+`1491.5/1609.9ms`. A queue-profile run on the same commit is useful for phase
+shape but not for score decisions: profiling synchronizes prefill work and moved
+the row to `314.9 / 49.8 / 368.0ms`. Its final records still show the known
+split: sampled `max_tokens=300` sessions handled `896` requests, spent `8.86s`
+in online phase time, `5.56s` in prefill wall, and paid two request-path
+ragged-prefill captures totaling `2.00s`; deterministic eval sessions handled
+the other `80` requests and were mostly decode-GPU bound.
+
+Rechecking sampled common-prefix warmup alignment with
+`TORCHINFERNO_OPENAI_WARMUP_ONLINE_SAMPLED_COMMON_PREFIX_TEMPERATURE=0.7` is
+still rejected on the current stack. The unprofiled candidate completed
+`963/992` raw correct but regressed the row to `281.4 / 50.4 / 316.5ms` and
+worsened p99 TTFT/E2E to `2973.8/3562.5ms`. Keep the sampled warmup temperature
+default at `1.0`; current tree work should avoid retesting this knob and focus
+on a different prefill/session pipeline change.
+
 ## Published local refresh and rejected follow-ups (2026-06-28)
 
 The public result stream stalled after `20260628_050325`, so a same-host
