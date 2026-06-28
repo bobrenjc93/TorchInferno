@@ -1,5 +1,18 @@
 # TorchInferno vs vLLM/sglang — Performance Gap Analysis (Llama-3.1-70B, 8xH100)
 
+## Current no-profile local scorecard (2026-06-28)
+
+A current no-profile all-provider run on pushed `50580d6` landed at
+TorchInferno `6/20`, vLLM `0/20`, and SGLang `13/20`. This is the best current
+score-facing baseline because the earlier `1702ba1` full pass carried queue
+profiling overhead. TorchInferno now wins few_shot TPOT/E2E
+(`48.5ms` / `202.4ms`), self_consistency E2E/throughput
+(`278.6ms` / `3.6 tok/s`), multi_turn TPOT (`61.4ms`), and tree_of_thought TPOT
+(`47.1ms`). SGLang still leads row-level TTFT/E2E/throughput for multi_turn,
+tree, and long_output; the long_output row remains the broadest gap at
+`301.7 / 24.9 / 1346.9ms` versus SGLang `64.2 / 24.1 / 867.5ms` and vLLM
+`88.0 / 26.0 / 1057.4ms`.
+
 ## Greedy-large multi_turn suffix bucket refinement (2026-06-28)
 
 Current multi_turn is still conversation-prefix prefill dominated, but the
