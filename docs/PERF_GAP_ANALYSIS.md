@@ -50,6 +50,14 @@ that normally needs about `72` decode calls and `1.6k` decode tokens. Keep
 decode-many scoped to short greedy output; few_shot needs a different stop-aware
 decode batching mechanism.
 
+Rechecking sampled-medium tree initial wait `5ms` is rejected on current
+`92c2480`. The focused tree run preserved normal raw correctness (`960/992`) but
+regressed to `280.2 / 49.5 / 323.4ms`, versus the current full-pass default
+`219.0 / 48.1 / 257.4ms`. The first sampled-medium wave paid one request-path
+prefill graph capture and `1.87s` prefill wall, and later waves still fragmented
+into small prefill/decode groups. Keep the sampled-medium `10ms` first collection
+window; shortening it does not recover the tree TTFT/E2E gap.
+
 ## FlashInfer packaging and no-FI decode A/B (2026-06-28)
 
 Public provider logs for `20260628_190318` showed vLLM and SGLang running with
