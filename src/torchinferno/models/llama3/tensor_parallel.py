@@ -5646,7 +5646,11 @@ def _rank0_replicated_checkpoint_page_cache_warm_enabled(
         or "TORCHINFERNO_TP_RANK0_REPLICATED_CHECKPOINT_BROADCAST" in os.environ
     ):
         return False
-    return True
+    # This only orders per-rank reads through rank 0; it is not a collective
+    # broadcast. It helps on local cached filesystems, but public submit hosts
+    # have shown 500s+ initial tensor loads with this path. Keep concurrent
+    # per-rank reads as the portable default.
+    return False
 
 
 def _rank0_checkpoint_shard_scatter_enabled(

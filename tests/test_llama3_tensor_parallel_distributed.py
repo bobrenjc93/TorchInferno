@@ -262,7 +262,7 @@ def test_tensor_parallel_replicated_checkpoint_broadcast_defaults_off_for_cuda_t
     )
 
 
-def test_tensor_parallel_replicated_checkpoint_page_cache_warm_defaults_on_for_cuda_tp(monkeypatch) -> None:
+def test_tensor_parallel_replicated_checkpoint_page_cache_warm_defaults_off_for_cuda_tp(monkeypatch) -> None:
     monkeypatch.setattr(tensor_parallel_module.dist, "is_available", lambda: True)
     monkeypatch.setattr(tensor_parallel_module.dist, "is_initialized", lambda: True)
     monkeypatch.delenv("TORCHINFERNO_TP_RANK0_CHECKPOINT_BROADCAST", raising=False)
@@ -275,7 +275,7 @@ def test_tensor_parallel_replicated_checkpoint_page_cache_warm_defaults_on_for_c
         raising=False,
     )
 
-    assert tensor_parallel_module._rank0_replicated_checkpoint_page_cache_warm_enabled(
+    assert not tensor_parallel_module._rank0_replicated_checkpoint_page_cache_warm_enabled(
         device=torch.device("cuda"),
         world_size=2,
         dtype=torch.bfloat16,

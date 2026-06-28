@@ -15,27 +15,30 @@ packing a later checkpoint tensor.
 This was not an isolated public-host artifact. Submit run `20260628_090338`
 failed the same way on `467c3c3` (`SCATTER`, `SeqNum=78`) while the same direct
 scatter code looked healthy only on the local devgpu run `20260628_093044`
-(`15.9s` checkpoint load). The default has been reverted to the portable
-per-rank safetensor shard reader when
-`TORCHINFERNO_TP_RANK0_CHECKPOINT_SHARD_SCATTER` is unset. Direct scatter remains
-available as an explicit opt-in via
+(`15.9s` checkpoint load). The default has been reverted to portable concurrent
+per-rank safetensor reads for both replicated and sharded checkpoint tensors.
+Replicated page-cache ordering remains available via
+`TORCHINFERNO_TP_RANK0_REPLICATED_CHECKPOINT_PAGE_CACHE_WARM=1`, and direct
+scatter remains available as an explicit opt-in via
 `TORCHINFERNO_TP_RANK0_CHECKPOINT_SHARD_SCATTER=1`, with
 `TORCHINFERNO_TP_RANK0_CHECKPOINT_DIRECT_SCATTER=0` preserving the older
 reduce-scatter fallback only for controlled experiments.
 
-Same-host inference-bench validation on this working-tree patch over `b9cf070`
-selected `rank0_direct_scatter=0 rank0_shard_scatter=0`, loaded initial
-embedding/norm/head tensors in `2.6s`, loaded all `80/80` layers in `20.2s`,
-and reached `/health` in `145.6s`. The focused few_shot row completed at
-`162.8 / 51.2 / 203.6ms` with 98% correctness, matching the expected latency
-band while removing the public SCATTER startup failure mode.
+Same-host inference-bench validation on the follow-up working-tree patch over
+`f9abdc0` selected
+`rank0_replicated_page_cache_warm=0 rank0_direct_scatter=0
+rank0_shard_scatter=0`, loaded initial embedding/norm/head tensors in `0.3s`,
+loaded all `80/80` layers in `18.3s`, and reached `/health` in `145.6s`. The
+focused few_shot row completed at `161.5 / 46.7 / 200.8ms` with 98%
+correctness, matching the expected latency band while removing the public
+SCATTER startup failure mode.
 
 ## Published local refresh and rejected follow-ups (2026-06-28)
 
 The public result stream stalled after `20260628_050325`, so a same-host
 skip-build all-provider run was published as inference-bench
 `20260628_093044` after preloading the conda `libstdc++` needed by the local
-vLLM import path. This is the current public artifact for local comparison:
+vLLM import path. This remains the best same-host artifact for local comparison:
 SGLang won `14/20` metric cells, TorchInferno won `3/20`, and vLLM won `2/20`.
 TorchInferno's rows were few_shot `165.3 / 51.1 / 207.1ms`,
 self_consistency `245.0 / 0.0 / 329.0ms`, multi_turn
