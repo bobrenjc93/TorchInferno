@@ -2,17 +2,18 @@
 
 ## Current `578e117` refresh and rejected follow-ups (2026-06-28)
 
-The latest public v1 run is still `20260627_230306`, which measures
-TorchInferno `d3131f4`, vLLM `9036c89`, and SGLang `073de15`. It therefore
-does not include the two pushed TorchInferno updates from this loop:
-`886ad79` buckets short common-prefix suffix graphs behind the dynamic-context
-path, and `578e117` warms sampled common-prefix suffix graphs under the same
-sampled symmetric-memory policy used at runtime. The public scorecard remains
-vLLM `16/20`, SGLang `2/20`, and TorchInferno `1/20`; public TorchInferno rows
-are few_shot `249.6 / 49.0 / 298.7ms`, self_consistency
-`281.9 / 0.0 / 303.1ms`, multi_turn `366.3 / 60.2 / 428.5ms`,
-tree_of_thought `262.1 / 43.0 / 310.7ms`, and long_output
-`321.8 / 21.5 / 1127.0ms` (TTFT/TPOT/E2E).
+The latest public v1 run is `20260628_010307`, which measures TorchInferno
+`578e117`, vLLM `11a1230`, and SGLang `da802dd`. It includes the two pushed
+TorchInferno runtime updates from this loop: `886ad79` buckets short
+common-prefix suffix graphs behind the dynamic-context path, and `578e117`
+warms sampled common-prefix suffix graphs under the same sampled
+symmetric-memory policy used at runtime. The public scorecard is still vLLM
+`16/20`, SGLang `2/20`, and TorchInferno `1/20`. TorchInferno rows are now
+few_shot `143.2 / 45.3 / 184.2ms`, self_consistency
+`262.6 / 0.0 / 278.0ms`, multi_turn `353.5 / 58.9 / 412.2ms`,
+tree_of_thought `269.8 / 42.3 / 312.2ms`, and long_output
+`316.8 / 22.1 / 1126.9ms` (TTFT/TPOT/E2E). The few_shot row now wins TPOT
+against vLLM, but vLLM still owns the other score cells.
 
 A full local TorchInferno-only pass on pushed `578e117` completed all five
 rows with 100% benchmark-level correctness: few_shot
@@ -55,6 +56,18 @@ split between sampled `max_tokens=300` sessions and deterministic
 decode work across bursty sessions (`~6.3s` aggregated prefill wall and
 `~4.1s` decode-active time in final queue records), not a missed HTTP streaming
 optimization.
+
+Same-host provider comparison remains directionally consistent even though the
+local vLLM import path is slower than the public vLLM row: a skip-build vLLM
+tree-only run with the conda `libstdc++` preloaded completed at
+`131.3 / 84.3 / 193.9ms`, versus local TorchInferno `238.7 / 50.1 / 289.9ms`
+and public vLLM `63.2 / 31.1 / 85.9ms`.
+
+A runtime FP8 ragged-prefill warmup alignment experiment is rejected. Changing
+that startup warmup to use `_dynamic_prefix_prefill_context_len()` instead of
+exact `prefix+suffix` contexts did not remove the two sampled prefix captures
+and regressed the focused tree row to `302.7 / 50.3 / 344.7ms`; the patch was
+reverted.
 
 Current multi_turn on pushed `6659e61` is still prefill dominated:
 `366.8 / 62.8 / 426.0ms`, with `5.52s` prefill wall, `3.54s` decode active,
