@@ -59,18 +59,20 @@ def _dynamic_prefix_prefill_context_len(
     suffix_bucket: int,
     *,
     max_seq_len: int | None = None,
+    max_dynamic_suffix: int | None = None,
 ) -> int:
     exact_len = max(1, int(prefix_len) + int(suffix_bucket))
     explicit_enabled = "TORCHINFERNO_CONTINUOUS_DYNAMIC_PREFIX_PREFILL_GRAPH" in os.environ
     if explicit_enabled:
         dynamic_enabled = env_flag("TORCHINFERNO_CONTINUOUS_DYNAMIC_PREFIX_PREFILL_GRAPH", False)
     else:
-        max_dynamic_suffix = env_int(
-            "TORCHINFERNO_CONTINUOUS_DYNAMIC_PREFIX_PREFILL_MAX_SUFFIX",
-            16,
-            minimum=1,
-        )
-        dynamic_enabled = int(suffix_bucket) <= max_dynamic_suffix
+        if max_dynamic_suffix is None:
+            max_dynamic_suffix = env_int(
+                "TORCHINFERNO_CONTINUOUS_DYNAMIC_PREFIX_PREFILL_MAX_SUFFIX",
+                16,
+                minimum=1,
+            )
+        dynamic_enabled = int(suffix_bucket) <= int(max_dynamic_suffix)
     if not dynamic_enabled:
         return exact_len
     bucket = exact_len
@@ -87,6 +89,28 @@ def _dynamic_prefix_prefill_context_len(
     if bucket < exact_len:
         return exact_len
     return -bucket
+
+
+def _dynamic_prefix_prefill_max_suffix_for_policy(
+    temperature: float,
+    max_tokens: int | None,
+) -> int | None:
+    if "TORCHINFERNO_CONTINUOUS_DYNAMIC_PREFIX_PREFILL_MAX_SUFFIX" in os.environ:
+        return None
+    if temperature > 0.0 or max_tokens is None or int(max_tokens) <= 0:
+        return None
+    short_max_tokens = env_int(
+        "TORCHINFERNO_CONTINUOUS_DYNAMIC_PREFIX_PREFILL_GREEDY_SHORT_MAX_TOKENS",
+        128,
+        minimum=1,
+    )
+    if int(max_tokens) > short_max_tokens:
+        return None
+    return env_int(
+        "TORCHINFERNO_CONTINUOUS_DYNAMIC_PREFIX_PREFILL_GREEDY_SHORT_MAX_SUFFIX",
+        128,
+        minimum=1,
+    )
 
 
 @dataclass(frozen=True)
@@ -333,6 +357,7 @@ class ContinuousBatchEngine:
         enable_decode_many: bool | None = None,
         decode_many_allow_stop: bool | None = None,
         generated_prefix_cache: bool | None = None,
+        max_generation_tokens: int | None = None,
     ) -> None:
         if max_active_requests < 1:
             raise ValueError("max_active_requests must be positive")
@@ -351,6 +376,9 @@ class ContinuousBatchEngine:
         self.cache_backend = cache_backend
         self.page_size = page_size
         self.temperature = temperature
+        self.max_generation_tokens = (
+            None if max_generation_tokens is None else max(0, int(max_generation_tokens))
+        )
         self.max_active_requests = max_active_requests
         self.prefix_cache_capacity = max_active_requests if prefix_cache_capacity is None else prefix_cache_capacity
         self.prefill_token_budget = prefill_token_budget
@@ -411,6 +439,23 @@ class ContinuousBatchEngine:
         self._online_step = 0
         self._online_next_index = 0
         self._pending_decode_ragged_model_events: list[tuple[object, object]] = []
+
+    def _dynamic_prefix_prefill_context_len(
+        self,
+        prefix_len: int,
+        suffix_bucket: int,
+        *,
+        max_seq_len: int | None = None,
+    ) -> int:
+        return _dynamic_prefix_prefill_context_len(
+            prefix_len,
+            suffix_bucket,
+            max_seq_len=max_seq_len,
+            max_dynamic_suffix=_dynamic_prefix_prefill_max_suffix_for_policy(
+                self.temperature,
+                self.max_generation_tokens,
+            ),
+        )
 
     @torch.inference_mode()
     def run(self, requests: list[ServingRequest]) -> list[ServingResult]:
@@ -993,7 +1038,7 @@ class ContinuousBatchEngine:
         cache_max_seq = self._cache_max_seq_len()
         if cache_max_seq is not None:
             chunk_bucket = min(chunk_bucket, max(1, cache_max_seq - cursor))
-        context_len = _dynamic_prefix_prefill_context_len(
+        context_len = self._dynamic_prefix_prefill_context_len(
             cursor,
             chunk_bucket,
             max_seq_len=cache_max_seq,
@@ -1667,7 +1712,7 @@ class ContinuousBatchEngine:
         suffix_bucket = self._suffix_bucket(max(suffix_lengths))
         if cache_max_seq is not None:
             suffix_bucket = min(suffix_bucket, max(1, cache_max_seq - max(prefix_hits)))
-        context_len = None if mixed_prefixes else _dynamic_prefix_prefill_context_len(
+        context_len = None if mixed_prefixes else self._dynamic_prefix_prefill_context_len(
             prefix_hits[0],
             suffix_bucket,
             max_seq_len=cache_max_seq,

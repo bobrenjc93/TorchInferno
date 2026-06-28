@@ -11,6 +11,7 @@ from torchinferno.runtime.serving import (
     ContinuousBatchEngine,
     ServingRequest,
     _dynamic_prefix_prefill_context_len,
+    _dynamic_prefix_prefill_max_suffix_for_policy,
 )
 
 
@@ -30,6 +31,34 @@ def test_dynamic_prefix_prefill_context_len_buckets_when_enabled(monkeypatch) ->
     monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_DYNAMIC_PREFIX_PREFILL_MIN_CONTEXT", "256")
     assert _dynamic_prefix_prefill_context_len(45, 16, max_seq_len=512) == -256
     assert _dynamic_prefix_prefill_context_len(250, 16, max_seq_len=260) == 266
+
+
+def test_dynamic_prefix_prefill_policy_extends_short_greedy_suffixes(monkeypatch) -> None:
+    monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_DYNAMIC_PREFIX_PREFILL_GRAPH", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_DYNAMIC_PREFIX_PREFILL_MAX_SUFFIX", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_DYNAMIC_PREFIX_PREFILL_GREEDY_SHORT_MAX_TOKENS", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_DYNAMIC_PREFIX_PREFILL_GREEDY_SHORT_MAX_SUFFIX", raising=False)
+
+    short_suffix = _dynamic_prefix_prefill_max_suffix_for_policy(0.0, 82)
+    assert short_suffix == 128
+    assert (
+        _dynamic_prefix_prefill_context_len(
+            111,
+            128,
+            max_seq_len=512,
+            max_dynamic_suffix=short_suffix,
+        )
+        == -256
+    )
+
+    assert _dynamic_prefix_prefill_max_suffix_for_policy(0.0, 512) is None
+    assert _dynamic_prefix_prefill_context_len(111, 128, max_seq_len=512) == 239
+    assert _dynamic_prefix_prefill_max_suffix_for_policy(0.7, 82) is None
+
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_DYNAMIC_PREFIX_PREFILL_MAX_SUFFIX", "64")
+    assert _dynamic_prefix_prefill_max_suffix_for_policy(0.0, 82) is None
+    assert _dynamic_prefix_prefill_context_len(111, 64, max_seq_len=512) == -256
+    assert _dynamic_prefix_prefill_context_len(111, 128, max_seq_len=512) == 239
 
 
 class _ToyCache:

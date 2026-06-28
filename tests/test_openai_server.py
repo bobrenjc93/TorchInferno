@@ -1178,6 +1178,7 @@ def test_tensor_parallel_worker_loop_handles_online_runtime_commands(monkeypatch
             enable_decode_many: bool | None = None,
             decode_many_allow_stop: bool | None = None,
             generated_prefix_cache: bool | None = None,
+            max_generation_tokens: int | None = None,
         ) -> None:
             self.init_args = (
                 model,
@@ -1196,6 +1197,7 @@ def test_tensor_parallel_worker_loop_handles_online_runtime_commands(monkeypatch
                 enable_decode_many,
                 decode_many_allow_stop,
                 generated_prefix_cache,
+                max_generation_tokens,
             )
             self.started: int | None = None
             self.submitted: list[object] = []
@@ -1251,6 +1253,7 @@ def test_tensor_parallel_worker_loop_handles_online_runtime_commands(monkeypatch
         False,
         False,
         True,
+        6,
     )
     assert [
         (
@@ -1444,6 +1447,7 @@ def test_tensor_parallel_worker_loop_receives_online_tensor_commands(monkeypatch
             enable_decode_many: bool | None = None,
             decode_many_allow_stop: bool | None = None,
             generated_prefix_cache: bool | None = None,
+            max_generation_tokens: int | None = None,
         ) -> None:
             self.init_args = (
                 model,
@@ -1462,6 +1466,7 @@ def test_tensor_parallel_worker_loop_receives_online_tensor_commands(monkeypatch
                 enable_decode_many,
                 decode_many_allow_stop,
                 generated_prefix_cache,
+                max_generation_tokens,
             )
             self.started: int | None = None
             self.submitted: list[object] = []
@@ -1522,6 +1527,7 @@ def test_tensor_parallel_worker_loop_receives_online_tensor_commands(monkeypatch
         False,
         False,
         True,
+        6,
     )
     assert [(request.request_id, request.prompt, request.max_new_tokens) for request in runtime.submitted] == [
         ("10", (1, 2), 5),

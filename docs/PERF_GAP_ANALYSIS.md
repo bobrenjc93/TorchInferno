@@ -40,6 +40,17 @@ Extending that short timeout to low-but-nonzero live-request counts is rejected:
 the threshold variant landed at few_shot `167.5 / 51.3 / 207.7ms` and
 self_consistency `304.4 / 0.0 / 333.5ms`.
 
+Short greedy common-prefix suffix prefill now uses the dynamic-context graph
+bucket through suffix `128` only for deterministic `max_tokens <= 128`
+sessions. Current long_output on pushed `dfc88cb` spent `5.94s` in nine
+request-path prefill graph captures and landed at `240.2 / 26.0 / 1287.1ms`.
+The scoped source-default rerun cut request-path captures to one, prefill wall
+`11.10s -> 8.11s`, and phase time `27.83s -> 24.07s`, with score-facing
+long_output at `246.6 / 26.5 / 1264.0ms`. A broad dynamic suffix-128 default
+is rejected: it made long_output faster internally but regressed multi_turn to
+`433.9 / 60.7 / 493.6ms`. The scoped version kept multi_turn in band at
+`364.7 / 62.3 / 423.6ms` with zero prefill captures.
+
 ## Current `578e117` refresh and rejected follow-ups (2026-06-28)
 
 The latest public v1 run is `20260628_010307`, which measures TorchInferno

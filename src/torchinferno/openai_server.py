@@ -77,6 +77,7 @@ from torchinferno.runtime.serving import (
     ContinuousBatchEngine as _RuntimeContinuousBatchEngine,
     ServingRequest as _RuntimeServingRequest,
     _dynamic_prefix_prefill_context_len,
+    _dynamic_prefix_prefill_max_suffix_for_policy,
 )
 
 
@@ -3108,6 +3109,10 @@ class OpenAICompletionEngine:
             return
         if warmup_max_tokens is None:
             warmup_max_tokens = _online_greedy_common_prefix_suffix_prefill_warmup_max_tokens()
+        dynamic_max_suffix = _dynamic_prefix_prefill_max_suffix_for_policy(
+            warmup_temperature,
+            warmup_max_tokens,
+        )
         fp8_prefill_enabled = _online_fp8_prefill_enabled(
             temperature=warmup_temperature,
             max_tokens=warmup_max_tokens,
@@ -3191,6 +3196,7 @@ class OpenAICompletionEngine:
                                     prefix_count,
                                     suffix_count,
                                     max_seq_len=max_seq_len,
+                                    max_dynamic_suffix=dynamic_max_suffix,
                                 ),
                                 src_prefix_row=src_prefix_row,
                             )
@@ -4248,6 +4254,7 @@ class OpenAICompletionEngine:
                     temperature=first.temperature,
                     max_tokens=run_max_tokens,
                 ),
+                max_generation_tokens=run_max_tokens,
             )
         decode_runner = getattr(self, "_decode_graph_runner", None)
         if decode_runner is not None:
@@ -5374,6 +5381,7 @@ class OpenAICompletionEngine:
                 temperature=group[0].temperature,
                 max_tokens=max_tokens,
             ),
+            max_generation_tokens=max_tokens,
         )
         request_by_id = {str(index): request for index, request in enumerate(group)}
         row_max_tokens = [request.max_tokens for request in group]
@@ -5617,6 +5625,7 @@ class OpenAICompletionEngine:
                 temperature=group[0].temperature,
                 max_tokens=max_tokens,
             ),
+            max_generation_tokens=max_tokens,
         )
         request_by_id = {str(index): request for index, request in enumerate(group)}
         runtime_requests = [
@@ -12915,6 +12924,7 @@ def _tensor_parallel_worker_loop(engine: OpenAICompletionEngine) -> None:
                             temperature=temperature,
                             max_tokens=max_tokens,
                         ),
+                        max_generation_tokens=max_tokens,
                     )
                 if worker_use_paged:
                     worker_shared_cache = None  # PagedEngine owns its own paged KV pool
