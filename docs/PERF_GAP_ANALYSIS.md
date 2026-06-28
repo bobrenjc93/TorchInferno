@@ -55,6 +55,23 @@ also regressed under profiling to `298.2 / 25.1 / 1380.1ms`. Do not promote more
 startup suffix graphs for this row without a score-facing win; the remaining gap
 is still decode/readback and streaming tails, not that single prefill capture.
 
+Two command-path follow-ups are also rejected on the current stack. Enabling the
+existing `DecodeGraphRunner` for focused few_shot reduced the internal queue
+phase to `4.91s` but regressed the benchmark row to
+`201.2 / 62.4 / 251.1ms` (TTFT/TPOT/E2E), versus the current
+`~165 / 51 / 207ms` band. Keep the runner off by default; the synchronous
+harvest path still does not translate internal work reduction into client-visible
+latency.
+
+Broadening tensor-parallel shared-memory command transport is not a durable tree
+or self fix. `TORCHINFERNO_OPENAI_TP_SHM_COMMAND_MODE=all` regressed focused
+self_consistency to `296.8 / 0.0 / 359.4ms`. The same broad mode looked
+promising for tree_of_thought at `212.5 / 49.9 / 254.1ms`, but the scoped
+sampled-medium prompt-submit mode that would avoid sampled-short/greedy
+regressions did not reproduce the win (`233.2 / 49.6 / 283.2ms`, with a worse
+p99). The env-gated prototype was reverted; keep the default sampled
+start/step/close shared-memory scope unchanged.
+
 ## Direct rank-0 shard scatter (2026-06-28)
 
 The old rank-0 shard-scatter checkpoint path used `reduce_scatter_tensor`,
