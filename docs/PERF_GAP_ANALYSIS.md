@@ -108,6 +108,20 @@ default at `237.7 / 25.4 / 1204.4ms`. A narrower greedy KV-token budget
 vLLM long_output gap. Keep the current refill floor and KV budget; the next
 long_output work needs a real decode/readback or pipeline change.
 
+Two FlashInfer decode follow-ups are rejected on current `d2bd224`. First,
+forcing greedy traffic onto the sampled FlashInfer decode graph path with
+`TORCHINFERNO_FI_DECODE_GRAPH=always` preserved long_output correctness but
+regressed the focused row from the local default band (`292.3 / 25.4 /
+1275.4ms` in the adjacent profiled run) to `263.3 / 36.9 / 1692.7ms`; a source
+patch that fused one-token FlashInfer RoPE plus KV append with the existing
+Triton ragged decode append kernel stayed in the same bad band at
+`267.1 / 37.2 / 1707.9ms`. Second, the same fused FlashInfer append patch did
+not produce a sampled tree win: default tree_of_thought landed at
+`257.7 / 49.6 / 312.8ms`, compared with the current public-order profile's
+`266.6 / 48.9 / 307.3ms`. The patch was reverted. Keep greedy decode on the
+dense ragged token graph and do not add a FlashInfer decode-append branch
+without a clear sampled score-facing gain.
+
 ## Current long-output admission profile (2026-06-28)
 
 On pushed `5c67607`, same-host focused long_output control completed at
