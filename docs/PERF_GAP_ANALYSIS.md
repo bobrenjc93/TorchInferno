@@ -27,6 +27,19 @@ focused tree row regressed to `342.4 / 49.5 / 396.3ms`. Queue counters showed
 zero captures but four prefill graph misses; the eager miss path was more
 score-visible than the rare captures it avoided.
 
+Fast HTTP keepalive cleanup is now scoped to fully drained engines. A prior
+focused `few_shot -> self_consistency` control landed at few_shot
+`164.8 / 48.3 / 203.1ms` and self_consistency `305.8 / 0.0 / 337.2ms`.
+Forcing every keepalive socket down to `0.25s` helped the next row
+(`277.6 / 0.0 / 304.2ms`) but hurt few_shot
+(`170.1 / 50.1 / 210.1ms`). The promoted version keeps the normal `5s`
+keepalive timeout while requests are live, then uses a `0.25s` timeout only
+after the engine drains; the same focused sequence landed at few_shot
+`168.0 / 48.8 / 207.0ms` and self_consistency `299.6 / 0.0 / 334.0ms`.
+Extending that short timeout to low-but-nonzero live-request counts is rejected:
+the threshold variant landed at few_shot `167.5 / 51.3 / 207.7ms` and
+self_consistency `304.4 / 0.0 / 333.5ms`.
+
 ## Current `578e117` refresh and rejected follow-ups (2026-06-28)
 
 The latest public v1 run is `20260628_010307`, which measures TorchInferno

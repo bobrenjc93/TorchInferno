@@ -357,9 +357,8 @@ class FastOpenAIHTTPServer:
         del client_address
         with connection:
             enable_tcp_nodelay(connection)
-            connection.settimeout(
-                env_float("TORCHINFERNO_OPENAI_FAST_HTTP_IDLE_TIMEOUT_SECONDS", 5.0, minimum=0.05)
-            )
+            idle_timeout_s = _fast_http_idle_timeout_seconds()
+            connection.settimeout(idle_timeout_s)
             buffer = bytearray()
             keepalive_enabled = env_flag("TORCHINFERNO_OPENAI_FAST_HTTP_KEEPALIVE", True)
             while not self._closed.is_set():
@@ -370,6 +369,7 @@ class FastOpenAIHTTPServer:
                     method, path, headers, body = request
                     request_close = headers.get("connection", "").lower() == "close"
                     keep_alive = keepalive_enabled and not request_close
+                    connection.settimeout(idle_timeout_s)
                     self._handle_request(
                         connection,
                         method,
@@ -380,6 +380,12 @@ class FastOpenAIHTTPServer:
                     )
                     if not keep_alive:
                         return
+                    connection.settimeout(
+                        _fast_http_keepalive_idle_timeout_seconds(
+                            self.engine,
+                            idle_timeout_s,
+                        )
+                    )
                 except socket.timeout:
                     return
                 except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError, TimeoutError):
@@ -622,6 +628,47 @@ def _stream_fast_chat(
 
 
 _FAST_HTTP_PROFILE_LOCK = threading.Lock()
+
+
+def _fast_http_idle_timeout_seconds() -> float:
+    return env_float(
+        "TORCHINFERNO_OPENAI_FAST_HTTP_IDLE_TIMEOUT_SECONDS",
+        5.0,
+        minimum=0.05,
+    )
+
+
+def _fast_http_keepalive_idle_timeout_seconds(
+    engine: object,
+    default_timeout_s: float,
+) -> float:
+    default_timeout = max(0.05, float(default_timeout_s))
+    live_requests = _fast_http_engine_live_requests(engine)
+    if live_requests is None or live_requests > 0:
+        return default_timeout
+    drained_timeout = env_float(
+        "TORCHINFERNO_OPENAI_FAST_HTTP_DRAINED_IDLE_TIMEOUT_SECONDS",
+        0.25,
+        minimum=0.05,
+    )
+    return min(default_timeout, drained_timeout)
+
+
+def _fast_http_engine_live_requests(engine: object) -> int | None:
+    condition = getattr(engine, "_live_request_condition", None)
+    if condition is not None:
+        try:
+            with condition:
+                return int(getattr(engine, "_live_requests", 0))
+        except Exception:
+            return None
+    live_requests = getattr(engine, "_live_requests", None)
+    if live_requests is None:
+        return None
+    try:
+        return int(live_requests)
+    except (TypeError, ValueError):
+        return None
 
 
 def _new_fast_http_stream_profile(

@@ -23,6 +23,7 @@ from torchinferno.openai_http import (
     _chat_completion_chunk_prefix,
     _chat_delta_content,
     _chunked_stream_enabled,
+    _fast_http_keepalive_idle_timeout_seconds,
     _fast_stream_end_bytes,
     _new_fast_http_stream_profile,
     _record_fast_http_profile,
@@ -442,6 +443,34 @@ def test_openai_fast_http_profile_writes_jsonl(monkeypatch, tmp_path) -> None:
     assert record["content_chunks"] == 2
     assert record["total_ms"] >= 0.0
     assert "_start_s" not in record
+
+
+def test_openai_fast_http_keepalive_timeout_preserves_active_connections(monkeypatch) -> None:
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_FAST_HTTP_DRAINED_IDLE_TIMEOUT_SECONDS", "0.25")
+
+    assert _fast_http_keepalive_idle_timeout_seconds(object(), 5.0) == 5.0
+
+    engine = types.SimpleNamespace(
+        _live_request_condition=threading.Condition(),
+        _live_requests=2,
+    )
+
+    assert _fast_http_keepalive_idle_timeout_seconds(engine, 5.0) == 5.0
+
+
+def test_openai_fast_http_keepalive_timeout_shortens_after_drain(monkeypatch) -> None:
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_FAST_HTTP_DRAINED_IDLE_TIMEOUT_SECONDS", raising=False)
+    engine = types.SimpleNamespace(
+        _live_request_condition=threading.Condition(),
+        _live_requests=0,
+    )
+
+    assert _fast_http_keepalive_idle_timeout_seconds(engine, 5.0) == pytest.approx(0.25)
+
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_FAST_HTTP_DRAINED_IDLE_TIMEOUT_SECONDS", "0.5")
+
+    assert _fast_http_keepalive_idle_timeout_seconds(engine, 5.0) == pytest.approx(0.5)
+    assert _fast_http_keepalive_idle_timeout_seconds(engine, 0.1) == pytest.approx(0.1)
 
 
 def test_openai_chunked_stream_requires_http11(monkeypatch) -> None:
