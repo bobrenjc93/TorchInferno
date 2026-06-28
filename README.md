@@ -169,6 +169,7 @@ Optional extras are declared in [`pyproject.toml`](pyproject.toml):
 | --- | --- | --- |
 | `dev` | `pytest`, `ruff`, `pyflakes`, `vulture` | Running the local test and lint loop. |
 | `serve` / `text` | `transformers`, `tokenizers` | Loading Hub tokenizers or running the OpenAI-compatible server against real checkpoints. |
+| `flashinfer` | `flashinfer-python` | Optional FlashInfer CUDA serving kernels. |
 | `kernels` | [Triton](https://triton-lang.org/main/index.html) | Exercising CUDA kernel specializations instead of torch fallbacks. |
 | `helion` | [Helion](https://github.com/pytorch-labs/helion) | Trying one optional generated-kernel provider in the offline promotion flow. |
 

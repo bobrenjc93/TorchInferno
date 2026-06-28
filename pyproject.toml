@@ -12,6 +12,7 @@ dependencies = ["huggingface-hub", "safetensors", "torch"]
 
 [project.optional-dependencies]
 dev = ["pyflakes", "pytest", "ruff", "vulture"]
+flashinfer = ["flashinfer-python>=0.6.8,<0.7"]
 helion = ["helion"]
 kernels = ["triton"]
 serve = ["tokenizers", "transformers"]
