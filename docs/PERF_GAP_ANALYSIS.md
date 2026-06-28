@@ -153,6 +153,14 @@ self_consistency `306.9 / 0.0 / 338.4ms`, multi_turn
 `341.8 / 60.3 / 401.4ms`, tree_of_thought `249.5 / 47.8 / 284.9ms`, and
 long_output `280.9 / 24.2 / 1307.6ms`.
 
+A same-host provider comparison on `d4a03ec` confirms what remains in
+multi_turn after the FP8 gate change. TorchInferno landed at `366.8 / 60.9 /
+432.6ms`, vLLM at `291.3 / 107.6 / 389.2ms`, and SGLang at `167.3 / 103.9 /
+279.3ms` (TTFT/TPOT/E2E), all with 100% correctness. TorchInferno now wins the
+decode/TPOT cell locally, but still trails on TTFT, E2E, and throughput; the
+next multi_turn lever is still first-token queueing/prefix scheduling, not
+decode throughput.
+
 ## Current long-output admission profile (2026-06-28)
 
 On pushed `5c67607`, same-host focused long_output control completed at
