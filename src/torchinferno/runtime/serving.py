@@ -54,6 +54,41 @@ def _enable_runtime_cache_capture_sync(cache: object) -> None:
         pass
 
 
+def _dynamic_prefix_prefill_context_len(
+    prefix_len: int,
+    suffix_bucket: int,
+    *,
+    max_seq_len: int | None = None,
+) -> int:
+    exact_len = max(1, int(prefix_len) + int(suffix_bucket))
+    explicit_enabled = "TORCHINFERNO_CONTINUOUS_DYNAMIC_PREFIX_PREFILL_GRAPH" in os.environ
+    if explicit_enabled:
+        dynamic_enabled = env_flag("TORCHINFERNO_CONTINUOUS_DYNAMIC_PREFIX_PREFILL_GRAPH", False)
+    else:
+        max_dynamic_suffix = env_int(
+            "TORCHINFERNO_CONTINUOUS_DYNAMIC_PREFIX_PREFILL_MAX_SUFFIX",
+            16,
+            minimum=1,
+        )
+        dynamic_enabled = int(suffix_bucket) <= max_dynamic_suffix
+    if not dynamic_enabled:
+        return exact_len
+    bucket = exact_len
+    min_bucket = env_int(
+        "TORCHINFERNO_CONTINUOUS_DYNAMIC_PREFIX_PREFILL_MIN_CONTEXT",
+        256,
+        minimum=0,
+    )
+    if min_bucket > 0:
+        bucket = max(bucket, min_bucket)
+    bucket = 1 << (bucket - 1).bit_length()
+    if max_seq_len is not None:
+        bucket = min(bucket, max(1, int(max_seq_len)))
+    if bucket < exact_len:
+        return exact_len
+    return -bucket
+
+
 @dataclass(frozen=True)
 class ServingRequest:
     request_id: str
@@ -958,7 +993,11 @@ class ContinuousBatchEngine:
         cache_max_seq = self._cache_max_seq_len()
         if cache_max_seq is not None:
             chunk_bucket = min(chunk_bucket, max(1, cache_max_seq - cursor))
-        context_len = cursor + chunk_bucket
+        context_len = _dynamic_prefix_prefill_context_len(
+            cursor,
+            chunk_bucket,
+            max_seq_len=cache_max_seq,
+        )
         chunks = [s.request.prompt[cursor : cursor + n] for s, n in zip(states, chunk_lens)]
         padded = [[*c, *([0] * (chunk_bucket - len(c)))] for c in chunks]
         rows = [s.row for s in states]
@@ -1628,7 +1667,11 @@ class ContinuousBatchEngine:
         suffix_bucket = self._suffix_bucket(max(suffix_lengths))
         if cache_max_seq is not None:
             suffix_bucket = min(suffix_bucket, max(1, cache_max_seq - max(prefix_hits)))
-        context_len = None if mixed_prefixes else prefix_hits[0] + suffix_bucket
+        context_len = None if mixed_prefixes else _dynamic_prefix_prefill_context_len(
+            prefix_hits[0],
+            suffix_bucket,
+            max_seq_len=cache_max_seq,
+        )
         count = len(group)
         batch_bucket = self._prefill_batch_bucket(count)
         rows = [self._acquire_active_row() for _ in group]

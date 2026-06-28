@@ -76,6 +76,7 @@ from torchinferno.runtime.scheduler import (
 from torchinferno.runtime.serving import (
     ContinuousBatchEngine as _RuntimeContinuousBatchEngine,
     ServingRequest as _RuntimeServingRequest,
+    _dynamic_prefix_prefill_context_len,
 )
 
 
@@ -3113,7 +3114,11 @@ class OpenAICompletionEngine:
                                 seq_lens=seq_lens,
                                 row_indices=row_indices,
                                 logit_positions=logit_positions,
-                                context_len=prefix_count + suffix_count,
+                                context_len=_dynamic_prefix_prefill_context_len(
+                                    prefix_count,
+                                    suffix_count,
+                                    max_seq_len=max_seq_len,
+                                ),
                                 src_prefix_row=src_prefix_row,
                             )
                         except Exception as exc:

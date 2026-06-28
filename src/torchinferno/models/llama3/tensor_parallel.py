@@ -4303,7 +4303,10 @@ class Llama3TensorParallelForCausalLM:
         # reuse with equal prefix lengths.
         if src_prefix_row is not None and row_indices is not None:
             if context_len is not None:
-                prefix_len = context_len - input_ids.size(1)
+                if context_len < 0:
+                    prefix_len = (-context_len) - input_ids.size(1)
+                else:
+                    prefix_len = context_len - input_ids.size(1)
                 if prefix_len > 0:
                     for layer in cache.layers:
                         layer.keys[row_indices, :, :prefix_len, :] = layer.keys.index_select(
@@ -6063,6 +6066,11 @@ def _ragged_prefill_scaled_dot_product_attention(
     # boolean-mask math backend OOMs at large suffix x context. This is how the
     # batch worker prefills fast; here we keep it with scattered rows.
     #
+    # BUCKET PATH (context_len < 0): keys [0:-context_len] hold a static context
+    # bucket while start_positions stays dynamic. This sacrifices the lower-right
+    # flash mask for a captured boolean mask, but it lets one graph replay across
+    # different prefix lengths inside the same context bucket.
+    #
     # FALLBACK (context_len None, possibly MIXED per-row prefixes -- the eager
     # CPU oracle): explicit per-row offset-causal boolean mask over the full
     # cache. Correct for mixed starts; only used off the hot serving path.
@@ -6072,7 +6080,7 @@ def _ragged_prefill_scaled_dot_product_attention(
     else:
         k = cache_keys[: q.size(0)]
         v = cache_values[: q.size(0)]
-    if context_len is not None:
+    if context_len is not None and context_len > 0:
         k = k[:, :, :context_len, :]
         v = v[:, :, :context_len, :]
         from torch.nn.attention.bias import causal_lower_right
@@ -6082,6 +6090,31 @@ def _ragged_prefill_scaled_dot_product_attention(
             k,
             v,
             attn_mask=causal_lower_right(suffix_tokens, context_len),
+            dropout_p=0.0,
+            is_causal=False,
+            enable_gqa=enable_gqa,
+        )
+    if context_len is not None:
+        context_bucket = -context_len
+        if context_bucket < suffix_tokens:
+            raise ValueError("ragged prefill context bucket must cover the suffix")
+        context_bucket = min(context_bucket, k.size(2))
+        k = k[:, :, :context_bucket, :]
+        v = v[:, :, :context_bucket, :]
+        start_positions = start_positions.to(device=q.device)
+        key_positions = torch.arange(context_bucket, device=q.device)
+        query_offsets = torch.arange(suffix_tokens, device=q.device)
+        written = key_positions[None, :] < (start_positions[:, None] + suffix_tokens)
+        zero = torch.zeros((), dtype=k.dtype, device=k.device)
+        k = torch.where(written[:, None, :, None], k, zero)
+        v = torch.where(written[:, None, :, None], v, zero)
+        q_abs = start_positions[:, None] + query_offsets[None, :]
+        mask = key_positions[None, None, :] <= q_abs[:, :, None]
+        return F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=mask[:, None, :, :],
             dropout_p=0.0,
             is_causal=False,
             enable_gqa=enable_gqa,

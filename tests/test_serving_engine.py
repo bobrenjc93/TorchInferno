@@ -7,7 +7,29 @@ import torch
 
 import torchinferno.models.deepseek_v32.model as deepseek_mod
 from torchinferno.models.deepseek_v32 import DeepSeekV32ForCausalLM, tiny_deepseek_v32_config
-from torchinferno.runtime.serving import ContinuousBatchEngine, ServingRequest
+from torchinferno.runtime.serving import (
+    ContinuousBatchEngine,
+    ServingRequest,
+    _dynamic_prefix_prefill_context_len,
+)
+
+
+def test_dynamic_prefix_prefill_context_len_buckets_when_enabled(monkeypatch) -> None:
+    monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_DYNAMIC_PREFIX_PREFILL_GRAPH", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_DYNAMIC_PREFIX_PREFILL_MIN_CONTEXT", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_DYNAMIC_PREFIX_PREFILL_MAX_SUFFIX", raising=False)
+
+    assert _dynamic_prefix_prefill_context_len(45, 16, max_seq_len=512) == -256
+    assert _dynamic_prefix_prefill_context_len(45, 32, max_seq_len=512) == 77
+
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_DYNAMIC_PREFIX_PREFILL_GRAPH", "0")
+    assert _dynamic_prefix_prefill_context_len(45, 16, max_seq_len=512) == 61
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_DYNAMIC_PREFIX_PREFILL_GRAPH", "1")
+    assert _dynamic_prefix_prefill_context_len(45, 32, max_seq_len=512) == -256
+
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_DYNAMIC_PREFIX_PREFILL_MIN_CONTEXT", "256")
+    assert _dynamic_prefix_prefill_context_len(45, 16, max_seq_len=512) == -256
+    assert _dynamic_prefix_prefill_context_len(250, 16, max_seq_len=260) == 266
 
 
 class _ToyCache:

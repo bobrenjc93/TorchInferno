@@ -3555,6 +3555,19 @@ large greedy max-token policies (`128,512`) for whatever prefix/suffix shapes
 are already configured. Exact additional prefix-token warmups remain env-only
 until there is a general dynamic-prefix graph path.
 
+That general path is now scoped to short suffixes: a negative ragged-prefill
+`context_len` selects a static context bucket while keeping per-row
+`start_positions` dynamic, so one CUDA graph can replay across different shared
+prefix lengths in the same bucket. Keep it default-on only for suffix buckets
+`<=16` with a 256-token minimum context. The profiled few_shot row improved from
+`190.5 / 47.9 / 226.2ms` to `166.4 / 47.8 / 203.9ms`; request-path prefill
+captures dropped from `2` (`1038.2ms`) to `0`, and prefill wall fell from
+`3561.4ms` to `2834.7ms`. Multi_turn was neutral at
+`364.4 / 62.7 / 428.2ms` with zero request-path prefill captures. A broader
+env-forced dynamic run on long_output is rejected (`263.9 / 25.5 / 1220.7ms`):
+the larger `s32/s64/s128` boolean-mask bucket path slows prefill forward enough
+that those suffixes should stay on the exact flash `context_len` path.
+
 Rejected follow-ups after the public `d3131f4` refresh:
 - Prompt-lookup decode for long_output accepted copied prompt tokens but routed
   verification through expensive eager multi-token forwards; an interrupted run

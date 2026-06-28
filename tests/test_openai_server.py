@@ -9250,6 +9250,8 @@ def test_openai_startup_common_prefix_warmup_installs_persistent_cache(monkeypat
 
 
 def test_openai_greedy_common_prefix_suffix_warmup_captures_target_shapes(monkeypatch) -> None:
+    monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_DYNAMIC_PREFIX_PREFILL_GRAPH", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_DYNAMIC_PREFIX_PREFILL_MIN_CONTEXT", raising=False)
     monkeypatch.setenv("TORCHINFERNO_OPENAI_WARMUP_ONLINE_COMMON_PREFIX_ROWS", "8")
     monkeypatch.setenv("TORCHINFERNO_OPENAI_WARMUP_ONLINE_GREEDY_COMMON_PREFIX_TOKENS", "5")
     monkeypatch.setenv("TORCHINFERNO_OPENAI_WARMUP_ONLINE_GREEDY_COMMON_PREFIX_SUFFIX_TOKENS", "3,7")
@@ -9358,10 +9360,10 @@ def test_openai_greedy_common_prefix_suffix_warmup_captures_target_shapes(monkey
     assert model.fp8_calls == [(True, 2048), (False, 2048)]
     assert model.prefix_calls == [((8,), (1, 5), True)]
     assert [call[:3] for call in model.ragged_calls] == [
-        ((2, 3), 8, 8),
-        ((4, 3), 8, 8),
-        ((2, 7), 12, 8),
-        ((4, 7), 12, 8),
+        ((2, 3), -16, 8),
+        ((4, 3), -16, 8),
+        ((2, 7), -16, 8),
+        ((4, 7), -16, 8),
     ]
     assert model.ragged_calls[0][3][0:3] == (5, 5, 0)
     assert model.ragged_calls[0][3][8] == 5

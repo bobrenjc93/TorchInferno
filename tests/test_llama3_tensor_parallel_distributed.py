@@ -651,6 +651,64 @@ def test_llama3_tensor_parallel_ragged_prefill_folds_prefix_copy(tmp_path, monke
         torch.testing.assert_close(out[i, 0, :], ref_logits[i], atol=2e-5, rtol=2e-5)
 
 
+def test_llama3_tensor_parallel_ragged_prefill_dynamic_context_bucket(tmp_path, monkeypatch) -> None:
+    # A negative context_len selects a fixed context bucket while start_positions
+    # remain dynamic. The bucket can be larger than prefix+suffix; padded and
+    # uninitialized KV columns must not affect the selected logits.
+    torch.manual_seed(9103)
+    config = tiny_llama3_config(vocab_size=32, max_position_embeddings=32)
+    reference = Llama3V0ForCausalLM(config).eval()
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    _write_hf_checkpoint(reference, config, checkpoint)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    model = Llama3TensorParallelForCausalLM.from_pretrained(checkpoint, dtype="float32").eval()
+    device = model.device
+
+    shared_prefix = [1, 5, 9, 13, 2, 6, 10]
+    suffixes = [[3, 7], [11, 4, 8], [14]]
+    prompts = [shared_prefix + s for s in suffixes]
+    rows = [3, 1, 2]
+    prefix_row = 0
+    prefix_len = len(shared_prefix)
+    suffix_bucket = 4
+    context_bucket = 16
+    batch = len(prompts)
+
+    with torch.inference_mode():
+        ref_logits = []
+        for prompt in prompts:
+            rc = model.allocate_cache(1, max_seq_len=32, cache_backend="dense")
+            logits, _ = model.forward(torch.tensor([prompt], dtype=torch.long, device=device), cache=rc, use_cache=True)
+            ref_logits.append(logits[0, -1, :])
+
+        cache = model.allocate_cache(4, max_seq_len=32, cache_backend="dense")
+        prefix_view = cache.for_rows((prefix_row,))
+        model.forward(torch.tensor([shared_prefix], dtype=torch.long, device=device), cache=prefix_view, use_cache=True)
+
+        padded = [s + [0] * (suffix_bucket - len(s)) for s in suffixes]
+        input_ids = torch.tensor(padded, dtype=torch.long, device=device)
+        seq_lens = torch.zeros(4, dtype=torch.long, device=device)
+        for r in rows:
+            seq_lens[r] = prefix_len
+        row_indices = torch.tensor(rows, dtype=torch.long, device=device)
+        logit_positions = torch.tensor([len(s) - 1 for s in suffixes], dtype=torch.long, device=device)
+        src_prefix_row = torch.tensor([prefix_row], dtype=torch.long, device=device)
+        out = model.prefill_ragged_logits(
+            input_ids,
+            cache,
+            seq_lens=seq_lens,
+            row_indices=row_indices,
+            logit_positions=logit_positions,
+            context_len=-context_bucket,
+            src_prefix_row=src_prefix_row,
+        )
+
+    assert out.shape == (batch, 1, config.vocab_size)
+    for i in range(batch):
+        torch.testing.assert_close(out[i, 0, :], ref_logits[i], atol=2e-5, rtol=2e-5)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_llama3_tensor_parallel_ragged_prefill_graph_replays_across_rows(tmp_path) -> None:
     # GPU capture/replay gate: capture the ragged-prefill graph on one scattered
