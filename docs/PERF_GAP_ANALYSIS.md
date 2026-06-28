@@ -111,6 +111,16 @@ default on; the self row's server-side first-content median is already around
 `18ms` after request read, so the remaining gap is not a simple SSE write or
 keepalive setting.
 
+Changing the sampled common-prefix suffix warmup temperature default is not
+robust enough to promote. An env-only run with
+`TORCHINFERNO_OPENAI_WARMUP_ONLINE_SAMPLED_COMMON_PREFIX_TEMPERATURE=0.7`
+looked promising (`254.4 / 48.6 / 304.5ms` no-env control to
+`224.3 / 49.7 / 268.4ms`, with sampled phase total `8.88s -> 8.06s` and
+captures `3 -> 2`). But the same value as a code default did not reproduce the
+mechanism: score-facing E2E stayed better at `291.2ms`, but sampled captures
+rose to `4`, sampled prefill wall rose to `7.06s`, and sampled phase total rose
+to `9.88s`. Keep the `1.0` default until the graph-key mismatch is explained.
+
 Current multi_turn on pushed `6659e61` is still prefill dominated:
 `366.8 / 62.8 / 426.0ms`, with `5.52s` prefill wall, `3.54s` decode active,
 and only common-prefix reuse (`45,000` reused prefix tokens). A mixed-prefix
