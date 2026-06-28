@@ -41,6 +41,15 @@ time rose to `9.94s` versus the no-env confirmation's `9.22s`, and both prefill
 wall and decode-active time were higher. Keep the `10ms` greedy-large first
 collection default; the suffix-bucket change did not reopen the old 5ms tradeoff.
 
+Extending greedy decode-many to the 256-token few_shot path is rejected.
+`TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_GEN_MAX_TOKENS=256` preserved raw
+correctness but regressed few_shot to `303.6 / 203.2 / 506.3ms` and only
+`2.1 tok/s`. The profile confirmed the wrong shape: `use_decode_many=true`,
+but decode model calls jumped to `480` and decode tokens to `15.4k` for a row
+that normally needs about `72` decode calls and `1.6k` decode tokens. Keep
+decode-many scoped to short greedy output; few_shot needs a different stop-aware
+decode batching mechanism.
+
 ## FlashInfer packaging and no-FI decode A/B (2026-06-28)
 
 Public provider logs for `20260628_190318` showed vLLM and SGLang running with
