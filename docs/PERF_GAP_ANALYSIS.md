@@ -108,6 +108,19 @@ default at `237.7 / 25.4 / 1204.4ms`. A narrower greedy KV-token budget
 vLLM long_output gap. Keep the current refill floor and KV budget; the next
 long_output work needs a real decode/readback or pipeline change.
 
+One source-level decode-many scheduling follow-up is also rejected. A patch made
+`ContinuousBatchEngine._can_step_decode_many` capacity-aware so waiting requests
+only blocked multi-step greedy decode when active rows were below
+`max_active_requests`, with the intent of amortizing token readback while all
+rows were full. The focused long_output profile
+`/tmp/ti_full_decode_many_waiting_profile` kept correctness but worsened the
+row to `243.1 / 25.6 / 1215.7ms` versus the nearby local default
+`237.7 / 25.4 / 1204.4ms`; queue counters also moved the wrong way
+(`723 -> 753` decode batches, `544 -> 591` runtime step calls, `11.70s ->
+13.12s` decode GPU event time, and `22.42s -> 24.74s` phase time). The patch
+was reverted. The current one-token pacing while arrivals are waiting is still
+the least-bad measured default until decode/readback can be pipelined.
+
 Two FlashInfer decode follow-ups are rejected on current `d2bd224`. First,
 forcing greedy traffic onto the sampled FlashInfer decode graph path with
 `TORCHINFERNO_FI_DECODE_GRAPH=always` preserved long_output correctness but
