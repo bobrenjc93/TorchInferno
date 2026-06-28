@@ -56,6 +56,20 @@ decode work across bursty sessions (`~6.3s` aggregated prefill wall and
 `~4.1s` decode-active time in final queue records), not a missed HTTP streaming
 optimization.
 
+Current multi_turn on pushed `6659e61` is still prefill dominated:
+`366.8 / 62.8 / 426.0ms`, with `5.52s` prefill wall, `3.54s` decode active,
+and only common-prefix reuse (`45,000` reused prefix tokens). A mixed-prefix
+dynamic-context experiment is rejected. Enabling pinned full-prompt stores,
+non-common-prefix graph prefill, mixed-prefix graph prefill, and a mixed-prefix
+dynamic context bucket raised prefix reuse to `~97.7K` tokens and cut prefill
+tokens to `~45.7K`, but the store/state path and graph capture dominated:
+`1123.2 / 69.0 / 1209.3ms` with `21.1s` prefill wall, `11.3s` prefill state
+time, and `6.29s` graph capture even when dynamic bucketing covered suffixes
+through `256`. Without the wider dynamic bucket the same idea was worse at
+`2051.9 / 68.7 / 2131.5ms` with `27` request-path graph captures. Keep
+full-prompt mixed-prefix reuse out of default multi_turn; the missing piece is a
+low-overhead prefix-store/adoption policy, not just a graph context key.
+
 ## Latest public refresh and streaming send batching (2026-06-27)
 
 The latest public result while profiling this loop is still
