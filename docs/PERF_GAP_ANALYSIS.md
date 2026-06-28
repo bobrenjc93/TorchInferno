@@ -287,6 +287,22 @@ improved the paired no-profile self_consistency row from `350.0 / 0.0 /
 `TORCHINFERNO_OPENAI_TP_ONLINE_STEP_SYNC` authoritative for debugging or
 conservative deployments.
 
+A post-push TorchInferno-only five-benchmark pass on `2564898` validated the
+sampled-short sync policy in full benchmark order: few_shot
+`159.6 / 47.6 / 197.3ms`, self_consistency `197.7 / 0.0 / 248.7ms`,
+multi_turn `328.8 / 59.6 / 384.8ms`, tree_of_thought
+`227.9 / 48.0 / 268.2ms`, and long_output `252.0 / 25.0 / 1154.8ms`, all
+with normalized correctness at 1.0. Two adjacent command-path follow-ups are
+rejected on the same commit. Expanding shared-memory command transport to all
+online commands (`TORCHINFERNO_OPENAI_TP_SHM_COMMAND_MODE=online`) reduced
+measured submit-sync time but regressed focused self_consistency to
+`320.5 / 0.0 / 337.8ms`, with more submit batches and higher runtime
+prefill/step wall. Disabling online step sync for deterministic 512-token
+multi_turn (`TORCHINFERNO_OPENAI_TP_ONLINE_STEP_SYNC=0`) also regressed: the
+profiled row was `355.1 / 59.3 / 417.9ms`, and the no-profile confirmation was
+`376.4 / 63.0 / 445.2ms`. Keep the no-step-sync default scoped to sampled-short
+online sessions only.
+
 ## Published local refresh and rejected follow-ups (2026-06-28)
 
 The public result stream stalled after `20260628_050325`, so a same-host
