@@ -96,6 +96,26 @@ the fixed-wait tail win (`3064.8/3086.6ms` p99). Keep the greedy-large initial
 wait at `10ms`; multi_turn needs a lower-overhead conversation-prefix reuse or
 prefill pipeline change rather than another first-wave wait knob.
 
+## Current self-consistency sampled-short refresh (2026-06-28)
+
+Current pushed `3f37307` shows focused self_consistency is still highly
+run-order sensitive. Two no-profile self-first controls were stable in the slow
+band, `326.3 / 0.0 / 347.6ms` and `329.1 / 0.0 / 353.1ms`, both 1000/1000
+correct with `/health` at `145.7s`. A queue-profile run on the same tree landed
+much faster at `214.5 / 0.0 / 313.0ms`, so the score-facing control should come
+from no-profile runs, not the profiled row.
+
+The profile still confirms the intended sampled-short mechanism: one
+`common_prefix:b1:t55` prefill graph hit, one generated-prefix store,
+`980` generated-prefix reuses, one decode model call, and `55` raw prefill
+tokens for the whole 1000-request burst. The remaining server-side work was
+arrival/command fragmentation: `207` submit batches, `189` runtime steps,
+`2.74s` online phase time, `1.55s` prefix-reuse/prefill wall, `512ms`
+submit-sync, and `111ms` step-sync. Do not reopen generated-prefix, sampled
+initial/idle wait, min-ready, decode-quantum, or HTTP worker-prestart knobs from
+this evidence; the next self lever needs a batching/command-cadence change that
+improves no-profile medians and full-order behavior together.
+
 ## Published local refresh and rejected follow-ups (2026-06-28)
 
 The public result stream stalled after `20260628_050325`, so a same-host
