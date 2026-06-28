@@ -1,5 +1,61 @@
 # TorchInferno vs vLLM/sglang — Performance Gap Analysis (Llama-3.1-70B, 8xH100)
 
+## Current `578e117` refresh and rejected follow-ups (2026-06-28)
+
+The latest public v1 run is still `20260627_230306`, which measures
+TorchInferno `d3131f4`, vLLM `9036c89`, and SGLang `073de15`. It therefore
+does not include the two pushed TorchInferno updates from this loop:
+`886ad79` buckets short common-prefix suffix graphs behind the dynamic-context
+path, and `578e117` warms sampled common-prefix suffix graphs under the same
+sampled symmetric-memory policy used at runtime. The public scorecard remains
+vLLM `16/20`, SGLang `2/20`, and TorchInferno `1/20`; public TorchInferno rows
+are few_shot `249.6 / 49.0 / 298.7ms`, self_consistency
+`281.9 / 0.0 / 303.1ms`, multi_turn `366.3 / 60.2 / 428.5ms`,
+tree_of_thought `262.1 / 43.0 / 310.7ms`, and long_output
+`321.8 / 21.5 / 1127.0ms` (TTFT/TPOT/E2E).
+
+A full local TorchInferno-only pass on pushed `578e117` completed all five
+rows with 100% benchmark-level correctness: few_shot
+`160.6 / 46.9 / 198.6ms`, self_consistency `271.1 / 0.0 / 291.6ms`,
+multi_turn `343.8 / 59.6 / 402.5ms`, tree_of_thought
+`289.2 / 47.0 / 324.6ms`, and long_output `261.5 / 24.2 / 1188.8ms`. Focused
+no-profile/current profiles show substantial run-order noise: tree-only now
+lands around `238.7 / 50.1 / 289.9ms`, and long-output around
+`233.9 / 24.7 / 1251.7ms`.
+
+The self_consistency queue profile separated server work from benchmark-client
+arrival timing. The default row was `234.3 / 0.0 / 354.2ms`, while the final
+queue snapshot showed only `3.18s` total online phase time, `243` submit
+batches, `218` runtime steps, one common-prefix prefill, one decode batch, and
+`979` generated-prefix reuse hits. A local patch that accumulated idle arrivals
+before one TP submit reduced internal work (`243 -> 196` submit batches and
+`3.18s -> 2.89s` phase time), but it regressed score-facing TTFT to
+`295.3ms`. Setting idle wait to zero was worse at `311.5 / 0.0 / 332.5ms`.
+Reject both policies; benchmark median TTFT, not only internal phase time, moved
+the wrong way.
+
+Current long_output remains decode/readback dominated. The focused profile
+(`233.9 / 24.7 / 1251.7ms`) recorded `9.48s` prefill wall, `4.42s` request-path
+prefill graph capture across seven exact-context suffix shapes, `12.48s`
+ragged-decode GPU event time, and `6.92s` CPU token readback across `747`
+decode batches. Disabling common-prefix prefill capture-on-miss removed capture
+time but regressed to `363.6 / 33.4 / 1684.6ms` because eager suffix prefill
+grew prefill wall to `13.72s`. Extending dynamic prefix context to suffix
+bucket `64` cut captures to four and prefill wall to `9.11s`, but the
+boolean-mask bucket path still regressed score-facing latency to
+`258.5 / 25.4 / 1319.0ms`. Keep exact-context graph capture enabled for long
+until there is a faster dynamic-context attention path.
+
+Tree-of-thought on `578e117` no longer spends request time capturing sampled
+common-prefix suffix graphs in the common short-prefix sessions; queue records
+show only two prefill captures across the focused run. The current focused row
+is `238.7 / 50.1 / 289.9ms`, and aggregate final batcher records are still
+split between sampled `max_tokens=300` sessions and deterministic
+`max_tokens=400` eval sessions. The remaining local tree gap is prefill and
+decode work across bursty sessions (`~6.3s` aggregated prefill wall and
+`~4.1s` decode-active time in final queue records), not a missed HTTP streaming
+optimization.
+
 ## Latest public refresh and streaming send batching (2026-06-27)
 
 The latest public result while profiling this loop is still
