@@ -262,6 +262,58 @@ def test_tensor_parallel_replicated_checkpoint_broadcast_defaults_off_for_cuda_t
     )
 
 
+def test_tensor_parallel_replicated_checkpoint_page_cache_warm_defaults_on_for_cuda_tp(monkeypatch) -> None:
+    monkeypatch.setattr(tensor_parallel_module.dist, "is_available", lambda: True)
+    monkeypatch.setattr(tensor_parallel_module.dist, "is_initialized", lambda: True)
+    monkeypatch.delenv("TORCHINFERNO_TP_RANK0_CHECKPOINT_BROADCAST", raising=False)
+    monkeypatch.delenv(
+        "TORCHINFERNO_TP_RANK0_REPLICATED_CHECKPOINT_BROADCAST",
+        raising=False,
+    )
+    monkeypatch.delenv(
+        "TORCHINFERNO_TP_RANK0_REPLICATED_CHECKPOINT_PAGE_CACHE_WARM",
+        raising=False,
+    )
+
+    assert tensor_parallel_module._rank0_replicated_checkpoint_page_cache_warm_enabled(
+        device=torch.device("cuda"),
+        world_size=2,
+        dtype=torch.bfloat16,
+    )
+
+    monkeypatch.setenv("TORCHINFERNO_TP_RANK0_CHECKPOINT_BROADCAST", "0")
+    assert not tensor_parallel_module._rank0_replicated_checkpoint_page_cache_warm_enabled(
+        device=torch.device("cuda"),
+        world_size=2,
+        dtype=torch.bfloat16,
+    )
+
+    monkeypatch.setenv("TORCHINFERNO_TP_RANK0_REPLICATED_CHECKPOINT_PAGE_CACHE_WARM", "1")
+    assert tensor_parallel_module._rank0_replicated_checkpoint_page_cache_warm_enabled(
+        device=torch.device("cuda"),
+        world_size=2,
+        dtype=torch.bfloat16,
+    )
+
+    monkeypatch.setenv("TORCHINFERNO_TP_RANK0_REPLICATED_CHECKPOINT_PAGE_CACHE_WARM", "0")
+    assert not tensor_parallel_module._rank0_replicated_checkpoint_page_cache_warm_enabled(
+        device=torch.device("cuda"),
+        world_size=2,
+        dtype=torch.bfloat16,
+    )
+
+    assert not tensor_parallel_module._rank0_replicated_checkpoint_page_cache_warm_enabled(
+        device=torch.device("cuda"),
+        world_size=1,
+        dtype=torch.bfloat16,
+    )
+    assert not tensor_parallel_module._rank0_replicated_checkpoint_page_cache_warm_enabled(
+        device=torch.device("cpu"),
+        world_size=2,
+        dtype=torch.bfloat16,
+    )
+
+
 def test_tensor_parallel_checkpoint_shard_scatter_defaults_off_when_broadcast_unset(monkeypatch) -> None:
     monkeypatch.setattr(tensor_parallel_module.dist, "is_available", lambda: True)
     monkeypatch.setattr(tensor_parallel_module.dist, "is_initialized", lambda: True)
@@ -399,6 +451,159 @@ def test_tensor_parallel_replicated_checkpoint_broadcast_nonzero_rank_avoids_che
     )
 
     assert offset == full.numel()
+    torch.testing.assert_close(tensor, full)
+
+
+def test_tensor_parallel_replicated_checkpoint_page_cache_warm_orders_rank0_read(monkeypatch) -> None:
+    full = torch.arange(10, dtype=torch.float32)
+    calls: list[str] = []
+
+    class Loader:
+        def get_tensor_shape(self, name: str) -> tuple[int, ...]:
+            assert name == "weight"
+            calls.append("shape")
+            return tuple(full.shape)
+
+        def get_tensor(
+            self,
+            name: str,
+            *,
+            device: torch.device,
+            dtype: torch.dtype | None,
+        ) -> torch.Tensor:
+            assert name == "weight"
+            calls.append("read")
+            return full.to(device=device, dtype=dtype)
+
+    monkeypatch.setattr(
+        tensor_parallel_module,
+        "_rank0_replicated_checkpoint_broadcast_enabled",
+        lambda **kwargs: False,
+    )
+    monkeypatch.setattr(
+        tensor_parallel_module,
+        "_rank0_replicated_checkpoint_page_cache_warm_enabled",
+        lambda **kwargs: True,
+    )
+    monkeypatch.setattr(
+        tensor_parallel_module,
+        "_replicated_checkpoint_page_cache_warm_min_bytes",
+        lambda: 1,
+    )
+    monkeypatch.setattr(tensor_parallel_module, "_barrier", lambda: calls.append("barrier"))
+
+    tensor = tensor_parallel_module._load_checkpoint_tensor(
+        Loader(),
+        "weight",
+        rank=0,
+        world_size=2,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+
+    assert calls == ["shape", "read", "barrier", "barrier"]
+    torch.testing.assert_close(tensor, full)
+
+
+def test_tensor_parallel_replicated_checkpoint_page_cache_warm_nonzero_waits_before_read(monkeypatch) -> None:
+    full = torch.arange(10, dtype=torch.float32)
+    calls: list[str] = []
+
+    class Loader:
+        def get_tensor_shape(self, name: str) -> tuple[int, ...]:
+            assert name == "weight"
+            calls.append("shape")
+            return tuple(full.shape)
+
+        def get_tensor(
+            self,
+            name: str,
+            *,
+            device: torch.device,
+            dtype: torch.dtype | None,
+        ) -> torch.Tensor:
+            assert name == "weight"
+            calls.append("read")
+            return full.to(device=device, dtype=dtype)
+
+    monkeypatch.setattr(
+        tensor_parallel_module,
+        "_rank0_replicated_checkpoint_broadcast_enabled",
+        lambda **kwargs: False,
+    )
+    monkeypatch.setattr(
+        tensor_parallel_module,
+        "_rank0_replicated_checkpoint_page_cache_warm_enabled",
+        lambda **kwargs: True,
+    )
+    monkeypatch.setattr(
+        tensor_parallel_module,
+        "_replicated_checkpoint_page_cache_warm_min_bytes",
+        lambda: 1,
+    )
+    monkeypatch.setattr(tensor_parallel_module, "_barrier", lambda: calls.append("barrier"))
+
+    tensor = tensor_parallel_module._load_checkpoint_tensor(
+        Loader(),
+        "weight",
+        rank=1,
+        world_size=2,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+
+    assert calls == ["shape", "barrier", "read", "barrier"]
+    torch.testing.assert_close(tensor, full)
+
+
+def test_tensor_parallel_replicated_checkpoint_page_cache_warm_skips_small_tensors(monkeypatch) -> None:
+    full = torch.arange(10, dtype=torch.float32)
+    calls: list[str] = []
+
+    class Loader:
+        def get_tensor_shape(self, name: str) -> tuple[int, ...]:
+            assert name == "weight"
+            calls.append("shape")
+            return tuple(full.shape)
+
+        def get_tensor(
+            self,
+            name: str,
+            *,
+            device: torch.device,
+            dtype: torch.dtype | None,
+        ) -> torch.Tensor:
+            assert name == "weight"
+            calls.append("read")
+            return full.to(device=device, dtype=dtype)
+
+    monkeypatch.setattr(
+        tensor_parallel_module,
+        "_rank0_replicated_checkpoint_broadcast_enabled",
+        lambda **kwargs: False,
+    )
+    monkeypatch.setattr(
+        tensor_parallel_module,
+        "_rank0_replicated_checkpoint_page_cache_warm_enabled",
+        lambda **kwargs: True,
+    )
+    monkeypatch.setattr(
+        tensor_parallel_module,
+        "_replicated_checkpoint_page_cache_warm_min_bytes",
+        lambda: 1024,
+    )
+    monkeypatch.setattr(tensor_parallel_module, "_barrier", lambda: calls.append("barrier"))
+
+    tensor = tensor_parallel_module._load_checkpoint_tensor(
+        Loader(),
+        "weight",
+        rank=0,
+        world_size=2,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+
+    assert calls == ["shape", "read"]
     torch.testing.assert_close(tensor, full)
 
 

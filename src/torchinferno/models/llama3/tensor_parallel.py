@@ -2721,6 +2721,11 @@ class Llama3TensorParallelForCausalLM:
             world_size=world_size,
             dtype=torch_dtype,
         )
+        checkpoint_replicated_page_cache_warm = _rank0_replicated_checkpoint_page_cache_warm_enabled(
+            device=device,
+            world_size=world_size,
+            dtype=torch_dtype,
+        )
         checkpoint_shard_scatter = _rank0_checkpoint_shard_scatter_enabled(
             device=device,
             world_size=world_size,
@@ -2732,6 +2737,7 @@ class Llama3TensorParallelForCausalLM:
                 f"world_size={world_size} dtype={str(torch_dtype).replace('torch.', '')} "
                 f"rank0_broadcast={int(checkpoint_broadcast)} "
                 f"rank0_replicated_broadcast={int(checkpoint_replicated_broadcast)} "
+                f"rank0_replicated_page_cache_warm={int(checkpoint_replicated_page_cache_warm)} "
                 f"rank0_shard_scatter={int(checkpoint_shard_scatter)}",
                 flush=True,
             )
@@ -5619,6 +5625,28 @@ def _rank0_replicated_checkpoint_broadcast_enabled(
     return False
 
 
+def _rank0_replicated_checkpoint_page_cache_warm_enabled(
+    *,
+    device: torch.device,
+    world_size: int,
+    dtype: torch.dtype | None,
+) -> bool:
+    del dtype
+    env_name = "TORCHINFERNO_TP_RANK0_REPLICATED_CHECKPOINT_PAGE_CACHE_WARM"
+    if world_size <= 1 or device.type != "cuda":
+        return False
+    if not dist.is_available() or not dist.is_initialized():
+        return False
+    if env_name in os.environ:
+        return _tp_flag(env_name, True)
+    if (
+        "TORCHINFERNO_TP_RANK0_CHECKPOINT_BROADCAST" in os.environ
+        or "TORCHINFERNO_TP_RANK0_REPLICATED_CHECKPOINT_BROADCAST" in os.environ
+    ):
+        return False
+    return True
+
+
 def _rank0_checkpoint_shard_scatter_enabled(
     *,
     device: torch.device,
@@ -5652,6 +5680,22 @@ def _checkpoint_broadcast_chunk_bytes() -> int:
     )
 
 
+def _replicated_checkpoint_page_cache_warm_min_bytes() -> int:
+    return _tp_int(
+        "TORCHINFERNO_TP_RANK0_REPLICATED_CHECKPOINT_PAGE_CACHE_WARM_MIN_BYTES",
+        64 * 1024 * 1024,
+        minimum=0,
+    )
+
+
+def _checkpoint_tensor_nbytes(shape: tuple[int, ...], dtype: torch.dtype | None) -> int:
+    elements = 1
+    for size in shape:
+        elements *= int(size)
+    element_dtype = dtype if dtype is not None else torch.float32
+    return elements * torch.empty((), dtype=element_dtype).element_size()
+
+
 def _broadcast_tensor_in_chunks(tensor: Tensor, *, src: int) -> Tensor:
     if not tensor.is_contiguous():
         tensor = tensor.contiguous()
@@ -5683,6 +5727,21 @@ def _load_checkpoint_tensor(
         world_size=world_size,
         dtype=dtype,
     ):
+        if _rank0_replicated_checkpoint_page_cache_warm_enabled(
+            device=device,
+            world_size=world_size,
+            dtype=dtype,
+        ):
+            shape = loader.get_tensor_shape(name)
+            if _checkpoint_tensor_nbytes(shape, dtype) >= _replicated_checkpoint_page_cache_warm_min_bytes():
+                if rank == 0:
+                    tensor = loader.get_tensor(name, device=device, dtype=dtype)
+                    _barrier()
+                else:
+                    _barrier()
+                    tensor = loader.get_tensor(name, device=device, dtype=dtype)
+                _barrier()
+                return tensor
         return loader.get_tensor(name, device=device, dtype=dtype)
     shape = loader.get_tensor_shape(name)
     if rank == 0:
