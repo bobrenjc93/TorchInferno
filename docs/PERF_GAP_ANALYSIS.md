@@ -1,5 +1,28 @@
 # TorchInferno vs vLLM/sglang — Performance Gap Analysis (Llama-3.1-70B, 8xH100)
 
+## FlashInfer packaging and no-FI decode A/B (2026-06-28)
+
+Public provider logs for `20260628_190318` showed vLLM and SGLang running with
+FlashInfer-backed attention/sampling and CUDA graph buckets, while TorchInferno
+printed repeated `[WARMUP] FlashInfer unavailable: No module named
+'flashinfer'`. TorchInferno now declares a dedicated `flashinfer` optional
+extra (`flashinfer-python>=0.6.8,<0.7`), and inference-bench installs
+`.[serve,flashinfer]` for the TorchInferno GPU provider by default with a
+fallback to `.[serve]` if the optional package cannot resolve. This keeps the
+base serving extra CPU-friendly while letting public GPU runs exercise the same
+optional FlashInfer-backed paths used locally.
+
+The missing package is not the primary long_output bottleneck. A same-host
+TorchInferno `81eda1d` run with `TORCHINFERNO_FI_DECODE_GRAPH=off` completed
+long_output at `275.0 / 25.6 / 1288.5ms` (TTFT/TPOT/E2E), 1000/1000 correct,
+versus the recent importable-FlashInfer control on `06c3e04` at
+`290.8 / 23.9 / 1297.9ms`. Queue shape stayed the same: dense online serving,
+`use_decode_many=true`, no paged engine, one ragged-prefill capture, and
+ragged decode graph hits for nearly all decode batches. So the packaging change
+is still the right public-run fairness fix, but long_output remains dominated by
+decode GPU time plus token readback/CPU sampling overhead rather than by the
+FlashInfer decode-graph warmup alone.
+
 ## Public run 20260628_190318 and finished-prefix reuse rejection (2026-06-28)
 
 Public run `20260628_190318` measured TorchInferno `4000a03`, vLLM `c2127a2`,
