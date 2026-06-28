@@ -1345,6 +1345,9 @@ def test_continuous_batch_engine_counts_ragged_prefill_captures() -> None:
     assert engine.stats.prefill_graph_replays == 1
     assert engine.stats.prefill_graph_capture_ms >= 0.0
     assert engine.stats.prefill_graph_replay_ms >= 0.0
+    assert engine.stats.prefill_graph_capture_shape_counts == {
+        "ragged_prefill:b2:s2:rows1:ctx-1:src0": 1,
+    }
 
 
 def test_continuous_batch_engine_keeps_common_prefix_logits_for_exact_prompt() -> None:

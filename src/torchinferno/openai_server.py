@@ -451,6 +451,13 @@ def _startup_graph_warmup_enabled() -> bool:
     return env_flag("TORCHINFERNO_OPENAI_STARTUP_GRAPH_WARMUP", False)
 
 
+def _queue_profile_path_from_env() -> str:
+    path = os.environ.get("TORCHINFERNO_OPENAI_QUEUE_PROFILE_JSONL")
+    if path is not None:
+        return path
+    return os.environ.get("TORCHINFERNO_OPENAI_QUEUE_PROFILE", "")
+
+
 def _startup_ragged_decode_warmup_enabled() -> bool:
     return env_flag("TORCHINFERNO_OPENAI_WARMUP_RAGGED_DECODE_STARTUP", False)
 
@@ -2406,7 +2413,7 @@ class OpenAICompletionEngine:
         self._phase_timing_enabled = env_flag("TORCHINFERNO_OPENAI_PHASE_TIMINGS")
         self._phase_records: list[dict[str, float]] = []
         self._phase_records_lock = threading.Lock()
-        self._queue_profile_path = os.environ.get("TORCHINFERNO_OPENAI_QUEUE_PROFILE_JSONL", "")
+        self._queue_profile_path = _queue_profile_path_from_env()
         self._queue_profile_lock = threading.Lock()
         self._queue_profile_next_sequence = 0
         self._persistent_prompt_list_step_state: _PersistentPromptListStepState | None = None
@@ -4790,7 +4797,7 @@ class OpenAICompletionEngine:
     def _queue_profile_path_value(self) -> str:
         path = getattr(self, "_queue_profile_path", None)
         if path is None:
-            path = os.environ.get("TORCHINFERNO_OPENAI_QUEUE_PROFILE_JSONL", "")
+            path = _queue_profile_path_from_env()
             self._queue_profile_path = path
         return str(path)
 
@@ -4896,7 +4903,11 @@ class OpenAICompletionEngine:
             value = getattr(stats, name, None)
             if isinstance(value, (int, float)):
                 record[f"runtime_{name}"] = value
-        for name in ("prefill_shape_counts", "decode_shape_counts"):
+        for name in (
+            "prefill_shape_counts",
+            "prefill_graph_capture_shape_counts",
+            "decode_shape_counts",
+        ):
             value = getattr(stats, name, None)
             if isinstance(value, Mapping):
                 top_counts = sorted(

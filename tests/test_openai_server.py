@@ -12194,6 +12194,23 @@ def test_openai_queue_profile_creates_parent_directories(
     }
 
 
+def test_openai_queue_profile_accepts_legacy_env_alias(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile_path = tmp_path / "queue-profile.jsonl"
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_QUEUE_PROFILE_JSONL", raising=False)
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_QUEUE_PROFILE", str(profile_path))
+    engine = _cache_only_engine()
+
+    engine._record_queue_profile({"event": "online_batcher", "submitted_requests": 5})
+
+    assert json.loads(profile_path.read_text()) == {
+        "event": "online_batcher",
+        "submitted_requests": 5,
+    }
+
+
 def test_openai_queue_profile_records_runtime_engine_stats(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -12228,6 +12245,9 @@ def test_openai_queue_profile_records_runtime_engine_stats(
             "prefix_graph:b8:s16:p45-45:src1:mixed0": 3,
             "common_prefix:b1:t45": 1,
         }
+        prefill_graph_capture_shape_counts = {
+            "ragged_prefill:b8:s16:rows1:ctx-256:src1": 1,
+        }
         decode_shape_counts = {"ragged:b8/8": 5}
 
     class RuntimeEngine:
@@ -12260,6 +12280,9 @@ def test_openai_queue_profile_records_runtime_engine_stats(
             "runtime_prefill_graph_replay_ms": 1.25,
             "runtime_prefill_graph_replays": 2,
             "runtime_prefill_model_calls": 2,
+            "runtime_prefill_graph_capture_shape_counts": {
+                "ragged_prefill:b8:s16:rows1:ctx-256:src1": 1,
+            },
             "runtime_prefill_shape_counts": {
                 "prefix_graph:b8:s16:p45-45:src1:mixed0": 3,
                 "common_prefix:b1:t45": 1,

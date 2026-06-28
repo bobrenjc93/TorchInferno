@@ -203,6 +203,7 @@ class ServingStats:
     generated_prefix_reuse_requests: int = 0
     generated_prefix_reuse_tokens: int = 0
     prefill_shape_counts: dict[str, int] = field(default_factory=dict)
+    prefill_graph_capture_shape_counts: dict[str, int] = field(default_factory=dict)
     decode_shape_counts: dict[str, int] = field(default_factory=dict)
 
 
@@ -1891,10 +1892,37 @@ class ContinuousBatchEngine:
             if captured:
                 self.stats.prefill_graph_captures += 1
                 self.stats.prefill_graph_capture_ms += elapsed_ms
+                self._record_shape_count(
+                    self.stats.prefill_graph_capture_shape_counts,
+                    self._ragged_prefill_graph_shape_key(
+                        input_ids,
+                        row_indices=row_indices,
+                        context_len=context_len,
+                        src_prefix_row=src_prefix_row,
+                    ),
+                )
             else:
                 self.stats.prefill_graph_replays += 1
                 self.stats.prefill_graph_replay_ms += elapsed_ms
         return logits
+
+    @staticmethod
+    def _ragged_prefill_graph_shape_key(
+        input_ids: Tensor,
+        *,
+        row_indices: Tensor | None,
+        context_len: int | None,
+        src_prefix_row: Tensor | None,
+    ) -> str:
+        src_rows = int(src_prefix_row.numel()) if src_prefix_row is not None else 0
+        return (
+            "ragged_prefill:"
+            f"b{input_ids.size(0)}:"
+            f"s{input_ids.size(1)}:"
+            f"rows{int(row_indices is not None)}:"
+            f"ctx{context_len if context_len is not None else -1}:"
+            f"src{src_rows}"
+        )
 
     def _ragged_prefill_logits_eager(
         self,
