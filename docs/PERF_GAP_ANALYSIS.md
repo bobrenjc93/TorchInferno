@@ -1,5 +1,35 @@
 # TorchInferno vs vLLM/sglang — Performance Gap Analysis (Llama-3.1-70B, 8xH100)
 
+## Public direct-scatter startup regression (2026-06-28)
+
+Public submit run `20260628_110307` failed before any TorchInferno benchmark
+rows on `ed7f29b`. The server selected
+`rank0_replicated_page_cache_warm=1 rank0_direct_scatter=1
+rank0_shard_scatter=1`, spent `516.4s` on initial embedding/norm/head loading,
+then only reached `10/80` layers after `2473.8s`. Nonzero ranks timed out in
+NCCL `SCATTER` (`SeqNum=77`, `NumelIn=29360128`) while rank 0 had only
+completed work `76`, so the direct-scatter startup path can let nonzero ranks
+enqueue collective shard receives while rank 0 is still blocked reading or
+packing a later checkpoint tensor.
+
+This was not an isolated public-host artifact. Submit run `20260628_090338`
+failed the same way on `467c3c3` (`SCATTER`, `SeqNum=78`) while the same direct
+scatter code looked healthy only on the local devgpu run `20260628_093044`
+(`15.9s` checkpoint load). The default has been reverted to the portable
+per-rank safetensor shard reader when
+`TORCHINFERNO_TP_RANK0_CHECKPOINT_SHARD_SCATTER` is unset. Direct scatter remains
+available as an explicit opt-in via
+`TORCHINFERNO_TP_RANK0_CHECKPOINT_SHARD_SCATTER=1`, with
+`TORCHINFERNO_TP_RANK0_CHECKPOINT_DIRECT_SCATTER=0` preserving the older
+reduce-scatter fallback only for controlled experiments.
+
+Same-host inference-bench validation on this working-tree patch over `b9cf070`
+selected `rank0_direct_scatter=0 rank0_shard_scatter=0`, loaded initial
+embedding/norm/head tensors in `2.6s`, loaded all `80/80` layers in `20.2s`,
+and reached `/health` in `145.6s`. The focused few_shot row completed at
+`162.8 / 51.2 / 203.6ms` with 98% correctness, matching the expected latency
+band while removing the public SCATTER startup failure mode.
+
 ## Published local refresh and rejected follow-ups (2026-06-28)
 
 The public result stream stalled after `20260628_050325`, so a same-host
@@ -112,7 +142,7 @@ chunk before the first content chunk. Raising only
 landed at `353.1 / 62.6 / 416.6ms` with a large p99 tail, worse than the current
 public multi_turn row. Keep the role-deferral bound at 400.
 
-## Direct rank-0 shard scatter (2026-06-28)
+## Direct rank-0 shard scatter probe (2026-06-28)
 
 The old rank-0 shard-scatter checkpoint path used `reduce_scatter_tensor`,
 which forced every nonzero rank to allocate and collectively reduce a full-size
@@ -120,22 +150,20 @@ zero tensor for each checkpoint weight. That explains why the earlier
 `rank0_shard_scatter=1` default was brittle on public hosts: it removed shared
 storage reads but replaced them with very large unnecessary collective inputs.
 
-The shard path now defaults to direct `dist.scatter` when available. Rank 0
-loads each full sharded tensor once, builds equal-sized contiguous shards, and
-scatters those shards directly; nonzero ranks no longer read checkpoint shards
-or allocate full zero inputs. Explicit
-`TORCHINFERNO_TP_RANK0_CHECKPOINT_SHARD_SCATTER=0` still keeps the portable
-per-rank reader, and
-`TORCHINFERNO_TP_RANK0_CHECKPOINT_DIRECT_SCATTER=0` falls back to the old
-reduce-scatter implementation only when shard scatter is explicitly enabled.
+The next probe tried direct `dist.scatter` when shard scatter was enabled. Rank
+0 loaded each full sharded tensor once, built equal-sized contiguous shards, and
+scattered those shards directly; nonzero ranks no longer read checkpoint shards
+or allocated full zero inputs. This fixed the old reduce-scatter allocation
+problem, but later public submit runs showed that direct scatter is still too
+environment-sensitive for the default startup path.
 
 Same-host validation on current `e7c7acb` plus this patch selected
 `rank0_direct_scatter=1 rank0_shard_scatter=1` with no provider env override.
 Checkpoint load fell to `16.4s` versus roughly `20s` on the replicated
-page-cache-warm all-rank-shard path; an opt-in run just before the default
-change loaded in `15.8s` and completed self_consistency with 1000/1000
-correctness. This is a startup/shared-storage fix, not a runtime scheduling
-change.
+page-cache-warm all-rank-shard path; an opt-in run just before the temporary
+default change loaded in `15.8s` and completed self_consistency with 1000/1000
+correctness. This remains useful evidence for controlled hosts, but it is no
+longer the source default.
 
 ## Current `564783b` refresh and rejected tree capture bypass (2026-06-28)
 

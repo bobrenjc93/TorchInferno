@@ -314,14 +314,14 @@ def test_tensor_parallel_replicated_checkpoint_page_cache_warm_defaults_on_for_c
     )
 
 
-def test_tensor_parallel_checkpoint_shard_scatter_defaults_to_direct_scatter(monkeypatch) -> None:
+def test_tensor_parallel_checkpoint_shard_scatter_defaults_off_when_broadcast_unset(monkeypatch) -> None:
     monkeypatch.setattr(tensor_parallel_module.dist, "is_available", lambda: True)
     monkeypatch.setattr(tensor_parallel_module.dist, "is_initialized", lambda: True)
     monkeypatch.setattr(tensor_parallel_module, "_rank0_checkpoint_direct_scatter_enabled", lambda: True)
     monkeypatch.delenv("TORCHINFERNO_TP_RANK0_CHECKPOINT_BROADCAST", raising=False)
     monkeypatch.delenv("TORCHINFERNO_TP_RANK0_CHECKPOINT_SHARD_SCATTER", raising=False)
 
-    assert tensor_parallel_module._rank0_checkpoint_shard_scatter_enabled(
+    assert not tensor_parallel_module._rank0_checkpoint_shard_scatter_enabled(
         device=torch.device("cuda"),
         world_size=2,
         dtype=torch.bfloat16,
@@ -336,15 +336,6 @@ def test_tensor_parallel_checkpoint_shard_scatter_defaults_to_direct_scatter(mon
 
     monkeypatch.setenv("TORCHINFERNO_TP_RANK0_CHECKPOINT_SHARD_SCATTER", "1")
     assert tensor_parallel_module._rank0_checkpoint_shard_scatter_enabled(
-        device=torch.device("cuda"),
-        world_size=2,
-        dtype=torch.bfloat16,
-    )
-
-    monkeypatch.delenv("TORCHINFERNO_TP_RANK0_CHECKPOINT_SHARD_SCATTER", raising=False)
-    monkeypatch.setattr(tensor_parallel_module, "_rank0_checkpoint_direct_scatter_enabled", lambda: False)
-    monkeypatch.delenv("TORCHINFERNO_TP_RANK0_CHECKPOINT_BROADCAST", raising=False)
-    assert not tensor_parallel_module._rank0_checkpoint_shard_scatter_enabled(
         device=torch.device("cuda"),
         world_size=2,
         dtype=torch.bfloat16,

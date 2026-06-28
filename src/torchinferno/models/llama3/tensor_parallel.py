@@ -2726,12 +2726,12 @@ class Llama3TensorParallelForCausalLM:
             world_size=world_size,
             dtype=torch_dtype,
         )
-        checkpoint_direct_scatter = _rank0_checkpoint_direct_scatter_enabled()
         checkpoint_shard_scatter = _rank0_checkpoint_shard_scatter_enabled(
             device=device,
             world_size=world_size,
             dtype=torch_dtype,
         )
+        checkpoint_direct_scatter = checkpoint_shard_scatter and _rank0_checkpoint_direct_scatter_enabled()
         if rank == 0:
             print(
                 "[Llama3TP] loading checkpoint tensors "
@@ -5667,10 +5667,12 @@ def _rank0_checkpoint_shard_scatter_enabled(
             world_size=world_size,
             dtype=dtype,
         )
-    return _tp_flag(
-        "TORCHINFERNO_TP_RANK0_CHECKPOINT_SHARD_SCATTER",
-        _rank0_checkpoint_direct_scatter_enabled(),
-    )
+    # Large rank-0 checkpoint scatters are fast on healthy local hosts but have
+    # timed out repeatedly on public submit hosts when rank 0 stalls reading or
+    # packing a tensor while other ranks enqueue SCATTER work. Keep the
+    # per-rank safetensor shard reader as the default and require an explicit
+    # opt-in for collective shard loading.
+    return _tp_flag("TORCHINFERNO_TP_RANK0_CHECKPOINT_SHARD_SCATTER", False)
 
 
 def _rank0_checkpoint_scatter_enabled() -> bool:
