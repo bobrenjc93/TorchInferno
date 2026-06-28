@@ -33,15 +33,28 @@ focused few_shot row completed at `161.5 / 46.7 / 200.8ms` with 98%
 correctness, matching the expected latency band while removing the public
 SCATTER startup failure mode.
 
-## Current same-host refresh and tree graph probes (2026-06-28)
+## Latest public refresh (2026-06-28)
 
-The public stream is still stalled at `20260628_110307`, so the current score
-shape comes from same-host skip-build runs on pushed `6425184`. The all-provider
-run `20260628_150944` reached `/health` in `145.6s` for TorchInferno and
-`90.4s` for SGLang; local vLLM failed only because the host `/lib64/libstdc++`
-is missing `CXXABI_1.3.15`, and a separate vLLM rerun with the conda
+Public run `20260628_150314` measured TorchInferno `3f37307`, vLLM `4b643c4`,
+and SGLang `aaa31eb`, so the startup failure from `20260628_110307` is fixed in
+the public environment. TorchInferno now wins `3/4` few_shot cells:
+`139.0 / 46.2 / 178.1ms` versus vLLM `141.9 / 50.1 / 183.7ms` and SGLang
+`156.6 / 75.3 / 225.3ms`. The total scorecard is still vLLM `15/20`,
+TorchInferno `3/20`, SGLang `1/20`. The remaining public gaps are:
+self_consistency `248.2 / 0.0 / 267.6ms` versus vLLM
+`190.3 / 0.0 / 228.8ms`, multi_turn `387.0 / 56.7 / 453.2ms` versus vLLM
+`161.5 / 52.1 / 203.1ms`, tree_of_thought `278.6 / 41.5 / 318.2ms` versus
+vLLM `63.1 / 31.6 / 86.4ms`, and long_output `256.9 / 21.6 / 1102.9ms` versus
+vLLM `70.1 / 14.8 / 590.7ms` (TTFT/TPOT/E2E). Latest `main` through `f431d1c`
+is docs-only after `3f37307`, so these are current-code gaps.
+
+The same-host skip-build comparison on pushed `6425184` remains useful for local
+A/Bs, but no longer replaces public evidence. The local all-provider run
+`20260628_150944` reached `/health` in `145.6s` for TorchInferno and `90.4s`
+for SGLang; local vLLM failed only because the host `/lib64/libstdc++` is
+missing `CXXABI_1.3.15`, and a separate vLLM rerun with the conda
 `libstdc++.so.6.0.34` preload reached `/health` in `115.5s`. Combining those
-rows, SGLang still leads most TTFT/E2E/throughput cells while TorchInferno keeps
+rows, SGLang led most local TTFT/E2E/throughput cells while TorchInferno kept
 competitive TPOT: TorchInferno rows were few_shot
 `162.2 / 46.5 / 201.4ms`, self_consistency `293.3 / 0.0 / 324.0ms`,
 multi_turn `344.1 / 60.4 / 404.4ms`, tree_of_thought
@@ -79,6 +92,21 @@ to `7.32s`, but it regressed score-facing tree to `283.6 / 48.4 / 324.3ms` and
 self_consistency to `288.3 / 313.0ms`; the patch was reverted. Do not promote
 more startup graph retention or reorder sampled warmup without a score-facing
 win.
+
+Current long_output remains decode/readback dominated. A focused profile on
+`f431d1c` landed at `276.1 / 25.0 / 1250.9ms`, with `22.42s` online phase time,
+`7.74s` prefill wall, one `1.01s` request-path prefill graph capture,
+`11.70s` decode GPU event time, and `6.83s` CPU token harvest across `723`
+ragged decode batches. Rechecking the greedy-short refill floor is rejected:
+raising it to `16` cut prefill batches (`57 -> 50`) but regressed the row to
+`300.5 / 25.4 / 1276.7ms` and raised phase time to `24.70s`; lowering it to
+`8` improved profiled TTFT but worsened TPOT/aggregate phase, and the no-profile
+confirmation landed at `224.5 / 27.2 / 1226.1ms` versus the nearby no-profile
+default at `237.7 / 25.4 / 1204.4ms`. A narrower greedy KV-token budget
+(`24576`, roughly mid-90 active rows) is also not a default: it landed at
+`267.6 / 24.8 / 1199.7ms`, trading away TTFT without addressing the public
+vLLM long_output gap. Keep the current refill floor and KV budget; the next
+long_output work needs a real decode/readback or pipeline change.
 
 ## Current long-output admission profile (2026-06-28)
 
