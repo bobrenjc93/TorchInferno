@@ -69,6 +69,19 @@ exact `prefix+suffix` contexts did not remove the two sampled prefix captures
 and regressed the focused tree row to `302.7 / 50.3 / 344.7ms`; the patch was
 reverted.
 
+Two adjacent tree follow-ups are also rejected. Raising
+`TORCHINFERNO_CUDAGRAPH_PREFILL_MAX_GRAPHS` to `256` did not show graph-cache
+eviction as the limiter: the focused row stayed in the same band at
+`242.4 / 49.5 / 294.7ms` while request-path prefill captures increased to
+three (`2.78s`) and aggregate prefill wall rose to `7.16s`. A code patch that
+adopted the freshly-prefilled common-prefix row directly into the reusable
+prefix cache avoided one conceptual KV copy, but it did not improve the real
+tree path. The focused row landed at `240.7 / 49.3 / 289.8ms`, and sampled
+sessions worsened from `42` to `45` prefill batches, `2` to `3` request-path
+captures, and `7.82s` to `9.13s` aggregate sampled phase time. The patch was
+reverted; the remaining tree gap is still suffix-prefill capture/phase
+fragmentation plus decode, not common-prefix row registration.
+
 Current multi_turn on pushed `6659e61` is still prefill dominated:
 `366.8 / 62.8 / 426.0ms`, with `5.52s` prefill wall, `3.54s` decode active,
 and only common-prefix reuse (`45,000` reused prefix tokens). A mixed-prefix
