@@ -275,6 +275,18 @@ phase time, `198 -> 202` runtime steps, `196 -> 200` prefix-reuse batches, and
 active wait in front of live sampled-short submissions without a throughput/E2E
 win.
 
+One command-cadence change is accepted on current `51ba4f1`. Disabling the
+per-step tensor-parallel sync only for sampled-short online sessions
+(`temperature > 0`, `max_tokens <= 256`) preserved 1000/1000 correctness and
+improved the paired no-profile self_consistency row from `350.0 / 0.0 /
+373.1ms` to `313.7 / 0.0 / 336.1ms`; the explicit-env discovery run was
+`293.3 / 0.0 / 315.4ms`. The profiled no-env confirmation landed at
+`316.7 / 0.0 / 336.5ms`, kept the generated-prefix path healthy
+(`981` generated-prefix reuses, one store, one prompt prefill), and removed the
+`phase_step_sync_ms` field from the queue profile. Keep the env override
+`TORCHINFERNO_OPENAI_TP_ONLINE_STEP_SYNC` authoritative for debugging or
+conservative deployments.
+
 ## Published local refresh and rejected follow-ups (2026-06-28)
 
 The public result stream stalled after `20260628_050325`, so a same-host

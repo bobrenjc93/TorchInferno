@@ -418,8 +418,19 @@ def _online_generated_prefix_cache_enabled(*, temperature: float, max_tokens: in
     return None
 
 
-def _online_step_sync_enabled() -> bool:
-    return env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_STEP_SYNC", True)
+def _online_step_sync_enabled(*, temperature: float | None = None, max_tokens: int | None = None) -> bool:
+    if "TORCHINFERNO_OPENAI_TP_ONLINE_STEP_SYNC" in os.environ:
+        return env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_STEP_SYNC", True)
+    if temperature is None or max_tokens is None:
+        return True
+    sampled_short_max_tokens = env_int(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_SHORT_STEP_SYNC_MAX_TOKENS",
+        256,
+        minimum=1,
+    )
+    if temperature > 0.0 and 0 < max_tokens <= sampled_short_max_tokens:
+        return False
+    return True
 
 
 def _online_submit_step_command_enabled(*, temperature: float, max_tokens: int) -> bool:
@@ -4662,7 +4673,7 @@ class OpenAICompletionEngine:
                         add_phase("event_emit_ms", event_emit_start_s)
                         step += ran_steps
                         remaining_steps -= ran_steps
-                    if _online_step_sync_enabled():
+                    if _online_step_sync_enabled(temperature=first.temperature, max_tokens=run_max_tokens):
                         step_sync_start_s = time.perf_counter()
                         _sync_tensor_parallel_command(self.model, self.device)
                         add_phase("step_sync_ms", step_sync_start_s)
@@ -5486,7 +5497,7 @@ class OpenAICompletionEngine:
                                 finished_events += 1
                         online_steps += ran_steps
                         remaining_steps -= ran_steps
-                    if _online_step_sync_enabled():
+                    if _online_step_sync_enabled(temperature=group[0].temperature, max_tokens=max_tokens):
                         _sync_tensor_parallel_command(self.model, self.device)
         finally:
             self._record_runtime_engine_queue_profile(
@@ -12677,6 +12688,8 @@ def _tensor_parallel_worker_loop(engine: OpenAICompletionEngine) -> None:
     online_symm_scope: ContextManager[None] | None = None
     persistent_prompt_list_symm_scope: ContextManager[None] | None = None
     token_budget_symm_scope: ContextManager[None] | None = None
+    online_temperature = 0.0
+    online_max_tokens = 0
     _skip_finally_sync = False
 
     def run_online_worker_steps(steps: int) -> None:
@@ -12853,6 +12866,8 @@ def _tensor_parallel_worker_loop(engine: OpenAICompletionEngine) -> None:
                 prefill_budget_value = int(payload.get("prefill_token_budget", 0))
                 temperature = float(payload.get("temperature", 0.0))
                 max_tokens = int(payload.get("max_tokens", 0))
+                online_temperature = temperature
+                online_max_tokens = max_tokens
                 fp8_prefill_enabled = _online_fp8_prefill_enabled(
                     temperature=temperature,
                     max_tokens=max_tokens,
@@ -13031,12 +13046,12 @@ def _tensor_parallel_worker_loop(engine: OpenAICompletionEngine) -> None:
                     )
                 steps_after_submit = max(0, int(payload.get("steps_after_submit", 0)))
                 if steps_after_submit > 0:
-                    if not _online_step_sync_enabled():
+                    if not _online_step_sync_enabled(temperature=online_temperature, max_tokens=online_max_tokens):
                         _skip_finally_sync = True
                     run_online_worker_steps(steps_after_submit)
                 continue
             if op == "online_step":
-                if not _online_step_sync_enabled():
+                if not _online_step_sync_enabled(temperature=online_temperature, max_tokens=online_max_tokens):
                     _skip_finally_sync = True
                 run_online_worker_steps(int(payload.get("steps", 1)))
                 continue

@@ -1350,10 +1350,11 @@ def test_tensor_parallel_worker_loop_rebuilds_incompatible_online_cache(monkeypa
     assert engine._persistent_serving_cache is not stale_cache
 
 
-def test_tensor_parallel_worker_loop_skips_online_step_barrier_when_disabled(monkeypatch) -> None:
+def test_tensor_parallel_worker_loop_skips_sampled_short_online_step_barrier(monkeypatch) -> None:
     import torch.distributed as dist
 
-    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_STEP_SYNC", "0")
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_STEP_SYNC", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_SHORT_STEP_SYNC_MAX_TOKENS", raising=False)
     commands: list[dict[str, object]] = [
         {
             "op": "online_start",
@@ -1361,7 +1362,7 @@ def test_tensor_parallel_worker_loop_skips_online_step_barrier_when_disabled(mon
             "max_active_requests": 4,
             "prefix_cache_capacity": 2,
             "prefill_token_budget": 8,
-            "temperature": 0.0,
+            "temperature": 0.7,
             "max_tokens": 6,
         },
         {"op": "online_step"},
@@ -8763,12 +8764,24 @@ def test_openai_online_submit_step_respects_env_override(monkeypatch) -> None:
     assert _online_submit_step_command_enabled(temperature=0.0, max_tokens=512) is True
 
 
-def test_online_step_sync_enabled_defaults_on(monkeypatch) -> None:
+def test_online_step_sync_enabled_defaults_off_for_sampled_short(monkeypatch) -> None:
     monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_STEP_SYNC", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_SHORT_STEP_SYNC_MAX_TOKENS", raising=False)
     assert _online_step_sync_enabled()
+    assert not _online_step_sync_enabled(temperature=0.7, max_tokens=256)
+    assert _online_step_sync_enabled(temperature=0.7, max_tokens=257)
+    assert _online_step_sync_enabled(temperature=0.0, max_tokens=256)
+
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_SHORT_STEP_SYNC_MAX_TOKENS", "128")
+    assert not _online_step_sync_enabled(temperature=0.7, max_tokens=128)
+    assert _online_step_sync_enabled(temperature=0.7, max_tokens=129)
 
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_STEP_SYNC", "0")
     assert not _online_step_sync_enabled()
+    assert not _online_step_sync_enabled(temperature=0.0, max_tokens=512)
+
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_STEP_SYNC", "1")
+    assert _online_step_sync_enabled(temperature=0.7, max_tokens=256)
 
 
 def test_online_fp8_prefill_defaults_to_greedy_large_and_sampled_medium(monkeypatch) -> None:
