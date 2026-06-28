@@ -121,6 +121,15 @@ mechanism: score-facing E2E stayed better at `291.2ms`, but sampled captures
 rose to `4`, sampled prefill wall rose to `7.06s`, and sampled phase total rose
 to `9.88s`. Keep the `1.0` default until the graph-key mismatch is explained.
 
+Adding batch `2` to the common-prefix suffix warmup is promoted. The current
+tree control still hit tiny sampled suffix shapes such as
+`prefix_graph:b2:s16:p45-45:src1:mixed0`, while the default warmup covered
+`1,4,8,16,32`. Warming `1,2,4,8,16,32` moved focused tree to
+`243.8 / 49.6 / 291.0ms` and improved the sampled branch counters:
+phase total `8.88s -> 8.04s`, prefill wall `6.24s -> 5.45s`, prefill forward
+`4.61s -> 3.81s`, and request-path captures `3 -> 2`. This is only one extra
+startup graph shape per suffix/policy and does not alter runtime scheduling.
+
 Current multi_turn on pushed `6659e61` is still prefill dominated:
 `366.8 / 62.8 / 426.0ms`, with `5.52s` prefill wall, `3.54s` decode active,
 and only common-prefix reuse (`45,000` reused prefix tokens). A mixed-prefix

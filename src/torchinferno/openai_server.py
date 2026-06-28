@@ -899,7 +899,7 @@ def _online_greedy_common_prefix_suffix_prefill_warmup_batches(
     if cache_rows <= 0 or max_active <= 0:
         return ()
     batches = _parse_positive_int_csv(
-        os.environ.get("TORCHINFERNO_OPENAI_WARMUP_ONLINE_GREEDY_COMMON_PREFIX_SUFFIX_BATCHES", "1,4,8,16,32")
+        os.environ.get("TORCHINFERNO_OPENAI_WARMUP_ONLINE_GREEDY_COMMON_PREFIX_SUFFIX_BATCHES", "1,2,4,8,16,32")
     )
     limit = min(cache_rows, max_active)
     return tuple(batch for batch in batches if 0 < batch <= limit)

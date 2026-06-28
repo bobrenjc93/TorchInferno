@@ -9139,7 +9139,7 @@ def test_online_common_prefix_prefill_warmup_filters_shapes(monkeypatch) -> None
     assert _online_greedy_common_prefix_suffix_prefill_warmup_max_tokens() == 512
     assert _online_greedy_common_prefix_suffix_prefill_warmup_prefix_tokens(64) == (45,)
     assert _online_greedy_common_prefix_suffix_prefill_warmup_suffix_tokens(128) == (16, 32, 64, 128)
-    assert _online_greedy_common_prefix_suffix_prefill_warmup_batches(64, 48) == (1, 4, 8, 16, 32)
+    assert _online_greedy_common_prefix_suffix_prefill_warmup_batches(64, 48) == (1, 2, 4, 8, 16, 32)
 
     monkeypatch.setenv("TORCHINFERNO_OPENAI_WARMUP_ONLINE_COMMON_PREFIX_ROWS", "53,96,128")
     monkeypatch.setenv("TORCHINFERNO_OPENAI_WARMUP_ONLINE_COMMON_PREFIX_TOKENS", "32,128,256")
