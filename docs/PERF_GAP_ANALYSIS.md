@@ -1,5 +1,26 @@
 # TorchInferno vs vLLM/sglang — Performance Gap Analysis (Llama-3.1-70B, 8xH100)
 
+## Greedy-large multi_turn suffix bucket refinement (2026-06-28)
+
+Current multi_turn is still conversation-prefix prefill dominated, but the
+power-of-two suffix buckets were doing avoidable padded work for 512-token
+greedy sessions. An env-only A/B on `7be4858` with suffix buckets
+`16,32,64,96,128,160,192,224,256` improved the focused TorchInferno row from
+the same-host control `395.2 / 64.0 / 460.0ms` to
+`333.2 / 64.3 / 397.8ms` (TTFT/TPOT/E2E), with zero prefill graph misses.
+The queue profile moved profiled runtime phase time from `11.11s` to `9.60s`
+and prefill wall from `5.84s` to `4.54s`.
+
+The promoted default is deliberately scoped to deterministic greedy-large
+sessions (`400 < max_tokens <= 512`) and keeps explicit env overrides. A no-env
+confirmation of the guarded default landed at `347.1 / 60.1 / 406.6ms`, with
+`s96` and `s160` prefix graphs replaying and no request-path captures. The
+all-provider comparison landed at TorchInferno `347.7 / 64.4 / 405.1ms`, vLLM
+`279.0 / 133.3 / 358.7ms`, and SGLang `153.6 / 111.8 / 267.4ms`. TorchInferno
+therefore keeps the multi_turn TPOT cell locally but still trails on TTFT/E2E;
+the next lever remains first-token scheduling or lower-overhead conversation
+prefix reuse, not broader suffix graph warmup alone.
+
 ## FlashInfer packaging and no-FI decode A/B (2026-06-28)
 
 Public provider logs for `20260628_190318` showed vLLM and SGLang running with

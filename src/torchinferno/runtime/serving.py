@@ -28,9 +28,13 @@ def _fi_decode_graph_mode() -> str:
 
 def _preferred_prefix_rows() -> tuple[int, ...]:
     raw = os.environ.get("TORCHINFERNO_CONTINUOUS_PREFERRED_PREFIX_ROWS", "48,53,68,69,128")
+    return _parse_positive_int_csv(raw, minimum=0)
+
+
+def _parse_positive_int_csv(raw: str | None, *, minimum: int = 1) -> tuple[int, ...]:
     rows: list[int] = []
     seen: set[int] = set()
-    for part in raw.split(","):
+    for part in (raw or "").split(","):
         token = part.strip()
         if not token:
             continue
@@ -38,11 +42,44 @@ def _preferred_prefix_rows() -> tuple[int, ...]:
             row = int(token)
         except ValueError:
             continue
-        if row < 0 or row in seen:
+        if row < minimum or row in seen:
             continue
         rows.append(row)
         seen.add(row)
     return tuple(rows)
+
+
+def _bucket_from_values(length: int, buckets: tuple[int, ...]) -> int | None:
+    for bucket in buckets:
+        if length <= bucket:
+            return bucket
+    return None
+
+
+def _default_prefix_prefill_suffix_buckets(
+    temperature: float,
+    max_generation_tokens: int | None,
+) -> tuple[int, ...]:
+    if temperature > 0.0 or max_generation_tokens is None:
+        return ()
+    min_tokens = env_int(
+        "TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SUFFIX_BUCKETS_GREEDY_LARGE_MIN_TOKENS",
+        400,
+        minimum=0,
+    )
+    max_tokens = env_int(
+        "TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SUFFIX_BUCKETS_GREEDY_LARGE_MAX_TOKENS",
+        512,
+        minimum=1,
+    )
+    if not (min_tokens < max_generation_tokens <= max_tokens):
+        return ()
+    return _parse_positive_int_csv(
+        os.environ.get(
+            "TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SUFFIX_BUCKETS_GREEDY_LARGE",
+            "16,32,64,96,128,160,192,224,256",
+        )
+    )
 
 
 def _enable_runtime_cache_capture_sync(cache: object) -> None:
@@ -401,8 +438,8 @@ class ContinuousBatchEngine:
         # row_indices ragged-prefill LOGITS graph (try_prefill_ragged_logits_graph):
         # the suffix KV is scatter-written into the (scattered) active rows and
         # one logit row per request is gathered, replaying the graph across
-        # changing row sets. Batch and suffix are padded to power-of-two buckets
-        # so graph shapes repeat. Per-row start positions handle mixed prefixes.
+        # changing row sets. Batch and suffix are padded to stable buckets so
+        # graph shapes repeat. Per-row start positions handle mixed prefixes.
         self.graph_prefill = graph_prefill
         self.profile_timings = profile_timings
         self.admit_min_ready_requests = admit_min_ready_requests
@@ -1665,6 +1702,21 @@ class ContinuousBatchEngine:
         return min(bucket, self.max_active_requests)
 
     def _suffix_bucket(self, length: int) -> int:
+        configured_buckets = _parse_positive_int_csv(
+            os.environ.get("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SUFFIX_BUCKETS")
+        )
+        configured_bucket = _bucket_from_values(length, configured_buckets)
+        if configured_bucket is not None:
+            return configured_bucket
+        default_bucket = _bucket_from_values(
+            length,
+            _default_prefix_prefill_suffix_buckets(
+                self.temperature,
+                self.max_generation_tokens,
+            ),
+        )
+        if default_bucket is not None:
+            return default_bucket
         # Pad the suffix length to a power of two so the ragged-prefill graph key
         # (batch, suffix_bucket, ...) repeats across batches and replays.
         if length <= 1:
@@ -1684,7 +1736,7 @@ class ContinuousBatchEngine:
         # gathered. Per-row start positions handle MIXED prefix lengths, and the
         # graph replays across changing scattered row sets (unlike the old
         # contiguous for_rows selected-logits path). Batch and suffix are padded
-        # to power-of-two buckets so graph shapes repeat.
+        # to stable buckets so graph shapes repeat.
         prefix_hits = [prefix_hit_tokens for _i, _req, prefix_hit_tokens, _r in group]
         # _prefill_many groups reuse requests by prefix length, so the prefix is
         # uniform here; that lets the suffix attention use a flash causal_lower_right

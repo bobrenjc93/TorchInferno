@@ -61,6 +61,57 @@ def test_dynamic_prefix_prefill_policy_extends_short_greedy_suffixes(monkeypatch
     assert _dynamic_prefix_prefill_context_len(111, 128, max_seq_len=512) == 239
 
 
+def test_continuous_prefix_prefill_suffix_buckets_can_be_configured(monkeypatch) -> None:
+    monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SUFFIX_BUCKETS", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SUFFIX_BUCKETS_GREEDY_LARGE", raising=False)
+    monkeypatch.delenv(
+        "TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SUFFIX_BUCKETS_GREEDY_LARGE_MIN_TOKENS",
+        raising=False,
+    )
+    monkeypatch.delenv(
+        "TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SUFFIX_BUCKETS_GREEDY_LARGE_MAX_TOKENS",
+        raising=False,
+    )
+    engine = ContinuousBatchEngine(object(), device=torch.device("cpu"))
+
+    assert engine._suffix_bucket(65) == 128
+
+    large_greedy_engine = ContinuousBatchEngine(
+        object(),
+        device=torch.device("cpu"),
+        temperature=0.0,
+        max_generation_tokens=512,
+    )
+    assert large_greedy_engine._suffix_bucket(65) == 96
+    assert large_greedy_engine._suffix_bucket(129) == 160
+    assert large_greedy_engine._suffix_bucket(225) == 256
+    assert large_greedy_engine._suffix_bucket(257) == 512
+
+    short_greedy_engine = ContinuousBatchEngine(
+        object(),
+        device=torch.device("cpu"),
+        temperature=0.0,
+        max_generation_tokens=128,
+    )
+    assert short_greedy_engine._suffix_bucket(65) == 128
+
+    sampled_engine = ContinuousBatchEngine(
+        object(),
+        device=torch.device("cpu"),
+        temperature=0.7,
+        max_generation_tokens=512,
+    )
+    assert sampled_engine._suffix_bucket(65) == 128
+
+    monkeypatch.setenv(
+        "TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SUFFIX_BUCKETS",
+        "16,32,64,96,128,160",
+    )
+    assert engine._suffix_bucket(65) == 96
+    assert engine._suffix_bucket(129) == 160
+    assert engine._suffix_bucket(161) == 256
+
+
 class _ToyCache:
     def __init__(
         self,

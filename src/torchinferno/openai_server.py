@@ -76,6 +76,7 @@ from torchinferno.runtime.scheduler import (
 from torchinferno.runtime.serving import (
     ContinuousBatchEngine as _RuntimeContinuousBatchEngine,
     ServingRequest as _RuntimeServingRequest,
+    _default_prefix_prefill_suffix_buckets,
     _dynamic_prefix_prefill_context_len,
     _dynamic_prefix_prefill_max_suffix_for_policy,
 )
@@ -912,15 +913,25 @@ def _online_greedy_common_prefix_suffix_prefill_warmup_prefix_tokens(max_seq_len
     return tuple(token_count for token_count in tokens if token_count <= max_seq_len)
 
 
-def _online_greedy_common_prefix_suffix_prefill_warmup_suffix_tokens(max_seq_len: int) -> tuple[int, ...]:
+def _online_greedy_common_prefix_suffix_prefill_warmup_suffix_tokens(
+    max_seq_len: int,
+    *,
+    warmup_temperature: float = 0.0,
+    warmup_max_tokens: int | None = None,
+) -> tuple[int, ...]:
     if max_seq_len <= 0:
         return ()
-    tokens = _parse_positive_int_csv(
-        os.environ.get(
-            "TORCHINFERNO_OPENAI_WARMUP_ONLINE_GREEDY_COMMON_PREFIX_SUFFIX_TOKENS",
-            "16,32,64,128,256",
-        )
-    )
+    configured = os.environ.get("TORCHINFERNO_OPENAI_WARMUP_ONLINE_GREEDY_COMMON_PREFIX_SUFFIX_TOKENS")
+    runtime_buckets = os.environ.get("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SUFFIX_BUCKETS")
+    if configured is not None:
+        tokens = _parse_positive_int_csv(configured)
+    elif runtime_buckets is not None:
+        tokens = _parse_positive_int_csv(runtime_buckets)
+    else:
+        tokens = _default_prefix_prefill_suffix_buckets(
+            warmup_temperature,
+            warmup_max_tokens,
+        ) or _parse_positive_int_csv("16,32,64,128,256")
     return tuple(token_count for token_count in tokens if token_count <= max_seq_len)
 
 
@@ -3128,7 +3139,11 @@ class OpenAICompletionEngine:
         suffix_tokens = (
             suffix_tokens_override
             if suffix_tokens_override is not None
-            else _online_greedy_common_prefix_suffix_prefill_warmup_suffix_tokens(max_seq_len)
+            else _online_greedy_common_prefix_suffix_prefill_warmup_suffix_tokens(
+                max_seq_len,
+                warmup_temperature=warmup_temperature,
+                warmup_max_tokens=warmup_max_tokens,
+            )
         )
         batch_sizes = _online_greedy_common_prefix_suffix_prefill_warmup_batches(cache_rows, max_active)
         if not prefix_tokens or not suffix_tokens or not batch_sizes:
