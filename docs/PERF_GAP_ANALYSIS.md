@@ -33,6 +33,26 @@ focused few_shot row completed at `161.5 / 46.7 / 200.8ms` with 98%
 correctness, matching the expected latency band while removing the public
 SCATTER startup failure mode.
 
+## Current long-output admission profile (2026-06-28)
+
+On pushed `5c67607`, same-host focused long_output control completed at
+`274.3 / 25.3 / 1234.3ms` with 100% correctness. The queue profile row
+`20260628_134910` showed the current remaining shape: `1000/1000` prefix reuse,
+one prefill graph capture, `57` prefill batches, `7.85s` prefill wall, `765`
+decode graph hits, and `25.26s` total queue phase. Decode TPOT remains close
+to the local vLLM/SGLang band, but prefill/admission and CPU token harvest still
+dominate the TTFT/E2E gap.
+
+Two narrowly scoped admission follow-ups are rejected on that stack. Forcing
+`TORCHINFERNO_OPENAI_TP_ONLINE_COLLECT_IDLE_ARRIVALS=1` improved median TTFT
+to `250.8ms`, but left E2E flat at `1233.0ms` and worsened the long-output tail
+from `1938.6/3261.5ms` p99 TTFT/E2E to `2915.6/4125.9ms`. Lowering only
+`TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_INITIAL_BATCH_WAIT_MS` from `10` to
+`5` also regressed the row to `285.2 / 24.7 / 1286.6ms`, with p99 TTFT/E2E at
+`2797.9/4104.3ms`. Keep the current greedy-short initial wait and keep idle
+arrival collection disabled for greedy short streams until a policy preserves
+tail latency while improving median admission.
+
 ## Published local refresh and rejected follow-ups (2026-06-28)
 
 The public result stream stalled after `20260628_050325`, so a same-host
