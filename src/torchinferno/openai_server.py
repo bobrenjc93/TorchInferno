@@ -534,6 +534,18 @@ def _online_fp8_prefill_enabled(*, temperature: float, max_tokens: int) -> bool:
         return True
     if temperature > 0.0:
         return False
+    greedy_short_min_tokens = env_int(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_FP8_PREFILL_MIN_TOKENS",
+        16,
+        minimum=1,
+    )
+    greedy_short_max_tokens = env_int(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_FP8_PREFILL_MAX_TOKENS",
+        128,
+        minimum=greedy_short_min_tokens,
+    )
+    if greedy_short_min_tokens <= max_tokens <= greedy_short_max_tokens:
+        return True
     min_tokens = env_int(
         "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_FP8_PREFILL_MIN_TOKENS",
         400,
@@ -571,6 +583,22 @@ def _online_fp8_prefill_min_m(*, temperature: float, max_tokens: int) -> int:
         return env_int(
             "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_FP8_PREFILL_MIN_M",
             256,
+            minimum=1,
+        )
+    greedy_short_min_tokens = env_int(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_FP8_PREFILL_MIN_TOKENS",
+        16,
+        minimum=1,
+    )
+    greedy_short_max_tokens = env_int(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_FP8_PREFILL_MAX_TOKENS",
+        128,
+        minimum=greedy_short_min_tokens,
+    )
+    if temperature <= 0.0 and greedy_short_min_tokens <= max_tokens <= greedy_short_max_tokens:
+        return env_int(
+            "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_FP8_PREFILL_MIN_M",
+            2048,
             minimum=1,
         )
     greedy_large_min_tokens = env_int(
@@ -2835,7 +2863,7 @@ class OpenAICompletionEngine:
             and hasattr(self.model, "forward_step_flashinfer")
         ):
             try:
-                import flashinfer  # noqa: F401
+                __import__("flashinfer")
                 unified_cache_backend = "flashinfer"
             except ImportError:
                 pass
@@ -3102,7 +3130,7 @@ class OpenAICompletionEngine:
                 )
         if hasattr(self.model, "forward_decode_flashinfer") and _fi_decode_graph_mode() != "off":
             try:
-                import flashinfer  # noqa: F401
+                __import__("flashinfer")
                 self._warmup_flashinfer_decode_graphs(cache, batch_sizes)
                 self.model._flashinfer_jit_warmed = True
                 fi_count = len(getattr(self.model, "_fi_decode_graphs", {}))
@@ -4098,7 +4126,7 @@ class OpenAICompletionEngine:
         result = hasattr(self.model, "allocate_cache")
         if not result:
             import sys as _obr
-            print(f"[ONLINE_BATCHER] skipped: no allocate_cache", file=_obr.stderr, flush=True)
+            print("[ONLINE_BATCHER] skipped: no allocate_cache", file=_obr.stderr, flush=True)
         return result
 
     def _maybe_build_paged_online_engine(self, *, max_active: int, max_seq_len: int):
@@ -5461,7 +5489,6 @@ class OpenAICompletionEngine:
         if use_prompt_list_batch and _prefer_tensor_parallel_stream_group(prompts, self.model):
             if self._shared_prefix_prompt_list_tokens(prompts) <= 0:
                 use_prompt_list_batch = False
-        shared_prefix_tokens = self._shared_prefix_prompt_list_tokens(prompts) if use_prompt_list_batch else 0
         profile_queue = bool(self._queue_profile_path_value())
         with _tensor_parallel_symm_mem_allreduce_scope(
             self.model,
@@ -5773,7 +5800,7 @@ class OpenAICompletionEngine:
         if _tensor_parallel_tensor_commands_enabled(self.model):
             return False
         try:
-            import flashinfer  # noqa: F401
+            __import__("flashinfer")
         except ImportError:
             return False
         return hasattr(self.model, "forward_step_flashinfer") and hasattr(self.model, "allocate_cache")
@@ -5797,7 +5824,6 @@ class OpenAICompletionEngine:
         )
 
     def _run_flashinfer_stream_group(self, group: Sequence[_QueuedGeneration]) -> None:
-        import torch
         import torch.distributed as dist
         model = self.model
         stop_token_ids = getattr(self, "stop_token_ids", frozenset())

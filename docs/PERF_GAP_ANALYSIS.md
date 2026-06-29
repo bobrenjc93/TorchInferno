@@ -1,5 +1,29 @@
 # TorchInferno vs vLLM/sglang — Performance Gap Analysis (Llama-3.1-70B, 8xH100)
 
+## Current 23395db refresh and greedy-short FP8 prefill (2026-06-29)
+
+Public run `20260629_165551` measured TorchInferno `23395db`, SGLang
+`643e1cc`, and the current vLLM environment. The scorecard was SGLang `14/20`,
+TorchInferno `3/20`, and vLLM `2/20`. TorchInferno rows were few_shot
+`166.5 / 50.2 / 210.1ms`, self_consistency `358.9 / 0.0 / 394.9ms`,
+multi_turn `308.0 / 66.6 / 368.2ms`, tree_of_thought
+`282.9 / 46.7 / 324.2ms`, and long_output `296.1 / 25.1 / 1246.8ms`.
+TorchInferno still wins the few_shot, multi_turn, and tree_of_thought TPOT
+cells, but SGLang now owns every score-facing long_output cell on this run.
+
+A focused long_output queue/fast-HTTP profile on `23395db` landed at
+`287.7 / 26.4 / 1310.1ms`, 1000/1000 correct. HTTP p50 first-content was
+`250ms`, matching server queue-to-first-token p50 `246ms`, so the median gap is
+inside server scheduling/prefill rather than client response writing. The run
+spent `8.16s` in online prefill forward, with FP8 prefill disabled for this
+deterministic short-generation bucket. Enabling online FP8 prefill explicitly
+improved the focused row to `264.6 / 24.6 / 1274.9ms` and raised median
+throughput from `29.9` to `31.6 tok/s`, still 1000/1000 correct. After making
+that a scoped default for greedy short requests (`16-128` max tokens), the
+edited-checkout no-env validation landed at `254.1 / 25.7 / 1238.6ms`, again
+1000/1000 correct. This policy is intentionally below few_shot's 256-token
+greedy bucket and does not affect sampled self_consistency/tree traffic.
+
 ## Current 8bf4c1c public refresh and prompt-cache follow-up (2026-06-29)
 
 Public run `20260629_161720` measured TorchInferno `8bf4c1c`, SGLang

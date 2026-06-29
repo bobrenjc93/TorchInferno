@@ -8983,11 +8983,29 @@ def test_online_step_sync_enabled_defaults_off_for_sampled_short(monkeypatch) ->
     assert _online_step_sync_enabled(temperature=0.7, max_tokens=256)
 
 
-def test_online_fp8_prefill_defaults_to_greedy_large_and_sampled_medium(monkeypatch) -> None:
+def test_online_fp8_prefill_defaults_to_greedy_short_large_and_sampled_medium(monkeypatch) -> None:
     monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_FP8_PREFILL", raising=False)
     monkeypatch.delenv("TORCHINFERNO_FP8_PREFILL", raising=False)
-    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_FP8_PREFILL_MIN_TOKENS", raising=False)
-    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_FP8_PREFILL_MAX_TOKENS", raising=False)
+    monkeypatch.delenv(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_FP8_PREFILL_MIN_TOKENS",
+        raising=False,
+    )
+    monkeypatch.delenv(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_FP8_PREFILL_MAX_TOKENS",
+        raising=False,
+    )
+    monkeypatch.delenv(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_FP8_PREFILL_MIN_M",
+        raising=False,
+    )
+    monkeypatch.delenv(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_FP8_PREFILL_MIN_TOKENS",
+        raising=False,
+    )
+    monkeypatch.delenv(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_FP8_PREFILL_MAX_TOKENS",
+        raising=False,
+    )
     monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_FP8_PREFILL_MIN_M", raising=False)
     monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_FP8_PREFILL_MIN_M", raising=False)
     monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_FP8_PREFILL_MIN_TOKENS", raising=False)
@@ -8999,13 +9017,38 @@ def test_online_fp8_prefill_defaults_to_greedy_large_and_sampled_medium(monkeypa
     assert _online_fp8_prefill_enabled(temperature=0.7, max_tokens=257)
     assert _online_fp8_prefill_enabled(temperature=0.7, max_tokens=300)
     assert not _online_fp8_prefill_enabled(temperature=0.7, max_tokens=301)
+    assert not _online_fp8_prefill_enabled(temperature=0.0, max_tokens=15)
+    assert _online_fp8_prefill_enabled(temperature=0.0, max_tokens=16)
+    assert _online_fp8_prefill_enabled(temperature=0.0, max_tokens=128)
+    assert not _online_fp8_prefill_enabled(temperature=0.0, max_tokens=129)
     assert not _online_fp8_prefill_enabled(temperature=0.0, max_tokens=400)
     assert _online_fp8_prefill_enabled(temperature=0.0, max_tokens=401)
     assert _online_fp8_prefill_enabled(temperature=0.0, max_tokens=512)
     assert not _online_fp8_prefill_enabled(temperature=0.0, max_tokens=513)
+    assert _online_fp8_prefill_min_m(temperature=0.0, max_tokens=128) == 2048
     assert _online_fp8_prefill_min_m(temperature=0.0, max_tokens=512) == 512
     assert _online_fp8_prefill_min_m(temperature=0.0, max_tokens=400) == 2048
     assert _online_fp8_prefill_min_m(temperature=0.7, max_tokens=300) == 256
+
+    monkeypatch.setenv(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_FP8_PREFILL_MAX_TOKENS",
+        "96",
+    )
+    assert _online_fp8_prefill_enabled(temperature=0.0, max_tokens=96)
+    assert not _online_fp8_prefill_enabled(temperature=0.0, max_tokens=97)
+    monkeypatch.setenv(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_FP8_PREFILL_MIN_M",
+        "1024",
+    )
+    assert _online_fp8_prefill_min_m(temperature=0.0, max_tokens=96) == 1024
+    monkeypatch.delenv(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_FP8_PREFILL_MAX_TOKENS",
+        raising=False,
+    )
+    monkeypatch.delenv(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_FP8_PREFILL_MIN_M",
+        raising=False,
+    )
 
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_FP8_PREFILL_MIN_M", "1024")
     assert _online_fp8_prefill_min_m(temperature=0.0, max_tokens=512) == 1024
