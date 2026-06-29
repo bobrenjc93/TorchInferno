@@ -86,6 +86,16 @@ few_shot `165.3 / 48.7 / 205.0ms`, self_consistency
 tree_of_thought `243.0 / 47.5 / 294.9ms`, and long_output
 `272.1 / 25.4 / 1171.4ms`, with summary correctness rates at `1.0`.
 
+Rechecking a much larger greedy-large initial collection window is rejected.
+Forcing `TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_INITIAL_BATCH_WAIT_MS=50`
+on current `0b53edf` did collect a larger first wave (`initial_batch_size=28`
+instead of `8` in the focused no-env profile), but the multi_turn row landed at
+`341.3 / 64.9 / 399.7ms`, with only `984/1000` raw correct. Fast-HTTP first
+content worsened from `269.7ms` p50 and `2426.6ms` p99 to `274.1ms` p50 and
+`3111.0ms` p99. The queue profile also regressed total phase time to `10.00s`
+and decode-active time to `4.83s`. Keep the current greedy-large initial wait;
+the remaining multi_turn tail is not solved by collecting a bigger first wave.
+
 ## Earlier no-profile local scorecard (2026-06-28)
 
 An earlier no-profile all-provider run on pushed `50580d6` landed at
