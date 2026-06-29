@@ -1,6 +1,6 @@
 # TorchInferno vs vLLM/sglang — Performance Gap Analysis (Llama-3.1-70B, 8xH100)
 
-## Current 92af26f refresh and rejected self/few-shot follow-ups (2026-06-28)
+## Current 92af26f/b0d4c0f refresh and rejected follow-ups (2026-06-28)
 
 A same-host no-profile all-provider comparison on pushed `92af26f` is the
 current local source baseline. The scorecard was SGLang `11/20`,
@@ -56,6 +56,17 @@ the row still regressed badly to `180.0 / 69.4 / 759.9ms` and only
 was only `1.29s`, so the remaining problem is decode-many event pacing/CPU
 work rather than stopped-row overcompute. The prototype was reverted; keep
 decode-many scoped to short greedy output.
+
+Raising the stream token drain cap for long_output is rejected. On clean
+`b0d4c0f`, the current profiled long_output control landed at
+`271.6 / 24.8 / 1276.3ms`, with `1.2s` of prefill graph capture,
+`12.57s` ragged-decode GPU event time, and `6.62s` CPU-token readback.
+Increasing only `TORCHINFERNO_OPENAI_STREAM_TOKEN_BATCH_MAX` from `8` to `32`
+kept correctness at `1000/1000` but regressed the row to
+`279.6 / 25.5 / 1311.7ms`. Fast-HTTP profiling showed why this is not a
+promotion candidate: content chunks stayed unchanged at `36,715`, content
+send calls only moved `26,839 -> 26,160`, and summed content-send time rose
+`20.70s -> 21.30s`. Keep the current stream batch cap.
 
 ## Current no-profile local scorecard (2026-06-28)
 
