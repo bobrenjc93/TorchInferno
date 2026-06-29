@@ -359,6 +359,19 @@ was only `1.29s`, so the remaining problem is decode-many event pacing/CPU
 work rather than stopped-row overcompute. The prototype was reverted; keep
 decode-many scoped to short greedy output.
 
+The current pushed `707481b` few_shot row is still a small median gap but a bad
+tail row. Same-host providers landed at vLLM `170.7 / 86.5 / 273.1ms`, SGLang
+`127.7 / 82.3 / 206.7ms`, and TorchInferno `168.1 / 47.9 / 209.2ms`; all were
+in the 98% correctness band. The TorchInferno queue profile showed one online
+session, `35` prefill batches, `2.70s` prefill wall (`1.71s` forward), `72`
+decode batches, `3.15s` decode GPU event time, only `122` padded ragged decode
+tokens, and two prefill graph misses with no captures. Extending greedy
+common-prefix suffix warmup from `45` to `45,122` is rejected: readiness slowed
+from about `161s` to `206s`, the focused row was only noise-better at
+`164.2 / 48.9 / 203.9ms`, p99 worsened, and queue counters regressed to
+`3.60s` prefill wall with three misses and one request-path capture. The few_shot
+tail is not solved by warming that benchmark's 122-token common-prefix shape.
+
 Raising the stream token drain cap for long_output is rejected. On clean
 `b0d4c0f`, the current profiled long_output control landed at
 `271.6 / 24.8 / 1276.3ms`, with `1.2s` of prefill graph capture,
