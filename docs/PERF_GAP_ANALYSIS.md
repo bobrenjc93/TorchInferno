@@ -56,6 +56,20 @@ tokens from the 45-token shared system prefix. So the current stable common
 prefix path is not the blocker; the missing piece is efficient reuse of longer
 per-conversation prefixes.
 
+A current same-host multi_turn refresh on pushed `b448f97` keeps the same
+diagnosis with the newer turn metadata. vLLM landed at
+`303.8 / 100.2 / 394.1ms`, SGLang at `160.0 / 114.5 / 270.1ms`, and
+TorchInferno at `348.8 / 63.0 / 406.8ms`, all around 98% raw correctness.
+TorchInferno again won only TPOT. Queue counters showed one session with `36`
+prefill batches, zero graph misses/captures, `4.91s` prefill wall (`4.27s`
+forward), `5.19s` decode GPU event time, `191` padded ragged decode tokens, and
+exactly `45,000` reused tokens from the shared 45-token system prefix. Per-turn
+medians show where the tail comes from: TorchInferno turn 0 was `399ms`, turn 1
+spiked to `808ms` median and `3446ms` p99, and later turns settled into the
+`303-397ms` median band. SGLang reaches `122-177ms` medians for turns 1-7. This
+keeps conversation-prefix reuse or a faster mixed-prefix suffix path as the
+multi_turn requirement; the default common-prefix path is warm and stable.
+
 Exact-length full-prompt reuse is also rejected on current `9d62f6b`. Enabling
 pinned full-prompt stores for `max_tokens>=512` with non-common-prefix graph
 prefill, but without mixed-prefix grouping, completed correctly (`979/1000`) and
