@@ -2083,6 +2083,59 @@ def test_continuous_batch_engine_non_chunked_exact_prompt_reuses_generated_prefi
     assert engine.stats.generated_prefix_reuse_tokens == len(prompt) + 1
 
 
+def test_continuous_batch_engine_exact_prompt_elides_cached_stop_event(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_GENERATED_PREFIX_CACHE", "1")
+    prompt = tuple(range(1, 18))
+    eos_token_id = 19
+    model = _StaticDecodeGraphToyModel()
+    engine = ContinuousBatchEngine(
+        model,
+        device=torch.device("cpu"),
+        max_active_requests=2,
+        prefix_cache_capacity=4,
+        pin_shared_prefix=True,
+        graph_prefill=True,
+    )
+    engine.start_online(max_seq_len=64)
+    _indexed, warm_active = engine._prefill_many(
+        [
+            (0, ServingRequest("warm-a", prompt, 1, arrival_step=0)),
+            (1, ServingRequest("warm-b", prompt, 1, arrival_step=0)),
+        ],
+        0,
+        events=[],
+    )
+    for state in warm_active:
+        engine._finish_and_release(state, 0)
+
+    engine.submit_online(
+        ServingRequest("late-a", prompt, 2, arrival_step=0, eos_token_id=eos_token_id)
+    )
+    assert [(event.request_id, event.token, event.finished) for event in engine.step_online()] == [
+        ("late-a", 18, False)
+    ]
+    assert [(event.request_id, event.token, event.finished) for event in engine.step_online()] == [
+        ("late-a", eos_token_id, True)
+    ]
+    decode_calls = engine.stats.decode_model_calls
+    assert engine.stats.generated_prefix_store_requests == 1
+
+    engine.submit_online(
+        ServingRequest("late-b", prompt, 2, arrival_step=0, eos_token_id=eos_token_id)
+    )
+    events = engine.step_online()
+
+    assert [(event.request_id, event.token, event.finished) for event in events] == [
+        ("late-b", 18, True)
+    ]
+    assert not engine.has_online_work()
+    assert engine.stats.decode_model_calls == decode_calls
+    assert engine.stats.generated_prefix_reuse_requests == 1
+    assert engine.stats.generated_prefix_reuse_tokens == len(prompt) + 1
+
+
 def test_continuous_batch_engine_common_prompt_stores_generated_prefix(monkeypatch) -> None:
     monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_GENERATED_PREFIX_CACHE", "1")
     prompt = tuple(range(1, 18))

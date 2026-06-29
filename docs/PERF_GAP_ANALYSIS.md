@@ -148,6 +148,17 @@ local remaining self gap is request-wave/finish churn rather than prefix cache
 or decode compute. Keep the rejected idle-drain, event-ordering, and submit-step
 follow-ups closed unless a new mechanism reduces the wave count directly.
 
+Cached generated-prefix continuations now elide discard-only stop events when
+the cached second token is EOS/stop: the visible first token is marked finished
+instead of emitting a second internal stop event for the OpenAI server to drop.
+A profiled self_consistency run on the working tree after `54b6471` stayed
+correct (`1000/1000`) and cut internal emitted events from the previous
+`~2000` shape to `1025`, with `215` submit batches and `194` runtime step
+calls. The profiled row was `303.4 / 0.0 / 320.5ms`; a no-profile recheck
+landed at `201.8 / 0.0 / 310.2ms`. This is a small finish-path cleanup rather
+than a full self_consistency close: submit batches and runtime step calls remain
+in the same band, so the larger request-wave issue is still open.
+
 A current focused long_output profile on `26a9d5c` keeps that row in the known
 decode/readback bucket rather than exposing a missing prefix path. The row
 completed `1000/1000` correct at `301.4 / 25.4 / 1320.6ms`, with p99

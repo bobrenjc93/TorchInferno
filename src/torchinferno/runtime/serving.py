@@ -2151,39 +2151,24 @@ class ContinuousBatchEngine:
             continuation_reuse: dict[int, _ReusablePrefix] = {}
             pending_rows: list[int] = []
             active: list[_ActiveRequest] = []
-            for row_index, (original_index, request, prefix_hit_tokens, _reusable) in enumerate(group):
+            first_tokens = [0 for _ in group]
+            first_token_finished: list[bool | None] = [None for _ in group]
+            for row_index, (_original_index, request, _prefix_hit_tokens, _reusable) in enumerate(group):
                 next_token = int(next_tokens[row_index])
+                first_tokens[row_index] = int(next_token)
                 generated = 1
                 finished = request.is_stop_token(next_token) or generated >= request.max_new_tokens
                 if finished:
-                    if events is not None:
-                        events.append(
-                            ServingTokenEvent(
-                                request_id=request.request_id,
-                                token=next_token,
-                                step=step,
-                                generated=generated,
-                                finished=True,
-                        )
-                    )
+                    first_token_finished[row_index] = True
                     continue
 
-                if events is not None:
-                    events.append(
-                        ServingTokenEvent(
-                            request_id=request.request_id,
-                            token=next_token,
-                            step=step,
-                            generated=generated,
-                            finished=False,
-                        )
-                    )
                 generated_prefix = (*request.prompt, next_token)
                 continuation = self._lookup_exact_reusable_prefix(generated_prefix)
                 if continuation is not None:
                     continuation_reuse[row_index] = continuation
                     continuation_reuse_groups[continuation.route_id].append(row_index)
                     continue
+                first_token_finished[row_index] = False
                 pending_rows.append(row_index)
 
             continuation_next_tokens: dict[int, int] = {}
@@ -2197,6 +2182,37 @@ class ContinuousBatchEngine:
                 for token_index, row_index in enumerate(indices):
                     continuation_next_tokens[row_index] = int(sampled_tokens[token_index])
 
+            if events is not None:
+                second_events: list[ServingTokenEvent] = []
+                for row_index, (_original_index, request, _prefix_hit_tokens, _reusable) in enumerate(group):
+                    first_token = first_tokens[row_index]
+                    finished = first_token_finished[row_index]
+                    second_token = continuation_next_tokens.get(row_index)
+                    if finished is None:
+                        finished = second_token is not None and request.is_stop_token(second_token)
+                    events.append(
+                        ServingTokenEvent(
+                            request_id=request.request_id,
+                            token=first_token,
+                            step=step,
+                            generated=1,
+                            finished=bool(finished),
+                        )
+                    )
+                    if second_token is None or request.is_stop_token(second_token):
+                        continue
+                    second_generated = 2
+                    second_events.append(
+                        ServingTokenEvent(
+                            request_id=request.request_id,
+                            token=second_token,
+                            step=step,
+                            generated=second_generated,
+                            finished=second_generated >= request.max_new_tokens,
+                        )
+                    )
+                events.extend(second_events)
+
             continuation_copy_groups: dict[tuple[int, int], list[int]] = defaultdict(list)
             continuation_active: list[_ActiveRequest] = []
             for row_index, next_token in continuation_next_tokens.items():
@@ -2209,16 +2225,6 @@ class ContinuousBatchEngine:
                 self.stats.generated_prefix_reuse_requests += 1
                 self.stats.generated_prefix_reuse_tokens += generated_prefix_len
                 finished = request.is_stop_token(second_token) or generated >= request.max_new_tokens
-                if events is not None:
-                    events.append(
-                        ServingTokenEvent(
-                            request_id=request.request_id,
-                            token=second_token,
-                            step=step,
-                            generated=generated,
-                            finished=finished,
-                        )
-                    )
                 if finished:
                     continue
 
