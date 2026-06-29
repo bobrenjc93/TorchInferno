@@ -5289,6 +5289,19 @@ averages stay inspectable in long_output profiles. Do not infer a new
 decode-many knob from this alone: prior larger-quantum, waiting-capacity,
 pinned-readback, and async-copy attempts remain rejected.
 
+A lower greedy KV-token budget is still rejected after the decode-shape timing
+refresh. Forcing `TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_KV_TOKEN_BUDGET=16384`
+on pushed `bd7e38b` capped long_output at `63` active rows and completed
+1000/1000 correct, but the score-facing row moved to
+`264.2 / 26.8 / 1343.3ms`. The profile showed the intended padding reduction
+did not buy real throughput: prefill wall rose `7.66s -> 9.24s`, decode GPU
+time rose `12.98s -> 13.71s`, CPU token wait rose `7.19s -> 8.41s`, and total
+phase time rose `24.63s -> 26.03s`. Keep the 32K greedy KV budget. Queue
+profiles now also split `runtime_decode_many_cpu_tokens_ms` and attribute
+decode-many token-readback time into the per-shape CPU timing map so the next
+long_output profile can distinguish multi-step readback from ordinary ragged
+decode readback.
+
 ## In-flight, validated-locally-but-NOT-benchmarked commits
 
 The inference-bench harness has been frozen on `25260c0` for many hours, so these

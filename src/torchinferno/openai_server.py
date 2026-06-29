@@ -5007,6 +5007,7 @@ class OpenAICompletionEngine:
             "decode_many_skipped_tokens",
             "decode_many_stop_finishes",
             "decode_many_limit_finishes",
+            "decode_many_cpu_tokens_ms",
             "prefix_reuse_requests",
             "prefix_reuse_tokens",
             "queued_requests",

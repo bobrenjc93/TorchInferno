@@ -213,6 +213,7 @@ class ServingStats:
     decode_many_skipped_tokens: int = 0
     decode_many_stop_finishes: int = 0
     decode_many_limit_finishes: int = 0
+    decode_many_cpu_tokens_ms: float = 0.0
     prefix_reuse_requests: int = 0
     prefix_reuse_tokens: int = 0
     queued_requests: int = 0
@@ -669,6 +670,7 @@ class ContinuousBatchEngine:
         self._sync_gpu_seq_lens_from_states(active)
         records: list[tuple[list[_ActiveRequest], int, list[int], list[bool]]] = []
         token_parts: list[Tensor] = []
+        shape_parts: list[tuple[str, int]] = []
         steps_run = 0
 
         while steps_run < max_steps and active and self._can_decode_ragged(active):
@@ -677,6 +679,9 @@ class ContinuousBatchEngine:
             self.stats.scheduler_steps += 1
             next_token_tensor = self._decode_ragged_batch_token_tensor(states)
             token_parts.append(next_token_tensor[: len(states)].detach().clone())
+            if self.profile_timings:
+                shape_key = f"decode_many:b{len(states)}/{int(next_token_tensor.numel())}"
+                shape_parts.append((shape_key, len(states)))
 
             state_update_start_s = time.perf_counter() if self.profile_timings else 0.0
             generated_after: list[int] = []
@@ -705,7 +710,17 @@ class ContinuousBatchEngine:
         cpu_tokens_start_s = time.perf_counter() if self.profile_timings else 0.0
         flat_tokens = torch.cat(token_parts).detach().cpu().tolist()
         if self.profile_timings:
-            self.stats.decode_ragged_cpu_tokens_ms += (time.perf_counter() - cpu_tokens_start_s) * 1000.0
+            cpu_elapsed_ms = (time.perf_counter() - cpu_tokens_start_s) * 1000.0
+            self.stats.decode_ragged_cpu_tokens_ms += cpu_elapsed_ms
+            self.stats.decode_many_cpu_tokens_ms += cpu_elapsed_ms
+            shape_token_count = sum(token_count for _shape_key, token_count in shape_parts)
+            if shape_token_count > 0:
+                for shape_key, token_count in shape_parts:
+                    self._record_shape_time(
+                        self.stats.decode_shape_cpu_tokens_ms,
+                        shape_key,
+                        cpu_elapsed_ms * (token_count / shape_token_count),
+                    )
             self._flush_decode_ragged_model_gpu_timers()
 
         events: list[ServingTokenEvent] = []
