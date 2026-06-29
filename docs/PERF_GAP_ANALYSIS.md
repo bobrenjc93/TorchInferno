@@ -96,6 +96,14 @@ content worsened from `269.7ms` p50 and `2426.6ms` p99 to `274.1ms` p50 and
 and decode-active time to `4.83s`. Keep the current greedy-large initial wait;
 the remaining multi_turn tail is not solved by collecting a bigger first wave.
 
+Broadening prefill-cost admission priority to the 256-token greedy few_shot row
+is also rejected. On current `e5b7dcc`, a paired no-profile control landed at
+`163.3 / 49.2 / 202.7ms`, while forcing
+`TORCHINFERNO_CONTINUOUS_ADMIT_PREFILL_COST_PRIORITY=1` landed at
+`164.2 / 47.1 / 202.8ms`; both were `977/1000` raw correct. The env priority
+only traded a small TPOT improvement for a TTFT regression and no E2E movement,
+so keep the default scoped to deterministic greedy-short traffic.
+
 ## Earlier no-profile local scorecard (2026-06-28)
 
 An earlier no-profile all-provider run on pushed `50580d6` landed at
