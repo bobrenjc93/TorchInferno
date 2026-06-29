@@ -88,6 +88,25 @@ decode model call, and `992` generated-prefix reuses. Treat the full-order
 `330ms` self TTFT as client/host/provider-order admission noise unless a repeat
 reproduces it with server-side queue or HTTP first-content movement.
 
+A reduced full-order repeat on current `492994c` with
+`vllm -> sglang -> torchinferno` and only `self_consistency` reproduced the
+last-provider shape: TorchInferno landed at `320.6 / 0.0 / 389.2ms` versus the
+ordered TorchInferno-only `203.9 / 0.0 / 278.0ms` control. Server-side medians
+were still fast after request arrival: accepted-to-handler `0.05ms`,
+request-read `45.3ms`, HTTP first-content `8.7ms`, queue-to-first `7.5ms`, one
+prefill batch, one decode model call, and `986` generated-prefix reuses. The
+missing median is therefore mostly before server accept or while the client is
+delivering first-use localhost requests after earlier providers have run, not
+inside TorchInferno model execution.
+
+Increasing the general inference-bench inter-provider cleanup wait from `30s`
+to `75s` is rejected as a default. A profiled reduced full-order run looked
+promising (`252.4 / 0.0 / 359.4ms`, with TorchInferno winning E2E and
+throughput), but the no-profile validation did not hold:
+`358.9 / 0.0 / 385.7ms`, with SGLang winning TTFT, E2E, p99s, and throughput.
+The longer wait is therefore not enough evidence for a harness default change;
+keep using the env override only for isolation studies.
+
 Raising the drained fast-HTTP keepalive timeout from `0.25s` to `1.0s` is also
 rejected on the current stack. A focused self_consistency A/B on `afbbe89`
 regressed the score row to `364.2 / 0.0 / 394.0ms`; the HTTP profile still had
