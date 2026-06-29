@@ -407,6 +407,7 @@ class ContinuousBatchEngine:
         prefill_token_budget: int | None = None,
         prefill_chunk_size: int | None = None,
         decode_first: bool = True,
+        prefill_ready_before_decode: bool = False,
         enable_ragged_decode: bool = True,
         store_reusable_prefixes: bool = True,
         store_full_prompt_prefixes: bool = True,
@@ -449,6 +450,7 @@ class ContinuousBatchEngine:
         # prefill stalls the active decode batch. None preserves one-shot prefill.
         self.prefill_chunk_size = prefill_chunk_size
         self.decode_first = decode_first
+        self.prefill_ready_before_decode = prefill_ready_before_decode
         self.enable_ragged_decode = enable_ragged_decode
         self.store_reusable_prefixes = store_reusable_prefixes
         self.store_full_prompt_prefixes = store_full_prompt_prefixes
@@ -790,7 +792,12 @@ class ContinuousBatchEngine:
         step = self._online_step
         active = self._online_active
         self.stats.scheduler_steps += 1
-        if self.decode_first and active:
+        decode_before_admit = bool(self.decode_first and active)
+        decode_after_admit = not self.decode_first
+        if decode_before_admit and self.prefill_ready_before_decode and waiting:
+            decode_before_admit = False
+            decode_after_admit = True
+        if decode_before_admit:
             _da_start = time.perf_counter() if self.profile_timings else 0.0
             _decoded_results, active = self._decode_active(active, step, events=events)
             if self.profile_timings:
@@ -811,7 +818,7 @@ class ContinuousBatchEngine:
                 _admitted_results, admitted_active = self._prefill_many(admitted, step, events=events)
                 active.extend(admitted_active)
 
-        if not self.decode_first and active:
+        if active and decode_after_admit:
             _decoded_results, active = self._decode_active(active, step + 1, events=events)
         if self.decode_first and active:
             active = self._release_online_prefill_finished(active, step)

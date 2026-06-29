@@ -106,6 +106,7 @@ from torchinferno.openai_server import (
     _online_admit_per_step_cap,
     _online_collect_idle_arrivals_enabled,
     _online_decode_warmup_batch_sizes,
+    _online_decode_first_enabled,
     _online_decode_many_allow_stop_enabled,
     _online_decode_many_enabled,
     _online_decode_quantum,
@@ -119,6 +120,7 @@ from torchinferno.openai_server import (
     _online_kv_token_budget,
     _online_marlin_int4_decode_enabled,
     _online_persistent_idle_ms,
+    _online_prefill_ready_before_decode_enabled,
     _online_refill_min_ready_requests,
     _online_session_max_tokens,
     _online_session_prompt_headroom_tokens,
@@ -8806,6 +8808,22 @@ def test_openai_online_decode_many_respects_env_overrides(monkeypatch) -> None:
     monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY", raising=False)
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_DECODE_MANY", "0")
     assert not _online_decode_many_enabled(temperature=0.0, max_tokens=64)
+
+
+def test_openai_online_decode_first_respects_env(monkeypatch) -> None:
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_DECODE_FIRST", raising=False)
+    assert _online_decode_first_enabled(temperature=0.0, max_tokens=64)
+
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_DECODE_FIRST", "0")
+    assert not _online_decode_first_enabled(temperature=0.0, max_tokens=64)
+
+
+def test_openai_online_prefill_ready_before_decode_respects_env(monkeypatch) -> None:
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_PREFILL_READY_BEFORE_DECODE", raising=False)
+    assert not _online_prefill_ready_before_decode_enabled(temperature=0.0, max_tokens=64)
+
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_PREFILL_READY_BEFORE_DECODE", "1")
+    assert _online_prefill_ready_before_decode_enabled(temperature=0.0, max_tokens=64)
 
 
 def test_openai_online_generated_prefix_cache_defaults_to_sampled_short(monkeypatch) -> None:

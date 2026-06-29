@@ -397,6 +397,16 @@ def _online_decode_many_allow_stop_enabled(*, temperature: float, max_tokens: in
     return env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_DECODE_MANY_ALLOW_STOP", True)
 
 
+def _online_decode_first_enabled(*, temperature: float, max_tokens: int) -> bool:
+    del temperature, max_tokens
+    return env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_DECODE_FIRST", True)
+
+
+def _online_prefill_ready_before_decode_enabled(*, temperature: float, max_tokens: int) -> bool:
+    del temperature, max_tokens
+    return env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_PREFILL_READY_BEFORE_DECODE", False)
+
+
 def _stream_token_batch_max() -> int:
     return env_int("TORCHINFERNO_OPENAI_STREAM_TOKEN_BATCH_MAX", 8, minimum=1)
 
@@ -4301,10 +4311,20 @@ class OpenAICompletionEngine:
             temperature=first.temperature,
             max_tokens=run_max_tokens,
         )
-        decode_many_allow_stop = _online_decode_many_allow_stop_enabled(
+        decode_first = _online_decode_first_enabled(
             temperature=first.temperature,
             max_tokens=run_max_tokens,
         )
+        prefill_ready_before_decode = _online_prefill_ready_before_decode_enabled(
+            temperature=first.temperature,
+            max_tokens=run_max_tokens,
+        )
+        if not decode_first:
+            use_decode_many = False
+        decode_many_allow_stop = _online_decode_many_allow_stop_enabled(
+            temperature=first.temperature,
+            max_tokens=run_max_tokens,
+        ) if use_decode_many else False
         fp8_prefill_enabled = _online_fp8_prefill_enabled(
             temperature=first.temperature,
             max_tokens=run_max_tokens,
@@ -4354,6 +4374,8 @@ class OpenAICompletionEngine:
                 profile_timings=profile_queue,
                 admit_min_ready_requests=admit_min_ready_requests,
                 admit_per_step_cap=admit_per_step_cap,
+                decode_first=decode_first,
+                prefill_ready_before_decode=prefill_ready_before_decode,
                 enable_decode_many=use_decode_many,
                 decode_many_allow_stop=decode_many_allow_stop,
                 generated_prefix_cache=_online_generated_prefix_cache_enabled(
@@ -4460,6 +4482,8 @@ class OpenAICompletionEngine:
                 prefill_token_budget=normalized_prefill_budget or 0,
                 enable_ragged_decode=enable_ragged_decode,
                 use_decode_many=use_decode_many,
+                decode_first=decode_first,
+                prefill_ready_before_decode=prefill_ready_before_decode,
                 decode_many_allow_stop=decode_many_allow_stop,
                 use_paged_engine=use_paged_engine,
                 graph_prefill=graph_prefill,
@@ -13089,10 +13113,20 @@ def _tensor_parallel_worker_loop(engine: OpenAICompletionEngine) -> None:
                     temperature=temperature,
                     max_tokens=max_tokens,
                 )
-                decode_many_allow_stop = _online_decode_many_allow_stop_enabled(
+                decode_first = _online_decode_first_enabled(
                     temperature=temperature,
                     max_tokens=max_tokens,
                 )
+                prefill_ready_before_decode = _online_prefill_ready_before_decode_enabled(
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                )
+                if not decode_first:
+                    enable_decode_many = False
+                decode_many_allow_stop = _online_decode_many_allow_stop_enabled(
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                ) if enable_decode_many else False
                 # Flag-gated paged-KV worker engine -- MUST match the primary's choice
                 # (both build a PagedEngine identically + are driven by the same
                 # submit/step commands, so the deterministic page allocator keeps
@@ -13145,6 +13179,8 @@ def _tensor_parallel_worker_loop(engine: OpenAICompletionEngine) -> None:
                         prefill_chunk_size=(env_int("TORCHINFERNO_OPENAI_TP_ONLINE_PREFILL_CHUNK", 0, minimum=0) or None),
                         admit_min_ready_requests=admit_min_ready_requests,
                         admit_per_step_cap=admit_per_step_cap,
+                        decode_first=decode_first,
+                        prefill_ready_before_decode=prefill_ready_before_decode,
                         enable_decode_many=enable_decode_many,
                         decode_many_allow_stop=decode_many_allow_stop,
                         generated_prefix_cache=_online_generated_prefix_cache_enabled(
@@ -13203,6 +13239,10 @@ def _tensor_parallel_worker_loop(engine: OpenAICompletionEngine) -> None:
                     online_runtime_engine.enable_decode_many = enable_decode_many
                 if hasattr(online_runtime_engine, "decode_many_allow_stop"):
                     online_runtime_engine.decode_many_allow_stop = decode_many_allow_stop
+                if hasattr(online_runtime_engine, "decode_first"):
+                    online_runtime_engine.decode_first = decode_first
+                if hasattr(online_runtime_engine, "prefill_ready_before_decode"):
+                    online_runtime_engine.prefill_ready_before_decode = prefill_ready_before_decode
                 worker_decode_runner = getattr(engine, "_decode_graph_runner", None)
                 if worker_decode_runner is not None:
                     online_runtime_engine._decode_runner = worker_decode_runner

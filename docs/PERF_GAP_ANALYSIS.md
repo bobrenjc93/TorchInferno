@@ -5327,6 +5327,22 @@ long_output. The next useful runtime work is a prefill scheduling/pipeline
 change that reduces first-token wait without fragmenting prefill into the
 previously rejected low-MFU chunked path.
 
+Two prefill/decode ordering A/Bs are also rejected as defaults. First, forcing
+`TORCHINFERNO_OPENAI_TP_ONLINE_DECODE_FIRST=0` makes the online engine prefill
+before decode for the whole session. It preserved 1000/1000 correctness and cut
+median TTFT to `246.2ms`, but it disabled decode-many, raised CPU token wait to
+`8.72s`, and regressed E2E to `1289.0ms` with p99 TTFT `3744.8ms`. Second, the
+narrower `TORCHINFERNO_OPENAI_TP_ONLINE_PREFILL_READY_BEFORE_DECODE=1` only
+prefills before decode while runtime-ready requests are waiting, then returns to
+decode-first/decode-many once the queue drains. That kept decode-many active
+(`112` calls) and reduced request-path capture to one `b64:s64` graph, but the
+score-facing row still regressed to `295.7 / 24.8 / 1322.4ms`; submit-to-first
+p50 rose to `195ms`. Keep both as opt-in scheduler probes only. The result
+reinforces that local first-token latency is not solved by simply swapping
+prefill ahead of decode; it needs either faster suffix prefill or a pipeline
+that overlaps ordinary ragged decode synchronization without losing the
+decode-many/e2e balance.
+
 ## In-flight, validated-locally-but-NOT-benchmarked commits
 
 The public results directory is still latest at `20260629_130308`; that run
