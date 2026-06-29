@@ -1173,6 +1173,52 @@ def test_continuous_batch_engine_prefers_ready_prefix_hits() -> None:
     assert engine.stats.prefix_reuse_tokens == 3
 
 
+def test_continuous_batch_engine_prioritizes_short_prefill_cost_for_greedy_short(monkeypatch) -> None:
+    monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_ADMIT_PREFILL_COST_PRIORITY", raising=False)
+    model = _RaggedGraphToyModel()
+    engine = ContinuousBatchEngine(
+        model,
+        device=torch.device("cpu"),
+        max_active_requests=1,
+        max_generation_tokens=128,
+    )
+
+    results = engine.run(
+        [
+            ServingRequest("long", (1, 2, 3, 4), 1, arrival_step=0),
+            ServingRequest("short", (5,), 1, arrival_step=0),
+            ServingRequest("mid", (6, 7), 1, arrival_step=0),
+        ]
+    )
+    by_id = {result.request_id: result for result in results}
+
+    assert by_id["short"].started_step == 0
+    assert by_id["mid"].started_step == 1
+    assert by_id["long"].started_step == 2
+
+
+def test_continuous_batch_engine_keeps_arrival_order_for_larger_greedy_admission(monkeypatch) -> None:
+    monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_ADMIT_PREFILL_COST_PRIORITY", raising=False)
+    model = _RaggedGraphToyModel()
+    engine = ContinuousBatchEngine(
+        model,
+        device=torch.device("cpu"),
+        max_active_requests=1,
+        max_generation_tokens=256,
+    )
+
+    results = engine.run(
+        [
+            ServingRequest("long", (1, 2, 3, 4), 1, arrival_step=0),
+            ServingRequest("short", (5,), 1, arrival_step=0),
+        ]
+    )
+    by_id = {result.request_id: result for result in results}
+
+    assert by_id["long"].started_step == 0
+    assert by_id["short"].started_step == 1
+
+
 def test_continuous_batch_engine_can_wait_for_refill_batch() -> None:
     model = _RaggedGraphToyModel()
     engine = ContinuousBatchEngine(

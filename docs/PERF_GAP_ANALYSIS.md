@@ -68,6 +68,19 @@ promotion candidate: content chunks stayed unchanged at `36,715`, content
 send calls only moved `26,839 -> 26,160`, and summed content-send time rose
 `20.70s -> 21.30s`. Keep the current stream batch cap.
 
+Greedy-short prefill-cost admission priority is promoted for deterministic
+`max_tokens <= 128` traffic. The policy keeps prefix-hit priority first, then
+admits cheaper prompt suffixes before longer suffixes only within this short
+greedy bucket. A profiled long_output run showed the expected tradeoff:
+TTFT improved to `248.2ms`, but the flag fragmented admissions
+(`129 -> 144` submit batches, `536 -> 600` runtime step calls) and made the
+profiled phase slower, so it needed a no-profile A/B. The paired no-profile
+control landed at `273.1 / 25.1 / 1234.4ms`, `31.3 tok/s`, while the scoped
+priority landed at `259.4 / 24.6 / 1205.1ms`, `32.1 tok/s`, both
+`1000/1000` correct. Keep the default scoped to greedy-short; few_shot
+(`max_tokens=256`), multi_turn (`512`), self_consistency/tree sampled traffic,
+and tree eval (`400`) keep arrival-order admission unless explicitly overridden.
+
 ## Current no-profile local scorecard (2026-06-28)
 
 A current no-profile all-provider run on pushed `50580d6` landed at
