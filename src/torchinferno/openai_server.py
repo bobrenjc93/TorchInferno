@@ -860,6 +860,26 @@ def _online_initial_batch_wait_ms(*, temperature: float, max_tokens: int) -> flo
             minimum=0.0,
         )
     elif temperature <= 0.0 and max_tokens > 0:
+        greedy_mid_min_tokens = env_int(
+            "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_MID_INITIAL_BATCH_WAIT_MIN_TOKENS",
+            128,
+            minimum=1,
+        )
+        greedy_mid_max_tokens = env_int(
+            "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_MID_INITIAL_BATCH_WAIT_MAX_TOKENS",
+            300,
+            minimum=greedy_mid_min_tokens,
+        )
+        if greedy_mid_min_tokens < max_tokens <= greedy_mid_max_tokens:
+            # Few-shot style greedy-mid bursts are close on median E2E but are
+            # sensitive to tiny first waves. A scoped 5ms wait admits more of
+            # the client wave without touching short long_output or 512-token
+            # multi-turn traffic.
+            default_wait_ms = env_float(
+                "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_MID_INITIAL_BATCH_WAIT_MS",
+                5.0,
+                minimum=0.0,
+            )
         greedy_large_min_tokens = env_int(
             "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_INITIAL_BATCH_WAIT_MIN_TOKENS",
             400,
