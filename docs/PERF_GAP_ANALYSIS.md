@@ -45,6 +45,27 @@ tree_of_thought, or long_output default buckets. Explicit overrides remain:
 `TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_SHORT_MARLIN_INT4_DECODE` for the
 sampled-short bucket.
 
+The pushed `642b555` full TorchInferno-only validation landed at few_shot
+`161.4 / 46.7 / 198.3ms`, self_consistency `245.3 / 0.0 / 260.3ms`,
+multi_turn `310.9 / 61.4 / 364.8ms`, tree_of_thought
+`252.5 / 49.2 / 291.2ms`, and long_output `283.5 / 25.0 / 1163.1ms`.
+A same-host all-provider pass hit the known local vLLM `libstdc++` preload
+issue, but the TorchInferno/SGLang rows plus a separate vLLM-only rerun with
+`LD_PRELOAD=/home/bobren/local/d/pytorch-env/lib/libstdc++.so.6` give the
+current local score shape: TorchInferno wins self_consistency TTFT, E2E, and
+throughput plus few_shot, multi_turn, and tree_of_thought TPOT; SGLang still owns
+most TTFT/E2E/throughput cells; vLLM only wins long_output E2E in that merged
+same-host view. Rows were TorchInferno few `165.4 / 52.1 / 206.7ms`,
+self `206.6 / 0.0 / 238.3ms`, multi `319.9 / 64.7 / 385.0ms`,
+tree `238.5 / 48.5 / 285.2ms`, long `282.3 / 24.7 / 1187.3ms`; SGLang few
+`117.2 / 83.8 / 202.7ms`, self `216.6 / 0.0 / 380.9ms`,
+multi `160.9 / 117.9 / 274.9ms`, tree `63.5 / 77.4 / 157.3ms`, long
+`61.8 / 24.6 / 962.6ms`; vLLM few `250.5 / 87.7 / 324.8ms`, self
+`234.1 / 0.0 / 284.4ms`, multi `276.3 / 100.9 / 373.3ms`, tree
+`125.7 / 84.9 / 192.3ms`, and long `85.9 / 25.7 / 956.6ms`. The remaining
+highest-leverage work is therefore first-token/prefill scheduling for
+tree_of_thought and long_output, plus smaller few_shot E2E/TTFT cleanup.
+
 The prior same-host no-profile all-provider comparison on pushed `d363367`
 landed at SGLang `13/20`, TorchInferno `4/20`, and vLLM `2/20`. TorchInferno
 rows were: few_shot `174.5 / 50.5 / 220.0ms`, self_consistency
