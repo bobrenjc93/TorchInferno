@@ -5311,10 +5311,27 @@ CPU time versus the larger ordinary ragged `b49-b62/64` buckets. Do not spend
 the next pass on decode-many CPU-copy micro-optimizations; the useful lever
 still has to reduce or overlap ordinary ragged decode synchronization.
 
+Same-host long_output comparison on pushed `874b4a8` narrows the current target:
+local vLLM needed a newer conda `libstdc++` in `LD_LIBRARY_PATH` to import the
+host `soxr` wheel, so inference-bench now fixes that automatically in commit
+`3b956711`. With that environment, vLLM landed at
+`86.9 / 25.6 / 1034.6ms`; SGLang landed at `64.6 / 23.8 / 994.5ms`; and
+TorchInferno landed at `284.7 / 24.7 / 1205.2ms`, all 1000/1000 correct. The
+TorchInferno profile shows median queue-to-submit is only `37ms`, while
+submit-to-first is `145ms`; TPOT is now in the same local band as vLLM/SGLang,
+but first-token latency and tails remain worse. The same profile had `9.0s`
+prefill wall and `2.67s` of request-path prefill graph capture on `b64:s64`
+and `b64:s128`; do not reopen broad b64 warmup or capture-on-miss disable
+without a different mechanism, since both have already regressed score-facing
+long_output. The next useful runtime work is a prefill scheduling/pipeline
+change that reduces first-token wait without fragmenting prefill into the
+previously rejected low-MFU chunked path.
+
 ## In-flight, validated-locally-but-NOT-benchmarked commits
 
-The inference-bench harness has been frozen on `25260c0` for many hours, so these
-are unmeasured against vllm/sglang:
+The public results directory is still latest at `20260629_130308`; that run
+measured stale TorchInferno `bd17332`, so these are unmeasured in the public
+scorecard:
 - joint (batch,q) prefill graphs under a token budget,
 - `max_active=128` decode batch + prefill/decode decoupling,
 - single-request prefill via graph (245 → 51ms single-req TTFT, local),
