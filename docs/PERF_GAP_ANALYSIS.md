@@ -42,6 +42,16 @@ worsened, phase time rose (`7.13s -> 7.26s`), prefill wall rose
 `8`-request refill floor until a scheduler change improves medians without
 trading away tail stability or graph-backed prefill shape reuse.
 
+Applying the finer greedy-large suffix bucket set to the 256-token greedy-mid
+few_shot path is rejected. Forcing
+`TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SUFFIX_BUCKETS=16,32,64,80,96,112,128,144,160,192,224,256`
+on current `5644e2f` landed at `169.2 / 48.7 / 209.3ms`, worse than the
+current default band, and stretched server readiness to about `201s`. The queue
+profile showed why: prefill wall rose to `4.37s`, request-path prefill misses
+rose to `3`, two prefix-graph captures appeared, and HTTP p90 first-content
+rose to `883ms`. Keep the fine suffix buckets scoped to the deterministic
+512-token greedy-large path where they were validated.
+
 ## Current self_consistency handler split (2026-06-29)
 
 The restored public run `20260629_185744` still shows self_consistency as a
