@@ -460,6 +460,13 @@ time. Ragged decode padding was only `165` tokens. So the current few_shot media
 gap is not a missing warmup bucket or padded decode waste; it remains the known
 greedy-mid balance of prefill wave cost plus decode cadence.
 
+Rechecking a global 5ms online initial collection window for the current
+few_shot shape is rejected. The no-profile 5ms run on pushed `03677fd` landed
+at `166.4 / 46.8 / 202.6ms`, 977/1000 raw correct. A same-code no-env control
+landed at `162.4 / 47.5 / 202.4ms`, 978/1000 raw correct. The extra wait did
+not improve median E2E and gave away TTFT, so it is not defaultable for
+greedy-mid traffic.
+
 Raising the stream token drain cap for long_output is rejected. On clean
 `b0d4c0f`, the current profiled long_output control landed at
 `271.6 / 24.8 / 1276.3ms`, with `1.2s` of prefill graph capture,
