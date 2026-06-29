@@ -1,5 +1,27 @@
 # TorchInferno vs vLLM/sglang — Performance Gap Analysis (Llama-3.1-70B, 8xH100)
 
+## Current few_shot refresh and refill-floor rejection (2026-06-29)
+
+The latest public run `20260629_185744` still shows few_shot as a narrow
+median gap: TorchInferno `171.0 / 50.5 / 215.8ms` versus SGLang
+`126.5 / 80.6 / 207.9ms`. A focused current profile on pushed `cd431f3`
+landed in-family at `168.9 / 49.3 / 208.6ms`, 978/1000 raw correct. Fast-HTTP
+accepted-to-handler and request-read p50 were only `0.1ms` and `5.3ms`; server
+first-content p50 was `124.9ms`, close to queue-to-first p50 `122.2ms`. The
+median is therefore mostly the existing online queue/prefill/decode cadence
+plus benchmark/client observation overhead, not response serialization or
+ThreadPoolExecutor backlog. The profile was graph-warm: `35` prefill batches,
+`33` graph hits, `2` misses, no captures, and `987` common-prefix reuse
+requests.
+
+Lowering only `TORCHINFERNO_OPENAI_TP_ONLINE_REFILL_MIN_READY_REQUESTS` from
+`8` to `4` is rejected for the 256-token greedy-mid bucket. The focused row
+moved only slightly to `166.6 / 48.8 / 207.0ms`, but p90/p99 first-content
+worsened, phase time rose (`7.13s -> 7.26s`), prefill wall rose
+(`2.71s -> 2.84s`), and prefill misses increased (`2 -> 3`). Keep the current
+`8`-request refill floor until a scheduler change improves medians without
+trading away tail stability or graph-backed prefill shape reuse.
+
 ## Current self_consistency handler split (2026-06-29)
 
 The restored public run `20260629_185744` still shows self_consistency as a
