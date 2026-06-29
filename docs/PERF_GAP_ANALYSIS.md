@@ -1,5 +1,29 @@
 # TorchInferno vs vLLM/sglang — Performance Gap Analysis (Llama-3.1-70B, 8xH100)
 
+## Current self_consistency handler split (2026-06-29)
+
+The restored public run `20260629_185744` still shows self_consistency as a
+request/handler-facing gap: vLLM/SGLang/TorchInferno landed at
+`210.9 / 206.2 / 319.3ms` TTFT and `285.3 / 361.4 / 398.6ms` E2E. A focused
+current TorchInferno profile on docs-only `31edf92` improved the row to
+`285.1 / 0.0 / 348.6ms`, 1000/1000 correct, but the queue/HTTP split confirms
+the runtime batcher is not the median limiter. The final queue record had p50
+queue-to-submit, submit-to-first, queue-to-first, and queue-to-finish at
+`1.6/6.0/8.2/8.2ms`; fast-HTTP p50 first-content/total was `9.5/9.7ms`, while
+the benchmark still observed `285/349ms`.
+
+The generated-prefix path is healthy in this profile: one common-prefix prefill,
+one decode model call, one generated-prefix store, `978` generated-prefix
+reuses, and `108,558` total prefix-reuse tokens. The remaining server-side
+phase is request fragmentation and command cadence after reuse, not model
+compute: `493` submit batches, `234` runtime steps, `1.21s` submit-sync, and
+`3.12s` total online phase. This does not reopen sampler-state caching,
+generated-prefix thresholds, sampled-short initial/idle waits, keepalive,
+thread-local clients, worker-count increases, or HTTP prestart as defaults;
+those knobs were already neutral or mixed in full-order checks. The next self
+lever needs to reduce handler/request admission fragmentation without hurting
+few_shot or multi_turn ordering.
+
 ## Current multi_turn refresh and DQ=8 rejection (2026-06-29)
 
 The restored public run `20260629_185744` kept multi_turn in the expected
