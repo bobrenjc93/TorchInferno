@@ -425,12 +425,20 @@ def test_openai_fast_stream_coalesces_ready_token_batches() -> None:
 def test_openai_fast_http_profile_writes_jsonl(monkeypatch, tmp_path) -> None:
     profile_path = tmp_path / "http-profile.jsonl"
     monkeypatch.setenv("TORCHINFERNO_OPENAI_FAST_HTTP_PROFILE_JSONL", str(profile_path))
+    accepted_s = time.perf_counter() - 0.01
+    handler_start_s = accepted_s + 0.001
+    read_start_s = accepted_s + 0.002
+    request_ready_s = accepted_s + 0.004
 
     profile = _new_fast_http_stream_profile(
         max_tokens=3,
         temperature=0.7,
         keep_alive=True,
-        request_ready_s=time.perf_counter(),
+        request_ready_s=request_ready_s,
+        accepted_s=accepted_s,
+        handler_start_s=handler_start_s,
+        read_start_s=read_start_s,
+        first_request_on_connection=True,
         parse_ms=1.5,
     )
     assert profile is not None
@@ -444,7 +452,12 @@ def test_openai_fast_http_profile_writes_jsonl(monkeypatch, tmp_path) -> None:
     assert record["max_tokens"] == 3
     assert record["temperature"] == 0.7
     assert record["keep_alive"] is True
+    assert record["first_request_on_connection"] is True
     assert record["parse_ms"] == 1.5
+    assert record["accepted_to_handler_ms"] == pytest.approx(1.0)
+    assert record["accepted_to_ready_ms"] == pytest.approx(4.0)
+    assert record["handler_to_ready_ms"] == pytest.approx(3.0)
+    assert record["request_read_ms"] == pytest.approx(2.0)
     assert record["engine_tokens"] == 2
     assert record["content_chunks"] == 2
     assert record["total_ms"] >= 0.0

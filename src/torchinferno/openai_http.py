@@ -334,13 +334,14 @@ class FastOpenAIHTTPServer:
         while not self._closed.is_set():
             try:
                 connection, client_address = self._socket.accept()
+                accepted_s = time.perf_counter()
             except socket.timeout:
                 continue
             except OSError:
                 if self._closed.is_set():
                     return
                 raise
-            self._executor.submit(self._handle_connection, connection, client_address)
+            self._executor.submit(self._handle_connection, connection, client_address, accepted_s)
 
     def shutdown(self) -> None:
         self._closed.set()
@@ -353,8 +354,15 @@ class FastOpenAIHTTPServer:
         self.shutdown()
         self._executor.shutdown(wait=True, cancel_futures=True)
 
-    def _handle_connection(self, connection: socket.socket, client_address: object) -> None:
+    def _handle_connection(
+        self,
+        connection: socket.socket,
+        client_address: object,
+        accepted_s: float | None = None,
+    ) -> None:
         del client_address
+        handler_start_s = time.perf_counter()
+        first_request = True
         with connection:
             enable_tcp_nodelay(connection)
             idle_timeout_s = _fast_http_idle_timeout_seconds()
@@ -363,9 +371,11 @@ class FastOpenAIHTTPServer:
             keepalive_enabled = env_flag("TORCHINFERNO_OPENAI_FAST_HTTP_KEEPALIVE", True)
             while not self._closed.is_set():
                 try:
+                    read_start_s = time.perf_counter()
                     request = _read_fast_http_request(connection, buffer)
                     if request is None:
                         return
+                    request_ready_s = time.perf_counter()
                     method, path, headers, body = request
                     request_close = headers.get("connection", "").lower() == "close"
                     keep_alive = keepalive_enabled and not request_close
@@ -376,8 +386,13 @@ class FastOpenAIHTTPServer:
                         path,
                         body,
                         keep_alive=keep_alive,
-                        request_ready_s=time.perf_counter(),
+                        request_ready_s=request_ready_s,
+                        accepted_s=accepted_s if first_request else None,
+                        handler_start_s=handler_start_s if first_request else None,
+                        read_start_s=read_start_s,
+                        first_request_on_connection=first_request,
                     )
+                    first_request = False
                     if not keep_alive:
                         return
                     connection.settimeout(
@@ -409,6 +424,10 @@ class FastOpenAIHTTPServer:
         *,
         keep_alive: bool,
         request_ready_s: float,
+        accepted_s: float | None,
+        handler_start_s: float | None,
+        read_start_s: float,
+        first_request_on_connection: bool,
     ) -> None:
         route = path.partition("?")[0]
         if method == "GET" and route == "/health":
@@ -438,6 +457,10 @@ class FastOpenAIHTTPServer:
                 temperature=request.temperature,
                 keep_alive=keep_alive,
                 request_ready_s=request_ready_s,
+                accepted_s=accepted_s,
+                handler_start_s=handler_start_s,
+                read_start_s=read_start_s,
+                first_request_on_connection=first_request_on_connection,
                 parse_ms=(parsed_s - parse_start_s) * 1000.0,
             )
             return
@@ -533,6 +556,10 @@ def _stream_fast_chat(
     temperature: float,
     keep_alive: bool = False,
     request_ready_s: float | None = None,
+    accepted_s: float | None = None,
+    handler_start_s: float | None = None,
+    read_start_s: float | None = None,
+    first_request_on_connection: bool = True,
     parse_ms: float = 0.0,
 ) -> None:
     profile = _new_fast_http_stream_profile(
@@ -540,6 +567,10 @@ def _stream_fast_chat(
         temperature=temperature,
         keep_alive=keep_alive,
         request_ready_s=request_ready_s,
+        accepted_s=accepted_s,
+        handler_start_s=handler_start_s,
+        read_start_s=read_start_s,
+        first_request_on_connection=first_request_on_connection,
         parse_ms=parse_ms,
     )
     completion_id = f"chatcmpl-{uuid.uuid4().hex}"
@@ -684,19 +715,33 @@ def _new_fast_http_stream_profile(
     temperature: float,
     keep_alive: bool,
     request_ready_s: float | None,
-    parse_ms: float,
+    accepted_s: float | None = None,
+    handler_start_s: float | None = None,
+    read_start_s: float | None = None,
+    first_request_on_connection: bool = True,
+    parse_ms: float = 0.0,
 ) -> dict[str, object] | None:
     if not _fast_http_profile_path():
         return None
     start_s = request_ready_s if request_ready_s is not None else time.perf_counter()
-    return {
+    profile: dict[str, object] = {
         "event": "fast_http_stream",
         "_start_s": start_s,
         "max_tokens": int(max_tokens),
         "temperature": float(temperature),
         "keep_alive": bool(keep_alive),
+        "first_request_on_connection": bool(first_request_on_connection),
         "parse_ms": float(parse_ms),
     }
+    if accepted_s is not None and request_ready_s is not None:
+        profile["accepted_to_ready_ms"] = max(0.0, (request_ready_s - accepted_s) * 1000.0)
+    if accepted_s is not None and handler_start_s is not None:
+        profile["accepted_to_handler_ms"] = max(0.0, (handler_start_s - accepted_s) * 1000.0)
+    if handler_start_s is not None and request_ready_s is not None:
+        profile["handler_to_ready_ms"] = max(0.0, (request_ready_s - handler_start_s) * 1000.0)
+    if read_start_s is not None and request_ready_s is not None:
+        profile["request_read_ms"] = max(0.0, (request_ready_s - read_start_s) * 1000.0)
+    return profile
 
 
 def _mark_fast_http_elapsed(profile: dict[str, object] | None, field: str, start_s: float) -> None:
