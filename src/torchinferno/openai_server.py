@@ -5064,21 +5064,26 @@ class OpenAICompletionEngine:
         ):
             value = getattr(stats, name, None)
             if isinstance(value, Mapping):
+                limit = 64 if name == "decode_shape_counts" else 32
                 top_counts = sorted(
                     value.items(),
                     key=lambda item: (-int(item[1]), str(item[0])),
-                )[:32]
+                )[:limit]
                 record[f"runtime_{name}"] = {str(key): int(count) for key, count in top_counts}
         for name in (
             "prefill_shape_wall_ms",
             "prefill_shape_forward_ms",
+            "decode_shape_model_ms",
+            "decode_shape_gpu_ms",
+            "decode_shape_cpu_tokens_ms",
         ):
             value = getattr(stats, name, None)
             if isinstance(value, Mapping):
+                limit = 64 if name.startswith("decode_shape_") else 32
                 top_timings = sorted(
                     value.items(),
                     key=lambda item: (-float(item[1]), str(item[0])),
-                )[:32]
+                )[:limit]
                 record[f"runtime_{name}"] = {
                     str(key): float(elapsed_ms) for key, elapsed_ms in top_timings
                 }

@@ -12455,6 +12455,9 @@ def test_openai_queue_profile_records_runtime_engine_stats(
             "ragged_prefill:b8:s16:rows1:ctx-256:src1": 1,
         }
         decode_shape_counts = {"ragged:b8/8": 5}
+        decode_shape_model_ms = {"ragged:b8/8": 11.0}
+        decode_shape_gpu_ms = {"ragged:b8/8": 10.5}
+        decode_shape_cpu_tokens_ms = {"ragged:b8/8": 1.25}
 
     class RuntimeEngine:
         stats = Stats()
@@ -12510,6 +12513,9 @@ def test_openai_queue_profile_records_runtime_engine_stats(
             },
             "runtime_prefill_tokens": 17,
             "runtime_decode_shape_counts": {"ragged:b8/8": 5},
+            "runtime_decode_shape_model_ms": {"ragged:b8/8": 11.0},
+            "runtime_decode_shape_gpu_ms": {"ragged:b8/8": 10.5},
+            "runtime_decode_shape_cpu_tokens_ms": {"ragged:b8/8": 1.25},
             "runtime_prefix_reuse_requests": 7,
             "runtime_prefix_reuse_tokens": 53,
             "runtime_queued_requests": 11,

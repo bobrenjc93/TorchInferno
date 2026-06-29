@@ -5277,6 +5277,18 @@ median TTFT dropped `765ms -> 587ms`; startup ready time increased by about
 `15s` because more warmup graph shapes are captured. Promote the finer bucket
 set only under the existing `400 < max_tokens <= 512`, `temperature=0` gate.
 
+Current long_output on `dbee040` remains decode/readback bound. A profile with
+per-shape decode timing landed at `282.4 / 25.3 / 1333.4ms`, with p50
+queue-to-first `229.6ms`, `7.66s` prefill wall, `12.98s` decode GPU time, and
+`7.19s` CPU token readback. The largest GPU shape was
+`decode_many:b64/64` (`2352ms` across 129 calls, about `18.2ms/call`); ordinary
+ragged `b43-b62/64` calls were roughly `14ms/call` and their CPU token harvest
+was of similar size. Queue-profile records now emit per-shape decode model,
+GPU, and CPU-token timings, with a wider decode-shape count export so these
+averages stay inspectable in long_output profiles. Do not infer a new
+decode-many knob from this alone: prior larger-quantum, waiting-capacity,
+pinned-readback, and async-copy attempts remain rejected.
+
 ## In-flight, validated-locally-but-NOT-benchmarked commits
 
 The inference-bench harness has been frozen on `25260c0` for many hours, so these
