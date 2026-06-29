@@ -94,6 +94,21 @@ out of the suspect list. The next self_consistency lever has to reduce
 submit/reuse wave churn without repeating the rejected idle-drain coalescing or
 idle-wait changes.
 
+A current focused long_output profile on `26a9d5c` keeps that row in the known
+decode/readback bucket rather than exposing a missing prefix path. The row
+completed `1000/1000` correct at `301.4 / 25.4 / 1320.6ms`, with p99
+TTFT/E2E/TPOT `2813.6/4662.4/261.2ms`. Prefix reuse was exactly the shared
+111-token prompt for all requests (`111,000` reused tokens) and prefill was warm
+apart from the single ragged-prefill capture (`56` prefill batches,
+`8.28s` prefill wall). The online phase still spent `12.43s` in ragged-decode
+GPU events and `7.50s` in CPU token harvest across `724` ragged decode batches.
+Decode-many was enabled with quantum `3`; the old counters show `44,715` decode
+row-tokens for `37,715` emitted token events, matching the existing
+stop-token-overcompute concern. Queue profiles now record decode-many model,
+emitted, skipped, stop-finish, and limit-finish counters directly so future
+long_output runs can distinguish useful multi-step decode work from overrun
+without local trace reconstruction.
+
 Runtime Marlin int4 decode is now disabled by default only for sampled-short
 online sessions (`temperature > 0`, `max_tokens <= 256`). The global env
 `TORCHINFERNO_MARLIN_INT4_DECODE=0` showed the initial signal on focused

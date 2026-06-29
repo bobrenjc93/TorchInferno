@@ -12411,6 +12411,13 @@ def test_openai_queue_profile_records_runtime_engine_stats(
         ragged_decode_tokens = 29
         decode_graph_hits = 3
         decode_graph_misses = 1
+        decode_many_calls = 2
+        decode_many_steps = 6
+        decode_many_model_tokens = 19
+        decode_many_emitted_tokens = 15
+        decode_many_skipped_tokens = 4
+        decode_many_stop_finishes = 3
+        decode_many_limit_finishes = 2
         prefill_graph_captures = 1
         prefill_graph_replays = 2
         prefill_graph_capture_ms = 9.5
@@ -12449,6 +12456,13 @@ def test_openai_queue_profile_records_runtime_engine_stats(
             "runtime_decode_batches": 5,
             "runtime_decode_graph_hits": 3,
             "runtime_decode_graph_misses": 1,
+            "runtime_decode_many_calls": 2,
+            "runtime_decode_many_emitted_tokens": 15,
+            "runtime_decode_many_limit_finishes": 2,
+            "runtime_decode_many_model_tokens": 19,
+            "runtime_decode_many_skipped_tokens": 4,
+            "runtime_decode_many_steps": 6,
+            "runtime_decode_many_stop_finishes": 3,
             "runtime_decode_model_calls": 5,
             "runtime_decode_ragged_model_gpu_ms": 12.5,
             "runtime_decode_tokens": 31,

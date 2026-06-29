@@ -203,6 +203,13 @@ class ServingStats:
     ragged_decode_tokens: int = 0
     decode_graph_hits: int = 0
     decode_graph_misses: int = 0
+    decode_many_calls: int = 0
+    decode_many_steps: int = 0
+    decode_many_model_tokens: int = 0
+    decode_many_emitted_tokens: int = 0
+    decode_many_skipped_tokens: int = 0
+    decode_many_stop_finishes: int = 0
+    decode_many_limit_finishes: int = 0
     prefix_reuse_requests: int = 0
     prefix_reuse_tokens: int = 0
     queued_requests: int = 0
@@ -681,6 +688,7 @@ class ContinuousBatchEngine:
         if steps_run <= 0 or not token_parts:
             return [], 0
 
+        model_tokens = sum(part.numel() for part in token_parts)
         cpu_tokens_start_s = time.perf_counter() if self.profile_timings else 0.0
         flat_tokens = torch.cat(token_parts).detach().cpu().tolist()
         if self.profile_timings:
@@ -689,6 +697,9 @@ class ContinuousBatchEngine:
 
         events: list[ServingTokenEvent] = []
         terminated: set[int] = set()
+        skipped_tokens = 0
+        stop_finishes = 0
+        limit_finishes = 0
         offset = 0
         for states, step, generated_after, finished_by_limit in records:
             row_tokens = flat_tokens[offset : offset + len(states)]
@@ -701,11 +712,13 @@ class ContinuousBatchEngine:
             ):
                 state_id = id(state)
                 if state_id in terminated:
+                    skipped_tokens += 1
                     continue
                 token = int(token_value)
                 state.tokens.append(token)
                 state.last_token = token
-                finished = bool(limit_finished or state.request.is_stop_token(token))
+                stop_finished = state.request.is_stop_token(token)
+                finished = bool(limit_finished or stop_finished)
                 events.append(
                     ServingTokenEvent(
                         request_id=state.request.request_id,
@@ -716,9 +729,20 @@ class ContinuousBatchEngine:
                     )
                 )
                 if finished:
+                    if stop_finished:
+                        stop_finishes += 1
+                    if limit_finished:
+                        limit_finishes += 1
                     terminated.add(state_id)
                     self._finish_and_release(state, step)
 
+        self.stats.decode_many_calls += 1
+        self.stats.decode_many_steps += steps_run
+        self.stats.decode_many_model_tokens += int(model_tokens)
+        self.stats.decode_many_emitted_tokens += len(events)
+        self.stats.decode_many_skipped_tokens += skipped_tokens
+        self.stats.decode_many_stop_finishes += stop_finishes
+        self.stats.decode_many_limit_finishes += limit_finishes
         self._online_active = [state for state in active if id(state) not in terminated]
         self._online_step += steps_run
         return events, steps_run

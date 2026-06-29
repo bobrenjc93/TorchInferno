@@ -3049,6 +3049,13 @@ def test_continuous_batch_engine_online_many_keeps_decode_tokens_ordered(monkeyp
         ("a", 7, 4, True),
         ("b", 9, 4, True),
     ]
+    assert engine.stats.decode_many_calls == 1
+    assert engine.stats.decode_many_steps == 3
+    assert engine.stats.decode_many_model_tokens == 6
+    assert engine.stats.decode_many_emitted_tokens == 6
+    assert engine.stats.decode_many_skipped_tokens == 0
+    assert engine.stats.decode_many_stop_finishes == 0
+    assert engine.stats.decode_many_limit_finishes == 2
     assert not engine.has_online_work()
     assert model.ragged_logits_graph_calls == 3
 
@@ -3133,6 +3140,13 @@ def test_continuous_batch_engine_online_many_can_overcompute_stop_tokens(monkeyp
         ("b", 8, 3, False),
         ("b", 9, 4, True),
     ]
+    assert engine.stats.decode_many_calls == 1
+    assert engine.stats.decode_many_steps == 3
+    assert engine.stats.decode_many_model_tokens == 6
+    assert engine.stats.decode_many_emitted_tokens == 4
+    assert engine.stats.decode_many_skipped_tokens == 2
+    assert engine.stats.decode_many_stop_finishes == 1
+    assert engine.stats.decode_many_limit_finishes == 1
     assert not engine.has_online_work()
     assert model.ragged_logits_graph_calls == 3
 
