@@ -107,6 +107,18 @@ sampled-short-only no-sync default, and it worsens the tail token cadence. Keep
 step-sync removal scoped to sampled-short self_consistency traffic until a
 tree-specific command path shows a clear median and tail win.
 
+A same-host all-provider long_output rerun on pushed `fc50b42` with the vLLM
+`LD_PRELOAD` workaround showed the local long gap is still TTFT and tail
+pipeline, not median token compute. vLLM landed at
+`98.1 / 29.1 / 1143.0ms`, SGLang at `63.5 / 24.3 / 951.5ms`, and
+TorchInferno at `257.0 / 25.2 / 1278.4ms`, all 1000/1000 correct with the same
+36.7k output-token count. SGLang won all four score metrics; TorchInferno was
+within `0.9ms` of SGLang median TPOT but had p99 TTFT/E2E/TPOT of
+`2462.6/3698.3/262.2ms` versus SGLang `542.3/1772.7/40.2ms`. The next
+long_output change still needs to reduce first-token queueing and tail
+decode/readback behavior; a median-only TPOT improvement is unlikely to move the
+score.
+
 Fresh focused profiles on pushed `0c45929` keep long_output in the known
 decode/readback bucket. The queue-profiled control completed `1000/1000`
 correct at `256.9 / 26.2 / 1255.9ms`. The last queue snapshot had all
