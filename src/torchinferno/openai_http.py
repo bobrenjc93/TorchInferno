@@ -319,7 +319,7 @@ class FastOpenAIHTTPServer:
         self.engine = engine
         self._closed = threading.Event()
         self._executor = ThreadPoolExecutor(
-            max_workers=env_int("TORCHINFERNO_OPENAI_HTTP_WORKERS", 256, minimum=1),
+            max_workers=_fast_http_worker_count(),
             thread_name_prefix="torchinferno-openai-http",
         )
         self._socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -457,6 +457,13 @@ class FastOpenAIHTTPServer:
             ),
             connection_close=not keep_alive,
         )
+
+
+def _fast_http_worker_count() -> int:
+    # Match inference-bench's default HTTP connection cap. Idle keepalive
+    # handlers occupy workers while other streams are still active, so the old
+    # 256-worker pool could queue accepted connections during 128-way bursts.
+    return env_int("TORCHINFERNO_OPENAI_HTTP_WORKERS", 512, minimum=1)
 
 
 _CHAT_DELTA_ROLE = b'{"role":"assistant"}'

@@ -25,6 +25,7 @@ from torchinferno.openai_http import (
     _chat_delta_content,
     _chunked_stream_enabled,
     _fast_http_keepalive_idle_timeout_seconds,
+    _fast_http_worker_count,
     _fast_stream_end_bytes,
     _new_fast_http_stream_profile,
     _record_fast_http_profile,
@@ -474,6 +475,14 @@ def test_openai_fast_http_keepalive_timeout_shortens_after_drain(monkeypatch) ->
 
     assert _fast_http_keepalive_idle_timeout_seconds(engine, 5.0) == pytest.approx(0.5)
     assert _fast_http_keepalive_idle_timeout_seconds(engine, 0.1) == pytest.approx(0.1)
+
+
+def test_openai_fast_http_worker_count_matches_burst_connection_cap(monkeypatch) -> None:
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_HTTP_WORKERS", raising=False)
+    assert _fast_http_worker_count() == 512
+
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_HTTP_WORKERS", "96")
+    assert _fast_http_worker_count() == 96
 
 
 def test_openai_chunked_stream_requires_http11(monkeypatch) -> None:

@@ -5244,6 +5244,17 @@ GPU time, and `9.77s` profiled phase. Lowering only sampled-medium
 useful queueing fix: p50 queue-to-submit worsened to `315.8ms`, step calls rose
 `138 -> 216`, and decode GPU/CPU exposure rose as well.
 
+Self_consistency on pushed `2ce0ed3` is now mostly outside the runtime batcher.
+The no-env TorchInferno-only row landed at `218.7 / 0.0 / 328.4ms`, 1000/1000
+correct, while the online-batcher profile had p50 queue-to-first and
+queue-to-finish around `13ms`. Fast-HTTP profiling confirmed that after a
+request is read, server first-content and total stream p50 are also about
+`14ms`; the remaining benchmark latency is before/around HTTP connection
+handling and client stream observation. Raising
+`TORCHINFERNO_OPENAI_HTTP_WORKERS` to `512` preserved TTFT and improved E2E
+`328.4 -> 314.6ms`; disabling keepalive regressed to `323.4 / 344.0ms`.
+Promote the 512-worker fast HTTP default, but keep keepalive enabled.
+
 ## In-flight, validated-locally-but-NOT-benchmarked commits
 
 The inference-bench harness has been frozen on `25260c0` for many hours, so these
