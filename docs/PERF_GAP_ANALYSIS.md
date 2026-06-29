@@ -290,6 +290,23 @@ not beat the same-code 256-token control: scoped `64` landed at
 `218.0 / 48.8 / 260.6ms`. The patch was reverted; keep the dynamic prefix
 context floor at `256`.
 
+A current same-host self_consistency rerun on pushed `62eb441` shows the local
+score shape has shifted from E2E to TTFT/tail control. TorchInferno landed at
+`302.6 / 0.0 / 323.1ms`, vLLM at `278.2 / 0.0 / 337.6ms`, and SGLang at
+`196.1 / 0.0 / 370.8ms`, all `1000/1000` correct with one unique final answer.
+TorchInferno wins median E2E locally but still loses first token and p99. The
+queue profile ended with progress records only because all submitted requests
+finished while the non-persistent sampled-short batcher was waiting in its
+750ms idle window; the harness can tear the server down before the final
+`online_batcher` record is written. The last snapshot still showed the issue:
+`1000` submitted requests fragmented into `240` submit batches and `214`
+runtime step commands over `2.99s` phase time, with generated-prefix reuse
+active for `970` requests and `54.3K` reused tokens. This is wave/control-plane
+churn, not a missing generated-prefix cache hit or decode-compute gap. Add an
+`online_batcher_quiescent` queue-profile record when all currently submitted
+work has drained and before the idle wait for future arrivals, so later sampled
+short profiles keep aggregate counters even if teardown races the final record.
+
 Lowering online admission granularity is rejected for sampled-medium tree. A
 focused source-free A/B forced
 `TORCHINFERNO_OPENAI_TP_ONLINE_ADMIT_PER_STEP_CAP=16` on the same pushed

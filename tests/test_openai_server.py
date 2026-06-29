@@ -13497,17 +13497,41 @@ def test_openai_tensor_parallel_online_batcher_records_profile_snapshots(
     engine.model = model
     engine.stop_token_ids = frozenset()
     engine.max_batch_size = 4
-    engine._generation_queue = queue.Queue()
+    observed_events_before_idle_timeout: list[str] = []
+
+    class EmptyQueueWithProfileObservation:
+        def get_nowait(self) -> object:
+            raise queue.Empty
+
+        def get(self, timeout: float | None = None) -> object:
+            del timeout
+            if profile_path.exists():
+                lines = profile_path.read_text().splitlines()
+                observed_events_before_idle_timeout[:] = [
+                    json.loads(line)["event"] for line in lines
+                ]
+            raise queue.Empty
+
+        def put(self, item: object) -> None:
+            del item
+
+    engine._generation_queue = EmptyQueueWithProfileObservation()  # type: ignore[assignment]
     first_queue: queue.Queue[object] = queue.Queue()
     first = _QueuedGeneration([1, 2], 3, 0.0, True, first_queue)
 
     engine._run_tensor_parallel_online_batcher(first)
 
     assert _queue_items(first_queue) == [801, 802, 803, _GenerationDone()]
+    assert observed_events_before_idle_timeout == [
+        "online_batcher_progress",
+        "online_batcher_progress",
+        "online_batcher_quiescent",
+    ]
     records = [json.loads(line) for line in profile_path.read_text().splitlines()]
     assert [record["event"] for record in records] == [
         "online_batcher_progress",
         "online_batcher_progress",
+        "online_batcher_quiescent",
         "online_batcher",
     ]
     assert records[0]["profile_snapshot_index"] == 1
@@ -13518,35 +13542,41 @@ def test_openai_tensor_parallel_online_batcher_records_profile_snapshots(
     assert records[1]["runtime_decode_tokens"] == 3
     assert records[1]["phase_total_ms"] >= 0.0
     assert records[2]["profile_snapshots"] == 2
+    assert records[2]["profile_waiting_for_next_request"] is True
+    assert records[2]["profile_pending_idle_timeout_ms"] >= 0.0
     assert records[2]["online_step_commands"] == 3
     assert records[2]["runtime_decode_tokens"] == 3
-    assert records[2]["requested_max_batch"] == 4
-    assert records[2]["initial_wait_ms"] == 0.0
-    assert records[2]["idle_batch_wait_ms"] == 0.0
-    assert records[2]["collect_idle_arrivals"] is False
-    assert records[2]["admit_min_ready_requests"] == 12
-    assert records[2]["admit_per_step_cap"] == 64
-    assert records[2]["prefill_token_budget"] == 0
-    assert records[2]["enable_ragged_decode"] is True
-    assert records[2]["use_decode_many"] is True
-    assert records[2]["decode_many_allow_stop"] is True
-    assert records[2]["use_paged_engine"] is False
-    assert records[2]["graph_prefill"] is True
-    assert records[2]["prefill_chunk_size"] == 0
-    assert records[2]["pin_shared_prefix"] is True
-    assert records[2]["store_reusable_prefixes"] is True
-    assert records[2]["store_full_prompt_prefixes"] is True
-    assert records[2]["submit_batches"] == 1
-    assert records[2]["submit_requests"] == 1
-    assert records[2]["submit_batch_max"] == 1
-    assert records[2]["submit_batch_hist"] == {"1": 1}
-    assert records[2]["drain_ready_calls"] >= 1
-    assert records[2]["drain_ready_nonempty_calls"] == 0
-    assert records[2]["drain_ready_requests"] == 0
-    assert records[2]["drain_ready_max"] == 0
-    assert records[2]["runtime_step_calls"] == 3
-    assert records[2]["runtime_step_events"] == 3
-    assert records[2]["runtime_step_max_events"] == 1
+    assert records[2]["phase_total_ms"] >= 0.0
+    assert records[3]["profile_snapshots"] == 2
+    assert records[3]["online_step_commands"] == 3
+    assert records[3]["runtime_decode_tokens"] == 3
+    assert records[3]["requested_max_batch"] == 4
+    assert records[3]["initial_wait_ms"] == 0.0
+    assert records[3]["idle_batch_wait_ms"] == 0.0
+    assert records[3]["collect_idle_arrivals"] is False
+    assert records[3]["admit_min_ready_requests"] == 12
+    assert records[3]["admit_per_step_cap"] == 64
+    assert records[3]["prefill_token_budget"] == 0
+    assert records[3]["enable_ragged_decode"] is True
+    assert records[3]["use_decode_many"] is True
+    assert records[3]["decode_many_allow_stop"] is True
+    assert records[3]["use_paged_engine"] is False
+    assert records[3]["graph_prefill"] is True
+    assert records[3]["prefill_chunk_size"] == 0
+    assert records[3]["pin_shared_prefix"] is True
+    assert records[3]["store_reusable_prefixes"] is True
+    assert records[3]["store_full_prompt_prefixes"] is True
+    assert records[3]["submit_batches"] == 1
+    assert records[3]["submit_requests"] == 1
+    assert records[3]["submit_batch_max"] == 1
+    assert records[3]["submit_batch_hist"] == {"1": 1}
+    assert records[3]["drain_ready_calls"] >= 1
+    assert records[3]["drain_ready_nonempty_calls"] == 0
+    assert records[3]["drain_ready_requests"] == 0
+    assert records[3]["drain_ready_max"] == 0
+    assert records[3]["runtime_step_calls"] == 3
+    assert records[3]["runtime_step_events"] == 3
+    assert records[3]["runtime_step_max_events"] == 1
 
 
 def test_openai_tensor_parallel_online_default_prefix_rows(monkeypatch: pytest.MonkeyPatch) -> None:

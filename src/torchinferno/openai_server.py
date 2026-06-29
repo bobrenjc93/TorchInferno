@@ -4353,8 +4353,9 @@ class OpenAICompletionEngine:
         )
         profile_snapshots = 0
         last_quiescent_profile_commands = -1
+        last_quiescent_aggregate_commands = -1
 
-        def record_online_profile(event: str) -> None:
+        def record_online_profile(event: str, **profile_fields: object) -> None:
             nonlocal profile_snapshots
             if not profile_queue:
                 return
@@ -4362,7 +4363,7 @@ class OpenAICompletionEngine:
             if is_progress:
                 profile_snapshots += 1
             phase_fields = {f"phase_{name}": round(value, 3) for name, value in phase_ms.items()}
-            extra_fields: dict[str, object] = {}
+            extra_fields: dict[str, object] = dict(profile_fields)
             all_submitted_finished = bool(request_by_id) and finished_events >= len(request_by_id)
             if is_progress:
                 extra_fields["profile_snapshot_index"] = profile_snapshots
@@ -4373,6 +4374,11 @@ class OpenAICompletionEngine:
                     )
             else:
                 extra_fields["profile_snapshots"] = profile_snapshots
+                if event == "online_batcher_quiescent" and all_submitted_finished:
+                    extra_fields.setdefault(
+                        "phase_total_ms",
+                        round((time.perf_counter() - profile_start_s) * 1000.0, 3),
+                    )
             self._record_runtime_engine_queue_profile(
                 event,
                 runtime_engine,
@@ -4613,15 +4619,34 @@ class OpenAICompletionEngine:
                     ready_count = drain_ready(step, steps_after_submit=steps_after_submit)
                     ran_combined_step_command = steps_after_submit > 0 and ready_count > 0
                     if not runtime_engine.has_online_work():
+                        all_submitted_finished = bool(request_by_id) and finished_events >= len(request_by_id)
                         if (
                             profile_snapshot_commands > 0
                             and online_step_commands != last_quiescent_profile_commands
-                            and request_by_id
-                            and finished_events >= len(request_by_id)
+                            and all_submitted_finished
                         ):
                             record_online_profile("online_batcher_progress")
                             last_quiescent_profile_commands = online_step_commands
                         if wait_and_drain(step, idle_wait_s) == 0:
+                            if (
+                                all_submitted_finished
+                                and profile_queue
+                                and online_step_commands != last_quiescent_aggregate_commands
+                                and (persistent or persistent_idle_s > 0.0)
+                            ):
+                                quiescent_profile_fields: dict[str, object] = {
+                                    "profile_waiting_for_next_request": True,
+                                }
+                                if not persistent:
+                                    quiescent_profile_fields["profile_pending_idle_timeout_ms"] = round(
+                                        persistent_idle_s * 1000.0,
+                                        3,
+                                    )
+                                record_online_profile(
+                                    "online_batcher_quiescent",
+                                    **quiescent_profile_fields,
+                                )
+                                last_quiescent_aggregate_commands = online_step_commands
                             if persistent:
                                 next_item = self._generation_queue.get()
                             else:
