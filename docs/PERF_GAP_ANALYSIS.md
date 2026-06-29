@@ -1,5 +1,51 @@
 # TorchInferno vs vLLM/sglang — Performance Gap Analysis (Llama-3.1-70B, 8xH100)
 
+## Current 92af26f refresh and rejected self/few-shot follow-ups (2026-06-28)
+
+A same-host no-profile all-provider comparison on pushed `92af26f` is the
+current local source baseline. The scorecard was SGLang `11/20`,
+TorchInferno `5/20`, and vLLM `3/20`. TorchInferno rows were: few_shot
+`165.9 / 51.9 / 207.6ms`, self_consistency `261.6 / 0.0 / 283.1ms`,
+multi_turn `328.8 / 64.1 / 393.9ms`, tree_of_thought
+`239.9 / 48.7 / 283.6ms`, and long_output `289.7 / 25.3 / 1239.9ms`.
+TorchInferno wins few_shot TPOT/E2E/throughput, multi_turn TPOT, and
+tree_of_thought TPOT locally, but still trails the fastest provider on
+TTFT/E2E for self, multi_turn, tree, and long_output.
+
+Public run `20260629_010316` measured the older TorchInferno `a349eba`,
+vLLM `311ad68`, and SGLang `06fd2ef`. It landed at TorchInferno `1/20`,
+vLLM `15/20`, and SGLang `3/20`. Public TorchInferno rows were:
+few_shot `160.5 / 45.2 / 197.0ms`, self_consistency
+`246.2 / 0.0 / 264.8ms`, multi_turn `324.8 / 57.7 / 383.5ms`,
+tree_of_thought `195.7 / 56.6 / 241.0ms`, and long_output
+`277.2 / 23.1 / 1092.5ms`. This public row predates the later startup
+barrier, greedy-short zero wait, and prefix-row padding changes, so use it as
+competitor evidence but not as the current TorchInferno source baseline.
+
+Self-consistency idle-drain submit coalescing is rejected. A source prototype
+changed the idle path to collect arrivals across the wait window and submit
+them once. It did reduce submit and runtime step counts, but the score-facing
+row regressed because ready arrivals paid repeated idle waits. With the 10ms
+sampled-short idle default, submit batches dropped `237 -> 154` and runtime
+step calls `214 -> 98`, but idle wait rose `182ms -> 1244ms` and the row landed
+at `306.7 / 0.0 / 353.0ms`. Lowering only
+`TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_SHORT_IDLE_BATCH_WAIT_MS` to `2` improved
+TTFT to `205.6ms`, but E2E stayed poor at `341.9ms` and throughput stayed
+`2.9 tok/s`. The patch was reverted; keep the current sampled-short idle drain
+shape until a change improves E2E/throughput rather than only reducing command
+count.
+
+Two few_shot follow-ups on `92af26f` are rejected. The current focused control
+landed at `166.1 / 50.9 / 208.2ms`, with `max_active=32`, `30` full
+32-request waves, `2.92s` prefill wall, and `3.98s` decode-active time.
+Raising only `TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_MID_MAX_ACTIVE` to `48`
+regressed to `196.5 / 49.8 / 242.1ms`; it introduced `b48` prefill shapes and
+raised runtime phase time to `10.41s` (`4.06s` prefill wall,
+`5.92s` decode-active). Forcing a 10ms initial collection window kept the
+32-row cap and moved initial admission from `3` to `13`, but was effectively
+flat at `166.7 / 49.7 / 206.6ms`. Keep greedy-mid active rows at `32` and do
+not add a greedy-mid initial wait default from this evidence.
+
 ## Current no-profile local scorecard (2026-06-28)
 
 A current no-profile all-provider run on pushed `50580d6` landed at
