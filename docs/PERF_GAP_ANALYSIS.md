@@ -65,6 +65,17 @@ TorchInferno `315.2 / 25.2 / 1312.5ms`, p99 TPOT `632.3ms`, versus SGLang
 quantum at `3`; the remaining long_output gap is not solved by a larger command
 quantum.
 
+The current tree_of_thought profile on `a349eba` keeps the sampled-medium
+diagnosis. A profiled focused run landed at `231.3 / 49.1 / 275.4ms`,
+964/992 raw correct, with one request-path suffix prefill graph capture
+(`ragged_prefill:b31:s16:rows1:ctx-256:src1`) costing about `1.0s`; total
+profiled prefill wall was `1.91s` for the first 256-request sampled wave.
+Narrowly adding only batch `31` to the existing common-prefix suffix warmup is
+rejected: readiness rose to `180.8s` and the score row regressed to
+`250.0 / 49.2 / 294.1ms`, 961/992 raw correct. Keep the sampled suffix warmup
+batch set at `1,2,4,8,16,32`; removing that one capture is not enough to improve
+client-observed tree medians.
+
 ## Greedy-large multi_turn suffix bucket refinement (2026-06-28)
 
 Current multi_turn is still conversation-prefix prefill dominated, but the
