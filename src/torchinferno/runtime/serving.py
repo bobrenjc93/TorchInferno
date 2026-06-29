@@ -77,7 +77,7 @@ def _default_prefix_prefill_suffix_buckets(
     return _parse_positive_int_csv(
         os.environ.get(
             "TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SUFFIX_BUCKETS_GREEDY_LARGE",
-            "16,32,64,96,128,160,192,224,256",
+            "16,32,64,80,96,112,128,144,160,192,224,256",
         )
     )
 

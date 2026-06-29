@@ -9368,7 +9368,7 @@ def test_online_common_prefix_prefill_warmup_filters_shapes(monkeypatch) -> None
     assert _online_greedy_common_prefix_suffix_prefill_warmup_suffix_tokens(
         160,
         warmup_max_tokens=512,
-    ) == (16, 32, 64, 96, 128, 160)
+    ) == (16, 32, 64, 80, 96, 112, 128, 144, 160)
     assert _online_greedy_common_prefix_suffix_prefill_warmup_suffix_tokens(
         160,
         warmup_max_tokens=128,

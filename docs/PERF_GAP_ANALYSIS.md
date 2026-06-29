@@ -5257,7 +5257,7 @@ Promote the 512-worker fast HTTP default, but keep keepalive enabled.
 
 The public `20260629_130308` refresh still measured stale TorchInferno
 `bd17332`, so it does not include the cached sampler-state or HTTP-worker
-changes above. On current `a8467f2`, the multi_turn row remains server-side:
+changes above. On current `722cc35`, the multi_turn row remains server-side:
 the local TorchInferno-only run landed at `320.2 / 62.1 / 378.2ms`, with p50
 queue-to-submit `104.6ms`, submit-to-first `139.9ms`, `4.71s` prefill wall, and
 `2.72s` ragged decode GPU time. Queue-profile snapshots now include per-shape
@@ -5268,6 +5268,14 @@ prefill dominates the current multi_turn TTFT path. Enabling prefill-cost
 admission priority is rejected: it shifted more waves into `s160`, increased
 prefill wall to `5.00s`, decode GPU time to `3.82s`, and regressed the row to
 `341.7 / 62.7 / 403.0ms`.
+
+The same shape-timing profile supports a narrower greedy-large suffix-bucket
+refinement. Adding `80/112/144` to the deterministic 512-token suffix bucket
+set kept request-path captures at zero and moved the local profiled row to
+`317.9 / 60.7 / 379.6ms`. Prefill wall dropped `4.71s -> 4.29s`, and first-turn
+median TTFT dropped `765ms -> 587ms`; startup ready time increased by about
+`15s` because more warmup graph shapes are captured. Promote the finer bucket
+set only under the existing `400 < max_tokens <= 512`, `temperature=0` gate.
 
 ## In-flight, validated-locally-but-NOT-benchmarked commits
 

@@ -82,8 +82,10 @@ def test_continuous_prefix_prefill_suffix_buckets_can_be_configured(monkeypatch)
         temperature=0.0,
         max_generation_tokens=512,
     )
-    assert large_greedy_engine._suffix_bucket(65) == 96
-    assert large_greedy_engine._suffix_bucket(129) == 160
+    assert large_greedy_engine._suffix_bucket(65) == 80
+    assert large_greedy_engine._suffix_bucket(97) == 112
+    assert large_greedy_engine._suffix_bucket(129) == 144
+    assert large_greedy_engine._suffix_bucket(145) == 160
     assert large_greedy_engine._suffix_bucket(225) == 256
     assert large_greedy_engine._suffix_bucket(257) == 512
 
