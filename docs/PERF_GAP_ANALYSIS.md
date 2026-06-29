@@ -216,6 +216,23 @@ tree_of_thought, or long_output default buckets. Explicit overrides remain:
 `TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_SHORT_MARLIN_INT4_DECODE` for the
 sampled-short bucket.
 
+Public refresh `20260629_110323` measured TorchInferno `03677fd` against vLLM
+`3483240` and SGLang `bb7d344`; vLLM now owns `16/20` score cells, TorchInferno
+`2/20`, and SGLang `1/20`. TorchInferno still wins only few_shot TPOT
+(`46.7ms`) and multi_turn TPOT (`57.8ms`). Rows were: few_shot TorchInferno
+`160.8 / 46.7 / 198.3ms`, vLLM `139.5 / 49.6 / 178.6ms`, SGLang
+`150.4 / 75.7 / 226.0ms`; self_consistency TorchInferno
+`249.2 / 0.0 / 269.6ms`, vLLM `210.4 / 0.0 / 231.9ms`, SGLang
+`220.4 / 0.0 / 360.2ms`; multi_turn TorchInferno
+`316.4 / 57.8 / 371.9ms`, vLLM `155.2 / 58.5 / 201.1ms`, SGLang
+`161.2 / 101.5 / 253.5ms`; tree_of_thought TorchInferno
+`208.2 / 59.1 / 257.5ms`, vLLM `63.0 / 31.5 / 85.5ms`, SGLang
+`78.7 / 52.5 / 138.5ms`; long_output TorchInferno
+`317.7 / 22.9 / 1119.8ms`, vLLM `76.4 / 15.0 / 629.6ms`, SGLang
+`68.6 / 22.1 / 844.1ms`. This supersedes the earlier public `090315` read:
+tree no longer has a TorchInferno TPOT win, and the dominant gaps are now
+tree/long-output first-token scheduling plus long-output decode throughput.
+
 The pushed `642b555` full TorchInferno-only validation landed at few_shot
 `161.4 / 46.7 / 198.3ms`, self_consistency `245.3 / 0.0 / 260.3ms`,
 multi_turn `310.9 / 61.4 / 364.8ms`, tree_of_thought
@@ -306,6 +323,13 @@ churn, not a missing generated-prefix cache hit or decode-compute gap. Add an
 `online_batcher_quiescent` queue-profile record when all currently submitted
 work has drained and before the idle wait for future arrivals, so later sampled
 short profiles keep aggregate counters even if teardown races the final record.
+The first source placement was still too late because teardown can occur during
+the short idle-arrival wait; moving the record ahead of that wait validated on
+`48b68bf`. A profiled TorchInferno-only self_consistency rerun landed at
+`324.0 / 0.0 / 372.6ms`, `1000/1000` correct, and emitted quiescent snapshots
+through the final `1000/1000` submitted/finished state (`217` online step
+commands, `255` submit batches, `979` generated-prefix reuse requests) despite
+the final `online_batcher` record still being preempted by server teardown.
 
 Lowering online admission granularity is rejected for sampled-medium tree. A
 focused source-free A/B forced
