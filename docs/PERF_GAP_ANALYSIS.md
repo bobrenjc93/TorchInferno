@@ -57,6 +57,16 @@ before server accept plus client request-body delivery and tail request waves.
 Do not reopen worker-count/prestart/parallel-accept without a change that
 improves that pre-accept/client-admission side in full benchmark order.
 
+Raising the drained fast-HTTP keepalive timeout from `0.25s` to `1.0s` is also
+rejected on the current stack. A focused self_consistency A/B on `afbbe89`
+regressed the score row to `364.2 / 0.0 / 394.0ms`; the HTTP profile still had
+`1000/1000` first requests on their connections, so the longer drained idle
+window did not produce connection reuse. Request-read p50 worsened
+`47.2ms -> 84.1ms`, server first-content p50 stayed around `9ms`, and queue
+phase time rose (`2.95s -> 3.39s`) with more submit batches (`455 -> 557`).
+Keep the short drained timeout; the missing self median is not fixed by simply
+holding idle sockets open longer.
+
 ## Current multi_turn refresh and DQ=8 rejection (2026-06-29)
 
 The restored public run `20260629_185744` kept multi_turn in the expected
