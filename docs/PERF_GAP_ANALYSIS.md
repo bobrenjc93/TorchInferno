@@ -1,16 +1,16 @@
 # TorchInferno vs vLLM/sglang — Performance Gap Analysis (Llama-3.1-70B, 8xH100)
 
-## Current 92af26f/b0d4c0f refresh and rejected follow-ups (2026-06-28)
+## Current d363367 refresh and rejected follow-ups (2026-06-28)
 
-A same-host no-profile all-provider comparison on pushed `92af26f` is the
-current local source baseline. The scorecard was SGLang `11/20`,
-TorchInferno `5/20`, and vLLM `3/20`. TorchInferno rows were: few_shot
-`165.9 / 51.9 / 207.6ms`, self_consistency `261.6 / 0.0 / 283.1ms`,
-multi_turn `328.8 / 64.1 / 393.9ms`, tree_of_thought
-`239.9 / 48.7 / 283.6ms`, and long_output `289.7 / 25.3 / 1239.9ms`.
-TorchInferno wins few_shot TPOT/E2E/throughput, multi_turn TPOT, and
-tree_of_thought TPOT locally, but still trails the fastest provider on
-TTFT/E2E for self, multi_turn, tree, and long_output.
+A same-host no-profile all-provider comparison on pushed `d363367` is the
+current local source baseline. The scorecard was SGLang `13/20`,
+TorchInferno `4/20`, and vLLM `2/20`. TorchInferno rows were: few_shot
+`174.5 / 50.5 / 220.0ms`, self_consistency `372.5 / 0.0 / 400.5ms`,
+multi_turn `333.7 / 64.8 / 393.1ms`, tree_of_thought
+`312.4 / 46.7 / 348.6ms`, and long_output `297.6 / 24.8 / 1247.2ms`.
+TorchInferno still wins TPOT on few_shot, long_output, multi_turn, and
+tree_of_thought locally, but SGLang leads most TTFT/E2E/throughput cells and
+vLLM owns several p99 tail cells plus the self_consistency median row.
 
 Public run `20260629_010316` measured the older TorchInferno `a349eba`,
 vLLM `311ad68`, and SGLang `06fd2ef`. It landed at TorchInferno `1/20`,
@@ -86,12 +86,12 @@ few_shot `165.3 / 48.7 / 205.0ms`, self_consistency
 tree_of_thought `243.0 / 47.5 / 294.9ms`, and long_output
 `272.1 / 25.4 / 1171.4ms`, with summary correctness rates at `1.0`.
 
-## Current no-profile local scorecard (2026-06-28)
+## Earlier no-profile local scorecard (2026-06-28)
 
-A current no-profile all-provider run on pushed `50580d6` landed at
-TorchInferno `6/20`, vLLM `0/20`, and SGLang `13/20`. This is the best current
-score-facing baseline because the earlier `1702ba1` full pass carried queue
-profiling overhead. TorchInferno now wins few_shot TPOT/E2E
+An earlier no-profile all-provider run on pushed `50580d6` landed at
+TorchInferno `6/20`, vLLM `0/20`, and SGLang `13/20`. It was the best
+score-facing baseline at that point because the earlier `1702ba1` full pass
+carried queue profiling overhead. TorchInferno then won few_shot TPOT/E2E
 (`48.5ms` / `202.4ms`), self_consistency E2E/throughput
 (`278.6ms` / `3.6 tok/s`), multi_turn TPOT (`61.4ms`), and tree_of_thought TPOT
 (`47.1ms`). SGLang still leads row-level TTFT/E2E/throughput for multi_turn,
