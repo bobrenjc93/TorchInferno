@@ -5233,6 +5233,17 @@ submit-to-first-token, and queue-to-finish counts plus p50/p90/p99/max. These
 fields separate HTTP/client arrival delay from runtime prefill/decode delay in
 the same `online_batcher` JSONL snapshots used above.
 
+The same request-latency profiling on tree_of_thought shows a different split.
+A no-env TorchInferno-only run on pushed `289ce77` landed at
+`230.6 / 49.5 / 275.4ms`, 992/992 benchmark-correct. Across the 12 quiescent
+online-batcher sessions, p50 queue-to-submit averaged `188.8ms` and p50
+submit-to-first averaged `154.9ms`, with `4.73s` prefill wall, `3.47s` decode
+GPU time, and `9.77s` profiled phase. Lowering only sampled-medium
+`max_active` from `32` to `16` is rejected: it regressed the score-facing row to
+`372.3 / 47.2 / 411.8ms` and `2.8 tok/s`. The profile confirms this is not a
+useful queueing fix: p50 queue-to-submit worsened to `315.8ms`, step calls rose
+`138 -> 216`, and decode GPU/CPU exposure rose as well.
+
 ## In-flight, validated-locally-but-NOT-benchmarked commits
 
 The inference-bench harness has been frozen on `25260c0` for many hours, so these
