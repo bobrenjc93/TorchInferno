@@ -5302,6 +5302,15 @@ decode-many token-readback time into the per-shape CPU timing map so the next
 long_output profile can distinguish multi-step readback from ordinary ragged
 decode readback.
 
+The first default profile with that split on pushed `9c83243` landed at
+`297.5 / 25.6 / 1325.9ms`, 1000/1000 correct. Total token readback was
+`7.17s`, but decode-many accounted for only `1.45s` of it across `120` calls
+and `305` internal steps. The remaining readback/synchronization exposure is
+ordinary ragged decode, with `decode_many:b64/64` contributing about `590ms`
+CPU time versus the larger ordinary ragged `b49-b62/64` buckets. Do not spend
+the next pass on decode-many CPU-copy micro-optimizations; the useful lever
+still has to reduce or overlap ordinary ragged decode synchronization.
+
 ## In-flight, validated-locally-but-NOT-benchmarked commits
 
 The inference-bench harness has been frozen on `25260c0` for many hours, so these
