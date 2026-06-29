@@ -130,6 +130,16 @@ prefill wall `1.73s -> 1.89s`, while step-broadcast time was only `9.5ms` in
 the control. The extra command fusion changed arrival/drain pacing more than it
 saved coordination overhead, so the prototype was backed out.
 
+Coarsening the sampled-short idle-drain poll interval is rejected too. The
+default idle drain loop polls every `0.1ms` inside the 10ms sampled-short window.
+An env-gated source prototype tested `1ms` polling to reduce tiny drain batches,
+but focused self_consistency regressed to `334.5 / 0.0 / 362.0ms`, 1000/1000
+correct. Queue counters moved the wrong way versus the `82e9d83` control:
+submit batches `199 -> 253`, runtime step calls `185 -> 230`, submit-sync
+`575.8ms -> 663.2ms`, runtime phase `2.90s -> 3.17s`, and prefill/reuse wall
+`1.73s -> 1.84s`. The prototype was backed out; changing the idle poll cadence
+does not solve self_consistency's finish-path churn.
+
 The prior same-host no-profile all-provider comparison on pushed `d363367`
 landed at SGLang `13/20`, TorchInferno `4/20`, and vLLM `2/20`. TorchInferno
 rows were: few_shot `174.5 / 50.5 / 220.0ms`, self_consistency
