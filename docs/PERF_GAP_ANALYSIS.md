@@ -437,6 +437,16 @@ from about `161s` to `206s`, the focused row was only noise-better at
 `3.60s` prefill wall with three misses and one request-path capture. The few_shot
 tail is not solved by warming that benchmark's 122-token common-prefix shape.
 
+A current profiled few_shot check on pushed `96cb9e7` keeps the same diagnosis.
+The row landed at `167.4 / 49.6 / 206.3ms`, 977/1000 raw correct, with
+`initial_batch_size=2`, `34` submit batches, `35` prefill batches, and `73`
+decode model calls. The runtime reused the 122-token common prefix for `980`
+requests, hit `33` prefill graphs with only `2` misses and no captures, and
+spent `2.69s` in prefill wall (`1.69s` forward) versus `4.03s` in decode-active
+time. Ragged decode padding was only `165` tokens. So the current few_shot median
+gap is not a missing warmup bucket or padded decode waste; it remains the known
+greedy-mid balance of prefill wave cost plus decode cadence.
+
 Raising the stream token drain cap for long_output is rejected. On clean
 `b0d4c0f`, the current profiled long_output control landed at
 `271.6 / 24.8 / 1276.3ms`, with `1.2s` of prefill graph capture,
