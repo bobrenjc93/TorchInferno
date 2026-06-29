@@ -294,6 +294,20 @@ in the known sampled common-prefix suffix prefill pipeline bucket; current
 metadata now separates submitted request order from completion order for future
 public traces.
 
+A current TorchInferno-only tree profile on pushed `b71070c` keeps that same
+bucket after the public `110323` refresh. The profiled row landed at
+`250.4 / 49.6 / 299.0ms`, `958/992` raw correct, with the expected queue-profile
+overhead versus the public no-profile `208.2 / 59.1 / 257.5ms` row. Sampled
+branch traffic (`temperature=0.7`, `max_tokens=300`) used six sessions for
+`896` submitted requests, `39` submit batches, `46` prefill batches, zero
+prefill graph misses/captures, `3.77s` prefill wall (`1.88s` forward),
+`1.60s` ragged-decode GPU time, and `1.37s` CPU token readback. Greedy eval
+traffic used six 16-request sessions and spent another `1.03s` prefill wall and
+`1.93s` decode GPU time. This does not reopen initial-wait, admission-cap,
+FP8-min-M, dynamic-context-floor, or graph-warmup knobs; the remaining tree gap
+needs a genuinely faster sampled-prefix prefill/decode pipeline rather than more
+shape cleanup.
+
 Lowering the dynamic prefix-prefill minimum context from `256` to `64` for the
 tree sampled-medium suffix shape is rejected. A broad env run
 (`TORCHINFERNO_CONTINUOUS_DYNAMIC_PREFIX_PREFILL_MIN_CONTEXT=64`) looked
