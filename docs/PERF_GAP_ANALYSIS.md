@@ -5203,6 +5203,36 @@ Rejected follow-ups after the public `d3131f4` refresh:
   capture cost but made every suffix prefill eager and regressed the row to
   `534.3 / 46.9 / 573.0ms`.
 
+The public `20260629_110323` refresh measured TorchInferno `03677fd` at 2/20
+scorecard cells. The largest remaining median gaps were TTFT/E2E for
+long_output (`317.7 / 22.9 / 1119.8ms` vs vLLM
+`76.4 / 15.0 / 629.6ms`) and tree (`208.2 / 59.1 / 257.5ms` vs vLLM
+`63.0 / 31.5 / 85.5ms`). A same-host long_output provider comparison on current
+`23bbd95` showed a narrower story: TorchInferno locally won median TPOT
+(`24.1ms` vs SGLang `24.5ms` and vLLM `27.7ms`) but still lagged TTFT/E2E
+(`281.1 / 1262.7ms` vs SGLang `59.5 / 928.6ms`). The queue profile points to
+first-token latency, not steady decode: `7.59s` prefill wall, `13.00s` ragged
+decode GPU time, `7.37s` CPU token time, and `23.43s` profiled phase for
+`37.7k` emitted events. Per-100 request windows after the cold first wave stayed
+around `219-296ms` TTFT for TorchInferno while vLLM was mostly `82-106ms` and
+SGLang `55-79ms`.
+
+Two greedy-short scheduling rechecks remain rejected on the current stack.
+Enabling idle-arrival collection improved median TTFT/E2E to
+`264.8 / 1158.4ms`, but increased prefill batches (`128 -> 135` submits) and
+worsened global p99 TPOT (`89.4 -> 269.3ms`). Setting the greedy-short initial
+batch wait to `1ms` improved median TTFT to `244.1ms`, but the run still started
+with one initial request and regressed p99 TTFT/TPOT/E2E to
+`5249.1 / 474.3 / 6550.6ms`. Keep the current zero-wait/no-idle-collection
+defaults until a different admission path can reduce first-token latency without
+tail damage.
+
+To make the next long-output profiles actionable, queue-profile records now emit
+server-side request latency aggregates: queue-to-submit, queue-to-first-token,
+submit-to-first-token, and queue-to-finish counts plus p50/p90/p99/max. These
+fields separate HTTP/client arrival delay from runtime prefill/decode delay in
+the same `online_batcher` JSONL snapshots used above.
+
 ## In-flight, validated-locally-but-NOT-benchmarked commits
 
 The inference-bench harness has been frozen on `25260c0` for many hours, so these

@@ -13522,7 +13522,14 @@ def test_openai_tensor_parallel_online_batcher_records_profile_snapshots(
 
     engine._generation_queue = EmptyQueueWithProfileObservation()  # type: ignore[assignment]
     first_queue: queue.Queue[object] = queue.Queue()
-    first = _QueuedGeneration([1, 2], 3, 0.0, True, first_queue)
+    first = _QueuedGeneration(
+        [1, 2],
+        3,
+        0.0,
+        True,
+        first_queue,
+        queued_at_s=time.perf_counter(),
+    )
 
     engine._run_tensor_parallel_online_batcher(first)
 
@@ -13587,6 +13594,20 @@ def test_openai_tensor_parallel_online_batcher_records_profile_snapshots(
     assert records[3]["runtime_step_calls"] == 3
     assert records[3]["runtime_step_events"] == 3
     assert records[3]["runtime_step_max_events"] == 1
+    assert records[3]["request_queue_to_submit_count"] == 1
+    assert records[3]["request_queue_to_submit_p50_ms"] >= 0.0
+    assert records[3]["request_queue_to_first_token_count"] == 1
+    assert (
+        records[3]["request_queue_to_first_token_p50_ms"]
+        >= records[3]["request_queue_to_submit_p50_ms"]
+    )
+    assert records[3]["request_submit_to_first_token_count"] == 1
+    assert records[3]["request_submit_to_first_token_p50_ms"] >= 0.0
+    assert records[3]["request_queue_to_finish_count"] == 1
+    assert (
+        records[3]["request_queue_to_finish_p50_ms"]
+        >= records[3]["request_queue_to_first_token_p50_ms"]
+    )
 
 
 def test_openai_tensor_parallel_online_default_prefix_rows(monkeypatch: pytest.MonkeyPatch) -> None:

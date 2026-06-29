@@ -999,8 +999,37 @@ class _QueuedGeneration:
     stream: bool
     responses: "queue.Queue[object] | queue.SimpleQueue[object]"
     queued_at_s: float = 0.0
+    submitted_at_s: float = 0.0
+    first_token_at_s: float = 0.0
+    finished_at_s: float = 0.0
     queue_sequence: int = -1
     done: bool = False
+
+
+def _latency_summary_fields(
+    prefix: str,
+    values_ms: Sequence[float],
+) -> dict[str, float | int]:
+    if not values_ms:
+        return {}
+    values = sorted(float(value) for value in values_ms)
+    count = len(values)
+
+    def percentile(fraction: float) -> float:
+        index = int(count * fraction)
+        return values[min(index, count - 1)]
+
+    if count % 2 == 1:
+        p50 = values[count // 2]
+    else:
+        p50 = (values[count // 2 - 1] + values[count // 2]) / 2.0
+    return {
+        f"{prefix}_count": count,
+        f"{prefix}_p50_ms": p50,
+        f"{prefix}_p90_ms": percentile(0.90),
+        f"{prefix}_p99_ms": percentile(0.99),
+        f"{prefix}_max_ms": values[-1],
+    }
 
 
 @dataclass
@@ -4355,6 +4384,37 @@ class OpenAICompletionEngine:
         last_quiescent_profile_commands = -1
         last_quiescent_aggregate_commands = -1
 
+        def request_latency_profile_fields() -> dict[str, float | int]:
+            queue_to_submit_ms: list[float] = []
+            queue_to_first_ms: list[float] = []
+            submit_to_first_ms: list[float] = []
+            queue_to_finish_ms: list[float] = []
+            for request in request_by_id.values():
+                queued_at_s = request.queued_at_s
+                if queued_at_s <= 0.0:
+                    continue
+                submitted_at_s = request.submitted_at_s
+                first_token_at_s = request.first_token_at_s
+                finished_at_s = request.finished_at_s
+                if submitted_at_s > 0.0:
+                    queue_to_submit_ms.append((submitted_at_s - queued_at_s) * 1000.0)
+                if first_token_at_s > 0.0:
+                    queue_to_first_ms.append((first_token_at_s - queued_at_s) * 1000.0)
+                    if submitted_at_s > 0.0:
+                        submit_to_first_ms.append((first_token_at_s - submitted_at_s) * 1000.0)
+                if finished_at_s > 0.0:
+                    queue_to_finish_ms.append((finished_at_s - queued_at_s) * 1000.0)
+            fields: dict[str, float | int] = {}
+            fields.update(_latency_summary_fields("request_queue_to_submit", queue_to_submit_ms))
+            fields.update(
+                _latency_summary_fields("request_queue_to_first_token", queue_to_first_ms)
+            )
+            fields.update(
+                _latency_summary_fields("request_submit_to_first_token", submit_to_first_ms)
+            )
+            fields.update(_latency_summary_fields("request_queue_to_finish", queue_to_finish_ms))
+            return fields
+
         def record_online_profile(event: str, **profile_fields: object) -> None:
             nonlocal profile_snapshots
             if not profile_queue:
@@ -4425,6 +4485,7 @@ class OpenAICompletionEngine:
                 runtime_step_calls=runtime_step_calls,
                 runtime_step_events=runtime_step_events,
                 runtime_step_max_events=runtime_step_max_events,
+                **request_latency_profile_fields(),
                 **extra_fields,
                 **phase_fields,
             )
@@ -4472,6 +4533,8 @@ class OpenAICompletionEngine:
             for request in requests:
                 request_id = str(next_request_id)
                 next_request_id += 1
+                if profile_queue and request.queued_at_s > 0.0:
+                    request.submitted_at_s = submit_start_s
                 request_by_id[request_id] = request
                 runtime_engine.submit_online(
                     _RuntimeServingRequest(
@@ -4746,6 +4809,8 @@ class OpenAICompletionEngine:
                                 _finish_stream_request(request)
                                 finished_events += 1
                                 continue
+                            if profile_queue and request.first_token_at_s <= 0.0:
+                                request.first_token_at_s = event_emit_start_s
                             request.responses.put(event.token)
                             if event.finished:
                                 _finish_stream_request(request)
@@ -14783,6 +14848,8 @@ def _flashinfer_step_loop(
 def _finish_stream_request(request: _QueuedGeneration) -> None:
     if request.done:
         return
+    if request.queued_at_s > 0.0 and request.finished_at_s <= 0.0:
+        request.finished_at_s = time.perf_counter()
     request.responses.put(_GenerationDone())
     request.done = True
 
