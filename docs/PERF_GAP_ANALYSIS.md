@@ -128,6 +128,17 @@ TTFT/E2E band and gives away TPOT versus the recent default few_shot rows
 `165.6 / 47.2 / 208.0ms`). Keep the no-step-sync default scoped to
 sampled-short self_consistency.
 
+A same-host all-provider multi_turn rerun on pushed `993f2bb` again isolates
+the gap to first-turn/prefix admission rather than decode TPOT. vLLM landed at
+`287.7 / 109.1 / 383.5ms`, SGLang at `166.0 / 102.7 / 275.4ms`, and
+TorchInferno at `359.2 / 62.9 / 422.2ms`, with all providers in the 98%
+correctness band. TorchInferno won only median TPOT; SGLang won TTFT/E2E and
+throughput. The first-turn TTFT average was the clearest split:
+TorchInferno `1049.7ms`, vLLM `438.4ms`, and SGLang `337.9ms`. TorchInferno
+last-turn TTFT dropped to `395.3ms`, so conversation-prefix reuse is helping
+after the first wave, but the initial admission/prefix-fill path is still too
+slow and has a `3199.8ms` p99 TTFT tail.
+
 Fresh focused profiles on pushed `0c45929` keep long_output in the known
 decode/readback bucket. The queue-profiled control completed `1000/1000`
 correct at `256.9 / 26.2 / 1255.9ms`. The last queue snapshot had all
