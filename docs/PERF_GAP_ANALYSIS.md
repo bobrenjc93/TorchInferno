@@ -80,6 +80,11 @@ priority landed at `259.4 / 24.6 / 1205.1ms`, `32.1 tok/s`, both
 `1000/1000` correct. Keep the default scoped to greedy-short; few_shot
 (`max_tokens=256`), multi_turn (`512`), self_consistency/tree sampled traffic,
 and tree eval (`400`) keep arrival-order admission unless explicitly overridden.
+The pushed default full TorchInferno-only validation on `7ca6f95` then landed at
+few_shot `165.3 / 48.7 / 205.0ms`, self_consistency
+`265.6 / 0.0 / 288.2ms`, multi_turn `305.9 / 63.1 / 363.6ms`,
+tree_of_thought `243.0 / 47.5 / 294.9ms`, and long_output
+`272.1 / 25.4 / 1171.4ms`, with summary correctness rates at `1.0`.
 
 ## Current no-profile local scorecard (2026-06-28)
 
