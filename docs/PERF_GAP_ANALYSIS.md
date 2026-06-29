@@ -66,6 +66,20 @@ multi `160.9 / 117.9 / 274.9ms`, tree `63.5 / 77.4 / 157.3ms`, long
 highest-leverage work is therefore first-token/prefill scheduling for
 tree_of_thought and long_output, plus smaller few_shot E2E/TTFT cleanup.
 
+Fresh focused profiles on pushed `0c45929` keep long_output in the known
+decode/readback bucket. The queue-profiled control completed `1000/1000`
+correct at `256.9 / 26.2 / 1255.9ms`. The last queue snapshot had all
+`1000` requests finished with one `b64:s64` ragged-prefill graph capture
+(`1013ms`), `8.05s` prefill wall, `10.16s` decode-active time, `13.50s`
+decode GPU event time, and `7.27s` CPU token readback across `756` decode
+batches; fast HTTP overhead was not the median bottleneck (`217ms` p50 first
+content, `1219ms` p50 total, `23ms` p50 content-send). Disabling online
+Marlin int4 decode globally is rejected for the greedy-short long_output row:
+the focused no-profile rerun improved TTFT only slightly (`247.5ms`) but
+regressed TPOT/E2E/throughput to `27.8ms`, `1296.4ms`, and `29.4 tok/s`.
+Keep Marlin enabled for greedy short sessions; the sampled-short-only Marlin
+disable remains the scoped default.
+
 The prior same-host no-profile all-provider comparison on pushed `d363367`
 landed at SGLang `13/20`, TorchInferno `4/20`, and vLLM `2/20`. TorchInferno
 rows were: few_shot `174.5 / 50.5 / 220.0ms`, self_consistency
