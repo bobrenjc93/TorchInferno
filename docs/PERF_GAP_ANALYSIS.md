@@ -104,6 +104,20 @@ is also rejected. On current `e5b7dcc`, a paired no-profile control landed at
 only traded a small TPOT improvement for a TTFT regression and no E2E movement,
 so keep the default scoped to deterministic greedy-short traffic.
 
+A fresh tree_of_thought profile on current `2b71f1f` landed back in the normal
+TorchInferno band at `236.0 / 49.8 / 286.8ms`, `959/992` raw correct. The
+aggregate queue profile across `11` online sessions showed zero prefill graph
+misses or captures, `52` prefill graph hits, `4.55s` prefill wall, `3.03s`
+decode GPU event time, `1.35s` decode CPU-token readback, `41` submit batches,
+and `144` runtime step calls. The all-provider tree row's `312.4ms` TTFT was
+therefore a run-order outlier, not evidence of a fresh request-path graph miss.
+Extending greedy-large FP8 prefill to the deterministic 400-token evaluator
+sub-sessions is rejected. Forcing
+`TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_FP8_PREFILL_MIN_TOKENS=399` and
+`TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_FP8_PREFILL_MIN_M=256` preserved
+correctness (`965/992` raw) but regressed the median row to
+`244.1 / 51.1 / 293.2ms`. Keep the FP8 boundary at `400 < max_tokens <= 512`.
+
 ## Earlier no-profile local scorecard (2026-06-28)
 
 An earlier no-profile all-provider run on pushed `50580d6` landed at
