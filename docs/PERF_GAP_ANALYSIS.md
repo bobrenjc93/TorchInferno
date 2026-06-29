@@ -263,6 +263,33 @@ decode-many overrun; it remains sampled-medium prefill/session shape plus the
 short greedy eval decode path. Do not reopen the already rejected 16/40/64-row,
 5ms/20ms initial-wait, idle, idle-arrival, or FP8 min-M knobs from this profile.
 
+A same-host current tree rerun on pushed `cc3bd6f` plus the updated
+inference-bench request/completion metadata again shows a sampled-prefill gap,
+not a correctness or output-length artifact. TorchInferno landed at
+`236.3 / 49.1 / 282.5ms`, vLLM at `130.0 / 83.5 / 189.1ms`, and SGLang at
+`63.1 / 71.7 / 152.2ms`; all providers completed around 97% raw correct.
+TorchInferno branch requests were `225.3 / 49.4 / 272.7ms`, while greedy eval
+requests were `317.4 / 27.3 / 372.9ms`. Queue totals for sampled-medium branch
+traffic were `896` submitted requests, `43` graph-backed prefill batches, zero
+prefill graph misses/captures, `3.66s` prefill wall (`1.80s` forward),
+`1.42s` ragged-decode GPU time, and `1.24s` token harvest time. This keeps tree
+in the known sampled common-prefix suffix prefill pipeline bucket; current
+metadata now separates submitted request order from completion order for future
+public traces.
+
+Lowering the dynamic prefix-prefill minimum context from `256` to `64` for the
+tree sampled-medium suffix shape is rejected. A broad env run
+(`TORCHINFERNO_CONTINUOUS_DYNAMIC_PREFIX_PREFILL_MIN_CONTEXT=64`) looked
+promising under queue profiling, moving the row to `208.1 / 48.4 / 248.8ms` and
+cutting sampled prefill forward from `1.80s` to `1.52s`, but the no-profile
+rerun exposed a greedy-eval tail (`220.4 / 49.2 / 259.8ms`, p99 E2E
+`3001.5ms`). A scoped source patch that applied the 64-token floor only to
+sampled-medium traffic and aligned startup warmup avoided the eval tail, but did
+not beat the same-code 256-token control: scoped `64` landed at
+`221.2 / 48.6 / 271.7ms`, while explicit sampled-medium `256` landed at
+`218.0 / 48.8 / 260.6ms`. The patch was reverted; keep the dynamic prefix
+context floor at `256`.
+
 Lowering online admission granularity is rejected for sampled-medium tree. A
 focused source-free A/B forced
 `TORCHINFERNO_OPENAI_TP_ONLINE_ADMIT_PER_STEP_CAP=16` on the same pushed
