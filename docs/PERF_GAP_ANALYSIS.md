@@ -98,6 +98,15 @@ waves do not improve first-token latency enough to offset the extra graph
 replays and decode fragmentation; keep the current sampled-medium 32-row
 admission shape.
 
+Broad online step-sync removal is still rejected for tree. A focused no-profile
+run with `TORCHINFERNO_OPENAI_TP_ONLINE_STEP_SYNC=0` on `62baef8` completed
+959/992 raw correct at `245.9 / 51.0 / 295.8ms`, with p99 TTFT/E2E
+`1580.6/1685.2ms` and p99 TPOT `1012.1ms`. That is only within the recent
+no-profile tree noise band, not a stable improvement over the existing
+sampled-short-only no-sync default, and it worsens the tail token cadence. Keep
+step-sync removal scoped to sampled-short self_consistency traffic until a
+tree-specific command path shows a clear median and tail win.
+
 Fresh focused profiles on pushed `0c45929` keep long_output in the known
 decode/readback bucket. The queue-profiled control completed `1000/1000`
 correct at `256.9 / 26.2 / 1255.9ms`. The last queue snapshot had all
