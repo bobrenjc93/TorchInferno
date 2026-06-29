@@ -47,6 +47,22 @@ win. The remaining useful long-output work is still a decode/readback or
 prefill pipeline change that lowers first-token latency without fragmenting the
 decode path.
 
+A fresh tree_of_thought profile on the restored runtime keeps tree in the same
+bucket. The focused TorchInferno row on docs-only `e264162` landed at
+`252.3 / 51.6 / 303.5ms`, 97% correct. Fast-HTTP p50 first-content was
+`236.2ms` and total stream p50 was `287.9ms`, close to benchmark
+TTFT/E2E, so response serialization is not the median limiter. The six sampled
+`max_tokens=300` sessions handled `896` requests at `max_active=32` and the
+current `10ms` first collection window with zero request-path prefill captures:
+median queue-to-submit across quiescent sessions was `129.6ms`, median
+submit-to-first was `78.5ms`, sampled prefill wall totaled `3.81s`, ragged
+decode GPU time `1.56s`, and ragged token harvest `1.32s`. The six deterministic
+`max_tokens=400` eval sessions handled the remaining `96` requests with no
+prefill captures as well. This profile does not reopen sampled-medium
+max-active, initial-wait, FP8 min-M, command transport, suffix warmup, or
+sampled decode-many knobs; the remaining tree gap is still the sampled
+prefix/suffix prefill cadence plus ragged decode synchronization.
+
 ## Current 23395db refresh and greedy-short FP8 prefill (2026-06-29)
 
 Public run `20260629_165551` measured TorchInferno `23395db`, SGLang
