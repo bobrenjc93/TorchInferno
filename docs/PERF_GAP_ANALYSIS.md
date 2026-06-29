@@ -233,6 +233,21 @@ Public refresh `20260629_110323` measured TorchInferno `03677fd` against vLLM
 tree no longer has a TorchInferno TPOT win, and the dominant gaps are now
 tree/long-output first-token scheduling plus long-output decode throughput.
 
+Current long_output on pushed `78bd240` still points at the decode/readback
+pipeline rather than request-shape skew. A queue-profiled TorchInferno-only run
+completed `1000/1000` correct at `283.7 / 25.9 / 1296.6ms`, with much worse
+tails than the public no-profile row (`p99` TTFT/E2E/TPOT
+`2841.6/4174.0/261.9ms`). The profile had one online session with
+`run_max_tokens=96`, `max_active=123`, `prefix_rows=21`, `decode_quantum=3`,
+and `143` submit batches. It issued `57` graph-backed prefill batches plus one
+cold `b64:s64` graph capture, for `7.85s` prefill wall (`6.79s` forward).
+Decode remained the larger floor: `717` decode model calls, `96` decode-many
+calls over `232` steps, `12.94s` decode GPU time, and `7.81s` token-harvest
+wait. Do not reopen the broad `b64` greedy suffix warmup: it was already
+rejected for startup cost/stability, and the current profile still needs a
+pipeline change that reduces GPU decode/readback work rather than just removing
+one cold prefill capture.
+
 The pushed `642b555` full TorchInferno-only validation landed at few_shot
 `161.4 / 46.7 / 198.3ms`, self_consistency `245.3 / 0.0 / 260.3ms`,
 multi_turn `310.9 / 61.4 / 364.8ms`, tree_of_thought
