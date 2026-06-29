@@ -10,6 +10,7 @@ import threading
 import time
 import types
 import urllib.request
+from collections.abc import Iterator
 from contextlib import nullcontext
 from pathlib import Path
 
@@ -8556,6 +8557,88 @@ def test_openai_symm_mem_validation_is_openai_opt_in(monkeypatch) -> None:
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE", "1")
     OpenAICompletionEngine._warmup_tensor_parallel_model(engine)
     assert calls == [torch.device("cuda")]
+
+
+def test_openai_startup_warmup_syncs_tp_ranks_after_cuda_warmup(monkeypatch) -> None:
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_STARTUP_GRAPH_WARMUP", raising=False)
+    monkeypatch.setattr(
+        "torchinferno.openai_server._startup_scheduler_warmup_enabled",
+        lambda: False,
+    )
+
+    class FakeConfig:
+        vocab_size = 128
+
+    class FakeTPModel:
+        world_size = 2
+        config = FakeConfig()
+
+        def generate(self) -> None:
+            return None
+
+    model = FakeTPModel()
+    calls: list[tuple[str, object, object | None]] = []
+    original_arange = torch.arange
+
+    def fake_arange(*args: object, **kwargs: object) -> torch.Tensor:
+        kwargs.pop("device", None)
+        return original_arange(*args, **kwargs)
+
+    def fake_generate_single_tokens(
+        *args: object,
+        **kwargs: object,
+    ) -> Iterator[object]:
+        del args, kwargs
+        return iter(())
+
+    def fake_sync_tensor_parallel_command(
+        candidate: object,
+        device: torch.device,
+        *,
+        cuda_sync: bool | None = None,
+    ) -> None:
+        del candidate
+        calls.append(("tp_sync", device, cuda_sync))
+
+    def fake_cuda_synchronize(device: torch.device) -> None:
+        calls.append(("cuda_sync", device, None))
+
+    monkeypatch.setattr(
+        "torchinferno.openai_server._is_tensor_parallel_model",
+        lambda candidate: candidate is model,
+    )
+    monkeypatch.setattr(
+        "torchinferno.openai_server._tensor_parallel_world_size",
+        lambda candidate: 2,
+    )
+    monkeypatch.setattr(
+        "torchinferno.openai_server._tensor_parallel_symm_mem_allreduce_scope",
+        lambda *a, **k: nullcontext(),
+    )
+    monkeypatch.setattr(
+        "torchinferno.openai_server._warmup_tensor_parallel_decode_attention",
+        lambda candidate: None,
+    )
+    monkeypatch.setattr(
+        "torchinferno.openai_server._sync_tensor_parallel_command",
+        fake_sync_tensor_parallel_command,
+    )
+    monkeypatch.setattr(torch, "arange", fake_arange)
+    monkeypatch.setattr(torch.cuda, "synchronize", fake_cuda_synchronize)
+
+    engine = object.__new__(OpenAICompletionEngine)
+    engine.model = model
+    engine.device = torch.device("cuda")
+    engine.cache_backend = "dense"
+    engine._generate_single_tokens = fake_generate_single_tokens  # type: ignore[method-assign]
+    engine._generation_cache = lambda *args, **kwargs: object()  # type: ignore[method-assign]
+
+    OpenAICompletionEngine._warmup_tensor_parallel_model(engine)
+
+    assert calls[-2:] == [
+        ("cuda_sync", torch.device("cuda"), None),
+        ("tp_sync", torch.device("cuda"), False),
+    ]
 
 
 def test_openai_refill_min_ready_requests_defaults_for_short_greedy_caps(monkeypatch) -> None:

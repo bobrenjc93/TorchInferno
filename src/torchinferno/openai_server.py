@@ -6543,6 +6543,10 @@ class OpenAICompletionEngine:
                 ):
                     self._warmup_unified_scheduler_cache(vocab_size)
         torch.cuda.synchronize(self.device)
+        # Startup graph warmup can finish at different times across TP ranks.
+        # Keep workers from entering the command-listener collectives while a
+        # slower rank is still draining warmup collectives.
+        _sync_tensor_parallel_command(self.model, self.device, cuda_sync=False)
 
     def _warmup_tensor_parallel_prefill_graphs(
         self,

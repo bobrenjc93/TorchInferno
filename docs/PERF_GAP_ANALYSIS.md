@@ -13,6 +13,40 @@ tree, and long_output; the long_output row remains the broadest gap at
 `301.7 / 24.9 / 1346.9ms` versus SGLang `64.2 / 24.1 / 867.5ms` and vLLM
 `88.0 / 26.0 / 1057.4ms`.
 
+## Public run 20260628_230259 and b64 warmup rejection (2026-06-28)
+
+Public run `20260628_230259` measured TorchInferno `1702ba1`, vLLM `4dfbf15`,
+and SGLang `b9b8606`. The scorecard was TorchInferno `0/20`, vLLM `18/20`,
+and SGLang `1/20`, so the newer competitor commits erased the earlier
+few_shot TPOT public cell. TorchInferno rows were: few_shot
+`163.4 / 50.3 / 203.7ms`, self_consistency `252.2 / 0.0 / 268.9ms`,
+multi_turn `319.3 / 58.2 / 376.3ms`, tree_of_thought
+`196.2 / 57.9 / 241.2ms`, and long_output
+`338.4 / 22.8 / 1164.9ms`. The public shape matches the local no-profile
+baseline: deterministic TPOT is competitive, but first-token and E2E gaps
+remain the score-facing problem.
+
+Rechecking `b64` greedy common-prefix suffix warmup is rejected. Adding
+`64` to `TORCHINFERNO_OPENAI_WARMUP_ONLINE_GREEDY_COMMON_PREFIX_SUFFIX_BATCHES`
+first exposed a startup ordering bug: several TP workers entered the command
+listener while slower ranks were still draining startup warmup collectives,
+which made the first object-list command receive interpret a corrupted size and
+try to allocate more than `1EB`. The general fix is a post-warmup TP sync after
+local CUDA synchronization, before workers can enter command-listener
+collectives.
+
+With that ordering fixed, the same `b64` warmup no longer hit the object-list
+crash but still failed the promotion bar: after more than seven minutes before
+readiness, six ranks had logged FlashInfer decode graph completion while ranks
+0 and 7 were still active in `_warmup_flashinfer_decode_graphs` under
+`marlin_int4_mm`. The run was stopped before requests. Keep default greedy
+suffix warmup at `1,2,4,8,16,32`; avoiding one request-path `b64:s64` capture
+is not worth the startup cost or stability risk from this broader warmup shape.
+The normal default warmup path remains healthy with the startup barrier: a
+focused long_output retry reached readiness in `165.7s`, completed `1000/1000`
+correct requests, and landed at `281.6 / 25.5 / 1337.3ms` with
+`30.3 tok/s`.
+
 ## Greedy-large multi_turn suffix bucket refinement (2026-06-28)
 
 Current multi_turn is still conversation-prefix prefill dominated, but the
