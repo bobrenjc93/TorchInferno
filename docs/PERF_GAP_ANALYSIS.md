@@ -1,9 +1,9 @@
 # TorchInferno vs vLLM/sglang — Performance Gap Analysis (Llama-3.1-70B, 8xH100)
 
-## Current 726ffad refresh and rejected follow-ups (2026-06-28)
+## Current 642b555/82e9d83 refresh and rejected follow-ups (2026-06-28/29)
 
 A same-host no-profile all-provider comparison on pushed `726ffad` is the
-current local source baseline. The scorecard was SGLang `12/20`,
+earlier local source baseline. The scorecard was SGLang `12/20`,
 TorchInferno `4/20`, and vLLM `3/20`. TorchInferno rows were: few_shot
 `170.6 / 49.7 / 213.2ms`, self_consistency `231.9 / 0.0 / 364.4ms`,
 multi_turn `320.3 / 61.6 / 379.1ms`, tree_of_thought
@@ -22,6 +22,16 @@ tree_of_thought `189.1 / 58.2 / 232.7ms`, and long_output
 greedy-short prefill-cost priority default, but the competitor movement is the
 important signal: public vLLM now wins even few_shot, tree_of_thought, and
 long_output TPOT, so local TPOT wins are not enough to close the public gap.
+
+The latest public run `20260629_050254` measured TorchInferno `642b555`,
+vLLM `4559c43`, and SGLang `38d4ffc`. The scorecard was TorchInferno `1/20`,
+vLLM `15/20`, and SGLang `3/20`. TorchInferno rows were few_shot
+`165.6 / 47.2 / 208.0ms`, self_consistency `269.2 / 0.0 / 287.5ms`,
+multi_turn `321.4 / 61.4 / 381.7ms`, tree_of_thought
+`192.9 / 57.2 / 239.5ms`, and long_output `316.8 / 23.0 / 1117.0ms`.
+The sampled-short Marlin default won one public TPOT cell, but public vLLM
+still owns nearly all TTFT/E2E/throughput cells; the remaining work has to
+reduce request-wave latency and not just token compute.
 
 Runtime Marlin int4 decode is now disabled by default only for sampled-short
 online sessions (`temperature > 0`, `max_tokens <= 256`). The global env
@@ -92,6 +102,21 @@ confirmation was not stable either: `267.6 / 25.0 / 1344.0ms`, 1000/1000
 correct, with `7.98s` prefill wall, `12.34s` decode GPU event time, and `7.48s`
 CPU token readback. The prototype was backed out; a single common-prefix logits
 skip is not enough for few_shot or long_output.
+
+Self-consistency finish-path follow-ups are also rejected. A fresh no-env
+control on pushed `82e9d83` landed at `200.7 / 0.0 / 314.4ms`, `1000/1000`
+correct. The queue profile confirms the model compute is already mostly out of
+the way for this row: a single generated-prefix cache fill served the repeated
+prompts, with `978` generated-prefix reuses, one prefill/decode batch, but
+`199` submit batches, `185` runtime step calls, `575.8ms` submit-sync time, and
+`2.90s` total runtime phase time. Lowering only the sampled-short idle wait to
+`2ms` made the row worse at `330.4 / 0.0 / 353.6ms`, with `244` submit batches
+and `3.18s` phase time. An exact-prefix event-interleaving source prototype,
+which emitted first and stop events per reused request instead of all first
+tokens followed by all stops, also regressed to `316.2 / 0.0 / 342.1ms`, with
+`250` submit batches and `3.03s` phase time. That prototype was backed out.
+The next self_consistency improvement needs to change the finish/request-wave
+shape more substantially than event ordering or a smaller idle wait.
 
 The prior same-host no-profile all-provider comparison on pushed `d363367`
 landed at SGLang `13/20`, TorchInferno `4/20`, and vLLM `2/20`. TorchInferno
