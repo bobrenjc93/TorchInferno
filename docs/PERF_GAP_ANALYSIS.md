@@ -119,6 +119,15 @@ long_output change still needs to reduce first-token queueing and tail
 decode/readback behavior; a median-only TPOT improvement is unlikely to move the
 score.
 
+Disabling online step sync for deterministic 256-token few_shot is rejected.
+The focused no-profile run with `TORCHINFERNO_OPENAI_TP_ONLINE_STEP_SYNC=0` on
+`536f14e` completed 978/1000 raw correct at `164.7 / 50.6 / 206.1ms`, with p99
+TTFT/E2E/TPOT `2062.6/2663.1/714.7ms`. That does not improve the current
+TTFT/E2E band and gives away TPOT versus the recent default few_shot rows
+(`161.4 / 46.7 / 198.3ms` full TorchInferno-only and public
+`165.6 / 47.2 / 208.0ms`). Keep the no-step-sync default scoped to
+sampled-short self_consistency.
+
 Fresh focused profiles on pushed `0c45929` keep long_output in the known
 decode/readback bucket. The queue-profiled control completed `1000/1000`
 correct at `256.9 / 26.2 / 1255.9ms`. The last queue snapshot had all
