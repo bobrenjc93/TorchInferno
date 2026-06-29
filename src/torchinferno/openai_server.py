@@ -4627,26 +4627,26 @@ class OpenAICompletionEngine:
                         ):
                             record_online_profile("online_batcher_progress")
                             last_quiescent_profile_commands = online_step_commands
-                        if wait_and_drain(step, idle_wait_s) == 0:
-                            if (
-                                all_submitted_finished
-                                and profile_queue
-                                and online_step_commands != last_quiescent_aggregate_commands
-                                and (persistent or persistent_idle_s > 0.0)
-                            ):
-                                quiescent_profile_fields: dict[str, object] = {
-                                    "profile_waiting_for_next_request": True,
-                                }
-                                if not persistent:
-                                    quiescent_profile_fields["profile_pending_idle_timeout_ms"] = round(
-                                        persistent_idle_s * 1000.0,
-                                        3,
-                                    )
-                                record_online_profile(
-                                    "online_batcher_quiescent",
-                                    **quiescent_profile_fields,
+                        if (
+                            all_submitted_finished
+                            and profile_queue
+                            and online_step_commands != last_quiescent_aggregate_commands
+                            and (persistent or persistent_idle_s > 0.0)
+                        ):
+                            quiescent_profile_fields: dict[str, object] = {
+                                "profile_waiting_for_next_request": True,
+                            }
+                            if not persistent:
+                                quiescent_profile_fields["profile_pending_idle_timeout_ms"] = round(
+                                    persistent_idle_s * 1000.0,
+                                    3,
                                 )
-                                last_quiescent_aggregate_commands = online_step_commands
+                            record_online_profile(
+                                "online_batcher_quiescent",
+                                **quiescent_profile_fields,
+                            )
+                            last_quiescent_aggregate_commands = online_step_commands
+                        if wait_and_drain(step, idle_wait_s) == 0:
                             if persistent:
                                 next_item = self._generation_queue.get()
                             else:

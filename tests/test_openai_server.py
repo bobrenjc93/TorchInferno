@@ -13459,7 +13459,7 @@ def test_openai_tensor_parallel_online_batcher_records_profile_snapshots(
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_CONTINUOUS_BATCHER", "1")
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_DECODE_QUANTUM", "1")
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_INITIAL_BATCH_WAIT_MS", "0")
-    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_IDLE_BATCH_WAIT_MS", "0")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_IDLE_BATCH_WAIT_MS", "5")
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_PREFIX_ROWS", "1")
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_MAX_SEQ_LEN_HEADROOM_TOKENS", "0")
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_PREFILL_TOKEN_BUDGET", "0")
@@ -13497,19 +13497,24 @@ def test_openai_tensor_parallel_online_batcher_records_profile_snapshots(
     engine.model = model
     engine.stop_token_ids = frozenset()
     engine.max_batch_size = 4
+    observed_events_before_idle_wait: list[str] = []
     observed_events_before_idle_timeout: list[str] = []
+
+    def profile_events() -> list[str]:
+        if not profile_path.exists():
+            return []
+        return [json.loads(line)["event"] for line in profile_path.read_text().splitlines()]
 
     class EmptyQueueWithProfileObservation:
         def get_nowait(self) -> object:
+            events = profile_events()
+            if "online_batcher_quiescent" in events:
+                observed_events_before_idle_wait[:] = events
             raise queue.Empty
 
         def get(self, timeout: float | None = None) -> object:
             del timeout
-            if profile_path.exists():
-                lines = profile_path.read_text().splitlines()
-                observed_events_before_idle_timeout[:] = [
-                    json.loads(line)["event"] for line in lines
-                ]
+            observed_events_before_idle_timeout[:] = profile_events()
             raise queue.Empty
 
         def put(self, item: object) -> None:
@@ -13522,6 +13527,11 @@ def test_openai_tensor_parallel_online_batcher_records_profile_snapshots(
     engine._run_tensor_parallel_online_batcher(first)
 
     assert _queue_items(first_queue) == [801, 802, 803, _GenerationDone()]
+    assert observed_events_before_idle_wait == [
+        "online_batcher_progress",
+        "online_batcher_progress",
+        "online_batcher_quiescent",
+    ]
     assert observed_events_before_idle_timeout == [
         "online_batcher_progress",
         "online_batcher_progress",
@@ -13552,7 +13562,7 @@ def test_openai_tensor_parallel_online_batcher_records_profile_snapshots(
     assert records[3]["runtime_decode_tokens"] == 3
     assert records[3]["requested_max_batch"] == 4
     assert records[3]["initial_wait_ms"] == 0.0
-    assert records[3]["idle_batch_wait_ms"] == 0.0
+    assert records[3]["idle_batch_wait_ms"] == 5.0
     assert records[3]["collect_idle_arrivals"] is False
     assert records[3]["admit_min_ready_requests"] == 12
     assert records[3]["admit_per_step_cap"] == 64
