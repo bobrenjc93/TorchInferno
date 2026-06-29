@@ -370,8 +370,17 @@ def _online_decode_quantum(*, temperature: float, max_tokens: int) -> int:
 def _online_decode_many_enabled(*, temperature: float, max_tokens: int) -> bool:
     if "TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY" in os.environ:
         return env_flag("TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY", False)
-    if temperature > 0.0 or max_tokens < 1:
+    if max_tokens < 1:
         return False
+    if temperature > 0.0:
+        sampled_max_tokens = env_int(
+            "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_DECODE_MANY_MAX_TOKENS",
+            400,
+            minimum=1,
+        )
+        if max_tokens > sampled_max_tokens:
+            return False
+        return env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_DECODE_MANY", False)
     greedy_short_max_tokens = env_int(
         "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_GEN_MAX_TOKENS",
         128,
@@ -387,6 +396,8 @@ def _online_decode_many_allow_stop_enabled(*, temperature: float, max_tokens: in
         return env_flag("TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY_ALLOW_STOP", False)
     if not _online_decode_many_enabled(temperature=temperature, max_tokens=max_tokens):
         return False
+    if temperature > 0.0:
+        return env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_DECODE_MANY_ALLOW_STOP", True)
     greedy_short_max_tokens = env_int(
         "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_GEN_MAX_TOKENS",
         128,

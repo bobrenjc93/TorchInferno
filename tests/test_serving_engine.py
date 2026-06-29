@@ -3302,6 +3302,51 @@ def test_continuous_batch_engine_online_many_can_overcompute_stop_tokens(monkeyp
     assert model.ragged_logits_graph_calls == 3
 
 
+def test_continuous_batch_engine_online_many_requires_sampled_stop_overcompute(monkeypatch) -> None:
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_UNIFORM_RAGGED_DECODE", "1")
+    engine = ContinuousBatchEngine(
+        _RaggedGraphToyModel(vocab_size=128),
+        device=torch.device("cpu"),
+        temperature=0.7,
+        max_active_requests=2,
+        prefix_cache_capacity=0,
+        enable_ragged_decode=True,
+        store_reusable_prefixes=False,
+        enable_decode_many=True,
+        decode_many_allow_stop=False,
+    )
+    engine.start_online(max_seq_len=16)
+    engine.submit_online(ServingRequest("a", (1, 2, 3), 4, arrival_step=0))
+    engine.submit_online(ServingRequest("b", (3, 4, 5), 4, arrival_step=0))
+
+    first = engine.step_online()
+    events, steps = engine.step_online_many(8)
+
+    assert [(event.request_id, event.token, event.generated, event.finished) for event in first] == [
+        ("a", 4, 1, False),
+        ("b", 6, 1, False),
+    ]
+    assert steps == 1
+    assert [(event.request_id, event.token, event.generated, event.finished) for event in events] == [
+        ("a", 5, 2, False),
+        ("b", 7, 2, False),
+    ]
+    assert engine.stats.decode_many_calls == 0
+
+    engine.decode_many_allow_stop = True
+    events, steps = engine.step_online_many(8)
+
+    assert steps == 2
+    assert [(event.request_id, event.token, event.generated, event.finished) for event in events] == [
+        ("a", 6, 3, False),
+        ("b", 8, 3, False),
+        ("a", 7, 4, True),
+        ("b", 9, 4, True),
+    ]
+    assert engine.stats.decode_many_calls == 1
+    assert not engine.has_online_work()
+
+
 def test_continuous_batch_engine_online_finishes_on_stop_token_ids() -> None:
     model = _RaggedGraphToyModel(vocab_size=128)
     engine = ContinuousBatchEngine(

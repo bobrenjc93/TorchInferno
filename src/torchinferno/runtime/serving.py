@@ -652,7 +652,9 @@ class ContinuousBatchEngine:
         waiting = self._online_waiting
         if waiting or self._online_prefilling or not self._online_active:
             return False
-        if self.unified_forward or not self.decode_first or self.temperature > 0.0:
+        if self.unified_forward or not self.decode_first:
+            return False
+        if self.temperature > 0.0 and not self.decode_many_allow_stop:
             return False
         if (
             any(state.request.stop_token_ids for state in self._online_active)

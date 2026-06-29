@@ -8799,8 +8799,16 @@ def test_openai_online_decode_many_defaults_on_for_short_greedy(monkeypatch) -> 
 
 
 def test_openai_online_decode_many_respects_env_overrides(monkeypatch) -> None:
-    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY", "1")
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_DECODE_MANY", raising=False)
+    assert not _online_decode_many_enabled(temperature=0.7, max_tokens=400)
+
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_DECODE_MANY", "1")
     assert _online_decode_many_enabled(temperature=0.7, max_tokens=400)
+    assert _online_decode_many_allow_stop_enabled(temperature=0.7, max_tokens=400)
+    assert not _online_decode_many_enabled(temperature=0.7, max_tokens=401)
+
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY", "1")
+    assert _online_decode_many_enabled(temperature=0.7, max_tokens=401)
 
     monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY", "0")
     assert not _online_decode_many_enabled(temperature=0.0, max_tokens=64)

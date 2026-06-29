@@ -5343,6 +5343,16 @@ prefill ahead of decode; it needs either faster suffix prefill or a pipeline
 that overlaps ordinary ragged decode synchronization without losing the
 decode-many/e2e balance.
 
+Sampled decode-many is also only a diagnostic probe. Tree-of-thought on current
+`fd3bebb` with queue profiling landed at `256.2 / 50.3 / 307.8ms` locally.
+Enabling `TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_DECODE_MANY=1` improved median
+TTFT to `216.5ms` and E2E to `294.7ms`, but regressed TPOT to `77.0ms`. The
+profile explains the loss: batched sampled decode cut ordinary decode CPU wait
+from `1.46s` to `0.86s`, but decode GPU rose from `3.73s` to `6.59s` because
+the run speculatively decoded `1185` tokens that were skipped after EOS
+(`778` stop finishes). Keep sampled decode-many off by default; it is useful
+only to measure CPU sync pressure on sampled workloads without early stops.
+
 ## In-flight, validated-locally-but-NOT-benchmarked commits
 
 The public results directory is still latest at `20260629_130308`; that run
