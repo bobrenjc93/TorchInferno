@@ -237,6 +237,8 @@ class ServingStats:
     prefill_setup_ms: float = 0.0
     prefill_sample_ms: float = 0.0
     prefill_state_ms: float = 0.0
+    prefill_shape_wall_ms: dict[str, float] = field(default_factory=dict)
+    prefill_shape_forward_ms: dict[str, float] = field(default_factory=dict)
     decode_ragged_prepare_ms: float = 0.0
     decode_ragged_model_ms: float = 0.0
     decode_ragged_model_gpu_ms: float = 0.0
@@ -1862,15 +1864,16 @@ class ContinuousBatchEngine:
                     source_prefix_rows.append(source_prefix_rows[0])
             if not mixed_prefixes and len(set(source_prefix_rows)) == 1:
                 source_prefix_rows = [source_prefix_rows[0]]
-            self._record_shape_count(
-                self.stats.prefill_shape_counts,
+            shape_key = (
                 "prefix_graph:"
                 f"b{batch_bucket}:"
                 f"s{suffix_bucket}:"
                 f"p{min(prefix_hits)}-{max(prefix_hits)}:"
                 f"src{len(source_prefix_rows)}:"
-                f"mixed{int(mixed_prefixes)}",
+                f"mixed{int(mixed_prefixes)}"
             )
+            self._record_shape_count(self.stats.prefill_shape_counts, shape_key)
+            shape_wall_start_s = copy_start_s
             if self.profile_timings:
                 self.stats.prefill_copy_ms += (time.perf_counter() - copy_start_s) * 1000.0
             setup_start_s = time.perf_counter() if self.profile_timings else 0.0
@@ -1910,7 +1913,13 @@ class ContinuousBatchEngine:
             if self.profile_timings and logits is not None:
                 # force the prefill graph/forward to complete for honest timing
                 torch.cuda.synchronize(self.device) if self.device.type == "cuda" else None
-                self.stats.prefill_forward_ms += (time.perf_counter() - forward_start_s) * 1000.0
+                forward_elapsed_ms = (time.perf_counter() - forward_start_s) * 1000.0
+                self.stats.prefill_forward_ms += forward_elapsed_ms
+                self._record_shape_time(
+                    self.stats.prefill_shape_forward_ms,
+                    shape_key,
+                    forward_elapsed_ms,
+                )
             for pad_row in pad_rows:
                 self._release_active_row(pad_row)
             pad_rows = []
@@ -1956,6 +1965,11 @@ class ContinuousBatchEngine:
                 active.append(state)
             if self.profile_timings:
                 self.stats.prefill_state_ms += (time.perf_counter() - state_start_s) * 1000.0
+                self._record_shape_time(
+                    self.stats.prefill_shape_wall_ms,
+                    shape_key,
+                    (time.perf_counter() - shape_wall_start_s) * 1000.0,
+                )
             return active
         except Exception:
             for pad_row in pad_rows:
@@ -4438,6 +4452,16 @@ class ContinuousBatchEngine:
         if not self.profile_timings:
             return
         counts[key] = counts.get(key, 0) + 1
+
+    def _record_shape_time(
+        self,
+        timings: dict[str, float],
+        key: str,
+        elapsed_ms: float,
+    ) -> None:
+        if not self.profile_timings:
+            return
+        timings[key] = timings.get(key, 0.0) + float(elapsed_ms)
 
     def _record_prefix_reuse(
         self,

@@ -5255,6 +5255,20 @@ handling and client stream observation. Raising
 `328.4 -> 314.6ms`; disabling keepalive regressed to `323.4 / 344.0ms`.
 Promote the 512-worker fast HTTP default, but keep keepalive enabled.
 
+The public `20260629_130308` refresh still measured stale TorchInferno
+`bd17332`, so it does not include the cached sampler-state or HTTP-worker
+changes above. On current `a8467f2`, the multi_turn row remains server-side:
+the local TorchInferno-only run landed at `320.2 / 62.1 / 378.2ms`, with p50
+queue-to-submit `104.6ms`, submit-to-first `139.9ms`, `4.71s` prefill wall, and
+`2.72s` ragged decode GPU time. Queue-profile snapshots now include per-shape
+prefix-graph prefill wall and forward timings. The largest actual prefill wall
+buckets were `b32:s128` (`1297ms` over 8 calls), `b32:s160` (`1009ms` over 5
+calls), and `b32:s96` (`922ms` over 7 calls), confirming that large suffix
+prefill dominates the current multi_turn TTFT path. Enabling prefill-cost
+admission priority is rejected: it shifted more waves into `s160`, increased
+prefill wall to `5.00s`, decode GPU time to `3.82s`, and regressed the row to
+`341.7 / 62.7 / 403.0ms`.
+
 ## In-flight, validated-locally-but-NOT-benchmarked commits
 
 The inference-bench harness has been frozen on `25260c0` for many hours, so these

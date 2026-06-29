@@ -5069,6 +5069,19 @@ class OpenAICompletionEngine:
                     key=lambda item: (-int(item[1]), str(item[0])),
                 )[:32]
                 record[f"runtime_{name}"] = {str(key): int(count) for key, count in top_counts}
+        for name in (
+            "prefill_shape_wall_ms",
+            "prefill_shape_forward_ms",
+        ):
+            value = getattr(stats, name, None)
+            if isinstance(value, Mapping):
+                top_timings = sorted(
+                    value.items(),
+                    key=lambda item: (-float(item[1]), str(item[0])),
+                )[:32]
+                record[f"runtime_{name}"] = {
+                    str(key): float(elapsed_ms) for key, elapsed_ms in top_timings
+                }
         self._record_queue_profile(record)
 
     def _reset_stream_group_profile_extra(self) -> None:
