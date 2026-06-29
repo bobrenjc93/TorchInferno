@@ -139,6 +139,21 @@ last-turn TTFT dropped to `395.3ms`, so conversation-prefix reuse is helping
 after the first wave, but the initial admission/prefix-fill path is still too
 slow and has a `3199.8ms` p99 TTFT tail.
 
+A focused TorchInferno-only multi_turn queue profile on current `cf3e3c1`
+keeps the same conclusion and rules out missed graph coverage on the default
+shared-prefix route. The row landed at `337.2 / 64.8 / 395.7ms`, `981/1000`
+raw correct, with first-turn TTFT average `1092.8ms` and last-turn average
+`402.9ms`. The online session submitted all `1000` requests through `34`
+prefill batches, all graph hits and zero captures/misses, with `4.72s`
+prefill wall (`4.10s` forward) and `3.58s` decode-active time. Prefix reuse was
+exactly `45,000` tokens (`45` shared system-prefix tokens x `1000` requests),
+with no generated/finished-prefix reuse. The remaining multi_turn gap is
+efficient per-conversation prefix reuse or a faster mixed-prefix suffix path;
+the current common-prefix graph path itself is already warm and stable. The
+inference-bench harness now records multi_turn conversation/turn metadata and
+first/last-turn median/p99 TTFTs (`8101d771`) so future public runs expose this
+shape directly.
+
 Fresh focused profiles on pushed `0c45929` keep long_output in the known
 decode/readback bucket. The queue-profiled control completed `1000/1000`
 correct at `256.9 / 26.2 / 1255.9ms`. The last queue snapshot had all
