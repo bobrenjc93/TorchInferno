@@ -24,6 +24,17 @@ edited-checkout no-env validation landed at `254.1 / 25.7 / 1238.6ms`, again
 1000/1000 correct. This policy is intentionally below few_shot's 256-token
 greedy bucket and does not affect sampled self_consistency/tree traffic.
 
+The next self_consistency profile on `3bff181` reconfirmed that the
+score-facing median includes client/request-wave time outside the handler:
+fast-HTTP p50 first-content was `14ms` while benchmark p50 TTFT was `262ms`.
+Server counters still exposed one real cleanup: cached repeated sampling spent
+`1115ms` across `464` tiny sample-state hits. A repeated-sample token reservoir
+cut that sampled-state time to `92ms` and improved fast-HTTP p50/p90
+first-content (`14/420ms -> 8/414ms`) with 1000/1000 correctness. The profiled
+benchmark row improved TTFT but not E2E (`228.7 / 0.0 / 348.9ms`), and a
+no-profile check was mixed (`320.1 / 0.0 / 346.4ms`), so this is a server-side
+control-plane cleanup rather than a claimed score flip.
+
 ## Current 8bf4c1c public refresh and prompt-cache follow-up (2026-06-29)
 
 Public run `20260629_161720` measured TorchInferno `8bf4c1c`, SGLang

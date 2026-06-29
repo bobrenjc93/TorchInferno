@@ -1201,6 +1201,8 @@ class _RepeatedTemperatureSampleState:
     temperature: float
     cumulative_local: Tensor
     rank_cumulative: Tensor | None
+    cached_tokens: Tensor | None = None
+    cached_offset: int = 0
 
 
 @dataclass
@@ -4593,7 +4595,6 @@ class Llama3TensorParallelForCausalLM:
         import flashinfer
 
         device = self.device
-        max_seq = cache.layers[0].max_seq_len
         graphs = getattr(self, "_fi_prefill_graphs", None)
         if graphs is None:
             graphs = {}
@@ -5388,20 +5389,39 @@ class Llama3TensorParallelForCausalLM:
         ):
             return None
         cumulative_local = state.cumulative_local
+        prefetch = _tp_int(
+            "TORCHINFERNO_TEMPERATURE_SAMPLE_REPEATED_STATE_PREFETCH",
+            128,
+            minimum=0,
+        )
+        if prefetch > 0 and state.cached_tokens is not None:
+            cached_offset = max(0, int(state.cached_offset))
+            cached_end = cached_offset + batch_size
+            if cached_end <= int(state.cached_tokens.numel()):
+                state.cached_offset = cached_end
+                return state.cached_tokens[cached_offset:cached_end]
+            state.cached_tokens = None
+            state.cached_offset = 0
+        sample_count = max(batch_size, prefetch) if prefetch > 0 else batch_size
         if not dist.is_available() or not dist.is_initialized():
             threshold = torch.rand(
-                (batch_size,),
+                (sample_count,),
                 dtype=cumulative_local.dtype,
                 device=cumulative_local.device,
             ) * cumulative_local[-1]
-            return torch.searchsorted(cumulative_local, threshold)
+            sampled = torch.searchsorted(cumulative_local, threshold)
+            if sample_count > batch_size:
+                state.cached_tokens = sampled
+                state.cached_offset = batch_size
+                return sampled[:batch_size]
+            return sampled
         rank_cumulative = state.rank_cumulative
         if rank_cumulative is None:
             return None
-        sample_payload = torch.empty((2, batch_size), dtype=torch.float32, device=cumulative_local.device)
+        sample_payload = torch.empty((2, sample_count), dtype=torch.float32, device=cumulative_local.device)
         if self.is_primary:
             target = torch.rand(
-                (batch_size,),
+                (sample_count,),
                 dtype=rank_cumulative.dtype,
                 device=rank_cumulative.device,
             ) * rank_cumulative[-1]
@@ -5424,6 +5444,10 @@ class Llama3TensorParallelForCausalLM:
             torch.zeros_like(local_index),
         )
         dist.all_reduce(local_token, op=dist.ReduceOp.SUM)
+        if sample_count > batch_size:
+            state.cached_tokens = local_token
+            state.cached_offset = batch_size
+            return local_token[:batch_size]
         return local_token
 
     def _sample_next_token_greedy(self, logits: Tensor) -> Tensor:

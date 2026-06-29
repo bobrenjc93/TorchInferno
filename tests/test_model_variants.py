@@ -813,6 +813,7 @@ def test_llama3_tensor_parallel_repeated_sample_state_samples_cached_cdf(monkeyp
 
     monkeypatch.setattr(dist, "is_available", lambda: False)
     monkeypatch.setattr(dist, "is_initialized", lambda: False)
+    monkeypatch.delenv("TORCHINFERNO_TEMPERATURE_SAMPLE_REPEATED_STATE_PREFETCH", raising=False)
 
     model = object.__new__(Llama3TensorParallelForCausalLM)
     logits = torch.tensor([[1000.0, -1000.0, -1000.0, -1000.0]])
@@ -823,6 +824,29 @@ def test_llama3_tensor_parallel_repeated_sample_state_samples_cached_cdf(monkeyp
     assert sampled is not None
     assert sampled.tolist() == [0, 0, 0]
     assert model.sample_repeated_next_token_from_state(state, batch_size=3, temperature=0.8) is None
+
+
+def test_llama3_tensor_parallel_repeated_sample_state_prefetches_tokens(monkeypatch) -> None:
+    import torch.distributed as dist
+
+    monkeypatch.setattr(dist, "is_available", lambda: False)
+    monkeypatch.setattr(dist, "is_initialized", lambda: False)
+    monkeypatch.setenv("TORCHINFERNO_TEMPERATURE_SAMPLE_REPEATED_STATE_PREFETCH", "5")
+
+    model = object.__new__(Llama3TensorParallelForCausalLM)
+    logits = torch.tensor([[1000.0, -1000.0, -1000.0, -1000.0]])
+    state = model.prepare_repeated_next_token_state(logits, temperature=0.7)
+
+    first = model.sample_repeated_next_token_from_state(state, batch_size=2, temperature=0.7)
+    assert first is not None
+    assert first.tolist() == [0, 0]
+    assert state.cached_tokens is not None
+    assert int(state.cached_offset) == 2
+
+    second = model.sample_repeated_next_token_from_state(state, batch_size=3, temperature=0.7)
+    assert second is not None
+    assert second.tolist() == [0, 0, 0]
+    assert int(state.cached_offset) == 5
 
 
 def _write_tiny_llama3_hf_checkpoint(reference: Llama3V0ForCausalLM, config, path) -> None:
