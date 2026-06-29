@@ -118,6 +118,18 @@ tokens followed by all stops, also regressed to `316.2 / 0.0 / 342.1ms`, with
 The next self_consistency improvement needs to change the finish/request-wave
 shape more substantially than event ordering or a smaller idle wait.
 
+Combining submit+step for newly idle sampled-short waves is rejected. The
+existing combined submit-step command remains useful only when runtime work was
+already active before the drain. A source prototype also sent
+`steps_after_submit` on idle self_consistency waves so the worker could process
+the new exact-prefix requests without a separate step command. Focused
+self_consistency regressed to `312.2 / 0.0 / 333.8ms`, 1000/1000 correct.
+Queue counters explain the loss: submit batches rose `199 -> 265`, runtime step
+calls `185 -> 224`, idle-wait drain time `116.3ms -> 251.4ms`, and runtime
+prefill wall `1.73s -> 1.89s`, while step-broadcast time was only `9.5ms` in
+the control. The extra command fusion changed arrival/drain pacing more than it
+saved coordination overhead, so the prototype was backed out.
+
 The prior same-host no-profile all-provider comparison on pushed `d363367`
 landed at SGLang `13/20`, TorchInferno `4/20`, and vLLM `2/20`. TorchInferno
 rows were: few_shot `174.5 / 50.5 / 220.0ms`, self_consistency
