@@ -1,5 +1,29 @@
 # TorchInferno vs vLLM/sglang — Performance Gap Analysis (Llama-3.1-70B, 8xH100)
 
+## Current 8bf4c1c public refresh and prompt-cache follow-up (2026-06-29)
+
+Public run `20260629_161720` measured TorchInferno `8bf4c1c`, SGLang
+`643e1cc`, and the current vLLM environment. The scorecard is SGLang `12/20`,
+TorchInferno `5/20`, and vLLM `2/20`. TorchInferno rows are few_shot
+`164.2 / 48.7 / 204.9ms`, self_consistency `213.3 / 0.0 / 325.9ms`,
+multi_turn `320.2 / 58.9 / 380.3ms`, tree_of_thought
+`270.2 / 47.8 / 314.0ms`, and long_output `283.0 / 25.3 / 1193.3ms`.
+TorchInferno now wins few_shot TPOT/E2E, self_consistency TTFT, and the
+multi_turn/tree TPOT cells, but still loses most TTFT/E2E/throughput cells.
+
+A focused self_consistency profile on `8bf4c1c` kept the known split between
+server runtime work and benchmark/client-side latency. With queue profiling,
+TorchInferno landed at `311.8 / 0.0 / 332.0ms`; fast-HTTP profiling landed at
+`313.3 / 0.0 / 340.1ms` and showed server-side p50 first content around
+`15ms` after the request body was ready, with `872/1000` requests below `50ms`
+on that server-side clock. The unexplained median gap is still before or around
+HTTP request arrival rather than token compute. A prompt token-cache
+single-flight follow-up prevents identical prompt bursts from running duplicate
+chat-template tokenization on concurrent cache misses. It is a general
+control-plane cleanup, not a claimed score flip: the focused dirty-tree
+confirmation was neutral/slightly positive at `311.3 / 0.0 / 334.6ms`,
+1000/1000 correct.
+
 ## Current 642b555/82e9d83 refresh and rejected follow-ups (2026-06-28/29)
 
 A same-host no-profile all-provider comparison on pushed `726ffad` is the

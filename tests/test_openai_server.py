@@ -2828,6 +2828,85 @@ def test_openai_engine_caches_encoded_chat_prompts(monkeypatch) -> None:
     assert tokenizer.calls == 1
 
 
+def test_openai_engine_prompt_token_cache_singleflights_concurrent_misses(monkeypatch) -> None:
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_PROMPT_TOKEN_CACHE_MAX_ENTRIES", "8")
+
+    class SlowCountingTokenizer(_CountingPromptTokenizer):
+        def __init__(self) -> None:
+            super().__init__()
+            self.started = threading.Event()
+            self.release = threading.Event()
+            self._calls_lock = threading.Lock()
+
+        def encode_messages(self, messages: list[dict[str, object]]) -> list[int]:
+            with self._calls_lock:
+                self.calls += 1
+                call = self.calls
+            self.started.set()
+            if not self.release.wait(timeout=5):
+                raise AssertionError("timed out waiting to release tokenizer")
+            content = str(messages[-1]["content"])
+            return [len(content), call]
+
+    tokenizer = SlowCountingTokenizer()
+    engine = _cache_only_engine()
+    engine.tokenizer = tokenizer
+    engine.max_model_len = None
+    messages = [{"role": "user", "content": "same"}]
+    parties = 8
+    barrier = threading.Barrier(parties + 1)
+    results: list[list[int] | None] = [None] * parties
+    errors: list[BaseException] = []
+
+    def run(index: int) -> None:
+        try:
+            barrier.wait(timeout=5)
+            results[index] = engine._encode_chat_prompt(messages, max_tokens=1)
+        except BaseException as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=run, args=(index,)) for index in range(parties)]
+    for thread in threads:
+        thread.start()
+    barrier.wait(timeout=5)
+    assert tokenizer.started.wait(timeout=5)
+    time.sleep(0.05)
+    assert tokenizer.calls == 1
+
+    tokenizer.release.set()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert errors == []
+    assert results == [[4, 1]] * parties
+    assert tokenizer.calls == 1
+
+
+def test_openai_engine_prompt_token_cache_retries_after_encode_failure(monkeypatch) -> None:
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_PROMPT_TOKEN_CACHE_MAX_ENTRIES", "2")
+
+    class FailOnceTokenizer(_CountingPromptTokenizer):
+        def encode_messages(self, messages: list[dict[str, object]]) -> list[int]:
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("encode failed")
+            content = str(messages[-1]["content"])
+            return [len(content), self.calls]
+
+    tokenizer = FailOnceTokenizer()
+    engine = _cache_only_engine()
+    engine.tokenizer = tokenizer
+    engine.max_model_len = None
+    messages = [{"role": "user", "content": "same"}]
+
+    with pytest.raises(RuntimeError, match="encode failed"):
+        engine._encode_chat_prompt(messages, max_tokens=1)
+
+    assert engine._encode_chat_prompt(messages, max_tokens=1) == [4, 2]
+    assert engine._encode_chat_prompt(messages, max_tokens=1) == [4, 2]
+    assert tokenizer.calls == 2
+
+
 def test_openai_engine_prompt_token_cache_can_be_disabled(monkeypatch) -> None:
     monkeypatch.setenv("TORCHINFERNO_OPENAI_PROMPT_TOKEN_CACHE_MAX_ENTRIES", "0")
     tokenizer = _CountingPromptTokenizer()

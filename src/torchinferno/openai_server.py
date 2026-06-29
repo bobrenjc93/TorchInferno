@@ -2494,6 +2494,7 @@ class OpenAICompletionEngine:
         self._prefix_cache_entries: dict[tuple[int, ...], TensorPrefixCacheEntry] = {}
         self._prompt_logits_cache: dict[tuple[int, ...], Tensor] = {}
         self._prompt_token_cache: dict[tuple[tuple[str, Hashable], ...], list[int]] = {}
+        self._prompt_token_cache_inflight: dict[tuple[tuple[str, Hashable], ...], threading.Event] = {}
         self._prompt_token_cache_lock = threading.Lock()
         self._phase_timing_enabled = env_flag("TORCHINFERNO_OPENAI_PHASE_TIMINGS")
         self._phase_records: list[dict[str, float]] = []
@@ -2606,18 +2607,38 @@ class OpenAICompletionEngine:
             return self.tokenizer.encode_messages(messages)
         cache_key = _chat_prompt_cache_key(messages)
         cache = self._prompt_token_cache_map()
-        with self._prompt_token_cache_lock:
-            cached = cache.get(cache_key)
-            if cached is not None:
-                cache.pop(cache_key, None)
-                cache[cache_key] = cached
-                return list(cached)
-        prompt = self.tokenizer.encode_messages(messages)
+        owner_event: threading.Event | None = None
+        # Coalesce identical cache misses so request bursts do not all run the
+        # tokenizer for the same chat template before reaching the scheduler.
+        while True:
+            with self._prompt_token_cache_lock:
+                cached = cache.get(cache_key)
+                if cached is not None:
+                    cache.pop(cache_key, None)
+                    cache[cache_key] = cached
+                    return list(cached)
+                inflight = self._prompt_token_cache_inflight.get(cache_key)
+                if inflight is None:
+                    owner_event = threading.Event()
+                    self._prompt_token_cache_inflight[cache_key] = owner_event
+                    break
+            inflight.wait()
+        try:
+            prompt = self.tokenizer.encode_messages(messages)
+        except BaseException:
+            with self._prompt_token_cache_lock:
+                if self._prompt_token_cache_inflight.get(cache_key) is owner_event:
+                    self._prompt_token_cache_inflight.pop(cache_key, None)
+                    owner_event.set()
+            raise
         with self._prompt_token_cache_lock:
             cache.pop(cache_key, None)
             cache[cache_key] = list(prompt)
             while len(cache) > max_entries:
                 cache.pop(next(iter(cache)))
+            if self._prompt_token_cache_inflight.get(cache_key) is owner_event:
+                self._prompt_token_cache_inflight.pop(cache_key, None)
+                owner_event.set()
         return prompt
 
     def _prompt_token_cache_map(self) -> dict[tuple[tuple[str, Hashable], ...], list[int]]:
@@ -2625,6 +2646,9 @@ class OpenAICompletionEngine:
         if not isinstance(cache, dict):
             cache = {}
             self._prompt_token_cache = cache
+        inflight = getattr(self, "_prompt_token_cache_inflight", None)
+        if not isinstance(inflight, dict):
+            self._prompt_token_cache_inflight = {}
         if getattr(self, "_prompt_token_cache_lock", None) is None:
             self._prompt_token_cache_lock = threading.Lock()
         return cache
