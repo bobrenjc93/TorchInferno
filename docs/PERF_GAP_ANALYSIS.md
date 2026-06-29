@@ -77,6 +77,17 @@ before server accept plus client request-body delivery and tail request waves.
 Do not reopen worker-count/prestart/parallel-accept without a change that
 improves that pre-accept/client-admission side in full benchmark order.
 
+The `36c5c9a` public-order refresh worsened the self row to
+`330.0 / 0.0 / 361.7ms`, but focused ordered controls show that is not a
+TorchInferno runtime regression after few_shot. A profiled TorchInferno-only
+`few_shot -> self_consistency` run on `682ade7` landed at
+`191.9 / 0.0 / 212.2ms`; the no-profile repeat landed at
+`203.9 / 0.0 / 278.0ms`. The profiled self queue still had p50
+queue-to-first `8.4ms`, HTTP first-content `9.6ms`, one prefill batch, one
+decode model call, and `992` generated-prefix reuses. Treat the full-order
+`330ms` self TTFT as client/host/provider-order admission noise unless a repeat
+reproduces it with server-side queue or HTTP first-content movement.
+
 Raising the drained fast-HTTP keepalive timeout from `0.25s` to `1.0s` is also
 rejected on the current stack. A focused self_consistency A/B on `afbbe89`
 regressed the score row to `364.2 / 0.0 / 394.0ms`; the HTTP profile still had
