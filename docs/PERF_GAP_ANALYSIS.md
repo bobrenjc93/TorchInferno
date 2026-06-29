@@ -44,6 +44,19 @@ harness change, but it confirms the same public shape: vLLM is now winning the
 median TTFT/E2E/throughput cells even where TorchInferno is near or ahead on
 token cadence locally.
 
+Public run `20260629_090315` measured TorchInferno `07b0d6f`, vLLM `a4e3cb4`,
+and SGLang `a2b5ce2`. The scorecard was TorchInferno `0/20`, vLLM `18/20`,
+and SGLang `1/20`. TorchInferno rows were few_shot
+`160.8 / 47.2 / 201.9ms`, self_consistency `251.7 / 0.0 / 269.1ms`,
+multi_turn `312.3 / 58.1 / 365.6ms`, tree_of_thought
+`191.8 / 57.0 / 235.2ms`, and long_output `314.9 / 23.2 / 1121.3ms`.
+This public run includes the decode-many overrun counters but predates the
+ragged active/padding split and later profile notes. vLLM now wins every
+few_shot, multi_turn, tree, and self score cell; SGLang wins long_output TTFT.
+TorchInferno's public median TPOT is no longer enough to win any cell, so the
+remaining work still needs lower request-wave/prefill latency and lower
+long-output decode/readback cost.
+
 A same-host all-provider multi_turn rerun on current pushed `9d62f6b` with the
 new harness metadata landed at vLLM `297.7 / 106.2 / 404.2ms`, SGLang
 `159.3 / 108.6 / 284.5ms`, and TorchInferno `352.0 / 63.1 / 408.2ms`.
@@ -69,6 +82,19 @@ spiked to `808ms` median and `3446ms` p99, and later turns settled into the
 `303-397ms` median band. SGLang reaches `122-177ms` medians for turns 1-7. This
 keeps conversation-prefix reuse or a faster mixed-prefix suffix path as the
 multi_turn requirement; the default common-prefix path is warm and stable.
+
+Non-common prefix-hit bucketing is also rejected as a finished-prefix rescue.
+A source prototype rounded finished-prefix reuse down to coarser prefix lengths
+before graph prefill, then ran two opt-in multi_turn checks with finished-prefix
+cache, non-common graph prefill, finished-prefix graph prefill, and dynamic
+context bucketing through suffix `256`. A 64-token prefix bucket completed but
+regressed to `1406.3 / 68.5 / 1488.7ms`; it reused `76.0K` prefix tokens but
+still paid `74` prefill batches, `19` captures, `18.1s` capture time, and
+`22.7s` prefill wall. A 16-token bucket cut prefill tokens further to `27.4K`
+and reused `90.0K` prefix tokens, but still regressed to
+`1111.8 / 69.2 / 1256.0ms` with `78` prefill batches, `19` captures, and
+`21.5s` prefill wall. The prototype was reverted; lowering exact prefix
+granularity does not solve the finished-prefix graph/capture overhead.
 
 Exact-length full-prompt reuse is also rejected on current `9d62f6b`. Enabling
 pinned full-prompt stores for `max_tokens>=512` with non-common-prefix graph
