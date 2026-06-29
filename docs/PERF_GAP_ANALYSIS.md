@@ -76,6 +76,28 @@ multi `160.9 / 117.9 / 274.9ms`, tree `63.5 / 77.4 / 157.3ms`, long
 highest-leverage work is therefore first-token/prefill scheduling for
 tree_of_thought and long_output, plus smaller few_shot E2E/TTFT cleanup.
 
+A same-host all-provider tree-only rerun on current pushed `a37dfc0` with the
+local vLLM `LD_PRELOAD` workaround confirmed the same shape without the earlier
+vLLM import failure. vLLM landed at `126.8 / 86.9 / 196.7ms`, SGLang at
+`61.8 / 65.6 / 150.8ms`, and TorchInferno at `265.6 / 50.5 / 309.7ms`;
+correctness was in the same 97% band for all three providers. The TorchInferno
+queue profile had 12 online sessions for 992 requests, with sampled branches
+spending `6.48s` total phase time, `3.79s` prefill wall, and `2.22s` decode
+active across 45 prefill graph hits and no misses. Greedy eval spent `3.81s`
+phase time, `1.04s` prefill wall, and `2.65s` decode active. TorchInferno still
+wins only tree TPOT locally; SGLang owns TTFT/E2E/throughput on the same host.
+
+Lowering online admission granularity is rejected for sampled-medium tree. A
+focused source-free A/B forced
+`TORCHINFERNO_OPENAI_TP_ONLINE_ADMIT_PER_STEP_CAP=16` on the same pushed
+`a37dfc0` tree row. It regressed to `283.9 / 64.1 / 357.3ms`, 957/992 raw
+correct. Queue counters show why: sampled prefill batches rose `45 -> 67`,
+sampled prefill wall rose `3.79s -> 4.22s`, sampled decode-active time rose
+`2.22s -> 2.50s`, and prefill graph misses stayed at zero. Smaller admission
+waves do not improve first-token latency enough to offset the extra graph
+replays and decode fragmentation; keep the current sampled-medium 32-row
+admission shape.
+
 Fresh focused profiles on pushed `0c45929` keep long_output in the known
 decode/readback bucket. The queue-profiled control completed `1000/1000`
 correct at `256.9 / 26.2 / 1255.9ms`. The last queue snapshot had all
