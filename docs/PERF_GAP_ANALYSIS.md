@@ -80,6 +80,19 @@ regressed TPOT/E2E/throughput to `27.8ms`, `1296.4ms`, and `29.4 tok/s`.
 Keep Marlin enabled for greedy short sessions; the sampled-short-only Marlin
 disable remains the scoped default.
 
+Common-prefix cache-only prefill is rejected as a default runtime change. A
+source prototype skipped logits for shared common-prefix rows when every request
+had a non-empty suffix, using the tensor-parallel `prefill_cache_only` hook for
+prefixes at least 96 tokens long. Focused few_shot A/B on the same working tree
+was neutral: cache-only landed at `165.5 / 50.4 / 205.6ms` versus
+`167.2 / 50.1 / 207.5ms` with the path disabled. Queue counters showed only a
+small whole-run prefill-forward movement (`1706.9ms -> 1684.6ms`), while decode
+and arrival-wave shape dominated the score-facing medians. The long_output
+confirmation was not stable either: `267.6 / 25.0 / 1344.0ms`, 1000/1000
+correct, with `7.98s` prefill wall, `12.34s` decode GPU event time, and `7.48s`
+CPU token readback. The prototype was backed out; a single common-prefix logits
+skip is not enough for few_shot or long_output.
+
 The prior same-host no-profile all-provider comparison on pushed `d363367`
 landed at SGLang `13/20`, TorchInferno `4/20`, and vLLM `2/20`. TorchInferno
 rows were: few_shot `174.5 / 50.5 / 220.0ms`, self_consistency
