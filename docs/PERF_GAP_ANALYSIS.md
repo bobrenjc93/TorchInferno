@@ -54,6 +54,17 @@ A no-env patched confirmation then landed at `255.7 / 25.5 / 1341.6ms`,
 `31.2 tok/s`, also `1000/1000` correct. This confirms the TTFT/throughput
 benefit while median E2E stays in the current variance band.
 
+The follow-up all-provider long_output comparison on pushed `b8cc49a` still
+left TorchInferno at `0/4`: TorchInferno `278.8 / 25.0 / 1264.2ms`, vLLM
+`90.9 / 27.6 / 1038.2ms`, and SGLang `58.6 / 24.2 / 920.5ms`. Reopening
+greedy-short decode quantum after the zero-wait change is rejected. A focused
+DQ=4 run looked superficially useful (`325.2 / 23.6 / 1229.2ms`), but the
+same-host all-provider check still lost every score cell and worsened tails:
+TorchInferno `315.2 / 25.2 / 1312.5ms`, p99 TPOT `632.3ms`, versus SGLang
+`62.7 / 24.7 / 985.5ms`, p99 TPOT `37.9ms`. Keep the greedy-short decode
+quantum at `3`; the remaining long_output gap is not solved by a larger command
+quantum.
+
 ## Greedy-large multi_turn suffix bucket refinement (2026-06-28)
 
 Current multi_turn is still conversation-prefix prefill dominated, but the
