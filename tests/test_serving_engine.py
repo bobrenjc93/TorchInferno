@@ -2564,6 +2564,8 @@ def test_continuous_batch_engine_uses_ragged_graph_decode_for_mixed_lengths() ->
     assert engine.stats.decode_model_calls == 2
     assert engine.stats.ragged_decode_batches == 2
     assert engine.stats.ragged_decode_tokens == 6
+    assert engine.stats.ragged_decode_active_tokens == 6
+    assert engine.stats.ragged_decode_padding_tokens == 0
     assert engine.stats.decode_graph_hits == 2
     assert engine.stats.max_model_batch_size == 3
 
@@ -2591,6 +2593,8 @@ def test_continuous_batch_engine_uses_ragged_graph_decode_for_uniform_batches(mo
     assert engine.stats.decode_model_calls == 2
     assert engine.stats.ragged_decode_batches == 2
     assert engine.stats.ragged_decode_tokens == 4
+    assert engine.stats.ragged_decode_active_tokens == 4
+    assert engine.stats.ragged_decode_padding_tokens == 0
 
 
 def test_continuous_batch_engine_can_bucket_mixed_length_decode_without_ragged() -> None:
@@ -3056,6 +3060,8 @@ def test_continuous_batch_engine_online_many_keeps_decode_tokens_ordered(monkeyp
     assert engine.stats.decode_many_skipped_tokens == 0
     assert engine.stats.decode_many_stop_finishes == 0
     assert engine.stats.decode_many_limit_finishes == 2
+    assert engine.stats.ragged_decode_active_tokens == 6
+    assert engine.stats.ragged_decode_padding_tokens == 0
     assert not engine.has_online_work()
     assert model.ragged_logits_graph_calls == 3
 
@@ -3147,6 +3153,8 @@ def test_continuous_batch_engine_online_many_can_overcompute_stop_tokens(monkeyp
     assert engine.stats.decode_many_skipped_tokens == 2
     assert engine.stats.decode_many_stop_finishes == 1
     assert engine.stats.decode_many_limit_finishes == 1
+    assert engine.stats.ragged_decode_active_tokens == 6
+    assert engine.stats.ragged_decode_padding_tokens == 0
     assert not engine.has_online_work()
     assert model.ragged_logits_graph_calls == 3
 

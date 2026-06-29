@@ -199,8 +199,11 @@ class ServingStats:
     decode_model_calls: int = 0
     decode_batches: int = 0
     decode_tokens: int = 0
+    decode_active_tokens: int = 0
     ragged_decode_batches: int = 0
     ragged_decode_tokens: int = 0
+    ragged_decode_active_tokens: int = 0
+    ragged_decode_padding_tokens: int = 0
     decode_graph_hits: int = 0
     decode_graph_misses: int = 0
     decode_many_calls: int = 0
@@ -3210,6 +3213,7 @@ class ContinuousBatchEngine:
             len(states),
             tokens=len(states) * (proposal_len + 1),
             ragged=True,
+            active_tokens=len(states) * (proposal_len + 1),
         )
         self._record_shape_count(
             self.stats.decode_shape_counts,
@@ -3306,7 +3310,7 @@ class ContinuousBatchEngine:
             reuse_logits = logits[:, -1, :]
             next_token_tensor = self._sample_logits(logits[:, -1, :])
         self._stop_decode_ragged_model_gpu_timer(gpu_model_events)
-        self._record_model_call("decode", n_padded, tokens=n_padded, ragged=True)
+        self._record_model_call("decode", n_padded, tokens=n_padded, ragged=True, active_tokens=n_active)
         if self.profile_timings:
             self.stats.decode_ragged_model_ms += (time.perf_counter() - model_start_s) * 1000.0
         cpu_tokens_start_s = time.perf_counter() if self.profile_timings else 0.0
@@ -3343,7 +3347,7 @@ class ContinuousBatchEngine:
             logits = self._ragged_decode_logits(input_ids, seq_lens, row_indices)
             next_token_tensor = self._sample_logits(logits[:, -1, :])
         self._stop_decode_ragged_model_gpu_timer(gpu_model_events)
-        self._record_model_call("decode", n_padded, tokens=n_padded, ragged=True)
+        self._record_model_call("decode", n_padded, tokens=n_padded, ragged=True, active_tokens=n_active)
         active_row_indices = row_indices[:n_active]
         self._ensure_gpu_token_buf().index_copy_(0, active_row_indices, next_token_tensor[:n_active])
         self._advance_gpu_seq_lens(active_row_indices)
@@ -4359,23 +4363,36 @@ class ContinuousBatchEngine:
             getattr(self.model, "_sample_next_token", None)
         )
 
-    def _record_model_call(self, kind: str, batch_size: int, *, tokens: int, ragged: bool = False) -> None:
+    def _record_model_call(
+        self,
+        kind: str,
+        batch_size: int,
+        *,
+        tokens: int,
+        ragged: bool = False,
+        active_tokens: int | None = None,
+    ) -> None:
         if kind == "prefill":
             self.stats.prefill_model_calls += 1
             self.stats.prefill_batches += 1
             self.stats.prefill_tokens += tokens
         elif kind == "decode":
+            active = tokens if active_tokens is None else active_tokens
             self.stats.decode_model_calls += 1
             self.stats.decode_batches += 1
             self.stats.decode_tokens += tokens
+            self.stats.decode_active_tokens += active
             if ragged:
                 self.stats.ragged_decode_batches += 1
                 self.stats.ragged_decode_tokens += tokens
+                self.stats.ragged_decode_active_tokens += active
+                self.stats.ragged_decode_padding_tokens += max(0, tokens - active)
         elif kind == "unified":
             self.stats.prefill_model_calls += 1
             self.stats.decode_model_calls += 1
             self.stats.prefill_tokens += tokens
             self.stats.decode_tokens += tokens
+            self.stats.decode_active_tokens += tokens
         self.stats.max_model_batch_size = max(self.stats.max_model_batch_size, batch_size)
 
     def _record_shape_count(self, counts: dict[str, int], key: str) -> None:

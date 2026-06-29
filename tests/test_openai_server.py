@@ -12406,9 +12406,12 @@ def test_openai_queue_profile_records_runtime_engine_stats(
         decode_model_calls = 5
         decode_batches = 5
         decode_tokens = 31
+        decode_active_tokens = 27
         decode_ragged_model_gpu_ms = 12.5
         ragged_decode_batches = 4
         ragged_decode_tokens = 29
+        ragged_decode_active_tokens = 25
+        ragged_decode_padding_tokens = 4
         decode_graph_hits = 3
         decode_graph_misses = 1
         decode_many_calls = 2
@@ -12453,6 +12456,7 @@ def test_openai_queue_profile_records_runtime_engine_stats(
         {
             "decode_quantum": 4,
             "event": "online_batcher",
+            "runtime_decode_active_tokens": 27,
             "runtime_decode_batches": 5,
             "runtime_decode_graph_hits": 3,
             "runtime_decode_graph_misses": 1,
@@ -12486,7 +12490,9 @@ def test_openai_queue_profile_records_runtime_engine_stats(
             "runtime_prefix_reuse_requests": 7,
             "runtime_prefix_reuse_tokens": 53,
             "runtime_queued_requests": 11,
+            "runtime_ragged_decode_active_tokens": 25,
             "runtime_ragged_decode_batches": 4,
+            "runtime_ragged_decode_padding_tokens": 4,
             "runtime_ragged_decode_tokens": 29,
             "runtime_scheduler_steps": 6,
             "submitted_requests": 11,

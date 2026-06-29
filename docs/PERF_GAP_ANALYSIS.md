@@ -103,11 +103,15 @@ apart from the single ragged-prefill capture (`56` prefill batches,
 `8.28s` prefill wall). The online phase still spent `12.43s` in ragged-decode
 GPU events and `7.50s` in CPU token harvest across `724` ragged decode batches.
 Decode-many was enabled with quantum `3`; the old counters show `44,715` decode
-row-tokens for `37,715` emitted token events, matching the existing
-stop-token-overcompute concern. Queue profiles now record decode-many model,
-emitted, skipped, stop-finish, and limit-finish counters directly so future
-long_output runs can distinguish useful multi-step decode work from overrun
-without local trace reconstruction.
+row-tokens for `37,715` emitted token events, but they did not separate padded
+ragged rows from true stop-token overrun. A follow-up run on `d60eead` landed in
+the same band (`272.0 / 25.9 / 1246.4ms`) and showed only `230` skipped
+decode-many tokens across `13,429` decode-many model tokens, with `305`
+stop-token finishes. So stop-token overrun is measurable but not the whole
+decode-token gap. Queue profiles now record decode-many model/emitted/skipped
+counters and ragged decode active/padding counters directly so future
+long_output runs can distinguish useful multi-step decode work, padded bucket
+work, and true overrun without local trace reconstruction.
 
 Runtime Marlin int4 decode is now disabled by default only for sampled-short
 online sessions (`temperature > 0`, `max_tokens <= 256`). The global env
