@@ -94,6 +94,20 @@ out of the suspect list. The next self_consistency lever has to reduce
 submit/reuse wave churn without repeating the rejected idle-drain coalescing or
 idle-wait changes.
 
+A same-host self_consistency provider refresh on pushed `63006f1` now favors
+TorchInferno locally on score-facing E2E/throughput even though SGLang still
+wins median TTFT. vLLM landed at `378.1 / 0.0 / 465.4ms`, SGLang at
+`193.0 / 0.0 / 373.6ms`, and TorchInferno at `223.9 / 0.0 / 319.7ms`, all
+1000/1000 correct with one unique final answer. The TorchInferno queue profile
+again shows the intended generated-prefix shape: one generated-prefix store,
+`985` generated-prefix reuses, route counts
+`{"common_prefix": 985, "generated_prefix": 985}`, one prefill batch, and one
+decode batch. The remaining server work is still `213` submit batches,
+`191` runtime step calls, `2000` events, and `578ms` submit-sync time, so the
+local remaining self gap is request-wave/finish churn rather than prefix cache
+or decode compute. Keep the rejected idle-drain, event-ordering, and submit-step
+follow-ups closed unless a new mechanism reduces the wave count directly.
+
 A current focused long_output profile on `26a9d5c` keeps that row in the known
 decode/readback bucket rather than exposing a missing prefix path. The row
 completed `1000/1000` correct at `301.4 / 25.4 / 1320.6ms`, with p99
