@@ -1,5 +1,39 @@
 # TorchInferno vs vLLM/sglang — Performance Gap Analysis (Llama-3.1-70B, 8xH100)
 
+## Current multi_turn refresh and DQ=8 rejection (2026-06-29)
+
+The restored public run `20260629_185744` kept multi_turn in the expected
+score shape: TorchInferno `302.0 / 66.1 / 358.1ms` versus SGLang
+`155.1 / 122.9 / 269.3ms`, so TorchInferno still wins only the TPOT cell.
+A focused current profile on docs-only `f363437` landed nearby at
+`321.6 / 67.8 / 380.4ms`, 983/1000 raw correct, with first-turn median TTFT
+`781.8ms` and last-turn median `389.6ms`. Fast-HTTP p50 first-content/total
+was `258.9/280.8ms`, while queue p50 queue-to-submit, submit-to-first, and
+queue-to-first were `106.2/141.3/255.9ms`, so the remaining median is still
+server prefill/admission plus benchmark/client observation overhead, not SSE
+writing.
+
+The queue profile confirms the current 512-token greedy path is graph-warm but
+prefill dominated: zero request-path prefill captures, `35` graph-backed
+prefill batches, `4.85s` prefill wall (`4.22s` forward), `3.69s` ragged decode
+GPU event time, and `706ms` ragged token harvest. The largest suffix buckets
+were the already-promoted fine greedy-large shapes, especially `b32:s144`
+(`1.47s` wall over eight calls), followed by `s128`, `s112`, and `s64`.
+This does not reopen finished/generated prefix reuse, mixed-prefix graph
+prefill, larger active caps, lower FP8 min-M, or first-wave wait changes; the
+remaining multi_turn gap is still fewer/faster conversation-prefix suffix
+prefill waves without fragmenting graph-backed batches.
+
+Lowering the 512-token greedy decode quantum from `16` to `8` is rejected on
+the current stack. The env-only focused run preserved correctness and improved
+tails (`ttft/e2e p99` `4054/4093ms -> 2131/2176ms`) while reducing internal
+phase time (`10.06s -> 8.18s`), prefill wall (`4.85s -> 4.43s`), and ragged
+decode GPU time (`3.69s -> 2.53s`). It did not improve score-facing medians:
+the row moved to `321.9 / 59.3 / 383.0ms`, throughput fell to `3.1 tok/s`, and
+HTTP p50 first-content stayed flat at `260.7ms`. Keep the greedy-large quantum
+at `16` until a scheduler change improves median TTFT/E2E or throughput, not
+only tails/internal counters.
+
 ## Greedy-mid first-wave wait rejected after public-order run (2026-06-29)
 
 Public run `20260629_180924` measured TorchInferno `7110c60`, SGLang
