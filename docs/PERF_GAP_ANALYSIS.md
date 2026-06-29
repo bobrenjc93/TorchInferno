@@ -46,6 +46,17 @@ raised runtime phase time to `10.41s` (`4.06s` prefill wall,
 flat at `166.7 / 49.7 / 206.6ms`. Keep greedy-mid active rows at `32` and do
 not add a greedy-mid initial wait default from this evidence.
 
+Reopening greedy-mid decode-many with a stop-aware source prototype is also
+rejected. The patch removed stopped rows from the rest of a decode-many quantum
+when all active requests shared the same stop ids, then rechecked few_shot with
+`TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_GEN_MAX_TOKENS=256`. It fixed the
+old overdecode symptom (`~1.5k` decode tokens instead of the prior `15k+`), but
+the row still regressed badly to `180.0 / 69.4 / 759.9ms` and only
+`2.6 tok/s`. Queue phase time rose to `13.46s` even though decode-active time
+was only `1.29s`, so the remaining problem is decode-many event pacing/CPU
+work rather than stopped-row overcompute. The prototype was reverted; keep
+decode-many scoped to short greedy output.
+
 ## Current no-profile local scorecard (2026-06-28)
 
 A current no-profile all-provider run on pushed `50580d6` landed at
