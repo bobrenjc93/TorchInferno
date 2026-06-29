@@ -1,5 +1,25 @@
 # TorchInferno vs vLLM/sglang — Performance Gap Analysis (Llama-3.1-70B, 8xH100)
 
+## Current public-order refresh on 36c5c9a (2026-06-29)
+
+Public run `20260629_201815` measured pushed TorchInferno `36c5c9a`, SGLang
+`643e1cc`, and the current vLLM environment after the fast-HTTP profiling
+instrumentation landed. The scorecard improved from the prior public
+`SGLang 14 / TorchInferno 3 / vLLM 2` shape to SGLang `12/20`,
+TorchInferno `5/20`, and vLLM `2/20`. TorchInferno won few_shot TPOT and E2E,
+long_output TPOT, multi_turn TPOT, and tree_of_thought TPOT. The no-profile run
+does not show a regression from the accept/read timing instrumentation.
+
+TorchInferno rows were few_shot `164.4 / 48.6 / 205.9ms`, self_consistency
+`330.0 / 0.0 / 361.7ms`, multi_turn `328.9 / 62.9 / 385.2ms`,
+tree_of_thought `296.5 / 47.2 / 313.6ms`, and long_output
+`274.9 / 23.9 / 1171.8ms`. Compared with `20260629_185744`, few_shot and
+long_output moved back into their better local bands, but self_consistency,
+multi_turn, and tree still have score-facing TTFT/E2E gaps. The current useful
+work remains the previously identified request-wave/admission path for self and
+fewer/faster prefill/decode waves for multi/tree/long, not reopening the
+rejected first-wave, refill-floor, keepalive, FP8, or decode-many knobs.
+
 ## Current few_shot refresh and refill-floor rejection (2026-06-29)
 
 The latest public run `20260629_185744` still shows few_shot as a narrow
