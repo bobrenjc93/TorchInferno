@@ -239,6 +239,8 @@ class ServingStats:
     generated_prefix_store_requests: int = 0
     generated_prefix_reuse_requests: int = 0
     generated_prefix_reuse_tokens: int = 0
+    prefix_reuse_route_counts: dict[str, int] = field(default_factory=dict)
+    prefix_reuse_hit_token_counts: dict[str, int] = field(default_factory=dict)
     prefill_shape_counts: dict[str, int] = field(default_factory=dict)
     prefill_graph_capture_shape_counts: dict[str, int] = field(default_factory=dict)
     decode_shape_counts: dict[str, int] = field(default_factory=dict)
@@ -807,8 +809,7 @@ class ContinuousBatchEngine:
             row = self._acquire_active_row()
             if reusable is not None and prefix_hit > 0:
                 self._copy_prefix(reusable.row, row, prefix_hit)
-                self.stats.prefix_reuse_requests += 1
-                self.stats.prefix_reuse_tokens += prefix_hit
+                self._record_prefix_reuse(prefix_hit, reusable)
             suffix = request.prompt[prefix_hit:]
             state = _ActiveRequest(
                 original_index=original_index,
@@ -1020,8 +1021,7 @@ class ContinuousBatchEngine:
                 prefix_hit = 0
             row = self._acquire_active_row()
             if prefix_hit > 0:
-                self.stats.prefix_reuse_requests += 1
-                self.stats.prefix_reuse_tokens += prefix_hit
+                self._record_prefix_reuse(prefix_hit, reusable)
             state = _ActiveRequest(
                 original_index=original_index,
                 request=request,
@@ -1807,8 +1807,7 @@ class ContinuousBatchEngine:
                 for _index, _request, _prefix_hit_tokens, reusable in group
             ]
             for _index, _request, prefix_hit_tokens, _reusable in group:
-                self.stats.prefix_reuse_requests += 1
-                self.stats.prefix_reuse_tokens += prefix_hit_tokens
+                self._record_prefix_reuse(prefix_hit_tokens, _reusable)
             padded_suffixes = [
                 [*suffix, *([0] * (suffix_bucket - len(suffix)))]
                 for suffix in suffixes
@@ -2116,10 +2115,8 @@ class ContinuousBatchEngine:
         acquired_rows: list[int] = []
         try:
             next_tokens, logits_by_index = self._sample_exact_prefix_group(group)
-            self.stats.prefix_reuse_requests += len(group)
-            self.stats.prefix_reuse_tokens += sum(
-                prefix_hit_tokens for _original_index, _request, prefix_hit_tokens, _reusable in group
-            )
+            for _original_index, _request, prefix_hit_tokens, reusable in group:
+                self._record_prefix_reuse(prefix_hit_tokens, reusable)
 
             active_items: list[tuple[_ActiveRequest, int, int]] = []
             copy_groups: dict[tuple[int, int], list[int]] = defaultdict(list)
@@ -2181,8 +2178,7 @@ class ContinuousBatchEngine:
                 second_token = int(next_token)
                 generated = 2
                 generated_prefix_len = len(request.prompt) + 1
-                self.stats.prefix_reuse_requests += 1
-                self.stats.prefix_reuse_tokens += generated_prefix_len
+                self._record_prefix_reuse(generated_prefix_len, continuation)
                 self.stats.generated_prefix_reuse_requests += 1
                 self.stats.generated_prefix_reuse_tokens += generated_prefix_len
                 finished = request.is_stop_token(second_token) or generated >= request.max_new_tokens
@@ -2383,8 +2379,7 @@ class ContinuousBatchEngine:
         copy_groups: dict[tuple[int, int], list[int]] = defaultdict(list)
         for row, (_original_index, _request, prefix_hit_tokens, reusable) in zip(rows, group):
             copy_groups[(reusable.row, prefix_hit_tokens)].append(row)
-            self.stats.prefix_reuse_requests += 1
-            self.stats.prefix_reuse_tokens += prefix_hit_tokens
+            self._record_prefix_reuse(prefix_hit_tokens, reusable)
         for (source_row, prefix_hit_tokens), dest_rows in copy_groups.items():
             self._copy_prefix_to_rows(source_row, dest_rows, prefix_hit_tokens)
 
@@ -2623,8 +2618,7 @@ class ContinuousBatchEngine:
         if reusable is not None and prefix_hit_tokens > 0:
             self._copy_prefix(reusable.row, row, prefix_hit_tokens)
             suffix = request.prompt[prefix_hit_tokens:]
-            self.stats.prefix_reuse_requests += 1
-            self.stats.prefix_reuse_tokens += prefix_hit_tokens
+            self._record_prefix_reuse(prefix_hit_tokens, reusable)
 
         if suffix:
             input_ids = torch.tensor([suffix], device=self.device, dtype=torch.long)
@@ -4162,8 +4156,7 @@ class ContinuousBatchEngine:
                 row = self._acquire_active_row()
                 self._copy_prefix(reusable.row, row, hit)
                 rows.append(row)
-                self.stats.prefix_reuse_requests += 1
-                self.stats.prefix_reuse_tokens += hit
+                self._record_prefix_reuse(hit, reusable)
         except Exception:
             for row in rows:
                 self._release_active_row(row)
@@ -4365,6 +4358,34 @@ class ContinuousBatchEngine:
         if not self.profile_timings:
             return
         counts[key] = counts.get(key, 0) + 1
+
+    def _record_prefix_reuse(
+        self,
+        prefix_hit_tokens: int,
+        reusable: _ReusablePrefix | None,
+    ) -> None:
+        self.stats.prefix_reuse_requests += 1
+        self.stats.prefix_reuse_tokens += prefix_hit_tokens
+        if not self.profile_timings:
+            return
+        self._record_shape_count(
+            self.stats.prefix_reuse_route_counts,
+            self._prefix_reuse_route_kind(reusable.route_id if reusable is not None else None),
+        )
+        self._record_shape_count(
+            self.stats.prefix_reuse_hit_token_counts,
+            str(int(prefix_hit_tokens)),
+        )
+
+    @staticmethod
+    def _prefix_reuse_route_kind(route_id: Hashable | None) -> str:
+        if isinstance(route_id, tuple) and route_id and isinstance(route_id[0], str):
+            return route_id[0]
+        if isinstance(route_id, str):
+            return "request_prompt"
+        if route_id is None:
+            return "unknown"
+        return type(route_id).__name__
 
     def _can_decode_ragged(self, states: list[_ActiveRequest]) -> bool:
         if not self.enable_ragged_decode:

@@ -4953,6 +4953,8 @@ class OpenAICompletionEngine:
             if isinstance(value, (int, float)):
                 record[f"runtime_{name}"] = value
         for name in (
+            "prefix_reuse_route_counts",
+            "prefix_reuse_hit_token_counts",
             "prefill_shape_counts",
             "prefill_graph_capture_shape_counts",
             "decode_shape_counts",

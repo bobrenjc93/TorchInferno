@@ -974,6 +974,7 @@ def test_continuous_batch_engine_can_opt_in_full_prompt_store_while_pinned(monke
         prefix_cache_capacity=5,
         pin_shared_prefix=True,
         graph_prefill=True,
+        profile_timings=True,
     )
 
     results = engine.run(
@@ -994,6 +995,10 @@ def test_continuous_batch_engine_can_opt_in_full_prompt_store_while_pinned(monke
     assert engine.reusable_prefixes[("common_prefix", shared)].tokens == shared
     assert engine.stats.prefill_graph_hits == 2
     assert any(rows is not None and len(rows) == 4 for rows in model.prefill_src_prefix_rows)
+    assert engine.stats.prefix_reuse_route_counts["common_prefix"] == 3
+    assert engine.stats.prefix_reuse_route_counts["request_prompt"] == 3
+    assert engine.stats.prefix_reuse_hit_token_counts[str(len(shared))] == 3
+    assert engine.stats.prefix_reuse_hit_token_counts[str(len(shared) + 1)] == 3
 
 
 def test_continuous_batch_engine_keeps_non_common_prefix_graph_opt_in(monkeypatch) -> None:

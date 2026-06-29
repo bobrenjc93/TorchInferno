@@ -33,6 +33,40 @@ The sampled-short Marlin default won one public TPOT cell, but public vLLM
 still owns nearly all TTFT/E2E/throughput cells; the remaining work has to
 reduce request-wave latency and not just token compute.
 
+Public run `20260629_070312` measured TorchInferno `a37dfc0`, vLLM `4559c43`,
+and SGLang `91cf159`. The scorecard moved to TorchInferno `1/20`, vLLM
+`18/20`, and SGLang `0/20`. TorchInferno kept only the few_shot TPOT cell and
+landed at few_shot `161.6 / 46.4 / 202.6ms`, self_consistency
+`247.6 / 0.0 / 265.0ms`, multi_turn `314.1 / 55.3 / 369.5ms`,
+tree_of_thought `201.4 / 56.7 / 248.5ms`, and long_output
+`319.5 / 23.3 / 1158.3ms`. This run predates the later multi-turn metadata
+harness change, but it confirms the same public shape: vLLM is now winning the
+median TTFT/E2E/throughput cells even where TorchInferno is near or ahead on
+token cadence locally.
+
+A same-host all-provider multi_turn rerun on current pushed `9d62f6b` with the
+new harness metadata landed at vLLM `297.7 / 106.2 / 404.2ms`, SGLang
+`159.3 / 108.6 / 284.5ms`, and TorchInferno `352.0 / 63.1 / 408.2ms`.
+TorchInferno still won only TPOT. The per-turn split makes the gap concrete:
+SGLang reaches about `150-174ms` median TTFT for turns 3-7, while TorchInferno
+stays around `301-404ms` despite much better median TPOT. The TorchInferno
+queue profile had `37` prefill batches, zero graph captures/misses, `4.46s`
+prefill forward, `3.12s` decode GPU time, and exactly `45,000` reused prefix
+tokens from the 45-token shared system prefix. So the current stable common
+prefix path is not the blocker; the missing piece is efficient reuse of longer
+per-conversation prefixes.
+
+Exact-length full-prompt reuse is also rejected on current `9d62f6b`. Enabling
+pinned full-prompt stores for `max_tokens>=512` with non-common-prefix graph
+prefill, but without mixed-prefix grouping, completed correctly (`979/1000`) and
+raised reused prefix tokens to `97.6K` while cutting prefill tokens to `18.1K`.
+It still regressed catastrophically to `7207.9 / 66.4 / 7269.9ms` because the
+exact prefix lengths fragmented into `282` prefill batches and `191` prefill
+graph captures, spending `120.1s` in prefill wall and `105.5s` in capture. This
+rules out "keep positive context_len by grouping exact prefix lengths" as the
+next default path; conversation-prefix reuse needs shape coalescing without
+per-length capture churn.
+
 Runtime Marlin int4 decode is now disabled by default only for sampled-short
 online sessions (`temperature > 0`, `max_tokens <= 256`). The global env
 `TORCHINFERNO_MARLIN_INT4_DECODE=0` showed the initial signal on focused
