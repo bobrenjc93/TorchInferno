@@ -1,26 +1,35 @@
 # TorchInferno vs vLLM/sglang — Performance Gap Analysis (Llama-3.1-70B, 8xH100)
 
-## Current d363367 refresh and rejected follow-ups (2026-06-28)
+## Current 726ffad refresh and rejected follow-ups (2026-06-28)
 
-A same-host no-profile all-provider comparison on pushed `d363367` is the
-current local source baseline. The scorecard was SGLang `13/20`,
-TorchInferno `4/20`, and vLLM `2/20`. TorchInferno rows were: few_shot
-`174.5 / 50.5 / 220.0ms`, self_consistency `372.5 / 0.0 / 400.5ms`,
-multi_turn `333.7 / 64.8 / 393.1ms`, tree_of_thought
-`312.4 / 46.7 / 348.6ms`, and long_output `297.6 / 24.8 / 1247.2ms`.
-TorchInferno still wins TPOT on few_shot, long_output, multi_turn, and
-tree_of_thought locally, but SGLang leads most TTFT/E2E/throughput cells and
-vLLM owns several p99 tail cells plus the self_consistency median row.
+A same-host no-profile all-provider comparison on pushed `726ffad` is the
+current local source baseline. The scorecard was SGLang `12/20`,
+TorchInferno `4/20`, and vLLM `3/20`. TorchInferno rows were: few_shot
+`170.6 / 49.7 / 213.2ms`, self_consistency `231.9 / 0.0 / 364.4ms`,
+multi_turn `320.3 / 61.6 / 379.1ms`, tree_of_thought
+`282.5 / 47.6 / 303.3ms`, and long_output `303.1 / 24.7 / 1248.1ms`.
+TorchInferno still wins only TPOT on few_shot, long_output, multi_turn, and
+tree_of_thought locally. SGLang leads most local TTFT/E2E/throughput cells,
+while vLLM leads the local self_consistency median row and several p99 cells.
 
-Public run `20260629_010316` measured the older TorchInferno `a349eba`,
-vLLM `311ad68`, and SGLang `06fd2ef`. It landed at TorchInferno `1/20`,
-vLLM `15/20`, and SGLang `3/20`. Public TorchInferno rows were:
-few_shot `160.5 / 45.2 / 197.0ms`, self_consistency
-`246.2 / 0.0 / 264.8ms`, multi_turn `324.8 / 57.7 / 383.5ms`,
-tree_of_thought `195.7 / 56.6 / 241.0ms`, and long_output
-`277.2 / 23.1 / 1092.5ms`. This public row predates the later startup
-barrier, greedy-short zero wait, and prefix-row padding changes, so use it as
-competitor evidence but not as the current TorchInferno source baseline.
+Public run `20260629_030325` measured the older TorchInferno `9b0f24c`,
+vLLM `5274c11`, and SGLang `2260e61`. It landed at TorchInferno `0/20`,
+vLLM `17/20`, and SGLang `2/20`. Public TorchInferno rows were:
+few_shot `166.2 / 48.2 / 207.4ms`, self_consistency
+`282.0 / 0.0 / 301.4ms`, multi_turn `314.9 / 59.0 / 369.9ms`,
+tree_of_thought `189.1 / 58.2 / 232.7ms`, and long_output
+`354.7 / 21.6 / 1110.8ms`. This public row predates the later
+greedy-short prefill-cost priority default, but the competitor movement is the
+important signal: public vLLM now wins even few_shot, tree_of_thought, and
+long_output TPOT, so local TPOT wins are not enough to close the public gap.
+
+The prior same-host no-profile all-provider comparison on pushed `d363367`
+landed at SGLang `13/20`, TorchInferno `4/20`, and vLLM `2/20`. TorchInferno
+rows were: few_shot `174.5 / 50.5 / 220.0ms`, self_consistency
+`372.5 / 0.0 / 400.5ms`, multi_turn `333.7 / 64.8 / 393.1ms`,
+tree_of_thought `312.4 / 46.7 / 348.6ms`, and long_output
+`297.6 / 24.8 / 1247.2ms`. Keep it as historical same-host evidence rather
+than the current source baseline.
 
 Self-consistency idle-drain submit coalescing is rejected. A source prototype
 changed the idle path to collect arrivals across the wait window and submit
