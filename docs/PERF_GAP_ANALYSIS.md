@@ -67,6 +67,33 @@ rules out "keep positive context_len by grouping exact prefix lengths" as the
 next default path; conversation-prefix reuse needs shape coalescing without
 per-length capture churn.
 
+The new prefix-reuse queue counters on current `0fae868` confirm the dense
+default has no hidden longer-prefix reuse. A focused no-env multi_turn row
+landed at `338.8 / 62.7 / 402.2ms`, with `34` prefill batches, zero captures,
+`4.70s` prefill wall, and route/hit histograms of exactly
+`{"common_prefix": 1000}` and `{"45": 1000}`. Enabling full-prompt stores plus
+dynamic context bucketing for suffixes through `32` did remove most exact-length
+capture churn (`191 -> 13` captures), but it still regressed to
+`1812.5 / 66.4 / 2034.6ms`: prefill wall was `31.6s`, including `19.4s`
+prefill forward and `11.4s` state/store time, with `861` request-prompt reuse
+hits. Forcing the paged prefix-cache engine below its default context threshold
+is also rejected for this prompt length: `6015.4 / 656.8 / 6193.8ms`, with
+`96.7s` online phase time and paged decode TPOT dominating. Keep paged-prefix
+experiments behind their explicit envs until the paged engine has a short-context
+decode/prefill path that beats dense.
+
+A current focused self_consistency profile on `0fae868` shows that sampled-short
+generated-prefix reuse is healthy and that the remaining row is control-plane
+churn. The row landed at `190.2 / 0.0 / 328.8ms`, 1000/1000 correct, with one
+common-prefix prefill, one generated-prefix store, `971` generated-prefix reuses,
+and route histograms `{"common_prefix": 971, "generated_prefix": 971}`. Server
+work was still split across `217` submit batches, `210` runtime steps, and
+`2000` token events for 1000 one-token outputs; `phase_submit_sync_ms` was
+`588ms` and `prefill_wall_ms` was `1.88s`. This keeps generated-prefix caching
+out of the suspect list. The next self_consistency lever has to reduce
+submit/reuse wave churn without repeating the rejected idle-drain coalescing or
+idle-wait changes.
+
 Runtime Marlin int4 decode is now disabled by default only for sampled-short
 online sessions (`temperature > 0`, `max_tokens <= 256`). The global env
 `TORCHINFERNO_MARLIN_INT4_DECODE=0` showed the initial signal on focused
