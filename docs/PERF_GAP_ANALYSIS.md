@@ -23,6 +23,28 @@ greedy-short prefill-cost priority default, but the competitor movement is the
 important signal: public vLLM now wins even few_shot, tree_of_thought, and
 long_output TPOT, so local TPOT wins are not enough to close the public gap.
 
+Runtime Marlin int4 decode is now disabled by default only for sampled-short
+online sessions (`temperature > 0`, `max_tokens <= 256`). The global env
+`TORCHINFERNO_MARLIN_INT4_DECODE=0` showed the initial signal on focused
+self_consistency, improving a same-host row from `337.7 / 0.0 / 359.6ms` to
+`312.6 / 0.0 / 332.9ms`, but that switch is too broad because prior tree
+checks showed all-session Marlin disable hurts sampled-medium traffic. A
+min-M gate prototype with `TORCHINFERNO_MARLIN_INT4_MIN_M=16` is rejected; it
+regressed focused self_consistency to `358.7 / 0.0 / 384.1ms`. The promoted
+runtime policy leaves Marlin enabled for greedy and sampled-medium sessions
+while turning it off for self_consistency's sampled-short bucket. A paired
+same-code check landed at `227.3 / 0.0 / 346.3ms` with
+`TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_SHORT_MARLIN_INT4_DECODE=0` versus
+`362.4 / 0.0 / 384.4ms` no-env Marlin-on control, both `1000/1000` correct.
+After making that sampled-short behavior the default, a no-env confirmation
+landed at `246.5 / 0.0 / 358.3ms`, also `1000/1000` correct. This does not
+close the public vLLM self_consistency row yet, but it removes a clear
+sampled-short regression without changing few_shot, multi_turn,
+tree_of_thought, or long_output default buckets. Explicit overrides remain:
+`TORCHINFERNO_OPENAI_TP_ONLINE_MARLIN_INT4_DECODE` for all online sessions and
+`TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_SHORT_MARLIN_INT4_DECODE` for the
+sampled-short bucket.
+
 The prior same-host no-profile all-provider comparison on pushed `d363367`
 landed at SGLang `13/20`, TorchInferno `4/20`, and vLLM `2/20`. TorchInferno
 rows were: few_shot `174.5 / 50.5 / 220.0ms`, self_consistency

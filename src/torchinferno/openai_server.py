@@ -581,6 +581,32 @@ def _set_tensor_parallel_runtime_fp8_prefill(model: object, *, enabled: bool, mi
         setattr(layer, "_runtime_fp8_prefill_min_m", max(1, int(min_m)))
 
 
+def _online_marlin_int4_decode_enabled(*, temperature: float, max_tokens: int) -> bool:
+    global_env = "TORCHINFERNO_OPENAI_TP_ONLINE_MARLIN_INT4_DECODE"
+    if global_env in os.environ:
+        return env_flag(global_env, True)
+    sampled_short_env = "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_SHORT_MARLIN_INT4_DECODE"
+    if (
+        temperature > 0.0
+        and 0 < max_tokens <= env_int(
+            "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_SHORT_MARLIN_INT4_MAX_TOKENS",
+            256,
+            minimum=1,
+        )
+    ):
+        return env_flag(sampled_short_env, False)
+    return True
+
+
+def _set_tensor_parallel_runtime_marlin_int4_decode(model: object, *, enabled: bool) -> None:
+    setter = getattr(model, "set_runtime_marlin_int4_decode", None)
+    if callable(setter):
+        setter(bool(enabled))
+        return
+    for layer in getattr(model, "layers", ()) or ():
+        setattr(layer, "_runtime_marlin_int4_decode_enabled", bool(enabled))
+
+
 def _online_persistent_idle_ms(*, temperature: float, max_tokens: int) -> float:
     global_env = "TORCHINFERNO_OPENAI_TP_ONLINE_PERSISTENT_IDLE_MS"
     if global_env in os.environ:
@@ -4258,6 +4284,10 @@ class OpenAICompletionEngine:
             temperature=first.temperature,
             max_tokens=run_max_tokens,
         )
+        marlin_int4_decode_enabled = _online_marlin_int4_decode_enabled(
+            temperature=first.temperature,
+            max_tokens=run_max_tokens,
+        )
         admit_min_ready_requests = _online_refill_min_ready_requests(
             temperature=first.temperature,
             max_tokens=run_max_tokens,
@@ -4373,6 +4403,7 @@ class OpenAICompletionEngine:
                 store_full_prompt_prefixes=store_full_prompt_prefixes,
                 fp8_prefill_enabled=fp8_prefill_enabled,
                 fp8_prefill_min_m=fp8_prefill_min_m,
+                marlin_int4_decode_enabled=marlin_int4_decode_enabled,
                 online_steps=step,
                 online_step_commands=online_step_commands,
                 emitted_events=emitted_events,
@@ -4502,6 +4533,10 @@ class OpenAICompletionEngine:
                 self.model,
                 enabled=fp8_prefill_enabled,
                 min_m=fp8_prefill_min_m,
+            )
+            _set_tensor_parallel_runtime_marlin_int4_decode(
+                self.model,
+                enabled=marlin_int4_decode_enabled,
             )
             with _tensor_parallel_symm_mem_allreduce_scope(
                 self.model,
@@ -4716,6 +4751,7 @@ class OpenAICompletionEngine:
                 enabled=False,
                 min_m=fp8_prefill_min_m,
             )
+            _set_tensor_parallel_runtime_marlin_int4_decode(self.model, enabled=True)
             if started:
                 _broadcast_tensor_parallel_online_close(self.model)
                 _sync_tensor_parallel_command(self.model, self.device)
@@ -12904,10 +12940,18 @@ def _tensor_parallel_worker_loop(engine: OpenAICompletionEngine) -> None:
                     temperature=temperature,
                     max_tokens=max_tokens,
                 )
+                marlin_int4_decode_enabled = _online_marlin_int4_decode_enabled(
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                )
                 _set_tensor_parallel_runtime_fp8_prefill(
                     getattr(engine, "model", None),
                     enabled=fp8_prefill_enabled,
                     min_m=fp8_prefill_min_m,
+                )
+                _set_tensor_parallel_runtime_marlin_int4_decode(
+                    getattr(engine, "model", None),
+                    enabled=marlin_int4_decode_enabled,
                 )
                 admit_min_ready_requests = _online_refill_min_ready_requests(
                     temperature=temperature,
@@ -13088,6 +13132,10 @@ def _tensor_parallel_worker_loop(engine: OpenAICompletionEngine) -> None:
                     getattr(engine, "model", None),
                     enabled=False,
                     min_m=2048,
+                )
+                _set_tensor_parallel_runtime_marlin_int4_decode(
+                    getattr(engine, "model", None),
+                    enabled=True,
                 )
                 # When COW prefix caching is on, KEEP the worker's engine across
                 # sessions so its PagedPrefixCache + paged pool persist -- matching the

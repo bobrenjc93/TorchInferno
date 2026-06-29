@@ -1272,6 +1272,7 @@ class _Llama3TensorParallelLayer:
         self.profile_seconds: dict[str, float] | None = None
         self._runtime_fp8_prefill_enabled = False
         self._runtime_fp8_prefill_min_m = 2048
+        self._runtime_marlin_int4_decode_enabled = True
         self.profile_counts: dict[str, int] | None = None
         self._mlp_project_graph: _StaticCudaGraphCall | None = None
         self._mlp_project_graph_failed = False
@@ -1868,6 +1869,8 @@ class _Llama3TensorParallelLayer:
         # gate_up int4 is greedy-EXACT vs bf16 (5/5 short + 4/4 long-ctx paged). The
         # large-M prefill GEMM lever is separately FP8 _scaled_mm (no infra yet).
         if not _tp_flag("TORCHINFERNO_MARLIN_INT4_DECODE", True):
+            return None
+        if not bool(getattr(self, "_runtime_marlin_int4_decode_enabled", True)):
             return None
         if not hidden.is_cuda:  # marlin_gemm is CUDA-only; CPU falls back to bf16
             return None
@@ -2681,6 +2684,10 @@ class Llama3TensorParallelForCausalLM:
         for layer in self.layers:
             setattr(layer, "_runtime_fp8_prefill_enabled", bool(enabled))
             setattr(layer, "_runtime_fp8_prefill_min_m", min_m)
+
+    def set_runtime_marlin_int4_decode(self, enabled: bool) -> None:
+        for layer in self.layers:
+            setattr(layer, "_runtime_marlin_int4_decode_enabled", bool(enabled))
 
     @classmethod
     def from_pretrained(

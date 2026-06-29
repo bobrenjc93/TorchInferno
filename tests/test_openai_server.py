@@ -116,6 +116,7 @@ from torchinferno.openai_server import (
     _online_kv_bounded_concurrency_enabled,
     _online_kv_bounded_max_active_cap,
     _online_kv_token_budget,
+    _online_marlin_int4_decode_enabled,
     _online_persistent_idle_ms,
     _online_refill_min_ready_requests,
     _online_session_max_tokens,
@@ -154,6 +155,7 @@ from torchinferno.openai_server import (
     _sampled_batch_shape_bucket_size,
     _set_generation_cache_rows_seq_lens,
     _set_tensor_parallel_runtime_fp8_prefill,
+    _set_tensor_parallel_runtime_marlin_int4_decode,
     _should_reexec_distributed_server,
     _startup_warmup_enabled_for_cache_backend,
     _sync_tensor_parallel_command,
@@ -8933,6 +8935,73 @@ def test_set_tensor_parallel_runtime_fp8_prefill_updates_layers() -> None:
 
     assert [layer._runtime_fp8_prefill_enabled for layer in layers] == [False, False]
     assert [layer._runtime_fp8_prefill_min_m for layer in layers] == [1, 1]
+
+
+def test_online_marlin_int4_decode_defaults_off_for_sampled_short(monkeypatch) -> None:
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_MARLIN_INT4_DECODE", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_SHORT_MARLIN_INT4_DECODE", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_SHORT_MARLIN_INT4_MAX_TOKENS", raising=False)
+
+    assert not _online_marlin_int4_decode_enabled(temperature=0.7, max_tokens=256)
+    assert _online_marlin_int4_decode_enabled(temperature=0.7, max_tokens=257)
+    assert _online_marlin_int4_decode_enabled(temperature=0.0, max_tokens=256)
+
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_SHORT_MARLIN_INT4_MAX_TOKENS", "128")
+    assert not _online_marlin_int4_decode_enabled(temperature=0.7, max_tokens=128)
+    assert _online_marlin_int4_decode_enabled(temperature=0.7, max_tokens=129)
+
+
+def test_online_marlin_int4_decode_respects_env_overrides(monkeypatch) -> None:
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_MARLIN_INT4_DECODE", raising=False)
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_SHORT_MARLIN_INT4_DECODE", "0")
+
+    assert not _online_marlin_int4_decode_enabled(temperature=0.7, max_tokens=256)
+    assert _online_marlin_int4_decode_enabled(temperature=0.7, max_tokens=257)
+    assert _online_marlin_int4_decode_enabled(temperature=0.0, max_tokens=256)
+
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_SHORT_MARLIN_INT4_MAX_TOKENS", "128")
+    assert not _online_marlin_int4_decode_enabled(temperature=0.7, max_tokens=128)
+    assert _online_marlin_int4_decode_enabled(temperature=0.7, max_tokens=129)
+
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_MARLIN_INT4_DECODE", "0")
+    assert not _online_marlin_int4_decode_enabled(temperature=0.7, max_tokens=128)
+    assert not _online_marlin_int4_decode_enabled(temperature=0.0, max_tokens=512)
+
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_MARLIN_INT4_DECODE", "1")
+    assert _online_marlin_int4_decode_enabled(temperature=0.7, max_tokens=128)
+
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_MARLIN_INT4_DECODE", raising=False)
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_SHORT_MARLIN_INT4_DECODE", "1")
+    assert _online_marlin_int4_decode_enabled(temperature=0.7, max_tokens=128)
+
+
+def test_set_tensor_parallel_runtime_marlin_int4_decode_updates_layers() -> None:
+    layers = [types.SimpleNamespace(), types.SimpleNamespace()]
+    model = types.SimpleNamespace(layers=layers)
+
+    _set_tensor_parallel_runtime_marlin_int4_decode(model, enabled=False)
+
+    assert [layer._runtime_marlin_int4_decode_enabled for layer in layers] == [False, False]
+
+    _set_tensor_parallel_runtime_marlin_int4_decode(model, enabled=True)
+
+    assert [layer._runtime_marlin_int4_decode_enabled for layer in layers] == [True, True]
+
+
+def test_set_tensor_parallel_runtime_marlin_int4_decode_uses_model_setter() -> None:
+    class RuntimeMarlinModel:
+        def __init__(self) -> None:
+            self.calls: list[bool] = []
+
+        def set_runtime_marlin_int4_decode(self, enabled: bool) -> None:
+            self.calls.append(enabled)
+
+    model = RuntimeMarlinModel()
+
+    _set_tensor_parallel_runtime_marlin_int4_decode(model, enabled=False)
+    _set_tensor_parallel_runtime_marlin_int4_decode(model, enabled=True)
+
+    assert model.calls == [False, True]
 
 
 def test_online_kv_bounded_concurrency_defaults_to_short_outputs(monkeypatch) -> None:

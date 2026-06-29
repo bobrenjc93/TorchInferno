@@ -665,6 +665,19 @@ def test_ragged_prefill_precision_graph_key_tracks_global_fp8_env(monkeypatch) -
     assert _ragged_prefill_precision_graph_key(512, is_cuda=True, layers=layers) == (False,)
 
 
+def test_llama3_tensor_parallel_runtime_marlin_int4_decode_updates_layers() -> None:
+    model = object.__new__(Llama3TensorParallelForCausalLM)
+    model.layers = [type("Layer", (), {})(), type("Layer", (), {})()]
+
+    model.set_runtime_marlin_int4_decode(False)
+
+    assert [layer._runtime_marlin_int4_decode_enabled for layer in model.layers] == [False, False]
+
+    model.set_runtime_marlin_int4_decode(True)
+
+    assert [layer._runtime_marlin_int4_decode_enabled for layer in model.layers] == [True, True]
+
+
 def test_llama3_tensor_parallel_temperature_sampling_uses_gumbel_max(monkeypatch) -> None:
     import torch.distributed as dist
 
