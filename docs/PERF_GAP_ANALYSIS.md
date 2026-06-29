@@ -24,6 +24,17 @@ those knobs were already neutral or mixed in full-order checks. The next self
 lever needs to reduce handler/request admission fragmentation without hurting
 few_shot or multi_turn ordering.
 
+Follow-up fast-HTTP accept/read instrumentation on `f4dcb85` narrows the missing
+time further. The score row stayed in-family at `286.5 / 0.0 / 330.4ms`, and
+all `1000` profiled streams were first requests on their connections.
+Accepted-to-handler p50/p99 was only `0.1/0.7ms`, so the `ThreadPoolExecutor`
+is not the hidden median queue. Accepted-to-ready and request-read p50/p99 were
+`47.4/250.0ms`, while server first-content p50/p99 was `9.5/552.3ms`; the
+benchmark still saw `286.5ms` TTFT. The remaining self gap is therefore mostly
+before server accept plus client request-body delivery and tail request waves.
+Do not reopen worker-count/prestart/parallel-accept without a change that
+improves that pre-accept/client-admission side in full benchmark order.
+
 ## Current multi_turn refresh and DQ=8 rejection (2026-06-29)
 
 The restored public run `20260629_185744` kept multi_turn in the expected
