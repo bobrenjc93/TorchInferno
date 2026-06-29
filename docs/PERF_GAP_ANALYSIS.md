@@ -163,6 +163,21 @@ active across 45 prefill graph hits and no misses. Greedy eval spent `3.81s`
 phase time, `1.04s` prefill wall, and `2.65s` decode active. TorchInferno still
 wins only tree TPOT locally; SGLang owns TTFT/E2E/throughput on the same host.
 
+A current same-host tree-only rerun on pushed `07b0d6f` keeps the row in the
+same bucket. vLLM landed at `122.4 / 82.4 / 187.6ms`, SGLang at
+`61.9 / 74.1 / 158.9ms`, and TorchInferno at `246.8 / 49.3 / 298.2ms`, with
+all providers around 97% raw correctness. The TorchInferno queue profile split
+into six sampled-medium sessions for `896` requests and five greedy eval
+sessions for `80` requests. Sampled-medium spent `6.27s` total phase time,
+`3.85s` prefill wall (`1.84s` forward), and `2.06s` decode-active across
+`44` prefill graph hits and zero misses/captures; greedy eval spent `3.24s`
+phase time, `0.86s` prefill wall, and `2.30s` decode-active. Prefix reuse was
+only the 45-token common prefix (`43,920` tokens total), and decode-many stayed
+off for both buckets. This confirms the tree gap is not hidden graph warmup or
+decode-many overrun; it remains sampled-medium prefill/session shape plus the
+short greedy eval decode path. Do not reopen the already rejected 16/40/64-row,
+5ms/20ms initial-wait, idle, idle-arrival, or FP8 min-M knobs from this profile.
+
 Lowering online admission granularity is rejected for sampled-medium tree. A
 focused source-free A/B forced
 `TORCHINFERNO_OPENAI_TP_ONLINE_ADMIT_PER_STEP_CAP=16` on the same pushed
