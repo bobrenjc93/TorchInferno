@@ -360,6 +360,21 @@ through the final `1000/1000` submitted/finished state (`217` online step
 commands, `255` submit batches, `979` generated-prefix reuse requests) despite
 the final `online_batcher` record still being preempted by server teardown.
 
+Cached repeated-sampler state is now enabled for exact-prefix reusable logits.
+The self_consistency hot path repeatedly samples from the same cached prompt and
+generated-prefix logits across hundreds of small waves; those draws still need
+fresh random thresholds, but the logits CDF/rank-sum setup is invariant per
+prefix. The promoted path prepares that state lazily and reuses it through the
+existing symmetric TP sampler hook. Same-tree profiled A/B on the working tree
+validated the direction: default cached state landed at
+`288.2 / 0.0 / 308.7ms`, `1000/1000` correct, with `452` cached-state sample
+hits covering `1950` sampled tokens, `1.55s` exact-prefix prefill wall, and
+`2.84s` online phase time. Disabling it with
+`TORCHINFERNO_CONTINUOUS_CACHED_REPEATED_SAMPLE_STATE=0` regressed to
+`327.6 / 0.0 / 359.6ms`, with `1.82s` prefill wall and `3.12s` phase time.
+This reduces the known self-control-plane cost without changing request
+admission, idle windows, prompt contents, or sampling semantics.
+
 Lowering online admission granularity is rejected for sampled-medium tree. A
 focused source-free A/B forced
 `TORCHINFERNO_OPENAI_TP_ONLINE_ADMIT_PER_STEP_CAP=16` on the same pushed

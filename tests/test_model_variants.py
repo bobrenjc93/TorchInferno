@@ -808,6 +808,23 @@ def test_llama3_tensor_parallel_temperature_gumbel_generators_are_rank_local() -
     assert not torch.equal(first_values, second_values)
 
 
+def test_llama3_tensor_parallel_repeated_sample_state_samples_cached_cdf(monkeypatch) -> None:
+    import torch.distributed as dist
+
+    monkeypatch.setattr(dist, "is_available", lambda: False)
+    monkeypatch.setattr(dist, "is_initialized", lambda: False)
+
+    model = object.__new__(Llama3TensorParallelForCausalLM)
+    logits = torch.tensor([[1000.0, -1000.0, -1000.0, -1000.0]])
+
+    state = model.prepare_repeated_next_token_state(logits, temperature=0.7)
+    sampled = model.sample_repeated_next_token_from_state(state, batch_size=3, temperature=0.7)
+
+    assert sampled is not None
+    assert sampled.tolist() == [0, 0, 0]
+    assert model.sample_repeated_next_token_from_state(state, batch_size=3, temperature=0.8) is None
+
+
 def _write_tiny_llama3_hf_checkpoint(reference: Llama3V0ForCausalLM, config, path) -> None:
     state = reference.state_dict()
     hf_state = {

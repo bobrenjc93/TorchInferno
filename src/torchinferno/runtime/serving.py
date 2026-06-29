@@ -249,6 +249,9 @@ class ServingStats:
     generated_prefix_store_requests: int = 0
     generated_prefix_reuse_requests: int = 0
     generated_prefix_reuse_tokens: int = 0
+    repeated_sample_state_prepares: int = 0
+    repeated_sample_state_hits: int = 0
+    repeated_sample_state_tokens: int = 0
     prefix_reuse_route_counts: dict[str, int] = field(default_factory=dict)
     prefix_reuse_hit_token_counts: dict[str, int] = field(default_factory=dict)
     prefill_shape_counts: dict[str, int] = field(default_factory=dict)
@@ -269,6 +272,8 @@ class _ReusablePrefix:
     tokens: tuple[int, ...]
     row: int
     logits: Tensor | None
+    sample_state: object | None = None
+    sample_temperature: float | None = None
 
 
 @dataclass
@@ -2176,8 +2181,7 @@ class ContinuousBatchEngine:
                 continuation = continuation_reuse[indices[0]]
                 if continuation.logits is None:
                     continue
-                logits = continuation.logits.to(self.device)
-                sampled = self._sample_repeated_logits(logits[:, -1, :], len(indices))
+                sampled = self._sample_reusable_prefix_next_tokens(continuation, len(indices))
                 sampled_tokens = sampled.detach().cpu().tolist()
                 for token_index, row_index in enumerate(indices):
                     continuation_next_tokens[row_index] = int(sampled_tokens[token_index])
@@ -2302,16 +2306,45 @@ class ContinuousBatchEngine:
             reusable = group[indices[0]][3]
             if reusable.logits is None:
                 raise RuntimeError("exact-prefix sampling requires cached logits")
-            logits = reusable.logits.to(self.device)
-            sampled = self._sample_repeated_logits(logits[:, -1, :], len(indices))
+            sampled = self._sample_reusable_prefix_next_tokens(reusable, len(indices))
             sampled_tokens = sampled.detach().cpu().tolist()
             for token_index, group_index in enumerate(indices):
                 next_tokens[group_index] = int(sampled_tokens[token_index])
-                logits_by_index[group_index] = logits
+                logits_by_index[group_index] = reusable.logits
 
         if any(logits is None for logits in logits_by_index):
             raise RuntimeError("exact-prefix sampling did not produce logits for every request")
         return next_tokens, [logits for logits in logits_by_index if logits is not None]
+
+    def _sample_reusable_prefix_next_tokens(self, reusable: _ReusablePrefix, batch_size: int) -> Tensor:
+        if reusable.logits is None:
+            raise RuntimeError("exact-prefix sampling requires cached logits")
+        sample_start_s = time.perf_counter() if self.profile_timings else 0.0
+        try:
+            logits = reusable.logits
+            if (
+                self.temperature > 0.0
+                and env_flag("TORCHINFERNO_CONTINUOUS_CACHED_REPEATED_SAMPLE_STATE", True)
+            ):
+                prepare_state = getattr(self.model, "prepare_repeated_next_token_state", None)
+                sample_from_state = getattr(self.model, "sample_repeated_next_token_from_state", None)
+                if callable(prepare_state) and callable(sample_from_state):
+                    if reusable.sample_state is None or reusable.sample_temperature != self.temperature:
+                        state_logits = logits[:, -1, :].to(self.device)
+                        reusable.sample_state = prepare_state(state_logits, self.temperature)
+                        reusable.sample_temperature = self.temperature
+                        if reusable.sample_state is not None:
+                            self.stats.repeated_sample_state_prepares += 1
+                    if reusable.sample_state is not None:
+                        sampled = sample_from_state(reusable.sample_state, batch_size, self.temperature)
+                        if sampled is not None:
+                            self.stats.repeated_sample_state_hits += 1
+                            self.stats.repeated_sample_state_tokens += int(batch_size)
+                            return sampled.to(self.device)
+            return self._sample_repeated_logits(logits[:, -1, :].to(self.device), batch_size)
+        finally:
+            if self.profile_timings:
+                self.stats.prefill_sample_ms += (time.perf_counter() - sample_start_s) * 1000.0
 
     def _sample_repeated_logits(self, logits: Tensor, batch_size: int) -> Tensor:
         if batch_size <= 1:

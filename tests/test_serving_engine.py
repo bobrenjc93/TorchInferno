@@ -1892,6 +1892,68 @@ def test_continuous_batch_engine_exact_prompt_uses_repeated_sampler() -> None:
     assert not engine.has_online_work()
 
 
+def test_continuous_batch_engine_exact_prompt_reuses_prepared_sample_state() -> None:
+    prompt = tuple(range(1, 18))
+    model = _SelectedLogitsToyModel()
+    prepare_calls: list[float] = []
+    sample_calls: list[tuple[int, float]] = []
+
+    def prepare_repeated_next_token_state(
+        logits: torch.Tensor,
+        temperature: float,
+    ) -> dict[str, torch.Tensor]:
+        prepare_calls.append(temperature)
+        return {"token": torch.argmax(logits, dim=-1)}
+
+    def sample_repeated_next_token_from_state(
+        state: dict[str, torch.Tensor],
+        batch_size: int,
+        temperature: float,
+    ) -> torch.Tensor:
+        sample_calls.append((batch_size, temperature))
+        return state["token"].expand(batch_size).contiguous()
+
+    model.prepare_repeated_next_token_state = prepare_repeated_next_token_state  # type: ignore[attr-defined]
+    model.sample_repeated_next_token_from_state = sample_repeated_next_token_from_state  # type: ignore[attr-defined]
+    engine = ContinuousBatchEngine(
+        model,
+        device=torch.device("cpu"),
+        temperature=0.7,
+        max_active_requests=2,
+        prefix_cache_capacity=4,
+        pin_shared_prefix=True,
+        graph_prefill=True,
+        prefill_chunk_size=4,
+    )
+    engine.start_online(max_seq_len=64)
+    _indexed, warm_active = engine._prefill_many(
+        [
+            (0, ServingRequest("warm-a", prompt, 1, arrival_step=0)),
+            (1, ServingRequest("warm-b", prompt, 1, arrival_step=0)),
+        ],
+        0,
+        events=[],
+    )
+    for state in warm_active:
+        engine._finish_and_release(state, 0)
+
+    engine.submit_online(ServingRequest("late-a", prompt, 1, arrival_step=0))
+    assert [(event.request_id, event.token, event.finished) for event in engine.step_online()] == [
+        ("late-a", 18, True)
+    ]
+    engine.submit_online(ServingRequest("late-b", prompt, 1, arrival_step=0))
+    assert [(event.request_id, event.token, event.finished) for event in engine.step_online()] == [
+        ("late-b", 18, True)
+    ]
+
+    assert prepare_calls == [0.7]
+    assert sample_calls == [(1, 0.7), (1, 0.7)]
+    assert engine.stats.repeated_sample_state_prepares == 1
+    assert engine.stats.repeated_sample_state_hits == 2
+    assert engine.stats.repeated_sample_state_tokens == 2
+    assert not engine.has_online_work()
+
+
 def test_continuous_batch_engine_unified_online_reuses_exact_prompt_from_cached_logits(
     monkeypatch,
 ) -> None:

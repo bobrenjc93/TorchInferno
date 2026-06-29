@@ -1197,6 +1197,13 @@ class _StaticRaggedPrefillLogitsGraphCall:
 
 
 @dataclass
+class _RepeatedTemperatureSampleState:
+    temperature: float
+    cumulative_local: Tensor
+    rank_cumulative: Tensor | None
+
+
+@dataclass
 class _StaticPrefillGraphCall:
     graph: torch.cuda.CUDAGraph
     static_input_ids: Tensor
@@ -5336,6 +5343,88 @@ class Llama3TensorParallelForCausalLM:
             threshold = torch.rand((batch_size,), dtype=cumulative.dtype, device=logits.device) * cumulative[-1]
             return torch.searchsorted(cumulative, threshold)
         return self._sample_next_token_temperature_repeated(logits, batch_size, temperature)
+
+    def prepare_repeated_next_token_state(
+        self,
+        logits: Tensor,
+        temperature: float,
+    ) -> _RepeatedTemperatureSampleState | None:
+        if temperature <= 0.0 or logits.size(0) != 1:
+            return None
+        logits_float = logits.float() / temperature
+        local_max = torch.max(logits_float, dim=-1).values
+        if dist.is_available() and dist.is_initialized():
+            global_max = local_max.clone()
+            dist.all_reduce(global_max, op=dist.ReduceOp.MAX)
+            weights = torch.exp(logits_float - global_max[:, None])
+            local_sum = weights.sum(dim=-1)
+            gathered_sums = torch.empty(
+                (self.world_size, *local_sum.shape),
+                dtype=local_sum.dtype,
+                device=logits.device,
+            )
+            dist.all_gather_into_tensor(gathered_sums, local_sum.contiguous())
+            rank_cumulative = torch.cumsum(gathered_sums[:, 0], dim=0).contiguous()
+        else:
+            weights = torch.exp(logits_float - local_max[:, None])
+            rank_cumulative = None
+        cumulative_local = torch.cumsum(weights[0], dim=-1).contiguous()
+        return _RepeatedTemperatureSampleState(
+            temperature=float(temperature),
+            cumulative_local=cumulative_local,
+            rank_cumulative=rank_cumulative,
+        )
+
+    def sample_repeated_next_token_from_state(
+        self,
+        state: object,
+        batch_size: int,
+        temperature: float,
+    ) -> Tensor | None:
+        if (
+            not isinstance(state, _RepeatedTemperatureSampleState)
+            or batch_size < 1
+            or abs(float(temperature) - state.temperature) > 1e-12
+        ):
+            return None
+        cumulative_local = state.cumulative_local
+        if not dist.is_available() or not dist.is_initialized():
+            threshold = torch.rand(
+                (batch_size,),
+                dtype=cumulative_local.dtype,
+                device=cumulative_local.device,
+            ) * cumulative_local[-1]
+            return torch.searchsorted(cumulative_local, threshold)
+        rank_cumulative = state.rank_cumulative
+        if rank_cumulative is None:
+            return None
+        sample_payload = torch.empty((2, batch_size), dtype=torch.float32, device=cumulative_local.device)
+        if self.is_primary:
+            target = torch.rand(
+                (batch_size,),
+                dtype=rank_cumulative.dtype,
+                device=rank_cumulative.device,
+            ) * rank_cumulative[-1]
+            selected_rank = (rank_cumulative[:, None] < target[None, :]).sum(dim=0).to(torch.long)
+            previous = torch.zeros_like(target)
+            has_previous = selected_rank > 0
+            previous[has_previous] = rank_cumulative[selected_rank[has_previous] - 1]
+            sample_payload[0].copy_(selected_rank.to(sample_payload.dtype))
+            sample_payload[1].copy_(target - previous)
+        dist.broadcast(sample_payload, src=0)
+        selected_rank = sample_payload[0].to(torch.long)
+        local_threshold = sample_payload[1].to(cumulative_local.dtype)
+        local_threshold = torch.minimum(local_threshold, cumulative_local[-1].expand_as(local_threshold))
+        local_index = torch.searchsorted(cumulative_local, local_threshold)
+        local_index = torch.clamp(local_index, max=self.local_vocab_size - 1)
+        selected = selected_rank == self.rank
+        local_token = torch.where(
+            selected,
+            local_index + self.vocab_start,
+            torch.zeros_like(local_index),
+        )
+        dist.all_reduce(local_token, op=dist.ReduceOp.SUM)
+        return local_token
 
     def _sample_next_token_greedy(self, logits: Tensor) -> Tensor:
         if _tp_flag("TORCHINFERNO_GREEDY_SAMPLE_GATHER", False):
