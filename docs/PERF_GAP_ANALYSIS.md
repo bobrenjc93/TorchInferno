@@ -28,6 +28,25 @@ TorchInferno dropped to `3/20`, few_shot regressed to
 (`25.2ms` vs `24.9ms`). Back out the greedy-mid default and keep first-wave
 collection as an env-only experiment until it improves the full scorecard.
 
+The restored public run `20260629_185744` measured TorchInferno `20cb8e8` after
+backing out that default. The scorecard remained SGLang `14/20`, TorchInferno
+`3/20`, and vLLM `2/20`; long_output was a near TPOT tie rather than a stable
+new regression (`24.7ms` TorchInferno vs `24.6ms` SGLang), but SGLang still won
+all four long_output score cells. A focused long_output queue/fast-HTTP profile
+on the same commit landed at `293.1 / 24.8 / 1180.9ms`, 1000/1000 correct.
+Server queue-to-first-token p50 was `240.5ms`, matching fast-HTTP
+first-content p50 `243.8ms`, so the median remains inside server
+scheduling/prefill rather than response writing.
+
+The long_output counters also match the older diagnosis: `56` prefill batches,
+one request-path `b64:s64` prefix graph capture costing `1.17s`, `7.89s`
+prefill wall, `13.62s` ragged-decode GPU event time, and `6.97s` ordinary
+ragged token harvest exposure. Reopening broad or narrow `b64` suffix warmup is
+still rejected because it already removed this capture without a score-facing
+win. The remaining useful long-output work is still a decode/readback or
+prefill pipeline change that lowers first-token latency without fragmenting the
+decode path.
+
 ## Current 23395db refresh and greedy-short FP8 prefill (2026-06-29)
 
 Public run `20260629_165551` measured TorchInferno `23395db`, SGLang
