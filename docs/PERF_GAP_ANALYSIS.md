@@ -45,7 +45,14 @@ is not worth the startup cost or stability risk from this broader warmup shape.
 The normal default warmup path remains healthy with the startup barrier: a
 focused long_output retry reached readiness in `165.7s`, completed `1000/1000`
 correct requests, and landed at `281.6 / 25.5 / 1337.3ms` with
-`30.3 tok/s`.
+`30.3 tok/s`. A same-host env-only follow-up lowered only
+`TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_INITIAL_BATCH_WAIT_MS` from `1` to
+`0` and improved the focused row to `274.0 / 24.9 / 1205.6ms`, `31.7 tok/s`,
+also `1000/1000` correct. Promote the zero wait for deterministic greedy-short
+traffic only; the bucket remains capped at `max_tokens <= 128`, below few_shot.
+A no-env patched confirmation then landed at `255.7 / 25.5 / 1341.6ms`,
+`31.2 tok/s`, also `1000/1000` correct. This confirms the TTFT/throughput
+benefit while median E2E stays in the current variance band.
 
 ## Greedy-large multi_turn suffix bucket refinement (2026-06-28)
 
@@ -167,7 +174,12 @@ SGLang (`24.9ms` vs `28.4ms` and `25.1ms`) but still loses TTFT/E2E/throughput
 phase total `24.73s -> 24.11s`. Lowering the refill floor to `1` is rejected:
 it improved TTFT to `152.9ms` but regressed TPOT/E2E/throughput to
 `32.6ms / 1380.0ms / 27.9 tok/s` by fragmenting into `190` prefill batches.
-Promote the `1ms` greedy-short first-batch wait only; this bucket stays below
+Later same-host rechecks on `de4d2e4` moved this bucket from `1ms` to `0ms`:
+the default barrier run was `281.6 / 25.5 / 1337.3ms`, while zero wait landed at
+`274.0 / 24.9 / 1205.6ms` as an env-only run. The patched no-env confirmation
+was `255.7 / 25.5 / 1341.6ms`, with better TTFT/throughput than the 1ms default
+and E2E in the same variance band; all three runs were `1000/1000` correct.
+Promote the `0ms` greedy-short first-batch wait only; this bucket stays below
 few_shot's `256`-token cap and targets long_output.
 
 Self_consistency on current `6ce94f1` is now mostly a control-plane/finish-path
