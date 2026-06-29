@@ -1,6 +1,6 @@
 # TorchInferno vs vLLM/sglang — Performance Gap Analysis (Llama-3.1-70B, 8xH100)
 
-## Current 7110c60 public refresh and greedy-mid first-wave wait (2026-06-29)
+## Greedy-mid first-wave wait rejected after public-order run (2026-06-29)
 
 Public run `20260629_180924` measured TorchInferno `7110c60`, SGLang
 `643e1cc`, and the current vLLM environment. The scorecard stayed at SGLang
@@ -8,8 +8,6 @@ Public run `20260629_180924` measured TorchInferno `7110c60`, SGLang
 `164.2 / 49.7 / 205.0ms`, self_consistency `281.8 / 0.0 / 349.0ms`,
 multi_turn `323.7 / 61.6 / 383.0ms`, tree_of_thought
 `283.9 / 47.0 / 308.1ms`, and long_output `273.9 / 24.4 / 1204.6ms`.
-TorchInferno still wins TPOT on few_shot, multi_turn, tree_of_thought, and
-long_output, but the score-facing TTFT/E2E gaps remain.
 
 A focused few_shot profile on the same commit landed at
 `171.3 / 51.1 / 213.8ms`, 978/1000 raw correct. Fast-HTTP p50 first-content was
@@ -19,11 +17,16 @@ server-side first-wave issue: `initial_batch_size=2`, greedy-mid
 `max_active=32`, and `fp8_prefill_enabled=false` for the 256-token deterministic
 bucket. Extending FP8 prefill to greedy `max_tokens=256` with `min_m=512` is
 rejected: the focused clean row landed at `166.9 / 51.8 / 208.1ms`, worse than
-the public TorchInferno few_shot row. A cleaner first-wave collection knob was
-useful: forcing a 5ms online initial wait landed at
-`164.5 / 48.7 / 204.3ms`, 977/1000 raw correct. Promote that narrowly for
-deterministic greedy-mid sessions (`128 < max_tokens <= 300`) so it can help
-few_shot without changing short greedy long_output or 512-token multi_turn.
+the public TorchInferno few_shot row.
+
+A 5ms first-wave collection looked useful in focused checks: the env-forced row
+landed at `164.5 / 48.7 / 204.3ms`, and the edited no-env checkout landed at
+`161.8 / 48.1 / 202.6ms`, both with 977/1000 raw correctness. The full
+public-order run `20260629_184300` on pushed `cdf5c65` did not hold the win:
+TorchInferno dropped to `3/20`, few_shot regressed to
+`170.1 / 48.5 / 213.8ms`, and long_output lost the TPOT cell to SGLang
+(`25.2ms` vs `24.9ms`). Back out the greedy-mid default and keep first-wave
+collection as an env-only experiment until it improves the full scorecard.
 
 ## Current 23395db refresh and greedy-short FP8 prefill (2026-06-29)
 
