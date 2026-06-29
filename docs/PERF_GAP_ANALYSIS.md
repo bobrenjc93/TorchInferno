@@ -132,6 +132,13 @@ HTTP p50 first-content stayed flat at `260.7ms`. Keep the greedy-large quantum
 at `16` until a scheduler change improves median TTFT/E2E or throughput, not
 only tails/internal counters.
 
+A midpoint decode quantum of `12` is also rejected. The profiled A/B on
+`de3d441` looked cleaner than DQ=8 (`308.5 / 63.9 / 365.9ms`) and preserved
+graph-backed prefill (`34` hits, zero misses), but the no-profile repeat did
+not hold the median win: `324.1 / 63.9 / 381.9ms`, with throughput still
+`3.1 tok/s`. This is not enough to change the public score shape, so keep the
+512-token greedy default at `16`.
+
 ## Greedy-mid first-wave wait rejected after public-order run (2026-06-29)
 
 Public run `20260629_180924` measured TorchInferno `7110c60`, SGLang
