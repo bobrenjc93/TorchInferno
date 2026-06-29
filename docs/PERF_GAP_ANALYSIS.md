@@ -76,6 +76,21 @@ rejected: readiness rose to `180.8s` and the score row regressed to
 batch set at `1,2,4,8,16,32`; removing that one capture is not enough to improve
 client-observed tree medians.
 
+Promote the narrower runtime-side fix for the same unpaddable shape: when a
+common-prefix suffix graph wants to pad to the warmed power-of-two batch but no
+active row is free, it may now borrow a free prefix-cache row for the discarded
+dummy row. This avoids evicting cached prefixes and keeps live decode rows
+unchanged. The patched tree profile eliminated request-path prefill graph
+captures entirely (`ragged_prefill:b31` disappeared) and replayed warmed
+`b32/b16/b4/b1` prefix graphs, with the focused row staying in band at
+`233.2 / 49.3 / 279.2ms` and p99 E2E improving versus the prior profiled
+`2577ms` tail. A no-profile same-host check kept the score-facing shape:
+TorchInferno `213.4 / 49.6 / 254.5ms`, SGLang
+`63.2 / 68.2 / 156.0ms`, and a separate vLLM rerun with the fixed
+`libstdc++` path landed at `125.1 / 85.5 / 193.9ms`. TorchInferno still wins
+only tree TPOT; the remaining gap is first-token scheduling/prefill MFU, not
+request-path graph capture.
+
 ## Greedy-large multi_turn suffix bucket refinement (2026-06-28)
 
 Current multi_turn is still conversation-prefix prefill dominated, but the

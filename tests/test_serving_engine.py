@@ -357,6 +357,8 @@ class _SelectedLogitsToyModel(_RaggedGraphToyModel):
         super().__init__(vocab_size)
         self.selected_positions: list[list[int]] = []
         self.prefill_src_prefix_rows: list[list[int] | None] = []
+        self.prefill_input_shapes: list[tuple[int, int]] = []
+        self.prefill_row_indices: list[list[int]] = []
         self.prefill_capture_flags: list[bool] = []
 
     def forward(
@@ -394,6 +396,8 @@ class _SelectedLogitsToyModel(_RaggedGraphToyModel):
         self.prefill_src_prefix_rows.append(
             None if src_prefix_row is None else src_prefix_row.detach().cpu().tolist()
         )
+        self.prefill_input_shapes.append((int(input_ids.size(0)), int(input_ids.size(1))))
+        self.prefill_row_indices.append(row_indices.detach().cpu().tolist())
         cache.advance_rows(row_indices.detach().cpu().tolist(), input_ids.size(1))
         return self._ragged_prefill_compute(input_ids, logit_positions)
 
@@ -404,6 +408,8 @@ class _SelectedLogitsToyModel(_RaggedGraphToyModel):
         self.prefill_src_prefix_rows.append(
             None if src_prefix_row is None else src_prefix_row.detach().cpu().tolist()
         )
+        self.prefill_input_shapes.append((int(input_ids.size(0)), int(input_ids.size(1))))
+        self.prefill_row_indices.append(row_indices.detach().cpu().tolist())
         cache.advance_rows(row_indices.detach().cpu().tolist(), input_ids.size(1))
         return self._ragged_prefill_compute(input_ids, logit_positions)
 
@@ -1482,6 +1488,33 @@ def test_continuous_batch_engine_records_profile_shape_counts() -> None:
         "prefix_graph:b4:s4:p16-16:src1:mixed0"
     ] == 1
     assert any(key.startswith("ragged:b3/") for key in engine.stats.decode_shape_counts)
+
+
+def test_continuous_batch_engine_uses_prefix_rows_for_graph_padding_when_active_rows_full() -> None:
+    shared = tuple(range(16))
+    model = _SelectedLogitsToyModel()
+    engine = ContinuousBatchEngine(
+        model,
+        device=torch.device("cpu"),
+        max_active_requests=4,
+        prefix_cache_capacity=4,
+        graph_prefill=True,
+    )
+    requests = [
+        ServingRequest("hold", (31, 32), 4, arrival_step=0),
+        ServingRequest("a", (*shared, 21), 2, arrival_step=1),
+        ServingRequest("b", (*shared, 22), 2, arrival_step=1),
+        ServingRequest("c", (*shared, 23), 2, arrival_step=1),
+    ]
+
+    results = engine.run(requests)
+
+    assert len(results) == 4
+    assert (4, 1) in model.prefill_input_shapes
+    assert any(
+        len(rows) == 4 and any(row >= engine.max_active_requests for row in rows)
+        for rows in model.prefill_row_indices
+    )
 
 
 def test_continuous_batch_engine_raises_common_prefix_ragged_suffix_threshold_for_greedy_short(

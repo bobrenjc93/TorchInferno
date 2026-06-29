@@ -1774,6 +1774,7 @@ class ContinuousBatchEngine:
         batch_bucket = self._prefill_batch_bucket(count)
         rows = [self._acquire_active_row() for _ in group]
         pad_rows: list[int] = []
+        pad_prefix_rows: list[int] = []
         try:
             # The prefix KV broadcast is FOLDED INTO the prefill graph (copy from
             # each reusable source row to its active row in one captured pass), so
@@ -1797,8 +1798,13 @@ class ContinuousBatchEngine:
                 for _ in range(batch_bucket - count):
                     pad_row = self._acquire_active_row_or_none()
                     if pad_row is None:
-                        break
-                    pad_rows.append(pad_row)
+                        prefix_pad_row = self._acquire_free_prefix_row_or_none()
+                        if prefix_pad_row is None:
+                            break
+                        pad_prefix_rows.append(prefix_pad_row)
+                        pad_row = prefix_pad_row
+                    else:
+                        pad_rows.append(pad_row)
                     padded_suffixes.append(list(dummy_suffix))
                     start_lens.append(prefix_hits[0])
                     source_prefix_rows.append(source_prefix_rows[0])
@@ -1816,7 +1822,7 @@ class ContinuousBatchEngine:
             if self.profile_timings:
                 self.stats.prefill_copy_ms += (time.perf_counter() - copy_start_s) * 1000.0
             setup_start_s = time.perf_counter() if self.profile_timings else 0.0
-            all_rows = rows + pad_rows
+            all_rows = rows + pad_rows + pad_prefix_rows
             input_ids = torch.tensor(padded_suffixes, device=self.device, dtype=torch.long)
             row_indices = torch.tensor(all_rows, device=self.device, dtype=torch.long)
             src_prefix_row = torch.tensor(source_prefix_rows, device=self.device, dtype=torch.long)
@@ -1826,7 +1832,8 @@ class ContinuousBatchEngine:
                 seq_lens_list[physical_row] = start_len
             seq_lens = torch.tensor(seq_lens_list, device=self.device, dtype=torch.long)
             logit_positions = torch.tensor(
-                [length - 1 for length in suffix_lengths] + [0] * len(pad_rows),
+                [length - 1 for length in suffix_lengths]
+                + [0] * (len(pad_rows) + len(pad_prefix_rows)),
                 device=self.device,
                 dtype=torch.long,
             )
@@ -1855,6 +1862,9 @@ class ContinuousBatchEngine:
             for pad_row in pad_rows:
                 self._release_active_row(pad_row)
             pad_rows = []
+            for pad_row in pad_prefix_rows:
+                self._release_prefix_row(pad_row)
+            pad_prefix_rows = []
             if logits is None:
                 for row in rows:
                     self._release_active_row(row)
@@ -1898,6 +1908,8 @@ class ContinuousBatchEngine:
         except Exception:
             for pad_row in pad_rows:
                 self._release_active_row(pad_row)
+            for pad_row in pad_prefix_rows:
+                self._release_prefix_row(pad_row)
             for row in rows:
                 self._release_active_row(row)
             raise
@@ -3775,6 +3787,15 @@ class ContinuousBatchEngine:
         row = self._free_active_rows.pop()
         self._clear_physical_row(row)
         return row
+
+    def _acquire_free_prefix_row_or_none(self) -> int | None:
+        if self.prefix_cache_capacity == 0 or not self._free_prefix_rows:
+            return None
+        for row in _preferred_prefix_rows():
+            if row in self._free_prefix_rows:
+                self._free_prefix_rows.remove(row)
+                return row
+        return self._free_prefix_rows.pop()
 
     def _release_active_row(self, row: int) -> None:
         # Skip the GPU KV zero on release: _acquire_active_row already clears a
