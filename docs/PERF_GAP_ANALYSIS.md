@@ -181,6 +181,19 @@ decode-many and ragged active/padding splits directly so future long_output runs
 can distinguish useful multi-step decode work, padded bucket work, and true
 overrun without local trace reconstruction.
 
+A current long_output profile on pushed `74629ea` landed at
+`255.5 / 25.7 / 1241.8ms`, 1000/1000 correct. Queue counters kept the known
+shape: `56` prefill batches with one `b64:s64` prefix-graph capture
+(`1.07s`), `8.03s` prefill wall, `11.73s` ragged-decode GPU event time,
+`6.10s` CPU token harvest, `6.49K` ragged padding tokens, and `430`
+decode-many skipped tokens. A source prototype split large prefix-reuse graph
+batches at `32` rows to avoid the cold `b64` capture. It did remove captures and
+cut prefill wall to `6.80s`, but regressed the score row to
+`271.3 / 25.0 / 1286.4ms`: runtime steps rose `486 -> 597`, decode GPU time
+rose `11.73s -> 13.44s`, CPU token harvest rose `6.10s -> 7.46s`, and ragged
+padding rose `6.49K -> 7.36K`. The prototype was reverted; trading one prefill
+capture for more decode/scheduling fragmentation is not a defaultable path.
+
 Runtime Marlin int4 decode is now disabled by default only for sampled-short
 online sessions (`temperature > 0`, `max_tokens <= 256`). The global env
 `TORCHINFERNO_MARLIN_INT4_DECODE=0` showed the initial signal on focused
