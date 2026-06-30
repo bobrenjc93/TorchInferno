@@ -3298,6 +3298,8 @@ class ContinuousBatchEngine:
         logits, _ = self._prefill_full_logits(input_ids, cache=self._cache_view(rows))
         self._stop_decode_ragged_model_gpu_timer(gpu_model_events, shape_key=shape_key)
         if self.profile_timings:
+            if self.device.type == "cuda":
+                torch.cuda.synchronize(self.device)
             model_elapsed_ms = (time.perf_counter() - model_start_s) * 1000.0
             self.stats.decode_ragged_model_ms += model_elapsed_ms
             if shape_key is not None:
@@ -3420,6 +3422,8 @@ class ContinuousBatchEngine:
         self._stop_decode_ragged_model_gpu_timer(gpu_model_events, shape_key=shape_key)
         self._record_model_call("decode", n_padded, tokens=n_padded, ragged=True, active_tokens=n_active)
         if self.profile_timings:
+            if self.device.type == "cuda":
+                torch.cuda.synchronize(self.device)
             model_elapsed_ms = (time.perf_counter() - model_start_s) * 1000.0
             self.stats.decode_ragged_model_ms += model_elapsed_ms
             if shape_key is not None:
@@ -3477,6 +3481,8 @@ class ContinuousBatchEngine:
         self._ensure_gpu_token_buf().index_copy_(0, active_row_indices, next_token_tensor[:n_active])
         self._advance_gpu_seq_lens(active_row_indices)
         if self.profile_timings:
+            if self.device.type == "cuda":
+                torch.cuda.synchronize(self.device)
             model_elapsed_ms = (time.perf_counter() - model_start_s) * 1000.0
             self.stats.decode_ragged_model_ms += model_elapsed_ms
             if shape_key is not None:
