@@ -2566,7 +2566,8 @@ def test_openai_stream_defer_role_defaults_to_bounded_streams(monkeypatch) -> No
     assert not _stream_defer_role_enabled(max_tokens=256, temperature=0.0)
 
 
-def test_openai_engine_microbatches_same_shape_requests() -> None:
+def test_openai_engine_microbatches_same_shape_requests(monkeypatch) -> None:
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_PROMPT_TOKEN_CACHE_MAX_ENTRIES", "0")
     model = _BatchRecordingModel()
     tokenizer = _BarrierByteFallbackTokenizer(vocab_size=8, parties=2)
     engine = OpenAICompletionEngine(
@@ -8956,12 +8957,42 @@ def test_openai_online_prefill_ready_before_decode_respects_env(monkeypatch) -> 
         "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_PREFILL_READY_MAX_TOKENS",
         raising=False,
     )
-    assert not _online_prefill_ready_before_decode_enabled(temperature=0.0, max_tokens=64)
+    monkeypatch.delenv(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_PREFILL_READY_BEFORE_DECODE",
+        raising=False,
+    )
+    monkeypatch.delenv(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_PREFILL_READY_ACTIVE_CAP",
+        raising=False,
+    )
+    assert _online_prefill_ready_before_decode_enabled(temperature=0.0, max_tokens=64)
+    assert _online_prefill_ready_before_decode_active_cap(temperature=0.0, max_tokens=64) == 4
+    assert not _online_prefill_ready_before_decode_enabled(temperature=0.0, max_tokens=256)
     assert not _online_prefill_ready_before_decode_enabled(temperature=0.7, max_tokens=256)
     assert _online_prefill_ready_before_decode_enabled(temperature=0.7, max_tokens=300)
     assert _online_prefill_ready_before_decode_active_cap(temperature=0.7, max_tokens=300) == 4
     assert not _online_prefill_ready_before_decode_enabled(temperature=0.7, max_tokens=301)
     assert _online_prefill_ready_before_decode_active_cap(temperature=0.7, max_tokens=301) is None
+
+    monkeypatch.setenv(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_PREFILL_READY_BEFORE_DECODE",
+        "0",
+    )
+    assert not _online_prefill_ready_before_decode_enabled(temperature=0.0, max_tokens=64)
+    assert _online_prefill_ready_before_decode_active_cap(temperature=0.0, max_tokens=64) is None
+    monkeypatch.delenv(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_PREFILL_READY_BEFORE_DECODE",
+        raising=False,
+    )
+    monkeypatch.setenv(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_PREFILL_READY_ACTIVE_CAP",
+        "8",
+    )
+    assert _online_prefill_ready_before_decode_active_cap(temperature=0.0, max_tokens=64) == 8
+    monkeypatch.delenv(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_PREFILL_READY_ACTIVE_CAP",
+        raising=False,
+    )
 
     monkeypatch.setenv(
         "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_PREFILL_READY_BEFORE_DECODE",
@@ -9731,6 +9762,7 @@ def test_openai_greedy_common_prefix_suffix_warmup_captures_target_shapes(monkey
     monkeypatch.setenv("TORCHINFERNO_OPENAI_WARMUP_ONLINE_GREEDY_COMMON_PREFIX_TOKENS", "5")
     monkeypatch.setenv("TORCHINFERNO_OPENAI_WARMUP_ONLINE_GREEDY_COMMON_PREFIX_SUFFIX_TOKENS", "3,7")
     monkeypatch.setenv("TORCHINFERNO_OPENAI_WARMUP_ONLINE_GREEDY_COMMON_PREFIX_SUFFIX_BATCHES", "2,4")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_WARMUP_ONLINE_GREEDY_COMMON_PREFIX_FP8_MIN_M", "2048")
 
     class GreedyPrefixSuffixWarmupCache:
         def __init__(self, rows: tuple[int, ...] = tuple(range(12))) -> None:

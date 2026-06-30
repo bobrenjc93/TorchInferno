@@ -420,7 +420,22 @@ def _online_prefill_ready_before_decode_enabled(*, temperature: float, max_token
     global_env = "TORCHINFERNO_OPENAI_TP_ONLINE_PREFILL_READY_BEFORE_DECODE"
     if global_env in os.environ:
         return env_flag(global_env, False)
-    if temperature <= 0.0 or max_tokens < 1:
+    if max_tokens < 1:
+        return False
+    if temperature <= 0.0:
+        greedy_short_max_tokens = env_int(
+            "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_GEN_MAX_TOKENS",
+            128,
+            minimum=1,
+        )
+        if max_tokens <= greedy_short_max_tokens:
+            # Short greedy batches are decode-throughput bound, but letting the
+            # next ready wave prefill only at the active tail reduces long-output
+            # queueing without disrupting the full 64-row decode buckets.
+            return env_flag(
+                "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_PREFILL_READY_BEFORE_DECODE",
+                True,
+            )
         return False
     sampled_medium_min_tokens = env_int(
         "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_PREFILL_READY_MIN_TOKENS",
@@ -458,6 +473,8 @@ def _online_prefill_ready_before_decode_active_cap(
     if global_env in os.environ:
         configured = env_int(global_env, 0, minimum=0)
         return None if configured <= 0 else configured
+    if "TORCHINFERNO_OPENAI_TP_ONLINE_PREFILL_READY_BEFORE_DECODE" in os.environ:
+        return None
     sampled_medium_min_tokens = env_int(
         "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_PREFILL_READY_MIN_TOKENS",
         256,
@@ -468,6 +485,19 @@ def _online_prefill_ready_before_decode_active_cap(
         300,
         minimum=sampled_medium_min_tokens,
     )
+    if temperature <= 0.0:
+        greedy_short_max_tokens = env_int(
+            "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_GEN_MAX_TOKENS",
+            128,
+            minimum=1,
+        )
+        if max_tokens <= greedy_short_max_tokens:
+            configured = env_int(
+                "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_PREFILL_READY_ACTIVE_CAP",
+                4,
+                minimum=0,
+            )
+            return None if configured <= 0 else configured
     if temperature > 0.0 and sampled_medium_min_tokens < max_tokens <= sampled_medium_max_tokens:
         configured = env_int(
             "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_PREFILL_READY_ACTIVE_CAP",
