@@ -512,6 +512,10 @@ def _stream_token_batch_max() -> int:
     return env_int("TORCHINFERNO_OPENAI_STREAM_TOKEN_BATCH_MAX", 8, minimum=1)
 
 
+def _online_mixed_temperature_batching_enabled() -> bool:
+    return env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_MIXED_TEMPERATURE_BATCHING", True)
+
+
 def _online_generated_prefix_cache_enabled(*, temperature: float, max_tokens: int) -> bool | None:
     if (
         "TORCHINFERNO_CONTINUOUS_GENERATED_PREFIX_CACHE" in os.environ
@@ -4333,8 +4337,12 @@ class OpenAICompletionEngine:
         def add_phase(name: str, started_at_s: float) -> None:
             phase_ms[name] = phase_ms.get(name, 0.0) + (time.perf_counter() - started_at_s) * 1000.0
 
+        allow_mixed_temperatures = _online_mixed_temperature_batching_enabled()
+
         def same_online_class(request: _QueuedGeneration) -> bool:
-            return request.stream and request.temperature == first.temperature
+            if not request.stream:
+                return False
+            return allow_mixed_temperatures or request.temperature == first.temperature
 
         initial_batch = [first]
         initial_batch_start_s = time.perf_counter()
@@ -4698,6 +4706,7 @@ class OpenAICompletionEngine:
             request_id_start = next_request_id
             prompts = [request.prompt for request in requests]
             row_max_tokens = [request.max_tokens for request in requests]
+            row_temperatures = [float(request.temperature) for request in requests]
             max_tokens = max(row_max_tokens, default=0)
             submit_kwargs: dict[str, object] = {
                 "max_tokens": max_tokens,
@@ -4707,6 +4716,8 @@ class OpenAICompletionEngine:
                 "stop_token_ids": list(stop_token_ids),
                 "request_id_start": request_id_start,
             }
+            if any(temperature != float(first.temperature) for temperature in row_temperatures):
+                submit_kwargs["row_temperatures"] = row_temperatures
             if submit_steps > 0:
                 submit_kwargs["steps_after_submit"] = submit_steps
             _broadcast_tensor_parallel_online_submit_prompt_lists(
@@ -4728,6 +4739,7 @@ class OpenAICompletionEngine:
                         arrival_step=arrival_step,
                         eos_token_id=eos_token_id,
                         stop_token_ids=tuple(stop_token_ids),
+                        temperature=request.temperature,
                     )
                 )
             if sync and submit_steps <= 0:
@@ -12368,7 +12380,15 @@ def _receive_tensor_parallel_tensor_payload(engine: OpenAICompletionEngine) -> d
     width = int(meta[3].item())
     max_tokens = int(meta[4].item())
     has_row_max_tokens = bool(meta[5].item())
-    temp = torch.empty(1, dtype=torch.float64, device=command_device)
+    has_row_temperatures = (
+        command_kind == _TP_COMMAND_ONLINE_SUBMIT_PROMPT_LISTS
+        and bool(meta[1].item())
+    )
+    temp = torch.empty(
+        rows if has_row_temperatures else 1,
+        dtype=torch.float64,
+        device=command_device,
+    )
     lengths = torch.empty(rows, dtype=torch.long, device=command_device)
     token_rows = torch.empty((rows, width), dtype=torch.long, device=command_device)
     _broadcast_tensor_command(temp, src=0, group=command_group)
@@ -12381,6 +12401,11 @@ def _receive_tensor_parallel_tensor_payload(engine: OpenAICompletionEngine) -> d
         row_max_tokens = [int(value) for value in row_max.detach().cpu().tolist()]
 
     if command_kind == _TP_COMMAND_ONLINE_SUBMIT_PROMPT_LISTS:
+        row_temperatures = (
+            [float(value) for value in temp.detach().cpu().tolist()]
+            if has_row_temperatures
+            else None
+        )
         lengths_list = [int(value) for value in lengths.detach().cpu().tolist()]
         token_rows_cpu = token_rows.detach().cpu()
         eos_token_id = int(meta[7].item())
@@ -12403,6 +12428,7 @@ def _receive_tensor_parallel_tensor_payload(engine: OpenAICompletionEngine) -> d
             "stop_token_ids": stop_token_ids,
             "request_id_start": int(meta[8].item()),
             "steps_after_submit": max(0, int(meta[10].item())),
+            "row_temperatures": row_temperatures,
         }
 
     payload: dict[str, object] = {
@@ -12722,6 +12748,7 @@ def _broadcast_tensor_parallel_online_submit_prompt_lists(
     stop_token_ids: Sequence[int] = (),
     request_id_start: int = 0,
     steps_after_submit: int = 0,
+    row_temperatures: Sequence[float] | None = None,
 ) -> None:
     payload: dict[str, object] = {
         "op": "online_submit",
@@ -12733,6 +12760,8 @@ def _broadcast_tensor_parallel_online_submit_prompt_lists(
         "stop_token_ids": [int(token_id) for token_id in stop_token_ids],
         "request_id_start": int(request_id_start),
     }
+    if row_temperatures is not None:
+        payload["row_temperatures"] = [float(value) for value in row_temperatures]
     if steps_after_submit > 0:
         payload["steps_after_submit"] = int(steps_after_submit)
     _broadcast_tensor_parallel_online_command(model, payload)
@@ -12944,31 +12973,38 @@ def _broadcast_tensor_parallel_online_command(model: object, payload: Mapping[st
             if isinstance(prompts, list):
                 token_rows, lengths = _prompt_list_tensor_payload(prompts, command_device)
                 row_max = _coerce_optional_int_sequence(payload.get("row_max_tokens"))
+                row_temperatures = _coerce_optional_float_sequence(payload.get("row_temperatures"))
+                if row_temperatures is not None and len(row_temperatures) != len(prompts):
+                    raise ValueError("online_submit row_temperatures must match input_id_lists")
                 stop_token_ids = _coerce_optional_int_sequence(payload.get("stop_token_ids")) or ()
                 row_max_tensor = (
                     torch.tensor(row_max, dtype=torch.long, device=command_device)
                     if row_max is not None
                     else torch.empty(0, dtype=torch.long, device=command_device)
                 )
-                stop_tensor = torch.tensor(stop_token_ids, dtype=torch.long, device=command_device)
-                meta = torch.tensor(
-                    [
-                        _TP_COMMAND_ONLINE_SUBMIT_PROMPT_LISTS,
-                        1,
-                        int(token_rows.size(0)),
-                        int(token_rows.size(1)),
-                        int(payload.get("max_tokens", 0)),
-                        int(row_max_tensor.numel() > 0),
-                        int(payload.get("arrival_step", 0)),
-                        -1 if payload.get("eos_token_id") is None else int(payload["eos_token_id"]),
-                        int(payload.get("request_id_start", 0)),
-                        int(stop_tensor.numel()),
-                        max(0, int(payload.get("steps_after_submit", 0))),
-                    ],
-                    dtype=torch.long,
-                    device=command_device,
+                row_temperature_tensor = (
+                    torch.tensor(row_temperatures, dtype=torch.float64, device=command_device)
+                    if row_temperatures is not None
+                    else torch.empty(0, dtype=torch.float64, device=command_device)
                 )
-                temp = torch.zeros(1, dtype=torch.float64, device=command_device)
+                stop_tensor = torch.tensor(stop_token_ids, dtype=torch.long, device=command_device)
+                meta = torch.zeros(_TP_COMMAND_META_FIELDS, dtype=torch.long, device=command_device)
+                meta[0] = _TP_COMMAND_ONLINE_SUBMIT_PROMPT_LISTS
+                meta[1] = int(row_temperature_tensor.numel() > 0)
+                meta[2] = int(token_rows.size(0))
+                meta[3] = int(token_rows.size(1))
+                meta[4] = int(payload.get("max_tokens", 0))
+                meta[5] = int(row_max_tensor.numel() > 0)
+                meta[6] = int(payload.get("arrival_step", 0))
+                meta[7] = -1 if payload.get("eos_token_id") is None else int(payload["eos_token_id"])
+                meta[8] = int(payload.get("request_id_start", 0))
+                meta[9] = int(stop_tensor.numel())
+                meta[10] = max(0, int(payload.get("steps_after_submit", 0)))
+                temp = (
+                    row_temperature_tensor
+                    if row_temperature_tensor.numel() > 0
+                    else torch.zeros(1, dtype=torch.float64, device=command_device)
+                )
                 _broadcast_tensor_command(meta, src=0, group=command_group)
                 _broadcast_tensor_command(temp, src=0, group=command_group)
                 _broadcast_tensor_command(lengths, src=0, group=command_group)
@@ -13429,6 +13465,9 @@ def _tensor_parallel_worker_loop(engine: OpenAICompletionEngine) -> None:
                 if row_max_tokens is None:
                     default_max_tokens = int(payload.get("max_tokens", 0))
                     row_max_tokens = [default_max_tokens for _ in input_id_lists]
+                row_temperatures = _coerce_optional_float_sequence(payload.get("row_temperatures"))
+                if row_temperatures is not None and len(row_temperatures) != len(input_id_lists):
+                    raise ValueError("online_submit row_temperatures must match input_id_lists")
                 eos_token_id = payload.get("eos_token_id")
                 eos = int(eos_token_id) if isinstance(eos_token_id, int) else None
                 stop_token_ids = _coerce_optional_int_sequence(payload.get("stop_token_ids")) or ()
@@ -13445,6 +13484,11 @@ def _tensor_parallel_worker_loop(engine: OpenAICompletionEngine) -> None:
                             arrival_step=arrival_step,
                             eos_token_id=eos,
                             stop_token_ids=tuple(stop_token_ids),
+                            temperature=(
+                                row_temperatures[index]
+                                if row_temperatures is not None
+                                else None
+                            ),
                         )
                     )
                 steps_after_submit = max(0, int(payload.get("steps_after_submit", 0)))
@@ -15143,6 +15187,18 @@ def _coerce_optional_int_sequence(value: object) -> list[int] | None:
     if not isinstance(value, (list, tuple)):
         return None
     return [int(item) for item in value]
+
+
+def _coerce_optional_float_sequence(value: object) -> list[float] | None:
+    if value is None:
+        return None
+    if isinstance(value, Tensor):
+        value = value.detach().cpu().tolist()
+    elif hasattr(value, "tolist") and not isinstance(value, (list, tuple, str, bytes)):
+        value = value.tolist()  # type: ignore[assignment]
+    if not isinstance(value, (list, tuple)):
+        return None
+    return [float(item) for item in value]
 
 
 def _indexed_prompts_by_length(indexed: Sequence[tuple[int, list[int]]]) -> list[list[tuple[int, list[int]]]]:

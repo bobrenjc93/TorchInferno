@@ -5,7 +5,7 @@ import time
 from collections import defaultdict
 from dataclasses import dataclass, field
 from inspect import signature
-from typing import Callable, Hashable, Iterator, Optional
+from typing import Callable, Hashable, Iterator, Optional, Sequence
 
 import torch
 from torch import Tensor
@@ -158,6 +158,7 @@ class ServingRequest:
     arrival_step: int = 0
     eos_token_id: Optional[int] = None
     stop_token_ids: tuple[int, ...] = ()
+    temperature: Optional[float] = None
 
     def __post_init__(self) -> None:
         stop_ids = {int(token_id) for token_id in self.stop_token_ids if int(token_id) >= 0}
@@ -167,6 +168,8 @@ class ServingRequest:
             if eos_token_id >= 0:
                 stop_ids.add(eos_token_id)
         object.__setattr__(self, "stop_token_ids", tuple(sorted(stop_ids)))
+        if self.temperature is not None:
+            object.__setattr__(self, "temperature", float(self.temperature))
 
     def is_stop_token(self, token_id: int) -> bool:
         return int(token_id) in self.stop_token_ids
@@ -660,7 +663,10 @@ class ContinuousBatchEngine:
             return False
         if self.unified_forward or not self.decode_first:
             return False
-        if self.temperature > 0.0 and not self.decode_many_allow_stop:
+        if (
+            any(self._state_temperature(state) > 0.0 for state in self._online_active)
+            and not self.decode_many_allow_stop
+        ):
             return False
         if (
             any(state.request.stop_token_ids for state in self._online_active)
@@ -995,7 +1001,10 @@ class ContinuousBatchEngine:
                 row_indices=row_indices,
             )
             self._record_model_call("unified", n, tokens=int(q_lens_t.sum().item()))
-            next_tokens_cpu = self._sample_logits(logits[:, -1, :]).detach().cpu().tolist()
+            next_tokens_cpu = self._sample_logits_for_states(
+                logits[:, -1, :],
+                batch_states,
+            ).detach().cpu().tolist()
 
             next_active: list[_ActiveRequest] = []
             for i, state in enumerate(batch_states):
@@ -1177,7 +1186,10 @@ class ContinuousBatchEngine:
             )
         self._record_model_call("prefill", len(states), tokens=sum(chunk_lens))
         self.stats.prefill_prefix_reuse_batches += 1
-        next_tokens = self._sample_logits(logits[:, -1, :]).detach().cpu().tolist()
+        next_tokens = self._sample_logits_for_states(
+            logits[:, -1, :],
+            states,
+        ).detach().cpu().tolist()
         finished: list[_ActiveRequest] = []
         pending: list[_ActiveRequest] = []
         for index, state in enumerate(states):
@@ -1628,7 +1640,10 @@ class ContinuousBatchEngine:
                     input_ids = torch.tensor(suffixes, device=self.device, dtype=torch.long)
                     logits, _ = self._prefill_logits(input_ids, cache=self._cache_view(rows))
                     self._record_model_call("prefill", len(suffix_group), tokens=input_ids.numel())
-                next_tokens = self._sample_logits(logits[:, -1, :]).detach().cpu().tolist()
+                next_tokens = self._sample_logits_for_requests(
+                    logits[: len(suffix_group), -1, :],
+                    [request for _original_index, request, _prefix_hit_tokens in suffix_group],
+                ).detach().cpu().tolist()
 
                 for row_index, (original_index, request, prefix_hit_tokens) in enumerate(suffix_group):
                     row = rows[row_index]
@@ -1751,7 +1766,10 @@ class ContinuousBatchEngine:
                 return None
             self._record_model_call("prefill", len(group), tokens=input_ids.numel())
             self.stats.prefill_padded_suffix_batches += 1
-            next_tokens = self._sample_logits(logits[:, -1, :]).detach().cpu().tolist()
+            next_tokens = self._sample_logits_for_requests(
+                logits[: len(group), -1, :],
+                [request for _original_index, request, _prefix_hit_tokens in group],
+            ).detach().cpu().tolist()
 
             active: list[_ActiveRequest] = []
             for row_index, (original_index, request, prefix_hit_tokens) in enumerate(group):
@@ -1992,7 +2010,10 @@ class ContinuousBatchEngine:
             self.stats.prefill_prefix_reuse_batches += 1
             self.stats.prefill_padded_suffix_batches += 1
             sample_start_s = time.perf_counter() if self.profile_timings else 0.0
-            next_tokens = self._sample_logits(logits[:, -1, :]).detach().cpu().tolist()
+            next_tokens = self._sample_logits_for_requests(
+                logits[: len(group), -1, :],
+                [request for _original_index, request, _prefix_hit_tokens, _reusable in group],
+            ).detach().cpu().tolist()
             if self.profile_timings:
                 self.stats.prefill_sample_ms += (time.perf_counter() - sample_start_s) * 1000.0
             state_start_s = time.perf_counter() if self.profile_timings else 0.0
@@ -2178,7 +2199,10 @@ class ContinuousBatchEngine:
                 raise RuntimeError("exact-prefix reuse requires cached logits")
             logits = torch.cat([item.to(self.device) for item in reusable_logits], dim=0)
 
-        next_tokens = self._sample_logits(logits[:, -1, :]).detach().cpu().tolist()
+        next_tokens = self._sample_logits_for_requests(
+            logits[:, -1, :],
+            [request for _original_index, request, _prefix_hit_tokens, _reusable in group],
+        ).detach().cpu().tolist()
         active = []
         for row_index, (original_index, request, prefix_hit_tokens, _reusable) in enumerate(group):
             row = rows[row_index]
@@ -2224,7 +2248,7 @@ class ContinuousBatchEngine:
 
             active_items: list[tuple[_ActiveRequest, int, int]] = []
             copy_groups: dict[tuple[int, int], list[int]] = defaultdict(list)
-            continuation_reuse_groups: dict[Hashable, list[int]] = defaultdict(list)
+            continuation_reuse_groups: dict[tuple[Hashable, float], list[int]] = defaultdict(list)
             continuation_reuse: dict[int, _ReusablePrefix] = {}
             pending_rows: list[int] = []
             active: list[_ActiveRequest] = []
@@ -2243,7 +2267,9 @@ class ContinuousBatchEngine:
                 continuation = self._lookup_exact_reusable_prefix(generated_prefix)
                 if continuation is not None:
                     continuation_reuse[row_index] = continuation
-                    continuation_reuse_groups[continuation.route_id].append(row_index)
+                    continuation_reuse_groups[
+                        (continuation.route_id, self._request_temperature(request))
+                    ].append(row_index)
                     continue
                 first_token_finished[row_index] = False
                 pending_rows.append(row_index)
@@ -2253,7 +2279,12 @@ class ContinuousBatchEngine:
                 continuation = continuation_reuse[indices[0]]
                 if continuation.logits is None:
                     continue
-                sampled = self._sample_reusable_prefix_next_tokens(continuation, len(indices))
+                temperature = self._request_temperature(group[indices[0]][1])
+                sampled = self._sample_reusable_prefix_next_tokens(
+                    continuation,
+                    len(indices),
+                    temperature=temperature,
+                )
                 sampled_tokens = sampled.detach().cpu().tolist()
                 for token_index, row_index in enumerate(indices):
                     continuation_next_tokens[row_index] = int(sampled_tokens[token_index])
@@ -2368,9 +2399,9 @@ class ContinuousBatchEngine:
         self,
         group: list[tuple[int, ServingRequest, int, _ReusablePrefix]],
     ) -> tuple[list[int], list[Tensor]]:
-        by_route: dict[Hashable, list[int]] = defaultdict(list)
+        by_route: dict[tuple[Hashable, float], list[int]] = defaultdict(list)
         for index, (_original_index, _request, _prefix_hit_tokens, reusable) in enumerate(group):
-            by_route[reusable.route_id].append(index)
+            by_route[(reusable.route_id, self._request_temperature(_request))].append(index)
 
         next_tokens = [0 for _ in group]
         logits_by_index: list[Tensor | None] = [None for _ in group]
@@ -2378,7 +2409,11 @@ class ContinuousBatchEngine:
             reusable = group[indices[0]][3]
             if reusable.logits is None:
                 raise RuntimeError("exact-prefix sampling requires cached logits")
-            sampled = self._sample_reusable_prefix_next_tokens(reusable, len(indices))
+            sampled = self._sample_reusable_prefix_next_tokens(
+                reusable,
+                len(indices),
+                temperature=self._request_temperature(group[indices[0]][1]),
+            )
             sampled_tokens = sampled.detach().cpu().tolist()
             for token_index, group_index in enumerate(indices):
                 next_tokens[group_index] = int(sampled_tokens[token_index])
@@ -2388,44 +2423,62 @@ class ContinuousBatchEngine:
             raise RuntimeError("exact-prefix sampling did not produce logits for every request")
         return next_tokens, [logits for logits in logits_by_index if logits is not None]
 
-    def _sample_reusable_prefix_next_tokens(self, reusable: _ReusablePrefix, batch_size: int) -> Tensor:
+    def _sample_reusable_prefix_next_tokens(
+        self,
+        reusable: _ReusablePrefix,
+        batch_size: int,
+        *,
+        temperature: float | None = None,
+    ) -> Tensor:
         if reusable.logits is None:
             raise RuntimeError("exact-prefix sampling requires cached logits")
         sample_start_s = time.perf_counter() if self.profile_timings else 0.0
         try:
             logits = reusable.logits
+            sampling_temperature = float(self.temperature if temperature is None else temperature)
             if (
-                self.temperature > 0.0
+                sampling_temperature > 0.0
                 and env_flag("TORCHINFERNO_CONTINUOUS_CACHED_REPEATED_SAMPLE_STATE", True)
             ):
                 prepare_state = getattr(self.model, "prepare_repeated_next_token_state", None)
                 sample_from_state = getattr(self.model, "sample_repeated_next_token_from_state", None)
                 if callable(prepare_state) and callable(sample_from_state):
-                    if reusable.sample_state is None or reusable.sample_temperature != self.temperature:
+                    if reusable.sample_state is None or reusable.sample_temperature != sampling_temperature:
                         state_logits = logits[:, -1, :].to(self.device)
-                        reusable.sample_state = prepare_state(state_logits, self.temperature)
-                        reusable.sample_temperature = self.temperature
+                        reusable.sample_state = prepare_state(state_logits, sampling_temperature)
+                        reusable.sample_temperature = sampling_temperature
                         if reusable.sample_state is not None:
                             self.stats.repeated_sample_state_prepares += 1
                     if reusable.sample_state is not None:
-                        sampled = sample_from_state(reusable.sample_state, batch_size, self.temperature)
+                        sampled = sample_from_state(reusable.sample_state, batch_size, sampling_temperature)
                         if sampled is not None:
                             self.stats.repeated_sample_state_hits += 1
                             self.stats.repeated_sample_state_tokens += int(batch_size)
                             return sampled.to(self.device)
-            return self._sample_repeated_logits(logits[:, -1, :].to(self.device), batch_size)
+            return self._sample_repeated_logits(
+                logits[:, -1, :].to(self.device),
+                batch_size,
+                temperature=sampling_temperature,
+            )
         finally:
             if self.profile_timings:
                 self.stats.prefill_sample_ms += (time.perf_counter() - sample_start_s) * 1000.0
 
-    def _sample_repeated_logits(self, logits: Tensor, batch_size: int) -> Tensor:
+    def _sample_repeated_logits(
+        self,
+        logits: Tensor,
+        batch_size: int,
+        *,
+        temperature: float | None = None,
+    ) -> Tensor:
+        sampling_temperature = float(self.temperature if temperature is None else temperature)
         if batch_size <= 1:
-            return self._sample_logits(logits)
+            return self._sample_logits_with_temperature(logits, sampling_temperature)
         sample_repeated = getattr(self.model, "sample_repeated_next_token", None)
         if callable(sample_repeated):
-            return sample_repeated(logits, batch_size, self.temperature).to(self.device)
+            return sample_repeated(logits, batch_size, sampling_temperature).to(self.device)
         expanded = logits.expand(batch_size, logits.size(-1)).contiguous()
-        return self._sample_logits(expanded)
+        return self._sample_logits_with_temperature(expanded, sampling_temperature)
 
     def _prefill_prefix_padded_suffix_batch(
         self,
@@ -2476,7 +2529,10 @@ class ContinuousBatchEngine:
             self._record_model_call("prefill", len(group), tokens=input_ids.numel())
             self.stats.prefill_prefix_reuse_batches += 1
             self.stats.prefill_padded_suffix_batches += 1
-            next_tokens = self._sample_logits(logits[:, -1, :]).detach().cpu().tolist()
+            next_tokens = self._sample_logits_for_requests(
+                logits[:, -1, :],
+                [request for _original_index, request, _prefix_hit_tokens, _reusable in group],
+            ).detach().cpu().tolist()
 
             active: list[_ActiveRequest] = []
             for row_index, (original_index, request, prefix_hit_tokens, _reusable) in enumerate(group):
@@ -2535,7 +2591,10 @@ class ContinuousBatchEngine:
         cache_view = self._cache_view(rows)
         logits, _ = self._prefill_logits(prompts, cache=cache_view)
         self._record_model_call("prefill", len(group), tokens=prompts.numel())
-        next_tokens = self._sample_logits(logits[:, -1, :]).detach().cpu().tolist()
+        next_tokens = self._sample_logits_for_requests(
+            logits[:, -1, :],
+            [request for _original_index, request, _prefix_hit_tokens in group],
+        ).detach().cpu().tolist()
 
         active = []
         for row_index, (original_index, request, prefix_hit_tokens) in enumerate(group):
@@ -2622,7 +2681,10 @@ class ContinuousBatchEngine:
         n = len(group)
         logits = logits[:n]
         self._record_model_call("prefill", n, tokens=sum(lengths))
-        next_tokens = self._sample_logits(logits[:, -1, :]).detach().cpu().tolist()
+        next_tokens = self._sample_logits_for_requests(
+            logits[:, -1, :],
+            [request for _original_index, request, _prefix_hit_tokens in group],
+        ).detach().cpu().tolist()
         for i, (_, request, _) in enumerate(group):
             self._set_cache_row_seq_len(rows[i], len(request.prompt))
         active = []
@@ -2707,7 +2769,10 @@ class ContinuousBatchEngine:
                     torch.tensor([length - 1 for length in lengths], device=self.device),
                 ].unsqueeze(1)
         self._record_model_call("prefill", len(group), tokens=input_ids.numel())
-        next_tokens = self._sample_logits(logits[:, -1, :]).detach().cpu().tolist()
+        next_tokens = self._sample_logits_for_requests(
+            logits[:, -1, :],
+            [request for _original_index, request, _prefix_hit_tokens in group],
+        ).detach().cpu().tolist()
 
         for row_index, (_, request, _) in enumerate(group):
             self._set_cache_row_seq_len(rows[row_index], len(request.prompt))
@@ -2768,7 +2833,7 @@ class ContinuousBatchEngine:
         else:
             raise RuntimeError("empty prompt suffix without a reusable prefix")
 
-        next_token_t = self._sample_logits(logits[:, -1, :])
+        next_token_t = self._sample_logits_for_requests(logits[:, -1, :], [request])
         next_token = int(next_token_t.item())
         seq_len = self._refresh_row_seq_len_from_cache(row, len(request.prompt))
         self._store_reusable_prefix(
@@ -2933,16 +2998,27 @@ class ContinuousBatchEngine:
         need_generated_prefix_logits = self._needs_generated_prefix_logits(states)
         if not hasattr(self, "_has_fi_decode"):
             self._has_fi_decode = bool(getattr(self.model, "_fi_decode_graphs", None))
+        shared_temperature = self._shared_temperature_for_states(states)
+        use_token_graph = shared_temperature is not None and not need_generated_prefix_logits
         if self._has_fi_decode:
             row_indices_t = torch.tensor(rows, dtype=torch.long, device=self.device)
             seq_lens_t = self._seq_lens_tensor(states, rows=rows)
             if need_generated_prefix_logits:
                 logits = self._ragged_decode_logits(input_ids, seq_lens_t, row_indices_t)
                 reuse_logits = logits[:, -1, :]
-                next_token_tensor = self._sample_logits(reuse_logits)
+                next_token_tensor = self._sample_logits_for_states(reuse_logits, states)
             else:
                 self._last_ragged_decode_logits = None
-                fi_token = self._try_ragged_token_graph(input_ids, seq_lens_t, row_indices_t)
+                fi_token = (
+                    self._try_ragged_token_graph(
+                        input_ids,
+                        seq_lens_t,
+                        row_indices_t,
+                        temperature=shared_temperature,
+                    )
+                    if use_token_graph
+                    else None
+                )
                 if fi_token is not None:
                     next_token_tensor = fi_token.to(self.device)
                     reuse_logits = getattr(self, "_last_ragged_decode_logits", None)
@@ -2951,14 +3027,22 @@ class ContinuousBatchEngine:
                     cache_view = self._cache_view(rows)
                     logits = self._static_decode_logits(input_ids, cache_view)
                     reuse_logits = logits[:, -1, :]
-                    next_token_tensor = self._sample_logits(logits[:, -1, :])
+                    next_token_tensor = self._sample_logits_for_states(logits[:, -1, :], states)
         else:
             cache_view = self._cache_view(rows)
-            graph_token = None if need_generated_prefix_logits else self._try_static_token_graph(input_ids, cache_view)
+            graph_token = (
+                self._try_static_token_graph(
+                    input_ids,
+                    cache_view,
+                    temperature=shared_temperature,
+                )
+                if use_token_graph
+                else None
+            )
             if graph_token is None:
                 logits = self._static_decode_logits(input_ids, cache_view)
                 reuse_logits = logits[:, -1, :]
-                next_token_tensor = self._sample_logits(logits[:, -1, :])
+                next_token_tensor = self._sample_logits_for_states(logits[:, -1, :], states)
             else:
                 next_token_tensor = graph_token.to(self.device)
                 self.stats.decode_graph_hits += 1
@@ -3025,16 +3109,22 @@ class ContinuousBatchEngine:
         need_generated_prefix_logits = self._needs_generated_prefix_logits([state])
         if not hasattr(self, "_has_fi_decode"):
             self._has_fi_decode = bool(getattr(self.model, "_fi_decode_graphs", None))
+        state_temperature = self._state_temperature(state)
         if self._has_fi_decode:
             row_indices_t = torch.tensor([state.row], dtype=torch.long, device=self.device)
             seq_lens_t = self._seq_lens_tensor([state], rows=[state.row])
             if need_generated_prefix_logits:
                 logits = self._ragged_decode_logits(input_ids, seq_lens_t, row_indices_t)
                 reuse_logits = logits[:, -1, :]
-                next_token_tensor = self._sample_logits(reuse_logits)
+                next_token_tensor = self._sample_logits_for_states(reuse_logits, [state])
             else:
                 self._last_ragged_decode_logits = None
-                fi_token = self._try_ragged_token_graph(input_ids, seq_lens_t, row_indices_t)
+                fi_token = self._try_ragged_token_graph(
+                    input_ids,
+                    seq_lens_t,
+                    row_indices_t,
+                    temperature=state_temperature,
+                )
                 if fi_token is not None:
                     next_token_tensor = fi_token.to(self.device)
                     reuse_logits = getattr(self, "_last_ragged_decode_logits", None)
@@ -3043,14 +3133,22 @@ class ContinuousBatchEngine:
                     cache_view = self._cache_view([state.row])
                     logits = self._static_decode_logits(input_ids, cache_view)
                     reuse_logits = logits[:, -1, :]
-                    next_token_tensor = self._sample_logits(logits[:, -1, :])
+                    next_token_tensor = self._sample_logits_for_states(logits[:, -1, :], [state])
         else:
             cache_view = self._cache_view([state.row])
-            graph_token = None if need_generated_prefix_logits else self._try_static_token_graph(input_ids, cache_view)
+            graph_token = (
+                self._try_static_token_graph(
+                    input_ids,
+                    cache_view,
+                    temperature=state_temperature,
+                )
+                if not need_generated_prefix_logits
+                else None
+            )
             if graph_token is None:
                 logits = self._static_decode_logits(input_ids, cache_view)
                 reuse_logits = logits[:, -1, :]
-                next_token_tensor = self._sample_logits(logits[:, -1, :])
+                next_token_tensor = self._sample_logits_for_states(logits[:, -1, :], [state])
             else:
                 next_token_tensor = graph_token.to(self.device)
                 self.stats.decode_graph_hits += 1
@@ -3199,6 +3297,8 @@ class ContinuousBatchEngine:
         events: list[ServingTokenEvent] | None,
     ) -> list[_ActiveRequest | ServingResult] | None:
         if not self._prompt_lookup_decode_enabled() or not states:
+            return None
+        if any(self._state_temperature(state) > 0.0 for state in states):
             return None
 
         proposals: list[tuple[int, ...]] = [
@@ -3360,7 +3460,14 @@ class ContinuousBatchEngine:
 
         cpu_tokens_start_s = time.perf_counter() if self.profile_timings else 0.0
         flat_logits = logits[:, : proposal_len + 1, :].reshape(-1, logits.size(-1))
-        predicted = self._sample_logits(flat_logits).view(len(states), proposal_len + 1)
+        predicted = self._sample_logits_for_temperatures(
+            flat_logits,
+            [
+                self._state_temperature(state)
+                for state in states
+                for _ in range(proposal_len + 1)
+            ],
+        ).view(len(states), proposal_len + 1)
         predicted_tokens = predicted.detach().cpu().tolist()
         if self.profile_timings:
             cpu_elapsed_ms = (time.perf_counter() - cpu_tokens_start_s) * 1000.0
@@ -3441,7 +3548,17 @@ class ContinuousBatchEngine:
         self._last_ragged_decode_logits = None
         reuse_logits: Tensor | None = None
         need_generated_prefix_logits = self._needs_generated_prefix_logits(states)
-        graph_token = None if need_generated_prefix_logits else self._try_ragged_token_graph(input_ids, seq_lens, row_indices)
+        shared_temperature = self._shared_temperature_for_states(states)
+        graph_token = (
+            self._try_ragged_token_graph(
+                input_ids,
+                seq_lens,
+                row_indices,
+                temperature=shared_temperature,
+            )
+            if not need_generated_prefix_logits and shared_temperature is not None
+            else None
+        )
         if graph_token is not None:
             next_token_tensor = graph_token.to(self.device)
             reuse_logits = getattr(self, "_last_ragged_decode_logits", None)
@@ -3449,7 +3566,7 @@ class ContinuousBatchEngine:
         else:
             logits = self._ragged_decode_logits(input_ids, seq_lens, row_indices)
             reuse_logits = logits[:, -1, :]
-            next_token_tensor = self._sample_logits(logits[:, -1, :])
+            next_token_tensor = self._sample_logits_for_states(logits[:, -1, :], states)
         self._stop_decode_ragged_model_gpu_timer(gpu_model_events, shape_key=shape_key)
         self._record_model_call("decode", n_padded, tokens=n_padded, ragged=True, active_tokens=n_active)
         if self.profile_timings:
@@ -3499,13 +3616,23 @@ class ContinuousBatchEngine:
         model_start_s = time.perf_counter() if self.profile_timings else 0.0
         gpu_model_events = self._start_decode_ragged_model_gpu_timer()
         self._last_ragged_decode_logits = None
-        graph_token = self._try_ragged_token_graph(input_ids, seq_lens, row_indices)
+        shared_temperature = self._shared_temperature_for_states(states)
+        graph_token = (
+            self._try_ragged_token_graph(
+                input_ids,
+                seq_lens,
+                row_indices,
+                temperature=shared_temperature,
+            )
+            if shared_temperature is not None
+            else None
+        )
         if graph_token is not None:
             next_token_tensor = graph_token.to(self.device)
             self.stats.decode_graph_hits += 1
         else:
             logits = self._ragged_decode_logits(input_ids, seq_lens, row_indices)
-            next_token_tensor = self._sample_logits(logits[:, -1, :])
+            next_token_tensor = self._sample_logits_for_states(logits[:, -1, :], states)
         self._stop_decode_ragged_model_gpu_timer(gpu_model_events, shape_key=shape_key)
         self._record_model_call("decode", n_padded, tokens=n_padded, ragged=True, active_tokens=n_active)
         active_row_indices = row_indices[:n_active]
@@ -4290,7 +4417,10 @@ class ContinuousBatchEngine:
                 self._release_active_row(row)
             return None
         self._record_model_call("prefill", batch, tokens=int(q_lens.sum().item()))
-        next_tokens = self._sample_logits(logits[:, -1, :]).detach().cpu().tolist()
+        next_tokens = self._sample_logits_for_requests(
+            logits[:, -1, :],
+            [request for _original_index, request, _prefix_hit_tokens, _reusable in requests],
+        ).detach().cpu().tolist()
         for i in range(batch):
             self._set_cache_row_seq_len(rows[i], len(requests[i][1].prompt))
         for i, (original_index, request, prefix_hit_tokens, reusable) in enumerate(requests):
@@ -4384,7 +4514,10 @@ class ContinuousBatchEngine:
                     write_positions=wpos, logit_positions=lpos, row_indices=ris,
                 )
                 self._record_model_call("prefill", b, tokens=int(q_lens.sum().item()))
-                toks = self._sample_logits(logits[:, -1, :]).detach().cpu().tolist()
+                toks = self._sample_logits_for_requests(
+                    logits[:, -1, :],
+                    [group[i][1] for i in suffix_idx],
+                ).detach().cpu().tolist()
                 for k, i in enumerate(suffix_idx):
                     next_tokens[i] = int(toks[k])
                     out_logits[i] = logits[k:k + 1]
@@ -4392,7 +4525,9 @@ class ContinuousBatchEngine:
                 if group[i][3].logits is None:
                     return None
                 cached = group[i][3].logits.to(self.device)
-                next_tokens[i] = int(self._sample_logits(cached[:, -1, :]).item())
+                next_tokens[i] = int(
+                    self._sample_logits_for_requests(cached[:, -1, :], [group[i][1]]).item()
+                )
                 out_logits[i] = cached
         except Exception:
             for row in rows:
@@ -4781,10 +4916,13 @@ class ContinuousBatchEngine:
         input_ids: Tensor,
         seq_lens: Tensor,
         row_indices: Tensor,
+        *,
+        temperature: float | None = None,
     ) -> Tensor | None:
+        sampling_temperature = float(self.temperature if temperature is None else temperature)
         fi_decode_mode = _fi_decode_graph_mode()
         use_fi_decode = fi_decode_mode == "always" or (
-            fi_decode_mode == "sampled" and float(self.temperature) > 0.0
+            fi_decode_mode == "sampled" and sampling_temperature > 0.0
         )
         fi_graphs = (
             getattr(self.model, "_fi_decode_graphs", None)
@@ -4822,7 +4960,7 @@ class ContinuousBatchEngine:
                 graph.replay()
                 last_logits = s_logits[:batch, -1, :]
                 self._last_ragged_decode_logits = last_logits
-                return self._sample_logits(last_logits)
+                return self._sample_logits_with_temperature(last_logits, sampling_temperature)
         decode_graph = getattr(self.model, "try_decode_ragged_token_graph", None)
         if decode_graph is None:
             return None
@@ -4832,23 +4970,30 @@ class ContinuousBatchEngine:
             self._require_cache(),
             seq_lens=seq_lens,
             row_indices=row_indices,
-            temperature=self.temperature,
+            temperature=sampling_temperature,
             capture_on_miss=self._decode_capture_on_miss(),
         )
         if token is None:
             self.stats.decode_graph_misses += 1
         return token
 
-    def _try_static_token_graph(self, input_ids: Tensor, cache: object) -> Tensor | None:
+    def _try_static_token_graph(
+        self,
+        input_ids: Tensor,
+        cache: object,
+        *,
+        temperature: float | None = None,
+    ) -> Tensor | None:
         decode_graph = getattr(self.model, "try_decode_one_token_graph", None)
         if decode_graph is None:
             self._report_static_graph_miss(input_ids, cache, "no_token_graph")
             return None
+        sampling_temperature = float(self.temperature if temperature is None else temperature)
         token = self._call_decode_graph(
             decode_graph,
             input_ids,
             cache,
-            temperature=self.temperature,
+            temperature=sampling_temperature,
             capture_on_miss=self._decode_capture_on_miss(),
         )
         if token is None:
@@ -4921,11 +5066,93 @@ class ContinuousBatchEngine:
             raise RuntimeError("model does not support ragged decode")
         return decode(input_ids, self._require_cache(), seq_lens=seq_lens, row_indices=row_indices)
 
-    def _sample_logits(self, logits: Tensor) -> Tensor:
+    def _request_temperature(self, request: ServingRequest) -> float:
+        if request.temperature is None:
+            return float(self.temperature)
+        return float(request.temperature)
+
+    def _state_temperature(self, state: _ActiveRequest) -> float:
+        return self._request_temperature(state.request)
+
+    def _shared_temperature(self, temperatures: Sequence[float]) -> float | None:
+        if not temperatures:
+            return float(self.temperature)
+        first = float(temperatures[0])
+        if all(float(temperature) == first for temperature in temperatures[1:]):
+            return first
+        return None
+
+    def _shared_temperature_for_requests(self, requests: Sequence[ServingRequest]) -> float | None:
+        return self._shared_temperature([self._request_temperature(request) for request in requests])
+
+    def _shared_temperature_for_states(self, states: Sequence[_ActiveRequest]) -> float | None:
+        return self._shared_temperature([self._state_temperature(state) for state in states])
+
+    def _sample_logits_with_temperature(self, logits: Tensor, temperature: float) -> Tensor:
         sampler = getattr(self.model, "_sample_next_token", None)
         if callable(sampler):
-            return sampler(logits, self.temperature).to(self.device)
-        return sample_next_token(logits, self.temperature).to(self.device)
+            return sampler(logits, float(temperature)).to(self.device)
+        return sample_next_token(logits, float(temperature)).to(self.device)
+
+    def _sample_logits(self, logits: Tensor) -> Tensor:
+        return self._sample_logits_with_temperature(logits, float(self.temperature))
+
+    def _sample_logits_for_temperatures(
+        self,
+        logits: Tensor,
+        temperatures: Sequence[float],
+    ) -> Tensor:
+        row_count = int(logits.size(0))
+        if row_count <= 0:
+            return torch.empty((0,), dtype=torch.long, device=self.device)
+        active_temperatures = [float(temperature) for temperature in temperatures[:row_count]]
+        active_count = len(active_temperatures)
+        if active_count == row_count:
+            shared = self._shared_temperature(active_temperatures)
+            if shared is not None:
+                return self._sample_logits_with_temperature(logits, shared)
+
+        sampled = torch.empty((row_count,), dtype=torch.long, device=self.device)
+        by_temperature: dict[float, list[int]] = defaultdict(list)
+        for row_index, temperature in enumerate(active_temperatures):
+            by_temperature[temperature].append(row_index)
+        for temperature, row_indices in by_temperature.items():
+            index = torch.tensor(row_indices, dtype=torch.long, device=self.device)
+            sampled.index_copy_(
+                0,
+                index,
+                self._sample_logits_with_temperature(
+                    logits.index_select(0, index.to(logits.device)),
+                    temperature,
+                ),
+            )
+        if active_count < row_count:
+            tail = self._sample_logits_with_temperature(
+                logits[active_count:],
+                float(self.temperature),
+            )
+            sampled[active_count:].copy_(tail)
+        return sampled
+
+    def _sample_logits_for_requests(
+        self,
+        logits: Tensor,
+        requests: Sequence[ServingRequest],
+    ) -> Tensor:
+        return self._sample_logits_for_temperatures(
+            logits,
+            [self._request_temperature(request) for request in requests],
+        )
+
+    def _sample_logits_for_states(
+        self,
+        logits: Tensor,
+        states: Sequence[_ActiveRequest],
+    ) -> Tensor:
+        return self._sample_logits_for_temperatures(
+            logits,
+            [self._state_temperature(state) for state in states],
+        )
 
     def _decode_capture_on_miss(self) -> bool:
         if "TORCHINFERNO_CONTINUOUS_DECODE_CAPTURE" in os.environ:

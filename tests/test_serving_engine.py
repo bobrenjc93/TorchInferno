@@ -114,6 +114,37 @@ def test_continuous_prefix_prefill_suffix_buckets_can_be_configured(monkeypatch)
     assert engine._suffix_bucket(161) == 256
 
 
+def test_continuous_engine_samples_request_temperature_per_row() -> None:
+    class TemperatureSamplingModel:
+        def __init__(self) -> None:
+            self.calls: list[tuple[float, int]] = []
+
+        def _sample_next_token(self, logits: torch.Tensor, temperature: float) -> torch.Tensor:
+            self.calls.append((float(temperature), int(logits.size(0))))
+            if temperature <= 0.0:
+                return torch.argmax(logits, dim=-1)
+            return torch.argmin(logits, dim=-1)
+
+    model = TemperatureSamplingModel()
+    engine = ContinuousBatchEngine(model, device=torch.device("cpu"), temperature=0.0)
+    logits = torch.tensor(
+        [
+            [0.0, 4.0, 2.0],
+            [5.0, 1.0, -3.0],
+        ]
+    )
+    sampled = engine._sample_logits_for_requests(
+        logits,
+        [
+            ServingRequest("greedy", (1,), 1, temperature=0.0),
+            ServingRequest("sampled", (1,), 1, temperature=0.7),
+        ],
+    )
+
+    assert sampled.tolist() == [1, 2]
+    assert model.calls == [(0.0, 1), (0.7, 1)]
+
+
 class _ToyCache:
     def __init__(
         self,
