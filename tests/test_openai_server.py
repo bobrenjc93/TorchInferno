@@ -9127,18 +9127,34 @@ def test_openai_online_generated_prefix_cache_preserves_runtime_env_overrides(mo
     assert _online_generated_prefix_cache_enabled(temperature=0.7, max_tokens=256) is None
 
 
-def test_openai_online_submit_step_defaults_to_sampled_short(monkeypatch) -> None:
+def test_openai_online_submit_step_defaults_to_sampled_short_and_medium(monkeypatch) -> None:
     monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_SUBMIT_STEP_COMMAND", raising=False)
     monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_SHORT_SUBMIT_STEP_MAX_TOKENS", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_SUBMIT_STEP_COMMAND", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_SUBMIT_STEP_MIN_TOKENS", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_SUBMIT_STEP_MAX_TOKENS", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_STEP_SYNC", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_STEP_SYNC_MIN_TOKENS", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_STEP_SYNC_MAX_TOKENS", raising=False)
 
     assert _online_submit_step_command_enabled(temperature=0.7, max_tokens=256) is True
-    assert _online_submit_step_command_enabled(temperature=0.7, max_tokens=257) is False
+    assert _online_submit_step_command_enabled(temperature=0.7, max_tokens=257) is True
+    assert _online_submit_step_command_enabled(temperature=0.7, max_tokens=300) is True
+    assert _online_submit_step_command_enabled(temperature=0.7, max_tokens=301) is False
     assert _online_submit_step_command_enabled(temperature=0.0, max_tokens=256) is False
     assert _online_submit_step_command_enabled(temperature=0.7, max_tokens=0) is False
 
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_SHORT_SUBMIT_STEP_MAX_TOKENS", "128")
     assert _online_submit_step_command_enabled(temperature=0.7, max_tokens=128) is True
     assert _online_submit_step_command_enabled(temperature=0.7, max_tokens=129) is False
+    assert _online_submit_step_command_enabled(temperature=0.7, max_tokens=300) is True
+
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_SUBMIT_STEP_COMMAND", "0")
+    assert _online_submit_step_command_enabled(temperature=0.7, max_tokens=300) is False
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_SUBMIT_STEP_COMMAND", raising=False)
+
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_STEP_SYNC", "1")
+    assert _online_submit_step_command_enabled(temperature=0.7, max_tokens=300) is False
 
 
 def test_openai_online_submit_step_respects_env_override(monkeypatch) -> None:
@@ -9149,17 +9165,27 @@ def test_openai_online_submit_step_respects_env_override(monkeypatch) -> None:
     assert _online_submit_step_command_enabled(temperature=0.0, max_tokens=512) is True
 
 
-def test_online_step_sync_enabled_defaults_off_for_sampled_short(monkeypatch) -> None:
+def test_online_step_sync_enabled_defaults_off_for_sampled_short_and_medium(monkeypatch) -> None:
     monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_STEP_SYNC", raising=False)
     monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_SHORT_STEP_SYNC_MAX_TOKENS", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_STEP_SYNC", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_STEP_SYNC_MIN_TOKENS", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_STEP_SYNC_MAX_TOKENS", raising=False)
     assert _online_step_sync_enabled()
     assert not _online_step_sync_enabled(temperature=0.7, max_tokens=256)
-    assert _online_step_sync_enabled(temperature=0.7, max_tokens=257)
+    assert not _online_step_sync_enabled(temperature=0.7, max_tokens=257)
+    assert not _online_step_sync_enabled(temperature=0.7, max_tokens=300)
+    assert _online_step_sync_enabled(temperature=0.7, max_tokens=301)
     assert _online_step_sync_enabled(temperature=0.0, max_tokens=256)
 
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_SHORT_STEP_SYNC_MAX_TOKENS", "128")
     assert not _online_step_sync_enabled(temperature=0.7, max_tokens=128)
     assert _online_step_sync_enabled(temperature=0.7, max_tokens=129)
+    assert not _online_step_sync_enabled(temperature=0.7, max_tokens=300)
+
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_STEP_SYNC", "1")
+    assert _online_step_sync_enabled(temperature=0.7, max_tokens=300)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_STEP_SYNC", raising=False)
 
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_STEP_SYNC", "0")
     assert not _online_step_sync_enabled()

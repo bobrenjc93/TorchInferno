@@ -539,13 +539,26 @@ def _online_step_sync_enabled(*, temperature: float | None = None, max_tokens: i
         return env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_STEP_SYNC", True)
     if temperature is None or max_tokens is None:
         return True
-    sampled_short_max_tokens = env_int(
-        "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_SHORT_STEP_SYNC_MAX_TOKENS",
-        256,
-        minimum=1,
-    )
-    if temperature > 0.0 and 0 < max_tokens <= sampled_short_max_tokens:
-        return False
+    if temperature > 0.0 and max_tokens > 0:
+        sampled_short_max_tokens = env_int(
+            "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_SHORT_STEP_SYNC_MAX_TOKENS",
+            256,
+            minimum=1,
+        )
+        if max_tokens <= sampled_short_max_tokens:
+            return False
+        sampled_medium_min_tokens = env_int(
+            "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_STEP_SYNC_MIN_TOKENS",
+            256,
+            minimum=1,
+        )
+        sampled_medium_max_tokens = env_int(
+            "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_STEP_SYNC_MAX_TOKENS",
+            300,
+            minimum=sampled_medium_min_tokens,
+        )
+        if sampled_medium_min_tokens < max_tokens <= sampled_medium_max_tokens:
+            return env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_STEP_SYNC", False)
     return True
 
 
@@ -555,12 +568,28 @@ def _online_submit_step_command_enabled(*, temperature: float, max_tokens: int) 
         return env_flag(global_env, False)
     if temperature <= 0.0 or max_tokens < 1:
         return False
+    if _online_step_sync_enabled(temperature=temperature, max_tokens=max_tokens):
+        return False
     sampled_short_max_tokens = env_int(
         "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_SHORT_SUBMIT_STEP_MAX_TOKENS",
         256,
         minimum=1,
     )
-    return max_tokens <= sampled_short_max_tokens
+    if max_tokens <= sampled_short_max_tokens:
+        return True
+    sampled_medium_min_tokens = env_int(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_SUBMIT_STEP_MIN_TOKENS",
+        256,
+        minimum=1,
+    )
+    sampled_medium_max_tokens = env_int(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_SUBMIT_STEP_MAX_TOKENS",
+        300,
+        minimum=sampled_medium_min_tokens,
+    )
+    if sampled_medium_min_tokens < max_tokens <= sampled_medium_max_tokens:
+        return env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_SUBMIT_STEP_COMMAND", True)
+    return False
 
 
 def _startup_graph_warmup_enabled() -> bool:
