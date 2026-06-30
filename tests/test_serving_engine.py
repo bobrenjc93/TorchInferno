@@ -3164,6 +3164,33 @@ def test_continuous_batch_engine_can_prefill_waiting_requests_before_decode() ->
     assert not engine.has_online_work()
 
 
+def test_continuous_batch_engine_prefill_before_decode_respects_active_cap() -> None:
+    engine = ContinuousBatchEngine(
+        _RaggedGraphToyModel(),
+        device=torch.device("cpu"),
+        max_active_requests=3,
+        prefix_cache_capacity=0,
+        prefill_ready_before_decode=True,
+        prefill_ready_before_decode_active_cap=1,
+    )
+    engine.start_online(max_seq_len=8)
+    engine.submit_online(ServingRequest("short", (1, 2), 2, arrival_step=0))
+    engine.submit_online(ServingRequest("long", (6, 7, 8), 2, arrival_step=0))
+
+    first_step = engine.step_online()
+    engine.submit_online(ServingRequest("late", (10, 11), 1, arrival_step=1))
+    second_step = engine.step_online()
+    final_step = engine.step_online()
+
+    assert [event.request_id for event in first_step] == ["short", "long"]
+    assert [event.request_id for event in second_step] == ["short", "long", "late"]
+    assert [event.step for event in second_step] == [1, 1, 1]
+    assert [event.generated for event in second_step] == [2, 2, 1]
+    assert [event.finished for event in second_step] == [True, True, True]
+    assert final_step == []
+    assert not engine.has_online_work()
+
+
 def test_continuous_batch_engine_online_many_keeps_decode_tokens_ordered(monkeypatch) -> None:
     monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY", "1")
     monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_UNIFORM_RAGGED_DECODE", "1")

@@ -408,6 +408,7 @@ class ContinuousBatchEngine:
         prefill_chunk_size: int | None = None,
         decode_first: bool = True,
         prefill_ready_before_decode: bool = False,
+        prefill_ready_before_decode_active_cap: int | None = None,
         enable_ragged_decode: bool = True,
         store_reusable_prefixes: bool = True,
         store_full_prompt_prefixes: bool = True,
@@ -451,6 +452,11 @@ class ContinuousBatchEngine:
         self.prefill_chunk_size = prefill_chunk_size
         self.decode_first = decode_first
         self.prefill_ready_before_decode = prefill_ready_before_decode
+        self.prefill_ready_before_decode_active_cap = (
+            None
+            if prefill_ready_before_decode_active_cap is None
+            else max(0, int(prefill_ready_before_decode_active_cap))
+        )
         self.enable_ragged_decode = enable_ragged_decode
         self.store_reusable_prefixes = store_reusable_prefixes
         self.store_full_prompt_prefixes = store_full_prompt_prefixes
@@ -797,6 +803,11 @@ class ContinuousBatchEngine:
         decode_before_admit = bool(self.decode_first and active)
         decode_after_admit = not self.decode_first
         if decode_before_admit and self.prefill_ready_before_decode and waiting:
+            active_cap = self.prefill_ready_before_decode_active_cap
+            prefill_before_decode = active_cap is None or len(active) <= active_cap
+        else:
+            prefill_before_decode = False
+        if prefill_before_decode:
             decode_before_admit = False
             decode_after_admit = True
         if decode_before_admit:

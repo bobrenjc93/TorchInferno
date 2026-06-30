@@ -120,6 +120,7 @@ from torchinferno.openai_server import (
     _online_kv_token_budget,
     _online_marlin_int4_decode_enabled,
     _online_persistent_idle_ms,
+    _online_prefill_ready_before_decode_active_cap,
     _online_prefill_ready_before_decode_enabled,
     _online_refill_min_ready_requests,
     _online_session_max_tokens,
@@ -1202,6 +1203,9 @@ def test_tensor_parallel_worker_loop_handles_online_runtime_commands(monkeypatch
             prefill_chunk_size: int | None = None,
             admit_min_ready_requests: int | None = None,
             admit_per_step_cap: int | None = None,
+            decode_first: bool | None = None,
+            prefill_ready_before_decode: bool | None = None,
+            prefill_ready_before_decode_active_cap: int | None = None,
             enable_decode_many: bool | None = None,
             decode_many_allow_stop: bool | None = None,
             generated_prefix_cache: bool | None = None,
@@ -1221,6 +1225,9 @@ def test_tensor_parallel_worker_loop_handles_online_runtime_commands(monkeypatch
                 store_full_prompt_prefixes,
                 admit_min_ready_requests,
                 admit_per_step_cap,
+                decode_first,
+                prefill_ready_before_decode,
+                prefill_ready_before_decode_active_cap,
                 enable_decode_many,
                 decode_many_allow_stop,
                 generated_prefix_cache,
@@ -1277,6 +1284,9 @@ def test_tensor_parallel_worker_loop_handles_online_runtime_commands(monkeypatch
         True,
         None,
         128,
+        True,
+        False,
+        None,
         False,
         False,
         True,
@@ -1472,6 +1482,9 @@ def test_tensor_parallel_worker_loop_receives_online_tensor_commands(monkeypatch
             prefill_chunk_size: int | None = None,
             admit_min_ready_requests: int | None = None,
             admit_per_step_cap: int | None = None,
+            decode_first: bool | None = None,
+            prefill_ready_before_decode: bool | None = None,
+            prefill_ready_before_decode_active_cap: int | None = None,
             enable_decode_many: bool | None = None,
             decode_many_allow_stop: bool | None = None,
             generated_prefix_cache: bool | None = None,
@@ -1491,6 +1504,9 @@ def test_tensor_parallel_worker_loop_receives_online_tensor_commands(monkeypatch
                 store_full_prompt_prefixes,
                 admit_min_ready_requests,
                 admit_per_step_cap,
+                decode_first,
+                prefill_ready_before_decode,
+                prefill_ready_before_decode_active_cap,
                 enable_decode_many,
                 decode_many_allow_stop,
                 generated_prefix_cache,
@@ -1552,6 +1568,9 @@ def test_tensor_parallel_worker_loop_receives_online_tensor_commands(monkeypatch
         False,
         None,
         128,
+        True,
+        False,
+        None,
         False,
         False,
         True,
@@ -8920,10 +8939,61 @@ def test_openai_online_decode_first_respects_env(monkeypatch) -> None:
 
 def test_openai_online_prefill_ready_before_decode_respects_env(monkeypatch) -> None:
     monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_PREFILL_READY_BEFORE_DECODE", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_PREFILL_READY_ACTIVE_CAP", raising=False)
+    monkeypatch.delenv(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_PREFILL_READY_BEFORE_DECODE",
+        raising=False,
+    )
+    monkeypatch.delenv(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_PREFILL_READY_ACTIVE_CAP",
+        raising=False,
+    )
+    monkeypatch.delenv(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_PREFILL_READY_MIN_TOKENS",
+        raising=False,
+    )
+    monkeypatch.delenv(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_PREFILL_READY_MAX_TOKENS",
+        raising=False,
+    )
     assert not _online_prefill_ready_before_decode_enabled(temperature=0.0, max_tokens=64)
+    assert not _online_prefill_ready_before_decode_enabled(temperature=0.7, max_tokens=256)
+    assert _online_prefill_ready_before_decode_enabled(temperature=0.7, max_tokens=300)
+    assert _online_prefill_ready_before_decode_active_cap(temperature=0.7, max_tokens=300) == 4
+    assert not _online_prefill_ready_before_decode_enabled(temperature=0.7, max_tokens=301)
+    assert _online_prefill_ready_before_decode_active_cap(temperature=0.7, max_tokens=301) is None
+
+    monkeypatch.setenv(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_PREFILL_READY_BEFORE_DECODE",
+        "0",
+    )
+    assert not _online_prefill_ready_before_decode_enabled(temperature=0.7, max_tokens=300)
+    assert _online_prefill_ready_before_decode_active_cap(temperature=0.7, max_tokens=300) is None
+    monkeypatch.delenv(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_PREFILL_READY_BEFORE_DECODE",
+        raising=False,
+    )
+    monkeypatch.setenv(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_PREFILL_READY_ACTIVE_CAP",
+        "2",
+    )
+    assert _online_prefill_ready_before_decode_active_cap(temperature=0.7, max_tokens=300) == 2
+    monkeypatch.delenv(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_PREFILL_READY_ACTIVE_CAP",
+        raising=False,
+    )
+
+    monkeypatch.setenv(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_PREFILL_READY_MAX_TOKENS",
+        "320",
+    )
+    assert _online_prefill_ready_before_decode_enabled(temperature=0.7, max_tokens=320)
 
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_PREFILL_READY_BEFORE_DECODE", "1")
     assert _online_prefill_ready_before_decode_enabled(temperature=0.0, max_tokens=64)
+    assert _online_prefill_ready_before_decode_active_cap(temperature=0.0, max_tokens=64) is None
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_PREFILL_READY_ACTIVE_CAP", "6")
+    assert _online_prefill_ready_before_decode_active_cap(temperature=0.0, max_tokens=64) == 6
 
 
 def test_openai_online_generated_prefix_cache_defaults_to_sampled_short(monkeypatch) -> None:

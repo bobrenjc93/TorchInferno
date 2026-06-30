@@ -414,8 +414,65 @@ def _online_decode_first_enabled(*, temperature: float, max_tokens: int) -> bool
 
 
 def _online_prefill_ready_before_decode_enabled(*, temperature: float, max_tokens: int) -> bool:
-    del temperature, max_tokens
-    return env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_PREFILL_READY_BEFORE_DECODE", False)
+    global_env = "TORCHINFERNO_OPENAI_TP_ONLINE_PREFILL_READY_BEFORE_DECODE"
+    if global_env in os.environ:
+        return env_flag(global_env, False)
+    if temperature <= 0.0 or max_tokens < 1:
+        return False
+    sampled_medium_min_tokens = env_int(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_PREFILL_READY_MIN_TOKENS",
+        256,
+        minimum=1,
+    )
+    sampled_medium_max_tokens = env_int(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_PREFILL_READY_MAX_TOKENS",
+        300,
+        minimum=sampled_medium_min_tokens,
+    )
+    if sampled_medium_min_tokens < max_tokens <= sampled_medium_max_tokens:
+        # Tree-style sampled medium bursts are first-token bound when a decode
+        # wave has drained to a small tail and the next worker wave is ready.
+        # Let that next wave prefill first, but keep greedy/eval and
+        # sampled-short defaults unchanged.
+        return env_flag(
+            "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_PREFILL_READY_BEFORE_DECODE",
+            True,
+        )
+    return False
+
+
+def _online_prefill_ready_before_decode_active_cap(
+    *,
+    temperature: float,
+    max_tokens: int,
+) -> int | None:
+    if not _online_prefill_ready_before_decode_enabled(
+        temperature=temperature,
+        max_tokens=max_tokens,
+    ):
+        return None
+    global_env = "TORCHINFERNO_OPENAI_TP_ONLINE_PREFILL_READY_ACTIVE_CAP"
+    if global_env in os.environ:
+        configured = env_int(global_env, 0, minimum=0)
+        return None if configured <= 0 else configured
+    sampled_medium_min_tokens = env_int(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_PREFILL_READY_MIN_TOKENS",
+        256,
+        minimum=1,
+    )
+    sampled_medium_max_tokens = env_int(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_PREFILL_READY_MAX_TOKENS",
+        300,
+        minimum=sampled_medium_min_tokens,
+    )
+    if temperature > 0.0 and sampled_medium_min_tokens < max_tokens <= sampled_medium_max_tokens:
+        configured = env_int(
+            "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_PREFILL_READY_ACTIVE_CAP",
+            4,
+            minimum=0,
+        )
+        return None if configured <= 0 else configured
+    return None
 
 
 def _stream_token_batch_max() -> int:
@@ -4382,6 +4439,10 @@ class OpenAICompletionEngine:
             temperature=first.temperature,
             max_tokens=run_max_tokens,
         )
+        prefill_ready_before_decode_active_cap = _online_prefill_ready_before_decode_active_cap(
+            temperature=first.temperature,
+            max_tokens=run_max_tokens,
+        )
         if not decode_first:
             use_decode_many = False
         decode_many_allow_stop = _online_decode_many_allow_stop_enabled(
@@ -4439,6 +4500,7 @@ class OpenAICompletionEngine:
                 admit_per_step_cap=admit_per_step_cap,
                 decode_first=decode_first,
                 prefill_ready_before_decode=prefill_ready_before_decode,
+                prefill_ready_before_decode_active_cap=prefill_ready_before_decode_active_cap,
                 enable_decode_many=use_decode_many,
                 decode_many_allow_stop=decode_many_allow_stop,
                 generated_prefix_cache=_online_generated_prefix_cache_enabled(
@@ -4547,6 +4609,9 @@ class OpenAICompletionEngine:
                 use_decode_many=use_decode_many,
                 decode_first=decode_first,
                 prefill_ready_before_decode=prefill_ready_before_decode,
+                prefill_ready_before_decode_active_cap=(
+                    prefill_ready_before_decode_active_cap or 0
+                ),
                 decode_many_allow_stop=decode_many_allow_stop,
                 use_paged_engine=use_paged_engine,
                 graph_prefill=graph_prefill,
@@ -13182,6 +13247,10 @@ def _tensor_parallel_worker_loop(engine: OpenAICompletionEngine) -> None:
                     temperature=temperature,
                     max_tokens=max_tokens,
                 )
+                prefill_ready_before_decode_active_cap = _online_prefill_ready_before_decode_active_cap(
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                )
                 if not decode_first:
                     enable_decode_many = False
                 decode_many_allow_stop = _online_decode_many_allow_stop_enabled(
@@ -13242,6 +13311,7 @@ def _tensor_parallel_worker_loop(engine: OpenAICompletionEngine) -> None:
                         admit_per_step_cap=admit_per_step_cap,
                         decode_first=decode_first,
                         prefill_ready_before_decode=prefill_ready_before_decode,
+                        prefill_ready_before_decode_active_cap=prefill_ready_before_decode_active_cap,
                         enable_decode_many=enable_decode_many,
                         decode_many_allow_stop=decode_many_allow_stop,
                         generated_prefix_cache=_online_generated_prefix_cache_enabled(
@@ -13304,6 +13374,10 @@ def _tensor_parallel_worker_loop(engine: OpenAICompletionEngine) -> None:
                     online_runtime_engine.decode_first = decode_first
                 if hasattr(online_runtime_engine, "prefill_ready_before_decode"):
                     online_runtime_engine.prefill_ready_before_decode = prefill_ready_before_decode
+                if hasattr(online_runtime_engine, "prefill_ready_before_decode_active_cap"):
+                    online_runtime_engine.prefill_ready_before_decode_active_cap = (
+                        prefill_ready_before_decode_active_cap
+                    )
                 worker_decode_runner = getattr(engine, "_decode_graph_runner", None)
                 if worker_decode_runner is not None:
                     online_runtime_engine._decode_runner = worker_decode_runner
