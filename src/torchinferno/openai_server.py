@@ -269,13 +269,16 @@ def _online_kv_bounded_max_active_cap(*, temperature: float, base_cap: int) -> i
         return min(cap, env_int(greedy_cap_env, cap, minimum=1))
     if "TORCHINFERNO_OPENAI_TP_ONLINE_KV_MAX_ACTIVE_CAP" in os.environ:
         return cap
-    # Short greedy long_output requests are decode-throughput bound and benefit
-    # from using most of the KV-bounded row cap, but keeping a small prefix floor
-    # under the 144-row dense cache envelope reduces refill fragmentation.
+    # Short greedy long_output requests are decode-throughput bound, but the
+    # previous 123-row active cap still decoded in 64-row model buckets while
+    # cutting the prefix cache down to 21 rows. That inflated prefill/refill work
+    # without increasing effective decode batch size. Keep the active cap at the
+    # 64-row decode bucket and preserve the 64-row prefix cache under the 144-row
+    # dense cache envelope.
     total_budget = env_int("TORCHINFERNO_OPENAI_TP_ONLINE_TOTAL_ROWS_BUDGET", 144, minimum=0)
     min_prefix_rows = env_int(
         "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_KV_MIN_PREFIX_ROWS",
-        21,
+        80,
         minimum=0,
     )
     default_greedy_cap = cap

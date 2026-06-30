@@ -9270,9 +9270,9 @@ def test_online_kv_bounded_max_active_cap_targets_greedy(monkeypatch) -> None:
     monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_TOTAL_ROWS_BUDGET", raising=False)
     monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_KV_MIN_PREFIX_ROWS", raising=False)
 
-    assert _online_kv_bounded_max_active_cap(temperature=0.0, base_cap=128) == 123
+    assert _online_kv_bounded_max_active_cap(temperature=0.0, base_cap=128) == 64
     assert _online_kv_bounded_max_active_cap(temperature=0.7, base_cap=128) == 128
-    assert _online_kv_bounded_max_active_cap(temperature=0.0, base_cap=80) == 80
+    assert _online_kv_bounded_max_active_cap(temperature=0.0, base_cap=80) == 64
 
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_KV_MAX_ACTIVE_CAP", "112")
     assert _online_kv_bounded_max_active_cap(temperature=0.0, base_cap=128) == 112
