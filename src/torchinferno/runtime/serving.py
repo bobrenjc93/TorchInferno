@@ -1794,6 +1794,26 @@ class ContinuousBatchEngine:
         bucket = 1 << (count - 1).bit_length()
         return min(bucket, self.max_active_requests)
 
+    def _prefix_prefill_capture_on_miss(self, batch_bucket: int) -> bool:
+        env_name = "TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_CAPTURE_ON_MISS"
+        if env_name in os.environ:
+            return env_flag(env_name, True)
+        max_tokens = self.max_generation_tokens
+        if self.temperature <= 0.0 and max_tokens is not None:
+            greedy_short_max_tokens = env_int(
+                "TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_CAPTURE_GREEDY_SHORT_MAX_TOKENS",
+                128,
+                minimum=1,
+            )
+            if 0 < int(max_tokens) <= greedy_short_max_tokens:
+                max_capture_batch = env_int(
+                    "TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_CAPTURE_GREEDY_SHORT_MAX_BATCH",
+                    32,
+                    minimum=0,
+                )
+                return int(batch_bucket) <= max_capture_batch
+        return True
+
     def _suffix_bucket(self, length: int) -> int:
         configured_buckets = _parse_positive_int_csv(
             os.environ.get("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SUFFIX_BUCKETS")
@@ -1942,7 +1962,7 @@ class ContinuousBatchEngine:
                     logit_positions,
                     context_len,
                     src_prefix_row,
-                    capture_on_miss=env_flag("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_CAPTURE_ON_MISS", True),
+                    capture_on_miss=self._prefix_prefill_capture_on_miss(batch_bucket),
                 )
             if logits is None:
                 logits = self._ragged_prefill_logits_eager(

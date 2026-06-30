@@ -2572,6 +2572,64 @@ def test_continuous_batch_engine_prefix_reuse_does_not_capture_ragged_graph_on_m
     assert engine.stats.prefix_reuse_requests == 4
 
 
+def test_continuous_batch_engine_short_greedy_skips_large_prefix_prefill_capture_on_miss(
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_CAPTURE_ON_MISS", raising=False)
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PADDED_SUFFIX_PREFILL", "1")
+    shared = tuple(range(16))
+    model = _SelectedRaggedGraphMissToyModel()
+    engine = ContinuousBatchEngine(
+        model,
+        device=torch.device("cpu"),
+        temperature=0.0,
+        max_active_requests=64,
+        prefix_cache_capacity=4,
+        pin_shared_prefix=True,
+        graph_prefill=True,
+        max_generation_tokens=96,
+    )
+    requests = [
+        ServingRequest(str(index), (*shared, 100 + index), 1, arrival_step=0)
+        for index in range(33)
+    ]
+
+    results = engine.run(requests)
+
+    assert len(results) == 33
+    assert model.prefill_capture_flags == [False]
+    assert engine.stats.prefill_graph_misses == 1
+
+
+def test_continuous_batch_engine_prefix_prefill_capture_on_miss_policy(
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_CAPTURE_ON_MISS", raising=False)
+    engine = ContinuousBatchEngine(
+        _RaggedGraphToyModel(),
+        device=torch.device("cpu"),
+        temperature=0.0,
+        max_active_requests=64,
+        max_generation_tokens=96,
+    )
+    sampled_engine = ContinuousBatchEngine(
+        _RaggedGraphToyModel(),
+        device=torch.device("cpu"),
+        temperature=0.7,
+        max_active_requests=64,
+        max_generation_tokens=96,
+    )
+
+    assert engine._prefix_prefill_capture_on_miss(32)
+    assert not engine._prefix_prefill_capture_on_miss(64)
+    assert sampled_engine._prefix_prefill_capture_on_miss(64)
+
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_CAPTURE_ON_MISS", "1")
+    assert engine._prefix_prefill_capture_on_miss(64)
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_CAPTURE_ON_MISS", "0")
+    assert not sampled_engine._prefix_prefill_capture_on_miss(1)
+
+
 def test_continuous_batch_engine_clears_external_cache_capture_skip() -> None:
     model = _RaggedGraphToyModel()
     cache = model.allocate_cache(2, max_seq_len=16)
