@@ -9513,8 +9513,8 @@ def test_openai_online_initial_batch_wait_uses_sampled_short_default(monkeypatch
     assert _online_initial_batch_wait_ms(temperature=0.0, max_tokens=401) == 10.0
     assert _online_initial_batch_wait_ms(temperature=0.0, max_tokens=512) == 10.0
     assert _online_initial_batch_wait_ms(temperature=0.0, max_tokens=513) == 1.0
-    assert _online_initial_batch_wait_ms(temperature=0.7, max_tokens=257) == 10.0
-    assert _online_initial_batch_wait_ms(temperature=0.7, max_tokens=300) == 10.0
+    assert _online_initial_batch_wait_ms(temperature=0.7, max_tokens=257) == 1.0
+    assert _online_initial_batch_wait_ms(temperature=0.7, max_tokens=300) == 1.0
     assert _online_initial_batch_wait_ms(temperature=0.7, max_tokens=301) == 1.0
 
 
