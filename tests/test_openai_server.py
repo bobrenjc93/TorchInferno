@@ -9314,7 +9314,7 @@ def test_online_fp8_prefill_defaults_to_greedy_short_large_and_sampled_medium(mo
     assert _online_fp8_prefill_enabled(temperature=0.0, max_tokens=401)
     assert _online_fp8_prefill_enabled(temperature=0.0, max_tokens=512)
     assert not _online_fp8_prefill_enabled(temperature=0.0, max_tokens=513)
-    assert _online_fp8_prefill_min_m(temperature=0.0, max_tokens=128) == 2048
+    assert _online_fp8_prefill_min_m(temperature=0.0, max_tokens=128) == 512
     assert _online_fp8_prefill_min_m(temperature=0.0, max_tokens=512) == 512
     assert _online_fp8_prefill_min_m(temperature=0.0, max_tokens=400) == 2048
     assert _online_fp8_prefill_min_m(temperature=0.7, max_tokens=300) == 256
