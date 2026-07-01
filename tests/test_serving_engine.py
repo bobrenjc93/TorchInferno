@@ -3075,6 +3075,7 @@ def test_continuous_batch_engine_uses_dense_token_graph_for_greedy_sampled_defau
 
 def test_continuous_batch_engine_uses_flashinfer_decode_graphs_for_sampled_default(monkeypatch) -> None:
     monkeypatch.delenv("TORCHINFERNO_FI_DECODE_GRAPH", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_FI_DECODE_SAMPLED_MAX_TOKENS", raising=False)
     model = _FiDecodeGraphToyModel()
     engine = ContinuousBatchEngine(
         model,
@@ -3082,6 +3083,64 @@ def test_continuous_batch_engine_uses_flashinfer_decode_graphs_for_sampled_defau
         max_active_requests=2,
         prefix_cache_capacity=0,
         temperature=0.7,
+    )
+
+    results = engine.run(
+        [
+            ServingRequest("short", (1, 2), 3, arrival_step=0),
+            ServingRequest("long", (6, 7, 8), 3, arrival_step=0),
+        ]
+    )
+
+    assert [len(result.tokens) for result in results] == [5, 6]
+    assert model.fi_graph.replay_calls == 2
+    assert model.fi_wrapper.plan_calls == 2
+    assert model.ragged_token_graph_calls == 0
+    assert engine.stats.decode_graph_hits == 2
+
+
+def test_continuous_batch_engine_skips_flashinfer_decode_for_sampled_medium_default(
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv("TORCHINFERNO_FI_DECODE_GRAPH", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_FI_DECODE_SAMPLED_MAX_TOKENS", raising=False)
+    model = _FiDecodeGraphToyModel()
+    engine = ContinuousBatchEngine(
+        model,
+        device=torch.device("cpu"),
+        max_active_requests=2,
+        prefix_cache_capacity=0,
+        temperature=0.7,
+        max_generation_tokens=300,
+    )
+
+    results = engine.run(
+        [
+            ServingRequest("short", (1, 2), 3, arrival_step=0),
+            ServingRequest("long", (6, 7, 8), 3, arrival_step=0),
+        ]
+    )
+
+    assert [len(result.tokens) for result in results] == [5, 6]
+    assert model.fi_graph.replay_calls == 0
+    assert model.fi_wrapper.plan_calls == 0
+    assert model.ragged_token_graph_calls == 2
+    assert engine.stats.decode_graph_hits == 2
+
+
+def test_continuous_batch_engine_can_allow_flashinfer_decode_for_sampled_medium(
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv("TORCHINFERNO_FI_DECODE_GRAPH", raising=False)
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_FI_DECODE_SAMPLED_MAX_TOKENS", "400")
+    model = _FiDecodeGraphToyModel()
+    engine = ContinuousBatchEngine(
+        model,
+        device=torch.device("cpu"),
+        max_active_requests=2,
+        prefix_cache_capacity=0,
+        temperature=0.7,
+        max_generation_tokens=300,
     )
 
     results = engine.run(

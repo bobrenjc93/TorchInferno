@@ -741,6 +741,52 @@ def test_openai_decode_warmup_excludes_prefix_cache_rows() -> None:
     )
 
 
+def test_openai_unified_scheduler_warmup_captures_ragged_logits_graphs(monkeypatch) -> None:
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_WARMUP_ONLINE_COMMON_PREFIX_PREFILL", "0")
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_FLASHINFER_PREFILL_DISABLE", "1")
+
+    class _TokenAndLogitsWarmupModel(_WarmupShapeModel):
+        def __init__(self) -> None:
+            super().__init__()
+            self.token_ragged_shapes: list[tuple[int, int, tuple[int, ...] | None]] = []
+
+        def try_decode_ragged_token_graph(
+            self,
+            input_ids: torch.Tensor,
+            cache: _WarmupShapeCache,
+            *,
+            seq_lens: torch.Tensor,
+            row_indices: torch.Tensor | None = None,
+            temperature: float = 0.0,
+        ) -> torch.Tensor:
+            del cache, seq_lens, temperature
+            row_tuple = None if row_indices is None else tuple(int(index) for index in row_indices.tolist())
+            self.token_ragged_shapes.append((input_ids.size(0), input_ids.size(1), row_tuple))
+            return torch.zeros(input_ids.size(0), dtype=torch.long)
+
+    cache = _WarmupShapeCache()
+    model = _TokenAndLogitsWarmupModel()
+    engine = object.__new__(OpenAICompletionEngine)
+    engine.model = model
+    engine.device = torch.device("cpu")
+    engine._persistent_serving_cache = None
+    engine._allocate_online_serving_warmup_cache = lambda: (cache, 4, 4, 16)  # type: ignore[method-assign]
+
+    engine._warmup_unified_scheduler_cache(vocab_size=16)
+
+    assert model.token_ragged_shapes == [
+        (1, 1, (0,)),
+        (2, 1, (0, 1)),
+        (4, 1, (0, 1, 2, 3)),
+    ]
+    assert [shape[:2] + (shape[3],) for shape in model.ragged_shapes] == [
+        (1, 1, (0,)),
+        (2, 1, (0, 1)),
+        (4, 1, (0, 1, 2, 3)),
+    ]
+    assert engine._persistent_serving_cache is cache
+
+
 def test_openai_temperature_warmup_uses_configured_batch_size(monkeypatch) -> None:
     monkeypatch.setenv("TORCHINFERNO_OPENAI_WARMUP_TEMPERATURE_BATCH_SIZES", "3")
     monkeypatch.setenv("TORCHINFERNO_OPENAI_WARMUP_TEMPERATURE_PROMPT_TOKEN_BUCKETS", "2")

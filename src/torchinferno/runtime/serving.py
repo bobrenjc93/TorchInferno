@@ -4945,7 +4945,9 @@ class ContinuousBatchEngine:
         sampling_temperature = float(self.temperature if temperature is None else temperature)
         fi_decode_mode = _fi_decode_graph_mode()
         use_fi_decode = fi_decode_mode == "always" or (
-            fi_decode_mode == "sampled" and sampling_temperature > 0.0
+            fi_decode_mode == "sampled"
+            and sampling_temperature > 0.0
+            and self._sampled_fi_decode_enabled_for_request()
         )
         fi_graphs = (
             getattr(self.model, "_fi_decode_graphs", None)
@@ -4999,6 +5001,13 @@ class ContinuousBatchEngine:
         if token is None:
             self.stats.decode_graph_misses += 1
         return token
+
+    def _sampled_fi_decode_enabled_for_request(self) -> bool:
+        max_tokens = self.max_generation_tokens
+        if max_tokens is None:
+            return True
+        limit = env_int("TORCHINFERNO_CONTINUOUS_FI_DECODE_SAMPLED_MAX_TOKENS", 256, minimum=0)
+        return limit > 0 and int(max_tokens) <= limit
 
     def _try_static_token_graph(
         self,
