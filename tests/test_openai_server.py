@@ -104,6 +104,7 @@ from torchinferno.openai_server import (
     _online_greedy_common_prefix_suffix_prefill_warmup_prefix_tokens,
     _online_greedy_common_prefix_suffix_prefill_warmup_suffix_tokens,
     _online_admit_per_step_cap,
+    _online_admit_min_free_rows,
     _online_collect_idle_arrivals_enabled,
     _online_decode_warmup_batch_sizes,
     _online_decode_first_enabled,
@@ -1203,6 +1204,7 @@ def test_tensor_parallel_worker_loop_handles_online_runtime_commands(monkeypatch
             pin_shared_prefix: bool = False,
             graph_prefill: bool = False,
             prefill_chunk_size: int | None = None,
+            admit_min_free_rows: int | None = None,
             admit_min_ready_requests: int | None = None,
             admit_per_step_cap: int | None = None,
             decode_first: bool | None = None,
@@ -1225,6 +1227,7 @@ def test_tensor_parallel_worker_loop_handles_online_runtime_commands(monkeypatch
                 enable_ragged_decode,
                 store_reusable_prefixes,
                 store_full_prompt_prefixes,
+                admit_min_free_rows,
                 admit_min_ready_requests,
                 admit_per_step_cap,
                 decode_first,
@@ -1284,6 +1287,7 @@ def test_tensor_parallel_worker_loop_handles_online_runtime_commands(monkeypatch
         True,
         True,
         True,
+        None,
         None,
         128,
         True,
@@ -1483,6 +1487,7 @@ def test_tensor_parallel_worker_loop_receives_online_tensor_commands(monkeypatch
             pin_shared_prefix: bool = False,
             graph_prefill: bool = False,
             prefill_chunk_size: int | None = None,
+            admit_min_free_rows: int | None = None,
             admit_min_ready_requests: int | None = None,
             admit_per_step_cap: int | None = None,
             decode_first: bool | None = None,
@@ -1505,6 +1510,7 @@ def test_tensor_parallel_worker_loop_receives_online_tensor_commands(monkeypatch
                 enable_ragged_decode,
                 store_reusable_prefixes,
                 store_full_prompt_prefixes,
+                admit_min_free_rows,
                 admit_min_ready_requests,
                 admit_per_step_cap,
                 decode_first,
@@ -1569,6 +1575,7 @@ def test_tensor_parallel_worker_loop_receives_online_tensor_commands(monkeypatch
         True,
         True,
         False,
+        None,
         None,
         128,
         True,
@@ -8887,6 +8894,26 @@ def test_openai_refill_min_ready_requests_respects_env_overrides(monkeypatch) ->
     assert _online_refill_min_ready_requests(temperature=0.0, max_tokens=45) is None
 
 
+def test_openai_admit_min_free_rows_defaults_for_short_greedy(monkeypatch) -> None:
+    monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_ADMIT_MIN_FREE_ROWS", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_ADMIT_MIN_FREE_ROWS", raising=False)
+
+    assert _online_admit_min_free_rows(temperature=0.0, max_tokens=45) == 4
+    assert _online_admit_min_free_rows(temperature=0.0, max_tokens=128) == 4
+    assert _online_admit_min_free_rows(temperature=0.0, max_tokens=129) is None
+    assert _online_admit_min_free_rows(temperature=0.7, max_tokens=45) is None
+    assert _online_admit_min_free_rows(temperature=0.0, max_tokens=0) is None
+
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_ADMIT_MIN_FREE_ROWS", "6")
+    assert _online_admit_min_free_rows(temperature=0.0, max_tokens=45) == 6
+
+
+def test_openai_admit_min_free_rows_respects_runtime_env(monkeypatch) -> None:
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_ADMIT_MIN_FREE_ROWS", "8")
+
+    assert _online_admit_min_free_rows(temperature=0.0, max_tokens=45) is None
+
+
 def test_openai_online_admit_per_step_cap_uses_greedy_mid_default(monkeypatch) -> None:
     monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_ADMIT_PER_STEP_CAP", raising=False)
     monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_ADMIT_PER_STEP_CAP", raising=False)
@@ -14069,6 +14096,7 @@ def test_openai_tensor_parallel_online_batcher_records_profile_snapshots(
     assert records[3]["initial_wait_ms"] == 0.0
     assert records[3]["idle_batch_wait_ms"] == 5.0
     assert records[3]["collect_idle_arrivals"] is False
+    assert records[3]["admit_min_free_rows"] == 4
     assert records[3]["admit_min_ready_requests"] == 12
     assert records[3]["admit_per_step_cap"] == 64
     assert records[3]["prefill_token_budget"] == 0

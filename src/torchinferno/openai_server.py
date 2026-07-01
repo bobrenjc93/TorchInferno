@@ -238,6 +238,30 @@ def _online_admit_per_step_cap(*, temperature: float, max_tokens: int) -> int | 
     )
 
 
+def _online_admit_min_free_rows(*, temperature: float, max_tokens: int) -> int | None:
+    if "TORCHINFERNO_CONTINUOUS_ADMIT_MIN_FREE_ROWS" in os.environ:
+        return None
+    if max_tokens < 1:
+        return None
+    if temperature > 0.0:
+        return None
+    greedy_short_max_tokens = env_int(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_ADMIT_MAX_TOKENS",
+        128,
+        minimum=1,
+    )
+    if max_tokens > greedy_short_max_tokens:
+        return None
+    # Long-output-style short greedy streams are decode-stall sensitive. Waiting
+    # for a small refill window batches suffix-prefill work without the larger
+    # TTFT hit seen from high refill floors.
+    return env_int(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_ADMIT_MIN_FREE_ROWS",
+        4,
+        minimum=1,
+    )
+
+
 def _online_kv_bounded_concurrency_enabled(*, temperature: float, max_tokens: int) -> bool:
     if not env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_KV_BOUNDED_CONCURRENCY", True):
         return False
@@ -4534,6 +4558,10 @@ class OpenAICompletionEngine:
             temperature=first.temperature,
             max_tokens=run_max_tokens,
         )
+        admit_min_free_rows = _online_admit_min_free_rows(
+            temperature=first.temperature,
+            max_tokens=run_max_tokens,
+        )
         admit_per_step_cap = _online_admit_per_step_cap(
             temperature=first.temperature,
             max_tokens=run_max_tokens,
@@ -4565,6 +4593,7 @@ class OpenAICompletionEngine:
                 graph_prefill=graph_prefill,
                 prefill_chunk_size=prefill_chunk_size,
                 profile_timings=profile_queue,
+                admit_min_free_rows=admit_min_free_rows,
                 admit_min_ready_requests=admit_min_ready_requests,
                 admit_per_step_cap=admit_per_step_cap,
                 decode_first=decode_first,
@@ -4671,6 +4700,7 @@ class OpenAICompletionEngine:
                 initial_wait_ms=round(initial_wait_s * 1000.0, 3),
                 idle_batch_wait_ms=round(idle_wait_s * 1000.0, 3),
                 collect_idle_arrivals=collect_idle_arrivals,
+                admit_min_free_rows=admit_min_free_rows,
                 admit_min_ready_requests=admit_min_ready_requests,
                 admit_per_step_cap=admit_per_step_cap,
                 prefill_token_budget=normalized_prefill_budget or 0,
@@ -5803,6 +5833,10 @@ class OpenAICompletionEngine:
             graph_prefill=env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_GRAPH_PREFILL", True),
             prefill_chunk_size=(env_int("TORCHINFERNO_OPENAI_TP_ONLINE_PREFILL_CHUNK", 0, minimum=0) or None),
             profile_timings=bool(self._queue_profile_path_value()),
+            admit_min_free_rows=_online_admit_min_free_rows(
+                temperature=group[0].temperature,
+                max_tokens=max_tokens,
+            ),
             admit_min_ready_requests=_online_refill_min_ready_requests(
                 temperature=group[0].temperature,
                 max_tokens=max_tokens,
@@ -6050,6 +6084,10 @@ class OpenAICompletionEngine:
             graph_prefill=env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_GRAPH_PREFILL", True),
             prefill_chunk_size=(env_int("TORCHINFERNO_OPENAI_TP_ONLINE_PREFILL_CHUNK", 0, minimum=0) or None),
             profile_timings=bool(self._queue_profile_path_value()),
+            admit_min_free_rows=_online_admit_min_free_rows(
+                temperature=group[0].temperature,
+                max_tokens=max_tokens,
+            ),
             admit_per_step_cap=_online_admit_per_step_cap(
                 temperature=group[0].temperature,
                 max_tokens=max_tokens,
@@ -13328,6 +13366,10 @@ def _tensor_parallel_worker_loop(engine: OpenAICompletionEngine) -> None:
                     temperature=temperature,
                     max_tokens=max_tokens,
                 )
+                admit_min_free_rows = _online_admit_min_free_rows(
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                )
                 admit_per_step_cap = _online_admit_per_step_cap(
                     temperature=temperature,
                     max_tokens=max_tokens,
@@ -13404,6 +13446,7 @@ def _tensor_parallel_worker_loop(engine: OpenAICompletionEngine) -> None:
                         pin_shared_prefix=env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_PIN_SHARED_PREFIX", True),
                         graph_prefill=env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_GRAPH_PREFILL", True),
                         prefill_chunk_size=(env_int("TORCHINFERNO_OPENAI_TP_ONLINE_PREFILL_CHUNK", 0, minimum=0) or None),
+                        admit_min_free_rows=admit_min_free_rows,
                         admit_min_ready_requests=admit_min_ready_requests,
                         admit_per_step_cap=admit_per_step_cap,
                         decode_first=decode_first,
@@ -13461,6 +13504,8 @@ def _tensor_parallel_worker_loop(engine: OpenAICompletionEngine) -> None:
                     )
                 if hasattr(online_runtime_engine, "admit_min_ready_requests"):
                     online_runtime_engine.admit_min_ready_requests = admit_min_ready_requests
+                if hasattr(online_runtime_engine, "admit_min_free_rows"):
+                    online_runtime_engine.admit_min_free_rows = admit_min_free_rows
                 if hasattr(online_runtime_engine, "admit_per_step_cap"):
                     online_runtime_engine.admit_per_step_cap = admit_per_step_cap
                 if hasattr(online_runtime_engine, "enable_decode_many"):

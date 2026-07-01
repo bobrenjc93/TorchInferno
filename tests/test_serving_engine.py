@@ -3508,6 +3508,33 @@ def test_continuous_batch_engine_online_refill_can_wait_for_free_rows(monkeypatc
     assert [event.finished for event in third_step] == [True, True, True]
 
 
+def test_continuous_batch_engine_online_refill_accepts_min_free_rows_policy(
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_ADMIT_MIN_FREE_ROWS", raising=False)
+    engine = ContinuousBatchEngine(
+        _RaggedGraphToyModel(),
+        device=torch.device("cpu"),
+        max_active_requests=3,
+        prefix_cache_capacity=0,
+        admit_min_free_rows=2,
+    )
+    engine.start_online(max_seq_len=8)
+    engine.submit_online(ServingRequest("a", (1, 2), 3, arrival_step=0))
+    engine.submit_online(ServingRequest("b", (6, 7), 3, arrival_step=0))
+
+    first_step = engine.step_online()
+    engine.submit_online(ServingRequest("late", (10, 11), 1, arrival_step=1))
+    second_step = engine.step_online()
+    third_step = engine.step_online()
+
+    assert [event.request_id for event in first_step] == ["a", "b"]
+    assert [event.request_id for event in second_step] == ["a", "b"]
+    assert [event.finished for event in second_step] == [False, False]
+    assert [event.request_id for event in third_step] == ["a", "b", "late"]
+    assert [event.finished for event in third_step] == [True, True, True]
+
+
 def test_continuous_batch_engine_online_refill_can_wait_for_ready_requests(monkeypatch) -> None:
     monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_ADMIT_MIN_READY_REQUESTS", "2")
     engine = ContinuousBatchEngine(

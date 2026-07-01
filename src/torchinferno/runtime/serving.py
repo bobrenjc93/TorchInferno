@@ -418,6 +418,7 @@ class ContinuousBatchEngine:
         pin_shared_prefix: bool = False,
         graph_prefill: bool = False,
         profile_timings: bool = False,
+        admit_min_free_rows: int | None = None,
         admit_min_ready_requests: int | None = None,
         admit_per_step_cap: int | None = None,
         enable_decode_many: bool | None = None,
@@ -476,6 +477,9 @@ class ContinuousBatchEngine:
         # graph shapes repeat. Per-row start positions handle mixed prefixes.
         self.graph_prefill = graph_prefill
         self.profile_timings = profile_timings
+        self.admit_min_free_rows = (
+            None if admit_min_free_rows is None else max(1, int(admit_min_free_rows))
+        )
         self.admit_min_ready_requests = admit_min_ready_requests
         self.admit_per_step_cap = admit_per_step_cap
         self.generated_prefix_cache = generated_prefix_cache
@@ -1260,7 +1264,14 @@ class ContinuousBatchEngine:
         active_count: int,
     ) -> list[tuple[int, ServingRequest]]:
         capacity = self.max_active_requests - active_count
-        min_free_rows = env_int("TORCHINFERNO_CONTINUOUS_ADMIT_MIN_FREE_ROWS", 1, minimum=1)
+        default_min_free_rows = (
+            1 if self.admit_min_free_rows is None else int(self.admit_min_free_rows)
+        )
+        min_free_rows = env_int(
+            "TORCHINFERNO_CONTINUOUS_ADMIT_MIN_FREE_ROWS",
+            default_min_free_rows,
+            minimum=1,
+        )
         if active_count > 0 and capacity < min(min_free_rows, self.max_active_requests):
             return []
         # Always cap NEW admissions per step at per_step_cap. This decouples the
