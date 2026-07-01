@@ -1,5 +1,70 @@
 # TorchInferno vs vLLM/sglang — Performance Gap Analysis (Llama-3.1-70B, 8xH100)
 
+## Current 20260701 refresh and local vLLM/SGLang checks
+
+Public run `20260701_211855` is stale for TorchInferno: it measured
+TorchInferno `3af4940`, before the dynamic-prefix context-floor and greedy
+ctx256 warmup changes (`304761c`, `f8cc9d5`). It landed at TorchInferno
+`9/20`, SGLang `10/20`, and vLLM `0/20`; vLLM did not serve because the public
+provider started with a too-small FlashInfer workspace buffer
+(`Buffer: 1048576 bytes, Required: 4194304 bytes`). The inference-bench provider
+has since been updated to default vLLM's FlashInfer workspace to the current
+upstream `394MiB` setting and to expose extra vLLM server args.
+
+The public TorchInferno rows were few_shot `154.1 / 49.0 / 196.5ms`,
+self_consistency `160.7 / 0.0 / 173.8ms`, multi_turn
+`296.3 / 62.2 / 349.8ms`, tree_of_thought `137.7 / 37.3 / 161.3ms`, and
+long_output `246.9 / 22.4 / 1051.4ms`. SGLang's long_output row was still well
+ahead on first-token and E2E latency: `82.5 / 21.8 / 875.3ms`.
+
+A same-host TorchInferno all-benchmark run with the warm ctx256 working tree
+landed at few_shot `170.6 / 48.8 / 208.2ms`, self_consistency
+`200.5 / 0.0 / 213.7ms`, multi_turn `294.0 / 59.3 / 351.0ms`,
+tree_of_thought `147.6 / 46.1 / 182.3ms`, and long_output
+`245.5 / 24.6 / 1214.5ms`. The long_output profile had zero request-path
+prefill captures, `64` prefill batches, `62` graph hits, `2` graph misses,
+`6.53s` prefill wall (`5.60s` forward), and `10.75s` ragged-decode GPU time.
+This keeps the long gap in the prefill/decode scheduling bucket rather than
+graph-capture cold start alone.
+
+Local vLLM with the fixed workspace buffer served successfully. Its rows were
+few_shot `240.4 / 91.6 / 320.6ms`, self_consistency `273.6 / 0.0 / 347.8ms`,
+multi_turn `284.9 / 110.4 / 391.7ms`, tree_of_thought
+`131.1 / 84.0 / 192.6ms`, and long_output `89.3 / 26.5 / 995.0ms`. Locally,
+vLLM only clearly beats TorchInferno on long_output first-token/E2E latency;
+TorchInferno remains ahead on the shorter rows and long_output TPOT.
+
+Local SGLang `1a5977d` served long_output at
+`62.6 / 24.8 / 1015.9ms`, 1000/1000 correct, after `125.6s` readiness. This
+confirms the remaining long_output competitor gap is mostly TorchInferno's
+prefill-to-first-token path, not steady token cadence.
+
+Rejected follow-ups on `f8cc9d5`:
+
+- `TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_ADMIT_PER_STEP_CAP=32` removed the
+  two `b64:s64` prefill graph misses but regressed long_output to
+  `269.4 / 25.1 / 1299.4ms`. Decode fragmentation dominated: step calls rose
+  from `500` to `600` and ragged-decode GPU time rose from `10.75s` to
+  `13.65s`.
+- Adding batch `64` to
+  `TORCHINFERNO_OPENAI_WARMUP_ONLINE_GREEDY_COMMON_PREFIX_SUFFIX_BATCHES`
+  is rejected. Startup rose to `226.0s`, long_output regressed to
+  `257.9 / 27.4 / 1618.7ms`, and prefill forward inflated to `15.86s`.
+  Capturing the larger graph hurts memory/steady-state behavior more than it
+  saves on the rare cold batch-64 suffix-prefill misses.
+- `INFERENCE_BENCH_TORCHINFERNO_PROFILE=0` did not validate profiling overhead
+  as the long-output gap. The no-profile run landed at
+  `254.5 / 24.4 / 1252.3ms`, essentially flat-to-worse versus the profiled
+  local control, so keep inference-bench profiling behavior unchanged.
+- `TORCHINFERNO_OPENAI_TP_ONLINE_PREFILL_CHUNK=32` is rejected:
+  `1460.6 / 82.2 / 4443.1ms`, with `369` prefill batches and many graph
+  captures.
+- `TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_PREFILL_READY_ACTIVE_CAP=16` is
+  rejected after warm graph retest: `250.6 / 25.5 / 1269.3ms`.
+- Enabling FlashInfer prefill
+  (`TORCHINFERNO_CONTINUOUS_FLASHINFER_PREFILL_DISABLE=0`) remains rejected:
+  `529.2 / 35.8 / 2002.9ms` and a correctness drop to `98%`.
+
 ## Current public-order refresh on 36c5c9a (2026-06-29)
 
 Public run `20260629_201815` measured pushed TorchInferno `36c5c9a`, SGLang
