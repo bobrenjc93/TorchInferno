@@ -542,7 +542,7 @@ def _online_prefill_ready_before_decode_active_cap(
         if max_tokens <= greedy_short_max_tokens:
             configured = env_int(
                 "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_PREFILL_READY_ACTIVE_CAP",
-                4,
+                8,
                 minimum=0,
             )
             return None if configured <= 0 else configured
