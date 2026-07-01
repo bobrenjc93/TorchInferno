@@ -9073,7 +9073,7 @@ def test_openai_online_prefill_ready_before_decode_respects_env(monkeypatch) -> 
     assert not _online_prefill_ready_before_decode_enabled(temperature=0.0, max_tokens=256)
     assert not _online_prefill_ready_before_decode_enabled(temperature=0.7, max_tokens=256)
     assert _online_prefill_ready_before_decode_enabled(temperature=0.7, max_tokens=300)
-    assert _online_prefill_ready_before_decode_active_cap(temperature=0.7, max_tokens=300) == 8
+    assert _online_prefill_ready_before_decode_active_cap(temperature=0.7, max_tokens=300) == 10
     assert not _online_prefill_ready_before_decode_enabled(temperature=0.7, max_tokens=301)
     assert _online_prefill_ready_before_decode_active_cap(temperature=0.7, max_tokens=301) is None
 

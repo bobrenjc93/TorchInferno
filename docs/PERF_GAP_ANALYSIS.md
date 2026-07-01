@@ -5651,6 +5651,16 @@ This is an explicit latency/TPOT tradeoff, but it moves tree TTFT/E2E toward the
 vLLM/SGLang gap and is scoped to `temperature > 0`, `256 < max_tokens <= 300`,
 leaving sampled-short self-consistency and greedy paths unchanged.
 
+The same q2/wait1 stack benefits from a smaller prefill-ready active-cap bump
+than the noisy cap-16 probe. A fresh cap-8 control landed at
+`165.8 / 79.4 / 211.1ms`; cap 12 improved TPOT/E2E but gave back too much TTFT
+and tail. The midpoint cap 10 landed at `171.5 / 51.6 / 209.1ms` with p99 E2E
+`1068.5ms`, and the no-env default confirmation landed at
+`166.4 / 57.2 / 199.8ms` with p99 E2E `1102.3ms`. Promote `10` as the
+sampled-medium default under the existing `temperature > 0`,
+`256 < max_tokens <= 300` gate: it keeps TTFT essentially flat versus cap 8
+while improving TPOT/E2E in the focused local runs.
+
 ## In-flight, validated-locally-but-NOT-benchmarked commits
 
 The public results directory is still latest at `20260629_130308`; that run
