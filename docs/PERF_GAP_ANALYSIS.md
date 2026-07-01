@@ -5643,6 +5643,14 @@ the run speculatively decoded `1185` tokens that were skipped after EOS
 (`778` stop finishes). Keep sampled decode-many off by default; it is useful
 only to measure CPU sync pressure on sampled workloads without early stops.
 
+Sampled-medium tree refresh (2026-07-01, current `b66d3d4`): focused control
+was `185.9 / 49.5 / 223.5ms`. Setting sampled-medium initial wait to `1ms` and
+decode quantum to `2` reproduced the earlier lower-latency shape at
+`166.9 / 72.3 / 207.7ms`, with p99 E2E `1110.5ms` and correctness in family.
+This is an explicit latency/TPOT tradeoff, but it moves tree TTFT/E2E toward the
+vLLM/SGLang gap and is scoped to `temperature > 0`, `256 < max_tokens <= 300`,
+leaving sampled-short self-consistency and greedy paths unchanged.
+
 ## In-flight, validated-locally-but-NOT-benchmarked commits
 
 The public results directory is still latest at `20260629_130308`; that run

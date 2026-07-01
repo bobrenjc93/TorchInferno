@@ -349,7 +349,31 @@ def _online_decode_quantum(*, temperature: float, max_tokens: int) -> int:
     if max_tokens > short_gen_max_tokens:
         return decode_quantum
     default_short_quantum = min(decode_quantum, 4)
-    if temperature <= 0.0:
+    if temperature > 0.0:
+        sampled_short_max_tokens = env_int(
+            "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_SHORT_GEN_DECODE_QUANTUM_MAX_TOKENS",
+            256,
+            minimum=1,
+        )
+        sampled_medium_max_tokens = env_int(
+            "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_GEN_DECODE_QUANTUM_MAX_TOKENS",
+            300,
+            minimum=sampled_short_max_tokens,
+        )
+        if sampled_short_max_tokens < max_tokens <= sampled_medium_max_tokens:
+            # Tree-style sampled medium bursts are E2E/TTFT-bound more than
+            # steady TPOT-bound. A smaller command quantum lets newly-prefilled
+            # workers surface tokens sooner while staying scoped away from
+            # sampled-short self-consistency and greedy decode-many traffic.
+            default_short_quantum = min(
+                decode_quantum,
+                env_int(
+                    "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_GEN_DECODE_QUANTUM",
+                    2,
+                    minimum=1,
+                ),
+            )
+    elif temperature <= 0.0:
         greedy_short_max_tokens = env_int(
             "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_GEN_MAX_TOKENS",
             128,
@@ -984,12 +1008,12 @@ def _online_initial_batch_wait_ms(*, temperature: float, max_tokens: int) -> flo
         )
         if sampled_short_max_tokens < max_tokens <= sampled_medium_max_tokens:
             # Tree-of-thought sampled medium bursts are queue-to-submit bound in
-            # the current worker-wave shape. A 5ms window collected more of the
-            # first wave and improved local TP8 70B tree TTFT/TPOT/E2E without
+            # the current worker-wave shape. With the sampled-medium decode
+            # quantum lowered, a shorter first window keeps TTFT/E2E down without
             # touching sampled-short or greedy policy.
             default_wait_ms = env_float(
                 "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_INITIAL_BATCH_WAIT_MS",
-                5.0,
+                1.0,
                 minimum=0.0,
             )
     elif temperature <= 0.0 and 0 < max_tokens <= env_int(
