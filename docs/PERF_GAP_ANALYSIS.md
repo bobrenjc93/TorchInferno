@@ -5701,6 +5701,17 @@ before the request body is fully read. Drained keepalive `5s` regressed to
 `332.8 / 0.0 / 352.3ms`. Keep the current fast-HTTP defaults until a change can
 move client-observed TTFT/E2E, not just internal queue timing.
 
+Current `13d2b75` follow-ups add two guardrails. A no-profile focused
+self-consistency run still landed at `304.9 / 0.0 / 372.9ms`, so the current
+self row is not merely queue/HTTP profiling overhead. Rechecking the
+sampled-medium prefill-ready active cap at `12` for tree_of_thought also does
+not beat the promoted cap-10 tradeoff on current main: the focused row landed
+at `181.6 / 54.8 / 216.7ms`, and the queue profile showed queue-to-first/finish
+p50 rising to `159.5/195.0ms`. A same-host all-provider tree comparison attempt
+could not start vLLM/SGLang because no skipped-build venvs existed in the fresh
+build directory, but its TorchInferno control row was `169.4 / 50.0 / 201.3ms`;
+keep cap `10` and do not reopen cap `12` without a new signal.
+
 ## In-flight, validated-locally-but-NOT-benchmarked commits
 
 The public results directory is still latest at `20260630_110306`; that run
