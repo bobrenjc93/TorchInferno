@@ -5688,6 +5688,19 @@ but raw request deltas are still favorable at median `-12.6ms` TTFT and
 `-14.3ms` E2E, so promote this as a narrow TTFT/tail cleanup rather than a
 decode-throughput fix.
 
+Self-consistency HTTP/admission follow-ups on pushed `837d84e` did not produce
+a defaultable server change. The full-suite run showed self at
+`323.3 / 0.0 / 347.5ms`; focused self was `236.3 / 0.0 / 322.5ms`, and forcing
+the old short-greedy suffix list still landed at `227.7 / 0.0 / 348.6ms`, so
+the suffix-96 patch is not the cause. Fast-HTTP profiling showed the server-side
+stream path itself is short (`total_ms` p50 about `10ms` from request-ready to
+done, queue-to-finish p50 about `8.7ms`), while benchmark time is dominated
+before the request body is fully read. Drained keepalive `5s` regressed to
+`379.7 / 0.0 / 414.0ms`; drained keepalive `50ms` stayed high at
+`241.5 / 0.0 / 350.2ms`; and `1024` HTTP workers landed at
+`332.8 / 0.0 / 352.3ms`. Keep the current fast-HTTP defaults until a change can
+move client-observed TTFT/E2E, not just internal queue timing.
+
 ## In-flight, validated-locally-but-NOT-benchmarked commits
 
 The public results directory is still latest at `20260630_110306`; that run
