@@ -625,6 +625,21 @@ still bucket to `128`, `256`, or above, and the
 `TORCHINFERNO_CONTINUOUS_DYNAMIC_PREFIX_PREFILL_MIN_CONTEXT` override remains
 available for deployments that need the old floor.
 
+The first current full-order local check after that change exposed a warmup
+coverage regression rather than a runtime scheduling issue. With the 64-token
+floor, startup `p45/s16` greedy warmup now captures `ctx64`; few_shot
+`p122/s16` and long_output `p111/s32,s64` still bucket to `ctx256`, so the
+unpatched `304761c` full-order run had request-path `ctx256` captures in both
+rows. It landed at few_shot `172.9 / 50.8 / 214.4ms`, multi_turn
+`313.6 / 61.4 / 374.2ms`, tree `156.2 / 53.9 / 193.0ms`, and long_output
+`253.0 / 25.6 / 1402.3ms`; long_output showed `8` prefill graph captures and
+`13.82s` prefill wall. Adding only the missing greedy-short warmup pairs
+`111:32,111:64,122:16` avoided repeating the rejected broad `45,122` warmup:
+readiness moved from `180.8s` to `195.9s`, request-path captures dropped to
+zero for few_shot and long_output, and the full-order row improved to few_shot
+`170.6 / 48.8 / 208.2ms`, multi_turn `294.0 / 59.3 / 351.0ms`, tree
+`147.6 / 46.1 / 182.3ms`, and long_output `245.5 / 24.6 / 1214.5ms`.
+
 A current same-host self_consistency rerun on pushed `62eb441` shows the local
 score shape has shifted from E2E to TTFT/tail control. TorchInferno landed at
 `302.6 / 0.0 / 323.1ms`, vLLM at `278.2 / 0.0 / 337.6ms`, and SGLang at

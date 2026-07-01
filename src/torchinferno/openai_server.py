@@ -41,6 +41,7 @@ from torchinferno.openai_http import (
     OpenAIHTTPServer as _OpenAIServer,
 )
 from torchinferno.openai_warmup import (
+    parse_nonnegative_positive_int_pair_csv as _parse_nonnegative_positive_int_pair_csv,
     parse_positive_int_csv as _parse_positive_int_csv,
     warmup_prefill_cache_token_counts as _warmup_prefill_cache_token_counts,
     warmup_prefix_suffix_cache_token_counts as _warmup_prefix_suffix_cache_token_counts,
@@ -1217,6 +1218,36 @@ def _online_greedy_common_prefix_suffix_prefill_warmup_suffix_tokens(
             warmup_max_tokens,
         ) or _parse_positive_int_csv("16,32,64,96,128,256")
     return tuple(token_count for token_count in tokens if token_count <= max_seq_len)
+
+
+def _online_greedy_common_prefix_suffix_prefill_warmup_extra_pairs(
+    max_seq_len: int,
+    *,
+    warmup_temperature: float = 0.0,
+    warmup_max_tokens: int | None = None,
+) -> tuple[tuple[int, int], ...]:
+    if max_seq_len <= 0 or warmup_temperature > 0.0:
+        return ()
+    configured = os.environ.get(
+        "TORCHINFERNO_OPENAI_WARMUP_ONLINE_GREEDY_COMMON_PREFIX_EXTRA_PAIRS"
+    )
+    if configured is not None:
+        pairs = _parse_nonnegative_positive_int_pair_csv(configured)
+    elif _dynamic_prefix_prefill_max_suffix_for_policy(
+        warmup_temperature,
+        warmup_max_tokens,
+    ) is not None:
+        pairs = _parse_nonnegative_positive_int_pair_csv("111:32,111:64,122:16")
+    else:
+        pairs = ()
+    return tuple(
+        (prefix_count, suffix_count)
+        for prefix_count, suffix_count in pairs
+        if prefix_count > 0
+        and prefix_count <= max_seq_len
+        and suffix_count <= max_seq_len
+        and prefix_count + suffix_count <= max_seq_len
+    )
 
 
 def _online_greedy_common_prefix_suffix_prefill_warmup_batches(
@@ -3491,7 +3522,26 @@ class OpenAICompletionEngine:
             )
         )
         batch_sizes = _online_greedy_common_prefix_suffix_prefill_warmup_batches(cache_rows, max_active)
-        if not prefix_tokens or not suffix_tokens or not batch_sizes:
+        if warmup_max_tokens is None:
+            warmup_max_tokens = _online_greedy_common_prefix_suffix_prefill_warmup_max_tokens()
+        extra_pairs = _online_greedy_common_prefix_suffix_prefill_warmup_extra_pairs(
+            max_seq_len,
+            warmup_temperature=warmup_temperature,
+            warmup_max_tokens=warmup_max_tokens,
+        )
+        suffixes_by_prefix: dict[int, list[int]] = {}
+        for prefix_count in prefix_tokens:
+            for suffix_count in suffix_tokens:
+                if prefix_count + suffix_count <= max_seq_len:
+                    suffixes_by_prefix.setdefault(prefix_count, []).append(suffix_count)
+        for prefix_count, suffix_count in extra_pairs:
+            suffixes_by_prefix.setdefault(prefix_count, []).append(suffix_count)
+        suffixes_by_prefix = {
+            prefix_count: list(dict.fromkeys(prefix_suffixes))
+            for prefix_count, prefix_suffixes in suffixes_by_prefix.items()
+            if prefix_suffixes
+        }
+        if not suffixes_by_prefix or not batch_sizes:
             return
         prefix_rows = _online_common_prefix_prefill_warmup_rows(cache_rows, max_active)
         row = next((candidate for candidate in prefix_rows if candidate >= max(batch_sizes)), None)
@@ -3499,8 +3549,6 @@ class OpenAICompletionEngine:
             row = max(batch_sizes)
         if row is None:
             return
-        if warmup_max_tokens is None:
-            warmup_max_tokens = _online_greedy_common_prefix_suffix_prefill_warmup_max_tokens()
         dynamic_max_suffix = _dynamic_prefix_prefill_max_suffix_for_policy(
             warmup_temperature,
             warmup_max_tokens,
@@ -3528,7 +3576,7 @@ class OpenAICompletionEngine:
                 enabled=fp8_prefill_enabled,
                 min_m=fp8_prefill_min_m,
             )
-            for prefix_count in prefix_tokens:
+            for prefix_count, prefix_suffixes in suffixes_by_prefix.items():
                 row_cache = cache.for_rows([row]) if hasattr(cache, "for_rows") else cache
                 _reset_generation_cache(cache)
                 _set_generation_cache_seq_len(row_cache, 0)
@@ -3555,9 +3603,7 @@ class OpenAICompletionEngine:
                         flush=True,
                     )
                     continue
-                for suffix_count in suffix_tokens:
-                    if prefix_count + suffix_count > max_seq_len:
-                        continue
+                for suffix_count in prefix_suffixes:
                     for batch_size in batch_sizes:
                         suffix_ids = torch.zeros(
                             batch_size,
