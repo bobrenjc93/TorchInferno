@@ -929,6 +929,44 @@ def _online_session_max_tokens(*, temperature: float, max_tokens: int) -> int:
     return max_tokens
 
 
+def _online_session_policy_key(*, temperature: float, max_tokens: int) -> tuple[bool, int]:
+    return (
+        temperature > 0.0,
+        _online_session_max_tokens(temperature=temperature, max_tokens=max_tokens),
+    )
+
+
+def _online_sampled_medium_mixed_followup_compatible(
+    *,
+    session_temperature: float,
+    session_max_tokens: int,
+    request_temperature: float,
+    request_max_tokens: int,
+) -> bool:
+    if session_temperature <= 0.0:
+        return False
+    sampled_medium_min_tokens = env_int(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_PREFILL_READY_MIN_TOKENS",
+        256,
+        minimum=1,
+    )
+    sampled_medium_max_tokens = env_int(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_PREFILL_READY_MAX_TOKENS",
+        300,
+        minimum=sampled_medium_min_tokens,
+    )
+    if not (sampled_medium_min_tokens < session_max_tokens <= sampled_medium_max_tokens):
+        return False
+    if request_temperature > 0.0:
+        return False
+    verifier_max_tokens = env_int(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_MIXED_GREEDY_MAX_TOKENS",
+        400,
+        minimum=sampled_medium_max_tokens,
+    )
+    return sampled_medium_max_tokens < request_max_tokens <= verifier_max_tokens
+
+
 def _online_session_prompt_headroom_tokens(*, temperature: float, max_tokens: int) -> int:
     if max_tokens < 1 or temperature > 0.0:
         return 0
@@ -4415,11 +4453,36 @@ class OpenAICompletionEngine:
             phase_ms[name] = phase_ms.get(name, 0.0) + (time.perf_counter() - started_at_s) * 1000.0
 
         allow_mixed_temperatures = _online_mixed_temperature_batching_enabled()
+        session_policy_key = _online_session_policy_key(
+            temperature=first.temperature,
+            max_tokens=first.max_tokens,
+        )
 
-        def same_online_class(request: _QueuedGeneration) -> bool:
+        def same_online_policy(request: _QueuedGeneration) -> bool:
             if not request.stream:
                 return False
-            return allow_mixed_temperatures or request.temperature == first.temperature
+            if allow_mixed_temperatures:
+                if (request.temperature > 0.0) != (first.temperature > 0.0):
+                    return False
+            elif request.temperature != first.temperature:
+                return False
+            return (
+                _online_session_policy_key(
+                    temperature=request.temperature,
+                    max_tokens=request.max_tokens,
+                )
+                == session_policy_key
+            )
+
+        def same_online_class(request: _QueuedGeneration) -> bool:
+            if same_online_policy(request):
+                return True
+            return allow_mixed_temperatures and _online_sampled_medium_mixed_followup_compatible(
+                session_temperature=first.temperature,
+                session_max_tokens=first.max_tokens,
+                request_temperature=request.temperature,
+                request_max_tokens=request.max_tokens,
+            )
 
         initial_batch = [first]
         initial_batch_start_s = time.perf_counter()
@@ -4434,7 +4497,7 @@ class OpenAICompletionEngine:
                 if item is None:
                     self._generation_queue.put(None)
                     break
-                if same_online_class(item):
+                if same_online_policy(item):
                     initial_batch.append(item)
                     admitted += 1
                 else:
@@ -4455,7 +4518,7 @@ class OpenAICompletionEngine:
                 if item is None:
                     self._generation_queue.put(None)
                     break
-                if same_online_class(item):
+                if same_online_policy(item):
                     initial_batch.append(item)
                 else:
                     deferred.append(item)

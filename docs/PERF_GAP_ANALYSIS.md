@@ -5661,6 +5661,19 @@ sampled-medium default under the existing `temperature > 0`,
 `256 < max_tokens <= 300` gate: it keeps TTFT essentially flat versus cap 8
 while improving TPOT/E2E in the focused local runs.
 
+Full-suite local refresh after `b8914db` exposed a session-compatibility bug:
+the online batcher could keep a 256-token greedy session open and admit later
+sampled, multi-turn, and long-output requests under the wrong policy. That
+regressed the full-suite rows to self `235.8 / 0.0 / 275.5ms`, multi
+`416.5 / 65.9 / 484.4ms`, and long_output `1163.4 / 31.1 / 2194.2ms`. Require
+new requests to match the online sampled/greedy class and max-token bucket, but
+keep sampled-medium deterministic follow-ups in the same session. The queue
+profile then shows four final sessions (`0/256`, `0.7/256`, `0/512`, `0.7/300`)
+instead of one merged session, and the full-suite row recovers to few_shot
+`169.9 / 48.8 / 209.6ms`, self `41.6 / 0.0 / 46.1ms`, multi
+`297.0 / 58.4 / 349.3ms`, tree `174.0 / 53.0 / 207.6ms`, and long_output
+`283.0 / 25.2 / 1314.8ms`.
+
 ## In-flight, validated-locally-but-NOT-benchmarked commits
 
 The public results directory is still latest at `20260629_130308`; that run
