@@ -127,7 +127,7 @@ def _dynamic_prefix_prefill_context_len(
     bucket = exact_len
     min_bucket = env_int(
         "TORCHINFERNO_CONTINUOUS_DYNAMIC_PREFIX_PREFILL_MIN_CONTEXT",
-        256,
+        64,
         minimum=0,
     )
     if min_bucket > 0:

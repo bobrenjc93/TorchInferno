@@ -20,13 +20,13 @@ def test_dynamic_prefix_prefill_context_len_buckets_when_enabled(monkeypatch) ->
     monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_DYNAMIC_PREFIX_PREFILL_MIN_CONTEXT", raising=False)
     monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_DYNAMIC_PREFIX_PREFILL_MAX_SUFFIX", raising=False)
 
-    assert _dynamic_prefix_prefill_context_len(45, 16, max_seq_len=512) == -256
+    assert _dynamic_prefix_prefill_context_len(45, 16, max_seq_len=512) == -64
     assert _dynamic_prefix_prefill_context_len(45, 32, max_seq_len=512) == 77
 
     monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_DYNAMIC_PREFIX_PREFILL_GRAPH", "0")
     assert _dynamic_prefix_prefill_context_len(45, 16, max_seq_len=512) == 61
     monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_DYNAMIC_PREFIX_PREFILL_GRAPH", "1")
-    assert _dynamic_prefix_prefill_context_len(45, 32, max_seq_len=512) == -256
+    assert _dynamic_prefix_prefill_context_len(45, 32, max_seq_len=512) == -128
 
     monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_DYNAMIC_PREFIX_PREFILL_MIN_CONTEXT", "256")
     assert _dynamic_prefix_prefill_context_len(45, 16, max_seq_len=512) == -256

@@ -613,18 +613,17 @@ FP8-min-M, dynamic-context-floor, or graph-warmup knobs; the remaining tree gap
 needs a genuinely faster sampled-prefix prefill/decode pipeline rather than more
 shape cleanup.
 
-Lowering the dynamic prefix-prefill minimum context from `256` to `64` for the
-tree sampled-medium suffix shape is rejected. A broad env run
-(`TORCHINFERNO_CONTINUOUS_DYNAMIC_PREFIX_PREFILL_MIN_CONTEXT=64`) looked
-promising under queue profiling, moving the row to `208.1 / 48.4 / 248.8ms` and
-cutting sampled prefill forward from `1.80s` to `1.52s`, but the no-profile
-rerun exposed a greedy-eval tail (`220.4 / 49.2 / 259.8ms`, p99 E2E
-`3001.5ms`). A scoped source patch that applied the 64-token floor only to
-sampled-medium traffic and aligned startup warmup avoided the eval tail, but did
-not beat the same-code 256-token control: scoped `64` landed at
-`221.2 / 48.6 / 271.7ms`, while explicit sampled-medium `256` landed at
-`218.0 / 48.8 / 260.6ms`. The patch was reverted; keep the dynamic prefix
-context floor at `256`.
+Lowering the dynamic prefix-prefill minimum context from `256` to `64` has been
+reopened and enabled by default for small dynamic suffix shapes. On pushed
+`3af4940`, a same-shape tree-only control landed at `168.2 / 63.1 / 202.1ms`
+with queue-profile phase `6000ms` and prefill forward `2470ms`; the 64-token
+floor landed at `144.5 / 33.5 / 170.2ms` with phase `5397ms` and prefill
+forward `2216ms`. The p99 E2E tail was slightly worse (`890ms` versus `837ms`),
+but queue finish p99 was comparable (`556ms` versus `549ms`) and median TTFT,
+TPOT, E2E, and prefill work improved materially. Larger prefix/suffix pairs
+still bucket to `128`, `256`, or above, and the
+`TORCHINFERNO_CONTINUOUS_DYNAMIC_PREFIX_PREFILL_MIN_CONTEXT` override remains
+available for deployments that need the old floor.
 
 A current same-host self_consistency rerun on pushed `62eb441` shows the local
 score shape has shifted from E2E to TTFT/tail control. TorchInferno landed at
