@@ -5674,10 +5674,24 @@ instead of one merged session, and the full-suite row recovers to few_shot
 `297.0 / 58.4 / 349.3ms`, tree `174.0 / 53.0 / 207.6ms`, and long_output
 `283.0 / 25.2 / 1314.8ms`.
 
+Short-greedy common-prefix suffix buckets now include `96` for deterministic
+`max_tokens <= 128` sessions. The prior default jumped directly from suffix
+`64` to `128`, overpadding long_output waves with prompt suffixes in the middle
+of that band. On pushed `357421b`, a fresh default focused control landed at
+`280.5 / 25.8 / 1275.1ms` with p99 E2E `4286.4ms`; forcing
+`16,32,64,96,128,256` by env landed at `247.9 / 25.6 / 1208.3ms`; and the
+no-env patch confirmation landed at `249.0 / 25.7 / 1301.3ms` with p99 E2E
+`3406.7ms`, all 1000/1000 correct. The no-env profile shows real `s96` graph
+use, reduces prefill wall from `7.47s` to `6.73s`, and cuts prefill forward from
+`6.48s` to `5.84s`. Aggregate median E2E is noisy against the paired control,
+but raw request deltas are still favorable at median `-12.6ms` TTFT and
+`-14.3ms` E2E, so promote this as a narrow TTFT/tail cleanup rather than a
+decode-throughput fix.
+
 ## In-flight, validated-locally-but-NOT-benchmarked commits
 
-The public results directory is still latest at `20260629_130308`; that run
-measured stale TorchInferno `bd17332`, so these are unmeasured in the public
+The public results directory is still latest at `20260630_110306`; that run
+measured stale TorchInferno `7cbb5fe`, so these are unmeasured in the public
 scorecard:
 - joint (batch,q) prefill graphs under a token budget,
 - `max_active=128` decode batch + prefill/decode decoupling,

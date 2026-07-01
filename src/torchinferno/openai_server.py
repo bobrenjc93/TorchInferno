@@ -1214,7 +1214,7 @@ def _online_greedy_common_prefix_suffix_prefill_warmup_suffix_tokens(
         tokens = _default_prefix_prefill_suffix_buckets(
             warmup_temperature,
             warmup_max_tokens,
-        ) or _parse_positive_int_csv("16,32,64,128,256")
+        ) or _parse_positive_int_csv("16,32,64,96,128,256")
     return tuple(token_count for token_count in tokens if token_count <= max_seq_len)
 
 

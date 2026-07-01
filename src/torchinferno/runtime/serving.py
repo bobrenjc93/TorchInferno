@@ -62,6 +62,18 @@ def _default_prefix_prefill_suffix_buckets(
 ) -> tuple[int, ...]:
     if temperature > 0.0 or max_generation_tokens is None:
         return ()
+    short_max_tokens = env_int(
+        "TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SUFFIX_BUCKETS_GREEDY_SHORT_MAX_TOKENS",
+        128,
+        minimum=1,
+    )
+    if 0 < max_generation_tokens <= short_max_tokens:
+        return _parse_positive_int_csv(
+            os.environ.get(
+                "TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SUFFIX_BUCKETS_GREEDY_SHORT",
+                "16,32,64,96,128,256",
+            )
+        )
     min_tokens = env_int(
         "TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SUFFIX_BUCKETS_GREEDY_LARGE_MIN_TOKENS",
         400,
