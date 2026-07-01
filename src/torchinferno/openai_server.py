@@ -1026,13 +1026,12 @@ def _online_initial_batch_wait_ms(*, temperature: float, max_tokens: int) -> flo
         if sampled_wait_env in os.environ:
             default_wait_ms = env_float(sampled_wait_env, 5.0, minimum=0.0)
         else:
-            # Self-consistency style sampled short bursts need enough collection
-            # time for prefix-cache reuse, but longer waits over-wait after the
-            # first client wave. Local TP8 A/B on 70B: 10ms improved current
-            # self-consistency to 255.7/384.1ms; a later 20ms recheck admitted
-            # more initial rows but kept the same prefix-reuse batch count and
-            # regressed the focused profile.
-            default_wait_ms = 10.0
+            # Self-consistency-style sampled short bursts are dominated by the
+            # first exact-prefix seed. Letting that seed start immediately was
+            # better on current TP8 70B than holding the first wave for 10ms:
+            # local A/B improved median TTFT/E2E 211.7/326.4 -> 196.8/301.0ms
+            # and cut queue p99 453 -> 378ms while preserving correctness.
+            default_wait_ms = 0.0
     elif temperature > 0.0 and max_tokens > 0:
         sampled_short_max_tokens = env_int(
             "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_SHORT_INITIAL_BATCH_WAIT_MAX_TOKENS",
