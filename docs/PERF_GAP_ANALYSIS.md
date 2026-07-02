@@ -71,6 +71,23 @@ score win at `271.0 / 24.9 / 1256.2ms`, `1000/1000` correct; prefill wall was
 `1172ms`. Active-row clears are measurable overhead, but removing them is not a
 safe default path to the remaining median gaps.
 
+A narrower decode-many-while-waiting policy is also rejected and not in source.
+The temporary patch allowed decode-many only while the ready queue was below the
+same refill floor that would admit the next prefill wave, trying to reduce
+one-token decode overhead without delaying admissions that were already
+eligible. The long_output run
+`agent_space/ti_long_wait_belowfloor_results/.../8xH100/runs/20260702_165707`
+stayed correct (`1000/1000`) and improved median TTFT/E2E to
+`196.7 / 26.1 / 1196.4ms`, but it worsened TPOT and produced a bad tail:
+p99 TTFT/E2E was `1492/2335ms`. The queue profile confirms the tradeoff:
+decode-many expanded to `222` bursts / `588` steps / `31.9K` model tokens with
+`839` skipped tokens, while queue-to-first p99 stayed above `1.15s`. Reducing
+the greedy-short decode quantum to `2` did not rescue it:
+`agent_space/ti_long_wait_belowfloor_dq2_results/.../8xH100/runs/20260702_170242`
+landed at `183.8 / 27.2 / 1199.8ms` with p99 TTFT/E2E `1688/2476ms`. Keep the
+existing waiting-decode diagnostics closed; long_output still needs a real
+prefill/decode pipeline rather than a decode-burst admission heuristic.
+
 Common-prefix row adoption is kept as a lifecycle/correctness fix, not as a
 new scheduling knob. The old common-prefix path computed the shared prefix in
 one prefix row, then tried to acquire a second prefix row just to store a
