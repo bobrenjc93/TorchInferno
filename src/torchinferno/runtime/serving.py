@@ -1609,6 +1609,7 @@ class ContinuousBatchEngine:
         prefix_row = self._acquire_prefix_row()
         if prefix_row is None:
             return None
+        prefix_row_adopted = False
         try:
             prefix_ids = torch.tensor(
                 [group[0][1].prompt[:prefix_tokens]],
@@ -1626,7 +1627,7 @@ class ContinuousBatchEngine:
                 len(request.prompt) <= prefix_tokens
                 for _index, request, _hit in group
             )
-            self._store_reusable_prefix_tokens(
+            prefix_row_adopted = self._store_reusable_prefix_tokens_in_row(
                 common_route,
                 "__common_prefix__",
                 prefix_tuple,
@@ -1721,7 +1722,8 @@ class ContinuousBatchEngine:
                     active.append(state)
             return active
         finally:
-            self._release_prefix_row(prefix_row)
+            if not prefix_row_adopted:
+                self._release_prefix_row(prefix_row)
 
     def _common_prefix_ragged_suffix_max_prefix_tokens(
         self,
@@ -4060,9 +4062,55 @@ class ContinuousBatchEngine:
             entry.route_id,
             tokens,
             prefix_row,
-            logits[:, -1:, :].detach().clone().cpu() if store_logits and logits is not None else None,
+            (
+                logits[:, -1:, :].detach().clone().cpu()
+                if store_logits and logits is not None
+                else None
+            ),
         )
         self._prefix_order.append(entry.route_id)
+
+    def _store_reusable_prefix_tokens_in_row(
+        self,
+        route_id: Hashable | None,
+        request_id: str,
+        tokens: tuple[int, ...],
+        prefix_row: int,
+        logits: Tensor | None,
+        *,
+        store_logits: bool = True,
+    ) -> bool:
+        if not self.store_reusable_prefixes or not env_flag(
+            "TORCHINFERNO_CONTINUOUS_PREFIX_CACHE_STORE",
+            True,
+        ):
+            return False
+        actual_route = request_id if route_id is None else route_id
+        old_prefix = self.reusable_prefixes.pop(actual_route, None)
+        if old_prefix is not None:
+            if actual_route in self._prefix_order:
+                self._prefix_order.remove(actual_route)
+            if old_prefix.row != prefix_row:
+                self._clear_physical_row(old_prefix.row)
+                if old_prefix.row not in self._free_prefix_rows:
+                    self._free_prefix_rows.append(old_prefix.row)
+                    self._free_prefix_rows.sort()
+        self._pinned_prefix_routes.discard(actual_route)
+        self.prefix_cache.remove(actual_route)
+        entry = self.prefix_cache.add(request_id, tokens, route_id=route_id)
+        self._set_cache_row_seq_len(prefix_row, len(tokens))
+        self.reusable_prefixes[entry.route_id] = _ReusablePrefix(
+            entry.route_id,
+            tokens,
+            prefix_row,
+            (
+                logits[:, -1:, :].detach().clone().cpu()
+                if store_logits and logits is not None
+                else None
+            ),
+        )
+        self._prefix_order.append(entry.route_id)
+        return True
 
     def _adopt_reusable_prefix_tokens(
         self,

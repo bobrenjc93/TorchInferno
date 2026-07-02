@@ -979,6 +979,40 @@ def test_continuous_batch_engine_pins_shared_prefix_across_batches() -> None:
     assert by_id["b1-a"].tokens == base[0].tokens
 
 
+def test_continuous_batch_engine_adopts_common_prefix_row_with_single_prefix_slot(
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_PREFIX_CACHE_STORE", raising=False)
+    shared = tuple(range(1, 17))
+    model = _SelectedLogitsToyModel()
+    engine = ContinuousBatchEngine(
+        model,
+        device=torch.device("cpu"),
+        max_active_requests=2,
+        prefix_cache_capacity=1,
+        pin_shared_prefix=True,
+        graph_prefill=True,
+    )
+
+    results = engine.run(
+        [
+            ServingRequest("warm-a", (*shared, 21), 1, arrival_step=0),
+            ServingRequest("warm-b", (*shared, 22), 1, arrival_step=0),
+            ServingRequest("late-a", (*shared, 23), 1, arrival_step=1),
+            ServingRequest("late-b", (*shared, 24), 1, arrival_step=1),
+        ]
+    )
+    by_id = {result.request_id: result for result in results}
+    route = ("common_prefix", shared)
+
+    assert by_id["late-a"].prefix_hit_tokens == len(shared)
+    assert by_id["late-b"].prefix_hit_tokens == len(shared)
+    assert route in engine.reusable_prefixes
+    assert engine.reusable_prefixes[route].row == engine.max_active_requests
+    assert engine._free_prefix_rows == []
+    assert engine.stats.prefill_common_prefix_batches == 1
+
+
 def test_continuous_batch_engine_prefers_warmed_prefix_rows(monkeypatch) -> None:
     monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_PREFERRED_PREFIX_ROWS", raising=False)
     engine = ContinuousBatchEngine(

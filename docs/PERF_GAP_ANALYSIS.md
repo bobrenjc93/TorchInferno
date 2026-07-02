@@ -71,6 +71,21 @@ score win at `271.0 / 24.9 / 1256.2ms`, `1000/1000` correct; prefill wall was
 `1172ms`. Active-row clears are measurable overhead, but removing them is not a
 safe default path to the remaining median gaps.
 
+Common-prefix row adoption is kept as a lifecycle/correctness fix, not as a
+new scheduling knob. The old common-prefix path computed the shared prefix in
+one prefix row, then tried to acquire a second prefix row just to store a
+reusable copy. With `prefix_cache_capacity=1`, that meant the shared prefix
+could not be retained for later arrivals. The adopted-row path stores the
+computed prefix row directly in `reusable_prefixes`, and a CPU regression test
+now covers the single-prefix-slot case. A dirty-worktree tree run based on
+`17f4993`
+(`agent_space/ti_tree_adopt_common_results/.../runs/20260702_145934`) landed
+at `149.3 / 45.9 / 179.7ms`, `959/992` correct. Its profile showed one common
+prefix prefill, `992` common-prefix reuse hits, and `58` prefix-suffix graph
+batches. That keeps tree medians in the current band and slightly improves
+TTFT/E2E versus the public row, but it is not a TPOT win and does not change
+the remaining diagnosis.
+
 ## Public 20260702_095238 refresh and sampled-medium active-cap lower bound
 
 The latest public all-provider run at
