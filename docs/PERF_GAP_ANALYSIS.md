@@ -91,6 +91,29 @@ fell from `6.05s` to `5.64s`, queue p99 first-token improved from `790ms` to
 p99 was roughly flat-to-slightly worse (`1863ms` to `1902ms`). Keep this as a
 scoped prefill-tail reduction, not a replacement for the remaining TTFT work.
 
+Tree prefix-graph profiling now exports per-shape prefill copy/setup/forward/
+sample/state timing plus active-vs-padded prefix-graph token counts. The focused
+instrumented tree run
+`agent_space/ti_tree_prefill_shape_phase_results2/.../runs/20260702_221034`
+landed at `148.6 / 50.0 / 178.7ms`, `964/992` correct. The final queue profile
+spent `2.73s` in prefill wall, including `2.25s` forward, `156ms` sampling,
+`67ms` setup, and `56ms` state update. The dominant
+`prefix_graph:b32:s16:p45-45:src1:mixed0` shape consumed `1.70s` wall and
+`1.41s` forward, while prefix-graph work overall ran `10,402` active suffix
+tokens inside `20,784` graph tokens. This confirms the sampled-medium tree gap
+is mostly padded prefix-suffix graph compute rather than host setup or sampling.
+
+An opt-in suffix-bucket split is available as
+`TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SPLIT_SUFFIX_BUCKETS=1`, but it is
+rejected as a default for tree. The focused A/B
+`agent_space/ti_tree_suffix_buckets_results/.../runs/20260702_221841` landed at
+`151.2 / 39.5 / 178.1ms`, `960/992` correct. It improved TPOT and p99 E2E
+(`706ms` to `581ms`) but worsened median TTFT and did not reduce the root
+prefill padding: all prefix-graph groups still landed in the `s16` suffix
+bucket, and model tokens only moved from `20,784` to `20,736`. Keep this as a
+diagnostic for workloads with mixed suffix buckets, not a sampled-medium tree
+default.
+
 A narrower decode-many-while-waiting policy is also rejected and not in source.
 The temporary patch allowed decode-many only while the ready queue was below the
 same refill floor that would admit the next prefill wave, trying to reduce

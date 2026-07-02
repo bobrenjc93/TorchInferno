@@ -1737,9 +1737,15 @@ def test_continuous_batch_engine_records_profile_shape_counts() -> None:
 
     assert len(results) == 3
     assert engine.stats.prefill_shape_counts["common_prefix:b1:t16"] == 1
-    assert engine.stats.prefill_shape_counts[
-        "prefix_graph:b4:s4:p16-16:src1:mixed0"
-    ] == 1
+    prefix_shape = "prefix_graph:b4:s4:p16-16:src1:mixed0"
+    assert engine.stats.prefill_shape_counts[prefix_shape] == 1
+    assert prefix_shape in engine.stats.prefill_shape_copy_ms
+    assert prefix_shape in engine.stats.prefill_shape_setup_ms
+    assert prefix_shape in engine.stats.prefill_shape_forward_ms
+    assert prefix_shape in engine.stats.prefill_shape_sample_ms
+    assert prefix_shape in engine.stats.prefill_shape_state_ms
+    assert engine.stats.prefill_shape_active_tokens[prefix_shape] == 6
+    assert engine.stats.prefill_shape_model_tokens[prefix_shape] == 16
     assert any(key.startswith("ragged:b3/") for key in engine.stats.decode_shape_counts)
 
 
@@ -1951,6 +1957,52 @@ def test_continuous_batch_engine_graph_prefill_buckets_batch_and_matches() -> No
     assert engine.stats.prefill_prefix_reuse_batches >= 1
     assert engine.stats.prefill_padded_suffix_batches >= 1
     assert engine.stats.prefix_reuse_requests >= 3
+
+
+def test_continuous_batch_engine_can_split_prefix_graph_by_suffix_bucket(monkeypatch) -> None:
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SPLIT_SUFFIX_BUCKETS", "1")
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SUFFIX_BUCKETS", "4,8")
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_COMMON_PREFIX_RAGGED_SUFFIX_MAX_PREFIX_TOKENS", "0")
+    shared = tuple(range(16))
+    model = _SelectedLogitsToyModel(vocab_size=128)
+    engine = ContinuousBatchEngine(
+        model,
+        device=torch.device("cpu"),
+        max_active_requests=8,
+        prefix_cache_capacity=8,
+        pin_shared_prefix=True,
+        graph_prefill=True,
+        profile_timings=True,
+    )
+    requests = [
+        ServingRequest("warm-a", (*shared, 21), 1, arrival_step=0),
+        ServingRequest("warm-b", (*shared, 22), 1, arrival_step=0),
+        ServingRequest("late-a", (*shared, 31), 1, arrival_step=1),
+        ServingRequest("late-b", (*shared, 32, 33), 1, arrival_step=1),
+        ServingRequest("late-c", (*shared, 34, 35, 36, 37, 38), 1, arrival_step=1),
+    ]
+
+    results = engine.run(requests)
+
+    by_id = {result.request_id: result for result in results}
+    assert by_id["late-a"].tokens[-1] == 32
+    assert by_id["late-b"].tokens[-1] == 34
+    assert by_id["late-c"].tokens[-1] == 39
+    assert (2, 4) in model.prefill_input_shapes
+    assert (1, 8) in model.prefill_input_shapes
+    assert engine.stats.prefill_prefix_reuse_batches >= 2
+    assert engine.stats.prefill_shape_counts[
+        "prefix_graph:b2:s4:p16-16:src1:mixed0"
+    ] == 1
+    assert engine.stats.prefill_shape_counts[
+        "prefix_graph:b1:s8:p16-16:src1:mixed0"
+    ] == 1
+    assert engine.stats.prefill_shape_active_tokens[
+        "prefix_graph:b2:s4:p16-16:src1:mixed0"
+    ] == 3
+    assert engine.stats.prefill_shape_model_tokens[
+        "prefix_graph:b2:s4:p16-16:src1:mixed0"
+    ] == 8
 
 
 def test_continuous_batch_engine_reuses_exact_common_prompt_without_suffix_prefill() -> None:

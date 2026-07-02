@@ -13296,8 +13296,26 @@ def test_openai_queue_profile_records_runtime_engine_stats(
             "prefix_graph:b8:s16:p45-45:src1:mixed0": 12.25,
             "common_prefix:b1:t45": 1.5,
         }
+        prefill_shape_copy_ms = {
+            "prefix_graph:b8:s16:p45-45:src1:mixed0": 0.25,
+        }
+        prefill_shape_setup_ms = {
+            "prefix_graph:b8:s16:p45-45:src1:mixed0": 0.75,
+        }
         prefill_shape_forward_ms = {
             "prefix_graph:b8:s16:p45-45:src1:mixed0": 9.75,
+        }
+        prefill_shape_sample_ms = {
+            "prefix_graph:b8:s16:p45-45:src1:mixed0": 1.25,
+        }
+        prefill_shape_state_ms = {
+            "prefix_graph:b8:s16:p45-45:src1:mixed0": 0.5,
+        }
+        prefill_shape_active_tokens = {
+            "prefix_graph:b8:s16:p45-45:src1:mixed0": 31,
+        }
+        prefill_shape_model_tokens = {
+            "prefix_graph:b8:s16:p45-45:src1:mixed0": 48,
         }
         prefill_graph_capture_shape_counts = {
             "ragged_prefill:b8:s16:rows1:ctx-256:src1": 1,
@@ -13380,8 +13398,26 @@ def test_openai_queue_profile_records_runtime_engine_stats(
                 "prefix_graph:b8:s16:p45-45:src1:mixed0": 12.25,
                 "common_prefix:b1:t45": 1.5,
             },
+            "runtime_prefill_shape_copy_ms": {
+                "prefix_graph:b8:s16:p45-45:src1:mixed0": 0.25,
+            },
+            "runtime_prefill_shape_setup_ms": {
+                "prefix_graph:b8:s16:p45-45:src1:mixed0": 0.75,
+            },
             "runtime_prefill_shape_forward_ms": {
                 "prefix_graph:b8:s16:p45-45:src1:mixed0": 9.75,
+            },
+            "runtime_prefill_shape_sample_ms": {
+                "prefix_graph:b8:s16:p45-45:src1:mixed0": 1.25,
+            },
+            "runtime_prefill_shape_state_ms": {
+                "prefix_graph:b8:s16:p45-45:src1:mixed0": 0.5,
+            },
+            "runtime_prefill_shape_active_tokens": {
+                "prefix_graph:b8:s16:p45-45:src1:mixed0": 31,
+            },
+            "runtime_prefill_shape_model_tokens": {
+                "prefix_graph:b8:s16:p45-45:src1:mixed0": 48,
             },
             "runtime_prefill_tokens": 17,
             "runtime_decode_shape_counts": {"ragged:b8/8": 5},

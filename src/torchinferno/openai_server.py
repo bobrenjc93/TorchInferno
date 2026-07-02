@@ -5633,6 +5633,8 @@ class OpenAICompletionEngine:
             "decode_graph_capture_shape_counts",
             "decode_graph_miss_shape_counts",
             "decode_shape_counts",
+            "prefill_shape_active_tokens",
+            "prefill_shape_model_tokens",
             "decode_many_shape_model_tokens",
             "decode_many_shape_emitted_tokens",
             "decode_many_shape_skipped_tokens",
@@ -5653,7 +5655,11 @@ class OpenAICompletionEngine:
                 record[f"runtime_{name}"] = {str(key): int(count) for key, count in top_counts}
         for name in (
             "prefill_shape_wall_ms",
+            "prefill_shape_copy_ms",
+            "prefill_shape_setup_ms",
             "prefill_shape_forward_ms",
+            "prefill_shape_sample_ms",
+            "prefill_shape_state_ms",
             "decode_shape_model_ms",
             "decode_shape_gpu_ms",
             "decode_shape_cpu_tokens_ms",

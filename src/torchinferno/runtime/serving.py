@@ -265,7 +265,13 @@ class ServingStats:
     prefill_sample_ms: float = 0.0
     prefill_state_ms: float = 0.0
     prefill_shape_wall_ms: dict[str, float] = field(default_factory=dict)
+    prefill_shape_copy_ms: dict[str, float] = field(default_factory=dict)
+    prefill_shape_setup_ms: dict[str, float] = field(default_factory=dict)
     prefill_shape_forward_ms: dict[str, float] = field(default_factory=dict)
+    prefill_shape_sample_ms: dict[str, float] = field(default_factory=dict)
+    prefill_shape_state_ms: dict[str, float] = field(default_factory=dict)
+    prefill_shape_active_tokens: dict[str, int] = field(default_factory=dict)
+    prefill_shape_model_tokens: dict[str, int] = field(default_factory=dict)
     decode_ragged_prepare_ms: float = 0.0
     decode_ragged_model_ms: float = 0.0
     decode_ragged_model_gpu_ms: float = 0.0
@@ -2097,7 +2103,13 @@ class ContinuousBatchEngine:
             self._record_shape_count(self.stats.prefill_shape_counts, shape_key)
             shape_wall_start_s = copy_start_s
             if self.profile_timings:
-                self.stats.prefill_copy_ms += (time.perf_counter() - copy_start_s) * 1000.0
+                copy_elapsed_ms = (time.perf_counter() - copy_start_s) * 1000.0
+                self.stats.prefill_copy_ms += copy_elapsed_ms
+                self._record_shape_time(
+                    self.stats.prefill_shape_copy_ms,
+                    shape_key,
+                    copy_elapsed_ms,
+                )
             setup_start_s = time.perf_counter() if self.profile_timings else 0.0
             all_rows = rows + pad_rows + pad_prefix_rows
             input_ids = torch.tensor(padded_suffixes, device=self.device, dtype=torch.long)
@@ -2115,7 +2127,13 @@ class ContinuousBatchEngine:
                 dtype=torch.long,
             )
             if self.profile_timings:
-                self.stats.prefill_setup_ms += (time.perf_counter() - setup_start_s) * 1000.0
+                setup_elapsed_ms = (time.perf_counter() - setup_start_s) * 1000.0
+                self.stats.prefill_setup_ms += setup_elapsed_ms
+                self._record_shape_time(
+                    self.stats.prefill_shape_setup_ms,
+                    shape_key,
+                    setup_elapsed_ms,
+                )
             forward_start_s = time.perf_counter() if self.profile_timings else 0.0
             logits = None
             prefix_copy_len = max(prefix_hits) if mixed_prefixes else None
@@ -2161,6 +2179,16 @@ class ContinuousBatchEngine:
                     self._release_active_row(row)
                 return None
             self._record_model_call("prefill", count, tokens=count * max(suffix_lengths))
+            self._record_shape_total(
+                self.stats.prefill_shape_active_tokens,
+                shape_key,
+                sum(suffix_lengths),
+            )
+            self._record_shape_total(
+                self.stats.prefill_shape_model_tokens,
+                shape_key,
+                int(input_ids.numel()),
+            )
             self.stats.prefill_prefix_reuse_batches += 1
             self.stats.prefill_padded_suffix_batches += 1
             sample_start_s = time.perf_counter() if self.profile_timings else 0.0
@@ -2169,7 +2197,13 @@ class ContinuousBatchEngine:
                 [request for _original_index, request, _prefix_hit_tokens, _reusable in group],
             ).detach().cpu().tolist()
             if self.profile_timings:
-                self.stats.prefill_sample_ms += (time.perf_counter() - sample_start_s) * 1000.0
+                sample_elapsed_ms = (time.perf_counter() - sample_start_s) * 1000.0
+                self.stats.prefill_sample_ms += sample_elapsed_ms
+                self._record_shape_time(
+                    self.stats.prefill_shape_sample_ms,
+                    shape_key,
+                    sample_elapsed_ms,
+                )
             state_start_s = time.perf_counter() if self.profile_timings else 0.0
             active: list[_ActiveRequest] = []
             for row_index, (original_index, request, prefix_hit_tokens, _reusable) in enumerate(group):
@@ -2197,7 +2231,13 @@ class ContinuousBatchEngine:
                 self._record_token_event(events, state, next_token, step, finished=self._should_finish_before_decode(state))
                 active.append(state)
             if self.profile_timings:
-                self.stats.prefill_state_ms += (time.perf_counter() - state_start_s) * 1000.0
+                state_elapsed_ms = (time.perf_counter() - state_start_s) * 1000.0
+                self.stats.prefill_state_ms += state_elapsed_ms
+                self._record_shape_time(
+                    self.stats.prefill_shape_state_ms,
+                    shape_key,
+                    state_elapsed_ms,
+                )
                 self._record_shape_time(
                     self.stats.prefill_shape_wall_ms,
                     shape_key,
@@ -2324,6 +2364,19 @@ class ContinuousBatchEngine:
             len(request.prompt) - prefix_hit_tokens
             for _index, request, prefix_hit_tokens, _reusable in group
         ]
+        if (
+            self.graph_prefill
+            and suffix_lengths
+            and env_flag("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SPLIT_SUFFIX_BUCKETS", False)
+        ):
+            by_suffix_bucket: dict[int, list[tuple[int, ServingRequest, int, _ReusablePrefix]]] = defaultdict(list)
+            for item, suffix_len in zip(group, suffix_lengths):
+                by_suffix_bucket[self._suffix_bucket(max(1, suffix_len))].append(item)
+            if len(by_suffix_bucket) > 1:
+                active: list[_ActiveRequest] = []
+                for suffix_group in by_suffix_bucket.values():
+                    active.extend(self._prefill_prefix_batch(suffix_group, step, events=events))
+                return active
         if self.graph_prefill and suffix_lengths and max(suffix_lengths) > 0:
             batch_bucket = self._prefill_batch_bucket(len(group))
             split_batch = self._prefix_prefill_split_on_capture_skip_batch(batch_bucket)
