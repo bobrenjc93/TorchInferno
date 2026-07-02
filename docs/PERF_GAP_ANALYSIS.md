@@ -6316,6 +6316,33 @@ correct. inference-bench commit `455dd782` now applies that default unless a
 caller supplies their own `--compilation-config` or sets
 `INFERENCE_BENCH_VLLM_DISABLE_ALLREDUCE_RMS_FUSION=0`.
 
+A same-host all-provider tree/long refresh with that vLLM fix wrote
+`agent_space/allproviders_current_tree_long_fixedvllm_results/.../8xH100-local-current-tree-long-allproviders-fixedvllm-20260702/runs/20260702_093317`.
+vLLM now starts under inference-bench defaults and wins the current long_output
+row at `68.7 / 16.9 / 669.8ms`; SGLang is `61.8 / 24.6 / 913.3ms`; TorchInferno
+is `259.3 / 25.2 / 1203.8ms`, all `1000/1000` correct. TorchInferno's
+long_output queue profile remains decode dominated: shared-prefix reuse hit the
+`111` token common prefix for all requests, but the session still spent `5.90s`
+in prefill forward, `6.76s` prefill wall, `10.20s` ragged decode GPU, and `755`
+decode batches. For tree_of_thought, vLLM was `66.0 / 32.1 / 90.4ms`, SGLang
+`56.9 / 76.8 / 167.0ms` with a severe p99 outlier, and TorchInferno
+`151.9 / 43.4 / 177.7ms`. The tree queue profile had only the `45` token common
+prefix reused, `59` prefill graph hits, `11,849` prefill tokens, `2.17s` prefill
+forward, and `1.38s` ragged decode GPU. The current tree gap is no longer a cold
+graph miss; it is steady sampled-medium prefill/decode pipeline cost plus
+queueing.
+
+Rechecking the sampled-medium prequeue wait at `2ms` is rejected on current head.
+The focused env run with
+`TORCHINFERNO_OPENAI_TP_SAMPLED_MEDIUM_STREAM_PREQUEUE_ADMISSION_WAIT_MS=2` wrote
+`agent_space/ti_tree_prequeue2_results/.../8xH100-local-ti-tree-sampled-prequeue2-20260702/runs/20260702_094540`
+and landed at `154.6 / 57.5 / 193.5ms`, `959/992` correct. It did gather a
+larger first batch (`3` vs `1` in the adjacent all-provider control), but p99
+queue-to-submit rose to `450ms`, p99 queue-to-first to `522ms`, decode batches
+rose to `95`, and ragged decode GPU rose to `1.48s`. Keep the sampled-medium
+prequeue default at `1ms`; larger waits increase tail and decode fragmentation
+without closing the vLLM tree gap.
+
 ## Priority for a focused (non-loop) session
 
 1. Prefill MFU (Issue 1) — biggest TTFT lever, ~2x, affects 3/5 benchmarks.
