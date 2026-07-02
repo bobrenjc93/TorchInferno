@@ -6909,6 +6909,37 @@ needs faster steady sampled-medium prefix-suffix prefill/decode, and long_output
 needs a decode/prefill pipeline policy that improves medians without the known
 waiting-decode tail regression.
 
+Current public pointer refresh on 2026-07-02 after the q8 drain change still
+showed public inference-bench at `origin/main=055de6e5` and run
+`20260702_140923`. The local full TorchInferno refresh on pushed `f7f2cd1`
+(`agent_space/ti_full_f7f2cd1_results/.../8xH100-local-ti-full-f7f2cd1-20260702/runs/20260702_205419`)
+landed at few_shot `170.5 / 50.1 / 210.9ms`, self_consistency
+`192.3 / 0.0 / 210.3ms`, multi_turn `306.0 / 64.5 / 367.1ms`,
+tree_of_thought `143.2 / 59.4 / 178.5ms`, and long_output
+`250.0 / 24.4 / 1160.5ms` (TTFT/TPOT/E2E). The accepted long-output mechanism
+is the scoped greedy-short drain quantum: base decode quantum stays at `3`
+while ready/waiting work exists, then drain-only decode-many uses quantum `8`.
+The profile cut long-output online step commands to `192` while preserving
+1000/1000 correctness and moving TPOT into the public vLLM/SGLang band.
+
+A larger drain quantum is rejected. The q12 focused run
+(`agent_space/ti_long_drainq12_results/.../8xH100-local-ti-long-drainq12-20260702/runs/20260702_210255`)
+completed 1000/1000 correct and improved median TPOT/E2E to
+`22.8ms` / `1088.2ms`, but median TTFT regressed to `310.9ms`, p99 E2E rose to
+`2187.8ms`, skipped decode-many tokens doubled (`1439 -> 2881`), and ragged
+decode GPU rose to `10.80s`. Since q8 already closes the public TPOT cell
+without that tail cost, keep q12 as an opt-in throughput/median-E2E tradeoff.
+
+The same full run also confirms that multi_turn's remaining TTFT/E2E gap is not
+a missing default env flip. It still has `34` prefill batches, `34/0` prefill
+graph hits/misses, and only `{"common_prefix":1000}` / `{"45":1000}` reuse.
+Finished-prefix and pinned full-prompt paths remain blocked by the same
+non-common-prefix prefill problem documented above: the safe fallback fragments
+into hundreds of tiny suffix prefills, while the non-common graph route has
+already shown TP failures or large prefill/state regressions. Do not repeat
+those env-only probes without a new batched, TP-safe non-common prefix prefill
+implementation.
+
 ## Priority for a focused (non-loop) session
 
 1. Prefill MFU (Issue 1) — biggest TTFT lever, ~2x, affects 3/5 benchmarks.
