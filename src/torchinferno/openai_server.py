@@ -3325,6 +3325,12 @@ class OpenAICompletionEngine:
                             row_indices=row_indices,
                             allow_capture=True,
                         )
+                        _try_decode_one_token_logits_graph(
+                            self.model,
+                            decode_input_ids,
+                            cache,
+                            allow_capture=True,
+                        )
                     except Exception as _warmup_exc:
                         import sys as _wsys
                         print(f"[WARMUP] graph capture failed bs={bs}: {_warmup_exc}", file=_wsys.stderr, flush=True)

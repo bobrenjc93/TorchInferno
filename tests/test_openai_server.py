@@ -862,6 +862,12 @@ def test_openai_unified_scheduler_warmup_captures_ragged_logits_graphs(monkeypat
         (3, 1, (0, 1, 2)),
         (4, 1, (0, 1, 2, 3)),
     ]
+    assert model.decode_shapes == [
+        (1, 1),
+        (2, 1),
+        (3, 1),
+        (4, 1),
+    ]
     assert engine._persistent_serving_cache is cache
 
 

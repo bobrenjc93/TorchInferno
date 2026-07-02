@@ -146,6 +146,17 @@ decode graph captures, so the residual tree miss in this run was a static
 fallback shape rather than ragged decode warmup coverage. Keep treating tree as
 sampled-prefix/suffix prefill and steady decode bound.
 
+Static logits decode warmup for the existing online decode batch set is accepted.
+The focused patched tree run
+`agent_space/ti_tree_static_logits_warm_results/.../runs/20260702_195432`
+captured static logits graphs during startup after the normal ragged token/logits
+decode warmup. It landed at `147.5 / 29.2 / 174.6ms`, `960/992` correct, and
+removed the residual miss (`runtime_decode_graph_misses=0`,
+`runtime_decode_graph_miss_shape_counts={}`). Queue timings stayed in-family
+with the control (`request_queue_to_first_token_p50=125.6ms`, prefill wall
+`2.92s`, ragged decode GPU `1.49s`), so this is a narrow graph-coverage fix, not
+a tree scheduling breakthrough.
+
 A current-head focused multi_turn profile on pushed `325cdf4` wrote
 `agent_space/ti_multi_325cdf4_results/.../runs/20260702_192513` and landed at
 `303.1 / 61.8 / 361.8ms`, `983/1000` correct. The new miss-shape field stayed
