@@ -133,8 +133,6 @@ def _flashinfer_prefill_warmup_batch_sizes(batch_sizes: Sequence[int]) -> tuple[
 def _online_decode_warmup_batch_sizes(*, max_active: int, cache_batch: int) -> tuple[int, ...]:
     active_limit = min(max(1, int(max_active)), max(1, int(cache_batch)))
     batch_sizes = {active_limit}
-    for exact_small_batch in range(3, min(active_limit, 8) + 1):
-        batch_sizes.add(exact_small_batch)
     bucket = 1
     while bucket <= active_limit:
         batch_sizes.add(bucket)
