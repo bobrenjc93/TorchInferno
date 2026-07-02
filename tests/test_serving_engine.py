@@ -3467,6 +3467,118 @@ def test_continuous_batch_engine_online_many_keeps_decode_tokens_ordered(monkeyp
     assert model.ragged_logits_graph_calls == 3
 
 
+def test_continuous_batch_engine_online_many_can_decode_before_waiting_admission(monkeypatch) -> None:
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_UNIFORM_RAGGED_DECODE", "1")
+    model = _RaggedGraphToyModel(vocab_size=128)
+    engine = ContinuousBatchEngine(
+        model,
+        device=torch.device("cpu"),
+        max_active_requests=2,
+        prefix_cache_capacity=0,
+        enable_ragged_decode=True,
+        store_reusable_prefixes=False,
+        enable_decode_many=True,
+        decode_many_with_waiting=True,
+    )
+    engine.start_online(max_seq_len=16)
+    engine.submit_online(ServingRequest("active-a", (1, 2, 3), 4, arrival_step=0))
+    engine.submit_online(ServingRequest("active-b", (3, 4, 5), 4, arrival_step=0))
+
+    first = engine.step_online()
+    engine.submit_online(ServingRequest("waiting", (10, 11), 1, arrival_step=1))
+    events, steps = engine.step_online_many(3)
+    waiting_events = engine.step_online()
+
+    assert [(event.request_id, event.generated, event.finished) for event in first] == [
+        ("active-a", 1, False),
+        ("active-b", 1, False),
+    ]
+    assert steps == 3
+    assert [(event.request_id, event.generated, event.finished) for event in events] == [
+        ("active-a", 2, False),
+        ("active-b", 2, False),
+        ("active-a", 3, False),
+        ("active-b", 3, False),
+        ("active-a", 4, True),
+        ("active-b", 4, True),
+    ]
+    assert [(event.request_id, event.generated, event.finished) for event in waiting_events] == [
+        ("waiting", 1, True),
+    ]
+    assert engine.stats.decode_many_calls == 1
+    assert engine.stats.decode_many_steps == 3
+    assert not engine.has_online_work()
+    assert model.ragged_logits_graph_calls == 3
+
+
+def test_continuous_batch_engine_online_many_keeps_default_waiting_pacing(monkeypatch) -> None:
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_UNIFORM_RAGGED_DECODE", "1")
+    engine = ContinuousBatchEngine(
+        _RaggedGraphToyModel(vocab_size=128),
+        device=torch.device("cpu"),
+        max_active_requests=3,
+        prefix_cache_capacity=0,
+        enable_ragged_decode=True,
+        store_reusable_prefixes=False,
+        enable_decode_many=True,
+    )
+    engine.start_online(max_seq_len=16)
+    engine.submit_online(ServingRequest("active-a", (1, 2, 3), 4, arrival_step=0))
+    engine.submit_online(ServingRequest("active-b", (3, 4, 5), 4, arrival_step=0))
+
+    first = engine.step_online()
+    engine.submit_online(ServingRequest("waiting", (10, 11), 1, arrival_step=1))
+    events, steps = engine.step_online_many(3)
+
+    assert [(event.request_id, event.generated, event.finished) for event in first] == [
+        ("active-a", 1, False),
+        ("active-b", 1, False),
+    ]
+    assert steps == 1
+    assert [(event.request_id, event.generated, event.finished) for event in events] == [
+        ("active-a", 2, False),
+        ("active-b", 2, False),
+        ("waiting", 1, True),
+    ]
+    assert engine.stats.decode_many_calls == 0
+    assert engine.has_online_work()
+
+
+def test_continuous_batch_engine_online_many_waiting_min_active_gate(monkeypatch) -> None:
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_UNIFORM_RAGGED_DECODE", "1")
+    engine = ContinuousBatchEngine(
+        _RaggedGraphToyModel(vocab_size=128),
+        device=torch.device("cpu"),
+        max_active_requests=3,
+        prefix_cache_capacity=0,
+        enable_ragged_decode=True,
+        store_reusable_prefixes=False,
+        enable_decode_many=True,
+        decode_many_with_waiting=True,
+        decode_many_with_waiting_min_active=3,
+    )
+    engine.start_online(max_seq_len=16)
+    engine.submit_online(ServingRequest("active-a", (1, 2, 3), 4, arrival_step=0))
+    engine.submit_online(ServingRequest("active-b", (3, 4, 5), 4, arrival_step=0))
+
+    first = engine.step_online()
+    engine.submit_online(ServingRequest("waiting", (10, 11), 1, arrival_step=1))
+    events, steps = engine.step_online_many(3)
+
+    assert [(event.request_id, event.generated, event.finished) for event in first] == [
+        ("active-a", 1, False),
+        ("active-b", 1, False),
+    ]
+    assert steps == 1
+    assert [(event.request_id, event.generated, event.finished) for event in events] == [
+        ("active-a", 2, False),
+        ("active-b", 2, False),
+        ("waiting", 1, True),
+    ]
+    assert engine.stats.decode_many_calls == 0
+    assert engine.has_online_work()
+
+
 def test_continuous_batch_engine_online_many_preserves_non_decode_pacing(monkeypatch) -> None:
     monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_UNIFORM_RAGGED_DECODE", "1")
     engine = ContinuousBatchEngine(

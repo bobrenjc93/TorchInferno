@@ -1343,6 +1343,7 @@ def test_tensor_parallel_worker_loop_handles_online_runtime_commands(monkeypatch
             prefill_ready_before_decode_active_cap: int | None = None,
             enable_decode_many: bool | None = None,
             decode_many_allow_stop: bool | None = None,
+            decode_many_with_waiting: bool | None = None,
             generated_prefix_cache: bool | None = None,
             max_generation_tokens: int | None = None,
         ) -> None:
@@ -1366,6 +1367,7 @@ def test_tensor_parallel_worker_loop_handles_online_runtime_commands(monkeypatch
                 prefill_ready_before_decode_active_cap,
                 enable_decode_many,
                 decode_many_allow_stop,
+                decode_many_with_waiting,
                 generated_prefix_cache,
                 max_generation_tokens,
             )
@@ -1424,6 +1426,7 @@ def test_tensor_parallel_worker_loop_handles_online_runtime_commands(monkeypatch
         True,
         False,
         None,
+        False,
         False,
         False,
         True,
@@ -1626,6 +1629,7 @@ def test_tensor_parallel_worker_loop_receives_online_tensor_commands(monkeypatch
             prefill_ready_before_decode_active_cap: int | None = None,
             enable_decode_many: bool | None = None,
             decode_many_allow_stop: bool | None = None,
+            decode_many_with_waiting: bool | None = None,
             generated_prefix_cache: bool | None = None,
             max_generation_tokens: int | None = None,
         ) -> None:
@@ -1649,6 +1653,7 @@ def test_tensor_parallel_worker_loop_receives_online_tensor_commands(monkeypatch
                 prefill_ready_before_decode_active_cap,
                 enable_decode_many,
                 decode_many_allow_stop,
+                decode_many_with_waiting,
                 generated_prefix_cache,
                 max_generation_tokens,
             )
@@ -1712,6 +1717,7 @@ def test_tensor_parallel_worker_loop_receives_online_tensor_commands(monkeypatch
         True,
         False,
         None,
+        False,
         False,
         False,
         True,

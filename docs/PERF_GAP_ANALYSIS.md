@@ -6218,6 +6218,28 @@ Both adjacent profiles also lacked the public run's small decode-many tail
 shape, so the local patch was removed. Do not add a decode-many minimum-active
 gate without a stronger, reproducible tail signal.
 
+Decode-many while runtime-ready requests are waiting is also rejected as a
+default. The current public long_output profile (`20260702_095238`) showed
+first-wave requests getting their first token around `140-150ms` but not
+finishing `9-10` output tokens until about `1.2s`, because waiting work prevents
+`step_online_many` from running a multi-token decode burst during the initial
+fill phase. An env-gated diagnostic path,
+`TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY_WITH_WAITING=1`, confirmed the
+mechanism but not the policy. Unrestricted waiting decode wrote
+`agent_space/ti_decode_many_wait_results/.../8xH100/runs/20260702_104143` and
+matched vLLM-like TPOT (`17.0ms`), but TTFT/E2E regressed to
+`668.2 / 17.0 / 1476.3ms`; queue profile p50 submit-to-first rose from
+`139.2ms` to `605.4ms`, prefill forward rose from `5.53s` to `7.81s`, and phase
+time rose from `19.58s` to `23.32s`. Constraining the same diagnostic to times
+when active rows were effectively full did not make it defaultable:
+`TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY_WITH_WAITING_MIN_ACTIVE=61` wrote
+`agent_space/ti_decode_many_wait61_results/.../8xH100/runs/20260702_104807` at
+`244.8 / 24.7 / 1183.7ms`, and `MIN_ACTIVE=64` wrote
+`agent_space/ti_decode_many_wait64_results/.../8xH100/runs/20260702_105339` at
+`265.5 / 25.1 / 1181.6ms`; both kept `1000/1000` correctness but worsened p99
+TTFT/E2E to about `1.5s` / `2.2-2.3s`. Keep the hook env-only for diagnostics;
+do not enable it by default without a policy that improves medians and tails.
+
 `TORCHINFERNO_COMPILED_POST_ATTENTION=1` is not a defaultable runtime win. A
 focused long_output check wrote
 `agent_space/ti_long_compiled_postattn_results/.../8xH100-local-ti-long-compiled-post-attn-20260702/runs/20260702_075057`

@@ -505,6 +505,14 @@ def _online_decode_many_allow_stop_enabled(*, temperature: float, max_tokens: in
     return env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_DECODE_MANY_ALLOW_STOP", True)
 
 
+def _online_decode_many_with_waiting_enabled(*, temperature: float, max_tokens: int) -> bool:
+    if "TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY_WITH_WAITING" in os.environ:
+        return env_flag("TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY_WITH_WAITING", False)
+    if not _online_decode_many_enabled(temperature=temperature, max_tokens=max_tokens):
+        return False
+    return False
+
+
 def _online_decode_first_enabled(*, temperature: float, max_tokens: int) -> bool:
     del temperature, max_tokens
     return env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_DECODE_FIRST", True)
@@ -4804,6 +4812,10 @@ class OpenAICompletionEngine:
             temperature=first.temperature,
             max_tokens=run_max_tokens,
         ) if use_decode_many else False
+        decode_many_with_waiting = _online_decode_many_with_waiting_enabled(
+            temperature=first.temperature,
+            max_tokens=run_max_tokens,
+        ) if use_decode_many else False
         fp8_prefill_enabled = _online_fp8_prefill_enabled(
             temperature=first.temperature,
             max_tokens=run_max_tokens,
@@ -4863,6 +4875,7 @@ class OpenAICompletionEngine:
                 prefill_ready_before_decode_active_cap=prefill_ready_before_decode_active_cap,
                 enable_decode_many=use_decode_many,
                 decode_many_allow_stop=decode_many_allow_stop,
+                decode_many_with_waiting=decode_many_with_waiting,
                 generated_prefix_cache=_online_generated_prefix_cache_enabled(
                     temperature=first.temperature,
                     max_tokens=run_max_tokens,
@@ -4974,6 +4987,12 @@ class OpenAICompletionEngine:
                     prefill_ready_before_decode_active_cap or 0
                 ),
                 decode_many_allow_stop=decode_many_allow_stop,
+                decode_many_with_waiting=decode_many_with_waiting,
+                decode_many_with_waiting_min_active=getattr(
+                    runtime_engine,
+                    "decode_many_with_waiting_min_active",
+                    0,
+                ),
                 use_paged_engine=use_paged_engine,
                 graph_prefill=graph_prefill,
                 prefill_chunk_size=prefill_chunk_size or 0,
@@ -6117,6 +6136,10 @@ class OpenAICompletionEngine:
             temperature=group[0].temperature,
             max_tokens=max_tokens,
         )
+        decode_many_with_waiting = _online_decode_many_with_waiting_enabled(
+            temperature=group[0].temperature,
+            max_tokens=max_tokens,
+        ) if use_decode_many else False
         runtime_engine = _RuntimeContinuousBatchEngine(
             self.model,
             device=self.device,
@@ -6145,6 +6168,7 @@ class OpenAICompletionEngine:
                 max_tokens=max_tokens,
             ),
             enable_decode_many=use_decode_many,
+            decode_many_with_waiting=decode_many_with_waiting,
             generated_prefix_cache=_online_generated_prefix_cache_enabled(
                 temperature=group[0].temperature,
                 max_tokens=max_tokens,
@@ -6369,6 +6393,10 @@ class OpenAICompletionEngine:
             temperature=group[0].temperature,
             max_tokens=max_tokens,
         )
+        decode_many_with_waiting = _online_decode_many_with_waiting_enabled(
+            temperature=group[0].temperature,
+            max_tokens=max_tokens,
+        ) if use_decode_many else False
         runtime_engine = _RuntimeContinuousBatchEngine(
             self.model,
             device=self.device,
@@ -6392,6 +6420,7 @@ class OpenAICompletionEngine:
                 max_tokens=max_tokens,
             ),
             enable_decode_many=use_decode_many,
+            decode_many_with_waiting=decode_many_with_waiting,
             generated_prefix_cache=_online_generated_prefix_cache_enabled(
                 temperature=group[0].temperature,
                 max_tokens=max_tokens,
@@ -13695,6 +13724,10 @@ def _tensor_parallel_worker_loop(engine: OpenAICompletionEngine) -> None:
                     temperature=temperature,
                     max_tokens=max_tokens,
                 ) if enable_decode_many else False
+                decode_many_with_waiting = _online_decode_many_with_waiting_enabled(
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                ) if enable_decode_many else False
                 # Flag-gated paged-KV worker engine -- MUST match the primary's choice
                 # (both build a PagedEngine identically + are driven by the same
                 # submit/step commands, so the deterministic page allocator keeps
@@ -13753,6 +13786,7 @@ def _tensor_parallel_worker_loop(engine: OpenAICompletionEngine) -> None:
                         prefill_ready_before_decode_active_cap=prefill_ready_before_decode_active_cap,
                         enable_decode_many=enable_decode_many,
                         decode_many_allow_stop=decode_many_allow_stop,
+                        decode_many_with_waiting=decode_many_with_waiting,
                         generated_prefix_cache=_online_generated_prefix_cache_enabled(
                             temperature=temperature,
                             max_tokens=max_tokens,
@@ -13811,6 +13845,8 @@ def _tensor_parallel_worker_loop(engine: OpenAICompletionEngine) -> None:
                     online_runtime_engine.enable_decode_many = enable_decode_many
                 if hasattr(online_runtime_engine, "decode_many_allow_stop"):
                     online_runtime_engine.decode_many_allow_stop = decode_many_allow_stop
+                if hasattr(online_runtime_engine, "decode_many_with_waiting"):
+                    online_runtime_engine.decode_many_with_waiting = decode_many_with_waiting
                 if hasattr(online_runtime_engine, "decode_first"):
                     online_runtime_engine.decode_first = decode_first
                 if hasattr(online_runtime_engine, "prefill_ready_before_decode"):

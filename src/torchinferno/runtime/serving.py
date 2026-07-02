@@ -440,6 +440,8 @@ class ContinuousBatchEngine:
         admit_per_step_cap: int | None = None,
         enable_decode_many: bool | None = None,
         decode_many_allow_stop: bool | None = None,
+        decode_many_with_waiting: bool | None = None,
+        decode_many_with_waiting_min_active: int | None = None,
         generated_prefix_cache: bool | None = None,
         max_generation_tokens: int | None = None,
     ) -> None:
@@ -510,6 +512,18 @@ class ContinuousBatchEngine:
             if decode_many_allow_stop is None
             else bool(decode_many_allow_stop)
         )
+        self.decode_many_with_waiting = (
+            env_flag("TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY_WITH_WAITING", False)
+            if decode_many_with_waiting is None
+            else bool(decode_many_with_waiting)
+        )
+        if decode_many_with_waiting_min_active is None:
+            decode_many_with_waiting_min_active = env_int(
+                "TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY_WITH_WAITING_MIN_ACTIVE",
+                0,
+                minimum=0,
+            )
+        self.decode_many_with_waiting_min_active = max(0, int(decode_many_with_waiting_min_active))
         self.unified_forward = bool(
             env_flag("TORCHINFERNO_CONTINUOUS_UNIFIED_FORWARD", False)
             and hasattr(model, "forward_step_flashinfer")
@@ -680,7 +694,15 @@ class ContinuousBatchEngine:
         if not self.enable_decode_many:
             return False
         waiting = self._online_waiting
-        if waiting or self._online_prefilling or not self._online_active:
+        if waiting:
+            if not self.decode_many_with_waiting:
+                return False
+            if (
+                self.decode_many_with_waiting_min_active > 0
+                and len(self._online_active) < self.decode_many_with_waiting_min_active
+            ):
+                return False
+        if self._online_prefilling or not self._online_active:
             return False
         if self.unified_forward or not self.decode_first:
             return False
