@@ -1195,6 +1195,46 @@ def test_continuous_batch_engine_can_batch_mixed_prefix_hits(monkeypatch) -> Non
     assert engine.stats.prefill_prefix_reuse_batches <= 2
 
 
+def test_continuous_batch_engine_can_delay_pinned_full_prompt_store_until_finish(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PINNED_FULL_PROMPT_STORE_MIN_MAX_TOKENS", "1")
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PINNED_FULL_PROMPT_STORE_ADOPT_ON_FINISH", "1")
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_NON_COMMON_PREFIX_GRAPH_PREFILL", "1")
+    prompt = tuple(range(1, 18))
+    continued_prompt = (*prompt, 99)
+    model = _SelectedLogitsToyModel(vocab_size=256)
+    engine = ContinuousBatchEngine(
+        model,
+        device=torch.device("cpu"),
+        max_active_requests=2,
+        prefix_cache_capacity=4,
+        pin_shared_prefix=True,
+        graph_prefill=True,
+    )
+    engine.start_online(max_seq_len=64)
+    engine.submit_online(ServingRequest("turn-1", prompt, 1, arrival_step=0))
+
+    assert [(event.request_id, event.token, event.finished) for event in engine.step_online()] == [
+        ("turn-1", 18, True)
+    ]
+    assert engine._reusable_prefix_hit_tokens(continued_prompt) == len(prompt)
+    reusable = engine.reusable_prefixes["turn-1"]
+    assert reusable.tokens == prompt
+    assert reusable.logits is None
+    assert reusable.row < engine.max_active_requests
+    assert reusable.row not in engine._free_active_rows
+    assert any(row >= engine.max_active_requests for row in engine._free_active_rows)
+
+    prefill_src_rows = len(model.prefill_src_prefix_rows)
+    engine.submit_online(ServingRequest("turn-2", continued_prompt, 1, arrival_step=0))
+
+    assert [(event.request_id, event.token, event.finished) for event in engine.step_online()] == [
+        ("turn-2", 100, True)
+    ]
+    assert model.prefill_src_prefix_rows[prefill_src_rows:] == [[reusable.row]]
+
+
 def test_continuous_batch_engine_does_not_report_hit_without_prefix_storage() -> None:
     torch.manual_seed(55)
     config = tiny_deepseek_v32_config(vocab_size=32, max_position_embeddings=16)

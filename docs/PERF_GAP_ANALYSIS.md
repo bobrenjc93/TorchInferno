@@ -154,6 +154,29 @@ paid `31` prefix-graph misses, `16.2s` prefill forward, `28.2s` prefill wall,
 and `11.6s` prefill state time. The graph-key fix removes unkeyed capture
 state; it does not make the non-common suffix path fast enough to default.
 
+Delayed pinned full-prompt row adoption is accepted only as an opt-in foundation
+for that rejected path. With
+`TORCHINFERNO_CONTINUOUS_PINNED_FULL_PROMPT_STORE_ADOPT_ON_FINISH=1`, the engine
+skips the prefill-time KV copy for pinned per-request full-prompt stores and
+adopts the already-live active row when the request finishes. A focused
+multi_turn run with the same full-prompt mixed-prefix reuse knobs wrote
+`agent_space/ti_multi_delayed_adopt_results/.../8xH100/runs/20260702_163130`
+and landed at `1071.7 / 70.4 / 1141.6ms`, `979/1000` correct. The profile
+shows the intended overhead reduction: request-prompt reuse still fired for
+`875` requests and `98.6K` tokens, while prefill state time dropped from the
+prior probe's `11.6s` to `60ms` and prefill wall dropped from `28.2s` to
+`17.5s`. It is still far slower than the current default multi_turn band
+because the run paid `31` prefix-graph misses and `16.3s` prefill forward for
+the non-common suffix path.
+
+The follow-up mixed-prefix dynamic-context experiment remains rejected and is
+not in source. Combining delayed row adoption with a temporary
+`TORCHINFERNO_CONTINUOUS_MIXED_PREFIX_DYNAMIC_CONTEXT=1` patch failed during a
+multi_turn run with a CUDA unspecified launch failure in prefix-graph prefill
+and returned server 500s before producing a result row. Do not revive this as a
+runtime knob without a smaller CUDA-level reproduction and correctness proof for
+mixed source-prefix lengths.
+
 ## Public 20260702_095238 refresh and sampled-medium active-cap lower bound
 
 The latest public all-provider run at

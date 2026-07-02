@@ -3773,6 +3773,8 @@ class ContinuousBatchEngine:
 
     def _finish_and_release(self, state: _ActiveRequest, step: int) -> ServingResult:
         row_adopted = self._store_finished_reusable_prefix(state)
+        if not row_adopted:
+            row_adopted = self._store_delayed_pinned_full_prompt_prefix(state)
         result = ServingResult(
             state.request.request_id,
             tuple(state.tokens),
@@ -3793,6 +3795,24 @@ class ContinuousBatchEngine:
         )
         return threshold > 0 and request.max_new_tokens >= threshold
 
+    def _delayed_pinned_full_prompt_store_enabled(self, request: ServingRequest) -> bool:
+        if not self._delayed_pinned_full_prompt_store_allowed(
+            allow_pinned=self._allow_pinned_full_prompt_store(request)
+        ):
+            return False
+        return True
+
+    def _delayed_pinned_full_prompt_store_allowed(self, *, allow_pinned: bool) -> bool:
+        if not self.pin_shared_prefix or not allow_pinned:
+            return False
+        if not env_flag("TORCHINFERNO_CONTINUOUS_PINNED_FULL_PROMPT_STORE_ADOPT_ON_FINISH", False):
+            return False
+        if env_flag("TORCHINFERNO_CONTINUOUS_PINNED_FULL_PROMPT_STORE_LOGITS", False):
+            return False
+        if env_flag("TORCHINFERNO_CONTINUOUS_PREFIX_CACHE_STORE_LOGITS", False):
+            return False
+        return True
+
     def _store_reusable_prefix(
         self,
         request_id: str,
@@ -3812,6 +3832,8 @@ class ContinuousBatchEngine:
             # multi-turn style workloads where one full-prompt row can save a
             # much larger next-turn suffix prefill.
             return
+        if self._delayed_pinned_full_prompt_store_allowed(allow_pinned=allow_pinned):
+            return
         store_logits = True
         if allow_pinned:
             store_logits = env_flag(
@@ -3828,6 +3850,27 @@ class ContinuousBatchEngine:
             logits,
             store_logits=store_logits,
         )
+
+    def _store_delayed_pinned_full_prompt_prefix(self, state: _ActiveRequest) -> bool:
+        if not self._delayed_pinned_full_prompt_store_enabled(state.request):
+            return False
+        prompt = state.request.prompt
+        if not prompt or not self._state_has_full_prompt_kv(state):
+            return False
+        if self._cache_row_seq_len(state.row, state.seq_len) < len(prompt):
+            return False
+        route_id = state.request.request_id
+        try:
+            return self._adopt_reusable_prefix_tokens(
+                route_id,
+                state.request.request_id,
+                prompt,
+                state.row,
+            )
+        except Exception:
+            if env_flag("TORCHINFERNO_CONTINUOUS_PINNED_FULL_PROMPT_STORE_STRICT", False):
+                raise
+            return False
 
     def _generated_prefix_cache_base_enabled(self) -> bool:
         return (
