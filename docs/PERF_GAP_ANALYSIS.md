@@ -192,6 +192,16 @@ therefore now records static cache length when available, e.g.
 `static_decode:logits:b2:s3`, before spending more startup time on static
 fallback warmups.
 
+A pushed-instrumentation rerun did not reproduce the static miss. The
+four-benchmark sequence through tree on `feaded7` wrote
+`agent_space/ti_tree_static_miss_seq_results/.../runs/20260702_202503` and
+landed at few_shot `168.8 / 50.5 / 208.4ms`, self_consistency
+`197.0 / 0.0 / 211.4ms`, multi_turn `296.0 / 62.7 / 350.2ms`, and
+tree_of_thought `150.4 / 48.1 / 179.3ms`. The tree queue profile ended with
+`runtime_decode_graph_misses=0`. Treat the static fallback as rare sequencing
+noise unless a sequence-qualified miss recurs; do not add more static startup
+warmups speculatively.
+
 A current-head focused multi_turn profile on pushed `325cdf4` wrote
 `agent_space/ti_multi_325cdf4_results/.../runs/20260702_192513` and landed at
 `303.1 / 61.8 / 361.8ms`, `983/1000` correct. The new miss-shape field stayed
