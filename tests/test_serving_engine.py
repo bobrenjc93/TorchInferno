@@ -2036,6 +2036,37 @@ def test_continuous_batch_engine_suffix_bucket_split_requires_model_token_saving
     assert split_groups is None
 
 
+def test_continuous_batch_engine_default_suffix_bucket_split_rejects_singletons(
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SPLIT_SUFFIX_BUCKETS", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SPLIT_SUFFIX_BUCKETS_MIN_GROUP", raising=False)
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SUFFIX_BUCKETS", "4,8")
+    engine = ContinuousBatchEngine(
+        object(),
+        device=torch.device("cpu"),
+        temperature=0.0,
+        max_generation_tokens=128,
+        graph_prefill=True,
+    )
+    group = [
+        (index, ServingRequest(str(index), tuple(range(16 + suffix_len)), 1), 16, object())
+        for index, suffix_len in enumerate([4, 4, 5])
+    ]
+    suffix_lengths = [
+        len(request.prompt) - prefix_tokens
+        for _index, request, prefix_tokens, _reusable in group
+    ]
+
+    assert engine._prefix_prefill_suffix_bucket_split_groups(group, suffix_lengths) is None
+
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SPLIT_SUFFIX_BUCKETS_MIN_GROUP", "1")
+    split_groups = engine._prefix_prefill_suffix_bucket_split_groups(group, suffix_lengths)
+
+    assert split_groups is not None
+    assert [len(items) for items in split_groups] == [2, 1]
+
+
 def test_continuous_batch_engine_suffix_bucket_split_default_scope(monkeypatch) -> None:
     monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SPLIT_SUFFIX_BUCKETS", raising=False)
     monkeypatch.delenv(

@@ -131,8 +131,8 @@ reuse or a non-fragmenting mixed-prefix suffix path.
 Guarded suffix-bucket splitting is accepted only for greedy-short long_output.
 The default policy now enables the split for deterministic `max_tokens<=128`
 sessions, but only when the actual admitted group reduces predicted prefill
-graph tokens and every split subgroup is at least `75%` full. The current-head
-control
+graph tokens, every split subgroup is at least `75%` full, and the automatic
+greedy-short path avoids singleton split groups. The current-head control
 `agent_space/ti_long_row_phase_results/.../runs/20260702_224930` landed at
 `248.9 / 24.8 / 1142.5ms`, `1000/1000` correct, with `44,715` active suffix
 tokens inside `91,136` prefix-graph tokens and `5.31s` prefill forward. The
@@ -145,6 +145,21 @@ landed at `256.9 / 24.4 / 1134.1ms`, `1000/1000` correct, with prefill forward
 down to `5.00s` and prefix-graph tokens at `80,096`. This is a TPOT/E2E and
 throughput tradeoff, not a TTFT fix; sampled tree and greedy-large multi_turn
 stay on their rejected opt-in paths.
+
+A follow-up full-order TorchInferno run on pushed `d869023`
+(`agent_space/ti_full_d869023_results/.../runs/20260702_231547`) kept the
+long_output improvement in-family at `286.2 / 23.3 / 1098.5ms`,
+`1000/1000` correct, and reduced long_output prefix-graph model tokens further
+to `75,712`. Requiring at least four requests per split subgroup is rejected as
+too broad: the focused env run
+`agent_space/ti_long_suffix_mingroup4_results/.../runs/20260702_232151`
+improved TTFT to `262.3ms`, but regressed TPOT/E2E to `23.9 / 1158.5ms`.
+Requiring only two requests per automatic greedy-short split subgroup is kept:
+`agent_space/ti_long_suffix_mingroup2_results/.../runs/20260702_232653`
+landed at `241.2 / 24.6 / 1120.4ms`, `1000/1000` correct, improving focused
+TTFT/E2E versus the no-env split confirmation while avoiding singleton
+`b1` suffix-prefill fragments. Explicit diagnostic split runs can still set
+`TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SPLIT_SUFFIX_BUCKETS_MIN_GROUP=1`.
 
 A narrower decode-many-while-waiting policy is also rejected and not in source.
 The temporary patch allowed decode-many only while the ready queue was below the

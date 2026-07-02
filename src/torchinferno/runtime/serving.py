@@ -2514,9 +2514,15 @@ class ContinuousBatchEngine:
             (base_model_tokens - split_model_tokens) * 100 < base_model_tokens * min_savings_pct
         ):
             return None
+        default_min_group_size = 1
+        if (
+            "TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SPLIT_SUFFIX_BUCKETS" not in os.environ
+            and self._prefix_prefill_split_suffix_buckets_enabled()
+        ):
+            default_min_group_size = 2
         min_group_size = env_int(
             "TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SPLIT_SUFFIX_BUCKETS_MIN_GROUP",
-            1,
+            default_min_group_size,
             minimum=1,
         )
         default_min_fill_pct = 75 if self._prefix_prefill_split_suffix_buckets_enabled() else 0
