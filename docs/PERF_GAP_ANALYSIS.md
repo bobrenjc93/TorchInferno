@@ -6142,17 +6142,23 @@ Keep prequeue admission scoped to sampled-medium tree traffic.
 
 ## Public Run Status
 
-The public results directory is still latest at `20260701_211855`, and that run
-measured stale TorchInferno `3af4940`. It also had a vLLM startup failure, so
-the public scorecard currently compares current-ish SGLang against an old
-TorchInferno and no vLLM rows. Current pushed TorchInferno `db1587d` has only
-the same-host local all-provider evidence above until the public harness runs
-again with the inference-bench vLLM workspace/libstdc++ fixes.
+The public results directory now has a current all-provider run at
+`20260702_062945`, written with inference-bench commit `045649d4` and
+TorchInferno `840f859` (perf-equivalent to `db1587d`; docs-only commits after
+that). vLLM started successfully with the workspace/libstdc++ fix. The public
+scorecard is vLLM `11/20`, SGLang `5/20`, TorchInferno `3/20`: TorchInferno wins
+few_shot TPOT and self_consistency E2E/throughput, while the remaining
+score-facing gaps are tree_of_thought, long_output, and multi_turn TTFT/E2E.
+
+Public-path medians are close to the same-host local refresh:
+few_shot TorchInferno `172.0 / 48.6 / 213.3ms`, self_consistency
+`211.2 / 0.0 / 229.0ms`, multi_turn `326.6 / 61.3 / 381.2ms`,
+tree_of_thought `161.4 / 46.7 / 190.7ms`, and long_output
+`257.2 / 24.5 / 1254.0ms`. The current vLLM targets are tree
+`66.5 / 31.4 / 89.6ms` and long_output `64.4 / 16.9 / 674.0ms`.
 
 ## Priority for a focused (non-loop) session
 
-1. Let/force the public harness to measure current TorchInferno and the vLLM
-   startup fix.
-2. Prefill MFU (Issue 1) — biggest TTFT lever, ~2x, affects 3/5 benchmarks.
-3. Chunked prefill interleaved with decode — lets early requests return fast.
-4. Persistent engine + TP-safe reuse (Issue 3) — needed for multi_turn.
+1. Prefill MFU (Issue 1) — biggest TTFT lever, ~2x, affects 3/5 benchmarks.
+2. Chunked prefill interleaved with decode — lets early requests return fast.
+3. Persistent engine + TP-safe reuse (Issue 3) — needed for multi_turn.
