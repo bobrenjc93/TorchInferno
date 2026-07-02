@@ -6343,6 +6343,24 @@ rose to `95`, and ragged decode GPU rose to `1.48s`. Keep the sampled-medium
 prequeue default at `1ms`; larger waits increase tail and decode fragmentation
 without closing the vLLM tree gap.
 
+Raising sampled-medium active rows is also rejected on the current stack.
+`TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_MAX_ACTIVE=64` wrote
+`agent_space/ti_tree_active64_results/.../8xH100-local-ti-tree-sampled-active64-20260702/runs/20260702_100818`
+and improved median tree to `150.6 / 34.1 / 177.2ms`, `964/992` correct, but
+phase time rose to `7.03s` and p99 first-token/finish were `1.59s/1.61s`.
+`MAX_ACTIVE=48` wrote
+`agent_space/ti_tree_active48_results/.../8xH100-local-ti-tree-sampled-active48-20260702/runs/20260702_101321`
+and landed at `145.8 / 51.8 / 176.7ms`, `958/992` correct, with an even worse
+tail (`1.88s` queue-to-first p99) because request-time `b48` prefill and decode
+graph captures cost about `1.0s` and `0.33s`. Warming those shapes with
+`TORCHINFERNO_OPENAI_WARMUP_ONLINE_GREEDY_COMMON_PREFIX_SUFFIX_BATCHES=1,2,4,8,16,32,48`
+and `TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_DECODE_WARMUP=1` moved the tail
+in the right direction but still lost the score row: startup increased to
+`241s`, tree was `146.4 / 48.0 / 174.4ms`, correctness was `957/992`, and p99
+first-token stayed at `825ms`. Keep the sampled-medium active cap at `32`; the
+extra rows reduce median queueing a little but increase decode/prefill work and
+tail latency.
+
 ## Priority for a focused (non-loop) session
 
 1. Prefill MFU (Issue 1) — biggest TTFT lever, ~2x, affects 3/5 benchmarks.
