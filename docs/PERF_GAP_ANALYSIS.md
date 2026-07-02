@@ -1,5 +1,41 @@
 # TorchInferno vs vLLM/sglang — Performance Gap Analysis (Llama-3.1-70B, 8xH100)
 
+## Public 20260702_140923 refresh and SGLang CLI compatibility
+
+The latest public all-provider run at
+`results/v1/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100/runs/20260702_140923`
+was published with inference-bench `055de6e5`. It includes inference-bench
+commit `2b770aee`, which switches the SGLang provider from the removed `--tp`
+flag to current `--tp-size` and adds a focused provider test. The measured
+provider commits were vLLM `2a16ece`, SGLang `a375e9f`, and TorchInferno
+`0c3edef`. All providers completed all five benchmarks with no recorded
+provider errors.
+
+The score split was SGLang `14`, TorchInferno `5`, and vLLM `0`. Rows as
+TTFT / TPOT / E2E:
+
+- few_shot: vLLM `239.1 / 86.4 / 319.8ms`, SGLang
+  `114.0 / 88.5 / 202.7ms`, TorchInferno `172.3 / 50.1 / 214.3ms`.
+- self_consistency: vLLM `216.4 / 0.0 / 304.4ms`, SGLang
+  `195.7 / 0.0 / 388.3ms`, TorchInferno `216.4 / 0.0 / 234.3ms`.
+- multi_turn: vLLM `284.7 / 97.0 / 379.4ms`, SGLang
+  `144.5 / 124.8 / 273.7ms`, TorchInferno `341.2 / 66.6 / 399.3ms`.
+- tree_of_thought: vLLM `125.4 / 82.8 / 186.4ms`, SGLang
+  `55.9 / 84.9 / 147.7ms`, TorchInferno `156.1 / 42.3 / 195.4ms`.
+- long_output: vLLM `94.6 / 27.4 / 1115.2ms`, SGLang
+  `60.5 / 24.7 / 889.8ms`, TorchInferno `274.0 / 25.1 / 1283.8ms`.
+
+TorchInferno now wins median TPOT on few_shot, multi_turn, and tree_of_thought,
+plus self_consistency E2E and throughput. It still loses SGLang on TTFT/E2E for
+few_shot, multi_turn, tree_of_thought, and long_output, and narrowly misses
+long_output TPOT. This refresh confirms the current code path and recent
+inference-bench provider fixes are runnable, but it does not change the
+remaining engineering diagnosis: multi_turn needs TP-safe non-common prefix
+reuse that does not fragment prefill, tree needs cheaper steady sampled-medium
+prefix-suffix prefill/decode, and long_output needs a decode/prefill policy that
+improves medians without reintroducing the rejected waiting-decode tail
+regression.
+
 ## Public 20260702_095238 refresh and sampled-medium active-cap lower bound
 
 The latest public all-provider run at
