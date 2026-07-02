@@ -6004,6 +6004,16 @@ prefill ahead of decode; it needs either faster suffix prefill or a pipeline
 that overlaps ordinary ragged decode synchronization without losing the
 decode-many/e2e balance.
 
+Greedy short prequeue admission is rejected for long_output. Applying the same
+prequeue mechanism globally with
+`TORCHINFERNO_OPENAI_TP_STREAM_PREQUEUE_ADMISSION_WAIT_MS=1` kept correctness at
+`1000/1000` and improved median E2E to `1240.3ms`, but it left TTFT/TPOT
+effectively unchanged at `265.9 / 24.6ms` and worsened p99 TTFT/E2E to
+`1477.7 / 2237.2ms`. A smaller `0.5ms` value also preserved correctness but
+regressed medians to `277.3 / 24.5 / 1330.9ms` with similarly bad tails. Keep
+prequeue admission scoped to sampled-medium tree traffic; the long_output gap
+remains decode and prefill/decode overlap, not first-wave request admission.
+
 Sampled decode-many is also only a diagnostic probe. Tree-of-thought on current
 `fd3bebb` with queue profiling landed at `256.2 / 50.3 / 307.8ms` locally.
 Enabling `TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_DECODE_MANY=1` improved median
