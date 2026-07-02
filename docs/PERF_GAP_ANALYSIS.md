@@ -6250,6 +6250,14 @@ deterministic `400 < max_tokens <= 512` policy. Keep the active cap at `8` and
 leave greedy short, greedy mid, sampled short, sampled medium, and global
 prefill/decode ordering unchanged.
 
+The no-env confirmation after promotion wrote
+`agent_space/ti_multi_prbd8_default_confirm_results/.../8xH100-local-ti-multi-prbd8-default-confirm-20260702/runs/20260702_083658`
+on pushed `bf6aa8b` and landed at `307.7 / 61.3 / 364.9ms`, `981/1000`
+correct. The quiescent queue record confirms the default policy fired without
+overrides: `run_max_tokens=512`, `prefill_ready_before_decode=true`, active cap
+`8`, `34/0` prefill graph hits/misses, and queue-to-first/finish p50
+`245.7/268.5ms`.
+
 Forcing prefill-cost admission priority on sampled-medium tree traffic is
 rejected. The profiled env run with
 `TORCHINFERNO_CONTINUOUS_ADMIT_PREFILL_COST_PRIORITY=1` wrote
