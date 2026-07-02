@@ -1,5 +1,39 @@
 # TorchInferno vs vLLM/sglang — Performance Gap Analysis (Llama-3.1-70B, 8xH100)
 
+## Public 20260702_095238 refresh and sampled-medium active-cap lower bound
+
+The latest public all-provider run at
+`results/v1/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100/runs/20260702_095238`
+measured vLLM `08a8a4a`, SGLang `b276a9a`, and TorchInferno `46007b2`.
+The score split was vLLM `13`, SGLang `5`, and TorchInferno `1`. Rows as
+TTFT / TPOT / E2E:
+
+- few_shot: vLLM `142.8 / 56.0 / 194.0ms`, SGLang
+  `115.7 / 87.0 / 203.3ms`, TorchInferno `173.0 / 51.2 / 214.5ms`.
+- self_consistency: vLLM `215.0 / 0.0 / 244.1ms`, SGLang
+  `193.5 / 0.0 / 382.0ms`, TorchInferno `196.7 / 0.0 / 277.7ms`.
+- multi_turn: vLLM `160.6 / 52.8 / 207.1ms`, SGLang
+  `148.3 / 126.1 / 280.2ms`, TorchInferno `306.4 / 65.7 / 365.3ms`.
+- tree_of_thought: vLLM `64.0 / 31.5 / 87.3ms`, SGLang
+  `58.1 / 74.2 / 147.6ms`, TorchInferno `158.2 / 35.0 / 186.8ms`.
+- long_output: vLLM `63.3 / 17.0 / 661.4ms`, SGLang
+  `60.7 / 24.5 / 874.7ms`, TorchInferno `271.3 / 24.8 / 1192.7ms`.
+
+The queue profile is still capture-clean enough that the remaining public gaps
+are steady dense prefill/decode work, not cold graph setup. Tree spent
+`2.12s` in prefix-suffix prefill forward and `1.44s` in ragged decode GPU;
+long_output spent `5.53s` in prefill forward and `10.48s` in decode GPU.
+
+Lowering sampled-medium tree active rows is rejected. A focused current-main
+run with `TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_MAX_ACTIVE=16` wrote
+`agent_space/ti_tree_active16_results/.../runs/20260702_112544` and landed at
+`304.8 / 51.9 / 327.8ms`, `957/992` correct. Queue counters explain the loss:
+`max_active=16` doubled prefix-suffix fragmentation (`119` prefill batches),
+raised prefill wall/forward to `4.53/3.72s`, raised decode GPU to `1.79s`,
+and pushed queue-to-first p50 to `282.3ms`. Keep sampled-medium max-active at
+`32`; both lowering and prior higher-row probes lose through fragmentation,
+tail, or startup/warmup cost.
+
 ## Current 20260702 full same-host provider refresh
 
 The current same-host all-provider run used inference-bench with skipped builds
