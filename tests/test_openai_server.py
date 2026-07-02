@@ -108,6 +108,7 @@ from torchinferno.openai_server import (
     _online_admit_min_free_rows,
     _online_collect_idle_arrivals_enabled,
     _online_decode_warmup_batch_sizes,
+    _online_decode_warmup_runtime_symm_mem_allreduce_enabled,
     _online_decode_first_enabled,
     _online_decode_many_allow_stop_enabled,
     _online_decode_many_enabled,
@@ -715,6 +716,7 @@ def test_openai_decode_warmup_excludes_prefix_cache_rows() -> None:
     assert _online_decode_warmup_batch_sizes(max_active=128, cache_batch=144) == (
         1,
         2,
+        3,
         4,
         8,
         16,
@@ -725,6 +727,7 @@ def test_openai_decode_warmup_excludes_prefix_cache_rows() -> None:
     assert _online_decode_warmup_batch_sizes(max_active=48, cache_batch=112) == (
         1,
         2,
+        3,
         4,
         8,
         16,
@@ -734,12 +737,58 @@ def test_openai_decode_warmup_excludes_prefix_cache_rows() -> None:
     assert _online_decode_warmup_batch_sizes(max_active=128, cache_batch=64) == (
         1,
         2,
+        3,
         4,
         8,
         16,
         32,
         64,
     )
+
+
+def test_openai_decode_warmup_runtime_symm_mem_default_and_overrides(monkeypatch) -> None:
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_SYMM_MEM_ALLREDUCE", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_STARTUP", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_DECODE_WARMUP", raising=False)
+    assert _online_decode_warmup_runtime_symm_mem_allreduce_enabled() is False
+
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE", "runtime")
+    assert _online_decode_warmup_runtime_symm_mem_allreduce_enabled() is True
+
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_STARTUP", "0")
+    assert _online_decode_warmup_runtime_symm_mem_allreduce_enabled() is False
+
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_DECODE_WARMUP", "1")
+    assert _online_decode_warmup_runtime_symm_mem_allreduce_enabled() is True
+
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_DECODE_WARMUP", "0")
+    assert _online_decode_warmup_runtime_symm_mem_allreduce_enabled() is False
+
+
+def test_openai_unified_scheduler_decode_warmup_uses_runtime_symm_scope(monkeypatch) -> None:
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE", "runtime")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_WARMUP_ONLINE_COMMON_PREFIX_PREFILL", "0")
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_FLASHINFER_PREFILL_DISABLE", "1")
+    scope_kwargs: list[dict[str, object]] = []
+
+    def symm_scope(*args: object, **kwargs: object) -> nullcontext[None]:
+        del args
+        scope_kwargs.append(dict(kwargs))
+        return nullcontext()
+
+    monkeypatch.setattr("torchinferno.openai_server._tensor_parallel_symm_mem_allreduce_scope", symm_scope)
+
+    cache = _WarmupShapeCache()
+    engine = object.__new__(OpenAICompletionEngine)
+    engine.model = _WarmupShapeModel()
+    engine.device = torch.device("cpu")
+    engine._persistent_serving_cache = None
+    engine._allocate_online_serving_warmup_cache = lambda: (cache, 4, 4, 16)  # type: ignore[method-assign]
+
+    engine._warmup_unified_scheduler_cache(vocab_size=16)
+
+    assert [kwargs["startup"] for kwargs in scope_kwargs] == [False]
 
 
 def test_openai_unified_scheduler_warmup_captures_ragged_logits_graphs(monkeypatch) -> None:
@@ -778,11 +827,13 @@ def test_openai_unified_scheduler_warmup_captures_ragged_logits_graphs(monkeypat
     assert model.token_ragged_shapes == [
         (1, 1, (0,)),
         (2, 1, (0, 1)),
+        (3, 1, (0, 1, 2)),
         (4, 1, (0, 1, 2, 3)),
     ]
     assert [shape[:2] + (shape[3],) for shape in model.ragged_shapes] == [
         (1, 1, (0,)),
         (2, 1, (0, 1)),
+        (3, 1, (0, 1, 2)),
         (4, 1, (0, 1, 2, 3)),
     ]
     assert engine._persistent_serving_cache is cache

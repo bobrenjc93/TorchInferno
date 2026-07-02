@@ -133,11 +133,23 @@ def _flashinfer_prefill_warmup_batch_sizes(batch_sizes: Sequence[int]) -> tuple[
 def _online_decode_warmup_batch_sizes(*, max_active: int, cache_batch: int) -> tuple[int, ...]:
     active_limit = min(max(1, int(max_active)), max(1, int(cache_batch)))
     batch_sizes = {active_limit}
+    if active_limit >= 3:
+        batch_sizes.add(3)
     bucket = 1
     while bucket <= active_limit:
         batch_sizes.add(bucket)
         bucket *= 2
     return tuple(sorted(batch_sizes))
+
+
+def _online_decode_warmup_runtime_symm_mem_allreduce_enabled() -> bool:
+    env_name = "TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_DECODE_WARMUP"
+    if env_name in os.environ:
+        return env_flag(env_name, True)
+    startup_env = "TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_STARTUP"
+    if startup_env in os.environ:
+        return env_flag(startup_env, False)
+    return _openai_tp_symm_mem_allreduce_enabled(startup=False)
 
 
 def _flashinfer_prefill_runtime_enabled() -> bool:
@@ -3169,17 +3181,23 @@ class OpenAICompletionEngine:
         # Decode touches only active rows (<= max_active), addressed via row
         # indices, so warm the active-range buckets, not prefix-cache rows.
         # Include EVERY power of two up to the active cap: the ragged decode path
-        # rounds the active count up to the next pow2 bucket, so a missing pow2
-        # (e.g. 64 when max_active=128) drops that range to eager decode. Prefix
-        # rows are only copied during prefill; warming cache_batch would capture a
-        # 144-row decode graph under the default 128 active + 16 prefix envelope
-        # even though no decode step can use it.
+        # usually rounds the active count up to the next pow2 bucket, so a missing
+        # pow2 (e.g. 64 when max_active=128) drops that range to eager decode.
+        # Prefix rows are only copied during prefill; warming cache_batch would
+        # capture a 144-row decode graph under the default 128 active + 16 prefix
+        # envelope even though no decode step can use it. The three-row exact
+        # shape covers the fallback when no free active row is available to pad.
         batch_sizes = list(_online_decode_warmup_batch_sizes(
             max_active=max_active,
             cache_batch=cache_batch,
         ))
+        decode_warmup_runtime_symm = _online_decode_warmup_runtime_symm_mem_allreduce_enabled()
         with _tensor_parallel_symm_mem_allreduce_scope(
-            self.model, self.device, max_tokens=1, temperature=0.0, startup=True,
+            self.model,
+            self.device,
+            max_tokens=1,
+            temperature=0.0,
+            startup=not decode_warmup_runtime_symm,
         ):
             for bs in batch_sizes:
                 _set_generation_cache_seq_len(cache, prompt_tokens)

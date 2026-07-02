@@ -88,6 +88,24 @@ queue-to-finish p50 `1224.2ms`, `6.94s` prefill wall (`6.01s` forward),
 The default therefore remains `runtime`; startup all-scope remains available as
 an explicit override, not a defaultable win.
 
+A narrower decode-warmup default did reproduce. On the patched run
+`agent_space/ti_long_decode_warmupsymm_results/.../8xH100-local-ti-long-decode-warmupsymm-20260702/runs/20260702_030000`,
+the server still auto-probed to `runtime` scope and reached readiness in
+`200.9s`, but online decode graph warmup captured under the same runtime
+symmetric-memory scope used by requests and also warmed the observed exact
+three-row decode shape. The long_output row improved to
+`240.9 / 25.1 / 1206.5ms`, with p99 TTFT/TPOT/E2E at
+`1398.6 / 100.3 / 2123.3ms`, and correctness stayed `1000/1000`. The queue
+profile confirms the mechanism: request-path decode graph captures fell to
+`0` (`744` replays, `0.0ms` capture wall), decode GPU time fell to `9.59s`,
+and online phase time fell to `19.37s`. The adjacent no-env control had
+`7` request-path decode captures, `5.07s` capture wall, `13.99s` decode GPU,
+and `24.49s` phase time. This is not a switch to all startup symm scope; it
+only makes the online decode graph warmup match the runtime request scope, with
+`TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_DECODE_WARMUP=0` as the targeted
+escape hatch and `TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_STARTUP=0`
+respected when the targeted override is unset.
+
 ## Prior 20260701 refresh and local vLLM/SGLang checks
 
 Public run `20260701_211855` is stale for TorchInferno: it measured
