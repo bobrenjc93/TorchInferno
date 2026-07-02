@@ -228,6 +228,16 @@ not preserve the score-facing E2E win. Keep the default drain quantum at `8`;
 set it to the base quantum to disable the drain behavior for latency-sensitive
 streaming deployments.
 
+Raising the same drain quantum to `12` is also rejected. The env-only run on
+pushed `f7f2cd1` wrote
+`agent_space/ti_long_drainq12_results/.../runs/20260702_210255` and landed at
+`310.9 / 22.8 / 1088.2ms`, `1000/1000` correct. It cut online step commands
+further (`183 -> 150`) and improved median TPOT/E2E, but queue-to-first p50
+regressed (`203ms -> 249ms`), p99 finish regressed (`1863ms -> 2098ms`),
+decode-many skipped tokens rose (`1907 -> 2881`), and decode GPU time rose
+(`10.23s -> 10.80s`). Because default `8` already clears the public TPOT cell,
+the larger drain burst is not worth the TTFT/tail tradeoff.
+
 A current-head focused multi_turn profile on pushed `325cdf4` wrote
 `agent_space/ti_multi_325cdf4_results/.../runs/20260702_192513` and landed at
 `303.1 / 61.8 / 361.8ms`, `983/1000` correct. The new miss-shape field stayed
