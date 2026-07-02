@@ -6157,6 +6157,21 @@ tree_of_thought `161.4 / 46.7 / 190.7ms`, and long_output
 `257.2 / 24.5 / 1254.0ms`. The current vLLM targets are tree
 `66.5 / 31.4 / 89.6ms` and long_output `64.4 / 16.9 / 674.0ms`.
 
+Lowering sampled-medium FP8 prefill's M threshold is rejected on the public
+stack. The focused tree run with
+`TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_FP8_PREFILL_MIN_M=64` wrote
+`agent_space/ti_tree_fp8_minm64_results/.../8xH100-local-ti-tree-fp8-minm64-20260702/runs/20260702_065057`
+and landed at `151.7 / 44.2 / 180.2ms` with `958/992` correct. A same-host
+no-env control immediately after it wrote
+`agent_space/ti_tree_control_results/.../8xH100-local-ti-tree-control-20260702/runs/20260702_065557`
+and beat the score-facing medians at `148.0 / 46.3 / 176.2ms` with `954/992`
+correct. Queue counters also did not show a defaultable mechanism: the
+`min_m=64` run kept prefill forward essentially flat (`2251.8ms` vs
+`2264.0ms`) while worsening phase time (`6066.0ms` vs `5258.5ms`), decode GPU
+time (`1492.8ms` vs `1412.4ms`), and queue-to-first p50 (`132.9ms` vs
+`126.7ms`). Keep sampled-medium FP8 prefill at `min_m=256`; the tree gap is
+still faster prefix-suffix prefill/decode, not a smaller FP8 gate.
+
 ## Priority for a focused (non-loop) session
 
 1. Prefill MFU (Issue 1) — biggest TTFT lever, ~2x, affects 3/5 benchmarks.
