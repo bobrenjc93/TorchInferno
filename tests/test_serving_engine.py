@@ -2813,6 +2813,48 @@ def test_continuous_batch_engine_records_ragged_decode_graph_captures() -> None:
     }
 
 
+def test_continuous_batch_engine_skips_native_ragged_token_graph_for_sampled_decode() -> None:
+    class _SampledRaggedGraphToyModel(_RaggedGraphToyModel):
+        def __init__(self) -> None:
+            super().__init__()
+            self.ragged_token_graph_calls = 0
+
+        def try_decode_ragged_token_graph(
+            self,
+            input_ids,
+            cache,
+            *,
+            seq_lens,
+            row_indices,
+            temperature=0.0,
+        ):
+            del input_ids, cache, seq_lens, row_indices, temperature
+            self.ragged_token_graph_calls += 1
+            raise AssertionError("sampled ragged decode should go straight to logits graphs")
+
+    model = _SampledRaggedGraphToyModel()
+    engine = ContinuousBatchEngine(
+        model,
+        device=torch.device("cpu"),
+        max_active_requests=3,
+        prefix_cache_capacity=0,
+        temperature=0.7,
+    )
+
+    engine.run(
+        [
+            ServingRequest("short", (1, 2), 3, arrival_step=0),
+            ServingRequest("medium", (3, 4, 5), 3, arrival_step=0),
+            ServingRequest("long", (6, 7, 8, 9), 3, arrival_step=0),
+        ]
+    )
+
+    assert model.ragged_token_graph_calls == 0
+    assert model.ragged_logits_graph_calls == 2
+    assert engine.stats.decode_graph_hits == 2
+    assert engine.stats.decode_graph_misses == 0
+
+
 def test_continuous_batch_engine_uses_ragged_graph_decode_for_uniform_batches(monkeypatch) -> None:
     monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_UNIFORM_RAGGED_DECODE", "1")
     model = _RaggedGraphToyModel()
@@ -3161,7 +3203,9 @@ def test_continuous_batch_engine_skips_flashinfer_decode_for_sampled_medium_defa
     assert [len(result.tokens) for result in results] == [5, 6]
     assert model.fi_graph.replay_calls == 0
     assert model.fi_wrapper.plan_calls == 0
-    assert model.ragged_token_graph_calls == 2
+    assert model.ragged_token_graph_calls == 0
+    assert model.ragged_logits_graph_calls == 2
+    assert engine.stats.decode_graph_misses == 0
     assert engine.stats.decode_graph_hits == 2
 
 
@@ -3215,7 +3259,9 @@ def test_continuous_batch_engine_can_disable_flashinfer_decode_graphs_for_sample
     assert [len(result.tokens) for result in results] == [5, 6]
     assert model.fi_graph.replay_calls == 0
     assert model.fi_wrapper.plan_calls == 0
-    assert model.ragged_token_graph_calls == 2
+    assert model.ragged_token_graph_calls == 0
+    assert model.ragged_logits_graph_calls == 2
+    assert engine.stats.decode_graph_misses == 0
     assert engine.stats.decode_graph_hits == 2
 
 

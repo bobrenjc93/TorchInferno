@@ -108,6 +108,7 @@ from torchinferno.openai_server import (
     _online_admit_min_free_rows,
     _online_collect_idle_arrivals_enabled,
     _online_decode_warmup_batch_sizes,
+    _online_decode_warmup_policy_specs,
     _online_decode_warmup_runtime_symm_mem_allreduce_enabled,
     _online_decode_first_enabled,
     _online_decode_many_allow_stop_enabled,
@@ -718,6 +719,9 @@ def test_openai_decode_warmup_excludes_prefix_cache_rows() -> None:
         2,
         3,
         4,
+        5,
+        6,
+        7,
         8,
         16,
         32,
@@ -729,6 +733,9 @@ def test_openai_decode_warmup_excludes_prefix_cache_rows() -> None:
         2,
         3,
         4,
+        5,
+        6,
+        7,
         8,
         16,
         32,
@@ -739,6 +746,9 @@ def test_openai_decode_warmup_excludes_prefix_cache_rows() -> None:
         2,
         3,
         4,
+        5,
+        6,
+        7,
         8,
         16,
         32,
@@ -766,6 +776,24 @@ def test_openai_decode_warmup_runtime_symm_mem_default_and_overrides(monkeypatch
     assert _online_decode_warmup_runtime_symm_mem_allreduce_enabled() is False
 
 
+def test_openai_decode_warmup_policy_specs_cover_sampled_no_symm_key(monkeypatch) -> None:
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE", "runtime")
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_STARTUP", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_DECODE_WARMUP", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_MAX_TEMPERATURE", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_MAX_TOKENS", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_WARMUP_ONLINE_DECODE_SAMPLED_TEMPERATURE", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_WARMUP_ONLINE_DECODE_SAMPLED_MAX_TOKENS", raising=False)
+
+    assert _online_decode_warmup_policy_specs() == ((0.0, 1), (1.0, 300))
+
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_MAX_TEMPERATURE", "1.0")
+    assert _online_decode_warmup_policy_specs() == ((0.0, 1),)
+
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_MAX_TOKENS", "128")
+    assert _online_decode_warmup_policy_specs() == ((0.0, 1), (1.0, 300))
+
+
 def test_openai_unified_scheduler_decode_warmup_uses_runtime_symm_scope(monkeypatch) -> None:
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE", "runtime")
     monkeypatch.setenv("TORCHINFERNO_OPENAI_WARMUP_ONLINE_COMMON_PREFIX_PREFILL", "0")
@@ -788,7 +816,11 @@ def test_openai_unified_scheduler_decode_warmup_uses_runtime_symm_scope(monkeypa
 
     engine._warmup_unified_scheduler_cache(vocab_size=16)
 
-    assert [kwargs["startup"] for kwargs in scope_kwargs] == [False]
+    assert [kwargs["startup"] for kwargs in scope_kwargs] == [False, False]
+    assert [(kwargs["temperature"], kwargs["max_tokens"]) for kwargs in scope_kwargs] == [
+        (0.0, 1),
+        (1.0, 300),
+    ]
 
 
 def test_openai_unified_scheduler_warmup_captures_ragged_logits_graphs(monkeypatch) -> None:
@@ -5552,6 +5584,70 @@ def test_openai_decode_next_token_ragged_prefers_token_graph(monkeypatch) -> Non
     assert returned_cache is cache
     assert model.token_graph_calls == 1
     assert model.logits_graph_calls == 0
+
+
+def test_openai_decode_next_token_ragged_skips_token_graph_for_sampled_decode(monkeypatch) -> None:
+    class _GraphModel:
+        world_size = 2
+        token_graph_calls = 0
+        logits_graph_calls = 0
+
+        def try_decode_ragged_token_graph(
+            self,
+            input_ids: torch.Tensor,
+            cache: object,
+            *,
+            seq_lens: torch.Tensor,
+            row_indices: torch.Tensor | None,
+            temperature: float,
+        ) -> torch.Tensor:
+            del input_ids, cache, seq_lens, row_indices, temperature
+            self.token_graph_calls += 1
+            raise AssertionError("sampled ragged decode should not probe token graphs")
+
+        def try_decode_ragged_logits_graph(
+            self,
+            input_ids: torch.Tensor,
+            cache: object,
+            *,
+            seq_lens: torch.Tensor,
+            row_indices: torch.Tensor | None,
+        ) -> torch.Tensor:
+            assert input_ids.tolist() == [[1]]
+            assert seq_lens.tolist() == [1]
+            assert row_indices is None
+            self.logits_graph_calls += 1
+            logits = torch.zeros(1, 1, 8)
+            logits[0, 0, 6] = 1.0
+            return logits
+
+        def decode_ragged_logits(self, *args, **kwargs):  # noqa: ANN002, ANN003
+            raise AssertionError("eager ragged decode should not run after logits graph succeeds")
+
+        def _sample_next_token(self, logits: torch.Tensor, temperature: float) -> torch.Tensor:
+            assert temperature == 0.7
+            return torch.argmax(logits, dim=-1)
+
+    model = _GraphModel()
+    monkeypatch.setattr(
+        "torchinferno.openai_server._is_tensor_parallel_model",
+        lambda candidate: candidate is model,
+    )
+    cache = object()
+
+    token, returned_cache = _decode_next_token_ragged(
+        model,
+        torch.tensor([[1]], dtype=torch.long),
+        cache,
+        torch.tensor([1], dtype=torch.long),
+        None,
+        0.7,
+    )
+
+    assert token.tolist() == [6]
+    assert returned_cache is cache
+    assert model.token_graph_calls == 0
+    assert model.logits_graph_calls == 1
 
 
 def test_openai_decode_profile_records_ragged_mode(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

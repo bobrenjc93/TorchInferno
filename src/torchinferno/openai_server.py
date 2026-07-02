@@ -133,8 +133,8 @@ def _flashinfer_prefill_warmup_batch_sizes(batch_sizes: Sequence[int]) -> tuple[
 def _online_decode_warmup_batch_sizes(*, max_active: int, cache_batch: int) -> tuple[int, ...]:
     active_limit = min(max(1, int(max_active)), max(1, int(cache_batch)))
     batch_sizes = {active_limit}
-    if active_limit >= 3:
-        batch_sizes.add(3)
+    for exact_small_batch in range(3, min(active_limit, 8) + 1):
+        batch_sizes.add(exact_small_batch)
     bucket = 1
     while bucket <= active_limit:
         batch_sizes.add(bucket)
@@ -150,6 +150,39 @@ def _online_decode_warmup_runtime_symm_mem_allreduce_enabled() -> bool:
     if startup_env in os.environ:
         return env_flag(startup_env, False)
     return _openai_tp_symm_mem_allreduce_enabled(startup=False)
+
+
+def _online_decode_warmup_policy_specs() -> tuple[tuple[float, int], ...]:
+    specs: list[tuple[float, int]] = [(0.0, 1)]
+    if not _online_decode_warmup_runtime_symm_mem_allreduce_enabled():
+        return tuple(specs)
+    sampled_temperature = env_float(
+        "TORCHINFERNO_OPENAI_WARMUP_ONLINE_DECODE_SAMPLED_TEMPERATURE",
+        1.0,
+        minimum=0.0,
+    )
+    sampled_max_tokens = env_int(
+        "TORCHINFERNO_OPENAI_WARMUP_ONLINE_DECODE_SAMPLED_MAX_TOKENS",
+        env_int(
+            "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_INITIAL_BATCH_WAIT_MAX_TOKENS",
+            300,
+            minimum=1,
+        ),
+        minimum=1,
+    )
+    symm_max_temperature = env_float(
+        "TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_MAX_TEMPERATURE",
+        0.0,
+        minimum=0.0,
+    )
+    symm_max_tokens = env_int(
+        "TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_MAX_TOKENS",
+        1024,
+        minimum=1,
+    )
+    if sampled_temperature > symm_max_temperature or sampled_max_tokens > symm_max_tokens:
+        specs.append((sampled_temperature, sampled_max_tokens))
+    return tuple(dict.fromkeys(specs))
 
 
 def _flashinfer_prefill_runtime_enabled() -> bool:
@@ -3185,42 +3218,45 @@ class OpenAICompletionEngine:
         # pow2 (e.g. 64 when max_active=128) drops that range to eager decode.
         # Prefix rows are only copied during prefill; warming cache_batch would
         # capture a 144-row decode graph under the default 128 active + 16 prefix
-        # envelope even though no decode step can use it. The three-row exact
-        # shape covers the fallback when no free active row is available to pad.
+        # envelope even though no decode step can use it. The small exact shapes
+        # cover fallbacks when no free active row is available to pad.
         batch_sizes = list(_online_decode_warmup_batch_sizes(
             max_active=max_active,
             cache_batch=cache_batch,
         ))
         decode_warmup_runtime_symm = _online_decode_warmup_runtime_symm_mem_allreduce_enabled()
-        with _tensor_parallel_symm_mem_allreduce_scope(
-            self.model,
-            self.device,
-            max_tokens=1,
-            temperature=0.0,
-            startup=not decode_warmup_runtime_symm,
-        ):
-            for bs in batch_sizes:
-                _set_generation_cache_seq_len(cache, prompt_tokens)
-                decode_input_ids = torch.zeros(bs, 1, dtype=torch.long, device=self.device)
-                row_indices = torch.arange(bs, dtype=torch.long, device=self.device)
-                seq_lens_tensor = torch.full((bs,), prompt_tokens, dtype=torch.long, device=self.device)
-                try:
-                    _try_decode_ragged_token_graph(
-                        self.model, decode_input_ids, cache, seq_lens=seq_lens_tensor,
-                        row_indices=row_indices, temperature=0.0, allow_capture=True,
-                    )
-                    _try_decode_ragged_logits_graph(
-                        self.model,
-                        decode_input_ids,
-                        cache,
-                        seq_lens=seq_lens_tensor,
-                        row_indices=row_indices,
-                        allow_capture=True,
-                    )
-                except Exception as _warmup_exc:
-                    import sys as _wsys
-                    print(f"[WARMUP] graph capture failed bs={bs}: {_warmup_exc}", file=_wsys.stderr, flush=True)
-                _reset_generation_cache(cache)
+        for warmup_temperature, warmup_max_tokens in _online_decode_warmup_policy_specs():
+            with _tensor_parallel_symm_mem_allreduce_scope(
+                self.model,
+                self.device,
+                max_tokens=warmup_max_tokens,
+                temperature=warmup_temperature,
+                startup=not decode_warmup_runtime_symm,
+            ):
+                for bs in batch_sizes:
+                    _set_generation_cache_seq_len(cache, prompt_tokens)
+                    decode_input_ids = torch.zeros(bs, 1, dtype=torch.long, device=self.device)
+                    row_indices = torch.arange(bs, dtype=torch.long, device=self.device)
+                    seq_lens_tensor = torch.full((bs,), prompt_tokens, dtype=torch.long, device=self.device)
+                    try:
+                        _try_decode_ragged_token_graph(
+                            self.model, decode_input_ids, cache, seq_lens=seq_lens_tensor,
+                            row_indices=row_indices, temperature=0.0, allow_capture=True,
+                        )
+                        _try_decode_ragged_logits_graph(
+                            self.model,
+                            decode_input_ids,
+                            cache,
+                            seq_lens=seq_lens_tensor,
+                            row_indices=row_indices,
+                            allow_capture=True,
+                        )
+                    except Exception as _warmup_exc:
+                        import sys as _wsys
+                        print(f"[WARMUP] graph capture failed bs={bs}: {_warmup_exc}", file=_wsys.stderr, flush=True)
+                    _reset_generation_cache(cache)
+            if (warmup_temperature, warmup_max_tokens) != (0.0, 1):
+                continue
             if env_flag("TORCHINFERNO_OPENAI_WARMUP_ONLINE_COMMON_PREFIX_PREFILL", True):
                 common_prefix_rows = _online_common_prefix_prefill_warmup_rows(cache_batch, max_active)
                 common_prefix_tokens = _online_common_prefix_prefill_warmup_tokens(max_seq_len)
@@ -14415,6 +14451,8 @@ def _try_decode_ragged_token_graph(
         "_torchinferno_ephemeral_ragged_graph_scope",
         False,
     ):
+        return None
+    if temperature > 0.0:
         return None
     if not _openai_ragged_decode_graph_enabled(model):
         return None

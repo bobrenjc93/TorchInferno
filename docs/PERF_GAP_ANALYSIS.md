@@ -93,7 +93,7 @@ A narrower decode-warmup default did reproduce. On the patched run
 the server still auto-probed to `runtime` scope and reached readiness in
 `200.9s`, but online decode graph warmup captured under the same runtime
 symmetric-memory scope used by requests and also warmed the observed exact
-three-row decode shape. The long_output row improved to
+small fallback decode shapes. The long_output row improved to
 `240.9 / 25.1 / 1206.5ms`, with p99 TTFT/TPOT/E2E at
 `1398.6 / 100.3 / 2123.3ms`, and correctness stayed `1000/1000`. The queue
 profile confirms the mechanism: request-path decode graph captures fell to
@@ -118,6 +118,44 @@ work: prefill wall/forward rose to `6.67/5.74s`, decode GPU rose to `9.72s`,
 decode-many work rose to `141` calls / `358` steps / `21,708` model tokens, and
 phase time rose to `19.75s`. Keep greedy-short initial wait at `0ms`; the
 remaining long_output gap is not the first-wave collection window.
+
+A sampled decode warmup extension is accepted for tree_of_thought. The
+post-symm full TorchInferno sweep
+`agent_space/ti_full_postsymm_results/.../8xH100-local-ti-full-postsymm-20260702/runs/20260702_031542`
+still had tree request-path decode captures because startup warmed the
+deterministic symmetric-memory graph key, while sampled tree requests run with
+the no-symm graph key under the temperature gate. Tree landed at
+`152.5 / 46.0 / 183.2ms`, p99 TTFT/TPOT/E2E
+`1327.8 / 366.6 / 1355.2ms`, with `43` decode misses, `6` live captures, and
+`1.85s` capture wall. Warming the sampled no-symm decode policy moved those
+captures to startup: focused tree reruns wrote
+`agent_space/ti_tree_sampled_decode_warmup_results/.../runs/20260702_032721`
+and
+`agent_space/ti_tree_sampled_decode_warmup2_results/.../runs/20260702_033526`.
+They kept captures at `0` and p99 E2E at `844-892ms`; the second run also
+dropped sampled token-graph fallthrough misses from `34` to `2` by skipping the
+native token graph for `temperature > 0` after the FlashInfer sampled path has
+had a chance to serve. Median rows were noisy (`151.8 / 43.7 / 180.5ms` then
+`151.4 / 49.0 / 183.1ms`), so this is primarily a tail/capture fix rather than
+a new score flip, but it removes a real request-path stall without adding a
+benchmark-specific policy.
+
+The final local TorchInferno-only sweep with the sampled decode warmup wrote
+`agent_space/ti_full_sampled_decode_warmup_results/.../8xH100-local-ti-full-sampled-decode-warmup-20260702/runs/20260702_034226`
+and stayed in-family on all rows: few_shot `169.6 / 48.7 / 209.7ms`,
+self_consistency `180.1 / 0.0 / 197.7ms`, multi_turn
+`304.8 / 59.2 / 359.0ms`, tree `150.9 / 52.5 / 181.8ms`, and long_output
+`256.7 / 25.0 / 1177.0ms`. Tree p99 TTFT/TPOT/E2E moved to
+`430.1 / 137.8 / 486.5ms` with `0` decode captures and `0` misses; long_output
+also stayed at `0` decode captures. That sweep exposed one deterministic
+few_shot `b5` token-graph capture (`602ms` capture wall), so the online decode
+warmup now covers exact small batches through `8`, not only powers of two plus
+`3`. The focused few_shot validation
+`agent_space/ti_few_small_decode_warmup_results/.../runs/20260702_034924`
+reached readiness in `210.9s`, kept correctness at `977/1000`, and removed the
+request-path decode capture (`0` misses, `0` captures, `0.0ms` capture wall).
+This adds modest startup work but closes another cold request tail without
+changing runtime admission or decode bucketing.
 
 ## Prior 20260701 refresh and local vLLM/SGLang checks
 

@@ -4991,6 +4991,8 @@ class ContinuousBatchEngine:
                 last_logits = s_logits[:batch, -1, :]
                 self._last_ragged_decode_logits = last_logits
                 return self._sample_logits_with_temperature(last_logits, sampling_temperature)
+        if sampling_temperature > 0.0:
+            return None
         decode_graph = getattr(self.model, "try_decode_ragged_token_graph", None)
         if decode_graph is None:
             return None
