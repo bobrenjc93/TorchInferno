@@ -86,6 +86,19 @@ batches. That keeps tree medians in the current band and slightly improves
 TTFT/E2E versus the public row, but it is not a TPOT win and does not change
 the remaining diagnosis.
 
+A follow-up TorchInferno-only full run on pushed `8d0093b` wrote
+`agent_space/ti_8d0093b_full_results/.../runs/20260702_151031`. Rows as
+TTFT / TPOT / E2E were: few_shot `171.1 / 46.6 / 210.3ms`,
+self_consistency `154.2 / 0.0 / 185.5ms`, multi_turn
+`314.1 / 62.4 / 367.8ms`, tree_of_thought `154.0 / 47.4 / 189.6ms`, and
+long_output `257.8 / 25.2 / 1302.2ms`. Correctness stayed in family:
+`977/1000`, `1000/1000`, `980/1000`, `956/992`, and `1000/1000`. The
+long_output queue profile still shows the unchanged bottleneck:
+`7.16s` prefill wall (`6.19s` forward), `9.88s` ragged decode GPU, `717`
+decode batches, and `153` decode-many calls. This run keeps the row-adoption
+change validated across all public benchmark shapes, but it does not reopen the
+rejected long_output scheduling knobs.
+
 ## Public 20260702_095238 refresh and sampled-medium active-cap lower bound
 
 The latest public all-provider run at
