@@ -5633,6 +5633,8 @@ class OpenAICompletionEngine:
             "decode_graph_capture_shape_counts",
             "decode_graph_miss_shape_counts",
             "decode_shape_counts",
+            "prefill_shape_active_requests",
+            "prefill_shape_model_rows",
             "prefill_shape_active_tokens",
             "prefill_shape_model_tokens",
             "decode_many_shape_model_tokens",

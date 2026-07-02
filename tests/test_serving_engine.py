@@ -1744,6 +1744,8 @@ def test_continuous_batch_engine_records_profile_shape_counts() -> None:
     assert prefix_shape in engine.stats.prefill_shape_forward_ms
     assert prefix_shape in engine.stats.prefill_shape_sample_ms
     assert prefix_shape in engine.stats.prefill_shape_state_ms
+    assert engine.stats.prefill_shape_active_requests[prefix_shape] == 3
+    assert engine.stats.prefill_shape_model_rows[prefix_shape] == 4
     assert engine.stats.prefill_shape_active_tokens[prefix_shape] == 6
     assert engine.stats.prefill_shape_model_tokens[prefix_shape] == 16
     assert any(key.startswith("ragged:b3/") for key in engine.stats.decode_shape_counts)
@@ -2000,6 +2002,12 @@ def test_continuous_batch_engine_can_split_prefix_graph_by_suffix_bucket(monkeyp
     assert engine.stats.prefill_shape_active_tokens[
         "prefix_graph:b2:s4:p16-16:src1:mixed0"
     ] == 3
+    assert engine.stats.prefill_shape_active_requests[
+        "prefix_graph:b2:s4:p16-16:src1:mixed0"
+    ] == 2
+    assert engine.stats.prefill_shape_model_rows[
+        "prefix_graph:b2:s4:p16-16:src1:mixed0"
+    ] == 2
     assert engine.stats.prefill_shape_model_tokens[
         "prefix_graph:b2:s4:p16-16:src1:mixed0"
     ] == 8

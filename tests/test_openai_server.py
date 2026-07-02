@@ -13311,6 +13311,12 @@ def test_openai_queue_profile_records_runtime_engine_stats(
         prefill_shape_state_ms = {
             "prefix_graph:b8:s16:p45-45:src1:mixed0": 0.5,
         }
+        prefill_shape_active_requests = {
+            "prefix_graph:b8:s16:p45-45:src1:mixed0": 3,
+        }
+        prefill_shape_model_rows = {
+            "prefix_graph:b8:s16:p45-45:src1:mixed0": 4,
+        }
         prefill_shape_active_tokens = {
             "prefix_graph:b8:s16:p45-45:src1:mixed0": 31,
         }
@@ -13412,6 +13418,12 @@ def test_openai_queue_profile_records_runtime_engine_stats(
             },
             "runtime_prefill_shape_state_ms": {
                 "prefix_graph:b8:s16:p45-45:src1:mixed0": 0.5,
+            },
+            "runtime_prefill_shape_active_requests": {
+                "prefix_graph:b8:s16:p45-45:src1:mixed0": 3,
+            },
+            "runtime_prefill_shape_model_rows": {
+                "prefix_graph:b8:s16:p45-45:src1:mixed0": 4,
             },
             "runtime_prefill_shape_active_tokens": {
                 "prefix_graph:b8:s16:p45-45:src1:mixed0": 31,

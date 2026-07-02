@@ -270,6 +270,8 @@ class ServingStats:
     prefill_shape_forward_ms: dict[str, float] = field(default_factory=dict)
     prefill_shape_sample_ms: dict[str, float] = field(default_factory=dict)
     prefill_shape_state_ms: dict[str, float] = field(default_factory=dict)
+    prefill_shape_active_requests: dict[str, int] = field(default_factory=dict)
+    prefill_shape_model_rows: dict[str, int] = field(default_factory=dict)
     prefill_shape_active_tokens: dict[str, int] = field(default_factory=dict)
     prefill_shape_model_tokens: dict[str, int] = field(default_factory=dict)
     decode_ragged_prepare_ms: float = 0.0
@@ -2179,6 +2181,16 @@ class ContinuousBatchEngine:
                     self._release_active_row(row)
                 return None
             self._record_model_call("prefill", count, tokens=count * max(suffix_lengths))
+            self._record_shape_total(
+                self.stats.prefill_shape_active_requests,
+                shape_key,
+                count,
+            )
+            self._record_shape_total(
+                self.stats.prefill_shape_model_rows,
+                shape_key,
+                int(input_ids.size(0)),
+            )
             self._record_shape_total(
                 self.stats.prefill_shape_active_tokens,
                 shape_key,

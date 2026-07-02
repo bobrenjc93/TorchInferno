@@ -114,6 +114,20 @@ bucket, and model tokens only moved from `20,784` to `20,736`. Keep this as a
 diagnostic for workloads with mixed suffix buckets, not a sampled-medium tree
 default.
 
+The same row-counter profiling now explains why suffix-bucket splitting also
+cannot be promoted for multi_turn. The focused control
+`agent_space/ti_multi_row_phase_results/.../runs/20260702_223534` landed at
+`304.3 / 62.5 / 364.2ms`, `983/1000` correct. Its prefix-graph prefill work
+ran `69,574` active suffix tokens inside `97,408` graph tokens; estimated waste
+was mostly suffix padding (`22.8K` tokens) rather than row padding (`5.0K`
+tokens). Enabling `TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SPLIT_SUFFIX_BUCKETS=1`
+for `agent_space/ti_multi_suffix_split_results/.../runs/20260702_224117`
+reduced suffix padding to `7.0K`, but row padding jumped to `27.3K`, prefill
+batches rose `35 -> 68`, prefill forward rose `4.03s -> 4.92s`, and the score
+row regressed to `374.8 / 63.0 / 425.0ms`, `982/1000` correct. Keep the split
+as an opt-in diagnostic only; multi_turn still needs longer conversation-prefix
+reuse or a non-fragmenting mixed-prefix suffix path.
+
 A narrower decode-many-while-waiting policy is also rejected and not in source.
 The temporary patch allowed decode-many only while the ready queue was below the
 same refill floor that would admit the next prefill wave, trying to reduce
