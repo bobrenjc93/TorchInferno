@@ -34,6 +34,26 @@ and pushed queue-to-first p50 to `282.3ms`. Keep sampled-medium max-active at
 `32`; both lowering and prior higher-row probes lose through fragmentation,
 tail, or startup/warmup cost.
 
+Narrowing sampled common-prefix suffix buckets to `12,16` is also not
+defaultable. The cold env-only run
+`agent_space/ti_tree_s12_results/.../runs/20260702_124224` did switch tree
+prefix reuse from `s16` to `s12`, but captured six prefill graphs on the request
+path, raising p99 TTFT/E2E to `2807/2880ms` and prefill wall/forward to
+`7.69/7.04s`. A fair rerun with
+`TORCHINFERNO_OPENAI_WARMUP_ONLINE_SAMPLED_COMMON_PREFIX_SUFFIX_TOKENS=12,16`
+prewarmed those graphs and wrote
+`agent_space/ti_tree_s12_warm_results/.../runs/20260702_124643`; it landed at
+`140.7 / 54.0 / 174.7ms`, `954/992` correct, with zero runtime prefill captures.
+The same-host current-default control
+`agent_space/ti_tree_default_control_results/.../runs/20260702_125045` landed at
+`152.7 / 48.7 / 184.8ms`, `958/992` correct. The warmed `s12` run improved
+median TTFT/E2E but worsened TPOT, and the queue counters do not show a real
+prefill kernel win: `s12` prefill forward/wall was `2.14/2.78s` versus the
+control `s16` `2.12/2.87s`, with the hot `b32` graph still around `1.40s`.
+Keep the sampled suffix bucket default at the graph-warmed `16` shape unless a
+broader prefix-suffix prefill implementation reduces the actual per-call GPU
+work.
+
 ## Current 20260702 full same-host provider refresh
 
 The current same-host all-provider run used inference-bench with skipped builds
