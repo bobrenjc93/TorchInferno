@@ -2772,6 +2772,10 @@ def test_continuous_batch_engine_prefix_prefill_capture_on_miss_policy(
     monkeypatch,
 ) -> None:
     monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_CAPTURE_ON_MISS", raising=False)
+    monkeypatch.delenv(
+        "TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SPLIT_ON_CAPTURE_SKIP_BATCH",
+        raising=False,
+    )
     engine = ContinuousBatchEngine(
         _RaggedGraphToyModel(),
         device=torch.device("cpu"),
@@ -2790,11 +2794,58 @@ def test_continuous_batch_engine_prefix_prefill_capture_on_miss_policy(
     assert engine._prefix_prefill_capture_on_miss(32)
     assert not engine._prefix_prefill_capture_on_miss(64)
     assert sampled_engine._prefix_prefill_capture_on_miss(64)
+    assert engine._prefix_prefill_split_on_capture_skip_batch(32) == 0
+    assert engine._prefix_prefill_split_on_capture_skip_batch(64) == 32
+    assert sampled_engine._prefix_prefill_split_on_capture_skip_batch(64) == 0
 
     monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_CAPTURE_ON_MISS", "1")
     assert engine._prefix_prefill_capture_on_miss(64)
+    assert engine._prefix_prefill_split_on_capture_skip_batch(64) == 0
     monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_CAPTURE_ON_MISS", "0")
     assert not sampled_engine._prefix_prefill_capture_on_miss(1)
+    monkeypatch.setenv(
+        "TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SPLIT_ON_CAPTURE_SKIP_BATCH",
+        "16",
+    )
+    assert engine._prefix_prefill_split_on_capture_skip_batch(64) == 16
+
+
+def test_continuous_batch_engine_splits_reused_large_prefix_prefill_capture_skip(
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_CAPTURE_ON_MISS", raising=False)
+    monkeypatch.delenv(
+        "TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SPLIT_ON_CAPTURE_SKIP_BATCH",
+        raising=False,
+    )
+    shared = tuple(range(16))
+    model = _SelectedLogitsToyModel(vocab_size=256)
+    engine = ContinuousBatchEngine(
+        model,
+        device=torch.device("cpu"),
+        temperature=0.0,
+        max_active_requests=64,
+        prefix_cache_capacity=64,
+        pin_shared_prefix=True,
+        graph_prefill=True,
+        max_generation_tokens=96,
+        store_full_prompt_prefixes=False,
+    )
+    requests = [
+        ServingRequest("warm-a", (*shared, 21), 2, arrival_step=0),
+        ServingRequest("warm-b", (*shared, 22), 2, arrival_step=0),
+        *[
+            ServingRequest(f"late-{index}", (*shared, 100 + index), 1, arrival_step=1)
+            for index in range(33)
+        ],
+    ]
+
+    results = engine.run(requests)
+
+    assert [result.prefix_hit_tokens for result in results[2:]] == [16] * 33
+    assert model.prefill_capture_flags[-2:] == [True, True]
+    assert [shape[0] for shape in model.prefill_input_shapes[-2:]] == [32, 1]
+    assert engine.stats.prefill_graph_misses == 0
 
 
 def test_continuous_batch_engine_clears_external_cache_capture_skip() -> None:

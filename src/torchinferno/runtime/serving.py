@@ -1884,6 +1884,27 @@ class ContinuousBatchEngine:
                 return int(batch_bucket) <= max_capture_batch
         return True
 
+    def _prefix_prefill_split_on_capture_skip_batch(self, batch_bucket: int) -> int:
+        env_name = "TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SPLIT_ON_CAPTURE_SKIP_BATCH"
+        if env_name in os.environ:
+            return env_int(env_name, 0, minimum=0)
+        if self._prefix_prefill_capture_on_miss(batch_bucket):
+            return 0
+        max_tokens = self.max_generation_tokens
+        if self.temperature <= 0.0 and max_tokens is not None:
+            greedy_short_max_tokens = env_int(
+                "TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_CAPTURE_GREEDY_SHORT_MAX_TOKENS",
+                128,
+                minimum=1,
+            )
+            if 0 < int(max_tokens) <= greedy_short_max_tokens:
+                return env_int(
+                    "TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_CAPTURE_GREEDY_SHORT_MAX_BATCH",
+                    32,
+                    minimum=0,
+                )
+        return 0
+
     def _suffix_bucket(self, length: int) -> int:
         configured_buckets = _parse_positive_int_csv(
             os.environ.get("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SUFFIX_BUCKETS")
@@ -2226,11 +2247,28 @@ class ContinuousBatchEngine:
         *,
         events: list[ServingTokenEvent] | None = None,
     ) -> list[_ActiveRequest]:
+        suffix_lengths = [
+            len(request.prompt) - prefix_hit_tokens
+            for _index, request, prefix_hit_tokens, _reusable in group
+        ]
+        if self.graph_prefill and suffix_lengths and max(suffix_lengths) > 0:
+            batch_bucket = self._prefill_batch_bucket(len(group))
+            split_batch = self._prefix_prefill_split_on_capture_skip_batch(batch_bucket)
+            if 0 < split_batch < len(group):
+                active: list[_ActiveRequest] = []
+                for start in range(0, len(group), split_batch):
+                    active.extend(
+                        self._prefill_prefix_batch(
+                            group[start : start + split_batch],
+                            step,
+                            events=events,
+                        )
+                    )
+                return active
         if self.graph_prefill:
             graph_active = self._prefill_prefix_graph_batch(group, step, events=events)
             if graph_active is not None:
                 return graph_active
-        suffix_lengths = [len(request.prompt) - prefix_hit_tokens for _index, request, prefix_hit_tokens, _reusable in group]
         if events is not None and suffix_lengths and max(suffix_lengths) == 0:
             return self._prefill_exact_prefix_batch(group, step, events=events)
         if len(set(suffix_lengths)) > 1:

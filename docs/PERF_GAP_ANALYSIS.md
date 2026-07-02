@@ -88,6 +88,23 @@ landed at `183.8 / 27.2 / 1199.8ms` with p99 TTFT/E2E `1688/2476ms`. Keep the
 existing waiting-decode diagnostics closed; long_output still needs a real
 prefill/decode pipeline rather than a decode-burst admission heuristic.
 
+Splitting only uncaptured greedy-short prefix-prefill compute is accepted as a
+narrow long_output fix. Public `20260702_140923` spent almost `1s` in two
+`b64:s64` prefix-suffix prefill calls that could not be captured because the
+greedy-short capture policy intentionally stops at batch `32`; limiting
+admission to `32` had already been rejected because it fragmented decode. The
+accepted path keeps the outer admission wave at `64` but splits only the prefix
+prefill compute into warmed capture-eligible chunks when capture-on-miss would
+otherwise be skipped. On the same checkout, the split-off control
+`agent_space/ti_long_splitoff_control_results/.../runs/20260702_180006` landed
+at `272.1 / 25.2 / 1253.3ms` with p99 TTFT/E2E `1582.8/2419.7ms` and one
+`b64:s64` prefix graph miss. The split run
+`agent_space/ti_long_split_b64_results/.../runs/20260702_175325` landed at
+`231.9 / 25.2 / 1188.9ms`, p99 TTFT/E2E `1157.8/2142.1ms`, `1000/1000`
+correct, and zero prefill graph misses. Queue profile improved from `6.86s` to
+`6.51s` prefill wall, `10.45s` to `10.05s` ragged decode GPU, and
+queue-to-first p99 from `1276ms` to `839ms`.
+
 Common-prefix row adoption is kept as a lifecycle/correctness fix, not as a
 new scheduling knob. The old common-prefix path computed the shared prefix in
 one prefix row, then tried to acquire a second prefix row just to store a
