@@ -146,6 +146,22 @@ decode graph captures, so the residual tree miss in this run was a static
 fallback shape rather than ragged decode warmup coverage. Keep treating tree as
 sampled-prefix/suffix prefill and steady decode bound.
 
+A current-head focused multi_turn profile on pushed `325cdf4` wrote
+`agent_space/ti_multi_325cdf4_results/.../runs/20260702_192513` and landed at
+`303.1 / 61.8 / 361.8ms`, `983/1000` correct. The new miss-shape field stayed
+empty because decode graph hits/misses were `86/0`; the row remains admission
+and prefix-suffix prefill bound. The queue profile admitted all `1000` requests
+through `34` prefill graph hits, reused only the shared `45` token prefix
+(`{"common_prefix":1000}`), and spent `3.82s` in prefill forward, `4.29s` in
+prefill wall, and `0.79s` in ragged decode GPU. Public raw multi_turn per-turn
+medians show why this is still a queue-facing gap: vLLM turn-0 TTFT was `172ms`
+and SGLang `70.8ms`, while the focused TorchInferno run had turn-0 median
+`618.4ms` as the 64-worker conversation harness waited for later conversations
+to enter the queue. This does not reopen the rejected greedy-large first-wait,
+active-row, generated-prefix, or full-prompt reuse knobs; the remaining win still
+needs TP-safe per-conversation prefix reuse or a cheaper batched non-common
+prefix path.
+
 Common-prefix row adoption is kept as a lifecycle/correctness fix, not as a
 new scheduling knob. The old common-prefix path computed the shared prefix in
 one prefix row, then tried to acquire a second prefix row just to store a
