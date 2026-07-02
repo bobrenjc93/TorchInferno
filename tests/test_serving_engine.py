@@ -1006,6 +1006,48 @@ def test_continuous_batch_engine_preferred_prefix_rows_can_be_overridden(monkeyp
     assert engine._acquire_prefix_row() == 10
 
 
+def test_continuous_batch_engine_can_skip_active_row_clear_on_acquire(monkeypatch) -> None:
+    monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_SKIP_ACTIVE_ROW_CLEAR", raising=False)
+    engine = ContinuousBatchEngine(
+        _RaggedGraphToyModel(),
+        device=torch.device("cpu"),
+        max_active_requests=1,
+        prefix_cache_capacity=0,
+    )
+    engine.start_online(max_seq_len=8)
+    assert isinstance(engine._cache, _ToyCache)
+    engine._cache._seq_lens[0] = 5
+    engine._row_seq_lens[0] = 5
+
+    clear_calls = 0
+    original_clear = engine._clear_physical_row
+
+    def count_clear(row: int) -> None:
+        nonlocal clear_calls
+        clear_calls += 1
+        original_clear(row)
+
+    engine._clear_physical_row = count_clear  # type: ignore[method-assign]
+    row = engine._acquire_active_row()
+
+    assert row == 0
+    assert clear_calls == 1
+    assert engine._cache._seq_lens[0] == 0
+
+    engine._release_active_row(row)
+    engine._cache._seq_lens[0] = 7
+    engine._row_seq_lens[0] = 7
+    clear_calls = 0
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_SKIP_ACTIVE_ROW_CLEAR", "1")
+
+    row = engine._acquire_active_row()
+
+    assert row == 0
+    assert clear_calls == 0
+    assert engine._cache._seq_lens[0] == 0
+    assert engine._row_seq_lens[0] == 0
+
+
 def test_continuous_batch_engine_can_opt_in_full_prompt_store_while_pinned(monkeypatch) -> None:
     monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PINNED_FULL_PROMPT_STORE_MIN_MAX_TOKENS", "2")
     monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_NON_COMMON_PREFIX_GRAPH_PREFILL", "1")

@@ -47,6 +47,30 @@ prefix-suffix prefill/decode, and long_output needs a decode/prefill policy that
 improves medians without reintroducing the rejected waiting-decode tail
 regression.
 
+Two focused follow-ups on the same checkout are rejected as defaults. Extending
+the sampled-medium idle window to `750ms` merged tree_of_thought into one online
+batcher session
+(`agent_space/ti_tree_idle750_results/.../runs/20260702_143454`), but only moved
+the row to `154.7 / 67.5 / 186.4ms`, `961/992` correct. The profile did reduce
+prefill wall versus the current full-run control (`3.08s` to `2.82s`) and merge
+the two public-shaped tree waves into one session, but total phase time was
+still `5.67s` and it gave back most of the TPOT cushion that currently wins
+TorchInferno's tree cell. Keep the sampled-medium idle window at the narrower
+default.
+
+Skipping active-row KV zeroing on acquire is now available only as the opt-in
+diagnostic `TORCHINFERNO_CONTINUOUS_SKIP_ACTIVE_ROW_CLEAR=1`; it should not be
+promoted. The tree run
+`agent_space/ti_tree_skipclear_results/.../runs/20260702_144429` landed at
+`150.9 / 87.5 / 180.5ms`, `957/992` correct. It cut tree prefill wall from the
+current full-run control's `3.08s` to `2.51s` and queue p99 first-token/finish
+to `304/395ms`, but median TPOT lost the vLLM/SGLang cell. The long_output run
+`agent_space/ti_long_skipclear_results/.../runs/20260702_144935` was also not a
+score win at `271.0 / 24.9 / 1256.2ms`, `1000/1000` correct; prefill wall was
+`6.78s`, decode GPU was `10.27s`, and queue finish p50 stayed high at
+`1172ms`. Active-row clears are measurable overhead, but removing them is not a
+safe default path to the remaining median gaps.
+
 ## Public 20260702_095238 refresh and sampled-medium active-cap lower bound
 
 The latest public all-provider run at

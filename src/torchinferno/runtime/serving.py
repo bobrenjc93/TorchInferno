@@ -4167,15 +4167,21 @@ class ContinuousBatchEngine:
         if not self._free_active_rows:
             raise RuntimeError("no active serving rows available")
         row = self._free_active_rows.pop()
-        self._clear_physical_row(row)
+        self._reset_active_row_for_acquire(row)
         return row
 
     def _acquire_active_row_or_none(self) -> int | None:
         if not self._free_active_rows:
             return None
         row = self._free_active_rows.pop()
-        self._clear_physical_row(row)
+        self._reset_active_row_for_acquire(row)
         return row
+
+    def _reset_active_row_for_acquire(self, row: int) -> None:
+        if env_flag("TORCHINFERNO_CONTINUOUS_SKIP_ACTIVE_ROW_CLEAR", False):
+            self._set_cache_row_seq_len(row, 0)
+            return
+        self._clear_physical_row(row)
 
     def _acquire_free_prefix_row_or_none(self) -> int | None:
         if self.prefix_cache_capacity == 0 or not self._free_prefix_rows:
