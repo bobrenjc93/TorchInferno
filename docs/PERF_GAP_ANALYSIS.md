@@ -6250,6 +6250,21 @@ deterministic `400 < max_tokens <= 512` policy. Keep the active cap at `8` and
 leave greedy short, greedy mid, sampled short, sampled medium, and global
 prefill/decode ordering unchanged.
 
+Forcing prefill-cost admission priority on sampled-medium tree traffic is
+rejected. The profiled env run with
+`TORCHINFERNO_CONTINUOUS_ADMIT_PREFILL_COST_PRIORITY=1` wrote
+`agent_space/ti_tree_prefillcost_results/.../8xH100-local-ti-tree-prefillcost-20260702/runs/20260702_082319`
+and looked borderline useful at `147.2 / 32.1 / 171.5ms`, `957/992` correct.
+The counters did not show the intended mechanism: prefill forward was flat
+against the adjacent tree control (`2264.0ms` to `2270.4ms`), decode GPU rose
+(`1412.4ms` to `1483.8ms`), runtime steps rose (`104` to `106`), and queue
+finish p99 worsened (`513.6ms` to `554.3ms`). The no-profile confirmation
+`agent_space/ti_tree_prefillcost_np_results/.../8xH100-local-ti-tree-prefillcost-np-20260702/runs/20260702_083020`
+then landed at `143.9 / 52.2 / 176.6ms`, `963/992` correct, so the profiled
+TPOT movement was not reproducible as a default tree win. Keep prefill-cost
+priority scoped to greedy-short traffic unless a sampled-medium rerun shows a
+real reduction in prefill/decode work.
+
 ## Priority for a focused (non-loop) session
 
 1. Prefill MFU (Issue 1) — biggest TTFT lever, ~2x, affects 3/5 benchmarks.
