@@ -6062,6 +6062,11 @@ queue-to-first p99 `519.7ms`. Promote `1ms` only for `temperature > 0`,
 and long-output sessions keep their existing admission behavior. This is a
 median scheduling cleanup, not a tail fix or vLLM-gap closure: sampled-medium
 suffix prefill and ordinary ragged decode remain the larger tree bottlenecks.
+A pushed `5137a36` TorchInferno-only full-suite guard kept the expected scope:
+few_shot `169.6 / 50.2 / 211.8ms`, self `204.2 / 0.0 / 217.8ms`, multi
+`317.7 / 65.5 / 376.9ms`, tree `152.7 / 54.9 / 186.7ms`, and long_output
+`266.1 / 24.6 / 1312.7ms`; tree queue-to-first p50/p99 was
+`128.9/425.7ms`.
 
 Short-greedy common-prefix suffix buckets now include `96` for deterministic
 `max_tokens <= 128` sessions. The prior default jumped directly from suffix
