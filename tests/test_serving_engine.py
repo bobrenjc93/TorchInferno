@@ -1743,6 +1743,41 @@ def test_continuous_batch_engine_records_profile_shape_counts() -> None:
     assert any(key.startswith("ragged:b3/") for key in engine.stats.decode_shape_counts)
 
 
+def test_continuous_batch_engine_skips_active_row_clear_for_prefix_graph_batch(
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_SKIP_ACTIVE_ROW_CLEAR", raising=False)
+    shared = tuple(range(16))
+    model = _SelectedLogitsToyModel()
+    engine = ContinuousBatchEngine(
+        model,
+        device=torch.device("cpu"),
+        max_active_requests=4,
+        prefix_cache_capacity=4,
+        graph_prefill=True,
+    )
+    clear_calls: list[int] = []
+    original_clear = engine._clear_physical_row
+
+    def count_clear(row: int) -> None:
+        clear_calls.append(row)
+        original_clear(row)
+
+    engine._clear_physical_row = count_clear  # type: ignore[method-assign]
+    requests = [
+        ServingRequest("a", (*shared, 21), 1, arrival_step=0),
+        ServingRequest("b", (*shared, 22, 23, 24), 1, arrival_step=0),
+        ServingRequest("c", (*shared, 25, 26), 1, arrival_step=0),
+    ]
+
+    results = engine.run(requests)
+
+    assert [result.tokens[-1] for result in results] == [22, 25, 27]
+    assert engine.stats.prefill_prefix_reuse_batches == 1
+    assert any(rows is not None for rows in model.prefill_src_prefix_rows)
+    assert clear_calls == []
+
+
 def test_continuous_batch_engine_uses_prefix_rows_for_graph_padding_when_active_rows_full() -> None:
     shared = tuple(range(16))
     model = _SelectedLogitsToyModel()

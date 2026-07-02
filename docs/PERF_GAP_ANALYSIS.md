@@ -71,6 +71,26 @@ score win at `271.0 / 24.9 / 1256.2ms`, `1000/1000` correct; prefill wall was
 `1172ms`. Active-row clears are measurable overhead, but removing them is not a
 safe default path to the remaining median gaps.
 
+A narrower active-row clear skip is accepted only for folded prefix-graph
+prefill rows. Unlike the rejected global diagnostic above, this path is limited
+to dense-cache `_prefill_prefix_graph_batch` rows whose copied prefix and suffix
+KV are written inside the ragged prefill graph before attention slices
+`context_len`; all other active-row acquisition still uses the normal clear
+path. The focused tree run
+`agent_space/ti_prefix_graph_noclear_results/.../runs/20260702_212204` landed at
+`150.8 / 29.6 / 174.3ms`, `957/992` correct. Versus the pushed f7 tree profile,
+prefix-copy accounting fell from `40.5ms` to `11.2ms`, prefill wall fell from
+`3.01s` to `2.72s`, and queue p99 first-token/finish improved from
+`388/473ms` to `310/355ms`; median TTFT was slightly worse, so this is not a
+front-door TTFT fix. The matching long_output run
+`agent_space/ti_prefix_graph_noclear_long_results/.../runs/20260702_212735`
+landed at `282.6 / 24.0 / 1105.4ms`, `1000/1000` correct. Versus the q8 drain
+profile, prefix-copy accounting fell from `98.2ms` to `9.7ms`, prefill wall
+fell from `6.05s` to `5.64s`, queue p99 first-token improved from `790ms` to
+`497ms`, and queue finish p50 improved from `1033ms` to `1015ms`; queue finish
+p99 was roughly flat-to-slightly worse (`1863ms` to `1902ms`). Keep this as a
+scoped prefill-tail reduction, not a replacement for the remaining TTFT work.
+
 A narrower decode-many-while-waiting policy is also rejected and not in source.
 The temporary patch allowed decode-many only while the ready queue was below the
 same refill floor that would admit the next prefill wave, trying to reduce

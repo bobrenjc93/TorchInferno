@@ -1980,7 +1980,8 @@ class ContinuousBatchEngine:
         )
         count = len(group)
         batch_bucket = self._prefill_batch_bucket(count)
-        rows = [self._acquire_active_row() for _ in group]
+        skip_active_row_clear = self._can_skip_prefix_graph_active_row_clear()
+        rows = [self._acquire_active_row(clear_cache=not skip_active_row_clear) for _ in group]
         pad_rows: list[int] = []
         pad_prefix_rows: list[int] = []
         try:
@@ -2003,7 +2004,7 @@ class ContinuousBatchEngine:
             if batch_bucket > count:
                 dummy_suffix = padded_suffixes[0]
                 for _ in range(batch_bucket - count):
-                    pad_row = self._acquire_active_row_or_none()
+                    pad_row = self._acquire_active_row_or_none(clear_cache=not skip_active_row_clear)
                     if pad_row is None:
                         prefix_pad_row = self._acquire_free_prefix_row_or_none()
                         if prefix_pad_row is None:
@@ -4308,25 +4309,29 @@ class ContinuousBatchEngine:
         except Exception:
             return False
 
-    def _acquire_active_row(self) -> int:
+    def _acquire_active_row(self, *, clear_cache: bool = True) -> int:
         if not self._free_active_rows:
             raise RuntimeError("no active serving rows available")
         row = self._free_active_rows.pop()
-        self._reset_active_row_for_acquire(row)
+        self._reset_active_row_for_acquire(row, clear_cache=clear_cache)
         return row
 
-    def _acquire_active_row_or_none(self) -> int | None:
+    def _acquire_active_row_or_none(self, *, clear_cache: bool = True) -> int | None:
         if not self._free_active_rows:
             return None
         row = self._free_active_rows.pop()
-        self._reset_active_row_for_acquire(row)
+        self._reset_active_row_for_acquire(row, clear_cache=clear_cache)
         return row
 
-    def _reset_active_row_for_acquire(self, row: int) -> None:
-        if env_flag("TORCHINFERNO_CONTINUOUS_SKIP_ACTIVE_ROW_CLEAR", False):
+    def _reset_active_row_for_acquire(self, row: int, *, clear_cache: bool = True) -> None:
+        if not clear_cache or env_flag("TORCHINFERNO_CONTINUOUS_SKIP_ACTIVE_ROW_CLEAR", False):
             self._set_cache_row_seq_len(row, 0)
             return
         self._clear_physical_row(row)
+
+    def _can_skip_prefix_graph_active_row_clear(self) -> bool:
+        cache = self._require_cache()
+        return getattr(cache, "cache_backend", self.cache_backend) == "dense"
 
     def _acquire_free_prefix_row_or_none(self) -> int | None:
         if self.prefix_cache_capacity == 0 or not self._free_prefix_rows:
