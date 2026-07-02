@@ -3602,6 +3602,7 @@ class Llama3TensorParallelForCausalLM:
         row_indices: Tensor | None = None,
         capture_on_miss: bool = True,
     ) -> Tensor | None:
+        self._last_ragged_decode_logits_graph_captured = None
         if self._ragged_decode_logits_graph_failed or not _should_use_ragged_decode_logits_graph(
             input_ids,
             cache,
@@ -3622,6 +3623,7 @@ class Llama3TensorParallelForCausalLM:
             if _tp_flag("TORCHINFERNO_CUDAGRAPH_DECODE_DEBUG", False):
                 print(f"rank={self.rank} ragged_decode_logits_graph_failed={exc!r}", flush=True)
             self._ragged_decode_logits_graph_failed = True
+            self._last_ragged_decode_logits_graph_captured = None
             return None
 
     def try_decode_ragged_token_graph(
@@ -3634,6 +3636,7 @@ class Llama3TensorParallelForCausalLM:
         temperature: float = 0.0,
         capture_on_miss: bool = True,
     ) -> Tensor | None:
+        self._last_ragged_decode_graph_captured = None
         if getattr(cache, "_block_decode_graph_captures", False):
             capture_on_miss = False
         if self._ragged_decode_graph_failed or not _should_use_ragged_decode_token_graph(
@@ -3657,6 +3660,7 @@ class Llama3TensorParallelForCausalLM:
             if _tp_flag("TORCHINFERNO_CUDAGRAPH_DECODE_DEBUG", False):
                 print(f"rank={self.rank} ragged_decode_token_graph_failed={exc!r}", flush=True)
             self._ragged_decode_graph_failed = True
+            self._last_ragged_decode_graph_captured = None
             return None
 
     def release_decode_graphs_for_cache(self, cache: Llama3TensorParallelCache) -> None:
@@ -3836,11 +3840,13 @@ class Llama3TensorParallelForCausalLM:
         needs_capture = _capture_needed_on_any_rank(needs_capture, self.device) if not getattr(cache, "_skip_capture_sync", False) else needs_capture
         if needs_capture:
             if not capture_on_miss:
+                self._last_ragged_decode_graph_captured = None
                 return None
             captured = self._capture_ragged_decode_graph(input_ids, cache, seq_lens, row_indices)
         else:
             self._copy_ragged_decode_graph_inputs(captured, input_ids, seq_lens, row_indices)
             captured.graph.replay()
+        self._last_ragged_decode_graph_captured = bool(needs_capture)
         _advance_paged_ragged_decode_cache_lengths(
             cache,
             batch=input_ids.size(0),
@@ -3878,11 +3884,13 @@ class Llama3TensorParallelForCausalLM:
         needs_capture = _capture_needed_on_any_rank(needs_capture, self.device) if not getattr(cache, "_skip_capture_sync", False) else needs_capture
         if needs_capture:
             if not capture_on_miss:
+                self._last_ragged_decode_logits_graph_captured = None
                 return None
             captured = self._capture_ragged_decode_logits_graph(input_ids, cache, seq_lens, row_indices)
         else:
             self._copy_ragged_decode_graph_inputs(captured, input_ids, seq_lens, row_indices)
             captured.graph.replay()
+        self._last_ragged_decode_logits_graph_captured = bool(needs_capture)
         captured_cache_positions = getattr(captured, "static_cache_positions", None)
         if isinstance(captured_cache_positions, Tensor):
             _advance_paged_ragged_decode_cache_lengths(

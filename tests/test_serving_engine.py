@@ -225,6 +225,17 @@ class _RaggedGraphToyModel(torch.nn.Module):
         return logits
 
 
+class _CaptureReportingRaggedGraphToyModel(_RaggedGraphToyModel):
+    def try_decode_ragged_logits_graph(self, input_ids, cache, *, seq_lens, row_indices):
+        self._last_ragged_decode_logits_graph_captured = self.ragged_logits_graph_calls == 0
+        return super().try_decode_ragged_logits_graph(
+            input_ids,
+            cache,
+            seq_lens=seq_lens,
+            row_indices=row_indices,
+        )
+
+
 class _StaticDecodeGraphToyModel(_RaggedGraphToyModel):
     def __init__(self, vocab_size: int = 64) -> None:
         super().__init__(vocab_size)
@@ -2774,6 +2785,32 @@ def test_continuous_batch_engine_uses_ragged_graph_decode_for_mixed_lengths() ->
     assert engine.stats.ragged_decode_padding_tokens == 0
     assert engine.stats.decode_graph_hits == 2
     assert engine.stats.max_model_batch_size == 3
+
+
+def test_continuous_batch_engine_records_ragged_decode_graph_captures() -> None:
+    model = _CaptureReportingRaggedGraphToyModel()
+    engine = ContinuousBatchEngine(
+        model,
+        device=torch.device("cpu"),
+        max_active_requests=3,
+        prefix_cache_capacity=0,
+        profile_timings=True,
+    )
+
+    engine.run(
+        [
+            ServingRequest("short", (1, 2), 3, arrival_step=0),
+            ServingRequest("medium", (3, 4, 5), 3, arrival_step=0),
+            ServingRequest("long", (6, 7, 8, 9), 3, arrival_step=0),
+        ]
+    )
+
+    assert engine.stats.decode_graph_hits == 2
+    assert engine.stats.decode_graph_captures == 1
+    assert engine.stats.decode_graph_replays == 1
+    assert engine.stats.decode_graph_capture_shape_counts == {
+        "ragged_decode:logits:b3:rows1": 1,
+    }
 
 
 def test_continuous_batch_engine_uses_ragged_graph_decode_for_uniform_batches(monkeypatch) -> None:

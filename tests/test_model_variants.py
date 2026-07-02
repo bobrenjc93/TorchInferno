@@ -470,6 +470,7 @@ def test_llama3_tensor_parallel_ragged_decode_graph_matches_eager(tmp_path, monk
 
         expected = model.decode_ragged_logits(decode_tokens, eager_cache, seq_lens=seq_lens)
         actual = model.try_decode_ragged_logits_graph(decode_tokens, graph_cache, seq_lens=seq_lens)
+        assert model._last_ragged_decode_logits_graph_captured is True
         row_indices = torch.tensor(
             [63, 1, 32, 0, 17, 9, 48, 2, 31, 4, 8, 16, 24, 40, 56, 7],
             dtype=torch.long,
@@ -487,6 +488,7 @@ def test_llama3_tensor_parallel_ragged_decode_graph_matches_eager(tmp_path, monk
             seq_lens=seq_lens,
             row_indices=row_indices,
         )
+        assert model._last_ragged_decode_logits_graph_captured is True
 
     assert actual is not None
     assert actual_indexed is not None
@@ -552,6 +554,7 @@ def test_llama3_tensor_parallel_ragged_decode_graph_replays_after_indexed_row_re
             row_indices=first_rows,
         )
         assert actual_first is not None
+        assert model._last_ragged_decode_logits_graph_captured is True
         # Graph replay returns a static output buffer; the second replay below reuses it.
         actual_first = actual_first.clone()
         seq_lens[first_rows] = seq_lens.index_select(0, first_rows) + 1
@@ -576,6 +579,7 @@ def test_llama3_tensor_parallel_ragged_decode_graph_replays_after_indexed_row_re
         )
 
     assert actual_second is not None
+    assert model._last_ragged_decode_logits_graph_captured is False
     assert len(model._ragged_decode_logits_graphs) == 1
     torch.testing.assert_close(actual_first, expected_first, atol=5e-4, rtol=5e-4)
     torch.testing.assert_close(actual_second, expected_second, atol=5e-4, rtol=5e-4)

@@ -221,6 +221,10 @@ class ServingStats:
     ragged_decode_padding_tokens: int = 0
     decode_graph_hits: int = 0
     decode_graph_misses: int = 0
+    decode_graph_captures: int = 0
+    decode_graph_replays: int = 0
+    decode_graph_capture_ms: float = 0.0
+    decode_graph_replay_ms: float = 0.0
     decode_many_calls: int = 0
     decode_many_steps: int = 0
     decode_many_model_tokens: int = 0
@@ -277,6 +281,7 @@ class ServingStats:
     prefix_reuse_hit_token_counts: dict[str, int] = field(default_factory=dict)
     prefill_shape_counts: dict[str, int] = field(default_factory=dict)
     prefill_graph_capture_shape_counts: dict[str, int] = field(default_factory=dict)
+    decode_graph_capture_shape_counts: dict[str, int] = field(default_factory=dict)
     decode_shape_counts: dict[str, int] = field(default_factory=dict)
 
 
@@ -4989,6 +4994,7 @@ class ContinuousBatchEngine:
         decode_graph = getattr(self.model, "try_decode_ragged_token_graph", None)
         if decode_graph is None:
             return None
+        graph_start_s = time.perf_counter() if self.profile_timings else 0.0
         token = self._call_decode_graph(
             decode_graph,
             input_ids,
@@ -5000,7 +5006,50 @@ class ContinuousBatchEngine:
         )
         if token is None:
             self.stats.decode_graph_misses += 1
+        else:
+            self._record_decode_graph_capture_state(
+                getattr(self.model, "_last_ragged_decode_graph_captured", None),
+                input_ids,
+                row_indices,
+                graph_start_s,
+                graph_kind="token",
+            )
         return token
+
+    def _record_decode_graph_capture_state(
+        self,
+        captured: object,
+        input_ids: Tensor,
+        row_indices: Tensor | None,
+        graph_start_s: float,
+        *,
+        graph_kind: str,
+    ) -> None:
+        if not isinstance(captured, bool):
+            return
+        elapsed_ms = (time.perf_counter() - graph_start_s) * 1000.0 if self.profile_timings else 0.0
+        if captured:
+            self.stats.decode_graph_captures += 1
+            self.stats.decode_graph_capture_ms += elapsed_ms
+            self._record_shape_count(
+                self.stats.decode_graph_capture_shape_counts,
+                self._ragged_decode_graph_shape_key(input_ids, row_indices, graph_kind=graph_kind),
+            )
+        else:
+            self.stats.decode_graph_replays += 1
+            self.stats.decode_graph_replay_ms += elapsed_ms
+
+    @staticmethod
+    def _ragged_decode_graph_shape_key(
+        input_ids: Tensor,
+        row_indices: Tensor | None,
+        *,
+        graph_kind: str,
+    ) -> str:
+        return (
+            f"ragged_decode:{graph_kind}:b{int(input_ids.size(0))}:"
+            f"rows{1 if row_indices is not None else 0}"
+        )
 
     def _sampled_fi_decode_enabled_for_request(self) -> bool:
         max_tokens = self.max_generation_tokens
@@ -5081,6 +5130,7 @@ class ContinuousBatchEngine:
     ) -> Tensor:
         decode_graph = getattr(self.model, "try_decode_ragged_logits_graph", None)
         if decode_graph is not None:
+            graph_start_s = time.perf_counter() if self.profile_timings else 0.0
             logits = self._call_decode_graph(
                 decode_graph,
                 input_ids,
@@ -5091,6 +5141,13 @@ class ContinuousBatchEngine:
             )
             if logits is not None:
                 self.stats.decode_graph_hits += 1
+                self._record_decode_graph_capture_state(
+                    getattr(self.model, "_last_ragged_decode_logits_graph_captured", None),
+                    input_ids,
+                    row_indices,
+                    graph_start_s,
+                    graph_kind="logits",
+                )
                 return logits
             self.stats.decode_graph_misses += 1
         decode = getattr(self.model, "decode_ragged_logits", None)

@@ -5397,6 +5397,10 @@ class OpenAICompletionEngine:
             "ragged_decode_padding_tokens",
             "decode_graph_hits",
             "decode_graph_misses",
+            "decode_graph_captures",
+            "decode_graph_replays",
+            "decode_graph_capture_ms",
+            "decode_graph_replay_ms",
             "decode_many_calls",
             "decode_many_steps",
             "decode_many_model_tokens",
@@ -5458,6 +5462,7 @@ class OpenAICompletionEngine:
             "prefix_reuse_hit_token_counts",
             "prefill_shape_counts",
             "prefill_graph_capture_shape_counts",
+            "decode_graph_capture_shape_counts",
             "decode_shape_counts",
         ):
             value = getattr(stats, name, None)
