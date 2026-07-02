@@ -64,6 +64,20 @@ Rejected follow-ups on `f8cc9d5`:
 - Enabling FlashInfer prefill
   (`TORCHINFERNO_CONTINUOUS_FLASHINFER_PREFILL_DISABLE=0`) remains rejected:
   `529.2 / 35.8 / 2002.9ms` and a correctness drop to `98%`.
+- Skipping the folded common-prefix copy when a dense active row already holds
+  the same prefix is rejected and was reverted. A cold no-copy prototype fired
+  for `896` requests but regressed long_output to `307.1 / 25.8 / 1458.7ms`
+  because the new `src0` graph shapes paid `11.29s` of runtime capture. Adding
+  startup `src0` warmup raised readiness to `281.2s` and still regressed to
+  `307.2 / 25.4 / 1516.4ms`; the serving cache still captured `10` no-copy
+  shapes at request time. The dense row-materialization copy is not the next
+  defaultable lever without a deeper graph/cache design.
+- Greedy-short FP8 prefill M-threshold sweeps around the current `512` gate are
+  rejected on the long_output shape. Lowering to `256` preserved correctness but
+  landed at `264.2 / 25.4 / 1229.6ms`; raising to `1024` landed at
+  `272.5 / 25.3 / 1306.0ms`. The profiles showed no useful capture artifact
+  and worse prefill forward/queue-to-finish balance, so keep the current
+  greedy-short `min_m=512`.
 
 ## Current public-order refresh on 36c5c9a (2026-06-29)
 
