@@ -6116,19 +6116,43 @@ could not start vLLM/SGLang because no skipped-build venvs existed in the fresh
 build directory, but its TorchInferno control row was `169.4 / 50.0 / 201.3ms`;
 keep cap `10` and do not reopen cap `12` without a new signal.
 
-## In-flight, validated-locally-but-NOT-benchmarked commits
+Same-host all-provider refresh on pushed `db1587d` gives the current local
+score shape after the sampled-medium prequeue and rejected long-output probes.
+vLLM started successfully with the inference-bench workspace/libstdc++ fixes and
+won `10` metric cells, SGLang won `5`, and TorchInferno won `4`: few_shot TPOT
+(`47.8ms` vs vLLM `54.8ms`), self_consistency E2E/throughput
+(`236.8ms`, `4.2 tok/s`), and multi_turn TPOT (`61.1ms`). The closest missed
+cell is self_consistency TTFT (`165.3ms` vs vLLM `159.7ms`), but the
+TorchInferno fast-HTTP profile for that row has p50 server stream total around
+`8.9ms` and queue-to-first p50 around `7.7ms`; the remaining difference is
+client-observed connection/request scheduling, not model/runtime work.
+Score-facing runtime gaps remain few_shot E2E (`207.6ms` vs SGLang `196.0ms`),
+tree TTFT/TPOT/E2E (`147.3 / 44.9 / 180.5ms` vs best
+`62.1 / 31.9 / 90.9ms`), multi_turn TTFT/E2E (`325.7 / 381.6ms` vs best
+`154.5 / 228.6ms`), and long_output decode/E2E
+(`24.8 / 1215.0ms` vs vLLM `16.9 / 666.4ms`).
 
-The public results directory is still latest at `20260630_110306`; that run
-measured stale TorchInferno `7cbb5fe`, so these are unmeasured in the public
-scorecard:
-- joint (batch,q) prefill graphs under a token budget,
-- `max_active=128` decode batch + prefill/decode decoupling,
-- single-request prefill via graph (245 → 51ms single-req TTFT, local),
-- paged-cache crash guards (SDPA fallback, FI-eager write-bounds).
+Greedy-mid prequeue admission is rejected for few_shot. Forcing the existing
+global prequeue override to `1ms` gathered the focused few_shot run into one
+online session with `initial_batch_size=4`, but it did not improve the row:
+`170.9 / 47.8 / 209.9ms` with p99 E2E `1288.3ms`, versus the current local
+all-provider control `168.0 / 47.8 / 207.6ms`. The queue profile still had p50
+queue-to-first around `125.9ms`, while p99 queue-to-first rose to `913.6ms`.
+Keep prequeue admission scoped to sampled-medium tree traffic.
+
+## Public Run Status
+
+The public results directory is still latest at `20260701_211855`, and that run
+measured stale TorchInferno `3af4940`. It also had a vLLM startup failure, so
+the public scorecard currently compares current-ish SGLang against an old
+TorchInferno and no vLLM rows. Current pushed TorchInferno `db1587d` has only
+the same-host local all-provider evidence above until the public harness runs
+again with the inference-bench vLLM workspace/libstdc++ fixes.
 
 ## Priority for a focused (non-loop) session
 
-1. Unfreeze the benchmark harness so the in-flight commits get measured.
+1. Let/force the public harness to measure current TorchInferno and the vLLM
+   startup fix.
 2. Prefill MFU (Issue 1) — biggest TTFT lever, ~2x, affects 3/5 benchmarks.
 3. Chunked prefill interleaved with decode — lets early requests return fast.
 4. Persistent engine + TP-safe reuse (Issue 3) — needed for multi_turn.
