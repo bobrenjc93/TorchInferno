@@ -6218,6 +6218,24 @@ Both adjacent profiles also lacked the public run's small decode-many tail
 shape, so the local patch was removed. Do not add a decode-many minimum-active
 gate without a stronger, reproducible tail signal.
 
+`TORCHINFERNO_COMPILED_POST_ATTENTION=1` is not a defaultable runtime win. A
+focused long_output check wrote
+`agent_space/ti_long_compiled_postattn_results/.../8xH100-local-ti-long-compiled-post-attn-20260702/runs/20260702_075057`
+and looked superficially good at `227.1 / 25.5 / 1177.4ms`, but the queue
+profile did not show a prefill mechanism: prefill forward barely moved versus
+the adjacent no-env control (`5.76s` to `5.71s`), while the row mostly changed
+through decode scheduling/padding noise. The clearer tree_of_thought check
+wrote
+`agent_space/ti_tree_compiled_postattn_results/.../8xH100-local-ti-tree-compiled-post-attn-20260702/runs/20260702_075645`
+and landed at `145.8 / 37.3 / 175.6ms` with `964/992` correct, but counters
+again showed no post-attention prefill win: prefill forward was flat
+(`2264.0ms` control vs `2262.9ms` compiled), decode GPU worsened
+(`1412.4ms` to `1443.0ms`), phase time worsened (`5258.5ms` to `5637.9ms`),
+and decode misses rose (`1` to `3`). Keep runtime `torch.compile`
+post-attention as an explicit experiment only; it does not satisfy the offline
+optimization contract for a default serving path and did not close the measured
+prefill gap.
+
 ## Priority for a focused (non-loop) session
 
 1. Prefill MFU (Issue 1) — biggest TTFT lever, ~2x, affects 3/5 benchmarks.
