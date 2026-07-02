@@ -202,6 +202,32 @@ tree_of_thought `150.4 / 48.1 / 179.3ms`. The tree queue profile ended with
 noise unless a sequence-qualified miss recurs; do not add more static startup
 warmups speculatively.
 
+Dynamic drain decode quantum is accepted for short greedy decode-many sessions.
+The base short-greedy command quantum stays at `3` while ready or waiting work
+can still be admitted, but once both the external queue drain and the runtime
+waiting queue are empty the online batcher now broadcasts a larger decode-many
+drain command. The focused default-`8` run on the patched `06ee764` tree wrote
+`agent_space/ti_long_drainq8_results/.../runs/20260702_203950` and landed at
+long_output `255.9 / 23.7 / 1118.8ms`, `1000/1000` correct, with readiness
+unchanged at `205.9s`. The profile showed the intended mechanism versus the
+latest full-run control: online step commands fell `249 -> 183`, step
+broadcast+sync fell `752ms -> 545ms`, queue-to-finish p50 improved
+`1192ms -> 1033ms`, and graph coverage stayed clean (`60/0` prefill,
+`801/0` decode). The cost is delayed stop-token readback during drain bursts:
+decode-many skipped tokens rose `412 -> 1907`, so this is scoped only to
+short greedy decode-many after admission has drained, with
+`TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_DRAIN_DECODE_QUANTUM` left as the
+deployment override.
+
+The narrower drain quantum `5` is rejected. The adjacent env run
+`TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_DRAIN_DECODE_QUANTUM=5` wrote
+`agent_space/ti_long_drainq5_results/.../runs/20260702_204529` and stayed
+correct, but regressed to `286.1 / 24.3 / 1223.9ms`. It reduced skipped tokens
+relative to `8` (`928` vs `1907`) but kept too many commands (`201`) and did
+not preserve the score-facing E2E win. Keep the default drain quantum at `8`;
+set it to the base quantum to disable the drain behavior for latency-sensitive
+streaming deployments.
+
 A current-head focused multi_turn profile on pushed `325cdf4` wrote
 `agent_space/ti_multi_325cdf4_results/.../runs/20260702_192513` and landed at
 `303.1 / 61.8 / 361.8ms`, `983/1000` correct. The new miss-shape field stayed

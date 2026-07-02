@@ -839,6 +839,9 @@ class ContinuousBatchEngine:
         waiting = self._online_waiting
         return bool(waiting) or bool(self._online_active) or bool(self._online_prefilling)
 
+    def has_online_waiting_requests(self) -> bool:
+        return bool(self._online_waiting)
+
     @torch.inference_mode()
     def step_online(self) -> list[ServingTokenEvent]:
         if self.unified_forward:

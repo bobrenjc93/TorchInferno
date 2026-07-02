@@ -464,6 +464,32 @@ def _online_decode_quantum(*, temperature: float, max_tokens: int) -> int:
     )
 
 
+def _online_decode_drain_quantum(*, temperature: float, max_tokens: int, base_quantum: int) -> int:
+    base = max(1, int(base_quantum))
+    global_env = "TORCHINFERNO_OPENAI_TP_ONLINE_DRAIN_DECODE_QUANTUM"
+    if global_env in os.environ:
+        return env_int(global_env, base, minimum=1)
+    if max_tokens < 1 or temperature > 0.0:
+        return base
+    greedy_short_max_tokens = env_int(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_GEN_MAX_TOKENS",
+        128,
+        minimum=1,
+    )
+    if max_tokens > greedy_short_max_tokens:
+        return base
+    if not _online_decode_many_enabled(temperature=temperature, max_tokens=max_tokens):
+        return base
+    return max(
+        base,
+        env_int(
+            "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_DRAIN_DECODE_QUANTUM",
+            8,
+            minimum=1,
+        ),
+    )
+
+
 def _online_decode_many_enabled(*, temperature: float, max_tokens: int) -> bool:
     if "TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY" in os.environ:
         return env_flag("TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY", False)
@@ -4896,6 +4922,11 @@ class OpenAICompletionEngine:
             temperature=first.temperature,
             max_tokens=run_max_tokens,
         )
+        drain_decode_quantum = _online_decode_drain_quantum(
+            temperature=first.temperature,
+            max_tokens=run_max_tokens,
+            base_quantum=decode_quantum,
+        )
         collect_idle_arrivals = _online_collect_idle_arrivals_enabled(
             temperature=first.temperature,
             max_tokens=run_max_tokens,
@@ -4977,6 +5008,7 @@ class OpenAICompletionEngine:
                 max_active=max_active,
                 prefix_rows=prefix_rows,
                 decode_quantum=decode_quantum,
+                drain_decode_quantum=drain_decode_quantum,
                 requested_max_batch=requested_max_batch,
                 initial_wait_ms=round(initial_wait_s * 1000.0, 3),
                 idle_batch_wait_ms=round(idle_wait_s * 1000.0, 3),
@@ -5299,16 +5331,26 @@ class OpenAICompletionEngine:
                             submit_batch(idle_batch, arrival_step=step)
                         continue
                     step_broadcast_start_s = time.perf_counter()
+                    step_many = getattr(runtime_engine, "step_online_many", None) if use_decode_many else None
+                    has_waiting_fn = getattr(runtime_engine, "has_online_waiting_requests", None)
+                    has_runtime_waiting = bool(has_waiting_fn()) if callable(has_waiting_fn) else False
+                    command_decode_quantum = decode_quantum
+                    if (
+                        drain_decode_quantum > decode_quantum
+                        and ready_count == 0
+                        and callable(step_many)
+                        and not has_runtime_waiting
+                    ):
+                        command_decode_quantum = drain_decode_quantum
                     if not ran_combined_step_command:
-                        _broadcast_tensor_parallel_online_step(self.model, decode_quantum)
+                        _broadcast_tensor_parallel_online_step(self.model, command_decode_quantum)
                     add_phase("step_broadcast_ms", step_broadcast_start_s)
                     online_step_commands += 1
-                    remaining_steps = decode_quantum
+                    remaining_steps = command_decode_quantum
                     while remaining_steps > 0:
                         if not runtime_engine.has_online_work():
                             break
                         runtime_step_start_s = time.perf_counter()
-                        step_many = getattr(runtime_engine, "step_online_many", None) if use_decode_many else None
                         if step_many is not None and callable(step_many):
                             events, ran_steps = step_many(remaining_steps)
                         else:

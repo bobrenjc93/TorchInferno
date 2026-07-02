@@ -111,6 +111,7 @@ from torchinferno.openai_server import (
     _online_decode_warmup_policy_specs,
     _online_decode_warmup_runtime_symm_mem_allreduce_enabled,
     _online_decode_first_enabled,
+    _online_decode_drain_quantum,
     _online_decode_many_allow_stop_enabled,
     _online_decode_many_enabled,
     _online_decode_quantum,
@@ -9170,6 +9171,27 @@ def test_openai_online_decode_quantum_uses_greedy_mid_cap_default(monkeypatch) -
     assert _online_decode_quantum(temperature=0.0, max_tokens=64) == 8
 
 
+def test_openai_online_decode_drain_quantum_scopes_to_short_greedy_decode_many(monkeypatch) -> None:
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_DRAIN_DECODE_QUANTUM", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_DRAIN_DECODE_QUANTUM", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY", raising=False)
+
+    assert _online_decode_drain_quantum(temperature=0.0, max_tokens=64, base_quantum=3) == 8
+    assert _online_decode_drain_quantum(temperature=0.0, max_tokens=128, base_quantum=12) == 12
+    assert _online_decode_drain_quantum(temperature=0.0, max_tokens=256, base_quantum=16) == 16
+    assert _online_decode_drain_quantum(temperature=0.7, max_tokens=64, base_quantum=4) == 4
+
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY", "0")
+    assert _online_decode_drain_quantum(temperature=0.0, max_tokens=64, base_quantum=3) == 3
+    monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY", raising=False)
+
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_DRAIN_DECODE_QUANTUM", "5")
+    assert _online_decode_drain_quantum(temperature=0.0, max_tokens=64, base_quantum=3) == 5
+
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_DRAIN_DECODE_QUANTUM", "2")
+    assert _online_decode_drain_quantum(temperature=0.0, max_tokens=64, base_quantum=3) == 2
+
+
 def test_openai_online_decode_quantum_respects_env_overrides(monkeypatch) -> None:
     monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_SHORT_GEN_DECODE_QUANTUM", raising=False)
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_DECODE_QUANTUM", "3")
@@ -14649,6 +14671,7 @@ def test_openai_tensor_parallel_online_batcher_records_profile_snapshots(
     assert records[3]["online_step_commands"] == 3
     assert records[3]["runtime_decode_tokens"] == 3
     assert records[3]["requested_max_batch"] == 4
+    assert records[3]["drain_decode_quantum"] == 8
     assert records[3]["initial_wait_ms"] == 0.0
     assert records[3]["idle_batch_wait_ms"] == 5.0
     assert records[3]["collect_idle_arrivals"] is False
@@ -14690,6 +14713,124 @@ def test_openai_tensor_parallel_online_batcher_records_profile_snapshots(
         records[3]["request_queue_to_finish_p50_ms"]
         >= records[3]["request_queue_to_first_token_p50_ms"]
     )
+
+
+def test_openai_tensor_parallel_online_batcher_uses_drain_decode_quantum(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = type("FakeTPModel", (), {"world_size": 2, "rank": 0, "allocate_cache": lambda self: None})()
+    step_broadcasts: list[int] = []
+
+    class RuntimeEngine:
+        def __init__(self, *args, **kwargs) -> None:  # noqa: ANN002, ANN003
+            del args, kwargs
+            self.request_id: str | None = None
+            self.steps = 0
+            self.stats = types.SimpleNamespace(
+                decode_tokens=0,
+                scheduler_steps=0,
+                queued_requests=0,
+                decode_many_calls=0,
+                decode_many_steps=0,
+            )
+
+        def start_online(self, *, max_seq_len: int, external_cache: object | None = None) -> None:
+            del max_seq_len, external_cache
+
+        def submit_online(self, request: object) -> None:
+            self.request_id = str(getattr(request, "request_id"))
+            self.stats.queued_requests += 1
+
+        def has_online_work(self) -> bool:
+            return self.request_id is not None
+
+        def has_online_waiting_requests(self) -> bool:
+            return False
+
+        def step_online_many(self, max_steps: int) -> tuple[list[object], int]:
+            assert self.request_id is not None
+            events: list[object] = []
+            ran_steps = 0
+            while ran_steps < max_steps and self.request_id is not None:
+                self.steps += 1
+                ran_steps += 1
+                finished = self.steps >= 5
+                events.append(
+                    types.SimpleNamespace(
+                        request_id=self.request_id,
+                        token=900 + self.steps,
+                        finished=finished,
+                    )
+                )
+                if finished:
+                    self.request_id = None
+            self.stats.scheduler_steps += ran_steps
+            self.stats.decode_tokens += ran_steps
+            self.stats.decode_many_calls += 1
+            self.stats.decode_many_steps += ran_steps
+            return events, ran_steps
+
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_CONTINUOUS_BATCHER", "1")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_DECODE_QUANTUM", "1")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_INITIAL_BATCH_WAIT_MS", "0")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_IDLE_BATCH_WAIT_MS", "0")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_PREFIX_ROWS", "1")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_MAX_SEQ_LEN_HEADROOM_TOKENS", "0")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_PREFILL_TOKEN_BUDGET", "0")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_DRAIN_DECODE_QUANTUM", "8")
+    monkeypatch.setattr(
+        "torchinferno.openai_server._is_tensor_parallel_model",
+        lambda candidate: candidate is model,
+    )
+    monkeypatch.setattr("torchinferno.openai_server._RuntimeContinuousBatchEngine", RuntimeEngine)
+    monkeypatch.setattr(
+        "torchinferno.openai_server._tensor_parallel_symm_mem_allreduce_scope",
+        lambda *args, **kwargs: nullcontext(),
+    )
+    monkeypatch.setattr(
+        "torchinferno.openai_server._broadcast_tensor_parallel_online_start",
+        lambda model, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        "torchinferno.openai_server._broadcast_tensor_parallel_online_submit_prompt_lists",
+        lambda model, prompts, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        "torchinferno.openai_server._broadcast_tensor_parallel_online_step",
+        lambda model, steps=1: step_broadcasts.append(int(steps)),
+    )
+    monkeypatch.setattr(
+        "torchinferno.openai_server._broadcast_tensor_parallel_online_close",
+        lambda model: None,
+    )
+    monkeypatch.setattr(
+        "torchinferno.openai_server._sync_tensor_parallel_command",
+        lambda model, device, **kwargs: None,
+    )
+
+    class EmptyQueue:
+        def get_nowait(self) -> object:
+            raise queue.Empty
+
+        def get(self, timeout: float | None = None) -> object:
+            del timeout
+            raise queue.Empty
+
+        def put(self, item: object) -> None:
+            del item
+
+    engine = _cache_only_engine()
+    engine.model = model
+    engine.stop_token_ids = frozenset()
+    engine.max_batch_size = 4
+    engine._generation_queue = EmptyQueue()  # type: ignore[assignment]
+    first_queue: queue.Queue[object] = queue.Queue()
+    first = _QueuedGeneration([1, 2], 5, 0.0, True, first_queue)
+
+    engine._run_tensor_parallel_online_batcher(first)
+
+    assert step_broadcasts == [8]
+    assert _queue_items(first_queue) == [901, 902, 903, 904, 905, _GenerationDone()]
 
 
 def test_openai_tensor_parallel_online_default_prefix_rows(monkeypatch: pytest.MonkeyPatch) -> None:
