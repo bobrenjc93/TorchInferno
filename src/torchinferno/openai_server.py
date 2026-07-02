@@ -530,6 +530,24 @@ def _online_prefill_ready_before_decode_enabled(*, temperature: float, max_token
                 "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_PREFILL_READY_BEFORE_DECODE",
                 True,
             )
+        greedy_large_min_tokens = env_int(
+            "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_PREFILL_READY_MIN_TOKENS",
+            400,
+            minimum=greedy_short_max_tokens,
+        )
+        greedy_large_max_tokens = env_int(
+            "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_PREFILL_READY_MAX_TOKENS",
+            512,
+            minimum=greedy_large_min_tokens,
+        )
+        if greedy_large_min_tokens < max_tokens <= greedy_large_max_tokens:
+            # Multi-turn 512-token greedy traffic is prefill/admission bound.
+            # Let a ready wave prefill when decode has drained to a small tail,
+            # while keeping the normal decode-first path for larger tails.
+            return env_flag(
+                "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_PREFILL_READY_BEFORE_DECODE",
+                True,
+            )
         return False
     sampled_medium_min_tokens = env_int(
         "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_PREFILL_READY_MIN_TOKENS",
@@ -588,6 +606,23 @@ def _online_prefill_ready_before_decode_active_cap(
         if max_tokens <= greedy_short_max_tokens:
             configured = env_int(
                 "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_PREFILL_READY_ACTIVE_CAP",
+                8,
+                minimum=0,
+            )
+            return None if configured <= 0 else configured
+        greedy_large_min_tokens = env_int(
+            "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_PREFILL_READY_MIN_TOKENS",
+            400,
+            minimum=greedy_short_max_tokens,
+        )
+        greedy_large_max_tokens = env_int(
+            "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_PREFILL_READY_MAX_TOKENS",
+            512,
+            minimum=greedy_large_min_tokens,
+        )
+        if greedy_large_min_tokens < max_tokens <= greedy_large_max_tokens:
+            configured = env_int(
+                "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_PREFILL_READY_ACTIVE_CAP",
                 8,
                 minimum=0,
             )

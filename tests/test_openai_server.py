@@ -9263,9 +9263,29 @@ def test_openai_online_prefill_ready_before_decode_respects_env(monkeypatch) -> 
         "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_PREFILL_READY_ACTIVE_CAP",
         raising=False,
     )
+    monkeypatch.delenv(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_PREFILL_READY_BEFORE_DECODE",
+        raising=False,
+    )
+    monkeypatch.delenv(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_PREFILL_READY_ACTIVE_CAP",
+        raising=False,
+    )
+    monkeypatch.delenv(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_PREFILL_READY_MIN_TOKENS",
+        raising=False,
+    )
+    monkeypatch.delenv(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_PREFILL_READY_MAX_TOKENS",
+        raising=False,
+    )
     assert _online_prefill_ready_before_decode_enabled(temperature=0.0, max_tokens=64)
     assert _online_prefill_ready_before_decode_active_cap(temperature=0.0, max_tokens=64) == 8
     assert not _online_prefill_ready_before_decode_enabled(temperature=0.0, max_tokens=256)
+    assert not _online_prefill_ready_before_decode_enabled(temperature=0.0, max_tokens=400)
+    assert _online_prefill_ready_before_decode_enabled(temperature=0.0, max_tokens=401)
+    assert _online_prefill_ready_before_decode_active_cap(temperature=0.0, max_tokens=512) == 8
+    assert not _online_prefill_ready_before_decode_enabled(temperature=0.0, max_tokens=513)
     assert not _online_prefill_ready_before_decode_enabled(temperature=0.7, max_tokens=256)
     assert _online_prefill_ready_before_decode_enabled(temperature=0.7, max_tokens=300)
     assert _online_prefill_ready_before_decode_active_cap(temperature=0.7, max_tokens=300) == 10
@@ -9289,6 +9309,35 @@ def test_openai_online_prefill_ready_before_decode_respects_env(monkeypatch) -> 
     assert _online_prefill_ready_before_decode_active_cap(temperature=0.0, max_tokens=64) == 8
     monkeypatch.delenv(
         "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_PREFILL_READY_ACTIVE_CAP",
+        raising=False,
+    )
+
+    monkeypatch.setenv(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_PREFILL_READY_BEFORE_DECODE",
+        "0",
+    )
+    assert not _online_prefill_ready_before_decode_enabled(temperature=0.0, max_tokens=512)
+    assert _online_prefill_ready_before_decode_active_cap(temperature=0.0, max_tokens=512) is None
+    monkeypatch.delenv(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_PREFILL_READY_BEFORE_DECODE",
+        raising=False,
+    )
+    monkeypatch.setenv(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_PREFILL_READY_ACTIVE_CAP",
+        "4",
+    )
+    assert _online_prefill_ready_before_decode_active_cap(temperature=0.0, max_tokens=512) == 4
+    monkeypatch.delenv(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_PREFILL_READY_ACTIVE_CAP",
+        raising=False,
+    )
+    monkeypatch.setenv(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_PREFILL_READY_MAX_TOKENS",
+        "520",
+    )
+    assert _online_prefill_ready_before_decode_enabled(temperature=0.0, max_tokens=520)
+    monkeypatch.delenv(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_PREFILL_READY_MAX_TOKENS",
         raising=False,
     )
 

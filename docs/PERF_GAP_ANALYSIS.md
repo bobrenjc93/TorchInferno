@@ -6236,6 +6236,20 @@ post-attention as an explicit experiment only; it does not satisfy the offline
 optimization contract for a default serving path and did not close the measured
 prefill gap.
 
+Greedy-large prefill-before-decode at the active tail is a small current
+multi_turn win. A focused current-head validation with
+`TORCHINFERNO_OPENAI_TP_ONLINE_PREFILL_READY_BEFORE_DECODE=1` and
+`TORCHINFERNO_OPENAI_TP_ONLINE_PREFILL_READY_ACTIVE_CAP=8` wrote
+`agent_space/ti_multi_prbd8_current_results/.../8xH100-local-ti-multi-prbd8-current-20260702/runs/20260702_081043`
+and landed at `309.5 / 60.9 / 366.2ms`, `982/1000` correct. The queue profile
+kept the desired graph shape (`34` prefill graph hits, `0` misses) and moved
+queue-to-first/finish p50 to `248.2/268.8ms`, with p99s at `445.4/501.3ms`.
+Versus the recent focused default band (`323.4 / 64.1 / 380.6ms`) and the
+public row (`326.6 / 61.3 / 381.2ms`), this is enough to promote only the
+deterministic `400 < max_tokens <= 512` policy. Keep the active cap at `8` and
+leave greedy short, greedy mid, sampled short, sampled medium, and global
+prefill/decode ordering unchanged.
+
 ## Priority for a focused (non-loop) session
 
 1. Prefill MFU (Issue 1) — biggest TTFT lever, ~2x, affects 3/5 benchmarks.
