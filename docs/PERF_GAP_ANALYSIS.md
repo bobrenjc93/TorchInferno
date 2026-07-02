@@ -6975,6 +6975,19 @@ percentages were tail/narrow shapes such as `b48/64` (`15.8%`), `b51/64`
 global drain-quantum increase as the next default; any further decode-many
 change should be tail-specific and should preserve the full 64-wide drain path.
 
+An opt-in tail stop cap is also rejected as a default. The probe
+`TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY_STOP_TAIL_MAX_STEPS=4`
+(`agent_space/ti_long_tailcap4_results/.../8xH100-local-ti-long-tailcap4-20260702/runs/20260702_215601`)
+finished 1000/1000 correct and improved median TTFT to `235.1ms`, but regressed
+TPOT/E2E to `25.0ms` / `1178.1ms`, p99 TTFT to `1141.2ms`, and p99 E2E to
+`1968.3ms`. The queue profile showed the intended mechanism did fire
+(`28` tail-limited decode-many calls, `112` deferred steps) and reduced skipped
+decode-many tokens (`1871 -> 1322`) plus ragged decode GPU (`10.26s -> 9.85s`),
+but it increased decode-many calls (`105 -> 143`) and active decode-many model
+tokens (`28.7k -> 30.3k`). Keep the cap as an opt-in profiling/tuning hook only;
+the default should stay q8 drain without tail splitting until there is a
+narrower policy that improves E2E and tails together.
+
 The same full run also confirms that multi_turn's remaining TTFT/E2E gap is not
 a missing default env flip. It still has `34` prefill batches, `34/0` prefill
 graph hits/misses, and only `{"common_prefix":1000}` / `{"45":1000}` reuse.

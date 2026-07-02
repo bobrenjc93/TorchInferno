@@ -5575,6 +5575,8 @@ class OpenAICompletionEngine:
             "decode_many_stop_finishes",
             "decode_many_limit_finishes",
             "decode_many_cpu_tokens_ms",
+            "decode_many_tail_limited_calls",
+            "decode_many_tail_limited_steps",
             "prefix_reuse_requests",
             "prefix_reuse_tokens",
             "queued_requests",

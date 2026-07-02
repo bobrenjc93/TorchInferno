@@ -233,6 +233,8 @@ class ServingStats:
     decode_many_stop_finishes: int = 0
     decode_many_limit_finishes: int = 0
     decode_many_cpu_tokens_ms: float = 0.0
+    decode_many_tail_limited_calls: int = 0
+    decode_many_tail_limited_steps: int = 0
     decode_many_shape_model_tokens: dict[str, int] = field(default_factory=dict)
     decode_many_shape_emitted_tokens: dict[str, int] = field(default_factory=dict)
     decode_many_shape_skipped_tokens: dict[str, int] = field(default_factory=dict)
@@ -523,6 +525,11 @@ class ContinuousBatchEngine:
             if decode_many_with_waiting is None
             else bool(decode_many_with_waiting)
         )
+        self.decode_many_stop_tail_max_steps = env_int(
+            "TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY_STOP_TAIL_MAX_STEPS",
+            0,
+            minimum=0,
+        )
         if decode_many_with_waiting_min_active is None:
             decode_many_with_waiting_min_active = env_int(
                 "TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY_WITH_WAITING_MIN_ACTIVE",
@@ -680,12 +687,19 @@ class ContinuousBatchEngine:
         steps_run = 0
         while steps_left > 0 and self.has_online_work():
             if self._can_step_decode_many(steps_left):
-                many_events, many_steps = self._step_decode_only_many(steps_left)
+                many_max_steps = self._decode_many_step_limit(steps_left)
+                tail_limited = many_max_steps < steps_left
+                if tail_limited:
+                    self.stats.decode_many_tail_limited_calls += 1
+                    self.stats.decode_many_tail_limited_steps += steps_left - many_max_steps
+                many_events, many_steps = self._step_decode_only_many(many_max_steps)
                 if many_steps <= 0:
                     break
                 events.extend(many_events)
                 steps_run += many_steps
                 steps_left -= many_steps
+                if tail_limited:
+                    break
                 continue
             step_events = self.step_online()
             events.extend(step_events)
@@ -725,6 +739,20 @@ class ContinuousBatchEngine:
         if self._generated_prefix_cache_enabled() or self._prompt_lookup_decode_enabled():
             return False
         return self._can_decode_ragged(self._online_active)
+
+    def _decode_many_step_limit(self, max_steps: int) -> int:
+        requested_steps = max(1, int(max_steps))
+        tail_max_steps = max(0, int(self.decode_many_stop_tail_max_steps))
+        if tail_max_steps <= 0 or requested_steps <= tail_max_steps:
+            return requested_steps
+        active = self._online_active
+        if not active or len(active) >= self.max_active_requests:
+            return requested_steps
+        if not self.decode_many_allow_stop:
+            return requested_steps
+        if not any(state.request.stop_token_ids for state in active):
+            return requested_steps
+        return max(1, min(requested_steps, tail_max_steps))
 
     def _step_decode_only_many(self, max_steps: int) -> tuple[list[ServingTokenEvent], int]:
         active = list(self._online_active)
