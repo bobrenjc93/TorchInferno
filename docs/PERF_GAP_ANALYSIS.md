@@ -67,6 +67,27 @@ and kept correctness at `1000/1000`, but queue counters still showed
 is not a defaultable win; the remaining `copy_` profile needs a broader
 layout/capture or decode pipeline change.
 
+Startup symmetric-memory allreduce stays explicit after the current
+long_output recheck. The successful auto-probe already validates
+graph-captured multimem allreduce for decode shapes, and an explicit
+startup-scope run on `c9865f7`
+(`agent_space/ti_long_startup_symm_results/.../8xH100-local-ti-long-startup-symm-20260702/runs/20260702_022326`)
+started normally (`195.8s` readiness), kept long_output correctness at
+`1000/1000`, and improved the row to `243.2 / 24.5 / 1174.5ms`. Its queue
+profile moved phase time to `19.42s`, queue-to-first p50/p99 to
+`195.9/1279.4ms`, queue-to-finish p50 to `1128.1ms`, and decode GPU time to
+`9.62s`.
+
+That result did not reproduce cleanly when the default auto-probe scope was
+temporarily changed from `runtime` to `all` and rerun with no override
+(`agent_space/ti_long_auto_symm_default_results/.../8xH100-local-ti-long-auto-symm-default-20260702/runs/20260702_022947`).
+The server enabled all scope after probe and stayed correct (`1000/1000`), but
+the row regressed to `256.1 / 24.4 / 1295.7ms`, with `20.81s` phase time,
+queue-to-finish p50 `1224.2ms`, `6.94s` prefill wall (`6.01s` forward),
+`10.25s` decode GPU time, `7,065` ragged padding tokens, and `569` step calls.
+The default therefore remains `runtime`; startup all-scope remains available as
+an explicit override, not a defaultable win.
+
 ## Prior 20260701 refresh and local vLLM/SGLang checks
 
 Public run `20260701_211855` is stale for TorchInferno: it measured
