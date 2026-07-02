@@ -6273,6 +6273,49 @@ TPOT movement was not reproducible as a default tree win. Keep prefill-cost
 priority scoped to greedy-short traffic unless a sampled-medium rerun shows a
 real reduction in prefill/decode work.
 
+A current-head all-provider multi_turn rebuild confirmed the remaining gap is
+request-specific prefix reuse, not just the earlier scheduling default. The run
+`agent_space/allproviders_current_multi_built_results/.../8xH100-local-current-multi-allproviders-build-20260702/runs/20260702_085107`
+used TorchInferno `912728c`, SGLang `b276a9a`, and vLLM `08a8a4a`. vLLM failed
+server startup in `flashinfer_comm.allreduce_fusion` with `Buffer: 1048576
+bytes, Required: 4194304 bytes`, so the comparable rows were SGLang at
+`152.4 / 119.8 / 280.1ms`, `981/1000` correct, and TorchInferno at
+`316.6 / 61.0 / 371.6ms`, `982/1000` correct. Per-turn TTFT medians show the
+shape: SGLang stays mostly flat after turn 0 (`356.1`, then `121-200ms`), while
+TorchInferno grows from `376.5ms` to `387.2ms` by turn 7. TorchInferno's queue
+profile reused only the shared `45` token system prefix for all `1000`
+requests, with `85,398` prefill tokens and `4.48s` prefill wall. Closing multi
+requires TP-safe per-conversation prefix reuse that can still batch and replay
+stable prefill shapes.
+
+Pinned full-prompt stores remain rejected on current head. Enabling
+`TORCHINFERNO_CONTINUOUS_PINNED_FULL_PROMPT_STORE_MIN_MAX_TOKENS=1` with
+`TORCHINFERNO_OPENAI_TP_ONLINE_PREFIX_ROWS=112` wrote
+`agent_space/ti_multi_fullprompt_p112_results/.../8xH100-local-ti-multi-fullprompt-prefix112-20260702/runs/20260702_091013`
+and produced request-prompt reuse (`875` request-prompt hits, `98,517` reused
+tokens), but regressed catastrophically to `8221.2 / 63.9 / 8276.4ms`. The
+profile had only `16k` prefill tokens, but `506` prefill batches, `505`
+prefix-reuse batches, and `499` graph misses, so longer hits fragmented into
+many tiny suffix passes. A follow-up using mixed-prefix batching with
+`TORCHINFERNO_CONTINUOUS_NON_COMMON_PREFIX_GRAPH_PREFILL=1`,
+`TORCHINFERNO_CONTINUOUS_MIXED_PREFIX_PREFILL=1`, and
+`TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_CAPTURE_ON_MISS=0` avoided the crash and
+collapsed to `34` prefill batches, but still regressed to
+`1898.7 / 128.3 / 2031.5ms`, `981/1000` correct. The counters explain the
+failure: `98,523` reused prefix tokens and `18,543` prefill tokens, but
+`16.64s` prefill forward / `28.58s` prefill wall and `11.55s` prefill state
+time. Do not default full-prompt reuse until non-common prefix prefill is both
+graph-safe and cheap enough to beat recomputing the compact full prompts.
+
+The vLLM startup failure has an inference-bench fix, not a TorchInferno change.
+A vLLM-only confirmation with
+`--compilation-config '{"pass_config":{"fuse_allreduce_rms":false}}'` wrote
+`agent_space/vllm_disable_allreduce_rms_results/.../8xH100-local-vllm-disable-allreduce-rms-20260702/runs/20260702_092631`
+and started successfully, landing at `162.9 / 53.6 / 216.9ms`, `981/1000`
+correct. inference-bench commit `455dd782` now applies that default unless a
+caller supplies their own `--compilation-config` or sets
+`INFERENCE_BENCH_VLLM_DISABLE_ALLREDUCE_RMS_FUSION=0`.
+
 ## Priority for a focused (non-loop) session
 
 1. Prefill MFU (Issue 1) — biggest TTFT lever, ~2x, affects 3/5 benchmarks.
