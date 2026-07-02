@@ -198,6 +198,18 @@ still cost about `13.78ms/call`. The nearby explicit-off control had lower phase
 time (`19.21s`) and lower decode GPU (`9.61s`), so fusing only ragged RoPE and
 dense KV append is not a defaultable long-output lever.
 
+A ragged decode graph replay-input cleanup is rejected as well. A temporary
+env-gated patch moved the per-step rotary table gather into the captured graph
+body and skipped the replay-side `static_rotary_cos/sin` copies. The focused
+long_output run wrote
+`agent_space/ti_long_rotary_in_graph_results/.../8xH100-local-ti-long-rotary-in-graph-20260702/runs/20260702_045708`
+and was correct at `1000/1000`, but regressed the score row to
+`270.6 / 25.0 / 1283.7ms` with throughput `31.1`. Queue counters showed no
+useful mechanism: phase time was `19.87s`, ragged decode GPU `9.71s`, prefill
+wall `6.78s`, replay setup/graph replay accounting stayed in-family, and step
+calls rose to `576`. Keep the explicit static rotary copy path until a broader
+decode graph layout change can reduce actual per-step GPU work.
+
 ## Prior 20260701 refresh and local vLLM/SGLang checks
 
 Public run `20260701_211855` is stale for TorchInferno: it measured
