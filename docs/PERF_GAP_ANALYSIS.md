@@ -115,6 +115,18 @@ Do not re-open dense-row prefix graphing without first fixing graph-key/warmup
 reuse and proving it reduces prefill wall without the startup, memory, and p99
 tail cost.
 
+The token-budget executor stop-token lifecycle fix is accepted as a foundation
+change, not as a current public-score lever. The experimental token-budget path
+can coalesce decode steps and batch shared-prefix suffix prefill, which is useful
+for future non-common-prefix work, but stop-token finishes were previously only
+reflected in the stream emitter. A row that stopped inside a coalesced decode run
+could remain active in executor state, causing later precomputed decode steps to
+run or later grouped-prefix admissions to fall back to slower per-row prefill.
+The executor now clears stop-finished rows locally and skips stale decode chunks
+inside a decode-run payload. Focused CPU coverage exercises grouped-prefix
+prefill stop rows and decode-run stop rows; this does not change the default
+dense online batcher used by the current public run.
+
 ## Public 20260702_095238 refresh and sampled-medium active-cap lower bound
 
 The latest public all-provider run at

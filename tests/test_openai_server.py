@@ -12146,6 +12146,62 @@ def test_openai_token_budget_step_executor_batches_shared_prefix_suffix_prefill(
     )
 
 
+def test_openai_token_budget_grouped_prefill_releases_stop_rows() -> None:
+    engine = _cache_only_engine()
+    engine.stop_token_ids = frozenset({4})
+    model = _RowTargetPrefillModel()
+    engine.model = model
+    state = engine._start_token_budget_step_state(
+        cache_batch_size=2,
+        max_seq_len=8,
+        prefix=[1, 2],
+        temperature=0.0,
+    )
+
+    result = engine._execute_token_budget_step_payload(
+        {
+            "op": "token_budget_step",
+            "step": 0,
+            "chunks": [
+                {
+                    "request_id": "0",
+                    "row": 0,
+                    "kind": "prefill",
+                    "start_token": 2,
+                    "token_count": 1,
+                    "prompt_complete": True,
+                    "emits_token": True,
+                    "prefix": [1, 2],
+                    "prompt_chunk": [3],
+                    "prompt_tokens": 3,
+                    "max_tokens": 4,
+                },
+                {
+                    "request_id": "1",
+                    "row": 1,
+                    "kind": "prefill",
+                    "start_token": 2,
+                    "token_count": 1,
+                    "prompt_complete": True,
+                    "emits_token": True,
+                    "prefix": [1, 2],
+                    "prompt_chunk": [5],
+                    "prompt_tokens": 3,
+                    "max_tokens": 4,
+                },
+            ],
+            "finished_request_ids": [],
+        },
+        state,
+        temperature=0.0,
+    )
+
+    assert result.prefill_tokens == {"0": 4, "1": 6}
+    assert state.row_request_ids == [None, "1"]
+    assert state.active == [False, True]
+    assert model.forward_calls == [((0,), [[1, 2]]), ((0, 1), [[3], [5]])]
+
+
 def test_openai_persistent_prompt_list_state_sets_ragged_graph_capture(monkeypatch) -> None:
     engine = _cache_only_engine()
     model = _RowTargetPrefillModel()
@@ -13028,6 +13084,31 @@ def test_openai_token_budget_local_group_runner_releases_stop_finished_rows() ->
     assert stats.scheduler_steps == 3
     assert stats.step_commands == 2
     assert stats.empty_plans == 1
+    assert stats.emitted_tokens == 2
+    assert stats.finished_events == 1
+    assert stats.closed
+
+
+def test_openai_token_budget_decode_run_skips_rows_stopped_inside_run() -> None:
+    engine = _cache_only_engine()
+    engine.stop_token_ids = frozenset({3})
+    model = _RowTargetPrefillModel()
+    engine.model = model
+    first_queue: queue.Queue[object] = queue.Queue()
+    group = [_QueuedGeneration([1], 5, 0.0, True, first_queue)]
+
+    stats = engine._run_token_budget_group_local(
+        group,
+        max_active_rows=1,
+        max_scheduled_tokens=4,
+        decode_run_steps=3,
+    )
+
+    assert _queue_items(first_queue) == [2, _GenerationDone()]
+    assert group[0].done
+    assert engine._token_budget_step_state is None
+    assert model.forward_calls == [((0,), [[1]]), ((0,), [[2]])]
+    assert stats.decode_run_commands == 1
     assert stats.emitted_tokens == 2
     assert stats.finished_events == 1
     assert stats.closed

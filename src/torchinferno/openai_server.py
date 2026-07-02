@@ -10529,7 +10529,10 @@ class OpenAICompletionEngine:
             state.seq_lens[row] = len(prompt)
             state.next_token_tensor[row] = 0 if token_id is None else int(token_id)
             state.active[row] = bool(active)
-            state.row_request_ids[row] = request_id if max_tokens > 0 else None
+            if token_id is not None and int(token_id) in self.stop_token_ids:
+                state.row_request_ids[row] = None
+            else:
+                state.row_request_ids[row] = request_id if max_tokens > 0 else None
         return tokens
 
     def _execute_token_budget_prefill_chunk(
@@ -10591,6 +10594,9 @@ class OpenAICompletionEngine:
         token_id = int(next_token.item())
         state.next_token_tensor[row] = token_id
         state.generated_tokens[row] += 1
+        if token_id in self.stop_token_ids:
+            state.active[row] = False
+            state.row_request_ids[row] = None
         return token_id
 
     def _copy_token_budget_prefix_for_chunk(
@@ -10650,11 +10656,15 @@ class OpenAICompletionEngine:
         request_ids: list[str] = []
         rows: list[int] = []
         input_tokens: list[int] = []
+        result: dict[str, int | None] = {}
         for chunk in chunks:
             request_id = str(chunk.get("request_id"))
             row = int(chunk["row"])
             if row < 0 or row >= state.cache_batch_size:
                 raise ValueError("token-budget decode row is out of range")
+            if state.row_request_ids[row] is None and not state.active[row]:
+                result[request_id] = None
+                continue
             if state.row_request_ids[row] != request_id or not state.active[row]:
                 raise ValueError("token-budget decode requires an active matching row")
             if int(chunk["token_count"]) != 1:
@@ -10662,6 +10672,8 @@ class OpenAICompletionEngine:
             request_ids.append(request_id)
             rows.append(row)
             input_tokens.append(int(state.next_token_tensor[row].item()))
+        if not input_tokens:
+            return result
 
         actual_batch = len(input_tokens)
         padded_batch = _decode_graph_padded_batch(actual_batch, state.cache_batch_size)
@@ -10700,12 +10712,14 @@ class OpenAICompletionEngine:
                     temperature,
                 )
         token_values = [int(token_id) for token_id in next_tokens.detach().cpu().tolist()]
-        result: dict[str, int | None] = {}
         for request_id, row, token_id in zip(request_ids, rows, token_values):
             state.next_token_tensor[row] = token_id
             state.generated_tokens[row] += 1
             state.seq_lens[row] = int(state.seq_lens[row].item()) + 1
             result[request_id] = token_id
+            if token_id in self.stop_token_ids:
+                state.active[row] = False
+                state.row_request_ids[row] = None
         return result
 
     def _execute_token_budget_decode_chunk(
@@ -10717,6 +10731,8 @@ class OpenAICompletionEngine:
         row: int,
         temperature: float,
     ) -> int | None:
+        if state.row_request_ids[row] is None and not state.active[row]:
+            return None
         if state.row_request_ids[row] != request_id or not state.active[row]:
             raise ValueError("token-budget decode requires an active matching row")
         if int(chunk["token_count"]) != 1:
@@ -10730,6 +10746,9 @@ class OpenAICompletionEngine:
         state.next_token_tensor[row] = token_id
         state.generated_tokens[row] += 1
         state.seq_lens[row] = int(state.seq_lens[row].item()) + 1
+        if token_id in self.stop_token_ids:
+            state.active[row] = False
+            state.row_request_ids[row] = None
         return token_id
 
     def _handle_token_budget_start_payload(self, payload: Mapping[str, object]) -> _TokenBudgetStepState:
