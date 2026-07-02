@@ -99,6 +99,22 @@ decode batches, and `153` decode-many calls. This run keeps the row-adoption
 change validated across all public benchmark shapes, but it does not reopen the
 rejected long_output scheduling knobs.
 
+A dense-row prefix-graph prototype is rejected and was backed out. The idea was
+to route common-prefix suffix prefill through a `row_indices=None` ragged-prefill
+graph when active rows were exactly `0..batch-1`, so the model could copy the
+shared prefix into a dense destination slice instead of using advanced row
+indexing. A focused long_output run with
+`TORCHINFERNO_CONTINUOUS_DENSE_ROW_PREFIX_GRAPH=1` wrote
+`agent_space/ti_long_dense_prefix_results/.../runs/20260702_152740` and kept
+correctness at `1000/1000`, but landed at `267.8 / 26.0 / 1256.6ms` with p99
+TTFT/E2E `2552/4367ms`. Startup ready time rose to `306.3s`, GPU memory during
+warmup reached roughly `85GB`, and the queue profile regressed prefill wall to
+`15.15s` (`14.21s` forward) with `10` request-path graph captures
+(`9.44s` capture time). Decode GPU time stayed in the same band at `10.15s`.
+Do not re-open dense-row prefix graphing without first fixing graph-key/warmup
+reuse and proving it reduces prefill wall without the startup, memory, and p99
+tail cost.
+
 ## Public 20260702_095238 refresh and sampled-medium active-cap lower bound
 
 The latest public all-provider run at
