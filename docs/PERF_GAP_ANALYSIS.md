@@ -28,8 +28,19 @@ TTFT / TPOT / E2E:
 TorchInferno now wins median TPOT on few_shot, multi_turn, and tree_of_thought,
 plus self_consistency E2E and throughput. It still loses SGLang on TTFT/E2E for
 few_shot, multi_turn, tree_of_thought, and long_output, and narrowly misses
-long_output TPOT. This refresh confirms the current code path and recent
-inference-bench provider fixes are runnable, but it does not change the
+long_output TPOT. The TorchInferno queue profile explains the remaining losses:
+few_shot reused the `122` token common prefix, but still spent `1.61s` in
+prefill forward and `0.77s` in ragged decode GPU across the two client waves;
+multi_turn reused only the `45` token shared prefix and spent `4.27s` in prefill
+forward; tree reused the same `45` token shared prefix and spent `2.21s` in
+prefill forward plus `1.45s` in ragged decode GPU; long_output reused the `111`
+token common prefix but still spent `6.06s` in prefill forward and `10.08s` in
+ragged decode GPU across `740` decode batches. The long_output decode-many path
+was already active (`150` calls, `393` steps, `22.5k` model tokens), so the
+gap is not an obvious disabled decode-many fast path.
+
+This refresh confirms the current code path and recent inference-bench provider
+fixes are runnable, but it does not change the
 remaining engineering diagnosis: multi_turn needs TP-safe non-common prefix
 reuse that does not fragment prefill, tree needs cheaper steady sampled-medium
 prefix-suffix prefill/decode, and long_output needs a decode/prefill policy that
