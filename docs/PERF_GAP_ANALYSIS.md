@@ -157,6 +157,19 @@ with the control (`request_queue_to_first_token_p50=125.6ms`, prefill wall
 `2.92s`, ragged decode GPU `1.49s`), so this is a narrow graph-coverage fix, not
 a tree scheduling breakthrough.
 
+Raising the sampled FlashInfer decode cutoff to include tree's `max_tokens=300`
+is rejected. The env-only run with
+`TORCHINFERNO_CONTINUOUS_FI_DECODE_SAMPLED_MAX_TOKENS=400` on pushed `c6f04e8`
+wrote
+`agent_space/ti_tree_fi_sampled400_results/.../runs/20260702_200138` and
+landed at `154.7 / 63.0 / 190.6ms`, `957/992` correct, versus the adjacent
+static-logits-warm control's `147.5 / 29.2 / 174.6ms`. The run still had zero
+decode misses/captures, but ordinary decode GPU time rose (`1.49s -> 1.70s`)
+and queue-to-finish median rose (`148.9ms -> 165.1ms`) despite fewer scheduler
+steps (`109 -> 99`). Keep the sampled FlashInfer decode default scoped to
+`max_tokens <= 256`; tree's 300-token branch remains faster on the dense ragged
+logits path.
+
 A current-head focused multi_turn profile on pushed `325cdf4` wrote
 `agent_space/ti_multi_325cdf4_results/.../runs/20260702_192513` and landed at
 `303.1 / 61.8 / 361.8ms`, `983/1000` correct. The new miss-shape field stayed
