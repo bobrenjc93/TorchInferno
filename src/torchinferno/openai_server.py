@@ -133,6 +133,8 @@ def _flashinfer_prefill_warmup_batch_sizes(batch_sizes: Sequence[int]) -> tuple[
 def _online_decode_warmup_batch_sizes(*, max_active: int, cache_batch: int) -> tuple[int, ...]:
     active_limit = min(max(1, int(max_active)), max(1, int(cache_batch)))
     batch_sizes = {active_limit}
+    if active_limit >= 3:
+        batch_sizes.add(3)
     bucket = 1
     while bucket <= active_limit:
         batch_sizes.add(bucket)
@@ -3290,8 +3292,8 @@ class OpenAICompletionEngine:
         # pow2 (e.g. 64 when max_active=128) drops that range to eager decode.
         # Prefix rows are only copied during prefill; warming cache_batch would
         # capture a 144-row decode graph under the default 128 active + 16 prefix
-        # envelope even though no decode step can use it. The small exact shapes
-        # cover fallbacks when no free active row is available to pad.
+        # envelope even though no decode step can use it. Exact batch 3 covers
+        # the observed no-free-row fallback without restoring the old 3..8 set.
         batch_sizes = list(_online_decode_warmup_batch_sizes(
             max_active=max_active,
             cache_batch=cache_batch,

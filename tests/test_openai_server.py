@@ -718,6 +718,7 @@ def test_openai_decode_warmup_excludes_prefix_cache_rows() -> None:
     assert _online_decode_warmup_batch_sizes(max_active=128, cache_batch=144) == (
         1,
         2,
+        3,
         4,
         8,
         16,
@@ -728,6 +729,7 @@ def test_openai_decode_warmup_excludes_prefix_cache_rows() -> None:
     assert _online_decode_warmup_batch_sizes(max_active=48, cache_batch=112) == (
         1,
         2,
+        3,
         4,
         8,
         16,
@@ -737,13 +739,14 @@ def test_openai_decode_warmup_excludes_prefix_cache_rows() -> None:
     assert _online_decode_warmup_batch_sizes(max_active=128, cache_batch=64) == (
         1,
         2,
+        3,
         4,
         8,
         16,
         32,
         64,
     )
-    assert _online_decode_warmup_batch_sizes(max_active=7, cache_batch=7) == (1, 2, 4, 7)
+    assert _online_decode_warmup_batch_sizes(max_active=7, cache_batch=7) == (1, 2, 3, 4, 7)
     assert _online_decode_warmup_batch_sizes(max_active=3, cache_batch=3) == (1, 2, 3)
 
 
@@ -850,11 +853,13 @@ def test_openai_unified_scheduler_warmup_captures_ragged_logits_graphs(monkeypat
     assert model.token_ragged_shapes == [
         (1, 1, (0,)),
         (2, 1, (0, 1)),
+        (3, 1, (0, 1, 2)),
         (4, 1, (0, 1, 2, 3)),
     ]
     assert [shape[:2] + (shape[3],) for shape in model.ragged_shapes] == [
         (1, 1, (0,)),
         (2, 1, (0, 1)),
+        (3, 1, (0, 1, 2)),
         (4, 1, (0, 1, 2, 3)),
     ]
     assert engine._persistent_serving_cache is cache

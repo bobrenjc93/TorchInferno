@@ -107,19 +107,33 @@ queue-to-first p99 from `1276ms` to `839ms`.
 
 Pruning redundant online decode warmup shapes is accepted as a startup-safety
 follow-up. The warmed runtime ragged decode path buckets active rows to powers
-of two plus the active cap, so exact small non-power batches such as `3`, `5`,
-`6`, and `7` did not add request-time coverage but did add extra
-symmetric-memory graph warmup rendezvous points. A focused long_output run on
-pushed `3085141` plus the local pruning patch wrote
+of two plus the active cap; exact small non-power batches `5`, `6`, and `7`
+did not add request-time coverage but did add extra symmetric-memory graph
+warmup rendezvous points. A focused long_output run on pushed `3085141` plus
+the local pruning patch wrote
 `agent_space/ti_long_pruned_decode_warmup_results/.../runs/20260702_183607`.
 It reached readiness in `200.9s`, captured `8` startup FlashInfer decode graphs
 instead of the previous larger set, completed `1000/1000` requests, and landed
 at `243.5 / 25.0 / 1188.6ms` with p99 TTFT/E2E `1110.2/1936.7ms`. The queue
 profile stayed clean: prefill graph hits/misses `60/0`, decode graph
 hits/misses `745/0`, runtime decode graph captures `0`, prefill wall `5.89s`,
-and ragged decode GPU `10.17s`. Keep symmetric-memory decode warmup enabled;
-the rejected no-symm-decode-warmup probe avoided startup risk but regressed
-long_output tails and decode GPU time.
+and ragged decode GPU `10.17s`. A full TorchInferno-only run on pushed
+`51977ce`
+(`agent_space/ti_main_51977ce_full_results/.../runs/20260702_184338`) then
+showed why exact `3` should remain: after earlier benchmarks consumed active-row
+state, long_output hit one request-time `ragged_decode:token:b3:rows1` capture
+(`651ms`) even though prefill and decode graph misses were otherwise zero. Keep
+exact `3` as the no-free-row fallback, but do not restore the old `5..8` exact
+set. The accepted exact-3 follow-up
+`agent_space/ti_main_exact3_decode_warmup_results/.../runs/20260702_185228`
+kept readiness at `200.8s`, warmed `9` startup FlashInfer decode graphs,
+completed the full TorchInferno-only run, and moved long_output to
+`250.4 / 24.8 / 1129.7ms` with p99 TTFT/E2E `783.5/1962.6ms`. Its long_output
+queue profile had prefill graph hits/misses `66/0`, decode graph hits/misses
+`720/0`, runtime decode graph captures `0`, prefill wall `6.23s`, and ragged
+decode GPU `9.88s`. Keep symmetric-memory decode warmup enabled; the rejected
+no-symm-decode-warmup probe avoided startup risk but regressed long_output tails
+and decode GPU time.
 
 Common-prefix row adoption is kept as a lifecycle/correctness fix, not as a
 new scheduling knob. The old common-prefix path computed the shared prefix in
