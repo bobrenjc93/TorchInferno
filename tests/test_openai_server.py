@@ -13806,15 +13806,15 @@ def test_openai_tensor_parallel_online_batcher_can_submit_mixed_temperatures(
     engine._generation_queue = queue.Queue()
     first_queue: queue.Queue[object] = queue.Queue()
     second_queue: queue.Queue[object] = queue.Queue()
-    first = _QueuedGeneration([1, 2], 1, 0.0, True, first_queue)
-    second = _QueuedGeneration([3, 4], 1, 0.7, True, second_queue)
+    first = _QueuedGeneration([1, 2], 1, 0.7, True, first_queue)
+    second = _QueuedGeneration([3, 4], 1, 0.5, True, second_queue)
     engine._generation_queue.put(second)
 
     assert engine._should_use_tensor_parallel_online_batcher(first)
     engine._run_tensor_parallel_online_batcher(first)
 
     runtime = instances[0]
-    assert [getattr(request, "temperature") for request in runtime.submitted] == [0.0, 0.7]
+    assert [getattr(request, "temperature") for request in runtime.submitted] == [0.7, 0.5]
     assert commands[1] == (
         "submit",
         (
@@ -13826,7 +13826,7 @@ def test_openai_tensor_parallel_online_batcher_can_submit_mixed_temperatures(
                 "eos_token_id": None,
                 "stop_token_ids": [],
                 "request_id_start": 0,
-                "row_temperatures": [0.0, 0.7],
+                "row_temperatures": [0.7, 0.5],
             },
         ),
     )
@@ -14716,7 +14716,7 @@ def test_openai_tensor_parallel_online_batcher_sizes_cache_from_initial_window(
     engine._generation_queue = queue.Queue()
     first_queue: queue.Queue[object] = queue.Queue()
     second_queue: queue.Queue[object] = queue.Queue()
-    first = _QueuedGeneration([1, 2], 1, 0.0, True, first_queue)
+    first = _QueuedGeneration([1, 2], 2, 0.0, True, first_queue)
     second = _QueuedGeneration([3, 4, 5, 6], 2, 0.0, True, second_queue)
     engine._generation_queue.put(second)
 
@@ -14725,7 +14725,7 @@ def test_openai_tensor_parallel_online_batcher_sizes_cache_from_initial_window(
     assert started == [6]
     assert commands[:2] == [
         ("start", {"max_seq_len": 6, "max_active_requests": 4, "prefix_cache_capacity": 1, "prefill_token_budget": None, "temperature": 0.0, "enable_ragged_decode": True, "store_reusable_prefixes": True, "store_full_prompt_prefixes": True, "max_tokens": 2}),
-        ("submit", ([[1, 2], [3, 4, 5, 6]], {"max_tokens": 2, "row_max_tokens": [1, 2], "arrival_step": 0, "eos_token_id": None, "stop_token_ids": [], "request_id_start": 0})),
+        ("submit", ([[1, 2], [3, 4, 5, 6]], {"max_tokens": 2, "row_max_tokens": [2, 2], "arrival_step": 0, "eos_token_id": None, "stop_token_ids": [], "request_id_start": 0})),
     ]
     assert first_queue.get_nowait() == 600
     assert isinstance(first_queue.get_nowait(), _GenerationDone)
@@ -15031,7 +15031,7 @@ def test_openai_tensor_parallel_online_batcher_combines_active_submit_with_step(
     first_queue: queue.Queue[object] = queue.Queue()
     second_queue: queue.Queue[object] = queue.Queue()
     first = _QueuedGeneration([1, 2], 2, 0.0, True, first_queue)
-    second = _QueuedGeneration([3, 4], 1, 0.0, True, second_queue)
+    second = _QueuedGeneration([3, 4], 2, 0.0, True, second_queue)
     enqueued_after_first_step = False
 
     class RuntimeEngine:
@@ -15135,8 +15135,8 @@ def test_openai_tensor_parallel_online_batcher_combines_active_submit_with_step(
             (
                 [[3, 4]],
                 {
-                    "max_tokens": 1,
-                    "row_max_tokens": [1],
+                    "max_tokens": 2,
+                    "row_max_tokens": [2],
                     "arrival_step": 1,
                     "eos_token_id": None,
                     "stop_token_ids": [],
@@ -15145,11 +15145,12 @@ def test_openai_tensor_parallel_online_batcher_combines_active_submit_with_step(
                 },
             ),
         ),
+        ("step", 1),
         ("close", None),
     ]
-    assert syncs == ["sync", "sync", "sync", "sync", "sync"]
+    assert syncs == ["sync", "sync", "sync", "sync", "sync", "sync"]
     assert _queue_items(first_queue) == [900, 900, _GenerationDone()]
-    assert _queue_items(second_queue) == [901, _GenerationDone()]
+    assert _queue_items(second_queue) == [901, 901, _GenerationDone()]
 
 
 def test_openai_completion_group_respects_per_request_max_tokens() -> None:

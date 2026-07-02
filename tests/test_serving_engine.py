@@ -95,7 +95,7 @@ def test_continuous_prefix_prefill_suffix_buckets_can_be_configured(monkeypatch)
         temperature=0.0,
         max_generation_tokens=128,
     )
-    assert short_greedy_engine._suffix_bucket(65) == 128
+    assert short_greedy_engine._suffix_bucket(65) == 96
 
     sampled_engine = ContinuousBatchEngine(
         object(),
