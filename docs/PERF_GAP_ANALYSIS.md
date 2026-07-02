@@ -187,6 +187,17 @@ and better score-facing TTFT. Do not add a small side-stream D2H copy shim as a
 default; the long-output gap still needs a real prefill/decode/readback pipeline
 or lower decode GPU work.
 
+A fused Triton ragged RoPE+KV-append probe is also rejected for long_output. The
+env-only run with `TORCHINFERNO_TRITON_RAGGED_DECODE_ROTARY_APPEND=1` wrote
+`agent_space/ti_long_triton_ragged_rotary_append_results/.../8xH100-local-ti-long-triton-ragged-rotary-append-20260702/runs/20260702_044748`
+and stayed correct at `1000/1000`, but the score-facing row was only
+`260.9 / 25.0 / 1159.8ms` with p99 E2E `2428.7ms`. The queue profile did not
+show a decode-kernel win: phase time was `19.81s`, ragged decode GPU was
+`10.20s`, prefill wall was `6.76s`, and the largest `b64/64` decode-many shape
+still cost about `13.78ms/call`. The nearby explicit-off control had lower phase
+time (`19.21s`) and lower decode GPU (`9.61s`), so fusing only ragged RoPE and
+dense KV append is not a defaultable long-output lever.
+
 ## Prior 20260701 refresh and local vLLM/SGLang checks
 
 Public run `20260701_211855` is stale for TorchInferno: it measured
