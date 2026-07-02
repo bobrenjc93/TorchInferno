@@ -2379,14 +2379,12 @@ class ContinuousBatchEngine:
         if (
             self.graph_prefill
             and suffix_lengths
-            and env_flag("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SPLIT_SUFFIX_BUCKETS", False)
+            and self._prefix_prefill_split_suffix_buckets_enabled()
         ):
-            by_suffix_bucket: dict[int, list[tuple[int, ServingRequest, int, _ReusablePrefix]]] = defaultdict(list)
-            for item, suffix_len in zip(group, suffix_lengths):
-                by_suffix_bucket[self._suffix_bucket(max(1, suffix_len))].append(item)
-            if len(by_suffix_bucket) > 1:
+            split_groups = self._prefix_prefill_suffix_bucket_split_groups(group, suffix_lengths)
+            if split_groups is not None:
                 active: list[_ActiveRequest] = []
-                for suffix_group in by_suffix_bucket.values():
+                for suffix_group in split_groups:
                     active.extend(self._prefill_prefix_batch(suffix_group, step, events=events))
                 return active
         if self.graph_prefill and suffix_lengths and max(suffix_lengths) > 0:
@@ -2469,6 +2467,72 @@ class ContinuousBatchEngine:
             self._record_token_event(events, state, next_token, step, finished=self._should_finish_before_decode(state))
             active.append(state)
         return active
+
+    def _prefix_prefill_split_suffix_buckets_enabled(self) -> bool:
+        env_name = "TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SPLIT_SUFFIX_BUCKETS"
+        if env_name in os.environ:
+            return env_flag(env_name, False)
+        if self.temperature > 0.0 or self.max_generation_tokens is None:
+            return False
+        greedy_short_max_tokens = env_int(
+            "TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SPLIT_SUFFIX_BUCKETS_GREEDY_SHORT_MAX_TOKENS",
+            128,
+            minimum=1,
+        )
+        if not (0 < int(self.max_generation_tokens) <= greedy_short_max_tokens):
+            return False
+        return env_flag(
+            "TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SPLIT_SUFFIX_BUCKETS_GREEDY_SHORT",
+            True,
+        )
+
+    def _prefix_prefill_suffix_bucket_split_groups(
+        self,
+        group: list[tuple[int, ServingRequest, int, _ReusablePrefix]],
+        suffix_lengths: Sequence[int],
+    ) -> list[list[tuple[int, ServingRequest, int, _ReusablePrefix]]] | None:
+        by_suffix_bucket: dict[int, list[tuple[int, ServingRequest, int, _ReusablePrefix]]] = defaultdict(list)
+        for item, suffix_len in zip(group, suffix_lengths):
+            by_suffix_bucket[self._suffix_bucket(max(1, suffix_len))].append(item)
+        if len(by_suffix_bucket) <= 1:
+            return None
+
+        base_bucket = self._suffix_bucket(max(suffix_lengths))
+        base_model_tokens = self._prefill_batch_bucket(len(group)) * base_bucket
+        split_model_tokens = sum(
+            self._prefill_batch_bucket(len(items)) * suffix_bucket
+            for suffix_bucket, items in by_suffix_bucket.items()
+        )
+        if split_model_tokens >= base_model_tokens:
+            return None
+        min_savings_pct = env_int(
+            "TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SPLIT_SUFFIX_BUCKETS_MIN_SAVINGS_PCT",
+            0,
+            minimum=0,
+        )
+        if min_savings_pct > 0 and (
+            (base_model_tokens - split_model_tokens) * 100 < base_model_tokens * min_savings_pct
+        ):
+            return None
+        min_group_size = env_int(
+            "TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SPLIT_SUFFIX_BUCKETS_MIN_GROUP",
+            1,
+            minimum=1,
+        )
+        default_min_fill_pct = 75 if self._prefix_prefill_split_suffix_buckets_enabled() else 0
+        min_fill_pct = env_int(
+            "TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SPLIT_SUFFIX_BUCKETS_MIN_FILL_PCT",
+            default_min_fill_pct,
+            minimum=0,
+        )
+        for items in by_suffix_bucket.values():
+            if len(items) < min_group_size:
+                return None
+            if min_fill_pct > 0 and (
+                len(items) * 100 < self._prefill_batch_bucket(len(items)) * min_fill_pct
+            ):
+                return None
+        return list(by_suffix_bucket.values())
 
     def _prefill_exact_prefix_batch(
         self,

@@ -128,6 +128,24 @@ row regressed to `374.8 / 63.0 / 425.0ms`, `982/1000` correct. Keep the split
 as an opt-in diagnostic only; multi_turn still needs longer conversation-prefix
 reuse or a non-fragmenting mixed-prefix suffix path.
 
+Guarded suffix-bucket splitting is accepted only for greedy-short long_output.
+The default policy now enables the split for deterministic `max_tokens<=128`
+sessions, but only when the actual admitted group reduces predicted prefill
+graph tokens and every split subgroup is at least `75%` full. The current-head
+control
+`agent_space/ti_long_row_phase_results/.../runs/20260702_224930` landed at
+`248.9 / 24.8 / 1142.5ms`, `1000/1000` correct, with `44,715` active suffix
+tokens inside `91,136` prefix-graph tokens and `5.31s` prefill forward. The
+guarded env A/B
+`agent_space/ti_long_guarded_suffix_split_results/.../runs/20260702_225711`
+cut prefix-graph tokens to `80,032` and moved the row to
+`254.2 / 24.0 / 1128.5ms`. The no-env patched confirmation
+`agent_space/ti_long_greedy_split_default_results/.../runs/20260702_230348`
+landed at `256.9 / 24.4 / 1134.1ms`, `1000/1000` correct, with prefill forward
+down to `5.00s` and prefix-graph tokens at `80,096`. This is a TPOT/E2E and
+throughput tradeoff, not a TTFT fix; sampled tree and greedy-large multi_turn
+stay on their rejected opt-in paths.
+
 A narrower decode-many-while-waiting policy is also rejected and not in source.
 The temporary patch allowed decode-many only while the ready queue was below the
 same refill floor that would admit the next prefill wave, trying to reduce

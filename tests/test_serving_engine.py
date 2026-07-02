@@ -1964,6 +1964,7 @@ def test_continuous_batch_engine_graph_prefill_buckets_batch_and_matches() -> No
 def test_continuous_batch_engine_can_split_prefix_graph_by_suffix_bucket(monkeypatch) -> None:
     monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SPLIT_SUFFIX_BUCKETS", "1")
     monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SUFFIX_BUCKETS", "4,8")
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SPLIT_SUFFIX_BUCKETS_MIN_FILL_PCT", "0")
     monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_COMMON_PREFIX_RAGGED_SUFFIX_MAX_PREFIX_TOKENS", "0")
     shared = tuple(range(16))
     model = _SelectedLogitsToyModel(vocab_size=128)
@@ -2011,6 +2012,63 @@ def test_continuous_batch_engine_can_split_prefix_graph_by_suffix_bucket(monkeyp
     assert engine.stats.prefill_shape_model_tokens[
         "prefix_graph:b2:s4:p16-16:src1:mixed0"
     ] == 8
+
+
+def test_continuous_batch_engine_suffix_bucket_split_requires_model_token_savings(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SUFFIX_BUCKETS", "4,8")
+    engine = ContinuousBatchEngine(
+        object(),
+        device=torch.device("cpu"),
+        max_active_requests=32,
+        graph_prefill=True,
+    )
+    group = [
+        (index, ServingRequest(str(index), tuple(range(16 + suffix_len)), 1), 16, object())
+        for index, suffix_len in enumerate([4] * 17 + [5] * 15)
+    ]
+
+    split_groups = engine._prefix_prefill_suffix_bucket_split_groups(
+        group, [len(request.prompt) - prefix_tokens for _index, request, prefix_tokens, _reusable in group]
+    )
+
+    assert split_groups is None
+
+
+def test_continuous_batch_engine_suffix_bucket_split_default_scope(monkeypatch) -> None:
+    monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SPLIT_SUFFIX_BUCKETS", raising=False)
+    monkeypatch.delenv(
+        "TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SPLIT_SUFFIX_BUCKETS_GREEDY_SHORT",
+        raising=False,
+    )
+    greedy_short = ContinuousBatchEngine(
+        object(),
+        device=torch.device("cpu"),
+        temperature=0.0,
+        max_generation_tokens=128,
+    )
+    greedy_mid = ContinuousBatchEngine(
+        object(),
+        device=torch.device("cpu"),
+        temperature=0.0,
+        max_generation_tokens=256,
+    )
+    sampled_short = ContinuousBatchEngine(
+        object(),
+        device=torch.device("cpu"),
+        temperature=0.7,
+        max_generation_tokens=128,
+    )
+
+    assert greedy_short._prefix_prefill_split_suffix_buckets_enabled()
+    assert not greedy_mid._prefix_prefill_split_suffix_buckets_enabled()
+    assert not sampled_short._prefix_prefill_split_suffix_buckets_enabled()
+
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SPLIT_SUFFIX_BUCKETS_GREEDY_SHORT", "0")
+    assert not greedy_short._prefix_prefill_split_suffix_buckets_enabled()
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SPLIT_SUFFIX_BUCKETS", "1")
+    assert sampled_short._prefix_prefill_split_suffix_buckets_enabled()
 
 
 def test_continuous_batch_engine_reuses_exact_common_prompt_without_suffix_prefill() -> None:
