@@ -162,6 +162,20 @@ active-row, generated-prefix, or full-prompt reuse knobs; the remaining win stil
 needs TP-safe per-conversation prefix reuse or a cheaper batched non-common
 prefix path.
 
+A suffix-bucket admission-affinity probe is also rejected. A local patch kept
+the first ready request as the admission anchor, then filled the wave with other
+ready requests sharing the same reusable-prefix hit length and suffix graph
+bucket before falling back to normal arrival order. The run
+`agent_space/ti_multi_bucket_affinity_results/.../runs/20260702_194240` landed
+at `308.0 / 61.9 / 362.2ms`, `981/1000` correct, so it slightly regressed the
+current-head control. The queue profile explains why this should not be kept:
+prefill wall rose `4.29s -> 4.44s`, prefill forward rose `3.82s -> 3.96s`, and
+queue-to-first p50/p99 moved from `239.8/466.3ms` to `245.2/501.7ms`. It also
+shifted one extra wave into `b32:s128` without reducing the dominant `b32:s144`
+work. Keep the existing arrival-order greedy-large admission; the prior
+shortest-suffix priority and this weaker bucket-affinity variant both fail to
+turn suffix bucketing into a multi_turn win.
+
 Common-prefix row adoption is kept as a lifecycle/correctness fix, not as a
 new scheduling knob. The old common-prefix path computed the shared prefix in
 one prefix row, then tried to acquire a second prefix row just to store a
