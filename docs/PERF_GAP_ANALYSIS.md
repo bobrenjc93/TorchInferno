@@ -6201,6 +6201,23 @@ rose from `27.1ms` to `36.0ms`. Decode-specific Triton norm/SwiGLU paths are
 already default-on; keep the broader prefill RMSNorm path opt-in until it shows
 a clear win on more than noisy long_output E2E.
 
+A local decode-many tail gate is rejected. The public profile showed an
+expensive-looking small `decode_many:b8/8` tail, so a throwaway patch added an
+env-gated minimum-active check and tested
+`TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY_MIN_ACTIVE=16` on long_output. The
+run wrote
+`agent_space/ti_long_decodemany_min16_results/.../8xH100-local-ti-long-decodemany-min16-20260702/runs/20260702_073649`
+and landed at `243.2 / 24.7 / 1209.9ms` with `1000/1000` correct. The adjacent
+patched no-env control wrote
+`agent_space/ti_long_decodemany_control2_results/.../8xH100-local-ti-long-decodemany-control2-20260702/runs/20260702_074223`
+and landed at `256.9 / 25.1 / 1212.5ms`. The median movement was too small and
+the counters contradicted the intended mechanism: the min-active run raised
+decode GPU time (`9.96s` to `10.20s`), decode-many model tokens (`16,453` to
+`20,441`), skipped tokens (`271` to `399`), and stop finishes (`372` to `490`).
+Both adjacent profiles also lacked the public run's small decode-many tail
+shape, so the local patch was removed. Do not add a decode-many minimum-active
+gate without a stronger, reproducible tail signal.
+
 ## Priority for a focused (non-loop) session
 
 1. Prefill MFU (Issue 1) — biggest TTFT lever, ~2x, affects 3/5 benchmarks.
