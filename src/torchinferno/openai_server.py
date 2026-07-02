@@ -5581,6 +5581,7 @@ class OpenAICompletionEngine:
             "prefill_shape_counts",
             "prefill_graph_capture_shape_counts",
             "decode_graph_capture_shape_counts",
+            "decode_graph_miss_shape_counts",
             "decode_shape_counts",
         ):
             value = getattr(stats, name, None)

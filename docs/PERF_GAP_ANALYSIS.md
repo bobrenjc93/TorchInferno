@@ -135,6 +135,17 @@ decode GPU `9.88s`. Keep symmetric-memory decode warmup enabled; the rejected
 no-symm-decode-warmup probe avoided startup risk but regressed long_output tails
 and decode GPU time.
 
+Decode graph miss-shape profiling is added as instrumentation, not as a new
+scheduling default. Queue profiles now emit
+`runtime_decode_graph_miss_shape_counts` beside the aggregate miss counter. A
+focused tree probe after the exact-3 warmup change wrote
+`agent_space/ti_tree_static_decode_miss_shapes_results/.../runs/20260702_191417`
+and landed at `145.1 / 56.3 / 175.1ms`, `955/992` correct. Its single runtime
+decode graph miss was `{"static_decode:logits:b3":1}` with zero request-path
+decode graph captures, so the residual tree miss in this run was a static
+fallback shape rather than ragged decode warmup coverage. Keep treating tree as
+sampled-prefix/suffix prefill and steady decode bound.
+
 Common-prefix row adoption is kept as a lifecycle/correctness fix, not as a
 new scheduling knob. The old common-prefix path computed the shared prefix in
 one prefix row, then tried to acquire a second prefix row just to store a

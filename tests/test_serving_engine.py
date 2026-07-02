@@ -236,6 +236,13 @@ class _CaptureReportingRaggedGraphToyModel(_RaggedGraphToyModel):
         )
 
 
+class _MissingRaggedGraphToyModel(_RaggedGraphToyModel):
+    def try_decode_ragged_logits_graph(self, input_ids, cache, *, seq_lens, row_indices):
+        del input_ids, cache, seq_lens, row_indices
+        self.ragged_logits_graph_calls += 1
+        return None
+
+
 class _StaticDecodeGraphToyModel(_RaggedGraphToyModel):
     def __init__(self, vocab_size: int = 64) -> None:
         super().__init__(vocab_size)
@@ -3015,6 +3022,31 @@ def test_continuous_batch_engine_records_ragged_decode_graph_captures() -> None:
     }
 
 
+def test_continuous_batch_engine_records_ragged_decode_graph_miss_shapes() -> None:
+    model = _MissingRaggedGraphToyModel()
+    engine = ContinuousBatchEngine(
+        model,
+        device=torch.device("cpu"),
+        max_active_requests=3,
+        prefix_cache_capacity=0,
+        profile_timings=True,
+    )
+
+    engine.run(
+        [
+            ServingRequest("short", (1, 2), 2, arrival_step=0),
+            ServingRequest("medium", (3, 4, 5), 2, arrival_step=0),
+            ServingRequest("long", (6, 7, 8, 9), 2, arrival_step=0),
+        ]
+    )
+
+    assert engine.stats.decode_graph_hits == 0
+    assert engine.stats.decode_graph_misses == 1
+    assert engine.stats.decode_graph_miss_shape_counts == {
+        "ragged_decode:logits:b3:rows1": 1,
+    }
+
+
 def test_continuous_batch_engine_skips_native_ragged_token_graph_for_sampled_decode() -> None:
     class _SampledRaggedGraphToyModel(_RaggedGraphToyModel):
         def __init__(self) -> None:
@@ -3288,6 +3320,7 @@ def test_continuous_batch_engine_skips_decode_capture_for_generated_prefix_cache
         prefix_cache_capacity=1,
         enable_ragged_decode=False,
         generated_prefix_cache=True,
+        profile_timings=True,
     )
 
     results = engine.run(
@@ -3303,6 +3336,7 @@ def test_continuous_batch_engine_skips_decode_capture_for_generated_prefix_cache
     assert model.static_logits_graph_calls == 0
     assert engine.stats.decode_graph_hits == 0
     assert engine.stats.decode_graph_misses == 2
+    assert engine.stats.decode_graph_miss_shape_counts == {"static_decode:logits:b2": 2}
     assert engine.stats.decode_model_calls == 2
 
 

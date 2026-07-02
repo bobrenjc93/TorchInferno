@@ -282,6 +282,7 @@ class ServingStats:
     prefill_shape_counts: dict[str, int] = field(default_factory=dict)
     prefill_graph_capture_shape_counts: dict[str, int] = field(default_factory=dict)
     decode_graph_capture_shape_counts: dict[str, int] = field(default_factory=dict)
+    decode_graph_miss_shape_counts: dict[str, int] = field(default_factory=dict)
     decode_shape_counts: dict[str, int] = field(default_factory=dict)
 
 
@@ -5176,7 +5177,11 @@ class ContinuousBatchEngine:
             capture_on_miss=self._decode_capture_on_miss(),
         )
         if token is None:
-            self.stats.decode_graph_misses += 1
+            self._record_decode_graph_miss(
+                input_ids,
+                row_indices,
+                graph_kind="token",
+            )
         else:
             self._record_decode_graph_capture_state(
                 getattr(self.model, "_last_ragged_decode_graph_captured", None),
@@ -5209,6 +5214,19 @@ class ContinuousBatchEngine:
         else:
             self.stats.decode_graph_replays += 1
             self.stats.decode_graph_replay_ms += elapsed_ms
+
+    def _record_decode_graph_miss(
+        self,
+        input_ids: Tensor,
+        row_indices: Tensor | None,
+        *,
+        graph_kind: str,
+    ) -> None:
+        self.stats.decode_graph_misses += 1
+        self._record_shape_count(
+            self.stats.decode_graph_miss_shape_counts,
+            self._ragged_decode_graph_shape_key(input_ids, row_indices, graph_kind=graph_kind),
+        )
 
     @staticmethod
     def _ragged_decode_graph_shape_key(
@@ -5249,7 +5267,7 @@ class ContinuousBatchEngine:
             capture_on_miss=self._decode_capture_on_miss(),
         )
         if token is None:
-            self.stats.decode_graph_misses += 1
+            self._record_static_decode_graph_miss(input_ids, graph_kind="token")
             self._report_static_graph_miss(input_ids, cache, "token_graph_returned_none")
         return token
 
@@ -5265,7 +5283,7 @@ class ContinuousBatchEngine:
             if logits is not None:
                 self.stats.decode_graph_hits += 1
                 return logits
-            self.stats.decode_graph_misses += 1
+            self._record_static_decode_graph_miss(input_ids, graph_kind="logits")
             self._report_static_graph_miss(input_ids, cache, "logits_graph_returned_none")
         else:
             self._report_static_graph_miss(input_ids, cache, "no_logits_graph")
@@ -5291,6 +5309,13 @@ class ContinuousBatchEngine:
             f"token_failed={getattr(self.model, '_decode_graph_failed', None)} "
             f"logits_failed={getattr(self.model, '_decode_logits_graph_failed', None)}",
             flush=True,
+        )
+
+    def _record_static_decode_graph_miss(self, input_ids: Tensor, *, graph_kind: str) -> None:
+        self.stats.decode_graph_misses += 1
+        self._record_shape_count(
+            self.stats.decode_graph_miss_shape_counts,
+            f"static_decode:{graph_kind}:b{int(input_ids.size(0))}",
         )
 
     def _ragged_decode_logits(
@@ -5320,7 +5345,11 @@ class ContinuousBatchEngine:
                     graph_kind="logits",
                 )
                 return logits
-            self.stats.decode_graph_misses += 1
+            self._record_decode_graph_miss(
+                input_ids,
+                row_indices,
+                graph_kind="logits",
+            )
         decode = getattr(self.model, "decode_ragged_logits", None)
         if decode is None:
             raise RuntimeError("model does not support ragged decode")
