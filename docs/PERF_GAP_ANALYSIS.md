@@ -106,6 +106,19 @@ only makes the online decode graph warmup match the runtime request scope, with
 escape hatch and `TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_STARTUP=0`
 respected when the targeted override is unset.
 
+Rechecking the scoped greedy-short initial wait after the decode-warmup fix is
+still rejected. With
+`TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_INITIAL_BATCH_WAIT_MS=10`, the run
+`agent_space/ti_long_initwait10_postsymm_results/.../8xH100-local-ti-long-initwait10-postsymm-20260702/runs/20260702_030927`
+kept correctness at `1000/1000` and raised the initial batch from `2` to `10`,
+but the row moved to `235.9 / 25.7 / 1240.1ms` with worse p99
+TTFT/TPOT/E2E (`1538.9 / 104.3 / 2269.8ms`) than the no-env patched run.
+The queue profile showed no request-path decode captures, so the loss is normal
+work: prefill wall/forward rose to `6.67/5.74s`, decode GPU rose to `9.72s`,
+decode-many work rose to `141` calls / `358` steps / `21,708` model tokens, and
+phase time rose to `19.75s`. Keep greedy-short initial wait at `0ms`; the
+remaining long_output gap is not the first-wave collection window.
+
 ## Prior 20260701 refresh and local vLLM/SGLang checks
 
 Public run `20260701_211855` is stale for TorchInferno: it measured
