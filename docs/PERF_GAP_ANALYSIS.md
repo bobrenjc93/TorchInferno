@@ -6452,6 +6452,33 @@ first-token stayed at `825ms`. Keep the sampled-medium active cap at `32`; the
 extra rows reduce median queueing a little but increase decode/prefill work and
 tail latency.
 
+A current-head TorchInferno-only full refresh on pushed `401888a` wrote
+`agent_space/ti_current_full_results/.../8xH100/runs/20260702_132520`.
+The rows were few_shot `170.4 / 50.1 / 211.0ms`, self_consistency
+`182.5 / 0.0 / 195.6ms`, multi_turn `306.9 / 60.3 / 359.1ms`,
+tree_of_thought `154.3 / 44.8 / 184.9ms`, and long_output
+`240.3 / 25.4 / 1225.6ms`, all with normal correctness bands
+(`977/1000`, `1000/1000`, `981/1000`, `957/992`, `1000/1000`). Versus the
+public `20260702_095238` TorchInferno row this confirms the current head
+improved self_consistency E2E materially and nudged multi_turn/long_output TTFT,
+but it still loses the public vLLM/SGLang targets on multi_turn TTFT/E2E, tree
+TTFT/E2E, and long_output decode/E2E.
+
+The queue split from that run matches the remaining work rather than pointing to
+a small default knob. multi_turn still reused only the shared `45` token prefix
+for all `1000` requests, with `3.80s` prefill forward and no request-specific
+reuse (`runtime_prefix_reuse_hit_token_counts={"45":1000}`). tree_of_thought
+had stable common-prefix graph reuse (`60` prefix graph batches, no misses), but
+still spent `2.41s` in prefill forward and `1.49s` in ragged decode GPU. The
+long_output row reused the `111` token common prefix, then spent `9.76s` in
+ragged decode GPU across `705` decode batches; decode-many handled `140` bursts
+and `358` steps (`20.9k` model tokens), so the fast 64-wide decode graph is
+already being used after the queue drains. The gap is therefore not another
+tail-bucket tweak: multi_turn needs batched TP-safe non-common prefix reuse, tree
+needs faster steady sampled-medium prefix-suffix prefill/decode, and long_output
+needs a decode/prefill pipeline policy that improves medians without the known
+waiting-decode tail regression.
+
 ## Priority for a focused (non-loop) session
 
 1. Prefill MFU (Issue 1) — biggest TTFT lever, ~2x, affects 3/5 benchmarks.
