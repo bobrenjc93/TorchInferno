@@ -6386,6 +6386,21 @@ requests, with `85,398` prefill tokens and `4.48s` prefill wall. Closing multi
 requires TP-safe per-conversation prefix reuse that can still batch and replay
 stable prefill shapes.
 
+Persistent online continuation now keeps the already-started runtime alive for
+compatible idle batches instead of broadcasting a fresh online start and calling
+`start_online()` again. That fixes the opt-in mode's command semantics and keeps
+the runtime prefix index available across compatible bursts, but it is not a
+multi_turn win by itself. A current-head probe with
+`TORCHINFERNO_OPENAI_TP_ONLINE_PERSISTENT=1` wrote
+`agent_space/ti_multi_persistent_results/.../8xH100-local-ti-multi-persistent-20260702/runs/20260702_134747`
+and landed at `304.7 / 62.7 / 359.5ms`, `981/1000` correct. The queue counters
+stayed essentially identical to default: `34` prefill batches, `3.85s` prefill
+forward, `4.30s` prefill wall, and only `{"common_prefix":1000}` /
+`{"45":1000}` prefix reuse. p50 first-token improved slightly
+(`250.3ms -> 243.9ms`) but p99 first-token regressed (`356.3ms -> 472.7ms`) and
+throughput fell, so keep persistent mode opt-in for multi_turn until paired with
+a cheap request-specific prefix reuse path.
+
 Pinned full-prompt stores remain rejected on current head. Enabling
 `TORCHINFERNO_CONTINUOUS_PINNED_FULL_PROMPT_STORE_MIN_MAX_TOKENS=1` with
 `TORCHINFERNO_OPENAI_TP_ONLINE_PREFIX_ROWS=112` wrote

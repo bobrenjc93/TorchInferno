@@ -13943,6 +13943,116 @@ def test_openai_tensor_parallel_online_batcher_collects_idle_arrivals(
     assert _queue_items(third_queue)[0] == 701
 
 
+def test_openai_tensor_parallel_online_persistent_keeps_started_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_PERSISTENT", "1")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_CONTINUOUS_BATCHER", "1")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_DECODE_QUANTUM", "1")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_INITIAL_BATCH_WAIT_MS", "0")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_IDLE_BATCH_WAIT_MS", "0")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_PREFIX_ROWS", "1")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_MAX_SEQ_LEN_HEADROOM_TOKENS", "0")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_PREFILL_TOKEN_BUDGET", "0")
+    model = type("FakeTPModel", (), {"world_size": 2, "rank": 0, "allocate_cache": lambda self: None})()
+    commands: list[tuple[str, object]] = []
+    start_calls = 0
+
+    class RuntimeEngine:
+        def __init__(self, *args, **kwargs) -> None:  # noqa: ANN002, ANN003
+            del args, kwargs
+            self.pending: list[object] = []
+
+        def start_online(self, *, max_seq_len: int, external_cache: object | None = None) -> None:
+            nonlocal start_calls
+            del max_seq_len, external_cache
+            start_calls += 1
+
+        def submit_online(self, request: object) -> None:
+            self.pending.append(request)
+
+        def has_online_work(self) -> bool:
+            return bool(self.pending)
+
+        def step_online(self) -> list[object]:
+            events = [
+                types.SimpleNamespace(
+                    request_id=getattr(request, "request_id"),
+                    token=800 + int(getattr(request, "request_id")),
+                    finished=True,
+                )
+                for request in self.pending
+            ]
+            self.pending.clear()
+            return events
+
+    class ScriptedGenerationQueue:
+        def __init__(self, items: list[object]) -> None:
+            self.items = list(items)
+
+        def get_nowait(self) -> object:
+            raise queue.Empty
+
+        def get(self, timeout: float | None = None) -> object:
+            del timeout
+            if self.items:
+                return self.items.pop(0)
+            raise queue.Empty
+
+        def put(self, item: object) -> None:
+            self.items.append(item)
+
+    monkeypatch.setattr(
+        "torchinferno.openai_server._is_tensor_parallel_model",
+        lambda candidate: candidate is model,
+    )
+    monkeypatch.setattr("torchinferno.openai_server._RuntimeContinuousBatchEngine", RuntimeEngine)
+    monkeypatch.setattr(
+        "torchinferno.openai_server._tensor_parallel_symm_mem_allreduce_scope",
+        lambda *args, **kwargs: nullcontext(),
+    )
+    monkeypatch.setattr(
+        "torchinferno.openai_server._broadcast_tensor_parallel_online_start",
+        lambda model, **kwargs: commands.append(("start", kwargs)),
+    )
+    monkeypatch.setattr(
+        "torchinferno.openai_server._broadcast_tensor_parallel_online_submit_prompt_lists",
+        lambda model, prompts, **kwargs: commands.append(("submit", (prompts, kwargs))),
+    )
+    monkeypatch.setattr(
+        "torchinferno.openai_server._broadcast_tensor_parallel_online_step",
+        lambda model, steps=1: commands.append(("step", steps)),
+    )
+    monkeypatch.setattr(
+        "torchinferno.openai_server._broadcast_tensor_parallel_online_close",
+        lambda model: commands.append(("close", None)),
+    )
+    monkeypatch.setattr(
+        "torchinferno.openai_server._sync_tensor_parallel_command",
+        lambda model, device, **kwargs: None,
+    )
+
+    first_queue: queue.Queue[object] = queue.Queue()
+    second_queue: queue.Queue[object] = queue.Queue()
+    first = _QueuedGeneration([1, 2], 1, 0.0, True, first_queue)
+    second = _QueuedGeneration([3, 4], 1, 0.0, True, second_queue)
+    engine = _cache_only_engine()
+    engine.model = model
+    engine.stop_token_ids = frozenset()
+    engine.max_batch_size = 4
+    engine._generation_queue = ScriptedGenerationQueue([second, None])  # type: ignore[assignment]
+
+    engine._run_tensor_parallel_online_batcher(first)
+
+    assert start_calls == 1
+    assert [name for name, _payload in commands].count("start") == 1
+    submit_commands = [command for command in commands if command[0] == "submit"]
+    assert [payload[0] for _name, payload in submit_commands] == [[[1, 2]], [[3, 4]]]
+    assert [payload[1]["request_id_start"] for _name, payload in submit_commands] == [0, 1]
+    assert _queue_items(first_queue)[0] == 800
+    assert _queue_items(second_queue)[0] == 801
+
+
 def test_openai_tensor_parallel_online_batcher_uses_queued_limit_for_default_rows(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

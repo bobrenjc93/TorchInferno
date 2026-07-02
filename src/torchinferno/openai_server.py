@@ -5273,27 +5273,6 @@ class OpenAICompletionEngine:
                                         idle_batch.append(more)
                                     else:
                                         deferred.append(more)
-                                _broadcast_tensor_parallel_online_start(
-                                    self.model,
-                                    max_seq_len=max_seq_len,
-                                    max_active_requests=max_active,
-                                    prefix_cache_capacity=prefix_rows,
-                                    prefill_token_budget=prefill_budget if prefill_budget > 0 else None,
-                                    temperature=first.temperature,
-                                    enable_ragged_decode=enable_ragged_decode,
-                                    store_reusable_prefixes=store_reusable_prefixes,
-                                    store_full_prompt_prefixes=store_full_prompt_prefixes,
-                                    max_tokens=run_max_tokens,
-                                )
-                                _reset_generation_cache(shared_cache)
-                                runtime_engine.start_online(
-                                    max_seq_len=max_seq_len,
-                                    external_cache=shared_cache,
-                                )
-                                _sync_tensor_parallel_command(self.model, self.device)
-                                request_by_id.clear()
-                                next_request_id = 0
-                                step = 0
                             elif collect_idle_arrivals and idle_wait_s > 0.0:
                                 deadline = time.perf_counter() + idle_wait_s
                                 while len(idle_batch) < max_active:
