@@ -3209,6 +3209,21 @@ power-of-two padding. This did exercise the intended shapes
 this result; the power-of-two graph replay shape is faster despite extra padded
 rows.
 
+A narrower decode-many-only variant is also rejected on current `5b25a4e` plus
+a local env-gated source patch. The focused long_output run
+`agent_space/ti_long_decode_many_fine_buckets_results/.../8xH100/runs/20260702_130453`
+completed 1000/1000 correct with
+`TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY_BUCKET_SIZES=4,8,16,24,32,40,48,56,64`
+but regressed to `279.2 / 24.9 / 1395.8ms`, with p99 TTFT/E2E
+`2623/3934ms`. The profile did reduce ragged padding versus the current public
+long_output profile (`7.93K -> 6.22K` padded tokens), but it introduced four
+request-path decode graph captures for `b24`, `b40`, `b48`, and `b56`, costing
+`2.79s`; ragged decode GPU time rose from the public `10.48s` to `12.80s` and
+online phase time rose from `19.58s` to `22.73s`. The source patch was reverted.
+Keep decode-many on the existing graph-warmed power-of-two bucket family unless
+non-power decode shapes can be warmed and replayed without request-path captures
+and without the prior broad-bucket GPU regression.
+
 A same-host long-output provider refresh on current TorchInferno `4fb4065`
 (`20260626_170958`, isolation monitor disabled because an unrelated small GPU
 process tripped the guard in the first attempt) confirms the local gap:
