@@ -50,6 +50,23 @@ pipeline improvement: reduce per-step decode GPU time, fuse or replace the
 remaining decode-heavy kernels, or pipeline prefill/decode/readback so
 long_output can approach vLLM's `16.9ms` TPOT without worsening TTFT/E2E tails.
 
+One follow-up from the current decode profile is also rejected. Profiling a
+single FlashInfer decode step on pushed `dd78e77` showed `23.6ms` self CUDA:
+`8.0ms` in 160 `aten::copy_` calls, `6.2ms` in 160 NCCL all-reduces, `4.8ms`
+in dense GEMMs, and `2.6ms` in Marlin gate/up GEMMs. A guarded Triton
+FlashInfer KV append micro-kernel matched the torch reference in a focused CUDA
+test, but the no-profile long_output A/B with
+`TORCHINFERNO_TRITON_FLASHINFER_KV_APPEND=1` regressed the score row to
+`275.5 / 25.4 / 1236.1ms` versus the nearby default band around
+`237.7 / 25.4 / 1204.4ms` and the full-run row `251.0 / 24.5 / 1254.1ms`.
+The run wrote
+`agent_space/ti_long_fi_triton_kv_results/.../8xH100-local-ti-long-fi-triton-kv-20260702/runs/20260702_020647`
+and kept correctness at `1000/1000`, but queue counters still showed
+`11.79s` decode GPU time, `6.66s` prefill wall, `720` decode graph hits, and
+`7,320` ragged padding tokens. Replacing only the indexed FlashInfer KV write
+is not a defaultable win; the remaining `copy_` profile needs a broader
+layout/capture or decode pipeline change.
+
 ## Prior 20260701 refresh and local vLLM/SGLang checks
 
 Public run `20260701_211855` is stale for TorchInferno: it measured
