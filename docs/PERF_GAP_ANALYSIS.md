@@ -6306,8 +6306,15 @@ when active rows were effectively full did not make it defaultable:
 `244.8 / 24.7 / 1183.7ms`, and `MIN_ACTIVE=64` wrote
 `agent_space/ti_decode_many_wait64_results/.../8xH100/runs/20260702_105339` at
 `265.5 / 25.1 / 1181.6ms`; both kept `1000/1000` correctness but worsened p99
-TTFT/E2E to about `1.5s` / `2.2-2.3s`. Keep the hook env-only for diagnostics;
-do not enable it by default without a policy that improves medians and tails.
+TTFT/E2E to about `1.5s` / `2.2-2.3s`. Reducing the command quantum did not
+rescue the policy: the current-head check with
+`TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_GEN_DECODE_QUANTUM=2` wrote
+`agent_space/ti_long_waitdq2_results/.../8xH100-local-ti-long-waitdq2-20260702/runs/20260702_133611`
+and landed at `658.8 / 17.6 / 1402.9ms`, `1000/1000` correct. It expanded
+decode-many to `420` bursts / `840` steps and lowered TPOT, but queue-to-first
+p50/p99 still rose to `633ms` / `2.02s` while prefill forward rose to `7.63s`.
+Keep the hook env-only for diagnostics; do not enable it by default without a
+policy that improves medians and tails.
 
 `TORCHINFERNO_COMPILED_POST_ATTENTION=1` is not a defaultable runtime win. A
 focused long_output check wrote
