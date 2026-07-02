@@ -3914,6 +3914,7 @@ def test_continuous_batch_engine_online_many_can_overcompute_stop_tokens(monkeyp
         prefix_cache_capacity=0,
         enable_ragged_decode=True,
         store_reusable_prefixes=False,
+        profile_timings=True,
     )
     engine.start_online(max_seq_len=16)
     engine.submit_online(ServingRequest("a", (1, 2, 3), 4, arrival_step=0, eos_token_id=5))
@@ -3940,6 +3941,11 @@ def test_continuous_batch_engine_online_many_can_overcompute_stop_tokens(monkeyp
     assert engine.stats.decode_many_skipped_tokens == 2
     assert engine.stats.decode_many_stop_finishes == 1
     assert engine.stats.decode_many_limit_finishes == 1
+    assert engine.stats.decode_many_shape_model_tokens == {"decode_many:b2/2": 6}
+    assert engine.stats.decode_many_shape_emitted_tokens == {"decode_many:b2/2": 4}
+    assert engine.stats.decode_many_shape_skipped_tokens == {"decode_many:b2/2": 2}
+    assert engine.stats.decode_many_shape_stop_finishes == {"decode_many:b2/2": 1}
+    assert engine.stats.decode_many_shape_limit_finishes == {"decode_many:b2/2": 1}
     assert engine.stats.ragged_decode_active_tokens == 6
     assert engine.stats.ragged_decode_padding_tokens == 0
     assert not engine.has_online_work()

@@ -5631,10 +5631,19 @@ class OpenAICompletionEngine:
             "decode_graph_capture_shape_counts",
             "decode_graph_miss_shape_counts",
             "decode_shape_counts",
+            "decode_many_shape_model_tokens",
+            "decode_many_shape_emitted_tokens",
+            "decode_many_shape_skipped_tokens",
+            "decode_many_shape_stop_finishes",
+            "decode_many_shape_limit_finishes",
         ):
             value = getattr(stats, name, None)
             if isinstance(value, Mapping):
-                limit = 64 if name == "decode_shape_counts" else 32
+                limit = (
+                    64
+                    if name == "decode_shape_counts" or name.startswith("decode_many_shape_")
+                    else 32
+                )
                 top_counts = sorted(
                     value.items(),
                     key=lambda item: (-int(item[1]), str(item[0])),

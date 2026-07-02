@@ -233,6 +233,11 @@ class ServingStats:
     decode_many_stop_finishes: int = 0
     decode_many_limit_finishes: int = 0
     decode_many_cpu_tokens_ms: float = 0.0
+    decode_many_shape_model_tokens: dict[str, int] = field(default_factory=dict)
+    decode_many_shape_emitted_tokens: dict[str, int] = field(default_factory=dict)
+    decode_many_shape_skipped_tokens: dict[str, int] = field(default_factory=dict)
+    decode_many_shape_stop_finishes: dict[str, int] = field(default_factory=dict)
+    decode_many_shape_limit_finishes: dict[str, int] = field(default_factory=dict)
     prefix_reuse_requests: int = 0
     prefix_reuse_tokens: int = 0
     queued_requests: int = 0
@@ -728,7 +733,7 @@ class ContinuousBatchEngine:
 
         self._sync_gpu_last_tokens_from_states(active)
         self._sync_gpu_seq_lens_from_states(active)
-        records: list[tuple[list[_ActiveRequest], int, list[int], list[bool]]] = []
+        records: list[tuple[list[_ActiveRequest], int, list[int], list[bool], str | None]] = []
         token_parts: list[Tensor] = []
         shape_parts: list[tuple[str, int]] = []
         steps_run = 0
@@ -739,6 +744,7 @@ class ContinuousBatchEngine:
             self.stats.scheduler_steps += 1
             next_token_tensor = self._decode_ragged_batch_token_tensor(states)
             token_parts.append(next_token_tensor[: len(states)].detach().clone())
+            shape_key: str | None = None
             if self.profile_timings:
                 shape_key = f"decode_many:b{len(states)}/{int(next_token_tensor.numel())}"
                 shape_parts.append((shape_key, len(states)))
@@ -759,7 +765,7 @@ class ContinuousBatchEngine:
                     next_active.append(state)
             if self.profile_timings:
                 self.stats.decode_ragged_state_update_ms += (time.perf_counter() - state_update_start_s) * 1000.0
-            records.append((states, step, generated_after, finished_by_limit))
+            records.append((states, step, generated_after, finished_by_limit, shape_key))
             active = next_active
             steps_run += 1
 
@@ -789,9 +795,13 @@ class ContinuousBatchEngine:
         stop_finishes = 0
         limit_finishes = 0
         offset = 0
-        for states, step, generated_after, finished_by_limit in records:
+        for states, step, generated_after, finished_by_limit, shape_key in records:
             row_tokens = flat_tokens[offset : offset + len(states)]
             offset += len(states)
+            record_emitted_tokens = 0
+            record_skipped_tokens = 0
+            record_stop_finishes = 0
+            record_limit_finishes = 0
             for state, token_value, generated, limit_finished in zip(
                 states,
                 row_tokens,
@@ -801,6 +811,7 @@ class ContinuousBatchEngine:
                 state_id = id(state)
                 if state_id in terminated:
                     skipped_tokens += 1
+                    record_skipped_tokens += 1
                     continue
                 token = int(token_value)
                 state.tokens.append(token)
@@ -816,13 +827,42 @@ class ContinuousBatchEngine:
                         finished=finished,
                     )
                 )
+                record_emitted_tokens += 1
                 if finished:
                     if stop_finished:
                         stop_finishes += 1
+                        record_stop_finishes += 1
                     if limit_finished:
                         limit_finishes += 1
+                        record_limit_finishes += 1
                     terminated.add(state_id)
                     self._finish_and_release(state, step)
+            if shape_key is not None:
+                self._record_shape_total(
+                    self.stats.decode_many_shape_model_tokens,
+                    shape_key,
+                    len(states),
+                )
+                self._record_shape_total(
+                    self.stats.decode_many_shape_emitted_tokens,
+                    shape_key,
+                    record_emitted_tokens,
+                )
+                self._record_shape_total(
+                    self.stats.decode_many_shape_skipped_tokens,
+                    shape_key,
+                    record_skipped_tokens,
+                )
+                self._record_shape_total(
+                    self.stats.decode_many_shape_stop_finishes,
+                    shape_key,
+                    record_stop_finishes,
+                )
+                self._record_shape_total(
+                    self.stats.decode_many_shape_limit_finishes,
+                    shape_key,
+                    record_limit_finishes,
+                )
 
         self.stats.decode_many_calls += 1
         self.stats.decode_many_steps += steps_run
@@ -4909,6 +4949,11 @@ class ContinuousBatchEngine:
         if not self.profile_timings:
             return
         counts[key] = counts.get(key, 0) + 1
+
+    def _record_shape_total(self, counts: dict[str, int], key: str, amount: int) -> None:
+        if not self.profile_timings:
+            return
+        counts[key] = counts.get(key, 0) + int(amount)
 
     def _record_shape_time(
         self,

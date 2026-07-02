@@ -6950,6 +6950,31 @@ completed 1000/1000 correct and improved median TPOT/E2E to
 decode GPU rose to `10.80s`. Since q8 already closes the public TPOT cell
 without that tail cost, keep q12 as an opt-in throughput/median-E2E tradeoff.
 
+Current head now exports per-shape decode-many counters in queue profiles:
+`runtime_decode_many_shape_model_tokens`,
+`runtime_decode_many_shape_emitted_tokens`,
+`runtime_decode_many_shape_skipped_tokens`,
+`runtime_decode_many_shape_stop_finishes`, and
+`runtime_decode_many_shape_limit_finishes`. The next long-output profile should
+use these before changing the drain policy again: the global counters prove
+q8/q12 trade off skipped stop-token work against fewer command steps, but the
+shape split is needed to tell whether the waste is concentrated in large
+64-wide graph batches, narrow tail batches, or a small set of stop-heavy prompt
+shapes.
+
+A focused long-output reprofile with those counters
+(`agent_space/ti_long_decode_shape_results/.../8xH100-local-ti-long-decode-shape-20260702/runs/20260702_214353`)
+landed at `280.4 / 24.1 / 1150.7ms`, p99 E2E `1894.9ms`, and 1000/1000
+correct. The profile recorded `105` decode-many calls, `516` decode-many steps,
+`28.7k` active decode-many model tokens, `26.8k` emitted tokens, `1.87k`
+skipped tokens, and `680` stop-token finishes. The new shape counters show the
+dominant `decode_many:b64/64` shape consumed `14.98k` active tokens and
+`3.22s` GPU with only `385` skipped tokens (`2.6%`), while the higher skipped
+percentages were tail/narrow shapes such as `b48/64` (`15.8%`), `b51/64`
+(`17.7%`), `b47/64` (`31.1%`), and `b16/16` (`52.3%`). That rejects another
+global drain-quantum increase as the next default; any further decode-many
+change should be tail-specific and should preserve the full 64-wide drain path.
+
 The same full run also confirms that multi_turn's remaining TTFT/E2E gap is not
 a missing default env flip. It still has `34` prefill batches, `34/0` prefill
 graph hits/misses, and only `{"common_prefix":1000}` / `{"45":1000}` reuse.
