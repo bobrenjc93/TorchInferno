@@ -170,6 +170,28 @@ steps (`109 -> 99`). Keep the sampled FlashInfer decode default scoped to
 `max_tokens <= 256`; tree's 300-token branch remains faster on the dense ragged
 logits path.
 
+The pushed `fcb4567` TorchInferno-only full refresh wrote
+`agent_space/ti_full_fcb4567_results/.../runs/20260702_200744`. The rows were
+few_shot `171.5 / 47.8 / 210.3ms`, self_consistency `120.2 / 0.0 / 269.8ms`,
+multi_turn `316.0 / 62.5 / 368.7ms`, tree_of_thought
+`150.7 / 47.0 / 183.1ms`, and long_output `241.3 / 25.7 / 1235.1ms`.
+The full-order tree queue profile still had one static fallback miss,
+`{"static_decode:logits:b5":1}`, even though the focused tree run above had
+zero misses.
+
+Restoring exact small static-logits warmup is rejected. A source probe warmed
+static logits batches `5`, `6`, and `7` without restoring the earlier rejected
+ragged decode warmups, then ran the public-order prefix through tree:
+`agent_space/ti_tree_static_logits_small_results/.../runs/20260702_201606`.
+Readiness rose to `210.9s`, tree landed at `153.1 / 42.1 / 180.5ms`,
+`964/992` correct, and the queue profile still had a static miss, now
+`{"static_decode:logits:b2":1}`. The miss moving to an already-warmed batch
+showed that static graph misses are not keyed by batch alone; cache
+sequence/attention-block state matters. The runtime miss-shape instrumentation
+therefore now records static cache length when available, e.g.
+`static_decode:logits:b2:s3`, before spending more startup time on static
+fallback warmups.
+
 A current-head focused multi_turn profile on pushed `325cdf4` wrote
 `agent_space/ti_multi_325cdf4_results/.../runs/20260702_192513` and landed at
 `303.1 / 61.8 / 361.8ms`, `983/1000` correct. The new miss-shape field stayed

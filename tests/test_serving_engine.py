@@ -3336,7 +3336,10 @@ def test_continuous_batch_engine_skips_decode_capture_for_generated_prefix_cache
     assert model.static_logits_graph_calls == 0
     assert engine.stats.decode_graph_hits == 0
     assert engine.stats.decode_graph_misses == 2
-    assert engine.stats.decode_graph_miss_shape_counts == {"static_decode:logits:b2": 2}
+    assert engine.stats.decode_graph_miss_shape_counts == {
+        "static_decode:logits:b2:s2": 1,
+        "static_decode:logits:b2:s3": 1,
+    }
     assert engine.stats.decode_model_calls == 2
 
 

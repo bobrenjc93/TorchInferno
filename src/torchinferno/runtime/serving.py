@@ -5267,7 +5267,7 @@ class ContinuousBatchEngine:
             capture_on_miss=self._decode_capture_on_miss(),
         )
         if token is None:
-            self._record_static_decode_graph_miss(input_ids, graph_kind="token")
+            self._record_static_decode_graph_miss(input_ids, cache, graph_kind="token")
             self._report_static_graph_miss(input_ids, cache, "token_graph_returned_none")
         return token
 
@@ -5283,7 +5283,7 @@ class ContinuousBatchEngine:
             if logits is not None:
                 self.stats.decode_graph_hits += 1
                 return logits
-            self._record_static_decode_graph_miss(input_ids, graph_kind="logits")
+            self._record_static_decode_graph_miss(input_ids, cache, graph_kind="logits")
             self._report_static_graph_miss(input_ids, cache, "logits_graph_returned_none")
         else:
             self._report_static_graph_miss(input_ids, cache, "no_logits_graph")
@@ -5311,12 +5311,23 @@ class ContinuousBatchEngine:
             flush=True,
         )
 
-    def _record_static_decode_graph_miss(self, input_ids: Tensor, *, graph_kind: str) -> None:
+    def _record_static_decode_graph_miss(self, input_ids: Tensor, cache: object, *, graph_kind: str) -> None:
         self.stats.decode_graph_misses += 1
         self._record_shape_count(
             self.stats.decode_graph_miss_shape_counts,
-            f"static_decode:{graph_kind}:b{int(input_ids.size(0))}",
+            self._static_decode_graph_shape_key(input_ids, cache, graph_kind=graph_kind),
         )
+
+    @staticmethod
+    def _static_decode_graph_shape_key(input_ids: Tensor, cache: object, *, graph_kind: str) -> str:
+        key = f"static_decode:{graph_kind}:b{int(input_ids.size(0))}"
+        try:
+            seq_len = getattr(cache, "seq_len", None)
+        except Exception:
+            seq_len = None
+        if isinstance(seq_len, int):
+            return f"{key}:s{seq_len}"
+        return key
 
     def _ragged_decode_logits(
         self,
