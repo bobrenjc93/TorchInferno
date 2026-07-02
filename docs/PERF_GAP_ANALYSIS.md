@@ -39,6 +39,42 @@ Local SGLang `1a5977d` served long_output at
 confirms the remaining long_output competitor gap is mostly TorchInferno's
 prefill-to-first-token path, not steady token cadence.
 
+Same-host multi_turn/tree_of_thought checks on current pushed TorchInferno
+`c33d773` and local SGLang `1a5977d` isolate the remaining queue-facing gap.
+SGLang landed at multi_turn `152.0 / 109.0 / 262.7ms` and tree_of_thought
+`65.3 / 56.5 / 137.1ms`. TorchInferno landed at multi_turn
+`329.8 / 71.9 / 398.7ms` and tree_of_thought `147.8 / 31.2 / 174.4ms`.
+TorchInferno still wins TPOT, but SGLang wins TTFT/E2E/throughput. The
+TorchInferno multi_turn profile was graph-warm with no captures, `35` prefill
+batches, `4.44s` prefill wall (`3.96s` forward), `3.78s` ragged-decode GPU
+time, and only shared-prefix reuse (`{"common_prefix": 1000}`,
+`{"45": 1000}`). Per-turn medians were `602/742/257/276/300/349/362/423ms`;
+SGLang's were `399/124/134/133/219/155/165/181ms`. This keeps the gap in
+fewer/faster conversation-prefix suffix waves, not cold graph capture.
+
+Rejected multi_turn prefix-cache follow-ups on `c33d773`:
+
+- `TORCHINFERNO_CONTINUOUS_GENERATED_PREFIX_CACHE=1` is unsafe for this greedy
+  512-token route. The server hit a CUDA launch failure in prefix graph prefill
+  after startup, so generated-prefix reuse cannot be promoted for multi_turn
+  without a separate correctness fix.
+- Enabling pinned full-prompt stores for greedy-large requests
+  (`TORCHINFERNO_CONTINUOUS_PINNED_FULL_PROMPT_STORE_MIN_MAX_TOKENS=512`)
+  is rejected. It created request-prompt hits (`862` request-prompt reuses) but
+  regressed multi_turn to `8165.4 / 73.3 / 8236.6ms`; prefill wall rose to
+  `116.5s` because the non-common path incurred `501` prefill graph misses.
+- Adding `TORCHINFERNO_CONTINUOUS_NON_COMMON_PREFIX_GRAPH_PREFILL=1` removed
+  misses but still regressed to `7579.4 / 67.1 / 7638.7ms`. The profile showed
+  `187` request-path graph captures, `117.3s` prefill wall, and `105.0s`
+  prefill forward because exact context lengths produced too many graph keys.
+- Bucketing those non-common suffixes with
+  `TORCHINFERNO_CONTINUOUS_DYNAMIC_PREFIX_PREFILL_MAX_SUFFIX=32` reduced
+  captures to `22` and TTFT to `2160.7ms`, confirming the capture-key diagnosis,
+  but it still lost badly to the default `329.8ms` row. Prefill wall remained
+  `38.5s` with `26.0s` forward and `11.4s` prefill state work. Keep full-prompt
+  and non-common prefix graph reuse out of default multi_turn until the source
+  row copy/state path is redesigned, not just bucketed.
+
 Rejected follow-ups on `f8cc9d5`:
 
 - `TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_ADMIT_PER_STEP_CAP=32` removed the
