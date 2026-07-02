@@ -174,6 +174,19 @@ decode misses and long_output spent `10.30s` in ragged decode GPU with
 long-output TTFT/E2E and tree decode/throughput, not more request-path graph
 capture cleanup.
 
+A side-stream async ragged token-copy probe is rejected on this stack. The
+env-gated run
+`agent_space/ti_long_async_ragged_copy_results/.../8xH100-local-ti-long-async-ragged-copy-20260702/runs/20260702_042347`
+looked promising at `237.2 / 24.3 / 1125.6ms`, but the same working tree with
+the path defaulted on landed at only `256.6 / 25.2 / 1230.1ms`, and the paired
+explicit-off control landed at `235.2 / 25.1 / 1222.5ms`. Queue counters showed
+the mechanism was not stable: the default-on run issued `332` deferred token
+copies and had `19.69s` phase time, while the explicit-off control had no
+deferred copies, `19.21s` phase time, similar decode GPU (`9.72s` vs `9.61s`),
+and better score-facing TTFT. Do not add a small side-stream D2H copy shim as a
+default; the long-output gap still needs a real prefill/decode/readback pipeline
+or lower decode GPU work.
+
 ## Prior 20260701 refresh and local vLLM/SGLang checks
 
 Public run `20260701_211855` is stale for TorchInferno: it measured
