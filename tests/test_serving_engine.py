@@ -404,6 +404,7 @@ class _SelectedLogitsToyModel(_RaggedGraphToyModel):
         self.prefill_input_shapes: list[tuple[int, int]] = []
         self.prefill_row_indices: list[list[int]] = []
         self.prefill_capture_flags: list[bool] = []
+        self.prefill_prefix_copy_lens: list[int | None] = []
 
     def forward(
         self,
@@ -433,10 +434,11 @@ class _SelectedLogitsToyModel(_RaggedGraphToyModel):
 
     def try_prefill_ragged_logits_graph(
         self, input_ids, cache, *, seq_lens, row_indices, logit_positions,
-        context_len=None, src_prefix_row=None, capture_on_miss=True,
+        context_len=None, src_prefix_row=None, prefix_copy_len=None, capture_on_miss=True,
     ):
         del seq_lens, context_len
         self.prefill_capture_flags.append(bool(capture_on_miss))
+        self.prefill_prefix_copy_lens.append(prefix_copy_len)
         self.prefill_src_prefix_rows.append(
             None if src_prefix_row is None else src_prefix_row.detach().cpu().tolist()
         )
@@ -446,9 +448,11 @@ class _SelectedLogitsToyModel(_RaggedGraphToyModel):
         return self._ragged_prefill_compute(input_ids, logit_positions)
 
     def prefill_ragged_logits(
-        self, input_ids, cache, *, seq_lens, row_indices, logit_positions, context_len=None, src_prefix_row=None
+        self, input_ids, cache, *, seq_lens, row_indices, logit_positions, context_len=None,
+        src_prefix_row=None, prefix_copy_len=None,
     ):
         del seq_lens, context_len
+        self.prefill_prefix_copy_lens.append(prefix_copy_len)
         self.prefill_src_prefix_rows.append(
             None if src_prefix_row is None else src_prefix_row.detach().cpu().tolist()
         )
@@ -469,10 +473,12 @@ class _SelectedRaggedGraphMissToyModel(_SelectedLogitsToyModel):
         logit_positions,
         context_len=None,
         src_prefix_row=None,
+        prefix_copy_len=None,
         capture_on_miss=True,
     ):
         del seq_lens, context_len
         self.prefill_capture_flags.append(bool(capture_on_miss))
+        self.prefill_prefix_copy_lens.append(prefix_copy_len)
         if not capture_on_miss:
             return None
         self.prefill_src_prefix_rows.append(
@@ -497,6 +503,7 @@ class _CaptureReportingSelectedLogitsToyModel(_SelectedLogitsToyModel):
         logit_positions,
         context_len=None,
         src_prefix_row=None,
+        prefix_copy_len=None,
         capture_on_miss=True,
     ):
         logits = super().try_prefill_ragged_logits_graph(
@@ -507,6 +514,7 @@ class _CaptureReportingSelectedLogitsToyModel(_SelectedLogitsToyModel):
             logit_positions=logit_positions,
             context_len=context_len,
             src_prefix_row=src_prefix_row,
+            prefix_copy_len=prefix_copy_len,
             capture_on_miss=capture_on_miss,
         )
         self._last_ragged_prefill_graph_captured = (
@@ -1183,6 +1191,7 @@ def test_continuous_batch_engine_can_batch_mixed_prefix_hits(monkeypatch) -> Non
     assert by_id["turn1-b"].prefix_hit_tokens == len(shared) + 2
     assert by_id["turn1-c"].prefix_hit_tokens == len(shared) + 3
     assert any(rows is not None and len(rows) >= 3 for rows in model.prefill_src_prefix_rows)
+    assert max(value for value in model.prefill_prefix_copy_lens if value is not None) == len(shared) + 3
     assert engine.stats.prefill_prefix_reuse_batches <= 2
 
 

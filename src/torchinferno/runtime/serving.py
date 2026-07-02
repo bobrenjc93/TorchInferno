@@ -2024,6 +2024,7 @@ class ContinuousBatchEngine:
                 self.stats.prefill_setup_ms += (time.perf_counter() - setup_start_s) * 1000.0
             forward_start_s = time.perf_counter() if self.profile_timings else 0.0
             logits = None
+            prefix_copy_len = max(prefix_hits) if mixed_prefixes else None
             if not mixed_prefixes or env_flag("TORCHINFERNO_CONTINUOUS_MIXED_PREFIX_PREFILL_GRAPH", False):
                 logits = self._try_ragged_prefill_logits(
                     input_ids,
@@ -2032,11 +2033,18 @@ class ContinuousBatchEngine:
                     logit_positions,
                     context_len,
                     src_prefix_row,
+                    prefix_copy_len,
                     capture_on_miss=self._prefix_prefill_capture_on_miss(batch_bucket),
                 )
             if logits is None:
                 logits = self._ragged_prefill_logits_eager(
-                    input_ids, seq_lens, row_indices, logit_positions, context_len, src_prefix_row
+                    input_ids,
+                    seq_lens,
+                    row_indices,
+                    logit_positions,
+                    context_len,
+                    src_prefix_row,
+                    prefix_copy_len,
                 )
             if self.profile_timings and logits is not None:
                 # force the prefill graph/forward to complete for honest timing
@@ -2126,6 +2134,7 @@ class ContinuousBatchEngine:
         logit_positions: Tensor,
         context_len: int | None = None,
         src_prefix_row: Tensor | None = None,
+        prefix_copy_len: int | None = None,
         *,
         capture_on_miss: bool = True,
     ) -> Tensor | None:
@@ -2141,6 +2150,7 @@ class ContinuousBatchEngine:
             logit_positions=logit_positions,
             context_len=context_len,
             src_prefix_row=src_prefix_row,
+            prefix_copy_len=prefix_copy_len,
             capture_on_miss=capture_on_miss,
         )
         if logits is None:
@@ -2193,6 +2203,7 @@ class ContinuousBatchEngine:
         logit_positions: Tensor,
         context_len: int | None = None,
         src_prefix_row: Tensor | None = None,
+        prefix_copy_len: int | None = None,
     ) -> Tensor | None:
         eager = getattr(self.model, "prefill_ragged_logits", None)
         if eager is None:
@@ -2205,6 +2216,7 @@ class ContinuousBatchEngine:
             logit_positions=logit_positions,
             context_len=context_len,
             src_prefix_row=src_prefix_row,
+            prefix_copy_len=prefix_copy_len,
         )
 
     def _prefill_prefix_batch(

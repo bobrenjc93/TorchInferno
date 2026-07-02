@@ -1194,6 +1194,7 @@ class _StaticRaggedPrefillLogitsGraphCall:
     max_seq_len: int
     suffix_bucket: int
     context_len: int | None
+    prefix_copy_len: int | None
 
 
 @dataclass
@@ -4323,6 +4324,7 @@ class Llama3TensorParallelForCausalLM:
         logit_positions: Tensor,
         context_len: int | None = None,
         src_prefix_row: Tensor | None = None,
+        prefix_copy_len: int | None = None,
     ) -> Tensor:
         batch = input_ids.size(0)
         # Fold the prefix KV broadcast INTO the graph: copy [0:prefix_len] from
@@ -4348,7 +4350,11 @@ class Llama3TensorParallelForCausalLM:
                             0, src_prefix_row
                         )[:, :, :prefix_len, :]
             else:
-                prefix_len = int(start_positions.max().item()) if start_positions.numel() else 0
+                prefix_len = (
+                    int(prefix_copy_len)
+                    if prefix_copy_len is not None
+                    else int(start_positions.max().item()) if start_positions.numel() else 0
+                )
                 if prefix_len > 0:
                     source_rows = src_prefix_row
                     if source_rows.numel() == 1 and row_indices.numel() > 1:
@@ -5003,6 +5009,7 @@ class Llama3TensorParallelForCausalLM:
         logit_positions: Tensor,
         context_len: int | None = None,
         src_prefix_row: Tensor | None = None,
+        prefix_copy_len: int | None = None,
     ) -> Tensor:
         # Eager reference for the ragged-prefill graph: prefill a [batch, suffix]
         # block of tokens into scattered cache rows with per-row prefix offsets,
@@ -5050,6 +5057,7 @@ class Llama3TensorParallelForCausalLM:
             logit_positions,
             context_len,
             src_prefix_row,
+            prefix_copy_len,
         )
 
     def try_prefill_ragged_logits_graph(
@@ -5062,6 +5070,7 @@ class Llama3TensorParallelForCausalLM:
         logit_positions: Tensor,
         context_len: int | None = None,
         src_prefix_row: Tensor | None = None,
+        prefix_copy_len: int | None = None,
         capture_on_miss: bool = True,
     ) -> Tensor | None:
         self._last_ragged_prefill_graph_captured = False
@@ -5082,6 +5091,7 @@ class Llama3TensorParallelForCausalLM:
                 logit_positions=logit_positions,
                 context_len=context_len,
                 src_prefix_row=src_prefix_row,
+                prefix_copy_len=prefix_copy_len,
                 capture_on_miss=capture_on_miss,
             )
         except Exception as exc:
@@ -5101,6 +5111,7 @@ class Llama3TensorParallelForCausalLM:
         logit_positions: Tensor,
         context_len: int | None = None,
         src_prefix_row: Tensor | None = None,
+        prefix_copy_len: int | None = None,
         capture_on_miss: bool = True,
     ) -> Tensor | None:
         if not cache.layers:
@@ -5118,6 +5129,7 @@ class Llama3TensorParallelForCausalLM:
             cache.layers[0].max_seq_len,
             row_indices is not None,
             context_len if context_len is not None else -1,
+            prefix_copy_len if prefix_copy_len is not None else -1,
             src_prefix_rows,
             precision_key,
             _symm_mem_allreduce_graph_key(input_ids.size(0), _model_world_size(self)),
@@ -5130,6 +5142,7 @@ class Llama3TensorParallelForCausalLM:
             or captured.static_input_ids.shape != input_ids.shape
             or (captured.static_row_indices is None) != (row_indices is None)
             or captured.context_len != context_len
+            or captured.prefix_copy_len != prefix_copy_len
             or (captured.static_src_prefix_row is None) != (src_prefix_row is None)
             or (
                 captured.static_src_prefix_row is not None
@@ -5146,7 +5159,14 @@ class Llama3TensorParallelForCausalLM:
             new_captured: _StaticRaggedPrefillLogitsGraphCall | None = None
             try:
                 new_captured = self._capture_ragged_prefill_logits_graph(
-                    input_ids, cache, seq_lens, row_indices, logit_positions, context_len, src_prefix_row,
+                    input_ids,
+                    cache,
+                    seq_lens,
+                    row_indices,
+                    logit_positions,
+                    context_len,
+                    src_prefix_row,
+                    prefix_copy_len,
                 )
             except Exception:
                 succeeded = False
@@ -5176,6 +5196,7 @@ class Llama3TensorParallelForCausalLM:
         logit_positions: Tensor,
         context_len: int | None = None,
         src_prefix_row: Tensor | None = None,
+        prefix_copy_len: int | None = None,
     ) -> _StaticRaggedPrefillLogitsGraphCall:
         batch, suffix = input_ids.shape
         rotary_cache_dim = self.rotary_cos_cache.size(1)
@@ -5196,6 +5217,7 @@ class Llama3TensorParallelForCausalLM:
             max_seq_len=cache.layers[0].max_seq_len,
             suffix_bucket=suffix,
             context_len=context_len,
+            prefix_copy_len=prefix_copy_len,
         )
         self._copy_ragged_prefill_graph_inputs(
             captured, input_ids, seq_lens, row_indices, logit_positions, src_prefix_row
@@ -5213,6 +5235,7 @@ class Llama3TensorParallelForCausalLM:
                 captured.static_logit_positions,
                 context_len,
                 captured.static_src_prefix_row,
+                prefix_copy_len,
             )
         torch.cuda.current_stream(self.device).wait_stream(stream)
         with torch.cuda.graph(captured.graph):
@@ -5226,6 +5249,7 @@ class Llama3TensorParallelForCausalLM:
                 captured.static_logit_positions,
                 context_len,
                 captured.static_src_prefix_row,
+                prefix_copy_len,
             )
         captured.graph.replay()
         return captured

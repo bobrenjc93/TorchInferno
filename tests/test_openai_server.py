@@ -10253,8 +10253,9 @@ def test_openai_greedy_common_prefix_suffix_warmup_captures_target_shapes(monkey
             logit_positions: torch.Tensor,
             context_len: int | None = None,
             src_prefix_row: torch.Tensor | None = None,
+            prefix_copy_len: int | None = None,
         ) -> torch.Tensor:
-            del cache, row_indices, logit_positions
+            del cache, row_indices, logit_positions, prefix_copy_len
             self.ragged_calls.append(
                 (
                     (input_ids.size(0), input_ids.size(1)),
@@ -10497,8 +10498,9 @@ def test_openai_startup_runtime_fp8_ragged_prefill_warmup_captures_policy_graphs
             logit_positions: torch.Tensor,
             context_len: int | None = None,
             src_prefix_row: torch.Tensor | None = None,
+            prefix_copy_len: int | None = None,
         ) -> torch.Tensor:
-            del cache, row_indices, logit_positions
+            del cache, row_indices, logit_positions, prefix_copy_len
             self.ragged_calls.append(
                 (
                     (input_ids.size(0), input_ids.size(1)),

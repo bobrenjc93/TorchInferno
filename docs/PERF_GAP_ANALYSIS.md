@@ -127,6 +127,19 @@ inside a decode-run payload. Focused CPU coverage exercises grouped-prefix
 prefill stop rows and decode-run stop rows; this does not change the default
 dense online batcher used by the current public run.
 
+The opt-in mixed-prefix ragged prefill graph now carries an explicit
+`prefix_copy_len` from the scheduler into the Llama3 CUDA graph key and captured
+prefix-copy block. Previously the mixed-prefix graph used
+`start_positions.max().item()` inside capture while the graph key only included
+batch, suffix, context, and source-row count. A later mixed-prefix replay with
+the same tensor shape but a different maximum prefix length could therefore
+reuse a graph whose prefix-copy span was baked for the first batch. The fix keeps
+the non-common-prefix path opt-in, but removes that unkeyed capture state and
+adds CPU coverage that a mixed group with `17/18/19` token hits passes
+`prefix_copy_len=19` to the graph provider. This is groundwork for the
+multi_turn reuse gap; it does not promote full-prompt or finished-prefix reuse
+as a default.
+
 ## Public 20260702_095238 refresh and sampled-medium active-cap lower bound
 
 The latest public all-provider run at
@@ -6600,6 +6613,19 @@ in the right direction but still lost the score row: startup increased to
 first-token stayed at `825ms`. Keep the sampled-medium active cap at `32`; the
 extra rows reduce median queueing a little but increase decode/prefill work and
 tail latency.
+
+A current-head recheck confirms sampled-medium prefill-ready-before-decode
+should stay enabled. Disabling only
+`TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_PREFILL_READY_BEFORE_DECODE`
+wrote
+`agent_space/ti_tree_no_sampled_prbd_results/.../8xH100/runs/20260702_160326`
+and landed at `154.1 / 93.8 / 213.1ms`, `957/992` correct. The score-facing
+regression came from decode fragmentation rather than prefill: prefill graph
+hits stayed clean (`59/0`) and prefill forward was in-family (`2.23s`), but
+decode batches rose to `116`, ragged-decode GPU time rose to `1.81s`, and phase
+time rose to `5.80s` versus the current full-run control's `91` decode batches,
+`1.49s` decode GPU, and `5.41s` phase time. Keep the current scoped
+sampled-medium prefill-ready policy (`active_cap=10`).
 
 A current-head TorchInferno-only full refresh on pushed `401888a` wrote
 `agent_space/ti_current_full_results/.../8xH100/runs/20260702_132520`.
