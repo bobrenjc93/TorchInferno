@@ -87,6 +87,23 @@ cadence by delaying first-token work; keep decode-many blocked when the waiting
 queue is non-empty until there is a real overlap pipeline that preserves
 prefill/admission latency.
 
+Rejected long_output refill/tail-prefill A/B on `ae34ce5`: lowering the
+greedy-short refill floor and delaying prefill-before-decode until the active
+tail was smaller
+(`TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_REFILL_MIN_READY_REQUESTS=8`,
+`TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_PREFILL_READY_ACTIVE_CAP=4`)
+improved first-token latency but traded away the score row. The current-head
+run landed at `213.0 / 27.6 / 1292.2ms`, 1000/1000 correct, versus the
+warm-ctx256 control at `245.5 / 24.6 / 1214.5ms`. The queue profile shows why
+this is not a default: queue-to-first improved (`204.1ms -> 173.7ms`) and
+submit-to-first improved (`137.9ms -> 111.1ms`), but prefill fragmented
+(`64 -> 84` batches), prefill wall/forward grew
+(`6.53/5.60s -> 7.65/6.70s`), decode GPU time rose
+(`10.75s -> 11.27s`), and total online phase rose
+(`19.85s -> 22.10s`). Keep the current `12`-request refill floor and
+`8`-row tail cap until a scheduling change lowers first-token latency without
+losing TPOT/E2E.
+
 Rejected follow-ups on `f8cc9d5`:
 
 - `TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_ADMIT_PER_STEP_CAP=32` removed the
