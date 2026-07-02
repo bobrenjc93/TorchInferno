@@ -75,6 +75,18 @@ Rejected multi_turn prefix-cache follow-ups on `c33d773`:
   and non-common prefix graph reuse out of default multi_turn until the source
   row copy/state path is redesigned, not just bucketed.
 
+Rejected long_output decode/readback probe on `687860f`: a local env-gated
+patch allowed decode-many to run even while compatible requests were still
+waiting. It proved the CPU-token readback hypothesis but not a defaultable
+policy. The row moved to `679.1 / 16.9 / 1510.4ms`, 1000/1000 correct, versus
+the warm ctx256 control at `245.5 / 24.6 / 1214.5ms`. The profile had
+`313` decode-many calls, `920` decode-many steps, and only `56.6ms` total token
+readback, but submit-to-first p50 ballooned to `627.9ms` and queue-to-first to
+`651.4ms`. Running decode bursts while requests wait improves steady token
+cadence by delaying first-token work; keep decode-many blocked when the waiting
+queue is non-empty until there is a real overlap pipeline that preserves
+prefill/admission latency.
+
 Rejected follow-ups on `f8cc9d5`:
 
 - `TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_ADMIT_PER_STEP_CAP=32` removed the
