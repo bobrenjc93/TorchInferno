@@ -1,6 +1,56 @@
 # TorchInferno vs vLLM/sglang — Performance Gap Analysis (Llama-3.1-70B, 8xH100)
 
-## Current 20260701 refresh and local vLLM/SGLang checks
+## Current 20260702 full same-host provider refresh
+
+The current same-host all-provider run used inference-bench with skipped builds
+and the fixed vLLM FlashInfer workspace default. It wrote results under
+`agent_space/allproviders_current_full_results/.../8xH100-local-all-current-20260702/runs/20260702_014042`.
+Provider commits were vLLM `4236514`, SGLang `1a5977d`, and TorchInferno
+`3283bbf`. vLLM served successfully, so this run supersedes the earlier local
+provider fragments where vLLM was either absent or only checked per-row.
+
+The local scorecard shifted to vLLM `15` metric wins, SGLang `4`, and
+TorchInferno `0`. Rows as TTFT / TPOT / E2E:
+
+- few_shot: vLLM `130.7 / 48.1 / 170.1ms`, SGLang
+  `124.1 / 79.3 / 205.3ms`, TorchInferno `174.6 / 50.2 / 215.8ms`.
+- self_consistency: vLLM `183.4 / 0.0 / 256.3ms`, SGLang
+  `216.3 / 0.0 / 383.7ms`, TorchInferno `214.8 / 0.0 / 325.4ms`.
+- multi_turn: vLLM `167.0 / 56.8 / 217.0ms`, SGLang
+  `158.1 / 112.4 / 267.4ms`, TorchInferno `308.9 / 58.8 / 362.7ms`.
+- tree_of_thought: vLLM `65.5 / 31.1 / 89.7ms`, SGLang
+  `64.5 / 65.4 / 143.5ms`, TorchInferno `159.5 / 47.4 / 203.9ms`.
+- long_output: vLLM `85.4 / 16.9 / 700.1ms`, SGLang
+  `62.5 / 24.4 / 894.0ms`, TorchInferno `251.0 / 24.5 / 1254.1ms`.
+
+TorchInferno correctness stayed in-family: `977/1000` few_shot, `1000/1000`
+self, `982/1000` multi_turn, `958/992` tree, and `1000/1000` long_output. The
+healthy-vLLM run changes the remaining target: TorchInferno no longer has a
+local TPOT cushion on long_output (`24.5ms` versus vLLM `16.9ms`) and only stays
+near vLLM on few/multi TPOT. The remaining work is therefore not another
+median-only scheduling knob; it needs lower decode GPU time and fewer/faster
+prefill waves.
+
+The TorchInferno queue profile supports that target. few_shot had graph-warm
+prefill (`37` prefill batches, `35` hits, `2` misses), but still exposed a bad
+tail: queue-to-first p50/p99 was `125.6/2491.6ms`, with `2.58s` prefill wall and
+`3.18s` ragged-decode GPU time. long_output was also graph-warm (`56` prefill
+batches, `54` hits, `2` misses), with queue-to-first p50/p99
+`202.7/1635.1ms`, queue-to-finish p50 `1196.3ms`, `6.53s` prefill wall
+(`5.66s` forward), and `10.38s` ragged-decode GPU time. Decode-many ran
+`140` calls / `365` steps / `21,238` model tokens for `20,812` emitted tokens,
+with `426` skipped tokens and `6,654` ragged padding tokens.
+
+This keeps the already-rejected controls closed: greedy-mid row-cap increases,
+greedy-mid first-wave wait, fine greedy-mid suffix buckets, long_output refill
+floors/tail caps, short-greedy decode quantum changes, step-sync-off,
+prompt-lookup decode, and down-projection Marlin do not become defaultable from
+this run. The next credible implementation target is a real decode/prefill
+pipeline improvement: reduce per-step decode GPU time, fuse or replace the
+remaining decode-heavy kernels, or pipeline prefill/decode/readback so
+long_output can approach vLLM's `16.9ms` TPOT without worsening TTFT/E2E tails.
+
+## Prior 20260701 refresh and local vLLM/SGLang checks
 
 Public run `20260701_211855` is stale for TorchInferno: it measured
 TorchInferno `3af4940`, before the dynamic-prefix context-floor and greedy
