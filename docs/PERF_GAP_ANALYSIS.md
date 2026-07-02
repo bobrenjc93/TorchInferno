@@ -140,6 +140,20 @@ adds CPU coverage that a mixed group with `17/18/19` token hits passes
 multi_turn reuse gap; it does not promote full-prompt or finished-prefix reuse
 as a default.
 
+A post-fix multi_turn probe confirms that full-prompt mixed-prefix reuse remains
+rejected. With pinned full-prompt stores, `112` prefix rows,
+`TORCHINFERNO_CONTINUOUS_NON_COMMON_PREFIX_GRAPH_PREFILL=1`,
+`TORCHINFERNO_CONTINUOUS_MIXED_PREFIX_PREFILL=1`, and
+`TORCHINFERNO_CONTINUOUS_MIXED_PREFIX_PREFILL_GRAPH=1`, the run
+`agent_space/ti_multi_mixed_graph_prefixcopy_results/.../8xH100/runs/20260702_161639`
+completed without the earlier mixed-prefix stall and kept correctness in family
+(`982/1000`), but landed at `1729.1 / 66.1 / 1799.5ms`. The profile shows the
+remaining failure mode: request-prompt reuse fired (`875` request-prompt hits,
+`98.5K` reused tokens) and raw prefill tokens fell to `18.6K`, but the run still
+paid `31` prefix-graph misses, `16.2s` prefill forward, `28.2s` prefill wall,
+and `11.6s` prefill state time. The graph-key fix removes unkeyed capture
+state; it does not make the non-common suffix path fast enough to default.
+
 ## Public 20260702_095238 refresh and sampled-medium active-cap lower bound
 
 The latest public all-provider run at
