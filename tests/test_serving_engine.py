@@ -1195,11 +1195,37 @@ def test_continuous_batch_engine_can_batch_mixed_prefix_hits(monkeypatch) -> Non
     assert engine.stats.prefill_prefix_reuse_batches <= 2
 
 
+def test_continuous_batch_engine_delays_pinned_full_prompt_store_by_default(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PINNED_FULL_PROMPT_STORE_MIN_MAX_TOKENS", "1")
+    monkeypatch.delenv(
+        "TORCHINFERNO_CONTINUOUS_PINNED_FULL_PROMPT_STORE_ADOPT_ON_FINISH",
+        raising=False,
+    )
+    monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_PINNED_FULL_PROMPT_STORE_LOGITS", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_PREFIX_CACHE_STORE_LOGITS", raising=False)
+    engine = ContinuousBatchEngine(
+        _SelectedLogitsToyModel(vocab_size=256),
+        device=torch.device("cpu"),
+        max_active_requests=2,
+        prefix_cache_capacity=2,
+        pin_shared_prefix=True,
+    )
+
+    assert engine._delayed_pinned_full_prompt_store_allowed(allow_pinned=True)
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PINNED_FULL_PROMPT_STORE_ADOPT_ON_FINISH", "0")
+    assert not engine._delayed_pinned_full_prompt_store_allowed(allow_pinned=True)
+
+
 def test_continuous_batch_engine_can_delay_pinned_full_prompt_store_until_finish(
     monkeypatch,
 ) -> None:
     monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PINNED_FULL_PROMPT_STORE_MIN_MAX_TOKENS", "1")
-    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PINNED_FULL_PROMPT_STORE_ADOPT_ON_FINISH", "1")
+    monkeypatch.delenv(
+        "TORCHINFERNO_CONTINUOUS_PINNED_FULL_PROMPT_STORE_ADOPT_ON_FINISH",
+        raising=False,
+    )
     monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_NON_COMMON_PREFIX_GRAPH_PREFILL", "1")
     prompt = tuple(range(1, 18))
     continued_prompt = (*prompt, 99)

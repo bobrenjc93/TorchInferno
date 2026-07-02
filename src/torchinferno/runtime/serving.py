@@ -3843,7 +3843,7 @@ class ContinuousBatchEngine:
     def _delayed_pinned_full_prompt_store_allowed(self, *, allow_pinned: bool) -> bool:
         if not self.pin_shared_prefix or not allow_pinned:
             return False
-        if not env_flag("TORCHINFERNO_CONTINUOUS_PINNED_FULL_PROMPT_STORE_ADOPT_ON_FINISH", False):
+        if not env_flag("TORCHINFERNO_CONTINUOUS_PINNED_FULL_PROMPT_STORE_ADOPT_ON_FINISH", True):
             return False
         if env_flag("TORCHINFERNO_CONTINUOUS_PINNED_FULL_PROMPT_STORE_LOGITS", False):
             return False

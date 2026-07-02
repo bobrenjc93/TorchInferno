@@ -188,12 +188,13 @@ paid `31` prefix-graph misses, `16.2s` prefill forward, `28.2s` prefill wall,
 and `11.6s` prefill state time. The graph-key fix removes unkeyed capture
 state; it does not make the non-common suffix path fast enough to default.
 
-Delayed pinned full-prompt row adoption is accepted only as an opt-in foundation
-for that rejected path. With
-`TORCHINFERNO_CONTINUOUS_PINNED_FULL_PROMPT_STORE_ADOPT_ON_FINISH=1`, the engine
-skips the prefill-time KV copy for pinned per-request full-prompt stores and
-adopts the already-live active row when the request finishes. A focused
-multi_turn run with the same full-prompt mixed-prefix reuse knobs wrote
+Delayed pinned full-prompt row adoption is accepted only as a foundation for
+that rejected opt-in path. When pinned per-request full-prompt stores are
+explicitly enabled and logits are not stored, the engine now skips the
+prefill-time KV copy by default and adopts the already-live active row when the
+request finishes; `TORCHINFERNO_CONTINUOUS_PINNED_FULL_PROMPT_STORE_ADOPT_ON_FINISH=0`
+restores the eager-copy behavior for diagnostics. A focused multi_turn run with
+the same full-prompt mixed-prefix reuse knobs wrote
 `agent_space/ti_multi_delayed_adopt_results/.../8xH100/runs/20260702_163130`
 and landed at `1071.7 / 70.4 / 1141.6ms`, `979/1000` correct. The profile
 shows the intended overhead reduction: request-prompt reuse still fired for
