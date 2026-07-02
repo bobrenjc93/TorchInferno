@@ -102,7 +102,10 @@ submit-to-first improved (`137.9ms -> 111.1ms`), but prefill fragmented
 (`10.75s -> 11.27s`), and total online phase rose
 (`19.85s -> 22.10s`). Keep the current `12`-request refill floor and
 `8`-row tail cap until a scheduling change lowers first-token latency without
-losing TPOT/E2E.
+losing TPOT/E2E. Isolating only the tail cap at `4` is also rejected: it landed
+at `252.1 / 25.4 / 1280.6ms`, 1000/1000 correct, with submit-to-first worse
+than control (`147.6ms` vs `137.9ms`) and decode GPU time up
+(`13.83s` vs `10.75s`).
 
 Rejected follow-ups on `f8cc9d5`:
 
