@@ -157,6 +157,23 @@ request-path decode capture (`0` misses, `0` captures, `0.0ms` capture wall).
 This adds modest startup work but closes another cold request tail without
 changing runtime admission or decode bucketing.
 
+The pushed `cb429b9` all-provider rerun used reusable local provider envs
+(`vllm` `c621af1`, `sglang` `99b8f36`) and wrote
+`agent_space/allproviders_cb429b9_results/.../8xH100-local-all-cb429b9-20260702/runs/20260702_035806`.
+The local scorecard moved from the earlier same-host `15/4/0` split to vLLM
+`13`, SGLang `3`, and TorchInferno `3`. TorchInferno won few_shot TPOT
+(`48.4ms` vs vLLM `56.5ms` / SGLang `85.4ms`), self_consistency TTFT
+(`135.3ms` vs `179.9ms` / `215.0ms`), and multi_turn TPOT
+(`59.1ms` vs `82.1ms` / `112.1ms`). It still loses tree_of_thought and
+long_output score cells to vLLM, and long_output remained the largest gap:
+vLLM `64.8 / 16.9 / 668.9ms`, SGLang `61.4 / 25.0 / 969.4ms`,
+TorchInferno `270.7 / 24.4 / 1289.6ms`. TorchInferno's queue profile stayed
+capture-clean for tree and long (`0` decode captures), but tree still had `3`
+decode misses and long_output spent `10.30s` in ragged decode GPU with
+`7.44s` prefill wall. The next score-facing work is therefore still lower
+long-output TTFT/E2E and tree decode/throughput, not more request-path graph
+capture cleanup.
+
 ## Prior 20260701 refresh and local vLLM/SGLang checks
 
 Public run `20260701_211855` is stale for TorchInferno: it measured
