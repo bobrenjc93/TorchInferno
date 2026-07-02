@@ -6189,6 +6189,18 @@ so this is not just an env handoff issue; the added bucket creates expensive
 short-greedy graph variants that outweigh the reduced padding. Keep the
 short-greedy default at `16,32,64,96,128,256`.
 
+The non-decode Triton RMSNorm path is not a standalone default either. Enabling
+`TORCHINFERNO_TRITON_RMS_NORM=1` for a focused long_output run wrote
+`agent_space/ti_long_triton_rms_results/.../8xH100-local-ti-long-triton-rms-20260702/runs/20260702_072613`
+and stayed correct (`1000/1000`), but landed at `252.9 / 25.0 / 1229.7ms`
+against the adjacent default control's `241.2 / 24.9 / 1284.9ms`. The headline
+E2E movement did not come from a durable runtime win: prefill forward only moved
+from `5.83s` to `5.71s`, while decode GPU rose from `9.65s` to `10.26s`,
+queue-to-first p50 rose from `192.7ms` to `207.5ms`, and queue-to-submit p50
+rose from `27.1ms` to `36.0ms`. Decode-specific Triton norm/SwiGLU paths are
+already default-on; keep the broader prefill RMSNorm path opt-in until it shows
+a clear win on more than noisy long_output E2E.
+
 ## Priority for a focused (non-loop) session
 
 1. Prefill MFU (Issue 1) — biggest TTFT lever, ~2x, affects 3/5 benchmarks.
