@@ -2687,6 +2687,8 @@ class Llama3TensorParallelForCausalLM:
             _StaticRaggedPrefillLogitsGraphCall,
         ] = {}
         self._ragged_prefill_logits_graph_failed = False
+        self._ragged_prefill_mixed_logits_graph_failed = False
+        self._ragged_prefill_capture_on_miss_failed = False
         self._temperature_gumbel_generators: dict[str, torch.Generator] = {}
 
     def set_runtime_fp8_prefill(self, enabled: bool, *, min_m: int = 2048) -> None:
@@ -5060,6 +5062,15 @@ class Llama3TensorParallelForCausalLM:
             prefix_copy_len,
         )
 
+    @staticmethod
+    def _is_mixed_prefix_ragged_prefill_graph(
+        *,
+        context_len: int | None,
+        src_prefix_rows: int,
+        prefix_copy_len: int | None,
+    ) -> bool:
+        return context_len is None and prefix_copy_len is not None and src_prefix_rows > 1
+
     def try_prefill_ragged_logits_graph(
         self,
         input_ids: Tensor,
@@ -5074,6 +5085,17 @@ class Llama3TensorParallelForCausalLM:
         capture_on_miss: bool = True,
     ) -> Tensor | None:
         self._last_ragged_prefill_graph_captured = False
+        src_prefix_rows = int(src_prefix_row.numel()) if src_prefix_row is not None else 0
+        if getattr(self, "_ragged_prefill_mixed_logits_graph_failed", False) and (
+            self._is_mixed_prefix_ragged_prefill_graph(
+                context_len=context_len,
+                src_prefix_rows=src_prefix_rows,
+                prefix_copy_len=prefix_copy_len,
+            )
+        ):
+            return None
+        if getattr(self, "_ragged_prefill_capture_on_miss_failed", False):
+            capture_on_miss = False
         if self._ragged_prefill_logits_graph_failed or not _should_use_ragged_prefill_logits_graph(
             input_ids,
             cache,
@@ -5117,6 +5139,11 @@ class Llama3TensorParallelForCausalLM:
         if not cache.layers:
             raise ValueError("ragged prefill requires a non-empty KV cache")
         src_prefix_rows = int(src_prefix_row.numel()) if src_prefix_row is not None else 0
+        mixed_prefix_graph = self._is_mixed_prefix_ragged_prefill_graph(
+            context_len=context_len,
+            src_prefix_rows=src_prefix_rows,
+            prefix_copy_len=prefix_copy_len,
+        )
         precision_key = _ragged_prefill_precision_graph_key(
             input_ids.numel(),
             is_cuda=input_ids.is_cuda,
@@ -5173,6 +5200,14 @@ class Llama3TensorParallelForCausalLM:
             if not skip_sync:
                 succeeded = _capture_succeeded_on_all_ranks(succeeded, self.device)
             if not succeeded or new_captured is None:
+                if mixed_prefix_graph:
+                    self._ragged_prefill_mixed_logits_graph_failed = True
+                    self._ragged_prefill_capture_on_miss_failed = True
+                    exc = RuntimeError("mixed-prefix ragged prefill graph capture failed on at least one rank")
+                    warn_optional_failure("llama3_tensor_parallel.ragged_prefill_mixed_logits_graph", exc)
+                    if _tp_flag("TORCHINFERNO_CUDAGRAPH_PREFILL_DEBUG", False):
+                        print(f"rank={self.rank} ragged_prefill_mixed_logits_graph_failed={exc!r}", flush=True)
+                    return None
                 raise RuntimeError("ragged prefill graph capture failed on at least one rank")
             max_graphs = _tp_int("TORCHINFERNO_CUDAGRAPH_PREFILL_MAX_GRAPHS", 128, minimum=1)
             if key not in self._ragged_prefill_logits_graphs and len(self._ragged_prefill_logits_graphs) >= max_graphs:

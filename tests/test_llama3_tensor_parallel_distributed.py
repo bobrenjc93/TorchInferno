@@ -5,6 +5,7 @@ import os
 import subprocess
 import sys
 import textwrap
+import types
 from datetime import timedelta
 from pathlib import Path
 
@@ -62,6 +63,145 @@ def test_llama3_tensor_parallel_greedy_sampler_gather_opt_in(monkeypatch) -> Non
     sampled = model._sample_next_token_greedy(torch.zeros(1, 2))
 
     assert sampled.tolist() == [5]
+
+
+def test_llama3_tensor_parallel_mixed_prefill_capture_failure_keeps_uniform_replays(
+    monkeypatch,
+) -> None:
+    model = object.__new__(Llama3TensorParallelForCausalLM)
+    model.device = torch.device("cpu")
+    model.rank = 0
+    model.layers = []
+    model._ragged_prefill_logits_graphs = {}
+    model._ragged_prefill_logits_graph_failed = False
+    model._ragged_prefill_mixed_logits_graph_failed = False
+    model._ragged_prefill_capture_on_miss_failed = False
+    model._last_ragged_prefill_graph_captured = False
+    cache = types.SimpleNamespace(layers=[types.SimpleNamespace(max_seq_len=16)])
+    input_ids = torch.zeros((2, 4), dtype=torch.long)
+    seq_lens = torch.zeros(4, dtype=torch.long)
+    row_indices = torch.tensor([0, 1], dtype=torch.long)
+    logit_positions = torch.tensor([3, 3], dtype=torch.long)
+    mixed_src_rows = torch.tensor([2, 3], dtype=torch.long)
+    uniform_src_row = torch.tensor([2], dtype=torch.long)
+    monkeypatch.setattr(
+        tensor_parallel_module,
+        "_should_use_ragged_prefill_logits_graph",
+        lambda *args, **kwargs: True,
+    )
+
+    def fail_capture(*args, **kwargs):  # noqa: ANN002, ANN003
+        raise RuntimeError("capture failed")
+
+    monkeypatch.setattr(model, "_capture_ragged_prefill_logits_graph", fail_capture)
+
+    mixed = model.try_prefill_ragged_logits_graph(
+        input_ids,
+        cache,
+        seq_lens=seq_lens,
+        row_indices=row_indices,
+        logit_positions=logit_positions,
+        context_len=None,
+        src_prefix_row=mixed_src_rows,
+        prefix_copy_len=6,
+        capture_on_miss=True,
+    )
+
+    assert mixed is None
+    assert model._ragged_prefill_mixed_logits_graph_failed
+    assert model._ragged_prefill_capture_on_miss_failed
+    assert not model._ragged_prefill_logits_graph_failed
+
+    captured_logits = torch.ones((2, 1, 8), dtype=torch.float32)
+    capture_calls = []
+
+    def capture_uniform(
+        input_ids,
+        cache,
+        seq_lens,
+        row_indices,
+        logit_positions,
+        context_len=None,
+        src_prefix_row=None,
+        prefix_copy_len=None,
+    ):
+        del seq_lens, row_indices, logit_positions, context_len, src_prefix_row, prefix_copy_len
+        capture_calls.append(tuple(input_ids.shape))
+        return None
+
+    monkeypatch.setattr(model, "_capture_ragged_prefill_logits_graph", capture_uniform)
+
+    uniform_miss = model.try_prefill_ragged_logits_graph(
+        input_ids,
+        cache,
+        seq_lens=seq_lens,
+        row_indices=row_indices,
+        logit_positions=logit_positions,
+        context_len=8,
+        src_prefix_row=uniform_src_row,
+        prefix_copy_len=None,
+        capture_on_miss=True,
+    )
+
+    assert uniform_miss is None
+    assert capture_calls == []
+    assert not model._ragged_prefill_logits_graph_failed
+
+    class FakeGraph:
+        def __init__(self) -> None:
+            self.replays = 0
+
+        def replay(self) -> None:
+            self.replays += 1
+
+    fake_graph = FakeGraph()
+    copied = []
+    monkeypatch.setattr(
+        model,
+        "_copy_ragged_prefill_graph_inputs",
+        lambda *args, **kwargs: copied.append((args, kwargs)),
+    )
+    key = (
+        id(cache),
+        input_ids.size(0),
+        input_ids.size(1),
+        cache.layers[0].max_seq_len,
+        True,
+        8,
+        -1,
+        1,
+        (False,),
+        0,
+    )
+    model._ragged_prefill_logits_graphs[key] = types.SimpleNamespace(
+        graph=fake_graph,
+        static_input_ids=torch.empty_like(input_ids),
+        static_row_indices=torch.empty_like(row_indices),
+        static_src_prefix_row=torch.empty_like(uniform_src_row),
+        output_logits=captured_logits,
+        cache=cache,
+        max_seq_len=cache.layers[0].max_seq_len,
+        context_len=8,
+        prefix_copy_len=None,
+    )
+
+    uniform_replay = model.try_prefill_ragged_logits_graph(
+        input_ids,
+        cache,
+        seq_lens=seq_lens,
+        row_indices=row_indices,
+        logit_positions=logit_positions,
+        context_len=8,
+        src_prefix_row=uniform_src_row,
+        prefix_copy_len=None,
+        capture_on_miss=True,
+    )
+
+    assert uniform_replay is captured_logits
+    assert fake_graph.replays == 1
+    assert len(copied) == 1
+    assert not model._last_ragged_prefill_graph_captured
+    assert not model._ragged_prefill_logits_graph_failed
 
 
 def test_tensor_parallel_remote_checkpoint_resolves_on_rank_zero(tmp_path, monkeypatch) -> None:

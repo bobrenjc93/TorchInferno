@@ -194,6 +194,26 @@ and returned server 500s before producing a result row. Do not revive this as a
 runtime knob without a smaller CUDA-level reproduction and correctness proof for
 mixed source-prefix lengths.
 
+A reduced 16-conversation multi_turn diagnostic with
+`TORCHINFERNO_OPTIONAL_WARNINGS=1` confirmed why the opt-in mixed-prefix graph
+path still falls back to eager: the first mixed-prefix ragged-prefill capture
+fails collectively (`mixed-prefix ragged prefill graph capture failed on at
+least one rank`). The runtime now scopes that failure to mixed-prefix capture
+on miss instead of poisoning the whole ragged-prefill graph family. Existing
+uniform/common-prefix graph replays remain usable, but new request-path captures
+are blocked after the mixed failure so one-off uniform shapes do not pay capture
+cost. The diagnostic before the change
+(`agent_space/ti_multi_debug_capture_results/.../runs/20260702_171811`) landed
+at `752.4 / 38.9 / 784.8ms` with global ragged-prefill graph disablement. A
+broader scoped-failure prototype that still allowed later captures regressed to
+`1044.8 / 37.7 / 1072.1ms` because it spent `3.56s` capturing late one-off
+prefix graphs. The accepted capture-blocked variant
+(`agent_space/ti_multi_mixed_capture_block_results/.../runs/20260702_173158`)
+landed at `747.2 / 38.5 / 779.9ms`, kept correctness at `127/128`, and showed
+`0ms` request-path prefill capture time with warmed replays preserved. This is a
+failure-containment fix for the opt-in path; mixed-prefix suffix prefill is
+still eager and not fast enough to default.
+
 ## Public 20260702_095238 refresh and sampled-medium active-cap lower bound
 
 The latest public all-provider run at
