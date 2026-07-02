@@ -1138,6 +1138,33 @@ def _online_initial_batch_wait_ms(*, temperature: float, max_tokens: int) -> flo
     return default_wait_ms
 
 
+def _tp_stream_prequeue_admission_wait_ms(*, temperature: float, max_tokens: int) -> float:
+    if "TORCHINFERNO_OPENAI_TP_STREAM_PREQUEUE_ADMISSION_WAIT_MS" in os.environ:
+        return env_float("TORCHINFERNO_OPENAI_TP_STREAM_PREQUEUE_ADMISSION_WAIT_MS", 0.0, minimum=0.0)
+    if temperature > 0.0 and max_tokens > 0:
+        sampled_short_max_tokens = env_int(
+            "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_SHORT_INITIAL_BATCH_WAIT_MAX_TOKENS",
+            256,
+            minimum=1,
+        )
+        sampled_medium_max_tokens = env_int(
+            "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_INITIAL_BATCH_WAIT_MAX_TOKENS",
+            300,
+            minimum=sampled_short_max_tokens,
+        )
+        if sampled_short_max_tokens < max_tokens <= sampled_medium_max_tokens:
+            # Sampled-medium tree-style bursts can start the online batcher while
+            # sibling HTTP workers are still tokenizing. A tiny prequeue window
+            # lets the first wave enqueue together without touching sampled-short
+            # self-consistency or greedy decode policy.
+            return env_float(
+                "TORCHINFERNO_OPENAI_TP_SAMPLED_MEDIUM_STREAM_PREQUEUE_ADMISSION_WAIT_MS",
+                1.0,
+                minimum=0.0,
+            )
+    return 0.0
+
+
 def _online_common_prefix_prefill_warmup_rows(cache_rows: int, max_active: int | None = None) -> tuple[int, ...]:
     if cache_rows <= 0:
         return ()
@@ -2878,6 +2905,10 @@ class OpenAICompletionEngine:
                     self._model_lock.release()
             else:
                 self._mark_phase(phase, "queued_generation")
+                self._wait_for_tensor_parallel_stream_prequeue_admission(
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                )
                 yield from self._submit_generation_batches(
                     prompt,
                     max_tokens=max_tokens,
@@ -5607,6 +5638,38 @@ class OpenAICompletionEngine:
                 if timeout <= 0.0:
                     break
                 self._live_request_condition.wait(timeout=timeout)
+
+    def _wait_for_tensor_parallel_stream_prequeue_admission(
+        self,
+        *,
+        temperature: float,
+        max_tokens: int,
+    ) -> None:
+        wait_s = _tp_stream_prequeue_admission_wait_ms(
+            temperature=temperature,
+            max_tokens=max_tokens,
+        ) / 1000.0
+        if wait_s <= 0.0 or self.max_batch_size <= 1:
+            return
+        if not (
+            _is_tensor_parallel_primary_model(self.model)
+            and self.device.type == "cuda"
+            and env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_CONTINUOUS_BATCHER", True)
+        ):
+            return
+        if self._model_lock.locked() or not self._generation_queue.empty():
+            return
+        deadline = time.perf_counter() + min(wait_s, self.batch_wait_s)
+        while self._generation_queue.empty():
+            remaining = deadline - time.perf_counter()
+            if remaining <= 0.0:
+                break
+            with self._live_request_condition:
+                live_requests = self._live_requests
+                if live_requests <= 1:
+                    self._live_request_condition.wait(timeout=min(remaining, 0.0001))
+                    continue
+            time.sleep(min(remaining, 0.0001))
 
     def _temperature_single_request_admission_wait_s(self, temperature: float) -> float:
         if temperature <= 0.0:

@@ -6045,6 +6045,24 @@ instead of one merged session, and the full-suite row recovers to few_shot
 `297.0 / 58.4 / 349.3ms`, tree `174.0 / 53.0 / 207.6ms`, and long_output
 `283.0 / 25.2 / 1314.8ms`.
 
+Sampled-medium prequeue admission is now a narrow tree latency default. The
+latest same-host all-provider control at `cb429b9` had tree at
+`157.2 / 61.3 / 210.5ms`, with the sampled-medium online session starting from
+`initial_batch_size=1`, queue-to-submit p50 `63.8ms`, and queue-to-first p50
+`133.2ms`. A global `2ms` prequeue admission barrier raised the initial batch
+to `6` and improved medians to `150.9 / 40.0 / 177.8ms`, but it also pushed
+queue-to-submit p99 to `433ms` and raw p99 E2E to `778ms`. The `1ms` override
+kept the p50 gains with a smaller server-side p99 hit in that run:
+`150.9 / 54.9 / 182.1ms`, `962/992` correct, initial batch `3`,
+queue-to-submit p50/p99 `56.8/322.2ms`, and queue-to-first p50/p99
+`131.3/396.2ms`. The no-env default confirmation was even better on medians at
+`145.8 / 40.3 / 172.0ms`, but still had a raw p99 E2E tail of `890ms` and
+queue-to-first p99 `519.7ms`. Promote `1ms` only for `temperature > 0`,
+`256 < max_tokens <= 300` so sampled-short self-consistency, greedy, multi-turn,
+and long-output sessions keep their existing admission behavior. This is a
+median scheduling cleanup, not a tail fix or vLLM-gap closure: sampled-medium
+suffix prefill and ordinary ragged decode remain the larger tree bottlenecks.
+
 Short-greedy common-prefix suffix buckets now include `96` for deterministic
 `max_tokens <= 128` sessions. The prior default jumped directly from suffix
 `64` to `128`, overpadding long_output waves with prompt suffixes in the middle

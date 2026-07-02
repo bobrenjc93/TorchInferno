@@ -185,6 +185,7 @@ from torchinferno.openai_server import (
     _token_budget_step_tensor_payload,
     _tensor_parallel_worker_loop,
     _tp_command_cuda_sync_for_steps,
+    _tp_stream_prequeue_admission_wait_ms,
     _try_decode_ragged_token_graph,
     _try_decode_ragged_logits_graph,
     _try_decode_one_token_graph,
@@ -9787,6 +9788,50 @@ def test_openai_online_collect_idle_arrivals_uses_sampled_short_default(monkeypa
 
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_COLLECT_IDLE_ARRIVALS", "1")
     assert _online_collect_idle_arrivals_enabled(temperature=0.0, max_tokens=256)
+
+
+def test_openai_tp_stream_prequeue_admission_wait_uses_sampled_medium_default(
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_STREAM_PREQUEUE_ADMISSION_WAIT_MS", raising=False)
+    monkeypatch.delenv(
+        "TORCHINFERNO_OPENAI_TP_SAMPLED_MEDIUM_STREAM_PREQUEUE_ADMISSION_WAIT_MS",
+        raising=False,
+    )
+    monkeypatch.delenv(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_SHORT_INITIAL_BATCH_WAIT_MAX_TOKENS",
+        raising=False,
+    )
+    monkeypatch.delenv(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_INITIAL_BATCH_WAIT_MAX_TOKENS",
+        raising=False,
+    )
+
+    assert _tp_stream_prequeue_admission_wait_ms(temperature=0.7, max_tokens=256) == 0.0
+    assert _tp_stream_prequeue_admission_wait_ms(temperature=0.7, max_tokens=300) == 1.0
+    assert _tp_stream_prequeue_admission_wait_ms(temperature=0.7, max_tokens=301) == 0.0
+    assert _tp_stream_prequeue_admission_wait_ms(temperature=0.0, max_tokens=300) == 0.0
+
+
+def test_openai_tp_stream_prequeue_admission_wait_respects_env_overrides(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_STREAM_PREQUEUE_ADMISSION_WAIT_MS", "4")
+    assert _tp_stream_prequeue_admission_wait_ms(temperature=0.7, max_tokens=256) == 4.0
+
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_STREAM_PREQUEUE_ADMISSION_WAIT_MS", raising=False)
+    monkeypatch.setenv(
+        "TORCHINFERNO_OPENAI_TP_SAMPLED_MEDIUM_STREAM_PREQUEUE_ADMISSION_WAIT_MS",
+        "2",
+    )
+    monkeypatch.setenv(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_INITIAL_BATCH_WAIT_MAX_TOKENS",
+        "320",
+    )
+    assert _tp_stream_prequeue_admission_wait_ms(temperature=0.7, max_tokens=256) == 0.0
+    assert _tp_stream_prequeue_admission_wait_ms(temperature=0.7, max_tokens=300) == 2.0
+    assert _tp_stream_prequeue_admission_wait_ms(temperature=0.7, max_tokens=320) == 2.0
+    assert _tp_stream_prequeue_admission_wait_ms(temperature=0.7, max_tokens=321) == 0.0
 
 
 def test_openai_online_initial_batch_wait_uses_sampled_short_default(monkeypatch) -> None:
