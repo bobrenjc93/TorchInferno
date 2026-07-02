@@ -6172,6 +6172,23 @@ time (`1492.8ms` vs `1412.4ms`), and queue-to-first p50 (`132.9ms` vs
 `126.7ms`). Keep sampled-medium FP8 prefill at `min_m=256`; the tree gap is
 still faster prefix-suffix prefill/decode, not a smaller FP8 gate.
 
+Adding a finer short-greedy suffix bucket at `80` is also rejected. The public
+long_output prompts share a `111` token prefix and have suffixes in `17-75`, so
+`TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SUFFIX_BUCKETS_GREEDY_SHORT=16,32,64,80,96,128,256`
+looked plausible as a way to move the current `65-96` suffix wave from `s96` to
+`s80`. A same-host default long_output control on current main wrote
+`agent_space/ti_long_control_results/.../8xH100-local-ti-long-control-20260702/runs/20260702_071620`
+and landed at `241.2 / 24.9 / 1284.9ms`, with `5.83s` prefill forward,
+`9.65s` decode GPU, queue-to-first p50 `192.7ms`, and queue-to-finish p50
+`1221.6ms`. The adjacent `s80` override wrote
+`agent_space/ti_long_s80_bucket_results/.../8xH100-local-ti-long-s80-bucket-20260702/runs/20260702_071011`
+and regressed to `272.4 / 25.7 / 1500.1ms`, with prefill forward rising to
+`13.70s`, decode GPU to `10.30s`, queue-to-first p50 to `210.7ms`, and
+queue-to-finish p50 to `1441.7ms`. The warmup helper consumes the same policy,
+so this is not just an env handoff issue; the added bucket creates expensive
+short-greedy graph variants that outweigh the reduced padding. Keep the
+short-greedy default at `16,32,64,96,128,256`.
+
 ## Priority for a focused (non-loop) session
 
 1. Prefill MFU (Issue 1) — biggest TTFT lever, ~2x, affects 3/5 benchmarks.
