@@ -161,6 +161,28 @@ TTFT/E2E versus the no-env split confirmation while avoiding singleton
 `b1` suffix-prefill fragments. Explicit diagnostic split runs can still set
 `TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SPLIT_SUFFIX_BUCKETS_MIN_GROUP=1`.
 
+The automatic greedy-short suffix split is retracted after the public
+`20260702_231040` refresh and same-head controls. That public run measured
+TorchInferno `02949d2`, before automatic suffix splitting, at
+`244.3 / 21.5 / 993.2ms` for long_output with `4.54s` prefill forward and
+`9.66s` ragged-decode GPU. A current-head forced-off control
+(`agent_space/ti_long_suffix_split_off_445ca96_results/.../runs/20260702_233832`)
+landed at `254.2 / 23.8 / 1105.9ms`, beating the min-group-2 split run on
+TPOT/E2E but not by enough to claim a new win. The patched no-env confirmation
+with the automatic default off
+(`agent_space/ti_long_split_default_off_results/.../runs/20260702_235427`)
+landed at `268.0 / 24.1 / 1112.7ms`, `1000/1000` correct, with `5.16s`
+prefill forward, `10.19s` ragged-decode GPU, and no split-induced extra prefill
+groups. Disabling greedy-short prefill-cost priority on top of the forced-off
+split is rejected:
+`agent_space/ti_long_no_cost_priority_445ca96_results/.../runs/20260702_234717`
+landed at `262.0 / 24.4 / 1118.8ms` and increased decode-many work to
+`29.3K` model tokens with `1.9K` skipped. Keep suffix-bucket splitting opt-in
+via `TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SPLIT_SUFFIX_BUCKETS=1` or
+`TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SPLIT_SUFFIX_BUCKETS_GREEDY_SHORT=1`;
+the automatic default should stay off until it reproduces against the public
+no-split baseline.
+
 A narrower decode-many-while-waiting policy is also rejected and not in source.
 The temporary patch allowed decode-many only while the ready queue was below the
 same refill floor that would admit the next prefill wave, trying to reduce
