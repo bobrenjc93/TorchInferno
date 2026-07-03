@@ -220,6 +220,17 @@ tokens, and `3.3K` decode-many padding tokens. Total ragged decode padding was
 diagnosis, but do not treat decode-many padding as the main long-output lever;
 the remaining gap is still steady decode GPU plus prefix-suffix prefill waste.
 
+Ragged-prefill graph cache hits now refresh eviction order, but the intermediate
+long_output batch buckets remain opt-in. The current-head LRU stress run with
+`TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_BATCH_BUCKETS=1,2,4,8,16,24,32`
+(`agent_space/ti_long_batch_buckets_lru_results_0703/.../runs/20260703_103637`)
+landed at `240.2 / 25.4 / 1206.4ms`, `1000/1000` correct. The profile showed
+the cache guardrail working (`124/128` live prefill graphs, `0` graph-cache
+evictions), but it still paid three request-path `b24` captures (`3.17s`),
+raised prefill wall to `8.09s`, and left decode GPU at `10.09s`. Keep LRU
+replacement as a safer graph-cache policy; do not promote the intermediate
+bucket set.
+
 Sampled-medium prefix prefill now has a default `b24` batch bucket. The focused
 env probe with `TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_BATCH_BUCKETS=1,2,4,8,16,24,32`
 and matching warmup wrote

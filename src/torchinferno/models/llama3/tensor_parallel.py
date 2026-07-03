@@ -5405,6 +5405,8 @@ class Llama3TensorParallelForCausalLM:
             captured = new_captured
             self._last_ragged_prefill_graph_captured = True
         else:
+            self._ragged_prefill_logits_graphs.pop(key, None)
+            self._ragged_prefill_logits_graphs[key] = captured
             self._copy_ragged_prefill_graph_inputs(
                 captured, input_ids, seq_lens, row_indices, logit_positions, src_prefix_row
             )
