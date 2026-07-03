@@ -45,6 +45,35 @@ cache exists. This does not make paged serving a default path; it removes a
 correctness and validation blocker for the vLLM/SGLang-style KV reuse work that
 multi_turn needs.
 
+Mixed-prefix dynamic context is accepted only as opt-in infrastructure for the
+same multi_turn reuse gap. The previous full-prompt reuse route could collapse
+the run to coarse non-common-prefix batches, but mixed-prefix prefill either
+fell back to the eager boolean-mask path or failed capture. The runtime now lets
+`TORCHINFERNO_CONTINUOUS_MIXED_PREFIX_DYNAMIC_CONTEXT=1` route mixed prefix hits
+through the existing negative context-bucket attention path when the suffix
+bucket fits
+`TORCHINFERNO_CONTINUOUS_MIXED_PREFIX_DYNAMIC_CONTEXT_MAX_SUFFIX` (default
+`32`). Focused CPU coverage verifies that mixed request-prompt hits with an
+`s32` suffix use a negative context bucket instead of the old `prefix_copy_len`
+mixed eager marker.
+
+The score-path decision is still rejected. With pinned full-prompt stores,
+`112` prefix rows, non-common/mixed prefix graph prefill, and mixed dynamic
+context left at the old global `16` suffix gate, the run
+`agent_space/ti_multi_mixed_dynamic_context_results/.../runs/20260703_031955`
+landed at `1060.8 / 74.6 / 1124.6ms`, `983/1000` correct, because the `s32`
+mixed groups still missed the graph and spent `16.2s` in prefill forward.
+Exercising the intended `s32` bucket with
+`TORCHINFERNO_CONTINUOUS_DYNAMIC_PREFIX_PREFILL_MAX_SUFFIX=32` wrote
+`agent_space/ti_multi_mixed_dynamic_context32_results/.../runs/20260703_032523`
+and improved to `435.2 / 87.2 / 523.8ms`, `983/1000` correct. The queue profile
+shows real improvement (`s32` mixed groups replayed around `65-75ms` instead of
+`~500ms` eager), but the benchmark still split into two online sessions, paid
+about `10.4s` aggregate online phase time, and hit a mixed capture failure on a
+long `s144` group. Dense default multi_turn remains around
+`309 / 65 / 364ms`, so keep full-prompt/mixed dynamic context opt-in until
+long-suffix routing and prefix-row policy beat the common-prefix baseline.
+
 ## Public 20260702_140923 refresh and SGLang CLI compatibility
 
 The latest public all-provider run at

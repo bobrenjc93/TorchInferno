@@ -2065,11 +2065,28 @@ class ContinuousBatchEngine:
         suffix_bucket = self._suffix_bucket(max(suffix_lengths))
         if cache_max_seq is not None:
             suffix_bucket = min(suffix_bucket, max(1, cache_max_seq - max(prefix_hits)))
-        context_len = None if mixed_prefixes else self._dynamic_prefix_prefill_context_len(
-            prefix_hits[0],
-            suffix_bucket,
-            max_seq_len=cache_max_seq,
-        )
+        if mixed_prefixes:
+            context_len = None
+            if env_flag("TORCHINFERNO_CONTINUOUS_MIXED_PREFIX_DYNAMIC_CONTEXT", False):
+                mixed_max_suffix = env_int(
+                    "TORCHINFERNO_CONTINUOUS_MIXED_PREFIX_DYNAMIC_CONTEXT_MAX_SUFFIX",
+                    32,
+                    minimum=1,
+                )
+                dynamic_context_len = _dynamic_prefix_prefill_context_len(
+                    max(prefix_hits),
+                    suffix_bucket,
+                    max_seq_len=cache_max_seq,
+                    max_dynamic_suffix=mixed_max_suffix,
+                )
+                if dynamic_context_len < 0:
+                    context_len = dynamic_context_len
+        else:
+            context_len = self._dynamic_prefix_prefill_context_len(
+                prefix_hits[0],
+                suffix_bucket,
+                max_seq_len=cache_max_seq,
+            )
         count = len(group)
         batch_bucket = self._prefill_batch_bucket(count)
         skip_active_row_clear = self._can_skip_prefix_graph_active_row_clear()
@@ -2172,7 +2189,7 @@ class ContinuousBatchEngine:
                 )
             forward_start_s = time.perf_counter() if self.profile_timings else 0.0
             logits = None
-            prefix_copy_len = max(prefix_hits) if mixed_prefixes else None
+            prefix_copy_len = max(prefix_hits) if mixed_prefixes and context_len is None else None
             if not mixed_prefixes or env_flag("TORCHINFERNO_CONTINUOUS_MIXED_PREFIX_PREFILL_GRAPH", False):
                 logits = self._try_ragged_prefill_logits(
                     input_ids,

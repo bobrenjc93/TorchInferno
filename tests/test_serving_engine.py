@@ -440,6 +440,7 @@ class _SelectedLogitsToyModel(_RaggedGraphToyModel):
         self.prefill_row_indices: list[list[int]] = []
         self.prefill_capture_flags: list[bool] = []
         self.prefill_prefix_copy_lens: list[int | None] = []
+        self.prefill_context_lens: list[int | None] = []
 
     def forward(
         self,
@@ -471,9 +472,10 @@ class _SelectedLogitsToyModel(_RaggedGraphToyModel):
         self, input_ids, cache, *, seq_lens, row_indices, logit_positions,
         context_len=None, src_prefix_row=None, prefix_copy_len=None, capture_on_miss=True,
     ):
-        del seq_lens, context_len
+        del seq_lens
         self.prefill_capture_flags.append(bool(capture_on_miss))
         self.prefill_prefix_copy_lens.append(prefix_copy_len)
+        self.prefill_context_lens.append(context_len)
         self.prefill_src_prefix_rows.append(
             None if src_prefix_row is None else src_prefix_row.detach().cpu().tolist()
         )
@@ -486,8 +488,9 @@ class _SelectedLogitsToyModel(_RaggedGraphToyModel):
         self, input_ids, cache, *, seq_lens, row_indices, logit_positions, context_len=None,
         src_prefix_row=None, prefix_copy_len=None,
     ):
-        del seq_lens, context_len
+        del seq_lens
         self.prefill_prefix_copy_lens.append(prefix_copy_len)
+        self.prefill_context_lens.append(context_len)
         self.prefill_src_prefix_rows.append(
             None if src_prefix_row is None else src_prefix_row.detach().cpu().tolist()
         )
@@ -1375,14 +1378,15 @@ def test_continuous_batch_engine_can_batch_mixed_prefix_hits(monkeypatch) -> Non
         graph_prefill=True,
     )
 
+    tail = tuple(range(31, 49))
     results = engine.run(
         [
             ServingRequest("turn0-a", (*shared, 21), 2, arrival_step=0),
             ServingRequest("turn0-b", (*shared, 22, 23), 2, arrival_step=0),
             ServingRequest("turn0-c", (*shared, 24, 25, 26), 2, arrival_step=0),
-            ServingRequest("turn1-a", (*shared, 21, 31), 2, arrival_step=2),
-            ServingRequest("turn1-b", (*shared, 22, 23, 32), 2, arrival_step=2),
-            ServingRequest("turn1-c", (*shared, 24, 25, 26, 33), 2, arrival_step=2),
+            ServingRequest("turn1-a", (*shared, 21, *tail), 2, arrival_step=2),
+            ServingRequest("turn1-b", (*shared, 22, 23, *tail), 2, arrival_step=2),
+            ServingRequest("turn1-c", (*shared, 24, 25, 26, *tail), 2, arrival_step=2),
         ]
     )
     by_id = {result.request_id: result for result in results}
@@ -1393,6 +1397,43 @@ def test_continuous_batch_engine_can_batch_mixed_prefix_hits(monkeypatch) -> Non
     assert any(rows is not None and len(rows) >= 3 for rows in model.prefill_src_prefix_rows)
     assert max(value for value in model.prefill_prefix_copy_lens if value is not None) == len(shared) + 3
     assert engine.stats.prefill_prefix_reuse_batches <= 2
+
+
+def test_continuous_batch_engine_can_bucket_mixed_prefix_context(monkeypatch) -> None:
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PINNED_FULL_PROMPT_STORE_MIN_MAX_TOKENS", "2")
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_MIXED_PREFIX_PREFILL", "1")
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_MIXED_PREFIX_DYNAMIC_CONTEXT", "1")
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_NON_COMMON_PREFIX_GRAPH_PREFILL", "1")
+    shared = tuple(range(1, 17))
+    model = _SelectedLogitsToyModel()
+    engine = ContinuousBatchEngine(
+        model,
+        device=torch.device("cpu"),
+        max_active_requests=4,
+        prefix_cache_capacity=6,
+        pin_shared_prefix=True,
+        graph_prefill=True,
+    )
+
+    tail = tuple(range(31, 49))
+    results = engine.run(
+        [
+            ServingRequest("turn0-a", (*shared, 21), 2, arrival_step=0),
+            ServingRequest("turn0-b", (*shared, 22, 23), 2, arrival_step=0),
+            ServingRequest("turn0-c", (*shared, 24, 25, 26), 2, arrival_step=0),
+            ServingRequest("turn1-a", (*shared, 21, *tail), 2, arrival_step=2),
+            ServingRequest("turn1-b", (*shared, 22, 23, *tail), 2, arrival_step=2),
+            ServingRequest("turn1-c", (*shared, 24, 25, 26, *tail), 2, arrival_step=2),
+        ]
+    )
+    by_id = {result.request_id: result for result in results}
+
+    assert by_id["turn1-a"].prefix_hit_tokens == len(shared) + 1
+    assert by_id["turn1-b"].prefix_hit_tokens == len(shared) + 2
+    assert by_id["turn1-c"].prefix_hit_tokens == len(shared) + 3
+    assert any(context_len is not None and context_len < 0 for context_len in model.prefill_context_lens)
+    assert all(value is None for value in model.prefill_prefix_copy_lens)
+    assert any(rows is not None and len(rows) >= 3 for rows in model.prefill_src_prefix_rows)
 
 
 def test_continuous_batch_engine_delays_pinned_full_prompt_store_by_default(
