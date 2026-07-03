@@ -32,6 +32,7 @@ class PagedEngineStats:
     prefill_admitted_requests: int = 0
     prefill_plain_batches: int = 0
     prefill_prefix_reuse_batches: int = 0
+    prefill_padded_suffix_batches: int = 0
     prefill_wall_ms: float = 0.0
     prefill_forward_ms: float = 0.0
     decode_model_calls: int = 0
@@ -789,12 +790,13 @@ class PagedEngine:
     def _prefill_suffix(self, rid, prompt, shared):
         return self._prefill_suffix_batch([rid], [prompt], [shared])
 
-    def _prefill_suffix_batch(self, rids, prompts, shared_tokens):
+    def _prefill_suffix_batch(self, rids, prompts, shared_tokens, *, suffix_len: int | None = None):
         # COW suffix prefill: rid already holds the shared prefix pages (positions
         # 0..shared-1 KV present); prefill ONLY prompt[shared:] at start_position=shared
         # over the FULL page table (prefix + suffix pages), causal -> attention reads
-        # the shared prefix for free. Returns [1, suffix_len, vocab]. Mirrors the
-        # GPU-validated scripts/validate_paged_suffix_prefill.py path.
+        # the shared prefix for free. Mixed suffix lengths may be padded to one
+        # FlashInfer call; callers select logits at each row's real suffix end.
+        # Mirrors the GPU-validated scripts/validate_paged_suffix_prefill.py path.
         import flashinfer
 
         if self._prefill_ws is None:
@@ -806,12 +808,30 @@ class PagedEngine:
             list(prompt[int(shared):])
             for prompt, shared in zip(prompts, shared_tokens)
         ]
-        suffix_lens = {len(suffix) for suffix in suffixes}
-        if not suffix_lens or min(suffix_lens) <= 0:
+        suffix_lengths = [len(suffix) for suffix in suffixes]
+        if not suffix_lengths or min(suffix_lengths) <= 0:
             raise ValueError("paged suffix prefill requires non-empty suffixes")
-        if len(suffix_lens) != 1:
-            raise ValueError("paged suffix prefill batch requires uniform suffix length")
-        suffix_len = suffix_lens.pop()
+        unique_suffix_lengths = set(suffix_lengths)
+        if suffix_len is None:
+            if len(unique_suffix_lengths) != 1:
+                raise ValueError("paged suffix prefill batch requires uniform suffix length")
+            suffix_len = suffix_lengths[0]
+        else:
+            suffix_len = int(suffix_len)
+        if max(suffix_lengths) > suffix_len:
+            raise ValueError("paged suffix prefill padding shorter than a real suffix")
+        padded_suffixes = [
+            [*suffix, *([0] * (suffix_len - len(suffix)))]
+            for suffix in suffixes
+        ]
+        original_lengths: list[int] = []
+        for rid, prompt, shared in zip(rids, prompts, shared_tokens):
+            shared_i = int(shared)
+            seq = self.cache._sequences[rid]
+            original_lengths.append(seq.length)
+            target_len = shared_i + suffix_len
+            self.cache.reserve(rid, target_len)
+            seq.length = target_len
         indptr, indices, lpl = self.cache.flashinfer_page_table(list(rids))
         qo = torch.arange(0, (len(rids) + 1) * suffix_len, suffix_len, dtype=torch.int32, device=self.dev)
         self._prefill_wrapper.plan(
@@ -821,10 +841,14 @@ class PagedEngine:
         )
         starts = [int(shared) for shared in shared_tokens]
         start_position = starts[0] if len(set(starts)) == 1 else torch.tensor(starts, dtype=torch.long, device=self.dev)
-        return self.model.forward_prefill_paged(
-            torch.tensor(suffixes, dtype=torch.long, device=self.dev), self.cache,
-            request_ids=list(rids), prefill_wrapper=self._prefill_wrapper, start_position=start_position,
-        )
+        try:
+            return self.model.forward_prefill_paged(
+                torch.tensor(padded_suffixes, dtype=torch.long, device=self.dev), self.cache,
+                request_ids=list(rids), prefill_wrapper=self._prefill_wrapper, start_position=start_position,
+            )
+        finally:
+            for rid, length in zip(rids, original_lengths):
+                self.cache._sequences[rid].length = length
 
     def submit(
         self,
@@ -853,8 +877,12 @@ class PagedEngine:
         tokens_per_request: int,
         elapsed_ms: float,
         prefix_reuse: bool,
+        active_tokens: int | None = None,
+        model_rows: int | None = None,
     ) -> None:
-        model_tokens = int(batch) * int(tokens_per_request)
+        rows = int(batch) if model_rows is None else int(model_rows)
+        model_tokens = rows * int(tokens_per_request)
+        real_tokens = model_tokens if active_tokens is None else int(active_tokens)
         self.stats.prefill_model_calls += 1
         self.stats.prefill_batches += 1
         self.stats.prefill_tokens += model_tokens
@@ -868,9 +896,63 @@ class PagedEngine:
         _add_time(self.stats.prefill_shape_wall_ms, shape_key, elapsed_ms)
         _add_time(self.stats.prefill_shape_forward_ms, shape_key, elapsed_ms)
         _add_count(self.stats.prefill_shape_active_requests, shape_key, batch)
-        _add_count(self.stats.prefill_shape_model_rows, shape_key, batch)
-        _add_count(self.stats.prefill_shape_active_tokens, shape_key, model_tokens)
+        _add_count(self.stats.prefill_shape_model_rows, shape_key, rows)
+        _add_count(self.stats.prefill_shape_active_tokens, shape_key, real_tokens)
         _add_count(self.stats.prefill_shape_model_tokens, shape_key, model_tokens)
+
+    def _shared_prefix_prefill_groups(self, admitted: list[dict]) -> list[tuple[int, list[dict], list[int], bool]]:
+        shared = [a for a in admitted if int(a["shared"]) > 0]
+        if not shared:
+            return []
+
+        def exact_groups() -> list[tuple[int, list[dict], list[int], bool]]:
+            groups: dict[int, list[dict]] = {}
+            for item in shared:
+                suffix = len(item["prompt"]) - int(item["shared"])
+                groups.setdefault(suffix, []).append(item)
+            return [
+                (suffix, group, [suffix] * len(group), False)
+                for suffix, group in groups.items()
+            ]
+
+        suffix_lengths = [len(a["prompt"]) - int(a["shared"]) for a in shared]
+        if (
+            len(shared) <= 1
+            or min(suffix_lengths) <= 0
+            or len(set(suffix_lengths)) <= 1
+            or not env_flag("TORCHINFERNO_PAGED_PREFIX_PADDED_SUFFIX_PREFILL", True)
+        ):
+            return exact_groups()
+
+        max_suffix = max(suffix_lengths)
+        active_tokens = sum(suffix_lengths)
+        padding_tokens = len(shared) * max_suffix - active_tokens
+        max_padding_tokens = env_int(
+            "TORCHINFERNO_PAGED_PREFIX_PADDED_SUFFIX_MAX_PADDING_TOKENS",
+            1024,
+            minimum=0,
+        )
+        max_padding_pct = env_int(
+            "TORCHINFERNO_PAGED_PREFIX_PADDED_SUFFIX_MAX_PADDING_PCT",
+            100,
+            minimum=0,
+        )
+        if (
+            padding_tokens > max_padding_tokens
+            or padding_tokens * 100 > active_tokens * max_padding_pct
+            or any(int(a["shared"]) + max_suffix > self.max_seq for a in shared)
+        ):
+            return exact_groups()
+
+        extra_pages = 0
+        for item in shared:
+            rid = item["rid"]
+            target_pages = math.ceil((int(item["shared"]) + max_suffix) / self.page_size)
+            extra_pages += max(0, target_pages - len(self.cache._sequences[rid].page_ids))
+        if extra_pages > len(self.cache.free_pages):
+            return exact_groups()
+
+        return [(max_suffix, shared, suffix_lengths, True)]
 
     def _record_decode_stats(self, *, batch: int, elapsed_ms: float) -> None:
         shape_key = f"paged_decode:b{int(batch)}"
@@ -978,17 +1060,15 @@ class PagedEngine:
 
             if admitted:
                 # COW-shared requests prefill ONLY their suffix. Group uniform
-                # suffix lengths so a turn wave reuses prefix pages without
-                # serializing one FlashInfer prefill per request.
-                shared_groups: dict[int, list[dict]] = {}
-                for a in (x for x in admitted if x["shared"] > 0):
-                    shared_groups.setdefault(len(a["prompt"]) - int(a["shared"]), []).append(a)
-                for _suffix_len, grp in shared_groups.items():
+                # suffix lengths exactly, or pad a mixed-length shared-prefix wave
+                # when the bounded padding cost is cheaper than serializing many
+                # FlashInfer prefill launches.
+                for _suffix_len, grp, suffix_lengths, padded in self._shared_prefix_prefill_groups(admitted):
                     rids = [a["rid"] for a in grp]
                     prompts = [a["prompt"] for a in grp]
                     starts = [int(a["shared"]) for a in grp]
                     start_s = time.perf_counter()
-                    logits = self._prefill_suffix_batch(rids, prompts, starts)
+                    logits = self._prefill_suffix_batch(rids, prompts, starts, suffix_len=_suffix_len)
                     elapsed_ms = (time.perf_counter() - start_s) * 1000.0
                     shape_key = (
                         f"paged_prefix:b{len(rids)}:s{_suffix_len}:"
@@ -1000,8 +1080,23 @@ class PagedEngine:
                         tokens_per_request=_suffix_len,
                         elapsed_ms=elapsed_ms,
                         prefix_reuse=True,
+                        active_tokens=sum(suffix_lengths),
                     )
-                    toks = _greedy_tokens(self.model, logits[:, -1, :])
+                    if padded:
+                        self.stats.prefill_padded_suffix_batches += 1
+                        positions = torch.tensor(
+                            [length - 1 for length in suffix_lengths],
+                            dtype=torch.long,
+                            device=self.dev,
+                        )
+                        selected_logits = logits[
+                            torch.arange(len(rids), dtype=torch.long, device=self.dev),
+                            positions,
+                            :,
+                        ]
+                    else:
+                        selected_logits = logits[:, -1, :]
+                    toks = _greedy_tokens(self.model, selected_logits)
                     for i, a in enumerate(grp):
                         _retire_or_activate(a, int(toks[i]))
                 plain = [x for x in admitted if x["shared"] == 0]
@@ -1166,6 +1261,8 @@ class PagedEngine:
                 self.runner.cache = external_cache
         self._pending = []
         self._active = []
+        self._gen_count = {}
+        self.stats = PagedEngineStats(max_model_batch_size=self.max_active)
         if self.prefix_cache is None:
             self._next_rid = 0
         self._step_no = 0

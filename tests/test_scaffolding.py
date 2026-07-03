@@ -274,13 +274,20 @@ def test_paged_engine_keeps_persistent_prefix_request_ids_monotonic() -> None:
         use_graph=False,
     )
     engine.prefix_cache = paged_serving.PagedPrefixCache(engine.cache, capacity=2)
+    engine._gen_count = {"0": 3}
+    engine.stats.queued_requests = 7
 
     assert engine._allocate_request_id() == "p0"
     engine.start_online(max_seq_len=8)
+    assert engine._gen_count == {}
+    assert engine.stats.queued_requests == 0
+    assert engine.stats.max_model_batch_size == 2
     assert engine._allocate_request_id() == "p1"
 
+    engine.stats.queued_requests = 5
     engine.prefix_cache = None
     engine.start_online(max_seq_len=8)
+    assert engine.stats.queued_requests == 0
     assert engine._allocate_request_id() == "p0"
 
 

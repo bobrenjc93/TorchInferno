@@ -4192,6 +4192,17 @@ correctness. Keep the default threshold unchanged; the paged path still needs a
 larger prefill/decode pipeline redesign before it can replace dense for the
 current benchmark shape.
 
+Mixed-length paged-prefix suffix padding is accepted as paged-engine
+infrastructure, not as a score-path switch. On the same `multi_turn` A/B,
+bounded padding collapsed paged-prefix prefill from `267` model calls to `35`
+and aggregate paged prefill forward time from about `51.0s` to `10.1s`; medians
+improved to `3040.3 / 713.5 / 3296.4ms` with correctness `0.982`. This proves
+the prior paged prefix cache path was launch-fragmented, but the remaining
+`35` paged prefill waves still cost roughly `260-290ms` each. Keep
+`TORCHINFERNO_PAGED_PREFIX_CACHE` opt-in and leave
+`TORCHINFERNO_OPENAI_PAGED_KV_MIN_SEQ` unchanged for the current dense
+multi_turn shape.
+
 Finished-prefix row adoption is also rejected for multi_turn on current
 `4ea5e98`. Enabling `TORCHINFERNO_CONTINUOUS_FINISHED_PREFIX_CACHE=1` completed
 1000/1000 requests but took `96311.6ms` in the batcher profile, with
