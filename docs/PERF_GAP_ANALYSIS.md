@@ -164,6 +164,21 @@ Keep the automatic greedy-large mixed-prefix policy off by default; the suffix
 split and capture guard remain useful for explicit opt-in probes, but they do
 not close the default multi_turn gap.
 
+A current-head policy-only recheck on pushed `839a943` is also rejected. Running
+the existing greedy-large mixed-prefix policy opt-in with `112` prefix rows
+(`TORCHINFERNO_CONTINUOUS_GREEDY_LARGE_MIXED_PREFIX_REUSE=1`,
+`TORCHINFERNO_OPENAI_TP_ONLINE_PREFIX_ROWS=112`) wrote
+`agent_space/ti_multi_policywarm_results_0703/.../runs/20260703_092218` and
+landed at `304.7 / 93.9 / 408.2ms`, `982/1000` correct. The automatic
+mixed-prefix warmup did its job (`0` request-path prefill captures), but the run
+split into two sessions (`448` and `552` requests) and the useful request-prompt
+hits still routed through many `b32:s32` mixed-prefix passes plus two
+`b32:s144` common-prefix passes. Prefill wall was about `3.24s` across the two
+sessions and TPOT regressed sharply versus the accepted full-suite default band
+(`293.5 / 60.5 / 346.5ms`). Keep this path opt-in; the next multi_turn attempt
+needs cheaper non-common prefix replay or fewer mixed-prefix prefill waves, not a
+broader default for the current policy bundle.
+
 Sampled-medium prefix prefill now has a default `b24` batch bucket. The focused
 env probe with `TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_BATCH_BUCKETS=1,2,4,8,16,24,32`
 and matching warmup wrote
