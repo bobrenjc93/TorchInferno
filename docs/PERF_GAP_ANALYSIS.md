@@ -23,6 +23,18 @@ Rows as TTFT / TPOT / E2E:
 - long_output: vLLM `78.4 / 15.1 / 621.6ms`, SGLang
   `72.5 / 21.6 / 805.8ms`, TorchInferno `252.5 / 21.2 / 966.4ms`.
 
+A current-head default TorchInferno-only refresh on `75fee00`
+(`agent_space/ti_default_head_results_0703/.../runs/20260703_055113`) landed
+at few_shot `167.0 / 46.9 / 206.0ms`, self_consistency
+`153.2 / 0.0 / 241.7ms`, multi_turn `331.4 / 59.0 / 386.1ms`,
+tree_of_thought `139.6 / 28.1 / 164.4ms`, and long_output
+`275.4 / 24.2 / 1144.1ms`. The default path did not pick up the paged-prefix
+suffix graph hook, which remains opt-in. Queue profiles still point to the same
+default bottlenecks: multi_turn reuses only the `45` token common prefix and
+spends `4.48s` in prefix-suffix prefill, while long_output reuses the `111`
+token common prefix, spends `5.26s` in prefill forward, and runs `786` decode
+batches for `38.2K` active decode tokens.
+
 The queue and provider logs point at the same architectural gap. vLLM reports
 prefix-cache hit rates in the `65-86%` range with chunked prefill, while SGLang
 uses RadixCache and prefill/decode CUDA graphs. TorchInferno still reuses only
