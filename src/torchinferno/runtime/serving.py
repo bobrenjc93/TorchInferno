@@ -11,7 +11,8 @@ import torch
 from torch import Tensor
 
 from torchinferno.runtime.options import env_flag, env_int
-from torchinferno.runtime.prefix_cache import PrefixCacheIndex
+from torchinferno.runtime.prefix import PrefixMatch
+from torchinferno.runtime.prefix_cache import PrefixCacheEntry, PrefixCacheIndex
 from torchinferno.runtime.sampling import sample_next_token
 
 
@@ -1482,6 +1483,13 @@ class ContinuousBatchEngine:
                 raise ValueError("request prompt must contain at least one token")
             match, entry = self.prefix_cache.lookup(request.prompt)
             reusable = self.reusable_prefixes.get(entry.route_id) if entry is not None else None
+            match, entry, reusable = self._maybe_demote_mixed_prefix_long_suffix(
+                request.prompt,
+                match,
+                entry,
+                reusable,
+                pad_prefix_suffixes=pad_prefix_suffixes,
+            )
             reusable_prefix_tokens = match.depth if reusable is not None else 0
             if request.max_new_tokens == 0:
                 indexed_results.append(
@@ -1678,6 +1686,66 @@ class ContinuousBatchEngine:
         if self.profile_timings:
             self.stats.prefill_wall_ms += (time.perf_counter() - timing_start_s) * 1000.0
         return indexed_results, active
+
+    def _maybe_demote_mixed_prefix_long_suffix(
+        self,
+        prompt: tuple[int, ...],
+        match: PrefixMatch,
+        entry: PrefixCacheEntry | None,
+        reusable: _ReusablePrefix | None,
+        *,
+        pad_prefix_suffixes: bool,
+    ) -> tuple[PrefixMatch, PrefixCacheEntry | None, _ReusablePrefix | None]:
+        if (
+            entry is None
+            or reusable is None
+            or not pad_prefix_suffixes
+            or not env_flag("TORCHINFERNO_CONTINUOUS_MIXED_PREFIX_PREFILL", False)
+            or not env_flag("TORCHINFERNO_CONTINUOUS_MIXED_PREFIX_DYNAMIC_CONTEXT", False)
+            or not env_flag(
+                "TORCHINFERNO_CONTINUOUS_MIXED_PREFIX_LONG_SUFFIX_COMMON_FALLBACK",
+                False,
+            )
+        ):
+            return match, entry, reusable
+        if self._prefix_reuse_route_kind(reusable.route_id) == "common_prefix":
+            return match, entry, reusable
+
+        suffix_len = len(prompt) - match.depth
+        if suffix_len <= 0:
+            return match, entry, reusable
+        suffix_bucket = self._suffix_bucket(suffix_len)
+        cache_max_seq = self._cache_max_seq_len()
+        if cache_max_seq is not None:
+            suffix_bucket = min(suffix_bucket, max(1, cache_max_seq - match.depth))
+        mixed_max_suffix = env_int(
+            "TORCHINFERNO_CONTINUOUS_MIXED_PREFIX_DYNAMIC_CONTEXT_MAX_SUFFIX",
+            32,
+            minimum=1,
+        )
+        if suffix_bucket <= mixed_max_suffix:
+            return match, entry, reusable
+
+        def _live_common_prefix(candidate: PrefixCacheEntry) -> bool:
+            return (
+                isinstance(candidate.route_id, tuple)
+                and candidate.route_id[:1] == ("common_prefix",)
+                and candidate.route_id in self.reusable_prefixes
+            )
+
+        fallback_match, fallback_entry = self.prefix_cache.lookup_filtered(prompt, _live_common_prefix)
+        fallback_reusable = (
+            self.reusable_prefixes.get(fallback_entry.route_id)
+            if fallback_entry is not None
+            else None
+        )
+        if (
+            fallback_reusable is None
+            or fallback_match.depth <= 0
+            or fallback_match.depth >= match.depth
+        ):
+            return match, entry, reusable
+        return fallback_match, fallback_entry, fallback_reusable
 
     def _prefill_common_prefix_batch(
         self,

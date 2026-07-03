@@ -1404,6 +1404,41 @@ def _online_greedy_common_prefix_suffix_prefill_warmup_batches(
     return tuple(batch for batch in batches if 0 < batch <= limit)
 
 
+def _online_mixed_prefix_suffix_prefill_warmup_enabled() -> bool:
+    return env_flag("TORCHINFERNO_OPENAI_WARMUP_ONLINE_MIXED_PREFIX_SUFFIX_PREFILL", False)
+
+
+def _online_mixed_prefix_suffix_prefill_warmup_specs(
+    max_seq_len: int,
+    *,
+    cache_rows: int,
+    max_active: int,
+) -> tuple[tuple[int, int, int], ...]:
+    if max_seq_len <= 0 or cache_rows <= 0 or max_active <= 0:
+        return ()
+    raw = os.environ.get(
+        "TORCHINFERNO_OPENAI_WARMUP_ONLINE_MIXED_PREFIX_SUFFIX_SPECS",
+        "32:32:128,32:32:256,16:32:256,8:32:256,4:16:256",
+    )
+    specs: list[tuple[int, int, int]] = []
+    for part in raw.split(","):
+        fields = [field.strip() for field in part.split(":")]
+        if len(fields) != 3:
+            continue
+        try:
+            batch_size, suffix_tokens, context_bucket = (int(field) for field in fields)
+        except ValueError:
+            continue
+        if batch_size <= 0 or suffix_tokens <= 0 or context_bucket <= suffix_tokens:
+            continue
+        if batch_size > max_active or batch_size > cache_rows:
+            continue
+        if context_bucket > max_seq_len:
+            continue
+        specs.append((batch_size, suffix_tokens, context_bucket))
+    return tuple(dict.fromkeys(specs))
+
+
 @contextmanager
 def _allow_prefill_graph_capture_for_cache(cache: object) -> Iterator[None]:
     sentinel = object()
@@ -3493,6 +3528,22 @@ class OpenAICompletionEngine:
                                     warmup_label="sampled",
                                     suffix_tokens_override=sampled_suffix_tokens,
                                 )
+            if _online_mixed_prefix_suffix_prefill_warmup_enabled():
+                mixed_warmup_max_tokens = _online_greedy_common_prefix_suffix_prefill_warmup_max_tokens()
+                with _tensor_parallel_symm_mem_allreduce_scope(
+                    self.model,
+                    self.device,
+                    max_tokens=mixed_warmup_max_tokens,
+                    temperature=0.0,
+                ):
+                    self._warmup_online_mixed_prefix_suffix_prefill_graphs(
+                        cache,
+                        vocab_size,
+                        cache_rows=cache_batch,
+                        max_active=max_active,
+                        max_seq_len=max_seq_len,
+                        warmup_max_tokens=mixed_warmup_max_tokens,
+                    )
             prefill_chunk = env_int("TORCHINFERNO_OPENAI_TP_ONLINE_PREFILL_CHUNK", 0, minimum=0)
             if prefill_chunk > 0:
                 ragged_prefill_graph = getattr(self.model, "try_prefill_ragged_logits_graph", None)
@@ -3956,6 +4007,127 @@ class OpenAICompletionEngine:
         except Exception as exc:
             import sys as _fp8raggedsys
             print(f"[WARMUP] runtime FP8 ragged prefill warmup failed: {exc}", file=_fp8raggedsys.stderr, flush=True)
+        finally:
+            _set_tensor_parallel_runtime_fp8_prefill(self.model, enabled=False, min_m=2048)
+            _reset_generation_cache(cache)
+
+    def _warmup_online_mixed_prefix_suffix_prefill_graphs(
+        self,
+        cache: object,
+        vocab_size: int,
+        *,
+        cache_rows: int,
+        max_active: int,
+        max_seq_len: int,
+        warmup_max_tokens: int | None = None,
+    ) -> None:
+        ragged_prefill_graph = getattr(self.model, "try_prefill_ragged_logits_graph", None)
+        if ragged_prefill_graph is None:
+            return
+        if getattr(self.model, "try_prefill_logits_graph", None) is None:
+            return
+        copy_prefix = getattr(cache, "copy_prefix_from", None)
+        if not callable(copy_prefix):
+            return
+        specs = _online_mixed_prefix_suffix_prefill_warmup_specs(
+            max_seq_len,
+            cache_rows=cache_rows,
+            max_active=max_active,
+        )
+        if not specs:
+            return
+        if warmup_max_tokens is None:
+            warmup_max_tokens = _online_greedy_common_prefix_suffix_prefill_warmup_max_tokens()
+        fp8_prefill_enabled = _online_fp8_prefill_enabled(
+            temperature=0.0,
+            max_tokens=warmup_max_tokens,
+        )
+        fp8_prefill_min_m = env_int(
+            "TORCHINFERNO_OPENAI_WARMUP_ONLINE_MIXED_PREFIX_FP8_MIN_M",
+            _online_fp8_prefill_min_m(temperature=0.0, max_tokens=warmup_max_tokens),
+            minimum=1,
+        )
+        try:
+            _set_tensor_parallel_runtime_fp8_prefill(
+                self.model,
+                enabled=fp8_prefill_enabled,
+                min_m=fp8_prefill_min_m,
+            )
+            for batch_size, suffix_tokens, context_bucket in specs:
+                prefix_tokens = context_bucket - suffix_tokens
+                if max_active + batch_size <= cache_rows:
+                    source_start = max_active
+                elif batch_size * 2 <= cache_rows:
+                    source_start = batch_size
+                else:
+                    continue
+                source_rows = list(range(source_start, source_start + batch_size))
+                seed_row = source_rows[0]
+                row_cache = cache.for_rows([seed_row]) if hasattr(cache, "for_rows") else cache
+                _reset_generation_cache(cache)
+                _set_generation_cache_seq_len(row_cache, 0)
+                prefix_ids = (
+                    torch.arange(prefix_tokens, device=self.device, dtype=torch.long)
+                    .remainder(max(1, int(vocab_size)))
+                    .view(1, prefix_tokens)
+                )
+                try:
+                    with _allow_prefill_graph_capture_for_cache(row_cache):
+                        _try_prefill_logits_graph(
+                            self.model,
+                            prefix_ids,
+                            row_cache,
+                            allow_capture=True,
+                        )
+                    _set_generation_cache_seq_len(row_cache, prefix_tokens)
+                    for source_row in source_rows:
+                        copy_prefix(
+                            cache,
+                            prefix_tokens,
+                            source_row=seed_row,
+                            dest_row=source_row,
+                        )
+                    suffix_ids = torch.zeros(
+                        batch_size,
+                        suffix_tokens,
+                        dtype=torch.long,
+                        device=self.device,
+                    )
+                    row_indices = torch.arange(batch_size, dtype=torch.long, device=self.device)
+                    required = max(source_rows[-1], batch_size - 1) + 1
+                    seq_lens = torch.zeros(required, dtype=torch.long, device=self.device)
+                    seq_lens[row_indices] = prefix_tokens
+                    seq_lens[torch.tensor(source_rows, dtype=torch.long, device=self.device)] = prefix_tokens
+                    logit_positions = torch.full(
+                        (batch_size,),
+                        suffix_tokens - 1,
+                        dtype=torch.long,
+                        device=self.device,
+                    )
+                    src_prefix_row = torch.tensor(source_rows, dtype=torch.long, device=self.device)
+                    ragged_prefill_graph(
+                        suffix_ids,
+                        cache,
+                        seq_lens=seq_lens,
+                        row_indices=row_indices,
+                        logit_positions=logit_positions,
+                        context_len=-context_bucket,
+                        src_prefix_row=src_prefix_row,
+                    )
+                except Exception as exc:
+                    import sys as _mixedsys
+                    print(
+                        f"[WARMUP] mixed-prefix suffix graph "
+                        f"batch={batch_size} suffix={suffix_tokens} "
+                        f"context={context_bucket}: {exc}",
+                        file=_mixedsys.stderr,
+                        flush=True,
+                    )
+                finally:
+                    _reset_generation_cache(cache)
+        except Exception as exc:
+            import sys as _mixedsys
+            print(f"[WARMUP] mixed-prefix suffix warmup failed: {exc}", file=_mixedsys.stderr, flush=True)
         finally:
             _set_tensor_parallel_runtime_fp8_prefill(self.model, enabled=False, min_m=2048)
             _reset_generation_cache(cache)

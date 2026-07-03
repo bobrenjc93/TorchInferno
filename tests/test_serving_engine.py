@@ -1436,6 +1436,55 @@ def test_continuous_batch_engine_can_bucket_mixed_prefix_context(monkeypatch) ->
     assert any(rows is not None and len(rows) >= 3 for rows in model.prefill_src_prefix_rows)
 
 
+def test_continuous_batch_engine_can_demote_long_mixed_prefix_suffix_to_common_prefix(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PINNED_FULL_PROMPT_STORE_MIN_MAX_TOKENS", "2")
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_MIXED_PREFIX_PREFILL", "1")
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_MIXED_PREFIX_DYNAMIC_CONTEXT", "1")
+    monkeypatch.setenv(
+        "TORCHINFERNO_CONTINUOUS_MIXED_PREFIX_LONG_SUFFIX_COMMON_FALLBACK",
+        "1",
+    )
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_NON_COMMON_PREFIX_GRAPH_PREFILL", "1")
+    shared = tuple(range(1, 17))
+    model = _SelectedLogitsToyModel(vocab_size=256)
+    engine = ContinuousBatchEngine(
+        model,
+        device=torch.device("cpu"),
+        max_active_requests=4,
+        prefix_cache_capacity=6,
+        pin_shared_prefix=True,
+        graph_prefill=True,
+        profile_timings=True,
+    )
+
+    tail = tuple(range(31, 97))
+    results = engine.run(
+        [
+            ServingRequest("turn0-a", (*shared, 21), 2, arrival_step=0),
+            ServingRequest("turn0-b", (*shared, 22, 23), 2, arrival_step=0),
+            ServingRequest("turn0-c", (*shared, 24, 25, 26), 2, arrival_step=0),
+            ServingRequest("turn1-a", (*shared, 21, *tail), 2, arrival_step=2),
+            ServingRequest("turn1-b", (*shared, 22, 23, *tail), 2, arrival_step=2),
+            ServingRequest("turn1-c", (*shared, 24, 25, 26, *tail), 2, arrival_step=2),
+        ]
+    )
+    by_id = {result.request_id: result for result in results}
+
+    assert by_id["turn1-a"].prefix_hit_tokens == len(shared)
+    assert by_id["turn1-b"].prefix_hit_tokens == len(shared)
+    assert by_id["turn1-c"].prefix_hit_tokens == len(shared)
+    assert all(rows is None or len(rows) == 1 for rows in model.prefill_src_prefix_rows)
+    assert engine.stats.prefix_reuse_route_counts["common_prefix"] == 6
+    assert engine.stats.prefix_reuse_route_counts.get("request_prompt", 0) == 0
+    assert engine.stats.prefix_reuse_hit_token_counts[str(len(shared))] == 6
+    assert any(
+        shape.startswith("prefix_graph:b4:s128:p16-16:src1:mixed0")
+        for shape in engine.stats.prefill_shape_counts
+    )
+
+
 def test_continuous_batch_engine_delays_pinned_full_prompt_store_by_default(
     monkeypatch,
 ) -> None:

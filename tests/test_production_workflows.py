@@ -145,6 +145,20 @@ def test_prefix_cache_remove_falls_back_to_shorter_prefix() -> None:
     assert entry is not None and entry.route_id == "shared"
 
 
+def test_prefix_cache_filtered_lookup_falls_back_to_shorter_match() -> None:
+    prefix_cache = PrefixCacheIndex()
+    prefix_cache.add("shared", (1, 2), route_id=("common_prefix", (1, 2)))
+    prefix_cache.add("conversation", (1, 2, 3, 4), route_id="conversation")
+
+    match, entry = prefix_cache.lookup_filtered(
+        (1, 2, 3, 4, 5),
+        lambda candidate: isinstance(candidate.route_id, tuple),
+    )
+
+    assert match.matched_tokens == (1, 2)
+    assert entry is not None and entry.request_id == "shared"
+
+
 def test_production_cli_workflows(tmp_path) -> None:
     torch.manual_seed(32)
     model = DeepSeekV32ForCausalLM(tiny_deepseek_v32_config(vocab_size=32, max_position_embeddings=16)).eval()

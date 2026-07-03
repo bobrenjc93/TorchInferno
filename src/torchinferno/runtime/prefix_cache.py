@@ -69,6 +69,28 @@ class PrefixCacheIndex:
             match = self._router.route(token_tuple)
         return match, None
 
+    def lookup_filtered(
+        self,
+        tokens: Iterable[int],
+        predicate: Callable[[PrefixCacheEntry], bool],
+    ) -> tuple[PrefixMatch, PrefixCacheEntry | None]:
+        token_tuple = tuple(int(token) for token in tokens)
+        best_entry: PrefixCacheEntry | None = None
+        best_depth = 0
+        for entry in self._entries.values():
+            depth = len(entry.tokens)
+            if depth < best_depth or depth > len(token_tuple):
+                continue
+            if token_tuple[:depth] != entry.tokens:
+                continue
+            if not predicate(entry):
+                continue
+            best_entry = entry
+            best_depth = depth
+        if best_entry is None:
+            return PrefixMatch(None, ()), None
+        return PrefixMatch(best_entry.route_id, best_entry.tokens), best_entry
+
 
 def cache_sequence_length(cache: object) -> int:
     seq_len = getattr(cache, "seq_len", None)

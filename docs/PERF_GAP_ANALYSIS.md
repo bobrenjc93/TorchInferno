@@ -74,6 +74,30 @@ long `s144` group. Dense default multi_turn remains around
 `309 / 65 / 364ms`, so keep full-prompt/mixed dynamic context opt-in until
 long-suffix routing and prefix-row policy beat the common-prefix baseline.
 
+The next opt-in scaffold narrows that long-suffix failure mode without changing
+defaults. `TORCHINFERNO_CONTINUOUS_MIXED_PREFIX_LONG_SUFFIX_COMMON_FALLBACK=1`
+lets a mixed-prefix request-prompt hit fall back to the best live
+`common_prefix` entry when the request-prompt suffix bucket exceeds
+`TORCHINFERNO_CONTINUOUS_MIXED_PREFIX_DYNAMIC_CONTEXT_MAX_SUFFIX`. This should
+preserve the fast `s32` dynamic-context wins while avoiding the pathological
+`s144` mixed-prefix route; CPU coverage now verifies that only the explicit
+fallback demotes overlong mixed hits back to the shared prefix. The 70B
+multi_turn fallback-only run
+`agent_space/ti_multi_long_common_fallback_results_0346/.../runs/20260703_034204`
+landed at `289.4 / 70.7 / 389.2ms`, `981/1000` correct. It removed the `s144`
+shape from that run, but still paid `5` request-time prefill graph captures
+(`4.53s` capture time), so it was not enough to promote.
+
+The stronger local result came from warming the mixed-source ragged prefill
+graphs at startup. With the fallback knobs above plus
+`TORCHINFERNO_OPENAI_WARMUP_ONLINE_MIXED_PREFIX_SUFFIX_PREFILL=1`, run
+`agent_space/ti_multi_warmmixed_results_0415/.../runs/20260703_035929` measured
+`243.5 / 67.4 / 312.3ms`, `979/1000` correct. The queue profile shows
+`36/36` request prefill graph hits, `0` request prefill captures, and prefill
+wall time down to `2.57s` from `7.20s` in the fallback-only run. This is now the
+best local multi_turn E2E result, but the knobs remain opt-in until the full
+benchmark suite validates correctness and cross-workload latency.
+
 ## Public 20260702_140923 refresh and SGLang CLI compatibility
 
 The latest public all-provider run at
