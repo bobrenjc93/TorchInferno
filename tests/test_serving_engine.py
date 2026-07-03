@@ -1104,6 +1104,114 @@ def test_paged_online_engine_pads_mixed_shared_suffix_prefill(monkeypatch) -> No
     assert engine.cache.sequence_length("p1") == 0
 
 
+def test_paged_online_engine_graphs_padded_shared_suffix_prefill(monkeypatch) -> None:
+    from types import SimpleNamespace
+
+    import torchinferno.runtime.paged_serving as paged_serving
+
+    monkeypatch.setenv("TORCHINFERNO_PAGED_PREFIX_PADDED_SUFFIX_PREFILL", "1")
+    monkeypatch.setenv("TORCHINFERNO_PAGED_PREFIX_PADDED_SUFFIX_MAX_PADDING_TOKENS", "4")
+    monkeypatch.setenv("TORCHINFERNO_PAGED_PREFIX_PADDED_SUFFIX_MAX_PADDING_PCT", "100")
+    monkeypatch.setenv("TORCHINFERNO_PAGED_PREFIX_SUFFIX_GRAPH", "1")
+    monkeypatch.setenv("TORCHINFERNO_PAGED_PREFIX_SUFFIX_GRAPH_MAX_T", "4")
+    monkeypatch.setenv("TORCHINFERNO_PAGED_PREFIX_SUFFIX_BUCKETS", "4,8")
+
+    class _FakeDecodeGraphRunner:
+        def __init__(self, model, cache, *, batch, max_pages) -> None:
+            self.model = model
+            self.cache = cache
+            self.batch = batch
+            self.max_pages = max_pages
+
+    class _FakeSpecGraphRunner:
+        instances: list["_FakeSpecGraphRunner"] = []
+
+        def __init__(self, model, cache, *, batch, T, max_pages, workspace_bytes=0) -> None:
+            del model, workspace_bytes
+            self.cache = cache
+            self.batch = batch
+            self.T = T
+            self.max_pages = max_pages
+            self.calls: list[dict[str, object]] = []
+            self.instances.append(self)
+
+        def step(self, input_ids, starts, request_ids):
+            self.calls.append(
+                {
+                    "input_ids": input_ids.detach().cpu().tolist(),
+                    "starts": starts.detach().cpu().tolist(),
+                    "request_ids": list(request_ids),
+                    "lengths": [self.cache.sequence_length(rid) for rid in request_ids],
+                }
+            )
+            batch, tokens = input_ids.shape
+            logits = torch.zeros(batch, tokens, 16)
+            for row in range(batch):
+                real_positions = torch.nonzero(input_ids[row] != 0, as_tuple=False).flatten()
+                logits[row, int(real_positions[-1]), 7 + row] = 1.0
+            return logits
+
+    monkeypatch.setattr(paged_serving, "PagedDecodeGraphRunner", _FakeDecodeGraphRunner)
+    monkeypatch.setattr(paged_serving, "PagedSpecGraphRunner", _FakeSpecGraphRunner)
+
+    class _FakeLayer:
+        local_attention_heads = 1
+        local_key_value_heads = 1
+
+    class _FakePagedModel:
+        def __init__(self) -> None:
+            self.device = torch.device("cpu")
+            self.dtype = torch.float32
+            self.config = SimpleNamespace(head_dim=2)
+            self.layers = [_FakeLayer()]
+            self.prefill_calls: list[dict[str, object]] = []
+
+        def forward_prefill_paged(self, *args, **kwargs):
+            del args, kwargs
+            self.prefill_calls.append({})
+            raise AssertionError("eager suffix prefill should not run")
+
+    class _FakePrefixCache:
+        def __init__(self) -> None:
+            self.remembered: list[tuple[str, tuple[int, ...]]] = []
+
+        def share_into(self, new_request_id: str, tokens) -> int:
+            del new_request_id, tokens
+            return 2
+
+        def remember(self, request_id: str, tokens) -> None:
+            self.remembered.append((request_id, tuple(tokens)))
+
+    model = _FakePagedModel()
+    engine = paged_serving.PagedEngine(model, page_size=2, max_active=4, max_seq=8, use_graph=True)
+    engine.prefix_cache = _FakePrefixCache()
+    engine.submit("a", [1, 2, 3, 4], 1)
+    engine.submit("b", [5, 6, 7, 8, 9], 1)
+
+    events = engine.step()
+
+    assert events == [("a", 7, True), ("b", 8, True)]
+    assert model.prefill_calls == []
+    assert len(_FakeSpecGraphRunner.instances) == 1
+    runner = _FakeSpecGraphRunner.instances[0]
+    assert runner.batch == 2
+    assert runner.T == 4
+    assert runner.calls == [
+        {
+            "input_ids": [[3, 4, 0, 0], [7, 8, 9, 0]],
+            "starts": [2, 2],
+            "request_ids": ["p0", "p1"],
+            "lengths": [6, 6],
+        }
+    ]
+    assert engine.stats.prefill_model_calls == 1
+    assert engine.stats.prefill_shape_counts == {"paged_prefix:b2:s4:p2-2": 1}
+    assert engine.stats.prefill_shape_active_tokens == {"paged_prefix:b2:s4:p2-2": 5}
+    assert engine.stats.prefill_shape_model_tokens == {"paged_prefix:b2:s4:p2-2": 8}
+    assert engine.cache.sequence_length("p0") == 0
+    assert engine.cache.sequence_length("p1") == 0
+
+
 def test_paged_online_engine_buckets_shared_suffix_prefill_when_one_group_is_too_wasteful(
     monkeypatch,
 ) -> None:

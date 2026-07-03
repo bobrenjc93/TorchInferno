@@ -57,6 +57,26 @@ inside the still opt-in paged-prefix engine, groups by
 guards per bucket. CPU coverage verifies a wave that rejects one all-in padded
 batch now emits a padded `s4` bucket plus an exact long suffix group.
 
+An opt-in suffix graph hook is available for that same experimental paged-prefix
+path as `TORCHINFERNO_PAGED_PREFIX_SUFFIX_GRAPH=1`. A focused paged multi_turn
+run with prefix caching and bucketed suffix prefill at
+`agent_space/ti_multi_paged_bucket_results_2211/.../runs/20260703_051110`
+landed at `3060.3 / 684.1 / 3287.3ms` with `981/1000` correct. The queue
+profile reduced the path to `34` prefill calls, but still spent `9.35s` in
+prefill forward, with most paged suffix/full prefill shapes taking roughly
+`260-290ms` each. Exact suffix graphing at
+`agent_space/ti_multi_paged_suffix_graph_results_0703/.../runs/20260703_052956`
+improved that to `2757.6 / 614.1 / 2982.6ms`, but captured several exact
+`s25..s31` shapes on the request path and still spent `8.41s` in prefill
+forward. The follow-up graph-bucket run at
+`agent_space/ti_multi_paged_suffix_graph_bucket_results_0703/.../runs/20260703_053849`
+coalesced those suffixes to `s32`, landed at `2668.4 / 715.3 / 3077.5ms` with
+`981/1000` correct, and cut prefill forward to `2.85s`; only the first
+`b32/s32` and `b8/s32` captures were expensive, while later `b32/s32` replays
+were about `10ms`. Keep this path default-off: graph replay removes the paged
+suffix launch floor, but request-path capture and remaining queueing still leave
+it far behind the default dense path and the vLLM/SGLang multi_turn rows.
+
 Mixed-prefix dynamic context is accepted only as opt-in infrastructure for the
 same multi_turn reuse gap. The previous full-prompt reuse route could collapse
 the run to coarse non-common-prefix batches, but mixed-prefix prefill either

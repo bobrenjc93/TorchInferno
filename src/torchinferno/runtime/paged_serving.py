@@ -697,6 +697,7 @@ class PagedEngine:
         self.page_size = page_size
         self.max_active = max_active
         self.max_seq = max_seq  # exposed for persistent-engine fit/rebuild checks
+        self.use_graph = bool(use_graph)
         dev = model.device
         self.dev = dev
         layer0 = model.layers[0]
@@ -711,7 +712,7 @@ class PagedEngine:
         )
         self.runner = (
             PagedDecodeGraphRunner(model, self.cache, batch=max_active, max_pages=pages_per)
-            if use_graph else None
+            if self.use_graph else None
         )
         self._pending: list[tuple] = []  # (request_id, prompt, max_new, eos, stop_ids)
         self._active: list[dict] = []
@@ -728,10 +729,29 @@ class PagedEngine:
         # 1.5-2.5x when shapes RECUR (few distinct lengths), but varied-length multi_turn
         # never reaches steady reuse. Needs T-BUCKETING (round T to coarse buckets + pad,
         # logits read at real_len-1) before it can be default-on.
-        self._use_prefill_graph = use_graph and env_flag("TORCHINFERNO_PAGED_PREFILL_GRAPH", False)
+        self._use_prefill_graph = self.use_graph and env_flag("TORCHINFERNO_PAGED_PREFILL_GRAPH", False)
         self._prefill_runners: dict[tuple, PagedPrefillGraphRunner] = {}
         self._prefill_runner_cap = env_int("TORCHINFERNO_PAGED_PREFILL_GRAPH_MAX", 16, minimum=1)
         self._prefill_graph_max_t = env_int("TORCHINFERNO_PAGED_PREFILL_GRAPH_MAX_T", 4096, minimum=1)
+        # Opt-in suffix-prefill graphs reuse the speculative paged-prefill runner
+        # for prefix-cache suffix batches. This targets the launch-floor dominated
+        # paged-prefix profile without changing default eager behavior.
+        self._use_suffix_prefill_graph = self.use_graph and env_flag(
+            "TORCHINFERNO_PAGED_PREFIX_SUFFIX_GRAPH",
+            False,
+        )
+        self._suffix_prefill_runners: dict[tuple[int, int], PagedSpecGraphRunner] = {}
+        self._suffix_prefill_runner_cap = env_int(
+            "TORCHINFERNO_PAGED_PREFIX_SUFFIX_GRAPH_MAX",
+            16,
+            minimum=1,
+        )
+        self._suffix_prefill_graph_max_t = env_int(
+            "TORCHINFERNO_PAGED_PREFIX_SUFFIX_GRAPH_MAX_T",
+            128,
+            minimum=1,
+        )
+        self._suffix_prefill_graph_failed = False
         self.stats = PagedEngineStats(max_model_batch_size=max_active)
         # Zero-copy COW prefix cache (default-off until end-to-end validated): a new
         # request shares the longest cached page-aligned prefix and prefills only its
@@ -785,6 +805,62 @@ class PagedEngine:
         input_ids = torch.tensor(prompts, dtype=torch.long, device=self.dev)
         return runner.step(input_ids, rids)
 
+    def _suffix_prefill_graph_enabled(self, batch: int, suffix_len: int) -> bool:
+        return (
+            self._use_suffix_prefill_graph
+            and not self._suffix_prefill_graph_failed
+            and 0 < int(batch) <= self.max_active
+            and 0 < int(suffix_len) <= self._suffix_prefill_graph_max_t
+        )
+
+    def _suffix_prefill_graph_batch(
+        self,
+        rids: list[str],
+        padded_suffixes: list[list[int]],
+        starts: list[int],
+        *,
+        suffix_len: int,
+    ):
+        batch = len(rids)
+        suffix_len = int(suffix_len)
+        if not self._suffix_prefill_graph_enabled(batch, suffix_len):
+            return None
+
+        batch_bucket = min(self.max_active, 1 << (batch - 1).bit_length())
+        if batch_bucket < batch:
+            return None
+        key = (batch_bucket, suffix_len)
+        runner = self._suffix_prefill_runners.get(key)
+        required_pages = self._required_pages_for(rids)
+        base_pages = math.ceil(self.max_seq / self.page_size) + 1
+        try:
+            if runner is None:
+                if len(self._suffix_prefill_runners) >= self._suffix_prefill_runner_cap:
+                    return None
+                runner = PagedSpecGraphRunner(
+                    self.model,
+                    self.cache,
+                    batch=batch_bucket,
+                    T=suffix_len,
+                    max_pages=max(required_pages, base_pages),
+                )
+                self._suffix_prefill_runners[key] = runner
+            elif required_pages > runner.max_pages:
+                runner = PagedSpecGraphRunner(
+                    self.model,
+                    self.cache,
+                    batch=batch_bucket,
+                    T=suffix_len,
+                    max_pages=max(required_pages, base_pages, runner.max_pages * 2),
+                )
+                self._suffix_prefill_runners[key] = runner
+            input_ids = torch.tensor(padded_suffixes, dtype=torch.long, device=self.dev)
+            start_positions = torch.tensor(starts, dtype=torch.long, device=self.dev)
+            return runner.step(input_ids, start_positions, rids)
+        except Exception:
+            self._suffix_prefill_graph_failed = True
+            return None
+
     def _prefill_batch(self, rids, prompts):
         # Batched (uniform-length) prefill: ONE forward_prefill_paged for all rids
         # of the same prompt length T, instead of one call per request -- the fix for
@@ -834,11 +910,6 @@ class PagedEngine:
         # the shared prefix for free. Mixed suffix lengths may be padded to one
         # FlashInfer call; callers select logits at each row's real suffix end.
         # Mirrors the GPU-validated scripts/validate_paged_suffix_prefill.py path.
-        import flashinfer
-
-        if self._prefill_ws is None:
-            self._prefill_ws = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=self.dev)
-            self._prefill_wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(self._prefill_ws, kv_layout="NHD")
         if len(rids) != len(prompts) or len(rids) != len(shared_tokens):
             raise ValueError("paged suffix prefill batch inputs must have matching lengths")
         suffixes = [
@@ -869,16 +940,37 @@ class PagedEngine:
             target_len = shared_i + suffix_len
             self.cache.reserve(rid, target_len)
             seq.length = target_len
-        indptr, indices, lpl = self.cache.flashinfer_page_table(list(rids))
-        qo = torch.arange(0, (len(rids) + 1) * suffix_len, suffix_len, dtype=torch.int32, device=self.dev)
-        self._prefill_wrapper.plan(
-            qo_indptr=qo, paged_kv_indptr=indptr, paged_kv_indices=indices, paged_kv_last_page_len=lpl,
-            num_qo_heads=self.nqo, num_kv_heads=self.nkv, head_dim_qk=self.hd, page_size=self.page_size,
-            causal=True, q_data_type=self.cache.kv.dtype,
-        )
         starts = [int(shared) for shared in shared_tokens]
-        start_position = starts[0] if len(set(starts)) == 1 else torch.tensor(starts, dtype=torch.long, device=self.dev)
         try:
+            graphed = self._suffix_prefill_graph_batch(
+                list(rids),
+                padded_suffixes,
+                starts,
+                suffix_len=suffix_len,
+            )
+            if graphed is not None:
+                return graphed
+
+            import flashinfer
+
+            if self._prefill_ws is None:
+                self._prefill_ws = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=self.dev)
+                self._prefill_wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+                    self._prefill_ws,
+                    kv_layout="NHD",
+                )
+            indptr, indices, lpl = self.cache.flashinfer_page_table(list(rids))
+            qo = torch.arange(0, (len(rids) + 1) * suffix_len, suffix_len, dtype=torch.int32, device=self.dev)
+            self._prefill_wrapper.plan(
+                qo_indptr=qo, paged_kv_indptr=indptr, paged_kv_indices=indices, paged_kv_last_page_len=lpl,
+                num_qo_heads=self.nqo, num_kv_heads=self.nkv, head_dim_qk=self.hd, page_size=self.page_size,
+                causal=True, q_data_type=self.cache.kv.dtype,
+            )
+            start_position = (
+                starts[0]
+                if len(set(starts)) == 1
+                else torch.tensor(starts, dtype=torch.long, device=self.dev)
+            )
             return self.model.forward_prefill_paged(
                 torch.tensor(padded_suffixes, dtype=torch.long, device=self.dev), self.cache,
                 request_ids=list(rids), prefill_wrapper=self._prefill_wrapper, start_position=start_position,
@@ -995,8 +1087,16 @@ class PagedEngine:
             return exact_groups()
 
         max_suffix = max(suffix_lengths)
-        if can_pad(shared, max_suffix, suffix_lengths):
-            return [(max_suffix, shared, suffix_lengths, True)]
+        graph_suffix = _paged_prefix_suffix_bucket(max_suffix)
+        # Graph replay is keyed by T, so coalesce near suffix lengths only when
+        # the suffix graph path is explicitly enabled and the bucket is allowed.
+        padded_suffix = (
+            graph_suffix
+            if self._suffix_prefill_graph_enabled(len(shared), graph_suffix)
+            else max_suffix
+        )
+        if can_pad(shared, padded_suffix, suffix_lengths):
+            return [(padded_suffix, shared, suffix_lengths, True)]
 
         if not env_flag("TORCHINFERNO_PAGED_PREFIX_BUCKETED_SUFFIX_PREFILL", True):
             return exact_groups()
@@ -1329,6 +1429,7 @@ class PagedEngine:
             self.cache = external_cache
             if self.runner is not None:
                 self.runner.cache = external_cache
+            self._suffix_prefill_runners = {}
         self._pending = []
         self._active = []
         self._gen_count = {}
