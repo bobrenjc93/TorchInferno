@@ -229,6 +229,20 @@ common prefix and spent `4.30s` in prefill forward; tree spent `2.15s` in
 prefill forward plus `1.46s` in ragged-decode GPU; long_output spent `5.20s`
 in prefill forward plus `10.45s` in ragged-decode GPU.
 
+After the sampled exact-context promotion, a full TorchInferno-only refresh on
+pushed `79c71d5`
+(`agent_space/ti_full_79c71d5_results/.../runs/20260703_022522`) landed at
+few_shot `171.2 / 53.2 / 211.9ms`, self_consistency
+`199.0 / 0.0 / 228.0ms`, multi_turn `309.5 / 65.0 / 364.4ms`,
+tree_of_thought `137.9 / 28.3 / 162.7ms`, and long_output
+`257.1 / 24.3 / 1151.0ms`. The intended tree win held in the full run, but the
+remaining priority did not change: multi_turn still reused only the `45` token
+common prefix and spent `4.26s` in prefill forward; long_output spent `5.21s`
+in prefill forward and `10.27s` in ragged decode GPU across `752` decode
+batches. The current long-output decode-many split is still dominated by
+`b64/64` work with only moderate skipped-token waste, so the rejected
+drain-quantum/tail-cap knobs remain closed.
+
 Rechecking sampled decode-many under the current sampled-medium q2 policy does
 not change the default. Enabling
 `TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_DECODE_MANY=1` alone for focused tree
