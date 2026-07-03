@@ -7415,6 +7415,22 @@ writing the profile JSONL; they do not change scheduling, graph keys, kernels,
 or serving behavior. Use them to rank the next packed/ragged prefill and decode
 overlap work instead of inferring waste by hand from multiple shape counters.
 
+A focused current-head run after adding those counters wrote
+`agent_space/ti_waste_counters_results_0703/.../8xH100-local-ti-waste-counters-20260703/runs/20260703_061357`
+against pushed `66a33ed`. It landed at multi_turn
+`305.0 / 60.0 / 358.7ms`, `984/1000` correct, and long_output
+`246.3 / 24.1 / 1122.0ms`, `1000/1000` correct. The new counters make the
+shape waste explicit: multi_turn used `82.2K` prefill tokens with `25.4K`
+padding tokens and no decode-many overgeneration, while long_output used
+`50.4K` prefill tokens with `42.2K` padding tokens plus `1.9K` decode-many
+overgenerated tokens. The dominant long-output padding was still in warmed,
+miss-free common-prefix graph shapes (`b32:s64` at `18.2K` padding and
+`1.87s` forward, then `b32:s96` at `9.9K` padding and `0.94s` forward). This
+confirms that the next large lever is a non-fragmenting packed/ragged cached
+prefix prefill path; the already-rejected suffix splitting, prefill-cost
+priority broadening, chunked/unified forward, and decode-many tail knobs should
+not be repeated without a new implementation.
+
 ## Priority for a focused (non-loop) session
 
 1. Prefill MFU (Issue 1) — biggest TTFT lever, ~2x, affects 3/5 benchmarks.
