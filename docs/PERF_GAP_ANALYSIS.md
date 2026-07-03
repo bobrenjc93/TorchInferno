@@ -181,6 +181,23 @@ few_shot `165.4 / 46.9 / 203.3ms`, self_consistency `180.1 / 0.0 / 192.5ms`,
 multi_turn `293.5 / 60.5 / 346.5ms`, tree_of_thought `134.0 / 27.9 / 156.4ms`,
 and long_output `263.2 / 24.4 / 1113.0ms`, with correctness in the normal band.
 
+Greedy-short `b24` prefix-prefill batching is rejected as a default. The focused
+long_output env probe
+`agent_space/ti_long_prefill_b24_results_0703/.../runs/20260703_082054`
+improved to `246.9 / 23.7 / 1092.8ms`, and the no-env patch validation
+`agent_space/ti_long_b24_default_results_0703/.../runs/20260703_082745` landed
+at `225.6 / 24.2 / 1075.7ms` with zero request-path prefill graph misses. The
+full-suite run
+`agent_space/ti_full_greedy_b24_default_results_0703/.../runs/20260703_083404`
+showed why it cannot ship broadly: long_output improved to
+`247.7 / 23.9 / 1059.1ms`, but self_consistency regressed to
+`262.9 / 0.0 / 427.5ms` and multi_turn to `336.2 / 66.4 / 400.8ms`. The queue
+profile was already at the `128` ragged prefill graph cap with `2` evictions,
+where the sampled-medium-only default stayed at `121` live entries with zero
+evictions. Keep greedy-short `b24` opt-in until the cache can hold those shapes
+without evicting useful warmed graphs or a narrower non-benchmark-specific
+policy proves safe across the full suite.
+
 A debug rerun on pushed commit `5089f09` wrote
 `agent_space/ti_multi_warmmixed_debug_results_0425/.../runs/20260703_041208`
 and measured `232.4 / 72.8 / 304.8ms`, `981/1000` correct. Saved response text
