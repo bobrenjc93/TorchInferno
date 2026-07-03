@@ -27,6 +27,8 @@ from torchinferno.models.llama3.tensor_parallel import (
     _decode_attention_block_size,
     _decode_linear,
     _prefill_graph_cache_storage,
+    _prepare_paged_ragged_decode_graph_state,
+    _ragged_decode_cache_token_bucket,
     _should_use_decode_step_graph,
     _should_use_decode_step_logits_graph,
     _static_decode_cache_rows_are_contiguous,
@@ -309,6 +311,83 @@ def test_paged_kv_cache_seq_len_restore_keeps_graph_pages() -> None:
     storage = _prefill_graph_cache_storage(Llama3TensorParallelCache([layer], cache_backend="paged"))
     assert storage is not None
     assert storage.data_ptr() == layer.pages.keys.data_ptr()
+
+
+def test_paged_ragged_decode_graph_state_uses_cache_token_bucket(monkeypatch) -> None:
+    monkeypatch.setenv("TORCHINFERNO_CUDAGRAPH_RAGGED_DECODE_CACHE_TOKEN_BUCKETS", "1")
+    monkeypatch.setenv("TORCHINFERNO_CUDAGRAPH_RAGGED_DECODE_CACHE_TOKEN_BUCKET_VALUES", "4,8,16")
+    dense_cache = Llama3TensorParallelCache(
+        [
+            Llama3TensorParallelLayerKVCache(
+                2,
+                16,
+                1,
+                2,
+                device=torch.device("cpu"),
+                dtype=torch.float32,
+            )
+        ]
+    )
+    cache = Llama3TensorParallelCache(
+        [
+            PagedLlama3TensorParallelLayerKVCache(
+                2,
+                16,
+                1,
+                2,
+                page_size=2,
+                device=torch.device("cpu"),
+                dtype=torch.float32,
+            )
+            for _ in range(2)
+        ],
+        cache_backend="paged",
+    )
+    seq_lens = torch.tensor([2, 5], dtype=torch.long)
+
+    assert _ragged_decode_cache_token_bucket(dense_cache, seq_lens, None, batch=2) == 8
+    assert _ragged_decode_cache_token_bucket(cache, seq_lens, None, batch=2) == 8
+    page_tables, seq_lens_buffers = _prepare_paged_ragged_decode_graph_state(
+        cache,
+        batch=2,
+        cache_positions=seq_lens,
+        row_indices=None,
+        device=torch.device("cpu"),
+        cache_token_bucket=8,
+    )
+    assert len(page_tables) == 2
+    assert len(seq_lens_buffers) == 2
+    assert page_tables[0].shape == (2, 4)
+    assert seq_lens_buffers[0].tolist() == [3, 6]
+    assert cache.layers[0]._torchinferno_paged_decode_cache_tokens == 8
+    first_page_table_ptr = page_tables[0].data_ptr()
+
+    reused_page_tables, reused_seq_lens = _prepare_paged_ragged_decode_graph_state(
+        cache,
+        batch=2,
+        cache_positions=seq_lens,
+        row_indices=None,
+        device=torch.device("cpu"),
+        cache_token_bucket=8,
+        page_tables=page_tables,
+        seq_lens_buffers=seq_lens_buffers,
+    )
+    assert reused_page_tables[0].data_ptr() == first_page_table_ptr
+    assert reused_seq_lens[0].data_ptr() == seq_lens_buffers[0].data_ptr()
+
+    wider_page_tables, _wider_seq_lens = _prepare_paged_ragged_decode_graph_state(
+        cache,
+        batch=2,
+        cache_positions=torch.tensor([9, 9], dtype=torch.long),
+        row_indices=None,
+        device=torch.device("cpu"),
+        cache_token_bucket=16,
+        page_tables=page_tables,
+        seq_lens_buffers=seq_lens_buffers,
+    )
+    assert wider_page_tables[0].shape == (2, 8)
+    assert wider_page_tables[0].data_ptr() != first_page_table_ptr
+    assert cache.layers[0]._torchinferno_paged_decode_cache_tokens == 16
 
 
 def test_tensor_parallel_kv_cache_row_views_copy_prefix_and_clear() -> None:

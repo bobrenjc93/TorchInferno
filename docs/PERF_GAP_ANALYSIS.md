@@ -193,6 +193,21 @@ reproduce the `b4` tail shape, so keep treating this as opt-in graph coverage
 for an observed miss rather than evidence to promote greedy-large mixed-prefix
 reuse by default.
 
+Bucketed ragged-decode cache-token loop bounds are rejected as a default for
+long_output. The first env probe only changed the paged graph metadata path and
+therefore did not affect the dense long-output path:
+`agent_space/ti_long_cachetoken_bucket_results_0703/.../runs/20260703_100113`
+landed at `285.4 / 24.3 / 1122.1ms`, with decode GPU still at `10.67s` and no
+decode graph misses. Extending the same bucket key to dense ragged decode by
+slicing the K/V cache before the grouped GQA kernel also failed:
+`agent_space/ti_long_dense_cachetoken_bucket_results_0703/.../runs/20260703_101009`
+landed at `272.6 / 23.7 / 1195.1ms`, still `1000/1000` correct, but introduced
+five request-path decode graph captures (`1.62s` capture time), raised decode GPU
+to `11.51s`, and worsened p99 TPOT to `104.9ms`. Keep
+`TORCHINFERNO_CUDAGRAPH_RAGGED_DECODE_CACHE_TOKEN_BUCKETS` default-off as a
+diagnostic; the long-output gap remains lower steady decode GPU without extra
+graph buckets, or a real prefill/decode/readback pipeline.
+
 Sampled-medium prefix prefill now has a default `b24` batch bucket. The focused
 env probe with `TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_BATCH_BUCKETS=1,2,4,8,16,24,32`
 and matching warmup wrote
