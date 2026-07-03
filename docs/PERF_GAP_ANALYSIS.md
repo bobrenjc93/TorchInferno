@@ -1,5 +1,50 @@
 # TorchInferno vs vLLM/sglang — Performance Gap Analysis (Llama-3.1-70B, 8xH100)
 
+## Public 20260703_010234 refresh and paged-prefix cache blocker
+
+The latest public all-provider run at
+`results/v1/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100/runs/20260703_010234`
+was published with inference-bench `fe3e4cf5`. It measured TorchInferno
+`5e433fe`, vLLM `4c3c64f`, and SGLang `05bc3f2`. The TorchInferno commit is
+behind the current local/pushed head by the sampled exact-context tree change
+and opt-in diagnostics, but the vLLM/SGLang rows are still the relevant target.
+The score split was vLLM `11`, TorchInferno `5`, and SGLang `3`.
+
+Rows as TTFT / TPOT / E2E:
+
+- few_shot: vLLM `155.2 / 56.3 / 205.8ms`, SGLang
+  `142.7 / 76.4 / 220.6ms`, TorchInferno `156.0 / 47.4 / 200.0ms`.
+- self_consistency: vLLM `210.2 / 0.0 / 233.5ms`, SGLang
+  `233.4 / 0.0 / 384.4ms`, TorchInferno `154.3 / 0.0 / 166.0ms`.
+- multi_turn: vLLM `174.9 / 54.0 / 225.6ms`, SGLang
+  `161.4 / 112.2 / 270.8ms`, TorchInferno `303.7 / 60.2 / 358.6ms`.
+- tree_of_thought: vLLM `63.4 / 30.6 / 86.5ms`, SGLang
+  `71.4 / 75.8 / 151.7ms`, TorchInferno `136.6 / 39.8 / 162.6ms`.
+- long_output: vLLM `78.4 / 15.1 / 621.6ms`, SGLang
+  `72.5 / 21.6 / 805.8ms`, TorchInferno `252.5 / 21.2 / 966.4ms`.
+
+The queue and provider logs point at the same architectural gap. vLLM reports
+prefix-cache hit rates in the `65-86%` range with chunked prefill, while SGLang
+uses RadixCache and prefill/decode CUDA graphs. TorchInferno still reuses only
+the `45` token shared prefix on multi_turn and spends about `4.1s` in
+multi_turn prefill forward; long_output spends about `4.35s` in prefill forward
+and `9.35s` in ragged-decode GPU across `771` decode batches. The current local
+TorchInferno refresh after the sampled exact-context promotion still has the
+same remaining shape: multi_turn only has common-prefix reuse, and long_output
+is dominated by full `b64/64` decode-many work rather than scalar skip waste.
+
+A concrete paged-prefix validation blocker was fixed after this inspection.
+The experimental `PagedEngine` can persist a zero-copy page-level prefix cache
+across online bursts, but `start_online()` reset internal ids back to `p0` while
+the prefix cache retained entries by those ids. Reusing an id caused
+`PagedPrefixCache.remember()` to touch the stale entry instead of replacing its
+retained pages and radix routes, so later bursts could keep an old prefix set.
+The cache now replaces same-id entries, rebuilds the router, releases stale
+retained refs, and the engine keeps ids monotonic while a persistent prefix
+cache exists. This does not make paged serving a default path; it removes a
+correctness and validation blocker for the vLLM/SGLang-style KV reuse work that
+multi_turn needs.
+
 ## Public 20260702_140923 refresh and SGLang CLI compatibility
 
 The latest public all-provider run at

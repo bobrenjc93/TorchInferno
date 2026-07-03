@@ -217,6 +217,73 @@ def test_paged_prefix_cache_zero_copy_share_and_evict() -> None:
     assert cache.page_refcount(a_pages[0]) == 1         # b still holds it
 
 
+def test_paged_prefix_cache_replaces_reused_request_id() -> None:
+    from torchinferno.runtime.paged import LayeredPagedKVCache
+    from torchinferno.runtime.paged_serving import PagedPrefixCache
+
+    cache = LayeredPagedKVCache(
+        num_layers=1, num_pages=32, page_size=4,
+        num_key_value_heads=1, head_dim=2,
+        device=torch.device("cpu"), dtype=torch.float32,
+    )
+    pc = PagedPrefixCache(cache, capacity=2)
+
+    old_tokens = list(range(8))
+    cache.reserve("p0", len(old_tokens))
+    cache._sequences["p0"].length = len(old_tokens)
+    old_pages = list(cache._sequences["p0"].page_ids)
+    pc.remember("p0", old_tokens)
+    cache.free("p0")
+    assert cache.page_refcount(old_pages[0]) == 1
+
+    new_tokens = list(range(100, 108))
+    cache.reserve("p0", len(new_tokens))
+    cache._sequences["p0"].length = len(new_tokens)
+    new_pages = list(cache._sequences["p0"].page_ids)
+    pc.remember("p0", new_tokens)
+    cache.free("p0")
+
+    assert cache.page_refcount(old_pages[0]) == 0
+    assert pc.share_into("old-query", old_tokens + [99]) == 0
+    assert pc.share_into("new-query", new_tokens + [99]) == 8
+    assert cache._sequences["new-query"].page_ids == new_pages
+
+
+def test_paged_engine_keeps_persistent_prefix_request_ids_monotonic() -> None:
+    import torch as _t
+    import torchinferno.runtime.paged_serving as paged_serving
+
+    class _FakeLayer:
+        local_attention_heads = 1
+        local_key_value_heads = 1
+
+    class _FakeConfig:
+        head_dim = 1
+
+    class _FakeModel:
+        device = _t.device("cpu")
+        dtype = _t.float32
+        layers = [_FakeLayer()]
+        config = _FakeConfig()
+
+    engine = paged_serving.PagedEngine(
+        _FakeModel(),
+        page_size=4,
+        max_active=2,
+        max_seq=8,
+        use_graph=False,
+    )
+    engine.prefix_cache = paged_serving.PagedPrefixCache(engine.cache, capacity=2)
+
+    assert engine._allocate_request_id() == "p0"
+    engine.start_online(max_seq_len=8)
+    assert engine._allocate_request_id() == "p1"
+
+    engine.prefix_cache = None
+    engine.start_online(max_seq_len=8)
+    assert engine._allocate_request_id() == "p0"
+
+
 def test_paged_engine_resizes_decode_runner_for_wider_page_tables(monkeypatch) -> None:
     import torch as _t
     import torchinferno.runtime.paged_serving as paged_serving

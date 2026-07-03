@@ -47,13 +47,15 @@ class PagedPrefixCache:
         self._lru: list[str] = []
 
     def remember(self, request_id: str, tokens) -> None:
-        if self.capacity <= 0 or request_id in self._entries:
-            if request_id in self._entries:
-                self._touch(request_id)
+        if self.capacity <= 0:
             return
         seq = self.cache._sequences.get(request_id)
         if seq is None:
+            if request_id in self._entries:
+                self._touch(request_id)
             return
+        if request_id in self._entries:
+            self._drop_entry(request_id)
         full_pages = min(len(seq.page_ids), len(tokens) // self.page_size)
         if full_pages <= 0:
             return
@@ -103,13 +105,17 @@ class PagedPrefixCache:
             self._lru.remove(request_id)
             self._lru.append(request_id)
 
+    def _drop_entry(self, request_id: str) -> None:
+        _toks, pages = self._entries.pop(request_id)
+        if request_id in self._lru:
+            self._lru.remove(request_id)
+        for pid in pages:
+            self.cache.release_page_ref(pid)
+        self._rebuild_router()
+
     def _evict(self) -> None:
         while len(self._lru) > self.capacity:
-            rid = self._lru.pop(0)
-            _toks, pages = self._entries.pop(rid)
-            for pid in pages:
-                self.cache.release_page_ref(pid)
-            self._rebuild_router()
+            self._drop_entry(self._lru[0])
 
     def _rebuild_router(self) -> None:
         # PrefixAwareRouter has no remove(); rebuild from the surviving entries
@@ -791,6 +797,11 @@ class PagedEngine:
             stop_ids.add(int(eos_token_id))
         self._pending.append((request_id, list(prompt), max_new_tokens, eos_token_id, tuple(sorted(stop_ids))))
 
+    def _allocate_request_id(self) -> str:
+        rid = f"p{self._next_rid}"
+        self._next_rid += 1
+        return rid
+
     def has_work(self) -> bool:
         return bool(self._pending or self._active)
 
@@ -850,8 +861,7 @@ class PagedEngine:
                 if len(self.cache.free_pages) < need:
                     break
                 self._pending.pop(0)
-                rid = f"p{self._next_rid}"
-                self._next_rid += 1
+                rid = self._allocate_request_id()
                 # COW: share the longest cached page-aligned prefix (zero-copy) so we
                 # prefill only the suffix. Deterministic across TP ranks (same cache +
                 # tokens -> same share), keeping per-request prefill collectives aligned.
@@ -1039,7 +1049,8 @@ class PagedEngine:
                 self.runner.cache = external_cache
         self._pending = []
         self._active = []
-        self._next_rid = 0
+        if self.prefix_cache is None:
+            self._next_rid = 0
         self._step_no = 0
         self._spec_runner = None  # rebuilt lazily (cache may have been swapped above)
 
