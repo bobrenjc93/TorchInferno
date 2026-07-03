@@ -2686,6 +2686,9 @@ class Llama3TensorParallelForCausalLM:
             tuple[int, int, int, int, bool, int, int, tuple[bool, ...], int],
             _StaticRaggedPrefillLogitsGraphCall,
         ] = {}
+        self._ragged_prefill_logits_graph_evictions = 0
+        self._ragged_prefill_logits_graph_evicted_entries = 0
+        self._ragged_prefill_logits_graph_max_entries = 0
         self._ragged_prefill_logits_graph_failed = False
         self._ragged_prefill_mixed_logits_graph_failed = False
         self._ragged_prefill_capture_on_miss_failed = False
@@ -5224,7 +5227,15 @@ class Llama3TensorParallelForCausalLM:
                     return None
                 raise RuntimeError("ragged prefill graph capture failed on at least one rank")
             max_graphs = _tp_int("TORCHINFERNO_CUDAGRAPH_PREFILL_MAX_GRAPHS", 128, minimum=1)
-            if key not in self._ragged_prefill_logits_graphs and len(self._ragged_prefill_logits_graphs) >= max_graphs:
+            self._ragged_prefill_logits_graph_max_entries = max_graphs
+            if (
+                key not in self._ragged_prefill_logits_graphs
+                and len(self._ragged_prefill_logits_graphs) >= max_graphs
+            ):
+                self._ragged_prefill_logits_graph_evictions += 1
+                self._ragged_prefill_logits_graph_evicted_entries += (
+                    len(self._ragged_prefill_logits_graphs)
+                )
                 self._ragged_prefill_logits_graphs.clear()
             self._ragged_prefill_logits_graphs[key] = new_captured
             captured = new_captured

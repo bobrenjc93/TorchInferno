@@ -13505,8 +13505,15 @@ def test_openai_queue_profile_records_runtime_engine_stats(
         decode_shape_gpu_ms = {"ragged:b8/8": 10.5}
         decode_shape_cpu_tokens_ms = {"ragged:b8/8": 1.25}
 
+    class Model:
+        _ragged_prefill_logits_graphs = {"shape-a": object(), "shape-b": object()}
+        _ragged_prefill_logits_graph_evictions = 2
+        _ragged_prefill_logits_graph_evicted_entries = 128
+        _ragged_prefill_logits_graph_max_entries = 64
+
     class RuntimeEngine:
         stats = Stats()
+        model = Model()
 
     engine._record_runtime_engine_queue_profile(
         "online_batcher",
@@ -13553,6 +13560,10 @@ def test_openai_queue_profile_records_runtime_engine_stats(
             "runtime_persistent_cache_rows": 12,
             "runtime_prefill_batches": 2,
             "runtime_prefill_graph_capture_ms": 9.5,
+            "runtime_prefill_graph_cache_evicted_entries": 128,
+            "runtime_prefill_graph_cache_evictions": 2,
+            "runtime_prefill_graph_cache_live_entries": 2,
+            "runtime_prefill_graph_cache_max_entries": 64,
             "runtime_prefill_graph_captures": 1,
             "runtime_prefill_graph_replay_ms": 1.25,
             "runtime_prefill_graph_replays": 2,

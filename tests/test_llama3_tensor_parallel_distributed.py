@@ -204,6 +204,68 @@ def test_llama3_tensor_parallel_mixed_prefill_capture_failure_keeps_uniform_repl
     assert not model._ragged_prefill_logits_graph_failed
 
 
+def test_llama3_tensor_parallel_ragged_prefill_graph_counts_evictions(monkeypatch) -> None:
+    model = object.__new__(Llama3TensorParallelForCausalLM)
+    model.device = torch.device("cpu")
+    model.rank = 0
+    model.world_size = 1
+    model.layers = []
+    model._ragged_prefill_logits_graphs = {("old",): object()}
+    model._ragged_prefill_logits_graph_evictions = 0
+    model._ragged_prefill_logits_graph_evicted_entries = 0
+    model._ragged_prefill_logits_graph_max_entries = 0
+    model._ragged_prefill_logits_graph_failed = False
+    model._ragged_prefill_mixed_logits_graph_failed = False
+    model._ragged_prefill_capture_on_miss_failed = False
+    model._last_ragged_prefill_graph_captured = False
+    cache = types.SimpleNamespace(layers=[types.SimpleNamespace(max_seq_len=16)])
+    cache._skip_capture_sync = True
+    input_ids = torch.zeros((2, 4), dtype=torch.long)
+    seq_lens = torch.zeros(4, dtype=torch.long)
+    row_indices = torch.tensor([0, 1], dtype=torch.long)
+    logit_positions = torch.tensor([3, 3], dtype=torch.long)
+    src_prefix_row = torch.tensor([2], dtype=torch.long)
+    captured_logits = torch.ones((2, 1, 8), dtype=torch.float32)
+    monkeypatch.setenv("TORCHINFERNO_CUDAGRAPH_PREFILL_MAX_GRAPHS", "1")
+    monkeypatch.setattr(
+        tensor_parallel_module,
+        "_should_use_ragged_prefill_logits_graph",
+        lambda *args, **kwargs: True,
+    )
+
+    def capture_graph(*args, **kwargs):  # noqa: ANN002, ANN003
+        del args, kwargs
+        return types.SimpleNamespace(
+            cache=cache,
+            max_seq_len=cache.layers[0].max_seq_len,
+            static_input_ids=torch.empty_like(input_ids),
+            static_row_indices=torch.empty_like(row_indices),
+            static_src_prefix_row=torch.empty_like(src_prefix_row),
+            context_len=8,
+            prefix_copy_len=None,
+            output_logits=captured_logits,
+        )
+
+    monkeypatch.setattr(model, "_capture_ragged_prefill_logits_graph", capture_graph)
+
+    logits = model.try_prefill_ragged_logits_graph(
+        input_ids,
+        cache,
+        seq_lens=seq_lens,
+        row_indices=row_indices,
+        logit_positions=logit_positions,
+        context_len=8,
+        src_prefix_row=src_prefix_row,
+        capture_on_miss=True,
+    )
+
+    assert logits is captured_logits
+    assert model._ragged_prefill_logits_graph_evictions == 1
+    assert model._ragged_prefill_logits_graph_evicted_entries == 1
+    assert model._ragged_prefill_logits_graph_max_entries == 1
+    assert len(model._ragged_prefill_logits_graphs) == 1
+
+
 def test_tensor_parallel_remote_checkpoint_resolves_on_rank_zero(tmp_path, monkeypatch) -> None:
     snapshot = tmp_path / "snapshot"
     cache_dir = tmp_path / "cache"

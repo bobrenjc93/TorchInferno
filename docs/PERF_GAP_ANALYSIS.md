@@ -7380,6 +7380,22 @@ wall to `19.9s`. Keep prefix-prefill batch buckets power-of-two by default;
 intermediate buckets need a graph-warmup/keying fix before they can be a
 runtime policy.
 
+A follow-up local warmup-alignment probe, where the configured runtime batch
+buckets also drove greedy common-prefix suffix warmup, wrote
+`agent_space/ti_long_batch_buckets_warmfix_results_0703/.../8xH100-local-ti-long-batch-buckets-warmfix-20260703/runs/20260703_063050`
+and still regressed to `246.8 / 29.1 / 1856.9ms` with p99 E2E `5116.4ms`.
+It did reduce measured prefill padding (`42.2K -> 28.6K` tokens versus the
+nearby default profile), but it still took `16` request-path prefill captures
+and `16.0s` capture time. Raising `TORCHINFERNO_CUDAGRAPH_PREFILL_MAX_GRAPHS`
+to `256` for the same bucket set was not viable either: the server reached
+about `97GB` per rank during startup, only `7/8` ranks printed the FlashInfer
+decode warmup completion line, and the run was aborted before readiness. Current
+queue profiles now expose `runtime_prefill_graph_cache_live_entries`,
+`runtime_prefill_graph_cache_max_entries`,
+`runtime_prefill_graph_cache_evictions`, and
+`runtime_prefill_graph_cache_evicted_entries` so the next bucket/graph-cache
+iteration can distinguish shape-key misses from graph-cache eviction directly.
+
 Warm-row prefix-copy skipping is rejected as a default. An opt-in diagnostic
 hook (`TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SKIP_WARM_PREFIX_COPY=1`) tracks
 free active rows whose KV still starts with the same shared prefix, then replays

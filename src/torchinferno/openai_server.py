@@ -5721,6 +5721,27 @@ class OpenAICompletionEngine:
                 record["runtime_cache_max_seq_len"] = cache_max_seq_len
             if cache_rows is not None:
                 record["runtime_cache_rows"] = cache_rows
+        model = getattr(runtime_engine, "model", None)
+        ragged_prefill_graphs = getattr(model, "_ragged_prefill_logits_graphs", None)
+        if isinstance(ragged_prefill_graphs, Mapping):
+            record["runtime_prefill_graph_cache_live_entries"] = len(ragged_prefill_graphs)
+        for attr_name, record_name in (
+            (
+                "_ragged_prefill_logits_graph_evictions",
+                "runtime_prefill_graph_cache_evictions",
+            ),
+            (
+                "_ragged_prefill_logits_graph_evicted_entries",
+                "runtime_prefill_graph_cache_evicted_entries",
+            ),
+            (
+                "_ragged_prefill_logits_graph_max_entries",
+                "runtime_prefill_graph_cache_max_entries",
+            ),
+        ):
+            value = getattr(model, attr_name, None)
+            if isinstance(value, int):
+                record[record_name] = value
 
         def _positive_shape_token_deltas(
             model_tokens_name: str,
