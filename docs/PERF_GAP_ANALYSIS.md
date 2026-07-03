@@ -129,6 +129,15 @@ run
 landed at `135.2 / 28.4 / 159.0ms`, `964/992` correct, again with zero
 request-path prefill captures and `1.25s` in the hot b32 prefix-graph forward.
 
+The next obvious lever, graph-captured symmetric-memory all-reduce for the same
+prefill shape, was tested as a local opt-in prototype and rejected. The
+`TORCHINFERNO_SYMM_MEM_PREFILL_GRAPH_ALLREDUCE=1` A/B with sampled symmetric
+scope enabled in
+`agent_space/ti_tree_symm_prefill_graph_results/.../runs/20260703_021900`
+landed at `136.3 / 42.3 / 167.7ms`, `956/992` correct. The hot b32
+prefix-graph forward regressed to `1.32s` and p99 worsened, so the remaining
+sampled tree gap should not be chased by promoting that path.
+
 An opt-in suffix-bucket split is available as
 `TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SPLIT_SUFFIX_BUCKETS=1`, but it is
 rejected as a default for tree. The focused A/B
