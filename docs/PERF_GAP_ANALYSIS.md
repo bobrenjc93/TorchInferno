@@ -213,6 +213,19 @@ evictions. Keep greedy-short `b24` opt-in until the cache can hold those shapes
 without evicting useful warmed graphs or a narrower non-benchmark-specific
 policy proves safe across the full suite.
 
+A decode-many preparation fast path is rejected and was backed out. The local
+patch skipped pad-row set construction when no padding was needed, used direct
+token-buffer views for contiguous prefix rows, and advanced contiguous seq-lens
+with an in-place slice add. The focused rebuilt long_output run
+`agent_space/ti_long_prepfast_results_0703/.../runs/20260703_093411` stayed
+correct (`1000/1000`) but landed at only `248.5 / 24.6 / 1152.0ms`. Its queue
+profile moved in the wrong direction versus the accepted full-suite default
+band: decode prepare rose from `420ms` to `443ms`, decode GPU from `10.23s` to
+`10.55s`, prefill wall from `5.63s` to `5.73s`, and E2E remained worse than the
+`1113.0ms` accepted run. Keep the existing index-select/index-add decode-many
+preparation path until a broader decode pipeline or kernel change reduces actual
+GPU work instead of reshaping small setup operations.
+
 Sampled-medium `s12` suffix buckets are also rejected as a default, even after
 the sampled `b24` batch bucket made the idea more plausible. The new
 row/suffix padding counters in
