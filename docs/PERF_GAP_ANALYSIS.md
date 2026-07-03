@@ -322,6 +322,22 @@ to `11.51s`, and worsened p99 TPOT to `104.9ms`. Keep
 diagnostic; the long-output gap remains lower steady decode GPU without extra
 graph buckets, or a real prefill/decode/readback pipeline.
 
+A focused current-head long_output baseline on pushed `862b1de`
+(`agent_space/ti_long_default_862b1de_results_0703/.../runs/20260703_123832`)
+landed at `262.2 / 24.2 / 1142.1ms`, p99 E2E `2134.0ms`, and `1000/1000`
+correct. The final queue profile is the same steady-state blocker as the recent
+public and local runs: common-prefix reuse hit `{"111":1000}`, prefill graph
+hits/misses were `61/0`, prefill forward/wall were `5.08s/5.61s`, and prefill
+padding was still `41.6K` tokens split about evenly between row and suffix
+padding. Decode remained the larger floor at `747` decode model calls,
+`10.23s` ragged-decode GPU, `104` decode-many calls over `490` steps, and
+`26.9K` decode-many model tokens. The dominant `decode_many:b64/64` shape still
+did useful work (`14.1K` model tokens with `466` skipped stop-tail tokens), so
+the existing q8 drain policy remains the right default. The next long_output
+change should reduce or overlap the `5s` prefill plus `10s` decode pipeline; do
+not reopen global drain-quantum, waiting decode-many, cache-token bucket, or
+intermediate prefill-bucket defaults from this profile alone.
+
 Decode-many padding is now separated from stop-tail overgeneration in queue
 profiles. The focused current-head long_output run
 `agent_space/ti_long_decodemany_padding_profile_results_0703/.../runs/20260703_102544`
