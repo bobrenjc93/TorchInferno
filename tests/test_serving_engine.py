@@ -2097,6 +2097,35 @@ def test_continuous_batch_engine_respects_admit_per_step_cap() -> None:
     assert by_id["third"].started_step == 2
 
 
+def test_continuous_batch_engine_can_disable_prefix_hit_admission_priority(
+    monkeypatch,
+) -> None:
+    engine = ContinuousBatchEngine(
+        _RaggedGraphToyModel(),
+        device=torch.device("cpu"),
+        max_active_requests=2,
+    )
+    prefix_prompt = (1, 2, 3)
+    plain_prompt = (9,)
+    engine._reusable_prefix_hit_tokens = (  # type: ignore[method-assign]
+        lambda prompt: len(prefix_prompt) if prompt == prefix_prompt else 0
+    )
+
+    class Item:
+        def __init__(self, request: ServingRequest, sequence: int) -> None:
+            self.request = request
+            self.sequence = sequence
+
+    plain = Item(ServingRequest("plain", plain_prompt, 1, arrival_step=0), 0)
+    prefixed = Item(ServingRequest("prefixed", prefix_prompt, 1, arrival_step=1), 1)
+
+    assert engine._admission_priority(prefixed) < engine._admission_priority(plain)
+
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_ADMIT_PREFIX_HIT_PRIORITY", "0")
+
+    assert engine._admission_priority(plain) < engine._admission_priority(prefixed)
+
+
 def test_continuous_batch_engine_batches_prefix_hit_suffix_prefill() -> None:
     model = _RaggedGraphToyModel()
     engine = ContinuousBatchEngine(

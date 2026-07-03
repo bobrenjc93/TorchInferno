@@ -38,6 +38,20 @@ is policy-limited conversation-prefix reuse rather than an exact lookup miss or
 generated-prefix cache miss; the previously rejected pinned full-prompt and
 mixed-prefix opt-ins still need cheaper batched replay before promotion.
 
+Disabling prefix-depth admission priority is also rejected for the mixed-prefix
+opt-in path. The diagnostic flag
+`TORCHINFERNO_CONTINUOUS_ADMIT_PREFIX_HIT_PRIORITY=0` keeps admission in
+arrival order instead of preferring deeper prefix hits. With the existing
+greedy-large mixed-prefix policy and `112` prefix rows, run
+`agent_space/ti_multi_no_prefix_priority_results_0703/.../runs/20260703_114531`
+landed at `246.7 / 72.1 / 313.6ms`, `982/1000` correct. The profile adopted
+all `1000` full-prompt rows and reused request prompts for `875` requests, but
+prefill batches rose to `39`, decode model calls stayed high at `98`, decode
+GPU time rose to `892ms`, and p99 TPOT regressed to `280.9ms`. This keeps the
+admission switch as an opt-in diagnostic only; the multi_turn promotion blocker
+is still mixed-prefix replay/active-set fragmentation, not simply prefix-hit
+priority.
+
 A current-head default TorchInferno-only refresh on `75fee00`
 (`agent_space/ti_default_head_results_0703/.../runs/20260703_055113`) landed
 at few_shot `167.0 / 46.9 / 206.0ms`, self_consistency

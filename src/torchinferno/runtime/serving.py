@@ -1536,16 +1536,20 @@ class ContinuousBatchEngine:
 
     def _admission_priority(self, item: _QueuedRequest) -> tuple[object, ...]:
         prefix_hit_tokens = self._reusable_prefix_hit_tokens(item.request.prompt)
+        prefix_priority = -prefix_hit_tokens if self._admit_prefix_hit_priority_enabled() else 0
         if self._admit_prefill_cost_priority_enabled():
             prefill_cost = max(1, len(item.request.prompt) - prefix_hit_tokens)
             return (
-                -prefix_hit_tokens,
+                prefix_priority,
                 prefill_cost,
                 item.request.max_new_tokens,
                 item.request.arrival_step,
                 item.sequence,
             )
-        return (-prefix_hit_tokens, item.request.arrival_step, item.sequence)
+        return (prefix_priority, item.request.arrival_step, item.sequence)
+
+    def _admit_prefix_hit_priority_enabled(self) -> bool:
+        return env_flag("TORCHINFERNO_CONTINUOUS_ADMIT_PREFIX_HIT_PRIORITY", True)
 
     def _admit_prefill_cost_priority_enabled(self) -> bool:
         if "TORCHINFERNO_CONTINUOUS_ADMIT_PREFILL_COST_PRIORITY" in os.environ:
