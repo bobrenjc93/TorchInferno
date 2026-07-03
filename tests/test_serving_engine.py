@@ -973,6 +973,21 @@ def test_paged_online_engine_batches_shared_suffix_prefill(monkeypatch) -> None:
     assert model.prefill_calls[0]["request_ids"] == ["p0", "p1"]
     assert model.prefill_calls[0]["start_position"] == 2
     assert plans[0]["qo_indptr"] == [0, 2, 4]
+    assert engine.stats.queued_requests == 2
+    assert engine.stats.scheduler_steps == 1
+    assert engine.stats.prefill_admitted_requests == 2
+    assert engine.stats.prefix_reuse_requests == 2
+    assert engine.stats.prefix_reuse_tokens == 4
+    assert engine.stats.prefill_model_calls == 1
+    assert engine.stats.prefill_batches == 1
+    assert engine.stats.prefill_tokens == 4
+    assert engine.stats.prefill_prefix_reuse_batches == 1
+    assert engine.stats.prefill_plain_batches == 0
+    assert engine.stats.prefill_shape_counts == {"paged_prefix:b2:s2:p2-2": 1}
+    assert engine.stats.prefill_shape_active_tokens == {"paged_prefix:b2:s2:p2-2": 4}
+    assert engine.stats.prefix_reuse_route_counts == {"paged_prefix": 2}
+    assert engine.stats.prefix_reuse_hit_token_counts == {"2": 2}
+    assert engine.stats.prefill_wall_ms >= 0.0
 
 
 def test_continuous_batch_engine_pins_shared_prefix_across_batches() -> None:

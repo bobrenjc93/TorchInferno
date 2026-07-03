@@ -13,14 +13,55 @@ consistent across TP ranks without extra broadcasts.
 """
 from __future__ import annotations
 
+import time
+from dataclasses import dataclass, field
 import math
 
 import torch
-from torch import Tensor
 
 from torchinferno.runtime.options import env_flag, env_int
 from torchinferno.runtime.paged import LayeredPagedKVCache, PagedSequence
 from torchinferno.runtime.prefix import PrefixAwareRouter
+
+
+@dataclass
+class PagedEngineStats:
+    prefill_model_calls: int = 0
+    prefill_batches: int = 0
+    prefill_tokens: int = 0
+    prefill_admitted_requests: int = 0
+    prefill_plain_batches: int = 0
+    prefill_prefix_reuse_batches: int = 0
+    prefill_wall_ms: float = 0.0
+    prefill_forward_ms: float = 0.0
+    decode_model_calls: int = 0
+    decode_batches: int = 0
+    decode_tokens: int = 0
+    decode_active_tokens: int = 0
+    prefix_reuse_requests: int = 0
+    prefix_reuse_tokens: int = 0
+    queued_requests: int = 0
+    scheduler_steps: int = 0
+    max_model_batch_size: int = 0
+    prefill_shape_counts: dict[str, int] = field(default_factory=dict)
+    prefill_shape_wall_ms: dict[str, float] = field(default_factory=dict)
+    prefill_shape_forward_ms: dict[str, float] = field(default_factory=dict)
+    prefill_shape_active_requests: dict[str, int] = field(default_factory=dict)
+    prefill_shape_model_rows: dict[str, int] = field(default_factory=dict)
+    prefill_shape_active_tokens: dict[str, int] = field(default_factory=dict)
+    prefill_shape_model_tokens: dict[str, int] = field(default_factory=dict)
+    decode_shape_counts: dict[str, int] = field(default_factory=dict)
+    decode_shape_model_ms: dict[str, float] = field(default_factory=dict)
+    prefix_reuse_route_counts: dict[str, int] = field(default_factory=dict)
+    prefix_reuse_hit_token_counts: dict[str, int] = field(default_factory=dict)
+
+
+def _add_count(mapping: dict[str, int], key: str, value: int = 1) -> None:
+    mapping[key] = int(mapping.get(key, 0)) + int(value)
+
+
+def _add_time(mapping: dict[str, float], key: str, value: float) -> None:
+    mapping[key] = float(mapping.get(key, 0.0)) + float(value)
 
 
 class PagedPrefixCache:
@@ -653,6 +694,7 @@ class PagedEngine:
         self._prefill_runners: dict[tuple, PagedPrefillGraphRunner] = {}
         self._prefill_runner_cap = env_int("TORCHINFERNO_PAGED_PREFILL_GRAPH_MAX", 16, minimum=1)
         self._prefill_graph_max_t = env_int("TORCHINFERNO_PAGED_PREFILL_GRAPH_MAX_T", 4096, minimum=1)
+        self.stats = PagedEngineStats(max_model_batch_size=max_active)
         # Zero-copy COW prefix cache (default-off until end-to-end validated): a new
         # request shares the longest cached page-aligned prefix and prefills only its
         # suffix (the multi_turn TTFT lever -- reuse prior turns' KV). Gated +
@@ -796,11 +838,48 @@ class PagedEngine:
         if eos_token_id is not None and int(eos_token_id) >= 0:
             stop_ids.add(int(eos_token_id))
         self._pending.append((request_id, list(prompt), max_new_tokens, eos_token_id, tuple(sorted(stop_ids))))
+        self.stats.queued_requests += 1
 
     def _allocate_request_id(self) -> str:
         rid = f"p{self._next_rid}"
         self._next_rid += 1
         return rid
+
+    def _record_prefill_stats(
+        self,
+        shape_key: str,
+        *,
+        batch: int,
+        tokens_per_request: int,
+        elapsed_ms: float,
+        prefix_reuse: bool,
+    ) -> None:
+        model_tokens = int(batch) * int(tokens_per_request)
+        self.stats.prefill_model_calls += 1
+        self.stats.prefill_batches += 1
+        self.stats.prefill_tokens += model_tokens
+        self.stats.prefill_wall_ms += elapsed_ms
+        self.stats.prefill_forward_ms += elapsed_ms
+        if prefix_reuse:
+            self.stats.prefill_prefix_reuse_batches += 1
+        else:
+            self.stats.prefill_plain_batches += 1
+        _add_count(self.stats.prefill_shape_counts, shape_key)
+        _add_time(self.stats.prefill_shape_wall_ms, shape_key, elapsed_ms)
+        _add_time(self.stats.prefill_shape_forward_ms, shape_key, elapsed_ms)
+        _add_count(self.stats.prefill_shape_active_requests, shape_key, batch)
+        _add_count(self.stats.prefill_shape_model_rows, shape_key, batch)
+        _add_count(self.stats.prefill_shape_active_tokens, shape_key, model_tokens)
+        _add_count(self.stats.prefill_shape_model_tokens, shape_key, model_tokens)
+
+    def _record_decode_stats(self, *, batch: int, elapsed_ms: float) -> None:
+        shape_key = f"paged_decode:b{int(batch)}"
+        self.stats.decode_model_calls += 1
+        self.stats.decode_batches += 1
+        self.stats.decode_tokens += int(batch)
+        self.stats.decode_active_tokens += int(batch)
+        _add_count(self.stats.decode_shape_counts, shape_key)
+        _add_time(self.stats.decode_shape_model_ms, shape_key, elapsed_ms)
 
     def has_work(self) -> bool:
         return bool(self._pending or self._active)
@@ -849,6 +928,7 @@ class PagedEngine:
 
         events: list[tuple] = []
         with torch.inference_mode():
+            self.stats.scheduler_steps += 1
             # admit new arrivals (reserve pages), then BATCHED prefill grouped by
             # prompt length (forward_prefill_paged is uniform-length, so one call per
             # length-group instead of one per request -- avoids serializing a herd,
@@ -872,6 +952,15 @@ class PagedEngine:
                 self.cache._sequences[rid].length = len(prompt)
                 admitted.append({"ext": ext_id, "rid": rid, "prompt": prompt,
                                  "max_new": max_new, "eos": eos, "stop": stop_ids, "shared": shared})
+            if admitted:
+                self.stats.prefill_admitted_requests += len(admitted)
+                for a in admitted:
+                    shared = int(a["shared"])
+                    if shared > 0:
+                        self.stats.prefix_reuse_requests += 1
+                        self.stats.prefix_reuse_tokens += shared
+                        _add_count(self.stats.prefix_reuse_route_counts, "paged_prefix")
+                        _add_count(self.stats.prefix_reuse_hit_token_counts, str(shared))
 
             def _retire_or_activate(a, tok):
                 fin = 1 >= a["max_new"] or tok in a["stop"]
@@ -898,7 +987,20 @@ class PagedEngine:
                     rids = [a["rid"] for a in grp]
                     prompts = [a["prompt"] for a in grp]
                     starts = [int(a["shared"]) for a in grp]
+                    start_s = time.perf_counter()
                     logits = self._prefill_suffix_batch(rids, prompts, starts)
+                    elapsed_ms = (time.perf_counter() - start_s) * 1000.0
+                    shape_key = (
+                        f"paged_prefix:b{len(rids)}:s{_suffix_len}:"
+                        f"p{min(starts)}-{max(starts)}"
+                    )
+                    self._record_prefill_stats(
+                        shape_key,
+                        batch=len(rids),
+                        tokens_per_request=_suffix_len,
+                        elapsed_ms=elapsed_ms,
+                        prefix_reuse=True,
+                    )
                     toks = _greedy_tokens(self.model, logits[:, -1, :])
                     for i, a in enumerate(grp):
                         _retire_or_activate(a, int(toks[i]))
@@ -909,7 +1011,16 @@ class PagedEngine:
                 for _T, grp in groups.items():
                     rids = [a["rid"] for a in grp]
                     prompts = [a["prompt"] for a in grp]
+                    start_s = time.perf_counter()
                     logits = self._prefill_batch(rids, prompts)  # [B, T, vocab]
+                    elapsed_ms = (time.perf_counter() - start_s) * 1000.0
+                    self._record_prefill_stats(
+                        f"paged_prefill:b{len(rids)}:t{_T}",
+                        batch=len(rids),
+                        tokens_per_request=_T,
+                        elapsed_ms=elapsed_ms,
+                        prefix_reuse=False,
+                    )
                     toks = _greedy_tokens(self.model, logits[:, -1, :])  # [B]
                     for i, a in enumerate(grp):
                         _retire_or_activate(a, int(toks[i]))
@@ -926,11 +1037,17 @@ class PagedEngine:
             rids_active = [a["rid"] for a in self._active]
             if self.runner is not None:
                 self._ensure_decode_runner_capacity(rids_active)
+                start_s = time.perf_counter()
                 logits = self.runner.step(tokens, positions, rids_active)
             else:
                 dw = _plan_decode(flashinfer, self.cache, rids_active, self.nqo, self.nkv, self.hd, self.page_size)
+                start_s = time.perf_counter()
                 logits = self.model.forward_decode_paged(
                     tokens, self.cache, request_ids=rids_active, positions=positions, decode_wrapper=dw)
+            self._record_decode_stats(
+                batch=len(rids_active),
+                elapsed_ms=(time.perf_counter() - start_s) * 1000.0,
+            )
             nxt = _greedy_tokens(self.model, logits[:, -1, :])
             still = []
             for i, a in enumerate(self._active):
