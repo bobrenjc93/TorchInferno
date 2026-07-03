@@ -198,6 +198,27 @@ evictions. Keep greedy-short `b24` opt-in until the cache can hold those shapes
 without evicting useful warmed graphs or a narrower non-benchmark-specific
 policy proves safe across the full suite.
 
+Sampled-medium `s12` suffix buckets are also rejected as a default, even after
+the sampled `b24` batch bucket made the idea more plausible. The new
+row/suffix padding counters in
+`agent_space/ti_padding_breakdown_results_0703/.../runs/20260703_085009` showed
+tree_of_thought still spending `8.0K` padding tokens, mostly suffix padding
+(`2.5K` row / `5.5K` suffix), while long_output remained split between row and
+suffix padding (`23.5K` / `22.2K`). An env probe with sampled suffix buckets
+`12,16` plus matching sampled warmup,
+`agent_space/ti_tree_s12_b24_results_0703/.../runs/20260703_085639`, cut tree
+padding to `3.5K` tokens (`2.0K` row / `1.5K` suffix) and improved focused
+medians to `120.5 / 38.4 / 149.2ms`. But the no-env patch validation
+`agent_space/ti_tree_s12_b24_default_results_0703/.../runs/20260703_090314`
+regressed tree TPOT to `51.0ms`, and the full-suite validation
+`agent_space/ti_full_s12_b24_default_results_0703/.../runs/20260703_090939`
+regressed self_consistency to `179.8 / 0.0 / 287.1ms`, tree to
+`130.5 / 52.2 / 160.6ms` with correctness `0.958`, and long_output to
+`254.6 / 25.7 / 1139.1ms`. The full profile sat at `128` live ragged prefill
+graphs for every segment, leaving no graph-cache headroom. Keep sampled `s12`
+suffixes as an opt-in diagnostic; the next tree fix needs lower per-call
+prefix-suffix cost without filling the graph cache.
+
 A debug rerun on pushed commit `5089f09` wrote
 `agent_space/ti_multi_warmmixed_debug_results_0425/.../runs/20260703_041208`
 and measured `232.4 / 72.8 / 304.8ms`, `981/1000` correct. Saved response text
