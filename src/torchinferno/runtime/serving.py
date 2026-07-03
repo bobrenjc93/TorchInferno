@@ -326,6 +326,9 @@ class ServingStats:
     prefill_shape_model_rows: dict[str, int] = field(default_factory=dict)
     prefill_shape_active_tokens: dict[str, int] = field(default_factory=dict)
     prefill_shape_model_tokens: dict[str, int] = field(default_factory=dict)
+    prefill_shape_route_counts: dict[str, int] = field(default_factory=dict)
+    prefill_shape_route_active_tokens: dict[str, int] = field(default_factory=dict)
+    prefill_shape_route_reuse_tokens: dict[str, int] = field(default_factory=dict)
     decode_ragged_prepare_ms: float = 0.0
     decode_ragged_model_ms: float = 0.0
     decode_ragged_model_gpu_ms: float = 0.0
@@ -2331,6 +2334,7 @@ class ContinuousBatchEngine:
                 f"mixed{int(mixed_prefixes)}"
             )
             self._record_shape_count(self.stats.prefill_shape_counts, shape_key)
+            self._record_prefix_graph_route_totals(shape_key, group, suffix_lengths)
             shape_wall_start_s = copy_start_s
             if self.profile_timings:
                 copy_elapsed_ms = (time.perf_counter() - copy_start_s) * 1000.0
@@ -5411,6 +5415,32 @@ class ContinuousBatchEngine:
             self.stats.prefix_reuse_hit_token_counts,
             str(int(prefix_hit_tokens)),
         )
+
+    def _record_prefix_graph_route_totals(
+        self,
+        shape_key: str,
+        group: Sequence[tuple[int, ServingRequest, int, _ReusablePrefix]],
+        suffix_lengths: Sequence[int],
+    ) -> None:
+        if not self.profile_timings:
+            return
+        for (_index, _request, prefix_hit_tokens, reusable), suffix_len in zip(
+            group,
+            suffix_lengths,
+        ):
+            route_kind = self._prefix_reuse_route_kind(reusable.route_id)
+            route_key = f"{shape_key}|route={route_kind}"
+            self._record_shape_total(self.stats.prefill_shape_route_counts, route_key, 1)
+            self._record_shape_total(
+                self.stats.prefill_shape_route_active_tokens,
+                route_key,
+                max(0, int(suffix_len)),
+            )
+            self._record_shape_total(
+                self.stats.prefill_shape_route_reuse_tokens,
+                route_key,
+                max(0, int(prefix_hit_tokens)),
+            )
 
     @staticmethod
     def _prefix_reuse_route_kind(route_id: Hashable | None) -> str:

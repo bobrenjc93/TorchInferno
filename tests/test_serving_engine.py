@@ -2403,6 +2403,10 @@ def test_continuous_batch_engine_records_profile_shape_counts() -> None:
     assert engine.stats.prefill_shape_model_rows[prefix_shape] == 4
     assert engine.stats.prefill_shape_active_tokens[prefix_shape] == 6
     assert engine.stats.prefill_shape_model_tokens[prefix_shape] == 16
+    route_shape = f"{prefix_shape}|route=common_prefix"
+    assert engine.stats.prefill_shape_route_counts[route_shape] == 3
+    assert engine.stats.prefill_shape_route_active_tokens[route_shape] == 6
+    assert engine.stats.prefill_shape_route_reuse_tokens[route_shape] == 48
     assert any(key.startswith("ragged:b3/") for key in engine.stats.decode_shape_counts)
 
 

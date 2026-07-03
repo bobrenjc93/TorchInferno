@@ -13536,6 +13536,18 @@ def test_openai_queue_profile_records_runtime_engine_stats(
         prefill_shape_model_tokens = {
             "prefix_graph:b8:s16:p45-45:src1:mixed0": 48,
         }
+        prefill_shape_route_counts = {
+            "prefix_graph:b8:s16:p45-45:src1:mixed0|route=common_prefix": 2,
+            "prefix_graph:b8:s16:p45-45:src1:mixed0|route=request_prompt": 1,
+        }
+        prefill_shape_route_active_tokens = {
+            "prefix_graph:b8:s16:p45-45:src1:mixed0|route=common_prefix": 20,
+            "prefix_graph:b8:s16:p45-45:src1:mixed0|route=request_prompt": 11,
+        }
+        prefill_shape_route_reuse_tokens = {
+            "prefix_graph:b8:s16:p45-45:src1:mixed0|route=common_prefix": 90,
+            "prefix_graph:b8:s16:p45-45:src1:mixed0|route=request_prompt": 57,
+        }
         prefill_graph_capture_shape_counts = {
             "ragged_prefill:b8:s16:rows1:ctx-256:src1": 1,
         }
@@ -13668,6 +13680,18 @@ def test_openai_queue_profile_records_runtime_engine_stats(
             },
             "runtime_prefill_shape_model_tokens": {
                 "prefix_graph:b8:s16:p45-45:src1:mixed0": 48,
+            },
+            "runtime_prefill_shape_route_counts": {
+                "prefix_graph:b8:s16:p45-45:src1:mixed0|route=common_prefix": 2,
+                "prefix_graph:b8:s16:p45-45:src1:mixed0|route=request_prompt": 1,
+            },
+            "runtime_prefill_shape_route_active_tokens": {
+                "prefix_graph:b8:s16:p45-45:src1:mixed0|route=common_prefix": 20,
+                "prefix_graph:b8:s16:p45-45:src1:mixed0|route=request_prompt": 11,
+            },
+            "runtime_prefill_shape_route_reuse_tokens": {
+                "prefix_graph:b8:s16:p45-45:src1:mixed0|route=common_prefix": 90,
+                "prefix_graph:b8:s16:p45-45:src1:mixed0|route=request_prompt": 57,
             },
             "runtime_prefill_padding_tokens": 17,
             "runtime_prefill_shape_padding_tokens": {

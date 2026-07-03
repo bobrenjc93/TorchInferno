@@ -222,6 +222,24 @@ reproduce the `b4` tail shape, so keep treating this as opt-in graph coverage
 for an observed miss rather than evidence to promote greedy-large mixed-prefix
 reuse by default.
 
+The queue profile now also records prefix-graph route composition as
+`runtime_prefill_shape_route_counts`,
+`runtime_prefill_shape_route_active_tokens`, and
+`runtime_prefill_shape_route_reuse_tokens`. A focused mixed-prefix opt-in run on
+the instrumented tree
+(`agent_space/ti_multi_route_comp_results_0703/.../runs/20260703_115712`)
+landed at `250.3 / 69.3 / 318.6ms`, `981/1000` correct. It reused
+`{"common_prefix":126,"request_prompt":874}`, issued `39` prefill batches,
+reported `37/2` prefill graph hits/misses with no request captures, spent
+`2.83s` in prefill forward, and still needed `108` decode calls / `145`
+scheduler steps. The new route-shape counters show that the expensive
+`b32:s32:mixed1` waves are mostly pure `request_prompt` rows; only a few
+`p45-*` waves mix common-prefix rows into the same graph. So the remaining TPOT
+cost is not mainly common-prefix contamination inside mixed groups. The next
+multi_turn attempt should reduce request-prompt prefill/decode interleaving or
+make those request-prompt replays cheaper; splitting mixed groups by route is
+unlikely to move enough work by itself.
+
 Bucketed ragged-decode cache-token loop bounds are rejected as a default for
 long_output. The first env probe only changed the paged graph metadata path and
 therefore did not affect the dense long-output path:
