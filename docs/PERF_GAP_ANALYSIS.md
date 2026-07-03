@@ -142,6 +142,28 @@ wall time down to `2.57s` from `7.20s` in the fallback-only run. This is now the
 best local multi_turn E2E result, but the knobs remain opt-in until the full
 benchmark suite validates correctness and cross-workload latency.
 
+Follow-up default-scope attempts on `8aed5df` were rejected. Enabling the
+mixed/full-prompt reuse bundle automatically for greedy `max_tokens=512` without
+also constraining long mixed suffixes wrote
+`agent_space/ti_multi_scoped_mixed_default_results_0703/.../runs/20260703_072817`
+and regressed multi_turn to `585.1 / 69.5 / 644.0ms`; the queue profile routed
+`s64..s144` mixed-prefix batches, raising prefill model tokens to `53.0K` and
+prefill forward to `9.71s`. Splitting mixed-prefix batches so only suffixes at
+or below the dynamic mixed-context limit (`s32` by default) fixed the structural
+bug (`19.3K` prefill tokens, no long `mixed1` shapes) but still measured
+`324.0 / 81.9 / 396.0ms` in
+`agent_space/ti_multi_scoped_mixed_split_results_0703/.../runs/20260703_073644`
+because three request-path common-prefix graph captures cost `2.09s`.
+Disabling request-path captures for that scoped policy improved p99 but not the
+median (`326.5 / 83.5 / 405.2ms` in
+`agent_space/ti_multi_scoped_mixed_nocapture_results_0703/.../runs/20260703_074343`).
+Repeating with `112` prefix rows, matching the earlier opt-in run, still landed
+at `309.8 / 84.7 / 415.2ms` in
+`agent_space/ti_multi_scoped_mixed_nocapture_p112_results_0703/.../runs/20260703_075004`.
+Keep the automatic greedy-large mixed-prefix policy off by default; the suffix
+split and capture guard remain useful for explicit opt-in probes, but they do
+not close the default multi_turn gap.
+
 A debug rerun on pushed commit `5089f09` wrote
 `agent_space/ti_multi_warmmixed_debug_results_0425/.../runs/20260703_041208`
 and measured `232.4 / 72.8 / 304.8ms`, `981/1000` correct. Saved response text

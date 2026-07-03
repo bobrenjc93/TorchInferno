@@ -12,6 +12,7 @@ from torchinferno.runtime.serving import (
     ServingRequest,
     _dynamic_prefix_prefill_context_len,
     _dynamic_prefix_prefill_max_suffix_for_policy,
+    _greedy_large_mixed_prefix_reuse_policy_enabled,
 )
 
 
@@ -70,6 +71,66 @@ def test_dynamic_prefix_prefill_policy_extends_short_greedy_suffixes(monkeypatch
     assert _dynamic_prefix_prefill_max_suffix_for_policy(0.7, 82) is None
     assert _dynamic_prefix_prefill_context_len(111, 64, max_seq_len=512) == -256
     assert _dynamic_prefix_prefill_context_len(111, 128, max_seq_len=512) == 239
+
+
+def test_greedy_large_mixed_prefix_reuse_policy_is_explicit_opt_in(monkeypatch) -> None:
+    for env_name in (
+        "TORCHINFERNO_CONTINUOUS_GREEDY_LARGE_MIXED_PREFIX_REUSE",
+        "TORCHINFERNO_CONTINUOUS_GREEDY_LARGE_MIXED_PREFIX_REUSE_MAX_TOKENS",
+        "TORCHINFERNO_CONTINUOUS_PINNED_FULL_PROMPT_STORE_MIN_MAX_TOKENS",
+        "TORCHINFERNO_CONTINUOUS_MIXED_PREFIX_PREFILL",
+        "TORCHINFERNO_CONTINUOUS_MIXED_PREFIX_DYNAMIC_CONTEXT",
+        "TORCHINFERNO_CONTINUOUS_MIXED_PREFIX_LONG_SUFFIX_COMMON_FALLBACK",
+        "TORCHINFERNO_CONTINUOUS_NON_COMMON_PREFIX_GRAPH_PREFILL",
+        "TORCHINFERNO_CONTINUOUS_MIXED_PREFIX_PREFILL_GRAPH",
+    ):
+        monkeypatch.delenv(env_name, raising=False)
+
+    assert not _greedy_large_mixed_prefix_reuse_policy_enabled(0.0, 512)
+    assert not _greedy_large_mixed_prefix_reuse_policy_enabled(0.0, 256)
+    assert not _greedy_large_mixed_prefix_reuse_policy_enabled(0.7, 512)
+    assert not _greedy_large_mixed_prefix_reuse_policy_enabled(0.0, None)
+
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_GREEDY_LARGE_MIXED_PREFIX_REUSE", "1")
+    assert _greedy_large_mixed_prefix_reuse_policy_enabled(0.0, 512)
+    assert not _greedy_large_mixed_prefix_reuse_policy_enabled(0.0, 256)
+    assert not _greedy_large_mixed_prefix_reuse_policy_enabled(0.7, 512)
+
+    engine = ContinuousBatchEngine(
+        _RaggedGraphToyModel(),
+        device=torch.device("cpu"),
+        temperature=0.0,
+        max_generation_tokens=512,
+        max_active_requests=2,
+        prefix_cache_capacity=2,
+        pin_shared_prefix=True,
+    )
+
+    assert engine._mixed_prefix_prefill_enabled()
+    assert engine._mixed_prefix_dynamic_context_enabled()
+    assert engine._mixed_prefix_long_suffix_common_fallback_enabled()
+    assert engine._non_common_prefix_graph_prefill_enabled()
+    assert engine._mixed_prefix_prefill_graph_enabled()
+    assert engine._allow_pinned_full_prompt_store(ServingRequest("large", (1,), 512))
+    assert not engine._allow_pinned_full_prompt_store(ServingRequest("short", (1,), 256))
+    assert not engine._prefix_prefill_capture_on_miss(32)
+
+    sampled = ContinuousBatchEngine(
+        _RaggedGraphToyModel(),
+        device=torch.device("cpu"),
+        temperature=0.7,
+        max_generation_tokens=512,
+        max_active_requests=2,
+        prefix_cache_capacity=2,
+    )
+    assert not sampled._mixed_prefix_prefill_enabled()
+
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_MIXED_PREFIX_PREFILL", "0")
+    assert not engine._mixed_prefix_prefill_enabled()
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_GREEDY_LARGE_MIXED_PREFIX_REUSE", "0")
+    assert not _greedy_large_mixed_prefix_reuse_policy_enabled(0.0, 512)
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_CAPTURE_ON_MISS", "1")
+    assert engine._prefix_prefill_capture_on_miss(32)
 
 
 def test_continuous_prefix_prefill_suffix_buckets_can_be_configured(monkeypatch) -> None:
@@ -1586,6 +1647,61 @@ def test_continuous_batch_engine_can_bucket_mixed_prefix_context(monkeypatch) ->
     assert any(context_len is not None and context_len < 0 for context_len in model.prefill_context_lens)
     assert all(value is None for value in model.prefill_prefix_copy_lens)
     assert any(rows is not None and len(rows) >= 3 for rows in model.prefill_src_prefix_rows)
+
+
+def test_continuous_batch_engine_splits_overlong_mixed_prefix_suffixes(monkeypatch) -> None:
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PINNED_FULL_PROMPT_STORE_MIN_MAX_TOKENS", "2")
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_MIXED_PREFIX_PREFILL", "1")
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_MIXED_PREFIX_DYNAMIC_CONTEXT", "1")
+    monkeypatch.setenv(
+        "TORCHINFERNO_CONTINUOUS_MIXED_PREFIX_LONG_SUFFIX_COMMON_FALLBACK",
+        "1",
+    )
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_NON_COMMON_PREFIX_GRAPH_PREFILL", "1")
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_MIXED_PREFIX_PREFILL_GRAPH", "1")
+    shared = tuple(range(1, 17))
+    model = _SelectedLogitsToyModel(vocab_size=256)
+    engine = ContinuousBatchEngine(
+        model,
+        device=torch.device("cpu"),
+        max_active_requests=4,
+        prefix_cache_capacity=6,
+        pin_shared_prefix=True,
+        graph_prefill=True,
+        profile_timings=True,
+    )
+
+    short_tail = tuple(range(31, 49))
+    long_tail = tuple(range(80, 145))
+    results = engine.run(
+        [
+            ServingRequest("turn0-a", (*shared, 21), 2, arrival_step=0),
+            ServingRequest("turn0-b", (*shared, 22, 23), 2, arrival_step=0),
+            ServingRequest("turn0-c", (*shared, 24, 25, 26), 2, arrival_step=0),
+            ServingRequest("turn1-a", (*shared, 21, *short_tail), 2, arrival_step=2),
+            ServingRequest("turn1-b", (*shared, 22, 23, *short_tail), 2, arrival_step=2),
+            ServingRequest("turn1-c", (*shared, 24, 25, 26, *short_tail), 2, arrival_step=2),
+            ServingRequest("turn1-long", (*shared, 99, *long_tail), 2, arrival_step=2),
+        ]
+    )
+    by_id = {result.request_id: result for result in results}
+
+    assert by_id["turn1-a"].prefix_hit_tokens == len(shared) + 1
+    assert by_id["turn1-b"].prefix_hit_tokens == len(shared) + 2
+    assert by_id["turn1-c"].prefix_hit_tokens == len(shared) + 3
+    assert by_id["turn1-long"].prefix_hit_tokens == len(shared)
+    assert any(
+        shape.startswith("prefix_graph:b4:s32:") and shape.endswith("mixed1")
+        for shape in engine.stats.prefill_shape_counts
+    )
+    assert any(
+        shape.startswith("prefix_graph:b1:s128:") and shape.endswith("mixed0")
+        for shape in engine.stats.prefill_shape_counts
+    )
+    assert not any(
+        shape.endswith("mixed1") and (":s64:" in shape or ":s128:" in shape)
+        for shape in engine.stats.prefill_shape_counts
+    )
 
 
 def test_continuous_batch_engine_can_demote_long_mixed_prefix_suffix_to_common_prefix(

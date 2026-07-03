@@ -165,6 +165,23 @@ def _dynamic_prefix_prefill_max_suffix_for_policy(
     )
 
 
+def _greedy_large_mixed_prefix_reuse_policy_enabled(
+    temperature: float,
+    max_tokens: int | None,
+) -> bool:
+    env_name = "TORCHINFERNO_CONTINUOUS_GREEDY_LARGE_MIXED_PREFIX_REUSE"
+    if not env_flag(env_name, False):
+        return False
+    if temperature > 0.0 or max_tokens is None:
+        return False
+    target_tokens = env_int(
+        "TORCHINFERNO_CONTINUOUS_GREEDY_LARGE_MIXED_PREFIX_REUSE_MAX_TOKENS",
+        512,
+        minimum=1,
+    )
+    return int(max_tokens) == target_tokens
+
+
 @dataclass(frozen=True)
 class ServingRequest:
     request_id: str
@@ -590,6 +607,41 @@ class ContinuousBatchEngine:
                 self.max_generation_tokens,
             ),
         )
+
+    def _greedy_large_mixed_prefix_reuse_enabled(self) -> bool:
+        return _greedy_large_mixed_prefix_reuse_policy_enabled(
+            self.temperature,
+            self.max_generation_tokens,
+        )
+
+    def _policy_or_env_flag(self, env_name: str) -> bool:
+        if env_name in os.environ:
+            return env_flag(env_name, False)
+        return self._greedy_large_mixed_prefix_reuse_enabled()
+
+    def _mixed_prefix_prefill_enabled(self) -> bool:
+        return self._policy_or_env_flag("TORCHINFERNO_CONTINUOUS_MIXED_PREFIX_PREFILL")
+
+    def _mixed_prefix_dynamic_context_enabled(self) -> bool:
+        return self._policy_or_env_flag("TORCHINFERNO_CONTINUOUS_MIXED_PREFIX_DYNAMIC_CONTEXT")
+
+    def _mixed_prefix_dynamic_context_max_suffix(self) -> int:
+        return env_int(
+            "TORCHINFERNO_CONTINUOUS_MIXED_PREFIX_DYNAMIC_CONTEXT_MAX_SUFFIX",
+            32,
+            minimum=1,
+        )
+
+    def _mixed_prefix_long_suffix_common_fallback_enabled(self) -> bool:
+        return self._policy_or_env_flag(
+            "TORCHINFERNO_CONTINUOUS_MIXED_PREFIX_LONG_SUFFIX_COMMON_FALLBACK"
+        )
+
+    def _non_common_prefix_graph_prefill_enabled(self) -> bool:
+        return self._policy_or_env_flag("TORCHINFERNO_CONTINUOUS_NON_COMMON_PREFIX_GRAPH_PREFILL")
+
+    def _mixed_prefix_prefill_graph_enabled(self) -> bool:
+        return self._policy_or_env_flag("TORCHINFERNO_CONTINUOUS_MIXED_PREFIX_PREFILL_GRAPH")
 
     @torch.inference_mode()
     def run(self, requests: list[ServingRequest]) -> list[ServingResult]:
@@ -1516,11 +1568,19 @@ class ContinuousBatchEngine:
             if reusable is not None and reusable_prefix_tokens > 0:
                 suffix_len = len(request.prompt) - reusable_prefix_tokens
                 batch_suffix_len = -1 if pad_prefix_suffixes else suffix_len
-                if (
-                    pad_prefix_suffixes
-                    and env_flag("TORCHINFERNO_CONTINUOUS_MIXED_PREFIX_PREFILL", False)
-                ):
-                    reusable_prefix_tokens = -1
+                if pad_prefix_suffixes and self._mixed_prefix_prefill_enabled():
+                    suffix_bucket = self._suffix_bucket(suffix_len)
+                    cache_max_seq = self._cache_max_seq_len()
+                    if cache_max_seq is not None:
+                        suffix_bucket = min(
+                            suffix_bucket,
+                            max(1, cache_max_seq - reusable_prefix_tokens),
+                        )
+                    if (
+                        not self._mixed_prefix_dynamic_context_enabled()
+                        or suffix_bucket <= self._mixed_prefix_dynamic_context_max_suffix()
+                    ):
+                        reusable_prefix_tokens = -1
                 prefix_batchable[(reusable_prefix_tokens, batch_suffix_len)].append(
                     (original_index, request, match.depth, reusable)
                 )
@@ -1700,12 +1760,9 @@ class ContinuousBatchEngine:
             entry is None
             or reusable is None
             or not pad_prefix_suffixes
-            or not env_flag("TORCHINFERNO_CONTINUOUS_MIXED_PREFIX_PREFILL", False)
-            or not env_flag("TORCHINFERNO_CONTINUOUS_MIXED_PREFIX_DYNAMIC_CONTEXT", False)
-            or not env_flag(
-                "TORCHINFERNO_CONTINUOUS_MIXED_PREFIX_LONG_SUFFIX_COMMON_FALLBACK",
-                False,
-            )
+            or not self._mixed_prefix_prefill_enabled()
+            or not self._mixed_prefix_dynamic_context_enabled()
+            or not self._mixed_prefix_long_suffix_common_fallback_enabled()
         ):
             return match, entry, reusable
         if self._prefix_reuse_route_kind(reusable.route_id) == "common_prefix":
@@ -1718,11 +1775,7 @@ class ContinuousBatchEngine:
         cache_max_seq = self._cache_max_seq_len()
         if cache_max_seq is not None:
             suffix_bucket = min(suffix_bucket, max(1, cache_max_seq - match.depth))
-        mixed_max_suffix = env_int(
-            "TORCHINFERNO_CONTINUOUS_MIXED_PREFIX_DYNAMIC_CONTEXT_MAX_SUFFIX",
-            32,
-            minimum=1,
-        )
+        mixed_max_suffix = self._mixed_prefix_dynamic_context_max_suffix()
         if suffix_bucket <= mixed_max_suffix:
             return match, entry, reusable
 
@@ -2032,6 +2085,8 @@ class ContinuousBatchEngine:
         env_name = "TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_CAPTURE_ON_MISS"
         if env_name in os.environ:
             return env_flag(env_name, True)
+        if self._greedy_large_mixed_prefix_reuse_enabled():
+            return False
         max_tokens = self.max_generation_tokens
         if self.temperature <= 0.0 and max_tokens is not None:
             greedy_short_max_tokens = env_int(
@@ -2112,13 +2167,13 @@ class ContinuousBatchEngine:
         # mask (which OOMs at large suffix x context). A non-uniform group (rare)
         # falls back to the eager per-suffix-length path.
         mixed_prefixes = len(set(prefix_hits)) != 1
-        if mixed_prefixes and not env_flag("TORCHINFERNO_CONTINUOUS_MIXED_PREFIX_PREFILL", False):
+        if mixed_prefixes and not self._mixed_prefix_prefill_enabled():
             return None
         suffixes = [request.prompt[prefix_hits[i]:] for i, (_idx, request, _h, _r) in enumerate(group)]
         suffix_lengths = [len(suffix) for suffix in suffixes]
         if not suffix_lengths or min(suffix_lengths) <= 0:
             return None
-        non_common_graph_prefill = env_flag("TORCHINFERNO_CONTINUOUS_NON_COMMON_PREFIX_GRAPH_PREFILL", False)
+        non_common_graph_prefill = self._non_common_prefix_graph_prefill_enabled()
         if not non_common_graph_prefill:
             for _index, _request, _prefix_hit_tokens, reusable in group:
                 route_id = reusable.route_id
@@ -2135,12 +2190,8 @@ class ContinuousBatchEngine:
             suffix_bucket = min(suffix_bucket, max(1, cache_max_seq - max(prefix_hits)))
         if mixed_prefixes:
             context_len = None
-            if env_flag("TORCHINFERNO_CONTINUOUS_MIXED_PREFIX_DYNAMIC_CONTEXT", False):
-                mixed_max_suffix = env_int(
-                    "TORCHINFERNO_CONTINUOUS_MIXED_PREFIX_DYNAMIC_CONTEXT_MAX_SUFFIX",
-                    32,
-                    minimum=1,
-                )
+            if self._mixed_prefix_dynamic_context_enabled():
+                mixed_max_suffix = self._mixed_prefix_dynamic_context_max_suffix()
                 dynamic_context_len = _dynamic_prefix_prefill_context_len(
                     max(prefix_hits),
                     suffix_bucket,
@@ -2258,7 +2309,7 @@ class ContinuousBatchEngine:
             forward_start_s = time.perf_counter() if self.profile_timings else 0.0
             logits = None
             prefix_copy_len = max(prefix_hits) if mixed_prefixes and context_len is None else None
-            if not mixed_prefixes or env_flag("TORCHINFERNO_CONTINUOUS_MIXED_PREFIX_PREFILL_GRAPH", False):
+            if not mixed_prefixes or self._mixed_prefix_prefill_graph_enabled():
                 logits = self._try_ragged_prefill_logits(
                     input_ids,
                     seq_lens,
@@ -4155,8 +4206,11 @@ class ContinuousBatchEngine:
         return result
 
     def _allow_pinned_full_prompt_store(self, request: ServingRequest) -> bool:
+        env_name = "TORCHINFERNO_CONTINUOUS_PINNED_FULL_PROMPT_STORE_MIN_MAX_TOKENS"
+        if env_name not in os.environ and self._greedy_large_mixed_prefix_reuse_enabled():
+            return request.max_new_tokens >= int(self.max_generation_tokens or 0)
         threshold = env_int(
-            "TORCHINFERNO_CONTINUOUS_PINNED_FULL_PROMPT_STORE_MIN_MAX_TOKENS",
+            env_name,
             0,
             minimum=0,
         )

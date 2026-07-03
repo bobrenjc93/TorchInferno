@@ -814,7 +814,7 @@ def test_openai_unified_scheduler_decode_warmup_uses_runtime_symm_scope(monkeypa
     engine._warmup_unified_scheduler_cache(vocab_size=16)
 
     assert [kwargs["startup"] for kwargs in scope_kwargs] == [False, False]
-    assert [(kwargs["temperature"], kwargs["max_tokens"]) for kwargs in scope_kwargs] == [
+    assert sorted((kwargs["temperature"], kwargs["max_tokens"]) for kwargs in scope_kwargs) == [
         (0.0, 1),
         (1.0, 300),
     ]
@@ -10039,6 +10039,8 @@ def test_online_common_prefix_prefill_warmup_filters_shapes(monkeypatch) -> None
     monkeypatch.delenv("TORCHINFERNO_OPENAI_WARMUP_ONLINE_GREEDY_COMMON_PREFIX_SUFFIX_BATCHES", raising=False)
     monkeypatch.delenv("TORCHINFERNO_OPENAI_WARMUP_ONLINE_MIXED_PREFIX_SUFFIX_PREFILL", raising=False)
     monkeypatch.delenv("TORCHINFERNO_OPENAI_WARMUP_ONLINE_MIXED_PREFIX_SUFFIX_SPECS", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_GREEDY_LARGE_MIXED_PREFIX_REUSE", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_GREEDY_LARGE_MIXED_PREFIX_REUSE_MAX_TOKENS", raising=False)
     monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SUFFIX_BUCKETS", raising=False)
     monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SUFFIX_BUCKETS_GREEDY_LARGE", raising=False)
     monkeypatch.delenv(
@@ -10101,6 +10103,12 @@ def test_online_common_prefix_prefill_warmup_filters_shapes(monkeypatch) -> None
     )
     assert _online_greedy_common_prefix_suffix_prefill_warmup_batches(64, 48) == (1, 2, 4, 8, 16, 32)
     assert not _online_mixed_prefix_suffix_prefill_warmup_enabled()
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_GREEDY_LARGE_MIXED_PREFIX_REUSE", "1")
+    assert _online_mixed_prefix_suffix_prefill_warmup_enabled()
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_WARMUP_ONLINE_MIXED_PREFIX_SUFFIX_PREFILL", "0")
+    assert not _online_mixed_prefix_suffix_prefill_warmup_enabled()
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_WARMUP_ONLINE_MIXED_PREFIX_SUFFIX_PREFILL", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_GREEDY_LARGE_MIXED_PREFIX_REUSE", raising=False)
     assert _online_mixed_prefix_suffix_prefill_warmup_specs(
         256,
         cache_rows=144,

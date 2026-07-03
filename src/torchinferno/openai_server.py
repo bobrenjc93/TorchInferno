@@ -80,6 +80,7 @@ from torchinferno.runtime.serving import (
     _default_prefix_prefill_suffix_buckets,
     _dynamic_prefix_prefill_context_len,
     _dynamic_prefix_prefill_max_suffix_for_policy,
+    _greedy_large_mixed_prefix_reuse_policy_enabled,
 )
 
 
@@ -1405,7 +1406,13 @@ def _online_greedy_common_prefix_suffix_prefill_warmup_batches(
 
 
 def _online_mixed_prefix_suffix_prefill_warmup_enabled() -> bool:
-    return env_flag("TORCHINFERNO_OPENAI_WARMUP_ONLINE_MIXED_PREFIX_SUFFIX_PREFILL", False)
+    env_name = "TORCHINFERNO_OPENAI_WARMUP_ONLINE_MIXED_PREFIX_SUFFIX_PREFILL"
+    if env_name in os.environ:
+        return env_flag(env_name, False)
+    return _greedy_large_mixed_prefix_reuse_policy_enabled(
+        0.0,
+        _online_greedy_common_prefix_suffix_prefill_warmup_max_tokens(),
+    )
 
 
 def _online_mixed_prefix_suffix_prefill_warmup_specs(
@@ -3535,6 +3542,7 @@ class OpenAICompletionEngine:
                     self.device,
                     max_tokens=mixed_warmup_max_tokens,
                     temperature=0.0,
+                    startup=False,
                 ):
                     self._warmup_online_mixed_prefix_suffix_prefill_graphs(
                         cache,
