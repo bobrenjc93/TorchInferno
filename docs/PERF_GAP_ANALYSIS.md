@@ -98,6 +98,15 @@ wall time down to `2.57s` from `7.20s` in the fallback-only run. This is now the
 best local multi_turn E2E result, but the knobs remain opt-in until the full
 benchmark suite validates correctness and cross-workload latency.
 
+A debug rerun on pushed commit `5089f09` wrote
+`agent_space/ti_multi_warmmixed_debug_results_0425/.../runs/20260703_041208`
+and measured `232.4 / 72.8 / 304.8ms`, `981/1000` correct. Saved response text
+shows the misses are ordinary arithmetic failures under load, such as
+`68 * 88 =` producing `5994` instead of `5984` and integer division prompts
+emitting decimal approximations. The public 20260703_010234 multi_turn
+correctness rates are TorchInferno `0.979`, vLLM `0.981`, and SGLang `0.980`,
+so the remaining correctness rate is not unique to the mixed-prefix cache path.
+
 ## Public 20260702_140923 refresh and SGLang CLI compatibility
 
 The latest public all-provider run at
