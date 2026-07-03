@@ -345,6 +345,8 @@ class ServingStats:
     full_prompt_store_stored_requests: int = 0
     full_prompt_store_deferred_requests: int = 0
     full_prompt_store_deferred_tokens: int = 0
+    full_prompt_store_adopted_requests: int = 0
+    full_prompt_store_adopted_tokens: int = 0
     full_prompt_store_skipped_requests: int = 0
     full_prompt_store_skipped_tokens: int = 0
     repeated_sample_state_prepares: int = 0
@@ -4362,12 +4364,16 @@ class ContinuousBatchEngine:
             return False
         route_id = state.request.request_id
         try:
-            return self._adopt_reusable_prefix_tokens(
+            adopted = self._adopt_reusable_prefix_tokens(
                 route_id,
                 state.request.request_id,
                 prompt,
                 state.row,
             )
+            if adopted:
+                self.stats.full_prompt_store_adopted_requests += 1
+                self.stats.full_prompt_store_adopted_tokens += len(prompt)
+            return adopted
         except Exception:
             if env_flag("TORCHINFERNO_CONTINUOUS_PINNED_FULL_PROMPT_STORE_STRICT", False):
                 raise

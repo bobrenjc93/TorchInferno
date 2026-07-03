@@ -1880,6 +1880,10 @@ def test_continuous_batch_engine_can_delay_pinned_full_prompt_store_until_finish
     assert reusable.row < engine.max_active_requests
     assert reusable.row not in engine._free_active_rows
     assert any(row >= engine.max_active_requests for row in engine._free_active_rows)
+    assert engine.stats.full_prompt_store_deferred_requests == 1
+    assert engine.stats.full_prompt_store_deferred_tokens == len(prompt)
+    assert engine.stats.full_prompt_store_adopted_requests == 1
+    assert engine.stats.full_prompt_store_adopted_tokens == len(prompt)
 
     prefill_src_rows = len(model.prefill_src_prefix_rows)
     engine.submit_online(ServingRequest("turn-2", continued_prompt, 1, arrival_step=0))

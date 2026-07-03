@@ -5943,6 +5943,8 @@ class OpenAICompletionEngine:
             "full_prompt_store_stored_requests",
             "full_prompt_store_deferred_requests",
             "full_prompt_store_deferred_tokens",
+            "full_prompt_store_adopted_requests",
+            "full_prompt_store_adopted_tokens",
             "full_prompt_store_skipped_requests",
             "full_prompt_store_skipped_tokens",
             "repeated_sample_state_prepares",
