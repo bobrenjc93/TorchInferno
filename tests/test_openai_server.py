@@ -13604,10 +13604,12 @@ def test_openai_queue_profile_records_runtime_engine_stats(
             "runtime_prefill_graph_capture_ms": 9.5,
             "runtime_prefill_graph_cache_evicted_entries": 128,
             "runtime_prefill_graph_cache_evictions": 2,
+            "runtime_prefill_graph_cache_live_batch_counts": {"b8": 2},
             "runtime_prefill_graph_cache_live_entries": 2,
             "runtime_prefill_graph_cache_live_shape_counts": {
                 "ragged_prefill:b8:s16:rows1:ctx-1:copy-1:src1:max4096:fp80:ar64": 2,
             },
+            "runtime_prefill_graph_cache_live_suffix_counts": {"s16": 2},
             "runtime_prefill_graph_cache_max_entries": 64,
             "runtime_prefill_graph_captures": 1,
             "runtime_prefill_graph_replay_ms": 1.25,

@@ -5760,6 +5760,26 @@ class OpenAICompletionEngine:
                 record["runtime_prefill_graph_cache_live_shape_counts"] = (
                     live_shape_counts
                 )
+            live_batch_counts = _ragged_prefill_graph_cache_live_dimension_counts(
+                ragged_prefill_graphs,
+                index=1,
+                prefix="b",
+                limit=64,
+            )
+            if live_batch_counts:
+                record["runtime_prefill_graph_cache_live_batch_counts"] = (
+                    live_batch_counts
+                )
+            live_suffix_counts = _ragged_prefill_graph_cache_live_dimension_counts(
+                ragged_prefill_graphs,
+                index=2,
+                prefix="s",
+                limit=64,
+            )
+            if live_suffix_counts:
+                record["runtime_prefill_graph_cache_live_suffix_counts"] = (
+                    live_suffix_counts
+                )
         for attr_name, record_name in (
             (
                 "_ragged_prefill_logits_graph_evictions",
@@ -14522,6 +14542,24 @@ def _ragged_prefill_graph_cache_live_shape_counts(
         counts[shape_key] = counts.get(shape_key, 0) + 1
     top_counts = sorted(counts.items(), key=lambda item: (-item[1], item[0]))[:limit]
     return {shape_key: count for shape_key, count in top_counts}
+
+
+def _ragged_prefill_graph_cache_live_dimension_counts(
+    graphs: Mapping[object, object],
+    *,
+    index: int,
+    prefix: str,
+    limit: int,
+) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for key in graphs:
+        if isinstance(key, tuple) and len(key) > index:
+            dimension_key = f"{prefix}{_profile_key_part(key[index])}"
+        else:
+            dimension_key = f"{prefix}unknown"
+        counts[dimension_key] = counts.get(dimension_key, 0) + 1
+    top_counts = sorted(counts.items(), key=lambda item: (-item[1], item[0]))[:limit]
+    return {dimension_key: count for dimension_key, count in top_counts}
 
 
 def _ragged_prefill_graph_cache_live_shape_key(key: object) -> str:
