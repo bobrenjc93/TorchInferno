@@ -7907,6 +7907,19 @@ prefix prefill path; the already-rejected suffix splitting, prefill-cost
 priority broadening, chunked/unified forward, and decode-many tail knobs should
 not be repeated without a new implementation.
 
+A current-head greedy-short suffix-split recheck on pushed `32a059d` keeps that
+conclusion. The diagnostic run
+`agent_space/ti_long_greedy_suffix_split_probe_0703/.../runs/20260703_140857`
+enabled `TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SPLIT_SUFFIX_BUCKETS_GREEDY_SHORT=1`
+and stayed correct (`1000/1000`), landing at
+`234.7 / 23.6 / 1072.3ms`. It reduced prefill padding
+(`34.8K -> 29.6K`) and prefill forward (`4.82s -> 4.68s`) versus the adjacent
+current-head full-run profile, but it also increased prefill model calls
+(`61 -> 66`), decode-many model tokens (`24.0K -> 27.9K`), and did not improve
+median E2E. Keep suffix splitting opt-in; the current padding distribution still
+needs a non-fragmenting packed/ragged cached-prefix prefill implementation
+rather than more suffix-bucket fragmentation.
+
 ## Priority for a focused (non-loop) session
 
 1. Prefill MFU (Issue 1) — biggest TTFT lever, ~2x, affects 3/5 benchmarks.
