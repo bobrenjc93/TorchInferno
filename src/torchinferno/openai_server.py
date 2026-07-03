@@ -5589,6 +5589,8 @@ class OpenAICompletionEngine:
             "prefill_prefix_reuse_batches",
             "prefill_common_prefix_batches",
             "prefill_padded_suffix_batches",
+            "prefill_prefix_copy_skipped_batches",
+            "prefill_prefix_copy_skipped_tokens",
             "prefill_graph_hits",
             "prefill_graph_misses",
             "prefill_graph_captures",

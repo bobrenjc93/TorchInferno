@@ -7156,6 +7156,21 @@ wall to `19.9s`. Keep prefix-prefill batch buckets power-of-two by default;
 intermediate buckets need a graph-warmup/keying fix before they can be a
 runtime policy.
 
+Warm-row prefix-copy skipping is rejected as a default. An opt-in diagnostic
+hook (`TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SKIP_WARM_PREFIX_COPY=1`) tracks
+free active rows whose KV still starts with the same shared prefix, then replays
+the prefix-suffix graph with `src_prefix_row=None` for those rows instead of
+copying the shared prefix again inside the graph. A focused few_shot run wrote
+`agent_space/ti_few_skip_warm_prefix_results/.../8xH100-local-ti-few-skip-warm-prefix-20260703/runs/20260703_013119`
+and preserved correctness (`977/1000`), but landed at
+`167.4 / 51.1 / 208.3ms` with p99 E2E around `2.0s`, worse than the current
+full-run control. The profile proves the mechanism fired (`31` skipped batches,
+`115.9K` skipped prefix-copy tokens), but it caused two request-path `src0`
+prefill graph captures (`1.66s`) and the steady b32 replay was not materially
+faster than the existing `src1` graph after capture cost is removed. Keep this as
+an opt-in diagnostic hook only; the common-prefix gap is not the dense KV copy
+inside the captured graph.
+
 The same full run also confirms that multi_turn's remaining TTFT/E2E gap is not
 a missing default env flip. It still has `34` prefill batches, `34/0` prefill
 graph hits/misses, and only `{"common_prefix":1000}` / `{"45":1000}` reuse.

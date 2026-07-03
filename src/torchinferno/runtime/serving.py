@@ -252,6 +252,8 @@ class ServingStats:
     prefill_prefix_reuse_batches: int = 0
     prefill_common_prefix_batches: int = 0
     prefill_padded_suffix_batches: int = 0
+    prefill_prefix_copy_skipped_batches: int = 0
+    prefill_prefix_copy_skipped_tokens: int = 0
     prefill_graph_hits: int = 0
     prefill_graph_misses: int = 0
     prefill_graph_captures: int = 0
@@ -559,6 +561,7 @@ class ContinuousBatchEngine:
         self._free_active_rows: list[int] = []
         self._free_prefix_rows: list[int] = []
         self._row_seq_lens: list[int] = []
+        self._row_cached_prefixes: list[tuple[int, ...] | None] = []
         self._device_index_tensors: dict[tuple[int, ...], Tensor] = {}
         self._prefix_order: list[Hashable] = []
         self._online_waiting: ServingQueue | None = None
@@ -1363,6 +1366,7 @@ class ContinuousBatchEngine:
         if not hasattr(self._cache, "for_rows"):
             raise ValueError("model cache must support row views for persistent serving")
         self._row_seq_lens = [0 for _ in range(total_rows)]
+        self._row_cached_prefixes = [None for _ in range(total_rows)]
         self._gpu_seq_lens = None
         self._device_index_tensors = {}
         self._free_active_rows = list(reversed(range(self.max_active_requests)))
@@ -2082,6 +2086,19 @@ class ContinuousBatchEngine:
             ]
             for _index, _request, prefix_hit_tokens, _reusable in group:
                 self._record_prefix_reuse(prefix_hit_tokens, _reusable)
+            skip_prefix_copy = (
+                not mixed_prefixes
+                and self._warm_row_prefix_copy_skip_enabled()
+                and self._rows_have_cached_prefix(
+                    rows,
+                    group[0][1].prompt,
+                    prefix_hits[0],
+                )
+            )
+            if skip_prefix_copy:
+                source_prefix_rows = []
+                self.stats.prefill_prefix_copy_skipped_batches += 1
+                self.stats.prefill_prefix_copy_skipped_tokens += prefix_hits[0] * len(rows)
             padded_suffixes = [
                 [*suffix, *([0] * (suffix_bucket - len(suffix)))]
                 for suffix in suffixes
@@ -2101,7 +2118,8 @@ class ContinuousBatchEngine:
                         pad_rows.append(pad_row)
                     padded_suffixes.append(list(dummy_suffix))
                     start_lens.append(prefix_hits[0])
-                    source_prefix_rows.append(source_prefix_rows[0])
+                    if source_prefix_rows:
+                        source_prefix_rows.append(source_prefix_rows[0])
             if not mixed_prefixes and len(set(source_prefix_rows)) == 1:
                 source_prefix_rows = [source_prefix_rows[0]]
             shape_key = (
@@ -2126,7 +2144,11 @@ class ContinuousBatchEngine:
             all_rows = rows + pad_rows + pad_prefix_rows
             input_ids = torch.tensor(padded_suffixes, device=self.device, dtype=torch.long)
             row_indices = torch.tensor(all_rows, device=self.device, dtype=torch.long)
-            src_prefix_row = torch.tensor(source_prefix_rows, device=self.device, dtype=torch.long)
+            src_prefix_row = (
+                torch.tensor(source_prefix_rows, device=self.device, dtype=torch.long)
+                if source_prefix_rows
+                else None
+            )
             required = max(all_rows + source_prefix_rows) + 1
             seq_lens_list = [0] * required
             for physical_row, start_len in zip(all_rows, start_lens):
@@ -4040,6 +4062,8 @@ class ContinuousBatchEngine:
             step,
         )
         if not row_adopted:
+            if self._warm_row_prefix_copy_skip_enabled():
+                self._remember_row_cached_prefix(state.row, state.tokens)
             self._release_active_row(state.row)
         return result
 
@@ -4621,6 +4645,7 @@ class ContinuousBatchEngine:
     def _clear_physical_row(self, row: int) -> None:
         self._cache_view([row]).clear_row(0)  # type: ignore[attr-defined]
         self._remember_row_seq_len(row, 0)
+        self._forget_row_cached_prefix(row)
 
     def _allocate_cache(self, batch_size: int, max_seq_len: int) -> object:
         allocate_cache = getattr(self.model, "allocate_cache")
@@ -5244,6 +5269,51 @@ class ContinuousBatchEngine:
     def _remember_row_seq_len(self, row: int, seq_len: int) -> None:
         if 0 <= row < len(self._row_seq_lens):
             self._row_seq_lens[row] = int(seq_len)
+
+    def _forget_row_cached_prefix(self, row: int) -> None:
+        if 0 <= row < len(self._row_cached_prefixes):
+            self._row_cached_prefixes[row] = None
+
+    @staticmethod
+    def _warm_row_prefix_copy_skip_enabled() -> bool:
+        return env_flag(
+            "TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SKIP_WARM_PREFIX_COPY",
+            False,
+        )
+
+    def _remember_row_cached_prefix(
+        self,
+        row: int,
+        tokens: Sequence[int],
+    ) -> None:
+        if not (0 <= row < len(self._row_cached_prefixes)):
+            return
+        max_tokens = env_int(
+            "TORCHINFERNO_CONTINUOUS_ROW_CACHED_PREFIX_MAX_TOKENS",
+            256,
+            minimum=1,
+        )
+        cached = tuple(int(token) for token in tokens[:max_tokens])
+        self._row_cached_prefixes[row] = cached if cached else None
+
+    def _rows_have_cached_prefix(
+        self,
+        rows: Sequence[int],
+        tokens: Sequence[int],
+        prefix_len: int,
+    ) -> bool:
+        if prefix_len <= 0:
+            return False
+        prefix = tuple(int(token) for token in tokens[:prefix_len])
+        if len(prefix) != prefix_len:
+            return False
+        for row in rows:
+            if not (0 <= row < len(self._row_cached_prefixes)):
+                return False
+            cached = self._row_cached_prefixes[row]
+            if cached is None or len(cached) < prefix_len or cached[:prefix_len] != prefix:
+                return False
+        return True
 
     def _set_cache_row_seq_len(self, row: int, seq_len: int) -> None:
         self._remember_row_seq_len(row, seq_len)

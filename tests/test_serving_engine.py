@@ -1045,6 +1045,45 @@ def test_continuous_batch_engine_adopts_common_prefix_row_with_single_prefix_slo
     assert engine.stats.prefill_common_prefix_batches == 1
 
 
+def test_continuous_batch_engine_can_skip_warm_row_prefix_copy(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv(
+        "TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SKIP_WARM_PREFIX_COPY",
+        "1",
+    )
+    shared = tuple(range(1, 17))
+    model = _SelectedLogitsToyModel()
+    engine = ContinuousBatchEngine(
+        model,
+        device=torch.device("cpu"),
+        max_active_requests=2,
+        prefix_cache_capacity=2,
+        pin_shared_prefix=True,
+        graph_prefill=True,
+    )
+
+    results = engine.run(
+        [
+            ServingRequest("warm-a", (*shared, 21), 1, arrival_step=0),
+            ServingRequest("warm-b", (*shared, 22), 1, arrival_step=0),
+            ServingRequest("late-a", (*shared, 23), 1, arrival_step=1),
+            ServingRequest("late-b", (*shared, 24), 1, arrival_step=1),
+        ]
+    )
+
+    assert {result.request_id for result in results} == {
+        "warm-a",
+        "warm-b",
+        "late-a",
+        "late-b",
+    }
+    assert model.prefill_src_prefix_rows[0] is not None
+    assert model.prefill_src_prefix_rows[-1] is None
+    assert engine.stats.prefill_prefix_copy_skipped_batches == 1
+    assert engine.stats.prefill_prefix_copy_skipped_tokens == len(shared) * 2
+
+
 def test_continuous_batch_engine_prefers_warmed_prefix_rows(monkeypatch) -> None:
     monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_PREFERRED_PREFIX_ROWS", raising=False)
     engine = ContinuousBatchEngine(
