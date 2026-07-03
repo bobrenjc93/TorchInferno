@@ -289,6 +289,24 @@ This validates the opt-in multi_turn median improvement, but not a broad
 default. Promoting it would need an adjacent same-head all-workload control and
 either a TPOT/tail fix or an explicit workload-scoped selection rule.
 
+A focused tree_of_thought A/B on pushed `2719235` separates prefix-row capacity
+from the mixed-prefix full-pass noise. The no-env control
+(`agent_space/ti_tree_default_2719235_results_0703/.../runs/20260703_122701`)
+landed at `127.3 / 43.7 / 155.6ms`, p99 E2E `632.5ms`, and `959/992`
+correct with `prefix_rows=64`. Its queue record had `59` prefix-prefill
+batches, `1.79s` prefill forward, `2.21s` prefill wall, `93` decode calls,
+`1.50s` decode GPU, and queue-to-first/finish p50 `105.6/131.7ms`. Repeating
+with only `TORCHINFERNO_OPENAI_TP_ONLINE_PREFIX_ROWS=112`
+(`agent_space/ti_tree_prefix112_2719235_results_0703/.../runs/20260703_123134`)
+landed at `129.5 / 45.1 / 157.6ms`, p99 E2E `556.6ms`, and `966/992`
+correct. The larger prefix pool improved internal tails
+(`271.8/309.9ms -> 172.2/241.8ms` queue-to-first/finish p99), but it did not
+reduce steady model work: prefill forward stayed `1.79s`, prefill wall stayed
+about `2.17s`, decode calls stayed `93`, and decode GPU stayed `1.49s`. Keep
+`112` prefix rows as an opt-in or future workload-scoped policy candidate, not
+a broad default; the score-facing tree median gap still needs faster
+sampled-medium prefix-suffix prefill or decode pipeline work.
+
 Bucketed ragged-decode cache-token loop bounds are rejected as a default for
 long_output. The first env probe only changed the paged graph metadata path and
 therefore did not affect the dense long-output path:
