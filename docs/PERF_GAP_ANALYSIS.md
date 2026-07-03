@@ -254,6 +254,19 @@ normal common-prefix multi_turn path. It is now only the default when the
 explicit `TORCHINFERNO_CONTINUOUS_GREEDY_LARGE_MIXED_PREFIX_REUSE=1` policy is
 selected; global prefill-ready env overrides still win.
 
+A default-prefix-row control keeps full mixed-prefix promotion blocked. Running
+the same pushed policy without `TORCHINFERNO_OPENAI_TP_ONLINE_PREFIX_ROWS=112`
+(`agent_space/ti_multi_mixed_default_prefixrows_results_0703/.../runs/20260703_121145`)
+landed at `248.0 / 69.3 / 330.0ms`, `981/1000` correct. The server used
+`max_active=32`, `prefix_rows=64`, and `96` total cache rows. It still adopted
+all `1000` full prompts, but request-prompt reuse fell to `849` requests,
+common-prefix fallback rose to `151`, prefill batches rose to `48`, prefill
+forward rose to `3.04s`, and p99 TTFT/E2E were `862.9/914.8ms`. This is better
+than the common-prefix median E2E band but materially worse than the `112`-row
+mixed-prefix run above. Do not promote the mixed-prefix policy by itself; any
+default-scope attempt must address prefix-row capacity and cross-workload memory
+first.
+
 Bucketed ragged-decode cache-token loop bounds are rejected as a default for
 long_output. The first env probe only changed the paged graph metadata path and
 therefore did not affect the dense long-output path:
