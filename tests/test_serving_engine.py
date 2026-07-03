@@ -1104,6 +1104,50 @@ def test_paged_online_engine_pads_mixed_shared_suffix_prefill(monkeypatch) -> No
     assert engine.cache.sequence_length("p1") == 0
 
 
+def test_paged_online_engine_buckets_shared_suffix_prefill_when_one_group_is_too_wasteful(
+    monkeypatch,
+) -> None:
+    from types import SimpleNamespace
+
+    from torchinferno.runtime.paged_serving import PagedEngine
+
+    monkeypatch.setenv("TORCHINFERNO_PAGED_PREFIX_PADDED_SUFFIX_MAX_PADDING_TOKENS", "8")
+    monkeypatch.setenv("TORCHINFERNO_PAGED_PREFIX_PADDED_SUFFIX_MAX_PADDING_PCT", "100")
+    monkeypatch.setenv("TORCHINFERNO_PAGED_PREFIX_BUCKETED_SUFFIX_PREFILL", "1")
+    monkeypatch.setenv("TORCHINFERNO_PAGED_PREFIX_SUFFIX_BUCKETS", "4,8,16")
+
+    class _FakeLayer:
+        local_attention_heads = 1
+        local_key_value_heads = 1
+
+    class _FakePagedModel:
+        def __init__(self) -> None:
+            self.device = torch.device("cpu")
+            self.dtype = torch.float32
+            self.config = SimpleNamespace(head_dim=2)
+            self.layers = [_FakeLayer()]
+
+    model = _FakePagedModel()
+    engine = PagedEngine(model, page_size=2, max_active=4, max_seq=32, use_graph=False)
+    admitted = [
+        {"rid": "p0", "prompt": [1, 2, 3, 4], "shared": 2},
+        {"rid": "p1", "prompt": [1, 2, 3, 4, 5], "shared": 2},
+        {"rid": "p2", "prompt": [1, 2, 10, 11, 12, 13, 14, 15, 16, 17, 18], "shared": 2},
+    ]
+    for item in admitted:
+        engine.cache.reserve(item["rid"], len(item["prompt"]) + 1)
+
+    groups = engine._shared_prefix_prefill_groups(admitted)
+
+    assert [
+        (suffix_len, [item["rid"] for item in group], lengths, padded)
+        for suffix_len, group, lengths, padded in groups
+    ] == [
+        (4, ["p0", "p1"], [2, 3], True),
+        (9, ["p2"], [9], False),
+    ]
+
+
 def test_continuous_batch_engine_pins_shared_prefix_across_batches() -> None:
     # With pin_shared_prefix, a recurring shared prompt prefix is prefilled once
     # and reused across separate scheduler batches (the online-batcher case),

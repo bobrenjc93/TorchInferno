@@ -13,9 +13,10 @@ consistent across TP ranks without extra broadcasts.
 """
 from __future__ import annotations
 
+import math
+import os
 import time
 from dataclasses import dataclass, field
-import math
 
 import torch
 
@@ -63,6 +64,42 @@ def _add_count(mapping: dict[str, int], key: str, value: int = 1) -> None:
 
 def _add_time(mapping: dict[str, float], key: str, value: float) -> None:
     mapping[key] = float(mapping.get(key, 0.0)) + float(value)
+
+
+def _parse_positive_int_csv(raw: str | None, *, minimum: int = 1) -> tuple[int, ...]:
+    values: list[int] = []
+    seen: set[int] = set()
+    for part in (raw or "").split(","):
+        token = part.strip()
+        if not token:
+            continue
+        try:
+            value = int(token)
+        except ValueError:
+            continue
+        if value < minimum or value in seen:
+            continue
+        values.append(value)
+        seen.add(value)
+    return tuple(values)
+
+
+def _bucket_from_values(length: int, buckets: tuple[int, ...]) -> int | None:
+    for bucket in buckets:
+        if length <= bucket:
+            return bucket
+    return None
+
+
+def _paged_prefix_suffix_bucket(length: int) -> int:
+    buckets = _parse_positive_int_csv(
+        os.environ.get(
+            "TORCHINFERNO_PAGED_PREFIX_SUFFIX_BUCKETS",
+            "16,32,64,96,128,256,512",
+        )
+    )
+    configured = _bucket_from_values(max(1, int(length)), buckets)
+    return max(1, int(configured if configured is not None else length))
 
 
 class PagedPrefixCache:
@@ -905,15 +942,45 @@ class PagedEngine:
         if not shared:
             return []
 
-        def exact_groups() -> list[tuple[int, list[dict], list[int], bool]]:
+        def exact_groups(items: list[dict] | None = None) -> list[tuple[int, list[dict], list[int], bool]]:
+            source = shared if items is None else items
             groups: dict[int, list[dict]] = {}
-            for item in shared:
+            for item in source:
                 suffix = len(item["prompt"]) - int(item["shared"])
                 groups.setdefault(suffix, []).append(item)
             return [
                 (suffix, group, [suffix] * len(group), False)
                 for suffix, group in groups.items()
             ]
+
+        def can_pad(items: list[dict], suffix_len: int, lengths: list[int]) -> bool:
+            if not items or min(lengths) <= 0 or max(lengths) > suffix_len:
+                return False
+            active_tokens = sum(lengths)
+            padding_tokens = len(items) * suffix_len - active_tokens
+            max_padding_tokens = env_int(
+                "TORCHINFERNO_PAGED_PREFIX_PADDED_SUFFIX_MAX_PADDING_TOKENS",
+                1024,
+                minimum=0,
+            )
+            max_padding_pct = env_int(
+                "TORCHINFERNO_PAGED_PREFIX_PADDED_SUFFIX_MAX_PADDING_PCT",
+                100,
+                minimum=0,
+            )
+            if (
+                padding_tokens > max_padding_tokens
+                or padding_tokens * 100 > active_tokens * max_padding_pct
+                or any(int(a["shared"]) + suffix_len > self.max_seq for a in items)
+            ):
+                return False
+
+            extra_pages = 0
+            for item in items:
+                rid = item["rid"]
+                target_pages = math.ceil((int(item["shared"]) + suffix_len) / self.page_size)
+                extra_pages += max(0, target_pages - len(self.cache._sequences[rid].page_ids))
+            return extra_pages <= len(self.cache.free_pages)
 
         suffix_lengths = [len(a["prompt"]) - int(a["shared"]) for a in shared]
         if (
@@ -925,34 +992,27 @@ class PagedEngine:
             return exact_groups()
 
         max_suffix = max(suffix_lengths)
-        active_tokens = sum(suffix_lengths)
-        padding_tokens = len(shared) * max_suffix - active_tokens
-        max_padding_tokens = env_int(
-            "TORCHINFERNO_PAGED_PREFIX_PADDED_SUFFIX_MAX_PADDING_TOKENS",
-            1024,
-            minimum=0,
-        )
-        max_padding_pct = env_int(
-            "TORCHINFERNO_PAGED_PREFIX_PADDED_SUFFIX_MAX_PADDING_PCT",
-            100,
-            minimum=0,
-        )
-        if (
-            padding_tokens > max_padding_tokens
-            or padding_tokens * 100 > active_tokens * max_padding_pct
-            or any(int(a["shared"]) + max_suffix > self.max_seq for a in shared)
-        ):
+        if can_pad(shared, max_suffix, suffix_lengths):
+            return [(max_suffix, shared, suffix_lengths, True)]
+
+        if not env_flag("TORCHINFERNO_PAGED_PREFIX_BUCKETED_SUFFIX_PREFILL", True):
             return exact_groups()
 
-        extra_pages = 0
-        for item in shared:
-            rid = item["rid"]
-            target_pages = math.ceil((int(item["shared"]) + max_suffix) / self.page_size)
-            extra_pages += max(0, target_pages - len(self.cache._sequences[rid].page_ids))
-        if extra_pages > len(self.cache.free_pages):
+        by_bucket: dict[int, list[tuple[dict, int]]] = {}
+        for item, suffix_len in zip(shared, suffix_lengths):
+            by_bucket.setdefault(_paged_prefix_suffix_bucket(suffix_len), []).append((item, suffix_len))
+        if len(by_bucket) <= 1:
             return exact_groups()
 
-        return [(max_suffix, shared, suffix_lengths, True)]
+        grouped: list[tuple[int, list[dict], list[int], bool]] = []
+        for bucket, pairs in by_bucket.items():
+            items = [item for item, _suffix_len in pairs]
+            lengths = [suffix_len for _item, suffix_len in pairs]
+            if len(items) > 1 and can_pad(items, bucket, lengths):
+                grouped.append((bucket, items, lengths, True))
+            else:
+                grouped.extend(exact_groups(items))
+        return grouped
 
     def _record_decode_stats(self, *, batch: int, elapsed_ms: float) -> None:
         shape_key = f"paged_decode:b{int(batch)}"

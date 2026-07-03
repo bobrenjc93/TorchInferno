@@ -45,6 +45,18 @@ cache exists. This does not make paged serving a default path; it removes a
 correctness and validation blocker for the vLLM/SGLang-style KV reuse work that
 multi_turn needs.
 
+The paged-prefix suffix prefill path now has a bucketed fallback for mixed
+suffix lengths. The previous infrastructure could either pad every shared-prefix
+request in an admitted wave to the maximum suffix, or fall back to one exact
+suffix-length prefill per group when that padding exceeded the guard. That left
+fragmentation on waves where short suffixes could be cheaply grouped but one
+long suffix made the all-in-one padded batch too expensive. The new
+`TORCHINFERNO_PAGED_PREFIX_BUCKETED_SUFFIX_PREFILL` path, enabled by default
+inside the still opt-in paged-prefix engine, groups by
+`TORCHINFERNO_PAGED_PREFIX_SUFFIX_BUCKETS` and applies the same padding/page
+guards per bucket. CPU coverage verifies a wave that rejects one all-in padded
+batch now emits a padded `s4` bucket plus an exact long suffix group.
+
 Mixed-prefix dynamic context is accepted only as opt-in infrastructure for the
 same multi_turn reuse gap. The previous full-prompt reuse route could collapse
 the run to coarse non-common-prefix batches, but mixed-prefix prefill either
