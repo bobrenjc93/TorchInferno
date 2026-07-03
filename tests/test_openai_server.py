@@ -13544,6 +13544,8 @@ def test_openai_queue_profile_records_runtime_engine_stats(
             "runtime_decode_many_shape_skipped_tokens": {"decode_many:b8/8": 4},
             "runtime_decode_many_shape_stop_finishes": {"decode_many:b8/8": 3},
             "runtime_decode_many_shape_limit_finishes": {"decode_many:b8/8": 2},
+            "runtime_decode_many_overgenerated_tokens": 4,
+            "runtime_decode_many_shape_overgenerated_tokens": {"decode_many:b8/8": 4},
             "runtime_decode_model_calls": 5,
             "runtime_decode_ragged_model_gpu_ms": 12.5,
             "runtime_decode_tokens": 31,
@@ -13598,6 +13600,10 @@ def test_openai_queue_profile_records_runtime_engine_stats(
             },
             "runtime_prefill_shape_model_tokens": {
                 "prefix_graph:b8:s16:p45-45:src1:mixed0": 48,
+            },
+            "runtime_prefill_padding_tokens": 17,
+            "runtime_prefill_shape_padding_tokens": {
+                "prefix_graph:b8:s16:p45-45:src1:mixed0": 17,
             },
             "runtime_prefill_tokens": 17,
             "runtime_decode_shape_counts": {"ragged:b8/8": 5},

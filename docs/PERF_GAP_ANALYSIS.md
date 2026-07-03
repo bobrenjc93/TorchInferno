@@ -7405,6 +7405,16 @@ already shown TP failures or large prefill/state regressions. Do not repeat
 those env-only probes without a new batched, TP-safe non-common prefix prefill
 implementation.
 
+The queue-profile schema now makes the two remaining shape wastes first-class:
+`runtime_prefill_padding_tokens` / `runtime_prefill_shape_padding_tokens` derive
+from prefill model-vs-active token maps, and
+`runtime_decode_many_overgenerated_tokens` /
+`runtime_decode_many_shape_overgenerated_tokens` derive from decode-many
+model-vs-emitted token maps. These are reporting-only fields computed while
+writing the profile JSONL; they do not change scheduling, graph keys, kernels,
+or serving behavior. Use them to rank the next packed/ragged prefill and decode
+overlap work instead of inferring waste by hand from multiple shape counters.
+
 ## Priority for a focused (non-loop) session
 
 1. Prefill MFU (Issue 1) — biggest TTFT lever, ~2x, affects 3/5 benchmarks.

@@ -5721,6 +5721,32 @@ class OpenAICompletionEngine:
                 record["runtime_cache_max_seq_len"] = cache_max_seq_len
             if cache_rows is not None:
                 record["runtime_cache_rows"] = cache_rows
+
+        def _positive_shape_token_deltas(
+            model_tokens_name: str,
+            used_tokens_name: str,
+            *,
+            limit: int,
+        ) -> tuple[int, dict[str, int]]:
+            model_tokens = getattr(stats, model_tokens_name, None)
+            used_tokens = getattr(stats, used_tokens_name, None)
+            if not isinstance(model_tokens, Mapping) or not isinstance(
+                used_tokens, Mapping
+            ):
+                return 0, {}
+
+            deltas: list[tuple[str, int]] = []
+            total = 0
+            for key, count in model_tokens.items():
+                delta = int(count) - int(used_tokens.get(key, 0))
+                if delta <= 0:
+                    continue
+                shape = str(key)
+                total += delta
+                deltas.append((shape, delta))
+            deltas.sort(key=lambda item: (-item[1], item[0]))
+            return total, {shape: delta for shape, delta in deltas[:limit]}
+
         for name in (
             "prefill_model_calls",
             "prefill_batches",
@@ -5829,6 +5855,33 @@ class OpenAICompletionEngine:
                     key=lambda item: (-int(item[1]), str(item[0])),
                 )[:limit]
                 record[f"runtime_{name}"] = {str(key): int(count) for key, count in top_counts}
+
+        prefill_padding_tokens, prefill_shape_padding_tokens = (
+            _positive_shape_token_deltas(
+                "prefill_shape_model_tokens",
+                "prefill_shape_active_tokens",
+                limit=32,
+            )
+        )
+        if prefill_padding_tokens:
+            record["runtime_prefill_padding_tokens"] = prefill_padding_tokens
+            record["runtime_prefill_shape_padding_tokens"] = (
+                prefill_shape_padding_tokens
+            )
+        decode_many_overgenerated_tokens, decode_many_shape_overgenerated_tokens = (
+            _positive_shape_token_deltas(
+                "decode_many_shape_model_tokens",
+                "decode_many_shape_emitted_tokens",
+                limit=64,
+            )
+        )
+        if decode_many_overgenerated_tokens:
+            record["runtime_decode_many_overgenerated_tokens"] = (
+                decode_many_overgenerated_tokens
+            )
+            record["runtime_decode_many_shape_overgenerated_tokens"] = (
+                decode_many_shape_overgenerated_tokens
+            )
         for name in (
             "prefill_shape_wall_ms",
             "prefill_shape_copy_ms",
