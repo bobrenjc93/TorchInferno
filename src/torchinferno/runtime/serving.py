@@ -1935,6 +1935,16 @@ class ContinuousBatchEngine:
             raise
 
     def _prefill_batch_bucket(self, count: int) -> int:
+        configured = os.environ.get("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_BATCH_BUCKETS")
+        if configured is not None:
+            configured_buckets = tuple(
+                bucket
+                for bucket in _parse_positive_int_csv(configured)
+                if bucket <= self.max_active_requests
+            )
+            configured_bucket = _bucket_from_values(count, configured_buckets)
+            if configured_bucket is not None:
+                return configured_bucket
         # Pad the prefill batch to a power of two so the model's prefill graph
         # key -- (batch, suffix_bucket, prefix_len) -- repeats across batches and
         # replays instead of recapturing on every differently-sized batch. Cap

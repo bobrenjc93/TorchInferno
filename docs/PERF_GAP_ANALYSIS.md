@@ -7143,6 +7143,19 @@ delayed first-token visibility enough to erase the score-facing win. Keep the
 q8 drain default; larger drain commands need an overlap/event-flush design, not
 just a tail limiter.
 
+Intermediate prefix-prefill batch buckets are also rejected as a simple
+long-output default. An opt-in diagnostic hook
+`TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_BATCH_BUCKETS=1,2,4,8,12,16,24,32`
+with matching greedy common-prefix warmup batches wrote
+`agent_space/ti_long_batch_buckets_results/.../8xH100-local-ti-long-batch-buckets-20260703/runs/20260703_011330`
+and finished 1000/1000 correct, but regressed to
+`298.9 / 27.0 / 1909.4ms` with p99 E2E `4996.4ms`. The profile did reduce
+some row padding and decode GPU was not the problem, but the new shapes caused
+`16` request-path prefill captures (`15.9s` capture time), inflating prefill
+wall to `19.9s`. Keep prefix-prefill batch buckets power-of-two by default;
+intermediate buckets need a graph-warmup/keying fix before they can be a
+runtime policy.
+
 The same full run also confirms that multi_turn's remaining TTFT/E2E gap is not
 a missing default env flip. It still has `34` prefill batches, `34/0` prefill
 graph hits/misses, and only `{"common_prefix":1000}` / `{"45":1000}` reuse.

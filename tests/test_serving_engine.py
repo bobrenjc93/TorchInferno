@@ -114,6 +114,23 @@ def test_continuous_prefix_prefill_suffix_buckets_can_be_configured(monkeypatch)
     assert engine._suffix_bucket(161) == 256
 
 
+def test_continuous_prefix_prefill_batch_buckets_can_be_configured(monkeypatch) -> None:
+    monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_BATCH_BUCKETS", raising=False)
+    engine = ContinuousBatchEngine(object(), device=torch.device("cpu"), max_active_requests=64)
+
+    assert engine._prefill_batch_bucket(17) == 32
+
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_BATCH_BUCKETS", "8,16,24,32")
+
+    assert engine._prefill_batch_bucket(17) == 24
+    assert engine._prefill_batch_bucket(25) == 32
+    assert engine._prefill_batch_bucket(33) == 64
+
+    capped_engine = ContinuousBatchEngine(object(), device=torch.device("cpu"), max_active_requests=24)
+    assert capped_engine._prefill_batch_bucket(17) == 24
+    assert capped_engine._prefill_batch_bucket(25) == 24
+
+
 def test_continuous_engine_samples_request_temperature_per_row() -> None:
     class TemperatureSamplingModel:
         def __init__(self) -> None:
