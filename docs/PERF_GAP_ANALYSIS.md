@@ -257,6 +257,21 @@ the ragged-prefill graph cache (`128/128` live entries, `12` startup evictions)
 and reached readiness in `226.0s`, so this does not reopen greedy-short `b24`
 as a default.
 
+Live prefill graph-cache queue profiles now also aggregate resident entries by
+batch and suffix bucket. The default long_output refresh on `fc7f6f4`
+(`agent_space/ti_long_cache_bucket_profile_results_0703/.../runs/20260703_111823`)
+showed `121/128` resident prefill graphs: `20` each for `b1`, `b2`, `b4`,
+`b8`, `b16`, and `b32`, plus one `b24` extra-pair graph. Pruning the small
+greedy suffix warmup to `b4,b8,b16,b32`
+(`TORCHINFERNO_OPENAI_WARMUP_ONLINE_GREEDY_COMMON_PREFIX_SUFFIX_BATCHES=4,8,16,32`)
+is rejected despite improving readiness to `180.8s` and reducing resident
+prefill graphs to `83/128`. The focused run
+`agent_space/ti_long_prune_small_prefill_warmup_results_0703/.../runs/20260703_112341`
+captured `ragged_prefill:b2:s64` on the request path (`787ms`), raised prefill
+wall to `6.35s`, and landed at `260.5 / 24.1 / 1223.7ms`. Keep the small
+greedy suffix graph warmups unless there is a replacement that can handle tail
+`b2` groups without request-time capture.
+
 Sampled-medium prefix prefill now has a default `b24` batch bucket. The focused
 env probe with `TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_BATCH_BUCKETS=1,2,4,8,16,24,32`
 and matching warmup wrote
