@@ -1435,7 +1435,7 @@ def _online_mixed_prefix_suffix_prefill_warmup_specs(
         return ()
     raw = os.environ.get(
         "TORCHINFERNO_OPENAI_WARMUP_ONLINE_MIXED_PREFIX_SUFFIX_SPECS",
-        "32:32:128,32:32:256,16:32:256,8:32:256,4:16:256",
+        "32:32:128,32:32:256,16:32:256,8:32:256,4:32:256,4:16:256",
     )
     specs: list[tuple[int, int, int]] = []
     for part in raw.split(","):

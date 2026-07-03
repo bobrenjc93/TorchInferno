@@ -179,6 +179,20 @@ sessions and TPOT regressed sharply versus the accepted full-suite default band
 needs cheaper non-common prefix replay or fewer mixed-prefix prefill waves, not a
 broader default for the current policy bundle.
 
+The opt-in mixed-prefix suffix warmup now also covers `b4:s32:ctx256`. The
+rejected current-head policy run above hit one request-path
+`prefix_graph:b4:s32:p154-159:src4:mixed1` miss and then paid about `354ms` in
+that small fallback, while the default warmup only covered `b4:s16`. The added
+shape is still scoped to the explicit greedy-large mixed-prefix policy or the
+mixed-prefix warmup env; it does not affect normal default serving. A rebuilt
+focused probe with the same policy env
+(`agent_space/ti_multi_mixed_b4warm_results_0703/.../runs/20260703_094659`)
+landed at `235.7 / 70.9 / 302.4ms`, `982/1000` correct, with a single online
+session and `37/0` request prefill graph hits/misses. That rerun did not
+reproduce the `b4` tail shape, so keep treating this as opt-in graph coverage
+for an observed miss rather than evidence to promote greedy-large mixed-prefix
+reuse by default.
+
 Sampled-medium prefix prefill now has a default `b24` batch bucket. The focused
 env probe with `TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_BATCH_BUCKETS=1,2,4,8,16,24,32`
 and matching warmup wrote
