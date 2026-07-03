@@ -13529,7 +13529,10 @@ def test_openai_queue_profile_records_runtime_engine_stats(
         decode_shape_cpu_tokens_ms = {"ragged:b8/8": 1.25}
 
     class Model:
-        _ragged_prefill_logits_graphs = {"shape-a": object(), "shape-b": object()}
+        _ragged_prefill_logits_graphs = {
+            (101, 8, 16, 4096, True, -1, -1, 1, (False,), 64): object(),
+            (102, 8, 16, 4096, True, -1, -1, 1, (False,), 64): object(),
+        }
         _ragged_prefill_logits_graph_evictions = 2
         _ragged_prefill_logits_graph_evicted_entries = 128
         _ragged_prefill_logits_graph_max_entries = 64
@@ -13590,6 +13593,9 @@ def test_openai_queue_profile_records_runtime_engine_stats(
             "runtime_prefill_graph_cache_evicted_entries": 128,
             "runtime_prefill_graph_cache_evictions": 2,
             "runtime_prefill_graph_cache_live_entries": 2,
+            "runtime_prefill_graph_cache_live_shape_counts": {
+                "ragged_prefill:b8:s16:rows1:ctx-1:copy-1:src1:max4096:fp80:ar64": 2,
+            },
             "runtime_prefill_graph_cache_max_entries": 64,
             "runtime_prefill_graph_captures": 1,
             "runtime_prefill_graph_replay_ms": 1.25,

@@ -5748,6 +5748,14 @@ class OpenAICompletionEngine:
         ragged_prefill_graphs = getattr(model, "_ragged_prefill_logits_graphs", None)
         if isinstance(ragged_prefill_graphs, Mapping):
             record["runtime_prefill_graph_cache_live_entries"] = len(ragged_prefill_graphs)
+            live_shape_counts = _ragged_prefill_graph_cache_live_shape_counts(
+                ragged_prefill_graphs,
+                limit=64,
+            )
+            if live_shape_counts:
+                record["runtime_prefill_graph_cache_live_shape_counts"] = (
+                    live_shape_counts
+                )
         for attr_name, record_name in (
             (
                 "_ragged_prefill_logits_graph_evictions",
@@ -14497,6 +14505,52 @@ def _generation_cache_shape_limits(cache: object) -> tuple[int | None, int | Non
     except (TypeError, ValueError):
         rows = None
     return max_seq_len, rows
+
+
+def _ragged_prefill_graph_cache_live_shape_counts(
+    graphs: Mapping[object, object],
+    *,
+    limit: int,
+) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for key in graphs:
+        shape_key = _ragged_prefill_graph_cache_live_shape_key(key)
+        counts[shape_key] = counts.get(shape_key, 0) + 1
+    top_counts = sorted(counts.items(), key=lambda item: (-item[1], item[0]))[:limit]
+    return {shape_key: count for shape_key, count in top_counts}
+
+
+def _ragged_prefill_graph_cache_live_shape_key(key: object) -> str:
+    if not isinstance(key, tuple) or len(key) < 10:
+        return "ragged_prefill:unknown"
+    return (
+        "ragged_prefill:"
+        f"b{_profile_key_part(key[1])}:"
+        f"s{_profile_key_part(key[2])}:"
+        f"rows{1 if bool(key[4]) else 0}:"
+        f"ctx{_profile_key_part(key[5])}:"
+        f"copy{_profile_key_part(key[6])}:"
+        f"src{_profile_key_part(key[7])}:"
+        f"max{_profile_key_part(key[3])}:"
+        f"fp8{_ragged_prefill_precision_profile_key(key[8])}:"
+        f"ar{_profile_key_part(key[9])}"
+    )
+
+
+def _ragged_prefill_precision_profile_key(value: object) -> str:
+    if isinstance(value, tuple) and all(isinstance(item, bool) for item in value):
+        if len(value) == 1:
+            return "1" if value[0] else "0"
+        enabled = sum(1 for item in value if item)
+        return f"{enabled}/{len(value)}"
+    return _profile_key_part(value)
+
+
+def _profile_key_part(value: object) -> str:
+    text = str(value).replace(" ", "")
+    if len(text) <= 48:
+        return text
+    return f"{text[:45]}..."
 
 
 def _generation_cache_fits_shape(cache: object, *, max_seq_len: int, total_rows: int) -> bool:
