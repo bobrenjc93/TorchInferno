@@ -267,6 +267,28 @@ mixed-prefix run above. Do not promote the mixed-prefix policy by itself; any
 default-scope attempt must address prefix-row capacity and cross-workload memory
 first.
 
+A full TorchInferno-only pass with the explicit greedy-large mixed-prefix policy
+and `TORCHINFERNO_OPENAI_TP_ONLINE_PREFIX_ROWS=112` on pushed `6ee6704`
+(`agent_space/ti_full_mixed_p112_results_0703/.../runs/20260703_121754`)
+landed at few_shot `168.3 / 47.9 / 206.1ms`, self_consistency
+`179.7 / 0.0 / 195.1ms`, multi_turn `234.2 / 73.4 / 305.4ms`,
+tree_of_thought `134.8 / 44.4 / 161.6ms`, and long_output
+`254.6 / 24.6 / 1135.0ms`. The multi_turn median TTFT/E2E improvement is real
+versus both the public default row (`303.7 / 60.2 / 358.6ms`) and the current
+default-head control (`331.4 / 59.0 / 386.1ms`), but TPOT and tails stay weak
+(`590.5 / 318.4 / 779.2ms` p99). The adjacent workloads were not catastrophic,
+but they were not a broad win either: few_shot stayed in family, tree_of_thought
+kept E2E in family with worse TPOT, self_consistency was slower than the public
+row, and long_output remained close to the local default while still far behind
+vLLM. Queue profiles used `112` prefix rows for few_shot, tree_of_thought, and
+multi_turn, `16` for self_consistency, and `80` for long_output. The multi_turn
+record still showed `38` prefill batches, `2.60s` prefill forward, `99` decode
+calls, route `{"common_prefix":125,"request_prompt":875}`, and `6.07s` phase
+time; long_output still spent `10.15s` in decode GPU across `741` decode calls.
+This validates the opt-in multi_turn median improvement, but not a broad
+default. Promoting it would need an adjacent same-head all-workload control and
+either a TPOT/tail fix or an explicit workload-scoped selection rule.
+
 Bucketed ragged-decode cache-token loop bounds are rejected as a default for
 long_output. The first env probe only changed the paged graph metadata path and
 therefore did not affect the dense long-output path:
