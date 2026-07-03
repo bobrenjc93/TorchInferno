@@ -324,6 +324,25 @@ This validates the opt-in multi_turn median improvement, but not a broad
 default. Promoting it would need an adjacent same-head all-workload control and
 either a TPOT/tail fix or an explicit workload-scoped selection rule.
 
+A same-head scoped-default recheck on pushed `c5c2664` is also rejected. The
+candidate made the greedy-large mixed-prefix policy default-on only for
+deterministic requests with `400 < max_tokens <= 512`, and raised online prefix
+rows to `112` only when that policy matched. The focused multi_turn run
+`agent_space/ti_multi_scoped_mixed_default_range_0703/.../runs/20260703_142156`
+landed at `241.6 / 71.7 / 309.6ms`, `981/1000` correct, confirming the
+selection rule did route to the intended mixed-prefix path (`max_active=32`,
+`prefix_rows=112`, `39/0` prefill graph hits/misses, no request captures). The
+full-suite run
+`agent_space/ti_full_scoped_mixed_default_range_0703/.../runs/20260703_142825`
+did not hold up: few_shot `170.5 / 49.8 / 210.8ms`, self_consistency
+`201.1 / 0.0 / 216.9ms`, multi_turn `313.9 / 83.3 / 398.3ms`,
+tree_of_thought `132.6 / 34.8 / 157.5ms`, and long_output
+`243.1 / 24.8 / 1070.3ms`. That multi_turn row is worse than the adjacent
+current-head full control (`298.3 / 58.9 / 349.4ms`) and the scoped policy also
+regressed adjacent medians enough to reject the default. Keep the greedy-large
+mixed-prefix policy explicit; do not promote a max-token/temperature scoped
+default until a full-suite run beats the same-head default control.
+
 Reducing the explicit greedy-large mixed-prefix active set is rejected. The
 probe kept the same opt-in policy and `112` prefix rows but added
 `TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_MAX_ACTIVE=24`
