@@ -103,6 +103,32 @@ spent `2.73s` in prefill wall, including `2.25s` forward, `156ms` sampling,
 tokens inside `20,784` graph tokens. This confirms the sampled-medium tree gap
 is mostly padded prefix-suffix graph compute rather than host setup or sampling.
 
+An opt-in one-shot CUDA profiler is available for the actual ragged
+prefix-prefill body:
+`TORCHINFERNO_PROFILE_RAGGED_PREFILL_ONCE=1`. Unlike the older
+`TORCHINFERNO_PROFILE_PREFILL_ONCE` hook, this targets the
+`try_prefill_ragged_logits_graph` body used by common-prefix suffix prefill. It
+defaults to `TORCHINFERNO_PROFILE_RAGGED_PREFILL_MIN_BATCH=32` so tiny startup
+warmups do not consume the profile slot unless explicitly requested. This is a
+diagnostic hook only; it should be used to locate the next prefill sink before
+changing default runtime policy.
+
+That hook found the hot sampled tree shape running as
+`batch=32 suffix=16 context_len=-64`: the one-shot CUDA profile spent
+`40.5ms` total, including `14.8ms` in GEMMs, `12.9ms` in TP all-reduces, and
+`5.7ms` under math SDPA. Forcing exact positive contexts with
+`TORCHINFERNO_CONTINUOUS_DYNAMIC_PREFIX_PREFILL_GRAPH=0` in
+`agent_space/ti_tree_exact_context_results/.../runs/20260703_015312` improved
+tree to `135.1 / 28.6 / 164.4ms`, `960/992` correct, with zero request-path
+captures and the dominant `prefix_graph:b32:s16:p45-45:src1:mixed0` forward
+time down to `1.25s`. The default policy now uses exact prefix-suffix context
+for sampled common-prefix prefill while preserving the greedy short-output
+dynamic bucket path that helped few_shot/long_output. The no-env confirmation
+run
+`agent_space/ti_tree_sampled_exact_default_results/.../runs/20260703_020000`
+landed at `135.2 / 28.4 / 159.0ms`, `964/992` correct, again with zero
+request-path prefill captures and `1.25s` in the hot b32 prefix-graph forward.
+
 An opt-in suffix-bucket split is available as
 `TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SPLIT_SUFFIX_BUCKETS=1`, but it is
 rejected as a default for tree. The focused A/B

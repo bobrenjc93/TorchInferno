@@ -5049,6 +5049,20 @@ class Llama3TensorParallelForCausalLM:
         )
         if src_prefix_row is not None:
             src_prefix_row = src_prefix_row.to(self.device, non_blocking=True)
+        profiled = self._maybe_profile_ragged_prefill_once(
+            input_ids,
+            cache,
+            start_positions,
+            write_positions,
+            row_indices,
+            rotary,
+            logit_positions,
+            context_len,
+            src_prefix_row,
+            prefix_copy_len,
+        )
+        if profiled is not None:
+            return profiled
         return self._forward_prefill_ragged_static(
             input_ids,
             cache,
@@ -5257,6 +5271,18 @@ class Llama3TensorParallelForCausalLM:
         self._copy_ragged_prefill_graph_inputs(
             captured, input_ids, seq_lens, row_indices, logit_positions, src_prefix_row
         )
+        self._maybe_profile_ragged_prefill_once(
+            captured.static_input_ids,
+            cache,
+            captured.static_start_positions,
+            captured.static_write_positions,
+            captured.static_row_indices,
+            (captured.static_rotary_cos, captured.static_rotary_sin),
+            captured.static_logit_positions,
+            context_len,
+            captured.static_src_prefix_row,
+            prefix_copy_len,
+        )
         stream = torch.cuda.Stream(device=self.device)
         stream.wait_stream(torch.cuda.current_stream(self.device))
         with torch.cuda.stream(stream):
@@ -5288,6 +5314,82 @@ class Llama3TensorParallelForCausalLM:
             )
         captured.graph.replay()
         return captured
+
+    def _maybe_profile_ragged_prefill_once(
+        self,
+        input_ids: Tensor,
+        cache: Llama3TensorParallelCache,
+        start_positions: Tensor,
+        write_positions: Tensor,
+        row_indices: Tensor | None,
+        rotary: tuple[Tensor, Tensor],
+        logit_positions: Tensor,
+        context_len: int | None = None,
+        src_prefix_row: Tensor | None = None,
+        prefix_copy_len: int | None = None,
+    ) -> Tensor | None:
+        if (
+            not env_flag("TORCHINFERNO_PROFILE_RAGGED_PREFILL_ONCE", False)
+            or getattr(self, "_ragged_prefill_profiled", False)
+            or input_ids.device.type != "cuda"
+        ):
+            return None
+        min_batch = env_int("TORCHINFERNO_PROFILE_RAGGED_PREFILL_MIN_BATCH", 32, minimum=1)
+        if input_ids.size(0) < min_batch:
+            return None
+        self._ragged_prefill_profiled = True
+        rank = getattr(self, "rank", 0)
+        if rank != 0:
+            # The profiled body contains TP collectives. Every rank must execute
+            # the same extra forward; only rank 0 pays for profiler collection.
+            return self._forward_prefill_ragged_static(
+                input_ids,
+                cache,
+                start_positions,
+                write_positions,
+                row_indices,
+                rotary,
+                logit_positions,
+                context_len,
+                src_prefix_row,
+                prefix_copy_len,
+            )
+        try:
+            import sys as _rpp
+            from torch.profiler import ProfilerActivity as _PA
+            from torch.profiler import profile as _tprof
+
+            torch.cuda.synchronize(self.device)
+            with _tprof(activities=[_PA.CPU, _PA.CUDA]) as prof:
+                output = self._forward_prefill_ragged_static(
+                    input_ids,
+                    cache,
+                    start_positions,
+                    write_positions,
+                    row_indices,
+                    rotary,
+                    logit_positions,
+                    context_len,
+                    src_prefix_row,
+                    prefix_copy_len,
+                )
+                torch.cuda.synchronize(self.device)
+            src_rows = int(src_prefix_row.numel()) if src_prefix_row is not None else 0
+            row_limit = env_int("TORCHINFERNO_PROFILE_RAGGED_PREFILL_ROW_LIMIT", 24, minimum=1)
+            print(
+                f"[RAGGED_PREFILL_PROF] batch={input_ids.size(0)} "
+                f"suffix={input_ids.size(1)} "
+                f"context_len={context_len if context_len is not None else 'none'} "
+                f"src_rows={src_rows} "
+                f"prefix_copy_len={prefix_copy_len if prefix_copy_len is not None else 'none'}\n"
+                + prof.key_averages().table(sort_by="cuda_time_total", row_limit=row_limit),
+                file=_rpp.stderr,
+                flush=True,
+            )
+            return output
+        except Exception as exc:
+            warn_optional_failure("llama3_tensor_parallel.ragged_prefill_profile", exc)
+            return None
 
     def _copy_ragged_prefill_graph_inputs(
         self,

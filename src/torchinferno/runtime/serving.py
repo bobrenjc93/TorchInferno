@@ -146,7 +146,9 @@ def _dynamic_prefix_prefill_max_suffix_for_policy(
 ) -> int | None:
     if "TORCHINFERNO_CONTINUOUS_DYNAMIC_PREFIX_PREFILL_MAX_SUFFIX" in os.environ:
         return None
-    if temperature > 0.0 or max_tokens is None or int(max_tokens) <= 0:
+    if temperature > 0.0:
+        return 0
+    if max_tokens is None or int(max_tokens) <= 0:
         return None
     short_max_tokens = env_int(
         "TORCHINFERNO_CONTINUOUS_DYNAMIC_PREFIX_PREFILL_GREEDY_SHORT_MAX_TOKENS",

@@ -53,10 +53,21 @@ def test_dynamic_prefix_prefill_policy_extends_short_greedy_suffixes(monkeypatch
 
     assert _dynamic_prefix_prefill_max_suffix_for_policy(0.0, 512) is None
     assert _dynamic_prefix_prefill_context_len(111, 128, max_seq_len=512) == 239
-    assert _dynamic_prefix_prefill_max_suffix_for_policy(0.7, 82) is None
+    sampled_suffix = _dynamic_prefix_prefill_max_suffix_for_policy(0.7, 82)
+    assert sampled_suffix == 0
+    assert (
+        _dynamic_prefix_prefill_context_len(
+            45,
+            16,
+            max_seq_len=512,
+            max_dynamic_suffix=sampled_suffix,
+        )
+        == 61
+    )
 
     monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_DYNAMIC_PREFIX_PREFILL_MAX_SUFFIX", "64")
     assert _dynamic_prefix_prefill_max_suffix_for_policy(0.0, 82) is None
+    assert _dynamic_prefix_prefill_max_suffix_for_policy(0.7, 82) is None
     assert _dynamic_prefix_prefill_context_len(111, 64, max_seq_len=512) == -256
     assert _dynamic_prefix_prefill_context_len(111, 128, max_seq_len=512) == 239
 
