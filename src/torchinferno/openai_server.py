@@ -5743,6 +5743,10 @@ class OpenAICompletionEngine:
             return
         stats = getattr(runtime_engine, "stats", None)
         record: dict[str, object] = {"event": event, **fields}
+        include_shape_details = (
+            event != "online_batcher_progress"
+            or env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_PROFILE_PROGRESS_SHAPES", False)
+        )
         cache = getattr(runtime_engine, "_cache", None)
         if cache is not None:
             cache_max_seq_len, cache_rows = _generation_cache_shape_limits(cache)
@@ -5754,34 +5758,35 @@ class OpenAICompletionEngine:
         ragged_prefill_graphs = getattr(model, "_ragged_prefill_logits_graphs", None)
         if isinstance(ragged_prefill_graphs, Mapping):
             record["runtime_prefill_graph_cache_live_entries"] = len(ragged_prefill_graphs)
-            live_shape_counts = _ragged_prefill_graph_cache_live_shape_counts(
-                ragged_prefill_graphs,
-                limit=64,
-            )
-            if live_shape_counts:
-                record["runtime_prefill_graph_cache_live_shape_counts"] = (
-                    live_shape_counts
+            if include_shape_details:
+                live_shape_counts = _ragged_prefill_graph_cache_live_shape_counts(
+                    ragged_prefill_graphs,
+                    limit=64,
                 )
-            live_batch_counts = _ragged_prefill_graph_cache_live_dimension_counts(
-                ragged_prefill_graphs,
-                index=1,
-                prefix="b",
-                limit=64,
-            )
-            if live_batch_counts:
-                record["runtime_prefill_graph_cache_live_batch_counts"] = (
-                    live_batch_counts
+                if live_shape_counts:
+                    record["runtime_prefill_graph_cache_live_shape_counts"] = (
+                        live_shape_counts
+                    )
+                live_batch_counts = _ragged_prefill_graph_cache_live_dimension_counts(
+                    ragged_prefill_graphs,
+                    index=1,
+                    prefix="b",
+                    limit=64,
                 )
-            live_suffix_counts = _ragged_prefill_graph_cache_live_dimension_counts(
-                ragged_prefill_graphs,
-                index=2,
-                prefix="s",
-                limit=64,
-            )
-            if live_suffix_counts:
-                record["runtime_prefill_graph_cache_live_suffix_counts"] = (
-                    live_suffix_counts
+                if live_batch_counts:
+                    record["runtime_prefill_graph_cache_live_batch_counts"] = (
+                        live_batch_counts
+                    )
+                live_suffix_counts = _ragged_prefill_graph_cache_live_dimension_counts(
+                    ragged_prefill_graphs,
+                    index=2,
+                    prefix="s",
+                    limit=64,
                 )
+                if live_suffix_counts:
+                    record["runtime_prefill_graph_cache_live_suffix_counts"] = (
+                        live_suffix_counts
+                    )
         for attr_name, record_name in (
             (
                 "_ragged_prefill_logits_graph_evictions",
@@ -5961,124 +5966,125 @@ class OpenAICompletionEngine:
             value = getattr(stats, name, None)
             if isinstance(value, (int, float)):
                 record[f"runtime_{name}"] = value
-        for name in (
-            "prefix_reuse_route_counts",
-            "prefix_reuse_hit_token_counts",
-            "prefill_shape_counts",
-            "prefill_graph_capture_shape_counts",
-            "decode_graph_capture_shape_counts",
-            "decode_graph_miss_shape_counts",
-            "decode_shape_counts",
-            "full_prompt_store_skip_reason_counts",
-            "full_prompt_store_skip_reason_tokens",
-            "prefill_shape_active_requests",
-            "prefill_shape_model_rows",
-            "prefill_shape_active_tokens",
-            "prefill_shape_model_tokens",
-            "prefill_shape_route_counts",
-            "prefill_shape_route_active_tokens",
-            "prefill_shape_route_reuse_tokens",
-            "decode_many_shape_model_tokens",
-            "decode_many_shape_padded_tokens",
-            "decode_many_shape_emitted_tokens",
-            "decode_many_shape_skipped_tokens",
-            "decode_many_shape_stop_finishes",
-            "decode_many_shape_limit_finishes",
-        ):
-            value = getattr(stats, name, None)
-            if isinstance(value, Mapping):
-                limit = (
-                    64
-                    if name == "decode_shape_counts" or name.startswith("decode_many_shape_")
-                    else 32
-                )
-                top_counts = sorted(
-                    value.items(),
-                    key=lambda item: (-int(item[1]), str(item[0])),
-                )[:limit]
-                record[f"runtime_{name}"] = {str(key): int(count) for key, count in top_counts}
-
-        prefill_padding_tokens, prefill_shape_padding_tokens = (
-            _positive_shape_token_deltas(
-                "prefill_shape_model_tokens",
+        if include_shape_details:
+            for name in (
+                "prefix_reuse_route_counts",
+                "prefix_reuse_hit_token_counts",
+                "prefill_shape_counts",
+                "prefill_graph_capture_shape_counts",
+                "decode_graph_capture_shape_counts",
+                "decode_graph_miss_shape_counts",
+                "decode_shape_counts",
+                "full_prompt_store_skip_reason_counts",
+                "full_prompt_store_skip_reason_tokens",
+                "prefill_shape_active_requests",
+                "prefill_shape_model_rows",
                 "prefill_shape_active_tokens",
-                limit=32,
-            )
-        )
-        if prefill_padding_tokens:
-            record["runtime_prefill_padding_tokens"] = prefill_padding_tokens
-            record["runtime_prefill_shape_padding_tokens"] = (
-                prefill_shape_padding_tokens
-            )
-            (
-                prefill_row_padding_tokens,
-                prefill_shape_row_padding_tokens,
-                prefill_suffix_padding_tokens,
-                prefill_shape_suffix_padding_tokens,
-            ) = _prefill_padding_breakdown(limit=32)
-            if prefill_row_padding_tokens:
-                record["runtime_prefill_row_padding_tokens"] = (
-                    prefill_row_padding_tokens
-                )
-                record["runtime_prefill_shape_row_padding_tokens"] = (
-                    prefill_shape_row_padding_tokens
-                )
-            if prefill_suffix_padding_tokens:
-                record["runtime_prefill_suffix_padding_tokens"] = (
-                    prefill_suffix_padding_tokens
-                )
-                record["runtime_prefill_shape_suffix_padding_tokens"] = (
-                    prefill_shape_suffix_padding_tokens
-                )
-        decode_many_padding_tokens, decode_many_shape_padding_tokens = (
-            _positive_shape_token_deltas(
+                "prefill_shape_model_tokens",
+                "prefill_shape_route_counts",
+                "prefill_shape_route_active_tokens",
+                "prefill_shape_route_reuse_tokens",
+                "decode_many_shape_model_tokens",
                 "decode_many_shape_padded_tokens",
-                "decode_many_shape_model_tokens",
-                limit=64,
-            )
-        )
-        if decode_many_padding_tokens:
-            record["runtime_decode_many_padding_tokens"] = (
-                decode_many_padding_tokens
-            )
-            record["runtime_decode_many_shape_padding_tokens"] = (
-                decode_many_shape_padding_tokens
-            )
-        decode_many_overgenerated_tokens, decode_many_shape_overgenerated_tokens = (
-            _positive_shape_token_deltas(
-                "decode_many_shape_model_tokens",
                 "decode_many_shape_emitted_tokens",
-                limit=64,
+                "decode_many_shape_skipped_tokens",
+                "decode_many_shape_stop_finishes",
+                "decode_many_shape_limit_finishes",
+            ):
+                value = getattr(stats, name, None)
+                if isinstance(value, Mapping):
+                    limit = (
+                        64
+                        if name == "decode_shape_counts" or name.startswith("decode_many_shape_")
+                        else 32
+                    )
+                    top_counts = sorted(
+                        value.items(),
+                        key=lambda item: (-int(item[1]), str(item[0])),
+                    )[:limit]
+                    record[f"runtime_{name}"] = {str(key): int(count) for key, count in top_counts}
+
+            prefill_padding_tokens, prefill_shape_padding_tokens = (
+                _positive_shape_token_deltas(
+                    "prefill_shape_model_tokens",
+                    "prefill_shape_active_tokens",
+                    limit=32,
+                )
             )
-        )
-        if decode_many_overgenerated_tokens:
-            record["runtime_decode_many_overgenerated_tokens"] = (
-                decode_many_overgenerated_tokens
+            if prefill_padding_tokens:
+                record["runtime_prefill_padding_tokens"] = prefill_padding_tokens
+                record["runtime_prefill_shape_padding_tokens"] = (
+                    prefill_shape_padding_tokens
+                )
+                (
+                    prefill_row_padding_tokens,
+                    prefill_shape_row_padding_tokens,
+                    prefill_suffix_padding_tokens,
+                    prefill_shape_suffix_padding_tokens,
+                ) = _prefill_padding_breakdown(limit=32)
+                if prefill_row_padding_tokens:
+                    record["runtime_prefill_row_padding_tokens"] = (
+                        prefill_row_padding_tokens
+                    )
+                    record["runtime_prefill_shape_row_padding_tokens"] = (
+                        prefill_shape_row_padding_tokens
+                    )
+                if prefill_suffix_padding_tokens:
+                    record["runtime_prefill_suffix_padding_tokens"] = (
+                        prefill_suffix_padding_tokens
+                    )
+                    record["runtime_prefill_shape_suffix_padding_tokens"] = (
+                        prefill_shape_suffix_padding_tokens
+                    )
+            decode_many_padding_tokens, decode_many_shape_padding_tokens = (
+                _positive_shape_token_deltas(
+                    "decode_many_shape_padded_tokens",
+                    "decode_many_shape_model_tokens",
+                    limit=64,
+                )
             )
-            record["runtime_decode_many_shape_overgenerated_tokens"] = (
-                decode_many_shape_overgenerated_tokens
+            if decode_many_padding_tokens:
+                record["runtime_decode_many_padding_tokens"] = (
+                    decode_many_padding_tokens
+                )
+                record["runtime_decode_many_shape_padding_tokens"] = (
+                    decode_many_shape_padding_tokens
+                )
+            decode_many_overgenerated_tokens, decode_many_shape_overgenerated_tokens = (
+                _positive_shape_token_deltas(
+                    "decode_many_shape_model_tokens",
+                    "decode_many_shape_emitted_tokens",
+                    limit=64,
+                )
             )
-        for name in (
-            "prefill_shape_wall_ms",
-            "prefill_shape_copy_ms",
-            "prefill_shape_setup_ms",
-            "prefill_shape_forward_ms",
-            "prefill_shape_sample_ms",
-            "prefill_shape_state_ms",
-            "decode_shape_model_ms",
-            "decode_shape_gpu_ms",
-            "decode_shape_cpu_tokens_ms",
-        ):
-            value = getattr(stats, name, None)
-            if isinstance(value, Mapping):
-                limit = 64 if name.startswith("decode_shape_") else 32
-                top_timings = sorted(
-                    value.items(),
-                    key=lambda item: (-float(item[1]), str(item[0])),
-                )[:limit]
-                record[f"runtime_{name}"] = {
-                    str(key): float(elapsed_ms) for key, elapsed_ms in top_timings
-                }
+            if decode_many_overgenerated_tokens:
+                record["runtime_decode_many_overgenerated_tokens"] = (
+                    decode_many_overgenerated_tokens
+                )
+                record["runtime_decode_many_shape_overgenerated_tokens"] = (
+                    decode_many_shape_overgenerated_tokens
+                )
+            for name in (
+                "prefill_shape_wall_ms",
+                "prefill_shape_copy_ms",
+                "prefill_shape_setup_ms",
+                "prefill_shape_forward_ms",
+                "prefill_shape_sample_ms",
+                "prefill_shape_state_ms",
+                "decode_shape_model_ms",
+                "decode_shape_gpu_ms",
+                "decode_shape_cpu_tokens_ms",
+            ):
+                value = getattr(stats, name, None)
+                if isinstance(value, Mapping):
+                    limit = 64 if name.startswith("decode_shape_") else 32
+                    top_timings = sorted(
+                        value.items(),
+                        key=lambda item: (-float(item[1]), str(item[0])),
+                    )[:limit]
+                    record[f"runtime_{name}"] = {
+                        str(key): float(elapsed_ms) for key, elapsed_ms in top_timings
+                    }
         self._record_queue_profile(record)
 
     def _reset_stream_group_profile_extra(self) -> None:

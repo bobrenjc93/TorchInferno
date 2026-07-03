@@ -378,6 +378,20 @@ change should reduce or overlap the `5s` prefill plus `10s` decode pipeline; do
 not reopen global drain-quantum, waiting decode-many, cache-token bucket, or
 intermediate prefill-bucket defaults from this profile alone.
 
+Queue-profile progress snapshots now omit heavy per-shape maps by default while
+keeping scalar counters in progress records and preserving full shape detail in
+quiescent/final records. `TORCHINFERNO_OPENAI_TP_ONLINE_PROFILE_PROGRESS_SHAPES=1`
+restores the previous verbose progress behavior for investigations that need
+mid-run shape detail. A focused long_output confirmation with the lighter
+progress records
+(`agent_space/ti_long_light_progress_profile_results_0703/.../runs/20260703_130650`)
+landed at `248.7 / 24.7 / 1146.5ms`, `1000/1000` correct. The queue profile
+file shrank from the adjacent default's `~772KB` to `~189KB`, but the final
+profile stayed in the same performance shape: `64` prefill batches,
+`5.20s/5.66s` prefill forward/wall, `733` decode model calls, `10.06s` decode
+GPU, and `106` decode-many calls over `488` steps. Keep this as diagnostics
+hygiene, not a score-facing long_output fix.
+
 Decode-many padding is now separated from stop-tail overgeneration in queue
 profiles. The focused current-head long_output run
 `agent_space/ti_long_decodemany_padding_profile_results_0703/.../runs/20260703_102544`

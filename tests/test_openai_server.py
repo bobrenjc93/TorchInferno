@@ -13752,6 +13752,56 @@ def test_openai_queue_profile_records_runtime_engine_stats(
     ]
 
 
+def test_openai_queue_profile_progress_skips_shape_details_by_default(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile_path = tmp_path / "queue-profile.jsonl"
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_QUEUE_PROFILE_JSONL", str(profile_path))
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_PROFILE_PROGRESS_SHAPES", raising=False)
+    engine = _cache_only_engine()
+
+    class Stats:
+        prefill_batches = 2
+        prefill_shape_counts = {"prefix_graph:b8:s16:p45-45:src1:mixed0": 3}
+        prefill_shape_active_requests = {"prefix_graph:b8:s16:p45-45:src1:mixed0": 3}
+        prefill_shape_model_rows = {"prefix_graph:b8:s16:p45-45:src1:mixed0": 4}
+        prefill_shape_active_tokens = {"prefix_graph:b8:s16:p45-45:src1:mixed0": 31}
+        prefill_shape_model_tokens = {"prefix_graph:b8:s16:p45-45:src1:mixed0": 48}
+        prefill_shape_forward_ms = {"prefix_graph:b8:s16:p45-45:src1:mixed0": 9.75}
+
+    class Model:
+        _ragged_prefill_logits_graphs = {
+            (101, 8, 16, 4096, True, -1, -1, 1, (False,), 64): object(),
+        }
+
+    class RuntimeEngine:
+        stats = Stats()
+        model = Model()
+
+    engine._record_runtime_engine_queue_profile("online_batcher_progress", RuntimeEngine())
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_PROFILE_PROGRESS_SHAPES", "1")
+    engine._record_runtime_engine_queue_profile("online_batcher_progress", RuntimeEngine())
+
+    first, second = [json.loads(line) for line in profile_path.read_text().splitlines()]
+    assert first["runtime_prefill_batches"] == 2
+    assert first["runtime_prefill_graph_cache_live_entries"] == 1
+    assert "runtime_prefill_shape_counts" not in first
+    assert "runtime_prefill_shape_padding_tokens" not in first
+    assert "runtime_prefill_graph_cache_live_shape_counts" not in first
+
+    assert second["runtime_prefill_batches"] == 2
+    assert second["runtime_prefill_shape_counts"] == {
+        "prefix_graph:b8:s16:p45-45:src1:mixed0": 3,
+    }
+    assert second["runtime_prefill_shape_padding_tokens"] == {
+        "prefix_graph:b8:s16:p45-45:src1:mixed0": 17,
+    }
+    assert second["runtime_prefill_graph_cache_live_shape_counts"] == {
+        "ragged_prefill:b8:s16:rows1:ctx-1:copy-1:src1:max4096:fp80:ar64": 1,
+    }
+
+
 def test_openai_stream_group_sync_policy_uses_emitted_tokens(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("TORCHINFERNO_OPENAI_BATCH_EARLY_RESTART", "0")
     monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_COMMAND_CUDA_SYNC", raising=False)
