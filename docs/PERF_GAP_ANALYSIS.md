@@ -7019,6 +7019,20 @@ time rose to `5.80s` versus the current full-run control's `91` decode batches,
 `1.49s` decode GPU, and `5.41s` phase time. Keep the current scoped
 sampled-medium prefill-ready policy (`active_cap=10`).
 
+Current `32c4aed` focused tree rechecks do not justify changing that cap. The
+same-conditions no-env control wrote
+`agent_space/ti_tree_default_32c4aed_results/.../8xH100-local-ti-tree-default-32c4aed-20260703/runs/20260703_003459`
+and landed at `150.8 / 44.8 / 178.4ms`, `959/992` correct. Lowering the cap to
+`6` wrote
+`agent_space/ti_tree_prbd_cap6_results/.../8xH100-local-ti-tree-prbd-cap6-20260703/runs/20260703_002431`
+and regressed TPOT/E2E to `59.7 / 179.7ms`; the queue profile showed more
+decode batches (`87 -> 101`) and higher ragged decode GPU (`1.39s -> 1.64s`).
+Raising the cap to `16` wrote
+`agent_space/ti_tree_prbd_cap16_results/.../8xH100-local-ti-tree-prbd-cap16-20260703/runs/20260703_002932`
+and improved TTFT/E2E slightly to `147.0 / 175.1ms`, but regressed TPOT to
+`46.7ms` and p99 E2E to `738.8ms` while adding prefill work and one decode graph
+miss. Keep cap `10`.
+
 A current-head TorchInferno-only full refresh on pushed `401888a` wrote
 `agent_space/ti_current_full_results/.../8xH100/runs/20260702_132520`.
 The rows were few_shot `170.4 / 50.1 / 211.0ms`, self_consistency
@@ -7104,6 +7118,20 @@ but it increased decode-many calls (`105 -> 143`) and active decode-many model
 tokens (`28.7k -> 30.3k`). Keep the cap as an opt-in profiling/tuning hook only;
 the default should stay q8 drain without tail splitting until there is a
 narrower policy that improves E2E and tails together.
+
+A narrower tail split based on active rows was also rejected on current head. A
+temporary opt-in guard limiting the same 4-step stop tail cap to active counts
+`<=32` wrote
+`agent_space/ti_long_tailcap4_active32_results/.../8xH100-local-ti-long-tailcap4-active32-20260703/runs/20260703_004155`
+and finished 1000/1000 correct, but landed at `260.3 / 23.8 / 1107.7ms` with
+p99 E2E `2077.3ms`. It fired only once (`1` tail-limited call, `4` deferred
+steps), so it was too narrow to affect the dominant work. Raising the guard to
+`<=48` wrote
+`agent_space/ti_long_tailcap4_active48_results/.../8xH100-local-ti-long-tailcap4-active48-20260703/runs/20260703_004744`
+and also preserved correctness, but regressed to `260.5 / 23.9 / 1143.2ms` with
+p99 E2E `1922.0ms`. Do not add a tail-active guard by default; the long-output
+gap remains decode throughput and prefill/decode pipeline structure, not a
+simple stop-tail limiter.
 
 The same full run also confirms that multi_turn's remaining TTFT/E2E gap is not
 a missing default env flip. It still has `34` prefill batches, `34/0` prefill
