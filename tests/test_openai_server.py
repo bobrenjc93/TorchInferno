@@ -13636,6 +13636,14 @@ def test_openai_queue_profile_records_runtime_engine_stats(
             "runtime_prefill_shape_padding_tokens": {
                 "prefix_graph:b8:s16:p45-45:src1:mixed0": 17,
             },
+            "runtime_prefill_row_padding_tokens": 12,
+            "runtime_prefill_shape_row_padding_tokens": {
+                "prefix_graph:b8:s16:p45-45:src1:mixed0": 12,
+            },
+            "runtime_prefill_suffix_padding_tokens": 5,
+            "runtime_prefill_shape_suffix_padding_tokens": {
+                "prefix_graph:b8:s16:p45-45:src1:mixed0": 5,
+            },
             "runtime_prefill_tokens": 17,
             "runtime_decode_shape_counts": {"ragged:b8/8": 5},
             "runtime_decode_shape_model_ms": {"ragged:b8/8": 11.0},

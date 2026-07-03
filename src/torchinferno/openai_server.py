@@ -5791,6 +5791,55 @@ class OpenAICompletionEngine:
             deltas.sort(key=lambda item: (-item[1], item[0]))
             return total, {shape: delta for shape, delta in deltas[:limit]}
 
+        def _prefill_padding_breakdown(
+            *,
+            limit: int,
+        ) -> tuple[int, dict[str, int], int, dict[str, int]]:
+            model_tokens = getattr(stats, "prefill_shape_model_tokens", None)
+            active_tokens = getattr(stats, "prefill_shape_active_tokens", None)
+            model_rows = getattr(stats, "prefill_shape_model_rows", None)
+            active_requests = getattr(stats, "prefill_shape_active_requests", None)
+            if not all(
+                isinstance(value, Mapping)
+                for value in (model_tokens, active_tokens, model_rows, active_requests)
+            ):
+                return 0, {}, 0, {}
+
+            row_total = 0
+            suffix_total = 0
+            row_deltas: list[tuple[str, int]] = []
+            suffix_deltas: list[tuple[str, int]] = []
+            for key, model_token_count in model_tokens.items():
+                model_count = int(model_token_count)
+                active_count = int(active_tokens.get(key, 0))
+                padding = model_count - active_count
+                if padding <= 0:
+                    continue
+                model_row_count = int(model_rows.get(key, 0))
+                active_request_count = int(active_requests.get(key, 0))
+                row_padding = 0
+                if model_row_count > 0 and model_count % model_row_count == 0:
+                    suffix_width = model_count // model_row_count
+                    padded_rows = max(0, model_row_count - active_request_count)
+                    row_padding = min(padding, padded_rows * suffix_width)
+                suffix_padding = padding - row_padding
+                shape = str(key)
+                if row_padding > 0:
+                    row_total += row_padding
+                    row_deltas.append((shape, row_padding))
+                if suffix_padding > 0:
+                    suffix_total += suffix_padding
+                    suffix_deltas.append((shape, suffix_padding))
+
+            row_deltas.sort(key=lambda item: (-item[1], item[0]))
+            suffix_deltas.sort(key=lambda item: (-item[1], item[0]))
+            return (
+                row_total,
+                {shape: count for shape, count in row_deltas[:limit]},
+                suffix_total,
+                {shape: count for shape, count in suffix_deltas[:limit]},
+            )
+
         for name in (
             "prefill_model_calls",
             "prefill_batches",
@@ -5912,6 +5961,26 @@ class OpenAICompletionEngine:
             record["runtime_prefill_shape_padding_tokens"] = (
                 prefill_shape_padding_tokens
             )
+            (
+                prefill_row_padding_tokens,
+                prefill_shape_row_padding_tokens,
+                prefill_suffix_padding_tokens,
+                prefill_shape_suffix_padding_tokens,
+            ) = _prefill_padding_breakdown(limit=32)
+            if prefill_row_padding_tokens:
+                record["runtime_prefill_row_padding_tokens"] = (
+                    prefill_row_padding_tokens
+                )
+                record["runtime_prefill_shape_row_padding_tokens"] = (
+                    prefill_shape_row_padding_tokens
+                )
+            if prefill_suffix_padding_tokens:
+                record["runtime_prefill_suffix_padding_tokens"] = (
+                    prefill_suffix_padding_tokens
+                )
+                record["runtime_prefill_shape_suffix_padding_tokens"] = (
+                    prefill_shape_suffix_padding_tokens
+                )
         decode_many_overgenerated_tokens, decode_many_shape_overgenerated_tokens = (
             _positive_shape_token_deltas(
                 "decode_many_shape_model_tokens",

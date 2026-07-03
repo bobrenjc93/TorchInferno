@@ -7499,6 +7499,10 @@ model-vs-emitted token maps. These are reporting-only fields computed while
 writing the profile JSONL; they do not change scheduling, graph keys, kernels,
 or serving behavior. Use them to rank the next packed/ragged prefill and decode
 overlap work instead of inferring waste by hand from multiple shape counters.
+The prefill profile now also splits that padding into
+`runtime_prefill_row_padding_tokens` and
+`runtime_prefill_suffix_padding_tokens` with per-shape maps, so batch-bucket
+padding and uneven suffix padding can be evaluated independently.
 
 A focused current-head run after adding those counters wrote
 `agent_space/ti_waste_counters_results_0703/.../8xH100-local-ti-waste-counters-20260703/runs/20260703_061357`
