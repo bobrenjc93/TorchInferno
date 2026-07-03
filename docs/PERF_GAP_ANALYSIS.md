@@ -7395,6 +7395,19 @@ queue profiles now expose `runtime_prefill_graph_cache_live_entries`,
 `runtime_prefill_graph_cache_evictions`, and
 `runtime_prefill_graph_cache_evicted_entries` so the next bucket/graph-cache
 iteration can distinguish shape-key misses from graph-cache eviction directly.
+Changing the ragged prefill graph cache to evict one oldest graph at a time
+instead of clearing the entire cache improves the opt-in bucket failure mode but
+still does not make intermediate buckets a default. The follow-up
+`agent_space/ti_long_batch_buckets_fifoevict_results_0703/.../8xH100-local-ti-long-batch-buckets-fifoevict-20260703/runs/20260703_065635`
+finished 1000/1000 correct and landed at `251.7 / 24.8 / 1157.0ms`. Request
+captures dropped from `16` to `4`, capture time dropped from `16.0s` to
+`4.5s`, and the profile reported `128/128` live graph entries with `36`
+one-entry evictions. A no-env control on the same change wrote
+`agent_space/ti_long_fifoevict_default_results_0703/.../8xH100-local-ti-long-fifoevict-default-20260703/runs/20260703_070242`
+and stayed capture-free (`0` evictions, `0` request captures), landing at
+`256.2 / 24.7 / 1139.0ms`. Keep intermediate buckets opt-in; the graph-cache
+policy change is useful guardrail behavior, not enough to offset the added
+prefill shape cost.
 
 Warm-row prefix-copy skipping is rejected as a default. An opt-in diagnostic
 hook (`TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SKIP_WARM_PREFIX_COPY=1`) tracks

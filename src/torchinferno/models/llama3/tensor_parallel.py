@@ -5232,11 +5232,11 @@ class Llama3TensorParallelForCausalLM:
                 key not in self._ragged_prefill_logits_graphs
                 and len(self._ragged_prefill_logits_graphs) >= max_graphs
             ):
-                self._ragged_prefill_logits_graph_evictions += 1
-                self._ragged_prefill_logits_graph_evicted_entries += (
-                    len(self._ragged_prefill_logits_graphs)
-                )
-                self._ragged_prefill_logits_graphs.clear()
+                evicted_key = next(iter(self._ragged_prefill_logits_graphs), None)
+                if evicted_key is not None:
+                    self._ragged_prefill_logits_graph_evictions += 1
+                    self._ragged_prefill_logits_graph_evicted_entries += 1
+                    del self._ragged_prefill_logits_graphs[evicted_key]
             self._ragged_prefill_logits_graphs[key] = new_captured
             captured = new_captured
             self._last_ragged_prefill_graph_captured = True
