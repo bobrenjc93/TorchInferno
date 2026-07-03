@@ -183,6 +183,31 @@ via `TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SPLIT_SUFFIX_BUCKETS=1` or
 the automatic default should stay off until it reproduces against the public
 no-split baseline.
 
+A full TorchInferno-only refresh on pushed `18104cd`
+(`agent_space/ti_full_18104cd_results/.../runs/20260703_000109`) landed at
+few_shot `165.8 / 49.9 / 206.3ms`, self_consistency
+`174.7 / 0.0 / 186.1ms`, multi_turn `308.7 / 62.1 / 362.4ms`,
+tree_of_thought `150.0 / 54.9 / 183.6ms`, and long_output
+`253.4 / 24.6 / 1078.6ms`, with correctness in the normal bands. The queue
+profiles keep the priority unchanged: multi_turn reused only the `45` token
+common prefix and spent `4.30s` in prefill forward; tree spent `2.15s` in
+prefill forward plus `1.46s` in ragged-decode GPU; long_output spent `5.20s`
+in prefill forward plus `10.45s` in ragged-decode GPU.
+
+Rechecking sampled decode-many under the current sampled-medium q2 policy does
+not change the default. Enabling
+`TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_DECODE_MANY=1` alone for focused tree
+(`agent_space/ti_tree_sampled_decode_many_q2_results/.../runs/20260703_000807`)
+landed at `148.7 / 46.6 / 176.1ms`, but the queue profile showed
+`use_decode_many=true` with `runtime_decode_many_calls=0`, so the row movement
+was run noise rather than the intended mechanism. Allowing decode-many while
+waiting made the mechanism fire, but regressed the row:
+`agent_space/ti_tree_sampled_decode_many_wait_q2_results/.../runs/20260703_001318`
+landed at `154.3 / 64.7 / 193.3ms`. It ran `32` decode-many calls over `64`
+steps, spent `1.90s` in ragged-decode GPU, and skipped `330/732` decode-many
+model tokens after stop finishes. Keep sampled decode-many and waiting
+decode-many off by default for tree.
+
 A narrower decode-many-while-waiting policy is also rejected and not in source.
 The temporary patch allowed decode-many only while the ready queue was below the
 same refill floor that would admit the next prefill wave, trying to reduce
