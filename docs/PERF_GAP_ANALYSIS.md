@@ -1,27 +1,40 @@
 # TorchInferno vs vLLM/sglang — Performance Gap Analysis (Llama-3.1-70B, 8xH100)
 
-## Public 20260703_010234 refresh and paged-prefix cache blocker
+## Public 20260703_110206 refresh and active-row rejection
 
 The latest public all-provider run at
-`results/v1/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100/runs/20260703_010234`
-was published with inference-bench `fe3e4cf5`. It measured TorchInferno
-`5e433fe`, vLLM `4c3c64f`, and SGLang `05bc3f2`. The TorchInferno commit is
-behind the current local/pushed head by the sampled exact-context tree change
-and opt-in diagnostics, but the vLLM/SGLang rows are still the relevant target.
-The score split was vLLM `11`, TorchInferno `5`, and SGLang `3`.
+`results/v1/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100/runs/20260703_110206`
+measured TorchInferno `3927cf1`, vLLM `a14f57a`, and SGLang `42acfd1`.
+The TorchInferno commit is behind the current local/pushed head by the sampled
+exact-context tree change and opt-in diagnostics, but the vLLM/SGLang rows are
+still the relevant target. The score split was vLLM `11`, TorchInferno `5`,
+and SGLang `3`.
 
 Rows as TTFT / TPOT / E2E:
 
-- few_shot: vLLM `155.2 / 56.3 / 205.8ms`, SGLang
-  `142.7 / 76.4 / 220.6ms`, TorchInferno `156.0 / 47.4 / 200.0ms`.
-- self_consistency: vLLM `210.2 / 0.0 / 233.5ms`, SGLang
-  `233.4 / 0.0 / 384.4ms`, TorchInferno `154.3 / 0.0 / 166.0ms`.
-- multi_turn: vLLM `174.9 / 54.0 / 225.6ms`, SGLang
-  `161.4 / 112.2 / 270.8ms`, TorchInferno `303.7 / 60.2 / 358.6ms`.
-- tree_of_thought: vLLM `63.4 / 30.6 / 86.5ms`, SGLang
-  `71.4 / 75.8 / 151.7ms`, TorchInferno `136.6 / 39.8 / 162.6ms`.
-- long_output: vLLM `78.4 / 15.1 / 621.6ms`, SGLang
-  `72.5 / 21.6 / 805.8ms`, TorchInferno `252.5 / 21.2 / 966.4ms`.
+- few_shot: vLLM `142.7 / 52.1 / 189.7ms`, SGLang
+  `141.1 / 83.2 / 218.4ms`, TorchInferno `148.5 / 45.5 / 187.1ms`.
+- self_consistency: vLLM `218.4 / 0.0 / 244.1ms`, SGLang
+  `217.9 / 0.0 / 380.3ms`, TorchInferno `146.0 / 0.0 / 155.2ms`.
+- multi_turn: vLLM `176.9 / 57.6 / 231.6ms`, SGLang
+  `163.0 / 112.2 / 269.4ms`, TorchInferno `296.9 / 59.6 / 347.5ms`.
+- tree_of_thought: vLLM `62.7 / 30.0 / 87.0ms`, SGLang
+  `74.6 / 79.5 / 158.8ms`, TorchInferno `129.0 / 40.9 / 155.3ms`.
+- long_output: vLLM `79.1 / 15.1 / 627.2ms`, SGLang
+  `77.4 / 22.6 / 834.1ms`, TorchInferno `228.4 / 20.9 / 915.7ms`.
+
+The latest TorchInferno public queue profiles keep the same remaining shape:
+few_shot and self_consistency are competitive, while multi_turn, tree, and
+long_output still trail vLLM/SGLang on prefix reuse, first-token scheduling, and
+decode throughput. Public multi_turn used `max_active=32`, `prefix_rows=64`,
+`decode_quantum=16`, and only the common-prefix route
+(`{"common_prefix":1000}`); it spent `4.06s` in prefill forward, `4.22s` in
+prefill wall, and `826ms` in decode GPU across `85` decode calls. Public
+long_output used `max_active=64`, `prefix_rows=64`, `decode_quantum=3` with a
+q8 drain, spent `4.50s` in prefill forward, and then paid `9.10s` decode GPU
+over `803` decode calls / `105` decode-many calls. vLLM still reports chunked
+prefill plus prefix-cache hit rates in the `65-86%` range, while SGLang uses
+RadixCache and graph-captured prefill/decode.
 
 The queue profile now records why per-request full-prompt prefixes are not
 stored. A focused current-head TorchInferno multi_turn profile on the local
@@ -274,7 +287,7 @@ landed at few_shot `168.3 / 47.9 / 206.1ms`, self_consistency
 `179.7 / 0.0 / 195.1ms`, multi_turn `234.2 / 73.4 / 305.4ms`,
 tree_of_thought `134.8 / 44.4 / 161.6ms`, and long_output
 `254.6 / 24.6 / 1135.0ms`. The multi_turn median TTFT/E2E improvement is real
-versus both the public default row (`303.7 / 60.2 / 358.6ms`) and the current
+versus both the public default row (`296.9 / 59.6 / 347.5ms`) and the current
 default-head control (`331.4 / 59.0 / 386.1ms`), but TPOT and tails stay weak
 (`590.5 / 318.4 / 779.2ms` p99). The adjacent workloads were not catastrophic,
 but they were not a broad win either: few_shot stayed in family, tree_of_thought
@@ -288,6 +301,20 @@ time; long_output still spent `10.15s` in decode GPU across `741` decode calls.
 This validates the opt-in multi_turn median improvement, but not a broad
 default. Promoting it would need an adjacent same-head all-workload control and
 either a TPOT/tail fix or an explicit workload-scoped selection rule.
+
+Reducing the explicit greedy-large mixed-prefix active set is rejected. The
+probe kept the same opt-in policy and `112` prefix rows but added
+`TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_MAX_ACTIVE=24`
+(`agent_space/ti_multi_mixed_active24_results_0703/.../runs/20260703_124801`).
+It landed at `1431.2 / 60.8 / 1473.5ms`, p99 E2E `2065.4ms`, and `983/1000`
+correct. The queue profile still adopted all `1000` full prompts and routed
+`{"common_prefix":125,"request_prompt":875}`, but the lower active cap forced
+`45` submit/prefill batches, raised prefill forward/wall to
+`18.42s/18.68s`, and pushed queue-to-submit p50 to `922ms` before the first
+token p50 reached `1391ms`. Decode did not become a useful win either
+(`97` decode calls, `1.58s` decode GPU). Keep active `32` for this opt-in
+policy; the remaining multi_turn lever is cheaper request-prompt replay or
+better prefill/decode overlap, not smaller active waves.
 
 A focused tree_of_thought A/B on pushed `2719235` separates prefix-row capacity
 from the mixed-prefix full-pass noise. The no-env control
@@ -475,8 +502,8 @@ A debug rerun on pushed commit `5089f09` wrote
 and measured `232.4 / 72.8 / 304.8ms`, `981/1000` correct. Saved response text
 shows the misses are ordinary arithmetic failures under load, such as
 `68 * 88 =` producing `5994` instead of `5984` and integer division prompts
-emitting decimal approximations. The public 20260703_010234 multi_turn
-correctness rates are TorchInferno `0.979`, vLLM `0.981`, and SGLang `0.980`,
+emitting decimal approximations. The public 20260703_110206 multi_turn
+correctness rates are TorchInferno `0.983`, vLLM `0.980`, and SGLang `0.980`,
 so the remaining correctness rate is not unique to the mixed-prefix cache path.
 
 Do not promote that exact env set as the inference-bench provider default.
