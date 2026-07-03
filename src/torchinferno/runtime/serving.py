@@ -341,11 +341,19 @@ class ServingStats:
     generated_prefix_store_requests: int = 0
     generated_prefix_reuse_requests: int = 0
     generated_prefix_reuse_tokens: int = 0
+    full_prompt_store_requests: int = 0
+    full_prompt_store_stored_requests: int = 0
+    full_prompt_store_deferred_requests: int = 0
+    full_prompt_store_deferred_tokens: int = 0
+    full_prompt_store_skipped_requests: int = 0
+    full_prompt_store_skipped_tokens: int = 0
     repeated_sample_state_prepares: int = 0
     repeated_sample_state_hits: int = 0
     repeated_sample_state_tokens: int = 0
     prefix_reuse_route_counts: dict[str, int] = field(default_factory=dict)
     prefix_reuse_hit_token_counts: dict[str, int] = field(default_factory=dict)
+    full_prompt_store_skip_reason_counts: dict[str, int] = field(default_factory=dict)
+    full_prompt_store_skip_reason_tokens: dict[str, int] = field(default_factory=dict)
     prefill_shape_counts: dict[str, int] = field(default_factory=dict)
     prefill_graph_capture_shape_counts: dict[str, int] = field(default_factory=dict)
     decode_graph_capture_shape_counts: dict[str, int] = field(default_factory=dict)
@@ -4291,7 +4299,9 @@ class ContinuousBatchEngine:
         *,
         allow_pinned: bool = False,
     ) -> None:
+        self.stats.full_prompt_store_requests += 1
         if not self.store_full_prompt_prefixes:
+            self._record_full_prompt_store_skip("disabled", tokens)
             return
         if self.pin_shared_prefix and not allow_pinned:
             # Per-request full-prompt stores would starve the prefix-row pool.
@@ -4300,8 +4310,11 @@ class ContinuousBatchEngine:
             # can still match. A long-output opt-in below enables this for
             # multi-turn style workloads where one full-prompt row can save a
             # much larger next-turn suffix prefill.
+            self._record_full_prompt_store_skip("pinned_without_allowance", tokens)
             return
         if self._delayed_pinned_full_prompt_store_allowed(allow_pinned=allow_pinned):
+            self.stats.full_prompt_store_deferred_requests += 1
+            self.stats.full_prompt_store_deferred_tokens += len(tokens)
             return
         store_logits = True
         if allow_pinned:
@@ -4318,6 +4331,25 @@ class ContinuousBatchEngine:
             source_row,
             logits,
             store_logits=store_logits,
+        )
+        if request_id in self.reusable_prefixes:
+            self.stats.full_prompt_store_stored_requests += 1
+        else:
+            self._record_full_prompt_store_skip("prefix_row_unavailable_or_store_disabled", tokens)
+
+    def _record_full_prompt_store_skip(self, reason: str, tokens: tuple[int, ...]) -> None:
+        self.stats.full_prompt_store_skipped_requests += 1
+        self.stats.full_prompt_store_skipped_tokens += len(tokens)
+        if not self.profile_timings:
+            return
+        self._record_shape_count(
+            self.stats.full_prompt_store_skip_reason_counts,
+            reason,
+        )
+        self._record_shape_total(
+            self.stats.full_prompt_store_skip_reason_tokens,
+            reason,
+            len(tokens),
         )
 
     def _store_delayed_pinned_full_prompt_prefix(self, state: _ActiveRequest) -> bool:

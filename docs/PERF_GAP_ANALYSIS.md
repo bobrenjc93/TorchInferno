@@ -23,6 +23,21 @@ Rows as TTFT / TPOT / E2E:
 - long_output: vLLM `78.4 / 15.1 / 621.6ms`, SGLang
   `72.5 / 21.6 / 805.8ms`, TorchInferno `252.5 / 21.2 / 966.4ms`.
 
+The queue profile now records why per-request full-prompt prefixes are not
+stored. A focused current-head TorchInferno multi_turn profile on the local
+instrumentation
+(`agent_space/ti_multi_fullprompt_stats_results_0703/.../runs/20260703_113444`)
+landed at `298.9 / 59.0 / 353.2ms`, `982/1000` correct. It still reused only
+the shared prefix (`{"common_prefix": 1000}`, `{"45": 1000}`), and the new
+profile counters make the default blocker explicit:
+`runtime_full_prompt_store_requests=1000`,
+`runtime_full_prompt_store_stored_requests=0`, and
+`runtime_full_prompt_store_skip_reason_counts={"pinned_without_allowance":1000}`
+for `114,608` skipped prompt tokens. This confirms the default multi_turn gap
+is policy-limited conversation-prefix reuse rather than an exact lookup miss or
+generated-prefix cache miss; the previously rejected pinned full-prompt and
+mixed-prefix opt-ins still need cheaper batched replay before promotion.
+
 A current-head default TorchInferno-only refresh on `75fee00`
 (`agent_space/ti_default_head_results_0703/.../runs/20260703_055113`) landed
 at few_shot `167.0 / 46.9 / 206.0ms`, self_consistency

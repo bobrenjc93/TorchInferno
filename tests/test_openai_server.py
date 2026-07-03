@@ -13487,6 +13487,14 @@ def test_openai_queue_profile_records_runtime_engine_stats(
         prefill_graph_replay_ms = 1.25
         prefix_reuse_requests = 7
         prefix_reuse_tokens = 53
+        full_prompt_store_requests = 4
+        full_prompt_store_stored_requests = 1
+        full_prompt_store_deferred_requests = 2
+        full_prompt_store_deferred_tokens = 34
+        full_prompt_store_skipped_requests = 1
+        full_prompt_store_skipped_tokens = 17
+        full_prompt_store_skip_reason_counts = {"pinned_without_allowance": 1}
+        full_prompt_store_skip_reason_tokens = {"pinned_without_allowance": 17}
         queued_requests = 11
         scheduler_steps = 6
         max_model_batch_size = 8
@@ -13676,6 +13684,18 @@ def test_openai_queue_profile_records_runtime_engine_stats(
             "runtime_decode_shape_model_ms": {"ragged:b8/8": 11.0},
             "runtime_decode_shape_gpu_ms": {"ragged:b8/8": 10.5},
             "runtime_decode_shape_cpu_tokens_ms": {"ragged:b8/8": 1.25},
+            "runtime_full_prompt_store_deferred_requests": 2,
+            "runtime_full_prompt_store_deferred_tokens": 34,
+            "runtime_full_prompt_store_requests": 4,
+            "runtime_full_prompt_store_skip_reason_counts": {
+                "pinned_without_allowance": 1,
+            },
+            "runtime_full_prompt_store_skip_reason_tokens": {
+                "pinned_without_allowance": 17,
+            },
+            "runtime_full_prompt_store_skipped_requests": 1,
+            "runtime_full_prompt_store_skipped_tokens": 17,
+            "runtime_full_prompt_store_stored_requests": 1,
             "runtime_prefix_reuse_requests": 7,
             "runtime_prefix_reuse_tokens": 53,
             "runtime_queued_requests": 11,
