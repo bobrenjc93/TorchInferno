@@ -107,6 +107,19 @@ emitting decimal approximations. The public 20260703_010234 multi_turn
 correctness rates are TorchInferno `0.979`, vLLM `0.981`, and SGLang `0.980`,
 so the remaining correctness rate is not unique to the mixed-prefix cache path.
 
+Do not promote that exact env set as the inference-bench provider default.
+Full-suite run
+`agent_space/ti_full_warmmixed_results_0430/.../runs/20260703_041927` improved
+multi_turn to `244.9 / 71.2 / 310.4ms`, but regressed few_shot
+(`190.5 / 58.3 / 245.9ms`), self_consistency (`552.0 / 0.0 / 756.9ms`),
+tree_of_thought (`184.9 / 83.2 / 272.8ms`), and long_output
+(`1135.2 / 53.5 / 2665.7ms`). The queue profile shows `31` request-time
+common-prefix prefill captures for `p111/s32,s64,s96`, costing `32.4s`. An
+attempt to warm `111:32,111:64,111:96,122:16` for exact batches `1..32`
+(`agent_space/ti_full_warmmixed_commonwarm_build_0440`) was interrupted after
+roughly six minutes without readiness and with near-full H100 memory use, so
+exhaustive exact-batch common-prefix warmup is too heavy as a default.
+
 ## Public 20260702_140923 refresh and SGLang CLI compatibility
 
 The latest public all-provider run at
