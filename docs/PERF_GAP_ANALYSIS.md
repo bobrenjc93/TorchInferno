@@ -7133,6 +7133,16 @@ p99 E2E `1922.0ms`. Do not add a tail-active guard by default; the long-output
 gap remains decode throughput and prefill/decode pipeline structure, not a
 simple stop-tail limiter.
 
+A full-width drain-quantum variant is also rejected. The probe
+`TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_DRAIN_DECODE_QUANTUM=16` with
+`TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY_STOP_TAIL_MAX_STEPS=8` wrote
+`agent_space/ti_long_fullq16_tail8_results/.../8xH100-local-ti-long-fullq16-tail8-20260703/runs/20260703_010017`
+and completed 1000/1000 correct, but landed at `350.5 / 21.9 / 1107.1ms` with
+p99 E2E `1958.1ms`. The shape-scoped idea did improve median TPOT, but it
+delayed first-token visibility enough to erase the score-facing win. Keep the
+q8 drain default; larger drain commands need an overlap/event-flush design, not
+just a tail limiter.
+
 The same full run also confirms that multi_turn's remaining TTFT/E2E gap is not
 a missing default env flip. It still has `34` prefill batches, `34/0` prefill
 graph hits/misses, and only `{"common_prefix":1000}` / `{"45":1000}` reuse.
