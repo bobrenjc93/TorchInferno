@@ -208,6 +208,18 @@ to `11.51s`, and worsened p99 TPOT to `104.9ms`. Keep
 diagnostic; the long-output gap remains lower steady decode GPU without extra
 graph buckets, or a real prefill/decode/readback pipeline.
 
+Decode-many padding is now separated from stop-tail overgeneration in queue
+profiles. The focused current-head long_output run
+`agent_space/ti_long_decodemany_padding_profile_results_0703/.../runs/20260703_102544`
+landed at `232.8 / 24.2 / 1093.5ms`, `1000/1000` correct. Its final profile
+reported `27.2K` active decode-many model tokens, `30.5K` padded decode-many
+graph slots, `25.4K` emitted decode-many tokens, `1.8K` skipped stop-tail
+tokens, and `3.3K` decode-many padding tokens. Total ragged decode padding was
+`6.6K` tokens, while decode GPU was still `10.19s` and prefill padding was
+`39.1K` tokens (`17.7K` row / `21.4K` suffix). Keep the new counters for
+diagnosis, but do not treat decode-many padding as the main long-output lever;
+the remaining gap is still steady decode GPU plus prefix-suffix prefill waste.
+
 Sampled-medium prefix prefill now has a default `b24` batch bucket. The focused
 env probe with `TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_BATCH_BUCKETS=1,2,4,8,16,24,32`
 and matching warmup wrote

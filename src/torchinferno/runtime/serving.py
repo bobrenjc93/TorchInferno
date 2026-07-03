@@ -276,6 +276,7 @@ class ServingStats:
     decode_many_calls: int = 0
     decode_many_steps: int = 0
     decode_many_model_tokens: int = 0
+    decode_many_padded_tokens: int = 0
     decode_many_emitted_tokens: int = 0
     decode_many_skipped_tokens: int = 0
     decode_many_stop_finishes: int = 0
@@ -284,6 +285,7 @@ class ServingStats:
     decode_many_tail_limited_calls: int = 0
     decode_many_tail_limited_steps: int = 0
     decode_many_shape_model_tokens: dict[str, int] = field(default_factory=dict)
+    decode_many_shape_padded_tokens: dict[str, int] = field(default_factory=dict)
     decode_many_shape_emitted_tokens: dict[str, int] = field(default_factory=dict)
     decode_many_shape_skipped_tokens: dict[str, int] = field(default_factory=dict)
     decode_many_shape_stop_finishes: dict[str, int] = field(default_factory=dict)
@@ -855,9 +857,9 @@ class ContinuousBatchEngine:
 
         self._sync_gpu_last_tokens_from_states(active)
         self._sync_gpu_seq_lens_from_states(active)
-        records: list[tuple[list[_ActiveRequest], int, list[int], list[bool], str | None]] = []
+        records: list[tuple[list[_ActiveRequest], int, list[int], list[bool], str | None, int]] = []
         token_parts: list[Tensor] = []
-        shape_parts: list[tuple[str, int]] = []
+        shape_parts: list[tuple[str, int, int]] = []
         steps_run = 0
 
         while steps_run < max_steps and active and self._can_decode_ragged(active):
@@ -867,9 +869,10 @@ class ContinuousBatchEngine:
             next_token_tensor = self._decode_ragged_batch_token_tensor(states)
             token_parts.append(next_token_tensor[: len(states)].detach().clone())
             shape_key: str | None = None
+            shape_model_tokens = int(next_token_tensor.numel())
             if self.profile_timings:
                 shape_key = f"decode_many:b{len(states)}/{int(next_token_tensor.numel())}"
-                shape_parts.append((shape_key, len(states)))
+                shape_parts.append((shape_key, len(states), shape_model_tokens))
 
             state_update_start_s = time.perf_counter() if self.profile_timings else 0.0
             generated_after: list[int] = []
@@ -887,7 +890,7 @@ class ContinuousBatchEngine:
                     next_active.append(state)
             if self.profile_timings:
                 self.stats.decode_ragged_state_update_ms += (time.perf_counter() - state_update_start_s) * 1000.0
-            records.append((states, step, generated_after, finished_by_limit, shape_key))
+            records.append((states, step, generated_after, finished_by_limit, shape_key, shape_model_tokens))
             active = next_active
             steps_run += 1
 
@@ -895,19 +898,20 @@ class ContinuousBatchEngine:
             return [], 0
 
         model_tokens = sum(part.numel() for part in token_parts)
+        padded_model_tokens = sum(record[5] for record in records)
         cpu_tokens_start_s = time.perf_counter() if self.profile_timings else 0.0
         flat_tokens = torch.cat(token_parts).detach().cpu().tolist()
         if self.profile_timings:
             cpu_elapsed_ms = (time.perf_counter() - cpu_tokens_start_s) * 1000.0
             self.stats.decode_ragged_cpu_tokens_ms += cpu_elapsed_ms
             self.stats.decode_many_cpu_tokens_ms += cpu_elapsed_ms
-            shape_token_count = sum(token_count for _shape_key, token_count in shape_parts)
+            shape_token_count = sum(active_count for _shape_key, active_count, _model_count in shape_parts)
             if shape_token_count > 0:
-                for shape_key, token_count in shape_parts:
+                for shape_key, active_count, _model_count in shape_parts:
                     self._record_shape_time(
                         self.stats.decode_shape_cpu_tokens_ms,
                         shape_key,
-                        cpu_elapsed_ms * (token_count / shape_token_count),
+                        cpu_elapsed_ms * (active_count / shape_token_count),
                     )
             self._flush_decode_ragged_model_gpu_timers()
 
@@ -917,7 +921,7 @@ class ContinuousBatchEngine:
         stop_finishes = 0
         limit_finishes = 0
         offset = 0
-        for states, step, generated_after, finished_by_limit, shape_key in records:
+        for states, step, generated_after, finished_by_limit, shape_key, shape_model_tokens in records:
             row_tokens = flat_tokens[offset : offset + len(states)]
             offset += len(states)
             record_emitted_tokens = 0
@@ -966,6 +970,11 @@ class ContinuousBatchEngine:
                     len(states),
                 )
                 self._record_shape_total(
+                    self.stats.decode_many_shape_padded_tokens,
+                    shape_key,
+                    shape_model_tokens,
+                )
+                self._record_shape_total(
                     self.stats.decode_many_shape_emitted_tokens,
                     shape_key,
                     record_emitted_tokens,
@@ -989,6 +998,7 @@ class ContinuousBatchEngine:
         self.stats.decode_many_calls += 1
         self.stats.decode_many_steps += steps_run
         self.stats.decode_many_model_tokens += int(model_tokens)
+        self.stats.decode_many_padded_tokens += int(padded_model_tokens)
         self.stats.decode_many_emitted_tokens += len(events)
         self.stats.decode_many_skipped_tokens += skipped_tokens
         self.stats.decode_many_stop_finishes += stop_finishes

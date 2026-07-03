@@ -5861,6 +5861,7 @@ class OpenAICompletionEngine:
             "decode_many_calls",
             "decode_many_steps",
             "decode_many_model_tokens",
+            "decode_many_padded_tokens",
             "decode_many_emitted_tokens",
             "decode_many_skipped_tokens",
             "decode_many_stop_finishes",
@@ -5931,6 +5932,7 @@ class OpenAICompletionEngine:
             "prefill_shape_active_tokens",
             "prefill_shape_model_tokens",
             "decode_many_shape_model_tokens",
+            "decode_many_shape_padded_tokens",
             "decode_many_shape_emitted_tokens",
             "decode_many_shape_skipped_tokens",
             "decode_many_shape_stop_finishes",
@@ -5981,6 +5983,20 @@ class OpenAICompletionEngine:
                 record["runtime_prefill_shape_suffix_padding_tokens"] = (
                     prefill_shape_suffix_padding_tokens
                 )
+        decode_many_padding_tokens, decode_many_shape_padding_tokens = (
+            _positive_shape_token_deltas(
+                "decode_many_shape_padded_tokens",
+                "decode_many_shape_model_tokens",
+                limit=64,
+            )
+        )
+        if decode_many_padding_tokens:
+            record["runtime_decode_many_padding_tokens"] = (
+                decode_many_padding_tokens
+            )
+            record["runtime_decode_many_shape_padding_tokens"] = (
+                decode_many_shape_padding_tokens
+            )
         decode_many_overgenerated_tokens, decode_many_shape_overgenerated_tokens = (
             _positive_shape_token_deltas(
                 "decode_many_shape_model_tokens",

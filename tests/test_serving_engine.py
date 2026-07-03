@@ -4472,6 +4472,50 @@ def test_continuous_batch_engine_online_many_keeps_decode_tokens_ordered(monkeyp
     assert model.ragged_logits_graph_calls == 3
 
 
+def test_continuous_batch_engine_online_many_shape_model_tokens_include_padding(monkeypatch) -> None:
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY", "1")
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_UNIFORM_RAGGED_DECODE", "1")
+    model = _RaggedGraphToyModel(vocab_size=128)
+    engine = ContinuousBatchEngine(
+        model,
+        device=torch.device("cpu"),
+        max_active_requests=4,
+        prefix_cache_capacity=0,
+        enable_ragged_decode=True,
+        store_reusable_prefixes=False,
+        profile_timings=True,
+    )
+    engine.start_online(max_seq_len=16)
+    for index in range(3):
+        engine.submit_online(
+            ServingRequest(
+                str(index),
+                (index + 1, index + 2, index + 3),
+                3,
+                arrival_step=0,
+            )
+        )
+
+    first = engine.step_online()
+    events, steps = engine.step_online_many(8)
+
+    assert len(first) == 3
+    assert steps == 2
+    assert len(events) == 6
+    assert engine.stats.decode_many_calls == 1
+    assert engine.stats.decode_many_steps == 2
+    assert engine.stats.decode_many_model_tokens == 6
+    assert engine.stats.decode_many_padded_tokens == 8
+    assert engine.stats.decode_many_emitted_tokens == 6
+    assert engine.stats.decode_many_shape_model_tokens == {"decode_many:b3/4": 6}
+    assert engine.stats.decode_many_shape_padded_tokens == {"decode_many:b3/4": 8}
+    assert engine.stats.decode_many_shape_emitted_tokens == {"decode_many:b3/4": 6}
+    assert engine.stats.ragged_decode_active_tokens == 6
+    assert engine.stats.ragged_decode_padding_tokens == 2
+    assert not engine.has_online_work()
+    assert model.ragged_logits_graph_calls == 2
+
+
 def test_continuous_batch_engine_online_many_can_decode_before_waiting_admission(monkeypatch) -> None:
     monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_UNIFORM_RAGGED_DECODE", "1")
     model = _RaggedGraphToyModel(vocab_size=128)

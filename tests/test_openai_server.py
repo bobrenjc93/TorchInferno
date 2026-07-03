@@ -13455,6 +13455,7 @@ def test_openai_queue_profile_records_runtime_engine_stats(
         decode_many_calls = 2
         decode_many_steps = 6
         decode_many_model_tokens = 19
+        decode_many_padded_tokens = 24
         decode_many_emitted_tokens = 15
         decode_many_skipped_tokens = 4
         decode_many_stop_finishes = 3
@@ -13463,6 +13464,7 @@ def test_openai_queue_profile_records_runtime_engine_stats(
         decode_many_tail_limited_calls = 4
         decode_many_tail_limited_steps = 9
         decode_many_shape_model_tokens = {"decode_many:b8/8": 19}
+        decode_many_shape_padded_tokens = {"decode_many:b8/8": 24}
         decode_many_shape_emitted_tokens = {"decode_many:b8/8": 15}
         decode_many_shape_skipped_tokens = {"decode_many:b8/8": 4}
         decode_many_shape_stop_finishes = {"decode_many:b8/8": 3}
@@ -13561,6 +13563,7 @@ def test_openai_queue_profile_records_runtime_engine_stats(
             "runtime_decode_many_emitted_tokens": 15,
             "runtime_decode_many_limit_finishes": 2,
             "runtime_decode_many_model_tokens": 19,
+            "runtime_decode_many_padded_tokens": 24,
             "runtime_decode_many_skipped_tokens": 4,
             "runtime_decode_many_steps": 6,
             "runtime_decode_many_stop_finishes": 3,
@@ -13568,10 +13571,13 @@ def test_openai_queue_profile_records_runtime_engine_stats(
             "runtime_decode_many_tail_limited_calls": 4,
             "runtime_decode_many_tail_limited_steps": 9,
             "runtime_decode_many_shape_model_tokens": {"decode_many:b8/8": 19},
+            "runtime_decode_many_shape_padded_tokens": {"decode_many:b8/8": 24},
             "runtime_decode_many_shape_emitted_tokens": {"decode_many:b8/8": 15},
             "runtime_decode_many_shape_skipped_tokens": {"decode_many:b8/8": 4},
             "runtime_decode_many_shape_stop_finishes": {"decode_many:b8/8": 3},
             "runtime_decode_many_shape_limit_finishes": {"decode_many:b8/8": 2},
+            "runtime_decode_many_padding_tokens": 5,
+            "runtime_decode_many_shape_padding_tokens": {"decode_many:b8/8": 5},
             "runtime_decode_many_overgenerated_tokens": 4,
             "runtime_decode_many_shape_overgenerated_tokens": {"decode_many:b8/8": 4},
             "runtime_decode_model_calls": 5,
