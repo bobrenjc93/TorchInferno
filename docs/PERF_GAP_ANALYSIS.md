@@ -220,6 +220,19 @@ tokens, and `3.3K` decode-many padding tokens. Total ragged decode padding was
 diagnosis, but do not treat decode-many padding as the main long-output lever;
 the remaining gap is still steady decode GPU plus prefix-suffix prefill waste.
 
+Async decode-many CPU token copy is also rejected. A local opt-in patch copied
+each decode-many token tensor to pinned CPU memory on a side CUDA stream and
+synchronized only at the final flattened readback. The focused run
+`agent_space/ti_long_async_cpu_tokens_results_0703/.../runs/20260703_104620`
+landed at `274.3 / 24.3 / 1103.5ms`, `1000/1000` correct. The internal
+`runtime_decode_many_cpu_tokens_ms` counter moved in the intended direction
+(`21.3ms -> 9.0ms` versus the adjacent no-env profile), but total phase time,
+prefill wall, and decode GPU time were all worse (`17.88s -> 18.79s`,
+`5.54s -> 5.67s`, and `10.19s -> 10.69s`). Keep decode-many token readback on
+the simpler synchronous path; the CPU readback bucket is too small to justify a
+side stream and per-step pinned allocation without a broader decode pipeline
+change.
+
 Ragged-prefill graph cache hits now refresh eviction order, but the intermediate
 long_output batch buckets remain opt-in. The current-head LRU stress run with
 `TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_BATCH_BUCKETS=1,2,4,8,16,24,32`
