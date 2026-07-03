@@ -1,40 +1,45 @@
 # TorchInferno vs vLLM/sglang — Performance Gap Analysis (Llama-3.1-70B, 8xH100)
 
-## Public 20260703_110206 refresh and active-row rejection
+## Public 20260703_130210 refresh and active-row rejection
 
 The latest public all-provider run at
-`results/v1/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100/runs/20260703_110206`
-measured TorchInferno `3927cf1`, vLLM `a14f57a`, and SGLang `42acfd1`.
-The TorchInferno commit is behind the current local/pushed head by the sampled
-exact-context tree change and opt-in diagnostics, but the vLLM/SGLang rows are
-still the relevant target. The score split was vLLM `11`, TorchInferno `5`,
-and SGLang `3`.
+`results/v1/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100/runs/20260703_130210`
+measured TorchInferno `4be1a2f`, vLLM `978de83`, and SGLang `1058d00`.
+The TorchInferno commit predates the current pushed head's queue-profile
+diagnostics, same-host long-output probes, and greedy-short `b24`/`192` prefill
+graph-cache default, but the vLLM/SGLang rows remain the relevant target. The
+score split was vLLM `10`, TorchInferno `6`, and SGLang `3`.
 
 Rows as TTFT / TPOT / E2E:
 
-- few_shot: vLLM `142.7 / 52.1 / 189.7ms`, SGLang
-  `141.1 / 83.2 / 218.4ms`, TorchInferno `148.5 / 45.5 / 187.1ms`.
-- self_consistency: vLLM `218.4 / 0.0 / 244.1ms`, SGLang
-  `217.9 / 0.0 / 380.3ms`, TorchInferno `146.0 / 0.0 / 155.2ms`.
-- multi_turn: vLLM `176.9 / 57.6 / 231.6ms`, SGLang
-  `163.0 / 112.2 / 269.4ms`, TorchInferno `296.9 / 59.6 / 347.5ms`.
-- tree_of_thought: vLLM `62.7 / 30.0 / 87.0ms`, SGLang
-  `74.6 / 79.5 / 158.8ms`, TorchInferno `129.0 / 40.9 / 155.3ms`.
-- long_output: vLLM `79.1 / 15.1 / 627.2ms`, SGLang
-  `77.4 / 22.6 / 834.1ms`, TorchInferno `228.4 / 20.9 / 915.7ms`.
+- few_shot: vLLM `144.7 / 51.4 / 191.7ms`, SGLang
+  `141.1 / 77.2 / 217.4ms`, TorchInferno `148.8 / 46.8 / 189.1ms`.
+- self_consistency: vLLM `204.4 / 0.0 / 229.7ms`, SGLang
+  `215.2 / 0.0 / 367.5ms`, TorchInferno `154.5 / 0.0 / 162.3ms`.
+- multi_turn: vLLM `177.5 / 55.1 / 226.9ms`, SGLang
+  `163.0 / 103.5 / 270.0ms`, TorchInferno `312.1 / 60.7 / 365.5ms`.
+- tree_of_thought: vLLM `62.1 / 29.9 / 84.1ms`, SGLang
+  `73.3 / 57.2 / 138.7ms`, TorchInferno `127.9 / 27.0 / 148.4ms`.
+- long_output: vLLM `81.5 / 15.1 / 612.8ms`, SGLang
+  `71.0 / 22.3 / 856.8ms`, TorchInferno `265.6 / 20.7 / 953.3ms`.
 
 The latest TorchInferno public queue profiles keep the same remaining shape:
 few_shot and self_consistency are competitive, while multi_turn, tree, and
 long_output still trail vLLM/SGLang on prefix reuse, first-token scheduling, and
 decode throughput. Public multi_turn used `max_active=32`, `prefix_rows=64`,
 `decode_quantum=16`, and only the common-prefix route
-(`{"common_prefix":1000}`); it spent `4.06s` in prefill forward, `4.22s` in
-prefill wall, and `826ms` in decode GPU across `85` decode calls. Public
-long_output used `max_active=64`, `prefix_rows=64`, `decode_quantum=3` with a
-q8 drain, spent `4.50s` in prefill forward, and then paid `9.10s` decode GPU
-over `803` decode calls / `105` decode-many calls. vLLM still reports chunked
-prefill plus prefix-cache hit rates in the `65-86%` range, while SGLang uses
-RadixCache and graph-captured prefill/decode.
+(`{"common_prefix":1000}`); it spent `4.16s` in prefill forward, `4.33s` in
+prefill wall, and `876ms` in decode GPU across `100` decode calls. Public
+tree_of_thought used the same active/cache shape with `decode_quantum=2`,
+reused only the `45` token common prefix, and spent `1.83s` in prefill forward
+plus `1.74s` in decode GPU. Public long_output used `max_active=64`,
+`prefix_rows=64`, `decode_quantum=3` with a q8 drain, spent `4.52s` in prefill
+forward, and then paid `9.19s` decode GPU over `806` decode calls / `88`
+decode-many calls. The public prefill graph cache was not thrashing
+(`121/128` live entries and zero evictions), so these rows still point at
+scheduling/reuse/decode work rather than cache churn. vLLM still reports
+chunked prefill plus prefix caching, while SGLang uses RadixCache and
+graph-captured prefill/decode.
 
 The queue profile now records why per-request full-prompt prefixes are not
 stored. A focused current-head TorchInferno multi_turn profile on the local
