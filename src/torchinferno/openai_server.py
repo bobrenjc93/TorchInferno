@@ -1406,6 +1406,10 @@ def _online_greedy_common_prefix_suffix_prefill_warmup_batches(
     configured = os.environ.get("TORCHINFERNO_OPENAI_WARMUP_ONLINE_GREEDY_COMMON_PREFIX_SUFFIX_BATCHES")
     if configured is not None:
         batches = _parse_positive_int_csv(configured)
+    elif "TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_BATCH_BUCKETS" in os.environ:
+        batches = _parse_positive_int_csv(
+            os.environ["TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_BATCH_BUCKETS"]
+        )
     else:
         batches = _default_prefix_prefill_batch_buckets(
             warmup_temperature,
