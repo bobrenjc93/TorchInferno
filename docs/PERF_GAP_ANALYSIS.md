@@ -240,6 +240,20 @@ multi_turn attempt should reduce request-prompt prefill/decode interleaving or
 make those request-prompt replays cheaper; splitting mixed groups by route is
 unlikely to move enough work by itself.
 
+For the explicit greedy-large mixed-prefix policy, disabling
+prefill-ready-before-decode is accepted as a scoped default. The A/B
+`agent_space/ti_multi_mixed_prbd_off_results_0703/.../runs/20260703_120418`
+used the same mixed-prefix knobs plus
+`TORCHINFERNO_OPENAI_TP_ONLINE_PREFILL_READY_BEFORE_DECODE=0` and landed at
+`228.5 / 69.9 / 295.9ms`, `981/1000` correct. Versus the adjacent
+route-composition run, it reduced prefill batches `39 -> 37`, graph misses
+`2 -> 0`, prefill forward `2.83s -> 2.33s`, decode calls `108 -> 88`,
+scheduler steps `145 -> 124`, and phase time `6.42s -> 5.85s`. Tails worsened
+(`710.9ms` p99 TTFT and `968.8ms` p99 E2E), so this is not a default for the
+normal common-prefix multi_turn path. It is now only the default when the
+explicit `TORCHINFERNO_CONTINUOUS_GREEDY_LARGE_MIXED_PREFIX_REUSE=1` policy is
+selected; global prefill-ready env overrides still win.
+
 Bucketed ragged-decode cache-token loop bounds are rejected as a default for
 long_output. The first env probe only changed the paged graph metadata path and
 therefore did not affect the dense long-output path:

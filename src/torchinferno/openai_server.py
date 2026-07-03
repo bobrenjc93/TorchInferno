@@ -552,6 +552,8 @@ def _online_prefill_ready_before_decode_enabled(*, temperature: float, max_token
         return env_flag(global_env, False)
     if max_tokens < 1:
         return False
+    if _greedy_large_mixed_prefix_reuse_policy_enabled(temperature, max_tokens):
+        return False
     if temperature <= 0.0:
         greedy_short_max_tokens = env_int(
             "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_GEN_MAX_TOKENS",
