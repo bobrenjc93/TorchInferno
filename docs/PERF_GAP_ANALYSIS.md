@@ -41,6 +41,23 @@ scheduling/reuse/decode work rather than cache churn. vLLM still reports
 chunked prefill plus prefix caching, while SGLang uses RadixCache and
 graph-captured prefill/decode.
 
+A current-head TorchInferno-only full-suite validation on pushed `135d127`
+(`agent_space/ti_head_135d127_full_results_0703/.../runs/20260703_135616`)
+exercised the new greedy-short `b24`/`192` prefill-graph defaults without env
+overrides. The run landed at few_shot `167.6 / 48.8 / 207.8ms`,
+self_consistency `186.1 / 0.0 / 232.5ms`, multi_turn
+`298.3 / 58.9 / 349.4ms`, tree_of_thought `130.4 / 30.1 / 154.0ms`, and
+long_output `237.9 / 24.2 / 1053.6ms`, with correctness in the normal bands.
+Queue profiles show the graph-cache-cap fix holding (`130/192` live prefill
+graphs, zero evictions across the full run), so the latest defaults are no
+longer losing to b24 cache churn. The remaining long_output row is still
+decode/prefix-work bound: `61` prefill batches, `4.82s/5.21s`
+prefill forward/wall, `777` decode model calls, `99` decode-many calls over
+`456` steps, and `10.53s` ragged-decode GPU. Multi_turn remains policy-limited
+to the shared `45` token common prefix and skipped all `1000` pinned full-prompt
+stores; it improved versus the public row but still needs non-fragmenting
+conversation-prefix reuse to close the vLLM/SGLang TTFT/E2E gap.
+
 The queue profile now records why per-request full-prompt prefixes are not
 stored. A focused current-head TorchInferno multi_turn profile on the local
 instrumentation
