@@ -316,6 +316,19 @@ token p50 reached `1391ms`. Decode did not become a useful win either
 policy; the remaining multi_turn lever is cheaper request-prompt replay or
 better prefill/decode overlap, not smaller active waves.
 
+Raising prefix rows alone is also rejected for the common-prefix multi_turn
+default path. A current-head focused run with only
+`TORCHINFERNO_OPENAI_TP_ONLINE_PREFIX_ROWS=112`
+(`agent_space/ti_multi_prefix112_common_results_0703/.../runs/20260703_125809`)
+landed at `305.7 / 64.2 / 366.8ms`, p99 E2E `627.5ms`, and `981/1000`
+correct, behind the latest public default row (`296.9 / 59.6 / 347.5ms`). The
+queue profile confirms that extra rows do not help without request-specific
+prefix reuse: routing stayed `{"common_prefix":1000}`, full-prompt stores still
+skipped as `{"pinned_without_allowance":1000}`, and the work stayed in-family at
+`35` prefill batches, `4.02s/4.27s` prefill forward/wall, `86` decode calls,
+and `820ms` decode GPU. Keep the default prefix pool at `64` rows unless it is
+paired with a cheaper full-prompt/mixed-prefix replay path.
+
 A focused tree_of_thought A/B on pushed `2719235` separates prefix-row capacity
 from the mixed-prefix full-pass noise. The no-env control
 (`agent_space/ti_tree_default_2719235_results_0703/.../runs/20260703_122701`)
