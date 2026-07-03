@@ -188,6 +188,15 @@ def test_continuous_prefix_prefill_suffix_buckets_can_be_configured(monkeypatch)
 
 def test_continuous_prefix_prefill_batch_buckets_can_be_configured(monkeypatch) -> None:
     monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_BATCH_BUCKETS", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_BATCH_BUCKETS_GREEDY_SHORT", raising=False)
+    monkeypatch.delenv(
+        "TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_BATCH_BUCKETS_GREEDY_SHORT_MIN_TOKENS",
+        raising=False,
+    )
+    monkeypatch.delenv(
+        "TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_BATCH_BUCKETS_GREEDY_SHORT_MAX_TOKENS",
+        raising=False,
+    )
     monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_BATCH_BUCKETS_SAMPLED_MEDIUM", raising=False)
     monkeypatch.delenv(
         "TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_BATCH_BUCKETS_SAMPLED_MEDIUM_MIN_TOKENS",
@@ -200,6 +209,25 @@ def test_continuous_prefix_prefill_batch_buckets_can_be_configured(monkeypatch) 
     engine = ContinuousBatchEngine(object(), device=torch.device("cpu"), max_active_requests=64)
 
     assert engine._prefill_batch_bucket(17) == 32
+
+    greedy_short_engine = ContinuousBatchEngine(
+        object(),
+        device=torch.device("cpu"),
+        temperature=0.0,
+        max_generation_tokens=96,
+        max_active_requests=64,
+    )
+    assert greedy_short_engine._prefill_batch_bucket(17) == 24
+    assert greedy_short_engine._prefill_batch_bucket(25) == 32
+
+    greedy_mid_engine = ContinuousBatchEngine(
+        object(),
+        device=torch.device("cpu"),
+        temperature=0.0,
+        max_generation_tokens=256,
+        max_active_requests=64,
+    )
+    assert greedy_mid_engine._prefill_batch_bucket(17) == 32
 
     sampled_medium_engine = ContinuousBatchEngine(
         object(),

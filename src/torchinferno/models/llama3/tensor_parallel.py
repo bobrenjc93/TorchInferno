@@ -3365,7 +3365,7 @@ class Llama3TensorParallelForCausalLM:
             except Exception:
                 self._set_cache_seq_len(cache, initial_seq_len)
                 raise
-            max_graphs = _tp_int("TORCHINFERNO_CUDAGRAPH_PREFILL_MAX_GRAPHS", 128, minimum=1)
+            max_graphs = _tp_int("TORCHINFERNO_CUDAGRAPH_PREFILL_MAX_GRAPHS", 192, minimum=1)
             if key not in self._prefill_graphs and len(self._prefill_graphs) >= max_graphs:
                 self._prefill_graphs.clear()
             self._prefill_graphs[key] = captured
@@ -3467,7 +3467,7 @@ class Llama3TensorParallelForCausalLM:
                 raise
             real_end = initial_seq_len + prompt_tokens
             self._set_cache_seq_len(cache, real_end)
-            max_graphs = _tp_int("TORCHINFERNO_CUDAGRAPH_PREFILL_MAX_GRAPHS", 128, minimum=1)
+            max_graphs = _tp_int("TORCHINFERNO_CUDAGRAPH_PREFILL_MAX_GRAPHS", 192, minimum=1)
             if key not in self._prefill_logits_graphs and len(self._prefill_logits_graphs) >= max_graphs:
                 self._prefill_logits_graphs.clear()
             self._prefill_logits_graphs[key] = captured
@@ -3580,7 +3580,7 @@ class Llama3TensorParallelForCausalLM:
                 raise
             real_end = initial_seq_len + prompt_tokens
             self._set_cache_seq_len(cache, real_end)
-            max_graphs = _tp_int("TORCHINFERNO_CUDAGRAPH_PREFILL_MAX_GRAPHS", 128, minimum=1)
+            max_graphs = _tp_int("TORCHINFERNO_CUDAGRAPH_PREFILL_MAX_GRAPHS", 192, minimum=1)
             if (
                 key not in self._prefill_selected_logits_graphs
                 and len(self._prefill_selected_logits_graphs) >= max_graphs
@@ -5390,7 +5390,7 @@ class Llama3TensorParallelForCausalLM:
                         print(f"rank={self.rank} ragged_prefill_mixed_logits_graph_failed={exc!r}", flush=True)
                     return None
                 raise RuntimeError("ragged prefill graph capture failed on at least one rank")
-            max_graphs = _tp_int("TORCHINFERNO_CUDAGRAPH_PREFILL_MAX_GRAPHS", 128, minimum=1)
+            max_graphs = _tp_int("TORCHINFERNO_CUDAGRAPH_PREFILL_MAX_GRAPHS", 192, minimum=1)
             self._ragged_prefill_logits_graph_max_entries = max_graphs
             if (
                 key not in self._ragged_prefill_logits_graphs

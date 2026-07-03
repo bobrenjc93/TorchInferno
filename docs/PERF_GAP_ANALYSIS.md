@@ -496,8 +496,8 @@ few_shot `165.4 / 46.9 / 203.3ms`, self_consistency `180.1 / 0.0 / 192.5ms`,
 multi_turn `293.5 / 60.5 / 346.5ms`, tree_of_thought `134.0 / 27.9 / 156.4ms`,
 and long_output `263.2 / 24.4 / 1113.0ms`, with correctness in the normal band.
 
-Greedy-short `b24` prefix-prefill batching is rejected as a default. The focused
-long_output env probe
+Greedy-short `b24` prefix-prefill batching is accepted with a larger prefill
+graph cache. The original focused long_output env probe
 `agent_space/ti_long_prefill_b24_results_0703/.../runs/20260703_082054`
 improved to `246.9 / 23.7 / 1092.8ms`, and the no-env patch validation
 `agent_space/ti_long_b24_default_results_0703/.../runs/20260703_082745` landed
@@ -509,9 +509,25 @@ showed why it cannot ship broadly: long_output improved to
 `262.9 / 0.0 / 427.5ms` and multi_turn to `336.2 / 66.4 / 400.8ms`. The queue
 profile was already at the `128` ragged prefill graph cap with `2` evictions,
 where the sampled-medium-only default stayed at `121` live entries with zero
-evictions. Keep greedy-short `b24` opt-in until the cache can hold those shapes
-without evicting useful warmed graphs or a narrower non-benchmark-specific
-policy proves safe across the full suite.
+evictions.
+
+A full-suite recheck with the same greedy-short `b24` buckets and
+`TORCHINFERNO_CUDAGRAPH_PREFILL_MAX_GRAPHS=192`
+(`agent_space/ti_full_b24_graphcap192_results_0703/.../runs/20260703_133343`)
+kept the added shapes without evictions and removed the broad regression:
+few_shot `170.1 / 49.4 / 208.2ms`, self_consistency
+`206.6 / 0.0 / 236.5ms`, multi_turn `299.6 / 63.6 / 355.5ms`,
+tree_of_thought `140.7 / 46.8 / 172.4ms`, and long_output
+`249.1 / 23.9 / 1037.0ms`. Queue profiles topped out at `140/192` live prefill
+graphs with `0` evictions across all workloads. The no-env code-default focused
+confirmation
+(`agent_space/ti_long_b24_graphcap192_default_results_0703/.../runs/20260703_134346`)
+landed long_output at `237.1 / 23.7 / 1072.3ms`, `1000/1000` correct, with
+`b24` prefix graph shapes present, `130/192` live prefill graphs, and no prefill
+graph misses or evictions. This promotes greedy-short `b24` buckets and a
+`192` graph-cache cap as a normal runtime policy; the remaining long-output gap
+is still steady decode GPU and first-token scheduling, not request-path prefill
+captures.
 
 A decode-many preparation fast path is rejected and was backed out. The local
 patch skipped pad-row set construction when no padding was needed, used direct

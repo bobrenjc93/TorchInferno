@@ -100,8 +100,28 @@ def _default_prefix_prefill_batch_buckets(
     max_generation_tokens: int | None,
     max_active_requests: int,
 ) -> tuple[int, ...]:
-    if temperature <= 0.0 or max_generation_tokens is None or max_active_requests <= 0:
+    if max_generation_tokens is None or max_active_requests <= 0:
         return ()
+    if temperature <= 0.0:
+        greedy_short_min_tokens = env_int(
+            "TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_BATCH_BUCKETS_GREEDY_SHORT_MIN_TOKENS",
+            1,
+            minimum=0,
+        )
+        greedy_short_max_tokens = env_int(
+            "TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_BATCH_BUCKETS_GREEDY_SHORT_MAX_TOKENS",
+            128,
+            minimum=greedy_short_min_tokens,
+        )
+        if not (greedy_short_min_tokens <= int(max_generation_tokens) <= greedy_short_max_tokens):
+            return ()
+        buckets = _parse_positive_int_csv(
+            os.environ.get(
+                "TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_BATCH_BUCKETS_GREEDY_SHORT",
+                "1,2,4,8,16,24,32",
+            )
+        )
+        return tuple(bucket for bucket in buckets if bucket <= int(max_active_requests))
     sampled_medium_min_tokens = env_int(
         "TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_BATCH_BUCKETS_SAMPLED_MEDIUM_MIN_TOKENS",
         256,
