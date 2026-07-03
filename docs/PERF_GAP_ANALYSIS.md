@@ -244,6 +244,19 @@ raised prefill wall to `8.09s`, and left decode GPU at `10.09s`. Keep LRU
 replacement as a safer graph-cache policy; do not promote the intermediate
 bucket set.
 
+Explicit runtime prefix-prefill batch buckets now also drive greedy
+common-prefix suffix warmup when the warmup-specific batch env is unset. This is
+accepted as opt-in hygiene: an env run should not configure runtime `b24`
+batches and then miss those same graphs during startup. The post-fix
+long_output recheck on pushed `d0e457b` with
+`TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_BATCH_BUCKETS=1,2,4,8,16,24,32`
+(`agent_space/ti_long_b24_warm_buckets_results_0703/.../runs/20260703_110936`)
+removed the previous three request-path `b24` captures (`0.0ms` capture time)
+and landed at `261.6 / 24.8 / 1095.8ms`, `1000/1000` correct. It still filled
+the ragged-prefill graph cache (`128/128` live entries, `12` startup evictions)
+and reached readiness in `226.0s`, so this does not reopen greedy-short `b24`
+as a default.
+
 Sampled-medium prefix prefill now has a default `b24` batch bucket. The focused
 env probe with `TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_BATCH_BUCKETS=1,2,4,8,16,24,32`
 and matching warmup wrote
