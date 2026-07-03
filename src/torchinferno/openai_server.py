@@ -77,6 +77,7 @@ from torchinferno.runtime.scheduler import (
 from torchinferno.runtime.serving import (
     ContinuousBatchEngine as _RuntimeContinuousBatchEngine,
     ServingRequest as _RuntimeServingRequest,
+    _default_prefix_prefill_batch_buckets,
     _default_prefix_prefill_suffix_buckets,
     _dynamic_prefix_prefill_context_len,
     _dynamic_prefix_prefill_max_suffix_for_policy,
@@ -1395,13 +1396,22 @@ def _online_greedy_common_prefix_suffix_prefill_warmup_extra_pairs(
 def _online_greedy_common_prefix_suffix_prefill_warmup_batches(
     cache_rows: int,
     max_active: int,
+    *,
+    warmup_temperature: float = 0.0,
+    warmup_max_tokens: int | None = None,
 ) -> tuple[int, ...]:
     if cache_rows <= 0 or max_active <= 0:
         return ()
-    batches = _parse_positive_int_csv(
-        os.environ.get("TORCHINFERNO_OPENAI_WARMUP_ONLINE_GREEDY_COMMON_PREFIX_SUFFIX_BATCHES", "1,2,4,8,16,32")
-    )
     limit = min(cache_rows, max_active)
+    configured = os.environ.get("TORCHINFERNO_OPENAI_WARMUP_ONLINE_GREEDY_COMMON_PREFIX_SUFFIX_BATCHES")
+    if configured is not None:
+        batches = _parse_positive_int_csv(configured)
+    else:
+        batches = _default_prefix_prefill_batch_buckets(
+            warmup_temperature,
+            warmup_max_tokens,
+            limit,
+        ) or _parse_positive_int_csv("1,2,4,8,16,32")
     return tuple(batch for batch in batches if 0 < batch <= limit)
 
 
@@ -3740,9 +3750,14 @@ class OpenAICompletionEngine:
                 warmup_max_tokens=warmup_max_tokens,
             )
         )
-        batch_sizes = _online_greedy_common_prefix_suffix_prefill_warmup_batches(cache_rows, max_active)
         if warmup_max_tokens is None:
             warmup_max_tokens = _online_greedy_common_prefix_suffix_prefill_warmup_max_tokens()
+        batch_sizes = _online_greedy_common_prefix_suffix_prefill_warmup_batches(
+            cache_rows,
+            max_active,
+            warmup_temperature=warmup_temperature,
+            warmup_max_tokens=warmup_max_tokens,
+        )
         extra_pairs = _online_greedy_common_prefix_suffix_prefill_warmup_extra_pairs(
             max_seq_len,
             warmup_temperature=warmup_temperature,

@@ -164,6 +164,23 @@ Keep the automatic greedy-large mixed-prefix policy off by default; the suffix
 split and capture guard remain useful for explicit opt-in probes, but they do
 not close the default multi_turn gap.
 
+Sampled-medium prefix prefill now has a default `b24` batch bucket. The focused
+env probe with `TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_BATCH_BUCKETS=1,2,4,8,16,24,32`
+and matching warmup wrote
+`agent_space/ti_tree_prefill_b24_results_0703/.../runs/20260703_075813` and
+improved tree_of_thought to `129.0 / 34.8 / 154.3ms`, `959/992` correct. The
+queue profile used `b24:s16` graphs, kept request-path prefill captures/misses at
+zero, and cut prefill padding from the fresh current-head profile's `9.5K` tokens
+to `8.1K`. Promoting that as a sampled-medium-only default (temperature > 0,
+`256 < max_tokens <= 384`) was validated by a no-env focused run,
+`agent_space/ti_tree_b24_default_results_0703/.../runs/20260703_080549`, at
+`135.3 / 36.0 / 164.3ms`, `960/992` correct, with zero prefill graph misses.
+The full TorchInferno-only validation
+`agent_space/ti_full_b24_default_results_0703/.../runs/20260703_081126` landed at
+few_shot `165.4 / 46.9 / 203.3ms`, self_consistency `180.1 / 0.0 / 192.5ms`,
+multi_turn `293.5 / 60.5 / 346.5ms`, tree_of_thought `134.0 / 27.9 / 156.4ms`,
+and long_output `263.2 / 24.4 / 1113.0ms`, with correctness in the normal band.
+
 A debug rerun on pushed commit `5089f09` wrote
 `agent_space/ti_multi_warmmixed_debug_results_0425/.../runs/20260703_041208`
 and measured `232.4 / 72.8 / 304.8ms`, `981/1000` correct. Saved response text

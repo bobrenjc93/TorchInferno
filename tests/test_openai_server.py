@@ -10102,6 +10102,18 @@ def test_online_common_prefix_prefill_warmup_filters_shapes(monkeypatch) -> None
         warmup_max_tokens=128,
     )
     assert _online_greedy_common_prefix_suffix_prefill_warmup_batches(64, 48) == (1, 2, 4, 8, 16, 32)
+    assert _online_greedy_common_prefix_suffix_prefill_warmup_batches(
+        64,
+        48,
+        warmup_temperature=1.0,
+        warmup_max_tokens=300,
+    ) == (1, 2, 4, 8, 16, 24, 32)
+    assert _online_greedy_common_prefix_suffix_prefill_warmup_batches(
+        64,
+        48,
+        warmup_temperature=1.0,
+        warmup_max_tokens=256,
+    ) == (1, 2, 4, 8, 16, 32)
     assert not _online_mixed_prefix_suffix_prefill_warmup_enabled()
     monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_GREEDY_LARGE_MIXED_PREFIX_REUSE", "1")
     assert _online_mixed_prefix_suffix_prefill_warmup_enabled()

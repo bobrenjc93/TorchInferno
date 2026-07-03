@@ -95,6 +95,34 @@ def _default_prefix_prefill_suffix_buckets(
     )
 
 
+def _default_prefix_prefill_batch_buckets(
+    temperature: float,
+    max_generation_tokens: int | None,
+    max_active_requests: int,
+) -> tuple[int, ...]:
+    if temperature <= 0.0 or max_generation_tokens is None or max_active_requests <= 0:
+        return ()
+    sampled_medium_min_tokens = env_int(
+        "TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_BATCH_BUCKETS_SAMPLED_MEDIUM_MIN_TOKENS",
+        256,
+        minimum=0,
+    )
+    sampled_medium_max_tokens = env_int(
+        "TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_BATCH_BUCKETS_SAMPLED_MEDIUM_MAX_TOKENS",
+        384,
+        minimum=sampled_medium_min_tokens,
+    )
+    if not (sampled_medium_min_tokens < int(max_generation_tokens) <= sampled_medium_max_tokens):
+        return ()
+    buckets = _parse_positive_int_csv(
+        os.environ.get(
+            "TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_BATCH_BUCKETS_SAMPLED_MEDIUM",
+            "1,2,4,8,16,24,32",
+        )
+    )
+    return tuple(bucket for bucket in buckets if bucket <= int(max_active_requests))
+
+
 def _enable_runtime_cache_capture_sync(cache: object) -> None:
     try:
         delattr(cache, "_skip_capture_sync")
@@ -2072,6 +2100,16 @@ class ContinuousBatchEngine:
             configured_bucket = _bucket_from_values(count, configured_buckets)
             if configured_bucket is not None:
                 return configured_bucket
+        default_bucket = _bucket_from_values(
+            count,
+            _default_prefix_prefill_batch_buckets(
+                self.temperature,
+                self.max_generation_tokens,
+                self.max_active_requests,
+            ),
+        )
+        if default_bucket is not None:
+            return default_bucket
         # Pad the prefill batch to a power of two so the model's prefill graph
         # key -- (batch, suffix_bucket, prefix_len) -- repeats across batches and
         # replays instead of recapturing on every differently-sized batch. Cap

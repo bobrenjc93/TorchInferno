@@ -188,9 +188,37 @@ def test_continuous_prefix_prefill_suffix_buckets_can_be_configured(monkeypatch)
 
 def test_continuous_prefix_prefill_batch_buckets_can_be_configured(monkeypatch) -> None:
     monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_BATCH_BUCKETS", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_BATCH_BUCKETS_SAMPLED_MEDIUM", raising=False)
+    monkeypatch.delenv(
+        "TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_BATCH_BUCKETS_SAMPLED_MEDIUM_MIN_TOKENS",
+        raising=False,
+    )
+    monkeypatch.delenv(
+        "TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_BATCH_BUCKETS_SAMPLED_MEDIUM_MAX_TOKENS",
+        raising=False,
+    )
     engine = ContinuousBatchEngine(object(), device=torch.device("cpu"), max_active_requests=64)
 
     assert engine._prefill_batch_bucket(17) == 32
+
+    sampled_medium_engine = ContinuousBatchEngine(
+        object(),
+        device=torch.device("cpu"),
+        temperature=0.7,
+        max_generation_tokens=300,
+        max_active_requests=32,
+    )
+    assert sampled_medium_engine._prefill_batch_bucket(17) == 24
+    assert sampled_medium_engine._prefill_batch_bucket(25) == 32
+
+    sampled_short_engine = ContinuousBatchEngine(
+        object(),
+        device=torch.device("cpu"),
+        temperature=0.7,
+        max_generation_tokens=256,
+        max_active_requests=32,
+    )
+    assert sampled_short_engine._prefill_batch_bucket(17) == 32
 
     monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_BATCH_BUCKETS", "8,16,24,32")
 
