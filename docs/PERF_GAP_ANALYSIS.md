@@ -392,6 +392,29 @@ profile stayed in the same performance shape: `64` prefill batches,
 GPU, and `106` decode-many calls over `488` steps. Keep this as diagnostics
 hygiene, not a score-facing long_output fix.
 
+A same-host repro of the public TorchInferno commit shows the public
+`915.7ms` long_output row is not locally stable. Running `3927cf1` from
+`/tmp/TorchInferno-public-3927`
+(`agent_space/ti_long_public3927_results_0703/.../runs/20260703_131540`)
+landed at `282.0 / 24.4 / 1145.1ms`, `1000/1000` correct. Its queue profile
+matched the current local band: `63` prefill batches, `5.33s/5.80s` prefill
+forward/wall, `789` decode model calls, `10.70s` decode GPU, and `107`
+decode-many calls over `508` steps. Treat the public/local long-output delta as
+run/environment variance until a same-host run reproduces the `~915ms` row.
+
+Full-active waiting decode-many is rejected as a default. A local patch allowed
+short greedy decode-many to run while requests were waiting only when
+`len(active) >= max_active`, so it could not delay admission into free active
+rows. The focused long_output run on that patch
+(`agent_space/ti_long_fullactive_wait_decode_many_results_0703/.../runs/20260703_132538`)
+landed at `250.8 / 24.7 / 1146.4ms`, `1000/1000` correct. The profile confirmed
+the intended policy (`decode_many_with_waiting=true`,
+`decode_many_with_waiting_min_active=64`), but model work stayed in-family:
+`62` prefill batches, `5.20s/5.70s` prefill forward/wall, `749` decode model
+calls, `10.24s` decode GPU, and `102` decode-many calls over `456` steps. This
+reduced neither median E2E nor steady decode GPU, so keep waiting decode-many
+as an explicit diagnostic/runtime knob rather than an OpenAI default.
+
 Decode-many padding is now separated from stop-tail overgeneration in queue
 profiles. The focused current-head long_output run
 `agent_space/ti_long_decodemany_padding_profile_results_0703/.../runs/20260703_102544`
