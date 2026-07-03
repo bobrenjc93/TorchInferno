@@ -953,6 +953,14 @@ class PagedEngine:
                 for suffix, group in groups.items()
             ]
 
+        def extra_pages_needed(items: list[dict], suffix_len: int) -> int:
+            extra_pages = 0
+            for item in items:
+                rid = item["rid"]
+                target_pages = math.ceil((int(item["shared"]) + suffix_len) / self.page_size)
+                extra_pages += max(0, target_pages - len(self.cache._sequences[rid].page_ids))
+            return extra_pages
+
         def can_pad(items: list[dict], suffix_len: int, lengths: list[int]) -> bool:
             if not items or min(lengths) <= 0 or max(lengths) > suffix_len:
                 return False
@@ -975,12 +983,7 @@ class PagedEngine:
             ):
                 return False
 
-            extra_pages = 0
-            for item in items:
-                rid = item["rid"]
-                target_pages = math.ceil((int(item["shared"]) + suffix_len) / self.page_size)
-                extra_pages += max(0, target_pages - len(self.cache._sequences[rid].page_ids))
-            return extra_pages <= len(self.cache.free_pages)
+            return extra_pages_needed(items, suffix_len) <= len(self.cache.free_pages)
 
         suffix_lengths = [len(a["prompt"]) - int(a["shared"]) for a in shared]
         if (
@@ -1012,6 +1015,13 @@ class PagedEngine:
                 grouped.append((bucket, items, lengths, True))
             else:
                 grouped.extend(exact_groups(items))
+        padded_extra_pages = sum(
+            extra_pages_needed(items, suffix_len)
+            for suffix_len, items, _lengths, padded in grouped
+            if padded
+        )
+        if padded_extra_pages > len(self.cache.free_pages):
+            return exact_groups()
         return grouped
 
     def _record_decode_stats(self, *, batch: int, elapsed_ms: float) -> None:
