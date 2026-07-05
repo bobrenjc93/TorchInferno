@@ -1,5 +1,39 @@
 # TorchInferno vs vLLM/sglang — Performance Gap Analysis (Llama-3.1-70B, 8xH100)
 
+## Public 20260705_190219
+
+Public inference-bench advanced to commit `6af04218` with run
+`results/v1/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100/runs/20260705_190219`.
+It ran after the inference-bench harness client fix and measured TorchInferno
+`70fbe31`, not the later documentation-only commits. Scorecard stayed
+TorchInferno `3/20`, vLLM `15/20`, and SGLang `1/20`.
+
+- few_shot: TorchInferno `156.0 / 45.0 / 199.6ms`, vLLM
+  `124.4 / 43.1 / 164.2ms`, SGLang `133.3 / 84.2 / 209.5ms`.
+- self_consistency: TorchInferno `105.9 / 0.0 / 114.3ms`, vLLM
+  `133.3 / 0.0 / 155.1ms`, SGLang `214.8 / 0.0 / 371.3ms`.
+- multi_turn: TorchInferno `329.8 / 59.4 / 395.7ms`, vLLM
+  `141.6 / 51.1 / 186.2ms`, SGLang `161.0 / 113.2 / 273.8ms`.
+- tree_of_thought: TorchInferno `79.7 / 63.2 / 111.7ms`, vLLM
+  `32.6 / 21.7 / 47.9ms`, SGLang `51.0 / 396.3 / 439.9ms`.
+- long_output: TorchInferno `288.6 / 20.3 / 1009.2ms`, vLLM
+  `76.8 / 14.7 / 670.4ms`, SGLang `68.3 / 22.7 / 943.5ms`.
+
+The queue profile keeps the same priority ordering. few_shot improved versus
+the prior public row but is still a cached-prefix prefill replay problem:
+`q2first_p50=98.7ms`, `39` prefill batches, `37/2` graph hits/misses,
+`1.41s/1.80s` prefill forward/wall, and `1.42s` wall in hot
+`prefix_graph:b32:s16:p122-122:src1:mixed0`. self_consistency remains healthy
+with `q2first_p50=6.6ms`, two prefill batches, and `989` generated-prefix reuse
+hits. multi_turn regressed mostly before first token: `q2first_p50=232.8ms`,
+`q2submit_p50=144.9ms`, only `606` prefix-reuse requests
+(`{"common_prefix":110,"request_prompt":496}`), and `1.63s/1.80s` prefill
+forward/wall across `29` prefill batches. tree_of_thought is still many small
+cached-prefix prefill replays (`227` batches, `5.02s/5.47s` prefill wall) plus
+`4.77s` ragged decode GPU. long_output remains decode dominated with
+`10.07s` ragged decode GPU, `3.39s` decode-many GPU, and `4.12s/4.47s`
+prefill forward/wall.
+
 ## Public 20260705_170204 after inference-bench client fix
 
 Public inference-bench advanced to commit `f240a799` with run
@@ -95,6 +129,20 @@ was still `31` calls and `1.79s` wall and total prefill wall rose to `2.67s`.
 Keep prefill symmetric-memory all-reduce default-off for few_shot; the next
 collective lever needs a measured reduction in the live replay body, not just a
 different all-reduce backend flag.
+
+A stricter local prototype that allowed graph-captured prefill symmetric-memory
+all-reduce only when the buffer had already been allocated and probed by the
+pre-capture warmup was also rejected and not retained in code. The focused run
+wrote
+`/tmp/inference-bench-ti-few-prefill-symm-ingraph-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-ti-few-prefill-symm-ingraph-f869dd0-dirty-20260705/runs/20260705_194020`
+and landed at `173.7 / 48.5 / 221.0ms`, `977/1000` correct, with p99
+TTFT/E2E `1065.3/1138.5ms`. The one-shot replay profile still showed
+`160` NCCL bf16 all-reduce kernels at `13.1ms` (`32%`) inside the same
+`batch=32,suffix=16,context_len=-64` graph, and queue telemetry again had
+`31` hot `prefix_graph:b32:s16:p122-122:src1:mixed0` replays at `1.80s`
+wall. Do not spend more time on prefill symmetric-memory graph capture unless a
+smaller standalone capture proves the replay body records multimem rather than
+NCCL and reduces the `13ms` collective slice.
 
 ## Public 20260705_150207 and inference-bench client fix
 
