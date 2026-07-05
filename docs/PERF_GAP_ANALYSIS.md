@@ -91,6 +91,18 @@ uncaptured `b16` mixed-prefix shapes and stretched queue-to-submit rather than
 reducing first-token time. Keep the default `admit_cap=48` and
 `min_ready=32` for this class.
 
+A follow-up on pushed `45e3b70` added the exact missing
+`ragged_prefill:b16:s32:rows1:ctx-128:src16` warmup shape and reran the same
+admit16/min-ready16 A/B at
+`/tmp/inference-bench-ti-multiturn-admit16-b16ctx128-45e-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-ti-multiturn-admit16-b16ctx128-45e3b70-20260705/runs/20260705_154405`.
+That fixed the graph-miss pathology and recovered much of the regression:
+`324.7 / 78.4 / 401.1ms`, `980/1000` correct, `67/0` prefill graph
+hits/misses, `3.10s/3.50s` prefill forward/wall, `q2first_p50=245.4ms`, and
+`q2submit_p50=126.5ms`. The policy is still rejected because it remains slower
+than the default mixed-prefix run (`310.8 / 63.1 / 362.8ms`) and still produces
+`67` prefill batches instead of the default run's `37`; keep the warmup shape,
+but do not lower the default greedy-large admission floor/cap.
+
 The finished-prefix cache is also rejected for the current greedy-large
 mixed-prefix path. Running the same focused `multi_turn` benchmark with
 `TORCHINFERNO_CONTINUOUS_FINISHED_PREFIX_CACHE=1` on pushed `248c81d` started
