@@ -69,6 +69,28 @@ GPU, `37/0` prefill graph hits/misses, and route counts
 public `c85d39b` row is stale, not as a reason to re-enable PRBD; the
 mixed-prefix PRBD-on path was already rejected below.
 
+A same-host provider-only `multi_turn` refresh wrote
+`/tmp/inference-bench-local-providers-multiturn-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-providers-multiturn-20260705/runs/20260705_150358`.
+vLLM built at `cc1d020d0194` and landed at `178.6 / 60.2 / 235.7ms`,
+`981/1000` correct. SGLang built at `602c8615a1af` and landed at
+`152.1 / 114.8 / 269.9ms`, `979/1000` correct. This keeps the current local
+target concrete: TorchInferno's mixed-prefix path is near the vLLM TPOT band,
+but it still needs about `130ms` lower median TTFT versus vLLM and about
+`160ms` versus SGLang.
+
+Lowering the greedy-large mixed-prefix admission floor/cap is rejected. The
+current-stack A/B with
+`TORCHINFERNO_OPENAI_TP_ONLINE_ADMIT_PER_STEP_CAP=16` and
+`TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_REFILL_MIN_READY_REQUESTS=16`
+wrote
+`/tmp/inference-bench-ti-multiturn-admit16-928-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-ti-multiturn-admit16-928-20260705/runs/20260705_151635`
+and regressed to `594.7 / 76.5 / 672.5ms`, `982/1000` correct. Queue telemetry
+showed `68` prefill batches, `23` prefill graph misses, `10.49s/10.85s`
+prefill forward/wall, and `q2first_p50=517.9ms`. Smaller waves exposed
+uncaptured `b16` mixed-prefix shapes and stretched queue-to-submit rather than
+reducing first-token time. Keep the default `admit_cap=48` and
+`min_ready=32` for this class.
+
 ## Public 20260705_110218 refresh and multi-turn scheduler rejections
 
 The latest public inference-bench commit advanced to `11363bd4` with run
