@@ -36,6 +36,18 @@ landed at `228.6 / 23.9 / 1056.0ms`, `1000/1000` correct, with
 `F.linear`/decode-linear path; remaining decode work needs fewer replays or a
 faster attention/collective body, not this allocation tradeoff.
 
+The greedy all-reduce sampler path is rejected for long_output. On clean
+`bc538c2`, the opt-in run with `TORCHINFERNO_GREEDY_SAMPLE_GATHER=0` wrote
+`/tmp/inference-bench-ti-greedy-allreduce-long-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100/runs/20260705_224320`
+and landed at `210.6 / 23.1 / 1063.8ms`, `1000/1000` correct. Its paired
+default gather-control run
+`/tmp/inference-bench-ti-bc538c2-long-default-control-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100/runs/20260705_224902`
+landed better overall at `198.0 / 23.9 / 1043.4ms`, also `1000/1000`
+correct. Queue counters were not a hidden sampler win: all-reduce had
+`q2first_p50=168.1ms`, `decode_gpu_ms=9.70s`, and `decode_many_gpu_ms=5.24s`,
+while the gather control had `q2first_p50=159.8ms`, `decode_gpu_ms=9.80s`, and
+`decode_many_gpu_ms=5.11s`. Keep the CUDA greedy gather default.
+
 ## Public 20260705_210211
 
 Public inference-bench advanced to run
