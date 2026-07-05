@@ -110,6 +110,17 @@ cached-prefix prefill implementation and consistently cheap request-prompt
 mixed-prefix replay, not current packed eager, wider active rows, or earlier
 refill prefill scheduling.
 
+A decode-many probe for greedy-large mixed-prefix multi_turn is rejected.
+Forcing `TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY=1` and
+`TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY_ALLOW_STOP=1` wrote
+`/tmp/inference-bench-ti-mixedprefix-decode-many-large-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-ti-mixedprefix-decode-many-large-20260705/runs/20260705_134657`
+and regressed to `323.8 / 217.5 / 541.7ms`, `981/1000` correct. The queue
+profile kept the intended `{"common_prefix":125,"request_prompt":875}` route
+mix and `34/0` prefill graph hits/misses, but decode-many did `15.0K` model
+tokens for only `1.46K` emitted tokens, skipped `13.5K`, and spent `5.69s` in
+decode GPU. The remaining multi_turn decode gap needs less overgenerated
+multi-step decode or cheaper scalar ragged decode, not broad decode-many.
+
 ## Public 20260705_090205 refresh and decode graph symm telemetry
 
 The latest public run advanced to
