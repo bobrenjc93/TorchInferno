@@ -12,6 +12,30 @@ misses. Keep the gather path opt-in for targeted experiments; the sampled tree
 gap still needs lower cached-prefix prefill and first-token cost, not a gather
 default.
 
+The existing Gumbel temperature sampler is also rejected as a tree_of_thought
+default on this code. The focused run
+`/tmp/inference-bench-ti-0e486ce-tree-gumbel-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100/runs/20260705_222142`
+with `TORCHINFERNO_TEMPERATURE_SAMPLE_GUMBEL=1` landed at
+`114.9 / 64.2 / 161.0ms`, `953/992` correct. It reduced sampled prefill
+time versus the gather run (`prefill_sample_ms=353.8`) but increased
+prefill work (`140` batches, `prefill_forward/wall=3.17s/3.79s`) and decode
+GPU (`2.84s`) while leaving repeated-sample-state hits at zero. Keep it
+opt-in; the sampled-tree path needs less common-prefix prefill and decode work,
+not a different default draw algorithm.
+
+A decode QKV scratch-buffer prototype is rejected and was not retained in code.
+It routed `_qkv` through a reusable `attention-qkv` buffer by adding an `out=`
+path to `_decode_linear`, but the output-buffer `torch.mm` path did not improve
+benchmark medians. The dirty-tree tree_of_thought run
+`/tmp/inference-bench-ti-qkv-scratch-tree-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100/runs/20260705_222932`
+landed at `134.8 / 69.1 / 202.9ms`, `956/992` correct. The decode-heavy
+long_output run
+`/tmp/inference-bench-ti-qkv-scratch-long-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100/runs/20260705_223507`
+landed at `228.6 / 23.9 / 1056.0ms`, `1000/1000` correct, with
+`decode_gpu_ms=10.54s` and `decode_many_gpu_ms=4.14s`. Keep QKV on the current
+`F.linear`/decode-linear path; remaining decode work needs fewer replays or a
+faster attention/collective body, not this allocation tradeoff.
+
 ## Public 20260705_210211
 
 Public inference-bench advanced to run
