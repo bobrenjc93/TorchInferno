@@ -66,6 +66,22 @@ slightly improved TPOT/E2E, but it worsened TTFT, p99 TTFT (`886.6ms` versus
 (`131.8ms` versus `122.2ms`). Keep the current initial wait; few_shot needs
 faster `b32`/mixed cached-prefix prefill rather than earlier launch.
 
+A one-shot replay profile of the current few_shot hot graph on pushed
+`7e2778a` confirms that diagnosis. The focused run wrote
+`/tmp/inference-bench-ti-few-prefill-replay-prof-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-ti-few-prefill-replay-prof-7e2778a-20260705/runs/20260705_192324`
+and landed at `173.4 / 46.9 / 222.1ms`, `977/1000` correct. Queue telemetry
+had `q2first_p50=124.3ms`, `q2submit_p50=55.5ms`,
+`submit2first_p50=67.6ms`, `36` prefill batches, `34/2` graph hits/misses,
+and hot `prefix_graph:b32:s16:p122-122:src1:mixed0` at `31` calls and
+`1.80s` wall. The replay profiler captured
+`batch=32,suffix=16,context_len=-64,src_rows=1` at `40.4ms` total CUDA time:
+NCCL bf16 all-reduce was `13.0ms` (`32%`), the largest GEMM/attention kernels
+were `7.65ms`, `4.84ms`, and `1.96ms`, and RMS/elementwise/gather kernels
+accounted for several more milliseconds. This rules out the remaining few_shot
+gap as a graph-miss or request-collection problem; a defaultable improvement
+has to reduce the TP collective count/cost or the 32-row suffix prefill model
+body itself.
+
 ## Public 20260705_150207 and inference-bench client fix
 
 Public inference-bench advanced to commit `0ace9c0a` with run
