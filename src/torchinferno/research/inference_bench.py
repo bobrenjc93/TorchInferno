@@ -659,6 +659,29 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
             )
             lines.append("")
 
+        packed_target_rows = _prefill_packed_implementation_target_rows(
+            summary.torchinferno_queue_profiles
+        )
+        if packed_target_rows:
+            lines.append("[torchinferno packed prefill implementation targets]")
+            lines.extend(
+                _format_table(
+                    (
+                        "temp",
+                        "max_tokens",
+                        "pattern",
+                        "calls",
+                        "repeat_saved",
+                        "fixed_saved",
+                        "est_saved_ms",
+                        "fixed_saved_pct",
+                        "sig_cov",
+                    ),
+                    packed_target_rows,
+                )
+            )
+            lines.append("")
+
         packed_signature_reuse_rows = _prefill_packed_signature_reuse_rows(
             summary.torchinferno_queue_profiles
         )
@@ -1891,6 +1914,99 @@ def _prefill_packed_fixed_capacity_saved_ms(
     if shape_ms is None or shape_model_tokens is None or shape_model_tokens <= 0:
         return None
     return float(fixed_saved_tokens) * float(shape_ms) / float(shape_model_tokens)
+
+
+def _prefill_packed_implementation_target_rows(
+    profiles: Sequence[QueueProfileSummary],
+    *,
+    limit: int = 8,
+) -> list[tuple[str, ...]]:
+    items: list[tuple[float, float, str, tuple[str, ...]]] = []
+    for profile in profiles:
+        fields = profile.fields
+        pattern_calls = _numeric_mapping(
+            fields.get("runtime_prefill_packed_candidate_pattern_counts")
+        )
+        if not pattern_calls:
+            continue
+        pattern_saved = _numeric_mapping(
+            fields.get("runtime_prefill_packed_candidate_pattern_saved_tokens")
+        )
+        pattern_max_slots: dict[str, dict[tuple[int, int], int]] = {}
+        pattern_signature_calls: dict[str, float] = {}
+        for slot_key, slot_count in _numeric_mapping(
+            fields.get("runtime_prefill_packed_candidate_pattern_slot_counts")
+        ).items():
+            parsed_slot = _parse_packed_prefill_pattern_slot_key(slot_key)
+            if parsed_slot is None:
+                continue
+            pattern, group = parsed_slot
+            if pattern not in pattern_calls:
+                continue
+            max_slots = pattern_max_slots.setdefault(pattern, {})
+            max_slots[group] = max(max_slots.get(group, 0), int(slot_count))
+        for signature, signature_calls in _numeric_mapping(
+            fields.get("runtime_prefill_packed_candidate_signature_counts")
+        ).items():
+            parsed = _parse_packed_prefill_signature_key(signature)
+            if parsed is None:
+                continue
+            pattern, group_counts = parsed
+            if pattern not in pattern_calls:
+                continue
+            pattern_signature_calls[pattern] = (
+                pattern_signature_calls.get(pattern, 0.0) + float(signature_calls)
+            )
+            max_slots = pattern_max_slots.setdefault(pattern, {})
+            for group, count in group_counts.items():
+                max_slots[group] = max(max_slots.get(group, 0), int(count))
+        for pattern, calls in pattern_calls.items():
+            call_count = max(0.0, float(calls))
+            if call_count < 2.0:
+                continue
+            dense_per_call = _packed_prefill_dense_tokens_per_call(pattern)
+            max_slots = pattern_max_slots.get(pattern)
+            if dense_per_call is None or dense_per_call <= 0 or not max_slots:
+                continue
+            fixed_per_call = sum(
+                max(0, int(count)) * max(0, int(suffix_len))
+                for (_start_len, suffix_len), count in max_slots.items()
+            )
+            if fixed_per_call <= 0:
+                continue
+            dense_tokens = float(dense_per_call) * call_count
+            fixed_tokens = float(fixed_per_call) * call_count
+            fixed_saved = max(0.0, dense_tokens - fixed_tokens)
+            if fixed_saved <= 0.0:
+                continue
+            est_saved_ms = _prefill_packed_fixed_capacity_saved_ms(
+                fields,
+                pattern,
+                fixed_saved,
+            )
+            repeat_saved = max(0.0, float(pattern_saved.get(pattern, 0.0)))
+            sig_calls = pattern_signature_calls.get(pattern, 0.0)
+            score_ms = float(est_saved_ms) if est_saved_ms is not None else -1.0
+            items.append(
+                (
+                    score_ms,
+                    fixed_saved,
+                    pattern,
+                    (
+                        _fmt_value(profile.temperature),
+                        _fmt_value(profile.max_tokens),
+                        pattern,
+                        _fmt_value(_int_if_whole(call_count)),
+                        _fmt_value(_int_if_whole(repeat_saved)),
+                        _fmt_value(_int_if_whole(fixed_saved)),
+                        _fmt_value(None if est_saved_ms is None else _int_if_whole(est_saved_ms)),
+                        _fmt_pct(fixed_saved, dense_tokens),
+                        _fmt_pct(sig_calls, call_count),
+                    ),
+                )
+            )
+    items.sort(key=lambda item: (-item[0], -item[1], item[2]))
+    return [item[3] for item in items[:limit]]
 
 
 def _parse_packed_prefill_signature_key(
