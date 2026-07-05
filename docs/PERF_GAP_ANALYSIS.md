@@ -103,6 +103,18 @@ than the default mixed-prefix run (`310.8 / 63.1 / 362.8ms`) and still produces
 `67` prefill batches instead of the default run's `37`; keep the warmup shape,
 but do not lower the default greedy-large admission floor/cap.
 
+Raising the scoped greedy-large mixed-prefix prequeue wait from `2ms` to `3ms`
+is rejected. The `3ms` env run on pushed `e3aea11` wrote
+`/tmp/inference-bench-ti-multiturn-prequeue3-e3-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-ti-multiturn-prequeue3-e3aea11-20260705/runs/20260705_155338`
+and landed at `247.7 / 63.3 / 355.9ms`, `982/1000` correct. The paired no-env
+control on the same commit wrote
+`/tmp/inference-bench-ti-multiturn-default-e3-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-ti-multiturn-default-e3aea11-20260705/runs/20260705_155926`
+and was better at `246.1 / 61.0 / 319.4ms`, `983/1000` correct. Queue
+telemetry also favors the current default: `q2submit_p50=60.0ms` and
+`q2first_p50=147.2ms` with `36/0` prefill graph hits/misses, versus
+`q2submit_p50=72.0ms`, `q2first_p50=153.9ms`, and `37/0` prefill graph
+hits/misses for `3ms`. Keep the scoped mixed-prefix prequeue wait at `2ms`.
+
 The finished-prefix cache is also rejected for the current greedy-large
 mixed-prefix path. Running the same focused `multi_turn` benchmark with
 `TORCHINFERNO_CONTINUOUS_FINISHED_PREFIX_CACHE=1` on pushed `248c81d` started
