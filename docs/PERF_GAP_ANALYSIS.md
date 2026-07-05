@@ -1,5 +1,65 @@
 # TorchInferno vs vLLM/sglang — Performance Gap Analysis (Llama-3.1-70B, 8xH100)
 
+## Public 20260705_150207 and inference-bench client fix
+
+Public inference-bench advanced to commit `0ace9c0a` with run
+`results/v1/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100/runs/20260705_150207`.
+That row measured TorchInferno `92889de`, so it includes the mixed-prefix
+multi_turn policy but predates the later `45e3b70` b16 ctx128 warmup and the
+inference-bench client fix below. Scorecard was TorchInferno `2/20`, vLLM
+`15/20`, and SGLang `2/20`.
+
+The public gaps were:
+
+- few_shot: TorchInferno `153.5 / 46.8 / 202.5ms`, vLLM
+  `137.6 / 52.6 / 178.0ms`, SGLang `148.0 / 74.1 / 224.1ms`. TorchInferno
+  kept only the TPOT win.
+- self_consistency: TorchInferno `278.0 / 0.0 / 317.3ms`, vLLM
+  `195.1 / 0.0 / 218.6ms`, SGLang `221.3 / 0.0 / 370.4ms`.
+- multi_turn: TorchInferno `309.8 / 62.2 / 361.5ms`, vLLM
+  `173.5 / 51.7 / 221.5ms`, SGLang `166.2 / 106.0 / 268.5ms`.
+- tree_of_thought: TorchInferno `121.7 / 29.1 / 145.4ms`, vLLM
+  `61.6 / 30.3 / 85.4ms`, SGLang `74.7 / 52.0 / 134.5ms`. TorchInferno kept
+  TPOT and p99 wins but lost TTFT/E2E/throughput.
+- long_output: TorchInferno `280.1 / 19.3 / 922.3ms`, vLLM
+  `77.8 / 15.0 / 638.1ms`, SGLang `73.3 / 22.2 / 835.6ms`.
+
+The self_consistency gap was mostly benchmark-client overhead, not runtime
+work. A focused TorchInferno profile on pushed `823d043` with the existing
+shared inference-bench OpenAI/httpx client wrote
+`/tmp/inference-bench-ti-self-http-profile-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-ti-self-http-profile-823d043-20260705/runs/20260705_161118`
+and landed at `301.2 / 0.0 / 389.0ms`, `1000/1000` correct. Queue telemetry
+had `q2first_p50=8.9ms`, `q2submit_p50=2.1ms`, `submit2first_p50=6.4ms`,
+one warmed prefill batch, `1/0` prefill graph hits/misses, and
+`987` generated-prefix reuse requests. Fast HTTP profiling put server-side
+`accepted_to_ready + first_content_sent` at `54.9ms` p50 and
+`327.4ms` p90, while benchmark-visible p50 TTFT was `301.2ms`. The shared
+client was the outlier: the server had already reduced the median runtime path
+to single-digit milliseconds after request submission.
+
+Changing only `TORCHINFERNO_OPENAI_FAST_HTTP_DRAINED_IDLE_TIMEOUT_SECONDS` to
+`5.0` is rejected. The A/B wrote
+`/tmp/inference-bench-ti-self-http-drained5-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-ti-self-http-profile-drained5-823d043-20260705/runs/20260705_161836`
+and regressed to `338.1 / 0.0 / 396.7ms`, `1000/1000` correct. Fast HTTP still
+reported `1000/1000` first requests on fresh connections, so the timeout did
+not fix the observed client contention.
+
+The provider-neutral fix was pushed to inference-bench main as `76591625`
+(`Use per-thread clients for concurrent benchmarks`). Concurrent benchmarks now
+use one lazily-created OpenAI/httpx client per worker thread instead of sharing
+one streaming client across all workers. A manual thread-local client harness
+against a fresh TorchInferno server produced `29.2ms` median TTFT and `31.8ms`
+median E2E, `1000/1000` correct. The real patched inference-bench validation
+wrote
+`/tmp/inference-bench-ti-self-threadlocal-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-ti-self-threadlocal-bench-823d043-20260705/runs/20260705_163400`
+and landed at `92.3 / 0.0 / 99.7ms`, `1000/1000` correct. The same Fast HTTP
+profile still showed `1000/1000` first requests on fresh connections, but
+server-side `accepted_to_ready + first_content_sent` was only `32.8ms` p50 and
+`71.5ms` p90, with queue `q2first_p50=7.6ms` and `q2first_p90=15.2ms`.
+Treat the next public self_consistency result after inference-bench `76591625`
+as a harness-corrected comparison; no TorchInferno runtime default should be
+changed from the keepalive A/B.
+
 ## Public 20260705_130223 refresh pending default mixed-prefix measurement
 
 Public inference-bench advanced to commit `fb5f61e9` with run
