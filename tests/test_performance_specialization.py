@@ -347,6 +347,15 @@ def test_paged_ragged_decode_graph_state_uses_cache_token_bucket(monkeypatch) ->
 
     assert _ragged_decode_cache_token_bucket(dense_cache, seq_lens, None, batch=2) == 8
     assert _ragged_decode_cache_token_bucket(cache, seq_lens, None, batch=2) == 8
+    monkeypatch.delenv("TORCHINFERNO_CUDAGRAPH_RAGGED_DECODE_CACHE_TOKEN_BUCKETS", raising=False)
+    setattr(dense_cache, "_torchinferno_ragged_decode_cache_token_limit", 6)
+    assert _ragged_decode_cache_token_bucket(dense_cache, seq_lens, None, batch=2) == 6
+    setattr(dense_cache, "_torchinferno_ragged_decode_cache_token_min_batch", 4)
+    assert _ragged_decode_cache_token_bucket(dense_cache, seq_lens, None, batch=2) == 16
+    assert _ragged_decode_cache_token_bucket(dense_cache, seq_lens, None, batch=4) == 6
+    delattr(dense_cache, "_torchinferno_ragged_decode_cache_token_limit")
+    delattr(dense_cache, "_torchinferno_ragged_decode_cache_token_min_batch")
+    monkeypatch.setenv("TORCHINFERNO_CUDAGRAPH_RAGGED_DECODE_CACHE_TOKEN_BUCKETS", "1")
     page_tables, seq_lens_buffers = _prepare_paged_ragged_decode_graph_state(
         cache,
         batch=2,

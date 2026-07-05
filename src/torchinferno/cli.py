@@ -67,10 +67,12 @@ from torchinferno.research import (
     HelionCandidateConfig,
     HelionDecisionStore,
     HelionRegionSearchConfig,
+    format_inference_bench_summary,
     ResearchHarness,
     run_helion_candidate as run_helion_candidate_trial,
     run_helion_fx_search,
     run_helion_region_search,
+    summarize_inference_bench_run,
 )
 from torchinferno.research.benchmarks import benchmark_callable
 from torchinferno.runtime.disagg import run_disagg_request, write_rank_files
@@ -232,6 +234,16 @@ def run_vllm_bench_plot(args: argparse.Namespace) -> int:
     print("TorchInferno vLLM benchmark plot")
     print(f"html={outputs['html']}")
     print(f"csv={outputs['csv']}")
+    return 0
+
+
+def run_inference_bench_summary(args: argparse.Namespace) -> int:
+    summary = summarize_inference_bench_run(
+        args.run_dir,
+        benchmarks=tuple(args.benchmark) if args.benchmark else None,
+        providers=tuple(args.provider) if args.provider else None,
+    )
+    print(format_inference_bench_summary(summary), end="")
     return 0
 
 
@@ -1730,6 +1742,25 @@ def build_parser() -> argparse.ArgumentParser:
     vllm_plot.add_argument("--output-html", default=None)
     vllm_plot.add_argument("--output-csv", default=None)
     vllm_plot.set_defaults(func=run_vllm_bench_plot)
+
+    inference_bench_summary = subparsers.add_parser(
+        "inference-bench-summary",
+        help="Summarize an inference-bench run directory across providers and TorchInferno queue profiles.",
+    )
+    inference_bench_summary.add_argument("run_dir", help="Path to an inference-bench run directory containing results.json.")
+    inference_bench_summary.add_argument(
+        "--benchmark",
+        action="append",
+        default=None,
+        help="Benchmark name to include. Repeat to include multiple; defaults to all.",
+    )
+    inference_bench_summary.add_argument(
+        "--provider",
+        action="append",
+        default=None,
+        help="Provider name to include. Repeat to include multiple; defaults to all.",
+    )
+    inference_bench_summary.set_defaults(func=run_inference_bench_summary)
 
     llama_bench = subparsers.add_parser(
         "llama-bench-suite",

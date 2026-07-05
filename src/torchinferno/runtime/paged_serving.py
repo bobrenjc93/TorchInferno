@@ -34,6 +34,11 @@ class PagedEngineStats:
     prefill_plain_batches: int = 0
     prefill_prefix_reuse_batches: int = 0
     prefill_padded_suffix_batches: int = 0
+    prefill_suffix_graph_attempts: int = 0
+    prefill_suffix_graph_captures: int = 0
+    prefill_suffix_graph_replays: int = 0
+    prefill_suffix_graph_fallbacks: int = 0
+    prefill_suffix_graph_failures: int = 0
     prefill_wall_ms: float = 0.0
     prefill_forward_ms: float = 0.0
     decode_model_calls: int = 0
@@ -42,6 +47,10 @@ class PagedEngineStats:
     decode_active_tokens: int = 0
     prefix_reuse_requests: int = 0
     prefix_reuse_tokens: int = 0
+    prefix_reuse_candidate_tokens: int = 0
+    prefix_reuse_page_aligned_tokens: int = 0
+    prefix_reuse_alignment_loss_tokens: int = 0
+    prefix_reuse_forced_suffix_tokens: int = 0
     queued_requests: int = 0
     scheduler_steps: int = 0
     max_model_batch_size: int = 0
@@ -56,6 +65,14 @@ class PagedEngineStats:
     decode_shape_model_ms: dict[str, float] = field(default_factory=dict)
     prefix_reuse_route_counts: dict[str, int] = field(default_factory=dict)
     prefix_reuse_hit_token_counts: dict[str, int] = field(default_factory=dict)
+    prefix_reuse_candidate_token_counts: dict[str, int] = field(default_factory=dict)
+    prefix_reuse_alignment_loss_token_counts: dict[str, int] = field(default_factory=dict)
+    prefix_reuse_page_size_counts: dict[str, int] = field(default_factory=dict)
+    prefill_suffix_graph_attempt_shape_counts: dict[str, int] = field(default_factory=dict)
+    prefill_suffix_graph_capture_shape_counts: dict[str, int] = field(default_factory=dict)
+    prefill_suffix_graph_replay_shape_counts: dict[str, int] = field(default_factory=dict)
+    prefill_suffix_graph_fallback_shape_counts: dict[str, int] = field(default_factory=dict)
+    prefill_suffix_graph_failure_shape_counts: dict[str, int] = field(default_factory=dict)
 
 
 def _add_count(mapping: dict[str, int], key: str, value: int = 1) -> None:
@@ -102,6 +119,14 @@ def _paged_prefix_suffix_bucket(length: int) -> int:
     return max(1, int(configured if configured is not None else length))
 
 
+def _common_prefix_len(left, right) -> int:
+    limit = min(len(left), len(right))
+    for index in range(limit):
+        if int(left[index]) != int(right[index]):
+            return index
+    return limit
+
+
 class PagedPrefixCache:
     """Zero-copy block-level prefix cache over a LayeredPagedKVCache (vllm-style).
 
@@ -124,6 +149,16 @@ class PagedPrefixCache:
         self._router = PrefixAwareRouter(default_route=None)
         self._entries: dict[str, tuple[tuple[int, ...], list[int]]] = {}
         self._lru: list[str] = []
+        self.last_share_candidate_tokens = 0
+        self.last_share_aligned_tokens = 0
+        self.last_share_alignment_loss_tokens = 0
+        self.last_share_page_size = self.page_size
+
+    def _reset_last_share_info(self) -> None:
+        self.last_share_candidate_tokens = 0
+        self.last_share_aligned_tokens = 0
+        self.last_share_alignment_loss_tokens = 0
+        self.last_share_page_size = self.page_size
 
     def remember(self, request_id: str, tokens) -> None:
         if self.capacity <= 0:
@@ -158,16 +193,21 @@ class PagedPrefixCache:
             self._router.add_prefix(toks[: p * self.page_size], request_id)
 
     def share_into(self, new_request_id: str, tokens) -> int:
+        self._reset_last_share_info()
         if not self._entries:
             return 0
         match = self._router.route(tokens)
         rid = match.route_id
         if rid is None or rid not in self._entries:
             return 0
-        depth = (match.depth // self.page_size) * self.page_size
+        _toks, ent_pages = self._entries[rid]
+        candidate_depth = _common_prefix_len(tokens, _toks)
+        depth = (candidate_depth // self.page_size) * self.page_size
+        self.last_share_candidate_tokens = candidate_depth
+        self.last_share_aligned_tokens = depth
+        self.last_share_alignment_loss_tokens = max(0, candidate_depth - depth)
         if depth < self.page_size:
             return 0
-        _toks, ent_pages = self._entries[rid]
         n_pages = depth // self.page_size
         dst = self.cache._sequences.setdefault(new_request_id, PagedSequence(new_request_id))
         if dst.page_ids:
@@ -813,6 +853,18 @@ class PagedEngine:
             and 0 < int(suffix_len) <= self._suffix_prefill_graph_max_t
         )
 
+    def _suffix_prefill_graph_shape_key(
+        self,
+        batch: int,
+        batch_bucket: int,
+        suffix_len: int,
+    ) -> str:
+        return f"paged_prefix_graph:b{int(batch)}/{int(batch_bucket)}:s{int(suffix_len)}"
+
+    def _record_suffix_prefill_graph_fallback(self, shape_key: str) -> None:
+        self.stats.prefill_suffix_graph_fallbacks += 1
+        _add_count(self.stats.prefill_suffix_graph_fallback_shape_counts, shape_key)
+
     def _suffix_prefill_graph_batch(
         self,
         rids: list[str],
@@ -823,20 +875,29 @@ class PagedEngine:
     ):
         batch = len(rids)
         suffix_len = int(suffix_len)
-        if not self._suffix_prefill_graph_enabled(batch, suffix_len):
-            return None
-
         batch_bucket = min(self.max_active, 1 << (batch - 1).bit_length())
+        shape_key = self._suffix_prefill_graph_shape_key(batch, batch_bucket, suffix_len)
+        if not self._use_suffix_prefill_graph:
+            return None
+        self.stats.prefill_suffix_graph_attempts += 1
+        _add_count(self.stats.prefill_suffix_graph_attempt_shape_counts, shape_key)
+        if not self._suffix_prefill_graph_enabled(batch, suffix_len):
+            self._record_suffix_prefill_graph_fallback(shape_key)
+            return None
         if batch_bucket < batch:
+            self._record_suffix_prefill_graph_fallback(shape_key)
             return None
         key = (batch_bucket, suffix_len)
         runner = self._suffix_prefill_runners.get(key)
         required_pages = self._required_pages_for(rids)
         base_pages = math.ceil(self.max_seq / self.page_size) + 1
         try:
+            capture = False
             if runner is None:
                 if len(self._suffix_prefill_runners) >= self._suffix_prefill_runner_cap:
+                    self._record_suffix_prefill_graph_fallback(shape_key)
                     return None
+                capture = True
                 runner = PagedSpecGraphRunner(
                     self.model,
                     self.cache,
@@ -846,6 +907,7 @@ class PagedEngine:
                 )
                 self._suffix_prefill_runners[key] = runner
             elif required_pages > runner.max_pages:
+                capture = True
                 runner = PagedSpecGraphRunner(
                     self.model,
                     self.cache,
@@ -856,9 +918,18 @@ class PagedEngine:
                 self._suffix_prefill_runners[key] = runner
             input_ids = torch.tensor(padded_suffixes, dtype=torch.long, device=self.dev)
             start_positions = torch.tensor(starts, dtype=torch.long, device=self.dev)
-            return runner.step(input_ids, start_positions, rids)
+            if capture:
+                self.stats.prefill_suffix_graph_captures += 1
+                _add_count(self.stats.prefill_suffix_graph_capture_shape_counts, shape_key)
+            logits = runner.step(input_ids, start_positions, rids)
+            self.stats.prefill_suffix_graph_replays += 1
+            _add_count(self.stats.prefill_suffix_graph_replay_shape_counts, shape_key)
+            return logits
         except Exception:
             self._suffix_prefill_graph_failed = True
+            self.stats.prefill_suffix_graph_failures += 1
+            _add_count(self.stats.prefill_suffix_graph_failure_shape_counts, shape_key)
+            self._record_suffix_prefill_graph_fallback(shape_key)
             return None
 
     def _prefill_batch(self, rids, prompts):
@@ -1029,6 +1100,45 @@ class PagedEngine:
         _add_count(self.stats.prefill_shape_active_tokens, shape_key, real_tokens)
         _add_count(self.stats.prefill_shape_model_tokens, shape_key, model_tokens)
 
+    def _record_prefix_reuse_match_stats(
+        self,
+        prefix_cache: object,
+        *,
+        shared_tokens: int,
+        aligned_tokens: int,
+    ) -> None:
+        candidate_tokens = int(
+            getattr(prefix_cache, "last_share_candidate_tokens", shared_tokens)
+        )
+        page_aligned_tokens = int(
+            getattr(prefix_cache, "last_share_aligned_tokens", aligned_tokens)
+        )
+        alignment_loss_tokens = int(
+            getattr(
+                prefix_cache,
+                "last_share_alignment_loss_tokens",
+                max(0, candidate_tokens - page_aligned_tokens),
+            )
+        )
+        page_size = int(getattr(prefix_cache, "last_share_page_size", self.page_size))
+        forced_suffix_tokens = max(0, page_aligned_tokens - int(shared_tokens))
+        if candidate_tokens <= 0 and shared_tokens <= 0:
+            return
+        self.stats.prefix_reuse_candidate_tokens += max(0, candidate_tokens)
+        self.stats.prefix_reuse_page_aligned_tokens += max(0, page_aligned_tokens)
+        self.stats.prefix_reuse_alignment_loss_tokens += max(0, alignment_loss_tokens)
+        self.stats.prefix_reuse_forced_suffix_tokens += forced_suffix_tokens
+        _add_count(
+            self.stats.prefix_reuse_candidate_token_counts,
+            str(max(0, candidate_tokens)),
+        )
+        if alignment_loss_tokens > 0:
+            _add_count(
+                self.stats.prefix_reuse_alignment_loss_token_counts,
+                str(alignment_loss_tokens),
+            )
+        _add_count(self.stats.prefix_reuse_page_size_counts, str(max(1, page_size)))
+
     def _shared_prefix_prefill_groups(self, admitted: list[dict]) -> list[tuple[int, list[dict], list[int], bool]]:
         shared = [a for a in admitted if int(a["shared"]) > 0]
         if not shared:
@@ -1197,9 +1307,17 @@ class PagedEngine:
                 # COW: share the longest cached page-aligned prefix (zero-copy) so we
                 # prefill only the suffix. Deterministic across TP ranks (same cache +
                 # tokens -> same share), keeping per-request prefill collectives aligned.
-                shared = self.prefix_cache.share_into(rid, prompt) if self.prefix_cache is not None else 0
+                prefix_cache = self.prefix_cache
+                shared = prefix_cache.share_into(rid, prompt) if prefix_cache is not None else 0
+                aligned_shared = int(shared)
                 if shared >= len(prompt):  # whole prompt cached -> keep >=1 token to prefill
                     shared = max(0, (len(prompt) - 1) // self.page_size * self.page_size)
+                if prefix_cache is not None and (aligned_shared > 0 or shared > 0):
+                    self._record_prefix_reuse_match_stats(
+                        prefix_cache,
+                        shared_tokens=int(shared),
+                        aligned_tokens=aligned_shared,
+                    )
                 self.cache.reserve(rid, len(prompt) + max_new)
                 self.cache._sequences[rid].length = len(prompt)
                 admitted.append({"ext": ext_id, "rid": rid, "prompt": prompt,

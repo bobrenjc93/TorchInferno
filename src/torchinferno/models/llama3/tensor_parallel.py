@@ -39,6 +39,7 @@ _SYMM_REDUCE_DISABLED = False
 _SYMM_MEM_ALLREDUCE_MAX_BATCH_OVERRIDE: list[int | None] = [None]
 _SYMM_MEM_ALLREDUCE_ENABLED_OVERRIDE: list[bool | None] = [None]
 _DEFAULT_DECODE_STEP_MAX_BATCH = 64
+_PackedPrefillAttentionGroup = tuple[int, int, Tensor, tuple[int, ...], tuple[int, ...]]
 
 
 @contextmanager
@@ -1058,6 +1059,9 @@ def _ragged_decode_cache_token_bucket(
     if not cache.layers:
         return 0
     max_seq_len = int(cache.layers[0].max_seq_len)
+    explicit_limit = _ragged_decode_cache_token_limit(cache, max_seq_len, batch=batch)
+    if explicit_limit is not None:
+        return explicit_limit
     if not _tp_flag("TORCHINFERNO_CUDAGRAPH_RAGGED_DECODE_CACHE_TOKEN_BUCKETS", False):
         return max_seq_len
     if row_indices is None:
@@ -1078,6 +1082,30 @@ def _ragged_decode_cache_token_bucket(
         if bucket >= needed:
             return min(int(bucket), max_seq_len)
     return max_seq_len
+
+
+def _ragged_decode_cache_token_limit(
+    cache: Llama3TensorParallelCache,
+    max_seq_len: int,
+    *,
+    batch: int,
+) -> int | None:
+    raw_limit = getattr(cache, "_torchinferno_ragged_decode_cache_token_limit", None)
+    if raw_limit is None:
+        return None
+    try:
+        min_batch = int(getattr(cache, "_torchinferno_ragged_decode_cache_token_min_batch", 1))
+    except (TypeError, ValueError):
+        min_batch = 1
+    if batch < max(1, min_batch):
+        return None
+    try:
+        limit = int(raw_limit)
+    except (TypeError, ValueError):
+        return None
+    if limit <= 0:
+        return None
+    return max(1, min(limit, max_seq_len))
 
 
 def _prepare_paged_ragged_decode_graph_state(
@@ -1258,6 +1286,7 @@ class _StaticRaggedDecodeLogitsGraphCall:
     cache_token_bucket: int
     static_paged_decode_page_tables: tuple[Tensor, ...] | None = None
     static_paged_decode_seq_lens: tuple[Tensor, ...] | None = None
+    rotary_in_graph: bool = False
 
 
 @dataclass
@@ -1274,6 +1303,25 @@ class _StaticRaggedDecodeGraphCall:
     cache_token_bucket: int
     static_paged_decode_page_tables: tuple[Tensor, ...] | None = None
     static_paged_decode_seq_lens: tuple[Tensor, ...] | None = None
+    rotary_in_graph: bool = False
+
+
+@dataclass
+class _StaticRaggedDecodeManyGraphCall:
+    graph: torch.cuda.CUDAGraph
+    static_input_ids: Tensor
+    static_cache_positions: Tensor
+    static_row_indices: Tensor | None
+    static_rotary_cos: Tensor
+    static_rotary_sin: Tensor
+    output_tokens: Tensor
+    cache: Llama3TensorParallelCache
+    max_seq_len: int
+    cache_token_bucket: int
+    steps: int
+    static_paged_decode_page_tables: tuple[Tensor, ...] | None = None
+    static_paged_decode_seq_lens: tuple[Tensor, ...] | None = None
+    rotary_in_graph: bool = True
 
 
 @dataclass
@@ -1282,16 +1330,42 @@ class _StaticRaggedPrefillLogitsGraphCall:
     static_input_ids: Tensor  # [batch, suffix_bucket]
     static_start_positions: Tensor  # [batch] per-row prefix length (write start)
     static_write_positions: Tensor  # [batch, suffix_bucket] absolute KV write columns
+    static_query_offsets: Tensor  # [suffix_bucket] offsets added to start positions
     static_row_indices: Tensor | None  # [batch] scattered physical rows
     static_rotary_cos: Tensor  # [batch, suffix_bucket, rotary_dim]
     static_rotary_sin: Tensor  # [batch, suffix_bucket, rotary_dim]
-    static_logit_positions: Tensor  # [batch] real last-token index per row
+    static_logit_positions: Tensor | None  # [batch] real last-token index per row
     static_src_prefix_row: Tensor | None  # [1] shared-prefix source row (folded copy)
-    output_logits: Tensor  # [batch, 1, local_vocab_size]
+    output_logits: Tensor  # [batch, 1, local_vocab_size], or empty for no-logits prefill
     cache: Llama3TensorParallelCache
     max_seq_len: int
     suffix_bucket: int
     context_len: int | None
+    prefix_copy_len: int | None
+    emit_logits: bool = True
+    rotary_in_graph: bool = False
+    write_positions_in_graph: bool = False
+
+
+@dataclass
+class _StaticPackedRaggedPrefillLogitsGraphCall:
+    graph: torch.cuda.CUDAGraph
+    static_input_ids: Tensor
+    static_start_positions: Tensor
+    static_q_lens: Tensor
+    static_row_indices: Tensor
+    static_logit_positions: Tensor
+    static_src_prefix_row: Tensor | None
+    static_request_offsets: Tensor
+    static_flat_token_indices: Tensor
+    static_flat_request_indices: Tensor
+    packed_attention_groups: tuple[_PackedPrefillAttentionGroup, ...]
+    output_logits: Tensor
+    cache: Llama3TensorParallelCache
+    max_seq_len: int
+    suffix_bucket: int
+    q_lens_key: tuple[int, ...]
+    start_positions_key: tuple[int, ...]
     prefix_copy_len: int | None
 
 
@@ -1908,6 +1982,161 @@ class _Llama3TensorParallelLayer:
             context_len=context_len,
         )
         out = out.transpose(1, 2).contiguous().view(batch, tokens, self.local_hidden_size)
+        return self._decode_linear_all_reduce(out, self.o_proj_weight, "attention", self.o_proj_weight_decode)
+
+    def forward_prefill_packed_eager(
+        self,
+        hidden: Tensor,
+        attn_in: Tensor | None,
+        rotary: tuple[Tensor, Tensor],
+        cache: Llama3TensorParallelLayerKVCache,
+        start_positions: Tensor,
+        write_positions: Tensor,
+        row_indices: Tensor,
+        flat_rows: Tensor,
+        q_lens: Tensor,
+        request_offsets: Tensor,
+        packed_attention_groups: tuple[_PackedPrefillAttentionGroup, ...],
+        next_norm_weight: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        residual = hidden
+        attention = self._attention_prefill_packed_eager(
+            hidden,
+            attn_in,
+            rotary,
+            cache,
+            start_positions,
+            write_positions,
+            row_indices,
+            flat_rows,
+            q_lens,
+            request_offsets,
+            packed_attention_groups,
+        )
+        hidden, mlp_in = _tp_decode_add_rms_norm(
+            attention,
+            residual,
+            self.post_attention_layernorm_weight,
+            self.config.rms_norm_eps,
+        )
+        residual = hidden
+        projected = self._mlp_project_decode_reduce(mlp_in)
+        return _tp_decode_add_rms_norm(projected, residual, next_norm_weight, self.config.rms_norm_eps)
+
+    def forward_prefill_packed_flashinfer(
+        self,
+        hidden: Tensor,
+        attn_in: Tensor | None,
+        rotary: tuple[Tensor, Tensor],
+        cache: FlashInferLayerKVCache,
+        write_positions: Tensor,
+        flat_rows: Tensor,
+        flashinfer_wrapper: object,
+        next_norm_weight: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        residual = hidden
+        attention = self._attention_prefill_packed_flashinfer(
+            hidden,
+            attn_in,
+            rotary,
+            cache,
+            write_positions,
+            flat_rows,
+            flashinfer_wrapper,
+        )
+        hidden, mlp_in = _tp_decode_add_rms_norm(
+            attention,
+            residual,
+            self.post_attention_layernorm_weight,
+            self.config.rms_norm_eps,
+        )
+        residual = hidden
+        projected = self._mlp_project_decode_reduce(mlp_in)
+        return _tp_decode_add_rms_norm(projected, residual, next_norm_weight, self.config.rms_norm_eps)
+
+    def _attention_prefill_packed_eager(
+        self,
+        hidden: Tensor,
+        attn_in: Tensor | None,
+        rotary: tuple[Tensor, Tensor],
+        cache: Llama3TensorParallelLayerKVCache,
+        start_positions: Tensor,
+        write_positions: Tensor,
+        row_indices: Tensor,
+        flat_rows: Tensor,
+        q_lens: Tensor,
+        request_offsets: Tensor,
+        packed_attention_groups: tuple[_PackedPrefillAttentionGroup, ...],
+    ) -> Tensor:
+        # Packed eager oracle for ragged prefill: projections run on the compact
+        # real-token stream, while attention is sliced back per request so tokens
+        # from different rows never attend to each other.
+        batch, tokens, _ = hidden.shape
+        if batch != 1:
+            raise ValueError("packed ragged prefill expects a single flattened token row")
+        if attn_in is None:
+            attn_in = _tp_decode_rms_norm(hidden, self.input_layernorm_weight, self.config.rms_norm_eps)
+        q, k, v = self._qkv(attn_in, batch, tokens, self.config.head_dim)
+        enable_gqa = self.local_attention_heads != self.local_key_value_heads
+        q, k = _apply_rotary_ragged_prefill(q, k, rotary)
+        _append_ragged_kv_prefill(
+            cache,
+            k.permute(2, 1, 0, 3).contiguous(),
+            v.permute(2, 1, 0, 3).contiguous(),
+            write_positions.view(tokens, 1),
+            flat_rows,
+        )
+        out = _packed_prefill_scaled_dot_product_attention(
+            q,
+            cache.keys,
+            cache.values,
+            start_positions,
+            q_lens=q_lens,
+            row_indices=row_indices,
+            request_offsets=request_offsets,
+            packed_attention_groups=packed_attention_groups,
+            enable_gqa=enable_gqa,
+        )
+        out = out.transpose(1, 2).contiguous().view(batch, tokens, self.local_hidden_size)
+        return self._decode_linear_all_reduce(out, self.o_proj_weight, "attention", self.o_proj_weight_decode)
+
+    def _attention_prefill_packed_flashinfer(
+        self,
+        hidden: Tensor,
+        attn_in: Tensor | None,
+        rotary: tuple[Tensor, Tensor],
+        cache: FlashInferLayerKVCache,
+        write_positions: Tensor,
+        flat_rows: Tensor,
+        flashinfer_wrapper: object,
+    ) -> Tensor:
+        # True packed ragged prefill for FlashInfer caches: projections, MLP, and
+        # collectives run on only the real suffix tokens, while FlashInfer handles
+        # the per-request varlen causal attention plan.
+        batch, tokens, _ = hidden.shape
+        if batch != 1:
+            raise ValueError("packed FlashInfer prefill expects a single flattened token row")
+        if attn_in is None:
+            attn_in = _tp_decode_rms_norm(hidden, self.input_layernorm_weight, self.config.rms_norm_eps)
+        q, k, v = self._qkv(attn_in, batch, tokens, self.config.head_dim)
+        q, k = _apply_rotary_ragged_prefill(q, k, rotary)
+        _append_ragged_kv_prefill(
+            cache,
+            k.permute(2, 1, 0, 3).contiguous(),
+            v.permute(2, 1, 0, 3).contiguous(),
+            write_positions.view(tokens, 1),
+            flat_rows,
+        )
+        paged_kv = getattr(cache, "paged_kv", None)
+        if paged_kv is None:
+            raise ValueError("packed FlashInfer prefill requires FlashInfer KV storage")
+        q_packed = q.permute(0, 2, 1, 3).reshape(
+            tokens,
+            self.local_attention_heads,
+            self.config.head_dim,
+        )
+        out_packed = flashinfer_wrapper.run(q_packed, paged_kv)
+        out = out_packed.reshape(1, tokens, self.local_hidden_size)
         return self._decode_linear_all_reduce(out, self.o_proj_weight, "attention", self.o_proj_weight_decode)
 
     def forward_flashinfer(
@@ -2787,18 +3016,29 @@ class Llama3TensorParallelForCausalLM:
             tuple[int, int, int, int, bool, int],
             _StaticRaggedDecodeLogitsGraphCall,
         ] = {}
+        self._ragged_decode_many_graphs: dict[
+            tuple[int, int, int, int, int, int],
+            _StaticRaggedDecodeManyGraphCall,
+        ] = {}
         self._decode_graph_failed = False
         self._decode_logits_graph_failed = False
         self._ragged_decode_graph_failed = False
         self._ragged_decode_logits_graph_failed = False
+        self._ragged_decode_many_graph_failed = False
         self._ragged_prefill_logits_graphs: dict[
-            tuple[int, int, int, int, bool, int, int, tuple[bool, ...], int],
+            tuple[int, int, int, int, bool, int, int, int, tuple[bool, ...], int, int, int, int],
             _StaticRaggedPrefillLogitsGraphCall,
         ] = {}
+        self._packed_ragged_prefill_logits_graphs: dict[
+            tuple[object, ...],
+            _StaticPackedRaggedPrefillLogitsGraphCall,
+        ] = {}
+        self._packed_ragged_prefill_logits_graph_seen: dict[tuple[object, ...], int] = {}
         self._ragged_prefill_logits_graph_evictions = 0
         self._ragged_prefill_logits_graph_evicted_entries = 0
         self._ragged_prefill_logits_graph_max_entries = 0
         self._ragged_prefill_logits_graph_failed = False
+        self._packed_ragged_prefill_logits_graph_failed = False
         self._ragged_prefill_mixed_logits_graph_failed = False
         self._ragged_prefill_capture_on_miss_failed = False
         self._temperature_gumbel_generators: dict[str, torch.Generator] = {}
@@ -3718,6 +3958,7 @@ class Llama3TensorParallelForCausalLM:
         capture_on_miss: bool = True,
     ) -> Tensor | None:
         self._last_ragged_decode_logits_graph_captured = None
+        self._last_ragged_decode_logits_graph_key = None
         if self._ragged_decode_logits_graph_failed or not _should_use_ragged_decode_logits_graph(
             input_ids,
             cache,
@@ -3739,6 +3980,7 @@ class Llama3TensorParallelForCausalLM:
                 print(f"rank={self.rank} ragged_decode_logits_graph_failed={exc!r}", flush=True)
             self._ragged_decode_logits_graph_failed = True
             self._last_ragged_decode_logits_graph_captured = None
+            self._last_ragged_decode_logits_graph_key = None
             return None
 
     def try_decode_ragged_token_graph(
@@ -3752,6 +3994,7 @@ class Llama3TensorParallelForCausalLM:
         capture_on_miss: bool = True,
     ) -> Tensor | None:
         self._last_ragged_decode_graph_captured = None
+        self._last_ragged_decode_graph_key = None
         if getattr(cache, "_block_decode_graph_captures", False):
             capture_on_miss = False
         if self._ragged_decode_graph_failed or not _should_use_ragged_decode_token_graph(
@@ -3776,6 +4019,50 @@ class Llama3TensorParallelForCausalLM:
                 print(f"rank={self.rank} ragged_decode_token_graph_failed={exc!r}", flush=True)
             self._ragged_decode_graph_failed = True
             self._last_ragged_decode_graph_captured = None
+            self._last_ragged_decode_graph_key = None
+            return None
+
+    def try_decode_ragged_token_graph_many(
+        self,
+        input_ids: Tensor,
+        cache: Llama3TensorParallelCache,
+        *,
+        seq_lens: Tensor,
+        row_indices: Tensor | None = None,
+        steps: int = 1,
+        temperature: float = 0.0,
+        capture_on_miss: bool = True,
+    ) -> Tensor | None:
+        self._last_ragged_decode_many_graph_captured = None
+        if (
+            steps <= 1
+            or getattr(cache, "cache_backend", "dense") != "dense"
+            or getattr(cache, "_block_decode_graph_captures", False)
+        ):
+            return None
+        if self._ragged_decode_many_graph_failed or not _should_use_ragged_decode_token_graph(
+            input_ids,
+            cache,
+            seq_lens,
+            row_indices,
+            temperature,
+        ):
+            return None
+        try:
+            return self._run_ragged_decode_many_graph(
+                input_ids,
+                cache,
+                seq_lens=seq_lens,
+                row_indices=row_indices,
+                steps=int(steps),
+                capture_on_miss=capture_on_miss,
+            )
+        except Exception as exc:
+            warn_optional_failure("llama3_tensor_parallel.ragged_decode_many_graph", exc)
+            if _tp_flag("TORCHINFERNO_CUDAGRAPH_DECODE_DEBUG", False):
+                print(f"rank={self.rank} ragged_decode_many_graph_failed={exc!r}", flush=True)
+            self._ragged_decode_many_graph_failed = True
+            self._last_ragged_decode_many_graph_captured = None
             return None
 
     def release_decode_graphs_for_cache(self, cache: Llama3TensorParallelCache) -> None:
@@ -3788,6 +4075,7 @@ class Llama3TensorParallelForCausalLM:
             self._decode_logits_graphs,
             getattr(self, "_ragged_decode_graphs", {}),
             self._ragged_decode_logits_graphs,
+            getattr(self, "_ragged_decode_many_graphs", {}),
         ):
             for key, captured in list(graph_map.items()):
                 if key[0] in cache_ids or getattr(captured, "cache", None) is cache:
@@ -3952,6 +4240,7 @@ class Llama3TensorParallelForCausalLM:
             _symm_mem_allreduce_graph_key(input_ids.size(0), _model_world_size(self)),
         )
         captured = self._ragged_decode_graphs.get(key)
+        self._last_ragged_decode_graph_key = key
         needs_capture = (
             captured is None
             or captured.cache is not cache
@@ -3964,6 +4253,7 @@ class Llama3TensorParallelForCausalLM:
         if needs_capture:
             if not capture_on_miss:
                 self._last_ragged_decode_graph_captured = None
+                self._last_ragged_decode_graph_key = None
                 return None
             captured = self._capture_ragged_decode_graph(
                 input_ids,
@@ -3974,7 +4264,13 @@ class Llama3TensorParallelForCausalLM:
             )
         else:
             self._copy_ragged_decode_graph_inputs(captured, input_ids, seq_lens, row_indices)
-            captured.graph.replay()
+            if not self._maybe_profile_ragged_decode_graph_replay_once(
+                captured,
+                input_ids,
+                cache_token_bucket=cache_token_bucket,
+                row_indices=row_indices,
+            ):
+                captured.graph.replay()
         self._last_ragged_decode_graph_captured = bool(needs_capture)
         _advance_paged_ragged_decode_cache_lengths(
             cache,
@@ -3983,6 +4279,214 @@ class Llama3TensorParallelForCausalLM:
             row_indices=captured.static_row_indices,
         )
         return captured.output_token
+
+    def _run_ragged_decode_many_graph(
+        self,
+        input_ids: Tensor,
+        cache: Llama3TensorParallelCache,
+        *,
+        seq_lens: Tensor,
+        row_indices: Tensor | None,
+        steps: int,
+        capture_on_miss: bool = True,
+    ) -> Tensor | None:
+        if not cache.layers:
+            raise ValueError("ragged decode requires a non-empty KV cache")
+        steps = max(1, int(steps))
+        cache_token_bucket = _ragged_decode_cache_token_bucket(
+            cache,
+            seq_lens,
+            row_indices,
+            batch=input_ids.size(0),
+        )
+        selected = (
+            seq_lens[: input_ids.size(0)]
+            if row_indices is None
+            else seq_lens.index_select(0, row_indices.to(device=seq_lens.device))
+        )
+        if selected.numel():
+            needed = int(selected.max().item()) + steps
+            if needed > cache_token_bucket:
+                return None
+        key = (
+            id(cache),
+            input_ids.size(0),
+            cache.layers[0].max_seq_len,
+            cache_token_bucket,
+            steps,
+            row_indices is not None,
+            _symm_mem_allreduce_graph_key(input_ids.size(0), _model_world_size(self)),
+        )
+        captured = self._ragged_decode_many_graphs.get(key)
+        needs_capture = (
+            captured is None
+            or captured.cache is not cache
+            or captured.max_seq_len != cache.layers[0].max_seq_len
+            or captured.cache_token_bucket != cache_token_bucket
+            or captured.static_input_ids.shape != input_ids.shape
+            or captured.steps != steps
+            or (captured.static_row_indices is None) != (row_indices is None)
+        )
+        needs_capture = _capture_needed_on_any_rank(needs_capture, self.device) if not getattr(cache, "_skip_capture_sync", False) else needs_capture
+        if needs_capture:
+            if not capture_on_miss:
+                self._last_ragged_decode_many_graph_captured = None
+                return None
+            captured = self._capture_ragged_decode_many_graph(
+                input_ids,
+                cache,
+                seq_lens,
+                row_indices,
+                steps=steps,
+                cache_token_bucket=cache_token_bucket,
+            )
+        else:
+            self._copy_ragged_decode_graph_inputs(captured, input_ids, seq_lens, row_indices)
+            captured.graph.replay()
+        self._last_ragged_decode_many_graph_captured = bool(needs_capture)
+        return captured.output_tokens
+
+    def _capture_ragged_decode_many_graph(
+        self,
+        input_ids: Tensor,
+        cache: Llama3TensorParallelCache,
+        seq_lens: Tensor,
+        row_indices: Tensor | None,
+        *,
+        steps: int,
+        cache_token_bucket: int,
+    ) -> _StaticRaggedDecodeManyGraphCall:
+        batch = input_ids.size(0)
+        rotary_cache_dim = self.rotary_cos_cache.size(1)
+        static_row_indices = torch.empty_like(row_indices) if row_indices is not None else None
+        captured = _StaticRaggedDecodeManyGraphCall(
+            graph=torch.cuda.CUDAGraph(),
+            static_input_ids=torch.empty_like(input_ids),
+            static_cache_positions=torch.empty((batch,), device=self.device, dtype=torch.int64),
+            static_row_indices=static_row_indices,
+            static_rotary_cos=torch.empty((batch, rotary_cache_dim), device=self.device, dtype=self.dtype),
+            static_rotary_sin=torch.empty((batch, rotary_cache_dim), device=self.device, dtype=self.dtype),
+            output_tokens=torch.empty((steps, batch), device=self.device, dtype=torch.long),
+            cache=cache,
+            max_seq_len=cache.layers[0].max_seq_len,
+            cache_token_bucket=cache_token_bucket,
+            steps=int(steps),
+            rotary_in_graph=True,
+        )
+        self._copy_ragged_decode_graph_inputs(captured, input_ids, seq_lens, row_indices)
+        stream = torch.cuda.Stream(device=self.device)
+        stream.wait_stream(torch.cuda.current_stream(self.device))
+        try:
+            with torch.cuda.stream(stream):
+                self._forward_decode_ragged_many_static(captured)
+            torch.cuda.current_stream(self.device).wait_stream(stream)
+            with torch.cuda.graph(captured.graph):
+                self._forward_decode_ragged_many_static(captured)
+            captured.graph.replay()
+        finally:
+            pass
+        key = (
+            id(cache),
+            input_ids.size(0),
+            cache.layers[0].max_seq_len,
+            cache_token_bucket,
+            int(steps),
+            row_indices is not None,
+            _symm_mem_allreduce_graph_key(input_ids.size(0), _model_world_size(self)),
+        )
+        max_graphs = _tp_int("TORCHINFERNO_CUDAGRAPH_DECODE_STEP_MAX_GRAPHS", 4096, minimum=1)
+        if key not in self._ragged_decode_many_graphs and len(self._ragged_decode_many_graphs) >= max_graphs:
+            self._ragged_decode_many_graphs.clear()
+        self._ragged_decode_many_graphs[key] = captured
+        return captured
+
+    def _forward_decode_ragged_many_static(
+        self,
+        captured: _StaticRaggedDecodeManyGraphCall,
+    ) -> None:
+        token_ids = captured.static_input_ids
+        for step in range(captured.steps):
+            cache_positions = (
+                captured.static_cache_positions
+                if step == 0
+                else captured.static_cache_positions + step
+            )
+            rotary = (
+                self.rotary_cos_cache.index_select(0, cache_positions),
+                self.rotary_sin_cache.index_select(0, cache_positions),
+            )
+            logits = self._forward_decode_ragged_static(
+                token_ids,
+                captured.cache,
+                cache_positions,
+                captured.static_row_indices,
+                rotary,
+                captured.cache_token_bucket,
+            )
+            next_token = self._sample_next_token(logits[:, -1, :], 0.0)
+            captured.output_tokens[step].copy_(next_token)
+            token_ids = next_token.view(next_token.size(0), 1)
+
+    def _maybe_profile_ragged_decode_graph_replay_once(
+        self,
+        captured: _StaticRaggedDecodeGraphCall,
+        input_ids: Tensor,
+        *,
+        cache_token_bucket: int,
+        row_indices: Tensor | None,
+    ) -> bool:
+        if (
+            not env_flag("TORCHINFERNO_PROFILE_RAGGED_DECODE_REPLAY_ONCE", False)
+            or getattr(self, "_ragged_decode_replay_profiled", False)
+            or input_ids.device.type != "cuda"
+        ):
+            return False
+        min_batch = env_int("TORCHINFERNO_PROFILE_RAGGED_DECODE_MIN_BATCH", 32, minimum=1)
+        if input_ids.size(0) < min_batch:
+            return False
+        configured_bucket = os.environ.get("TORCHINFERNO_PROFILE_RAGGED_DECODE_CACHE_BUCKET")
+        if configured_bucket is not None and configured_bucket.strip():
+            if int(configured_bucket) != int(cache_token_bucket):
+                return False
+        skip_matches = env_int(
+            "TORCHINFERNO_PROFILE_RAGGED_DECODE_REPLAY_SKIP_MATCHES", 0, minimum=0
+        )
+        profile_matches = int(getattr(self, "_ragged_decode_replay_profile_matches", 0)) + 1
+        self._ragged_decode_replay_profile_matches = profile_matches
+        if profile_matches <= skip_matches:
+            return False
+        self._ragged_decode_replay_profiled = True
+        rank = getattr(self, "rank", 0)
+        if rank != 0:
+            captured.graph.replay()
+            return True
+        replayed = False
+        try:
+            import sys as _rdp
+            from torch.profiler import ProfilerActivity as _PA
+            from torch.profiler import profile as _tprof
+
+            torch.cuda.synchronize(self.device)
+            with _tprof(activities=[_PA.CPU, _PA.CUDA]) as prof:
+                captured.graph.replay()
+                replayed = True
+                torch.cuda.synchronize(self.device)
+            rows = int(row_indices.numel()) if row_indices is not None else input_ids.size(0)
+            row_limit = env_int("TORCHINFERNO_PROFILE_RAGGED_DECODE_ROW_LIMIT", 24, minimum=1)
+            print(
+                f"[RAGGED_DECODE_REPLAY_PROF] batch={input_ids.size(0)} "
+                f"match={profile_matches} "
+                f"cache_bucket={cache_token_bucket} "
+                f"rows={rows}\n"
+                + prof.key_averages().table(sort_by="cuda_time_total", row_limit=row_limit),
+                file=_rdp.stderr,
+                flush=True,
+            )
+        except Exception as exc:
+            warn_optional_failure("llama3_tensor_parallel.ragged_decode_replay_profile", exc)
+            if not replayed:
+                captured.graph.replay()
+        return True
 
     def _run_ragged_decode_logits_graph(
         self,
@@ -4010,6 +4514,7 @@ class Llama3TensorParallelForCausalLM:
             _symm_mem_allreduce_graph_key(input_ids.size(0), _model_world_size(self)),
         )
         captured = self._ragged_decode_logits_graphs.get(key)
+        self._last_ragged_decode_logits_graph_key = key
         needs_capture = (
             captured is None
             or captured.cache is not cache
@@ -4022,6 +4527,7 @@ class Llama3TensorParallelForCausalLM:
         if needs_capture:
             if not capture_on_miss:
                 self._last_ragged_decode_logits_graph_captured = None
+                self._last_ragged_decode_logits_graph_key = None
                 return None
             captured = self._capture_ragged_decode_logits_graph(
                 input_ids,
@@ -4067,6 +4573,7 @@ class Llama3TensorParallelForCausalLM:
             cache=cache,
             max_seq_len=cache.layers[0].max_seq_len,
             cache_token_bucket=cache_token_bucket,
+            rotary_in_graph=_tp_flag("TORCHINFERNO_CUDAGRAPH_RAGGED_DECODE_ROTARY_IN_GRAPH", True),
         )
         self._copy_ragged_decode_graph_inputs(captured, input_ids, seq_lens, row_indices)
         stream = torch.cuda.Stream(device=self.device)
@@ -4079,7 +4586,7 @@ class Llama3TensorParallelForCausalLM:
                     cache,
                     captured.static_cache_positions,
                     captured.static_row_indices,
-                    (captured.static_rotary_cos, captured.static_rotary_sin),
+                    self._ragged_decode_graph_rotary(captured),
                     captured.cache_token_bucket,
                 )
                 self._sample_next_token(logits[:, -1, :], 0.0)
@@ -4090,7 +4597,7 @@ class Llama3TensorParallelForCausalLM:
                     cache,
                     captured.static_cache_positions,
                     captured.static_row_indices,
-                    (captured.static_rotary_cos, captured.static_rotary_sin),
+                    self._ragged_decode_graph_rotary(captured),
                     captured.cache_token_bucket,
                 )
                 captured.output_token = self._sample_next_token(logits[:, -1, :], 0.0)
@@ -4138,6 +4645,7 @@ class Llama3TensorParallelForCausalLM:
             cache=cache,
             max_seq_len=cache.layers[0].max_seq_len,
             cache_token_bucket=cache_token_bucket,
+            rotary_in_graph=_tp_flag("TORCHINFERNO_CUDAGRAPH_RAGGED_DECODE_ROTARY_IN_GRAPH", False),
         )
         self._copy_ragged_decode_graph_inputs(captured, input_ids, seq_lens, row_indices)
         stream = torch.cuda.Stream(device=self.device)
@@ -4150,7 +4658,7 @@ class Llama3TensorParallelForCausalLM:
                     cache,
                     captured.static_cache_positions,
                     captured.static_row_indices,
-                    (captured.static_rotary_cos, captured.static_rotary_sin),
+                    self._ragged_decode_graph_rotary(captured),
                     captured.cache_token_bucket,
                 )
             torch.cuda.current_stream(self.device).wait_stream(stream)
@@ -4160,7 +4668,7 @@ class Llama3TensorParallelForCausalLM:
                     cache,
                     captured.static_cache_positions,
                     captured.static_row_indices,
-                    (captured.static_rotary_cos, captured.static_rotary_sin),
+                    self._ragged_decode_graph_rotary(captured),
                     captured.cache_token_bucket,
                 )
             captured.graph.replay()
@@ -4199,8 +4707,9 @@ class Llama3TensorParallelForCausalLM:
             cache_positions = seq_lens.index_select(0, row_indices)
         captured.static_input_ids.copy_(input_ids)
         captured.static_cache_positions.copy_(cache_positions)
-        captured.static_rotary_cos.copy_(self.rotary_cos_cache.index_select(0, cache_positions))
-        captured.static_rotary_sin.copy_(self.rotary_sin_cache.index_select(0, cache_positions))
+        if not getattr(captured, "rotary_in_graph", False):
+            captured.static_rotary_cos.copy_(self.rotary_cos_cache.index_select(0, cache_positions))
+            captured.static_rotary_sin.copy_(self.rotary_sin_cache.index_select(0, cache_positions))
         paged_state = _prepare_paged_ragged_decode_graph_state(
             captured.cache,
             batch=input_ids.size(0),
@@ -4214,6 +4723,18 @@ class Llama3TensorParallelForCausalLM:
         if paged_state is not None:
             captured.static_paged_decode_page_tables = paged_state[0]
             captured.static_paged_decode_seq_lens = paged_state[1]
+
+    def _ragged_decode_graph_rotary(
+        self,
+        captured: _StaticRaggedDecodeGraphCall | _StaticRaggedDecodeLogitsGraphCall,
+    ) -> tuple[Tensor, Tensor]:
+        if getattr(captured, "rotary_in_graph", False):
+            positions = captured.static_cache_positions
+            return (
+                self.rotary_cos_cache.index_select(0, positions),
+                self.rotary_sin_cache.index_select(0, positions),
+            )
+        return captured.static_rotary_cos, captured.static_rotary_sin
 
     def _capture_decode_step_logits_graph(
         self,
@@ -4482,20 +5003,17 @@ class Llama3TensorParallelForCausalLM:
             attn_in = _tp_decode_rms_norm(hidden, self.norm_weight, self.config.rms_norm_eps)
         return _decode_linear(attn_in, self.lm_head_weight, self.lm_head_weight_decode)
 
-    def _forward_prefill_ragged_static(
+    def _copy_ragged_prefill_prefix(
         self,
-        input_ids: Tensor,
         cache: Llama3TensorParallelCache,
+        *,
+        input_tokens: int,
         start_positions: Tensor,
-        write_positions: Tensor,
         row_indices: Tensor | None,
-        rotary: tuple[Tensor, Tensor],
-        logit_positions: Tensor,
-        context_len: int | None = None,
-        src_prefix_row: Tensor | None = None,
+        context_len: int | None,
+        src_prefix_row: Tensor | None,
         prefix_copy_len: int | None = None,
-    ) -> Tensor:
-        batch = input_ids.size(0)
+    ) -> None:
         # Fold the prefix KV broadcast INTO the graph: copy [0:prefix_len] from
         # each source row into its active row, per layer, via advanced indexing.
         # Captured once, replayed in one launch -- removes the ~80 per-layer
@@ -4504,49 +5022,74 @@ class Llama3TensorParallelForCausalLM:
         # rows; row_indices re-targets dest rows. A single source row broadcasts
         # for common-prefix reuse, and one source per request handles full-prompt
         # reuse with equal prefix lengths.
-        if src_prefix_row is not None and row_indices is not None:
-            if context_len is not None:
-                if context_len < 0:
-                    prefix_len = (-context_len) - input_ids.size(1)
-                else:
-                    prefix_len = context_len - input_ids.size(1)
-                if prefix_len > 0:
-                    for layer in cache.layers:
-                        layer.keys[row_indices, :, :prefix_len, :] = layer.keys.index_select(
-                            0, src_prefix_row
-                        )[:, :, :prefix_len, :]
-                        layer.values[row_indices, :, :prefix_len, :] = layer.values.index_select(
-                            0, src_prefix_row
-                        )[:, :, :prefix_len, :]
+        if src_prefix_row is None or row_indices is None:
+            return
+        if context_len is not None:
+            if context_len < 0:
+                prefix_len = (-context_len) - input_tokens
             else:
-                prefix_len = (
-                    int(prefix_copy_len)
-                    if prefix_copy_len is not None
-                    else int(start_positions.max().item()) if start_positions.numel() else 0
-                )
-                if prefix_len > 0:
-                    source_rows = src_prefix_row
-                    if source_rows.numel() == 1 and row_indices.numel() > 1:
-                        source_rows = source_rows.expand(row_indices.numel())
-                    mask = (
-                        torch.arange(prefix_len, device=self.device)[None, :]
-                        < start_positions[:, None]
-                    )
-                    for layer in cache.layers:
-                        source_keys = layer.keys.index_select(0, source_rows)[:, :, :prefix_len, :]
-                        source_values = layer.values.index_select(0, source_rows)[:, :, :prefix_len, :]
-                        zero_key = torch.zeros((), dtype=source_keys.dtype, device=source_keys.device)
-                        zero_value = torch.zeros((), dtype=source_values.dtype, device=source_values.device)
-                        layer.keys[row_indices, :, :prefix_len, :] = torch.where(
-                            mask[:, None, :, None],
-                            source_keys,
-                            zero_key,
-                        )
-                        layer.values[row_indices, :, :prefix_len, :] = torch.where(
-                            mask[:, None, :, None],
-                            source_values,
-                            zero_value,
-                        )
+                prefix_len = context_len - input_tokens
+            if prefix_len > 0:
+                for layer in cache.layers:
+                    layer.keys[row_indices, :, :prefix_len, :] = layer.keys.index_select(
+                        0, src_prefix_row
+                    )[:, :, :prefix_len, :]
+                    layer.values[row_indices, :, :prefix_len, :] = layer.values.index_select(
+                        0, src_prefix_row
+                    )[:, :, :prefix_len, :]
+            return
+        prefix_len = (
+            int(prefix_copy_len)
+            if prefix_copy_len is not None
+            else int(start_positions.max().item()) if start_positions.numel() else 0
+        )
+        if prefix_len <= 0:
+            return
+        source_rows = src_prefix_row
+        if source_rows.numel() == 1 and row_indices.numel() > 1:
+            source_rows = source_rows.expand(row_indices.numel())
+        mask = torch.arange(prefix_len, device=self.device)[None, :] < start_positions[:, None]
+        for layer in cache.layers:
+            source_keys = layer.keys.index_select(0, source_rows)[:, :, :prefix_len, :]
+            source_values = layer.values.index_select(0, source_rows)[:, :, :prefix_len, :]
+            zero_key = torch.zeros((), dtype=source_keys.dtype, device=source_keys.device)
+            zero_value = torch.zeros((), dtype=source_values.dtype, device=source_values.device)
+            layer.keys[row_indices, :, :prefix_len, :] = torch.where(
+                mask[:, None, :, None],
+                source_keys,
+                zero_key,
+            )
+            layer.values[row_indices, :, :prefix_len, :] = torch.where(
+                mask[:, None, :, None],
+                source_values,
+                zero_value,
+            )
+
+    def _forward_prefill_ragged_static(
+        self,
+        input_ids: Tensor,
+        cache: Llama3TensorParallelCache,
+        start_positions: Tensor,
+        write_positions: Tensor,
+        row_indices: Tensor | None,
+        rotary: tuple[Tensor, Tensor],
+        logit_positions: Tensor | None,
+        context_len: int | None = None,
+        src_prefix_row: Tensor | None = None,
+        prefix_copy_len: int | None = None,
+        *,
+        emit_logits: bool = True,
+    ) -> Tensor:
+        batch = input_ids.size(0)
+        self._copy_ragged_prefill_prefix(
+            cache,
+            input_tokens=input_ids.size(1),
+            start_positions=start_positions,
+            row_indices=row_indices,
+            context_len=context_len,
+            src_prefix_row=src_prefix_row,
+            prefix_copy_len=prefix_copy_len,
+        )
         hidden = F.embedding(input_ids.to(self.device, non_blocking=True), self.embed_tokens_weight)
         attn_in: Tensor | None = None
         for layer_id, layer in enumerate(self.layers):
@@ -4568,6 +5111,10 @@ class Llama3TensorParallelForCausalLM:
             )
         if attn_in is None:
             attn_in = _tp_decode_rms_norm(hidden, self.norm_weight, self.config.rms_norm_eps)
+        if not emit_logits:
+            return attn_in.new_empty((0,))
+        if logit_positions is None:
+            raise ValueError("logit_positions are required when emit_logits is true")
         gather_positions = logit_positions.view(batch, 1, 1).expand(-1, 1, attn_in.size(-1))
         gathered = torch.gather(attn_in, 1, gather_positions)
         return _decode_linear(gathered, self.lm_head_weight, self.lm_head_weight_decode)
@@ -4649,6 +5196,37 @@ class Llama3TensorParallelForCausalLM:
         else:
             paged_kv_indices = torch.arange(batch, dtype=torch.int32, device=self.device)
         paged_kv_last_page_len = (seq_lens + q_lens).to(torch.int32)
+        wrapper.plan(
+            qo_indptr=qo_indptr,
+            paged_kv_indptr=paged_kv_indptr,
+            paged_kv_indices=paged_kv_indices,
+            paged_kv_last_page_len=paged_kv_last_page_len,
+            num_qo_heads=self.layers[0].local_attention_heads,
+            num_kv_heads=self.layers[0].local_key_value_heads,
+            head_dim_qk=self.config.head_dim,
+            page_size=max_seq,
+            causal=True,
+            q_data_type=self.dtype,
+        )
+
+    def _plan_packed_flashinfer_prefill(
+        self,
+        wrapper: object,
+        cache: Llama3TensorParallelCache,
+        *,
+        start_positions: Tensor,
+        q_lens: Tensor,
+        row_indices: Tensor,
+    ) -> None:
+        # Host-side varlen plan for packed suffix prefill. Each dense cache row is
+        # exposed to FlashInfer as one large page, matching forward_flashinfer.
+        batch = q_lens.size(0)
+        max_seq = cache.layers[0].max_seq_len
+        qo_indptr = torch.zeros(batch + 1, dtype=torch.int32, device=self.device)
+        qo_indptr[1:] = q_lens.to(torch.int32).cumsum(0)
+        paged_kv_indptr = torch.arange(batch + 1, dtype=torch.int32, device=self.device)
+        paged_kv_indices = row_indices.to(dtype=torch.int32, device=self.device)
+        paged_kv_last_page_len = (start_positions + q_lens).to(torch.int32)
         wrapper.plan(
             qo_indptr=qo_indptr,
             paged_kv_indptr=paged_kv_indptr,
@@ -5184,6 +5762,611 @@ class Llama3TensorParallelForCausalLM:
         # block of tokens into scattered cache rows with per-row prefix offsets,
         # returning one (sharded) logit row per request at logit_positions. This
         # is the oracle the CUDA graph captures and the CPU test compares against.
+        return self._prefill_ragged_impl(
+            input_ids,
+            cache,
+            seq_lens=seq_lens,
+            row_indices=row_indices,
+            logit_positions=logit_positions,
+            context_len=context_len,
+            src_prefix_row=src_prefix_row,
+            prefix_copy_len=prefix_copy_len,
+            emit_logits=True,
+        )
+
+    @torch.inference_mode()
+    def prefill_ragged_logits_packed_eager(
+        self,
+        input_ids: Tensor,
+        cache: Llama3TensorParallelCache,
+        *,
+        seq_lens: Tensor,
+        q_lens: Tensor,
+        row_indices: Tensor | None = None,
+        logit_positions: Tensor,
+        src_prefix_row: Tensor | None = None,
+        prefix_copy_len: int | None = None,
+    ) -> Tensor:
+        # Dense eager oracle for a future packed ragged-prefill kernel. It skips
+        # padded suffix columns entirely while preserving the padded oracle's KV
+        # row/position contract and one-logit-per-request output contract.
+        if input_ids.ndim != 2:
+            raise ValueError("packed ragged prefill expects input_ids [batch, suffix_bucket]")
+        if getattr(cache, "cache_backend", "dense") != "dense":
+            raise ValueError("packed eager ragged prefill currently requires a dense KV cache")
+        if not cache.layers:
+            raise ValueError("packed ragged prefill requires a non-empty KV cache")
+        batch, suffix_bucket = input_ids.shape
+        input_ids = input_ids.to(self.device, non_blocking=True)
+        seq_lens = seq_lens.to(self.device, non_blocking=True)
+        q_lens = q_lens.to(self.device, non_blocking=True)
+        logit_positions = logit_positions.to(self.device, non_blocking=True)
+        if q_lens.ndim != 1 or q_lens.numel() != batch:
+            raise ValueError("q_lens must have shape [batch]")
+        if logit_positions.ndim != 1 or logit_positions.numel() != batch:
+            raise ValueError("logit_positions must have shape [batch]")
+        if row_indices is not None:
+            row_indices = row_indices.to(self.device, non_blocking=True)
+            if row_indices.ndim != 1 or row_indices.numel() != batch:
+                raise ValueError("row_indices must have shape [batch]")
+        else:
+            row_indices = torch.arange(batch, dtype=torch.long, device=self.device)
+        if src_prefix_row is not None:
+            src_prefix_row = src_prefix_row.to(self.device, non_blocking=True)
+        if bool(torch.any(q_lens <= 0)):
+            raise ValueError("q_lens must be positive")
+        if bool(torch.any(q_lens > suffix_bucket)):
+            raise ValueError("q_lens cannot exceed the input suffix bucket")
+        if bool(torch.any(logit_positions < 0)) or bool(torch.any(logit_positions >= q_lens)):
+            raise ValueError("logit_positions must select real packed suffix tokens")
+        start_positions = seq_lens.index_select(0, row_indices)
+        if bool(torch.any(start_positions < 0)):
+            raise ValueError("seq_lens must be non-negative")
+        max_seq = cache.layers[0].max_seq_len
+        if bool(torch.any(start_positions + q_lens > max_seq)):
+            raise ValueError("KV cache capacity exceeded")
+        q_lens_cpu = tuple(int(v) for v in q_lens.detach().cpu().tolist())
+        start_positions_cpu = tuple(int(v) for v in start_positions.detach().cpu().tolist())
+        request_offsets_cpu = _packed_prefill_offsets_from_q_lens(q_lens_cpu)
+        request_offsets = torch.tensor(
+            request_offsets_cpu,
+            dtype=torch.long,
+            device=self.device,
+        )
+        packed_attention_groups = _build_packed_prefill_attention_groups(
+            q_lens_cpu,
+            start_positions_cpu,
+            request_offsets_cpu,
+            device=self.device,
+        )
+        flat_token_indices, flat_request_indices = _packed_prefill_flat_indices(
+            q_lens_cpu,
+            suffix_bucket,
+            device=self.device,
+        )
+
+        return self._prefill_ragged_logits_packed_eager_compute(
+            input_ids,
+            cache,
+            start_positions=start_positions,
+            q_lens=q_lens,
+            row_indices=row_indices,
+            logit_positions=logit_positions,
+            src_prefix_row=src_prefix_row,
+            prefix_copy_len=prefix_copy_len,
+            request_offsets=request_offsets,
+            flat_token_indices=flat_token_indices,
+            flat_request_indices=flat_request_indices,
+            packed_attention_groups=packed_attention_groups,
+        )
+
+    def _prefill_ragged_logits_packed_eager_compute(
+        self,
+        input_ids: Tensor,
+        cache: Llama3TensorParallelCache,
+        *,
+        start_positions: Tensor,
+        q_lens: Tensor,
+        row_indices: Tensor,
+        logit_positions: Tensor,
+        src_prefix_row: Tensor | None,
+        prefix_copy_len: int | None,
+        request_offsets: Tensor,
+        flat_token_indices: Tensor,
+        flat_request_indices: Tensor,
+        packed_attention_groups: tuple[_PackedPrefillAttentionGroup, ...],
+    ) -> Tensor:
+        batch, suffix_bucket = input_ids.shape
+        query_offsets = torch.arange(suffix_bucket, device=self.device)
+        flat_input_ids = input_ids.reshape(-1).index_select(0, flat_token_indices).view(1, -1)
+        total_tokens = flat_input_ids.size(1)
+        if total_tokens <= 0:
+            raise ValueError("packed ragged prefill requires at least one token")
+        bucket_write_positions = start_positions[:, None] + query_offsets[None, :]
+        flat_write_positions = bucket_write_positions.reshape(-1).index_select(
+            0,
+            flat_token_indices,
+        )
+        flat_rows = row_indices.index_select(0, flat_request_indices)
+
+        self._copy_ragged_prefill_prefix(
+            cache,
+            input_tokens=suffix_bucket,
+            start_positions=start_positions,
+            row_indices=row_indices,
+            context_len=None,
+            src_prefix_row=src_prefix_row,
+            prefix_copy_len=prefix_copy_len,
+        )
+        rotary = (
+            self.rotary_cos_cache.index_select(0, flat_write_positions).view(1, total_tokens, -1),
+            self.rotary_sin_cache.index_select(0, flat_write_positions).view(1, total_tokens, -1),
+        )
+        hidden = F.embedding(flat_input_ids, self.embed_tokens_weight)
+        attn_in: Tensor | None = None
+        for layer_id, layer in enumerate(self.layers):
+            next_norm_weight = (
+                self.layers[layer_id + 1].input_layernorm_weight
+                if layer_id + 1 < len(self.layers)
+                else self.norm_weight
+            )
+            hidden, attn_in = layer.forward_prefill_packed_eager(
+                hidden,
+                attn_in,
+                rotary,
+                cache.layers[layer_id],
+                start_positions,
+                flat_write_positions,
+                row_indices,
+                flat_rows,
+                q_lens,
+                request_offsets,
+                packed_attention_groups,
+                next_norm_weight,
+            )
+        if attn_in is None:
+            attn_in = _tp_decode_rms_norm(hidden, self.norm_weight, self.config.rms_norm_eps)
+        flat_logit_positions = request_offsets + logit_positions
+        gathered = attn_in.squeeze(0).index_select(0, flat_logit_positions).view(batch, 1, -1)
+        return _decode_linear(gathered, self.lm_head_weight, self.lm_head_weight_decode)
+
+    @torch.inference_mode()
+    def try_prefill_ragged_logits_packed_eager_graph(
+        self,
+        input_ids: Tensor,
+        cache: Llama3TensorParallelCache,
+        *,
+        seq_lens: Tensor,
+        q_lens: Tensor,
+        row_indices: Tensor | None = None,
+        logit_positions: Tensor,
+        src_prefix_row: Tensor | None = None,
+        prefix_copy_len: int | None = None,
+        capture_on_miss: bool = True,
+    ) -> Tensor | None:
+        if (
+            self._packed_ragged_prefill_logits_graph_failed
+            or input_ids.device.type != "cuda"
+            or getattr(cache, "cache_backend", "dense") != "dense"
+            or not cache.layers
+        ):
+            return None
+        try:
+            return self._run_packed_ragged_prefill_logits_graph(
+                input_ids,
+                cache,
+                seq_lens=seq_lens,
+                q_lens=q_lens,
+                row_indices=row_indices,
+                logit_positions=logit_positions,
+                src_prefix_row=src_prefix_row,
+                prefix_copy_len=prefix_copy_len,
+                capture_on_miss=capture_on_miss,
+            )
+        except Exception as exc:
+            warn_optional_failure("llama3_tensor_parallel.packed_ragged_prefill_logits_graph", exc)
+            if _tp_flag("TORCHINFERNO_CUDAGRAPH_PREFILL_DEBUG", False):
+                print(f"rank={self.rank} packed_ragged_prefill_logits_graph_failed={exc!r}", flush=True)
+            self._packed_ragged_prefill_logits_graph_failed = True
+            return None
+
+    def _run_packed_ragged_prefill_logits_graph(
+        self,
+        input_ids: Tensor,
+        cache: Llama3TensorParallelCache,
+        *,
+        seq_lens: Tensor,
+        q_lens: Tensor,
+        row_indices: Tensor | None,
+        logit_positions: Tensor,
+        src_prefix_row: Tensor | None = None,
+        prefix_copy_len: int | None = None,
+        capture_on_miss: bool = True,
+    ) -> Tensor | None:
+        batch, suffix_bucket = input_ids.shape
+        if batch <= 0 or suffix_bucket <= 0:
+            return None
+        q_lens = q_lens.to(self.device, non_blocking=True)
+        logit_positions = logit_positions.to(self.device, non_blocking=True)
+        if row_indices is None:
+            row_indices = torch.arange(batch, dtype=torch.long, device=self.device)
+        else:
+            row_indices = row_indices.to(self.device, non_blocking=True)
+        seq_lens = seq_lens.to(self.device, non_blocking=True)
+        start_positions = seq_lens.index_select(0, row_indices)
+        q_lens_key = tuple(int(value) for value in q_lens.detach().cpu().tolist())
+        start_positions_key = tuple(
+            int(value) for value in start_positions.detach().cpu().tolist()
+        )
+        logit_positions_key = tuple(
+            int(value) for value in logit_positions.detach().cpu().tolist()
+        )
+        if not q_lens_key or all(q_len >= suffix_bucket for q_len in q_lens_key):
+            return None
+        if any(q_len <= 0 or q_len > suffix_bucket for q_len in q_lens_key):
+            return None
+        if logit_positions_key != tuple(q_len - 1 for q_len in q_lens_key):
+            return None
+        if any(start < 0 for start in start_positions_key):
+            return None
+        max_seq_len = cache.layers[0].max_seq_len
+        if any(start + q_len > max_seq_len for start, q_len in zip(start_positions_key, q_lens_key)):
+            return None
+        src_prefix_rows = int(src_prefix_row.numel()) if src_prefix_row is not None else 0
+        precision_key = _ragged_prefill_precision_graph_key(
+            sum(q_lens_key),
+            is_cuda=input_ids.is_cuda,
+            layers=self.layers,
+        )
+        key = (
+            id(cache),
+            batch,
+            suffix_bucket,
+            max_seq_len,
+            q_lens_key,
+            start_positions_key,
+            src_prefix_rows,
+            prefix_copy_len if prefix_copy_len is not None else -1,
+            precision_key,
+            _symm_mem_allreduce_graph_key(1, _model_world_size(self)),
+        )
+        captured = self._packed_ragged_prefill_logits_graphs.get(key)
+        needs_capture = (
+            captured is None
+            or captured.cache is not cache
+            or captured.max_seq_len != max_seq_len
+            or captured.static_input_ids.shape != input_ids.shape
+            or captured.q_lens_key != q_lens_key
+            or captured.start_positions_key != start_positions_key
+            or captured.prefix_copy_len != prefix_copy_len
+            or (captured.static_src_prefix_row is None) != (src_prefix_row is None)
+        )
+        needs_capture = _capture_needed_on_any_rank(needs_capture, self.device)
+        if needs_capture:
+            if not capture_on_miss:
+                return None
+            if captured is None:
+                min_capture_calls = _tp_int(
+                    "TORCHINFERNO_CONTINUOUS_PACKED_RAGGED_PREFILL_EAGER_GRAPH_CAPTURE_MIN_CALLS",
+                    2,
+                    minimum=1,
+                )
+                seen = self._packed_ragged_prefill_logits_graph_seen.get(key, 0) + 1
+                self._packed_ragged_prefill_logits_graph_seen[key] = seen
+                if seen < min_capture_calls:
+                    return None
+            succeeded = True
+            new_captured: _StaticPackedRaggedPrefillLogitsGraphCall | None = None
+            try:
+                new_captured = self._capture_packed_ragged_prefill_logits_graph(
+                    input_ids,
+                    cache,
+                    start_positions=start_positions,
+                    q_lens=q_lens,
+                    row_indices=row_indices,
+                    logit_positions=logit_positions,
+                    src_prefix_row=src_prefix_row,
+                    prefix_copy_len=prefix_copy_len,
+                    q_lens_key=q_lens_key,
+                    start_positions_key=start_positions_key,
+                )
+            except Exception:
+                succeeded = False
+            succeeded = _capture_succeeded_on_all_ranks(succeeded, self.device)
+            if not succeeded or new_captured is None:
+                return None
+            captured = new_captured
+            self._packed_ragged_prefill_logits_graphs[key] = captured
+        else:
+            self._copy_packed_ragged_prefill_graph_inputs(
+                captured,
+                input_ids,
+                start_positions=start_positions,
+                row_indices=row_indices,
+                src_prefix_row=src_prefix_row,
+            )
+            captured.graph.replay()
+        return captured.output_logits
+
+    def _capture_packed_ragged_prefill_logits_graph(
+        self,
+        input_ids: Tensor,
+        cache: Llama3TensorParallelCache,
+        *,
+        start_positions: Tensor,
+        q_lens: Tensor,
+        row_indices: Tensor,
+        logit_positions: Tensor,
+        src_prefix_row: Tensor | None,
+        prefix_copy_len: int | None,
+        q_lens_key: tuple[int, ...],
+        start_positions_key: tuple[int, ...],
+    ) -> _StaticPackedRaggedPrefillLogitsGraphCall:
+        batch, suffix_bucket = input_ids.shape
+        request_offsets_cpu = _packed_prefill_offsets_from_q_lens(q_lens_key)
+        flat_token_indices, flat_request_indices = _packed_prefill_flat_indices(
+            q_lens_key,
+            suffix_bucket,
+            device=self.device,
+        )
+        packed_attention_groups = _build_packed_prefill_attention_groups(
+            q_lens_key,
+            start_positions_key,
+            request_offsets_cpu,
+            device=self.device,
+        )
+        captured = _StaticPackedRaggedPrefillLogitsGraphCall(
+            graph=torch.cuda.CUDAGraph(),
+            static_input_ids=torch.empty_like(input_ids),
+            static_start_positions=torch.empty((batch,), dtype=torch.long, device=self.device),
+            static_q_lens=torch.tensor(q_lens_key, dtype=torch.long, device=self.device),
+            static_row_indices=torch.empty((batch,), dtype=torch.long, device=self.device),
+            static_logit_positions=torch.tensor(
+                [q_len - 1 for q_len in q_lens_key],
+                dtype=torch.long,
+                device=self.device,
+            ),
+            static_src_prefix_row=(
+                torch.empty_like(src_prefix_row) if src_prefix_row is not None else None
+            ),
+            static_request_offsets=torch.tensor(
+                request_offsets_cpu,
+                dtype=torch.long,
+                device=self.device,
+            ),
+            static_flat_token_indices=flat_token_indices,
+            static_flat_request_indices=flat_request_indices,
+            packed_attention_groups=packed_attention_groups,
+            output_logits=torch.empty(
+                (batch, 1, self.local_vocab_size),
+                device=self.device,
+                dtype=self.dtype,
+            ),
+            cache=cache,
+            max_seq_len=cache.layers[0].max_seq_len,
+            suffix_bucket=suffix_bucket,
+            q_lens_key=q_lens_key,
+            start_positions_key=start_positions_key,
+            prefix_copy_len=prefix_copy_len,
+        )
+        self._copy_packed_ragged_prefill_graph_inputs(
+            captured,
+            input_ids,
+            start_positions=start_positions,
+            row_indices=row_indices,
+            src_prefix_row=src_prefix_row,
+        )
+        stream = torch.cuda.Stream(device=self.device)
+        stream.wait_stream(torch.cuda.current_stream(self.device))
+        with torch.cuda.stream(stream):
+            self._prefill_ragged_logits_packed_eager_compute(
+                captured.static_input_ids,
+                cache,
+                start_positions=captured.static_start_positions,
+                q_lens=captured.static_q_lens,
+                row_indices=captured.static_row_indices,
+                logit_positions=captured.static_logit_positions,
+                src_prefix_row=captured.static_src_prefix_row,
+                prefix_copy_len=prefix_copy_len,
+                request_offsets=captured.static_request_offsets,
+                flat_token_indices=captured.static_flat_token_indices,
+                flat_request_indices=captured.static_flat_request_indices,
+                packed_attention_groups=captured.packed_attention_groups,
+            )
+        torch.cuda.current_stream(self.device).wait_stream(stream)
+        with torch.cuda.graph(captured.graph):
+            captured.output_logits = self._prefill_ragged_logits_packed_eager_compute(
+                captured.static_input_ids,
+                cache,
+                start_positions=captured.static_start_positions,
+                q_lens=captured.static_q_lens,
+                row_indices=captured.static_row_indices,
+                logit_positions=captured.static_logit_positions,
+                src_prefix_row=captured.static_src_prefix_row,
+                prefix_copy_len=prefix_copy_len,
+                request_offsets=captured.static_request_offsets,
+                flat_token_indices=captured.static_flat_token_indices,
+                flat_request_indices=captured.static_flat_request_indices,
+                packed_attention_groups=captured.packed_attention_groups,
+            )
+        captured.graph.replay()
+        return captured
+
+    def _copy_packed_ragged_prefill_graph_inputs(
+        self,
+        captured: _StaticPackedRaggedPrefillLogitsGraphCall,
+        input_ids: Tensor,
+        *,
+        start_positions: Tensor,
+        row_indices: Tensor,
+        src_prefix_row: Tensor | None,
+    ) -> None:
+        captured.static_input_ids.copy_(input_ids.to(self.device, non_blocking=True))
+        captured.static_start_positions.copy_(
+            start_positions.to(self.device, non_blocking=True)
+        )
+        captured.static_row_indices.copy_(row_indices.to(self.device, non_blocking=True))
+        if captured.static_src_prefix_row is not None and src_prefix_row is not None:
+            captured.static_src_prefix_row.copy_(
+                src_prefix_row.to(self.device, non_blocking=True)
+            )
+
+    @torch.inference_mode()
+    def prefill_ragged_logits_packed_flashinfer(
+        self,
+        input_ids: Tensor,
+        cache: Llama3TensorParallelCache,
+        *,
+        seq_lens: Tensor,
+        q_lens: Tensor,
+        row_indices: Tensor | None = None,
+        logit_positions: Tensor,
+        src_prefix_row: Tensor | None = None,
+        prefix_copy_len: int | None = None,
+    ) -> Tensor:
+        # FlashInfer-backed packed ragged prefill. Unlike forward_step_flashinfer,
+        # this removes padded suffix columns from the whole transformer block, not
+        # just from the attention query tensor. It is intentionally a concrete
+        # opt-in path so dense graph prefill remains the default reference.
+        if input_ids.ndim != 2:
+            raise ValueError("packed FlashInfer prefill expects input_ids [batch, suffix_bucket]")
+        if getattr(cache, "cache_backend", "dense") != "flashinfer":
+            raise ValueError("packed FlashInfer prefill requires a FlashInfer KV cache")
+        if not cache.layers:
+            raise ValueError("packed FlashInfer prefill requires a non-empty KV cache")
+        batch, suffix_bucket = input_ids.shape
+        input_ids = input_ids.to(self.device, non_blocking=True)
+        seq_lens = seq_lens.to(self.device, non_blocking=True)
+        q_lens = q_lens.to(self.device, non_blocking=True)
+        logit_positions = logit_positions.to(self.device, non_blocking=True)
+        if q_lens.ndim != 1 or q_lens.numel() != batch:
+            raise ValueError("q_lens must have shape [batch]")
+        if logit_positions.ndim != 1 or logit_positions.numel() != batch:
+            raise ValueError("logit_positions must have shape [batch]")
+        if row_indices is not None:
+            row_indices = row_indices.to(self.device, non_blocking=True)
+            if row_indices.ndim != 1 or row_indices.numel() != batch:
+                raise ValueError("row_indices must have shape [batch]")
+            start_positions = seq_lens.index_select(0, row_indices)
+        else:
+            row_indices = torch.arange(batch, dtype=torch.long, device=self.device)
+            start_positions = seq_lens[:batch]
+            if start_positions.numel() != batch:
+                raise ValueError("seq_lens must cover the ragged prefill batch")
+        if src_prefix_row is not None:
+            src_prefix_row = src_prefix_row.to(self.device, non_blocking=True)
+        if bool(torch.any(q_lens <= 0)):
+            raise ValueError("q_lens must be positive")
+        if bool(torch.any(q_lens > suffix_bucket)):
+            raise ValueError("q_lens cannot exceed the input suffix bucket")
+        if bool(torch.any(logit_positions < 0)) or bool(torch.any(logit_positions >= q_lens)):
+            raise ValueError("logit_positions must select real packed suffix tokens")
+        if bool(torch.any(start_positions < 0)):
+            raise ValueError("seq_lens must be non-negative")
+        max_seq = cache.layers[0].max_seq_len
+        if bool(torch.any(start_positions + q_lens > max_seq)):
+            raise ValueError("KV cache capacity exceeded")
+
+        query_offsets = torch.arange(suffix_bucket, device=self.device)
+        real_token_mask = query_offsets[None, :] < q_lens[:, None]
+        flat_input_ids = input_ids[real_token_mask].view(1, -1)
+        total_tokens = flat_input_ids.size(1)
+        if total_tokens <= 0:
+            raise ValueError("packed FlashInfer prefill requires at least one token")
+        bucket_write_positions = start_positions[:, None] + query_offsets[None, :]
+        flat_write_positions = bucket_write_positions[real_token_mask]
+        flat_rows = row_indices[:, None].expand(batch, suffix_bucket)[real_token_mask]
+        request_offsets = torch.empty(batch, dtype=torch.long, device=self.device)
+        request_offsets[0] = 0
+        if batch > 1:
+            request_offsets[1:] = torch.cumsum(q_lens[:-1], dim=0)
+
+        self._copy_ragged_prefill_prefix(
+            cache,
+            input_tokens=suffix_bucket,
+            start_positions=start_positions,
+            row_indices=row_indices,
+            context_len=None,
+            src_prefix_row=src_prefix_row,
+            prefix_copy_len=prefix_copy_len,
+        )
+        wrapper = self._flashinfer_prefill_wrapper()
+        self._plan_packed_flashinfer_prefill(
+            wrapper,
+            cache,
+            start_positions=start_positions,
+            q_lens=q_lens,
+            row_indices=row_indices,
+        )
+        rotary = (
+            self.rotary_cos_cache.index_select(0, flat_write_positions).view(1, total_tokens, -1),
+            self.rotary_sin_cache.index_select(0, flat_write_positions).view(1, total_tokens, -1),
+        )
+        hidden = F.embedding(flat_input_ids, self.embed_tokens_weight)
+        attn_in: Tensor | None = None
+        for layer_id, layer in enumerate(self.layers):
+            next_norm_weight = (
+                self.layers[layer_id + 1].input_layernorm_weight
+                if layer_id + 1 < len(self.layers)
+                else self.norm_weight
+            )
+            hidden, attn_in = layer.forward_prefill_packed_flashinfer(
+                hidden,
+                attn_in,
+                rotary,
+                cache.layers[layer_id],
+                flat_write_positions,
+                flat_rows,
+                wrapper,
+                next_norm_weight,
+            )
+        if attn_in is None:
+            attn_in = _tp_decode_rms_norm(hidden, self.norm_weight, self.config.rms_norm_eps)
+        flat_logit_positions = request_offsets + logit_positions
+        gathered = attn_in.squeeze(0).index_select(0, flat_logit_positions).view(batch, 1, -1)
+        return _decode_linear(gathered, self.lm_head_weight, self.lm_head_weight_decode)
+
+    @torch.inference_mode()
+    def prefill_ragged_cache(
+        self,
+        input_ids: Tensor,
+        cache: Llama3TensorParallelCache,
+        *,
+        seq_lens: Tensor,
+        row_indices: Tensor | None = None,
+        context_len: int | None = None,
+        src_prefix_row: Tensor | None = None,
+        prefix_copy_len: int | None = None,
+    ) -> bool:
+        # No-logits variant for intermediate chunked prefill: populate KV for a
+        # suffix chunk, but skip the final gather/lm_head projection because no
+        # request emits a token until its last prompt chunk.
+        self._prefill_ragged_impl(
+            input_ids,
+            cache,
+            seq_lens=seq_lens,
+            row_indices=row_indices,
+            logit_positions=None,
+            context_len=context_len,
+            src_prefix_row=src_prefix_row,
+            prefix_copy_len=prefix_copy_len,
+            emit_logits=False,
+        )
+        return True
+
+    def _prefill_ragged_impl(
+        self,
+        input_ids: Tensor,
+        cache: Llama3TensorParallelCache,
+        *,
+        seq_lens: Tensor,
+        row_indices: Tensor | None,
+        logit_positions: Tensor | None,
+        context_len: int | None,
+        src_prefix_row: Tensor | None,
+        prefix_copy_len: int | None,
+        emit_logits: bool,
+    ) -> Tensor:
         if input_ids.ndim != 2:
             raise ValueError("ragged prefill expects input_ids [batch, suffix]")
         if not cache.layers:
@@ -5191,9 +6374,12 @@ class Llama3TensorParallelForCausalLM:
         batch, suffix = input_ids.shape
         input_ids = input_ids.to(self.device, non_blocking=True)
         seq_lens = seq_lens.to(self.device, non_blocking=True)
-        logit_positions = logit_positions.to(self.device, non_blocking=True)
-        if logit_positions.ndim != 1 or logit_positions.numel() != batch:
-            raise ValueError("logit_positions must have shape [batch]")
+        if logit_positions is not None:
+            logit_positions = logit_positions.to(self.device, non_blocking=True)
+            if logit_positions.ndim != 1 or logit_positions.numel() != batch:
+                raise ValueError("logit_positions must have shape [batch]")
+        elif emit_logits:
+            raise ValueError("logit_positions are required when emit_logits is true")
         if row_indices is not None:
             row_indices = row_indices.to(self.device, non_blocking=True)
             if row_indices.ndim != 1 or row_indices.numel() != batch:
@@ -5206,7 +6392,10 @@ class Llama3TensorParallelForCausalLM:
         max_seq = cache.layers[0].max_seq_len
         if bool(torch.any(start_positions < 0)):
             raise ValueError("seq_lens must be non-negative")
-        if bool(torch.any(start_positions + logit_positions >= max_seq)):
+        if logit_positions is not None:
+            if bool(torch.any(start_positions + logit_positions >= max_seq)):
+                raise ValueError("KV cache capacity exceeded")
+        elif bool(torch.any(start_positions + max(0, suffix - 1) >= max_seq)):
             raise ValueError("KV cache capacity exceeded")
         query_offsets = torch.arange(suffix, device=self.device)
         write_positions = (start_positions[:, None] + query_offsets[None, :]).clamp(max=max_seq - 1)
@@ -5216,20 +6405,21 @@ class Llama3TensorParallelForCausalLM:
         )
         if src_prefix_row is not None:
             src_prefix_row = src_prefix_row.to(self.device, non_blocking=True)
-        profiled = self._maybe_profile_ragged_prefill_once(
-            input_ids,
-            cache,
-            start_positions,
-            write_positions,
-            row_indices,
-            rotary,
-            logit_positions,
-            context_len,
-            src_prefix_row,
-            prefix_copy_len,
-        )
-        if profiled is not None:
-            return profiled
+        if emit_logits and logit_positions is not None:
+            profiled = self._maybe_profile_ragged_prefill_once(
+                input_ids,
+                cache,
+                start_positions,
+                write_positions,
+                row_indices,
+                rotary,
+                logit_positions,
+                context_len,
+                src_prefix_row,
+                prefix_copy_len,
+            )
+            if profiled is not None:
+                return profiled
         return self._forward_prefill_ragged_static(
             input_ids,
             cache,
@@ -5241,6 +6431,7 @@ class Llama3TensorParallelForCausalLM:
             context_len,
             src_prefix_row,
             prefix_copy_len,
+            emit_logits=emit_logits,
         )
 
     @staticmethod
@@ -5304,6 +6495,59 @@ class Llama3TensorParallelForCausalLM:
             self._ragged_prefill_logits_graph_failed = True
             return None
 
+    def try_prefill_ragged_cache_graph(
+        self,
+        input_ids: Tensor,
+        cache: Llama3TensorParallelCache,
+        *,
+        seq_lens: Tensor,
+        row_indices: Tensor | None = None,
+        context_len: int | None = None,
+        src_prefix_row: Tensor | None = None,
+        prefix_copy_len: int | None = None,
+        capture_on_miss: bool = True,
+    ) -> bool | None:
+        self._last_ragged_prefill_graph_captured = False
+        src_prefix_rows = int(src_prefix_row.numel()) if src_prefix_row is not None else 0
+        if getattr(self, "_ragged_prefill_mixed_logits_graph_failed", False) and (
+            self._is_mixed_prefix_ragged_prefill_graph(
+                context_len=context_len,
+                src_prefix_rows=src_prefix_rows,
+                prefix_copy_len=prefix_copy_len,
+            )
+        ):
+            return None
+        if getattr(self, "_ragged_prefill_capture_on_miss_failed", False):
+            capture_on_miss = False
+        if self._ragged_prefill_logits_graph_failed or not _should_use_ragged_prefill_graph(
+            input_ids,
+            cache,
+            seq_lens,
+            row_indices,
+            None,
+        ):
+            return None
+        try:
+            output = self._run_ragged_prefill_logits_graph(
+                input_ids,
+                cache,
+                seq_lens=seq_lens,
+                row_indices=row_indices,
+                logit_positions=None,
+                context_len=context_len,
+                src_prefix_row=src_prefix_row,
+                prefix_copy_len=prefix_copy_len,
+                capture_on_miss=capture_on_miss,
+                emit_logits=False,
+            )
+            return True if output is not None else None
+        except Exception as exc:
+            warn_optional_failure("llama3_tensor_parallel.ragged_prefill_cache_graph", exc)
+            if _tp_flag("TORCHINFERNO_CUDAGRAPH_PREFILL_DEBUG", False):
+                print(f"rank={self.rank} ragged_prefill_cache_graph_failed={exc!r}", flush=True)
+            self._ragged_prefill_logits_graph_failed = True
+            return None
+
     def _run_ragged_prefill_logits_graph(
         self,
         input_ids: Tensor,
@@ -5311,11 +6555,12 @@ class Llama3TensorParallelForCausalLM:
         *,
         seq_lens: Tensor,
         row_indices: Tensor | None,
-        logit_positions: Tensor,
+        logit_positions: Tensor | None,
         context_len: int | None = None,
         src_prefix_row: Tensor | None = None,
         prefix_copy_len: int | None = None,
         capture_on_miss: bool = True,
+        emit_logits: bool = True,
     ) -> Tensor | None:
         if not cache.layers:
             raise ValueError("ragged prefill requires a non-empty KV cache")
@@ -5330,6 +6575,14 @@ class Llama3TensorParallelForCausalLM:
             is_cuda=input_ids.is_cuda,
             layers=self.layers,
         )
+        rotary_in_graph = _tp_flag(
+            "TORCHINFERNO_CUDAGRAPH_RAGGED_PREFILL_ROTARY_IN_GRAPH",
+            True,
+        )
+        write_positions_in_graph = _tp_flag(
+            "TORCHINFERNO_CUDAGRAPH_RAGGED_PREFILL_WRITE_POSITIONS_IN_GRAPH",
+            True,
+        )
         key = (
             id(cache),
             input_ids.size(0),
@@ -5341,6 +6594,9 @@ class Llama3TensorParallelForCausalLM:
             src_prefix_rows,
             precision_key,
             _symm_mem_allreduce_graph_key(input_ids.size(0), _model_world_size(self)),
+            int(bool(emit_logits)),
+            int(bool(rotary_in_graph)),
+            int(bool(write_positions_in_graph)),
         )
         captured = self._ragged_prefill_logits_graphs.get(key)
         needs_capture = (
@@ -5349,13 +6605,22 @@ class Llama3TensorParallelForCausalLM:
             or captured.max_seq_len != cache.layers[0].max_seq_len
             or captured.static_input_ids.shape != input_ids.shape
             or (captured.static_row_indices is None) != (row_indices is None)
+            or captured.emit_logits != bool(emit_logits)
             or captured.context_len != context_len
             or captured.prefix_copy_len != prefix_copy_len
+            or captured.rotary_in_graph != bool(rotary_in_graph)
+            or captured.write_positions_in_graph != bool(write_positions_in_graph)
             or (captured.static_src_prefix_row is None) != (src_prefix_row is None)
+            or (captured.static_logit_positions is None) != (logit_positions is None)
             or (
                 captured.static_src_prefix_row is not None
                 and src_prefix_row is not None
                 and captured.static_src_prefix_row.shape != src_prefix_row.shape
+            )
+            or (
+                captured.static_logit_positions is not None
+                and logit_positions is not None
+                and captured.static_logit_positions.shape != logit_positions.shape
             )
         )
         skip_sync = bool(getattr(cache, "_skip_capture_sync", False))
@@ -5375,6 +6640,9 @@ class Llama3TensorParallelForCausalLM:
                     context_len,
                     src_prefix_row,
                     prefix_copy_len,
+                    emit_logits,
+                    rotary_in_graph,
+                    write_positions_in_graph,
                 )
             except Exception:
                 succeeded = False
@@ -5410,8 +6678,80 @@ class Llama3TensorParallelForCausalLM:
             self._copy_ragged_prefill_graph_inputs(
                 captured, input_ids, seq_lens, row_indices, logit_positions, src_prefix_row
             )
+            if self._maybe_profile_ragged_prefill_graph_replay_once(
+                captured,
+                input_ids,
+                context_len,
+                src_prefix_row,
+                prefix_copy_len,
+            ):
+                return captured.output_logits
             captured.graph.replay()
         return captured.output_logits
+
+    def _maybe_profile_ragged_prefill_graph_replay_once(
+        self,
+        captured: _StaticRaggedPrefillLogitsGraphCall,
+        input_ids: Tensor,
+        context_len: int | None,
+        src_prefix_row: Tensor | None,
+        prefix_copy_len: int | None,
+    ) -> bool:
+        if (
+            not env_flag("TORCHINFERNO_PROFILE_RAGGED_PREFILL_REPLAY_ONCE", False)
+            or getattr(self, "_ragged_prefill_replay_profiled", False)
+            or input_ids.device.type != "cuda"
+        ):
+            return False
+        min_batch = env_int("TORCHINFERNO_PROFILE_RAGGED_PREFILL_MIN_BATCH", 32, minimum=1)
+        if input_ids.size(0) < min_batch:
+            return False
+        min_suffix = env_int("TORCHINFERNO_PROFILE_RAGGED_PREFILL_MIN_SUFFIX", 1, minimum=1)
+        if input_ids.size(1) < min_suffix:
+            return False
+        if not self._ragged_prefill_profile_context_matches(context_len):
+            return False
+        skip_matches = env_int(
+            "TORCHINFERNO_PROFILE_RAGGED_PREFILL_REPLAY_SKIP_MATCHES", 0, minimum=0
+        )
+        profile_matches = int(getattr(self, "_ragged_prefill_replay_profile_matches", 0)) + 1
+        self._ragged_prefill_replay_profile_matches = profile_matches
+        if profile_matches <= skip_matches:
+            return False
+        self._ragged_prefill_replay_profiled = True
+        rank = getattr(self, "rank", 0)
+        if rank != 0:
+            captured.graph.replay()
+            return True
+        replayed = False
+        try:
+            import sys as _rpp
+            from torch.profiler import ProfilerActivity as _PA
+            from torch.profiler import profile as _tprof
+
+            torch.cuda.synchronize(self.device)
+            with _tprof(activities=[_PA.CPU, _PA.CUDA]) as prof:
+                captured.graph.replay()
+                replayed = True
+                torch.cuda.synchronize(self.device)
+            src_rows = int(src_prefix_row.numel()) if src_prefix_row is not None else 0
+            row_limit = env_int("TORCHINFERNO_PROFILE_RAGGED_PREFILL_ROW_LIMIT", 24, minimum=1)
+            print(
+                f"[RAGGED_PREFILL_REPLAY_PROF] batch={input_ids.size(0)} "
+                f"suffix={input_ids.size(1)} "
+                f"match={profile_matches} "
+                f"context_len={context_len if context_len is not None else 'none'} "
+                f"src_rows={src_rows} "
+                f"prefix_copy_len={prefix_copy_len if prefix_copy_len is not None else 'none'}\n"
+                + prof.key_averages().table(sort_by="cuda_time_total", row_limit=row_limit),
+                file=_rpp.stderr,
+                flush=True,
+            )
+        except Exception as exc:
+            warn_optional_failure("llama3_tensor_parallel.ragged_prefill_replay_profile", exc)
+            if not replayed:
+                captured.graph.replay()
+        return True
 
     def _capture_ragged_prefill_logits_graph(
         self,
@@ -5419,75 +6759,93 @@ class Llama3TensorParallelForCausalLM:
         cache: Llama3TensorParallelCache,
         seq_lens: Tensor,
         row_indices: Tensor | None,
-        logit_positions: Tensor,
+        logit_positions: Tensor | None,
         context_len: int | None = None,
         src_prefix_row: Tensor | None = None,
         prefix_copy_len: int | None = None,
+        emit_logits: bool = True,
+        rotary_in_graph: bool = False,
+        write_positions_in_graph: bool = False,
     ) -> _StaticRaggedPrefillLogitsGraphCall:
         batch, suffix = input_ids.shape
         rotary_cache_dim = self.rotary_cos_cache.size(1)
         static_row_indices = torch.empty_like(row_indices) if row_indices is not None else None
         static_src_prefix_row = torch.empty_like(src_prefix_row) if src_prefix_row is not None else None
+        static_logit_positions = torch.empty_like(logit_positions) if logit_positions is not None else None
         captured = _StaticRaggedPrefillLogitsGraphCall(
             graph=torch.cuda.CUDAGraph(),
             static_input_ids=torch.empty_like(input_ids),
             static_start_positions=torch.empty((batch,), device=self.device, dtype=torch.int64),
             static_write_positions=torch.empty((batch, suffix), device=self.device, dtype=torch.int64),
+            static_query_offsets=torch.arange(suffix, device=self.device, dtype=torch.int64),
             static_row_indices=static_row_indices,
             static_rotary_cos=torch.empty((batch, suffix, rotary_cache_dim), device=self.device, dtype=self.dtype),
             static_rotary_sin=torch.empty((batch, suffix, rotary_cache_dim), device=self.device, dtype=self.dtype),
-            static_logit_positions=torch.empty((batch,), device=self.device, dtype=torch.int64),
+            static_logit_positions=static_logit_positions,
             static_src_prefix_row=static_src_prefix_row,
-            output_logits=torch.empty((batch, 1, self.local_vocab_size), device=self.device, dtype=self.dtype),
+            output_logits=(
+                torch.empty((batch, 1, self.local_vocab_size), device=self.device, dtype=self.dtype)
+                if emit_logits
+                else torch.empty((0,), device=self.device, dtype=self.dtype)
+            ),
             cache=cache,
             max_seq_len=cache.layers[0].max_seq_len,
             suffix_bucket=suffix,
             context_len=context_len,
             prefix_copy_len=prefix_copy_len,
+            emit_logits=bool(emit_logits),
+            rotary_in_graph=bool(rotary_in_graph),
+            write_positions_in_graph=bool(write_positions_in_graph),
         )
         self._copy_ragged_prefill_graph_inputs(
             captured, input_ids, seq_lens, row_indices, logit_positions, src_prefix_row
         )
-        self._maybe_profile_ragged_prefill_once(
-            captured.static_input_ids,
-            cache,
-            captured.static_start_positions,
-            captured.static_write_positions,
-            captured.static_row_indices,
-            (captured.static_rotary_cos, captured.static_rotary_sin),
-            captured.static_logit_positions,
-            context_len,
-            captured.static_src_prefix_row,
-            prefix_copy_len,
-        )
-        stream = torch.cuda.Stream(device=self.device)
-        stream.wait_stream(torch.cuda.current_stream(self.device))
-        with torch.cuda.stream(stream):
-            self._forward_prefill_ragged_static(
+        if emit_logits and captured.static_logit_positions is not None:
+            write_positions = self._ragged_prefill_graph_write_positions(captured)
+            self._maybe_profile_ragged_prefill_once(
                 captured.static_input_ids,
                 cache,
                 captured.static_start_positions,
-                captured.static_write_positions,
+                write_positions,
                 captured.static_row_indices,
-                (captured.static_rotary_cos, captured.static_rotary_sin),
+                self._ragged_prefill_graph_rotary(captured, write_positions),
                 captured.static_logit_positions,
                 context_len,
                 captured.static_src_prefix_row,
                 prefix_copy_len,
             )
-        torch.cuda.current_stream(self.device).wait_stream(stream)
-        with torch.cuda.graph(captured.graph):
-            captured.output_logits = self._forward_prefill_ragged_static(
+        stream = torch.cuda.Stream(device=self.device)
+        stream.wait_stream(torch.cuda.current_stream(self.device))
+        with torch.cuda.stream(stream):
+            write_positions = self._ragged_prefill_graph_write_positions(captured)
+            self._forward_prefill_ragged_static(
                 captured.static_input_ids,
                 cache,
                 captured.static_start_positions,
-                captured.static_write_positions,
+                write_positions,
                 captured.static_row_indices,
-                (captured.static_rotary_cos, captured.static_rotary_sin),
+                self._ragged_prefill_graph_rotary(captured, write_positions),
                 captured.static_logit_positions,
                 context_len,
                 captured.static_src_prefix_row,
                 prefix_copy_len,
+                emit_logits=emit_logits,
+            )
+        torch.cuda.current_stream(self.device).wait_stream(stream)
+        with torch.cuda.graph(captured.graph):
+            write_positions = self._ragged_prefill_graph_write_positions(captured)
+            captured.output_logits = self._forward_prefill_ragged_static(
+                captured.static_input_ids,
+                cache,
+                captured.static_start_positions,
+                write_positions,
+                captured.static_row_indices,
+                self._ragged_prefill_graph_rotary(captured, write_positions),
+                captured.static_logit_positions,
+                context_len,
+                captured.static_src_prefix_row,
+                prefix_copy_len,
+                emit_logits=emit_logits,
             )
         captured.graph.replay()
         return captured
@@ -5513,6 +6871,18 @@ class Llama3TensorParallelForCausalLM:
             return None
         min_batch = env_int("TORCHINFERNO_PROFILE_RAGGED_PREFILL_MIN_BATCH", 32, minimum=1)
         if input_ids.size(0) < min_batch:
+            return None
+        min_suffix = env_int("TORCHINFERNO_PROFILE_RAGGED_PREFILL_MIN_SUFFIX", 1, minimum=1)
+        if input_ids.size(1) < min_suffix:
+            return None
+        if not self._ragged_prefill_profile_context_matches(context_len):
+            return None
+        skip_matches = env_int(
+            "TORCHINFERNO_PROFILE_RAGGED_PREFILL_SKIP_MATCHES", 0, minimum=0
+        )
+        profile_matches = int(getattr(self, "_ragged_prefill_profile_matches", 0)) + 1
+        self._ragged_prefill_profile_matches = profile_matches
+        if profile_matches <= skip_matches:
             return None
         self._ragged_prefill_profiled = True
         rank = getattr(self, "rank", 0)
@@ -5556,6 +6926,7 @@ class Llama3TensorParallelForCausalLM:
             print(
                 f"[RAGGED_PREFILL_PROF] batch={input_ids.size(0)} "
                 f"suffix={input_ids.size(1)} "
+                f"match={profile_matches} "
                 f"context_len={context_len if context_len is not None else 'none'} "
                 f"src_rows={src_rows} "
                 f"prefix_copy_len={prefix_copy_len if prefix_copy_len is not None else 'none'}\n"
@@ -5568,19 +6939,27 @@ class Llama3TensorParallelForCausalLM:
             warn_optional_failure("llama3_tensor_parallel.ragged_prefill_profile", exc)
             return None
 
+    @staticmethod
+    def _ragged_prefill_profile_context_matches(context_len: int | None) -> bool:
+        configured = os.environ.get("TORCHINFERNO_PROFILE_RAGGED_PREFILL_CONTEXT_LEN")
+        if configured is None or not configured.strip():
+            return True
+        return context_len is not None and context_len == int(configured)
+
     def _copy_ragged_prefill_graph_inputs(
         self,
         captured: _StaticRaggedPrefillLogitsGraphCall,
         input_ids: Tensor,
         seq_lens: Tensor,
         row_indices: Tensor | None,
-        logit_positions: Tensor,
+        logit_positions: Tensor | None,
         src_prefix_row: Tensor | None = None,
     ) -> None:
         batch, suffix = input_ids.shape
         input_ids = input_ids.to(self.device, non_blocking=True)
         seq_lens = seq_lens.to(self.device, non_blocking=True)
-        logit_positions = logit_positions.to(self.device, non_blocking=True)
+        if logit_positions is not None:
+            logit_positions = logit_positions.to(self.device, non_blocking=True)
         if captured.static_src_prefix_row is not None and src_prefix_row is not None:
             captured.static_src_prefix_row.copy_(src_prefix_row.to(self.device, non_blocking=True))
         if row_indices is None:
@@ -5591,18 +6970,59 @@ class Llama3TensorParallelForCausalLM:
                 raise RuntimeError("captured ragged prefill graph does not accept row indices")
             captured.static_row_indices.copy_(row_indices)
             start_positions = seq_lens.index_select(0, row_indices)
-        query_offsets = torch.arange(suffix, device=self.device)
-        write_positions = (start_positions[:, None] + query_offsets[None, :]).clamp(max=captured.max_seq_len - 1)
+        write_positions: Tensor | None = None
+
+        def derived_write_positions() -> Tensor:
+            nonlocal write_positions
+            if write_positions is None:
+                query_offsets = torch.arange(suffix, device=self.device, dtype=start_positions.dtype)
+                write_positions = (start_positions[:, None] + query_offsets[None, :]).clamp(
+                    max=captured.max_seq_len - 1
+                )
+            return write_positions
+
         captured.static_input_ids.copy_(input_ids)
         captured.static_start_positions.copy_(start_positions)
-        captured.static_write_positions.copy_(write_positions)
-        captured.static_logit_positions.copy_(logit_positions)
-        captured.static_rotary_cos.copy_(
-            self.rotary_cos_cache.index_select(0, write_positions.reshape(-1)).view(batch, suffix, -1)
-        )
-        captured.static_rotary_sin.copy_(
-            self.rotary_sin_cache.index_select(0, write_positions.reshape(-1)).view(batch, suffix, -1)
-        )
+        if not getattr(captured, "write_positions_in_graph", False):
+            captured.static_write_positions.copy_(derived_write_positions())
+        if captured.static_logit_positions is not None:
+            if logit_positions is None:
+                raise RuntimeError("captured ragged prefill graph requires logit positions")
+            captured.static_logit_positions.copy_(logit_positions)
+        if not getattr(captured, "rotary_in_graph", False):
+            positions = derived_write_positions()
+            captured.static_rotary_cos.copy_(
+                self.rotary_cos_cache.index_select(0, positions.reshape(-1)).view(batch, suffix, -1)
+            )
+            captured.static_rotary_sin.copy_(
+                self.rotary_sin_cache.index_select(0, positions.reshape(-1)).view(batch, suffix, -1)
+            )
+
+    def _ragged_prefill_graph_write_positions(
+        self,
+        captured: _StaticRaggedPrefillLogitsGraphCall,
+    ) -> Tensor:
+        if getattr(captured, "write_positions_in_graph", False):
+            return (captured.static_start_positions[:, None] + captured.static_query_offsets[None, :]).clamp(
+                max=captured.max_seq_len - 1
+            )
+        return captured.static_write_positions
+
+    def _ragged_prefill_graph_rotary(
+        self,
+        captured: _StaticRaggedPrefillLogitsGraphCall,
+        write_positions: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor]:
+        if getattr(captured, "rotary_in_graph", False):
+            if write_positions is None:
+                write_positions = self._ragged_prefill_graph_write_positions(captured)
+            batch, suffix = write_positions.shape
+            positions = write_positions.reshape(-1)
+            return (
+                self.rotary_cos_cache.index_select(0, positions).view(batch, suffix, -1),
+                self.rotary_sin_cache.index_select(0, positions).view(batch, suffix, -1),
+            )
+        return captured.static_rotary_cos, captured.static_rotary_sin
 
     @torch.inference_mode()
     def generate(
@@ -5797,7 +7217,7 @@ class Llama3TensorParallelForCausalLM:
         return local_token
 
     def _sample_next_token_greedy(self, logits: Tensor) -> Tensor:
-        if _tp_flag("TORCHINFERNO_GREEDY_SAMPLE_GATHER", False):
+        if _tp_flag("TORCHINFERNO_GREEDY_SAMPLE_GATHER", logits.is_cuda):
             try:
                 return self._sample_next_token_greedy_gather(logits)
             except Exception as exc:
@@ -6703,6 +8123,143 @@ def _ragged_prefill_scaled_dot_product_attention(
     )
 
 
+def _packed_prefill_offsets_from_q_lens(q_lens: tuple[int, ...]) -> tuple[int, ...]:
+    offsets: list[int] = []
+    cursor = 0
+    for q_len in q_lens:
+        if q_len <= 0:
+            raise ValueError("packed prefill q_lens must be positive")
+        offsets.append(cursor)
+        cursor += int(q_len)
+    return tuple(offsets)
+
+
+def _packed_prefill_flat_indices(
+    q_lens: tuple[int, ...],
+    suffix_bucket: int,
+    *,
+    device: torch.device,
+) -> tuple[Tensor, Tensor]:
+    token_indices: list[int] = []
+    request_indices: list[int] = []
+    for request_idx, q_len in enumerate(q_lens):
+        if q_len <= 0:
+            raise ValueError("packed prefill q_lens must be positive")
+        if q_len > suffix_bucket:
+            raise ValueError("packed prefill q_lens cannot exceed suffix bucket")
+        base = request_idx * suffix_bucket
+        token_indices.extend(base + offset for offset in range(q_len))
+        request_indices.extend([request_idx] * q_len)
+    return (
+        torch.tensor(token_indices, dtype=torch.long, device=device),
+        torch.tensor(request_indices, dtype=torch.long, device=device),
+    )
+
+
+def _build_packed_prefill_attention_groups(
+    q_lens: tuple[int, ...],
+    start_positions: tuple[int, ...],
+    request_offsets: tuple[int, ...],
+    *,
+    device: torch.device,
+) -> tuple[_PackedPrefillAttentionGroup, ...]:
+    if not (len(q_lens) == len(start_positions) == len(request_offsets)):
+        raise ValueError("packed prefill metadata must have one entry per request")
+    grouped: dict[tuple[int, int], list[tuple[int, int]]] = {}
+    for request_idx, (q_len, start, offset) in enumerate(zip(q_lens, start_positions, request_offsets)):
+        if q_len <= 0:
+            raise ValueError("packed prefill q_lens must be positive")
+        grouped.setdefault((int(q_len), int(start)), []).append((request_idx, int(offset)))
+    return tuple(
+        (
+            q_len,
+            start,
+            torch.tensor([request_idx for request_idx, _offset in entries], dtype=torch.long, device=device),
+            tuple(request_idx for request_idx, _offset in entries),
+            tuple(offset for _request_idx, offset in entries),
+        )
+        for (q_len, start), entries in grouped.items()
+    )
+
+
+def _packed_prefill_scaled_dot_product_attention(
+    q: Tensor,
+    cache_keys: Tensor,
+    cache_values: Tensor,
+    start_positions: Tensor,
+    *,
+    q_lens: Tensor,
+    row_indices: Tensor,
+    request_offsets: Tensor,
+    packed_attention_groups: tuple[_PackedPrefillAttentionGroup, ...] | None = None,
+    enable_gqa: bool,
+) -> Tensor:
+    if q.size(0) != 1:
+        raise ValueError("packed prefill attention expects q batch size 1")
+    if packed_attention_groups is None:
+        q_lens_cpu = tuple(int(v) for v in q_lens.detach().cpu().tolist())
+        starts_cpu = tuple(int(v) for v in start_positions.detach().cpu().tolist())
+        offsets_cpu = tuple(int(v) for v in request_offsets.detach().cpu().tolist())
+        packed_attention_groups = _build_packed_prefill_attention_groups(
+            q_lens_cpu,
+            starts_cpu,
+            offsets_cpu,
+            device=q.device,
+        )
+    if (
+        sum(
+            int(group_indices.numel())
+            for _q_len, _start, group_indices, _request_indices, _offsets in packed_attention_groups
+        )
+        != row_indices.numel()
+    ):
+        raise ValueError("packed prefill metadata must have one entry per request")
+    outs: list[Tensor | None] = [None] * int(row_indices.numel())
+    causal_lower_right = None
+    try:
+        from torch.nn.attention.bias import causal_lower_right as _causal_lower_right
+
+        causal_lower_right = _causal_lower_right
+    except Exception as exc:
+        warn_optional_failure("llama3_tensor_parallel.packed_causal_lower_right", exc)
+    for q_len, start, group_indices, request_indices, offsets in packed_attention_groups:
+        context = start + q_len
+        if context > cache_keys.size(2):
+            raise ValueError("KV cache capacity exceeded")
+        rows = row_indices.index_select(0, group_indices)
+        qi = torch.cat([q[:, :, offset : offset + q_len, :] for offset in offsets], dim=0)
+        ki = cache_keys.index_select(0, rows)[:, :, :context, :]
+        vi = cache_values.index_select(0, rows)[:, :, :context, :]
+        if causal_lower_right is not None:
+            out_group = F.scaled_dot_product_attention(
+                qi,
+                ki,
+                vi,
+                attn_mask=causal_lower_right(q_len, context),
+                dropout_p=0.0,
+                is_causal=False,
+                enable_gqa=enable_gqa,
+            )
+        else:
+            key_positions = torch.arange(context, device=q.device)
+            query_positions = start + torch.arange(q_len, device=q.device)
+            mask = key_positions[None, :] <= query_positions[:, None]
+            out_group = F.scaled_dot_product_attention(
+                qi,
+                ki,
+                vi,
+                attn_mask=mask[None, None, :, :],
+                dropout_p=0.0,
+                is_causal=False,
+                enable_gqa=enable_gqa,
+            )
+        for group_pos, request_idx in enumerate(request_indices):
+            outs[int(request_idx)] = out_group[group_pos : group_pos + 1]
+    if any(out is None for out in outs):
+        raise RuntimeError("packed prefill attention did not produce every request output")
+    return torch.cat([out for out in outs if out is not None], dim=2)
+
+
 def _decode_linear(x: Tensor, weight: Tensor, weight_t: Tensor | None = None) -> Tensor:
     if (
         x.is_cuda
@@ -6939,6 +8496,22 @@ def _should_use_ragged_prefill_logits_graph(
     row_indices: Tensor | None,
     logit_positions: Tensor,
 ) -> bool:
+    return _should_use_ragged_prefill_graph(
+        input_ids,
+        cache,
+        seq_lens,
+        row_indices,
+        logit_positions,
+    )
+
+
+def _should_use_ragged_prefill_graph(
+    input_ids: Tensor,
+    cache: Llama3TensorParallelCache,
+    seq_lens: Tensor,
+    row_indices: Tensor | None,
+    logit_positions: Tensor | None,
+) -> bool:
     cache_keys = _prefill_graph_cache_storage(cache)
     return (
         _tp_flag("TORCHINFERNO_CUDAGRAPH_RAGGED_PREFILL", True)
@@ -6948,8 +8521,10 @@ def _should_use_ragged_prefill_logits_graph(
         and 1 <= input_ids.size(0) <= _decode_step_max_batch()
         and seq_lens.is_cuda
         and seq_lens.ndim == 1
-        and logit_positions.is_cuda
-        and logit_positions.shape == (input_ids.size(0),)
+        and (
+            logit_positions is None
+            or (logit_positions.is_cuda and logit_positions.shape == (input_ids.size(0),))
+        )
         and (row_indices is None or (row_indices.is_cuda and row_indices.shape == (input_ids.size(0),)))
         and cache_keys is not None
         and cache_keys.is_cuda

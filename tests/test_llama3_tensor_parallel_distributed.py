@@ -21,7 +21,7 @@ from torchinferno.models.llama3 import (
 from torchinferno.models.llama3 import tensor_parallel as tensor_parallel_module
 
 
-def test_llama3_tensor_parallel_greedy_sampler_uses_all_reduce_by_default(monkeypatch) -> None:
+def test_llama3_tensor_parallel_greedy_sampler_uses_all_reduce_by_default_on_cpu(monkeypatch) -> None:
     model = object.__new__(Llama3TensorParallelForCausalLM)
     model.device = torch.device("cpu")
     model.rank = 0
@@ -37,6 +37,32 @@ def test_llama3_tensor_parallel_greedy_sampler_uses_all_reduce_by_default(monkey
     monkeypatch.setattr(tensor_parallel_module.dist, "all_reduce", lambda *args, **kwargs: None)
 
     sampled = model._sample_next_token_greedy(torch.tensor([[0.0, 3.0, 1.0]]))
+
+    assert sampled.tolist() == [5]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for CUDA greedy sampler default")
+def test_llama3_tensor_parallel_greedy_sampler_uses_gather_by_default_on_cuda(monkeypatch) -> None:
+    model = object.__new__(Llama3TensorParallelForCausalLM)
+    model.device = torch.device("cuda")
+    model.rank = 0
+    model.world_size = 2
+    model.vocab_start = 0
+    model.config = type("Config", (), {"vocab_size": 8})()
+    monkeypatch.delenv("TORCHINFERNO_GREEDY_SAMPLE_GATHER", raising=False)
+
+    def gather(logits: torch.Tensor) -> torch.Tensor:
+        assert logits.is_cuda
+        assert logits.shape == (1, 2)
+        return torch.tensor([5], device=logits.device)
+
+    def all_reduce(*args, **kwargs) -> None:
+        raise AssertionError("CUDA greedy sampling should use the gather path by default")
+
+    monkeypatch.setattr(model, "_sample_next_token_greedy_gather", gather)
+    monkeypatch.setattr(tensor_parallel_module.dist, "all_reduce", all_reduce)
+
+    sampled = model._sample_next_token_greedy(torch.zeros(1, 2, device="cuda"))
 
     assert sampled.tolist() == [5]
 
@@ -63,6 +89,101 @@ def test_llama3_tensor_parallel_greedy_sampler_gather_opt_in(monkeypatch) -> Non
     sampled = model._sample_next_token_greedy(torch.zeros(1, 2))
 
     assert sampled.tolist() == [5]
+
+
+def test_llama3_tensor_parallel_ragged_prefill_copy_accepts_no_logits() -> None:
+    model = object.__new__(Llama3TensorParallelForCausalLM)
+    model.device = torch.device("cpu")
+    model.rotary_cos_cache = torch.arange(32, dtype=torch.float32).view(8, 4)
+    model.rotary_sin_cache = (torch.arange(32, dtype=torch.float32).view(8, 4) + 100)
+    input_ids = torch.tensor([[1, 2, 0], [3, 4, 5]], dtype=torch.long)
+    seq_lens = torch.tensor([0, 4, 2], dtype=torch.long)
+    row_indices = torch.tensor([2, 1], dtype=torch.long)
+    captured = types.SimpleNamespace(
+        static_input_ids=torch.empty_like(input_ids),
+        static_start_positions=torch.empty((2,), dtype=torch.long),
+        static_write_positions=torch.empty((2, 3), dtype=torch.long),
+        static_row_indices=torch.empty_like(row_indices),
+        static_rotary_cos=torch.empty((2, 3, 4), dtype=torch.float32),
+        static_rotary_sin=torch.empty((2, 3, 4), dtype=torch.float32),
+        static_logit_positions=None,
+        static_src_prefix_row=None,
+        max_seq_len=8,
+    )
+
+    model._copy_ragged_prefill_graph_inputs(
+        captured,
+        input_ids,
+        seq_lens,
+        row_indices,
+        logit_positions=None,
+    )
+
+    assert torch.equal(captured.static_input_ids, input_ids)
+    assert torch.equal(captured.static_row_indices, row_indices)
+    assert captured.static_start_positions.tolist() == [2, 4]
+    assert captured.static_write_positions.tolist() == [[2, 3, 4], [4, 5, 6]]
+    assert torch.equal(
+        captured.static_rotary_cos,
+        model.rotary_cos_cache.index_select(
+            0,
+            captured.static_write_positions.reshape(-1),
+        ).view(2, 3, 4),
+    )
+    assert torch.equal(
+        captured.static_rotary_sin,
+        model.rotary_sin_cache.index_select(
+            0,
+            captured.static_write_positions.reshape(-1),
+        ).view(2, 3, 4),
+    )
+
+
+def test_llama3_tensor_parallel_ragged_prefill_graph_can_lookup_rotary_inside_graph() -> None:
+    model = object.__new__(Llama3TensorParallelForCausalLM)
+    model.device = torch.device("cpu")
+    model.rotary_cos_cache = torch.arange(48, dtype=torch.float32).view(12, 4)
+    model.rotary_sin_cache = torch.arange(48, dtype=torch.float32).view(12, 4) + 100
+    input_ids = torch.tensor([[1, 2, 0], [3, 4, 5]], dtype=torch.long)
+    seq_lens = torch.tensor([0, 4, 2], dtype=torch.long)
+    row_indices = torch.tensor([2, 1], dtype=torch.long)
+    static_cos = torch.full((2, 3, 4), -1.0)
+    static_sin = torch.full((2, 3, 4), -2.0)
+    static_write_positions = torch.full((2, 3), -7, dtype=torch.long)
+    captured = types.SimpleNamespace(
+        static_input_ids=torch.empty_like(input_ids),
+        static_start_positions=torch.empty((2,), dtype=torch.long),
+        static_write_positions=static_write_positions.clone(),
+        static_query_offsets=torch.arange(3, dtype=torch.long),
+        static_row_indices=torch.empty_like(row_indices),
+        static_rotary_cos=static_cos.clone(),
+        static_rotary_sin=static_sin.clone(),
+        static_logit_positions=None,
+        static_src_prefix_row=None,
+        max_seq_len=12,
+        rotary_in_graph=True,
+        write_positions_in_graph=True,
+    )
+
+    model._copy_ragged_prefill_graph_inputs(
+        captured,
+        input_ids,
+        seq_lens,
+        row_indices,
+        logit_positions=None,
+    )
+
+    expected_positions = torch.tensor([[2, 3, 4], [4, 5, 6]], dtype=torch.long)
+    expected_cos = model.rotary_cos_cache.index_select(0, expected_positions.reshape(-1)).view(2, 3, 4)
+    expected_sin = model.rotary_sin_cache.index_select(0, expected_positions.reshape(-1)).view(2, 3, 4)
+    graph_positions = model._ragged_prefill_graph_write_positions(captured)
+    rotary_cos, rotary_sin = model._ragged_prefill_graph_rotary(captured)
+    assert torch.equal(captured.static_write_positions, static_write_positions)
+    assert graph_positions.tolist() == expected_positions.tolist()
+    assert torch.equal(captured.static_rotary_cos, static_cos)
+    assert torch.equal(captured.static_rotary_sin, static_sin)
+    assert torch.equal(rotary_cos, expected_cos)
+    assert torch.equal(rotary_sin, expected_sin)
 
 
 def test_llama3_tensor_parallel_mixed_prefill_capture_failure_keeps_uniform_replays(
@@ -124,8 +245,21 @@ def test_llama3_tensor_parallel_mixed_prefill_capture_failure_keeps_uniform_repl
         context_len=None,
         src_prefix_row=None,
         prefix_copy_len=None,
+        emit_logits=True,
+        rotary_in_graph=False,
+        write_positions_in_graph=False,
     ):
-        del seq_lens, row_indices, logit_positions, context_len, src_prefix_row, prefix_copy_len
+        del (
+            seq_lens,
+            row_indices,
+            logit_positions,
+            context_len,
+            src_prefix_row,
+            prefix_copy_len,
+            emit_logits,
+            rotary_in_graph,
+            write_positions_in_graph,
+        )
         capture_calls.append(tuple(input_ids.shape))
         return None
 
@@ -172,17 +306,27 @@ def test_llama3_tensor_parallel_mixed_prefill_capture_failure_keeps_uniform_repl
         1,
         (False,),
         0,
+        1,
+        1,
+        1,
     )
     model._ragged_prefill_logits_graphs[key] = types.SimpleNamespace(
         graph=fake_graph,
         static_input_ids=torch.empty_like(input_ids),
+        static_start_positions=torch.empty((input_ids.size(0),), dtype=torch.long),
+        static_write_positions=torch.empty_like(input_ids),
+        static_query_offsets=torch.arange(input_ids.size(1), dtype=torch.long),
         static_row_indices=torch.empty_like(row_indices),
+        static_logit_positions=torch.empty_like(logit_positions),
         static_src_prefix_row=torch.empty_like(uniform_src_row),
         output_logits=captured_logits,
         cache=cache,
         max_seq_len=cache.layers[0].max_seq_len,
         context_len=8,
         prefix_copy_len=None,
+        emit_logits=True,
+        rotary_in_graph=True,
+        write_positions_in_graph=True,
     )
 
     uniform_replay = model.try_prefill_ragged_logits_graph(
@@ -368,6 +512,9 @@ def test_llama3_tensor_parallel_ragged_prefill_graph_replay_refreshes_eviction_o
             1,
             (False,),
             0,
+            1,
+            1,
+            1,
         )
 
     def captured_call(batch: int, output_value: float) -> types.SimpleNamespace:
@@ -375,13 +522,20 @@ def test_llama3_tensor_parallel_ragged_prefill_graph_replay_refreshes_eviction_o
         return types.SimpleNamespace(
             graph=FakeGraph(),
             static_input_ids=torch.empty((batch, 4), dtype=torch.long),
+            static_start_positions=torch.empty((batch,), dtype=torch.long),
+            static_write_positions=torch.empty((batch, 4), dtype=torch.long),
+            static_query_offsets=torch.arange(4, dtype=torch.long),
             static_row_indices=torch.empty_like(row_indices),
+            static_logit_positions=torch.empty((batch,), dtype=torch.long),
             static_src_prefix_row=torch.empty_like(src_prefix_row),
             output_logits=torch.full((batch, 1, 8), output_value, dtype=torch.float32),
             cache=cache,
             max_seq_len=cache.layers[0].max_seq_len,
             context_len=8,
             prefix_copy_len=None,
+            emit_logits=True,
+            rotary_in_graph=True,
+            write_positions_in_graph=True,
         )
 
     key_a = graph_key(2)
@@ -1245,6 +1399,281 @@ def test_llama3_tensor_parallel_ragged_prefill_matches_forward(tmp_path, monkeyp
     assert out.shape == (batch, 1, config.vocab_size)
     for i in range(batch):
         torch.testing.assert_close(out[i, 0, :], ref_logits[i], atol=2e-5, rtol=2e-5)
+
+
+def test_llama3_tensor_parallel_packed_ragged_prefill_graph_waits_for_reuse(
+    monkeypatch,
+) -> None:
+    model = object.__new__(Llama3TensorParallelForCausalLM)
+    model.device = torch.device("cpu")
+    model.world_size = 1
+    model.layers = []
+    model._packed_ragged_prefill_logits_graphs = {}
+    model._packed_ragged_prefill_logits_graph_seen = {}
+    cache = types.SimpleNamespace(
+        layers=[types.SimpleNamespace(max_seq_len=16)],
+    )
+    input_ids = torch.zeros((2, 4), dtype=torch.long)
+    seq_lens = torch.zeros(4, dtype=torch.long)
+    q_lens = torch.tensor([2, 3], dtype=torch.long)
+    row_indices = torch.tensor([0, 1], dtype=torch.long)
+    logit_positions = q_lens - 1
+    logits = torch.ones((2, 1, 8), dtype=torch.float32)
+    capture_calls: list[tuple[tuple[int, ...], tuple[int, ...]]] = []
+
+    def capture(
+        input_ids,
+        cache,
+        *,
+        start_positions,
+        q_lens,
+        row_indices,
+        logit_positions,
+        src_prefix_row,
+        prefix_copy_len,
+        q_lens_key,
+        start_positions_key,
+    ):
+        capture_calls.append((q_lens_key, start_positions_key))
+        return types.SimpleNamespace(
+            graph=types.SimpleNamespace(replay=lambda: None),
+            static_input_ids=input_ids.clone(),
+            static_start_positions=start_positions.clone(),
+            static_q_lens=q_lens.clone(),
+            static_row_indices=row_indices.clone(),
+            static_logit_positions=logit_positions.clone(),
+            static_src_prefix_row=src_prefix_row,
+            output_logits=logits,
+            cache=cache,
+            max_seq_len=16,
+            suffix_bucket=input_ids.size(1),
+            q_lens_key=q_lens_key,
+            start_positions_key=start_positions_key,
+            prefix_copy_len=prefix_copy_len,
+        )
+
+    monkeypatch.setattr(model, "_capture_packed_ragged_prefill_logits_graph", capture)
+
+    first = model._run_packed_ragged_prefill_logits_graph(
+        input_ids,
+        cache,
+        seq_lens=seq_lens,
+        q_lens=q_lens,
+        row_indices=row_indices,
+        logit_positions=logit_positions,
+        src_prefix_row=None,
+        prefix_copy_len=4,
+        capture_on_miss=True,
+    )
+    second = model._run_packed_ragged_prefill_logits_graph(
+        input_ids,
+        cache,
+        seq_lens=seq_lens,
+        q_lens=q_lens,
+        row_indices=row_indices,
+        logit_positions=logit_positions,
+        src_prefix_row=None,
+        prefix_copy_len=4,
+        capture_on_miss=True,
+    )
+
+    assert first is None
+    assert second is logits
+    assert capture_calls == [((2, 3), (0, 0))]
+
+
+def test_llama3_tensor_parallel_packed_ragged_prefill_matches_padded_oracle(tmp_path, monkeypatch) -> None:
+    torch.manual_seed(9104)
+    config = tiny_llama3_config(vocab_size=32, max_position_embeddings=32)
+    reference = Llama3V0ForCausalLM(config).eval()
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    _write_hf_checkpoint(reference, config, checkpoint)
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    model = Llama3TensorParallelForCausalLM.from_pretrained(checkpoint, dtype="float32").eval()
+    device = model.device
+
+    shared_prefix = [1, 5, 9, 13]
+    suffixes = [[2, 6], [3, 7, 11, 4], [8, 12]]
+    prompts = [shared_prefix + suffix for suffix in suffixes]
+    rows = [3, 1, 2]
+    prefix_row = 0
+    prefix_len = len(shared_prefix)
+    bucket = 5
+    batch = len(prompts)
+
+    with torch.inference_mode():
+        ref_logits = []
+        for prompt in prompts:
+            ref_cache = model.allocate_cache(1, max_seq_len=32, cache_backend="dense")
+            logits, _ = model.forward(torch.tensor([prompt], dtype=torch.long, device=device), cache=ref_cache, use_cache=True)
+            ref_logits.append(logits[0, -1, :])
+
+        padded_cache = model.allocate_cache(4, max_seq_len=32, cache_backend="dense")
+        packed_cache = model.allocate_cache(4, max_seq_len=32, cache_backend="dense")
+        for cache in (padded_cache, packed_cache):
+            prefix_view = cache.for_rows((prefix_row,))
+            model.forward(torch.tensor([shared_prefix], dtype=torch.long, device=device), cache=prefix_view, use_cache=True)
+
+        padded_suffixes = [suffix + [0] * (bucket - len(suffix)) for suffix in suffixes]
+        input_ids = torch.tensor(padded_suffixes, dtype=torch.long, device=device)
+        seq_lens = torch.zeros(4, dtype=torch.long, device=device)
+        for row in rows:
+            seq_lens[row] = prefix_len
+        row_indices = torch.tensor(rows, dtype=torch.long, device=device)
+        q_lens = torch.tensor([len(suffix) for suffix in suffixes], dtype=torch.long, device=device)
+        logit_positions = q_lens - 1
+        src_prefix_row = torch.tensor([prefix_row], dtype=torch.long, device=device)
+
+        padded = model.prefill_ragged_logits(
+            input_ids,
+            padded_cache,
+            seq_lens=seq_lens,
+            row_indices=row_indices,
+            logit_positions=logit_positions,
+            context_len=prefix_len + bucket,
+            src_prefix_row=src_prefix_row,
+        )
+        packed = model.prefill_ragged_logits_packed_eager(
+            input_ids,
+            packed_cache,
+            seq_lens=seq_lens,
+            q_lens=q_lens,
+            row_indices=row_indices,
+            logit_positions=logit_positions,
+            src_prefix_row=src_prefix_row,
+            prefix_copy_len=prefix_len,
+        )
+
+    assert packed.shape == (batch, 1, config.vocab_size)
+    torch.testing.assert_close(packed, padded, atol=2e-5, rtol=2e-5)
+    for i in range(batch):
+        torch.testing.assert_close(packed[i, 0, :], ref_logits[i], atol=2e-5, rtol=2e-5)
+    for padded_layer, packed_layer in zip(padded_cache.layers, packed_cache.layers):
+        for row, suffix in zip(rows, suffixes):
+            end = prefix_len + len(suffix)
+            torch.testing.assert_close(packed_layer.keys[row, :, :end, :], padded_layer.keys[row, :, :end, :])
+            torch.testing.assert_close(packed_layer.values[row, :, :end, :], padded_layer.values[row, :, :end, :])
+
+
+def test_llama3_tensor_parallel_packed_flashinfer_prefill_matches_padded_oracle(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    class _FakePackedPrefillWrapper:
+        def __init__(self) -> None:
+            self.plan_kwargs: dict[str, object] = {}
+
+        def plan(self, **kwargs) -> None:  # noqa: ANN003
+            self.plan_kwargs = kwargs
+
+        def run(self, q: torch.Tensor, paged_kv: torch.Tensor) -> torch.Tensor:
+            qo_indptr = self.plan_kwargs["qo_indptr"].to(torch.long)
+            row_indices = self.plan_kwargs["paged_kv_indices"].to(torch.long)
+            last_page_len = self.plan_kwargs["paged_kv_last_page_len"].to(torch.long)
+            num_qo_heads = int(self.plan_kwargs["num_qo_heads"])
+            num_kv_heads = int(self.plan_kwargs["num_kv_heads"])
+            enable_gqa = num_qo_heads != num_kv_heads
+            out: list[torch.Tensor] = []
+            for request_idx in range(row_indices.numel()):
+                q_start = int(qo_indptr[request_idx].item())
+                q_end = int(qo_indptr[request_idx + 1].item())
+                q_len = q_end - q_start
+                context = int(last_page_len[request_idx].item())
+                row = int(row_indices[request_idx].item())
+                qi = q[q_start:q_end].permute(1, 0, 2).unsqueeze(0)
+                ki = paged_kv[row, 0, :context, :, :].permute(1, 0, 2).unsqueeze(0)
+                vi = paged_kv[row, 1, :context, :, :].permute(1, 0, 2).unsqueeze(0)
+                key_positions = torch.arange(context, device=q.device)
+                query_positions = context - q_len + torch.arange(q_len, device=q.device)
+                mask = key_positions[None, :] <= query_positions[:, None]
+                oi = torch.nn.functional.scaled_dot_product_attention(
+                    qi,
+                    ki,
+                    vi,
+                    attn_mask=mask[None, None, :, :],
+                    dropout_p=0.0,
+                    is_causal=False,
+                    enable_gqa=enable_gqa,
+                )
+                out.append(oi.squeeze(0).permute(1, 0, 2).contiguous())
+            return torch.cat(out, dim=0)
+
+    torch.manual_seed(9105)
+    config = tiny_llama3_config(vocab_size=32, max_position_embeddings=32)
+    reference = Llama3V0ForCausalLM(config).eval()
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    _write_hf_checkpoint(reference, config, checkpoint)
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    model = Llama3TensorParallelForCausalLM.from_pretrained(checkpoint, dtype="float32").eval()
+    fake_wrapper = _FakePackedPrefillWrapper()
+    monkeypatch.setattr(model, "_flashinfer_prefill_wrapper", lambda: fake_wrapper)
+    device = model.device
+
+    shared_prefix = [1, 5, 9, 13]
+    suffixes = [[2, 6], [3, 7, 11, 4], [8, 12]]
+    rows = [3, 1, 2]
+    prefix_row = 0
+    prefix_len = len(shared_prefix)
+    bucket = 5
+    batch = len(suffixes)
+
+    with torch.inference_mode():
+        padded_cache = model.allocate_cache(4, max_seq_len=32, cache_backend="flashinfer")
+        packed_cache = model.allocate_cache(4, max_seq_len=32, cache_backend="flashinfer")
+        for cache in (padded_cache, packed_cache):
+            prefix_view = cache.for_rows((prefix_row,))
+            model.forward(
+                torch.tensor([shared_prefix], dtype=torch.long, device=device),
+                cache=prefix_view,
+                use_cache=True,
+            )
+
+        padded_suffixes = [suffix + [0] * (bucket - len(suffix)) for suffix in suffixes]
+        input_ids = torch.tensor(padded_suffixes, dtype=torch.long, device=device)
+        seq_lens = torch.zeros(4, dtype=torch.long, device=device)
+        for row in rows:
+            seq_lens[row] = prefix_len
+        row_indices = torch.tensor(rows, dtype=torch.long, device=device)
+        q_lens = torch.tensor([len(suffix) for suffix in suffixes], dtype=torch.long, device=device)
+        logit_positions = q_lens - 1
+        src_prefix_row = torch.tensor([prefix_row], dtype=torch.long, device=device)
+
+        padded = model.prefill_ragged_logits(
+            input_ids,
+            padded_cache,
+            seq_lens=seq_lens,
+            row_indices=row_indices,
+            logit_positions=logit_positions,
+            context_len=prefix_len + bucket,
+            src_prefix_row=src_prefix_row,
+        )
+        packed = model.prefill_ragged_logits_packed_flashinfer(
+            input_ids,
+            packed_cache,
+            seq_lens=seq_lens,
+            q_lens=q_lens,
+            row_indices=row_indices,
+            logit_positions=logit_positions,
+            src_prefix_row=src_prefix_row,
+            prefix_copy_len=prefix_len,
+        )
+
+    assert fake_wrapper.plan_kwargs["qo_indptr"].tolist() == [0, 2, 6, 8]
+    assert fake_wrapper.plan_kwargs["paged_kv_indices"].tolist() == rows
+    assert fake_wrapper.plan_kwargs["paged_kv_last_page_len"].tolist() == [
+        prefix_len + len(suffix) for suffix in suffixes
+    ]
+    assert packed.shape == (batch, 1, config.vocab_size)
+    torch.testing.assert_close(packed, padded, atol=2e-5, rtol=2e-5)
+    for padded_layer, packed_layer in zip(padded_cache.layers, packed_cache.layers):
+        for row, suffix in zip(rows, suffixes):
+            end = prefix_len + len(suffix)
+            torch.testing.assert_close(packed_layer.keys[row, :, :end, :], padded_layer.keys[row, :, :end, :])
+            torch.testing.assert_close(packed_layer.values[row, :, :end, :], padded_layer.values[row, :, :end, :])
 
 
 def test_llama3_tensor_parallel_ragged_prefill_folds_prefix_copy(tmp_path, monkeypatch) -> None:

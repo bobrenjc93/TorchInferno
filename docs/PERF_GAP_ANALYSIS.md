@@ -1,5 +1,1724 @@
 # TorchInferno vs vLLM/sglang — Performance Gap Analysis (Llama-3.1-70B, 8xH100)
 
+## Public 20260705_090205 refresh and decode graph symm telemetry
+
+The latest public run advanced to
+`results/v1/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100/runs/20260705_090205`
+at inference-bench commit `9bd2f350`. TorchInferno is now `4/20`, vLLM is
+`12/20`, and SGLang is `3/20`. The same gaps remain score-facing:
+
+- multi_turn: TorchInferno `365.6 / 63.5 / 417.3ms`, vLLM
+  `177.9 / 53.0 / 227.4ms`, SGLang `167.5 / 102.8 / 268.1ms`.
+- tree_of_thought: TorchInferno `129.6 / 42.2 / 158.1ms`, vLLM
+  `64.0 / 30.4 / 87.8ms`, SGLang `76.0 / 54.9 / 144.1ms`.
+- long_output: TorchInferno `220.9 / 20.8 / 1000.7ms`, vLLM
+  `83.0 / 14.9 / 616.9ms`, SGLang `74.0 / 22.2 / 833.2ms`.
+
+The public tree row still used the older sampled-medium
+`prefill_ready_before_decode_active_cap=10`, while current tree defaults use
+cap `32`. Revalidating current TorchInferno against the same public harness
+wrote
+`/tmp/inference-bench-ti-tree-cap32-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-ti-tree-cap32-20260705/runs/20260705_111300`
+and finished `963/992` correct at `137.4 / 27.7 / 159.6ms`. This is not a
+tree TTFT/E2E closure, but it is score-facing: TPOT would beat the public vLLM
+tree TPOT (`30.4ms`) versus public TorchInferno's `42.2ms`. The queue profile
+shows the intended policy (`prefill_ready_before_decode=true`, cap `32`),
+`57` prefill batches, `1.72s/2.22s` prefill forward/wall, `1.71s` decode GPU,
+and hot prefill at `prefix_graph:b24:s16:p45-45:src1:mixed0` (`909.7ms`).
+Keep cap `32`; the remaining tree gap is first-token/prefill latency, not
+sampled-medium TPOT.
+
+The analyzer now carries decode graph symmetric-memory bucket counts through
+queue-profile parsing and prints them as `decode_graph_symm`. The runtime records
+`runtime_decode_graph_cache_live_symm_counts` next to the existing decode graph
+batch/context/cache summaries when shape details are enabled, and the analyzer
+can derive the same compact counts from older `runtime_decode_graph_cache_live_shape_counts`
+keys. Re-rendering the current-tree long_output nosync profile at
+`/tmp/inference-bench-ti-long-nosync-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-ti-long-nosync-20260705/runs/20260705_093136`
+now exposes `decode_graph_symm=symm0=16,symm128=16` without a rerun. This is
+instrumentation for the remaining decode work: future public profiles can now
+distinguish graph surfaces that are using `symm...` variants from profiles that
+are spending decode replay time on non-symmetric-memory graph entries.
+
+The startup ragged-decode graph warmup now releases decode graphs tied to its
+temporary warmup caches after each cache spec. Those graph keys include
+`id(cache)`, so the temporary-cache CUDA graphs cannot be replayed by the later
+serving cache; the capture still warms the kernels, but the model-level graph
+dict no longer retains throwaway entries. The focused long_output recheck wrote
+`/tmp/inference-bench-ti-long-warmrelease-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-ti-long-warmrelease-20260705/runs/20260705_095350`
+and landed at `230.1 / 23.0 / 1095.7ms`, `1000/1000` correct. It is accepted
+as graph-cache cleanup, not a score closure: the live serving-cache surface is
+still `decode_graph_symm=symm0=16,symm128=16` because the online decode warmup
+intentionally captures deterministic symm and sampled non-symm variants.
+
+Decode graph replay telemetry now appends the actual graph-key symm bucket to
+`runtime_decode_graph_replay_shape_ms`, and the analyzer prints the compact
+`decode_replay_symm_ms` column. The focused long_output run
+`/tmp/inference-bench-ti-long-replaysymm-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-ti-long-replaysymm-20260705/runs/20260705_100535`
+landed at `222.5 / 23.2 / 1092.6ms`, `1000/1000` correct. Its live graph cache
+still had `decode_graph_symm=symm0=16,symm128=16`, but replay time was entirely
+`decode_replay_symm_ms=symm128=4900.8`. That rules out non-symm graph replay as
+the current long_output decode bottleneck; the remaining decode work is inside
+the symm-enabled graph body (`9.72s` total ragged decode GPU, `6.54s`
+decode-many GPU) plus padded prefill (`4.68s` forward).
+
+The short-cache ragged-decode cap remains rejected after the warmup graph-cache
+cleanup. Rechecking
+`TORCHINFERNO_OPENAI_TP_ONLINE_SHORT_GREEDY_RAGGED_DECODE_CACHE_TOKENS=256`
+with `MIN_BATCH=64` wrote
+`/tmp/inference-bench-ti-long-shortcache-warmrelease-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-ti-long-shortcache-warmrelease-20260705/runs/20260705_101445`
+and finished 1000/1000 correct at `236.3 / 22.7 / 1062.6ms`. The cleanup did
+avoid the old near-OOM behavior (`cache1024=32,cache256=2` live decode graphs,
+server ready in `216s`), but it did not lower steady decode cost:
+`decode_many_gpu_ms` rose to `7.13s` versus `6.54s` in the nearby replay-symm
+control, and hot `decode_many:b64/64` rose to `3.32s`. Keep the short-cache cap
+default-off; it is memory-safe enough to keep as a diagnostic now, but not a
+score-facing long_output fix.
+
+The queue analyzer now also prints live decode graph cache buckets as
+`decode_graph_cache`, and future runtime profiles append `cache...` to
+decode-graph replay keys so `decode_replay_cache_ms` can attribute replay time
+to `cache256` versus `cache1024`. Re-rendering the short-cache run can only show
+the live cache-bucket mix because that run predates the replay key change; the
+next cache-bucket probe will expose both live and replay cache attribution.
+
+Greedy tensor-parallel sampling now defaults to the one-collective gather path
+for CUDA logits, with `TORCHINFERNO_GREEDY_SAMPLE_GATHER=0` retaining the older
+two-all-reduce path and CPU behavior unchanged by default. The focused
+long_output A/B wrote
+`/tmp/inference-bench-ti-long-greedygather-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-ti-long-greedygather-20260705/runs/20260705_102421`
+and finished 1000/1000 correct at `239.5 / 22.4 / 1132.8ms`. The scored row is
+noisy, but the queue profile shows the intended model-side effect versus the
+nearby replay-symm control: `decode_many_gpu_ms` fell `6.54s -> 6.09s`, replay
+time fell `4.90s -> 4.65s`, while hot `decode_many:b64/64` was roughly flat to
+slightly worse (`2.99s -> 3.08s`) on a slightly different token mix. This is a
+modest decode win, not a long_output closure; the remaining gap is still
+full-batch model replay plus padded prefill.
+
+The packed FlashInfer prefill probe is not score-facing under the current
+public-style server configuration. Running
+`TORCHINFERNO_CONTINUOUS_PACKED_FLASHINFER_PREFILL=1` wrote
+`/tmp/inference-bench-ti-long-packedfi-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-ti-long-packedfi-20260705/runs/20260705_103510`
+and finished 1000/1000 correct at `262.2 / 23.1 / 1098.5ms`, but
+`packed_fi_calls=0`: inference-bench's TorchInferno FlashInfer toggle installs
+the optional kernels and leaves `--cache-backend` at dense, so this path cannot
+fire on the public long_output row. Do not promote anything from this run.
+
+The post-gather decode replay profile wrote
+`/tmp/inference-bench-ti-long-decodeprof-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-ti-long-decodeprof-20260705/runs/20260705_104243`
+and captured `batch=64 cache_bucket=1024 rows=64` at `12.47ms` self CUDA. The
+largest slices were dense GEMMs (`3.39ms` + `1.00ms`), gate-up Marlin
+(`3.34ms`), 160 symmetric-memory all-reduces (`2.09ms`), and grouped GQA
+attention (`1.48ms`). The new greedy all-gather sampler was only `9.5us`, so
+remaining long_output TPOT work is projection/collective dominated, not sampler
+or host-token handling.
+
+The opt-in multi-token ragged decode graph path now handles contiguous physical
+rows even when scheduler order differs from row order: it feeds the graph in
+physical row order and remaps returned token columns back to scheduler order.
+That fixed a previous no-op case without enabling row-indexed graph replay, but
+the long_output probe remains rejected as a default. Running
+`TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY_GRAPH=1` with greedy gather wrote
+`/tmp/inference-bench-ti-long-manygraph-reorder-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-ti-long-manygraph-reorder-20260705/runs/20260705_110303`
+and finished 1000/1000 correct at `212.8 / 23.9 / 1159.6ms`.
+`decode_many_graph_calls=47` covered `232` steps at `decode_many:b64/64`, so
+the repaired path did fire, but total decode work regressed:
+`decode_many_graph_ms=5.44s`, `decode_many_gpu_ms=9.65s`, and total
+`decode_gpu_ms=12.44s`. Keep the flag diagnostic-only; multi-step graph replay
+does not currently reduce the projection/all-reduce/attention body cost.
+
+## Public 20260705_070226 refresh and fixed-capacity packed-prefix rejection
+
+The latest public run advanced to
+`results/v1/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100/runs/20260705_070226`
+at inference-bench commit `9cbe5008`. TorchInferno is now `5/20`, vLLM is
+`11/20`, and SGLang is `3/20`. TorchInferno wins few_shot TPOT/E2E and
+self_consistency TTFT/E2E/throughput, but the score-facing gaps remain:
+
+- multi_turn: TorchInferno `328.0 / 58.2 / 383.3ms`, vLLM
+  `181.1 / 46.1 / 227.5ms`, SGLang `158.7 / 109.6 / 267.5ms`.
+- tree_of_thought: TorchInferno `123.1 / 37.5 / 152.0ms`, vLLM
+  `64.1 / 29.9 / 88.3ms`, SGLang `75.6 / 72.4 / 153.1ms`.
+- long_output: TorchInferno `239.0 / 20.6 / 958.0ms`, vLLM
+  `85.8 / 14.9 / 658.1ms`, SGLang `73.3 / 22.2 / 863.5ms`.
+
+The fixed-capacity packed-prefix branch now has an opt-in runtime prototype that
+learns per-pattern slot capacities, pads missing `(prefix_len, suffix_len)`
+slots, gathers real logits back to request order, and waits for repeated stable
+capacities before invoking the packed graph. It is still rejected as a
+performance path. The first targeted tree probe wrote
+`/tmp/inference-bench-ti-tree-fixed-capacity-packed-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-ti-tree-fixed-capacity-packed/runs/20260705_075427`
+and regressed to `1352.1 / 51.6 / 1662.7ms`, `959/992` correct, with `38`
+packed calls spending `20.3s`. After adding the stability guard, the recheck
+wrote
+`/tmp/inference-bench-ti-tree-fixed-capacity-stable-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-ti-tree-fixed-capacity-stable/runs/20260705_080055`
+and still regressed to `1265.3 / 38.5 / 1328.1ms`, `962/992` correct, with
+`37` packed calls spending `19.6s`. The mechanism records the opportunity, but
+the current packed layer loop/graph wrapper is far too expensive; keep the
+switch diagnostic-only. A defaultable packed-prefix fix needs a real lower-cost
+fixed-pattern body, not the current Python-packed transformer replay.
+
+Decode-many queue profiling now avoids a CUDA synchronize after every fallback
+decode replay by default. `TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY_SYNC_MODEL_TIMINGS=1`
+restores the old synchronized wall-time map for investigations that need it;
+normal queue profiles should use the existing CUDA-event counters
+(`runtime_decode_many_model_gpu_ms` and per-shape GPU maps). The focused
+current-tree long_output run wrote
+`/tmp/inference-bench-ti-long-nosync-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-ti-long-nosync-20260705/runs/20260705_093136`
+and landed at `269.9 / 22.3 / 1125.8ms`, `1000/1000` correct. The profile
+confirmed the sync removal (`runtime_decode_many_model_ms=0.0`,
+`runtime_decode_many_shape_model_ms={}`) while preserving GPU timing
+(`runtime_decode_many_model_gpu_ms=6.83s`, hot `decode_many:b64/64=2.90s`).
+This is accepted as measurement overhead reduction and keeps the queue profile
+usable under public profiling, but it is not a score-facing long_output
+closure; prefill stayed at `4.97s/5.39s` forward/wall and total decode GPU at
+`9.91s`.
+
+## Public 20260705_010222 refresh
+
+The latest public run advanced to
+`results/v1/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100/runs/20260705_010222`
+at inference-bench commit `656a409f`. TorchInferno improved the tree row versus
+`20260704_230159`, but the score-facing shape is unchanged:
+
+- multi_turn: TorchInferno `343.3 / 59.8 / 401.6ms`, vLLM
+  `172.0 / 49.4 / 217.4ms`, SGLang `168.0 / 100.6 / 273.6ms`.
+- tree_of_thought: TorchInferno `118.7 / 35.9 / 145.7ms`, vLLM
+  `64.4 / 30.9 / 87.5ms`, SGLang `74.6 / 56.7 / 139.5ms`.
+- long_output: TorchInferno `255.1 / 20.4 / 992.5ms`, vLLM
+  `91.4 / 14.9 / 661.0ms`, SGLang `73.3 / 22.1 / 804.8ms`.
+
+The current median gaps remain multi_turn TTFT/E2E
+(`+175.4/+184.1ms` versus the best other provider), tree TTFT/TPOT/E2E
+(`+54.3/+5.0/+58.2ms` versus vLLM), and long_output TTFT/E2E
+(`+181.8/+331.5ms`). The TorchInferno queue profile still points at the same
+implementation split. Multi_turn spent `4.30s/4.45s` in prefill forward/wall
+with queue-to-first p50 `277.3ms`. Tree spent `1.79s/2.02s` in prefill
+forward/wall plus `1.75s` ragged-decode GPU, with the hot cached-prefix prefill
+shape `prefix_graph:b24:s16:p45-45:src1:mixed0` at `752.4ms` and `43.7%`
+padding. Long_output spent `4.28s/4.50s` in prefill forward/wall and `9.23s`
+in decode GPU; its hottest decode-many shape was still `decode_many:b64/64`
+(`2.07s` GPU, `11.0K` model tokens, `10.7K` emitted, `312` overgenerated).
+The next defaultable work remains a real fixed-pattern packed cached-prefix
+prefill body for tree/multi and lower model-side decode replay cost for
+long_output.
+
+The analyzer now also prints the worst raw 64-request waves per provider. On
+this public long_output run, TorchInferno's high first-token cost persisted well
+after startup: the selected worst waves had TTFT p50 `379.7ms` at wave 1,
+`441.0ms` at wave 9, `301.6ms` at wave 10, `300.8ms` at wave 13, and
+`313.3ms` at wave 14. vLLM's selected worst waves were much lower
+(`173.3ms`, `132.2ms`, `141.8ms`, `115.0ms`, `164.8ms`), while SGLang was
+mostly `76-91ms` except its wave-10 spike at `258.2ms`. This rules out a
+single cold-start artifact; the long_output target is persistent wave/pipeline
+prefill plus decode replay cost.
+
+The analyzer now prints decode-many tail-cap details in the queue-profile table:
+configured stop-tail cap, tail-limited calls/steps, and overgenerated tokens.
+That immediately exposed why the public `20260705_010222` long_output row still
+overgenerated `1.19K` decode-many tokens: the run exported `decode_quantum=3`
+and `decode_many_allow_stop=true`, but no tail-cap field and
+`0` tail-limited calls. A focused current-tree cap-2 probe wrote
+`/tmp/inference-bench-ti-pattern-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-ti-long-tail2/runs/20260705_015457`
+and is rejected as a default. It reduced decode-many overgeneration to `567`
+tokens and exercised `81` tail-limited calls, but fragmented decode into `762`
+model calls, kept total ragged-decode GPU at `10.32s`, and landed at
+`244.9 / 24.0 / 1061.7ms`, throughput `32.4 tok/s`. That does not beat the
+better cap-4/tail-4 local controls on TTFT/TPOT/throughput, so the long_output
+gap remains model-side decode replay plus prefill, not a stricter stop-tail cap.
+
+A same-tree cap-4 default confirmation wrote
+`/tmp/inference-bench-ti-current-long-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-ti-long-current/runs/20260705_023128`
+and landed long_output at `216.1 / 23.9 / 1151.4ms`, `1000/1000` correct,
+throughput `33.7 tok/s`. It exercised the cap (`30` tail-limited calls,
+`120` tail-limited steps), kept decode-many overgeneration to `1.25K` tokens,
+and spent `10.30s` decode GPU plus `4.65s/5.08s` prefill forward/wall. A
+no-tail-cap A/B on the same tree wrote
+`/tmp/inference-bench-ti-current-long-notail-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-ti-long-notail-current/runs/20260705_023829`
+and landed at `238.2 / 24.5 / 1115.6ms`, `1000/1000` correct, throughput
+`32.7 tok/s`. Removing the tail cap reduced decode-many GPU time
+(`7.71s -> 6.82s`) and E2E, but worsened queue-to-first (`164.4 -> 184.6ms`),
+TPOT, throughput, and overgeneration (`1.25K -> 1.84K`). Keep the cap-4
+default; the long_output path needs lower steady model replay cost, not another
+tail-cap toggle.
+
+The runtime and analyzer now split decode-many work by generated-token windows
+(`g1-16`, `g17-32`, ...), and the full `bN/N` decode-many path skips padding-row
+seq-len bookkeeping. A TorchInferno-only long_output profile on the current tree
+wrote
+`/tmp/inference-bench-ti-step-window-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-ti-stepwin/runs/20260705_025747`
+and landed at `243.0 / 23.9 / 1066.3ms`, `1000/1000` correct, throughput
+`32.9 tok/s`. The new step-window table shows the dominant decode-many work is
+early and full-batch: `decode_many:b64/64:g1-16` accounted for `226` calls,
+`14.5K` model tokens, and `3.13s` model wall, while
+`decode_many:b64/64:g17-32` was only `20` calls, `1.28K` tokens, and `277ms`.
+This narrows the next long_output target to reducing the steady full-batch
+decode replay cost during the first 16 generated tokens, not drain-tail padding
+or late-window stop overgeneration.
+
+The next focused decode change removes explicit row-index tensors for greedy
+ragged decode when the active physical row set is exactly `0..N-1`. Decode-many
+now feeds the graph in physical-row order and gathers generated tokens back to
+the scheduler's active-state order, so request event ordering does not change;
+the one-step ragged decode path uses the same contract and gathers reusable
+prefix logits back before storing them. The exact-code TorchInferno-only
+long_output validation wrote
+`/tmp/inference-bench-ti-contig-all-decode-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-ti-contig-all-decode/runs/20260705_032508`
+and landed at `224.2 / 23.7 / 1162.8ms`, throughput `33.6 tok/s`,
+`1000/1000` correct. The queue profile confirmed a native
+`ragged_decode:token:b64:rows0` capture, lower decode-many GPU time than the
+step-window baseline (`6.87s` vs `7.35s`), fewer decode-many steps (`480` vs
+`546`), and fewer hot `decode_many:b64/64` model tokens (`14.98K` vs
+`15.74K`) with a similar GPU slice (`3.47s` vs `3.39s`). This is a modest
+TTFT/TPOT/throughput win over the step-window baseline, while E2E moved with
+run-to-run wave variance; it is not a complete long_output closure. The
+remaining score gap is still dominated by full-batch model replay and prefill.
+Validation: `venv/bin/python -m pytest tests/test_serving_engine.py -q`;
+`venv/bin/python -m pytest
+tests/test_openai_server.py::test_openai_queue_profile_records_runtime_engine_stats
+tests/test_inference_bench_summary.py -q`; `venv/bin/python -m pyflakes
+src/torchinferno/runtime/serving.py tests/test_serving_engine.py
+src/torchinferno/openai_server.py src/torchinferno/research/inference_bench.py
+tests/test_openai_server.py tests/test_inference_bench_summary.py`; and
+`git diff --check`.
+
+Startup scheduler warmup now captures the contiguous row-index-free ragged
+decode graphs on the persistent serving cache, instead of warming only the
+explicit-row-index variants. The focused long_output recheck wrote
+`/tmp/inference-bench-ti-rows0-warmup-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-ti-rows0-warmup/runs/20260705_033755`
+and landed at `232.7 / 23.3 / 1072.3ms`, throughput `33.6 tok/s`,
+`1000/1000` correct. The intended profile change is clear: request-time decode
+graph captures dropped from one `ragged_decode:token:b64:rows0` capture
+(`247.4ms`) to zero, the live decode graph cache now includes both `rows0` and
+`rows1` entries for the warmed buckets, queue-to-first p50 moved from
+`167.1ms` to `163.9ms`, and queue-to-finish p50 moved from `1026.7ms` to
+`991.3ms`. This removes a first-request capture bubble; it does not change the
+main long_output target, which remains lower full-batch decode replay and
+prefill cost.
+
+Short-cache ragged decode graph caps are rejected as a default and remain
+diagnostic-only. The tempting idea was to keep the 1024-token persistent cache
+for reuse, but slice the long_output decode graph body to a 256-token cache
+bucket for deterministic short generations. The broad default-on probe wrote
+`/tmp/inference-bench-ti-short-cachecap-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-ti-short-cachecap/runs/20260705_035804`
+and did capture/use the capped graphs with zero request-path decode captures
+(`cache256:16` live entries), but startup memory reached the H100 limit and the
+row regressed to `244.0 / 22.8 / 1074.0ms`, throughput `34.2 tok/s`. Narrowing
+the cap to the hot 64-row decode bucket wrote
+`/tmp/inference-bench-ti-short-cachecap-b64-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-ti-short-cachecap-b64/runs/20260705_040512`
+and reduced the extra graph surface to `cache256:2`, with zero decode captures
+and a lower hot `decode_many:b64/64` GPU slice (`2.26s` over `11.39K` model
+tokens). It still touched the memory ceiling and regressed to
+`249.3 / 22.9 / 1142.9ms`, throughput `33.9 tok/s`. Keep
+`TORCHINFERNO_OPENAI_TP_ONLINE_SHORT_GREEDY_RAGGED_DECODE_CACHE_TOKENS`
+default-off; the long_output fix is not another decode graph bucket unless the
+graph memory cost is solved.
+
+Multi-token ragged decode graphs are also rejected as a default. The runtime now
+has explicit `decode_many_graph_*` counters and the model can replay row-indexed
+multi-step greedy decode graphs, but the score probe showed this is the wrong
+long_output lever. With only
+`TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY_GRAPH=1`, the focused run wrote
+`/tmp/inference-bench-ti-long-manygraph-telemetry-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-ti-long-manygraph-telemetry/runs/20260705_083541`
+and landed at `233.1 / 23.3 / 1074.4ms`, `1000/1000` correct, but the new
+counters proved the path never fired (`runtime_decode_many_graph_calls=0`).
+Allowing scattered/padded row-index graphs with
+`TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY_GRAPH_ALLOW_ROW_INDICES=1` made the
+path fire on every decode-many call in
+`/tmp/inference-bench-ti-long-manygraph-rowidx-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-ti-long-manygraph-rowidx/runs/20260705_084645`
+(`128` graph calls, `466` graph steps, `28.9K` graph model tokens), but regressed
+the row to `222.1 / 23.9 / 1254.0ms` with TPOT p99 `298.8ms`. Decode-many GPU
+time rose to `12.65s` from `7.04s` in the no-row-index telemetry run. Keep the
+row-indexed multi-step graph behind the extra explicit opt-in; the default
+long_output target remains lower per-step model replay cost, not chaining
+several decode steps inside one CUDA graph.
+
+## Public 20260705_030215 refresh
+
+The latest public run advanced to
+`results/v1/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100/runs/20260705_030215`
+at inference-bench commit `cb96c382`. TorchInferno still wins
+self_consistency E2E/throughput, but the score-facing gaps are unchanged in
+shape: multi_turn is primarily TTFT/E2E (`340.0 / 62.9 / 398.6ms` versus vLLM
+`147.7 / 66.8 / 208.4ms`), tree_of_thought remains cached-prefix prefill/decode
+bound (`119.9 / 44.6 / 148.5ms` versus vLLM `65.6 / 29.6 / 90.4ms`), and
+long_output remains the deterministic short-generation throughput row
+(`250.4 / 20.9 / 982.9ms` versus vLLM `76.6 / 14.9 / 617.6ms`). The public
+long_output queue profile again had no decode graph captures, about `4.36s`
+prefill wall, and `9.20s` decode GPU, so the next defaultable change still has
+to reduce model-side replay/prefill work rather than warm more graph variants.
+
+`torchinferno.cli inference-bench-summary` now prints a compact
+`[torchinferno score targets]` table that joins provider gaps to the matching
+TorchInferno queue profile. On `20260705_030215` it ranks long_output first
+(`+176.0/+6.0/+365.3ms`, decode target, `9.20s` decode GPU and `8.96s`
+decode-many shape time), multi_turn second (`+192.3/-3.9/+190.2ms`, prefill
+target, `4.20s` prefill forward), and tree third (`+54.3/+15.0/+58.1ms`,
+balanced prefill+decode). That keeps the next implementation work focused on a
+real lower-cost decode replay for `decode_many:b64/64` and a true packed
+cached-prefix prefill body, not the already-rejected suffix-bucket,
+decode-cache-bucket, FI-reuse, or fused-append toggles.
+
+The score-target and queue-profile tables now include prefill/decode graph
+misses plus generated-prefix store/reuse counters. On the same public run,
+long_output shows only `2` decode graph misses and no generated-prefix activity,
+while self_consistency shows `1` generated-prefix store and `998` generated
+prefix reuses. That separates the long_output decode replay gap from
+generated-prefix/static-logits noise seen in some local runs.
+
+The analyzer now also mines vLLM/SGLang server logs for provider-side phase
+signals. On `20260705_030215`, vLLM reported six runtime intervals averaging
+`1760 tok/s` prompt throughput, `517 tok/s` generation throughput, and `76.5%`
+prefix-cache hit rate. SGLang logged `619` graphed prefill batches with `91.2K`
+new prompt tokens and `423.6K` cached tokens, plus `23` graphed decode batches.
+That comparison reinforces the same direction as the TorchInferno queue profile:
+competitors are getting broad prefix-cache/chunked-prefill reuse under CUDA
+graphs, while TorchInferno still spends score-facing time in padded cached-prefix
+replay and full-batch decode graph replay.
+
+Decode-many now skips redundant start-of-burst GPU state staging when the active
+rows, last tokens, and sequence lengths exactly match the GPU-resident state left
+by the previous burst. A focused long_output run wrote
+`/tmp/inference-bench-ti-state-syncskip-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-ti-state-syncskip/runs/20260705_042815`
+and landed at `218.4 / 24.4 / 1084.5ms`, throughput `33.3 tok/s`, `1000/1000`
+correct. The profile shows the new path did fire (`63` state syncs, `72` sync
+skips), but the score-facing shape did not change: `5.34s` prefill wall,
+`6.87s` decode-many GPU, and hot `decode_many:b64/64` at `3.07s` over `14.3K`
+model tokens. Keep the skip as default-safe runtime hygiene and profiling
+visibility; it is not a long_output closure. The next useful work remains a
+lower-cost full-batch decode replay or packed cached-prefix prefill body.
+
+A greedy-short persistent idle probe is also rejected as a default. Raising the
+online persistent idle window from the default `10ms` to `100ms` for a focused
+TorchInferno-only long_output run wrote
+`/tmp/inference-bench-ti-greedyidle100-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-ti-greedyidle100/runs/20260705_045432`
+and landed at `228.9 / 24.4 / 1092.3ms`, throughput `32.2 tok/s`,
+`1000/1000` correct. The profile moved the wrong model-work counters:
+`67` prefill batches, `4.99s/5.42s` prefill forward/wall, `6.43s`
+decode-many GPU over `478` decode-many steps, and hot `decode_many:b64/64`
+at `2.53s` over `11.8K` model tokens. Keeping the online session open longer
+does not recover the competitor-style prefix reuse; it just shifts more wave
+work into the same padded prefill and full-batch decode replay paths.
+
+Ragged token decode graphs now look up rotary rows from the static
+cache-position graph input inside the captured graph instead of copying rotary
+cos/sin buffers before every replay. Logits graphs stay on the old copy path
+unless `TORCHINFERNO_CUDAGRAPH_RAGGED_DECODE_ROTARY_IN_GRAPH=1` explicitly opts
+them in. A focused long_output A/B wrote
+`/tmp/inference-bench-ti-rotarygraph-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-ti-rotarygraph/runs/20260705_050408`
+and landed at `227.1 / 23.7 / 1094.5ms`, throughput `33.9 tok/s`,
+`1000/1000` correct. The internal counter moved in the intended direction:
+decode graph replay accounting fell to `579ms`, with `ragged_decode:token:b64`
+rows1 replay at `393ms` instead of about `587ms` in the 100ms-idle probe. The
+score-facing decode-many path did not close, though: total decode-many GPU was
+still `6.83s` over `510` decode-many steps, and hot `decode_many:b64/64` was
+`2.93s` over `13.95K` model tokens. This is a small decode-replay hygiene win,
+not a long_output closure; the remaining target is still lower full-batch
+decode replay or packed cached-prefix prefill.
+
+A no-env confirmation after promoting that behavior for token graphs wrote
+`/tmp/inference-bench-ti-rotarydefault-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-ti-rotarydefault/runs/20260705_051304`
+and landed at `246.0 / 23.6 / 1093.7ms`, throughput `33.7 tok/s`,
+`1000/1000` correct. It reproduced the internal counter win
+(`567ms` decode graph replay, with `ragged_decode:token:b64` rows1 replay at
+`374ms`) but not a score-facing closure: `67` prefill batches,
+`4.81s/5.23s` prefill forward/wall, `6.81s` decode-many GPU over `510`
+decode-many steps, and hot `decode_many:b64/64` at `2.98s` over `14.2K` model
+tokens.
+
+The same rotary-in-graph hygiene is now applied to ragged prefix-prefill graphs.
+The prefill graph key includes the rotary mode, and the default path looks up
+rotary rows from the static write-position tensor inside the captured graph
+instead of copying static cos/sin buffers before every replay. A long_output A/B
+against the same working tree wrote
+`/tmp/inference-bench-ti-prefillrotary-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-ti-prefillrotary/runs/20260705_052716`
+and
+`/tmp/inference-bench-ti-prefillrotaryoff-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-ti-prefillrotaryoff/runs/20260705_053233`.
+With in-graph prefill rotary enabled, score was
+`246.5 / 22.1 / 1068.2ms`, throughput `34.8 tok/s`; disabling it landed at
+`218.5 / 23.6 / 1131.6ms`, throughput `33.6 tok/s`; both were `1000/1000`
+correct. The mechanism is visible in queue counters despite decode variance:
+prefill graph replay fell `187.8ms -> 145.7ms` and prefill forward/wall fell
+`4.88s/5.29s -> 4.65s/5.04s`. This is a small defaultable prefill replay win,
+not a full long_output closure, because decode-many still moved independently.
+
+Ragged prefix-prefill graphs now also derive full write positions inside the
+captured graph from static start positions plus a static suffix offset vector.
+That avoids copying the full `[batch, suffix]` write-position tensor on replay
+when the graph also gathers rotary rows internally. The focused long_output A/B
+wrote
+`/tmp/inference-bench-ti-prefillposgraph-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-ti-prefillposgraph/runs/20260705_054445`
+with the default enabled and
+`/tmp/inference-bench-ti-prefillposoff-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-ti-prefillposoff/runs/20260705_054954`
+with `TORCHINFERNO_CUDAGRAPH_RAGGED_PREFILL_WRITE_POSITIONS_IN_GRAPH=0`.
+Enabled landed at `248.3 / 22.5 / 1076.4ms`, throughput `34.8 tok/s`;
+disabled landed at `223.7 / 24.1 / 1129.7ms`, throughput `33.5 tok/s`; both
+were `1000/1000` correct. Queue counters show the intended mechanism:
+prefill graph replay fell `157.5ms -> 122.8ms`, and prefill forward/wall fell
+`4.95s/5.38s -> 4.71s/5.09s`. Keep it default-on as prefill replay hygiene,
+with the same caveat as rotary: single-run TTFT and decode-many still vary
+enough that this is not a full score-facing closure.
+
+An opt-in stop-synchronized decode-many path is available under
+`TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY_SYNC_STOPS=1`, but it is not a
+default promotion. The path copies decode-many tokens back to CPU after each
+step when stop tokens are active, so stopped rows can be removed from later
+steps instead of being counted as skipped/overgenerated tokens at the end of the
+chunk. The focused long_output run wrote
+`/tmp/inference-bench-ti-decodemany-syncstops-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-ti-decodemany-syncstops/runs/20260705_060616`
+and landed at `233.3 / 23.1 / 1087.4ms`, throughput `33.6 tok/s`,
+`1000/1000` correct. Versus the nearby default
+`/tmp/inference-bench-ti-prefillposgraph-results/.../runs/20260705_054445`,
+it removed decode-many overgeneration (`1390 -> 0`) and reduced decode-many GPU
+time (`7.92s -> 7.14s`), but CPU token-copy time rose (`20.4ms -> 78.6ms`) and
+median E2E did not improve (`1076.4ms -> 1087.4ms`). Keep it as a diagnostic
+for stop-heavy decode profiling; the default still needs a lower-overhead
+GPU-side stop compaction or a broader decode pipeline change.
+
+A max-active-96 long_output probe is also rejected as a default. The run wrote
+`/tmp/inference-bench-ti-long-active96-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-ti-long-active96/runs/20260705_062302`
+with `TORCHINFERNO_OPENAI_TP_ONLINE_MAX_ACTIVE=96`,
+`TORCHINFERNO_OPENAI_TP_ONLINE_KV_MAX_ACTIVE_CAP=96`, and a `49152` greedy KV
+token budget. It landed at `241.5 / 23.9 / 1094.4ms`, throughput
+`33.3 tok/s`, `1000/1000` correct. The scheduler still did not move the hot
+decode work above the `decode_many:b64/64` bucket: total ragged decode GPU was
+`10.39s`, decode-many GPU was `4.62s` over `338` steps, and the hottest
+decode-many shape stayed `decode_many:b64/64` (`1.49s`, `7040` model tokens).
+Prefill remained `4.59s/5.09s` forward/wall. Keep the `64`-active default; the
+benchmark's wave shape is not unlocked by a higher active cap, and future queue
+profiles now export `runtime_max_active_requests` and
+`runtime_prefix_cache_capacity` so cap experiments are visible directly in the
+JSONL.
+
+## Public 20260705_050210 refresh
+
+The latest public run advanced to
+`results/v1/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100/runs/20260705_050210`
+at inference-bench commit `a2e6ba16`. TorchInferno is at `3/20`, vLLM at
+`14/20`, and SGLang at `2/20`. TorchInferno wins self_consistency
+TTFT/E2E/throughput, but still trails vLLM on few_shot, multi_turn,
+tree_of_thought, and long_output. The public long_output row is TorchInferno
+`262.4 / 20.0 / 1016.4ms`, vLLM `78.0 / 14.8 / 621.9ms`, and SGLang
+`72.6 / 21.9 / 838.4ms`. Public TorchInferno queue counters show the same
+shape as the local A/Bs: `64` prefill batches, `4.09s/4.30s` prefill
+forward/wall, `165ms` prefill graph replay, and `422` decode-many steps. The
+remaining public gap is still cached-prefix prefill plus full-batch decode
+throughput, not benchmark-specific request handling.
+
+## Public 20260704_230159 refresh
+
+The latest public run advanced to
+`results/v1/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100/runs/20260704_230159`
+at inference-bench commit `7b5bcd1c`. TorchInferno dropped to `1/20`, vLLM
+scored `15/20`, and SGLang scored `3/20`. The public row now has vLLM winning
+all tree_of_thought metrics and three of four long_output metrics:
+
+- few_shot: TorchInferno `157.6 / 45.9 / 210.3ms`, vLLM
+  `148.8 / 53.9 / 190.8ms`, SGLang `139.2 / 78.1 / 217.2ms`.
+- self_consistency: TorchInferno `258.1 / 0.0 / 302.8ms`, vLLM
+  `194.3 / 0.0 / 212.1ms`, SGLang `221.5 / 0.0 / 380.3ms`.
+- multi_turn: TorchInferno `360.2 / 62.8 / 413.2ms`, vLLM
+  `174.1 / 57.6 / 230.3ms`, SGLang `169.6 / 111.6 / 283.1ms`.
+- tree_of_thought: TorchInferno `125.0 / 47.2 / 150.5ms`, vLLM
+  `63.6 / 31.1 / 87.3ms`, SGLang `77.6 / 54.5 / 138.2ms`.
+- long_output: TorchInferno `258.1 / 20.8 / 970.1ms`, vLLM
+  `81.5 / 15.0 / 615.0ms`, SGLang `75.9 / 22.4 / 826.4ms`.
+
+`torchinferno.cli inference-bench-summary` now prints per-benchmark provider
+gap tables against the best non-TorchInferno row. On this public run the largest
+median gaps are long_output TTFT/E2E (`+182.2/+355.1ms`), multi_turn TTFT/E2E
+(`+190.6/+182.9ms`), and tree TTFT/TPOT/E2E (`+61.5/+16.1/+63.2ms`); few_shot
+TPOT remains a TorchInferno win (`-8.0ms` versus the best other provider).
+The same summary on the new run keeps the implementation split visible. Tree
+queue-to-first p50 was `105.8ms`, with `55`
+prefill batches, `1.70s/1.92s` prefill forward/wall, and `1.65s` decode GPU;
+its hottest prefill shape was `prefix_graph:b32:s16:p45-45:src1:mixed0`
+(`782.6ms`, `4.6K` padding tokens). Long_output queue-to-first p50 was
+`186.8ms`, with `62` prefill batches, `4.15s/4.63s` prefill forward/wall, and
+`9.24s` decode GPU; its hot decode shape stayed `decode_many:b64/64`
+(`1.69s` GPU, `254` overgenerated tokens). Multi_turn still reused the `45`
+token common prefix and spent `4.17s/4.33s` in prefill forward/wall. The public
+run therefore does not change the next engineering target: tree/multi need a
+real packed cached-prefix prefill body, while long_output needs lower model-side
+decode replay cost in the `b64` decode-many path.
+
+The analyzer now also shows decode-many shape efficiency: model tokens, emitted
+tokens, skipped/overgenerated tokens, and skip percentage for the hottest
+decode-many shape. On the existing q12-after-first diagnostic, the `b64/64`
+drain shape accounted for `21.2K` model tokens, `20.3K` emitted tokens, and
+`941` skipped tokens (`4.4%`) with `4.57s` GPU. That makes the q8/q12/tail-cap
+tradeoff visible from `inference-bench-summary` without manually diffing
+queue-profile JSON.
+
+The same summary now reports hot prefill shape efficiency from the existing
+model-token and active-token counters, and prints the top three prefill shapes
+per workload instead of only the single hottest row. On the public
+`20260704_230159` run, the hottest long_output suffix-prefill shape spent
+`927.9ms` on `16.4K` model tokens for `10.7K` active tokens (`34.8%` padding);
+its next two hot shapes were even less efficient (`48.8%` and `46.7%`
+padding). Multi_turn's hot `b32:s144` shape spent `1.44s` on `36.9K/25.8K`
+tokens (`29.9%` padding), and tree's top three hot shapes were all heavily
+padded (`42.7%`, `44.4%`, and `50.8%`). The row/suffix split shows the dominant
+waste is suffix padding, so the next performance lever remains a packed
+cached-prefix prefill body rather than another active-row or decode-tail cap.
+
+Packed-candidate telemetry now also records a fixed-pattern key that omits the
+per-wave request counts from the exact signature. Exact signatures answer
+whether a graph keyed on the full `(prefix_start, suffix_len, count)` histogram
+would replay; the new pattern counters answer the more useful next question for
+a fixed-capacity/dynamic-count packed prefill body: whether the same distinct
+`(prefix_start, suffix_len)` groups repeat even when their counts vary. Future
+queue profiles export pattern keys, calls, repeated calls, and repeated saved
+tokens beside the existing exact-signature reuse table.
+
+A current-tree TorchInferno-only tree run wrote
+`/tmp/inference-bench-ti-pattern-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-ti-pattern-tree/runs/20260705_012303`
+and confirmed the pattern signal: exact signatures repeated only `4/57`
+candidate calls (`604` saved tokens), while fixed patterns repeated `51/57`
+candidate calls and covered `8.36K` saved tokens (`98.7%` of candidate saved
+tokens). The analyzer now ranks fixed patterns by saved tokens; on that run the
+top pattern was
+`prefix_graph:b24:s16:p45-45:src1:mixed0|p45:s10/p45:s11/p45:s12`,
+with `27` calls, `5.9K/10.4K` real/model tokens, and `4.48K` saved tokens
+(`52.9%` of all candidate saved tokens). Future queue profiles now export the
+maximum observed slot count for each fixed-pattern `(prefix_start, suffix_len)`
+group, and the analyzer falls back to exact signatures for older logs. For that
+top tree pattern, the observed fixed slots would execute `7.75K` packed model
+tokens instead of `10.37K` dense tokens, saving `2.62K` tokens (`25.3%`) with
+`66.7%` exact-signature coverage. That is a more realistic first target than the
+raw dense-padding number: a fixed-capacity graph can save substantial suffix
+work, but dynamic-count slack and group capacity still leave about `1.86K`
+tokens between real tokens and fixed packed tokens. A follow-up sampled-medium
+`b20` batch-bucket probe wrote
+`/tmp/inference-bench-ti-pattern-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-ti-tree-b20/runs/20260705_012847`
+and is rejected as a default. It slightly improved TTFT (`127.5 -> 126.5ms`)
+but worsened TPOT/E2E (`27.3/150.9ms -> 36.7/153.5ms`), increased prefill
+batches (`58 -> 61`), and left prefill forward/wall essentially flat
+(`1.80s/2.22s -> 1.81s/2.23s`). This reinforces that bucket proliferation can
+reduce padding counters without reducing wall time; the next tree/multi change
+needs a fixed-capacity packed cached-prefix prefill body, not another bucket
+default.
+
+A fresh current-tree TorchInferno-only run with runtime slot-count export wrote
+`/tmp/inference-bench-ti-current-slot-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-ti-slot-current/runs/20260705_021555`
+and landed tree_of_thought at `127.5 / 25.5 / 150.6ms`, `953/992` correct.
+The fixed-capacity plan table now marks rows with `slot_src=runtime` when the
+queue profile provides direct slot maxima. On this run the top fixed-capacity
+target shifted to
+`prefix_graph:b32:s16:p45-45:src1:mixed0|p45:s10/p45:s11/p45:s12`: `15`
+calls, `37` fixed slots, `7.68K -> 5.88K` model tokens, and `1.80K` saved
+tokens (`23.4%`). The exact-signature map reported only `2/15` calls for that
+pattern because the exported top-signature map is intentionally capped; the
+runtime slot map is the authoritative source for the fixed-slot plan.
+The summary now also converts fixed-capacity saved tokens into an estimated
+saved-forward-ms column using the observed dense shape timing. On this artifact,
+the top three fixed-capacity targets estimate about `130ms`, `105ms`, and
+`51ms` of prefill-forward savings respectively, which is enough to prioritize
+the first packed-prefix graph body but not enough to explain the entire public
+tree TTFT/E2E gap by itself.
+
+Rechecking the existing `s12,16` suffix-bucket opt-in on the same current tree
+is also not a default promotion. The run wrote
+`/tmp/inference-bench-ti-current-s12-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-ti-s12-current/runs/20260705_022411`
+and landed at `119.5 / 37.2 / 145.0ms`, `958/992` correct. It reduced
+queue-to-first (`105.7 -> 98.5ms`), prefill padding (`8.51K -> 3.89K` candidate
+saved tokens), and E2E (`150.6 -> 145.0ms`), but it worsened TPOT from
+`25.5ms` to `37.2ms` and raised decode GPU (`1.39s -> 1.45s`). That gives up
+the local tree TPOT win that a public vLLM comparison needs, so keep `s12,16`
+as an opt-in diagnostic. The remaining defaultable work is still a packed
+fixed-capacity body that lowers prefill tokens without shifting decode shape
+quality.
+
+A targeted packed-eager pattern probe is also rejected as an implementation
+path, but useful as evidence. The runtime now has an opt-in
+`TORCHINFERNO_CONTINUOUS_PACKED_RAGGED_PREFILL_EAGER_PATTERN` switch that can
+run the existing Python packed-eager prefill only for an exact fixed-pattern key
+or coarse shape key. Targeting only the top tree pattern above wrote
+`/tmp/inference-bench-ti-pattern-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-ti-tree-packed-pattern/runs/20260705_014326`
+and regressed tree_of_thought to `568.5 / 42.9 / 612.2ms`, `958/992` correct.
+The queue profile confirms the cost source: only `16` packed-eager calls spent
+`8.43s` while saving `2.7K` padded tokens. Keep the pattern switch diagnostic
+only; the defaultable path still needs a real graph/kernel body for these fixed
+patterns, not the current dynamic packed-eager layer loop.
+
+A first exact-signature CUDA graph wrapper for the packed-eager body is also
+diagnostic only. The unguarded probe targeted the same coarse `b32/s16/p45`
+tree pattern with
+`TORCHINFERNO_CONTINUOUS_PACKED_RAGGED_PREFILL_EAGER_GRAPH=1` and wrote
+`/tmp/inference-bench-ti-tree-packed-graph-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-ti-tree-packed-graph/runs/20260705_065939`.
+It landed at `145.8 / 36.5 / 183.5ms`, `964/992` correct. The graph path was
+better than the earlier Python-only packed-eager probe, but it still spent
+`8.88s` across `7` packed calls because every targeted `b32` wave had a
+different exact suffix-length signature and paid capture cost instead of
+replaying one graph. That rules out exact-signature graph capture as the tree
+solution; the useful target remains the fixed-capacity pattern table.
+
+The exact packed graph now waits for shape reuse before capturing, defaulting
+`TORCHINFERNO_CONTINUOUS_PACKED_RAGGED_PREFILL_EAGER_GRAPH_CAPTURE_MIN_CALLS`
+to `2`. The guarded recheck wrote
+`/tmp/inference-bench-ti-tree-packed-graph-guard-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-ti-tree-packed-graph-guard/runs/20260705_070904`
+and landed at `141.9 / 28.2 / 167.9ms`, `956/992` correct, with no request-path
+packed graph captures and `3.67s` across `6` packed-eager calls. This prevents
+the worst exact-graph tail (`p99` fell from about `2.7s` to `1.1s`) and proves
+the static-index packed body is cheaper than the prior dynamic packed-eager
+probe, but it still loses to the no-env current-slot control (`150.6ms` E2E)
+and should remain opt-in.
+
+A stricter graph-only fallback keeps that diagnostic from accidentally taking
+the slow Python packed-eager body when no exact graph is reusable. With
+`TORCHINFERNO_CONTINUOUS_PACKED_RAGGED_PREFILL_EAGER_GRAPH_ONLY=1`, the targeted
+tree recheck wrote
+`/tmp/inference-bench-ti-tree-packed-graph-only-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-ti-tree-packed-graph-only/runs/20260705_073734`
+and landed at `148.4 / 49.5 / 193.3ms`, `960/992` correct. The queue profile
+shows the intended guard behavior (`0` packed-eager calls, `62` packed
+candidates recorded, and dense prefill graph replay at `104.5ms` total), but the
+timing is still worse than both the guarded probe and the no-env control. Keep
+the graph-only switch as a profiling safety valve; it is not the fixed-capacity
+packed prefill body needed to close the tree/multi gap.
+
+## Public 20260704_190215 refresh and long_output tail-cap recheck
+
+The latest public run advanced to
+`results/v1/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100/runs/20260704_190215`
+at inference-bench commit `7550e490`. TorchInferno is at `4/20`, vLLM scored
+`13/20`, and SGLang scored `2/20`. TorchInferno still wins few_shot TPOT and
+self_consistency TTFT/E2E/throughput. The remaining score-facing gaps are
+multi_turn, tree_of_thought, and long_output:
+
+- few_shot: TorchInferno `158.2 / 46.8 / 201.8ms`, vLLM
+  `145.1 / 47.8 / 188.3ms`, SGLang `146.7 / 75.8 / 221.9ms`.
+- self_consistency: TorchInferno `172.8 / 0.0 / 184.7ms`, vLLM
+  `216.6 / 0.0 / 240.5ms`, SGLang `225.7 / 0.0 / 387.1ms`.
+- multi_turn: TorchInferno `364.9 / 61.9 / 418.2ms`, vLLM
+  `174.8 / 46.4 / 222.4ms`, SGLang `161.1 / 113.1 / 269.0ms`.
+- tree_of_thought: TorchInferno `134.3 / 40.4 / 164.2ms`, vLLM
+  `62.9 / 30.5 / 85.8ms`, SGLang `74.1 / 57.2 / 142.8ms`.
+- long_output: TorchInferno `243.1 / 21.5 / 995.4ms`, vLLM
+  `79.2 / 14.8 / 625.5ms`, SGLang `76.6 / 22.0 / 831.1ms`.
+
+The gap parser is now repeatable through
+`torchinferno.cli inference-bench-summary <run-dir>`. Running it on the public
+`20260704_190215` directory for multi_turn, tree_of_thought, and long_output
+confirmed the provider distribution shape behind the scorecard:
+
+- multi_turn raw p50/p90 TTFT: TorchInferno `364.9/486.7ms`, vLLM
+  `174.8/273.8ms`, SGLang `161.1/277.8ms`.
+- tree_of_thought raw p50/p90 TTFT: TorchInferno `134.2/208.7ms`, vLLM
+  `62.9/99.4ms`, SGLang `74.1/121.6ms`.
+- long_output raw p50/p90 TTFT: TorchInferno `243.0/349.0ms`, vLLM
+  `79.2/120.6ms`, SGLang `76.6/127.7ms`. Output-token p50 was identical
+  (`36`) across providers, so the row is not an output-length artifact.
+
+The same command reports TorchInferno's final queue records beside provider
+metrics. In the public run, long_output had server-side queue-to-first p50
+`172.4ms`, `64` prefill batches, `4.21s/4.45s` prefill forward/wall, and
+`9.81s` ragged-decode GPU; tree had queue-to-first p50 `112.7ms`,
+`1.90s/2.13s` prefill forward/wall, and `1.97s` decode GPU; multi_turn had
+queue-to-first p50 `290.2ms` and `3.86s/4.02s` prefill forward/wall. This
+keeps the next loop grounded in two separate deficits: long_output still needs
+lower steady decode replay cost, while tree/multi remain dominated by
+cached-prefix prefill queueing and TP replay cost.
+
+The analyzer now also carries the queue-profile shape maps into hot-shape
+tables. On the same public run, long_output's hottest prefill replay was
+`prefix_graph:b24:s64:p111-111:src1:mixed0` (`973.7ms` forward,
+`9307` padding tokens) and its hottest decode replay was
+`decode_many:b64/64` (`1352.9ms` GPU, `266` overgenerated tokens). Multi_turn's
+largest prefill shape was `prefix_graph:b32:s144:p45-45:src1:mixed0`
+(`1026.4ms` forward, `8681` padding tokens), and tree's was
+`prefix_graph:b32:s16:p45-45:src1:mixed0` (`735.6ms` forward,
+`4132` padding tokens) with `ragged:b21/32` as the hottest decode shape
+(`293.0ms` GPU). That reinforces the implementation split: long_output needs a
+lower-cost `b64` decode replay path, while tree/multi need a real packed
+cached-prefix prefill path rather than more attention-only packing or shape
+bucket proliferation.
+
+The 20260704 local tree A/Bs narrowed the cached-prefix prefill branch but did
+not produce a default promotion. Enabling the FlashInfer cache backend without
+explicit FlashInfer prefill used to 500 because paged KV storage cannot safely
+fall back to the dense SDPA prefill path. The runtime now forces full-prompt
+FlashInfer prefill for paged caches and the diagnostic run completed, but it is
+not a performance candidate: `tree_of_thought` landed at
+`728.9 / 213.2 / 770.6ms`, with `51` packed FlashInfer calls spending
+`16.4s` and saving only `1.3K` padded tokens. The existing packed eager ragged
+prefill flag also remains diagnostic-only: it saved `7.8K` padded tokens but
+spent `29.8s` in packed eager prefill and regressed tree to
+`1183.9 / 309.5 / 1376.0ms`. A sampled-medium batch-bucket probe with
+`TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_BATCH_BUCKETS_SAMPLED_MEDIUM=1,2,4,8,16`
+improved tree TPOT to `29.4ms` but worsened TTFT/E2E to `147.6/179.4ms`; it
+also did not truly cap large groups because counts above the largest configured
+bucket fall back to the power-of-two `b32` bucket. The next viable tree lever is
+therefore a split/cap policy for large cached-prefix suffix groups or a graphed
+packed cached-prefix prefill, not the existing eager packed paths.
+The existing split knob is also rejected as a default:
+`TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SPLIT_ON_CAPTURE_SKIP_BATCH=16` forced
+large prefix groups through `b16` chunks, but raised tree to
+`176.1 / 40.9 / 201.9ms`. It increased prefill batches from the default `64`
+to `90`, pushed prefill forward/wall to `2.54s/3.20s`, and still left `7.5K`
+packed-candidate saved tokens. Splitting alone trades row padding for more TP
+graph replays; the next implementation needs a graph-backed packed-prefix
+prefill body or a more selective split policy that can prove lower wall time.
+
+`torchinferno.cli inference-bench-summary` now exposes that passive packed
+candidate signal directly. The queue table includes packed-candidate calls,
+saved tokens, and distinct packed groups, and the new
+`[torchinferno packed prefill candidates]` section reports the hottest shape by
+saved tokens. On the current local multi/tree profile this shows multi_turn's
+`prefix_graph:b32:s144:p45-45:src1:mixed0` candidate at `17.3K/23.0K`
+real/model tokens (`5.7K` saved for that shape, `22.6K` total saved), and
+tree's `prefix_graph:b24:s16:p45-45:src1:mixed0` at `3.8K/6.9K`
+real/model tokens (`3.1K` saved for that shape, `8.0K` total saved). This keeps
+future public profiles from hiding the packed-prefix opportunity behind the
+default graph-forward counters or the rejected eager packed paths.
+
+The packed-candidate telemetry now also records compact grouped signatures such
+as `prefix_graph:...|p45:s10:n12/p45:s11:n8`, with per-signature call, real
+token, model-token, saved-token, and group counters. The coarse shape counters
+show where padding is expensive; the signature counters answer whether a future
+packed CUDA graph can replay on exact `(prefix_start, suffix_len)` histograms or
+would churn on every wave. This remains telemetry-only and does not change
+admission, prefix reuse, or model execution.
+
+The first focused signature run wrote
+`/tmp/ti-bench-results/signature-tree/.../runs/20260704_230459` and landed
+tree_of_thought at `123.4 / 40.1 / 153.9ms`, throughput `8.2 tok/s`, and
+`967/992` correct. Queue-to-first p50 was `102.5ms`; prefill forward/wall was
+`1.81s/2.41s`; total ragged-decode GPU was `1.42s`. The packed-candidate
+counter saw `58` candidate waves, `8.5K` saved padding tokens, and `158`
+groups. The exported signature map retained `32` exact grouped keys covering
+`35` mapped calls; only `6/58` candidate calls repeated an exported exact
+signature, accounting for just `508` saved tokens (`6.0%` of candidate saved
+tokens). The hottest coarse shape remained reusable
+(`prefix_graph:b24:s16:p45-45:src1:mixed0`, `26` calls, `4.4K` saved tokens),
+but exact `(prefix_start, suffix_len, count)` histograms are too fragmented for
+an exact-signature graph cache to be the default packed-prefix implementation.
+The next viable packed path needs fixed-capacity/dynamic-count grouping, not a
+CUDA graph keyed directly on the full histogram.
+
+The analyzer now reports aggregate signature reuse as scalars when the server
+exports them: signature keys, signature-covered calls, total candidate calls,
+repeated calls, and repeated saved tokens. Older logs still get a best-effort
+map-derived row, but missing saved-token coverage is printed as `-` rather than
+`0`. The queue-profile exporter computes the scalar fields before top-N shape
+map limiting, so future public runs can answer the exact-signature question
+without manual `jq` or map-limit ambiguity.
+
+An extra sampled-medium bucket probe with
+`TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_BATCH_BUCKETS_SAMPLED_MEDIUM=1,2,4,8,12,16,20,24,28,32`
+wrote `/tmp/ti-bench-results/tree-buckets-mid-signature/.../runs/20260704_231651`
+and is rejected as a default. It reduced coarse padding opportunity
+(`6.8K` packed-candidate saved tokens versus `8.5K`) and improved TPOT to
+`38.2ms`, but tree_of_thought regressed to `128.8 / 38.2 / 156.9ms` with
+`958/992` correct. Queue-to-first rose to `106.5ms`, prefill batches increased
+to `63`, prefill forward stayed flat-to-worse at `1.84s`, and total
+ragged-decode GPU rose to `1.48s`. Finer batch buckets reduce padding in this
+row, but they also fragment shape reuse and do not improve the score-facing
+median. Keep them as opt-in evidence only.
+
+Two scheduler-side tree probes also failed to produce a default promotion.
+`TORCHINFERNO_OPENAI_TP_ONLINE_COLLECT_IDLE_ARRIVALS=1` wrote
+`/tmp/ti-bench-results/tree-idlecollect/.../runs/20260704_232750` and landed at
+`129.5 / 26.0 / 152.2ms`, with `956/992` correct. It improved TPOT and slightly
+improved E2E versus the local signature baseline, but worsened TTFT, lowered
+correctness, and pushed total decode GPU from `1.42s` to `1.80s`; the hot decode
+shape became `ragged:b19/32` (`263.3ms`). Capping sampled-medium active rows to
+`24` via `TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_MAX_ACTIVE=24` wrote
+`/tmp/ti-bench-results/tree-maxactive24/.../runs/20260704_233315` and regressed
+harder to `161.8 / 45.2 / 192.0ms`, `958/992` correct. It removed `b32` waves
+but increased prefill batches to `81`, prefill forward/wall to `2.16s/2.72s`,
+and queue-to-first p50 to `138.1ms`. The conclusion is the same as the padding
+probes: rearranging admissions and buckets cannot close the tree gap without a
+lower-cost packed-prefix prefill body.
+
+A common-prefix cache-only probe is also rejected. The temporary patch made
+`_prefill_common_prefix_batch` use the model cache-only hook when all requests
+had suffix tokens, avoiding logits for the shared prefix row. The focused tree
+run wrote `/tmp/ti-bench-results/tree-cacheonly-prefix/.../runs/20260704_235221`
+and regressed to `141.8 / 46.7 / 171.3ms`, `959/992` correct. Queue-to-first
+p50 rose to `117.3ms`, prefill wall rose to `2.64s`, and decode GPU rose to
+`1.66s`; the common prefix accounts for only one batch, so skipping its logits
+does not move the dominant cached-prefix suffix replay cost. Do not promote
+this cache-only common-prefix path without a stronger paired win.
+
+Public queue profiles still point at model-side replay and decode throughput,
+not graph-cache misses. Multi_turn reused only the `45` token common prefix,
+ran `34` prefill batches, and spent `3.86s/4.02s` in prefill forward/wall with
+`0` graph misses; its fast HTTP profile still sent role-only chunks for
+512-token streams. Tree reused the same `45` token prefix and spent
+`1.90s/2.13s` in prefill forward/wall plus `1.97s` ragged-decode GPU.
+Long_output reused the `111` token common prefix, spent `4.21s/4.45s` in
+prefill forward/wall, and spent `9.81s` in ragged-decode GPU across `803`
+ragged decode batches. The public long_output profile had
+`runtime_decode_many_tail_limited_calls=0`, so it did not exercise the local
+stop-tail cap default.
+
+A paired current-tree TorchInferno-only long_output recheck measured that local
+default. The no-env run wrote
+`/tmp/ti-bench-results/long-current/.../runs/20260704_155337` and landed at
+`246.1 / 24.3 / 1085.0ms`, throughput `33.0 tok/s`, `1000/1000` correct. Its
+profile did exercise the cap (`decode_many_stop_tail_max_steps=6`,
+`28` tail-limited calls, `56` tail-limited steps), reducing decode model calls
+to `736`, but still spending `10.10s` in ragged-decode GPU and
+`4.81s/5.22s` in prefill forward/wall.
+
+The same-tree cap-off control with
+`TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_DECODE_MANY_STOP_TAIL_MAX_STEPS=0`
+wrote `/tmp/ti-bench-results/long-cap0/.../runs/20260704_155859` and landed at
+`239.8 / 24.4 / 1119.4ms`, throughput `32.5 tok/s`, also `1000/1000`
+correct. Cap-off made TTFT about `6ms` better but worsened E2E by `34ms` and
+throughput by `0.5 tok/s`; it also ran `749` decode model calls and spent
+`10.28s` in ragged-decode GPU.
+
+A fresh cap-4 rerun on the same patched tree wrote
+`/tmp/ti-bench-results/long-tail4-current/.../runs/20260704_234227` and landed
+at `225.4 / 23.8 / 1061.4ms`, throughput `33.8 tok/s`, `1000/1000` correct.
+The profile showed `decode_many_stop_tail_max_steps=4`, `27` tail-limited
+calls, `108` tail-limited steps, `731` decode model calls, `7.14s`
+decode-many GPU time, and `1.22K` decode-many overgenerated tokens. Promote
+cap 4 as the greedy-short default: it now beats the current cap-6 and cap-off
+controls on E2E/throughput while preserving correctness. It is not the public
+long_output solution; the remaining gap is still larger prefill replay plus
+steady decode GPU time, not stop-tail overcompute.
+
+The no-env default confirmation on the patched tree wrote
+`/tmp/ti-bench-results/long-default-cap4-recheck/.../runs/20260705_001246` and
+landed at `211.0 / 24.0 / 1078.1ms`, throughput `33.6 tok/s`, `1000/1000`
+correct. The queue profile exported `decode_many_stop_tail_max_steps=4`, `31`
+tail-limited calls, `124` tail-limited steps, `7.52s` decode-many GPU time, and
+`1.25K` decode-many overgenerated tokens. This verifies that the promoted
+default, not only the env-forced probe, exercises the cap. The row still spends
+`4.74s/5.30s` in prefill forward/wall, so the remaining long_output target is
+lower prefill/decode model work rather than more stop-tail capping.
+
+A tighter cap-3 probe is rejected. With
+`TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_DECODE_MANY_STOP_TAIL_MAX_STEPS=3`,
+`/tmp/ti-bench-results/long-tail3-current/.../runs/20260705_002335` landed at
+`285.3 / 23.1 / 1116.4ms`, throughput `32.4 tok/s`, `1000/1000` correct.
+It cut decode-many model tokens and GPU time (`24.2K`, `6.02s`) but fragmented
+the tail into more scalar ragged decode work: total ragged-decode GPU rose to
+`10.19s`, decode model calls rose to `797`, and queue-to-first p50 rose to
+`207.2ms`. Keep cap 4 as the default balance point.
+
+A current-tree recheck of the rejected short-greedy `s80` suffix bucket also
+does not change the default. Adding
+`TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SUFFIX_BUCKETS_GREEDY_SHORT=16,32,64,80,96,128,256`
+wrote `/tmp/ti-bench-results/long-suffix80/.../runs/20260705_003038` and landed
+at `231.3 / 23.9 / 1094.2ms`, `1000/1000` correct. The bucket reduced total
+prefill padding to `28.1K`, but introduced cold `s80` graph captures during the
+request burst (`3.72s` capture time) and pushed prefill forward/wall to
+`8.04s/8.46s`; the hottest new shape was
+`prefix_graph:b24:s80:p111-111:src1:mixed0` at `2.13s` forward. The existing
+`16,32,64,96,128,256` short-greedy bucket list remains the right warmed shape
+set until a new bucket can be prewarmed and proven faster end to end.
+
+A targeted `s80` prewarm recheck removed the cold-capture failure mode but is
+still rejected as a default. The previous probe's hottest cold shape was
+`prefix_graph:b24:s80:p111-111:src1:mixed0`, while startup extra-pair warmup
+covered `111:32` and `111:64` but not `111:80`. Running the same `s80` bucket
+override with
+`TORCHINFERNO_OPENAI_WARMUP_ONLINE_GREEDY_COMMON_PREFIX_EXTRA_PAIRS=111:32,111:64,111:80,122:16`
+wrote `/tmp/ti-bench-results/long-s80-p111warm/.../runs/20260705_005103` and
+landed at `215.5 / 24.1 / 1091.3ms`, throughput `33.2 tok/s`, `1000/1000`
+correct. Queue profiles verified the intended mechanical fix (`0` request-path
+prefill graph captures/misses, `s80` p111 replay shapes present), but prefill
+forward/wall still stayed at `4.58s/4.98s` and total decode GPU at `9.98s`.
+This improves the rejected cold `s80` run's TTFT, but it does not beat the
+no-env cap-4 default confirmation on E2E or throughput; do not add `s80` to the
+default greedy-short bucket list.
+
+Greedy-short suffix-bucket splitting remains opt-in after the cap-4 default.
+The focused run with
+`TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SPLIT_SUFFIX_BUCKETS_GREEDY_SHORT=1`
+wrote `/tmp/ti-bench-results/long-suffixsplit-current/.../runs/20260705_003858`
+and landed at `217.5 / 24.1 / 1076.5ms`, throughput `33.2 tok/s`,
+`1000/1000` correct. It reduced prefill padding to `28.8K`, prefill
+forward/wall to `4.71s/5.11s`, and decode-many GPU to `6.53s`, but increased
+prefill batches to `69` and did not beat the cap-4 default recheck on
+TTFT/TPOT/throughput. The mechanism is real, but the score-facing movement is
+within noise and still fragments replay shapes (`68` candidate waves with no
+exact signature repeats), so keep it as a diagnostic rather than a default.
+
+Decode-many token readback now uses a reusable flat device scratch buffer
+instead of allocating and cloning one token tensor per replay step before the
+single host readback. The focused long_output run wrote
+`/tmp/ti-bench-results/long-decode-scratch-current/.../runs/20260704_172611`
+and landed at `269.0 / 23.9 / 1175.4ms`, throughput `31.8 tok/s`,
+`1000/1000` correct. This is not a score-facing win versus the better
+current-tree local bands, but it is useful hot-path hygiene: compared with the
+earlier same-tree packed-candidate profile, decode-many CPU token handling
+dropped from `26.2ms` to `19.9ms` despite more decode-many active model tokens
+(`32.0K` vs `29.1K`). The row remained dominated by `10.22s` ragged-decode GPU
+and `5.87s/4.86s` prefill wall/forward time, so the long_output gap still
+needs model-side decode throughput or packed cached-prefix prefill, not another
+host-token-copy tweak.
+
+Decode-many now has explicit model wall/GPU timing counters so the long_output
+profile can separate multi-step replay cost from token harvesting. The focused
+profile wrote
+`/tmp/ti-bench-results/long-decodemany-timing-current/.../runs/20260704_181309`
+and landed at `249.3 / 24.0 / 1195.6ms`, throughput `32.7 tok/s`,
+`1000/1000` correct. The final queue profile recorded `145` decode-many calls
+over `574` steps, `30.5K` active model tokens, `34.0K` padded tokens, and
+`29.0K` emitted tokens. Decode-many model time was `7.84s` wall and `7.79s`
+GPU event time; CPU token handling was only `18.0ms`. Total ragged decode was
+`10.37s` wall / `10.31s` GPU, with prefill at `4.75s/5.77s` forward/wall.
+The avoidable decode-many accounting was visible but not dominant:
+`3.47K` padding tokens and `1.49K` overgenerated stop-tail tokens. The hot
+`decode_many:b64/64` shape alone consumed `3.72s` GPU over `270` steps and
+`17.3K` model tokens. This closes the readback branch more firmly: the
+score-facing long_output lever is lower model-side decode replay cost or
+overlap, plus packed cached-prefix prefill, not more CPU token-copy surgery.
+Validation for the telemetry path:
+`venv/bin/python -m pyflakes src/torchinferno/runtime/serving.py
+src/torchinferno/openai_server.py tests/test_openai_server.py
+tests/test_serving_engine.py`; `venv/bin/python -m pytest
+tests/test_openai_server.py::test_openai_queue_profile_records_runtime_engine_stats
+tests/test_serving_engine.py::test_continuous_batch_engine_online_many_keeps_decode_tokens_ordered
+tests/test_serving_engine.py::test_continuous_batch_engine_online_many_shape_model_tokens_include_padding
+tests/test_serving_engine.py::test_continuous_batch_engine_online_many_can_overcompute_stop_tokens
+tests/test_serving_engine.py::test_continuous_batch_engine_online_many_can_cap_stop_tail_burst
+-q`; and `git diff --check`.
+
+The matching hot-shape replay profile used
+`TORCHINFERNO_PROFILE_RAGGED_DECODE_REPLAY_ONCE=1`,
+`TORCHINFERNO_PROFILE_RAGGED_DECODE_MIN_BATCH=64`, and
+`TORCHINFERNO_PROFILE_RAGGED_DECODE_REPLAY_SKIP_MATCHES=2`. It wrote
+`/tmp/ti-bench-results/long-b64-decode-profile-current/.../runs/20260704_182045`
+and landed at `264.4 / 24.5 / 1173.6ms`, `1000/1000` correct. The profiler
+captured `batch=64 match=3 cache_bucket=1024 rows=64` with `12.411ms` self CUDA
+time. The largest slices were the 160 dense GEMM kernels at `3.391ms`, gate-up
+Marlin at `3.299ms`, 160 symmetric-memory all-reduces at `2.075ms`, grouped GQA
+decode attention at `1.479ms`, and another dense split-K GEMM at `986us`.
+Attention is only about `12%` of the hot replay. The final queue profile also
+kept the new decode-many timing shape: `136` decode-many calls, `536` steps,
+`8.15s/8.10s` decode-many model wall/GPU time, and `4.20s` of that GPU time in
+`decode_many:b64/64` over `248` steps. This points at GEMM/Marlin and per-layer
+TP collective reduction as the decode-throughput levers; FlashAttention tuning
+or host-token handling will not move the long_output median enough on their own.
+
+Queue profiles now also export live ragged decode graph cache shape summaries:
+`runtime_decode_graph_cache_live_entries`,
+`runtime_decode_graph_cache_live_shape_counts`,
+`runtime_decode_graph_cache_live_batch_counts`,
+`runtime_decode_graph_cache_live_context_counts`, and
+`runtime_decode_graph_cache_live_cache_bucket_counts`. These mirror the live
+prefill graph summaries and make future public profiles distinguish first-use
+shape churn or cache eviction from steady replay cost. This is intentionally
+telemetry-only: it reads `_ragged_decode_graphs` and aggregates the real graph
+key `(cache id, batch, max_seq_len, cache token bucket, rows flag, symm key)`,
+without changing capture, replay, or graph-cache sizing. Validation:
+`venv/bin/python -m pyflakes src/torchinferno/openai_server.py
+tests/test_openai_server.py`; `venv/bin/python -m pytest
+tests/test_openai_server.py::test_openai_queue_profile_records_runtime_engine_stats
+tests/test_openai_server.py::test_openai_queue_profile_progress_skips_shape_details_by_default
+tests/test_openai_server.py::test_openai_queue_profile_graph_shape_limit_keeps_large_cache_visible
+-q`; and `git diff --check`.
+
+The runtime also now attributes decode graph capture and replay wall time by
+shape through `runtime_decode_graph_capture_shape_ms` and
+`runtime_decode_graph_replay_shape_ms`. The existing scalar
+`runtime_decode_graph_replay_ms` was enough to see total graph overhead, but not
+whether it came from the hot `b64` decode-many shape, smaller tail shapes, token
+graphs, or logits fallback. The new maps reuse the same
+`ragged_decode:{token|logits}:b*:rows*` keys as the capture/miss counters, so a
+future public profile can pair live cache shape, miss counts, replay counts, and
+replay time without enabling the heavyweight torch profiler. Focused validation:
+`venv/bin/python -m pyflakes src/torchinferno/runtime/serving.py
+src/torchinferno/openai_server.py tests/test_serving_engine.py
+tests/test_openai_server.py`; `venv/bin/python -m pytest
+tests/test_serving_engine.py::test_continuous_batch_engine_records_ragged_decode_graph_captures
+tests/test_openai_server.py::test_openai_queue_profile_records_runtime_engine_stats
+-q`.
+
+A current-tree explicit mixed-prefix multi_turn refresh is rejected as a default
+candidate. Running TorchInferno-only with
+`TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_MIXED_PREFIX_REUSE=1` wrote
+`/tmp/ti-bench-results/multi-mixed-current/.../runs/20260704_184104` and landed
+at `415.6 / 64.0 / 451.2ms`, `980/1000` correct. The queue profile confirms
+the regression is queueing, not missing graph warmup: `max_active=32`,
+`prefix_rows=112`, `39` prefill batches, `38/1` prefill graph hits/misses,
+`2.78s/3.07s` prefill forward/wall, and only `895ms` ragged decode GPU, but
+queue-to-submit was `104ms` p50 / `614ms` p99 and queue-to-first was `179ms`
+p50 / `700ms` p99. The harness terminated the server before a detailed
+quiescent profile, so the run did not include route maps that would prove
+request-prompt reuse. The profile recorder now marks final progress snapshots
+with `profile_complete_snapshot=true` and forces the same shape/detail maps as a
+quiescent record when all submitted requests have finished. That makes short
+targeted runs useful even when the harness sends SIGTERM immediately after the
+last stream closes. Validation:
+`venv/bin/python -m pyflakes src/torchinferno/openai_server.py
+tests/test_openai_server.py`; `venv/bin/python -m pytest
+tests/test_openai_server.py::test_openai_queue_profile_progress_skips_shape_details_by_default
+tests/test_openai_server.py::test_openai_queue_profile_records_runtime_engine_stats
+-q`; and `git diff --check`.
+
+Rebalancing the explicit mixed-prefix row budget toward active rows is also
+rejected. The focused probe kept the same explicit reuse policy but added
+`TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_MAX_ACTIVE=48` and
+`TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_MIXED_PREFIX_ROWS=96`, preserving
+the `144` total-row envelope. It wrote
+`/tmp/ti-bench-results/multi-mixed-active48-prefix96/.../runs/20260704_185228`
+and regressed to `936.4 / 90.5 / 1063.3ms`, `980/1000` correct. The completed
+queue snapshots captured all `1000` requests across three online sessions:
+`44` prefill batches, `31.0K` prefill tokens, `10.63s/11.33s` prefill
+forward/wall, `18/26` prefill graph hits/misses, `1.54s` ragged decode GPU,
+and route counts `{"common_prefix":247,"request_prompt":751}` with `1000`
+full-prompt adoptions. The new detail maps attribute the misses mostly to cold
+large-row mixed-prefix shapes (`b48:s32:ctx-128/ctx-256:src48`) and each
+session still showed submit-to-first p50 around `475ms`. Larger active waves
+therefore amplify cold mixed-prefix suffix replay and decode cost instead of
+fixing the explicit policy's queueing jitter; keep the opt-in at `32/112`.
+
+Extending stream role-deferral through 512-token requests is accepted. The
+benchmark counts TTFT at the first non-empty content delta, so sending a
+role-only SSE chunk before content adds client/parser work that the metric does
+not credit. The existing default already defers role chunks for bounded streams
+up to `400` tokens; the focused multi_turn probe raised only
+`TORCHINFERNO_OPENAI_STREAM_DEFER_ROLE_MAX_TOKENS=512` alongside the explicit
+mixed-prefix policy. It wrote
+`/tmp/ti-bench-results/multi-mixed-deferrole512/.../runs/20260704_190414` and
+landed at `285.7 / 63.2 / 349.2ms`, `980/1000` correct, versus the same
+current-tree mixed-prefix default at `415.6 / 64.0 / 451.2ms`. The runtime
+shape stayed intended: `max_active=32`, `prefix_rows=112`, `37` prefill
+batches, `18.7K` prefill tokens, `2.33s/2.63s` prefill forward/wall, `37/0`
+prefill graph hits/misses, `865ms` ragged decode GPU, route counts
+`{"common_prefix":125,"request_prompt":875}`, and `1000` full-prompt
+adoptions. Fast HTTP profiling confirmed the role-only chunk disappeared
+(`role_send_present=false`) and first-content p50 moved to `163ms`; benchmark
+TTFT still includes client-side overhead, but the content-visible median dropped
+by about `130ms`. Make `512` the default role-deferral bound.
+
+A no-env public-shape multi_turn check after the default change confirms role
+deferral alone does not solve the common-prefix path. The run wrote
+`/tmp/ti-bench-results/multi-default-deferrole512/.../runs/20260704_191132` and
+landed at `414.8 / 60.2 / 470.1ms`, `980/1000` correct. Fast HTTP profiling
+again showed no role-only chunk (`role_send_present=false`), but the runtime was
+still the common-prefix shape: `prefix_rows=64`, no full-prompt adoptions,
+route counts `{"common_prefix":1000}`, `35` prefill batches, `85.3K` prefill
+tokens, `4.08s/4.43s` prefill forward/wall, and queue-to-first p50 `317ms`.
+The stream packaging fix closes a client-visible chunking tax; the default
+multi_turn gap still needs cheaper conversation-prefix reuse or lower
+common-prefix prefill queueing.
+
+Close-delimited SSE is not a broad default. Disabling fast HTTP keepalive with
+`TORCHINFERNO_OPENAI_FAST_HTTP_KEEPALIVE=0` on the explicit mixed-prefix
+multi_turn path wrote
+`/tmp/ti-bench-results/multi-mixed-close-sse/.../runs/20260704_191923` and
+landed at `250.2 / 68.0 / 343.6ms`, `980/1000` correct. It improved TTFT
+versus role-deferral alone (`285.7ms -> 250.2ms`) and kept the intended runtime
+shape (`32/112`, `36` prefill batches, `18.8K` prefill tokens, `36/0` prefill
+graph hits/misses, `{"common_prefix":125,"request_prompt":875}`), but worsened
+TPOT and p99 latency. The adjacent few_shot control with only keepalive disabled
+wrote `/tmp/ti-bench-results/few-close-sse/.../runs/20260704_192447` and
+regressed to `188.0 / 51.4 / 236.9ms`, `977/1000` correct, worse than the
+current public few_shot row (`170.2 / 49.1 / 225.4ms`) with a bad `1.2s` TTFT
+p99. Keep chunked keepalive as the broad default; global close-SSE remains an
+explicit transport diagnostic.
+
+The same transport tradeoff is not stable enough to promote even under the
+deterministic large-stream bucket. A no-env common-prefix multi_turn control
+with global keepalive disabled wrote
+`/tmp/ti-bench-results/multi-default-close-sse/.../runs/20260704_194105` and
+landed at `357.2 / 60.8 / 411.3ms`, `983/1000` correct, versus the
+role-deferral-only no-env control at `414.8 / 60.2 / 470.1ms`. Implementing the
+close behavior as a request-scoped default for `temperature <= 0` and
+`400 < max_tokens <= 512` then wrote
+`/tmp/ti-bench-results/multi-default-scoped-close/.../runs/20260704_194827` and
+landed at `371.3 / 64.2 / 440.5ms`, `983/1000` correct. Fast HTTP profiling
+confirmed all `1000` 512-token streams used `keep_alive=false` with no role-only
+chunk, while the runtime stayed on the default common-prefix route
+(`prefix_rows=64`, `35/0` prefill graph hits/misses,
+`{"common_prefix":1000}`). The subsequent no-env full suite on the same patch
+wrote `/tmp/ti-bench-results/full-current-scopedclose/.../runs/20260704_200347`
+and regressed the multi_turn row back to `414.7 / 63.3 / 469.7ms` with queue
+profile `35` prefill batches, `83.7K` prefill tokens, and queue-to-first p50
+`326ms`. Keep stream keepalive as the default; the large-greedy close path is
+only an explicit diagnostic via
+`TORCHINFERNO_OPENAI_FAST_HTTP_GREEDY_LARGE_CLOSE_STREAM=1`. The restored
+default check
+`/tmp/ti-bench-results/multi-default-keepalive-restored/.../runs/20260704_201257`
+landed at `413.9 / 61.1 / 463.7ms`, `981/1000` correct, and confirmed
+`keep_alive=true` for all `1000` 512-token streams with the same common-prefix
+runtime shape (`34/0` prefill graph hits/misses, `80.2K` prefill tokens,
+queue-to-first p50 `329ms`).
+
+Do not extend close-SSE to short-greedy long_output. The focused global-close
+probe `/tmp/ti-bench-results/long-close-sse-current/.../runs/20260704_195728`
+kept correctness at `1000/1000` but landed at `258.0 / 23.4 / 1167.2ms`, worse
+TTFT/E2E than the current no-env long controls. The queue profile stayed on the
+normal common-prefix route but moved the wrong direction: `57` prefill batches,
+`4.59s/5.39s` prefill forward/wall, `10.46s` ragged-decode GPU, and `7.49s`
+decode-many GPU. Short-greedy streams keep chunked keepalive by default.
+
+Combining the already-rejected sampled-medium knobs is also rejected. The tree
+probe with `TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SUFFIX_BUCKETS=12,16` and
+`TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_INITIAL_BATCH_WAIT_MS=0` wrote
+`/tmp/ti-bench-results/tree-s12-initial0-current/.../runs/20260704_201920` and
+landed at `140.4 / 39.8 / 166.5ms`, `959/992` correct. Queue profiling showed
+the intended `s12` graph surface and no misses (`61/0` prefill graph
+hits/misses), but prefill wall rose to `2.51s`, queue-to-first p50 was
+`118ms`, and TPOT regressed. Keep sampled-medium suffix buckets and initial wait
+at their current defaults; the tree gap still needs true packed cached-prefix
+prefill or lower TP replay cost.
+
+The targeted current-tree tree replay profile wrote
+`/tmp/ti-bench-results/tree-replay-current/.../runs/20260704_160910` with
+`TORCHINFERNO_PROFILE_RAGGED_PREFILL_REPLAY_ONCE=1`,
+`TORCHINFERNO_PROFILE_RAGGED_PREFILL_CONTEXT_LEN=61`, and
+`TORCHINFERNO_PROFILE_RAGGED_PREFILL_REPLAY_SKIP_MATCHES=1`. It landed at
+`132.0 / 36.7 / 158.2ms`, `955/992` correct, with the expected profiler tail
+spike (`p99` TTFT/E2E `1682/1699ms`). The warmed request graph fired after
+readiness as `batch=32 suffix=16 match=2 context_len=61 src_rows=1`. The
+CUDA table is stable with the earlier diagnosis: total replay CUDA time was
+`33.064ms`, led by `160` NCCL all-reduces at `13.039ms` (`39.4%`), then GEMM
+kernels at about `9.8ms` combined, RMSNorm/add at about `3.3ms`, gather/index
+work at about `2.8ms`, and FlashAttention at only `0.796ms` (`2.4%`).
+
+The final queue profile from that same run confirms the request shape rather
+than a graph-cache issue: all `992` requests reused only the `45` token common
+prefix, with `58` prefill graph hits, `0` misses, `0` request-path captures,
+`2.89s/3.34s` prefill forward/wall, and `1.44s` ragged-decode GPU. Every
+prefix-suffix replay still used `s16`, while real suffixes were only `10`,
+`11`, and `12`, for `8.29K` padding tokens (`2.82K` row and `5.47K` suffix).
+The hot replay map was `b32:s16:ctx61` at `1.145s` over `11` calls, `b24:s16`
+at `87.3ms` over `24` calls, and `b16:s16` at `33.0ms` over `12` calls. This
+closes the scheduler/bucket retest loop for tree: the next score-facing lever
+must either make cached-prefix suffix prefill packed enough to avoid padded
+MLP/all-reduce work, or reduce the per-layer TP collective cost. Attention
+backend selection, more suffix buckets, and another wait/refill knob are not
+supported by the current evidence.
+
+A current-tree sampled-medium initial-wait-zero probe reinforces that conclusion.
+With only `TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_INITIAL_BATCH_WAIT_MS=0`
+changed, `/tmp/ti-bench-results/tree-initial0-current/.../runs/20260704_193424`
+landed at `130.7 / 27.3 / 155.0ms`, `960/992` correct. Queue-to-submit p50
+fell slightly to `48.6ms`, but queue-to-first stayed `107.8ms`, prefill
+forward/wall was `1.80s/2.44s`, and all `992` requests still used only the
+`45` token `common_prefix` route with `59/0` prefill graph hits/misses. Removing
+the sampled-medium first wait therefore shifts small scheduling counters without
+closing the TTFT/E2E gap; keep the existing `1ms` default.
+
+A fresh current-patch recheck confirms that decision. The same initial-wait-zero
+env wrote
+`/tmp/ti-bench-results/tree-initial0-recheck/.../runs/20260705_000626` and
+landed at `141.1 / 29.9 / 166.6ms`, `959/992` correct. It kept `59/0` prefill
+graph hits/misses, but queue-to-first p50 rose to `115.8ms`, prefill wall rose
+to `2.57s`, and decode GPU stayed high at `1.44s`. This can improve sampled
+TPOT in some runs, but it is not a stable TTFT/E2E improvement over the
+stronger no-env tree rows and should remain an override.
+
+Tree pinned full-prompt reuse is also rejected by passive candidate telemetry
+on current head. The runtime now keeps a profile-only shadow radix index for
+full prompts that pinned shared-prefix mode skipped with
+`pinned_without_allowance`, and exports
+`runtime_full_prompt_reuse_candidate_*` counters. A no-env tree profile wrote
+`/tmp/ti-bench-results/tree-fullprompt-candidate-current/.../runs/20260704_171403`
+and landed at `135.6 / 36.4 / 167.6ms`, `966/992` correct. The final queue
+profile stored `992` shadow full-prompt candidates covering `55,042` prompt
+tokens, but recorded `0` later requests with a deeper candidate hit:
+`runtime_full_prompt_reuse_candidate_requests=0`,
+`runtime_full_prompt_reuse_candidate_extra_tokens=0`, and empty candidate-depth
+maps. Actual reuse stayed `{"common_prefix":992}` / `{"45":992}` with
+`60` prefill graph hits and `0` misses. This rules out simply enabling pinned
+full-prompt/radix-style prompt stores for tree; the prompts do not repeat or
+extend prior full prompts in this benchmark stream, so that path would add
+store pressure without saving suffix prefill work.
+
+That profile-only local full-prompt candidate index is now opt-in. The current
+default previously built the shadow radix index for every pinned full-prompt
+store skip whenever queue profiling was enabled, but long_output candidate
+telemetry showed no useful hits and a current-tree control stored `1000` shadow
+candidates (`155.7K` prompt tokens) with `0` later candidate requests. A paired
+same-host long_output A/B made local candidate indexing require
+`TORCHINFERNO_CONTINUOUS_FULL_PROMPT_REUSE_CANDIDATE_PROFILE=1` or an explicit
+`TORCHINFERNO_CONTINUOUS_FULL_PROMPT_REUSE_CANDIDATE_CAPACITY`. The row moved
+from `243.4 / 24.9 / 1170.2ms` to `248.3 / 24.8 / 1144.5ms`, with
+`1000/1000` correct in both runs. Queue counters show the intended cleanup:
+candidate stores fell `1000 -> 0`, `prefill_state_ms` fell `625 -> 68ms`,
+prefill wall fell `5.86 -> 5.47s`, and queue-to-finish p50 fell
+`1083 -> 1038ms`. Keep the heavier candidate profiler opt-in for diagnostics;
+it should not tax default public-profile runs when it has no candidate hits.
+
+Periodic online progress profile snapshots are now opt-in as well. A profile-off
+long_output probe on the same tree wrote
+`/tmp/ti-bench-results/current-long-profileoff/.../runs/20260704_205520` and
+landed at `233.5 / 23.6 / 1106.7ms`, `1000/1000` correct, versus the profiled
+no-candidate control at `248.3 / 24.8 / 1144.5ms`. That leaves a remaining
+profile tax after disabling the local candidate index. A no-code A/B with
+`TORCHINFERNO_OPENAI_TP_ONLINE_PROFILE_SNAPSHOT_COMMANDS=0` still wrote the
+final queue/HTTP profiles but skipped the `22` periodic progress records; it
+wrote `/tmp/ti-bench-results/current-long-nosnapshots/.../runs/20260704_210040`
+and landed at `255.4 / 24.0 / 1112.9ms`, `1000/1000` correct. TTFT was noisy
+and worse in that run, but TPOT and E2E moved toward the profile-off row. The
+default now records quiescent/final queue profiles only; mid-run progress
+snapshots remain available by setting
+`TORCHINFERNO_OPENAI_TP_ONLINE_PROFILE_SNAPSHOT_COMMANDS` explicitly.
+
+The remaining profile-off delta came from the fast HTTP profile. A queue-only
+long_output run kept `TORCHINFERNO_OPENAI_QUEUE_PROFILE_JSONL` but omitted
+`TORCHINFERNO_OPENAI_FAST_HTTP_PROFILE_JSONL`; it wrote
+`/tmp/ti-bench-results/current-long-queueonly/.../runs/20260704_211009` plus
+the manual queue profile and landed at `226.7 / 23.8 / 1103.3ms`,
+`1000/1000` correct. A patched TorchInferno run with the default fast HTTP
+profile made per-token/per-send timing fields opt-in through
+`TORCHINFERNO_OPENAI_FAST_HTTP_PROFILE_DETAILED=1` and still wrote the useful
+request-level fields (`first_content_sent_ms`, token/chunk counts, and
+`role_sent`); it wrote
+`/tmp/ti-bench-results/current-long-lightfast/.../runs/20260704_211654` and
+landed at `245.2 / 24.3 / 1117.3ms`, `1000/1000` correct. The lightweight
+profile is cheaper and preserves explicit diagnostics, but the queue-only row
+shows the public score path should avoid the 1000 in-band HTTP profile records.
+Inference-bench `main` now carries commit `183c9c54`, which keeps TorchInferno's
+queue profile enabled by default and makes the fast HTTP profile opt-in via
+`INFERENCE_BENCH_TORCHINFERNO_FAST_HTTP_PROFILE=1`.
+
+The pushed inference-bench default was verified with fresh current-tree local
+runs. A long_output run at
+`/tmp/ti-bench-results/current-long-newdefault/.../runs/20260704_212644`
+landed at `251.3 / 23.9 / 1074.6ms`, throughput `33.4 tok/s`, and
+`1000/1000` correct. The provider log directory contained only
+`torchinferno_queue_profile.jsonl` and `torchinferno.log`, confirming the fast
+HTTP profile is no longer part of the default score path. The final queue
+profile stayed in the same shape as the manual queue-only run:
+`65` prefill batches, `4.94s/5.36s` prefill forward/wall, `64ms`
+prefill-state time, `10.52s` decode GPU, and the hot `decode_many:b64/64`
+shape at `3.64s` GPU. This removes the avoidable profile overhead from the next
+public run but does not change the diagnosis: long_output still needs lower
+model-side decode replay cost or a non-fragmenting packed cached-prefix prefill
+path.
+
+A current-default multi_turn plus tree_of_thought check with the same provider
+behavior wrote
+`/tmp/ti-bench-results/current-multitree-newdefault/.../runs/20260704_213322`.
+It landed at `386.6 / 61.6 / 435.1ms`, `981/1000` correct for multi_turn and
+`134.0 / 41.0 / 165.7ms`, `957/992` correct for tree. The analyzer now reports
+the official inference-bench scored medians (`score_ttft`, `score_tpot`,
+`score_e2e`, and `score_tps`) plus raw p90/output-shape context so single-token
+median rows do not hide the benchmark's nonzero scored TPOT. Queue profiles
+again show model/runtime work rather than transport as the blocker:
+multi_turn spent `4.08s/4.32s` in common-prefix prefill with queue-to-first p50
+`299ms`, while tree spent `1.88s/2.32s` in common-prefix prefill with
+queue-to-first p50 `113ms`. Provider logs again omitted the fast HTTP profile
+by default. These rows keep the next non-long lever focused on packed
+cached-prefix prefill or lower TP collective cost, not more stream/profile
+knobs.
+
+The analogous current-tree multi_turn replay profile wrote
+`/tmp/ti-bench-results/multi-replay-current/.../runs/20260704_161617` with
+`TORCHINFERNO_PROFILE_RAGGED_PREFILL_REPLAY_ONCE=1`,
+`TORCHINFERNO_PROFILE_RAGGED_PREFILL_CONTEXT_LEN=141`, and
+`TORCHINFERNO_PROFILE_RAGGED_PREFILL_MIN_SUFFIX=96`. The benchmark row was
+profiler-perturbed at `421.7 / 60.8 / 483.2ms`, `980/1000` correct, but the
+kernel table captured the intended greedy-large request graph:
+`batch=32 suffix=96 match=2 context_len=141 src_rows=1`. Replay CUDA time was
+`122.892ms`, led by `160` NCCL all-reduces at `43.434ms` (`35.3%`),
+FP8/GEMM kernels at about `44.8ms`, RMSNorm/add/reduce kernels at about
+`18.3ms`, and FlashAttention at only `1.470ms` (`1.2%`).
+
+The final multi_turn quiescent queue profile stayed common-prefix-only:
+`runtime_prefix_reuse_hit_token_counts={"45":1000}` and
+`runtime_prefix_reuse_route_counts={"common_prefix":1000}`. It ran `34`
+prefill batches, `34` graph hits, `0` graph misses/captures, and spent
+`5.28s/5.51s` in prefill forward/wall plus `805ms` ragged-decode GPU. Padding
+was `28.4K` tokens, dominated by `25.2K` suffix padding. The largest replay
+shape was `b32:s96:ctx141`, `1.343s` replay and `1.718s` forward over `4`
+calls; the other large common-prefix waves were `b32:s144` (`1.252s` forward
+over `7` calls), `b32:s128` (`631ms` over `4`), and `b32:s64` (`525ms` over
+`6`). This confirms that the default multi_turn row is not missing graph
+coverage. It needs either stable non-common request-prompt reuse that does not
+fragment the row, a packed suffix-prefill implementation that skips padded MLP
+and all-reduce work, or a real TP collective replacement for prefill. Another
+common-prefix scheduler knob cannot close the gap alone.
+
+An env-gated persistent full-prompt candidate probe rules out cross-session
+prefix persistence as the missing multi_turn lever on the current stream. With
+`TORCHINFERNO_CONTINUOUS_PERSISTENT_FULL_PROMPT_REUSE_CANDIDATE=1` and capacity
+`4096`, the focused run wrote
+`/tmp/ti-bench-results/multi-persistent-candidate-current/.../runs/20260704_173933`
+and landed at `389.3 / 59.8 / 439.9ms`, `981/1000` correct. The profile stored
+`1000` persistent shadow full prompts (`114,608` tokens) but recorded `0`
+cross-session candidate hits:
+`runtime_persistent_full_prompt_reuse_candidate_requests=0` and
+`runtime_persistent_full_prompt_reuse_candidate_extra_tokens=0`. The same run's
+per-session shadow index did find the known within-session opportunity:
+`runtime_full_prompt_reuse_candidate_requests=875` and `53,499` extra candidate
+tokens beyond the actual `45` token common-prefix hit. This confirms the
+multi_turn gap is not from losing candidates across `start_online` resets; it
+is from the current default rejecting the expensive non-common/request-prompt
+reuse route. The prior opt-in request-prompt route can expose that opportunity
+but is still too slow as implemented, so the next useful work is making those
+within-session request-prompt suffix waves cheaper rather than persisting prefix
+state across bursts.
+
+The current-tree mixed-prefix recheck keeps that conclusion. A no-env
+multi_turn baseline wrote
+`/tmp/inference-bench-ti-multiturn-baseline-results/.../runs/20260705_085755`
+and landed at `397.1 / 62.5 / 451.1ms`, `981/1000` correct, with the expected
+common-prefix shape (`34` prefill batches, `4.07s` prefill wall, `1000`
+common-prefix reuses at `45` tokens). The explicit mixed-prefix opt-in
+(`TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_MIXED_PREFIX_REUSE=1`) wrote
+`/tmp/inference-bench-ti-multiturn-mixed-optin-current-results/.../runs/20260705_090544`
+and regressed to `445.6 / 64.6 / 487.3ms`: prefill wall fell to `2.99s`, but
+queue-to-submit/first rose enough to erase the model-work win. Adding
+`TORCHINFERNO_OPENAI_TP_ONLINE_COLLECT_IDLE_ARRIVALS=1` recovered the score to
+`393.3 / 62.7 / 451.7ms`, but did not beat the no-env E2E and only left a
+partial queue-profile aggregate (`465/1000`) after shutdown. Keep mixed-prefix
+reuse and greedy-large idle collection explicit. The inference-bench summary now
+prints queue-profile coverage such as `465/1000 partial` so incomplete
+aggregates are not mistaken for full-run evidence.
+
+Packed-ragged eager remains an opt-in oracle, but it now has explicit runtime
+telemetry for future packed CUDA/FlashInfer replacements. The
+`TORCHINFERNO_CONTINUOUS_PACKED_RAGGED_PREFILL_EAGER=1` branch records
+`prefill_packed_eager_calls`, real suffix tokens, padded model-token
+equivalent, saved padding tokens, wall time, and per-shape counts/tokens/time;
+OpenAI queue profiles export them as `runtime_prefill_packed_eager_*`. This
+does not promote the Python eager oracle or change default scheduling. It makes
+the next packed implementation measurable without overloading graph-hit/miss
+counters. Validation: `venv/bin/python -m pyflakes
+src/torchinferno/runtime/serving.py src/torchinferno/openai_server.py
+tests/test_serving_engine.py tests/test_openai_server.py`; `venv/bin/python -m
+pytest
+tests/test_serving_engine.py::test_continuous_batch_engine_can_opt_into_packed_ragged_prefill_eager
+tests/test_openai_server.py::test_openai_queue_profile_records_runtime_engine_stats
+-q`; and `git diff --check`.
+
+Default prefix-graph prefill now also records passive packed-prefill candidate
+telemetry without enabling the slow eager oracle. For each padded cached-prefix
+graph wave, the runtime records `prefill_packed_candidate_calls`, real suffix
+tokens, padded graph model tokens, avoidable padding tokens, and the number of
+distinct `(prefix_start, suffix_len)` groups a packed attention body would need
+to cover. Per-shape maps are exported as
+`runtime_prefill_packed_candidate_shape_*` in detailed queue-profile records.
+This is diagnostic only, but it makes future public runs quantify the exact
+non-fragmenting packed-prefix opportunity in the default path. Validation:
+`venv/bin/python -m pyflakes src/torchinferno/runtime/serving.py
+src/torchinferno/openai_server.py tests/test_serving_engine.py
+tests/test_openai_server.py`; `venv/bin/python -m pytest
+tests/test_serving_engine.py::test_continuous_batch_engine_records_profile_shape_counts
+tests/test_openai_server.py::test_openai_queue_profile_records_runtime_engine_stats
+-q`; and `git diff --check`.
+
+A focused long_output run with the new passive counters quantified the default
+packed-prefix opportunity. The run wrote
+`/tmp/ti-bench-results/long-packed-candidate-current/.../runs/20260704_163527`
+and landed at `268.7 / 22.6 / 1124.6ms`, `1000/1000` correct. It recorded `57`
+packed-candidate calls, `44.7K` real suffix tokens, `75.5K` padded graph model
+tokens, and `30.8K` avoidable packed-candidate tokens (`40.8%` of the
+prefix-graph suffix slots). The largest saved-token shapes were
+`prefix_graph:b24:s64:p111-111:src1:mixed0` (`6.42K`), `b24:s96` (`5.47K`),
+`b16:s64` (`5.11K`), and `b32:s64` (`4.32K`). The same profile still spent
+`4.56s/4.96s` in prefill forward/wall and `10.42s` in ragged-decode GPU, so
+packed prefill is a real lever but not the only long_output gap.
+
+The first non-Python packed implementation is now available as an explicit
+FlashInfer-cache path. `prefill_ragged_logits_packed_flashinfer` flattens only
+real suffix tokens, scatter-writes their KV into FlashInfer NHD rows, plans one
+varlen `BatchPrefillWithPagedKVCacheWrapper` over the physical rows, and runs
+attention through FlashInfer while projections, MLP, and TP collectives operate
+on the compact `[1, total_real_tokens]` stream. Serving can route variable-length
+FlashInfer-cache prefill batches through it with
+`TORCHINFERNO_CONTINUOUS_PACKED_FLASHINFER_PREFILL=1`; it remains default-off
+because the public/default server still uses dense graph prefill and prior
+padded FlashInfer prefill was slower. Validation:
+`venv/bin/python -m pyflakes src/torchinferno/models/llama3/tensor_parallel.py
+src/torchinferno/runtime/serving.py tests/test_llama3_tensor_parallel_distributed.py
+tests/test_serving_engine.py`; `venv/bin/python -m pytest
+tests/test_llama3_tensor_parallel_distributed.py::test_llama3_tensor_parallel_packed_ragged_prefill_matches_padded_oracle
+tests/test_llama3_tensor_parallel_distributed.py::test_llama3_tensor_parallel_packed_flashinfer_prefill_matches_padded_oracle
+tests/test_serving_engine.py::test_continuous_batch_engine_can_use_packed_flashinfer_prefill
+-q`.
+
+The first real 8xH100 tree probe of that path rejects FlashInfer full-prompt
+prefill as a route for prefix-heavy workloads. With
+`TORCHINFERNO_OPENAI_FLASHINFER_FORWARD=1`,
+`TORCHINFERNO_CONTINUOUS_FLASHINFER_PREFILL_DISABLE=0`, and
+`TORCHINFERNO_CONTINUOUS_PACKED_FLASHINFER_PREFILL=1`, the run wrote
+`/tmp/ti-bench-results/tree-packed-fi-current/.../runs/20260704_165441` and
+landed at `719.2 / 46.2 / 749.0ms`, `960/992` correct. The packed FlashInfer
+branch fired (`53` calls) but skipped only `1.43K` padded tokens out of
+`56.25K` packed model-token slots, spent `16.9s` inside packed FlashInfer
+prefill and `17.37s` in prefill wall, and recorded `0` prefix-reuse requests.
+The failure mode is clear: the broad FI-prefill opt-in consumed cached-prefix
+groups as full-prompt prefill, erasing common-prefix reuse for a tiny padding
+win. The scheduler now keeps prefix-hit groups off full-prompt FI prefill unless
+`TORCHINFERNO_CONTINUOUS_FI_REUSE=1` is also set, and queue profiles export
+`runtime_prefill_packed_flashinfer_*` counters so future runs can prove whether
+the branch is active. Validation:
+`venv/bin/python -m pyflakes src/torchinferno/runtime/serving.py
+src/torchinferno/openai_server.py tests/test_serving_engine.py
+tests/test_openai_server.py`; `venv/bin/python -m pytest
+tests/test_serving_engine.py::test_continuous_batch_engine_can_use_packed_flashinfer_prefill
+tests/test_serving_engine.py::test_continuous_batch_engine_keeps_prefix_hits_off_full_prompt_flashinfer
+tests/test_openai_server.py::test_openai_queue_profile_records_runtime_engine_stats
+-q`; and `git diff --check`.
+
+## Public 20260704_131636 refresh and mixed-prefix default rejection
+
+The latest public all-provider run advanced to
+`results/v1/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100/runs/20260704_131636`
+with TorchInferno scoring `1/20`, vLLM `17/20`, and SGLang `1/20`. The
+remaining public gaps are still concentrated in TTFT/prefill work for
+multi_turn, tree_of_thought, and long_output, while few_shot also regressed
+against vLLM:
+
+- few_shot: TorchInferno `196.5 / 48.6 / 242.7ms`, vLLM
+  `130.0 / 42.7 / 163.6ms`, SGLang `143.5 / 75.8 / 221.0ms`.
+- self_consistency: TorchInferno `315.0 / 0.0 / 332.8ms`, vLLM
+  `185.2 / 0.0 / 208.4ms`, SGLang `225.7 / 0.0 / 378.9ms`.
+- multi_turn: TorchInferno `359.8 / 60.4 / 417.9ms`, vLLM
+  `143.6 / 61.5 / 203.1ms`, SGLang `166.0 / 109.3 / 277.2ms`.
+- tree_of_thought: TorchInferno `128.5 / 37.2 / 153.3ms`, vLLM
+  `63.6 / 31.3 / 87.7ms`, SGLang `77.0 / 61.8 / 148.4ms`.
+- long_output: TorchInferno `273.5 / 20.8 / 1075.9ms`, vLLM
+  `83.1 / 15.0 / 662.4ms`, SGLang `72.5 / 22.7 / 847.8ms`.
+
+The TorchInferno public queue profile stayed on the common-prefix-only default:
+`runtime_prefix_reuse_route_counts={"common_prefix":1000}` and
+`runtime_full_prompt_store_skip_reason_counts={"pinned_without_allowance":1000}`.
+It spent `4.08s/4.31s` in prefill forward/wall over `61` prefill batches,
+paid `34.0K` prefill padding tokens, and spent `9.35s` in ragged-decode GPU
+over `773` decode batches. The public prefill graph path was warm
+(`0` misses, `0` request-path captures, `60` replays), so this refresh again
+points at reducing model work per wave rather than graph-cache sizing.
+
+Two current-tree multi_turn probes rechecked the greedy-large mixed-prefix
+promotion question. The first no-env promotion candidate wrote
+`/tmp/ti-bench-results/multi-mixed-auto/.../runs/20260704_132423` and routed
+the intended mixed-prefix path (`max_active=32`, `prefix_rows=112`, PRBD off,
+`{"common_prefix":125,"request_prompt":875}`), landing at
+`280.4 / 69.1 / 341.7ms`, `983/1000` correct. That improved median TTFT/E2E
+against the public common-prefix row, but worsened TPOT/throughput and still
+lost all multi_turn metrics. A repeat with miss-shape telemetry wrote
+`/tmp/ti-bench-results/multi-mixed-miss-shapes/.../runs/20260704_133238` and
+landed at `387.3 / 64.5 / 439.1ms`, also `983/1000` correct. Model-side work
+was not worse (`37` prefill batches, `2.56s/2.87s` prefill forward/wall,
+`847ms` ragged-decode GPU), but user-visible latency regressed below the public
+baseline. The new `runtime_prefill_graph_miss_shape_counts` counter attributed
+the lone graph miss to a singleton suffix replay
+(`ragged_prefill:b1:s32:rows1:ctx189:src1`), matching the expensive
+`prefix_graph:b1:s32:p157-157:src1:mixed0` forward. That miss explains one
+outlier, not the median regression. Keep greedy-large mixed-prefix reuse as an
+explicit opt-in; do not make it a no-env OpenAI default until the mixed-prefix
+path has fewer prefill waves or cheaper non-common-prefix replay.
+
+A scoped request-prompt reuse subset is also rejected as a default direction.
+The new diagnostic
+`TORCHINFERNO_CONTINUOUS_MIXED_PREFIX_MAX_EXTRA_TOKENS=12` keeps only the
+shortest request-prompt savings in the explicit mixed-prefix path. The focused
+profile
+`/tmp/ti-bench-results/multi-mixed-maxextra12-current/.../runs/20260704_175358`
+completed `983/1000` correct but landed at `393.9 / 65.3 / 462.8ms`. The queue
+profile proved the guard worked (`{"common_prefix":875,"request_prompt":125}`
+with request-prompt hit depths `55/56/57`), but it retained most common-prefix
+prefill cost (`74.7K` prefill tokens, `4.95s/5.28s` prefill forward/wall) and
+added small mixed waves plus three graph misses. This rules out "reuse only the
+first short request-prompt turn" as the missing multi_turn lever; the remaining
+route needs a stable all-request-prompt mixed path or a cheaper non-common
+suffix replay, not a small prefix-depth subset.
+
+The opposite deep-only subset is rejected too. With
+`TORCHINFERNO_CONTINUOUS_MIXED_PREFIX_MIN_EXTRA_TOKENS=90`, the focused profile
+`/tmp/ti-bench-results/multi-mixed-minextra90-current/.../runs/20260704_180106`
+completed `980/1000` correct but regressed to `544.0 / 74.4 / 610.9ms`.
+The guard routed `250` request-prompt hits and `750` common-prefix hits, cutting
+raw prefill tokens to `52.6K`, but it fragmented the phase into `46` prefill
+batches with `7` graph misses and still spent `5.24s/5.59s` in prefill
+forward/wall. The largest remaining common-prefix shapes were still expensive
+(`b32:s112` at `1.63s`, `b32:s32:p45-45` at `1.42s`), while deep mixed
+`b32:s32` waves stayed around `71ms` apiece. Depth-thresholding request-prompt
+reuse therefore does not produce a score path from the current implementation:
+the shallow subset leaves too much common-prefix replay, and the deep subset
+adds too much fragmentation. Future work should focus on making the full
+request-prompt mixed path cheaper or less jittery, not another static
+extra-token cutoff.
+
+## Tree prefill replay attribution (20260704_134610)
+
+Queue profiles now join raw ragged-prefill graph replay/capture/miss counters
+back to the high-level prefix/chunk shape that triggered them via
+`runtime_prefill_shape_graph_*`. A no-env tree_of_thought probe on the patched
+tree wrote
+`/tmp/ti-bench-results/tree-shape-graph-profile/.../runs/20260704_134610` and
+landed at `131.0 / 32.8 / 157.6ms`, `958/992` correct, with readiness
+`205.9s`. The profile confirms the tree path is not graph-cache bound:
+`60` prefill graph hits, `0` misses, `0` request-path captures, and `59`
+replays. The high-level shape join shows the compute-heavy prefix waves:
+
+- `prefix_graph:b24:s16:p45-45:src1:mixed0`: `26` replays,
+  `862.5ms` synchronized forward time, `70.2ms` replay-call time.
+- `prefix_graph:b32:s16:p45-45:src1:mixed0`: `10` replays,
+  `370.7ms` synchronized forward time, `30.5ms` replay-call time.
+- `prefix_graph:b16:s16:p45-45:src1:mixed0`: `12` replays,
+  `386.5ms` synchronized forward time, `24.9ms` replay-call time.
+
+Actual suffixes were still only `10`, `11`, and `12`, while every request-path
+suffix replay stayed at `s16`. Total prefill padding was `8.49K` tokens
+(`3.02K` row / `5.47K` suffix), prefill forward/wall was `1.83s/2.30s`, and
+ragged-decode GPU was `1.50s`. The replay-call timings are small relative to
+the synchronized forward time, so the next defaultable tree improvement needs
+less model work per cached-prefix wave (true packed/paged prefix-suffix prefill
+or a fused attention body), not more graph warmup or cache sizing.
+
+## Long-output decode-many stop-tail cap (20260704_135558-142734)
+
+A same-host current-tree long_output baseline wrote
+`/tmp/ti-bench-results/long-baseline-current/.../runs/20260704_135558` and
+landed at `254.4 / 23.9 / 1100.0ms`, `1000/1000` correct. Its queue profile
+matched the public gap shape: `60` prefill batches, `34.5K` prefill padding
+tokens, `4.75s/5.17s` prefill forward/wall, `794` decode batches, and
+`10.20s` ragged-decode GPU. Two padding/decode-throughput probes were rejected:
+
+- Adding `48` and `80` to the greedy-short suffix buckets reduced prefill
+  padding from `34.5K` to `24.3K` tokens but regressed to
+  `275.5 / 24.7 / 1350.3ms`. The new `s48`/`s80` graph shapes were much slower
+  (`12.30s` prefill forward) and raised startup memory/readiness.
+- Allowing decode-many while requests were waiting at `min_active=48` increased
+  decode-many use and cut runtime step time, but regressed the median row to
+  `253.5 / 24.1 / 1145.6ms` because padding/skipped decode tokens rose.
+
+The accepted small default is a greedy-short stop-tail cap for decode-many, now
+wired as the OpenAI online default for stop-token-enabled greedy-short
+decode-many traffic. Cap `4` validated the mechanism
+(`/tmp/ti-bench-results/long-stop-tail4/.../runs/20260704_141238`) at
+`214.9 / 24.1 / 1071.2ms`, but a no-env repeat with the same cap landed at
+`227.9 / 24.5 / 1140.5ms`, improving TTFT while regressing E2E. Cap `6` was
+initially selected because
+`/tmp/ti-bench-results/long-stop-tail6/.../runs/20260704_142734` landed at
+`251.3 / 23.5 / 1095.9ms`, `1000/1000` correct, and improved throughput
+`32.2 -> 33.1 tok/s` against the baseline. A later current-tree cap-4 rerun
+(`20260704_234227`) landed at `225.4 / 23.8 / 1061.4ms`, so the default is now
+cap `4`. This narrows the long_output gap but is not a full decode-throughput
+solution by itself.
+
+## Self-consistency admission/coalescing rejections (20260704_143502-145246)
+
+A focused current-tree self_consistency no-env profile wrote
+`/tmp/ti-bench-results/self-profile/.../runs/20260704_143502` and reproduced the
+public gap shape at `307.0 / 0.0 / 327.6ms`, throughput `3.05 tok/s`, with
+`1000/1000` correct and one unique answer. The final queue profile separated the
+server hot path from benchmark-visible client waves: after the generated prefix
+was cached, server-side queue-to-first/finish p50 was only `9.0/9.0ms`, and the
+fast HTTP stream profile was `10.47ms` total p50. The remaining visible median
+comes from repeated tiny waves and admission/sync churn: `423` submit batches
+for `1000` requests, `1.35s` in submit sync, `1.05s` in idle-drain waiting, and
+request p90 queue-to-first/finish still `211.9/218.2ms`.
+
+Three same-host A/Bs rejected admission waits as the next self_consistency
+default:
+
+- `TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_SHORT_INITIAL_BATCH_WAIT_MS=2`
+  (`/tmp/ti-bench-results/self-initial-wait2/.../runs/20260704_144145`)
+  regressed to `319.7 / 0.0 / 351.7ms`. The initial batch stayed at `2`, submit
+  batches rose to `437`, and queue-to-first/finish p90 worsened to
+  `270.2/302.0ms`.
+- `TORCHINFERNO_OPENAI_TP_STREAM_PREQUEUE_ADMISSION_WAIT_MS=2`
+  (`/tmp/ti-bench-results/self-prequeue2/.../runs/20260704_144746`) regressed to
+  `334.2 / 0.0 / 354.9ms`. The first online batch shrank to `1`, submit batches
+  rose to `443`, and queue-to-first/finish p90 worsened to `301.1/323.7ms`.
+- `TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_SHORT_IDLE_BATCH_WAIT_MS=20`
+  (`/tmp/ti-bench-results/self-idle20/.../runs/20260704_145246`) reduced runtime
+  step calls (`222 -> 184`) and phase runtime step time (`617ms -> 565ms`) but
+  still regressed to `327.8 / 0.0 / 350.9ms`. Submit sync stayed high
+  (`1.38s`), idle waiting rose to `1.37s`, and accepted-request fast HTTP p50
+  rose to `14.0ms`.
+
+Skipping the explicit TP submit sync for sampled-short online requests is also
+rejected. A local source probe made that barrier default-off for
+self_consistency-style traffic and launched
+`/tmp/ti-bench-results/self-submit-nosync`, but the 1000-request benchmark
+stalled in `as_completed()` after readiness and had to be interrupted. The
+server remained alive, which points at rank command/progress ordering rather
+than model startup. Keep the submit barrier in place; any future fix should use
+a redesigned combined submit+step command that advances primary and worker
+runtimes together, not a silent barrier removal.
+
+That redesigned shape was tested as an opt-in source probe and is also rejected
+for now. The patch reused the existing `steps_after_submit` payload for
+quiescent sampled-short submits and made the primary consume the same attached
+step immediately. It completed correctly at
+`/tmp/ti-bench-results/self-quiescent-submit-step/.../runs/20260704_152412`,
+but regressed to `326.5 / 0.0 / 347.8ms`, throughput `2.9 tok/s`, with
+`1000/1000` correct. The profile reduced submit batches (`423 -> 357`) and
+idle-drain time (`1.05s -> 0.54s`), but runtime step time rose
+(`617ms -> 944ms`) and request p90 queue-to-finish worsened to `613ms`. The
+source hook was backed out; self_consistency needs lower per-submit/runtime-step
+cost without pushing more work into latency-critical idle waves.
+
+Keep sampled-short initial wait, stream prequeue admission, and idle drain at the
+current defaults. The next self_consistency lever should reduce per-submit TP
+sync/worker command overhead for already-cached repeated prompts, or combine
+small cached-prefix submissions with useful decode work, rather than adding more
+request-admission delay.
+
+## Current-tree few_shot no-env profile (20260704_153514)
+
+The public pointer was still `c976dec` / `20260704_131636`, so a focused
+current-tree few_shot run refreshed the local no-env profile after the latest
+tail-cap and queue-profile changes. It wrote
+`/tmp/ti-bench-results/few-current/.../runs/20260704_153514` and landed at
+`174.7 / 51.6 / 223.8ms`, p99 TTFT/E2E `1020.9/1057.7ms`, throughput
+`5.1 tok/s`, and `977/1000` correct.
+
+The queue profile was graph-warm and kept the expected greedy-mid shape:
+`max_active=32`, `prefix_rows=64`, `33` submit batches, `34` prefill batches,
+`0` request-path prefill captures, and only two static-prefill misses. The hot
+prefill body remained `prefix_graph:b32:s16:p122-122:src1:mixed0` with
+`31` replays, `1.67s/1.80s` synchronized forward/wall inside that shape and
+`2.39s` total prefill wall. Actual suffix lengths were `12`, `13`, and `14`,
+but every prefix-suffix replay still used the warmed `s16` graph, producing
+`3.47K` suffix-padding tokens. Decode was also in-family: `71` decode model
+calls, `65` ragged-decode batches, `958ms` ragged-decode GPU, and only `122`
+ragged-decode padding tokens.
+
+This does not reopen fine greedy-mid suffix buckets. The profile shows padding,
+but the already-rejected `s12/s16` and fine suffix-bucket probes did not turn
+padding reduction into a defaultable median/tail win. The remaining few_shot
+gap is still model-side cached-prefix prefill cost plus queue tail from the
+32-row wave cadence, not graph-cache miss handling or padded decode waste.
+
+## Paged-prefix telemetry added after current-tree profile
+
+The paged-prefix path remains default-off, but the next useful A/B needs better
+attribution than total paged prefill time. `PagedPrefixCache.share_into()` now
+records the raw matching prefix length, the page-aligned shareable length, and
+the tokens stranded by page alignment without changing its public return value.
+`PagedEngine` folds that into runtime stats as candidate, aligned, alignment
+loss, forced-suffix, page-size, and candidate-length buckets. This makes a
+future page-size or mixed page/suffix policy A/B measurable instead of inferred
+from hit-token counts alone.
+
+The optional paged-prefix suffix graph hook also records attempts, captures,
+successful replays, fallbacks, failures, and per-shape counts. These fields are
+exported through the OpenAI queue-profile JSONL alongside the existing runtime
+prefill/decode counters. This is profiling infrastructure only; it does not
+enable paged KV, paged prefix caching, or suffix graphing by default. Validation
+covered pyflakes plus the focused paged-prefix/cache and queue-profile tests:
+`venv/bin/python -m pytest tests/test_scaffolding.py::test_paged_prefix_cache_zero_copy_share_and_evict tests/test_serving_engine.py::test_paged_online_engine_batches_shared_suffix_prefill tests/test_serving_engine.py::test_paged_online_engine_pads_mixed_shared_suffix_prefill tests/test_serving_engine.py::test_paged_online_engine_graphs_padded_shared_suffix_prefill tests/test_openai_server.py::test_openai_queue_profile_records_runtime_engine_stats -q`.
+
+## Few-shot packed-ragged eager rejection (20260704_150159)
+
+A focused few_shot run exercised the packed-ragged prefill oracle with
+`TORCHINFERNO_CONTINUOUS_PACKED_RAGGED_PREFILL_EAGER=1`. The run wrote
+`/tmp/ti-bench-results/few-packed-eager/.../runs/20260704_150159` and landed at
+`1085.7 / 50.9 / 1127.7ms`, p99 TTFT/E2E `2403.0/2459.6ms`, throughput
+`1.0 tok/s`, and `976/1000` correct. It is rejected as a runtime
+implementation.
+
+The profile shows why: the path slightly reduced few_shot prefill padding
+(`4.7K -> 3.4K` tokens versus the latest public queue profile) and kept the
+expected admission shape (`max_active=32`, `prefix_rows=64`, `33` submit
+batches, `36` prefill batches), but made prefix-suffix prefill dramatically
+slower. Total prefill forward/wall rose to `15.75s/16.74s`; the hot
+`prefix_graph:b32:s16:p122-122:src1:mixed0` shape alone accounted for
+`15.05s/15.16s` across `30` waves. Median queue-to-first/finish rose to
+`1034.0/1059.5ms`, and runtime step time reached `20.12s`.
+
+Keep the packed-ragged eager path as a correctness/oracle scaffold only. The
+few_shot gap still points at true packed cached-prefix prefill, but the
+defaultable version needs one CUDA/FlashInfer body that keeps the layer stack
+packed, not a Python per-row eager loop.
+
 ## Public 20260703_130210 refresh and active-row rejection
 
 The latest public all-provider run at
@@ -735,9 +2454,20 @@ prefix-prefill body:
 `TORCHINFERNO_PROFILE_PREFILL_ONCE` hook, this targets the
 `try_prefill_ragged_logits_graph` body used by common-prefix suffix prefill. It
 defaults to `TORCHINFERNO_PROFILE_RAGGED_PREFILL_MIN_BATCH=32` so tiny startup
-warmups do not consume the profile slot unless explicitly requested. This is a
-diagnostic hook only; it should be used to locate the next prefill sink before
-changing default runtime policy.
+warmups do not consume the profile slot unless explicitly requested. Set
+`TORCHINFERNO_PROFILE_RAGGED_PREFILL_MIN_SUFFIX` when the target is a larger
+request-path suffix bucket rather than the warmed `s16` startup graph. If the
+request path uses the same bucket as startup, set
+`TORCHINFERNO_PROFILE_RAGGED_PREFILL_SKIP_MATCHES=N` to skip the first matching
+warmup calls; the profile line prints the selected `match=` index. Startup can
+still capture every request-shape graph before the server is ready; use
+`TORCHINFERNO_PROFILE_RAGGED_PREFILL_REPLAY_ONCE=1` to profile the warmed
+CUDA-graph replay path instead, with the same batch/suffix gates and optional
+`TORCHINFERNO_PROFILE_RAGGED_PREFILL_REPLAY_SKIP_MATCHES=N`. Both hooks also
+accept `TORCHINFERNO_PROFILE_RAGGED_PREFILL_CONTEXT_LEN` when a workload has
+both dynamic startup buckets such as `ctx-64` and exact request buckets such as
+tree's `ctx61`. These are diagnostic hooks only; they should be used to locate
+the next prefill sink before changing default runtime policy.
 
 That hook found the hot sampled tree shape running as
 `batch=32 suffix=16 context_len=-64`: the one-shot CUDA profile spent
@@ -7939,8 +9669,739 @@ median E2E. Keep suffix splitting opt-in; the current padding distribution still
 needs a non-fragmenting packed/ragged cached-prefix prefill implementation
 rather than more suffix-bucket fragmentation.
 
+Public `20260704_110219` is now the latest 8xH100 row. It measures
+TorchInferno `390fed4` at `4/20` metric wins versus vLLM `12/20` and SGLang
+`3/20`: few_shot `157.5 / 46.2 / 205.9ms`, self_consistency
+`157.3 / 0.0 / 168.9ms`, multi_turn `310.8 / 58.9 / 366.4ms`,
+tree_of_thought `135.0 / 41.6 / 160.9ms`, and long_output
+`257.5 / 19.8 / 981.7ms`. The queue profile still shows the default
+common-prefix-only multi_turn shape: `35` prefill batches, `80.7K` prefill
+tokens, `20.3K` suffix-padding tokens, `3.79s/3.95s` prefill forward/wall,
+zero full-prompt adoptions, `{"common_prefix":1000}` reuse routing,
+`prefix_rows=64`, PRBD cap `8`, and queue-to-first p50 `246.7ms`. Tree is
+still on the older sampled-medium PRBD cap `10` in this public run (`61`
+prefill batches, `1.90s/2.11s` prefill forward/wall, `1.96s` ragged-decode
+GPU), so it does not include the local cap-32 tree improvement yet. Long_output
+remains decode-heavy (`57` prefill batches, `3.98s/4.20s` prefill
+forward/wall, `822` decode batches, `91` decode-many calls, `452`
+decode-many steps, `24.0K` model tokens, `22.4K` emitted tokens, and `9.89s`
+ragged-decode GPU). This keeps the current local priorities intact:
+multi_turn needs stable request-prompt reuse, tree can take the local cap-32
+sampled-medium PRBD change, and long_output needs a deeper decode-throughput
+lever than q8/q12 stop-tail policy.
+
+Earlier public `20260704_070207` measured
+TorchInferno `390fed4` at `3/20` metric wins versus vLLM `14/20` and SGLang
+`2/20`: few_shot `177.9 / 47.9 / 231.5ms`, self_consistency
+`181.5 / 0.0 / 196.4ms`, multi_turn `341.2 / 62.6 / 399.5ms`,
+tree_of_thought `132.2 / 49.6 / 163.0ms`, and long_output
+`258.7 / 20.0 / 957.9ms`. The queue profile keeps the same unresolved shape:
+multi_turn stayed on stable common-prefix reuse only (`35` prefill batches,
+`29.8K` padding tokens, `3.98s/4.14s` prefill forward/wall, `{"45":1000}`
+reuse), tree used the cap-32 sampled-medium path (`54` prefill batches,
+`1.74s/1.95s` prefill forward/wall, `1.71s` ragged-decode GPU), and
+long_output remained decode-heavy (`57` prefill batches, `3.89s/4.35s`
+prefill forward/wall, `822` decode batches, `98` decode-many calls, `496`
+decode-many steps, `26.5K` model tokens, `24.9K` emitted tokens, and `1.57K`
+skipped tokens). This worsens the public score but does not change the local
+priority ordering: multi_turn still needs stable request-prompt reuse, tree
+needs packed/ragged prefix-suffix prefill or fewer small TP collectives, and
+long_output needs decode-kernel or decode-overlap work beyond q8/q12 tail
+policy.
+
+Earlier public `20260704_050216` measured
+TorchInferno `390fed4` at `6/20` metric wins versus vLLM `11/20` and SGLang
+`2/20`: few_shot `163.3 / 47.0 / 212.1ms`, self_consistency
+`166.6 / 0.0 / 178.7ms`, multi_turn `363.7 / 63.2 / 419.6ms`,
+tree_of_thought `136.4 / 28.0 / 156.3ms`, and long_output
+`221.6 / 20.9 / 954.2ms`. The queue profiles still show the same default
+shape. Multi_turn used `max_active=32`, `prefix_rows=64`, PRBD cap `8`, only
+`{"common_prefix":1000}` reuse, `36` prefill batches, `91.8K` prefill tokens,
+`4.12s/4.28s` prefill forward/wall, and queue-to-first p50 `286.7ms`. Tree
+still used the older sampled-medium PRBD cap `10`, with `56` prefill batches,
+`1.81s/2.03s` prefill forward/wall, and `2.10s` decode GPU. Long_output stayed
+decode-heavy at `790` decode batches, `95` decode-many calls, `20.5K`
+decode-many model tokens, `9.61s` ragged-decode GPU, and `16.17s` phase time.
+This keeps the current local conclusions intact: default multi_turn needs a
+stable request-prompt reuse path, tree can take the cap-32 sampled-medium PRBD
+tradeoff, and long_output still needs a deeper decode-throughput lever.
+
+Earlier public `20260704_030215` measured TorchInferno
+`390fed4` at `4/20` metric wins versus vLLM `12/20` and SGLang `3/20`, with
+the same unresolved gaps: multi_turn `344.2 / 59.5 / 400.4ms`,
+tree_of_thought `129.0 / 36.3 / 154.0ms`, and long_output
+`237.7 / 20.7 / 963.5ms`. A same-host patched multi_turn rerun against the
+current-main worktree plus the prefix-row no-clear eviction fix landed at
+`361.8 / 63.7 / 428.7ms`, `982/1000` correct. Its queue profile matched the
+public shape rather than showing a new lever: `34` prefill batches,
+`79.8K` prefill tokens, `22.1K` padding tokens, `34/0` prefill graph
+hits/misses, and only `{"common_prefix": 1000}` reuse at `45` tokens/request.
+The eviction fix is useful correctness/overhead cleanup for prefix-row churn,
+but it is not a public-score gap closer for the current multi_turn shape.
+
+The ragged-prefill one-shot profiler now also accepts
+`TORCHINFERNO_PROFILE_RAGGED_PREFILL_MIN_SUFFIX`; without that gate it consumed
+the profile slot on the warmed `b32:s16:ctx-64` startup graph. A first
+`min_suffix=96` run captured the greedy-short warmup graph
+`batch=32 suffix=96 context_len=-256`; it measured `153.1ms` self CUDA time
+with math SDPA still visible (`28.6ms`, `18.7%`). That is not the multi_turn
+request-path shape. Restricting warmup to greedy-large max tokens captured the
+actual exact-context graph used by the multi_turn common-prefix path,
+`batch=32 suffix=96 context_len=141`. That profile measured `123.3ms` self CUDA
+time: TP all-reduce `43.3ms` (`35.1%`), FP8/GEMM paths roughly `45.7ms`
+(`37.0%`), RMSNorm `14.6ms` (`11.8%`), and FlashAttention only `1.5ms`
+(`1.2%`). This supports the current priority ordering: exact-context attention
+is already cheap for the greedy-large common-prefix path, so the next
+score-facing improvement needs a model-path change that shortens the
+all-reduce/GEMM critical path or removes padded prefill work, not another
+scheduler-only suffix split, finished-prefix cache env, or admission wait tweak.
+
+An opt-in experiment that allowed symmetric-memory TP all-reduce inside the
+ragged prefill CUDA graph was rejected. With
+`TORCHINFERNO_SYMM_MEM_PREFILL_GRAPH_ALLREDUCE=1`, the targeted multi_turn run
+regressed to `843.7 / 69.3 / 911.6ms` and still profiled the exact-context
+`b32:s96:ctx141` graph at `43.1ms` of NCCL all-reduce (`160` calls), not a
+multimem replacement. The server also emitted symmetric-memory multicast OOM
+warnings and the final queue profile showed `10.69s` prefill forward wall
+inside a profiled run. Do not pursue graph-captured symmetric-memory prefill
+all-reduce in this form; first prove a non-graph prefill all-reduce replacement
+that reduces the `43ms` all-reduce slice without increasing graph-capture or
+memory pressure.
+
+A scoped greedy-large mixed-prefix OpenAI default was tried for the
+`temperature=0`, `max_tokens=512` class but is not promoted. The runtime now
+accepts an explicit `greedy_large_mixed_prefix_reuse` constructor policy, and
+OpenAI can still enable the path with
+`TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_MIXED_PREFIX_REUSE=1`; direct
+continuous-engine users retain the existing
+`TORCHINFERNO_CONTINUOUS_GREEDY_LARGE_MIXED_PREFIX_REUSE=1` opt-in. When the
+policy is explicit, OpenAI warms mixed-prefix suffix graphs and uses `112`
+prefix rows under the existing `144` total-row budget (`max_active=32`,
+`prefix_rows=112`). Row sizing can still be overridden with
+`TORCHINFERNO_OPENAI_TP_ONLINE_PREFIX_ROWS`.
+
+The first no-env validation run with the tentative default on the patched clean
+tree wrote
+`/tmp/inference-bench-ti-mixed-default-recheck-results/.../runs/20260704_033428`
+and landed at `280.5 / 65.5 / 336.8ms`, `983/1000` correct. Its final queue
+profile used the intended shape: `max_active=32`, `prefix_rows=112`,
+`runtime_persistent_cache_rows=144`, `37` prefill batches, `18.8K` prefill
+tokens, `2.53s` prefill forward, `2.81s` prefill wall, `36/1` prefill graph
+hits/misses, `875` request-prompt reuses plus `125` common-prefix reuses, and
+`1000` full-prompt adoptions. This improves the same-host common-prefix patched
+run (`361.8 / 63.7 / 428.7ms`) by about `81ms` TTFT and `92ms` E2E, at the
+cost of about `2ms` median TPOT and a longer startup warmup (`~211s`). It does
+not beat vLLM on the public multi_turn row, but it materially closes the
+TTFT/E2E gap without the catastrophic full-prompt-only fragmentation seen in
+older rejected probes.
+
+The first full-suite tentative-default run exposed a separate tensor-parallel
+worker lifecycle bug. Isolated multi_turn was fast, but the full suite at
+`/tmp/inference-bench-ti-full-mixed-default-results/.../runs/20260704_034510`
+regressed multi_turn to `412.7 / 64.9 / 468.3ms`: when
+`TORCHINFERNO_PAGED_PREFIX_CACHE=1` was set and the flashinfer-free server used
+the dense continuous engine, TP workers kept a stale dense
+`_RuntimeContinuousBatchEngine` across `online_start` sessions while the primary
+rebuilt per session. The worker loop now rebuilds dense runtimes on each
+`online_start` and only preserves engines with paged-engine shape (`max_seq`) on
+`online_close`.
+
+The first confirmation full-suite run after that lifecycle fix wrote
+`/tmp/inference-bench-ti-full-worker-rebuild-results/.../runs/20260704_035447`.
+It landed at few_shot `177.8 / 50.2 / 226.9ms`, self_consistency
+`202.4 / 0.0 / 245.5ms`, multi_turn `271.1 / 62.3 / 323.3ms`,
+tree_of_thought `137.7 / 48.0 / 166.6ms`, and long_output
+`229.8 / 23.9 / 1093.5ms`. The final multi_turn queue profile kept the intended
+mixed-prefix shape: `max_active=32`, `prefix_rows=112`,
+`runtime_persistent_cache_rows=144`, `41` prefill batches, `18.7K` prefill
+tokens, `2.87s` prefill forward, `3.17s` prefill wall, `40/1` prefill graph
+hits/misses, `875` request-prompt reuses plus `125` common-prefix reuses, and
+`1000` full-prompt adoptions.
+
+A later full-suite rerun after the sampled-medium tree cap change did not
+reproduce that multi_turn win:
+`/tmp/inference-bench-ti-full-cap32-results/.../runs/20260704_044212` landed at
+multi_turn `421.2 / 67.0 / 481.0ms`. The model work stayed in-family
+(`39` prefill batches, `2.97s` prefill forward, `102` decode batches), but
+queue-to-submit p50 grew to `264ms` late in the conversation stream. Forcing
+prefill-ready-before-decode back on with an 8-row cap in
+`/tmp/inference-bench-ti-multi-mixed-prbd8-results/.../runs/20260704_044951`
+landed only at `323.7 / 66.4 / 388.7ms`. Keep greedy-large mixed-prefix reuse
+explicit until the late-turn admission jitter is fixed; the worker rebuild
+remains a real correctness/lifecycle fix.
+
+Within that explicit mixed-prefix opt-in, reducing the 512-token greedy initial
+collection window from `10ms` to `5ms` is a useful refinement. The focused run
+with `TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_MIXED_PREFIX_REUSE=1`,
+prefill-ready-before-decode cap `8`, and
+`TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_INITIAL_BATCH_WAIT_MS=5` wrote
+`/tmp/inference-bench-ti-multi-mixed-prbd8-wait5-results/.../runs/20260704_053348`
+and landed at `278.4 / 70.3 / 355.0ms`, `982/1000` correct. The final queue
+profile preserved the intended reuse shape (`875` request-prompt reuses,
+`125` common-prefix reuses, `1000` full-prompt adoptions) with `37` prefill
+batches, `18.8K` prefill tokens, `2.37s` prefill forward, `2.67s` prefill
+wall, `37/0` prefill graph hits/misses, and queue-to-first p50 `149ms`.
+Versus the preceding explicit mixed+PRBD8 run, the smaller first wait cut
+prefill wall `3.21s -> 2.67s`, decode batches `104 -> 92`, and phase time
+`7.66s -> 6.21s`, at the cost of median TPOT moving `66.4ms -> 70.3ms`.
+Make `5ms` the default only inside the explicit greedy-large mixed-prefix
+policy; the normal common-prefix greedy-large path keeps the `10ms` collection
+window and automatic mixed-prefix reuse remains off.
+
+The explicit mixed-prefix path also gets a scoped tensor-parallel stream
+prequeue wait. A same-tree comparison on the current patch first measured the
+exact explicit mixed-prefix default at
+`/tmp/ti-bench-results/multi-mixed/.../runs/20260704_113619`: `326.0 / 66.9 /
+392.3ms`, `979/1000` correct, with `1000` full-prompt adoptions,
+`{"common_prefix":125,"request_prompt":875}` reuse routing, `37` prefill
+batches, `18.7K` prefill tokens, and `2.34s/2.64s` prefill forward/wall.
+Adding only `TORCHINFERNO_OPENAI_TP_STREAM_PREQUEUE_ADMISSION_WAIT_MS=2` wrote
+`/tmp/ti-bench-results/multi-mixed-prequeue2/.../runs/20260704_114322` and
+landed at `282.4 / 62.4 / 325.1ms`, `979/1000` correct. The runtime shape
+stayed the same (`1000` adoptions, `875` request-prompt reuses, PRBD off,
+`prefix_rows=112`, `max_active=32`, no graph evictions); queue-to-submit p50
+fell from `88.8ms` to `67.8ms` and queue-to-first p50 from `173.5ms` to
+`148.8ms`. Make a `2ms` prequeue wait the default only for the explicit
+greedy-large mixed-prefix policy via
+`TORCHINFERNO_OPENAI_TP_GREEDY_LARGE_MIXED_PREFIX_STREAM_PREQUEUE_ADMISSION_WAIT_MS`;
+the broad `TORCHINFERNO_OPENAI_TP_STREAM_PREQUEUE_ADMISSION_WAIT_MS` override
+still wins, and automatic mixed-prefix reuse remains off.
+
+The exact source default for the explicit mixed-prefix opt-in must keep PRBD
+off unless the caller opts into it explicitly. Running only
+`TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_MIXED_PREFIX_REUSE=1` with the 5ms
+source default wrote
+`/tmp/inference-bench-ti-multi-mixed-optin-default-wait5-results/.../runs/20260704_054529`
+and landed at `324.6 / 66.2 / 394.8ms`, `982/1000` correct. The queue
+shape reused the intended prompt rows (`875` request-prompt reuses,
+`125` common-prefix reuses, `1000` full-prompt adoptions), but PRBD was off:
+`39` prefill batches, `2.45s/2.75s` prefill forward/wall, `98` decode batches,
+queue-to-first p50 `166.7ms`, and p99 queue-to-first `761ms`. Although one
+env-backed PRBD+5ms diagnostic run was faster, two exact source-default PRBD
+rechecks were not: `/tmp/inference-bench-ti-multi-mixed-optin-default-prbd8-results/.../runs/20260704_055454`
+landed at `379.1 / 63.7 / 418.8ms`, and
+`/tmp/inference-bench-ti-multi-mixed-optin-default-prbd8-recheck-results/.../runs/20260704_060044`
+landed at `357.6 / 65.6 / 418.9ms`. Both had the intended PRBD shape
+(`prefill_ready_before_decode=true`, active cap `8`, `prefix_rows=112`), so do
+not make PRBD the mixed-prefix opt-in default. Keep PRBD as an explicit
+diagnostic override for this path; automatic mixed-prefix reuse remains
+disabled.
+
+The sampled-medium prefill-ready cap is now widened to the full 32-row active
+set. A same-host tree_of_thought comparison on the patched clean tree first
+measured the default cap-10 row at `142.4 / 40.5 / 176.4ms` in
+`/tmp/inference-bench-allproviders-tree-patched-results/.../runs/20260704_042026`.
+Repeating TorchInferno with
+`TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_PREFILL_READY_ACTIVE_CAP=32`
+(`.../8xH100-local-ti-tree-prbdcap32/runs/20260704_043029`) landed at
+`126.9 / 46.6 / 160.9ms`, `958/992` correct. The intended mechanism showed up
+in the queue profile: queue-to-submit p50 fell `58.1ms -> 43.6ms`,
+queue-to-first p50 fell `118.9ms -> 102.0ms`, and ragged-decode GPU fell
+`1.72s -> 1.48s`; prefill wall was roughly flat (`2.36s -> 2.31s`) while
+prefill batches rose `60 -> 63`. This is a scoped TTFT/E2E tradeoff for
+sampled `256 < max_tokens <= 300` sessions, not a broad admission-policy
+change.
+
+The current no-env full-suite validation after reverting automatic mixed-prefix
+reuse wrote
+`/tmp/inference-bench-ti-full-cap32-nomixed-results/.../runs/20260704_050159`.
+It landed at few_shot `172.5 / 48.9 / 215.6ms`, self_consistency
+`228.6 / 0.0 / 243.5ms`, multi_turn `355.6 / 61.5 / 408.2ms`,
+tree_of_thought `128.7 / 24.9 / 149.9ms`, and long_output
+`231.1 / 23.8 / 1066.8ms`. The tree queue profile used the intended cap-32
+sampled-medium path (`57` prefill batches, `57/0` graph hits/misses,
+`1.75s/2.15s` prefill forward/wall, queue-to-first p50 `108.6ms`). Multi_turn
+returned to the stable common-prefix shape (`prefix_rows=64`, no full-prompt
+adoptions, `35/0` prefill graph hits/misses, `4.10s/4.33s` prefill
+forward/wall). This keeps the tree improvement as the defaultable change and
+leaves multi_turn's next lever as a stable, non-fragmenting request-prompt reuse
+path rather than automatic mixed-prefix admission.
+
+Rechecking sampled-medium FlashInfer decode with the cap-32 tree policy is still
+rejected. Setting `TORCHINFERNO_CONTINUOUS_FI_DECODE_SAMPLED_MAX_TOKENS=400`
+on the patched tree wrote
+`/tmp/inference-bench-ti-tree-fi400-cap32-results/.../runs/20260704_052057`
+and landed at `129.7 / 27.0 / 153.0ms`, `961/992` correct. Decode graph hits
+were clean (`95/0`), but the queue profile moved the wrong way versus the
+no-env cap-32 full-suite validation: prefill batches rose `57 -> 61`, prefill
+forward/wall rose `1.75s/2.15s -> 1.86s/2.30s`, decode batches rose
+`90 -> 93`, and ragged-decode GPU stayed slightly higher (`1.49s -> 1.51s`).
+Keep the sampled FlashInfer decode cutoff scoped to `max_tokens <= 256`; tree's
+300-token branch remains on the dense ragged logits graph path.
+
+Focused sampled-medium tree profiling with the ragged-prefill profiler on the
+cap-32 policy wrote
+`/tmp/inference-bench-ti-tree-ragged-prefill-prof-s32-results/.../runs/20260704_061457`
+and landed at `135.0 / 28.7 / 159.3ms`, `961/992` correct. The profiler was
+gated with `MIN_BATCH=32`, `MIN_SUFFIX=32`, and captured a startup warmup
+instead of request traffic:
+`batch=32 suffix=32 context_len=-128 src_rows=1`. That warmup spent `58.7ms`
+self CUDA, led by TP all-reduce (`18.9ms`, `32.3%`), FP8/GEMM work
+(`15.9ms` combined `_scaled_mm` plus `mm`), attention math (`~9.5ms`), and
+copies (`4.6ms`). The queue profile confirms tree's real request path is all
+`s16`: `61` prefill batches, `1.83s/2.30s` prefill forward/wall, `11.8K`
+active prefill tokens, `8.35K` padding tokens, and hot shapes
+`prefix_graph:b16:s16:p45-45` (`11` calls), `b24:s16` (`21` calls), and
+`b32:s16` (`14` calls). Padding was split between `2.88K` row padding tokens
+and `5.47K` suffix padding tokens. This does not identify another bucket
+default to promote; the next tree lever is still packed/ragged cached-prefix
+prefill that avoids padded suffix compute, and the profiler now has
+`TORCHINFERNO_PROFILE_RAGGED_PREFILL_SKIP_MATCHES` for capturing the later
+request-path `s16` body directly.
+
+The first follow-up with `MIN_SUFFIX=16` and `SKIP_MATCHES=10` wrote
+`/tmp/inference-bench-ti-tree-ragged-prefill-prof-s16-skip10-results/.../runs/20260704_062407`
+and landed at `140.7 / 47.7 / 169.0ms`, `958/992` correct. It still captured
+startup before the server listened:
+`batch=32 suffix=64 match=11 context_len=109`, with `83.5ms` self CUDA
+(`30.2ms` all-reduce, `21.1ms` `_scaled_mm`, `9.7ms` RMSNorm, and `8.7ms`
+`mm`). The final graph cache contained twenty live `b32` ragged-prefill graph
+entries, so the capture hook is the wrong tool once startup warms request
+shapes. A separate `TORCHINFERNO_PROFILE_RAGGED_PREFILL_REPLAY_ONCE` hook now
+profiles graph hits in `_run_ragged_prefill_logits_graph`, which should capture
+the warmed tree request replay without disabling startup warmup or measuring a
+graph-capture body. The first replay-only run still captured startup
+`batch=32 suffix=16 match=1 context_len=-64`, so the hook also accepts
+`TORCHINFERNO_PROFILE_RAGGED_PREFILL_CONTEXT_LEN=61` to target the exact sampled
+common-prefix request graph.
+
+The targeted replay profile did capture that request graph. Running with
+`TORCHINFERNO_PROFILE_RAGGED_PREFILL_REPLAY_ONCE=1`,
+`TORCHINFERNO_PROFILE_RAGGED_PREFILL_CONTEXT_LEN=61`, and
+`TORCHINFERNO_PROFILE_RAGGED_PREFILL_REPLAY_SKIP_MATCHES=1` wrote
+`/tmp/inference-bench-ti-tree-ragged-prefill-replay-prof-ctx61-results/.../runs/20260704_063731`
+and landed at `134.2 / 39.2 / 162.2ms`, `965/992` correct. The profile fired
+after the server listened:
+`batch=32 suffix=16 match=2 context_len=61 src_rows=1`. The warmed exact
+request replay spent `32.75ms` self CUDA: NCCL all-reduce was `12.80ms`
+(`39.1%`, `160` calls), GEMM kernels were roughly `9.7ms` combined, RMSNorm was
+`1.93ms`, vector/gather/index overhead was `3.7ms`, and FlashAttention was only
+`0.80ms` (`2.4%`). The queue profile shows the expected profiler perturbation
+on the sampled request tail (`p99` TTFT `1381ms`, hot `b32:s16` forward
+inflated to `1.55s`), so use the kernel table as evidence rather than the p99
+row. The remaining tree gap is not attention selection; it is the combination
+of padded prefix-suffix graph work and the 160 small TP all-reduces per prefill
+replay.
+
+Do not treat the existing FlashInfer `q_lens` hook as that packed-prefill path.
+In `forward_flashinfer`, ragged `q_lens` only packs the attention queries in the
+eager path. Embedding, QKV, KV append, output projection, RMSNorm, MLP, and
+all-reduce still run on the padded `[batch_bucket, suffix_bucket]` tensor, and
+the CUDA-graph path intentionally passes `q_lens=None` to avoid graph-illegal
+tensor-to-bool control flow. That matches the warmed replay evidence above:
+FlashAttention is only `0.80ms` of the `32.75ms` tree replay, while all-reduce,
+GEMM, norms, and indexing dominate. The missing implementation is a true packed
+cached-prefix prefill that keeps the layer stack packed and only unpacks at
+cache/logit boundaries, not a toggle on the current `q_lens` attention branch.
+
+Adding more sampled-medium prefix-prefill batch buckets is rejected as a simple
+default. A focused tree probe with
+`TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_BATCH_BUCKETS=1,2,4,8,16,20,24,28,32`
+and matching
+`TORCHINFERNO_OPENAI_STARTUP_RUNTIME_FP8_RAGGED_PREFILL_BATCHES=1,2,4,8,16,20,24,28,32`
+(`8xH100-local-ti-tree-b20-b28-buckets`, port `8045`) stayed in startup for
+more than six minutes and never reached server readiness; it was terminated
+before requests, and no result row was written. The expected row-padding
+reduction is too small to justify a startup shape expansion that cannot
+reliably warm. Keep sampled-medium buckets at `1,2,4,8,16,24,32` until there is
+a packed/ragged prefill path that lowers row padding without multiplying
+warmup graph shapes.
+
+Long-output decode now has a matching one-shot replay profiler for the warmed
+ragged token graph:
+`TORCHINFERNO_PROFILE_RAGGED_DECODE_REPLAY_ONCE=1`. It profiles the graph-hit
+path in `_run_ragged_decode_graph`, not the eager FlashInfer body covered by
+the older `TORCHINFERNO_PROFILE_DECODE_ONCE` hook. Use
+`TORCHINFERNO_PROFILE_RAGGED_DECODE_MIN_BATCH`,
+`TORCHINFERNO_PROFILE_RAGGED_DECODE_CACHE_BUCKET`, and
+`TORCHINFERNO_PROFILE_RAGGED_DECODE_REPLAY_SKIP_MATCHES` to target the steady
+long-output `decode_many:b64/64` replay after startup warmups. The hook is
+diagnostic only; it should identify whether long's decode gap is still TP
+all-reduce/GEMM dominated before changing decode scheduling again.
+
+The first focused long-output replay profile wrote
+`/tmp/inference-bench-ti-long-ragged-decode-replay-prof-b64-results/.../runs/20260704_070025`
+with `TORCHINFERNO_PROFILE_RAGGED_DECODE_MIN_BATCH=64` and
+`TORCHINFERNO_PROFILE_RAGGED_DECODE_REPLAY_SKIP_MATCHES=1`. It landed at
+`249.2 / 24.7 / 1192.2ms`, `1000/1000` correct. The profiler fired after the
+server listened on the steady shape
+`batch=64 match=2 cache_bucket=1024 rows=64`, and the warmed replay spent
+`12.45ms` self CUDA: dense GEMM kernels were `4.50ms`, Marlin was `3.32ms`,
+multimem all-reduce was `2.09ms`, streaming GQA decode attention was `1.48ms`,
+and RMSNorm was `0.43ms`. The final queue profile had `100` decode-many calls,
+`470` decode-many steps, `27.5K` decode-many model tokens, `25.8K` emitted
+tokens, and `1.7K` overgenerated tokens; `decode_many:b64/64` alone consumed
+`16.1K` model tokens and `4.07s` GPU. This says the long-output decode gap is
+not primarily all-reduce anymore. The next useful work is either reducing the
+GEMM/Marlin slices per decode replay or overlapping/flushing decode-many work
+so q16-style larger bursts do not hide first tokens.
+
+Gating a larger drain burst on already-emitted tokens is also rejected as a
+default, though the runtime now has a useful diagnostic guard:
+`TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_DRAIN_DECODE_MIN_GENERATED`.
+Setting drain q12 after every active request had emitted one token wrote
+`/tmp/inference-bench-ti-long-drainq12-after-first-results/.../runs/20260704_071529`
+and landed at `321.0 / 21.8 / 1126.0ms`, `1000/1000` correct. It reduced
+median TPOT/E2E, but queue-to-first p50 was still `239ms`, p99 E2E was
+`2223ms`, decode-many skipped tokens rose to `3266`, and `b64/64` skipped
+`941` tokens. Raising the gate to four generated tokens wrote
+`/tmp/inference-bench-ti-long-drainq12-after-four-results/.../runs/20260704_072048`
+and softened the tradeoff to `286.2 / 24.0 / 1157.4ms`, `1000/1000` correct,
+with queue-to-first p50/p99 `229/481ms`, `10.34s` ragged decode GPU, `90`
+decode-many calls, and `3071` skipped tokens. Both variants still lose the q8
+default's TTFT/tail balance, so keep drain q8 as the default and use the
+min-generated guard only for future decode-many diagnostics.
+
+Capping stop-aware decode-many tails is rejected as a long-output default. A
+focused run with
+`TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY_STOP_TAIL_MAX_STEPS=1` wrote
+`/tmp/inference-bench-ti-long-stop-tail1-results/.../runs/20260704_073650`
+and landed at `266.4 / 23.8 / 1107.4ms`, `1000/1000` correct. It cut skipped
+decode-many tokens from the q8 default's `1385` to `596`, but fragmented the
+decode tail into `286` decode-many calls, tail-limited `242` calls / `871`
+steps, and still spent `10.13s` in ragged-decode GPU. The result is worse than
+the current q8 default and the q12 diagnostics on median TTFT/E2E, so leave the
+tail cap at `0` by default. Queue profiles now record
+`decode_many_stop_tail_max_steps` so future tail-cap probes are
+self-describing.
+
+Greedy-mid prefill-ready-before-decode is also rejected for few_shot. The latest
+public row made the 256-token greedy gap more visible, so a focused probe set
+`TORCHINFERNO_OPENAI_TP_ONLINE_PREFILL_READY_BEFORE_DECODE=1` and
+`TORCHINFERNO_OPENAI_TP_ONLINE_PREFILL_READY_ACTIVE_CAP=8` on the patched clean
+tree. It wrote
+`/tmp/inference-bench-ti-few-prbd8-results/.../runs/20260704_075038` and landed
+at `178.1 / 49.1 / 221.1ms`, `977/1000` correct. The queue profile confirms
+the mechanism is not defaultable: it used `34` prefill batches and `32/2`
+prefill graph hits/misses, but prefill wall rose to `2.44s`, p99
+queue-to-first stayed high at `896ms`, p99 E2E was `1272.5ms`, and median TPOT
+regressed to `49.1ms`. Keep prefill-ready-before-decode scoped to greedy-short,
+greedy-large, and sampled-medium policies that already have evidence; greedy-mid
+few_shot still needs faster `b32:s16` prefix-suffix prefill rather than another
+decode/prefill ordering toggle.
+
+The corrected few_shot replay profile confirms that diagnosis. The first
+attempt targeted `context_len=138`, but the serving path maps `p122/s16` through
+dynamic prefix prefill to the `ctx=-256` graph key, so no profile table was
+emitted. Rerunning with
+`TORCHINFERNO_PROFILE_RAGGED_PREFILL_REPLAY_ONCE=1`,
+`TORCHINFERNO_PROFILE_RAGGED_PREFILL_CONTEXT_LEN=-256`,
+`TORCHINFERNO_PROFILE_RAGGED_PREFILL_MIN_BATCH=32`, and
+`TORCHINFERNO_PROFILE_RAGGED_PREFILL_MIN_SUFFIX=16` wrote
+`/tmp/inference-bench-ti-few-prefill-replay-ctxneg256-results/.../runs/20260704_080737`
+and landed at `181.5 / 50.2 / 229.6ms`, `977/1000` correct. The profile fired
+on the warmed request shape
+`batch=32 suffix=16 match=1 context_len=-256 src_rows=1` and spent `50.22ms`
+self CUDA: NCCL all-reduce was `12.94ms` (`25.8%`, `160` calls), GEMM/NVJET
+kernels were roughly `19ms` combined, elementwise/norm/index/gather work was the
+remaining material cost, and attention was not a top item. Queue timing was
+profile-perturbed (`2.90s/3.61s` prefill forward/wall and p99 E2E `2.25s`), so
+use the kernel table rather than the row as evidence. This aligns few_shot with
+the targeted tree replay profile: the next defaultable improvement must reduce
+the model-side prefill replay cost itself, especially small TP all-reduces and
+GEMM/elementwise slices, or replace padded prefix-suffix replay with a packed
+path. The fixed 64-entry live-graph shape profile cap also hid the hot `b32`
+resident shapes; queue profiles now default
+`TORCHINFERNO_OPENAI_TP_ONLINE_PROFILE_GRAPH_SHAPE_LIMIT` to `192` so final
+records expose the full ragged-prefill graph cache, with an env override still
+available for smaller logs.
+
+Chunked prefill remains opt-in, but its intermediate chunks no longer need to
+pay for logits. The runtime now calls a cache-only ragged prefill graph/eager
+hook when no request finishes its prompt in the current chunk, skipping the
+final gather, LM-head projection, and CPU sampling for those chunks. Queue
+profiles label these resident graph entries with `:logits0` so chunked-prefill
+A/Bs can separate cache-fill graphs from token-emitting suffix graphs. This does
+not overturn the earlier chunking rejections by itself; it removes one known
+waste source before the next controlled chunked-prefill run.
+
+The chunked common-prefix setup now follows the same principle. When a chunked
+admission wave shares a prefix and every request still has a non-empty suffix,
+the runtime first replays a cache-only ragged prefill graph if one is already
+resident, with graph capture disabled on miss, then falls back to the model's
+cache-only eager hook and finally to the old logits prefill if neither no-logits
+path is available. This keeps the normal non-chunked common-prefix path
+unchanged because broad common-prefix no-logits was already rejected, but removes
+a discarded LM-head projection from the opt-in chunked path before any suffix
+chunks run. Focused CPU coverage:
+`venv/bin/python -m pytest
+tests/test_serving_engine.py::test_continuous_batch_engine_chunked_prefill_prepares_common_prefix
+tests/test_serving_engine.py::test_continuous_batch_engine_chunked_prefill_skips_intermediate_logits
+tests/test_serving_engine.py::test_continuous_batch_engine_chunked_prefill_matches_one_shot
+-q`.
+
+Focused post-fix synthetic evidence is positive for that specific waste
+removal. On the patched clean tree, a TP=8 `openai-microbench` with synthetic
+`prompt_tokens=160`, `max_tokens=16`, concurrency `64`, warmup `1`, and iters
+`1` compared no chunking against
+`TORCHINFERNO_OPENAI_TP_ONLINE_PREFILL_CHUNK=64`. The no-chunk measured
+concurrent row was `2611.4 / 19.7 / 2906.4ms` with `5.5 tok/s`; chunk-64 was
+`1284.1 / 19.3 / 1573.1ms` with `10.2 tok/s`. The chunked queue profile
+confirmed resident `:logits0` graph entries and, for the measured concurrent
+session after warmup, added six prefill graph replays with zero new captures or
+misses. Cold chunk sessions still paid `10` graph captures and `9.21s` aggregate
+capture time, so this is not a default-policy result; it shows the cache-only
+intermediate chunks are now viable enough for a warmer, public-shaped chunking
+A/B.
+
+The startup chunked-prefill warmup now targets that cold-capture gap directly
+when `TORCHINFERNO_OPENAI_TP_ONLINE_PREFILL_CHUNK` is set. Instead of warming
+only token-emitting logits graphs at `context_len=suffix`, it warms cache-only
+ragged prefill graphs for dynamic context buckets such as `-64/-128/-256/-512`
+and only warms logits graphs for the configured final context buckets. The
+warmup also enters the same online FP8 prefill policy key as the live request
+path. This keeps chunked prefill opt-in while making the next chunked A/B a
+startup-warmed measurement rather than a first-request graph-capture test.
+A same-shape rerun with that warmup active, `warmup=1`, and `iters=1` wrote
+`/tmp/ti_chunk_ab_chunk64_warmed_warm1.json`: concurrent-64 was
+`1282.0 / 18.9 / 1566.0ms` with `10.2 tok/s`, matching the earlier post-fix
+chunk-64 row while the queue profile stayed at `0` request-path prefill
+captures, `0` misses, and `24` prefill graph replays by the measured row.
+
+Real long_output chunking is still rejected as a default. The synthetic
+chunk-64 result did not carry over to the benchmark shape because the chunked
+admission path originally skipped the one-shot path's shared common-prefix
+setup. A direct run with
+`TORCHINFERNO_OPENAI_TP_ONLINE_PREFILL_CHUNK=64` on the patched tree hit `66`
+request-path prefill graph captures by the final queue snapshot, filled the
+ragged-prefill graph cache to `192`, and reached p50 queue-to-first around
+`4.65s` before the run was interrupted. Bucket-padding chunked groups to the
+runtime prefill batch buckets reduced captures to `19`, but still bypassed
+common-prefix reuse, prefilled `155.7K` active prompt tokens, spent `34.3s` in
+ragged decode GPU, and ended with p50 queue-to-first `1.38s`.
+
+Chunked admission now prepares a shared common prefix before creating
+prefilling states, and the chunked warmup covers the same batch buckets as the
+runtime path. That fixes the mechanical miss: the next
+`TORCHINFERNO_OPENAI_TP_ONLINE_PREFILL_CHUNK=64` long_output run reused the
+`111` token prefix for all `1000` requests (`111K` reused tokens), cut active
+prefill tokens to `44.8K`, and used `60` prefill batches. It still landed at
+`753.6 / 29.1 / 1804.8ms`, with `6` request-path prefill captures,
+`26.3s` ragged-decode GPU in the queue snapshot, and p99 E2E `6.80s`. Keep
+chunked prefill opt-in; a defaultable long_output fix needs a decode/prefill
+overlap design that preserves the common-prefix shape and does not fragment the
+steady 64-row decode path.
+
+The no-logits chunked common-prefix setup also needed a row-mapping fix before
+it was safe. The first graph-first cache-only run wrote
+`/tmp/ti-bench-results/current-long-chunk64-cacheprefix/.../runs/20260704_215142`
+and exposed the bug: correctness fell to `0.000`, even though the profile
+reported `111` reused prefix tokens for all `1000` requests. The cache-only
+helper had filled a cache row view with local `row_indices=[0]`; the ragged
+prefill write path treats explicit row indices as physical rows, so the shared
+prefix row could be left empty while row 0 was overwritten. The runtime now
+calls cache-only ragged prefill on the root cache with the acquired physical
+prefix row, and the CPU test asserts that the cache-only call records the same
+physical row later used as the suffix graph source.
+
+The corrected chunk-64 long_output rerun wrote
+`/tmp/ti-bench-results/current-long-chunk64-cacheprefix-rowfix/.../runs/20260704_220151`
+and recovered `1000/1000` correctness, but it still rejects chunking as a
+default: `817.7 / 39.1 / 2338.2ms`, versus the current non-chunked default
+probe's `251.3 / 23.9 / 1074.6ms`. Queue counters show why the fix is only
+correctness hygiene: prefix reuse hit `111` tokens for all `1000` requests and
+active prefill stayed at `44.8K` tokens, but the run still paid `9` prefill
+graph captures (`8.36s`), `25` decode graph captures (`20.14s`), and
+`30.98s` ragged-decode GPU. Keep
+`TORCHINFERNO_OPENAI_TP_ONLINE_PREFILL_CHUNK` diagnostic-only for public-shaped
+long_output.
+
+The `inference-bench-summary` helper now prints prefill/decode graph
+capture/replay timing and the hottest prefill graph capture/replay shapes.
+This run exposed why that belongs in the summary table: graph-only chunked
+prefill legitimately reports `0.0ms` in the old eager forward/wall columns
+while still spending `8.36s` in prefill graph capture.
+
+Public pointer refresh `20260704_090227` (`292caed`) did not change the
+underlying score-facing gaps. TorchInferno improved to `5/20` metric wins:
+few_shot `158.6 / 46.2 / 204.2ms`, self_consistency
+`174.4 / 0.0 / 182.1ms`, multi_turn `348.0 / 60.9 / 401.4ms`,
+tree_of_thought `128.4 / 69.0 / 161.1ms`, and long_output
+`244.8 / 21.0 / 987.0ms`. The long_output queue profile remained decode-heavy:
+`59` prefill batches, `4.31s/4.54s` prefill forward/wall, `812` decode
+batches, `95` decode-many calls over `430` decode-many steps, and `9.84s`
+ragged-decode GPU. Multi_turn remains common-prefix-only at default policy, and
+tree remains sampled-prefix/decode bound.
+
+Sampled tree suffix/batch bucketing probes do not produce a defaultable change.
+Forcing sampled suffix buckets to `8,16,32` and warming those suffixes wrote
+`/tmp/ti-bench-results/tree-suffix8/.../runs/20260704_102116` and landed at
+`133.0 / 31.2 / 159.7ms`, `959/992` correct. Shape details showed the env did
+not create any `s8` request shapes: all prefix-suffix replays remained
+`s16`, with `58` prefill batches, `11.8K` active prefill tokens,
+`18.9K` model prefill tokens, and `8.46K` padding tokens. Enabling the existing
+suffix-bucket split path on top wrote
+`/tmp/ti-bench-results/tree-suffix-split8/.../runs/20260704_102618` and landed
+at `132.1 / 27.9 / 154.6ms`, `956/992` correct, but still produced only `s16`
+request shapes. The TPOT movement is therefore not evidence for promoting `s8`
+suffix buckets.
+
+A finer sampled-medium batch-bucket probe
+(`TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_BATCH_BUCKETS_SAMPLED_MEDIUM=1,2,4,8,12,16,20,24,28,32`)
+wrote `/tmp/ti-bench-results/tree-batch12/.../runs/20260704_103128`. It reduced
+profiled prefill forward to `1.69s` and padding to `6.48K` tokens with `55`
+prefill batches and no request-path graph captures, but the benchmark regressed
+to `135.3 / 29.4 / 165.4ms`, p99 E2E `793ms`, and startup readiness `210.9s`.
+Keep sampled batch buckets at the current `1,2,4,8,16,24,32`; the next tree
+change needs model-side prefill/decode work, not more graph-bucket surface.
+To make that next pass less inferential, queue profiles now record
+`runtime_prefill_shape_real_batch_counts` and
+`runtime_prefill_shape_suffix_length_counts` alongside the existing
+row/suffix-padding totals. Those counters show the actual request counts and
+suffix lengths that fed each prefix graph shape, so future tree probes can
+target the real waste distribution without first adding more warmed graph
+buckets.
+
+Current-head tree profiling with those counters confirms the exact waste shape.
+The baseline focused run
+`/tmp/ti-bench-results/tree-newfields/.../runs/20260704_124446` landed at
+`130.5 / 39.1 / 160.2ms`, `959/992` correct, with startup readiness `205.9s`.
+Every prefix-suffix replay stayed in `s16`, while actual suffix lengths were
+only `10`, `11`, and `12`. The queue profile showed `59` prefill batches,
+`11.8K` active prefill tokens, `18.99K` model prefill tokens, `8.59K` padding
+tokens (`3.12K` row / `5.47K` suffix), `1.83s/2.27s` prefill forward/wall, and
+`1.42s` ragged-decode GPU.
+
+Rechecking the existing `s12/s16` opt-in on the same tree
+(`TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SUFFIX_BUCKETS=12,16` and matching
+startup suffix warmup) wrote
+`/tmp/ti-bench-results/tree-s12-current/.../runs/20260704_125036`. It improved
+median TPOT/E2E to `128.3 / 31.2 / 154.3ms` and cut padding to `3.17K` tokens
+(`1.67K` row / `1.50K` suffix), but it is still not a defaultable policy:
+p99 TTFT/E2E worsened to `895/922ms`, prefill forward/wall rose to
+`2.36s/2.79s`, and the run paid a request-path capture for
+`ragged_prefill:b24:s12:rows1:ctx57:src1`. Queue profiles now also expose
+`runtime_prefill_graph_capture_shape_ms` and
+`runtime_prefill_graph_replay_shape_ms` so future suffix-bucket or packed-prefill
+probes can attribute these tail spikes directly.
+The sampled common-prefix suffix warmup helper now follows
+`TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SUFFIX_BUCKETS` when no sampled-specific
+warmup suffix list is configured, matching the greedy path. The patched rerun
+`/tmp/ti-bench-results/tree-s12-warmfix/.../runs/20260704_125949` confirmed the
+targeted fix: no prefill graph misses or request-path captures, warmed
+`b24:s12` replay at `73.6ms`, `57` prefill batches, `11.8K` active tokens,
+`3.58K` padding tokens (`2.08K` row / `1.50K` suffix), and `1.68s/2.12s`
+prefill forward/wall. It landed at `128.9 / 26.6 / 149.5ms`, `961/992`
+correct, with p99 TTFT/E2E `590.5/614.8ms`.
+Promoting sampled-medium `12,16` suffix buckets to a no-env default is still
+rejected. The default-promotion probe
+`/tmp/ti-bench-results/tree-s12-default/.../runs/20260704_130535` also had zero
+prefill graph captures, but startup readiness rose to `210.9s`, profiled
+prefill forward/wall rose to `1.90s/2.35s`, and the benchmark landed at
+`140.9 / 28.6 / 165.2ms`, `959/992` correct. Keep `s12` as an explicit
+diagnostic/runtime opt-in until the startup graph surface and median TTFT/E2E
+are both improved.
+
+Lowering the few_shot runtime FP8 prefill gate is rejected. The replay profile
+made the tempting case: the hot `b32*s16=512` request graph misses the default
+runtime gate because `_ragged_prefill_precision_graph_key` uses a strict
+`token_count > min_m` check and the greedy-mid default leaves online FP8 prefill
+disabled. Forcing
+`TORCHINFERNO_OPENAI_TP_ONLINE_FP8_PREFILL=1` and
+`TORCHINFERNO_OPENAI_TP_ONLINE_FP8_PREFILL_MIN_M=256` wrote
+`/tmp/inference-bench-ti-few-fp8-minm256-results/.../runs/20260704_081537`
+and flipped the hot resident graph from `fp80` to `fp81`. It landed at
+`176.0 / 50.2 / 218.7ms`, `980/1000` correct. The adjacent no-env control on
+the same tree wrote
+`/tmp/inference-bench-ti-few-control-390fed4-results/.../runs/20260704_082058`
+and landed at `176.1 / 49.0 / 219.0ms`, `977/1000` correct. The FP8 variant
+cut the hot `b32:s16:p122` forward counter from `1.66s` to `1.60s`, but added a
+prefill batch/miss, raised prefill wall from `2.39s` to `2.59s`, worsened p99
+queue-to-first/finish from `678/696ms` to `1056/1083ms`, and lost `1.2ms`
+median TPOT. Keep few_shot out of the runtime FP8 prefill default; this exact
+gate does not close the score gap.
+
+Added a dense packed-ragged prefill oracle for the next prefix-suffix lever.
+`prefill_ragged_logits_packed_eager` flattens only real suffix tokens, scatters
+KV into the same physical rows/positions as padded ragged prefill, and slices
+attention per request so rows do not cross-attend. A CPU test compares logits
+and real-token KV columns against the existing padded oracle with shared-prefix
+copy. Serving can route padded suffix groups through it with the explicit
+diagnostic switch `TORCHINFERNO_CONTINUOUS_PACKED_RAGGED_PREFILL_EAGER=1`; it
+only fires when `logit_positions + 1` shows at least one row is shorter than the
+suffix bucket. This is not a default optimization yet: it is a correctness and
+profiling scaffold to prove the tensor contract before replacing the Python
+per-row attention loop with a CUDA/FlashInfer packed implementation.
+
+The first full long_output A/B on the patched local tree rejects that Python
+packed-eager path as a runtime implementation. The same-tree control wrote
+`/tmp/ti-bench-results/control-current/.../runs/20260704_111103` and landed at
+`244.8 / 24.7 / 1106.2ms`, `1000/1000` correct, with `5.02s/5.40s`
+prefill forward/wall and `10.10s` ragged-decode GPU. Enabling
+`TORCHINFERNO_CONTINUOUS_PACKED_RAGGED_PREFILL_EAGER=1` wrote
+`/tmp/ti-bench-results/packed-ragged/.../runs/20260704_110423` and landed at
+`1671.4 / 98.2 / 5535.0ms`, also `1000/1000` correct, but with
+`71.82s/72.17s` prefill forward/wall. It did reduce padded suffix accounting
+from `24.8K` to `21.7K` tokens, but the per-request Python attention loop
+dominates. Keep the method as a correctness oracle and profiling scaffold only;
+the defaultable version needs one packed CUDA/FlashInfer prefill body, not eager
+per-row SDPA.
+
+The packed eager scaffold now precomputes packed suffix metadata once per
+prefill and groups attention calls by `(prefix_start, q_len)` instead of
+re-reading CUDA metadata inside every layer. The correctness test was tightened
+to include two requests with the same real suffix length so the grouped path is
+covered. A focused tree_of_thought probe with
+`TORCHINFERNO_CONTINUOUS_PACKED_RAGGED_PREFILL_EAGER=1` wrote
+`/tmp/ti-bench-results/tree-packed-grouped/.../runs/20260704_121800` and still
+landed at `1263.1 / 303.8 / 1363.2ms`, `957/992` correct. Queue counters show
+the reason: prefill forward/wall was `29.52s/29.94s` across `58` batches,
+versus about `1.74s/2.18s` for the padded graph control. Metadata grouping
+removes obvious Python sync waste, but the eager attention structure is still
+orders of magnitude too slow for runtime. Keep it opt-in as an oracle; do not
+default packed prefill until it has a single CUDA/FlashInfer body.
+
+A follow-up packed-query indexing experiment is also rejected and was backed
+out. It precomputed each grouped query token index and replaced the per-layer
+slice/`torch.cat` construction with a single `index_select`, but the focused
+tree probe with `TORCHINFERNO_CONTINUOUS_PACKED_RAGGED_PREFILL_EAGER=1` wrote
+`/tmp/ti-bench-results/tree-packed-queryindex/.../runs/20260704_123142` and
+landed at `1215.6 / 316.4 / 1391.9ms`, `953/992` correct. Queue counters still
+showed the same blocker: prefill forward/wall was `30.66s/31.14s` across `63`
+batches, versus `29.52s/29.94s` for the prior grouped packed probe and
+`~1.74s/~2.18s` for padded graph control. The bottleneck is not query slicing;
+it is still eager per-group SDPA and uncaptured per-layer work.
+
+A fresh ragged-decode replay profile on the same tree wrote
+`/tmp/ti-bench-results/decode-profile/.../runs/20260704_111646` and profiled a
+hot `batch=64 cache_bucket=1024` graph replay at `12.44ms` self CUDA. The
+largest slices were dense GEMMs (`4.50ms` combined), gate-up Marlin
+(`3.32ms`), symmetric-memory all-reduce (`2.07ms`), grouped GQA decode
+attention (`1.49ms`), and RMSNorm/add (`0.44ms`). A matching Marlin-off run
+with `TORCHINFERNO_OPENAI_TP_ONLINE_MARLIN_INT4_DECODE=0` wrote
+`/tmp/ti-bench-results/marlin-off/.../runs/20260704_112227` and landed at
+`249.8 / 24.1 / 1124.9ms`, `1000/1000` correct, with `10.64s` decode GPU.
+That is not a clean win over the control (`24.7ms` TPOT, `10.10s` decode GPU),
+so keep gate-up Marlin enabled. The current long_output gap remains decode GEMM
+and per-layer collective work; cache-token buckets and stop-tail caps are still
+covered by prior rejected A/Bs.
+
+A same-tree all-provider tree_of_thought refresh on the patched local tree wrote
+`/tmp/ti-bench-results/tree-current-allproviders/.../runs/20260704_115517`.
+TorchInferno landed at `140.5 / 27.0 / 162.4ms`, vLLM at
+`65.5 / 32.2 / 89.9ms`, and SGLang at `58.8 / 83.6 / 154.7ms`. The current
+sampled-medium policy now wins TPOT locally, but TTFT/E2E remain bounded by
+cached-prefix prefill: TorchInferno used `56` prefill graph batches for
+`11.8K` active prompt tokens and `8.0K` padding tokens. The remaining tree
+lever is therefore true packed cached-prefix prefill, not another sampled
+decode or graph-bucket default.
+
+A fresh current-tree long_output profile with
+`TORCHINFERNO_PROFILE_RAGGED_DECODE_REPLAY_ONCE=1` wrote
+`/tmp/ti-bench-results/long-current-profile/.../runs/20260704_120555` and
+landed at `263.9 / 23.9 / 1168.4ms`, `1000/1000` correct. The queue profile
+showed `59` prefill batches, `4.66s/5.05s` prefill forward/wall, and `100`
+decode-many calls over `482` decode-many steps. The replay profiler captured a
+`batch=32 cache_bucket=1024` graph at `10.68ms` self CUDA: dense GEMMs were
+`4.24ms` combined, gate-up Marlin `2.26ms`, symmetric-memory all-reduce
+`1.66ms`, grouped GQA decode attention `1.40ms`, and RMSNorm/add `0.40ms`.
+That confirms the same shape as the earlier `batch=64` replay: the long_output
+gap is model-kernel throughput plus padded prefill, not an untried
+queue-scheduling toggle.
+
 ## Priority for a focused (non-loop) session
 
 1. Prefill MFU (Issue 1) — biggest TTFT lever, ~2x, affects 3/5 benchmarks.
-2. Chunked prefill interleaved with decode — lets early requests return fast.
+2. Packed/ragged prefix-suffix prefill — reduce padding without multiplying
+   small TP graph replays.
 3. Persistent engine + TP-safe reuse (Issue 3) — needed for multi_turn.

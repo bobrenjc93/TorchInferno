@@ -16,6 +16,13 @@ from torchinferno.research.helion import (
     run_helion_region_search,
     trace_helion_candidate,
 )
+from torchinferno.research.inference_bench import (
+    InferenceBenchRunSummary,
+    ProviderBenchmarkSummary,
+    QueueProfileSummary,
+    format_inference_bench_summary,
+    summarize_inference_bench_run,
+)
 
 __all__ = [
     "BenchmarkResult",
@@ -28,12 +35,17 @@ __all__ = [
     "HelionFXSearchReport",
     "HelionRegionSearchConfig",
     "HelionRegionSearchReport",
+    "InferenceBenchRunSummary",
     "MacroRegionCandidate",
+    "ProviderBenchmarkSummary",
+    "QueueProfileSummary",
     "ResearchHarness",
     "benchmark_callable",
     "discover_fx_windows",
+    "format_inference_bench_summary",
     "run_helion_candidate",
     "run_helion_fx_search",
     "run_helion_region_search",
+    "summarize_inference_bench_run",
     "trace_helion_candidate",
 ]

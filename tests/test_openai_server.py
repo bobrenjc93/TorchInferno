@@ -25,6 +25,7 @@ from torchinferno.openai_http import (
     _chat_delta_content,
     _chunked_stream_enabled,
     _fast_http_keepalive_idle_timeout_seconds,
+    _fast_http_stream_keep_alive_enabled,
     _fast_http_worker_count,
     _fast_stream_end_bytes,
     _new_fast_http_stream_profile,
@@ -97,6 +98,7 @@ from torchinferno.openai_server import (
     _online_common_prefix_suffix_prefill_warmup_enabled,
     _online_common_prefix_suffix_prefill_warmup_batches,
     _online_common_prefix_suffix_prefill_warmup_tokens,
+    _online_chunked_prefill_warmup_batches,
     _online_greedy_common_prefix_suffix_prefill_warmup_batches,
     _online_greedy_common_prefix_suffix_prefill_warmup_enabled,
     _online_greedy_common_prefix_suffix_prefill_warmup_max_token_values,
@@ -104,6 +106,7 @@ from torchinferno.openai_server import (
     _online_greedy_common_prefix_suffix_prefill_warmup_extra_pairs,
     _online_greedy_common_prefix_suffix_prefill_warmup_prefix_tokens,
     _online_greedy_common_prefix_suffix_prefill_warmup_suffix_tokens,
+    _online_sampled_common_prefix_suffix_prefill_warmup_suffix_tokens,
     _online_mixed_prefix_suffix_prefill_warmup_enabled,
     _online_mixed_prefix_suffix_prefill_warmup_specs,
     _online_admit_per_step_cap,
@@ -116,10 +119,13 @@ from torchinferno.openai_server import (
     _online_decode_drain_quantum,
     _online_decode_many_allow_stop_enabled,
     _online_decode_many_enabled,
+    _online_decode_many_stop_tail_max_steps,
     _online_decode_quantum,
+    _online_decode_warmup_cache_token_limits,
     _online_fp8_prefill_enabled,
     _online_fp8_prefill_min_m,
     _online_generated_prefix_cache_enabled,
+    _online_greedy_large_mixed_prefix_reuse_enabled,
     _online_idle_batch_wait_ms,
     _online_initial_batch_wait_ms,
     _online_kv_bounded_concurrency_enabled,
@@ -133,6 +139,8 @@ from torchinferno.openai_server import (
     _online_refill_min_ready_requests,
     _online_session_max_tokens,
     _online_session_prompt_headroom_tokens,
+    _online_short_greedy_ragged_decode_cache_token_limit,
+    _online_short_greedy_ragged_decode_cache_token_min_batch,
     _online_step_sync_enabled,
     _online_submit_step_command_enabled,
     _openai_cuda_graph_enabled_for_model,
@@ -165,6 +173,7 @@ from torchinferno.openai_server import (
     _startup_runtime_fp8_prefill_warmup_enabled,
     _startup_scheduler_warmup_enabled,
     _sampled_batch_shape_bucket_size,
+    _set_generation_cache_ragged_decode_cache_token_limit,
     _set_generation_cache_rows_seq_lens,
     _set_tensor_parallel_runtime_fp8_prefill,
     _set_tensor_parallel_runtime_marlin_int4_decode,
@@ -472,6 +481,60 @@ def test_openai_fast_http_profile_writes_jsonl(monkeypatch, tmp_path) -> None:
     assert record["content_chunks"] == 2
     assert record["total_ms"] >= 0.0
     assert "_start_s" not in record
+    assert "_detailed" not in record
+
+
+def test_openai_fast_http_profile_skips_detailed_token_timing_by_default(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    profile_path = tmp_path / "http-profile.jsonl"
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_FAST_HTTP_PROFILE_JSONL", str(profile_path))
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_FAST_HTTP_PROFILE_DETAILED", raising=False)
+    connection = _RecordingConnection()
+
+    _stream_fast_chat(
+        connection,  # type: ignore[arg-type]
+        _BatchStreamEngine(),
+        [{"role": "user", "content": "hello"}],
+        max_tokens=3,
+        temperature=0.0,
+    )
+
+    record = json.loads(profile_path.read_text())
+    assert record["event"] == "fast_http_stream"
+    assert record["engine_tokens"] == 3
+    assert record["content_chunks"] == 3
+    assert record["role_sent"] is True
+    assert record["first_engine_token_ms"] >= 0.0
+    assert record["first_content_sent_ms"] >= 0.0
+    assert "decode_token_ms" not in record
+    assert "content_send_ms" not in record
+    assert "headers_ms" not in record
+
+
+def test_openai_fast_http_profile_can_record_detailed_token_timing(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    profile_path = tmp_path / "http-profile.jsonl"
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_FAST_HTTP_PROFILE_JSONL", str(profile_path))
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_FAST_HTTP_PROFILE_DETAILED", "1")
+    connection = _RecordingConnection()
+
+    _stream_fast_chat(
+        connection,  # type: ignore[arg-type]
+        _BatchStreamEngine(),
+        [{"role": "user", "content": "hello"}],
+        max_tokens=3,
+        temperature=0.0,
+    )
+
+    record = json.loads(profile_path.read_text())
+    assert record["decode_token_ms"] >= 0.0
+    assert record["content_send_ms"] >= 0.0
+    assert record["headers_ms"] >= 0.0
+    assert record["finish_send_ms"] >= 0.0
 
 
 def test_openai_fast_http_keepalive_timeout_preserves_active_connections(monkeypatch) -> None:
@@ -500,6 +563,106 @@ def test_openai_fast_http_keepalive_timeout_shortens_after_drain(monkeypatch) ->
 
     assert _fast_http_keepalive_idle_timeout_seconds(engine, 5.0) == pytest.approx(0.5)
     assert _fast_http_keepalive_idle_timeout_seconds(engine, 0.1) == pytest.approx(0.1)
+
+
+def test_openai_fast_http_stream_keepalive_preserves_default_for_greedy_large_streams(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for name in (
+        "TORCHINFERNO_OPENAI_FAST_HTTP_STREAM_KEEPALIVE",
+        "TORCHINFERNO_OPENAI_FAST_HTTP_GREEDY_LARGE_CLOSE_STREAM",
+        "TORCHINFERNO_OPENAI_FAST_HTTP_GREEDY_LARGE_CLOSE_STREAM_MIN_TOKENS",
+        "TORCHINFERNO_OPENAI_FAST_HTTP_GREEDY_LARGE_CLOSE_STREAM_MAX_TOKENS",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    assert _fast_http_stream_keep_alive_enabled(
+        keep_alive=True,
+        max_tokens=512,
+        temperature=0.0,
+    )
+    assert _fast_http_stream_keep_alive_enabled(
+        keep_alive=True,
+        max_tokens=400,
+        temperature=0.0,
+    )
+    assert _fast_http_stream_keep_alive_enabled(
+        keep_alive=True,
+        max_tokens=513,
+        temperature=0.0,
+    )
+    assert _fast_http_stream_keep_alive_enabled(
+        keep_alive=True,
+        max_tokens=512,
+        temperature=0.7,
+    )
+    assert not _fast_http_stream_keep_alive_enabled(
+        keep_alive=False,
+        max_tokens=512,
+        temperature=0.0,
+    )
+
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_FAST_HTTP_GREEDY_LARGE_CLOSE_STREAM", "1")
+    assert not _fast_http_stream_keep_alive_enabled(
+        keep_alive=True,
+        max_tokens=512,
+        temperature=0.0,
+    )
+    assert _fast_http_stream_keep_alive_enabled(
+        keep_alive=True,
+        max_tokens=400,
+        temperature=0.0,
+    )
+    assert _fast_http_stream_keep_alive_enabled(
+        keep_alive=True,
+        max_tokens=513,
+        temperature=0.0,
+    )
+
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_FAST_HTTP_GREEDY_LARGE_CLOSE_STREAM", "0")
+    assert _fast_http_stream_keep_alive_enabled(
+        keep_alive=True,
+        max_tokens=512,
+        temperature=0.0,
+    )
+
+
+def test_openai_fast_http_stream_keepalive_respects_overrides(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_FAST_HTTP_STREAM_KEEPALIVE", "1")
+    assert _fast_http_stream_keep_alive_enabled(
+        keep_alive=True,
+        max_tokens=512,
+        temperature=0.0,
+    )
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_FAST_HTTP_STREAM_KEEPALIVE", "0")
+    assert not _fast_http_stream_keep_alive_enabled(
+        keep_alive=True,
+        max_tokens=256,
+        temperature=0.0,
+    )
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_FAST_HTTP_STREAM_KEEPALIVE", raising=False)
+
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_FAST_HTTP_GREEDY_LARGE_CLOSE_STREAM_MIN_TOKENS", "300")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_FAST_HTTP_GREEDY_LARGE_CLOSE_STREAM_MAX_TOKENS", "640")
+    assert _fast_http_stream_keep_alive_enabled(
+        keep_alive=True,
+        max_tokens=640,
+        temperature=0.0,
+    )
+
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_FAST_HTTP_GREEDY_LARGE_CLOSE_STREAM", "1")
+    assert not _fast_http_stream_keep_alive_enabled(
+        keep_alive=True,
+        max_tokens=640,
+        temperature=0.0,
+    )
+    assert _fast_http_stream_keep_alive_enabled(
+        keep_alive=True,
+        max_tokens=641,
+        temperature=0.0,
+    )
 
 
 def test_openai_fast_http_worker_count_matches_burst_connection_cap(monkeypatch) -> None:
@@ -791,9 +954,126 @@ def test_openai_decode_warmup_policy_specs_cover_sampled_no_symm_key(monkeypatch
     assert _online_decode_warmup_policy_specs() == ((0.0, 1), (1.0, 300))
 
 
+def test_openai_short_greedy_ragged_decode_cache_token_limit(monkeypatch) -> None:
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_SHORT_GREEDY_RAGGED_DECODE_CACHE_TOKENS", raising=False)
+    monkeypatch.delenv(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_SHORT_GREEDY_RAGGED_DECODE_CACHE_MAX_TOKENS",
+        raising=False,
+    )
+    monkeypatch.delenv(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_SHORT_GREEDY_RAGGED_DECODE_CACHE_MIN_BATCH",
+        raising=False,
+    )
+
+    assert _online_short_greedy_ragged_decode_cache_token_min_batch() == 64
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_SHORT_GREEDY_RAGGED_DECODE_CACHE_MIN_BATCH", "32")
+    assert _online_short_greedy_ragged_decode_cache_token_min_batch() == 32
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_SHORT_GREEDY_RAGGED_DECODE_CACHE_MIN_BATCH", raising=False)
+
+    assert _online_short_greedy_ragged_decode_cache_token_limit(
+        temperature=0.0,
+        max_tokens=96,
+        max_seq_len=256,
+    ) is None
+
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_SHORT_GREEDY_RAGGED_DECODE_CACHE_TOKENS", "256")
+    assert _online_short_greedy_ragged_decode_cache_token_limit(
+        temperature=0.0,
+        max_tokens=96,
+        max_seq_len=256,
+    ) == 256
+    assert _online_short_greedy_ragged_decode_cache_token_limit(
+        temperature=0.0,
+        max_tokens=96,
+        max_seq_len=192,
+    ) == 256
+    assert _online_short_greedy_ragged_decode_cache_token_limit(
+        temperature=0.7,
+        max_tokens=96,
+        max_seq_len=256,
+    ) is None
+    assert _online_short_greedy_ragged_decode_cache_token_limit(
+        temperature=0.0,
+        max_tokens=256,
+        max_seq_len=256,
+    ) is None
+    assert _online_short_greedy_ragged_decode_cache_token_limit(
+        temperature=0.0,
+        max_tokens=96,
+        max_seq_len=384,
+    ) is None
+
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_SHORT_GREEDY_RAGGED_DECODE_CACHE_MAX_TOKENS", "64")
+    assert _online_short_greedy_ragged_decode_cache_token_limit(
+        temperature=0.0,
+        max_tokens=96,
+        max_seq_len=256,
+    ) is None
+
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_SHORT_GREEDY_RAGGED_DECODE_CACHE_TOKENS", "0")
+    assert _online_short_greedy_ragged_decode_cache_token_limit(
+        temperature=0.0,
+        max_tokens=32,
+        max_seq_len=128,
+    ) is None
+
+
+def test_openai_decode_warmup_cache_token_limits_add_short_greedy_cap(monkeypatch) -> None:
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_SHORT_GREEDY_RAGGED_DECODE_CACHE_TOKENS", raising=False)
+    monkeypatch.delenv(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_SHORT_GREEDY_RAGGED_DECODE_CACHE_MAX_TOKENS",
+        raising=False,
+    )
+
+    assert _online_decode_warmup_cache_token_limits(
+        warmup_temperature=0.0,
+        warmup_max_tokens=1,
+        max_seq_len=1024,
+    ) == (None,)
+
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_SHORT_GREEDY_RAGGED_DECODE_CACHE_TOKENS", "256")
+    assert _online_decode_warmup_cache_token_limits(
+        warmup_temperature=0.0,
+        warmup_max_tokens=1,
+        max_seq_len=1024,
+    ) == (None, 256)
+    assert _online_decode_warmup_cache_token_limits(
+        warmup_temperature=0.7,
+        warmup_max_tokens=1,
+        max_seq_len=1024,
+    ) == (None,)
+    assert _online_decode_warmup_cache_token_limits(
+        warmup_temperature=0.0,
+        warmup_max_tokens=256,
+        max_seq_len=1024,
+    ) == (None,)
+    assert _online_decode_warmup_cache_token_limits(
+        warmup_temperature=0.0,
+        warmup_max_tokens=1,
+        max_seq_len=128,
+    ) == (None,)
+
+
+def test_openai_generation_cache_ragged_decode_cache_token_limit_setter() -> None:
+    cache = types.SimpleNamespace()
+
+    _set_generation_cache_ragged_decode_cache_token_limit(cache, 256, min_batch=64)
+    assert cache._torchinferno_ragged_decode_cache_token_limit == 256
+    assert cache._torchinferno_ragged_decode_cache_token_min_batch == 64
+
+    _set_generation_cache_ragged_decode_cache_token_limit(cache, None)
+    assert not hasattr(cache, "_torchinferno_ragged_decode_cache_token_limit")
+    assert not hasattr(cache, "_torchinferno_ragged_decode_cache_token_min_batch")
+
+    _set_generation_cache_ragged_decode_cache_token_limit(cache, 0)
+    assert not hasattr(cache, "_torchinferno_ragged_decode_cache_token_limit")
+    assert not hasattr(cache, "_torchinferno_ragged_decode_cache_token_min_batch")
+
+
 def test_openai_unified_scheduler_decode_warmup_uses_runtime_symm_scope(monkeypatch) -> None:
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE", "runtime")
     monkeypatch.setenv("TORCHINFERNO_OPENAI_WARMUP_ONLINE_COMMON_PREFIX_PREFILL", "0")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_WARMUP_ONLINE_MIXED_PREFIX_SUFFIX_PREFILL", "0")
     monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_FLASHINFER_PREFILL_DISABLE", "1")
     scope_kwargs: list[dict[str, object]] = []
 
@@ -818,6 +1098,86 @@ def test_openai_unified_scheduler_decode_warmup_uses_runtime_symm_scope(monkeypa
         (0.0, 1),
         (1.0, 300),
     ]
+
+
+def test_openai_unified_scheduler_decode_warmup_captures_short_cache_limit(monkeypatch) -> None:
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_WARMUP_PROMPT_TOKENS", "3")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_WARMUP_ONLINE_COMMON_PREFIX_PREFILL", "0")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_WARMUP_ONLINE_MIXED_PREFIX_SUFFIX_PREFILL", "0")
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_FLASHINFER_PREFILL_DISABLE", "1")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_SHORT_GREEDY_RAGGED_DECODE_CACHE_TOKENS", "8")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_SHORT_GREEDY_RAGGED_DECODE_CACHE_MIN_BATCH", "1")
+
+    class Cache:
+        def __init__(self) -> None:
+            self.seq_len = 0
+
+        def set_seq_len(self, seq_len: int) -> None:
+            self.seq_len = seq_len
+
+        def reset(self) -> None:
+            self.seq_len = 0
+
+    class Model:
+        def __init__(self) -> None:
+            self.config = types.SimpleNamespace(vocab_size=16)
+            self.token_limits: list[int | None] = []
+            self.logits_limits: list[int | None] = []
+
+        def try_decode_ragged_token_graph(
+            self,
+            input_ids: torch.Tensor,
+            cache: Cache,
+            *,
+            seq_lens: torch.Tensor,
+            row_indices: torch.Tensor | None = None,
+            temperature: float = 0.0,
+            capture_on_miss: bool = False,
+        ) -> torch.Tensor:
+            del seq_lens, row_indices, temperature, capture_on_miss
+            self.token_limits.append(
+                getattr(cache, "_torchinferno_ragged_decode_cache_token_limit", None)
+            )
+            return torch.zeros(input_ids.size(0), dtype=torch.long)
+
+        def try_decode_ragged_logits_graph(
+            self,
+            input_ids: torch.Tensor,
+            cache: Cache,
+            *,
+            seq_lens: torch.Tensor,
+            row_indices: torch.Tensor | None = None,
+            capture_on_miss: bool = False,
+        ) -> torch.Tensor:
+            del seq_lens, row_indices, capture_on_miss
+            self.logits_limits.append(
+                getattr(cache, "_torchinferno_ragged_decode_cache_token_limit", None)
+            )
+            return torch.zeros(input_ids.size(0), input_ids.size(1), self.config.vocab_size)
+
+        def try_decode_one_token_logits_graph(
+            self,
+            input_ids: torch.Tensor,
+            cache: Cache,
+            *,
+            capture_on_miss: bool = False,
+        ) -> torch.Tensor:
+            del cache, capture_on_miss
+            return torch.zeros(input_ids.size(0), input_ids.size(1), self.config.vocab_size)
+
+    cache = Cache()
+    model = Model()
+    engine = object.__new__(OpenAICompletionEngine)
+    engine.model = model
+    engine.device = torch.device("cpu")
+    engine._persistent_serving_cache = None
+    engine._allocate_online_serving_warmup_cache = lambda: (cache, 1, 1, 16)  # type: ignore[method-assign]
+
+    engine._warmup_unified_scheduler_cache(vocab_size=16)
+
+    assert model.token_limits == [None, None, 8, 8]
+    assert model.logits_limits == [None, None, 8, 8]
+    assert not hasattr(cache, "_torchinferno_ragged_decode_cache_token_limit")
 
 
 def test_openai_unified_scheduler_warmup_captures_ragged_logits_graphs(monkeypatch) -> None:
@@ -854,15 +1214,23 @@ def test_openai_unified_scheduler_warmup_captures_ragged_logits_graphs(monkeypat
     engine._warmup_unified_scheduler_cache(vocab_size=16)
 
     assert model.token_ragged_shapes == [
+        (1, 1, None),
         (1, 1, (0,)),
+        (2, 1, None),
         (2, 1, (0, 1)),
+        (3, 1, None),
         (3, 1, (0, 1, 2)),
+        (4, 1, None),
         (4, 1, (0, 1, 2, 3)),
     ]
     assert [shape[:2] + (shape[3],) for shape in model.ragged_shapes] == [
+        (1, 1, None),
         (1, 1, (0,)),
+        (2, 1, None),
         (2, 1, (0, 1)),
+        (3, 1, None),
         (3, 1, (0, 1, 2)),
+        (4, 1, None),
         (4, 1, (0, 1, 2, 3)),
     ]
     assert model.decode_shapes == [
@@ -931,6 +1299,7 @@ def test_openai_ragged_decode_warmup_captures_token_and_logits_graphs(monkeypatc
         def __init__(self) -> None:
             super().__init__()
             self.token_ragged_shapes: list[tuple[int, int, tuple[int, ...] | None]] = []
+            self.released_caches: list[_WarmupShapeCache] = []
 
         def try_decode_ragged_token_graph(
             self,
@@ -945,6 +1314,9 @@ def test_openai_ragged_decode_warmup_captures_token_and_logits_graphs(monkeypatc
             row_tuple = None if row_indices is None else tuple(int(index) for index in row_indices.tolist())
             self.token_ragged_shapes.append((input_ids.size(0), input_ids.size(1), row_tuple))
             return torch.zeros(input_ids.size(0), dtype=torch.long)
+
+        def release_decode_graphs_for_cache(self, cache: _WarmupShapeCache) -> None:
+            self.released_caches.append(cache)
 
     model = _TokenWarmupShapeModel()
     engine = object.__new__(OpenAICompletionEngine)
@@ -962,6 +1334,7 @@ def test_openai_ragged_decode_warmup_captures_token_and_logits_graphs(monkeypatc
         (4, 1, (3, 3, 3, 3), None),
         (2, 1, (3, 3, 3, 3), (0, 1)),
     ]
+    assert len(model.released_caches) == 1
 
 
 def test_openai_startup_ragged_decode_warmup_is_opt_in(monkeypatch) -> None:
@@ -1346,9 +1719,12 @@ def test_tensor_parallel_worker_loop_handles_online_runtime_commands(monkeypatch
             enable_decode_many: bool | None = None,
             decode_many_allow_stop: bool | None = None,
             decode_many_with_waiting: bool | None = None,
+            decode_many_stop_tail_max_steps: int | None = None,
             generated_prefix_cache: bool | None = None,
+            greedy_large_mixed_prefix_reuse: bool | None = None,
             max_generation_tokens: int | None = None,
         ) -> None:
+            del greedy_large_mixed_prefix_reuse
             self.init_args = (
                 model,
                 device,
@@ -1370,6 +1746,7 @@ def test_tensor_parallel_worker_loop_handles_online_runtime_commands(monkeypatch
                 enable_decode_many,
                 decode_many_allow_stop,
                 decode_many_with_waiting,
+                decode_many_stop_tail_max_steps,
                 generated_prefix_cache,
                 max_generation_tokens,
             )
@@ -1431,6 +1808,7 @@ def test_tensor_parallel_worker_loop_handles_online_runtime_commands(monkeypatch
         False,
         False,
         False,
+        0,
         True,
         6,
     )
@@ -1449,6 +1827,76 @@ def test_tensor_parallel_worker_loop_handles_online_runtime_commands(monkeypatch
         ((3,), 6, 7, 0, (0, 9), 0.7),
     ]
     assert [request.request_id for request in runtime.submitted] == ["10", "11"]
+
+
+def test_tensor_parallel_worker_loop_rebuilds_dense_runtime_with_paged_prefix_cache(
+    monkeypatch,
+) -> None:
+    import torch.distributed as dist
+
+    monkeypatch.setenv("TORCHINFERNO_PAGED_PREFIX_CACHE", "1")
+    commands: list[dict[str, object]] = [
+        {
+            "op": "online_start",
+            "max_seq_len": 16,
+            "max_active_requests": 4,
+            "prefix_cache_capacity": 2,
+            "prefill_token_budget": 8,
+            "temperature": 0.0,
+            "max_tokens": 256,
+        },
+        {"op": "online_close"},
+        {
+            "op": "online_start",
+            "max_seq_len": 32,
+            "max_active_requests": 8,
+            "prefix_cache_capacity": 6,
+            "prefill_token_budget": 16,
+            "temperature": 0.0,
+            "max_tokens": 512,
+        },
+        {"op": "online_close"},
+        {"op": "stop"},
+    ]
+    instances: list[object] = []
+
+    class RuntimeEngine:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            del args
+            self.kwargs = dict(kwargs)
+            self.started: list[int] = []
+            instances.append(self)
+
+        def start_online(self, *, max_seq_len: int, external_cache: object | None = None) -> None:
+            del external_cache
+            self.started.append(max_seq_len)
+
+    def broadcast_object_list(payload: list[object], *, src: int) -> None:
+        del src
+        payload[0] = commands.pop(0)
+
+    monkeypatch.setattr(dist, "is_available", lambda: True)
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(dist, "broadcast_object_list", broadcast_object_list)
+    monkeypatch.setattr("torchinferno.openai_server._RuntimeContinuousBatchEngine", RuntimeEngine)
+    monkeypatch.setattr(
+        "torchinferno.openai_server._tensor_parallel_symm_mem_allreduce_scope",
+        lambda *args, **kwargs: nullcontext(),
+    )
+
+    engine = _WorkerLoopRecordingEngine()
+    engine.model = object()
+    engine.cache_backend = "paged"
+    engine.page_size = 2
+
+    _tensor_parallel_worker_loop(engine)
+
+    assert commands == []
+    assert len(instances) == 2
+    assert [runtime.started for runtime in instances] == [[16], [32]]
+    assert [runtime.kwargs["prefix_cache_capacity"] for runtime in instances] == [2, 6]
+    assert [runtime.kwargs["prefill_token_budget"] for runtime in instances] == [8, 16]
+    assert [runtime.kwargs["max_generation_tokens"] for runtime in instances] == [256, 512]
 
 
 def test_tensor_parallel_worker_loop_rebuilds_incompatible_online_cache(monkeypatch) -> None:
@@ -1632,9 +2080,12 @@ def test_tensor_parallel_worker_loop_receives_online_tensor_commands(monkeypatch
             enable_decode_many: bool | None = None,
             decode_many_allow_stop: bool | None = None,
             decode_many_with_waiting: bool | None = None,
+            decode_many_stop_tail_max_steps: int | None = None,
             generated_prefix_cache: bool | None = None,
+            greedy_large_mixed_prefix_reuse: bool | None = None,
             max_generation_tokens: int | None = None,
         ) -> None:
+            del greedy_large_mixed_prefix_reuse
             self.init_args = (
                 model,
                 device,
@@ -1656,6 +2107,7 @@ def test_tensor_parallel_worker_loop_receives_online_tensor_commands(monkeypatch
                 enable_decode_many,
                 decode_many_allow_stop,
                 decode_many_with_waiting,
+                decode_many_stop_tail_max_steps,
                 generated_prefix_cache,
                 max_generation_tokens,
             )
@@ -1722,6 +2174,7 @@ def test_tensor_parallel_worker_loop_receives_online_tensor_commands(monkeypatch
         False,
         False,
         False,
+        0,
         True,
         6,
     )
@@ -2767,10 +3220,11 @@ def test_openai_stream_defer_role_defaults_to_bounded_streams(monkeypatch) -> No
 
     assert _stream_defer_role_enabled(max_tokens=256, temperature=0.0)
     assert _stream_defer_role_enabled(max_tokens=400, temperature=0.7)
-    assert not _stream_defer_role_enabled(max_tokens=512, temperature=0.0)
-
-    monkeypatch.setenv("TORCHINFERNO_OPENAI_STREAM_DEFER_ROLE_MAX_TOKENS", "512")
     assert _stream_defer_role_enabled(max_tokens=512, temperature=0.0)
+    assert not _stream_defer_role_enabled(max_tokens=513, temperature=0.0)
+
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_STREAM_DEFER_ROLE_MAX_TOKENS", "640")
+    assert _stream_defer_role_enabled(max_tokens=640, temperature=0.0)
 
     monkeypatch.setenv("TORCHINFERNO_OPENAI_STREAM_DEFER_ROLE", "0")
     assert not _stream_defer_role_enabled(max_tokens=256, temperature=0.0)
@@ -5377,8 +5831,16 @@ def test_llama_tp_decode_graph_capture_uses_rank_sync(monkeypatch) -> None:
         capture_calls.append("decode_logits")
         return types.SimpleNamespace(output_logits=logits)
 
-    def capture_ragged(self, captured_input_ids, captured_cache, seq_lens, row_indices):  # noqa: ANN001
-        del self, captured_input_ids, captured_cache, seq_lens, row_indices
+    def capture_ragged(
+        self,
+        captured_input_ids,
+        captured_cache,
+        seq_lens,
+        row_indices,
+        *,
+        cache_token_bucket,
+    ):  # noqa: ANN001
+        del self, captured_input_ids, captured_cache, seq_lens, row_indices, cache_token_bucket
         capture_calls.append("ragged")
         return types.SimpleNamespace(output_logits=logits)
 
@@ -5403,9 +5865,13 @@ def test_llama_tp_decode_graph_capture_uses_rank_sync(monkeypatch) -> None:
         graph=existing_graph,
         output_logits=logits,
     )
-    model._ragged_decode_logits_graphs[(id(cache), 1, cache.layers[0].max_seq_len, False, 0)] = types.SimpleNamespace(
+    cache_token_bucket = cache.layers[0].max_seq_len
+    model._ragged_decode_logits_graphs[
+        (id(cache), 1, cache.layers[0].max_seq_len, cache_token_bucket, False, 0)
+    ] = types.SimpleNamespace(
         cache=cache,
         max_seq_len=cache.layers[0].max_seq_len,
+        cache_token_bucket=cache_token_bucket,
         static_input_ids=input_ids.clone(),
         static_row_indices=None,
         graph=existing_graph,
@@ -5447,15 +5913,20 @@ def test_llama_tp_ragged_decode_graph_replay_updates_indexed_rows() -> None:
     captured = types.SimpleNamespace(
         cache=cache,
         max_seq_len=cache.layers[0].max_seq_len,
+        cache_token_bucket=cache.layers[0].max_seq_len,
         static_input_ids=torch.empty((2, 1), dtype=torch.long),
         static_cache_positions=torch.empty((2,), dtype=torch.long),
         static_row_indices=torch.empty((2,), dtype=torch.long),
         static_rotary_cos=torch.empty((2, 4), dtype=torch.float32),
         static_rotary_sin=torch.empty((2, 4), dtype=torch.float32),
+        static_paged_decode_page_tables=None,
+        static_paged_decode_seq_lens=None,
         graph=types.SimpleNamespace(replay=lambda: replay_calls.append(1)),
         output_logits=logits,
     )
-    model._ragged_decode_logits_graphs[(id(cache), 2, cache.layers[0].max_seq_len, True, 0)] = captured
+    model._ragged_decode_logits_graphs[
+        (id(cache), 2, cache.layers[0].max_seq_len, cache.layers[0].max_seq_len, True, 0)
+    ] = captured
 
     seq_lens = torch.tensor([3, 7, 11, 13], dtype=torch.long)
     first_rows = torch.tensor([0, 2], dtype=torch.long)
@@ -5486,6 +5957,39 @@ def test_llama_tp_ragged_decode_graph_replay_updates_indexed_rows() -> None:
     assert torch.equal(captured.static_rotary_cos, model.rotary_cos_cache.index_select(0, torch.tensor([13, 7])))
     assert torch.equal(captured.static_rotary_sin, model.rotary_sin_cache.index_select(0, torch.tensor([13, 7])))
     assert replay_calls == [1, 1]
+
+
+def test_llama_tp_ragged_decode_graph_can_lookup_rotary_inside_graph() -> None:
+    from torchinferno.models.llama3 import tensor_parallel as tp
+
+    model = object.__new__(tp.Llama3TensorParallelForCausalLM)
+    model.device = torch.device("cpu")
+    model.rotary_cos_cache = torch.arange(64, dtype=torch.float32).view(16, 4)
+    model.rotary_sin_cache = model.rotary_cos_cache + 1000
+    input_ids = torch.tensor([[10], [20]], dtype=torch.long)
+    seq_lens = torch.tensor([3, 11], dtype=torch.long)
+    captured = types.SimpleNamespace(
+        cache=types.SimpleNamespace(cache_backend="dense", layers=[types.SimpleNamespace(max_seq_len=16)]),
+        cache_token_bucket=16,
+        static_input_ids=torch.empty_like(input_ids),
+        static_cache_positions=torch.empty((2,), dtype=torch.long),
+        static_row_indices=None,
+        static_rotary_cos=torch.full((2, 4), -1.0),
+        static_rotary_sin=torch.full((2, 4), -2.0),
+        static_paged_decode_page_tables=None,
+        static_paged_decode_seq_lens=None,
+        rotary_in_graph=True,
+    )
+
+    model._copy_ragged_decode_graph_inputs(captured, input_ids, seq_lens, row_indices=None)
+    rotary_cos, rotary_sin = model._ragged_decode_graph_rotary(captured)
+
+    assert torch.equal(captured.static_input_ids, input_ids)
+    assert captured.static_cache_positions.tolist() == [3, 11]
+    assert torch.equal(rotary_cos, model.rotary_cos_cache.index_select(0, torch.tensor([3, 11])))
+    assert torch.equal(rotary_sin, model.rotary_sin_cache.index_select(0, torch.tensor([3, 11])))
+    assert torch.equal(captured.static_rotary_cos, torch.full((2, 4), -1.0))
+    assert torch.equal(captured.static_rotary_sin, torch.full((2, 4), -2.0))
 
 
 def test_openai_ephemeral_cache_skips_ragged_decode_graph() -> None:
@@ -9212,8 +9716,14 @@ def test_openai_online_decode_quantum_respects_env_overrides(monkeypatch) -> Non
 
 def test_openai_online_decode_many_defaults_on_for_short_greedy(monkeypatch) -> None:
     monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY_STOP_TAIL_MAX_STEPS", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_DECODE_MANY_STOP_TAIL_MAX_STEPS", raising=False)
     monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_DECODE_MANY", raising=False)
     monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_DECODE_MANY_ALLOW_STOP", raising=False)
+    monkeypatch.delenv(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_DECODE_MANY_STOP_TAIL_MAX_STEPS",
+        raising=False,
+    )
     monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_GEN_MAX_TOKENS", raising=False)
 
     assert _online_decode_many_enabled(temperature=0.0, max_tokens=64)
@@ -9222,19 +9732,40 @@ def test_openai_online_decode_many_defaults_on_for_short_greedy(monkeypatch) -> 
     assert not _online_decode_many_enabled(temperature=0.7, max_tokens=64)
     assert not _online_decode_many_enabled(temperature=0.0, max_tokens=0)
     assert _online_decode_many_allow_stop_enabled(temperature=0.0, max_tokens=64)
+    assert _online_decode_many_stop_tail_max_steps(temperature=0.0, max_tokens=64) == 4
+    assert _online_decode_many_stop_tail_max_steps(temperature=0.0, max_tokens=128) == 4
+    assert _online_decode_many_stop_tail_max_steps(temperature=0.0, max_tokens=256) == 0
+    assert _online_decode_many_stop_tail_max_steps(temperature=0.7, max_tokens=64) == 0
 
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_DECODE_MANY", "0")
     assert not _online_decode_many_enabled(temperature=0.0, max_tokens=64)
     assert not _online_decode_many_allow_stop_enabled(temperature=0.0, max_tokens=64)
+    assert _online_decode_many_stop_tail_max_steps(temperature=0.0, max_tokens=64) == 0
 
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_DECODE_MANY", "1")
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_DECODE_MANY_ALLOW_STOP", "0")
     assert not _online_decode_many_allow_stop_enabled(temperature=0.0, max_tokens=64)
+    assert _online_decode_many_stop_tail_max_steps(temperature=0.0, max_tokens=64) == 0
+
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_DECODE_MANY_ALLOW_STOP", "1")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_DECODE_MANY_STOP_TAIL_MAX_STEPS", "2")
+    assert _online_decode_many_stop_tail_max_steps(temperature=0.0, max_tokens=64) == 2
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_DECODE_MANY_STOP_TAIL_MAX_STEPS", "3")
+    assert _online_decode_many_stop_tail_max_steps(temperature=0.0, max_tokens=64) == 3
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY_STOP_TAIL_MAX_STEPS", "1")
+    assert _online_decode_many_stop_tail_max_steps(temperature=0.0, max_tokens=64) == 1
+    monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY_STOP_TAIL_MAX_STEPS", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_DECODE_MANY_STOP_TAIL_MAX_STEPS", raising=False)
+    monkeypatch.delenv(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_DECODE_MANY_STOP_TAIL_MAX_STEPS",
+        raising=False,
+    )
 
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_GEN_MAX_TOKENS", "256")
     assert _online_decode_many_enabled(temperature=0.0, max_tokens=256)
     monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_DECODE_MANY_ALLOW_STOP", raising=False)
     assert _online_decode_many_allow_stop_enabled(temperature=0.0, max_tokens=256)
+    assert _online_decode_many_stop_tail_max_steps(temperature=0.0, max_tokens=256) == 4
 
 
 def test_openai_online_decode_many_respects_env_overrides(monkeypatch) -> None:
@@ -9313,16 +9844,34 @@ def test_openai_online_prefill_ready_before_decode_respects_env(monkeypatch) -> 
         "TORCHINFERNO_CONTINUOUS_GREEDY_LARGE_MIXED_PREFIX_REUSE_MAX_TOKENS",
         raising=False,
     )
+    monkeypatch.delenv(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_MIXED_PREFIX_REUSE",
+        raising=False,
+    )
+    monkeypatch.delenv(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_MIXED_PREFIX_REUSE_MAX_TOKENS",
+        raising=False,
+    )
+    assert not _online_greedy_large_mixed_prefix_reuse_enabled(temperature=0.0, max_tokens=512)
+    assert not _online_greedy_large_mixed_prefix_reuse_enabled(temperature=0.0, max_tokens=511)
+    assert not _online_greedy_large_mixed_prefix_reuse_enabled(temperature=0.7, max_tokens=512)
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_MIXED_PREFIX_REUSE", "1")
+    assert _online_greedy_large_mixed_prefix_reuse_enabled(temperature=0.0, max_tokens=512)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_MIXED_PREFIX_REUSE", raising=False)
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_MIXED_PREFIX_REUSE", "0")
+    assert not _online_greedy_large_mixed_prefix_reuse_enabled(temperature=0.0, max_tokens=512)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_MIXED_PREFIX_REUSE", raising=False)
     assert _online_prefill_ready_before_decode_enabled(temperature=0.0, max_tokens=64)
     assert _online_prefill_ready_before_decode_active_cap(temperature=0.0, max_tokens=64) == 8
     assert not _online_prefill_ready_before_decode_enabled(temperature=0.0, max_tokens=256)
     assert not _online_prefill_ready_before_decode_enabled(temperature=0.0, max_tokens=400)
     assert _online_prefill_ready_before_decode_enabled(temperature=0.0, max_tokens=401)
+    assert _online_prefill_ready_before_decode_enabled(temperature=0.0, max_tokens=512)
     assert _online_prefill_ready_before_decode_active_cap(temperature=0.0, max_tokens=512) == 8
     assert not _online_prefill_ready_before_decode_enabled(temperature=0.0, max_tokens=513)
     assert not _online_prefill_ready_before_decode_enabled(temperature=0.7, max_tokens=256)
     assert _online_prefill_ready_before_decode_enabled(temperature=0.7, max_tokens=300)
-    assert _online_prefill_ready_before_decode_active_cap(temperature=0.7, max_tokens=300) == 10
+    assert _online_prefill_ready_before_decode_active_cap(temperature=0.7, max_tokens=300) == 32
     assert not _online_prefill_ready_before_decode_enabled(temperature=0.7, max_tokens=301)
     assert _online_prefill_ready_before_decode_active_cap(temperature=0.7, max_tokens=301) is None
 
@@ -9334,6 +9883,7 @@ def test_openai_online_prefill_ready_before_decode_respects_env(monkeypatch) -> 
     assert _online_prefill_ready_before_decode_active_cap(temperature=0.0, max_tokens=512) is None
     monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_PREFILL_READY_BEFORE_DECODE", raising=False)
     monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_GREEDY_LARGE_MIXED_PREFIX_REUSE", raising=False)
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_MIXED_PREFIX_REUSE", "0")
 
     monkeypatch.setenv(
         "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_PREFILL_READY_BEFORE_DECODE",
@@ -9905,6 +10455,40 @@ def test_openai_tp_stream_prequeue_admission_wait_uses_sampled_medium_default(
     assert _tp_stream_prequeue_admission_wait_ms(temperature=0.0, max_tokens=300) == 0.0
 
 
+def test_openai_tp_stream_prequeue_admission_wait_scopes_greedy_large_mixed_prefix(
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_STREAM_PREQUEUE_ADMISSION_WAIT_MS", raising=False)
+    monkeypatch.delenv(
+        "TORCHINFERNO_OPENAI_TP_GREEDY_LARGE_MIXED_PREFIX_STREAM_PREQUEUE_ADMISSION_WAIT_MS",
+        raising=False,
+    )
+    monkeypatch.delenv(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_MIXED_PREFIX_REUSE",
+        raising=False,
+    )
+    monkeypatch.delenv(
+        "TORCHINFERNO_CONTINUOUS_GREEDY_LARGE_MIXED_PREFIX_REUSE",
+        raising=False,
+    )
+
+    assert _tp_stream_prequeue_admission_wait_ms(temperature=0.0, max_tokens=512) == 0.0
+    assert _tp_stream_prequeue_admission_wait_ms(temperature=0.0, max_tokens=256) == 0.0
+    assert _tp_stream_prequeue_admission_wait_ms(temperature=0.7, max_tokens=512) == 0.0
+
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_MIXED_PREFIX_REUSE", "1")
+    assert _tp_stream_prequeue_admission_wait_ms(temperature=0.0, max_tokens=512) == 2.0
+
+    monkeypatch.setenv(
+        "TORCHINFERNO_OPENAI_TP_GREEDY_LARGE_MIXED_PREFIX_STREAM_PREQUEUE_ADMISSION_WAIT_MS",
+        "3",
+    )
+    assert _tp_stream_prequeue_admission_wait_ms(temperature=0.0, max_tokens=512) == 3.0
+
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_STREAM_PREQUEUE_ADMISSION_WAIT_MS", "4")
+    assert _tp_stream_prequeue_admission_wait_ms(temperature=0.0, max_tokens=512) == 4.0
+
+
 def test_openai_tp_stream_prequeue_admission_wait_respects_env_overrides(
     monkeypatch,
 ) -> None:
@@ -9964,6 +10548,22 @@ def test_openai_online_initial_batch_wait_uses_sampled_short_default(monkeypatch
         "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_INITIAL_BATCH_WAIT_MAX_TOKENS",
         raising=False,
     )
+    monkeypatch.delenv(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_MIXED_PREFIX_REUSE",
+        raising=False,
+    )
+    monkeypatch.delenv(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_MIXED_PREFIX_REUSE_MAX_TOKENS",
+        raising=False,
+    )
+    monkeypatch.delenv(
+        "TORCHINFERNO_CONTINUOUS_GREEDY_LARGE_MIXED_PREFIX_REUSE",
+        raising=False,
+    )
+    monkeypatch.delenv(
+        "TORCHINFERNO_CONTINUOUS_GREEDY_LARGE_MIXED_PREFIX_REUSE_MAX_TOKENS",
+        raising=False,
+    )
 
     assert _online_initial_batch_wait_ms(temperature=0.7, max_tokens=256) == 0.0
     assert _online_initial_batch_wait_ms(temperature=0.0, max_tokens=64) == 0.0
@@ -9976,6 +10576,13 @@ def test_openai_online_initial_batch_wait_uses_sampled_short_default(monkeypatch
     assert _online_initial_batch_wait_ms(temperature=0.7, max_tokens=257) == 1.0
     assert _online_initial_batch_wait_ms(temperature=0.7, max_tokens=300) == 1.0
     assert _online_initial_batch_wait_ms(temperature=0.7, max_tokens=301) == 1.0
+
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_MIXED_PREFIX_REUSE", "1")
+    assert _online_initial_batch_wait_ms(temperature=0.0, max_tokens=401) == 10.0
+    assert _online_initial_batch_wait_ms(temperature=0.0, max_tokens=512) == 5.0
+
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_MIXED_PREFIX_REUSE", "0")
+    assert _online_initial_batch_wait_ms(temperature=0.0, max_tokens=512) == 10.0
 
 
 def test_openai_online_initial_batch_wait_respects_env_overrides(monkeypatch) -> None:
@@ -10035,6 +10642,7 @@ def test_openai_online_initial_batch_wait_respects_env_overrides(monkeypatch) ->
         "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_INITIAL_BATCH_WAIT_MAX_TOKENS",
         "512",
     )
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_MIXED_PREFIX_REUSE", "1")
     assert _online_initial_batch_wait_ms(temperature=0.0, max_tokens=300) == 1.0
     assert _online_initial_batch_wait_ms(temperature=0.0, max_tokens=301) == 8.0
     assert _online_initial_batch_wait_ms(temperature=0.0, max_tokens=512) == 8.0
@@ -10051,6 +10659,7 @@ def test_online_common_prefix_prefill_warmup_filters_shapes(monkeypatch) -> None
     monkeypatch.delenv("TORCHINFERNO_OPENAI_WARMUP_ONLINE_GREEDY_COMMON_PREFIX_TOKENS", raising=False)
     monkeypatch.delenv("TORCHINFERNO_OPENAI_WARMUP_ONLINE_GREEDY_COMMON_PREFIX_SUFFIX_TOKENS", raising=False)
     monkeypatch.delenv("TORCHINFERNO_OPENAI_WARMUP_ONLINE_GREEDY_COMMON_PREFIX_SUFFIX_BATCHES", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_WARMUP_ONLINE_SAMPLED_COMMON_PREFIX_SUFFIX_TOKENS", raising=False)
     monkeypatch.delenv("TORCHINFERNO_OPENAI_WARMUP_ONLINE_MIXED_PREFIX_SUFFIX_PREFILL", raising=False)
     monkeypatch.delenv("TORCHINFERNO_OPENAI_WARMUP_ONLINE_MIXED_PREFIX_SUFFIX_SPECS", raising=False)
     monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_GREEDY_LARGE_MIXED_PREFIX_REUSE", raising=False)
@@ -10088,6 +10697,7 @@ def test_online_common_prefix_prefill_warmup_filters_shapes(monkeypatch) -> None
         32,
         48,
     )
+    assert _online_sampled_common_prefix_suffix_prefill_warmup_suffix_tokens(128) == (16,)
     assert _online_greedy_common_prefix_suffix_prefill_warmup_enabled()
     assert _online_greedy_common_prefix_suffix_prefill_warmup_max_token_values() == (128, 512)
     assert _online_greedy_common_prefix_suffix_prefill_warmup_max_tokens() == 512
@@ -10146,7 +10756,15 @@ def test_online_common_prefix_prefill_warmup_filters_shapes(monkeypatch) -> None
         warmup_temperature=1.0,
         warmup_max_tokens=256,
     ) == (1, 2, 4, 8, 16, 32)
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SUFFIX_BUCKETS", "8,16")
+    assert _online_sampled_common_prefix_suffix_prefill_warmup_suffix_tokens(128) == (8, 16)
+    monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SUFFIX_BUCKETS", raising=False)
     assert not _online_mixed_prefix_suffix_prefill_warmup_enabled()
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_MIXED_PREFIX_REUSE", "1")
+    assert _online_mixed_prefix_suffix_prefill_warmup_enabled()
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_MIXED_PREFIX_REUSE", "0")
+    assert not _online_mixed_prefix_suffix_prefill_warmup_enabled()
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_MIXED_PREFIX_REUSE", raising=False)
     monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_GREEDY_LARGE_MIXED_PREFIX_REUSE", "1")
     assert _online_mixed_prefix_suffix_prefill_warmup_enabled()
     monkeypatch.setenv("TORCHINFERNO_OPENAI_WARMUP_ONLINE_MIXED_PREFIX_SUFFIX_PREFILL", "0")
@@ -10187,6 +10805,8 @@ def test_online_common_prefix_prefill_warmup_filters_shapes(monkeypatch) -> None
     monkeypatch.setenv("TORCHINFERNO_OPENAI_WARMUP_ONLINE_GREEDY_COMMON_PREFIX_TOKENS", "8,256")
     monkeypatch.setenv("TORCHINFERNO_OPENAI_WARMUP_ONLINE_GREEDY_COMMON_PREFIX_SUFFIX_TOKENS", "4,8,256")
     monkeypatch.setenv("TORCHINFERNO_OPENAI_WARMUP_ONLINE_GREEDY_COMMON_PREFIX_SUFFIX_BATCHES", "4,64")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_WARMUP_ONLINE_SAMPLED_COMMON_PREFIX_SUFFIX_TOKENS", "8,16,256")
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SUFFIX_BUCKETS", "12,16")
     monkeypatch.setenv("TORCHINFERNO_OPENAI_WARMUP_ONLINE_MIXED_PREFIX_SUFFIX_PREFILL", "1")
     monkeypatch.setenv(
         "TORCHINFERNO_OPENAI_WARMUP_ONLINE_MIXED_PREFIX_SUFFIX_SPECS",
@@ -10208,6 +10828,7 @@ def test_online_common_prefix_prefill_warmup_filters_shapes(monkeypatch) -> None
     assert _online_greedy_common_prefix_suffix_prefill_warmup_prefix_tokens(128) == (8,)
     assert _online_greedy_common_prefix_suffix_prefill_warmup_suffix_tokens(128) == (4, 8)
     assert _online_greedy_common_prefix_suffix_prefill_warmup_batches(64, 128) == (4, 64)
+    assert _online_sampled_common_prefix_suffix_prefill_warmup_suffix_tokens(128) == (8, 16)
     assert _online_mixed_prefix_suffix_prefill_warmup_enabled()
     assert _online_mixed_prefix_suffix_prefill_warmup_specs(
         16,
@@ -10469,6 +11090,163 @@ def test_openai_greedy_common_prefix_suffix_warmup_captures_target_shapes(monkey
         ((2, 64), -256, 8),
         ((2, 16), -256, 8),
     ]
+
+
+def test_openai_chunked_prefill_warmup_captures_cache_and_logits_dynamic_contexts(monkeypatch) -> None:
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_FP8_PREFILL", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_FP8_PREFILL", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_DYNAMIC_PREFIX_PREFILL_GRAPH", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_DYNAMIC_PREFIX_PREFILL_MAX_SUFFIX", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SUFFIX_BUCKETS", raising=False)
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_WARMUP_ONLINE_CHUNKED_PREFILL_BATCHES", "1,4")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_WARMUP_ONLINE_CHUNKED_PREFILL_CONTEXT_BUCKETS", "64,128")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_WARMUP_ONLINE_CHUNKED_PREFILL_LOGIT_CONTEXT_BUCKETS", "128")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_WARMUP_ONLINE_CHUNKED_PREFILL_FP8_MIN_M", "128")
+
+    class ChunkedPrefillWarmupCache:
+        def __init__(self) -> None:
+            self.seq_len = -1
+            self.reset_count = 0
+
+        def set_seq_len(self, seq_len: int) -> None:
+            self.seq_len = seq_len
+
+        def reset(self) -> None:
+            self.reset_count += 1
+            self.seq_len = 0
+
+    class ChunkedPrefillWarmupModel:
+        def __init__(self) -> None:
+            self.fp8_calls: list[tuple[bool, int]] = []
+            self.cache_calls: list[
+                tuple[tuple[int, int], int, tuple[int, ...], tuple[int, ...], bool]
+            ] = []
+            self.logits_calls: list[
+                tuple[tuple[int, int], int, tuple[int, ...], tuple[int, ...], tuple[int, ...]]
+            ] = []
+
+        def set_runtime_fp8_prefill(self, enabled: bool, *, min_m: int) -> None:
+            self.fp8_calls.append((enabled, min_m))
+
+        def try_prefill_ragged_cache_graph(
+            self,
+            input_ids: torch.Tensor,
+            cache: ChunkedPrefillWarmupCache,
+            *,
+            seq_lens: torch.Tensor,
+            row_indices: torch.Tensor | None = None,
+            context_len: int | None = None,
+            capture_on_miss: bool = False,
+        ) -> bool:
+            del cache
+            self.cache_calls.append(
+                (
+                    (input_ids.size(0), input_ids.size(1)),
+                    int(context_len or 0),
+                    tuple(int(value) for value in seq_lens.tolist()),
+                    tuple(int(value) for value in (row_indices.tolist() if row_indices is not None else [])),
+                    capture_on_miss,
+                )
+            )
+            return True
+
+        def try_prefill_ragged_logits_graph(
+            self,
+            input_ids: torch.Tensor,
+            cache: ChunkedPrefillWarmupCache,
+            *,
+            seq_lens: torch.Tensor,
+            row_indices: torch.Tensor | None = None,
+            logit_positions: torch.Tensor,
+            context_len: int | None = None,
+        ) -> torch.Tensor:
+            del cache
+            self.logits_calls.append(
+                (
+                    (input_ids.size(0), input_ids.size(1)),
+                    int(context_len or 0),
+                    tuple(int(value) for value in seq_lens.tolist()),
+                    tuple(int(value) for value in (row_indices.tolist() if row_indices is not None else [])),
+                    tuple(int(value) for value in logit_positions.tolist()),
+                )
+            )
+            return torch.zeros(input_ids.size(0), 1, 1)
+
+    original_arange = torch.arange
+    original_zeros = torch.zeros
+    original_full = torch.full
+    original_tensor = torch.tensor
+
+    def cpu_arange(*args, **kwargs) -> torch.Tensor:  # noqa: ANN002, ANN003
+        kwargs.pop("device", None)
+        return original_arange(*args, **kwargs)
+
+    def cpu_zeros(*args, **kwargs) -> torch.Tensor:  # noqa: ANN002, ANN003
+        kwargs.pop("device", None)
+        return original_zeros(*args, **kwargs)
+
+    def cpu_full(*args, **kwargs) -> torch.Tensor:  # noqa: ANN002, ANN003
+        kwargs.pop("device", None)
+        return original_full(*args, **kwargs)
+
+    def cpu_tensor(*args, **kwargs) -> torch.Tensor:  # noqa: ANN002, ANN003
+        kwargs.pop("device", None)
+        return original_tensor(*args, **kwargs)
+
+    monkeypatch.setattr("torchinferno.openai_server.torch.arange", cpu_arange)
+    monkeypatch.setattr("torchinferno.openai_server.torch.zeros", cpu_zeros)
+    monkeypatch.setattr("torchinferno.openai_server.torch.full", cpu_full)
+    monkeypatch.setattr("torchinferno.openai_server.torch.tensor", cpu_tensor)
+
+    model = ChunkedPrefillWarmupModel()
+    cache = ChunkedPrefillWarmupCache()
+    engine = object.__new__(OpenAICompletionEngine)
+    engine.model = model
+    engine.device = torch.device("cuda")
+
+    engine._warmup_online_chunked_prefill_graphs(
+        cache,
+        vocab_size=17,
+        cache_rows=8,
+        max_active=4,
+        max_seq_len=256,
+        prefill_chunk=64,
+        warmup_max_tokens=128,
+    )
+
+    assert model.fp8_calls == [(True, 128), (False, 2048)]
+    assert model.cache_calls == [
+        ((1, 64), -64, (0,), (0,), True),
+        ((1, 64), -128, (64,), (0,), True),
+        ((4, 64), -64, (0, 0, 0, 0), (0, 1, 2, 3), True),
+        ((4, 64), -128, (64, 64, 64, 64), (0, 1, 2, 3), True),
+    ]
+    assert model.logits_calls == [
+        ((1, 64), -128, (64,), (0,), (63,)),
+        ((4, 64), -128, (64, 64, 64, 64), (0, 1, 2, 3), (63, 63, 63, 63)),
+    ]
+    assert cache.reset_count == 9
+    assert cache.seq_len == 0
+
+
+def test_openai_chunked_prefill_warmup_uses_runtime_batch_buckets(monkeypatch) -> None:
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_WARMUP_ONLINE_CHUNKED_PREFILL_BATCHES", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_BATCH_BUCKETS_GREEDY_SHORT", raising=False)
+
+    assert _online_chunked_prefill_warmup_batches(
+        128,
+        64,
+        warmup_temperature=0.0,
+        warmup_max_tokens=96,
+    ) == (1, 2, 4, 8, 16, 24, 32, 64)
+
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_WARMUP_ONLINE_CHUNKED_PREFILL_BATCHES", "3,5")
+    assert _online_chunked_prefill_warmup_batches(
+        128,
+        64,
+        warmup_temperature=0.0,
+        warmup_max_tokens=96,
+    ) == (3, 5)
 
 
 def test_openai_mixed_prefix_suffix_warmup_captures_source_row_graphs(monkeypatch) -> None:
@@ -13493,6 +14271,10 @@ def test_openai_queue_profile_records_runtime_engine_stats(
         decode_many_stop_finishes = 3
         decode_many_limit_finishes = 2
         decode_many_cpu_tokens_ms = 2.75
+        decode_many_model_ms = 14.25
+        decode_many_model_gpu_ms = 13.75
+        decode_many_state_syncs = 5
+        decode_many_state_sync_skips = 7
         decode_many_tail_limited_calls = 4
         decode_many_tail_limited_steps = 9
         decode_many_shape_model_tokens = {"decode_many:b8/8": 19}
@@ -13501,12 +14283,106 @@ def test_openai_queue_profile_records_runtime_engine_stats(
         decode_many_shape_skipped_tokens = {"decode_many:b8/8": 4}
         decode_many_shape_stop_finishes = {"decode_many:b8/8": 3}
         decode_many_shape_limit_finishes = {"decode_many:b8/8": 2}
+        decode_many_shape_model_ms = {"decode_many:b8/8": 14.25}
+        decode_many_shape_gpu_ms = {"decode_many:b8/8": 13.75}
+        decode_many_step_window_counts = {"decode_many:b8/8:g1-16": 3}
+        decode_many_step_window_model_tokens = {"decode_many:b8/8:g1-16": 19}
+        decode_many_step_window_padded_tokens = {"decode_many:b8/8:g1-16": 24}
+        decode_many_step_window_emitted_tokens = {"decode_many:b8/8:g1-16": 15}
+        decode_many_step_window_skipped_tokens = {"decode_many:b8/8:g1-16": 4}
+        decode_many_step_window_model_ms = {"decode_many:b8/8:g1-16": 14.25}
+        prefill_packed_eager_calls = 1
+        prefill_packed_eager_tokens = 31
+        prefill_packed_eager_model_tokens = 48
+        prefill_packed_eager_saved_tokens = 17
+        prefill_packed_eager_ms = 4.25
+        prefill_packed_flashinfer_calls = 2
+        prefill_packed_flashinfer_tokens = 40
+        prefill_packed_flashinfer_model_tokens = 64
+        prefill_packed_flashinfer_saved_tokens = 24
+        prefill_packed_flashinfer_ms = 6.5
+        prefill_packed_eager_shape_counts = {
+            "prefix_graph:b8:s16:p45-45:src1:mixed0": 1,
+        }
+        prefill_packed_eager_shape_tokens = {
+            "prefix_graph:b8:s16:p45-45:src1:mixed0": 31,
+        }
+        prefill_packed_eager_shape_model_tokens = {
+            "prefix_graph:b8:s16:p45-45:src1:mixed0": 48,
+        }
+        prefill_packed_eager_shape_saved_tokens = {
+            "prefix_graph:b8:s16:p45-45:src1:mixed0": 17,
+        }
+        prefill_packed_eager_shape_ms = {
+            "prefix_graph:b8:s16:p45-45:src1:mixed0": 4.25,
+        }
+        prefill_packed_candidate_calls = 3
+        prefill_packed_candidate_tokens = 31
+        prefill_packed_candidate_model_tokens = 48
+        prefill_packed_candidate_saved_tokens = 17
+        prefill_packed_candidate_groups = 5
+        prefill_packed_candidate_shape_counts = {
+            "prefix_graph:b8:s16:p45-45:src1:mixed0": 3,
+        }
+        prefill_packed_candidate_shape_tokens = {
+            "prefix_graph:b8:s16:p45-45:src1:mixed0": 31,
+        }
+        prefill_packed_candidate_shape_model_tokens = {
+            "prefix_graph:b8:s16:p45-45:src1:mixed0": 48,
+        }
+        prefill_packed_candidate_shape_saved_tokens = {
+            "prefix_graph:b8:s16:p45-45:src1:mixed0": 17,
+        }
+        prefill_packed_candidate_shape_groups = {
+            "prefix_graph:b8:s16:p45-45:src1:mixed0": 5,
+        }
+        prefill_packed_candidate_signature_counts = {
+            "prefix_graph:b8:s16:p45-45:src1:mixed0|p45:s10:n2/p45:s11:n1": 3,
+        }
+        prefill_packed_candidate_signature_tokens = {
+            "prefix_graph:b8:s16:p45-45:src1:mixed0|p45:s10:n2/p45:s11:n1": 31,
+        }
+        prefill_packed_candidate_signature_model_tokens = {
+            "prefix_graph:b8:s16:p45-45:src1:mixed0|p45:s10:n2/p45:s11:n1": 48,
+        }
+        prefill_packed_candidate_signature_saved_tokens = {
+            "prefix_graph:b8:s16:p45-45:src1:mixed0|p45:s10:n2/p45:s11:n1": 17,
+        }
+        prefill_packed_candidate_signature_groups = {
+            "prefix_graph:b8:s16:p45-45:src1:mixed0|p45:s10:n2/p45:s11:n1": 5,
+        }
+        prefill_packed_candidate_pattern_counts = {
+            "prefix_graph:b8:s16:p45-45:src1:mixed0|p45:s10/p45:s11": 3,
+        }
+        prefill_packed_candidate_pattern_tokens = {
+            "prefix_graph:b8:s16:p45-45:src1:mixed0|p45:s10/p45:s11": 31,
+        }
+        prefill_packed_candidate_pattern_model_tokens = {
+            "prefix_graph:b8:s16:p45-45:src1:mixed0|p45:s10/p45:s11": 48,
+        }
+        prefill_packed_candidate_pattern_saved_tokens = {
+            "prefix_graph:b8:s16:p45-45:src1:mixed0|p45:s10/p45:s11": 17,
+        }
+        prefill_packed_candidate_pattern_groups = {
+            "prefix_graph:b8:s16:p45-45:src1:mixed0|p45:s10/p45:s11": 5,
+        }
+        prefill_packed_candidate_pattern_slot_counts = {
+            "prefix_graph:b8:s16:p45-45:src1:mixed0|p45:s10/p45:s11#p45:s10": 2,
+            "prefix_graph:b8:s16:p45-45:src1:mixed0|p45:s10/p45:s11#p45:s11": 1,
+        }
         prefill_graph_captures = 1
         prefill_graph_replays = 2
         prefill_graph_capture_ms = 9.5
         prefill_graph_replay_ms = 1.25
         prefix_reuse_requests = 7
         prefix_reuse_tokens = 53
+        prefix_reuse_candidate_tokens = 59
+        prefix_reuse_page_aligned_tokens = 53
+        prefix_reuse_alignment_loss_tokens = 6
+        prefix_reuse_forced_suffix_tokens = 1
+        prefix_reuse_candidate_token_counts = {"45": 5, "14": 2}
+        prefix_reuse_alignment_loss_token_counts = {"1": 4, "2": 1}
+        prefix_reuse_page_size_counts = {"16": 7}
         full_prompt_store_requests = 4
         full_prompt_store_stored_requests = 1
         full_prompt_store_deferred_requests = 2
@@ -13517,6 +14393,24 @@ def test_openai_queue_profile_records_runtime_engine_stats(
         full_prompt_store_skipped_tokens = 17
         full_prompt_store_skip_reason_counts = {"pinned_without_allowance": 1}
         full_prompt_store_skip_reason_tokens = {"pinned_without_allowance": 17}
+        full_prompt_reuse_candidate_stored_requests = 3
+        full_prompt_reuse_candidate_stored_tokens = 52
+        full_prompt_reuse_candidate_requests = 1
+        full_prompt_reuse_candidate_tokens = 17
+        full_prompt_reuse_candidate_extra_tokens = 1
+        full_prompt_reuse_candidate_suffix_tokens = 1
+        full_prompt_reuse_candidate_token_counts = {"17": 1}
+        full_prompt_reuse_candidate_extra_token_counts = {"1": 1}
+        full_prompt_reuse_candidate_suffix_token_counts = {"1": 1}
+        persistent_full_prompt_reuse_candidate_stored_requests = 4
+        persistent_full_prompt_reuse_candidate_stored_tokens = 68
+        persistent_full_prompt_reuse_candidate_requests = 2
+        persistent_full_prompt_reuse_candidate_tokens = 34
+        persistent_full_prompt_reuse_candidate_extra_tokens = 3
+        persistent_full_prompt_reuse_candidate_suffix_tokens = 5
+        persistent_full_prompt_reuse_candidate_token_counts = {"17": 2}
+        persistent_full_prompt_reuse_candidate_extra_token_counts = {"1": 1, "2": 1}
+        persistent_full_prompt_reuse_candidate_suffix_token_counts = {"2": 1, "3": 1}
         queued_requests = 11
         scheduler_steps = 6
         max_model_batch_size = 8
@@ -13556,6 +14450,14 @@ def test_openai_queue_profile_records_runtime_engine_stats(
         prefill_shape_model_tokens = {
             "prefix_graph:b8:s16:p45-45:src1:mixed0": 48,
         }
+        prefill_shape_real_batch_counts = {
+            "prefix_graph:b8:s16:p45-45:src1:mixed0|real_b3": 1,
+            "prefix_graph:b8:s16:p45-45:src1:mixed0|real_b2": 2,
+        }
+        prefill_shape_suffix_length_counts = {
+            "prefix_graph:b8:s16:p45-45:src1:mixed0|suffix10": 2,
+            "prefix_graph:b8:s16:p45-45:src1:mixed0|suffix11": 1,
+        }
         prefill_shape_route_counts = {
             "prefix_graph:b8:s16:p45-45:src1:mixed0|route=common_prefix": 2,
             "prefix_graph:b8:s16:p45-45:src1:mixed0|route=request_prompt": 1,
@@ -13568,14 +14470,62 @@ def test_openai_queue_profile_records_runtime_engine_stats(
             "prefix_graph:b8:s16:p45-45:src1:mixed0|route=common_prefix": 90,
             "prefix_graph:b8:s16:p45-45:src1:mixed0|route=request_prompt": 57,
         }
+        prefill_shape_graph_capture_counts = {
+            "prefix_graph:b8:s16:p45-45:src1:mixed0": 1,
+        }
+        prefill_shape_graph_replay_counts = {
+            "prefix_graph:b8:s16:p45-45:src1:mixed0": 2,
+        }
+        prefill_shape_graph_miss_counts = {
+            "prefix_graph:b4:s16:p45-45:src4:mixed1": 2,
+        }
+        prefill_shape_graph_capture_ms = {
+            "prefix_graph:b8:s16:p45-45:src1:mixed0": 8.75,
+        }
+        prefill_shape_graph_replay_ms = {
+            "prefix_graph:b8:s16:p45-45:src1:mixed0": 1.5,
+        }
         prefill_graph_capture_shape_counts = {
             "ragged_prefill:b8:s16:rows1:ctx-256:src1": 1,
+        }
+        prefill_graph_miss_shape_counts = {
+            "ragged_prefill:b4:s16:rows1:ctx-256:src4": 2,
+        }
+        prefill_suffix_graph_attempts = 3
+        prefill_suffix_graph_captures = 1
+        prefill_suffix_graph_replays = 2
+        prefill_suffix_graph_fallbacks = 1
+        prefill_suffix_graph_failures = 0
+        prefill_suffix_graph_attempt_shape_counts = {
+            "paged_prefix_graph:b2/2:s16": 3,
+        }
+        prefill_suffix_graph_capture_shape_counts = {
+            "paged_prefix_graph:b2/2:s16": 1,
+        }
+        prefill_suffix_graph_replay_shape_counts = {
+            "paged_prefix_graph:b2/2:s16": 2,
+        }
+        prefill_suffix_graph_fallback_shape_counts = {
+            "paged_prefix_graph:b2/2:s16": 1,
+        }
+        prefill_suffix_graph_failure_shape_counts = {}
+        prefill_graph_capture_shape_ms = {
+            "ragged_prefill:b8:s16:rows1:ctx-256:src1": 8.75,
+        }
+        prefill_graph_replay_shape_ms = {
+            "ragged_prefill:b8:s16:rows1:ctx-256:src1": 1.5,
         }
         decode_graph_capture_shape_counts = {
             "ragged_decode:token:b8:rows1": 1,
         }
         decode_graph_miss_shape_counts = {
             "ragged_decode:logits:b4:rows1": 2,
+        }
+        decode_graph_capture_shape_ms = {
+            "ragged_decode:token:b8:rows1": 8.75,
+        }
+        decode_graph_replay_shape_ms = {
+            "ragged_decode:token:b8:rows1": 1.5,
         }
         decode_shape_counts = {"ragged:b8/8": 5}
         decode_shape_model_ms = {"ragged:b8/8": 11.0}
@@ -13587,6 +14537,10 @@ def test_openai_queue_profile_records_runtime_engine_stats(
             (101, 8, 16, 4096, True, -1, -1, 1, (False,), 64): object(),
             (102, 8, 16, 4096, True, -1, -1, 1, (False,), 64): object(),
         }
+        _ragged_decode_graphs = {
+            (201, 8, 4096, 1024, True, (64, 8)): object(),
+            (202, 8, 4096, 1024, True, (64, 8)): object(),
+        }
         _ragged_prefill_logits_graph_evictions = 2
         _ragged_prefill_logits_graph_evicted_entries = 128
         _ragged_prefill_logits_graph_max_entries = 64
@@ -13594,6 +14548,8 @@ def test_openai_queue_profile_records_runtime_engine_stats(
     class RuntimeEngine:
         stats = Stats()
         model = Model()
+        max_active_requests = 96
+        prefix_cache_capacity = 128
 
     engine._record_runtime_engine_queue_profile(
         "online_batcher",
@@ -13616,6 +14572,14 @@ def test_openai_queue_profile_records_runtime_engine_stats(
             "runtime_decode_graph_replays": 2,
             "runtime_decode_graph_capture_ms": 8.5,
             "runtime_decode_graph_replay_ms": 1.75,
+            "runtime_decode_graph_cache_live_batch_counts": {"b8": 2},
+            "runtime_decode_graph_cache_live_cache_bucket_counts": {"cache1024": 2},
+            "runtime_decode_graph_cache_live_context_counts": {"ctx4096": 2},
+            "runtime_decode_graph_cache_live_entries": 2,
+            "runtime_decode_graph_cache_live_shape_counts": {
+                "ragged_decode:b8:ctx4096:cache1024:rows1:symm(64,8)": 2,
+            },
+            "runtime_decode_graph_cache_live_symm_counts": {"symm(64,8)": 2},
             "runtime_decode_many_calls": 2,
             "runtime_decode_many_emitted_tokens": 15,
             "runtime_decode_many_limit_finishes": 2,
@@ -13625,6 +14589,10 @@ def test_openai_queue_profile_records_runtime_engine_stats(
             "runtime_decode_many_steps": 6,
             "runtime_decode_many_stop_finishes": 3,
             "runtime_decode_many_cpu_tokens_ms": 2.75,
+            "runtime_decode_many_model_ms": 14.25,
+            "runtime_decode_many_model_gpu_ms": 13.75,
+            "runtime_decode_many_state_syncs": 5,
+            "runtime_decode_many_state_sync_skips": 7,
             "runtime_decode_many_tail_limited_calls": 4,
             "runtime_decode_many_tail_limited_steps": 9,
             "runtime_decode_many_shape_model_tokens": {"decode_many:b8/8": 19},
@@ -13633,6 +14601,19 @@ def test_openai_queue_profile_records_runtime_engine_stats(
             "runtime_decode_many_shape_skipped_tokens": {"decode_many:b8/8": 4},
             "runtime_decode_many_shape_stop_finishes": {"decode_many:b8/8": 3},
             "runtime_decode_many_shape_limit_finishes": {"decode_many:b8/8": 2},
+            "runtime_decode_many_step_window_counts": {"decode_many:b8/8:g1-16": 3},
+            "runtime_decode_many_step_window_model_tokens": {
+                "decode_many:b8/8:g1-16": 19,
+            },
+            "runtime_decode_many_step_window_padded_tokens": {
+                "decode_many:b8/8:g1-16": 24,
+            },
+            "runtime_decode_many_step_window_emitted_tokens": {
+                "decode_many:b8/8:g1-16": 15,
+            },
+            "runtime_decode_many_step_window_skipped_tokens": {
+                "decode_many:b8/8:g1-16": 4,
+            },
             "runtime_decode_many_padding_tokens": 5,
             "runtime_decode_many_shape_padding_tokens": {"decode_many:b8/8": 5},
             "runtime_decode_many_overgenerated_tokens": 4,
@@ -13640,9 +14621,26 @@ def test_openai_queue_profile_records_runtime_engine_stats(
             "runtime_decode_model_calls": 5,
             "runtime_decode_ragged_model_gpu_ms": 12.5,
             "runtime_decode_tokens": 31,
+            "runtime_max_active_requests": 96,
             "runtime_max_model_batch_size": 8,
             "runtime_persistent_cache_rows": 12,
+            "runtime_prefix_cache_capacity": 128,
             "runtime_prefill_batches": 2,
+            "runtime_prefill_packed_eager_calls": 1,
+            "runtime_prefill_packed_eager_tokens": 31,
+            "runtime_prefill_packed_eager_model_tokens": 48,
+            "runtime_prefill_packed_eager_saved_tokens": 17,
+            "runtime_prefill_packed_eager_ms": 4.25,
+            "runtime_prefill_packed_flashinfer_calls": 2,
+            "runtime_prefill_packed_flashinfer_tokens": 40,
+            "runtime_prefill_packed_flashinfer_model_tokens": 64,
+            "runtime_prefill_packed_flashinfer_saved_tokens": 24,
+            "runtime_prefill_packed_flashinfer_ms": 6.5,
+            "runtime_prefill_packed_candidate_calls": 3,
+            "runtime_prefill_packed_candidate_groups": 5,
+            "runtime_prefill_packed_candidate_model_tokens": 48,
+            "runtime_prefill_packed_candidate_saved_tokens": 17,
+            "runtime_prefill_packed_candidate_tokens": 31,
             "runtime_prefill_graph_capture_ms": 9.5,
             "runtime_prefill_graph_cache_evicted_entries": 128,
             "runtime_prefill_graph_cache_evictions": 2,
@@ -13656,15 +14654,48 @@ def test_openai_queue_profile_records_runtime_engine_stats(
             "runtime_prefill_graph_captures": 1,
             "runtime_prefill_graph_replay_ms": 1.25,
             "runtime_prefill_graph_replays": 2,
+            "runtime_prefill_suffix_graph_attempts": 3,
+            "runtime_prefill_suffix_graph_captures": 1,
+            "runtime_prefill_suffix_graph_replays": 2,
+            "runtime_prefill_suffix_graph_fallbacks": 1,
+            "runtime_prefill_suffix_graph_failures": 0,
             "runtime_prefill_model_calls": 2,
             "runtime_prefill_graph_capture_shape_counts": {
                 "ragged_prefill:b8:s16:rows1:ctx-256:src1": 1,
+            },
+            "runtime_prefill_graph_miss_shape_counts": {
+                "ragged_prefill:b4:s16:rows1:ctx-256:src4": 2,
+            },
+            "runtime_prefill_suffix_graph_attempt_shape_counts": {
+                "paged_prefix_graph:b2/2:s16": 3,
+            },
+            "runtime_prefill_suffix_graph_capture_shape_counts": {
+                "paged_prefix_graph:b2/2:s16": 1,
+            },
+            "runtime_prefill_suffix_graph_replay_shape_counts": {
+                "paged_prefix_graph:b2/2:s16": 2,
+            },
+            "runtime_prefill_suffix_graph_fallback_shape_counts": {
+                "paged_prefix_graph:b2/2:s16": 1,
+            },
+            "runtime_prefill_suffix_graph_failure_shape_counts": {},
+            "runtime_prefill_graph_capture_shape_ms": {
+                "ragged_prefill:b8:s16:rows1:ctx-256:src1": 8.75,
+            },
+            "runtime_prefill_graph_replay_shape_ms": {
+                "ragged_prefill:b8:s16:rows1:ctx-256:src1": 1.5,
             },
             "runtime_decode_graph_capture_shape_counts": {
                 "ragged_decode:token:b8:rows1": 1,
             },
             "runtime_decode_graph_miss_shape_counts": {
                 "ragged_decode:logits:b4:rows1": 2,
+            },
+            "runtime_decode_graph_capture_shape_ms": {
+                "ragged_decode:token:b8:rows1": 8.75,
+            },
+            "runtime_decode_graph_replay_shape_ms": {
+                "ragged_decode:token:b8:rows1": 1.5,
             },
             "runtime_prefill_shape_counts": {
                 "prefix_graph:b8:s16:p45-45:src1:mixed0": 3,
@@ -13701,6 +14732,14 @@ def test_openai_queue_profile_records_runtime_engine_stats(
             "runtime_prefill_shape_model_tokens": {
                 "prefix_graph:b8:s16:p45-45:src1:mixed0": 48,
             },
+            "runtime_prefill_shape_real_batch_counts": {
+                "prefix_graph:b8:s16:p45-45:src1:mixed0|real_b2": 2,
+                "prefix_graph:b8:s16:p45-45:src1:mixed0|real_b3": 1,
+            },
+            "runtime_prefill_shape_suffix_length_counts": {
+                "prefix_graph:b8:s16:p45-45:src1:mixed0|suffix10": 2,
+                "prefix_graph:b8:s16:p45-45:src1:mixed0|suffix11": 1,
+            },
             "runtime_prefill_shape_route_counts": {
                 "prefix_graph:b8:s16:p45-45:src1:mixed0|route=common_prefix": 2,
                 "prefix_graph:b8:s16:p45-45:src1:mixed0|route=request_prompt": 1,
@@ -13712,6 +14751,95 @@ def test_openai_queue_profile_records_runtime_engine_stats(
             "runtime_prefill_shape_route_reuse_tokens": {
                 "prefix_graph:b8:s16:p45-45:src1:mixed0|route=common_prefix": 90,
                 "prefix_graph:b8:s16:p45-45:src1:mixed0|route=request_prompt": 57,
+            },
+            "runtime_prefill_shape_graph_capture_counts": {
+                "prefix_graph:b8:s16:p45-45:src1:mixed0": 1,
+            },
+            "runtime_prefill_shape_graph_replay_counts": {
+                "prefix_graph:b8:s16:p45-45:src1:mixed0": 2,
+            },
+            "runtime_prefill_shape_graph_miss_counts": {
+                "prefix_graph:b4:s16:p45-45:src4:mixed1": 2,
+            },
+            "runtime_prefill_packed_eager_shape_counts": {
+                "prefix_graph:b8:s16:p45-45:src1:mixed0": 1,
+            },
+            "runtime_prefill_packed_eager_shape_tokens": {
+                "prefix_graph:b8:s16:p45-45:src1:mixed0": 31,
+            },
+            "runtime_prefill_packed_eager_shape_model_tokens": {
+                "prefix_graph:b8:s16:p45-45:src1:mixed0": 48,
+            },
+            "runtime_prefill_packed_eager_shape_saved_tokens": {
+                "prefix_graph:b8:s16:p45-45:src1:mixed0": 17,
+            },
+            "runtime_prefill_packed_candidate_shape_counts": {
+                "prefix_graph:b8:s16:p45-45:src1:mixed0": 3,
+            },
+            "runtime_prefill_packed_candidate_shape_tokens": {
+                "prefix_graph:b8:s16:p45-45:src1:mixed0": 31,
+            },
+            "runtime_prefill_packed_candidate_shape_model_tokens": {
+                "prefix_graph:b8:s16:p45-45:src1:mixed0": 48,
+            },
+            "runtime_prefill_packed_candidate_shape_saved_tokens": {
+                "prefix_graph:b8:s16:p45-45:src1:mixed0": 17,
+            },
+            "runtime_prefill_packed_candidate_shape_groups": {
+                "prefix_graph:b8:s16:p45-45:src1:mixed0": 5,
+            },
+            "runtime_prefill_packed_candidate_signature_keys": 1,
+            "runtime_prefill_packed_candidate_signature_calls": 3,
+            "runtime_prefill_packed_candidate_signature_repeated_keys": 1,
+            "runtime_prefill_packed_candidate_signature_repeated_calls": 3,
+            "runtime_prefill_packed_candidate_signature_repeated_saved_tokens": 17,
+            "runtime_prefill_packed_candidate_signature_counts": {
+                "prefix_graph:b8:s16:p45-45:src1:mixed0|p45:s10:n2/p45:s11:n1": 3,
+            },
+            "runtime_prefill_packed_candidate_signature_tokens": {
+                "prefix_graph:b8:s16:p45-45:src1:mixed0|p45:s10:n2/p45:s11:n1": 31,
+            },
+            "runtime_prefill_packed_candidate_signature_model_tokens": {
+                "prefix_graph:b8:s16:p45-45:src1:mixed0|p45:s10:n2/p45:s11:n1": 48,
+            },
+            "runtime_prefill_packed_candidate_signature_saved_tokens": {
+                "prefix_graph:b8:s16:p45-45:src1:mixed0|p45:s10:n2/p45:s11:n1": 17,
+            },
+            "runtime_prefill_packed_candidate_signature_groups": {
+                "prefix_graph:b8:s16:p45-45:src1:mixed0|p45:s10:n2/p45:s11:n1": 5,
+            },
+            "runtime_prefill_packed_candidate_pattern_keys": 1,
+            "runtime_prefill_packed_candidate_pattern_calls": 3,
+            "runtime_prefill_packed_candidate_pattern_repeated_keys": 1,
+            "runtime_prefill_packed_candidate_pattern_repeated_calls": 3,
+            "runtime_prefill_packed_candidate_pattern_repeated_saved_tokens": 17,
+            "runtime_prefill_packed_candidate_pattern_counts": {
+                "prefix_graph:b8:s16:p45-45:src1:mixed0|p45:s10/p45:s11": 3,
+            },
+            "runtime_prefill_packed_candidate_pattern_tokens": {
+                "prefix_graph:b8:s16:p45-45:src1:mixed0|p45:s10/p45:s11": 31,
+            },
+            "runtime_prefill_packed_candidate_pattern_model_tokens": {
+                "prefix_graph:b8:s16:p45-45:src1:mixed0|p45:s10/p45:s11": 48,
+            },
+            "runtime_prefill_packed_candidate_pattern_saved_tokens": {
+                "prefix_graph:b8:s16:p45-45:src1:mixed0|p45:s10/p45:s11": 17,
+            },
+            "runtime_prefill_packed_candidate_pattern_groups": {
+                "prefix_graph:b8:s16:p45-45:src1:mixed0|p45:s10/p45:s11": 5,
+            },
+            "runtime_prefill_packed_candidate_pattern_slot_counts": {
+                "prefix_graph:b8:s16:p45-45:src1:mixed0|p45:s10/p45:s11#p45:s10": 2,
+                "prefix_graph:b8:s16:p45-45:src1:mixed0|p45:s10/p45:s11#p45:s11": 1,
+            },
+            "runtime_prefill_shape_graph_capture_ms": {
+                "prefix_graph:b8:s16:p45-45:src1:mixed0": 8.75,
+            },
+            "runtime_prefill_shape_graph_replay_ms": {
+                "prefix_graph:b8:s16:p45-45:src1:mixed0": 1.5,
+            },
+            "runtime_prefill_packed_eager_shape_ms": {
+                "prefix_graph:b8:s16:p45-45:src1:mixed0": 4.25,
             },
             "runtime_prefill_padding_tokens": 17,
             "runtime_prefill_shape_padding_tokens": {
@@ -13730,6 +14858,11 @@ def test_openai_queue_profile_records_runtime_engine_stats(
             "runtime_decode_shape_model_ms": {"ragged:b8/8": 11.0},
             "runtime_decode_shape_gpu_ms": {"ragged:b8/8": 10.5},
             "runtime_decode_shape_cpu_tokens_ms": {"ragged:b8/8": 1.25},
+            "runtime_decode_many_shape_model_ms": {"decode_many:b8/8": 14.25},
+            "runtime_decode_many_shape_gpu_ms": {"decode_many:b8/8": 13.75},
+            "runtime_decode_many_step_window_model_ms": {
+                "decode_many:b8/8:g1-16": 14.25,
+            },
             "runtime_full_prompt_store_adopted_requests": 2,
             "runtime_full_prompt_store_adopted_tokens": 34,
             "runtime_full_prompt_store_deferred_requests": 2,
@@ -13744,8 +14877,39 @@ def test_openai_queue_profile_records_runtime_engine_stats(
             "runtime_full_prompt_store_skipped_requests": 1,
             "runtime_full_prompt_store_skipped_tokens": 17,
             "runtime_full_prompt_store_stored_requests": 1,
+            "runtime_full_prompt_reuse_candidate_stored_requests": 3,
+            "runtime_full_prompt_reuse_candidate_stored_tokens": 52,
+            "runtime_full_prompt_reuse_candidate_requests": 1,
+            "runtime_full_prompt_reuse_candidate_tokens": 17,
+            "runtime_full_prompt_reuse_candidate_extra_tokens": 1,
+            "runtime_full_prompt_reuse_candidate_suffix_tokens": 1,
+            "runtime_full_prompt_reuse_candidate_token_counts": {"17": 1},
+            "runtime_full_prompt_reuse_candidate_extra_token_counts": {"1": 1},
+            "runtime_full_prompt_reuse_candidate_suffix_token_counts": {"1": 1},
+            "runtime_persistent_full_prompt_reuse_candidate_stored_requests": 4,
+            "runtime_persistent_full_prompt_reuse_candidate_stored_tokens": 68,
+            "runtime_persistent_full_prompt_reuse_candidate_requests": 2,
+            "runtime_persistent_full_prompt_reuse_candidate_tokens": 34,
+            "runtime_persistent_full_prompt_reuse_candidate_extra_tokens": 3,
+            "runtime_persistent_full_prompt_reuse_candidate_suffix_tokens": 5,
+            "runtime_persistent_full_prompt_reuse_candidate_token_counts": {"17": 2},
+            "runtime_persistent_full_prompt_reuse_candidate_extra_token_counts": {
+                "1": 1,
+                "2": 1,
+            },
+            "runtime_persistent_full_prompt_reuse_candidate_suffix_token_counts": {
+                "2": 1,
+                "3": 1,
+            },
             "runtime_prefix_reuse_requests": 7,
             "runtime_prefix_reuse_tokens": 53,
+            "runtime_prefix_reuse_candidate_tokens": 59,
+            "runtime_prefix_reuse_page_aligned_tokens": 53,
+            "runtime_prefix_reuse_alignment_loss_tokens": 6,
+            "runtime_prefix_reuse_forced_suffix_tokens": 1,
+            "runtime_prefix_reuse_candidate_token_counts": {"45": 5, "14": 2},
+            "runtime_prefix_reuse_alignment_loss_token_counts": {"1": 4, "2": 1},
+            "runtime_prefix_reuse_page_size_counts": {"16": 7},
             "runtime_queued_requests": 11,
             "runtime_ragged_decode_active_tokens": 25,
             "runtime_ragged_decode_batches": 4,
@@ -13780,6 +14944,9 @@ def test_openai_queue_profile_progress_skips_shape_details_by_default(
         _ragged_prefill_logits_graphs = {
             (101, 8, 16, 4096, True, -1, -1, 1, (False,), 64): object(),
         }
+        _ragged_decode_graphs = {
+            (201, 8, 4096, 1024, True, (64, 8)): object(),
+        }
 
     class RuntimeEngine:
         stats = Stats()
@@ -13788,13 +14955,23 @@ def test_openai_queue_profile_progress_skips_shape_details_by_default(
     engine._record_runtime_engine_queue_profile("online_batcher_progress", RuntimeEngine())
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_PROFILE_PROGRESS_SHAPES", "1")
     engine._record_runtime_engine_queue_profile("online_batcher_progress", RuntimeEngine())
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_PROFILE_PROGRESS_SHAPES", raising=False)
+    engine._record_runtime_engine_queue_profile(
+        "online_batcher_progress",
+        RuntimeEngine(),
+        profile_complete_snapshot=True,
+        profile_include_shape_details=True,
+    )
 
-    first, second = [json.loads(line) for line in profile_path.read_text().splitlines()]
+    first, second, third = [json.loads(line) for line in profile_path.read_text().splitlines()]
     assert first["runtime_prefill_batches"] == 2
     assert first["runtime_prefill_graph_cache_live_entries"] == 1
+    assert first["runtime_decode_graph_cache_live_entries"] == 1
     assert "runtime_prefill_shape_counts" not in first
     assert "runtime_prefill_shape_padding_tokens" not in first
     assert "runtime_prefill_graph_cache_live_shape_counts" not in first
+    assert "runtime_decode_graph_cache_live_shape_counts" not in first
+    assert "runtime_decode_graph_cache_live_symm_counts" not in first
 
     assert second["runtime_prefill_batches"] == 2
     assert second["runtime_prefill_shape_counts"] == {
@@ -13806,6 +14983,90 @@ def test_openai_queue_profile_progress_skips_shape_details_by_default(
     assert second["runtime_prefill_graph_cache_live_shape_counts"] == {
         "ragged_prefill:b8:s16:rows1:ctx-1:copy-1:src1:max4096:fp80:ar64": 1,
     }
+    assert second["runtime_decode_graph_cache_live_shape_counts"] == {
+        "ragged_decode:b8:ctx4096:cache1024:rows1:symm(64,8)": 1,
+    }
+    assert second["runtime_decode_graph_cache_live_symm_counts"] == {
+        "symm(64,8)": 1,
+    }
+
+    assert third["profile_complete_snapshot"] is True
+    assert "profile_include_shape_details" not in third
+    assert third["runtime_prefill_shape_counts"] == {
+        "prefix_graph:b8:s16:p45-45:src1:mixed0": 3,
+    }
+    assert third["runtime_decode_graph_cache_live_shape_counts"] == {
+        "ragged_decode:b8:ctx4096:cache1024:rows1:symm(64,8)": 1,
+    }
+    assert third["runtime_decode_graph_cache_live_symm_counts"] == {
+        "symm(64,8)": 1,
+    }
+
+
+def test_openai_queue_profile_graph_shape_limit_keeps_large_cache_visible(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile_path = tmp_path / "queue-profile.jsonl"
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_QUEUE_PROFILE_JSONL", str(profile_path))
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_PROFILE_GRAPH_SHAPE_LIMIT", raising=False)
+    engine = _cache_only_engine()
+
+    graphs = {}
+    for batch in (1, 2, 4, 8, 16, 24, 32):
+        for suffix in range(16, 176, 16):
+            graphs[(100000 + batch * 1000 + suffix, batch, suffix, 1024, True, -256, -1, 1, (False,), 128)] = object()
+    decode_graphs = {}
+    for batch in (1, 2, 4, 8, 16, 24, 32):
+        for cache_bucket in range(128, 1408, 128):
+            decode_graphs[(200000 + batch * 1000 + cache_bucket, batch, 4096, cache_bucket, True, (batch, 8))] = object()
+
+    class Model:
+        _ragged_prefill_logits_graphs = graphs
+        _ragged_decode_graphs = decode_graphs
+
+    class RuntimeEngine:
+        stats = object()
+        model = Model()
+
+    engine._record_runtime_engine_queue_profile("online_batcher", RuntimeEngine())
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_PROFILE_GRAPH_SHAPE_LIMIT", "3")
+    engine._record_runtime_engine_queue_profile("online_batcher", RuntimeEngine())
+
+    first, second = [json.loads(line) for line in profile_path.read_text().splitlines()]
+    assert first["runtime_prefill_graph_cache_live_entries"] == 70
+    assert first["runtime_prefill_graph_cache_live_batch_counts"]["b32"] == 10
+    assert first["runtime_prefill_graph_cache_live_suffix_counts"]["s160"] == 7
+    assert any(
+        key.startswith("ragged_prefill:b32:s16:")
+        for key in first["runtime_prefill_graph_cache_live_shape_counts"]
+    )
+    assert first["runtime_decode_graph_cache_live_entries"] == 70
+    assert first["runtime_decode_graph_cache_live_batch_counts"]["b32"] == 10
+    assert first["runtime_decode_graph_cache_live_cache_bucket_counts"]["cache1280"] == 7
+    assert first["runtime_decode_graph_cache_live_context_counts"] == {"ctx4096": 70}
+    assert first["runtime_decode_graph_cache_live_symm_counts"] == {
+        "symm(1,8)": 10,
+        "symm(2,8)": 10,
+        "symm(4,8)": 10,
+        "symm(8,8)": 10,
+        "symm(16,8)": 10,
+        "symm(24,8)": 10,
+        "symm(32,8)": 10,
+    }
+    assert any(
+        key.startswith("ragged_decode:b32:ctx4096:cache128:")
+        for key in first["runtime_decode_graph_cache_live_shape_counts"]
+    )
+
+    assert len(second["runtime_prefill_graph_cache_live_shape_counts"]) == 3
+    assert len(second["runtime_prefill_graph_cache_live_batch_counts"]) == 3
+    assert len(second["runtime_prefill_graph_cache_live_suffix_counts"]) == 3
+    assert len(second["runtime_decode_graph_cache_live_shape_counts"]) == 3
+    assert len(second["runtime_decode_graph_cache_live_batch_counts"]) == 3
+    assert len(second["runtime_decode_graph_cache_live_cache_bucket_counts"]) == 3
+    assert len(second["runtime_decode_graph_cache_live_symm_counts"]) == 3
+    assert second["runtime_decode_graph_cache_live_context_counts"] == {"ctx4096": 70}
 
 
 def test_openai_stream_group_sync_policy_uses_emitted_tokens(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -14933,13 +16194,42 @@ def test_openai_tensor_parallel_online_batcher_buckets_greedy_short_sessions(
     assert _queue_items(second_queue) == [470, _GenerationDone()]
 
 
-def test_openai_tensor_parallel_online_batcher_records_profile_snapshots(
+@pytest.mark.parametrize(
+    ("snapshot_commands", "expected_events", "expected_snapshots"),
+    [
+        (
+            "2",
+            [
+                "online_batcher_progress",
+                "online_batcher_progress",
+                "online_batcher_quiescent",
+                "online_batcher",
+            ],
+            2,
+        ),
+        (
+            None,
+            [
+                "online_batcher_quiescent",
+                "online_batcher",
+            ],
+            0,
+        ),
+    ],
+)
+def test_openai_tensor_parallel_online_batcher_profile_snapshots(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    snapshot_commands: str | None,
+    expected_events: list[str],
+    expected_snapshots: int,
 ) -> None:
     profile_path = tmp_path / "queue-profile.jsonl"
     monkeypatch.setenv("TORCHINFERNO_OPENAI_QUEUE_PROFILE_JSONL", str(profile_path))
-    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_PROFILE_SNAPSHOT_COMMANDS", "2")
+    if snapshot_commands is None:
+        monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_PROFILE_SNAPSHOT_COMMANDS", raising=False)
+    else:
+        monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_PROFILE_SNAPSHOT_COMMANDS", snapshot_commands)
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_PERSISTENT", "0")
     model = type("FakeTPModel", (), {"world_size": 2, "rank": 0, "allocate_cache": lambda self: None})()
 
@@ -15057,81 +16347,73 @@ def test_openai_tensor_parallel_online_batcher_records_profile_snapshots(
     engine._run_tensor_parallel_online_batcher(first)
 
     assert _queue_items(first_queue) == [801, 802, 803, _GenerationDone()]
-    assert observed_events_before_idle_wait == [
-        "online_batcher_progress",
-        "online_batcher_progress",
-        "online_batcher_quiescent",
-    ]
-    assert observed_events_before_idle_timeout == [
-        "online_batcher_progress",
-        "online_batcher_progress",
-        "online_batcher_quiescent",
-    ]
+    expected_observed_events = expected_events[:-1]
+    assert observed_events_before_idle_wait == expected_observed_events
+    assert observed_events_before_idle_timeout == expected_observed_events
     records = [json.loads(line) for line in profile_path.read_text().splitlines()]
-    assert [record["event"] for record in records] == [
-        "online_batcher_progress",
-        "online_batcher_progress",
-        "online_batcher_quiescent",
-        "online_batcher",
-    ]
-    assert records[0]["profile_snapshot_index"] == 1
-    assert records[0]["online_step_commands"] == 2
-    assert records[0]["runtime_decode_tokens"] == 2
-    assert records[1]["profile_snapshot_index"] == 2
-    assert records[1]["online_step_commands"] == 3
-    assert records[1]["runtime_decode_tokens"] == 3
-    assert records[1]["phase_total_ms"] >= 0.0
-    assert records[2]["profile_snapshots"] == 2
-    assert records[2]["profile_waiting_for_next_request"] is True
-    assert records[2]["profile_pending_idle_timeout_ms"] >= 0.0
-    assert records[2]["online_step_commands"] == 3
-    assert records[2]["runtime_decode_tokens"] == 3
-    assert records[2]["phase_total_ms"] >= 0.0
-    assert records[3]["profile_snapshots"] == 2
-    assert records[3]["online_step_commands"] == 3
-    assert records[3]["runtime_decode_tokens"] == 3
-    assert records[3]["requested_max_batch"] == 4
-    assert records[3]["drain_decode_quantum"] == 8
-    assert records[3]["initial_wait_ms"] == 0.0
-    assert records[3]["idle_batch_wait_ms"] == 5.0
-    assert records[3]["collect_idle_arrivals"] is False
-    assert records[3]["admit_min_free_rows"] == 4
-    assert records[3]["admit_min_ready_requests"] == 12
-    assert records[3]["admit_per_step_cap"] == 64
-    assert records[3]["prefill_token_budget"] == 0
-    assert records[3]["enable_ragged_decode"] is True
-    assert records[3]["use_decode_many"] is True
-    assert records[3]["decode_many_allow_stop"] is True
-    assert records[3]["use_paged_engine"] is False
-    assert records[3]["graph_prefill"] is True
-    assert records[3]["prefill_chunk_size"] == 0
-    assert records[3]["pin_shared_prefix"] is True
-    assert records[3]["store_reusable_prefixes"] is True
-    assert records[3]["store_full_prompt_prefixes"] is True
-    assert records[3]["submit_batches"] == 1
-    assert records[3]["submit_requests"] == 1
-    assert records[3]["submit_batch_max"] == 1
-    assert records[3]["submit_batch_hist"] == {"1": 1}
-    assert records[3]["drain_ready_calls"] >= 1
-    assert records[3]["drain_ready_nonempty_calls"] == 0
-    assert records[3]["drain_ready_requests"] == 0
-    assert records[3]["drain_ready_max"] == 0
-    assert records[3]["runtime_step_calls"] == 3
-    assert records[3]["runtime_step_events"] == 3
-    assert records[3]["runtime_step_max_events"] == 1
-    assert records[3]["request_queue_to_submit_count"] == 1
-    assert records[3]["request_queue_to_submit_p50_ms"] >= 0.0
-    assert records[3]["request_queue_to_first_token_count"] == 1
+    assert [record["event"] for record in records] == expected_events
+    if expected_snapshots:
+        assert records[0]["profile_snapshot_index"] == 1
+        assert records[0]["online_step_commands"] == 2
+        assert records[0]["runtime_decode_tokens"] == 2
+        assert records[1]["profile_snapshot_index"] == 2
+        assert records[1]["online_step_commands"] == 3
+        assert records[1]["runtime_decode_tokens"] == 3
+        assert records[1]["phase_total_ms"] >= 0.0
+    quiescent_record = records[-2]
+    final_record = records[-1]
+    assert quiescent_record["profile_snapshots"] == expected_snapshots
+    assert quiescent_record["profile_waiting_for_next_request"] is True
+    assert quiescent_record["profile_pending_idle_timeout_ms"] >= 0.0
+    assert quiescent_record["online_step_commands"] == 3
+    assert quiescent_record["runtime_decode_tokens"] == 3
+    assert quiescent_record["phase_total_ms"] >= 0.0
+    assert final_record["profile_snapshots"] == expected_snapshots
+    assert final_record["online_step_commands"] == 3
+    assert final_record["runtime_decode_tokens"] == 3
+    assert final_record["requested_max_batch"] == 4
+    assert final_record["drain_decode_quantum"] == 8
+    assert final_record["initial_wait_ms"] == 0.0
+    assert final_record["idle_batch_wait_ms"] == 5.0
+    assert final_record["collect_idle_arrivals"] is False
+    assert final_record["admit_min_free_rows"] == 4
+    assert final_record["admit_min_ready_requests"] == 12
+    assert final_record["admit_per_step_cap"] == 64
+    assert final_record["prefill_token_budget"] == 0
+    assert final_record["enable_ragged_decode"] is True
+    assert final_record["use_decode_many"] is True
+    assert final_record["decode_many_allow_stop"] is True
+    assert final_record["decode_many_stop_tail_max_steps"] == 0
+    assert final_record["use_paged_engine"] is False
+    assert final_record["graph_prefill"] is True
+    assert final_record["prefill_chunk_size"] == 0
+    assert final_record["pin_shared_prefix"] is True
+    assert final_record["store_reusable_prefixes"] is True
+    assert final_record["store_full_prompt_prefixes"] is True
+    assert final_record["submit_batches"] == 1
+    assert final_record["submit_requests"] == 1
+    assert final_record["submit_batch_max"] == 1
+    assert final_record["submit_batch_hist"] == {"1": 1}
+    assert final_record["drain_ready_calls"] >= 1
+    assert final_record["drain_ready_nonempty_calls"] == 0
+    assert final_record["drain_ready_requests"] == 0
+    assert final_record["drain_ready_max"] == 0
+    assert final_record["runtime_step_calls"] == 3
+    assert final_record["runtime_step_events"] == 3
+    assert final_record["runtime_step_max_events"] == 1
+    assert final_record["request_queue_to_submit_count"] == 1
+    assert final_record["request_queue_to_submit_p50_ms"] >= 0.0
+    assert final_record["request_queue_to_first_token_count"] == 1
     assert (
-        records[3]["request_queue_to_first_token_p50_ms"]
-        >= records[3]["request_queue_to_submit_p50_ms"]
+        final_record["request_queue_to_first_token_p50_ms"]
+        >= final_record["request_queue_to_submit_p50_ms"]
     )
-    assert records[3]["request_submit_to_first_token_count"] == 1
-    assert records[3]["request_submit_to_first_token_p50_ms"] >= 0.0
-    assert records[3]["request_queue_to_finish_count"] == 1
+    assert final_record["request_submit_to_first_token_count"] == 1
+    assert final_record["request_submit_to_first_token_p50_ms"] >= 0.0
+    assert final_record["request_queue_to_finish_count"] == 1
     assert (
-        records[3]["request_queue_to_finish_p50_ms"]
-        >= records[3]["request_queue_to_first_token_p50_ms"]
+        final_record["request_queue_to_finish_p50_ms"]
+        >= final_record["request_queue_to_first_token_p50_ms"]
     )
 
 
@@ -15253,13 +16535,157 @@ def test_openai_tensor_parallel_online_batcher_uses_drain_decode_quantum(
     assert _queue_items(first_queue) == [901, 902, 903, 904, 905, _GenerationDone()]
 
 
+def test_openai_tensor_parallel_online_batcher_can_delay_drain_quantum(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = type("FakeTPModel", (), {"world_size": 2, "rank": 0, "allocate_cache": lambda self: None})()
+    step_broadcasts: list[int] = []
+
+    class RuntimeEngine:
+        def __init__(self, *args, **kwargs) -> None:  # noqa: ANN002, ANN003
+            del args, kwargs
+            self.request_id: str | None = None
+            self.steps = 0
+            self.stats = types.SimpleNamespace(
+                decode_tokens=0,
+                scheduler_steps=0,
+                queued_requests=0,
+                decode_many_calls=0,
+                decode_many_steps=0,
+            )
+
+        def start_online(self, *, max_seq_len: int, external_cache: object | None = None) -> None:
+            del max_seq_len, external_cache
+
+        def submit_online(self, request: object) -> None:
+            self.request_id = str(getattr(request, "request_id"))
+            self.stats.queued_requests += 1
+
+        def has_online_work(self) -> bool:
+            return self.request_id is not None
+
+        def has_online_waiting_requests(self) -> bool:
+            return False
+
+        def online_active_min_generated(self) -> int | None:
+            return self.steps if self.request_id is not None else None
+
+        def step_online_many(self, max_steps: int) -> tuple[list[object], int]:
+            assert self.request_id is not None
+            events: list[object] = []
+            ran_steps = 0
+            while ran_steps < max_steps and self.request_id is not None:
+                self.steps += 1
+                ran_steps += 1
+                finished = self.steps >= 5
+                events.append(
+                    types.SimpleNamespace(
+                        request_id=self.request_id,
+                        token=900 + self.steps,
+                        finished=finished,
+                    )
+                )
+                if finished:
+                    self.request_id = None
+            self.stats.scheduler_steps += ran_steps
+            self.stats.decode_tokens += ran_steps
+            self.stats.decode_many_calls += 1
+            self.stats.decode_many_steps += ran_steps
+            return events, ran_steps
+
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_CONTINUOUS_BATCHER", "1")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_DECODE_QUANTUM", "1")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_INITIAL_BATCH_WAIT_MS", "0")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_IDLE_BATCH_WAIT_MS", "0")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_PREFIX_ROWS", "1")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_MAX_SEQ_LEN_HEADROOM_TOKENS", "0")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_PREFILL_TOKEN_BUDGET", "0")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_DRAIN_DECODE_QUANTUM", "8")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_DRAIN_DECODE_MIN_GENERATED", "1")
+    monkeypatch.setattr(
+        "torchinferno.openai_server._is_tensor_parallel_model",
+        lambda candidate: candidate is model,
+    )
+    monkeypatch.setattr("torchinferno.openai_server._RuntimeContinuousBatchEngine", RuntimeEngine)
+    monkeypatch.setattr(
+        "torchinferno.openai_server._tensor_parallel_symm_mem_allreduce_scope",
+        lambda *args, **kwargs: nullcontext(),
+    )
+    monkeypatch.setattr(
+        "torchinferno.openai_server._broadcast_tensor_parallel_online_start",
+        lambda model, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        "torchinferno.openai_server._broadcast_tensor_parallel_online_submit_prompt_lists",
+        lambda model, prompts, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        "torchinferno.openai_server._broadcast_tensor_parallel_online_step",
+        lambda model, steps=1: step_broadcasts.append(int(steps)),
+    )
+    monkeypatch.setattr(
+        "torchinferno.openai_server._broadcast_tensor_parallel_online_close",
+        lambda model: None,
+    )
+    monkeypatch.setattr(
+        "torchinferno.openai_server._sync_tensor_parallel_command",
+        lambda model, device, **kwargs: None,
+    )
+
+    class EmptyQueue:
+        def get_nowait(self) -> object:
+            raise queue.Empty
+
+        def get(self, timeout: float | None = None) -> object:
+            del timeout
+            raise queue.Empty
+
+        def put(self, item: object) -> None:
+            del item
+
+    engine = _cache_only_engine()
+    engine.model = model
+    engine.stop_token_ids = frozenset()
+    engine.max_batch_size = 4
+    engine._generation_queue = EmptyQueue()  # type: ignore[assignment]
+    first_queue: queue.Queue[object] = queue.Queue()
+    first = _QueuedGeneration([1, 2], 5, 0.0, True, first_queue)
+
+    engine._run_tensor_parallel_online_batcher(first)
+
+    assert step_broadcasts == [1, 8]
+    assert _queue_items(first_queue) == [901, 902, 903, 904, 905, _GenerationDone()]
+
+
 def test_openai_tensor_parallel_online_default_prefix_rows(monkeypatch: pytest.MonkeyPatch) -> None:
     engine = _cache_only_engine()
 
     monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_PREFIX_ROWS", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_MIXED_PREFIX_ROWS", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_MIXED_PREFIX_REUSE", raising=False)
+    monkeypatch.delenv(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_MIXED_PREFIX_REUSE_MAX_TOKENS",
+        raising=False,
+    )
+    monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_GREEDY_LARGE_MIXED_PREFIX_REUSE", raising=False)
     assert engine._online_serving_prefix_rows() == 64
     assert engine._online_serving_effective_prefix_rows(48) == 64
     assert engine._online_serving_effective_prefix_rows(128) == 16
+    assert engine._online_serving_prefix_rows(temperature=0.0, max_tokens=512) == 64
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_MIXED_PREFIX_REUSE", "1")
+    assert engine._online_serving_prefix_rows(temperature=0.0, max_tokens=512) == 112
+    assert (
+        engine._online_serving_effective_prefix_rows(
+            32,
+            temperature=0.0,
+            max_tokens=512,
+        )
+        == 112
+    )
+    assert engine._online_serving_prefix_rows(temperature=0.0, max_tokens=256) == 64
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_MIXED_PREFIX_REUSE", "0")
+    assert engine._online_serving_prefix_rows(temperature=0.0, max_tokens=512) == 64
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_MIXED_PREFIX_REUSE", raising=False)
 
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_PREFIX_ROWS", "7")
     assert engine._online_serving_prefix_rows() == 7

@@ -380,7 +380,7 @@ class FastOpenAIHTTPServer:
                     request_close = headers.get("connection", "").lower() == "close"
                     keep_alive = keepalive_enabled and not request_close
                     connection.settimeout(idle_timeout_s)
-                    self._handle_request(
+                    keep_alive = self._handle_request(
                         connection,
                         method,
                         path,
@@ -428,14 +428,14 @@ class FastOpenAIHTTPServer:
         handler_start_s: float | None,
         read_start_s: float,
         first_request_on_connection: bool,
-    ) -> None:
+    ) -> bool:
         route = path.partition("?")[0]
         if method == "GET" and route == "/health":
             _send_fast_json(connection, {"status": "ok"}, connection_close=not keep_alive)
-            return
+            return keep_alive
         if method == "GET" and route == "/v1/models":
             _send_fast_json(connection, model_list_response(self.engine.model_id), connection_close=not keep_alive)
-            return
+            return keep_alive
         if method != "POST" or route != "/v1/chat/completions":
             _send_fast_json(
                 connection,
@@ -443,19 +443,24 @@ class FastOpenAIHTTPServer:
                 status=404,
                 connection_close=not keep_alive,
             )
-            return
+            return keep_alive
         parse_start_s = time.perf_counter()
         payload = json.loads(body.decode("utf-8"))
         request = parse_chat_completion_request(payload)
         parsed_s = time.perf_counter()
         if request.stream:
+            stream_keep_alive = _fast_http_stream_keep_alive_enabled(
+                keep_alive=keep_alive,
+                max_tokens=request.max_tokens,
+                temperature=request.temperature,
+            )
             _stream_fast_chat(
                 connection,
                 self.engine,
                 request.messages,
                 max_tokens=request.max_tokens,
                 temperature=request.temperature,
-                keep_alive=keep_alive,
+                keep_alive=stream_keep_alive,
                 request_ready_s=request_ready_s,
                 accepted_s=accepted_s,
                 handler_start_s=handler_start_s,
@@ -463,7 +468,7 @@ class FastOpenAIHTTPServer:
                 first_request_on_connection=first_request_on_connection,
                 parse_ms=(parsed_s - parse_start_s) * 1000.0,
             )
-            return
+            return stream_keep_alive
         completion = self.engine.complete_chat(
             request.messages,
             max_tokens=request.max_tokens,
@@ -480,6 +485,7 @@ class FastOpenAIHTTPServer:
             ),
             connection_close=not keep_alive,
         )
+        return keep_alive
 
 
 def _fast_http_worker_count() -> int:
@@ -662,6 +668,7 @@ def _stream_fast_chat(
             profile["content_send_calls"] = content_send_calls
             profile["empty_tokens"] = empty_tokens
             profile["client_open"] = bool(client_open)
+            profile["role_sent"] = bool(role_sent)
             _record_fast_http_profile(profile)
 
 
@@ -690,6 +697,37 @@ def _fast_http_keepalive_idle_timeout_seconds(
         minimum=0.05,
     )
     return min(default_timeout, drained_timeout)
+
+
+def _fast_http_stream_keep_alive_enabled(
+    *,
+    keep_alive: bool,
+    max_tokens: int,
+    temperature: float,
+) -> bool:
+    if not keep_alive:
+        return False
+    global_env = "TORCHINFERNO_OPENAI_FAST_HTTP_STREAM_KEEPALIVE"
+    if global_env in os.environ:
+        return env_flag(global_env, True)
+    if (
+        temperature <= 0.0
+        and max_tokens > 0
+        and env_flag("TORCHINFERNO_OPENAI_FAST_HTTP_GREEDY_LARGE_CLOSE_STREAM", False)
+    ):
+        min_tokens = env_int(
+            "TORCHINFERNO_OPENAI_FAST_HTTP_GREEDY_LARGE_CLOSE_STREAM_MIN_TOKENS",
+            400,
+            minimum=1,
+        )
+        max_close_tokens = env_int(
+            "TORCHINFERNO_OPENAI_FAST_HTTP_GREEDY_LARGE_CLOSE_STREAM_MAX_TOKENS",
+            512,
+            minimum=min_tokens,
+        )
+        if min_tokens < int(max_tokens) <= max_close_tokens:
+            return False
+    return True
 
 
 def _fast_http_engine_live_requests(engine: object) -> int | None:
@@ -723,10 +761,12 @@ def _new_fast_http_stream_profile(
 ) -> dict[str, object] | None:
     if not _fast_http_profile_path():
         return None
+    detailed = env_flag("TORCHINFERNO_OPENAI_FAST_HTTP_PROFILE_DETAILED", False)
     start_s = request_ready_s if request_ready_s is not None else time.perf_counter()
     profile: dict[str, object] = {
         "event": "fast_http_stream",
         "_start_s": start_s,
+        "_detailed": detailed,
         "max_tokens": int(max_tokens),
         "temperature": float(temperature),
         "keep_alive": bool(keep_alive),
@@ -745,12 +785,12 @@ def _new_fast_http_stream_profile(
 
 
 def _mark_fast_http_elapsed(profile: dict[str, object] | None, field: str, start_s: float) -> None:
-    if profile is not None:
+    if profile is not None and bool(profile.get("_detailed", False)):
         profile[field] = (time.perf_counter() - start_s) * 1000.0
 
 
 def _add_fast_http_elapsed(profile: dict[str, object] | None, field: str, start_s: float) -> None:
-    if profile is not None:
+    if profile is not None and bool(profile.get("_detailed", False)):
         profile[field] = float(profile.get(field, 0.0)) + (time.perf_counter() - start_s) * 1000.0
 
 
@@ -770,6 +810,7 @@ def _record_fast_http_profile(profile: dict[str, object]) -> None:
     path = _fast_http_profile_path()
     if not path:
         return
+    profile.pop("_detailed", None)
     start_s = profile.pop("_start_s", None)
     if isinstance(start_s, float):
         profile["total_ms"] = (time.perf_counter() - start_s) * 1000.0
@@ -940,7 +981,7 @@ def _stream_defer_role_enabled(*, max_tokens: int, temperature: float) -> bool:
     del temperature
     if not env_flag("TORCHINFERNO_OPENAI_STREAM_DEFER_ROLE", True):
         return False
-    max_defer_tokens = env_int("TORCHINFERNO_OPENAI_STREAM_DEFER_ROLE_MAX_TOKENS", 400, minimum=1)
+    max_defer_tokens = env_int("TORCHINFERNO_OPENAI_STREAM_DEFER_ROLE_MAX_TOKENS", 512, minimum=1)
     return max_tokens <= max_defer_tokens
 
 

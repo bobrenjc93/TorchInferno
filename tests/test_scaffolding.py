@@ -201,11 +201,25 @@ def test_paged_prefix_cache_zero_copy_share_and_evict() -> None:
     toks_b = toks_a[:8] + [99, 99, 99, 99]
     shared = pc.share_into("b", toks_b)
     assert shared == 8                                  # 2 full shared pages
+    assert pc.last_share_candidate_tokens == 8
+    assert pc.last_share_aligned_tokens == 8
+    assert pc.last_share_alignment_loss_tokens == 0
+    assert pc.last_share_page_size == 4
     assert cache._sequences["b"].page_ids == a_pages[:2]  # ZERO-COPY same pages
     assert cache.page_refcount(a_pages[0]) == 2         # retained(1) + b(1)
 
+    # A longer token match that crosses a partial page can only share full pages;
+    # the cache records those stranded tokens for page-size tuning profiles.
+    partial_shared = pc.share_into("b-partial", toks_a[:10] + [99, 99])
+    assert partial_shared == 8
+    assert pc.last_share_candidate_tokens == 10
+    assert pc.last_share_aligned_tokens == 8
+    assert pc.last_share_alignment_loss_tokens == 2
+    cache.free("b-partial")
+
     # No prefix match -> no share.
     assert pc.share_into("c", [7, 7, 7, 7, 7, 7, 7, 7]) == 0
+    assert pc.last_share_candidate_tokens == 0
 
     # LRU eviction: remember 2 more (capacity=2) -> "a" evicted -> its now-unreferenced
     # page (a_pages[2], the unshared one) returns to the pool; a_pages[:2] still held by b.
