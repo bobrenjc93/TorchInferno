@@ -48,6 +48,17 @@ correct. Queue counters were not a hidden sampler win: all-reduce had
 while the gather control had `q2first_p50=159.8ms`, `decode_gpu_ms=9.80s`, and
 `decode_many_gpu_ms=5.11s`. Keep the CUDA greedy gather default.
 
+Prompt-lookup decode is rejected for long_output despite high proposal
+acceptance. The opt-in run with
+`TORCHINFERNO_CONTINUOUS_PROMPT_LOOKUP_DECODE=1` wrote
+`/tmp/inference-bench-ti-prompt-lookup-long-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100/runs/20260705_230818`
+and landed at `4244.6 / 367.9 / 16877.9ms`, `1000/1000` correct. Queue
+counters show the problem: `1547` prompt-lookup verification batches across
+`4292` requests proposed `34336` tokens and accepted `30420`, but this disabled
+decode-many and spent `281.9s` in decode GPU, dominated by
+`prompt_lookup:b3:proposal8`. Keep prompt lookup default-off for this workload;
+accepted proposals are not useful when verification fragments the decode body.
+
 ## Public 20260705_210211
 
 Public inference-bench advanced to run
