@@ -41,6 +41,9 @@ def test_dynamic_prefix_prefill_policy_extends_short_greedy_suffixes(monkeypatch
     monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_DYNAMIC_PREFIX_PREFILL_MAX_SUFFIX", raising=False)
     monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_DYNAMIC_PREFIX_PREFILL_GREEDY_SHORT_MAX_TOKENS", raising=False)
     monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_DYNAMIC_PREFIX_PREFILL_GREEDY_SHORT_MAX_SUFFIX", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_DYNAMIC_PREFIX_PREFILL_GREEDY_LARGE_MIN_TOKENS", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_DYNAMIC_PREFIX_PREFILL_GREEDY_LARGE_MAX_TOKENS", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_DYNAMIC_PREFIX_PREFILL_GREEDY_LARGE_MAX_SUFFIX", raising=False)
 
     short_suffix = _dynamic_prefix_prefill_max_suffix_for_policy(0.0, 82)
     assert short_suffix == 128
@@ -54,8 +57,19 @@ def test_dynamic_prefix_prefill_policy_extends_short_greedy_suffixes(monkeypatch
         == -256
     )
 
-    assert _dynamic_prefix_prefill_max_suffix_for_policy(0.0, 512) is None
+    large_suffix = _dynamic_prefix_prefill_max_suffix_for_policy(0.0, 512)
+    assert large_suffix == 32
+    assert (
+        _dynamic_prefix_prefill_context_len(
+            111,
+            32,
+            max_seq_len=512,
+            max_dynamic_suffix=large_suffix,
+        )
+        == -256
+    )
     assert _dynamic_prefix_prefill_context_len(111, 128, max_seq_len=512) == 239
+    assert _dynamic_prefix_prefill_max_suffix_for_policy(0.0, 256) is None
     sampled_suffix = _dynamic_prefix_prefill_max_suffix_for_policy(0.7, 82)
     assert sampled_suffix == 0
     assert (

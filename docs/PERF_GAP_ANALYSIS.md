@@ -30,7 +30,8 @@ The hottest prefill shape was `prefix_graph:b32:s144:p45-45:src1:mixed0`
 (`20.5K` total, `6.3K` on the hot shape), but pattern reuse was low
 (`9/32` repeat calls, `13.2%` repeated saved-token share).
 
-Four current-stack `multi_turn` probes are rejected or remain opt-in:
+Current-stack `multi_turn` probes split into three rejected scheduler/body
+changes and one scoped mixed-prefix promotion:
 
 - Shape-gated packed eager prefill for `prefix_graph:b32:s144:p45-45:src1:mixed0`
   wrote
@@ -48,8 +49,10 @@ Four current-stack `multi_turn` probes are rejected or remain opt-in:
   `/tmp/inference-bench-ti-multiturn-active48-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-ti-multiturn-active48-20260705/runs/20260705_115609`
   and regressed sharply to `798.5 / 81.0 / 881.5ms`, `984/1000` correct.
   Wider active rows are still not a defaultable multi_turn fix.
-- Explicit greedy-large mixed-prefix reuse remains promising but not stable
-  enough to default on. The first current-stack opt-in run wrote
+- Explicit greedy-large mixed-prefix reuse is now promoted only for the OpenAI
+  `temperature=0,max_tokens=512` class after adding missing mixed-prefix warmup
+  coverage and a large-greedy dynamic suffix bucket. The first current-stack
+  opt-in run wrote
   `/tmp/inference-bench-ti-multiturn-mixedprefix-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-ti-multiturn-mixedprefix-20260705/runs/20260705_120548`
   and improved to `272.1 / 65.4 / 349.7ms`, with prefill wall down to
   `2.76s` and `q2first_p50=150.6ms`. The immediate repeat wrote
@@ -64,8 +67,43 @@ Four current-stack `multi_turn` probes are rejected or remain opt-in:
   at `321.0 / 65.4 / 412.7ms`, `979/1000` correct. The repeat queue profile
   had `prefill_graph_misses=0` and a live
   `ragged_prefill:b2:s32:rows1:ctx-256:copy-1:src2:max1024:fp80:ar128:logits1`
-  entry. Keep the broader mixed-prefix reuse policy opt-in until the full row
-  wins consistently without TPOT/E2E tradeoffs.
+  entry.
+- A TorchInferno-only full-suite pass with the fixed mixed-prefix opt-in on
+  pushed `c85d39b` wrote
+  `/tmp/inference-bench-ti-full-mixedprefix-c85-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-ti-full-mixedprefix-c85-20260705/runs/20260705_125305`.
+  Multi_turn landed at `226.7 / 63.8 / 297.3ms`, `982/1000` correct, with
+  `q2first_p50=149.8ms`, `37` prefill batches, `2.32s/2.65s` prefill
+  forward/wall, `0` prefill graph misses, and route counts
+  `{"common_prefix":125,"request_prompt":875}`. The scoped policy only changed
+  the `temperature=0,max_tokens=512` row: few_shot stayed at `prefix_rows=64`,
+  self_consistency at `16`, tree at `64`, and long_output at `64`. Promote the
+  OpenAI mixed-prefix policy as the default for that exact multi_turn class,
+  while preserving `TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_MIXED_PREFIX_REUSE=0`
+  as the opt-out and keeping the lower-level continuous-engine policy opt-in.
+- The first no-env default-on repeat exposed the remaining large-greedy exact
+  context miss:
+  `/tmp/inference-bench-ti-mixedprefix-default-c85-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-ti-mixedprefix-default-c85-20260705/runs/20260705_130428`
+  regressed to `444.8 / 67.2 / 498.3ms` with one
+  `ragged_prefill:b1:s32:rows1:ctx156:src1` miss. Rather than warm the
+  prompt-specific exact length, the runtime now gives greedy-large suffixes up
+  to `32` tokens a dynamic context bucket, so that request reuses the already
+  warmed `ctx-256` graph class. The next no-env repeat also found a normal
+  mixed-source `b16:s16:ctx-256:src16` warmup gap; adding `16:16:256` to the
+  mixed-prefix suffix warmup wrote
+  `/tmp/inference-bench-ti-mixedprefix-default-dynamiclarge-b16s16-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-ti-mixedprefix-default-dynamiclarge-b16s16-20260705/runs/20260705_132421`
+  at `262.7 / 61.0 / 327.2ms`, `981/1000` correct, with one online phase,
+  `38/0` prefill graph hits/misses, route counts
+  `{"common_prefix":125,"request_prompt":875}`, and `q2first_p50=146.9ms`.
+- The no-env full-suite check for the same narrow policy wrote
+  `/tmp/inference-bench-ti-full-default-dynamiclarge-b16s16-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-ti-full-default-dynamiclarge-b16s16-20260705/runs/20260705_132949`.
+  Multi_turn landed at `232.6 / 65.5 / 303.2ms`, `982/1000` correct, with
+  route counts `{"common_prefix":125,"request_prompt":875}` and one remaining
+  `b2:s16:ctx-256:src2` miss. Broadening suffix-16 warmup across every mixed
+  batch bucket removed misses but is rejected for now:
+  `/tmp/inference-bench-ti-mixedprefix-default-dynamiclarge-s16warm-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-ti-mixedprefix-default-dynamiclarge-s16warm-20260705/runs/20260705_133731`
+  regressed to `357.6 / 62.4 / 445.1ms` despite `37/0` graph hits/misses.
+  Keep only the narrow `16:16:256` warmup until a broader startup set proves
+  stable.
 
 The practical multi_turn target remains a lower-cost packed/fixed-pattern
 cached-prefix prefill implementation and consistently cheap request-prompt

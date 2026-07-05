@@ -342,13 +342,29 @@ def _dynamic_prefix_prefill_max_suffix_for_policy(
         128,
         minimum=1,
     )
-    if int(max_tokens) > short_max_tokens:
-        return None
-    return env_int(
-        "TORCHINFERNO_CONTINUOUS_DYNAMIC_PREFIX_PREFILL_GREEDY_SHORT_MAX_SUFFIX",
-        128,
+    if int(max_tokens) <= short_max_tokens:
+        return env_int(
+            "TORCHINFERNO_CONTINUOUS_DYNAMIC_PREFIX_PREFILL_GREEDY_SHORT_MAX_SUFFIX",
+            128,
+            minimum=1,
+        )
+    large_min_tokens = env_int(
+        "TORCHINFERNO_CONTINUOUS_DYNAMIC_PREFIX_PREFILL_GREEDY_LARGE_MIN_TOKENS",
+        400,
+        minimum=0,
+    )
+    large_max_tokens = env_int(
+        "TORCHINFERNO_CONTINUOUS_DYNAMIC_PREFIX_PREFILL_GREEDY_LARGE_MAX_TOKENS",
+        512,
         minimum=1,
     )
+    if large_min_tokens < int(max_tokens) <= large_max_tokens:
+        return env_int(
+            "TORCHINFERNO_CONTINUOUS_DYNAMIC_PREFIX_PREFILL_GREEDY_LARGE_MAX_SUFFIX",
+            32,
+            minimum=0,
+        )
+    return None
 
 
 def _greedy_large_mixed_prefix_reuse_policy_enabled(

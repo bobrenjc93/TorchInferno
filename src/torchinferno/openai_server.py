@@ -671,7 +671,7 @@ def _online_greedy_large_mixed_prefix_reuse_enabled(*, temperature: float, max_t
     if continuous_env in os.environ:
         return _greedy_large_mixed_prefix_reuse_policy_enabled(temperature, max_tokens)
     env_name = "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_MIXED_PREFIX_REUSE"
-    if not env_flag(env_name, False):
+    if not env_flag(env_name, True):
         return False
     if temperature > 0.0 or max_tokens < 1:
         return False
@@ -1550,13 +1550,25 @@ def _online_greedy_common_prefix_suffix_prefill_warmup_extra_pairs(
     )
     if configured is not None:
         pairs = _parse_nonnegative_positive_int_pair_csv(configured)
-    elif _dynamic_prefix_prefill_max_suffix_for_policy(
-        warmup_temperature,
-        warmup_max_tokens,
-    ) is not None:
-        pairs = _parse_nonnegative_positive_int_pair_csv("111:32,111:64,122:16")
     else:
-        pairs = ()
+        short_max_tokens = env_int(
+            "TORCHINFERNO_CONTINUOUS_DYNAMIC_PREFIX_PREFILL_GREEDY_SHORT_MAX_TOKENS",
+            128,
+            minimum=1,
+        )
+        dynamic_max_suffix = _dynamic_prefix_prefill_max_suffix_for_policy(
+            warmup_temperature,
+            warmup_max_tokens,
+        )
+        short_dynamic_warmup = (
+            dynamic_max_suffix is not None
+            and warmup_max_tokens is not None
+            and 0 < int(warmup_max_tokens) <= short_max_tokens
+        )
+        if short_dynamic_warmup:
+            pairs = _parse_nonnegative_positive_int_pair_csv("111:32,111:64,122:16")
+        else:
+            pairs = ()
     return tuple(
         (prefix_count, suffix_count)
         for prefix_count, suffix_count in pairs
@@ -1726,7 +1738,7 @@ def _online_mixed_prefix_suffix_prefill_warmup_specs(
         return ()
     raw = os.environ.get(
         "TORCHINFERNO_OPENAI_WARMUP_ONLINE_MIXED_PREFIX_SUFFIX_SPECS",
-        "32:32:128,32:32:256,16:32:256,8:32:256,4:32:256,2:32:256,4:16:256",
+        "32:32:128,32:32:256,16:32:256,16:16:256,8:32:256,4:32:256,2:32:256,4:16:256",
     )
     specs: list[tuple[int, int, int]] = []
     for part in raw.split(","):

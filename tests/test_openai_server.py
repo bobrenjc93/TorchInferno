@@ -9852,7 +9852,7 @@ def test_openai_online_prefill_ready_before_decode_respects_env(monkeypatch) -> 
         "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_MIXED_PREFIX_REUSE_MAX_TOKENS",
         raising=False,
     )
-    assert not _online_greedy_large_mixed_prefix_reuse_enabled(temperature=0.0, max_tokens=512)
+    assert _online_greedy_large_mixed_prefix_reuse_enabled(temperature=0.0, max_tokens=512)
     assert not _online_greedy_large_mixed_prefix_reuse_enabled(temperature=0.0, max_tokens=511)
     assert not _online_greedy_large_mixed_prefix_reuse_enabled(temperature=0.7, max_tokens=512)
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_MIXED_PREFIX_REUSE", "1")
@@ -10472,9 +10472,12 @@ def test_openai_tp_stream_prequeue_admission_wait_scopes_greedy_large_mixed_pref
         raising=False,
     )
 
-    assert _tp_stream_prequeue_admission_wait_ms(temperature=0.0, max_tokens=512) == 0.0
+    assert _tp_stream_prequeue_admission_wait_ms(temperature=0.0, max_tokens=512) == 2.0
     assert _tp_stream_prequeue_admission_wait_ms(temperature=0.0, max_tokens=256) == 0.0
     assert _tp_stream_prequeue_admission_wait_ms(temperature=0.7, max_tokens=512) == 0.0
+
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_MIXED_PREFIX_REUSE", "0")
+    assert _tp_stream_prequeue_admission_wait_ms(temperature=0.0, max_tokens=512) == 0.0
 
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_MIXED_PREFIX_REUSE", "1")
     assert _tp_stream_prequeue_admission_wait_ms(temperature=0.0, max_tokens=512) == 2.0
@@ -10664,6 +10667,10 @@ def test_online_common_prefix_prefill_warmup_filters_shapes(monkeypatch) -> None
     monkeypatch.delenv("TORCHINFERNO_OPENAI_WARMUP_ONLINE_MIXED_PREFIX_SUFFIX_SPECS", raising=False)
     monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_GREEDY_LARGE_MIXED_PREFIX_REUSE", raising=False)
     monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_GREEDY_LARGE_MIXED_PREFIX_REUSE_MAX_TOKENS", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_DYNAMIC_PREFIX_PREFILL_GREEDY_SHORT_MAX_TOKENS", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_DYNAMIC_PREFIX_PREFILL_GREEDY_LARGE_MIN_TOKENS", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_DYNAMIC_PREFIX_PREFILL_GREEDY_LARGE_MAX_TOKENS", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_DYNAMIC_PREFIX_PREFILL_GREEDY_LARGE_MAX_SUFFIX", raising=False)
     monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_BATCH_BUCKETS", raising=False)
     monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SUFFIX_BUCKETS", raising=False)
     monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SUFFIX_BUCKETS_GREEDY_LARGE", raising=False)
@@ -10759,7 +10766,7 @@ def test_online_common_prefix_prefill_warmup_filters_shapes(monkeypatch) -> None
     monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SUFFIX_BUCKETS", "8,16")
     assert _online_sampled_common_prefix_suffix_prefill_warmup_suffix_tokens(128) == (8, 16)
     monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SUFFIX_BUCKETS", raising=False)
-    assert not _online_mixed_prefix_suffix_prefill_warmup_enabled()
+    assert _online_mixed_prefix_suffix_prefill_warmup_enabled()
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_MIXED_PREFIX_REUSE", "1")
     assert _online_mixed_prefix_suffix_prefill_warmup_enabled()
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_MIXED_PREFIX_REUSE", "0")
@@ -10779,6 +10786,7 @@ def test_online_common_prefix_prefill_warmup_filters_shapes(monkeypatch) -> None
         (32, 32, 128),
         (32, 32, 256),
         (16, 32, 256),
+        (16, 16, 256),
         (8, 32, 256),
         (4, 32, 256),
         (2, 32, 256),
