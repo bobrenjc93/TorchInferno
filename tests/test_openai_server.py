@@ -10785,6 +10785,7 @@ def test_online_common_prefix_prefill_warmup_filters_shapes(monkeypatch) -> None
     ) == (
         (32, 32, 128),
         (32, 32, 256),
+        (16, 32, 128),
         (16, 32, 256),
         (16, 16, 256),
         (8, 32, 256),
