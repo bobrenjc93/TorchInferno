@@ -82,6 +82,20 @@ gap as a graph-miss or request-collection problem; a defaultable improvement
 has to reduce the TP collective count/cost or the 32-row suffix prefill model
 body itself.
 
+A current prefill symmetric-memory all-reduce recheck is rejected. The replay
+profile above made the collective cost tempting, so the focused A/B set
+`TORCHINFERNO_SYMM_MEM_PREFILL_ALLREDUCE=1` and wrote
+`/tmp/inference-bench-ti-few-prefill-symm-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-ti-few-prefill-symm-7e2778a-20260705/runs/20260705_192942`.
+It landed at `173.0 / 47.0 / 215.1ms`, `977/1000` correct: not a clear median
+win versus the adjacent no-env/profiler controls, and p99 TTFT/E2E worsened to
+`1008.7/1061.8ms`. Queue telemetry kept the same shape
+(`q2first_p50=123.4ms`, `q2submit_p50=55.7ms`, `34` prefill batches,
+`32/2` graph hits/misses), while hot `prefix_graph:b32:s16:p122-122:src1:mixed0`
+was still `31` calls and `1.79s` wall and total prefill wall rose to `2.67s`.
+Keep prefill symmetric-memory all-reduce default-off for few_shot; the next
+collective lever needs a measured reduction in the live replay body, not just a
+different all-reduce backend flag.
+
 ## Public 20260705_150207 and inference-bench client fix
 
 Public inference-bench advanced to commit `0ace9c0a` with run
