@@ -8123,11 +8123,35 @@ class ContinuousBatchEngine:
             return first
         return None
 
-    def _shared_temperature_for_requests(self, requests: Sequence[ServingRequest]) -> float | None:
-        return self._shared_temperature([self._request_temperature(request) for request in requests])
+    def _shared_temperature_for_requests(
+        self,
+        requests: Sequence[ServingRequest],
+        *,
+        limit: int | None = None,
+    ) -> float | None:
+        count = len(requests) if limit is None else min(len(requests), max(0, int(limit)))
+        if count <= 0:
+            return float(self.temperature)
+        first = self._request_temperature(requests[0])
+        for index in range(1, count):
+            if self._request_temperature(requests[index]) != first:
+                return None
+        return first
 
-    def _shared_temperature_for_states(self, states: Sequence[_ActiveRequest]) -> float | None:
-        return self._shared_temperature([self._state_temperature(state) for state in states])
+    def _shared_temperature_for_states(
+        self,
+        states: Sequence[_ActiveRequest],
+        *,
+        limit: int | None = None,
+    ) -> float | None:
+        count = len(states) if limit is None else min(len(states), max(0, int(limit)))
+        if count <= 0:
+            return float(self.temperature)
+        first = self._state_temperature(states[0])
+        for index in range(1, count):
+            if self._state_temperature(states[index]) != first:
+                return None
+        return first
 
     def _sample_logits_with_temperature(self, logits: Tensor, temperature: float) -> Tensor:
         sampler = getattr(self.model, "_sample_next_token", None)
@@ -8180,6 +8204,13 @@ class ContinuousBatchEngine:
         logits: Tensor,
         requests: Sequence[ServingRequest],
     ) -> Tensor:
+        row_count = int(logits.size(0))
+        if row_count <= 0:
+            return torch.empty((0,), dtype=torch.long, device=self.device)
+        if len(requests) >= row_count:
+            shared = self._shared_temperature_for_requests(requests, limit=row_count)
+            if shared is not None:
+                return self._sample_logits_with_temperature(logits, shared)
         return self._sample_logits_for_temperatures(
             logits,
             [self._request_temperature(request) for request in requests],
@@ -8190,6 +8221,13 @@ class ContinuousBatchEngine:
         logits: Tensor,
         states: Sequence[_ActiveRequest],
     ) -> Tensor:
+        row_count = int(logits.size(0))
+        if row_count <= 0:
+            return torch.empty((0,), dtype=torch.long, device=self.device)
+        if len(states) >= row_count:
+            shared = self._shared_temperature_for_states(states, limit=row_count)
+            if shared is not None:
+                return self._sample_logits_with_temperature(logits, shared)
         return self._sample_logits_for_temperatures(
             logits,
             [self._state_temperature(state) for state in states],
