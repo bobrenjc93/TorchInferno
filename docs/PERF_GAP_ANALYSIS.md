@@ -1,5 +1,71 @@
 # TorchInferno vs vLLM/sglang — Performance Gap Analysis (Llama-3.1-70B, 8xH100)
 
+## Public 20260705_170204 after inference-bench client fix
+
+Public inference-bench advanced to commit `f240a799` with run
+`results/v1/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100/runs/20260705_170204`.
+This is the first public all-provider row after inference-bench `76591625`
+(`Use per-thread clients for concurrent benchmarks`). It measured TorchInferno
+`823d043` plus the later `45e3b70` warmup in the source tree; the subsequent
+TorchInferno `70fbe31` commit is documentation-only. Scorecard was
+TorchInferno `3/20`, vLLM `15/20`, and SGLang `1/20`.
+
+The harness-corrected self_consistency comparison now matches the local
+diagnosis: TorchInferno wins TTFT, E2E, and throughput on that row. The
+remaining public gaps are prefill/first-token dominated for few_shot,
+multi_turn, and tree_of_thought, and decode/replay dominated for long_output:
+
+- few_shot: TorchInferno `147.6 / 42.3 / 186.4ms`, vLLM
+  `126.4 / 40.9 / 161.8ms`, SGLang `129.1 / 83.8 / 210.3ms`.
+- self_consistency: TorchInferno `100.0 / 0.0 / 107.5ms`, vLLM
+  `124.2 / 0.0 / 144.4ms`, SGLang `217.8 / 0.0 / 363.8ms`.
+- multi_turn: TorchInferno `227.3 / 57.8 / 280.3ms`, vLLM
+  `149.3 / 43.1 / 194.2ms`, SGLang `163.0 / 103.4 / 274.5ms`.
+- tree_of_thought: TorchInferno `80.0 / 64.7 / 115.1ms`, vLLM
+  `32.4 / 21.7 / 47.8ms`, SGLang `49.8 / 422.4 / 465.8ms`.
+- long_output: TorchInferno `283.3 / 20.0 / 988.5ms`, vLLM
+  `80.6 / 14.6 / 597.9ms`, SGLang `66.9 / 22.7 / 915.7ms`.
+
+The public TorchInferno queue profiles explain why the old scheduler knobs are
+not enough. few_shot still spent `1.42s/1.81s` in prefill forward/wall over
+`39` prefill batches, with `q2first_p50=94.6ms`. self_consistency had only
+`q2first_p50=6.4ms`, `2` prefill batches, and `988` generated-prefix reuse
+requests, so the client fix exposed the actual runtime win. multi_turn used the
+intended mixed-prefix default (`{"common_prefix":125,"request_prompt":874}`),
+but still spent `2.35s/2.86s` in prefill and `q2first_p50=138.1ms`.
+tree_of_thought spent `4.89s/5.35s` in prefill and `4.46s` in decode GPU
+across `220` prefill batches. long_output remained decode-heavy: the profiled
+sessions used `use_decode_many=true`, `decode_many_calls=62` in the larger
+session, `5.78s` total decode GPU, and `3.05s` decode-many GPU.
+
+A same-host patched all-provider comparison on TorchInferno `70fbe31` and
+inference-bench `76591625` wrote
+`/tmp/inference-bench-patched-all-providers-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-patched-all-70fbe31-76591625-20260705/runs/20260705_172939`.
+It scored vLLM `14`, TorchInferno `3`, and SGLang `2`. Local TorchInferno
+again won self_consistency (`85.1 / 0.0 / 93.1ms` versus vLLM
+`101.7 / 0.0 / 123.1ms`) and trailed on the same four rows: few_shot
+`179.7 / 46.3 / 222.5ms` versus vLLM `109.2 / 38.7 / 142.2ms`, multi_turn
+`219.1 / 62.2 / 283.8ms` versus vLLM `138.0 / 47.7 / 177.0ms`,
+tree_of_thought `148.1 / 64.3 / 209.1ms` versus vLLM
+`38.9 / 27.0 / 57.7ms`, and long_output `256.9 / 23.1 / 1140.8ms` versus
+SGLang/vLLM TTFT near `65-68ms` and vLLM E2E `707.2ms`. Treat the local tree
+row as noisy/profile-sensitive because the public TorchInferno tree row was
+much better, but the required fix is unchanged: a lower-cost packed
+cached-prefix prefill path or lower TP replay/collective cost, not another
+sampled-medium wait/cap tweak.
+
+Lowering the global online initial batch wait to `0ms` is rejected for
+few_shot. The focused A/B wrote
+`/tmp/inference-bench-ti-few-initial0-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-ti-few-initial0-70fbe31-20260705/runs/20260705_181700`
+and landed at `178.0 / 44.3 / 216.0ms`, `977/1000` correct. The paired no-env
+control wrote
+`/tmp/inference-bench-ti-few-default-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-ti-few-default-70fbe31-20260705/runs/20260705_182349`
+and landed at `177.5 / 46.6 / 222.4ms`, `977/1000` correct. The zero-wait run
+slightly improved TPOT/E2E, but it worsened TTFT, p99 TTFT (`886.6ms` versus
+`720.2ms`), p99 E2E (`938.3ms` versus `780.4ms`), and queue-to-first
+(`131.8ms` versus `122.2ms`). Keep the current initial wait; few_shot needs
+faster `b32`/mixed cached-prefix prefill rather than earlier launch.
+
 ## Public 20260705_150207 and inference-bench client fix
 
 Public inference-bench advanced to commit `0ace9c0a` with run
