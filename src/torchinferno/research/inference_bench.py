@@ -794,6 +794,30 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
             )
             lines.append("")
 
+        decode_window_target_rows = _decode_many_step_window_target_rows(
+            summary.torchinferno_queue_profiles
+        )
+        if decode_window_target_rows:
+            lines.append("[torchinferno decode-many implementation targets]")
+            lines.extend(
+                _format_table(
+                    (
+                        "temp",
+                        "max_tokens",
+                        "window",
+                        "calls",
+                        "model_tokens",
+                        "emitted",
+                        "skipped",
+                        "skip_pct",
+                        "est_gpu_ms",
+                        "est_us_tok",
+                    ),
+                    decode_window_target_rows,
+                )
+            )
+            lines.append("")
+
     provider_phase_rows = _provider_server_log_rows(summary.provider_server_logs)
     if provider_phase_rows:
         lines.append("[provider server log phases]")
@@ -2325,6 +2349,79 @@ def _decode_many_step_window_rows(
                 )
             )
     return rows
+
+
+def _decode_many_step_window_target_rows(
+    profiles: Sequence[QueueProfileSummary],
+    *,
+    limit: int = 8,
+) -> list[tuple[str, ...]]:
+    items: list[tuple[float, float, str, tuple[str, ...]]] = []
+    for profile in profiles:
+        fields = profile.fields
+        window_tokens = _numeric_mapping(
+            fields.get("runtime_decode_many_step_window_model_tokens")
+        )
+        if not window_tokens:
+            continue
+        shape_tokens = _numeric_mapping(
+            fields.get("runtime_decode_many_shape_model_tokens")
+        )
+        shape_gpu_ms = _numeric_mapping(
+            fields.get("runtime_decode_many_shape_gpu_ms")
+        )
+        window_counts = _numeric_mapping(
+            fields.get("runtime_decode_many_step_window_counts")
+        )
+        window_emitted = _numeric_mapping(
+            fields.get("runtime_decode_many_step_window_emitted_tokens")
+        )
+        window_skipped = _numeric_mapping(
+            fields.get("runtime_decode_many_step_window_skipped_tokens")
+        )
+        for window, raw_tokens in window_tokens.items():
+            model_tokens = max(0.0, float(raw_tokens))
+            if model_tokens <= 0.0:
+                continue
+            shape = _decode_many_step_window_shape(window)
+            shape_model_tokens = float(shape_tokens.get(shape, 0.0))
+            shape_ms = float(shape_gpu_ms.get(shape, 0.0))
+            est_gpu_ms: float | None = None
+            if shape_model_tokens > 0.0 and shape_ms > 0.0:
+                est_gpu_ms = shape_ms * model_tokens / shape_model_tokens
+            est_us_tok: float | None = None
+            if est_gpu_ms is not None:
+                est_us_tok = est_gpu_ms * 1000.0 / model_tokens
+            skipped = float(window_skipped.get(window, 0.0))
+            score_ms = est_gpu_ms if est_gpu_ms is not None else -1.0
+            items.append(
+                (
+                    score_ms,
+                    model_tokens,
+                    window,
+                    (
+                        _fmt_value(profile.temperature),
+                        _fmt_value(profile.max_tokens),
+                        window,
+                        _fmt_value(_int_if_whole(window_counts.get(window, 0.0))),
+                        _fmt_value(_int_if_whole(model_tokens)),
+                        _fmt_value(_int_if_whole(window_emitted.get(window, 0.0))),
+                        _fmt_value(_int_if_whole(skipped)),
+                        _fmt_pct(skipped, model_tokens),
+                        _fmt_value(None if est_gpu_ms is None else _int_if_whole(est_gpu_ms)),
+                        _fmt_value(None if est_us_tok is None else _int_if_whole(est_us_tok)),
+                    ),
+                )
+            )
+    items.sort(key=lambda item: (-item[0], -item[1], item[2]))
+    return [item[3] for item in items[:limit]]
+
+
+def _decode_many_step_window_shape(window: str) -> str:
+    shape, sep, suffix = window.rpartition(":")
+    if sep and suffix.startswith("g"):
+        return shape
+    return window
 
 
 def _top_mapping_entry(value: Any) -> tuple[str | None, float | int | None]:
