@@ -3080,6 +3080,7 @@ class Llama3TensorParallelForCausalLM:
         self._ragged_prefill_mixed_logits_graph_failed = False
         self._ragged_prefill_capture_on_miss_failed = False
         self._temperature_gumbel_generators: dict[str, torch.Generator] = {}
+        self._temperature_sample_buffers: dict[tuple[str, tuple[int, ...]], tuple[Tensor, Tensor]] = {}
 
     def set_runtime_fp8_prefill(self, enabled: bool, *, min_m: int = 2048) -> None:
         min_m = max(1, int(min_m))
@@ -7303,11 +7304,13 @@ class Llama3TensorParallelForCausalLM:
         return next_token
 
     def _sample_next_token_temperature_gumbel(self, logits: Tensor, temperature: float) -> Tensor:
-        logits_float = logits.float() / temperature
-        gumbel = -torch.empty_like(logits_float).exponential_(
-            generator=self._temperature_gumbel_generator(logits.device)
-        ).log()
-        local_values, local_indices = torch.max(logits_float + gumbel, dim=-1)
+        logits_float, gumbel = self._temperature_sample_work_buffers(logits)
+        logits_float.copy_(logits)
+        logits_float.div_(temperature)
+        gumbel.exponential_(generator=self._temperature_gumbel_generator(logits.device))
+        gumbel.log_()
+        gumbel.neg_()
+        local_values, local_indices = torch.max(logits_float.add_(gumbel), dim=-1)
         global_values = local_values.clone()
         dist.all_reduce(global_values, op=dist.ReduceOp.MAX)
         sentinel = torch.full_like(local_indices, self.config.vocab_size)
@@ -7330,6 +7333,23 @@ class Llama3TensorParallelForCausalLM:
             generator.manual_seed(seed)
             generators[key] = generator
         return generator
+
+    def _temperature_sample_work_buffers(self, logits: Tensor) -> tuple[Tensor, Tensor]:
+        shape = tuple(int(dim) for dim in logits.shape)
+        if _cuda_stream_is_capturing(logits.device):
+            logits_float = torch.empty(shape, dtype=torch.float32, device=logits.device)
+            return logits_float, torch.empty_like(logits_float)
+        buffers = getattr(self, "_temperature_sample_buffers", None)
+        if buffers is None:
+            buffers = {}
+            self._temperature_sample_buffers = buffers
+        key = (str(logits.device), shape)
+        cached = buffers.get(key)
+        if cached is None or cached[0].device != logits.device or cached[0].shape != logits.shape:
+            logits_float = torch.empty(shape, dtype=torch.float32, device=logits.device)
+            cached = (logits_float, torch.empty_like(logits_float))
+            buffers[key] = cached
+        return cached
 
     def _sample_next_token_temperature(self, logits: Tensor, temperature: float) -> Tensor:
         logits_float = logits.float() / temperature

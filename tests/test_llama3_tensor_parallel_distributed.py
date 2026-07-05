@@ -91,6 +91,26 @@ def test_llama3_tensor_parallel_greedy_sampler_gather_opt_in(monkeypatch) -> Non
     assert sampled.tolist() == [5]
 
 
+def test_llama3_tensor_parallel_temperature_sampler_reuses_work_buffers() -> None:
+    model = object.__new__(Llama3TensorParallelForCausalLM)
+    model.device = torch.device("cpu")
+    model._temperature_sample_buffers = {}
+
+    logits = torch.randn(3, 5, dtype=torch.bfloat16)
+    first_scaled, first_gumbel = model._temperature_sample_work_buffers(logits)
+    second_scaled, second_gumbel = model._temperature_sample_work_buffers(logits)
+
+    assert first_scaled.dtype == torch.float32
+    assert first_scaled.shape == logits.shape
+    assert first_scaled.data_ptr() == second_scaled.data_ptr()
+    assert first_gumbel.data_ptr() == second_gumbel.data_ptr()
+
+    other_scaled, other_gumbel = model._temperature_sample_work_buffers(torch.randn(4, 5))
+
+    assert other_scaled.data_ptr() != first_scaled.data_ptr()
+    assert other_gumbel.data_ptr() != first_gumbel.data_ptr()
+
+
 def test_llama3_tensor_parallel_decode_marlin_writes_into_symm_buffer(monkeypatch) -> None:
     layer = object.__new__(tensor_parallel_module._Llama3TensorParallelLayer)
     layer.world_size = 2
