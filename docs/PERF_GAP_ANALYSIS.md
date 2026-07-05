@@ -48,6 +48,22 @@ also stayed in one session with `1000` adoptions and landed faster on medians:
 greedy-large persistent idle window; the public split is host/run timing noise,
 not a robust gap closer.
 
+The transposed-weight decode `mm` path is rejected for long_output. A focused
+run with `TORCHINFERNO_DECODE_TRANSPOSED_WEIGHTS=1` and
+`TORCHINFERNO_DECODE_LINEAR_MM=1` wrote
+`/tmp/inference-bench-ti-long-decode-mm-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-ti-long-decode-mm-5f737d4-20260705/runs/20260705_200955`
+and landed at `220.9 / 24.1 / 1058.2ms`, `1000/1000` correct. The immediate
+no-env paired control on the same commit and harness wrote
+`/tmp/inference-bench-ti-long-default-paired-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-ti-long-default-paired-5f737d4-20260705/runs/20260705_201526`
+and was better on all medians at `207.9 / 23.5 / 1038.7ms`, also
+`1000/1000` correct. Queue counters confirm this was not a hidden decode-body
+win: the transposed-mm run spent `10.26s` in ragged decode GPU and `5.08s` in
+decode-many GPU across `117` decode-many calls, while the control spent `9.77s`
+ragged decode GPU and `5.65s` decode-many GPU across `120` calls with lower
+median TPOT/E2E. Keep the transposed decode-mm path opt-in; the long_output gap
+still needs a structural decode replay reduction or packed cached-prefix
+prefill body, not a different `F.linear` layout.
+
 ## Public 20260705_170204 after inference-bench client fix
 
 Public inference-bench advanced to commit `f240a799` with run
