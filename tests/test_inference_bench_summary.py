@@ -87,6 +87,14 @@ def _write_inference_bench_run(tmp_path) -> None:
         "runtime_max_active_requests": 96,
         "runtime_prefix_cache_capacity": 128,
         "greedy_large_mixed_prefix_reuse": True,
+        "use_decode_many": True,
+        "decode_quantum": 3,
+        "drain_decode_quantum": 8,
+        "admit_per_step_cap": 64,
+        "admit_min_free_rows": 4,
+        "admit_min_ready_requests": 12,
+        "prefill_ready_before_decode": True,
+        "prefill_ready_before_decode_active_cap": 8,
         "request_queue_to_first_token_p50_ms": 11.0,
         "runtime_prefill_batches": 1,
         "runtime_prefill_forward_ms": 12.0,
@@ -350,6 +358,14 @@ def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) ->
     assert "max_active" in text
     assert "prefix_cap" in text
     assert "mixed_prefix" in text
+    assert "decode_many" in text
+    assert "decode_q" in text
+    assert "drain_q" in text
+    assert "admit_cap" in text
+    assert "min_free" in text
+    assert "min_ready" in text
+    assert "prefill_ready" in text
+    assert "ready_cap" in text
     assert "coverage" in text
     assert "2/2" in text
     assert "[torchinferno score targets]" in text

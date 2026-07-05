@@ -33,12 +33,29 @@ The public shape moved a few cells but did not change the unresolved work:
   `9.77s` ragged-decode GPU), matching the current decode-throughput gap rather
   than a missing default knob.
 
+Rechecking current `11f7acc` on focused local long_output wrote
+`/tmp/inference-bench-ti-long-current-head-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-ti-long-current-20260705/runs/20260705_141140`
+and landed at `234.1 / 23.4 / 1129.4ms`, `1000/1000` correct. The row was
+still decode-bound: `63` prefill batches, `4.79s/5.22s` prefill forward/wall,
+`10.26s` ragged-decode GPU, `4.61s` decode-many GPU, and `611` overgenerated
+tokens with the default stop-tail cap `4`. Turning the short-greedy stop-tail
+cap off is rejected. The focused A/B
+`/tmp/inference-bench-ti-long-tail0-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-ti-long-tail0-20260705/runs/20260705_141815`
+landed at `261.6 / 22.7 / 1152.7ms`, `1000/1000` correct: TPOT moved slightly
+down, but E2E worsened, overgeneration rose to `1282`, decode-many GPU rose to
+`5.42s`, and replay time rose to `4.47s`. Keep the default tail cap at `4`;
+the remaining long_output gap is still cheaper per-step model replay or a real
+prefill packing path, not looser stop-tail filtering.
+
 Keep the next public read focused on whether the measured TorchInferno commit
 has advanced past `c85d39b`; only then should the multi_turn row be compared
 against the local no-env mixed-prefix validations below. Queue profiles now also
 emit `greedy_large_mixed_prefix_reuse` so that public rows self-report whether
-the scoped OpenAI policy was active, and `inference-bench-summary` prints that
-field as `mixed_prefix` in its queue-profile table.
+the scoped OpenAI policy was active. `inference-bench-summary` prints that field
+as `mixed_prefix` and also exposes the recorded decode/admission/prefill-ready
+policy columns (`decode_many`, `decode_q`, `drain_q`, `admit_cap`,
+`min_free`, `min_ready`, `prefill_ready`, and `ready_cap`) in its queue-profile
+table.
 
 ## Public 20260705_110218 refresh and multi-turn scheduler rejections
 
