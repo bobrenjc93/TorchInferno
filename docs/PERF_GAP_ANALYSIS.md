@@ -10894,6 +10894,18 @@ That confirms the same shape as the earlier `batch=64` replay: the long_output
 gap is model-kernel throughput plus padded prefill, not an untried
 queue-scheduling toggle.
 
+A sampled temperature scratch-buffer experiment was also rejected and reverted.
+Commit `e20eff3` reused per-shape float/Gumbel work buffers in the distributed
+temperature sampler, but a valid tree-only run at
+`/tmp/inference-bench-ti-e20eff3-tree-results/.../runs/20260705_215756`
+landed at `146.4 / 64.1 / 205.8ms`, `963/992` correct, worse than the public
+`20260705_210211` tree row (`79.6 / 64.9 / 114.5ms`). The queue profile showed
+lower model-side prefill/decode totals (`2.84s` prefill forward, `2.46s`
+decode GPU), but `prefill_sample_ms` rose to `305ms` and request queueing
+dominated (`q2first=130ms`, `q2submit=75ms`). The extra copy/divide work is not
+a proven default win; keep sampled decode focused on a real fused or graph-safe
+sampler, not persistent scratch buffers.
+
 ## Priority for a focused (non-loop) session
 
 1. Prefill MFU (Issue 1) — biggest TTFT lever, ~2x, affects 3/5 benchmarks.
