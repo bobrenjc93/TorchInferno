@@ -48,10 +48,20 @@ Three current-stack `multi_turn` probes are rejected:
   `/tmp/inference-bench-ti-multiturn-active48-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-ti-multiturn-active48-20260705/runs/20260705_115609`
   and regressed sharply to `798.5 / 81.0 / 881.5ms`, `984/1000` correct.
   Wider active rows are still not a defaultable multi_turn fix.
+- Explicit greedy-large mixed-prefix reuse remains promising but not stable
+  enough to default on. The first current-stack opt-in run wrote
+  `/tmp/inference-bench-ti-multiturn-mixedprefix-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-ti-multiturn-mixedprefix-20260705/runs/20260705_120548`
+  and improved to `272.1 / 65.4 / 349.7ms`, with prefill wall down to
+  `2.76s` and `q2first_p50=150.6ms`. The immediate repeat wrote
+  `/tmp/inference-bench-ti-multiturn-mixedprefix-repeat-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-ti-multiturn-mixedprefix-repeat-20260705/runs/20260705_121126`
+  and regressed to `466.2 / 63.2 / 510.2ms`; it hit a rare mixed-prefix graph
+  miss and spent `389ms` on `prefix_graph:b2:s32:p156-158:src2:mixed1`.
+  Keep the policy opt-in until mixed-prefix prefill graph coverage is robust.
 
 The practical multi_turn target remains a lower-cost packed/fixed-pattern
-cached-prefix prefill implementation, not current packed eager, wider active
-rows, or earlier refill prefill scheduling.
+cached-prefix prefill implementation and robust mixed-prefix graph coverage,
+not current packed eager, wider active rows, or earlier refill prefill
+scheduling.
 
 ## Public 20260705_090205 refresh and decode graph symm telemetry
 
