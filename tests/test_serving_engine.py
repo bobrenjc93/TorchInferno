@@ -3271,8 +3271,8 @@ def test_continuous_batch_engine_can_use_fixed_capacity_packed_prefill_graph(
     assert logits.shape == (2, 1, model.vocab_size)
     assert engine.stats.prefill_packed_eager_calls == 1
     assert engine.stats.prefill_packed_eager_tokens == 6
-    assert engine.stats.prefill_packed_eager_model_tokens == 10
-    assert engine.stats.prefill_packed_eager_saved_tokens == 4
+    assert engine.stats.prefill_packed_eager_model_tokens == 8
+    assert engine.stats.prefill_packed_eager_saved_tokens == 2
     assert pad_rows == [2]
     for row in pad_rows:
         engine._release_active_row(row)

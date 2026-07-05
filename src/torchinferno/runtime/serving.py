@@ -3809,7 +3809,7 @@ class ContinuousBatchEngine:
             self._record_packed_prefill_eager_result(
                 profile_shape_key=profile_shape_key,
                 real_tokens=sum(suffix_lengths),
-                model_tokens=dense_tokens,
+                model_tokens=fixed_tokens,
                 elapsed_ms=elapsed_ms,
             )
             pad_rows.extend(extra_active_rows)
