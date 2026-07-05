@@ -57,6 +57,18 @@ prefill-ready policy columns (`fp8_prefill`, `fp8_min_m`, `marlin_decode`,
 `decode_many`, `decode_q`, `drain_q`, `admit_cap`, `min_free`, `min_ready`,
 `prefill_ready`, and `ready_cap`) in its queue-profile table.
 
+The first pushed-head focused `multi_turn` validation on `a170138` wrote
+`/tmp/inference-bench-ti-multiturn-current-a170-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-ti-multiturn-current-a170-20260705/runs/20260705_144052`
+and landed at `310.8 / 63.1 / 362.8ms`, `981/1000` correct. The score row was
+noisier than the best no-env mixed-prefix full-suite checks, but the policy and
+mechanics matched the intended default: `mixed_prefix=true`, `prefix_rows=112`,
+`prefill_ready=false`, `decode_many=false`, `q2first_p50=156.9ms`, `37`
+prefill batches, `2.29s/2.87s` prefill forward/wall, `843.8ms` ragged-decode
+GPU, `37/0` prefill graph hits/misses, and route counts
+`{"common_prefix":125,"request_prompt":875}`. Treat this as evidence that the
+public `c85d39b` row is stale, not as a reason to re-enable PRBD; the
+mixed-prefix PRBD-on path was already rejected below.
+
 ## Public 20260705_110218 refresh and multi-turn scheduler rejections
 
 The latest public inference-bench commit advanced to `11363bd4` with run
