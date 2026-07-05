@@ -1,5 +1,49 @@
 # TorchInferno vs vLLM/sglang — Performance Gap Analysis (Llama-3.1-70B, 8xH100)
 
+A current tree_of_thought sample-gather recheck is rejected as a default
+runtime change. On pushed `b2b11a3`, the focused run with
+`TORCHINFERNO_TEMPERATURE_SAMPLE_GATHER=1` wrote
+`/tmp/inference-bench-ti-b2b11a3-tree-sample-gather-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100/runs/20260705_221318`
+and landed at `135.4 / 62.7 / 192.9ms`, `956/992` correct. Queue telemetry
+shows why the small TPOT improvement is not enough: `q2first_p50=121.6ms`,
+`q2submit_p50=71.2ms`, `prefill_forward/wall=2.98s/3.69s`,
+`prefill_sample_ms=404.4`, `2.61s` ragged decode GPU, and `43` decode graph
+misses. Keep the gather path opt-in for targeted experiments; the sampled tree
+gap still needs lower cached-prefix prefill and first-token cost, not a gather
+default.
+
+## Public 20260705_210211
+
+Public inference-bench advanced to run
+`results/v1/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100/runs/20260705_210211`
+while the checked-out inference-bench repo was at `5d4447d`. It measured
+TorchInferno `79bd32e`, so it predates the later Marlin output-buffer,
+decode-MLP scratch, shared-temperature list, and rejected-sample-scratch
+commits now pushed to main. Scorecard stayed TorchInferno `3/20`, vLLM
+`15/20`, and SGLang `1/20`.
+
+- few_shot: TorchInferno `175.1 / 44.4 / 212.3ms`, vLLM
+  `115.7 / 39.9 / 145.3ms`, SGLang `139.6 / 74.7 / 214.9ms`.
+- self_consistency: TorchInferno `106.6 / 0.0 / 115.1ms`, vLLM
+  `136.7 / 0.0 / 161.6ms`, SGLang `226.8 / 0.0 / 361.1ms`.
+- multi_turn: TorchInferno `245.4 / 56.9 / 297.0ms`, vLLM
+  `153.7 / 45.3 / 196.7ms`, SGLang `164.4 / 105.8 / 275.1ms`.
+- tree_of_thought: TorchInferno `79.6 / 64.9 / 114.5ms`, vLLM
+  `33.1 / 21.7 / 49.0ms`, SGLang `47.9 / 382.9 / 404.6ms`.
+- long_output: TorchInferno `255.0 / 20.6 / 959.5ms`, vLLM
+  `101.0 / 14.5 / 701.4ms`, SGLang `68.8 / 22.3 / 931.9ms`.
+
+The queue profile points to the same remaining gaps. long_output was dominated
+by `10.21s` ragged decode GPU and `3.50s` decode-many GPU, with
+`q2first_p50=174.8ms` and `q2submit_p50=50.9ms`. few_shot remained a cached
+prefix prefill replay problem with `q2first_p50=102.2ms`,
+`prefill_forward/wall=1.48s/1.87s`, and `4.83K` packed-prefix saved-token
+opportunity. multi_turn spent `2.48s/2.84s` in prefill with
+`q2first_p50=142.3ms` and mixed-prefix reuse enabled. tree_of_thought still
+had many sampled cached-prefix prefill waves: `q2first_p50=75.2ms`,
+`q2submit_p50=37.3ms`, `prefill_forward/wall=5.05s/5.50s`, `4.65s` ragged
+decode GPU, and `97` decode graph misses.
+
 ## Public 20260705_190219
 
 Public inference-bench advanced to commit `6af04218` with run
