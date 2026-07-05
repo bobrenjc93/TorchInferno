@@ -5765,6 +5765,7 @@ class OpenAICompletionEngine:
                 pin_shared_prefix=pin_shared_prefix,
                 store_reusable_prefixes=store_reusable_prefixes,
                 store_full_prompt_prefixes=store_full_prompt_prefixes,
+                greedy_large_mixed_prefix_reuse=greedy_large_mixed_prefix_reuse,
                 fp8_prefill_enabled=fp8_prefill_enabled,
                 fp8_prefill_min_m=fp8_prefill_min_m,
                 marlin_int4_decode_enabled=marlin_int4_decode_enabled,

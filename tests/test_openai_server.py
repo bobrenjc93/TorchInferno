@@ -16399,6 +16399,7 @@ def test_openai_tensor_parallel_online_batcher_profile_snapshots(
     assert final_record["pin_shared_prefix"] is True
     assert final_record["store_reusable_prefixes"] is True
     assert final_record["store_full_prompt_prefixes"] is True
+    assert final_record["greedy_large_mixed_prefix_reuse"] is False
     assert final_record["submit_batches"] == 1
     assert final_record["submit_requests"] == 1
     assert final_record["submit_batch_max"] == 1
