@@ -59,6 +59,29 @@ decode-many and spent `281.9s` in decode GPU, dominated by
 `prompt_lookup:b3:proposal8`. Keep prompt lookup default-off for this workload;
 accepted proposals are not useful when verification fragments the decode body.
 
+Allowing short greedy decode-many while requests are waiting is rejected as a
+default. The opt-in run with
+`TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY_WITH_WAITING=1` wrote
+`/tmp/inference-bench-ti-decode-many-waiting-long-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100/runs/20260705_232115`
+and landed at `422.5 / 15.8 / 1083.8ms`, `1000/1000` correct. It did improve
+median TPOT, but first-token pacing collapsed: `q2first_p50=393.9ms`,
+`submit2first_p50=377.1ms`, and decode-many expanded to `320` calls,
+`953` steps, and `12.19s` decode-many GPU. The scheduler kept the model busy
+after admission, but it starved newly admitted rows from first-token service.
+Keep waiting decode-many disabled until there is an event-flush or overlap
+design that preserves TTFT.
+
+Raising the short greedy drain-only decode quantum from `8` to `16` is also
+rejected on the current pushed tree. The env-only run with
+`TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_DRAIN_DECODE_QUANTUM=16` wrote
+`/tmp/inference-bench-ti-drain16-long-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100/runs/20260705_232736`
+and landed at `298.4 / 21.9 / 1046.8ms`, `1000/1000` correct. Compared with
+the adjacent default-control row (`198.0 / 23.9 / 1043.4ms`), drain-16 bought
+a small TPOT win but lost TTFT and E2E. Queue counters show the same tradeoff:
+`q2first_p50=227.7ms`, `submit2first_p50=178.3ms`, `129` decode-many calls,
+`604` decode-many steps, and `7.75s` decode-many GPU. Keep the default drain
+quantum at `8`; larger bursts need a first-token-preserving flush policy.
+
 ## Public 20260705_210211
 
 Public inference-bench advanced to run
