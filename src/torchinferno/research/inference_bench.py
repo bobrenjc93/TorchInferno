@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import json
 import re
 from dataclasses import dataclass, field
@@ -2490,3 +2491,39 @@ def _format_table(header: tuple[str, ...], rows: Sequence[tuple[str, ...]]) -> l
     for row in rows:
         formatted.append("  " + "  ".join(cell.ljust(widths[index]) for index, cell in enumerate(row)))
     return formatted
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="python -m torchinferno.research.inference_bench",
+        description="Summarize an inference-bench run directory.",
+    )
+    parser.add_argument("run_dir", help="Path to an inference-bench run directory containing results.json.")
+    parser.add_argument(
+        "--benchmark",
+        action="append",
+        default=None,
+        help="Benchmark name to include. Repeat to include multiple; defaults to all.",
+    )
+    parser.add_argument(
+        "--provider",
+        action="append",
+        default=None,
+        help="Provider name to include. Repeat to include multiple; defaults to all.",
+    )
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = build_arg_parser().parse_args(argv)
+    summary = summarize_inference_bench_run(
+        args.run_dir,
+        benchmarks=tuple(args.benchmark) if args.benchmark else None,
+        providers=tuple(args.provider) if args.provider else None,
+    )
+    print(format_inference_bench_summary(summary), end="")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

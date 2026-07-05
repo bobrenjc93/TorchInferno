@@ -16,13 +16,24 @@ from torchinferno.research.helion import (
     run_helion_region_search,
     trace_helion_candidate,
 )
-from torchinferno.research.inference_bench import (
-    InferenceBenchRunSummary,
-    ProviderBenchmarkSummary,
-    QueueProfileSummary,
-    format_inference_bench_summary,
-    summarize_inference_bench_run,
-)
+
+_INFERENCE_BENCH_EXPORTS = {
+    "InferenceBenchRunSummary",
+    "ProviderBenchmarkSummary",
+    "QueueProfileSummary",
+    "format_inference_bench_summary",
+    "summarize_inference_bench_run",
+}
+
+
+def __getattr__(name: str) -> object:
+    if name in _INFERENCE_BENCH_EXPORTS:
+        from torchinferno.research import inference_bench
+
+        value = getattr(inference_bench, name)
+        globals()[name] = value
+        return value
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 __all__ = [
     "BenchmarkResult",
