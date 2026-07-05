@@ -1,5 +1,58 @@
 # TorchInferno vs vLLM/sglang — Performance Gap Analysis (Llama-3.1-70B, 8xH100)
 
+## Public 20260705_110218 refresh and multi-turn scheduler rejections
+
+The latest public inference-bench commit advanced to `11363bd4` with run
+`results/v1/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100/runs/20260705_110218`.
+That public run still measured TorchInferno commit `390fed4`, not the later
+`879a6b6` commit that was pushed with CUDA greedy-gather sampling and decode
+graph cache/symm telemetry. Score stayed `4/20` for TorchInferno, while vLLM
+rose to `13/20` and SGLang fell to `2/20`.
+
+Public gaps after `20260705_110218`:
+
+- multi_turn: TorchInferno `350.8 / 61.7 / 401.5ms`, vLLM
+  `172.4 / 48.9 / 219.5ms`, SGLang `165.4 / 104.3 / 278.8ms`.
+- tree_of_thought: TorchInferno `123.5 / 30.6 / 148.2ms`, vLLM
+  `62.6 / 30.6 / 85.9ms`, SGLang `76.5 / 57.1 / 141.8ms`. The earlier
+  sampled-medium cap-32 work is now visible publicly as a TPOT tie with vLLM,
+  but TTFT/E2E are still first-token/prefill bound.
+- long_output: TorchInferno `278.4 / 19.6 / 1003.4ms`, vLLM
+  `84.5 / 14.9 / 634.3ms`, SGLang `75.3 / 22.2 / 823.6ms`.
+
+Rechecking current `879a6b6` defaults on local `multi_turn` wrote
+`/tmp/inference-bench-ti-multiturn-current-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-ti-multiturn-current-20260705/runs/20260705_113750`
+and landed at `361.3 / 57.5 / 416.7ms`, `981/1000` correct. Queue telemetry
+again points at prefill, not decode: `q2first_p50=263.5ms`, `33` prefill
+batches, `3.79s/4.06s` prefill forward/wall, and only `0.73s` decode GPU.
+The hottest prefill shape was `prefix_graph:b32:s144:p45-45:src1:mixed0`
+(`982.5ms` forward). Packed prefill candidates saved apparent dense tokens
+(`20.5K` total, `6.3K` on the hot shape), but pattern reuse was low
+(`9/32` repeat calls, `13.2%` repeated saved-token share).
+
+Three current-stack `multi_turn` probes are rejected:
+
+- Shape-gated packed eager prefill for `prefix_graph:b32:s144:p45-45:src1:mixed0`
+  wrote
+  `/tmp/inference-bench-ti-multiturn-packedeager-s144-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-ti-multiturn-packedeager-s144-20260705/runs/20260705_114357`
+  and regressed to `522.6 / 61.1 / 577.3ms`, `980/1000` correct. Six packed
+  eager calls spent `6.71s`, so the Python-packed transformer body is still far
+  more expensive than dense graphed prefill despite token savings.
+- Raising greedy-large `prefill_ready_before_decode_active_cap` from `8` to
+  `32` wrote
+  `/tmp/inference-bench-ti-multiturn-cap32-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-ti-multiturn-cap32-20260705/runs/20260705_115006`
+  and regressed to `427.5 / 63.5 / 476.3ms`, `984/1000` correct. It added
+  another prefill batch and increased prefill wall to `4.37s`; keep the greedy
+  large cap at `8`.
+- Raising greedy-large max active rows to `48` wrote
+  `/tmp/inference-bench-ti-multiturn-active48-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-ti-multiturn-active48-20260705/runs/20260705_115609`
+  and regressed sharply to `798.5 / 81.0 / 881.5ms`, `984/1000` correct.
+  Wider active rows are still not a defaultable multi_turn fix.
+
+The practical multi_turn target remains a lower-cost packed/fixed-pattern
+cached-prefix prefill implementation, not current packed eager, wider active
+rows, or earlier refill prefill scheduling.
+
 ## Public 20260705_090205 refresh and decode graph symm telemetry
 
 The latest public run advanced to
