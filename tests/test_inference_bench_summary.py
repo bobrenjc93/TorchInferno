@@ -203,6 +203,7 @@ def _write_inference_bench_run(tmp_path) -> None:
         "runtime_prefill_packed_candidate_pattern_repeated_saved_tokens": 20,
         "runtime_prefill_packed_candidate_pattern_counts": {
             "prefix_graph:b8:s16:p45-45:src1:mixed0|p45:s10/p45:s11": 4,
+            "prefix_graph:b2:s4:p0-0:src0:mixed0|p0:s4": 3,
         },
         "runtime_prefill_packed_candidate_pattern_tokens": {
             "prefix_graph:b8:s16:p45-45:src1:mixed0|p45:s10/p45:s11": 35,
@@ -219,6 +220,7 @@ def _write_inference_bench_run(tmp_path) -> None:
         "runtime_prefill_packed_candidate_pattern_slot_counts": {
             "prefix_graph:b8:s16:p45-45:src1:mixed0|p45:s10/p45:s11#p45:s10": 2,
             "prefix_graph:b8:s16:p45-45:src1:mixed0|p45:s10/p45:s11#p45:s11": 1,
+            "prefix_graph:b2:s4:p0-0:src0:mixed0|p0:s4#p0:s4": 3,
         },
         "runtime_decode_ragged_model_gpu_ms": 14.0,
         "runtime_decode_graph_misses": 10,
@@ -421,6 +423,7 @@ def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) ->
     assert "fixed_saved_pct" in text
     assert "est_saved_ms" in text
     assert "75.8%" in text
+    assert "prefix_graph:b2:s4:p0-0:src0:mixed0|p0:s4" not in text
     assert "saved_pct" in text
     assert "pattern_keys" in text
     assert "repeat_call_pct" in text

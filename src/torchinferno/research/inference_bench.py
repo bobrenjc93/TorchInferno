@@ -1842,6 +1842,8 @@ def _prefill_packed_fixed_capacity_plan_rows(
             dense_tokens = dense_per_call * call_count
             fixed_tokens = fixed_per_call * call_count
             fixed_saved = max(0.0, dense_tokens - fixed_tokens)
+            if fixed_saved <= 0.0:
+                continue
             sig_calls = pattern_signature_calls.get(pattern, 0.0)
             est_saved_ms = _prefill_packed_fixed_capacity_saved_ms(
                 fields,
