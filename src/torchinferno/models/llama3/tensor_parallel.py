@@ -1478,6 +1478,7 @@ class _Llama3TensorParallelLayer:
         ] = {}
         self._prefill_gate_up_activation_graph_failed = False
         self._symm_reduce_failed = False
+        self._decode_scratch_buffers: dict[tuple[str, torch.device, torch.dtype, tuple[int, ...]], Tensor] = {}
 
     def forward(
         self,
@@ -2325,7 +2326,12 @@ class _Llama3TensorParallelLayer:
         # This path serves BOTH decode (small M) and paged PREFILL (large M, via
         # forward_prefill_paged). marlin wins small-M; fp8 wins large-M (M-gates are
         # complementary, so at most one fires).
-        gu = self._marlin_proj(hidden, "gu", self.gate_up_proj_weight)
+        gu_buffer = self._decode_scratch_buffer(
+            "mlp-gate-up",
+            hidden,
+            self.gate_up_proj_weight.size(0),
+        )
+        gu = self._marlin_proj(hidden, "gu", self.gate_up_proj_weight, out=gu_buffer)
         if gu is None:
             gu = self._fp8_proj(hidden, "gu", self.gate_up_proj_weight)
         if gu is not None:
@@ -2335,7 +2341,12 @@ class _Llama3TensorParallelLayer:
                 (self.local_intermediate_size, self.local_intermediate_size),
                 dim=-1,
             )
-        activated = _tp_decode_swiglu(gate, up)
+        activation_buffer = self._decode_scratch_buffer(
+            "mlp-activation",
+            hidden,
+            self.local_intermediate_size,
+        )
+        activated = _tp_decode_swiglu(gate, up, out=activation_buffer)
         # down_proj is the OTHER big MLP GEMM (N=hidden 8192, K=local_intermediate);
         # at decode M it is weight-read/memory-bound where marlin int4 wins the GEMM
         # (~1.44x, bench_marlin_int4). BUT default-OFF: unlike gate_up (greedy-EXACT vs
@@ -2350,6 +2361,20 @@ class _Llama3TensorParallelLayer:
             activated, self.down_proj_weight, "mlp", self.down_proj_weight_decode,
             marlin_key=down_key, fp8_key="down",
         )
+
+    def _decode_scratch_buffer(self, name: str, hidden: Tensor, width: int) -> Tensor | None:
+        if hidden.ndim != 3 or hidden.size(1) != 1:
+            return None
+        if _cuda_stream_is_capturing(hidden.device):
+            key = (name, hidden.device, hidden.dtype, (*hidden.shape[:-1], int(width)))
+            return self._decode_scratch_buffers.get(key)
+        expected_shape = (*hidden.shape[:-1], int(width))
+        key = (name, hidden.device, hidden.dtype, expected_shape)
+        buffer = self._decode_scratch_buffers.get(key)
+        if buffer is None:
+            buffer = torch.empty(expected_shape, device=hidden.device, dtype=hidden.dtype)
+            self._decode_scratch_buffers[key] = buffer
+        return buffer
 
     def _mlp_project_prefill_reduce(self, hidden: Tensor) -> Tensor | None:
         if not _should_use_symm_mem_prefill_all_reduce(hidden, self.down_proj_weight, self.world_size):
@@ -8349,26 +8374,34 @@ def _tp_decode_add_rms_norm(x: Tensor, residual: Tensor, weight: Tensor, eps: fl
     return hidden, _torch_rms_norm(hidden, weight, eps)
 
 
-def _tp_swiglu(gate: Tensor, up: Tensor) -> Tensor:
+def _tp_swiglu(gate: Tensor, up: Tensor, *, out: Tensor | None = None) -> Tensor:
     if gate.is_cuda and up.is_cuda and _tp_flag("TORCHINFERNO_TRITON_SWIGLU", False):
         try:
             from torchinferno.kernels import swiglu_activation
 
-            return swiglu_activation(gate, up)
+            return swiglu_activation(gate, up, out=out)
         except Exception as exc:
             warn_optional_failure("llama3_tensor_parallel.swiglu", exc)
-    return F.silu(gate) * up
+    activated = F.silu(gate) * up
+    if out is not None:
+        out.copy_(activated)
+        return out
+    return activated
 
 
-def _tp_decode_swiglu(gate: Tensor, up: Tensor) -> Tensor:
+def _tp_decode_swiglu(gate: Tensor, up: Tensor, *, out: Tensor | None = None) -> Tensor:
     if gate.is_cuda and up.is_cuda and _tp_flag("TORCHINFERNO_TRITON_DECODE_SWIGLU"):
         try:
             from torchinferno.kernels import swiglu_activation
 
-            return swiglu_activation(gate, up)
+            return swiglu_activation(gate, up, out=out)
         except Exception as exc:
             warn_optional_failure("llama3_tensor_parallel.decode_swiglu", exc)
-    return F.silu(gate) * up
+    activated = F.silu(gate) * up
+    if out is not None:
+        out.copy_(activated)
+        return out
+    return activated
 
 
 def _should_use_mlp_project_graph(hidden: Tensor) -> bool:

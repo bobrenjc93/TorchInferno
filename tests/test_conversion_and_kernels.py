@@ -126,6 +126,10 @@ def test_kernel_fallbacks_match_torch_reference() -> None:
     weight = torch.randn(8)
 
     torch.testing.assert_close(swiglu_activation(gate, up), torch.nn.functional.silu(gate) * up)
+    provided = torch.empty_like(gate)
+    actual = swiglu_activation(gate, up, out=provided)
+    assert actual is provided
+    torch.testing.assert_close(provided, torch.nn.functional.silu(gate) * up)
     expected_norm = x * torch.rsqrt(x.float().pow(2).mean(dim=-1, keepdim=True) + 1e-6).to(x.dtype) * weight
     torch.testing.assert_close(rms_norm(x, weight, eps=1e-6), expected_norm)
 
@@ -155,6 +159,15 @@ def test_triton_cuda_kernels_match_torch_reference() -> None:
         torch.nn.functional.silu(gate_bf16) * up_bf16,
         atol=2e-2,
         rtol=2e-2,
+    )
+    provided = torch.empty_like(gate)
+    actual = swiglu_activation(gate, up, out=provided, config=config)
+    assert actual is provided
+    torch.testing.assert_close(
+        provided,
+        torch.nn.functional.silu(gate) * up,
+        atol=1e-5,
+        rtol=1e-5,
     )
     expected_norm = x * torch.rsqrt(x.float().pow(2).mean(dim=-1, keepdim=True) + 1e-6).to(x.dtype) * weight
     torch.testing.assert_close(rms_norm(x, weight, eps=1e-6, config=config), expected_norm, atol=1e-5, rtol=1e-5)

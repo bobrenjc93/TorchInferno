@@ -89,6 +89,7 @@ def swiglu_activation(
     gate: Tensor,
     up: Tensor,
     *,
+    out: Tensor | None = None,
     config: Optional[KernelConfig] = None,
 ) -> Tensor:
     """SwiGLU activation with a Triton CUDA implementation and torch fallback."""
@@ -97,8 +98,12 @@ def swiglu_activation(
     if _should_use_triton(gate, up, config):
         from torchinferno.kernels.triton_ops import triton_swiglu_activation
 
-        return triton_swiglu_activation(gate, up)
-    return swiglu_activation_reference(gate, up)
+        return triton_swiglu_activation(gate, up, out=out)
+    result = swiglu_activation_reference(gate, up)
+    if out is not None:
+        out.copy_(result)
+        return out
+    return result
 
 
 def fused_rmsnorm_swiglu(

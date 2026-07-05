@@ -20,6 +20,7 @@ def _swiglu_kernel(
     cols: tl.constexpr,
     gate_stride_row: tl.constexpr,
     up_stride_row: tl.constexpr,
+    out_stride_row: tl.constexpr,
     block_size: tl.constexpr,
 ) -> None:
     row = tl.program_id(0)
@@ -28,34 +29,43 @@ def _swiglu_kernel(
     gate = tl.load(gate_ptr + row * gate_stride_row + offsets, mask=mask, other=0.0).to(tl.float32)
     up = tl.load(up_ptr + row * up_stride_row + offsets, mask=mask, other=0.0)
     out = gate / (1.0 + tl.exp(-gate)) * up
-    tl.store(out_ptr + row * cols + offsets, out, mask=mask)
+    tl.store(out_ptr + row * out_stride_row + offsets, out, mask=mask)
 
 
-def triton_swiglu_activation(gate: Tensor, up: Tensor) -> Tensor:
+def triton_swiglu_activation(gate: Tensor, up: Tensor, *, out: Tensor | None = None) -> Tensor:
     if gate.shape != up.shape:
         raise ValueError("gate and up tensors must have the same shape")
+    if out is not None and out.shape != gate.shape:
+        raise ValueError("out tensor must have the same shape as gate and up")
+    if out is not None and (out.device != gate.device or out.dtype != gate.dtype):
+        raise ValueError("out tensor must have the same device and dtype as gate")
     if gate.stride(-1) != 1 or up.stride(-1) != 1:
         raise ValueError("gate and up tensors must have contiguous last dimensions")
+    if out is not None and out.stride(-1) != 1:
+        raise ValueError("out tensor must have a contiguous last dimension")
     if gate.ndim == 1:
         gate_2d = gate[None, :]
         up_2d = up[None, :]
+        out_2d = out[None, :] if out is not None else None
     else:
         gate_2d = gate.flatten(0, -2)
         up_2d = up.flatten(0, -2)
-    out = torch.empty_like(gate_2d)
+        out_2d = out.flatten(0, -2) if out is not None else None
+    out_2d = torch.empty_like(gate_2d) if out_2d is None else out_2d
     cols = gate_2d.size(1)
     block_size = triton.next_power_of_2(cols)
     _swiglu_kernel[(gate_2d.size(0),)](
         gate_2d,
         up_2d,
-        out,
+        out_2d,
         cols,
         gate_2d.stride(0),
         up_2d.stride(0),
+        out_2d.stride(0),
         block_size,
         num_warps=8,
     )
-    return out.view_as(gate)
+    return out if out is not None else out_2d.view_as(gate)
 
 
 @triton.jit

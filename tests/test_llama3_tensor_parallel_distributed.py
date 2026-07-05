@@ -153,6 +153,48 @@ def test_llama3_tensor_parallel_decode_marlin_writes_into_symm_buffer(monkeypatc
     torch.testing.assert_close(reduce_buffer, torch.full_like(reduce_buffer, 7))
 
 
+def test_llama3_tensor_parallel_decode_mlp_reuses_scratch_buffers(monkeypatch) -> None:
+    layer = object.__new__(tensor_parallel_module._Llama3TensorParallelLayer)
+    layer.world_size = 1
+    layer.local_intermediate_size = 3
+    layer.gate_up_proj_weight = torch.ones((6, 4), dtype=torch.float32)
+    layer.down_proj_weight = torch.ones((4, 3), dtype=torch.float32)
+    layer.down_proj_weight_decode = None
+    layer._decode_scratch_buffers = {}
+    hidden = torch.ones((2, 1, 4), dtype=torch.float32)
+    marlin_out_ptrs = []
+    swiglu_out_ptrs = []
+
+    def marlin_proj(hidden_arg, key, weight_arg, *, out=None):
+        assert key == "gu"
+        assert out is not None
+        out.copy_(2.0)
+        marlin_out_ptrs.append(out.data_ptr())
+        return out.view(*hidden_arg.shape[:-1], weight_arg.size(0))
+
+    def fp8_proj(*args, **kwargs):
+        return None
+
+    def decode_linear_all_reduce(hidden_arg, weight_arg, buffer_name, weight_t=None, marlin_key=None, fp8_key=None):
+        del buffer_name, weight_t, marlin_key, fp8_key
+        swiglu_out_ptrs.append(hidden_arg.data_ptr())
+        return torch.matmul(hidden_arg.reshape(-1, hidden_arg.size(-1)), weight_arg.t()).view(2, 1, 4)
+
+    monkeypatch.setattr(layer, "_marlin_proj", marlin_proj)
+    monkeypatch.setattr(layer, "_fp8_proj", fp8_proj)
+    monkeypatch.setattr(layer, "_decode_linear_all_reduce", decode_linear_all_reduce)
+    monkeypatch.setattr(tensor_parallel_module, "_tp_flag", lambda name, default=False: False)
+
+    first = layer._mlp_project_decode_reduce(hidden)
+    second = layer._mlp_project_decode_reduce(hidden)
+
+    assert first.shape == (2, 1, 4)
+    torch.testing.assert_close(first, second)
+    assert len(set(marlin_out_ptrs)) == 1
+    assert len(set(swiglu_out_ptrs)) == 1
+    assert len(layer._decode_scratch_buffers) == 2
+
+
 def test_llama3_tensor_parallel_ragged_prefill_copy_accepts_no_logits() -> None:
     model = object.__new__(Llama3TensorParallelForCausalLM)
     model.device = torch.device("cpu")
