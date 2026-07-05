@@ -1,5 +1,42 @@
 # TorchInferno vs vLLM/sglang — Performance Gap Analysis (Llama-3.1-70B, 8xH100)
 
+## Public 20260705_130223 refresh pending default mixed-prefix measurement
+
+Public inference-bench advanced to commit `fb5f61e9` with run
+`results/v1/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100/runs/20260705_130223`.
+This row measured TorchInferno `c85d39b`, so it includes the small mixed-prefix
+warmup follow-up but still predates pushed `e32436f` / `6c41917`, where the
+OpenAI `temperature=0,max_tokens=512` mixed-prefix policy became the no-env
+default and the greedy-large decode-many rejection was documented. The public
+scorecard is TorchInferno `6/20`, vLLM `10/20`, and SGLang `3/20`.
+
+The public shape moved a few cells but did not change the unresolved work:
+
+- few_shot: TorchInferno `156.7 / 46.7 / 201.8ms`, vLLM
+  `151.9 / 57.1 / 205.9ms`, SGLang `141.7 / 75.0 / 216.9ms`. TorchInferno
+  keeps TPOT/E2E wins.
+- self_consistency: TorchInferno `119.7 / 0.0 / 170.0ms`, vLLM
+  `200.8 / 0.0 / 224.5ms`, SGLang `219.2 / 0.0 / 372.3ms`. TorchInferno
+  wins TTFT/E2E/throughput.
+- multi_turn: TorchInferno `371.5 / 59.0 / 423.8ms`, vLLM
+  `175.1 / 55.8 / 227.5ms`, SGLang `170.2 / 109.2 / 276.2ms`. This is still
+  the old common-prefix-only route: queue telemetry shows
+  `{"common_prefix":1000}`, `35` prefill batches, no request-prompt reuse, and
+  `4.09s/4.27s` prefill forward/wall. It does not measure the default-on
+  `{"common_prefix":125,"request_prompt":875}` path from `e32436f`.
+- tree_of_thought: TorchInferno `130.0 / 29.3 / 151.4ms`, vLLM
+  `62.5 / 30.5 / 85.5ms`, SGLang `75.3 / 48.7 / 136.6ms`. The row keeps a
+  TPOT win but remains TTFT/E2E bound.
+- long_output: TorchInferno `258.9 / 20.6 / 918.4ms`, vLLM
+  `80.5 / 15.1 / 623.3ms`, SGLang `73.9 / 22.0 / 848.1ms`. The queue profile
+  remains decode-heavy (`815` decode batches, `105` decode-many calls,
+  `9.77s` ragged-decode GPU), matching the current decode-throughput gap rather
+  than a missing default knob.
+
+Keep the next public read focused on whether the measured TorchInferno commit
+has advanced past `c85d39b`; only then should the multi_turn row be compared
+against the local no-env mixed-prefix validations below.
+
 ## Public 20260705_110218 refresh and multi-turn scheduler rejections
 
 The latest public inference-bench commit advanced to `11363bd4` with run
