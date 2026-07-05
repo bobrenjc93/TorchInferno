@@ -34,6 +34,20 @@ cached-prefix prefill replays (`227` batches, `5.02s/5.47s` prefill wall) plus
 `10.07s` ragged decode GPU, `3.39s` decode-many GPU, and `4.12s/4.47s`
 prefill forward/wall.
 
+A focused multi_turn test of a longer greedy-large online idle window is
+rejected. The latest public profile split multi_turn into `394` and `606`
+request online sessions, so the same-host A/B tried
+`TORCHINFERNO_OPENAI_TP_ONLINE_PERSISTENT_IDLE_MS=100` and wrote
+`/tmp/inference-bench-ti-multi-idle100-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-ti-multi-idle100-bbc9a84-20260705/runs/20260705_195041`.
+It did keep all `1000` requests in one session with `1000` full-prompt
+adoptions and `{"common_prefix":125,"request_prompt":875}` reuse, landing at
+`293.3 / 61.6 / 353.3ms`, `982/1000` correct. The paired no-env control
+`/tmp/inference-bench-ti-multi-default-control-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-ti-multi-default-control-bbc9a84-20260705/runs/20260705_195604`
+also stayed in one session with `1000` adoptions and landed faster on medians:
+`275.3 / 62.0 / 339.1ms`, `980/1000` correct. Do not increase the default
+greedy-large persistent idle window; the public split is host/run timing noise,
+not a robust gap closer.
+
 ## Public 20260705_170204 after inference-bench client fix
 
 Public inference-bench advanced to commit `f240a799` with run
