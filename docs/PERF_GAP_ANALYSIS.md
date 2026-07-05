@@ -64,6 +64,21 @@ median TPOT/E2E. Keep the transposed decode-mm path opt-in; the long_output gap
 still needs a structural decode replay reduction or packed cached-prefix
 prefill body, not a different `F.linear` layout.
 
+Disabling inference-bench's TorchInferno queue profile is also rejected as a
+long_output score lever on current `4cc9073`. The profile-off run
+`/tmp/inference-bench-ti-profile-off-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-ti-profile-off-20260705/runs/20260705_204347`
+landed at `212.7 / 22.9 / 1034.9ms`, `1000/1000` correct. The same-host
+profiled control
+`/tmp/inference-bench-ti-profile-on-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-ti-profile-on-20260705/runs/20260705_204908`
+landed at `225.1 / 23.3 / 1005.6ms`, also `1000/1000` correct. Queue
+profiling did not explain the gap: turning it off slightly improved TTFT and
+TPOT but worsened median E2E, while the profiled control still attributed the
+run to normal model work (`5.19s` prefill wall, `10.03s` ragged decode GPU,
+and `5.27s` decode-many GPU over `20.7K` decode-many model tokens). Keep queue
+profiling enabled for public evidence; the next useful long_output work remains
+lower decode replay cost, a real decode/readback pipeline, or packed
+cached-prefix prefill.
+
 ## Public 20260705_170204 after inference-bench client fix
 
 Public inference-bench advanced to commit `f240a799` with run
