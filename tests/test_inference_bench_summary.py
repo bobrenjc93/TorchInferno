@@ -87,6 +87,9 @@ def _write_inference_bench_run(tmp_path) -> None:
         "runtime_max_active_requests": 96,
         "runtime_prefix_cache_capacity": 128,
         "greedy_large_mixed_prefix_reuse": True,
+        "fp8_prefill_enabled": True,
+        "fp8_prefill_min_m": 512,
+        "marlin_int4_decode_enabled": True,
         "use_decode_many": True,
         "decode_quantum": 3,
         "drain_decode_quantum": 8,
@@ -358,6 +361,9 @@ def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) ->
     assert "max_active" in text
     assert "prefix_cap" in text
     assert "mixed_prefix" in text
+    assert "fp8_prefill" in text
+    assert "fp8_min_m" in text
+    assert "marlin_decode" in text
     assert "decode_many" in text
     assert "decode_q" in text
     assert "drain_q" in text

@@ -47,6 +47,10 @@ _SGLANG_DECODE_RE = re.compile(
     r"gen throughput \(token/s\): (?P<generation_tps>[0-9.]+)"
 )
 _QUEUE_PROFILE_FIELDS = (
+    "greedy_large_mixed_prefix_reuse",
+    "fp8_prefill_enabled",
+    "fp8_prefill_min_m",
+    "marlin_int4_decode_enabled",
     "use_decode_many",
     "decode_quantum",
     "drain_decode_quantum",
@@ -419,6 +423,9 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
             "max_active",
             "prefix_cap",
             "mixed_prefix",
+            "fp8_prefill",
+            "fp8_min_m",
+            "marlin_decode",
             "decode_many",
             "decode_q",
             "drain_q",
@@ -478,6 +485,9 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
                     _fmt_value(fields.get("runtime_max_active_requests")),
                     _fmt_value(fields.get("runtime_prefix_cache_capacity")),
                     _fmt_value(fields.get("greedy_large_mixed_prefix_reuse")),
+                    _fmt_value(fields.get("fp8_prefill_enabled")),
+                    _fmt_value(fields.get("fp8_prefill_min_m")),
+                    _fmt_value(fields.get("marlin_int4_decode_enabled")),
                     _fmt_value(fields.get("use_decode_many")),
                     _fmt_value(fields.get("decode_quantum")),
                     _fmt_value(fields.get("drain_decode_quantum")),

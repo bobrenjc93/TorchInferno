@@ -52,10 +52,10 @@ has advanced past `c85d39b`; only then should the multi_turn row be compared
 against the local no-env mixed-prefix validations below. Queue profiles now also
 emit `greedy_large_mixed_prefix_reuse` so that public rows self-report whether
 the scoped OpenAI policy was active. `inference-bench-summary` prints that field
-as `mixed_prefix` and also exposes the recorded decode/admission/prefill-ready
-policy columns (`decode_many`, `decode_q`, `drain_q`, `admit_cap`,
-`min_free`, `min_ready`, `prefill_ready`, and `ready_cap`) in its queue-profile
-table.
+as `mixed_prefix` and also exposes the recorded backend/decode/admission/
+prefill-ready policy columns (`fp8_prefill`, `fp8_min_m`, `marlin_decode`,
+`decode_many`, `decode_q`, `drain_q`, `admit_cap`, `min_free`, `min_ready`,
+`prefill_ready`, and `ready_cap`) in its queue-profile table.
 
 ## Public 20260705_110218 refresh and multi-turn scheduler rejections
 
