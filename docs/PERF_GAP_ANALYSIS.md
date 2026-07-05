@@ -91,6 +91,16 @@ uncaptured `b16` mixed-prefix shapes and stretched queue-to-submit rather than
 reducing first-token time. Keep the default `admit_cap=48` and
 `min_ready=32` for this class.
 
+The finished-prefix cache is also rejected for the current greedy-large
+mixed-prefix path. Running the same focused `multi_turn` benchmark with
+`TORCHINFERNO_CONTINUOUS_FINISHED_PREFIX_CACHE=1` on pushed `248c81d` started
+cleanly, but then made no visible request progress for several minutes with
+`0%` GPU utilization across all eight devices. Interrupting the run shut the
+server down and unwound blocked streaming clients with `RemoteProtocolError:
+illegal chunk header: ... 400 Bad Request`; no result directory was written.
+This path needs a correctness/hang investigation before it can be used for the
+assistant-token reuse idea, and it is not a defaultable multi_turn optimization.
+
 ## Public 20260705_110218 refresh and multi-turn scheduler rejections
 
 The latest public inference-bench commit advanced to `11363bd4` with run
