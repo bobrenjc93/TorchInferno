@@ -91,6 +91,68 @@ def test_llama3_tensor_parallel_greedy_sampler_gather_opt_in(monkeypatch) -> Non
     assert sampled.tolist() == [5]
 
 
+def test_llama3_tensor_parallel_decode_marlin_writes_into_symm_buffer(monkeypatch) -> None:
+    layer = object.__new__(tensor_parallel_module._Llama3TensorParallelLayer)
+    layer.world_size = 2
+    layer._symm_reduce_failed = False
+    hidden = torch.ones((2, 1, 4), dtype=torch.bfloat16)
+    weight = torch.ones((8, 4), dtype=torch.bfloat16)
+    reduce_buffer = torch.empty((2, 1, 8), dtype=torch.bfloat16)
+    marlin_out_views = []
+    reduce_calls = []
+
+    def symm_reduce_buffer(name, hidden_arg, expected_shape):
+        assert name == "mlp"
+        assert hidden_arg is hidden
+        assert expected_shape == reduce_buffer.shape
+        return reduce_buffer, "world"
+
+    def marlin_proj(hidden_arg, key, weight_arg, *, out=None):
+        assert hidden_arg is hidden
+        assert key == "gu"
+        assert weight_arg is weight
+        assert out is not None
+        assert out.data_ptr() == reduce_buffer.data_ptr()
+        out.copy_(7)
+        marlin_out_views.append(out)
+        return out.view(*hidden_arg.shape[:-1], weight_arg.size(0))
+
+    def fp8_proj(*args, **kwargs):
+        raise AssertionError("Marlin direct output should avoid fp8 fallback")
+
+    def all_reduce(*args, **kwargs):
+        raise AssertionError("symm-memory path should not use NCCL all_reduce")
+
+    def multimem_all_reduce(tensor, op, group):
+        assert tensor is reduce_buffer
+        assert op == "sum"
+        assert group == "world"
+        reduce_calls.append(tensor)
+
+    monkeypatch.setattr(layer, "_symm_reduce_buffer", symm_reduce_buffer)
+    monkeypatch.setattr(layer, "_marlin_proj", marlin_proj)
+    monkeypatch.setattr(layer, "_fp8_proj", fp8_proj)
+    monkeypatch.setattr(tensor_parallel_module, "_all_reduce", all_reduce)
+    monkeypatch.setattr(
+        tensor_parallel_module,
+        "_should_use_symm_mem_all_reduce",
+        lambda hidden_arg, weight_arg, world_size: True,
+    )
+    monkeypatch.setattr(
+        tensor_parallel_module,
+        "_should_use_symm_mem_prefill_all_reduce",
+        lambda hidden_arg, weight_arg, world_size: False,
+    )
+    monkeypatch.setattr(torch.ops.symm_mem, "multimem_all_reduce_", multimem_all_reduce, raising=False)
+
+    result = layer._decode_linear_all_reduce(hidden, weight, "mlp", marlin_key="gu")
+
+    assert result is reduce_buffer
+    assert marlin_out_views
+    assert reduce_calls == [reduce_buffer]
+    torch.testing.assert_close(reduce_buffer, torch.full_like(reduce_buffer, 7))
+
+
 def test_llama3_tensor_parallel_ragged_prefill_copy_accepts_no_logits() -> None:
     model = object.__new__(Llama3TensorParallelForCausalLM)
     model.device = torch.device("cpu")

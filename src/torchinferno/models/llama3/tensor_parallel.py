@@ -2195,7 +2195,14 @@ class _Llama3TensorParallelLayer:
         projected = self._mlp_project_decode_reduce(mlp_in)
         return _tp_decode_add_rms_norm(projected, residual, next_norm_weight, self.config.rms_norm_eps)
 
-    def _marlin_proj(self, hidden: Tensor, key: str, weight: Tensor) -> Tensor | None:
+    def _marlin_proj(
+        self,
+        hidden: Tensor,
+        key: str,
+        weight: Tensor,
+        *,
+        out: Tensor | None = None,
+    ) -> Tensor | None:
         # Generic COLUMN-parallel (output-sharded, NO allreduce) projection via
         # Marlin int4. Lazily quantizes `weight` ([N,K]) to int4 on first call (eager,
         # BEFORE any decode CUDA-graph capture), caches per `key` on self, then runs
@@ -2247,9 +2254,10 @@ class _Llama3TensorParallelLayer:
         n = getattr(self, f"_marlin_{key}_n")
         k = getattr(self, f"_marlin_{key}_k")
         x2d = hidden.reshape(-1, k).contiguous()
+        out_2d = out.reshape(-1, n) if out is not None else None
         out = _marlin.marlin_int4_mm(
             x2d, getattr(self, f"_marlin_{key}_q"), getattr(self, f"_marlin_{key}_s"),
-            getattr(self, f"_marlin_{key}_ws"), n, k,
+            getattr(self, f"_marlin_{key}_ws"), n, k, out=out_2d,
         )
         return out.reshape(*hidden.shape[:-1], n)
 
@@ -2417,11 +2425,8 @@ class _Llama3TensorParallelLayer:
         # marlin_key/fp8_key set => try a quantized GEMM for this row-parallel proj
         # (down_proj). Both kernels are reduce-agnostic; we all-reduce the output after.
         # marlin (int4) wins small-M decode; fp8 wins large-M prefill (M-gates are
-        # complementary). The op returns its own tensor, so for the symm-mem fast path we
-        # copy it into the symm buffer (small [M,N] copy) then multimem-all-reduce.
-        marlin_out = self._marlin_proj(hidden, marlin_key, weight) if marlin_key is not None else None
-        if marlin_out is None and fp8_key is not None:
-            marlin_out = self._fp8_proj(hidden, fp8_key, weight)
+        # complementary). In the symm-mem path, let Marlin write directly into the
+        # reduce buffer so decode does not allocate an intermediate and copy it.
         use_sm = _should_use_symm_mem_all_reduce(hidden, weight, self.world_size)
         sm_name = buffer_name
         if not use_sm and _should_use_symm_mem_prefill_all_reduce(hidden, weight, self.world_size):
@@ -2441,17 +2446,25 @@ class _Llama3TensorParallelLayer:
                     _SYMM_PREFILL_SHAPES.add((sm_name, tuple(hidden.shape[:-1]), int(weight.size(0))))
                 hidden_2d = hidden.reshape(-1, hidden.size(-1))
                 output_2d = buffer.reshape(-1, weight.size(0))
-                if marlin_out is not None:
-                    output_2d.copy_(marlin_out.reshape(-1, weight.size(0)))
-                elif weight_t is not None:
-                    torch.mm(hidden_2d, weight_t, out=output_2d)
-                else:
-                    torch.mm(hidden_2d, weight.t(), out=output_2d)
+                wrote_output = False
+                if marlin_key is not None:
+                    wrote_output = self._marlin_proj(hidden, marlin_key, weight, out=output_2d) is not None
+                if not wrote_output:
+                    fp8_out = self._fp8_proj(hidden, fp8_key, weight) if fp8_key is not None else None
+                    if fp8_out is not None:
+                        output_2d.copy_(fp8_out.reshape(-1, weight.size(0)))
+                    elif weight_t is not None:
+                        torch.mm(hidden_2d, weight_t, out=output_2d)
+                    else:
+                        torch.mm(hidden_2d, weight.t(), out=output_2d)
                 torch.ops.symm_mem.multimem_all_reduce_(buffer, "sum", group_name)
                 return buffer
             except Exception:
                 self._symm_reduce_failed = True
                 _disable_symm_reduce()
+        marlin_out = self._marlin_proj(hidden, marlin_key, weight) if marlin_key is not None else None
+        if marlin_out is None and fp8_key is not None:
+            marlin_out = self._fp8_proj(hidden, fp8_key, weight)
         if marlin_out is not None:
             _all_reduce(marlin_out)
             return marlin_out

@@ -139,15 +139,32 @@ def make_workspace(size_n: int, device) -> Tensor:
 _EMPTY = None
 
 
-def marlin_int4_mm(a: Tensor, q_weight: Tensor, scales: Tensor, workspace: Tensor,
-                   size_n: int, size_k: int) -> Tensor:
+def marlin_int4_mm(
+    a: Tensor,
+    q_weight: Tensor,
+    scales: Tensor,
+    workspace: Tensor,
+    size_n: int,
+    size_k: int,
+    *,
+    out: Tensor | None = None,
+) -> Tensor:
     """a [M, K] @ int4 weight -> [M, N], same dtype as a. a must be 2D contiguous;
     a.dtype must match the scale dtype used in quantize_to_marlin_int4 (default bf16)."""
     global _EMPTY
     if _EMPTY is None or _EMPTY.device != a.device:
         _EMPTY = torch.empty(0, dtype=torch.int, device=a.device)
     m = a.shape[0]
-    out = torch.empty((m, size_n), dtype=a.dtype, device=a.device)
+    expected_shape = (m, size_n)
+    if out is None:
+        out = torch.empty(expected_shape, dtype=a.dtype, device=a.device)
+    elif (
+        tuple(out.shape) != expected_shape
+        or out.dtype != a.dtype
+        or out.device != a.device
+        or not out.is_contiguous()
+    ):
+        raise ValueError("marlin output buffer must be contiguous with shape [M, N], matching input dtype/device")
     return torch.ops._C.marlin_gemm(
         a, out, q_weight, None, scales, None, None, None, _EMPTY, _EMPTY, workspace,
         _UINT4B8_ID, m, size_n, size_k, True, False, False, False,

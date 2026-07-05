@@ -12,6 +12,31 @@ import torch
 from torchinferno.kernels import marlin
 
 
+def test_marlin_int4_mm_can_use_provided_output_buffer(monkeypatch):
+    a = torch.ones((2, 4), dtype=torch.bfloat16)
+    q_weight = torch.empty((1, 1), dtype=torch.int32)
+    scales = torch.ones((1, 8), dtype=torch.bfloat16)
+    workspace = torch.empty((1,), dtype=torch.int32)
+    provided = torch.empty((2, 8), dtype=torch.bfloat16)
+    expected = torch.arange(16, dtype=torch.float32).view(2, 8).to(torch.bfloat16)
+    calls = []
+
+    def fake_marlin_gemm(a_arg, out_arg, *args):
+        assert a_arg is a
+        assert out_arg is provided
+        out_arg.copy_(expected)
+        calls.append(out_arg)
+        return out_arg
+
+    monkeypatch.setattr(torch.ops._C, "marlin_gemm", fake_marlin_gemm, raising=False)
+
+    out = marlin.marlin_int4_mm(a, q_weight, scales, workspace, 8, 4, out=provided)
+
+    assert out is provided
+    assert calls == [provided]
+    torch.testing.assert_close(out, expected)
+
+
 def _dequant_ref(a, w, group=128):
     # Reproduce the module's symmetric int4 (bias-8) quant as a bf16 reference.
     K, N = w.shape
