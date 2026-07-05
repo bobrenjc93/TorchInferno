@@ -86,6 +86,7 @@ def _write_inference_bench_run(tmp_path) -> None:
         "finished_events": 2,
         "runtime_max_active_requests": 96,
         "runtime_prefix_cache_capacity": 128,
+        "greedy_large_mixed_prefix_reuse": True,
         "request_queue_to_first_token_p50_ms": 11.0,
         "runtime_prefill_batches": 1,
         "runtime_prefill_forward_ms": 12.0,
@@ -348,6 +349,7 @@ def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) ->
     assert "[torchinferno queue profiles]" in text
     assert "max_active" in text
     assert "prefix_cap" in text
+    assert "mixed_prefix" in text
     assert "coverage" in text
     assert "2/2" in text
     assert "[torchinferno score targets]" in text

@@ -37,7 +37,8 @@ Keep the next public read focused on whether the measured TorchInferno commit
 has advanced past `c85d39b`; only then should the multi_turn row be compared
 against the local no-env mixed-prefix validations below. Queue profiles now also
 emit `greedy_large_mixed_prefix_reuse` so that public rows self-report whether
-the scoped OpenAI policy was active.
+the scoped OpenAI policy was active, and `inference-bench-summary` prints that
+field as `mixed_prefix` in its queue-profile table.
 
 ## Public 20260705_110218 refresh and multi-turn scheduler rejections
 
