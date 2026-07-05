@@ -5,9 +5,9 @@
 The latest public inference-bench commit advanced to `11363bd4` with run
 `results/v1/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100/runs/20260705_110218`.
 That public run still measured TorchInferno commit `390fed4`, not the later
-`879a6b6` commit that was pushed with CUDA greedy-gather sampling and decode
-graph cache/symm telemetry. Score stayed `4/20` for TorchInferno, while vLLM
-rose to `13/20` and SGLang fell to `2/20`.
+`fecef37` pushed stack that includes CUDA greedy-gather sampling, decode graph
+cache/symm telemetry, and the latest evidence notes. Score stayed `4/20` for
+TorchInferno, while vLLM rose to `13/20` and SGLang fell to `2/20`.
 
 Public gaps after `20260705_110218`:
 
@@ -30,7 +30,7 @@ The hottest prefill shape was `prefix_graph:b32:s144:p45-45:src1:mixed0`
 (`20.5K` total, `6.3K` on the hot shape), but pattern reuse was low
 (`9/32` repeat calls, `13.2%` repeated saved-token share).
 
-Three current-stack `multi_turn` probes are rejected:
+Four current-stack `multi_turn` probes are rejected or remain opt-in:
 
 - Shape-gated packed eager prefill for `prefix_graph:b32:s144:p45-45:src1:mixed0`
   wrote
@@ -56,12 +56,21 @@ Three current-stack `multi_turn` probes are rejected:
   `/tmp/inference-bench-ti-multiturn-mixedprefix-repeat-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-ti-multiturn-mixedprefix-repeat-20260705/runs/20260705_121126`
   and regressed to `466.2 / 63.2 / 510.2ms`; it hit a rare mixed-prefix graph
   miss and spent `389ms` on `prefix_graph:b2:s32:p156-158:src2:mixed1`.
-  Keep the policy opt-in until mixed-prefix prefill graph coverage is robust.
+  Adding `2:32:256` to the opt-in mixed-prefix suffix warmup covers that exact
+  `b2:s32:ctx-256:src2` graph. Follow-up opt-in repeats wrote
+  `/tmp/inference-bench-ti-multiturn-mixedprefix-b2warm-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-ti-multiturn-mixedprefix-b2warm-20260705/runs/20260705_122423`
+  at `289.3 / 64.8 / 350.8ms`, `982/1000` correct, and
+  `/tmp/inference-bench-ti-multiturn-mixedprefix-b2warm-repeat-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-ti-multiturn-mixedprefix-b2warm-repeat-20260705/runs/20260705_123044`
+  at `321.0 / 65.4 / 412.7ms`, `979/1000` correct. The repeat queue profile
+  had `prefill_graph_misses=0` and a live
+  `ragged_prefill:b2:s32:rows1:ctx-256:copy-1:src2:max1024:fp80:ar128:logits1`
+  entry. Keep the broader mixed-prefix reuse policy opt-in until the full row
+  wins consistently without TPOT/E2E tradeoffs.
 
 The practical multi_turn target remains a lower-cost packed/fixed-pattern
-cached-prefix prefill implementation and robust mixed-prefix graph coverage,
-not current packed eager, wider active rows, or earlier refill prefill
-scheduling.
+cached-prefix prefill implementation and consistently cheap request-prompt
+mixed-prefix replay, not current packed eager, wider active rows, or earlier
+refill prefill scheduling.
 
 ## Public 20260705_090205 refresh and decode graph symm telemetry
 
