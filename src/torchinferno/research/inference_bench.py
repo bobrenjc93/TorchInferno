@@ -564,6 +564,10 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
             "decode_many_gpu_ms",
             "decode_many_cpu_ms",
             "decode_many_steps",
+            "decode_many_model_tok",
+            "decode_many_emit_tok",
+            "decode_many_tok_call",
+            "decode_many_steps_call",
             "decode_many_graph_ms",
             "decode_many_graph_calls",
             "decode_many_graph_steps",
@@ -682,6 +686,20 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
                     _fmt_value(fields.get("runtime_decode_many_model_gpu_ms")),
                     _fmt_value(fields.get("runtime_decode_many_cpu_tokens_ms")),
                     _fmt_value(fields.get("runtime_decode_many_steps")),
+                    _fmt_value(fields.get("runtime_decode_many_model_tokens")),
+                    _fmt_value(fields.get("runtime_decode_many_emitted_tokens")),
+                    _fmt_value(
+                        _ratio_or_none(
+                            fields.get("runtime_decode_many_model_tokens"),
+                            fields.get("runtime_decode_many_calls"),
+                        )
+                    ),
+                    _fmt_value(
+                        _ratio_or_none(
+                            fields.get("runtime_decode_many_steps"),
+                            fields.get("runtime_decode_many_calls"),
+                        )
+                    ),
                     _fmt_value(fields.get("runtime_decode_many_graph_ms")),
                     _fmt_value(fields.get("runtime_decode_many_graph_calls")),
                     _fmt_value(fields.get("runtime_decode_many_graph_steps")),

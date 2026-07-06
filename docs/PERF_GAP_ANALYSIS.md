@@ -30,6 +30,15 @@ CPU token handling. The dominant decode-many target remains the full-batch body:
 cached-prefix prefill for TTFT, and reduce or overlap single-step decode replay
 plus token readback for TPOT/E2E.
 
+The queue table now prints decode-many aggregate density as well. In this
+public long_output run TorchInferno processed only `22.5K` decode-many model
+tokens across `128` calls (`176` model tokens/call, `3.8` generated steps/call),
+while SGLang reported `71.5K` decode tokens across `24` decode batches
+(`2.98K` tokens/batch). The comparison is not one-to-one because providers
+report different scheduler boundaries, but it makes the remaining gap concrete:
+TorchInferno is still launching many small single-step replay groups instead of
+amortizing long decode phases into denser graph work.
+
 The latest run also reinforces the packed-prefix conclusion. Few_shot is closer
 but remains prefill-bound (`1.38s` prefill forward, `4.66K` padding tokens, hot
 `prefix_graph:b32:s16:p122-122:src1:mixed0`), while multi_turn now surfaces a

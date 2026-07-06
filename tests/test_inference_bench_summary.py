@@ -284,8 +284,11 @@ def _write_inference_bench_run(tmp_path) -> None:
         "runtime_decode_graph_replay_ms": 8.0,
         "runtime_decode_graph_cache_live_cache_bucket_counts": {"cache1024": 3, "cache256": 1},
         "runtime_decode_graph_cache_live_symm_counts": {"symm128": 3, "symm0": 1},
+        "runtime_decode_many_calls": 2,
         "runtime_decode_many_model_gpu_ms": 15.0,
         "runtime_decode_many_steps": 6,
+        "runtime_decode_many_model_tokens": 24,
+        "runtime_decode_many_emitted_tokens": 15,
         "decode_many_stop_tail_max_steps": 4,
         "decode_many_min_active_pct": 25,
         "decode_many_sync_stops": True,
@@ -803,7 +806,13 @@ def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) ->
     assert "decode_state_ms" in text
     assert "decode_many_calls" in text
     assert "decode_many_cpu_ms" in text
+    assert "decode_many_model_tok" in text
+    assert "decode_many_emit_tok" in text
+    assert "decode_many_tok_call" in text
+    assert "decode_many_steps_call" in text
     assert "decode_many_graph_ms" in text
+    assert "12.0" in text
+    assert "3.0" in text
     assert "1.2" in text
     assert "1.5" in text
     assert "2.2" in text
