@@ -60,6 +60,20 @@ TorchInferno regressed to `238.3 / 61.9 / 303.6ms` with
 Keep large-greedy refill cost priority opt-in; the remaining first-token gap
 needs a scheduler policy that avoids starving longer refill prompts.
 
+A current safe-head long_output all-provider refresh on `46164b4` wrote
+`/tmp/inference-bench-46164b4-long-allproviders-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100/runs/20260706_005421`.
+vLLM landed at `69.6 / 16.9 / 662.9ms`, SGLang at
+`58.6 / 24.6 / 936.7ms`, and TorchInferno at `232.4 / 22.6 / 1080.4ms`,
+`1000/1000` correct. Queue telemetry still splits the gap between first-token
+prefill and decode replay: `q2first_p50=192.3ms`, `q2submit_p50=35.4ms`,
+`submit2first_p50=142.3ms`, `4.58s/5.14s` prefill forward/wall, `9.84s`
+ragged decode GPU, and `4.95s` decode-many GPU with `815` overgenerated
+tokens. The hot prefill rows remain the known common-prefix padded-suffix
+shapes (`b24:s64:p111`, `b24:s96:p111`, `b16:s64:p111`). This does not reopen
+suffix-bucket, batch-bucket, or decode-tail defaults; the next long-output
+lever is still a non-fragmenting packed cached-prefix prefill body plus lower
+per-step replay cost.
+
 A current tree_of_thought sample-gather recheck is rejected as a default
 runtime change. On pushed `b2b11a3`, the focused run with
 `TORCHINFERNO_TEMPERATURE_SAMPLE_GATHER=1` wrote
