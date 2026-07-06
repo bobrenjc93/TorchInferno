@@ -139,6 +139,20 @@ padding (`34.6K` -> `22.2K`, `43.7%` -> `33.2%`) and shifted hot shapes to
 greedy-short suffix buckets without a warm-shape strategy or a cheaper
 non-capturing path.
 
+A follow-up warm-shape A/B kept the same finer suffix buckets and explicitly
+warmed the missing common-prefix shapes with
+`TORCHINFERNO_OPENAI_WARMUP_ONLINE_GREEDY_COMMON_PREFIX_EXTRA_PAIRS=111:32,111:48,111:64,111:80,122:16`.
+It wrote
+`/tmp/inference-bench-finer-suffix-warm-p111-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-finer-suffix-warm-p111-543df7f/runs/20260706_071001`
+and landed at `215.8 / 23.1 / 1021.6ms`, `34.8 tok/s`, with `1000/1000`
+correct. This eliminated measured prefill graph capture
+(`runtime_prefill_graph_capture_gpu_ms=0`) and cut prefill padding to `23.8K`
+tokens (`34.7%`), but startup grew to `266s` and measured prefill forward still
+cost `4.37s`. The result is not strong enough to make finer greedy-short
+suffix buckets or broader p111 startup warmup the default; the next useful
+target is reducing the actual padded-prefix prefill body, not adding more
+bucket shapes.
+
 ## Public 20260706_030205 refresh
 
 The latest public run advanced to
