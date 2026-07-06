@@ -32,6 +32,19 @@ needed for the 512-token mixed-prefix multi_turn path, where the accepted
 prequeue wait is meant to reduce request-prompt admission fragmentation but
 older public profiles did not show whether the gate actually fired.
 
+A focused current-head multi_turn validation on pushed `d7b41ee` wrote
+`/tmp/inference-bench-ti-d7b-multiturn-profile-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100/runs/20260706_000557`
+and landed at `204.0 / 59.7 / 259.1ms`, `983/1000` correct. This is a much
+better local band than the public `322.2 / 62.5 / 381.2ms` row, but still
+trails the recent local vLLM/SGLang TTFT band near `143ms`. Queue telemetry
+shows the mixed-prefix path is active (`prefix_rows=112`, `mixed_prefix=true`,
+`41` prefill batches, `2.80s/3.13s` prefill forward/wall, `854ms` ragged decode
+GPU, `q2first_p50=142.6ms`, `q2submit_p50=57.3ms`,
+`submit2first_p50=85.6ms`). The new prequeue fields show why raising the
+prequeue wait is not the next lever: all `1000` requests were configured for a
+`2ms` stream prequeue wait, but only `4` actually applied and the median
+prequeue elapsed time was `0.0ms`.
+
 A current tree_of_thought sample-gather recheck is rejected as a default
 runtime change. On pushed `b2b11a3`, the focused run with
 `TORCHINFERNO_TEMPERATURE_SAMPLE_GATHER=1` wrote
