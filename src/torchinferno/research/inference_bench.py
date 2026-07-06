@@ -1093,11 +1093,14 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
                     "prefix_hit_max",
                     "prefill_batches",
                     "prefill_tokens",
+                    "prefill_tok_batch",
                     "cached_tokens",
+                    "cached_pct",
                     "prefill_graph_pct",
                     "prefill_new_seq_max",
                     "decode_batches",
                     "decode_tokens",
+                    "decode_tok_batch",
                     "decode_graph_pct",
                     "decode_running_max",
                 ),
@@ -1596,11 +1599,25 @@ def _provider_server_log_rows(
                 _fmt_pct_value(summary.prefix_hit_pct_max),
                 _fmt_value(summary.prefill_batches),
                 _fmt_value(summary.prefill_new_tokens),
+                _fmt_value(
+                    summary.prefill_new_tokens / summary.prefill_batches
+                    if summary.prefill_batches
+                    else None
+                ),
                 _fmt_value(summary.prefill_cached_tokens),
+                _fmt_pct(
+                    summary.prefill_cached_tokens,
+                    summary.prefill_new_tokens + summary.prefill_cached_tokens,
+                ),
                 _fmt_pct(summary.prefill_cuda_graph_batches, summary.prefill_batches),
                 _fmt_value(summary.prefill_new_seq_max),
                 _fmt_value(summary.decode_batches),
                 _fmt_value(summary.decode_logged_tokens),
+                _fmt_value(
+                    summary.decode_logged_tokens / summary.decode_batches
+                    if summary.decode_batches
+                    else None
+                ),
                 _fmt_pct(summary.decode_cuda_graph_batches, summary.decode_batches),
                 _fmt_value(summary.decode_running_max),
             )

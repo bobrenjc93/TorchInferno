@@ -192,6 +192,12 @@ tiny tail rows, is still the main decode-many lever:
 The sparse `b2/b3` tails are several milliseconds per token but only about
 `3%` of total decode-many time per row, so tail gating alone cannot close the
 long-output gap.
+The provider log table now also prints provider aggregate token density. In the
+same public run SGLang reports `70.7K` decode tokens over only `24` logged decode
+batches (`2946.4` tokens/batch) with `100%` decode graph coverage, while
+TorchInferno's long_output profile still uses `109` decode-many calls and `436`
+single-step decode-many steps. This keeps the contrast focused on real decode
+batching/replay structure rather than the already-rejected tiny-tail policies.
 The packed-prefix target tables now also print `est_share`, the estimated saved
 prefill-forward time divided by total profiled prefill forward. On public
 few_shot, the hot `prefix_graph:b32:s16:p122-122:src1:mixed0` candidate is

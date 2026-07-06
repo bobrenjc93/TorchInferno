@@ -764,10 +764,16 @@ def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) ->
     assert "[provider server log phases]" in text
     assert "prefix_hit_avg" in text
     assert "prefill_graph_pct" in text
+    assert "prefill_tok_batch" in text
+    assert "cached_pct" in text
+    assert "decode_tok_batch" in text
     assert "decode_graph_pct" in text
     assert "sglang" in text
     assert "85.0%" in text
     assert "50.0%" in text
+    assert "28.0" in text
+    assert "22.2%" in text
+    assert "64.0" in text
 
 
 def test_inference_bench_summary_reads_current_provider_log_names(tmp_path) -> None:
@@ -783,6 +789,9 @@ def test_inference_bench_summary_reads_current_provider_log_names(tmp_path) -> N
     assert "sglang" in text
     assert "prefix_hit_avg" in text
     assert "prefill_graph_pct" in text
+    assert "prefill_tok_batch" in text
+    assert "cached_pct" in text
+    assert "decode_tok_batch" in text
     assert "decode_graph_pct" in text
 
 
