@@ -155,6 +155,22 @@ CPU readback over `8448` model tokens, while `b64/64:g17-32` was only
 single-step replay cost or a real emission/readback pipeline, not tail-only
 readback.
 
+Rechecking the guarded greedy-short suffix splitter on the same current head is
+still not a clean default promotion, but it is useful evidence. With
+`TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SPLIT_SUFFIX_BUCKETS_GREEDY_SHORT=1`,
+the run wrote
+`/tmp/inference-bench-current-long-guarded-suffix-split-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-guarded-suffix-split-a73a7d1/runs/20260706_043850`
+and landed at `214.2 / 23.5 / 1045.3ms`, `1000/1000` correct, versus the
+adjacent no-split current run at `238.2 / 23.7 / 1062.9ms`. The split reduced
+prefill model tokens (`51.6K -> 49.5K`), padding (`38.0K -> 32.1K`), and
+decode-many work (`388 -> 314` internal steps, `5.05s -> 4.21s` decode-many
+GPU). It also left prefill wall essentially flat (`5.28s -> 5.26s`) and
+worsened long_output TPOT p99 (`29.1ms -> 36.8ms`). Keep the automatic suffix
+split default off: the current signal is a median TTFT/E2E improvement against
+one noisy same-head control, not a robust public-style TPOT/E2E win. A better
+prefill fix still needs non-fragmenting packed cached-prefix prefill or a
+grouping policy that avoids tiny split fragments.
+
 The direct pinned-host async readback A/B is rejected as a default. The first
 attempt on
 `/tmp/inference-bench-async-readback-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-async-readback/runs/20260706_034651`
