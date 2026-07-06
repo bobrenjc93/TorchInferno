@@ -73,6 +73,9 @@ _QUEUE_PROFILE_FIELDS = (
     "runtime_prefill_batches",
     "runtime_prefill_forward_ms",
     "runtime_prefill_wall_ms",
+    "runtime_prefill_setup_ms",
+    "runtime_prefill_copy_ms",
+    "runtime_prefill_sample_ms",
     "runtime_prefill_state_ms",
     "runtime_prefill_packed_flashinfer_calls",
     "runtime_prefill_packed_flashinfer_ms",
@@ -121,6 +124,11 @@ _QUEUE_PROFILE_FIELDS = (
     "runtime_prefill_graph_cache_live_entries",
     "runtime_prefill_shape_counts",
     "runtime_prefill_shape_forward_ms",
+    "runtime_prefill_shape_wall_ms",
+    "runtime_prefill_shape_setup_ms",
+    "runtime_prefill_shape_copy_ms",
+    "runtime_prefill_shape_sample_ms",
+    "runtime_prefill_shape_state_ms",
     "runtime_prefill_shape_active_requests",
     "runtime_prefill_shape_model_rows",
     "runtime_prefill_shape_active_tokens",
@@ -456,6 +464,9 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
             "prefill_batches",
             "prefill_forward_ms",
             "prefill_wall_ms",
+            "prefill_setup_ms",
+            "prefill_copy_ms",
+            "prefill_sample_ms",
             "prefill_state_ms",
             "packed_fi_calls",
             "packed_fi_ms",
@@ -524,6 +535,9 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
                     _fmt_value(fields.get("runtime_prefill_batches")),
                     _fmt_value(fields.get("runtime_prefill_forward_ms")),
                     _fmt_value(fields.get("runtime_prefill_wall_ms")),
+                    _fmt_value(fields.get("runtime_prefill_setup_ms")),
+                    _fmt_value(fields.get("runtime_prefill_copy_ms")),
+                    _fmt_value(fields.get("runtime_prefill_sample_ms")),
                     _fmt_value(fields.get("runtime_prefill_state_ms")),
                     _fmt_value(fields.get("runtime_prefill_packed_flashinfer_calls")),
                     _fmt_value(fields.get("runtime_prefill_packed_flashinfer_ms")),
@@ -581,6 +595,11 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
                         "shape",
                         "calls",
                         "forward_ms",
+                        "wall_ms",
+                        "setup_ms",
+                        "copy_ms",
+                        "sample_ms",
+                        "state_ms",
                         "active_tokens",
                         "model_tokens",
                         "padding_tokens",
@@ -1704,6 +1723,21 @@ def _hot_prefill_shape_rows(
                         _mapping_value(fields.get("runtime_prefill_shape_counts"), shape)
                     ),
                     _fmt_value(forward_ms),
+                    _fmt_value(
+                        _mapping_value(fields.get("runtime_prefill_shape_wall_ms"), shape)
+                    ),
+                    _fmt_value(
+                        _mapping_value(fields.get("runtime_prefill_shape_setup_ms"), shape)
+                    ),
+                    _fmt_value(
+                        _mapping_value(fields.get("runtime_prefill_shape_copy_ms"), shape)
+                    ),
+                    _fmt_value(
+                        _mapping_value(fields.get("runtime_prefill_shape_sample_ms"), shape)
+                    ),
+                    _fmt_value(
+                        _mapping_value(fields.get("runtime_prefill_shape_state_ms"), shape)
+                    ),
                     _fmt_value(active_tokens),
                     _fmt_value(model_tokens),
                     _fmt_value(padding_tokens),

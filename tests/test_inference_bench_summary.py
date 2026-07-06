@@ -105,6 +105,10 @@ def _write_inference_bench_run(tmp_path) -> None:
         "runtime_prefill_batches": 1,
         "runtime_prefill_forward_ms": 12.0,
         "runtime_prefill_wall_ms": 13.0,
+        "runtime_prefill_setup_ms": 1.5,
+        "runtime_prefill_copy_ms": 2.5,
+        "runtime_prefill_sample_ms": 3.5,
+        "runtime_prefill_state_ms": 4.5,
         "runtime_prefill_packed_flashinfer_calls": 3,
         "runtime_prefill_packed_flashinfer_ms": 4.0,
         "runtime_prefill_packed_flashinfer_saved_tokens": 5,
@@ -127,6 +131,26 @@ def _write_inference_bench_run(tmp_path) -> None:
         "runtime_prefill_shape_forward_ms": {
             "prefix_graph:b8:s16:p45-45:src1:mixed0": 9.5,
             "prefix_graph:b4:s16:p45-45:src1:mixed0": 2.0,
+        },
+        "runtime_prefill_shape_wall_ms": {
+            "prefix_graph:b8:s16:p45-45:src1:mixed0": 12.5,
+            "prefix_graph:b4:s16:p45-45:src1:mixed0": 3.0,
+        },
+        "runtime_prefill_shape_setup_ms": {
+            "prefix_graph:b8:s16:p45-45:src1:mixed0": 1.1,
+            "prefix_graph:b4:s16:p45-45:src1:mixed0": 0.2,
+        },
+        "runtime_prefill_shape_copy_ms": {
+            "prefix_graph:b8:s16:p45-45:src1:mixed0": 1.2,
+            "prefix_graph:b4:s16:p45-45:src1:mixed0": 0.3,
+        },
+        "runtime_prefill_shape_sample_ms": {
+            "prefix_graph:b8:s16:p45-45:src1:mixed0": 1.3,
+            "prefix_graph:b4:s16:p45-45:src1:mixed0": 0.4,
+        },
+        "runtime_prefill_shape_state_ms": {
+            "prefix_graph:b8:s16:p45-45:src1:mixed0": 1.4,
+            "prefix_graph:b4:s16:p45-45:src1:mixed0": 0.5,
         },
         "runtime_prefill_shape_active_requests": {
             "prefix_graph:b8:s16:p45-45:src1:mixed0": 3,
@@ -393,6 +417,11 @@ def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) ->
     assert "packed_eager_ms" in text
     assert "packed_eager_saved" in text
     assert "packed_cand_saved" in text
+    assert "prefill_setup_ms" in text
+    assert "prefill_copy_ms" in text
+    assert "prefill_sample_ms" in text
+    assert "wall_ms" in text
+    assert "sample_ms" in text
     assert "prefill_miss" in text
     assert "decode_miss" in text
     assert "decode_graph_cache" in text

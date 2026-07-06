@@ -60,6 +60,19 @@ TorchInferno regressed to `238.3 / 61.9 / 303.6ms` with
 Keep large-greedy refill cost priority opt-in; the remaining first-token gap
 needs a scheduler policy that avoids starving longer refill prompts.
 
+A pushed-head `6b5f32f` TorchInferno-only `multi_turn` profile wrote
+`/tmp/inference-bench-ti-6b5-multiturn-profile-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100/runs/20260706_014843`
+and landed at `220.8 / 63.4 / 285.2ms`, `982/1000` correct. Queue telemetry
+matches the current all-provider band: `q2first_p50=144.3ms`,
+`q2submit_p50=60.2ms`, `submit2first_p50=86.5ms`, `41` prefill batches, and
+`2.54s/2.87s` prefill forward/wall. The new analyzer prefill split rules out
+Python setup/copy as the main gap (`setup=51.5ms`, `copy=7.6ms`,
+`sample=97.0ms`, `state=62.2ms`). The hottest mixed-prefix shapes are still
+`b32:s32` padded suffix replays with roughly 50% suffix padding, while packed
+candidate patterns had zero repeated calls in this run. That keeps the
+multi_turn target on the model-side cached-prefix prefill body rather than
+another admission order or setup/copy optimization.
+
 A current safe-head long_output all-provider refresh on `46164b4` wrote
 `/tmp/inference-bench-46164b4-long-allproviders-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100/runs/20260706_005421`.
 vLLM landed at `69.6 / 16.9 / 662.9ms`, SGLang at
@@ -100,6 +113,15 @@ session fragmentation plus padded cached-prefix prefill: `q2first_p50=138.4ms`,
 decode graph misses are visible (`40`, mostly sparse tail `b1/b2` sequence
 lengths `55..57`), but they are secondary to the many `b4/b8/b16` cached-prefix
 prefills and the remaining `8.6K` prefill padding tokens.
+
+The same tree profiles show why packed-prefix work remains the structural tree
+lever but not via the current dense packed-eager runtime: packed candidate
+patterns repeated heavily (`94.5%` repeated pattern calls in the all-provider
+control and `95.9%` in the no-env TorchInferno control), with fixed-capacity
+plans estimating tens of milliseconds of avoidable padded prefill. That is
+evidence for a real packed CUDA/FlashInfer cached-prefix body; it does not
+reopen the existing dense fixed-capacity packed-eager default, which was already
+measured as much slower than padded graph replay.
 
 An active-session ready-drain wait is now available only as an explicit
 diagnostic knob and is rejected as a default tree policy. The no-env
