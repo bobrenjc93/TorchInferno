@@ -74,6 +74,33 @@ suffix-bucket, batch-bucket, or decode-tail defaults; the next long-output
 lever is still a non-fragmenting packed cached-prefix prefill body plus lower
 per-step replay cost.
 
+A current safe-head tree_of_thought all-provider refresh on `aaaa8e4` wrote
+`/tmp/inference-bench-aaaa8e4-tree-allproviders-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100/runs/20260706_010735`.
+vLLM landed at `39.3 / 27.0 / 57.8ms`, SGLang at
+`40.6 / 111.6 / 112.4ms`, and TorchInferno at `158.0 / 62.7 / 213.6ms`,
+`956/992` correct. The queue profile shows the current tree gap is active
+session fragmentation plus padded cached-prefix prefill: `q2first_p50=138.4ms`,
+`q2submit_p50=72.9ms`, `submit2first_p50=53.6ms`, `130` prefill batches,
+`3.16s/4.47s` prefill forward/wall, and `2.50s` ragged decode GPU. Static
+decode graph misses are visible (`40`, mostly sparse tail `b1/b2` sequence
+lengths `55..57`), but they are secondary to the many `b4/b8/b16` cached-prefix
+prefills and the remaining `8.6K` prefill padding tokens.
+
+An active-session ready-drain wait is now available only as an explicit
+diagnostic knob and is rejected as a default tree policy. The no-env
+TorchInferno-only control wrote
+`/tmp/inference-bench-ti-active-ready-control-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100/runs/20260706_012941`
+and landed at `135.6 / 68.6 / 201.9ms`, `957/992` correct, with
+`active_ready_wait_ms=0`, `122` prefill batches, `2.84s/3.39s` prefill
+forward/wall, and `2.55s` ragged decode GPU. Enabling
+`TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_ACTIVE_READY_WAIT_MS=0.5` wrote
+`/tmp/inference-bench-ti-active-ready05-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100/runs/20260706_012412`
+and improved medians to `123.0 / 63.5 / 178.4ms`, but correctness dropped to
+`952/992`, p99 TTFT/E2E worsened to `771/830ms`, prefill batches rose to `142`,
+prefill wall rose to `3.88s`, and ragged decode GPU rose to `2.82s`. Keep the
+active-ready wait default at `0ms`; it is useful to prove that queue delay can
+be traded for more small-batch prefill/decode work, not a score-safe fix.
+
 A current tree_of_thought sample-gather recheck is rejected as a default
 runtime change. On pushed `b2b11a3`, the focused run with
 `TORCHINFERNO_TEMPERATURE_SAMPLE_GATHER=1` wrote

@@ -1284,6 +1284,30 @@ def _online_collect_idle_arrivals_enabled(*, temperature: float, max_tokens: int
     )
 
 
+def _online_active_ready_wait_ms(*, temperature: float, max_tokens: int) -> float:
+    global_env = "TORCHINFERNO_OPENAI_TP_ONLINE_ACTIVE_READY_WAIT_MS"
+    if global_env in os.environ:
+        return env_float(global_env, 0.0, minimum=0.0)
+    if temperature > 0.0 and max_tokens > 0:
+        sampled_short_max_tokens = env_int(
+            "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_SHORT_INITIAL_BATCH_WAIT_MAX_TOKENS",
+            256,
+            minimum=1,
+        )
+        sampled_medium_max_tokens = env_int(
+            "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_INITIAL_BATCH_WAIT_MAX_TOKENS",
+            300,
+            minimum=sampled_short_max_tokens,
+        )
+        if sampled_short_max_tokens < max_tokens <= sampled_medium_max_tokens:
+            return env_float(
+                "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_ACTIVE_READY_WAIT_MS",
+                0.0,
+                minimum=0.0,
+            )
+    return 0.0
+
+
 def _online_initial_batch_wait_ms(*, temperature: float, max_tokens: int) -> float:
     global_env = "TORCHINFERNO_OPENAI_TP_ONLINE_INITIAL_BATCH_WAIT_MS"
     if global_env in os.environ:
@@ -5365,6 +5389,13 @@ class OpenAICompletionEngine:
             )
             / 1000.0
         )
+        active_ready_wait_s = (
+            _online_active_ready_wait_ms(
+                temperature=first.temperature,
+                max_tokens=first.max_tokens,
+            )
+            / 1000.0
+        )
         profile_start_s = time.perf_counter()
         phase_ms: dict[str, float] = {}
 
@@ -5774,6 +5805,7 @@ class OpenAICompletionEngine:
                 requested_max_batch=requested_max_batch,
                 initial_wait_ms=round(initial_wait_s * 1000.0, 3),
                 idle_batch_wait_ms=round(idle_wait_s * 1000.0, 3),
+                active_ready_wait_ms=round(active_ready_wait_s * 1000.0, 3),
                 collect_idle_arrivals=collect_idle_arrivals,
                 admit_min_free_rows=admit_min_free_rows,
                 admit_min_ready_requests=admit_min_ready_requests,
@@ -5897,23 +5929,48 @@ class OpenAICompletionEngine:
                 _sync_tensor_parallel_command(self.model, self.device)
             add_phase("submit_sync_ms", submit_start_s)
 
-        def drain_ready(arrival_step: int, *, steps_after_submit: int = 0) -> int:
+        def drain_ready(
+            arrival_step: int,
+            *,
+            steps_after_submit: int = 0,
+            wait_s: float = 0.0,
+        ) -> int:
             nonlocal drain_ready_calls, drain_ready_nonempty_calls, drain_ready_requests, drain_ready_max
             drain_start_s = time.perf_counter()
             drain_ready_calls += 1
             ready: list[_QueuedGeneration] = []
-            while len(ready) < max_active:
+            saw_sentinel = False
+
+            def drain_one(*, timeout: float | None = None) -> bool:
+                nonlocal saw_sentinel
                 try:
-                    item = self._generation_queue.get_nowait()
+                    if timeout is None:
+                        item = self._generation_queue.get_nowait()
+                    else:
+                        item = self._generation_queue.get(timeout=timeout)
                 except queue.Empty:
-                    break
+                    return False
                 if item is None:
                     self._generation_queue.put(None)
-                    break
+                    saw_sentinel = True
+                    return False
                 if compatible(item):
                     ready.append(item)
                 else:
                     deferred.append(item)
+                return True
+
+            while len(ready) < max_active and drain_one():
+                pass
+            if 0 < wait_s and 0 < len(ready) < max_active and not saw_sentinel:
+                deadline = time.perf_counter() + wait_s
+                while len(ready) < max_active:
+                    remaining = deadline - time.perf_counter()
+                    if remaining <= 0.0:
+                        break
+                    drain_one(timeout=min(remaining, 0.0001))
+                    if saw_sentinel:
+                        break
             ready_count = len(ready)
             if ready_count:
                 drain_ready_nonempty_calls += 1
@@ -6028,7 +6085,11 @@ class OpenAICompletionEngine:
                         and had_work_before_drain
                         else 0
                     )
-                    ready_count = drain_ready(step, steps_after_submit=steps_after_submit)
+                    ready_count = drain_ready(
+                        step,
+                        steps_after_submit=steps_after_submit,
+                        wait_s=active_ready_wait_s if had_work_before_drain else 0.0,
+                    )
                     ran_combined_step_command = steps_after_submit > 0 and ready_count > 0
                     if not runtime_engine.has_online_work():
                         all_submitted_finished = bool(request_by_id) and finished_events >= len(request_by_id)

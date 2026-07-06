@@ -111,6 +111,7 @@ from torchinferno.openai_server import (
     _online_mixed_prefix_suffix_prefill_warmup_specs,
     _online_admit_per_step_cap,
     _online_admit_min_free_rows,
+    _online_active_ready_wait_ms,
     _online_collect_idle_arrivals_enabled,
     _online_decode_warmup_batch_sizes,
     _online_decode_warmup_policy_specs,
@@ -10511,6 +10512,41 @@ def test_openai_tp_stream_prequeue_admission_wait_respects_env_overrides(
     assert _tp_stream_prequeue_admission_wait_ms(temperature=0.7, max_tokens=300) == 2.0
     assert _tp_stream_prequeue_admission_wait_ms(temperature=0.7, max_tokens=320) == 2.0
     assert _tp_stream_prequeue_admission_wait_ms(temperature=0.7, max_tokens=321) == 0.0
+
+
+def test_openai_online_active_ready_wait_scopes_sampled_medium(
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_ACTIVE_READY_WAIT_MS", raising=False)
+    monkeypatch.delenv(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_ACTIVE_READY_WAIT_MS",
+        raising=False,
+    )
+    monkeypatch.delenv(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_SHORT_INITIAL_BATCH_WAIT_MAX_TOKENS",
+        raising=False,
+    )
+    monkeypatch.delenv(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_INITIAL_BATCH_WAIT_MAX_TOKENS",
+        raising=False,
+    )
+
+    assert _online_active_ready_wait_ms(temperature=0.7, max_tokens=256) == 0.0
+    assert _online_active_ready_wait_ms(temperature=0.7, max_tokens=300) == 0.0
+    assert _online_active_ready_wait_ms(temperature=0.0, max_tokens=300) == 0.0
+
+    monkeypatch.setenv(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_ACTIVE_READY_WAIT_MS",
+        "0.5",
+    )
+    assert _online_active_ready_wait_ms(temperature=0.7, max_tokens=256) == 0.0
+    assert _online_active_ready_wait_ms(temperature=0.7, max_tokens=300) == 0.5
+    assert _online_active_ready_wait_ms(temperature=0.7, max_tokens=301) == 0.0
+    assert _online_active_ready_wait_ms(temperature=0.0, max_tokens=300) == 0.0
+
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_ACTIVE_READY_WAIT_MS", "1.25")
+    assert _online_active_ready_wait_ms(temperature=0.7, max_tokens=256) == 1.25
+    assert _online_active_ready_wait_ms(temperature=0.0, max_tokens=300) == 1.25
 
 
 def test_openai_online_initial_batch_wait_uses_sampled_short_default(monkeypatch) -> None:
