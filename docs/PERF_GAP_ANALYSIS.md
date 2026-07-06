@@ -74,6 +74,21 @@ suffix-bucket, batch-bucket, or decode-tail defaults; the next long-output
 lever is still a non-fragmenting packed cached-prefix prefill body plus lower
 per-step replay cost.
 
+Rechecking the opt-in multi-token decode graph on current head rejects it as a
+long_output default. The diagnostic run with
+`TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY_GRAPH=1` and
+`TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY_GRAPH_MIN_STEPS=2` wrote
+`/tmp/inference-bench-ti-long-decodemany-graph-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100/runs/20260706_014026`
+and landed at `221.5 / 23.1 / 1058.5ms`, `1000/1000` correct. The graph path
+did fire (`40` decode-many graph calls, `206` graph steps, `13.2K` graph model
+tokens), but it made the dominant `decode_many:b64/64` path much slower:
+`5.06s` GPU in the graph run versus `1.95s` for the same shape in the adjacent
+safe-head all-provider control. Total decode-many GPU rose to `8.45s`, ragged
+decode GPU rose to `12.41s`, and p99 E2E stayed high at `3885ms`. Keep
+multi-token decode graphs opt-in; the long-output decode gap needs a faster
+single-step replay body or lower replay count, not graphing the current
+multi-step body.
+
 A current safe-head tree_of_thought all-provider refresh on `aaaa8e4` wrote
 `/tmp/inference-bench-aaaa8e4-tree-allproviders-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100/runs/20260706_010735`.
 vLLM landed at `39.3 / 27.0 / 57.8ms`, SGLang at
