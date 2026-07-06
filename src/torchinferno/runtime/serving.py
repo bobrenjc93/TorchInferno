@@ -529,12 +529,18 @@ class ServingStats:
     prefill_setup_ms: float = 0.0
     prefill_sample_ms: float = 0.0
     prefill_state_ms: float = 0.0
+    prefill_state_seq_ms: float = 0.0
+    prefill_state_store_ms: float = 0.0
+    prefill_state_create_ms: float = 0.0
     prefill_shape_wall_ms: dict[str, float] = field(default_factory=dict)
     prefill_shape_copy_ms: dict[str, float] = field(default_factory=dict)
     prefill_shape_setup_ms: dict[str, float] = field(default_factory=dict)
     prefill_shape_forward_ms: dict[str, float] = field(default_factory=dict)
     prefill_shape_sample_ms: dict[str, float] = field(default_factory=dict)
     prefill_shape_state_ms: dict[str, float] = field(default_factory=dict)
+    prefill_shape_state_seq_ms: dict[str, float] = field(default_factory=dict)
+    prefill_shape_state_store_ms: dict[str, float] = field(default_factory=dict)
+    prefill_shape_state_create_ms: dict[str, float] = field(default_factory=dict)
     prefill_shape_active_requests: dict[str, int] = field(default_factory=dict)
     prefill_shape_model_rows: dict[str, int] = field(default_factory=dict)
     prefill_shape_active_tokens: dict[str, int] = field(default_factory=dict)
@@ -3608,10 +3614,18 @@ class ContinuousBatchEngine:
                     sample_elapsed_ms,
                 )
             state_start_s = time.perf_counter() if self.profile_timings else 0.0
+            state_seq_ms = 0.0
+            state_store_ms = 0.0
+            state_create_ms = 0.0
             active: list[_ActiveRequest] = []
             for row_index, (original_index, request, prefix_hit_tokens, _reusable) in enumerate(output_group):
                 row = output_rows[row_index]
-                self._set_cache_row_seq_len(row, len(request.prompt))
+                prompt_len = len(request.prompt)
+                state_seq_start_s = time.perf_counter() if self.profile_timings else 0.0
+                self._set_cache_row_seq_len(row, prompt_len)
+                if self.profile_timings:
+                    state_seq_ms += (time.perf_counter() - state_seq_start_s) * 1000.0
+                state_store_start_s = time.perf_counter() if self.profile_timings else 0.0
                 self._store_reusable_prefix(
                     request.request_id,
                     request.prompt,
@@ -3619,6 +3633,9 @@ class ContinuousBatchEngine:
                     logits[row_index : row_index + 1],
                     allow_pinned=self._allow_pinned_full_prompt_store(request),
                 )
+                if self.profile_timings:
+                    state_store_ms += (time.perf_counter() - state_store_start_s) * 1000.0
+                state_create_start_s = time.perf_counter() if self.profile_timings else 0.0
                 next_token = int(next_tokens[row_index])
                 state = _ActiveRequest(
                     original_index=original_index,
@@ -3627,19 +3644,39 @@ class ContinuousBatchEngine:
                     generated=1,
                     row=row,
                     last_token=next_token,
-                    seq_len=self._cache_row_seq_len(row, len(request.prompt)),
+                    seq_len=self._cache_row_seq_len(row, prompt_len),
                     prefix_hit_tokens=prefix_hit_tokens,
                     started_step=step,
                 )
                 self._record_token_event(events, state, next_token, step, finished=self._should_finish_before_decode(state))
                 active.append(state)
+                if self.profile_timings:
+                    state_create_ms += (time.perf_counter() - state_create_start_s) * 1000.0
             if self.profile_timings:
                 state_elapsed_ms = (time.perf_counter() - state_start_s) * 1000.0
                 self.stats.prefill_state_ms += state_elapsed_ms
+                self.stats.prefill_state_seq_ms += state_seq_ms
+                self.stats.prefill_state_store_ms += state_store_ms
+                self.stats.prefill_state_create_ms += state_create_ms
                 self._record_shape_time(
                     self.stats.prefill_shape_state_ms,
                     shape_key,
                     state_elapsed_ms,
+                )
+                self._record_shape_time(
+                    self.stats.prefill_shape_state_seq_ms,
+                    shape_key,
+                    state_seq_ms,
+                )
+                self._record_shape_time(
+                    self.stats.prefill_shape_state_store_ms,
+                    shape_key,
+                    state_store_ms,
+                )
+                self._record_shape_time(
+                    self.stats.prefill_shape_state_create_ms,
+                    shape_key,
+                    state_create_ms,
                 )
                 self._record_shape_time(
                     self.stats.prefill_shape_wall_ms,
@@ -8119,11 +8156,12 @@ class ContinuousBatchEngine:
     ) -> Tensor:
         if len(rows) != len(start_lens):
             raise ValueError("rows and start_lens must have the same length")
-        total = max(1, int(required), len(self._row_seq_lens))
+        total = max(1, int(required))
         scratch = getattr(self, "_prefix_prefill_seq_lens_scratch", None)
         if scratch is None or scratch.device != self.device or scratch.numel() < total:
             scratch = torch.empty(total, dtype=torch.long, device=self.device)
             self._prefix_prefill_seq_lens_scratch = scratch
+        scratch[:total].zero_()
         values = torch.tensor(start_lens, device=self.device, dtype=torch.long)
         scratch[:total].index_copy_(0, row_indices.to(dtype=torch.long), values)
         return scratch[:total]

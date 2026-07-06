@@ -80,6 +80,9 @@ _QUEUE_PROFILE_FIELDS = (
     "runtime_prefill_copy_ms",
     "runtime_prefill_sample_ms",
     "runtime_prefill_state_ms",
+    "runtime_prefill_state_seq_ms",
+    "runtime_prefill_state_store_ms",
+    "runtime_prefill_state_create_ms",
     "runtime_prefill_packed_flashinfer_calls",
     "runtime_prefill_packed_flashinfer_ms",
     "runtime_prefill_packed_flashinfer_saved_tokens",
@@ -158,6 +161,9 @@ _QUEUE_PROFILE_FIELDS = (
     "runtime_prefill_shape_copy_ms",
     "runtime_prefill_shape_sample_ms",
     "runtime_prefill_shape_state_ms",
+    "runtime_prefill_shape_state_seq_ms",
+    "runtime_prefill_shape_state_store_ms",
+    "runtime_prefill_shape_state_create_ms",
     "runtime_prefill_shape_active_requests",
     "runtime_prefill_shape_model_rows",
     "runtime_prefill_shape_active_tokens",
@@ -523,6 +529,9 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
             "prefill_copy_ms",
             "prefill_sample_ms",
             "prefill_state_ms",
+            "state_seq_ms",
+            "state_store_ms",
+            "state_create_ms",
             "prefill_pad",
             "prefill_row_pad",
             "prefill_sfx_pad",
@@ -628,6 +637,9 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
                     _fmt_value(fields.get("runtime_prefill_copy_ms")),
                     _fmt_value(fields.get("runtime_prefill_sample_ms")),
                     _fmt_value(fields.get("runtime_prefill_state_ms")),
+                    _fmt_value(fields.get("runtime_prefill_state_seq_ms")),
+                    _fmt_value(fields.get("runtime_prefill_state_store_ms")),
+                    _fmt_value(fields.get("runtime_prefill_state_create_ms")),
                     _fmt_value(
                         None
                         if prefill_padding_tokens is None
@@ -784,6 +796,9 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
                         "copy_ms",
                         "sample_ms",
                         "state_ms",
+                        "state_seq_ms",
+                        "state_store_ms",
+                        "state_create_ms",
                         "active_tokens",
                         "model_tokens",
                         "padding_tokens",
@@ -2356,6 +2371,15 @@ def _hot_prefill_shape_rows(
                     ),
                     _fmt_value(
                         _mapping_value(fields.get("runtime_prefill_shape_state_ms"), shape)
+                    ),
+                    _fmt_value(
+                        _mapping_value(fields.get("runtime_prefill_shape_state_seq_ms"), shape)
+                    ),
+                    _fmt_value(
+                        _mapping_value(fields.get("runtime_prefill_shape_state_store_ms"), shape)
+                    ),
+                    _fmt_value(
+                        _mapping_value(fields.get("runtime_prefill_shape_state_create_ms"), shape)
                     ),
                     _fmt_value(active_tokens),
                     _fmt_value(model_tokens),

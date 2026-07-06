@@ -3531,6 +3531,33 @@ def test_continuous_batch_engine_records_profile_shape_counts() -> None:
     assert any(key.startswith("ragged:b3/") for key in engine.stats.decode_shape_counts)
 
 
+def test_prefix_prefill_seq_lens_scratch_keeps_unfilled_rows_zero() -> None:
+    engine = ContinuousBatchEngine(
+        _SelectedLogitsToyModel(),
+        device=torch.device("cpu"),
+        max_active_requests=4,
+        prefix_cache_capacity=4,
+        graph_prefill=True,
+    )
+
+    first = engine._prefix_prefill_seq_lens_tensor(
+        [0, 4],
+        [7, 9],
+        row_indices=torch.tensor([0, 4], dtype=torch.long),
+        required=5,
+    )
+    assert first.tolist() == [7, 0, 0, 0, 9]
+
+    second = engine._prefix_prefill_seq_lens_tensor(
+        [1],
+        [3],
+        row_indices=torch.tensor([1], dtype=torch.long),
+        required=5,
+    )
+
+    assert second.tolist() == [0, 3, 0, 0, 0]
+
+
 def test_continuous_batch_engine_skips_active_row_clear_for_prefix_graph_batch(
     monkeypatch,
 ) -> None:
@@ -3575,6 +3602,7 @@ def test_continuous_batch_engine_uses_prefix_rows_for_graph_padding_when_active_
         max_active_requests=4,
         prefix_cache_capacity=4,
         graph_prefill=True,
+        profile_timings=True,
     )
     requests = [
         ServingRequest("hold", (31, 32), 4, arrival_step=0),
@@ -3594,6 +3622,14 @@ def test_continuous_batch_engine_uses_prefix_rows_for_graph_padding_when_active_
     ]
     assert sparse_prefills
     assert any(starts == [len(shared)] * len(rows) for rows, starts in sparse_prefills)
+    assert engine.stats.prefill_state_ms >= 0.0
+    assert engine.stats.prefill_state_seq_ms >= 0.0
+    assert engine.stats.prefill_state_store_ms >= 0.0
+    assert engine.stats.prefill_state_create_ms >= 0.0
+    assert engine.stats.prefill_shape_state_seq_ms
+    assert set(engine.stats.prefill_shape_state_seq_ms) == set(engine.stats.prefill_shape_state_ms)
+    assert set(engine.stats.prefill_shape_state_store_ms) == set(engine.stats.prefill_shape_state_ms)
+    assert set(engine.stats.prefill_shape_state_create_ms) == set(engine.stats.prefill_shape_state_ms)
 
 
 def test_continuous_batch_engine_raises_common_prefix_ragged_suffix_threshold_for_greedy_short(

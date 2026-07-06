@@ -89,6 +89,21 @@ at `240.4 / 23.4 / 1111.7ms`, with setup `94.8ms`. Keep only the reusable
 seq-lens scratch; the remaining setup work is small enough that these tensor
 construction variants are run-noise or worse, not a new default lever.
 
+The prefix-prefill state bucket is now split into cache-row seq-len update,
+reusable-prefix store, and request/event creation. A local multi_turn rerun with
+the split counters and zero-filled seq-lens scratch semantics
+(`/tmp/inference-bench-prefill-state-zero-scratch-results/.../20260706_113425`)
+landed at `214.5 / 61.9 / 274.8ms`, `0.982` correctness, matching the public
+multi_turn correctness neighborhood (`0.980`). The queue profile spent
+`2.79s/3.41s` in prefill forward/wall and only `62.0ms` in the prefill state
+bucket, split as `39.7ms` row seq-len update, `15.9ms` reusable-prefix store,
+and `5.4ms` request/event creation. This rules out the state bookkeeping bucket
+as the current multi_turn TTFT/E2E target; the profile remains dominated by
+padded mixed-prefix prefill body cost, with sampled first-token handling noisy
+across runs. The scratch helper also now preserves the original zero-filled
+`required`-length tensor contract for unfilled rows instead of returning a
+full-cache-row view with stale entries.
+
 A same-host provider refresh
 (`/tmp/inference-bench-provider-long-results/.../20260706_103437`) measured
 vLLM `68.8 / 17.0 / 676.0ms` and SGLang `63.5 / 23.1 / 928.8ms`, both
