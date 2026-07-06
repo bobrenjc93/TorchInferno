@@ -644,6 +644,7 @@ class _SelectedLogitsToyModel(_RaggedGraphToyModel):
         self.prefill_src_prefix_rows: list[list[int] | None] = []
         self.prefill_input_shapes: list[tuple[int, int]] = []
         self.prefill_row_indices: list[list[int]] = []
+        self.prefill_start_positions: list[list[int]] = []
         self.prefill_capture_flags: list[bool] = []
         self.prefill_prefix_copy_lens: list[int | None] = []
         self.prefill_context_lens: list[int | None] = []
@@ -682,10 +683,12 @@ class _SelectedLogitsToyModel(_RaggedGraphToyModel):
         self, input_ids, cache, *, seq_lens, row_indices, logit_positions,
         context_len=None, src_prefix_row=None, prefix_copy_len=None, capture_on_miss=True,
     ):
-        del seq_lens
         self.prefill_capture_flags.append(bool(capture_on_miss))
         self.prefill_prefix_copy_lens.append(prefix_copy_len)
         self.prefill_context_lens.append(context_len)
+        self.prefill_start_positions.append(
+            _toy_decode_positions(input_ids, seq_lens, row_indices)
+        )
         self.prefill_src_prefix_rows.append(
             None if src_prefix_row is None else src_prefix_row.detach().cpu().tolist()
         )
@@ -698,9 +701,11 @@ class _SelectedLogitsToyModel(_RaggedGraphToyModel):
         self, input_ids, cache, *, seq_lens, row_indices, logit_positions, context_len=None,
         src_prefix_row=None, prefix_copy_len=None,
     ):
-        del seq_lens
         self.prefill_prefix_copy_lens.append(prefix_copy_len)
         self.prefill_context_lens.append(context_len)
+        self.prefill_start_positions.append(
+            _toy_decode_positions(input_ids, seq_lens, row_indices)
+        )
         self.prefill_src_prefix_rows.append(
             None if src_prefix_row is None else src_prefix_row.detach().cpu().tolist()
         )
@@ -713,7 +718,9 @@ class _SelectedLogitsToyModel(_RaggedGraphToyModel):
         self, input_ids, cache, *, seq_lens, q_lens, row_indices, logit_positions,
         src_prefix_row=None, prefix_copy_len=None,
     ):
-        del seq_lens
+        self.prefill_start_positions.append(
+            _toy_decode_positions(input_ids, seq_lens, row_indices)
+        )
         self.packed_prefill_q_lens.append(q_lens.detach().cpu().tolist())
         self.prefill_prefix_copy_lens.append(prefix_copy_len)
         self.prefill_src_prefix_rows.append(
@@ -728,7 +735,9 @@ class _SelectedLogitsToyModel(_RaggedGraphToyModel):
         self, input_ids, cache, *, seq_lens, q_lens, row_indices, logit_positions,
         src_prefix_row=None, prefix_copy_len=None, capture_on_miss=True,
     ):
-        del seq_lens
+        self.prefill_start_positions.append(
+            _toy_decode_positions(input_ids, seq_lens, row_indices)
+        )
         self.packed_prefill_graph_q_lens.append(q_lens.detach().cpu().tolist())
         self.prefill_capture_flags.append(bool(capture_on_miss))
         self.prefill_prefix_copy_lens.append(prefix_copy_len)
@@ -744,11 +753,13 @@ class _SelectedLogitsToyModel(_RaggedGraphToyModel):
         self, input_ids, cache, *, seq_lens, row_indices, context_len=None,
         src_prefix_row=None, prefix_copy_len=None, capture_on_miss=True,
     ):
-        del seq_lens
         self.prefill_cache_graph_calls += 1
         self.prefill_capture_flags.append(bool(capture_on_miss))
         self.prefill_prefix_copy_lens.append(prefix_copy_len)
         self.prefill_context_lens.append(context_len)
+        self.prefill_start_positions.append(
+            _toy_decode_positions(input_ids, seq_lens, row_indices)
+        )
         self.prefill_src_prefix_rows.append(
             None if src_prefix_row is None else src_prefix_row.detach().cpu().tolist()
         )
@@ -762,10 +773,12 @@ class _SelectedLogitsToyModel(_RaggedGraphToyModel):
         self, input_ids, cache, *, seq_lens, row_indices, context_len=None,
         src_prefix_row=None, prefix_copy_len=None,
     ):
-        del seq_lens
         self.prefill_cache_eager_calls += 1
         self.prefill_prefix_copy_lens.append(prefix_copy_len)
         self.prefill_context_lens.append(context_len)
+        self.prefill_start_positions.append(
+            _toy_decode_positions(input_ids, seq_lens, row_indices)
+        )
         self.prefill_src_prefix_rows.append(
             None if src_prefix_row is None else src_prefix_row.detach().cpu().tolist()
         )
@@ -3574,10 +3587,13 @@ def test_continuous_batch_engine_uses_prefix_rows_for_graph_padding_when_active_
 
     assert len(results) == 4
     assert (4, 1) in model.prefill_input_shapes
-    assert any(
-        len(rows) == 4 and any(row >= engine.max_active_requests for row in rows)
-        for rows in model.prefill_row_indices
-    )
+    sparse_prefills = [
+        (rows, starts)
+        for rows, starts in zip(model.prefill_row_indices, model.prefill_start_positions)
+        if len(rows) == 4 and any(row >= engine.max_active_requests for row in rows)
+    ]
+    assert sparse_prefills
+    assert any(starts == [len(shared)] * len(rows) for rows, starts in sparse_prefills)
 
 
 def test_continuous_batch_engine_raises_common_prefix_ragged_suffix_threshold_for_greedy_short(

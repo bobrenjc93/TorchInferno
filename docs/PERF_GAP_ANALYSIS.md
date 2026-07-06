@@ -67,6 +67,17 @@ A local TorchInferno-only long_output run on `17af09d`
 saved tokens, and compact reject reasons so future public profiles expose this
 signal directly.
 
+A follow-up local TorchInferno-only long_output run with reusable prefix-prefill
+`seq_lens` scratch
+(`/tmp/inference-bench-seqlens-scratch-results/.../20260706_104714`) landed at
+`203.1 / 23.8 / 1077.7ms`, `1000/1000` correct. The targeted setup counter
+dropped from `295.3ms` to `82.9ms`; prefill wall was roughly flat
+(`5.29s -> 5.23s`) and prefill forward moved noisily in the wrong direction
+(`4.66s -> 4.80s`). Keep the scratch reuse because it removes real per-prefill
+host/device setup overhead, but do not treat it as the structural long-output
+fix: the remaining gap is still dense cached-prefix prefill body cost plus
+decode replay/readback density.
+
 A same-host provider refresh
 (`/tmp/inference-bench-provider-long-results/.../20260706_103437`) measured
 vLLM `68.8 / 17.0 / 676.0ms` and SGLang `63.5 / 23.1 / 928.8ms`, both

@@ -3462,10 +3462,12 @@ class ContinuousBatchEngine:
                 else None
             )
             required = max(all_rows + source_prefix_rows) + 1
-            seq_lens_list = [0] * required
-            for physical_row, start_len in zip(all_rows, start_lens):
-                seq_lens_list[physical_row] = start_len
-            seq_lens = torch.tensor(seq_lens_list, device=self.device, dtype=torch.long)
+            seq_lens = self._prefix_prefill_seq_lens_tensor(
+                all_rows,
+                start_lens,
+                row_indices=row_indices,
+                required=required,
+            )
             logit_positions = torch.tensor(
                 [length - 1 for length in suffix_lengths]
                 + [0] * (len(pad_rows) + len(pad_prefix_rows)),
@@ -8106,6 +8108,25 @@ class ContinuousBatchEngine:
             if row not in active_rows and 0 <= row < len(seq_lens) and seq_lens[row] <= 0:
                 seq_lens[row] = pad_seq_len
         return torch.tensor(seq_lens, device=self.device, dtype=torch.long)
+
+    def _prefix_prefill_seq_lens_tensor(
+        self,
+        rows: Sequence[int],
+        start_lens: Sequence[int],
+        *,
+        row_indices: Tensor,
+        required: int,
+    ) -> Tensor:
+        if len(rows) != len(start_lens):
+            raise ValueError("rows and start_lens must have the same length")
+        total = max(1, int(required), len(self._row_seq_lens))
+        scratch = getattr(self, "_prefix_prefill_seq_lens_scratch", None)
+        if scratch is None or scratch.device != self.device or scratch.numel() < total:
+            scratch = torch.empty(total, dtype=torch.long, device=self.device)
+            self._prefix_prefill_seq_lens_scratch = scratch
+        values = torch.tensor(start_lens, device=self.device, dtype=torch.long)
+        scratch[:total].index_copy_(0, row_indices.to(dtype=torch.long), values)
+        return scratch[:total]
 
     def _cache_row_seq_len(self, row: int, fallback: int) -> int:
         if 0 <= row < len(self._row_seq_lens):
