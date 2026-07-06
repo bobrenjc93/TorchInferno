@@ -51,6 +51,21 @@ score-facing A/B, not just lower phase counters. Multi_turn and few_shot are
 still ordinary prefill-body/padding targets (`16.9K` and `3.4K` padded tokens)
 with no new state-bookkeeping culprit.
 
+An adjacent same-head long_output suffix-split recheck keeps the guarded split
+diagnostic-only. The no-split control
+(`/tmp/inference-bench-current-nosplit-control-results/.../20260706_140045`)
+landed at `224.5 / 23.4 / 1009.8ms`, `1000/1000` correct. Enabling
+`TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SPLIT_SUFFIX_BUCKETS_GREEDY_SHORT=1`
+(`/tmp/inference-bench-current-suffixsplit-results/.../20260706_135507`)
+landed at `217.9 / 23.1 / 1105.5ms`, also `1000/1000` correct. The split
+accepted `12/19` candidates and cut prefill padding from `34.6K` to `27.2K`
+tokens (`9.0K` accepted saved tokens), but prefill batches rose `58 -> 72`,
+prefill forward stayed flat/slightly worse (`4.66s -> 4.70s`), and decode-many
+work rose (`4.80s/1.29s` GPU/CPU over `105` calls and `360` steps to
+`5.86s/1.48s` over `120` calls and `438` steps). Keep the automatic split off;
+lower padding alone is not enough when fragmentation pushes more work into
+decode-many and worsens median E2E.
+
 ## Public 20260706_110224 refresh and sample split follow-up
 
 The public run then advanced to
