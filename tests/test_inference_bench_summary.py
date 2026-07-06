@@ -644,6 +644,22 @@ def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) ->
     assert "50.0%" in text
 
 
+def test_inference_bench_summary_reads_current_provider_log_names(tmp_path) -> None:
+    _write_inference_bench_run(tmp_path)
+    logs = tmp_path / "provider_logs"
+    (logs / "vllm_server.log").rename(logs / "vllm.log")
+    (logs / "sglang_server.log").rename(logs / "sglang.log")
+
+    text = format_inference_bench_summary(summarize_inference_bench_run(tmp_path))
+
+    assert "[provider server log phases]" in text
+    assert "vllm" in text
+    assert "sglang" in text
+    assert "prefix_hit_avg" in text
+    assert "prefill_graph_pct" in text
+    assert "decode_graph_pct" in text
+
+
 def test_inference_bench_summary_marks_partial_queue_profiles(tmp_path) -> None:
     _write_inference_bench_run(tmp_path)
     queue_path = tmp_path / "provider_logs" / "torchinferno_queue_profile.jsonl"

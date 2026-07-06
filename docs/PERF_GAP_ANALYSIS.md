@@ -99,6 +99,32 @@ masked-SDPA start-grouping shim as the packed-prefix implementation; the viable
 path still needs a real varlen prefill kernel/body that avoids both padded
 transformer tokens and per-group Python/SDPA work.
 
+A same-host current-head long_output comparison after `543df7f` used the
+available local provider environments instead of rebuilding. The first run wrote
+`/tmp/inference-bench-current-allproviders-long-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-current-allproviders-long-543df7f/runs/20260706_064427`;
+the fresh build dir lacked vLLM/SGLang virtualenvs, so it produced only the
+TorchInferno leg: `211.6 / 23.5 / 1061.3ms`, `33.9 tok/s`, `1000/1000`
+correct. The provider-only rerun used existing envs at vLLM `cc1d020d0194` and
+SGLang `602c8615a1af`, wrote
+`/tmp/inference-bench-current-providers-long-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-current-providers-long-543df7f/runs/20260706_065031`,
+and landed at vLLM `69.4 / 16.9 / 669.1ms`, `52.8 tok/s`, and SGLang
+`61.0 / 24.1 / 944.5ms`, `38.2 tok/s`, both fully correct. This is not an
+exact public-run reproduction because the provider commits differ, but it
+confirms the same split: TorchInferno's TTFT is still about `3x` SGLang and TPOT
+is still behind vLLM, while TorchInferno is near SGLang on TPOT.
+
+The same provider-only run exposed a small analyzer blind spot. Current
+inference-bench saves provider artifacts as `provider_logs/vllm.log` and
+`provider_logs/sglang.log`, while the TorchInferno analyzer only read the older
+`*_server.log` names. The analyzer now accepts both forms. Re-rendering the
+local run shows vLLM's single aggregate runtime line (`4.8K` prompt tok/s,
+`3.2K` generation tok/s, `64.9%` prefix hit) and SGLang's detailed phase logs:
+`355` prefill batches, `44.4K` new tokens, `111.3K` cached tokens, `100%`
+prefill graph coverage, `17` decode batches, `71.1K` decoded tokens, and `100%`
+decode graph coverage. That is useful provider context for future local runs,
+but the runtime target remains lower padded-prefix prefill work plus lower
+decode replay/readback cost.
+
 ## Public 20260706_030205 refresh
 
 The latest public run advanced to

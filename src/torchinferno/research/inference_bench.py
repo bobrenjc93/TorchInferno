@@ -1372,13 +1372,21 @@ def _sum_optional_int(values: Iterable[int | None]) -> int | None:
 def _summarize_provider_server_logs(root: Path) -> tuple[ProviderServerLogSummary, ...]:
     logs_dir = root / "provider_logs"
     summaries: list[ProviderServerLogSummary] = []
-    vllm_path = logs_dir / "vllm_server.log"
+    vllm_path = _first_existing_provider_log(logs_dir, "vllm.log", "vllm_server.log")
     if vllm_path.exists():
         summaries.append(_summarize_vllm_server_log(vllm_path))
-    sglang_path = logs_dir / "sglang_server.log"
+    sglang_path = _first_existing_provider_log(logs_dir, "sglang.log", "sglang_server.log")
     if sglang_path.exists():
         summaries.append(_summarize_sglang_server_log(sglang_path))
     return tuple(summaries)
+
+
+def _first_existing_provider_log(logs_dir: Path, *names: str) -> Path:
+    for name in names:
+        path = logs_dir / name
+        if path.exists():
+            return path
+    return logs_dir / names[0]
 
 
 def _summarize_vllm_server_log(path: Path) -> ProviderServerLogSummary:
