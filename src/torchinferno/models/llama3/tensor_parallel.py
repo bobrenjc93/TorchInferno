@@ -4380,7 +4380,13 @@ class Llama3TensorParallelForCausalLM:
             )
         else:
             self._copy_ragged_decode_graph_inputs(captured, input_ids, seq_lens, row_indices)
-            captured.graph.replay()
+            if not self._maybe_profile_ragged_decode_many_graph_replay_once(
+                captured,
+                input_ids,
+                cache_token_bucket=cache_token_bucket,
+                row_indices=row_indices,
+            ):
+                captured.graph.replay()
         self._last_ragged_decode_many_graph_captured = bool(needs_capture)
         return captured.output_tokens
 
@@ -4437,6 +4443,74 @@ class Llama3TensorParallelForCausalLM:
             self._ragged_decode_many_graphs.clear()
         self._ragged_decode_many_graphs[key] = captured
         return captured
+
+    def _maybe_profile_ragged_decode_many_graph_replay_once(
+        self,
+        captured: _StaticRaggedDecodeManyGraphCall,
+        input_ids: Tensor,
+        *,
+        cache_token_bucket: int,
+        row_indices: Tensor | None,
+    ) -> bool:
+        if (
+            not env_flag("TORCHINFERNO_PROFILE_RAGGED_DECODE_MANY_REPLAY_ONCE", False)
+            or getattr(self, "_ragged_decode_many_replay_profiled", False)
+            or input_ids.device.type != "cuda"
+        ):
+            return False
+        min_batch = env_int("TORCHINFERNO_PROFILE_RAGGED_DECODE_MANY_MIN_BATCH", 32, minimum=1)
+        if input_ids.size(0) < min_batch:
+            return False
+        configured_bucket = os.environ.get("TORCHINFERNO_PROFILE_RAGGED_DECODE_MANY_CACHE_BUCKET")
+        if configured_bucket is not None and configured_bucket.strip():
+            if int(configured_bucket) != int(cache_token_bucket):
+                return False
+        configured_steps = os.environ.get("TORCHINFERNO_PROFILE_RAGGED_DECODE_MANY_STEPS")
+        if configured_steps is not None and configured_steps.strip():
+            if int(configured_steps) != int(captured.steps):
+                return False
+        skip_matches = env_int(
+            "TORCHINFERNO_PROFILE_RAGGED_DECODE_MANY_REPLAY_SKIP_MATCHES",
+            0,
+            minimum=0,
+        )
+        profile_matches = int(getattr(self, "_ragged_decode_many_replay_profile_matches", 0)) + 1
+        self._ragged_decode_many_replay_profile_matches = profile_matches
+        if profile_matches <= skip_matches:
+            return False
+        self._ragged_decode_many_replay_profiled = True
+        rank = getattr(self, "rank", 0)
+        if rank != 0:
+            captured.graph.replay()
+            return True
+        replayed = False
+        try:
+            import sys as _rdmp
+            from torch.profiler import ProfilerActivity as _PA
+            from torch.profiler import profile as _tprof
+
+            torch.cuda.synchronize(self.device)
+            with _tprof(activities=[_PA.CPU, _PA.CUDA]) as prof:
+                captured.graph.replay()
+                replayed = True
+                torch.cuda.synchronize(self.device)
+            rows = int(row_indices.numel()) if row_indices is not None else input_ids.size(0)
+            row_limit = env_int("TORCHINFERNO_PROFILE_RAGGED_DECODE_MANY_ROW_LIMIT", 32, minimum=1)
+            print(
+                f"[RAGGED_DECODE_MANY_REPLAY_PROF] batch={input_ids.size(0)} "
+                f"steps={captured.steps} "
+                f"match={profile_matches} "
+                f"cache_bucket={cache_token_bucket} "
+                f"rows={rows}\n"
+                + prof.key_averages().table(sort_by="cuda_time_total", row_limit=row_limit),
+                file=_rdmp.stderr,
+                flush=True,
+            )
+        except Exception as exc:
+            warn_optional_failure("llama3_tensor_parallel.ragged_decode_many_replay_profile", exc)
+            if not replayed:
+                captured.graph.replay()
+        return True
 
     def _forward_decode_ragged_many_static(
         self,

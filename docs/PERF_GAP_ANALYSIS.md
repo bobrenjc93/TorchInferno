@@ -11366,6 +11366,40 @@ dominated (`q2first=130ms`, `q2submit=75ms`). The extra copy/divide work is not
 a proven default win; keep sampled decode focused on a real fused or graph-safe
 sampler, not persistent scratch buffers.
 
+Added an opt-in decode-many replay profiler for the captured multi-step ragged
+decode graph. Set `TORCHINFERNO_PROFILE_RAGGED_DECODE_MANY_REPLAY_ONCE=1`,
+optionally with `TORCHINFERNO_PROFILE_RAGGED_DECODE_MANY_MIN_BATCH`,
+`TORCHINFERNO_PROFILE_RAGGED_DECODE_MANY_CACHE_BUCKET`,
+`TORCHINFERNO_PROFILE_RAGGED_DECODE_MANY_STEPS`,
+`TORCHINFERNO_PROFILE_RAGGED_DECODE_MANY_REPLAY_SKIP_MATCHES`, and
+`TORCHINFERNO_PROFILE_RAGGED_DECODE_MANY_ROW_LIMIT`, to print one rank-0
+`torch.profiler` table for the exact `decode_many` graph replay. This is
+instrumentation only; default serving behavior is unchanged.
+
+A long_output run with the new decode-many replay profiler enabled wrote
+`/tmp/inference-bench-decode-many-prof-results/.../runs/20260706_052503` and
+landed at `237.4 / 23.4 / 1062.5ms`, `1000/1000` correct. The hook did not
+fire because the current default path has `runtime_decode_many_graph_calls=0`;
+`decode_many` is a scheduler loop over single-step ragged decode graph replays.
+The queue profile still showed the same shape: `4.68s` prefill forward,
+`5.05s` decode-many GPU, `3.86s` ragged decode graph replay, and `1.36s`
+decode-many CPU token handling.
+
+The matching single-step ragged replay profile filtered to
+`batch=64/cache_bucket=1024` wrote
+`/tmp/inference-bench-ragged64-prof-results/.../runs/20260706_053043` and
+landed at `216.3 / 23.6 / 1139.3ms`, `1000/1000` correct. The rank-0 profiler
+captured one hot `batch=64` replay at `12.53ms` self CUDA: dense GEMMs were
+`4.58ms` combined, gate-up Marlin `3.34ms`, symmetric-memory all-reduce
+`2.11ms`, grouped GQA decode attention `1.49ms`, add/RMSNorm `0.44ms`, rotary
+append `0.18ms`, and greedy sampling all-gather `0.009ms`. Queue counters
+showed `5.72s` total ragged decode graph replay, almost entirely
+`b64/cache1024/symm128`, plus `4.80s` prefill forward and `1.60s` decode token
+CPU handling. This rules out token sampling and rotary as meaningful
+long_output levers; the remaining decode gap is dense GEMM/Marlin throughput
+and per-layer collective/attention cost, with padded prefill still the TTFT
+lever.
+
 ## Priority for a focused (non-loop) session
 
 1. Prefill MFU (Issue 1) — biggest TTFT lever, ~2x, affects 3/5 benchmarks.
