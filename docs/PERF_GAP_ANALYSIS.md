@@ -208,6 +208,19 @@ fixed-capacity target is only `258ms` (`5.0%` of prefill forward); tree still
 needs a broader packed-prefix body and lower sampled decode cost rather than one
 narrow pattern rewrite.
 
+An env-only few_shot exact-suffix probe on the same branch confirms that simply
+shrinking the dense bucket is not enough. With
+`TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SUFFIX_BUCKETS=12,13,14,16` plus
+matching `p122` warmup, the run
+`/tmp/inference-bench-few-exact-suffix-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-few-exact-suffix-f82a9c6/runs/20260706_092410`
+landed at `179.3 / 45.2 / 218.9ms`, `977/1000` correct, after `190.9s`
+server readiness. It cut profiled few_shot prefill padding to `1.54K` tokens,
+but the hot body became `prefix_graph:b32:s14:p122-122:src1:mixed0` and slowed
+to `55.1ms/call` / `123us/model-token`, worse than the public `s16` body's
+`~40.7ms/call` / `79us/model-token`. Keep exact greedy-mid suffix buckets as a
+diagnostic only; the score-facing fix still needs a faster model-side cached
+prefix body, not a smaller dense suffix bucket.
+
 A same-branch tree A/B checked whether generated-prefix decode capture should
 be enabled by default. The opt-in decode-capture run
 `/tmp/inference-bench-tree-decode-capture-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-tree-decode-capture-aca24b0/runs/20260706_074034`
