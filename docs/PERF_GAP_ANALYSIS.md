@@ -66,6 +66,22 @@ work rose (`4.80s/1.29s` GPU/CPU over `105` calls and `360` steps to
 lower padding alone is not enough when fragmentation pushes more work into
 decode-many and worsens median E2E.
 
+A small TP sampler cleanup is accepted on the sampled tree path: use scalar
+sentinel values in the greedy and Gumbel token tie-breaks instead of allocating
+a full sentinel tensor for every sample. The adjacent baseline control on
+`6893af8`
+(`/tmp/inference-bench-sampler-scalar-control-results/.../20260706_141832`)
+landed at `145.8 / 67.4 / 208.4ms`, `0.968` correctness. The scalar-sentinel
+run
+(`/tmp/inference-bench-sampler-scalar-results/.../20260706_141149`) landed at
+`119.9 / 63.4 / 182.6ms`, `0.966` correctness. The profiler supports the
+general allocation cleanup: prefill sample selection dropped from `399.6ms` to
+`302.9ms`, and cumulative TP Gumbel time dropped from `616.1ms` to `568.2ms`
+even though the accepted run issued more sampler calls (`476` versus `436`).
+Tree remains noisy, so keep pursuing sampler collectives and sampled decode
+graph misses, but this change removes per-call allocation work from the active
+runtime path.
+
 ## Public 20260706_110224 refresh and sample split follow-up
 
 The public run then advanced to

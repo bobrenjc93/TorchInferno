@@ -7456,9 +7456,10 @@ class Llama3TensorParallelForCausalLM:
         local_values, local_indices = torch.max(logits.float(), dim=-1)
         global_values = local_values.clone()
         dist.all_reduce(global_values, op=dist.ReduceOp.MAX)
-        sentinel = torch.full_like(local_indices, self.config.vocab_size)
         local_tokens = local_indices + self.vocab_start
-        next_token = torch.where(local_values == global_values, local_tokens, sentinel)
+        next_token = torch.where(
+            local_values == global_values, local_tokens, self.config.vocab_size
+        )
         dist.all_reduce(next_token, op=dist.ReduceOp.MIN)
         return next_token
 
@@ -7475,8 +7476,9 @@ class Llama3TensorParallelForCausalLM:
         values = gathered[..., 0]
         tokens = gathered[..., 1].to(torch.long)
         global_values = values.max(dim=0).values
-        sentinel = torch.full_like(tokens, self.config.vocab_size)
-        candidate_tokens = torch.where(values == global_values[None, :], tokens, sentinel)
+        candidate_tokens = torch.where(
+            values == global_values[None, :], tokens, self.config.vocab_size
+        )
         return candidate_tokens.min(dim=0).values
 
     def _sample_next_token_temperature_gather(self, logits: Tensor, temperature: float) -> Tensor:
@@ -7507,9 +7509,10 @@ class Llama3TensorParallelForCausalLM:
         global_values = local_values.clone()
         dist.all_reduce(global_values, op=dist.ReduceOp.MAX)
         max_ms = (time.perf_counter() - phase_start_s) * 1000.0 if profile_sample else 0.0
-        sentinel = torch.full_like(local_indices, self.config.vocab_size)
         local_tokens = local_indices + self.vocab_start
-        next_token = torch.where(local_values == global_values, local_tokens, sentinel)
+        next_token = torch.where(
+            local_values == global_values, local_tokens, self.config.vocab_size
+        )
         phase_start_s = time.perf_counter() if profile_sample else 0.0
         dist.all_reduce(next_token, op=dist.ReduceOp.MIN)
         if profile_sample:
@@ -7690,9 +7693,10 @@ class Llama3TensorParallelForCausalLM:
         local_values, local_indices = torch.max(logits_float.expand_as(gumbel) + gumbel, dim=-1)
         global_values = local_values.clone()
         dist.all_reduce(global_values, op=dist.ReduceOp.MAX)
-        sentinel = torch.full_like(local_indices, self.config.vocab_size)
         local_tokens = local_indices + self.vocab_start
-        next_token = torch.where(local_values == global_values, local_tokens, sentinel)
+        next_token = torch.where(
+            local_values == global_values, local_tokens, self.config.vocab_size
+        )
         dist.all_reduce(next_token, op=dist.ReduceOp.MIN)
         return next_token
 
