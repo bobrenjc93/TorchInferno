@@ -268,6 +268,7 @@ def _write_inference_bench_run(tmp_path) -> None:
         "runtime_decode_shape_gpu_ms": {"ragged:b8/8": 14.0},
         "runtime_decode_shape_cpu_tokens_ms": {"ragged:b8/8": 1.25},
         "runtime_decode_many_shape_model_tokens": {"decode_many:b8/8": 19},
+        "runtime_decode_many_cpu_tokens_ms": 1.5,
         "runtime_decode_many_shape_padded_tokens": {"decode_many:b8/8": 24},
         "runtime_decode_many_shape_emitted_tokens": {"decode_many:b8/8": 15},
         "runtime_decode_many_shape_skipped_tokens": {"decode_many:b8/8": 4},
@@ -476,7 +477,9 @@ def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) ->
     assert "decode_graph_cap_ms" in text
     assert "decode_cpu_ms" in text
     assert "decode_state_ms" in text
+    assert "decode_many_cpu_ms" in text
     assert "1.2" in text
+    assert "1.5" in text
     assert "2.2" in text
     assert "tail_cap" in text
     assert "sync_stops" in text

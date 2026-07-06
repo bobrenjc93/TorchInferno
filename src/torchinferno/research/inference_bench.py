@@ -175,6 +175,7 @@ _QUEUE_PROFILE_FIELDS = (
     "runtime_decode_many_padded_tokens",
     "runtime_decode_many_emitted_tokens",
     "runtime_decode_many_skipped_tokens",
+    "runtime_decode_many_cpu_tokens_ms",
     "runtime_decode_many_model_gpu_ms",
     "runtime_decode_many_tail_limited_calls",
     "runtime_decode_many_tail_limited_steps",
@@ -497,6 +498,7 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
             "decode_graph_symm",
             "decode_replay_symm_ms",
             "decode_many_gpu_ms",
+            "decode_many_cpu_ms",
             "decode_many_steps",
             "decode_many_graph_calls",
             "decode_many_graph_steps",
@@ -578,6 +580,7 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
                         )
                     ),
                     _fmt_value(fields.get("runtime_decode_many_model_gpu_ms")),
+                    _fmt_value(fields.get("runtime_decode_many_cpu_tokens_ms")),
                     _fmt_value(fields.get("runtime_decode_many_steps")),
                     _fmt_value(fields.get("runtime_decode_many_graph_calls")),
                     _fmt_value(fields.get("runtime_decode_many_graph_steps")),

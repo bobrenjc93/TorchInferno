@@ -17,13 +17,13 @@ TTFT/TPOT/E2E.
 The analyzer now carries decode host overhead in the queue-profile and hot
 decode tables. Re-rendering the latest public run shows long_output's logged
 partial queue profile (`547/1000` requests) spent `5.36s` in ragged decode GPU,
-`897ms` copying decode tokens to CPU, and `20ms` in decode state updates; the
-hottest `decode_many:b64/64` shape spent `1.54s` GPU and `257ms` CPU-copy.
-That makes host readback visible as a material cost, but not enough to explain
-the whole gap or reopen the rejected side-stream copy shim. The defaultable
-long-output target remains lower `b64` replay cost or a real decode/readback
-pipeline, while current-head multi_turn remains focused on the padded
-cached-prefix prefill body documented below.
+`897ms` copying decode tokens to CPU, `890ms` of that inside decode-many, and
+`20ms` in decode state updates; the hottest `decode_many:b64/64` shape spent
+`1.54s` GPU and `257ms` CPU-copy. That makes q8 drain readback visible as a
+material cost, but not enough to explain the whole gap or reopen the rejected
+side-stream copy shim. The defaultable long-output target remains lower `b64`
+replay cost or a real decode/readback pipeline, while current-head multi_turn
+remains focused on the padded cached-prefix prefill body documented below.
 
 ## Public 20260705_230202 and current HTTP split
 
