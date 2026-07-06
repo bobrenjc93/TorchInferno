@@ -105,6 +105,16 @@ Tree remains noisy, so keep pursuing sampler collectives and sampled decode
 graph misses, but this change removes per-call allocation work from the active
 runtime path.
 
+Forcing static decode capture for generated-prefix traffic is not a fix for the
+remaining sampled-tree graph misses. The focused run with
+`TORCHINFERNO_CONTINUOUS_DECODE_CAPTURE=1`
+(`/tmp/inference-bench-tree-static-capture-results/.../20260706_144249`) landed
+at `131.6 / 64.0 / 190.7ms`, `0.967` correctness, slower than the accepted
+scalar-sentinel tree run. It still reported `19` static-logits decode misses and
+recorded no new decode captures, so the env override did not address the
+`b2-b5/s55-s57` miss pattern. Keep generated-prefix static capture disabled
+unless a future change warms or captures those concrete cache shapes directly.
+
 ## Public 20260706_110224 refresh and sample split follow-up
 
 The public run then advanced to
