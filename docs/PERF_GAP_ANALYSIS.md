@@ -1,8 +1,59 @@
 # TorchInferno vs vLLM/sglang — Performance Gap Analysis (Llama-3.1-70B, 8xH100)
 
-## Public 20260706_110224 refresh and sample split follow-up
+## Public 20260706_130207 and current-head all-provider refresh
 
 The latest public run advanced to
+`results/v1/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100/runs/20260706_130207`.
+It measured TorchInferno `3558018`, vLLM `07f9baf`, and SGLang `80decc7`.
+This is the first public run with the accepted reusable Gumbel scratch runtime;
+the later TorchInferno commits through `9d51ff9` record rejected probes and do
+not change the active runtime path. Public TorchInferno wins self_consistency
+(`101.5 / 0.0 / 108.6ms`) and few_shot TPOT (`44.2ms` versus vLLM `45.9ms`),
+but still trails vLLM/SGLang on few_shot (`+18.7ms` TTFT, `-1.7ms` TPOT,
+`+24.0ms` E2E), multi_turn (`+152.2ms`, `+13.9ms`, `+164.6ms`),
+tree_of_thought (`+47.5ms`, `+42.4ms`, `+66.0ms`), and long_output
+(`+206.0ms`, `+5.1ms`, `+391.3ms`).
+
+The public queue profile keeps long_output as the largest score-facing gap.
+It spent `3.98s` in prefill forward, padded `34.6K` prefill tokens
+(`43.6%`), spent `10.32s` in ragged decode GPU work, and spent `4.73s` GPU
+plus `1.28s` CPU across `112` decode-many calls. The hot decode-many body is
+still the full-batch first window: `decode_many:b64/64:g1-16` consumed
+`1.34s` total at `188us/token`, followed by `g17-32` at another `296ms`.
+Multi_turn remains prefill-body bound (`2.47s` prefill forward, `17.5K`
+padded tokens, `53.5%` padding). Public tree is much faster than several local
+tree reruns, but the target is unchanged: sampled short-prefix prefill plus
+ragged sampled decode (`4.94s` prefill forward, `173.2ms` prefill sample,
+`4.53s` decode GPU, and sampled static decode graph misses
+`static_logits=32,static_token=1`).
+
+A same-host all-provider refresh on current TorchInferno head
+(`/tmp/inference-bench-current-full-results/.../20260706_133554`) used vLLM
+`cc1d020`, SGLang `602c861`, and TorchInferno `9d51ff9`. TorchInferno still
+wins self_consistency (`65.4 / 0.0 / 70.9ms`) but trails on few_shot
+(`+72.8ms` TTFT, `+8.2ms` TPOT, `+82.5ms` E2E), multi_turn (`+86.2ms`,
+`+8.7ms`, `+100.4ms`), tree_of_thought (`+124.5ms`, `+38.9ms`, `+166.3ms`),
+and long_output (`+179.9ms`, `+6.7ms`, `+428.9ms`). Because the active
+TorchInferno runtime is the same as public `3558018`, treat the public/local
+spread, especially tree, as run variance and provider-revision context rather
+than a TorchInferno code regression.
+
+The local current-head profile sharpens the next targets. Long_output spent
+`4.68s` in prefill forward, padded `32.9K` tokens, spent `10.53s` in ragged
+decode GPU, and spent `5.49s` GPU plus `1.38s` CPU in `114` decode-many calls.
+The same `b64/64:g1-16` window alone consumed `2.17s` total at
+`210us/token`, so denser or cheaper decode-many replay/readback remains the
+largest E2E lever; simply raising the stop-tail cap was already rejected.
+Tree spent `409.5ms` in prefill sampling and `650.8ms` total in TP Gumbel
+sampling (`301.1ms` noise, `174.0ms` max, `78.4ms` reduce), while the public
+tree run shows that this path is noisy enough that future sampler work needs a
+score-facing A/B, not just lower phase counters. Multi_turn and few_shot are
+still ordinary prefill-body/padding targets (`16.9K` and `3.4K` padded tokens)
+with no new state-bookkeeping culprit.
+
+## Public 20260706_110224 refresh and sample split follow-up
+
+The public run then advanced to
 `results/v1/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100/runs/20260706_110224`.
 It still measured TorchInferno `0d6ab82`, so it does not include the pushed
 state/sample split telemetry. vLLM advanced to `ba22152`, while SGLang stayed at
