@@ -5,7 +5,7 @@ import json
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Callable, Iterable, Sequence
 
 
 _LATENCY_METRICS = ("ttft_ms", "tpot_ms", "e2e_latency_ms")
@@ -690,6 +690,48 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
             )
         lines.extend(_format_table(header, body))
         lines.append("")
+
+        prefill_miss_shape_rows = _graph_miss_shape_rows(
+            queue_profiles,
+            "runtime_prefill_graph_miss_shape_counts",
+            _prefill_graph_miss_kind,
+        )
+        if prefill_miss_shape_rows:
+            lines.append("[torchinferno prefill graph miss shapes]")
+            lines.extend(
+                _format_table(
+                    (
+                        "temp",
+                        "max_tokens",
+                        "kind",
+                        "shape",
+                        "misses",
+                    ),
+                    prefill_miss_shape_rows,
+                )
+            )
+            lines.append("")
+
+        decode_miss_shape_rows = _graph_miss_shape_rows(
+            queue_profiles,
+            "runtime_decode_graph_miss_shape_counts",
+            _decode_graph_miss_kind,
+        )
+        if decode_miss_shape_rows:
+            lines.append("[torchinferno decode graph miss shapes]")
+            lines.extend(
+                _format_table(
+                    (
+                        "temp",
+                        "max_tokens",
+                        "kind",
+                        "shape",
+                        "misses",
+                    ),
+                    decode_miss_shape_rows,
+                )
+            )
+            lines.append("")
 
         prefill_rows = _hot_prefill_shape_rows(queue_profiles)
         if prefill_rows:
@@ -1920,6 +1962,29 @@ def _decode_graph_miss_kind(shape: str) -> str:
     if len(parts) >= 2 and parts[0] == "ragged_decode":
         return f"ragged_{parts[1]}"
     return "other"
+
+
+def _graph_miss_shape_rows(
+    profiles: Sequence[QueueProfileSummary],
+    field_name: str,
+    kind_func: Callable[[str], str],
+    *,
+    limit: int = 8,
+) -> list[tuple[str, ...]]:
+    rows: list[tuple[str, ...]] = []
+    for profile in profiles:
+        fields = profile.fields
+        for shape, count in _top_mapping_entries(fields.get(field_name), limit=limit):
+            rows.append(
+                (
+                    _fmt_value(profile.temperature),
+                    _fmt_value(profile.max_tokens),
+                    kind_func(shape),
+                    shape,
+                    _fmt_value(count),
+                )
+            )
+    return rows
 
 
 def _decode_graph_symm_counts(fields: dict[str, Any]) -> dict[str, float | int]:

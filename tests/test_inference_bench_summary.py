@@ -592,6 +592,10 @@ def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) ->
     assert "[torchinferno score targets]" in text
     assert "phase_target" in text
     assert "capture" in text
+    assert "[torchinferno prefill graph miss shapes]" in text
+    assert "static_prefill:logits:b1:t56" in text
+    assert "[torchinferno decode graph miss shapes]" in text
+    assert "static_decode:logits:b2:s55" in text
     assert "q2submit" in text
     assert "submit2first" in text
     assert "prefill_pad" in text

@@ -260,6 +260,10 @@ TorchInferno queue snapshot per benchmark policy key, so a tree-only render shou
 show the `0.7/300` profile and hide unrelated `0.0/96`, `0.0/256`, and
 `0.0/512` profile rows. If a custom run has no matching built-in key, the
 formatter falls back to all profiles so diagnostics are not accidentally hidden.
+It also prints top prefill/decode graph miss shapes. For the current local tree
+slice, the remaining sampled decode misses are concrete late static-logits
+shapes (`b2:s56`, `b3:s55`, `b2:s58`, and neighbors), which makes future warmup
+or path-selection probes easier to target without manually opening JSONL.
 
 ## Public 20260706_030205 refresh
 
