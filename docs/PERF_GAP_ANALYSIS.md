@@ -72,6 +72,18 @@ down to `151.8ms` versus the prior Gumbel-profile run's `221.6ms` over `2599`
 rows. Prefill sample selection also stayed lower (`300.5ms` versus `314.2ms`).
 Keep the scratch path enabled by default with the env opt-out for future A/Bs.
 
+Rechecking the existing sampled-medium `s12,16` suffix bucket opt-in on top of
+the Gumbel scratch path is still rejected as a default. The same-host run
+(`/tmp/inference-bench-s12-scratch-results/.../20260706_130409`) landed at
+`122.5 / 60.7 / 179.8ms`, `0.967` correctness. It cut prefill padding from the
+scratch baseline's `8.3K` tokens (`2.9K` row / `5.5K` suffix) to `3.9K`
+(`2.4K` row / `1.5K` suffix), and profiled prefill forward/wall moved from
+`3.06s/3.68s` to `2.85s/3.47s`. The score-facing TTFT/E2E still regressed from
+the scratch baseline's `117.3 / 61.6 / 168.8ms`, while TPOT was effectively
+flat and prefill sample readback rose (`10.8ms` to `16.8ms`). Keep `s12,16` as
+an explicit diagnostic/runtime opt-in until it produces a repeatable median win,
+not just lower padding counters.
+
 ## Public 20260706_090220 refresh and queue segment merge fix
 
 The prior public run advanced to
