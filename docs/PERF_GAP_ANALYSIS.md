@@ -153,6 +153,19 @@ suffix buckets or broader p111 startup warmup the default; the next useful
 target is reducing the actual padded-prefix prefill body, not adding more
 bucket shapes.
 
+The existing warm-row prefix-copy skip remains rejected for default serving. An
+A/B with `TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SKIP_WARM_PREFIX_COPY=1` wrote
+`/tmp/inference-bench-warm-row-prefix-skip-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-warm-row-prefix-skip-543df7f/runs/20260706_071817`
+and preserved correctness, but regressed to `231.6 / 24.9 / 1442.8ms`,
+`28.3 tok/s`; its queue-profile artifact was empty, so use only the request
+metrics from that run. A patched diagnostic that also warmed no-prefix-copy
+(`src0`) suffix graphs never reached server readiness after several minutes,
+raised graph memory substantially, and was stopped before measured traffic.
+That rules out turning prefix-copy skip plus broader startup warmup into a
+default. Avoiding the shared-prefix KV copy is still only useful if a future
+path can reuse the existing `src1` graph shape or avoid multiplying startup
+graph captures.
+
 ## Public 20260706_030205 refresh
 
 The latest public run advanced to
