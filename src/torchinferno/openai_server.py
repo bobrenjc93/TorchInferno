@@ -115,6 +115,13 @@ class CompletionResult:
     prompt_tokens: int
 
 
+@dataclass(frozen=True)
+class _StreamPrequeueAdmissionWait:
+    configured_ms: float = 0.0
+    elapsed_ms: float = 0.0
+    applied: bool = False
+
+
 def _startup_warmup_enabled_for_cache_backend(cache_backend: str) -> bool:
     if cache_backend.lower() == "dense":
         return True
@@ -1788,6 +1795,9 @@ class _QueuedGeneration:
     first_token_at_s: float = 0.0
     finished_at_s: float = 0.0
     queue_sequence: int = -1
+    stream_prequeue_wait_configured_ms: float = 0.0
+    stream_prequeue_wait_ms: float = 0.0
+    stream_prequeue_wait_applied: bool = False
     done: bool = False
 
 
@@ -3329,7 +3339,7 @@ class OpenAICompletionEngine:
                     self._model_lock.release()
             else:
                 self._mark_phase(phase, "queued_generation")
-                self._wait_for_tensor_parallel_stream_prequeue_admission(
+                prequeue_wait = self._wait_for_tensor_parallel_stream_prequeue_admission(
                     temperature=temperature,
                     max_tokens=max_tokens,
                 )
@@ -3337,6 +3347,7 @@ class OpenAICompletionEngine:
                     prompt,
                     max_tokens=max_tokens,
                     temperature=temperature,
+                    prequeue_wait=prequeue_wait,
                 )
         finally:
             self._exit_live_request()
@@ -3432,6 +3443,7 @@ class OpenAICompletionEngine:
         *,
         max_tokens: int,
         temperature: float,
+        prequeue_wait: _StreamPrequeueAdmissionWait | None = None,
     ) -> Iterator[list[int]]:
         if self._closed:
             raise RuntimeError("OpenAI completion engine is closed")
@@ -3448,6 +3460,15 @@ class OpenAICompletionEngine:
                 responses,
                 queued_at_s=queued_at_s,
                 queue_sequence=queue_sequence,
+                stream_prequeue_wait_configured_ms=(
+                    0.0 if prequeue_wait is None else float(prequeue_wait.configured_ms)
+                ),
+                stream_prequeue_wait_ms=(
+                    0.0 if prequeue_wait is None else float(prequeue_wait.elapsed_ms)
+                ),
+                stream_prequeue_wait_applied=(
+                    False if prequeue_wait is None else bool(prequeue_wait.applied)
+                ),
             )
         )
         max_batch = _stream_token_batch_max()
@@ -5660,7 +5681,16 @@ class OpenAICompletionEngine:
             queue_to_first_ms: list[float] = []
             submit_to_first_ms: list[float] = []
             queue_to_finish_ms: list[float] = []
+            stream_prequeue_wait_ms: list[float] = []
+            stream_prequeue_wait_configured_ms: list[float] = []
+            stream_prequeue_wait_applied = 0
             for request in request_by_id.values():
+                configured_prequeue_ms = request.stream_prequeue_wait_configured_ms
+                if configured_prequeue_ms > 0.0:
+                    stream_prequeue_wait_configured_ms.append(configured_prequeue_ms)
+                    stream_prequeue_wait_ms.append(request.stream_prequeue_wait_ms)
+                    if request.stream_prequeue_wait_applied:
+                        stream_prequeue_wait_applied += 1
                 queued_at_s = request.queued_at_s
                 if queued_at_s <= 0.0:
                     continue
@@ -5684,6 +5714,20 @@ class OpenAICompletionEngine:
                 _latency_summary_fields("request_submit_to_first_token", submit_to_first_ms)
             )
             fields.update(_latency_summary_fields("request_queue_to_finish", queue_to_finish_ms))
+            fields.update(
+                _latency_summary_fields(
+                    "request_stream_prequeue_wait",
+                    stream_prequeue_wait_ms,
+                )
+            )
+            fields.update(
+                _latency_summary_fields(
+                    "request_stream_prequeue_wait_configured",
+                    stream_prequeue_wait_configured_ms,
+                )
+            )
+            if stream_prequeue_wait_configured_ms:
+                fields["request_stream_prequeue_wait_applied_count"] = stream_prequeue_wait_applied
             return fields
 
         def record_online_profile(event: str, **profile_fields: object) -> None:
@@ -6931,21 +6975,23 @@ class OpenAICompletionEngine:
         *,
         temperature: float,
         max_tokens: int,
-    ) -> None:
-        wait_s = _tp_stream_prequeue_admission_wait_ms(
+    ) -> _StreamPrequeueAdmissionWait:
+        configured_ms = _tp_stream_prequeue_admission_wait_ms(
             temperature=temperature,
             max_tokens=max_tokens,
-        ) / 1000.0
+        )
+        wait_s = configured_ms / 1000.0
         if wait_s <= 0.0 or self.max_batch_size <= 1:
-            return
+            return _StreamPrequeueAdmissionWait(configured_ms=configured_ms)
         if not (
             _is_tensor_parallel_primary_model(self.model)
             and self.device.type == "cuda"
             and env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_CONTINUOUS_BATCHER", True)
         ):
-            return
+            return _StreamPrequeueAdmissionWait(configured_ms=configured_ms)
         if self._model_lock.locked() or not self._generation_queue.empty():
-            return
+            return _StreamPrequeueAdmissionWait(configured_ms=configured_ms)
+        wait_start_s = time.perf_counter()
         deadline = time.perf_counter() + min(wait_s, self.batch_wait_s)
         while self._generation_queue.empty():
             remaining = deadline - time.perf_counter()
@@ -6957,6 +7003,11 @@ class OpenAICompletionEngine:
                     self._live_request_condition.wait(timeout=min(remaining, 0.0001))
                     continue
             time.sleep(min(remaining, 0.0001))
+        return _StreamPrequeueAdmissionWait(
+            configured_ms=configured_ms,
+            elapsed_ms=(time.perf_counter() - wait_start_s) * 1000.0,
+            applied=True,
+        )
 
     def _temperature_single_request_admission_wait_s(self, temperature: float) -> float:
         if temperature <= 0.0:

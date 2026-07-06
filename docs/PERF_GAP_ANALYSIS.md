@@ -1,5 +1,37 @@
 # TorchInferno vs vLLM/sglang — Performance Gap Analysis (Llama-3.1-70B, 8xH100)
 
+## Public 20260705_230202 and current HTTP split
+
+The latest public run at
+`results/v1/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100/runs/20260705_230202`
+measured TorchInferno `cddde7e`, vLLM `b712181`, and SGLang `8673e85`.
+TorchInferno scored `0/20` against vLLM's `18/20`: few_shot
+`164.3 / 46.0 / 213.1ms`, self_consistency `157.4 / 0.0 / 166.1ms`,
+multi_turn `322.2 / 62.5 / 381.2ms`, tree_of_thought
+`76.6 / 63.0 / 106.5ms`, and long_output `282.6 / 20.1 / 989.8ms`.
+The final queue records show two different gaps. Self_consistency is not
+model-bound (`q2first_p50=6.6ms`, `q2submit_p50=0.7ms`,
+`submit2first_p50=5.3ms`, `2` prefill batches). Tree and long remain
+model/scheduler-bound: tree spent `5.28s/5.74s` in prefill forward/wall and
+`5.02s` in ragged decode GPU; long spent `4.12s/4.46s` in prefill
+forward/wall, `9.61s` in ragged decode GPU, and `3.79s` in decode-many GPU.
+
+A focused current-head self_consistency run with fast-HTTP detailed profiling
+(`9415f7e`,
+`/tmp/inference-bench-ti-http-profile-self-results/.../runs/20260705_235400`)
+landed at `93.0 / 0.0 / 101.9ms`, `1000/1000` correct. Its server-side
+profile confirms the public self_consistency queue/score mismatch is mostly
+outside model execution: queue `q2first_p50=8.1ms`, fast-HTTP
+`first_engine_token_p50=9.2ms`, `first_content_sent_p50=9.5ms`, and
+`total_p50=9.7ms`, while client-observed TTFT was `93.0ms`. The HTTP path's
+accepted-to-handler p50 was only `0.06ms`; request-read p50 was `19.8ms`.
+
+The current profiling patch records the scoped stream prequeue gate directly in
+online queue profiles as `request_stream_prequeue_wait_*` fields. This is
+needed for the 512-token mixed-prefix multi_turn path, where the accepted
+prequeue wait is meant to reduce request-prompt admission fragmentation but
+older public profiles did not show whether the gate actually fired.
+
 A current tree_of_thought sample-gather recheck is rejected as a default
 runtime change. On pushed `b2b11a3`, the focused run with
 `TORCHINFERNO_TEMPERATURE_SAMPLE_GATHER=1` wrote

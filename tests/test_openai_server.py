@@ -16352,6 +16352,9 @@ def test_openai_tensor_parallel_online_batcher_profile_snapshots(
         True,
         first_queue,
         queued_at_s=time.perf_counter(),
+        stream_prequeue_wait_configured_ms=2.0,
+        stream_prequeue_wait_ms=1.25,
+        stream_prequeue_wait_applied=True,
     )
 
     engine._run_tensor_parallel_online_batcher(first)
@@ -16381,6 +16384,10 @@ def test_openai_tensor_parallel_online_batcher_profile_snapshots(
     assert final_record["profile_snapshots"] == expected_snapshots
     assert final_record["online_step_commands"] == 3
     assert final_record["runtime_decode_tokens"] == 3
+    assert final_record["request_stream_prequeue_wait_count"] == 1
+    assert final_record["request_stream_prequeue_wait_p50_ms"] == 1.25
+    assert final_record["request_stream_prequeue_wait_configured_p50_ms"] == 2.0
+    assert final_record["request_stream_prequeue_wait_applied_count"] == 1
     assert final_record["requested_max_batch"] == 4
     assert final_record["drain_decode_quantum"] == 8
     assert final_record["initial_wait_ms"] == 0.0
