@@ -84,6 +84,18 @@ flat and prefill sample readback rose (`10.8ms` to `16.8ms`). Keep `s12,16` as
 an explicit diagnostic/runtime opt-in until it produces a repeatable median win,
 not just lower padding counters.
 
+A single-gather Gumbel sampler is also rejected. The env-gated probe gathered
+each rank's local perturbed max value and token, replacing the current
+max-allreduce plus token-min-allreduce pair with one value/token all-gather.
+The same-host run
+(`/tmp/inference-bench-gumbel-gather-results/.../20260706_131134`) regressed to
+`129.2 / 69.0 / 197.3ms`, `0.965` correctness. The final queue profile removed
+the reduce bucket (`0.0ms`) but moved cumulative Gumbel max/select work to
+`471.7ms`, versus `205.6ms` max plus `89.2ms` reduce in the scratch baseline;
+total Gumbel sampling rose to `634.2ms` from `554.5ms`. Keep the two-reduce
+Gumbel sampler until there is a fused or backend-native value/token reduction,
+not a tensor all-gather of the local maxima.
+
 ## Public 20260706_090220 refresh and queue segment merge fix
 
 The prior public run advanced to
