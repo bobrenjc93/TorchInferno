@@ -102,6 +102,20 @@ artifacts render that column as `-`; the next current run should show whether
 the dominant `decode_many:b64/64:g1-16` window also carries most readback cost
 or whether the CPU exposure is concentrated in tail windows.
 
+A current-head long_output profile with that telemetry on `0366d17` wrote
+`/tmp/inference-bench-current-long-decode-window-cpu-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-decode-window-cpu/runs/20260706_032928`
+and landed at `204.9 / 23.3 / 1047.3ms`, `1000/1000` correct. Queue telemetry
+recorded `61` prefill batches, `4.64s/5.04s` prefill forward/wall,
+`10.35s` decode GPU, and `1.41s` decode CPU-copy; decode-many contributed
+`112` calls, `386` internal steps, `5.00s` GPU, and `1.35s` CPU-copy. The new
+step-window CPU split shows the largest window,
+`decode_many:b64/64:g1-16`, at `8256` model tokens, `333ms` CPU-copy, and an
+estimated `1.73s` GPU. The next high-active first-window rows (`b62`, `b61`,
+`b49`, `b60`) add another `265ms` CPU-copy. That rules out a tail-only
+readback fix for the median long_output gap: readback is spread across the
+main full/near-full decode-many body, so the needed change is genuine
+readback/decode pipelining or lower replay cost, not another stop-tail split.
+
 ## Public 20260705_230202 and current HTTP split
 
 The latest public run at
