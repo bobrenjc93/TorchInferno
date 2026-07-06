@@ -477,6 +477,7 @@ def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) ->
     assert "decode_graph_cap_ms" in text
     assert "decode_cpu_ms" in text
     assert "decode_state_ms" in text
+    assert "decode_many_calls" in text
     assert "decode_many_cpu_ms" in text
     assert "1.2" in text
     assert "1.5" in text

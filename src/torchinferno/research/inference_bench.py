@@ -497,6 +497,7 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
             "decode_replay_cache_ms",
             "decode_graph_symm",
             "decode_replay_symm_ms",
+            "decode_many_calls",
             "decode_many_gpu_ms",
             "decode_many_cpu_ms",
             "decode_many_steps",
@@ -579,6 +580,7 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
                             fields.get("runtime_decode_graph_replay_shape_ms")
                         )
                     ),
+                    _fmt_value(fields.get("runtime_decode_many_calls")),
                     _fmt_value(fields.get("runtime_decode_many_model_gpu_ms")),
                     _fmt_value(fields.get("runtime_decode_many_cpu_tokens_ms")),
                     _fmt_value(fields.get("runtime_decode_many_steps")),
