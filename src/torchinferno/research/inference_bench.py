@@ -660,6 +660,30 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
             )
             lines.append("")
 
+        packed_per_batch_rows = _prefill_packed_per_batch_target_rows(
+            summary.torchinferno_queue_profiles
+        )
+        if packed_per_batch_rows:
+            lines.append("[torchinferno packed prefill per-batch targets]")
+            lines.extend(
+                _format_table(
+                    (
+                        "temp",
+                        "max_tokens",
+                        "candidate_shape",
+                        "calls",
+                        "real_tokens",
+                        "model_tokens",
+                        "saved_tokens",
+                        "saved_pct",
+                        "est_saved_ms",
+                        "groups",
+                    ),
+                    packed_per_batch_rows,
+                )
+            )
+            lines.append("")
+
         packed_signature_rows = _hot_prefill_packed_signature_rows(summary.torchinferno_queue_profiles)
         if packed_signature_rows:
             lines.append("[torchinferno packed prefill signatures]")
@@ -1840,6 +1864,72 @@ def _hot_prefill_packed_candidate_rows(
             )
         )
     return rows
+
+
+def _prefill_packed_per_batch_target_rows(
+    profiles: Sequence[QueueProfileSummary],
+    *,
+    limit: int = 8,
+) -> list[tuple[str, ...]]:
+    items: list[tuple[float, float, str, tuple[str, ...]]] = []
+    for profile in profiles:
+        fields = profile.fields
+        shape_saved = _numeric_mapping(
+            fields.get("runtime_prefill_packed_candidate_shape_saved_tokens")
+        )
+        if not shape_saved:
+            continue
+        shape_model_tokens = _numeric_mapping(
+            fields.get("runtime_prefill_packed_candidate_shape_model_tokens")
+        )
+        shape_real_tokens = _numeric_mapping(
+            fields.get("runtime_prefill_packed_candidate_shape_tokens")
+        )
+        shape_counts = _numeric_mapping(
+            fields.get("runtime_prefill_packed_candidate_shape_counts")
+        )
+        if not shape_counts:
+            shape_counts = _numeric_mapping(fields.get("runtime_prefill_shape_counts"))
+        shape_groups = _numeric_mapping(
+            fields.get("runtime_prefill_packed_candidate_shape_groups")
+        )
+        shape_forward_ms = _numeric_mapping(fields.get("runtime_prefill_shape_forward_ms"))
+        for shape, saved_tokens in shape_saved.items():
+            saved = max(0.0, float(saved_tokens))
+            model_tokens = max(0.0, float(shape_model_tokens.get(shape, 0.0)))
+            if saved <= 0.0 or model_tokens <= 0.0:
+                continue
+            forward_ms = max(0.0, float(shape_forward_ms.get(shape, 0.0)))
+            est_saved_ms: float | None = None
+            score_ms = -1.0
+            if forward_ms > 0.0:
+                est_saved_ms = forward_ms * saved / model_tokens
+                score_ms = est_saved_ms
+            items.append(
+                (
+                    score_ms,
+                    saved,
+                    shape,
+                    (
+                        _fmt_value(profile.temperature),
+                        _fmt_value(profile.max_tokens),
+                        shape,
+                        _fmt_value(_int_if_whole(shape_counts.get(shape, 0.0))),
+                        _fmt_value(_int_if_whole(shape_real_tokens.get(shape, 0.0))),
+                        _fmt_value(_int_if_whole(model_tokens)),
+                        _fmt_value(_int_if_whole(saved)),
+                        _fmt_pct(saved, model_tokens),
+                        _fmt_value(
+                            None
+                            if est_saved_ms is None
+                            else _int_if_whole(est_saved_ms)
+                        ),
+                        _fmt_value(_int_if_whole(shape_groups.get(shape, 0.0))),
+                    ),
+                )
+            )
+    items.sort(key=lambda item: (-item[0], -item[1], item[2]))
+    return [item[3] for item in items[:limit]]
 
 
 def _hot_prefill_packed_signature_rows(

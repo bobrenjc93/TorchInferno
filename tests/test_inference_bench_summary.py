@@ -453,6 +453,7 @@ def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) ->
     assert "+30.0" in text
     assert "1.60x" in text
     assert "[torchinferno packed prefill candidates]" in text
+    assert "[torchinferno packed prefill per-batch targets]" in text
     assert "[torchinferno packed prefill signatures]" in text
     assert "[torchinferno packed prefill patterns]" in text
     assert "[torchinferno packed prefill fixed-capacity plans]" in text
@@ -463,8 +464,8 @@ def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) ->
     assert "p45:s10/p45:s11" in text
     assert "slot_src" in text
     assert "runtime" in text
-    assert "fixed_saved_pct" in text
     assert "est_saved_ms" in text
+    assert "fixed_saved_pct" in text
     assert "repeat_saved" in text
     assert "sig_cov" in text
     assert "75.8%" in text
