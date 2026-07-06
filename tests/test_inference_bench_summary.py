@@ -4,9 +4,11 @@ import subprocess
 import sys
 
 from torchinferno.research.inference_bench import (
+    QueueProfileSummary,
     _decode_graph_cache_counts,
     _decode_graph_symm_counts,
     _phase_target,
+    _prefill_packed_fixed_capacity_reject_rows,
     _prefill_shape_call_count,
     _prefill_shape_dense_forward_ms,
     format_inference_bench_summary,
@@ -944,6 +946,45 @@ def test_inference_bench_summary_falls_back_to_signatures_for_fixed_capacity(tmp
     assert "slot_src" in text
     assert "signature" in text
     assert "75.8%" in text
+
+
+def test_prefill_fixed_capacity_reject_rows_show_over_dense_patterns() -> None:
+    profile = QueueProfileSummary(
+        event="online_batcher_quiescent",
+        temperature=0.0,
+        max_tokens=256,
+        submitted_requests=1000,
+        finished_events=1000,
+        fields={
+            "runtime_prefill_packed_candidate_pattern_counts": {
+                "prefix_graph:b32:s16:p122-122:src1:mixed0|p122:s12/p122:s13/p122:s14": 33,
+            },
+            "runtime_prefill_packed_candidate_pattern_saved_tokens": {
+                "prefix_graph:b32:s16:p122-122:src1:mixed0|p122:s12/p122:s13/p122:s14": 5088,
+            },
+            "runtime_prefill_packed_candidate_pattern_slot_counts": {
+                "prefix_graph:b32:s16:p122-122:src1:mixed0|p122:s12/p122:s13/p122:s14#p122:s12": 24,
+                "prefix_graph:b32:s16:p122-122:src1:mixed0|p122:s12/p122:s13/p122:s14#p122:s13": 16,
+                "prefix_graph:b32:s16:p122-122:src1:mixed0|p122:s12/p122:s13/p122:s14#p122:s14": 7,
+            },
+        },
+    )
+
+    rows = _prefill_packed_fixed_capacity_reject_rows([profile])
+
+    assert rows == [
+        (
+            "0.0",
+            "256",
+            "prefix_graph:b32:s16:p122-122:src1:mixed0|p122:s12/p122:s13/p122:s14",
+            "33",
+            "16896",
+            "19602",
+            "2706",
+            "5088",
+            "16.0%",
+        ),
+    ]
 
 
 def test_inference_bench_summary_cli_filters_benchmarks(tmp_path) -> None:

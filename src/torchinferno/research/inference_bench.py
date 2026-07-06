@@ -883,6 +883,29 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
             )
             lines.append("")
 
+        packed_fixed_capacity_reject_rows = _prefill_packed_fixed_capacity_reject_rows(
+            queue_profiles
+        )
+        if packed_fixed_capacity_reject_rows:
+            lines.append("[torchinferno packed prefill fixed-capacity rejects]")
+            lines.extend(
+                _format_table(
+                    (
+                        "temp",
+                        "max_tokens",
+                        "pattern",
+                        "calls",
+                        "dense_tokens",
+                        "fixed_tokens",
+                        "over_tokens",
+                        "raw_saved",
+                        "fixed_over_pct",
+                    ),
+                    packed_fixed_capacity_reject_rows,
+                )
+            )
+            lines.append("")
+
         packed_target_rows = _prefill_packed_implementation_target_rows(
             queue_profiles
         )
@@ -2631,6 +2654,74 @@ def _prefill_packed_fixed_capacity_saved_ms(
     if shape_ms is None or shape_model_tokens is None or shape_model_tokens <= 0:
         return None
     return float(fixed_saved_tokens) * float(shape_ms) / float(shape_model_tokens)
+
+
+def _prefill_packed_fixed_capacity_reject_rows(
+    profiles: Sequence[QueueProfileSummary],
+    *,
+    limit: int = 5,
+) -> list[tuple[str, ...]]:
+    items: list[tuple[float, float, str, tuple[str, ...]]] = []
+    for profile in profiles:
+        fields = profile.fields
+        pattern_calls = _numeric_mapping(
+            fields.get("runtime_prefill_packed_candidate_pattern_counts")
+        )
+        if not pattern_calls:
+            continue
+        pattern_saved = _numeric_mapping(
+            fields.get("runtime_prefill_packed_candidate_pattern_saved_tokens")
+        )
+        pattern_slots: dict[str, dict[tuple[int, int], int]] = {}
+        for slot_key, slot_count in _numeric_mapping(
+            fields.get("runtime_prefill_packed_candidate_pattern_slot_counts")
+        ).items():
+            parsed_slot = _parse_packed_prefill_pattern_slot_key(slot_key)
+            if parsed_slot is None:
+                continue
+            pattern, group = parsed_slot
+            if pattern not in pattern_calls:
+                continue
+            slots = pattern_slots.setdefault(pattern, {})
+            slots[group] = max(slots.get(group, 0), int(slot_count))
+        for pattern, calls in pattern_calls.items():
+            dense_per_call = _packed_prefill_dense_tokens_per_call(pattern)
+            slots = pattern_slots.get(pattern)
+            if dense_per_call is None or dense_per_call <= 0 or not slots:
+                continue
+            fixed_per_call = sum(
+                max(0, int(count)) * max(0, int(suffix_len))
+                for (_start_len, suffix_len), count in slots.items()
+            )
+            if fixed_per_call < dense_per_call:
+                continue
+            call_count = max(0.0, float(calls))
+            dense_tokens = float(dense_per_call) * call_count
+            fixed_tokens = float(fixed_per_call) * call_count
+            over_tokens = max(0.0, fixed_tokens - dense_tokens)
+            raw_saved = max(0.0, float(pattern_saved.get(pattern, 0.0)))
+            if raw_saved <= 0.0:
+                continue
+            items.append(
+                (
+                    raw_saved,
+                    over_tokens,
+                    pattern,
+                    (
+                        _fmt_value(profile.temperature),
+                        _fmt_value(profile.max_tokens),
+                        pattern,
+                        _fmt_value(_int_if_whole(call_count)),
+                        _fmt_value(_int_if_whole(dense_tokens)),
+                        _fmt_value(_int_if_whole(fixed_tokens)),
+                        _fmt_value(_int_if_whole(over_tokens)),
+                        _fmt_value(_int_if_whole(raw_saved)),
+                        _fmt_pct(over_tokens, dense_tokens),
+                    ),
+                )
+            )
+    items.sort(key=lambda item: (-item[0], -item[1], item[2]))
+    return [item[3] for item in items[:limit]]
 
 
 def _prefill_shape_observed_packed_ms(

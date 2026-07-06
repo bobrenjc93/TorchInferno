@@ -200,10 +200,13 @@ real packed cached-prefix body for that shape would be score-facing. Its main
 coarse pattern repeats (`p122:s12/s13/s14` for `33` calls), but fixed-capacity
 slots are not viable for that row: the observed maxima (`24*s12 + 16*s13 +
 7*s14`) would execute `594` packed suffix tokens per call, more than the dense
-`b32*s16=512` bucket. Public tree has more repeated fixed patterns, but the
-largest fixed-capacity target is only `258ms` (`5.0%` of prefill forward); tree
-still needs a broader packed-prefix body and lower sampled decode cost rather
-than one narrow pattern rewrite.
+`b32*s16=512` bucket. The analyzer now surfaces these as
+`packed prefill fixed-capacity rejects`; public few_shot shows this row as
+`19.6K` fixed tokens versus `16.9K` dense tokens despite `5.1K` raw saved
+tokens. Public tree has more repeated fixed patterns, but the largest
+fixed-capacity target is only `258ms` (`5.0%` of prefill forward); tree still
+needs a broader packed-prefix body and lower sampled decode cost rather than one
+narrow pattern rewrite.
 
 A same-branch tree A/B checked whether generated-prefix decode capture should
 be enabled by default. The opt-in decode-capture run
