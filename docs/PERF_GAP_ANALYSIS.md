@@ -39,6 +39,18 @@ report different scheduler boundaries, but it makes the remaining gap concrete:
 TorchInferno is still launching many small single-step replay groups instead of
 amortizing long decode phases into denser graph work.
 
+A same-host stop-tail cap A/B on current head rejects simply raising the cap
+from the default `4` to `8`. The control run
+`/tmp/inference-bench-tailcap4-control-results/.../20260706_101035` landed at
+`216.2 / 23.3 / 1057.5ms`, while the cap-8 run
+`/tmp/inference-bench-tailcap8-results/.../20260706_100410` landed at
+`247.5 / 23.0 / 1077.5ms`, both `1000/1000` correct. Cap 8 reduced
+decode-many calls (`106 -> 88`) and CPU token handling (`1.30s -> 1.09s`), but
+it increased overgenerated tokens (`756 -> 1043`), worsened TTFT/E2E and
+throughput, and did not reduce total decode GPU time. Keep the default cap at
+`4`; denser decode needs a real multi-step graph/body win, not just longer
+stop-token bursts.
+
 The latest run also reinforces the packed-prefix conclusion. Few_shot is closer
 but remains prefill-bound (`1.38s` prefill forward, `4.66K` padding tokens, hot
 `prefix_graph:b32:s16:p122-122:src1:mixed0`), while multi_turn now surfaces a
