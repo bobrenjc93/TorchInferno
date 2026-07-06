@@ -131,6 +131,10 @@ def _write_inference_bench_run(tmp_path) -> None:
         "runtime_prefill_graph_replay_ms": 6.0,
         "runtime_prefill_graph_replay_gpu_ms": 5.0,
         "runtime_prefill_graph_misses": 9,
+        "runtime_prefill_graph_miss_shape_counts": {
+            "ragged_prefill:b8:s32:rows1:ctx-128:src8": 6,
+            "static_prefill:logits:b1:t56": 3,
+        },
         "runtime_prefill_graph_cache_live_entries": 3,
         "runtime_prefill_shape_counts": {
             "prefix_graph:b8:s16:p45-45:src1:mixed0": 2,
@@ -453,6 +457,12 @@ def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) ->
     assert summary.torchinferno_queue_profiles[0].fields["runtime_prefix_cache_capacity"] == 128
     assert summary.torchinferno_queue_profiles[0].fields["runtime_prefill_batches"] == 1
     assert summary.torchinferno_queue_profiles[0].fields["runtime_prefill_graph_misses"] == 9
+    assert summary.torchinferno_queue_profiles[0].fields[
+        "runtime_prefill_graph_miss_shape_counts"
+    ] == {
+        "ragged_prefill:b8:s32:rows1:ctx-128:src8": 6,
+        "static_prefill:logits:b1:t56": 3,
+    }
     assert summary.torchinferno_queue_profiles[0].fields["runtime_decode_graph_misses"] == 10
     assert summary.torchinferno_queue_profiles[0].fields[
         "runtime_decode_graph_miss_shape_counts"
@@ -560,6 +570,8 @@ def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) ->
     assert "gen_reuse" in text
     assert "gen_tokens" in text
     assert "prefill_graph_miss" in text
+    assert "prefill_miss_kind" in text
+    assert "ragged=6,static_logits=3" in text
     assert "decode_graph_miss" in text
     assert "[long_output provider gaps vs torchinferno]" in text
     assert "best_provider" in text
