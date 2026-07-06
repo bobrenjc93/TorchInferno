@@ -938,6 +938,7 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
                         "skip_pct",
                         "est_gpu_ms",
                         "cpu_ms",
+                        "est_total_ms",
                         "est_us_tok",
                     ),
                     decode_window_target_rows,
@@ -2749,8 +2750,12 @@ def _decode_many_step_window_target_rows(
             est_us_tok: float | None = None
             if est_gpu_ms is not None:
                 est_us_tok = est_gpu_ms * 1000.0 / model_tokens
+            cpu_ms = window_cpu_ms.get(window)
+            est_total_ms: float | None = None
+            if est_gpu_ms is not None or cpu_ms is not None:
+                est_total_ms = (est_gpu_ms or 0.0) + (cpu_ms or 0.0)
             skipped = float(window_skipped.get(window, 0.0))
-            score_ms = est_gpu_ms if est_gpu_ms is not None else -1.0
+            score_ms = est_total_ms if est_total_ms is not None else -1.0
             items.append(
                 (
                     score_ms,
@@ -2768,8 +2773,13 @@ def _decode_many_step_window_target_rows(
                         _fmt_value(None if est_gpu_ms is None else _int_if_whole(est_gpu_ms)),
                         _fmt_value(
                             None
-                            if window not in window_cpu_ms
-                            else _int_if_whole(window_cpu_ms[window])
+                            if cpu_ms is None
+                            else _int_if_whole(cpu_ms)
+                        ),
+                        _fmt_value(
+                            None
+                            if est_total_ms is None
+                            else _int_if_whole(est_total_ms)
                         ),
                         _fmt_value(None if est_us_tok is None else _int_if_whole(est_us_tok)),
                     ),

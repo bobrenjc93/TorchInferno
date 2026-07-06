@@ -526,6 +526,8 @@ def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) ->
     assert "decode_many:b8/8:g1-16" in text
     assert "model_ms" in text
     assert "cpu_ms" in text
+    assert "est_total_ms" in text
+    assert "16.2" in text
     assert "[provider server log phases]" in text
     assert "prefix_hit_avg" in text
     assert "prefill_graph_pct" in text

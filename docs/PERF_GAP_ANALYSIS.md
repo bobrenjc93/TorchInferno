@@ -97,10 +97,12 @@ decode/readback body.
 
 Current-head queue profiles now also attribute decode-many CPU token readback by
 step window as `runtime_decode_many_step_window_cpu_tokens_ms`, and the summary
-prints it as `cpu_ms` beside the existing per-window GPU estimate. Older public
-artifacts render that column as `-`; the next current run should show whether
-the dominant `decode_many:b64/64:g1-16` window also carries most readback cost
-or whether the CPU exposure is concentrated in tail windows.
+prints it as `cpu_ms` beside the existing per-window GPU estimate. The
+implementation-target table now also ranks windows by `est_total_ms`
+(`est_gpu_ms + cpu_ms` when both are available). Older public artifacts render
+the CPU column as `-`; the next current run should show whether the dominant
+`decode_many:b64/64:g1-16` window also carries most readback cost or whether the
+CPU exposure is concentrated in tail windows.
 
 A current-head long_output profile with that telemetry on `0366d17` wrote
 `/tmp/inference-bench-current-long-decode-window-cpu-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-decode-window-cpu/runs/20260706_032928`
@@ -110,8 +112,9 @@ recorded `61` prefill batches, `4.64s/5.04s` prefill forward/wall,
 `112` calls, `386` internal steps, `5.00s` GPU, and `1.35s` CPU-copy. The new
 step-window CPU split shows the largest window,
 `decode_many:b64/64:g1-16`, at `8256` model tokens, `333ms` CPU-copy, and an
-estimated `1.73s` GPU. The next high-active first-window rows (`b62`, `b61`,
-`b49`, `b60`) add another `265ms` CPU-copy. That rules out a tail-only
+estimated `1.73s` GPU (`2.06s` combined). The next high-active first-window
+rows (`b49`, `b62`, `b61`, `b57`, `b60`) each sit around `212-269ms` combined
+GPU+CPU. That rules out a tail-only
 readback fix for the median long_output gap: readback is spread across the
 main full/near-full decode-many body, so the needed change is genuine
 readback/decode pipelining or lower replay cost, not another stop-tail split.
