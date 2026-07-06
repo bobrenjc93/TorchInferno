@@ -79,6 +79,16 @@ regressed badly: decode-many GPU rose from `4.80s` to `7.36s`, while the hot
 `4.07s` at `548us/token`. Keep the flag off until the captured multi-step body
 is made cheaper than repeated one-step ragged decode.
 
+Async decode-many readback stays opt-in as well. The focused run with only
+`TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY_ASYNC_READBACK=1`
+(`/tmp/inference-bench-decode-many-async-readback-results/.../20260706_143417`)
+landed at a slightly better `208.8 / 23.2 / 1006.0ms`, `1000/1000` correct,
+but the mechanism did not validate: decode-many CPU time rose from `1.29s` to
+`1.45s`, decode-many GPU rose from `4.80s` to `5.82s`, and the run performed
+more decode-many work (`438` steps and `23.5K` model tokens versus `360` steps
+and `19.0K`). Treat the median win as scheduling/run variance until async
+readback reduces CPU tokens time without increasing the model-work envelope.
+
 A small TP sampler cleanup is accepted on the sampled tree path: use scalar
 sentinel values in the greedy and Gumbel token tie-breaks instead of allocating
 a full sentinel tensor for every sample. The adjacent baseline control on
