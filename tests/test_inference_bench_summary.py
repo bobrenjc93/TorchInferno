@@ -89,6 +89,7 @@ def _write_inference_bench_run(tmp_path) -> None:
         "run_max_tokens": 96,
         "submitted_requests": 2,
         "finished_events": 2,
+        "runtime_cache_backend": "dense",
         "runtime_max_active_requests": 96,
         "runtime_prefix_cache_capacity": 128,
         "greedy_large_mixed_prefix_reuse": True,
@@ -437,6 +438,89 @@ def test_queue_profile_merges_restart_segments(tmp_path) -> None:
     assert "5/5 2seg" in text
 
 
+def test_queue_profile_merges_final_marker_segments_without_counter_drop(tmp_path) -> None:
+    results = {
+        "model": "meta-llama/test",
+        "tensor_parallel_size": 8,
+        "hardware": "8xH100",
+        "providers": {
+            "torchinferno": {
+                "benchmarks": {
+                    "long_output": {
+                        "metrics": {
+                            "num_requests": 1000,
+                            "ttft_median_ms": 20.0,
+                            "tpot_median_ms": 4.0,
+                            "e2e_median_ms": 80.0,
+                            "throughput_median_tps": 30.0,
+                        }
+                    }
+                }
+            }
+        },
+    }
+    (tmp_path / "results.json").write_text(json.dumps(results))
+    logs = tmp_path / "provider_logs"
+    logs.mkdir()
+    records = [
+        {
+            "event": "online_batcher_quiescent",
+            "temperature": 0.0,
+            "run_max_tokens": 96,
+            "submitted_requests": 120,
+            "finished_events": 120,
+            "runtime_prefill_batches": 1,
+        },
+        {
+            "event": "online_batcher_quiescent",
+            "temperature": 0.0,
+            "run_max_tokens": 96,
+            "submitted_requests": 499,
+            "finished_events": 499,
+            "runtime_prefill_batches": 10,
+        },
+        {
+            "event": "online_batcher",
+            "temperature": 0.0,
+            "run_max_tokens": 96,
+            "submitted_requests": 499,
+            "finished_events": 499,
+            "runtime_prefill_batches": 10,
+        },
+        {
+            "event": "online_batcher_quiescent",
+            "temperature": 0.0,
+            "run_max_tokens": 96,
+            "submitted_requests": 501,
+            "finished_events": 501,
+            "runtime_prefill_batches": 11,
+        },
+        {
+            "event": "online_batcher",
+            "temperature": 0.0,
+            "run_max_tokens": 96,
+            "submitted_requests": 501,
+            "finished_events": 501,
+            "runtime_prefill_batches": 11,
+        },
+    ]
+    (logs / "torchinferno_queue_profile.jsonl").write_text(
+        "\n".join(json.dumps(record) for record in records) + "\n"
+    )
+
+    summary = summarize_inference_bench_run(tmp_path)
+
+    assert len(summary.torchinferno_queue_profiles) == 1
+    profile = summary.torchinferno_queue_profiles[0]
+    assert profile.segments == 2
+    assert profile.submitted_requests == 1000
+    assert profile.finished_events == 1000
+    assert profile.fields["runtime_prefill_batches"] == 21
+
+    text = format_inference_bench_summary(summary)
+    assert "1000/1000 2seg" in text
+
+
 def test_benchmark_filter_limits_queue_profile_tables(tmp_path) -> None:
     results = {
         "model": "meta-llama/test",
@@ -546,6 +630,7 @@ def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) ->
     assert torch_row.request_waves[1].request_end == 127
     assert torch_row.request_waves[1].request_percentiles["ttft_ms"].p90 == 30.0
     assert summary.torchinferno_queue_profiles[0].max_tokens == 96
+    assert summary.torchinferno_queue_profiles[0].fields["runtime_cache_backend"] == "dense"
     assert summary.torchinferno_queue_profiles[0].fields["runtime_max_active_requests"] == 96
     assert summary.torchinferno_queue_profiles[0].fields["runtime_prefix_cache_capacity"] == 128
     assert summary.torchinferno_queue_profiles[0].fields["runtime_prefill_batches"] == 1
@@ -598,6 +683,8 @@ def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) ->
     assert "0-63" in text
     assert "64-127" in text
     assert "[torchinferno queue profiles]" in text
+    assert "cache" in text
+    assert "dense" in text
     assert "max_active" in text
     assert "prefix_cap" in text
     assert "mixed_prefix" in text
@@ -775,6 +862,53 @@ def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) ->
     assert "28.0" in text
     assert "22.2%" in text
     assert "64.0" in text
+
+
+def test_queue_profile_infers_cache_backend_from_torchinferno_log(tmp_path) -> None:
+    for case_name, command_tail, expected_backend in (
+        ("default", "--port 8001 --trust-remote-code", "dense"),
+        ("explicit", "--cache-backend flashinfer --port 8001", "flashinfer"),
+    ):
+        case_root = tmp_path / case_name
+        logs = case_root / "provider_logs"
+        logs.mkdir(parents=True)
+        (case_root / "results.json").write_text(
+            json.dumps(
+                {
+                    "model": "meta-llama/test",
+                    "tensor_parallel_size": 8,
+                    "hardware": "8xH100",
+                    "providers": {
+                        "torchinferno": {
+                            "benchmarks": {"long_output": {"metrics": {}}},
+                        },
+                    },
+                }
+            )
+        )
+        (logs / "torchinferno_queue_profile.jsonl").write_text(
+            json.dumps(
+                {
+                    "event": "online_batcher",
+                    "temperature": 0.0,
+                    "run_max_tokens": 96,
+                    "submitted_requests": 1,
+                }
+            )
+            + "\n"
+        )
+        (logs / "torchinferno_server.log").write_text(
+            "TorchInferno OpenAI server auto-launching tensor-parallel workers: "
+            "python -m torchinferno.openai_server --model /models/llama "
+            f"{command_tail}\n"
+        )
+
+        summary = summarize_inference_bench_run(case_root)
+
+        assert (
+            summary.torchinferno_queue_profiles[0].fields["runtime_cache_backend"]
+            == expected_backend
+        )
 
 
 def test_inference_bench_summary_reads_current_provider_log_names(tmp_path) -> None:

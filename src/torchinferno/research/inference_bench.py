@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import shlex
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable, Sequence
@@ -69,6 +70,7 @@ _QUEUE_PROFILE_FIELDS = (
     "request_stream_prequeue_wait_configured_p50_ms",
     "request_stream_prequeue_wait_applied_count",
     "active_ready_wait_ms",
+    "runtime_cache_backend",
     "runtime_max_active_requests",
     "runtime_prefix_cache_capacity",
     "runtime_prefill_batches",
@@ -489,6 +491,7 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
         header = (
             "temp",
             "max_tokens",
+            "cache",
             "max_active",
             "prefix_cap",
             "mixed_prefix",
@@ -586,6 +589,7 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
                 (
                     _fmt_value(profile.temperature),
                     _fmt_value(profile.max_tokens),
+                    _fmt_value(fields.get("runtime_cache_backend")),
                     _fmt_value(fields.get("runtime_max_active_requests")),
                     _fmt_value(fields.get("runtime_prefix_cache_capacity")),
                     _fmt_value(fields.get("greedy_large_mixed_prefix_reuse")),
@@ -1329,6 +1333,7 @@ def _summarize_torchinferno_queue(root: Path) -> tuple[QueueProfileSummary, ...]
     path = root / "provider_logs" / "torchinferno_queue_profile.jsonl"
     if not path.exists():
         return ()
+    inferred_cache_backend = _infer_torchinferno_cache_backend(root)
     segments_by_key: dict[tuple[float | None, int | None], list[QueueProfileSummary]] = {}
     for line in path.read_text().splitlines():
         if not line.strip():
@@ -1338,19 +1343,25 @@ def _summarize_torchinferno_queue(root: Path) -> tuple[QueueProfileSummary, ...]
         if event not in {"online_batcher", "online_batcher_quiescent"}:
             continue
         key = (_maybe_float(record.get("temperature")), _maybe_int(record.get("run_max_tokens")))
+        fields = {name: record.get(name) for name in _QUEUE_PROFILE_FIELDS if name in record}
+        if inferred_cache_backend is not None and "runtime_cache_backend" not in fields:
+            fields["runtime_cache_backend"] = inferred_cache_backend
         profile = QueueProfileSummary(
             event=event,
             temperature=key[0],
             max_tokens=key[1],
             submitted_requests=_maybe_int(record.get("submitted_requests")),
             finished_events=_maybe_int(record.get("finished_events")),
-            fields={name: record.get(name) for name in _QUEUE_PROFILE_FIELDS if name in record},
+            fields=fields,
         )
         segments = segments_by_key.setdefault(key, [])
-        if segments and _queue_profile_restarts(segments[-1], profile):
-            segments.append(profile)
-            continue
         if segments:
+            previous = segments[-1]
+            if _queue_profile_starts_new_segment(previous, profile):
+                segments.append(profile)
+                continue
+            if previous.event == "online_batcher" and profile.event != "online_batcher":
+                continue
             segments[-1] = profile
         else:
             segments.append(profile)
@@ -1363,6 +1374,28 @@ def _summarize_torchinferno_queue(root: Path) -> tuple[QueueProfileSummary, ...]
                 -1 if item[1] is None else item[1],
             ),
         )
+    )
+
+
+def _queue_profile_starts_new_segment(
+    previous: QueueProfileSummary,
+    current: QueueProfileSummary,
+) -> bool:
+    if _queue_profile_restarts(previous, current):
+        return True
+    return previous.event == "online_batcher" and not _queue_profile_same_position(
+        previous,
+        current,
+    )
+
+
+def _queue_profile_same_position(
+    left: QueueProfileSummary,
+    right: QueueProfileSummary,
+) -> bool:
+    return (
+        left.submitted_requests == right.submitted_requests
+        and left.finished_events == right.finished_events
     )
 
 
@@ -1425,6 +1458,7 @@ def _merge_queue_profile_field(name: str, values: Sequence[Any]) -> Any:
 
 def _queue_profile_field_is_additive(name: str) -> bool:
     if name in {
+        "runtime_cache_backend",
         "runtime_max_active_requests",
         "runtime_prefix_cache_capacity",
         "runtime_prefill_graph_cache_live_entries",
@@ -1470,6 +1504,33 @@ def _sum_optional_int(values: Iterable[int | None]) -> int | None:
         total += int(value)
         seen = True
     return total if seen else None
+
+
+def _infer_torchinferno_cache_backend(root: Path) -> str | None:
+    logs_dir = root / "provider_logs"
+    log_path = _first_existing_provider_log(
+        logs_dir,
+        "torchinferno.log",
+        "torchinferno_server.log",
+    )
+    if not log_path.exists():
+        return None
+    for line in log_path.read_text(errors="replace").splitlines():
+        if "torchinferno.openai_server" not in line:
+            continue
+        try:
+            parts = shlex.split(line)
+        except ValueError:
+            continue
+        if "torchinferno.openai_server" not in parts:
+            continue
+        for index, part in enumerate(parts):
+            if part == "--cache-backend" and index + 1 < len(parts):
+                return str(parts[index + 1])
+            if part.startswith("--cache-backend="):
+                return part.split("=", 1)[1]
+        return "dense"
+    return None
 
 
 def _summarize_provider_server_logs(root: Path) -> tuple[ProviderServerLogSummary, ...]:

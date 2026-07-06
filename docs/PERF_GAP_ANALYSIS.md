@@ -1,8 +1,46 @@
 # TorchInferno vs vLLM/sglang — Performance Gap Analysis (Llama-3.1-70B, 8xH100)
 
-## Public 20260706_050221 refresh and prefill GPU timing split
+## Public 20260706_090220 refresh and queue segment merge fix
 
 The latest public run advanced to
+`results/v1/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100/runs/20260706_090220`.
+It measured TorchInferno `0d6ab82`, vLLM `90ce3a0`, and SGLang `80decc7`.
+TorchInferno still wins self_consistency (`94.5 / 0.0 / 101.8ms`) and now wins
+few_shot TPOT (`44.1ms` versus vLLM `46.0ms`), but still trails on few_shot
+TTFT/E2E (`+21.6ms` / `+31.2ms`), multi_turn (`+85.1ms` TTFT, `+92.0ms` E2E),
+tree_of_thought (`+47.4ms` TTFT, `+62.5ms` E2E), and long_output
+(`+199.3ms` TTFT, `+4.6ms` TPOT, `+251.3ms` E2E).
+
+The new public queue profile exposed a second analyzer merge case. Long_output
+wrote two final `online_batcher` segments with `499` and `501` submitted
+requests; the old restart detector only merged segments when counters dropped,
+so it kept the latter as `501/1000 partial`. The analyzer now treats a final
+`online_batcher` record as closing a segment and starts a new segment for later
+same-key snapshots, while still replacing ordinary `online_batcher_quiescent`
+progress snapshots within the current segment. Re-rendering the run reports
+`1000/1000 2seg` and the correct full long_output totals.
+
+With the corrected merge, public long_output still targets decode first:
+`4.03s` prefill forward, `4.41s` prefill wall, `35.6K` prefill padding tokens,
+`10.12s` ragged decode GPU, `5.74s` decode-many GPU, and `1.46s` decode-many
+CPU token handling. The dominant decode-many target remains the full-batch body:
+`decode_many:b64/64:g1-16` is `27.7%` of decode-many time at `188us/token`, and
+`g17-32` adds another `4.7%`; the tiny `b8` tails are inefficient but only about
+`3%` each. This keeps the long-output work split unchanged: reduce padded
+cached-prefix prefill for TTFT, and reduce or overlap single-step decode replay
+plus token readback for TPOT/E2E.
+
+The latest run also reinforces the packed-prefix conclusion. Few_shot is closer
+but remains prefill-bound (`1.38s` prefill forward, `4.66K` padding tokens, hot
+`prefix_graph:b32:s16:p122-122:src1:mixed0`), while multi_turn now surfaces a
+large `b32:s144:p45-45` cached-prefix shape with `20.3K` padding tokens. The
+queue table backfills `cache=dense` and still shows `packed_fi_calls=0`, so the
+existing packed FlashInfer prefill body remains ineligible for public dense-cache
+runs.
+
+## Public 20260706_050221 refresh and prefill GPU timing split
+
+An earlier public run advanced to
 `results/v1/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100/runs/20260706_050221`
 at inference-bench `069f519c`. It measured TorchInferno `fa12aa1`, vLLM
 `6971582`, and SGLang `6f22790`; the public runner has not yet picked up
@@ -240,6 +278,16 @@ to `55.1ms/call` / `123us/model-token`, worse than the public `s16` body's
 `~40.7ms/call` / `79us/model-token`. Keep exact greedy-mid suffix buckets as a
 diagnostic only; the score-facing fix still needs a faster model-side cached
 prefix body, not a smaller dense suffix bucket.
+
+The queue-profile analyzer now prints the runtime cache backend and backfills it
+from older TorchInferno launch logs. Re-rendering public `20260706_070225`
+shows `cache=dense` with `packed_fi_calls=0`, which makes the packed
+FlashInfer prefill path ineligible for that run. The existing
+`prefill_ragged_logits_packed_flashinfer` body requires a FlashInfer KV cache
+with paged storage; the current dense public path cannot reach it without a new
+cache representation or a per-layer KV repack that would need its own benchmark
+evidence. Treat dense-cache packed FlashInfer as blocked, not as an untried
+environment toggle.
 
 A same-branch tree A/B checked whether generated-prefix decode capture should
 be enabled by default. The opt-in decode-capture run

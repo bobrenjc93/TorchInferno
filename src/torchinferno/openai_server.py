@@ -6415,11 +6415,14 @@ class OpenAICompletionEngine:
             or env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_PROFILE_PROGRESS_SHAPES", False)
         )
         for attr_name, record_name in (
+            ("cache_backend", "runtime_cache_backend"),
             ("max_active_requests", "runtime_max_active_requests"),
             ("prefix_cache_capacity", "runtime_prefix_cache_capacity"),
         ):
             value = getattr(runtime_engine, attr_name, None)
             if isinstance(value, int):
+                record[record_name] = value
+            elif isinstance(value, str):
                 record[record_name] = value
         for attr_name, record_name in (
             ("decode_many_async_readback", "decode_many_async_readback"),
