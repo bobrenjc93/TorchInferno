@@ -746,8 +746,11 @@ def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) ->
     assert "[torchinferno decode-many implementation targets]" in text
     assert "gpu_ms" in text
     assert "gpu_src" in text
+    assert "tok_share" in text
+    assert "total_share" in text
     assert "us_tok" in text
     assert "605.3" in text
+    assert "77.0%" in text
     assert "decode_many:b8/8:g1-16" in text
     assert "exact" in text
     assert "model_ms" in text

@@ -1034,6 +1034,7 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
                         "window",
                         "calls",
                         "model_tokens",
+                        "tok_share",
                         "emitted",
                         "skipped",
                         "skip_pct",
@@ -1041,6 +1042,7 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
                         "gpu_src",
                         "cpu_ms",
                         "total_ms",
+                        "total_share",
                         "us_tok",
                     ),
                     decode_window_target_rows,
@@ -3107,6 +3109,17 @@ def _decode_many_step_window_target_rows(
         )
         if not window_tokens:
             continue
+        total_window_tokens = sum(
+            max(0.0, float(value)) for value in window_tokens.values()
+        )
+        total_gpu_ms = _numeric_field(fields, "runtime_decode_many_model_gpu_ms")
+        total_cpu_ms = _numeric_field(fields, "runtime_decode_many_cpu_tokens_ms")
+        total_decode_many_ms: float | None = None
+        if total_gpu_ms is not None or total_cpu_ms is not None:
+            total_decode_many_ms = max(0.0, float(total_gpu_ms or 0.0)) + max(
+                0.0,
+                float(total_cpu_ms or 0.0),
+            )
         shape_tokens = _numeric_mapping(
             fields.get("runtime_decode_many_shape_model_tokens")
         )
@@ -3159,6 +3172,7 @@ def _decode_many_step_window_target_rows(
                         window,
                         _fmt_value(_int_if_whole(window_counts.get(window, 0.0))),
                         _fmt_value(_int_if_whole(model_tokens)),
+                        _fmt_pct(model_tokens, total_window_tokens),
                         _fmt_value(_int_if_whole(window_emitted.get(window, 0.0))),
                         _fmt_value(_int_if_whole(skipped)),
                         _fmt_pct(skipped, model_tokens),
@@ -3173,6 +3187,10 @@ def _decode_many_step_window_target_rows(
                             None
                             if total_ms is None
                             else _int_if_whole(total_ms)
+                        ),
+                        _fmt_pct(
+                            float(total_ms or 0.0),
+                            float(total_decode_many_ms or 0.0),
                         ),
                         _fmt_value(None if us_tok is None else _int_if_whole(us_tok)),
                     ),

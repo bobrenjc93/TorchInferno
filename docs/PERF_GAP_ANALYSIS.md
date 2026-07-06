@@ -184,6 +184,14 @@ decode and decode-many replay/readback (`10.46s` ragged decode GPU,
 tokens. Multi_turn and few_shot remain prefill bound, and tree remains split:
 `5.17s` prefill forward, `4.99s` decode GPU, `9.4K` prefill padding tokens, and
 `95` decode graph misses.
+The decode-many implementation target table now prints token and total-time
+shares. Re-rendering public long_output shows the full-batch body, not just the
+tiny tail rows, is still the main decode-many lever:
+`decode_many:b64/64:g1-16` accounts for `35.8%` of window model tokens and
+`24.3%` of decode-many time, `g17-32` adds `11.2%`, and `g33-48` adds `3.4%`.
+The sparse `b2/b3` tails are several milliseconds per token but only about
+`3%` of total decode-many time per row, so tail gating alone cannot close the
+long-output gap.
 
 A same-branch tree A/B checked whether generated-prefix decode capture should
 be enabled by default. The opt-in decode-capture run
