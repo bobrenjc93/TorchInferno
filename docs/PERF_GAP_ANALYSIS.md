@@ -66,6 +66,19 @@ work rose (`4.80s/1.29s` GPU/CPU over `105` calls and `360` steps to
 lower padding alone is not enough when fragmentation pushes more work into
 decode-many and worsens median E2E.
 
+Enabling the existing multi-step decode-many CUDA graph is also rejected as a
+default for long_output. With only
+`TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY_GRAPH=1` on current `8abf063`, the
+focused run
+(`/tmp/inference-bench-decode-many-graph-results/.../20260706_142727`) landed
+at `229.5 / 23.9 / 1167.2ms`, `1000/1000` correct, versus the no-graph
+control's `224.5 / 23.4 / 1009.8ms`. The graph path did execute (`25` graph
+calls, `116` graph steps), and it reduced CPU token readback, but GPU time
+regressed badly: decode-many GPU rose from `4.80s` to `7.36s`, while the hot
+`decode_many:b64/64:g1-16` window rose from `1.60s` at `210us/token` to
+`4.07s` at `548us/token`. Keep the flag off until the captured multi-step body
+is made cheaper than repeated one-step ragged decode.
+
 A small TP sampler cleanup is accepted on the sampled tree path: use scalar
 sentinel values in the greedy and Gumbel token tie-breaks instead of allocating
 a full sentinel tensor for every sample. The adjacent baseline control on
