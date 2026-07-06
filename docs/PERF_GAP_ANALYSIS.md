@@ -45,6 +45,15 @@ Python/CUDA-graph submission window (`~100-200ms` in long_output), while
 completion (`~4-5s`). Future public profiles should use the new GPU fields when
 ranking prefill graph-body work.
 
+The post-change validation run on `a0dc2f3` wrote
+`/tmp/inference-bench-prefill-gpu-telemetry-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-prefill-gpu-telemetry-a0dc2f3/runs/20260706_055924`
+and landed at `235.0 / 23.1 / 1082.2ms`, `1000/1000` correct. The new counters
+recorded `runtime_prefill_graph_replay_gpu_ms=4683.8` versus the old
+`runtime_prefill_graph_replay_ms=146.7`, matching
+`runtime_prefill_forward_ms=4695.9`. The hot GPU replay shapes were
+`b24:s64:p111` (`1227.6ms`), `b16:s64:p111` (`841.1ms`), `b24:s96:p111`
+(`724.1ms`), `b16:s96:p111` (`603.6ms`), and `b32:s64:p111` (`548.4ms`).
+
 ## Public 20260706_030205 refresh
 
 The latest public run advanced to
