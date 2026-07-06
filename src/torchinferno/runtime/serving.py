@@ -2467,17 +2467,25 @@ class ContinuousBatchEngine:
             capacity=capacity,
             token_budget=self.prefill_token_budget,
             token_cost=self._prefill_token_cost,
-            priority_key=self._admission_priority,
+            priority_key=lambda item: self._admission_priority(
+                item,
+                active_count=active_count,
+            ),
         )
 
     def _prefill_token_cost(self, request: ServingRequest) -> int:
         prefix_hit_tokens = self._reusable_prefix_hit_tokens(request.prompt)
         return max(1, len(request.prompt) - prefix_hit_tokens)
 
-    def _admission_priority(self, item: _QueuedRequest) -> tuple[object, ...]:
+    def _admission_priority(
+        self,
+        item: _QueuedRequest,
+        *,
+        active_count: int = 0,
+    ) -> tuple[object, ...]:
         prefix_hit_tokens = self._reusable_prefix_hit_tokens(item.request.prompt)
         prefix_priority = -prefix_hit_tokens if self._admit_prefix_hit_priority_enabled() else 0
-        if self._admit_prefill_cost_priority_enabled():
+        if self._admit_prefill_cost_priority_enabled(active_count=active_count):
             prefill_cost = max(1, len(item.request.prompt) - prefix_hit_tokens)
             return (
                 prefix_priority,
@@ -2491,7 +2499,7 @@ class ContinuousBatchEngine:
     def _admit_prefix_hit_priority_enabled(self) -> bool:
         return env_flag("TORCHINFERNO_CONTINUOUS_ADMIT_PREFIX_HIT_PRIORITY", True)
 
-    def _admit_prefill_cost_priority_enabled(self) -> bool:
+    def _admit_prefill_cost_priority_enabled(self, *, active_count: int = 0) -> bool:
         if "TORCHINFERNO_CONTINUOUS_ADMIT_PREFILL_COST_PRIORITY" in os.environ:
             return env_flag("TORCHINFERNO_CONTINUOUS_ADMIT_PREFILL_COST_PRIORITY", False)
         if self.temperature > 0.0 or self.max_generation_tokens is None:
@@ -2501,7 +2509,14 @@ class ContinuousBatchEngine:
             128,
             minimum=1,
         )
-        return 0 < int(self.max_generation_tokens) <= short_max
+        if 0 < int(self.max_generation_tokens) <= short_max:
+            return True
+        if active_count <= 0:
+            return False
+        large_refill_env = "TORCHINFERNO_CONTINUOUS_ADMIT_PREFILL_COST_PRIORITY_GREEDY_LARGE_REFILL"
+        if large_refill_env in os.environ:
+            return env_flag(large_refill_env, False)
+        return self._greedy_large_mixed_prefix_reuse_enabled()
 
     def _prefill_many(
         self,

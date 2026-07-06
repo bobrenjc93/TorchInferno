@@ -2714,7 +2714,8 @@ def test_continuous_batch_engine_keeps_arrival_order_for_larger_greedy_admission
         model,
         device=torch.device("cpu"),
         max_active_requests=1,
-        max_generation_tokens=256,
+        max_generation_tokens=512,
+        greedy_large_mixed_prefix_reuse=True,
     )
 
     results = engine.run(
@@ -2727,6 +2728,66 @@ def test_continuous_batch_engine_keeps_arrival_order_for_larger_greedy_admission
 
     assert by_id["long"].started_step == 0
     assert by_id["short"].started_step == 1
+
+
+def test_continuous_batch_engine_prioritizes_large_greedy_refill_prefill_cost(monkeypatch) -> None:
+    monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_ADMIT_PREFILL_COST_PRIORITY", raising=False)
+    monkeypatch.delenv(
+        "TORCHINFERNO_CONTINUOUS_ADMIT_PREFILL_COST_PRIORITY_GREEDY_LARGE_REFILL",
+        raising=False,
+    )
+    model = _RaggedGraphToyModel()
+    engine = ContinuousBatchEngine(
+        model,
+        device=torch.device("cpu"),
+        max_active_requests=2,
+        admit_per_step_cap=1,
+        max_generation_tokens=512,
+        greedy_large_mixed_prefix_reuse=True,
+    )
+
+    results = engine.run(
+        [
+            ServingRequest("active", (1, 2, 3, 4), 3, arrival_step=0),
+            ServingRequest("long", (5, 6, 7, 8), 1, arrival_step=0),
+            ServingRequest("short", (9,), 1, arrival_step=0),
+        ]
+    )
+    by_id = {result.request_id: result for result in results}
+
+    assert by_id["active"].started_step == 0
+    assert by_id["short"].started_step == 1
+    assert by_id["long"].started_step == 2
+
+
+def test_continuous_batch_engine_can_disable_large_greedy_refill_prefill_cost(monkeypatch) -> None:
+    monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_ADMIT_PREFILL_COST_PRIORITY", raising=False)
+    monkeypatch.setenv(
+        "TORCHINFERNO_CONTINUOUS_ADMIT_PREFILL_COST_PRIORITY_GREEDY_LARGE_REFILL",
+        "0",
+    )
+    model = _RaggedGraphToyModel()
+    engine = ContinuousBatchEngine(
+        model,
+        device=torch.device("cpu"),
+        max_active_requests=2,
+        admit_per_step_cap=1,
+        max_generation_tokens=512,
+        greedy_large_mixed_prefix_reuse=True,
+    )
+
+    results = engine.run(
+        [
+            ServingRequest("active", (1, 2, 3, 4), 3, arrival_step=0),
+            ServingRequest("long", (5, 6, 7, 8), 1, arrival_step=0),
+            ServingRequest("short", (9,), 1, arrival_step=0),
+        ]
+    )
+    by_id = {result.request_id: result for result in results}
+
+    assert by_id["active"].started_step == 0
+    assert by_id["long"].started_step == 1
+    assert by_id["short"].started_step == 2
 
 
 def test_continuous_batch_engine_can_wait_for_refill_batch() -> None:
