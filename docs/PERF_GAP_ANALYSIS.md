@@ -30,6 +30,22 @@ next public run distinguish sampler selection from host readback; do not reopen
 the rejected sampled decode and greedy sampler variants without a new profile
 showing a different bottleneck.
 
+A current local tree baseline on pushed `818c201`
+(`/tmp/inference-bench-main-818c201-tree-results/.../20260706_120339`) landed at
+`128.0 / 64.3 / 186.3ms`, `0.967` correctness. Its final queue profile spent
+`458.5ms` in prefill sample, split as `445.6ms` distributed sampler selection
+and `12.7ms` host readback; sampled static-token misses were mostly gone
+(`static_logits=18,static_token=1`). Two same-host sampler probes were rejected:
+the Gumbel sampler
+(`/tmp/inference-bench-main-818c201-tree-gumbel-results/.../20260706_120936`)
+regressed to `147.9 / 70.1 / 213.3ms` despite reducing profiled sample-select
+time to `373.8ms`, and a selected-row CDF prototype
+(`/tmp/inference-bench-selected-cdf-results/.../20260706_121835`) regressed to
+`137.3 / 69.0 / 202.0ms` with worse final `prefill_sample_select_ms=488.7`.
+Keep the sampler target open, but do not reintroduce Gumbel or selected-row CDF
+as defaults without a new correctness-preserving profile that moves end-to-end
+tree latency.
+
 ## Public 20260706_090220 refresh and queue segment merge fix
 
 The prior public run advanced to
