@@ -192,6 +192,7 @@ _QUEUE_PROFILE_FIELDS = (
     "runtime_decode_many_graph_shape_model_tokens",
     "runtime_decode_many_graph_shape_ms",
     "decode_many_stop_tail_max_steps",
+    "decode_many_min_active_pct",
     "decode_many_sync_stops",
     "runtime_decode_many_calls",
     "runtime_decode_many_steps",
@@ -203,6 +204,7 @@ _QUEUE_PROFILE_FIELDS = (
     "runtime_decode_many_model_gpu_ms",
     "runtime_decode_many_tail_limited_calls",
     "runtime_decode_many_tail_limited_steps",
+    "runtime_decode_many_min_active_skips",
     "runtime_decode_many_padding_tokens",
     "runtime_decode_many_overgenerated_tokens",
     "runtime_decode_many_shape_model_tokens",
@@ -546,9 +548,11 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
             "decode_many_graph_calls",
             "decode_many_graph_steps",
             "tail_cap",
+            "min_active_pct",
             "sync_stops",
             "tail_calls",
             "tail_steps",
+            "min_active_skips",
             "overgen",
         )
         body = []
@@ -656,9 +660,11 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
                     _fmt_value(fields.get("runtime_decode_many_graph_calls")),
                     _fmt_value(fields.get("runtime_decode_many_graph_steps")),
                     _fmt_value(fields.get("decode_many_stop_tail_max_steps")),
+                    _fmt_value(fields.get("decode_many_min_active_pct")),
                     _fmt_value(fields.get("decode_many_sync_stops")),
                     _fmt_value(fields.get("runtime_decode_many_tail_limited_calls")),
                     _fmt_value(fields.get("runtime_decode_many_tail_limited_steps")),
+                    _fmt_value(fields.get("runtime_decode_many_min_active_skips")),
                     _fmt_value(fields.get("runtime_decode_many_overgenerated_tokens")),
                 )
             )

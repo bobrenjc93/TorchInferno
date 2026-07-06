@@ -178,6 +178,19 @@ candidate/fragment shape maps. This is stats-only and does not change the split
 default. It is meant to show which suffix-bucket fragments caused the TPOT-tail
 tradeoff above before any stricter grouping policy is promoted.
 
+Current head also exposes an opt-in low-occupancy decode-many gate,
+`TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY_MIN_ACTIVE_PCT`, with queue-profile
+fields for the configured percentage and skip count. The focused long_output
+probe at `25%` wrote
+`/tmp/inference-bench-minactive25-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-minactive25-fa12aa1-plus/runs/20260706_051402`
+and is rejected as a default: it improved TPOT p99 (`32.9ms -> 31.2ms`) but
+regressed median TTFT/E2E (`204.8/1052.3ms -> 219.0/1088.6ms`) and throughput
+(`33.7 -> 33.1 tok/s`) versus the adjacent no-split control. The profile
+recorded `43` min-active skips, but decode-many GPU still rose
+(`4.19s -> 4.40s`) as work shifted into fuller `b64/64` windows. Keep the gate
+diagnostic-only; the long_output fix remains lower high-active replay cost or a
+real decode/readback pipeline.
+
 The direct pinned-host async readback A/B is rejected as a default. The first
 attempt on
 `/tmp/inference-bench-async-readback-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-async-readback/runs/20260706_034651`

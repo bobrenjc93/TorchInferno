@@ -5830,6 +5830,11 @@ class OpenAICompletionEngine:
                     "decode_many_with_waiting_min_active",
                     0,
                 ),
+                decode_many_min_active_pct=getattr(
+                    runtime_engine,
+                    "decode_many_min_active_pct",
+                    0,
+                ),
                 decode_many_sync_stops=getattr(
                     runtime_engine,
                     "decode_many_sync_stops",
@@ -6689,6 +6694,7 @@ class OpenAICompletionEngine:
             "decode_many_state_sync_skips",
             "decode_many_tail_limited_calls",
             "decode_many_tail_limited_steps",
+            "decode_many_min_active_skips",
             "prefix_reuse_requests",
             "prefix_reuse_tokens",
             "queued_requests",

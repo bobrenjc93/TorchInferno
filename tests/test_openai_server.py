@@ -14323,6 +14323,7 @@ def test_openai_queue_profile_records_runtime_engine_stats(
         decode_many_state_sync_skips = 7
         decode_many_tail_limited_calls = 4
         decode_many_tail_limited_steps = 9
+        decode_many_min_active_skips = 6
         decode_many_shape_model_tokens = {"decode_many:b8/8": 19}
         decode_many_shape_padded_tokens = {"decode_many:b8/8": 24}
         decode_many_shape_emitted_tokens = {"decode_many:b8/8": 15}
@@ -14669,6 +14670,7 @@ def test_openai_queue_profile_records_runtime_engine_stats(
             "runtime_decode_many_state_sync_skips": 7,
             "runtime_decode_many_tail_limited_calls": 4,
             "runtime_decode_many_tail_limited_steps": 9,
+            "runtime_decode_many_min_active_skips": 6,
             "runtime_decode_many_shape_model_tokens": {"decode_many:b8/8": 19},
             "runtime_decode_many_shape_padded_tokens": {"decode_many:b8/8": 24},
             "runtime_decode_many_shape_emitted_tokens": {"decode_many:b8/8": 15},
@@ -16496,6 +16498,7 @@ def test_openai_tensor_parallel_online_batcher_profile_snapshots(
     assert final_record["use_decode_many"] is True
     assert final_record["decode_many_allow_stop"] is True
     assert final_record["decode_many_stop_tail_max_steps"] == 0
+    assert final_record["decode_many_min_active_pct"] == 0
     assert final_record["use_paged_engine"] is False
     assert final_record["graph_prefill"] is True
     assert final_record["prefill_chunk_size"] == 0

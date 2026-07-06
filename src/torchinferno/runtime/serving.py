@@ -466,6 +466,7 @@ class ServingStats:
     decode_many_state_sync_skips: int = 0
     decode_many_tail_limited_calls: int = 0
     decode_many_tail_limited_steps: int = 0
+    decode_many_min_active_skips: int = 0
     decode_many_shape_model_tokens: dict[str, int] = field(default_factory=dict)
     decode_many_shape_padded_tokens: dict[str, int] = field(default_factory=dict)
     decode_many_shape_emitted_tokens: dict[str, int] = field(default_factory=dict)
@@ -801,6 +802,7 @@ class ContinuousBatchEngine:
         decode_many_with_waiting: bool | None = None,
         decode_many_stop_tail_max_steps: int | None = None,
         decode_many_with_waiting_min_active: int | None = None,
+        decode_many_min_active_pct: int | None = None,
         decode_many_sync_stops: bool | None = None,
         generated_prefix_cache: bool | None = None,
         greedy_large_mixed_prefix_reuse: bool | None = None,
@@ -895,6 +897,13 @@ class ContinuousBatchEngine:
                 minimum=0,
             )
         self.decode_many_with_waiting_min_active = max(0, int(decode_many_with_waiting_min_active))
+        if decode_many_min_active_pct is None:
+            decode_many_min_active_pct = env_int(
+                "TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY_MIN_ACTIVE_PCT",
+                0,
+                minimum=0,
+            )
+        self.decode_many_min_active_pct = min(100, max(0, int(decode_many_min_active_pct)))
         self.decode_many_sync_stops = (
             env_flag("TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY_SYNC_STOPS", False)
             if decode_many_sync_stops is None
@@ -1164,6 +1173,10 @@ class ContinuousBatchEngine:
                 and len(self._online_active) < self.decode_many_with_waiting_min_active
             ):
                 return False
+        min_active_pct = int(getattr(self, "decode_many_min_active_pct", 0))
+        if min_active_pct > 0 and len(self._online_active) * 100 < self.max_active_requests * min_active_pct:
+            self.stats.decode_many_min_active_skips += 1
+            return False
         if self._online_prefilling or not self._online_active:
             return False
         if self.unified_forward or not self.decode_first:

@@ -266,9 +266,11 @@ def _write_inference_bench_run(tmp_path) -> None:
         "runtime_decode_many_model_gpu_ms": 15.0,
         "runtime_decode_many_steps": 6,
         "decode_many_stop_tail_max_steps": 4,
+        "decode_many_min_active_pct": 25,
         "decode_many_sync_stops": True,
         "runtime_decode_many_tail_limited_calls": 2,
         "runtime_decode_many_tail_limited_steps": 5,
+        "runtime_decode_many_min_active_skips": 6,
         "runtime_decode_many_overgenerated_tokens": 3,
         "runtime_decode_graph_cache_live_entries": 4,
         "runtime_decode_shape_gpu_ms": {"ragged:b8/8": 14.0},
@@ -508,6 +510,8 @@ def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) ->
     assert "True" in text
     assert "tail_calls" in text
     assert "tail_steps" in text
+    assert "min_active_pct" in text
+    assert "min_active_skips" in text
     assert "overgen" in text
     assert "[torchinferno hot prefill shapes]" in text
     assert "prefix_graph:b8:s16:p45-45:src1:mixed0" in text
