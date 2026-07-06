@@ -45,6 +45,25 @@ This does not reopen the rejected sample-gather, Gumbel, or scratch-buffer
 sampler defaults; it makes the sampler term visible in the compact target table
 so future fused/graph-safe sampler work is judged against the right counter.
 
+A current-head Gumbel recheck on `2f33f36` wrote
+`/tmp/inference-bench-current-tree-gumbel-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-gumbel/runs/20260706_030042`
+and remains rejected as a default. It landed at `142.9 / 67.7 / 211.7ms`,
+`954/992` correct, versus the no-env current control's
+`134.4 / 66.3 / 193.9ms`, `961/992` correct. The queue profile reduced
+recorded prefill sampling only from `300ms` to `285ms`, while q2submit and E2E
+both worsened. A narrower fixed-capacity packed-prefix probe targeting only the
+single-suffix `prefix_graph:b4:s16:p45-45:src1:mixed0|p45:s10` pattern wrote
+`/tmp/inference-bench-current-tree-fixed-b4s10-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-fixed-b4s10/runs/20260706_030756`
+and also remains rejected: it regressed to `277.3 / 61.6 / 342.1ms`,
+`960/992` correct. The targeted packed path made only `10` packed calls,
+saved `303` padded tokens, and spent `3.75s` in packed eager/graph work. The
+analyzer now subtracts observed packed-prototype shape time from dense
+saved-forward estimates and prints `obs_packed_ms`; for this rejected run the
+single-suffix `b4/p45:s10` target shows about `244ms` theoretical dense savings
+next to `3748ms` observed packed cost. This keeps the existing packed-eager and
+fixed-capacity switches diagnostic-only until the packed body itself is
+rewritten, not merely narrowed.
+
 The analyzer also now prints per-batch packed-prefill targets that do not require
 repeatable exact signatures, with row-vs-suffix saved-token splits attached to
 each target. On the same public run, the largest target is tree_of_thought's

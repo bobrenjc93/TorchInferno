@@ -7,6 +7,7 @@ from torchinferno.research.inference_bench import (
     _decode_graph_cache_counts,
     _decode_graph_symm_counts,
     _phase_target,
+    _prefill_shape_dense_forward_ms,
     format_inference_bench_summary,
     summarize_inference_bench_run,
 )
@@ -482,6 +483,7 @@ def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) ->
     assert "saved_tokens" in text
     assert "row_saved" in text
     assert "suffix_saved" in text
+    assert "obs_packed_ms" in text
     assert "prefill_graph_cap_ms" in text
     assert "decode_graph_cap_ms" in text
     assert "decode_cpu_ms" in text
@@ -561,6 +563,40 @@ def test_phase_target_can_select_sampling() -> None:
             capture_ms=0.0,
         )
         == "prefill+decode"
+    )
+
+
+def test_packed_prefill_estimate_excludes_observed_packed_cost() -> None:
+    fields = {
+        "runtime_prefill_shape_forward_ms": {"prefix_graph:b4:s16:p45-45:src1:mixed0": 10.0},
+        "runtime_prefill_packed_eager_shape_ms": {
+            "prefix_graph:b4:s16:p45-45:src1:mixed0": 3.5,
+        },
+    }
+
+    assert (
+        _prefill_shape_dense_forward_ms(
+            fields,
+            "prefix_graph:b4:s16:p45-45:src1:mixed0",
+        )
+        == 6.5
+    )
+    assert (
+        _prefill_shape_dense_forward_ms(
+            {"runtime_prefill_shape_forward_ms": {"shape": 2.0}},
+            "shape",
+        )
+        == 2.0
+    )
+    assert (
+        _prefill_shape_dense_forward_ms(
+            {
+                "runtime_prefill_shape_forward_ms": {"shape": 2.0},
+                "runtime_prefill_packed_eager_shape_ms": {"shape": 3.0},
+            },
+            "shape",
+        )
+        == 0.0
     )
 
 

@@ -85,6 +85,13 @@ _QUEUE_PROFILE_FIELDS = (
     "runtime_prefill_packed_eager_calls",
     "runtime_prefill_packed_eager_ms",
     "runtime_prefill_packed_eager_saved_tokens",
+    "runtime_prefill_packed_eager_tokens",
+    "runtime_prefill_packed_eager_model_tokens",
+    "runtime_prefill_packed_eager_shape_counts",
+    "runtime_prefill_packed_eager_shape_tokens",
+    "runtime_prefill_packed_eager_shape_model_tokens",
+    "runtime_prefill_packed_eager_shape_saved_tokens",
+    "runtime_prefill_packed_eager_shape_ms",
     "runtime_prefill_packed_candidate_calls",
     "runtime_prefill_packed_candidate_tokens",
     "runtime_prefill_packed_candidate_model_tokens",
@@ -697,6 +704,7 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
                         "suffix_saved",
                         "saved_pct",
                         "est_saved_ms",
+                        "obs_packed_ms",
                         "groups",
                     ),
                     packed_per_batch_rows,
@@ -765,6 +773,7 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
                         "fixed_tokens",
                         "fixed_saved",
                         "est_saved_ms",
+                        "obs_packed_ms",
                         "fixed_saved_pct",
                     ),
                     packed_fixed_capacity_rows,
@@ -787,6 +796,7 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
                         "repeat_saved",
                         "fixed_saved",
                         "est_saved_ms",
+                        "obs_packed_ms",
                         "fixed_saved_pct",
                         "sig_cov",
                     ),
@@ -1960,16 +1970,16 @@ def _prefill_packed_per_batch_target_rows(
         shape_groups = _numeric_mapping(
             fields.get("runtime_prefill_packed_candidate_shape_groups")
         )
-        shape_forward_ms = _numeric_mapping(fields.get("runtime_prefill_shape_forward_ms"))
         for shape, saved_tokens in shape_saved.items():
             saved = max(0.0, float(saved_tokens))
             model_tokens = max(0.0, float(shape_model_tokens.get(shape, 0.0)))
             if saved <= 0.0 or model_tokens <= 0.0:
                 continue
-            forward_ms = max(0.0, float(shape_forward_ms.get(shape, 0.0)))
+            forward_ms = _prefill_shape_dense_forward_ms(fields, shape)
+            observed_packed_ms = _prefill_shape_observed_packed_ms(fields, shape)
             est_saved_ms: float | None = None
             score_ms = -1.0
-            if forward_ms > 0.0:
+            if forward_ms is not None and forward_ms > 0.0:
                 est_saved_ms = forward_ms * saved / model_tokens
                 score_ms = est_saved_ms
             has_split = shape in shape_row_saved or shape in shape_suffix_saved
@@ -2003,6 +2013,11 @@ def _prefill_packed_per_batch_target_rows(
                             None
                             if est_saved_ms is None
                             else _int_if_whole(est_saved_ms)
+                        ),
+                        _fmt_value(
+                            None
+                            if observed_packed_ms is None
+                            else _int_if_whole(observed_packed_ms)
                         ),
                         _fmt_value(_int_if_whole(shape_groups.get(shape, 0.0))),
                     ),
@@ -2177,6 +2192,10 @@ def _prefill_packed_fixed_capacity_plan_rows(
                 pattern,
                 fixed_saved,
             )
+            observed_packed_ms = _prefill_shape_observed_packed_ms(
+                fields,
+                pattern.split("|", 1)[0],
+            )
             plan_items.append(
                 (
                     fixed_saved,
@@ -2193,6 +2212,11 @@ def _prefill_packed_fixed_capacity_plan_rows(
                         _fmt_value(_int_if_whole(fixed_tokens)),
                         _fmt_value(_int_if_whole(fixed_saved)),
                         _fmt_value(None if est_saved_ms is None else _int_if_whole(est_saved_ms)),
+                        _fmt_value(
+                            None
+                            if observed_packed_ms is None
+                            else _int_if_whole(observed_packed_ms)
+                        ),
                         _fmt_pct(fixed_saved, dense_tokens),
                     ),
                 )
@@ -2210,14 +2234,41 @@ def _prefill_packed_fixed_capacity_saved_ms(
     if fixed_saved_tokens <= 0:
         return None
     shape_key = pattern.split("|", 1)[0]
-    shape_ms = _mapping_value(fields.get("runtime_prefill_shape_forward_ms"), shape_key)
     shape_model_tokens = _mapping_value(
         fields.get("runtime_prefill_shape_model_tokens"),
         shape_key,
     )
+    shape_ms = _prefill_shape_dense_forward_ms(fields, shape_key)
     if shape_ms is None or shape_model_tokens is None or shape_model_tokens <= 0:
         return None
     return float(fixed_saved_tokens) * float(shape_ms) / float(shape_model_tokens)
+
+
+def _prefill_shape_observed_packed_ms(
+    fields: dict[str, Any],
+    shape_key: str,
+) -> float | None:
+    packed_ms = _mapping_value(
+        fields.get("runtime_prefill_packed_eager_shape_ms"),
+        shape_key,
+    )
+    if packed_ms is None:
+        return None
+    return max(0.0, float(packed_ms))
+
+
+def _prefill_shape_dense_forward_ms(
+    fields: dict[str, Any],
+    shape_key: str,
+) -> float | None:
+    shape_ms = _mapping_value(fields.get("runtime_prefill_shape_forward_ms"), shape_key)
+    if shape_ms is None:
+        return None
+    dense_ms = max(0.0, float(shape_ms))
+    packed_ms = _prefill_shape_observed_packed_ms(fields, shape_key)
+    if packed_ms is not None:
+        dense_ms = max(0.0, dense_ms - packed_ms)
+    return dense_ms
 
 
 def _prefill_packed_implementation_target_rows(
@@ -2288,6 +2339,10 @@ def _prefill_packed_implementation_target_rows(
                 pattern,
                 fixed_saved,
             )
+            observed_packed_ms = _prefill_shape_observed_packed_ms(
+                fields,
+                pattern.split("|", 1)[0],
+            )
             repeat_saved = max(0.0, float(pattern_saved.get(pattern, 0.0)))
             sig_calls = pattern_signature_calls.get(pattern, 0.0)
             score_ms = float(est_saved_ms) if est_saved_ms is not None else -1.0
@@ -2304,6 +2359,11 @@ def _prefill_packed_implementation_target_rows(
                         _fmt_value(_int_if_whole(repeat_saved)),
                         _fmt_value(_int_if_whole(fixed_saved)),
                         _fmt_value(None if est_saved_ms is None else _int_if_whole(est_saved_ms)),
+                        _fmt_value(
+                            None
+                            if observed_packed_ms is None
+                            else _int_if_whole(observed_packed_ms)
+                        ),
                         _fmt_pct(fixed_saved, dense_tokens),
                         _fmt_pct(sig_calls, call_count),
                     ),
