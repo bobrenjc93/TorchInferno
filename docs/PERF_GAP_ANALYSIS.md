@@ -125,6 +125,20 @@ decode graph coverage. That is useful provider context for future local runs,
 but the runtime target remains lower padded-prefix prefill work plus lower
 decode replay/readback cost.
 
+A finer greedy-short suffix-bucket A/B is also rejected for the score-facing
+cold-run path. The run set
+`TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SUFFIX_BUCKETS_GREEDY_SHORT=16,32,48,64,80,96,112,128,256`
+and wrote
+`/tmp/inference-bench-finer-suffix-buckets-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-greedy-short-finer-suffix-buckets-543df7f/runs/20260706_070002`.
+It preserved correctness but landed worse at `220.5 / 23.4 / 1130.1ms`,
+`32.9 tok/s`, with severe early-wave p99. The queue profile did reduce prefill
+padding (`34.6K` -> `22.2K`, `43.7%` -> `33.2%`) and shifted hot shapes to
+`s80`/`s48`, but it introduced new cold graph captures:
+`runtime_prefill_graph_capture_gpu_ms=5697.7` and total prefill forward
+`9.50s` versus `4.73s` on the default current run. Do not promote finer
+greedy-short suffix buckets without a warm-shape strategy or a cheaper
+non-capturing path.
+
 ## Public 20260706_030205 refresh
 
 The latest public run advanced to
