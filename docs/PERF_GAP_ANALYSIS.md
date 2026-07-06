@@ -51,6 +51,17 @@ exercise the default sampled-tree path and should not guide defaults. Keep the
 sampler target open around the active Gumbel phases, especially noise
 generation and the two distributed reductions.
 
+Disabling Gumbel to force the exact distributed CDF sampler is rejected. The
+same-host CDF run
+(`/tmp/inference-bench-cdf-sampler-results/.../20260706_124643`) landed at
+`156.7 / 79.3 / 222.6ms`, `0.966` correctness. Its prefill sample bucket rose
+to `617.7ms` (`608.5ms` selection), and cumulative TP temperature sampling
+spent `1.88s` across `374` calls: `228.9ms` max reduction, `210.0ms`
+exp/weight sum, `1.19s` rank selection/all-gather/broadcast, `171.6ms` local
+CDF/search, and `75.4ms` final token reduction. Keep Gumbel as the default
+unless a future implementation reduces random-noise and reduction cost without
+falling back to this CDF collective shape.
+
 ## Public 20260706_090220 refresh and queue segment merge fix
 
 The prior public run advanced to
