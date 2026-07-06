@@ -67,6 +67,16 @@ A local TorchInferno-only long_output run on `17af09d`
 saved tokens, and compact reject reasons so future public profiles expose this
 signal directly.
 
+A same-host provider refresh
+(`/tmp/inference-bench-provider-long-results/.../20260706_103437`) measured
+vLLM `68.8 / 17.0 / 676.0ms` and SGLang `63.5 / 23.1 / 928.8ms`, both
+`1000/1000` correct. SGLang's log reported `70.8K` decode tokens in only `17`
+decode batches (`4.16K` tokens/batch, `100%` decode graph), while the adjacent
+TorchInferno profile processed `22.3K` decode-many model tokens in `115` calls
+(`194` tokens/call, `3.6` steps/call). The same-host comparison keeps the
+priority on a denser/faster decode body and a packed cached-prefix prefill path;
+suffix splitting alone is too small.
+
 The latest run also reinforces the packed-prefix conclusion. Few_shot is closer
 but remains prefill-bound (`1.38s` prefill forward, `4.66K` padding tokens, hot
 `prefix_graph:b32:s16:p122-122:src1:mixed0`), while multi_turn now surfaces a
