@@ -107,6 +107,14 @@ total Gumbel sampling rose to `639.7ms`; prefill sample selection also rose to
 `367.6ms`. Keep the scratch buffer limited to noise generation until a fused
 perturb-and-reduce path proves a score-facing win.
 
+Uniform-based Gumbel noise is rejected. The env probe generated scratch noise as
+`-log(-log(U))` instead of using the exponential sampler. The same-host run
+(`/tmp/inference-bench-gumbel-uniform-results/.../20260706_132528`) landed at
+`137.8 / 64.8 / 198.7ms`, `0.963` correctness, with p99 TTFT/E2E regressing to
+`753.9/812.0ms`. The max/reduce phases were not the problem (`187.8ms` and
+`85.0ms`), but noise generation rose to `408.9ms` and total Gumbel sampling rose
+to `782.1ms`. Keep the exponential scratch generator as the default noise path.
+
 ## Public 20260706_090220 refresh and queue segment merge fix
 
 The prior public run advanced to
