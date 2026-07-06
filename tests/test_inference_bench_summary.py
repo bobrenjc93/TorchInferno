@@ -187,13 +187,13 @@ def _write_inference_bench_run(tmp_path) -> None:
             "prefix_graph:b4:s16:p45-45:src1:mixed0": 2,
         },
         "runtime_prefill_packed_candidate_shape_tokens": {
-            "prefix_graph:b8:s16:p45-45:src1:mixed0": 32,
+            "prefix_graph:b8:s16:p45-45:src1:mixed0": 31,
         },
         "runtime_prefill_packed_candidate_shape_model_tokens": {
             "prefix_graph:b8:s16:p45-45:src1:mixed0": 48,
         },
         "runtime_prefill_packed_candidate_shape_saved_tokens": {
-            "prefix_graph:b8:s16:p45-45:src1:mixed0": 16,
+            "prefix_graph:b8:s16:p45-45:src1:mixed0": 17,
         },
         "runtime_prefill_packed_candidate_shape_groups": {
             "prefix_graph:b8:s16:p45-45:src1:mixed0": 2,
@@ -479,6 +479,8 @@ def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) ->
     assert "75.0%" in text
     assert "80.0%" in text
     assert "saved_tokens" in text
+    assert "row_saved" in text
+    assert "suffix_saved" in text
     assert "prefill_graph_cap_ms" in text
     assert "decode_graph_cap_ms" in text
     assert "decode_cpu_ms" in text

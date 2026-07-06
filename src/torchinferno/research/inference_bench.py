@@ -692,6 +692,8 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
                         "real_tokens",
                         "model_tokens",
                         "saved_tokens",
+                        "row_saved",
+                        "suffix_saved",
                         "saved_pct",
                         "est_saved_ms",
                         "groups",
@@ -1929,6 +1931,12 @@ def _prefill_packed_per_batch_target_rows(
         shape_real_tokens = _numeric_mapping(
             fields.get("runtime_prefill_packed_candidate_shape_tokens")
         )
+        shape_row_saved = _numeric_mapping(
+            fields.get("runtime_prefill_shape_row_padding_tokens")
+        )
+        shape_suffix_saved = _numeric_mapping(
+            fields.get("runtime_prefill_shape_suffix_padding_tokens")
+        )
         shape_counts = _numeric_mapping(
             fields.get("runtime_prefill_packed_candidate_shape_counts")
         )
@@ -1949,6 +1957,9 @@ def _prefill_packed_per_batch_target_rows(
             if forward_ms > 0.0:
                 est_saved_ms = forward_ms * saved / model_tokens
                 score_ms = est_saved_ms
+            has_split = shape in shape_row_saved or shape in shape_suffix_saved
+            row_saved = shape_row_saved.get(shape, 0.0) if has_split else None
+            suffix_saved = shape_suffix_saved.get(shape, 0.0) if has_split else None
             items.append(
                 (
                     score_ms,
@@ -1962,6 +1973,16 @@ def _prefill_packed_per_batch_target_rows(
                         _fmt_value(_int_if_whole(shape_real_tokens.get(shape, 0.0))),
                         _fmt_value(_int_if_whole(model_tokens)),
                         _fmt_value(_int_if_whole(saved)),
+                        _fmt_value(
+                            None
+                            if row_saved is None
+                            else _int_if_whole(max(0.0, row_saved))
+                        ),
+                        _fmt_value(
+                            None
+                            if suffix_saved is None
+                            else _int_if_whole(max(0.0, suffix_saved))
+                        ),
                         _fmt_pct(saved, model_tokens),
                         _fmt_value(
                             None

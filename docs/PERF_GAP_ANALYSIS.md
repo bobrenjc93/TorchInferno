@@ -30,18 +30,19 @@ pipeline, while current-head multi_turn remains focused on the padded
 cached-prefix prefill body documented below.
 
 The analyzer also now prints per-batch packed-prefill targets that do not require
-repeatable exact signatures. On the same public run, the largest target is
-tree_of_thought's `prefix_graph:b4:s16:p45-45:src1:mixed0` shape: `126` calls,
-`3.64K` saved tokens (`45.2%`), and an estimated `1.22s` prefill-forward saving
-for a true per-batch packed body. Across the score-facing rows, suffix padding
-dominates total padding for long_output (`14.2K/20.1K`), multi_turn
-(`3.3K/4.4K`), and tree (`5.5K/9.5K`), so the first packed-prefill body needs to
-remove per-row suffix waste as well as any batch-row waste. The long_output
-one-shot targets are the `b32:s96`, `b16:s96`, and `b32:s64` `p111` shapes,
-each saving `38-56%` of its prefill model tokens, but they still lack
-fixed-pattern reuse. That confirms the first packed-prefill implementation
-should support arbitrary per-batch suffix lengths, not only fixed-capacity
-repeating slots.
+repeatable exact signatures, with row-vs-suffix saved-token splits attached to
+each target. On the same public run, the largest target is tree_of_thought's
+`prefix_graph:b4:s16:p45-45:src1:mixed0` shape: `126` calls, `3.64K` saved
+tokens (`1.30K` row / `2.35K` suffix, `45.2%`), and an estimated `1.22s`
+prefill-forward saving for a true per-batch packed body. Across the
+score-facing rows, suffix padding dominates total padding for long_output
+(`14.2K/20.1K`), multi_turn (`3.3K/4.4K`), and tree (`5.5K/9.5K`), so the first
+packed-prefill body needs to remove per-row suffix waste as well as any
+batch-row waste. The long_output one-shot targets are the `b32:s96`,
+`b16:s96`, and `b32:s64` `p111` shapes, each saving `38-56%` of its prefill
+model tokens, but they still lack fixed-pattern reuse. That confirms the first
+packed-prefill implementation should support arbitrary per-batch suffix lengths,
+not only fixed-capacity repeating slots.
 
 A full current-head TorchInferno-only long_output profile on `30a1872` wrote
 `/tmp/inference-bench-ti-30a-long-profile-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100/runs/20260706_020656`
