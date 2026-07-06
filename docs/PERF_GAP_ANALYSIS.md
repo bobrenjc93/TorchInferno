@@ -192,6 +192,14 @@ tiny tail rows, is still the main decode-many lever:
 The sparse `b2/b3` tails are several milliseconds per token but only about
 `3%` of total decode-many time per row, so tail gating alone cannot close the
 long-output gap.
+The packed-prefix target tables now also print `est_share`, the estimated saved
+prefill-forward time divided by total profiled prefill forward. On public
+few_shot, the hot `prefix_graph:b32:s16:p122-122:src1:mixed0` candidate is
+large enough to matter by itself (`415ms`, `28.9%` of prefill forward), so a
+real packed cached-prefix body for that shape would be score-facing. Public tree
+has more repeated fixed patterns, but the largest fixed-capacity target is only
+`258ms` (`5.0%` of prefill forward); tree still needs a broader packed-prefix
+body and lower sampled decode cost rather than one narrow pattern rewrite.
 
 A same-branch tree A/B checked whether generated-prefix decode capture should
 be enabled by default. The opt-in decode-capture run

@@ -703,6 +703,8 @@ def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) ->
     assert "saved_tokens" in text
     assert "row_saved" in text
     assert "suffix_saved" in text
+    assert "est_share" in text
+    assert "28.0%" in text
     assert "obs_packed_ms" in text
     assert "prefill_graph_cap_ms" in text
     assert "prefill_graph_cap_gpu_ms" in text

@@ -804,6 +804,7 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
                         "suffix_saved",
                         "saved_pct",
                         "est_saved_ms",
+                        "est_share",
                         "obs_packed_ms",
                         "groups",
                     ),
@@ -873,6 +874,7 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
                         "fixed_tokens",
                         "fixed_saved",
                         "est_saved_ms",
+                        "est_share",
                         "obs_packed_ms",
                         "fixed_saved_pct",
                     ),
@@ -896,6 +898,7 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
                         "repeat_saved",
                         "fixed_saved",
                         "est_saved_ms",
+                        "est_share",
                         "obs_packed_ms",
                         "fixed_saved_pct",
                         "sig_cov",
@@ -2326,6 +2329,7 @@ def _prefill_packed_per_batch_target_rows(
         )
         if not shape_saved:
             continue
+        total_prefill_ms = _numeric_field(fields, "runtime_prefill_forward_ms")
         shape_model_tokens = _numeric_mapping(
             fields.get("runtime_prefill_packed_candidate_shape_model_tokens")
         )
@@ -2389,6 +2393,10 @@ def _prefill_packed_per_batch_target_rows(
                             None
                             if est_saved_ms is None
                             else _int_if_whole(est_saved_ms)
+                        ),
+                        _fmt_pct(
+                            float(est_saved_ms or 0.0),
+                            float(total_prefill_ms or 0.0),
                         ),
                         _fmt_value(
                             None
@@ -2543,6 +2551,7 @@ def _prefill_packed_fixed_capacity_plan_rows(
             for group, count in group_counts.items():
                 max_slots[group] = max(max_slots.get(group, 0), int(count))
         plan_items: list[tuple[float, tuple[str, ...]]] = []
+        total_prefill_ms = _numeric_field(fields, "runtime_prefill_forward_ms")
         for pattern, calls in pattern_calls.items():
             max_slots = pattern_max_slots.get(pattern)
             if not max_slots:
@@ -2588,6 +2597,10 @@ def _prefill_packed_fixed_capacity_plan_rows(
                         _fmt_value(_int_if_whole(fixed_tokens)),
                         _fmt_value(_int_if_whole(fixed_saved)),
                         _fmt_value(None if est_saved_ms is None else _int_if_whole(est_saved_ms)),
+                        _fmt_pct(
+                            float(est_saved_ms or 0.0),
+                            float(total_prefill_ms or 0.0),
+                        ),
                         _fmt_value(
                             None
                             if observed_packed_ms is None
@@ -2663,6 +2676,7 @@ def _prefill_packed_implementation_target_rows(
         pattern_saved = _numeric_mapping(
             fields.get("runtime_prefill_packed_candidate_pattern_saved_tokens")
         )
+        total_prefill_ms = _numeric_field(fields, "runtime_prefill_forward_ms")
         pattern_max_slots: dict[str, dict[tuple[int, int], int]] = {}
         pattern_signature_calls: dict[str, float] = {}
         for slot_key, slot_count in _numeric_mapping(
@@ -2735,6 +2749,10 @@ def _prefill_packed_implementation_target_rows(
                         _fmt_value(_int_if_whole(repeat_saved)),
                         _fmt_value(_int_if_whole(fixed_saved)),
                         _fmt_value(None if est_saved_ms is None else _int_if_whole(est_saved_ms)),
+                        _fmt_pct(
+                            float(est_saved_ms or 0.0),
+                            float(total_prefill_ms or 0.0),
+                        ),
                         _fmt_value(
                             None
                             if observed_packed_ms is None
