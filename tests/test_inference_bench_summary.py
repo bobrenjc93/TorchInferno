@@ -187,6 +187,7 @@ def _write_inference_bench_run(tmp_path) -> None:
         },
         "runtime_prefill_shape_graph_replay_gpu_ms": {
             "chunk_graph:b8:s64:p111:logits0": 5.0,
+            "prefix_graph:b8:s16:p45-45:src1:mixed0": 4.8,
         },
         "runtime_prefill_shape_padding_tokens": {
             "prefix_graph:b8:s16:p45-45:src1:mixed0": 17,
@@ -448,6 +449,12 @@ def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) ->
     assert "prefill_setup_ms" in text
     assert "prefill_copy_ms" in text
     assert "prefill_sample_ms" in text
+    assert "gpu_ms_call" in text
+    assert "gpu_us_tok" in text
+    assert "pad_call" in text
+    assert "2.4" in text
+    assert "100.0" in text
+    assert "8.5" in text
     assert "37.5%" in text
     assert "wall_ms" in text
     assert "sample_ms" in text

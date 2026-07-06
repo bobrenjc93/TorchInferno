@@ -54,6 +54,28 @@ recorded `runtime_prefill_graph_replay_gpu_ms=4683.8` versus the old
 `b24:s64:p111` (`1227.6ms`), `b16:s64:p111` (`841.1ms`), `b24:s96:p111`
 (`724.1ms`), `b16:s96:p111` (`603.6ms`), and `b32:s64:p111` (`548.4ms`).
 
+A targeted long_output replay profile on pushed `0d6ab82` corrected the earlier
+exact-context filter and hit the actual dynamic-context bucket:
+`TORCHINFERNO_PROFILE_RAGGED_PREFILL_CONTEXT_LEN=-256`,
+`TORCHINFERNO_PROFILE_RAGGED_PREFILL_MIN_BATCH=16`, and
+`TORCHINFERNO_PROFILE_RAGGED_PREFILL_MIN_SUFFIX=64`. It wrote
+`/tmp/inference-bench-long-prefill-ctxneg256-s64-prof-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-long-prefill-ctxneg256-s64-prof-0d6ab82/runs/20260706_060809`
+and landed at `205.0 / 23.5 / 1098.3ms`, `1000/1000` correct. The one-shot
+profiler fired on `batch=24 suffix=64 context_len=-256` and recorded
+`83.27ms` self CUDA: NCCL all-reduce was `24.52ms` (`160` calls), the main
+GEMM/NVJET buckets were about `22.6ms` combined, add/RMS/elementwise/index work
+was the next tier, and visible softmax attention was only `0.65ms`. This
+confirms the dynamic bucket mask is not the leading long-output prefill cost;
+the hot body is ordinary TP transformer work over padded suffix rows. Queue
+telemetry for the same profile reported `6.19s` prefill graph GPU replay,
+`5.05s` decode-many GPU, `1.32s` decode token readback, and
+`decode_many_graph_calls=0`. The profiled `b24:s64` row was profiler-inflated
+(`2.74s` GPU across `14` calls), but it usefully exposed density:
+`127.4us/model-token` and `637` padded tokens per call. The summary formatter
+now prints `gpu_ms_call`, `gpu_us_tok`, and `pad_call` in the hot prefill shape
+table so future public queue profiles can identify these targets without manual
+JSON parsing.
+
 ## Public 20260706_030205 refresh
 
 The latest public run advanced to

@@ -693,6 +693,8 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
                         "calls",
                         "forward_ms",
                         "graph_gpu_ms",
+                        "gpu_ms_call",
+                        "gpu_us_tok",
                         "wall_ms",
                         "setup_ms",
                         "copy_ms",
@@ -702,6 +704,7 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
                         "model_tokens",
                         "padding_tokens",
                         "pad_pct",
+                        "pad_call",
                         "row_pad",
                         "suffix_pad",
                         "graphs",
@@ -1863,6 +1866,19 @@ def _fmt_pct_value(value: float | None) -> str:
     return f"{value:.1f}%"
 
 
+def _ratio_or_none(
+    numerator: Any,
+    denominator: Any,
+    *,
+    scale: float = 1.0,
+) -> float | None:
+    if not isinstance(numerator, (int, float)) or not isinstance(denominator, (int, float)):
+        return None
+    if float(denominator) == 0.0:
+        return None
+    return float(numerator) * float(scale) / float(denominator)
+
+
 def _int_if_whole(value: float | int) -> float | int:
     if isinstance(value, float) and value.is_integer():
         return int(value)
@@ -1904,6 +1920,11 @@ def _hot_prefill_shape_rows(
                 (int, float),
             ) and isinstance(model_tokens, (int, float)):
                 padding_tokens = max(0, model_tokens - active_tokens)
+            calls = _mapping_value(fields.get("runtime_prefill_shape_counts"), shape)
+            graph_gpu_ms = _mapping_value(
+                fields.get("runtime_prefill_shape_graph_replay_gpu_ms"),
+                shape,
+            )
             row_padding_tokens = _mapping_value(
                 fields.get("runtime_prefill_shape_row_padding_tokens"),
                 shape,
@@ -1917,16 +1938,11 @@ def _hot_prefill_shape_rows(
                     _fmt_value(profile.temperature),
                     _fmt_value(profile.max_tokens),
                     shape,
-                    _fmt_value(
-                        _mapping_value(fields.get("runtime_prefill_shape_counts"), shape)
-                    ),
+                    _fmt_value(calls),
                     _fmt_value(forward_ms),
-                    _fmt_value(
-                        _mapping_value(
-                            fields.get("runtime_prefill_shape_graph_replay_gpu_ms"),
-                            shape,
-                        )
-                    ),
+                    _fmt_value(graph_gpu_ms),
+                    _fmt_value(_ratio_or_none(graph_gpu_ms, calls)),
+                    _fmt_value(_ratio_or_none(graph_gpu_ms, model_tokens, scale=1000.0)),
                     _fmt_value(
                         _mapping_value(fields.get("runtime_prefill_shape_wall_ms"), shape)
                     ),
@@ -1946,6 +1962,7 @@ def _hot_prefill_shape_rows(
                     _fmt_value(model_tokens),
                     _fmt_value(padding_tokens),
                     _fmt_pct(float(padding_tokens or 0), float(model_tokens or 0)),
+                    _fmt_value(_ratio_or_none(padding_tokens, calls)),
                     _fmt_value(row_padding_tokens),
                     _fmt_value(suffix_padding_tokens),
                     _fmt_value(fields.get("runtime_prefill_graph_cache_live_entries")),
