@@ -6336,6 +6336,46 @@ def test_continuous_batch_engine_online_many_shape_model_tokens_include_padding(
     assert model.ragged_logits_graph_calls == 2
 
 
+def test_continuous_batch_engine_decode_many_gpu_timers_populate_step_windows() -> None:
+    class _FakeCudaStartEvent:
+        def elapsed_time(self, _end_event) -> float:
+            return 12.0
+
+    engine = ContinuousBatchEngine(
+        _RaggedGraphToyModel(vocab_size=128),
+        device=torch.device("cpu"),
+        max_active_requests=8,
+        prefix_cache_capacity=0,
+        enable_ragged_decode=True,
+        store_reusable_prefixes=False,
+        profile_timings=True,
+    )
+    engine._pending_decode_ragged_model_events = [
+        (
+            _FakeCudaStartEvent(),
+            object(),
+            "decode_many:b8/8",
+            "decode_many",
+            None,
+        )
+    ]
+
+    engine._attach_latest_decode_many_gpu_window("decode_many:b8/8:g1-16", 8)
+    engine._attach_latest_decode_many_gpu_window("decode_many:b8/8:g17-32", 4)
+    engine._flush_decode_ragged_model_gpu_timers()
+
+    assert engine.stats.decode_ragged_model_gpu_ms == pytest.approx(12.0)
+    assert engine.stats.decode_shape_gpu_ms == {"decode_many:b8/8": pytest.approx(12.0)}
+    assert engine.stats.decode_many_model_gpu_ms == pytest.approx(12.0)
+    assert engine.stats.decode_many_shape_gpu_ms == {
+        "decode_many:b8/8": pytest.approx(12.0),
+    }
+    assert engine.stats.decode_many_step_window_model_ms == {
+        "decode_many:b8/8:g1-16": pytest.approx(8.0),
+        "decode_many:b8/8:g17-32": pytest.approx(4.0),
+    }
+
+
 def test_continuous_batch_engine_online_many_can_decode_before_waiting_admission(monkeypatch) -> None:
     monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_UNIFORM_RAGGED_DECODE", "1")
     model = _RaggedGraphToyModel(vocab_size=128)

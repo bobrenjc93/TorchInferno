@@ -141,6 +141,14 @@ readback fix for the median long_output gap: readback is spread across the
 main full/near-full decode-many body, so the needed change is genuine
 readback/decode pipelining or lower replay cost, not another stop-tail split.
 
+Current head now also attaches decode-many step-window metadata to deferred
+CUDA decode events before they are flushed. That populates
+`runtime_decode_many_step_window_model_ms` on CUDA profiles instead of leaving
+the analyzer to estimate per-window GPU time from whole-shape averages. This is
+still stats-only plumbing; the next long_output run should use the exact
+`model_ms + cpu_ms` window totals to choose between lower `b64` replay work and
+a true emission/readback pipeline.
+
 The direct pinned-host async readback A/B is rejected as a default. The first
 attempt on
 `/tmp/inference-bench-async-readback-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-async-readback/runs/20260706_034651`

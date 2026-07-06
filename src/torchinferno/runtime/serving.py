@@ -934,9 +934,7 @@ class ContinuousBatchEngine:
         self._online_prefilling: list[_ActiveRequest] = []
         self._online_step = 0
         self._online_next_index = 0
-        self._pending_decode_ragged_model_events: list[
-            tuple[object, object, str | None, str | None]
-        ] = []
+        self._pending_decode_ragged_model_events: list[tuple[object, ...]] = []
 
     def _dynamic_prefix_prefill_context_len(
         self,
@@ -1453,6 +1451,12 @@ class ContinuousBatchEngine:
                                 step_window_key,
                                 model_elapsed_ms,
                             )
+                        else:
+                            self._attach_latest_decode_many_gpu_window(
+                                step_window_key,
+                                shape_model_tokens,
+                                shape_key=shape_key,
+                            )
                 records.append(
                     (
                         step_states,
@@ -1691,7 +1695,6 @@ class ContinuousBatchEngine:
                         shape_key,
                         cpu_elapsed_ms,
                     )
-                self._flush_decode_ragged_model_gpu_timers()
 
             state_update_start_s = time.perf_counter() if self.profile_timings else 0.0
             generated_after: list[int] = []
@@ -1763,11 +1766,18 @@ class ContinuousBatchEngine:
                             step_window_key,
                             model_elapsed_ms,
                         )
+                    else:
+                        self._attach_latest_decode_many_gpu_window(
+                            step_window_key,
+                            shape_model_tokens,
+                            shape_key=shape_key,
+                        )
                     self._record_shape_time(
                         self.stats.decode_many_step_window_cpu_tokens_ms,
                         step_window_key,
                         cpu_elapsed_ms,
                     )
+                self._flush_decode_ragged_model_gpu_timers()
             if shape_key is not None:
                 self._record_shape_total(
                     self.stats.decode_many_shape_model_tokens,
@@ -5374,20 +5384,51 @@ class ContinuousBatchEngine:
         except Exception:
             return
         self._pending_decode_ragged_model_events.append(
-            (start, end, shape_key, profile_source)
+            (start, end, shape_key, profile_source, None)
         )
+
+    def _decode_gpu_timer_event_fields(
+        self,
+        item: tuple[object, ...],
+    ) -> tuple[object, object, str | None, str | None, dict[str, float] | None]:
+        start, end = item[0], item[1]
+        shape_key = item[2] if len(item) >= 3 and isinstance(item[2], str) else None
+        profile_source = item[3] if len(item) >= 4 and isinstance(item[3], str) else None
+        window_weights = item[4] if len(item) >= 5 and isinstance(item[4], dict) else None
+        return start, end, shape_key, profile_source, window_weights
+
+    def _attach_latest_decode_many_gpu_window(
+        self,
+        step_window_key: str | None,
+        model_tokens: int,
+        *,
+        shape_key: str | None = None,
+    ) -> None:
+        if not step_window_key or model_tokens <= 0:
+            return
+        pending = getattr(self, "_pending_decode_ragged_model_events", [])
+        if not pending:
+            return
+        start, end, pending_shape_key, profile_source, window_weights = (
+            self._decode_gpu_timer_event_fields(pending[-1])
+        )
+        if profile_source != "decode_many":
+            return
+        if shape_key is not None and shape_key != pending_shape_key:
+            return
+        weights = dict(window_weights or {})
+        weights[step_window_key] = weights.get(step_window_key, 0.0) + float(model_tokens)
+        pending[-1] = (start, end, pending_shape_key, profile_source, weights)
 
     def _flush_decode_ragged_model_gpu_timers(self) -> None:
         pending = getattr(self, "_pending_decode_ragged_model_events", [])
         if not pending:
             return
-        remaining: list[tuple[object, object, str | None, str | None]] = []
+        remaining: list[tuple[object, ...]] = []
         for item in pending:
-            if len(item) == 3:
-                start, end, shape_key = item
-                profile_source = None
-            else:
-                start, end, shape_key, profile_source = item
+            start, end, shape_key, profile_source, window_weights = (
+                self._decode_gpu_timer_event_fields(item)
+            )
             try:
                 elapsed_ms = float(start.elapsed_time(end))
                 self.stats.decode_ragged_model_gpu_ms += elapsed_ms
@@ -5405,8 +5446,22 @@ class ContinuousBatchEngine:
                             shape_key,
                             elapsed_ms,
                         )
+                    if window_weights:
+                        total_weight = sum(
+                            max(0.0, float(weight)) for weight in window_weights.values()
+                        )
+                        if total_weight > 0.0:
+                            for step_window_key, weight in window_weights.items():
+                                share = max(0.0, float(weight)) / total_weight
+                                if share <= 0.0:
+                                    continue
+                                self._record_shape_time(
+                                    self.stats.decode_many_step_window_model_ms,
+                                    str(step_window_key),
+                                    elapsed_ms * share,
+                                )
             except RuntimeError:
-                remaining.append((start, end, shape_key, profile_source))
+                remaining.append((start, end, shape_key, profile_source, window_weights))
             except Exception:
                 continue
         self._pending_decode_ragged_model_events = remaining
