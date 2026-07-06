@@ -271,6 +271,7 @@ class QueueProfileSummary:
     submitted_requests: int | None
     finished_events: int | None
     fields: dict[str, Any] = field(default_factory=dict)
+    segments: int = 1
 
 
 @dataclass(frozen=True)
@@ -1181,8 +1182,13 @@ def _fmt_queue_profile_coverage(
     if submitted is None:
         return "-"
     if expected_requests is None or expected_requests <= 0:
-        return str(submitted)
+        text = str(submitted)
+        if profile.segments > 1:
+            return f"{text} {profile.segments}seg"
+        return text
     text = f"{submitted}/{expected_requests}"
+    if profile.segments > 1:
+        text = f"{text} {profile.segments}seg"
     if submitted < expected_requests:
         return f"{text} partial"
     if submitted > expected_requests:
@@ -1220,7 +1226,7 @@ def _summarize_torchinferno_queue(root: Path) -> tuple[QueueProfileSummary, ...]
     path = root / "provider_logs" / "torchinferno_queue_profile.jsonl"
     if not path.exists():
         return ()
-    latest_by_key: dict[tuple[float | None, int | None], QueueProfileSummary] = {}
+    segments_by_key: dict[tuple[float | None, int | None], list[QueueProfileSummary]] = {}
     for line in path.read_text().splitlines():
         if not line.strip():
             continue
@@ -1229,7 +1235,7 @@ def _summarize_torchinferno_queue(root: Path) -> tuple[QueueProfileSummary, ...]
         if event not in {"online_batcher", "online_batcher_quiescent"}:
             continue
         key = (_maybe_float(record.get("temperature")), _maybe_int(record.get("run_max_tokens")))
-        latest_by_key[key] = QueueProfileSummary(
+        profile = QueueProfileSummary(
             event=event,
             temperature=key[0],
             max_tokens=key[1],
@@ -1237,16 +1243,130 @@ def _summarize_torchinferno_queue(root: Path) -> tuple[QueueProfileSummary, ...]
             finished_events=_maybe_int(record.get("finished_events")),
             fields={name: record.get(name) for name in _QUEUE_PROFILE_FIELDS if name in record},
         )
+        segments = segments_by_key.setdefault(key, [])
+        if segments and _queue_profile_restarts(segments[-1], profile):
+            segments.append(profile)
+            continue
+        if segments:
+            segments[-1] = profile
+        else:
+            segments.append(profile)
     return tuple(
-        latest_by_key[key]
+        _merge_queue_profile_segments(segments_by_key[key])
         for key in sorted(
-            latest_by_key,
+            segments_by_key,
             key=lambda item: (
                 -1.0 if item[0] is None else item[0],
                 -1 if item[1] is None else item[1],
             ),
         )
     )
+
+
+def _queue_profile_restarts(previous: QueueProfileSummary, current: QueueProfileSummary) -> bool:
+    previous_submitted = previous.submitted_requests
+    current_submitted = current.submitted_requests
+    if previous_submitted is not None and current_submitted is not None:
+        return current_submitted < previous_submitted
+    previous_finished = previous.finished_events
+    current_finished = current.finished_events
+    return (
+        previous_finished is not None
+        and current_finished is not None
+        and current_finished < previous_finished
+    )
+
+
+def _merge_queue_profile_segments(
+    segments: Sequence[QueueProfileSummary],
+) -> QueueProfileSummary:
+    if len(segments) == 1:
+        return segments[0]
+    latest = segments[-1]
+    field_names = sorted({name for segment in segments for name in segment.fields})
+    fields: dict[str, Any] = {}
+    for name in field_names:
+        values = [segment.fields.get(name) for segment in segments if name in segment.fields]
+        merged = _merge_queue_profile_field(name, values)
+        if merged is not None:
+            fields[name] = merged
+    return QueueProfileSummary(
+        event="online_batcher_merged",
+        temperature=latest.temperature,
+        max_tokens=latest.max_tokens,
+        submitted_requests=_sum_optional_int(segment.submitted_requests for segment in segments),
+        finished_events=_sum_optional_int(segment.finished_events for segment in segments),
+        fields=fields,
+        segments=len(segments),
+    )
+
+
+def _merge_queue_profile_field(name: str, values: Sequence[Any]) -> Any:
+    if not values:
+        return None
+    if all(isinstance(value, dict) for value in values):
+        if _queue_profile_field_is_additive(name):
+            return _sum_numeric_mappings(values)
+        return values[-1]
+    if _queue_profile_field_is_additive(name):
+        numeric_values = [value for value in values if isinstance(value, (int, float))]
+        if len(numeric_values) == len(values):
+            return sum(numeric_values)
+    first = values[0]
+    if all(value == first for value in values):
+        return first
+    if name.startswith("request_") and name.endswith("_ms"):
+        return None
+    return values[-1]
+
+
+def _queue_profile_field_is_additive(name: str) -> bool:
+    if name in {
+        "runtime_max_active_requests",
+        "runtime_prefix_cache_capacity",
+        "runtime_prefill_graph_cache_live_entries",
+        "runtime_decode_graph_cache_live_entries",
+    }:
+        return False
+    if "cache_live" in name:
+        return False
+    if name.startswith("request_"):
+        return name.endswith("_count")
+    if name.startswith("runtime_"):
+        return True
+    return name in {
+        "active_ready_wait_ms",
+        "request_stream_prequeue_wait_applied_count",
+    }
+
+
+def _sum_numeric_mappings(values: Sequence[Any]) -> dict[str, float | int]:
+    totals: dict[str, float] = {}
+    integral: dict[str, bool] = {}
+    for value in values:
+        if not isinstance(value, dict):
+            continue
+        for key, item in value.items():
+            if not isinstance(item, (int, float)):
+                continue
+            text_key = str(key)
+            totals[text_key] = totals.get(text_key, 0.0) + float(item)
+            integral[text_key] = integral.get(text_key, True) and float(item).is_integer()
+    return {
+        key: int(total) if integral.get(key, False) and float(total).is_integer() else total
+        for key, total in totals.items()
+    }
+
+
+def _sum_optional_int(values: Iterable[int | None]) -> int | None:
+    total = 0
+    seen = False
+    for value in values:
+        if value is None:
+            continue
+        total += int(value)
+        seen = True
+    return total if seen else None
 
 
 def _summarize_provider_server_logs(root: Path) -> tuple[ProviderServerLogSummary, ...]:

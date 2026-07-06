@@ -352,6 +352,80 @@ def _write_inference_bench_run(tmp_path) -> None:
     )
 
 
+def test_queue_profile_merges_restart_segments(tmp_path) -> None:
+    results = {
+        "model": "meta-llama/test",
+        "tensor_parallel_size": 8,
+        "hardware": "8xH100",
+        "providers": {
+            "torchinferno": {
+                "benchmarks": {
+                    "long_output": {
+                        "metrics": {
+                            "num_requests": 5,
+                            "ttft_median_ms": 20.0,
+                            "tpot_median_ms": 4.0,
+                            "e2e_median_ms": 80.0,
+                            "throughput_median_tps": 30.0,
+                        }
+                    }
+                }
+            }
+        },
+    }
+    (tmp_path / "results.json").write_text(json.dumps(results))
+    logs = tmp_path / "provider_logs"
+    logs.mkdir()
+    records = [
+        {
+            "event": "online_batcher_quiescent",
+            "temperature": 0.0,
+            "run_max_tokens": 96,
+            "submitted_requests": 3,
+            "finished_events": 3,
+            "request_queue_to_first_token_p50_ms": 11.0,
+            "runtime_prefill_batches": 2,
+            "runtime_prefill_forward_ms": 10.0,
+            "runtime_prefill_shape_counts": {"shape_a": 1},
+            "runtime_decode_many_model_gpu_ms": 4.0,
+        },
+        {
+            "event": "online_batcher_quiescent",
+            "temperature": 0.0,
+            "run_max_tokens": 96,
+            "submitted_requests": 2,
+            "finished_events": 2,
+            "request_queue_to_first_token_p50_ms": 22.0,
+            "runtime_prefill_batches": 5,
+            "runtime_prefill_forward_ms": 7.0,
+            "runtime_prefill_shape_counts": {"shape_a": 2, "shape_b": 1},
+            "runtime_decode_many_model_gpu_ms": 6.0,
+        },
+    ]
+    (logs / "torchinferno_queue_profile.jsonl").write_text(
+        "\n".join(json.dumps(record) for record in records) + "\n"
+    )
+
+    summary = summarize_inference_bench_run(tmp_path)
+
+    assert len(summary.torchinferno_queue_profiles) == 1
+    profile = summary.torchinferno_queue_profiles[0]
+    assert profile.segments == 2
+    assert profile.submitted_requests == 5
+    assert profile.finished_events == 5
+    assert profile.fields["runtime_prefill_batches"] == 7
+    assert profile.fields["runtime_prefill_forward_ms"] == 17.0
+    assert profile.fields["runtime_decode_many_model_gpu_ms"] == 10.0
+    assert profile.fields["runtime_prefill_shape_counts"] == {
+        "shape_a": 3,
+        "shape_b": 1,
+    }
+    assert "request_queue_to_first_token_p50_ms" not in profile.fields
+
+    text = format_inference_bench_summary(summary)
+    assert "5/5 2seg" in text
+
+
 def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) -> None:
     _write_inference_bench_run(tmp_path)
 

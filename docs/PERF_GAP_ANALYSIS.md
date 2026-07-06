@@ -21,6 +21,14 @@ decode graph replays. The two long-output TorchInferno sessions spent about
 the same target split: dense cached-prefix prefill padding on TTFT/E2E and
 single-step decode replay plus token readback on TPOT/E2E.
 
+The analyzer now merges restart-split TorchInferno queue-profile segments for
+the same `(temperature, max_tokens)` key. Public long_output had two server
+segments (`627` and `373` submitted requests); the old formatter kept only the
+last segment and showed `373/1000 partial`, undercounting prefill/decode phase
+totals. The merged view reports `1000/1000 2seg` and sums counters/maps while
+leaving per-segment p50 latency fields blank because aggregate medians cannot be
+reconstructed from JSONL snapshots alone.
+
 Two local long_output profiles on `a2a126e` refine the prefill evidence. A
 context-filtered `p111+s64` replay probe did not print because the one-shot hook
 missed the filtered replay, but the queue profile showed warmed, miss-free
@@ -75,6 +83,21 @@ telemetry for the same profile reported `6.19s` prefill graph GPU replay,
 now prints `gpu_ms_call`, `gpu_us_tok`, and `pad_call` in the hot prefill shape
 table so future public queue profiles can identify these targets without manual
 JSON parsing.
+
+A current-head packed-prefix rerun with start-grouped packed attention stayed
+rejected and was reverted. The run used
+`TORCHINFERNO_CONTINUOUS_PACKED_RAGGED_PREFILL_EAGER=1`,
+`TORCHINFERNO_CONTINUOUS_PACKED_RAGGED_PREFILL_EAGER_GRAPH=1`, and a
+shared-prefix grouped SDPA prototype that collapsed exact `(prefix, suffix)`
+attention groups into one masked group per prefix start. It wrote
+`/tmp/inference-bench-packed-startgroup-long-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-packed-startgroup-long/runs/20260706_062730`
+and landed at `1016.9 / 73.7 / 3871.6ms`, `1000/1000` correct. The path saved
+`34.0K` padded suffix tokens but spent `48.25s` in packed eager work; hot
+observed packed costs were `12.54s` for `b16:s64:p111`, `11.33s` for
+`b24:s64:p111`, and `7.97s` for `b16:s96:p111`. This rules out a PyTorch
+masked-SDPA start-grouping shim as the packed-prefix implementation; the viable
+path still needs a real varlen prefill kernel/body that avoids both padded
+transformer tokens and per-group Python/SDPA work.
 
 ## Public 20260706_030205 refresh
 
