@@ -939,10 +939,11 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
                         "emitted",
                         "skipped",
                         "skip_pct",
-                        "est_gpu_ms",
+                        "gpu_ms",
+                        "gpu_src",
                         "cpu_ms",
-                        "est_total_ms",
-                        "est_us_tok",
+                        "total_ms",
+                        "us_tok",
                     ),
                     decode_window_target_rows,
                 )
@@ -2728,6 +2729,9 @@ def _decode_many_step_window_target_rows(
         shape_gpu_ms = _numeric_mapping(
             fields.get("runtime_decode_many_shape_gpu_ms")
         )
+        window_model_ms = _numeric_mapping(
+            fields.get("runtime_decode_many_step_window_model_ms")
+        )
         window_counts = _numeric_mapping(
             fields.get("runtime_decode_many_step_window_counts")
         )
@@ -2747,18 +2751,19 @@ def _decode_many_step_window_target_rows(
             shape = _decode_many_step_window_shape(window)
             shape_model_tokens = float(shape_tokens.get(shape, 0.0))
             shape_ms = float(shape_gpu_ms.get(shape, 0.0))
-            est_gpu_ms: float | None = None
-            if shape_model_tokens > 0.0 and shape_ms > 0.0:
-                est_gpu_ms = shape_ms * model_tokens / shape_model_tokens
-            est_us_tok: float | None = None
-            if est_gpu_ms is not None:
-                est_us_tok = est_gpu_ms * 1000.0 / model_tokens
+            gpu_ms: float | None = window_model_ms.get(window)
+            gpu_src = "exact" if gpu_ms is not None else "est"
+            if gpu_ms is None and shape_model_tokens > 0.0 and shape_ms > 0.0:
+                gpu_ms = shape_ms * model_tokens / shape_model_tokens
+            us_tok: float | None = None
+            if gpu_ms is not None:
+                us_tok = gpu_ms * 1000.0 / model_tokens
             cpu_ms = window_cpu_ms.get(window)
-            est_total_ms: float | None = None
-            if est_gpu_ms is not None or cpu_ms is not None:
-                est_total_ms = (est_gpu_ms or 0.0) + (cpu_ms or 0.0)
+            total_ms: float | None = None
+            if gpu_ms is not None or cpu_ms is not None:
+                total_ms = (gpu_ms or 0.0) + (cpu_ms or 0.0)
             skipped = float(window_skipped.get(window, 0.0))
-            score_ms = est_total_ms if est_total_ms is not None else -1.0
+            score_ms = total_ms if total_ms is not None else -1.0
             items.append(
                 (
                     score_ms,
@@ -2773,7 +2778,8 @@ def _decode_many_step_window_target_rows(
                         _fmt_value(_int_if_whole(window_emitted.get(window, 0.0))),
                         _fmt_value(_int_if_whole(skipped)),
                         _fmt_pct(skipped, model_tokens),
-                        _fmt_value(None if est_gpu_ms is None else _int_if_whole(est_gpu_ms)),
+                        _fmt_value(None if gpu_ms is None else _int_if_whole(gpu_ms)),
+                        gpu_src if gpu_ms is not None else "-",
                         _fmt_value(
                             None
                             if cpu_ms is None
@@ -2781,10 +2787,10 @@ def _decode_many_step_window_target_rows(
                         ),
                         _fmt_value(
                             None
-                            if est_total_ms is None
-                            else _int_if_whole(est_total_ms)
+                            if total_ms is None
+                            else _int_if_whole(total_ms)
                         ),
-                        _fmt_value(None if est_us_tok is None else _int_if_whole(est_us_tok)),
+                        _fmt_value(None if us_tok is None else _int_if_whole(us_tok)),
                     ),
                 )
             )

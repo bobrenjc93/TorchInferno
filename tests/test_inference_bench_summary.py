@@ -520,14 +520,16 @@ def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) ->
     assert "21.1%" in text
     assert "[torchinferno decode-many step windows]" in text
     assert "[torchinferno decode-many implementation targets]" in text
-    assert "est_gpu_ms" in text
-    assert "est_us_tok" in text
-    assert "789.5" in text
+    assert "gpu_ms" in text
+    assert "gpu_src" in text
+    assert "us_tok" in text
+    assert "605.3" in text
     assert "decode_many:b8/8:g1-16" in text
+    assert "exact" in text
     assert "model_ms" in text
     assert "cpu_ms" in text
-    assert "est_total_ms" in text
-    assert "16.2" in text
+    assert "total_ms" in text
+    assert "12.7" in text
     assert "[provider server log phases]" in text
     assert "prefix_hit_avg" in text
     assert "prefill_graph_pct" in text

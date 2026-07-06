@@ -119,12 +119,12 @@ decode/readback body.
 
 Current-head queue profiles now also attribute decode-many CPU token readback by
 step window as `runtime_decode_many_step_window_cpu_tokens_ms`, and the summary
-prints it as `cpu_ms` beside the existing per-window GPU estimate. The
-implementation-target table now also ranks windows by `est_total_ms`
-(`est_gpu_ms + cpu_ms` when both are available). Older public artifacts render
-the CPU column as `-`; the next current run should show whether the dominant
-`decode_many:b64/64:g1-16` window also carries most readback cost or whether the
-CPU exposure is concentrated in tail windows.
+prints it as `cpu_ms` beside per-window model time. The implementation-target
+table now ranks windows by `total_ms` (`gpu_ms + cpu_ms` when both are
+available) and marks `gpu_src` as `exact` for profiles with
+`runtime_decode_many_step_window_model_ms` or `est` for older artifacts that
+must still derive GPU time from whole-shape averages. Older public artifacts
+render the CPU/model columns as `-` or `est`.
 
 A current-head long_output profile with that telemetry on `0366d17` wrote
 `/tmp/inference-bench-current-long-decode-window-cpu-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-decode-window-cpu/runs/20260706_032928`
@@ -145,9 +145,15 @@ Current head now also attaches decode-many step-window metadata to deferred
 CUDA decode events before they are flushed. That populates
 `runtime_decode_many_step_window_model_ms` on CUDA profiles instead of leaving
 the analyzer to estimate per-window GPU time from whole-shape averages. This is
-still stats-only plumbing; the next long_output run should use the exact
-`model_ms + cpu_ms` window totals to choose between lower `b64` replay work and
-a true emission/readback pipeline.
+still stats-only plumbing. A follow-up current-head run on `db1ca1f` wrote
+`/tmp/inference-bench-current-long-window-gpu-db1ca1f-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-window-gpu-db1ca1f/runs/20260706_042514`
+and landed at `238.2 / 23.7 / 1062.9ms`, `1000/1000` correct, so it is not a
+score improvement. It did prove the exact attribution: the dominant
+`decode_many:b64/64:g1-16` window spent `1774ms` model/GPU time plus `319ms`
+CPU readback over `8448` model tokens, while `b64/64:g17-32` was only
+`269ms + 31ms`. The next decode change should target lower high-active
+single-step replay cost or a real emission/readback pipeline, not tail-only
+readback.
 
 The direct pinned-host async readback A/B is rejected as a default. The first
 attempt on
