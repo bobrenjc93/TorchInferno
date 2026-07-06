@@ -199,6 +199,24 @@ explicit diagnostic. The analyzer now retains
 which points future work at the static generated-prefix decode fallback rather
 than ragged graph miss churn.
 
+Two follow-up probes are not defaultable. Enabling global uniform ragged decode
+with `TORCHINFERNO_CONTINUOUS_UNIFORM_RAGGED_DECODE=1` wrote
+`/tmp/inference-bench-tree-uniform-ragged-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-tree-uniform-ragged-d38cfa3/runs/20260706_075729`
+and landed at `117.3 / 66.1 / 163.8ms`, `958/992` correct. That improves median
+TTFT/E2E versus the no-env control, but worsens p99 (`679/770ms`), raises
+profiled decode GPU (`3.11s` vs `2.71s`), raises prefill sampling
+(`600ms` vs `507ms`), and still leaves static token misses (`static_token=17`).
+Keep uniform ragged decode as an explicit diagnostic.
+
+A narrower runtime patch that kept normal grouping but routed the FlashInfer
+sampled-token fallback through ragged logits was also reverted. The local run
+`/tmp/inference-bench-tree-ragged-fallback-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-tree-ragged-fallback-d38cfa3-dirty/runs/20260706_080520`
+landed at `127.8 / 62.4 / 192.7ms`, `960/992` correct. It improved TPOT but
+regressed TTFT/E2E, and the new miss split showed it did not hit the public
+Llama path: misses remained static (`static_token=41,static_logits=20`). The
+next useful decode-side change needs to target the non-FlashInfer static branch
+or make uniform ragged faster, not reroute the FI fallback.
+
 ## Public 20260706_030205 refresh
 
 The latest public run advanced to
