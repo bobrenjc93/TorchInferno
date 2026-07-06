@@ -78,6 +78,17 @@ host/device setup overhead, but do not treat it as the structural long-output
 fix: the remaining gap is still dense cached-prefix prefill body cost plus
 decode replay/readback density.
 
+Two smaller prefix-setup follow-ups are rejected and were backed out. Replacing
+the per-prefill row/source/logit-position tensors with cached device-index
+tensors wrote
+`/tmp/inference-bench-cached-index-results/.../20260706_105621` and landed at
+`216.1 / 23.7 / 1101.7ms`, with setup worsening to `91.2ms`. Changing the
+uniform common-prefix seq-lens update from `index_copy_` to `index_fill_` wrote
+`/tmp/inference-bench-uniform-seqlens-results/.../20260706_110347` and landed
+at `240.4 / 23.4 / 1111.7ms`, with setup `94.8ms`. Keep only the reusable
+seq-lens scratch; the remaining setup work is small enough that these tensor
+construction variants are run-noise or worse, not a new default lever.
+
 A same-host provider refresh
 (`/tmp/inference-bench-provider-long-results/.../20260706_103437`) measured
 vLLM `68.8 / 17.0 / 676.0ms` and SGLang `63.5 / 23.1 / 928.8ms`, both
