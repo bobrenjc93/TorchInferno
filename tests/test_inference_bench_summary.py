@@ -114,7 +114,12 @@ def _write_inference_bench_run(tmp_path) -> None:
         "runtime_prefill_setup_ms": 1.5,
         "runtime_prefill_copy_ms": 2.5,
         "runtime_prefill_sample_ms": 3.5,
+        "runtime_prefill_sample_select_ms": 1.6,
+        "runtime_prefill_sample_readback_ms": 1.7,
         "runtime_prefill_state_ms": 4.5,
+        "runtime_prefill_state_seq_ms": 1.8,
+        "runtime_prefill_state_store_ms": 1.9,
+        "runtime_prefill_state_create_ms": 2.0,
         "runtime_prefill_packed_flashinfer_calls": 3,
         "runtime_prefill_packed_flashinfer_ms": 4.0,
         "runtime_prefill_packed_flashinfer_saved_tokens": 5,
@@ -167,9 +172,29 @@ def _write_inference_bench_run(tmp_path) -> None:
             "prefix_graph:b8:s16:p45-45:src1:mixed0": 1.3,
             "prefix_graph:b4:s16:p45-45:src1:mixed0": 0.4,
         },
+        "runtime_prefill_shape_sample_select_ms": {
+            "prefix_graph:b8:s16:p45-45:src1:mixed0": 0.6,
+            "prefix_graph:b4:s16:p45-45:src1:mixed0": 0.1,
+        },
+        "runtime_prefill_shape_sample_readback_ms": {
+            "prefix_graph:b8:s16:p45-45:src1:mixed0": 0.7,
+            "prefix_graph:b4:s16:p45-45:src1:mixed0": 0.2,
+        },
         "runtime_prefill_shape_state_ms": {
             "prefix_graph:b8:s16:p45-45:src1:mixed0": 1.4,
             "prefix_graph:b4:s16:p45-45:src1:mixed0": 0.5,
+        },
+        "runtime_prefill_shape_state_seq_ms": {
+            "prefix_graph:b8:s16:p45-45:src1:mixed0": 0.8,
+            "prefix_graph:b4:s16:p45-45:src1:mixed0": 0.2,
+        },
+        "runtime_prefill_shape_state_store_ms": {
+            "prefix_graph:b8:s16:p45-45:src1:mixed0": 0.4,
+            "prefix_graph:b4:s16:p45-45:src1:mixed0": 0.2,
+        },
+        "runtime_prefill_shape_state_create_ms": {
+            "prefix_graph:b8:s16:p45-45:src1:mixed0": 0.2,
+            "prefix_graph:b4:s16:p45-45:src1:mixed0": 0.1,
         },
         "runtime_prefill_shape_active_requests": {
             "prefix_graph:b8:s16:p45-45:src1:mixed0": 3,
@@ -737,6 +762,11 @@ def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) ->
     assert "prefill_setup_ms" in text
     assert "prefill_copy_ms" in text
     assert "prefill_sample_ms" in text
+    assert "sample_select_ms" in text
+    assert "sample_readback_ms" in text
+    assert "state_seq_ms" in text
+    assert "state_store_ms" in text
+    assert "state_create_ms" in text
     assert "gpu_ms_call" in text
     assert "gpu_us_tok" in text
     assert "pad_call" in text

@@ -79,6 +79,8 @@ _QUEUE_PROFILE_FIELDS = (
     "runtime_prefill_setup_ms",
     "runtime_prefill_copy_ms",
     "runtime_prefill_sample_ms",
+    "runtime_prefill_sample_select_ms",
+    "runtime_prefill_sample_readback_ms",
     "runtime_prefill_state_ms",
     "runtime_prefill_state_seq_ms",
     "runtime_prefill_state_store_ms",
@@ -160,6 +162,8 @@ _QUEUE_PROFILE_FIELDS = (
     "runtime_prefill_shape_setup_ms",
     "runtime_prefill_shape_copy_ms",
     "runtime_prefill_shape_sample_ms",
+    "runtime_prefill_shape_sample_select_ms",
+    "runtime_prefill_shape_sample_readback_ms",
     "runtime_prefill_shape_state_ms",
     "runtime_prefill_shape_state_seq_ms",
     "runtime_prefill_shape_state_store_ms",
@@ -528,6 +532,8 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
             "prefill_setup_ms",
             "prefill_copy_ms",
             "prefill_sample_ms",
+            "sample_select_ms",
+            "sample_readback_ms",
             "prefill_state_ms",
             "state_seq_ms",
             "state_store_ms",
@@ -636,6 +642,8 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
                     _fmt_value(fields.get("runtime_prefill_setup_ms")),
                     _fmt_value(fields.get("runtime_prefill_copy_ms")),
                     _fmt_value(fields.get("runtime_prefill_sample_ms")),
+                    _fmt_value(fields.get("runtime_prefill_sample_select_ms")),
+                    _fmt_value(fields.get("runtime_prefill_sample_readback_ms")),
                     _fmt_value(fields.get("runtime_prefill_state_ms")),
                     _fmt_value(fields.get("runtime_prefill_state_seq_ms")),
                     _fmt_value(fields.get("runtime_prefill_state_store_ms")),
@@ -795,6 +803,8 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
                         "setup_ms",
                         "copy_ms",
                         "sample_ms",
+                        "sample_select_ms",
+                        "sample_readback_ms",
                         "state_ms",
                         "state_seq_ms",
                         "state_store_ms",
@@ -2368,6 +2378,12 @@ def _hot_prefill_shape_rows(
                     ),
                     _fmt_value(
                         _mapping_value(fields.get("runtime_prefill_shape_sample_ms"), shape)
+                    ),
+                    _fmt_value(
+                        _mapping_value(fields.get("runtime_prefill_shape_sample_select_ms"), shape)
+                    ),
+                    _fmt_value(
+                        _mapping_value(fields.get("runtime_prefill_shape_sample_readback_ms"), shape)
                     ),
                     _fmt_value(
                         _mapping_value(fields.get("runtime_prefill_shape_state_ms"), shape)

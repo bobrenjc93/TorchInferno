@@ -3622,10 +3622,16 @@ def test_continuous_batch_engine_uses_prefix_rows_for_graph_padding_when_active_
     ]
     assert sparse_prefills
     assert any(starts == [len(shared)] * len(rows) for rows, starts in sparse_prefills)
+    assert engine.stats.prefill_sample_ms >= 0.0
+    assert engine.stats.prefill_sample_select_ms >= 0.0
+    assert engine.stats.prefill_sample_readback_ms >= 0.0
     assert engine.stats.prefill_state_ms >= 0.0
     assert engine.stats.prefill_state_seq_ms >= 0.0
     assert engine.stats.prefill_state_store_ms >= 0.0
     assert engine.stats.prefill_state_create_ms >= 0.0
+    assert engine.stats.prefill_shape_sample_select_ms
+    assert set(engine.stats.prefill_shape_sample_select_ms) == set(engine.stats.prefill_shape_sample_ms)
+    assert set(engine.stats.prefill_shape_sample_readback_ms) == set(engine.stats.prefill_shape_sample_ms)
     assert engine.stats.prefill_shape_state_seq_ms
     assert set(engine.stats.prefill_shape_state_seq_ms) == set(engine.stats.prefill_shape_state_ms)
     assert set(engine.stats.prefill_shape_state_store_ms) == set(engine.stats.prefill_shape_state_ms)

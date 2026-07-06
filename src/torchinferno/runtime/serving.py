@@ -528,6 +528,8 @@ class ServingStats:
     prefill_graph_replay_gpu_ms: float = 0.0
     prefill_setup_ms: float = 0.0
     prefill_sample_ms: float = 0.0
+    prefill_sample_select_ms: float = 0.0
+    prefill_sample_readback_ms: float = 0.0
     prefill_state_ms: float = 0.0
     prefill_state_seq_ms: float = 0.0
     prefill_state_store_ms: float = 0.0
@@ -537,6 +539,8 @@ class ServingStats:
     prefill_shape_setup_ms: dict[str, float] = field(default_factory=dict)
     prefill_shape_forward_ms: dict[str, float] = field(default_factory=dict)
     prefill_shape_sample_ms: dict[str, float] = field(default_factory=dict)
+    prefill_shape_sample_select_ms: dict[str, float] = field(default_factory=dict)
+    prefill_shape_sample_readback_ms: dict[str, float] = field(default_factory=dict)
     prefill_shape_state_ms: dict[str, float] = field(default_factory=dict)
     prefill_shape_state_seq_ms: dict[str, float] = field(default_factory=dict)
     prefill_shape_state_store_ms: dict[str, float] = field(default_factory=dict)
@@ -3601,17 +3605,42 @@ class ContinuousBatchEngine:
             self.stats.prefill_prefix_reuse_batches += 1
             self.stats.prefill_padded_suffix_batches += 1
             sample_start_s = time.perf_counter() if self.profile_timings else 0.0
-            next_tokens = self._sample_logits_for_requests(
+            sample_select_start_s = time.perf_counter() if self.profile_timings else 0.0
+            next_token_tensor = self._sample_logits_for_requests(
                 logits[: len(output_group), -1, :],
                 [request for _original_index, request, _prefix_hit_tokens, _reusable in output_group],
-            ).detach().cpu().tolist()
+            ).detach()
+            sample_select_ms = (
+                (time.perf_counter() - sample_select_start_s) * 1000.0
+                if self.profile_timings
+                else 0.0
+            )
+            sample_readback_start_s = time.perf_counter() if self.profile_timings else 0.0
+            next_tokens = next_token_tensor.cpu().tolist()
+            sample_readback_ms = (
+                (time.perf_counter() - sample_readback_start_s) * 1000.0
+                if self.profile_timings
+                else 0.0
+            )
             if self.profile_timings:
                 sample_elapsed_ms = (time.perf_counter() - sample_start_s) * 1000.0
                 self.stats.prefill_sample_ms += sample_elapsed_ms
+                self.stats.prefill_sample_select_ms += sample_select_ms
+                self.stats.prefill_sample_readback_ms += sample_readback_ms
                 self._record_shape_time(
                     self.stats.prefill_shape_sample_ms,
                     shape_key,
                     sample_elapsed_ms,
+                )
+                self._record_shape_time(
+                    self.stats.prefill_shape_sample_select_ms,
+                    shape_key,
+                    sample_select_ms,
+                )
+                self._record_shape_time(
+                    self.stats.prefill_shape_sample_readback_ms,
+                    shape_key,
+                    sample_readback_ms,
                 )
             state_start_s = time.perf_counter() if self.profile_timings else 0.0
             state_seq_ms = 0.0
