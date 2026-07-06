@@ -7,6 +7,7 @@ from torchinferno.research.inference_bench import (
     _decode_graph_cache_counts,
     _decode_graph_symm_counts,
     _phase_target,
+    _prefill_shape_call_count,
     _prefill_shape_dense_forward_ms,
     format_inference_bench_summary,
     summarize_inference_bench_run,
@@ -500,6 +501,28 @@ def test_benchmark_filter_limits_queue_profile_tables(tmp_path) -> None:
     assert "tree_shape" in text
     assert "long_output_shape" not in text
     assert "96" not in text
+
+
+def test_prefill_shape_call_count_falls_back_to_graph_counts() -> None:
+    fields = {
+        "runtime_prefill_shape_graph_replay_counts": {"shape_a": 2},
+        "runtime_prefill_shape_graph_capture_counts": {"shape_a": 1, "shape_b": 3},
+    }
+
+    assert _prefill_shape_call_count(fields, "shape_a") == 2
+    assert _prefill_shape_call_count(fields, "shape_b") == 3
+
+    fields["runtime_prefill_shape_counts"] = {"shape_a": 4}
+    assert _prefill_shape_call_count(fields, "shape_a") == 4
+
+    assert _prefill_shape_call_count(
+        {
+            "runtime_prefill_shape_model_tokens": {
+                "prefix_graph:b8:s32:p45-56:src8:mixed1": 256,
+            },
+        },
+        "prefix_graph:b8:s32:p45-56:src8:mixed1",
+    ) == 1
 
 
 def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) -> None:

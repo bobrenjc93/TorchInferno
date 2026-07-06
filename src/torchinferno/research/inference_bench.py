@@ -2185,7 +2185,7 @@ def _hot_prefill_shape_rows(
                 (int, float),
             ) and isinstance(model_tokens, (int, float)):
                 padding_tokens = max(0, model_tokens - active_tokens)
-            calls = _mapping_value(fields.get("runtime_prefill_shape_counts"), shape)
+            calls = _prefill_shape_call_count(fields, shape)
             graph_gpu_ms = _mapping_value(
                 fields.get("runtime_prefill_shape_graph_replay_gpu_ms"),
                 shape,
@@ -2234,6 +2234,41 @@ def _hot_prefill_shape_rows(
                 )
             )
     return rows
+
+
+def _prefill_shape_call_count(fields: dict[str, Any], shape: str) -> float | int | None:
+    for field_name in (
+        "runtime_prefill_shape_counts",
+        "runtime_prefill_shape_graph_replay_counts",
+        "runtime_prefill_shape_graph_capture_counts",
+    ):
+        calls = _mapping_value(fields.get(field_name), shape)
+        if calls is not None:
+            return calls
+    model_tokens = _mapping_value(fields.get("runtime_prefill_shape_model_tokens"), shape)
+    per_call_tokens = _prefix_graph_model_tokens_per_call(shape)
+    if (
+        isinstance(model_tokens, (int, float))
+        and per_call_tokens is not None
+        and per_call_tokens > 0
+    ):
+        return _int_if_whole(float(model_tokens) / float(per_call_tokens))
+    return None
+
+
+def _prefix_graph_model_tokens_per_call(shape: str) -> int | None:
+    if not shape.startswith("prefix_graph:"):
+        return None
+    batch: int | None = None
+    suffix: int | None = None
+    for part in shape.split(":"):
+        if part.startswith("b") and part[1:].isdigit():
+            batch = int(part[1:])
+        elif part.startswith("s") and part[1:].isdigit():
+            suffix = int(part[1:])
+    if batch is None or suffix is None:
+        return None
+    return batch * suffix
 
 
 def _hot_prefill_packed_candidate_rows(

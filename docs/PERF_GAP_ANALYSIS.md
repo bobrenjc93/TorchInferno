@@ -264,6 +264,12 @@ It also prints top prefill/decode graph miss shapes. For the current local tree
 slice, the remaining sampled decode misses are concrete late static-logits
 shapes (`b2:s56`, `b3:s55`, `b2:s58`, and neighbors), which makes future warmup
 or path-selection probes easier to target without manually opening JSONL.
+The hot prefill-shape table also backfills call counts from graph replay/capture
+maps and, for prefix-graph rows, from model tokens divided by `batch * suffix`.
+That makes per-call padding and GPU costs visible on public profiles where
+`runtime_prefill_shape_counts` was missing; for example, public multi_turn now
+shows the `prefix_graph:b8:s32:p45-56:src8:mixed1` row as one call with `199`
+padded tokens instead of blank per-call columns.
 
 A direct static-logits warmup probe set
 `TORCHINFERNO_OPENAI_WARMUP_PROMPT_TOKENS=56` and wrote
