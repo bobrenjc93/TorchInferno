@@ -1,15 +1,37 @@
 # TorchInferno vs vLLM/sglang — Performance Gap Analysis (Llama-3.1-70B, 8xH100)
 
-## Public 20260706_010157 and decode host split
+## Public 20260706_030205 refresh
 
 The latest public run advanced to
+`results/v1/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100/runs/20260706_030205`
+at inference-bench `356bd0ff`. It measured TorchInferno `2f33f36`, vLLM
+`f2aaf59`, and SGLang `c016c6f`. TorchInferno improved to `3/20` by winning
+self_consistency (`108.0 / 0.0 / 115.1ms`, `8.7 tok/s`) but still lost
+few_shot (`178.9 / 45.3 / 217.5ms`), multi_turn
+(`246.3 / 60.0 / 303.3ms`), tree_of_thought
+(`77.5 / 63.5 / 110.9ms`), and long_output
+(`277.2 / 19.8 / 1000.1ms`). The current score-facing gaps are unchanged:
+long_output needs lower steady decode/readback cost, while tree and multi_turn
+need cheaper padded cached-prefix prefill plus lower TP replay cost.
+
+The public long_output queue profile was split across two TorchInferno server
+sessions (`537` and `463` submitted requests). Combined, those partial profiles
+showed about `4.29s` prefill forward, `10.06s` ragged decode GPU, `4.92s`
+decode-many GPU, `1.31s` decode-many CPU-copy, and `35.7K` prefill padding
+tokens. This run predates the new `decode_many_async_readback` marker, so that
+field renders as absent/`None`; the async-readback A/B below remains current
+local evidence and is not promoted.
+
+## Public 20260706_010157 and decode host split
+
+The previous public run advanced to
 `results/v1/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100/runs/20260706_010157`
 at inference-bench commit `2fbb9f18`. It still measured pre-current
 TorchInferno `46164b4` against vLLM `95a248f` and SGLang `8673e85`.
 TorchInferno remained `0/20`: few_shot `154.1 / 45.7 / 196.1ms`,
 self_consistency `160.2 / 0.0 / 167.8ms`, multi_turn
 `317.7 / 61.3 / 376.9ms`, tree_of_thought `79.4 / 64.1 / 114.6ms`, and
-long_output `262.5 / 19.6 / 934.2ms`. The largest latest gaps are still
+long_output `262.5 / 19.6 / 934.2ms`. The largest gaps in that run were still
 long_output TTFT/E2E (`+197.7/+291.2ms` versus the best other provider) and
 multi_turn TTFT/E2E (`+170.7/+188.1ms` versus vLLM), followed by tree
 TTFT/TPOT/E2E.
@@ -118,6 +140,23 @@ GPU+CPU. That rules out a tail-only
 readback fix for the median long_output gap: readback is spread across the
 main full/near-full decode-many body, so the needed change is genuine
 readback/decode pipelining or lower replay cost, not another stop-tail split.
+
+The direct pinned-host async readback A/B is rejected as a default. The first
+attempt on
+`/tmp/inference-bench-async-readback-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-async-readback/runs/20260706_034651`
+fell back to the old blocking copy because of a stream-cache naming collision
+and landed near control at `203.4 / 23.2 / 1038.3ms`. After fixing the stream
+cache and preallocating the pinned host scratch for the full burst, the real
+async run wrote
+`/tmp/inference-bench-async-readback-fixed-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-async-readback-fixed/runs/20260706_035723`
+and landed worse on median TTFT/throughput at `232.1 / 23.5 / 1046.1ms`,
+`1000/1000` correct. Queue profiles confirmed the opt-in path was active via
+`decode_many_async_readback=true`, but total decode-many CPU time did not drop
+(`1.29s` versus `1.24s` in the fallback run) and decode GPU rose (`4.68s`
+versus `4.48s`). Keep
+`TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY_ASYNC_READBACK` default-off as a
+diagnostic; a useful readback overlap needs less stream/copy interference or a
+different event-emission pipeline.
 
 ## Public 20260705_230202 and current HTTP split
 

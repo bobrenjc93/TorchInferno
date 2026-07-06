@@ -589,7 +589,8 @@ OpenAI serving also has explicit environment knobs for production-shape tuning:
   rows are still active. `TORCHINFERNO_OPENAI_RAGGED_DECODE_POWER2_BUCKETS=0`
   disables power-of-two row buckets for sustained ragged decode, and
   `TORCHINFERNO_OPENAI_RAGGED_DECODE_BUCKET_MIN_STEP` controls when those
-  buckets begin.
+  buckets begin. `TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY_ASYNC_READBACK=1`
+  opts decode-many bursts into CUDA pinned-host async token readback.
 - `TORCHINFERNO_OPENAI_PHASE_TIMINGS=1` records serving phase timings, and
   `TORCHINFERNO_OPENAI_PREFIX_CACHE_SHARED_SAMPLE=1` enables shared-prefix
   cache reuse for temperature sampling.

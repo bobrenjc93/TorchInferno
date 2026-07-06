@@ -897,6 +897,10 @@ class ContinuousBatchEngine:
             "TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY_SYNC_MODEL_TIMINGS",
             False,
         )
+        self.decode_many_async_readback = env_flag(
+            "TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY_ASYNC_READBACK",
+            False,
+        )
         self.unified_forward = bool(
             env_flag("TORCHINFERNO_CONTINUOUS_UNIFIED_FORWARD", False)
             and hasattr(model, "forward_step_flashinfer")
@@ -1335,6 +1339,8 @@ class ContinuousBatchEngine:
             tuple[list[_ActiveRequest], int, list[int], list[bool], str | None, int, str | None]
         ] = []
         token_scratch = self._ensure_decode_many_token_scratch(max_steps * max(1, self.max_active_requests))
+        if self._decode_many_async_readback_enabled():
+            self._ensure_decode_many_cpu_token_scratch(token_scratch.numel())
         token_offset = 0
         shape_parts: list[tuple[str, int, int]] = []
         steps_run = 0
@@ -1381,10 +1387,16 @@ class ContinuousBatchEngine:
                     self.stats.scheduler_steps += 1
                 step_states = list(active)
                 active_tokens = len(step_states)
-                token_scratch[token_offset : token_offset + active_tokens].copy_(
+                token_start = token_offset
+                token_scratch[token_start : token_start + active_tokens].copy_(
                     token_matrix[graph_step, :active_tokens]
                 )
                 token_offset += active_tokens
+                self._maybe_schedule_decode_many_readback(
+                    token_scratch[token_start:token_offset],
+                    token_start,
+                    token_offset,
+                )
                 shape_key: str | None = None
                 step_window_key: str | None = None
                 shape_model_tokens = graph_shape_model_tokens
@@ -1471,7 +1483,7 @@ class ContinuousBatchEngine:
         model_tokens = token_offset
         padded_model_tokens = sum(record[5] for record in records)
         cpu_tokens_start_s = time.perf_counter() if self.profile_timings else 0.0
-        flat_tokens = token_scratch[:token_offset].detach().cpu().tolist()
+        flat_tokens = self._decode_many_tokens_to_list(token_scratch, token_offset)
         if self.profile_timings:
             cpu_elapsed_ms = (time.perf_counter() - cpu_tokens_start_s) * 1000.0
             self.stats.decode_ragged_cpu_tokens_ms += cpu_elapsed_ms
@@ -5414,6 +5426,84 @@ class ContinuousBatchEngine:
             scratch = torch.empty(needed, dtype=torch.long, device=self.device)
             self._decode_many_token_scratch = scratch
         return scratch
+
+    def _decode_many_async_readback_enabled(self) -> bool:
+        return bool(
+            self.decode_many_async_readback
+            and self.device.type == "cuda"
+            and torch.cuda.is_available()
+        )
+
+    def _ensure_decode_many_cpu_token_scratch(self, tokens: int) -> Tensor | None:
+        needed = max(1, int(tokens))
+        scratch = getattr(self, "_decode_many_cpu_token_scratch", None)
+        if scratch is None or scratch.numel() < needed:
+            try:
+                scratch = torch.empty(needed, dtype=torch.long, device="cpu", pin_memory=True)
+            except Exception as exc:
+                warn_optional_failure("continuous.decode_many_async_readback", exc)
+                self.decode_many_async_readback = False
+                return None
+            self._decode_many_cpu_token_scratch = scratch
+        return scratch
+
+    def _decode_many_readback_stream(self) -> torch.cuda.Stream | None:
+        if not self._decode_many_async_readback_enabled():
+            return None
+        stream = getattr(self, "_decode_many_readback_cuda_stream", None)
+        if stream is None:
+            try:
+                stream = torch.cuda.Stream(device=self.device)
+            except Exception as exc:
+                warn_optional_failure("continuous.decode_many_async_readback_stream", exc)
+                self.decode_many_async_readback = False
+                return None
+            self._decode_many_readback_cuda_stream = stream
+        return stream
+
+    def _maybe_schedule_decode_many_readback(
+        self,
+        src: Tensor,
+        start: int,
+        end: int,
+    ) -> None:
+        if not self._decode_many_async_readback_enabled():
+            return
+        stream = self._decode_many_readback_stream()
+        if stream is None:
+            return
+        cpu_scratch = self._ensure_decode_many_cpu_token_scratch(end)
+        if cpu_scratch is None:
+            return
+        try:
+            stream.wait_stream(torch.cuda.current_stream(self.device))
+            with torch.cuda.stream(stream):
+                cpu_scratch[start:end].copy_(src.detach(), non_blocking=True)
+        except Exception as exc:
+            warn_optional_failure("continuous.decode_many_async_readback_copy", exc)
+            try:
+                stream.synchronize()
+            except Exception:
+                pass
+            self.decode_many_async_readback = False
+
+    def _decode_many_tokens_to_list(self, token_scratch: Tensor, token_count: int) -> list[int]:
+        stream = (
+            self._decode_many_readback_stream()
+            if self._decode_many_async_readback_enabled()
+            else None
+        )
+        cpu_scratch = getattr(self, "_decode_many_cpu_token_scratch", None)
+        if stream is not None and cpu_scratch is not None and cpu_scratch.numel() >= token_count:
+            stream.synchronize()
+            return cpu_scratch[:token_count].tolist()
+        stale_stream = getattr(self, "_decode_many_readback_cuda_stream", None)
+        if stale_stream is not None:
+            try:
+                stale_stream.synchronize()
+            except Exception:
+                pass
+        return token_scratch[:token_count].detach().cpu().tolist()
 
     def _device_index_tensor(self, values: tuple[int, ...]) -> Tensor:
         cached = self._device_index_tensors.get(values)

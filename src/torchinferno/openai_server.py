@@ -6406,6 +6406,12 @@ class OpenAICompletionEngine:
             value = getattr(runtime_engine, attr_name, None)
             if isinstance(value, int):
                 record[record_name] = value
+        for attr_name, record_name in (
+            ("decode_many_async_readback", "decode_many_async_readback"),
+        ):
+            value = getattr(runtime_engine, attr_name, None)
+            if isinstance(value, bool):
+                record[record_name] = value
         cache = getattr(runtime_engine, "_cache", None)
         if cache is not None:
             cache_max_seq_len, cache_rows = _generation_cache_shape_limits(cache)
