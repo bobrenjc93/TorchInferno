@@ -171,6 +171,13 @@ one noisy same-head control, not a robust public-style TPOT/E2E win. A better
 prefill fix still needs non-fragmenting packed cached-prefix prefill or a
 grouping policy that avoids tiny split fragments.
 
+Current head now records suffix-split candidate telemetry in TorchInferno queue
+profiles: accepted/rejected candidate counts, base versus split model-token
+totals, accepted saved tokens, fragment counts, rejection reasons, and compact
+candidate/fragment shape maps. This is stats-only and does not change the split
+default. It is meant to show which suffix-bucket fragments caused the TPOT-tail
+tradeoff above before any stricter grouping policy is promoted.
+
 The direct pinned-host async readback A/B is rejected as a default. The first
 attempt on
 `/tmp/inference-bench-async-readback-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-async-readback/runs/20260706_034651`

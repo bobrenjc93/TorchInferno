@@ -5,7 +5,7 @@ import time
 from collections import defaultdict
 from dataclasses import dataclass, field
 from inspect import signature
-from typing import Callable, Hashable, Iterator, Optional, Sequence
+from typing import Callable, Hashable, Iterator, Mapping, Optional, Sequence
 
 import torch
 from torch import Tensor
@@ -567,6 +567,22 @@ class ServingStats:
     prefill_packed_candidate_pattern_saved_tokens: dict[str, int] = field(default_factory=dict)
     prefill_packed_candidate_pattern_groups: dict[str, int] = field(default_factory=dict)
     prefill_packed_candidate_pattern_slot_counts: dict[str, int] = field(default_factory=dict)
+    prefill_suffix_split_candidate_calls: int = 0
+    prefill_suffix_split_accepted_calls: int = 0
+    prefill_suffix_split_rejected_calls: int = 0
+    prefill_suffix_split_base_model_tokens: int = 0
+    prefill_suffix_split_candidate_model_tokens: int = 0
+    prefill_suffix_split_candidate_saved_tokens: int = 0
+    prefill_suffix_split_accepted_base_model_tokens: int = 0
+    prefill_suffix_split_accepted_model_tokens: int = 0
+    prefill_suffix_split_accepted_saved_tokens: int = 0
+    prefill_suffix_split_accepted_fragments: int = 0
+    prefill_suffix_split_reject_reason_counts: dict[str, int] = field(default_factory=dict)
+    prefill_suffix_split_candidate_shape_counts: dict[str, int] = field(default_factory=dict)
+    prefill_suffix_split_candidate_shape_saved_tokens: dict[str, int] = field(default_factory=dict)
+    prefill_suffix_split_accepted_shape_counts: dict[str, int] = field(default_factory=dict)
+    prefill_suffix_split_accepted_shape_saved_tokens: dict[str, int] = field(default_factory=dict)
+    prefill_suffix_split_accepted_fragment_counts: dict[str, int] = field(default_factory=dict)
     decode_ragged_prepare_ms: float = 0.0
     decode_ragged_model_ms: float = 0.0
     decode_ragged_model_gpu_ms: float = 0.0
@@ -4364,6 +4380,77 @@ class ContinuousBatchEngine:
             False,
         )
 
+    def _record_prefix_prefill_suffix_split_candidate(
+        self,
+        *,
+        group_size: int,
+        base_bucket: int,
+        base_model_tokens: int,
+        split_model_tokens: int,
+        by_suffix_bucket: Mapping[int, Sequence[object]],
+        accepted: bool,
+        reject_reason: str | None = None,
+    ) -> None:
+        saved_tokens = max(0, int(base_model_tokens) - int(split_model_tokens))
+        self.stats.prefill_suffix_split_candidate_calls += 1
+        self.stats.prefill_suffix_split_base_model_tokens += int(base_model_tokens)
+        self.stats.prefill_suffix_split_candidate_model_tokens += int(split_model_tokens)
+        self.stats.prefill_suffix_split_candidate_saved_tokens += saved_tokens
+        shape_key = self._prefix_prefill_suffix_split_shape_key(
+            group_size=group_size,
+            base_bucket=base_bucket,
+            by_suffix_bucket=by_suffix_bucket,
+        )
+        self._record_shape_count(
+            self.stats.prefill_suffix_split_candidate_shape_counts,
+            shape_key,
+        )
+        self._record_shape_total(
+            self.stats.prefill_suffix_split_candidate_shape_saved_tokens,
+            shape_key,
+            saved_tokens,
+        )
+        if accepted:
+            self.stats.prefill_suffix_split_accepted_calls += 1
+            self.stats.prefill_suffix_split_accepted_base_model_tokens += int(base_model_tokens)
+            self.stats.prefill_suffix_split_accepted_model_tokens += int(split_model_tokens)
+            self.stats.prefill_suffix_split_accepted_saved_tokens += saved_tokens
+            self.stats.prefill_suffix_split_accepted_fragments += len(by_suffix_bucket)
+            self._record_shape_count(
+                self.stats.prefill_suffix_split_accepted_shape_counts,
+                shape_key,
+            )
+            self._record_shape_total(
+                self.stats.prefill_suffix_split_accepted_shape_saved_tokens,
+                shape_key,
+                saved_tokens,
+            )
+            for suffix_bucket, items in by_suffix_bucket.items():
+                self._record_shape_count(
+                    self.stats.prefill_suffix_split_accepted_fragment_counts,
+                    f"b{len(items)}:s{int(suffix_bucket)}",
+                )
+            return
+
+        self.stats.prefill_suffix_split_rejected_calls += 1
+        reason = str(reject_reason or "unknown")
+        self.stats.prefill_suffix_split_reject_reason_counts[reason] = (
+            self.stats.prefill_suffix_split_reject_reason_counts.get(reason, 0) + 1
+        )
+
+    @staticmethod
+    def _prefix_prefill_suffix_split_shape_key(
+        *,
+        group_size: int,
+        base_bucket: int,
+        by_suffix_bucket: Mapping[int, Sequence[object]],
+    ) -> str:
+        parts = [
+            f"b{len(items)}:s{int(suffix_bucket)}"
+            for suffix_bucket, items in sorted(by_suffix_bucket.items())
+        ]
+        return f"base_b{int(group_size)}:s{int(base_bucket)}->" + "+".join(parts)
+
     def _prefix_prefill_suffix_bucket_split_groups(
         self,
         group: list[tuple[int, ServingRequest, int, _ReusablePrefix]],
@@ -4382,6 +4469,15 @@ class ContinuousBatchEngine:
             for suffix_bucket, items in by_suffix_bucket.items()
         )
         if split_model_tokens >= base_model_tokens:
+            self._record_prefix_prefill_suffix_split_candidate(
+                group_size=len(group),
+                base_bucket=base_bucket,
+                base_model_tokens=base_model_tokens,
+                split_model_tokens=split_model_tokens,
+                by_suffix_bucket=by_suffix_bucket,
+                accepted=False,
+                reject_reason="no_savings",
+            )
             return None
         min_savings_pct = env_int(
             "TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SPLIT_SUFFIX_BUCKETS_MIN_SAVINGS_PCT",
@@ -4391,6 +4487,15 @@ class ContinuousBatchEngine:
         if min_savings_pct > 0 and (
             (base_model_tokens - split_model_tokens) * 100 < base_model_tokens * min_savings_pct
         ):
+            self._record_prefix_prefill_suffix_split_candidate(
+                group_size=len(group),
+                base_bucket=base_bucket,
+                base_model_tokens=base_model_tokens,
+                split_model_tokens=split_model_tokens,
+                by_suffix_bucket=by_suffix_bucket,
+                accepted=False,
+                reject_reason="min_savings",
+            )
             return None
         default_min_group_size = 1
         if (
@@ -4411,11 +4516,37 @@ class ContinuousBatchEngine:
         )
         for items in by_suffix_bucket.values():
             if len(items) < min_group_size:
+                self._record_prefix_prefill_suffix_split_candidate(
+                    group_size=len(group),
+                    base_bucket=base_bucket,
+                    base_model_tokens=base_model_tokens,
+                    split_model_tokens=split_model_tokens,
+                    by_suffix_bucket=by_suffix_bucket,
+                    accepted=False,
+                    reject_reason="min_group",
+                )
                 return None
             if min_fill_pct > 0 and (
                 len(items) * 100 < self._prefill_batch_bucket(len(items)) * min_fill_pct
             ):
+                self._record_prefix_prefill_suffix_split_candidate(
+                    group_size=len(group),
+                    base_bucket=base_bucket,
+                    base_model_tokens=base_model_tokens,
+                    split_model_tokens=split_model_tokens,
+                    by_suffix_bucket=by_suffix_bucket,
+                    accepted=False,
+                    reject_reason="min_fill",
+                )
                 return None
+        self._record_prefix_prefill_suffix_split_candidate(
+            group_size=len(group),
+            base_bucket=base_bucket,
+            base_model_tokens=base_model_tokens,
+            split_model_tokens=split_model_tokens,
+            by_suffix_bucket=by_suffix_bucket,
+            accepted=True,
+        )
         return list(by_suffix_bucket.values())
 
     def _prefill_exact_prefix_batch(

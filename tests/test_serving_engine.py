@@ -3809,6 +3809,7 @@ def test_continuous_batch_engine_opt_in_suffix_bucket_split_rejects_singletons(
         temperature=0.0,
         max_generation_tokens=128,
         graph_prefill=True,
+        profile_timings=True,
     )
     group = [
         (index, ServingRequest(str(index), tuple(range(16 + suffix_len)), 1), 16, object())
@@ -3820,12 +3821,26 @@ def test_continuous_batch_engine_opt_in_suffix_bucket_split_rejects_singletons(
     ]
 
     assert engine._prefix_prefill_suffix_bucket_split_groups(group, suffix_lengths) is None
+    assert engine.stats.prefill_suffix_split_candidate_calls == 1
+    assert engine.stats.prefill_suffix_split_rejected_calls == 1
+    assert engine.stats.prefill_suffix_split_reject_reason_counts == {"min_group": 1}
+    assert engine.stats.prefill_suffix_split_candidate_saved_tokens == 16
 
     monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SPLIT_SUFFIX_BUCKETS_MIN_GROUP", "1")
     split_groups = engine._prefix_prefill_suffix_bucket_split_groups(group, suffix_lengths)
 
     assert split_groups is not None
     assert [len(items) for items in split_groups] == [2, 1]
+    assert engine.stats.prefill_suffix_split_candidate_calls == 2
+    assert engine.stats.prefill_suffix_split_accepted_calls == 1
+    assert engine.stats.prefill_suffix_split_rejected_calls == 1
+    assert engine.stats.prefill_suffix_split_candidate_saved_tokens == 32
+    assert engine.stats.prefill_suffix_split_accepted_saved_tokens == 16
+    assert engine.stats.prefill_suffix_split_accepted_fragments == 2
+    assert engine.stats.prefill_suffix_split_accepted_fragment_counts == {
+        "b2:s4": 1,
+        "b1:s8": 1,
+    }
 
 
 def test_continuous_batch_engine_suffix_bucket_split_default_scope(monkeypatch) -> None:

@@ -14416,6 +14416,34 @@ def test_openai_queue_profile_records_runtime_engine_stats(
             "prefix_graph:b8:s16:p45-45:src1:mixed0|p45:s10/p45:s11#p45:s10": 2,
             "prefix_graph:b8:s16:p45-45:src1:mixed0|p45:s10/p45:s11#p45:s11": 1,
         }
+        prefill_suffix_split_candidate_calls = 4
+        prefill_suffix_split_accepted_calls = 2
+        prefill_suffix_split_rejected_calls = 2
+        prefill_suffix_split_base_model_tokens = 128
+        prefill_suffix_split_candidate_model_tokens = 80
+        prefill_suffix_split_candidate_saved_tokens = 48
+        prefill_suffix_split_accepted_base_model_tokens = 64
+        prefill_suffix_split_accepted_model_tokens = 40
+        prefill_suffix_split_accepted_saved_tokens = 24
+        prefill_suffix_split_accepted_fragments = 5
+        prefill_suffix_split_reject_reason_counts = {"min_group": 1, "min_fill": 1}
+        prefill_suffix_split_candidate_shape_counts = {
+            "base_b8:s16->b4:s8+b4:s16": 3,
+        }
+        prefill_suffix_split_candidate_shape_saved_tokens = {
+            "base_b8:s16->b4:s8+b4:s16": 36,
+        }
+        prefill_suffix_split_accepted_shape_counts = {
+            "base_b8:s16->b4:s8+b4:s16": 2,
+        }
+        prefill_suffix_split_accepted_shape_saved_tokens = {
+            "base_b8:s16->b4:s8+b4:s16": 24,
+        }
+        prefill_suffix_split_accepted_fragment_counts = {
+            "b4:s8": 2,
+            "b4:s16": 2,
+            "b1:s16": 1,
+        }
         prefill_graph_captures = 1
         prefill_graph_replays = 2
         prefill_graph_capture_ms = 9.5
@@ -14877,6 +14905,37 @@ def test_openai_queue_profile_records_runtime_engine_stats(
             "runtime_prefill_packed_candidate_pattern_slot_counts": {
                 "prefix_graph:b8:s16:p45-45:src1:mixed0|p45:s10/p45:s11#p45:s10": 2,
                 "prefix_graph:b8:s16:p45-45:src1:mixed0|p45:s10/p45:s11#p45:s11": 1,
+            },
+            "runtime_prefill_suffix_split_candidate_calls": 4,
+            "runtime_prefill_suffix_split_accepted_calls": 2,
+            "runtime_prefill_suffix_split_rejected_calls": 2,
+            "runtime_prefill_suffix_split_base_model_tokens": 128,
+            "runtime_prefill_suffix_split_candidate_model_tokens": 80,
+            "runtime_prefill_suffix_split_candidate_saved_tokens": 48,
+            "runtime_prefill_suffix_split_accepted_base_model_tokens": 64,
+            "runtime_prefill_suffix_split_accepted_model_tokens": 40,
+            "runtime_prefill_suffix_split_accepted_saved_tokens": 24,
+            "runtime_prefill_suffix_split_accepted_fragments": 5,
+            "runtime_prefill_suffix_split_reject_reason_counts": {
+                "min_fill": 1,
+                "min_group": 1,
+            },
+            "runtime_prefill_suffix_split_candidate_shape_counts": {
+                "base_b8:s16->b4:s8+b4:s16": 3,
+            },
+            "runtime_prefill_suffix_split_candidate_shape_saved_tokens": {
+                "base_b8:s16->b4:s8+b4:s16": 36,
+            },
+            "runtime_prefill_suffix_split_accepted_shape_counts": {
+                "base_b8:s16->b4:s8+b4:s16": 2,
+            },
+            "runtime_prefill_suffix_split_accepted_shape_saved_tokens": {
+                "base_b8:s16->b4:s8+b4:s16": 24,
+            },
+            "runtime_prefill_suffix_split_accepted_fragment_counts": {
+                "b4:s16": 2,
+                "b4:s8": 2,
+                "b1:s16": 1,
             },
             "runtime_prefill_shape_graph_capture_ms": {
                 "prefix_graph:b8:s16:p45-45:src1:mixed0": 8.75,
