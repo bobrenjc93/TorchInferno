@@ -198,6 +198,20 @@ batches (`2946.4` tokens/batch) with `100%` decode graph coverage, while
 TorchInferno's long_output profile still uses `109` decode-many calls and `436`
 single-step decode-many steps. This keeps the contrast focused on real decode
 batching/replay structure rather than the already-rejected tiny-tail policies.
+The queue table now also includes `decode_many_graph_ms`, which clarifies the
+rejected TorchInferno multi-step graph path. A focused long_output profile with
+`TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY_GRAPH=1` and
+`TORCHINFERNO_PROFILE_RAGGED_DECODE_MANY_REPLAY_ONCE=1` wrote
+`/tmp/inference-bench-long-manygraph-prof-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-long-manygraph-prof-f48d307/runs/20260706_093552`
+and landed at `219.9 / 23.5 / 1142.5ms`, `1000/1000` correct, after `231s`
+server readiness. The graph path fired (`38` graph calls, `202` graph steps,
+`12.9K` graph model tokens) but spent `7.80s` in `decode_many_graph_ms`, with
+`b64/64` alone at `7.28s`. The one profiled `batch=64,steps=8,cache1024` replay
+spent `99.1ms` self CUDA, led by dense GEMM/NVJET (`27.1ms`), gate-up Marlin
+(`26.7ms`), multimem all-reduce (`15.4ms`), GQA decode attention (`12.4ms`),
+and splitK GEMM reduction (`8.2ms`). That is roughly `12.4ms` per generated
+step, matching the single-step replay profile; the current multi-step graph does
+not amortize the model body and remains an opt-in diagnostic.
 The packed-prefix target tables now also print `est_share`, the estimated saved
 prefill-forward time divided by total profiled prefill forward. On public
 few_shot, the hot `prefix_graph:b32:s16:p122-122:src1:mixed0` candidate is
