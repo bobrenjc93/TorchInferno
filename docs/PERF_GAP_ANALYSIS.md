@@ -96,6 +96,17 @@ total Gumbel sampling rose to `634.2ms` from `554.5ms`. Keep the two-reduce
 Gumbel sampler until there is a fused or backend-native value/token reduction,
 not a tensor all-gather of the local maxima.
 
+In-place perturbed-logit reuse is rejected as well. The probe reused the Gumbel
+scratch tensor for `logits + noise` before the local max, avoiding the explicit
+temporary in the current `torch.max(logits_float + gumbel, dim=-1)` expression.
+The same-host run
+(`/tmp/inference-bench-gumbel-add-results/.../20260706_131819`) regressed to
+`131.0 / 68.0 / 193.9ms`, `0.960` correctness. The max phase was slightly lower
+(`193.9ms` versus `205.6ms`), but cumulative noise time rose to `243.9ms` and
+total Gumbel sampling rose to `639.7ms`; prefill sample selection also rose to
+`367.6ms`. Keep the scratch buffer limited to noise generation until a fused
+perturb-and-reduce path proves a score-facing win.
+
 ## Public 20260706_090220 refresh and queue segment merge fix
 
 The prior public run advanced to
