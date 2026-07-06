@@ -229,6 +229,18 @@ to `static_token=1,static_logits=15`, and profiled decode GPU fell from
 closed tree gap; tree still needs faster prefix prefill and a real sampled
 decode path.
 
+A focused multi_turn warmup probe added the two public miss shapes
+(`8:32:128` and `2:16:256`) to
+`TORCHINFERNO_OPENAI_WARMUP_ONLINE_MIXED_PREFIX_SUFFIX_SPECS`. The run
+`/tmp/inference-bench-multiturn-warm-miss-shapes-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-multiturn-warm-miss-shapes-92335d4/runs/20260706_082439`
+kept startup at `226s` and eliminated prefill graph misses, but request latency
+regressed to `288.2 / 59.6 / 380.3ms`, `982/1000` correct. Queue profile
+counters moved in the wrong user-visible direction even though prefill forward
+fell (`2.46s`): `q2first=170ms`, `q2submit=100ms`, and
+`prefill_sample_ms=100ms`. Do not add these warmup specs by default; the
+multi_turn gap is dominated by padded mixed-prefix prefill and queue formation,
+not these few request-path captures.
+
 ## Public 20260706_030205 refresh
 
 The latest public run advanced to
