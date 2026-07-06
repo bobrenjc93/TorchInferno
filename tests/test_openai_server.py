@@ -14620,6 +14620,24 @@ def test_openai_queue_profile_records_runtime_engine_stats(
         _ragged_prefill_logits_graph_evicted_entries = 128
         _ragged_prefill_logits_graph_max_entries = 64
 
+        def temperature_sample_profile_summary(self) -> dict[str, float | int]:
+            return {
+                "temperature_sample_calls": 3,
+                "temperature_sample_rows": 17,
+                "temperature_sample_total_ms": 4.5,
+                "temperature_sample_max_ms": 0.5,
+                "temperature_sample_weights_ms": 1.0,
+                "temperature_sample_rank_ms": 1.25,
+                "temperature_sample_cdf_ms": 1.5,
+                "temperature_sample_reduce_ms": 0.25,
+                "temperature_sample_gumbel_calls": 2,
+                "temperature_sample_gumbel_rows": 9,
+                "temperature_sample_gumbel_ms": 2.75,
+                "temperature_sample_gumbel_noise_ms": 1.1,
+                "temperature_sample_gumbel_max_ms": 1.2,
+                "temperature_sample_gumbel_reduce_ms": 0.45,
+            }
+
     class RuntimeEngine:
         stats = Stats()
         model = Model()
@@ -14961,6 +14979,20 @@ def test_openai_queue_profile_records_runtime_engine_stats(
                 "prefix_graph:b8:s16:p45-45:src1:mixed0": 5,
             },
             "runtime_prefill_tokens": 17,
+            "runtime_temperature_sample_calls": 3,
+            "runtime_temperature_sample_rows": 17,
+            "runtime_temperature_sample_total_ms": 4.5,
+            "runtime_temperature_sample_max_ms": 0.5,
+            "runtime_temperature_sample_weights_ms": 1.0,
+            "runtime_temperature_sample_rank_ms": 1.25,
+            "runtime_temperature_sample_cdf_ms": 1.5,
+            "runtime_temperature_sample_reduce_ms": 0.25,
+            "runtime_temperature_sample_gumbel_calls": 2,
+            "runtime_temperature_sample_gumbel_rows": 9,
+            "runtime_temperature_sample_gumbel_ms": 2.75,
+            "runtime_temperature_sample_gumbel_noise_ms": 1.1,
+            "runtime_temperature_sample_gumbel_max_ms": 1.2,
+            "runtime_temperature_sample_gumbel_reduce_ms": 0.45,
             "runtime_decode_shape_counts": {"ragged:b8/8": 5},
             "runtime_decode_shape_model_ms": {"ragged:b8/8": 11.0},
             "runtime_decode_shape_gpu_ms": {"ragged:b8/8": 10.5},

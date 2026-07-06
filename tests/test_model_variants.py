@@ -685,6 +685,7 @@ def test_llama3_tensor_parallel_runtime_marlin_int4_decode_updates_layers() -> N
 def test_llama3_tensor_parallel_temperature_sampling_uses_gumbel_max(monkeypatch) -> None:
     import torch.distributed as dist
 
+    monkeypatch.setenv("TORCHINFERNO_TEMPERATURE_SAMPLE_PROFILE", "1")
     calls: list[object] = []
 
     def all_reduce(tensor: torch.Tensor, *, op: object) -> None:
@@ -709,9 +710,22 @@ def test_llama3_tensor_parallel_temperature_sampling_uses_gumbel_max(monkeypatch
     logits = torch.tensor([[1000.0, -1000.0, -1000.0, -1000.0], [-1000.0, 1000.0, -1000.0, -1000.0]])
 
     sampled = model._sample_next_token(logits, temperature=0.7)
+    summary = model.temperature_sample_profile_summary()
 
     assert sampled.tolist() == [0, 1]
     assert calls == [dist.ReduceOp.MAX, dist.ReduceOp.MIN]
+    assert summary["temperature_sample_calls"] == 1
+    assert summary["temperature_sample_rows"] == 2
+    assert summary["temperature_sample_gumbel_calls"] == 1
+    assert summary["temperature_sample_gumbel_rows"] == 2
+    for name in (
+        "temperature_sample_total_ms",
+        "temperature_sample_gumbel_ms",
+        "temperature_sample_gumbel_noise_ms",
+        "temperature_sample_gumbel_max_ms",
+        "temperature_sample_gumbel_reduce_ms",
+    ):
+        assert summary[name] >= 0.0
 
 
 def test_llama3_tensor_parallel_temperature_sampling_combines_broadcast(monkeypatch) -> None:
@@ -754,6 +768,51 @@ def test_llama3_tensor_parallel_temperature_sampling_combines_broadcast(monkeypa
         ("broadcast", (2, 2)),
         ("all_reduce", dist.ReduceOp.SUM),
     ]
+
+
+def test_llama3_tensor_parallel_temperature_sampling_profiles_phases(monkeypatch) -> None:
+    import torch.distributed as dist
+
+    monkeypatch.setenv("TORCHINFERNO_TEMPERATURE_SAMPLE_PROFILE", "1")
+
+    def all_reduce(tensor: torch.Tensor, *, op: object) -> None:
+        del tensor, op
+
+    def all_gather_into_tensor(output: torch.Tensor, input_tensor: torch.Tensor) -> None:
+        output[0].copy_(input_tensor)
+
+    def broadcast(tensor: torch.Tensor, *, src: int) -> None:
+        del tensor, src
+
+    monkeypatch.setattr(dist, "is_available", lambda: True)
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(dist, "all_reduce", all_reduce)
+    monkeypatch.setattr(dist, "all_gather_into_tensor", all_gather_into_tensor)
+    monkeypatch.setattr(dist, "broadcast", broadcast)
+
+    model = object.__new__(Llama3TensorParallelForCausalLM)
+    model.world_size = 1
+    model.rank = 0
+    model.device = torch.device("cpu")
+    model.vocab_start = 0
+    model.local_vocab_size = 4
+    logits = torch.tensor([[1000.0, -1000.0, -1000.0, -1000.0], [-1000.0, 1000.0, -1000.0, -1000.0]])
+
+    sampled = model._sample_next_token_temperature(logits, temperature=0.7)
+    summary = model.temperature_sample_profile_summary()
+
+    assert sampled.tolist() == [0, 1]
+    assert summary["temperature_sample_calls"] == 1
+    assert summary["temperature_sample_rows"] == 2
+    for name in (
+        "temperature_sample_total_ms",
+        "temperature_sample_max_ms",
+        "temperature_sample_weights_ms",
+        "temperature_sample_rank_ms",
+        "temperature_sample_cdf_ms",
+        "temperature_sample_reduce_ms",
+    ):
+        assert summary[name] >= 0.0
 
 
 def test_llama3_tensor_parallel_repeated_temperature_sampling_combines_broadcast(monkeypatch) -> None:

@@ -3080,6 +3080,11 @@ class Llama3TensorParallelForCausalLM:
         self._ragged_prefill_mixed_logits_graph_failed = False
         self._ragged_prefill_capture_on_miss_failed = False
         self._temperature_gumbel_generators: dict[str, torch.Generator] = {}
+        self._temperature_sample_profile_ms: dict[str, float] = {}
+        self._temperature_sample_profile_calls = 0
+        self._temperature_sample_profile_rows = 0
+        self._temperature_sample_gumbel_profile_calls = 0
+        self._temperature_sample_gumbel_profile_rows = 0
 
     def set_runtime_fp8_prefill(self, enabled: bool, *, min_m: int = 2048) -> None:
         min_m = max(1, int(min_m))
@@ -3346,6 +3351,119 @@ class Llama3TensorParallelForCausalLM:
             "seconds": dict(sorted(self.profile_seconds.items())),
             "counts": dict(sorted(self.profile_counts.items())),
         }
+
+    def _temperature_sample_profile_enabled(self) -> bool:
+        cached = getattr(self, "_temperature_sample_profile_enabled_cached", None)
+        if isinstance(cached, bool):
+            return cached
+        if _tp_env_set("TORCHINFERNO_TEMPERATURE_SAMPLE_PROFILE"):
+            enabled = _tp_flag("TORCHINFERNO_TEMPERATURE_SAMPLE_PROFILE", False)
+        else:
+            enabled = bool(
+                os.environ.get("TORCHINFERNO_OPENAI_QUEUE_PROFILE_JSONL")
+                or os.environ.get("TORCHINFERNO_OPENAI_QUEUE_PROFILE")
+            )
+        self._temperature_sample_profile_enabled_cached = enabled
+        return enabled
+
+    def _record_temperature_sample_profile(
+        self,
+        *,
+        rows: int,
+        total_ms: float,
+        max_ms: float,
+        weights_ms: float,
+        rank_ms: float,
+        cdf_ms: float,
+        reduce_ms: float,
+    ) -> None:
+        totals = getattr(self, "_temperature_sample_profile_ms", None)
+        if not isinstance(totals, dict):
+            totals = {}
+            self._temperature_sample_profile_ms = totals
+        for name, value in (
+            ("total", total_ms),
+            ("max", max_ms),
+            ("weights", weights_ms),
+            ("rank", rank_ms),
+            ("cdf", cdf_ms),
+            ("reduce", reduce_ms),
+        ):
+            totals[name] = float(totals.get(name, 0.0)) + float(value)
+        self._temperature_sample_profile_calls = int(
+            getattr(self, "_temperature_sample_profile_calls", 0)
+        ) + 1
+        self._temperature_sample_profile_rows = int(
+            getattr(self, "_temperature_sample_profile_rows", 0)
+        ) + max(0, int(rows))
+
+    def _record_temperature_sample_gumbel_profile(
+        self,
+        *,
+        rows: int,
+        total_ms: float,
+        noise_ms: float,
+        max_ms: float,
+        reduce_ms: float,
+    ) -> None:
+        totals = getattr(self, "_temperature_sample_profile_ms", None)
+        if not isinstance(totals, dict):
+            totals = {}
+            self._temperature_sample_profile_ms = totals
+        for name, value in (
+            ("total", total_ms),
+            ("gumbel_total", total_ms),
+            ("gumbel_noise", noise_ms),
+            ("gumbel_max", max_ms),
+            ("gumbel_reduce", reduce_ms),
+        ):
+            totals[name] = float(totals.get(name, 0.0)) + float(value)
+        self._temperature_sample_profile_calls = int(
+            getattr(self, "_temperature_sample_profile_calls", 0)
+        ) + 1
+        self._temperature_sample_profile_rows = int(
+            getattr(self, "_temperature_sample_profile_rows", 0)
+        ) + max(0, int(rows))
+        self._temperature_sample_gumbel_profile_calls = int(
+            getattr(self, "_temperature_sample_gumbel_profile_calls", 0)
+        ) + 1
+        self._temperature_sample_gumbel_profile_rows = int(
+            getattr(self, "_temperature_sample_gumbel_profile_rows", 0)
+        ) + max(0, int(rows))
+
+    def temperature_sample_profile_summary(self) -> dict[str, float | int]:
+        calls = int(getattr(self, "_temperature_sample_profile_calls", 0))
+        if calls <= 0:
+            return {}
+        totals = getattr(self, "_temperature_sample_profile_ms", None)
+        if not isinstance(totals, dict):
+            totals = {}
+        rows = int(getattr(self, "_temperature_sample_profile_rows", 0))
+        summary: dict[str, float | int] = {
+            "temperature_sample_calls": calls,
+            "temperature_sample_rows": rows,
+        }
+        for name in ("total", "max", "weights", "rank", "cdf", "reduce"):
+            summary[f"temperature_sample_{name}_ms"] = float(totals.get(name, 0.0))
+        gumbel_calls = int(getattr(self, "_temperature_sample_gumbel_profile_calls", 0))
+        if gumbel_calls > 0:
+            summary["temperature_sample_gumbel_calls"] = gumbel_calls
+            summary["temperature_sample_gumbel_rows"] = int(
+                getattr(self, "_temperature_sample_gumbel_profile_rows", 0)
+            )
+            summary["temperature_sample_gumbel_ms"] = float(
+                totals.get("gumbel_total", 0.0)
+            )
+            summary["temperature_sample_gumbel_noise_ms"] = float(
+                totals.get("gumbel_noise", 0.0)
+            )
+            summary["temperature_sample_gumbel_max_ms"] = float(
+                totals.get("gumbel_max", 0.0)
+            )
+            summary["temperature_sample_gumbel_reduce_ms"] = float(
+                totals.get("gumbel_reduce", 0.0)
+            )
+        return summary
 
     def allocate_cache(
         self,
@@ -7377,17 +7495,33 @@ class Llama3TensorParallelForCausalLM:
         return next_token
 
     def _sample_next_token_temperature_gumbel(self, logits: Tensor, temperature: float) -> Tensor:
+        profile_sample = self._temperature_sample_profile_enabled()
+        total_start_s = time.perf_counter() if profile_sample else 0.0
+        phase_start_s = total_start_s
         logits_float = logits.float() / temperature
         gumbel = -torch.empty_like(logits_float).exponential_(
             generator=self._temperature_gumbel_generator(logits.device)
         ).log()
+        noise_ms = (time.perf_counter() - phase_start_s) * 1000.0 if profile_sample else 0.0
+        phase_start_s = time.perf_counter() if profile_sample else 0.0
         local_values, local_indices = torch.max(logits_float + gumbel, dim=-1)
         global_values = local_values.clone()
         dist.all_reduce(global_values, op=dist.ReduceOp.MAX)
+        max_ms = (time.perf_counter() - phase_start_s) * 1000.0 if profile_sample else 0.0
         sentinel = torch.full_like(local_indices, self.config.vocab_size)
         local_tokens = local_indices + self.vocab_start
         next_token = torch.where(local_values == global_values, local_tokens, sentinel)
+        phase_start_s = time.perf_counter() if profile_sample else 0.0
         dist.all_reduce(next_token, op=dist.ReduceOp.MIN)
+        if profile_sample:
+            reduce_ms = (time.perf_counter() - phase_start_s) * 1000.0
+            self._record_temperature_sample_gumbel_profile(
+                rows=int(logits.size(0)),
+                total_ms=(time.perf_counter() - total_start_s) * 1000.0,
+                noise_ms=noise_ms,
+                max_ms=max_ms,
+                reduce_ms=reduce_ms,
+            )
         return next_token
 
     def _temperature_gumbel_generator(self, device: torch.device) -> torch.Generator:
@@ -7406,12 +7540,19 @@ class Llama3TensorParallelForCausalLM:
         return generator
 
     def _sample_next_token_temperature(self, logits: Tensor, temperature: float) -> Tensor:
+        profile_sample = self._temperature_sample_profile_enabled()
+        total_start_s = time.perf_counter() if profile_sample else 0.0
+        phase_start_s = total_start_s
         logits_float = logits.float() / temperature
         local_max = torch.max(logits_float, dim=-1).values
         global_max = local_max.clone()
         dist.all_reduce(global_max, op=dist.ReduceOp.MAX)
+        max_ms = (time.perf_counter() - phase_start_s) * 1000.0 if profile_sample else 0.0
+        phase_start_s = time.perf_counter() if profile_sample else 0.0
         weights = torch.exp(logits_float - global_max[:, None])
         local_sum = weights.sum(dim=-1)
+        weights_ms = (time.perf_counter() - phase_start_s) * 1000.0 if profile_sample else 0.0
+        phase_start_s = time.perf_counter() if profile_sample else 0.0
         gathered_sums = torch.empty(
             (self.world_size, *local_sum.shape),
             dtype=local_sum.dtype,
@@ -7434,7 +7575,9 @@ class Llama3TensorParallelForCausalLM:
         dist.broadcast(sample_payload, src=0)
         selected_rank = sample_payload[0].to(torch.long)
         local_threshold = sample_payload[1]
+        rank_ms = (time.perf_counter() - phase_start_s) * 1000.0 if profile_sample else 0.0
 
+        phase_start_s = time.perf_counter() if profile_sample else 0.0
         cumulative_local = torch.cumsum(weights, dim=-1)
         local_threshold = torch.minimum(local_threshold, cumulative_local[:, -1])
         local_index = torch.searchsorted(cumulative_local.contiguous(), local_threshold[:, None]).squeeze(-1)
@@ -7445,7 +7588,20 @@ class Llama3TensorParallelForCausalLM:
             local_index + self.vocab_start,
             torch.zeros_like(local_index),
         )
+        cdf_ms = (time.perf_counter() - phase_start_s) * 1000.0 if profile_sample else 0.0
+        phase_start_s = time.perf_counter() if profile_sample else 0.0
         dist.all_reduce(local_token, op=dist.ReduceOp.SUM)
+        if profile_sample:
+            reduce_ms = (time.perf_counter() - phase_start_s) * 1000.0
+            self._record_temperature_sample_profile(
+                rows=int(logits.size(0)),
+                total_ms=(time.perf_counter() - total_start_s) * 1000.0,
+                max_ms=max_ms,
+                weights_ms=weights_ms,
+                rank_ms=rank_ms,
+                cdf_ms=cdf_ms,
+                reduce_ms=reduce_ms,
+            )
         return local_token
 
     def _sample_next_token_temperature_repeated(

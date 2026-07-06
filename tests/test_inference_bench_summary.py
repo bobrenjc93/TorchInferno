@@ -116,6 +116,20 @@ def _write_inference_bench_run(tmp_path) -> None:
         "runtime_prefill_sample_ms": 3.5,
         "runtime_prefill_sample_select_ms": 1.6,
         "runtime_prefill_sample_readback_ms": 1.7,
+        "runtime_temperature_sample_calls": 2,
+        "runtime_temperature_sample_rows": 16,
+        "runtime_temperature_sample_total_ms": 1.4,
+        "runtime_temperature_sample_max_ms": 0.2,
+        "runtime_temperature_sample_weights_ms": 0.3,
+        "runtime_temperature_sample_rank_ms": 0.4,
+        "runtime_temperature_sample_cdf_ms": 0.35,
+        "runtime_temperature_sample_reduce_ms": 0.15,
+        "runtime_temperature_sample_gumbel_calls": 1,
+        "runtime_temperature_sample_gumbel_rows": 8,
+        "runtime_temperature_sample_gumbel_ms": 0.9,
+        "runtime_temperature_sample_gumbel_noise_ms": 0.25,
+        "runtime_temperature_sample_gumbel_max_ms": 0.45,
+        "runtime_temperature_sample_gumbel_reduce_ms": 0.2,
         "runtime_prefill_state_ms": 4.5,
         "runtime_prefill_state_seq_ms": 1.8,
         "runtime_prefill_state_store_ms": 1.9,
@@ -764,6 +778,11 @@ def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) ->
     assert "prefill_sample_ms" in text
     assert "sample_select_ms" in text
     assert "sample_readback_ms" in text
+    assert "tp_samp_ms" in text
+    assert "tp_g_noise" in text
+    assert "tp_g_reduce" in text
+    assert "tp_samp_cdf" in text
+    assert "tp_samp_reduce" in text
     assert "state_seq_ms" in text
     assert "state_store_ms" in text
     assert "state_create_ms" in text

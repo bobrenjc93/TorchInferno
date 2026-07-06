@@ -6551,6 +6551,17 @@ class OpenAICompletionEngine:
             value = getattr(model, attr_name, None)
             if isinstance(value, int):
                 record[record_name] = value
+        sample_profile_summary = getattr(model, "temperature_sample_profile_summary", None)
+        if callable(sample_profile_summary):
+            try:
+                sample_profile = sample_profile_summary()
+            except Exception as exc:
+                warn_optional_failure("openai.queue_profile.temperature_sample_profile", exc)
+                sample_profile = None
+            if isinstance(sample_profile, Mapping):
+                for name, value in sample_profile.items():
+                    if isinstance(value, (int, float)) and not isinstance(value, bool):
+                        record[f"runtime_{name}"] = value
 
         def _positive_shape_token_deltas(
             model_tokens_name: str,

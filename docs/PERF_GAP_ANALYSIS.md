@@ -35,16 +35,21 @@ A current local tree baseline on pushed `818c201`
 `128.0 / 64.3 / 186.3ms`, `0.967` correctness. Its final queue profile spent
 `458.5ms` in prefill sample, split as `445.6ms` distributed sampler selection
 and `12.7ms` host readback; sampled static-token misses were mostly gone
-(`static_logits=18,static_token=1`). Two same-host sampler probes were rejected:
-the Gumbel sampler
-(`/tmp/inference-bench-main-818c201-tree-gumbel-results/.../20260706_120936`)
-regressed to `147.9 / 70.1 / 213.3ms` despite reducing profiled sample-select
-time to `373.8ms`, and a selected-row CDF prototype
-(`/tmp/inference-bench-selected-cdf-results/.../20260706_121835`) regressed to
-`137.3 / 69.0 / 202.0ms` with worse final `prefill_sample_select_ms=488.7`.
-Keep the sampler target open, but do not reintroduce Gumbel or selected-row CDF
-as defaults without a new correctness-preserving profile that moves end-to-end
-tree latency.
+(`static_logits=18,static_token=1`). A later Gumbel-profile run with the new TP
+sampler counters
+(`/tmp/inference-bench-gumbel-profile-results/.../20260706_123750`) landed at
+`144.2 / 66.7 / 207.5ms`, `0.967` correctness. Its prefill sample bucket was
+`326.0ms` (`314.2ms` selection, `11.6ms` readback), while cumulative
+temperature sampling across prefill plus sampled decode recorded `419` Gumbel
+calls over `2599` rows and `578.2ms` total: `221.6ms` Gumbel noise generation,
+`174.8ms` local/global max selection, and `82.6ms` final token reduction.
+This confirms the default sampled path is already Gumbel; the earlier
+`TORCHINFERNO_TEMPERATURE_SAMPLE_GUMBEL=1` run was a noisy same-path rerun, not
+an alternate sampler. The selected-row CDF prototype
+(`/tmp/inference-bench-selected-cdf-results/.../20260706_121835`) did not
+exercise the default sampled-tree path and should not guide defaults. Keep the
+sampler target open around the active Gumbel phases, especially noise
+generation and the two distributed reductions.
 
 ## Public 20260706_090220 refresh and queue segment merge fix
 
