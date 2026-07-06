@@ -434,6 +434,74 @@ def test_queue_profile_merges_restart_segments(tmp_path) -> None:
     assert "5/5 2seg" in text
 
 
+def test_benchmark_filter_limits_queue_profile_tables(tmp_path) -> None:
+    results = {
+        "model": "meta-llama/test",
+        "tensor_parallel_size": 8,
+        "hardware": "8xH100",
+        "providers": {
+            "torchinferno": {
+                "benchmarks": {
+                    "long_output": {
+                        "metrics": {
+                            "num_requests": 1,
+                            "ttft_median_ms": 20.0,
+                        }
+                    },
+                    "tree_of_thought": {
+                        "metrics": {
+                            "num_requests": 1,
+                            "ttft_median_ms": 30.0,
+                        }
+                    },
+                }
+            }
+        },
+    }
+    (tmp_path / "results.json").write_text(json.dumps(results))
+    logs = tmp_path / "provider_logs"
+    logs.mkdir()
+    records = [
+        {
+            "event": "online_batcher_quiescent",
+            "temperature": 0.0,
+            "run_max_tokens": 96,
+            "submitted_requests": 1,
+            "runtime_prefill_shape_counts": {
+                "long_output_shape": 1,
+            },
+            "runtime_prefill_shape_forward_ms": {
+                "long_output_shape": 10.0,
+            },
+        },
+        {
+            "event": "online_batcher_quiescent",
+            "temperature": 0.7,
+            "run_max_tokens": 300,
+            "submitted_requests": 1,
+            "runtime_prefill_shape_counts": {
+                "tree_shape": 1,
+            },
+            "runtime_prefill_shape_forward_ms": {
+                "tree_shape": 20.0,
+            },
+        },
+    ]
+    (logs / "torchinferno_queue_profile.jsonl").write_text(
+        "\n".join(json.dumps(record) for record in records) + "\n"
+    )
+
+    summary = summarize_inference_bench_run(tmp_path, benchmarks=["tree_of_thought"])
+    text = format_inference_bench_summary(summary)
+
+    assert "[tree_of_thought]" in text
+    assert "0.7" in text
+    assert "300" in text
+    assert "tree_shape" in text
+    assert "long_output_shape" not in text
+    assert "96" not in text
+
+
 def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) -> None:
     _write_inference_bench_run(tmp_path)
 

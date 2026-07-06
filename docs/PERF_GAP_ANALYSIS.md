@@ -241,6 +241,26 @@ fell (`2.46s`): `q2first=170ms`, `q2submit=100ms`, and
 multi_turn gap is dominated by padded mixed-prefix prefill and queue formation,
 not these few request-path captures.
 
+A local current-head provider slice on `f7f3d38` rechecked tree_of_thought using
+the existing vLLM/SGLang environments:
+`/tmp/inference-bench-current-tree-providers-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-current-tree-providers-f7f3d38/runs/20260706_083559`.
+TorchInferno landed at `132.6 / 66.0 / 188.0ms`, `960/992` correct; vLLM landed
+at `39.3 / 27.2 / 58.1ms`, `964/992` correct; SGLang landed at
+`39.8 / 103.4 / 109.9ms`, `964/992` correct but with very poor p99. The
+TorchInferno profile stayed miss-free on prefill and reduced decode misses to
+`static_logits=21`, but still spent `3.12s` prefill forward, `3.76s` prefill
+wall, `363ms` sampling first tokens, `8.5K` prefill padding tokens, and `2.73s`
+ragged decode GPU. This confirms the static-token cleanup improved profile
+clarity without closing the tree gap; the next defaultable runtime work still has
+to reduce prefix-prefill body cost or sampled ragged/static decode cost.
+
+The analyzer now applies `--benchmark` selection to queue-profile-derived tables
+instead of only to provider metric rows. Public multi-benchmark runs carry one
+TorchInferno queue snapshot per benchmark policy key, so a tree-only render should
+show the `0.7/300` profile and hide unrelated `0.0/96`, `0.0/256`, and
+`0.0/512` profile rows. If a custom run has no matching built-in key, the
+formatter falls back to all profiles so diagnostics are not accidentally hidden.
+
 ## Public 20260706_030205 refresh
 
 The latest public run advanced to

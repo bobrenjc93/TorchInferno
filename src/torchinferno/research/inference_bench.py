@@ -443,7 +443,8 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
             )
         lines.append("")
 
-    if summary.torchinferno_queue_profiles:
+    queue_profiles = _queue_profiles_for_selected_benchmarks(summary)
+    if queue_profiles:
         score_target_rows = _torchinferno_score_target_rows(summary)
         if score_target_rows:
             lines.append("[torchinferno score targets]")
@@ -571,7 +572,7 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
             "overgen",
         )
         body = []
-        for profile in summary.torchinferno_queue_profiles:
+        for profile in queue_profiles:
             fields = profile.fields
             expected_requests = _expected_requests_for_queue_profile(summary, profile)
             _prefill_active_tokens, prefill_model_tokens, prefill_padding_tokens = (
@@ -690,7 +691,7 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
         lines.extend(_format_table(header, body))
         lines.append("")
 
-        prefill_rows = _hot_prefill_shape_rows(summary.torchinferno_queue_profiles)
+        prefill_rows = _hot_prefill_shape_rows(queue_profiles)
         if prefill_rows:
             lines.append("[torchinferno hot prefill shapes]")
             lines.extend(
@@ -723,7 +724,7 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
             )
             lines.append("")
 
-        packed_candidate_rows = _hot_prefill_packed_candidate_rows(summary.torchinferno_queue_profiles)
+        packed_candidate_rows = _hot_prefill_packed_candidate_rows(queue_profiles)
         if packed_candidate_rows:
             lines.append("[torchinferno packed prefill candidates]")
             lines.extend(
@@ -743,7 +744,7 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
             lines.append("")
 
         packed_per_batch_rows = _prefill_packed_per_batch_target_rows(
-            summary.torchinferno_queue_profiles
+            queue_profiles
         )
         if packed_per_batch_rows:
             lines.append("[torchinferno packed prefill per-batch targets]")
@@ -769,7 +770,7 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
             )
             lines.append("")
 
-        packed_signature_rows = _hot_prefill_packed_signature_rows(summary.torchinferno_queue_profiles)
+        packed_signature_rows = _hot_prefill_packed_signature_rows(queue_profiles)
         if packed_signature_rows:
             lines.append("[torchinferno packed prefill signatures]")
             lines.extend(
@@ -789,7 +790,7 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
             )
             lines.append("")
 
-        packed_pattern_rows = _hot_prefill_packed_pattern_rows(summary.torchinferno_queue_profiles)
+        packed_pattern_rows = _hot_prefill_packed_pattern_rows(queue_profiles)
         if packed_pattern_rows:
             lines.append("[torchinferno packed prefill patterns]")
             lines.extend(
@@ -811,7 +812,7 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
             lines.append("")
 
         packed_fixed_capacity_rows = _prefill_packed_fixed_capacity_plan_rows(
-            summary.torchinferno_queue_profiles
+            queue_profiles
         )
         if packed_fixed_capacity_rows:
             lines.append("[torchinferno packed prefill fixed-capacity plans]")
@@ -839,7 +840,7 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
             lines.append("")
 
         packed_target_rows = _prefill_packed_implementation_target_rows(
-            summary.torchinferno_queue_profiles
+            queue_profiles
         )
         if packed_target_rows:
             lines.append("[torchinferno packed prefill implementation targets]")
@@ -863,7 +864,7 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
             lines.append("")
 
         packed_signature_reuse_rows = _prefill_packed_signature_reuse_rows(
-            summary.torchinferno_queue_profiles
+            queue_profiles
         )
         if packed_signature_reuse_rows:
             lines.append("[torchinferno packed prefill signature reuse]")
@@ -886,7 +887,7 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
             lines.append("")
 
         packed_pattern_reuse_rows = _prefill_packed_key_reuse_rows(
-            summary.torchinferno_queue_profiles,
+            queue_profiles,
             kind="pattern",
         )
         if packed_pattern_reuse_rows:
@@ -909,7 +910,7 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
             )
             lines.append("")
 
-        prefill_graph_rows = _hot_prefill_graph_shape_rows(summary.torchinferno_queue_profiles)
+        prefill_graph_rows = _hot_prefill_graph_shape_rows(queue_profiles)
         if prefill_graph_rows:
             lines.append("[torchinferno hot prefill graph shapes]")
             lines.extend(
@@ -930,7 +931,7 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
             )
             lines.append("")
 
-        decode_rows = _hot_decode_shape_rows(summary.torchinferno_queue_profiles)
+        decode_rows = _hot_decode_shape_rows(queue_profiles)
         if decode_rows:
             lines.append("[torchinferno hot decode shapes]")
             lines.extend(
@@ -955,7 +956,7 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
             )
             lines.append("")
 
-        decode_window_rows = _decode_many_step_window_rows(summary.torchinferno_queue_profiles)
+        decode_window_rows = _decode_many_step_window_rows(queue_profiles)
         if decode_window_rows:
             lines.append("[torchinferno decode-many step windows]")
             lines.extend(
@@ -979,7 +980,7 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
             lines.append("")
 
         decode_window_target_rows = _decode_many_step_window_target_rows(
-            summary.torchinferno_queue_profiles
+            queue_profiles
         )
         if decode_window_target_rows:
             lines.append("[torchinferno decode-many implementation targets]")
@@ -1180,6 +1181,25 @@ def _expected_requests_for_queue_profile(
     for percentile in row.request_percentiles.values():
         return percentile.count
     return None
+
+
+def _queue_profiles_for_selected_benchmarks(
+    summary: InferenceBenchRunSummary,
+) -> tuple[QueueProfileSummary, ...]:
+    profiles = summary.torchinferno_queue_profiles
+    expected_keys = {
+        _BENCHMARK_QUEUE_PROFILE_KEYS[benchmark]
+        for benchmark in summary.benchmarks
+        if benchmark in _BENCHMARK_QUEUE_PROFILE_KEYS
+    }
+    if not expected_keys:
+        return profiles
+    selected = tuple(
+        profile
+        for profile in profiles
+        if (profile.temperature, profile.max_tokens) in expected_keys
+    )
+    return selected or profiles
 
 
 def _fmt_queue_profile_coverage(
