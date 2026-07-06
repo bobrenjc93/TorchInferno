@@ -4246,6 +4246,42 @@ def test_continuous_batch_engine_exact_prompt_uses_repeated_sampler() -> None:
     assert not engine.has_online_work()
 
 
+def test_reusable_prefix_sampler_records_select_timing() -> None:
+    model = _SelectedLogitsToyModel()
+    repeated_calls: list[tuple[int, float]] = []
+
+    def sample_repeated_next_token(
+        logits: torch.Tensor,
+        batch_size: int,
+        temperature: float,
+    ) -> torch.Tensor:
+        repeated_calls.append((int(batch_size), float(temperature)))
+        token = torch.argmax(logits, dim=-1)
+        return token.expand(batch_size).contiguous()
+
+    model.sample_repeated_next_token = sample_repeated_next_token  # type: ignore[attr-defined]
+    engine = ContinuousBatchEngine(
+        model,
+        device=torch.device("cpu"),
+        temperature=0.7,
+        profile_timings=True,
+    )
+    reusable = _ReusablePrefix(
+        route_id=("test",),
+        tokens=(1, 2, 3),
+        row=0,
+        logits=torch.tensor([[[0.0, 3.0, 1.0]]]),
+    )
+
+    sampled = engine._sample_reusable_prefix_next_tokens(reusable, 4)
+
+    assert sampled.tolist() == [1, 1, 1, 1]
+    assert repeated_calls == [(4, 0.7)]
+    assert engine.stats.prefill_sample_ms >= engine.stats.prefill_sample_select_ms
+    assert engine.stats.prefill_sample_select_ms >= 0.0
+    assert engine.stats.prefill_sample_readback_ms == 0.0
+
+
 def test_continuous_batch_engine_exact_prompt_reuses_prepared_sample_state() -> None:
     prompt = tuple(range(1, 18))
     model = _SelectedLogitsToyModel()

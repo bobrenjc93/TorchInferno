@@ -4892,6 +4892,7 @@ class ContinuousBatchEngine:
         if reusable.logits is None:
             raise RuntimeError("exact-prefix sampling requires cached logits")
         sample_start_s = time.perf_counter() if self.profile_timings else 0.0
+        sample_select_ms = 0.0
         try:
             logits = reusable.logits
             sampling_temperature = float(self.temperature if temperature is None else temperature)
@@ -4913,15 +4914,23 @@ class ContinuousBatchEngine:
                         if sampled is not None:
                             self.stats.repeated_sample_state_hits += 1
                             self.stats.repeated_sample_state_tokens += int(batch_size)
-                            return sampled.to(self.device)
-            return self._sample_repeated_logits(
+                            result = sampled.to(self.device)
+                            if self.profile_timings:
+                                sample_select_ms = (time.perf_counter() - sample_start_s) * 1000.0
+                            return result
+            result = self._sample_repeated_logits(
                 logits[:, -1, :].to(self.device),
                 batch_size,
                 temperature=sampling_temperature,
             )
+            if self.profile_timings:
+                sample_select_ms = (time.perf_counter() - sample_start_s) * 1000.0
+            return result
         finally:
             if self.profile_timings:
-                self.stats.prefill_sample_ms += (time.perf_counter() - sample_start_s) * 1000.0
+                sample_elapsed_ms = (time.perf_counter() - sample_start_s) * 1000.0
+                self.stats.prefill_sample_ms += sample_elapsed_ms
+                self.stats.prefill_sample_select_ms += sample_select_ms
 
     def _sample_repeated_logits(
         self,
