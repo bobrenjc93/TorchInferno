@@ -14,12 +14,14 @@ long_output TTFT/E2E (`+197.7/+291.2ms` versus the best other provider) and
 multi_turn TTFT/E2E (`+170.7/+188.1ms` versus vLLM), followed by tree
 TTFT/TPOT/E2E.
 
-The analyzer now carries decode host overhead and total prefill padding in the
-queue-profile and score-target tables. Re-rendering the latest public run shows
+The analyzer now carries decode host overhead and prefill padding split into row
+padding and suffix padding in the queue-profile and score-target tables.
+Re-rendering the latest public run shows
 long_output's logged partial queue profile (`547/1000` requests) spent `5.36s`
 in ragged decode GPU, `897ms` copying decode tokens to CPU, `890ms` of that
 inside decode-many, and `20ms` in decode state updates; it also spent `20.1K`
-cached-prefix prefill tokens on padding (`44.5%`). The hottest
+cached-prefix prefill tokens on padding (`44.5%`), split as `6.0K` row padding
+and `14.2K` suffix padding. The hottest
 `decode_many:b64/64` shape spent `1.54s` GPU and `257ms` CPU-copy. That makes
 q8 drain readback visible as a material cost, but not enough to explain the
 whole gap or reopen the rejected side-stream copy shim. The defaultable
@@ -31,11 +33,15 @@ The analyzer also now prints per-batch packed-prefill targets that do not requir
 repeatable exact signatures. On the same public run, the largest target is
 tree_of_thought's `prefix_graph:b4:s16:p45-45:src1:mixed0` shape: `126` calls,
 `3.64K` saved tokens (`45.2%`), and an estimated `1.22s` prefill-forward saving
-for a true per-batch packed body. The long_output one-shot targets are the
-`b32:s96`, `b16:s96`, and `b32:s64` `p111` shapes, each saving `38-56%` of its
-prefill model tokens, but they still lack fixed-pattern reuse. That confirms the
-first packed-prefill implementation should support arbitrary per-batch suffix
-lengths, not only fixed-capacity repeating slots.
+for a true per-batch packed body. Across the score-facing rows, suffix padding
+dominates total padding for long_output (`14.2K/20.1K`), multi_turn
+(`3.3K/4.4K`), and tree (`5.5K/9.5K`), so the first packed-prefill body needs to
+remove per-row suffix waste as well as any batch-row waste. The long_output
+one-shot targets are the `b32:s96`, `b16:s96`, and `b32:s64` `p111` shapes,
+each saving `38-56%` of its prefill model tokens, but they still lack
+fixed-pattern reuse. That confirms the first packed-prefill implementation
+should support arbitrary per-batch suffix lengths, not only fixed-capacity
+repeating slots.
 
 A full current-head TorchInferno-only long_output profile on `30a1872` wrote
 `/tmp/inference-bench-ti-30a-long-profile-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100/runs/20260706_020656`

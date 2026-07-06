@@ -429,6 +429,8 @@ def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) ->
     assert "37.5%" in text
     assert "wall_ms" in text
     assert "sample_ms" in text
+    assert "prefill_row_pad" in text
+    assert "prefill_sfx_pad" in text
     assert "prefill_miss" in text
     assert "decode_miss" in text
     assert "decode_graph_cache" in text

@@ -424,6 +424,8 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
                         "submit2first",
                         "prefill_ms",
                         "prefill_pad",
+                        "prefill_row_pad",
+                        "prefill_sfx_pad",
                         "prefill_pad_pct",
                         "decode_ms",
                         "decode_many_ms",
@@ -478,6 +480,8 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
             "prefill_sample_ms",
             "prefill_state_ms",
             "prefill_pad",
+            "prefill_row_pad",
+            "prefill_sfx_pad",
             "prefill_pad_pct",
             "packed_fi_calls",
             "packed_fi_ms",
@@ -523,6 +527,9 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
             _prefill_active_tokens, prefill_model_tokens, prefill_padding_tokens = (
                 _prefill_token_totals(fields)
             )
+            prefill_row_padding_tokens, prefill_suffix_padding_tokens = (
+                _prefill_padding_split_totals(fields)
+            )
             body.append(
                 (
                     _fmt_value(profile.temperature),
@@ -561,6 +568,16 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
                         None
                         if prefill_padding_tokens is None
                         else _int_if_whole(prefill_padding_tokens)
+                    ),
+                    _fmt_value(
+                        None
+                        if prefill_row_padding_tokens is None
+                        else _int_if_whole(prefill_row_padding_tokens)
+                    ),
+                    _fmt_value(
+                        None
+                        if prefill_suffix_padding_tokens is None
+                        else _int_if_whole(prefill_suffix_padding_tokens)
                     ),
                     _fmt_pct(prefill_padding_tokens or 0.0, prefill_model_tokens or 0.0),
                     _fmt_value(fields.get("runtime_prefill_packed_flashinfer_calls")),
@@ -1454,6 +1471,9 @@ def _torchinferno_score_target_rows(
         _prefill_active_tokens, prefill_model_tokens, prefill_padding_tokens = (
             _prefill_token_totals(fields)
         )
+        prefill_row_padding_tokens, prefill_suffix_padding_tokens = (
+            _prefill_padding_split_totals(fields)
+        )
         decode_ms = _numeric_field(fields, "runtime_decode_ragged_model_gpu_ms")
         decode_many_ms = _numeric_field(fields, "runtime_decode_many_model_gpu_ms")
         decode_cpu_ms = _numeric_field(fields, "runtime_decode_ragged_cpu_tokens_ms")
@@ -1503,6 +1523,16 @@ def _torchinferno_score_target_rows(
                     None
                     if prefill_padding_tokens is None
                     else _int_if_whole(prefill_padding_tokens)
+                ),
+                _fmt_value(
+                    None
+                    if prefill_row_padding_tokens is None
+                    else _int_if_whole(prefill_row_padding_tokens)
+                ),
+                _fmt_value(
+                    None
+                    if prefill_suffix_padding_tokens is None
+                    else _int_if_whole(prefill_suffix_padding_tokens)
                 ),
                 _fmt_pct(prefill_padding_tokens or 0.0, prefill_model_tokens or 0.0),
                 _fmt_value(decode_ms),
@@ -1595,6 +1625,20 @@ def _prefill_token_totals(fields: dict[str, Any]) -> tuple[float | None, float |
     if padding_tokens is None and active_tokens is not None and model_tokens is not None:
         padding_tokens = max(0.0, model_tokens - active_tokens)
     return active_tokens, model_tokens, padding_tokens
+
+
+def _prefill_padding_split_totals(fields: dict[str, Any]) -> tuple[float | None, float | None]:
+    row_padding = _numeric_field(fields, "runtime_prefill_row_padding_tokens")
+    suffix_padding = _numeric_field(fields, "runtime_prefill_suffix_padding_tokens")
+    if row_padding is None:
+        row_padding = _sum_numeric_mapping(
+            fields.get("runtime_prefill_shape_row_padding_tokens")
+        )
+    if suffix_padding is None:
+        suffix_padding = _sum_numeric_mapping(
+            fields.get("runtime_prefill_shape_suffix_padding_tokens")
+        )
+    return row_padding, suffix_padding
 
 
 def _decode_graph_symm_counts(fields: dict[str, Any]) -> dict[str, float | int]:
