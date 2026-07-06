@@ -425,6 +425,9 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
                         "prefill_ms",
                         "decode_ms",
                         "decode_many_ms",
+                        "decode_cpu_ms",
+                        "decode_many_cpu_ms",
+                        "decode_many_calls",
                         "prefill_miss",
                         "decode_miss",
                         "gen_store",
@@ -1413,6 +1416,8 @@ def _torchinferno_score_target_rows(
         prefill_ms = _numeric_field(fields, "runtime_prefill_forward_ms")
         decode_ms = _numeric_field(fields, "runtime_decode_ragged_model_gpu_ms")
         decode_many_ms = _numeric_field(fields, "runtime_decode_many_model_gpu_ms")
+        decode_cpu_ms = _numeric_field(fields, "runtime_decode_ragged_cpu_tokens_ms")
+        decode_many_cpu_ms = _numeric_field(fields, "runtime_decode_many_cpu_tokens_ms")
         if decode_many_ms is None:
             decode_many_ms = _sum_numeric_mapping(
                 fields.get("runtime_decode_many_shape_gpu_ms")
@@ -1456,6 +1461,9 @@ def _torchinferno_score_target_rows(
                 _fmt_value(prefill_ms),
                 _fmt_value(decode_ms),
                 _fmt_value(decode_many_ms),
+                _fmt_value(decode_cpu_ms),
+                _fmt_value(decode_many_cpu_ms),
+                _fmt_value(fields.get("runtime_decode_many_calls")),
                 _fmt_value(fields.get("runtime_prefill_graph_misses")),
                 _fmt_value(fields.get("runtime_decode_graph_misses")),
                 _fmt_value(fields.get("runtime_generated_prefix_store_requests")),
