@@ -1,5 +1,50 @@
 # TorchInferno vs vLLM/sglang — Performance Gap Analysis (Llama-3.1-70B, 8xH100)
 
+## Public 20260706_050221 refresh and prefill GPU timing split
+
+The latest public run advanced to
+`results/v1/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100/runs/20260706_050221`
+at inference-bench `069f519c`. It measured TorchInferno `fa12aa1`, vLLM
+`6971582`, and SGLang `6f22790`; the public runner has not yet picked up
+`a2a126e`. TorchInferno scored `4/20`: it won self_consistency
+(`98.9 / 0.0 / 105.8ms`, `9.5 tok/s`) but still trailed vLLM on few_shot
+(`165.3 / 45.1 / 203.4ms` vs `125.7 / 41.2 / 156.7ms`), multi_turn
+(`228.8 / 58.5 / 280.7ms` vs `155.1 / 50.6 / 199.9ms`), tree_of_thought
+(`80.2 / 64.6 / 114.1ms` vs `33.0 / 21.7 / 48.7ms`), and long_output
+(`267.8 / 20.6 / 990.0ms` vs `78.2 / 14.7 / 600.2ms`).
+
+The public long_output queue profile still reports `decode_many_graph_calls=0`,
+so the default path remains a decode-many scheduler around single-step ragged
+decode graph replays. The two long-output TorchInferno sessions spent about
+`4.19s` in prefill forward, `4.73s` prefill wall, `4.94s` decode-many GPU,
+`1.31s` decode-many CPU-copy, and `38.6K` prefill padding tokens. This keeps
+the same target split: dense cached-prefix prefill padding on TTFT/E2E and
+single-step decode replay plus token readback on TPOT/E2E.
+
+Two local long_output profiles on `a2a126e` refine the prefill evidence. A
+context-filtered `p111+s64` replay probe did not print because the one-shot hook
+missed the filtered replay, but the queue profile showed warmed, miss-free
+hot shapes: `b16:s64:p111` (`20` calls, `1.30s` forward), `b24:s64:p111`
+(`14` calls, `1.22s`), and `b16:s96:p111` (`12` calls, `1.03s`), with `33.4K`
+prefill padding and `4.30s` decode-many GPU. A broad replay probe did fire on
+the first small `b1:s16:ctx-64` graph. Even at that size, the CUDA profile was
+dominated by TP all-reduce (`3.39ms`), QKV GEMM (`3.38ms`), Marlin gate-up
+(`1.82ms`), index/index-select kernels (`1.95ms` combined), and split-K GEMM
+(`0.98ms`) out of `17.17ms` self CUDA. That does not justify toggling Marlin or
+symm-memory off; it points back to a lower-overhead packed cached-prefix prefill
+body and less fragmented decode/readback work.
+
+Queue telemetry now records CUDA-event GPU time for ragged prefill graph
+capture/replay separately from CPU submission time. New fields include
+`runtime_prefill_graph_capture_gpu_ms`,
+`runtime_prefill_graph_replay_gpu_ms`,
+`runtime_prefill_shape_graph_replay_gpu_ms`, and graph-shape GPU maps. This
+matters because the old `runtime_prefill_graph_replay_ms` measured only the
+Python/CUDA-graph submission window (`~100-200ms` in long_output), while
+`runtime_prefill_shape_forward_ms` synchronized and included the actual GPU
+completion (`~4-5s`). Future public profiles should use the new GPU fields when
+ranking prefill graph-body work.
+
 ## Public 20260706_030205 refresh
 
 The latest public run advanced to

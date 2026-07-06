@@ -6395,6 +6395,16 @@ class OpenAICompletionEngine:
     ) -> None:
         if not self._queue_profile_path_value():
             return
+        for flush_name in (
+            "_flush_prefill_graph_gpu_timers",
+            "_flush_decode_ragged_model_gpu_timers",
+        ):
+            flush = getattr(runtime_engine, flush_name, None)
+            if callable(flush):
+                try:
+                    flush()
+                except Exception as exc:
+                    warn_optional_failure(f"openai.queue_profile.{flush_name}", exc)
         stats = getattr(runtime_engine, "stats", None)
         force_shape_details = bool(fields.pop("profile_include_shape_details", False))
         record: dict[str, object] = {"event": event, **fields}
@@ -6748,6 +6758,8 @@ class OpenAICompletionEngine:
             "prefill_forward_ms",
             "prefill_graph_capture_ms",
             "prefill_graph_replay_ms",
+            "prefill_graph_capture_gpu_ms",
+            "prefill_graph_replay_gpu_ms",
             "prefill_setup_ms",
             "prefill_sample_ms",
             "prefill_state_ms",
@@ -6966,9 +6978,13 @@ class OpenAICompletionEngine:
                 "prefill_shape_state_ms",
                 "prefill_shape_graph_capture_ms",
                 "prefill_shape_graph_replay_ms",
+                "prefill_shape_graph_capture_gpu_ms",
+                "prefill_shape_graph_replay_gpu_ms",
                 "prefill_packed_eager_shape_ms",
                 "prefill_graph_capture_shape_ms",
                 "prefill_graph_replay_shape_ms",
+                "prefill_graph_capture_shape_gpu_ms",
+                "prefill_graph_replay_shape_gpu_ms",
                 "decode_graph_capture_shape_ms",
                 "decode_graph_replay_shape_ms",
                 "decode_shape_model_ms",

@@ -142,8 +142,10 @@ _QUEUE_PROFILE_FIELDS = (
     "runtime_prefill_graph_hits",
     "runtime_prefill_graph_captures",
     "runtime_prefill_graph_capture_ms",
+    "runtime_prefill_graph_capture_gpu_ms",
     "runtime_prefill_graph_replays",
     "runtime_prefill_graph_replay_ms",
+    "runtime_prefill_graph_replay_gpu_ms",
     "runtime_prefill_graph_misses",
     "runtime_prefill_graph_cache_live_entries",
     "runtime_prefill_shape_counts",
@@ -159,8 +161,12 @@ _QUEUE_PROFILE_FIELDS = (
     "runtime_prefill_shape_model_tokens",
     "runtime_prefill_shape_graph_capture_counts",
     "runtime_prefill_shape_graph_capture_ms",
+    "runtime_prefill_shape_graph_capture_gpu_ms",
     "runtime_prefill_shape_graph_replay_counts",
     "runtime_prefill_shape_graph_replay_ms",
+    "runtime_prefill_shape_graph_replay_gpu_ms",
+    "runtime_prefill_graph_capture_shape_gpu_ms",
+    "runtime_prefill_graph_replay_shape_gpu_ms",
     "runtime_prefill_shape_padding_tokens",
     "runtime_prefill_shape_row_padding_tokens",
     "runtime_prefill_shape_suffix_padding_tokens",
@@ -530,7 +536,9 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
             "gen_tokens",
             "prefill_graph_miss",
             "prefill_graph_cap_ms",
+            "prefill_graph_cap_gpu_ms",
             "prefill_graph_replay_ms",
+            "prefill_graph_replay_gpu_ms",
             "decode_gpu_ms",
             "decode_cpu_ms",
             "decode_state_ms",
@@ -634,7 +642,9 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
                     _fmt_value(fields.get("runtime_generated_prefix_reuse_tokens")),
                     _fmt_value(fields.get("runtime_prefill_graph_misses")),
                     _fmt_value(fields.get("runtime_prefill_graph_capture_ms")),
+                    _fmt_value(fields.get("runtime_prefill_graph_capture_gpu_ms")),
                     _fmt_value(fields.get("runtime_prefill_graph_replay_ms")),
+                    _fmt_value(fields.get("runtime_prefill_graph_replay_gpu_ms")),
                     _fmt_value(fields.get("runtime_decode_ragged_model_gpu_ms")),
                     _fmt_value(fields.get("runtime_decode_ragged_cpu_tokens_ms")),
                     _fmt_value(fields.get("runtime_decode_ragged_state_update_ms")),
@@ -682,6 +692,7 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
                         "shape",
                         "calls",
                         "forward_ms",
+                        "graph_gpu_ms",
                         "wall_ms",
                         "setup_ms",
                         "copy_ms",
@@ -896,8 +907,10 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
                         "max_tokens",
                         "capture_shape",
                         "capture_ms",
+                        "capture_gpu_ms",
                         "replay_shape",
                         "replay_ms",
+                        "replay_gpu_ms",
                         "graphs",
                     ),
                     prefill_graph_rows,
@@ -1909,6 +1922,12 @@ def _hot_prefill_shape_rows(
                     ),
                     _fmt_value(forward_ms),
                     _fmt_value(
+                        _mapping_value(
+                            fields.get("runtime_prefill_shape_graph_replay_gpu_ms"),
+                            shape,
+                        )
+                    ),
+                    _fmt_value(
                         _mapping_value(fields.get("runtime_prefill_shape_wall_ms"), shape)
                     ),
                     _fmt_value(
@@ -2576,8 +2595,24 @@ def _hot_prefill_graph_shape_rows(
         capture_shape, capture_ms = _top_mapping_entry(
             fields.get("runtime_prefill_shape_graph_capture_ms")
         )
+        capture_gpu_ms = (
+            _mapping_value(
+                fields.get("runtime_prefill_shape_graph_capture_gpu_ms"),
+                capture_shape,
+            )
+            if capture_shape is not None
+            else None
+        )
         replay_shape, replay_ms = _top_mapping_entry(
             fields.get("runtime_prefill_shape_graph_replay_ms")
+        )
+        replay_gpu_ms = (
+            _mapping_value(
+                fields.get("runtime_prefill_shape_graph_replay_gpu_ms"),
+                replay_shape,
+            )
+            if replay_shape is not None
+            else None
         )
         if capture_shape is None and replay_shape is None:
             continue
@@ -2587,8 +2622,10 @@ def _hot_prefill_graph_shape_rows(
                 _fmt_value(profile.max_tokens),
                 capture_shape or "-",
                 _fmt_value(capture_ms),
+                _fmt_value(capture_gpu_ms),
                 replay_shape or "-",
                 _fmt_value(replay_ms),
+                _fmt_value(replay_gpu_ms),
                 _fmt_value(fields.get("runtime_prefill_graph_cache_live_entries")),
             )
         )

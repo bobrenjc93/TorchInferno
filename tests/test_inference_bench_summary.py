@@ -126,8 +126,10 @@ def _write_inference_bench_run(tmp_path) -> None:
         "runtime_prefill_suffix_split_accepted_fragments": 5,
         "runtime_prefill_graph_captures": 2,
         "runtime_prefill_graph_capture_ms": 21.0,
+        "runtime_prefill_graph_capture_gpu_ms": 18.0,
         "runtime_prefill_graph_replays": 5,
         "runtime_prefill_graph_replay_ms": 6.0,
+        "runtime_prefill_graph_replay_gpu_ms": 5.0,
         "runtime_prefill_graph_misses": 9,
         "runtime_prefill_graph_cache_live_entries": 3,
         "runtime_prefill_shape_counts": {
@@ -177,8 +179,14 @@ def _write_inference_bench_run(tmp_path) -> None:
         "runtime_prefill_shape_graph_capture_ms": {
             "chunk_graph:b8:s64:p111:logits0": 21.0,
         },
+        "runtime_prefill_shape_graph_capture_gpu_ms": {
+            "chunk_graph:b8:s64:p111:logits0": 18.0,
+        },
         "runtime_prefill_shape_graph_replay_ms": {
             "chunk_graph:b8:s64:p111:logits0": 6.0,
+        },
+        "runtime_prefill_shape_graph_replay_gpu_ms": {
+            "chunk_graph:b8:s64:p111:logits0": 5.0,
         },
         "runtime_prefill_shape_padding_tokens": {
             "prefix_graph:b8:s16:p45-45:src1:mixed0": 17,
@@ -497,6 +505,8 @@ def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) ->
     assert "suffix_saved" in text
     assert "obs_packed_ms" in text
     assert "prefill_graph_cap_ms" in text
+    assert "prefill_graph_cap_gpu_ms" in text
+    assert "prefill_graph_replay_gpu_ms" in text
     assert "decode_graph_cap_ms" in text
     assert "decode_cpu_ms" in text
     assert "decode_state_ms" in text
@@ -522,7 +532,10 @@ def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) ->
     assert "35.4%" in text
     assert "row_pad" in text
     assert "suffix_pad" in text
+    assert "graph_gpu_ms" in text
     assert "[torchinferno hot prefill graph shapes]" in text
+    assert "capture_gpu_ms" in text
+    assert "replay_gpu_ms" in text
     assert "chunk_graph:b8:s64:p111:logits0" in text
     assert "[torchinferno hot decode shapes]" in text
     assert "decode_cpu_ms" in text

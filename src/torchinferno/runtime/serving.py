@@ -524,6 +524,8 @@ class ServingStats:
     prefill_forward_ms: float = 0.0
     prefill_graph_capture_ms: float = 0.0
     prefill_graph_replay_ms: float = 0.0
+    prefill_graph_capture_gpu_ms: float = 0.0
+    prefill_graph_replay_gpu_ms: float = 0.0
     prefill_setup_ms: float = 0.0
     prefill_sample_ms: float = 0.0
     prefill_state_ms: float = 0.0
@@ -547,6 +549,10 @@ class ServingStats:
     prefill_shape_graph_miss_counts: dict[str, int] = field(default_factory=dict)
     prefill_shape_graph_capture_ms: dict[str, float] = field(default_factory=dict)
     prefill_shape_graph_replay_ms: dict[str, float] = field(default_factory=dict)
+    prefill_shape_graph_capture_gpu_ms: dict[str, float] = field(default_factory=dict)
+    prefill_shape_graph_replay_gpu_ms: dict[str, float] = field(default_factory=dict)
+    prefill_graph_capture_shape_gpu_ms: dict[str, float] = field(default_factory=dict)
+    prefill_graph_replay_shape_gpu_ms: dict[str, float] = field(default_factory=dict)
     prefill_packed_eager_shape_counts: dict[str, int] = field(default_factory=dict)
     prefill_packed_eager_shape_tokens: dict[str, int] = field(default_factory=dict)
     prefill_packed_eager_shape_model_tokens: dict[str, int] = field(default_factory=dict)
@@ -959,6 +965,7 @@ class ContinuousBatchEngine:
         self._online_prefilling: list[_ActiveRequest] = []
         self._online_step = 0
         self._online_next_index = 0
+        self._pending_prefill_graph_events: list[tuple[object, ...]] = []
         self._pending_decode_ragged_model_events: list[tuple[object, ...]] = []
 
     def _dynamic_prefix_prefill_context_len(
@@ -2496,6 +2503,7 @@ class ContinuousBatchEngine:
         self._online_prefilling = []
         self._online_step = 0
         self._online_next_index = 0
+        self._pending_prefill_graph_events = []
         self._pending_decode_ragged_model_events = []
 
     def _admit_ready_requests(
@@ -3543,6 +3551,7 @@ class ContinuousBatchEngine:
             if self.profile_timings and logits is not None:
                 # force the prefill graph/forward to complete for honest timing
                 torch.cuda.synchronize(self.device) if self.device.type == "cuda" else None
+                self._flush_prefill_graph_gpu_timers()
                 forward_elapsed_ms = (time.perf_counter() - forward_start_s) * 1000.0
                 self.stats.prefill_forward_ms += forward_elapsed_ms
                 self._record_shape_time(
@@ -4008,6 +4017,13 @@ class ContinuousBatchEngine:
         if graph is None:
             return None
         graph_start_s = time.perf_counter() if self.profile_timings else 0.0
+        graph_shape_key = self._ragged_prefill_graph_shape_key(
+            input_ids,
+            row_indices=row_indices,
+            context_len=context_len,
+            src_prefix_row=src_prefix_row,
+        )
+        gpu_events = self._start_prefill_graph_gpu_timer()
         logits = graph(
             input_ids,
             self._require_cache(),
@@ -4031,13 +4047,13 @@ class ContinuousBatchEngine:
         self.stats.prefill_graph_hits += 1
         captured = getattr(self.model, "_last_ragged_prefill_graph_captured", None)
         if isinstance(captured, bool):
-            elapsed_ms = (time.perf_counter() - graph_start_s) * 1000.0 if self.profile_timings else 0.0
-            graph_shape_key = self._ragged_prefill_graph_shape_key(
-                input_ids,
-                row_indices=row_indices,
-                context_len=context_len,
-                src_prefix_row=src_prefix_row,
+            self._stop_prefill_graph_gpu_timer(
+                gpu_events,
+                captured=captured,
+                graph_shape_key=graph_shape_key,
+                profile_shape_key=profile_shape_key,
             )
+            elapsed_ms = (time.perf_counter() - graph_start_s) * 1000.0 if self.profile_timings else 0.0
             if captured:
                 self.stats.prefill_graph_captures += 1
                 self.stats.prefill_graph_capture_ms += elapsed_ms
@@ -4103,6 +4119,13 @@ class ContinuousBatchEngine:
                 prefix_copy_len,
             )
         graph_start_s = time.perf_counter() if self.profile_timings else 0.0
+        graph_shape_key = self._ragged_prefill_graph_shape_key(
+            input_ids,
+            row_indices=row_indices,
+            context_len=context_len,
+            src_prefix_row=src_prefix_row,
+        )
+        gpu_events = self._start_prefill_graph_gpu_timer()
         filled = graph(
             input_ids,
             self._require_cache(),
@@ -4132,13 +4155,13 @@ class ContinuousBatchEngine:
         self.stats.prefill_graph_hits += 1
         captured = getattr(self.model, "_last_ragged_prefill_graph_captured", None)
         if isinstance(captured, bool):
-            elapsed_ms = (time.perf_counter() - graph_start_s) * 1000.0 if self.profile_timings else 0.0
-            graph_shape_key = self._ragged_prefill_graph_shape_key(
-                input_ids,
-                row_indices=row_indices,
-                context_len=context_len,
-                src_prefix_row=src_prefix_row,
+            self._stop_prefill_graph_gpu_timer(
+                gpu_events,
+                captured=captured,
+                graph_shape_key=graph_shape_key,
+                profile_shape_key=profile_shape_key,
             )
+            elapsed_ms = (time.perf_counter() - graph_start_s) * 1000.0 if self.profile_timings else 0.0
             if captured:
                 self.stats.prefill_graph_captures += 1
                 self.stats.prefill_graph_capture_ms += elapsed_ms
@@ -5498,6 +5521,78 @@ class ContinuousBatchEngine:
         if finished:
             return self._finish_and_release(state, step)
         return state
+
+    def _start_prefill_graph_gpu_timer(self) -> tuple[object, object] | None:
+        if not self.profile_timings or self.device.type != "cuda":
+            return None
+        try:
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record(torch.cuda.current_stream(self.device))
+            return start, end
+        except Exception:
+            return None
+
+    def _stop_prefill_graph_gpu_timer(
+        self,
+        events: tuple[object, object] | None,
+        *,
+        captured: bool,
+        graph_shape_key: str,
+        profile_shape_key: str | None = None,
+    ) -> None:
+        if events is None:
+            return
+        try:
+            start, end = events
+            end.record(torch.cuda.current_stream(self.device))
+        except Exception:
+            return
+        self._pending_prefill_graph_events.append(
+            (start, end, bool(captured), str(graph_shape_key), profile_shape_key)
+        )
+
+    def _flush_prefill_graph_gpu_timers(self) -> None:
+        pending = getattr(self, "_pending_prefill_graph_events", [])
+        if not pending:
+            return
+        remaining: list[tuple[object, ...]] = []
+        for item in pending:
+            start, end, captured, graph_shape_key, profile_shape_key = item
+            try:
+                elapsed_ms = float(start.elapsed_time(end))
+            except RuntimeError:
+                remaining.append(item)
+                continue
+            except Exception:
+                continue
+            if bool(captured):
+                self.stats.prefill_graph_capture_gpu_ms += elapsed_ms
+                self._record_shape_time(
+                    self.stats.prefill_graph_capture_shape_gpu_ms,
+                    str(graph_shape_key),
+                    elapsed_ms,
+                )
+                if profile_shape_key is not None:
+                    self._record_shape_time(
+                        self.stats.prefill_shape_graph_capture_gpu_ms,
+                        str(profile_shape_key),
+                        elapsed_ms,
+                    )
+                continue
+            self.stats.prefill_graph_replay_gpu_ms += elapsed_ms
+            self._record_shape_time(
+                self.stats.prefill_graph_replay_shape_gpu_ms,
+                str(graph_shape_key),
+                elapsed_ms,
+            )
+            if profile_shape_key is not None:
+                self._record_shape_time(
+                    self.stats.prefill_shape_graph_replay_gpu_ms,
+                    str(profile_shape_key),
+                    elapsed_ms,
+                )
+        self._pending_prefill_graph_events = remaining
 
     def _start_decode_ragged_model_gpu_timer(self) -> tuple[object, object] | None:
         if not self.profile_timings or self.device.type != "cuda":
