@@ -58,6 +58,15 @@ queue profiles can now show whether a guarded suffix-bucket split would pass
 `min_group`/`min_fill` and how many padded model tokens it would save before we
 spend another full A/B run on it.
 
+A local TorchInferno-only long_output run on `17af09d`
+(`/tmp/inference-bench-suffix-profile-results/.../20260706_102600`) landed at
+`213.1 / 23.5 / 1099.5ms`, `1000/1000` correct. The new queue counters found
+`19` suffix-split candidates with `5.5K` candidate saved model tokens, but only
+`6` reached the disabled-policy rejection; the rest failed `no_savings`,
+`min_fill`, or `min_group`. The analyzer now prints candidate calls, candidate
+saved tokens, and compact reject reasons so future public profiles expose this
+signal directly.
+
 The latest run also reinforces the packed-prefix conclusion. Few_shot is closer
 but remains prefill-bound (`1.38s` prefill forward, `4.66K` padding tokens, hot
 `prefix_graph:b32:s16:p122-122:src1:mixed0`), while multi_turn now surfaces a

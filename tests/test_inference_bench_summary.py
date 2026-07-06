@@ -124,8 +124,11 @@ def _write_inference_bench_run(tmp_path) -> None:
         "runtime_prefill_packed_candidate_calls": 4,
         "runtime_prefill_packed_candidate_saved_tokens": 20,
         "runtime_prefill_packed_candidate_groups": 11,
+        "runtime_prefill_suffix_split_candidate_calls": 3,
+        "runtime_prefill_suffix_split_candidate_saved_tokens": 42,
         "runtime_prefill_suffix_split_accepted_calls": 2,
         "runtime_prefill_suffix_split_rejected_calls": 1,
+        "runtime_prefill_suffix_split_reject_reason_counts": {"disabled": 1},
         "runtime_prefill_suffix_split_accepted_saved_tokens": 18,
         "runtime_prefill_suffix_split_accepted_fragments": 5,
         "runtime_prefill_graph_captures": 2,
@@ -715,9 +718,13 @@ def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) ->
     assert "submit2first" in text
     assert "prefill_pad" in text
     assert "prefill_pad_pct" in text
+    assert "suffix_split_cand" in text
+    assert "suffix_split_cand_saved" in text
     assert "suffix_split_ok" in text
+    assert "suffix_split_reasons" in text
     assert "suffix_split_saved" in text
     assert "suffix_split_frags" in text
+    assert "disabled=1" in text
     assert "active_wait" in text
     assert "hot_prefill" in text
     assert "b8:s16:p45-45:src1:mixed0" in text

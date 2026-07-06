@@ -527,8 +527,11 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
             "prefill_row_pad",
             "prefill_sfx_pad",
             "prefill_pad_pct",
+            "suffix_split_cand",
+            "suffix_split_cand_saved",
             "suffix_split_ok",
             "suffix_split_rej",
+            "suffix_split_reasons",
             "suffix_split_saved",
             "suffix_split_frags",
             "packed_fi_calls",
@@ -641,8 +644,13 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
                         else _int_if_whole(prefill_suffix_padding_tokens)
                     ),
                     _fmt_pct(prefill_padding_tokens or 0.0, prefill_model_tokens or 0.0),
+                    _fmt_value(fields.get("runtime_prefill_suffix_split_candidate_calls")),
+                    _fmt_value(fields.get("runtime_prefill_suffix_split_candidate_saved_tokens")),
                     _fmt_value(fields.get("runtime_prefill_suffix_split_accepted_calls")),
                     _fmt_value(fields.get("runtime_prefill_suffix_split_rejected_calls")),
+                    _fmt_mapping_summary(
+                        fields.get("runtime_prefill_suffix_split_reject_reason_counts")
+                    ),
                     _fmt_value(fields.get("runtime_prefill_suffix_split_accepted_saved_tokens")),
                     _fmt_value(fields.get("runtime_prefill_suffix_split_accepted_fragments")),
                     _fmt_value(fields.get("runtime_prefill_packed_flashinfer_calls")),
