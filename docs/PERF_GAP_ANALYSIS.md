@@ -166,6 +166,39 @@ default. Avoiding the shared-prefix KV copy is still only useful if a future
 path can reuse the existing `src1` graph shape or avoid multiplying startup
 graph captures.
 
+## Public 20260706_070225 refresh and tree decode-capture check
+
+The latest public run advanced to
+`results/v1/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100/runs/20260706_070225`.
+It measured TorchInferno `0d6ab82`, vLLM `cdab283`, and SGLang `5f98f62`.
+TorchInferno scored `3/20`: it still wins self_consistency
+(`100.9 / 0.0 / 107.9ms`), but trails vLLM on few_shot
+(`158.8 / 44.5 / 206.5ms` vs `121.9 / 42.5 / 158.0ms`), multi_turn
+(`234.3 / 56.7 / 291.9ms` vs `145.5 / 44.6 / 190.0ms`), tree_of_thought
+(`76.4 / 63.4 / 107.2ms` vs `32.8 / 21.7 / 48.4ms`), and long_output
+(`307.5 / 18.5 / 1061.5ms` vs vLLM `74.8 / 14.8 / 658.8ms`).
+
+The score targets remain the same. Public long_output is still dominated by
+decode and decode-many replay/readback (`10.46s` ragged decode GPU,
+`5.14s` decode-many GPU, `1.24s` decode-many CPU) with `32.1K` prefill padding
+tokens. Multi_turn and few_shot remain prefill bound, and tree remains split:
+`5.17s` prefill forward, `4.99s` decode GPU, `9.4K` prefill padding tokens, and
+`95` decode graph misses.
+
+A same-branch tree A/B checked whether generated-prefix decode capture should
+be enabled by default. The opt-in decode-capture run
+`/tmp/inference-bench-tree-decode-capture-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-tree-decode-capture-aca24b0/runs/20260706_074034`
+landed at `127.8 / 66.0 / 184.6ms`, `956/992` correct. The no-env control
+`/tmp/inference-bench-tree-control-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-tree-control-aca24b0/runs/20260706_074717`
+landed slightly better at `124.6 / 65.5 / 179.7ms`, `957/992` correct. Capture
+trimmed aggregate decode GPU (`2.57s` vs `2.71s`) but did not improve request
+medians or correctness, so keep `TORCHINFERNO_CONTINUOUS_DECODE_CAPTURE` as an
+explicit diagnostic. The analyzer now retains
+`runtime_decode_graph_miss_shape_counts` and summarizes it as
+`decode_miss_kind`; the tree control showed `static_token=27,static_logits=20`,
+which points future work at the static generated-prefix decode fallback rather
+than ragged graph miss churn.
+
 ## Public 20260706_030205 refresh
 
 The latest public run advanced to

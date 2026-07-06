@@ -268,6 +268,10 @@ def _write_inference_bench_run(tmp_path) -> None:
         "runtime_decode_ragged_cpu_tokens_ms": 1.25,
         "runtime_decode_ragged_state_update_ms": 2.25,
         "runtime_decode_graph_misses": 10,
+        "runtime_decode_graph_miss_shape_counts": {
+            "static_decode:logits:b2:s55": 7,
+            "ragged_decode:token:b8:rows1": 3,
+        },
         "runtime_decode_graph_capture_ms": 7.0,
         "runtime_decode_graph_replay_ms": 8.0,
         "runtime_decode_graph_cache_live_cache_bucket_counts": {"cache1024": 3, "cache256": 1},
@@ -450,6 +454,12 @@ def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) ->
     assert summary.torchinferno_queue_profiles[0].fields["runtime_prefill_batches"] == 1
     assert summary.torchinferno_queue_profiles[0].fields["runtime_prefill_graph_misses"] == 9
     assert summary.torchinferno_queue_profiles[0].fields["runtime_decode_graph_misses"] == 10
+    assert summary.torchinferno_queue_profiles[0].fields[
+        "runtime_decode_graph_miss_shape_counts"
+    ] == {
+        "static_decode:logits:b2:s55": 7,
+        "ragged_decode:token:b8:rows1": 3,
+    }
     assert (
         summary.torchinferno_queue_profiles[0].fields[
             "runtime_generated_prefix_reuse_tokens"
@@ -536,6 +546,8 @@ def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) ->
     assert "prefill_sfx_pad" in text
     assert "prefill_miss" in text
     assert "decode_miss" in text
+    assert "decode_miss_kind" in text
+    assert "static_logits=7,ragged_token=3" in text
     assert "decode_graph_cache" in text
     assert "cache1024=3,cache256=1" in text
     assert "decode_replay_cache_ms" in text

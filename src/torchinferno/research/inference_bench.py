@@ -147,6 +147,7 @@ _QUEUE_PROFILE_FIELDS = (
     "runtime_prefill_graph_replay_ms",
     "runtime_prefill_graph_replay_gpu_ms",
     "runtime_prefill_graph_misses",
+    "runtime_prefill_graph_miss_shape_counts",
     "runtime_prefill_graph_cache_live_entries",
     "runtime_prefill_shape_counts",
     "runtime_prefill_shape_forward_ms",
@@ -180,6 +181,7 @@ _QUEUE_PROFILE_FIELDS = (
     "runtime_decode_graph_capture_ms",
     "runtime_decode_graph_capture_shape_ms",
     "runtime_decode_graph_misses",
+    "runtime_decode_graph_miss_shape_counts",
     "runtime_decode_graph_replays",
     "runtime_decode_graph_replay_ms",
     "runtime_decode_graph_replay_shape_ms",
@@ -469,6 +471,7 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
                         "decode_many_calls",
                         "prefill_miss",
                         "decode_miss",
+                        "decode_miss_kind",
                         "gen_store",
                         "gen_reuse",
                         "packed_saved",
@@ -544,6 +547,7 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
             "decode_cpu_ms",
             "decode_state_ms",
             "decode_graph_miss",
+            "decode_miss_kind",
             "decode_graph_cap_ms",
             "decode_graph_replay_ms",
             "decode_graph_cache",
@@ -650,6 +654,7 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
                     _fmt_value(fields.get("runtime_decode_ragged_cpu_tokens_ms")),
                     _fmt_value(fields.get("runtime_decode_ragged_state_update_ms")),
                     _fmt_value(fields.get("runtime_decode_graph_misses")),
+                    _fmt_mapping_summary(_decode_graph_miss_kind_counts(fields)),
                     _fmt_value(fields.get("runtime_decode_graph_capture_ms")),
                     _fmt_value(fields.get("runtime_decode_graph_replay_ms")),
                     _fmt_mapping_summary(_decode_graph_cache_counts(fields)),
@@ -1740,6 +1745,7 @@ def _torchinferno_score_target_rows(
                 _fmt_value(fields.get("runtime_decode_many_calls")),
                 _fmt_value(fields.get("runtime_prefill_graph_misses")),
                 _fmt_value(fields.get("runtime_decode_graph_misses")),
+                _fmt_mapping_summary(_decode_graph_miss_kind_counts(fields)),
                 _fmt_value(fields.get("runtime_generated_prefix_store_requests")),
                 _fmt_value(fields.get("runtime_generated_prefix_reuse_requests")),
                 _fmt_value(fields.get("runtime_prefill_packed_candidate_saved_tokens")),
@@ -1848,6 +1854,26 @@ def _prefill_padding_split_totals(fields: dict[str, Any]) -> tuple[float | None,
             fields.get("runtime_prefill_shape_suffix_padding_tokens")
         )
     return row_padding, suffix_padding
+
+
+def _decode_graph_miss_kind_counts(fields: dict[str, Any]) -> dict[str, float | int]:
+    shape_counts = _numeric_mapping_preserving_type(
+        fields.get("runtime_decode_graph_miss_shape_counts")
+    )
+    kind_counts: dict[str, float | int] = {}
+    for shape, count in shape_counts.items():
+        kind = _decode_graph_miss_kind(shape)
+        kind_counts[kind] = kind_counts.get(kind, 0) + count
+    return kind_counts
+
+
+def _decode_graph_miss_kind(shape: str) -> str:
+    parts = shape.split(":")
+    if len(parts) >= 2 and parts[0] == "static_decode":
+        return f"static_{parts[1]}"
+    if len(parts) >= 2 and parts[0] == "ragged_decode":
+        return f"ragged_{parts[1]}"
+    return "other"
 
 
 def _decode_graph_symm_counts(fields: dict[str, Any]) -> dict[str, float | int]:
