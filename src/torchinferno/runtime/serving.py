@@ -4306,12 +4306,20 @@ class ContinuousBatchEngine:
             len(request.prompt) - prefix_hit_tokens
             for _index, request, prefix_hit_tokens, _reusable in group
         ]
-        if (
-            self.graph_prefill
-            and suffix_lengths
-            and self._prefix_prefill_split_suffix_buckets_enabled()
+        split_suffix_buckets = self._prefix_prefill_split_suffix_buckets_enabled()
+        profile_suffix_split_candidates = (
+            not split_suffix_buckets
+            and self._prefix_prefill_split_suffix_buckets_profile_candidates_enabled()
+        )
+        if self.graph_prefill and suffix_lengths and (
+            split_suffix_buckets or profile_suffix_split_candidates
         ):
-            split_groups = self._prefix_prefill_suffix_bucket_split_groups(group, suffix_lengths)
+            split_groups = self._prefix_prefill_suffix_bucket_split_groups(
+                group,
+                suffix_lengths,
+                accept_enabled=split_suffix_buckets,
+                policy_enabled=split_suffix_buckets or profile_suffix_split_candidates,
+            )
             if split_groups is not None:
                 active: list[_ActiveRequest] = []
                 for suffix_group in split_groups:
@@ -4402,6 +4410,23 @@ class ContinuousBatchEngine:
         env_name = "TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SPLIT_SUFFIX_BUCKETS"
         if env_name in os.environ:
             return env_flag(env_name, False)
+        if not self._prefix_prefill_split_suffix_buckets_greedy_short_scope():
+            return False
+        return env_flag(
+            "TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SPLIT_SUFFIX_BUCKETS_GREEDY_SHORT",
+            False,
+        )
+
+    def _prefix_prefill_split_suffix_buckets_profile_candidates_enabled(self) -> bool:
+        env_name = "TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SPLIT_SUFFIX_BUCKETS_PROFILE_CANDIDATES"
+        if env_name in os.environ:
+            return env_flag(env_name, False)
+        return bool(
+            self.profile_timings
+            and self._prefix_prefill_split_suffix_buckets_greedy_short_scope()
+        )
+
+    def _prefix_prefill_split_suffix_buckets_greedy_short_scope(self) -> bool:
         if self.temperature > 0.0 or self.max_generation_tokens is None:
             return False
         greedy_short_max_tokens = env_int(
@@ -4409,12 +4434,7 @@ class ContinuousBatchEngine:
             128,
             minimum=1,
         )
-        if not (0 < int(self.max_generation_tokens) <= greedy_short_max_tokens):
-            return False
-        return env_flag(
-            "TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SPLIT_SUFFIX_BUCKETS_GREEDY_SHORT",
-            False,
-        )
+        return 0 < int(self.max_generation_tokens) <= greedy_short_max_tokens
 
     def _record_prefix_prefill_suffix_split_candidate(
         self,
@@ -4491,7 +4511,12 @@ class ContinuousBatchEngine:
         self,
         group: list[tuple[int, ServingRequest, int, _ReusablePrefix]],
         suffix_lengths: Sequence[int],
+        *,
+        accept_enabled: bool = True,
+        policy_enabled: bool | None = None,
     ) -> list[list[tuple[int, ServingRequest, int, _ReusablePrefix]]] | None:
+        if policy_enabled is None:
+            policy_enabled = self._prefix_prefill_split_suffix_buckets_enabled()
         by_suffix_bucket: dict[int, list[tuple[int, ServingRequest, int, _ReusablePrefix]]] = defaultdict(list)
         for item, suffix_len in zip(group, suffix_lengths):
             by_suffix_bucket[self._suffix_bucket(max(1, suffix_len))].append(item)
@@ -4536,7 +4561,7 @@ class ContinuousBatchEngine:
         default_min_group_size = 1
         if (
             "TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SPLIT_SUFFIX_BUCKETS" not in os.environ
-            and self._prefix_prefill_split_suffix_buckets_enabled()
+            and policy_enabled
         ):
             default_min_group_size = 2
         min_group_size = env_int(
@@ -4544,7 +4569,7 @@ class ContinuousBatchEngine:
             default_min_group_size,
             minimum=1,
         )
-        default_min_fill_pct = 75 if self._prefix_prefill_split_suffix_buckets_enabled() else 0
+        default_min_fill_pct = 75 if policy_enabled else 0
         min_fill_pct = env_int(
             "TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SPLIT_SUFFIX_BUCKETS_MIN_FILL_PCT",
             default_min_fill_pct,
@@ -4575,6 +4600,17 @@ class ContinuousBatchEngine:
                     reject_reason="min_fill",
                 )
                 return None
+        if not accept_enabled:
+            self._record_prefix_prefill_suffix_split_candidate(
+                group_size=len(group),
+                base_bucket=base_bucket,
+                base_model_tokens=base_model_tokens,
+                split_model_tokens=split_model_tokens,
+                by_suffix_bucket=by_suffix_bucket,
+                accepted=False,
+                reject_reason="disabled",
+            )
+            return None
         self._record_prefix_prefill_suffix_split_candidate(
             group_size=len(group),
             base_bucket=base_bucket,

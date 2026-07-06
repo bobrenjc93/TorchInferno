@@ -3731,6 +3731,7 @@ def test_continuous_batch_engine_graph_prefill_buckets_batch_and_matches() -> No
 def test_continuous_batch_engine_can_split_prefix_graph_by_suffix_bucket(monkeypatch) -> None:
     monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SPLIT_SUFFIX_BUCKETS", "1")
     monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SUFFIX_BUCKETS", "4,8")
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SPLIT_SUFFIX_BUCKETS_MIN_GROUP", "1")
     monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SPLIT_SUFFIX_BUCKETS_MIN_FILL_PCT", "0")
     monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_COMMON_PREFIX_RAGGED_SUFFIX_MAX_PREFIX_TOKENS", "0")
     shared = tuple(range(16))
@@ -3794,6 +3795,55 @@ def test_continuous_batch_engine_can_split_prefix_graph_by_suffix_bucket(monkeyp
     assert engine.stats.prefill_shape_suffix_length_counts[
         "prefix_graph:b1:s8:p16-16:src1:mixed0|suffix5"
     ] == 1
+
+
+def test_continuous_batch_engine_profiles_disabled_suffix_bucket_split(
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SPLIT_SUFFIX_BUCKETS", raising=False)
+    monkeypatch.delenv(
+        "TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SPLIT_SUFFIX_BUCKETS_GREEDY_SHORT",
+        raising=False,
+    )
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SUFFIX_BUCKETS", "4,8")
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SPLIT_SUFFIX_BUCKETS_MIN_GROUP", "1")
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SPLIT_SUFFIX_BUCKETS_MIN_FILL_PCT", "0")
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_COMMON_PREFIX_RAGGED_SUFFIX_MAX_PREFIX_TOKENS", "0")
+    shared = tuple(range(16))
+    model = _SelectedLogitsToyModel(vocab_size=128)
+    engine = ContinuousBatchEngine(
+        model,
+        device=torch.device("cpu"),
+        temperature=0.0,
+        max_generation_tokens=128,
+        max_active_requests=8,
+        prefix_cache_capacity=8,
+        pin_shared_prefix=True,
+        graph_prefill=True,
+        profile_timings=True,
+    )
+    requests = [
+        ServingRequest("warm-a", (*shared, 21), 1, arrival_step=0),
+        ServingRequest("warm-b", (*shared, 22), 1, arrival_step=0),
+        ServingRequest("late-a", (*shared, 31), 1, arrival_step=1),
+        ServingRequest("late-b", (*shared, 32, 33), 1, arrival_step=1),
+        ServingRequest("late-c", (*shared, 34, 35, 36, 37, 38), 1, arrival_step=1),
+    ]
+
+    results = engine.run(requests)
+
+    by_id = {result.request_id: result for result in results}
+    assert by_id["late-a"].tokens[-1] == 32
+    assert by_id["late-b"].tokens[-1] == 34
+    assert by_id["late-c"].tokens[-1] == 39
+    assert (4, 8) in model.prefill_input_shapes
+    assert "prefix_graph:b4:s8:p16-16:src1:mixed0" in engine.stats.prefill_shape_counts
+    assert "prefix_graph:b2:s4:p16-16:src1:mixed0" not in engine.stats.prefill_shape_counts
+    assert engine.stats.prefill_suffix_split_candidate_calls == 1
+    assert engine.stats.prefill_suffix_split_accepted_calls == 0
+    assert engine.stats.prefill_suffix_split_rejected_calls == 1
+    assert engine.stats.prefill_suffix_split_reject_reason_counts == {"disabled": 1}
+    assert engine.stats.prefill_suffix_split_candidate_saved_tokens == 16
 
 
 def test_continuous_batch_engine_suffix_bucket_split_requires_model_token_savings(
@@ -3865,6 +3915,49 @@ def test_continuous_batch_engine_opt_in_suffix_bucket_split_rejects_singletons(
     }
 
 
+def test_continuous_batch_engine_records_disabled_suffix_bucket_split_candidate(
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SPLIT_SUFFIX_BUCKETS", raising=False)
+    monkeypatch.delenv(
+        "TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SPLIT_SUFFIX_BUCKETS_GREEDY_SHORT",
+        raising=False,
+    )
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SUFFIX_BUCKETS", "4,8")
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SPLIT_SUFFIX_BUCKETS_MIN_GROUP", "1")
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SPLIT_SUFFIX_BUCKETS_MIN_FILL_PCT", "0")
+    engine = ContinuousBatchEngine(
+        object(),
+        device=torch.device("cpu"),
+        temperature=0.0,
+        max_generation_tokens=128,
+        graph_prefill=True,
+        profile_timings=True,
+    )
+    group = [
+        (index, ServingRequest(str(index), tuple(range(16 + suffix_len)), 1), 16, object())
+        for index, suffix_len in enumerate([4, 4, 5])
+    ]
+    suffix_lengths = [
+        len(request.prompt) - prefix_tokens
+        for _index, request, prefix_tokens, _reusable in group
+    ]
+
+    split_groups = engine._prefix_prefill_suffix_bucket_split_groups(
+        group,
+        suffix_lengths,
+        accept_enabled=False,
+        policy_enabled=True,
+    )
+
+    assert split_groups is None
+    assert engine.stats.prefill_suffix_split_candidate_calls == 1
+    assert engine.stats.prefill_suffix_split_rejected_calls == 1
+    assert engine.stats.prefill_suffix_split_accepted_calls == 0
+    assert engine.stats.prefill_suffix_split_reject_reason_counts == {"disabled": 1}
+    assert engine.stats.prefill_suffix_split_candidate_saved_tokens == 16
+
+
 def test_continuous_batch_engine_suffix_bucket_split_default_scope(monkeypatch) -> None:
     monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SPLIT_SUFFIX_BUCKETS", raising=False)
     monkeypatch.delenv(
@@ -3893,6 +3986,23 @@ def test_continuous_batch_engine_suffix_bucket_split_default_scope(monkeypatch) 
     assert not greedy_short._prefix_prefill_split_suffix_buckets_enabled()
     assert not greedy_mid._prefix_prefill_split_suffix_buckets_enabled()
     assert not sampled_short._prefix_prefill_split_suffix_buckets_enabled()
+
+    profiled_greedy_short = ContinuousBatchEngine(
+        object(),
+        device=torch.device("cpu"),
+        temperature=0.0,
+        max_generation_tokens=128,
+        profile_timings=True,
+    )
+    profiled_greedy_mid = ContinuousBatchEngine(
+        object(),
+        device=torch.device("cpu"),
+        temperature=0.0,
+        max_generation_tokens=256,
+        profile_timings=True,
+    )
+    assert profiled_greedy_short._prefix_prefill_split_suffix_buckets_profile_candidates_enabled()
+    assert not profiled_greedy_mid._prefix_prefill_split_suffix_buckets_profile_candidates_enabled()
 
     monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SPLIT_SUFFIX_BUCKETS_GREEDY_SHORT", "1")
     assert greedy_short._prefix_prefill_split_suffix_buckets_enabled()

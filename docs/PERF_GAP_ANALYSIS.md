@@ -51,6 +51,13 @@ throughput, and did not reduce total decode GPU time. Keep the default cap at
 `4`; denser decode needs a real multi-step graph/body win, not just longer
 stop-token bursts.
 
+Suffix-split candidate telemetry now records opportunities even when the split
+policy is disabled in default greedy-short profiling runs. Serving behavior is
+unchanged; accepted split execution remains opt-in. Future public long_output
+queue profiles can now show whether a guarded suffix-bucket split would pass
+`min_group`/`min_fill` and how many padded model tokens it would save before we
+spend another full A/B run on it.
+
 The latest run also reinforces the packed-prefix conclusion. Few_shot is closer
 but remains prefill-bound (`1.38s` prefill forward, `4.66K` padding tokens, hot
 `prefix_graph:b32:s16:p122-122:src1:mixed0`), while multi_turn now surfaces a
