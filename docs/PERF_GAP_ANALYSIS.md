@@ -1,5 +1,30 @@
 # TorchInferno vs vLLM/sglang — Performance Gap Analysis (Llama-3.1-70B, 8xH100)
 
+## Public 20260706_010157 and decode host split
+
+The latest public run advanced to
+`results/v1/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100/runs/20260706_010157`
+at inference-bench commit `2fbb9f18`. It still measured pre-current
+TorchInferno `46164b4` against vLLM `95a248f` and SGLang `8673e85`.
+TorchInferno remained `0/20`: few_shot `154.1 / 45.7 / 196.1ms`,
+self_consistency `160.2 / 0.0 / 167.8ms`, multi_turn
+`317.7 / 61.3 / 376.9ms`, tree_of_thought `79.4 / 64.1 / 114.6ms`, and
+long_output `262.5 / 19.6 / 934.2ms`. The largest latest gaps are still
+long_output TTFT/E2E (`+197.7/+291.2ms` versus the best other provider) and
+multi_turn TTFT/E2E (`+170.7/+188.1ms` versus vLLM), followed by tree
+TTFT/TPOT/E2E.
+
+The analyzer now carries decode host overhead in the queue-profile and hot
+decode tables. Re-rendering the latest public run shows long_output's logged
+partial queue profile (`547/1000` requests) spent `5.36s` in ragged decode GPU,
+`897ms` copying decode tokens to CPU, and `20ms` in decode state updates; the
+hottest `decode_many:b64/64` shape spent `1.54s` GPU and `257ms` CPU-copy.
+That makes host readback visible as a material cost, but not enough to explain
+the whole gap or reopen the rejected side-stream copy shim. The defaultable
+long-output target remains lower `b64` replay cost or a real decode/readback
+pipeline, while current-head multi_turn remains focused on the padded
+cached-prefix prefill body documented below.
+
 ## Public 20260705_230202 and current HTTP split
 
 The latest public run at

@@ -142,6 +142,8 @@ _QUEUE_PROFILE_FIELDS = (
     "runtime_prefill_shape_suffix_padding_tokens",
     "runtime_prefill_shape_route_counts",
     "runtime_prefill_shape_route_reuse_tokens",
+    "runtime_decode_ragged_cpu_tokens_ms",
+    "runtime_decode_ragged_state_update_ms",
     "runtime_decode_ragged_model_gpu_ms",
     "runtime_decode_graph_hits",
     "runtime_decode_graph_captures",
@@ -156,6 +158,7 @@ _QUEUE_PROFILE_FIELDS = (
     "runtime_decode_graph_cache_live_cache_bucket_counts",
     "runtime_decode_graph_cache_live_symm_counts",
     "runtime_decode_shape_gpu_ms",
+    "runtime_decode_shape_cpu_tokens_ms",
     "runtime_decode_many_graph_calls",
     "runtime_decode_many_graph_steps",
     "runtime_decode_many_graph_model_tokens",
@@ -484,6 +487,8 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
             "prefill_graph_cap_ms",
             "prefill_graph_replay_ms",
             "decode_gpu_ms",
+            "decode_cpu_ms",
+            "decode_state_ms",
             "decode_graph_miss",
             "decode_graph_cap_ms",
             "decode_graph_replay_ms",
@@ -555,6 +560,8 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
                     _fmt_value(fields.get("runtime_prefill_graph_capture_ms")),
                     _fmt_value(fields.get("runtime_prefill_graph_replay_ms")),
                     _fmt_value(fields.get("runtime_decode_ragged_model_gpu_ms")),
+                    _fmt_value(fields.get("runtime_decode_ragged_cpu_tokens_ms")),
+                    _fmt_value(fields.get("runtime_decode_ragged_state_update_ms")),
                     _fmt_value(fields.get("runtime_decode_graph_misses")),
                     _fmt_value(fields.get("runtime_decode_graph_capture_ms")),
                     _fmt_value(fields.get("runtime_decode_graph_replay_ms")),
@@ -799,6 +806,7 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
                         "max_tokens",
                         "decode_gpu_shape",
                         "decode_gpu_ms",
+                        "decode_cpu_ms",
                         "decode_many_shape",
                         "decode_many_gpu_ms",
                         "model_tokens",
@@ -2284,6 +2292,11 @@ def _hot_decode_shape_rows(
         decode_shape, decode_gpu_ms = _top_mapping_entry(
             fields.get("runtime_decode_shape_gpu_ms")
         )
+        decode_cpu_ms = (
+            _mapping_value(fields.get("runtime_decode_shape_cpu_tokens_ms"), decode_shape)
+            if decode_shape is not None
+            else None
+        )
         decode_many_shape, decode_many_gpu_ms = _top_mapping_entry(
             fields.get("runtime_decode_many_shape_gpu_ms")
         )
@@ -2333,6 +2346,7 @@ def _hot_decode_shape_rows(
                 _fmt_value(profile.max_tokens),
                 decode_shape or "-",
                 _fmt_value(decode_gpu_ms),
+                _fmt_value(decode_cpu_ms),
                 decode_many_key or "-",
                 _fmt_value(decode_many_gpu_ms),
                 _fmt_value(decode_many_model_tokens),
