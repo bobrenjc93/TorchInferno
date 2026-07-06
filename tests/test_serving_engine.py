@@ -503,6 +503,28 @@ class _CaptureAwareStaticDecodeGraphToyModel(_StaticDecodeGraphToyModel):
         return self._logits(input_ids[:, -1] + 1)
 
 
+class _SampledStaticDecodeGraphToyModel(_CaptureAwareStaticDecodeGraphToyModel):
+    def __init__(self) -> None:
+        super().__init__()
+        self.static_token_graph_attempts = 0
+
+    def try_decode_one_token_graph(
+        self,
+        input_ids,
+        cache,
+        *,
+        temperature=0.0,
+        capture_on_miss: bool = True,
+    ):
+        self.static_token_graph_attempts += 1
+        return super().try_decode_one_token_graph(
+            input_ids,
+            cache,
+            temperature=temperature,
+            capture_on_miss=capture_on_miss,
+        )
+
+
 class _FiDecodeGraphFallbackToyModel(_RaggedGraphToyModel):
     def __init__(self, vocab_size: int = 64) -> None:
         super().__init__(vocab_size)
@@ -5496,6 +5518,53 @@ def test_continuous_batch_engine_can_capture_decode_graphs_with_env(monkeypatch)
     assert model.static_token_graph_calls == 0
     assert model.static_logits_graph_calls == 2
     assert engine.stats.decode_graph_hits == 2
+
+
+def test_continuous_batch_engine_skips_static_token_graph_for_sampled_decode() -> None:
+    model = _SampledStaticDecodeGraphToyModel()
+    engine = ContinuousBatchEngine(
+        model,
+        device=torch.device("cpu"),
+        max_active_requests=2,
+        prefix_cache_capacity=0,
+        enable_ragged_decode=False,
+        temperature=0.7,
+    )
+
+    results = engine.run(
+        [
+            ServingRequest("a", (1, 2), 3, arrival_step=0),
+            ServingRequest("b", (3, 4), 3, arrival_step=0),
+        ]
+    )
+
+    assert [len(result.tokens) for result in results] == [5, 5]
+    assert model.static_token_graph_attempts == 0
+    assert model.static_token_graph_calls == 0
+    assert model.static_logits_graph_calls == 2
+    assert engine.stats.decode_graph_hits == 2
+    assert engine.stats.decode_graph_misses == 0
+
+
+def test_continuous_batch_engine_skips_static_token_graph_for_sampled_decode_one() -> None:
+    model = _SampledStaticDecodeGraphToyModel()
+    engine = ContinuousBatchEngine(
+        model,
+        device=torch.device("cpu"),
+        max_active_requests=1,
+        prefix_cache_capacity=0,
+        enable_ragged_decode=False,
+        temperature=0.7,
+    )
+
+    results = engine.run([ServingRequest("a", (1, 2), 3, arrival_step=0)])
+
+    assert len(results[0].tokens) == 5
+    assert model.static_token_graph_attempts == 0
+    assert model.static_token_graph_calls == 0
+    assert model.static_logits_graph_calls == 2
+    assert engine.stats.decode_graph_hits == 2
+    assert engine.stats.decode_graph_misses == 0
 
 
 def test_continuous_batch_engine_uses_dense_token_graph_for_greedy_sampled_default(monkeypatch) -> None:

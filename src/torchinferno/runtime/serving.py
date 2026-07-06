@@ -5354,7 +5354,12 @@ class ContinuousBatchEngine:
         if not hasattr(self, "_has_fi_decode"):
             self._has_fi_decode = bool(getattr(self.model, "_fi_decode_graphs", None))
         shared_temperature = self._shared_temperature_for_states(states)
-        use_token_graph = shared_temperature is not None and not need_generated_prefix_logits
+        use_ragged_token_graph = shared_temperature is not None and not need_generated_prefix_logits
+        use_static_token_graph = (
+            shared_temperature is not None
+            and shared_temperature <= 0.0
+            and not need_generated_prefix_logits
+        )
         if self._has_fi_decode:
             row_indices_t = torch.tensor(rows, dtype=torch.long, device=self.device)
             seq_lens_t = self._seq_lens_tensor(states, rows=rows)
@@ -5371,7 +5376,7 @@ class ContinuousBatchEngine:
                         row_indices_t,
                         temperature=shared_temperature,
                     )
-                    if use_token_graph
+                    if use_ragged_token_graph
                     else None
                 )
                 if fi_token is not None:
@@ -5391,7 +5396,7 @@ class ContinuousBatchEngine:
                     cache_view,
                     temperature=shared_temperature,
                 )
-                if use_token_graph
+                if use_static_token_graph
                 else None
             )
             if graph_token is None:
@@ -5497,7 +5502,7 @@ class ContinuousBatchEngine:
                     cache_view,
                     temperature=state_temperature,
                 )
-                if not need_generated_prefix_logits
+                if state_temperature <= 0.0 and not need_generated_prefix_logits
                 else None
             )
             if graph_token is None:

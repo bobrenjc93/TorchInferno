@@ -217,6 +217,18 @@ Llama path: misses remained static (`static_token=41,static_logits=20`). The
 next useful decode-side change needs to target the non-FlashInfer static branch
 or make uniform ragged faster, not reroute the FI fallback.
 
+The static branch now skips static token-graph attempts for sampled decode,
+because the Llama static token graph is greedy-only and sampled decode always
+falls through to logits. The validation run
+`/tmp/inference-bench-tree-static-token-skip-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-tree-static-token-skip-d38cfa3-dirty/runs/20260706_081507`
+landed at `129.8 / 63.9 / 189.9ms`, `956/992` correct. This is not a request
+median win, but it removes the impossible sampled token-graph churn:
+`decode_miss_kind` fell from the control's `static_token=27,static_logits=20`
+to `static_token=1,static_logits=15`, and profiled decode GPU fell from
+`2.71s` to `2.52s`. Treat it as hot-path cleanup and profile clarity, not as a
+closed tree gap; tree still needs faster prefix prefill and a real sampled
+decode path.
+
 ## Public 20260706_030205 refresh
 
 The latest public run advanced to
