@@ -2730,11 +2730,11 @@ def test_continuous_batch_engine_keeps_arrival_order_for_larger_greedy_admission
     assert by_id["short"].started_step == 1
 
 
-def test_continuous_batch_engine_prioritizes_large_greedy_refill_prefill_cost(monkeypatch) -> None:
+def test_continuous_batch_engine_can_prioritize_large_greedy_refill_prefill_cost(monkeypatch) -> None:
     monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_ADMIT_PREFILL_COST_PRIORITY", raising=False)
-    monkeypatch.delenv(
+    monkeypatch.setenv(
         "TORCHINFERNO_CONTINUOUS_ADMIT_PREFILL_COST_PRIORITY_GREEDY_LARGE_REFILL",
-        raising=False,
+        "1",
     )
     model = _RaggedGraphToyModel()
     engine = ContinuousBatchEngine(
@@ -2760,11 +2760,11 @@ def test_continuous_batch_engine_prioritizes_large_greedy_refill_prefill_cost(mo
     assert by_id["long"].started_step == 2
 
 
-def test_continuous_batch_engine_can_disable_large_greedy_refill_prefill_cost(monkeypatch) -> None:
+def test_continuous_batch_engine_keeps_large_greedy_refill_arrival_order_by_default(monkeypatch) -> None:
     monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_ADMIT_PREFILL_COST_PRIORITY", raising=False)
-    monkeypatch.setenv(
+    monkeypatch.delenv(
         "TORCHINFERNO_CONTINUOUS_ADMIT_PREFILL_COST_PRIORITY_GREEDY_LARGE_REFILL",
-        "0",
+        raising=False,
     )
     model = _RaggedGraphToyModel()
     engine = ContinuousBatchEngine(

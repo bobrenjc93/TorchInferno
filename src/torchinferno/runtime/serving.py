@@ -2516,7 +2516,7 @@ class ContinuousBatchEngine:
         large_refill_env = "TORCHINFERNO_CONTINUOUS_ADMIT_PREFILL_COST_PRIORITY_GREEDY_LARGE_REFILL"
         if large_refill_env in os.environ:
             return env_flag(large_refill_env, False)
-        return self._greedy_large_mixed_prefix_reuse_enabled()
+        return False
 
     def _prefill_many(
         self,

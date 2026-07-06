@@ -51,13 +51,14 @@ vLLM `150.7 / 49.8 / 194.3ms`, SGLang `136.8 / 125.5 / 252.6ms`, and
 TorchInferno `223.1 / 61.6 / 289.7ms`, `983/1000` correct. A forced
 suffix-bucket splitter stayed rejected (`223.2 / 62.0 / 289.3ms`, p99
 regressed, `prefill_forward_ms=2816`). A scoped refill-only prefill-cost
-admission priority for the greedy-large mixed-prefix path improved the local
-TorchInferno median band to `202.9 / 59.1 / 258.3ms`, `984/1000` correct at
+admission priority for the greedy-large mixed-prefix path looked promising in a
+provider-only run (`202.9 / 59.1 / 258.3ms`, `984/1000` correct at
 `/tmp/inference-bench-ti-active-refill-priority-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100/runs/20260706_003547`.
-It preserves initial-wave arrival order and applies cost ordering only while
-rows are already active. The remaining risk is tail fairness: p90/p99 TTFT got
-worse because longer refill prompts can wait behind shorter suffixes. Keep this
-as a median `multi_turn` win, not as the final first-token scheduler answer.
+The same-host all-provider rerun on pushed `061a037` rejected it as a default:
+TorchInferno regressed to `238.3 / 61.9 / 303.6ms` with
+`q2submit_p50=66.1ms`, `40` prefill batches, and `2.50s` prefill forward.
+Keep large-greedy refill cost priority opt-in; the remaining first-token gap
+needs a scheduler policy that avoids starving longer refill prompts.
 
 A current tree_of_thought sample-gather recheck is rejected as a default
 runtime change. On pushed `b2b11a3`, the focused run with
