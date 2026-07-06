@@ -1,8 +1,38 @@
 # TorchInferno vs vLLM/sglang — Performance Gap Analysis (Llama-3.1-70B, 8xH100)
 
-## Public 20260706_090220 refresh and queue segment merge fix
+## Public 20260706_110224 refresh and sample split follow-up
 
 The latest public run advanced to
+`results/v1/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100/runs/20260706_110224`.
+It still measured TorchInferno `0d6ab82`, so it does not include the pushed
+state/sample split telemetry. vLLM advanced to `ba22152`, while SGLang stayed at
+`80decc7`. TorchInferno still wins self_consistency (`100.8 / 0.0 / 105.8ms`)
+but trails vLLM on few_shot (`+19.1ms` TTFT, `+24.5ms` E2E), multi_turn
+(`+112.6ms` TTFT, `+18.9ms` TPOT, `+127.7ms` E2E), tree_of_thought
+(`+48.7ms` TTFT, `+42.0ms` TPOT, `+69.5ms` E2E), and long_output
+(`+179.5ms` TTFT, `+5.6ms` TPOT, `+343.6ms` E2E).
+
+The public multi_turn queue profile now reports `44.6ms` in prefill state
+bookkeeping, so the earlier `293ms` public state bucket was not stable. The
+current multi_turn target remains the mixed-prefix body and queue formation:
+`2.53s/2.92s` prefill forward/wall, `18.3K` padded prefill tokens
+(`49.4%`), `41.7ms` prefill sample, and `371.5ms` decode state updates.
+Long_output is still split between prefill TTFT and decode density:
+`4.03s/4.37s` prefill forward/wall, `36.7K` padded prefill tokens, `10.36s`
+ragged decode GPU, `5.92s` decode-many GPU, `1.56s` decode-many CPU handling,
+and only `164` decode-many model tokens per call across `137` calls.
+
+Tree remains the sampled-decode outlier: public `0.7/300` spent
+`4.84s/5.27s` in prefill forward/wall, `143.6ms` in prefill sample, `4.36s`
+ragged decode GPU, and still missed sampled static decode graphs
+(`static_token=70,static_logits=29`). The sample split below should make the
+next public run distinguish sampler selection from host readback; do not reopen
+the rejected sampled decode and greedy sampler variants without a new profile
+showing a different bottleneck.
+
+## Public 20260706_090220 refresh and queue segment merge fix
+
+The prior public run advanced to
 `results/v1/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100/runs/20260706_090220`.
 It measured TorchInferno `0d6ab82`, vLLM `90ce3a0`, and SGLang `80decc7`.
 TorchInferno still wins self_consistency (`94.5 / 0.0 / 101.8ms`) and now wins
@@ -103,6 +133,15 @@ padded mixed-prefix prefill body cost, with sampled first-token handling noisy
 across runs. The scratch helper also now preserves the original zero-filled
 `required`-length tensor contract for unfilled rows instead of returning a
 full-cache-row view with stale entries.
+
+The follow-up prefix-prefill sample split on pushed `f09e875`
+(`/tmp/inference-bench-prefill-sample-split-results/.../20260706_114426`)
+landed at a noisy `323.5 / 58.6 / 366.2ms`, `0.981` correctness. The merged
+queue profile split `101.6ms` of prefill sample time into `95.4ms` sampler
+selection and only `6.1ms` host readback, so the sample bucket is not a token
+copy problem. It is mostly the greedy TP sampler path around first-token
+selection; keep this as telemetry for future public profiles rather than
+reopening the already-rejected greedy sampler alternatives without new evidence.
 
 A same-host provider refresh
 (`/tmp/inference-bench-provider-long-results/.../20260706_103437`) measured
