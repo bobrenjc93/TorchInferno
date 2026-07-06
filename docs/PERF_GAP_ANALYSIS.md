@@ -265,6 +265,16 @@ slice, the remaining sampled decode misses are concrete late static-logits
 shapes (`b2:s56`, `b3:s55`, `b2:s58`, and neighbors), which makes future warmup
 or path-selection probes easier to target without manually opening JSONL.
 
+A direct static-logits warmup probe set
+`TORCHINFERNO_OPENAI_WARMUP_PROMPT_TOKENS=56` and wrote
+`/tmp/inference-bench-tree-static-logits-warm-s56-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-tree-static-logits-warm-s56-9b13b94/runs/20260706_085555`.
+It landed at `132.7 / 65.4 / 190.9ms`, `957/992` correct, versus the local
+current tree provider slice's TorchInferno leg at `132.6 / 66.0 / 188.0ms`,
+`960/992` correct. The targeted miss class barely moved (`static_logits=20`
+instead of `21`) and reshuffled to `b2:s56`, `b3:s56`, `b2:s57`, and nearby
+shapes. Do not change the default decode warmup prompt length; these late small
+static-logits misses are not the visible tree bottleneck.
+
 ## Public 20260706_030205 refresh
 
 The latest public run advanced to
