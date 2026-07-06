@@ -95,6 +95,13 @@ path remains the wrong default. This keeps the next long-output work on a true
 per-batch packed cached-prefix prefill body plus a lower-cost or overlapped
 decode/readback body.
 
+Current-head queue profiles now also attribute decode-many CPU token readback by
+step window as `runtime_decode_many_step_window_cpu_tokens_ms`, and the summary
+prints it as `cpu_ms` beside the existing per-window GPU estimate. Older public
+artifacts render that column as `-`; the next current run should show whether
+the dominant `decode_many:b64/64:g1-16` window also carries most readback cost
+or whether the CPU exposure is concentrated in tail windows.
+
 ## Public 20260705_230202 and current HTTP split
 
 The latest public run at

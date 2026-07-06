@@ -6326,6 +6326,10 @@ def test_continuous_batch_engine_online_many_shape_model_tokens_include_padding(
     assert engine.stats.decode_many_step_window_emitted_tokens == {"decode_many:b3/4:g1-16": 6}
     assert engine.stats.decode_many_step_window_skipped_tokens == {"decode_many:b3/4:g1-16": 0}
     assert engine.stats.decode_many_step_window_model_ms["decode_many:b3/4:g1-16"] >= 0.0
+    assert (
+        engine.stats.decode_many_step_window_cpu_tokens_ms["decode_many:b3/4:g1-16"]
+        >= 0.0
+    )
     assert engine.stats.ragged_decode_active_tokens == 6
     assert engine.stats.ragged_decode_padding_tokens == 2
     assert not engine.has_online_work()
@@ -6652,6 +6656,14 @@ def test_continuous_batch_engine_online_many_can_sync_stop_tokens(monkeypatch) -
         "decode_many:b2/2": 2,
         "decode_many:b3/3": 0,
     }
+    assert set(engine.stats.decode_many_step_window_cpu_tokens_ms) == {
+        "decode_many:b2/2:g1-16",
+        "decode_many:b3/3:g1-16",
+    }
+    assert all(
+        elapsed_ms >= 0.0
+        for elapsed_ms in engine.stats.decode_many_step_window_cpu_tokens_ms.values()
+    )
     assert engine.stats.ragged_decode_active_tokens == 7
     assert engine.stats.ragged_decode_padding_tokens == 0
     assert not engine.has_online_work()

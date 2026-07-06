@@ -203,6 +203,7 @@ _QUEUE_PROFILE_FIELDS = (
     "runtime_decode_many_step_window_emitted_tokens",
     "runtime_decode_many_step_window_skipped_tokens",
     "runtime_decode_many_step_window_model_ms",
+    "runtime_decode_many_step_window_cpu_tokens_ms",
     "runtime_generated_prefix_store_requests",
     "runtime_generated_prefix_reuse_requests",
     "runtime_generated_prefix_reuse_tokens",
@@ -912,6 +913,7 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
                         "skipped",
                         "skip_pct",
                         "model_ms",
+                        "cpu_ms",
                     ),
                     decode_window_rows,
                 )
@@ -935,6 +937,7 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
                         "skipped",
                         "skip_pct",
                         "est_gpu_ms",
+                        "cpu_ms",
                         "est_us_tok",
                     ),
                     decode_window_target_rows,
@@ -2672,6 +2675,10 @@ def _decode_many_step_window_rows(
                 fields.get("runtime_decode_many_step_window_skipped_tokens"),
                 key,
             )
+            cpu_ms = _mapping_value(
+                fields.get("runtime_decode_many_step_window_cpu_tokens_ms"),
+                key,
+            )
             rows.append(
                 (
                     _fmt_value(profile.temperature),
@@ -2692,6 +2699,7 @@ def _decode_many_step_window_rows(
                         float(model_tokens or 0),
                     ),
                     _fmt_value(model_ms),
+                    _fmt_value(cpu_ms),
                 )
             )
     return rows
@@ -2725,6 +2733,9 @@ def _decode_many_step_window_target_rows(
         window_skipped = _numeric_mapping(
             fields.get("runtime_decode_many_step_window_skipped_tokens")
         )
+        window_cpu_ms = _numeric_mapping(
+            fields.get("runtime_decode_many_step_window_cpu_tokens_ms")
+        )
         for window, raw_tokens in window_tokens.items():
             model_tokens = max(0.0, float(raw_tokens))
             if model_tokens <= 0.0:
@@ -2755,6 +2766,11 @@ def _decode_many_step_window_target_rows(
                         _fmt_value(_int_if_whole(skipped)),
                         _fmt_pct(skipped, model_tokens),
                         _fmt_value(None if est_gpu_ms is None else _int_if_whole(est_gpu_ms)),
+                        _fmt_value(
+                            None
+                            if window not in window_cpu_ms
+                            else _int_if_whole(window_cpu_ms[window])
+                        ),
                         _fmt_value(None if est_us_tok is None else _int_if_whole(est_us_tok)),
                     ),
                 )

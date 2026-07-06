@@ -484,6 +484,7 @@ class ServingStats:
     decode_many_step_window_emitted_tokens: dict[str, int] = field(default_factory=dict)
     decode_many_step_window_skipped_tokens: dict[str, int] = field(default_factory=dict)
     decode_many_step_window_model_ms: dict[str, float] = field(default_factory=dict)
+    decode_many_step_window_cpu_tokens_ms: dict[str, float] = field(default_factory=dict)
     prefix_reuse_requests: int = 0
     prefix_reuse_tokens: int = 0
     queued_requests: int = 0
@@ -1483,6 +1484,22 @@ class ContinuousBatchEngine:
                         shape_key,
                         cpu_elapsed_ms * (active_count / shape_token_count),
                     )
+                for (
+                    states,
+                    _step,
+                    _generated_after,
+                    _finished_by_limit,
+                    _shape_key,
+                    _shape_model_tokens,
+                    step_window_key,
+                ) in records:
+                    if step_window_key is None:
+                        continue
+                    self._record_shape_time(
+                        self.stats.decode_many_step_window_cpu_tokens_ms,
+                        step_window_key,
+                        cpu_elapsed_ms * (len(states) / shape_token_count),
+                    )
             self._flush_decode_ragged_model_gpu_timers()
 
         events: list[ServingTokenEvent] = []
@@ -1651,6 +1668,7 @@ class ContinuousBatchEngine:
 
             cpu_tokens_start_s = time.perf_counter() if self.profile_timings else 0.0
             row_tokens = next_token_tensor[:active_tokens].detach().cpu().tolist()
+            cpu_elapsed_ms = 0.0
             if self.profile_timings:
                 cpu_elapsed_ms = (time.perf_counter() - cpu_tokens_start_s) * 1000.0
                 self.stats.decode_ragged_cpu_tokens_ms += cpu_elapsed_ms
@@ -1733,6 +1751,11 @@ class ContinuousBatchEngine:
                             step_window_key,
                             model_elapsed_ms,
                         )
+                    self._record_shape_time(
+                        self.stats.decode_many_step_window_cpu_tokens_ms,
+                        step_window_key,
+                        cpu_elapsed_ms,
+                    )
             if shape_key is not None:
                 self._record_shape_total(
                     self.stats.decode_many_shape_model_tokens,

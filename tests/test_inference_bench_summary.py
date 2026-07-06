@@ -299,6 +299,9 @@ def _write_inference_bench_run(tmp_path) -> None:
         "runtime_decode_many_step_window_model_ms": {
             "decode_many:b8/8:g1-16": 11.5,
         },
+        "runtime_decode_many_step_window_cpu_tokens_ms": {
+            "decode_many:b8/8:g1-16": 1.2,
+        },
         "runtime_generated_prefix_store_requests": 12,
         "runtime_generated_prefix_reuse_requests": 3,
         "runtime_generated_prefix_reuse_tokens": 33,
@@ -522,6 +525,7 @@ def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) ->
     assert "789.5" in text
     assert "decode_many:b8/8:g1-16" in text
     assert "model_ms" in text
+    assert "cpu_ms" in text
     assert "[provider server log phases]" in text
     assert "prefix_hit_avg" in text
     assert "prefill_graph_pct" in text
@@ -647,6 +651,7 @@ def test_inference_bench_summary_leaves_decode_many_window_ms_blank_without_timi
     queue_path = tmp_path / "provider_logs" / "torchinferno_queue_profile.jsonl"
     queue_record = json.loads(queue_path.read_text())
     queue_record.pop("runtime_decode_many_step_window_model_ms")
+    queue_record.pop("runtime_decode_many_step_window_cpu_tokens_ms")
     queue_path.write_text(json.dumps(queue_record) + "\n")
 
     text = format_inference_bench_summary(summarize_inference_bench_run(tmp_path))
@@ -657,7 +662,7 @@ def test_inference_bench_summary_leaves_decode_many_window_ms_blank_without_timi
         and "decode_many:b8/8:g1-16" in line
     )
 
-    assert row.split()[-1] == "-"
+    assert row.split()[-2:] == ["-", "-"]
 
 
 def test_inference_bench_summary_uses_runtime_slot_counts_without_signatures(tmp_path) -> None:
