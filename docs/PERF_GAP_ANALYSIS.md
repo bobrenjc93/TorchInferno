@@ -25,6 +25,21 @@ side-stream copy shim. The defaultable long-output target remains lower `b64`
 replay cost or a real decode/readback pipeline, while current-head multi_turn
 remains focused on the padded cached-prefix prefill body documented below.
 
+A full current-head TorchInferno-only long_output profile on `30a1872` wrote
+`/tmp/inference-bench-ti-30a-long-profile-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100/runs/20260706_020656`
+and landed at `215.4 / 24.1 / 1080.3ms`, `1000/1000` correct. Queue telemetry
+shows both halves of the same remaining gap: `q2first_p50=163.5ms`,
+`q2submit_p50=33.7ms`, `submit2first_p50=114.8ms`, `64` prefill batches,
+`4.80s/5.24s` prefill forward/wall, `10.35s` ragged decode GPU, and
+`1.41s` decode CPU-copy. Decode-many accounted for `4.75s` GPU and `1.34s`
+CPU-copy over `364` steps; the hot `decode_many:b64/64` row was `1.50s` GPU
+and `286ms` CPU-copy, with the early `g1-16` window dominant. Long-output also
+has large per-batch packed-prefix savings (`35.2K` candidate saved tokens) but
+almost no repeatable packed pattern reuse (`2/63` calls), so the current dense
+fixed-capacity packed-eager path remains the wrong default. This keeps the next
+long-output work on a true per-batch packed cached-prefix prefill body plus a
+lower-cost or overlapped decode/readback body.
+
 ## Public 20260705_230202 and current HTTP split
 
 The latest public run at
