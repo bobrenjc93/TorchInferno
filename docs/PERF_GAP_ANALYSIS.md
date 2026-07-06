@@ -62,6 +62,16 @@ CDF/search, and `75.4ms` final token reduction. Keep Gumbel as the default
 unless a future implementation reduces random-noise and reduction cost without
 falling back to this CDF collective shape.
 
+The accepted follow-up is reusable in-place Gumbel noise scratch. The same-host
+scratch run
+(`/tmp/inference-bench-gumbel-scratch-results/.../20260706_125443`) landed at
+`117.3 / 61.6 / 168.8ms`, `0.965` correctness, improving the local tree median
+latencies despite ordinary tree-run noise. Its cumulative Gumbel profile covered
+`444` calls over `2657` rows and spent `554.5ms` total, with noise generation
+down to `151.8ms` versus the prior Gumbel-profile run's `221.6ms` over `2599`
+rows. Prefill sample selection also stayed lower (`300.5ms` versus `314.2ms`).
+Keep the scratch path enabled by default with the env opt-out for future A/Bs.
+
 ## Public 20260706_090220 refresh and queue segment merge fix
 
 The prior public run advanced to

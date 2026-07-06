@@ -871,6 +871,41 @@ def test_llama3_tensor_parallel_temperature_gumbel_generators_are_rank_local() -
     assert not torch.equal(first_values, second_values)
 
 
+def test_llama3_tensor_parallel_temperature_gumbel_noise_reuses_scratch(monkeypatch) -> None:
+    monkeypatch.delenv("TORCHINFERNO_TEMPERATURE_SAMPLE_GUMBEL_SCRATCH", raising=False)
+
+    model = object.__new__(Llama3TensorParallelForCausalLM)
+    model.rank = 0
+    logits = torch.zeros(2, 4)
+
+    first = model._temperature_gumbel_noise(logits)
+    scratch = model._temperature_gumbel_scratch
+    scratch_ptr = scratch.data_ptr()
+    second = model._temperature_gumbel_noise(torch.zeros(1, 4))
+
+    assert first.shape == (2, 4)
+    assert second.shape == (1, 4)
+    assert model._temperature_gumbel_scratch.data_ptr() == scratch_ptr
+    assert model._temperature_gumbel_scratch.shape == (2, 4)
+
+    third = model._temperature_gumbel_noise(torch.zeros(3, 4))
+
+    assert third.shape == (3, 4)
+    assert model._temperature_gumbel_scratch.shape == (3, 4)
+
+
+def test_llama3_tensor_parallel_temperature_gumbel_noise_can_skip_scratch(monkeypatch) -> None:
+    monkeypatch.setenv("TORCHINFERNO_TEMPERATURE_SAMPLE_GUMBEL_SCRATCH", "0")
+
+    model = object.__new__(Llama3TensorParallelForCausalLM)
+    model.rank = 0
+
+    noise = model._temperature_gumbel_noise(torch.zeros(2, 4))
+
+    assert noise.shape == (2, 4)
+    assert getattr(model, "_temperature_gumbel_scratch", None) is None
+
+
 def test_llama3_tensor_parallel_repeated_sample_state_samples_cached_cdf(monkeypatch) -> None:
     import torch.distributed as dist
 

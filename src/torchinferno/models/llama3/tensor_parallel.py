@@ -3080,6 +3080,7 @@ class Llama3TensorParallelForCausalLM:
         self._ragged_prefill_mixed_logits_graph_failed = False
         self._ragged_prefill_capture_on_miss_failed = False
         self._temperature_gumbel_generators: dict[str, torch.Generator] = {}
+        self._temperature_gumbel_scratch: Tensor | None = None
         self._temperature_sample_profile_ms: dict[str, float] = {}
         self._temperature_sample_profile_calls = 0
         self._temperature_sample_profile_rows = 0
@@ -7499,9 +7500,7 @@ class Llama3TensorParallelForCausalLM:
         total_start_s = time.perf_counter() if profile_sample else 0.0
         phase_start_s = total_start_s
         logits_float = logits.float() / temperature
-        gumbel = -torch.empty_like(logits_float).exponential_(
-            generator=self._temperature_gumbel_generator(logits.device)
-        ).log()
+        gumbel = self._temperature_gumbel_noise(logits_float)
         noise_ms = (time.perf_counter() - phase_start_s) * 1000.0 if profile_sample else 0.0
         phase_start_s = time.perf_counter() if profile_sample else 0.0
         local_values, local_indices = torch.max(logits_float + gumbel, dim=-1)
@@ -7523,6 +7522,27 @@ class Llama3TensorParallelForCausalLM:
                 reduce_ms=reduce_ms,
             )
         return next_token
+
+    def _temperature_gumbel_noise(self, logits_float: Tensor) -> Tensor:
+        if not _tp_flag("TORCHINFERNO_TEMPERATURE_SAMPLE_GUMBEL_SCRATCH", True):
+            return -torch.empty_like(logits_float).exponential_(
+                generator=self._temperature_gumbel_generator(logits_float.device)
+            ).log()
+        scratch = getattr(self, "_temperature_gumbel_scratch", None)
+        if (
+            not isinstance(scratch, Tensor)
+            or scratch.device != logits_float.device
+            or scratch.dtype != logits_float.dtype
+            or scratch.dim() != logits_float.dim()
+            or scratch.size(-1) != logits_float.size(-1)
+            or scratch.size(0) < logits_float.size(0)
+        ):
+            scratch = torch.empty_like(logits_float)
+            self._temperature_gumbel_scratch = scratch
+        noise = scratch[: logits_float.size(0), : logits_float.size(1)]
+        noise.exponential_(generator=self._temperature_gumbel_generator(logits_float.device))
+        noise.log_().neg_()
+        return noise
 
     def _temperature_gumbel_generator(self, device: torch.device) -> torch.Generator:
         generators = getattr(self, "_temperature_gumbel_generators", None)
