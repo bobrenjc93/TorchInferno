@@ -423,6 +423,7 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
                         "q2submit",
                         "submit2first",
                         "prefill_ms",
+                        "prefill_sample_ms",
                         "prefill_pad",
                         "prefill_row_pad",
                         "prefill_sfx_pad",
@@ -1470,6 +1471,7 @@ def _torchinferno_score_target_rows(
         )
         fields = profile.fields
         prefill_ms = _numeric_field(fields, "runtime_prefill_forward_ms")
+        prefill_sample_ms = _numeric_field(fields, "runtime_prefill_sample_ms")
         _prefill_active_tokens, prefill_model_tokens, prefill_padding_tokens = (
             _prefill_token_totals(fields)
         )
@@ -1498,6 +1500,7 @@ def _torchinferno_score_target_rows(
         phase_target = _phase_target(
             prefill_ms=prefill_ms,
             decode_ms=decode_target_ms,
+            sample_ms=prefill_sample_ms,
             capture_ms=capture_ms,
         )
         hot_prefill, _hot_prefill_ms = _top_mapping_entry(
@@ -1521,6 +1524,7 @@ def _torchinferno_score_target_rows(
                 _fmt_value(fields.get("request_queue_to_submit_p50_ms")),
                 _fmt_value(fields.get("request_submit_to_first_token_p50_ms")),
                 _fmt_value(prefill_ms),
+                _fmt_value(prefill_sample_ms),
                 _fmt_value(
                     None
                     if prefill_padding_tokens is None
@@ -1596,21 +1600,32 @@ def _phase_target(
     *,
     prefill_ms: float | None,
     decode_ms: float | None,
+    sample_ms: float | None,
     capture_ms: float,
 ) -> str:
-    if capture_ms > 0.0 and capture_ms >= max(prefill_ms or 0.0, decode_ms or 0.0):
+    values = {
+        name: value
+        for name, value in (
+            ("prefill", prefill_ms),
+            ("decode", decode_ms),
+            ("sample", sample_ms),
+        )
+        if value is not None
+    }
+    if capture_ms > 0.0 and capture_ms >= max(values.values(), default=0.0):
         return "capture"
-    if prefill_ms is None and decode_ms is None:
+    if not values:
         return "unknown"
-    if prefill_ms is None:
-        return "decode"
-    if decode_ms is None:
-        return "prefill"
-    smaller = min(prefill_ms, decode_ms)
-    larger = max(prefill_ms, decode_ms)
-    if smaller > 0.0 and smaller / larger >= 0.75:
-        return "prefill+decode"
-    return "prefill" if prefill_ms > decode_ms else "decode"
+    ranked = sorted(values.items(), key=lambda item: (-item[1], item[0]))
+    if len(ranked) >= 2:
+        top_name, top_value = ranked[0]
+        second_name, second_value = ranked[1]
+        if second_value > 0.0 and second_value / top_value >= 0.75:
+            labels = {top_name, second_name}
+            return "+".join(
+                label for label in ("prefill", "decode", "sample") if label in labels
+            )
+    return ranked[0][0]
 
 
 def _sum_numeric_mapping(value: Any) -> float | None:

@@ -6,6 +6,7 @@ import sys
 from torchinferno.research.inference_bench import (
     _decode_graph_cache_counts,
     _decode_graph_symm_counts,
+    _phase_target,
     format_inference_bench_summary,
     summarize_inference_bench_run,
 )
@@ -540,6 +541,27 @@ def test_inference_bench_summary_marks_partial_queue_profiles(tmp_path) -> None:
 
     assert "coverage" in text
     assert "1/2 partial" in text
+
+
+def test_phase_target_can_select_sampling() -> None:
+    assert (
+        _phase_target(
+            prefill_ms=0.0,
+            decode_ms=0.0,
+            sample_ms=71.3,
+            capture_ms=0.0,
+        )
+        == "sample"
+    )
+    assert (
+        _phase_target(
+            prefill_ms=100.0,
+            decode_ms=80.0,
+            sample_ms=5.0,
+            capture_ms=0.0,
+        )
+        == "prefill+decode"
+    )
 
 
 def test_inference_bench_summary_derives_decode_graph_symm_counts_from_shapes() -> None:

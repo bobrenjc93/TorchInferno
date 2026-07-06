@@ -14,8 +14,11 @@ long_output TTFT/E2E (`+197.7/+291.2ms` versus the best other provider) and
 multi_turn TTFT/E2E (`+170.7/+188.1ms` versus vLLM), followed by tree
 TTFT/TPOT/E2E.
 
-The analyzer now carries decode host overhead and prefill padding split into row
-padding and suffix padding in the queue-profile and score-target tables.
+The analyzer now carries decode host overhead, sampled prefill sampling time,
+and prefill padding split into row padding and suffix padding in the
+queue-profile and score-target tables. The compact phase target also treats
+sampling as its own measured subsystem instead of forcing cache-only sampled
+rows into a prefill/decode bucket.
 Re-rendering the latest public run shows
 long_output's logged partial queue profile (`547/1000` requests) spent `5.36s`
 in ragged decode GPU, `897ms` copying decode tokens to CPU, `890ms` of that
@@ -28,6 +31,19 @@ whole gap or reopen the rejected side-stream copy shim. The defaultable
 long-output target remains lower `b64` replay cost or a real decode/readback
 pipeline, while current-head multi_turn remains focused on the padded
 cached-prefix prefill body documented below.
+
+A focused current-head TorchInferno-only tree run on pushed `af0f574` wrote
+`/tmp/inference-bench-current-tree-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-current/runs/20260706_024843`
+and landed at `134.4 / 66.3 / 193.9ms`, `961/992` correct, with server
+readiness `226.0s`. Queue telemetry had zero prefill graph misses, but still
+spent `2.90s/3.45s` in prefill forward/wall, `300ms` in sampled prefill
+sampling, `2.47s` in ragged decode GPU, and `7.8K` prefill padding tokens
+(`2.35K` row / `5.47K` suffix). The per-batch packed-prefix targets remain
+real (`b4:s16` saves `1.63K` tokens, `1.21K` suffix, estimated `466ms`), but
+the score-facing tree gap also needs lower sampled first-token/decode cost.
+This does not reopen the rejected sample-gather, Gumbel, or scratch-buffer
+sampler defaults; it makes the sampler term visible in the compact target table
+so future fused/graph-safe sampler work is judged against the right counter.
 
 The analyzer also now prints per-batch packed-prefill targets that do not require
 repeatable exact signatures, with row-vs-suffix saved-token splits attached to
