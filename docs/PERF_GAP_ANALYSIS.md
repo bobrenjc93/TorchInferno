@@ -14,16 +14,18 @@ long_output TTFT/E2E (`+197.7/+291.2ms` versus the best other provider) and
 multi_turn TTFT/E2E (`+170.7/+188.1ms` versus vLLM), followed by tree
 TTFT/TPOT/E2E.
 
-The analyzer now carries decode host overhead in the queue-profile and hot
-decode tables. Re-rendering the latest public run shows long_output's logged
-partial queue profile (`547/1000` requests) spent `5.36s` in ragged decode GPU,
-`897ms` copying decode tokens to CPU, `890ms` of that inside decode-many, and
-`20ms` in decode state updates; the hottest `decode_many:b64/64` shape spent
-`1.54s` GPU and `257ms` CPU-copy. That makes q8 drain readback visible as a
-material cost, but not enough to explain the whole gap or reopen the rejected
-side-stream copy shim. The defaultable long-output target remains lower `b64`
-replay cost or a real decode/readback pipeline, while current-head multi_turn
-remains focused on the padded cached-prefix prefill body documented below.
+The analyzer now carries decode host overhead and total prefill padding in the
+queue-profile and score-target tables. Re-rendering the latest public run shows
+long_output's logged partial queue profile (`547/1000` requests) spent `5.36s`
+in ragged decode GPU, `897ms` copying decode tokens to CPU, `890ms` of that
+inside decode-many, and `20ms` in decode state updates; it also spent `20.1K`
+cached-prefix prefill tokens on padding (`44.5%`). The hottest
+`decode_many:b64/64` shape spent `1.54s` GPU and `257ms` CPU-copy. That makes
+q8 drain readback visible as a material cost, but not enough to explain the
+whole gap or reopen the rejected side-stream copy shim. The defaultable
+long-output target remains lower `b64` replay cost or a real decode/readback
+pipeline, while current-head multi_turn remains focused on the padded
+cached-prefix prefill body documented below.
 
 A full current-head TorchInferno-only long_output profile on `30a1872` wrote
 `/tmp/inference-bench-ti-30a-long-profile-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100/runs/20260706_020656`
@@ -35,10 +37,11 @@ shows both halves of the same remaining gap: `q2first_p50=163.5ms`,
 `4.75s` GPU, and `1.34s` CPU-copy; the hot `decode_many:b64/64` row was
 `1.50s` GPU and `286ms` CPU-copy, with the early `g1-16` window dominant.
 Long-output also has large per-batch packed-prefix savings (`35.2K` candidate
-saved tokens) but almost no repeatable packed pattern reuse (`2/63` calls), so
-the current dense fixed-capacity packed-eager path remains the wrong default.
-This keeps the next long-output work on a true per-batch packed cached-prefix
-prefill body plus a lower-cost or overlapped decode/readback body.
+saved tokens, `44.0%` of prefill model tokens) but almost no repeatable packed
+pattern reuse (`2/63` calls), so the current dense fixed-capacity packed-eager
+path remains the wrong default. This keeps the next long-output work on a true
+per-batch packed cached-prefix prefill body plus a lower-cost or overlapped
+decode/readback body.
 
 ## Public 20260705_230202 and current HTTP split
 

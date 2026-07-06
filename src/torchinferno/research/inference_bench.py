@@ -423,6 +423,8 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
                         "q2submit",
                         "submit2first",
                         "prefill_ms",
+                        "prefill_pad",
+                        "prefill_pad_pct",
                         "decode_ms",
                         "decode_many_ms",
                         "decode_cpu_ms",
@@ -475,6 +477,8 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
             "prefill_copy_ms",
             "prefill_sample_ms",
             "prefill_state_ms",
+            "prefill_pad",
+            "prefill_pad_pct",
             "packed_fi_calls",
             "packed_fi_ms",
             "packed_fi_saved",
@@ -516,6 +520,9 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
         for profile in summary.torchinferno_queue_profiles:
             fields = profile.fields
             expected_requests = _expected_requests_for_queue_profile(summary, profile)
+            _prefill_active_tokens, prefill_model_tokens, prefill_padding_tokens = (
+                _prefill_token_totals(fields)
+            )
             body.append(
                 (
                     _fmt_value(profile.temperature),
@@ -550,6 +557,12 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
                     _fmt_value(fields.get("runtime_prefill_copy_ms")),
                     _fmt_value(fields.get("runtime_prefill_sample_ms")),
                     _fmt_value(fields.get("runtime_prefill_state_ms")),
+                    _fmt_value(
+                        None
+                        if prefill_padding_tokens is None
+                        else _int_if_whole(prefill_padding_tokens)
+                    ),
+                    _fmt_pct(prefill_padding_tokens or 0.0, prefill_model_tokens or 0.0),
                     _fmt_value(fields.get("runtime_prefill_packed_flashinfer_calls")),
                     _fmt_value(fields.get("runtime_prefill_packed_flashinfer_ms")),
                     _fmt_value(fields.get("runtime_prefill_packed_flashinfer_saved_tokens")),
@@ -1414,6 +1427,9 @@ def _torchinferno_score_target_rows(
         )
         fields = profile.fields
         prefill_ms = _numeric_field(fields, "runtime_prefill_forward_ms")
+        _prefill_active_tokens, prefill_model_tokens, prefill_padding_tokens = (
+            _prefill_token_totals(fields)
+        )
         decode_ms = _numeric_field(fields, "runtime_decode_ragged_model_gpu_ms")
         decode_many_ms = _numeric_field(fields, "runtime_decode_many_model_gpu_ms")
         decode_cpu_ms = _numeric_field(fields, "runtime_decode_ragged_cpu_tokens_ms")
@@ -1459,6 +1475,12 @@ def _torchinferno_score_target_rows(
                 _fmt_value(fields.get("request_queue_to_submit_p50_ms")),
                 _fmt_value(fields.get("request_submit_to_first_token_p50_ms")),
                 _fmt_value(prefill_ms),
+                _fmt_value(
+                    None
+                    if prefill_padding_tokens is None
+                    else _int_if_whole(prefill_padding_tokens)
+                ),
+                _fmt_pct(prefill_padding_tokens or 0.0, prefill_model_tokens or 0.0),
                 _fmt_value(decode_ms),
                 _fmt_value(decode_many_ms),
                 _fmt_value(decode_cpu_ms),
@@ -1540,6 +1562,15 @@ def _sum_numeric_mapping(value: Any) -> float | None:
     if not mapping:
         return None
     return sum(mapping.values())
+
+
+def _prefill_token_totals(fields: dict[str, Any]) -> tuple[float | None, float | None, float | None]:
+    active_tokens = _sum_numeric_mapping(fields.get("runtime_prefill_shape_active_tokens"))
+    model_tokens = _sum_numeric_mapping(fields.get("runtime_prefill_shape_model_tokens"))
+    padding_tokens = _sum_numeric_mapping(fields.get("runtime_prefill_shape_padding_tokens"))
+    if padding_tokens is None and active_tokens is not None and model_tokens is not None:
+        padding_tokens = max(0.0, model_tokens - active_tokens)
+    return active_tokens, model_tokens, padding_tokens
 
 
 def _decode_graph_symm_counts(fields: dict[str, Any]) -> dict[str, float | int]:

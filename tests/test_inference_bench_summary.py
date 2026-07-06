@@ -412,6 +412,8 @@ def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) ->
     assert "capture" in text
     assert "q2submit" in text
     assert "submit2first" in text
+    assert "prefill_pad" in text
+    assert "prefill_pad_pct" in text
     assert "active_wait" in text
     assert "hot_prefill" in text
     assert "b8:s16:p45-45:src1:mixed0" in text
@@ -424,6 +426,7 @@ def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) ->
     assert "prefill_setup_ms" in text
     assert "prefill_copy_ms" in text
     assert "prefill_sample_ms" in text
+    assert "37.5%" in text
     assert "wall_ms" in text
     assert "sample_ms" in text
     assert "prefill_miss" in text
