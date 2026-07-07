@@ -26,6 +26,23 @@ at `216.5 / 23.5 / 1060.7ms`. Keep multi-step decode graphs opt-in; the
 remaining long-output lever is still a cheaper high-active decode body or real
 decode/readback overlap, not this rotary placement.
 
+## Current 20260707 greedy-short FP8 boundary check
+
+An exact greedy-short FP8 boundary probe is not promoted. The default runtime
+min_m remains 512, and the model gate is strict (`m > min_m`), so exact
+512-token waves stay bf16 unless an experiment lowers the gate. Lowering only
+`TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_FP8_PREFILL_MIN_M` to 511 wrote
+`/tmp/ti-long-fp8min511-20260707-results/.../runs/20260707_225347` and landed
+at `209.4 / 23.7 / 1046.2ms`, `1000/1000` correct. Against the current
+graph-off long_output band
+(`/tmp/allproviders-long-85007b2-20260707-results/.../runs/20260707_215812`)
+at `216.5 / 23.5 / 1060.7ms`, this only shifts medians within run variance:
+exact-512 shapes stayed near `87-93us/token`, prefill wall fell slightly, but
+decode-many GPU and CPU time rose. An adjacent no-env control on `49c2f1b` was
+stopped before server launch because an unrelated GPU job held inference-bench
+isolation. Keep the default threshold unchanged until a clean paired run shows
+a real prefill-body win without decode-work growth.
+
 ## Public 20260706_130207 and current-head all-provider refresh
 
 The latest public run advanced to

@@ -1038,8 +1038,9 @@ def _online_fp8_prefill_min_m(*, temperature: float, max_tokens: int) -> int:
         minimum=greedy_short_min_tokens,
     )
     if temperature <= 0.0 and greedy_short_min_tokens <= max_tokens <= greedy_short_max_tokens:
-        # Long-output suffix-prefill waves are mostly 512-1536 rows; include
-        # those in the runtime FP8 path by default while keeping env override.
+        # Long-output suffix-prefill waves are mostly 512-1536 rows. The model
+        # gate is strict (`m > min_m`), so the 512 default intentionally keeps
+        # exact-512 waves on bf16 unless an experiment opts into a lower gate.
         return env_int(
             "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_FP8_PREFILL_MIN_M",
             512,
