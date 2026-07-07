@@ -4502,6 +4502,7 @@ class Llama3TensorParallelForCausalLM:
             cache_token_bucket,
             steps,
             row_indices is not None,
+            _tp_flag("TORCHINFERNO_CUDAGRAPH_RAGGED_DECODE_MANY_ROTARY_IN_GRAPH", False),
             _symm_mem_allreduce_graph_key(input_ids.size(0), _model_world_size(self)),
         )
         captured = self._ragged_decode_many_graphs.get(key)
@@ -4557,14 +4558,14 @@ class Llama3TensorParallelForCausalLM:
             static_input_ids=torch.empty_like(input_ids),
             static_cache_positions=torch.empty((batch,), device=self.device, dtype=torch.int64),
             static_row_indices=static_row_indices,
-            static_rotary_cos=torch.empty((batch, rotary_cache_dim), device=self.device, dtype=self.dtype),
-            static_rotary_sin=torch.empty((batch, rotary_cache_dim), device=self.device, dtype=self.dtype),
+            static_rotary_cos=torch.empty((steps, batch, rotary_cache_dim), device=self.device, dtype=self.dtype),
+            static_rotary_sin=torch.empty((steps, batch, rotary_cache_dim), device=self.device, dtype=self.dtype),
             output_tokens=torch.empty((steps, batch), device=self.device, dtype=torch.long),
             cache=cache,
             max_seq_len=cache.layers[0].max_seq_len,
             cache_token_bucket=cache_token_bucket,
             steps=int(steps),
-            rotary_in_graph=True,
+            rotary_in_graph=_tp_flag("TORCHINFERNO_CUDAGRAPH_RAGGED_DECODE_MANY_ROTARY_IN_GRAPH", False),
         )
         self._copy_ragged_decode_graph_inputs(captured, input_ids, seq_lens, row_indices)
         stream = torch.cuda.Stream(device=self.device)
@@ -4585,6 +4586,7 @@ class Llama3TensorParallelForCausalLM:
             cache_token_bucket,
             int(steps),
             row_indices is not None,
+            bool(captured.rotary_in_graph),
             _symm_mem_allreduce_graph_key(input_ids.size(0), _model_world_size(self)),
         )
         max_graphs = _tp_int("TORCHINFERNO_CUDAGRAPH_DECODE_STEP_MAX_GRAPHS", 4096, minimum=1)
@@ -4673,8 +4675,15 @@ class Llama3TensorParallelForCausalLM:
                 else captured.static_cache_positions + step
             )
             rotary = (
-                self.rotary_cos_cache.index_select(0, cache_positions),
-                self.rotary_sin_cache.index_select(0, cache_positions),
+                (
+                    self.rotary_cos_cache.index_select(0, cache_positions),
+                    self.rotary_sin_cache.index_select(0, cache_positions),
+                )
+                if captured.rotary_in_graph
+                else (
+                    captured.static_rotary_cos[step],
+                    captured.static_rotary_sin[step],
+                )
             )
             logits = self._forward_decode_ragged_static(
                 token_ids,
@@ -4969,8 +4978,28 @@ class Llama3TensorParallelForCausalLM:
         captured.static_input_ids.copy_(input_ids)
         captured.static_cache_positions.copy_(cache_positions)
         if not getattr(captured, "rotary_in_graph", False):
-            captured.static_rotary_cos.copy_(self.rotary_cos_cache.index_select(0, cache_positions))
-            captured.static_rotary_sin.copy_(self.rotary_sin_cache.index_select(0, cache_positions))
+            steps = int(getattr(captured, "steps", 1))
+            if steps > 1:
+                step_offsets = torch.arange(steps, device=self.device, dtype=cache_positions.dtype)
+                positions = cache_positions.unsqueeze(0) + step_offsets[:, None]
+                flat_positions = positions.reshape(-1)
+                captured.static_rotary_cos.copy_(
+                    self.rotary_cos_cache.index_select(0, flat_positions).view(
+                        steps,
+                        input_ids.size(0),
+                        -1,
+                    )
+                )
+                captured.static_rotary_sin.copy_(
+                    self.rotary_sin_cache.index_select(0, flat_positions).view(
+                        steps,
+                        input_ids.size(0),
+                        -1,
+                    )
+                )
+            else:
+                captured.static_rotary_cos.copy_(self.rotary_cos_cache.index_select(0, cache_positions))
+                captured.static_rotary_sin.copy_(self.rotary_sin_cache.index_select(0, cache_positions))
         paged_state = _prepare_paged_ragged_decode_graph_state(
             captured.cache,
             batch=input_ids.size(0),

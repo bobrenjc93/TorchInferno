@@ -327,6 +327,111 @@ def test_llama3_tensor_parallel_ragged_prefill_graph_can_lookup_rotary_inside_gr
     assert torch.equal(rotary_sin, expected_sin)
 
 
+def test_llama3_tensor_parallel_ragged_decode_many_graph_copies_step_rotary() -> None:
+    model = object.__new__(Llama3TensorParallelForCausalLM)
+    model.device = torch.device("cpu")
+    model.rotary_cos_cache = torch.arange(80, dtype=torch.float32).view(20, 4)
+    model.rotary_sin_cache = model.rotary_cos_cache + 1000
+    input_ids = torch.tensor([[10], [20]], dtype=torch.long)
+    seq_lens = torch.tensor([3, 7, 11, 13], dtype=torch.long)
+    row_indices = torch.tensor([0, 2], dtype=torch.long)
+    captured = types.SimpleNamespace(
+        cache=types.SimpleNamespace(cache_backend="dense", layers=[types.SimpleNamespace(max_seq_len=20)]),
+        cache_token_bucket=20,
+        static_input_ids=torch.empty_like(input_ids),
+        static_cache_positions=torch.empty((2,), dtype=torch.long),
+        static_row_indices=torch.empty_like(row_indices),
+        static_rotary_cos=torch.empty((3, 2, 4), dtype=torch.float32),
+        static_rotary_sin=torch.empty((3, 2, 4), dtype=torch.float32),
+        static_paged_decode_page_tables=None,
+        static_paged_decode_seq_lens=None,
+        steps=3,
+        rotary_in_graph=False,
+    )
+
+    model._copy_ragged_decode_graph_inputs(captured, input_ids, seq_lens, row_indices)
+
+    expected_positions = torch.tensor([[3, 11], [4, 12], [5, 13]], dtype=torch.long)
+    assert torch.equal(captured.static_input_ids, input_ids)
+    assert torch.equal(captured.static_row_indices, row_indices)
+    assert captured.static_cache_positions.tolist() == [3, 11]
+    assert torch.equal(
+        captured.static_rotary_cos,
+        model.rotary_cos_cache.index_select(0, expected_positions.reshape(-1)).view(3, 2, 4),
+    )
+    assert torch.equal(
+        captured.static_rotary_sin,
+        model.rotary_sin_cache.index_select(0, expected_positions.reshape(-1)).view(3, 2, 4),
+    )
+
+
+def test_llama3_tensor_parallel_ragged_decode_many_static_uses_step_rotary(
+    monkeypatch,
+) -> None:
+    class _OutputTokens:
+        def __init__(self) -> None:
+            self.copies: list[tuple[int, torch.Tensor]] = []
+
+        def __getitem__(self, step: int) -> "_OutputTokens":
+            self._step = int(step)
+            return self
+
+        def copy_(self, token: torch.Tensor) -> None:
+            self.copies.append((self._step, token.clone()))
+
+    model = object.__new__(Llama3TensorParallelForCausalLM)
+    model.device = torch.device("cpu")
+    model.rotary_cos_cache = torch.full((20, 4), -1.0)
+    model.rotary_sin_cache = torch.full((20, 4), -2.0)
+    output_tokens = _OutputTokens()
+    captured = types.SimpleNamespace(
+        static_input_ids=torch.tensor([[1], [2]], dtype=torch.long),
+        static_cache_positions=torch.tensor([3, 11], dtype=torch.long),
+        static_row_indices=None,
+        static_rotary_cos=torch.arange(16, dtype=torch.float32).view(2, 2, 4),
+        static_rotary_sin=torch.arange(16, dtype=torch.float32).view(2, 2, 4) + 100,
+        output_tokens=output_tokens,
+        cache=object(),
+        cache_token_bucket=20,
+        steps=2,
+        rotary_in_graph=False,
+    )
+    calls: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = []
+
+    def forward_decode_ragged_static(
+        input_ids: torch.Tensor,
+        cache: object,
+        cache_positions: torch.Tensor,
+        row_indices: torch.Tensor | None,
+        rotary: tuple[torch.Tensor, torch.Tensor],
+        cache_token_bucket: int,
+    ) -> torch.Tensor:
+        del cache, row_indices, cache_token_bucket
+        calls.append((input_ids.clone(), cache_positions.clone(), rotary[0].clone(), rotary[1].clone()))
+        return torch.zeros((2, 1, 4), dtype=torch.float32)
+
+    def sample_next_token(logits: torch.Tensor, temperature: float) -> torch.Tensor:
+        del logits, temperature
+        offset = len(calls)
+        return torch.tensor([10 + offset, 20 + offset], dtype=torch.long)
+
+    monkeypatch.setattr(model, "_forward_decode_ragged_static", forward_decode_ragged_static)
+    monkeypatch.setattr(model, "_sample_next_token", sample_next_token)
+
+    model._forward_decode_ragged_many_static(captured)
+
+    assert [step for step, _token in output_tokens.copies] == [0, 1]
+    assert [token.tolist() for _step, token in output_tokens.copies] == [[11, 21], [12, 22]]
+    assert calls[0][0].tolist() == [[1], [2]]
+    assert calls[1][0].tolist() == [[11], [21]]
+    assert calls[0][1].tolist() == [3, 11]
+    assert calls[1][1].tolist() == [4, 12]
+    assert torch.equal(calls[0][2], captured.static_rotary_cos[0])
+    assert torch.equal(calls[0][3], captured.static_rotary_sin[0])
+    assert torch.equal(calls[1][2], captured.static_rotary_cos[1])
+    assert torch.equal(calls[1][3], captured.static_rotary_sin[1])
+
+
 def test_llama3_tensor_parallel_mixed_prefill_capture_failure_keeps_uniform_replays(
     monkeypatch,
 ) -> None:

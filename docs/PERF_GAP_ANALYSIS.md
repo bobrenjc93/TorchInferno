@@ -1,5 +1,31 @@
 # TorchInferno vs vLLM/sglang — Performance Gap Analysis (Llama-3.1-70B, 8xH100)
 
+## Current 20260707 decode-many graph rotary check
+
+The multi-step ragged decode graph now pre-copies per-step rotary tables for the
+diagnostic graph path instead of hardwiring per-step rotary `index_select` inside
+the captured body. The old behavior remains available with
+`TORCHINFERNO_CUDAGRAPH_RAGGED_DECODE_MANY_ROTARY_IN_GRAPH=1`. CPU coverage
+checks the `[steps, batch, rotary_dim]` copy layout and the static multi-step
+forward loop.
+
+The score-facing result is still not defaultable. With
+`TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY_GRAPH=1`, the static-rotary run
+(`/tmp/ti-long-decodemany-staticrotary-20260707-results/.../runs/20260707_223424`)
+landed at `239.4 / 24.3 / 1073.8ms`, `1000/1000` correct. It executed only
+`18` decode-many graph calls (`84` graph steps, `5.4K` graph model tokens) but
+still spent `3.70s` in `decode_many_graph_ms` and `6.70s` in decode-many GPU.
+The same patch with in-graph rotary
+(`/tmp/ti-long-decodemany-ingraphrotary-20260707-results/.../runs/20260707_224014`)
+landed at `228.5 / 23.4 / 1130.9ms`, also correct, with `44` graph calls,
+`214` graph steps, `13.6K` graph model tokens, `5.71s` graph time, and `9.58s`
+decode-many GPU. Static rotary improves E2E/p99 versus the in-graph comparison,
+but neither variant beats the current graph-off long_output band
+(`/tmp/allproviders-long-85007b2-20260707-results/.../runs/20260707_215812`)
+at `216.5 / 23.5 / 1060.7ms`. Keep multi-step decode graphs opt-in; the
+remaining long-output lever is still a cheaper high-active decode body or real
+decode/readback overlap, not this rotary placement.
+
 ## Public 20260706_130207 and current-head all-provider refresh
 
 The latest public run advanced to
