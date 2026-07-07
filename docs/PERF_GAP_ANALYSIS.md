@@ -12205,6 +12205,37 @@ similar, while prefill grew to `40` batches and `2.85s/3.43s`
 forward/wall. Keep combined submit+step scoped to the sampled-short policy and
 leave the global env override as an explicit diagnostic.
 
+A same-host all-provider `long_output` refresh on pushed `85007b2` wrote
+`/tmp/allproviders-long-85007b2-20260707-results/.../runs/20260707_215812`.
+vLLM landed at `84.2 / 16.8 / 685.9ms`, SGLang at
+`62.6 / 23.7 / 948.1ms`, and TorchInferno at
+`216.5 / 23.5 / 1060.7ms`, all `1000/1000` correct. TorchInferno's queue
+profile is the current dense-cache long-output band: `max_active=64`,
+`prefix_rows=64`, `use_decode_many=true`, `decode_quantum=3`,
+`drain_decode_quantum=8`, `62` prefill batches, `4.70s/5.25s` prefill
+forward/wall, `50.9K` prefill tokens, `21.4K` suffix-padding tokens,
+`5.05s` decode-many GPU, and `3.82s` ragged decode graph replay. The biggest
+score-facing gaps are unchanged: first-token latency is still padded
+cached-prefix prefill and decode/E2E is still the full-batch decode replay body.
+The earlier non-power decode-bucket, decode-many graph, stop-tail, and suffix
+split probes remain rejected because they move padding counters without
+lowering the dominant replay bodies enough.
+
+A focused current-head `few_shot` TorchInferno-only profile on `85007b2` wrote
+`/tmp/ti-few-current-85007b2-results/.../runs/20260707_221159` and landed at
+`170.1 / 46.6 / 211.6ms`, p99 `1198.4/197.1/1244.4ms`, `977/1000` correct.
+The live shape is fully warmed and concentrated: `max_active=32`,
+`prefix_rows=64`, no decode-many, no runtime FP8 prefill, `34` prefill
+batches, `31` hot replays of
+`prefix_graph:b32:s16:p122-122:src1:mixed0`, and no request-path prefill graph
+captures or misses. The hot row accounts for `987` requests, `12.3K` real
+suffix tokens, `15.9K` model tokens, and `3.48K` suffix-padding tokens with
+actual suffix lengths `12/13/14`. The existing exact-suffix, FP8, PRBD,
+prequeue, row-cap, warm-prefix-copy, selected-logit, and greedy-mid
+decode-many directions do not change under this profile: the current target is
+still a faster model-side cached-prefix prefill body, or a packed prefill body
+that avoids the Python packed-eager path's already-measured overhead.
+
 ## Priority for a focused (non-loop) session
 
 1. Prefill MFU (Issue 1) — biggest TTFT lever, ~2x, affects 3/5 benchmarks.
