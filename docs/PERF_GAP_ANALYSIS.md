@@ -12141,6 +12141,23 @@ fewer padded rows still does not beat the existing power-of-two replay family.
 Do not add non-power continuous decode buckets by default without a cheaper
 replay body.
 
+Greedy-large mixed-prefix multi_turn now defaults the scoped stream prequeue
+admission wait to `0ms`. On current `027a6d8`, the baseline `2ms` default wrote
+`/tmp/ti-multi-current-027a-20260707-results/.../runs/20260707_210346` and
+landed at `215.6 / 64.6 / 278.0ms`, p99 E2E `784.9ms`, `982/1000` correct.
+Disabling only
+`TORCHINFERNO_OPENAI_TP_GREEDY_LARGE_MIXED_PREFIX_STREAM_PREQUEUE_ADMISSION_WAIT_MS`
+with `0` wrote
+`/tmp/ti-multi-prequeue0-027a-20260707-results/.../runs/20260707_211442` and
+improved the score-facing medians to `213.1 / 57.3 / 267.7ms`, `979/1000`
+correct. Midpoint and larger waits did not validate: `1ms`
+(`/tmp/ti-multi-prequeue1-027a-20260707-results/.../runs/20260707_212000`)
+landed at `222.6 / 59.4 / 284.6ms`, and `4ms`
+(`/tmp/ti-multi-prequeue4-027a-20260707-results/.../runs/20260707_210942`)
+landed at `229.7 / 60.3 / 290.1ms`. Keep the env override for explicit
+diagnostics, but do not add an automatic stream prequeue delay to the
+mixed-prefix default.
+
 ## Priority for a focused (non-loop) session
 
 1. Prefill MFU (Issue 1) — biggest TTFT lever, ~2x, affects 3/5 benchmarks.

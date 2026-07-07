@@ -10482,7 +10482,7 @@ def test_openai_tp_stream_prequeue_admission_wait_scopes_greedy_large_mixed_pref
         raising=False,
     )
 
-    assert _tp_stream_prequeue_admission_wait_ms(temperature=0.0, max_tokens=512) == 2.0
+    assert _tp_stream_prequeue_admission_wait_ms(temperature=0.0, max_tokens=512) == 0.0
     assert _tp_stream_prequeue_admission_wait_ms(temperature=0.0, max_tokens=256) == 0.0
     assert _tp_stream_prequeue_admission_wait_ms(temperature=0.7, max_tokens=512) == 0.0
 
@@ -10490,7 +10490,7 @@ def test_openai_tp_stream_prequeue_admission_wait_scopes_greedy_large_mixed_pref
     assert _tp_stream_prequeue_admission_wait_ms(temperature=0.0, max_tokens=512) == 0.0
 
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_MIXED_PREFIX_REUSE", "1")
-    assert _tp_stream_prequeue_admission_wait_ms(temperature=0.0, max_tokens=512) == 2.0
+    assert _tp_stream_prequeue_admission_wait_ms(temperature=0.0, max_tokens=512) == 0.0
 
     monkeypatch.setenv(
         "TORCHINFERNO_OPENAI_TP_GREEDY_LARGE_MIXED_PREFIX_STREAM_PREQUEUE_ADMISSION_WAIT_MS",

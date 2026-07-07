@@ -1408,12 +1408,11 @@ def _tp_stream_prequeue_admission_wait_ms(*, temperature: float, max_tokens: int
         temperature=temperature,
         max_tokens=max_tokens,
     ):
-        # The request-prompt reuse path benefits from letting sibling HTTP
-        # workers finish tokenization before the first request starts the online
-        # batcher; keep this wait scoped to the greedy-large mixed-prefix policy.
+        # Current TP8 multi-turn A/B favors immediate admission for the
+        # mixed-prefix path. Keep the scoped env hook for diagnostics.
         return env_float(
             "TORCHINFERNO_OPENAI_TP_GREEDY_LARGE_MIXED_PREFIX_STREAM_PREQUEUE_ADMISSION_WAIT_MS",
-            2.0,
+            0.0,
             minimum=0.0,
         )
     if temperature > 0.0 and max_tokens > 0:
