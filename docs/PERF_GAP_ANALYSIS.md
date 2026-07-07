@@ -12158,6 +12158,53 @@ landed at `229.7 / 60.3 / 290.1ms`. Keep the env override for explicit
 diagnostics, but do not add an automatic stream prequeue delay to the
 mixed-prefix default.
 
+Public `20260707_210232` measured TorchInferno `027a6d8`, so it includes the
+sampled-medium prefill-ready active-cap restoration and the decode-bucket
+rejection note, but not the later `c997899` mixed-prefix prequeue default. The
+public row kept the scorecard at TorchInferno `3/20`, vLLM `15/20`, and SGLang
+`1/20`. Tree improved materially on the public scoreboard at
+`65.8 / 43.5 / 99.1ms` versus vLLM `33.1 / 21.8 / 48.8ms`; this validates the
+sampled-medium tree direction even though vLLM still wins that row. Public
+multi_turn remained the stale prequeue target at `272.1 / 58.6 / 327.0ms`
+versus vLLM `157.0 / 46.3 / 201.3ms`.
+
+A same-host all-provider `multi_turn` refresh on pushed `c997899` wrote
+`/tmp/allproviders-multi-c997899-20260707-results/.../runs/20260707_212948`.
+vLLM landed at `157.0 / 55.5 / 205.6ms`, SGLang at
+`164.2 / 116.0 / 275.3ms`, and TorchInferno at
+`225.4 / 60.9 / 295.0ms`, `982/1000` correct. The queue profile shows the
+current mixed-prefix path is active (`max_active=32`, `prefix_rows=112`,
+`{"common_prefix":125,"request_prompt":875}`), with `38` prefill batches,
+`2.39s/2.73s` prefill forward/wall, `q2submit_p50=66.6ms`,
+`q2first_p50=151.0ms`, and `submit2first_p50=86.5ms`. This is the current
+post-prequeue local comparison band while public waits for a `c997899` run.
+
+Adding an intermediate greedy-large prefix-prefill batch bucket is rejected.
+The scoped env probe
+`TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_BATCH_BUCKETS=1,2,4,8,16,24,32` on
+`c997899` wrote
+`/tmp/ti-multi-b24bucket-c997899-20260707-results/.../runs/20260707_214417`.
+It stayed correct enough (`981/1000`) but landed at
+`227.4 / 61.0 / 288.2ms` with a much worse p99 (`1192.6ms` TTFT,
+`1253.6ms` E2E) and readiness stretched to `226s`. Queue telemetry split the
+run into `381` and `619` request sessions and exposed very slow mixed-prefix
+`b24:s32` replays (`453-486ms` forward) plus `3` graph misses in the larger
+session. The saved padded rows do not compensate for the extra warmup,
+fragmentation, and slow b24 mixed-prefix bodies; keep greedy-large mixed-prefix
+batch buckets on the existing power-of-two path unless the b24 replay body is
+made cheap and warm.
+
+Forcing combined submit+step on greedy-large mixed-prefix multi_turn is also
+rejected. The env run
+`TORCHINFERNO_OPENAI_TP_ONLINE_SUBMIT_STEP_COMMAND=1` on `c997899` wrote
+`/tmp/ti-multi-submitstep-c997899-20260707-results/.../runs/20260707_215043`
+and landed at `227.0 / 61.8 / 287.1ms`, `980/1000` correct, with p99 TTFT/E2E
+regressing to `1036.5/1095.7ms`. It did not reduce score-facing first-token
+latency versus the current no-env band: queue `q2first_p50=145.4ms` was
+similar, while prefill grew to `40` batches and `2.85s/3.43s`
+forward/wall. Keep combined submit+step scoped to the sampled-short policy and
+leave the global env override as an explicit diagnostic.
+
 ## Priority for a focused (non-loop) session
 
 1. Prefill MFU (Issue 1) — biggest TTFT lever, ~2x, affects 3/5 benchmarks.
