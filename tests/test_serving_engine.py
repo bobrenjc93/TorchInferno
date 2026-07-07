@@ -3616,6 +3616,7 @@ def test_prefix_prefill_seq_lens_scratch_keeps_unfilled_rows_zero() -> None:
         required=5,
     )
     assert first.tolist() == [7, 0, 0, 0, 9]
+    cached_values = engine._device_index_tensors[(7, 9)]
 
     second = engine._prefix_prefill_seq_lens_tensor(
         [1],
@@ -3625,6 +3626,15 @@ def test_prefix_prefill_seq_lens_scratch_keeps_unfilled_rows_zero() -> None:
     )
 
     assert second.tolist() == [0, 3, 0, 0, 0]
+    third = engine._prefix_prefill_seq_lens_tensor(
+        [0, 4],
+        [7, 9],
+        row_indices=torch.tensor([0, 4], dtype=torch.long),
+        required=5,
+    )
+
+    assert third.tolist() == [7, 0, 0, 0, 9]
+    assert engine._device_index_tensors[(7, 9)] is cached_values
 
 
 def test_continuous_batch_engine_skips_active_row_clear_for_prefix_graph_batch(

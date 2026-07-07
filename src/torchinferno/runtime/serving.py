@@ -3465,9 +3465,9 @@ class ContinuousBatchEngine:
             setup_start_s = time.perf_counter() if self.profile_timings else 0.0
             all_rows = rows + pad_rows + pad_prefix_rows
             input_ids = torch.tensor(padded_suffixes, device=self.device, dtype=torch.long)
-            row_indices = torch.tensor(all_rows, device=self.device, dtype=torch.long)
+            row_indices = self._device_index_tensor(tuple(all_rows))
             src_prefix_row = (
-                torch.tensor(source_prefix_rows, device=self.device, dtype=torch.long)
+                self._device_index_tensor(tuple(source_prefix_rows))
                 if source_prefix_rows
                 else None
             )
@@ -3478,11 +3478,11 @@ class ContinuousBatchEngine:
                 row_indices=row_indices,
                 required=required,
             )
-            logit_positions = torch.tensor(
-                [length - 1 for length in suffix_lengths]
-                + [0] * (len(pad_rows) + len(pad_prefix_rows)),
-                device=self.device,
-                dtype=torch.long,
+            logit_positions = self._device_index_tensor(
+                tuple(
+                    [length - 1 for length in suffix_lengths]
+                    + [0] * (len(pad_rows) + len(pad_prefix_rows))
+                )
             )
             packed_prefill_pattern_key = _packed_prefill_candidate_pattern(
                 shape_key,
@@ -3935,17 +3935,11 @@ class ContinuousBatchEngine:
                 device=self.device,
                 dtype=torch.long,
             )
-            fixed_seq_lens = torch.tensor(seq_lens_list, device=self.device, dtype=torch.long)
-            fixed_row_indices = torch.tensor(fixed_rows, device=self.device, dtype=torch.long)
-            fixed_q_lens = torch.tensor(
-                fixed_q_lens_values,
-                device=self.device,
-                dtype=torch.long,
-            )
-            fixed_logit_positions = torch.tensor(
-                fixed_logit_positions_values,
-                device=self.device,
-                dtype=torch.long,
+            fixed_seq_lens = self._device_index_tensor(tuple(seq_lens_list))
+            fixed_row_indices = self._device_index_tensor(tuple(fixed_rows))
+            fixed_q_lens = self._device_index_tensor(tuple(fixed_q_lens_values))
+            fixed_logit_positions = self._device_index_tensor(
+                tuple(fixed_logit_positions_values)
             )
             packed_start_s = time.perf_counter() if self.profile_timings else 0.0
             logits = packed_graph(
@@ -3961,10 +3955,8 @@ class ContinuousBatchEngine:
             )
             if logits is None:
                 return None
-            real_index_tensor = torch.tensor(
-                real_slot_indices,
-                device=logits.device,
-                dtype=torch.long,
+            real_index_tensor = self._device_index_tensor(tuple(real_slot_indices)).to(
+                device=logits.device
             )
             real_logits = logits.index_select(0, real_index_tensor)
             elapsed_ms = (
@@ -8232,7 +8224,7 @@ class ContinuousBatchEngine:
             scratch = torch.empty(total, dtype=torch.long, device=self.device)
             self._prefix_prefill_seq_lens_scratch = scratch
         scratch[:total].zero_()
-        values = torch.tensor(start_lens, device=self.device, dtype=torch.long)
+        values = self._device_index_tensor(tuple(int(value) for value in start_lens))
         scratch[:total].index_copy_(0, row_indices.to(dtype=torch.long), values)
         return scratch[:total]
 
