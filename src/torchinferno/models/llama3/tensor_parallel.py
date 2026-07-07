@@ -38,6 +38,7 @@ _SYMM_PREFILL_SHAPES: set[tuple[str, tuple[int, ...], int]] = set()
 _SYMM_REDUCE_DISABLED = False
 _SYMM_MEM_ALLREDUCE_MAX_BATCH_OVERRIDE: list[int | None] = [None]
 _SYMM_MEM_ALLREDUCE_ENABLED_OVERRIDE: list[bool | None] = [None]
+_SYMM_MEM_PREFILL_ALLREDUCE_ENABLED_OVERRIDE: list[bool | None] = [None]
 _DEFAULT_DECODE_STEP_MAX_BATCH = 64
 _PackedPrefillAttentionGroup = tuple[int, int, Tensor, tuple[int, ...], tuple[int, ...]]
 
@@ -55,6 +56,16 @@ def symm_mem_allreduce_max_batch(max_batch: int | None, *, enabled: bool | None 
     finally:
         _SYMM_MEM_ALLREDUCE_MAX_BATCH_OVERRIDE[0] = previous_batch
         _SYMM_MEM_ALLREDUCE_ENABLED_OVERRIDE[0] = previous_enabled
+
+
+@contextmanager
+def symm_mem_prefill_allreduce(enabled: bool | None = None) -> Iterator[None]:
+    previous_enabled = _SYMM_MEM_PREFILL_ALLREDUCE_ENABLED_OVERRIDE[0]
+    _SYMM_MEM_PREFILL_ALLREDUCE_ENABLED_OVERRIDE[0] = enabled
+    try:
+        yield
+    finally:
+        _SYMM_MEM_PREFILL_ALLREDUCE_ENABLED_OVERRIDE[0] = previous_enabled
 
 
 def _tp_flag(name: str, default: bool = True) -> bool:
@@ -2457,12 +2468,18 @@ class _Llama3TensorParallelLayer:
         if not use_sm and _should_use_symm_mem_prefill_all_reduce(hidden, weight, self.world_size):
             # Eager prefill: bound distinct prefill shapes so per-shape ~0.5GB
             # symm-mem buffers cannot churn into OOM; new shapes past the cap fall
-            # back to NCCL. few_shot's shape repeats, so it stays cached.
+            # back to NCCL. During CUDA graph capture, only reuse a buffer that an
+            # eager warmup already allocated and probed; rendezvous/allocation inside
+            # capture is not legal.
             sm_name = f"{buffer_name}-pf"
             cap = _tp_int("TORCHINFERNO_SYMM_MEM_PREFILL_MAX_BUFFERS", 6, minimum=1)
             shape_key = (sm_name, tuple(hidden.shape[:-1]), int(weight.size(0)))
             if shape_key in _SYMM_PREFILL_SHAPES or len(_SYMM_PREFILL_SHAPES) < cap:
-                use_sm = True
+                expected_shape = (*hidden.shape[:-1], weight.size(0))
+                use_sm = (
+                    not _cuda_stream_is_capturing(hidden.device)
+                    or self._symm_reduce_buffer_ready(sm_name, hidden, expected_shape)
+                )
         if use_sm and not self._symm_reduce_failed:
             try:
                 expected_shape = (*hidden.shape[:-1], weight.size(0))
@@ -2508,6 +2525,11 @@ class _Llama3TensorParallelLayer:
         fp8_out = self._fp8_proj(hidden, fp8_key, weight) if fp8_key is not None else None
         try:
             expected_shape = (*hidden.shape[:-1], weight.size(0))
+            if (
+                _cuda_stream_is_capturing(hidden.device)
+                and not self._symm_reduce_buffer_ready(buffer_name, hidden, expected_shape)
+            ):
+                return None
             buffer, group_name = self._symm_reduce_buffer(buffer_name, hidden, expected_shape)
             if fp8_out is not None:
                 buffer.reshape(-1, weight.size(0)).copy_(fp8_out.reshape(-1, weight.size(0)))
@@ -2524,6 +2546,14 @@ class _Llama3TensorParallelLayer:
         except Exception:
             _disable_symm_reduce()
             return None
+
+    def _symm_reduce_buffer_ready(self, name: str, hidden: Tensor, expected_shape: tuple[int, ...]) -> bool:
+        if not dist.is_available() or not dist.is_initialized():
+            return False
+        group_name = dist.group.WORLD.group_name
+        device_index = hidden.device.index if hidden.device.index is not None else torch.cuda.current_device()
+        key = (group_name, device_index, name, str(hidden.dtype), expected_shape)
+        return key in _SYMM_REDUCE_BUFFERS and key in _SYMM_REDUCE_PROBED
 
     def _symm_reduce_buffer(self, name: str, hidden: Tensor, expected_shape: tuple[int, ...]) -> tuple[Tensor, str]:
         if not dist.is_available() or not dist.is_initialized():
@@ -8985,25 +9015,25 @@ def _model_world_size(model: object) -> int:
 def _should_use_symm_mem_prefill_all_reduce(hidden: Tensor, weight: Tensor, world_size: int) -> bool:
     # symm-mem multimem_all_reduce beats NCCL ring 1.38-3.16x on 8xH100 for
     # prefill-sized [tokens, hidden] bf16 (scripts/bench_allreduce.py). Allreduce
-    # is ~31% of prefill (profiled), so this is the top prefill lever. ON by
-    # default. Restricted to EAGER execution: during CUDA-graph capture the
-    # per-shape symm-mem buffer would need a rendezvous (a collective) inside the
-    # graph, which is illegal -- so captured (bucketed) prefill stays on NCCL and
-    # only the eager path (e.g. few_shot's 48x640 graph-miss) uses symm-mem.
+    # is ~31% of prefill (profiled), so this is the top prefill lever. Callers must
+    # avoid allocating/probing the per-shape symm-mem buffer during CUDA graph
+    # capture; captured prefill may reuse only buffers prepared by eager warmup.
     max_tokens = _tp_int("TORCHINFERNO_SYMM_MEM_PREFILL_ALLREDUCE_MAX_TOKENS", 40960, minimum=1)
+    override = _SYMM_MEM_PREFILL_ALLREDUCE_ENABLED_OVERRIDE[0]
+    prefill_enabled = (
+        override
+        if override is not None
+        else _tp_flag("TORCHINFERNO_SYMM_MEM_PREFILL_ALLREDUCE", False)
+    )
     return (
         world_size > 1
         and not _SYMM_REDUCE_DISABLED
-        # DEFAULT OFF for the same per-rank-fallback divergence-deadlock reason as
-        # the decode path (see _symm_mem_allreduce_enabled): a subset-rank multicast
-        # init failure on a fresh remote host hangs warmup -> bench dash runs.
-        and _tp_flag("TORCHINFERNO_SYMM_MEM_PREFILL_ALLREDUCE", False)
+        and prefill_enabled
         and hidden.is_cuda
         and weight.is_cuda
         and hidden.ndim == 3
         and hidden.size(1) > 1
         and hidden.size(0) * hidden.size(1) <= max_tokens
-        and not torch.cuda.is_current_stream_capturing()
     )
 
 

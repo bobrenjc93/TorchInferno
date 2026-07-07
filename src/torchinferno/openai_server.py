@@ -24,6 +24,7 @@ from torch import Tensor
 from torchinferno.models.llama3.tensor_parallel import (
     Llama3TensorParallelForCausalLM,
     symm_mem_allreduce_max_batch,
+    symm_mem_prefill_allreduce,
 )
 from torchinferno.engine.loader import (
     distributed_env_requested as _engine_distributed_env_requested,
@@ -1334,19 +1335,24 @@ def _online_initial_batch_wait_ms(*, temperature: float, max_tokens: int) -> flo
             256,
             minimum=1,
         )
+        sampled_medium_min_tokens = env_int(
+            "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_INITIAL_BATCH_WAIT_MIN_TOKENS",
+            sampled_short_max_tokens + 1,
+            minimum=1,
+        )
         sampled_medium_max_tokens = env_int(
             "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_INITIAL_BATCH_WAIT_MAX_TOKENS",
             300,
-            minimum=sampled_short_max_tokens,
+            minimum=sampled_medium_min_tokens,
         )
-        if sampled_short_max_tokens < max_tokens <= sampled_medium_max_tokens:
+        if sampled_medium_min_tokens <= max_tokens <= sampled_medium_max_tokens:
             # Tree-of-thought sampled medium bursts are queue-to-submit bound in
             # the current worker-wave shape. With the sampled-medium decode
             # quantum lowered, a shorter first window keeps TTFT/E2E down without
             # touching sampled-short or greedy policy.
             default_wait_ms = env_float(
                 "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_INITIAL_BATCH_WAIT_MS",
-                1.0,
+                2.0,
                 minimum=0.0,
             )
     elif temperature <= 0.0 and 0 < max_tokens <= env_int(
@@ -13328,6 +13334,30 @@ def _openai_tp_symm_mem_allreduce_enabled(*, startup: bool = False) -> bool:
     return mode in {"all", "runtime"}
 
 
+def _openai_tp_symm_mem_prefill_allreduce_enabled(
+    *,
+    max_tokens: int,
+    temperature: float,
+    startup: bool = False,
+) -> bool:
+    del temperature
+    global_env = "TORCHINFERNO_SYMM_MEM_ALLREDUCE"
+    if global_env in os.environ and not env_flag(global_env, False):
+        return False
+    model_prefill_env = "TORCHINFERNO_SYMM_MEM_PREFILL_ALLREDUCE"
+    if model_prefill_env in os.environ:
+        return env_flag(model_prefill_env, False)
+    openai_prefill_env = "TORCHINFERNO_OPENAI_TP_SYMM_MEM_PREFILL_ALLREDUCE"
+    if openai_prefill_env in os.environ:
+        return env_flag(openai_prefill_env, False)
+    if not _openai_tp_symm_mem_allreduce_enabled(startup=startup):
+        return False
+    max_tokens_limit = env_int("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_MAX_TOKENS", 1024, minimum=1)
+    if max_tokens > max_tokens_limit:
+        return False
+    return env_flag("TORCHINFERNO_OPENAI_TP_SYMM_MEM_PREFILL_ALLREDUCE_DEFAULT", True)
+
+
 def _prepare_tensor_parallel_symm_mem_allreduce_auto(config: OpenAIServerConfig) -> None:
     openai_env = "TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE"
     global_env = "TORCHINFERNO_SYMM_MEM_ALLREDUCE"
@@ -13449,6 +13479,18 @@ def _terminate_process_group(proc: subprocess.Popen[str]) -> None:
     proc.wait(timeout=5.0)
 
 
+@contextmanager
+def _tensor_parallel_symm_mem_allreduce_context(
+    max_batch: int | None,
+    *,
+    enabled: bool,
+    prefill_enabled: bool,
+) -> Iterator[None]:
+    with symm_mem_allreduce_max_batch(max_batch, enabled=enabled):
+        with symm_mem_prefill_allreduce(prefill_enabled):
+            yield
+
+
 def _tensor_parallel_symm_mem_allreduce_scope(
     model: object,
     device: torch.device,
@@ -13463,20 +13505,30 @@ def _tensor_parallel_symm_mem_allreduce_scope(
         or device.type != "cuda"
     ):
         return nullcontext()
-    max_temperature = env_float(
-        "TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_MAX_TEMPERATURE",
-        0.0,
-        minimum=0.0,
-    )
-    if float(temperature) > max_temperature:
-        return symm_mem_allreduce_max_batch(None, enabled=False)
     max_tokens_limit = env_int("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_MAX_TOKENS", 1024, minimum=1)
+    prefill_enabled = _openai_tp_symm_mem_prefill_allreduce_enabled(
+        max_tokens=max_tokens,
+        temperature=temperature,
+        startup=startup,
+    )
     if max_tokens > max_tokens_limit:
-        return symm_mem_allreduce_max_batch(None, enabled=False)
+        return _tensor_parallel_symm_mem_allreduce_context(
+            None,
+            enabled=False,
+            prefill_enabled=prefill_enabled,
+        )
     if not _openai_tp_symm_mem_allreduce_enabled(startup=startup):
-        return symm_mem_allreduce_max_batch(None, enabled=False)
+        return _tensor_parallel_symm_mem_allreduce_context(
+            None,
+            enabled=False,
+            prefill_enabled=prefill_enabled,
+        )
     max_batch = env_int("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_MAX_BATCH", 128, minimum=1)
-    return symm_mem_allreduce_max_batch(max_batch, enabled=True)
+    return _tensor_parallel_symm_mem_allreduce_context(
+        max_batch,
+        enabled=True,
+        prefill_enabled=prefill_enabled,
+    )
 
 
 def _fi_decode_graph_mode() -> str:

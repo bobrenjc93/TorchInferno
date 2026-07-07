@@ -9362,12 +9362,15 @@ def test_openai_symm_mem_scope_runtime_mode_skips_startup(monkeypatch) -> None:
     assert captured == [(128, True), (None, False)]
 
 
-def test_openai_symm_mem_scope_disables_sampled_and_long_generations(monkeypatch) -> None:
+def test_openai_symm_mem_scope_enables_sampled_and_disables_long_generations(monkeypatch) -> None:
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE", "1")
     monkeypatch.delenv("TORCHINFERNO_SYMM_MEM_ALLREDUCE", raising=False)
     monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_MAX_TEMPERATURE", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_SYMM_MEM_PREFILL_ALLREDUCE", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_SYMM_MEM_PREFILL_ALLREDUCE", raising=False)
     model = object()
     captured: list[tuple[int | None, bool | None]] = []
+    prefill_captured: list[bool | None] = []
 
     class FakeContext:
         def __enter__(self): return None
@@ -9377,9 +9380,14 @@ def test_openai_symm_mem_scope_disables_sampled_and_long_generations(monkeypatch
         captured.append((max_batch, enabled))
         return FakeContext()
 
+    def fake_prefill_scope(enabled: bool | None = None):
+        prefill_captured.append(enabled)
+        return FakeContext()
+
     monkeypatch.setattr("torchinferno.openai_server._is_tensor_parallel_model", lambda candidate: candidate is model)
     monkeypatch.setattr("torchinferno.openai_server._tensor_parallel_world_size", lambda candidate: 8)
     monkeypatch.setattr("torchinferno.openai_server.symm_mem_allreduce_max_batch", fake_symm_scope)
+    monkeypatch.setattr("torchinferno.openai_server.symm_mem_prefill_allreduce", fake_prefill_scope)
 
     with _tensor_parallel_symm_mem_allreduce_scope(
         model,
@@ -9396,7 +9404,8 @@ def test_openai_symm_mem_scope_disables_sampled_and_long_generations(monkeypatch
     ):
         pass
 
-    assert captured == [(None, False), (None, False)]
+    assert captured == [(128, True), (None, False)]
+    assert prefill_captured == [True, False]
 
 
 def test_openai_symm_mem_scope_can_enable_sampled_generations(monkeypatch) -> None:
@@ -10564,6 +10573,10 @@ def test_openai_online_initial_batch_wait_uses_sampled_short_default(monkeypatch
         raising=False,
     )
     monkeypatch.delenv(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_INITIAL_BATCH_WAIT_MIN_TOKENS",
+        raising=False,
+    )
+    monkeypatch.delenv(
         "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_INITIAL_BATCH_WAIT_MAX_TOKENS",
         raising=False,
     )
@@ -10610,10 +10623,10 @@ def test_openai_online_initial_batch_wait_uses_sampled_short_default(monkeypatch
     assert _online_initial_batch_wait_ms(temperature=0.0, max_tokens=256) == 1.0
     assert _online_initial_batch_wait_ms(temperature=0.0, max_tokens=400) == 1.0
     assert _online_initial_batch_wait_ms(temperature=0.0, max_tokens=401) == 10.0
-    assert _online_initial_batch_wait_ms(temperature=0.0, max_tokens=512) == 10.0
+    assert _online_initial_batch_wait_ms(temperature=0.0, max_tokens=512) == 5.0
     assert _online_initial_batch_wait_ms(temperature=0.0, max_tokens=513) == 1.0
-    assert _online_initial_batch_wait_ms(temperature=0.7, max_tokens=257) == 1.0
-    assert _online_initial_batch_wait_ms(temperature=0.7, max_tokens=300) == 1.0
+    assert _online_initial_batch_wait_ms(temperature=0.7, max_tokens=257) == 2.0
+    assert _online_initial_batch_wait_ms(temperature=0.7, max_tokens=300) == 2.0
     assert _online_initial_batch_wait_ms(temperature=0.7, max_tokens=301) == 1.0
 
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_MIXED_PREFIX_REUSE", "1")

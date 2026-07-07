@@ -153,6 +153,43 @@ def test_llama3_tensor_parallel_decode_marlin_writes_into_symm_buffer(monkeypatc
     torch.testing.assert_close(reduce_buffer, torch.full_like(reduce_buffer, 7))
 
 
+def test_llama3_tensor_parallel_prefill_symm_capture_requires_ready_buffer(monkeypatch) -> None:
+    layer = object.__new__(tensor_parallel_module._Llama3TensorParallelLayer)
+    layer.world_size = 2
+    layer._symm_reduce_failed = False
+    hidden = torch.ones((2, 3, 4), dtype=torch.bfloat16)
+    weight = torch.ones((8, 4), dtype=torch.bfloat16)
+    all_reduce_calls = []
+
+    def symm_reduce_buffer(*args, **kwargs):
+        raise AssertionError("capture should not allocate or probe a missing symm buffer")
+
+    def all_reduce(tensor):
+        all_reduce_calls.append(tensor)
+
+    monkeypatch.setattr(layer, "_symm_reduce_buffer", symm_reduce_buffer)
+    monkeypatch.setattr(layer, "_symm_reduce_buffer_ready", lambda *args, **kwargs: False)
+    monkeypatch.setattr(layer, "_marlin_proj", lambda *args, **kwargs: None)
+    monkeypatch.setattr(layer, "_fp8_proj", lambda *args, **kwargs: None)
+    monkeypatch.setattr(tensor_parallel_module, "_all_reduce", all_reduce)
+    monkeypatch.setattr(tensor_parallel_module, "_cuda_stream_is_capturing", lambda device: True)
+    monkeypatch.setattr(
+        tensor_parallel_module,
+        "_should_use_symm_mem_all_reduce",
+        lambda hidden_arg, weight_arg, world_size: False,
+    )
+    monkeypatch.setattr(
+        tensor_parallel_module,
+        "_should_use_symm_mem_prefill_all_reduce",
+        lambda hidden_arg, weight_arg, world_size: True,
+    )
+
+    result = layer._decode_linear_all_reduce(hidden, weight, "attention")
+
+    assert result.shape == (2, 3, 8)
+    assert all_reduce_calls == [result]
+
+
 def test_llama3_tensor_parallel_decode_mlp_reuses_scratch_buffers(monkeypatch) -> None:
     layer = object.__new__(tensor_parallel_module._Llama3TensorParallelLayer)
     layer.world_size = 1
