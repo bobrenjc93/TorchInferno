@@ -12126,6 +12126,21 @@ queue-to-first p50/p99 to `100.6/335.1ms` and queue-to-finish p50/p99 to
 medium traffic; sampled-short self-consistency, greedy traffic, and the row cap
 remain unchanged.
 
+Warmed non-power decode buckets remain rejected for long_output. A temporary
+opt-in patch made continuous decode buckets configurable and added matching
+online startup warmup, then tested `2,3,4,8,16,32,40,48,56,64` on current
+`620557c`. The run
+`/tmp/ti-long-decodebuckets-f620-20260707-results/.../runs/20260707_204749`
+stayed correct and cut decode-many padding to `850` tokens, but landed only
+neutral at `217.0 / 23.5 / 1051.1ms` with `5.00s` decode-many GPU. A narrower
+`2,3,4,8,16,32,48,64` run
+`/tmp/ti-long-decodeb48-f620-20260707-results/.../runs/20260707_205337` also
+stayed correct but regressed to `220.9 / 23.9 / 1072.8ms`. This validates that
+request-path capture was not the only blocker in the earlier fine-bucket probe:
+fewer padded rows still does not beat the existing power-of-two replay family.
+Do not add non-power continuous decode buckets by default without a cheaper
+replay body.
+
 ## Priority for a focused (non-loop) session
 
 1. Prefill MFU (Issue 1) — biggest TTFT lever, ~2x, affects 3/5 benchmarks.
