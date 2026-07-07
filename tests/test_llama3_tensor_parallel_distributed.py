@@ -432,6 +432,81 @@ def test_llama3_tensor_parallel_ragged_decode_many_static_uses_step_rotary(
     assert torch.equal(calls[1][3], captured.static_rotary_sin[1])
 
 
+def test_llama3_tensor_parallel_ragged_decode_reuses_attention_lengths() -> None:
+    class _FakeLayer:
+        def __init__(self) -> None:
+            self.input_layernorm_weight = torch.ones(4)
+            self.seen_attention_lengths: list[torch.Tensor | None] = []
+
+        def forward_decode_ragged(
+            self,
+            hidden: torch.Tensor,
+            attn_in: torch.Tensor | None,
+            rotary: tuple[torch.Tensor, torch.Tensor],
+            cache: object,
+            cache_positions: torch.Tensor,
+            row_indices: torch.Tensor | None,
+            next_norm_weight: torch.Tensor,
+            attention_cache_tokens: int | None = None,
+            attention_lengths: torch.Tensor | None = None,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            del attn_in, rotary, cache, cache_positions, row_indices, next_norm_weight
+            del attention_cache_tokens
+            self.seen_attention_lengths.append(attention_lengths)
+            return hidden, hidden
+
+    def make_model() -> Llama3TensorParallelForCausalLM:
+        model = object.__new__(Llama3TensorParallelForCausalLM)
+        model.device = torch.device("cpu")
+        model.embed_tokens_weight = torch.eye(16, 4)
+        model.lm_head_weight = torch.eye(4)
+        model.lm_head_weight_decode = None
+        model.norm_weight = torch.ones(4)
+        model.rotary_cos_cache = torch.zeros(16, 4)
+        model.rotary_sin_cache = torch.zeros(16, 4)
+        model.layers = [_FakeLayer(), _FakeLayer()]
+        return model
+
+    cache = types.SimpleNamespace(
+        cache_backend="dense",
+        layers=[
+            types.SimpleNamespace(max_seq_len=16),
+            types.SimpleNamespace(max_seq_len=16),
+        ],
+    )
+    model = make_model()
+    input_ids = torch.tensor([[1], [2]], dtype=torch.long)
+    cache_positions = torch.tensor([3, 11], dtype=torch.long)
+    rotary = (
+        torch.zeros(2, 4, dtype=torch.float32),
+        torch.zeros(2, 4, dtype=torch.float32),
+    )
+
+    model._forward_decode_ragged_static(
+        input_ids,
+        cache,
+        cache_positions,
+        None,
+        rotary,
+        attention_cache_tokens=16,
+    )
+
+    static_seen = [layer.seen_attention_lengths[0] for layer in model.layers]
+    assert static_seen[0] is static_seen[1]
+    assert static_seen[0] is not None
+    assert static_seen[0].tolist() == [4, 12]
+
+    model = make_model()
+    seq_lens = torch.tensor([0, 3, 0, 11], dtype=torch.long)
+    row_indices = torch.tensor([1, 3], dtype=torch.long)
+    model.decode_ragged_logits(input_ids, cache, seq_lens=seq_lens, row_indices=row_indices)
+
+    eager_seen = [layer.seen_attention_lengths[0] for layer in model.layers]
+    assert eager_seen[0] is eager_seen[1]
+    assert eager_seen[0] is not None
+    assert eager_seen[0].tolist() == [4, 12]
+
+
 def test_llama3_tensor_parallel_mixed_prefill_capture_failure_keeps_uniform_replays(
     monkeypatch,
 ) -> None:

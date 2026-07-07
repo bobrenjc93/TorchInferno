@@ -1722,6 +1722,7 @@ class _Llama3TensorParallelLayer:
         row_indices: Tensor | None,
         next_norm_weight: Tensor,
         attention_cache_tokens: int | None = None,
+        attention_lengths: Tensor | None = None,
     ) -> tuple[Tensor, Tensor]:
         residual = hidden
         attention = self._attention_decode_ragged(
@@ -1732,6 +1733,7 @@ class _Llama3TensorParallelLayer:
             cache_positions,
             row_indices,
             attention_cache_tokens=attention_cache_tokens,
+            attention_lengths=attention_lengths,
         )
         hidden, mlp_in = _tp_decode_add_rms_norm(
             attention,
@@ -1856,6 +1858,7 @@ class _Llama3TensorParallelLayer:
         row_indices: Tensor | None,
         *,
         attention_cache_tokens: int | None = None,
+        attention_lengths: Tensor | None = None,
     ) -> Tensor:
         batch, tokens, _ = hidden.shape
         if tokens != 1:
@@ -1904,7 +1907,8 @@ class _Llama3TensorParallelLayer:
         else:
             q, k = _apply_rotary_ragged(q, k, rotary)
             _append_ragged_kv_cache(cache, k, v, cache_positions, row_indices)
-        attention_lengths = cache_positions + 1
+        if attention_lengths is None:
+            attention_lengths = cache_positions + 1
         if row_indices is None:
             attention_keys = cache.keys[:batch]
             attention_values = cache.values[:batch]
@@ -5190,6 +5194,11 @@ class Llama3TensorParallelForCausalLM:
     ) -> Tensor:
         hidden = F.embedding(input_ids.to(self.device, non_blocking=True), self.embed_tokens_weight)
         attn_in: Tensor | None = None
+        attention_lengths = (
+            None
+            if callable(getattr(cache.layers[0], "append_and_attend_ragged", None))
+            else cache_positions + 1
+        )
         context_set = _set_paged_ragged_decode_context(
             cache,
             batch=input_ids.size(0),
@@ -5213,6 +5222,7 @@ class Llama3TensorParallelForCausalLM:
                     row_indices,
                     next_norm_weight,
                     attention_cache_tokens=attention_cache_tokens,
+                    attention_lengths=attention_lengths,
                 )
         finally:
             if context_set:
@@ -5262,6 +5272,11 @@ class Llama3TensorParallelForCausalLM:
         )
         hidden = F.embedding(input_ids, self.embed_tokens_weight)
         attn_in: Tensor | None = None
+        attention_lengths = (
+            None
+            if callable(getattr(cache.layers[0], "append_and_attend_ragged", None))
+            else cache_positions + 1
+        )
         context_set = _set_paged_ragged_decode_context(
             cache,
             batch=input_ids.size(0),
@@ -5285,6 +5300,7 @@ class Llama3TensorParallelForCausalLM:
                     row_indices,
                     next_norm_weight,
                     attention_cache_tokens=attention_cache_tokens,
+                    attention_lengths=attention_lengths,
                 )
         finally:
             if context_set:
