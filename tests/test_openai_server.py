@@ -10541,7 +10541,7 @@ def test_openai_online_active_ready_wait_scopes_sampled_medium(
     )
 
     assert _online_active_ready_wait_ms(temperature=0.7, max_tokens=256) == 0.0
-    assert _online_active_ready_wait_ms(temperature=0.7, max_tokens=300) == 0.0
+    assert _online_active_ready_wait_ms(temperature=0.7, max_tokens=300) == 1.0
     assert _online_active_ready_wait_ms(temperature=0.0, max_tokens=300) == 0.0
 
     monkeypatch.setenv(

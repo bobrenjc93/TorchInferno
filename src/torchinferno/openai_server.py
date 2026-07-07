@@ -1303,7 +1303,7 @@ def _online_active_ready_wait_ms(*, temperature: float, max_tokens: int) -> floa
         if sampled_short_max_tokens < max_tokens <= sampled_medium_max_tokens:
             return env_float(
                 "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_ACTIVE_READY_WAIT_MS",
-                0.0,
+                1.0,
                 minimum=0.0,
             )
     return 0.0
