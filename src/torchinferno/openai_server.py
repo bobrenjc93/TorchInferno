@@ -1381,14 +1381,12 @@ def _online_initial_batch_wait_ms(*, temperature: float, max_tokens: int) -> flo
         )
         if greedy_large_min_tokens < max_tokens <= greedy_large_max_tokens:
             # Multi-turn 512-token greedy traffic is dominated by prefix/suffix
-            # prefill waves. A first collection window admits more of the
-            # initial client wave and reduces prefill/decode fragmentation, while
-            # staying scoped above few_shot and short greedy long_output. The
-            # mixed-prefix opt-ins reuse per-conversation prompts and benefit
-            # from a smaller wait; the no-env path keeps the larger
-            # common-prefix collection window.
+            # prefill waves. Mixed-prefix reuse keeps batching healthy without a
+            # first-wave collection delay on current TP8 70B A/B: wait0 improved
+            # median TTFT/E2E/TPOT over wait5 while preserving correctness. The
+            # no-env path keeps the larger common-prefix collection window.
             default_greedy_large_wait_ms = (
-                5.0
+                0.0
                 if _online_greedy_large_mixed_prefix_reuse_enabled(
                     temperature=temperature,
                     max_tokens=max_tokens,
