@@ -1491,6 +1491,75 @@ def test_continuous_batch_engine_forces_flashinfer_prefill_for_paged_cache(monke
     assert model.calls[0]["input_ids"] == [[*shared, 101], [*shared, 102]]
 
 
+def test_continuous_batch_engine_skips_ragged_prefill_for_pages_cache(
+    monkeypatch,
+) -> None:
+    class _FakePagesLayer:
+        cache_backend = "paged"
+
+        def __init__(self, rows: int, seq_lens: list[int]) -> None:
+            self.pages = object()
+            self.max_seq_len = 64
+            self._seq_lens = seq_lens
+            self._uniform_seq_len = [0]
+
+    class _FakePagesCache(_ToyCache):
+        cache_backend = "paged"
+
+        def __init__(
+            self,
+            batch_size: int,
+            max_seq_len: int,
+            *,
+            rows: tuple[int, ...] | None = None,
+            seq_lens: list[int] | None = None,
+            layers: list[object] | None = None,
+        ) -> None:
+            super().__init__(batch_size, max_seq_len, rows=rows, seq_lens=seq_lens)
+            self.layers = layers if layers is not None else [_FakePagesLayer(batch_size, self._seq_lens)]
+
+        def for_rows(self, rows):  # noqa: ANN001
+            physical = tuple(self._rows[int(row)] for row in rows)
+            return _FakePagesCache(
+                len(physical),
+                self.max_seq_len,
+                rows=physical,
+                seq_lens=self._seq_lens,
+                layers=self.layers,
+            )
+
+    class _FakePagesModel(_SelectedLogitsToyModel):
+        def allocate_cache(self, batch_size: int, max_seq_len: int | None = None, **kwargs) -> _FakePagesCache:
+            del kwargs
+            return _FakePagesCache(batch_size, max_seq_len or 1)
+
+    model = _FakePagesModel()
+    engine = ContinuousBatchEngine(
+        model,
+        device=torch.device("cpu"),
+        cache_backend="paged",
+        page_size=2,
+        max_active_requests=2,
+        graph_prefill=True,
+        prefix_cache_capacity=2,
+    )
+    shared = tuple(range(1, 17))
+
+    results = engine.run(
+        [
+            ServingRequest("a", (*shared, 20), 1, arrival_step=0),
+            ServingRequest("b", (*shared, 21, 22), 1, arrival_step=0),
+        ]
+    )
+
+    assert [result.tokens for result in results] == [
+        (*shared, 20, 21),
+        (*shared, 21, 22, 23),
+    ]
+    assert model.prefill_row_indices == []
+    assert engine.stats.prefill_common_prefix_batches == 1
+
+
 def test_continuous_batch_engine_keeps_prefix_hits_off_full_prompt_flashinfer(
     monkeypatch,
 ) -> None:

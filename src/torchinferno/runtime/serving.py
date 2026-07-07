@@ -4013,6 +4013,8 @@ class ContinuousBatchEngine:
         profile_shape_key: str | None = None,
         packed_prefill_pattern_key: str | None = None,
     ) -> Tensor | None:
+        if not self._cache_supports_tensor_ragged_prefill():
+            return None
         packed_eager_enabled = env_flag(
             "TORCHINFERNO_CONTINUOUS_PACKED_RAGGED_PREFILL_EAGER",
             False,
@@ -4176,6 +4178,8 @@ class ContinuousBatchEngine:
         capture_on_miss: bool = True,
         profile_shape_key: str | None = None,
     ) -> bool:
+        if not self._cache_supports_tensor_ragged_prefill():
+            return False
         graph = getattr(self.model, "try_prefill_ragged_cache_graph", None)
         if graph is None:
             return self._ragged_prefill_cache_eager(
@@ -4306,6 +4310,8 @@ class ContinuousBatchEngine:
         src_prefix_row: Tensor | None = None,
         prefix_copy_len: int | None = None,
     ) -> bool:
+        if not self._cache_supports_tensor_ragged_prefill():
+            return False
         eager = getattr(self.model, "prefill_ragged_cache", None)
         if eager is None:
             return False
@@ -4349,6 +4355,8 @@ class ContinuousBatchEngine:
         src_prefix_row: Tensor | None = None,
         prefix_copy_len: int | None = None,
     ) -> Tensor | None:
+        if not self._cache_supports_tensor_ragged_prefill():
+            return None
         eager = getattr(self.model, "prefill_ragged_logits", None)
         if eager is None:
             return None
@@ -5101,13 +5109,18 @@ class ContinuousBatchEngine:
         ragged_graph = getattr(self.model, "try_prefill_ragged_logits_graph", None)
         if ragged_graph is None:
             return None
+        if not self._cache_supports_tensor_ragged_prefill():
+            return None
         rows = [self._acquire_active_row() for _ in group]
         cache = self._require_cache()
         for row in rows:
             cache.clear_row(row)
             for layer_cache in cache.layers:
-                layer_cache.keys[row].zero_()
-                layer_cache.values[row].zero_()
+                keys = getattr(layer_cache, "keys", None)
+                values = getattr(layer_cache, "values", None)
+                if isinstance(keys, Tensor) and isinstance(values, Tensor):
+                    keys[row].zero_()
+                    values[row].zero_()
         lengths = [len(request.prompt) for _, request, _ in group]
         max_len = max(lengths)
         suffix_bucket = self._suffix_bucket(max_len)
@@ -7295,6 +7308,25 @@ class ContinuousBatchEngine:
             return False
         layers = getattr(self._cache, "layers", None)
         return bool(layers and hasattr(layers[0], "paged_kv"))
+
+    def _cache_supports_tensor_ragged_prefill(self) -> bool:
+        cache = self._cache
+        if cache is None:
+            return True
+        if str(getattr(cache, "cache_backend", "dense")).lower() == "dense":
+            return True
+        layers = tuple(getattr(cache, "layers", ()) or ())
+        if not layers:
+            return True
+        for layer in layers:
+            try:
+                keys = getattr(layer, "keys", None)
+                values = getattr(layer, "values", None)
+            except Exception:
+                return False
+            if not isinstance(keys, Tensor) or not isinstance(values, Tensor):
+                return False
+        return True
 
     def _require_cache(self) -> object:
         if self._cache is None:
