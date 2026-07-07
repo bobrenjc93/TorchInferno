@@ -12108,6 +12108,24 @@ long_output levers; the remaining decode gap is dense GEMM/Marlin throughput
 and per-layer collective/attention cost, with padded prefill still the TTFT
 lever.
 
+A current-head sampled-medium tree recheck on `f135593` restores the
+prefill-ready active cap to the full 32-row sampled-medium active set. The
+same-conditions control wrote
+`/tmp/ti-tree-default-20260707-results/.../runs/20260707_195656` and landed at
+`135.4 / 55.4 / 185.0ms`, p99 E2E `621.0ms`, `961/992` correct. Raising
+`TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_MAX_ACTIVE=40` improved medians
+to `119.8 / 57.5 / 172.1ms` but increased active rows. Keeping max_active at
+`32` and setting
+`TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_PREFILL_READY_ACTIVE_CAP=32`
+wrote `/tmp/ti-tree-prbdcap32-f135-20260707-results/.../runs/20260707_201623`
+and landed at `116.3 / 58.9 / 172.8ms`, p99 E2E `482.1ms`, `958/992`
+correct. The queue profile kept the scoped sampled-medium shape
+(`temperature=0.7`, `run_max_tokens=300`, `max_active=32`) while moving
+queue-to-first p50/p99 to `100.6/335.1ms` and queue-to-finish p50/p99 to
+`159.8/405.4ms`. This is a TTFT/E2E and tail tradeoff for tree-style sampled
+medium traffic; sampled-short self-consistency, greedy traffic, and the row cap
+remain unchanged.
+
 ## Priority for a focused (non-loop) session
 
 1. Prefill MFU (Issue 1) — biggest TTFT lever, ~2x, affects 3/5 benchmarks.
