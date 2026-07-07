@@ -820,7 +820,7 @@ def _online_prefill_ready_before_decode_active_cap(
     if temperature > 0.0 and sampled_medium_min_tokens < max_tokens <= sampled_medium_max_tokens:
         configured = env_int(
             "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_PREFILL_READY_ACTIVE_CAP",
-            32,
+            16,
             minimum=0,
         )
         return None if configured <= 0 else configured
