@@ -232,6 +232,117 @@ def test_llama3_tensor_parallel_decode_mlp_reuses_scratch_buffers(monkeypatch) -
     assert len(layer._decode_scratch_buffers) == 2
 
 
+def test_llama3_tensor_parallel_fast_prefill_post_attention_uses_prefill_project(monkeypatch) -> None:
+    layer = object.__new__(tensor_parallel_module._Llama3TensorParallelLayer)
+    layer.config = types.SimpleNamespace(rms_norm_eps=1e-5)
+    layer.post_attention_layernorm_weight = torch.ones((4,), dtype=torch.float32)
+    attention = torch.full((2, 3, 4), 2.0)
+    residual = torch.full((2, 3, 4), 3.0)
+    projected = torch.full((2, 3, 4), 7.0)
+    seen_mlp_inputs = []
+
+    def add_rms_norm(x, residual_arg, weight, eps):
+        assert weight is layer.post_attention_layernorm_weight
+        assert eps == layer.config.rms_norm_eps
+        hidden = residual_arg + x
+        return hidden, hidden + 1.0
+
+    def fast_prefill_project(mlp_in):
+        seen_mlp_inputs.append(mlp_in)
+        return projected
+
+    monkeypatch.setattr(tensor_parallel_module, "_tp_decode_add_rms_norm", add_rms_norm)
+    monkeypatch.setattr(layer, "_mlp_project_fast_prefill", fast_prefill_project)
+
+    output, next_attn_in = layer._post_attention_forward_impl(attention, residual, None)
+
+    assert next_attn_in is None
+    assert len(seen_mlp_inputs) == 1
+    torch.testing.assert_close(seen_mlp_inputs[0], attention + residual + 1.0)
+    torch.testing.assert_close(output, attention + residual + projected)
+
+
+def test_llama3_tensor_parallel_fast_prefill_project_uses_reduced_path(monkeypatch) -> None:
+    layer = object.__new__(tensor_parallel_module._Llama3TensorParallelLayer)
+    hidden = torch.ones((2, 3, 4), dtype=torch.float32)
+    reduced = torch.full((2, 3, 4), 5.0)
+
+    monkeypatch.setattr(layer, "_mlp_project_prefill_reduce", lambda hidden_arg: reduced)
+    monkeypatch.setattr(
+        layer,
+        "_prefill_gate_up_activation",
+        lambda hidden_arg: (_ for _ in ()).throw(AssertionError("reduced path should return directly")),
+    )
+    monkeypatch.setattr(
+        tensor_parallel_module,
+        "_all_reduce",
+        lambda tensor: (_ for _ in ()).throw(AssertionError("reduced path already all-reduced")),
+    )
+
+    assert layer._mlp_project_fast_prefill(hidden) is reduced
+
+
+def test_llama3_tensor_parallel_fast_prefill_project_uses_fp8_down(monkeypatch) -> None:
+    layer = object.__new__(tensor_parallel_module._Llama3TensorParallelLayer)
+    layer.local_intermediate_size = 3
+    layer.gate_up_proj_weight = torch.ones((6, 4), dtype=torch.float32)
+    layer.down_proj_weight = torch.ones((4, 3), dtype=torch.float32)
+    layer.down_proj_weight_decode = None
+    hidden = torch.ones((2, 3, 4), dtype=torch.float32)
+    gate = torch.full((2, 3, 3), 2.0)
+    up = torch.full((2, 3, 3), 3.0)
+    gu = torch.cat((gate, up), dim=-1)
+    expected_activated = torch.nn.functional.silu(gate) * up
+    fp8_down = torch.full((2, 3, 4), 9.0)
+    fp8_calls = []
+    all_reduce_calls = []
+
+    def fp8_proj(hidden_arg, key, weight):
+        fp8_calls.append(key)
+        if key == "gu":
+            assert hidden_arg is hidden
+            assert weight is layer.gate_up_proj_weight
+            return gu
+        assert key == "down"
+        assert weight is layer.down_proj_weight
+        torch.testing.assert_close(hidden_arg, expected_activated)
+        return fp8_down
+
+    monkeypatch.setattr(layer, "_mlp_project_prefill_reduce", lambda hidden_arg: None)
+    monkeypatch.setattr(layer, "_fp8_proj", fp8_proj)
+    monkeypatch.setattr(
+        layer,
+        "_mlp_project_eager",
+        lambda hidden_arg: (_ for _ in ()).throw(AssertionError("FP8 gate/up should avoid eager MLP")),
+    )
+    monkeypatch.setattr(tensor_parallel_module, "_all_reduce", lambda tensor: all_reduce_calls.append(tensor))
+
+    result = layer._mlp_project_fast_prefill(hidden)
+
+    assert result is fp8_down
+    assert fp8_calls == ["gu", "down"]
+    assert all_reduce_calls == [fp8_down]
+
+
+def test_llama3_tensor_parallel_fast_prefill_project_falls_back_to_eager(monkeypatch) -> None:
+    layer = object.__new__(tensor_parallel_module._Llama3TensorParallelLayer)
+    layer.gate_up_proj_weight = torch.ones((6, 4), dtype=torch.float32)
+    layer.down_proj_weight = torch.ones((4, 3), dtype=torch.float32)
+    hidden = torch.ones((2, 3, 4), dtype=torch.float32)
+    projected = torch.full((2, 3, 4), 6.0)
+    all_reduce_calls = []
+
+    monkeypatch.setattr(layer, "_mlp_project_prefill_reduce", lambda hidden_arg: None)
+    monkeypatch.setattr(layer, "_fp8_proj", lambda hidden_arg, key, weight: None)
+    monkeypatch.setattr(layer, "_mlp_project_eager", lambda hidden_arg: projected)
+    monkeypatch.setattr(tensor_parallel_module, "_all_reduce", lambda tensor: all_reduce_calls.append(tensor))
+
+    result = layer._mlp_project_fast_prefill(hidden)
+
+    assert result is projected
+    assert all_reduce_calls == [projected]
+
+
 def test_llama3_tensor_parallel_ragged_prefill_copy_accepts_no_logits() -> None:
     model = object.__new__(Llama3TensorParallelForCausalLM)
     model.device = torch.device("cpu")

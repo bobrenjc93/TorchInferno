@@ -1554,8 +1554,7 @@ class _Llama3TensorParallelLayer:
             attention, residual,
             self.post_attention_layernorm_weight, self.config.rms_norm_eps,
         )
-        projected = self._mlp_project_eager(mlp_in)
-        _all_reduce(projected)
+        projected = self._mlp_project_fast_prefill(mlp_in)
         if next_norm_weight is None:
             return hidden + projected, None
         return _tp_decode_add_rms_norm(projected, hidden, next_norm_weight, self.config.rms_norm_eps)
@@ -2399,6 +2398,25 @@ class _Llama3TensorParallelLayer:
             lambda: self._prefill_gate_up_activation(hidden),
         )
         return self._prefill_linear_all_reduce(activated, self.down_proj_weight, "mlp-prefill", fp8_key="down")
+
+    def _mlp_project_fast_prefill(self, hidden: Tensor) -> Tensor:
+        reduced = self._mlp_project_prefill_reduce(hidden)
+        if reduced is not None:
+            return reduced
+        gu = self._fp8_proj(hidden, "gu", self.gate_up_proj_weight)
+        if gu is None:
+            projected = self._mlp_project_eager(hidden)
+            _all_reduce(projected)
+            return projected
+        gate, up = gu.split((self.local_intermediate_size, self.local_intermediate_size), dim=-1)
+        activated = _tp_swiglu(gate, up)
+        fp8_down = self._fp8_proj(activated, "down", self.down_proj_weight)
+        if fp8_down is not None:
+            _all_reduce(fp8_down)
+            return fp8_down
+        projected = _decode_linear(activated, self.down_proj_weight, self.down_proj_weight_decode)
+        _all_reduce(projected)
+        return projected
 
     def _prefill_gate_up_activation(self, hidden: Tensor) -> Tensor:
         # FP8 prefill (large-M, compute-bound) runs EAGER: the fused-quant fp8 GEMM win
