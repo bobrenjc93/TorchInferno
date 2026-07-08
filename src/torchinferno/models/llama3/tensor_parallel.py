@@ -1385,6 +1385,7 @@ class _RepeatedTemperatureSampleState:
     temperature: float
     cumulative_local: Tensor
     rank_cumulative: Tensor | None
+    prefetch: int
     cached_tokens: Tensor | None = None
     cached_offset: int = 0
 
@@ -7464,6 +7465,11 @@ class Llama3TensorParallelForCausalLM:
             temperature=float(temperature),
             cumulative_local=cumulative_local,
             rank_cumulative=rank_cumulative,
+            prefetch=_tp_int(
+                "TORCHINFERNO_TEMPERATURE_SAMPLE_REPEATED_STATE_PREFETCH",
+                128,
+                minimum=0,
+            ),
         )
 
     def sample_repeated_next_token_from_state(
@@ -7479,11 +7485,7 @@ class Llama3TensorParallelForCausalLM:
         ):
             return None
         cumulative_local = state.cumulative_local
-        prefetch = _tp_int(
-            "TORCHINFERNO_TEMPERATURE_SAMPLE_REPEATED_STATE_PREFETCH",
-            128,
-            minimum=0,
-        )
+        prefetch = max(0, int(state.prefetch))
         if prefetch > 0 and state.cached_tokens is not None:
             cached_offset = max(0, int(state.cached_offset))
             cached_end = cached_offset + batch_size

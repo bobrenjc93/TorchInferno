@@ -876,6 +876,18 @@ class ContinuousBatchEngine:
         self.enable_ragged_decode = enable_ragged_decode
         self.store_reusable_prefixes = store_reusable_prefixes
         self.store_full_prompt_prefixes = store_full_prompt_prefixes
+        self._cached_repeated_sample_state_enabled = env_flag(
+            "TORCHINFERNO_CONTINUOUS_CACHED_REPEATED_SAMPLE_STATE",
+            True,
+        )
+        prepare_repeated_sample_state = getattr(model, "prepare_repeated_next_token_state", None)
+        self._prepare_repeated_sample_state = (
+            prepare_repeated_sample_state if callable(prepare_repeated_sample_state) else None
+        )
+        sample_repeated_from_state = getattr(model, "sample_repeated_next_token_from_state", None)
+        self._sample_repeated_from_state = (
+            sample_repeated_from_state if callable(sample_repeated_from_state) else None
+        )
         # When pinning is on, the engine caches ONLY shared common prefixes and
         # pins them against eviction, skipping per-request full-prompt stores
         # that would otherwise starve the prefix-row pool and shadow the shared
@@ -4990,10 +5002,10 @@ class ContinuousBatchEngine:
                 return result
             if (
                 sampling_temperature > 0.0
-                and env_flag("TORCHINFERNO_CONTINUOUS_CACHED_REPEATED_SAMPLE_STATE", True)
+                and self._cached_repeated_sample_state_enabled
             ):
-                prepare_state = getattr(self.model, "prepare_repeated_next_token_state", None)
-                sample_from_state = getattr(self.model, "sample_repeated_next_token_from_state", None)
+                prepare_state = self._prepare_repeated_sample_state
+                sample_from_state = self._sample_repeated_from_state
                 if callable(prepare_state) and callable(sample_from_state):
                     if reusable.sample_state is None or reusable.sample_temperature != sampling_temperature:
                         state_logits = logits[:, -1, :].to(self.device)
