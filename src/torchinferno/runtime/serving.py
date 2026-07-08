@@ -982,6 +982,17 @@ class ContinuousBatchEngine:
             "TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY_ASYNC_READBACK",
             False,
         )
+        self._fi_decode_graph_mode = _fi_decode_graph_mode()
+        self._sampled_fi_decode_max_tokens = env_int(
+            "TORCHINFERNO_CONTINUOUS_FI_DECODE_SAMPLED_MAX_TOKENS",
+            256,
+            minimum=0,
+        )
+        self._decode_capture_on_miss_override = (
+            env_flag("TORCHINFERNO_CONTINUOUS_DECODE_CAPTURE", False)
+            if "TORCHINFERNO_CONTINUOUS_DECODE_CAPTURE" in os.environ
+            else None
+        )
         self.unified_forward = bool(
             env_flag("TORCHINFERNO_CONTINUOUS_UNIFIED_FORWARD", False)
             and hasattr(model, "forward_step_flashinfer")
@@ -8588,7 +8599,7 @@ class ContinuousBatchEngine:
         temperature: float | None = None,
     ) -> Tensor | None:
         sampling_temperature = float(self.temperature if temperature is None else temperature)
-        fi_decode_mode = _fi_decode_graph_mode()
+        fi_decode_mode = self._fi_decode_graph_mode
         use_fi_decode = fi_decode_mode == "always" or (
             fi_decode_mode == "sampled"
             and sampling_temperature > 0.0
@@ -8741,7 +8752,7 @@ class ContinuousBatchEngine:
         max_tokens = self.max_generation_tokens
         if max_tokens is None:
             return True
-        limit = env_int("TORCHINFERNO_CONTINUOUS_FI_DECODE_SAMPLED_MAX_TOKENS", 256, minimum=0)
+        limit = max(0, int(self._sampled_fi_decode_max_tokens))
         return limit > 0 and int(max_tokens) <= limit
 
     def _try_static_token_graph(
@@ -8991,8 +9002,8 @@ class ContinuousBatchEngine:
         )
 
     def _decode_capture_on_miss(self) -> bool:
-        if "TORCHINFERNO_CONTINUOUS_DECODE_CAPTURE" in os.environ:
-            return env_flag("TORCHINFERNO_CONTINUOUS_DECODE_CAPTURE", False)
+        if self._decode_capture_on_miss_override is not None:
+            return bool(self._decode_capture_on_miss_override)
         if self._generated_prefix_cache_enabled():
             return False
         return True
