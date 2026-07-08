@@ -675,6 +675,7 @@ class _ReusablePrefix:
     logits: Tensor | None
     sample_state: object | None = None
     sample_temperature: float | None = None
+    greedy_token: int | None = None
 
 
 @dataclass
@@ -4896,6 +4897,16 @@ class ContinuousBatchEngine:
         try:
             logits = reusable.logits
             sampling_temperature = float(self.temperature if temperature is None else temperature)
+            if sampling_temperature <= 0.0 and reusable.greedy_token is not None:
+                result = torch.full(
+                    (max(0, int(batch_size)),),
+                    int(reusable.greedy_token),
+                    dtype=torch.long,
+                    device=self.device,
+                )
+                if self.profile_timings:
+                    sample_select_ms = (time.perf_counter() - sample_start_s) * 1000.0
+                return result
             if (
                 sampling_temperature > 0.0
                 and env_flag("TORCHINFERNO_CONTINUOUS_CACHED_REPEATED_SAMPLE_STATE", True)
@@ -4923,6 +4934,8 @@ class ContinuousBatchEngine:
                 batch_size,
                 temperature=sampling_temperature,
             )
+            if sampling_temperature <= 0.0 and result.numel() > 0:
+                reusable.greedy_token = int(result.reshape(-1)[0].detach().cpu().item())
             if self.profile_timings:
                 sample_select_ms = (time.perf_counter() - sample_start_s) * 1000.0
             return result
