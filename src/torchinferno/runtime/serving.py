@@ -3659,46 +3659,52 @@ class ContinuousBatchEngine:
                     shape_key,
                     sample_readback_ms,
                 )
-            state_start_s = time.perf_counter() if self.profile_timings else 0.0
-            state_seq_ms = 0.0
-            state_store_ms = 0.0
-            state_create_ms = 0.0
             active: list[_ActiveRequest] = []
-            for row_index, (original_index, request, prefix_hit_tokens, _reusable) in enumerate(output_group):
-                row = output_rows[row_index]
-                prompt_len = len(request.prompt)
-                state_seq_start_s = time.perf_counter() if self.profile_timings else 0.0
-                self._set_cache_row_seq_len(row, prompt_len)
-                if self.profile_timings:
-                    state_seq_ms += (time.perf_counter() - state_seq_start_s) * 1000.0
-                state_store_start_s = time.perf_counter() if self.profile_timings else 0.0
-                self._store_reusable_prefix(
-                    request.request_id,
-                    request.prompt,
-                    row,
-                    logits[row_index : row_index + 1],
-                    allow_pinned=self._allow_pinned_full_prompt_store(request),
-                )
-                if self.profile_timings:
-                    state_store_ms += (time.perf_counter() - state_store_start_s) * 1000.0
-                state_create_start_s = time.perf_counter() if self.profile_timings else 0.0
-                next_token = int(next_tokens[row_index])
-                state = _ActiveRequest(
-                    original_index=original_index,
-                    request=request,
-                    tokens=[*request.prompt, next_token],
-                    generated=1,
-                    row=row,
-                    last_token=next_token,
-                    seq_len=self._cache_row_seq_len(row, prompt_len),
-                    prefix_hit_tokens=prefix_hit_tokens,
-                    started_step=step,
-                )
-                self._record_token_event(events, state, next_token, step, finished=self._should_finish_before_decode(state))
-                active.append(state)
-                if self.profile_timings:
-                    state_create_ms += (time.perf_counter() - state_create_start_s) * 1000.0
             if self.profile_timings:
+                state_start_s = time.perf_counter()
+                state_seq_start_s = time.perf_counter()
+                for row_index, (_original_index, request, _prefix_hit_tokens, _reusable) in enumerate(output_group):
+                    row = output_rows[row_index]
+                    self._set_cache_row_seq_len(row, len(request.prompt))
+                state_seq_ms = (time.perf_counter() - state_seq_start_s) * 1000.0
+
+                state_store_start_s = time.perf_counter()
+                for row_index, (_original_index, request, _prefix_hit_tokens, _reusable) in enumerate(output_group):
+                    row = output_rows[row_index]
+                    self._store_reusable_prefix(
+                        request.request_id,
+                        request.prompt,
+                        row,
+                        logits[row_index : row_index + 1],
+                        allow_pinned=self._allow_pinned_full_prompt_store(request),
+                    )
+                state_store_ms = (time.perf_counter() - state_store_start_s) * 1000.0
+
+                state_create_start_s = time.perf_counter()
+                for row_index, (original_index, request, prefix_hit_tokens, _reusable) in enumerate(output_group):
+                    row = output_rows[row_index]
+                    prompt_len = len(request.prompt)
+                    next_token = int(next_tokens[row_index])
+                    state = _ActiveRequest(
+                        original_index=original_index,
+                        request=request,
+                        tokens=[*request.prompt, next_token],
+                        generated=1,
+                        row=row,
+                        last_token=next_token,
+                        seq_len=self._cache_row_seq_len(row, prompt_len),
+                        prefix_hit_tokens=prefix_hit_tokens,
+                        started_step=step,
+                    )
+                    self._record_token_event(
+                        events,
+                        state,
+                        next_token,
+                        step,
+                        finished=self._should_finish_before_decode(state),
+                    )
+                    active.append(state)
+                state_create_ms = (time.perf_counter() - state_create_start_s) * 1000.0
                 state_elapsed_ms = (time.perf_counter() - state_start_s) * 1000.0
                 self.stats.prefill_state_ms += state_elapsed_ms
                 self.stats.prefill_state_seq_ms += state_seq_ms
@@ -3729,6 +3735,38 @@ class ContinuousBatchEngine:
                     shape_key,
                     (time.perf_counter() - shape_wall_start_s) * 1000.0,
                 )
+            else:
+                for row_index, (original_index, request, prefix_hit_tokens, _reusable) in enumerate(output_group):
+                    row = output_rows[row_index]
+                    prompt_len = len(request.prompt)
+                    self._set_cache_row_seq_len(row, prompt_len)
+                    self._store_reusable_prefix(
+                        request.request_id,
+                        request.prompt,
+                        row,
+                        logits[row_index : row_index + 1],
+                        allow_pinned=self._allow_pinned_full_prompt_store(request),
+                    )
+                    next_token = int(next_tokens[row_index])
+                    state = _ActiveRequest(
+                        original_index=original_index,
+                        request=request,
+                        tokens=[*request.prompt, next_token],
+                        generated=1,
+                        row=row,
+                        last_token=next_token,
+                        seq_len=self._cache_row_seq_len(row, prompt_len),
+                        prefix_hit_tokens=prefix_hit_tokens,
+                        started_step=step,
+                    )
+                    self._record_token_event(
+                        events,
+                        state,
+                        next_token,
+                        step,
+                        finished=self._should_finish_before_decode(state),
+                    )
+                    active.append(state)
             return active
         except Exception:
             for pad_row in pad_rows:
