@@ -9875,8 +9875,8 @@ def test_openai_online_prefill_ready_before_decode_respects_env(monkeypatch) -> 
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_MIXED_PREFIX_REUSE", "0")
     assert not _online_greedy_large_mixed_prefix_reuse_enabled(temperature=0.0, max_tokens=512)
     monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_MIXED_PREFIX_REUSE", raising=False)
-    assert _online_prefill_ready_before_decode_enabled(temperature=0.0, max_tokens=64)
-    assert _online_prefill_ready_before_decode_active_cap(temperature=0.0, max_tokens=64) == 8
+    assert not _online_prefill_ready_before_decode_enabled(temperature=0.0, max_tokens=64)
+    assert _online_prefill_ready_before_decode_active_cap(temperature=0.0, max_tokens=64) is None
     assert not _online_prefill_ready_before_decode_enabled(temperature=0.0, max_tokens=256)
     assert not _online_prefill_ready_before_decode_enabled(temperature=0.0, max_tokens=400)
     assert _online_prefill_ready_before_decode_enabled(temperature=0.0, max_tokens=401)
@@ -9910,12 +9910,22 @@ def test_openai_online_prefill_ready_before_decode_respects_env(monkeypatch) -> 
         raising=False,
     )
     monkeypatch.setenv(
-        "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_PREFILL_READY_ACTIVE_CAP",
-        "8",
+        "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_PREFILL_READY_BEFORE_DECODE",
+        "1",
     )
+    assert _online_prefill_ready_before_decode_enabled(temperature=0.0, max_tokens=64)
     assert _online_prefill_ready_before_decode_active_cap(temperature=0.0, max_tokens=64) == 8
+    monkeypatch.setenv(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_PREFILL_READY_ACTIVE_CAP",
+        "6",
+    )
+    assert _online_prefill_ready_before_decode_active_cap(temperature=0.0, max_tokens=64) == 6
     monkeypatch.delenv(
         "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_PREFILL_READY_ACTIVE_CAP",
+        raising=False,
+    )
+    monkeypatch.delenv(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_PREFILL_READY_BEFORE_DECODE",
         raising=False,
     )
 

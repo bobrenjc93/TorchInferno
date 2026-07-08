@@ -713,12 +713,12 @@ def _online_prefill_ready_before_decode_enabled(*, temperature: float, max_token
             minimum=1,
         )
         if max_tokens <= greedy_short_max_tokens:
-            # Short greedy batches are decode-throughput bound, but letting the
-            # next ready wave prefill only at the active tail reduces long-output
-            # queueing without disrupting the full 64-row decode buckets.
+            # Short greedy batches are decode-throughput bound. Keeping decode
+            # first avoids long-output tail spikes from interleaving padded suffix
+            # prefill at the active tail; leave tail prefill as an explicit knob.
             return env_flag(
                 "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_PREFILL_READY_BEFORE_DECODE",
-                True,
+                False,
             )
         greedy_large_min_tokens = env_int(
             "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_PREFILL_READY_MIN_TOKENS",
