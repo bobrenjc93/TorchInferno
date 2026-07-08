@@ -960,6 +960,11 @@ class ContinuousBatchEngine:
             2,
             minimum=2,
         )
+        self._decode_many_profile_step_window = env_int(
+            "TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY_PROFILE_STEP_WINDOW",
+            16,
+            minimum=1,
+        )
         self.decode_many_sync_model_timings = env_flag(
             "TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY_SYNC_MODEL_TIMINGS",
             False,
@@ -6104,11 +6109,7 @@ class ContinuousBatchEngine:
         return buf
 
     def _decode_many_step_window_key(self, generated_after: list[int], shape_key: str) -> str:
-        window = env_int(
-            "TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY_PROFILE_STEP_WINDOW",
-            16,
-            minimum=1,
-        )
+        window = max(1, int(self._decode_many_profile_step_window))
         if not generated_after:
             return f"{shape_key}:g?"
         first_generated = max(1, min(int(value) for value in generated_after))
