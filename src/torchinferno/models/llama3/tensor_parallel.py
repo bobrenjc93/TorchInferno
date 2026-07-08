@@ -40,6 +40,10 @@ _SYMM_MEM_ALLREDUCE_MAX_BATCH_OVERRIDE: list[int | None] = [None]
 _SYMM_MEM_ALLREDUCE_ENABLED_OVERRIDE: list[bool | None] = [None]
 _SYMM_MEM_PREFILL_ALLREDUCE_ENABLED_OVERRIDE: list[bool | None] = [None]
 _DEFAULT_DECODE_STEP_MAX_BATCH = 64
+_DEFAULT_PREFILL_GRAPH_MAX_GRAPHS = 192
+# Keep a small allocator cushion; CUDA graph private pools can otherwise consume
+# all free memory on tight 70B tensor-parallel hosts before the next prefill.
+_DEFAULT_PREFILL_GRAPH_MIN_FREE_MB = 1024
 _PackedPrefillAttentionGroup = tuple[int, int, Tensor, tuple[int, ...], tuple[int, ...]]
 
 
@@ -74,6 +78,23 @@ def _tp_flag(name: str, default: bool = True) -> bool:
 
 def _tp_int(name: str, default: int, *, minimum: int | None = None) -> int:
     return env_int(name, default, minimum=minimum)
+
+
+def _prefill_graph_max_graphs() -> int:
+    return _tp_int(
+        "TORCHINFERNO_CUDAGRAPH_PREFILL_MAX_GRAPHS",
+        _DEFAULT_PREFILL_GRAPH_MAX_GRAPHS,
+        minimum=1,
+    )
+
+
+def _prefill_graph_min_free_bytes() -> int:
+    min_free_mb = _tp_int(
+        "TORCHINFERNO_CUDAGRAPH_PREFILL_MIN_FREE_MB",
+        _DEFAULT_PREFILL_GRAPH_MIN_FREE_MB,
+        minimum=0,
+    )
+    return min_free_mb * 1024 * 1024
 
 
 def _tp_env_set(name: str) -> bool:
@@ -3813,12 +3834,17 @@ class Llama3TensorParallelForCausalLM:
         if capture_on_miss:
             needs_capture = _capture_needed_on_any_rank(needs_capture, self.device)
         if needs_capture:
+            memory_ok = self._trim_ragged_prefill_logits_graphs_for_memory()
+            if capture_on_miss:
+                memory_ok = _capture_succeeded_on_all_ranks(memory_ok, self.device)
+            if not memory_ok:
+                return None
             try:
                 captured = self._capture_prefill_graph(input_ids, cache)
             except Exception:
                 self._set_cache_seq_len(cache, initial_seq_len)
                 raise
-            max_graphs = _tp_int("TORCHINFERNO_CUDAGRAPH_PREFILL_MAX_GRAPHS", 192, minimum=1)
+            max_graphs = _prefill_graph_max_graphs()
             if key not in self._prefill_graphs and len(self._prefill_graphs) >= max_graphs:
                 self._prefill_graphs.clear()
             self._prefill_graphs[key] = captured
@@ -3913,6 +3939,11 @@ class Llama3TensorParallelForCausalLM:
         if capture_on_miss:
             needs_capture = _capture_needed_on_any_rank(needs_capture, self.device)
         if needs_capture:
+            memory_ok = self._trim_ragged_prefill_logits_graphs_for_memory()
+            if capture_on_miss:
+                memory_ok = _capture_succeeded_on_all_ranks(memory_ok, self.device)
+            if not memory_ok:
+                return None
             try:
                 captured = self._capture_prefill_logits_graph(input_ids, cache, logit_positions)
             except Exception:
@@ -3920,7 +3951,7 @@ class Llama3TensorParallelForCausalLM:
                 raise
             real_end = initial_seq_len + prompt_tokens
             self._set_cache_seq_len(cache, real_end)
-            max_graphs = _tp_int("TORCHINFERNO_CUDAGRAPH_PREFILL_MAX_GRAPHS", 192, minimum=1)
+            max_graphs = _prefill_graph_max_graphs()
             if key not in self._prefill_logits_graphs and len(self._prefill_logits_graphs) >= max_graphs:
                 self._prefill_logits_graphs.clear()
             self._prefill_logits_graphs[key] = captured
@@ -4026,6 +4057,11 @@ class Llama3TensorParallelForCausalLM:
         if capture_on_miss:
             needs_capture = _capture_needed_on_any_rank(needs_capture, self.device)
         if needs_capture:
+            memory_ok = self._trim_ragged_prefill_logits_graphs_for_memory()
+            if capture_on_miss:
+                memory_ok = _capture_succeeded_on_all_ranks(memory_ok, self.device)
+            if not memory_ok:
+                return None
             try:
                 captured = self._capture_prefill_selected_logits_graph(input_ids, cache, logit_positions)
             except Exception:
@@ -4033,7 +4069,7 @@ class Llama3TensorParallelForCausalLM:
                 raise
             real_end = initial_seq_len + prompt_tokens
             self._set_cache_seq_len(cache, real_end)
-            max_graphs = _tp_int("TORCHINFERNO_CUDAGRAPH_PREFILL_MAX_GRAPHS", 192, minimum=1)
+            max_graphs = _prefill_graph_max_graphs()
             if (
                 key not in self._prefill_selected_logits_graphs
                 and len(self._prefill_selected_logits_graphs) >= max_graphs
@@ -4284,6 +4320,7 @@ class Llama3TensorParallelForCausalLM:
             self._prefill_graphs,
             self._prefill_logits_graphs,
             getattr(self, "_prefill_selected_logits_graphs", {}),
+            getattr(self, "_ragged_prefill_logits_graphs", {}),
             self._decode_graphs,
             self._decode_logits_graphs,
             getattr(self, "_ragged_decode_graphs", {}),
@@ -4293,6 +4330,57 @@ class Llama3TensorParallelForCausalLM:
             for key, captured in list(graph_map.items()):
                 if key[0] in cache_ids or getattr(captured, "cache", None) is cache:
                     graph_map.pop(key, None)
+
+    def _evict_one_ragged_prefill_logits_graph(self, *, protected_key: tuple[object, ...] | None = None) -> bool:
+        graphs = getattr(self, "_ragged_prefill_logits_graphs", None)
+        if not isinstance(graphs, dict):
+            return False
+        evicted_key = next((candidate for candidate in graphs if candidate != protected_key), None)
+        if evicted_key is None:
+            return False
+        self._ragged_prefill_logits_graph_evictions = int(
+            getattr(self, "_ragged_prefill_logits_graph_evictions", 0)
+        ) + 1
+        self._ragged_prefill_logits_graph_evicted_entries = int(
+            getattr(self, "_ragged_prefill_logits_graph_evicted_entries", 0)
+        ) + 1
+        del graphs[evicted_key]
+        return True
+
+    def _trim_ragged_prefill_logits_graphs_for_memory(
+        self,
+        *,
+        protected_key: tuple[object, ...] | None = None,
+    ) -> bool:
+        graphs = getattr(self, "_ragged_prefill_logits_graphs", None)
+        if not isinstance(graphs, dict):
+            return True
+        max_graphs = _prefill_graph_max_graphs()
+        self._ragged_prefill_logits_graph_max_entries = max_graphs
+        while len(graphs) > max_graphs:
+            if not self._evict_one_ragged_prefill_logits_graph(protected_key=protected_key):
+                break
+        min_free_bytes = _prefill_graph_min_free_bytes()
+        if min_free_bytes <= 0 or self.device.type != "cuda":
+            return True
+        while graphs:
+            try:
+                free_bytes, _total_bytes = torch.cuda.mem_get_info(self.device)
+            except Exception:
+                return True
+            if int(free_bytes) >= min_free_bytes:
+                return True
+            if not self._evict_one_ragged_prefill_logits_graph(protected_key=protected_key):
+                return False
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+        try:
+            free_bytes, _total_bytes = torch.cuda.mem_get_info(self.device)
+        except Exception:
+            return True
+        return int(free_bytes) >= min_free_bytes
 
     def _run_decode_step_graph(
         self,
@@ -6995,6 +7083,7 @@ class Llama3TensorParallelForCausalLM:
             int(bool(rotary_in_graph)),
             int(bool(write_positions_in_graph)),
         )
+        memory_ok = self._trim_ragged_prefill_logits_graphs_for_memory(protected_key=key)
         captured = self._ragged_prefill_logits_graphs.get(key)
         needs_capture = (
             captured is None
@@ -7025,6 +7114,10 @@ class Llama3TensorParallelForCausalLM:
         needs_capture = needs_capture if skip_sync else _capture_needed_on_any_rank(needs_capture, self.device)
         if needs_capture:
             if not capture_on_miss:
+                return None
+            if not skip_sync:
+                memory_ok = _capture_succeeded_on_all_ranks(memory_ok, self.device)
+            if not memory_ok:
                 return None
             succeeded = True
             new_captured: _StaticRaggedPrefillLogitsGraphCall | None = None
@@ -7060,18 +7153,15 @@ class Llama3TensorParallelForCausalLM:
                         print(f"rank={self.rank} ragged_prefill_mixed_logits_graph_failed={exc!r}", flush=True)
                     return None
                 raise RuntimeError("ragged prefill graph capture failed on at least one rank")
-            max_graphs = _tp_int("TORCHINFERNO_CUDAGRAPH_PREFILL_MAX_GRAPHS", 192, minimum=1)
+            max_graphs = _prefill_graph_max_graphs()
             self._ragged_prefill_logits_graph_max_entries = max_graphs
             if (
                 key not in self._ragged_prefill_logits_graphs
                 and len(self._ragged_prefill_logits_graphs) >= max_graphs
             ):
-                evicted_key = next(iter(self._ragged_prefill_logits_graphs), None)
-                if evicted_key is not None:
-                    self._ragged_prefill_logits_graph_evictions += 1
-                    self._ragged_prefill_logits_graph_evicted_entries += 1
-                    del self._ragged_prefill_logits_graphs[evicted_key]
+                self._evict_one_ragged_prefill_logits_graph(protected_key=key)
             self._ragged_prefill_logits_graphs[key] = new_captured
+            self._trim_ragged_prefill_logits_graphs_for_memory(protected_key=key)
             captured = new_captured
             self._last_ragged_prefill_graph_captured = True
         else:

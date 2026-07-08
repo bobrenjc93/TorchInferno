@@ -16278,10 +16278,12 @@ def _model_graph_cache_profile_fields(model: object, prefix: str) -> dict[str, i
         "_prefill_graphs",
         "_prefill_logits_graphs",
         "_prefill_selected_logits_graphs",
+        "_ragged_prefill_logits_graphs",
         "_decode_graphs",
         "_decode_logits_graphs",
         "_ragged_decode_graphs",
         "_ragged_decode_logits_graphs",
+        "_ragged_decode_many_graphs",
     ):
         graphs = getattr(model, name, None)
         if isinstance(graphs, dict):
@@ -18105,10 +18107,12 @@ def _clear_model_graph_caches(model: object) -> None:
         "_prefill_graphs",
         "_prefill_logits_graphs",
         "_prefill_selected_logits_graphs",
+        "_ragged_prefill_logits_graphs",
         "_decode_graphs",
         "_decode_logits_graphs",
         "_ragged_decode_graphs",
         "_ragged_decode_logits_graphs",
+        "_ragged_decode_many_graphs",
     ):
         graph_map = getattr(model, attr, None)
         if isinstance(graph_map, dict):
@@ -18135,10 +18139,12 @@ def _cache_graph_ref_count(model: object, cache: object) -> int:
         "_prefill_graphs",
         "_prefill_logits_graphs",
         "_prefill_selected_logits_graphs",
+        "_ragged_prefill_logits_graphs",
         "_decode_graphs",
         "_decode_logits_graphs",
         "_ragged_decode_graphs",
         "_ragged_decode_logits_graphs",
+        "_ragged_decode_many_graphs",
     ):
         graph_map = getattr(model, attr, None)
         if not isinstance(graph_map, dict):

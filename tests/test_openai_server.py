@@ -78,6 +78,7 @@ from torchinferno.openai_server import (
     _broadcast_tensor_parallel_online_step,
     _broadcast_tensor_parallel_online_submit_prompt_lists,
     _cache_row_slice,
+    _clear_model_graph_caches,
     _copy_generation_cache_first_row,
     _copy_generation_cache_row,
     _copy_generation_cache_state_rows_padded,
@@ -5778,6 +5779,9 @@ def test_llama_tp_cache_release_clears_prefill_and_decode_graphs() -> None:
     model._prefill_logits_graphs = {
         (id(cache), 0, 1, (1, 1)): types.SimpleNamespace(cache=cache),
     }
+    model._ragged_prefill_logits_graphs = {
+        (id(cache), 2, 4, 16, True): types.SimpleNamespace(cache=cache),
+    }
     model._decode_graphs = {
         (id(cache), 1, 8): types.SimpleNamespace(cache=cache),
     }
@@ -5787,14 +5791,48 @@ def test_llama_tp_cache_release_clears_prefill_and_decode_graphs() -> None:
     model._ragged_decode_logits_graphs = {
         (id(cache), 1, 8, False): types.SimpleNamespace(cache=cache),
     }
+    model._ragged_decode_many_graphs = {
+        (id(cache), 1, 8, 4): types.SimpleNamespace(cache=cache),
+    }
 
     model.release_decode_graphs_for_cache(cache)
 
     assert list(model._prefill_graphs.values()) == [types.SimpleNamespace(cache=other_cache)]
     assert model._prefill_logits_graphs == {}
+    assert model._ragged_prefill_logits_graphs == {}
     assert model._decode_graphs == {}
     assert model._decode_logits_graphs == {}
     assert model._ragged_decode_logits_graphs == {}
+    assert model._ragged_decode_many_graphs == {}
+
+
+def test_clear_model_graph_caches_includes_ragged_prefill_and_decode_many() -> None:
+    model = types.SimpleNamespace(
+        _prefill_graphs={"prefill": object()},
+        _prefill_logits_graphs={"prefill_logits": object()},
+        _prefill_selected_logits_graphs={"selected": object()},
+        _ragged_prefill_logits_graphs={"ragged_prefill": object()},
+        _decode_graphs={"decode": object()},
+        _decode_logits_graphs={"decode_logits": object()},
+        _ragged_decode_graphs={"ragged_decode": object()},
+        _ragged_decode_logits_graphs={"ragged_decode_logits": object()},
+        _ragged_decode_many_graphs={"decode_many": object()},
+    )
+
+    _clear_model_graph_caches(model)
+
+    for graph_map in (
+        model._prefill_graphs,
+        model._prefill_logits_graphs,
+        model._prefill_selected_logits_graphs,
+        model._ragged_prefill_logits_graphs,
+        model._decode_graphs,
+        model._decode_logits_graphs,
+        model._ragged_decode_graphs,
+        model._ragged_decode_logits_graphs,
+        model._ragged_decode_many_graphs,
+    ):
+        assert graph_map == {}
 
 
 def test_llama_tp_decode_graph_capture_uses_rank_sync(monkeypatch) -> None:

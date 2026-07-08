@@ -844,6 +844,7 @@ def test_llama3_tensor_parallel_ragged_prefill_graph_counts_evictions(monkeypatc
 
 def test_llama3_tensor_parallel_ragged_prefill_graph_default_cap(monkeypatch) -> None:
     monkeypatch.delenv("TORCHINFERNO_CUDAGRAPH_PREFILL_MAX_GRAPHS", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_CUDAGRAPH_PREFILL_MIN_FREE_MB", raising=False)
     model = object.__new__(Llama3TensorParallelForCausalLM)
     model.device = torch.device("cpu")
     model.rank = 0
@@ -899,6 +900,142 @@ def test_llama3_tensor_parallel_ragged_prefill_graph_default_cap(monkeypatch) ->
     assert model._ragged_prefill_logits_graph_evictions == 0
 
 
+def test_llama3_tensor_parallel_ragged_prefill_graph_trims_low_free_memory(monkeypatch) -> None:
+    model = object.__new__(Llama3TensorParallelForCausalLM)
+    model.device = torch.device("cuda")
+    model.rank = 0
+    model.world_size = 1
+    model.layers = []
+    model._ragged_prefill_logits_graphs = {
+        ("old-a",): object(),
+        ("old-b",): object(),
+    }
+    model._ragged_prefill_logits_graph_evictions = 0
+    model._ragged_prefill_logits_graph_evicted_entries = 0
+    model._ragged_prefill_logits_graph_max_entries = 0
+    model._ragged_prefill_logits_graph_failed = False
+    model._ragged_prefill_mixed_logits_graph_failed = False
+    model._ragged_prefill_capture_on_miss_failed = False
+    model._last_ragged_prefill_graph_captured = False
+    cache = types.SimpleNamespace(layers=[types.SimpleNamespace(max_seq_len=16)])
+    cache._skip_capture_sync = True
+    input_ids = torch.zeros((2, 4), dtype=torch.long)
+    seq_lens = torch.zeros(4, dtype=torch.long)
+    row_indices = torch.tensor([0, 1], dtype=torch.long)
+    logit_positions = torch.tensor([3, 3], dtype=torch.long)
+    captured_logits = torch.ones((2, 1, 8), dtype=torch.float32)
+    monkeypatch.setenv("TORCHINFERNO_CUDAGRAPH_PREFILL_MAX_GRAPHS", "8")
+    monkeypatch.setenv("TORCHINFERNO_CUDAGRAPH_PREFILL_MIN_FREE_MB", "1024")
+    monkeypatch.setattr(
+        tensor_parallel_module,
+        "_should_use_ragged_prefill_logits_graph",
+        lambda *args, **kwargs: True,
+    )
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(
+        torch.cuda,
+        "mem_get_info",
+        lambda device=None: (
+            2 * 1024 * 1024 * 1024
+            if len(model._ragged_prefill_logits_graphs) <= 1
+            else 8 * 1024 * 1024,
+            80 * 1024 * 1024 * 1024,
+        ),
+    )
+
+    def capture_graph(*args, **kwargs):  # noqa: ANN002, ANN003
+        del args, kwargs
+        return types.SimpleNamespace(
+            cache=cache,
+            max_seq_len=cache.layers[0].max_seq_len,
+            static_input_ids=torch.empty_like(input_ids),
+            static_row_indices=torch.empty_like(row_indices),
+            static_src_prefix_row=None,
+            context_len=None,
+            prefix_copy_len=None,
+            output_logits=captured_logits,
+        )
+
+    monkeypatch.setattr(model, "_capture_ragged_prefill_logits_graph", capture_graph)
+
+    logits = model.try_prefill_ragged_logits_graph(
+        input_ids,
+        cache,
+        seq_lens=seq_lens,
+        row_indices=row_indices,
+        logit_positions=logit_positions,
+        capture_on_miss=True,
+    )
+
+    assert logits is captured_logits
+    assert model._ragged_prefill_logits_graph_evictions == 2
+    assert model._ragged_prefill_logits_graph_evicted_entries == 2
+    assert model._ragged_prefill_logits_graph_max_entries == 8
+    assert len(model._ragged_prefill_logits_graphs) == 1
+
+
+def test_llama3_tensor_parallel_ragged_prefill_low_memory_skip_is_collective(monkeypatch) -> None:
+    model = object.__new__(Llama3TensorParallelForCausalLM)
+    model.device = torch.device("cuda")
+    model.rank = 0
+    model.world_size = 2
+    model.layers = []
+    model._ragged_prefill_logits_graphs = {}
+    model._ragged_prefill_logits_graph_evictions = 0
+    model._ragged_prefill_logits_graph_evicted_entries = 0
+    model._ragged_prefill_logits_graph_max_entries = 0
+    model._ragged_prefill_logits_graph_failed = False
+    model._ragged_prefill_mixed_logits_graph_failed = False
+    model._ragged_prefill_capture_on_miss_failed = False
+    model._last_ragged_prefill_graph_captured = False
+    cache = types.SimpleNamespace(layers=[types.SimpleNamespace(max_seq_len=16)])
+    cache._skip_capture_sync = False
+    input_ids = torch.zeros((2, 4), dtype=torch.long)
+    seq_lens = torch.zeros(4, dtype=torch.long)
+    row_indices = torch.tensor([0, 1], dtype=torch.long)
+    logit_positions = torch.tensor([3, 3], dtype=torch.long)
+    collective_votes: list[bool] = []
+    monkeypatch.setenv("TORCHINFERNO_CUDAGRAPH_PREFILL_MIN_FREE_MB", "1024")
+    monkeypatch.setattr(
+        tensor_parallel_module,
+        "_should_use_ragged_prefill_logits_graph",
+        lambda *args, **kwargs: True,
+    )
+    monkeypatch.setattr(
+        torch.cuda,
+        "mem_get_info",
+        lambda device=None: (8 * 1024 * 1024, 80 * 1024**3),
+    )
+
+    def collective_memory_vote(ok: bool, device: torch.device) -> bool:
+        collective_votes.append(ok)
+        return False
+
+    monkeypatch.setattr(
+        tensor_parallel_module,
+        "_capture_succeeded_on_all_ranks",
+        collective_memory_vote,
+    )
+
+    def capture_graph(*args, **kwargs):  # noqa: ANN002, ANN003
+        del args, kwargs
+        raise AssertionError("low-memory capture should be skipped collectively")
+
+    monkeypatch.setattr(model, "_capture_ragged_prefill_logits_graph", capture_graph)
+
+    logits = model.try_prefill_ragged_logits_graph(
+        input_ids,
+        cache,
+        seq_lens=seq_lens,
+        row_indices=row_indices,
+        logit_positions=logit_positions,
+        capture_on_miss=True,
+    )
+
+    assert logits is None
+    assert collective_votes == [False]
+
+
 def test_llama3_tensor_parallel_ragged_prefill_graph_replay_refreshes_eviction_order(monkeypatch) -> None:
     model = object.__new__(Llama3TensorParallelForCausalLM)
     model.device = torch.device("cpu")
@@ -945,6 +1082,7 @@ def test_llama3_tensor_parallel_ragged_prefill_graph_replay_refreshes_eviction_o
             (False,),
             0,
             1,
+            0,
             1,
             1,
         )
@@ -966,6 +1104,8 @@ def test_llama3_tensor_parallel_ragged_prefill_graph_replay_refreshes_eviction_o
             context_len=8,
             prefix_copy_len=None,
             emit_logits=True,
+            emit_tokens=False,
+            output_token=None,
             rotary_in_graph=True,
             write_positions_in_graph=True,
         )
