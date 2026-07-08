@@ -5095,9 +5095,11 @@ class ContinuousBatchEngine:
         group: list[tuple[int, ServingRequest, int, _ReusablePrefix]],
     ) -> None:
         copy_groups: dict[tuple[int, int], list[int]] = defaultdict(list)
+        reuse_entries: list[tuple[int, _ReusablePrefix | None]] = []
         for row, (_original_index, _request, prefix_hit_tokens, reusable) in zip(rows, group):
             copy_groups[(reusable.row, prefix_hit_tokens)].append(row)
-            self._record_prefix_reuse(prefix_hit_tokens, reusable)
+            reuse_entries.append((prefix_hit_tokens, reusable))
+        self._record_prefix_reuse_batch(reuse_entries)
         for (source_row, prefix_hit_tokens), dest_rows in copy_groups.items():
             self._copy_prefix_to_rows(source_row, dest_rows, prefix_hit_tokens)
 
@@ -7737,12 +7739,14 @@ class ContinuousBatchEngine:
                 return None
         cache = self._require_cache()
         rows: list[int] = []
+        reuse_entries: list[tuple[int, _ReusablePrefix | None]] = []
         try:
             for _idx, request, hit, reusable in group:
                 row = self._acquire_active_row()
                 self._copy_prefix(reusable.row, row, hit)
                 rows.append(row)
-                self._record_prefix_reuse(hit, reusable)
+                reuse_entries.append((hit, reusable))
+            self._record_prefix_reuse_batch(reuse_entries)
         except Exception:
             for row in rows:
                 self._release_active_row(row)
