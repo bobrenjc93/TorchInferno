@@ -489,14 +489,15 @@ def _online_decode_quantum(*, temperature: float, max_tokens: int) -> int:
         )
         if sampled_short_max_tokens < max_tokens <= sampled_medium_max_tokens:
             # Tree-style sampled medium bursts are E2E/TTFT-bound more than
-            # steady TPOT-bound. A smaller command quantum lets newly-prefilled
-            # workers surface tokens sooner while staying scoped away from
-            # sampled-short self-consistency and greedy decode-many traffic.
+            # steady TPOT-bound. A one-step command quantum lets one-token
+            # branch/eval completions surface immediately while staying scoped
+            # away from sampled-short self-consistency and greedy decode-many
+            # traffic.
             default_short_quantum = min(
                 decode_quantum,
                 env_int(
                     "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_GEN_DECODE_QUANTUM",
-                    2,
+                    1,
                     minimum=1,
                 ),
             )
