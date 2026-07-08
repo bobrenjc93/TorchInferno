@@ -260,6 +260,43 @@ def test_openai_startup_warmup_skips_non_dense_cache_by_default(
     assert _startup_warmup_enabled_for_cache_backend("dense")
 
 
+def test_online_serving_warmup_cache_falls_back_to_dense_without_flashinfer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("torchinferno.openai_server.importlib.util.find_spec", lambda name: None)
+    allocated_backends: list[str] = []
+
+    class Model:
+        def allocate_cache(
+            self,
+            batch_size: int,
+            max_seq_len: int,
+            *,
+            device: torch.device | None = None,
+            cache_backend: str = "dense",
+            page_size: int = 16,
+        ) -> object:
+            del device, page_size
+            allocated_backends.append(cache_backend)
+            layer = types.SimpleNamespace(max_seq_len=max_seq_len, batch_size=batch_size, seq_len=0)
+            return types.SimpleNamespace(cache_backend=cache_backend, layers=[layer], seq_len=0)
+
+        def forward_decode_paged(self) -> None:
+            raise AssertionError("paged engine should not be built without flashinfer")
+
+    engine = _cache_only_engine()
+    engine.model = Model()
+    engine.device = torch.device("cpu")
+    engine.cache_backend = "paged"
+    engine.max_batch_size = 4
+    engine.max_model_len = 128
+
+    cache, _max_active, _cache_batch, _max_seq_len = engine._allocate_online_serving_warmup_cache()
+
+    assert allocated_backends == ["dense"]
+    assert getattr(cache, "cache_backend", None) == "dense"
+
+
 def test_flashinfer_prefill_warmup_batches_are_capped(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1833,6 +1870,92 @@ def test_tensor_parallel_worker_loop_handles_online_runtime_commands(monkeypatch
         ((3,), 6, 7, 0, (0, 9), 0.7),
     ]
     assert [request.request_id for request in runtime.submitted] == ["10", "11"]
+
+
+def test_tensor_parallel_worker_loop_falls_back_to_dense_cache_without_flashinfer(
+    monkeypatch,
+) -> None:
+    import torch.distributed as dist
+
+    monkeypatch.setattr("torchinferno.openai_server.importlib.util.find_spec", lambda name: None)
+    commands: list[dict[str, object]] = [
+        {
+            "op": "online_start",
+            "max_seq_len": 16,
+            "max_active_requests": 4,
+            "prefix_cache_capacity": 2,
+            "prefill_token_budget": 8,
+            "temperature": 0.0,
+            "max_tokens": 6,
+        },
+        {"op": "online_close"},
+        {"op": "stop"},
+    ]
+    instances: list[object] = []
+    allocated_backends: list[str] = []
+
+    class Model:
+        world_size = 2
+        rank = 1
+
+        def allocate_cache(
+            self,
+            batch_size: int,
+            max_seq_len: int,
+            *,
+            device: torch.device | None = None,
+            cache_backend: str = "dense",
+            page_size: int = 16,
+        ) -> object:
+            del device, page_size
+            allocated_backends.append(cache_backend)
+            layer = types.SimpleNamespace(max_seq_len=max_seq_len, batch_size=batch_size, seq_len=0)
+            return types.SimpleNamespace(cache_backend=cache_backend, layers=[layer], seq_len=0)
+
+        def forward_decode_paged(self) -> None:
+            raise AssertionError("paged engine should not be built without flashinfer")
+
+    class RuntimeEngine:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            del args
+            self.kwargs = dict(kwargs)
+            self.started_cache_backend: str | None = None
+            instances.append(self)
+
+        def start_online(self, *, max_seq_len: int, external_cache: object | None = None) -> None:
+            del max_seq_len
+            self.started_cache_backend = getattr(external_cache, "cache_backend", None)
+
+        def has_online_work(self) -> bool:
+            return False
+
+    def broadcast_object_list(payload: list[object], *, src: int) -> None:
+        del src
+        payload[0] = commands.pop(0)
+
+    monkeypatch.setattr(dist, "is_available", lambda: True)
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(dist, "broadcast_object_list", broadcast_object_list)
+    monkeypatch.setattr("torchinferno.openai_server._RuntimeContinuousBatchEngine", RuntimeEngine)
+    monkeypatch.setattr("torchinferno.openai_server._reset_generation_cache", lambda cache: True)
+    monkeypatch.setattr(
+        "torchinferno.openai_server._tensor_parallel_symm_mem_allreduce_scope",
+        lambda *args, **kwargs: nullcontext(),
+    )
+
+    engine = _WorkerLoopRecordingEngine()
+    engine.model = Model()
+    engine.cache_backend = "paged"
+    engine.page_size = 2
+
+    _tensor_parallel_worker_loop(engine)
+
+    assert commands == []
+    assert len(instances) == 1
+    runtime = instances[0]
+    assert runtime.kwargs["cache_backend"] == "dense"
+    assert runtime.started_cache_backend == "dense"
+    assert allocated_backends == ["dense"]
 
 
 def test_tensor_parallel_worker_loop_rebuilds_dense_runtime_with_paged_prefix_cache(
@@ -15812,6 +15935,121 @@ def test_openai_tensor_parallel_online_batcher_drains_ready_requests(monkeypatch
     assert second_items[0] == 301
     assert isinstance(first_items[1], _GenerationDone)
     assert isinstance(second_items[1], _GenerationDone)
+
+
+def test_openai_tensor_parallel_online_batcher_falls_back_to_dense_cache_without_flashinfer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_PERSISTENT", "0")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_CONTINUOUS_BATCHER", "1")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_DECODE_QUANTUM", "1")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_INITIAL_BATCH_WAIT_MS", "0")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_IDLE_BATCH_WAIT_MS", "0")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_PREFIX_ROWS", "1")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_MAX_SEQ_LEN_HEADROOM_TOKENS", "0")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_PREFILL_TOKEN_BUDGET", "0")
+    monkeypatch.setattr("torchinferno.openai_server.importlib.util.find_spec", lambda name: None)
+
+    allocated_backends: list[str] = []
+    instances: list[object] = []
+
+    class Model:
+        world_size = 2
+        rank = 0
+
+        def allocate_cache(
+            self,
+            batch_size: int,
+            max_seq_len: int,
+            *,
+            device: torch.device | None = None,
+            cache_backend: str = "dense",
+            page_size: int = 16,
+        ) -> object:
+            del device, page_size
+            allocated_backends.append(cache_backend)
+            layer = types.SimpleNamespace(max_seq_len=max_seq_len, batch_size=batch_size, seq_len=0)
+            return types.SimpleNamespace(cache_backend=cache_backend, layers=[layer], seq_len=0)
+
+        def forward_decode_paged(self) -> None:
+            raise AssertionError("paged engine should not be built without flashinfer")
+
+    model = Model()
+
+    class RuntimeEngine:
+        def __init__(self, *args, **kwargs) -> None:  # noqa: ANN002, ANN003
+            del args
+            self.kwargs = dict(kwargs)
+            self.pending: list[object] = []
+            self.external_cache_backend: str | None = None
+            instances.append(self)
+
+        def start_online(self, *, max_seq_len: int, external_cache: object | None = None) -> None:
+            del max_seq_len
+            self.external_cache_backend = getattr(external_cache, "cache_backend", None)
+
+        def submit_online(self, request: object) -> None:
+            self.pending.append(request)
+
+        def has_online_work(self) -> bool:
+            return bool(self.pending)
+
+        def step_online(self) -> list[object]:
+            events = [
+                types.SimpleNamespace(request_id=getattr(request, "request_id"), token=900 + index, finished=True)
+                for index, request in enumerate(self.pending)
+            ]
+            self.pending.clear()
+            return events
+
+    monkeypatch.setattr(
+        "torchinferno.openai_server._is_tensor_parallel_model",
+        lambda candidate: candidate is model,
+    )
+    monkeypatch.setattr("torchinferno.openai_server._RuntimeContinuousBatchEngine", RuntimeEngine)
+    monkeypatch.setattr(
+        "torchinferno.openai_server._tensor_parallel_symm_mem_allreduce_scope",
+        lambda *args, **kwargs: nullcontext(),
+    )
+    monkeypatch.setattr(
+        "torchinferno.openai_server._broadcast_tensor_parallel_online_start",
+        lambda model, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        "torchinferno.openai_server._broadcast_tensor_parallel_online_submit_prompt_lists",
+        lambda model, prompts, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        "torchinferno.openai_server._broadcast_tensor_parallel_online_step",
+        lambda model, steps=1: None,
+    )
+    monkeypatch.setattr(
+        "torchinferno.openai_server._broadcast_tensor_parallel_online_close",
+        lambda model: None,
+    )
+    monkeypatch.setattr(
+        "torchinferno.openai_server._sync_tensor_parallel_command",
+        lambda model, device, **kwargs: None,
+    )
+
+    engine = _cache_only_engine()
+    engine.model = model
+    engine.device = torch.device("cuda")
+    engine.cache_backend = "paged"
+    engine.stop_token_ids = frozenset()
+    engine.max_batch_size = 4
+    engine._generation_queue = queue.Queue()
+    first_queue: queue.Queue[object] = queue.Queue()
+
+    engine._run_tensor_parallel_online_batcher(_QueuedGeneration([1, 2], 1, 0.0, True, first_queue))
+
+    assert len(instances) == 1
+    runtime = instances[0]
+    assert runtime.kwargs["cache_backend"] == "dense"
+    assert runtime.external_cache_backend == "dense"
+    assert allocated_backends == ["dense"]
+    assert first_queue.get_nowait() == 900
+    assert isinstance(first_queue.get_nowait(), _GenerationDone)
 
 
 def test_openai_tensor_parallel_online_batcher_can_submit_mixed_temperatures(

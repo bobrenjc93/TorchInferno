@@ -3722,7 +3722,13 @@ class OpenAICompletionEngine:
             getattr(self, "max_model_len", None) or 768,
             minimum=64,
         )
-        unified_cache_backend = self.cache_backend
+        paged_kv_requested = _paged_kv_active_for(self.model, max_seq_len)
+        paged_cache_fallback_candidate = paged_kv_requested or hasattr(self.model, "forward_decode_paged")
+        unified_cache_backend = _online_continuous_cache_backend(
+            self.cache_backend,
+            paged_cache_fallback_candidate=paged_cache_fallback_candidate,
+            use_paged_engine=_paged_online_engine_class_for(self.model, max_seq_len) is not None,
+        )
         # Auto-selecting the flashinfer FORWARD backend for the dense short-context
         # engine REGRESSES at 64-conc (TI's flashinfer forward wrapper is naive:
         # few_shot TPOT 81->206). It is SEPARATE from the long-context graphed paged
@@ -3730,7 +3736,7 @@ class OpenAICompletionEngine:
         # back-compat) so flashinfer can be installed FOR the paged decode while the
         # dense forward stays dense. Only override an explicitly-dense backend.
         if (
-            self.cache_backend == "dense"
+            unified_cache_backend == "dense"
             and env_flag("TORCHINFERNO_OPENAI_FLASHINFER_FORWARD", False)
             and hasattr(self.model, "forward_step_flashinfer")
         ):
@@ -5433,21 +5439,14 @@ class OpenAICompletionEngine:
         # the same submit/step command protocol, so the deterministic page allocator
         # keeps block tables in sync without extra broadcast. Returns None (-> dense)
         # when off or the model lacks the paged forward.
-        if not _paged_kv_active_for(self.model, max_seq_len):
-            return None
-        try:
-            from torchinferno.runtime.paged_serving import PagedEngine
-        except Exception:
+        PagedEngine = _paged_online_engine_class_for(self.model, max_seq_len)
+        if PagedEngine is None:
             return None
         # PagedEngine's graphed decode (PagedDecodeGraphRunner) hard-requires
         # flashinfer. The inference-bench environment does NOT install flashinfer,
         # so building PagedEngine there raises ModuleNotFoundError mid-batcher and
         # wedges paged serving. When flashinfer is absent, return None so the online
-        # batcher falls back to the dense _RuntimeContinuousBatchEngine driving the
-        # paged cache through the flashinfer-FREE triton append_and_attend_ragged
-        # decode (the same path the single-request solo route already uses correctly).
-        if importlib.util.find_spec("flashinfer") is None:
-            return None
+        # batcher falls back to the dense _RuntimeContinuousBatchEngine.
         page_size = int(getattr(self, "page_size", 16) or 16)
         # COW prefix caching needs the engine (its paged pool + PagedPrefixCache +
         # retained pages) to PERSIST across batcher sessions, so multi_turn's per-turn
@@ -5775,8 +5774,15 @@ class OpenAICompletionEngine:
             max_tokens=run_max_tokens,
         )
         engine_create_start_s = time.perf_counter()
+        paged_kv_requested = _paged_kv_active_for(self.model, max_seq_len)
         runtime_engine = self._maybe_build_paged_online_engine(max_active=max_active, max_seq_len=max_seq_len)
         use_paged_engine = runtime_engine is not None
+        paged_cache_fallback_candidate = paged_kv_requested or hasattr(self.model, "forward_decode_paged")
+        online_cache_backend = _online_continuous_cache_backend(
+            self.cache_backend,
+            paged_cache_fallback_candidate=paged_cache_fallback_candidate,
+            use_paged_engine=use_paged_engine,
+        )
         normalized_prefill_budget = prefill_budget if prefill_budget > 0 else None
         graph_prefill = False
         prefill_chunk_size: int | None = None
@@ -5788,7 +5794,7 @@ class OpenAICompletionEngine:
             runtime_engine = _RuntimeContinuousBatchEngine(
                 self.model,
                 device=self.device,
-                cache_backend=self.cache_backend,
+                cache_backend=online_cache_backend,
                 page_size=self.page_size,
                 temperature=first.temperature,
                 max_active_requests=max_active,
@@ -6199,6 +6205,7 @@ class OpenAICompletionEngine:
                                 max_seq_len,
                                 model=self.model,
                                 batch_capacity=_generation_cache_batch_capacity(self.model, total_online_rows),
+                                cache_backend=online_cache_backend,
                             )
                             _reset_generation_cache(shared_cache)
                             self._persistent_serving_cache = shared_cache
@@ -8180,7 +8187,9 @@ class OpenAICompletionEngine:
         model: object,
         pool: bool = True,
         batch_capacity: int | None = None,
+        cache_backend: str | None = None,
     ) -> object:
+        backend = self.cache_backend if cache_backend is None else str(cache_backend)
         cache_batch_size = max(batch_size, int(batch_capacity)) if batch_capacity is not None else batch_size
         cache_capacity = _generation_cache_capacity(model, max_seq_len)
         if not pool:
@@ -8189,7 +8198,7 @@ class OpenAICompletionEngine:
                 cache_batch_size,
                 cache_capacity,
                 device=self.device,
-                cache_backend=self.cache_backend,
+                cache_backend=backend,
                 page_size=self.page_size,
             )
             try:
@@ -8199,14 +8208,14 @@ class OpenAICompletionEngine:
             _reset_generation_cache(cache)
             return cache
         exact_capacity = _prefers_exact_generation_cache(model)
-        key = (cache_batch_size, cache_capacity, self.cache_backend, self.page_size, str(self.device))
+        key = (cache_batch_size, cache_capacity, backend, self.page_size, str(self.device))
         for cached_key, cached in list(self._cache_pool.items()):
             cached_batch, cached_max_seq_len, cached_backend, cached_page_size, cached_device = cached_key
             capacity_matches = cached_max_seq_len == cache_capacity if exact_capacity else cached_max_seq_len >= max_seq_len
             if (
                 cached_batch == cache_batch_size
                 and capacity_matches
-                and cached_backend == self.cache_backend
+                and cached_backend == backend
                 and cached_page_size == self.page_size
                 and cached_device == str(self.device)
             ):
@@ -8244,7 +8253,7 @@ class OpenAICompletionEngine:
             cache_batch_size,
             cache_capacity,
             device=self.device,
-            cache_backend=self.cache_backend,
+            cache_backend=backend,
             page_size=self.page_size,
         )
         if _reset_generation_cache(cache):
@@ -13732,6 +13741,36 @@ def _paged_kv_active_for(model: object, max_seq_len: int) -> bool:
     return int(max_seq_len) >= min_seq
 
 
+def _paged_online_engine_class_for(model: object, max_seq_len: int) -> object | None:
+    if not _paged_kv_active_for(model, max_seq_len):
+        return None
+    if importlib.util.find_spec("flashinfer") is None:
+        return None
+    try:
+        from torchinferno.runtime.paged_serving import PagedEngine
+    except Exception as exc:
+        warn_optional_failure("paged online engine", exc)
+        return None
+    return PagedEngine
+
+
+def _online_continuous_cache_backend(
+    cache_backend: object,
+    *,
+    paged_cache_fallback_candidate: bool,
+    use_paged_engine: bool,
+) -> str:
+    backend = str(cache_backend or "dense")
+    if (
+        backend.lower() == "paged"
+        and paged_cache_fallback_candidate
+        and not use_paged_engine
+        and env_flag("TORCHINFERNO_OPENAI_PAGED_KV_DENSE_FALLBACK", True)
+    ):
+        return "dense"
+    return backend
+
+
 def _prefix_cache_enabled_for_model(model: object) -> bool:
     if _is_tensor_parallel_model(model) and _tensor_parallel_world_size(model) > 1:
         return env_flag("TORCHINFERNO_OPENAI_TP_PREFIX_CACHE", True)
@@ -15378,7 +15417,18 @@ def _tensor_parallel_worker_loop(engine: OpenAICompletionEngine) -> None:
                 # (both build a PagedEngine identically + are driven by the same
                 # submit/step commands, so the deterministic page allocator keeps
                 # block tables in sync across ranks).
-                worker_use_paged = _paged_kv_active_for(getattr(engine, "model", None), max_seq_len)
+                worker_model = getattr(engine, "model", None)
+                worker_paged_kv_requested = _paged_kv_active_for(worker_model, max_seq_len)
+                worker_paged_engine_cls = _paged_online_engine_class_for(worker_model, max_seq_len)
+                worker_use_paged = worker_paged_engine_cls is not None
+                worker_paged_cache_fallback_candidate = (
+                    worker_paged_kv_requested or hasattr(worker_model, "forward_decode_paged")
+                )
+                worker_cache_backend = _online_continuous_cache_backend(
+                    getattr(engine, "cache_backend", "dense"),
+                    paged_cache_fallback_candidate=worker_paged_cache_fallback_candidate,
+                    use_paged_engine=worker_use_paged,
+                )
                 # Rebuild the worker's paged engine if it does not FIT this burst, with
                 # the SAME monotonic-growth sizing as the primary (_maybe_build_paged_
                 # online_engine) so both ranks size identically -> consistent paged pool
@@ -15396,13 +15446,12 @@ def _tensor_parallel_worker_loop(engine: OpenAICompletionEngine) -> None:
                         or getattr(online_runtime_engine, "max_active", 0) < max_active))
                 )
                 if _paged_needs_build:
-                    from torchinferno.runtime.paged_serving import PagedEngine
                     _prev = online_runtime_engine if _persist_paged else None
                     _floor = env_int("TORCHINFERNO_PAGED_PERSIST_FLOOR_SEQ", 2048, minimum=1)
                     _cap = int(getattr(engine, "max_model_len", None) or (1 << 20))
                     _t_seq = min(_cap, max(int(max_seq_len), _floor, getattr(_prev, "max_seq", 0)))
                     _t_active = max(int(max_active), getattr(_prev, "max_active", 0))
-                    online_runtime_engine = PagedEngine(
+                    online_runtime_engine = worker_paged_engine_cls(
                         getattr(engine, "model"),
                         page_size=int(getattr(engine, "page_size", 16)) or 16,
                         max_active=_t_active, max_seq=_t_seq,
@@ -15412,7 +15461,7 @@ def _tensor_parallel_worker_loop(engine: OpenAICompletionEngine) -> None:
                     online_runtime_engine = _RuntimeContinuousBatchEngine(
                         getattr(engine, "model"),
                         device=getattr(engine, "device", torch.device("cpu")),
-                        cache_backend=str(getattr(engine, "cache_backend", "dense")),
+                        cache_backend=worker_cache_backend,
                         page_size=int(getattr(engine, "page_size", 16)),
                         temperature=temperature,
                         max_active_requests=max_active,
@@ -15460,8 +15509,6 @@ def _tensor_parallel_worker_loop(engine: OpenAICompletionEngine) -> None:
                         worker_shared_cache = None
                     if worker_shared_cache is None:
                         try:
-                            worker_model = getattr(engine, "model")
-                            worker_cache_backend = str(getattr(engine, "cache_backend", "dense"))
                             worker_shared_cache = _allocate_cache(
                                 worker_model, total_rows,
                                 _generation_cache_capacity(worker_model, max_seq_len),
