@@ -874,6 +874,15 @@ class ContinuousBatchEngine:
             else max(0, int(prefill_ready_before_decode_active_cap))
         )
         self.enable_ragged_decode = enable_ragged_decode
+        self._ragged_decode_buckets_enabled = env_flag(
+            "TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_BUCKETS",
+            True,
+        )
+        self._ragged_decode_bucket_capacity = env_int(
+            "TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_BUCKET_CAPACITY",
+            max_active_requests,
+            minimum=1,
+        )
         self.store_reusable_prefixes = store_reusable_prefixes
         self.store_full_prompt_prefixes = store_full_prompt_prefixes
         self._cached_repeated_sample_state_enabled = env_flag(
@@ -6583,19 +6592,12 @@ class ContinuousBatchEngine:
         return decoded
 
     def _ragged_decode_bucket_rows(self, rows: list[int]) -> list[int]:
-        if not env_flag("TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_BUCKETS", True):
+        if not self._ragged_decode_buckets_enabled:
             return rows
         active_count = len(rows)
         if active_count <= 1:
             return rows
-        capacity = min(
-            self.max_active_requests,
-            env_int(
-                "TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_BUCKET_CAPACITY",
-                self.max_active_requests,
-                minimum=1,
-            ),
-        )
+        capacity = min(self.max_active_requests, max(1, int(self._ragged_decode_bucket_capacity)))
         if active_count >= capacity:
             return rows
         bucket_size = min(capacity, 1 << (active_count - 1).bit_length())
