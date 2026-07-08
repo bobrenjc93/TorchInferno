@@ -1252,6 +1252,22 @@ def _online_session_prompt_headroom_tokens(*, temperature: float, max_tokens: in
                 32,
                 minimum=0,
             )
+    greedy_large_min_tokens = env_int(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_SESSION_HEADROOM_MIN_TOKENS",
+        400,
+        minimum=1,
+    )
+    greedy_large_max_tokens = env_int(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_SESSION_HEADROOM_MAX_TOKENS",
+        512,
+        minimum=greedy_large_min_tokens,
+    )
+    if greedy_large_min_tokens < max_tokens <= greedy_large_max_tokens:
+        return env_int(
+            "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_SESSION_PROMPT_HEADROOM_TOKENS",
+            64,
+            minimum=0,
+        )
     return 0
 
 

@@ -10493,6 +10493,18 @@ def test_online_session_max_tokens_buckets_greedy_short_by_default(monkeypatch) 
         "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_SESSION_PROMPT_HEADROOM_TOKENS",
         raising=False,
     )
+    monkeypatch.delenv(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_SESSION_HEADROOM_MIN_TOKENS",
+        raising=False,
+    )
+    monkeypatch.delenv(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_SESSION_HEADROOM_MAX_TOKENS",
+        raising=False,
+    )
+    monkeypatch.delenv(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_SESSION_PROMPT_HEADROOM_TOKENS",
+        raising=False,
+    )
 
     assert _online_session_max_tokens(temperature=0.0, max_tokens=15) == 15
     assert _online_session_max_tokens(temperature=0.0, max_tokens=16) == 96
@@ -10502,11 +10514,14 @@ def test_online_session_max_tokens_buckets_greedy_short_by_default(monkeypatch) 
     assert _online_session_max_tokens(temperature=0.0, max_tokens=129) == 129
     assert _online_session_max_tokens(temperature=0.7, max_tokens=82) == 82
     assert _online_session_prompt_headroom_tokens(temperature=0.0, max_tokens=82) == 32
+    assert _online_session_prompt_headroom_tokens(temperature=0.0, max_tokens=512) == 64
     assert _online_session_prompt_headroom_tokens(temperature=0.7, max_tokens=82) == 0
+    assert _online_session_prompt_headroom_tokens(temperature=0.7, max_tokens=512) == 0
 
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_SESSION_MAX_TOKENS", "0")
     assert _online_session_max_tokens(temperature=0.0, max_tokens=82) == 82
     assert _online_session_prompt_headroom_tokens(temperature=0.0, max_tokens=82) == 0
+    assert _online_session_prompt_headroom_tokens(temperature=0.0, max_tokens=512) == 64
 
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_SESSION_MAX_TOKENS", "96")
     assert _online_session_max_tokens(temperature=0.0, max_tokens=82) == 96
@@ -10516,6 +10531,17 @@ def test_online_session_max_tokens_buckets_greedy_short_by_default(monkeypatch) 
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_SESSION_MAX_TOKENS", "128")
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SMALL_SESSION_MAX_TOKENS", "0")
     assert _online_session_max_tokens(temperature=0.0, max_tokens=82) == 128
+
+    monkeypatch.setenv(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_SESSION_PROMPT_HEADROOM_TOKENS",
+        "48",
+    )
+    assert _online_session_prompt_headroom_tokens(temperature=0.0, max_tokens=512) == 48
+    monkeypatch.setenv(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_SESSION_HEADROOM_MAX_TOKENS",
+        "511",
+    )
+    assert _online_session_prompt_headroom_tokens(temperature=0.0, max_tokens=512) == 0
 
 
 def test_openai_online_persistent_idle_uses_sampled_short_default(monkeypatch) -> None:
