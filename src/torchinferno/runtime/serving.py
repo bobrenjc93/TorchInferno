@@ -81,6 +81,13 @@ def _packed_prefill_candidate_signature(
         suffix_lengths=suffix_lengths,
         start_lens=start_lens,
     )
+    return _packed_prefill_candidate_signature_from_counts(shape_key, group_counts)
+
+
+def _packed_prefill_candidate_signature_from_counts(
+    shape_key: str,
+    group_counts: Mapping[tuple[int, int], int],
+) -> str:
     groups = "/".join(
         f"p{start}:s{suffix}:n{count}"
         for (start, suffix), count in sorted(group_counts.items())
@@ -94,14 +101,20 @@ def _packed_prefill_candidate_pattern(
     suffix_lengths: Sequence[int],
     start_lens: Sequence[int],
 ) -> str:
+    group_counts = _packed_prefill_group_counts(
+        suffix_lengths=suffix_lengths,
+        start_lens=start_lens,
+    )
+    return _packed_prefill_candidate_pattern_from_counts(shape_key, group_counts)
+
+
+def _packed_prefill_candidate_pattern_from_counts(
+    shape_key: str,
+    group_counts: Mapping[tuple[int, int], int],
+) -> str:
     groups = "/".join(
         f"p{start}:s{suffix}"
-        for start, suffix in sorted(
-            {
-                (max(0, int(start_len)), max(0, int(suffix_len)))
-                for suffix_len, start_len in zip(suffix_lengths, start_lens)
-            }
-        )
+        for start, suffix in sorted(group_counts)
     )
     return f"{shape_key}|{groups}" if groups else f"{shape_key}|empty"
 
@@ -3495,6 +3508,7 @@ class ContinuousBatchEngine:
                 suffix_lengths=suffix_lengths,
                 start_lens=start_lens[:count],
                 model_tokens=int(input_ids.numel()),
+                packed_prefill_pattern_key=packed_prefill_pattern_key,
             )
             if self.profile_timings:
                 setup_elapsed_ms = (time.perf_counter() - setup_start_s) * 1000.0
@@ -8029,14 +8043,18 @@ class ContinuousBatchEngine:
         suffix_lengths: Sequence[int],
         start_lens: Sequence[int],
         model_tokens: int,
+        packed_prefill_pattern_key: str | None = None,
     ) -> None:
-        real_tokens = sum(max(0, int(suffix_len)) for suffix_len in suffix_lengths)
+        group_counts: dict[tuple[int, int], int] = defaultdict(int)
+        real_tokens = 0
+        for suffix_len, start_len in zip(suffix_lengths, start_lens):
+            suffix = max(0, int(suffix_len))
+            start = max(0, int(start_len))
+            real_tokens += suffix
+            group_counts[(start, suffix)] += 1
         saved_tokens = max(0, int(model_tokens) - real_tokens)
         if saved_tokens <= 0:
             return
-        group_counts: dict[tuple[int, int], int] = defaultdict(int)
-        for suffix_len, start_len in zip(suffix_lengths, start_lens):
-            group_counts[(max(0, int(start_len)), max(0, int(suffix_len)))] += 1
         groups = len(group_counts)
         self.stats.prefill_packed_candidate_calls += 1
         self.stats.prefill_packed_candidate_tokens += real_tokens
@@ -8069,11 +8087,7 @@ class ContinuousBatchEngine:
             shape_key,
             groups,
         )
-        signature_key = _packed_prefill_candidate_signature(
-            shape_key,
-            suffix_lengths=suffix_lengths,
-            start_lens=start_lens,
-        )
+        signature_key = _packed_prefill_candidate_signature_from_counts(shape_key, group_counts)
         self._record_shape_count(
             self.stats.prefill_packed_candidate_signature_counts,
             signature_key,
@@ -8098,10 +8112,9 @@ class ContinuousBatchEngine:
             signature_key,
             groups,
         )
-        pattern_key = _packed_prefill_candidate_pattern(
+        pattern_key = packed_prefill_pattern_key or _packed_prefill_candidate_pattern_from_counts(
             shape_key,
-            suffix_lengths=suffix_lengths,
-            start_lens=start_lens,
+            group_counts,
         )
         self._record_shape_count(
             self.stats.prefill_packed_candidate_pattern_counts,
