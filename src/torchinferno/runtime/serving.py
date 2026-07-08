@@ -5,7 +5,7 @@ import time
 from collections import defaultdict
 from dataclasses import dataclass, field
 from inspect import signature
-from typing import Callable, Hashable, Iterator, Mapping, Optional, Sequence
+from typing import Callable, Hashable, Iterable, Iterator, Mapping, Optional, Sequence
 
 import torch
 from torch import Tensor
@@ -3414,8 +3414,10 @@ class ContinuousBatchEngine:
                 reusable.row
                 for _index, _request, _prefix_hit_tokens, reusable in group
             ]
-            for _index, _request, prefix_hit_tokens, _reusable in group:
-                self._record_prefix_reuse(prefix_hit_tokens, _reusable)
+            self._record_prefix_reuse_batch(
+                (prefix_hit_tokens, reusable)
+                for _index, _request, prefix_hit_tokens, reusable in group
+            )
             skip_prefix_copy = (
                 not mixed_prefixes
                 and self._warm_row_prefix_copy_skip_enabled()
@@ -4717,8 +4719,10 @@ class ContinuousBatchEngine:
         acquired_rows: list[int] = []
         try:
             next_tokens, logits_by_index = self._sample_exact_prefix_group(group)
-            for _original_index, _request, prefix_hit_tokens, reusable in group:
-                self._record_prefix_reuse(prefix_hit_tokens, reusable)
+            self._record_prefix_reuse_batch(
+                (prefix_hit_tokens, reusable)
+                for _original_index, _request, prefix_hit_tokens, reusable in group
+            )
 
             active_items: list[tuple[_ActiveRequest, int, int]] = []
             copy_groups: dict[tuple[int, int], list[int]] = defaultdict(list)
@@ -4795,13 +4799,14 @@ class ContinuousBatchEngine:
 
             continuation_copy_groups: dict[tuple[int, int], list[int]] = defaultdict(list)
             continuation_active: list[_ActiveRequest] = []
+            generated_reuse_entries: list[tuple[int, _ReusablePrefix | None]] = []
             for row_index, next_token in continuation_next_tokens.items():
                 original_index, request, _prefix_hit_tokens, _reusable = group[row_index]
                 continuation = continuation_reuse[row_index]
                 second_token = int(next_token)
                 generated = 2
                 generated_prefix_len = len(request.prompt) + 1
-                self._record_prefix_reuse(generated_prefix_len, continuation)
+                generated_reuse_entries.append((generated_prefix_len, continuation))
                 self.stats.generated_prefix_reuse_requests += 1
                 self.stats.generated_prefix_reuse_tokens += generated_prefix_len
                 finished = request.is_stop_token(second_token) or generated >= request.max_new_tokens
@@ -4824,6 +4829,7 @@ class ContinuousBatchEngine:
                 continuation_copy_groups[(continuation.row, generated_prefix_len)].append(row)
                 continuation_active.append(state)
 
+            self._record_prefix_reuse_batch(generated_reuse_entries)
             for (source_row, tokens), dest_rows in continuation_copy_groups.items():
                 self._copy_prefix_to_rows(source_row, dest_rows, tokens)
             for state in continuation_active:
@@ -8176,17 +8182,75 @@ class ContinuousBatchEngine:
         prefix_hit_tokens: int,
         reusable: _ReusablePrefix | None,
     ) -> None:
-        self.stats.prefix_reuse_requests += 1
-        self.stats.prefix_reuse_tokens += prefix_hit_tokens
+        route_kind = (
+            self._prefix_reuse_route_kind(reusable.route_id if reusable is not None else None)
+            if self.profile_timings
+            else None
+        )
+        self._record_prefix_reuse_total(prefix_hit_tokens, route_kind=route_kind, count=1)
+
+    def _record_prefix_reuse_batch(
+        self,
+        entries: Iterable[tuple[int, _ReusablePrefix | None]],
+    ) -> None:
+        request_count = 0
+        token_count = 0
+        grouped_counts: dict[tuple[int, str], int] | None = defaultdict(int) if self.profile_timings else None
+        for prefix_hit_tokens, reusable in entries:
+            hit_tokens = int(prefix_hit_tokens)
+            request_count += 1
+            token_count += hit_tokens
+            if grouped_counts is not None:
+                route_kind = self._prefix_reuse_route_kind(
+                    reusable.route_id if reusable is not None else None
+                )
+                grouped_counts[(hit_tokens, route_kind)] += 1
+        if request_count <= 0:
+            return
+        self.stats.prefix_reuse_requests += request_count
+        self.stats.prefix_reuse_tokens += token_count
+        if grouped_counts is None:
+            return
+        for (hit_tokens, route_kind), count in grouped_counts.items():
+            self._record_prefix_reuse_profile_counts(hit_tokens, route_kind=route_kind, count=count)
+
+    def _record_prefix_reuse_total(
+        self,
+        prefix_hit_tokens: int,
+        *,
+        route_kind: str | None,
+        count: int,
+    ) -> None:
+        count = int(count)
+        if count <= 0:
+            return
+        hit_tokens = int(prefix_hit_tokens)
+        self.stats.prefix_reuse_requests += count
+        self.stats.prefix_reuse_tokens += hit_tokens * count
         if not self.profile_timings:
             return
-        self._record_shape_count(
-            self.stats.prefix_reuse_route_counts,
-            self._prefix_reuse_route_kind(reusable.route_id if reusable is not None else None),
+        self._record_prefix_reuse_profile_counts(
+            hit_tokens,
+            route_kind=route_kind or "none",
+            count=count,
         )
-        self._record_shape_count(
+
+    def _record_prefix_reuse_profile_counts(
+        self,
+        prefix_hit_tokens: int,
+        *,
+        route_kind: str,
+        count: int,
+    ) -> None:
+        self._record_shape_total(
+            self.stats.prefix_reuse_route_counts,
+            route_kind,
+            count,
+        )
+        self._record_shape_total(
             self.stats.prefix_reuse_hit_token_counts,
             str(int(prefix_hit_tokens)),
+            count,
         )
 
     def _record_prefix_graph_route_totals(
