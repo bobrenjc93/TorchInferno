@@ -897,6 +897,10 @@ class ContinuousBatchEngine:
         self._sample_repeated_from_state = (
             sample_repeated_from_state if callable(sample_repeated_from_state) else None
         )
+        prefill_token_logits_graph = getattr(model, "try_prefill_ragged_token_logits_graph", None)
+        self._prefill_ragged_token_logits_graph = (
+            prefill_token_logits_graph if callable(prefill_token_logits_graph) else None
+        )
         # When pinning is on, the engine caches ONLY shared common prefixes and
         # pins them against eviction, skipping per-request full-prompt stores
         # that would otherwise starve the prefix-row pool and shadow the shared
@@ -1015,6 +1019,7 @@ class ContinuousBatchEngine:
         ] = {}
         self._packed_prefill_fixed_capacity_seen: dict[str, int] = {}
         self._packed_prefill_fixed_capacity_stable_seen: dict[str, int] = {}
+        self._prefill_token_graph_miss_keys: set[str] = set()
         self._free_active_rows: list[int] = []
         self._free_prefix_rows: list[int] = []
         self._row_seq_lens: list[int] = []
@@ -3329,6 +3334,29 @@ class ContinuousBatchEngine:
                 return int(batch_bucket) <= max_capture_batch
         return True
 
+    def _prefix_prefill_token_graph_capture_on_miss(self) -> bool:
+        return env_flag(
+            "TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_TOKEN_GRAPH_CAPTURE_ON_MISS",
+            False,
+        )
+
+    def _prefix_prefill_token_graph_enabled(self) -> bool:
+        warmup_env = "TORCHINFERNO_OPENAI_WARMUP_ONLINE_GREEDY_COMMON_PREFIX_TOKEN_SUFFIX_PREFILL"
+        warmup_default_enabled = False
+        max_tokens = self.max_generation_tokens
+        if self.temperature <= 0.0 and max_tokens is not None:
+            greedy_short_max_tokens = env_int(
+                "TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SUFFIX_BUCKETS_GREEDY_SHORT_MAX_TOKENS",
+                128,
+                minimum=1,
+            )
+            warmup_default_enabled = 0 < int(max_tokens) <= greedy_short_max_tokens
+        return bool(
+            self._prefix_prefill_token_graph_capture_on_miss()
+            or env_flag("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_TOKEN_GRAPH", False)
+            or env_flag(warmup_env, warmup_default_enabled)
+        )
+
     def _prefix_prefill_split_on_capture_skip_batch(self, batch_bucket: int) -> int:
         env_name = "TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SPLIT_ON_CAPTURE_SKIP_BATCH"
         if env_name in os.environ:
@@ -3556,6 +3584,7 @@ class ContinuousBatchEngine:
                 )
             forward_start_s = time.perf_counter() if self.profile_timings else 0.0
             logits = None
+            next_token_tensor: Tensor | None = None
             prefix_copy_len = max(prefix_hits) if mixed_prefixes and context_len is None else None
             output_group = group
             output_rows = rows
@@ -3589,18 +3618,38 @@ class ContinuousBatchEngine:
                     model_tokens_for_stats,
                 ) = fixed_packed
             elif not mixed_prefixes or self._mixed_prefix_prefill_graph_enabled():
-                logits = self._try_ragged_prefill_logits(
-                    input_ids,
-                    seq_lens,
-                    row_indices,
-                    logit_positions,
-                    context_len,
-                    src_prefix_row,
-                    prefix_copy_len,
-                    capture_on_miss=self._prefix_prefill_capture_on_miss(batch_bucket),
-                    profile_shape_key=shape_key,
-                    packed_prefill_pattern_key=packed_prefill_pattern_key,
+                token_graph_output = (
+                    self._try_ragged_prefill_logits_with_greedy_tokens(
+                        input_ids,
+                        seq_lens,
+                        row_indices,
+                        logit_positions,
+                        [request for _index, request, _prefix_hit_tokens, _reusable in group],
+                        context_len,
+                        src_prefix_row,
+                        prefix_copy_len,
+                        capture_on_miss=self._prefix_prefill_token_graph_capture_on_miss(),
+                        profile_shape_key=shape_key,
+                        packed_prefill_pattern_key=packed_prefill_pattern_key,
+                    )
+                    if self._prefix_prefill_token_graph_enabled()
+                    else None
                 )
+                if token_graph_output is not None:
+                    logits, next_token_tensor = token_graph_output
+                else:
+                    logits = self._try_ragged_prefill_logits(
+                        input_ids,
+                        seq_lens,
+                        row_indices,
+                        logit_positions,
+                        context_len,
+                        src_prefix_row,
+                        prefix_copy_len,
+                        capture_on_miss=self._prefix_prefill_capture_on_miss(batch_bucket),
+                        profile_shape_key=shape_key,
+                        packed_prefill_pattern_key=packed_prefill_pattern_key,
+                    )
             if logits is None:
                 logits = self._ragged_prefill_logits_eager(
                     input_ids,
@@ -3657,10 +3706,13 @@ class ContinuousBatchEngine:
             self.stats.prefill_padded_suffix_batches += 1
             sample_start_s = time.perf_counter() if self.profile_timings else 0.0
             sample_select_start_s = time.perf_counter() if self.profile_timings else 0.0
-            next_token_tensor = self._sample_logits_for_requests(
-                logits[: len(output_group), -1, :],
-                [request for _original_index, request, _prefix_hit_tokens, _reusable in output_group],
-            ).detach()
+            if next_token_tensor is None:
+                next_token_tensor = self._sample_logits_for_requests(
+                    logits[: len(output_group), -1, :],
+                    [request for _original_index, request, _prefix_hit_tokens, _reusable in output_group],
+                ).detach()
+            else:
+                next_token_tensor = next_token_tensor[: len(output_group)].detach()
             sample_select_ms = (
                 (time.perf_counter() - sample_select_start_s) * 1000.0
                 if self.profile_timings
@@ -4195,57 +4247,146 @@ class ContinuousBatchEngine:
                 profile_shape_key=profile_shape_key,
             )
             return None
+        self._record_ragged_prefill_graph_hit(
+            graph_start_s=graph_start_s,
+            graph_shape_key=graph_shape_key,
+            gpu_events=gpu_events,
+            profile_shape_key=profile_shape_key,
+        )
+        return logits
+
+    def _try_ragged_prefill_logits_with_greedy_tokens(
+        self,
+        input_ids: Tensor,
+        seq_lens: Tensor,
+        row_indices: Tensor,
+        logit_positions: Tensor,
+        requests: Sequence[ServingRequest],
+        context_len: int | None = None,
+        src_prefix_row: Tensor | None = None,
+        prefix_copy_len: int | None = None,
+        *,
+        capture_on_miss: bool = True,
+        profile_shape_key: str | None = None,
+        packed_prefill_pattern_key: str | None = None,
+    ) -> tuple[Tensor, Tensor] | None:
+        if not self._cache_supports_tensor_ragged_prefill():
+            return None
+        graph = self._prefill_ragged_token_logits_graph
+        if graph is None:
+            return None
+        packed_eager_enabled = env_flag(
+            "TORCHINFERNO_CONTINUOUS_PACKED_RAGGED_PREFILL_EAGER",
+            False,
+        )
+        if not packed_eager_enabled:
+            packed_eager_enabled = _packed_prefill_eager_pattern_matches(
+                profile_shape_key=profile_shape_key,
+                packed_prefill_pattern_key=packed_prefill_pattern_key,
+            )
+        if packed_eager_enabled and bool(torch.any(logit_positions + 1 < input_ids.size(1))):
+            return None
+        shared_temperature = self._shared_temperature_for_requests(
+            requests,
+            limit=int(input_ids.size(0)),
+        )
+        if shared_temperature is None or shared_temperature > 0.0:
+            return None
+        graph_start_s = time.perf_counter() if self.profile_timings else 0.0
+        graph_shape_key = self._ragged_prefill_graph_shape_key(
+            input_ids,
+            row_indices=row_indices,
+            context_len=context_len,
+            src_prefix_row=src_prefix_row,
+        )
+        if not capture_on_miss and graph_shape_key in self._prefill_token_graph_miss_keys:
+            return None
+        gpu_events = self._start_prefill_graph_gpu_timer() if capture_on_miss else None
+        output = graph(
+            input_ids,
+            self._require_cache(),
+            seq_lens=seq_lens,
+            row_indices=row_indices,
+            logit_positions=logit_positions,
+            context_len=context_len,
+            src_prefix_row=src_prefix_row,
+            prefix_copy_len=prefix_copy_len,
+            temperature=shared_temperature,
+            capture_on_miss=capture_on_miss,
+        )
+        if output is None:
+            if not capture_on_miss:
+                self._prefill_token_graph_miss_keys.add(graph_shape_key)
+            return None
+        logits, tokens = output
+        self._record_ragged_prefill_graph_hit(
+            graph_start_s=graph_start_s,
+            graph_shape_key=graph_shape_key,
+            gpu_events=gpu_events,
+            profile_shape_key=profile_shape_key,
+        )
+        return logits, tokens
+
+    def _record_ragged_prefill_graph_hit(
+        self,
+        *,
+        graph_start_s: float,
+        graph_shape_key: str,
+        gpu_events: tuple[object, object] | None,
+        profile_shape_key: str | None = None,
+    ) -> None:
         self.stats.prefill_graph_hits += 1
         captured = getattr(self.model, "_last_ragged_prefill_graph_captured", None)
-        if isinstance(captured, bool):
-            self._stop_prefill_graph_gpu_timer(
-                gpu_events,
-                captured=captured,
-                graph_shape_key=graph_shape_key,
-                profile_shape_key=profile_shape_key,
+        if not isinstance(captured, bool):
+            return
+        self._stop_prefill_graph_gpu_timer(
+            gpu_events,
+            captured=captured,
+            graph_shape_key=graph_shape_key,
+            profile_shape_key=profile_shape_key,
+        )
+        elapsed_ms = (time.perf_counter() - graph_start_s) * 1000.0 if self.profile_timings else 0.0
+        if captured:
+            self.stats.prefill_graph_captures += 1
+            self.stats.prefill_graph_capture_ms += elapsed_ms
+            self._record_shape_count(
+                self.stats.prefill_graph_capture_shape_counts,
+                graph_shape_key,
             )
-            elapsed_ms = (time.perf_counter() - graph_start_s) * 1000.0 if self.profile_timings else 0.0
-            if captured:
-                self.stats.prefill_graph_captures += 1
-                self.stats.prefill_graph_capture_ms += elapsed_ms
+            self._record_shape_time(
+                self.stats.prefill_graph_capture_shape_ms,
+                graph_shape_key,
+                elapsed_ms,
+            )
+            if profile_shape_key is not None:
                 self._record_shape_count(
-                    self.stats.prefill_graph_capture_shape_counts,
-                    graph_shape_key,
+                    self.stats.prefill_shape_graph_capture_counts,
+                    profile_shape_key,
                 )
                 self._record_shape_time(
-                    self.stats.prefill_graph_capture_shape_ms,
-                    graph_shape_key,
+                    self.stats.prefill_shape_graph_capture_ms,
+                    profile_shape_key,
                     elapsed_ms,
                 )
-                if profile_shape_key is not None:
-                    self._record_shape_count(
-                        self.stats.prefill_shape_graph_capture_counts,
-                        profile_shape_key,
-                    )
-                    self._record_shape_time(
-                        self.stats.prefill_shape_graph_capture_ms,
-                        profile_shape_key,
-                        elapsed_ms,
-                    )
-            else:
-                self.stats.prefill_graph_replays += 1
-                self.stats.prefill_graph_replay_ms += elapsed_ms
-                self._record_shape_time(
-                    self.stats.prefill_graph_replay_shape_ms,
-                    graph_shape_key,
-                    elapsed_ms,
-                )
-                if profile_shape_key is not None:
-                    self._record_shape_count(
-                        self.stats.prefill_shape_graph_replay_counts,
-                        profile_shape_key,
-                    )
-                    self._record_shape_time(
-                        self.stats.prefill_shape_graph_replay_ms,
-                        profile_shape_key,
-                        elapsed_ms,
-                    )
-        return logits
+            return
+
+        self.stats.prefill_graph_replays += 1
+        self.stats.prefill_graph_replay_ms += elapsed_ms
+        self._record_shape_time(
+            self.stats.prefill_graph_replay_shape_ms,
+            graph_shape_key,
+            elapsed_ms,
+        )
+        if profile_shape_key is not None:
+            self._record_shape_count(
+                self.stats.prefill_shape_graph_replay_counts,
+                profile_shape_key,
+            )
+            self._record_shape_time(
+                self.stats.prefill_shape_graph_replay_ms,
+                profile_shape_key,
+                elapsed_ms,
+            )
 
     def _try_ragged_prefill_cache(
         self,
@@ -9004,9 +9145,19 @@ class ContinuousBatchEngine:
     def _decode_capture_on_miss(self) -> bool:
         if self._decode_capture_on_miss_override is not None:
             return bool(self._decode_capture_on_miss_override)
+        # TP online workers are command-driven; a rank-local decode graph miss
+        # must not insert an unscheduled capture-coordination collective.
+        if self._model_world_size() > 1:
+            return False
         if self._generated_prefix_cache_enabled():
             return False
         return True
+
+    def _model_world_size(self) -> int:
+        try:
+            return max(1, int(getattr(self.model, "world_size", 1)))
+        except (TypeError, ValueError):
+            return 1
 
     @staticmethod
     def _graph_signature_cache_key(graph: Callable[..., object]) -> object:

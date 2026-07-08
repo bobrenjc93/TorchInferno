@@ -1498,6 +1498,21 @@ def _online_greedy_common_prefix_suffix_prefill_warmup_enabled() -> bool:
     return env_flag("TORCHINFERNO_OPENAI_WARMUP_ONLINE_GREEDY_COMMON_PREFIX_SUFFIX_PREFILL", True)
 
 
+def _online_greedy_common_prefix_token_suffix_prefill_warmup_enabled() -> bool:
+    return env_flag(
+        "TORCHINFERNO_OPENAI_WARMUP_ONLINE_GREEDY_COMMON_PREFIX_TOKEN_SUFFIX_PREFILL",
+        True,
+    )
+
+
+def _online_greedy_common_prefix_token_suffix_prefill_warmup_max_token_values() -> tuple[int, ...]:
+    configured = os.environ.get(
+        "TORCHINFERNO_OPENAI_WARMUP_ONLINE_GREEDY_COMMON_PREFIX_TOKEN_SUFFIX_MAX_TOKENS"
+    )
+    values = _parse_positive_int_csv(configured if configured is not None else "128")
+    return values or (128,)
+
+
 def _online_greedy_common_prefix_suffix_prefill_warmup_max_token_values() -> tuple[int, ...]:
     configured = os.environ.get("TORCHINFERNO_OPENAI_WARMUP_ONLINE_GREEDY_COMMON_PREFIX_MAX_TOKENS")
     values = _parse_positive_int_csv(configured if configured is not None else "128,512")
@@ -1637,6 +1652,70 @@ def _online_greedy_common_prefix_suffix_prefill_warmup_batches(
             warmup_max_tokens,
             limit,
         ) or _parse_positive_int_csv("1,2,4,8,16,32")
+    return tuple(batch for batch in batches if 0 < batch <= limit)
+
+
+def _online_greedy_common_prefix_token_suffix_prefill_warmup_suffix_tokens(
+    max_seq_len: int,
+    *,
+    warmup_temperature: float = 0.0,
+    warmup_max_tokens: int | None = None,
+) -> tuple[int, ...]:
+    if max_seq_len <= 0 or warmup_temperature > 0.0:
+        return ()
+    configured = os.environ.get(
+        "TORCHINFERNO_OPENAI_WARMUP_ONLINE_GREEDY_COMMON_PREFIX_TOKEN_SUFFIX_TOKENS"
+    )
+    if configured is not None:
+        tokens = _parse_positive_int_csv(configured)
+    else:
+        tokens = _online_greedy_common_prefix_suffix_prefill_warmup_suffix_tokens(
+            max_seq_len,
+            warmup_temperature=warmup_temperature,
+            warmup_max_tokens=warmup_max_tokens,
+        )
+        min_suffix = env_int(
+            "TORCHINFERNO_OPENAI_WARMUP_ONLINE_GREEDY_COMMON_PREFIX_TOKEN_SUFFIX_MIN_TOKENS",
+            32,
+            minimum=1,
+        )
+        max_suffix = env_int(
+            "TORCHINFERNO_OPENAI_WARMUP_ONLINE_GREEDY_COMMON_PREFIX_TOKEN_SUFFIX_MAX_SUFFIX_TOKENS",
+            96,
+            minimum=min_suffix,
+        )
+        tokens = tuple(token for token in tokens if min_suffix <= token <= max_suffix)
+    return tuple(token_count for token_count in tokens if token_count <= max_seq_len)
+
+
+def _online_greedy_common_prefix_token_suffix_prefill_warmup_batches(
+    cache_rows: int,
+    max_active: int,
+    *,
+    warmup_temperature: float = 0.0,
+    warmup_max_tokens: int | None = None,
+) -> tuple[int, ...]:
+    if cache_rows <= 0 or max_active <= 0 or warmup_temperature > 0.0:
+        return ()
+    limit = min(cache_rows, max_active)
+    configured = os.environ.get(
+        "TORCHINFERNO_OPENAI_WARMUP_ONLINE_GREEDY_COMMON_PREFIX_TOKEN_SUFFIX_BATCHES"
+    )
+    if configured is not None:
+        batches = _parse_positive_int_csv(configured)
+    else:
+        batches = _online_greedy_common_prefix_suffix_prefill_warmup_batches(
+            cache_rows,
+            max_active,
+            warmup_temperature=warmup_temperature,
+            warmup_max_tokens=warmup_max_tokens,
+        )
+        min_batch = env_int(
+            "TORCHINFERNO_OPENAI_WARMUP_ONLINE_GREEDY_COMMON_PREFIX_TOKEN_SUFFIX_MIN_BATCH",
+            16,
+            minimum=1,
+        )
+        batches = tuple(batch for batch in batches if batch >= min_batch)
     return tuple(batch for batch in batches if 0 < batch <= limit)
 
 
@@ -4104,6 +4183,12 @@ class OpenAICompletionEngine:
         ragged_prefill_graph = getattr(self.model, "try_prefill_ragged_logits_graph", None)
         if ragged_prefill_graph is None:
             return
+        ragged_token_prefill_graph = (
+            getattr(self.model, "try_prefill_ragged_token_logits_graph", None)
+            if warmup_temperature <= 0.0
+            and _online_greedy_common_prefix_token_suffix_prefill_warmup_enabled()
+            else None
+        )
         prefix_graph = getattr(self.model, "try_prefill_logits_graph", None)
         if prefix_graph is None:
             return
@@ -4124,6 +4209,39 @@ class OpenAICompletionEngine:
             max_active,
             warmup_temperature=warmup_temperature,
             warmup_max_tokens=warmup_max_tokens,
+        )
+        token_warmup_max_tokens = (
+            warmup_max_tokens
+            if warmup_max_tokens is not None
+            else _online_greedy_common_prefix_suffix_prefill_warmup_max_tokens()
+        )
+        token_warmup_enabled = bool(
+            callable(ragged_token_prefill_graph)
+            and token_warmup_max_tokens
+            in _online_greedy_common_prefix_token_suffix_prefill_warmup_max_token_values()
+        )
+        token_suffix_tokens = (
+            set(
+                _online_greedy_common_prefix_token_suffix_prefill_warmup_suffix_tokens(
+                    max_seq_len,
+                    warmup_temperature=warmup_temperature,
+                    warmup_max_tokens=token_warmup_max_tokens,
+                )
+            )
+            if token_warmup_enabled
+            else set()
+        )
+        token_batch_sizes = (
+            set(
+                _online_greedy_common_prefix_token_suffix_prefill_warmup_batches(
+                    cache_rows,
+                    max_active,
+                    warmup_temperature=warmup_temperature,
+                    warmup_max_tokens=token_warmup_max_tokens,
+                )
+            )
+            if token_warmup_enabled
+            else set()
         )
         extra_pairs = _online_greedy_common_prefix_suffix_prefill_warmup_extra_pairs(
             max_seq_len,
@@ -4239,6 +4357,26 @@ class OpenAICompletionEngine:
                                 ),
                                 src_prefix_row=src_prefix_row,
                             )
+                            if (
+                                token_warmup_enabled
+                                and suffix_count in token_suffix_tokens
+                                and batch_size in token_batch_sizes
+                            ):
+                                ragged_token_prefill_graph(
+                                    suffix_ids,
+                                    cache,
+                                    seq_lens=seq_lens,
+                                    row_indices=row_indices,
+                                    logit_positions=logit_positions,
+                                    context_len=_dynamic_prefix_prefill_context_len(
+                                        prefix_count,
+                                        suffix_count,
+                                        max_seq_len=max_seq_len,
+                                        max_dynamic_suffix=dynamic_max_suffix,
+                                    ),
+                                    src_prefix_row=src_prefix_row,
+                                    temperature=warmup_temperature,
+                                )
                         except Exception as exc:
                             import sys as _gpsys
                             print(

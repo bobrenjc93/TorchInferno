@@ -849,6 +849,56 @@ class _CaptureReportingSelectedLogitsToyModel(_SelectedLogitsToyModel):
         return logits
 
 
+class _TokenLogitsGraphToyModel(_SelectedLogitsToyModel):
+    def __init__(self, vocab_size: int = 64) -> None:
+        super().__init__(vocab_size)
+        self.prefill_token_logits_graph_calls = 0
+        self.prefill_token_capture_flags: list[bool] = []
+        self.prefill_token_logits_graph_available = False
+        self.sample_next_token_calls = 0
+
+    def _sample_next_token(self, logits, temperature):
+        self.sample_next_token_calls += 1
+        return super()._sample_next_token(logits, temperature)
+
+    def try_prefill_ragged_token_logits_graph(
+        self,
+        input_ids,
+        cache,
+        *,
+        seq_lens,
+        row_indices,
+        logit_positions,
+        context_len=None,
+        src_prefix_row=None,
+        prefix_copy_len=None,
+        temperature=0.0,
+        capture_on_miss=True,
+    ):
+        self.prefill_token_logits_graph_calls += 1
+        self.prefill_token_capture_flags.append(bool(capture_on_miss))
+        if temperature > 0.0:
+            return None
+        if not capture_on_miss and not self.prefill_token_logits_graph_available:
+            return None
+        self.prefill_token_logits_graph_available = True
+        logits = super().try_prefill_ragged_logits_graph(
+            input_ids,
+            cache,
+            seq_lens=seq_lens,
+            row_indices=row_indices,
+            logit_positions=logit_positions,
+            context_len=context_len,
+            src_prefix_row=src_prefix_row,
+            prefix_copy_len=prefix_copy_len,
+            capture_on_miss=capture_on_miss,
+        )
+        self._last_ragged_prefill_graph_captured = (
+            bool(capture_on_miss) and self.prefill_token_logits_graph_calls == 1
+        )
+        return logits, torch.argmax(logits[:, -1, :], dim=-1)
+
+
 class _PromptLookupToyModel(_RaggedGraphToyModel):
     def __init__(self, vocab_size: int = 128) -> None:
         super().__init__(vocab_size)
@@ -3505,6 +3555,102 @@ def test_continuous_batch_engine_keeps_common_prefix_logits_for_exact_prompt() -
     assert reusable.logits.shape[-1] == model.vocab_size
 
 
+def test_continuous_batch_engine_uses_prefix_graph_greedy_tokens(monkeypatch) -> None:
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_TOKEN_GRAPH_CAPTURE_ON_MISS", "1")
+    shared = tuple(range(16))
+    model = _TokenLogitsGraphToyModel()
+    engine = ContinuousBatchEngine(
+        model,
+        device=torch.device("cpu"),
+        max_active_requests=4,
+        prefix_cache_capacity=4,
+        graph_prefill=True,
+        profile_timings=True,
+    )
+    requests = [
+        ServingRequest("a", (*shared, 21), 1, arrival_step=0),
+        ServingRequest("b", (*shared, 22, 23), 1, arrival_step=0),
+        ServingRequest("c", (*shared, 24), 1, arrival_step=0),
+    ]
+
+    results = engine.run(requests)
+
+    assert [result.tokens[-1] for result in results] == [22, 24, 25]
+    assert model.prefill_token_logits_graph_calls == 1
+    assert model.sample_next_token_calls == 0
+    assert engine.stats.prefill_graph_hits == 1
+    assert engine.stats.prefill_graph_captures == 1
+    for request in requests:
+        reusable = engine.reusable_prefixes[request.request_id]
+        assert reusable.logits is not None
+        cached_token = int(torch.argmax(reusable.logits[:, -1, :], dim=-1).item())
+        assert cached_token == (request.prompt[-1] + 1) % model.vocab_size
+
+
+def test_continuous_batch_engine_uses_warmed_prefix_token_graph_by_default(monkeypatch) -> None:
+    monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_TOKEN_GRAPH_CAPTURE_ON_MISS", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_TOKEN_GRAPH", raising=False)
+    monkeypatch.delenv(
+        "TORCHINFERNO_OPENAI_WARMUP_ONLINE_GREEDY_COMMON_PREFIX_TOKEN_SUFFIX_PREFILL",
+        raising=False,
+    )
+    shared = tuple(range(16))
+    model = _TokenLogitsGraphToyModel()
+    model.prefill_token_logits_graph_available = True
+    engine = ContinuousBatchEngine(
+        model,
+        device=torch.device("cpu"),
+        max_active_requests=4,
+        prefix_cache_capacity=4,
+        graph_prefill=True,
+        profile_timings=True,
+        max_generation_tokens=96,
+    )
+    requests = [
+        ServingRequest("a", (*shared, 21), 1, arrival_step=0),
+        ServingRequest("b", (*shared, 22, 23), 1, arrival_step=0),
+        ServingRequest("c", (*shared, 24), 1, arrival_step=0),
+    ]
+
+    results = engine.run(requests)
+
+    assert [result.tokens[-1] for result in results] == [22, 24, 25]
+    assert model.prefill_token_logits_graph_calls == 1
+    assert model.prefill_token_capture_flags == [False]
+    assert model.sample_next_token_calls == 0
+    assert engine.stats.prefill_graph_hits == 1
+    assert engine.stats.prefill_graph_captures == 0
+    assert engine.stats.prefill_graph_replays == 1
+
+
+def test_continuous_batch_engine_skips_disabled_prefix_token_graph(monkeypatch) -> None:
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_WARMUP_ONLINE_GREEDY_COMMON_PREFIX_TOKEN_SUFFIX_PREFILL", "0")
+    shared = tuple(range(16))
+    model = _TokenLogitsGraphToyModel()
+    engine = ContinuousBatchEngine(
+        model,
+        device=torch.device("cpu"),
+        max_active_requests=4,
+        prefix_cache_capacity=4,
+        graph_prefill=True,
+        profile_timings=True,
+    )
+    requests = [
+        ServingRequest("a", (*shared, 21), 1, arrival_step=0),
+        ServingRequest("b", (*shared, 22, 23), 1, arrival_step=0),
+        ServingRequest("c", (*shared, 24), 1, arrival_step=0),
+    ]
+
+    results = engine.run(requests)
+
+    assert [result.tokens[-1] for result in results] == [22, 24, 25]
+    assert model.prefill_token_logits_graph_calls == 0
+    assert model.prefill_token_capture_flags == []
+    assert model.sample_next_token_calls == 1
+    assert engine.stats.prefill_graph_hits == 1
+    assert engine.stats.prefill_graph_misses == 0
+
+
 def test_continuous_batch_engine_respects_common_prefix_ragged_suffix_threshold(
     monkeypatch,
 ) -> None:
@@ -5839,6 +5985,65 @@ def test_continuous_batch_engine_skips_decode_capture_for_generated_prefix_cache
         "static_decode:logits:b2:s3": 1,
     }
     assert engine.stats.decode_model_calls == 2
+
+
+def test_continuous_batch_engine_skips_decode_capture_for_tensor_parallel_default(
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_DECODE_CAPTURE", raising=False)
+    model = _CaptureAwareStaticDecodeGraphToyModel()
+    model.world_size = 2
+    engine = ContinuousBatchEngine(
+        model,
+        device=torch.device("cpu"),
+        max_active_requests=2,
+        prefix_cache_capacity=1,
+        enable_ragged_decode=False,
+        profile_timings=True,
+    )
+
+    results = engine.run(
+        [
+            ServingRequest("a", (1, 2), 3, arrival_step=0),
+            ServingRequest("b", (3, 4), 3, arrival_step=0),
+        ]
+    )
+
+    assert [len(result.tokens) for result in results] == [5, 5]
+    assert model.capture_flags == [False, False, False, False]
+    assert model.static_token_graph_calls == 0
+    assert model.static_logits_graph_calls == 0
+    assert engine.stats.decode_graph_hits == 0
+    assert engine.stats.decode_graph_misses == 4
+    assert engine.stats.decode_model_calls == 2
+
+
+def test_continuous_batch_engine_can_capture_tensor_parallel_decode_with_env(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_DECODE_CAPTURE", "1")
+    model = _CaptureAwareStaticDecodeGraphToyModel()
+    model.world_size = 2
+    engine = ContinuousBatchEngine(
+        model,
+        device=torch.device("cpu"),
+        max_active_requests=2,
+        prefix_cache_capacity=1,
+        enable_ragged_decode=False,
+    )
+
+    results = engine.run(
+        [
+            ServingRequest("a", (1, 2), 3, arrival_step=0),
+            ServingRequest("b", (3, 4), 3, arrival_step=0),
+        ]
+    )
+
+    assert [len(result.tokens) for result in results] == [5, 5]
+    assert model.capture_flags == [True, True]
+    assert model.static_token_graph_calls == 2
+    assert model.static_logits_graph_calls == 0
+    assert engine.stats.decode_graph_hits == 2
 
 
 def test_continuous_batch_engine_can_capture_decode_graphs_with_env(monkeypatch) -> None:
