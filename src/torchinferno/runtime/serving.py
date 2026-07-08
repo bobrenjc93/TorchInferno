@@ -1000,6 +1000,7 @@ class ContinuousBatchEngine:
         self._row_seq_lens: list[int] = []
         self._row_cached_prefixes: list[tuple[int, ...] | None] = []
         self._device_index_tensors: dict[tuple[int, ...], Tensor] = {}
+        self._graph_capture_on_miss_support: dict[object, bool] = {}
         self._prefix_order: list[Hashable] = []
         self._online_waiting: ServingQueue | None = None
         self._online_active: list[_ActiveRequest] = []
@@ -1318,17 +1319,13 @@ class ContinuousBatchEngine:
         model_start_s = time.perf_counter() if self.profile_timings else 0.0
         gpu_model_events = self._start_decode_ragged_model_gpu_timer()
         try:
-            try:
-                parameters = signature(graph).parameters
-            except (TypeError, ValueError):
-                parameters = {}
             kwargs: dict[str, object] = {
                 "seq_lens": seq_lens,
                 "row_indices": row_indices,
                 "steps": step_count,
                 "temperature": 0.0,
             }
-            if "capture_on_miss" in parameters:
+            if self._graph_accepts_capture_on_miss(graph):
                 kwargs["capture_on_miss"] = self._decode_capture_on_miss()
             token_matrix = graph(input_ids, self._require_cache(), **kwargs)
         except Exception as exc:
@@ -7982,8 +7979,8 @@ class ContinuousBatchEngine:
         self.stats.prefill_graph_hits += 1
         return logits
 
-    @staticmethod
     def _call_prefill_graph(
+        self,
         graph: Callable[..., Tensor | None],
         input_ids: Tensor,
         cache: object,
@@ -7991,11 +7988,7 @@ class ContinuousBatchEngine:
         capture_on_miss: bool,
         logit_positions: Tensor | None = None,
     ) -> Tensor | None:
-        try:
-            parameters = signature(graph).parameters
-        except (TypeError, ValueError):
-            parameters = {}
-        if "capture_on_miss" in parameters:
+        if self._graph_accepts_capture_on_miss(graph):
             if logit_positions is None:
                 return graph(input_ids, cache, capture_on_miss=capture_on_miss)
             return graph(
@@ -9003,7 +8996,28 @@ class ContinuousBatchEngine:
         return True
 
     @staticmethod
+    def _graph_signature_cache_key(graph: Callable[..., object]) -> object:
+        key = getattr(graph, "__func__", graph)
+        try:
+            hash(key)
+        except TypeError:
+            return id(key)
+        return key
+
+    def _graph_accepts_capture_on_miss(self, graph: Callable[..., object]) -> bool:
+        key = self._graph_signature_cache_key(graph)
+        cached = self._graph_capture_on_miss_support.get(key)
+        if cached is not None:
+            return cached
+        try:
+            accepts = "capture_on_miss" in signature(graph).parameters
+        except (TypeError, ValueError):
+            accepts = False
+        self._graph_capture_on_miss_support[key] = accepts
+        return accepts
+
     def _call_decode_graph(
+        self,
         graph: Callable[..., Tensor | None],
         input_ids: Tensor,
         cache: object,
@@ -9013,17 +9027,13 @@ class ContinuousBatchEngine:
         seq_lens: Tensor | None = None,
         row_indices: Tensor | None = None,
     ) -> Tensor | None:
-        try:
-            parameters = signature(graph).parameters
-        except (TypeError, ValueError):
-            parameters = {}
         kwargs: dict[str, object] = {}
         if temperature is not None:
             kwargs["temperature"] = temperature
         if seq_lens is not None:
             kwargs["seq_lens"] = seq_lens
             kwargs["row_indices"] = row_indices
-        if "capture_on_miss" in parameters:
+        if self._graph_accepts_capture_on_miss(graph):
             kwargs["capture_on_miss"] = capture_on_miss
         return graph(input_ids, cache, **kwargs)
 
