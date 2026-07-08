@@ -8030,10 +8030,14 @@ class ContinuousBatchEngine:
             self.stats.prefill_shape_real_batch_counts,
             f"{shape_key}|real_b{max(0, int(real_batch))}",
         )
+        suffix_counts: dict[int, int] = defaultdict(int)
         for suffix_len in suffix_lengths:
-            self._record_shape_count(
+            suffix_counts[max(0, int(suffix_len))] += 1
+        for suffix_len, count in suffix_counts.items():
+            self._record_shape_total(
                 self.stats.prefill_shape_suffix_length_counts,
-                f"{shape_key}|suffix{max(0, int(suffix_len))}",
+                f"{shape_key}|suffix{suffix_len}",
+                count,
             )
 
     def _record_packed_prefill_candidate(
@@ -8193,22 +8197,28 @@ class ContinuousBatchEngine:
     ) -> None:
         if not self.profile_timings:
             return
+        route_totals: dict[str, list[int]] = defaultdict(lambda: [0, 0, 0])
         for (_index, _request, prefix_hit_tokens, reusable), suffix_len in zip(
             group,
             suffix_lengths,
         ):
             route_kind = self._prefix_reuse_route_kind(reusable.route_id)
+            totals = route_totals[route_kind]
+            totals[0] += 1
+            totals[1] += max(0, int(suffix_len))
+            totals[2] += max(0, int(prefix_hit_tokens))
+        for route_kind, (count, active_tokens, reuse_tokens) in route_totals.items():
             route_key = f"{shape_key}|route={route_kind}"
-            self._record_shape_total(self.stats.prefill_shape_route_counts, route_key, 1)
+            self._record_shape_total(self.stats.prefill_shape_route_counts, route_key, count)
             self._record_shape_total(
                 self.stats.prefill_shape_route_active_tokens,
                 route_key,
-                max(0, int(suffix_len)),
+                active_tokens,
             )
             self._record_shape_total(
                 self.stats.prefill_shape_route_reuse_tokens,
                 route_key,
-                max(0, int(prefix_hit_tokens)),
+                reuse_tokens,
             )
 
     @staticmethod
