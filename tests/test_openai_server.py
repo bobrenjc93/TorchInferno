@@ -9719,7 +9719,7 @@ def test_openai_online_decode_quantum_uses_greedy_mid_cap_default(monkeypatch) -
     monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_GEN_DECODE_QUANTUM", raising=False)
     monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_GEN_DECODE_QUANTUM_MAX_TOKENS", raising=False)
 
-    assert _online_decode_quantum(temperature=0.0, max_tokens=64) == 3
+    assert _online_decode_quantum(temperature=0.0, max_tokens=64) == 8
     assert _online_decode_quantum(temperature=0.0, max_tokens=256) == 16
     assert _online_decode_quantum(temperature=0.7, max_tokens=256) == 4
     assert _online_decode_quantum(temperature=0.7, max_tokens=300) == 2

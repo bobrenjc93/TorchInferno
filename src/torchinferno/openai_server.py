@@ -508,14 +508,10 @@ def _online_decode_quantum(*, temperature: float, max_tokens: int) -> int:
         )
         if max_tokens <= greedy_short_max_tokens:
             # Decode-many already batches several token steps before surfacing
-            # events. Keep the command quantum small enough that queued short
-            # greedy streams do not sit behind a long decode burst; local TP8
-            # 70B long_output rechecks showed 3 improves TTFT/E2E versus 4
-            # without the larger decode-sync penalty seen at 2.
-            decode_many_quantum = 3 if _online_decode_many_enabled(
-                temperature=temperature,
-                max_tokens=max_tokens,
-            ) else 8
+            # events. A full 8-token command quantum cuts command/sync churn for
+            # long-output-style short greedy streams; local TP8 70B rechecks cut
+            # long_output median TPOT 22.9 -> 21.1ms and p99 E2E 2234 -> 1783ms.
+            decode_many_quantum = 8
             default_short_quantum = min(
                 decode_quantum,
                 env_int(

@@ -97,7 +97,7 @@ def _write_inference_bench_run(tmp_path) -> None:
         "fp8_prefill_min_m": 512,
         "marlin_int4_decode_enabled": True,
         "use_decode_many": True,
-        "decode_quantum": 3,
+        "decode_quantum": 8,
         "drain_decode_quantum": 8,
         "admit_per_step_cap": 64,
         "admit_min_free_rows": 4,
