@@ -2060,7 +2060,7 @@ def test_continuous_batch_engine_can_skip_warm_row_prefix_copy(
         "late-a",
         "late-b",
     }
-    assert model.prefill_src_prefix_rows[0] is not None
+    assert any(rows is not None for rows in model.prefill_src_prefix_rows[:-1])
     assert model.prefill_src_prefix_rows[-1] is None
     assert engine.stats.prefill_prefix_copy_skipped_batches == 1
     assert engine.stats.prefill_prefix_copy_skipped_tokens == len(shared) * 2
@@ -2202,7 +2202,7 @@ def test_continuous_batch_engine_can_opt_in_full_prompt_store_while_pinned(monke
     assert by_id["turn1-b"].prefix_hit_tokens == len(shared) + 1
     assert by_id["turn1-c"].prefix_hit_tokens == len(shared) + 1
     assert engine.reusable_prefixes[("common_prefix", shared)].tokens == shared
-    assert engine.stats.prefill_graph_hits == 2
+    assert engine.stats.prefill_graph_hits == 3
     assert any(rows is not None and len(rows) == 4 for rows in model.prefill_src_prefix_rows)
     assert engine.stats.prefix_reuse_route_counts["common_prefix"] == 3
     assert engine.stats.prefix_reuse_route_counts["request_prompt"] == 3
@@ -3159,13 +3159,40 @@ def test_continuous_batch_engine_graphs_initial_common_prefix_suffixes() -> None
     assert engine.stats.prefill_common_prefix_batches == 1
     assert engine.stats.prefill_prefix_reuse_batches == 1
     assert engine.stats.prefill_padded_suffix_batches == 1
-    assert engine.stats.prefill_graph_hits == 1
+    assert engine.stats.prefill_graph_hits == 2
     assert engine.stats.prefill_model_calls == 2
     assert engine.stats.prefill_tokens == 25
     assert engine.stats.prefix_reuse_requests == 3
     assert engine.stats.prefix_reuse_tokens == 48
+    assert model.prefill_cache_graph_calls == 1
     common_route = ("common_prefix", shared)
     assert engine.reusable_prefixes[common_route].logits is None
+
+
+def test_continuous_batch_engine_cache_only_common_prefix_skips_logits_when_not_needed() -> None:
+    shared = tuple(range(16))
+    model = _SelectedLogitsToyModel()
+    engine = ContinuousBatchEngine(
+        model,
+        device=torch.device("cpu"),
+        max_active_requests=4,
+        prefix_cache_capacity=4,
+        pin_shared_prefix=True,
+        graph_prefill=True,
+    )
+    requests = [
+        ServingRequest("a", (*shared, 21), 1, arrival_step=0),
+        ServingRequest("b", (*shared, 22, 23), 1, arrival_step=0),
+    ]
+
+    results = engine.run(requests)
+
+    assert [result.tokens[-1] for result in results] == [22, 24]
+    common_route = ("common_prefix", shared)
+    reusable = engine.reusable_prefixes[common_route]
+    assert reusable.logits is None
+    assert model.prefill_cache_graph_calls == 1
+    assert engine.stats.prefill_common_prefix_batches == 1
 
 
 def test_continuous_batch_engine_counts_ragged_prefill_captures() -> None:
@@ -3553,6 +3580,7 @@ def test_continuous_batch_engine_keeps_common_prefix_logits_for_exact_prompt() -
     reusable = engine.reusable_prefixes[common_route]
     assert reusable.logits is not None
     assert reusable.logits.shape[-1] == model.vocab_size
+    assert model.prefill_cache_graph_calls == 0
 
 
 def test_continuous_batch_engine_uses_prefix_graph_greedy_tokens(monkeypatch) -> None:
@@ -3578,7 +3606,7 @@ def test_continuous_batch_engine_uses_prefix_graph_greedy_tokens(monkeypatch) ->
     assert [result.tokens[-1] for result in results] == [22, 24, 25]
     assert model.prefill_token_logits_graph_calls == 1
     assert model.sample_next_token_calls == 0
-    assert engine.stats.prefill_graph_hits == 1
+    assert engine.stats.prefill_graph_hits == 2
     assert engine.stats.prefill_graph_captures == 1
     for request in requests:
         reusable = engine.reusable_prefixes[request.request_id]
@@ -3618,7 +3646,7 @@ def test_continuous_batch_engine_uses_warmed_prefix_token_graph_by_default(monke
     assert model.prefill_token_logits_graph_calls == 1
     assert model.prefill_token_capture_flags == [False]
     assert model.sample_next_token_calls == 0
-    assert engine.stats.prefill_graph_hits == 1
+    assert engine.stats.prefill_graph_hits == 2
     assert engine.stats.prefill_graph_captures == 0
     assert engine.stats.prefill_graph_replays == 1
 
@@ -3647,7 +3675,7 @@ def test_continuous_batch_engine_skips_disabled_prefix_token_graph(monkeypatch) 
     assert model.prefill_token_logits_graph_calls == 0
     assert model.prefill_token_capture_flags == []
     assert model.sample_next_token_calls == 1
-    assert engine.stats.prefill_graph_hits == 1
+    assert engine.stats.prefill_graph_hits == 2
     assert engine.stats.prefill_graph_misses == 0
 
 
@@ -3678,7 +3706,7 @@ def test_continuous_batch_engine_respects_common_prefix_ragged_suffix_threshold(
     assert [result.tokens[-1] for result in results] == [22, 25, 27]
     assert engine.stats.prefill_common_prefix_batches == 1
     assert engine.stats.prefill_prefix_reuse_batches == 0
-    assert engine.stats.prefill_graph_hits == 0
+    assert engine.stats.prefill_graph_hits == 1
     assert engine.stats.prefix_reuse_requests == 0
 
 
@@ -3898,11 +3926,11 @@ def test_continuous_batch_engine_raises_common_prefix_ragged_suffix_threshold_fo
     assert first_generated == [202, 205, 207]
     assert engine.stats.prefill_common_prefix_batches == 1
     assert engine.stats.prefill_prefix_reuse_batches == 1
-    assert engine.stats.prefill_graph_hits == 1
+    assert engine.stats.prefill_graph_hits == 2
     assert model.prefill_src_prefix_rows[-1] is not None
 
 
-def test_continuous_batch_engine_keeps_common_prefix_ragged_suffix_threshold_low_for_greedy_mid(
+def test_continuous_batch_engine_raises_common_prefix_ragged_suffix_threshold_for_greedy_mid(
     monkeypatch,
 ) -> None:
     monkeypatch.delenv(
@@ -3932,9 +3960,9 @@ def test_continuous_batch_engine_keeps_common_prefix_ragged_suffix_threshold_low
     ]
     assert first_generated == [202, 205, 207]
     assert engine.stats.prefill_common_prefix_batches == 1
-    assert engine.stats.prefill_prefix_reuse_batches == 0
-    assert engine.stats.prefill_graph_hits == 0
-    assert model.prefill_src_prefix_rows == []
+    assert engine.stats.prefill_prefix_reuse_batches == 1
+    assert engine.stats.prefill_graph_hits == 2
+    assert model.prefill_src_prefix_rows[-1] is not None
 
 
 def test_continuous_batch_engine_reuses_common_prefix_for_padded_refill(monkeypatch) -> None:
@@ -5359,7 +5387,7 @@ def test_continuous_batch_engine_prefix_reuse_does_not_capture_ragged_graph_on_m
     results = engine.run(requests)
 
     assert [result.prefix_hit_tokens for result in results] == [16, 16, 16, 16]
-    assert model.prefill_capture_flags == [False, False]
+    assert model.prefill_capture_flags == [False, False, False]
     assert engine.stats.prefill_graph_misses == 2
     assert engine.stats.prefill_prefix_reuse_batches == 2
     assert engine.stats.prefix_reuse_requests == 4
@@ -5390,7 +5418,7 @@ def test_continuous_batch_engine_short_greedy_skips_large_prefix_prefill_capture
     results = engine.run(requests)
 
     assert len(results) == 33
-    assert model.prefill_capture_flags == [False]
+    assert model.prefill_capture_flags == [False, False]
     assert engine.stats.prefill_graph_misses == 1
 
 
@@ -5535,7 +5563,7 @@ def test_continuous_batch_engine_can_use_selected_prefill_logits_graph(monkeypat
     assert [result.tokens[-1] for result in results] == [22, 25, 27]
     assert model.selected_capture_flags == [True]
     assert model.selected_positions == [[0, 2, 1]]
-    assert engine.stats.prefill_graph_hits == 1
+    assert engine.stats.prefill_graph_hits == 2
     assert engine.stats.prefill_graph_misses == 0
 
 

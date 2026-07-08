@@ -3044,17 +3044,25 @@ class ContinuousBatchEngine:
                 device=self.device,
                 dtype=torch.long,
             )
-            prefix_logits, _ = self._prefill_logits(prefix_ids, cache=self._cache_view([prefix_row]))
+            store_common_prefix_logits = any(
+                len(request.prompt) <= prefix_tokens
+                for _index, request, _hit in group
+            )
+            prefix_logits: Tensor | None = None
+            prefix_filled = (
+                not store_common_prefix_logits
+                and not self._cache_uses_paged_kv()
+                and self._cache_supports_tensor_ragged_prefill()
+                and self._prefill_cache_only(prefix_ids, rows=[prefix_row])
+            )
+            if not prefix_filled:
+                prefix_logits, _ = self._prefill_logits(prefix_ids, cache=self._cache_view([prefix_row]))
             self._refresh_row_seq_len_from_cache(prefix_row, prefix_tokens)
             self._record_model_call("prefill", 1, tokens=prefix_ids.numel())
             self._record_shape_count(self.stats.prefill_shape_counts, f"common_prefix:b1:t{prefix_tokens}")
             self.stats.prefill_common_prefix_batches += 1
             prefix_tuple = tuple(group[0][1].prompt[:prefix_tokens])
             common_route = ("common_prefix", prefix_tuple)
-            store_common_prefix_logits = any(
-                len(request.prompt) <= prefix_tokens
-                for _index, request, _hit in group
-            )
             prefix_row_adopted = self._store_reusable_prefix_tokens_in_row(
                 common_route,
                 "__common_prefix__",
@@ -3068,9 +3076,9 @@ class ContinuousBatchEngine:
                 self._pinned_prefix_routes.add(common_route)
 
             # Folding the common-prefix KV copy into the ragged suffix graph is
-            # profitable for short greedy streams, where it removes one-off
-            # prefill graph misses. Greedy-mid workloads such as few_shot stay on
-            # the lower cutoff because the extra ragged suffix work regresses TPOT.
+            # profitable for greedy streams when the shared prefix fits in the
+            # startup-warmed prefix-suffix buckets, where it avoids per-request
+            # eager suffix prefill without promoting large-prefix graph misses.
             max_ragged_prefix_tokens = self._common_prefix_ragged_suffix_max_prefix_tokens(group)
             if (
                 self.graph_prefill
@@ -3114,6 +3122,11 @@ class ContinuousBatchEngine:
                 ]
 
                 if not suffixes or not suffixes[0]:
+                    if prefix_logits is None:
+                        prefix_logits, _ = self._prefill_logits(
+                            prefix_ids,
+                            cache=self._cache_view([prefix_row]),
+                        )
                     logits = prefix_logits.expand(len(suffix_group), -1, -1)
                 else:
                     input_ids = torch.tensor(suffixes, device=self.device, dtype=torch.long)
@@ -3176,6 +3189,22 @@ class ContinuousBatchEngine:
             if 0 < max_new_tokens <= greedy_short_max:
                 return env_int(
                     "TORCHINFERNO_CONTINUOUS_COMMON_PREFIX_RAGGED_SUFFIX_GREEDY_SHORT_PREFIX_TOKENS",
+                    128,
+                    minimum=0,
+                )
+            greedy_mid_min = env_int(
+                "TORCHINFERNO_CONTINUOUS_COMMON_PREFIX_RAGGED_SUFFIX_GREEDY_MID_MIN_TOKENS",
+                greedy_short_max + 1,
+                minimum=1,
+            )
+            greedy_mid_max = env_int(
+                "TORCHINFERNO_CONTINUOUS_COMMON_PREFIX_RAGGED_SUFFIX_GREEDY_MID_MAX_TOKENS",
+                300,
+                minimum=greedy_mid_min,
+            )
+            if greedy_mid_min <= max_new_tokens <= greedy_mid_max:
+                return env_int(
+                    "TORCHINFERNO_CONTINUOUS_COMMON_PREFIX_RAGGED_SUFFIX_GREEDY_MID_PREFIX_TOKENS",
                     128,
                     minimum=0,
                 )
