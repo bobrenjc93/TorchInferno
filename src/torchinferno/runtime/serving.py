@@ -4740,12 +4740,11 @@ class ContinuousBatchEngine:
                 if continuation.logits is None:
                     continue
                 temperature = self._request_temperature(group[indices[0]][1])
-                sampled = self._sample_reusable_prefix_next_tokens(
+                sampled_tokens = self._sample_reusable_prefix_next_token_list(
                     continuation,
                     len(indices),
                     temperature=temperature,
                 )
-                sampled_tokens = sampled.detach().cpu().tolist()
                 for token_index, row_index in enumerate(indices):
                     continuation_next_tokens[row_index] = int(sampled_tokens[token_index])
 
@@ -4869,12 +4868,11 @@ class ContinuousBatchEngine:
             reusable = group[indices[0]][3]
             if reusable.logits is None:
                 raise RuntimeError("exact-prefix sampling requires cached logits")
-            sampled = self._sample_reusable_prefix_next_tokens(
+            sampled_tokens = self._sample_reusable_prefix_next_token_list(
                 reusable,
                 len(indices),
                 temperature=self._request_temperature(group[indices[0]][1]),
             )
-            sampled_tokens = sampled.detach().cpu().tolist()
             for token_index, group_index in enumerate(indices):
                 next_tokens[group_index] = int(sampled_tokens[token_index])
                 logits_by_index[group_index] = reusable.logits
@@ -4882,6 +4880,31 @@ class ContinuousBatchEngine:
         if any(logits is None for logits in logits_by_index):
             raise RuntimeError("exact-prefix sampling did not produce logits for every request")
         return next_tokens, [logits for logits in logits_by_index if logits is not None]
+
+    def _sample_reusable_prefix_next_token_list(
+        self,
+        reusable: _ReusablePrefix,
+        batch_size: int,
+        *,
+        temperature: float | None = None,
+    ) -> list[int]:
+        if reusable.logits is None:
+            raise RuntimeError("exact-prefix sampling requires cached logits")
+        sampling_temperature = float(self.temperature if temperature is None else temperature)
+        if sampling_temperature <= 0.0 and reusable.greedy_token is not None:
+            sample_start_s = time.perf_counter() if self.profile_timings else 0.0
+            tokens = [int(reusable.greedy_token)] * max(0, int(batch_size))
+            if self.profile_timings:
+                sample_elapsed_ms = (time.perf_counter() - sample_start_s) * 1000.0
+                self.stats.prefill_sample_ms += sample_elapsed_ms
+                self.stats.prefill_sample_select_ms += sample_elapsed_ms
+            return tokens
+        sampled = self._sample_reusable_prefix_next_tokens(
+            reusable,
+            batch_size,
+            temperature=sampling_temperature,
+        )
+        return [int(token) for token in sampled.detach().cpu().tolist()]
 
     def _sample_reusable_prefix_next_tokens(
         self,

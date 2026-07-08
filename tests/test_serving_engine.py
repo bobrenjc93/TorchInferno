@@ -4396,6 +4396,35 @@ def test_reusable_prefix_sampler_caches_greedy_token() -> None:
     assert repeated_calls == [(3, 0.0)]
 
 
+def test_exact_prefix_group_reads_cached_greedy_token_without_tensor_sample() -> None:
+    engine = ContinuousBatchEngine(
+        _SelectedLogitsToyModel(),
+        device=torch.device("cpu"),
+        temperature=0.0,
+    )
+    reusable = _ReusablePrefix(
+        route_id=("test",),
+        tokens=(1, 2, 3),
+        row=0,
+        logits=torch.tensor([[[0.0, 3.0, 1.0]]]),
+        greedy_token=1,
+    )
+
+    def fail_tensor_sample(*_args: object, **_kwargs: object) -> torch.Tensor:
+        raise AssertionError("cached greedy exact-prefix sampling should stay on the CPU list path")
+
+    engine._sample_reusable_prefix_next_tokens = fail_tensor_sample  # type: ignore[method-assign]
+    next_tokens, logits = engine._sample_exact_prefix_group(
+        [
+            (0, ServingRequest("a", (1, 2, 3), 1), 3, reusable),
+            (1, ServingRequest("b", (1, 2, 3), 1), 3, reusable),
+        ]
+    )
+
+    assert next_tokens == [1, 1]
+    assert logits == [reusable.logits, reusable.logits]
+
+
 def test_continuous_batch_engine_exact_prompt_reuses_prepared_sample_state() -> None:
     prompt = tuple(range(1, 18))
     model = _SelectedLogitsToyModel()
