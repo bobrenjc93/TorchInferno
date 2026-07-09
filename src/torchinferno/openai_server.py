@@ -698,11 +698,6 @@ def _online_prefill_ready_before_decode_enabled(*, temperature: float, max_token
         return env_flag(global_env, False)
     if max_tokens < 1:
         return False
-    if _online_greedy_large_mixed_prefix_reuse_enabled(
-        temperature=temperature,
-        max_tokens=max_tokens,
-    ):
-        return False
     if temperature <= 0.0:
         greedy_short_max_tokens = env_int(
             "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_GEN_MAX_TOKENS",
@@ -729,8 +724,9 @@ def _online_prefill_ready_before_decode_enabled(*, temperature: float, max_token
         )
         if greedy_large_min_tokens < max_tokens <= greedy_large_max_tokens:
             # Multi-turn 512-token greedy traffic is prefill/admission bound.
-            # Let a ready wave prefill when decode has drained to a small tail,
-            # while keeping the normal decode-first path for larger tails.
+            # This also applies to mixed-prefix reuse: local TP8 70B A/B showed
+            # the 8-row tail cap cuts queue-to-submit latency without the p99
+            # regression seen from a larger cap.
             return env_flag(
                 "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_PREFILL_READY_BEFORE_DECODE",
                 True,

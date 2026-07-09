@@ -10041,8 +10041,8 @@ def test_openai_online_prefill_ready_before_decode_respects_env(monkeypatch) -> 
     assert not _online_prefill_ready_before_decode_enabled(temperature=0.0, max_tokens=256)
     assert not _online_prefill_ready_before_decode_enabled(temperature=0.0, max_tokens=400)
     assert _online_prefill_ready_before_decode_enabled(temperature=0.0, max_tokens=401)
-    assert not _online_prefill_ready_before_decode_enabled(temperature=0.0, max_tokens=512)
-    assert _online_prefill_ready_before_decode_active_cap(temperature=0.0, max_tokens=512) is None
+    assert _online_prefill_ready_before_decode_enabled(temperature=0.0, max_tokens=512)
+    assert _online_prefill_ready_before_decode_active_cap(temperature=0.0, max_tokens=512) == 8
     assert not _online_prefill_ready_before_decode_enabled(temperature=0.0, max_tokens=513)
     assert not _online_prefill_ready_before_decode_enabled(temperature=0.7, max_tokens=256)
     assert _online_prefill_ready_before_decode_enabled(temperature=0.7, max_tokens=300)
@@ -10051,8 +10051,8 @@ def test_openai_online_prefill_ready_before_decode_respects_env(monkeypatch) -> 
     assert _online_prefill_ready_before_decode_active_cap(temperature=0.7, max_tokens=301) is None
 
     monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_GREEDY_LARGE_MIXED_PREFIX_REUSE", "1")
-    assert not _online_prefill_ready_before_decode_enabled(temperature=0.0, max_tokens=512)
-    assert _online_prefill_ready_before_decode_active_cap(temperature=0.0, max_tokens=512) is None
+    assert _online_prefill_ready_before_decode_enabled(temperature=0.0, max_tokens=512)
+    assert _online_prefill_ready_before_decode_active_cap(temperature=0.0, max_tokens=512) == 8
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_PREFILL_READY_BEFORE_DECODE", "1")
     assert _online_prefill_ready_before_decode_enabled(temperature=0.0, max_tokens=512)
     assert _online_prefill_ready_before_decode_active_cap(temperature=0.0, max_tokens=512) is None
