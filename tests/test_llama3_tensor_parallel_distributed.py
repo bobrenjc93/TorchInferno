@@ -2261,6 +2261,96 @@ def test_llama3_tensor_parallel_packed_ragged_prefill_matches_padded_oracle(tmp_
             torch.testing.assert_close(packed_layer.values[row, :, :end, :], padded_layer.values[row, :, :end, :])
 
 
+def test_llama3_tensor_parallel_ragged_prefill_copies_prefix_without_row_indices(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    torch.manual_seed(9105)
+    config = tiny_llama3_config(vocab_size=32, max_position_embeddings=32)
+    reference = Llama3V0ForCausalLM(config).eval()
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    _write_hf_checkpoint(reference, config, checkpoint)
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    model = Llama3TensorParallelForCausalLM.from_pretrained(checkpoint, dtype="float32").eval()
+    device = model.device
+
+    shared_prefix = [1, 5, 9, 13]
+    suffixes = [[2, 6], [3, 7, 11], [8, 12]]
+    prompts = [shared_prefix + suffix for suffix in suffixes]
+    prefix_row = 3
+    prefix_len = len(shared_prefix)
+    bucket = 4
+
+    with torch.inference_mode():
+        ref_logits = []
+        for prompt in prompts:
+            ref_cache = model.allocate_cache(1, max_seq_len=32, cache_backend="dense")
+            logits, _ = model.forward(
+                torch.tensor([prompt], dtype=torch.long, device=device),
+                cache=ref_cache,
+                use_cache=True,
+            )
+            ref_logits.append(logits[0, -1, :])
+
+        indexed_cache = model.allocate_cache(4, max_seq_len=32, cache_backend="dense")
+        contiguous_cache = model.allocate_cache(4, max_seq_len=32, cache_backend="dense")
+        for cache in (indexed_cache, contiguous_cache):
+            prefix_view = cache.for_rows((prefix_row,))
+            model.forward(
+                torch.tensor([shared_prefix], dtype=torch.long, device=device),
+                cache=prefix_view,
+                use_cache=True,
+            )
+
+        padded_suffixes = [suffix + [0] * (bucket - len(suffix)) for suffix in suffixes]
+        input_ids = torch.tensor(padded_suffixes, dtype=torch.long, device=device)
+        seq_lens = torch.zeros(4, dtype=torch.long, device=device)
+        seq_lens[: len(suffixes)] = prefix_len
+        row_indices = torch.arange(len(suffixes), dtype=torch.long, device=device)
+        logit_positions = torch.tensor(
+            [len(suffix) - 1 for suffix in suffixes],
+            dtype=torch.long,
+            device=device,
+        )
+        src_prefix_row = torch.tensor([prefix_row], dtype=torch.long, device=device)
+
+        indexed = model.prefill_ragged_logits(
+            input_ids,
+            indexed_cache,
+            seq_lens=seq_lens,
+            row_indices=row_indices,
+            logit_positions=logit_positions,
+            context_len=prefix_len + bucket,
+            src_prefix_row=src_prefix_row,
+        )
+        contiguous = model.prefill_ragged_logits(
+            input_ids,
+            contiguous_cache,
+            seq_lens=seq_lens,
+            row_indices=None,
+            logit_positions=logit_positions,
+            context_len=prefix_len + bucket,
+            src_prefix_row=src_prefix_row,
+        )
+
+    torch.testing.assert_close(contiguous, indexed, atol=2e-5, rtol=2e-5)
+    for index, ref in enumerate(ref_logits):
+        torch.testing.assert_close(contiguous[index, 0, :], ref, atol=2e-5, rtol=2e-5)
+    for indexed_layer, contiguous_layer in zip(indexed_cache.layers, contiguous_cache.layers):
+        for row, suffix in enumerate(suffixes):
+            end = prefix_len + len(suffix)
+            torch.testing.assert_close(
+                contiguous_layer.keys[row, :, :end, :],
+                indexed_layer.keys[row, :, :end, :],
+            )
+            torch.testing.assert_close(
+                contiguous_layer.values[row, :, :end, :],
+                indexed_layer.values[row, :, :end, :],
+            )
+
+
 def test_llama3_tensor_parallel_packed_flashinfer_prefill_matches_padded_oracle(
     tmp_path,
     monkeypatch,

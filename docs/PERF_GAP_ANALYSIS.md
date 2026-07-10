@@ -12616,6 +12616,20 @@ regressed because prefill wall rose from `7.84s` to `9.11s`; keep treating the
 tree gap as packed prefix-suffix prefill first, with this row-index change only
 as a minor sampled-decode cleanup.
 
+A follow-up dirty-tree prefill cleanup lets dense ordered prefix-prefill batches
+omit `row_indices` too, and fixes the Llama3 TP prefix-copy path so
+`src_prefix_row` still copies into destination rows `0..N-1` when `row_indices`
+is absent. The TorchInferno-only tree run wrote
+`/tmp/inference-bench-tree-prefill-contigrows-results/.../runs/20260710_100021`
+and landed at `65.8 / 39.4 / 94.6ms`, `954/992` correct. The final queue
+profile showed the intended narrow effect: prefill graph replay fell to
+`816ms` versus `1319ms` on the clean `3dfd5c5` control, with prefill
+forward/wall roughly flat-to-slightly-better (`6.27s/7.71s` vs
+`6.41s/7.84s`). Only two live ragged-prefill graph entries used `rows0`
+against `133` `rows1` entries, so this is not the main tree lever; keep it as
+correctness coverage and a small row-index-free graph scaffold, while the
+score-facing gap still points at the padded `s16` prefix-suffix body.
+
 ## Priority for a focused (non-loop) session
 
 1. Prefill MFU (Issue 1) — biggest TTFT lever, ~2x, affects 3/5 benchmarks.

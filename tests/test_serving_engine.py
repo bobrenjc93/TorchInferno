@@ -643,7 +643,7 @@ class _SelectedLogitsToyModel(_RaggedGraphToyModel):
         self.selected_positions: list[list[int]] = []
         self.prefill_src_prefix_rows: list[list[int] | None] = []
         self.prefill_input_shapes: list[tuple[int, int]] = []
-        self.prefill_row_indices: list[list[int]] = []
+        self.prefill_row_indices: list[list[int] | None] = []
         self.prefill_start_positions: list[list[int]] = []
         self.prefill_capture_flags: list[bool] = []
         self.prefill_prefix_copy_lens: list[int | None] = []
@@ -679,6 +679,13 @@ class _SelectedLogitsToyModel(_RaggedGraphToyModel):
         idx = torch.arange(input_ids.size(0), device=input_ids.device)
         return self._logits(input_ids[idx, positions] + 1)
 
+    def _record_prefill_row_indices(self, input_ids, row_indices) -> list[int]:
+        rows = _toy_decode_rows(input_ids, row_indices)
+        self.prefill_row_indices.append(
+            None if row_indices is None else row_indices.detach().cpu().tolist()
+        )
+        return rows
+
     def try_prefill_ragged_logits_graph(
         self, input_ids, cache, *, seq_lens, row_indices, logit_positions,
         context_len=None, src_prefix_row=None, prefix_copy_len=None, capture_on_miss=True,
@@ -693,8 +700,10 @@ class _SelectedLogitsToyModel(_RaggedGraphToyModel):
             None if src_prefix_row is None else src_prefix_row.detach().cpu().tolist()
         )
         self.prefill_input_shapes.append((int(input_ids.size(0)), int(input_ids.size(1))))
-        self.prefill_row_indices.append(row_indices.detach().cpu().tolist())
-        cache.advance_rows(row_indices.detach().cpu().tolist(), input_ids.size(1))
+        cache.advance_rows(
+            self._record_prefill_row_indices(input_ids, row_indices),
+            input_ids.size(1),
+        )
         return self._ragged_prefill_compute(input_ids, logit_positions)
 
     def prefill_ragged_logits(
@@ -710,8 +719,10 @@ class _SelectedLogitsToyModel(_RaggedGraphToyModel):
             None if src_prefix_row is None else src_prefix_row.detach().cpu().tolist()
         )
         self.prefill_input_shapes.append((int(input_ids.size(0)), int(input_ids.size(1))))
-        self.prefill_row_indices.append(row_indices.detach().cpu().tolist())
-        cache.advance_rows(row_indices.detach().cpu().tolist(), input_ids.size(1))
+        cache.advance_rows(
+            self._record_prefill_row_indices(input_ids, row_indices),
+            input_ids.size(1),
+        )
         return self._ragged_prefill_compute(input_ids, logit_positions)
 
     def prefill_ragged_logits_packed_eager(
@@ -727,8 +738,10 @@ class _SelectedLogitsToyModel(_RaggedGraphToyModel):
             None if src_prefix_row is None else src_prefix_row.detach().cpu().tolist()
         )
         self.prefill_input_shapes.append((int(input_ids.size(0)), int(input_ids.size(1))))
-        self.prefill_row_indices.append(row_indices.detach().cpu().tolist())
-        cache.advance_rows(row_indices.detach().cpu().tolist(), input_ids.size(1))
+        cache.advance_rows(
+            self._record_prefill_row_indices(input_ids, row_indices),
+            input_ids.size(1),
+        )
         return self._ragged_prefill_compute(input_ids, logit_positions)
 
     def try_prefill_ragged_logits_packed_eager_graph(
@@ -745,8 +758,10 @@ class _SelectedLogitsToyModel(_RaggedGraphToyModel):
             None if src_prefix_row is None else src_prefix_row.detach().cpu().tolist()
         )
         self.prefill_input_shapes.append((int(input_ids.size(0)), int(input_ids.size(1))))
-        self.prefill_row_indices.append(row_indices.detach().cpu().tolist())
-        cache.advance_rows(row_indices.detach().cpu().tolist(), input_ids.size(1))
+        cache.advance_rows(
+            self._record_prefill_row_indices(input_ids, row_indices),
+            input_ids.size(1),
+        )
         return self._ragged_prefill_compute(input_ids, logit_positions)
 
     def try_prefill_ragged_cache_graph(
@@ -764,9 +779,9 @@ class _SelectedLogitsToyModel(_RaggedGraphToyModel):
             None if src_prefix_row is None else src_prefix_row.detach().cpu().tolist()
         )
         self.prefill_input_shapes.append((int(input_ids.size(0)), int(input_ids.size(1))))
-        self.prefill_row_indices.append(row_indices.detach().cpu().tolist())
+        rows = self._record_prefill_row_indices(input_ids, row_indices)
         self._last_ragged_prefill_graph_captured = self.prefill_cache_graph_calls == 1
-        cache.advance_rows(row_indices.detach().cpu().tolist(), input_ids.size(1))
+        cache.advance_rows(rows, input_ids.size(1))
         return True
 
     def prefill_ragged_cache(
@@ -783,8 +798,10 @@ class _SelectedLogitsToyModel(_RaggedGraphToyModel):
             None if src_prefix_row is None else src_prefix_row.detach().cpu().tolist()
         )
         self.prefill_input_shapes.append((int(input_ids.size(0)), int(input_ids.size(1))))
-        self.prefill_row_indices.append(row_indices.detach().cpu().tolist())
-        cache.advance_rows(row_indices.detach().cpu().tolist(), input_ids.size(1))
+        cache.advance_rows(
+            self._record_prefill_row_indices(input_ids, row_indices),
+            input_ids.size(1),
+        )
         return True
 
 
@@ -3902,6 +3919,7 @@ def test_continuous_batch_engine_skips_active_row_clear_for_prefix_graph_batch(
     assert [result.tokens[-1] for result in results] == [22, 25, 27]
     assert engine.stats.prefill_prefix_reuse_batches == 1
     assert any(rows is not None for rows in model.prefill_src_prefix_rows)
+    assert model.prefill_row_indices[-1] is None
     assert clear_calls == []
 
 
@@ -4055,12 +4073,11 @@ def test_continuous_batch_engine_reuses_common_prefix_for_padded_refill(monkeypa
 
 
 def test_continuous_batch_engine_graph_prefill_buckets_batch_and_matches() -> None:
-    # graph_prefill routes suffix prefill through the model's row_indices
-    # ragged-prefill LOGITS graph with the batch padded to a power of two so
-    # graph shapes repeat across batches. A reuse batch of three differently-sized
-    # suffixes is bucketed up to four rows (one dummy padding row); outputs must
-    # equal the toy model's selected-token contract and the ragged graph path
-    # must be taken (prefill_graph_hits incremented).
+    # graph_prefill routes suffix prefill through the model's ragged-prefill
+    # LOGITS graph with the batch padded to a power of two so graph shapes repeat
+    # across batches. Dense ordered physical rows can omit row_indices; scattered
+    # rows keep row_indices. Outputs must equal the toy model's selected-token
+    # contract and the ragged graph path must be taken.
     shared = tuple(range(16))
     model = _SelectedLogitsToyModel()
     engine = ContinuousBatchEngine(

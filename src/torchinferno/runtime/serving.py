@@ -3625,6 +3625,11 @@ class ContinuousBatchEngine:
             all_rows = rows + pad_rows + pad_prefix_rows
             input_ids = torch.tensor(padded_suffixes, device=self.device, dtype=torch.long)
             row_indices = self._device_index_tensor(tuple(all_rows))
+            model_row_indices = (
+                None
+                if all_rows == list(range(len(all_rows)))
+                else row_indices
+            )
             src_prefix_row = (
                 self._device_index_tensor(tuple(source_prefix_rows))
                 if source_prefix_rows
@@ -3703,7 +3708,7 @@ class ContinuousBatchEngine:
                     self._try_ragged_prefill_logits_with_greedy_tokens(
                         input_ids,
                         seq_lens,
-                        row_indices,
+                        model_row_indices,
                         logit_positions,
                         [request for _index, request, _prefix_hit_tokens, _reusable in group],
                         context_len,
@@ -3722,7 +3727,7 @@ class ContinuousBatchEngine:
                     logits = self._try_ragged_prefill_logits(
                         input_ids,
                         seq_lens,
-                        row_indices,
+                        model_row_indices,
                         logit_positions,
                         context_len,
                         src_prefix_row,
@@ -3735,7 +3740,7 @@ class ContinuousBatchEngine:
                 logits = self._ragged_prefill_logits_eager(
                     input_ids,
                     seq_lens,
-                    row_indices,
+                    model_row_indices,
                     logit_positions,
                     context_len,
                     src_prefix_row,

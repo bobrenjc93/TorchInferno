@@ -5488,8 +5488,13 @@ class Llama3TensorParallelForCausalLM:
         # rows; row_indices re-targets dest rows. A single source row broadcasts
         # for common-prefix reuse, and one source per request handles full-prompt
         # reuse with equal prefix lengths.
-        if src_prefix_row is None or row_indices is None:
+        if src_prefix_row is None:
             return
+        dest_rows = (
+            torch.arange(start_positions.numel(), device=self.device)
+            if row_indices is None
+            else row_indices
+        )
         if context_len is not None:
             if context_len < 0:
                 prefix_len = (-context_len) - input_tokens
@@ -5497,10 +5502,10 @@ class Llama3TensorParallelForCausalLM:
                 prefix_len = context_len - input_tokens
             if prefix_len > 0:
                 for layer in cache.layers:
-                    layer.keys[row_indices, :, :prefix_len, :] = layer.keys.index_select(
+                    layer.keys[dest_rows, :, :prefix_len, :] = layer.keys.index_select(
                         0, src_prefix_row
                     )[:, :, :prefix_len, :]
-                    layer.values[row_indices, :, :prefix_len, :] = layer.values.index_select(
+                    layer.values[dest_rows, :, :prefix_len, :] = layer.values.index_select(
                         0, src_prefix_row
                     )[:, :, :prefix_len, :]
             return
@@ -5512,20 +5517,20 @@ class Llama3TensorParallelForCausalLM:
         if prefix_len <= 0:
             return
         source_rows = src_prefix_row
-        if source_rows.numel() == 1 and row_indices.numel() > 1:
-            source_rows = source_rows.expand(row_indices.numel())
+        if source_rows.numel() == 1 and dest_rows.numel() > 1:
+            source_rows = source_rows.expand(dest_rows.numel())
         mask = torch.arange(prefix_len, device=self.device)[None, :] < start_positions[:, None]
         for layer in cache.layers:
             source_keys = layer.keys.index_select(0, source_rows)[:, :, :prefix_len, :]
             source_values = layer.values.index_select(0, source_rows)[:, :, :prefix_len, :]
             zero_key = torch.zeros((), dtype=source_keys.dtype, device=source_keys.device)
             zero_value = torch.zeros((), dtype=source_values.dtype, device=source_values.device)
-            layer.keys[row_indices, :, :prefix_len, :] = torch.where(
+            layer.keys[dest_rows, :, :prefix_len, :] = torch.where(
                 mask[:, None, :, None],
                 source_keys,
                 zero_key,
             )
-            layer.values[row_indices, :, :prefix_len, :] = torch.where(
+            layer.values[dest_rows, :, :prefix_len, :] = torch.where(
                 mask[:, None, :, None],
                 source_values,
                 zero_value,
