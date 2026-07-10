@@ -13603,6 +13603,19 @@ because TP runtime disables capture-on-miss and startup warmup captures static
 graphs on the base cache, while online serving uses cached `for_rows(...)`
 views whose graph keys are tied to the view object.
 
+Routing single-active greedy decode through the existing ragged row-index graph
+closes that miss source without changing TP static graph keying. The dirty
+validation
+`/tmp/inference-bench-multi-ragged-single-results/.../runs/20260710_231839`
+landed at `229.3 / 39.3 / 260.5ms`, correctness `0.980`. The queue profile
+showed `runtime_decode_graph_misses=0`, `runtime_decode_graph_hits=95`, and
+`runtime_decode_graph_replays=95`; the previous diagnostic run had `44` misses
+and `65` hits/replays. Median TPOT was flat-to-slightly-worse, but median TTFT
+improved by `11.9ms`, median E2E by `12.6ms`, and p99 E2E dropped from
+`1738.7ms` to `715.4ms`. Keep this as a general runtime routing fix: single
+active rows should prefer the already-warmed ragged graph over static row-view
+graphs that TP cannot capture on miss.
+
 ## Priority for a focused (non-loop) session
 
 1. Prefill MFU (Issue 1) — biggest TTFT lever, ~2x, affects 3/5 benchmarks.

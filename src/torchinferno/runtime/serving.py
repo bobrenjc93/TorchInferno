@@ -6112,23 +6112,32 @@ class ContinuousBatchEngine:
                     reuse_logits = logits[:, -1, :]
                     next_token_tensor = self._sample_logits_for_states(logits[:, -1, :], states)
         else:
-            cache_view = self._cache_view(rows)
-            graph_token = (
-                self._try_static_token_graph(
-                    input_ids,
-                    cache_view,
-                    temperature=shared_temperature,
-                )
-                if use_static_token_graph
-                else None
+            ragged_decode = self._try_ragged_decode_states(
+                states,
+                input_ids,
+                need_logits=need_generated_prefix_logits,
+                temperature=shared_temperature,
             )
-            if graph_token is None:
-                logits = self._static_decode_logits(input_ids, cache_view)
-                reuse_logits = logits[:, -1, :]
-                next_token_tensor = self._sample_logits_for_states(logits[:, -1, :], states)
+            if ragged_decode is not None:
+                next_token_tensor, reuse_logits = ragged_decode
             else:
-                next_token_tensor = graph_token.to(self.device)
-                self.stats.decode_graph_hits += 1
+                cache_view = self._cache_view(rows)
+                graph_token = (
+                    self._try_static_token_graph(
+                        input_ids,
+                        cache_view,
+                        temperature=shared_temperature,
+                    )
+                    if use_static_token_graph
+                    else None
+                )
+                if graph_token is None:
+                    logits = self._static_decode_logits(input_ids, cache_view)
+                    reuse_logits = logits[:, -1, :]
+                    next_token_tensor = self._sample_logits_for_states(logits[:, -1, :], states)
+                else:
+                    next_token_tensor = graph_token.to(self.device)
+                    self.stats.decode_graph_hits += 1
         self._record_model_call("decode", len(states), tokens=len(states))
         next_tokens = next_token_tensor.detach().cpu().tolist()
         self._store_decoded_reusable_prefixes(states, reuse_logits)
@@ -6158,6 +6167,40 @@ class ContinuousBatchEngine:
             else:
                 decoded.append(state)
         return decoded
+
+    def _try_ragged_decode_states(
+        self,
+        states: list[_ActiveRequest],
+        input_ids: Tensor,
+        *,
+        need_logits: bool,
+        temperature: float | None,
+    ) -> tuple[Tensor, Tensor | None] | None:
+        if not self.enable_ragged_decode or not states:
+            return None
+        rows = [state.row for state in states]
+        row_indices = torch.tensor(rows, dtype=torch.long, device=self.device)
+        seq_lens = self._seq_lens_tensor(states, rows=rows)
+        if need_logits:
+            if not (
+                hasattr(self.model, "try_decode_ragged_logits_graph")
+                or hasattr(self.model, "decode_ragged_logits")
+            ):
+                return None
+            logits = self._ragged_decode_logits(input_ids, seq_lens, row_indices)
+            return self._sample_logits_for_states(logits[:, -1, :], states), logits[:, -1, :]
+        if temperature is None:
+            return None
+        token = self._try_ragged_token_graph(
+            input_ids,
+            seq_lens,
+            row_indices,
+            temperature=temperature,
+        )
+        if token is None:
+            return None
+        self.stats.decode_graph_hits += 1
+        return token.to(self.device), getattr(self, "_last_ragged_decode_logits", None)
 
     def _finalize_decode(
         self,
@@ -6218,23 +6261,32 @@ class ContinuousBatchEngine:
                     reuse_logits = logits[:, -1, :]
                     next_token_tensor = self._sample_logits_for_states(logits[:, -1, :], [state])
         else:
-            cache_view = self._cache_view([state.row])
-            graph_token = (
-                self._try_static_token_graph(
-                    input_ids,
-                    cache_view,
-                    temperature=state_temperature,
-                )
-                if state_temperature <= 0.0 and not need_generated_prefix_logits
-                else None
+            ragged_decode = self._try_ragged_decode_states(
+                [state],
+                input_ids,
+                need_logits=need_generated_prefix_logits,
+                temperature=state_temperature,
             )
-            if graph_token is None:
-                logits = self._static_decode_logits(input_ids, cache_view)
-                reuse_logits = logits[:, -1, :]
-                next_token_tensor = self._sample_logits_for_states(logits[:, -1, :], [state])
+            if ragged_decode is not None:
+                next_token_tensor, reuse_logits = ragged_decode
             else:
-                next_token_tensor = graph_token.to(self.device)
-                self.stats.decode_graph_hits += 1
+                cache_view = self._cache_view([state.row])
+                graph_token = (
+                    self._try_static_token_graph(
+                        input_ids,
+                        cache_view,
+                        temperature=state_temperature,
+                    )
+                    if state_temperature <= 0.0 and not need_generated_prefix_logits
+                    else None
+                )
+                if graph_token is None:
+                    logits = self._static_decode_logits(input_ids, cache_view)
+                    reuse_logits = logits[:, -1, :]
+                    next_token_tensor = self._sample_logits_for_states(logits[:, -1, :], [state])
+                else:
+                    next_token_tensor = graph_token.to(self.device)
+                    self.stats.decode_graph_hits += 1
         self._record_model_call("decode", 1, tokens=1)
         next_token = int(next_token_tensor.item())
         self._store_decoded_reusable_prefixes([state], reuse_logits)

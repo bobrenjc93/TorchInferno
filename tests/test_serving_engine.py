@@ -6330,6 +6330,56 @@ def test_continuous_batch_engine_uses_ragged_graph_decode_for_mixed_lengths() ->
     assert engine.stats.max_model_batch_size == 3
 
 
+def test_continuous_batch_engine_uses_ragged_graph_decode_for_single_active_row() -> None:
+    class _SingleRowRaggedTokenGraphToyModel(_RaggedGraphToyModel):
+        def __init__(self) -> None:
+            super().__init__()
+            self.ragged_token_graph_calls = 0
+            self.static_token_graph_calls = 0
+            self.static_logits_graph_calls = 0
+
+        def try_decode_ragged_token_graph(
+            self,
+            input_ids,
+            cache,
+            *,
+            seq_lens,
+            row_indices,
+            temperature=0.0,
+        ):
+            del seq_lens, temperature
+            self.ragged_token_graph_calls += 1
+            cache.advance_rows(_toy_decode_rows(input_ids, row_indices), 1)
+            return torch.argmax(self._logits(input_ids[:, -1] + 1)[:, -1, :], dim=-1)
+
+        def try_decode_one_token_graph(self, input_ids, cache, *, temperature=0.0):  # noqa: ANN001
+            del input_ids, cache, temperature
+            self.static_token_graph_calls += 1
+            return None
+
+        def try_decode_one_token_logits_graph(self, input_ids, cache):  # noqa: ANN001
+            del input_ids, cache
+            self.static_logits_graph_calls += 1
+            return None
+
+    model = _SingleRowRaggedTokenGraphToyModel()
+    engine = ContinuousBatchEngine(
+        model,
+        device=torch.device("cpu"),
+        max_active_requests=1,
+        prefix_cache_capacity=0,
+        enable_ragged_decode=True,
+    )
+
+    results = engine.run([ServingRequest("single", (1, 2), 3, arrival_step=0)])
+
+    assert len(results[0].tokens) == 5
+    assert model.ragged_token_graph_calls == 2
+    assert model.static_token_graph_calls == 0
+    assert model.static_logits_graph_calls == 0
+    assert engine.stats.decode_graph_hits == 2
+
+
 def test_continuous_batch_engine_records_ragged_decode_graph_captures() -> None:
     model = _CaptureReportingRaggedGraphToyModel()
     engine = ContinuousBatchEngine(
