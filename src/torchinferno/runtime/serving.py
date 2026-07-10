@@ -6937,7 +6937,7 @@ class ContinuousBatchEngine:
             return rows
         row_set = set(rows)
         bucketed = list(rows)
-        for row in self._free_active_rows:
+        for row in reversed(self._free_active_rows):
             if row in row_set:
                 continue
             bucketed.append(row)
@@ -7574,8 +7574,7 @@ class ContinuousBatchEngine:
         )
         self._prefix_order.append(entry.route_id)
         self._remember_row_seq_len(replacement_active_row, 0)
-        if replacement_active_row not in self._free_active_rows:
-            self._free_active_rows.append(replacement_active_row)
+        self._mark_active_row_free(replacement_active_row)
         return True
 
     def _reusable_prefix_hit_tokens(self, prompt: tuple[int, ...]) -> int:
@@ -7689,8 +7688,20 @@ class ContinuousBatchEngine:
         # row reused as decode-bucket padding has seq_len 0 so attention never
         # reads its stale KV, and its bucket output is discarded regardless.
         self._remember_row_seq_len(row, 0)
-        if row not in self._free_active_rows:
-            self._free_active_rows.append(row)
+        self._mark_active_row_free(row)
+
+    def _mark_active_row_free(self, row: int) -> None:
+        if row in self._free_active_rows:
+            return
+        # Keep descending order so pop() returns the lowest available row. This
+        # preserves dense low-row active batches after prefix-row adoption.
+        insert_at = 0
+        while (
+            insert_at < len(self._free_active_rows)
+            and self._free_active_rows[insert_at] > row
+        ):
+            insert_at += 1
+        self._free_active_rows.insert(insert_at, row)
 
     def _prefill_static_batch_size(self, request_count: int) -> int:
         bucket = env_int("TORCHINFERNO_CONTINUOUS_PREFILL_STATIC_BATCH", self.max_active_requests, minimum=1)

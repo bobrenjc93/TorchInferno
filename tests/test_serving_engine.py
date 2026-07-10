@@ -2188,6 +2188,39 @@ def test_continuous_batch_engine_can_skip_active_row_clear_on_acquire(monkeypatc
     assert engine._row_seq_lens[0] == 0
 
 
+def test_continuous_batch_engine_prefers_low_free_active_rows() -> None:
+    engine = ContinuousBatchEngine(
+        _RaggedGraphToyModel(),
+        device=torch.device("cpu"),
+        max_active_requests=4,
+        prefix_cache_capacity=2,
+    )
+    engine.start_online(max_seq_len=8)
+
+    acquired = [engine._acquire_active_row() for _ in range(4)]
+    assert acquired == [0, 1, 2, 3]
+
+    engine._release_active_row(2)
+    engine._release_active_row(0)
+    engine._release_active_row(1)
+
+    assert [engine._acquire_active_row() for _ in range(3)] == [0, 1, 2]
+
+
+def test_continuous_batch_engine_decode_bucket_uses_low_padding_rows() -> None:
+    engine = ContinuousBatchEngine(
+        _RaggedGraphToyModel(),
+        device=torch.device("cpu"),
+        max_active_requests=6,
+        prefix_cache_capacity=2,
+    )
+    engine.start_online(max_seq_len=8)
+    rows = [engine._acquire_active_row() for _ in range(3)]
+
+    assert rows == [0, 1, 2]
+    assert engine._ragged_decode_bucket_rows(rows) == [0, 1, 2, 3]
+
+
 def test_continuous_batch_engine_can_opt_in_full_prompt_store_while_pinned(monkeypatch) -> None:
     monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PINNED_FULL_PROMPT_STORE_MIN_MAX_TOKENS", "2")
     monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_NON_COMMON_PREFIX_GRAPH_PREFILL", "1")
@@ -3955,6 +3988,7 @@ def test_continuous_batch_engine_uses_prefix_rows_for_graph_padding_when_active_
     ]
     assert sparse_prefills
     assert any(starts == [len(shared)] * len(rows) for rows, starts in sparse_prefills)
+    assert engine.stats.prefill_row_indices_indexed_batches >= 1
     assert engine.stats.prefill_sample_ms >= 0.0
     assert engine.stats.prefill_sample_select_ms >= 0.0
     assert engine.stats.prefill_sample_readback_ms >= 0.0
@@ -4117,7 +4151,7 @@ def test_continuous_batch_engine_graph_prefill_buckets_batch_and_matches() -> No
     assert engine.stats.prefill_padded_suffix_batches >= 1
     assert engine.stats.prefix_reuse_requests >= 3
     assert engine.stats.prefill_row_indices_omitted_batches >= 1
-    assert engine.stats.prefill_row_indices_indexed_batches >= 1
+    assert engine.stats.prefill_row_indices_indexed_batches == 0
 
 
 def test_continuous_batch_engine_can_split_prefix_graph_by_suffix_bucket(monkeypatch) -> None:

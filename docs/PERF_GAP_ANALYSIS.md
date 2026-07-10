@@ -12648,6 +12648,18 @@ modes. Use these alongside live `rows0/rows1` graph-cache keys to verify that a
 future row-layout experiment changes actual replay calls, not just resident graph
 entries.
 
+Keeping the active-row freelist sorted after release and prefix-row adoption is
+a small general cleanup, not a score-facing multi_turn fix by itself. The dirty
+TorchInferno-only multi_turn run
+`/tmp/inference-bench-multiturn-lowrows-results/.../runs/20260710_104006`
+landed at `234.5 / 37.3 / 266.7ms`, slightly ahead of the earlier
+cleanup-sequence sample (`241.1 / 39.9 / 275.2ms`), but the profile showed only
+one omitted row-index prefill batch with two rows versus 32 indexed batches and
+1000 indexed rows. Live ragged-prefill graph keys also stayed concentrated in
+`rows1` (`0` `rows0` entries and `148` `rows1` entries). Treat this as
+allocator hygiene and unit coverage for dense low-row reuse; the remaining
+multi_turn gap still needs a real mixed-prefix prefill/queueing lever.
+
 ## Priority for a focused (non-loop) session
 
 1. Prefill MFU (Issue 1) — biggest TTFT lever, ~2x, affects 3/5 benchmarks.
