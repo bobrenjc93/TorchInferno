@@ -143,6 +143,16 @@ E2E, while long_output needs about `187ms` lower TTFT, `5.1ms` lower TPOT, and
 `405ms` lower E2E. Startup is also still about `176s` slower than vLLM because
 TorchInferno eagerly warms many runtime graph shapes.
 
+The same-host SGLang refresh on `2286e25` wrote
+`/tmp/inference-bench-sglang-tree-long-refresh-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-sglang-tree-long-refresh/runs/20260710_204146`.
+SGLang reached readiness in `65.3s`, tree_of_thought landed at
+`38.7 / 105.8 / 109.4ms`, `966/992` correct, and long_output landed at
+`45.4 / 25.9 / 957.1ms`, `1000/1000` correct. TorchInferno still beats SGLang
+on tree TPOT/E2E and long_output TPOT, but loses both TTFT cells and
+long_output E2E. That keeps the next cross-provider target on lower first-token
+admission/prefill latency and long-output end-to-end pipeline cost rather than
+a broad raw-token-rate issue.
+
 ## Public 20260710_140141 current-run refresh and scheduling rejections
 
 The public pointer now includes the current TorchInferno main run:
