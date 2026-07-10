@@ -1,5 +1,52 @@
 # TorchInferno vs vLLM/sglang — Performance Gap Analysis (Llama-3.1-70B, 8xH100)
 
+## Public 20260710_130259 refresh and main fast-forward
+
+The public pointer advanced again to
+`results/v1/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100/runs/20260710_130259`.
+It still measured stale TorchInferno `a4d92f0` while vLLM was `fabec87` and
+SGLang was `e9493a0`, leaving the published scorecard at TorchInferno `4/20`,
+vLLM `13/20`, and SGLang `2/20`. Public medians were few_shot
+`152.8 / 31.2 / 179.3ms`, self_consistency `51.4 / 0.0 / 52.1ms`,
+multi_turn `476.5 / 125.9 / 580.5ms`, tree_of_thought
+`133.2 / 83.6 / 169.2ms`, and long_output `614.5 / 67.2 / 2935.6ms`.
+
+That public row is not comparable to the current local evidence below because
+the public runner clones TorchInferno `main`, and `main` had not yet advanced
+past `a4d92f0`. The current benchmark branch was verified as a clean
+fast-forward from `origin/main` (`35` commits ahead, `0` behind), passed the
+focused suffix/warmup tests, pyflakes, and `git diff --check`, then TorchInferno
+`main` was advanced to `54f4c42`. The next public run should therefore measure
+the sampled dense warmup, sampled-medium suffix buckets, decode/prefill
+telemetry, and the documented rejection fixes rather than the stale public
+baseline.
+
+## Current 20260710 mixed-prefix suffix-split rejection
+
+Multi_turn still shows real `s16-17 -> s32` suffix padding in mixed-prefix
+prefill, but the guarded suffix-split path is not a defaultable fix. Enabling
+`TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SPLIT_SUFFIX_BUCKETS=1` on `54f4c42`
+wrote
+`/tmp/inference-bench-multiturn-split-suffix-54f4c42-results/.../runs/20260710_134045`
+and regressed to `276.8 / 38.8 / 312.7ms`, p99
+`1561.3 / 268.2 / 1814.1ms`, with `980/1000` correct. The splitter found
+`30` candidates and accepted `5`, saving `1696` model tokens, but it fragmented
+prefill into cold small graph bodies such as `b16:s16`, `b2:s32`, and `b2:s16`;
+queue-to-first p50 rose to `263.4ms`.
+
+Adding the missing mixed-prefix warmup specs
+`16:16:128`, `32:16:128`, `2:32:128`, plus dense `45:16`, removed most of the
+cold-request penalty but did not create a useful median win. The warmed probe
+wrote
+`/tmp/inference-bench-multiturn-split-warm-54f4c42-results/.../runs/20260710_134753`
+and landed at `232.4 / 37.3 / 264.0ms`, p99
+`925.9 / 82.1 / 956.5ms`, with `982/1000` correct. That is effectively flat
+versus the no-env full-suite multi_turn row `232.3 / 37.8 / 264.1ms`; it
+accepted only `1` of `31` split candidates, saved `64` model tokens, and still
+left a cold `b8:s16:ctx-256` mixed-prefix miss. Keep mixed-prefix suffix
+splitting and broader warmup as diagnostics until there is a cheaper
+mixed-prefix prefill body or a grouping policy that proves lower wall time.
+
 ## Public 20260710_111248 refresh
 
 The public pointer advanced in `origin/main` to
