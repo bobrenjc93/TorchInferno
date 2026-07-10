@@ -292,11 +292,11 @@ def _online_refill_min_ready_requests(*, temperature: float, max_tokens: int) ->
         minimum=1,
     ):
         # Long-output-style short greedy streams are suffix-prefill fragmented
-        # after the small first client wave. A 12-request refill floor reduces
-        # queue-facing turnaround without changing the 256-token few-shot path.
+        # after the small first client wave. An 8-request refill floor keeps
+        # first-token queueing low without changing the 256-token few-shot path.
         default_min_ready = env_int(
             "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_REFILL_MIN_READY_REQUESTS",
-            12,
+            8,
             minimum=1,
         )
     if max_tokens > env_int(
@@ -449,11 +449,14 @@ def _online_kv_token_budget(*, temperature: float, max_tokens: int) -> int:
         )
         if max_tokens <= sampled_max_tokens:
             # Self-consistency-style sampled bursts are wave-scheduling bound.
-            # Allowing 128 active rows under the fixed 144-row cache envelope
-            # cuts E2E/throughput without touching greedy long-output policy.
+            # A 32K token budget keeps more prefix rows than the full 128-row
+            # active cap while still admitting large sampled-short waves. Local
+            # TP8 70B rechecks: 32K improved self-consistency median E2E/p99
+            # from 284.4/1578.9ms to 227.7/1303.4ms, while 24K regressed to
+            # 295.4/1552.1ms. Greedy long-output policy is handled separately.
             return env_int(
                 "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_KV_TOKEN_BUDGET",
-                128 * 512,
+                64 * 512,
                 minimum=1,
             )
         return env_int("TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_LONG_KV_TOKEN_BUDGET", 64 * 512, minimum=1)
@@ -705,12 +708,12 @@ def _online_prefill_ready_before_decode_enabled(*, temperature: float, max_token
             minimum=1,
         )
         if max_tokens <= greedy_short_max_tokens:
-            # Short greedy batches are decode-throughput bound. Keeping decode
-            # first avoids long-output tail spikes from interleaving padded suffix
-            # prefill at the active tail; leave tail prefill as an explicit knob.
+            # Long-output-style short greedy streams need bounded prefill
+            # interleaving to avoid queue tail spikes while decode-many remains
+            # the hot path.
             return env_flag(
                 "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_PREFILL_READY_BEFORE_DECODE",
-                False,
+                True,
             )
         greedy_large_min_tokens = env_int(
             "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_PREFILL_READY_MIN_TOKENS",
@@ -789,7 +792,7 @@ def _online_prefill_ready_before_decode_active_cap(
         if max_tokens <= greedy_short_max_tokens:
             configured = env_int(
                 "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_PREFILL_READY_ACTIVE_CAP",
-                8,
+                6,
                 minimum=0,
             )
             return None if configured <= 0 else configured
@@ -872,6 +875,11 @@ def _online_step_sync_enabled(*, temperature: float | None = None, max_tokens: i
         if sampled_medium_min_tokens < max_tokens <= sampled_medium_max_tokens:
             return env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_STEP_SYNC", False)
     return True
+
+
+def _online_close_cuda_sync_enabled(*, temperature: float | None = None, max_tokens: int | None = None) -> bool:
+    del temperature, max_tokens
+    return env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_CLOSE_CUDA_SYNC", True)
 
 
 def _online_submit_step_command_enabled(*, temperature: float, max_tokens: int) -> bool:
@@ -1135,6 +1143,21 @@ def _online_persistent_idle_ms(*, temperature: float, max_tokens: int) -> float:
                 minimum=0.0,
             )
     elif temperature <= 0.0 and max_tokens > 0:
+        greedy_short_max_tokens = env_int(
+            "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_IDLE_MAX_TOKENS",
+            128,
+            minimum=1,
+        )
+        if max_tokens <= greedy_short_max_tokens:
+            # Short greedy client workers can trickle in just after a drained
+            # online session. Keep the session open long enough to avoid
+            # fragmenting long-output bursts into slow early micro-sessions.
+            default_idle_ms = env_float(
+                "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_IDLE_MS",
+                1000.0,
+                minimum=0.0,
+            )
+            return default_idle_ms
         greedy_mid_min_tokens = env_int(
             "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_MID_IDLE_MIN_TOKENS",
             128,
@@ -1313,6 +1336,17 @@ def _online_active_ready_wait_ms(*, temperature: float, max_tokens: int) -> floa
             256,
             minimum=1,
         )
+        if max_tokens <= sampled_short_max_tokens:
+            # Self-consistency-style sampled-short bursts should start their seed
+            # immediately, then briefly collect ready arrivals while active work
+            # exists. Local TP8 70B A/B: a 1ms active-ready wait improved median
+            # TTFT/E2E 288.8/311.3ms -> 175.3/189.0ms and p99 E2E
+            # 1562.3ms -> 1246.3ms without changing startup or correctness.
+            return env_float(
+                "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_SHORT_ACTIVE_READY_WAIT_MS",
+                1.0,
+                minimum=0.0,
+            )
         sampled_medium_max_tokens = env_int(
             "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_INITIAL_BATCH_WAIT_MAX_TOKENS",
             300,
@@ -1367,10 +1401,13 @@ def _online_initial_batch_wait_ms(*, temperature: float, max_tokens: int) -> flo
             # Tree-of-thought sampled medium bursts are queue-to-submit bound in
             # the current worker-wave shape. With the sampled-medium decode
             # quantum lowered, a shorter first window keeps TTFT/E2E down without
-            # touching sampled-short or greedy policy.
+            # touching sampled-short or greedy policy. Local TP8 70B A/B after
+            # the sampled-medium active-ready fix: 1ms improved tree median
+            # TTFT/E2E/TPS from 62.7/94.1ms/15.7 tok/s to
+            # 60.5/89.8ms/16.2 tok/s while preserving correctness.
             default_wait_ms = env_float(
                 "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_INITIAL_BATCH_WAIT_MS",
-                2.0,
+                1.0,
                 minimum=0.0,
             )
     elif temperature <= 0.0 and 0 < max_tokens <= env_int(
@@ -5312,11 +5349,9 @@ class OpenAICompletionEngine:
         # rows cut TTFT/E2E from the 594-614ms / 631-659ms band to 465ms /
         # 531ms while keeping TPOT at 64.6ms, still around the same-node vLLM
         # TPOT band. Sampled medium bursts such as tree-of-thought are also
-        # latency-sensitive: local TP8 70B recheck showed a 32-row cap cut
-        # median TTFT/E2E from 425/465ms to 243/291ms, while 64 rows regressed
-        # to 590/659ms. A current-stack 40-row result looked promising once, but
-        # no-env repeats regressed to about 310/346ms, so keep the stable
-        # 32-row cap.
+        # latency-sensitive. Current-stack TP8 tree A/Bs showed a 16-row cap
+        # improves median E2E/throughput versus 32 rows without touching
+        # sampled-short self-consistency or greedy traffic.
         default_cap = 48
         if temperature is not None and max_tokens is not None:
             sampled_medium_min_tokens = env_int(
@@ -5332,7 +5367,7 @@ class OpenAICompletionEngine:
             if temperature > 0.0 and sampled_medium_min_tokens < max_tokens <= sampled_medium_max_tokens:
                 default_cap = env_int(
                     "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_MAX_ACTIVE",
-                    32,
+                    16,
                     minimum=1,
                 )
             greedy_mid_min_tokens = env_int(
@@ -5871,6 +5906,7 @@ class OpenAICompletionEngine:
         profile_snapshots = 0
         last_quiescent_profile_commands = -1
         last_quiescent_aggregate_commands = -1
+        graph_memory_cleanup_fields: dict[str, object] = {}
 
         def request_latency_profile_fields() -> dict[str, float | int]:
             queue_to_submit_ms: list[float] = []
@@ -6031,6 +6067,7 @@ class OpenAICompletionEngine:
                 runtime_step_events=runtime_step_events,
                 runtime_step_max_events=runtime_step_max_events,
                 **request_latency_profile_fields(),
+                **graph_memory_cleanup_fields,
                 **extra_fields,
                 **phase_fields,
             )
@@ -6187,6 +6224,14 @@ class OpenAICompletionEngine:
                 max_tokens=run_max_tokens,
                 temperature=first.temperature,
             ):
+                graph_cleanup_start_s = time.perf_counter()
+                graph_memory_cleanup_fields.update(
+                    self._maybe_release_online_graph_caches_for_memory(
+                        temperature=first.temperature,
+                        max_tokens=run_max_tokens,
+                    )
+                )
+                add_phase("graph_memory_cleanup_ms", graph_cleanup_start_s)
                 start_sync_start_s = time.perf_counter()
                 _broadcast_tensor_parallel_online_start(
                     self.model,
@@ -6427,8 +6472,16 @@ class OpenAICompletionEngine:
             )
             _set_tensor_parallel_runtime_marlin_int4_decode(self.model, enabled=True)
             if started:
+                close_cuda_sync = _online_close_cuda_sync_enabled(
+                    temperature=first.temperature,
+                    max_tokens=run_max_tokens,
+                )
                 _broadcast_tensor_parallel_online_close(self.model)
-                _sync_tensor_parallel_command(self.model, self.device)
+                _sync_tensor_parallel_command(
+                    self.model,
+                    self.device,
+                    cuda_sync=close_cuda_sync,
+                )
             for request in deferred:
                 self._generation_queue.put(request)
 
@@ -6479,7 +6532,7 @@ class OpenAICompletionEngine:
         self._clear_runtime_state_after_idle()
         _sync_tensor_parallel_command(self.model, self.device, cuda_sync=False)
 
-    def _clear_runtime_state_after_idle(self) -> None:
+    def _clear_runtime_state_after_idle(self, *, force_empty_cache: bool = False) -> None:
         if env_flag("TORCHINFERNO_OPENAI_IDLE_CLEANUP_CACHE_POOLS", True):
             self._clear_cache_pool(self._cache_pool, model=self.model)
             self._clear_cache_pool(self._microbatch_cache_pool, model=self.model)
@@ -6493,8 +6546,59 @@ class OpenAICompletionEngine:
             self._clear_prefix_cache()
         if env_flag("TORCHINFERNO_OPENAI_IDLE_CLEANUP_GRAPH_CACHES", True):
             _clear_model_graph_caches(self.model)
-        if self.device.type == "cuda" and env_flag("TORCHINFERNO_OPENAI_IDLE_CLEANUP_EMPTY_CACHE", False):
+        if self.device.type == "cuda" and (
+            force_empty_cache or env_flag("TORCHINFERNO_OPENAI_IDLE_CLEANUP_EMPTY_CACHE", False)
+        ):
+            try:
+                torch.cuda.synchronize(self.device)
+            except Exception as exc:
+                warn_optional_failure("openai.idle_cleanup.synchronize_before_empty_cache", exc)
             torch.cuda.empty_cache()
+
+    def _maybe_release_online_graph_caches_for_memory(
+        self,
+        *,
+        temperature: float,
+        max_tokens: int,
+    ) -> dict[str, object]:
+        if not env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_LOW_MEMORY_GRAPH_CLEANUP", True):
+            return {}
+        if self.device.type != "cuda":
+            return {}
+        min_free_mb = env_int(
+            "TORCHINFERNO_OPENAI_TP_ONLINE_GRAPH_CLEANUP_MIN_FREE_MB",
+            256,
+            minimum=0,
+        )
+        if min_free_mb <= 0:
+            return {}
+        try:
+            free_before, total_bytes = torch.cuda.mem_get_info(self.device)
+        except Exception as exc:
+            warn_optional_failure("openai.online_graph_memory.mem_get_info_before", exc)
+            return {}
+        min_free_bytes = int(min_free_mb) * 1024 * 1024
+        if int(free_before) >= min_free_bytes:
+            return {}
+        fields: dict[str, object] = {
+            "graph_memory_cleanup_applied": True,
+            "graph_memory_cleanup_min_free_mb": int(min_free_mb),
+            "graph_memory_cleanup_free_before_mb": round(int(free_before) / (1024 * 1024), 3),
+            "graph_memory_cleanup_total_mb": round(int(total_bytes) / (1024 * 1024), 3),
+            "graph_memory_cleanup_temperature": float(temperature),
+            "graph_memory_cleanup_max_tokens": int(max_tokens),
+        }
+        fields.update(_model_graph_cache_profile_fields(self.model, "graph_memory_cleanup_before_"))
+        _broadcast_tensor_parallel_cleanup(self.model, empty_cache=True)
+        self._clear_runtime_state_after_idle(force_empty_cache=True)
+        _sync_tensor_parallel_command(self.model, self.device, cuda_sync=False)
+        try:
+            free_after, _total_after = torch.cuda.mem_get_info(self.device)
+            fields["graph_memory_cleanup_free_after_mb"] = round(int(free_after) / (1024 * 1024), 3)
+        except Exception as exc:
+            warn_optional_failure("openai.online_graph_memory.mem_get_info_after", exc)
+        fields.update(_model_graph_cache_profile_fields(self.model, "graph_memory_cleanup_after_"))
+        return fields
 
     def pop_phase_records(self) -> list[dict[str, float]]:
         with self._phase_records_lock:
@@ -7858,8 +7962,16 @@ class OpenAICompletionEngine:
                 finished_events=finished_events,
             )
             if started:
+                close_cuda_sync = _online_close_cuda_sync_enabled(
+                    temperature=group[0].temperature,
+                    max_tokens=max_tokens,
+                )
                 _broadcast_tensor_parallel_online_close(self.model)
-                _sync_tensor_parallel_command(self.model, self.device)
+                _sync_tensor_parallel_command(
+                    self.model,
+                    self.device,
+                    cuda_sync=close_cuda_sync,
+                )
 
     def _should_use_flashinfer_stream_group(self, group: Sequence[_QueuedGeneration]) -> bool:
         if not env_flag("TORCHINFERNO_OPENAI_FLASHINFER", False):
@@ -14321,9 +14433,9 @@ def _receive_tensor_parallel_tensor_payload(engine: OpenAICompletionEngine) -> d
     if command_kind == _TP_COMMAND_ONLINE_STEP:
         return {"op": "online_step", "steps": max(1, int(meta[4].item()))}
     if command_kind == _TP_COMMAND_ONLINE_CLOSE:
-        return {"op": "online_close"}
+        return {"op": "online_close", "cuda_sync": bool(int(meta[1].item()))}
     if command_kind == _TP_COMMAND_CLEANUP:
-        return {"op": "cleanup"}
+        return {"op": "cleanup", "empty_cache": bool(int(meta[1].item()))}
     if command_kind == _TP_COMMAND_PROMPT_LIST_PERSISTENT_CLOSE:
         return {"op": "persistent_prompt_list_close"}
     if command_kind == _TP_COMMAND_TOKEN_BUDGET_CLOSE:
@@ -14855,8 +14967,12 @@ def _broadcast_tensor_parallel_online_step(model: object, steps: int = 1) -> Non
     _broadcast_tensor_parallel_online_command(model, payload)
 
 
-def _broadcast_tensor_parallel_online_close(model: object) -> None:
-    _broadcast_tensor_parallel_online_command(model, {"op": "online_close"})
+def _broadcast_tensor_parallel_online_close(model: object, *, cuda_sync: bool | None = None) -> None:
+    if cuda_sync is None:
+        cuda_sync = _online_close_cuda_sync_enabled()
+    payload: dict[str, object] = {"op": "online_close"}
+    payload["cuda_sync"] = bool(cuda_sync)
+    _broadcast_tensor_parallel_online_command(model, payload)
 
 
 def _broadcast_tensor_parallel_token_budget_start(
@@ -15047,6 +15163,7 @@ def _broadcast_tensor_parallel_online_command(model: object, payload: Mapping[st
         if op == "online_close":
             meta = torch.zeros(_TP_COMMAND_META_FIELDS, dtype=torch.long, device=command_device)
             meta[0] = _TP_COMMAND_ONLINE_CLOSE
+            meta[1] = int(bool(payload.get("cuda_sync", False)))
             _broadcast_tensor_command(meta, src=0, group=command_group)
             return
         if op == "online_submit":
@@ -15119,14 +15236,15 @@ def _broadcast_tensor_parallel_stop(model: object) -> None:
         dist.broadcast_object_list([{"op": "stop"}], src=0)
 
 
-def _broadcast_tensor_parallel_cleanup(model: object) -> None:
+def _broadcast_tensor_parallel_cleanup(model: object, *, empty_cache: bool = False) -> None:
     if not _is_tensor_parallel_primary_model(model):
         return
     import torch.distributed as dist
 
     if not (dist.is_available() and dist.is_initialized()):
         return
-    if _broadcast_tensor_parallel_shm_payload(model, {"op": "cleanup"}):
+    payload = {"op": "cleanup", "empty_cache": bool(empty_cache)}
+    if _broadcast_tensor_parallel_shm_payload(model, payload):
         return
     if _tensor_parallel_tensor_commands_enabled(model):
         command_group = _tensor_parallel_tensor_command_group(dist)
@@ -15136,9 +15254,10 @@ def _broadcast_tensor_parallel_cleanup(model: object) -> None:
         )
         meta = torch.zeros(_TP_COMMAND_META_FIELDS, dtype=torch.long, device=device)
         meta[0] = _TP_COMMAND_CLEANUP
+        meta[1] = int(bool(empty_cache))
         _broadcast_tensor_command(meta, src=0, group=command_group)
         return
-    dist.broadcast_object_list([{"op": "cleanup"}], src=0)
+    dist.broadcast_object_list([payload], src=0)
 
 
 def _prompt_list_tensor_payload(
@@ -15218,7 +15337,9 @@ def _tensor_parallel_worker_loop(engine: OpenAICompletionEngine) -> None:
             cuda_sync = cuda_sync_value
         try:
             if op == "cleanup":
-                engine._clear_runtime_state_after_idle()
+                engine._clear_runtime_state_after_idle(
+                    force_empty_cache=bool(payload.get("empty_cache", False))
+                )
                 continue
             if op == "flashinfer_start":
                 _skip_finally_sync = True
