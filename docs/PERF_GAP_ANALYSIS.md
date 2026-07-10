@@ -13550,6 +13550,19 @@ decode-many tokens to `722`, and lowered the internal phase snapshot to
 Treat cap `1` and cap `2` as opt-in tail-latency diagnostics, not default
 promotions.
 
+The sampled-medium tree max-active cap is back to `32` on current evidence. A
+same-commit focused default control on `2db2e1d` wrote
+`/tmp/inference-bench-tree-default-2db-results/.../runs/20260710_223655` and
+landed at `60.0 / 37.2 / 88.4ms`, correctness `0.962`, with queue-to-finish
+p50 `83.7ms` and phase total `15.53s`. The matching
+`TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_MAX_ACTIVE=32` probe wrote
+`/tmp/inference-bench-tree-maxactive32-results/.../runs/20260710_223043` and
+landed at `59.2 / 37.7 / 85.5ms`, correctness `0.968`, queue-to-finish p50
+`80.1ms`, and phase total `15.25s`. Prefill/decode counts were essentially
+unchanged (`353/302` batches at 16 rows, `358/307` at 32 rows), so this is a
+small tree scheduling default, not a new prefill implementation. It remains
+scoped to `temperature > 0` and `256 < max_tokens <= 300`.
+
 ## Priority for a focused (non-loop) session
 
 1. Prefill MFU (Issue 1) — biggest TTFT lever, ~2x, affects 3/5 benchmarks.
