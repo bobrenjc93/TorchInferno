@@ -12660,6 +12660,24 @@ one omitted row-index prefill batch with two rows versus 32 indexed batches and
 allocator hygiene and unit coverage for dense low-row reuse; the remaining
 multi_turn gap still needs a real mixed-prefix prefill/queueing lever.
 
+Aligning greedy common-prefix suffix warmup with row-index-free dense prefill is
+a few_shot p99 fix, not a median throughput win. The pushed `9de1244` control
+run
+`/tmp/inference-bench-torchinferno-few-9de1244-results/.../runs/20260710_105028`
+landed at `180.1 / 33.9 / 210.4ms` with p99
+`2108.5 / 68.6 / 2122.8ms`. Its request path omitted row indices for all
+prefill batches, but startup warmup had only populated indexed suffix graphs,
+so live traffic captured cold `rows0` prefill graphs for
+`prefix_graph:b2/b8/b32:s16:p122-122:src1:mixed0` and spent `2.72s` in prefill
+graph capture. The dirty dense-extra-pair warmup run
+`/tmp/inference-bench-torchinferno-few-densewarm-results/.../runs/20260710_110102`
+landed at `181.0 / 35.2 / 211.2ms`, p99
+`447.1 / 267.1 / 484.9ms`, with zero request-path prefill graph captures and
+the hot `b32:s16:p122` path replay-only. Startup readiness grew from `231.0s`
+to `261.2s` and warmup memory reached about `84GB/GPU`, so keep the change
+limited to already-configured greedy-short extra pairs instead of broadening
+the warmup shape set.
+
 ## Priority for a focused (non-loop) session
 
 1. Prefill MFU (Issue 1) — biggest TTFT lever, ~2x, affects 3/5 benchmarks.

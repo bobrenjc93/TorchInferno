@@ -11654,8 +11654,10 @@ def test_openai_greedy_common_prefix_suffix_warmup_captures_target_shapes(monkey
         def __init__(self) -> None:
             self.fp8_calls: list[tuple[bool, int]] = []
             self.prefix_calls: list[tuple[tuple[int, ...], tuple[int, int], bool]] = []
-            self.ragged_calls: list[tuple[tuple[int, int], int, int, tuple[int, ...]]] = []
-            self.token_calls: list[tuple[tuple[int, int], int, int, float]] = []
+            self.ragged_calls: list[
+                tuple[tuple[int, int], int, int, bool, tuple[int, ...]]
+            ] = []
+            self.token_calls: list[tuple[tuple[int, int], int, int, bool, float]] = []
 
         def set_runtime_fp8_prefill(self, enabled: bool, *, min_m: int) -> None:
             self.fp8_calls.append((enabled, min_m))
@@ -11682,12 +11684,13 @@ def test_openai_greedy_common_prefix_suffix_warmup_captures_target_shapes(monkey
             src_prefix_row: torch.Tensor | None = None,
             prefix_copy_len: int | None = None,
         ) -> torch.Tensor:
-            del cache, row_indices, logit_positions, prefix_copy_len
+            del cache, logit_positions, prefix_copy_len
             self.ragged_calls.append(
                 (
                     (input_ids.size(0), input_ids.size(1)),
                     int(context_len or 0),
                     int(src_prefix_row[0].item()) if src_prefix_row is not None else -1,
+                    row_indices is not None,
                     tuple(int(value) for value in seq_lens.tolist()),
                 )
             )
@@ -11706,12 +11709,13 @@ def test_openai_greedy_common_prefix_suffix_warmup_captures_target_shapes(monkey
             temperature: float = 0.0,
             prefix_copy_len: int | None = None,
         ) -> tuple[torch.Tensor, torch.Tensor]:
-            del cache, seq_lens, row_indices, logit_positions, prefix_copy_len
+            del cache, seq_lens, logit_positions, prefix_copy_len
             self.token_calls.append(
                 (
                     (input_ids.size(0), input_ids.size(1)),
                     int(context_len or 0),
                     int(src_prefix_row[0].item()) if src_prefix_row is not None else -1,
+                    row_indices is not None,
                     float(temperature),
                 )
             )
@@ -11760,20 +11764,20 @@ def test_openai_greedy_common_prefix_suffix_warmup_captures_target_shapes(monkey
 
     assert model.fp8_calls == [(True, 2048), (False, 2048)]
     assert model.prefix_calls == [((8,), (1, 5), True)]
-    assert [call[:3] for call in model.ragged_calls] == [
-        ((2, 3), -16, 8),
-        ((4, 3), -16, 8),
-        ((2, 7), -16, 8),
-        ((4, 7), -16, 8),
+    assert [call[:4] for call in model.ragged_calls] == [
+        ((2, 3), -16, 8, True),
+        ((4, 3), -16, 8, True),
+        ((2, 7), -16, 8, True),
+        ((4, 7), -16, 8, True),
     ]
     assert model.token_calls == [
-        ((2, 3), -16, 8, 0.0),
-        ((4, 3), -16, 8, 0.0),
-        ((2, 7), -16, 8, 0.0),
-        ((4, 7), -16, 8, 0.0),
+        ((2, 3), -16, 8, True, 0.0),
+        ((4, 3), -16, 8, True, 0.0),
+        ((2, 7), -16, 8, True, 0.0),
+        ((4, 7), -16, 8, True, 0.0),
     ]
-    assert model.ragged_calls[0][3][0:3] == (5, 5, 0)
-    assert model.ragged_calls[0][3][8] == 5
+    assert model.ragged_calls[0][4][0:3] == (5, 5, 0)
+    assert model.ragged_calls[0][4][8] == 5
     assert cache.reset_count == 3
 
     model.fp8_calls.clear()
@@ -11793,11 +11797,11 @@ def test_openai_greedy_common_prefix_suffix_warmup_captures_target_shapes(monkey
     )
     assert model.fp8_calls == [(True, 256), (False, 2048)]
     assert model.prefix_calls == [((8,), (1, 5), True)]
-    assert [call[:3] for call in model.ragged_calls] == [
-        ((2, 3), 8, 8),
-        ((4, 3), 8, 8),
-        ((2, 7), 12, 8),
-        ((4, 7), 12, 8),
+    assert [call[:4] for call in model.ragged_calls] == [
+        ((2, 3), 8, 8, True),
+        ((4, 3), 8, 8, True),
+        ((2, 7), 12, 8, True),
+        ((4, 7), 12, 8, True),
     ]
     assert model.token_calls == []
 
@@ -11826,17 +11830,23 @@ def test_openai_greedy_common_prefix_suffix_warmup_captures_target_shapes(monkey
         ((8,), (1, 111), True),
         ((8,), (1, 122), True),
     ]
-    assert [call[:3] for call in model.ragged_calls] == [
-        ((2, 16), -64, 8),
-        ((2, 32), -256, 8),
-        ((2, 64), -256, 8),
-        ((2, 16), -256, 8),
+    assert [call[:4] for call in model.ragged_calls] == [
+        ((2, 16), -64, 8, True),
+        ((2, 32), -256, 8, True),
+        ((2, 32), -256, 8, False),
+        ((2, 64), -256, 8, True),
+        ((2, 64), -256, 8, False),
+        ((2, 16), -256, 8, True),
+        ((2, 16), -256, 8, False),
     ]
     assert model.token_calls == [
-        ((2, 16), -64, 8, 0.0),
-        ((2, 32), -256, 8, 0.0),
-        ((2, 64), -256, 8, 0.0),
-        ((2, 16), -256, 8, 0.0),
+        ((2, 16), -64, 8, True, 0.0),
+        ((2, 32), -256, 8, True, 0.0),
+        ((2, 32), -256, 8, False, 0.0),
+        ((2, 64), -256, 8, True, 0.0),
+        ((2, 64), -256, 8, False, 0.0),
+        ((2, 16), -256, 8, True, 0.0),
+        ((2, 16), -256, 8, False, 0.0),
     ]
 
 def test_openai_chunked_prefill_warmup_captures_cache_and_logits_dynamic_contexts(monkeypatch) -> None:

@@ -4313,6 +4313,11 @@ class OpenAICompletionEngine:
             warmup_temperature=warmup_temperature,
             warmup_max_tokens=warmup_max_tokens,
         )
+        extra_pair_set = set(extra_pairs)
+        warm_dense_extra_pairs = env_flag(
+            "TORCHINFERNO_OPENAI_WARMUP_ONLINE_GREEDY_COMMON_PREFIX_DENSE_EXTRA_PAIRS",
+            True,
+        )
         suffixes_by_prefix: dict[int, list[int]] = {}
         for prefix_count in prefix_tokens:
             for suffix_count in suffix_tokens:
@@ -4407,31 +4412,20 @@ class OpenAICompletionEngine:
                             device=self.device,
                         )
                         src_prefix_row = torch.tensor([row], dtype=torch.long, device=self.device)
+                        row_index_modes: tuple[Tensor | None, ...] = (row_indices,)
+                        if (
+                            warm_dense_extra_pairs
+                            and (prefix_count, suffix_count) in extra_pair_set
+                            and batch_size <= row
+                        ):
+                            row_index_modes = (row_indices, None)
                         try:
-                            ragged_prefill_graph(
-                                suffix_ids,
-                                cache,
-                                seq_lens=seq_lens,
-                                row_indices=row_indices,
-                                logit_positions=logit_positions,
-                                context_len=_dynamic_prefix_prefill_context_len(
-                                    prefix_count,
-                                    suffix_count,
-                                    max_seq_len=max_seq_len,
-                                    max_dynamic_suffix=dynamic_max_suffix,
-                                ),
-                                src_prefix_row=src_prefix_row,
-                            )
-                            if (
-                                token_warmup_enabled
-                                and suffix_count in token_suffix_tokens
-                                and batch_size in token_batch_sizes
-                            ):
-                                ragged_token_prefill_graph(
+                            for mode_row_indices in row_index_modes:
+                                ragged_prefill_graph(
                                     suffix_ids,
                                     cache,
                                     seq_lens=seq_lens,
-                                    row_indices=row_indices,
+                                    row_indices=mode_row_indices,
                                     logit_positions=logit_positions,
                                     context_len=_dynamic_prefix_prefill_context_len(
                                         prefix_count,
@@ -4440,8 +4434,27 @@ class OpenAICompletionEngine:
                                         max_dynamic_suffix=dynamic_max_suffix,
                                     ),
                                     src_prefix_row=src_prefix_row,
-                                    temperature=warmup_temperature,
                                 )
+                                if (
+                                    token_warmup_enabled
+                                    and suffix_count in token_suffix_tokens
+                                    and batch_size in token_batch_sizes
+                                ):
+                                    ragged_token_prefill_graph(
+                                        suffix_ids,
+                                        cache,
+                                        seq_lens=seq_lens,
+                                        row_indices=mode_row_indices,
+                                        logit_positions=logit_positions,
+                                        context_len=_dynamic_prefix_prefill_context_len(
+                                            prefix_count,
+                                            suffix_count,
+                                            max_seq_len=max_seq_len,
+                                            max_dynamic_suffix=dynamic_max_suffix,
+                                        ),
+                                        src_prefix_row=src_prefix_row,
+                                        temperature=warmup_temperature,
+                                    )
                         except Exception as exc:
                             import sys as _gpsys
                             print(
