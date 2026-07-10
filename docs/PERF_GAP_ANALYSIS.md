@@ -12327,6 +12327,16 @@ both workloads, and multi_turn only one miss. The new unit coverage directly
 exercises the low-memory trim-first path, prefill-only fallback clear, decode
 graph preservation, and the TP cleanup command bits.
 
+A focused long_output validation on `6979820` wrote
+`/tmp/inference-bench-torchinferno-cleanup-prefill-only-results/.../runs/20260710_062209`.
+It landed at `226.2 / 20.6 / 1078.9ms`, p99 `1514.7 / 36.8 /
+1864.9ms`, `1000/1000` correct. Queue telemetry showed no cleanup on the
+normal path, `16` live ragged decode graphs (`symm128` buckets), `728` decode
+graph replays, `16` misses limited to static decode warmup shapes, and zero
+request-path graph captures. This matches the intended post-cleanup invariant:
+long_output should keep warmed decode graphs unless the last-resort full graph
+clear is actually required.
+
 ## Priority for a focused (non-loop) session
 
 1. Prefill MFU (Issue 1) — biggest TTFT lever, ~2x, affects 3/5 benchmarks.
