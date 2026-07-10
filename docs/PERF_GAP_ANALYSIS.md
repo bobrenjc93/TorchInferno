@@ -13519,6 +13519,24 @@ row seq-len portion falling `38.9ms -> 14.3ms`, and prefill wall fell
 mixed-prefix prefill path, but the remaining row gap is still dominated by
 fragmented padded `b32:s32:mixed1` prefill and queue formation.
 
+A current-head full-suite validation after forwarding the TP online close sync
+bit wrote
+`/tmp/inference-bench-close-sync-results/.../runs/20260710_220324` and completed
+all five TorchInferno rows without reproducing the public `20260710_210746`
+rank-0 NCCL watchdog crash. Metrics were `170.1 / 34.6 / 198.9ms` for
+few_shot, `35.3 / 0.0 / 35.7ms` for self_consistency,
+`229.7 / 37.2 / 263.5ms` for multi_turn, `77.4 / 45.8 / 107.3ms` for
+tree_of_thought, and `227.3 / 21.6 / 1027.1ms` for long_output. The useful
+long_output queue profile arrived as a completed `online_batcher_quiescent`
+record rather than a final `online_batcher` record because the benchmark
+terminated the server after receiving all responses. That row had max-active
+`64`, `60` prefill batches, `139` decode-many calls, `604` internal
+decode-many steps, `31,957` model tokens, `30,369` emitted tokens, and `1,588`
+skipped tokens; `decode_many:b64/64:g1-16` alone accounted for `11,584` model
+tokens. Completed quiescent rows are now marked as complete profile snapshots so
+this final-shape detail is not missed by profile readers when the server is
+stopped immediately after the last response.
+
 ## Priority for a focused (non-loop) session
 
 1. Prefill MFU (Issue 1) — biggest TTFT lever, ~2x, affects 3/5 benchmarks.

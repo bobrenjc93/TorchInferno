@@ -6219,6 +6219,8 @@ class OpenAICompletionEngine:
             else:
                 extra_fields["profile_snapshots"] = profile_snapshots
                 if event == "online_batcher_quiescent" and all_submitted_finished:
+                    extra_fields["profile_complete_snapshot"] = True
+                    extra_fields["profile_include_shape_details"] = True
                     extra_fields.setdefault(
                         "phase_total_ms",
                         round((time.perf_counter() - profile_start_s) * 1000.0, 3),

@@ -17623,6 +17623,7 @@ def test_openai_tensor_parallel_online_batcher_profile_snapshots(
     quiescent_record = records[-2]
     final_record = records[-1]
     assert quiescent_record["profile_snapshots"] == expected_snapshots
+    assert quiescent_record["profile_complete_snapshot"] is True
     assert quiescent_record["profile_waiting_for_next_request"] is True
     assert quiescent_record["profile_pending_idle_timeout_ms"] >= 0.0
     assert quiescent_record["online_step_commands"] == 3
