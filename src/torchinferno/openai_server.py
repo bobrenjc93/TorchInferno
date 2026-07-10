@@ -6806,6 +6806,7 @@ class OpenAICompletionEngine:
             or env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_PROFILE_PROGRESS_SHAPES", False)
         )
         for attr_name, record_name in (
+            ("decode_many_graph_min_steps", "decode_many_graph_min_steps"),
             ("cache_backend", "runtime_cache_backend"),
             ("max_active_requests", "runtime_max_active_requests"),
             ("prefix_cache_capacity", "runtime_prefix_cache_capacity"),
@@ -6817,10 +6818,17 @@ class OpenAICompletionEngine:
                 record[record_name] = value
         for attr_name, record_name in (
             ("decode_many_async_readback", "decode_many_async_readback"),
+            ("decode_many_graph", "decode_many_graph"),
         ):
             value = getattr(runtime_engine, attr_name, None)
             if isinstance(value, bool):
                 record[record_name] = value
+        decode_capture_on_miss = getattr(runtime_engine, "_decode_capture_on_miss", None)
+        if callable(decode_capture_on_miss):
+            try:
+                record["decode_capture_on_miss"] = bool(decode_capture_on_miss())
+            except Exception as exc:
+                warn_optional_failure("openai.queue_profile.decode_capture_on_miss", exc)
         cache = getattr(runtime_engine, "_cache", None)
         if cache is not None:
             cache_max_seq_len, cache_rows = _generation_cache_shape_limits(cache)

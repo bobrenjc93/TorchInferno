@@ -476,6 +476,133 @@ def test_llama3_tensor_parallel_ragged_decode_many_graph_copies_step_rotary() ->
     )
 
 
+def test_llama3_tensor_parallel_ragged_decode_many_graph_accepts_paged_cache(
+    monkeypatch,
+) -> None:
+    model = object.__new__(Llama3TensorParallelForCausalLM)
+    model._last_ragged_decode_many_graph_captured = None
+    model._ragged_decode_many_graph_failed = False
+    cache = types.SimpleNamespace(
+        cache_backend="paged",
+        _block_decode_graph_captures=False,
+        layers=[types.SimpleNamespace(max_seq_len=16)],
+    )
+    output = torch.tensor([[5, 7], [6, 8]], dtype=torch.long)
+    calls: list[dict[str, object]] = []
+
+    monkeypatch.setattr(
+        tensor_parallel_module,
+        "_should_use_ragged_decode_token_graph",
+        lambda *args, **kwargs: True,
+    )
+
+    def run_many(
+        input_ids: torch.Tensor,
+        run_cache: object,
+        *,
+        seq_lens: torch.Tensor,
+        row_indices: torch.Tensor | None,
+        steps: int,
+        capture_on_miss: bool,
+    ) -> torch.Tensor:
+        calls.append(
+            {
+                "input_ids": input_ids.clone(),
+                "cache": run_cache,
+                "seq_lens": seq_lens.clone(),
+                "row_indices": None if row_indices is None else row_indices.clone(),
+                "steps": steps,
+                "capture_on_miss": capture_on_miss,
+            }
+        )
+        return output
+
+    monkeypatch.setattr(model, "_run_ragged_decode_many_graph", run_many)
+
+    input_ids = torch.tensor([[1], [2]], dtype=torch.long)
+    seq_lens = torch.tensor([3, 7], dtype=torch.long)
+    result = model.try_decode_ragged_token_graph_many(
+        input_ids,
+        cache,
+        seq_lens=seq_lens,
+        row_indices=None,
+        steps=2,
+        temperature=0.0,
+        capture_on_miss=False,
+    )
+
+    assert result is output
+    assert len(calls) == 1
+    assert calls[0]["cache"] is cache
+    assert calls[0]["steps"] == 2
+    assert calls[0]["capture_on_miss"] is False
+
+
+def test_llama3_tensor_parallel_paged_decode_many_graph_state_spans_steps() -> None:
+    layers = [
+        tensor_parallel_module.PagedLlama3TensorParallelLayerKVCache(
+            batch_size=2,
+            max_seq_len=8,
+            local_key_value_heads=1,
+            head_dim=1,
+            page_size=2,
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+        )
+        for _ in range(2)
+    ]
+    cache = tensor_parallel_module.Llama3TensorParallelCache(layers, cache_backend="paged")
+    cache_positions = torch.tensor([1, 3], dtype=torch.long)
+
+    page_tables, seq_lens = tensor_parallel_module._prepare_paged_ragged_decode_graph_state(
+        cache,
+        batch=2,
+        cache_positions=cache_positions,
+        row_indices=None,
+        device=torch.device("cpu"),
+        cache_token_bucket=8,
+        steps=3,
+    )
+
+    assert len(page_tables) == 2
+    assert len(seq_lens) == 2
+    assert seq_lens[0] is seq_lens[1]
+    assert seq_lens[0].tolist() == [2, 4]
+    assert all(table.shape == (2, 4) for table in page_tables)
+    for layer in layers:
+        assert layer._torchinferno_paged_decode_seq_lens is seq_lens[0]
+        assert len(layer.pages.sequence(layer.request_ids[0]).page_ids) >= 2
+        assert len(layer.pages.sequence(layer.request_ids[1]).page_ids) >= 3
+
+    tensor_parallel_module._advance_paged_ragged_decode_cache_lengths(
+        cache,
+        batch=2,
+        cache_positions=cache_positions,
+        row_indices=None,
+        steps=3,
+    )
+
+    for layer in layers:
+        assert layer.seq_len_for_row(0) == 4
+        assert layer.seq_len_for_row(1) == 6
+
+    reused = seq_lens[0]
+    _page_tables, new_seq_lens = tensor_parallel_module._prepare_paged_ragged_decode_graph_state(
+        cache,
+        batch=2,
+        cache_positions=torch.tensor([2, 4], dtype=torch.long),
+        row_indices=None,
+        device=torch.device("cpu"),
+        cache_token_bucket=8,
+        steps=2,
+        seq_lens_buffers=seq_lens,
+    )
+
+    assert new_seq_lens[0] is reused
+    assert new_seq_lens[1] is reused
+    assert reused.tolist() == [3, 5]
+
+
 def test_llama3_tensor_parallel_ragged_decode_many_static_uses_step_rotary(
     monkeypatch,
 ) -> None:
@@ -495,12 +622,14 @@ def test_llama3_tensor_parallel_ragged_decode_many_static_uses_step_rotary(
     model.rotary_cos_cache = torch.full((20, 4), -1.0)
     model.rotary_sin_cache = torch.full((20, 4), -2.0)
     output_tokens = _OutputTokens()
+    step_lengths = torch.empty((2,), dtype=torch.long)
     captured = types.SimpleNamespace(
         static_input_ids=torch.tensor([[1], [2]], dtype=torch.long),
         static_cache_positions=torch.tensor([3, 11], dtype=torch.long),
         static_row_indices=None,
         static_rotary_cos=torch.arange(16, dtype=torch.float32).view(2, 2, 4),
         static_rotary_sin=torch.arange(16, dtype=torch.float32).view(2, 2, 4) + 100,
+        static_paged_decode_seq_lens=(step_lengths,),
         output_tokens=output_tokens,
         cache=object(),
         cache_token_bucket=20,
@@ -508,6 +637,7 @@ def test_llama3_tensor_parallel_ragged_decode_many_static_uses_step_rotary(
         rotary_in_graph=False,
     )
     calls: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = []
+    length_snapshots: list[torch.Tensor] = []
 
     def forward_decode_ragged_static(
         input_ids: torch.Tensor,
@@ -519,6 +649,7 @@ def test_llama3_tensor_parallel_ragged_decode_many_static_uses_step_rotary(
     ) -> torch.Tensor:
         del cache, row_indices, cache_token_bucket
         calls.append((input_ids.clone(), cache_positions.clone(), rotary[0].clone(), rotary[1].clone()))
+        length_snapshots.append(step_lengths.clone())
         return torch.zeros((2, 1, 4), dtype=torch.float32)
 
     def sample_next_token(logits: torch.Tensor, temperature: float) -> torch.Tensor:
@@ -537,6 +668,7 @@ def test_llama3_tensor_parallel_ragged_decode_many_static_uses_step_rotary(
     assert calls[1][0].tolist() == [[11], [21]]
     assert calls[0][1].tolist() == [3, 11]
     assert calls[1][1].tolist() == [4, 12]
+    assert [lengths.tolist() for lengths in length_snapshots] == [[4, 12], [5, 13]]
     assert torch.equal(calls[0][2], captured.static_rotary_cos[0])
     assert torch.equal(calls[0][3], captured.static_rotary_sin[0])
     assert torch.equal(calls[1][2], captured.static_rotary_cos[1])

@@ -15349,8 +15349,13 @@ def test_openai_queue_profile_records_runtime_engine_stats(
     class RuntimeEngine:
         stats = Stats()
         model = Model()
+        decode_many_graph = True
+        decode_many_graph_min_steps = 3
         max_active_requests = 96
         prefix_cache_capacity = 128
+
+        def _decode_capture_on_miss(self) -> bool:
+            return False
 
     engine._record_runtime_engine_queue_profile(
         "online_batcher",
@@ -15404,6 +15409,9 @@ def test_openai_queue_profile_records_runtime_engine_stats(
             "runtime_decode_many_shape_skipped_tokens": {"decode_many:b8/8": 4},
             "runtime_decode_many_shape_stop_finishes": {"decode_many:b8/8": 3},
             "runtime_decode_many_shape_limit_finishes": {"decode_many:b8/8": 2},
+            "decode_capture_on_miss": False,
+            "decode_many_graph": True,
+            "decode_many_graph_min_steps": 3,
             "runtime_decode_many_step_window_counts": {"decode_many:b8/8:g1-16": 3},
             "runtime_decode_many_step_window_model_tokens": {
                 "decode_many:b8/8:g1-16": 19,

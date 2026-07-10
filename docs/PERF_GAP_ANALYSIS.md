@@ -1,5 +1,34 @@
 # TorchInferno vs vLLM/sglang — Performance Gap Analysis (Llama-3.1-70B, 8xH100)
 
+## Current 20260710 decode-many graph capture-gate recheck
+
+The current-head long_output recheck keeps multi-step decode-many graphs rejected
+as a default. The first run enabled
+`TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY_GRAPH=1` and row-index support, but
+left tensor-parallel decode capture on the runtime default. It wrote
+`/tmp/inference-bench-torchinferno-long-decodemanygraph-paged-results/.../runs/20260710_073646`,
+landed at `224.9 / 21.8 / 1129.7ms`, and stayed `1000/1000` correct, but the
+queue profile showed `runtime_decode_many_graph_calls=0`: TP online workers keep
+`decode_capture_on_miss=false`, so the graph path cannot capture unseen
+multi-step shapes during normal serving. The run also confirmed the public path
+was still the dense runtime cache (`runtime_cache_backend=dense`,
+`use_paged_engine=false`), not a paged-cache graph validation.
+
+Forcing capture with `TORCHINFERNO_CONTINUOUS_DECODE_CAPTURE=1` validated the
+graph path but rejected it on performance. The run
+`/tmp/inference-bench-torchinferno-long-decodemanygraph-capture-results/.../runs/20260710_074551`
+landed at `229.2 / 23.4 / 1182.7ms` with `1000/1000` correctness and p99 TPOT
+`200.7ms`. Queue telemetry recorded `decode_capture_on_miss=true`,
+`decode_many_graph=true`, `144` decode-many graph calls, `633` graph steps, and
+`39.9K` graph model tokens, but graph/model time rose to `15.8s` versus the
+current graph-off long_output band around `7.6-8.2s` decode-many GPU. Keep
+multi-step decode graphs diagnostic-only; the useful long-output target remains
+the single-step high-active decode replay body and pipeline/readback overlap.
+
+Queue profiles now record `decode_many_graph`, `decode_many_graph_min_steps`,
+and `decode_capture_on_miss` so future runs can distinguish an intentionally
+disabled graph path from a graph path that ran and lost.
+
 ## Current 20260707 decode-many graph rotary check
 
 The multi-step ragged decode graph now pre-copies per-step rotary tables for the
