@@ -1,5 +1,30 @@
 # TorchInferno vs vLLM/sglang — Performance Gap Analysis (Llama-3.1-70B, 8xH100)
 
+## Public 20260710_170747 startup failure and symm-mem warmup fix
+
+The latest public pointer advanced to
+`results/v1/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100/runs/20260710_170747`.
+It measured TorchInferno `00126b8`, vLLM `c227aaa`, and SGLang `7b99900`.
+TorchInferno scored `0/20` because the server never reached readiness: the log
+showed `symmetric-memory allreduce enabled after probe (runtime scope)`, then a
+30-minute NCCL timeout inside `_warmup_online_mixed_prefix_suffix_prefill_graphs`
+while capturing a ragged prefill graph. The call site was incorrectly entering
+`_tensor_parallel_symm_mem_allreduce_scope(..., startup=False)`, so the mixed
+startup warmup opted into runtime symmetric-memory allreduce despite the runtime
+scope guard.
+
+Commit `8bbfa25` changes the mixed-prefix suffix prefill warmup to pass
+`startup=True`, preserving runtime symm-mem for request traffic while keeping it
+out of startup unless explicitly enabled by the startup override. The local
+8xH100 validation wrote
+`/tmp/inference-bench-8bbfa25-startup-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-8bbfa25-startup/runs/20260710_183539`.
+It reached server readiness in `271.3s`, completed tensor-parallel startup
+warmup in `204.9s`, and ran `self_consistency` successfully at
+`119.2 / 0.0 / 119.3ms`, `1000/1000` correct. The warmup log confirms the
+runtime-scope probe remained enabled, common-prefix prefill completed in
+`154.9s`, unified scheduler warmup completed in `201.9s`, and no NCCL timeout
+occurred before health.
+
 ## Public 20260710_140141 current-run refresh and scheduling rejections
 
 The public pointer now includes the current TorchInferno main run:
