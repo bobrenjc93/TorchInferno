@@ -988,7 +988,7 @@ class ContinuousBatchEngine:
         )
         self.decode_many_async_readback = env_flag(
             "TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY_ASYNC_READBACK",
-            True,
+            False,
         )
         self._fi_decode_graph_mode = _fi_decode_graph_mode()
         self._sampled_fi_decode_max_tokens = env_int(

@@ -7102,7 +7102,7 @@ def test_continuous_batch_engine_decode_many_gpu_timers_populate_step_windows() 
     }
 
 
-def test_continuous_batch_engine_decode_many_async_readback_defaults_on(monkeypatch) -> None:
+def test_continuous_batch_engine_decode_many_async_readback_defaults_off(monkeypatch) -> None:
     monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY_ASYNC_READBACK", raising=False)
     engine = ContinuousBatchEngine(
         _RaggedGraphToyModel(vocab_size=128),
@@ -7114,11 +7114,11 @@ def test_continuous_batch_engine_decode_many_async_readback_defaults_on(monkeypa
         enable_decode_many=True,
     )
 
-    assert engine.decode_many_async_readback is True
+    assert engine.decode_many_async_readback is False
     assert engine._decode_many_async_readback_enabled() is False
 
-    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY_ASYNC_READBACK", "0")
-    disabled = ContinuousBatchEngine(
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY_ASYNC_READBACK", "1")
+    enabled = ContinuousBatchEngine(
         _RaggedGraphToyModel(vocab_size=128),
         device=torch.device("cpu"),
         max_active_requests=2,
@@ -7128,7 +7128,8 @@ def test_continuous_batch_engine_decode_many_async_readback_defaults_on(monkeypa
         enable_decode_many=True,
     )
 
-    assert disabled.decode_many_async_readback is False
+    assert enabled.decode_many_async_readback is True
+    assert enabled._decode_many_async_readback_enabled() is False
 
 
 def test_continuous_batch_engine_online_many_can_decode_before_waiting_admission(monkeypatch) -> None:

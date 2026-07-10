@@ -1,5 +1,30 @@
 # TorchInferno vs vLLM/sglang — Performance Gap Analysis (Llama-3.1-70B, 8xH100)
 
+## Current 20260710 decode-many async-readback default-off recheck
+
+Async decode-many readback is default-off again. A paired focused long_output
+A/B on `1df91d1` used the same TorchInferno commit and no build step. The
+default async-readback control wrote
+`/tmp/inference-bench-torchinferno-long-default-1df91d1-results/.../runs/20260710_084547`
+and landed at `240.0 / 21.5 / 1076.3ms`, `1000/1000` correct. Disabling only
+`TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY_ASYNC_READBACK` wrote
+`/tmp/inference-bench-torchinferno-long-noasync-1df91d1-results/.../runs/20260710_083925`
+and improved the paired medians to `229.4 / 21.1 / 1048.8ms`, also
+`1000/1000` correct.
+
+The queue profiles explain why the opt-in path is still not a default. The
+async run reported `decode_many_async_readback=true` but did more decode-many
+work: `137` calls, `650` steps, `34.6K` model tokens, `8.23s` decode-many GPU,
+and `7.59s` decode-many CPU token handling. The no-async run reported
+`decode_many_async_readback=false` with `134` calls, `625` steps, `33.6K`
+model tokens, `7.90s` decode-many GPU, and `7.38s` CPU token handling. The hot
+`decode_many:b64/64:g1-16` window moved from `3334ms` model / `3133ms` CPU in
+the async run to `3128ms` model / `2974ms` CPU in the no-async run. Keep the
+pinned-host readback stream as an explicit diagnostic via
+`TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY_ASYNC_READBACK=1`; the useful
+long-output fix still needs a real decode/readback pipeline or a cheaper
+high-active replay body.
+
 ## Current 20260710 current-head full-suite refresh
 
 A TorchInferno-only full-suite refresh on pushed `5c89f30` wrote
