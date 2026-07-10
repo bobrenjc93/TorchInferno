@@ -7027,6 +7027,68 @@ class Llama3TensorParallelForCausalLM:
             self._ragged_prefill_token_logits_graph_failed = True
             return None
 
+    def try_prefill_ragged_token_graph(
+        self,
+        input_ids: Tensor,
+        cache: Llama3TensorParallelCache,
+        *,
+        seq_lens: Tensor,
+        row_indices: Tensor | None = None,
+        logit_positions: Tensor,
+        context_len: int | None = None,
+        src_prefix_row: Tensor | None = None,
+        prefix_copy_len: int | None = None,
+        temperature: float = 0.0,
+        capture_on_miss: bool = True,
+    ) -> Tensor | None:
+        if float(temperature) > 0.0:
+            return None
+        if getattr(self, "_ragged_prefill_token_logits_graph_failed", False):
+            return None
+        self._last_ragged_prefill_graph_captured = False
+        src_prefix_rows = int(src_prefix_row.numel()) if src_prefix_row is not None else 0
+        if getattr(self, "_ragged_prefill_mixed_logits_graph_failed", False) and (
+            self._is_mixed_prefix_ragged_prefill_graph(
+                context_len=context_len,
+                src_prefix_rows=src_prefix_rows,
+                prefix_copy_len=prefix_copy_len,
+            )
+        ):
+            return None
+        if getattr(self, "_ragged_prefill_capture_on_miss_failed", False):
+            capture_on_miss = False
+        if self._ragged_prefill_logits_graph_failed or not _should_use_ragged_prefill_logits_graph(
+            input_ids,
+            cache,
+            seq_lens,
+            row_indices,
+            logit_positions,
+        ):
+            return None
+        try:
+            output = self._run_ragged_prefill_logits_graph(
+                input_ids,
+                cache,
+                seq_lens=seq_lens,
+                row_indices=row_indices,
+                logit_positions=logit_positions,
+                context_len=context_len,
+                src_prefix_row=src_prefix_row,
+                prefix_copy_len=prefix_copy_len,
+                capture_on_miss=capture_on_miss,
+                emit_logits=False,
+                emit_tokens=True,
+            )
+            if isinstance(output, tuple):
+                return output[1]
+            return output
+        except Exception as exc:
+            warn_optional_failure("llama3_tensor_parallel.ragged_prefill_token_graph", exc)
+            if _tp_flag("TORCHINFERNO_CUDAGRAPH_PREFILL_DEBUG", False):
+                print(f"rank={self.rank} ragged_prefill_token_graph_failed={exc!r}", flush=True)
+            self._ragged_prefill_token_logits_graph_failed = True
+            return None
+
     def try_prefill_ragged_cache_graph(
         self,
         input_ids: Tensor,
@@ -7095,8 +7157,6 @@ class Llama3TensorParallelForCausalLM:
         emit_logits: bool = True,
         emit_tokens: bool = False,
     ) -> Tensor | tuple[Tensor, Tensor] | None:
-        if emit_tokens and not emit_logits:
-            raise ValueError("ragged prefill token graph requires logits")
         if not cache.layers:
             raise ValueError("ragged prefill requires a non-empty KV cache")
         src_prefix_rows = int(src_prefix_row.numel()) if src_prefix_row is not None else 0
@@ -7242,6 +7302,8 @@ class Llama3TensorParallelForCausalLM:
             return captured.output_logits
         if captured.output_token is None:
             raise RuntimeError("ragged prefill token graph did not produce tokens")
+        if not captured.emit_logits:
+            return captured.output_token
         return captured.output_logits, captured.output_token
 
     def _maybe_profile_ragged_prefill_graph_replay_once(
@@ -7323,8 +7385,6 @@ class Llama3TensorParallelForCausalLM:
         rotary_in_graph: bool = False,
         write_positions_in_graph: bool = False,
     ) -> _StaticRaggedPrefillLogitsGraphCall:
-        if emit_tokens and not emit_logits:
-            raise ValueError("ragged prefill token graph requires logits")
         batch, suffix = input_ids.shape
         rotary_cache_dim = self.rotary_cos_cache.size(1)
         static_row_indices = torch.empty_like(row_indices) if row_indices is not None else None
@@ -7364,7 +7424,7 @@ class Llama3TensorParallelForCausalLM:
         self._copy_ragged_prefill_graph_inputs(
             captured, input_ids, seq_lens, row_indices, logit_positions, src_prefix_row
         )
-        if emit_logits and captured.static_logit_positions is not None:
+        if (emit_logits or emit_tokens) and captured.static_logit_positions is not None:
             write_positions = self._ragged_prefill_graph_write_positions(captured)
             self._maybe_profile_ragged_prefill_once(
                 captured.static_input_ids,
@@ -7393,7 +7453,7 @@ class Llama3TensorParallelForCausalLM:
                 context_len,
                 captured.static_src_prefix_row,
                 prefix_copy_len,
-                emit_logits=emit_logits,
+                emit_logits=emit_logits or emit_tokens,
             )
             if emit_tokens:
                 self._sample_next_token(logits[:, -1, :], 0.0)
@@ -7411,9 +7471,10 @@ class Llama3TensorParallelForCausalLM:
                 context_len,
                 captured.static_src_prefix_row,
                 prefix_copy_len,
-                emit_logits=emit_logits,
+                emit_logits=emit_logits or emit_tokens,
             )
-            captured.output_logits = logits
+            if emit_logits:
+                captured.output_logits = logits
             if emit_tokens:
                 captured.output_token = self._sample_next_token(logits[:, -1, :], 0.0)
         captured.graph.replay()

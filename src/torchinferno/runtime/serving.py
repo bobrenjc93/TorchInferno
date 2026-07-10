@@ -936,6 +936,10 @@ class ContinuousBatchEngine:
         self._prefill_ragged_token_logits_graph = (
             prefill_token_logits_graph if callable(prefill_token_logits_graph) else None
         )
+        prefill_token_graph = getattr(model, "try_prefill_ragged_token_graph", None)
+        self._prefill_ragged_token_graph = (
+            prefill_token_graph if callable(prefill_token_graph) else None
+        )
         # When pinning is on, the engine caches ONLY shared common prefixes and
         # pins them against eviction, skipping per-request full-prompt stores
         # that would otherwise starve the prefix-row pool and shadow the shared
@@ -3469,6 +3473,12 @@ class ContinuousBatchEngine:
             or env_flag(warmup_env, warmup_default_enabled)
         )
 
+    def _prefix_prefill_token_only_graph_enabled(self) -> bool:
+        return env_flag(
+            "TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_TOKEN_ONLY_GRAPH",
+            False,
+        )
+
     def _prefix_prefill_split_on_capture_skip_batch(self, batch_bucket: int) -> int:
         env_name = "TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SPLIT_ON_CAPTURE_SKIP_BATCH"
         if env_name in os.environ:
@@ -3741,6 +3751,23 @@ class ContinuousBatchEngine:
                     model_rows=int(input_ids.size(0)),
                 )
                 if not mixed_prefixes or self._mixed_prefix_prefill_graph_enabled():
+                    if (
+                        self._prefix_prefill_token_only_graph_enabled()
+                        and self._prefix_prefill_group_can_omit_logits(group)
+                    ):
+                        next_token_tensor = self._try_ragged_prefill_greedy_tokens(
+                            input_ids,
+                            seq_lens,
+                            model_row_indices,
+                            logit_positions,
+                            [request for _index, request, _prefix_hit_tokens, _reusable in group],
+                            context_len,
+                            src_prefix_row,
+                            prefix_copy_len,
+                            capture_on_miss=self._prefix_prefill_token_graph_capture_on_miss(),
+                            profile_shape_key=shape_key,
+                            packed_prefill_pattern_key=packed_prefill_pattern_key,
+                        )
                     token_graph_output = (
                         self._try_ragged_prefill_logits_with_greedy_tokens(
                             input_ids,
@@ -3755,12 +3782,12 @@ class ContinuousBatchEngine:
                             profile_shape_key=shape_key,
                             packed_prefill_pattern_key=packed_prefill_pattern_key,
                         )
-                        if self._prefix_prefill_token_graph_enabled()
+                        if next_token_tensor is None and self._prefix_prefill_token_graph_enabled()
                         else None
                     )
                     if token_graph_output is not None:
                         logits, next_token_tensor = token_graph_output
-                    else:
+                    elif next_token_tensor is None:
                         logits = self._try_ragged_prefill_logits(
                             input_ids,
                             seq_lens,
@@ -3773,7 +3800,7 @@ class ContinuousBatchEngine:
                             profile_shape_key=shape_key,
                             packed_prefill_pattern_key=packed_prefill_pattern_key,
                         )
-            if logits is None:
+            if logits is None and next_token_tensor is None:
                 logits = self._ragged_prefill_logits_eager(
                     input_ids,
                     seq_lens,
@@ -3783,7 +3810,7 @@ class ContinuousBatchEngine:
                     src_prefix_row,
                     prefix_copy_len,
                 )
-            if self.profile_timings and logits is not None:
+            if self.profile_timings and (logits is not None or next_token_tensor is not None):
                 # force the prefill graph/forward to complete for honest timing
                 torch.cuda.synchronize(self.device) if self.device.type == "cuda" else None
                 self._flush_prefill_graph_gpu_timers()
@@ -3800,7 +3827,7 @@ class ContinuousBatchEngine:
             for pad_row in pad_prefix_rows:
                 self._release_prefix_row(pad_row)
             pad_prefix_rows = []
-            if logits is None:
+            if logits is None and next_token_tensor is None:
                 for row in rows:
                     self._release_active_row(row)
                 return None
@@ -3889,7 +3916,7 @@ class ContinuousBatchEngine:
                         request.request_id,
                         request.prompt,
                         row,
-                        logits[row_index : row_index + 1],
+                        None if logits is None else logits[row_index : row_index + 1],
                         allow_pinned=self._allow_pinned_full_prompt_store(request),
                     )
                 state_store_ms = (time.perf_counter() - state_store_start_s) * 1000.0
@@ -3961,7 +3988,7 @@ class ContinuousBatchEngine:
                         request.request_id,
                         request.prompt,
                         row,
-                        logits[row_index : row_index + 1],
+                        None if logits is None else logits[row_index : row_index + 1],
                         allow_pinned=self._allow_pinned_full_prompt_store(request),
                     )
                     next_token = int(next_tokens[row_index])
@@ -4428,6 +4455,77 @@ class ContinuousBatchEngine:
             profile_shape_key=profile_shape_key,
         )
         return logits
+
+    def _try_ragged_prefill_greedy_tokens(
+        self,
+        input_ids: Tensor,
+        seq_lens: Tensor,
+        row_indices: Tensor,
+        logit_positions: Tensor,
+        requests: Sequence[ServingRequest],
+        context_len: int | None = None,
+        src_prefix_row: Tensor | None = None,
+        prefix_copy_len: int | None = None,
+        *,
+        capture_on_miss: bool = True,
+        profile_shape_key: str | None = None,
+        packed_prefill_pattern_key: str | None = None,
+    ) -> Tensor | None:
+        if not self._cache_supports_tensor_ragged_prefill():
+            return None
+        graph = self._prefill_ragged_token_graph
+        if graph is None:
+            return None
+        packed_eager_enabled = env_flag(
+            "TORCHINFERNO_CONTINUOUS_PACKED_RAGGED_PREFILL_EAGER",
+            False,
+        )
+        if not packed_eager_enabled:
+            packed_eager_enabled = _packed_prefill_eager_pattern_matches(
+                profile_shape_key=profile_shape_key,
+                packed_prefill_pattern_key=packed_prefill_pattern_key,
+            )
+        if packed_eager_enabled and bool(torch.any(logit_positions + 1 < input_ids.size(1))):
+            return None
+        shared_temperature = self._shared_temperature_for_requests(
+            requests,
+            limit=int(input_ids.size(0)),
+        )
+        if shared_temperature is None or shared_temperature > 0.0:
+            return None
+        graph_start_s = time.perf_counter() if self.profile_timings else 0.0
+        graph_shape_key = self._ragged_prefill_graph_shape_key(
+            input_ids,
+            row_indices=row_indices,
+            context_len=context_len,
+            src_prefix_row=src_prefix_row,
+        )
+        if not capture_on_miss and graph_shape_key in self._prefill_token_graph_miss_keys:
+            return None
+        gpu_events = self._start_prefill_graph_gpu_timer() if capture_on_miss else None
+        tokens = graph(
+            input_ids,
+            self._require_cache(),
+            seq_lens=seq_lens,
+            row_indices=row_indices,
+            logit_positions=logit_positions,
+            context_len=context_len,
+            src_prefix_row=src_prefix_row,
+            prefix_copy_len=prefix_copy_len,
+            temperature=shared_temperature,
+            capture_on_miss=capture_on_miss,
+        )
+        if tokens is None:
+            if not capture_on_miss:
+                self._prefill_token_graph_miss_keys.add(graph_shape_key)
+            return None
+        self._record_ragged_prefill_graph_hit(
+            graph_start_s=graph_start_s,
+            graph_shape_key=graph_shape_key,
+            gpu_events=gpu_events,
+            profile_shape_key=profile_shape_key,
+        )
+        return tokens
 
     def _try_ragged_prefill_logits_with_greedy_tokens(
         self,
@@ -7041,7 +7139,7 @@ class ContinuousBatchEngine:
         request_id: str,
         tokens: tuple[int, ...],
         source_row: int,
-        logits: Tensor,
+        logits: Tensor | None,
         *,
         allow_pinned: bool = False,
     ) -> None:
@@ -7083,6 +7181,36 @@ class ContinuousBatchEngine:
             self.stats.full_prompt_store_stored_requests += 1
         else:
             self._record_full_prompt_store_skip("prefix_row_unavailable_or_store_disabled", tokens)
+
+    def _full_prompt_store_needs_logits(self, request: ServingRequest) -> bool:
+        if not self.store_full_prompt_prefixes:
+            return False
+        allow_pinned = self._allow_pinned_full_prompt_store(request)
+        if self.pin_shared_prefix and not allow_pinned:
+            return False
+        if self._delayed_pinned_full_prompt_store_allowed(allow_pinned=allow_pinned):
+            return False
+        store_logits = True
+        if allow_pinned:
+            store_logits = env_flag(
+                "TORCHINFERNO_CONTINUOUS_PINNED_FULL_PROMPT_STORE_LOGITS",
+                False,
+            )
+        if "TORCHINFERNO_CONTINUOUS_PREFIX_CACHE_STORE_LOGITS" in os.environ:
+            store_logits = env_flag(
+                "TORCHINFERNO_CONTINUOUS_PREFIX_CACHE_STORE_LOGITS",
+                store_logits,
+            )
+        return bool(store_logits)
+
+    def _prefix_prefill_group_can_omit_logits(
+        self,
+        group: Sequence[tuple[int, ServingRequest, int, _ReusablePrefix]],
+    ) -> bool:
+        return all(
+            not self._full_prompt_store_needs_logits(request)
+            for _original_index, request, _prefix_hit_tokens, _reusable in group
+        )
 
     def _record_full_prompt_store_skip(self, reason: str, tokens: tuple[int, ...]) -> None:
         self.stats.full_prompt_store_skipped_requests += 1

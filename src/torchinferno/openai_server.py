@@ -4254,10 +4254,19 @@ class OpenAICompletionEngine:
         ragged_prefill_graph = getattr(self.model, "try_prefill_ragged_logits_graph", None)
         if ragged_prefill_graph is None:
             return
+        token_suffix_warmup_enabled = (
+            warmup_temperature <= 0.0
+            and _online_greedy_common_prefix_token_suffix_prefill_warmup_enabled()
+        )
         ragged_token_prefill_graph = (
             getattr(self.model, "try_prefill_ragged_token_logits_graph", None)
-            if warmup_temperature <= 0.0
-            and _online_greedy_common_prefix_token_suffix_prefill_warmup_enabled()
+            if token_suffix_warmup_enabled
+            else None
+        )
+        ragged_token_only_prefill_graph = (
+            getattr(self.model, "try_prefill_ragged_token_graph", None)
+            if token_suffix_warmup_enabled
+            and env_flag("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_TOKEN_ONLY_GRAPH", False)
             else None
         )
         prefix_graph = getattr(self.model, "try_prefill_logits_graph", None)
@@ -4287,7 +4296,7 @@ class OpenAICompletionEngine:
             else _online_greedy_common_prefix_suffix_prefill_warmup_max_tokens()
         )
         token_warmup_enabled = bool(
-            callable(ragged_token_prefill_graph)
+            (callable(ragged_token_prefill_graph) or callable(ragged_token_only_prefill_graph))
             and token_warmup_max_tokens
             in _online_greedy_common_prefix_token_suffix_prefill_warmup_max_token_values()
         )
@@ -4460,21 +4469,34 @@ class OpenAICompletionEngine:
                                     and suffix_count in token_suffix_tokens
                                     and batch_size in token_batch_sizes
                                 ):
-                                    ragged_token_prefill_graph(
-                                        suffix_ids,
-                                        cache,
-                                        seq_lens=seq_lens,
-                                        row_indices=mode_row_indices,
-                                        logit_positions=logit_positions,
-                                        context_len=_dynamic_prefix_prefill_context_len(
-                                            prefix_count,
-                                            suffix_count,
-                                            max_seq_len=max_seq_len,
-                                            max_dynamic_suffix=dynamic_max_suffix,
-                                        ),
-                                        src_prefix_row=src_prefix_row,
-                                        temperature=warmup_temperature,
+                                    token_context_len = _dynamic_prefix_prefill_context_len(
+                                        prefix_count,
+                                        suffix_count,
+                                        max_seq_len=max_seq_len,
+                                        max_dynamic_suffix=dynamic_max_suffix,
                                     )
+                                    if callable(ragged_token_prefill_graph):
+                                        ragged_token_prefill_graph(
+                                            suffix_ids,
+                                            cache,
+                                            seq_lens=seq_lens,
+                                            row_indices=mode_row_indices,
+                                            logit_positions=logit_positions,
+                                            context_len=token_context_len,
+                                            src_prefix_row=src_prefix_row,
+                                            temperature=warmup_temperature,
+                                        )
+                                    if callable(ragged_token_only_prefill_graph):
+                                        ragged_token_only_prefill_graph(
+                                            suffix_ids,
+                                            cache,
+                                            seq_lens=seq_lens,
+                                            row_indices=mode_row_indices,
+                                            logit_positions=logit_positions,
+                                            context_len=token_context_len,
+                                            src_prefix_row=src_prefix_row,
+                                            temperature=warmup_temperature,
+                                        )
                         except Exception as exc:
                             import sys as _gpsys
                             print(

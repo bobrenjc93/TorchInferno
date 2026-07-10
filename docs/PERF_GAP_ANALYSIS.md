@@ -12708,6 +12708,38 @@ graph replay time rose to `305.5ms` (`b32:s16` accounted for `304.4ms`) and
 queue-to-first rose to `191.3ms`. The earlier broad win was not a stable
 mechanism-level improvement.
 
+Greedy token-only common-prefix prefill is also rejected as a default for the
+current public few_shot row. The no-logits graph path is useful as a diagnostic:
+when full-prompt logits are skipped under pinned shared-prefix caching, it can
+return only greedy next tokens and avoid the runtime sample-select body. It did
+not close the score gap in focused local probes against public
+`20260710_140141` (`174.0 / 34.5 / 203.4ms`).
+
+The broad token-only suffix warmup probe
+`/tmp/inference-bench-few-tokenonly-results/.../runs/20260710_150115` landed at
+`184.7 / 34.0 / 216.1ms`, `977/1000` correct. It lowered few_shot prefill
+forward from `1.91s` to `1.75s`, but added `15` token-only resident prefill
+graph entries, pushed startup memory to roughly `95GB/GPU`, raised prefill graph
+evictions from `4` to `25`, and inflated decode graph replay from `30.5ms` to
+`248.5ms`.
+
+The request-capture probe
+`/tmp/inference-bench-few-tokenonly-capture-results/.../runs/20260710_150852`
+disabled broad token suffix warmup and enabled token-only capture-on-miss. It
+kept decode replay healthy and cut prefill sample-select from `54.9ms` to
+`2.8ms`, but paid `3` request-path prefill captures (`2.50s`) and landed at
+`178.2 / 33.5 / 209.0ms`, with p99 TTFT/E2E above `2s`.
+
+The targeted warmup probe
+`/tmp/inference-bench-few-tokenonly-targeted-results/.../runs/20260710_151454`
+warmed suffix `16` for observed small/big buckets and avoided request-path
+captures, landing at `174.1 / 34.6 / 204.2ms`, `977/1000` correct. Median
+queue-to-first was effectively flat (`165.25ms` vs `165.42ms` control), p99
+TTFT/E2E worsened to `1420/1454ms`, and overall phase time rose by `1.31s`.
+Keep token-only prefill default-off; the remaining few_shot gap is still the
+hot cached-prefix `b32:s16` prefill body, not logits materialization or greedy
+sampling.
+
 Post-fix focused local validation on `a4d92f0` plus the trim-first cleanup
 patch wrote
 `/tmp/inference-bench-torchinferno-cleanup-trim-results/.../runs/20260710_060847`.

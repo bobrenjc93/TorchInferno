@@ -971,6 +971,45 @@ class _TokenLogitsGraphToyModel(_SelectedLogitsToyModel):
         return logits, torch.argmax(logits[:, -1, :], dim=-1)
 
 
+class _TokenOnlyGraphToyModel(_SelectedLogitsToyModel):
+    def __init__(self, vocab_size: int = 64) -> None:
+        super().__init__(vocab_size)
+        self.prefill_token_graph_calls = 0
+        self.prefill_token_capture_flags: list[bool] = []
+
+    def try_prefill_ragged_token_graph(
+        self,
+        input_ids,
+        cache,
+        *,
+        seq_lens,
+        row_indices,
+        logit_positions,
+        context_len=None,
+        src_prefix_row=None,
+        prefix_copy_len=None,
+        temperature=0.0,
+        capture_on_miss=True,
+    ):
+        self.prefill_token_graph_calls += 1
+        self.prefill_token_capture_flags.append(bool(capture_on_miss))
+        if temperature > 0.0:
+            return None
+        logits = super().try_prefill_ragged_logits_graph(
+            input_ids,
+            cache,
+            seq_lens=seq_lens,
+            row_indices=row_indices,
+            logit_positions=logit_positions,
+            context_len=context_len,
+            src_prefix_row=src_prefix_row,
+            prefix_copy_len=prefix_copy_len,
+            capture_on_miss=capture_on_miss,
+        )
+        self._last_ragged_prefill_graph_captured = bool(capture_on_miss)
+        return torch.argmax(logits[:, -1, :], dim=-1)
+
+
 class _PromptLookupToyModel(_RaggedGraphToyModel):
     def __init__(self, vocab_size: int = 128) -> None:
         super().__init__(vocab_size)
@@ -4033,6 +4072,67 @@ def test_continuous_batch_engine_skips_disabled_prefix_token_graph(monkeypatch) 
     assert model.sample_next_token_calls == 1
     assert engine.stats.prefill_graph_hits == 2
     assert engine.stats.prefill_graph_misses == 0
+
+
+def test_continuous_batch_engine_uses_prefix_token_only_graph_when_logits_skipped(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_TOKEN_ONLY_GRAPH", "1")
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_TOKEN_GRAPH_CAPTURE_ON_MISS", "1")
+    shared = tuple(range(16))
+    model = _TokenOnlyGraphToyModel()
+    engine = ContinuousBatchEngine(
+        model,
+        device=torch.device("cpu"),
+        max_active_requests=4,
+        prefix_cache_capacity=4,
+        graph_prefill=True,
+        pin_shared_prefix=True,
+        profile_timings=True,
+    )
+    requests = [
+        ServingRequest("a", (*shared, 21), 1, arrival_step=0),
+        ServingRequest("b", (*shared, 22, 23), 1, arrival_step=0),
+        ServingRequest("c", (*shared, 24), 1, arrival_step=0),
+    ]
+
+    results = engine.run(requests)
+
+    assert [result.tokens[-1] for result in results] == [22, 24, 25]
+    assert model.prefill_token_graph_calls == 1
+    assert model.prefill_token_capture_flags == [True]
+    assert engine.stats.prefill_graph_hits == 2
+    assert engine.stats.full_prompt_store_skip_reason_counts == {"pinned_without_allowance": 3}
+
+
+def test_continuous_batch_engine_skips_prefix_token_only_graph_when_logits_needed(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_TOKEN_ONLY_GRAPH", "1")
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_TOKEN_GRAPH_CAPTURE_ON_MISS", "1")
+    shared = tuple(range(16))
+    model = _TokenOnlyGraphToyModel()
+    engine = ContinuousBatchEngine(
+        model,
+        device=torch.device("cpu"),
+        max_active_requests=4,
+        prefix_cache_capacity=4,
+        graph_prefill=True,
+        pin_shared_prefix=False,
+    )
+    requests = [
+        ServingRequest("a", (*shared, 21), 1, arrival_step=0),
+        ServingRequest("b", (*shared, 22, 23), 1, arrival_step=0),
+        ServingRequest("c", (*shared, 24), 1, arrival_step=0),
+    ]
+
+    results = engine.run(requests)
+
+    assert [result.tokens[-1] for result in results] == [22, 24, 25]
+    assert model.prefill_token_graph_calls == 0
+    for request in requests:
+        reusable = engine.reusable_prefixes[request.request_id]
+        assert reusable.logits is not None
 
 
 def test_continuous_batch_engine_respects_common_prefix_ragged_suffix_threshold(
