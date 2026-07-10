@@ -41,6 +41,35 @@ these knobs diagnostic-only; the next useful work is a cheaper common-prefix
 prefill body or a decode/readback pipeline improvement, not broader admission
 or full-prompt pinning.
 
+## Local 4f55f28 multi-turn refresh and dense-first warmup rejection
+
+A pushed-head TorchInferno-only `multi_turn` refresh on `4f55f28` wrote
+`/tmp/inference-bench-4f55f28-multi-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-4f55f28-multi/runs/20260710_164532`
+and landed at `228.1 / 37.5 / 257.7ms`, `980/1000` correct. The public pointer
+was still `20260710_140141`, so this is the freshest local TorchInferno
+evidence, not a new public row. The new startup logs showed server readiness in
+`281.2s`: tensor-parallel startup warmup took `215.1s`, including `40.8s`
+online decode graph warmup, `96.8s` greedy common-prefix suffix warmup for
+`max_tokens=128`, `40.2s` for greedy `512`, and `16.7s` for sampled `300`.
+
+The local queue profile slightly improves the public multi_turn TorchInferno
+profile (`q2first_p50=220.0ms` vs public `236.7ms`; prefill wall `3.22s` vs
+public `3.93s`), but still trails vLLM primarily in queue formation and padded
+mixed-prefix prefill. The current run used `32` active rows and `112` prefix
+rows, hit `32/33` prefill graphs, and spent `2.52s/3.22s` in prefill
+forward/wall with `15.3K` suffix padding tokens.
+
+A narrow warmup experiment that also captured the dense row-index variant for
+the first greedy common-prefix suffix pair is rejected. The dirty run wrote
+`/tmp/inference-bench-4f55f28-dense-first-multi-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-4f55f28-dense-first-multi/runs/20260710_165640`
+and eliminated the single runtime prefill miss
+(`prefix_graph:b2:s16:p45-45:src1:mixed0`, `ragged_prefill:b2:s16:rows0:ctx-64:src1`),
+cutting prefill wall from `3.22s` to `2.93s`. It still regressed median
+TTFT/E2E to `234.3 / 263.7ms` by adding another prefill batch and more scheduler
+steps (`127` vs `122`), though p99 improved. Do not promote this dense-first
+warmup; the remaining multi_turn gap needs lower-cost mixed-prefix prefill or a
+queue policy that improves medians without fragmenting the session.
+
 ## Public 20260710_130259 refresh and main fast-forward
 
 The public pointer advanced again to
