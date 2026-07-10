@@ -252,6 +252,22 @@ window was `decode_many:b64/64:g1-16` (`195` steps, `12.5K` model tokens,
 better-overlapped high-active decode body plus lower padded prefill, not more
 shape-specific warmup.
 
+A current `6b592fe` focused A/B also rejects capping greedy-short prefix-prefill
+capture below the long-output `b16/b24` waves. The probe set
+`TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_CAPTURE_GREEDY_SHORT_MAX_BATCH=15` and
+wrote
+`/tmp/inference-bench-long-capture15-results/.../runs/20260710_195358`. It
+removed request-path prefill captures (`runtime_prefill_graph_captures=0`,
+`capture_ms=0`) and stayed correct (`1000/1000`), but fragmented the admitted
+groups and regressed medians to `263.2 / 22.9 / 1178.7ms`. Queue telemetry
+showed `q2first=250.5ms`, `q2submit=94.6ms`, `submit2first=154.8ms`, one
+prefill graph miss, `90` graph hits, and the large work shifted into `15`
+`b16:s32`, `38` `b16:s64`, and `14` `b16:s96` prefix-graph calls. The default
+captures are expensive, but avoiding them by splitting at `15` loses the larger
+prefill waves that amortize the graph body. Keep the short-greedy capture cap at
+the current batch-32 policy until there is a non-fragmenting packed-prefix
+prefill body.
+
 A source audit of the current decode-many loop does not reopen token
 materialization as a score-facing lever. `_step_decode_only_many` intentionally
 launches one-step ragged decode replays without synchronizing each step, copies
