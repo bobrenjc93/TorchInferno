@@ -13563,6 +13563,46 @@ unchanged (`353/302` batches at 16 rows, `358/307` at 32 rows), so this is a
 small tree scheduling default, not a new prefill implementation. It remains
 scoped to `temperature > 0` and `256 < max_tokens <= 300`.
 
+The current pushed `a360de1` full-suite validation wrote
+`/tmp/inference-bench-a360-full-results/.../runs/20260710_224606` and completed
+all TorchInferno rows: few_shot `177.7 / 34.2 / 206.2ms`,
+self_consistency `34.7 / 0.0 / 35.2ms`, multi_turn
+`249.9 / 38.0 / 279.8ms`, tree_of_thought `61.4 / 36.3 / 88.5ms`, and
+long_output `233.6 / 21.7 / 995.6ms`. Public results remained stale at
+`20260710_210746`, where TorchInferno still crashes mid-suite before the close
+sync and completed-quiescent-profile fixes. The local priority shifted back to
+multi_turn because same-host public vLLM is still `76.8 / 36.1 / 104.7ms`.
+
+Raising greedy-large multi_turn max-active from `32` to `48` is rejected. The
+focused probe
+`/tmp/inference-bench-multi-maxactive48-results/.../runs/20260710_225405`
+landed at `615.8 / 144.0 / 743.1ms`, correctness `0.981`. It slightly reduced
+prefill batches (`36 -> 32`) and queue-to-submit (`135.2ms -> 123.1ms`), but
+blew up submit-to-first (`94.8ms -> 471.2ms`) and doubled decode graph misses
+(`46 -> 86`) while cutting decode graph hits (`68 -> 40`). Keep greedy-large
+online max-active at `32`.
+
+Graph capture/miss shape counters now follow the lightweight queue-profile
+contract. Before this change, no-sync public-style profiles could report
+`runtime_decode_graph_misses > 0` with an empty
+`runtime_decode_graph_miss_shape_counts` map because the shape maps were gated
+behind `profile_timings`. The runtime now records prefill/decode graph
+capture/miss shape counts when `TORCHINFERNO_OPENAI_QUEUE_PROFILE_JSONL` is
+enabled, without enabling CUDA-synchronized timing maps. Focused unit coverage
+checks both prefill and decode graph shape maps with `profile_timings=False`.
+
+A focused current-head multi_turn run with the new diagnostic wrote
+`/tmp/inference-bench-multi-shapemap-results/.../runs/20260710_230407` and
+landed at `241.2 / 38.8 / 273.1ms`, correctness `0.981`. The queue profile
+now shows the miss source clearly: `runtime_decode_graph_misses=44` split
+across static single-row decode token/logits shapes at seq lens `57-66`,
+`73-75`, `92-96`, `109`, and `138`; the live decode graph cache only held the
+ragged batch shapes. The remaining multi_turn decode gap is therefore not a
+new ragged batch bucket. It is the static row-view path falling back to eager
+because TP runtime disables capture-on-miss and startup warmup captures static
+graphs on the base cache, while online serving uses cached `for_rows(...)`
+views whose graph keys are tied to the view object.
+
 ## Priority for a focused (non-loop) session
 
 1. Prefill MFU (Issue 1) — biggest TTFT lever, ~2x, affects 3/5 benchmarks.

@@ -4646,7 +4646,7 @@ class ContinuousBatchEngine:
         if captured:
             self.stats.prefill_graph_captures += 1
             self.stats.prefill_graph_capture_ms += elapsed_ms
-            self._record_shape_count(
+            self._record_queue_profile_shape_count(
                 self.stats.prefill_graph_capture_shape_counts,
                 graph_shape_key,
             )
@@ -4656,7 +4656,7 @@ class ContinuousBatchEngine:
                 elapsed_ms,
             )
             if profile_shape_key is not None:
-                self._record_shape_count(
+                self._record_queue_profile_shape_count(
                     self.stats.prefill_shape_graph_capture_counts,
                     profile_shape_key,
                 )
@@ -4675,7 +4675,7 @@ class ContinuousBatchEngine:
             elapsed_ms,
         )
         if profile_shape_key is not None:
-            self._record_shape_count(
+            self._record_queue_profile_shape_count(
                 self.stats.prefill_shape_graph_replay_counts,
                 profile_shape_key,
             )
@@ -4756,7 +4756,7 @@ class ContinuousBatchEngine:
             if captured:
                 self.stats.prefill_graph_captures += 1
                 self.stats.prefill_graph_capture_ms += elapsed_ms
-                self._record_shape_count(
+                self._record_queue_profile_shape_count(
                     self.stats.prefill_graph_capture_shape_counts,
                     graph_shape_key,
                 )
@@ -4766,7 +4766,7 @@ class ContinuousBatchEngine:
                     elapsed_ms,
                 )
                 if profile_shape_key is not None:
-                    self._record_shape_count(
+                    self._record_queue_profile_shape_count(
                         self.stats.prefill_shape_graph_capture_counts,
                         profile_shape_key,
                     )
@@ -4784,7 +4784,7 @@ class ContinuousBatchEngine:
                     elapsed_ms,
                 )
                 if profile_shape_key is not None:
-                    self._record_shape_count(
+                    self._record_queue_profile_shape_count(
                         self.stats.prefill_shape_graph_replay_counts,
                         profile_shape_key,
                     )
@@ -4805,7 +4805,7 @@ class ContinuousBatchEngine:
         profile_shape_key: str | None = None,
     ) -> None:
         self.stats.prefill_graph_misses += 1
-        self._record_shape_count(
+        self._record_queue_profile_shape_count(
             self.stats.prefill_graph_miss_shape_counts,
             self._ragged_prefill_graph_shape_key(
                 input_ids,
@@ -4815,7 +4815,7 @@ class ContinuousBatchEngine:
             ),
         )
         if profile_shape_key is not None:
-            self._record_shape_count(
+            self._record_queue_profile_shape_count(
                 self.stats.prefill_shape_graph_miss_counts,
                 profile_shape_key,
             )
@@ -8635,6 +8635,11 @@ class ContinuousBatchEngine:
             return
         counts[key] = counts.get(key, 0) + 1
 
+    def _record_queue_profile_shape_count(self, counts: dict[str, int], key: str) -> None:
+        if not (self.profile_timings or _queue_profile_counts_enabled()):
+            return
+        counts[key] = counts.get(key, 0) + 1
+
     def _record_shape_total(self, counts: dict[str, int], key: str, amount: int) -> None:
         if not self.profile_timings:
             return
@@ -9337,7 +9342,10 @@ class ContinuousBatchEngine:
         if captured:
             self.stats.decode_graph_captures += 1
             self.stats.decode_graph_capture_ms += elapsed_ms
-            self._record_shape_count(self.stats.decode_graph_capture_shape_counts, shape_key)
+            self._record_queue_profile_shape_count(
+                self.stats.decode_graph_capture_shape_counts,
+                shape_key,
+            )
             if self.profile_timings:
                 self._record_shape_time(
                     self.stats.decode_graph_capture_shape_ms,
@@ -9362,7 +9370,7 @@ class ContinuousBatchEngine:
         graph_kind: str,
     ) -> None:
         self.stats.decode_graph_misses += 1
-        self._record_shape_count(
+        self._record_queue_profile_shape_count(
             self.stats.decode_graph_miss_shape_counts,
             self._ragged_decode_graph_shape_key(input_ids, row_indices, graph_kind=graph_kind),
         )
@@ -9460,7 +9468,7 @@ class ContinuousBatchEngine:
 
     def _record_static_decode_graph_miss(self, input_ids: Tensor, cache: object, *, graph_kind: str) -> None:
         self.stats.decode_graph_misses += 1
-        self._record_shape_count(
+        self._record_queue_profile_shape_count(
             self.stats.decode_graph_miss_shape_counts,
             self._static_decode_graph_shape_key(input_ids, cache, graph_kind=graph_kind),
         )

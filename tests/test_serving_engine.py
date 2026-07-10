@@ -3385,6 +3385,77 @@ def test_continuous_batch_engine_counts_ragged_prefill_captures() -> None:
     assert engine.stats.prefill_shape_graph_replay_ms[shape_key] >= 0.0
 
 
+def test_continuous_batch_engine_records_prefill_graph_shapes_for_queue_profile_without_timings(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_QUEUE_PROFILE_JSONL", "/tmp/queue.jsonl")
+    model = _CaptureReportingSelectedLogitsToyModel([True, False])
+    engine = ContinuousBatchEngine(
+        model,
+        device=torch.device("cpu"),
+        max_active_requests=2,
+        prefix_cache_capacity=0,
+        profile_timings=False,
+    )
+    engine.start_online(max_seq_len=8)
+    input_ids = torch.tensor([[1, 2], [3, 4]], dtype=torch.long)
+    seq_lens = torch.zeros(2, dtype=torch.long)
+    row_indices = torch.tensor([0, 1], dtype=torch.long)
+    logit_positions = torch.tensor([1, 1], dtype=torch.long)
+    shape_key = "prefix_graph:b2:s2:p0-0:src0:mixed0"
+
+    engine._try_ragged_prefill_logits(
+        input_ids,
+        seq_lens,
+        row_indices,
+        logit_positions,
+        profile_shape_key=shape_key,
+    )
+    engine._try_ragged_prefill_logits(
+        input_ids,
+        seq_lens,
+        row_indices,
+        logit_positions,
+        profile_shape_key=shape_key,
+    )
+
+    assert engine.stats.prefill_graph_capture_shape_counts == {
+        "ragged_prefill:b2:s2:rows1:ctx-1:src0": 1,
+    }
+    assert engine.stats.prefill_shape_graph_capture_counts == {shape_key: 1}
+    assert engine.stats.prefill_shape_graph_replay_counts == {shape_key: 1}
+    assert engine.stats.prefill_graph_capture_shape_ms == {}
+    assert engine.stats.prefill_shape_graph_capture_ms == {}
+
+    miss_model = _SelectedRaggedGraphMissToyModel()
+    miss_engine = ContinuousBatchEngine(
+        miss_model,
+        device=torch.device("cpu"),
+        max_active_requests=2,
+        prefix_cache_capacity=0,
+        profile_timings=False,
+    )
+    miss_engine.start_online(max_seq_len=8)
+    miss_shape_key = "prefix_graph:b2:s2:p16-16:src2:mixed0"
+
+    logits = miss_engine._try_ragged_prefill_logits(
+        input_ids,
+        seq_lens,
+        row_indices,
+        logit_positions,
+        context_len=16,
+        src_prefix_row=torch.tensor([4, 5], dtype=torch.long),
+        capture_on_miss=False,
+        profile_shape_key=miss_shape_key,
+    )
+
+    assert logits is None
+    assert miss_engine.stats.prefill_graph_miss_shape_counts == {
+        "ragged_prefill:b2:s2:rows1:ctx16:src2": 1,
+    }
+    assert miss_engine.stats.prefill_shape_graph_miss_counts == {miss_shape_key: 1}
+
+
 def test_continuous_batch_engine_counts_ragged_prefill_miss_shapes() -> None:
     model = _SelectedRaggedGraphMissToyModel()
     engine = ContinuousBatchEngine(
@@ -6359,6 +6430,35 @@ def test_continuous_batch_engine_records_ragged_decode_graph_miss_shapes() -> No
     assert engine.stats.decode_graph_miss_shape_counts == {
         "ragged_decode:logits:b3:rows0": 1,
     }
+
+
+def test_continuous_batch_engine_records_decode_graph_miss_shapes_for_queue_profile_without_timings(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_QUEUE_PROFILE_JSONL", "/tmp/queue.jsonl")
+    model = _MissingRaggedGraphToyModel()
+    engine = ContinuousBatchEngine(
+        model,
+        device=torch.device("cpu"),
+        max_active_requests=3,
+        prefix_cache_capacity=0,
+        profile_timings=False,
+    )
+
+    engine.run(
+        [
+            ServingRequest("short", (1, 2), 2, arrival_step=0),
+            ServingRequest("medium", (3, 4, 5), 2, arrival_step=0),
+            ServingRequest("long", (6, 7, 8, 9), 2, arrival_step=0),
+        ]
+    )
+
+    assert engine.stats.decode_graph_hits == 0
+    assert engine.stats.decode_graph_misses == 1
+    assert engine.stats.decode_graph_miss_shape_counts == {
+        "ragged_decode:logits:b3:rows0": 1,
+    }
+    assert engine.stats.decode_graph_capture_shape_ms == {}
 
 
 def test_continuous_batch_engine_skips_native_ragged_token_graph_for_sampled_decode() -> None:
