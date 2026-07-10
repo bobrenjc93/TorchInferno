@@ -25,6 +25,28 @@ runtime-scope probe remained enabled, common-prefix prefill completed in
 `154.9s`, unified scheduler warmup completed in `201.9s`, and no NCCL timeout
 occurred before health.
 
+## Local 2f294d6 self-consistency static-prefill warmup
+
+After the startup fix, the local `8bbfa25` self_consistency run still carried
+two request-path static prefill misses for the identical 55-token prompt shape
+and spent about `2.25s` in runtime prefill wall time. Commit `4993816` added
+single-prefill logits graph warmup for the same generic common-prefix token
+buckets and reduced that to one miss. Commit `2f294d6` also warms fallback
+prefix row `105`, which is the first free prefix row after the generated-prefix
+store consumes preferred row `128` under the 144-row dense cache envelope.
+
+The no-env local validation wrote
+`/tmp/inference-bench-2f294d6-row105-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-2f294d6-row105/runs/20260710_185934`
+and landed at `31.9 / 0.0 / 32.1ms`, p99 `229.0 / 0.0 / 301.9ms`, with
+`1000/1000` correct. The queue profile confirms the warmup is hitting the live
+paths: `runtime_prefill_graph_hits=2`, `runtime_prefill_graph_misses=0`,
+`runtime_prefill_graph_miss_shape_counts={}`, and
+`runtime_prefill_shape_counts={"common_prefix:b1:t55": 1, "single:b1:t55": 1}`.
+Runtime prefill wall dropped to about `345ms`. Startup remained in the expected
+range (`281.2s` server ready, `214.4s` tensor-parallel warmup) and the shutdown
+traceback in the provider log is the normal inference-bench SIGTERM after the
+completed request phase.
+
 ## Public 20260710_140141 current-run refresh and scheduling rejections
 
 The public pointer now includes the current TorchInferno main run:
