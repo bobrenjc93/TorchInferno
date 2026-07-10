@@ -17253,6 +17253,7 @@ def test_openai_tensor_parallel_online_batcher_profile_snapshots(
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_PREFIX_ROWS", "1")
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_MAX_SEQ_LEN_HEADROOM_TOKENS", "0")
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_PREFILL_TOKEN_BUDGET", "0")
+    monkeypatch.setenv("TORCHINFERNO_TRITON_STREAMING_DECODE_ATTENTION_BLOCK_S", "128")
     monkeypatch.setattr(
         "torchinferno.openai_server._is_tensor_parallel_model",
         lambda candidate: candidate is model,
@@ -17381,6 +17382,7 @@ def test_openai_tensor_parallel_online_batcher_profile_snapshots(
     assert final_record["store_reusable_prefixes"] is True
     assert final_record["store_full_prompt_prefixes"] is True
     assert final_record["greedy_large_mixed_prefix_reuse"] is False
+    assert final_record["triton_streaming_decode_attention_block_s"] == 128
     assert final_record["submit_batches"] == 1
     assert final_record["submit_requests"] == 1
     assert final_record["submit_batch_max"] == 1

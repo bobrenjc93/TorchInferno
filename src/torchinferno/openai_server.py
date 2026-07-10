@@ -6065,6 +6065,11 @@ class OpenAICompletionEngine:
                 fp8_prefill_enabled=fp8_prefill_enabled,
                 fp8_prefill_min_m=fp8_prefill_min_m,
                 marlin_int4_decode_enabled=marlin_int4_decode_enabled,
+                triton_streaming_decode_attention_block_s=env_int(
+                    "TORCHINFERNO_TRITON_STREAMING_DECODE_ATTENTION_BLOCK_S",
+                    64,
+                    minimum=1,
+                ),
                 online_steps=step,
                 online_step_commands=online_step_commands,
                 emitted_events=emitted_events,

@@ -76,6 +76,8 @@ telemetry showed `runtime_decode_many_model_gpu_ms=53.64s` and
 `batch=64 cache_bucket=1024` replay inflated to `95.26ms` self CUDA and was
 dominated by elementwise/GEMV/softmax kernels, so keep the tile-size default at
 `64`; `128` is diagnostic-only and `256` should not be used for this path.
+Queue profiles now record `triton_streaming_decode_attention_block_s` so future
+public runs make any non-default attention tile immediately visible.
 
 ## Current 20260707 decode-many graph rotary check
 
