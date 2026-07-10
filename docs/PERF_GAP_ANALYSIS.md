@@ -103,6 +103,36 @@ window was `decode_many:b64/64:g1-16` (`195` steps, `12.5K` model tokens,
 better-overlapped high-active decode body plus lower padded prefill, not more
 shape-specific warmup.
 
+## Local c37c86d tree refresh and Gumbel score-form rejection
+
+A pushed-head TorchInferno-only `tree_of_thought` refresh on `c37c86d` wrote
+`/tmp/inference-bench-c37c86d-tree-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-c37c86d-tree/runs/20260710_171745`
+and landed at `61.8 / 38.9 / 87.6ms`, `957/992` correct. Startup stayed in
+the expected band at `276.2s` ready and `210.5s` tensor-parallel warmup. The
+public pointer was still `20260710_140141`.
+
+The queue profile confirms the current tree gap is steady sampled-medium work,
+not graph churn: no prefill graph captures or misses, server-side p50s
+`q2submit=21.7ms`, `submit2first=36.6ms`, `q2first=58.2ms`, and
+`q2finish=82.7ms`. Prefill spent `6.29s/7.66s` forward/wall across `341`
+batches, Gumbel sampling spent `938.7ms` for `2586` sampled rows, and ragged
+decode spent `3.44s` GPU across `297` batches. The dominant shapes remain
+sampled common-prefix `s12` prefill (`b2` and `b4`) and ragged decode buckets
+`b3/b4/b5`.
+
+A general sampler rewrite that used the mathematically equivalent Gumbel score
+`logits + temperature * gumbel` instead of `logits / temperature + gumbel` is
+rejected for the default path. The dirty run wrote
+`/tmp/inference-bench-gumbel-score-tree-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-gumbel-score-tree/runs/20260710_172618`
+and regressed score-facing medians to `65.3 / 40.8 / 91.3ms`, though
+correctness was `961/992`. The final queue profile showed a modest raw Gumbel
+drop (`938.7ms -> 876.5ms`, noise `250.3ms -> 196.3ms`) but worse request
+medians and higher prefill/decode totals (`prefill 7.66s -> 8.35s`, decode GPU
+`3.44s -> 3.51s`). Do not promote this score-form sampler without a new A/B
+that improves end-to-end medians; the next tree target remains a cheaper
+sampled `s12` prefill/decode body or lower-overhead sharded sampling with stable
+request-level latency.
+
 ## Public 20260710_130259 refresh and main fast-forward
 
 The public pointer advanced again to
