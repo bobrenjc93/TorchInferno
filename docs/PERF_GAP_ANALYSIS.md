@@ -12711,6 +12711,19 @@ warmup constant. Keep the default extra pairs at the already-configured
 single-step high-active decode replay body plus padded prefill, not more
 shape-specific warmup.
 
+A same-host vLLM refresh after the TorchInferno `02d160a` long_output profile
+wrote
+`/tmp/inference-bench-vllm-long-refresh-results/.../runs/20260710_114420`
+using vLLM `cbe9c40f998f`. It landed at `50.1 / 16.9 / 644.4ms`, p99
+`90.6 / 23.1 / 1120.9ms`, and `1000/1000` correct. vLLM startup readiness was
+`65.3s`; its server log showed graph capture finishing in about `9s`, custom
+all-reduce graph-address registration, `65.7%` prefix-cache hit rate, about
+`4.8K` prompt tok/s, and about `3.6K` generation tok/s. Against the fresh
+TorchInferno control, the same-host gap is still roughly `+174ms` TTFT,
+`+4.7ms` TPOT, and `+413ms` E2E. No reusable SGLang venv was present in the
+active skipped-build directory for this refresh; the older same-host SGLang
+rows remain the current SGLang comparison.
+
 ## Priority for a focused (non-loop) session
 
 1. Prefill MFU (Issue 1) — biggest TTFT lever, ~2x, affects 3/5 benchmarks.
