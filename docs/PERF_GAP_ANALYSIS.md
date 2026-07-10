@@ -70,6 +70,39 @@ steps (`127` vs `122`), though p99 improved. Do not promote this dense-first
 warmup; the remaining multi_turn gap needs lower-cost mixed-prefix prefill or a
 queue policy that improves medians without fragmenting the session.
 
+## Local 00126b8 long-output refresh
+
+A pushed-head TorchInferno-only `long_output` refresh on `00126b8` wrote
+`/tmp/inference-bench-00126b8-long-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-00126b8-long/runs/20260710_170646`
+and landed at `223.6 / 21.4 / 1081.0ms`, `1000/1000` correct. Startup was in
+the expected band: server readiness `276.2s`, tensor-parallel warmup `209.3s`,
+including `35.6s` online decode graph warmup and `157.9s` online common-prefix
+prefill warmup. The public pointer was still `20260710_140141`.
+
+Same-host provider references keep the long-output target unchanged. The latest
+available vLLM long-output refresh
+`/tmp/inference-bench-vllm-long-refresh-results/.../runs/20260710_114420`
+measured `50.1 / 16.9 / 644.4ms`, and the same-host SGLang comparison from
+`/tmp/inference-bench-sglang-local-compare-results/.../runs/20260709_204619`
+measured `61.1 / 24.6 / 975.9ms`. TorchInferno remains behind vLLM on all
+score-facing long-output metrics, but its TPOT remains better than that SGLang
+reference; the primary gap is still vLLM's much lower first-token and denser
+steady decode path.
+
+The current queue profile mirrors the known split rather than exposing a new
+default-safe knob. Server-side p50s were `q2submit=96.0ms`,
+`submit2first=115.7ms`, `q2first=212.7ms`, and `q2finish=1069.4ms`. Prefill
+spent `5.79s/6.42s` forward/wall with `21.5K` suffix padding tokens and no
+prefill graph misses; the request-path `p111/s96` capture symptom persists
+(`prefix_graph:b16:s96:p111-111:src1:mixed0`, `1.12s` capture GPU), but the
+same-host `111:96` startup warmup A/B remains rejected because it removed that
+capture while regressing medians. Decode-many still spent `7.79s` GPU and
+`7.30s` CPU token handling across `141` calls and `619` steps. The hottest
+window was `decode_many:b64/64:g1-16` (`195` steps, `12.5K` model tokens,
+`2.48s` GPU, `2.35s` token wait). Keep the long-output target on a cheaper or
+better-overlapped high-active decode body plus lower padded prefill, not more
+shape-specific warmup.
+
 ## Public 20260710_130259 refresh and main fast-forward
 
 The public pointer advanced again to
