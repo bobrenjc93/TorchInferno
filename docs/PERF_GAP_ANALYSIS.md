@@ -12337,6 +12337,15 @@ request-path graph captures. This matches the intended post-cleanup invariant:
 long_output should keep warmed decode graphs unless the last-resort full graph
 clear is actually required.
 
+The greedy-short initial wait expansion remains rejected on current head. A
+local `TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_INITIAL_BATCH_WAIT_MS=5`
+probe wrote
+`/tmp/inference-bench-torchinferno-long-wait5-results/.../runs/20260710_063320`
+and landed slightly worse than the 2ms default: `226.7 / 21.2 / 1083.5ms`,
+p99 `1533.2 / 37.1 / 1902.3ms`, `1000/1000` correct. Queue telemetry showed
+the first batch still admitted only one request, while prefill fragmented from
+56 to 59 batches and prefill wall rose from `5.23s` to `5.45s`.
+
 ## Priority for a focused (non-loop) session
 
 1. Prefill MFU (Issue 1) — biggest TTFT lever, ~2x, affects 3/5 benchmarks.
