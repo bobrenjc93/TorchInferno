@@ -1495,6 +1495,13 @@ class ContinuousBatchEngine:
         shape_parts: list[tuple[str, int, int]] = []
         steps_run = 0
         record_sync_model_timing = self._decode_many_records_sync_model_timing()
+        record_shape_counts = self.profile_timings or _queue_profile_counts_enabled()
+
+        def record_count(counts: dict[str, int], key: str) -> None:
+            counts[key] = counts.get(key, 0) + 1
+
+        def record_total(counts: dict[str, int], key: str, amount: int) -> None:
+            counts[key] = counts.get(key, 0) + int(amount)
 
         while steps_run < max_steps and active and self._can_decode_ragged(active):
             step = self._online_step + steps_run
@@ -1551,17 +1558,15 @@ class ContinuousBatchEngine:
                 step_window_key: str | None = None
                 shape_model_tokens = graph_shape_model_tokens
                 model_elapsed_ms = 0.0
-                if self.profile_timings:
+                if record_shape_counts:
                     shape_key = graph_shape_key or f"decode_many:b{active_tokens}/{shape_model_tokens}"
-                    if record_model_call_for_steps:
+                    if self.profile_timings and record_model_call_for_steps:
                         self._record_shape_count(self.stats.decode_shape_counts, shape_key)
-                    self._record_shape_count(
-                        self.stats.decode_many_shape_steps,
-                        shape_key,
-                    )
-                    shape_parts.append((shape_key, active_tokens, shape_model_tokens))
+                    record_count(self.stats.decode_many_shape_steps, shape_key)
+                    if self.profile_timings:
+                        shape_parts.append((shape_key, active_tokens, shape_model_tokens))
                     model_elapsed_ms = graph_model_elapsed_ms / max(1, graph_steps)
-                    if record_model_timing_for_steps:
+                    if self.profile_timings and record_model_timing_for_steps:
                         self.stats.decode_many_model_ms += model_elapsed_ms
                         self._record_shape_time(
                             self.stats.decode_many_shape_model_ms,
@@ -1585,22 +1590,23 @@ class ContinuousBatchEngine:
                         next_active.append(state)
                 if self.profile_timings:
                     self.stats.decode_ragged_state_update_ms += (time.perf_counter() - state_update_start_s) * 1000.0
-                    if shape_key is not None:
-                        step_window_key = self._decode_many_step_window_key(generated_after, shape_key)
-                        self._record_shape_count(
-                            self.stats.decode_many_step_window_counts,
-                            step_window_key,
-                        )
-                        self._record_shape_total(
-                            self.stats.decode_many_step_window_model_tokens,
-                            step_window_key,
-                            active_tokens,
-                        )
-                        self._record_shape_total(
-                            self.stats.decode_many_step_window_padded_tokens,
-                            step_window_key,
-                            shape_model_tokens,
-                        )
+                if shape_key is not None:
+                    step_window_key = self._decode_many_step_window_key(generated_after, shape_key)
+                    record_count(
+                        self.stats.decode_many_step_window_counts,
+                        step_window_key,
+                    )
+                    record_total(
+                        self.stats.decode_many_step_window_model_tokens,
+                        step_window_key,
+                        active_tokens,
+                    )
+                    record_total(
+                        self.stats.decode_many_step_window_padded_tokens,
+                        step_window_key,
+                        shape_model_tokens,
+                    )
+                    if self.profile_timings:
                         if record_model_timing_for_steps:
                             self._record_shape_time(
                                 self.stats.decode_many_step_window_model_ms,
@@ -1749,43 +1755,43 @@ class ContinuousBatchEngine:
                     terminated.add(state_id)
                     self._finish_and_release(state, step)
             if shape_key is not None:
-                self._record_shape_total(
+                record_total(
                     self.stats.decode_many_shape_model_tokens,
                     shape_key,
                     len(states),
                 )
-                self._record_shape_total(
+                record_total(
                     self.stats.decode_many_shape_padded_tokens,
                     shape_key,
                     shape_model_tokens,
                 )
-                self._record_shape_total(
+                record_total(
                     self.stats.decode_many_shape_emitted_tokens,
                     shape_key,
                     record_emitted_tokens,
                 )
-                self._record_shape_total(
+                record_total(
                     self.stats.decode_many_shape_skipped_tokens,
                     shape_key,
                     record_skipped_tokens,
                 )
-                self._record_shape_total(
+                record_total(
                     self.stats.decode_many_shape_stop_finishes,
                     shape_key,
                     record_stop_finishes,
                 )
-                self._record_shape_total(
+                record_total(
                     self.stats.decode_many_shape_limit_finishes,
                     shape_key,
                     record_limit_finishes,
                 )
             if step_window_key is not None:
-                self._record_shape_total(
+                record_total(
                     self.stats.decode_many_step_window_emitted_tokens,
                     step_window_key,
                     record_emitted_tokens,
                 )
-                self._record_shape_total(
+                record_total(
                     self.stats.decode_many_step_window_skipped_tokens,
                     step_window_key,
                     record_skipped_tokens,
@@ -1826,6 +1832,13 @@ class ContinuousBatchEngine:
         stop_finishes = 0
         limit_finishes = 0
         record_sync_model_timing = self._decode_many_records_sync_model_timing()
+        record_shape_counts = self.profile_timings or _queue_profile_counts_enabled()
+
+        def record_count(counts: dict[str, int], key: str) -> None:
+            counts[key] = counts.get(key, 0) + 1
+
+        def record_total(counts: dict[str, int], key: str, amount: int) -> None:
+            counts[key] = counts.get(key, 0) + int(amount)
 
         while steps_run < max_steps and active and self._can_decode_ragged(active):
             step = self._online_step + steps_run
@@ -1845,9 +1858,9 @@ class ContinuousBatchEngine:
             shape_key: str | None = None
             step_window_key: str | None = None
             model_elapsed_ms = 0.0
-            if self.profile_timings:
+            if record_shape_counts:
                 shape_key = f"decode_many:b{active_tokens}/{shape_model_tokens}"
-                if record_sync_model_timing:
+                if self.profile_timings and record_sync_model_timing:
                     model_elapsed_ms = max(0.0, self.stats.decode_ragged_model_ms - model_ms_before)
                     self.stats.decode_many_model_ms += model_elapsed_ms
                     self._record_shape_time(
@@ -1916,32 +1929,34 @@ class ContinuousBatchEngine:
                     next_active.append(state)
             if self.profile_timings:
                 self.stats.decode_ragged_state_update_ms += (time.perf_counter() - state_update_start_s) * 1000.0
-                if shape_key is not None:
-                    step_window_key = self._decode_many_step_window_key(generated_after, shape_key)
-                    self._record_shape_count(
-                        self.stats.decode_many_step_window_counts,
-                        step_window_key,
-                    )
-                    self._record_shape_total(
-                        self.stats.decode_many_step_window_model_tokens,
-                        step_window_key,
-                        active_tokens,
-                    )
-                    self._record_shape_total(
-                        self.stats.decode_many_step_window_padded_tokens,
-                        step_window_key,
-                        shape_model_tokens,
-                    )
-                    self._record_shape_total(
-                        self.stats.decode_many_step_window_emitted_tokens,
-                        step_window_key,
-                        active_tokens,
-                    )
-                    self._record_shape_total(
-                        self.stats.decode_many_step_window_skipped_tokens,
-                        step_window_key,
-                        0,
-                    )
+                self._flush_decode_ragged_model_gpu_timers()
+            if shape_key is not None:
+                step_window_key = self._decode_many_step_window_key(generated_after, shape_key)
+                record_count(
+                    self.stats.decode_many_step_window_counts,
+                    step_window_key,
+                )
+                record_total(
+                    self.stats.decode_many_step_window_model_tokens,
+                    step_window_key,
+                    active_tokens,
+                )
+                record_total(
+                    self.stats.decode_many_step_window_padded_tokens,
+                    step_window_key,
+                    shape_model_tokens,
+                )
+                record_total(
+                    self.stats.decode_many_step_window_emitted_tokens,
+                    step_window_key,
+                    active_tokens,
+                )
+                record_total(
+                    self.stats.decode_many_step_window_skipped_tokens,
+                    step_window_key,
+                    0,
+                )
+                if self.profile_timings:
                     if record_sync_model_timing:
                         self._record_shape_time(
                             self.stats.decode_many_step_window_model_ms,
@@ -1969,38 +1984,37 @@ class ContinuousBatchEngine:
                         step_window_key,
                         token_materialize_ms,
                     )
-                self._flush_decode_ragged_model_gpu_timers()
             if shape_key is not None:
-                self._record_shape_count(
+                record_count(
                     self.stats.decode_many_shape_steps,
                     shape_key,
                 )
-                self._record_shape_total(
+                record_total(
                     self.stats.decode_many_shape_model_tokens,
                     shape_key,
                     active_tokens,
                 )
-                self._record_shape_total(
+                record_total(
                     self.stats.decode_many_shape_padded_tokens,
                     shape_key,
                     shape_model_tokens,
                 )
-                self._record_shape_total(
+                record_total(
                     self.stats.decode_many_shape_emitted_tokens,
                     shape_key,
                     active_tokens,
                 )
-                self._record_shape_total(
+                record_total(
                     self.stats.decode_many_shape_skipped_tokens,
                     shape_key,
                     0,
                 )
-                self._record_shape_total(
+                record_total(
                     self.stats.decode_many_shape_stop_finishes,
                     shape_key,
                     record_stop_finishes,
                 )
-                self._record_shape_total(
+                record_total(
                     self.stats.decode_many_shape_limit_finishes,
                     shape_key,
                     record_limit_finishes,

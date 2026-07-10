@@ -7723,6 +7723,62 @@ def test_continuous_batch_engine_online_many_shape_model_tokens_include_padding(
     assert model.ragged_logits_graph_calls == 2
 
 
+def test_continuous_batch_engine_records_decode_many_shapes_for_queue_profile_without_timings(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY", "1")
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_UNIFORM_RAGGED_DECODE", "1")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_QUEUE_PROFILE_JSONL", "/tmp/queue.jsonl")
+    model = _RaggedGraphToyModel(vocab_size=128)
+    engine = ContinuousBatchEngine(
+        model,
+        device=torch.device("cpu"),
+        max_active_requests=4,
+        prefix_cache_capacity=0,
+        enable_ragged_decode=True,
+        store_reusable_prefixes=False,
+        profile_timings=False,
+    )
+    engine.start_online(max_seq_len=16)
+    for index in range(3):
+        engine.submit_online(
+            ServingRequest(
+                str(index),
+                (index + 1, index + 2, index + 3),
+                3,
+                arrival_step=0,
+            )
+        )
+
+    first = engine.step_online()
+    events, steps = engine.step_online_many(8)
+
+    assert len(first) == 3
+    assert steps == 2
+    assert len(events) == 6
+    assert engine.stats.decode_many_shape_steps == {"decode_many:b3/4": 2}
+    assert engine.stats.decode_many_shape_model_tokens == {"decode_many:b3/4": 6}
+    assert engine.stats.decode_many_shape_padded_tokens == {"decode_many:b3/4": 8}
+    assert engine.stats.decode_many_shape_emitted_tokens == {"decode_many:b3/4": 6}
+    assert engine.stats.decode_many_shape_skipped_tokens == {"decode_many:b3/4": 0}
+    assert engine.stats.decode_many_step_window_counts == {"decode_many:b3/4:g1-16": 2}
+    assert engine.stats.decode_many_step_window_model_tokens == {
+        "decode_many:b3/4:g1-16": 6,
+    }
+    assert engine.stats.decode_many_step_window_padded_tokens == {
+        "decode_many:b3/4:g1-16": 8,
+    }
+    assert engine.stats.decode_many_step_window_emitted_tokens == {
+        "decode_many:b3/4:g1-16": 6,
+    }
+    assert engine.stats.decode_many_step_window_skipped_tokens == {
+        "decode_many:b3/4:g1-16": 0,
+    }
+    assert engine.stats.decode_many_shape_model_ms == {}
+    assert engine.stats.decode_many_step_window_model_ms == {}
+    assert engine.stats.decode_many_step_window_cpu_tokens_ms == {}
+
+
 def test_continuous_batch_engine_decode_many_gpu_timers_populate_step_windows() -> None:
     class _FakeCudaStartEvent:
         def elapsed_time(self, _end_event) -> float:

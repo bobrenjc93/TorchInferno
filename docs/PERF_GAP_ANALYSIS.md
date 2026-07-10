@@ -265,6 +265,17 @@ saved `2.23K/3.07K` tokens (`72.7%`) across `11` groups. This keeps
 long_output pointed at a generic variable-packed cached-prefix body rather than
 another fixed-pattern graph experiment.
 
+Decode-many shape telemetry now follows the same lightweight-profile rule.
+When queue profiling is enabled without sync timings, the runtime records
+integer-only `runtime_decode_many_shape_*` and
+`runtime_decode_many_step_window_*` maps for steps, model tokens, padded tokens,
+emitted/skipped tokens, and stop/limit finishes, while keeping decode-many
+timing maps empty. This makes public/default long_output profiles identify the
+hot `b64/64` early-window decode body without paying CUDA synchronization
+overhead. Focused CPU validation covers the no-timing queue-profile path plus
+the existing profile-timed decode-many, stop/limit, sync-stop, and state-sync
+accounting.
+
 ## Public 20260710_140141 current-run refresh and scheduling rejections
 
 The public pointer now includes the current TorchInferno main run:
