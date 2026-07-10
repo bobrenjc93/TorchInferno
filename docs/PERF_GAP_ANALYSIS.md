@@ -98,6 +98,21 @@ steps (`127` vs `122`), though p99 improved. Do not promote this dense-first
 warmup; the remaining multi_turn gap needs lower-cost mixed-prefix prefill or a
 queue policy that improves medians without fragmenting the session.
 
+Forcing the existing submit-step command for greedy multi_turn requests is a
+small queue-policy win when scoped to larger generations. The focused A/B on
+`281de98` wrote
+`/tmp/inference-bench-submitstep-multi-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-281de98-submitstep-multi/runs/20260710_175335`
+and moved baseline `228.1 / 37.5 / 257.7ms` to
+`224.0 / 38.1 / 256.0ms`, with p99 `1892.5 / 93.9 / 1924.3ms` improving to
+`903.2 / 68.9 / 945.4ms` and correctness staying comparable
+(`980/1000 -> 981/1000`). The queue profile shows the mechanism:
+`q2submit 129.9 -> 123.2ms`, step broadcast `49.0 -> 43.7ms`, step sync
+`54.8 -> 46.9ms`, and total phase time `7.24s -> 5.81s`. Promote only the
+large-greedy default via
+`TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_SUBMIT_STEP_COMMAND`, keeping
+greedy short generations at or below
+`TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_GEN_MAX_TOKENS` unchanged.
+
 ## Local 00126b8 long-output refresh
 
 A pushed-head TorchInferno-only `long_output` refresh on `00126b8` wrote

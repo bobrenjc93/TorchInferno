@@ -920,8 +920,20 @@ def _online_submit_step_command_enabled(*, temperature: float, max_tokens: int) 
     global_env = "TORCHINFERNO_OPENAI_TP_ONLINE_SUBMIT_STEP_COMMAND"
     if global_env in os.environ:
         return env_flag(global_env, False)
-    if temperature <= 0.0 or max_tokens < 1:
+    if max_tokens < 1:
         return False
+    if temperature <= 0.0:
+        greedy_short_max_tokens = env_int(
+            "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_GEN_MAX_TOKENS",
+            128,
+            minimum=1,
+        )
+        if max_tokens <= greedy_short_max_tokens:
+            return False
+        return env_flag(
+            "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_SUBMIT_STEP_COMMAND",
+            True,
+        )
     if _online_step_sync_enabled(temperature=temperature, max_tokens=max_tokens):
         return False
     sampled_short_max_tokens = env_int(
