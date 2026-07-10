@@ -64,6 +64,19 @@ current dense baseline: `222.5 / 21.2 / 1052.1ms` versus
 long_output gap is still projection/Marlin/all-reduce dominated rather than a
 single attention tile-size issue.
 
+Raising the same tile to `256` is a hard rejection. The diagnostic run used
+`TORCHINFERNO_TRITON_STREAMING_DECODE_ATTENTION_BLOCK_S=256` with the same
+one-shot ragged decode replay profiler and wrote
+`/tmp/inference-bench-torchinferno-long-attnblock256-results/.../runs/20260710_081347`.
+It stayed `1000/1000` correct but regressed to
+`940.6 / 109.2 / 4456.1ms`, with throughput down to `7.4 tok/s`. Queue
+telemetry showed `runtime_decode_many_model_gpu_ms=53.64s` and
+`decode_many:b64/64=17.47s` over `188` steps, versus the dense baseline's
+`8.18s` decode-many GPU and `3.43s` hot `b64/64` slice. The captured
+`batch=64 cache_bucket=1024` replay inflated to `95.26ms` self CUDA and was
+dominated by elementwise/GEMV/softmax kernels, so keep the tile-size default at
+`64`; `128` is diagnostic-only and `256` should not be used for this path.
+
 ## Current 20260707 decode-many graph rotary check
 
 The multi-step ragged decode graph now pre-copies per-step rotary tables for the
