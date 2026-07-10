@@ -1555,7 +1555,7 @@ def _online_common_prefix_prefill_warmup_rows(cache_rows: int, max_active: int |
         return ()
     configured = os.environ.get("TORCHINFERNO_OPENAI_WARMUP_ONLINE_COMMON_PREFIX_ROWS")
     rows = _parse_positive_int_csv(
-        configured if configured is not None else "48,53,68,69"
+        configured if configured is not None else "48,53,68,69,105"
     )
     if configured is None and max_active is not None and 0 < max_active < cache_rows:
         rows = tuple(sorted({*rows, int(max_active)}))

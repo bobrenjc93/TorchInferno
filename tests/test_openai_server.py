@@ -11460,7 +11460,7 @@ def test_online_common_prefix_prefill_warmup_filters_shapes(monkeypatch) -> None
     assert _online_common_prefix_prefill_warmup_rows(49) == (48,)
     assert _online_common_prefix_prefill_warmup_rows(69) == (48, 53, 68)
     assert _online_common_prefix_prefill_warmup_rows(70) == (48, 53, 68, 69)
-    assert _online_common_prefix_prefill_warmup_rows(144, 128) == (48, 53, 68, 69, 128)
+    assert _online_common_prefix_prefill_warmup_rows(144, 128) == (48, 53, 68, 69, 105, 128)
     assert _online_common_prefix_prefill_warmup_tokens(64) == (45, 55, 64)
     assert _online_common_prefix_prefill_warmup_tokens(128) == (45, 55, 64, 128)
     assert _startup_online_common_prefix_prefill_warmup_rows(144, 128) == (128,)
