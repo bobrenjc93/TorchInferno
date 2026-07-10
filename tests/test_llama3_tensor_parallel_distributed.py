@@ -21,6 +21,25 @@ from torchinferno.models.llama3 import (
 from torchinferno.models.llama3 import tensor_parallel as tensor_parallel_module
 
 
+def test_llama3_tensor_parallel_temperature_sample_profile_uses_detail_gate(monkeypatch) -> None:
+    model = object.__new__(Llama3TensorParallelForCausalLM)
+    monkeypatch.delenv("TORCHINFERNO_TEMPERATURE_SAMPLE_PROFILE", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_QUEUE_PROFILE_SYNC_TIMINGS", raising=False)
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_QUEUE_PROFILE_JSONL", "queue.jsonl")
+
+    assert model._temperature_sample_profile_enabled() is False
+
+    delattr(model, "_temperature_sample_profile_enabled_cached")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_QUEUE_PROFILE_SYNC_TIMINGS", "1")
+
+    assert model._temperature_sample_profile_enabled() is True
+
+    delattr(model, "_temperature_sample_profile_enabled_cached")
+    monkeypatch.setenv("TORCHINFERNO_TEMPERATURE_SAMPLE_PROFILE", "0")
+
+    assert model._temperature_sample_profile_enabled() is False
+
+
 def test_llama3_tensor_parallel_greedy_sampler_uses_all_reduce_by_default_on_cpu(monkeypatch) -> None:
     model = object.__new__(Llama3TensorParallelForCausalLM)
     model.device = torch.device("cpu")

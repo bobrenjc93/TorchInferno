@@ -3452,8 +3452,11 @@ class Llama3TensorParallelForCausalLM:
             enabled = _tp_flag("TORCHINFERNO_TEMPERATURE_SAMPLE_PROFILE", False)
         else:
             enabled = bool(
-                os.environ.get("TORCHINFERNO_OPENAI_QUEUE_PROFILE_JSONL")
-                or os.environ.get("TORCHINFERNO_OPENAI_QUEUE_PROFILE")
+                (
+                    os.environ.get("TORCHINFERNO_OPENAI_QUEUE_PROFILE_JSONL")
+                    or os.environ.get("TORCHINFERNO_OPENAI_QUEUE_PROFILE")
+                )
+                and env_flag("TORCHINFERNO_OPENAI_QUEUE_PROFILE_SYNC_TIMINGS", False)
             )
         self._temperature_sample_profile_enabled_cached = enabled
         return enabled

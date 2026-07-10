@@ -974,6 +974,10 @@ def _queue_profile_path_from_env() -> str:
     return os.environ.get("TORCHINFERNO_OPENAI_QUEUE_PROFILE", "")
 
 
+def _queue_profile_sync_timings_enabled() -> bool:
+    return env_flag("TORCHINFERNO_OPENAI_QUEUE_PROFILE_SYNC_TIMINGS", False)
+
+
 def _startup_ragged_decode_warmup_enabled() -> bool:
     return env_flag("TORCHINFERNO_OPENAI_WARMUP_RAGGED_DECODE_STARTUP", False)
 
@@ -5968,6 +5972,7 @@ class OpenAICompletionEngine:
             stop_token_ids = frozenset()
             eos_token_id = None
         profile_queue = bool(self._queue_profile_path_value())
+        profile_runtime_timings = profile_queue and _queue_profile_sync_timings_enabled()
         use_decode_many = _online_decode_many_enabled(
             temperature=first.temperature,
             max_tokens=run_max_tokens,
@@ -6063,7 +6068,7 @@ class OpenAICompletionEngine:
                 pin_shared_prefix=pin_shared_prefix,
                 graph_prefill=graph_prefill,
                 prefill_chunk_size=prefill_chunk_size,
-                profile_timings=profile_queue,
+                profile_timings=profile_runtime_timings,
                 admit_min_free_rows=admit_min_free_rows,
                 admit_min_ready_requests=admit_min_ready_requests,
                 admit_per_step_cap=admit_per_step_cap,
@@ -8223,7 +8228,10 @@ class OpenAICompletionEngine:
             store_full_prompt_prefixes=store_full_prompt_prefixes,
             graph_prefill=env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_GRAPH_PREFILL", True),
             prefill_chunk_size=(env_int("TORCHINFERNO_OPENAI_TP_ONLINE_PREFILL_CHUNK", 0, minimum=0) or None),
-            profile_timings=bool(self._queue_profile_path_value()),
+            profile_timings=(
+                bool(self._queue_profile_path_value())
+                and _queue_profile_sync_timings_enabled()
+            ),
             admit_min_free_rows=_online_admit_min_free_rows(
                 temperature=group[0].temperature,
                 max_tokens=max_tokens,
@@ -8487,7 +8495,10 @@ class OpenAICompletionEngine:
             store_full_prompt_prefixes=store_full_prompt_prefixes,
             graph_prefill=env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_GRAPH_PREFILL", True),
             prefill_chunk_size=(env_int("TORCHINFERNO_OPENAI_TP_ONLINE_PREFILL_CHUNK", 0, minimum=0) or None),
-            profile_timings=bool(self._queue_profile_path_value()),
+            profile_timings=(
+                bool(self._queue_profile_path_value())
+                and _queue_profile_sync_timings_enabled()
+            ),
             admit_min_free_rows=_online_admit_min_free_rows(
                 temperature=group[0].temperature,
                 max_tokens=max_tokens,

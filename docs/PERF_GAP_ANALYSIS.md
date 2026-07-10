@@ -83,6 +83,42 @@ captures, and replay coverage for both hot `b32:s32:ctx-128/256:src32` shapes.
 This restores the pre-startup-fix multi_turn band without re-enabling the
 startup symm-mem failure mode.
 
+## Local lightweight queue-profile timing gate
+
+Inference-bench's TorchInferno provider writes
+`TORCHINFERNO_OPENAI_QUEUE_PROFILE_JSONL` by default. Before `d5168d8`, the
+server treated that as a request to enable detailed runtime timing, which added
+CUDA synchronizes in model prefill/decode profiling and temperature-sampler
+phase timers during score-facing runs. The accepted change keeps queue-profile
+request timing and graph counters on by default, but gates the sync-heavy
+runtime timers behind `TORCHINFERNO_OPENAI_QUEUE_PROFILE_SYNC_TIMINGS=1`;
+explicit `TORCHINFERNO_TEMPERATURE_SAMPLE_PROFILE` still overrides sampler
+profiling.
+
+A focused no-env long_output validation wrote
+`/tmp/inference-bench-light-profile-long-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-light-profile-long/runs/20260710_200932`
+and landed at `223.4 / 21.4 / 1035.7ms`, p99
+`1766.1 / 58.5 / 3054.5ms`, with `1000/1000` correct. That is a small
+TTFT/TPOT improvement over the prior local full-suite row
+(`229.4 / 22.0 / 1031.1ms`) while keeping E2E in the same band. The resulting
+queue snapshot preserved request p50s and graph counters
+(`q2first=213.0ms`, `q2submit=92.9ms`, `submit2first=132.1ms`,
+`runtime_prefill_graph_hits=54`, `runtime_prefill_graph_captures=1`), but the
+detail-only timing totals stayed inert (`runtime_prefill_wall_ms=0`,
+`runtime_decode_many_token_wait_ms=0`) and temperature profiling was absent.
+
+The tree_of_thought validation showed the clearer score-facing benefit:
+`/tmp/inference-bench-light-profile-tree-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-light-profile-tree/runs/20260710_201553`
+landed at `58.0 / 36.5 / 84.5ms`, p99 `343.9 / 226.1 / 386.6ms`, with
+`959/992` correct. The prior local full-suite row was
+`68.7 / 41.1 / 97.9ms`, `957/992` correct. The queue profile retained
+request timing and graph counters (`q2first=54.9ms`, `q2submit=21.5ms`,
+`submit2first=33.0ms`, `runtime_prefill_graph_hits=368`) while leaving
+temperature timing null. Keep the lightweight queue profile as the default for
+public runs; opt into `TORCHINFERNO_OPENAI_QUEUE_PROFILE_SYNC_TIMINGS=1` only
+for diagnostic profiles where detailed CUDA-synchronized phase timing is worth
+the measurement perturbation.
+
 ## Public 20260710_140141 current-run refresh and scheduling rejections
 
 The public pointer now includes the current TorchInferno main run:
