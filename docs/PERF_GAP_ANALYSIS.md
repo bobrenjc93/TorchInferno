@@ -49,6 +49,21 @@ Queue profiles now also record `configured_cache_backend`,
 runs can distinguish threshold-gated dense selection from a requested paged
 backend that fell back to dense.
 
+## Current 20260710 streaming decode attention block-size rejection
+
+Increasing the Triton streaming GQA decode attention tile from the default `64`
+to `128` is not a score-facing long_output win. The diagnostic run used
+`TORCHINFERNO_TRITON_STREAMING_DECODE_ATTENTION_BLOCK_S=128` plus the one-shot
+ragged decode replay profiler and wrote
+`/tmp/inference-bench-torchinferno-long-attnblock128-results/.../runs/20260710_080414`.
+It stayed `1000/1000` correct and the profiled `batch=64 cache_bucket=1024`
+replay reduced the attention slice from the prior `~1.48ms` to `1.18ms`, but
+total replay was still `12.11ms` and benchmark medians regressed versus the
+current dense baseline: `222.5 / 21.2 / 1052.1ms` versus
+`228.4 / 20.9 / 1029.4ms`. Keep the default tile at `64`; the remaining
+long_output gap is still projection/Marlin/all-reduce dominated rather than a
+single attention tile-size issue.
+
 ## Current 20260707 decode-many graph rotary check
 
 The multi-step ragged decode graph now pre-copies per-step rotary tables for the
