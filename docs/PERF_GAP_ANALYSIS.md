@@ -131,6 +131,22 @@ window was `decode_many:b64/64:g1-16` (`195` steps, `12.5K` model tokens,
 better-overlapped high-active decode body plus lower padded prefill, not more
 shape-specific warmup.
 
+A source audit of the current decode-many loop does not reopen token
+materialization as a score-facing lever. `_step_decode_only_many` intentionally
+launches one-step ragged decode replays without synchronizing each step, copies
+the generated token slices into a GPU scratch buffer, then materializes one
+batched token list after the command quantum. The profiled `7.30s`
+`runtime_decode_many_cpu_tokens_ms` is therefore mostly the first stream fence
+after queued GPU work: `7.26s` token wait and only `32ms` actual
+materialization. Async readback and stop-synchronized decode-many already have
+A/Bs that failed to improve the model-work envelope or E2E, and the inference
+bench streaming helper is already using direct `httpx` SSE streaming rather
+than OpenAI object parsing on the timing path. Treat readback/client parsing as
+rejected for this profile; the next long-output implementation needs a cheaper
+full-width replay body, GPU-side stop compaction, real prefill/decode overlap,
+or a packed cached-prefix prefill path that lowers model work without adding
+batch fragmentation.
+
 ## Local c37c86d tree refresh and Gumbel score-form rejection
 
 A pushed-head TorchInferno-only `tree_of_thought` refresh on `c37c86d` wrote
