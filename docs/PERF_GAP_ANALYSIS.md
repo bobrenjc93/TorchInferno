@@ -12641,6 +12641,13 @@ entries as `rows1` (`1-2` `rows0` entries versus `133` `rows1`). Keep the
 row-index-free prefill path limited to exact ordered physical rows unless it is
 paired with warmup or allocator changes that avoid new capture tails.
 
+Queue profiles now record prefix-prefill row-index mode counters:
+`runtime_prefill_row_indices_omitted_batches/rows`,
+`runtime_prefill_row_indices_indexed_batches/rows`, and per-shape maps for both
+modes. Use these alongside live `rows0/rows1` graph-cache keys to verify that a
+future row-layout experiment changes actual replay calls, not just resident graph
+entries.
+
 ## Priority for a focused (non-loop) session
 
 1. Prefill MFU (Issue 1) — biggest TTFT lever, ~2x, affects 3/5 benchmarks.

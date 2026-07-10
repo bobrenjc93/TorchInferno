@@ -535,6 +535,10 @@ class ServingStats:
     prefill_packed_fixed_capacity_accepts: int = 0
     prefill_prefix_copy_skipped_batches: int = 0
     prefill_prefix_copy_skipped_tokens: int = 0
+    prefill_row_indices_omitted_batches: int = 0
+    prefill_row_indices_omitted_rows: int = 0
+    prefill_row_indices_indexed_batches: int = 0
+    prefill_row_indices_indexed_rows: int = 0
     prefill_graph_hits: int = 0
     prefill_graph_misses: int = 0
     prefill_graph_captures: int = 0
@@ -583,6 +587,10 @@ class ServingStats:
     prefill_shape_graph_replay_gpu_ms: dict[str, float] = field(default_factory=dict)
     prefill_graph_capture_shape_gpu_ms: dict[str, float] = field(default_factory=dict)
     prefill_graph_replay_shape_gpu_ms: dict[str, float] = field(default_factory=dict)
+    prefill_shape_row_indices_omitted_batches: dict[str, int] = field(default_factory=dict)
+    prefill_shape_row_indices_omitted_rows: dict[str, int] = field(default_factory=dict)
+    prefill_shape_row_indices_indexed_batches: dict[str, int] = field(default_factory=dict)
+    prefill_shape_row_indices_indexed_rows: dict[str, int] = field(default_factory=dict)
     prefill_packed_eager_shape_counts: dict[str, int] = field(default_factory=dict)
     prefill_packed_eager_shape_tokens: dict[str, int] = field(default_factory=dict)
     prefill_packed_eager_shape_model_tokens: dict[str, int] = field(default_factory=dict)
@@ -3703,39 +3711,45 @@ class ContinuousBatchEngine:
                     model_rows_for_stats,
                     model_tokens_for_stats,
                 ) = fixed_packed
-            elif not mixed_prefixes or self._mixed_prefix_prefill_graph_enabled():
-                token_graph_output = (
-                    self._try_ragged_prefill_logits_with_greedy_tokens(
-                        input_ids,
-                        seq_lens,
-                        model_row_indices,
-                        logit_positions,
-                        [request for _index, request, _prefix_hit_tokens, _reusable in group],
-                        context_len,
-                        src_prefix_row,
-                        prefix_copy_len,
-                        capture_on_miss=self._prefix_prefill_token_graph_capture_on_miss(),
-                        profile_shape_key=shape_key,
-                        packed_prefill_pattern_key=packed_prefill_pattern_key,
-                    )
-                    if self._prefix_prefill_token_graph_enabled()
-                    else None
+            else:
+                self._record_prefill_row_index_mode(
+                    shape_key,
+                    omitted=model_row_indices is None,
+                    model_rows=int(input_ids.size(0)),
                 )
-                if token_graph_output is not None:
-                    logits, next_token_tensor = token_graph_output
-                else:
-                    logits = self._try_ragged_prefill_logits(
-                        input_ids,
-                        seq_lens,
-                        model_row_indices,
-                        logit_positions,
-                        context_len,
-                        src_prefix_row,
-                        prefix_copy_len,
-                        capture_on_miss=self._prefix_prefill_capture_on_miss(batch_bucket),
-                        profile_shape_key=shape_key,
-                        packed_prefill_pattern_key=packed_prefill_pattern_key,
+                if not mixed_prefixes or self._mixed_prefix_prefill_graph_enabled():
+                    token_graph_output = (
+                        self._try_ragged_prefill_logits_with_greedy_tokens(
+                            input_ids,
+                            seq_lens,
+                            model_row_indices,
+                            logit_positions,
+                            [request for _index, request, _prefix_hit_tokens, _reusable in group],
+                            context_len,
+                            src_prefix_row,
+                            prefix_copy_len,
+                            capture_on_miss=self._prefix_prefill_token_graph_capture_on_miss(),
+                            profile_shape_key=shape_key,
+                            packed_prefill_pattern_key=packed_prefill_pattern_key,
+                        )
+                        if self._prefix_prefill_token_graph_enabled()
+                        else None
                     )
+                    if token_graph_output is not None:
+                        logits, next_token_tensor = token_graph_output
+                    else:
+                        logits = self._try_ragged_prefill_logits(
+                            input_ids,
+                            seq_lens,
+                            model_row_indices,
+                            logit_positions,
+                            context_len,
+                            src_prefix_row,
+                            prefix_copy_len,
+                            capture_on_miss=self._prefix_prefill_capture_on_miss(batch_bucket),
+                            profile_shape_key=shape_key,
+                            packed_prefill_pattern_key=packed_prefill_pattern_key,
+                        )
             if logits is None:
                 logits = self._ragged_prefill_logits_eager(
                     input_ids,
@@ -8380,6 +8394,39 @@ class ContinuousBatchEngine:
         if not self.profile_timings:
             return
         counts[key] = counts.get(key, 0) + int(amount)
+
+    def _record_prefill_row_index_mode(
+        self,
+        shape_key: str,
+        *,
+        omitted: bool,
+        model_rows: int,
+    ) -> None:
+        rows = max(0, int(model_rows))
+        if omitted:
+            self.stats.prefill_row_indices_omitted_batches += 1
+            self.stats.prefill_row_indices_omitted_rows += rows
+            self._record_shape_count(
+                self.stats.prefill_shape_row_indices_omitted_batches,
+                shape_key,
+            )
+            self._record_shape_total(
+                self.stats.prefill_shape_row_indices_omitted_rows,
+                shape_key,
+                rows,
+            )
+            return
+        self.stats.prefill_row_indices_indexed_batches += 1
+        self.stats.prefill_row_indices_indexed_rows += rows
+        self._record_shape_count(
+            self.stats.prefill_shape_row_indices_indexed_batches,
+            shape_key,
+        )
+        self._record_shape_total(
+            self.stats.prefill_shape_row_indices_indexed_rows,
+            shape_key,
+            rows,
+        )
 
     def _record_shape_time(
         self,

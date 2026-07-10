@@ -3920,6 +3920,9 @@ def test_continuous_batch_engine_skips_active_row_clear_for_prefix_graph_batch(
     assert engine.stats.prefill_prefix_reuse_batches == 1
     assert any(rows is not None for rows in model.prefill_src_prefix_rows)
     assert model.prefill_row_indices[-1] is None
+    assert engine.stats.prefill_row_indices_omitted_batches == 1
+    assert engine.stats.prefill_row_indices_omitted_rows == 4
+    assert engine.stats.prefill_row_indices_indexed_batches == 0
     assert clear_calls == []
 
 
@@ -4113,6 +4116,8 @@ def test_continuous_batch_engine_graph_prefill_buckets_batch_and_matches() -> No
     assert engine.stats.prefill_prefix_reuse_batches >= 1
     assert engine.stats.prefill_padded_suffix_batches >= 1
     assert engine.stats.prefix_reuse_requests >= 3
+    assert engine.stats.prefill_row_indices_omitted_batches >= 1
+    assert engine.stats.prefill_row_indices_indexed_batches >= 1
 
 
 def test_continuous_batch_engine_can_split_prefix_graph_by_suffix_bucket(monkeypatch) -> None:
