@@ -171,6 +171,18 @@ or stop-tail knobs; the remaining long_output closure needs a non-fragmenting
 packed cached-prefix prefill body and lower high-active decode/stop pipeline
 cost.
 
+Sampler queue-profile telemetry now keeps the lightweight gate useful for
+sampled rows as well. When queue profiling is enabled but
+`TORCHINFERNO_OPENAI_QUEUE_PROFILE_SYNC_TIMINGS` is not, the tensor-parallel
+temperature sampler records count-only `runtime_temperature_sample_calls`,
+`runtime_temperature_sample_rows`, and Gumbel call/row fields without recording
+CUDA-synchronized timing fields. This restores the public tree_of_thought
+sampled-row signal that the timing gate intentionally removed, while keeping
+score-facing runs free of sampler phase timers. Validation covered the
+count-only queue-profile path plus existing profile-timed Gumbel sampling,
+queue-profile export, inference-bench summary formatting, `pyflakes`, and
+`git diff --check`; `ruff` was unavailable in both local Python environments.
+
 ## Public 20260710_140141 current-run refresh and scheduling rejections
 
 The public pointer now includes the current TorchInferno main run:

@@ -728,6 +728,41 @@ def test_llama3_tensor_parallel_temperature_sampling_uses_gumbel_max(monkeypatch
         assert summary[name] >= 0.0
 
 
+def test_llama3_tensor_parallel_temperature_sampling_counts_queue_profile_without_timings(
+    monkeypatch,
+) -> None:
+    import torch.distributed as dist
+
+    monkeypatch.delenv("TORCHINFERNO_TEMPERATURE_SAMPLE_PROFILE", raising=False)
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_QUEUE_PROFILE_JSONL", "/tmp/queue.jsonl")
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_QUEUE_PROFILE_SYNC_TIMINGS", raising=False)
+
+    def all_reduce(tensor: torch.Tensor, *, op: object) -> None:
+        del tensor, op
+
+    monkeypatch.setattr(dist, "is_available", lambda: True)
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(dist, "all_reduce", all_reduce)
+
+    model = object.__new__(Llama3TensorParallelForCausalLM)
+    model.config = type("Config", (), {"vocab_size": 4})()
+    model.rank = 0
+    model.vocab_start = 0
+    model.local_vocab_size = 4
+    logits = torch.tensor([[1000.0, -1000.0, -1000.0, -1000.0]])
+
+    sampled = model._sample_next_token(logits, temperature=0.7)
+    summary = model.temperature_sample_profile_summary()
+
+    assert sampled.tolist() == [0]
+    assert summary["temperature_sample_calls"] == 1
+    assert summary["temperature_sample_rows"] == 1
+    assert summary["temperature_sample_gumbel_calls"] == 1
+    assert summary["temperature_sample_gumbel_rows"] == 1
+    assert "temperature_sample_total_ms" not in summary
+    assert "temperature_sample_gumbel_ms" not in summary
+
+
 def test_llama3_tensor_parallel_temperature_sampling_combines_broadcast(monkeypatch) -> None:
     import torch.distributed as dist
 

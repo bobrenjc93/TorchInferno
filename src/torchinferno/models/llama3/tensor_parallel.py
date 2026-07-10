@@ -3461,6 +3461,17 @@ class Llama3TensorParallelForCausalLM:
         self._temperature_sample_profile_enabled_cached = enabled
         return enabled
 
+    def _temperature_sample_counts_enabled(self) -> bool:
+        cached = getattr(self, "_temperature_sample_counts_enabled_cached", None)
+        if isinstance(cached, bool):
+            return cached
+        enabled = bool(
+            os.environ.get("TORCHINFERNO_OPENAI_QUEUE_PROFILE_JSONL")
+            or os.environ.get("TORCHINFERNO_OPENAI_QUEUE_PROFILE")
+        )
+        self._temperature_sample_counts_enabled_cached = enabled
+        return enabled
+
     def _record_temperature_sample_profile(
         self,
         *,
@@ -3471,20 +3482,22 @@ class Llama3TensorParallelForCausalLM:
         rank_ms: float,
         cdf_ms: float,
         reduce_ms: float,
+        record_timings: bool = True,
     ) -> None:
-        totals = getattr(self, "_temperature_sample_profile_ms", None)
-        if not isinstance(totals, dict):
-            totals = {}
-            self._temperature_sample_profile_ms = totals
-        for name, value in (
-            ("total", total_ms),
-            ("max", max_ms),
-            ("weights", weights_ms),
-            ("rank", rank_ms),
-            ("cdf", cdf_ms),
-            ("reduce", reduce_ms),
-        ):
-            totals[name] = float(totals.get(name, 0.0)) + float(value)
+        if record_timings:
+            totals = getattr(self, "_temperature_sample_profile_ms", None)
+            if not isinstance(totals, dict):
+                totals = {}
+                self._temperature_sample_profile_ms = totals
+            for name, value in (
+                ("total", total_ms),
+                ("max", max_ms),
+                ("weights", weights_ms),
+                ("rank", rank_ms),
+                ("cdf", cdf_ms),
+                ("reduce", reduce_ms),
+            ):
+                totals[name] = float(totals.get(name, 0.0)) + float(value)
         self._temperature_sample_profile_calls = int(
             getattr(self, "_temperature_sample_profile_calls", 0)
         ) + 1
@@ -3500,19 +3513,21 @@ class Llama3TensorParallelForCausalLM:
         noise_ms: float,
         max_ms: float,
         reduce_ms: float,
+        record_timings: bool = True,
     ) -> None:
-        totals = getattr(self, "_temperature_sample_profile_ms", None)
-        if not isinstance(totals, dict):
-            totals = {}
-            self._temperature_sample_profile_ms = totals
-        for name, value in (
-            ("total", total_ms),
-            ("gumbel_total", total_ms),
-            ("gumbel_noise", noise_ms),
-            ("gumbel_max", max_ms),
-            ("gumbel_reduce", reduce_ms),
-        ):
-            totals[name] = float(totals.get(name, 0.0)) + float(value)
+        if record_timings:
+            totals = getattr(self, "_temperature_sample_profile_ms", None)
+            if not isinstance(totals, dict):
+                totals = {}
+                self._temperature_sample_profile_ms = totals
+            for name, value in (
+                ("total", total_ms),
+                ("gumbel_total", total_ms),
+                ("gumbel_noise", noise_ms),
+                ("gumbel_max", max_ms),
+                ("gumbel_reduce", reduce_ms),
+            ):
+                totals[name] = float(totals.get(name, 0.0)) + float(value)
         self._temperature_sample_profile_calls = int(
             getattr(self, "_temperature_sample_profile_calls", 0)
         ) + 1
@@ -3539,25 +3554,30 @@ class Llama3TensorParallelForCausalLM:
             "temperature_sample_rows": rows,
         }
         for name in ("total", "max", "weights", "rank", "cdf", "reduce"):
-            summary[f"temperature_sample_{name}_ms"] = float(totals.get(name, 0.0))
+            if name in totals:
+                summary[f"temperature_sample_{name}_ms"] = float(totals.get(name, 0.0))
         gumbel_calls = int(getattr(self, "_temperature_sample_gumbel_profile_calls", 0))
         if gumbel_calls > 0:
             summary["temperature_sample_gumbel_calls"] = gumbel_calls
             summary["temperature_sample_gumbel_rows"] = int(
                 getattr(self, "_temperature_sample_gumbel_profile_rows", 0)
             )
-            summary["temperature_sample_gumbel_ms"] = float(
-                totals.get("gumbel_total", 0.0)
-            )
-            summary["temperature_sample_gumbel_noise_ms"] = float(
-                totals.get("gumbel_noise", 0.0)
-            )
-            summary["temperature_sample_gumbel_max_ms"] = float(
-                totals.get("gumbel_max", 0.0)
-            )
-            summary["temperature_sample_gumbel_reduce_ms"] = float(
-                totals.get("gumbel_reduce", 0.0)
-            )
+            if "gumbel_total" in totals:
+                summary["temperature_sample_gumbel_ms"] = float(
+                    totals.get("gumbel_total", 0.0)
+                )
+            if "gumbel_noise" in totals:
+                summary["temperature_sample_gumbel_noise_ms"] = float(
+                    totals.get("gumbel_noise", 0.0)
+                )
+            if "gumbel_max" in totals:
+                summary["temperature_sample_gumbel_max_ms"] = float(
+                    totals.get("gumbel_max", 0.0)
+                )
+            if "gumbel_reduce" in totals:
+                summary["temperature_sample_gumbel_reduce_ms"] = float(
+                    totals.get("gumbel_reduce", 0.0)
+                )
         return summary
 
     def allocate_cache(
@@ -7902,6 +7922,7 @@ class Llama3TensorParallelForCausalLM:
 
     def _sample_next_token_temperature_gumbel(self, logits: Tensor, temperature: float) -> Tensor:
         profile_sample = self._temperature_sample_profile_enabled()
+        count_sample = profile_sample or self._temperature_sample_counts_enabled()
         total_start_s = time.perf_counter() if profile_sample else 0.0
         phase_start_s = total_start_s
         logits_float = logits.float() / temperature
@@ -7918,14 +7939,15 @@ class Llama3TensorParallelForCausalLM:
         )
         phase_start_s = time.perf_counter() if profile_sample else 0.0
         dist.all_reduce(next_token, op=dist.ReduceOp.MIN)
-        if profile_sample:
-            reduce_ms = (time.perf_counter() - phase_start_s) * 1000.0
+        if count_sample:
+            reduce_ms = (time.perf_counter() - phase_start_s) * 1000.0 if profile_sample else 0.0
             self._record_temperature_sample_gumbel_profile(
                 rows=int(logits.size(0)),
-                total_ms=(time.perf_counter() - total_start_s) * 1000.0,
+                total_ms=(time.perf_counter() - total_start_s) * 1000.0 if profile_sample else 0.0,
                 noise_ms=noise_ms,
                 max_ms=max_ms,
                 reduce_ms=reduce_ms,
+                record_timings=profile_sample,
             )
         return next_token
 
@@ -7967,6 +7989,7 @@ class Llama3TensorParallelForCausalLM:
 
     def _sample_next_token_temperature(self, logits: Tensor, temperature: float) -> Tensor:
         profile_sample = self._temperature_sample_profile_enabled()
+        count_sample = profile_sample or self._temperature_sample_counts_enabled()
         total_start_s = time.perf_counter() if profile_sample else 0.0
         phase_start_s = total_start_s
         logits_float = logits.float() / temperature
@@ -8017,16 +8040,17 @@ class Llama3TensorParallelForCausalLM:
         cdf_ms = (time.perf_counter() - phase_start_s) * 1000.0 if profile_sample else 0.0
         phase_start_s = time.perf_counter() if profile_sample else 0.0
         dist.all_reduce(local_token, op=dist.ReduceOp.SUM)
-        if profile_sample:
-            reduce_ms = (time.perf_counter() - phase_start_s) * 1000.0
+        if count_sample:
+            reduce_ms = (time.perf_counter() - phase_start_s) * 1000.0 if profile_sample else 0.0
             self._record_temperature_sample_profile(
                 rows=int(logits.size(0)),
-                total_ms=(time.perf_counter() - total_start_s) * 1000.0,
+                total_ms=(time.perf_counter() - total_start_s) * 1000.0 if profile_sample else 0.0,
                 max_ms=max_ms,
                 weights_ms=weights_ms,
                 rank_ms=rank_ms,
                 cdf_ms=cdf_ms,
                 reduce_ms=reduce_ms,
+                record_timings=profile_sample,
             )
         return local_token
 
