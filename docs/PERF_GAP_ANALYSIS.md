@@ -13537,6 +13537,19 @@ tokens. Completed quiescent rows are now marked as complete profile snapshots so
 this final-shape detail is not missed by profile readers when the server is
 stopped immediately after the last response.
 
+Rechecking smaller greedy-short decode-many stop-tail caps on current
+`b9a4a38` keeps the default cap at `4`. The cap-1 probe
+`/tmp/inference-bench-tailcap1-results/.../runs/20260710_221604` landed at
+`226.6 / 21.6 / 1040.1ms`: it cut skipped decode-many tokens from the cap-4
+control's `1,588` to `527`, but fragmented the tail into `380` decode-many
+calls and regressed median E2E. The cap-2 probe
+`/tmp/inference-bench-tailcap2-results/.../runs/20260710_222246` landed at
+`214.8 / 21.5 / 1039.0ms`: it improved TTFT and p99 E2E, reduced skipped
+decode-many tokens to `722`, and lowered the internal phase snapshot to
+`17.34s`, but still missed the score-facing cap-4 median E2E (`1027.1ms`).
+Treat cap `1` and cap `2` as opt-in tail-latency diagnostics, not default
+promotions.
+
 ## Priority for a focused (non-loop) session
 
 1. Prefill MFU (Issue 1) — biggest TTFT lever, ~2x, affects 3/5 benchmarks.
