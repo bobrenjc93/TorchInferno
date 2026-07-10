@@ -41,6 +41,34 @@ these knobs diagnostic-only; the next useful work is a cheaper common-prefix
 prefill body or a decode/readback pipeline improvement, not broader admission
 or full-prompt pinning.
 
+## Local 6d83c82 few-shot refresh
+
+A pushed-head TorchInferno-only `few_shot` refresh on `6d83c82` wrote
+`/tmp/inference-bench-6d83c82-few-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-6d83c82-few/runs/20260710_173435`
+and landed at `187.1 / 34.0 / 216.4ms`, `977/1000` correct. Startup stayed in
+the expected band at `276.3s` ready and `211.1s` tensor-parallel warmup. The
+public pointer was still `20260710_140141`.
+
+The queue profile is the same warmed greedy-mid shape seen in earlier
+few_shot diagnostics, but with current-head counters: no request-path prefill
+captures or misses, `q2submit=106.0ms`, `submit2first=70.7ms`,
+`q2first=179.7ms`, and `q2finish=203.0ms` p50. Prefill ran `34` batches and
+spent `1.87s/2.52s` forward/wall, almost entirely in
+`prefix_graph:b32:s16:p122-122:src1:mixed0` (`32` calls, `2.04s` wall), with
+`3.94K` padding tokens and `3.53K` suffix-padding tokens. Decode is not the
+median bottleneck: ragged decode spent `723ms` GPU across `81` batches, and the
+decode graph miss counter remained a small static-tail artifact with no capture
+time.
+
+This refresh does not reopen the already rejected few_shot knobs. Greedy-mid
+prefill-ready-before-decode, larger row caps, prequeue waits, exact-suffix or
+fine suffix buckets, token-prefill/token-only prefill, FP8 gate changes, packed
+eager prefill, and symmetric-memory prefill all have prior A/Bs that either
+regressed medians or moved only diagnostic counters. The next useful few_shot
+work is still a cheaper model-side cached-prefix `b32:s16` prefill body or a
+packed cached-prefix implementation that avoids the measured Python/graph-cache
+overhead.
+
 ## Local 4f55f28 multi-turn refresh and dense-first warmup rejection
 
 A pushed-head TorchInferno-only `multi_turn` refresh on `4f55f28` wrote
