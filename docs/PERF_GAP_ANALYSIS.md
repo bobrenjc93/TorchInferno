@@ -119,6 +119,18 @@ public runs; opt into `TORCHINFERNO_OPENAI_QUEUE_PROFILE_SYNC_TIMINGS=1` only
 for diagnostic profiles where detailed CUDA-synchronized phase timing is worth
 the measurement perturbation.
 
+The pushed-head `71b9933` full-suite validation wrote
+`/tmp/inference-bench-light-profile-full-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-light-profile-full/runs/20260710_202413`.
+Startup stayed healthy (`271.2s` server ready), and all five rows completed:
+few_shot `191.3 / 33.1 / 221.1ms`, self_consistency
+`31.3 / 0.0 / 31.9ms`, multi_turn `227.0 / 36.9 / 258.1ms`,
+tree_of_thought `65.6 / 39.2 / 96.0ms`, and long_output
+`238.2 / 21.9 / 1044.4ms`. Correctness stayed in the expected bands
+(`977/1000`, `1000/1000`, `983/1000`, `957/992`, `1000/1000`). The full-suite
+queue profile kept the same lightweight shape across rows: request p50s and
+graph counters remained populated, while detailed runtime timing totals stayed
+zero and temperature timing stayed null.
+
 ## Public 20260710_140141 current-run refresh and scheduling rejections
 
 The public pointer now includes the current TorchInferno main run:
