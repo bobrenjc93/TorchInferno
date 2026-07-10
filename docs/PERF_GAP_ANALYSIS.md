@@ -210,6 +210,21 @@ prefill work without requiring `TORCHINFERNO_OPENAI_QUEUE_PROFILE_SYNC_TIMINGS=1
 Focused validation covered the no-timing serving-engine path plus queue-profile
 export and inference-bench summary consumers.
 
+The pushed-head `2f7e16b` tree validation wrote
+`/tmp/inference-bench-packed-count-tree-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-packed-count-tree/runs/20260710_212051`.
+It reached readiness in `276.2s` and landed at `57.4 / 36.7 / 86.4ms`,
+p99 `415.3 / 217.5 / 448.7ms`, with `956/992` correct. The no-sync queue
+profile now carries packed-candidate detail without timing: `341` candidate
+calls, `9.7K` real suffix tokens, `13.1K` dense model tokens, and `3.4K` saved
+tokens. The top saved-token shapes were
+`prefix_graph:b4:s12:p45-45:src1:mixed0` (`1.4K` saved),
+`b16:s12:p45-45` (`1.1K`), and `b2:s12:p45-45` (`579`). Pattern summaries
+reported `20` pattern keys, `15` repeated pattern keys, and `3.2K` repeated
+saved tokens. The same profile kept sampler counts (`840` calls, `2584` rows,
+matching Gumbel counts), had no `runtime_temperature_sample*` timing keys, and
+left `runtime_prefill_wall_ms`, `runtime_prefill_forward_ms`, and
+`runtime_prefill_sample_ms` at `0.0`.
+
 ## Public 20260710_140141 current-run refresh and scheduling rejections
 
 The public pointer now includes the current TorchInferno main run:
