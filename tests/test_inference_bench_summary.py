@@ -107,7 +107,10 @@ def _write_inference_bench_run(tmp_path) -> None:
         "request_queue_to_first_token_p50_ms": 11.0,
         "request_queue_to_submit_p50_ms": 4.0,
         "request_submit_to_first_token_p50_ms": 7.0,
+        "initial_wait_ms": 1.0,
+        "idle_batch_wait_ms": 2.0,
         "active_ready_wait_ms": 0.5,
+        "decode_capture_on_miss": False,
         "runtime_prefill_batches": 1,
         "runtime_prefill_forward_ms": 12.0,
         "runtime_prefill_wall_ms": 13.0,
@@ -773,7 +776,11 @@ def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) ->
     assert "suffix_split_saved" in text
     assert "suffix_split_frags" in text
     assert "disabled=1" in text
+    assert "init_wait" in text
+    assert "idle_wait" in text
     assert "active_wait" in text
+    assert "decode_capture" in text
+    assert "False" in text
     assert "hot_prefill" in text
     assert "b8:s16:p45-45:src1:mixed0" in text
     assert "hot_decode" in text

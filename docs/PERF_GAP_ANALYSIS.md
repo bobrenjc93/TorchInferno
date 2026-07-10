@@ -12580,6 +12580,29 @@ misses limited to warmup/static shapes. The new split shows the old
 therefore not a score-facing long_output lever; the decode gap remains the
 GPU replay body plus prefill/decode pipeline ordering.
 
+A same-host TorchInferno/vLLM tree_of_thought refresh on pushed `3dfd5c5`
+wrote
+`/tmp/inference-bench-tree-3dfd5c5-results/.../runs/20260710_092441`. The
+cached vLLM tree build `cbe9c40` landed at `38.5 / 26.8 / 57.1ms`, while
+TorchInferno landed at `61.6 / 40.0 / 90.6ms`, with correctness `960/992` vs
+`953/992`. The TorchInferno score gap is now roughly `1.6x` TTFT/E2E and
+`1.5x` TPOT, much smaller than the older `132/66ms` tree baseline but still
+visible.
+
+The current TorchInferno profile is prefill-bound: `q2first_p50=57.4ms`,
+`q2submit_p50=22.1ms`, `submit2first_p50=36.1ms`, `6.41s` prefill forward,
+`7.84s` prefill wall, and `44%` padded prefill tokens. Decode-many is not on
+this path. Hot shapes remain the sampled common-prefix suffix bucket
+`prefix_graph:b2/b4/b16:s16:p45-45:src1:mixed0`, with the largest packed
+candidate savings in `b4:s16` and `b2:s16`. The new research-summary columns
+make the active policy explicit for future A/Bs: `init_wait=1.0`,
+`idle_wait=2.0`, `active_wait=1.0`, and `decode_capture=False`. Do not reopen
+sampled `s12` suffix buckets, generated-prefix caching, or larger
+sampled-medium active caps as defaults; those have already failed to turn the
+padding signal into a score win. The next score-facing tree lever needs a real
+packed/FlashInfer-style prefix-suffix prefill body or another way to reduce the
+`s16` padded model work without multiplying small graph replays.
+
 ## Priority for a focused (non-loop) session
 
 1. Prefill MFU (Issue 1) — biggest TTFT lever, ~2x, affects 3/5 benchmarks.

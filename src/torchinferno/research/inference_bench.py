@@ -69,7 +69,10 @@ _QUEUE_PROFILE_FIELDS = (
     "request_stream_prequeue_wait_p50_ms",
     "request_stream_prequeue_wait_configured_p50_ms",
     "request_stream_prequeue_wait_applied_count",
+    "initial_wait_ms",
+    "idle_batch_wait_ms",
     "active_ready_wait_ms",
+    "decode_capture_on_miss",
     "runtime_cache_backend",
     "runtime_max_active_requests",
     "runtime_prefix_cache_capacity",
@@ -543,7 +546,10 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
             "preq_cfg_p50",
             "preq_p50",
             "preq_applied",
+            "init_wait",
+            "idle_wait",
             "active_wait",
+            "decode_capture",
             "prefill_batches",
             "prefill_forward_ms",
             "prefill_wall_ms",
@@ -668,7 +674,10 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
                     _fmt_value(fields.get("request_stream_prequeue_wait_configured_p50_ms")),
                     _fmt_value(fields.get("request_stream_prequeue_wait_p50_ms")),
                     _fmt_value(fields.get("request_stream_prequeue_wait_applied_count")),
+                    _fmt_value(fields.get("initial_wait_ms")),
+                    _fmt_value(fields.get("idle_batch_wait_ms")),
                     _fmt_value(fields.get("active_ready_wait_ms")),
+                    _fmt_value(fields.get("decode_capture_on_miss")),
                     _fmt_value(fields.get("runtime_prefill_batches")),
                     _fmt_value(fields.get("runtime_prefill_forward_ms")),
                     _fmt_value(fields.get("runtime_prefill_wall_ms")),
@@ -1564,6 +1573,10 @@ def _queue_profile_field_is_additive(name: str) -> bool:
         "runtime_prefix_cache_capacity",
         "runtime_prefill_graph_cache_live_entries",
         "runtime_decode_graph_cache_live_entries",
+        "initial_wait_ms",
+        "idle_batch_wait_ms",
+        "active_ready_wait_ms",
+        "decode_capture_on_miss",
     }:
         return False
     if "cache_live" in name:
@@ -1572,10 +1585,7 @@ def _queue_profile_field_is_additive(name: str) -> bool:
         return name.endswith("_count")
     if name.startswith("runtime_"):
         return True
-    return name in {
-        "active_ready_wait_ms",
-        "request_stream_prequeue_wait_applied_count",
-    }
+    return name in {"request_stream_prequeue_wait_applied_count"}
 
 
 def _sum_numeric_mappings(values: Sequence[Any]) -> dict[str, float | int]:
