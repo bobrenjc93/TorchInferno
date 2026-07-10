@@ -29,6 +29,26 @@ Queue profiles now record `decode_many_graph`, `decode_many_graph_min_steps`,
 and `decode_capture_on_miss` so future runs can distinguish an intentionally
 disabled graph path from a graph path that ran and lost.
 
+## Current 20260710 forced short-context paged-KV rejection
+
+Forced paged-KV is not a long_output fix. The dense current-head baseline
+(`/tmp/inference-bench-torchinferno-long-current-shapesteps-results/.../runs/20260710_072229`)
+used `max_seq_len=288`, below the default paged threshold of `1024`, and landed
+at `228.4 / 20.9 / 1029.4ms` with `1000/1000` correctness. Forcing
+`TORCHINFERNO_OPENAI_PAGED_KV_MIN_SEQ=1` and
+`TORCHINFERNO_OPENAI_CACHE_BACKEND=paged` wrote
+`/tmp/inference-bench-torchinferno-long-forcedpaged-results/.../runs/20260710_075615`,
+kept correctness at `1000/1000`, but regressed to `1638.0 / 132.9 / 6803.7ms`.
+Queue telemetry showed the forced paged engine spent `84.6s` in prefill versus
+`5.25s` on the dense path, so the default long-context threshold remains
+correct for this short-context decode-throughput cell.
+
+Queue profiles now also record `configured_cache_backend`,
+`online_cache_backend`, `paged_kv_requested`, `paged_kv_min_seq`, and
+`paged_cache_fallback_candidate`, alongside `use_paged_engine`, so future public
+runs can distinguish threshold-gated dense selection from a requested paged
+backend that fell back to dense.
+
 ## Current 20260707 decode-many graph rotary check
 
 The multi-step ragged decode graph now pre-copies per-step rotary tables for the

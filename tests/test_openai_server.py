@@ -17369,6 +17369,11 @@ def test_openai_tensor_parallel_online_batcher_profile_snapshots(
     assert final_record["decode_many_allow_stop"] is True
     assert final_record["decode_many_stop_tail_max_steps"] == 0
     assert final_record["decode_many_min_active_pct"] == 0
+    assert final_record["configured_cache_backend"] == "dense"
+    assert final_record["online_cache_backend"] == "dense"
+    assert final_record["paged_kv_requested"] is False
+    assert final_record["paged_kv_min_seq"] == 1024
+    assert final_record["paged_cache_fallback_candidate"] is False
     assert final_record["use_paged_engine"] is False
     assert final_record["graph_prefill"] is True
     assert final_record["prefill_chunk_size"] == 0
