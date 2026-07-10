@@ -12568,6 +12568,18 @@ profiles now export `runtime_decode_many_token_wait_ms` and
 field. Use those fields on the next long_output run before treating token
 readback as a Python-side bottleneck.
 
+The post-push validation on `2044b85` wrote
+`/tmp/inference-bench-torchinferno-long-2044b85-results/.../runs/20260710_091123`.
+It stayed in the current score band at `222.5 / 21.9 / 1076.3ms`,
+`1000/1000` correct, with `57` prefill batches, `5.59s/4.94s`
+prefill wall/forward, `728` decode graph replays, and `16` decode graph
+misses limited to warmup/static shapes. The new split shows the old
+`runtime_decode_many_cpu_tokens_ms=7219ms` is almost entirely stream wait:
+`runtime_decode_many_token_wait_ms=7180ms` and
+`runtime_decode_many_token_materialize_ms=34ms`. Token list materialization is
+therefore not a score-facing long_output lever; the decode gap remains the
+GPU replay body plus prefill/decode pipeline ordering.
+
 ## Priority for a focused (non-loop) session
 
 1. Prefill MFU (Issue 1) — biggest TTFT lever, ~2x, affects 3/5 benchmarks.
