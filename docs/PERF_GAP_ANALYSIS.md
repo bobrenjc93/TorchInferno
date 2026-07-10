@@ -12678,6 +12678,21 @@ to `261.2s` and warmup memory reached about `84GB/GPU`, so keep the change
 limited to already-configured greedy-short extra pairs instead of broadening
 the warmup shape set.
 
+Extending the same dense row-index-free suffix warmup to small base
+common-prefix batches is rejected for multi_turn. The pushed `1cd8f36` control
+run
+`/tmp/inference-bench-torchinferno-multiturn-1cd8f36-results/.../runs/20260710_110920`
+landed at `243.1 / 37.6 / 277.3ms`, p99
+`1275.7 / 272.3 / 1305.5ms`, with one request-path prefill miss on the tiny
+initial `ragged_prefill:b2:s16:rows0:ctx-64:src1` shape. A dirty probe that
+warmed dense base batches up to `b2`
+`/tmp/inference-bench-torchinferno-multiturn-densebase-results/.../runs/20260710_111858`
+removed that miss, but regressed to `249.5 / 39.5 / 286.7ms`, p99
+`1295.3 / 83.8 / 1333.2ms`, and increased readiness from `261.2s` to
+`296.3s`. The remaining multi_turn gap is the expensive and fragmented
+`b32:s32:mixed1` request-prompt replay body, not this one small cold dense-base
+graph.
+
 ## Priority for a focused (non-loop) session
 
 1. Prefill MFU (Issue 1) — biggest TTFT lever, ~2x, affects 3/5 benchmarks.
