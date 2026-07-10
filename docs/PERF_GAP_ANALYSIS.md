@@ -12360,6 +12360,18 @@ p99 `1533.2 / 37.1 / 1902.3ms`, `1000/1000` correct. Queue telemetry showed
 the first batch still admitted only one request, while prefill fragmented from
 56 to 59 batches and prefill wall rose from `5.23s` to `5.45s`.
 
+Disabling the OpenAI-scoped prefill symmetric-memory all-reduce is not promoted
+from a focused few_shot recheck. The env run
+`TORCHINFERNO_OPENAI_TP_SYMM_MEM_PREFILL_ALLREDUCE=0` wrote
+`/tmp/inference-bench-torchinferno-few-nosymm-prefill-results/.../runs/20260710_070115`
+and landed at `179.6 / 35.4 / 209.7ms`, `977/1000` correct, versus the
+comparable current profiled control at `186.6 / 34.2 / 216.4ms`. The profile
+does not show a prefill-model win: prefill forward was effectively flat
+(`1.77s -> 1.78s`) and prefill wall worsened (`2.44s -> 2.59s`), while the
+median shift came from queue/decode variation. Keep the current default and
+treat this as noise unless a repeated full-suite comparison shows a stable
+score win.
+
 ## Priority for a focused (non-loop) session
 
 1. Prefill MFU (Issue 1) — biggest TTFT lever, ~2x, affects 3/5 benchmarks.
