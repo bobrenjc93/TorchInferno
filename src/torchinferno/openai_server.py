@@ -4202,12 +4202,10 @@ class OpenAICompletionEngine:
                 )
             if _online_mixed_prefix_suffix_prefill_warmup_enabled():
                 mixed_warmup_max_tokens = _online_greedy_common_prefix_suffix_prefill_warmup_max_tokens()
-                with _tensor_parallel_symm_mem_allreduce_scope(
+                with _tensor_parallel_prefill_graph_runtime_key_scope(
                     self.model,
                     self.device,
                     max_tokens=mixed_warmup_max_tokens,
-                    temperature=0.0,
-                    startup=True,
                 ):
                     self._warmup_online_mixed_prefix_suffix_prefill_graphs(
                         cache,
@@ -14212,6 +14210,35 @@ def _tensor_parallel_symm_mem_allreduce_scope(
         max_batch,
         enabled=True,
         prefill_enabled=prefill_enabled,
+    )
+
+
+def _tensor_parallel_prefill_graph_runtime_key_scope(
+    model: object,
+    device: torch.device,
+    *,
+    max_tokens: int,
+) -> ContextManager[None]:
+    if (
+        not _is_tensor_parallel_model(model)
+        or _tensor_parallel_world_size(model) <= 1
+        or device.type != "cuda"
+    ):
+        return nullcontext()
+    # Match runtime graph keys without enabling prefill symm-mem rendezvous during
+    # startup graph capture; the captured graph still uses regular NCCL allreduce.
+    max_tokens_limit = env_int("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_MAX_TOKENS", 1024, minimum=1)
+    if max_tokens > max_tokens_limit or not _openai_tp_symm_mem_allreduce_enabled(startup=False):
+        return _tensor_parallel_symm_mem_allreduce_context(
+            None,
+            enabled=False,
+            prefill_enabled=False,
+        )
+    max_batch = env_int("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_MAX_BATCH", 128, minimum=1)
+    return _tensor_parallel_symm_mem_allreduce_context(
+        max_batch,
+        enabled=True,
+        prefill_enabled=False,
     )
 
 

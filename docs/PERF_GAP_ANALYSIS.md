@@ -47,6 +47,42 @@ range (`281.2s` server ready, `214.4s` tensor-parallel warmup) and the shutdown
 traceback in the provider log is the normal inference-bench SIGTERM after the
 completed request phase.
 
+## Local runtime-key mixed-prefix prefill graph warmup
+
+The `7ea0fb6` full-suite validation exposed a regression from the startup
+symm-mem fix: mixed-prefix suffix warmup captured `ar0` ragged-prefill graphs
+under `startup=True`, while runtime greedy multi_turn looked for `ar128` graph
+keys because runtime symmetric-memory allreduce remained enabled. The full-suite
+multi_turn row regressed to `1013.6 / 38.0 / 1045.8ms`; its queue profile showed
+`31` request-path prefill graph misses on
+`ragged_prefill:b32:s32:rows1:ctx-128:src32` and
+`ragged_prefill:b32:s32:rows1:ctx-256:src32`, spending `15.16s` in runtime
+prefill wall time.
+
+The accepted fix captures mixed-prefix prefill graphs under the runtime
+allreduce graph key while forcing prefill symmetric-memory allreduce off during
+startup graph capture. This preserves the `ar128` cache key that runtime uses,
+but avoids the symm-mem prefill rendezvous path that caused the public startup
+timeout. A focused no-env multi_turn validation wrote
+`/tmp/inference-bench-runtime-key-prefill-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-runtime-key-prefill/runs/20260710_192747`
+and landed at `228.8 / 36.7 / 258.5ms`, `982/1000` correct. Its final profile
+had `runtime_prefill_graph_hits=32`, `runtime_prefill_graph_misses=1`, with
+only the tiny `ragged_prefill:b2:s16:rows0:ctx-64:src1` miss remaining; the
+two `b32:s32:src32` shapes replayed in `50.2ms` and `57.0ms`, and runtime
+prefill wall dropped to `3.24s`.
+
+The no-env full-suite validation wrote
+`/tmp/inference-bench-runtime-key-full-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-runtime-key-full/runs/20260710_193511`.
+Startup stayed healthy (`276.2s` server ready, `207.7s` tensor-parallel
+warmup), and the benchmark medians were few_shot
+`177.8 / 33.8 / 206.3ms`, self_consistency `34.9 / 0.0 / 35.3ms`, multi_turn
+`227.4 / 37.8 / 257.3ms`, tree_of_thought `68.7 / 41.1 / 97.9ms`, and
+long_output `229.4 / 22.0 / 1031.1ms`. The multi_turn queue snapshot showed
+`runtime_prefill_graph_hits=36`, `runtime_prefill_graph_misses=0`, no request
+captures, and replay coverage for both hot `b32:s32:ctx-128/256:src32` shapes.
+This restores the pre-startup-fix multi_turn band without re-enabling the
+startup symm-mem failure mode.
+
 ## Public 20260710_140141 current-run refresh and scheduling rejections
 
 The public pointer now includes the current TorchInferno main run:

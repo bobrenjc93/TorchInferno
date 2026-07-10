@@ -194,6 +194,7 @@ from torchinferno.openai_server import (
     _set_shared_prefix_ragged_static_graph_bucket_mode,
     _shared_prefix_padded_suffix_bucketed_length,
     _shared_prefix_ragged_decode_row_plan,
+    _tensor_parallel_prefill_graph_runtime_key_scope,
     _tensor_parallel_symm_mem_allreduce_scope,
     _tensor_parallel_symm_mem_allreduce_probe_batches,
     _tensor_parallel_token_budget_lifecycle,
@@ -1147,7 +1148,7 @@ def test_openai_unified_scheduler_decode_warmup_uses_runtime_symm_scope(monkeypa
     ]
 
 
-def test_openai_unified_scheduler_mixed_prefix_warmup_uses_startup_symm_scope(
+def test_openai_unified_scheduler_mixed_prefix_warmup_uses_runtime_key_prefill_scope(
     monkeypatch,
 ) -> None:
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE", "runtime")
@@ -1157,6 +1158,7 @@ def test_openai_unified_scheduler_mixed_prefix_warmup_uses_startup_symm_scope(
     monkeypatch.setenv("TORCHINFERNO_OPENAI_WARMUP_ONLINE_DECODE_SAMPLED_MAX_TOKENS", "1")
     monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_FLASHINFER_PREFILL_DISABLE", "1")
     scope_kwargs: list[dict[str, object]] = []
+    runtime_key_kwargs: list[dict[str, object]] = []
     mixed_calls: list[tuple[int, int]] = []
 
     def symm_scope(*args: object, **kwargs: object) -> nullcontext[None]:
@@ -1164,11 +1166,20 @@ def test_openai_unified_scheduler_mixed_prefix_warmup_uses_startup_symm_scope(
         scope_kwargs.append(dict(kwargs))
         return nullcontext()
 
+    def runtime_key_scope(*args: object, **kwargs: object) -> nullcontext[None]:
+        del args
+        runtime_key_kwargs.append(dict(kwargs))
+        return nullcontext()
+
     def mixed_warmup(self: OpenAICompletionEngine, cache: object, vocab_size: int, **kwargs: object) -> None:
         del self, cache, kwargs
-        mixed_calls.append((vocab_size, len(scope_kwargs)))
+        mixed_calls.append((vocab_size, len(runtime_key_kwargs)))
 
     monkeypatch.setattr("torchinferno.openai_server._tensor_parallel_symm_mem_allreduce_scope", symm_scope)
+    monkeypatch.setattr(
+        "torchinferno.openai_server._tensor_parallel_prefill_graph_runtime_key_scope",
+        runtime_key_scope,
+    )
     monkeypatch.setattr(
         OpenAICompletionEngine,
         "_warmup_online_mixed_prefix_suffix_prefill_graphs",
@@ -1184,12 +1195,10 @@ def test_openai_unified_scheduler_mixed_prefix_warmup_uses_startup_symm_scope(
 
     engine._warmup_unified_scheduler_cache(vocab_size=16)
 
-    assert mixed_calls == [(16, 2)]
-    assert [kwargs["startup"] for kwargs in scope_kwargs] == [False, True]
-    assert [(kwargs["temperature"], kwargs["max_tokens"]) for kwargs in scope_kwargs] == [
-        (0.0, 1),
-        (0.0, 512),
-    ]
+    assert mixed_calls == [(16, 1)]
+    assert [kwargs["startup"] for kwargs in scope_kwargs] == [False]
+    assert [(kwargs["temperature"], kwargs["max_tokens"]) for kwargs in scope_kwargs] == [(0.0, 1)]
+    assert runtime_key_kwargs == [{"max_tokens": 512}]
 
 
 def test_openai_online_single_prefill_warmup_captures_prompt_buckets(monkeypatch) -> None:
@@ -9961,6 +9970,46 @@ def test_openai_symm_mem_scope_runtime_mode_skips_startup(monkeypatch) -> None:
         pass
 
     assert captured == [(128, True), (None, False)]
+
+
+def test_openai_prefill_graph_runtime_key_scope_disables_prefill_symm(monkeypatch) -> None:
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE", "runtime")
+    monkeypatch.delenv("TORCHINFERNO_SYMM_MEM_ALLREDUCE", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_MAX_TOKENS", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_MAX_BATCH", raising=False)
+    model = object()
+    captured: list[tuple[int | None, bool | None]] = []
+    prefill_captured: list[bool | None] = []
+
+    class FakeContext:
+        def __enter__(self) -> None:
+            return None
+
+        def __exit__(self, exc_type, exc, traceback) -> bool:  # noqa: ANN001
+            return False
+
+    def fake_symm_scope(max_batch: int | None, *, enabled: bool | None = None) -> FakeContext:
+        captured.append((max_batch, enabled))
+        return FakeContext()
+
+    def fake_prefill_scope(enabled: bool | None = None) -> FakeContext:
+        prefill_captured.append(enabled)
+        return FakeContext()
+
+    monkeypatch.setattr("torchinferno.openai_server._is_tensor_parallel_model", lambda candidate: candidate is model)
+    monkeypatch.setattr("torchinferno.openai_server._tensor_parallel_world_size", lambda candidate: 8)
+    monkeypatch.setattr("torchinferno.openai_server.symm_mem_allreduce_max_batch", fake_symm_scope)
+    monkeypatch.setattr("torchinferno.openai_server.symm_mem_prefill_allreduce", fake_prefill_scope)
+
+    with _tensor_parallel_prefill_graph_runtime_key_scope(
+        model,
+        torch.device("cuda"),
+        max_tokens=512,
+    ):
+        pass
+
+    assert captured == [(128, True)]
+    assert prefill_captured == [False]
 
 
 def test_openai_symm_mem_scope_enables_sampled_and_disables_long_generations(monkeypatch) -> None:
