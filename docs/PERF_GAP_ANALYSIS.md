@@ -13616,6 +13616,21 @@ improved by `11.9ms`, median E2E by `12.6ms`, and p99 E2E dropped from
 active rows should prefer the already-warmed ragged graph over static row-view
 graphs that TP cannot capture on miss.
 
+The pushed-head `4e79fc9` full-suite validation wrote
+`/tmp/inference-bench-4e79-full-results/.../runs/20260710_232601` and completed
+all rows: few_shot `169.8 / 34.7 / 197.3ms`, self_consistency
+`28.5 / 0.0 / 29.3ms`, multi_turn `244.7 / 37.2 / 274.5ms`,
+tree_of_thought `60.9 / 39.2 / 90.1ms`, and long_output
+`235.7 / 21.5 / 944.8ms`. Correctness stayed in band
+(`977/1000`, `1000/1000`, `982/1000`, `956/992`, `1000/1000`). Multi_turn
+still shows some run-to-run median variance versus the focused probe, but the
+queue profile confirms the intended structural fix held in the full suite:
+`runtime_decode_graph_misses=0`, `runtime_decode_graph_hits=91`, and
+`runtime_decode_graph_replays=91` for the multi_turn row. The same full-suite
+profile now exposes a separate sampled-row target: self_consistency/tree still
+report small static logits misses at `b2/b3/b4...:s55/s56/s57`, because sampled
+decode cannot use the greedy ragged token graph path.
+
 ## Priority for a focused (non-loop) session
 
 1. Prefill MFU (Issue 1) — biggest TTFT lever, ~2x, affects 3/5 benchmarks.
