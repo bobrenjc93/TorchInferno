@@ -6636,6 +6636,7 @@ def test_continuous_batch_engine_online_many_can_use_multi_token_graph(monkeypat
     assert engine.stats.decode_many_model_tokens == 6
     assert engine.stats.decode_many_padded_tokens == 6
     assert engine.stats.decode_many_emitted_tokens == 6
+    assert engine.stats.decode_many_shape_steps == {"decode_many:b2/2": 3}
     assert engine.stats.decode_many_shape_model_tokens == {"decode_many:b2/2": 6}
     assert engine.stats.decode_many_step_window_counts == {"decode_many:b2/2:g1-16": 3}
     assert engine.stats.ragged_decode_active_tokens == 6
@@ -6830,6 +6831,7 @@ def test_continuous_batch_engine_online_many_graph_uses_row_indices(monkeypatch)
     assert engine.stats.decode_many_model_tokens == 9
     assert engine.stats.decode_many_padded_tokens == 12
     assert engine.stats.decode_many_emitted_tokens == 9
+    assert engine.stats.decode_many_shape_steps == {"decode_many:b3/4": 3}
     assert engine.stats.decode_many_shape_model_tokens == {"decode_many:b3/4": 9}
     assert engine.stats.decode_many_shape_padded_tokens == {"decode_many:b3/4": 12}
     assert engine.stats.ragged_decode_active_tokens == 9
@@ -7040,6 +7042,7 @@ def test_continuous_batch_engine_online_many_shape_model_tokens_include_padding(
     assert engine.stats.decode_many_model_tokens == 6
     assert engine.stats.decode_many_padded_tokens == 8
     assert engine.stats.decode_many_emitted_tokens == 6
+    assert engine.stats.decode_many_shape_steps == {"decode_many:b3/4": 2}
     assert engine.stats.decode_many_shape_model_tokens == {"decode_many:b3/4": 6}
     assert engine.stats.decode_many_shape_padded_tokens == {"decode_many:b3/4": 8}
     assert engine.stats.decode_many_shape_emitted_tokens == {"decode_many:b3/4": 6}
@@ -7403,6 +7406,7 @@ def test_continuous_batch_engine_online_many_can_overcompute_stop_tokens(monkeyp
     assert engine.stats.decode_many_skipped_tokens == 2
     assert engine.stats.decode_many_stop_finishes == 1
     assert engine.stats.decode_many_limit_finishes == 1
+    assert engine.stats.decode_many_shape_steps == {"decode_many:b2/2": 3}
     assert engine.stats.decode_many_shape_model_tokens == {"decode_many:b2/2": 6}
     assert engine.stats.decode_many_shape_emitted_tokens == {"decode_many:b2/2": 4}
     assert engine.stats.decode_many_shape_skipped_tokens == {"decode_many:b2/2": 2}
@@ -7465,6 +7469,10 @@ def test_continuous_batch_engine_online_many_can_sync_stop_tokens(monkeypatch) -
     assert engine.stats.decode_many_shape_model_tokens == {
         "decode_many:b2/2": 4,
         "decode_many:b3/3": 3,
+    }
+    assert engine.stats.decode_many_shape_steps == {
+        "decode_many:b2/2": 2,
+        "decode_many:b3/3": 1,
     }
     assert engine.stats.decode_many_shape_emitted_tokens == {
         "decode_many:b2/2": 4,

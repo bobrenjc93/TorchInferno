@@ -341,6 +341,7 @@ def _write_inference_bench_run(tmp_path) -> None:
         "runtime_decode_graph_cache_live_entries": 4,
         "runtime_decode_shape_gpu_ms": {"ragged:b8/8": 14.0},
         "runtime_decode_shape_cpu_tokens_ms": {"ragged:b8/8": 1.25},
+        "runtime_decode_many_shape_steps": {"decode_many:b8/8": 6},
         "runtime_decode_many_shape_model_tokens": {"decode_many:b8/8": 19},
         "runtime_decode_many_cpu_tokens_ms": 1.5,
         "runtime_decode_many_shape_padded_tokens": {"decode_many:b8/8": 24},

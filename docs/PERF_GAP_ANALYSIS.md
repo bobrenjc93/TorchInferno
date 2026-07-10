@@ -12382,6 +12382,14 @@ median shift came from queue/decode variation. Keep the current default and
 treat this as noise unless a repeated full-suite comparison shows a stable
 score win.
 
+Decode-many queue profiles now also export
+`runtime_decode_many_shape_steps` for the non-graph decode-many path. The
+existing `runtime_decode_many_shape_model_tokens` and emitted/skipped counters
+show token volume, while the new step counter makes it explicit whether a shape
+is expensive because it repeats many single-step replays or because each replay
+is slow. This is telemetry only; it does not change scheduling or graph replay
+behavior.
+
 ## Priority for a focused (non-loop) session
 
 1. Prefill MFU (Issue 1) — biggest TTFT lever, ~2x, affects 3/5 benchmarks.

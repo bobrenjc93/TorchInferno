@@ -480,6 +480,7 @@ class ServingStats:
     decode_many_tail_limited_calls: int = 0
     decode_many_tail_limited_steps: int = 0
     decode_many_min_active_skips: int = 0
+    decode_many_shape_steps: dict[str, int] = field(default_factory=dict)
     decode_many_shape_model_tokens: dict[str, int] = field(default_factory=dict)
     decode_many_shape_padded_tokens: dict[str, int] = field(default_factory=dict)
     decode_many_shape_emitted_tokens: dict[str, int] = field(default_factory=dict)
@@ -1505,6 +1506,10 @@ class ContinuousBatchEngine:
                     shape_key = graph_shape_key or f"decode_many:b{active_tokens}/{shape_model_tokens}"
                     if record_model_call_for_steps:
                         self._record_shape_count(self.stats.decode_shape_counts, shape_key)
+                    self._record_shape_count(
+                        self.stats.decode_many_shape_steps,
+                        shape_key,
+                    )
                     shape_parts.append((shape_key, active_tokens, shape_model_tokens))
                     model_elapsed_ms = graph_model_elapsed_ms / max(1, graph_steps)
                     if record_model_timing_for_steps:
@@ -1881,6 +1886,10 @@ class ContinuousBatchEngine:
                     )
                 self._flush_decode_ragged_model_gpu_timers()
             if shape_key is not None:
+                self._record_shape_count(
+                    self.stats.decode_many_shape_steps,
+                    shape_key,
+                )
                 self._record_shape_total(
                     self.stats.decode_many_shape_model_tokens,
                     shape_key,

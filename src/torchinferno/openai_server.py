@@ -7287,6 +7287,7 @@ class OpenAICompletionEngine:
                 "prefill_suffix_split_accepted_shape_counts",
                 "prefill_suffix_split_accepted_shape_saved_tokens",
                 "prefill_suffix_split_accepted_fragment_counts",
+                "decode_many_shape_steps",
                 "decode_many_shape_model_tokens",
                 "decode_many_shape_padded_tokens",
                 "decode_many_shape_emitted_tokens",

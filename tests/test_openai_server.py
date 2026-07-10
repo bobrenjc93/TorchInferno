@@ -15025,6 +15025,7 @@ def test_openai_queue_profile_records_runtime_engine_stats(
         decode_many_tail_limited_calls = 4
         decode_many_tail_limited_steps = 9
         decode_many_min_active_skips = 6
+        decode_many_shape_steps = {"decode_many:b8/8": 3}
         decode_many_shape_model_tokens = {"decode_many:b8/8": 19}
         decode_many_shape_padded_tokens = {"decode_many:b8/8": 24}
         decode_many_shape_emitted_tokens = {"decode_many:b8/8": 15}
@@ -15396,6 +15397,7 @@ def test_openai_queue_profile_records_runtime_engine_stats(
             "runtime_decode_many_tail_limited_calls": 4,
             "runtime_decode_many_tail_limited_steps": 9,
             "runtime_decode_many_min_active_skips": 6,
+            "runtime_decode_many_shape_steps": {"decode_many:b8/8": 3},
             "runtime_decode_many_shape_model_tokens": {"decode_many:b8/8": 19},
             "runtime_decode_many_shape_padded_tokens": {"decode_many:b8/8": 24},
             "runtime_decode_many_shape_emitted_tokens": {"decode_many:b8/8": 15},
