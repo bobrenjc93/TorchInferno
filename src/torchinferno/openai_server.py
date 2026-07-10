@@ -1606,10 +1606,16 @@ def _online_sampled_common_prefix_suffix_prefill_warmup_suffix_tokens(max_seq_le
         return ()
     configured = os.environ.get("TORCHINFERNO_OPENAI_WARMUP_ONLINE_SAMPLED_COMMON_PREFIX_SUFFIX_TOKENS")
     runtime_buckets = os.environ.get("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SUFFIX_BUCKETS")
+    default_buckets = _default_prefix_prefill_suffix_buckets(
+        _online_sampled_common_prefix_suffix_prefill_warmup_temperature(),
+        _online_sampled_common_prefix_suffix_prefill_warmup_max_token_values()[-1],
+    )
     if configured is not None:
         tokens = _parse_positive_int_csv(configured)
     elif runtime_buckets is not None:
         tokens = _parse_positive_int_csv(runtime_buckets)
+    elif default_buckets:
+        tokens = default_buckets
     else:
         tokens = _parse_positive_int_csv("16")
     return tuple(token_count for token_count in tokens if token_count <= max_seq_len)

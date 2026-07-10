@@ -186,12 +186,21 @@ def test_continuous_batch_engine_accepts_explicit_mixed_prefix_policy(monkeypatc
 def test_continuous_prefix_prefill_suffix_buckets_can_be_configured(monkeypatch) -> None:
     monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SUFFIX_BUCKETS", raising=False)
     monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SUFFIX_BUCKETS_GREEDY_LARGE", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SUFFIX_BUCKETS_SAMPLED_MEDIUM", raising=False)
     monkeypatch.delenv(
         "TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SUFFIX_BUCKETS_GREEDY_LARGE_MIN_TOKENS",
         raising=False,
     )
     monkeypatch.delenv(
         "TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SUFFIX_BUCKETS_GREEDY_LARGE_MAX_TOKENS",
+        raising=False,
+    )
+    monkeypatch.delenv(
+        "TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SUFFIX_BUCKETS_SAMPLED_MEDIUM_MIN_TOKENS",
+        raising=False,
+    )
+    monkeypatch.delenv(
+        "TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SUFFIX_BUCKETS_SAMPLED_MEDIUM_MAX_TOKENS",
         raising=False,
     )
     engine = ContinuousBatchEngine(object(), device=torch.device("cpu"))
@@ -226,6 +235,16 @@ def test_continuous_prefix_prefill_suffix_buckets_can_be_configured(monkeypatch)
         max_generation_tokens=512,
     )
     assert sampled_engine._suffix_bucket(65) == 128
+    sampled_medium_engine = ContinuousBatchEngine(
+        object(),
+        device=torch.device("cpu"),
+        temperature=0.7,
+        max_generation_tokens=300,
+    )
+    assert sampled_medium_engine._suffix_bucket(10) == 12
+    assert sampled_medium_engine._suffix_bucket(12) == 12
+    assert sampled_medium_engine._suffix_bucket(13) == 16
+    assert sampled_medium_engine._suffix_bucket(17) == 32
 
     monkeypatch.setenv(
         "TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SUFFIX_BUCKETS",

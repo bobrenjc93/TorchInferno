@@ -47,8 +47,41 @@ It moved readiness from `256.1s` to `266.2s`, removed request-time prefill graph
 capture (`2344.2ms -> 0`), and improved tree to `67.3 / 40.6 / 96.0ms`, p99
 `378.9 / 225.5 / 434.3ms`, with `957/992` correct. Keep the new sampled dense
 warmup: it is general graph-key hygiene for sampled common-prefix serving, not
-a benchmark prompt shortcut. The remaining tree gap is now steady prefill
-forward (`6.40s`), sampled decode (`3.49s` GPU), and sampling (`883ms`).
+a benchmark prompt shortcut. Before suffix-bucket promotion, the remaining tree
+gap was steady prefill forward (`6.40s`), sampled decode (`3.49s` GPU), and
+sampling (`883ms`).
+
+## Current 20260710 sampled-medium suffix buckets
+
+After sampled dense row-index warmup landed in `712aa08`, the previously
+rejected `s12,16` suffix-bucket candidate became valid for sampled medium
+traffic. The old rejection was caused by cold dense (`rows0`) configured-suffix
+graph keys; it is superseded for sampled common-prefix requests because startup
+now warms the `rows0` and indexed (`rows1`) sampled graph variants.
+
+An opt-in run on `712aa08` with
+`TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SUFFIX_BUCKETS=12,16` wrote
+`/tmp/inference-bench-tree-s12s16-712aa08-results/.../runs/20260710_125925`.
+It landed at `55.8 / 36.3 / 81.0ms`, p99 `339.9 / 230.8 / 404.0ms`, with
+`961/992` correct. Queue telemetry showed no request-time prefill captures or
+misses, prefill forward/wall `3.68s/4.61s`, padding `1989` tokens
+(`825` suffix, `1164` row), decode GPU `1.81s`, and Gumbel sampling `491ms`.
+
+Promoting the same shape policy as the no-env sampled-medium default wrote
+`/tmp/inference-bench-tree-s12default-dirty-results/.../runs/20260710_130643`.
+It landed at `59.2 / 39.0 / 86.0ms`, p99 `426.0 / 219.5 / 461.0ms`, with
+`959/992` correct. The final queue profile again had
+`runtime_prefill_graph_capture_gpu_ms=0` and no prefill graph miss shapes. It
+reported `s12` replay for `b1/b2/b4/b8/b16` sampled common-prefix shapes,
+prefill forward/wall `6.27s/7.73s`, padding `3590` tokens (`1502` suffix,
+`2088` row), decode GPU `3.52s`, and Gumbel sampling `949ms`.
+
+Keep sampled-medium `s12,16` as a default only for sampled requests with
+`max_generation_tokens` in `(256, 384]`, with explicit env overrides still
+taking precedence. Against the same-host vLLM tree refresh at
+`38.8 / 26.7 / 56.9ms`, TorchInferno is still behind by roughly `+17-20ms`
+TTFT, `+10-12ms` TPOT, and `+24-29ms` E2E, so the next tree target is reducing
+steady `s12` prefill/decode/sampling cost rather than graph capture churn.
 
 ## Current 20260710 tree fixed-capacity packed-prefill rejection
 

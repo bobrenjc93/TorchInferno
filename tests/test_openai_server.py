@@ -11345,6 +11345,15 @@ def test_online_common_prefix_prefill_warmup_filters_shapes(monkeypatch) -> None
     monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_DYNAMIC_PREFIX_PREFILL_GREEDY_LARGE_MAX_SUFFIX", raising=False)
     monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_BATCH_BUCKETS", raising=False)
     monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SUFFIX_BUCKETS", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SUFFIX_BUCKETS_SAMPLED_MEDIUM", raising=False)
+    monkeypatch.delenv(
+        "TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SUFFIX_BUCKETS_SAMPLED_MEDIUM_MIN_TOKENS",
+        raising=False,
+    )
+    monkeypatch.delenv(
+        "TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SUFFIX_BUCKETS_SAMPLED_MEDIUM_MAX_TOKENS",
+        raising=False,
+    )
     monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SUFFIX_BUCKETS_GREEDY_LARGE", raising=False)
     monkeypatch.delenv(
         "TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SUFFIX_BUCKETS_GREEDY_LARGE_MIN_TOKENS",
@@ -11376,7 +11385,7 @@ def test_online_common_prefix_prefill_warmup_filters_shapes(monkeypatch) -> None
         32,
         48,
     )
-    assert _online_sampled_common_prefix_suffix_prefill_warmup_suffix_tokens(128) == (16,)
+    assert _online_sampled_common_prefix_suffix_prefill_warmup_suffix_tokens(128) == (12, 16)
     assert _online_greedy_common_prefix_suffix_prefill_warmup_enabled()
     assert _online_greedy_common_prefix_suffix_prefill_warmup_max_token_values() == (128, 512)
     assert _online_greedy_common_prefix_suffix_prefill_warmup_max_tokens() == 512
@@ -11453,6 +11462,7 @@ def test_online_common_prefix_prefill_warmup_filters_shapes(monkeypatch) -> None
         warmup_temperature=1.0,
         warmup_max_tokens=256,
     ) == (1, 2, 4, 8, 16, 32)
+    assert _online_sampled_common_prefix_suffix_prefill_warmup_suffix_tokens(128) == (12, 16)
     monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SUFFIX_BUCKETS", "8,16")
     assert _online_sampled_common_prefix_suffix_prefill_warmup_suffix_tokens(128) == (8, 16)
     monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SUFFIX_BUCKETS", raising=False)
