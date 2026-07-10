@@ -183,6 +183,22 @@ count-only queue-profile path plus existing profile-timed Gumbel sampling,
 queue-profile export, inference-bench summary formatting, `pyflakes`, and
 `git diff --check`; `ruff` was unavailable in both local Python environments.
 
+A pushed-head no-sync tree_of_thought validation on `ea1e71a` wrote
+`/tmp/inference-bench-sampler-count-tree-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-sampler-count-tree/runs/20260710_210745`.
+It reached readiness in `281.3s` and landed at `63.6 / 36.6 / 89.7ms`,
+p99 `340.6 / 238.6 / 348.5ms`, with `957/992` correct. The final
+queue-profile event kept the lightweight sampled-row signal:
+`runtime_temperature_sample_calls=785`,
+`runtime_temperature_sample_rows=2571`,
+`runtime_temperature_sample_gumbel_calls=785`, and
+`runtime_temperature_sample_gumbel_rows=2571`, while no
+`runtime_temperature_sample*` timing keys were present. The final profile also
+kept request timing and graph counters (`q2first=59.1ms`,
+`q2submit=22.9ms`, `submit2first=35.1ms`,
+`runtime_prefill_graph_hits=331`, `runtime_prefill_graph_misses=0`), so the
+count-only sampler signal does not reintroduce the CUDA-synchronized sampler
+timing overhead that the lightweight gate removed.
+
 ## Public 20260710_140141 current-run refresh and scheduling rejections
 
 The public pointer now includes the current TorchInferno main run:
