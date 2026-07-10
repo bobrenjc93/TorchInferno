@@ -6024,7 +6024,9 @@ def test_online_low_memory_graph_cleanup_clears_graphs_and_empties_cache(monkeyp
     monkeypatch.setattr(torch.cuda, "empty_cache", lambda: calls.append("empty_cache"))
     monkeypatch.setattr(
         "torchinferno.openai_server._broadcast_tensor_parallel_cleanup",
-        lambda cleanup_model, *, empty_cache=False: calls.append(("cleanup", cleanup_model, empty_cache)),
+        lambda cleanup_model, *, empty_cache=False, clear_graph_caches=True, trim_graph_caches=False: calls.append(
+            ("cleanup", cleanup_model, empty_cache, clear_graph_caches, trim_graph_caches)
+        ),
     )
     monkeypatch.setattr(
         "torchinferno.openai_server._sync_tensor_parallel_command",
@@ -6038,7 +6040,8 @@ def test_online_low_memory_graph_cleanup_clears_graphs_and_empties_cache(monkeyp
     assert fields["graph_memory_cleanup_free_after_mb"] == 2048.0
     assert fields["graph_memory_cleanup_before_ragged_prefill_logits_graphs"] == 1
     assert fields["graph_memory_cleanup_after_ragged_prefill_logits_graphs"] == 0
-    assert ("cleanup", model, True) in calls
+    assert fields["graph_memory_cleanup_strategy"] == "clear_all"
+    assert ("cleanup", model, True, True, False) in calls
     assert "empty_cache" in calls
     assert any(call[0] == "tp_sync" for call in calls if isinstance(call, tuple))
     for graph_map in (
@@ -6055,7 +6058,64 @@ def test_online_low_memory_graph_cleanup_clears_graphs_and_empties_cache(monkeyp
         assert graph_map == {}
 
 
-def test_tensor_parallel_cleanup_broadcast_sets_empty_cache_bit(monkeypatch) -> None:
+def test_online_low_memory_graph_cleanup_trims_prefill_graphs_before_full_clear(monkeypatch) -> None:
+    class Model:
+        def __init__(self) -> None:
+            self._prefill_graphs = {"prefill": object()}
+            self._prefill_logits_graphs = {"prefill_logits": object()}
+            self._prefill_selected_logits_graphs = {"selected": object()}
+            self._ragged_prefill_logits_graphs = {"keep": object(), "evict": object()}
+            self._decode_graphs = {"decode": object()}
+            self._decode_logits_graphs = {"decode_logits": object()}
+            self._ragged_decode_graphs = {"ragged_decode": object()}
+            self._ragged_decode_logits_graphs = {"ragged_decode_logits": object()}
+            self._ragged_decode_many_graphs = {"decode_many": object()}
+
+        def _trim_ragged_prefill_logits_graphs_for_memory(self) -> bool:
+            self._ragged_prefill_logits_graphs.pop("evict", None)
+            return True
+
+    model = Model()
+    engine = OpenAICompletionEngine.__new__(OpenAICompletionEngine)
+    engine.model = model
+    engine.device = torch.device("cuda")
+    engine._cache_pool = {}
+    engine._microbatch_cache_pool = {}
+    engine._single_prefill_capture_seen = set()
+    engine._batched_prefill_capture_seen = set()
+    calls: list[object] = []
+    mem_values = [
+        (2 * 1024 * 1024, 80 * 1024 * 1024 * 1024),
+        (512 * 1024 * 1024, 80 * 1024 * 1024 * 1024),
+    ]
+
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_GRAPH_CLEANUP_MIN_FREE_MB", "256")
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device=None: mem_values.pop(0))
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda device=None: calls.append(("cuda_sync", device)))
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: calls.append("empty_cache"))
+    monkeypatch.setattr(
+        "torchinferno.openai_server._broadcast_tensor_parallel_cleanup",
+        lambda cleanup_model, *, empty_cache=False, clear_graph_caches=True, trim_graph_caches=False: calls.append(
+            ("cleanup", cleanup_model, empty_cache, clear_graph_caches, trim_graph_caches)
+        ),
+    )
+    monkeypatch.setattr(
+        "torchinferno.openai_server._sync_tensor_parallel_command",
+        lambda sync_model, device, **kwargs: calls.append(("tp_sync", sync_model, device, kwargs)),
+    )
+
+    fields = engine._maybe_release_online_graph_caches_for_memory(temperature=0.0, max_tokens=512)
+
+    assert fields["graph_memory_cleanup_strategy"] == "trim_prefill"
+    assert fields["graph_memory_cleanup_before_ragged_prefill_logits_graphs"] == 2
+    assert fields["graph_memory_cleanup_after_ragged_prefill_logits_graphs"] == 1
+    assert "graph_memory_cleanup_fallback_clear" not in fields
+    assert ("cleanup", model, True, False, True) in calls
+    assert list(model._ragged_prefill_logits_graphs) == ["keep"]
+    assert model._decode_graphs
+
+
+def test_tensor_parallel_cleanup_broadcast_sets_cache_and_graph_bits(monkeypatch) -> None:
     import torch.distributed as dist
 
     model = type("FakeTPModel", (), {"world_size": 2, "rank": 0, "device": torch.device("cpu")})()
@@ -6078,12 +6138,19 @@ def test_tensor_parallel_cleanup_broadcast_sets_empty_cache_bit(monkeypatch) -> 
     )
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_TENSOR_COMMANDS", "1")
 
-    _broadcast_tensor_parallel_cleanup(model, empty_cache=True)
+    _broadcast_tensor_parallel_cleanup(
+        model,
+        empty_cache=True,
+        clear_graph_caches=False,
+        trim_graph_caches=True,
+    )
 
     assert len(captured) == 1
     meta = captured[0]
     assert int(meta[0].item()) == _TP_COMMAND_CLEANUP
     assert int(meta[1].item()) == 1
+    assert int(meta[2].item()) == 0
+    assert int(meta[3].item()) == 1
 
 
 def test_tensor_parallel_online_close_broadcast_sets_cuda_sync_bit(monkeypatch) -> None:
@@ -11637,7 +11704,6 @@ def test_openai_greedy_common_prefix_suffix_warmup_captures_target_shapes(monkey
         ((2, 16), -256, 8, 0.0),
     ]
 
-
 def test_openai_chunked_prefill_warmup_captures_cache_and_logits_dynamic_contexts(monkeypatch) -> None:
     monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_FP8_PREFILL", raising=False)
     monkeypatch.delenv("TORCHINFERNO_FP8_PREFILL", raising=False)
@@ -16693,7 +16759,7 @@ def test_openai_tensor_parallel_online_batcher_uses_queued_limit_for_default_row
     assert commands[0] == (
         "start",
         {
-            "max_seq_len": 248,
+            "max_seq_len": 280,
             "max_active_requests": 48,
             "prefix_cache_capacity": 1,
             "prefill_token_budget": None,
@@ -16913,7 +16979,7 @@ def test_openai_tensor_parallel_online_batcher_buckets_greedy_short_sessions(
         (
             "start",
             {
-                "max_seq_len": 130,
+                "max_seq_len": 162,
                 "max_active_requests": 4,
                 "prefix_cache_capacity": 1,
                 "prefill_token_budget": None,
@@ -17446,7 +17512,7 @@ def test_openai_tensor_parallel_online_default_prefix_rows(monkeypatch: pytest.M
     assert engine._online_serving_prefix_rows() == 64
     assert engine._online_serving_effective_prefix_rows(48) == 64
     assert engine._online_serving_effective_prefix_rows(128) == 16
-    assert engine._online_serving_prefix_rows(temperature=0.0, max_tokens=512) == 64
+    assert engine._online_serving_prefix_rows(temperature=0.0, max_tokens=512) == 112
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_MIXED_PREFIX_REUSE", "1")
     assert engine._online_serving_prefix_rows(temperature=0.0, max_tokens=512) == 112
     assert (

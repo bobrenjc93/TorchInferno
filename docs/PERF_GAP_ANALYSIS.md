@@ -12292,6 +12292,38 @@ decode-many directions do not change under this profile: the current target is
 still a faster model-side cached-prefix prefill body, or a packed prefill body
 that avoids the Python packed-eager path's already-measured overhead.
 
+Public `20260710_050745` exposed a distinct multi_turn failure mode on
+TorchInferno `861b7c3`: the 512-token greedy session entered the online batcher
+with only `2.062MB` free CUDA memory, so low-memory cleanup cleared all `136`
+ragged-prefill graphs and raised free memory to `23818MB`. Because
+greedy-large prefix prefill has capture-on-miss disabled, multi_turn then paid
+`33` request-path ragged-prefill graph misses and landed at
+`481.6 / 122.3 / 585.3ms` versus the local no-cleanup band near
+`233.5 / 37.2 / 262.5ms`. The fix is to make the low-memory path trim
+ragged-prefill graph entries first using the model-side memory watermark, and
+fall back to full graph clearing only when trimming does not recover the online
+cleanup threshold. The cleanup command now carries explicit `clear_graph_caches`
+and `trim_graph_caches` bits so TP workers mirror rank 0. This keeps the
+existing OOM guard while avoiding the all-or-nothing graph-cache wipe that made
+large greedy sessions unrecoverable.
+
+The greedy-mid token-prefill default remains rejected. A broad env probe
+(`TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_TOKEN_GRAPH=1` plus token suffix `16`)
+improved local few_shot to `172.2 / 35.5 / 201.7ms`, but the narrow
+code-default version landed at `184.4 / 35.5 / 214.6ms`, worse than the local
+control `182.7 / 35.1 / 213.2ms`. Keep token-prefill expansion opt-in until it
+beats the default without relying on broad suffix coverage.
+
+Post-fix focused local validation on `a4d92f0` plus the trim-first cleanup
+patch wrote
+`/tmp/inference-bench-torchinferno-cleanup-trim-results/.../runs/20260710_060847`.
+The normal no-cleanup path stayed in the expected band: few_shot
+`184.2 / 36.0 / 214.8ms`, multi_turn `242.3 / 37.9 / 283.1ms`, correctness
+`0.977/0.982`. Queue telemetry showed no cleanup applied locally, `148` live
+ragged-prefill graph entries, zero evictions, `33` prefill graph replays on
+both workloads, and multi_turn only one miss. The new unit coverage directly
+exercises the low-memory trim-first path and the TP cleanup command bits.
+
 ## Priority for a focused (non-loop) session
 
 1. Prefill MFU (Issue 1) — biggest TTFT lever, ~2x, affects 3/5 benchmarks.

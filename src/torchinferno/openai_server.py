@@ -6537,7 +6537,13 @@ class OpenAICompletionEngine:
         self._clear_runtime_state_after_idle()
         _sync_tensor_parallel_command(self.model, self.device, cuda_sync=False)
 
-    def _clear_runtime_state_after_idle(self, *, force_empty_cache: bool = False) -> None:
+    def _clear_runtime_state_after_idle(
+        self,
+        *,
+        force_empty_cache: bool = False,
+        clear_graph_caches: bool | None = None,
+        trim_graph_caches: bool = False,
+    ) -> None:
         if env_flag("TORCHINFERNO_OPENAI_IDLE_CLEANUP_CACHE_POOLS", True):
             self._clear_cache_pool(self._cache_pool, model=self.model)
             self._clear_cache_pool(self._microbatch_cache_pool, model=self.model)
@@ -6549,8 +6555,12 @@ class OpenAICompletionEngine:
         self._token_budget_step_last_result = None
         if env_flag("TORCHINFERNO_OPENAI_IDLE_CLEANUP_PREFIX_CACHE", False):
             self._clear_prefix_cache()
-        if env_flag("TORCHINFERNO_OPENAI_IDLE_CLEANUP_GRAPH_CACHES", True):
+        if clear_graph_caches is None:
+            clear_graph_caches = env_flag("TORCHINFERNO_OPENAI_IDLE_CLEANUP_GRAPH_CACHES", True)
+        if clear_graph_caches:
             _clear_model_graph_caches(self.model)
+        elif trim_graph_caches:
+            _trim_model_ragged_prefill_graph_caches_for_memory(self.model)
         if self.device.type == "cuda" and (
             force_empty_cache or env_flag("TORCHINFERNO_OPENAI_IDLE_CLEANUP_EMPTY_CACHE", False)
         ):
@@ -6594,14 +6604,67 @@ class OpenAICompletionEngine:
             "graph_memory_cleanup_max_tokens": int(max_tokens),
         }
         fields.update(_model_graph_cache_profile_fields(self.model, "graph_memory_cleanup_before_"))
-        _broadcast_tensor_parallel_cleanup(self.model, empty_cache=True)
-        self._clear_runtime_state_after_idle(force_empty_cache=True)
+        trim_graph_caches = (
+            env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_GRAPH_CLEANUP_TRIM_PREFILL", True)
+            and _model_supports_ragged_prefill_graph_trim(self.model)
+        )
+        clear_graph_caches = not trim_graph_caches
+        fields["graph_memory_cleanup_strategy"] = (
+            "trim_prefill" if trim_graph_caches else "clear_all"
+        )
+        _broadcast_tensor_parallel_cleanup(
+            self.model,
+            empty_cache=True,
+            clear_graph_caches=clear_graph_caches,
+            trim_graph_caches=trim_graph_caches,
+        )
+        self._clear_runtime_state_after_idle(
+            force_empty_cache=True,
+            clear_graph_caches=clear_graph_caches,
+            trim_graph_caches=trim_graph_caches,
+        )
         _sync_tensor_parallel_command(self.model, self.device, cuda_sync=False)
+        free_after: int | None = None
         try:
             free_after, _total_after = torch.cuda.mem_get_info(self.device)
             fields["graph_memory_cleanup_free_after_mb"] = round(int(free_after) / (1024 * 1024), 3)
         except Exception as exc:
             warn_optional_failure("openai.online_graph_memory.mem_get_info_after", exc)
+        if (
+            trim_graph_caches
+            and free_after is not None
+            and int(free_after) < min_free_bytes
+            and env_flag(
+                "TORCHINFERNO_OPENAI_TP_ONLINE_GRAPH_CLEANUP_FALLBACK_CLEAR",
+                True,
+            )
+        ):
+            fields["graph_memory_cleanup_fallback_clear"] = True
+            fields["graph_memory_cleanup_free_after_trim_mb"] = round(
+                int(free_after) / (1024 * 1024),
+                3,
+            )
+            fields.update(_model_graph_cache_profile_fields(self.model, "graph_memory_cleanup_after_trim_"))
+            _broadcast_tensor_parallel_cleanup(
+                self.model,
+                empty_cache=True,
+                clear_graph_caches=True,
+                trim_graph_caches=False,
+            )
+            self._clear_runtime_state_after_idle(
+                force_empty_cache=True,
+                clear_graph_caches=True,
+                trim_graph_caches=False,
+            )
+            _sync_tensor_parallel_command(self.model, self.device, cuda_sync=False)
+            try:
+                free_after_clear, _total_after_clear = torch.cuda.mem_get_info(self.device)
+                fields["graph_memory_cleanup_free_after_mb"] = round(
+                    int(free_after_clear) / (1024 * 1024),
+                    3,
+                )
+            except Exception as exc:
+                warn_optional_failure("openai.online_graph_memory.mem_get_info_after_clear", exc)
         fields.update(_model_graph_cache_profile_fields(self.model, "graph_memory_cleanup_after_"))
         return fields
 
@@ -14443,7 +14506,12 @@ def _receive_tensor_parallel_tensor_payload(engine: OpenAICompletionEngine) -> d
     if command_kind == _TP_COMMAND_ONLINE_CLOSE:
         return {"op": "online_close", "cuda_sync": bool(int(meta[1].item()))}
     if command_kind == _TP_COMMAND_CLEANUP:
-        return {"op": "cleanup", "empty_cache": bool(int(meta[1].item()))}
+        return {
+            "op": "cleanup",
+            "empty_cache": bool(int(meta[1].item())),
+            "clear_graph_caches": bool(int(meta[2].item())),
+            "trim_graph_caches": bool(int(meta[3].item())),
+        }
     if command_kind == _TP_COMMAND_PROMPT_LIST_PERSISTENT_CLOSE:
         return {"op": "persistent_prompt_list_close"}
     if command_kind == _TP_COMMAND_TOKEN_BUDGET_CLOSE:
@@ -15244,14 +15312,25 @@ def _broadcast_tensor_parallel_stop(model: object) -> None:
         dist.broadcast_object_list([{"op": "stop"}], src=0)
 
 
-def _broadcast_tensor_parallel_cleanup(model: object, *, empty_cache: bool = False) -> None:
+def _broadcast_tensor_parallel_cleanup(
+    model: object,
+    *,
+    empty_cache: bool = False,
+    clear_graph_caches: bool = True,
+    trim_graph_caches: bool = False,
+) -> None:
     if not _is_tensor_parallel_primary_model(model):
         return
     import torch.distributed as dist
 
     if not (dist.is_available() and dist.is_initialized()):
         return
-    payload = {"op": "cleanup", "empty_cache": bool(empty_cache)}
+    payload = {
+        "op": "cleanup",
+        "empty_cache": bool(empty_cache),
+        "clear_graph_caches": bool(clear_graph_caches),
+        "trim_graph_caches": bool(trim_graph_caches),
+    }
     if _broadcast_tensor_parallel_shm_payload(model, payload):
         return
     if _tensor_parallel_tensor_commands_enabled(model):
@@ -15263,6 +15342,8 @@ def _broadcast_tensor_parallel_cleanup(model: object, *, empty_cache: bool = Fal
         meta = torch.zeros(_TP_COMMAND_META_FIELDS, dtype=torch.long, device=device)
         meta[0] = _TP_COMMAND_CLEANUP
         meta[1] = int(bool(empty_cache))
+        meta[2] = int(bool(clear_graph_caches))
+        meta[3] = int(bool(trim_graph_caches))
         _broadcast_tensor_command(meta, src=0, group=command_group)
         return
     dist.broadcast_object_list([payload], src=0)
@@ -15346,7 +15427,9 @@ def _tensor_parallel_worker_loop(engine: OpenAICompletionEngine) -> None:
         try:
             if op == "cleanup":
                 engine._clear_runtime_state_after_idle(
-                    force_empty_cache=bool(payload.get("empty_cache", False))
+                    force_empty_cache=bool(payload.get("empty_cache", False)),
+                    clear_graph_caches=bool(payload.get("clear_graph_caches", True)),
+                    trim_graph_caches=bool(payload.get("trim_graph_caches", False)),
                 )
                 continue
             if op == "flashinfer_start":
@@ -18285,6 +18368,22 @@ def _sync_before_decode_graph_release(
         torch.cuda.synchronize(sync_device)
     except Exception as exc:
         warn_optional_failure(label, exc)
+
+
+def _model_supports_ragged_prefill_graph_trim(model: object) -> bool:
+    trim = getattr(model, "_trim_ragged_prefill_logits_graphs_for_memory", None)
+    return callable(trim)
+
+
+def _trim_model_ragged_prefill_graph_caches_for_memory(model: object) -> bool | None:
+    trim = getattr(model, "_trim_ragged_prefill_logits_graphs_for_memory", None)
+    if not callable(trim):
+        return None
+    try:
+        return bool(trim())
+    except Exception as exc:
+        warn_optional_failure("openai.trim_ragged_prefill_graph_caches", exc)
+        return None
 
 
 def _clear_model_graph_caches(model: object) -> None:
