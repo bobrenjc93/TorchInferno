@@ -12337,6 +12337,20 @@ request-path graph captures. This matches the intended post-cleanup invariant:
 long_output should keep warmed decode graphs unless the last-resort full graph
 clear is actually required.
 
+Two current-head sequence reruns kept the same invariant across workload
+handoff. A TorchInferno-only `multi_turn long_output` run on `e19cd9e` wrote
+`/tmp/inference-bench-torchinferno-cleanup-sequence-results/.../runs/20260710_064659`.
+It landed at multi_turn `241.1 / 39.9 / 275.2ms`, long_output `246.7 / 21.0 /
+1089.4ms`, and kept `16` live ragged decode graphs with `736` long_output
+replays. Repeating the sequence with
+`TORCHINFERNO_OPENAI_TP_ONLINE_GRAPH_CLEANUP_MIN_FREE_MB=8192` wrote
+`/tmp/inference-bench-torchinferno-forced-cleanup-sequence-results/.../runs/20260710_065308`.
+It landed at multi_turn `232.5 / 38.3 / 264.0ms`, long_output `220.0 / 22.1 /
+1115.3ms`, and again kept `16` live decode graphs with `728` long_output
+replays. The local host still had enough free memory that even the 8GB threshold
+did not apply cleanup, so direct low-memory branch evidence remains the unit
+coverage plus the public `20260710_050745` cleanup telemetry.
+
 The greedy-short initial wait expansion remains rejected on current head. A
 local `TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_INITIAL_BATCH_WAIT_MS=5`
 probe wrote
