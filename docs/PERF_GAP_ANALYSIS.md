@@ -1,5 +1,49 @@
 # TorchInferno vs vLLM/sglang — Performance Gap Analysis (Llama-3.1-70B, 8xH100)
 
+## Public 20260710_111248 refresh
+
+The public pointer advanced in `origin/main` to
+`results/v1/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100/runs/20260710_111248`.
+It measured TorchInferno `a4d92f0`, vLLM `68ea76e`, and SGLang `7045e0f`, so it
+still predates the current `codex/token-prefill-decode-safety` branch through
+the dense greedy-prefix warmup and later rejection notes. Public TorchInferno
+wins self-consistency (`53.7 / 0.0 / 54.1ms`) and few-shot TPOT (`31.4ms`),
+but trails vLLM on few-shot (`152.1 / 31.4 / 176.9ms` vs
+`77.0 / 36.2 / 107.3ms`), multi-turn (`469.5 / 124.5 / 569.0ms` vs
+`70.4 / 35.9 / 96.8ms`), tree (`126.7 / 84.4 / 166.2ms` vs
+`35.2 / 22.9 / 53.3ms`), and long-output (`587.9 / 65.3 / 2915.1ms` vs
+`46.4 / 15.2 / 581.0ms`).
+
+The public queue profile matches the already-open targets rather than a new
+direction. Few-shot still suffers first-wave prefill/decode graph churn that
+the later dense warmup branch improves locally. Multi-turn is dominated by
+decode graph misses and padded mixed-prefix prefill (`3.6K` padding tokens,
+`1.36s` prefill forward). Tree remains sampled prefill plus sampled decode
+(`5.02s` prefill forward, `10.30s` decode GPU, `188` decode graph misses).
+Long-output is again high-active decode-many dominated:
+`32.56s` decode-many GPU over `607` steps with `1.6K` overgenerated tokens.
+
+## Current 20260710 tree fixed-capacity packed-prefill rejection
+
+The fixed-capacity packed-prefix prefill diagnostic is not a sampled-tree fix.
+A focused TorchInferno-only tree run on `a0f380c` enabled
+`TORCHINFERNO_CONTINUOUS_PACKED_RAGGED_PREFILL_FIXED_CAPACITY_GRAPH=1` and
+wrote
+`/tmp/inference-bench-tree-fixedpacked-a0f380c-results/.../runs/20260710_115122`.
+It stayed correct enough (`964/992`) but regressed catastrophically to
+`1151.1 / 458.3 / 1297.1ms` from the current tree band near
+`61-86 / 39-47 / 89-122ms`.
+
+The queue profile shows why the env path must remain diagnostic-only:
+`runtime_prefill_packed_fixed_capacity_attempts=111` and
+`runtime_prefill_packed_fixed_capacity_accepts=0`, with rejects
+`{"capacity_grew": 33, "graph_returned_none": 63, "warming": 15}`. The failed
+packed probes collapsed the schedule into large `b16:s16:p45` prefill waves,
+inflating prefill forward/wall to `31.5s/32.6s`. The runtime now remembers
+concrete fixed-capacity layouts whose packed graph returned `None` and records
+later skips as `graph_returned_none_cached`, so future opt-in packed-prefill
+experiments do not keep probing the same unsupported graph shape.
+
 ## Current 20260710 decode-many async-readback default-off recheck
 
 Async decode-many readback is default-off again. A paired focused long_output

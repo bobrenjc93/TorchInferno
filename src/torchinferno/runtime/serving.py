@@ -1035,6 +1035,9 @@ class ContinuousBatchEngine:
         ] = {}
         self._packed_prefill_fixed_capacity_seen: dict[str, int] = {}
         self._packed_prefill_fixed_capacity_stable_seen: dict[str, int] = {}
+        self._packed_prefill_fixed_capacity_graph_none_keys: set[
+            tuple[str, tuple[tuple[int, int], ...]]
+        ] = set()
         self._prefill_token_graph_miss_keys: set[str] = set()
         self._free_active_rows: list[int] = []
         self._free_prefix_rows: list[int] = []
@@ -2604,6 +2607,7 @@ class ContinuousBatchEngine:
         self._packed_prefill_fixed_capacity_counts = {}
         self._packed_prefill_fixed_capacity_seen = {}
         self._packed_prefill_fixed_capacity_stable_seen = {}
+        self._packed_prefill_fixed_capacity_graph_none_keys = set()
         total_rows = self.max_active_requests + self.prefix_cache_capacity
         if external_cache is not None:
             self._cache = external_cache
@@ -4141,6 +4145,13 @@ class ContinuousBatchEngine:
         if fixed_tokens <= 0 or fixed_tokens >= dense_tokens:
             self._record_fixed_capacity_packed_prefill_reject("no_savings")
             return None
+        graph_none_key = (
+            packed_prefill_pattern_key,
+            tuple((start_len, suffix_len) for start_len, suffix_len, _real_index in slot_specs),
+        )
+        if graph_none_key in self._packed_prefill_fixed_capacity_graph_none_keys:
+            self._record_fixed_capacity_packed_prefill_reject("graph_returned_none_cached")
+            return None
 
         dummy_needed = sum(
             1 for _start_len, _suffix_len, real_index in slot_specs if real_index is None
@@ -4223,6 +4234,7 @@ class ContinuousBatchEngine:
             )
             if logits is None:
                 self._record_fixed_capacity_packed_prefill_reject("graph_returned_none")
+                self._packed_prefill_fixed_capacity_graph_none_keys.add(graph_none_key)
                 return None
             real_index_tensor = self._device_index_tensor(tuple(real_slot_indices)).to(
                 device=logits.device

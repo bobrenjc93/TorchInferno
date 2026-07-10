@@ -3468,7 +3468,15 @@ def test_continuous_batch_engine_packed_ragged_prefill_graph_only_falls_back_to_
         prefix_copy_len=None,
         capture_on_miss=True,
     ):
-        del input_ids, cache, seq_lens, row_indices, logit_positions, src_prefix_row, prefix_copy_len
+        del (
+            input_ids,
+            cache,
+            seq_lens,
+            row_indices,
+            logit_positions,
+            src_prefix_row,
+            prefix_copy_len,
+        )
         model.packed_prefill_graph_q_lens.append(q_lens.detach().cpu().tolist())
         model.prefill_capture_flags.append(bool(capture_on_miss))
         return None
@@ -3628,6 +3636,92 @@ def test_continuous_batch_engine_records_fixed_capacity_packed_prefill_rejects(
         "capacity_grew": 1,
     }
     for row in real_rows:
+        engine._release_active_row(row)
+
+
+def test_continuous_batch_engine_caches_fixed_capacity_packed_graph_none(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv(
+        "TORCHINFERNO_CONTINUOUS_PACKED_RAGGED_PREFILL_FIXED_CAPACITY_GRAPH",
+        "1",
+    )
+    monkeypatch.setenv(
+        "TORCHINFERNO_CONTINUOUS_PACKED_RAGGED_PREFILL_FIXED_CAPACITY_MIN_CALLS",
+        "1",
+    )
+    shape_key = "prefix_graph:b2:s5:p0-0:src0:mixed0"
+    pattern_key = f"{shape_key}|p0:s2/p0:s4"
+    model = _SelectedLogitsToyModel()
+
+    def decline_packed_graph(
+        input_ids,
+        cache,
+        *,
+        seq_lens,
+        q_lens,
+        row_indices,
+        logit_positions,
+        src_prefix_row=None,
+        prefix_copy_len=None,
+        capture_on_miss=True,
+    ):
+        del input_ids, cache, seq_lens, row_indices, logit_positions, src_prefix_row, prefix_copy_len
+        model.packed_prefill_graph_q_lens.append(q_lens.detach().cpu().tolist())
+        model.prefill_capture_flags.append(bool(capture_on_miss))
+        return None
+
+    model.try_prefill_ragged_logits_packed_eager_graph = decline_packed_graph
+    engine = ContinuousBatchEngine(
+        model,
+        device=torch.device("cpu"),
+        max_active_requests=3,
+        prefix_cache_capacity=3,
+        profile_timings=True,
+    )
+    engine.start_online(max_seq_len=8)
+    real_rows = [engine._acquire_active_row(), engine._acquire_active_row()]
+    pad_rows = [engine._acquire_active_row()]
+    engine._packed_prefill_fixed_capacity_counts[pattern_key] = {
+        (0, 2): 2,
+        (0, 4): 1,
+    }
+
+    def try_fixed() -> object:
+        return engine._try_fixed_capacity_packed_prefill_logits(
+            input_ids=torch.tensor(
+                [[3, 4, 5, 6, 0], [1, 2, 0, 0, 0]],
+                dtype=torch.long,
+            ),
+            group=[
+                (1, ServingRequest("long", (3, 4, 5, 6), 1), 0, object()),
+                (0, ServingRequest("short", (1, 2), 1), 0, object()),
+            ],
+            rows=real_rows,
+            suffixes=[[3, 4, 5, 6], [1, 2]],
+            suffix_lengths=[4, 2],
+            suffix_bucket=5,
+            source_prefix_rows=[],
+            src_prefix_row=None,
+            prefix_copy_len=None,
+            pad_rows=pad_rows,
+            pad_prefix_rows=[],
+            capture_on_miss=False,
+            profile_shape_key=shape_key,
+            packed_prefill_pattern_key=pattern_key,
+            skip_active_row_clear=True,
+        )
+
+    assert try_fixed() is None
+    assert try_fixed() is None
+    assert model.packed_prefill_graph_q_lens == [[2, 2, 4]]
+    assert engine.stats.prefill_packed_fixed_capacity_attempts == 2
+    assert engine.stats.prefill_packed_fixed_capacity_accepts == 0
+    assert engine.stats.prefill_packed_fixed_capacity_reject_reason_counts == {
+        "graph_returned_none": 1,
+        "graph_returned_none_cached": 1,
+    }
+    for row in [*pad_rows, *real_rows]:
         engine._release_active_row(row)
 
 
