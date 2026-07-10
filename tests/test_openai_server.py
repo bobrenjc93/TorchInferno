@@ -1192,6 +1192,34 @@ def test_openai_unified_scheduler_mixed_prefix_warmup_uses_startup_symm_scope(
     ]
 
 
+def test_openai_online_single_prefill_warmup_captures_prompt_buckets(monkeypatch) -> None:
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_WARMUP_ONLINE_SINGLE_PREFILL", raising=False)
+    cache = _WarmupShapeCache()
+    model = _WarmupShapeModel()
+    engine = object.__new__(OpenAICompletionEngine)
+    engine.model = model
+    engine.device = torch.device("cpu")
+
+    engine._warmup_online_single_prefill_logits_graphs(
+        cache,
+        vocab_size=16,
+        token_counts=(2, 3),
+    )
+
+    assert model.prefill_shapes == [(1, 2), (1, 3)]
+    assert cache.seq_len == 0
+
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_WARMUP_ONLINE_SINGLE_PREFILL", "0")
+    model.prefill_shapes.clear()
+    engine._warmup_online_single_prefill_logits_graphs(
+        cache,
+        vocab_size=16,
+        token_counts=(4,),
+    )
+
+    assert model.prefill_shapes == []
+
+
 def test_openai_unified_scheduler_decode_warmup_captures_short_cache_limit(monkeypatch) -> None:
     monkeypatch.setenv("TORCHINFERNO_OPENAI_WARMUP_PROMPT_TOKENS", "3")
     monkeypatch.setenv("TORCHINFERNO_OPENAI_WARMUP_ONLINE_COMMON_PREFIX_PREFILL", "0")
@@ -11433,8 +11461,8 @@ def test_online_common_prefix_prefill_warmup_filters_shapes(monkeypatch) -> None
     assert _online_common_prefix_prefill_warmup_rows(69) == (48, 53, 68)
     assert _online_common_prefix_prefill_warmup_rows(70) == (48, 53, 68, 69)
     assert _online_common_prefix_prefill_warmup_rows(144, 128) == (48, 53, 68, 69, 128)
-    assert _online_common_prefix_prefill_warmup_tokens(64) == (45, 64)
-    assert _online_common_prefix_prefill_warmup_tokens(128) == (45, 64, 128)
+    assert _online_common_prefix_prefill_warmup_tokens(64) == (45, 55, 64)
+    assert _online_common_prefix_prefill_warmup_tokens(128) == (45, 55, 64, 128)
     assert _startup_online_common_prefix_prefill_warmup_rows(144, 128) == (128,)
     assert _startup_online_common_prefix_prefill_warmup_tokens(128) == (64,)
     assert not _online_common_prefix_suffix_prefill_warmup_enabled()

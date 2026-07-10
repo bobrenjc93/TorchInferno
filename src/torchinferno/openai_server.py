@@ -1566,7 +1566,7 @@ def _online_common_prefix_prefill_warmup_tokens(max_seq_len: int) -> tuple[int, 
     if max_seq_len <= 0:
         return ()
     tokens = _parse_positive_int_csv(
-        os.environ.get("TORCHINFERNO_OPENAI_WARMUP_ONLINE_COMMON_PREFIX_TOKENS", "45,64,128")
+        os.environ.get("TORCHINFERNO_OPENAI_WARMUP_ONLINE_COMMON_PREFIX_TOKENS", "45,55,64,128")
     )
     return tuple(token_count for token_count in tokens if token_count <= max_seq_len)
 
@@ -3913,6 +3913,43 @@ class OpenAICompletionEngine:
                 pass
             self._persistent_serving_cache = cache
 
+    def _warmup_online_single_prefill_logits_graphs(
+        self,
+        cache: object,
+        vocab_size: int,
+        token_counts: Sequence[int],
+    ) -> None:
+        if not env_flag("TORCHINFERNO_OPENAI_WARMUP_ONLINE_SINGLE_PREFILL", True):
+            return
+        if getattr(self.model, "try_prefill_logits_graph", None) is None:
+            return
+        for token_count in token_counts:
+            if token_count <= 0:
+                continue
+            _reset_generation_cache(cache)
+            _set_generation_cache_seq_len(cache, 0)
+            input_ids = (
+                torch.arange(token_count, device=self.device, dtype=torch.long)
+                % vocab_size
+            )[None, :]
+            try:
+                with _allow_prefill_graph_capture_for_cache(cache):
+                    _try_prefill_logits_graph(
+                        self.model,
+                        input_ids,
+                        cache,
+                        allow_capture=True,
+                    )
+            except Exception as exc:
+                import sys as _opsys
+                print(
+                    f"[WARMUP] online single-prefill graph tokens={token_count}: {exc}",
+                    file=_opsys.stderr,
+                    flush=True,
+                )
+            finally:
+                _reset_generation_cache(cache)
+
     def _warmup_unified_scheduler_cache(self, vocab_size: int) -> None:
         cache, max_active, cache_batch, max_seq_len = self._allocate_online_serving_warmup_cache()
         prompt_tokens = env_int("TORCHINFERNO_OPENAI_WARMUP_PROMPT_TOKENS", 32, minimum=1)
@@ -4036,6 +4073,11 @@ class OpenAICompletionEngine:
                     f"suffix_tokens={common_prefix_suffix_tokens} "
                     f"suffix_batches={common_prefix_suffix_batches} "
                     f"suffix_prefill={warm_suffix_prefill}",
+                )
+                self._warmup_online_single_prefill_logits_graphs(
+                    cache,
+                    vocab_size,
+                    common_prefix_tokens,
                 )
                 for row in common_prefix_rows:
                     row_cache = cache.for_rows([row])
