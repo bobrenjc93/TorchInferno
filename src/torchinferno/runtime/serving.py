@@ -6703,9 +6703,10 @@ class ContinuousBatchEngine:
             self._record_shape_count(self.stats.decode_shape_counts, shape_key)
         need_generated_prefix_logits = self._needs_generated_prefix_logits(states)
         shared_temperature = self._shared_temperature_for_states(states)
+        # Same-temperature sampled batches can use the contiguous graph too;
+        # token/logit outputs are reordered back to active-state order below.
         contiguous_row_set = (
             shared_temperature is not None
-            and shared_temperature <= 0.0
             and n_active == n_padded
             and sorted(decode_rows) == list(range(n_padded))
         )
@@ -6806,9 +6807,10 @@ class ContinuousBatchEngine:
         if shape_key is not None:
             self._record_shape_count(self.stats.decode_shape_counts, shape_key)
         shared_temperature = self._shared_temperature_for_states(states)
+        # Same-temperature sampled batches can use the contiguous graph too;
+        # token outputs are reordered back to active-state order below.
         contiguous_row_set = (
             shared_temperature is not None
-            and shared_temperature <= 0.0
             and n_active == n_padded
             and sorted(decode_rows) == list(range(n_padded))
         )

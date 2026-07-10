@@ -12603,6 +12603,19 @@ padding signal into a score win. The next score-facing tree lever needs a real
 packed/FlashInfer-style prefix-suffix prefill body or another way to reduce the
 `s16` padded model work without multiplying small graph replays.
 
+A focused dirty-tree decode cleanup allowed same-temperature sampled ragged
+decode to use the contiguous-row graph form when the active physical rows are
+already dense. The TorchInferno-only tree run wrote
+`/tmp/inference-bench-tree-contigrows-results/.../runs/20260710_094515` and
+landed at `69.2 / 40.9 / 99.7ms`, `954/992` correct, so it is not a
+score-facing tree win by itself. Combining its non-overlapping queue-profile
+records shows the intended small effect: decode graph replay fell from
+`124.2ms` to `114.2ms`, decode GPU from `3.44s` to `3.17s`, and `5.6ms` of
+decode replay moved to `rows0` contiguous graph keys. The overall median still
+regressed because prefill wall rose from `7.84s` to `9.11s`; keep treating the
+tree gap as packed prefix-suffix prefill first, with this row-index change only
+as a minor sampled-decode cleanup.
+
 ## Priority for a focused (non-loop) session
 
 1. Prefill MFU (Issue 1) — biggest TTFT lever, ~2x, affects 3/5 benchmarks.

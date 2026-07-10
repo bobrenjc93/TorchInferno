@@ -7007,6 +7007,66 @@ def test_continuous_batch_engine_ragged_decode_omits_row_indices_for_contiguous_
     assert not engine.has_online_work()
 
 
+def test_continuous_batch_engine_ragged_decode_omits_row_indices_for_contiguous_sampled_decode(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_UNIFORM_RAGGED_DECODE", "1")
+
+    class _ContiguousSampledLogitsGraphToyModel(_RaggedGraphToyModel):
+        def __init__(self) -> None:
+            super().__init__(vocab_size=128)
+            self.row_indices_were_none: list[bool] = []
+
+        def try_decode_ragged_logits_graph(
+            self,
+            input_ids,
+            cache,
+            *,
+            seq_lens,
+            row_indices,
+        ):
+            del seq_lens
+            self.row_indices_were_none.append(row_indices is None)
+            cache.advance_rows(_toy_decode_rows(input_ids, row_indices), 1)
+            return self._logits(input_ids[:, -1] + 1)
+
+        def _sample_next_token(self, logits, temperature):
+            return serving_mod.sample_next_token(logits, temperature)
+
+        def _logits(self, next_ids):
+            return super()._logits(next_ids) * 1000.0
+
+    model = _ContiguousSampledLogitsGraphToyModel()
+    engine = ContinuousBatchEngine(
+        model,
+        device=torch.device("cpu"),
+        temperature=0.7,
+        max_active_requests=2,
+        prefix_cache_capacity=0,
+        enable_ragged_decode=True,
+        store_reusable_prefixes=False,
+    )
+    engine.start_online(max_seq_len=16)
+    engine.submit_online(ServingRequest("a", (1, 2, 3), 2, arrival_step=0))
+    engine.submit_online(ServingRequest("b", (3, 4, 5), 2, arrival_step=0))
+
+    first = engine.step_online()
+    engine._online_active = list(reversed(engine._online_active))
+    second = engine.step_online()
+
+    assert [(event.request_id, event.token, event.generated, event.finished) for event in first] == [
+        ("a", 4, 1, False),
+        ("b", 6, 1, False),
+    ]
+    assert [(event.request_id, event.token, event.generated, event.finished) for event in second] == [
+        ("b", 7, 2, True),
+        ("a", 5, 2, True),
+    ]
+    assert model.row_indices_were_none == [True]
+    assert engine.stats.decode_graph_hits == 1
+    assert not engine.has_online_work()
+
+
 def test_continuous_batch_engine_online_many_shape_model_tokens_include_padding(monkeypatch) -> None:
     monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY", "1")
     monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_UNIFORM_RAGGED_DECODE", "1")
