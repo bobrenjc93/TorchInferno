@@ -10546,7 +10546,8 @@ def test_openai_online_generated_prefix_cache_preserves_runtime_env_overrides(mo
 def test_openai_online_submit_step_defaults_to_sampled_short_and_medium(monkeypatch) -> None:
     monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_SUBMIT_STEP_COMMAND", raising=False)
     monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_SUBMIT_STEP_COMMAND", raising=False)
-    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_GEN_MAX_TOKENS", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_SUBMIT_STEP_MIN_TOKENS", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_SUBMIT_STEP_MAX_TOKENS", raising=False)
     monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_SHORT_SUBMIT_STEP_MAX_TOKENS", raising=False)
     monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_SUBMIT_STEP_COMMAND", raising=False)
     monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_SUBMIT_STEP_MIN_TOKENS", raising=False)
@@ -10560,6 +10561,8 @@ def test_openai_online_submit_step_defaults_to_sampled_short_and_medium(monkeypa
     assert _online_submit_step_command_enabled(temperature=0.7, max_tokens=300) is True
     assert _online_submit_step_command_enabled(temperature=0.7, max_tokens=301) is False
     assert _online_submit_step_command_enabled(temperature=0.0, max_tokens=128) is False
+    assert _online_submit_step_command_enabled(temperature=0.0, max_tokens=256) is False
+    assert _online_submit_step_command_enabled(temperature=0.0, max_tokens=400) is False
     assert _online_submit_step_command_enabled(temperature=0.0, max_tokens=512) is True
     assert _online_submit_step_command_enabled(temperature=0.7, max_tokens=0) is False
 
@@ -10567,9 +10570,13 @@ def test_openai_online_submit_step_defaults_to_sampled_short_and_medium(monkeypa
     assert _online_submit_step_command_enabled(temperature=0.0, max_tokens=512) is False
     monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_SUBMIT_STEP_COMMAND", raising=False)
 
-    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_GEN_MAX_TOKENS", "512")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_SUBMIT_STEP_MIN_TOKENS", "512")
     assert _online_submit_step_command_enabled(temperature=0.0, max_tokens=512) is False
-    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_GEN_MAX_TOKENS", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_SUBMIT_STEP_MIN_TOKENS", raising=False)
+
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_SUBMIT_STEP_MAX_TOKENS", "480")
+    assert _online_submit_step_command_enabled(temperature=0.0, max_tokens=512) is False
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_SUBMIT_STEP_MAX_TOKENS", raising=False)
 
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_SHORT_SUBMIT_STEP_MAX_TOKENS", "128")
     assert _online_submit_step_command_enabled(temperature=0.7, max_tokens=128) is True

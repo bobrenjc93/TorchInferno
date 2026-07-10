@@ -923,12 +923,17 @@ def _online_submit_step_command_enabled(*, temperature: float, max_tokens: int) 
     if max_tokens < 1:
         return False
     if temperature <= 0.0:
-        greedy_short_max_tokens = env_int(
-            "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_GEN_MAX_TOKENS",
-            128,
+        greedy_large_min_tokens = env_int(
+            "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_SUBMIT_STEP_MIN_TOKENS",
+            400,
             minimum=1,
         )
-        if max_tokens <= greedy_short_max_tokens:
+        greedy_large_max_tokens = env_int(
+            "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_SUBMIT_STEP_MAX_TOKENS",
+            512,
+            minimum=greedy_large_min_tokens,
+        )
+        if not (greedy_large_min_tokens < max_tokens <= greedy_large_max_tokens):
             return False
         return env_flag(
             "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_SUBMIT_STEP_COMMAND",

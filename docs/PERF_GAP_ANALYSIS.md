@@ -109,9 +109,12 @@ and moved baseline `228.1 / 37.5 / 257.7ms` to
 `q2submit 129.9 -> 123.2ms`, step broadcast `49.0 -> 43.7ms`, step sync
 `54.8 -> 46.9ms`, and total phase time `7.24s -> 5.81s`. Promote only the
 large-greedy default via
-`TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_SUBMIT_STEP_COMMAND`, keeping
-greedy short generations at or below
-`TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_GEN_MAX_TOKENS` unchanged.
+`TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_SUBMIT_STEP_COMMAND`, scoped by
+`TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_SUBMIT_STEP_MIN_TOKENS` and
+`TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_SUBMIT_STEP_MAX_TOKENS`. The
+default range is `400 < max_tokens <= 512`, so multi_turn keeps the submit-step
+win while greedy short long_output (`<=128`), few_shot (`256`), and tree's
+deterministic eval calls (`400`) stay on their prior command path.
 
 The no-env current-head validation after promotion wrote
 `/tmp/inference-bench-1960ff6-multi-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-1960ff6-multi-default/runs/20260710_180537`
