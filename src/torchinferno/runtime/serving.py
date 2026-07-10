@@ -138,6 +138,13 @@ def _parse_string_csv(raw: str | None) -> tuple[str, ...]:
     return tuple(token for token in (part.strip() for part in (raw or "").split(",")) if token)
 
 
+def _queue_profile_counts_enabled() -> bool:
+    return bool(
+        os.environ.get("TORCHINFERNO_OPENAI_QUEUE_PROFILE_JSONL")
+        or os.environ.get("TORCHINFERNO_OPENAI_QUEUE_PROFILE")
+    )
+
+
 def _packed_prefill_eager_pattern_matches(
     *,
     profile_shape_key: str | None,
@@ -8706,53 +8713,59 @@ class ContinuousBatchEngine:
         self.stats.prefill_packed_candidate_model_tokens += int(model_tokens)
         self.stats.prefill_packed_candidate_saved_tokens += saved_tokens
         self.stats.prefill_packed_candidate_groups += groups
-        if not self.profile_timings:
+        if not (self.profile_timings or _queue_profile_counts_enabled()):
             return
-        self._record_shape_count(
+        def record_count(counts: dict[str, int], key: str) -> None:
+            counts[key] = counts.get(key, 0) + 1
+
+        def record_total(counts: dict[str, int], key: str, amount: int) -> None:
+            counts[key] = counts.get(key, 0) + int(amount)
+
+        record_count(
             self.stats.prefill_packed_candidate_shape_counts,
             shape_key,
         )
-        self._record_shape_total(
+        record_total(
             self.stats.prefill_packed_candidate_shape_tokens,
             shape_key,
             real_tokens,
         )
-        self._record_shape_total(
+        record_total(
             self.stats.prefill_packed_candidate_shape_model_tokens,
             shape_key,
             int(model_tokens),
         )
-        self._record_shape_total(
+        record_total(
             self.stats.prefill_packed_candidate_shape_saved_tokens,
             shape_key,
             saved_tokens,
         )
-        self._record_shape_total(
+        record_total(
             self.stats.prefill_packed_candidate_shape_groups,
             shape_key,
             groups,
         )
         signature_key = _packed_prefill_candidate_signature_from_counts(shape_key, group_counts)
-        self._record_shape_count(
+        record_count(
             self.stats.prefill_packed_candidate_signature_counts,
             signature_key,
         )
-        self._record_shape_total(
+        record_total(
             self.stats.prefill_packed_candidate_signature_tokens,
             signature_key,
             real_tokens,
         )
-        self._record_shape_total(
+        record_total(
             self.stats.prefill_packed_candidate_signature_model_tokens,
             signature_key,
             int(model_tokens),
         )
-        self._record_shape_total(
+        record_total(
             self.stats.prefill_packed_candidate_signature_saved_tokens,
             signature_key,
             saved_tokens,
         )
-        self._record_shape_total(
+        record_total(
             self.stats.prefill_packed_candidate_signature_groups,
             signature_key,
             groups,
@@ -8761,26 +8774,26 @@ class ContinuousBatchEngine:
             shape_key,
             group_counts,
         )
-        self._record_shape_count(
+        record_count(
             self.stats.prefill_packed_candidate_pattern_counts,
             pattern_key,
         )
-        self._record_shape_total(
+        record_total(
             self.stats.prefill_packed_candidate_pattern_tokens,
             pattern_key,
             real_tokens,
         )
-        self._record_shape_total(
+        record_total(
             self.stats.prefill_packed_candidate_pattern_model_tokens,
             pattern_key,
             int(model_tokens),
         )
-        self._record_shape_total(
+        record_total(
             self.stats.prefill_packed_candidate_pattern_saved_tokens,
             pattern_key,
             saved_tokens,
         )
-        self._record_shape_total(
+        record_total(
             self.stats.prefill_packed_candidate_pattern_groups,
             pattern_key,
             groups,

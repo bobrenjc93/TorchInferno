@@ -199,6 +199,17 @@ kept request timing and graph counters (`q2first=59.1ms`,
 count-only sampler signal does not reintroduce the CUDA-synchronized sampler
 timing overhead that the lightweight gate removed.
 
+Packed-prefix candidate telemetry now follows the same lightweight profile
+principle. The no-sync tree validation above had useful aggregate candidate
+totals, but shape/signature/pattern dictionaries were empty unless sync timing
+was enabled. The runtime now records packed-candidate shape, signature, pattern,
+slot, and token counters whenever queue profiling is enabled, while leaving
+timing fields and generic per-shape timing gated behind sync profiling. This
+keeps future public long_output/tree profiles actionable for packed cached-prefix
+prefill work without requiring `TORCHINFERNO_OPENAI_QUEUE_PROFILE_SYNC_TIMINGS=1`.
+Focused validation covered the no-timing serving-engine path plus queue-profile
+export and inference-bench summary consumers.
+
 ## Public 20260710_140141 current-run refresh and scheduling rejections
 
 The public pointer now includes the current TorchInferno main run:

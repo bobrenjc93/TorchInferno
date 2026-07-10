@@ -4230,6 +4230,67 @@ def test_continuous_batch_engine_records_profile_shape_counts() -> None:
     assert any(key.startswith("ragged:b3/") for key in engine.stats.decode_shape_counts)
 
 
+def test_continuous_batch_engine_records_packed_prefill_candidate_shapes_for_queue_profile_without_timings(
+    monkeypatch,
+) -> None:
+    shape_key = "prefix_graph:b4:s4:p16-16:src1:mixed0"
+    pattern = f"{shape_key}|p16:s1/p16:s2/p16:s3"
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_QUEUE_PROFILE_JSONL", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_QUEUE_PROFILE", raising=False)
+    engine = ContinuousBatchEngine(
+        _SelectedLogitsToyModel(),
+        device=torch.device("cpu"),
+        max_active_requests=4,
+        profile_timings=False,
+    )
+
+    engine._record_packed_prefill_candidate(
+        shape_key,
+        suffix_lengths=[1, 2, 3],
+        start_lens=[16, 16, 16],
+        model_tokens=16,
+        packed_prefill_pattern_key=pattern,
+    )
+
+    assert engine.stats.prefill_packed_candidate_calls == 1
+    assert engine.stats.prefill_packed_candidate_shape_counts == {}
+
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_QUEUE_PROFILE_JSONL", "/tmp/queue.jsonl")
+    profiled_engine = ContinuousBatchEngine(
+        _SelectedLogitsToyModel(),
+        device=torch.device("cpu"),
+        max_active_requests=4,
+        profile_timings=False,
+    )
+
+    profiled_engine._record_packed_prefill_candidate(
+        shape_key,
+        suffix_lengths=[1, 2, 3],
+        start_lens=[16, 16, 16],
+        model_tokens=16,
+        packed_prefill_pattern_key=pattern,
+    )
+
+    assert profiled_engine.stats.prefill_packed_candidate_calls == 1
+    assert profiled_engine.stats.prefill_packed_candidate_shape_counts == {shape_key: 1}
+    assert profiled_engine.stats.prefill_packed_candidate_shape_tokens == {shape_key: 6}
+    assert profiled_engine.stats.prefill_packed_candidate_shape_model_tokens == {
+        shape_key: 16,
+    }
+    assert profiled_engine.stats.prefill_packed_candidate_shape_saved_tokens == {
+        shape_key: 10,
+    }
+    assert profiled_engine.stats.prefill_packed_candidate_shape_groups == {shape_key: 3}
+    signature = f"{shape_key}|p16:s1:n1/p16:s2:n1/p16:s3:n1"
+    assert profiled_engine.stats.prefill_packed_candidate_signature_counts == {
+        signature: 1,
+    }
+    assert profiled_engine.stats.prefill_packed_candidate_pattern_counts == {
+        pattern: 1,
+    }
+    assert profiled_engine.stats.prefill_shape_forward_ms == {}
+
+
 def test_prefix_prefill_seq_lens_scratch_keeps_unfilled_rows_zero() -> None:
     engine = ContinuousBatchEngine(
         _SelectedLogitsToyModel(),
