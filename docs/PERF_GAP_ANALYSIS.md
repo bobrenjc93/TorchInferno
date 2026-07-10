@@ -13642,6 +13642,23 @@ as a small routing cleanup, not a primary tree score win: TTFT/TPOT remained
 within the current focused-run variance, but the static row-view sampled miss
 source is almost gone.
 
+The pushed-head `8ff3638` full-suite validation wrote
+`/tmp/inference-bench-8ff-full-results/.../runs/20260710_234322` and completed
+all rows: few_shot `172.8 / 34.7 / 200.6ms`, self_consistency
+`20.4 / 0.0 / 21.1ms`, multi_turn `220.5 / 36.8 / 249.4ms`,
+tree_of_thought `57.9 / 38.0 / 80.5ms`, and long_output
+`242.8 / 21.1 / 972.7ms`. Correctness stayed in band
+(`977/1000`, `1000/1000`, `980/1000`, `958/992`, `1000/1000`). Relative to
+the `4e79fc9` full suite, self_consistency, multi_turn, and tree medians moved
+the right way, while few_shot and long_output TTFT moved slightly against the
+change and should be treated as run variance or unrelated scheduler mix. The
+graph profile confirms the sampled fallback mostly held under full-suite load:
+tree ended with `runtime_decode_graph_hits=331`, `runtime_decode_graph_misses=6`,
+and `runtime_decode_graph_replays=331`, down from the previous full-suite tree
+row's `17` static sampled logits misses. Long_output remained clean on decode
+graphs (`759` hits/replays, `0` misses), so the remaining long gap is still
+decode throughput and tail policy, not graph coverage.
+
 ## Priority for a focused (non-loop) session
 
 1. Prefill MFU (Issue 1) — biggest TTFT lever, ~2x, affects 3/5 benchmarks.
