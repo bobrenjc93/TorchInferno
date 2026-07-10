@@ -7056,6 +7056,16 @@ def test_continuous_batch_engine_online_many_shape_model_tokens_include_padding(
         engine.stats.decode_many_step_window_cpu_tokens_ms["decode_many:b3/4:g1-16"]
         >= 0.0
     )
+    assert (
+        engine.stats.decode_many_step_window_token_wait_ms["decode_many:b3/4:g1-16"]
+        >= 0.0
+    )
+    assert (
+        engine.stats.decode_many_step_window_token_materialize_ms[
+            "decode_many:b3/4:g1-16"
+        ]
+        >= 0.0
+    )
     assert engine.stats.decode_many_cpu_tokens_ms >= 0.0
     assert engine.stats.decode_many_token_wait_ms >= 0.0
     assert engine.stats.decode_many_token_materialize_ms >= 0.0

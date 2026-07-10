@@ -7460,6 +7460,8 @@ class OpenAICompletionEngine:
                 "decode_many_graph_shape_ms",
                 "decode_many_step_window_model_ms",
                 "decode_many_step_window_cpu_tokens_ms",
+                "decode_many_step_window_token_wait_ms",
+                "decode_many_step_window_token_materialize_ms",
             ):
                 value = getattr(stats, name, None)
                 if isinstance(value, Mapping):

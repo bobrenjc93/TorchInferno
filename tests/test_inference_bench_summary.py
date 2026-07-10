@@ -377,6 +377,12 @@ def _write_inference_bench_run(tmp_path) -> None:
         "runtime_decode_many_step_window_cpu_tokens_ms": {
             "decode_many:b8/8:g1-16": 1.2,
         },
+        "runtime_decode_many_step_window_token_wait_ms": {
+            "decode_many:b8/8:g1-16": 1.0,
+        },
+        "runtime_decode_many_step_window_token_materialize_ms": {
+            "decode_many:b8/8:g1-16": 0.2,
+        },
         "runtime_generated_prefix_store_requests": 12,
         "runtime_generated_prefix_reuse_requests": 3,
         "runtime_generated_prefix_reuse_tokens": 33,
@@ -917,6 +923,8 @@ def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) ->
     assert "exact" in text
     assert "model_ms" in text
     assert "cpu_ms" in text
+    assert "wait_ms" in text
+    assert "materialize_ms" in text
     assert "total_ms" in text
     assert "12.7" in text
     assert "[provider server log phases]" in text
@@ -1117,6 +1125,8 @@ def test_inference_bench_summary_leaves_decode_many_window_ms_blank_without_timi
     queue_record = json.loads(queue_path.read_text())
     queue_record.pop("runtime_decode_many_step_window_model_ms")
     queue_record.pop("runtime_decode_many_step_window_cpu_tokens_ms")
+    queue_record.pop("runtime_decode_many_step_window_token_wait_ms")
+    queue_record.pop("runtime_decode_many_step_window_token_materialize_ms")
     queue_path.write_text(json.dumps(queue_record) + "\n")
 
     text = format_inference_bench_summary(summarize_inference_bench_run(tmp_path))
@@ -1127,7 +1137,7 @@ def test_inference_bench_summary_leaves_decode_many_window_ms_blank_without_timi
         and "decode_many:b8/8:g1-16" in line
     )
 
-    assert row.split()[-2:] == ["-", "-"]
+    assert row.split()[-4:] == ["-", "-", "-", "-"]
 
 
 def test_inference_bench_summary_uses_runtime_slot_counts_without_signatures(tmp_path) -> None:

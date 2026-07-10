@@ -259,6 +259,8 @@ _QUEUE_PROFILE_FIELDS = (
     "runtime_decode_many_step_window_skipped_tokens",
     "runtime_decode_many_step_window_model_ms",
     "runtime_decode_many_step_window_cpu_tokens_ms",
+    "runtime_decode_many_step_window_token_wait_ms",
+    "runtime_decode_many_step_window_token_materialize_ms",
     "runtime_generated_prefix_store_requests",
     "runtime_generated_prefix_reuse_requests",
     "runtime_generated_prefix_reuse_tokens",
@@ -1144,6 +1146,8 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
                         "skip_pct",
                         "model_ms",
                         "cpu_ms",
+                        "wait_ms",
+                        "materialize_ms",
                     ),
                     decode_window_rows,
                 )
@@ -3371,6 +3375,14 @@ def _decode_many_step_window_rows(
                 fields.get("runtime_decode_many_step_window_cpu_tokens_ms"),
                 key,
             )
+            wait_ms = _mapping_value(
+                fields.get("runtime_decode_many_step_window_token_wait_ms"),
+                key,
+            )
+            materialize_ms = _mapping_value(
+                fields.get("runtime_decode_many_step_window_token_materialize_ms"),
+                key,
+            )
             rows.append(
                 (
                     _fmt_value(profile.temperature),
@@ -3392,6 +3404,8 @@ def _decode_many_step_window_rows(
                     ),
                     _fmt_value(model_ms),
                     _fmt_value(cpu_ms),
+                    _fmt_value(wait_ms),
+                    _fmt_value(materialize_ms),
                 )
             )
     return rows

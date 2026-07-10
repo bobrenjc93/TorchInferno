@@ -502,6 +502,8 @@ class ServingStats:
     decode_many_step_window_skipped_tokens: dict[str, int] = field(default_factory=dict)
     decode_many_step_window_model_ms: dict[str, float] = field(default_factory=dict)
     decode_many_step_window_cpu_tokens_ms: dict[str, float] = field(default_factory=dict)
+    decode_many_step_window_token_wait_ms: dict[str, float] = field(default_factory=dict)
+    decode_many_step_window_token_materialize_ms: dict[str, float] = field(default_factory=dict)
     prefix_reuse_requests: int = 0
     prefix_reuse_tokens: int = 0
     queued_requests: int = 0
@@ -1631,6 +1633,16 @@ class ContinuousBatchEngine:
                         step_window_key,
                         cpu_elapsed_ms * (len(states) / shape_token_count),
                     )
+                    self._record_shape_time(
+                        self.stats.decode_many_step_window_token_wait_ms,
+                        step_window_key,
+                        token_wait_ms * (len(states) / shape_token_count),
+                    )
+                    self._record_shape_time(
+                        self.stats.decode_many_step_window_token_materialize_ms,
+                        step_window_key,
+                        token_materialize_ms * (len(states) / shape_token_count),
+                    )
             self._flush_decode_ragged_model_gpu_timers()
         else:
             flat_tokens = self._decode_many_tokens_to_list(token_scratch, token_offset)
@@ -1901,6 +1913,16 @@ class ContinuousBatchEngine:
                         self.stats.decode_many_step_window_cpu_tokens_ms,
                         step_window_key,
                         cpu_elapsed_ms,
+                    )
+                    self._record_shape_time(
+                        self.stats.decode_many_step_window_token_wait_ms,
+                        step_window_key,
+                        token_wait_ms,
+                    )
+                    self._record_shape_time(
+                        self.stats.decode_many_step_window_token_materialize_ms,
+                        step_window_key,
+                        token_materialize_ms,
                     )
                 self._flush_decode_ragged_model_gpu_timers()
             if shape_key is not None:
