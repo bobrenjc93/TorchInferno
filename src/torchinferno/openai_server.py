@@ -129,6 +129,40 @@ def _startup_warmup_enabled_for_cache_backend(cache_backend: str) -> bool:
     return env_flag("TORCHINFERNO_OPENAI_STARTUP_WARMUP_NON_DENSE_CACHE", True)
 
 
+def _startup_warmup_log_should_emit(model: object) -> bool:
+    if not env_flag("TORCHINFERNO_OPENAI_STARTUP_WARMUP_LOG", True):
+        return False
+    try:
+        rank = int(getattr(model, "rank", 0) or 0)
+    except Exception:
+        rank = 0
+    return rank == 0
+
+
+def _startup_warmup_log(model: object, message: str) -> None:
+    if _startup_warmup_log_should_emit(model):
+        print(f"[WARMUP] {message}", file=sys.stderr, flush=True)
+
+
+@contextmanager
+def _startup_warmup_span(model: object, label: str) -> Iterator[None]:
+    should_log = _startup_warmup_log_should_emit(model)
+    started_s = time.perf_counter()
+    if should_log:
+        print(f"[WARMUP] {label} start", file=sys.stderr, flush=True)
+    try:
+        yield
+    except Exception:
+        if should_log:
+            elapsed_s = time.perf_counter() - started_s
+            print(f"[WARMUP] {label} failed after {elapsed_s:.1f}s", file=sys.stderr, flush=True)
+        raise
+    else:
+        if should_log:
+            elapsed_s = time.perf_counter() - started_s
+            print(f"[WARMUP] {label} done in {elapsed_s:.1f}s", file=sys.stderr, flush=True)
+
+
 def _flashinfer_prefill_warmup_batch_sizes(batch_sizes: Sequence[int]) -> tuple[int, ...]:
     if not batch_sizes:
         return ()
@@ -3878,8 +3912,23 @@ class OpenAICompletionEngine:
             max_active=max_active,
             cache_batch=cache_batch,
         ))
+        decode_policy_specs = _online_decode_warmup_policy_specs()
+        _startup_warmup_log(
+            self.model,
+            "unified scheduler cache prepared "
+            f"cache_rows={cache_batch} max_active={max_active} max_seq_len={max_seq_len} "
+            f"prompt_tokens={prompt_tokens} decode_batches={tuple(batch_sizes)} "
+            f"decode_policies={decode_policy_specs}",
+        )
         decode_warmup_runtime_symm = _online_decode_warmup_runtime_symm_mem_allreduce_enabled()
-        for warmup_temperature, warmup_max_tokens in _online_decode_warmup_policy_specs():
+        for warmup_temperature, warmup_max_tokens in decode_policy_specs:
+            decode_started_s = time.perf_counter()
+            _startup_warmup_log(
+                self.model,
+                "online decode graph warmup start "
+                f"temperature={warmup_temperature:g} max_tokens={warmup_max_tokens} "
+                f"batches={tuple(batch_sizes)}",
+            )
             with _tensor_parallel_symm_mem_allreduce_scope(
                 self.model,
                 self.device,
@@ -3940,9 +3989,16 @@ class OpenAICompletionEngine:
                             _reset_generation_cache(cache)
                 finally:
                     _set_generation_cache_ragged_decode_cache_token_limit(cache, None)
+            _startup_warmup_log(
+                self.model,
+                "online decode graph warmup done "
+                f"temperature={warmup_temperature:g} max_tokens={warmup_max_tokens} "
+                f"in {time.perf_counter() - decode_started_s:.1f}s",
+            )
             if (warmup_temperature, warmup_max_tokens) != (0.0, 1):
                 continue
             if env_flag("TORCHINFERNO_OPENAI_WARMUP_ONLINE_COMMON_PREFIX_PREFILL", True):
+                common_prefix_started_s = time.perf_counter()
                 common_prefix_rows = _online_common_prefix_prefill_warmup_rows(cache_batch, max_active)
                 common_prefix_tokens = _online_common_prefix_prefill_warmup_tokens(max_seq_len)
                 warm_suffix_prefill = _online_common_prefix_suffix_prefill_warmup_enabled()
@@ -3955,6 +4011,14 @@ class OpenAICompletionEngine:
                 common_prefix_suffix_batches = _online_common_prefix_suffix_prefill_warmup_batches(
                     cache_batch,
                     max_active,
+                )
+                _startup_warmup_log(
+                    self.model,
+                    "online common-prefix prefill warmup start "
+                    f"rows={common_prefix_rows} prefix_tokens={common_prefix_tokens} "
+                    f"suffix_tokens={common_prefix_suffix_tokens} "
+                    f"suffix_batches={common_prefix_suffix_batches} "
+                    f"suffix_prefill={warm_suffix_prefill}",
                 )
                 for row in common_prefix_rows:
                     row_cache = cache.for_rows([row])
@@ -4072,6 +4136,11 @@ class OpenAICompletionEngine:
                                     warmup_label="sampled",
                                     suffix_tokens_override=sampled_suffix_tokens,
                                 )
+                _startup_warmup_log(
+                    self.model,
+                    "online common-prefix prefill warmup done "
+                    f"in {time.perf_counter() - common_prefix_started_s:.1f}s",
+                )
             if _online_mixed_prefix_suffix_prefill_warmup_enabled():
                 mixed_warmup_max_tokens = _online_greedy_common_prefix_suffix_prefill_warmup_max_tokens()
                 with _tensor_parallel_symm_mem_allreduce_scope(
@@ -4369,6 +4438,17 @@ class OpenAICompletionEngine:
             row = max(batch_sizes)
         if row is None:
             return
+        suffix_pair_count = sum(len(prefix_suffixes) for prefix_suffixes in suffixes_by_prefix.values())
+        warmup_shape_count = suffix_pair_count * len(batch_sizes)
+        warmup_started_s = time.perf_counter()
+        _startup_warmup_log(
+            self.model,
+            f"{warmup_label} common-prefix suffix warmup start "
+            f"temperature={warmup_temperature:g} max_tokens={warmup_max_tokens} row={row} "
+            f"prefixes={len(suffixes_by_prefix)} suffix_pairs={suffix_pair_count} "
+            f"batches={len(batch_sizes)} shapes={warmup_shape_count} "
+            f"token_graphs={token_warmup_enabled}",
+        )
         dynamic_max_suffix = _dynamic_prefix_prefill_max_suffix_for_policy(
             warmup_temperature,
             warmup_max_tokens,
@@ -4524,6 +4604,11 @@ class OpenAICompletionEngine:
         finally:
             _set_tensor_parallel_runtime_fp8_prefill(self.model, enabled=False, min_m=2048)
             _reset_generation_cache(cache)
+            _startup_warmup_log(
+                self.model,
+                f"{warmup_label} common-prefix suffix warmup done "
+                f"in {time.perf_counter() - warmup_started_s:.1f}s",
+            )
 
     def _warmup_online_chunked_prefill_graphs(
         self,
@@ -9168,6 +9253,13 @@ class OpenAICompletionEngine:
         prompt_token_counts = _warmup_prompt_token_counts(prompt_tokens)
         new_tokens = env_int("TORCHINFERNO_OPENAI_WARMUP_NEW_TOKENS", 2, minimum=1)
         vocab_size = max(1, int(getattr(getattr(self.model, "config", object()), "vocab_size", 1)))
+        startup_started_s = time.perf_counter()
+        _startup_warmup_log(
+            self.model,
+            "tensor-parallel startup warmup start "
+            f"cache_backend={getattr(self, 'cache_backend', 'dense')} "
+            f"prompt_counts={tuple(prompt_token_counts)} new_tokens={new_tokens}",
+        )
         with torch.inference_mode():
             with _tensor_parallel_symm_mem_allreduce_scope(
                 self.model,
@@ -9176,39 +9268,49 @@ class OpenAICompletionEngine:
                 temperature=0.0,
                 startup=True,
             ):
-                for count in prompt_token_counts:
-                    input_ids = (torch.arange(count, device=self.device, dtype=torch.long) % vocab_size)[None, :]
-                    for _ in self._generate_single_tokens(
-                        input_ids,
-                        max_tokens=new_tokens,
-                        temperature=0.0,
-                        broadcast_tensor_parallel=False,
-                        update_prefix_cache=False,
-                    ):
-                        pass
+                with _startup_warmup_span(
+                    self.model,
+                    "single-request generate warmup "
+                    f"prompt_counts={tuple(prompt_token_counts)} new_tokens={new_tokens}",
+                ):
+                    for count in prompt_token_counts:
+                        input_ids = (torch.arange(count, device=self.device, dtype=torch.long) % vocab_size)[None, :]
+                        for _ in self._generate_single_tokens(
+                            input_ids,
+                            max_tokens=new_tokens,
+                            temperature=0.0,
+                            broadcast_tensor_parallel=False,
+                            update_prefix_cache=False,
+                        ):
+                            pass
                 if _startup_graph_warmup_enabled():
-                    self._warmup_tensor_parallel_prefill_graphs(prompt_token_counts, vocab_size)
-                    self._warmup_tensor_parallel_prefix_suffix_graphs(vocab_size)
-                    self._warmup_tensor_parallel_temperature_graphs(vocab_size)
-                    self._warmup_tensor_parallel_resident_temperature_graphs(vocab_size)
-                    if _startup_ragged_decode_warmup_enabled():
-                        self._warmup_tensor_parallel_ragged_decode_graphs(vocab_size)
-                        if env_flag("TORCHINFERNO_OPENAI_WARMUP_RAGGED_DECODE_SYMM_GRAPHS", True):
-                            with _tensor_parallel_symm_mem_allreduce_scope(
-                                self.model,
-                                self.device,
-                                max_tokens=1,
-                                temperature=0.0,
-                                startup=True,
-                            ):
-                                self._warmup_tensor_parallel_ragged_decode_graphs(vocab_size)
-                    self._warmup_tensor_parallel_batched_prefix_suffix_graphs(vocab_size)
+                    with _startup_warmup_span(self.model, "startup graph warmup"):
+                        self._warmup_tensor_parallel_prefill_graphs(prompt_token_counts, vocab_size)
+                        self._warmup_tensor_parallel_prefix_suffix_graphs(vocab_size)
+                        self._warmup_tensor_parallel_temperature_graphs(vocab_size)
+                        self._warmup_tensor_parallel_resident_temperature_graphs(vocab_size)
+                        if _startup_ragged_decode_warmup_enabled():
+                            self._warmup_tensor_parallel_ragged_decode_graphs(vocab_size)
+                            if env_flag("TORCHINFERNO_OPENAI_WARMUP_RAGGED_DECODE_SYMM_GRAPHS", True):
+                                with _tensor_parallel_symm_mem_allreduce_scope(
+                                    self.model,
+                                    self.device,
+                                    max_tokens=1,
+                                    temperature=0.0,
+                                    startup=True,
+                                ):
+                                    self._warmup_tensor_parallel_ragged_decode_graphs(vocab_size)
+                        self._warmup_tensor_parallel_batched_prefix_suffix_graphs(vocab_size)
                 warmup_cache_tokens = max(
                     max(prompt_token_counts) + new_tokens,
                     env_int("TORCHINFERNO_OPENAI_WARMUP_CACHE_TOKENS", 256, minimum=1),
                 )
-                self._generation_cache(1, warmup_cache_tokens, model=self.model, pool=False)
-                _warmup_tensor_parallel_decode_attention(self.model)
+                with _startup_warmup_span(
+                    self.model,
+                    f"generation-cache/decode-attention warmup cache_tokens={warmup_cache_tokens}",
+                ):
+                    self._generation_cache(1, warmup_cache_tokens, model=self.model, pool=False)
+                    _warmup_tensor_parallel_decode_attention(self.model)
                 if (
                     _startup_online_common_prefix_prefill_warmup_enabled()
                     and not _startup_scheduler_warmup_enabled()
@@ -9218,7 +9320,8 @@ class OpenAICompletionEngine:
                     )
                     and hasattr(self.model, "allocate_cache")
                 ):
-                    self._warmup_online_common_prefix_prefill_cache(vocab_size)
+                    with _startup_warmup_span(self.model, "online common-prefix prefill cache warmup"):
+                        self._warmup_online_common_prefix_prefill_cache(vocab_size)
                 if (
                     _startup_scheduler_warmup_enabled()
                     and (
@@ -9227,12 +9330,17 @@ class OpenAICompletionEngine:
                     )
                     and hasattr(self.model, "allocate_cache")
                 ):
-                    self._warmup_unified_scheduler_cache(vocab_size)
+                    with _startup_warmup_span(self.model, "unified scheduler cache warmup"):
+                        self._warmup_unified_scheduler_cache(vocab_size)
         torch.cuda.synchronize(self.device)
         # Startup graph warmup can finish at different times across TP ranks.
         # Keep workers from entering the command-listener collectives while a
         # slower rank is still draining warmup collectives.
         _sync_tensor_parallel_command(self.model, self.device, cuda_sync=False)
+        _startup_warmup_log(
+            self.model,
+            f"tensor-parallel startup warmup done in {time.perf_counter() - startup_started_s:.1f}s",
+        )
 
     def _warmup_tensor_parallel_prefill_graphs(
         self,
