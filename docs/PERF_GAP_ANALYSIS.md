@@ -225,6 +225,22 @@ matching Gumbel counts), had no `runtime_temperature_sample*` timing keys, and
 left `runtime_prefill_wall_ms`, `runtime_prefill_forward_ms`, and
 `runtime_prefill_sample_ms` at `0.0`.
 
+The same pushed-head lightweight profile on long_output wrote
+`/tmp/inference-bench-packed-count-long-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-packed-count-long/runs/20260710_212835`.
+It reached readiness in `276.2s` and landed at `226.3 / 20.9 / 1027.8ms`,
+p99 `2019.6 / 54.4 / 3248.5ms`, with `1000/1000` correct. The no-sync queue
+profile split p50 first-token latency into `q2submit=93.2ms` and
+`submit2first=114.9ms`, while keeping all detailed runtime timing totals at
+`0.0`. Packed-candidate counters now expose the long-output target without the
+sync-timed run: `51` candidate calls, `44.7K` real suffix tokens, `75.8K`
+dense model tokens, and `31.1K` saved tokens. The top saved-token shapes were
+`b32:s64:p111` (`6.6K` saved), `b24:s64:p111` (`6.4K`),
+`b24:s96:p111` (`6.2K`), and `b16:s96:p111` (`5.4K`). Pattern detail was much
+less reusable than tree: `49` pattern keys with only `2` repeated keys and
+`2.5K` repeated saved tokens. This reinforces the same implementation target:
+a packed cached-prefix prefill path must avoid per-pattern fragmentation rather
+than specializing narrowly to one repeated pattern.
+
 ## Public 20260710_140141 current-run refresh and scheduling rejections
 
 The public pointer now includes the current TorchInferno main run:
