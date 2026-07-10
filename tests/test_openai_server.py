@@ -16485,6 +16485,7 @@ def test_openai_stream_group_can_drive_tensor_parallel_online_runtime(monkeypatc
 
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_CONTINUOUS", "1")
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_DECODE_QUANTUM", "1")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_CLOSE_CUDA_SYNC", "0")
     monkeypatch.setattr(
         "torchinferno.openai_server._is_tensor_parallel_model",
         lambda candidate: candidate is model,
@@ -16504,7 +16505,7 @@ def test_openai_stream_group_can_drive_tensor_parallel_online_runtime(monkeypatc
     )
     monkeypatch.setattr(
         "torchinferno.openai_server._broadcast_tensor_parallel_online_close",
-        lambda model: commands.append(("close", None)),
+        lambda model, **kwargs: commands.append(("close", kwargs.get("cuda_sync"))),
     )
     monkeypatch.setattr(
         "torchinferno.openai_server._sync_tensor_parallel_command",
@@ -16549,7 +16550,7 @@ def test_openai_stream_group_can_drive_tensor_parallel_online_runtime(monkeypatc
         ("submit", ([[1, 2], [3, 4]], {"max_tokens": 2, "row_max_tokens": [2, 1], "arrival_step": 0, "eos_token_id": None, "stop_token_ids": [], "request_id_start": 0})),
         ("step", 1),
         ("step", 1),
-        ("close", None),
+        ("close", False),
     ]
     assert syncs == ["sync", "sync", "sync", "sync", "sync"]
     first_items = _queue_items(first_queue)
@@ -16602,6 +16603,7 @@ def test_openai_tensor_parallel_online_batcher_drains_ready_requests(
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_PREFIX_ROWS", "1")
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_MAX_SEQ_LEN_HEADROOM_TOKENS", "0")
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_PREFILL_TOKEN_BUDGET", "0")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_CLOSE_CUDA_SYNC", "0")
     monkeypatch.setenv("TORCHINFERNO_OPENAI_QUEUE_PROFILE_JSONL", str(tmp_path / "queue.jsonl"))
     monkeypatch.setattr(
         "torchinferno.openai_server._is_tensor_parallel_model",
@@ -16622,7 +16624,7 @@ def test_openai_tensor_parallel_online_batcher_drains_ready_requests(
     )
     monkeypatch.setattr(
         "torchinferno.openai_server._broadcast_tensor_parallel_online_close",
-        lambda model: commands.append(("close", None)),
+        lambda model, **kwargs: commands.append(("close", kwargs.get("cuda_sync"))),
     )
     monkeypatch.setattr(
         "torchinferno.openai_server._sync_tensor_parallel_command",
@@ -16650,7 +16652,7 @@ def test_openai_tensor_parallel_online_batcher_drains_ready_requests(
         ("start", {"max_seq_len": 3, "max_active_requests": 4, "prefix_cache_capacity": 1, "prefill_token_budget": None, "temperature": 0.0, "enable_ragged_decode": True, "store_reusable_prefixes": True, "store_full_prompt_prefixes": True, "max_tokens": 1}),
         ("submit", ([[1, 2], [3, 4]], {"max_tokens": 1, "row_max_tokens": [1, 1], "arrival_step": 0, "eos_token_id": None, "stop_token_ids": [], "request_id_start": 0})),
         ("step", 1),
-        ("close", None),
+        ("close", False),
     ]
     assert syncs == ["sync", "sync", "sync", "sync"]
     first_items = _queue_items(first_queue)
@@ -16749,7 +16751,7 @@ def test_openai_tensor_parallel_online_batcher_falls_back_to_dense_cache_without
     )
     monkeypatch.setattr(
         "torchinferno.openai_server._broadcast_tensor_parallel_online_close",
-        lambda model: None,
+        lambda model, **kwargs: None,
     )
     monkeypatch.setattr(
         "torchinferno.openai_server._sync_tensor_parallel_command",
@@ -16836,7 +16838,7 @@ def test_openai_tensor_parallel_online_batcher_can_submit_mixed_temperatures(
     )
     monkeypatch.setattr(
         "torchinferno.openai_server._broadcast_tensor_parallel_online_close",
-        lambda model: commands.append(("close", None)),
+        lambda model, **kwargs: commands.append(("close", None)),
     )
     monkeypatch.setattr(
         "torchinferno.openai_server._sync_tensor_parallel_command",
@@ -16956,7 +16958,7 @@ def test_openai_tensor_parallel_online_batcher_collects_idle_arrivals(
     )
     monkeypatch.setattr(
         "torchinferno.openai_server._broadcast_tensor_parallel_online_close",
-        lambda model: commands.append(("close", None)),
+        lambda model, **kwargs: commands.append(("close", None)),
     )
     monkeypatch.setattr(
         "torchinferno.openai_server._sync_tensor_parallel_command",
@@ -17069,7 +17071,7 @@ def test_openai_tensor_parallel_online_persistent_keeps_started_runtime(
     )
     monkeypatch.setattr(
         "torchinferno.openai_server._broadcast_tensor_parallel_online_close",
-        lambda model: commands.append(("close", None)),
+        lambda model, **kwargs: commands.append(("close", None)),
     )
     monkeypatch.setattr(
         "torchinferno.openai_server._sync_tensor_parallel_command",
@@ -17156,7 +17158,7 @@ def test_openai_tensor_parallel_online_batcher_uses_queued_limit_for_default_row
     )
     monkeypatch.setattr(
         "torchinferno.openai_server._broadcast_tensor_parallel_online_close",
-        lambda model: commands.append(("close", None)),
+        lambda model, **kwargs: commands.append(("close", None)),
     )
     monkeypatch.setattr(
         "torchinferno.openai_server._sync_tensor_parallel_command",
@@ -17260,7 +17262,7 @@ def test_openai_tensor_parallel_online_batcher_boost_uses_admitted_max_tokens(
     )
     monkeypatch.setattr(
         "torchinferno.openai_server._broadcast_tensor_parallel_online_close",
-        lambda model: commands.append(("close", None)),
+        lambda model, **kwargs: commands.append(("close", None)),
     )
     monkeypatch.setattr(
         "torchinferno.openai_server._sync_tensor_parallel_command",
@@ -17387,7 +17389,7 @@ def test_openai_tensor_parallel_online_batcher_buckets_greedy_short_sessions(
     )
     monkeypatch.setattr(
         "torchinferno.openai_server._broadcast_tensor_parallel_online_close",
-        lambda model: commands.append(("close", None)),
+        lambda model, **kwargs: commands.append(("close", None)),
     )
     monkeypatch.setattr(
         "torchinferno.openai_server._sync_tensor_parallel_command",
@@ -17553,7 +17555,7 @@ def test_openai_tensor_parallel_online_batcher_profile_snapshots(
     )
     monkeypatch.setattr(
         "torchinferno.openai_server._broadcast_tensor_parallel_online_close",
-        lambda model: None,
+        lambda model, **kwargs: None,
     )
     monkeypatch.setattr(
         "torchinferno.openai_server._sync_tensor_parallel_command",
@@ -17780,7 +17782,7 @@ def test_openai_tensor_parallel_online_batcher_uses_drain_decode_quantum(
     )
     monkeypatch.setattr(
         "torchinferno.openai_server._broadcast_tensor_parallel_online_close",
-        lambda model: None,
+        lambda model, **kwargs: None,
     )
     monkeypatch.setattr(
         "torchinferno.openai_server._sync_tensor_parallel_command",
@@ -17902,7 +17904,7 @@ def test_openai_tensor_parallel_online_batcher_can_delay_drain_quantum(
     )
     monkeypatch.setattr(
         "torchinferno.openai_server._broadcast_tensor_parallel_online_close",
-        lambda model: None,
+        lambda model, **kwargs: None,
     )
     monkeypatch.setattr(
         "torchinferno.openai_server._sync_tensor_parallel_command",
@@ -18163,7 +18165,7 @@ def test_openai_tensor_parallel_online_batcher_sizes_cache_from_initial_window(
     )
     monkeypatch.setattr(
         "torchinferno.openai_server._broadcast_tensor_parallel_online_close",
-        lambda model: commands.append(("close", None)),
+        lambda model, **kwargs: commands.append(("close", None)),
     )
     monkeypatch.setattr(
         "torchinferno.openai_server._sync_tensor_parallel_command",
@@ -18264,7 +18266,7 @@ def test_openai_tensor_parallel_online_batcher_drains_after_short_step(monkeypat
     )
     monkeypatch.setattr(
         "torchinferno.openai_server._broadcast_tensor_parallel_online_close",
-        lambda model: commands.append(("close", None)),
+        lambda model, **kwargs: commands.append(("close", None)),
     )
     monkeypatch.setattr(
         "torchinferno.openai_server._sync_tensor_parallel_command",
@@ -18361,7 +18363,7 @@ def test_openai_tensor_parallel_online_batcher_restarts_for_different_token_buck
     )
     monkeypatch.setattr(
         "torchinferno.openai_server._broadcast_tensor_parallel_online_close",
-        lambda model: commands.append(("close", None)),
+        lambda model, **kwargs: commands.append(("close", None)),
     )
     monkeypatch.setattr(
         "torchinferno.openai_server._sync_tensor_parallel_command",
@@ -18452,7 +18454,7 @@ def test_openai_tensor_parallel_online_batcher_keeps_sampled_medium_followups(
     )
     monkeypatch.setattr(
         "torchinferno.openai_server._broadcast_tensor_parallel_online_close",
-        lambda model: commands.append(("close", None)),
+        lambda model, **kwargs: commands.append(("close", None)),
     )
     monkeypatch.setattr(
         "torchinferno.openai_server._sync_tensor_parallel_command",
@@ -18553,7 +18555,7 @@ def test_openai_tensor_parallel_online_batcher_combines_active_submit_with_step(
     )
     monkeypatch.setattr(
         "torchinferno.openai_server._broadcast_tensor_parallel_online_close",
-        lambda model: commands.append(("close", None)),
+        lambda model, **kwargs: commands.append(("close", None)),
     )
     monkeypatch.setattr(
         "torchinferno.openai_server._sync_tensor_parallel_command",

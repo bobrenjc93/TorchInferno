@@ -6726,7 +6726,7 @@ class OpenAICompletionEngine:
                     temperature=first.temperature,
                     max_tokens=run_max_tokens,
                 )
-                _broadcast_tensor_parallel_online_close(self.model)
+                _broadcast_tensor_parallel_online_close(self.model, cuda_sync=close_cuda_sync)
                 _sync_tensor_parallel_command(
                     self.model,
                     self.device,
@@ -8363,7 +8363,7 @@ class OpenAICompletionEngine:
                     temperature=group[0].temperature,
                     max_tokens=max_tokens,
                 )
-                _broadcast_tensor_parallel_online_close(self.model)
+                _broadcast_tensor_parallel_online_close(self.model, cuda_sync=close_cuda_sync)
                 _sync_tensor_parallel_command(
                     self.model,
                     self.device,

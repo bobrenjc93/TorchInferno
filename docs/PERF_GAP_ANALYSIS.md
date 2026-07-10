@@ -276,6 +276,18 @@ overhead. Focused CPU validation covers the no-timing queue-profile path plus
 the existing profile-timed decode-many, stop/limit, sync-stop, and state-sync
 accounting.
 
+The latest public run
+`results/v1/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100/runs/20260710_210746`
+completed only few_shot and self_consistency before rank 0 aborted with a
+CUDA unspecified launch failure reported by the NCCL watchdog. The final useful
+queue profile was sampled self-consistency (`temperature=0.7`, `max_tokens=256`)
+with `1` generated-prefix store, `994` generated-prefix reuses, and only `2`
+real decode model calls; multi_turn then timed out and tree/long saw connection
+refused. As a scoped lifecycle fix, tensor-parallel online close commands now
+forward the primary's phase-specific CUDA-sync decision to workers instead of
+letting worker close use its own default. This keeps primary/worker close
+barriers explicit when sampled-short sessions run without per-step sync.
+
 ## Public 20260710_140141 current-run refresh and scheduling rejections
 
 The public pointer now includes the current TorchInferno main run:
