@@ -1147,6 +1147,51 @@ def test_openai_unified_scheduler_decode_warmup_uses_runtime_symm_scope(monkeypa
     ]
 
 
+def test_openai_unified_scheduler_mixed_prefix_warmup_uses_startup_symm_scope(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE", "runtime")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_WARMUP_ONLINE_COMMON_PREFIX_PREFILL", "0")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_WARMUP_ONLINE_MIXED_PREFIX_SUFFIX_PREFILL", "1")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_MAX_TEMPERATURE", "1.0")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_WARMUP_ONLINE_DECODE_SAMPLED_MAX_TOKENS", "1")
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_FLASHINFER_PREFILL_DISABLE", "1")
+    scope_kwargs: list[dict[str, object]] = []
+    mixed_calls: list[tuple[int, int]] = []
+
+    def symm_scope(*args: object, **kwargs: object) -> nullcontext[None]:
+        del args
+        scope_kwargs.append(dict(kwargs))
+        return nullcontext()
+
+    def mixed_warmup(self: OpenAICompletionEngine, cache: object, vocab_size: int, **kwargs: object) -> None:
+        del self, cache, kwargs
+        mixed_calls.append((vocab_size, len(scope_kwargs)))
+
+    monkeypatch.setattr("torchinferno.openai_server._tensor_parallel_symm_mem_allreduce_scope", symm_scope)
+    monkeypatch.setattr(
+        OpenAICompletionEngine,
+        "_warmup_online_mixed_prefix_suffix_prefill_graphs",
+        mixed_warmup,
+    )
+
+    cache = _WarmupShapeCache()
+    engine = object.__new__(OpenAICompletionEngine)
+    engine.model = _WarmupShapeModel()
+    engine.device = torch.device("cpu")
+    engine._persistent_serving_cache = None
+    engine._allocate_online_serving_warmup_cache = lambda: (cache, 4, 4, 16)  # type: ignore[method-assign]
+
+    engine._warmup_unified_scheduler_cache(vocab_size=16)
+
+    assert mixed_calls == [(16, 2)]
+    assert [kwargs["startup"] for kwargs in scope_kwargs] == [False, True]
+    assert [(kwargs["temperature"], kwargs["max_tokens"]) for kwargs in scope_kwargs] == [
+        (0.0, 1),
+        (0.0, 512),
+    ]
+
+
 def test_openai_unified_scheduler_decode_warmup_captures_short_cache_limit(monkeypatch) -> None:
     monkeypatch.setenv("TORCHINFERNO_OPENAI_WARMUP_PROMPT_TOKENS", "3")
     monkeypatch.setenv("TORCHINFERNO_OPENAI_WARMUP_ONLINE_COMMON_PREFIX_PREFILL", "0")

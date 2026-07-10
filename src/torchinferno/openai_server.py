@@ -4165,7 +4165,7 @@ class OpenAICompletionEngine:
                     self.device,
                     max_tokens=mixed_warmup_max_tokens,
                     temperature=0.0,
-                    startup=False,
+                    startup=True,
                 ):
                     self._warmup_online_mixed_prefix_suffix_prefill_graphs(
                         cache,
