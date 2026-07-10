@@ -11799,9 +11799,13 @@ def test_openai_greedy_common_prefix_suffix_warmup_captures_target_shapes(monkey
     assert model.prefix_calls == [((8,), (1, 5), True)]
     assert [call[:4] for call in model.ragged_calls] == [
         ((2, 3), 8, 8, True),
+        ((2, 3), 8, 8, False),
         ((4, 3), 8, 8, True),
+        ((4, 3), 8, 8, False),
         ((2, 7), 12, 8, True),
+        ((2, 7), 12, 8, False),
         ((4, 7), 12, 8, True),
+        ((4, 7), 12, 8, False),
     ]
     assert model.token_calls == []
 

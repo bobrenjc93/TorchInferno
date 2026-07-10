@@ -23,6 +23,33 @@ decode graph misses and padded mixed-prefix prefill (`3.6K` padding tokens,
 Long-output is again high-active decode-many dominated:
 `32.56s` decode-many GPU over `607` steps with `1.6K` overgenerated tokens.
 
+## Current 20260710 tree sampled dense warmup
+
+A same-host tree refresh on current TorchInferno `936821b` wrote
+`/tmp/inference-bench-tree-default-936821b-results/.../runs/20260710_123708`
+and landed at `71.2 / 44.1 / 102.6ms`, p99
+`908.1 / 234.1 / 971.9ms`, with `958/992` correct. A same-host vLLM refresh
+using `cbe9c40f998f` wrote
+`/tmp/inference-bench-vllm-tree-refresh-results/.../runs/20260710_124306`
+and landed at `38.8 / 26.7 / 56.9ms`, p99 `210.0 / 30.7 / 233.1ms`, with
+`961/992` correct. The current local tree gap is therefore roughly `+32ms`
+TTFT, `+17ms` TPOT, and `+46ms` E2E, much smaller than the stale public row but
+still score-facing.
+
+The TorchInferno control still captured sampled common-prefix prefill graphs
+during request traffic: `runtime_prefill_graph_capture_gpu_ms=2344.2` across
+`b1/b2/b4/b8:s16:p45` dense row-index (`rows0`) shapes. Startup warmup already
+covered the indexed (`rows1`) sampled variants, but early online tree waves use
+contiguous active rows and omit `row_indices`, so those graph keys were cold.
+Warming sampled common-prefix dense row-index variants by default wrote
+`/tmp/inference-bench-tree-sampled-densewarm-dirty-results/.../runs/20260710_124932`.
+It moved readiness from `256.1s` to `266.2s`, removed request-time prefill graph
+capture (`2344.2ms -> 0`), and improved tree to `67.3 / 40.6 / 96.0ms`, p99
+`378.9 / 225.5 / 434.3ms`, with `957/992` correct. Keep the new sampled dense
+warmup: it is general graph-key hygiene for sampled common-prefix serving, not
+a benchmark prompt shortcut. The remaining tree gap is now steady prefill
+forward (`6.40s`), sampled decode (`3.49s` GPU), and sampling (`883ms`).
+
 ## Current 20260710 tree fixed-capacity packed-prefill rejection
 
 The fixed-capacity packed-prefix prefill diagnostic is not a sampled-tree fix.

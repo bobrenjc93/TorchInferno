@@ -4318,6 +4318,15 @@ class OpenAICompletionEngine:
             "TORCHINFERNO_OPENAI_WARMUP_ONLINE_GREEDY_COMMON_PREFIX_DENSE_EXTRA_PAIRS",
             True,
         )
+        # Sampled online waves often start with contiguous active rows, so the
+        # runtime omits row_indices and needs the dense graph key warmed too.
+        warm_sampled_dense_row_indices = (
+            warmup_temperature > 0.0
+            and env_flag(
+                "TORCHINFERNO_OPENAI_WARMUP_ONLINE_SAMPLED_COMMON_PREFIX_DENSE_ROW_INDICES",
+                True,
+            )
+        )
         suffixes_by_prefix: dict[int, list[int]] = {}
         for prefix_count in prefix_tokens:
             for suffix_count in suffix_tokens:
@@ -4414,9 +4423,14 @@ class OpenAICompletionEngine:
                         src_prefix_row = torch.tensor([row], dtype=torch.long, device=self.device)
                         row_index_modes: tuple[Tensor | None, ...] = (row_indices,)
                         if (
-                            warm_dense_extra_pairs
-                            and (prefix_count, suffix_count) in extra_pair_set
-                            and batch_size <= row
+                            batch_size <= row
+                            and (
+                                (
+                                    warm_dense_extra_pairs
+                                    and (prefix_count, suffix_count) in extra_pair_set
+                                )
+                                or warm_sampled_dense_row_indices
+                            )
                         ):
                             row_index_modes = (row_indices, None)
                         try:
