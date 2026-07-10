@@ -12693,6 +12693,24 @@ removed that miss, but regressed to `249.5 / 39.5 / 286.7ms`, p99
 `b32:s32:mixed1` request-prompt replay body, not this one small cold dense-base
 graph.
 
+Adding a new `p111/s96` greedy-short extra warmup is also rejected for
+long_output. A fresh `02d160a` control wrote
+`/tmp/inference-bench-torchinferno-long-02d160a-results/.../runs/20260710_112817`
+and landed at `224.4 / 21.6 / 1057.7ms`, p99
+`1613.9 / 56.1 / 2924.1ms`, `1000/1000` correct. Its profile had one
+request-path capture for `prefix_graph:b16:s96:p111-111:src1:mixed0`,
+`1.42s` prefill graph capture GPU, `6.11s/6.77s` prefill forward/wall, and
+`7.76s` decode-many GPU. A dirty probe adding `111:96` to the existing
+greedy-short extra pairs wrote
+`/tmp/inference-bench-torchinferno-long-p111s96warm-results/.../runs/20260710_113613`
+and did remove that capture (`runtime_prefill_graph_capture_gpu_ms=0`,
+prefill forward/wall `4.85s/5.48s`), but regressed score-facing medians to
+`232.1 / 21.8 / 1069.4ms` while adding another benchmark-shaped startup
+warmup constant. Keep the default extra pairs at the already-configured
+`111:32`, `111:64`, and `122:16`; the remaining long_output gap is the
+single-step high-active decode replay body plus padded prefill, not more
+shape-specific warmup.
+
 ## Priority for a focused (non-loop) session
 
 1. Prefill MFU (Issue 1) — biggest TTFT lever, ~2x, affects 3/5 benchmarks.
