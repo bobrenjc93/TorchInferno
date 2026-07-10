@@ -153,6 +153,24 @@ long_output E2E. That keeps the next cross-provider target on lower first-token
 admission/prefill latency and long-output end-to-end pipeline cost rather than
 a broad raw-token-rate issue.
 
+A sync-timed long_output diagnostic on pushed `38c9716` wrote
+`/tmp/inference-bench-long-detail-profile-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-long-detail-profile/runs/20260710_204639`
+with `TORCHINFERNO_OPENAI_QUEUE_PROFILE_SYNC_TIMINGS=1`. It landed at
+`232.8 / 22.0 / 1084.7ms`, p99 `1516.7 / 47.9 / 2629.7ms`, with
+`1000/1000` correct and `276.2s` server readiness. The queue profile split the
+median first-token path into `q2submit=96.9ms` and `submit2first=133.7ms`, with
+`6.48s` prefill wall (`5.81s` forward) plus `7.38s` decode-many GPU and
+`6.87s` decode-many token wait. Packed-prefix candidates covered `54` calls,
+`44.7K` real suffix tokens, and `32.7K` saved dense tokens, led by
+`b32:s64:p111` (`8.3K` saved), `b24:s96:p111` (`6.9K`), and
+`b16:s96:p111` (`5.0K`). Decode-many remained concentrated in
+`decode_many:b64/64` (`187` steps, `11.97K` model tokens, `2.38s` GPU) with
+`1.53K` overgenerated stop-tail tokens. This profile reinforces the current
+decision not to reopen fixed-capacity packed prefill, active-cap, refill-floor,
+or stop-tail knobs; the remaining long_output closure needs a non-fragmenting
+packed cached-prefix prefill body and lower high-active decode/stop pipeline
+cost.
+
 ## Public 20260710_140141 current-run refresh and scheduling rejections
 
 The public pointer now includes the current TorchInferno main run:
