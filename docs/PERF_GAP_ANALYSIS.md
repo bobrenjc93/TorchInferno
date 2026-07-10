@@ -632,6 +632,19 @@ fixed-capacity target is only `258ms` (`5.0%` of prefill forward); tree still
 needs a broader packed-prefix body and lower sampled decode cost rather than one
 narrow pattern rewrite.
 
+A local forced fixed-capacity few_shot run after adding runtime reject counters
+confirmed the analyzer prediction. The diagnostic wrote
+`/tmp/inference-bench-torchinferno-few-fixedpacked-telemetry-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100/runs/20260710_053201`
+and landed at `201.7 / 36.0 / 241.9ms`, `977/1000` correct, worse than the
+default allreduce few_shot control. The queue profile reported
+`runtime_prefill_packed_fixed_capacity_attempts=33`,
+`runtime_prefill_packed_fixed_capacity_accepts=0`, and rejects
+`{"no_savings": 20, "capacity_grew": 8, "graph_returned_none": 5}` with
+`runtime_prefill_packed_eager_calls=0`. The same run also logged prefill logits
+graph capture invalidation during startup. Keep the fixed-capacity switches as
+diagnostic telemetry until the packed body can run below the dense `b32*s16`
+graph cost.
+
 An env-only few_shot exact-suffix probe on the same branch confirms that simply
 shrinking the dense bucket is not enough. With
 `TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SUFFIX_BUCKETS=12,13,14,16` plus
