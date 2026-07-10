@@ -131,6 +131,18 @@ queue profile kept the same lightweight shape across rows: request p50s and
 graph counters remained populated, while detailed runtime timing totals stayed
 zero and temperature timing stayed null.
 
+A same-host vLLM refresh on `85c09e9` for the two largest remaining score gaps
+wrote
+`/tmp/inference-bench-vllm-tree-long-refresh-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-vllm-tree-long-refresh/runs/20260710_203647`.
+vLLM reached readiness in `95.4s`, then landed at tree_of_thought
+`38.7 / 26.7 / 56.5ms`, `960/992` correct, and long_output
+`50.9 / 16.8 / 639.2ms`, `1000/1000` correct. Against the pushed-head
+TorchInferno full-suite row, the remaining deltas are still structural:
+tree needs about `27ms` lower TTFT, `12.5ms` lower TPOT, and `39.5ms` lower
+E2E, while long_output needs about `187ms` lower TTFT, `5.1ms` lower TPOT, and
+`405ms` lower E2E. Startup is also still about `176s` slower than vLLM because
+TorchInferno eagerly warms many runtime graph shapes.
+
 ## Public 20260710_140141 current-run refresh and scheduling rejections
 
 The public pointer now includes the current TorchInferno main run:
