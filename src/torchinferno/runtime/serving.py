@@ -5209,149 +5209,186 @@ class ContinuousBatchEngine:
                 for _original_index, _request, prefix_hit_tokens, reusable in group
             )
 
-            active_items: list[tuple[_ActiveRequest, int, int]] = []
+            active_items: list[tuple[_ActiveRequest, int, int, bool]] = []
             copy_groups: dict[tuple[int, int], list[int]] = defaultdict(list)
-            continuation_reuse_groups: dict[tuple[Hashable, float], list[int]] = defaultdict(list)
-            continuation_reuse: dict[int, _ReusablePrefix] = {}
-            pending_rows: list[int] = []
             active: list[_ActiveRequest] = []
-            first_tokens = [0 for _ in group]
-            first_token_finished: list[bool | None] = [None for _ in group]
+            tokens_by_row = [list(request.prompt) for _original_index, request, _hit, _reusable in group]
+            generated_by_row = [0 for _ in group]
+            continuation_reuse: dict[int, _ReusablePrefix] = {}
+            final_prefix_by_row: dict[int, tuple[_ReusablePrefix, int, bool]] = {}
+            finished_rows: set[int] = set()
+            last_event_index_by_row: dict[int, int] = {}
+
+            def append_event(
+                row_index: int,
+                token: int,
+                generated: int,
+                *,
+                finished: bool,
+            ) -> None:
+                if events is None:
+                    return
+                request = group[row_index][1]
+                events.append(
+                    ServingTokenEvent(
+                        request_id=request.request_id,
+                        token=int(token),
+                        step=step,
+                        generated=int(generated),
+                        finished=bool(finished),
+                    )
+                )
+                last_event_index_by_row[row_index] = len(events) - 1
+
+            def finish_last_event(row_index: int) -> None:
+                if events is None:
+                    return
+                event_index = last_event_index_by_row.get(row_index)
+                if event_index is None:
+                    return
+                event = events[event_index]
+                events[event_index] = ServingTokenEvent(
+                    request_id=event.request_id,
+                    token=event.token,
+                    step=event.step,
+                    generated=event.generated,
+                    finished=True,
+                )
+
             for row_index, (_original_index, request, _prefix_hit_tokens, _reusable) in enumerate(group):
                 next_token = int(next_tokens[row_index])
-                first_tokens[row_index] = int(next_token)
+                tokens_by_row[row_index].append(next_token)
                 generated = 1
+                generated_by_row[row_index] = generated
                 finished = request.is_stop_token(next_token) or generated >= request.max_new_tokens
+                append_event(row_index, next_token, generated, finished=finished)
                 if finished:
-                    first_token_finished[row_index] = True
+                    finished_rows.add(row_index)
                     continue
 
-                generated_prefix = (*request.prompt, next_token)
+                generated_prefix = tuple(tokens_by_row[row_index])
                 continuation = self._lookup_exact_reusable_prefix(generated_prefix)
-                if continuation is not None:
+                if continuation is not None and continuation.logits is not None:
                     continuation_reuse[row_index] = continuation
+                    continue
+                final_prefix_by_row[row_index] = (_reusable, _prefix_hit_tokens, True)
+
+            generated_reuse_entries: list[tuple[int, _ReusablePrefix | None]] = []
+
+            max_generated_hops = env_int(
+                "TORCHINFERNO_CONTINUOUS_GENERATED_PREFIX_REUSE_MAX_HOPS",
+                8,
+                minimum=1,
+            )
+            generated_hops = 0
+            while continuation_reuse and generated_hops < max_generated_hops:
+                continuation_reuse_groups: dict[tuple[Hashable, float], list[int]] = defaultdict(list)
+                for row_index in sorted(continuation_reuse):
+                    request = group[row_index][1]
+                    continuation = continuation_reuse[row_index]
                     continuation_reuse_groups[
                         (continuation.route_id, self._request_temperature(request))
                     ].append(row_index)
-                    continue
-                first_token_finished[row_index] = False
-                pending_rows.append(row_index)
 
-            continuation_next_tokens: dict[int, int] = {}
-            for indices in continuation_reuse_groups.values():
-                continuation = continuation_reuse[indices[0]]
-                if continuation.logits is None:
-                    continue
-                temperature = self._request_temperature(group[indices[0]][1])
-                sampled_tokens = self._sample_reusable_prefix_next_token_list(
-                    continuation,
-                    len(indices),
-                    temperature=temperature,
-                )
-                for token_index, row_index in enumerate(indices):
-                    continuation_next_tokens[row_index] = int(sampled_tokens[token_index])
-
-            if events is not None:
-                second_events: list[ServingTokenEvent] = []
-                for row_index, (_original_index, request, _prefix_hit_tokens, _reusable) in enumerate(group):
-                    first_token = first_tokens[row_index]
-                    finished = first_token_finished[row_index]
-                    second_token = continuation_next_tokens.get(row_index)
-                    if finished is None:
-                        finished = second_token is not None and request.is_stop_token(second_token)
-                    events.append(
-                        ServingTokenEvent(
-                            request_id=request.request_id,
-                            token=first_token,
-                            step=step,
-                            generated=1,
-                            finished=bool(finished),
-                        )
+                sampled_by_row: dict[int, tuple[int, _ReusablePrefix]] = {}
+                for indices in continuation_reuse_groups.values():
+                    continuation = continuation_reuse[indices[0]]
+                    temperature = self._request_temperature(group[indices[0]][1])
+                    sampled_tokens = self._sample_reusable_prefix_next_token_list(
+                        continuation,
+                        len(indices),
+                        temperature=temperature,
                     )
-                    if second_token is None or request.is_stop_token(second_token):
+                    for token_index, row_index in enumerate(indices):
+                        sampled_by_row[row_index] = (
+                            int(sampled_tokens[token_index]),
+                            continuation,
+                        )
+
+                next_continuation_reuse: dict[int, _ReusablePrefix] = {}
+                for row_index in range(len(group)):
+                    sampled = sampled_by_row.get(row_index)
+                    if sampled is None:
                         continue
-                    second_generated = 2
-                    second_events.append(
-                        ServingTokenEvent(
-                            request_id=request.request_id,
-                            token=second_token,
-                            step=step,
-                            generated=second_generated,
-                            finished=second_generated >= request.max_new_tokens,
-                        )
+                    next_token, continuation = sampled
+                    original_index, request, _prefix_hit_tokens, _reusable = group[row_index]
+                    del original_index, _prefix_hit_tokens, _reusable
+                    generated_prefix_len = len(continuation.tokens)
+                    generated_reuse_entries.append((generated_prefix_len, continuation))
+                    self.stats.generated_prefix_reuse_requests += 1
+                    self.stats.generated_prefix_reuse_tokens += generated_prefix_len
+
+                    generated = generated_by_row[row_index] + 1
+                    generated_by_row[row_index] = generated
+                    if request.is_stop_token(next_token):
+                        finish_last_event(row_index)
+                        finished_rows.add(row_index)
+                        continue
+
+                    tokens_by_row[row_index].append(next_token)
+                    reached_limit = generated >= request.max_new_tokens
+                    append_event(row_index, next_token, generated, finished=reached_limit)
+                    if reached_limit:
+                        finished_rows.add(row_index)
+                        continue
+
+                    generated_prefix = tuple(tokens_by_row[row_index])
+                    next_continuation = self._lookup_exact_reusable_prefix(generated_prefix)
+                    if (
+                        next_continuation is not None
+                        and next_continuation.logits is not None
+                        and generated_hops + 1 < max_generated_hops
+                    ):
+                        next_continuation_reuse[row_index] = next_continuation
+                        continue
+                    final_prefix_by_row[row_index] = (
+                        continuation,
+                        generated_prefix_len,
+                        False,
                     )
-                events.extend(second_events)
+                continuation_reuse = next_continuation_reuse
+                generated_hops += 1
 
-            continuation_copy_groups: dict[tuple[int, int], list[int]] = defaultdict(list)
-            continuation_active: list[_ActiveRequest] = []
-            generated_reuse_entries: list[tuple[int, _ReusablePrefix | None]] = []
-            for row_index, next_token in continuation_next_tokens.items():
-                original_index, request, _prefix_hit_tokens, _reusable = group[row_index]
-                continuation = continuation_reuse[row_index]
-                second_token = int(next_token)
-                generated = 2
-                generated_prefix_len = len(request.prompt) + 1
-                generated_reuse_entries.append((generated_prefix_len, continuation))
-                self.stats.generated_prefix_reuse_requests += 1
-                self.stats.generated_prefix_reuse_tokens += generated_prefix_len
-                finished = request.is_stop_token(second_token) or generated >= request.max_new_tokens
-                if finished:
-                    continue
-
-                row = self._acquire_active_row()
-                acquired_rows.append(row)
-                state = _ActiveRequest(
-                    original_index=original_index,
-                    request=request,
-                    tokens=[*request.prompt, int(next_tokens[row_index]), second_token],
-                    generated=generated,
-                    row=row,
-                    last_token=second_token,
-                    seq_len=generated_prefix_len,
-                    prefix_hit_tokens=generated_prefix_len,
-                    started_step=step,
-                )
-                continuation_copy_groups[(continuation.row, generated_prefix_len)].append(row)
-                continuation_active.append(state)
+            for row_index, continuation in continuation_reuse.items():
+                final_prefix_by_row[row_index] = (continuation, len(continuation.tokens), False)
 
             self._record_prefix_reuse_batch(generated_reuse_entries)
-            for (source_row, tokens), dest_rows in continuation_copy_groups.items():
-                self._copy_prefix_to_rows(source_row, dest_rows, tokens)
-            for state in continuation_active:
-                state.seq_len = self._cache_row_seq_len(state.row, state.seq_len)
-                active.append(state)
-
-            for row_index in pending_rows:
-                original_index, request, prefix_hit_tokens, _reusable = group[row_index]
-                next_token = int(next_tokens[row_index])
-                generated = 1
+            for row_index in range(len(group)):
+                if row_index in finished_rows:
+                    continue
+                source = final_prefix_by_row.get(row_index)
+                if source is None:
+                    continue
+                source_reusable, source_tokens, should_store_prompt_logits = source
+                original_index, request, _prefix_hit_tokens, _reusable = group[row_index]
                 row = self._acquire_active_row()
                 acquired_rows.append(row)
                 state = _ActiveRequest(
                     original_index=original_index,
                     request=request,
-                    tokens=[*request.prompt, next_token],
-                    generated=generated,
+                    tokens=tokens_by_row[row_index],
+                    generated=generated_by_row[row_index],
                     row=row,
-                    last_token=next_token,
-                    seq_len=len(request.prompt),
-                    prefix_hit_tokens=prefix_hit_tokens,
+                    last_token=tokens_by_row[row_index][-1],
+                    seq_len=source_tokens,
+                    prefix_hit_tokens=source_tokens,
                     started_step=step,
                 )
-                copy_groups[(_reusable.row, prefix_hit_tokens)].append(row)
-                active_items.append((state, row_index, row))
+                copy_groups[(source_reusable.row, source_tokens)].append(row)
+                active_items.append((state, row_index, row, should_store_prompt_logits))
 
             for (source_row, prefix_hit_tokens), dest_rows in copy_groups.items():
                 self._copy_prefix_to_rows(source_row, dest_rows, prefix_hit_tokens)
-            for state, row_index, row in active_items:
-                state.seq_len = self._cache_row_seq_len(row, len(state.request.prompt))
-                self._store_reusable_prefix(
-                    state.request.request_id,
-                    state.request.prompt,
-                    row,
-                    logits_by_index[row_index],
-                    allow_pinned=self._allow_pinned_full_prompt_store(state.request),
-                )
+            for state, row_index, row, should_store_prompt_logits in active_items:
+                state.seq_len = self._cache_row_seq_len(row, state.seq_len)
+                if should_store_prompt_logits:
+                    self._store_reusable_prefix(
+                        state.request.request_id,
+                        state.request.prompt,
+                        row,
+                        logits_by_index[row_index],
+                        allow_pinned=self._allow_pinned_full_prompt_store(state.request),
+                    )
                 active.append(state)
             return active
         except Exception:
