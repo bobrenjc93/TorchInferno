@@ -627,6 +627,10 @@ class ServingStats:
     prefill_packed_candidate_shape_model_tokens: dict[str, int] = field(default_factory=dict)
     prefill_packed_candidate_shape_saved_tokens: dict[str, int] = field(default_factory=dict)
     prefill_packed_candidate_shape_groups: dict[str, int] = field(default_factory=dict)
+    prefill_packed_candidate_shape_max_tokens: dict[str, int] = field(default_factory=dict)
+    prefill_packed_candidate_shape_max_model_tokens: dict[str, int] = field(default_factory=dict)
+    prefill_packed_candidate_shape_max_saved_tokens: dict[str, int] = field(default_factory=dict)
+    prefill_packed_candidate_shape_max_groups: dict[str, int] = field(default_factory=dict)
     prefill_packed_candidate_signature_counts: dict[str, int] = field(default_factory=dict)
     prefill_packed_candidate_signature_tokens: dict[str, int] = field(default_factory=dict)
     prefill_packed_candidate_signature_model_tokens: dict[str, int] = field(default_factory=dict)
@@ -8745,6 +8749,25 @@ class ContinuousBatchEngine:
             shape_key,
             groups,
         )
+        prior_max_saved = self.stats.prefill_packed_candidate_shape_max_saved_tokens.get(
+            shape_key,
+            -1,
+        )
+        prior_max_groups = self.stats.prefill_packed_candidate_shape_max_groups.get(
+            shape_key,
+            -1,
+        )
+        if saved_tokens > prior_max_saved or (
+            saved_tokens == prior_max_saved and groups > prior_max_groups
+        ):
+            self.stats.prefill_packed_candidate_shape_max_tokens[shape_key] = real_tokens
+            self.stats.prefill_packed_candidate_shape_max_model_tokens[shape_key] = int(
+                model_tokens
+            )
+            self.stats.prefill_packed_candidate_shape_max_saved_tokens[shape_key] = (
+                saved_tokens
+            )
+            self.stats.prefill_packed_candidate_shape_max_groups[shape_key] = groups
         signature_key = _packed_prefill_candidate_signature_from_counts(shape_key, group_counts)
         record_count(
             self.stats.prefill_packed_candidate_signature_counts,

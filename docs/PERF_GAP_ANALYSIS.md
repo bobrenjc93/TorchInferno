@@ -241,6 +241,30 @@ less reusable than tree: `49` pattern keys with only `2` repeated keys and
 a packed cached-prefix prefill path must avoid per-pattern fragmentation rather
 than specializing narrowly to one repeated pattern.
 
+Packed-candidate target telemetry now also records the best single variable
+packed wave per dense prefill shape: max real tokens, max dense model tokens,
+max saved tokens, and max group count. These are count-only fields exported in
+queue profiles alongside the existing aggregate shape/signature/pattern maps,
+and `inference-bench-summary` now keeps `shape_counts` in its queue-profile
+allowlist so the per-shape target table reports real call counts. This closes
+the diagnostic gap left by long_output's low pattern reuse: a non-fragmenting
+packed body can now be sized from the largest observed variable-packed wave,
+not only from repeated exact or fixed-capacity patterns.
+
+A validation long_output run with the new fields wrote
+`/tmp/inference-bench-packed-max-long-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-packed-max-long/runs/20260710_214232`.
+It reached readiness in `276.3s` and landed at
+`225.8 / 21.5 / 1043.1ms`, p99 `1505.5 / 45.1 / 2712.2ms`, with
+`1000/1000` correct. The queue profile recorded `54` packed-prefix candidate
+calls, `44.7K` real suffix tokens, `79.9K` dense model tokens, and `35.2K`
+saved tokens. The new max-call columns show the first concrete variable-packed
+body targets: `prefix_graph:b24:s96:p111-111:src1:mixed0` ran `9` calls,
+saved `10.3K` total tokens, and had a single wave saving `1.66K/2.30K`
+tokens (`72.0%`) across `9` groups; `b32:s96:p111` appeared only once but
+saved `2.23K/3.07K` tokens (`72.7%`) across `11` groups. This keeps
+long_output pointed at a generic variable-packed cached-prefix body rather than
+another fixed-pattern graph experiment.
+
 ## Public 20260710_140141 current-run refresh and scheduling rejections
 
 The public pointer now includes the current TorchInferno main run:

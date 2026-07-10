@@ -15323,6 +15323,18 @@ def test_openai_queue_profile_records_runtime_engine_stats(
         prefill_packed_candidate_shape_groups = {
             "prefix_graph:b8:s16:p45-45:src1:mixed0": 5,
         }
+        prefill_packed_candidate_shape_max_tokens = {
+            "prefix_graph:b8:s16:p45-45:src1:mixed0": 12,
+        }
+        prefill_packed_candidate_shape_max_model_tokens = {
+            "prefix_graph:b8:s16:p45-45:src1:mixed0": 16,
+        }
+        prefill_packed_candidate_shape_max_saved_tokens = {
+            "prefix_graph:b8:s16:p45-45:src1:mixed0": 4,
+        }
+        prefill_packed_candidate_shape_max_groups = {
+            "prefix_graph:b8:s16:p45-45:src1:mixed0": 2,
+        }
         prefill_packed_candidate_signature_counts = {
             "prefix_graph:b8:s16:p45-45:src1:mixed0|p45:s10:n2/p45:s11:n1": 3,
         }
@@ -15846,6 +15858,18 @@ def test_openai_queue_profile_records_runtime_engine_stats(
             },
             "runtime_prefill_packed_candidate_shape_groups": {
                 "prefix_graph:b8:s16:p45-45:src1:mixed0": 5,
+            },
+            "runtime_prefill_packed_candidate_shape_max_tokens": {
+                "prefix_graph:b8:s16:p45-45:src1:mixed0": 12,
+            },
+            "runtime_prefill_packed_candidate_shape_max_model_tokens": {
+                "prefix_graph:b8:s16:p45-45:src1:mixed0": 16,
+            },
+            "runtime_prefill_packed_candidate_shape_max_saved_tokens": {
+                "prefix_graph:b8:s16:p45-45:src1:mixed0": 4,
+            },
+            "runtime_prefill_packed_candidate_shape_max_groups": {
+                "prefix_graph:b8:s16:p45-45:src1:mixed0": 2,
             },
             "runtime_prefill_packed_candidate_signature_keys": 1,
             "runtime_prefill_packed_candidate_signature_calls": 3,

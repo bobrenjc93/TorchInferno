@@ -266,6 +266,18 @@ def _write_inference_bench_run(tmp_path) -> None:
         "runtime_prefill_packed_candidate_shape_groups": {
             "prefix_graph:b8:s16:p45-45:src1:mixed0": 2,
         },
+        "runtime_prefill_packed_candidate_shape_max_tokens": {
+            "prefix_graph:b8:s16:p45-45:src1:mixed0": 10,
+        },
+        "runtime_prefill_packed_candidate_shape_max_model_tokens": {
+            "prefix_graph:b8:s16:p45-45:src1:mixed0": 16,
+        },
+        "runtime_prefill_packed_candidate_shape_max_saved_tokens": {
+            "prefix_graph:b8:s16:p45-45:src1:mixed0": 6,
+        },
+        "runtime_prefill_packed_candidate_shape_max_groups": {
+            "prefix_graph:b8:s16:p45-45:src1:mixed0": 2,
+        },
         "runtime_prefill_packed_candidate_signature_keys": 2,
         "runtime_prefill_packed_candidate_signature_calls": 4,
         "runtime_prefill_packed_candidate_signature_repeated_keys": 1,
@@ -868,6 +880,8 @@ def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) ->
     assert "80.0%" in text
     assert "saved_tokens" in text
     assert "row_saved" in text
+    assert "max_call_saved" in text
+    assert "max_call_pct" in text
     assert "suffix_saved" in text
     assert "est_share" in text
     assert "28.0%" in text

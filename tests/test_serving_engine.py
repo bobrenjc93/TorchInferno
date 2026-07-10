@@ -4208,6 +4208,10 @@ def test_continuous_batch_engine_records_profile_shape_counts() -> None:
     assert engine.stats.prefill_packed_candidate_shape_model_tokens[prefix_shape] == 16
     assert engine.stats.prefill_packed_candidate_shape_saved_tokens[prefix_shape] == 10
     assert engine.stats.prefill_packed_candidate_shape_groups[prefix_shape] == 3
+    assert engine.stats.prefill_packed_candidate_shape_max_tokens[prefix_shape] == 6
+    assert engine.stats.prefill_packed_candidate_shape_max_model_tokens[prefix_shape] == 16
+    assert engine.stats.prefill_packed_candidate_shape_max_saved_tokens[prefix_shape] == 10
+    assert engine.stats.prefill_packed_candidate_shape_max_groups[prefix_shape] == 3
     signature = f"{prefix_shape}|p16:s1:n1/p16:s2:n1/p16:s3:n1"
     assert engine.stats.prefill_packed_candidate_signature_counts[signature] == 1
     assert engine.stats.prefill_packed_candidate_signature_tokens[signature] == 6
@@ -4281,6 +4285,14 @@ def test_continuous_batch_engine_records_packed_prefill_candidate_shapes_for_que
         shape_key: 10,
     }
     assert profiled_engine.stats.prefill_packed_candidate_shape_groups == {shape_key: 3}
+    assert profiled_engine.stats.prefill_packed_candidate_shape_max_tokens == {shape_key: 6}
+    assert profiled_engine.stats.prefill_packed_candidate_shape_max_model_tokens == {
+        shape_key: 16,
+    }
+    assert profiled_engine.stats.prefill_packed_candidate_shape_max_saved_tokens == {
+        shape_key: 10,
+    }
+    assert profiled_engine.stats.prefill_packed_candidate_shape_max_groups == {shape_key: 3}
     signature = f"{shape_key}|p16:s1:n1/p16:s2:n1/p16:s3:n1"
     assert profiled_engine.stats.prefill_packed_candidate_signature_counts == {
         signature: 1,

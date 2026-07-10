@@ -122,10 +122,15 @@ _QUEUE_PROFILE_FIELDS = (
     "runtime_prefill_packed_candidate_model_tokens",
     "runtime_prefill_packed_candidate_saved_tokens",
     "runtime_prefill_packed_candidate_groups",
+    "runtime_prefill_packed_candidate_shape_counts",
     "runtime_prefill_packed_candidate_shape_tokens",
     "runtime_prefill_packed_candidate_shape_model_tokens",
     "runtime_prefill_packed_candidate_shape_saved_tokens",
     "runtime_prefill_packed_candidate_shape_groups",
+    "runtime_prefill_packed_candidate_shape_max_tokens",
+    "runtime_prefill_packed_candidate_shape_max_model_tokens",
+    "runtime_prefill_packed_candidate_shape_max_saved_tokens",
+    "runtime_prefill_packed_candidate_shape_max_groups",
     "runtime_prefill_packed_candidate_signature_keys",
     "runtime_prefill_packed_candidate_signature_calls",
     "runtime_prefill_packed_candidate_signature_repeated_keys",
@@ -925,6 +930,9 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
                         "row_saved",
                         "suffix_saved",
                         "saved_pct",
+                        "max_call_saved",
+                        "max_call_pct",
+                        "max_call_groups",
                         "est_saved_ms",
                         "est_share",
                         "obs_packed_ms",
@@ -2587,6 +2595,15 @@ def _prefill_packed_per_batch_target_rows(
         shape_groups = _numeric_mapping(
             fields.get("runtime_prefill_packed_candidate_shape_groups")
         )
+        shape_max_model = _numeric_mapping(
+            fields.get("runtime_prefill_packed_candidate_shape_max_model_tokens")
+        )
+        shape_max_saved = _numeric_mapping(
+            fields.get("runtime_prefill_packed_candidate_shape_max_saved_tokens")
+        )
+        shape_max_groups = _numeric_mapping(
+            fields.get("runtime_prefill_packed_candidate_shape_max_groups")
+        )
         for shape, saved_tokens in shape_saved.items():
             saved = max(0.0, float(saved_tokens))
             model_tokens = max(0.0, float(shape_model_tokens.get(shape, 0.0)))
@@ -2626,6 +2643,22 @@ def _prefill_packed_per_batch_target_rows(
                             else _int_if_whole(max(0.0, suffix_saved))
                         ),
                         _fmt_pct(saved, model_tokens),
+                        _fmt_value(
+                            None
+                            if shape not in shape_max_saved
+                            else _int_if_whole(max(0.0, shape_max_saved.get(shape, 0.0)))
+                        ),
+                        _fmt_pct(
+                            max(0.0, shape_max_saved.get(shape, 0.0)),
+                            max(0.0, shape_max_model.get(shape, 0.0)),
+                        )
+                        if shape in shape_max_saved
+                        else "-",
+                        _fmt_value(
+                            None
+                            if shape not in shape_max_groups
+                            else _int_if_whole(max(0.0, shape_max_groups.get(shape, 0.0)))
+                        ),
                         _fmt_value(
                             None
                             if est_saved_ms is None
