@@ -14917,6 +14917,12 @@ def test_openai_queue_profile_records_runtime_engine_stats(
             "prefix_graph:b8:s16:p45-45:src1:mixed0|p45:s10/p45:s11#p45:s10": 2,
             "prefix_graph:b8:s16:p45-45:src1:mixed0|p45:s10/p45:s11#p45:s11": 1,
         }
+        prefill_packed_fixed_capacity_attempts = 4
+        prefill_packed_fixed_capacity_accepts = 1
+        prefill_packed_fixed_capacity_reject_reason_counts = {
+            "capacity_grew": 2,
+            "graph_returned_none": 1,
+        }
         prefill_suffix_split_candidate_calls = 4
         prefill_suffix_split_accepted_calls = 2
         prefill_suffix_split_rejected_calls = 2
@@ -15235,6 +15241,8 @@ def test_openai_queue_profile_records_runtime_engine_stats(
             "runtime_prefill_packed_candidate_model_tokens": 48,
             "runtime_prefill_packed_candidate_saved_tokens": 17,
             "runtime_prefill_packed_candidate_tokens": 31,
+            "runtime_prefill_packed_fixed_capacity_attempts": 4,
+            "runtime_prefill_packed_fixed_capacity_accepts": 1,
             "runtime_prefill_graph_capture_ms": 9.5,
             "runtime_prefill_graph_cache_evicted_entries": 128,
             "runtime_prefill_graph_cache_evictions": 2,
@@ -15425,6 +15433,10 @@ def test_openai_queue_profile_records_runtime_engine_stats(
             "runtime_prefill_packed_candidate_pattern_slot_counts": {
                 "prefix_graph:b8:s16:p45-45:src1:mixed0|p45:s10/p45:s11#p45:s10": 2,
                 "prefix_graph:b8:s16:p45-45:src1:mixed0|p45:s10/p45:s11#p45:s11": 1,
+            },
+            "runtime_prefill_packed_fixed_capacity_reject_reason_counts": {
+                "capacity_grew": 2,
+                "graph_returned_none": 1,
             },
             "runtime_prefill_suffix_split_candidate_calls": 4,
             "runtime_prefill_suffix_split_accepted_calls": 2,

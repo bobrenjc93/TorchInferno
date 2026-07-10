@@ -526,6 +526,8 @@ class ServingStats:
     prefill_packed_candidate_model_tokens: int = 0
     prefill_packed_candidate_saved_tokens: int = 0
     prefill_packed_candidate_groups: int = 0
+    prefill_packed_fixed_capacity_attempts: int = 0
+    prefill_packed_fixed_capacity_accepts: int = 0
     prefill_prefix_copy_skipped_batches: int = 0
     prefill_prefix_copy_skipped_tokens: int = 0
     prefill_graph_hits: int = 0
@@ -597,6 +599,7 @@ class ServingStats:
     prefill_packed_candidate_pattern_saved_tokens: dict[str, int] = field(default_factory=dict)
     prefill_packed_candidate_pattern_groups: dict[str, int] = field(default_factory=dict)
     prefill_packed_candidate_pattern_slot_counts: dict[str, int] = field(default_factory=dict)
+    prefill_packed_fixed_capacity_reject_reason_counts: dict[str, int] = field(default_factory=dict)
     prefill_suffix_split_candidate_calls: int = 0
     prefill_suffix_split_accepted_calls: int = 0
     prefill_suffix_split_rejected_calls: int = 0
@@ -3942,6 +3945,10 @@ class ContinuousBatchEngine:
             elapsed_ms,
         )
 
+    def _record_fixed_capacity_packed_prefill_reject(self, reason: str) -> None:
+        counts = self.stats.prefill_packed_fixed_capacity_reject_reason_counts
+        counts[reason] = int(counts.get(reason, 0)) + 1
+
     def _try_fixed_capacity_packed_prefill_logits(
         self,
         *,
@@ -3968,25 +3975,41 @@ class ContinuousBatchEngine:
         int,
         int,
     ] | None:
+        if not env_flag(
+            "TORCHINFERNO_CONTINUOUS_PACKED_RAGGED_PREFILL_FIXED_CAPACITY_GRAPH",
+            False,
+        ):
+            return None
         if not _packed_prefill_fixed_capacity_enabled(
             profile_shape_key=profile_shape_key,
             packed_prefill_pattern_key=packed_prefill_pattern_key,
         ):
+            self.stats.prefill_packed_fixed_capacity_attempts += 1
+            self._record_fixed_capacity_packed_prefill_reject("pattern_disabled")
             return None
+        self.stats.prefill_packed_fixed_capacity_attempts += 1
         packed_graph = getattr(
             self.model,
             "try_prefill_ragged_logits_packed_eager_graph",
             None,
         )
-        if packed_graph is None or not group:
+        if packed_graph is None:
+            self._record_fixed_capacity_packed_prefill_reject("no_graph")
+            return None
+        if not group:
+            self._record_fixed_capacity_packed_prefill_reject("empty_group")
             return None
         if len(rows) != len(group) or len(suffixes) != len(group):
+            self._record_fixed_capacity_packed_prefill_reject("shape_mismatch")
             return None
         if src_prefix_row is None and any(prefix_hit > 0 for _i, _req, prefix_hit, _r in group):
+            self._record_fixed_capacity_packed_prefill_reject("missing_src_prefix")
             return None
         if src_prefix_row is not None and int(src_prefix_row.numel()) != 1:
+            self._record_fixed_capacity_packed_prefill_reject("multi_src_prefix")
             return None
         if suffix_bucket <= 0 or any(length <= 0 or length > suffix_bucket for length in suffix_lengths):
+            self._record_fixed_capacity_packed_prefill_reject("invalid_suffix")
             return None
 
         start_lens = [int(prefix_hit) for _i, _request, prefix_hit, _reusable in group]
@@ -4008,6 +4031,7 @@ class ContinuousBatchEngine:
         )
         if grew_capacity:
             self._packed_prefill_fixed_capacity_stable_seen[packed_prefill_pattern_key] = 0
+            self._record_fixed_capacity_packed_prefill_reject("capacity_grew")
             return None
         stable_seen = (
             self._packed_prefill_fixed_capacity_stable_seen.get(
@@ -4023,6 +4047,7 @@ class ContinuousBatchEngine:
             minimum=1,
         )
         if stable_seen < min_calls:
+            self._record_fixed_capacity_packed_prefill_reject("warming")
             return None
 
         real_by_key: dict[tuple[int, int], list[int]] = defaultdict(list)
@@ -4033,17 +4058,20 @@ class ContinuousBatchEngine:
         for key in sorted(capacities):
             start_len, suffix_len = key
             if suffix_len <= 0 or suffix_len > suffix_bucket:
+                self._record_fixed_capacity_packed_prefill_reject("invalid_capacity")
                 return None
             entries = real_by_key.get(key, [])
             for slot in range(capacities[key]):
                 real_index = entries[slot] if slot < len(entries) else None
                 slot_specs.append((start_len, suffix_len, real_index))
         if not slot_specs:
+            self._record_fixed_capacity_packed_prefill_reject("no_slots")
             return None
 
         fixed_tokens = sum(suffix_len for _start_len, suffix_len, _real_index in slot_specs)
         dense_tokens = int(input_ids.numel())
         if fixed_tokens <= 0 or fixed_tokens >= dense_tokens:
+            self._record_fixed_capacity_packed_prefill_reject("no_savings")
             return None
 
         dummy_needed = sum(
@@ -4064,6 +4092,7 @@ class ContinuousBatchEngine:
                     continue
                 prefix_pad_row = self._acquire_free_prefix_row_or_none()
                 if prefix_pad_row is None:
+                    self._record_fixed_capacity_packed_prefill_reject("no_dummy_rows")
                     return None
                 extra_prefix_rows.append(prefix_pad_row)
                 dummy_pool.append(prefix_pad_row)
@@ -4094,6 +4123,7 @@ class ContinuousBatchEngine:
                 fixed_real_rows.append(rows[real_index])
                 fixed_real_suffix_lengths.append(suffix_lengths[real_index])
             if len(real_slot_indices) != len(group):
+                self._record_fixed_capacity_packed_prefill_reject("real_slot_mismatch")
                 return None
 
             required = max(fixed_rows + source_prefix_rows) + 1
@@ -4124,6 +4154,7 @@ class ContinuousBatchEngine:
                 capture_on_miss=capture_on_miss,
             )
             if logits is None:
+                self._record_fixed_capacity_packed_prefill_reject("graph_returned_none")
                 return None
             real_index_tensor = self._device_index_tensor(tuple(real_slot_indices)).to(
                 device=logits.device
@@ -4134,6 +4165,7 @@ class ContinuousBatchEngine:
                 if self.profile_timings
                 else None
             )
+            self.stats.prefill_packed_fixed_capacity_accepts += 1
             self._record_packed_prefill_eager_result(
                 profile_shape_key=profile_shape_key,
                 real_tokens=sum(suffix_lengths),
@@ -4152,6 +4184,7 @@ class ContinuousBatchEngine:
                 fixed_tokens,
             )
         except Exception as exc:
+            self._record_fixed_capacity_packed_prefill_reject("exception")
             warn_optional_failure("continuous.fixed_capacity_packed_prefill", exc)
             return None
         finally:
