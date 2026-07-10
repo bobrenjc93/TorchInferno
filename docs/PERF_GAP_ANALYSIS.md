@@ -12390,6 +12390,19 @@ is expensive because it repeats many single-step replays or because each replay
 is slow. This is telemetry only; it does not change scheduling or graph replay
 behavior.
 
+A current-head long_output validation with that telemetry on `f3d6a47` wrote
+`/tmp/inference-bench-torchinferno-long-current-shapesteps-results/.../runs/20260710_072229`.
+It landed at `228.4 / 20.9 / 1029.4ms`, p99 `1571.8 / 28.4 /
+1771.0ms`, `1000/1000` correct. Queue telemetry stayed in the expected band:
+`53` prefill batches, `51.5K` prefill tokens, `4.54s/5.25s` prefill
+forward/wall, `16` live decode graph entries, `736` decode graph replays, and
+`16` misses. The new decode-many shape-step map makes the hot body explicit:
+`decode_many:b64/64` ran `270` single-step replays, consumed `17.28K` model
+tokens, emitted `16.27K`, skipped `1.01K`, and accounted for about `3.43s` of
+step-window model time. The remaining long_output gap is therefore still the
+full-width decode replay body and prefill/decode pipeline structure, not just a
+tail-padding counter.
+
 ## Priority for a focused (non-loop) session
 
 1. Prefill MFU (Issue 1) — biggest TTFT lever, ~2x, affects 3/5 benchmarks.
