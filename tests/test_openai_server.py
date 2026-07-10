@@ -17320,6 +17320,7 @@ def test_openai_tensor_parallel_online_batcher_profile_snapshots(
         True,
         first_queue,
         queued_at_s=time.perf_counter(),
+        queue_sequence=11,
         stream_prequeue_wait_configured_ms=2.0,
         stream_prequeue_wait_ms=1.25,
         stream_prequeue_wait_applied=True,
@@ -17391,6 +17392,13 @@ def test_openai_tensor_parallel_online_batcher_profile_snapshots(
     assert final_record["drain_ready_nonempty_calls"] == 0
     assert final_record["drain_ready_requests"] == 0
     assert final_record["drain_ready_max"] == 0
+    assert final_record["request_prompt_tokens_min"] == 2
+    assert final_record["request_prompt_tokens_max"] == 2
+    assert final_record["request_max_tokens_min"] == 3
+    assert final_record["request_max_tokens_max"] == 3
+    assert final_record["queue_sequence_min"] == 11
+    assert final_record["queue_sequence_max"] == 11
+    assert final_record["queue_sequence_count"] == 1
     assert final_record["runtime_step_calls"] == 3
     assert final_record["runtime_step_events"] == 3
     assert final_record["runtime_step_max_events"] == 1

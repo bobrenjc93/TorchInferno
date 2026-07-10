@@ -5967,6 +5967,27 @@ class OpenAICompletionEngine:
                 fields["request_stream_prequeue_wait_applied_count"] = stream_prequeue_wait_applied
             return fields
 
+        def request_shape_profile_fields() -> dict[str, int]:
+            requests = list(request_by_id.values())
+            if not requests:
+                return {}
+            prompt_lengths = [len(request.prompt) for request in requests]
+            row_max_tokens = [request.max_tokens for request in requests]
+            fields = {
+                "request_prompt_tokens_min": min(prompt_lengths),
+                "request_prompt_tokens_max": max(prompt_lengths),
+                "request_max_tokens_min": min(row_max_tokens),
+                "request_max_tokens_max": max(row_max_tokens),
+            }
+            queue_sequences = [
+                request.queue_sequence for request in requests if request.queue_sequence >= 0
+            ]
+            if queue_sequences:
+                fields["queue_sequence_min"] = min(queue_sequences)
+                fields["queue_sequence_max"] = max(queue_sequences)
+                fields["queue_sequence_count"] = len(queue_sequences)
+            return fields
+
         def record_online_profile(event: str, **profile_fields: object) -> None:
             nonlocal profile_snapshots
             if not profile_queue:
@@ -6085,6 +6106,7 @@ class OpenAICompletionEngine:
                 runtime_step_calls=runtime_step_calls,
                 runtime_step_events=runtime_step_events,
                 runtime_step_max_events=runtime_step_max_events,
+                **request_shape_profile_fields(),
                 **request_latency_profile_fields(),
                 **graph_memory_cleanup_fields,
                 **extra_fields,

@@ -1,5 +1,41 @@
 # TorchInferno vs vLLM/sglang — Performance Gap Analysis (Llama-3.1-70B, 8xH100)
 
+## Current 20260710 current-head full-suite refresh
+
+A TorchInferno-only full-suite refresh on pushed `5c89f30` wrote
+`/tmp/inference-bench-torchinferno-current-full-5c89f30-results/.../runs/20260710_082723`.
+It landed at few_shot `188.9 / 33.5 / 219.3ms`, self_consistency
+`113.3 / 0.0 / 113.7ms`, multi_turn `246.5 / 38.0 / 291.1ms`,
+tree_of_thought `61.5 / 38.7 / 89.2ms`, and long_output
+`226.8 / 21.5 / 1042.8ms`. The public pointer was still
+`20260710_050745`, so the public TorchInferno row still reflects older
+`861b7c3` numbers. Current head should materially improve the public
+multi_turn and long_output rows once it is picked up, but it remains behind the
+same public vLLM row on the score-facing gaps: tree is still about
+`+27.6ms` TTFT and `+37.7ms` E2E, and long_output is still about
+`+182.2ms` TTFT, `+6.5ms` TPOT, and `+476.3ms` E2E.
+
+The full-run profile keeps the next targets concrete. Tree is no longer an
+obvious sampled-medium active-row cap issue: it ran with `max_active=16`, no
+decode-many work, `290` decode graph replays with `290` hits, and spent
+`7.79s` wall / `6.26s` forward in prefill, led by the repeated
+`prefix_graph:b2:s16:p45-45:src1:mixed0` and
+`prefix_graph:b4:s16:p45-45:src1:mixed0` shapes. Long_output still splits
+between prefill and high-active decode: `5.43s` prefill wall / `4.66s`
+forward, `32.3K` padded prefill tokens, `7.59s` decode-many GPU, `7.00s`
+decode-many CPU token handling, and a hot `decode_many:b64/64` slice of
+`2.41s` over `189` steps. The suffix split candidate counter showed `6.7K`
+theoretical saved tokens but no defaultable split, matching earlier
+fragmentation rejections.
+
+This full-suite pass also exposed a profile usability gap: online-batcher
+records were interpretable only by file order. Queue profiles now record
+`queue_sequence_min`, `queue_sequence_max`, `queue_sequence_count`,
+`request_prompt_tokens_min/max`, and `request_max_tokens_min/max` on
+online-batcher records, matching the existing stream-group sequence telemetry
+and making future full-suite JSONL records easier to align with benchmark
+waves.
+
 ## Current 20260710 decode-many graph capture-gate recheck
 
 The current-head long_output recheck keeps multi-step decode-many graphs rejected
