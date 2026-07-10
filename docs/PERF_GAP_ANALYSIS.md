@@ -12736,9 +12736,18 @@ warmed suffix `16` for observed small/big buckets and avoided request-path
 captures, landing at `174.1 / 34.6 / 204.2ms`, `977/1000` correct. Median
 queue-to-first was effectively flat (`165.25ms` vs `165.42ms` control), p99
 TTFT/E2E worsened to `1420/1454ms`, and overall phase time rose by `1.31s`.
-Keep token-only prefill default-off; the remaining few_shot gap is still the
-hot cached-prefix `b32:s16` prefill body, not logits materialization or greedy
-sampling.
+
+A pure token-only probe added a separate diagnostic warmup switch,
+`TORCHINFERNO_OPENAI_WARMUP_ONLINE_GREEDY_COMMON_PREFIX_TOKEN_ONLY_SUFFIX_PREFILL`,
+so the no-logits graphs can be warmed without also enabling the older
+logits+token runtime fallback. The run
+`/tmp/inference-bench-few-tokenonly-pure-results/.../runs/20260710_152822`
+landed at `176.1 / 33.2 / 203.2ms`, `977/1000` correct. It kept decode replay
+healthy (`31.6ms`), avoided request-path captures, and cut sample-select to
+`3.0ms`, but p99 TTFT/E2E remained `1410/1435ms`, phase time rose by `1.33s`,
+and prefill state-create time grew to `212ms` on the hot shape. Keep token-only
+prefill default-off; the remaining few_shot gap is still the hot cached-prefix
+`b32:s16` prefill body, not logits materialization or greedy sampling.
 
 Post-fix focused local validation on `a4d92f0` plus the trim-first cleanup
 patch wrote

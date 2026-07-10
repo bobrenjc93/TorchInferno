@@ -4258,6 +4258,13 @@ class OpenAICompletionEngine:
             warmup_temperature <= 0.0
             and _online_greedy_common_prefix_token_suffix_prefill_warmup_enabled()
         )
+        token_only_suffix_warmup_enabled = (
+            warmup_temperature <= 0.0
+            and env_flag(
+                "TORCHINFERNO_OPENAI_WARMUP_ONLINE_GREEDY_COMMON_PREFIX_TOKEN_ONLY_SUFFIX_PREFILL",
+                False,
+            )
+        )
         ragged_token_prefill_graph = (
             getattr(self.model, "try_prefill_ragged_token_logits_graph", None)
             if token_suffix_warmup_enabled
@@ -4265,7 +4272,7 @@ class OpenAICompletionEngine:
         )
         ragged_token_only_prefill_graph = (
             getattr(self.model, "try_prefill_ragged_token_graph", None)
-            if token_suffix_warmup_enabled
+            if (token_suffix_warmup_enabled or token_only_suffix_warmup_enabled)
             and env_flag("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_TOKEN_ONLY_GRAPH", False)
             else None
         )
