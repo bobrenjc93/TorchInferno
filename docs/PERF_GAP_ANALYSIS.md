@@ -12630,6 +12630,17 @@ against `133` `rows1` entries, so this is not the main tree lever; keep it as
 correctness coverage and a small row-index-free graph scaffold, while the
 score-facing gap still points at the padded `s16` prefix-suffix body.
 
+Extending that cleanup to dense row permutations is rejected. A dirty prototype
+reordered prefix-prefill inputs when physical rows were a permutation of
+`0..N-1`, then gathered real outputs back to request order. The run
+`/tmp/inference-bench-tree-prefill-denseperm-results/.../runs/20260710_101213`
+regressed to `70.4 / 40.2 / 101.1ms`, `954/992` correct, with p99 TTFT/E2E
+above `2.5s`. The queue profile showed why: it added cold `rows0` prefill graph
+captures (`~466-547ms`) while still leaving almost all live ragged-prefill graph
+entries as `rows1` (`1-2` `rows0` entries versus `133` `rows1`). Keep the
+row-index-free prefill path limited to exact ordered physical rows unless it is
+paired with warmup or allocator changes that avoid new capture tails.
+
 ## Priority for a focused (non-loop) session
 
 1. Prefill MFU (Issue 1) — biggest TTFT lever, ~2x, affects 3/5 benchmarks.
