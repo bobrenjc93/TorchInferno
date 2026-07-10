@@ -4157,7 +4157,11 @@ class ContinuousBatchEngine:
             packed_prefill_pattern_key,
             tuple((start_len, suffix_len) for start_len, suffix_len, _real_index in slot_specs),
         )
-        if graph_none_key in self._packed_prefill_fixed_capacity_graph_none_keys:
+        cache_graph_none = not bool(capture_on_miss)
+        if (
+            cache_graph_none
+            and graph_none_key in self._packed_prefill_fixed_capacity_graph_none_keys
+        ):
             self._record_fixed_capacity_packed_prefill_reject("graph_returned_none_cached")
             return None
 
@@ -4242,7 +4246,8 @@ class ContinuousBatchEngine:
             )
             if logits is None:
                 self._record_fixed_capacity_packed_prefill_reject("graph_returned_none")
-                self._packed_prefill_fixed_capacity_graph_none_keys.add(graph_none_key)
+                if cache_graph_none:
+                    self._packed_prefill_fixed_capacity_graph_none_keys.add(graph_none_key)
                 return None
             real_index_tensor = self._device_index_tensor(tuple(real_slot_indices)).to(
                 device=logits.device

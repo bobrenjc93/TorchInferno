@@ -40,9 +40,25 @@ The queue profile shows why the env path must remain diagnostic-only:
 `{"capacity_grew": 33, "graph_returned_none": 63, "warming": 15}`. The failed
 packed probes collapsed the schedule into large `b16:s16:p45` prefill waves,
 inflating prefill forward/wall to `31.5s/32.6s`. The runtime now remembers
-concrete fixed-capacity layouts whose packed graph returned `None` and records
-later skips as `graph_returned_none_cached`, so future opt-in packed-prefill
-experiments do not keep probing the same unsupported graph shape.
+concrete fixed-capacity layouts whose packed graph returned `None` only for
+no-capture calls and records later skips as `graph_returned_none_cached`, so
+future opt-in packed-prefill experiments do not keep probing the same
+unsupported graph shape. Capture-on-miss calls deliberately retry because the
+model graph path also uses `None` as a warmup signal before capturing an exact
+packed signature.
+
+A follow-up dirty rerun after narrowing the graph-`None` cache to no-capture
+calls wrote
+`/tmp/inference-bench-tree-fixedpacked-retrydirty-results/.../runs/20260710_122816`.
+It stayed rejected: `806.6 / 62.1 / 940.3ms`, p99
+`2984.1 / 698.1 / 3514.6ms`, and `957/992` correct. The queue profile showed
+`117` fixed-capacity attempts, `0` accepts, and rejects
+`{"capacity_grew": 32, "graph_returned_none": 62, "no_savings": 1, "warming": 22}`.
+It spent `26.4s/27.6s` in prefill forward/wall, with `70` large
+`prefix_graph:b16:s16:p45-45:src1:mixed0` waves and only regular dense prefill
+graph captures. Keep the retry fix as diagnostic correctness for future packed
+graph experiments, but do not treat the current fixed-capacity packed graph as
+a score-facing tree path.
 
 ## Current 20260710 decode-many async-readback default-off recheck
 
