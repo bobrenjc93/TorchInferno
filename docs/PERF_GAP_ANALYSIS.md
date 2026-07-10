@@ -126,6 +126,16 @@ confirmed `submit_step_command_enabled=true` without the forced global env:
 `20` decode graph misses, and `108` scheduler steps. Keep this as the current
 local multi_turn evidence while the public pointer remains on `20260710_140141`.
 
+The post-scope few_shot control on `4f2b7b2` wrote
+`/tmp/inference-bench-4f2b7b2-few-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-4f2b7b2-few-default-scope/runs/20260710_181848`
+and landed at `181.0 / 33.4 / 211.4ms`, p99
+`793.3 / 229.5 / 820.5ms`, with `977/1000` correct. Its queue profile
+confirmed `submit_step_command_enabled=false` at `max_tokens=256`:
+`q2submit=104.2ms`, `submit2first=68.4ms`, `q2finish=197.7ms`,
+`phase_total=4.95s`, `runtime_prefill_wall=2.36s`, `decode_gpu=733.7ms`,
+`22` decode graph misses, and `110` scheduler steps. This keeps the
+greedy-large submit-step default out of the greedy-mid few_shot path.
+
 ## Local 00126b8 long-output refresh
 
 A pushed-head TorchInferno-only `long_output` refresh on `00126b8` wrote
