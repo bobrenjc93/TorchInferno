@@ -12768,6 +12768,40 @@ TorchInferno control, the same-host gap is still roughly `+174ms` TTFT,
 active skipped-build directory for this refresh; the older same-host SGLang
 rows remain the current SGLang comparison.
 
+Public `20260710_111248` still measures stale TorchInferno `a4d92f0`, before
+the current cleanup and dense-greedy warmup patches. The public scorecard is
+TorchInferno `4/20`, vLLM `14/20`, and SGLang `1/20`; the visible public gaps
+remain multi_turn, tree_of_thought, and long_output TTFT/E2E. The public
+TorchInferno queue profile still shows many stale ragged decode misses and
+older prefill behavior, so current local comparisons should use the pushed
+`d6f1b5c` branch runs until the public pointer advances.
+
+A stop-synchronized decode-many probe for current multi_turn is rejected as a
+default. The env run
+`TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY=1`,
+`TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY_ALLOW_STOP=1`, and
+`TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY_SYNC_STOPS=1` wrote
+`/tmp/inference-bench-multiturn-syncstops-d6f1b5c-results/.../runs/20260710_120532`.
+It improved TTFT versus the nearby profiled control (`215.6ms` vs `243.1ms`)
+and removed overgeneration, but E2E was flat (`276.9ms` vs `277.3ms`) and TPOT
+regressed (`44.2ms` vs `37.6ms`). Queue telemetry shows why this is not a
+promotion: it ran `65` stop-synchronized decode-many steps, emitted `1427`
+tokens with zero skips, but charged `662.7ms` of token wait because each step
+must synchronize to observe stop tokens before the next step. Keep sync-stops
+decode-many as a diagnostic until streaming can emit between internal steps or
+stop compaction can stay GPU-side.
+
+Batching cache seq-len updates inside prefix-graph prefill is accepted as small
+runtime hygiene, not a score-facing multi_turn fix. The dirty validation run
+`/tmp/inference-bench-multiturn-batchedseqlen-dirty-results/.../runs/20260710_121540`
+landed at `242.8 / 38.9 / 283.2ms`, essentially flat-to-slightly-worse versus
+the `1cd8f36` control `243.1 / 37.6 / 277.3ms`. The internal counter moved in
+the intended direction: prefill state setup fell `57.2ms -> 32.3ms`, with the
+row seq-len portion falling `38.9ms -> 14.3ms`, and prefill wall fell
+`3.41s -> 3.18s`. This removes avoidable repeated cache setter work from the
+mixed-prefix prefill path, but the remaining row gap is still dominated by
+fragmented padded `b32:s32:mixed1` prefill and queue formation.
+
 ## Priority for a focused (non-loop) session
 
 1. Prefill MFU (Issue 1) — biggest TTFT lever, ~2x, affects 3/5 benchmarks.

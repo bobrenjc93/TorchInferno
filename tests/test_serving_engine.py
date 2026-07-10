@@ -340,6 +340,42 @@ def test_continuous_engine_samples_request_temperature_per_row() -> None:
     assert model.calls == [(0.0, 1), (0.7, 1)]
 
 
+def test_continuous_batch_engine_groups_cache_row_seq_len_updates() -> None:
+    class SeqLenLayer:
+        def __init__(self, rows: int) -> None:
+            self._seq_lens = [0 for _ in range(rows)]
+            self._uniform_seq_len = [0]
+            self.calls: list[tuple[tuple[int, ...], int]] = []
+
+        def _set_rows_seq_len(self, rows: tuple[int, ...], seq_len: int) -> None:
+            self.calls.append((tuple(rows), int(seq_len)))
+            for row in rows:
+                self._seq_lens[row] = int(seq_len)
+
+    class SeqLenCache:
+        def __init__(self, rows: int) -> None:
+            self.layers = (SeqLenLayer(rows),)
+
+        def for_rows(self, rows):  # noqa: ANN001
+            del rows
+            return self
+
+    cache = SeqLenCache(rows=6)
+    engine = ContinuousBatchEngine(
+        object(),
+        device=torch.device("cpu"),
+        max_active_requests=4,
+        prefix_cache_capacity=2,
+    )
+    engine.start_online(max_seq_len=16, external_cache=cache)
+
+    engine._set_cache_row_seq_lens([0, 1, 2, 3], [5, 5, 7, 5])
+
+    assert cache.layers[0].calls == [((0, 1, 3), 5), ((2,), 7)]
+    assert cache.layers[0]._seq_lens[:4] == [5, 5, 7, 5]
+    assert engine._row_seq_lens[:4] == [5, 5, 7, 5]
+
+
 class _ToyCache:
     def __init__(
         self,

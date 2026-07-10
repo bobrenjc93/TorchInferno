@@ -3850,12 +3850,17 @@ class ContinuousBatchEngine:
                     sample_readback_ms,
                 )
             active: list[_ActiveRequest] = []
+            output_prompt_lens = [
+                len(request.prompt)
+                for _original_index, request, _prefix_hit_tokens, _reusable in output_group
+            ]
             if self.profile_timings:
                 state_start_s = time.perf_counter()
                 state_seq_start_s = time.perf_counter()
-                for row_index, (_original_index, request, _prefix_hit_tokens, _reusable) in enumerate(output_group):
-                    row = output_rows[row_index]
-                    self._set_cache_row_seq_len(row, len(request.prompt))
+                self._set_cache_row_seq_lens(
+                    output_rows[: len(output_group)],
+                    output_prompt_lens,
+                )
                 state_seq_ms = (time.perf_counter() - state_seq_start_s) * 1000.0
 
                 state_store_start_s = time.perf_counter()
@@ -3873,7 +3878,7 @@ class ContinuousBatchEngine:
                 state_create_start_s = time.perf_counter()
                 for row_index, (original_index, request, prefix_hit_tokens, _reusable) in enumerate(output_group):
                     row = output_rows[row_index]
-                    prompt_len = len(request.prompt)
+                    prompt_len = output_prompt_lens[row_index]
                     next_token = int(next_tokens[row_index])
                     state = _ActiveRequest(
                         original_index=original_index,
@@ -3882,7 +3887,7 @@ class ContinuousBatchEngine:
                         generated=1,
                         row=row,
                         last_token=next_token,
-                        seq_len=self._cache_row_seq_len(row, prompt_len),
+                        seq_len=prompt_len,
                         prefix_hit_tokens=prefix_hit_tokens,
                         started_step=step,
                     )
@@ -3926,10 +3931,13 @@ class ContinuousBatchEngine:
                     (time.perf_counter() - shape_wall_start_s) * 1000.0,
                 )
             else:
+                self._set_cache_row_seq_lens(
+                    output_rows[: len(output_group)],
+                    output_prompt_lens,
+                )
                 for row_index, (original_index, request, prefix_hit_tokens, _reusable) in enumerate(output_group):
                     row = output_rows[row_index]
-                    prompt_len = len(request.prompt)
-                    self._set_cache_row_seq_len(row, prompt_len)
+                    prompt_len = output_prompt_lens[row_index]
                     self._store_reusable_prefix(
                         request.request_id,
                         request.prompt,
@@ -3945,7 +3953,7 @@ class ContinuousBatchEngine:
                         generated=1,
                         row=row,
                         last_token=next_token,
-                        seq_len=self._cache_row_seq_len(row, prompt_len),
+                        seq_len=prompt_len,
                         prefix_hit_tokens=prefix_hit_tokens,
                         started_step=step,
                     )
@@ -8966,6 +8974,21 @@ class ContinuousBatchEngine:
             for row in row_tuple:
                 if 0 <= row < len(seq_lens):
                     seq_lens[row] = seq_len
+
+    def _set_cache_row_seq_lens(
+        self,
+        rows: Sequence[int],
+        seq_lens: Sequence[int],
+    ) -> None:
+        if len(rows) != len(seq_lens):
+            raise ValueError("rows and seq_lens must have the same length")
+        if not rows:
+            return
+        grouped_rows: dict[int, list[int]] = defaultdict(list)
+        for row, seq_len in zip(rows, seq_lens):
+            grouped_rows[int(seq_len)].append(int(row))
+        for seq_len, group_rows in grouped_rows.items():
+            self._set_cache_rows_seq_len(group_rows, seq_len)
 
     def _try_ragged_token_graph(
         self,
