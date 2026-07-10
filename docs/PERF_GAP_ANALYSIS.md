@@ -12316,6 +12316,16 @@ code-default version landed at `184.4 / 35.5 / 214.6ms`, worse than the local
 control `182.7 / 35.1 / 213.2ms`. Keep token-prefill expansion opt-in until it
 beats the default without relying on broad suffix coverage.
 
+Repeating the broad token-prefill probe on current head `9513b9e` confirms it
+is not defaultable. The run
+`/tmp/inference-bench-torchinferno-few-tokenprefill-current-results/.../runs/20260710_071040`
+landed at `205.9 / 33.7 / 239.6ms`, `977/1000` correct, worse than the
+current profiled control `186.6 / 34.2 / 216.4ms`. Queue telemetry showed the
+same `34` prefill batches and `14.1K` prefill tokens as default, but prefill
+graph replay time rose to `305.5ms` (`b32:s16` accounted for `304.4ms`) and
+queue-to-first rose to `191.3ms`. The earlier broad win was not a stable
+mechanism-level improvement.
+
 Post-fix focused local validation on `a4d92f0` plus the trim-first cleanup
 patch wrote
 `/tmp/inference-bench-torchinferno-cleanup-trim-results/.../runs/20260710_060847`.
