@@ -344,6 +344,8 @@ def _write_inference_bench_run(tmp_path) -> None:
         "runtime_decode_many_shape_steps": {"decode_many:b8/8": 6},
         "runtime_decode_many_shape_model_tokens": {"decode_many:b8/8": 19},
         "runtime_decode_many_cpu_tokens_ms": 1.5,
+        "runtime_decode_many_token_wait_ms": 1.2,
+        "runtime_decode_many_token_materialize_ms": 0.3,
         "runtime_decode_many_shape_padded_tokens": {"decode_many:b8/8": 24},
         "runtime_decode_many_shape_emitted_tokens": {"decode_many:b8/8": 15},
         "runtime_decode_many_shape_skipped_tokens": {"decode_many:b8/8": 4},
@@ -789,6 +791,8 @@ def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) ->
     assert "state_create_ms" in text
     assert "gpu_ms_call" in text
     assert "gpu_us_tok" in text
+    assert "decode_many_wait_ms" in text
+    assert "decode_many_materialize_ms" in text
     assert "pad_call" in text
     assert "2.4" in text
     assert "100.0" in text

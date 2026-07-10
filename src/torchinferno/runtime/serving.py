@@ -473,6 +473,8 @@ class ServingStats:
     decode_many_stop_finishes: int = 0
     decode_many_limit_finishes: int = 0
     decode_many_cpu_tokens_ms: float = 0.0
+    decode_many_token_wait_ms: float = 0.0
+    decode_many_token_materialize_ms: float = 0.0
     decode_many_model_ms: float = 0.0
     decode_many_model_gpu_ms: float = 0.0
     decode_many_state_syncs: int = 0
@@ -1593,12 +1595,18 @@ class ContinuousBatchEngine:
 
         model_tokens = token_offset
         padded_model_tokens = sum(record[5] for record in records)
-        cpu_tokens_start_s = time.perf_counter() if self.profile_timings else 0.0
-        flat_tokens = self._decode_many_tokens_to_list(token_scratch, token_offset)
         if self.profile_timings:
+            cpu_tokens_start_s = time.perf_counter()
+            (
+                flat_tokens,
+                token_wait_ms,
+                token_materialize_ms,
+            ) = self._decode_many_tokens_to_list_profiled(token_scratch, token_offset)
             cpu_elapsed_ms = (time.perf_counter() - cpu_tokens_start_s) * 1000.0
             self.stats.decode_ragged_cpu_tokens_ms += cpu_elapsed_ms
             self.stats.decode_many_cpu_tokens_ms += cpu_elapsed_ms
+            self.stats.decode_many_token_wait_ms += token_wait_ms
+            self.stats.decode_many_token_materialize_ms += token_materialize_ms
             shape_token_count = sum(active_count for _shape_key, active_count, _model_count in shape_parts)
             if shape_token_count > 0:
                 for shape_key, active_count, _model_count in shape_parts:
@@ -1624,6 +1632,8 @@ class ContinuousBatchEngine:
                         cpu_elapsed_ms * (len(states) / shape_token_count),
                     )
             self._flush_decode_ragged_model_gpu_timers()
+        else:
+            flat_tokens = self._decode_many_tokens_to_list(token_scratch, token_offset)
 
         events: list[ServingTokenEvent] = []
         terminated: set[int] = set()
@@ -1789,19 +1799,27 @@ class ContinuousBatchEngine:
                         model_elapsed_ms,
                     )
 
-            cpu_tokens_start_s = time.perf_counter() if self.profile_timings else 0.0
-            row_tokens = next_token_tensor[:active_tokens].detach().cpu().tolist()
             cpu_elapsed_ms = 0.0
             if self.profile_timings:
+                cpu_tokens_start_s = time.perf_counter()
+                (
+                    row_tokens,
+                    token_wait_ms,
+                    token_materialize_ms,
+                ) = self._token_tensor_to_list_profiled(next_token_tensor[:active_tokens])
                 cpu_elapsed_ms = (time.perf_counter() - cpu_tokens_start_s) * 1000.0
                 self.stats.decode_ragged_cpu_tokens_ms += cpu_elapsed_ms
                 self.stats.decode_many_cpu_tokens_ms += cpu_elapsed_ms
+                self.stats.decode_many_token_wait_ms += token_wait_ms
+                self.stats.decode_many_token_materialize_ms += token_materialize_ms
                 if shape_key is not None:
                     self._record_shape_time(
                         self.stats.decode_shape_cpu_tokens_ms,
                         shape_key,
                         cpu_elapsed_ms,
                     )
+            else:
+                row_tokens = next_token_tensor[:active_tokens].detach().cpu().tolist()
 
             state_update_start_s = time.perf_counter() if self.profile_timings else 0.0
             generated_after: list[int] = []
@@ -6263,6 +6281,54 @@ class ContinuousBatchEngine:
             except Exception:
                 pass
         return token_scratch[:token_count].detach().cpu().tolist()
+
+    def _decode_many_tokens_to_list_profiled(
+        self,
+        token_scratch: Tensor,
+        token_count: int,
+    ) -> tuple[list[int], float, float]:
+        stream = (
+            self._decode_many_readback_stream()
+            if self._decode_many_async_readback_enabled()
+            else None
+        )
+        cpu_scratch = getattr(self, "_decode_many_cpu_token_scratch", None)
+        if stream is not None and cpu_scratch is not None and cpu_scratch.numel() >= token_count:
+            wait_start_s = time.perf_counter()
+            stream.synchronize()
+            wait_ms = (time.perf_counter() - wait_start_s) * 1000.0
+            materialize_start_s = time.perf_counter()
+            tokens = cpu_scratch[:token_count].tolist()
+            materialize_ms = (time.perf_counter() - materialize_start_s) * 1000.0
+            return tokens, wait_ms, materialize_ms
+
+        stale_stream = getattr(self, "_decode_many_readback_cuda_stream", None)
+        wait_ms = 0.0
+        if stale_stream is not None:
+            try:
+                wait_start_s = time.perf_counter()
+                stale_stream.synchronize()
+                wait_ms += (time.perf_counter() - wait_start_s) * 1000.0
+            except Exception:
+                pass
+        tokens, tensor_wait_ms, materialize_ms = self._token_tensor_to_list_profiled(
+            token_scratch[:token_count]
+        )
+        return tokens, wait_ms + tensor_wait_ms, materialize_ms
+
+    def _token_tensor_to_list_profiled(self, token_tensor: Tensor) -> tuple[list[int], float, float]:
+        wait_ms = 0.0
+        if token_tensor.device.type == "cuda" and torch.cuda.is_available():
+            try:
+                wait_start_s = time.perf_counter()
+                torch.cuda.current_stream(token_tensor.device).synchronize()
+                wait_ms = (time.perf_counter() - wait_start_s) * 1000.0
+            except Exception:
+                wait_ms = 0.0
+        materialize_start_s = time.perf_counter()
+        tokens = token_tensor.detach().cpu().tolist()
+        materialize_ms = (time.perf_counter() - materialize_start_s) * 1000.0
+        return tokens, wait_ms, materialize_ms
 
     def _device_index_tensor(self, values: tuple[int, ...]) -> Tensor:
         cached = self._device_index_tensors.get(values)

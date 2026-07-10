@@ -15018,6 +15018,8 @@ def test_openai_queue_profile_records_runtime_engine_stats(
         decode_many_stop_finishes = 3
         decode_many_limit_finishes = 2
         decode_many_cpu_tokens_ms = 2.75
+        decode_many_token_wait_ms = 2.25
+        decode_many_token_materialize_ms = 0.5
         decode_many_model_ms = 14.25
         decode_many_model_gpu_ms = 13.75
         decode_many_state_syncs = 5
@@ -15395,6 +15397,8 @@ def test_openai_queue_profile_records_runtime_engine_stats(
             "runtime_decode_many_steps": 6,
             "runtime_decode_many_stop_finishes": 3,
             "runtime_decode_many_cpu_tokens_ms": 2.75,
+            "runtime_decode_many_token_wait_ms": 2.25,
+            "runtime_decode_many_token_materialize_ms": 0.5,
             "runtime_decode_many_model_ms": 14.25,
             "runtime_decode_many_model_gpu_ms": 13.75,
             "runtime_decode_many_state_syncs": 5,

@@ -12543,6 +12543,31 @@ step-window model time. The remaining long_output gap is therefore still the
 full-width decode replay body and prefill/decode pipeline structure, not just a
 tail-padding counter.
 
+A same-host TorchInferno/vLLM long_output refresh on pushed `e617c52` wrote
+`/tmp/inference-bench-ti-vllm-long-e617c52-429f405-results/.../runs/20260710_085503`.
+vLLM `429f405` landed at `50.0 / 16.9 / 651.8ms`, while TorchInferno landed at
+`226.7 / 21.5 / 999.6ms`, both `1000/1000` correct. This removes public-run
+host variance from the current target: TorchInferno still loses first token by
+about `4.5x` and TPOT by `27%`. The TorchInferno profile used the no-env
+default with decode-many async readback off and kept the warmed decode graphs
+live (`16` entries, `735` replays, `2` misses). It spent `5.48s` in prefill
+wall (`4.72s` forward across `56` batches), then `7.63s` in decode-many GPU
+events and `7.14s` in the old `decode_many_cpu_tokens_ms` bucket across
+`137` decode-many calls / `605` steps. Queueing is still material:
+`q2submit_p50=93.5ms`, `submit2first_p50=114.9ms`, and
+`q2first_p50=214.8ms`. Prior cap/wait/chunk/fine-bucket A/Bs already reject
+the simple scheduler knobs; the supported next work remains a real
+prefill/decode overlap design or faster full-width decode replay body.
+
+The same profile also shows why `runtime_decode_many_cpu_tokens_ms` needs a
+clearer split. In the CUDA decode-many path, model calls are intentionally not
+synchronized step-by-step; the synchronous token materialization is often the
+first stream fence, so the old CPU token bucket includes GPU wait time. Queue
+profiles now export `runtime_decode_many_token_wait_ms` and
+`runtime_decode_many_token_materialize_ms` while preserving the existing total
+field. Use those fields on the next long_output run before treating token
+readback as a Python-side bottleneck.
+
 ## Priority for a focused (non-loop) session
 
 1. Prefill MFU (Issue 1) — biggest TTFT lever, ~2x, affects 3/5 benchmarks.

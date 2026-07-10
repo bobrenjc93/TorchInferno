@@ -7147,6 +7147,8 @@ class OpenAICompletionEngine:
             "decode_many_stop_finishes",
             "decode_many_limit_finishes",
             "decode_many_cpu_tokens_ms",
+            "decode_many_token_wait_ms",
+            "decode_many_token_materialize_ms",
             "decode_many_model_ms",
             "decode_many_model_gpu_ms",
             "decode_many_state_syncs",
