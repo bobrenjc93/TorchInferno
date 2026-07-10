@@ -12292,20 +12292,22 @@ decode-many directions do not change under this profile: the current target is
 still a faster model-side cached-prefix prefill body, or a packed prefill body
 that avoids the Python packed-eager path's already-measured overhead.
 
-Public `20260710_050745` exposed a distinct multi_turn failure mode on
-TorchInferno `861b7c3`: the 512-token greedy session entered the online batcher
-with only `2.062MB` free CUDA memory, so low-memory cleanup cleared all `136`
-ragged-prefill graphs and raised free memory to `23818MB`. Because
-greedy-large prefix prefill has capture-on-miss disabled, multi_turn then paid
-`33` request-path ragged-prefill graph misses and landed at
-`481.6 / 122.3 / 585.3ms` versus the local no-cleanup band near
-`233.5 / 37.2 / 262.5ms`. The fix is to make the low-memory path trim
-ragged-prefill graph entries first using the model-side memory watermark, and
-fall back to full graph clearing only when trimming does not recover the online
-cleanup threshold. The cleanup command now carries explicit `clear_graph_caches`
-and `trim_graph_caches` bits so TP workers mirror rank 0. This keeps the
-existing OOM guard while avoiding the all-or-nothing graph-cache wipe that made
-large greedy sessions unrecoverable.
+Public `20260710_050745` exposed a distinct graph-cache cleanup failure mode on
+TorchInferno `861b7c3`: few_shot/self started with the expected 16 ragged decode
+graphs (`symm128` buckets), then the 512-token greedy multi_turn session entered
+the online batcher with only `2.062MB` free CUDA memory. Low-memory cleanup
+cleared all `136` ragged-prefill graphs and every decode graph, raising free
+memory to `23818MB`. Because greedy-large prefix prefill and TP online decode
+both disable capture-on-miss, multi_turn paid `33` request-path ragged-prefill
+graph misses and later tree/long_output ran with zero decode graph replays; the
+public long_output tail had `0` live decode graphs, `0` hits, and `1472` ragged
+decode misses. The fix is to make the low-memory path trim ragged-prefill graph
+entries first using the model-side memory watermark, then clear prefill graph
+caches before considering a full graph clear. The cleanup command now carries
+explicit `clear_graph_caches`, `clear_prefill_graph_caches`, and
+`trim_graph_caches` bits so TP workers mirror rank 0. This keeps the existing
+OOM guard while preserving warmed decode graphs whenever prefill graph cleanup
+recovers enough memory.
 
 The greedy-mid token-prefill default remains rejected. A broad env probe
 (`TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_TOKEN_GRAPH=1` plus token suffix `16`)
@@ -12322,7 +12324,8 @@ The normal no-cleanup path stayed in the expected band: few_shot
 `0.977/0.982`. Queue telemetry showed no cleanup applied locally, `148` live
 ragged-prefill graph entries, zero evictions, `33` prefill graph replays on
 both workloads, and multi_turn only one miss. The new unit coverage directly
-exercises the low-memory trim-first path and the TP cleanup command bits.
+exercises the low-memory trim-first path, prefill-only fallback clear, decode
+graph preservation, and the TP cleanup command bits.
 
 ## Priority for a focused (non-loop) session
 

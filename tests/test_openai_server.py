@@ -81,6 +81,7 @@ from torchinferno.openai_server import (
     _broadcast_tensor_parallel_online_submit_prompt_lists,
     _cache_row_slice,
     _clear_model_graph_caches,
+    _clear_model_prefill_graph_caches,
     _copy_generation_cache_first_row,
     _copy_generation_cache_row,
     _copy_generation_cache_state_rows_padded,
@@ -5993,6 +5994,35 @@ def test_clear_model_graph_caches_includes_ragged_prefill_and_decode_many() -> N
         assert graph_map == {}
 
 
+def test_clear_model_prefill_graph_caches_keeps_decode_graphs() -> None:
+    model = types.SimpleNamespace(
+        _prefill_graphs={"prefill": object()},
+        _prefill_logits_graphs={"prefill_logits": object()},
+        _prefill_selected_logits_graphs={"selected": object()},
+        _ragged_prefill_logits_graphs={"ragged_prefill": object()},
+        _decode_graphs={"decode": object()},
+        _decode_logits_graphs={"decode_logits": object()},
+        _ragged_decode_graphs={"ragged_decode": object()},
+        _ragged_decode_logits_graphs={"ragged_decode_logits": object()},
+        _ragged_decode_many_graphs={"decode_many": object()},
+    )
+
+    _clear_model_prefill_graph_caches(model)
+
+    for graph_map in (
+        model._prefill_graphs,
+        model._prefill_logits_graphs,
+        model._prefill_selected_logits_graphs,
+        model._ragged_prefill_logits_graphs,
+    ):
+        assert graph_map == {}
+    assert model._decode_graphs
+    assert model._decode_logits_graphs
+    assert model._ragged_decode_graphs
+    assert model._ragged_decode_logits_graphs
+    assert model._ragged_decode_many_graphs
+
+
 def test_online_low_memory_graph_cleanup_clears_graphs_and_empties_cache(monkeypatch) -> None:
     model = types.SimpleNamespace(
         _prefill_graphs={"prefill": object()},
@@ -6024,8 +6054,20 @@ def test_online_low_memory_graph_cleanup_clears_graphs_and_empties_cache(monkeyp
     monkeypatch.setattr(torch.cuda, "empty_cache", lambda: calls.append("empty_cache"))
     monkeypatch.setattr(
         "torchinferno.openai_server._broadcast_tensor_parallel_cleanup",
-        lambda cleanup_model, *, empty_cache=False, clear_graph_caches=True, trim_graph_caches=False: calls.append(
-            ("cleanup", cleanup_model, empty_cache, clear_graph_caches, trim_graph_caches)
+        lambda cleanup_model,
+        *,
+        empty_cache=False,
+        clear_graph_caches=True,
+        clear_prefill_graph_caches=False,
+        trim_graph_caches=False: calls.append(
+            (
+                "cleanup",
+                cleanup_model,
+                empty_cache,
+                clear_graph_caches,
+                clear_prefill_graph_caches,
+                trim_graph_caches,
+            )
         ),
     )
     monkeypatch.setattr(
@@ -6041,7 +6083,7 @@ def test_online_low_memory_graph_cleanup_clears_graphs_and_empties_cache(monkeyp
     assert fields["graph_memory_cleanup_before_ragged_prefill_logits_graphs"] == 1
     assert fields["graph_memory_cleanup_after_ragged_prefill_logits_graphs"] == 0
     assert fields["graph_memory_cleanup_strategy"] == "clear_all"
-    assert ("cleanup", model, True, True, False) in calls
+    assert ("cleanup", model, True, True, False, False) in calls
     assert "empty_cache" in calls
     assert any(call[0] == "tp_sync" for call in calls if isinstance(call, tuple))
     for graph_map in (
@@ -6095,8 +6137,20 @@ def test_online_low_memory_graph_cleanup_trims_prefill_graphs_before_full_clear(
     monkeypatch.setattr(torch.cuda, "empty_cache", lambda: calls.append("empty_cache"))
     monkeypatch.setattr(
         "torchinferno.openai_server._broadcast_tensor_parallel_cleanup",
-        lambda cleanup_model, *, empty_cache=False, clear_graph_caches=True, trim_graph_caches=False: calls.append(
-            ("cleanup", cleanup_model, empty_cache, clear_graph_caches, trim_graph_caches)
+        lambda cleanup_model,
+        *,
+        empty_cache=False,
+        clear_graph_caches=True,
+        clear_prefill_graph_caches=False,
+        trim_graph_caches=False: calls.append(
+            (
+                "cleanup",
+                cleanup_model,
+                empty_cache,
+                clear_graph_caches,
+                clear_prefill_graph_caches,
+                trim_graph_caches,
+            )
         ),
     )
     monkeypatch.setattr(
@@ -6110,9 +6164,88 @@ def test_online_low_memory_graph_cleanup_trims_prefill_graphs_before_full_clear(
     assert fields["graph_memory_cleanup_before_ragged_prefill_logits_graphs"] == 2
     assert fields["graph_memory_cleanup_after_ragged_prefill_logits_graphs"] == 1
     assert "graph_memory_cleanup_fallback_clear" not in fields
-    assert ("cleanup", model, True, False, True) in calls
+    assert ("cleanup", model, True, False, False, True) in calls
     assert list(model._ragged_prefill_logits_graphs) == ["keep"]
     assert model._decode_graphs
+
+
+def test_online_low_memory_cleanup_clears_prefill_graphs_before_decode_graphs(monkeypatch) -> None:
+    class Model:
+        def __init__(self) -> None:
+            self._prefill_graphs = {"prefill": object()}
+            self._prefill_logits_graphs = {"prefill_logits": object()}
+            self._prefill_selected_logits_graphs = {"selected": object()}
+            self._ragged_prefill_logits_graphs = {"keep": object(), "evict": object()}
+            self._decode_graphs = {"decode": object()}
+            self._decode_logits_graphs = {"decode_logits": object()}
+            self._ragged_decode_graphs = {"ragged_decode": object()}
+            self._ragged_decode_logits_graphs = {"ragged_decode_logits": object()}
+            self._ragged_decode_many_graphs = {"decode_many": object()}
+
+        def _trim_ragged_prefill_logits_graphs_for_memory(self) -> bool:
+            self._ragged_prefill_logits_graphs.pop("evict", None)
+            return True
+
+    model = Model()
+    engine = OpenAICompletionEngine.__new__(OpenAICompletionEngine)
+    engine.model = model
+    engine.device = torch.device("cuda")
+    engine._cache_pool = {}
+    engine._microbatch_cache_pool = {}
+    engine._single_prefill_capture_seen = set()
+    engine._batched_prefill_capture_seen = set()
+    calls: list[object] = []
+    mem_values = [
+        (2 * 1024 * 1024, 80 * 1024 * 1024 * 1024),
+        (128 * 1024 * 1024, 80 * 1024 * 1024 * 1024),
+        (2048 * 1024 * 1024, 80 * 1024 * 1024 * 1024),
+    ]
+
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_GRAPH_CLEANUP_MIN_FREE_MB", "1024")
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device=None: mem_values.pop(0))
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda device=None: calls.append(("cuda_sync", device)))
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: calls.append("empty_cache"))
+    monkeypatch.setattr(
+        "torchinferno.openai_server._broadcast_tensor_parallel_cleanup",
+        lambda cleanup_model,
+        *,
+        empty_cache=False,
+        clear_graph_caches=True,
+        clear_prefill_graph_caches=False,
+        trim_graph_caches=False: calls.append(
+            (
+                "cleanup",
+                cleanup_model,
+                empty_cache,
+                clear_graph_caches,
+                clear_prefill_graph_caches,
+                trim_graph_caches,
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        "torchinferno.openai_server._sync_tensor_parallel_command",
+        lambda sync_model, device, **kwargs: calls.append(("tp_sync", sync_model, device, kwargs)),
+    )
+
+    fields = engine._maybe_release_online_graph_caches_for_memory(temperature=0.0, max_tokens=512)
+
+    assert fields["graph_memory_cleanup_strategy"] == "trim_prefill"
+    assert fields["graph_memory_cleanup_fallback_clear_prefill"] is True
+    assert fields["graph_memory_cleanup_free_after_trim_mb"] == 128.0
+    assert fields["graph_memory_cleanup_free_after_prefill_clear_mb"] == 2048.0
+    assert "graph_memory_cleanup_fallback_clear" not in fields
+    assert ("cleanup", model, True, False, False, True) in calls
+    assert ("cleanup", model, True, False, True, False) in calls
+    assert model._prefill_graphs == {}
+    assert model._prefill_logits_graphs == {}
+    assert model._prefill_selected_logits_graphs == {}
+    assert model._ragged_prefill_logits_graphs == {}
+    assert model._decode_graphs
+    assert model._decode_logits_graphs
+    assert model._ragged_decode_graphs
+    assert model._ragged_decode_logits_graphs
+    assert model._ragged_decode_many_graphs
 
 
 def test_tensor_parallel_cleanup_broadcast_sets_cache_and_graph_bits(monkeypatch) -> None:
@@ -6142,6 +6275,7 @@ def test_tensor_parallel_cleanup_broadcast_sets_cache_and_graph_bits(monkeypatch
         model,
         empty_cache=True,
         clear_graph_caches=False,
+        clear_prefill_graph_caches=True,
         trim_graph_caches=True,
     )
 
@@ -6151,6 +6285,7 @@ def test_tensor_parallel_cleanup_broadcast_sets_cache_and_graph_bits(monkeypatch
     assert int(meta[1].item()) == 1
     assert int(meta[2].item()) == 0
     assert int(meta[3].item()) == 1
+    assert int(meta[4].item()) == 1
 
 
 def test_tensor_parallel_online_close_broadcast_sets_cuda_sync_bit(monkeypatch) -> None:
