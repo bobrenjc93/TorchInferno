@@ -871,6 +871,7 @@ def test_llama3_tensor_parallel_mixed_prefill_capture_failure_keeps_uniform_repl
         (False,),
         0,
         1,
+        0,
         1,
         1,
     )
@@ -889,6 +890,7 @@ def test_llama3_tensor_parallel_mixed_prefill_capture_failure_keeps_uniform_repl
         context_len=8,
         prefix_copy_len=None,
         emit_logits=True,
+        emit_tokens=False,
         rotary_in_graph=True,
         write_positions_in_graph=True,
     )

@@ -9,7 +9,6 @@ writes to GPU buffers during the hot decode loop.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
 
 import torch
 from torch import Tensor
