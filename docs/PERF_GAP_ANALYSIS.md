@@ -113,6 +113,16 @@ large-greedy default via
 greedy short generations at or below
 `TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_GEN_MAX_TOKENS` unchanged.
 
+The no-env current-head validation after promotion wrote
+`/tmp/inference-bench-1960ff6-multi-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-1960ff6-multi-default/runs/20260710_180537`
+and landed at `223.8 / 36.4 / 252.8ms`, p99
+`917.8 / 71.6 / 954.7ms`, with `982/1000` correct. The final queue profile
+confirmed `submit_step_command_enabled=true` without the forced global env:
+`q2submit=125.4ms`, `submit2first=87.5ms`, `q2finish=236.6ms`,
+`phase_total=5.81s`, `runtime_prefill_wall=3.16s`, `decode_gpu=706.9ms`,
+`20` decode graph misses, and `108` scheduler steps. Keep this as the current
+local multi_turn evidence while the public pointer remains on `20260710_140141`.
+
 ## Local 00126b8 long-output refresh
 
 A pushed-head TorchInferno-only `long_output` refresh on `00126b8` wrote
