@@ -1,5 +1,46 @@
 # TorchInferno vs vLLM/sglang — Performance Gap Analysis (Llama-3.1-70B, 8xH100)
 
+## Public 20260710_140141 current-run refresh and scheduling rejections
+
+The public pointer now includes the current TorchInferno main run:
+`results/v1/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100/runs/20260710_140141`.
+It measured TorchInferno `adaa950`, vLLM `85c09e9`, and SGLang `2286e25`;
+the scorecard is TorchInferno `2/20`, vLLM `14/20`, and SGLang `3/20`.
+TorchInferno medians were few_shot `174.0 / 34.5 / 203.4ms`,
+self_consistency `135.9 / 0.0 / 136.1ms`, multi_turn
+`255.8 / 39.7 / 290.3ms`, tree_of_thought `61.7 / 39.7 / 92.2ms`,
+and long_output `217.1 / 21.7 / 1011.7ms`.
+
+The refreshed profile confirms the remaining score gaps are not fixed by the
+obvious scheduling knobs. Few_shot is still first-token/prefill dominated:
+`2.51s` prefill wall, `1.91s` prefill forward, `728.8ms` decode GPU, and
+queue-to-first p50 `165.4ms`; TPOT already beats vLLM (`34.5ms` vs
+`39.9ms`). Multi_turn shows the same pattern at larger prompts:
+`3.93s` prefill wall and queue-to-first p50 `236.7ms`, while TPOT is
+competitive (`39.7ms` vs vLLM `40.9ms`). Tree remains the sampled-medium
+steady-cost target (`7.79s` prefill wall, `3.36s` decode GPU, `925.9ms`
+Gumbel sampling). Long_output still splits between prefill and decode-many
+wait: `6.33s` prefill wall, `7.72s` decode-many GPU, and `7.22s` of
+decode-many token wait.
+
+Three focused probes on `adaa950` are rejected. Enabling
+`TORCHINFERNO_OPENAI_TP_ONLINE_PREFILL_READY_BEFORE_DECODE=1` with
+`TORCHINFERNO_OPENAI_TP_ONLINE_PREFILL_READY_ACTIVE_CAP=8` for few_shot wrote
+`/tmp/inference-bench-fewshot-prefillready-cap8-results/.../runs/20260710_142443`
+and regressed to `203.8 / 34.0 / 234.8ms`; the profile shows prefill wall rose
+from `2510.6ms` to `2903.4ms` and added another prefill batch. Raising only
+`TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_MID_MAX_ACTIVE=48` wrote
+`/tmp/inference-bench-fewshot-greedymid48-results/.../runs/20260710_143052`
+and regressed much harder to `212.7 / 140.9 / 338.7ms`, confirming the old
+32-row greedy-mid cap still protects decode tail latency. Enabling
+`TORCHINFERNO_CONTINUOUS_PINNED_FULL_PROMPT_STORE_MIN_MAX_TOKENS=1` for
+self_consistency wrote
+`/tmp/inference-bench-self-fullprompt-results/.../runs/20260710_143717` and
+regressed from the public `135.9 / 136.1ms` band to `494.0 / 731.6ms`. Keep
+these knobs diagnostic-only; the next useful work is a cheaper common-prefix
+prefill body or a decode/readback pipeline improvement, not broader admission
+or full-prompt pinning.
+
 ## Public 20260710_130259 refresh and main fast-forward
 
 The public pointer advanced again to
