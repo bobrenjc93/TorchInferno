@@ -6380,6 +6380,42 @@ def test_continuous_batch_engine_uses_ragged_graph_decode_for_single_active_row(
     assert engine.stats.decode_graph_hits == 2
 
 
+def test_continuous_batch_engine_uses_ragged_logits_for_sampled_single_active_row() -> None:
+    class _SampledSingleRowRaggedLogitsToyModel(_RaggedGraphToyModel):
+        def __init__(self) -> None:
+            super().__init__()
+            self.static_token_graph_calls = 0
+            self.static_logits_graph_calls = 0
+
+        def try_decode_one_token_graph(self, input_ids, cache, *, temperature=0.0):  # noqa: ANN001
+            del input_ids, cache, temperature
+            self.static_token_graph_calls += 1
+            return None
+
+        def try_decode_one_token_logits_graph(self, input_ids, cache):  # noqa: ANN001
+            del input_ids, cache
+            self.static_logits_graph_calls += 1
+            return None
+
+    model = _SampledSingleRowRaggedLogitsToyModel()
+    engine = ContinuousBatchEngine(
+        model,
+        device=torch.device("cpu"),
+        max_active_requests=1,
+        prefix_cache_capacity=0,
+        enable_ragged_decode=True,
+        temperature=0.7,
+    )
+
+    results = engine.run([ServingRequest("sampled", (1, 2), 3, arrival_step=0)])
+
+    assert len(results[0].tokens) == 5
+    assert model.ragged_logits_graph_calls == 2
+    assert model.static_token_graph_calls == 0
+    assert model.static_logits_graph_calls == 0
+    assert engine.stats.decode_graph_hits == 2
+
+
 def test_continuous_batch_engine_records_ragged_decode_graph_captures() -> None:
     model = _CaptureReportingRaggedGraphToyModel()
     engine = ContinuousBatchEngine(

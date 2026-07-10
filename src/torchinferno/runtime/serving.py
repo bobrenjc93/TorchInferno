@@ -6191,16 +6191,23 @@ class ContinuousBatchEngine:
             return self._sample_logits_for_states(logits[:, -1, :], states), logits[:, -1, :]
         if temperature is None:
             return None
-        token = self._try_ragged_token_graph(
-            input_ids,
-            seq_lens,
-            row_indices,
-            temperature=temperature,
-        )
-        if token is None:
+        if temperature <= 0.0:
+            token = self._try_ragged_token_graph(
+                input_ids,
+                seq_lens,
+                row_indices,
+                temperature=temperature,
+            )
+            if token is not None:
+                self.stats.decode_graph_hits += 1
+                return token.to(self.device), getattr(self, "_last_ragged_decode_logits", None)
+        if not (
+            hasattr(self.model, "try_decode_ragged_logits_graph")
+            or hasattr(self.model, "decode_ragged_logits")
+        ):
             return None
-        self.stats.decode_graph_hits += 1
-        return token.to(self.device), getattr(self, "_last_ragged_decode_logits", None)
+        logits = self._ragged_decode_logits(input_ids, seq_lens, row_indices)
+        return self._sample_logits_for_states(logits[:, -1, :], states), logits[:, -1, :]
 
     def _finalize_decode(
         self,

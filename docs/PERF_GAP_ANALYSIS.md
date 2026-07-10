@@ -13631,6 +13631,17 @@ profile now exposes a separate sampled-row target: self_consistency/tree still
 report small static logits misses at `b2/b3/b4...:s55/s56/s57`, because sampled
 decode cannot use the greedy ragged token graph path.
 
+Extending the same fallback to ragged logits reduces the sampled-row miss
+source. The dirty tree_of_thought validation
+`/tmp/inference-bench-tree-ragged-sampled-results/.../runs/20260710_233507`
+landed at `62.0 / 41.5 / 87.9ms`, correctness `0.964`. The completed
+queue-profile snapshots showed sampled decode graph misses falling from the
+full-suite row's `17` static logits misses to at most `1`
+(`static_decode:logits:b4:s56`) while keeping correctness unchanged. Treat this
+as a small routing cleanup, not a primary tree score win: TTFT/TPOT remained
+within the current focused-run variance, but the static row-view sampled miss
+source is almost gone.
+
 ## Priority for a focused (non-loop) session
 
 1. Prefill MFU (Issue 1) — biggest TTFT lever, ~2x, affects 3/5 benchmarks.
