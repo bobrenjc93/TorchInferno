@@ -83,6 +83,40 @@ taking precedence. Against the same-host vLLM tree refresh at
 TTFT, `+10-12ms` TPOT, and `+24-29ms` E2E, so the next tree target is reducing
 steady `s12` prefill/decode/sampling cost rather than graph capture churn.
 
+## Current 20260710 full-suite profile after sampled suffix promotion
+
+A no-env TorchInferno-only full-suite refresh on pushed `68079db` wrote
+`/tmp/inference-bench-torchinferno-current-full-68079db-results/.../runs/20260710_131536`.
+It landed at few_shot `176.9 / 35.2 / 208.4ms`, self_consistency
+`130.4 / 0.0 / 130.7ms`, multi_turn `232.3 / 37.8 / 264.1ms`,
+tree_of_thought `63.4 / 40.3 / 91.5ms`, and long_output
+`232.9 / 22.0 / 1026.4ms`. Public `origin/main` was still `29acfe72` with
+latest run `20260710_111248`, so this is the current local branch evidence
+until the public row advances.
+
+The queue profile keeps the next gaps concrete. Multi_turn is still mixed-prefix
+prefill dominated: queue-to-submit/submit-to-first p50 was `129.1/88.2ms`,
+prefill forward/wall `2.19s/4.10s`, and prefill padding `15.6K` tokens, almost
+all suffix padding. Tree preserved the sampled-medium suffix promotion with no
+prefill graph captures and ran at `6.21s/7.70s` prefill forward/wall,
+`3.60s` decode GPU, and `1.18s` Gumbel sampling. Long_output remains the
+largest E2E gap: prefill forward/wall `7.74s/8.49s`, decode-many GPU `7.82s`,
+decode-many CPU token handling `7.36s`, and `2.96s` of request-time prefill
+graph capture on `p111/s96` dense shapes. The earlier `111:96` warmup rejection
+still applies: removing that capture alone did not improve medians.
+
+Adding an intermediate `s24` suffix bucket for deterministic greedy-large
+multi_turn is rejected as a simple default. The probe used
+`TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SUFFIX_BUCKETS=16,24,32,64,80,96,112,128,144,160,192,224,256`
+on `68079db` and wrote under
+`/tmp/inference-bench-multiturn-s24-68079db-results`, but it never reached
+server readiness: after more than seven minutes the workers were still warming
+at about `97GB/GPU`, with no benchmark traffic. This confirms the observed
+`s16-17 -> s32` padding is real, but adding another warmed graph bucket is not
+the right default lever. The next multi_turn path still needs a cheaper
+mixed-prefix prefill body or queueing/prefix-reuse change that avoids expanding
+startup graph memory.
+
 ## Current 20260710 tree fixed-capacity packed-prefill rejection
 
 The fixed-capacity packed-prefix prefill diagnostic is not a sampled-tree fix.
