@@ -12,8 +12,8 @@ server log shows a rank-0 CUDA launch failure and NCCL watchdog termination;
 tree_of_thought and long_output were connection-refused aftermath, not
 score-facing measurements of the current runtime.
 
-The current-head same-host `long_output` comparison on pushed `88df304` remains
-the actionable gap:
+The first current-head same-host `long_output` comparison on pushed `88df304`
+identified the actionable gap:
 `/tmp/inference-bench-long-output-compare-88df304-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-long-output-compare-88df304/runs/20260711_033419`.
 TorchInferno completed `1000/1000` at `227.9 / 20.9 / 948.3ms`, vLLM completed
 `1000/1000` at `50.5 / 16.9 / 651.5ms`, and SGLang completed `1000/1000` at
@@ -100,6 +100,37 @@ and held the improvement at `50.9 / 33.7 / 72.0ms`, p99 E2E `365.1ms`,
 session (`submitted_requests=992`), with `q2first_p50=47.7ms`,
 `q2first_p99=345.2ms`, `q2submit_p50=16.2ms`, and
 `submit2first_p50=31.6ms`, no request-path graph misses.
+
+## Current fa15dc6 long-output refresh and wait rejections
+
+The latest pushed head `fa15dc6` keeps `long_output` complete and graph-clean
+locally, but does not close the main same-host gap. The no-env control wrote
+`/tmp/inference-bench-long-output-fa15dc6-current-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-long-output-fa15dc6-current/runs/20260711_060623`
+and landed at `212.7 / 21.6 / 947.7ms`, p99
+`535.4 / 32.6 / 1844.1ms`, with `1000/1000` correct. The profile had
+`max_active=64`, `admit_per_step_cap=24`, `admit_min_ready_requests=8`,
+`prefill_ready_before_decode_active_cap=6`, no request-path graph captures or
+misses, `56` prefill batches, and `123` decode-many calls covering `545`
+internal steps. Median first-token time split into `q2submit=90.5ms` and
+`submit2first=111.2ms`; median `q2finish` was `940.5ms`. Same-host vLLM
+remains around `50.3 / 16.8 / 635.6ms`, so the live gap is still both
+first-token prefill/admission and high-active decode replay.
+
+Two greedy-short wait A/Bs on the same head are rejected. Setting both
+`TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_INITIAL_BATCH_WAIT_MS=0` and
+`TORCHINFERNO_OPENAI_TP_ONLINE_IDLE_BATCH_WAIT_MS=0` wrote
+`/tmp/inference-bench-long-output-zero-greedy-waits-fa15dc6-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-long-output-zero-greedy-waits-fa15dc6/runs/20260711_061330`
+and moved TTFT only slightly to `208.8ms` while regressing TPOT/E2E to
+`22.5 / 974.4ms`. It also increased prefill batches (`56 -> 63`) and
+decode-many work (`123 -> 133` calls, `545 -> 578` internal steps), while
+median `q2submit` did not improve (`90.5 -> 92.8ms`). Lowering only the
+greedy-short initial wait to `1ms` wrote
+`/tmp/inference-bench-long-output-greedy-initial1-fa15dc6-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-long-output-greedy-initial1-fa15dc6/runs/20260711_062104`
+and regressed to `223.0 / 22.2 / 1014.9ms`, with
+`q2first=211.5ms` and `q2finish=1005.8ms`. Keep the current greedy-short
+`2ms` initial wait and `2ms` idle wait. The remaining long-output target is the
+ordinary cached-prefix suffix prefill body plus high-active decode-many replay,
+not more admission collection tuning.
 
 ## Public 20260710_170747 startup failure and symm-mem warmup fix
 
