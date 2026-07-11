@@ -79,6 +79,30 @@ prefill padding fell `33.2K -> 28.3K`, but prefill batches rose `60 -> 74`.
 The smaller cap moves work from padded `b24` replays into more `b16` replays;
 that improves first-token queueing slightly but loses the score row.
 
+## Current 20260711 fixed-capacity packed long-output rejection
+
+A long_output A/B on current pushed head `fe42474` enabled the diagnostic
+fixed-capacity packed ragged prefill graph with
+`TORCHINFERNO_CONTINUOUS_PACKED_RAGGED_PREFILL_FIXED_CAPACITY_GRAPH=1` and
+`TORCHINFERNO_CONTINUOUS_PACKED_RAGGED_PREFILL_FIXED_CAPACITY_MIN_CALLS=1`.
+It wrote
+`/tmp/inference-bench-ti-long-fixedcap-min1-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-long-fixedcap-min1-fe42474/runs/20260711_180445`
+and stayed correct, but regressed the fair row to
+`214.6 / 21.8 / 1026.4ms`, `35.9 tok/s`, versus the latest public fair row at
+`193.7 / 19.0 / 845.2ms`, `40.7 tok/s`.
+
+The queue profile explains the miss: fixed-capacity packed prefill attempted
+`62` calls and accepted `0`; all `62` rejects were `capacity_grew`. Exact
+signature reuse was `0/62`, while coarser pattern reuse was only `2/62` calls
+and `310` saved model tokens (`0.9%`). The run also kept the cache-integrity
+counters clean (`runtime_generated_prefix_reuse_requests=0`,
+`runtime_generated_prefix_store_requests=0`,
+`runtime_prompt_lookup_accepted_tokens=0`,
+`runtime_repeated_sample_state_hits=0`). Do not enable this path by default for
+long_output. The prefill target remains a non-fragmenting dynamic packed
+cached-prefix body whose graph/kernel contract does not key on the exact
+per-slot `q_lens` tuple.
+
 ## Current 20260711 fair sampled-short decode cap
 
 After the logits-cache reset, self_consistency fell back to normal model
