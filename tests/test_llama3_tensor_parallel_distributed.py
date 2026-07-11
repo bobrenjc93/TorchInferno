@@ -21,6 +21,27 @@ from torchinferno.models.llama3 import (
 from torchinferno.models.llama3 import tensor_parallel as tensor_parallel_module
 
 
+def test_llama3_ragged_prefill_profile_shape_filter_accepts_exact_targets(
+    monkeypatch,
+) -> None:
+    input_ids = torch.zeros((24, 64), dtype=torch.long)
+    matcher = Llama3TensorParallelForCausalLM._ragged_prefill_profile_shape_matches
+
+    monkeypatch.setenv("TORCHINFERNO_PROFILE_RAGGED_PREFILL_CONTEXT_LEN", "-256")
+    monkeypatch.setenv("TORCHINFERNO_PROFILE_RAGGED_PREFILL_BATCH", "24")
+    monkeypatch.setenv("TORCHINFERNO_PROFILE_RAGGED_PREFILL_SUFFIX", "64")
+
+    assert matcher(input_ids, -256) is True
+    assert matcher(input_ids[:16], -256) is False
+    assert matcher(input_ids[:, :32], -256) is False
+    assert matcher(input_ids, 175) is False
+
+    monkeypatch.delenv("TORCHINFERNO_PROFILE_RAGGED_PREFILL_BATCH")
+    monkeypatch.delenv("TORCHINFERNO_PROFILE_RAGGED_PREFILL_SUFFIX")
+
+    assert matcher(input_ids[:16, :32], -256) is True
+
+
 def test_llama3_tensor_parallel_temperature_sample_profile_uses_detail_gate(monkeypatch) -> None:
     model = object.__new__(Llama3TensorParallelForCausalLM)
     monkeypatch.delenv("TORCHINFERNO_TEMPERATURE_SAMPLE_PROFILE", raising=False)

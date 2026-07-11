@@ -7349,7 +7349,7 @@ class Llama3TensorParallelForCausalLM:
         min_suffix = env_int("TORCHINFERNO_PROFILE_RAGGED_PREFILL_MIN_SUFFIX", 1, minimum=1)
         if input_ids.size(1) < min_suffix:
             return False
-        if not self._ragged_prefill_profile_context_matches(context_len):
+        if not self._ragged_prefill_profile_shape_matches(input_ids, context_len):
             return False
         skip_matches = env_int(
             "TORCHINFERNO_PROFILE_RAGGED_PREFILL_REPLAY_SKIP_MATCHES", 0, minimum=0
@@ -7528,7 +7528,7 @@ class Llama3TensorParallelForCausalLM:
         min_suffix = env_int("TORCHINFERNO_PROFILE_RAGGED_PREFILL_MIN_SUFFIX", 1, minimum=1)
         if input_ids.size(1) < min_suffix:
             return None
-        if not self._ragged_prefill_profile_context_matches(context_len):
+        if not self._ragged_prefill_profile_shape_matches(input_ids, context_len):
             return None
         skip_matches = env_int(
             "TORCHINFERNO_PROFILE_RAGGED_PREFILL_SKIP_MATCHES", 0, minimum=0
@@ -7598,6 +7598,25 @@ class Llama3TensorParallelForCausalLM:
         if configured is None or not configured.strip():
             return True
         return context_len is not None and context_len == int(configured)
+
+    @staticmethod
+    def _ragged_prefill_profile_shape_matches(
+        input_ids: Tensor,
+        context_len: int | None,
+    ) -> bool:
+        if not Llama3TensorParallelForCausalLM._ragged_prefill_profile_context_matches(
+            context_len
+        ):
+            return False
+        configured_batch = os.environ.get("TORCHINFERNO_PROFILE_RAGGED_PREFILL_BATCH")
+        if configured_batch is not None and configured_batch.strip():
+            if int(input_ids.size(0)) != int(configured_batch):
+                return False
+        configured_suffix = os.environ.get("TORCHINFERNO_PROFILE_RAGGED_PREFILL_SUFFIX")
+        if configured_suffix is not None and configured_suffix.strip():
+            if int(input_ids.size(1)) != int(configured_suffix):
+                return False
+        return True
 
     def _copy_ragged_prefill_graph_inputs(
         self,

@@ -23,6 +23,28 @@ cost is the differentiator: `b24:s96` reports `149.1ms` submit-to-first,
 prefix-suffix prefill body and high-active decode replay, not another simple
 admission wait sweep.
 
+## Current 20260711 ragged-prefill replay profiler targeting
+
+A pushed-head `e1e3c2b` replay-profile run used
+`TORCHINFERNO_PROFILE_RAGGED_PREFILL_REPLAY_ONCE=1`,
+`TORCHINFERNO_PROFILE_RAGGED_PREFILL_MIN_BATCH=16`, and
+`TORCHINFERNO_PROFILE_RAGGED_PREFILL_MIN_SUFFIX=64` while running
+long_output. It wrote
+`/tmp/inference-bench-local-e1e3c2b-prefill-replay-prof-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-e1e3c2b-prefill-replay-prof/runs/20260711_094436`
+and stayed in family at `221.1 / 21.9 / 1007.8ms`, `1000/1000` correct. The
+profile hook fired during startup greedy-large warmup instead of the benchmark
+request path, capturing `batch=16 suffix=256 context_len=301`.
+
+The request-path graph cache confirms long_output's hot common-prefix shapes
+use the dynamic `ctx=-256` bucket, including `b24:s64` and `b24:s96` with
+`rows1:ctx-256:src1`. The ragged-prefill profiler now accepts exact
+`TORCHINFERNO_PROFILE_RAGGED_PREFILL_BATCH` and
+`TORCHINFERNO_PROFILE_RAGGED_PREFILL_SUFFIX` filters, shared by capture and
+replay profiling. Future long_output replay profiles should target the hot row
+directly, for example `CONTEXT_LEN=-256`, `BATCH=24`, `SUFFIX=64`, and
+`MIN_BATCH=1`, instead of relying on broad minimum gates that can be consumed by
+startup.
+
 ## Current 20260711 greedy-short batch-bucket rejection
 
 After the decode-many state-sync fix (`829b227`/`1369e8f`), the remaining
@@ -5340,9 +5362,13 @@ still capture every request-shape graph before the server is ready; use
 `TORCHINFERNO_PROFILE_RAGGED_PREFILL_REPLAY_ONCE=1` to profile the warmed
 CUDA-graph replay path instead, with the same batch/suffix gates and optional
 `TORCHINFERNO_PROFILE_RAGGED_PREFILL_REPLAY_SKIP_MATCHES=N`. Both hooks also
-accept `TORCHINFERNO_PROFILE_RAGGED_PREFILL_CONTEXT_LEN` when a workload has
-both dynamic startup buckets such as `ctx-64` and exact request buckets such as
-tree's `ctx61`. These are diagnostic hooks only; they should be used to locate
+accept `TORCHINFERNO_PROFILE_RAGGED_PREFILL_CONTEXT_LEN`,
+`TORCHINFERNO_PROFILE_RAGGED_PREFILL_BATCH`, and
+`TORCHINFERNO_PROFILE_RAGGED_PREFILL_SUFFIX` when a workload has both dynamic
+startup buckets such as `ctx-64` and exact request buckets such as tree's
+`ctx61`, or when startup has larger suffix buckets that would otherwise consume
+the one-shot profile slot. These are diagnostic hooks only; they should be used
+to locate
 the next prefill sink before changing default runtime policy.
 
 That hook found the hot sampled tree shape running as
