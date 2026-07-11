@@ -17580,6 +17580,12 @@ def test_openai_tensor_parallel_online_batcher_profile_snapshots(
                 request_id=self.request_id,
                 token=800 + self.steps,
                 finished=finished,
+                source="prefill" if self.steps == 1 else "",
+                prefill_shape=(
+                    "prefix_graph:b1:s2:p0-0:src1:mixed0"
+                    if self.steps == 1
+                    else ""
+                ),
             )
             if finished:
                 self.request_id = None
@@ -17751,6 +17757,29 @@ def test_openai_tensor_parallel_online_batcher_profile_snapshots(
     )
     assert final_record["request_submit_to_first_token_count"] == 1
     assert final_record["request_submit_to_first_token_p50_ms"] >= 0.0
+    prefill_shape = "prefix_graph:b1:s2:p0-0:src1:mixed0"
+    assert final_record["request_first_token_source_counts"] == {"prefill": 1}
+    assert final_record["request_first_token_prefill_shape_counts"] == {
+        prefill_shape: 1,
+    }
+    assert final_record["request_first_token_prefill_shape_queue_to_first_counts"] == {
+        prefill_shape: 1,
+    }
+    assert (
+        final_record["request_first_token_prefill_shape_queue_to_first_p50_ms"][
+            prefill_shape
+        ]
+        == final_record["request_queue_to_first_token_p50_ms"]
+    )
+    assert final_record["request_first_token_prefill_shape_submit_to_first_counts"] == {
+        prefill_shape: 1,
+    }
+    assert (
+        final_record["request_first_token_prefill_shape_submit_to_first_p50_ms"][
+            prefill_shape
+        ]
+        == final_record["request_submit_to_first_token_p50_ms"]
+    )
     assert final_record["request_queue_to_finish_count"] == 1
     assert (
         final_record["request_queue_to_finish_p50_ms"]

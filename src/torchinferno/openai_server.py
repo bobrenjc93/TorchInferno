@@ -2020,6 +2020,8 @@ class _QueuedGeneration:
     queued_at_s: float = 0.0
     submitted_at_s: float = 0.0
     first_token_at_s: float = 0.0
+    first_token_source: str = ""
+    first_token_prefill_shape: str = ""
     finished_at_s: float = 0.0
     queue_sequence: int = -1
     stream_prequeue_wait_configured_ms: float = 0.0
@@ -6161,11 +6163,15 @@ class OpenAICompletionEngine:
         last_quiescent_aggregate_commands = -1
         graph_memory_cleanup_fields: dict[str, object] = {}
 
-        def request_latency_profile_fields() -> dict[str, float | int]:
+        def request_latency_profile_fields() -> dict[str, object]:
             queue_to_submit_ms: list[float] = []
             queue_to_first_ms: list[float] = []
             submit_to_first_ms: list[float] = []
             queue_to_finish_ms: list[float] = []
+            first_token_source_counts: dict[str, int] = {}
+            first_token_prefill_shape_counts: dict[str, int] = {}
+            first_token_shape_queue_to_first_ms: dict[str, list[float]] = {}
+            first_token_shape_submit_to_first_ms: dict[str, list[float]] = {}
             stream_prequeue_wait_ms: list[float] = []
             stream_prequeue_wait_configured_ms: list[float] = []
             stream_prequeue_wait_applied = 0
@@ -6185,12 +6191,35 @@ class OpenAICompletionEngine:
                 if submitted_at_s > 0.0:
                     queue_to_submit_ms.append((submitted_at_s - queued_at_s) * 1000.0)
                 if first_token_at_s > 0.0:
-                    queue_to_first_ms.append((first_token_at_s - queued_at_s) * 1000.0)
+                    queue_to_first = (first_token_at_s - queued_at_s) * 1000.0
+                    queue_to_first_ms.append(queue_to_first)
                     if submitted_at_s > 0.0:
-                        submit_to_first_ms.append((first_token_at_s - submitted_at_s) * 1000.0)
+                        submit_to_first = (first_token_at_s - submitted_at_s) * 1000.0
+                        submit_to_first_ms.append(submit_to_first)
+                    else:
+                        submit_to_first = None
+                    first_token_source = request.first_token_source
+                    if first_token_source:
+                        first_token_source_counts[first_token_source] = (
+                            first_token_source_counts.get(first_token_source, 0) + 1
+                        )
+                    first_token_shape = request.first_token_prefill_shape
+                    if first_token_shape:
+                        first_token_prefill_shape_counts[first_token_shape] = (
+                            first_token_prefill_shape_counts.get(first_token_shape, 0) + 1
+                        )
+                        first_token_shape_queue_to_first_ms.setdefault(
+                            first_token_shape,
+                            [],
+                        ).append(queue_to_first)
+                        if submit_to_first is not None:
+                            first_token_shape_submit_to_first_ms.setdefault(
+                                first_token_shape,
+                                [],
+                            ).append(submit_to_first)
                 if finished_at_s > 0.0:
                     queue_to_finish_ms.append((finished_at_s - queued_at_s) * 1000.0)
-            fields: dict[str, float | int] = {}
+            fields: dict[str, object] = {}
             fields.update(_latency_summary_fields("request_queue_to_submit", queue_to_submit_ms))
             fields.update(
                 _latency_summary_fields("request_queue_to_first_token", queue_to_first_ms)
@@ -6199,6 +6228,66 @@ class OpenAICompletionEngine:
                 _latency_summary_fields("request_submit_to_first_token", submit_to_first_ms)
             )
             fields.update(_latency_summary_fields("request_queue_to_finish", queue_to_finish_ms))
+
+            def add_count_map(name: str, counts: Mapping[str, int]) -> None:
+                if not counts:
+                    return
+                top_counts = sorted(
+                    counts.items(),
+                    key=lambda item: (-int(item[1]), str(item[0])),
+                )[:32]
+                fields[name] = {str(key): int(count) for key, count in top_counts}
+
+            def add_latency_maps(
+                prefix: str,
+                values_by_shape: Mapping[str, Sequence[float]],
+            ) -> None:
+                if not values_by_shape:
+                    return
+                top_items = sorted(
+                    values_by_shape.items(),
+                    key=lambda item: (-len(item[1]), str(item[0])),
+                )[:32]
+                counts: dict[str, int] = {}
+                p50: dict[str, float] = {}
+                p90: dict[str, float] = {}
+                p99: dict[str, float] = {}
+                max_values: dict[str, float] = {}
+                for shape, raw_values in top_items:
+                    values = sorted(float(value) for value in raw_values)
+                    if not values:
+                        continue
+                    count = len(values)
+                    if count % 2 == 1:
+                        median = values[count // 2]
+                    else:
+                        median = (values[count // 2 - 1] + values[count // 2]) / 2.0
+                    shape_key = str(shape)
+                    counts[shape_key] = count
+                    p50[shape_key] = median
+                    p90[shape_key] = values[min(int(count * 0.90), count - 1)]
+                    p99[shape_key] = values[min(int(count * 0.99), count - 1)]
+                    max_values[shape_key] = values[-1]
+                if counts:
+                    fields[f"{prefix}_counts"] = counts
+                    fields[f"{prefix}_p50_ms"] = p50
+                    fields[f"{prefix}_p90_ms"] = p90
+                    fields[f"{prefix}_p99_ms"] = p99
+                    fields[f"{prefix}_max_ms"] = max_values
+
+            add_count_map("request_first_token_source_counts", first_token_source_counts)
+            add_count_map(
+                "request_first_token_prefill_shape_counts",
+                first_token_prefill_shape_counts,
+            )
+            add_latency_maps(
+                "request_first_token_prefill_shape_queue_to_first",
+                first_token_shape_queue_to_first_ms,
+            )
+            add_latency_maps(
+                "request_first_token_prefill_shape_submit_to_first",
+                first_token_shape_submit_to_first_ms,
+            )
             fields.update(
                 _latency_summary_fields(
                     "request_stream_prequeue_wait",
@@ -6731,6 +6820,12 @@ class OpenAICompletionEngine:
                                 continue
                             if profile_queue and request.first_token_at_s <= 0.0:
                                 request.first_token_at_s = event_emit_start_s
+                                request.first_token_source = str(
+                                    getattr(event, "source", "") or ""
+                                )
+                                request.first_token_prefill_shape = str(
+                                    getattr(event, "prefill_shape", "") or ""
+                                )
                             request.responses.put(event.token)
                             if event.finished:
                                 _finish_stream_request(request)

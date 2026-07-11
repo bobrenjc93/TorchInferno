@@ -1,5 +1,39 @@
 # TorchInferno vs vLLM/sglang — Performance Gap Analysis (Llama-3.1-70B, 8xH100)
 
+## Public 20260711_030227 stale TorchInferno failure and first-token shape attribution
+
+The latest public pointer advanced to
+`results/v1/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100/runs/20260711_030227`.
+It still does not measure the current pushed TorchInferno head: the summary
+lists TorchInferno `54cb558`, vLLM `04d553f`, and SGLang `9068836`.
+TorchInferno completed only few_shot (`141.5 / 32.6 / 165.8ms`) and
+self_consistency (`23.9 / 0.0 / 24.5ms`), then timed out in multi_turn. The
+server log shows a rank-0 CUDA launch failure and NCCL watchdog termination;
+tree_of_thought and long_output were connection-refused aftermath, not
+score-facing measurements of the current runtime.
+
+The current-head same-host `long_output` comparison on pushed `88df304` remains
+the actionable gap:
+`/tmp/inference-bench-long-output-compare-88df304-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-long-output-compare-88df304/runs/20260711_033419`.
+TorchInferno completed `1000/1000` at `227.9 / 20.9 / 948.3ms`, vLLM completed
+`1000/1000` at `50.5 / 16.9 / 651.5ms`, and SGLang completed `1000/1000` at
+`45.1 / 25.8 / 965.9ms`. The no-sync TorchInferno queue profile showed no
+request-path prefill graph captures (`runtime_prefill_graph_captures=0`,
+`hits=53`) and split median first-token latency into about `88.7ms`
+queue-to-submit plus `116.0ms` submit-to-first. The remaining gap is therefore
+not cold graph capture; it is admission-wave timing plus the prefix-suffix
+prefill replay that emits the first token, followed by vLLM's lower steady
+decode TPOT.
+
+Queue profiles now carry first-token source and prefill-shape attribution.
+`ServingTokenEvent` has optional `source` and `prefill_shape` fields, prefix
+graph and chunked-prefix prefill events tag first tokens with their shape key,
+and the OpenAI queue profile aggregates
+`request_first_token_prefill_shape_*` count and latency maps. This keeps public
+profiling no-sync and compact while letting the next default run identify which
+`prefix_graph:b*:s*:p*:src*:mixed*` shapes own queue-to-first and
+submit-to-first latency.
+
 ## Public 20260710_170747 startup failure and symm-mem warmup fix
 
 The latest public pointer advanced to

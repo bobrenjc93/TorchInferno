@@ -4364,6 +4364,40 @@ def test_continuous_batch_engine_records_profile_shape_counts() -> None:
     assert any(key.startswith("ragged:b3/") for key in engine.stats.decode_shape_counts)
 
 
+def test_continuous_batch_engine_tags_prefill_first_token_events_with_shape() -> None:
+    shared = tuple(range(16))
+    model = _SelectedLogitsToyModel()
+    engine = ContinuousBatchEngine(
+        model,
+        device=torch.device("cpu"),
+        max_active_requests=4,
+        prefix_cache_capacity=4,
+        graph_prefill=True,
+        profile_timings=True,
+    )
+    requests = [
+        ServingRequest("a", (*shared, 21), 1, arrival_step=0),
+        ServingRequest("b", (*shared, 22, 23, 24), 1, arrival_step=0),
+        ServingRequest("c", (*shared, 25, 26), 1, arrival_step=0),
+    ]
+    events: list[serving_mod.ServingTokenEvent] = []
+
+    engine.start_online(max_seq_len=64)
+    _results, active = engine._prefill_many(
+        [(index, request) for index, request in enumerate(requests)],
+        0,
+        events=events,
+    )
+
+    assert len(active) == 3
+    prefix_shape = "prefix_graph:b4:s4:p16-16:src1:mixed0"
+    assert [(event.request_id, event.source, event.prefill_shape) for event in events] == [
+        ("a", "prefill", prefix_shape),
+        ("b", "prefill", prefix_shape),
+        ("c", "prefill", prefix_shape),
+    ]
+
+
 def test_continuous_batch_engine_records_packed_prefill_candidate_shapes_for_queue_profile_without_timings(
     monkeypatch,
 ) -> None:

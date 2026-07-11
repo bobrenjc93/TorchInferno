@@ -465,6 +465,8 @@ class ServingTokenEvent:
     step: int
     generated: int
     finished: bool
+    source: str = ""
+    prefill_shape: str = ""
 
 
 @dataclass
@@ -2624,7 +2626,15 @@ class ContinuousBatchEngine:
                     state.last_token = next_token
                     state.phase = "decoding"
                     request_finished = self._should_finish_before_decode(state)
-                    self._record_token_event(events, state, next_token, step, finished=request_finished)
+                    self._record_token_event(
+                        events,
+                        state,
+                        next_token,
+                        step,
+                        finished=request_finished,
+                        source="prefill",
+                        prefill_shape=shape_key,
+                    )
                     if request_finished:
                         self._finish_and_release(state, step)
                     else:
@@ -3977,6 +3987,8 @@ class ContinuousBatchEngine:
                         next_token,
                         step,
                         finished=self._should_finish_before_decode(state),
+                        source="prefill",
+                        prefill_shape=shape_key,
                     )
                     active.append(state)
                 state_create_ms = (time.perf_counter() - state_create_start_s) * 1000.0
@@ -4043,6 +4055,8 @@ class ContinuousBatchEngine:
                         next_token,
                         step,
                         finished=self._should_finish_before_decode(state),
+                        source="prefill",
+                        prefill_shape=shape_key,
                     )
                     active.append(state)
             return active
@@ -5287,6 +5301,8 @@ class ContinuousBatchEngine:
                     step=event.step,
                     generated=event.generated,
                     finished=True,
+                    source=event.source,
+                    prefill_shape=event.prefill_shape,
                 )
 
             for row_index, (_original_index, request, _prefix_hit_tokens, _reusable) in enumerate(group):
@@ -9853,6 +9869,8 @@ class ContinuousBatchEngine:
         step: int,
         *,
         finished: bool,
+        source: str = "",
+        prefill_shape: str = "",
     ) -> None:
         if events is None:
             return
@@ -9863,6 +9881,8 @@ class ContinuousBatchEngine:
                 step=step,
                 generated=state.generated,
                 finished=finished,
+                source=source,
+                prefill_shape=prefill_shape,
             )
         )
 
