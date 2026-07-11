@@ -145,6 +145,18 @@ and regressed harder to `217.0 / 22.8 / 1020.2ms` with `65` prefill batches,
 `132` decode-many calls, and `582` decode-many steps. Do not lower the default
 below `24` without a non-fragmenting cached-prefix prefill body.
 
+The current-head guarded suffix-split recheck is also rejected. Enabling
+`TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SPLIT_SUFFIX_BUCKETS_GREEDY_SHORT=1`
+on `5a5776f` wrote
+`/tmp/inference-bench-long-output-guarded-suffix-split-5a5776f-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-long-output-guarded-suffix-split-5a5776f/runs/20260711_074107`
+and landed at `225.5 / 22.2 / 1009.5ms`, p99
+`576.5 / 33.1 / 1843.8ms`, with `1000/1000` correct. The profile accepted
+`6/16` suffix-split candidates and saved `3.1K` accepted model-token slots, led
+by `base_b24:s96->b16:s32+b8:s96`, but prefill batches rose to `66` and
+median `submit2first` stayed high at `120.3ms`. Keep the splitter diagnostic;
+the profile still points at a non-fragmenting packed cached-prefix body rather
+than recursive suffix fragmentation.
+
 ## Current no-sync prefill-shape telemetry
 
 A dirty-tree telemetry validation after `be39510` wrote
