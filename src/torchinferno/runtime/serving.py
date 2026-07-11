@@ -6534,6 +6534,14 @@ class ContinuousBatchEngine:
             self._decode_many_token_scratch = scratch
         return scratch
 
+    def _ensure_decode_input_scratch(self, tokens: int) -> Tensor:
+        needed = max(1, int(tokens))
+        scratch = getattr(self, "_decode_input_scratch", None)
+        if scratch is None or scratch.numel() < needed or scratch.device != self.device:
+            scratch = torch.empty(needed, dtype=torch.long, device=self.device)
+            self._decode_input_scratch = scratch
+        return scratch
+
     def _decode_many_async_readback_enabled(self) -> bool:
         return bool(
             self.decode_many_async_readback
@@ -7140,7 +7148,14 @@ class ContinuousBatchEngine:
                 state_order_indices = self._device_index_tensor(tuple(rows))
         else:
             row_indices = self._device_index_tensor(tuple(decode_rows))
-            input_ids = self._ensure_gpu_token_buf().index_select(0, row_indices).view(n_padded, 1)
+            input_scratch = self._ensure_decode_input_scratch(n_padded)[:n_padded]
+            torch.index_select(
+                self._ensure_gpu_token_buf(),
+                0,
+                row_indices,
+                out=input_scratch,
+            )
+            input_ids = input_scratch.view(n_padded, 1)
         seq_lens = self._decode_many_seq_lens_tensor(states, decode_rows)
         if self.profile_timings:
             self.stats.decode_ragged_prepare_ms += (time.perf_counter() - prepare_start_s) * 1000.0

@@ -7543,6 +7543,59 @@ def test_continuous_batch_engine_online_many_keeps_decode_tokens_ordered(monkeyp
     assert model.ragged_logits_graph_calls == 3
 
 
+def test_continuous_batch_engine_reuses_row_indexed_decode_input_scratch(monkeypatch) -> None:
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY", "1")
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_UNIFORM_RAGGED_DECODE", "1")
+
+    class _RecordingRaggedGraphToyModel(_RaggedGraphToyModel):
+        def __init__(self) -> None:
+            super().__init__(vocab_size=128)
+            self.input_ptrs: list[int] = []
+            self.row_index_batches: list[list[int] | None] = []
+
+        def try_decode_ragged_logits_graph(self, input_ids, cache, *, seq_lens, row_indices):
+            self.input_ptrs.append(int(input_ids.data_ptr()))
+            self.row_index_batches.append(
+                None if row_indices is None else row_indices.detach().cpu().tolist()
+            )
+            return super().try_decode_ragged_logits_graph(
+                input_ids,
+                cache,
+                seq_lens=seq_lens,
+                row_indices=row_indices,
+            )
+
+    model = _RecordingRaggedGraphToyModel()
+    engine = ContinuousBatchEngine(
+        model,
+        device=torch.device("cpu"),
+        max_active_requests=4,
+        prefix_cache_capacity=0,
+        enable_ragged_decode=True,
+        store_reusable_prefixes=False,
+    )
+    engine.start_online(max_seq_len=16)
+    for index in range(3):
+        engine.submit_online(
+            ServingRequest(
+                str(index),
+                (index + 1, index + 2, index + 3),
+                4,
+                arrival_step=0,
+            )
+        )
+
+    first = engine.step_online()
+    events, steps = engine.step_online_many(8)
+
+    assert len(first) == 3
+    assert steps == 3
+    assert len(events) == 9
+    assert model.row_index_batches == [[0, 1, 2, 3]] * 3
+    assert len(set(model.input_ptrs)) == 1
+    assert engine._decode_input_scratch.data_ptr() == model.input_ptrs[0]
+
+
 def test_continuous_batch_engine_online_many_can_use_multi_token_graph(monkeypatch) -> None:
     monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY", "1")
     monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY_GRAPH", "1")

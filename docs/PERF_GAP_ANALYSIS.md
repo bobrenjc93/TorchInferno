@@ -13766,6 +13766,39 @@ and stayed correct (`1000/1000`) but did not produce a score-facing win
 (`234.5 / 21.2 / 1015.0ms`, p99 `1503.1 / 50.1 / 2614.0ms`). Keep treating
 this as decode housekeeping; it does not change the main prefill-body target.
 
+The latest public run `20260711_010210` picked up `d78c1ae`, scored
+TorchInferno `4/20`, and crashed after `self_consistency`: `multi_turn` timed
+out and `tree_of_thought`/`long_output` saw connection refused after a rank-0
+CUDA launch failure. A local current-head TorchInferno-only multi_turn repro on
+`5e855d2` plus the row-indexed decode-input scratch patch
+(`/tmp/inference-bench-multiturn-repro-results/.../runs/20260711_015235`)
+completed cleanly at `220.6 / 36.3 / 250.8ms`, `983/1000` correct. The queue
+profile showed the remaining median gap as admission/prefill latency, not
+decode-many: `use_decode_many=false`, `queue_to_submit_p50=125.1ms`,
+`submit_to_first_p50=84.3ms`, and `queue_to_first_p50=212.0ms`.
+
+Reopening the 512-token greedy active-row cap is still rejected. Raising
+`TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_MAX_ACTIVE` from `32` to `48`
+wrote
+`/tmp/inference-bench-multiturn-maxactive48-results/.../runs/20260711_020015`
+and regressed multi_turn to `617.8 / 141.5 / 741.2ms`, still `983/1000`
+correct. Queue telemetry made the tradeoff explicit: `queue_to_submit_p50`
+moved only to `109.9ms`, while `submit_to_first_p50` ballooned to `476.7ms`.
+Keep the 32-row greedy-large cap; the next multi_turn lever remains a cheaper
+mixed-prefix prefill body or better queue formation at the existing decode row
+count.
+
+The row-indexed decode-input scratch patch does exercise the real long_output
+decode-many path, but it remains decode housekeeping rather than a score-facing
+fix. The local default long_output validation
+`/tmp/inference-bench-long-output-scratch-results/.../runs/20260711_020627`
+landed at `226.5 / 21.7 / 991.7ms`, `1000/1000` correct. Its final queue
+profile reported `use_decode_many=true`, `149` decode-many calls, `657`
+internal steps, and `40640` padded decode-many tokens, with
+`queue_to_first_p50=215.8ms` and `queue_to_finish_p50=977.7ms`. Default queue
+timing was sync-light, so this validates correctness and path coverage, not a
+direct prepare-ms delta.
+
 ## Priority for a focused (non-loop) session
 
 1. Prefill MFU (Issue 1) — biggest TTFT lever, ~2x, affects 3/5 benchmarks.
