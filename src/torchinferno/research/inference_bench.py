@@ -208,6 +208,9 @@ _QUEUE_PROFILE_FIELDS = (
     "runtime_prefill_packed_candidate_pattern_saved_tokens",
     "runtime_prefill_packed_candidate_pattern_groups",
     "runtime_prefill_packed_candidate_pattern_slot_counts",
+    "runtime_prefill_packed_fixed_capacity_attempts",
+    "runtime_prefill_packed_fixed_capacity_accepts",
+    "runtime_prefill_packed_fixed_capacity_reject_reason_counts",
     "runtime_prefill_prefix_copy_batches",
     "runtime_prefill_prefix_copy_tokens",
     "runtime_prefill_prefix_copy_shared_tokens",
@@ -1232,6 +1235,31 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
                         "fixed_over_pct",
                     ),
                     packed_fixed_capacity_reject_rows,
+                )
+            )
+            lines.append("")
+
+        packed_fixed_capacity_runtime_rows = (
+            _prefill_packed_fixed_capacity_runtime_rows(queue_profiles)
+        )
+        if packed_fixed_capacity_runtime_rows:
+            lines.append("[torchinferno packed prefill fixed-capacity runtime]")
+            lines.extend(
+                _format_table(
+                    (
+                        "temp",
+                        "max_tokens",
+                        "attempts",
+                        "accepts",
+                        "accept_pct",
+                        "rejects",
+                        "reject_reasons",
+                        "packed_calls",
+                        "packed_saved",
+                        "packed_ms",
+                        "candidate_saved",
+                    ),
+                    packed_fixed_capacity_runtime_rows,
                 )
             )
             lines.append("")
@@ -3822,6 +3850,66 @@ def _prefill_packed_fixed_capacity_reject_rows(
             )
     items.sort(key=lambda item: (-item[0], -item[1], item[2]))
     return [item[3] for item in items[:limit]]
+
+
+def _prefill_packed_fixed_capacity_runtime_rows(
+    profiles: Sequence[QueueProfileSummary],
+) -> list[tuple[str, ...]]:
+    rows: list[tuple[str, ...]] = []
+    for profile in profiles:
+        fields = profile.fields
+        attempts = _numeric_field(
+            fields,
+            "runtime_prefill_packed_fixed_capacity_attempts",
+        )
+        accepts = _numeric_field(
+            fields,
+            "runtime_prefill_packed_fixed_capacity_accepts",
+        )
+        rejects = _sum_numeric_mapping(
+            fields.get("runtime_prefill_packed_fixed_capacity_reject_reason_counts")
+        )
+        packed_calls = _numeric_field(fields, "runtime_prefill_packed_eager_calls")
+        packed_saved = _numeric_field(
+            fields,
+            "runtime_prefill_packed_eager_saved_tokens",
+        )
+        packed_ms = _numeric_field(fields, "runtime_prefill_packed_eager_ms")
+        candidate_saved = _numeric_field(
+            fields,
+            "runtime_prefill_packed_candidate_saved_tokens",
+        )
+        if not any(
+            isinstance(value, (int, float)) and float(value) > 0.0
+            for value in (attempts, accepts, rejects, packed_calls, packed_saved)
+        ):
+            continue
+        rows.append(
+            (
+                _fmt_value(profile.temperature),
+                _fmt_value(profile.max_tokens),
+                _fmt_value(_int_if_whole(attempts) if attempts is not None else None),
+                _fmt_value(_int_if_whole(accepts) if accepts is not None else None),
+                _fmt_pct(float(accepts or 0.0), float(attempts or 0.0)),
+                _fmt_value(_int_if_whole(rejects) if rejects is not None else None),
+                _fmt_mapping_summary(
+                    fields.get("runtime_prefill_packed_fixed_capacity_reject_reason_counts")
+                ),
+                _fmt_value(
+                    _int_if_whole(packed_calls) if packed_calls is not None else None
+                ),
+                _fmt_value(
+                    _int_if_whole(packed_saved) if packed_saved is not None else None
+                ),
+                _fmt_value(packed_ms),
+                _fmt_value(
+                    _int_if_whole(candidate_saved)
+                    if candidate_saved is not None
+                    else None
+                ),
+            )
+        )
+    return rows
 
 
 def _prefill_shape_observed_packed_ms(

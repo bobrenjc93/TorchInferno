@@ -12,6 +12,7 @@ from torchinferno.research.inference_bench import (
     _phase_target,
     _prefill_graph_phase_rows,
     _prefill_packed_dynamic_target_rows,
+    _prefill_packed_fixed_capacity_runtime_rows,
     _prefill_packed_fixed_capacity_reject_rows,
     _prefill_shape_call_count,
     _prefill_shape_dense_forward_ms,
@@ -161,6 +162,11 @@ def _write_inference_bench_run(tmp_path) -> None:
         "runtime_prefill_packed_candidate_calls": 4,
         "runtime_prefill_packed_candidate_saved_tokens": 20,
         "runtime_prefill_packed_candidate_groups": 11,
+        "runtime_prefill_packed_fixed_capacity_attempts": 4,
+        "runtime_prefill_packed_fixed_capacity_accepts": 1,
+        "runtime_prefill_packed_fixed_capacity_reject_reason_counts": {
+            "capacity_grew": 3,
+        },
         "runtime_prefix_reuse_requests": 5,
         "runtime_prefix_reuse_tokens": 64,
         "runtime_prefix_reuse_route_counts": {
@@ -1058,6 +1064,8 @@ def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) ->
     assert "packed_eager_ms" in text
     assert "packed_eager_saved" in text
     assert "packed_cand_saved" in text
+    assert "[torchinferno packed prefill fixed-capacity runtime]" in text
+    assert "capacity_grew=3" in text
     assert "prefix_reuse" in text
     assert "prefix_reuse_tok" in text
     assert "prefix_routes" in text
@@ -1747,6 +1755,43 @@ def test_prefill_fixed_capacity_reject_rows_show_over_dense_patterns() -> None:
             "15.1%",
             "-",
         ),
+    ]
+
+
+def test_prefill_fixed_capacity_runtime_rows_show_acceptance_and_rejects() -> None:
+    profile = QueueProfileSummary(
+        event="online_batcher_quiescent",
+        temperature=0.0,
+        max_tokens=96,
+        submitted_requests=1000,
+        finished_events=1000,
+        fields={
+            "runtime_prefill_packed_fixed_capacity_attempts": 58,
+            "runtime_prefill_packed_fixed_capacity_accepts": 0,
+            "runtime_prefill_packed_fixed_capacity_reject_reason_counts": {
+                "capacity_grew": 58,
+            },
+            "runtime_prefill_packed_eager_calls": 0,
+            "runtime_prefill_packed_eager_saved_tokens": 0,
+            "runtime_prefill_packed_eager_ms": 0.0,
+            "runtime_prefill_packed_candidate_saved_tokens": 28117,
+        },
+    )
+
+    assert _prefill_packed_fixed_capacity_runtime_rows([profile]) == [
+        (
+            "0.0",
+            "96",
+            "58",
+            "0",
+            "0.0%",
+            "58",
+            "capacity_grew=58",
+            "0",
+            "0",
+            "0.0",
+            "28117",
+        )
     ]
 
 
