@@ -90,6 +90,37 @@ reuse for this workload and reinforces that the remaining lever is a true
 dynamic packed cached-prefix prefill body or a non-fragmenting scheduler policy,
 not logits reuse or exact-prompt replay.
 
+## Current 20260711 tree sync-timing profile
+
+A current-head TorchInferno-only `tree_of_thought` profile on pushed `b38f8a7`
+enabled queue sync timings and used inference-bench `4ce41a7b` benchmark
+boundary markers. It wrote
+`/tmp/inference-bench-tree-b38-sync-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-tree-b38-sync/runs/20260711_203255`
+and landed at `57.3 / 38.9 / 80.3ms`, `17.8 tok/s`, `957/992` correct. The
+queue profile has explicit `benchmark_start` and `benchmark_end` records around
+the tree run, so future multi-benchmark queue profiles no longer need order
+inference to segment records.
+
+The run stayed clean on shortcut counters and integrity checks:
+`runtime_generated_prefix_store_requests=0`,
+`runtime_generated_prefix_reuse_requests=0`,
+`runtime_prompt_lookup_accepted_tokens=0`, and
+`runtime_repeated_sample_state_hits=0`. The final complete snapshot shows
+`403` prefill calls for `10.95K` real prefill tokens, `3.24K` padding tokens,
+`7.47s` prefill graph GPU time, `341` decode model calls, and `3.87s` ragged
+decode GPU time. Gumbel sampling accounted for `1.04s` over `911` calls and
+`2555` rows (`272ms` noise, `369ms` max/reduce setup, `184ms` final token
+reduce), with host readback only `39ms`.
+
+The hot shapes are still small sampled-medium prefix-suffix waves:
+`prefix_graph:b2:s12:p45-45:src1:mixed0` used `3.68s` of prefill replay GPU
+and `prefix_graph:b4:s12:p45-45:src1:mixed0` used `2.73s`; sampled decode was
+similarly concentrated in `ragged:b4/4`, `ragged:b3/4`, and `ragged:b5/8`.
+This does not support a logits/cache shortcut or a sampler default flip. The
+next tree lever remains a real way to batch or fuse the tiny `s12` sampled
+prefix/decode waves, not the previously rejected wait, gather, or CDF sampler
+knobs.
+
 ## Current 20260711 targeted packed-prefill rejection
 
 A shape-targeted multi_turn A/B on pushed `d5c3c19` enabled packed ragged eager
