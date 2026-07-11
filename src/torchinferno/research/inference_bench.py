@@ -454,10 +454,13 @@ class ProviderServerLogSummary:
     prefill_cached_tokens: int = 0
     prefill_cuda_graph_batches: int = 0
     prefill_new_seq_max: int | None = None
+    prefill_new_seq_counts: dict[str, int] = field(default_factory=dict)
+    prefill_new_token_bucket_counts: dict[str, int] = field(default_factory=dict)
     decode_batches: int = 0
     decode_logged_tokens: int = 0
     decode_cuda_graph_batches: int = 0
     decode_running_max: int | None = None
+    decode_running_counts: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -1683,11 +1686,14 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
                     "cached_pct",
                     "prefill_graph_pct",
                     "prefill_new_seq_max",
+                    "prefill_seq_top",
+                    "prefill_tok_top",
                     "decode_batches",
                     "decode_tokens",
                     "decode_tok_batch",
                     "decode_graph_pct",
                     "decode_running_max",
+                    "decode_running_top",
                 ),
                 provider_phase_rows,
             )
@@ -2469,10 +2475,13 @@ def _summarize_sglang_server_log(path: Path) -> ProviderServerLogSummary:
     prefill_cached_tokens = 0
     prefill_cuda_graph_batches = 0
     prefill_new_seq_max: int | None = None
+    prefill_new_seq_counts: dict[str, int] = {}
+    prefill_new_token_bucket_counts: dict[str, int] = {}
     decode_batches = 0
     decode_logged_tokens = 0
     decode_cuda_graph_batches = 0
     decode_running_max: int | None = None
+    decode_running_counts: dict[str, int] = {}
 
     for line in path.read_text(errors="replace").splitlines():
         prefill_match = _SGLANG_PREFILL_RE.search(line)
@@ -2487,6 +2496,11 @@ def _summarize_sglang_server_log(path: Path) -> ProviderServerLogSummary:
                 new_seq
                 if prefill_new_seq_max is None
                 else max(prefill_new_seq_max, new_seq)
+            )
+            _increment_count(prefill_new_seq_counts, str(new_seq))
+            _increment_count(
+                prefill_new_token_bucket_counts,
+                _provider_log_token_bucket(new_tokens),
             )
             if prefill_match.group("cuda_graph") == "True":
                 prefill_cuda_graph_batches += 1
@@ -2504,6 +2518,7 @@ def _summarize_sglang_server_log(path: Path) -> ProviderServerLogSummary:
             if decode_running_max is None
             else max(decode_running_max, running)
         )
+        _increment_count(decode_running_counts, str(running))
         if decode_match.group("cuda_graph") == "True":
             decode_cuda_graph_batches += 1
         generation_tps.append(float(decode_match.group("generation_tps")))
@@ -2521,11 +2536,27 @@ def _summarize_sglang_server_log(path: Path) -> ProviderServerLogSummary:
         prefill_cached_tokens=prefill_cached_tokens,
         prefill_cuda_graph_batches=prefill_cuda_graph_batches,
         prefill_new_seq_max=prefill_new_seq_max,
+        prefill_new_seq_counts=prefill_new_seq_counts,
+        prefill_new_token_bucket_counts=prefill_new_token_bucket_counts,
         decode_batches=decode_batches,
         decode_logged_tokens=decode_logged_tokens,
         decode_cuda_graph_batches=decode_cuda_graph_batches,
         decode_running_max=decode_running_max,
+        decode_running_counts=decode_running_counts,
     )
+
+
+def _increment_count(counts: dict[str, int], key: str) -> None:
+    counts[key] = counts.get(key, 0) + 1
+
+
+def _provider_log_token_bucket(tokens: int) -> str:
+    value = max(0, int(tokens))
+    bounds = (1, 8, 16, 32, 64, 128, 256, 512, 1024)
+    for bound in bounds:
+        if value <= bound:
+            return f"<={bound}"
+    return ">1024"
 
 
 def _torchinferno_profiler_event_rows(
@@ -2609,6 +2640,8 @@ def _provider_server_log_rows(
                 ),
                 _fmt_pct(summary.prefill_cuda_graph_batches, summary.prefill_batches),
                 _fmt_value(summary.prefill_new_seq_max),
+                _fmt_mapping_summary(summary.prefill_new_seq_counts),
+                _fmt_mapping_summary(summary.prefill_new_token_bucket_counts),
                 _fmt_value(summary.decode_batches),
                 _fmt_value(summary.decode_logged_tokens),
                 _fmt_value(
@@ -2618,6 +2651,7 @@ def _provider_server_log_rows(
                 ),
                 _fmt_pct(summary.decode_cuda_graph_batches, summary.decode_batches),
                 _fmt_value(summary.decode_running_max),
+                _fmt_mapping_summary(summary.decode_running_counts),
             )
         )
     return rows

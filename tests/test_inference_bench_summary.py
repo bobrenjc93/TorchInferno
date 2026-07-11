@@ -586,6 +586,8 @@ def _write_inference_bench_run(tmp_path) -> None:
                 "cuda graph: False, input throughput (token/s): 800.0",
                 "TP0] Decode batch, #running-req: 4, #token: 64, token usage: 0.00, "
                 "cuda graph: True, gen throughput (token/s): 1600.0, #queue-req: 0",
+                "TP0] Decode batch, #running-req: 2, #token: 8, token usage: 0.00, "
+                "cuda graph: False, gen throughput (token/s): 400.0, #queue-req: 0",
             ]
         )
         + "\n"
@@ -951,8 +953,11 @@ def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) ->
     assert sglang_log.prefill_batches == 2
     assert sglang_log.prefill_new_tokens == 56
     assert sglang_log.prefill_cached_tokens == 16
-    assert sglang_log.decode_batches == 1
-    assert sglang_log.decode_logged_tokens == 64
+    assert sglang_log.prefill_new_seq_counts == {"3": 1, "1": 1}
+    assert sglang_log.prefill_new_token_bucket_counts == {"<=64": 1, "<=8": 1}
+    assert sglang_log.decode_batches == 2
+    assert sglang_log.decode_logged_tokens == 72
+    assert sglang_log.decode_running_counts == {"4": 1, "2": 1}
     assert len(summary.torchinferno_startup_warmups) == 3
     decode_warmup = summary.torchinferno_startup_warmups[0]
     assert decode_warmup.label == "online decode graph warmup"
@@ -1320,16 +1325,22 @@ def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) ->
     assert "prefix_hit_avg" in text
     assert "prefill_graph_pct" in text
     assert "prefill_tok_batch" in text
+    assert "prefill_seq_top" in text
+    assert "prefill_tok_top" in text
     assert "cached_pct" in text
     assert "decode_tok_batch" in text
     assert "decode_graph_pct" in text
+    assert "decode_running_top" in text
     assert "sglang" in text
     assert "0.2%" in text
     assert "85.0%" in text
     assert "50.0%" in text
     assert "28.0" in text
     assert "22.2%" in text
-    assert "64.0" in text
+    assert "3=1" in text
+    assert "<=64=1" in text
+    assert "4=1" in text
+    assert "36.0" in text
 
 
 def test_queue_profile_infers_cache_backend_from_torchinferno_log(tmp_path) -> None:
@@ -1393,9 +1404,12 @@ def test_inference_bench_summary_reads_current_provider_log_names(tmp_path) -> N
     assert "prefix_hit_avg" in text
     assert "prefill_graph_pct" in text
     assert "prefill_tok_batch" in text
+    assert "prefill_seq_top" in text
+    assert "prefill_tok_top" in text
     assert "cached_pct" in text
     assert "decode_tok_batch" in text
     assert "decode_graph_pct" in text
+    assert "decode_running_top" in text
 
 
 def test_inference_bench_summary_marks_partial_queue_profiles(tmp_path) -> None:

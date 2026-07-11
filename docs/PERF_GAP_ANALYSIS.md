@@ -15016,6 +15016,18 @@ rate, while SGLang exposed `429` prefill batches with `71.5%` cached tokens.
 That keeps the cross-provider evidence focused on normal prefix-cache and
 prefill scheduling behavior rather than benchmark-specific shortcuts.
 
+The SGLang provider-log row now also renders compact prefill/decode batch
+distributions. Re-rendering the latest public run, `20260711_210242`, shows
+SGLang ran `1438` prefill batches with `83.8%` cached tokens and all prefill
+batches using CUDA graphs. The top prefill sequence counts were `1=846`,
+`2=227`, and `3=155`, with top new-token buckets `<=16=545`, `<=32=214`, and
+`<=256=166`. Decode was the opposite shape: only `21` batches, `72187` logged
+tokens, `100%` CUDA graphs, and top running counts `64=15`, `61=2`, `23=1`.
+This makes the next fair comparison concrete: SGLang wins TTFT by aggressively
+serving many tiny cached-prefix suffix prefill batches, while TorchInferno's
+remaining target is still a faster non-fragmenting cached-prefix suffix body and
+high-active decode-many cost, not exact-prompt logits reuse.
+
 For older public queue profiles that lack per-shape no-sync GPU replay timing,
 the packed-prefill target tables now estimate shape milliseconds by allocating
 total prefill graph replay GPU time across `runtime_prefill_shape_model_tokens`.
