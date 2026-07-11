@@ -14790,11 +14790,15 @@ essentially the same as the current default band (`q2first_p50=215.3ms`,
 `ragged_prefill:b2:s16:rows0:ctx-64:src1` miss), so the current
 prefill-ready cap-8 policy remains the better default tradeoff.
 
-The latest public run remains `20260711_170752` on TorchInferno `0ba2517`.
-Cache integrity is clean: generated-prefix stores/reuses, prompt-lookup
-accepted tokens, and repeated-sample hits are all zero. Score remains
-TorchInferno `4/20` versus vLLM `15/20`; the remaining fair gaps are few_shot
-and multi_turn TTFT plus long_output decode throughput. A local current-head
+The latest public run is `20260711_190237` on TorchInferno `49107ad`. Cache
+integrity is clean: generated-prefix stores/reuses, prompt-lookup accepted
+tokens, and repeated-sample hits are all zero. Score remains TorchInferno
+`4/20` versus vLLM `15/20`, with public rows at few_shot
+`141.2 / 32.0 / 166.0ms`, self_consistency `64.3 / 0.0 / 84.8ms`,
+multi_turn `191.1 / 36.0 / 221.6ms`, tree_of_thought
+`53.5 / 35.2 / 74.9ms`, and long_output `185.3 / 19.0 / 843.1ms`.
+TorchInferno still trails vLLM on few_shot and multi_turn TTFT, sampled tree
+prefill/decode cost, and long_output decode throughput. A local current-head
 few_shot sync profile wrote
 `/tmp/inference-bench-ti-few-timed-results/.../runs/20260711_184452` and landed
 at `171.7 / 33.8 / 198.3ms`, `977/1000` correct. Its hot model-side prefill
