@@ -14137,6 +14137,16 @@ the combined GPU decode-state signature when an already-current active set is
 extended by a prefilled refill wave, with a focused CPU regression covering the
 mid-session refill -> decode-many path.
 
+The pushed validation on `829b227` confirmed the intended counter movement:
+`/tmp/inference-bench-local-829b227-results/.../runs/20260711_090410` completed
+long_output at `213.2 / 21.6 / 998.7ms`, p99 `612.8 / 39.3 / 1772.6ms`, with
+`1000/1000` correct. The queue profile reported `109` decode-many calls,
+`480` internal steps, `runtime_decode_many_state_syncs=0`, and
+`runtime_decode_many_state_sync_skips=109`. This removes the refill-wave GPU
+state upload path but leaves the score-facing row in the same performance band;
+the remaining long_output gap is still cached-prefix suffix prefill and
+high-active decode replay cost, not decode-state synchronization.
+
 ## Priority for a focused (non-loop) session
 
 1. Prefill MFU (Issue 1) — biggest TTFT lever, ~2x, affects 3/5 benchmarks.
