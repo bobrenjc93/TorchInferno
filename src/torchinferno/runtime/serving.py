@@ -4527,7 +4527,7 @@ class ContinuousBatchEngine:
         )
         if not capture_on_miss and graph_shape_key in self._prefill_token_graph_miss_keys:
             return None
-        gpu_events = self._start_prefill_graph_gpu_timer() if capture_on_miss else None
+        gpu_events = self._start_prefill_graph_gpu_timer()
         tokens = graph(
             input_ids,
             self._require_cache(),
@@ -4598,7 +4598,7 @@ class ContinuousBatchEngine:
         )
         if not capture_on_miss and graph_shape_key in self._prefill_token_graph_miss_keys:
             return None
-        gpu_events = self._start_prefill_graph_gpu_timer() if capture_on_miss else None
+        gpu_events = self._start_prefill_graph_gpu_timer()
         output = graph(
             input_ids,
             self._require_cache(),

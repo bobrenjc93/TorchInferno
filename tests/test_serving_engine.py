@@ -3385,6 +3385,65 @@ def test_continuous_batch_engine_counts_ragged_prefill_captures() -> None:
     assert engine.stats.prefill_shape_graph_replay_ms[shape_key] >= 0.0
 
 
+def test_continuous_batch_engine_times_no_capture_greedy_prefill_graph(
+    monkeypatch,
+) -> None:
+    model = _TokenOnlyGraphToyModel()
+    engine = ContinuousBatchEngine(
+        model,
+        device=torch.device("cpu"),
+        max_active_requests=2,
+        prefix_cache_capacity=0,
+        profile_timings=True,
+    )
+    engine.start_online(max_seq_len=8)
+    input_ids = torch.tensor([[1, 2], [3, 4]], dtype=torch.long)
+    seq_lens = torch.zeros(2, dtype=torch.long)
+    row_indices = torch.tensor([0, 1], dtype=torch.long)
+    logit_positions = torch.tensor([1, 1], dtype=torch.long)
+    requests = [
+        ServingRequest("a", (1, 2), 1, arrival_step=0),
+        ServingRequest("b", (3, 4), 1, arrival_step=0),
+    ]
+    shape_key = "prefix_graph:b2:s2:p0-0:src0:mixed0"
+    timer_events = (object(), object())
+    stopped: list[tuple[tuple[object, object] | None, bool, str, str | None]] = []
+
+    monkeypatch.setattr(engine, "_start_prefill_graph_gpu_timer", lambda: timer_events)
+
+    def stop_timer(
+        events,
+        *,
+        captured,
+        graph_shape_key,
+        profile_shape_key=None,
+    ):
+        stopped.append((events, bool(captured), graph_shape_key, profile_shape_key))
+
+    monkeypatch.setattr(engine, "_stop_prefill_graph_gpu_timer", stop_timer)
+
+    tokens = engine._try_ragged_prefill_greedy_tokens(
+        input_ids,
+        seq_lens,
+        row_indices,
+        logit_positions,
+        requests,
+        capture_on_miss=False,
+        profile_shape_key=shape_key,
+    )
+
+    assert tokens is not None
+    assert model.prefill_token_capture_flags == [False]
+    assert stopped == [
+        (
+            timer_events,
+            False,
+            "ragged_prefill:b2:s2:rows1:ctx-1:src0",
+            shape_key,
+        ),
+    ]
+
+
 def test_continuous_batch_engine_records_prefill_graph_shapes_for_queue_profile_without_timings(
     monkeypatch,
 ) -> None:

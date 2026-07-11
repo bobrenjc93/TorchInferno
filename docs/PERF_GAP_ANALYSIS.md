@@ -13692,6 +13692,35 @@ held the intended structural fix in the full suite:
 unrelated run variance until it repeats, because the routing change does not
 touch that row's prompt path and decode graph misses stayed at zero there.
 
+The current long_output sync-timing refresh on the same pushed head wrote
+`/tmp/inference-bench-7a025-long-sync-results/.../runs/20260711_002946` and
+landed at `232.1 / 21.1 / 984.7ms`, `1000/1000` correct. The profile stayed on
+the known path: `52` prefill batches with `5.25s` prefill wall / `4.59s`
+forward, `744` clean decode graph replays, and `128` decode-many calls covering
+`577` internal steps. Decode-many CPU time was again stream wait rather than
+Python materialization (`6976.7ms` wait vs `28.7ms` materialize), and packed
+candidate telemetry still pointed at the same cached-prefix prefill target
+(`33.8K` avoidable padded suffix tokens).
+
+That run exposed a profiling attribution gap rather than a new serving gap:
+hot greedy ragged prefill token graph replays used `capture_on_miss=False`, so
+their sync-timing GPU events were not recorded. The real hot shapes had forward
+time (`b24:s64`, `b24:s96`, `b32:s64`, `b32:s96`) but
+`runtime_prefill_shape_graph_replay_gpu_ms` only showed tiny `b1/b2/b4` entries.
+Greedy token and token+logits prefill graph attempts now start the same GPU
+timer regardless of capture mode, while still only recording it when the graph
+actually hits. This is timing-only; default lightweight queue profiles and
+serving behavior are unchanged.
+
+The patched sync-timing validation wrote
+`/tmp/inference-bench-prefill-gpu-timing-results/.../runs/20260711_003722` and
+landed at `223.2 / 21.8 / 965.6ms`, `1000/1000` correct. The intended
+telemetry is now present: `runtime_prefill_graph_replay_gpu_ms=4984.3ms`, with
+hot shape GPU attribution including `b24:s64=975.3ms`, `b24:s96=780.3ms`,
+`b32:s64=682.9ms`, and `b32:s96=378.8ms`. This confirms the long_output gap is
+ordinary cached-prefix suffix prefill body plus high-active decode-many replay;
+it is not hidden graph capture, token materialization, or missing shape timing.
+
 ## Priority for a focused (non-loop) session
 
 1. Prefill MFU (Issue 1) — biggest TTFT lever, ~2x, affects 3/5 benchmarks.
