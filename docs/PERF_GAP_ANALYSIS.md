@@ -26,6 +26,35 @@ that also have `0.0%` fixed coverage. The matching multi_turn artifact has
 gap is not solved by an exact-pattern packed graph; it needs either a broader
 dynamic mixed-prefix body or cheaper model-side common-prefix replay.
 
+## Current 20260711 same-host global-vLLM refresh
+
+A same-host vLLM refresh used the globally installed Python at
+`/home/bobren/local/d/pytorch-env/bin/python3` with
+`INFERENCE_BENCH_VLLM_PYTHON` and `--skip-build`. The run did not use the
+public vLLM commit (`04d553f`); the server log reports
+`v0.20.2rc1.dev107+g2a16ece2d.d20260507`, V1 engine, async scheduling,
+prefix caching, chunked prefill, and the same compilation override
+`fuse_allreduce_rms=false`. Treat these rows as local/global-build evidence,
+not as a replacement for the public vLLM baseline.
+
+The local long_output run wrote
+`/tmp/inference-bench-vllm-global-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-vllm-global/runs/20260711_120011`.
+It completed `1000/1000` at `120.4 / 37.7 / 1383.8ms`, `25.2 tok/s`, with
+server readiness at `125.5s`. Compared with the current local TorchInferno
+`greedy-graph128` row (`207.8 / 21.8 / 1046.9ms`, `36.5 tok/s`), this global
+vLLM build is much stronger on TTFT but weaker on TPOT/E2E. The public vLLM row
+remains the stronger external target at `44.6 / 15.0 / 563.0ms`.
+
+The matching local multi_turn run wrote
+`/tmp/inference-bench-vllm-global-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-vllm-global/runs/20260711_120413`.
+It completed `979/1000` at `125.2 / 82.5 / 197.8ms`, `6.2 tok/s`, with
+server readiness at `110.5s` and a logged prefix-cache hit rate of `76.1%`.
+Current local TorchInferno is slower on TTFT (`224.7ms`) but faster on TPOT
+(`37.2ms`), while the public vLLM row remains better on both
+(`71.2 / 34.2 / 94.6ms`). This keeps the cross-provider target split clear:
+TorchInferno needs a lower first-token path for multi_turn and a cheaper
+decode/prefill body for long_output, not only better provider startup.
+
 ## Current 20260711 greedy suffix graph warmup split
 
 Promote a startup-only warmup split: keep the `max_tokens=512` policy target for
