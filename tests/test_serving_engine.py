@@ -4436,6 +4436,31 @@ def test_continuous_batch_engine_does_not_store_prompt_logits_by_default() -> No
     assert engine.reusable_prefixes["req"].logits is None
 
 
+def test_continuous_batch_engine_direct_prefix_store_discards_logits() -> None:
+    model = _SelectedLogitsToyModel()
+    engine = ContinuousBatchEngine(
+        model,
+        device=torch.device("cpu"),
+        max_active_requests=2,
+        prefix_cache_capacity=2,
+        pin_shared_prefix=False,
+    )
+    engine.start_online(max_seq_len=8)
+    logits = torch.ones((1, 1, 128), dtype=torch.float32)
+
+    stored = engine._store_reusable_prefix_tokens_in_row(
+        ("direct",),
+        "req",
+        (1, 2, 3),
+        engine.max_active_requests,
+        logits,
+        store_logits=True,
+    )
+
+    assert stored
+    assert engine.reusable_prefixes[("direct",)].logits is None
+
+
 def test_continuous_batch_engine_does_not_keep_common_prefix_logits_for_exact_prompt(
     monkeypatch,
 ) -> None:

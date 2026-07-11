@@ -7885,6 +7885,7 @@ class ContinuousBatchEngine:
         *,
         store_logits: bool = True,
     ) -> None:
+        del logits, store_logits
         if not self.store_reusable_prefixes or not env_flag("TORCHINFERNO_CONTINUOUS_PREFIX_CACHE_STORE", True):
             return
         actual_route = request_id if route_id is None else route_id
@@ -7916,11 +7917,7 @@ class ContinuousBatchEngine:
             entry.route_id,
             tokens,
             prefix_row,
-            (
-                logits[:, -1:, :].detach().clone().cpu()
-                if store_logits and logits is not None
-                else None
-            ),
+            None,
         )
         self._prefix_order.append(entry.route_id)
 
@@ -7934,6 +7931,7 @@ class ContinuousBatchEngine:
         *,
         store_logits: bool = True,
     ) -> bool:
+        del logits, store_logits
         if not self.store_reusable_prefixes or not env_flag(
             "TORCHINFERNO_CONTINUOUS_PREFIX_CACHE_STORE",
             True,
@@ -7957,11 +7955,7 @@ class ContinuousBatchEngine:
             entry.route_id,
             tokens,
             prefix_row,
-            (
-                logits[:, -1:, :].detach().clone().cpu()
-                if store_logits and logits is not None
-                else None
-            ),
+            None,
         )
         self._prefix_order.append(entry.route_id)
         return True
