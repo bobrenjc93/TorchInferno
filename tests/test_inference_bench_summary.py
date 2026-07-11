@@ -426,6 +426,28 @@ def _write_inference_bench_run(tmp_path) -> None:
         "runtime_generated_prefix_reuse_tokens": 33,
     }
     (logs / "torchinferno_queue_profile.jsonl").write_text(json.dumps(queue_record) + "\n")
+    (logs / "torchinferno.log").write_text(
+        "\n".join(
+            [
+                "[RAGGED_PREFILL_REPLAY_PROF] batch=24 suffix=64 match=5 "
+                "context_len=-256 src_rows=1 prefix_copy_len=none",
+                "ncclDevKernel_AllReduce_Sum_bf16_RING_LL         0.00% "
+                "0.000us 0.00% 0.000us 0.000us 24.592ms 29.49% "
+                "24.592ms 153.699us 160",
+                "nvjet_qqtst_112x128_128x7_2x1_v_bz_coopA_algo2_TNN "
+                "0.00% 0.000us 0.00% 0.000us 0.000us 10.669ms 12.79% "
+                "10.669ms 133.357us 80",
+                "_add_rms_norm_kernel                            0.00% "
+                "0.000us 0.00% 0.000us 0.000us 7.138ms 8.56% "
+                "7.138ms 44.615us 160",
+                "void softmax_warp_forward                       0.00% "
+                "0.000us 0.00% 0.000us 0.000us 654.337us 0.78% "
+                "654.337us 8.179us 80",
+                "Self CUDA time total: 83.400ms",
+            ]
+        )
+        + "\n"
+    )
     (logs / "vllm_server.log").write_text(
         "\n".join(
             [
@@ -800,6 +822,20 @@ def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) ->
     assert sglang_log.prefill_cached_tokens == 16
     assert sglang_log.decode_batches == 1
     assert sglang_log.decode_logged_tokens == 64
+    assert len(summary.torchinferno_profiler_events) == 1
+    profiler_event = summary.torchinferno_profiler_events[0]
+    assert profiler_event.kind == "RAGGED_PREFILL_REPLAY_PROF"
+    assert profiler_event.batch == 24
+    assert profiler_event.suffix == 64
+    assert profiler_event.matches == 5
+    assert profiler_event.context_len == "-256"
+    assert profiler_event.src_rows == 1
+    assert profiler_event.prefix_copy_len == "none"
+    assert profiler_event.self_cuda_ms == 83.4
+    assert round(profiler_event.allreduce_ms, 3) == 24.592
+    assert round(profiler_event.gemm_ms, 3) == 10.669
+    assert round(profiler_event.add_rms_ms, 3) == 7.138
+    assert round(profiler_event.softmax_ms, 3) == 0.654
 
     text = format_inference_bench_summary(summary)
     assert "[long_output]" in text
@@ -1026,6 +1062,18 @@ def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) ->
     assert "materialize_ms" in text
     assert "total_ms" in text
     assert "12.7" in text
+    assert "[torchinferno ragged prefill profiler]" in text
+    assert "replay" in text
+    assert "self_cuda_ms" in text
+    assert "allreduce_pct" in text
+    assert "gemm_pct" in text
+    assert "83.4" in text
+    assert "24.6" in text
+    assert "29.5%" in text
+    assert "10.7" in text
+    assert "12.8%" in text
+    assert "7.1" in text
+    assert "0.7" in text
     assert "[provider server log phases]" in text
     assert "prefix_hit_avg" in text
     assert "prefill_graph_pct" in text

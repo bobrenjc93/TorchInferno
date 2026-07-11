@@ -48,6 +48,19 @@ _SGLANG_DECODE_RE = re.compile(
     r"cuda graph: (?P<cuda_graph>True|False), "
     r"gen throughput \(token/s\): (?P<generation_tps>[0-9.]+)"
 )
+_TORCHINFERNO_RAGGED_PREFILL_PROFILE_RE = re.compile(
+    r"\[(?P<kind>RAGGED_PREFILL(?:_REPLAY)?_PROF)\] "
+    r"batch=(?P<batch>[0-9]+) "
+    r"suffix=(?P<suffix>[0-9]+) "
+    r"match=(?P<matches>[0-9]+) "
+    r"context_len=(?P<context_len>\S+) "
+    r"src_rows=(?P<src_rows>[0-9]+) "
+    r"prefix_copy_len=(?P<prefix_copy_len>\S+)"
+)
+_PROFILER_TIME_RE = re.compile(r"(?P<value>[0-9]+(?:\.[0-9]+)?)(?P<unit>us|ms|s)\b")
+_PROFILER_SELF_CUDA_TOTAL_RE = re.compile(
+    r"Self CUDA time total:\s*(?P<value>[0-9]+(?:\.[0-9]+)?)(?P<unit>us|ms|s)\b"
+)
 _QUEUE_PROFILE_FIELDS = (
     "greedy_large_mixed_prefix_reuse",
     "fp8_prefill_enabled",
@@ -372,6 +385,22 @@ class ProviderServerLogSummary:
 
 
 @dataclass(frozen=True)
+class TorchInfernoProfilerSummary:
+    kind: str
+    batch: int
+    suffix: int
+    matches: int
+    context_len: str
+    src_rows: int
+    prefix_copy_len: str
+    self_cuda_ms: float | None = None
+    allreduce_ms: float = 0.0
+    gemm_ms: float = 0.0
+    add_rms_ms: float = 0.0
+    softmax_ms: float = 0.0
+
+
+@dataclass(frozen=True)
 class InferenceBenchRunSummary:
     run_dir: Path
     model: str
@@ -381,6 +410,7 @@ class InferenceBenchRunSummary:
     benchmarks: tuple[str, ...]
     provider_benchmarks: tuple[ProviderBenchmarkSummary, ...]
     torchinferno_queue_profiles: tuple[QueueProfileSummary, ...]
+    torchinferno_profiler_events: tuple[TorchInfernoProfilerSummary, ...]
     provider_server_logs: tuple[ProviderServerLogSummary, ...]
 
 
@@ -432,6 +462,7 @@ def summarize_inference_bench_run(
         benchmarks=selected_benchmarks,
         provider_benchmarks=tuple(provider_benchmarks),
         torchinferno_queue_profiles=_summarize_torchinferno_queue(root),
+        torchinferno_profiler_events=_summarize_torchinferno_profiler_logs(root),
         provider_server_logs=_summarize_provider_server_logs(root),
     )
 
@@ -1284,6 +1315,34 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
             )
             lines.append("")
 
+    profiler_rows = _torchinferno_profiler_event_rows(
+        summary.torchinferno_profiler_events
+    )
+    if profiler_rows:
+        lines.append("[torchinferno ragged prefill profiler]")
+        lines.extend(
+            _format_table(
+                (
+                    "kind",
+                    "batch",
+                    "suffix",
+                    "match",
+                    "context",
+                    "src_rows",
+                    "prefix_copy",
+                    "self_cuda_ms",
+                    "allreduce_ms",
+                    "allreduce_pct",
+                    "gemm_ms",
+                    "gemm_pct",
+                    "add_rms_ms",
+                    "softmax_ms",
+                ),
+                profiler_rows,
+            )
+        )
+        lines.append("")
+
     provider_phase_rows = _provider_server_log_rows(summary.provider_server_logs)
     if provider_phase_rows:
         lines.append("[provider server log phases]")
@@ -1757,6 +1816,124 @@ def _first_existing_provider_log(logs_dir: Path, *names: str) -> Path:
     return logs_dir / names[0]
 
 
+def _summarize_torchinferno_profiler_logs(
+    root: Path,
+) -> tuple[TorchInfernoProfilerSummary, ...]:
+    logs_dir = root / "provider_logs"
+    path = _first_existing_provider_log(
+        logs_dir,
+        "torchinferno.log",
+        "torchinferno_server.log",
+    )
+    if not path.exists():
+        return ()
+    return _parse_torchinferno_profiler_events(path.read_text(errors="replace"))
+
+
+def _parse_torchinferno_profiler_events(
+    text: str,
+) -> tuple[TorchInfernoProfilerSummary, ...]:
+    events: list[TorchInfernoProfilerSummary] = []
+    current: dict[str, Any] | None = None
+    for line in text.splitlines():
+        profile_match = _TORCHINFERNO_RAGGED_PREFILL_PROFILE_RE.search(line)
+        if profile_match is not None:
+            if current is not None:
+                events.append(_torchinferno_profiler_event_from_fields(current))
+            current = {
+                "kind": profile_match.group("kind"),
+                "batch": int(profile_match.group("batch")),
+                "suffix": int(profile_match.group("suffix")),
+                "matches": int(profile_match.group("matches")),
+                "context_len": profile_match.group("context_len"),
+                "src_rows": int(profile_match.group("src_rows")),
+                "prefix_copy_len": profile_match.group("prefix_copy_len"),
+                "self_cuda_ms": None,
+                "allreduce_ms": 0.0,
+                "gemm_ms": 0.0,
+                "add_rms_ms": 0.0,
+                "softmax_ms": 0.0,
+            }
+            continue
+
+        if current is None:
+            continue
+
+        total_match = _PROFILER_SELF_CUDA_TOTAL_RE.search(line)
+        if total_match is not None:
+            current["self_cuda_ms"] = _profiler_time_to_ms(
+                total_match.group("value"), total_match.group("unit")
+            )
+            events.append(_torchinferno_profiler_event_from_fields(current))
+            current = None
+            continue
+
+        row_self_cuda_ms = _profiler_row_self_cuda_ms(line)
+        if row_self_cuda_ms is None:
+            continue
+        category = _profiler_row_category(line)
+        if category is not None:
+            current[category] = float(current[category]) + row_self_cuda_ms
+
+    if current is not None:
+        events.append(_torchinferno_profiler_event_from_fields(current))
+    return tuple(events)
+
+
+def _torchinferno_profiler_event_from_fields(
+    fields: dict[str, Any],
+) -> TorchInfernoProfilerSummary:
+    return TorchInfernoProfilerSummary(
+        kind=str(fields["kind"]),
+        batch=int(fields["batch"]),
+        suffix=int(fields["suffix"]),
+        matches=int(fields["matches"]),
+        context_len=str(fields["context_len"]),
+        src_rows=int(fields["src_rows"]),
+        prefix_copy_len=str(fields["prefix_copy_len"]),
+        self_cuda_ms=(
+            float(fields["self_cuda_ms"])
+            if isinstance(fields.get("self_cuda_ms"), (int, float))
+            else None
+        ),
+        allreduce_ms=float(fields["allreduce_ms"]),
+        gemm_ms=float(fields["gemm_ms"]),
+        add_rms_ms=float(fields["add_rms_ms"]),
+        softmax_ms=float(fields["softmax_ms"]),
+    )
+
+
+def _profiler_row_self_cuda_ms(line: str) -> float | None:
+    # torch.profiler's text table puts Self CUDA as the fourth time-valued column.
+    matches = list(_PROFILER_TIME_RE.finditer(line))
+    if len(matches) < 4:
+        return None
+    match = matches[3]
+    return _profiler_time_to_ms(match.group("value"), match.group("unit"))
+
+
+def _profiler_time_to_ms(value: str, unit: str) -> float:
+    raw = float(value)
+    if unit == "s":
+        return raw * 1000.0
+    if unit == "us":
+        return raw / 1000.0
+    return raw
+
+
+def _profiler_row_category(line: str) -> str | None:
+    lowered = line.lower()
+    if "allreduce" in lowered or "all_reduce" in lowered or "all-reduce" in lowered:
+        return "allreduce_ms"
+    if "gemm" in lowered or "nvjet" in lowered or "_scaled_mm" in lowered:
+        return "gemm_ms"
+    if "add_rms_norm" in lowered or "rms_norm" in lowered:
+        return "add_rms_ms"
+    if "softmax" in lowered or "scaled_dot_product" in lowered:
+        return "softmax_ms"
+    return None
+
+
 def _summarize_vllm_server_log(path: Path) -> ProviderServerLogSummary:
     prompt_tps: list[float] = []
     generation_tps: list[float] = []
@@ -1846,6 +2023,40 @@ def _summarize_sglang_server_log(path: Path) -> ProviderServerLogSummary:
         decode_cuda_graph_batches=decode_cuda_graph_batches,
         decode_running_max=decode_running_max,
     )
+
+
+def _torchinferno_profiler_event_rows(
+    events: Sequence[TorchInfernoProfilerSummary],
+) -> list[tuple[str, ...]]:
+    rows: list[tuple[str, ...]] = []
+    for event in events:
+        rows.append(
+            (
+                _short_torchinferno_profiler_kind(event.kind),
+                _fmt_value(event.batch),
+                _fmt_value(event.suffix),
+                _fmt_value(event.matches),
+                event.context_len,
+                _fmt_value(event.src_rows),
+                event.prefix_copy_len,
+                _fmt_value(event.self_cuda_ms),
+                _fmt_value(event.allreduce_ms),
+                _fmt_pct(event.allreduce_ms, event.self_cuda_ms or 0.0),
+                _fmt_value(event.gemm_ms),
+                _fmt_pct(event.gemm_ms, event.self_cuda_ms or 0.0),
+                _fmt_value(event.add_rms_ms),
+                _fmt_value(event.softmax_ms),
+            )
+        )
+    return rows
+
+
+def _short_torchinferno_profiler_kind(kind: str) -> str:
+    if kind == "RAGGED_PREFILL_REPLAY_PROF":
+        return "replay"
+    if kind == "RAGGED_PREFILL_PROF":
+        return "capture"
+    return kind
 
 
 def _provider_server_log_rows(
