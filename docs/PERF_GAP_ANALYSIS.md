@@ -14393,6 +14393,25 @@ state upload path but leaves the score-facing row in the same performance band;
 the remaining long_output gap is still cached-prefix suffix prefill and
 high-active decode replay cost, not decode-state synchronization.
 
+Skipping redundant logits-graph capture for greedy token-suffix common-prefix
+warmup is accepted as startup/readiness cleanup. The prior current-head
+long_output control
+`/tmp/inference-bench-greedy-graph128-results/.../runs/20260711_113921` landed
+at `207.8 / 21.8 / 1046.9ms`, `1000/1000`, with `102.6s` in the greedy
+common-prefix suffix warmup, `174.5s` unified scheduler warmup, and `148`
+prefill graph cache entries. The dirty validation after running token warmup
+before logits warmup and skipping logits when token warmup succeeds wrote
+`/tmp/inference-bench-token-warm-skip-results/.../runs/20260711_122106` and
+landed at `210.6 / 21.9 / 970.2ms`, `1000/1000`. Startup moved in the intended
+direction: server readiness fell to `210.9s`, greedy suffix warmup fell to
+`78.5s`, unified scheduler warmup fell to `143.6s`, and the prefill graph cache
+fell to `124` entries. The queue profile still reported
+`runtime_prefill_graph_misses=0` and `runtime_decode_graph_misses=0`, so the
+shorter warmup did not push those skipped logits captures onto the request
+path. This does not close the score-facing long_output gap, but it reduces
+public-run timeout risk and removes startup graph work that greedy serving does
+not use.
+
 ## Priority for a focused (non-loop) session
 
 1. Prefill MFU (Issue 1) — biggest TTFT lever, ~2x, affects 3/5 benchmarks.

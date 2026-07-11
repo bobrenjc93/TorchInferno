@@ -11957,12 +11957,7 @@ def test_openai_greedy_common_prefix_suffix_warmup_captures_target_shapes(monkey
 
     assert model.fp8_calls == [(True, 2048), (False, 2048)]
     assert model.prefix_calls == [((8,), (1, 5), True)]
-    assert [call[:4] for call in model.ragged_calls] == [
-        ((2, 3), -16, 8, True),
-        ((4, 3), -16, 8, True),
-        ((2, 7), -16, 8, True),
-        ((4, 7), -16, 8, True),
-    ]
+    assert model.ragged_calls == []
     assert model.token_calls == [
         ((2, 3), -16, 8, True, 0.0),
         ((4, 3), -16, 8, True, 0.0),
@@ -11970,8 +11965,6 @@ def test_openai_greedy_common_prefix_suffix_warmup_captures_target_shapes(monkey
         ((4, 7), -16, 8, True, 0.0),
     ]
     assert model.token_only_calls == []
-    assert model.ragged_calls[0][4][0:3] == (5, 5, 0)
-    assert model.ragged_calls[0][4][8] == 5
     assert cache.reset_count == 3
 
     model.fp8_calls.clear()
@@ -11980,6 +11973,42 @@ def test_openai_greedy_common_prefix_suffix_warmup_captures_target_shapes(monkey
     model.token_calls.clear()
     model.token_only_calls.clear()
     cache.reset_count = 0
+    monkeypatch.setenv(
+        "TORCHINFERNO_OPENAI_WARMUP_ONLINE_GREEDY_COMMON_PREFIX_TOKEN_SUFFIX_LOGITS_PREFILL",
+        "1",
+    )
+    engine._warmup_online_greedy_common_prefix_suffix_prefill_graphs(
+        cache,
+        vocab_size=17,
+        cache_rows=12,
+        max_active=8,
+        max_seq_len=16,
+    )
+    assert [call[:4] for call in model.ragged_calls] == [
+        ((2, 3), -16, 8, True),
+        ((4, 3), -16, 8, True),
+        ((2, 7), -16, 8, True),
+        ((4, 7), -16, 8, True),
+    ]
+    assert model.ragged_calls[0][4][0:3] == (5, 5, 0)
+    assert model.ragged_calls[0][4][8] == 5
+    assert model.token_calls == [
+        ((2, 3), -16, 8, True, 0.0),
+        ((4, 3), -16, 8, True, 0.0),
+        ((2, 7), -16, 8, True, 0.0),
+        ((4, 7), -16, 8, True, 0.0),
+    ]
+
+    model.fp8_calls.clear()
+    model.prefix_calls.clear()
+    model.ragged_calls.clear()
+    model.token_calls.clear()
+    model.token_only_calls.clear()
+    cache.reset_count = 0
+    monkeypatch.delenv(
+        "TORCHINFERNO_OPENAI_WARMUP_ONLINE_GREEDY_COMMON_PREFIX_TOKEN_SUFFIX_LOGITS_PREFILL",
+        raising=False,
+    )
     engine._warmup_online_greedy_common_prefix_suffix_prefill_graphs(
         cache,
         vocab_size=17,
@@ -12032,15 +12061,7 @@ def test_openai_greedy_common_prefix_suffix_warmup_captures_target_shapes(monkey
         ((8,), (1, 111), True),
         ((8,), (1, 122), True),
     ]
-    assert [call[:4] for call in model.ragged_calls] == [
-        ((2, 16), -64, 8, True),
-        ((2, 32), -256, 8, True),
-        ((2, 32), -256, 8, False),
-        ((2, 64), -256, 8, True),
-        ((2, 64), -256, 8, False),
-        ((2, 16), -256, 8, True),
-        ((2, 16), -256, 8, False),
-    ]
+    assert model.ragged_calls == []
     assert model.token_calls == [
         ((2, 16), -64, 8, True, 0.0),
         ((2, 32), -256, 8, True, 0.0),
@@ -12137,6 +12158,13 @@ def test_openai_greedy_common_prefix_suffix_warmup_captures_target_shapes(monkey
         ((2, 16), -256, 8, True, 0.0),
         ((2, 16), -256, 8, False, 0.0),
     ]
+    assert [call[:4] for call in model.ragged_calls] == [
+        ((2, 32), -256, 8, True),
+        ((2, 32), -256, 8, False),
+        ((2, 64), -256, 8, True),
+        ((2, 64), -256, 8, False),
+    ]
+
 
 def test_openai_chunked_prefill_warmup_captures_cache_and_logits_dynamic_contexts(monkeypatch) -> None:
     monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_FP8_PREFILL", raising=False)

@@ -4528,6 +4528,10 @@ class OpenAICompletionEngine:
             96,
             minimum=1,
         )
+        warm_logits_with_token_suffix = env_flag(
+            "TORCHINFERNO_OPENAI_WARMUP_ONLINE_GREEDY_COMMON_PREFIX_TOKEN_SUFFIX_LOGITS_PREFILL",
+            False,
+        )
         suffixes_by_prefix: dict[int, list[int]] = {}
         for prefix_count in prefix_tokens:
             for suffix_count in suffix_tokens:
@@ -4658,53 +4662,71 @@ class OpenAICompletionEngine:
                             row_index_modes = (row_indices, None)
                         try:
                             for mode_row_indices in row_index_modes:
-                                ragged_prefill_graph(
-                                    suffix_ids,
-                                    cache,
-                                    seq_lens=seq_lens,
-                                    row_indices=mode_row_indices,
-                                    logit_positions=logit_positions,
-                                    context_len=_dynamic_prefix_prefill_context_len(
-                                        prefix_count,
-                                        suffix_count,
-                                        max_seq_len=max_seq_len,
-                                        max_dynamic_suffix=dynamic_max_suffix,
-                                    ),
-                                    src_prefix_row=src_prefix_row,
-                                )
-                                if (
+                                token_shape_warmed = False
+                                token_shape_requested = (
                                     token_warmup_enabled
                                     and suffix_count in token_suffix_tokens
                                     and batch_size in token_batch_sizes
-                                ):
-                                    token_context_len = _dynamic_prefix_prefill_context_len(
-                                        prefix_count,
-                                        suffix_count,
-                                        max_seq_len=max_seq_len,
-                                        max_dynamic_suffix=dynamic_max_suffix,
+                                )
+                                if token_shape_requested:
+                                    try:
+                                        token_context_len = _dynamic_prefix_prefill_context_len(
+                                            prefix_count,
+                                            suffix_count,
+                                            max_seq_len=max_seq_len,
+                                            max_dynamic_suffix=dynamic_max_suffix,
+                                        )
+                                        if callable(ragged_token_prefill_graph):
+                                            token_output = ragged_token_prefill_graph(
+                                                suffix_ids,
+                                                cache,
+                                                seq_lens=seq_lens,
+                                                row_indices=mode_row_indices,
+                                                logit_positions=logit_positions,
+                                                context_len=token_context_len,
+                                                src_prefix_row=src_prefix_row,
+                                                temperature=warmup_temperature,
+                                            )
+                                            token_shape_warmed = token_output is not None
+                                        if callable(ragged_token_only_prefill_graph):
+                                            token_only_output = ragged_token_only_prefill_graph(
+                                                suffix_ids,
+                                                cache,
+                                                seq_lens=seq_lens,
+                                                row_indices=mode_row_indices,
+                                                logit_positions=logit_positions,
+                                                context_len=token_context_len,
+                                                src_prefix_row=src_prefix_row,
+                                                temperature=warmup_temperature,
+                                            )
+                                            token_shape_warmed = (
+                                                token_shape_warmed or token_only_output is not None
+                                            )
+                                    except Exception as token_exc:
+                                        import sys as _gtpsys
+
+                                        print(
+                                            f"[WARMUP] {warmup_label} common-prefix token suffix graph "
+                                            f"row={row} prefix={prefix_count} suffix={suffix_count} "
+                                            f"batch={batch_size}: {token_exc}",
+                                            file=_gtpsys.stderr,
+                                            flush=True,
+                                        )
+                                if not token_shape_warmed or warm_logits_with_token_suffix:
+                                    ragged_prefill_graph(
+                                        suffix_ids,
+                                        cache,
+                                        seq_lens=seq_lens,
+                                        row_indices=mode_row_indices,
+                                        logit_positions=logit_positions,
+                                        context_len=_dynamic_prefix_prefill_context_len(
+                                            prefix_count,
+                                            suffix_count,
+                                            max_seq_len=max_seq_len,
+                                            max_dynamic_suffix=dynamic_max_suffix,
+                                        ),
+                                        src_prefix_row=src_prefix_row,
                                     )
-                                    if callable(ragged_token_prefill_graph):
-                                        ragged_token_prefill_graph(
-                                            suffix_ids,
-                                            cache,
-                                            seq_lens=seq_lens,
-                                            row_indices=mode_row_indices,
-                                            logit_positions=logit_positions,
-                                            context_len=token_context_len,
-                                            src_prefix_row=src_prefix_row,
-                                            temperature=warmup_temperature,
-                                        )
-                                    if callable(ragged_token_only_prefill_graph):
-                                        ragged_token_only_prefill_graph(
-                                            suffix_ids,
-                                            cache,
-                                            seq_lens=seq_lens,
-                                            row_indices=mode_row_indices,
-                                            logit_positions=logit_positions,
-                                            context_len=token_context_len,
-                                            src_prefix_row=src_prefix_row,
-                                            temperature=warmup_temperature,
-                                        )
                         except Exception as exc:
                             import sys as _gpsys
                             print(
