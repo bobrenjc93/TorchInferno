@@ -15476,6 +15476,10 @@ def test_openai_queue_profile_records_runtime_engine_stats(
         }
         prefill_packed_fixed_capacity_attempts = 4
         prefill_packed_fixed_capacity_accepts = 1
+        prefill_prefix_copy_batches = 2
+        prefill_prefix_copy_tokens = 147
+        prefill_prefix_copy_shared_tokens = 136
+        prefill_prefix_copy_masked_tail_tokens = 11
         prefill_packed_fixed_capacity_reject_reason_counts = {
             "capacity_grew": 2,
             "graph_returned_none": 1,
@@ -15817,6 +15821,10 @@ def test_openai_queue_profile_records_runtime_engine_stats(
             "runtime_prefill_packed_candidate_tokens": 31,
             "runtime_prefill_packed_fixed_capacity_attempts": 4,
             "runtime_prefill_packed_fixed_capacity_accepts": 1,
+            "runtime_prefill_prefix_copy_batches": 2,
+            "runtime_prefill_prefix_copy_tokens": 147,
+            "runtime_prefill_prefix_copy_shared_tokens": 136,
+            "runtime_prefill_prefix_copy_masked_tail_tokens": 11,
             "runtime_prefill_graph_capture_ms": 9.5,
             "runtime_prefill_graph_cache_evicted_entries": 128,
             "runtime_prefill_graph_cache_evictions": 2,

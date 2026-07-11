@@ -2175,6 +2175,17 @@ def test_continuous_batch_engine_can_skip_warm_row_prefix_copy(
     }
     assert any(rows is not None for rows in model.prefill_src_prefix_rows[:-1])
     assert model.prefill_src_prefix_rows[-1] is None
+    copy_call = next(
+        idx for idx, rows in enumerate(model.prefill_src_prefix_rows) if rows is not None
+    )
+    copy_context_len = model.prefill_context_lens[copy_call]
+    copy_row_count, copy_suffix_bucket = model.prefill_input_shapes[copy_call]
+    assert copy_context_len is not None and copy_context_len < 0
+    expected_copied_tokens = ((-copy_context_len) - copy_suffix_bucket) * copy_row_count
+    assert engine.stats.prefill_prefix_copy_batches == 1
+    assert engine.stats.prefill_prefix_copy_tokens == expected_copied_tokens
+    assert engine.stats.prefill_prefix_copy_shared_tokens == expected_copied_tokens
+    assert engine.stats.prefill_prefix_copy_masked_tail_tokens == 0
     assert engine.stats.prefill_prefix_copy_skipped_batches == 1
     assert engine.stats.prefill_prefix_copy_skipped_tokens == len(shared) * 2
 
@@ -2711,6 +2722,10 @@ def test_continuous_batch_engine_can_batch_mixed_prefix_hits(monkeypatch) -> Non
     assert any(rows is not None and len(rows) >= 3 for rows in model.prefill_src_prefix_rows)
     assert max(value for value in model.prefill_prefix_copy_lens if value is not None) == len(shared) + 3
     assert engine.stats.prefill_prefix_reuse_batches <= 2
+    assert engine.stats.prefill_prefix_copy_batches >= 1
+    assert engine.stats.prefill_prefix_copy_tokens > 0
+    assert engine.stats.prefill_prefix_copy_shared_tokens > 0
+    assert engine.stats.prefill_prefix_copy_masked_tail_tokens > 0
 
 
 def test_continuous_batch_engine_can_bucket_mixed_prefix_context(monkeypatch) -> None:

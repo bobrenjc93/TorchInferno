@@ -568,6 +568,10 @@ class ServingStats:
     prefill_packed_candidate_groups: int = 0
     prefill_packed_fixed_capacity_attempts: int = 0
     prefill_packed_fixed_capacity_accepts: int = 0
+    prefill_prefix_copy_batches: int = 0
+    prefill_prefix_copy_tokens: int = 0
+    prefill_prefix_copy_shared_tokens: int = 0
+    prefill_prefix_copy_masked_tail_tokens: int = 0
     prefill_prefix_copy_skipped_batches: int = 0
     prefill_prefix_copy_skipped_tokens: int = 0
     prefill_row_indices_omitted_batches: int = 0
@@ -3732,6 +3736,12 @@ class ContinuousBatchEngine:
                         source_prefix_rows.append(source_prefix_rows[0])
             if not mixed_prefixes and len(set(source_prefix_rows)) == 1:
                 source_prefix_rows = [source_prefix_rows[0]]
+            if source_prefix_rows and not skip_prefix_copy:
+                self._record_prefix_copy_volume(
+                    start_lens,
+                    suffix_bucket=suffix_bucket,
+                    context_len=context_len,
+                )
             shape_key = (
                 "prefix_graph:"
                 f"b{batch_bucket}:"
@@ -4179,6 +4189,36 @@ class ContinuousBatchEngine:
             profile_shape_key,
             elapsed_ms,
         )
+
+    def _record_prefix_copy_volume(
+        self,
+        start_lens: Sequence[int],
+        *,
+        suffix_bucket: int,
+        context_len: int | None,
+    ) -> None:
+        if not start_lens:
+            return
+        row_count = len(start_lens)
+        if context_len is None:
+            min_len = min(int(value) for value in start_lens)
+            max_len = max(int(value) for value in start_lens)
+            useful_tokens = sum(int(value) for value in start_lens)
+            copied_tokens = max_len * row_count
+            shared_tokens = min_len * row_count
+            masked_tail_tokens = max(0, copied_tokens - useful_tokens)
+        else:
+            if context_len < 0:
+                copy_len = (-int(context_len)) - int(suffix_bucket)
+            else:
+                copy_len = int(context_len) - int(suffix_bucket)
+            copied_tokens = max(0, copy_len) * row_count
+            shared_tokens = copied_tokens
+            masked_tail_tokens = 0
+        self.stats.prefill_prefix_copy_batches += 1
+        self.stats.prefill_prefix_copy_tokens += int(copied_tokens)
+        self.stats.prefill_prefix_copy_shared_tokens += int(shared_tokens)
+        self.stats.prefill_prefix_copy_masked_tail_tokens += int(masked_tail_tokens)
 
     def _record_fixed_capacity_packed_prefill_reject(self, reason: str) -> None:
         counts = self.stats.prefill_packed_fixed_capacity_reject_reason_counts
