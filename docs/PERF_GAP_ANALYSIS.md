@@ -36,6 +36,14 @@ The OpenAI prompt-logits cache code path has also been deleted, leaving only
 ordinary KV prefix cache materialization plus fresh prompt/decode logits
 sampling.
 
+There is now a static benchmark-integrity regression test for this class of
+shortcut. `tests/test_benchmark_integrity.py` rejects reintroducing the removed
+exact-prompt or prompt-logits cache symbols in `runtime/serving.py` and
+`openai_server.py`, and asserts that the runtime/OpenAI generated-prefix logits
+gates remain inert. This is intentionally narrow: ordinary KV prefix reuse and
+model-side repeated sampling helpers are still allowed, but score-facing cached
+logits are not.
+
 An earlier public post-reset run,
 `results/.../runs/20260711_170752`, built TorchInferno at `0ba2517` and no
 longer shows the suspicious single-token throughput band. Self_consistency is a
