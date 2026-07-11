@@ -15092,6 +15092,28 @@ are zero; the observed row already uses ordinary `request_prompt` KV hits for
 most requests, so the current fair target remains padded mixed-prefix prefill
 rather than a hidden full-prompt candidate route.
 
+A current-head multi_turn full-prompt candidate profile on `312e29e` wrote
+`/tmp/inference-bench-multi-candidates-312e-results/.../runs/20260711_225740`.
+It stayed in the same latency band as the public run (`222.0 / 38.2 /
+253.8ms`, `985/1000` correct) and remained cache-integrity clean: generated
+prefix store/reuse, prompt lookup, reusable-prefix logits, sample state,
+precomputed greedy tokens, and repeated-sample counters were all zero.
+Persistent and transient full-prompt candidate counters were also zero, while
+the route histogram was already `{"common_prefix": 125, "request_prompt":
+875}`. This rejects the hypothesis that a hidden full-prompt reuse route is
+available; the multi_turn gap remains the padded mixed-prefix prefill body
+(`2199.7ms` prefill graph GPU, `48.9%` padding).
+
+A follow-up greedy-large suffix-bucket split probe is also rejected. Enabling a
+default large-greedy split plus a `24` batch bucket saved `1472` padded model
+slots across `8` accepted split calls, but it fragmented the prefill schedule
+and regressed multi_turn to `297.1 / 35.5 / 326.9ms`, `982/1000` correct
+(`/tmp/inference-bench-multi-suffixsplit-312e-results/.../runs/20260711_231009`).
+Cache-integrity counters were still clean, so this was a normal runtime-policy
+regression, not a shortcut. Keep large-greedy suffix splitting opt-in/profiled;
+the next fair target needs a non-fragmenting packed or mixed-prefix prefill
+body rather than more small graph replays.
+
 The fixed-capacity packed-prefix probe is also rejected on current evidence.
 The long_output run with
 `TORCHINFERNO_CONTINUOUS_PACKED_RAGGED_PREFILL_FIXED_CAPACITY_GRAPH=1` accepted
