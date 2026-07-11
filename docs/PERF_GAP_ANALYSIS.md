@@ -15026,6 +15026,18 @@ prefill replay GPU time. The estimate is intentionally proportional and
 analysis-only, but it keeps old public artifacts useful for ranking the same
 non-fragmenting packed-prefix implementation target.
 
+The summary also now prints a phase-level decode-many row so the long_output
+target is visible without manually summing shape windows. On the same public
+artifact, TorchInferno long_output spent `6021.4ms` of decode-many GPU time over
+`123` calls and `518` internal steps, processing `25,539` model tokens,
+`29,408` padded slots, and `24,381` emitted tokens. That is `4049.1`
+emitted tok/s (`247.0us` per emitted token) and `4241.4` model tok/s
+(`235.8us` per model token), with `13.2%` decode padding and `4.5%`
+stop-tail overgeneration. This keeps the decode target concrete: reduce the
+high-active replay cost or padding/overgeneration in normal decode-many
+execution, not via exact prompt, prompt-logits, generated-prefix-logits, or
+repeat-state shortcuts.
+
 ## Priority for a focused (non-loop) session
 
 1. Prefill MFU (Issue 1) — biggest TTFT lever, ~2x, affects 3/5 benchmarks.

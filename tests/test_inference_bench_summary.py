@@ -7,6 +7,7 @@ from torchinferno.research.inference_bench import (
     QueueProfileSummary,
     _decode_graph_cache_counts,
     _decode_graph_symm_counts,
+    _decode_many_phase_rows,
     _hot_prefill_shape_rows,
     _phase_target,
     _prefill_packed_dynamic_target_rows,
@@ -1046,6 +1047,9 @@ def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) ->
     assert "hot_prefill" in text
     assert "b8:s16:p45-45:src1:mixed0" in text
     assert "hot_decode" in text
+    assert "[torchinferno decode-many phase]" in text
+    assert "emit_tok_s" in text
+    assert "overgen_pct" in text
     assert "packed_fi_ms" in text
     assert "packed_fi_saved" in text
     assert "packed_eager_ms" in text
@@ -1527,6 +1531,54 @@ def test_inference_bench_summary_derives_decode_graph_cache_counts_from_shapes()
             "runtime_decode_graph_cache_live_cache_bucket_counts": {"cache256": 4},
         }
     ) == {"cache256": 4}
+
+
+def test_decode_many_phase_rows_summarize_throughput_and_overgeneration() -> None:
+    rows = _decode_many_phase_rows(
+        [
+            QueueProfileSummary(
+                event="online_batcher_quiescent",
+                temperature=0.0,
+                max_tokens=96,
+                submitted_requests=8,
+                finished_events=8,
+                fields={
+                    "runtime_decode_many_calls": 2,
+                    "runtime_decode_many_steps": 6,
+                    "runtime_decode_many_model_gpu_ms": 15.0,
+                    "runtime_decode_many_shape_model_tokens": {"decode_many:b8/8": 24},
+                    "runtime_decode_many_shape_padded_tokens": {"decode_many:b8/8": 30},
+                    "runtime_decode_many_shape_emitted_tokens": {"decode_many:b8/8": 15},
+                    "runtime_decode_many_shape_skipped_tokens": {"decode_many:b8/8": 4},
+                    "runtime_decode_many_shape_overgenerated_tokens": {
+                        "decode_many:b8/8": 3,
+                    },
+                },
+            )
+        ]
+    )
+
+    assert rows == [
+        (
+            "0.0",
+            "96",
+            "2",
+            "6",
+            "15.0",
+            "24",
+            "30",
+            "15",
+            "4",
+            "3",
+            "20.0%",
+            "16.7%",
+            "12.5%",
+            "1000.0",
+            "1600.0",
+            "1000.0",
+            "625.0",
+        )
+    ]
 
 
 def test_inference_bench_summary_leaves_decode_many_window_ms_blank_without_timing(

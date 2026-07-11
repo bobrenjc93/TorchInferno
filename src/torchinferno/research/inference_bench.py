@@ -1378,6 +1378,35 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
             )
             lines.append("")
 
+        decode_phase_rows = _decode_many_phase_rows(queue_profiles)
+        if decode_phase_rows:
+            lines.append("[torchinferno decode-many phase]")
+            lines.extend(
+                _format_table(
+                    (
+                        "temp",
+                        "max_tokens",
+                        "calls",
+                        "steps",
+                        "gpu_ms",
+                        "model_tokens",
+                        "padded_tokens",
+                        "emitted",
+                        "skipped",
+                        "overgen",
+                        "pad_pct",
+                        "skip_pct",
+                        "overgen_pct",
+                        "emit_tok_s",
+                        "model_tok_s",
+                        "us_emit",
+                        "us_model",
+                    ),
+                    decode_phase_rows,
+                )
+            )
+            lines.append("")
+
         decode_window_rows = _decode_many_step_window_rows(queue_profiles)
         if decode_window_rows:
             lines.append("[torchinferno decode-many step windows]")
@@ -4363,6 +4392,101 @@ def _hot_decode_shape_rows(
                 ),
                 _fmt_value(decode_many_overgen_tokens),
                 _fmt_value(fields.get("runtime_decode_graph_cache_live_entries")),
+            )
+        )
+    return rows
+
+
+def _decode_many_phase_rows(
+    profiles: Sequence[QueueProfileSummary],
+) -> list[tuple[str, ...]]:
+    rows: list[tuple[str, ...]] = []
+    for profile in profiles:
+        fields = profile.fields
+        calls = _numeric_field(fields, "runtime_decode_many_calls")
+        steps = _numeric_field(fields, "runtime_decode_many_steps")
+        gpu_ms = _numeric_field(fields, "runtime_decode_many_model_gpu_ms")
+        model_tokens = _numeric_field(fields, "runtime_decode_many_model_tokens")
+        if model_tokens is None:
+            model_tokens = _sum_numeric_mapping(
+                fields.get("runtime_decode_many_shape_model_tokens")
+            )
+        padded_tokens = _numeric_field(fields, "runtime_decode_many_padded_tokens")
+        if padded_tokens is None:
+            padded_tokens = _sum_numeric_mapping(
+                fields.get("runtime_decode_many_shape_padded_tokens")
+            )
+        emitted_tokens = _numeric_field(fields, "runtime_decode_many_emitted_tokens")
+        if emitted_tokens is None:
+            emitted_tokens = _sum_numeric_mapping(
+                fields.get("runtime_decode_many_shape_emitted_tokens")
+            )
+        skipped_tokens = _numeric_field(fields, "runtime_decode_many_skipped_tokens")
+        if skipped_tokens is None:
+            skipped_tokens = _sum_numeric_mapping(
+                fields.get("runtime_decode_many_shape_skipped_tokens")
+            )
+        overgenerated_tokens = _numeric_field(
+            fields,
+            "runtime_decode_many_overgenerated_tokens",
+        )
+        if overgenerated_tokens is None:
+            overgenerated_tokens = _sum_numeric_mapping(
+                fields.get("runtime_decode_many_shape_overgenerated_tokens")
+            )
+        if not any(
+            isinstance(value, (int, float)) and float(value) > 0.0
+            for value in (
+                calls,
+                steps,
+                gpu_ms,
+                model_tokens,
+                padded_tokens,
+                emitted_tokens,
+                skipped_tokens,
+                overgenerated_tokens,
+            )
+        ):
+            continue
+        rows.append(
+            (
+                _fmt_value(profile.temperature),
+                _fmt_value(profile.max_tokens),
+                _fmt_value(_int_if_whole(calls) if calls is not None else None),
+                _fmt_value(_int_if_whole(steps) if steps is not None else None),
+                _fmt_value(gpu_ms),
+                _fmt_value(
+                    _int_if_whole(model_tokens) if model_tokens is not None else None
+                ),
+                _fmt_value(
+                    _int_if_whole(padded_tokens) if padded_tokens is not None else None
+                ),
+                _fmt_value(
+                    _int_if_whole(emitted_tokens) if emitted_tokens is not None else None
+                ),
+                _fmt_value(
+                    _int_if_whole(skipped_tokens) if skipped_tokens is not None else None
+                ),
+                _fmt_value(
+                    _int_if_whole(overgenerated_tokens)
+                    if overgenerated_tokens is not None
+                    else None
+                ),
+                _fmt_pct(
+                    max(0.0, float(padded_tokens or 0.0) - float(model_tokens or 0.0)),
+                    float(padded_tokens or 0.0),
+                ),
+                _fmt_pct(float(skipped_tokens or 0.0), float(model_tokens or 0.0)),
+                _fmt_pct(
+                    float(overgenerated_tokens or 0.0),
+                    float(model_tokens or 0.0),
+                ),
+                _fmt_value(
+                    _ratio_or_none(emitted_tokens, gpu_ms, scale=1000.0)
+                ),
+                _fmt_value(_ratio_or_none(model_tokens, gpu_ms, scale=1000.0)),
+                _fmt_value(_ratio_or_none(gpu_ms, emitted_tokens, scale=1000.0)),
+                _fmt_value(_ratio_or_none(gpu_ms, model_tokens, scale=1000.0)),
             )
         )
     return rows
