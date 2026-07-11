@@ -32,6 +32,19 @@ inert. The old constructor/env flags can no longer disable decode-many or
 decode graph capture after the cached-logits implementation has been removed;
 ordinary KV prefix reuse and finished-prefix KV diagnostics remain separate.
 
+The latest public post-reset run,
+`results/.../runs/20260711_170752`, built TorchInferno at `0ba2517` and no
+longer shows the suspicious single-token throughput band. Self_consistency is a
+fair narrow TorchInferno win at `70.4 / 0.0 / 89.1ms`, `11.2 tok/s`, versus
+vLLM `77.2 / 0.0 / 93.5ms`, `10.7 tok/s`. Long_output remains the largest fair
+gap at TorchInferno `193.7 / 19.0 / 845.2ms`, `40.7 tok/s`, versus vLLM
+`46.4 / 15.2 / 569.7ms`, `61.7 tok/s`. The TorchInferno queue profile reports
+`runtime_generated_prefix_store_requests=0`,
+`runtime_generated_prefix_reuse_requests=0`,
+`runtime_generated_prefix_reuse_tokens=0`, and
+`runtime_prompt_lookup_accepted_tokens=0`; remaining reuse is ordinary
+`common_prefix` KV reuse.
+
 ## Current 20260711 guarded long-output baseline
 
 A current-head TorchInferno-only `long_output` run on pushed `8b8cc67`, through
