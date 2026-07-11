@@ -12043,8 +12043,8 @@ def test_openai_greedy_common_prefix_suffix_warmup_captures_target_shapes(monkey
     model.token_only_calls.clear()
     cache.reset_count = 0
     monkeypatch.setenv("TORCHINFERNO_OPENAI_WARMUP_ONLINE_GREEDY_COMMON_PREFIX_TOKENS", "45")
-    monkeypatch.setenv("TORCHINFERNO_OPENAI_WARMUP_ONLINE_GREEDY_COMMON_PREFIX_SUFFIX_TOKENS", "64")
-    monkeypatch.setenv("TORCHINFERNO_OPENAI_WARMUP_ONLINE_GREEDY_COMMON_PREFIX_SUFFIX_BATCHES", "16")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_WARMUP_ONLINE_GREEDY_COMMON_PREFIX_SUFFIX_TOKENS", "96")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_WARMUP_ONLINE_GREEDY_COMMON_PREFIX_SUFFIX_BATCHES", "16,32")
     monkeypatch.setenv("TORCHINFERNO_OPENAI_WARMUP_ONLINE_GREEDY_COMMON_PREFIX_EXTRA_PAIRS", "")
     monkeypatch.setenv("TORCHINFERNO_OPENAI_WARMUP_ONLINE_GREEDY_COMMON_PREFIX_TOKEN_SUFFIX_PREFILL", "0")
     monkeypatch.delenv(
@@ -12054,15 +12054,17 @@ def test_openai_greedy_common_prefix_suffix_warmup_captures_target_shapes(monkey
     engine._warmup_online_greedy_common_prefix_suffix_prefill_graphs(
         cache,
         vocab_size=17,
-        cache_rows=32,
-        max_active=16,
+        cache_rows=64,
+        max_active=32,
         max_seq_len=256,
         warmup_max_tokens=128,
     )
-    assert model.prefix_calls == [((16,), (1, 45), True)]
+    assert model.prefix_calls == [((32,), (1, 45), True)]
     assert [call[:4] for call in model.ragged_calls] == [
-        ((16, 64), -128, 16, True),
-        ((16, 64), -128, 16, False),
+        ((16, 96), -256, 32, True),
+        ((16, 96), -256, 32, False),
+        ((32, 96), -256, 32, True),
+        ((32, 96), -256, 32, False),
     ]
     assert model.token_calls == []
     assert model.token_only_calls == []
@@ -12078,13 +12080,14 @@ def test_openai_greedy_common_prefix_suffix_warmup_captures_target_shapes(monkey
     engine._warmup_online_greedy_common_prefix_suffix_prefill_graphs(
         cache,
         vocab_size=17,
-        cache_rows=32,
-        max_active=16,
+        cache_rows=64,
+        max_active=32,
         max_seq_len=256,
         warmup_max_tokens=128,
     )
     assert [call[:4] for call in model.ragged_calls] == [
-        ((16, 64), -128, 16, True),
+        ((16, 96), -256, 32, True),
+        ((32, 96), -256, 32, True),
     ]
 
     model.fp8_calls.clear()

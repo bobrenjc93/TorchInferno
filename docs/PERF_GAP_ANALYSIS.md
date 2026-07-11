@@ -13814,24 +13814,34 @@ at `1000/1000`. The benchmark row landed at `205.5 / 22.0 / 1003.8ms`; treat
 this as a small TTFT/preparation cleanup, not a closure of the long_output gap,
 because prefill wall (`6.56s`) and decode-many GPU (`8.06s`) still dominate.
 
-Greedy short common-prefix suffix warmup now also captures the dense active-row
-dynamic-prefix graph keys for batch `>=16` and suffix `>=64`. This targets the
-long_output request-time dense graph miss seen after the dense-row cleanup:
+Greedy short common-prefix suffix warmup now captures dense active-row
+dynamic-prefix graph keys only for the observed long_output dense suffix bucket:
+batch `16..32`, suffix `96`. The broader first pass (`batch >=16`,
+`suffix >=64`) targeted the request-time miss seen after the dense-row cleanup:
 `ragged_prefill:b16:s96:rows0:ctx-256:src1` captured on the request path for
 `1126.9ms` of GPU time in
 `/tmp/inference-bench-long-output-dense-row-info-results/.../runs/20260711_023053`.
-The sync-timed patched validation
+It did remove captures in
 `/tmp/inference-bench-long-output-dense-dynamic-warm-results/.../runs/20260711_025057`
-landed at `220.2 / 21.4 / 974.2ms`, `1000/1000` correct, with
-`runtime_prefill_graph_captures=0`, `61` prefill graph hits, and no misses. The
-no-sync confirmation
+(`220.2 / 21.4 / 974.2ms`, `1000/1000`, `61` prefill graph hits, no misses)
+and in the no-sync confirmation
 `/tmp/inference-bench-long-output-dense-dynamic-warm-nosync-results/.../runs/20260711_025753`
-landed at `237.2 / 21.0 / 972.3ms`, `1000/1000` correct, with
-`runtime_prefill_graph_captures=0`, `51` hits, no misses, `192/192` live prefill
-graphs, and `19` startup evictions. The change buys deterministic request-path
-capture avoidance, not a score-facing win yet; startup warmup rose to `228.6s`
-total (`111.5s` for the short-greedy suffix pass) and the long_output row
-remains decode-bound.
+(`237.2 / 21.0 / 972.3ms`, `1000/1000`, no captures, no misses), but it raised
+TP warmup to `228.6s`, spent `111.5s` in the short-greedy suffix pass, and
+caused `19` startup prefill-graph evictions.
+
+Narrowing all the way to `b16:s96` was too tight:
+`/tmp/inference-bench-long-output-dense-dynamic-narrow-sync-results/.../runs/20260711_031719`
+landed at `249.3 / 20.8 / 1020.7ms`, `1000/1000`, but still captured
+`ragged_prefill:b32:s96:rows0:ctx-256:src1` on the request path for `1870.0ms`.
+The final `s96`-only batch range validation
+`/tmp/inference-bench-long-output-dense-dynamic-s96-sync-results/.../runs/20260711_032444`
+landed at `207.1 / 21.8 / 989.7ms`, `1000/1000`, with
+`runtime_prefill_graph_captures=0`, `61` prefill graph hits, no misses, `10`
+startup evictions, `217.6s` TP warmup, and `102.9s` in the short-greedy suffix
+pass. This keeps deterministic request-path capture avoidance while avoiding
+the broad `s64/s128` startup cost; the long_output row still needs cheaper
+prefill/decode bodies for a score-facing closure.
 
 ## Priority for a focused (non-loop) session
 

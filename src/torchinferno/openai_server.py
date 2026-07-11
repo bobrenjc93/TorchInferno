@@ -4491,9 +4491,19 @@ class OpenAICompletionEngine:
             16,
             minimum=1,
         )
+        greedy_dense_dynamic_max_batch = env_int(
+            "TORCHINFERNO_OPENAI_WARMUP_ONLINE_GREEDY_COMMON_PREFIX_DENSE_DYNAMIC_MAX_BATCH",
+            32,
+            minimum=1,
+        )
         greedy_dense_dynamic_min_suffix = env_int(
             "TORCHINFERNO_OPENAI_WARMUP_ONLINE_GREEDY_COMMON_PREFIX_DENSE_DYNAMIC_MIN_SUFFIX",
-            64,
+            96,
+            minimum=1,
+        )
+        greedy_dense_dynamic_max_suffix = env_int(
+            "TORCHINFERNO_OPENAI_WARMUP_ONLINE_GREEDY_COMMON_PREFIX_DENSE_DYNAMIC_MAX_SUFFIX",
+            96,
             minimum=1,
         )
         suffixes_by_prefix: dict[int, list[int]] = {}
@@ -4608,7 +4618,9 @@ class OpenAICompletionEngine:
                             and dynamic_max_suffix > 0
                             and suffix_count <= dynamic_max_suffix
                             and batch_size >= greedy_dense_dynamic_min_batch
+                            and batch_size <= greedy_dense_dynamic_max_batch
                             and suffix_count >= greedy_dense_dynamic_min_suffix
+                            and suffix_count <= greedy_dense_dynamic_max_suffix
                         )
                         if (
                             batch_size <= row
