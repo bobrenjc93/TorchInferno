@@ -10289,7 +10289,7 @@ def test_openai_online_admit_per_step_cap_uses_greedy_mid_default(monkeypatch) -
     monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_ADMIT_PER_STEP_CAP", raising=False)
     monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_MID_ADMIT_PER_STEP_CAP", raising=False)
 
-    assert _online_admit_per_step_cap(temperature=0.0, max_tokens=64) == 64
+    assert _online_admit_per_step_cap(temperature=0.0, max_tokens=64) == 24
     assert _online_admit_per_step_cap(temperature=0.0, max_tokens=256) == 64
     assert _online_admit_per_step_cap(temperature=0.7, max_tokens=256) == 128
     assert _online_admit_per_step_cap(temperature=0.7, max_tokens=300) == 48
@@ -17710,7 +17710,7 @@ def test_openai_tensor_parallel_online_batcher_profile_snapshots(
     assert final_record["collect_idle_arrivals"] is False
     assert final_record["admit_min_free_rows"] == 4
     assert final_record["admit_min_ready_requests"] == 8
-    assert final_record["admit_per_step_cap"] == 64
+    assert final_record["admit_per_step_cap"] == 24
     assert final_record["prefill_token_budget"] == 0
     assert final_record["enable_ragged_decode"] is True
     assert final_record["use_decode_many"] is True

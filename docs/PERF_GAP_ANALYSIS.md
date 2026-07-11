@@ -34,6 +34,25 @@ profiling no-sync and compact while letting the next default run identify which
 `prefix_graph:b*:s*:p*:src*:mixed*` shapes own queue-to-first and
 submit-to-first latency.
 
+The first current-head run with that attribution wrote
+`/tmp/inference-bench-long-output-first-shape-e2ef272-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-long-output-first-shape-e2ef272/runs/20260711_035849`
+and landed at `229.6 / 21.7 / 993.3ms`, `1000/1000` correct. It showed all
+first tokens came from prefill, with `b32` waves owning a slow submit-to-first
+tail: `prefix_graph:b32:s64:p111-111:src1:mixed0` covered `177` requests at
+`182.3ms` median submit-to-first and `b32:s96` covered `28` requests at
+`180.3ms`, versus `b24:s64` at `110.7ms` and `b16:s64` at `92.3ms`.
+
+Promote the greedy-short admission cap from `64` to `24`. The current-head A/B
+with `TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_ADMIT_PER_STEP_CAP=24` wrote
+`/tmp/inference-bench-long-output-admit24-e2ef272-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-long-output-admit24-e2ef272/runs/20260711_040627`
+and improved long_output to `207.4 / 21.5 / 938.1ms`, p99
+`489.5 / 29.9 / 1764.4ms`, throughput `36.4 tok/s`, with `1000/1000`
+correct. The queue profile confirms the mechanism: `b32` first-token shapes
+disappeared, queue-to-submit improved `90.5 -> 82.6ms`, submit-to-first
+improved `125.7 -> 110.8ms`, and decode-many model tokens fell
+`31.1K -> 27.8K`. few_shot remains outside this policy because it uses
+`max_tokens=256` and stays on the greedy-mid cap.
+
 ## Public 20260710_170747 startup failure and symm-mem warmup fix
 
 The latest public pointer advanced to

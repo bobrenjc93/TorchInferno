@@ -371,11 +371,14 @@ def _online_admit_per_step_cap(*, temperature: float, max_tokens: int) -> int | 
         minimum=1,
     ):
         # Long-output-style greedy short streams are prefill/admission sensitive
-        # but still decode with the same active-row cap. Local TP8 A/B on 70B:
-        # 64 cut long_output TTFT/E2E to 311.6/1374.3ms while 96 regressed.
+        # but still decode with the same active-row cap. Current TP8 70B
+        # first-token attribution showed b32 prefix-prefill waves own the slow
+        # submit-to-first tail; capping new admissions at 24 keeps those waves on
+        # the warmed b24 bucket and improved long_output 229.6/21.7/993.3ms ->
+        # 207.4/21.5/938.1ms with 100% correctness.
         default_cap = env_int(
             "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_ADMIT_PER_STEP_CAP",
-            64,
+            24,
             minimum=0,
         )
     if temperature <= 0.0 and max_tokens > env_int(
