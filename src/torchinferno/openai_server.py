@@ -7275,6 +7275,27 @@ class OpenAICompletionEngine:
                 record["runtime_cache_max_seq_len"] = cache_max_seq_len
             if cache_rows is not None:
                 record["runtime_cache_rows"] = cache_rows
+        reusable_prefixes = getattr(runtime_engine, "reusable_prefixes", None)
+        if isinstance(reusable_prefixes, Mapping):
+            logits_entries = 0
+            logits_tokens = 0
+            sample_state_entries = 0
+            greedy_token_entries = 0
+            for prefix in reusable_prefixes.values():
+                tokens = getattr(prefix, "tokens", ())
+                token_count = len(tokens) if isinstance(tokens, tuple) else 0
+                if getattr(prefix, "logits", None) is not None:
+                    logits_entries += 1
+                    logits_tokens += token_count
+                if getattr(prefix, "sample_state", None) is not None:
+                    sample_state_entries += 1
+                if getattr(prefix, "greedy_token", None) is not None:
+                    greedy_token_entries += 1
+            record["runtime_reusable_prefix_entries"] = len(reusable_prefixes)
+            record["runtime_reusable_prefix_logits_entries"] = logits_entries
+            record["runtime_reusable_prefix_logits_tokens"] = logits_tokens
+            record["runtime_reusable_prefix_sample_state_entries"] = sample_state_entries
+            record["runtime_reusable_prefix_greedy_token_entries"] = greedy_token_entries
         model = getattr(runtime_engine, "model", None)
         ragged_prefill_graphs = getattr(model, "_ragged_prefill_logits_graphs", None)
         if isinstance(ragged_prefill_graphs, Mapping):

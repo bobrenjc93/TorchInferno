@@ -436,6 +436,11 @@ def _write_inference_bench_run(tmp_path) -> None:
         "runtime_prompt_lookup_requests": 3,
         "runtime_prompt_lookup_proposed_tokens": 10,
         "runtime_prompt_lookup_accepted_tokens": 4,
+        "runtime_reusable_prefix_entries": 5,
+        "runtime_reusable_prefix_logits_entries": 2,
+        "runtime_reusable_prefix_logits_tokens": 34,
+        "runtime_reusable_prefix_sample_state_entries": 1,
+        "runtime_reusable_prefix_greedy_token_entries": 1,
         "runtime_generated_prefix_store_requests": 12,
         "runtime_generated_prefix_reuse_requests": 3,
         "runtime_generated_prefix_reuse_tokens": 33,
@@ -1128,6 +1133,10 @@ def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) ->
     assert "[torchinferno cache integrity]" in text
     assert "prompt_lookup_req" in text
     assert "prompt_lookup_accept" in text
+    assert "prefix_logits" in text
+    assert "prefix_logit_tok" in text
+    assert "prefix_sample" in text
+    assert "prefix_greedy" in text
     assert "repeat_hits" in text
     assert "review" in text
     assert "[long_output provider gaps vs torchinferno]" in text

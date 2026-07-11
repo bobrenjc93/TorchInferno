@@ -16293,6 +16293,46 @@ def test_openai_queue_profile_progress_skips_shape_details_by_default(
     }
 
 
+def test_openai_queue_profile_records_reusable_prefix_payloads(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile_path = tmp_path / "queue-profile.jsonl"
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_QUEUE_PROFILE_JSONL", str(profile_path))
+    engine = _cache_only_engine()
+
+    class RuntimeEngine:
+        reusable_prefixes = {
+            "kv-only": types.SimpleNamespace(
+                tokens=(1, 2, 3),
+                logits=None,
+                sample_state=None,
+                greedy_token=None,
+            ),
+            "logits": types.SimpleNamespace(
+                tokens=(4, 5),
+                logits=object(),
+                sample_state=None,
+                greedy_token=None,
+            ),
+            "sampled": types.SimpleNamespace(
+                tokens=(6,),
+                logits=None,
+                sample_state=object(),
+                greedy_token=7,
+            ),
+        }
+
+    engine._record_runtime_engine_queue_profile("online_batcher", RuntimeEngine())
+
+    record = json.loads(profile_path.read_text().splitlines()[0])
+    assert record["runtime_reusable_prefix_entries"] == 3
+    assert record["runtime_reusable_prefix_logits_entries"] == 1
+    assert record["runtime_reusable_prefix_logits_tokens"] == 2
+    assert record["runtime_reusable_prefix_sample_state_entries"] == 1
+    assert record["runtime_reusable_prefix_greedy_token_entries"] == 1
+
+
 def test_openai_queue_profile_graph_shape_limit_keeps_large_cache_visible(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

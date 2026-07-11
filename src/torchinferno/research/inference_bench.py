@@ -350,6 +350,11 @@ _QUEUE_PROFILE_FIELDS = (
     "runtime_prompt_lookup_requests",
     "runtime_prompt_lookup_proposed_tokens",
     "runtime_prompt_lookup_accepted_tokens",
+    "runtime_reusable_prefix_entries",
+    "runtime_reusable_prefix_logits_entries",
+    "runtime_reusable_prefix_logits_tokens",
+    "runtime_reusable_prefix_sample_state_entries",
+    "runtime_reusable_prefix_greedy_token_entries",
     "runtime_generated_prefix_store_requests",
     "runtime_generated_prefix_reuse_requests",
     "runtime_generated_prefix_reuse_tokens",
@@ -982,6 +987,10 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
                         "prompt_lookup_req",
                         "prompt_lookup_prop",
                         "prompt_lookup_accept",
+                        "prefix_logits",
+                        "prefix_logit_tok",
+                        "prefix_sample",
+                        "prefix_greedy",
                         "repeat_hits",
                         "repeat_tokens",
                         "status",
@@ -2866,6 +2875,22 @@ def _cache_integrity_rows(
             fields,
             "runtime_repeated_sample_state_tokens",
         )
+        prefix_logits = _cache_integrity_counter(
+            fields,
+            "runtime_reusable_prefix_logits_entries",
+        )
+        prefix_logit_tokens = _cache_integrity_counter(
+            fields,
+            "runtime_reusable_prefix_logits_tokens",
+        )
+        prefix_sample_state = _cache_integrity_counter(
+            fields,
+            "runtime_reusable_prefix_sample_state_entries",
+        )
+        prefix_greedy = _cache_integrity_counter(
+            fields,
+            "runtime_reusable_prefix_greedy_token_entries",
+        )
         review_values = (
             gen_store,
             gen_reuse,
@@ -2873,6 +2898,10 @@ def _cache_integrity_rows(
             prompt_requests,
             prompt_proposed,
             prompt_accepted,
+            prefix_logits,
+            prefix_logit_tokens,
+            prefix_sample_state,
+            prefix_greedy,
             repeated_hits,
             repeated_tokens,
         )
@@ -2887,6 +2916,10 @@ def _cache_integrity_rows(
                 _fmt_cache_integrity_counter(prompt_requests),
                 _fmt_cache_integrity_counter(prompt_proposed),
                 _fmt_cache_integrity_counter(prompt_accepted),
+                _fmt_cache_integrity_counter(prefix_logits),
+                _fmt_cache_integrity_counter(prefix_logit_tokens),
+                _fmt_cache_integrity_counter(prefix_sample_state),
+                _fmt_cache_integrity_counter(prefix_greedy),
                 _fmt_cache_integrity_counter(repeated_hits),
                 _fmt_cache_integrity_counter(repeated_tokens),
                 "review" if any(value > 0 for value in review_values) else "clean",

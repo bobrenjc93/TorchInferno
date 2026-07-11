@@ -15038,6 +15038,28 @@ high-active replay cost or padding/overgeneration in normal decode-many
 execution, not via exact prompt, prompt-logits, generated-prefix-logits, or
 repeat-state shortcuts.
 
+The latest public run remains `20260711_210242` on TorchInferno `a8874cd`.
+Cache integrity is clean on the existing shortcut counters: generated-prefix
+store/reuse, prompt lookup, and repeated-sample hits are all zero. The earlier
+exact-prompt logits reuse commit `e887422` is already reverted by `c11dcaf`,
+and follow-up commits removed or inerted the other prompt/generation logits
+cache paths. A new queue-profile guardrail now records whether any reusable
+prefix entry actually carries logits, sample state, or a precomputed greedy
+token; the inference-bench cache-integrity table marks those payloads as
+`review`. Re-rendering `20260711_210242` shows the new fields as zero on old
+artifacts, preserving the clean verdict while making future regressions easier
+to catch even if they use different function names.
+
+The fixed-capacity packed-prefix probe is also rejected on current evidence.
+The long_output run with
+`TORCHINFERNO_CONTINUOUS_PACKED_RAGGED_PREFILL_FIXED_CAPACITY_GRAPH=1` accepted
+zero of `58` attempts (`capacity_grew=58`) and regressed to `36.8 tok/s`.
+The tree_of_thought run accepted `122/229` attempts but saved only `80` model
+tokens, carried `graph_returned_none` and `capacity_grew` rejects, and regressed
+to `98.5 / 44.1 / 135.2ms` with `957/992` correctness. Keep the path opt-in;
+the fair prefill target remains a non-fragmenting cached-prefix suffix body,
+not a static-capacity graph that changes request-path shape churn.
+
 ## Priority for a focused (non-loop) session
 
 1. Prefill MFU (Issue 1) — biggest TTFT lever, ~2x, affects 3/5 benchmarks.
