@@ -13678,6 +13678,20 @@ tree median improvement versus the pushed `8ff3638` full-suite tree row
 (`57.9 / 38.0 / 80.5ms`), but it does not change the larger sampled-prefix and
 decode-throughput priorities.
 
+The pushed-head `7a025c4` full-suite validation wrote
+`/tmp/inference-bench-7a025-full-results/.../runs/20260711_001911` and completed
+all rows: few_shot `186.0 / 34.4 / 213.4ms`, self_consistency
+`24.4 / 0.0 / 25.1ms`, multi_turn `220.2 / 36.0 / 249.3ms`,
+tree_of_thought `53.7 / 35.9 / 75.6ms`, and long_output
+`236.7 / 21.3 / 989.2ms`. Correctness stayed in band
+(`977/1000`, `1000/1000`, `979/1000`, `958/992`, `1000/1000`). The tree row
+held the intended structural fix in the full suite:
+`runtime_decode_graph_hits=355`, `runtime_decode_graph_replays=355`, and
+`runtime_decode_graph_misses=0`; the previous `8ff3638` full-suite tree row had
+`6` sampled decode graph misses. Treat the few_shot TTFT/E2E regression as
+unrelated run variance until it repeats, because the routing change does not
+touch that row's prompt path and decode graph misses stayed at zero there.
+
 ## Priority for a focused (non-loop) session
 
 1. Prefill MFU (Issue 1) — biggest TTFT lever, ~2x, affects 3/5 benchmarks.
