@@ -171,6 +171,22 @@ median `submit2first` stayed high at `120.3ms`. Keep the splitter diagnostic;
 the profile still points at a non-fragmenting packed cached-prefix body rather
 than recursive suffix fragmentation.
 
+A pure token-only prefix-prefill probe on current head `bd87d04` is also
+rejected for `long_output`. The run enabled
+`TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_TOKEN_ONLY_GRAPH=1`, disabled the
+logits+token token-prefill warmup, enabled token-only suffix warmup, and wrote
+`/tmp/inference-bench-long-output-tokenonly-bd87d04-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-long-output-tokenonly-bd87d04/runs/20260711_080807`.
+It completed `1000/1000` correct but landed at `219.0 / 22.2 / 964.4ms`, p99
+`577.5 / 33.8 / 1891.3ms`, worse than the latest clean long-output control
+band. Startup also paid a large cost: common-prefix prefill warmup took
+`167.5s`, readiness was `286.3s`, memory reached roughly `93GB/GPU`, and the
+final profile had `192` live prefill graph entries with `10` evictions. Runtime
+telemetry did not expose a new bottleneck removal: prefill sample time was
+already `0.0ms` in the control, while the token-only run still executed `59`
+padded prefix graph replays and reported `31.6K` avoidable packed-candidate
+tokens. Keep token-only prefix prefill diagnostic-only; it does not replace the
+needed non-fragmenting cached-prefix prefill body.
+
 ## Current no-sync prefill-shape telemetry
 
 A dirty-tree telemetry validation after `be39510` wrote
