@@ -6167,7 +6167,7 @@ class ContinuousBatchEngine:
         return state
 
     def _start_prefill_graph_gpu_timer(self) -> tuple[object, object] | None:
-        if not self.profile_timings or self.device.type != "cuda":
+        if not self._prefill_graph_gpu_timing_enabled():
             return None
         try:
             start = torch.cuda.Event(enable_timing=True)
@@ -6176,6 +6176,16 @@ class ContinuousBatchEngine:
             return start, end
         except Exception:
             return None
+
+    def _prefill_graph_gpu_timing_enabled(self) -> bool:
+        if self.device.type != "cuda":
+            return False
+        if self.profile_timings:
+            return True
+        env_name = "TORCHINFERNO_CONTINUOUS_PREFILL_GRAPH_GPU_EVENT_TIMING"
+        if env_name in os.environ:
+            return env_flag(env_name, False)
+        return _queue_profile_counts_enabled()
 
     def _stop_prefill_graph_gpu_timer(
         self,

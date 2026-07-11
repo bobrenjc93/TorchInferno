@@ -3643,6 +3643,45 @@ def test_continuous_batch_engine_records_prefill_graph_shapes_for_queue_profile_
     assert miss_engine.stats.prefill_shape_graph_miss_counts == {miss_shape_key: 1}
 
 
+def test_continuous_batch_engine_prefill_graph_gpu_timing_gate(
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_QUEUE_PROFILE_JSONL", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_QUEUE_PROFILE", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_PREFILL_GRAPH_GPU_EVENT_TIMING", raising=False)
+    engine = ContinuousBatchEngine(
+        _CaptureReportingSelectedLogitsToyModel([True]),
+        device=torch.device("cpu"),
+        max_active_requests=2,
+        prefix_cache_capacity=0,
+        profile_timings=False,
+    )
+
+    assert not engine._prefill_graph_gpu_timing_enabled()
+    engine.device = torch.device("cuda")
+    assert not engine._prefill_graph_gpu_timing_enabled()
+
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_QUEUE_PROFILE_JSONL", "/tmp/queue.jsonl")
+    assert engine._prefill_graph_gpu_timing_enabled()
+
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PREFILL_GRAPH_GPU_EVENT_TIMING", "0")
+    assert not engine._prefill_graph_gpu_timing_enabled()
+
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PREFILL_GRAPH_GPU_EVENT_TIMING", "1")
+    assert engine._prefill_graph_gpu_timing_enabled()
+
+    timed_engine = ContinuousBatchEngine(
+        _CaptureReportingSelectedLogitsToyModel([True]),
+        device=torch.device("cpu"),
+        max_active_requests=2,
+        prefix_cache_capacity=0,
+        profile_timings=True,
+    )
+    timed_engine.device = torch.device("cuda")
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PREFILL_GRAPH_GPU_EVENT_TIMING", "0")
+    assert timed_engine._prefill_graph_gpu_timing_enabled()
+
+
 def test_continuous_batch_engine_counts_ragged_prefill_miss_shapes() -> None:
     model = _SelectedRaggedGraphMissToyModel()
     engine = ContinuousBatchEngine(

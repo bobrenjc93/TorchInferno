@@ -14790,6 +14790,28 @@ essentially the same as the current default band (`q2first_p50=215.3ms`,
 `ragged_prefill:b2:s16:rows0:ctx-64:src1` miss), so the current
 prefill-ready cap-8 policy remains the better default tradeoff.
 
+The latest public run remains `20260711_170752` on TorchInferno `0ba2517`.
+Cache integrity is clean: generated-prefix stores/reuses, prompt-lookup
+accepted tokens, and repeated-sample hits are all zero. Score remains
+TorchInferno `4/20` versus vLLM `15/20`; the remaining fair gaps are few_shot
+and multi_turn TTFT plus long_output decode throughput. A local current-head
+few_shot sync profile wrote
+`/tmp/inference-bench-ti-few-timed-results/.../runs/20260711_184452` and landed
+at `171.7 / 33.8 / 198.3ms`, `977/1000` correct. Its hot model-side prefill
+body was `prefix_graph:b32:s16:p122-122:src1:mixed0` with about `1.67s`
+forward time, `12.1K` active tokens, and `3.8K` padded suffix tokens, while
+fixed-capacity packed prefill stayed rejected because the static capacity would
+increase dense model tokens.
+
+Queue profiles now enable CUDA-event prefill graph timing by default, matching
+the decode-many GPU timing default. This fills
+`runtime_prefill_graph_replay_gpu_ms` and
+`runtime_prefill_shape_graph_replay_gpu_ms` in public-style no-sync queue
+profiles without enabling full synchronized CPU timing. Set
+`TORCHINFERNO_CONTINUOUS_PREFILL_GRAPH_GPU_EVENT_TIMING=0` to opt out. Future
+public runs should rank few_shot and multi_turn prefill bodies from these GPU
+maps instead of requiring a separate sync-timing rerun.
+
 ## Priority for a focused (non-loop) session
 
 1. Prefill MFU (Issue 1) — biggest TTFT lever, ~2x, affects 3/5 benchmarks.
