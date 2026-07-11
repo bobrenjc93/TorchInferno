@@ -15008,6 +15008,14 @@ behavior, but it makes future public-style artifacts rank the real
 non-fragmenting packed-prefix implementation targets without enabling expensive
 sync profiling.
 
+The provider log phase summary now also retains vLLM's periodic `Running`,
+`Waiting`, and GPU KV cache usage counters instead of dropping them after
+parsing. On the same local long_output artifact, this shows vLLM ran with
+`running_max=60`, no waiting queue, `0.3%` KV cache use, and `63.9%` prefix-hit
+rate, while SGLang exposed `429` prefill batches with `71.5%` cached tokens.
+That keeps the cross-provider evidence focused on normal prefix-cache and
+prefill scheduling behavior rather than benchmark-specific shortcuts.
+
 ## Priority for a focused (non-loop) session
 
 1. Prefill MFU (Issue 1) — biggest TTFT lever, ~2x, affects 3/5 benchmarks.

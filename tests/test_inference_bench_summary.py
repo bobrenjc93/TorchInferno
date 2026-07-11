@@ -894,6 +894,10 @@ def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) ->
     assert vllm_log.prompt_events == 2
     assert vllm_log.prompt_tps_avg == 200.0
     assert vllm_log.generation_tps_max == 40.0
+    assert vllm_log.running_max == 2
+    assert vllm_log.waiting_max == 0
+    assert vllm_log.kv_cache_pct_avg == 0.15000000000000002
+    assert vllm_log.kv_cache_pct_max == 0.2
     assert vllm_log.prefix_hit_pct_avg == 85.0
     sglang_log = next(row for row in summary.provider_server_logs if row.provider == "sglang")
     assert sglang_log.prefill_batches == 2
@@ -1238,6 +1242,8 @@ def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) ->
     assert "7.1" in text
     assert "0.7" in text
     assert "[provider server log phases]" in text
+    assert "running_max" in text
+    assert "kv_cache_avg" in text
     assert "prefix_hit_avg" in text
     assert "prefill_graph_pct" in text
     assert "prefill_tok_batch" in text
@@ -1245,6 +1251,7 @@ def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) ->
     assert "decode_tok_batch" in text
     assert "decode_graph_pct" in text
     assert "sglang" in text
+    assert "0.2%" in text
     assert "85.0%" in text
     assert "50.0%" in text
     assert "28.0" in text

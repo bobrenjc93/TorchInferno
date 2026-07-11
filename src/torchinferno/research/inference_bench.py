@@ -405,6 +405,10 @@ class ProviderServerLogSummary:
     generation_events: int = 0
     generation_tps_avg: float | None = None
     generation_tps_max: float | None = None
+    running_max: int | None = None
+    waiting_max: int | None = None
+    kv_cache_pct_avg: float | None = None
+    kv_cache_pct_max: float | None = None
     prefix_hit_pct_avg: float | None = None
     prefix_hit_pct_max: float | None = None
     prefill_batches: int = 0
@@ -1496,6 +1500,10 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
                     "gen_events",
                     "gen_tps_avg",
                     "gen_tps_max",
+                    "running_max",
+                    "waiting_max",
+                    "kv_cache_avg",
+                    "kv_cache_max",
                     "prefix_hit_avg",
                     "prefix_hit_max",
                     "prefill_batches",
@@ -2246,6 +2254,9 @@ def _profiler_row_category(line: str) -> str | None:
 def _summarize_vllm_server_log(path: Path) -> ProviderServerLogSummary:
     prompt_tps: list[float] = []
     generation_tps: list[float] = []
+    running_values: list[int] = []
+    waiting_values: list[int] = []
+    kv_cache_pct: list[float] = []
     prefix_hit_pct: list[float] = []
     for line in path.read_text(errors="replace").splitlines():
         match = _VLLM_RUNTIME_RE.search(line)
@@ -2253,6 +2264,9 @@ def _summarize_vllm_server_log(path: Path) -> ProviderServerLogSummary:
             continue
         prompt_tps.append(float(match.group("prompt_tps")))
         generation_tps.append(float(match.group("generation_tps")))
+        running_values.append(int(match.group("running")))
+        waiting_values.append(int(match.group("waiting")))
+        kv_cache_pct.append(float(match.group("kv_cache_pct")))
         prefix_hit_pct.append(float(match.group("prefix_hit_pct")))
     return ProviderServerLogSummary(
         provider="vllm",
@@ -2262,6 +2276,10 @@ def _summarize_vllm_server_log(path: Path) -> ProviderServerLogSummary:
         generation_events=len(generation_tps),
         generation_tps_avg=_avg(generation_tps),
         generation_tps_max=max(generation_tps) if generation_tps else None,
+        running_max=max(running_values) if running_values else None,
+        waiting_max=max(waiting_values) if waiting_values else None,
+        kv_cache_pct_avg=_avg(kv_cache_pct),
+        kv_cache_pct_max=max(kv_cache_pct) if kv_cache_pct else None,
         prefix_hit_pct_avg=_avg(prefix_hit_pct),
         prefix_hit_pct_max=max(prefix_hit_pct) if prefix_hit_pct else None,
     )
@@ -2395,6 +2413,10 @@ def _provider_server_log_rows(
                 _fmt_value(summary.generation_events),
                 _fmt_value(summary.generation_tps_avg),
                 _fmt_value(summary.generation_tps_max),
+                _fmt_value(summary.running_max),
+                _fmt_value(summary.waiting_max),
+                _fmt_pct_value(summary.kv_cache_pct_avg),
+                _fmt_pct_value(summary.kv_cache_pct_max),
                 _fmt_pct_value(summary.prefix_hit_pct_avg),
                 _fmt_pct_value(summary.prefix_hit_pct_max),
                 _fmt_value(summary.prefill_batches),
