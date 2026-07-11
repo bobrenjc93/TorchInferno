@@ -13721,6 +13721,33 @@ hot shape GPU attribution including `b24:s64=975.3ms`, `b24:s96=780.3ms`,
 ordinary cached-prefix suffix prefill body plus high-active decode-many replay;
 it is not hidden graph capture, token materialization, or missing shape timing.
 
+The current same-host all-provider refresh on `d78c1ae` wrote
+`/tmp/inference-bench-current-compare-results/.../runs/20260711_004651`.
+The target rows were vLLM tree `39.1 / 26.6 / 56.9ms` and long_output
+`50.3 / 16.8 / 635.6ms`, SGLang tree `39.0 / 108.4 / 109.6ms` and long_output
+`45.1 / 25.9 / 924.2ms`, and TorchInferno tree
+`60.1 / 38.9 / 83.6ms` and long_output `219.4 / 21.2 / 976.0ms`.
+TorchInferno stayed stable on current head (`956/992` tree, `1000/1000` long),
+so the latest public `b3dab3b` multi_turn CUDA launch failure is stale relative
+to the pushed sampling/close-sync fixes.
+
+A focused greedy-short refill A/B on the same head keeps refill-floor changes
+rejected. Lowering
+`TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_ADMIT_MIN_FREE_ROWS` from `4` to
+`1` wrote `/tmp/inference-bench-long-minfree1-results/.../runs/20260711_010004`
+and landed at `235.2 / 21.0 / 961.3ms`, improving E2E slightly but regressing
+median TTFT and p99 finish. Lowering only
+`TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_REFILL_MIN_READY_REQUESTS` from
+`8` to `4` first looked promising:
+`/tmp/inference-bench-long-refill4-results/.../runs/20260711_010631` landed at
+`217.7 / 21.2 / 964.4ms`, p99 `443.8 / 30.3 / 1751.7ms`, `1000/1000` correct,
+with p99 first-token down from `532.2` to `438.8ms`. The no-env patched
+confirmation then regressed to `243.1 / 20.9 / 975.1ms`, p99
+`1392.3 / 42.0 / 2571.9ms`, and a midpoint floor of `6` landed at
+`253.5 / 21.4 / 1000.0ms`. Keep the greedy-short refill floor at `8`; the
+observed instability points back to model-side prefill/decode work rather than
+another queue-floor default.
+
 ## Priority for a focused (non-loop) session
 
 1. Prefill MFU (Issue 1) — biggest TTFT lever, ~2x, affects 3/5 benchmarks.
