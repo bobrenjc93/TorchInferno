@@ -45,6 +45,19 @@ directly, for example `CONTEXT_LEN=-256`, `BATCH=24`, `SUFFIX=64`, and
 `MIN_BATCH=1`, instead of relying on broad minimum gates that can be consumed by
 startup.
 
+The exact-filter validation on pushed `e8b82c4` used those new filters plus
+`TORCHINFERNO_PROFILE_RAGGED_PREFILL_REPLAY_SKIP_MATCHES=4`. It wrote
+`/tmp/inference-bench-local-e8b82c4-b24s64-replay-prof-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-e8b82c4-b24s64-replay-prof/runs/20260711_095343`
+and completed `1000/1000`; the p99 row was profiler-perturbed, so use the
+kernel table as evidence rather than the score. The profile line hit the
+intended request-path replay: `batch=24 suffix=64 match=5 context_len=-256`
+with `src_rows=1`. Self CUDA was `83.40ms`: `160` NCCL all-reduces took `24.59ms`
+(`29.5%`), the main GEMM/NVJET buckets were about `27ms`, add/RMS and
+elementwise/index/gather work filled most of the rest, and visible softmax was
+only `0.65ms`. This revalidates the earlier `0d6ab82` diagnosis on current
+head: the hot common-prefix prefill body is dense TP transformer replay over
+padded suffix rows, not a graph-cache miss or attention-mask bottleneck.
+
 ## Current 20260711 greedy-short batch-bucket rejection
 
 After the decode-many state-sync fix (`829b227`/`1369e8f`), the remaining
