@@ -23,6 +23,29 @@ cost is the differentiator: `b24:s96` reports `149.1ms` submit-to-first,
 prefix-suffix prefill body and high-active decode replay, not another simple
 admission wait sweep.
 
+## Current 20260711 decode replay profiler refresh
+
+Pushed head `b705b81` adds an env-gated
+`RAGGED_DECODE_MANY_EAGER_PROF` hook around the eager decode-many fallback, but
+the current long_output default does not hit that fallback. A validation run
+wrote
+`/tmp/inference-bench-local-b705b81-decode-many-eager-prof-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-b705b81-decode-many-eager-prof/runs/20260711_104136`
+and completed `1000/1000` at `208.0 / 21.6 / 1005.2ms`. Its queue profile had
+`744` decode graph hits/replays, `0` decode graph misses, `0` decode-many graph
+calls, and no eager profiler block. The default path is therefore the
+decode-many scheduler around warmed single-token ragged graph replay, not eager
+ragged decode.
+
+A same-head replay-profiler run wrote
+`/tmp/inference-bench-local-b705b81-decode-replay-prof-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-b705b81-decode-replay-prof/runs/20260711_104840`.
+The profiler perturbed the first wave, so use it as kernel evidence rather than
+score evidence. The summary parsed `decode_replay b64/cache1024/rows64` at
+`12.4ms` self CUDA: GEMM/NVJET buckets were `4.5ms` (`36.6%`), Marlin was
+`3.3ms` (`26.8%`), symmetric-memory all-reduce was `2.1ms` (`16.7%`), decode
+attention was `1.5ms` (`12.1%`), and add/RMS was `0.4ms`. This reinforces the
+current decode target: cheaper full-batch projection/Marlin/all-reduce replay
+or real overlap, not eager fallback tuning.
+
 ## Current 20260711 ragged-prefill replay profiler targeting
 
 A pushed-head `e1e3c2b` replay-profile run used
