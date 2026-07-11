@@ -4897,6 +4897,58 @@ def test_continuous_batch_engine_profiles_disabled_suffix_bucket_split(
     assert engine.stats.prefill_suffix_split_candidate_saved_tokens == 16
 
 
+def test_continuous_batch_engine_profiles_suffix_split_candidates_without_sync(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_QUEUE_PROFILE_JSONL", "queue.jsonl")
+    monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SPLIT_SUFFIX_BUCKETS", raising=False)
+    monkeypatch.delenv(
+        "TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SPLIT_SUFFIX_BUCKETS_GREEDY_SHORT",
+        raising=False,
+    )
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SUFFIX_BUCKETS", "4,8")
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SPLIT_SUFFIX_BUCKETS_MIN_GROUP", "1")
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SPLIT_SUFFIX_BUCKETS_MIN_FILL_PCT", "0")
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_COMMON_PREFIX_RAGGED_SUFFIX_MAX_PREFIX_TOKENS", "0")
+    shared = tuple(range(16))
+    model = _SelectedLogitsToyModel(vocab_size=128)
+    engine = ContinuousBatchEngine(
+        model,
+        device=torch.device("cpu"),
+        temperature=0.0,
+        max_generation_tokens=128,
+        max_active_requests=8,
+        prefix_cache_capacity=8,
+        pin_shared_prefix=True,
+        graph_prefill=True,
+        profile_timings=False,
+    )
+    requests = [
+        ServingRequest("warm-a", (*shared, 21), 1, arrival_step=0),
+        ServingRequest("warm-b", (*shared, 22), 1, arrival_step=0),
+        ServingRequest("late-a", (*shared, 31), 1, arrival_step=1),
+        ServingRequest("late-b", (*shared, 32, 33), 1, arrival_step=1),
+        ServingRequest("late-c", (*shared, 34, 35, 36, 37, 38), 1, arrival_step=1),
+    ]
+
+    results = engine.run(requests)
+
+    assert len(results) == 5
+    split_shape = "base_b3:s8->b2:s4+b1:s8"
+    assert engine._prefix_prefill_split_suffix_buckets_profile_candidates_enabled()
+    assert "prefix_graph:b4:s8:p16-16:src1:mixed0" in engine.stats.prefill_shape_counts
+    assert "prefix_graph:b2:s4:p16-16:src1:mixed0" not in engine.stats.prefill_shape_counts
+    assert engine.stats.prefill_suffix_split_candidate_calls == 1
+    assert engine.stats.prefill_suffix_split_accepted_calls == 0
+    assert engine.stats.prefill_suffix_split_rejected_calls == 1
+    assert engine.stats.prefill_suffix_split_reject_reason_counts == {"disabled": 1}
+    assert engine.stats.prefill_suffix_split_candidate_saved_tokens == 16
+    assert engine.stats.prefill_suffix_split_candidate_shape_counts[split_shape] == 1
+    assert engine.stats.prefill_suffix_split_candidate_shape_saved_tokens[split_shape] == 16
+    assert engine.stats.prefill_shape_forward_ms == {}
+    assert engine.stats.prefill_shape_wall_ms == {}
+
+
 def test_continuous_batch_engine_suffix_bucket_split_requires_model_token_savings(
     monkeypatch,
 ) -> None:

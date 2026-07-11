@@ -5049,7 +5049,7 @@ class ContinuousBatchEngine:
         if env_name in os.environ:
             return env_flag(env_name, False)
         return bool(
-            self.profile_timings
+            (self.profile_timings or _queue_profile_counts_enabled())
             and self._prefix_prefill_split_suffix_buckets_greedy_short_scope()
         )
 
@@ -5084,11 +5084,11 @@ class ContinuousBatchEngine:
             base_bucket=base_bucket,
             by_suffix_bucket=by_suffix_bucket,
         )
-        self._record_shape_count(
+        self._record_queue_profile_shape_count(
             self.stats.prefill_suffix_split_candidate_shape_counts,
             shape_key,
         )
-        self._record_shape_total(
+        self._record_queue_profile_shape_total(
             self.stats.prefill_suffix_split_candidate_shape_saved_tokens,
             shape_key,
             saved_tokens,
@@ -5099,17 +5099,17 @@ class ContinuousBatchEngine:
             self.stats.prefill_suffix_split_accepted_model_tokens += int(split_model_tokens)
             self.stats.prefill_suffix_split_accepted_saved_tokens += saved_tokens
             self.stats.prefill_suffix_split_accepted_fragments += len(by_suffix_bucket)
-            self._record_shape_count(
+            self._record_queue_profile_shape_count(
                 self.stats.prefill_suffix_split_accepted_shape_counts,
                 shape_key,
             )
-            self._record_shape_total(
+            self._record_queue_profile_shape_total(
                 self.stats.prefill_suffix_split_accepted_shape_saved_tokens,
                 shape_key,
                 saved_tokens,
             )
             for suffix_bucket, items in by_suffix_bucket.items():
-                self._record_shape_count(
+                self._record_queue_profile_shape_count(
                     self.stats.prefill_suffix_split_accepted_fragment_counts,
                     f"b{len(items)}:s{int(suffix_bucket)}",
                 )

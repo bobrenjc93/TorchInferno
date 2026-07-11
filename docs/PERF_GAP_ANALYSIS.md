@@ -157,6 +157,19 @@ can now quantify ordinary cached-prefix suffix-prefill padding without enabling
 sync timings; the target remains non-fragmenting cached-prefix packed prefill
 and high-active decode replay.
 
+A follow-up dirty-tree validation after `e606bef` also moved suffix-split
+candidate profiling onto the no-sync queue-profile path. It wrote
+`/tmp/inference-bench-suffix-candidate-nosync-e606bef-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-suffix-candidate-nosync-e606bef-dirty/runs/20260711_064755`
+and landed at `223.0 / 22.2 / 990.1ms`, p99 `535.6 / 33.5 / 1793.6ms`,
+with `1000/1000` correct. The final queue record had `15` suffix-split
+candidates, `0` accepted, `15` rejected, and `7.1K` predicted saved model
+tokens (`26.9K` base versus `20.4K` split candidate tokens). Rejection reasons
+were `{"disabled": 7, "min_fill": 4, "min_group": 1, "no_savings": 3}`, and
+shape maps such as `base_b24:s96->b16:s32+b8:s96` now appear while
+`runtime_prefill_shape_forward_ms` and `runtime_prefill_shape_wall_ms` remain
+empty. This keeps public no-sync profiles able to explain why suffix splitting
+is not promoted without paying sync-timing overhead.
+
 ## Public 20260710_170747 startup failure and symm-mem warmup fix
 
 The latest public pointer advanced to
