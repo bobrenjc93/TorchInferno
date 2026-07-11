@@ -16,6 +16,52 @@ server exact-prompt logits cache is also opt-in only via
 `TORCHINFERNO_OPENAI_PROMPT_LOGITS_CACHE=1`. Neither path should be used for
 score-facing benchmark runs.
 
+The benchmark harness now also forces those score-facing caches off for
+TorchInferno provider runs. inference-bench `034494c0` sets
+`TORCHINFERNO_CONTINUOUS_GENERATED_PREFIX_CACHE=0`,
+`TORCHINFERNO_CONTINUOUS_ADAPTIVE_GENERATED_PREFIX_CACHE=0`,
+`TORCHINFERNO_OPENAI_TP_ONLINE_GENERATED_PREFIX_CACHE=0`,
+`TORCHINFERNO_CONTINUOUS_PREFIX_CACHE_STORE_LOGITS=0`,
+`TORCHINFERNO_CONTINUOUS_PINNED_FULL_PROMPT_STORE_LOGITS=0`, and
+`TORCHINFERNO_OPENAI_PROMPT_LOGITS_CACHE=0` unless the explicit diagnostic
+override `INFERENCE_BENCH_TORCHINFERNO_ALLOW_LOGITS_CACHES=1` is set. This
+protects public comparisons even when the runner happens to build an older
+TorchInferno commit.
+
+## Current 20260711 guarded long-output baseline
+
+A current-head TorchInferno-only `long_output` run on pushed `8b8cc67`, through
+inference-bench `034494c0`, wrote
+`/tmp/inference-bench-long-current-8b8cc67-guarded-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-long-current-8b8cc67-guarded/runs/20260711_161517`.
+It completed `1000/1000` correct at `217.4 / 21.9 / 973.1ms`,
+`35.6 tok/s`. The cache-integrity counters stayed clean:
+`runtime_generated_prefix_reuse_requests=0`,
+`runtime_generated_prefix_store_requests=0`, and exact-prompt logits stores
+were absent; all first-token reuse was ordinary common-prefix KV reuse
+(`runtime_prefix_reuse_requests=1000`, `runtime_prefix_reuse_tokens=111000`,
+hit length `111`).
+
+The performance profile stayed in the same real-gap band as the public row:
+`60` prefill batches, `51.0K` prefill model tokens, `33.2K` prefill padding
+tokens, no prefill or decode graph misses, `117` decode-many calls over `517`
+internal steps, and `28.6K/32.8K` real/padded decode-many tokens. Hot prefill
+shapes were still the padded cached-prefix suffix bodies
+(`b24:s96`, `b24:s64`, `b16:s64`, `b16:s96`), while hot decode remained
+`decode_many:b64/64` plus high-active tails. This confirms the remaining
+long_output target after cache hardening is still dynamic packed
+prefix-suffix prefill plus a faster high-active decode replay body.
+
+A scoped A/B lowering
+`TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_ADMIT_PER_STEP_CAP` from the
+default `24` to `16` wrote
+`/tmp/inference-bench-long-current-8b8cc67-cap16-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-long-current-8b8cc67-cap16/runs/20260711_162100`.
+It stayed correct but is rejected as a default: TTFT improved only
+`217.4 -> 211.4ms`, while TPOT/E2E regressed `21.9/973.1ms -> 23.0/1022.3ms`
+and throughput fell `35.6 -> 34.6 tok/s`. Counters explain the tradeoff:
+prefill padding fell `33.2K -> 28.3K`, but prefill batches rose `60 -> 74`.
+The smaller cap moves work from padded `b24` replays into more `b16` replays;
+that improves first-token queueing slightly but loses the score row.
+
 ## Current 20260711 fair sampled-short decode cap
 
 After the logits-cache reset, self_consistency fell back to normal model
