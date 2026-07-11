@@ -14823,6 +14823,36 @@ ungated GPU-event shape recorder, matching decode GPU timing, so future
 public-style queue profiles should include both aggregate and per-shape prefill
 GPU maps.
 
+A current-head long_output refresh on `d953a91` confirms that the post-cache
+hardening gap is still model-body work, not a hidden shortcut. The no-env run
+`/tmp/inference-bench-long-d953-results/.../runs/20260711_193533` landed at
+`210.3 / 21.7 / 976.5ms`, `1000/1000` correct, with throughput `35.9 tok/s`.
+Queue integrity stayed clean: generated-prefix store/reuse, prompt-lookup
+accepted tokens, and repeated-sample hits were all zero. Runtime was dominated
+by `7.17s` decode-many GPU time and `4.70s` common-prefix prefill graph GPU
+time. The hot prefill shapes were ordinary `p111` common-prefix suffix waves
+(`b24:s64`, `b16:s96`, `b16:s64`, `b24:s96`) with `32.9K` padded prefill
+tokens. Disabling the public-style GPU-event timers
+(`TORCHINFERNO_CONTINUOUS_DECODE_MANY_GPU_EVENT_TIMING=0` and
+`TORCHINFERNO_CONTINUOUS_PREFILL_GRAPH_GPU_EVENT_TIMING=0`) wrote
+`/tmp/inference-bench-long-d953-notiming-results/.../runs/20260711_194059`
+and is rejected: throughput stayed `35.9 tok/s`, TTFT/E2E regressed to
+`215.9 / 1033.5ms`, and the runtime phase remained about `17.0s`.
+
+A narrow packed-ragged suffix probe is also rejected. Targeting only the largest
+observed structural pattern
+`prefix_graph:b24:s96:p111-111:src1:mixed0|p111:s17/p111:s18/p111:s19/p111:s20/p111:s21/p111:s22/p111:s73/p111:s74/p111:s75`
+with `TORCHINFERNO_CONTINUOUS_PACKED_RAGGED_PREFILL_EAGER_PATTERN`,
+`TORCHINFERNO_CONTINUOUS_PACKED_RAGGED_PREFILL_EAGER_GRAPH=1`, and capture on
+first call wrote
+`/tmp/inference-bench-long-d953-packed-target-results/.../runs/20260711_194714`.
+It stayed correct but regressed to `216.8 / 22.3 / 1011.8ms`, throughput
+`34.7 tok/s`, and p99 E2E `3239.6ms`. The packed path fired only once, saving
+`1.46K` model tokens, while the runtime phase grew to `18.35s`. Keep
+pattern-targeted packed-ragged prefill opt-in; the useful target remains a
+dynamic non-fragmenting packed prefix-suffix body that handles the recurring
+long_output `p111` waves without request-path graph churn.
+
 ## Priority for a focused (non-loop) session
 
 1. Prefill MFU (Issue 1) — biggest TTFT lever, ~2x, affects 3/5 benchmarks.
