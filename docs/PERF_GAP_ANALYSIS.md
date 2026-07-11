@@ -15148,6 +15148,18 @@ and `2326` for tree_of_thought. That keeps the fair next step focused on a
 dense-cache packed/ragged prefix-suffix prefill body or an explicitly measured
 FlashInfer-cache run, not a silent no-op env toggle.
 
+The explicit FlashInfer-cache experiment is now reachable but rejected as a
+default. Commit `a69ad33` allows `--cache-backend flashinfer` on the OpenAI
+server CLI, and a focused local long_output run with
+`TORCHINFERNO_CONTINUOUS_PACKED_FLASHINFER_PREFILL=1` wrote
+`/tmp/inference-bench-ti-fi-pack-results-2/.../runs/20260711_233544`. It stayed
+correct (`1000/1000`) and proved the gate works (`requested=True`,
+`cache_ok=True`, status `ran`, `57` packed-FI calls, `4997` saved tokens), but
+regressed to `481.0 / 39.1 / 2088.1ms`, `18.4 tok/s`. Startup also rose to
+`216s`, with `98.2s` online common-prefix prefill warmup and `143.3s` unified
+scheduler warmup. Keep FlashInfer cache/packed prefill as an experiment-only
+path until it beats dense on the same public request flow.
+
 ## Priority for a focused (non-loop) session
 
 1. Prefill MFU (Issue 1) — biggest TTFT lever, ~2x, affects 3/5 benchmarks.
