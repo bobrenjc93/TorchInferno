@@ -1422,7 +1422,7 @@ def _online_active_ready_wait_ms(*, temperature: float, max_tokens: int) -> floa
         if sampled_short_max_tokens < max_tokens <= sampled_medium_max_tokens:
             return env_float(
                 "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_ACTIVE_READY_WAIT_MS",
-                1.0,
+                0.0,
                 minimum=0.0,
             )
     return 0.0
@@ -1465,16 +1465,14 @@ def _online_initial_batch_wait_ms(*, temperature: float, max_tokens: int) -> flo
             minimum=sampled_medium_min_tokens,
         )
         if sampled_medium_min_tokens <= max_tokens <= sampled_medium_max_tokens:
-            # Tree-of-thought sampled medium bursts are queue-to-submit bound in
-            # the current worker-wave shape. With the sampled-medium decode
-            # quantum lowered, a shorter first window keeps TTFT/E2E down without
-            # touching sampled-short or greedy policy. Local TP8 70B A/B after
-            # the sampled-medium active-ready fix: 1ms improved tree median
-            # TTFT/E2E/TPS from 62.7/94.1ms/15.7 tok/s to
-            # 60.5/89.8ms/16.2 tok/s while preserving correctness.
+            # Current tree-style sampled-medium traffic is served best by
+            # immediate admission. Local TP8 70B A/B on pushed 1443e18 zeroed
+            # sampled-medium initial, active-ready, and prequeue waits, keeping
+            # TTFT/TPOT flat while improving tree median E2E 76.1 -> 73.9ms and
+            # p99 E2E 658.9 -> 402.1ms with correctness in band.
             default_wait_ms = env_float(
                 "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_INITIAL_BATCH_WAIT_MS",
-                1.0,
+                0.0,
                 minimum=0.0,
             )
     elif temperature <= 0.0 and 0 < max_tokens <= env_int(
@@ -1549,13 +1547,12 @@ def _tp_stream_prequeue_admission_wait_ms(*, temperature: float, max_tokens: int
             minimum=sampled_short_max_tokens,
         )
         if sampled_short_max_tokens < max_tokens <= sampled_medium_max_tokens:
-            # Sampled-medium tree-style bursts can start the online batcher while
-            # sibling HTTP workers are still tokenizing. A tiny prequeue window
-            # lets the first wave enqueue together without touching sampled-short
-            # self-consistency or greedy decode policy.
+            # Sampled-medium tree-style bursts now favor immediate queuing; the
+            # scoped env hook remains for diagnostics if a future worker-wave
+            # shape needs a collection window again.
             return env_float(
                 "TORCHINFERNO_OPENAI_TP_SAMPLED_MEDIUM_STREAM_PREQUEUE_ADMISSION_WAIT_MS",
-                1.0,
+                0.0,
                 minimum=0.0,
             )
     return 0.0

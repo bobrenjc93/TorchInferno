@@ -70,6 +70,37 @@ submit-to-first improved `91.3 -> 85.7ms`, and p99 submit-to-first improved
 `164.5 -> 100.4ms`, so greedy-large now uses the same `8` refill floor by
 default.
 
+The current pushed head `1443e18` completes tree_of_thought locally despite the
+stale public connection-refused row. The no-env TorchInferno control wrote
+`/tmp/inference-bench-tree-1443e18-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-tree-1443e18/runs/20260711_053608`
+and landed at `53.0 / 36.0 / 76.1ms`, `959/992` correct. The matching same-host
+provider refresh wrote
+`/tmp/inference-bench-tree-vllm-sglang-1443e18-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-tree-vllm-sglang-1443e18/runs/20260711_054245`;
+vLLM landed at `38.8 / 26.7 / 56.6ms` and SGLang at
+`39.1 / 145.0 / 125.3ms`, so vLLM remains the tree target while TorchInferno
+already beats SGLang on TPOT/E2E/throughput. A scoped sampled-medium zero-wait
+A/B with
+`TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_INITIAL_BATCH_WAIT_MS=0`,
+`TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_ACTIVE_READY_WAIT_MS=0`, and
+`TORCHINFERNO_OPENAI_TP_SAMPLED_MEDIUM_STREAM_PREQUEUE_ADMISSION_WAIT_MS=0`
+wrote
+`/tmp/inference-bench-tree-zero-waits-1443e18-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-tree-zero-waits-1443e18/runs/20260711_054833`
+and landed at `53.0 / 36.1 / 73.9ms`, p99 E2E `402.1ms`, `956/992` correct.
+Queue telemetry explains this as a tail cleanup rather than a model-body fix:
+median queue-to-first stayed near `50ms`, submit-to-first stayed near `32ms`,
+but p99 queue-to-first fell `611ms -> 366ms` and the run stayed in one online
+session. Promote the zero waits only for sampled-medium tree-style traffic
+(`temperature > 0`, `256 < max_tokens <= 300`); sampled-short self-consistency,
+greedy traffic, active-row caps, and graph policy remain unchanged.
+
+The no-env patched confirmation wrote
+`/tmp/inference-bench-tree-zero-default-1443e18-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-tree-zero-default-1443e18/runs/20260711_055631`
+and held the improvement at `50.9 / 33.7 / 72.0ms`, p99 E2E `365.1ms`,
+`958/992` correct. Its queue profile stayed on one sampled-medium online
+session (`submitted_requests=992`), with `q2first_p50=47.7ms`,
+`q2first_p99=345.2ms`, `q2submit_p50=16.2ms`, and
+`submit2first_p50=31.6ms`, no request-path graph misses.
+
 ## Public 20260710_170747 startup failure and symm-mem warmup fix
 
 The latest public pointer advanced to

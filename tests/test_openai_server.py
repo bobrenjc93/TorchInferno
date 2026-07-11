@@ -11194,7 +11194,7 @@ def test_openai_tp_stream_prequeue_admission_wait_uses_sampled_medium_default(
     )
 
     assert _tp_stream_prequeue_admission_wait_ms(temperature=0.7, max_tokens=256) == 0.0
-    assert _tp_stream_prequeue_admission_wait_ms(temperature=0.7, max_tokens=300) == 1.0
+    assert _tp_stream_prequeue_admission_wait_ms(temperature=0.7, max_tokens=300) == 0.0
     assert _tp_stream_prequeue_admission_wait_ms(temperature=0.7, max_tokens=301) == 0.0
     assert _tp_stream_prequeue_admission_wait_ms(temperature=0.0, max_tokens=300) == 0.0
 
@@ -11279,7 +11279,7 @@ def test_openai_online_active_ready_wait_scopes_sampled_policies(
     )
 
     assert _online_active_ready_wait_ms(temperature=0.7, max_tokens=256) == 1.0
-    assert _online_active_ready_wait_ms(temperature=0.7, max_tokens=300) == 1.0
+    assert _online_active_ready_wait_ms(temperature=0.7, max_tokens=300) == 0.0
     assert _online_active_ready_wait_ms(temperature=0.0, max_tokens=300) == 0.0
 
     monkeypatch.setenv(
@@ -11373,8 +11373,8 @@ def test_openai_online_initial_batch_wait_uses_sampled_short_default(monkeypatch
     assert _online_initial_batch_wait_ms(temperature=0.0, max_tokens=401) == 10.0
     assert _online_initial_batch_wait_ms(temperature=0.0, max_tokens=512) == 0.0
     assert _online_initial_batch_wait_ms(temperature=0.0, max_tokens=513) == 1.0
-    assert _online_initial_batch_wait_ms(temperature=0.7, max_tokens=257) == 1.0
-    assert _online_initial_batch_wait_ms(temperature=0.7, max_tokens=300) == 1.0
+    assert _online_initial_batch_wait_ms(temperature=0.7, max_tokens=257) == 0.0
+    assert _online_initial_batch_wait_ms(temperature=0.7, max_tokens=300) == 0.0
     assert _online_initial_batch_wait_ms(temperature=0.7, max_tokens=301) == 1.0
 
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_MIXED_PREFIX_REUSE", "1")
