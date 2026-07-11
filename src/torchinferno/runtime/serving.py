@@ -1079,7 +1079,7 @@ class ContinuousBatchEngine:
         self._packed_prefill_fixed_capacity_seen: dict[str, int] = {}
         self._packed_prefill_fixed_capacity_stable_seen: dict[str, int] = {}
         self._packed_prefill_fixed_capacity_graph_none_keys: set[
-            tuple[str, tuple[tuple[int, int], ...]]
+            tuple[str, tuple[tuple[int, int], ...], int]
         ] = set()
         self._prefill_token_graph_miss_keys: set[str] = set()
         self._free_active_rows: list[int] = []
@@ -4240,9 +4240,16 @@ class ContinuousBatchEngine:
         if src_prefix_row is None and any(prefix_hit > 0 for _i, _req, prefix_hit, _r in group):
             self._record_fixed_capacity_packed_prefill_reject("missing_src_prefix")
             return None
-        if src_prefix_row is not None and int(src_prefix_row.numel()) != 1:
-            self._record_fixed_capacity_packed_prefill_reject("multi_src_prefix")
-            return None
+        multi_src_prefix = False
+        if src_prefix_row is not None:
+            src_prefix_row_count = int(src_prefix_row.numel())
+            if src_prefix_row_count <= 0 or not source_prefix_rows:
+                self._record_fixed_capacity_packed_prefill_reject("shape_mismatch")
+                return None
+            multi_src_prefix = src_prefix_row_count != 1
+            if multi_src_prefix and len(source_prefix_rows) < len(group):
+                self._record_fixed_capacity_packed_prefill_reject("shape_mismatch")
+                return None
         if suffix_bucket <= 0 or any(length <= 0 or length > suffix_bucket for length in suffix_lengths):
             self._record_fixed_capacity_packed_prefill_reject("invalid_suffix")
             return None
@@ -4308,9 +4315,21 @@ class ContinuousBatchEngine:
         if fixed_tokens <= 0 or fixed_tokens >= dense_tokens:
             self._record_fixed_capacity_packed_prefill_reject("no_savings")
             return None
+        dummy_needed = sum(
+            1 for _start_len, _suffix_len, real_index in slot_specs if real_index is None
+        )
+        if multi_src_prefix and dummy_needed > 0:
+            self._record_fixed_capacity_packed_prefill_reject("multi_src_prefix_dummy")
+            return None
+        graph_src_prefix_rows = (
+            len(slot_specs)
+            if multi_src_prefix
+            else 1 if src_prefix_row is not None else 0
+        )
         graph_none_key = (
             packed_prefill_pattern_key,
             tuple((start_len, suffix_len) for start_len, suffix_len, _real_index in slot_specs),
+            graph_src_prefix_rows,
         )
         cache_graph_none = not bool(capture_on_miss)
         if (
@@ -4319,10 +4338,6 @@ class ContinuousBatchEngine:
         ):
             self._record_fixed_capacity_packed_prefill_reject("graph_returned_none_cached")
             return None
-
-        dummy_needed = sum(
-            1 for _start_len, _suffix_len, real_index in slot_specs if real_index is None
-        )
         dummy_pool = list(pad_rows) + list(pad_prefix_rows)
         extra_active_rows: list[int] = []
         extra_prefix_rows: list[int] = []
@@ -4353,6 +4368,7 @@ class ContinuousBatchEngine:
             fixed_group: list[tuple[int, ServingRequest, int, _ReusablePrefix]] = []
             fixed_real_rows: list[int] = []
             fixed_real_suffix_lengths: list[int] = []
+            fixed_source_prefix_rows: list[int] = []
             for slot_index, (start_len, suffix_len, real_index) in enumerate(slot_specs):
                 fixed_start_lens.append(start_len)
                 fixed_q_lens_values.append(suffix_len)
@@ -4368,11 +4384,28 @@ class ContinuousBatchEngine:
                 fixed_group.append(group[real_index])
                 fixed_real_rows.append(rows[real_index])
                 fixed_real_suffix_lengths.append(suffix_lengths[real_index])
+                if multi_src_prefix:
+                    fixed_source_prefix_rows.append(int(source_prefix_rows[real_index]))
             if len(real_slot_indices) != len(group):
                 self._record_fixed_capacity_packed_prefill_reject("real_slot_mismatch")
                 return None
 
-            required = max(fixed_rows + source_prefix_rows) + 1
+            fixed_src_prefix_row: Tensor | None = None
+            source_rows_for_required: list[int] = []
+            if src_prefix_row is not None:
+                if multi_src_prefix:
+                    if len(fixed_source_prefix_rows) != len(fixed_rows):
+                        self._record_fixed_capacity_packed_prefill_reject("shape_mismatch")
+                        return None
+                    fixed_src_prefix_row = self._device_index_tensor(
+                        tuple(fixed_source_prefix_rows)
+                    )
+                    source_rows_for_required = fixed_source_prefix_rows
+                else:
+                    fixed_src_prefix_row = src_prefix_row
+                    source_rows_for_required = [int(source_prefix_rows[0])]
+
+            required = max(fixed_rows + source_rows_for_required) + 1
             seq_lens_list = [0] * required
             for physical_row, start_len in zip(fixed_rows, fixed_start_lens):
                 seq_lens_list[physical_row] = start_len
@@ -4395,7 +4428,7 @@ class ContinuousBatchEngine:
                 q_lens=fixed_q_lens,
                 row_indices=fixed_row_indices,
                 logit_positions=fixed_logit_positions,
-                src_prefix_row=src_prefix_row,
+                src_prefix_row=fixed_src_prefix_row,
                 prefix_copy_len=prefix_copy_len,
                 capture_on_miss=capture_on_miss,
             )

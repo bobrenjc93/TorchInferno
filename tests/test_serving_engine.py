@@ -3903,6 +3903,156 @@ def test_continuous_batch_engine_can_use_fixed_capacity_packed_prefill_graph(
         engine._release_active_row(row)
 
 
+def test_continuous_batch_engine_can_use_fixed_capacity_packed_prefill_graph_with_multi_source_rows(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv(
+        "TORCHINFERNO_CONTINUOUS_PACKED_RAGGED_PREFILL_FIXED_CAPACITY_GRAPH",
+        "1",
+    )
+    monkeypatch.setenv(
+        "TORCHINFERNO_CONTINUOUS_PACKED_RAGGED_PREFILL_FIXED_CAPACITY_MIN_CALLS",
+        "1",
+    )
+    shape_key = "prefix_graph:b2:s5:p4-6:src2:mixed1"
+    pattern_key = f"{shape_key}|p4:s2/p6:s4"
+    model = _SelectedLogitsToyModel()
+    engine = ContinuousBatchEngine(
+        model,
+        device=torch.device("cpu"),
+        max_active_requests=2,
+        prefix_cache_capacity=2,
+        profile_timings=True,
+    )
+    engine.start_online(max_seq_len=8)
+    real_rows = [engine._acquire_active_row(), engine._acquire_active_row()]
+    source_rows = [
+        engine._acquire_free_prefix_row_or_none(),
+        engine._acquire_free_prefix_row_or_none(),
+    ]
+    assert None not in source_rows
+    source_prefix_rows = [int(row) for row in source_rows if row is not None]
+    engine._packed_prefill_fixed_capacity_counts[pattern_key] = {
+        (4, 2): 1,
+        (6, 4): 1,
+    }
+    engine._packed_prefill_fixed_capacity_seen[pattern_key] = 1
+
+    result = engine._try_fixed_capacity_packed_prefill_logits(
+        input_ids=torch.tensor([[3, 4, 5, 6, 0], [1, 2, 0, 0, 0]], dtype=torch.long),
+        group=[
+            (1, ServingRequest("long", (3, 4, 5, 6), 1), 6, object()),
+            (0, ServingRequest("short", (1, 2), 1), 4, object()),
+        ],
+        rows=real_rows,
+        suffixes=[[3, 4, 5, 6], [1, 2]],
+        suffix_lengths=[4, 2],
+        suffix_bucket=5,
+        source_prefix_rows=source_prefix_rows,
+        src_prefix_row=torch.tensor(source_prefix_rows, dtype=torch.long),
+        prefix_copy_len=6,
+        pad_rows=[],
+        pad_prefix_rows=[],
+        capture_on_miss=False,
+        profile_shape_key=shape_key,
+        packed_prefill_pattern_key=pattern_key,
+        skip_active_row_clear=True,
+    )
+
+    assert result is not None
+    logits, fixed_group, fixed_rows, fixed_suffix_lengths, slot_count, fixed_tokens = result
+    assert model.packed_prefill_graph_q_lens == [[2, 4]]
+    assert model.prefill_src_prefix_rows[-1] == [
+        source_prefix_rows[1],
+        source_prefix_rows[0],
+    ]
+    assert model.prefill_start_positions[-1] == [4, 6]
+    assert model.prefill_row_indices[-1] == [real_rows[1], real_rows[0]]
+    assert fixed_group[0][1].request_id == "short"
+    assert fixed_group[1][1].request_id == "long"
+    assert fixed_rows == [real_rows[1], real_rows[0]]
+    assert fixed_suffix_lengths == [2, 4]
+    assert slot_count == 2
+    assert fixed_tokens == 6
+    assert logits.shape == (2, 1, model.vocab_size)
+    assert engine.stats.prefill_packed_fixed_capacity_attempts == 1
+    assert engine.stats.prefill_packed_fixed_capacity_accepts == 1
+    assert engine.stats.prefill_packed_fixed_capacity_reject_reason_counts == {}
+    for row in source_prefix_rows:
+        engine._release_prefix_row(row)
+    for row in real_rows:
+        engine._release_active_row(row)
+
+
+def test_continuous_batch_engine_rejects_fixed_capacity_packed_prefill_multi_source_dummy_slots(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv(
+        "TORCHINFERNO_CONTINUOUS_PACKED_RAGGED_PREFILL_FIXED_CAPACITY_GRAPH",
+        "1",
+    )
+    monkeypatch.setenv(
+        "TORCHINFERNO_CONTINUOUS_PACKED_RAGGED_PREFILL_FIXED_CAPACITY_MIN_CALLS",
+        "1",
+    )
+    shape_key = "prefix_graph:b2:s5:p4-6:src2:mixed1"
+    pattern_key = f"{shape_key}|p4:s2/p6:s4"
+    model = _SelectedLogitsToyModel()
+    engine = ContinuousBatchEngine(
+        model,
+        device=torch.device("cpu"),
+        max_active_requests=2,
+        prefix_cache_capacity=2,
+        profile_timings=True,
+    )
+    engine.start_online(max_seq_len=8)
+    real_rows = [engine._acquire_active_row(), engine._acquire_active_row()]
+    source_rows = [
+        engine._acquire_free_prefix_row_or_none(),
+        engine._acquire_free_prefix_row_or_none(),
+    ]
+    assert None not in source_rows
+    source_prefix_rows = [int(row) for row in source_rows if row is not None]
+    engine._packed_prefill_fixed_capacity_counts[pattern_key] = {
+        (4, 2): 2,
+        (6, 4): 1,
+    }
+    engine._packed_prefill_fixed_capacity_seen[pattern_key] = 1
+
+    result = engine._try_fixed_capacity_packed_prefill_logits(
+        input_ids=torch.tensor([[3, 4, 5, 6, 0], [1, 2, 0, 0, 0]], dtype=torch.long),
+        group=[
+            (1, ServingRequest("long", (3, 4, 5, 6), 1), 6, object()),
+            (0, ServingRequest("short", (1, 2), 1), 4, object()),
+        ],
+        rows=real_rows,
+        suffixes=[[3, 4, 5, 6], [1, 2]],
+        suffix_lengths=[4, 2],
+        suffix_bucket=5,
+        source_prefix_rows=source_prefix_rows,
+        src_prefix_row=torch.tensor(source_prefix_rows, dtype=torch.long),
+        prefix_copy_len=6,
+        pad_rows=[],
+        pad_prefix_rows=[],
+        capture_on_miss=False,
+        profile_shape_key=shape_key,
+        packed_prefill_pattern_key=pattern_key,
+        skip_active_row_clear=True,
+    )
+
+    assert result is None
+    assert model.packed_prefill_graph_q_lens == []
+    assert engine.stats.prefill_packed_fixed_capacity_attempts == 1
+    assert engine.stats.prefill_packed_fixed_capacity_accepts == 0
+    assert engine.stats.prefill_packed_fixed_capacity_reject_reason_counts == {
+        "multi_src_prefix_dummy": 1,
+    }
+    for row in source_prefix_rows:
+        engine._release_prefix_row(row)
+    for row in real_rows:
+        engine._release_active_row(row)
+
+
 def test_continuous_batch_engine_records_fixed_capacity_packed_prefill_rejects(
     monkeypatch,
 ) -> None:
