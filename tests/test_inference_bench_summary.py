@@ -456,6 +456,32 @@ def _write_inference_bench_run(tmp_path) -> None:
         "runtime_repeated_sample_state_prepares": 5,
         "runtime_repeated_sample_state_hits": 1,
         "runtime_repeated_sample_state_tokens": 7,
+        "runtime_full_prompt_store_skipped_requests": 2,
+        "runtime_full_prompt_store_skipped_tokens": 40,
+        "runtime_full_prompt_store_skip_reason_counts": {
+            "pinned_without_allowance": 2,
+        },
+        "runtime_full_prompt_store_skip_reason_tokens": {
+            "pinned_without_allowance": 40,
+        },
+        "runtime_full_prompt_reuse_candidate_stored_requests": 3,
+        "runtime_full_prompt_reuse_candidate_stored_tokens": 60,
+        "runtime_full_prompt_reuse_candidate_requests": 2,
+        "runtime_full_prompt_reuse_candidate_tokens": 44,
+        "runtime_full_prompt_reuse_candidate_extra_tokens": 12,
+        "runtime_full_prompt_reuse_candidate_suffix_tokens": 4,
+        "runtime_full_prompt_reuse_candidate_token_counts": {"22": 2},
+        "runtime_full_prompt_reuse_candidate_extra_token_counts": {"6": 2},
+        "runtime_full_prompt_reuse_candidate_suffix_token_counts": {"2": 2},
+        "runtime_persistent_full_prompt_reuse_candidate_stored_requests": 1,
+        "runtime_persistent_full_prompt_reuse_candidate_stored_tokens": 24,
+        "runtime_persistent_full_prompt_reuse_candidate_requests": 1,
+        "runtime_persistent_full_prompt_reuse_candidate_tokens": 21,
+        "runtime_persistent_full_prompt_reuse_candidate_extra_tokens": 7,
+        "runtime_persistent_full_prompt_reuse_candidate_suffix_tokens": 1,
+        "runtime_persistent_full_prompt_reuse_candidate_token_counts": {"21": 1},
+        "runtime_persistent_full_prompt_reuse_candidate_extra_token_counts": {"7": 1},
+        "runtime_persistent_full_prompt_reuse_candidate_suffix_token_counts": {"1": 1},
     }
     (logs / "torchinferno_queue_profile.jsonl").write_text(json.dumps(queue_record) + "\n")
     (logs / "torchinferno.log").write_text(
@@ -1154,6 +1180,14 @@ def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) ->
     assert "prefix_greedy" in text
     assert "repeat_hits" in text
     assert "review" in text
+    assert "[torchinferno full-prompt store skips]" in text
+    assert "pinned_without_allowance=2" in text
+    assert "pinned_without_allowance=40" in text
+    assert "[torchinferno full-prompt reuse candidates]" in text
+    assert "session" in text
+    assert "persistent" in text
+    assert "22=2" in text
+    assert "21=1" in text
     assert "[long_output provider gaps vs torchinferno]" in text
     assert "best_provider" in text
     assert "+8.0" in text

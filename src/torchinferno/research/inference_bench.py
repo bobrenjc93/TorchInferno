@@ -132,6 +132,8 @@ _QUEUE_PROFILE_FIELDS = (
     "runtime_prefix_reuse_tokens",
     "runtime_prefix_reuse_route_counts",
     "runtime_prefix_reuse_hit_token_counts",
+    "runtime_prefix_reuse_candidate_tokens",
+    "runtime_prefix_reuse_candidate_token_counts",
     "runtime_prefill_batches",
     "runtime_prefill_forward_ms",
     "runtime_prefill_wall_ms",
@@ -367,6 +369,28 @@ _QUEUE_PROFILE_FIELDS = (
     "runtime_repeated_sample_state_prepares",
     "runtime_repeated_sample_state_hits",
     "runtime_repeated_sample_state_tokens",
+    "runtime_full_prompt_store_skipped_requests",
+    "runtime_full_prompt_store_skipped_tokens",
+    "runtime_full_prompt_store_skip_reason_counts",
+    "runtime_full_prompt_store_skip_reason_tokens",
+    "runtime_full_prompt_reuse_candidate_stored_requests",
+    "runtime_full_prompt_reuse_candidate_stored_tokens",
+    "runtime_full_prompt_reuse_candidate_requests",
+    "runtime_full_prompt_reuse_candidate_tokens",
+    "runtime_full_prompt_reuse_candidate_extra_tokens",
+    "runtime_full_prompt_reuse_candidate_suffix_tokens",
+    "runtime_full_prompt_reuse_candidate_token_counts",
+    "runtime_full_prompt_reuse_candidate_extra_token_counts",
+    "runtime_full_prompt_reuse_candidate_suffix_token_counts",
+    "runtime_persistent_full_prompt_reuse_candidate_stored_requests",
+    "runtime_persistent_full_prompt_reuse_candidate_stored_tokens",
+    "runtime_persistent_full_prompt_reuse_candidate_requests",
+    "runtime_persistent_full_prompt_reuse_candidate_tokens",
+    "runtime_persistent_full_prompt_reuse_candidate_extra_tokens",
+    "runtime_persistent_full_prompt_reuse_candidate_suffix_tokens",
+    "runtime_persistent_full_prompt_reuse_candidate_token_counts",
+    "runtime_persistent_full_prompt_reuse_candidate_extra_token_counts",
+    "runtime_persistent_full_prompt_reuse_candidate_suffix_token_counts",
 )
 
 
@@ -1008,6 +1032,48 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
                         "status",
                     ),
                     cache_integrity_rows,
+                )
+            )
+            lines.append("")
+
+        full_prompt_store_skip_rows = _full_prompt_store_skip_rows(queue_profiles)
+        if full_prompt_store_skip_rows:
+            lines.append("[torchinferno full-prompt store skips]")
+            lines.extend(
+                _format_table(
+                    (
+                        "temp",
+                        "max_tokens",
+                        "skipped_req",
+                        "skipped_tok",
+                        "reasons",
+                        "reason_tokens",
+                    ),
+                    full_prompt_store_skip_rows,
+                )
+            )
+            lines.append("")
+
+        full_prompt_reuse_rows = _full_prompt_reuse_candidate_rows(queue_profiles)
+        if full_prompt_reuse_rows:
+            lines.append("[torchinferno full-prompt reuse candidates]")
+            lines.extend(
+                _format_table(
+                    (
+                        "temp",
+                        "max_tokens",
+                        "scope",
+                        "stored_req",
+                        "stored_tok",
+                        "hits",
+                        "hit_tok",
+                        "extra_tok",
+                        "suffix_tok",
+                        "hit_lens",
+                        "extra_lens",
+                        "suffix_lens",
+                    ),
+                    full_prompt_reuse_rows,
                 )
             )
             lines.append("")
@@ -3007,6 +3073,92 @@ def _fmt_cache_integrity_flag(value: bool | None) -> str:
     if value is None:
         return "-"
     return "on" if value else "off"
+
+
+def _full_prompt_store_skip_rows(
+    queue_profiles: Sequence[QueueProfileSummary],
+) -> list[tuple[str, ...]]:
+    rows: list[tuple[str, ...]] = []
+    for profile in queue_profiles:
+        fields = profile.fields
+        skipped_requests = _numeric_field(
+            fields,
+            "runtime_full_prompt_store_skipped_requests",
+        ) or 0.0
+        skipped_tokens = _numeric_field(
+            fields,
+            "runtime_full_prompt_store_skipped_tokens",
+        ) or 0.0
+        reason_counts = fields.get("runtime_full_prompt_store_skip_reason_counts")
+        reason_tokens = fields.get("runtime_full_prompt_store_skip_reason_tokens")
+        if (
+            skipped_requests <= 0.0
+            and skipped_tokens <= 0.0
+            and not _numeric_mapping(reason_counts)
+            and not _numeric_mapping(reason_tokens)
+        ):
+            continue
+        rows.append(
+            (
+                _fmt_value(profile.temperature),
+                _fmt_value(profile.max_tokens),
+                _fmt_value(_int_if_whole(skipped_requests)),
+                _fmt_value(_int_if_whole(skipped_tokens)),
+                _fmt_top_mapping_counts(reason_counts),
+                _fmt_top_mapping_counts(reason_tokens),
+            )
+        )
+    return rows
+
+
+def _full_prompt_reuse_candidate_rows(
+    queue_profiles: Sequence[QueueProfileSummary],
+) -> list[tuple[str, ...]]:
+    rows: list[tuple[str, ...]] = []
+    for profile in queue_profiles:
+        for scope, prefix in (
+            ("session", "runtime_full_prompt_reuse_candidate"),
+            ("persistent", "runtime_persistent_full_prompt_reuse_candidate"),
+        ):
+            fields = profile.fields
+            stored_requests = _numeric_field(fields, f"{prefix}_stored_requests") or 0.0
+            stored_tokens = _numeric_field(fields, f"{prefix}_stored_tokens") or 0.0
+            hits = _numeric_field(fields, f"{prefix}_requests") or 0.0
+            hit_tokens = _numeric_field(fields, f"{prefix}_tokens") or 0.0
+            extra_tokens = _numeric_field(fields, f"{prefix}_extra_tokens") or 0.0
+            suffix_tokens = _numeric_field(fields, f"{prefix}_suffix_tokens") or 0.0
+            hit_counts = fields.get(f"{prefix}_token_counts")
+            extra_counts = fields.get(f"{prefix}_extra_token_counts")
+            suffix_counts = fields.get(f"{prefix}_suffix_token_counts")
+            if (
+                stored_requests <= 0.0
+                and stored_tokens <= 0.0
+                and hits <= 0.0
+                and hit_tokens <= 0.0
+                and extra_tokens <= 0.0
+                and suffix_tokens <= 0.0
+                and not _numeric_mapping(hit_counts)
+                and not _numeric_mapping(extra_counts)
+                and not _numeric_mapping(suffix_counts)
+            ):
+                continue
+            rows.append(
+                (
+                    _fmt_value(profile.temperature),
+                    _fmt_value(profile.max_tokens),
+                    scope,
+                    _fmt_value(_int_if_whole(stored_requests)),
+                    _fmt_value(_int_if_whole(stored_tokens)),
+                    _fmt_value(_int_if_whole(hits)),
+                    _fmt_value(_int_if_whole(hit_tokens)),
+                    _fmt_value(_int_if_whole(extra_tokens)),
+                    _fmt_value(_int_if_whole(suffix_tokens)),
+                    _fmt_top_mapping_counts(hit_counts),
+                    _fmt_top_mapping_counts(extra_counts),
+                    _fmt_top_mapping_counts(suffix_counts),
+                )
+            )
+    return rows
 
 
 def _prefill_target_ms(fields: Mapping[str, Any]) -> float | None:
@@ -5027,6 +5179,16 @@ def _top_mapping_entries(value: Any, *, limit: int) -> list[tuple[str, float | i
             entries.append((str(key), raw))
     entries.sort(key=lambda item: (-float(item[1]), item[0]))
     return entries[:limit]
+
+
+def _fmt_top_mapping_counts(value: Any, *, limit: int = 5) -> str:
+    entries = _top_mapping_entries(value, limit=limit)
+    if not entries:
+        return "-"
+    return ",".join(
+        f"{key}={_fmt_value(_int_if_whole(float(amount)))}"
+        for key, amount in entries
+    )
 
 
 def _numeric_mapping(value: Any) -> dict[str, float]:

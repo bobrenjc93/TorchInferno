@@ -15081,6 +15081,17 @@ extra `29.9s` 256-token suffix warmup pass. The queue profile still spent
 this is not a default lever. The few_shot target remains the cached-prefix
 prefill body and padding, not token selection or logits materialization.
 
+The analyzer now preserves the full-prompt reuse candidate counters already
+written by the OpenAI queue profile. Future multi_turn diagnostics that enable
+`TORCHINFERNO_CONTINUOUS_FULL_PROMPT_REUSE_CANDIDATE_PROFILE=1` or the
+persistent candidate variant will render stored requests, candidate hits,
+extra reusable tokens, remaining suffix tokens, and top hit-length buckets.
+It also renders full-prompt store skip reasons when present. Re-rendering the
+latest public multi_turn artifact stays quiet because the candidate counters
+are zero; the observed row already uses ordinary `request_prompt` KV hits for
+most requests, so the current fair target remains padded mixed-prefix prefill
+rather than a hidden full-prompt candidate route.
+
 The fixed-capacity packed-prefix probe is also rejected on current evidence.
 The long_output run with
 `TORCHINFERNO_CONTINUOUS_PACKED_RAGGED_PREFILL_FIXED_CAPACITY_GRAPH=1` accepted
