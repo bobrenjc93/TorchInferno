@@ -15050,6 +15050,16 @@ token; the inference-bench cache-integrity table marks those payloads as
 artifacts, preserving the clean verdict while making future regressions easier
 to catch even if they use different function names.
 
+The score-target analyzer now also treats no-sync prefill graph CUDA-event
+replay time as the prefill phase cost when synchronized
+`runtime_prefill_forward_ms` is unavailable. Re-rendering `20260711_210242`
+therefore points few_shot (`1292.6ms`), tree_of_thought (`9466.0ms`), and
+multi_turn (`1858.8ms`) at prefill instead of the misleading zero-forward
+decode label from old no-sync profiles. Long_output remains decode-led
+(`5921.9ms` decode-many GPU) with a large `4098.8ms` prefill component, so the
+fair targets stay normal prefill body efficiency, cached-prefix suffix prefill,
+and high-active decode-many replay cost.
+
 The fixed-capacity packed-prefix probe is also rejected on current evidence.
 The long_output run with
 `TORCHINFERNO_CONTINUOUS_PACKED_RAGGED_PREFILL_FIXED_CAPACITY_GRAPH=1` accepted

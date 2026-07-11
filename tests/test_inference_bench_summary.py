@@ -16,6 +16,8 @@ from torchinferno.research.inference_bench import (
     _prefill_packed_fixed_capacity_reject_rows,
     _prefill_shape_call_count,
     _prefill_shape_dense_forward_ms,
+    _prefill_target_ms,
+    _top_prefill_target_entry,
     format_inference_bench_summary,
     summarize_inference_bench_run,
 )
@@ -1381,6 +1383,33 @@ def test_phase_target_can_select_sampling() -> None:
             capture_ms=0.0,
         )
         == "prefill+decode"
+    )
+
+
+def test_prefill_target_uses_gpu_replay_timing_without_sync() -> None:
+    fields = {
+        "runtime_prefill_forward_ms": 0.0,
+        "runtime_prefill_graph_replay_gpu_ms": 40.0,
+        "runtime_prefill_shape_graph_replay_gpu_ms": {
+            "prefix_graph:b2:s12:p45-45:src1:mixed0": 30.0,
+            "prefix_graph:b4:s12:p45-45:src1:mixed0": 10.0,
+        },
+        "runtime_decode_many_model_gpu_ms": 0.0,
+    }
+
+    assert _prefill_target_ms(fields) == 40.0
+    assert (
+        _phase_target(
+            prefill_ms=_prefill_target_ms(fields),
+            decode_ms=0.0,
+            sample_ms=0.0,
+            capture_ms=0.0,
+        )
+        == "prefill"
+    )
+    assert _top_prefill_target_entry(fields) == (
+        "prefix_graph:b2:s12:p45-45:src1:mixed0",
+        30.0,
     )
 
 

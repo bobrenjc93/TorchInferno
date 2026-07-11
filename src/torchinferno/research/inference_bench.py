@@ -2709,7 +2709,7 @@ def _torchinferno_score_target_rows(
             higher_is_better=False,
         )
         fields = profile.fields
-        prefill_ms = _numeric_field(fields, "runtime_prefill_forward_ms")
+        prefill_ms = _prefill_target_ms(fields)
         prefill_sample_ms = _numeric_field(fields, "runtime_prefill_sample_ms")
         _prefill_active_tokens, prefill_model_tokens, prefill_padding_tokens = (
             _prefill_token_totals(fields)
@@ -2742,9 +2742,7 @@ def _torchinferno_score_target_rows(
             sample_ms=prefill_sample_ms,
             capture_ms=capture_ms,
         )
-        hot_prefill, _hot_prefill_ms = _top_mapping_entry(
-            fields.get("runtime_prefill_shape_forward_ms")
-        )
+        hot_prefill, _hot_prefill_ms = _top_prefill_target_entry(fields)
         hot_decode, _hot_decode_ms = _top_mapping_entry(
             fields.get("runtime_decode_many_shape_gpu_ms")
         )
@@ -2934,6 +2932,33 @@ def _cache_integrity_counter(fields: Mapping[str, Any], name: str) -> float:
 
 def _fmt_cache_integrity_counter(value: float) -> str:
     return _fmt_value(_int_if_whole(value))
+
+
+def _prefill_target_ms(fields: Mapping[str, Any]) -> float | None:
+    candidates = [
+        _numeric_field(fields, "runtime_prefill_forward_ms"),
+        _numeric_field(fields, "runtime_prefill_graph_replay_gpu_ms"),
+        _sum_numeric_mapping(fields.get("runtime_prefill_shape_graph_replay_gpu_ms")),
+        _sum_numeric_mapping(fields.get("runtime_prefill_graph_replay_shape_gpu_ms")),
+        _numeric_field(fields, "runtime_prefill_graph_replay_ms"),
+        _sum_numeric_mapping(fields.get("runtime_prefill_shape_graph_replay_ms")),
+    ]
+    values = [value for value in candidates if value is not None]
+    return max(values) if values else None
+
+
+def _top_prefill_target_entry(fields: Mapping[str, Any]) -> tuple[str | None, float | None]:
+    for name in (
+        "runtime_prefill_shape_forward_ms",
+        "runtime_prefill_shape_graph_replay_gpu_ms",
+        "runtime_prefill_graph_replay_shape_gpu_ms",
+        "runtime_prefill_shape_graph_replay_ms",
+        "runtime_prefill_graph_replay_shape_ms",
+    ):
+        shape, value = _top_mapping_entry(fields.get(name))
+        if shape is not None:
+            return shape, value
+    return None, None
 
 
 def _phase_target(
