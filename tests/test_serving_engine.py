@@ -3682,6 +3682,37 @@ def test_continuous_batch_engine_prefill_graph_gpu_timing_gate(
     assert timed_engine._prefill_graph_gpu_timing_enabled()
 
 
+def test_continuous_batch_engine_flushes_prefill_gpu_shape_times_without_profile_timings() -> None:
+    class _FakeEvent:
+        def __init__(self, elapsed_ms: float) -> None:
+            self.elapsed_ms = float(elapsed_ms)
+
+        def elapsed_time(self, _end) -> float:
+            return self.elapsed_ms
+
+    engine = ContinuousBatchEngine(
+        _CaptureReportingSelectedLogitsToyModel([True]),
+        device=torch.device("cpu"),
+        max_active_requests=2,
+        prefix_cache_capacity=0,
+        profile_timings=False,
+    )
+    engine._pending_prefill_graph_events = [
+        (_FakeEvent(1.25), object(), True, "graph:capture", "profile:capture"),
+        (_FakeEvent(2.5), object(), False, "graph:replay", "profile:replay"),
+    ]
+
+    engine._flush_prefill_graph_gpu_timers()
+
+    assert engine.stats.prefill_graph_capture_gpu_ms == 1.25
+    assert engine.stats.prefill_graph_replay_gpu_ms == 2.5
+    assert engine.stats.prefill_graph_capture_shape_gpu_ms == {"graph:capture": 1.25}
+    assert engine.stats.prefill_graph_replay_shape_gpu_ms == {"graph:replay": 2.5}
+    assert engine.stats.prefill_shape_graph_capture_gpu_ms == {"profile:capture": 1.25}
+    assert engine.stats.prefill_shape_graph_replay_gpu_ms == {"profile:replay": 2.5}
+    assert engine._pending_prefill_graph_events == []
+
+
 def test_continuous_batch_engine_counts_ragged_prefill_miss_shapes() -> None:
     model = _SelectedRaggedGraphMissToyModel()
     engine = ContinuousBatchEngine(

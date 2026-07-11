@@ -14812,6 +14812,17 @@ profiles without enabling full synchronized CPU timing. Set
 public runs should rank few_shot and multi_turn prefill bodies from these GPU
 maps instead of requiring a separate sync-timing rerun.
 
+A current-head no-sync queue-profile validation on `49107ad` wrote
+`/tmp/inference-bench-ti-few-491-results/.../runs/20260711_185744` and landed
+at `171.1 / 33.4 / 197.4ms`, `977/1000` correct. The aggregate prefill graph
+CUDA-event timer worked (`runtime_prefill_graph_replay_gpu_ms=1811.6ms`) and
+confirmed that the no-sync run stayed in the same few_shot band, but the
+per-shape GPU maps were empty because the prefill event flush reused the
+full-timing-only shape-time helper. Prefill GPU-event flush now uses the
+ungated GPU-event shape recorder, matching decode GPU timing, so future
+public-style queue profiles should include both aggregate and per-shape prefill
+GPU maps.
+
 ## Priority for a focused (non-loop) session
 
 1. Prefill MFU (Issue 1) — biggest TTFT lever, ~2x, affects 3/5 benchmarks.

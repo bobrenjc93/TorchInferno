@@ -6222,26 +6222,26 @@ class ContinuousBatchEngine:
                 continue
             if bool(captured):
                 self.stats.prefill_graph_capture_gpu_ms += elapsed_ms
-                self._record_shape_time(
+                self._record_gpu_event_shape_time(
                     self.stats.prefill_graph_capture_shape_gpu_ms,
                     str(graph_shape_key),
                     elapsed_ms,
                 )
                 if profile_shape_key is not None:
-                    self._record_shape_time(
+                    self._record_gpu_event_shape_time(
                         self.stats.prefill_shape_graph_capture_gpu_ms,
                         str(profile_shape_key),
                         elapsed_ms,
                     )
                 continue
             self.stats.prefill_graph_replay_gpu_ms += elapsed_ms
-            self._record_shape_time(
+            self._record_gpu_event_shape_time(
                 self.stats.prefill_graph_replay_shape_gpu_ms,
                 str(graph_shape_key),
                 elapsed_ms,
             )
             if profile_shape_key is not None:
-                self._record_shape_time(
+                self._record_gpu_event_shape_time(
                     self.stats.prefill_shape_graph_replay_gpu_ms,
                     str(profile_shape_key),
                     elapsed_ms,
