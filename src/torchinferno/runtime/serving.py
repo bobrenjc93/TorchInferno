@@ -2189,15 +2189,12 @@ class ContinuousBatchEngine:
         admitted = self._admit_ready_requests(waiting, step, occupied)
 
         prefill_states: list[_ActiveRequest] = []
-        exact_reuse_group: list[tuple[int, ServingRequest, int, _ReusablePrefix]] = []
         for original_index, request in admitted:
             match, entry = self.prefix_cache.lookup(request.prompt)
             reusable = self.reusable_prefixes.get(entry.route_id) if entry is not None else None
             prefix_hit = match.depth if (reusable is not None and match.depth > 0) else 0
-            if reusable is not None and prefix_hit >= len(request.prompt) and reusable.logits is not None:
-                exact_reuse_group.append((original_index, request, prefix_hit, reusable))
-                continue
-            if reusable is not None and prefix_hit >= len(request.prompt):
+            prefix_hit = self._prefix_hit_requiring_logits(request.prompt, prefix_hit)
+            if reusable is not None and prefix_hit <= 0:
                 reusable = None
                 prefix_hit = 0
             self._record_full_prompt_reuse_candidate_lookup(request.prompt, prefix_hit)
@@ -2219,24 +2216,10 @@ class ContinuousBatchEngine:
             )
             state._prefill_suffix = suffix
             prefill_states.append(state)
-        self.stats.prefill_admitted_requests += len(prefill_states) + len(exact_reuse_group)
-
-        exact_reuse_active: list[_ActiveRequest] = []
-        exact_reuse_processed = False
-
-        def finish_exact_reuse() -> list[_ActiveRequest]:
-            nonlocal exact_reuse_active, exact_reuse_processed
-            if exact_reuse_group and not exact_reuse_processed:
-                exact_reuse_active = self._prefill_exact_prefix_batch(
-                    exact_reuse_group,
-                    step,
-                    events=events,
-                )
-                exact_reuse_processed = True
-            return exact_reuse_active
+        self.stats.prefill_admitted_requests += len(prefill_states)
 
         if not decode_states and not prefill_states and not self._online_prefilling:
-            self._online_active = finish_exact_reuse()
+            self._online_active = []
             self._online_step = step + 1
             return events
 
@@ -2290,7 +2273,7 @@ class ContinuousBatchEngine:
                 max_q = max(max_q, q_len)
 
             if not batch_rows:
-                self._online_active = decode_states + finish_exact_reuse()
+                self._online_active = decode_states
                 self._online_prefilling = still_prefilling
                 self._online_step = step + 1
                 return events
@@ -2363,7 +2346,6 @@ class ContinuousBatchEngine:
                     else:
                         still_prefilling.append(state)
 
-            next_active.extend(finish_exact_reuse())
             self._online_active = next_active
             self._online_prefilling = still_prefilling
         else:
@@ -2382,7 +2364,6 @@ class ContinuousBatchEngine:
                     pass
                 else:
                     next_active.append(item)
-            next_active.extend(finish_exact_reuse())
             self._online_active = next_active
 
         self._online_step = step + 1
@@ -2405,20 +2386,17 @@ class ContinuousBatchEngine:
         # advances incrementally, and prefix KV copies are folded into the first
         # suffix chunk.
         self._prepare_chunked_common_prefix_for_admission(admitted)
-        exact_reuse_group: list[tuple[int, ServingRequest, int, _ReusablePrefix]] = []
         for original_index, request in admitted:
             if request.max_new_tokens == 0:
                 continue
             match, entry = self.prefix_cache.lookup(request.prompt)
             reusable = self.reusable_prefixes.get(entry.route_id) if entry is not None else None
             prefix_hit = match.depth if (reusable is not None and match.depth > 0) else 0
-            source_row = reusable.row if (reusable is not None and prefix_hit > 0) else -1
-            if reusable is not None and prefix_hit >= len(request.prompt) and reusable.logits is not None:
-                exact_reuse_group.append((original_index, request, prefix_hit, reusable))
-                continue
-            if reusable is not None and prefix_hit >= len(request.prompt):
+            prefix_hit = self._prefix_hit_requiring_logits(request.prompt, prefix_hit)
+            if reusable is not None and prefix_hit <= 0:
                 reusable = None
                 prefix_hit = 0
+            source_row = reusable.row if (reusable is not None and prefix_hit > 0) else -1
             row = self._acquire_active_row()
             if prefix_hit > 0:
                 self._record_prefix_reuse(prefix_hit, reusable)
@@ -2437,11 +2415,13 @@ class ContinuousBatchEngine:
                 prefix_source_row=source_row,
             )
             self._online_prefilling.append(state)
-        return self._prefill_exact_prefix_batch(
-            exact_reuse_group,
-            step,
-            events=events,
-        )
+        return []
+
+    @staticmethod
+    def _prefix_hit_requiring_logits(prompt: tuple[int, ...], prefix_hit: int) -> int:
+        if prefix_hit >= len(prompt):
+            return max(0, len(prompt) - 1)
+        return prefix_hit
 
     def _prepare_chunked_common_prefix_for_admission(
         self,
@@ -2897,11 +2877,12 @@ class ContinuousBatchEngine:
                     )
                 )
                 continue
-            if (
-                reusable is not None
-                and reusable_prefix_tokens >= len(request.prompt)
-                and reusable.logits is None
-            ):
+            if reusable is not None:
+                reusable_prefix_tokens = self._prefix_hit_requiring_logits(
+                    request.prompt,
+                    reusable_prefix_tokens,
+                )
+            if reusable is not None and reusable_prefix_tokens <= 0:
                 reusable = None
                 reusable_prefix_tokens = 0
             self._record_full_prompt_reuse_candidate_lookup(
@@ -2910,6 +2891,7 @@ class ContinuousBatchEngine:
             )
             if reusable is not None and reusable_prefix_tokens > 0:
                 suffix_len = len(request.prompt) - reusable_prefix_tokens
+                prefix_batch_key = reusable_prefix_tokens
                 batch_suffix_len = -1 if pad_prefix_suffixes else suffix_len
                 if pad_prefix_suffixes and self._mixed_prefix_prefill_enabled():
                     suffix_bucket = self._suffix_bucket(suffix_len)
@@ -2923,9 +2905,9 @@ class ContinuousBatchEngine:
                         not self._mixed_prefix_dynamic_context_enabled()
                         or suffix_bucket <= self._mixed_prefix_dynamic_context_max_suffix()
                     ):
-                        reusable_prefix_tokens = -1
-                prefix_batchable[(reusable_prefix_tokens, batch_suffix_len)].append(
-                    (original_index, request, match.depth, reusable)
+                        prefix_batch_key = -1
+                prefix_batchable[(prefix_batch_key, batch_suffix_len)].append(
+                    (original_index, request, reusable_prefix_tokens, reusable)
                 )
             else:
                 batchable[len(request.prompt)].append((original_index, request, 0))
@@ -5064,6 +5046,7 @@ class ContinuousBatchEngine:
         *,
         events: list[ServingTokenEvent] | None = None,
     ) -> list[_ActiveRequest]:
+        group = self._prefix_group_requiring_logits(group)
         suffix_lengths = [
             len(request.prompt) - prefix_hit_tokens
             for _index, request, prefix_hit_tokens, _reusable in group
@@ -5105,8 +5088,6 @@ class ContinuousBatchEngine:
             graph_active = self._prefill_prefix_graph_batch(group, step, events=events)
             if graph_active is not None:
                 return graph_active
-        if events is not None and suffix_lengths and max(suffix_lengths) == 0:
-            return self._prefill_exact_prefix_batch(group, step, events=events)
         if len(set(suffix_lengths)) > 1:
             padded_active = self._prefill_prefix_padded_suffix_batch(group, step, events=events)
             if padded_active is not None:
@@ -5133,9 +5114,7 @@ class ContinuousBatchEngine:
             logits, _ = self._prefill_logits(input_ids, cache=self._cache_view(rows))
             self._record_model_call("prefill", len(group), tokens=input_ids.numel())
         else:
-            if any(item is None for item in reusable_logits):
-                raise RuntimeError("exact-prefix reuse requires cached logits")
-            logits = torch.cat([item.to(self.device) for item in reusable_logits], dim=0)
+            raise RuntimeError("exact-prefix cached-logits reuse is disabled")
 
         next_tokens = self._sample_logits_for_requests(
             logits[:, -1, :],
@@ -5167,6 +5146,18 @@ class ContinuousBatchEngine:
             self._record_token_event(events, state, next_token, step, finished=self._should_finish_before_decode(state))
             active.append(state)
         return active
+
+    def _prefix_group_requiring_logits(
+        self,
+        group: list[tuple[int, ServingRequest, int, _ReusablePrefix]],
+    ) -> list[tuple[int, ServingRequest, int, _ReusablePrefix]]:
+        changed = False
+        normalized: list[tuple[int, ServingRequest, int, _ReusablePrefix]] = []
+        for original_index, request, prefix_hit_tokens, reusable in group:
+            capped = self._prefix_hit_requiring_logits(request.prompt, prefix_hit_tokens)
+            changed = changed or capped != prefix_hit_tokens
+            normalized.append((original_index, request, capped, reusable))
+        return normalized if changed else group
 
     def _prefix_prefill_split_suffix_buckets_enabled(self) -> bool:
         env_name = "TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SPLIT_SUFFIX_BUCKETS"
@@ -5382,304 +5373,6 @@ class ContinuousBatchEngine:
             accepted=True,
         )
         return list(by_suffix_bucket.values())
-
-    def _prefill_exact_prefix_batch(
-        self,
-        group: list[tuple[int, ServingRequest, int, _ReusablePrefix]],
-        step: int,
-        *,
-        events: list[ServingTokenEvent] | None = None,
-    ) -> list[_ActiveRequest]:
-        if not group:
-            return []
-        self.stats.prefill_prefix_reuse_batches += 1
-        acquired_rows: list[int] = []
-        try:
-            next_tokens, logits_by_index = self._sample_exact_prefix_group(group)
-            self._record_prefix_reuse_batch(
-                (prefix_hit_tokens, reusable)
-                for _original_index, _request, prefix_hit_tokens, reusable in group
-            )
-
-            active_items: list[tuple[_ActiveRequest, int, int]] = []
-            copy_groups: dict[tuple[int, int], list[int]] = defaultdict(list)
-            continuation_reuse_groups: dict[tuple[Hashable, float], list[int]] = defaultdict(list)
-            continuation_reuse: dict[int, _ReusablePrefix] = {}
-            pending_rows: list[int] = []
-            active: list[_ActiveRequest] = []
-            first_tokens = [0 for _ in group]
-            first_token_finished: list[bool | None] = [None for _ in group]
-            for row_index, (_original_index, request, _prefix_hit_tokens, _reusable) in enumerate(group):
-                next_token = int(next_tokens[row_index])
-                first_tokens[row_index] = int(next_token)
-                generated = 1
-                finished = request.is_stop_token(next_token) or generated >= request.max_new_tokens
-                if finished:
-                    first_token_finished[row_index] = True
-                    continue
-
-                generated_prefix = (*request.prompt, next_token)
-                continuation = self._lookup_exact_reusable_prefix(generated_prefix)
-                if continuation is not None:
-                    continuation_reuse[row_index] = continuation
-                    continuation_reuse_groups[
-                        (continuation.route_id, self._request_temperature(request))
-                    ].append(row_index)
-                    continue
-                first_token_finished[row_index] = False
-                pending_rows.append(row_index)
-
-            continuation_next_tokens: dict[int, int] = {}
-            for indices in continuation_reuse_groups.values():
-                continuation = continuation_reuse[indices[0]]
-                if continuation.logits is None:
-                    continue
-                temperature = self._request_temperature(group[indices[0]][1])
-                sampled_tokens = self._sample_reusable_prefix_next_token_list(
-                    continuation,
-                    len(indices),
-                    temperature=temperature,
-                )
-                for token_index, row_index in enumerate(indices):
-                    continuation_next_tokens[row_index] = int(sampled_tokens[token_index])
-
-            if events is not None:
-                second_events: list[ServingTokenEvent] = []
-                for row_index, (_original_index, request, _prefix_hit_tokens, _reusable) in enumerate(group):
-                    first_token = first_tokens[row_index]
-                    finished = first_token_finished[row_index]
-                    second_token = continuation_next_tokens.get(row_index)
-                    if finished is None:
-                        finished = second_token is not None and request.is_stop_token(second_token)
-                    events.append(
-                        ServingTokenEvent(
-                            request_id=request.request_id,
-                            token=first_token,
-                            step=step,
-                            generated=1,
-                            finished=bool(finished),
-                        )
-                    )
-                    if second_token is None or request.is_stop_token(second_token):
-                        continue
-                    second_generated = 2
-                    second_events.append(
-                        ServingTokenEvent(
-                            request_id=request.request_id,
-                            token=second_token,
-                            step=step,
-                            generated=second_generated,
-                            finished=second_generated >= request.max_new_tokens,
-                        )
-                    )
-                events.extend(second_events)
-
-            continuation_copy_groups: dict[tuple[int, int], list[int]] = defaultdict(list)
-            continuation_active: list[_ActiveRequest] = []
-            generated_reuse_entries: list[tuple[int, _ReusablePrefix | None]] = []
-            for row_index, next_token in continuation_next_tokens.items():
-                original_index, request, _prefix_hit_tokens, _reusable = group[row_index]
-                continuation = continuation_reuse[row_index]
-                second_token = int(next_token)
-                generated = 2
-                generated_prefix_len = len(request.prompt) + 1
-                generated_reuse_entries.append((generated_prefix_len, continuation))
-                self.stats.generated_prefix_reuse_requests += 1
-                self.stats.generated_prefix_reuse_tokens += generated_prefix_len
-                finished = request.is_stop_token(second_token) or generated >= request.max_new_tokens
-                if finished:
-                    continue
-
-                row = self._acquire_active_row()
-                acquired_rows.append(row)
-                state = _ActiveRequest(
-                    original_index=original_index,
-                    request=request,
-                    tokens=[*request.prompt, int(next_tokens[row_index]), second_token],
-                    generated=generated,
-                    row=row,
-                    last_token=second_token,
-                    seq_len=generated_prefix_len,
-                    prefix_hit_tokens=generated_prefix_len,
-                    started_step=step,
-                )
-                continuation_copy_groups[(continuation.row, generated_prefix_len)].append(row)
-                continuation_active.append(state)
-
-            self._record_prefix_reuse_batch(generated_reuse_entries)
-            for (source_row, tokens), dest_rows in continuation_copy_groups.items():
-                self._copy_prefix_to_rows(source_row, dest_rows, tokens)
-            for state in continuation_active:
-                state.seq_len = self._cache_row_seq_len(state.row, state.seq_len)
-                active.append(state)
-
-            for row_index in pending_rows:
-                original_index, request, prefix_hit_tokens, _reusable = group[row_index]
-                next_token = int(next_tokens[row_index])
-                generated = 1
-                row = self._acquire_active_row()
-                acquired_rows.append(row)
-                state = _ActiveRequest(
-                    original_index=original_index,
-                    request=request,
-                    tokens=[*request.prompt, next_token],
-                    generated=generated,
-                    row=row,
-                    last_token=next_token,
-                    seq_len=len(request.prompt),
-                    prefix_hit_tokens=prefix_hit_tokens,
-                    started_step=step,
-                )
-                copy_groups[(_reusable.row, prefix_hit_tokens)].append(row)
-                active_items.append((state, row_index, row))
-
-            for (source_row, prefix_hit_tokens), dest_rows in copy_groups.items():
-                self._copy_prefix_to_rows(source_row, dest_rows, prefix_hit_tokens)
-            for state, row_index, row in active_items:
-                state.seq_len = self._cache_row_seq_len(row, len(state.request.prompt))
-                self._store_reusable_prefix(
-                    state.request.request_id,
-                    state.request.prompt,
-                    row,
-                    logits_by_index[row_index],
-                    allow_pinned=self._allow_pinned_full_prompt_store(state.request),
-                )
-                active.append(state)
-            return active
-        except Exception:
-            for row in acquired_rows:
-                self._release_active_row(row)
-            raise
-
-    def _sample_exact_prefix_group(
-        self,
-        group: list[tuple[int, ServingRequest, int, _ReusablePrefix]],
-    ) -> tuple[list[int], list[Tensor]]:
-        by_route: dict[tuple[Hashable, float], list[int]] = defaultdict(list)
-        for index, (_original_index, _request, _prefix_hit_tokens, reusable) in enumerate(group):
-            by_route[(reusable.route_id, self._request_temperature(_request))].append(index)
-
-        next_tokens = [0 for _ in group]
-        logits_by_index: list[Tensor | None] = [None for _ in group]
-        for indices in by_route.values():
-            reusable = group[indices[0]][3]
-            if reusable.logits is None:
-                raise RuntimeError("exact-prefix sampling requires cached logits")
-            sampled_tokens = self._sample_reusable_prefix_next_token_list(
-                reusable,
-                len(indices),
-                temperature=self._request_temperature(group[indices[0]][1]),
-            )
-            for token_index, group_index in enumerate(indices):
-                next_tokens[group_index] = int(sampled_tokens[token_index])
-                logits_by_index[group_index] = reusable.logits
-
-        if any(logits is None for logits in logits_by_index):
-            raise RuntimeError("exact-prefix sampling did not produce logits for every request")
-        return next_tokens, [logits for logits in logits_by_index if logits is not None]
-
-    def _sample_reusable_prefix_next_token_list(
-        self,
-        reusable: _ReusablePrefix,
-        batch_size: int,
-        *,
-        temperature: float | None = None,
-    ) -> list[int]:
-        if reusable.logits is None:
-            raise RuntimeError("exact-prefix sampling requires cached logits")
-        sampling_temperature = float(self.temperature if temperature is None else temperature)
-        if sampling_temperature <= 0.0 and reusable.greedy_token is not None:
-            sample_start_s = time.perf_counter() if self.profile_timings else 0.0
-            tokens = [int(reusable.greedy_token)] * max(0, int(batch_size))
-            if self.profile_timings:
-                sample_elapsed_ms = (time.perf_counter() - sample_start_s) * 1000.0
-                self.stats.prefill_sample_ms += sample_elapsed_ms
-                self.stats.prefill_sample_select_ms += sample_elapsed_ms
-            return tokens
-        sampled = self._sample_reusable_prefix_next_tokens(
-            reusable,
-            batch_size,
-            temperature=sampling_temperature,
-        )
-        return [int(token) for token in sampled.detach().cpu().tolist()]
-
-    def _sample_reusable_prefix_next_tokens(
-        self,
-        reusable: _ReusablePrefix,
-        batch_size: int,
-        *,
-        temperature: float | None = None,
-    ) -> Tensor:
-        if reusable.logits is None:
-            raise RuntimeError("exact-prefix sampling requires cached logits")
-        sample_start_s = time.perf_counter() if self.profile_timings else 0.0
-        sample_select_ms = 0.0
-        try:
-            logits = reusable.logits
-            sampling_temperature = float(self.temperature if temperature is None else temperature)
-            if sampling_temperature <= 0.0 and reusable.greedy_token is not None:
-                result = torch.full(
-                    (max(0, int(batch_size)),),
-                    int(reusable.greedy_token),
-                    dtype=torch.long,
-                    device=self.device,
-                )
-                if self.profile_timings:
-                    sample_select_ms = (time.perf_counter() - sample_start_s) * 1000.0
-                return result
-            if (
-                sampling_temperature > 0.0
-                and self._cached_repeated_sample_state_enabled
-            ):
-                prepare_state = self._prepare_repeated_sample_state
-                sample_from_state = self._sample_repeated_from_state
-                if callable(prepare_state) and callable(sample_from_state):
-                    if reusable.sample_state is None or reusable.sample_temperature != sampling_temperature:
-                        state_logits = logits[:, -1, :].to(self.device)
-                        reusable.sample_state = prepare_state(state_logits, sampling_temperature)
-                        reusable.sample_temperature = sampling_temperature
-                        if reusable.sample_state is not None:
-                            self.stats.repeated_sample_state_prepares += 1
-                    if reusable.sample_state is not None:
-                        sampled = sample_from_state(reusable.sample_state, batch_size, sampling_temperature)
-                        if sampled is not None:
-                            self.stats.repeated_sample_state_hits += 1
-                            self.stats.repeated_sample_state_tokens += int(batch_size)
-                            result = sampled.to(self.device)
-                            if self.profile_timings:
-                                sample_select_ms = (time.perf_counter() - sample_start_s) * 1000.0
-                            return result
-            result = self._sample_repeated_logits(
-                logits[:, -1, :].to(self.device),
-                batch_size,
-                temperature=sampling_temperature,
-            )
-            if sampling_temperature <= 0.0 and result.numel() > 0:
-                reusable.greedy_token = int(result.reshape(-1)[0].detach().cpu().item())
-            if self.profile_timings:
-                sample_select_ms = (time.perf_counter() - sample_start_s) * 1000.0
-            return result
-        finally:
-            if self.profile_timings:
-                sample_elapsed_ms = (time.perf_counter() - sample_start_s) * 1000.0
-                self.stats.prefill_sample_ms += sample_elapsed_ms
-                self.stats.prefill_sample_select_ms += sample_select_ms
-
-    def _sample_repeated_logits(
-        self,
-        logits: Tensor,
-        batch_size: int,
-        *,
-        temperature: float | None = None,
-    ) -> Tensor:
-        sampling_temperature = float(self.temperature if temperature is None else temperature)
-        if batch_size <= 1:
-            return self._sample_logits_with_temperature(logits, sampling_temperature)
-        sample_repeated = getattr(self.model, "sample_repeated_next_token", None)
-        if callable(sample_repeated):
-            return sample_repeated(logits, batch_size, sampling_temperature).to(self.device)
-        expanded = logits.expand(batch_size, logits.size(-1)).contiguous()
-        return self._sample_logits_with_temperature(expanded, sampling_temperature)
 
     def _prefill_prefix_padded_suffix_batch(
         self,
@@ -6026,6 +5719,14 @@ class ContinuousBatchEngine:
         events: list[ServingTokenEvent] | None = None,
     ) -> _ActiveRequest:
         self.stats.prefill_single_batches += 1
+        if reusable is not None:
+            prefix_hit_tokens = self._prefix_hit_requiring_logits(
+                request.prompt,
+                prefix_hit_tokens,
+            )
+        if reusable is not None and prefix_hit_tokens <= 0:
+            reusable = None
+            prefix_hit_tokens = 0
         row = self._acquire_active_row()
         suffix = request.prompt
         logits: Tensor
@@ -6042,8 +5743,6 @@ class ContinuousBatchEngine:
             )
             logits, _ = self._prefill_logits(input_ids, cache=self._cache_view([row]))
             self._record_model_call("prefill", 1, tokens=input_ids.numel())
-        elif reusable is not None and reusable.logits is not None:
-            logits = reusable.logits.to(self.device)
         else:
             raise RuntimeError("empty prompt suffix without a reusable prefix")
 
@@ -7801,10 +7500,6 @@ class ContinuousBatchEngine:
             return False
         if not env_flag("TORCHINFERNO_CONTINUOUS_PINNED_FULL_PROMPT_STORE_ADOPT_ON_FINISH", True):
             return False
-        if env_flag("TORCHINFERNO_CONTINUOUS_PINNED_FULL_PROMPT_STORE_LOGITS", False):
-            return False
-        if env_flag("TORCHINFERNO_CONTINUOUS_PREFIX_CACHE_STORE_LOGITS", False):
-            return False
         return True
 
     def _store_reusable_prefix(
@@ -7849,13 +7544,7 @@ class ContinuousBatchEngine:
             self._record_full_prompt_store_skip("prefix_row_unavailable_or_store_disabled", tokens)
 
     def _prefix_cache_store_logits_enabled(self, *, allow_pinned: bool) -> bool:
-        if "TORCHINFERNO_CONTINUOUS_PREFIX_CACHE_STORE_LOGITS" in os.environ:
-            return env_flag("TORCHINFERNO_CONTINUOUS_PREFIX_CACHE_STORE_LOGITS", False)
-        if allow_pinned:
-            return env_flag(
-                "TORCHINFERNO_CONTINUOUS_PINNED_FULL_PROMPT_STORE_LOGITS",
-                False,
-            )
+        del allow_pinned
         return False
 
     def _full_prompt_store_needs_logits(self, request: ServingRequest) -> bool:
@@ -8114,36 +7803,8 @@ class ContinuousBatchEngine:
         )
 
     def _should_collect_generated_prefix_logits(self, states: list[_ActiveRequest]) -> bool:
-        if not states or not self._generated_prefix_cache_base_enabled():
-            return False
-        configured = self.generated_prefix_cache
-        if configured is not None:
-            return bool(configured)
-        if env_flag("TORCHINFERNO_CONTINUOUS_GENERATED_PREFIX_CACHE", False):
-            return True
-        if not env_flag("TORCHINFERNO_CONTINUOUS_ADAPTIVE_GENERATED_PREFIX_CACHE", False):
-            return False
-        waiting = self._online_waiting
-        if waiting is None or not bool(waiting):
-            return False
-        candidate_prompts = {
-            state.request.prompt
-            for state in states
-            if state.generated > 0 and self._state_has_full_prompt_kv(state)
-        }
-        if not candidate_prompts:
-            return False
-        pending_exact = sum(
-            1
-            for item in waiting._items
-            if item.request.prompt in candidate_prompts
-        )
-        min_pending = env_int(
-            "TORCHINFERNO_CONTINUOUS_ADAPTIVE_GENERATED_PREFIX_MIN_PENDING",
-            16,
-            minimum=1,
-        )
-        return pending_exact >= min_pending
+        del states
+        return False
 
     def _finished_prefix_cache_enabled(self) -> bool:
         return (
@@ -8154,52 +7815,8 @@ class ContinuousBatchEngine:
         )
 
     @staticmethod
-    def _generated_prefix_route_id(tokens: tuple[int, ...]) -> tuple[str, tuple[int, ...]]:
-        return ("generated_prefix", tokens)
-
-    @staticmethod
     def _finished_prefix_route_id(tokens: tuple[int, ...]) -> tuple[str, tuple[int, ...]]:
         return ("finished_prefix", tokens)
-
-    def _lookup_exact_reusable_prefix(self, tokens: tuple[int, ...]) -> _ReusablePrefix | None:
-        if not self._generated_prefix_cache_enabled():
-            return None
-        route_id = self._generated_prefix_route_id(tokens)
-        reusable = self.reusable_prefixes.get(route_id)
-        if reusable is not None and reusable.tokens == tokens:
-            return reusable
-        match, entry = self.prefix_cache.lookup(tokens)
-        if entry is None or match.depth != len(tokens):
-            return None
-        reusable = self.reusable_prefixes.get(entry.route_id)
-        if reusable is None or reusable.tokens != tokens:
-            return None
-        return reusable
-
-    def _store_generated_reusable_prefix(
-        self,
-        request_id: str,
-        tokens: tuple[int, ...],
-        source_row: int,
-        logits: Tensor,
-    ) -> None:
-        if not self._generated_prefix_cache_base_enabled():
-            return
-        max_tokens = env_int("TORCHINFERNO_CONTINUOUS_GENERATED_PREFIX_CACHE_MAX_TOKENS", 1024, minimum=1)
-        if len(tokens) <= 0 or len(tokens) > max_tokens:
-            return
-        route_id = self._generated_prefix_route_id(tokens)
-        if route_id in self.reusable_prefixes:
-            return
-        store_logits = logits[:, None, :] if logits.ndim == 2 else logits
-        try:
-            self._store_reusable_prefix_tokens(route_id, request_id, tokens, source_row, store_logits)
-        except Exception:
-            if env_flag("TORCHINFERNO_CONTINUOUS_GENERATED_PREFIX_CACHE_STRICT", False):
-                raise
-            return
-        if route_id in self.reusable_prefixes:
-            self.stats.generated_prefix_store_requests += 1
 
     def _store_finished_reusable_prefix(self, state: _ActiveRequest) -> bool:
         if not self._finished_prefix_cache_enabled():
@@ -8255,26 +7872,8 @@ class ContinuousBatchEngine:
         states: list[_ActiveRequest],
         logits: Tensor | None,
     ) -> None:
-        if logits is None or not states or not self._should_collect_generated_prefix_logits(states):
-            return
-        seen: set[tuple[str, tuple[int, ...]]] = set()
-        for row_index, state in enumerate(states):
-            if state.generated <= 0 or not self._state_has_full_prompt_kv(state):
-                continue
-            tokens = tuple(state.tokens)
-            if len(tokens) <= len(state.request.prompt):
-                continue
-            route_id = self._generated_prefix_route_id(tokens)
-            if route_id in seen or route_id in self.reusable_prefixes:
-                continue
-            seen.add(route_id)
-            self._set_cache_row_seq_len(state.row, len(tokens))
-            self._store_generated_reusable_prefix(
-                state.request.request_id,
-                tokens,
-                state.row,
-                logits[row_index : row_index + 1],
-            )
+        del states, logits
+        return
 
     @staticmethod
     def _state_has_full_prompt_kv(state: _ActiveRequest) -> bool:
@@ -8282,17 +7881,7 @@ class ContinuousBatchEngine:
         return state.prefix_hit_tokens >= prompt_len or state.seq_len >= prompt_len
 
     def _needs_generated_prefix_logits(self, states: list[_ActiveRequest]) -> bool:
-        if not states or not self._should_collect_generated_prefix_logits(states):
-            return False
-        max_tokens = env_int("TORCHINFERNO_CONTINUOUS_GENERATED_PREFIX_CACHE_MAX_TOKENS", 1024, minimum=1)
-        for state in states:
-            if state.generated <= 0 or not self._state_has_full_prompt_kv(state):
-                continue
-            tokens = tuple(state.tokens)
-            if len(tokens) <= len(state.request.prompt) or len(tokens) > max_tokens:
-                continue
-            if self._generated_prefix_route_id(tokens) not in self.reusable_prefixes:
-                return True
+        del states
         return False
 
     def _store_reusable_prefix_tokens(
@@ -8952,8 +8541,9 @@ class ContinuousBatchEngine:
         events: list["ServingTokenEvent"] | None = None,
     ) -> list["_ActiveRequest"] | None:
         # FlashInfer-native prefix reuse: copy cached prefix KV into each row,
-        # then prefill only the suffix (seq_lens=prefix_len). Empty suffix (whole
-        # prompt cached) just samples the cached logits. FlashInfer-cache-safe.
+        # then prefill only the suffix (seq_lens=prefix_len). Exact prompt hits
+        # are capped before this point so at least one token is replayed.
+        group = self._prefix_group_requiring_logits(group)
         forward_fi = getattr(self.model, "forward_step_flashinfer", None)
         if forward_fi is None:
             return None
@@ -8988,7 +8578,10 @@ class ContinuousBatchEngine:
         next_tokens: list[int | None] = [None] * n
         out_logits: list[Tensor | None] = [None] * n
         suffix_idx = [i for i, (_x, req, hit, _r) in enumerate(group) if len(req.prompt) > hit]
-        full_idx = [i for i, (_x, req, hit, _r) in enumerate(group) if len(req.prompt) <= hit]
+        if len(suffix_idx) != len(group):
+            for row in rows:
+                self._release_active_row(row)
+            return None
         try:
             if suffix_idx:
                 suffixes = [list(group[i][1].prompt[group[i][2]:]) for i in suffix_idx]
@@ -9050,14 +8643,6 @@ class ContinuousBatchEngine:
                 for k, i in enumerate(suffix_idx):
                     next_tokens[i] = int(toks[k])
                     out_logits[i] = logits[k:k + 1]
-            for i in full_idx:
-                if group[i][3].logits is None:
-                    return None
-                cached = group[i][3].logits.to(self.device)
-                next_tokens[i] = int(
-                    self._sample_logits_for_requests(cached[:, -1, :], [group[i][1]]).item()
-                )
-                out_logits[i] = cached
         except Exception:
             for row in rows:
                 self._release_active_row(row)

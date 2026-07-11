@@ -18,6 +18,23 @@ from torchinferno.runtime.serving import (
 )
 
 
+def _drain_online_events(engine: ContinuousBatchEngine, *, limit: int = 100) -> list[object]:
+    events: list[object] = []
+    for _ in range(limit):
+        events.extend(engine.step_online())
+        if not engine.has_online_work():
+            return events
+    raise AssertionError("online engine did not drain")
+
+
+def _next_online_events(engine: ContinuousBatchEngine, *, limit: int = 100) -> list[object]:
+    for _ in range(limit):
+        events = engine.step_online()
+        if events:
+            return list(events)
+    raise AssertionError("online engine did not emit events")
+
+
 def test_dynamic_prefix_prefill_context_len_buckets_when_enabled(monkeypatch) -> None:
     monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_DYNAMIC_PREFIX_PREFILL_GRAPH", raising=False)
     monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_DYNAMIC_PREFIX_PREFILL_MIN_CONTEXT", raising=False)
@@ -4419,7 +4436,7 @@ def test_continuous_batch_engine_does_not_store_prompt_logits_by_default() -> No
     assert engine.reusable_prefixes["req"].logits is None
 
 
-def test_continuous_batch_engine_keeps_common_prefix_logits_for_exact_prompt(
+def test_continuous_batch_engine_does_not_keep_common_prefix_logits_for_exact_prompt(
     monkeypatch,
 ) -> None:
     monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PREFIX_CACHE_STORE_LOGITS", "1")
@@ -4443,8 +4460,7 @@ def test_continuous_batch_engine_keeps_common_prefix_logits_for_exact_prompt(
     assert [result.tokens[-1] for result in results] == [16, 22]
     common_route = ("common_prefix", shared)
     reusable = engine.reusable_prefixes[common_route]
-    assert reusable.logits is not None
-    assert reusable.logits.shape[-1] == model.vocab_size
+    assert reusable.logits is None
     assert model.prefill_cache_graph_calls == 0
 
 
@@ -4476,9 +4492,7 @@ def test_continuous_batch_engine_uses_prefix_graph_greedy_tokens(monkeypatch) ->
     assert engine.stats.prefill_graph_captures == 1
     for request in requests:
         reusable = engine.reusable_prefixes[request.request_id]
-        assert reusable.logits is not None
-        cached_token = int(torch.argmax(reusable.logits[:, -1, :], dim=-1).item())
-        assert cached_token == (request.prompt[-1] + 1) % model.vocab_size
+        assert reusable.logits is None
 
 
 def test_continuous_batch_engine_uses_warmed_prefix_token_graph_by_default(monkeypatch) -> None:
@@ -4576,7 +4590,7 @@ def test_continuous_batch_engine_uses_prefix_token_only_graph_when_logits_skippe
     assert engine.stats.full_prompt_store_skip_reason_counts == {"pinned_without_allowance": 3}
 
 
-def test_continuous_batch_engine_skips_prefix_token_only_graph_when_logits_needed(
+def test_continuous_batch_engine_uses_prefix_token_only_graph_when_logits_env_is_set(
     monkeypatch,
 ) -> None:
     monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_TOKEN_ONLY_GRAPH", "1")
@@ -4601,10 +4615,10 @@ def test_continuous_batch_engine_skips_prefix_token_only_graph_when_logits_neede
     results = engine.run(requests)
 
     assert [result.tokens[-1] for result in results] == [22, 24, 25]
-    assert model.prefill_token_graph_calls == 0
+    assert model.prefill_token_graph_calls == 1
     for request in requests:
         reusable = engine.reusable_prefixes[request.request_id]
-        assert reusable.logits is not None
+        assert reusable.logits is None
 
 
 def test_continuous_batch_engine_respects_common_prefix_ragged_suffix_threshold(
@@ -5457,7 +5471,7 @@ def test_continuous_batch_engine_suffix_bucket_split_default_scope(monkeypatch) 
     assert sampled_short._prefix_prefill_split_suffix_buckets_enabled()
 
 
-def test_continuous_batch_engine_reuses_exact_common_prompt_without_suffix_prefill(monkeypatch) -> None:
+def test_continuous_batch_engine_replays_one_token_for_exact_prompt_hit(monkeypatch) -> None:
     monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PREFIX_CACHE_STORE_LOGITS", "1")
     prompt = tuple(range(1, 18))
     model = _SelectedLogitsToyModel()
@@ -5466,35 +5480,37 @@ def test_continuous_batch_engine_reuses_exact_common_prompt_without_suffix_prefi
         device=torch.device("cpu"),
         max_active_requests=2,
         prefix_cache_capacity=4,
-        pin_shared_prefix=True,
         graph_prefill=True,
     )
-
-    results = engine.run(
-        [
-            ServingRequest("warm-a", prompt, 1, arrival_step=0),
-            ServingRequest("warm-b", prompt, 1, arrival_step=0),
-            ServingRequest("late-a", prompt, 1, arrival_step=1),
-            ServingRequest("late-b", prompt, 1, arrival_step=1),
-        ]
+    engine.start_online(max_seq_len=64)
+    _indexed, warm_active = engine._prefill_many(
+        [(0, ServingRequest("warm", prompt, 1, arrival_step=0))],
+        0,
+        events=[],
     )
-    by_id = {result.request_id: result for result in results}
+    for state in warm_active:
+        engine._finish_and_release(state, 0)
+    assert not engine.has_online_work()
+    assert engine.reusable_prefixes
+    assert all(prefix.logits is None for prefix in engine.reusable_prefixes.values())
 
-    assert [result.tokens[-1] for result in results] == [18, 18, 18, 18]
-    assert by_id["late-a"].prefix_hit_tokens == len(prompt)
-    assert by_id["late-b"].prefix_hit_tokens == len(prompt)
-    assert engine.stats.prefill_common_prefix_batches == 1
-    assert engine.stats.prefill_prefix_reuse_batches == 1
-    assert engine.stats.prefill_model_calls == 1
-    assert engine.stats.prefill_tokens == len(prompt)
-    assert engine.stats.prefix_reuse_requests == 2
-    assert engine.stats.prefix_reuse_tokens == 2 * len(prompt)
+    prefill_calls = engine.stats.prefill_model_calls
+    decode_calls = engine.stats.decode_model_calls
+    reuse_tokens = engine.stats.prefix_reuse_tokens
+    engine.submit_online(ServingRequest("late", prompt, 1, arrival_step=0))
+
+    assert [(event.request_id, event.token, event.finished) for event in engine.step_online()] == [
+        ("late", 18, True)
+    ]
+    assert not engine.has_online_work()
+    assert engine.stats.prefill_model_calls == prefill_calls + 1
+    assert engine.stats.decode_model_calls == decode_calls
+    assert engine.stats.prefix_reuse_tokens == reuse_tokens + len(prompt) - 1
+    assert engine.stats.generated_prefix_store_requests == 0
+    assert engine.stats.generated_prefix_reuse_requests == 0
 
 
-def test_continuous_batch_engine_chunked_online_reuses_exact_prompt_from_cached_logits(
-    monkeypatch,
-) -> None:
-    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PREFIX_CACHE_STORE_LOGITS", "1")
+def test_continuous_batch_engine_chunked_exact_prompt_replays_one_token() -> None:
     prompt = tuple(range(1, 18))
     model = _SelectedLogitsToyModel()
     engine = ContinuousBatchEngine(
@@ -5502,16 +5518,12 @@ def test_continuous_batch_engine_chunked_online_reuses_exact_prompt_from_cached_
         device=torch.device("cpu"),
         max_active_requests=2,
         prefix_cache_capacity=4,
-        pin_shared_prefix=True,
         graph_prefill=True,
         prefill_chunk_size=4,
     )
     engine.start_online(max_seq_len=64)
     _indexed, warm_active = engine._prefill_many(
-        [
-            (0, ServingRequest("warm-a", prompt, 1, arrival_step=0)),
-            (1, ServingRequest("warm-b", prompt, 1, arrival_step=0)),
-        ],
+        [(0, ServingRequest("warm", prompt, 1, arrival_step=0))],
         0,
         events=[],
     )
@@ -5523,72 +5535,18 @@ def test_continuous_batch_engine_chunked_online_reuses_exact_prompt_from_cached_
     reuse_tokens = engine.stats.prefix_reuse_tokens
     engine.submit_online(ServingRequest("late", prompt, 1, arrival_step=0))
 
-    events = engine.step_online()
+    events = _next_online_events(engine)
 
     assert [(event.request_id, event.token, event.finished) for event in events] == [
         ("late", 18, True)
     ]
     assert not engine.has_online_work()
-    assert engine.stats.prefill_model_calls == prefill_calls
+    assert engine.stats.prefill_model_calls == prefill_calls + 1
     assert engine.stats.decode_model_calls == decode_calls
-    assert engine.stats.prefix_reuse_tokens == reuse_tokens + len(prompt)
+    assert engine.stats.prefix_reuse_tokens == reuse_tokens + len(prompt) - 1
 
 
-def test_continuous_batch_engine_exact_prompt_finishes_without_kv_copy(monkeypatch) -> None:
-    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PREFIX_CACHE_STORE_LOGITS", "1")
-    prompt = tuple(range(1, 18))
-    model = _SelectedLogitsToyModel()
-    engine = ContinuousBatchEngine(
-        model,
-        device=torch.device("cpu"),
-        max_active_requests=2,
-        prefix_cache_capacity=4,
-        pin_shared_prefix=True,
-        graph_prefill=True,
-        prefill_chunk_size=4,
-    )
-    engine.start_online(max_seq_len=64)
-    _indexed, warm_active = engine._prefill_many(
-        [
-            (0, ServingRequest("warm-a", prompt, 1, arrival_step=0)),
-            (1, ServingRequest("warm-b", prompt, 1, arrival_step=0)),
-        ],
-        0,
-        events=[],
-    )
-    for state in warm_active:
-        engine._finish_and_release(state, 0)
-
-    copy_calls = 0
-    acquire_calls = 0
-    original_copy = engine._copy_prefix_to_rows
-    original_acquire = engine._acquire_active_row
-
-    def count_copy(source_row: int, dest_rows: list[int], tokens: int) -> None:
-        nonlocal copy_calls
-        copy_calls += 1
-        original_copy(source_row, dest_rows, tokens)
-
-    def count_acquire() -> int:
-        nonlocal acquire_calls
-        acquire_calls += 1
-        return original_acquire()
-
-    engine._copy_prefix_to_rows = count_copy  # type: ignore[method-assign]
-    engine._acquire_active_row = count_acquire  # type: ignore[method-assign]
-    engine.submit_online(ServingRequest("late", prompt, 1, arrival_step=0))
-
-    events = engine.step_online()
-
-    assert [(event.request_id, event.token, event.finished) for event in events] == [
-        ("late", 18, True)
-    ]
-    assert acquire_calls == 0
-    assert copy_calls == 0
-    assert not engine.has_online_work()
-
-
-def test_continuous_batch_engine_exact_prompt_uses_repeated_sampler(monkeypatch) -> None:
+def test_continuous_batch_engine_exact_prompt_ignores_repeated_sampler(monkeypatch) -> None:
     monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PREFIX_CACHE_STORE_LOGITS", "1")
     prompt = tuple(range(1, 18))
     model = _SelectedLogitsToyModel()
@@ -5610,16 +5568,12 @@ def test_continuous_batch_engine_exact_prompt_uses_repeated_sampler(monkeypatch)
         temperature=0.7,
         max_active_requests=2,
         prefix_cache_capacity=4,
-        pin_shared_prefix=True,
         graph_prefill=True,
         prefill_chunk_size=4,
     )
     engine.start_online(max_seq_len=64)
     _indexed, warm_active = engine._prefill_many(
-        [
-            (0, ServingRequest("warm-a", prompt, 1, arrival_step=0)),
-            (1, ServingRequest("warm-b", prompt, 1, arrival_step=0)),
-        ],
+        [(0, ServingRequest("warm", prompt, 1, arrival_step=0))],
         0,
         events=[],
     )
@@ -5629,186 +5583,20 @@ def test_continuous_batch_engine_exact_prompt_uses_repeated_sampler(monkeypatch)
     engine.submit_online(ServingRequest("late-a", prompt, 1, arrival_step=0))
     engine.submit_online(ServingRequest("late-b", prompt, 1, arrival_step=0))
 
-    events = engine.step_online()
+    events = _next_online_events(engine)
 
     assert [(event.request_id, event.token, event.finished) for event in events] == [
         ("late-a", 18, True),
         ("late-b", 18, True),
     ]
-    assert repeated_calls == [(2, 0.7)]
+    assert repeated_calls == []
     assert not engine.has_online_work()
 
 
-def test_reusable_prefix_sampler_records_select_timing() -> None:
-    model = _SelectedLogitsToyModel()
-    repeated_calls: list[tuple[int, float]] = []
-
-    def sample_repeated_next_token(
-        logits: torch.Tensor,
-        batch_size: int,
-        temperature: float,
-    ) -> torch.Tensor:
-        repeated_calls.append((int(batch_size), float(temperature)))
-        token = torch.argmax(logits, dim=-1)
-        return token.expand(batch_size).contiguous()
-
-    model.sample_repeated_next_token = sample_repeated_next_token  # type: ignore[attr-defined]
-    engine = ContinuousBatchEngine(
-        model,
-        device=torch.device("cpu"),
-        temperature=0.7,
-        profile_timings=True,
-    )
-    reusable = _ReusablePrefix(
-        route_id=("test",),
-        tokens=(1, 2, 3),
-        row=0,
-        logits=torch.tensor([[[0.0, 3.0, 1.0]]]),
-    )
-
-    sampled = engine._sample_reusable_prefix_next_tokens(reusable, 4)
-
-    assert sampled.tolist() == [1, 1, 1, 1]
-    assert repeated_calls == [(4, 0.7)]
-    assert engine.stats.prefill_sample_ms >= engine.stats.prefill_sample_select_ms
-    assert engine.stats.prefill_sample_select_ms >= 0.0
-    assert engine.stats.prefill_sample_readback_ms == 0.0
-
-
-def test_reusable_prefix_sampler_caches_greedy_token() -> None:
-    model = _SelectedLogitsToyModel()
-    repeated_calls: list[tuple[int, float]] = []
-
-    def sample_repeated_next_token(
-        logits: torch.Tensor,
-        batch_size: int,
-        temperature: float,
-    ) -> torch.Tensor:
-        repeated_calls.append((int(batch_size), float(temperature)))
-        token = torch.argmax(logits, dim=-1)
-        return token.expand(batch_size).contiguous()
-
-    model.sample_repeated_next_token = sample_repeated_next_token  # type: ignore[attr-defined]
-    engine = ContinuousBatchEngine(
-        model,
-        device=torch.device("cpu"),
-        temperature=0.0,
-    )
-    reusable = _ReusablePrefix(
-        route_id=("test",),
-        tokens=(1, 2, 3),
-        row=0,
-        logits=torch.tensor([[[0.0, 3.0, 1.0]]]),
-    )
-
-    first = engine._sample_reusable_prefix_next_tokens(reusable, 3)
-    second = engine._sample_reusable_prefix_next_tokens(reusable, 2)
-
-    assert first.tolist() == [1, 1, 1]
-    assert second.tolist() == [1, 1]
-    assert reusable.greedy_token == 1
-    assert repeated_calls == [(3, 0.0)]
-
-
-def test_exact_prefix_group_reads_cached_greedy_token_without_tensor_sample() -> None:
-    engine = ContinuousBatchEngine(
-        _SelectedLogitsToyModel(),
-        device=torch.device("cpu"),
-        temperature=0.0,
-    )
-    reusable = _ReusablePrefix(
-        route_id=("test",),
-        tokens=(1, 2, 3),
-        row=0,
-        logits=torch.tensor([[[0.0, 3.0, 1.0]]]),
-        greedy_token=1,
-    )
-
-    def fail_tensor_sample(*_args: object, **_kwargs: object) -> torch.Tensor:
-        raise AssertionError("cached greedy exact-prefix sampling should stay on the CPU list path")
-
-    engine._sample_reusable_prefix_next_tokens = fail_tensor_sample  # type: ignore[method-assign]
-    next_tokens, logits = engine._sample_exact_prefix_group(
-        [
-            (0, ServingRequest("a", (1, 2, 3), 1), 3, reusable),
-            (1, ServingRequest("b", (1, 2, 3), 1), 3, reusable),
-        ]
-    )
-
-    assert next_tokens == [1, 1]
-    assert logits == [reusable.logits, reusable.logits]
-
-
-def test_continuous_batch_engine_exact_prompt_reuses_prepared_sample_state(
-    monkeypatch,
-) -> None:
-    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PREFIX_CACHE_STORE_LOGITS", "1")
-    prompt = tuple(range(1, 18))
-    model = _SelectedLogitsToyModel()
-    prepare_calls: list[float] = []
-    sample_calls: list[tuple[int, float]] = []
-
-    def prepare_repeated_next_token_state(
-        logits: torch.Tensor,
-        temperature: float,
-    ) -> dict[str, torch.Tensor]:
-        prepare_calls.append(temperature)
-        return {"token": torch.argmax(logits, dim=-1)}
-
-    def sample_repeated_next_token_from_state(
-        state: dict[str, torch.Tensor],
-        batch_size: int,
-        temperature: float,
-    ) -> torch.Tensor:
-        sample_calls.append((batch_size, temperature))
-        return state["token"].expand(batch_size).contiguous()
-
-    model.prepare_repeated_next_token_state = prepare_repeated_next_token_state  # type: ignore[attr-defined]
-    model.sample_repeated_next_token_from_state = sample_repeated_next_token_from_state  # type: ignore[attr-defined]
-    engine = ContinuousBatchEngine(
-        model,
-        device=torch.device("cpu"),
-        temperature=0.7,
-        max_active_requests=2,
-        prefix_cache_capacity=4,
-        pin_shared_prefix=True,
-        graph_prefill=True,
-        prefill_chunk_size=4,
-    )
-    engine.start_online(max_seq_len=64)
-    _indexed, warm_active = engine._prefill_many(
-        [
-            (0, ServingRequest("warm-a", prompt, 1, arrival_step=0)),
-            (1, ServingRequest("warm-b", prompt, 1, arrival_step=0)),
-        ],
-        0,
-        events=[],
-    )
-    for state in warm_active:
-        engine._finish_and_release(state, 0)
-
-    engine.submit_online(ServingRequest("late-a", prompt, 1, arrival_step=0))
-    assert [(event.request_id, event.token, event.finished) for event in engine.step_online()] == [
-        ("late-a", 18, True)
-    ]
-    engine.submit_online(ServingRequest("late-b", prompt, 1, arrival_step=0))
-    assert [(event.request_id, event.token, event.finished) for event in engine.step_online()] == [
-        ("late-b", 18, True)
-    ]
-
-    assert prepare_calls == [0.7]
-    assert sample_calls == [(1, 0.7), (1, 0.7)]
-    assert engine.stats.repeated_sample_state_prepares == 1
-    assert engine.stats.repeated_sample_state_hits == 2
-    assert engine.stats.repeated_sample_state_tokens == 2
-    assert not engine.has_online_work()
-
-
-def test_continuous_batch_engine_unified_online_reuses_exact_prompt_from_cached_logits(
+def test_continuous_batch_engine_unified_online_replays_one_token_for_exact_prompt(
     monkeypatch,
 ) -> None:
     monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_UNIFIED_FORWARD", "1")
-    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PREFIX_CACHE_STORE_LOGITS", "1")
     prompt = tuple(range(1, 18))
     model = _UnifiedStepToyModel()
     engine = ContinuousBatchEngine(
@@ -5816,21 +5604,14 @@ def test_continuous_batch_engine_unified_online_reuses_exact_prompt_from_cached_
         device=torch.device("cpu"),
         max_active_requests=2,
         prefix_cache_capacity=4,
-        pin_shared_prefix=True,
         graph_prefill=True,
     )
     assert engine.unified_forward
     engine.start_online(max_seq_len=64)
-    _indexed, warm_active = engine._prefill_many(
-        [
-            (0, ServingRequest("warm-a", prompt, 1, arrival_step=0)),
-            (1, ServingRequest("warm-b", prompt, 1, arrival_step=0)),
-        ],
-        0,
-        events=[],
-    )
-    for state in warm_active:
-        engine._finish_and_release(state, 0)
+    engine.submit_online(ServingRequest("warm", prompt, 1, arrival_step=0))
+    assert [(event.request_id, event.token, event.finished) for event in engine.step_online()] == [
+        ("warm", 18, True)
+    ]
 
     prefill_calls = engine.stats.prefill_model_calls
     decode_calls = engine.stats.decode_model_calls
@@ -5842,17 +5623,14 @@ def test_continuous_batch_engine_unified_online_reuses_exact_prompt_from_cached_
     assert [(event.request_id, event.token, event.finished) for event in events] == [
         ("late", 18, True)
     ]
-    assert model.unified_calls == 0
+    assert model.unified_calls >= 1
     assert not engine.has_online_work()
-    assert engine.stats.prefill_model_calls == prefill_calls
-    assert engine.stats.decode_model_calls == decode_calls
-    assert engine.stats.prefix_reuse_tokens == reuse_tokens + len(prompt)
+    assert engine.stats.prefill_model_calls == prefill_calls + 1
+    assert engine.stats.decode_model_calls == decode_calls + 1
+    assert engine.stats.prefix_reuse_tokens == reuse_tokens + len(prompt) - 1
 
 
-def test_continuous_batch_engine_chunked_online_continues_exact_prompt_on_second_token(
-    monkeypatch,
-) -> None:
-    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PREFIX_CACHE_STORE_LOGITS", "1")
+def test_continuous_batch_engine_chunked_online_continues_after_exact_prompt_replay() -> None:
     prompt = tuple(range(1, 18))
     model = _SelectedLogitsToyModel()
     engine = ContinuousBatchEngine(
@@ -5860,16 +5638,12 @@ def test_continuous_batch_engine_chunked_online_continues_exact_prompt_on_second
         device=torch.device("cpu"),
         max_active_requests=2,
         prefix_cache_capacity=4,
-        pin_shared_prefix=True,
         graph_prefill=True,
         prefill_chunk_size=4,
     )
     engine.start_online(max_seq_len=64)
     _indexed, warm_active = engine._prefill_many(
-        [
-            (0, ServingRequest("warm-a", prompt, 1, arrival_step=0)),
-            (1, ServingRequest("warm-b", prompt, 1, arrival_step=0)),
-        ],
+        [(0, ServingRequest("warm", prompt, 1, arrival_step=0))],
         0,
         events=[],
     )
@@ -5881,15 +5655,15 @@ def test_continuous_batch_engine_chunked_online_continues_exact_prompt_on_second
     reuse_tokens = engine.stats.prefix_reuse_tokens
     engine.submit_online(ServingRequest("late", prompt, 2, arrival_step=0))
 
-    first_events = engine.step_online()
+    first_events = _next_online_events(engine)
 
     assert [(event.request_id, event.token, event.finished) for event in first_events] == [
         ("late", 18, False)
     ]
     assert engine.has_online_work()
-    assert engine.stats.prefill_model_calls == prefill_calls
+    assert engine.stats.prefill_model_calls == prefill_calls + 1
     assert engine.stats.decode_model_calls == decode_calls
-    assert engine.stats.prefix_reuse_tokens == reuse_tokens + len(prompt)
+    assert engine.stats.prefix_reuse_tokens == reuse_tokens + len(prompt) - 1
 
     second_events = engine.step_online()
 
@@ -5897,12 +5671,13 @@ def test_continuous_batch_engine_chunked_online_continues_exact_prompt_on_second
         ("late", 19, True)
     ]
     assert not engine.has_online_work()
-    assert engine.stats.prefill_model_calls == prefill_calls
+    assert engine.stats.prefill_model_calls == prefill_calls + 1
     assert engine.stats.decode_model_calls == decode_calls + 1
 
 
-def test_continuous_batch_engine_exact_prompt_reuses_generated_prefix(monkeypatch) -> None:
+def test_continuous_batch_engine_generated_prefix_cache_env_is_inert(monkeypatch) -> None:
     monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_GENERATED_PREFIX_CACHE", "1")
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_ADAPTIVE_GENERATED_PREFIX_CACHE", "1")
     monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PREFIX_CACHE_STORE_LOGITS", "1")
     prompt = tuple(range(1, 18))
     model = _StaticDecodeGraphToyModel()
@@ -5911,161 +5686,6 @@ def test_continuous_batch_engine_exact_prompt_reuses_generated_prefix(monkeypatc
         device=torch.device("cpu"),
         max_active_requests=2,
         prefix_cache_capacity=4,
-        pin_shared_prefix=True,
-        graph_prefill=True,
-        prefill_chunk_size=4,
-    )
-    engine.start_online(max_seq_len=64)
-    _indexed, warm_active = engine._prefill_many(
-        [
-            (0, ServingRequest("warm-a", prompt, 1, arrival_step=0)),
-            (1, ServingRequest("warm-b", prompt, 1, arrival_step=0)),
-        ],
-        0,
-        events=[],
-    )
-    for state in warm_active:
-        engine._finish_and_release(state, 0)
-
-    engine.submit_online(ServingRequest("late-a", prompt, 2, arrival_step=0))
-    assert [(event.request_id, event.token, event.finished) for event in engine.step_online()] == [
-        ("late-a", 18, False)
-    ]
-    assert [(event.request_id, event.token, event.finished) for event in engine.step_online()] == [
-        ("late-a", 19, True)
-    ]
-    decode_calls = engine.stats.decode_model_calls
-    assert model.static_token_graph_calls == 0
-    assert engine.stats.generated_prefix_store_requests == 1
-
-    engine.submit_online(ServingRequest("late-b", prompt, 2, arrival_step=0))
-    events = engine.step_online()
-
-    assert [(event.request_id, event.token, event.finished) for event in events] == [
-        ("late-b", 18, False),
-        ("late-b", 19, True),
-    ]
-    assert not engine.has_online_work()
-    assert engine.stats.decode_model_calls == decode_calls
-    assert engine.stats.generated_prefix_reuse_requests == 1
-    assert engine.stats.generated_prefix_reuse_tokens == len(prompt) + 1
-
-
-def test_continuous_batch_engine_non_chunked_exact_prompt_reuses_generated_prefix(
-    monkeypatch,
-) -> None:
-    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_GENERATED_PREFIX_CACHE", "1")
-    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PREFIX_CACHE_STORE_LOGITS", "1")
-    prompt = tuple(range(1, 18))
-    model = _StaticDecodeGraphToyModel()
-    engine = ContinuousBatchEngine(
-        model,
-        device=torch.device("cpu"),
-        max_active_requests=2,
-        prefix_cache_capacity=4,
-        pin_shared_prefix=True,
-        graph_prefill=True,
-    )
-    engine.start_online(max_seq_len=64)
-    _indexed, warm_active = engine._prefill_many(
-        [
-            (0, ServingRequest("warm-a", prompt, 1, arrival_step=0)),
-            (1, ServingRequest("warm-b", prompt, 1, arrival_step=0)),
-        ],
-        0,
-        events=[],
-    )
-    for state in warm_active:
-        engine._finish_and_release(state, 0)
-
-    engine.submit_online(ServingRequest("late-a", prompt, 2, arrival_step=0))
-    assert [(event.request_id, event.token, event.finished) for event in engine.step_online()] == [
-        ("late-a", 18, False)
-    ]
-    assert [(event.request_id, event.token, event.finished) for event in engine.step_online()] == [
-        ("late-a", 19, True)
-    ]
-    decode_calls = engine.stats.decode_model_calls
-    assert engine.stats.generated_prefix_store_requests == 1
-
-    engine.submit_online(ServingRequest("late-b", prompt, 2, arrival_step=0))
-    events = engine.step_online()
-
-    assert [(event.request_id, event.token, event.finished) for event in events] == [
-        ("late-b", 18, False),
-        ("late-b", 19, True),
-    ]
-    assert not engine.has_online_work()
-    assert engine.stats.decode_model_calls == decode_calls
-    assert engine.stats.generated_prefix_reuse_requests == 1
-    assert engine.stats.generated_prefix_reuse_tokens == len(prompt) + 1
-
-
-def test_continuous_batch_engine_exact_prompt_elides_cached_stop_event(
-    monkeypatch,
-) -> None:
-    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_GENERATED_PREFIX_CACHE", "1")
-    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PREFIX_CACHE_STORE_LOGITS", "1")
-    prompt = tuple(range(1, 18))
-    eos_token_id = 19
-    model = _StaticDecodeGraphToyModel()
-    engine = ContinuousBatchEngine(
-        model,
-        device=torch.device("cpu"),
-        max_active_requests=2,
-        prefix_cache_capacity=4,
-        pin_shared_prefix=True,
-        graph_prefill=True,
-    )
-    engine.start_online(max_seq_len=64)
-    _indexed, warm_active = engine._prefill_many(
-        [
-            (0, ServingRequest("warm-a", prompt, 1, arrival_step=0)),
-            (1, ServingRequest("warm-b", prompt, 1, arrival_step=0)),
-        ],
-        0,
-        events=[],
-    )
-    for state in warm_active:
-        engine._finish_and_release(state, 0)
-
-    engine.submit_online(
-        ServingRequest("late-a", prompt, 2, arrival_step=0, eos_token_id=eos_token_id)
-    )
-    assert [(event.request_id, event.token, event.finished) for event in engine.step_online()] == [
-        ("late-a", 18, False)
-    ]
-    assert [(event.request_id, event.token, event.finished) for event in engine.step_online()] == [
-        ("late-a", eos_token_id, True)
-    ]
-    decode_calls = engine.stats.decode_model_calls
-    assert engine.stats.generated_prefix_store_requests == 1
-
-    engine.submit_online(
-        ServingRequest("late-b", prompt, 2, arrival_step=0, eos_token_id=eos_token_id)
-    )
-    events = engine.step_online()
-
-    assert [(event.request_id, event.token, event.finished) for event in events] == [
-        ("late-b", 18, True)
-    ]
-    assert not engine.has_online_work()
-    assert engine.stats.decode_model_calls == decode_calls
-    assert engine.stats.generated_prefix_reuse_requests == 1
-    assert engine.stats.generated_prefix_reuse_tokens == len(prompt) + 1
-
-
-def test_continuous_batch_engine_common_prompt_stores_generated_prefix(monkeypatch) -> None:
-    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_GENERATED_PREFIX_CACHE", "1")
-    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PREFIX_CACHE_STORE_LOGITS", "1")
-    prompt = tuple(range(1, 18))
-    model = _StaticDecodeGraphToyModel()
-    engine = ContinuousBatchEngine(
-        model,
-        device=torch.device("cpu"),
-        max_active_requests=2,
-        prefix_cache_capacity=4,
-        pin_shared_prefix=True,
         graph_prefill=True,
     )
     engine.start_online(max_seq_len=64)
@@ -6083,122 +5703,10 @@ def test_continuous_batch_engine_common_prompt_stores_generated_prefix(monkeypat
         ("req-b", 19, True),
     ]
     assert not engine.has_online_work()
-    assert engine.stats.generated_prefix_store_requests == 1
-
-
-def test_continuous_batch_engine_adaptively_reuses_generated_prefix(
-    monkeypatch,
-) -> None:
-    monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_GENERATED_PREFIX_CACHE", raising=False)
-    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_ADAPTIVE_GENERATED_PREFIX_CACHE", "1")
-    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_ADAPTIVE_GENERATED_PREFIX_MIN_PENDING", "1")
-    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PREFIX_CACHE_STORE_LOGITS", "1")
-    prompt = tuple(range(1, 18))
-    model = _StaticDecodeGraphToyModel()
-    engine = ContinuousBatchEngine(
-        model,
-        device=torch.device("cpu"),
-        max_active_requests=2,
-        prefix_cache_capacity=4,
-        pin_shared_prefix=True,
-        graph_prefill=True,
-    )
-    engine.start_online(max_seq_len=64)
-    _indexed, warm_active = engine._prefill_many(
-        [
-            (0, ServingRequest("warm-a", prompt, 1, arrival_step=0)),
-            (1, ServingRequest("warm-b", prompt, 1, arrival_step=0)),
-        ],
-        0,
-        events=[],
-    )
-    for state in warm_active:
-        engine._finish_and_release(state, 0)
-
-    engine.submit_online(ServingRequest("late-a", prompt, 2, arrival_step=0))
-    engine.submit_online(ServingRequest("late-b", prompt, 2, arrival_step=0))
-    engine.submit_online(ServingRequest("late-c", prompt, 2, arrival_step=0))
-
-    assert [(event.request_id, event.token, event.finished) for event in engine.step_online()] == [
-        ("late-a", 18, False),
-        ("late-b", 18, False),
-    ]
-    decode_calls_before = engine.stats.decode_model_calls
-    second_events = engine.step_online()
-    assert [(event.request_id, event.token, event.finished) for event in second_events] == [
-        ("late-a", 19, True),
-        ("late-b", 19, True),
-        ("late-c", 18, False),
-        ("late-c", 19, True),
-    ]
-    assert engine.stats.generated_prefix_store_requests == 1
-    assert engine.stats.decode_model_calls == decode_calls_before + 1
-    assert engine.stats.generated_prefix_reuse_requests == 1
-    assert engine.stats.generated_prefix_reuse_tokens == len(prompt) + 1
-
-
-def test_continuous_batch_engine_generated_prefix_store_updates_source_seq_len(
-    monkeypatch,
-) -> None:
-    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_GENERATED_PREFIX_CACHE", "1")
-    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_UNIFORM_RAGGED_DECODE", "1")
-    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PREFIX_CACHE_STORE_LOGITS", "1")
-    prompt = tuple(range(1, 18))
-    model = _RaggedNoSeqLenUpdateToyModel()
-    engine = ContinuousBatchEngine(
-        model,
-        device=torch.device("cpu"),
-        max_active_requests=2,
-        prefix_cache_capacity=4,
-        pin_shared_prefix=True,
-        graph_prefill=True,
-    )
-    engine.start_online(max_seq_len=64)
-    engine.submit_online(ServingRequest("req-a", prompt, 2, arrival_step=0))
-    engine.submit_online(ServingRequest("req-b", prompt, 2, arrival_step=0))
-
-    assert [(event.request_id, event.token, event.finished) for event in engine.step_online()] == [
-        ("req-a", 18, False),
-        ("req-b", 18, False),
-    ]
-    assert [(event.request_id, event.token, event.finished) for event in engine.step_online()] == [
-        ("req-a", 19, True),
-        ("req-b", 19, True),
-    ]
-    assert engine.stats.generated_prefix_store_requests == 1
-    assert engine._lookup_exact_reusable_prefix((*prompt, 18)) is not None
-
-
-def test_continuous_batch_engine_exact_generated_prefix_lookup_uses_live_route(
-    monkeypatch,
-) -> None:
-    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_GENERATED_PREFIX_CACHE", "1")
-    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PREFIX_CACHE_STORE_LOGITS", "1")
-    prompt = tuple(range(1, 18))
-    tokens = (*prompt, 18)
-    model = _StaticDecodeGraphToyModel()
-    engine = ContinuousBatchEngine(
-        model,
-        device=torch.device("cpu"),
-        max_active_requests=2,
-        prefix_cache_capacity=4,
-        pin_shared_prefix=True,
-        graph_prefill=True,
-    )
-    engine.start_online(max_seq_len=64)
-    row = engine._acquire_active_row()
-    engine._set_cache_row_seq_len(row, len(tokens))
-    engine._store_generated_reusable_prefix(
-        "req-a",
-        tokens,
-        row,
-        torch.zeros(1, 32),
-    )
-    route_id = engine._generated_prefix_route_id(tokens)
-    reusable = engine.reusable_prefixes[route_id]
-    engine.prefix_cache.remove(route_id)
-
-    assert engine._lookup_exact_reusable_prefix(tokens) is reusable
+    assert engine.stats.generated_prefix_store_requests == 0
+    assert engine.stats.generated_prefix_reuse_requests == 0
+    assert engine.stats.generated_prefix_reuse_tokens == 0
+    assert all(prefix.logits is None for prefix in engine.reusable_prefixes.values())
 
 
 def test_continuous_batch_engine_finished_prefix_cache_reuses_kv_without_logits(
@@ -6228,7 +5736,7 @@ def test_continuous_batch_engine_finished_prefix_cache_reuses_kv_without_logits(
     unsafe_finished_tokens = (*prompt, 18, 19)
     finished_prefix = (*prompt, 18)
     continued_prompt = (*finished_prefix, 99)
-    assert model.static_token_graph_calls == 1
+    assert model.static_token_graph_calls == 0
     assert engine.stats.generated_prefix_store_requests == 1
     assert engine._reusable_prefix_hit_tokens(unsafe_finished_tokens) == len(finished_prefix)
     assert engine._reusable_prefix_hit_tokens(continued_prompt) == len(finished_prefix)
@@ -6293,7 +5801,6 @@ def test_continuous_batch_engine_unified_online_continues_exact_prompt_on_second
     monkeypatch,
 ) -> None:
     monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_UNIFIED_FORWARD", "1")
-    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PREFIX_CACHE_STORE_LOGITS", "1")
     prompt = tuple(range(1, 18))
     model = _UnifiedStepToyModel()
     engine = ContinuousBatchEngine(
@@ -6301,21 +5808,14 @@ def test_continuous_batch_engine_unified_online_continues_exact_prompt_on_second
         device=torch.device("cpu"),
         max_active_requests=2,
         prefix_cache_capacity=4,
-        pin_shared_prefix=True,
         graph_prefill=True,
     )
     assert engine.unified_forward
     engine.start_online(max_seq_len=64)
-    _indexed, warm_active = engine._prefill_many(
-        [
-            (0, ServingRequest("warm-a", prompt, 1, arrival_step=0)),
-            (1, ServingRequest("warm-b", prompt, 1, arrival_step=0)),
-        ],
-        0,
-        events=[],
-    )
-    for state in warm_active:
-        engine._finish_and_release(state, 0)
+    engine.submit_online(ServingRequest("warm", prompt, 1, arrival_step=0))
+    assert [(event.request_id, event.token, event.finished) for event in engine.step_online()] == [
+        ("warm", 18, True)
+    ]
 
     prefill_calls = engine.stats.prefill_model_calls
     decode_calls = engine.stats.decode_model_calls
@@ -6331,11 +5831,11 @@ def test_continuous_batch_engine_unified_online_continues_exact_prompt_on_second
     assert [(event.request_id, event.token, event.finished) for event in second_events] == [
         ("late", 19, True)
     ]
-    assert model.unified_calls == 0
+    assert model.unified_calls >= 1
     assert not engine.has_online_work()
-    assert engine.stats.prefill_model_calls == prefill_calls
-    assert engine.stats.decode_model_calls == decode_calls + 1
-    assert engine.stats.prefix_reuse_tokens == reuse_tokens + len(prompt)
+    assert engine.stats.prefill_model_calls == prefill_calls + 1
+    assert engine.stats.decode_model_calls == decode_calls + 2
+    assert engine.stats.prefix_reuse_tokens == reuse_tokens + len(prompt) - 1
 
 
 def test_continuous_batch_engine_chunked_prefill_matches_one_shot() -> None:
@@ -7361,13 +6861,15 @@ def test_continuous_batch_engine_skips_decode_capture_for_generated_prefix_cache
     )
 
     assert [len(result.tokens) for result in results] == [5, 5]
-    assert model.capture_flags == [False, False]
+    assert model.capture_flags == [False, False, False, False]
     assert model.static_token_graph_calls == 0
     assert model.static_logits_graph_calls == 0
     assert engine.stats.decode_graph_hits == 0
-    assert engine.stats.decode_graph_misses == 2
+    assert engine.stats.decode_graph_misses == 4
     assert engine.stats.decode_graph_miss_shape_counts == {
+        "static_decode:token:b2:s2": 1,
         "static_decode:logits:b2:s2": 1,
+        "static_decode:token:b2:s3": 1,
         "static_decode:logits:b2:s3": 1,
     }
     assert engine.stats.decode_model_calls == 2
@@ -7453,8 +6955,8 @@ def test_continuous_batch_engine_can_capture_decode_graphs_with_env(monkeypatch)
 
     assert [len(result.tokens) for result in results] == [5, 5]
     assert model.capture_flags == [True, True]
-    assert model.static_token_graph_calls == 0
-    assert model.static_logits_graph_calls == 2
+    assert model.static_token_graph_calls == 2
+    assert model.static_logits_graph_calls == 0
     assert engine.stats.decode_graph_hits == 2
 
 

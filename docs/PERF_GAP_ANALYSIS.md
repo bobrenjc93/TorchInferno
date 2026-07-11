@@ -7,13 +7,13 @@ cached prompt or generated-prefix logits tensor lets repeated byte-identical
 prompts return tokens without normal model execution, which disproportionately
 inflates single-token rows such as self_consistency.
 
-The `e887422` generated-prefix chain extension has been reverted, and prompt
-logits are no longer persisted in the reusable-prefix cache by default. OpenAI
-sampled-short serving also no longer auto-enables generated-prefix caching.
-Logits persistence remains available only as an explicit diagnostic opt-in via
-`TORCHINFERNO_CONTINUOUS_PREFIX_CACHE_STORE_LOGITS=1`. The separate OpenAI
-server exact-prompt logits cache is also opt-in only via
-`TORCHINFERNO_OPENAI_PROMPT_LOGITS_CACHE=1`. Neither path should be used for
+The `e887422` generated-prefix chain extension has been reverted, and the
+runtime reusable-prefix cache no longer stores or samples prompt/generated
+logits. Full-prompt KV hits are capped to `len(prompt) - 1` so the final prompt
+token is replayed through the model before sampling. OpenAI sampled-short
+serving also no longer auto-enables generated-prefix caching. The separate
+OpenAI server exact-prompt logits cache remains opt-in only via
+`TORCHINFERNO_OPENAI_PROMPT_LOGITS_CACHE=1` and should not be used for
 score-facing benchmark runs.
 
 The benchmark harness now also forces those score-facing caches off for
@@ -10781,8 +10781,9 @@ the added session boundaries.
 COMMON-PREFIX LOGITS STORE CLEANUP (2026-06-21, current a9699a4 + local patch):
 shared common-prefix rows no longer clone cached logits back to CPU when every
 request in the group has a non-empty suffix. The prefix-suffix graph only needs
-the KV row; exact-prefix groups still keep logits. This removes an avoidable
-sync from common-prefix storage. Profiled tree_of_thought improved from the
+the KV row; exact-prefix groups now replay at least the final prompt token
+instead of sampling cached logits. This removes an avoidable sync from
+common-prefix storage. Profiled tree_of_thought improved from the
 current control's 248.2 / 52.1 / 306.7 ms (TTFT/TPOT/E2E), 4.0 tok/s, 962/992
 raw correct, to 216.7 / 51.8 / 255.6 ms, 4.6 tok/s, 962/992 raw correct. Queue
 counters showed the same 50 prefill batches, while aggregate prefill wall fell
