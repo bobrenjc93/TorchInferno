@@ -58,7 +58,7 @@ _TORCHINFERNO_RAGGED_PREFILL_PROFILE_RE = re.compile(
     r"prefix_copy_len=(?P<prefix_copy_len>\S+)"
 )
 _TORCHINFERNO_RAGGED_DECODE_MANY_PROFILE_RE = re.compile(
-    r"\[(?P<kind>RAGGED_DECODE_MANY_REPLAY_PROF)\] "
+    r"\[(?P<kind>RAGGED_DECODE_MANY_(?:REPLAY|EAGER)_PROF)\] "
     r"batch=(?P<batch>[0-9]+) "
     r"steps=(?P<steps>[0-9]+) "
     r"match=(?P<matches>[0-9]+) "
@@ -2167,6 +2167,8 @@ def _short_torchinferno_profiler_kind(kind: str) -> str:
         return "decode_replay"
     if kind == "RAGGED_DECODE_MANY_REPLAY_PROF":
         return "decode_many_replay"
+    if kind == "RAGGED_DECODE_MANY_EAGER_PROF":
+        return "decode_many_eager"
     return kind
 
 

@@ -479,6 +479,18 @@ def _write_inference_bench_run(tmp_path) -> None:
                 "0.000us 0.00% 0.000us 0.000us 1.000ms 5.00% "
                 "1.000ms 12.500us 80",
                 "Self CUDA time total: 20.000ms",
+                "[RAGGED_DECODE_MANY_EAGER_PROF] batch=64 steps=1 match=4 "
+                "cache_bucket=1024 rows=64 active=64 padded=64",
+                "nvjet_tst_64x64_64x13_2x1_v_bz_NNT            0.00% "
+                "0.000us 0.00% 0.000us 0.000us 3.500ms 29.17% "
+                "3.500ms 21.875us 160",
+                "void marlin::Marlin<test>                       0.00% "
+                "0.000us 0.00% 0.000us 0.000us 3.250ms 27.08% "
+                "3.250ms 40.625us 80",
+                "_grouped_gqa_decode_attention_streaming_kernel  0.00% "
+                "0.000us 0.00% 0.000us 0.000us 1.250ms 10.42% "
+                "1.250ms 15.625us 80",
+                "Self CUDA time total: 12.000ms",
             ]
         )
         + "\n"
@@ -858,7 +870,7 @@ def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) ->
     assert sglang_log.prefill_cached_tokens == 16
     assert sglang_log.decode_batches == 1
     assert sglang_log.decode_logged_tokens == 64
-    assert len(summary.torchinferno_profiler_events) == 3
+    assert len(summary.torchinferno_profiler_events) == 4
     profiler_event = summary.torchinferno_profiler_events[0]
     assert profiler_event.kind == "RAGGED_PREFILL_REPLAY_PROF"
     assert profiler_event.batch == 24
@@ -902,6 +914,17 @@ def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) ->
     assert single_decode_profiler_event.gemm_ms == 4.0
     assert single_decode_profiler_event.marlin_ms == 2.0
     assert single_decode_profiler_event.attention_ms == 1.0
+    eager_decode_many_event = summary.torchinferno_profiler_events[3]
+    assert eager_decode_many_event.kind == "RAGGED_DECODE_MANY_EAGER_PROF"
+    assert eager_decode_many_event.batch == 64
+    assert eager_decode_many_event.cache_bucket == "1024"
+    assert eager_decode_many_event.rows == 64
+    assert eager_decode_many_event.steps == 1
+    assert eager_decode_many_event.matches == 4
+    assert eager_decode_many_event.self_cuda_ms == 12.0
+    assert eager_decode_many_event.gemm_ms == 3.5
+    assert eager_decode_many_event.marlin_ms == 3.25
+    assert eager_decode_many_event.attention_ms == 1.25
 
     text = format_inference_bench_summary(summary)
     assert "[long_output]" in text
@@ -913,6 +936,7 @@ def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) ->
     assert "4.0" in text
     assert "torchinferno" in text
     assert "decode_many_replay" in text
+    assert "decode_many_eager" in text
     assert "decode_replay" in text
     assert "cache" in text
     assert "1024" in text

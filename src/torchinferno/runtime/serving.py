@@ -7333,6 +7333,171 @@ class ContinuousBatchEngine:
         )
         return self._apply_decoded_tokens(states, next_tokens, step, events)
 
+    def _maybe_profile_decode_many_eager_once(
+        self,
+        run_decode_model: Callable[[], Tensor],
+        *,
+        profile_source: str | None,
+        input_ids: Tensor,
+        seq_lens: Tensor,
+        row_indices: Tensor | None,
+        n_active: int,
+        n_padded: int,
+    ) -> Tensor:
+        if not self._should_profile_decode_many_eager_once(
+            profile_source=profile_source,
+            n_active=n_active,
+            n_padded=n_padded,
+        ):
+            return run_decode_model()
+        profile_matches = int(getattr(self, "_decode_many_eager_profile_matches", 0)) + 1
+        self._decode_many_eager_profile_matches = profile_matches
+        skip_matches = env_int(
+            "TORCHINFERNO_PROFILE_RAGGED_DECODE_MANY_EAGER_SKIP_MATCHES",
+            0,
+            minimum=0,
+        )
+        if profile_matches <= skip_matches:
+            return run_decode_model()
+        self._decode_many_eager_profiled = True
+        try:
+            import sys as _rdmep
+            from torch.profiler import ProfilerActivity as _PA
+            from torch.profiler import profile as _tprof
+        except Exception as exc:
+            warn_optional_failure("continuous.decode_many_eager_profile_import", exc)
+            return run_decode_model()
+
+        torch.cuda.synchronize(self.device)
+        with _tprof(activities=[_PA.CPU, _PA.CUDA]) as prof:
+            result = run_decode_model()
+            torch.cuda.synchronize(self.device)
+        try:
+            row_limit = env_int(
+                "TORCHINFERNO_PROFILE_RAGGED_DECODE_MANY_EAGER_ROW_LIMIT",
+                32,
+                minimum=1,
+            )
+            cache_bucket = self._decode_many_eager_profile_cache_bucket(
+                seq_lens,
+                row_indices,
+                batch=input_ids.size(0),
+            )
+            rows = int(row_indices.numel()) if row_indices is not None else input_ids.size(0)
+            print(
+                f"[RAGGED_DECODE_MANY_EAGER_PROF] batch={input_ids.size(0)} "
+                f"steps=1 "
+                f"match={profile_matches} "
+                f"cache_bucket={cache_bucket} "
+                f"rows={rows} "
+                f"active={n_active} padded={n_padded}\n"
+                + prof.key_averages().table(sort_by="cuda_time_total", row_limit=row_limit),
+                file=_rdmep.stderr,
+                flush=True,
+            )
+        except Exception as exc:
+            warn_optional_failure("continuous.decode_many_eager_profile_print", exc)
+        return result
+
+    def _should_profile_decode_many_eager_once(
+        self,
+        *,
+        profile_source: str | None,
+        n_active: int,
+        n_padded: int,
+    ) -> bool:
+        if (
+            profile_source != "decode_many"
+            or not env_flag("TORCHINFERNO_PROFILE_RAGGED_DECODE_MANY_EAGER_ONCE", False)
+            or getattr(self, "_decode_many_eager_profiled", False)
+            or self.device.type != "cuda"
+            or not torch.cuda.is_available()
+        ):
+            return False
+        min_batch = env_int(
+            "TORCHINFERNO_PROFILE_RAGGED_DECODE_MANY_EAGER_MIN_BATCH",
+            32,
+            minimum=1,
+        )
+        if n_padded < min_batch:
+            return False
+        if not self._decode_many_eager_profile_filter_matches(
+            "TORCHINFERNO_PROFILE_RAGGED_DECODE_MANY_EAGER_ACTIVE",
+            n_active,
+        ):
+            return False
+        if not self._decode_many_eager_profile_filter_matches(
+            "TORCHINFERNO_PROFILE_RAGGED_DECODE_MANY_EAGER_PADDED",
+            n_padded,
+        ):
+            return False
+        return True
+
+    def _decode_many_eager_profile_filter_matches(
+        self,
+        env_name: str,
+        value: int,
+    ) -> bool:
+        raw = os.environ.get(env_name)
+        if raw is None or not raw.strip():
+            return True
+        try:
+            return int(raw) == int(value)
+        except ValueError as exc:
+            warn_optional_failure("continuous.decode_many_eager_profile_filter", exc)
+            return False
+
+    def _decode_many_eager_profile_cache_bucket(
+        self,
+        seq_lens: Tensor,
+        row_indices: Tensor | None,
+        *,
+        batch: int,
+    ) -> int:
+        cache = self._require_cache()
+        layers = getattr(cache, "layers", ())
+        if not layers:
+            return 0
+        max_seq_len = int(getattr(layers[0], "max_seq_len", 0) or 0)
+        if max_seq_len <= 0:
+            return 0
+        raw_limit = getattr(cache, "_torchinferno_ragged_decode_cache_token_limit", None)
+        if raw_limit is not None:
+            try:
+                min_batch = int(
+                    getattr(cache, "_torchinferno_ragged_decode_cache_token_min_batch", 1)
+                    or 1
+                )
+                if batch >= max(1, min_batch):
+                    return max(1, min(int(raw_limit), max_seq_len))
+            except (TypeError, ValueError):
+                pass
+        if not env_flag("TORCHINFERNO_CUDAGRAPH_RAGGED_DECODE_CACHE_TOKEN_BUCKETS", False):
+            return max_seq_len
+        if row_indices is None:
+            selected = seq_lens[:batch]
+        else:
+            selected = seq_lens.index_select(
+                0,
+                row_indices.to(device=seq_lens.device, dtype=torch.long),
+            )
+        needed = int(selected.max().item()) + 1 if selected.numel() else 1
+        needed = max(1, min(needed, max_seq_len))
+        buckets = sorted(
+            set(
+                _parse_positive_int_csv(
+                    os.environ.get(
+                        "TORCHINFERNO_CUDAGRAPH_RAGGED_DECODE_CACHE_TOKEN_BUCKET_VALUES",
+                        "128,256,512,1024,2048,4096,8192",
+                    )
+                )
+            )
+        )
+        for bucket in buckets:
+            if bucket >= needed:
+                return min(int(bucket), max_seq_len)
+        return max_seq_len
+
     def _decode_ragged_batch_token_tensor(
         self,
         states: list[_ActiveRequest],
@@ -7384,6 +7549,11 @@ class ContinuousBatchEngine:
         model_start_s = time.perf_counter() if self.profile_timings else 0.0
         gpu_model_events = self._start_decode_ragged_model_gpu_timer()
         self._last_ragged_decode_logits = None
+
+        def run_decode_model() -> Tensor:
+            logits = self._ragged_decode_logits(input_ids, seq_lens, row_indices)
+            return self._sample_logits_for_states(logits[:, -1, :], states)
+
         graph_token = (
             self._try_ragged_token_graph(
                 input_ids,
@@ -7398,8 +7568,15 @@ class ContinuousBatchEngine:
             next_token_tensor = graph_token.to(self.device)
             self.stats.decode_graph_hits += 1
         else:
-            logits = self._ragged_decode_logits(input_ids, seq_lens, row_indices)
-            next_token_tensor = self._sample_logits_for_states(logits[:, -1, :], states)
+            next_token_tensor = self._maybe_profile_decode_many_eager_once(
+                run_decode_model,
+                profile_source=profile_source,
+                input_ids=input_ids,
+                seq_lens=seq_lens,
+                row_indices=row_indices,
+                n_active=n_active,
+                n_padded=n_padded,
+            )
         self._stop_decode_ragged_model_gpu_timer(
             gpu_model_events,
             shape_key=shape_key,
