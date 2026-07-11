@@ -1,5 +1,42 @@
 # TorchInferno vs vLLM/sglang — Performance Gap Analysis (Llama-3.1-70B, 8xH100)
 
+## Current 20260711 long-output decode-many timing refresh
+
+The latest public run is still `20260711_132252`; re-rendering it through
+`torchinferno.cli inference-bench-summary` keeps the score-facing gaps
+unchanged. Long_output is the largest gap at `187.7 / 19.0 / 873.4ms` for
+TorchInferno versus vLLM's `43.9 / 14.7 / 556.5ms`. The merged public queue
+profile attributes the long row to `125` decode-many calls, `539` internal
+steps, `28.5K` decode-many model tokens, and the hot
+`decode_many:b64/64:g1-16` window with `151` calls and `9.7K` model tokens.
+Because public queue profiling is no-sync by default, it does not include GPU
+time for those windows.
+
+A current-head timing run on `bdab337` used
+`TORCHINFERNO_CONTINUOUS_DECODE_MANY_GPU_EVENT_TIMING=1` plus the decode-many
+replay profiler gates while running only long_output:
+`/tmp/inference-bench-long-decodemany-gputiming-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-ti-long-decodemany-gputiming-bdab337/runs/20260711_144621`.
+It completed `1000/1000` correct at `213.6 / 22.7 / 978.2ms`; treat the score
+as timing-perturbed evidence, not a default-performance row. The useful
+counters are the GPU attribution: `runtime_decode_many_model_gpu_ms=6299.8ms`
+over `114` calls, `493` steps, `27.2K` model tokens, and `31.4K` padded
+tokens. The hot full-batch window was
+`decode_many:b64/64:g1-16`, `157` calls, `10.0K` model tokens, and
+`2014.2ms` GPU time. Other high-active `g1-16` windows were smaller but had the
+same shape: `b54/64` at `446.7ms`, `b60/64` at `305.5ms`, `b50/64` at
+`306.8ms`, and `b62/64` at `242.3ms`.
+
+The one-shot `RAGGED_DECODE_MANY_REPLAY_PROF` hook did not fire because the
+default long_output path does not use the experimental multi-step decode graph;
+it schedules multi-token bursts around warmed single-token ragged graph replay.
+That matches prior profiler rows that measured the same `b64/cache1024` replay
+at roughly `12.4ms` self CUDA, dominated by dense GEMMs, gate-up Marlin,
+symmetric-memory all-reduces, and grouped GQA attention. Keep
+`TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY_GRAPH` off: recent rechecks made
+the hot path slower. The current decode target is still a faster single-step
+replay body or true overlap/fusion of projection and TP collectives, not another
+scheduler/readback toggle.
+
 ## Current 20260711 fixed-capacity packed-prefix tree rejection
 
 The latest public run remains `20260711_132252` on TorchInferno `9af4c72`,
