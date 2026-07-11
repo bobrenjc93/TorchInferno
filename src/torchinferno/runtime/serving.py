@@ -7463,7 +7463,7 @@ class ContinuousBatchEngine:
         request_id: str,
         tokens: tuple[int, ...],
     ) -> None:
-        if not self.profile_timings or not tokens:
+        if not (self.profile_timings or _queue_profile_counts_enabled()) or not tokens:
             return
         if self._full_prompt_reuse_candidate_enabled() and self.prefix_cache_capacity > 0:
             route_id: Hashable = ("full_prompt_reuse_candidate", request_id)
@@ -7496,7 +7496,7 @@ class ContinuousBatchEngine:
         prompt: tuple[int, ...],
         actual_prefix_tokens: int,
     ) -> None:
-        if not self.profile_timings:
+        if not (self.profile_timings or _queue_profile_counts_enabled()):
             return
         if self._full_prompt_reuse_candidate_enabled() and self._full_prompt_reuse_candidate_order:
             match, entry = self._full_prompt_reuse_candidate_cache.lookup(prompt)
@@ -7619,15 +7619,15 @@ class ContinuousBatchEngine:
             f"{prefix}_suffix_tokens",
             getattr(self.stats, f"{prefix}_suffix_tokens") + suffix_tokens,
         )
-        self._record_shape_count(
+        self._record_queue_profile_shape_count(
             getattr(self.stats, f"{prefix}_token_counts"),
             str(candidate_tokens),
         )
-        self._record_shape_count(
+        self._record_queue_profile_shape_count(
             getattr(self.stats, f"{prefix}_extra_token_counts"),
             str(extra_tokens),
         )
-        self._record_shape_count(
+        self._record_queue_profile_shape_count(
             getattr(self.stats, f"{prefix}_suffix_token_counts"),
             str(suffix_tokens),
         )

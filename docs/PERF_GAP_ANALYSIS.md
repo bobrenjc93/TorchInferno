@@ -183,6 +183,17 @@ show that long-output full-prompt stores are intentionally skipped under pinned
 shared-prefix policy rather than silently failing for capacity or store-disable
 reasons.
 
+A follow-up dirty-tree validation after `9d5144c` moved the opt-in
+full-prompt reuse candidate profiler onto the same no-sync path. It wrote
+`/tmp/inference-bench-fullprompt-candidate-nosync-9d5144c-long-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-fullprompt-candidate-nosync-9d5144c-long-dirty/runs/20260711_071448`
+and landed at `222.8 / 22.3 / 1049.3ms`, p99
+`560.0 / 37.0 / 1720.5ms`, with `1000/1000` correct. The queue profile stored
+`1000` shadow full-prompt candidates covering `155,715` prompt tokens, recorded
+`0` later candidate hits, and kept `runtime_prefill_shape_forward_ms` and
+`runtime_prefill_shape_wall_ms` empty. This is still a diagnostics-only path:
+long_output keeps routing through `{"common_prefix": 1000}`, so the heavier
+candidate radix index remains opt-in rather than default public-profile work.
+
 ## Public 20260710_170747 startup failure and symm-mem warmup fix
 
 The latest public pointer advanced to

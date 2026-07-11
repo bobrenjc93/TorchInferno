@@ -2488,6 +2488,54 @@ def test_continuous_batch_engine_profiles_pinned_full_prompt_reuse_candidates(
     assert engine.stats.full_prompt_reuse_candidate_suffix_token_counts == {"1": 1}
 
 
+def test_continuous_batch_engine_profiles_full_prompt_reuse_candidates_without_sync(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_QUEUE_PROFILE_JSONL", "queue.jsonl")
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_FULL_PROMPT_REUSE_CANDIDATE_PROFILE", "1")
+    monkeypatch.delenv(
+        "TORCHINFERNO_CONTINUOUS_PINNED_FULL_PROMPT_STORE_MIN_MAX_TOKENS",
+        raising=False,
+    )
+    monkeypatch.delenv(
+        "TORCHINFERNO_CONTINUOUS_GREEDY_LARGE_MIXED_PREFIX_REUSE",
+        raising=False,
+    )
+    shared = tuple(range(1, 17))
+    engine = ContinuousBatchEngine(
+        _SelectedLogitsToyModel(),
+        device=torch.device("cpu"),
+        max_active_requests=2,
+        prefix_cache_capacity=4,
+        pin_shared_prefix=True,
+        graph_prefill=True,
+        profile_timings=False,
+    )
+
+    results = engine.run(
+        [
+            ServingRequest("turn0-a", (*shared, 21), 1, arrival_step=0),
+            ServingRequest("turn0-b", (*shared, 22), 1, arrival_step=0),
+            ServingRequest("turn1-a", (*shared, 21, 31), 1, arrival_step=2),
+        ]
+    )
+    by_id = {result.request_id: result for result in results}
+
+    assert by_id["turn1-a"].prefix_hit_tokens == len(shared)
+    assert engine.stats.full_prompt_reuse_candidate_stored_requests == 3
+    assert engine.stats.full_prompt_reuse_candidate_requests == 1
+    assert engine.stats.full_prompt_reuse_candidate_tokens == len(shared) + 1
+    assert engine.stats.full_prompt_reuse_candidate_extra_tokens == 1
+    assert engine.stats.full_prompt_reuse_candidate_suffix_tokens == 1
+    assert engine.stats.full_prompt_reuse_candidate_token_counts == {
+        str(len(shared) + 1): 1,
+    }
+    assert engine.stats.full_prompt_reuse_candidate_extra_token_counts == {"1": 1}
+    assert engine.stats.full_prompt_reuse_candidate_suffix_token_counts == {"1": 1}
+    assert engine.stats.prefill_shape_forward_ms == {}
+    assert engine.stats.prefill_shape_wall_ms == {}
+
+
 def test_continuous_batch_engine_skips_full_prompt_reuse_candidates_by_default(
     monkeypatch,
 ) -> None:
