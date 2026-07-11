@@ -2437,7 +2437,11 @@ def _hot_prefill_shape_rows(
             )
         if not shape_entries:
             continue
-        for shape, forward_ms in shape_entries:
+        for shape, _rank_value in shape_entries:
+            forward_ms = _mapping_value(
+                fields.get("runtime_prefill_shape_forward_ms"),
+                shape,
+            )
             active_tokens = _mapping_value(
                 fields.get("runtime_prefill_shape_active_tokens"),
                 shape,

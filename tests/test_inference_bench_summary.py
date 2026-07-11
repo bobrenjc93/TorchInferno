@@ -7,6 +7,7 @@ from torchinferno.research.inference_bench import (
     QueueProfileSummary,
     _decode_graph_cache_counts,
     _decode_graph_symm_counts,
+    _hot_prefill_shape_rows,
     _phase_target,
     _prefill_packed_fixed_capacity_reject_rows,
     _prefill_shape_call_count,
@@ -691,6 +692,33 @@ def test_prefill_shape_call_count_falls_back_to_graph_counts() -> None:
         },
         "prefix_graph:b8:s32:p45-56:src8:mixed1",
     ) == 1
+
+
+def test_hot_prefill_shape_rows_keep_forward_blank_for_padding_ranked_rows() -> None:
+    rows = _hot_prefill_shape_rows(
+        [
+            QueueProfileSummary(
+                event="online_batcher",
+                temperature=0.0,
+                max_tokens=96,
+                submitted_requests=1,
+                finished_events=1,
+                fields={
+                    "runtime_prefill_shape_counts": {"shape_a": 2},
+                    "runtime_prefill_shape_active_tokens": {"shape_a": 40},
+                    "runtime_prefill_shape_model_tokens": {"shape_a": 64},
+                    "runtime_prefill_shape_padding_tokens": {"shape_a": 24},
+                },
+            )
+        ]
+    )
+
+    assert rows[0][2] == "shape_a"
+    assert rows[0][3] == "2"
+    assert rows[0][4] == "-"
+    assert rows[0][18] == "40"
+    assert rows[0][19] == "64"
+    assert rows[0][20] == "24"
 
 
 def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) -> None:
