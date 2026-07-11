@@ -6132,6 +6132,12 @@ class OpenAICompletionEngine:
             paged_cache_fallback_candidate=paged_cache_fallback_candidate,
             use_paged_engine=use_paged_engine,
         )
+        packed_flashinfer_prefill_fields = (
+            _packed_flashinfer_prefill_profile_fields(
+                self.model,
+                online_cache_backend,
+            )
+        )
         normalized_prefill_budget = prefill_budget if prefill_budget > 0 else None
         graph_prefill = False
         prefill_chunk_size: int | None = None
@@ -6466,6 +6472,7 @@ class OpenAICompletionEngine:
                 ),
                 configured_cache_backend=str(self.cache_backend or "dense"),
                 online_cache_backend=online_cache_backend,
+                **packed_flashinfer_prefill_fields,
                 paged_kv_requested=paged_kv_requested,
                 paged_kv_min_seq=env_int(
                     "TORCHINFERNO_OPENAI_PAGED_KV_MIN_SEQ",
@@ -14481,6 +14488,36 @@ def _online_continuous_cache_backend(
     ):
         return "dense"
     return backend
+
+
+def _packed_flashinfer_prefill_profile_fields(
+    model: object,
+    cache_backend: object,
+) -> dict[str, object]:
+    requested = env_flag("TORCHINFERNO_CONTINUOUS_PACKED_FLASHINFER_PREFILL", False)
+    backend = str(cache_backend or "dense").lower()
+    cache_enabled = backend == "flashinfer"
+    model_available = callable(
+        getattr(model, "prefill_ragged_logits_packed_flashinfer", None)
+    )
+    flashinfer_available = importlib.util.find_spec("flashinfer") is not None
+    if not requested:
+        status = "disabled_env"
+    elif not cache_enabled:
+        status = f"cache_backend_{backend}"
+    elif not model_available:
+        status = "model_method_missing"
+    elif not flashinfer_available:
+        status = "flashinfer_unavailable"
+    else:
+        status = "ready"
+    return {
+        "packed_flashinfer_prefill_requested": requested,
+        "packed_flashinfer_prefill_model_available": model_available,
+        "packed_flashinfer_prefill_flashinfer_available": flashinfer_available,
+        "packed_flashinfer_prefill_cache_enabled": cache_enabled,
+        "packed_flashinfer_prefill_status": status,
+    }
 
 
 def _prefix_cache_enabled_for_model(model: object) -> bool:

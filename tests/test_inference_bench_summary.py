@@ -13,6 +13,7 @@ from torchinferno.research.inference_bench import (
     _phase_target,
     _prefill_graph_phase_rows,
     _prefill_packed_dynamic_target_rows,
+    _prefill_packed_flashinfer_gate_rows,
     _prefill_packed_fixed_capacity_runtime_rows,
     _prefill_packed_fixed_capacity_reject_rows,
     _prefill_shape_call_count,
@@ -1106,6 +1107,8 @@ def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) ->
     assert "overgen_pct" in text
     assert "packed_fi_ms" in text
     assert "packed_fi_saved" in text
+    assert "[torchinferno packed FlashInfer prefill gate]" in text
+    assert "ran" in text
     assert "packed_eager_ms" in text
     assert "packed_eager_saved" in text
     assert "packed_cand_saved" in text
@@ -1388,6 +1391,40 @@ def test_queue_profile_infers_cache_backend_from_torchinferno_log(tmp_path) -> N
             summary.torchinferno_queue_profiles[0].fields["runtime_cache_backend"]
             == expected_backend
         )
+
+
+def test_packed_flashinfer_gate_rows_infers_dense_cache_blocker() -> None:
+    profile = QueueProfileSummary(
+        event="online_batcher",
+        temperature=0.0,
+        max_tokens=96,
+        submitted_requests=64,
+        finished_events=64,
+        fields={
+            "runtime_cache_backend": "dense",
+            "runtime_prefill_packed_flashinfer_calls": 0,
+            "runtime_prefill_packed_flashinfer_saved_tokens": 0,
+            "runtime_prefill_packed_candidate_calls": 12,
+            "runtime_prefill_packed_candidate_saved_tokens": 4096,
+        },
+    )
+
+    assert _prefill_packed_flashinfer_gate_rows([profile]) == [
+        (
+            "0.0",
+            "96",
+            "dense",
+            "-",
+            "-",
+            "-",
+            "-",
+            "cache_backend_dense",
+            "0",
+            "0",
+            "12",
+            "4096",
+        )
+    ]
 
 
 def test_inference_bench_summary_reads_current_provider_log_names(tmp_path) -> None:

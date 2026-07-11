@@ -125,6 +125,11 @@ _QUEUE_PROFILE_FIELDS = (
     "idle_batch_wait_ms",
     "active_ready_wait_ms",
     "decode_capture_on_miss",
+    "packed_flashinfer_prefill_requested",
+    "packed_flashinfer_prefill_model_available",
+    "packed_flashinfer_prefill_flashinfer_available",
+    "packed_flashinfer_prefill_cache_enabled",
+    "packed_flashinfer_prefill_status",
     "runtime_cache_backend",
     "runtime_max_active_requests",
     "runtime_prefix_cache_capacity",
@@ -1350,6 +1355,32 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
                         "candidate_saved",
                     ),
                     packed_fixed_capacity_runtime_rows,
+                )
+            )
+            lines.append("")
+
+        packed_flashinfer_gate_rows = _prefill_packed_flashinfer_gate_rows(
+            queue_profiles
+        )
+        if packed_flashinfer_gate_rows:
+            lines.append("[torchinferno packed FlashInfer prefill gate]")
+            lines.extend(
+                _format_table(
+                    (
+                        "temp",
+                        "max_tokens",
+                        "cache",
+                        "requested",
+                        "model",
+                        "flashinfer",
+                        "cache_ok",
+                        "status",
+                        "fi_calls",
+                        "fi_saved",
+                        "cand_calls",
+                        "cand_saved",
+                    ),
+                    packed_flashinfer_gate_rows,
                 )
             )
             lines.append("")
@@ -4229,6 +4260,78 @@ def _prefill_packed_fixed_capacity_runtime_rows(
             )
         )
     return rows
+
+
+def _prefill_packed_flashinfer_gate_rows(
+    profiles: Sequence[QueueProfileSummary],
+    *,
+    limit: int = 8,
+) -> list[tuple[str, ...]]:
+    items: list[tuple[float, float, str, tuple[str, ...]]] = []
+    for profile in profiles:
+        fields = profile.fields
+        fi_calls = (
+            _numeric_field(fields, "runtime_prefill_packed_flashinfer_calls")
+            or 0.0
+        )
+        fi_saved = (
+            _numeric_field(fields, "runtime_prefill_packed_flashinfer_saved_tokens")
+            or 0.0
+        )
+        candidate_calls = (
+            _numeric_field(fields, "runtime_prefill_packed_candidate_calls")
+            or 0.0
+        )
+        candidate_saved = (
+            _numeric_field(fields, "runtime_prefill_packed_candidate_saved_tokens")
+            or 0.0
+        )
+        requested = fields.get("packed_flashinfer_prefill_requested")
+        status = fields.get("packed_flashinfer_prefill_status")
+        cache_backend = fields.get("runtime_cache_backend")
+        if fi_calls > 0.0:
+            status = "ran"
+        elif status is None and candidate_saved > 0.0:
+            backend = str(cache_backend or "").lower()
+            if backend and backend != "flashinfer":
+                status = f"cache_backend_{backend}"
+            else:
+                status = "not_executed"
+        if (
+            status is None
+            and fi_calls <= 0.0
+            and fi_saved <= 0.0
+            and candidate_calls <= 0.0
+            and candidate_saved <= 0.0
+            and requested is not True
+        ):
+            continue
+        score = max(float(candidate_saved), float(fi_saved), float(fi_calls))
+        items.append(
+            (
+                score,
+                float(candidate_saved),
+                f"{profile.temperature}:{profile.max_tokens}",
+                (
+                    _fmt_value(profile.temperature),
+                    _fmt_value(profile.max_tokens),
+                    _fmt_value(cache_backend),
+                    _fmt_value(requested),
+                    _fmt_value(fields.get("packed_flashinfer_prefill_model_available")),
+                    _fmt_value(
+                        fields.get("packed_flashinfer_prefill_flashinfer_available")
+                    ),
+                    _fmt_value(fields.get("packed_flashinfer_prefill_cache_enabled")),
+                    _fmt_value(status),
+                    _fmt_value(_int_if_whole(fi_calls)),
+                    _fmt_value(_int_if_whole(fi_saved)),
+                    _fmt_value(_int_if_whole(candidate_calls)),
+                    _fmt_value(_int_if_whole(candidate_saved)),
+                ),
+            )
+        )
+    items.sort(key=lambda item: (-item[0], -item[1], item[2]))
+    return [item[3] for item in items[:limit]]
 
 
 def _prefill_shape_observed_packed_ms(

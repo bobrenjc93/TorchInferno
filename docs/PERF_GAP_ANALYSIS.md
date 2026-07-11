@@ -15136,6 +15136,18 @@ to `98.5 / 44.1 / 135.2ms` with `957/992` correctness. Keep the path opt-in;
 the fair prefill target remains a non-fragmenting cached-prefix suffix body,
 not a static-capacity graph that changes request-path shape churn.
 
+The analyzer now also renders the packed-FlashInfer prefill gate. New OpenAI
+queue profiles record whether `TORCHINFERNO_CONTINUOUS_PACKED_FLASHINFER_PREFILL`
+was requested, whether the model exposes the packed FlashInfer method, whether
+FlashInfer is importable, whether the online cache backend is FlashInfer, and
+the resulting gate status. Re-rendering the existing public `20260711_210242`
+artifact infers the blocker from old fields: every packed-FI row is
+`cache_backend_dense`, with zero packed-FI calls despite candidate savings of
+`33143` tokens for long_output, `15433` for multi_turn, `3557` for few_shot,
+and `2326` for tree_of_thought. That keeps the fair next step focused on a
+dense-cache packed/ragged prefix-suffix prefill body or an explicitly measured
+FlashInfer-cache run, not a silent no-op env toggle.
+
 ## Priority for a focused (non-loop) session
 
 1. Prefill MFU (Issue 1) — biggest TTFT lever, ~2x, affects 3/5 benchmarks.
