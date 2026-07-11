@@ -4403,7 +4403,26 @@ def test_continuous_batch_engine_ignores_nonmatching_packed_ragged_prefill_patte
     assert engine.stats.prefill_packed_eager_calls == 0
 
 
-def test_continuous_batch_engine_keeps_common_prefix_logits_for_exact_prompt() -> None:
+def test_continuous_batch_engine_does_not_store_prompt_logits_by_default() -> None:
+    model = _SelectedLogitsToyModel()
+    engine = ContinuousBatchEngine(
+        model,
+        device=torch.device("cpu"),
+        max_active_requests=2,
+        prefix_cache_capacity=2,
+        pin_shared_prefix=False,
+    )
+
+    results = engine.run([ServingRequest("req", (1, 2, 3), 1, arrival_step=0)])
+
+    assert results[0].tokens[-1] == 4
+    assert engine.reusable_prefixes["req"].logits is None
+
+
+def test_continuous_batch_engine_keeps_common_prefix_logits_for_exact_prompt(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PREFIX_CACHE_STORE_LOGITS", "1")
     shared = tuple(range(16))
     model = _SelectedLogitsToyModel()
     engine = ContinuousBatchEngine(
@@ -4431,6 +4450,7 @@ def test_continuous_batch_engine_keeps_common_prefix_logits_for_exact_prompt() -
 
 def test_continuous_batch_engine_uses_prefix_graph_greedy_tokens(monkeypatch) -> None:
     monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_TOKEN_GRAPH_CAPTURE_ON_MISS", "1")
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PREFIX_CACHE_STORE_LOGITS", "1")
     shared = tuple(range(16))
     model = _TokenLogitsGraphToyModel()
     engine = ContinuousBatchEngine(
@@ -4561,6 +4581,7 @@ def test_continuous_batch_engine_skips_prefix_token_only_graph_when_logits_neede
 ) -> None:
     monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_TOKEN_ONLY_GRAPH", "1")
     monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_TOKEN_GRAPH_CAPTURE_ON_MISS", "1")
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PREFIX_CACHE_STORE_LOGITS", "1")
     shared = tuple(range(16))
     model = _TokenOnlyGraphToyModel()
     engine = ContinuousBatchEngine(
@@ -5712,7 +5733,10 @@ def test_exact_prefix_group_reads_cached_greedy_token_without_tensor_sample() ->
     assert logits == [reusable.logits, reusable.logits]
 
 
-def test_continuous_batch_engine_exact_prompt_reuses_prepared_sample_state() -> None:
+def test_continuous_batch_engine_exact_prompt_reuses_prepared_sample_state(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PREFIX_CACHE_STORE_LOGITS", "1")
     prompt = tuple(range(1, 18))
     model = _SelectedLogitsToyModel()
     prepare_calls: list[float] = []
@@ -5778,6 +5802,7 @@ def test_continuous_batch_engine_unified_online_reuses_exact_prompt_from_cached_
     monkeypatch,
 ) -> None:
     monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_UNIFIED_FORWARD", "1")
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PREFIX_CACHE_STORE_LOGITS", "1")
     prompt = tuple(range(1, 18))
     model = _UnifiedStepToyModel()
     engine = ContinuousBatchEngine(
@@ -5818,7 +5843,10 @@ def test_continuous_batch_engine_unified_online_reuses_exact_prompt_from_cached_
     assert engine.stats.prefix_reuse_tokens == reuse_tokens + len(prompt)
 
 
-def test_continuous_batch_engine_chunked_online_continues_exact_prompt_on_second_token() -> None:
+def test_continuous_batch_engine_chunked_online_continues_exact_prompt_on_second_token(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PREFIX_CACHE_STORE_LOGITS", "1")
     prompt = tuple(range(1, 18))
     model = _SelectedLogitsToyModel()
     engine = ContinuousBatchEngine(
@@ -5869,6 +5897,7 @@ def test_continuous_batch_engine_chunked_online_continues_exact_prompt_on_second
 
 def test_continuous_batch_engine_exact_prompt_reuses_generated_prefix(monkeypatch) -> None:
     monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_GENERATED_PREFIX_CACHE", "1")
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PREFIX_CACHE_STORE_LOGITS", "1")
     prompt = tuple(range(1, 18))
     model = _StaticDecodeGraphToyModel()
     engine = ContinuousBatchEngine(
@@ -5920,6 +5949,7 @@ def test_continuous_batch_engine_non_chunked_exact_prompt_reuses_generated_prefi
     monkeypatch,
 ) -> None:
     monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_GENERATED_PREFIX_CACHE", "1")
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PREFIX_CACHE_STORE_LOGITS", "1")
     prompt = tuple(range(1, 18))
     model = _StaticDecodeGraphToyModel()
     engine = ContinuousBatchEngine(
@@ -5969,6 +5999,7 @@ def test_continuous_batch_engine_exact_prompt_elides_cached_stop_event(
     monkeypatch,
 ) -> None:
     monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_GENERATED_PREFIX_CACHE", "1")
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PREFIX_CACHE_STORE_LOGITS", "1")
     prompt = tuple(range(1, 18))
     eos_token_id = 19
     model = _StaticDecodeGraphToyModel()
@@ -6020,6 +6051,7 @@ def test_continuous_batch_engine_exact_prompt_elides_cached_stop_event(
 
 def test_continuous_batch_engine_common_prompt_stores_generated_prefix(monkeypatch) -> None:
     monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_GENERATED_PREFIX_CACHE", "1")
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PREFIX_CACHE_STORE_LOGITS", "1")
     prompt = tuple(range(1, 18))
     model = _StaticDecodeGraphToyModel()
     engine = ContinuousBatchEngine(
@@ -6054,6 +6086,7 @@ def test_continuous_batch_engine_adaptively_reuses_generated_prefix(
     monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_GENERATED_PREFIX_CACHE", raising=False)
     monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_ADAPTIVE_GENERATED_PREFIX_CACHE", "1")
     monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_ADAPTIVE_GENERATED_PREFIX_MIN_PENDING", "1")
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PREFIX_CACHE_STORE_LOGITS", "1")
     prompt = tuple(range(1, 18))
     model = _StaticDecodeGraphToyModel()
     engine = ContinuousBatchEngine(
@@ -6103,6 +6136,7 @@ def test_continuous_batch_engine_generated_prefix_store_updates_source_seq_len(
 ) -> None:
     monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_GENERATED_PREFIX_CACHE", "1")
     monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_UNIFORM_RAGGED_DECODE", "1")
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PREFIX_CACHE_STORE_LOGITS", "1")
     prompt = tuple(range(1, 18))
     model = _RaggedNoSeqLenUpdateToyModel()
     engine = ContinuousBatchEngine(
@@ -6133,6 +6167,7 @@ def test_continuous_batch_engine_exact_generated_prefix_lookup_uses_live_route(
     monkeypatch,
 ) -> None:
     monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_GENERATED_PREFIX_CACHE", "1")
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PREFIX_CACHE_STORE_LOGITS", "1")
     prompt = tuple(range(1, 18))
     tokens = (*prompt, 18)
     model = _StaticDecodeGraphToyModel()
@@ -6252,6 +6287,7 @@ def test_continuous_batch_engine_unified_online_continues_exact_prompt_on_second
     monkeypatch,
 ) -> None:
     monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_UNIFIED_FORWARD", "1")
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PREFIX_CACHE_STORE_LOGITS", "1")
     prompt = tuple(range(1, 18))
     model = _UnifiedStepToyModel()
     engine = ContinuousBatchEngine(

@@ -873,20 +873,12 @@ def _online_mixed_temperature_batching_enabled() -> bool:
 
 
 def _online_generated_prefix_cache_enabled(*, temperature: float, max_tokens: int) -> bool | None:
+    del temperature, max_tokens
     if (
         "TORCHINFERNO_CONTINUOUS_GENERATED_PREFIX_CACHE" in os.environ
         or "TORCHINFERNO_CONTINUOUS_ADAPTIVE_GENERATED_PREFIX_CACHE" in os.environ
     ):
         return None
-    if temperature <= 0.0 or max_tokens < 1:
-        return None
-    sampled_short_max_tokens = env_int(
-        "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_SHORT_GENERATED_PREFIX_CACHE_MAX_TOKENS",
-        256,
-        minimum=1,
-    )
-    if max_tokens <= sampled_short_max_tokens:
-        return True
     return None
 
 

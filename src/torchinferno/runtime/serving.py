@@ -3248,13 +3248,17 @@ class ContinuousBatchEngine:
             self.stats.prefill_common_prefix_batches += 1
             prefix_tuple = tuple(group[0][1].prompt[:prefix_tokens])
             common_route = ("common_prefix", prefix_tuple)
+            persist_common_prefix_logits = (
+                store_common_prefix_logits
+                and self._prefix_cache_store_logits_enabled(allow_pinned=False)
+            )
             prefix_row_adopted = self._store_reusable_prefix_tokens_in_row(
                 common_route,
                 "__common_prefix__",
                 prefix_tuple,
                 prefix_row,
-                prefix_logits if store_common_prefix_logits else None,
-                store_logits=store_common_prefix_logits,
+                prefix_logits if persist_common_prefix_logits else None,
+                store_logits=persist_common_prefix_logits,
             )
             reusable = self.reusable_prefixes.get(common_route)
             if self.pin_shared_prefix and common_route in self.reusable_prefixes:
@@ -7830,14 +7834,7 @@ class ContinuousBatchEngine:
             self.stats.full_prompt_store_deferred_requests += 1
             self.stats.full_prompt_store_deferred_tokens += len(tokens)
             return
-        store_logits = True
-        if allow_pinned:
-            store_logits = env_flag(
-                "TORCHINFERNO_CONTINUOUS_PINNED_FULL_PROMPT_STORE_LOGITS",
-                False,
-            )
-        if "TORCHINFERNO_CONTINUOUS_PREFIX_CACHE_STORE_LOGITS" in os.environ:
-            store_logits = env_flag("TORCHINFERNO_CONTINUOUS_PREFIX_CACHE_STORE_LOGITS", store_logits)
+        store_logits = self._prefix_cache_store_logits_enabled(allow_pinned=allow_pinned)
         self._store_reusable_prefix_tokens(
             None,
             request_id,
@@ -7851,6 +7848,16 @@ class ContinuousBatchEngine:
         else:
             self._record_full_prompt_store_skip("prefix_row_unavailable_or_store_disabled", tokens)
 
+    def _prefix_cache_store_logits_enabled(self, *, allow_pinned: bool) -> bool:
+        if "TORCHINFERNO_CONTINUOUS_PREFIX_CACHE_STORE_LOGITS" in os.environ:
+            return env_flag("TORCHINFERNO_CONTINUOUS_PREFIX_CACHE_STORE_LOGITS", False)
+        if allow_pinned:
+            return env_flag(
+                "TORCHINFERNO_CONTINUOUS_PINNED_FULL_PROMPT_STORE_LOGITS",
+                False,
+            )
+        return False
+
     def _full_prompt_store_needs_logits(self, request: ServingRequest) -> bool:
         if not self.store_full_prompt_prefixes:
             return False
@@ -7859,18 +7866,7 @@ class ContinuousBatchEngine:
             return False
         if self._delayed_pinned_full_prompt_store_allowed(allow_pinned=allow_pinned):
             return False
-        store_logits = True
-        if allow_pinned:
-            store_logits = env_flag(
-                "TORCHINFERNO_CONTINUOUS_PINNED_FULL_PROMPT_STORE_LOGITS",
-                False,
-            )
-        if "TORCHINFERNO_CONTINUOUS_PREFIX_CACHE_STORE_LOGITS" in os.environ:
-            store_logits = env_flag(
-                "TORCHINFERNO_CONTINUOUS_PREFIX_CACHE_STORE_LOGITS",
-                store_logits,
-            )
-        return bool(store_logits)
+        return self._prefix_cache_store_logits_enabled(allow_pinned=allow_pinned)
 
     def _prefix_prefill_group_can_omit_logits(
         self,

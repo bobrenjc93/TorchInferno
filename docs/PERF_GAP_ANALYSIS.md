@@ -1,5 +1,19 @@
 # TorchInferno vs vLLM/sglang — Performance Gap Analysis (Llama-3.1-70B, 8xH100)
 
+## Current 20260711 logits-cache integrity reset
+
+Exact-prompt logits reuse is not a valid benchmark optimization. Reusing a
+cached prompt or generated-prefix logits tensor lets repeated byte-identical
+prompts return tokens without normal model execution, which disproportionately
+inflates single-token rows such as self_consistency.
+
+The `e887422` generated-prefix chain extension has been reverted, and prompt
+logits are no longer persisted in the reusable-prefix cache by default. OpenAI
+sampled-short serving also no longer auto-enables generated-prefix caching.
+Logits persistence remains available only as an explicit diagnostic opt-in via
+`TORCHINFERNO_CONTINUOUS_PREFIX_CACHE_STORE_LOGITS=1` and should not be used
+for score-facing benchmark runs.
+
 ## Current 20260711 prefix-copy volume refresh
 
 The latest public run remains `20260711_132252`. A current-head TorchInferno

@@ -10639,7 +10639,7 @@ def test_openai_online_prefill_ready_before_decode_respects_env(monkeypatch) -> 
     assert _online_prefill_ready_before_decode_active_cap(temperature=0.0, max_tokens=64) == 6
 
 
-def test_openai_online_generated_prefix_cache_defaults_to_sampled_short(monkeypatch) -> None:
+def test_openai_online_generated_prefix_cache_defaults_off(monkeypatch) -> None:
     monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_GENERATED_PREFIX_CACHE", raising=False)
     monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_ADAPTIVE_GENERATED_PREFIX_CACHE", raising=False)
     monkeypatch.delenv(
@@ -10647,14 +10647,14 @@ def test_openai_online_generated_prefix_cache_defaults_to_sampled_short(monkeypa
         raising=False,
     )
 
-    assert _online_generated_prefix_cache_enabled(temperature=0.7, max_tokens=1) is True
-    assert _online_generated_prefix_cache_enabled(temperature=0.7, max_tokens=256) is True
+    assert _online_generated_prefix_cache_enabled(temperature=0.7, max_tokens=1) is None
+    assert _online_generated_prefix_cache_enabled(temperature=0.7, max_tokens=256) is None
     assert _online_generated_prefix_cache_enabled(temperature=0.7, max_tokens=257) is None
     assert _online_generated_prefix_cache_enabled(temperature=0.0, max_tokens=256) is None
     assert _online_generated_prefix_cache_enabled(temperature=0.7, max_tokens=0) is None
 
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_SHORT_GENERATED_PREFIX_CACHE_MAX_TOKENS", "128")
-    assert _online_generated_prefix_cache_enabled(temperature=0.7, max_tokens=128) is True
+    assert _online_generated_prefix_cache_enabled(temperature=0.7, max_tokens=128) is None
     assert _online_generated_prefix_cache_enabled(temperature=0.7, max_tokens=129) is None
 
 
