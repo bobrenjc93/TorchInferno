@@ -1,5 +1,31 @@
 # TorchInferno vs vLLM/sglang — Performance Gap Analysis (Llama-3.1-70B, 8xH100)
 
+## Current 20260711 dynamic-count packed-prefix target attribution
+
+The research summary now prints
+`[torchinferno packed prefill dynamic-count targets]` between the fixed-capacity
+reject table and the implementation-target table. This separates the broad
+per-pattern savings a dynamic packed-prefix body could recover from the narrower
+fixed-slot savings the current diagnostic prototype can use.
+
+On the latest public artifact, `20260711_030227`, the top repeated few_shot
+pattern is
+`prefix_graph:b32:s16:p122-122:src1:mixed0|p122:s12/p122:s13/p122:s14`: it has
+`28` calls and `3131` dynamic saved tokens, but `0` fixed saved tokens
+(`0.0%` fixed coverage). The next repeated pattern has `363` dynamic saved
+tokens and only `138` fixed saved tokens (`38.0%` fixed coverage). This makes
+the earlier fixed-capacity rejection concrete: the useful packed-prefix target
+is a variable-count grouped body, not another fixed-slot promotion.
+
+The current local long_output artifact
+`/tmp/inference-bench-greedy-graph128-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-greedy-graph128/runs/20260711_113921`
+shows the same shape. The top repeated dynamic-count target has `4101` saved
+tokens with `0.0%` fixed coverage, followed by `756` and `512` saved-token rows
+that also have `0.0%` fixed coverage. The matching multi_turn artifact has
+`0.0%` signature and pattern reuse, so its current padded mixed-prefix prefill
+gap is not solved by an exact-pattern packed graph; it needs either a broader
+dynamic mixed-prefix body or cheaper model-side common-prefix replay.
+
 ## Current 20260711 greedy suffix graph warmup split
 
 Promote a startup-only warmup split: keep the `max_tokens=512` policy target for

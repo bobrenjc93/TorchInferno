@@ -9,6 +9,7 @@ from torchinferno.research.inference_bench import (
     _decode_graph_symm_counts,
     _hot_prefill_shape_rows,
     _phase_target,
+    _prefill_packed_dynamic_target_rows,
     _prefill_packed_fixed_capacity_reject_rows,
     _prefill_shape_call_count,
     _prefill_shape_dense_forward_ms,
@@ -1099,6 +1100,7 @@ def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) ->
     assert "[torchinferno packed prefill signatures]" in text
     assert "[torchinferno packed prefill patterns]" in text
     assert "[torchinferno packed prefill fixed-capacity plans]" in text
+    assert "[torchinferno packed prefill dynamic-count targets]" in text
     assert "[torchinferno packed prefill implementation targets]" in text
     assert "[torchinferno packed prefill signature reuse]" in text
     assert "[torchinferno packed prefill pattern reuse]" in text
@@ -1108,6 +1110,8 @@ def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) ->
     assert "runtime" in text
     assert "est_saved_ms" in text
     assert "fixed_saved_pct" in text
+    assert "dynamic_saved" in text
+    assert "fixed_cover" in text
     assert "repeat_saved" in text
     assert "sig_cov" in text
     assert "75.8%" in text
@@ -1465,6 +1469,13 @@ def test_prefill_fixed_capacity_reject_rows_show_over_dense_patterns() -> None:
             "runtime_prefill_packed_candidate_pattern_counts": {
                 "prefix_graph:b32:s16:p122-122:src1:mixed0|p122:s12/p122:s13/p122:s14": 33,
             },
+            "runtime_prefill_forward_ms": 120.0,
+            "runtime_prefill_shape_forward_ms": {
+                "prefix_graph:b32:s16:p122-122:src1:mixed0": 60.0,
+            },
+            "runtime_prefill_shape_model_tokens": {
+                "prefix_graph:b32:s16:p122-122:src1:mixed0": 16896,
+            },
             "runtime_prefill_packed_candidate_pattern_saved_tokens": {
                 "prefix_graph:b32:s16:p122-122:src1:mixed0|p122:s12/p122:s13/p122:s14": 5088,
             },
@@ -1489,6 +1500,23 @@ def test_prefill_fixed_capacity_reject_rows_show_over_dense_patterns() -> None:
             "2706",
             "5088",
             "16.0%",
+        ),
+    ]
+
+    dynamic_rows = _prefill_packed_dynamic_target_rows([profile])
+
+    assert dynamic_rows == [
+        (
+            "0.0",
+            "256",
+            "prefix_graph:b32:s16:p122-122:src1:mixed0|p122:s12/p122:s13/p122:s14",
+            "33",
+            "5088",
+            "0",
+            "0.0%",
+            "18.1",
+            "15.1%",
+            "-",
         ),
     ]
 
