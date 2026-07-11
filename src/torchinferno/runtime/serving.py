@@ -4326,6 +4326,12 @@ class ContinuousBatchEngine:
             if multi_src_prefix
             else 1 if src_prefix_row is not None else 0
         )
+        fixed_prefix_copy_len = prefix_copy_len
+        if src_prefix_row is not None and fixed_prefix_copy_len is None:
+            fixed_prefix_copy_len = max(
+                start_len for start_len, _suffix_len, _real_index in slot_specs
+            )
+
         graph_none_key = (
             packed_prefill_pattern_key,
             tuple((start_len, suffix_len) for start_len, suffix_len, _real_index in slot_specs),
@@ -4429,7 +4435,7 @@ class ContinuousBatchEngine:
                 row_indices=fixed_row_indices,
                 logit_positions=fixed_logit_positions,
                 src_prefix_row=fixed_src_prefix_row,
-                prefix_copy_len=prefix_copy_len,
+                prefix_copy_len=fixed_prefix_copy_len,
                 capture_on_miss=capture_on_miss,
             )
             if logits is None:

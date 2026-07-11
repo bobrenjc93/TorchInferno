@@ -3984,6 +3984,66 @@ def test_continuous_batch_engine_can_use_fixed_capacity_packed_prefill_graph_wit
         engine._release_active_row(row)
 
 
+def test_continuous_batch_engine_fixed_capacity_packed_prefill_sets_uniform_prefix_copy_len(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv(
+        "TORCHINFERNO_CONTINUOUS_PACKED_RAGGED_PREFILL_FIXED_CAPACITY_GRAPH",
+        "1",
+    )
+    monkeypatch.setenv(
+        "TORCHINFERNO_CONTINUOUS_PACKED_RAGGED_PREFILL_FIXED_CAPACITY_MIN_CALLS",
+        "1",
+    )
+    shape_key = "prefix_graph:b2:s5:p4-4:src1:mixed0"
+    pattern_key = f"{shape_key}|p4:s2/p4:s4"
+    model = _SelectedLogitsToyModel()
+    engine = ContinuousBatchEngine(
+        model,
+        device=torch.device("cpu"),
+        max_active_requests=3,
+        prefix_cache_capacity=2,
+        profile_timings=True,
+    )
+    engine.start_online(max_seq_len=8)
+    real_rows = [engine._acquire_active_row(), engine._acquire_active_row()]
+    source_row = engine._acquire_free_prefix_row_or_none()
+    assert source_row is not None
+    engine._packed_prefill_fixed_capacity_counts[pattern_key] = {
+        (4, 2): 1,
+        (4, 4): 1,
+    }
+    engine._packed_prefill_fixed_capacity_seen[pattern_key] = 1
+
+    result = engine._try_fixed_capacity_packed_prefill_logits(
+        input_ids=torch.tensor([[3, 4, 5, 6, 0], [1, 2, 0, 0, 0]], dtype=torch.long),
+        group=[
+            (1, ServingRequest("long", (9, 9, 9, 9, 3, 4, 5, 6), 1), 4, object()),
+            (0, ServingRequest("short", (9, 9, 9, 9, 1, 2), 1), 4, object()),
+        ],
+        rows=real_rows,
+        suffixes=[[3, 4, 5, 6], [1, 2]],
+        suffix_lengths=[4, 2],
+        suffix_bucket=5,
+        source_prefix_rows=[int(source_row)],
+        src_prefix_row=torch.tensor([int(source_row)], dtype=torch.long),
+        prefix_copy_len=None,
+        pad_rows=[],
+        pad_prefix_rows=[],
+        capture_on_miss=False,
+        profile_shape_key=shape_key,
+        packed_prefill_pattern_key=pattern_key,
+        skip_active_row_clear=True,
+    )
+
+    assert result is not None
+    assert model.prefill_prefix_copy_lens[-1] == 4
+    assert model.prefill_src_prefix_rows[-1] == [int(source_row)]
+    engine._release_prefix_row(int(source_row))
+    for row in real_rows:
+        engine._release_active_row(row)
+
+
 def test_continuous_batch_engine_rejects_fixed_capacity_packed_prefill_multi_source_dummy_slots(
     monkeypatch,
 ) -> None:

@@ -1,5 +1,49 @@
 # TorchInferno vs vLLM/sglang — Performance Gap Analysis (Llama-3.1-70B, 8xH100)
 
+## Current 20260711 fixed-capacity packed-prefix tree rejection
+
+The latest public run remains `20260711_132252` on TorchInferno `9af4c72`,
+vLLM `19069bc`, and SGLang `32cb89d`. TorchInferno scores `5/20`, with the
+remaining score-facing rows led by first-token/tree and long-output gaps:
+tree_of_thought is `53.9 / 35.1 / 75.1ms` versus vLLM
+`32.4 / 21.6 / 48.0ms`, and long_output is
+`187.7 / 19.0 / 873.4ms` versus vLLM `43.9 / 14.7 / 556.5ms`.
+
+The public tree profile now has repeated packed-prefix candidate patterns
+(`402` candidate calls, `16` pattern keys, `2209` saved model tokens), but the
+fixed-capacity packed-prefill prototype is still rejected as a default path. A
+same-host control on current head wrote
+`/tmp/inference-bench-tree-control-dirty-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-ti-tree-control-dirty-4e9b5fd/runs/20260711_143509`
+and scored `110.9 / 64.7 / 146.4ms`, with `76` prefill model calls and
+`4298` candidate padding tokens. Enabling best-case fixed-capacity before the
+prefix-copy fix wrote
+`/tmp/inference-bench-tree-fixedcap-best-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-ti-tree-fixedcap-best-4e9b5fd/runs/20260711_142251`;
+it scored `132.5 / 71.2 / 214.4ms` and accepted `0/71` attempts because
+`17` graph attempts returned none, `33` grew capacity, and `21` had no
+savings.
+
+The guarded fix is to pass a concrete uniform `prefix_copy_len` into
+fixed-capacity packed-prefill graphs when the batch has a reusable source
+prefix but the caller left the copy length unspecified. With the fix and the
+same best-case envs, the run
+`/tmp/inference-bench-tree-fixedcap-prefixlen-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-ti-tree-fixedcap-prefixlen-dirty-4e9b5fd/runs/20260711_142949`
+accepted `14/69` attempts instead of failing graph replay, but still regressed
+to `119.0 / 69.5 / 169.2ms`. The accepted packed calls covered only `1995`
+active tokens, `2404` model tokens, and `409` saved model tokens, while total
+phase runtime grew to `11.1s` from the control's `4.6s`. Keep the env-gated
+path as a correctness/debug fix only; the next tree target is a cheaper dynamic
+packed-prefix body or lower first-token scheduling cost, not default
+fixed-capacity replay.
+
+The public long_output profile continues to point elsewhere. Its final record
+has `747` ragged-decode batches, `125` decode-many calls, `539` internal
+decode-many steps, and a hot `decode_many:b64/64` shape with `159` steps. Hot
+prefill remains padded common-prefix replay (`b24:s64`/`b24:s96` and
+`b16:s64`/`b16:s96`), with `59` packed candidates spread over `56` pattern
+keys. There is not enough exact fixed-capacity reuse to make this prototype a
+long_output fix; keep the long-output target on the cached-prefix prefill body
+and high-active decode replay.
+
 ## Current 20260711 dynamic-count packed-prefix target attribution
 
 The research summary now prints
