@@ -13799,6 +13799,21 @@ internal steps, and `40640` padded decode-many tokens, with
 timing was sync-light, so this validates correctness and path coverage, not a
 direct prepare-ms delta.
 
+A follow-up sync-timed long_output profile on `d079b76` refreshed the current
+decode prep target:
+`/tmp/inference-bench-long-output-sync-d079-results/.../runs/20260711_021522`
+landed at `225.8 / 21.3 / 973.8ms`, `1000/1000` correct, with
+`runtime_decode_ragged_prepare_ms=484.4ms`, `queue_to_first_p50=214.0ms`,
+`5.12s` prefill wall, and `7.61s` decode-many GPU. Replacing the repeated
+`sorted(rows) == range(...)` dense-row checks with a one-pass dense-prefix row
+helper, and reusing its ordered-row result at the call sites, reduced decode
+preparation in the exact-final sync validation
+`/tmp/inference-bench-long-output-dense-row-info-results/.../runs/20260711_023053`
+to `367.2ms` and moved `queue_to_first_p50` to `195.6ms` while staying correct
+at `1000/1000`. The benchmark row landed at `205.5 / 22.0 / 1003.8ms`; treat
+this as a small TTFT/preparation cleanup, not a closure of the long_output gap,
+because prefill wall (`6.56s`) and decode-many GPU (`8.06s`) still dominate.
+
 ## Priority for a focused (non-loop) session
 
 1. Prefill MFU (Issue 1) — biggest TTFT lever, ~2x, affects 3/5 benchmarks.

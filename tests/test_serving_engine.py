@@ -8004,6 +8004,13 @@ def test_continuous_batch_engine_online_many_omits_row_indices_for_contiguous_gr
     assert not engine.has_online_work()
 
 
+def test_continuous_batch_engine_dense_prefix_row_check_matches_sorted_semantics() -> None:
+    assert ContinuousBatchEngine._dense_prefix_row_info([0, 1, 2, 3]) == (True, True)
+    assert ContinuousBatchEngine._dense_prefix_row_info([2, 0, 3, 1]) == (True, False)
+    assert ContinuousBatchEngine._dense_prefix_row_info([0, 2, 3]) == (False, False)
+    assert ContinuousBatchEngine._dense_prefix_row_info([0, 2, 2]) == (False, False)
+
+
 def test_continuous_batch_engine_ragged_decode_omits_row_indices_for_contiguous_greedy_decode(
     monkeypatch,
 ) -> None:

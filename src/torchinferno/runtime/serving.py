@@ -1380,12 +1380,17 @@ class ContinuousBatchEngine:
         n_active = len(states)
         decode_rows = self._ragged_decode_bucket_rows(rows)
         n_padded = len(decode_rows)
-        contiguous_row_set = n_active == n_padded and sorted(decode_rows) == list(range(n_padded))
+        dense_row_set, dense_row_ordered = (
+            self._dense_prefix_row_info(decode_rows)
+            if n_active == n_padded
+            else (False, False)
+        )
+        contiguous_row_set = dense_row_set
         state_order_indices: Tensor | None = None
         if contiguous_row_set:
             row_indices = None
             input_ids = self._ensure_gpu_token_buf()[:n_padded].view(n_padded, 1)
-            if any(row != index for index, row in enumerate(rows)):
+            if not dense_row_ordered:
                 state_order_indices = self._device_index_tensor(tuple(rows))
         else:
             if not env_flag(
@@ -6724,6 +6729,28 @@ class ContinuousBatchEngine:
             and seq_lens.numel() > max_row
         )
 
+    @staticmethod
+    def _dense_prefix_row_info(rows: list[int]) -> tuple[bool, bool]:
+        count = len(rows)
+        if count <= 1:
+            return True, True
+        ordered = True
+        min_row = rows[0]
+        max_row = rows[0]
+        for index, row in enumerate(rows):
+            if row != index:
+                ordered = False
+            if row < min_row:
+                min_row = row
+            if row > max_row:
+                max_row = row
+        if ordered:
+            return True, True
+        covers_dense_prefix = (
+            min_row == 0 and max_row == count - 1 and len(set(rows)) == count
+        )
+        return covers_dense_prefix, False
+
     def _decode_many_seq_lens_tensor(self, states: list[_ActiveRequest], rows: list[int]) -> Tensor:
         buf = self._ensure_gpu_seq_lens_buf()
         if not states:
@@ -7030,11 +7057,12 @@ class ContinuousBatchEngine:
         shared_temperature = self._shared_temperature_for_states(states)
         # Same-temperature sampled batches can use the contiguous graph too;
         # token/logit outputs are reordered back to active-state order below.
-        contiguous_row_set = (
-            shared_temperature is not None
-            and n_active == n_padded
-            and sorted(decode_rows) == list(range(n_padded))
+        dense_row_set, dense_row_ordered = (
+            self._dense_prefix_row_info(decode_rows)
+            if shared_temperature is not None and n_active == n_padded
+            else (False, False)
         )
+        contiguous_row_set = dense_row_set
         state_order_indices: Tensor | None = None
         row_indices: Tensor | None
         if contiguous_row_set:
@@ -7043,7 +7071,7 @@ class ContinuousBatchEngine:
                 input_tokens[state.row] = state.last_token
             input_ids = torch.tensor([[token] for token in input_tokens], device=self.device, dtype=torch.long)
             row_indices = None
-            if any(row != index for index, row in enumerate(rows)):
+            if not dense_row_ordered:
                 state_order_indices = self._device_index_tensor(tuple(rows))
         else:
             pad_token = states[0].last_token
@@ -7134,17 +7162,18 @@ class ContinuousBatchEngine:
         shared_temperature = self._shared_temperature_for_states(states)
         # Same-temperature sampled batches can use the contiguous graph too;
         # token outputs are reordered back to active-state order below.
-        contiguous_row_set = (
-            shared_temperature is not None
-            and n_active == n_padded
-            and sorted(decode_rows) == list(range(n_padded))
+        dense_row_set, dense_row_ordered = (
+            self._dense_prefix_row_info(decode_rows)
+            if shared_temperature is not None and n_active == n_padded
+            else (False, False)
         )
+        contiguous_row_set = dense_row_set
         state_order_indices: Tensor | None = None
         row_indices: Tensor | None
         if contiguous_row_set:
             row_indices = None
             input_ids = self._ensure_gpu_token_buf()[:n_padded].view(n_padded, 1)
-            if any(row != index for index, row in enumerate(rows)):
+            if not dense_row_ordered:
                 state_order_indices = self._device_index_tensor(tuple(rows))
         else:
             row_indices = self._device_index_tensor(tuple(decode_rows))
