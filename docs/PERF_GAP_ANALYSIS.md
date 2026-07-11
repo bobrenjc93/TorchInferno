@@ -1,5 +1,28 @@
 # TorchInferno vs vLLM/sglang — Performance Gap Analysis (Llama-3.1-70B, 8xH100)
 
+## Current 20260711 pushed-head long_output refresh and startup warmup attribution
+
+A pushed-head TorchInferno long_output refresh on `821193a` wrote
+`/tmp/inference-bench-long-compare-821193a-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-long-compare-821193a/runs/20260711_112515`.
+TorchInferno completed `1000/1000` at `209.1 / 21.9 / 1006.7ms`,
+`36.4 tok/s`, and `100%` correctness. The same command could not refresh local
+vLLM or SGLang because `--skip-build` found no provider venvs under
+`/tmp/inference-bench-origin-main-20260707/builds/{vllm,sglang}`; keep using the
+same-host public/local reference rows for those providers until the provider
+venvs are rebuilt.
+
+The run keeps the score-facing diagnosis unchanged: median first-token latency
+splits into `90.0ms` queue-to-submit plus `112.3ms` submit-to-first, hot prefill
+is still padded `p111` common-prefix replay (`b24:s64` and `b24:s96`), and
+`decode_many:b64/64:g1-16` owns `38.6%` of decode-many model tokens. The new
+research summary now also parses TorchInferno startup warmup spans from
+`provider_logs/torchinferno.log`. On this artifact it reports `219.9s` total
+startup warmup: `35.8s` online decode graph warmup, `102.3s` greedy
+common-prefix suffix warmup for `max_tokens=128`, `43.1s` greedy warmup for
+`max_tokens=512`, and `16.9s` sampled common-prefix suffix warmup for
+`temperature=1,max_tokens=300`. This makes public timeout/staleness triage
+visible in the analyzer output instead of requiring manual server-log reads.
+
 ## Current 20260711 decode-many queue-profile GPU timing
 
 Queue profiles can now opt into asynchronous CUDA-event timing for decode-many

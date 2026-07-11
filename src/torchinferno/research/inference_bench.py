@@ -72,6 +72,13 @@ _TORCHINFERNO_RAGGED_DECODE_PROFILE_RE = re.compile(
     r"cache_bucket=(?P<cache_bucket>\S+) "
     r"rows=(?P<rows>[0-9]+)"
 )
+_TORCHINFERNO_WARMUP_START_RE = re.compile(
+    r"^\[WARMUP\] (?P<label>.+?) start(?: (?P<detail>.*))?$"
+)
+_TORCHINFERNO_WARMUP_DONE_RE = re.compile(
+    r"^\[WARMUP\] (?P<label>.+?) done(?: (?P<detail>.*?))? "
+    r"in (?P<seconds>[0-9]+(?:\.[0-9]+)?)s$"
+)
 _PROFILER_TIME_RE = re.compile(r"(?P<value>[0-9]+(?:\.[0-9]+)?)(?P<unit>us|ms|s)\b")
 _PROFILER_SELF_CUDA_TOTAL_RE = re.compile(
     r"Self CUDA time total:\s*(?P<value>[0-9]+(?:\.[0-9]+)?)(?P<unit>us|ms|s)\b"
@@ -422,6 +429,16 @@ class TorchInfernoProfilerSummary:
 
 
 @dataclass(frozen=True)
+class TorchInfernoStartupWarmupSummary:
+    label: str
+    seconds: float
+    temperature: float | None = None
+    max_tokens: int | None = None
+    shapes: int | None = None
+    token_graphs: bool | None = None
+
+
+@dataclass(frozen=True)
 class InferenceBenchRunSummary:
     run_dir: Path
     model: str
@@ -432,6 +449,7 @@ class InferenceBenchRunSummary:
     provider_benchmarks: tuple[ProviderBenchmarkSummary, ...]
     torchinferno_queue_profiles: tuple[QueueProfileSummary, ...]
     torchinferno_profiler_events: tuple[TorchInfernoProfilerSummary, ...]
+    torchinferno_startup_warmups: tuple[TorchInfernoStartupWarmupSummary, ...]
     provider_server_logs: tuple[ProviderServerLogSummary, ...]
 
 
@@ -486,6 +504,7 @@ def summarize_inference_bench_run(
         provider_benchmarks=tuple(provider_benchmarks),
         torchinferno_queue_profiles=_summarize_torchinferno_queue(root),
         torchinferno_profiler_events=_summarize_torchinferno_profiler_logs(root),
+        torchinferno_startup_warmups=_summarize_torchinferno_startup_warmup_logs(root),
         provider_server_logs=_summarize_provider_server_logs(root),
     )
 
@@ -1375,6 +1394,26 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
         )
         lines.append("")
 
+    startup_rows = _torchinferno_startup_warmup_rows(
+        summary.torchinferno_startup_warmups
+    )
+    if startup_rows:
+        lines.append("[torchinferno startup warmup]")
+        lines.extend(
+            _format_table(
+                (
+                    "phase",
+                    "seconds",
+                    "temp",
+                    "max_tokens",
+                    "shapes",
+                    "token_graphs",
+                ),
+                startup_rows,
+            )
+        )
+        lines.append("")
+
     provider_phase_rows = _provider_server_log_rows(summary.provider_server_logs)
     if provider_phase_rows:
         lines.append("[provider server log phases]")
@@ -1862,6 +1901,107 @@ def _summarize_torchinferno_profiler_logs(
     return _parse_torchinferno_profiler_events(path.read_text(errors="replace"))
 
 
+def _summarize_torchinferno_startup_warmup_logs(
+    root: Path,
+) -> tuple[TorchInfernoStartupWarmupSummary, ...]:
+    logs_dir = root / "provider_logs"
+    path = _first_existing_provider_log(
+        logs_dir,
+        "torchinferno.log",
+        "torchinferno_server.log",
+    )
+    if not path.exists():
+        return ()
+    return _parse_torchinferno_startup_warmups(path.read_text(errors="replace"))
+
+
+def _parse_torchinferno_startup_warmups(
+    text: str,
+) -> tuple[TorchInfernoStartupWarmupSummary, ...]:
+    warmups: list[TorchInfernoStartupWarmupSummary] = []
+    active_details: dict[str, str] = {}
+    for line in text.splitlines():
+        start_match = _TORCHINFERNO_WARMUP_START_RE.search(line)
+        if start_match is not None:
+            label = _short_torchinferno_warmup_label(start_match.group("label"))
+            active_details[label] = start_match.group("detail") or ""
+            continue
+
+        done_match = _TORCHINFERNO_WARMUP_DONE_RE.search(line)
+        if done_match is None:
+            continue
+        label = _short_torchinferno_warmup_label(done_match.group("label"))
+        detail_parts = [
+            active_details.pop(label, ""),
+            done_match.group("detail") or "",
+        ]
+        detail = " ".join(part for part in detail_parts if part)
+        warmups.append(
+            TorchInfernoStartupWarmupSummary(
+                label=label,
+                seconds=float(done_match.group("seconds")),
+                temperature=_warmup_detail_float(detail, "temperature"),
+                max_tokens=_warmup_detail_int(detail, "max_tokens"),
+                shapes=_warmup_detail_int(detail, "shapes"),
+                token_graphs=_warmup_detail_bool(detail, "token_graphs"),
+            )
+        )
+    return tuple(warmups)
+
+
+def _short_torchinferno_warmup_label(label: str) -> str:
+    label = label.strip()
+    for marker in (
+        " prompt_counts=",
+        " cache_tokens=",
+        " temperature=",
+        " row=",
+        " rows=",
+        " cache_rows=",
+    ):
+        if marker in label:
+            label = label.split(marker, 1)[0].strip()
+    return label
+
+
+def _warmup_detail_value(detail: str, name: str) -> str | None:
+    match = re.search(rf"\b{re.escape(name)}=(?P<value>[^\s,]+)", detail)
+    if match is None:
+        return None
+    return match.group("value")
+
+
+def _warmup_detail_int(detail: str, name: str) -> int | None:
+    value = _warmup_detail_value(detail, name)
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return None
+
+
+def _warmup_detail_float(detail: str, name: str) -> float | None:
+    value = _warmup_detail_value(detail, name)
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except ValueError:
+        return None
+
+
+def _warmup_detail_bool(detail: str, name: str) -> bool | None:
+    value = _warmup_detail_value(detail, name)
+    if value is None:
+        return None
+    if value.lower() in {"1", "true", "yes", "on"}:
+        return True
+    if value.lower() in {"0", "false", "no", "off"}:
+        return False
+    return None
+
+
 def _parse_torchinferno_profiler_events(
     text: str,
 ) -> tuple[TorchInfernoProfilerSummary, ...]:
@@ -2211,6 +2351,24 @@ def _provider_server_log_rows(
                 ),
                 _fmt_pct(summary.decode_cuda_graph_batches, summary.decode_batches),
                 _fmt_value(summary.decode_running_max),
+            )
+        )
+    return rows
+
+
+def _torchinferno_startup_warmup_rows(
+    summaries: Sequence[TorchInfernoStartupWarmupSummary],
+) -> list[tuple[str, ...]]:
+    rows: list[tuple[str, ...]] = []
+    for summary in summaries:
+        rows.append(
+            (
+                summary.label,
+                _fmt_value(summary.seconds),
+                _fmt_value(summary.temperature),
+                _fmt_value(summary.max_tokens),
+                _fmt_value(summary.shapes),
+                _fmt_value(summary.token_graphs),
             )
         )
     return rows

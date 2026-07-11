@@ -431,6 +431,17 @@ def _write_inference_bench_run(tmp_path) -> None:
     (logs / "torchinferno.log").write_text(
         "\n".join(
             [
+                "[WARMUP] tensor-parallel startup warmup start cache_backend=dense "
+                "prompt_counts=(32, 16, 64, 128, 256) new_tokens=2",
+                "[WARMUP] online decode graph warmup start temperature=0 "
+                "max_tokens=1 batches=(1, 2, 4, 8)",
+                "[WARMUP] online decode graph warmup done temperature=0 "
+                "max_tokens=1 in 35.8s",
+                "[WARMUP] greedy common-prefix suffix warmup start temperature=0 "
+                "max_tokens=128 row=48 prefixes=3 suffix_pairs=9 batches=7 "
+                "shapes=63 token_graphs=True",
+                "[WARMUP] greedy common-prefix suffix warmup done in 102.3s",
+                "[WARMUP] tensor-parallel startup warmup done in 219.9s",
                 "[RAGGED_PREFILL_REPLAY_PROF] batch=24 suffix=64 match=5 "
                 "context_len=-256 src_rows=1 prefix_copy_len=none",
                 "ncclDevKernel_AllReduce_Sum_bf16_RING_LL         0.00% "
@@ -747,7 +758,7 @@ def test_benchmark_filter_limits_queue_profile_tables(tmp_path) -> None:
     assert "300" in text
     assert "tree_shape" in text
     assert "long_output_shape" not in text
-    assert "96" not in text
+    assert "0.0   96" not in text
 
 
 def test_prefill_shape_call_count_falls_back_to_graph_counts() -> None:
@@ -870,6 +881,21 @@ def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) ->
     assert sglang_log.prefill_cached_tokens == 16
     assert sglang_log.decode_batches == 1
     assert sglang_log.decode_logged_tokens == 64
+    assert len(summary.torchinferno_startup_warmups) == 3
+    decode_warmup = summary.torchinferno_startup_warmups[0]
+    assert decode_warmup.label == "online decode graph warmup"
+    assert decode_warmup.seconds == 35.8
+    assert decode_warmup.temperature == 0.0
+    assert decode_warmup.max_tokens == 1
+    greedy_warmup = summary.torchinferno_startup_warmups[1]
+    assert greedy_warmup.label == "greedy common-prefix suffix warmup"
+    assert greedy_warmup.seconds == 102.3
+    assert greedy_warmup.max_tokens == 128
+    assert greedy_warmup.shapes == 63
+    assert greedy_warmup.token_graphs is True
+    total_warmup = summary.torchinferno_startup_warmups[2]
+    assert total_warmup.label == "tensor-parallel startup warmup"
+    assert total_warmup.seconds == 219.9
     assert len(summary.torchinferno_profiler_events) == 4
     profiler_event = summary.torchinferno_profiler_events[0]
     assert profiler_event.kind == "RAGGED_PREFILL_REPLAY_PROF"
@@ -929,6 +955,12 @@ def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) ->
     text = format_inference_bench_summary(summary)
     assert "[long_output]" in text
     assert "[torchinferno ragged replay profiler]" in text
+    assert "[torchinferno startup warmup]" in text
+    assert "online decode graph warmup" in text
+    assert "greedy common-prefix suffix warmup" in text
+    assert "102.3" in text
+    assert "63" in text
+    assert "True" in text
     assert "commit" in text
     assert "abcdef1" in text
     assert "123456a" in text
