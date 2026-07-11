@@ -3953,6 +3953,11 @@ class ContinuousBatchEngine:
                 len(request.prompt)
                 for _original_index, request, _prefix_hit_tokens, _reusable in output_group
             ]
+            self._set_gpu_decode_state(
+                output_rows[: len(output_group)],
+                next_token_tensor[: len(output_group)],
+                output_prompt_lens,
+            )
             if self.profile_timings:
                 state_start_s = time.perf_counter()
                 state_seq_start_s = time.perf_counter()
@@ -4068,6 +4073,9 @@ class ContinuousBatchEngine:
                         prefill_shape=shape_key,
                     )
                     active.append(state)
+            self._decode_many_gpu_state_signature = self._make_decode_many_gpu_state_signature(
+                active
+            )
             return active
         except Exception:
             for pad_row in pad_rows:
@@ -6578,6 +6586,97 @@ class ContinuousBatchEngine:
             self._decode_input_scratch = scratch
         return scratch
 
+    def _set_gpu_decode_state(
+        self,
+        rows: Sequence[int],
+        tokens: Tensor | Sequence[int],
+        seq_lens: Sequence[int],
+    ) -> None:
+        if len(rows) != len(seq_lens):
+            raise ValueError("rows and seq_lens must have the same length")
+        if not rows:
+            return
+        row_tuple = tuple(int(row) for row in rows)
+        row_indices = self._device_index_tensor(row_tuple)
+        if isinstance(tokens, Tensor):
+            token_values = tokens.to(device=self.device, dtype=torch.long).view(-1)
+            if token_values.numel() < len(row_tuple):
+                raise ValueError("tokens must include one value per row")
+            token_values = token_values[: len(row_tuple)]
+        else:
+            token_values = torch.tensor(
+                [int(token) for token in tokens],
+                device=self.device,
+                dtype=torch.long,
+            )
+            if token_values.numel() != len(row_tuple):
+                raise ValueError("tokens must include one value per row")
+        seq_len_values = torch.tensor(
+            [int(seq_len) for seq_len in seq_lens],
+            device=self.device,
+            dtype=torch.long,
+        )
+        self._ensure_gpu_token_buf().index_copy_(0, row_indices, token_values)
+        self._ensure_gpu_seq_lens_buf().index_copy_(0, row_indices, seq_len_values)
+
+    def _decode_input_ids_from_gpu_state(
+        self,
+        states: list[_ActiveRequest],
+        decode_rows: list[int],
+        *,
+        dense_row_set: bool,
+        dense_row_ordered: bool,
+    ) -> tuple[Tensor, Tensor | None, Tensor | None] | None:
+        if not states:
+            return None
+        signature = self._make_decode_many_gpu_state_signature(states)
+        if not self._decode_many_gpu_state_is_current(signature):
+            return None
+        if dense_row_set:
+            input_ids = self._ensure_gpu_token_buf()[: len(decode_rows)].view(len(decode_rows), 1)
+            state_order_indices = (
+                None
+                if dense_row_ordered
+                else self._device_index_tensor(tuple(state.row for state in states))
+            )
+            return input_ids, None, state_order_indices
+        row_indices = self._device_index_tensor(tuple(decode_rows))
+        input_scratch = self._ensure_decode_input_scratch(len(decode_rows))[: len(decode_rows)]
+        torch.index_select(
+            self._ensure_gpu_token_buf(),
+            0,
+            row_indices,
+            out=input_scratch,
+        )
+        return input_scratch.view(len(decode_rows), 1), row_indices, None
+
+    def _record_gpu_decode_tokens(
+        self,
+        next_token_tensor: Tensor,
+        *,
+        row_indices: Tensor | None,
+        n_active: int,
+        state_order_indices: Tensor | None = None,
+    ) -> Tensor:
+        if n_active <= 0:
+            return next_token_tensor
+        if row_indices is None:
+            self._ensure_gpu_token_buf()[:n_active].copy_(next_token_tensor[:n_active])
+            seq_lens_buf = getattr(self, "_gpu_seq_lens", None)
+            if seq_lens_buf is not None:
+                seq_lens_buf[:n_active].add_(1)
+            if state_order_indices is not None:
+                return next_token_tensor.index_select(0, state_order_indices)
+            return next_token_tensor
+        active_row_indices = row_indices[:n_active].to(dtype=torch.long)
+        self._ensure_gpu_token_buf().index_copy_(
+            0,
+            active_row_indices,
+            next_token_tensor[:n_active],
+        )
+        self._advance_gpu_seq_lens(active_row_indices)
+        return next_token_tensor
+
     def _decode_many_async_readback_enabled(self) -> bool:
         return bool(
             self.decode_many_async_readback
@@ -7096,7 +7195,15 @@ class ContinuousBatchEngine:
         contiguous_row_set = dense_row_set
         state_order_indices: Tensor | None = None
         row_indices: Tensor | None
-        if contiguous_row_set:
+        gpu_inputs = self._decode_input_ids_from_gpu_state(
+            states,
+            decode_rows,
+            dense_row_set=contiguous_row_set,
+            dense_row_ordered=dense_row_ordered,
+        )
+        if gpu_inputs is not None:
+            input_ids, row_indices, state_order_indices = gpu_inputs
+        elif contiguous_row_set:
             input_tokens = [0 for _ in range(n_padded)]
             for state in states:
                 input_tokens[state.row] = state.last_token
@@ -7111,7 +7218,7 @@ class ContinuousBatchEngine:
                 for index, _row in enumerate(decode_rows)
             ]
             input_ids = torch.tensor([[token] for token in input_tokens], device=self.device, dtype=torch.long)
-            row_indices = torch.tensor(decode_rows, dtype=torch.long, device=self.device)
+            row_indices = self._device_index_tensor(tuple(decode_rows))
         seq_lens = self._seq_lens_tensor(states, rows=decode_rows)
         if self.profile_timings:
             self.stats.decode_ragged_prepare_ms += (time.perf_counter() - prepare_start_s) * 1000.0
@@ -7137,10 +7244,14 @@ class ContinuousBatchEngine:
             logits = self._ragged_decode_logits(input_ids, seq_lens, row_indices)
             reuse_logits = logits[:, -1, :]
             next_token_tensor = self._sample_logits_for_states(logits[:, -1, :], states)
-        if row_indices is None and state_order_indices is not None:
-            next_token_tensor = next_token_tensor.index_select(0, state_order_indices)
-            if reuse_logits is not None:
-                reuse_logits = reuse_logits.index_select(0, state_order_indices)
+        next_token_tensor = self._record_gpu_decode_tokens(
+            next_token_tensor,
+            row_indices=row_indices,
+            n_active=n_active,
+            state_order_indices=state_order_indices,
+        )
+        if row_indices is None and state_order_indices is not None and reuse_logits is not None:
+            reuse_logits = reuse_logits.index_select(0, state_order_indices)
         self._stop_decode_ragged_model_gpu_timer(gpu_model_events, shape_key=shape_key)
         self._record_model_call("decode", n_padded, tokens=n_padded, ragged=True, active_tokens=n_active)
         if self.profile_timings:
@@ -7246,16 +7357,18 @@ class ContinuousBatchEngine:
         )
         self._record_model_call("decode", n_padded, tokens=n_padded, ragged=True, active_tokens=n_active)
         if row_indices is None:
-            self._ensure_gpu_token_buf()[:n_active].copy_(next_token_tensor[:n_active])
-            seq_lens_buf = getattr(self, "_gpu_seq_lens", None)
-            if seq_lens_buf is not None:
-                seq_lens_buf[:n_active].add_(1)
-            if state_order_indices is not None:
-                next_token_tensor = next_token_tensor.index_select(0, state_order_indices)
+            next_token_tensor = self._record_gpu_decode_tokens(
+                next_token_tensor,
+                row_indices=None,
+                n_active=n_active,
+                state_order_indices=state_order_indices,
+            )
         else:
-            active_row_indices = row_indices[:n_active]
-            self._ensure_gpu_token_buf().index_copy_(0, active_row_indices, next_token_tensor[:n_active])
-            self._advance_gpu_seq_lens(active_row_indices)
+            next_token_tensor = self._record_gpu_decode_tokens(
+                next_token_tensor,
+                row_indices=row_indices,
+                n_active=n_active,
+            )
         if self.profile_timings and record_sync_model_timing:
             if self.device.type == "cuda":
                 torch.cuda.synchronize(self.device)
@@ -7278,6 +7391,7 @@ class ContinuousBatchEngine:
     ) -> list[_ActiveRequest | ServingResult]:
         state_update_start_s = time.perf_counter() if self.profile_timings else 0.0
         decoded: list[_ActiveRequest | ServingResult] = []
+        active_states: list[_ActiveRequest] = []
         for row_index, state in enumerate(states):
             next_token = int(next_tokens[row_index])
             state.tokens.append(next_token)
@@ -7292,6 +7406,10 @@ class ContinuousBatchEngine:
                 decoded.append(self._finish_and_release(state, step))
             else:
                 decoded.append(state)
+                active_states.append(state)
+        self._decode_many_gpu_state_signature = self._make_decode_many_gpu_state_signature(
+            active_states
+        )
         if self.profile_timings:
             self.stats.decode_ragged_state_update_ms += (time.perf_counter() - state_update_start_s) * 1000.0
         return decoded
@@ -8065,6 +8183,7 @@ class ContinuousBatchEngine:
         return row
 
     def _reset_active_row_for_acquire(self, row: int, *, clear_cache: bool = True) -> None:
+        self._decode_many_gpu_state_signature = None
         if not clear_cache or env_flag("TORCHINFERNO_CONTINUOUS_SKIP_ACTIVE_ROW_CLEAR", False):
             self._set_cache_row_seq_len(row, 0)
             return
@@ -8090,6 +8209,7 @@ class ContinuousBatchEngine:
         # request). Only the seq_len reset is needed for correctness -- a free
         # row reused as decode-bucket padding has seq_len 0 so attention never
         # reads its stale KV, and its bucket output is discarded regardless.
+        self._decode_many_gpu_state_signature = None
         self._remember_row_seq_len(row, 0)
         self._mark_active_row_free(row)
 

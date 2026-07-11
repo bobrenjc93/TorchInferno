@@ -8234,6 +8234,65 @@ def test_continuous_batch_engine_dense_prefix_row_check_matches_sorted_semantics
     assert ContinuousBatchEngine._dense_prefix_row_info([0, 2, 2]) == (False, False)
 
 
+def test_continuous_batch_engine_reuses_gpu_decode_state_for_ragged_baseline() -> None:
+    class _InputPointerToyModel(_RaggedGraphToyModel):
+        def __init__(self) -> None:
+            super().__init__(vocab_size=128)
+            self.input_ptrs: list[int] = []
+            self.row_indices_were_none: list[bool] = []
+
+        def try_decode_ragged_logits_graph(self, input_ids, cache, *, seq_lens, row_indices):
+            del seq_lens
+            self.input_ptrs.append(input_ids.data_ptr())
+            self.row_indices_were_none.append(row_indices is None)
+            cache.advance_rows(_toy_decode_rows(input_ids, row_indices), 1)
+            return self._logits(input_ids[:, -1] + 1)
+
+    def active(index: int, row: int, token: int) -> serving_mod._ActiveRequest:
+        request = ServingRequest(f"req-{index}", (token - 1,), 3, arrival_step=0)
+        return serving_mod._ActiveRequest(
+            original_index=index,
+            request=request,
+            tokens=[token - 1, token],
+            generated=1,
+            row=row,
+            last_token=token,
+            seq_len=2,
+            prefix_hit_tokens=0,
+            started_step=0,
+        )
+
+    model = _InputPointerToyModel()
+    engine = ContinuousBatchEngine(
+        model,
+        device=torch.device("cpu"),
+        max_active_requests=2,
+        prefix_cache_capacity=0,
+        enable_ragged_decode=True,
+        store_reusable_prefixes=False,
+    )
+    engine.start_online(max_seq_len=16)
+    states = [active(0, 0, 10), active(1, 1, 20)]
+    engine._row_seq_lens[0] = 2
+    engine._row_seq_lens[1] = 2
+    engine._set_gpu_decode_state([0, 1], torch.tensor([10, 20]), [2, 2])
+    engine._decode_many_gpu_state_signature = engine._make_decode_many_gpu_state_signature(
+        states
+    )
+
+    decoded = engine._decode_ragged_batch_baseline(states, step=1, events=[])
+
+    assert [state.last_token for state in decoded if isinstance(state, serving_mod._ActiveRequest)] == [
+        11,
+        21,
+    ]
+    assert model.input_ptrs == [engine._ensure_gpu_token_buf().data_ptr()]
+    assert model.row_indices_were_none == [True]
+    assert engine._decode_many_gpu_state_signature == engine._make_decode_many_gpu_state_signature(
+        [state for state in decoded if isinstance(state, serving_mod._ActiveRequest)]
+    )
+
+
 def test_continuous_batch_engine_ragged_decode_omits_row_indices_for_contiguous_greedy_decode(
     monkeypatch,
 ) -> None:
