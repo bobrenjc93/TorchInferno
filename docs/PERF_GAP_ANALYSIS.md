@@ -1,5 +1,26 @@
 # TorchInferno vs vLLM/sglang — Performance Gap Analysis (Llama-3.1-70B, 8xH100)
 
+## Current 20260711 decode-many queue-profile GPU timing
+
+Queue profiles can now opt into asynchronous CUDA-event timing for decode-many
+model calls even when `profile_timings` is off. Set
+`TORCHINFERNO_CONTINUOUS_DECODE_MANY_GPU_EVENT_TIMING=1` with the normal
+queue-profile env to populate `runtime_decode_many_model_gpu_ms`,
+`runtime_decode_many_shape_gpu_ms`, and
+`runtime_decode_many_step_window_model_ms` without the synchronized
+`TORCHINFERNO_OPENAI_QUEUE_PROFILE_SYNC_TIMINGS` path or a torch profiler run.
+
+The same-patch A/B keeps this opt-in rather than default-on. The timing-on
+validation wrote
+`/tmp/inference-bench-local-decodemany-gpu-timing-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-decodemany-gpu-timing/runs/20260711_110906`,
+completed `1000/1000`, and reported `238.2 / 21.9 / 1061.4ms`. It identified
+`runtime_decode_many_model_gpu_ms=6547.1ms` and the hot
+`decode_many:b64/64:g1-16` window at `2487.8ms`. The timing-off control wrote
+`/tmp/inference-bench-local-decodemany-gpu-timing-off-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-decodemany-gpu-timing-off/runs/20260711_111534`,
+also completed `1000/1000`, and scored `211.1 / 21.8 / 980.2ms` with the GPU
+timing maps empty. Use the flag for targeted decode attribution runs; keep it
+off for public/default score runs.
+
 ## Current 20260711 first-token admission split
 
 Queue-profile diagnostics now export per-prefill-shape queue-to-submit maps

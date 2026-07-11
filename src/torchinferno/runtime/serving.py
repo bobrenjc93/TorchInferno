@@ -145,6 +145,13 @@ def _queue_profile_counts_enabled() -> bool:
     )
 
 
+def _decode_many_queue_profile_gpu_timing_enabled() -> bool:
+    env_name = "TORCHINFERNO_CONTINUOUS_DECODE_MANY_GPU_EVENT_TIMING"
+    if env_name in os.environ:
+        return env_flag(env_name, False)
+    return False
+
+
 def _packed_prefill_eager_pattern_matches(
     *,
     profile_shape_key: str | None,
@@ -1413,10 +1420,16 @@ class ContinuousBatchEngine:
             row_indices = self._device_index_tensor(tuple(decode_rows))
             input_ids = self._ensure_gpu_token_buf().index_select(0, row_indices).view(n_padded, 1)
         seq_lens = self._decode_many_seq_lens_tensor(states, decode_rows)
-        shape_key = f"decode_many:b{n_active}/{n_padded}" if self.profile_timings else None
+        shape_key = (
+            f"decode_many:b{n_active}/{n_padded}"
+            if self.profile_timings or _queue_profile_counts_enabled()
+            else None
+        )
 
         model_start_s = time.perf_counter() if self.profile_timings else 0.0
-        gpu_model_events = self._start_decode_ragged_model_gpu_timer()
+        gpu_model_events = self._start_decode_ragged_model_gpu_timer(
+            profile_source=profile_source
+        )
         try:
             kwargs: dict[str, object] = {
                 "seq_lens": seq_lens,
@@ -1640,6 +1653,12 @@ class ContinuousBatchEngine:
                                 shape_model_tokens,
                                 shape_key=shape_key,
                             )
+                    elif self._decode_gpu_event_timing_enabled("decode_many"):
+                        self._attach_latest_decode_many_gpu_window(
+                            step_window_key,
+                            shape_model_tokens,
+                            shape_key=shape_key,
+                        )
                 records.append(
                     (
                         step_states,
@@ -2004,6 +2023,12 @@ class ContinuousBatchEngine:
                         self.stats.decode_many_step_window_token_materialize_ms,
                         step_window_key,
                         token_materialize_ms,
+                    )
+                elif self._decode_gpu_event_timing_enabled("decode_many"):
+                    self._attach_latest_decode_many_gpu_window(
+                        step_window_key,
+                        shape_model_tokens,
+                        shape_key=shape_key,
                     )
             if shape_key is not None:
                 record_count(
@@ -6470,8 +6495,22 @@ class ContinuousBatchEngine:
                 )
         self._pending_prefill_graph_events = remaining
 
-    def _start_decode_ragged_model_gpu_timer(self) -> tuple[object, object] | None:
-        if not self.profile_timings or self.device.type != "cuda":
+    def _decode_gpu_event_timing_enabled(self, profile_source: str | None = None) -> bool:
+        if self.device.type != "cuda":
+            return False
+        if self.profile_timings:
+            return True
+        return (
+            profile_source == "decode_many"
+            and _decode_many_queue_profile_gpu_timing_enabled()
+        )
+
+    def _start_decode_ragged_model_gpu_timer(
+        self,
+        *,
+        profile_source: str | None = None,
+    ) -> tuple[object, object] | None:
+        if not self._decode_gpu_event_timing_enabled(profile_source):
             return None
         try:
             start = torch.cuda.Event(enable_timing=True)
@@ -6483,6 +6522,14 @@ class ContinuousBatchEngine:
 
     def _decode_many_records_sync_model_timing(self) -> bool:
         return self.device.type != "cuda" or bool(self.decode_many_sync_model_timings)
+
+    def _record_gpu_event_shape_time(
+        self,
+        timings: dict[str, float],
+        key: str,
+        elapsed_ms: float,
+    ) -> None:
+        timings[key] = timings.get(key, 0.0) + float(elapsed_ms)
 
     def _stop_decode_ragged_model_gpu_timer(
         self,
@@ -6548,7 +6595,7 @@ class ContinuousBatchEngine:
                 elapsed_ms = float(start.elapsed_time(end))
                 self.stats.decode_ragged_model_gpu_ms += elapsed_ms
                 if shape_key is not None:
-                    self._record_shape_time(
+                    self._record_gpu_event_shape_time(
                         self.stats.decode_shape_gpu_ms,
                         shape_key,
                         elapsed_ms,
@@ -6556,7 +6603,7 @@ class ContinuousBatchEngine:
                 if profile_source == "decode_many":
                     self.stats.decode_many_model_gpu_ms += elapsed_ms
                     if shape_key is not None:
-                        self._record_shape_time(
+                        self._record_gpu_event_shape_time(
                             self.stats.decode_many_shape_gpu_ms,
                             shape_key,
                             elapsed_ms,
@@ -6570,7 +6617,7 @@ class ContinuousBatchEngine:
                                 share = max(0.0, float(weight)) / total_weight
                                 if share <= 0.0:
                                     continue
-                                self._record_shape_time(
+                                self._record_gpu_event_shape_time(
                                     self.stats.decode_many_step_window_model_ms,
                                     str(step_window_key),
                                     elapsed_ms * share,
@@ -7513,7 +7560,11 @@ class ContinuousBatchEngine:
         decode_rows = self._ragged_decode_bucket_rows(rows)
         n_active = len(states)
         n_padded = len(decode_rows)
-        shape_key = f"decode_many:b{n_active}/{n_padded}" if self.profile_timings else None
+        shape_key = (
+            f"decode_many:b{n_active}/{n_padded}"
+            if self.profile_timings or _queue_profile_counts_enabled()
+            else None
+        )
         if shape_key is not None:
             self._record_shape_count(self.stats.decode_shape_counts, shape_key)
         shared_temperature = self._shared_temperature_for_states(states)
@@ -7547,7 +7598,9 @@ class ContinuousBatchEngine:
             self.stats.decode_ragged_prepare_ms += (time.perf_counter() - prepare_start_s) * 1000.0
 
         model_start_s = time.perf_counter() if self.profile_timings else 0.0
-        gpu_model_events = self._start_decode_ragged_model_gpu_timer()
+        gpu_model_events = self._start_decode_ragged_model_gpu_timer(
+            profile_source=profile_source
+        )
         self._last_ragged_decode_logits = None
 
         def run_decode_model() -> Tensor:

@@ -8695,6 +8695,80 @@ def test_continuous_batch_engine_decode_many_gpu_timers_populate_step_windows() 
     }
 
 
+def test_continuous_batch_engine_decode_many_gpu_timers_work_without_profile_timings() -> None:
+    class _FakeCudaStartEvent:
+        def elapsed_time(self, _end_event) -> float:
+            return 10.0
+
+    engine = ContinuousBatchEngine(
+        _RaggedGraphToyModel(vocab_size=128),
+        device=torch.device("cpu"),
+        max_active_requests=8,
+        prefix_cache_capacity=0,
+        enable_ragged_decode=True,
+        store_reusable_prefixes=False,
+        profile_timings=False,
+    )
+    engine._pending_decode_ragged_model_events = [
+        (
+            _FakeCudaStartEvent(),
+            object(),
+            "decode_many:b8/8",
+            "decode_many",
+            None,
+        )
+    ]
+
+    engine._attach_latest_decode_many_gpu_window("decode_many:b8/8:g1-16", 8)
+    engine._attach_latest_decode_many_gpu_window("decode_many:b8/8:g17-32", 2)
+    engine._flush_decode_ragged_model_gpu_timers()
+
+    assert engine.stats.decode_ragged_model_gpu_ms == pytest.approx(10.0)
+    assert engine.stats.decode_shape_gpu_ms == {"decode_many:b8/8": pytest.approx(10.0)}
+    assert engine.stats.decode_many_model_gpu_ms == pytest.approx(10.0)
+    assert engine.stats.decode_many_shape_gpu_ms == {
+        "decode_many:b8/8": pytest.approx(10.0),
+    }
+    assert engine.stats.decode_many_step_window_model_ms == {
+        "decode_many:b8/8:g1-16": pytest.approx(8.0),
+        "decode_many:b8/8:g17-32": pytest.approx(2.0),
+    }
+
+
+def test_continuous_batch_engine_decode_many_queue_profile_gpu_timing_gate(
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_QUEUE_PROFILE_JSONL", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_QUEUE_PROFILE", raising=False)
+    monkeypatch.delenv(
+        "TORCHINFERNO_CONTINUOUS_DECODE_MANY_GPU_EVENT_TIMING",
+        raising=False,
+    )
+    engine = ContinuousBatchEngine(
+        _RaggedGraphToyModel(vocab_size=128),
+        device=torch.device("cpu"),
+        max_active_requests=8,
+        prefix_cache_capacity=0,
+        enable_ragged_decode=True,
+        store_reusable_prefixes=False,
+        profile_timings=False,
+    )
+
+    assert engine._decode_gpu_event_timing_enabled("decode_many") is False
+    engine.device = torch.device("cuda")
+    assert engine._decode_gpu_event_timing_enabled("decode_many") is False
+
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_QUEUE_PROFILE_JSONL", "/tmp/queue.jsonl")
+    assert engine._decode_gpu_event_timing_enabled("decode_many") is False
+
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_DECODE_MANY_GPU_EVENT_TIMING", "1")
+    assert engine._decode_gpu_event_timing_enabled("decode_many") is True
+    assert engine._decode_gpu_event_timing_enabled(None) is False
+
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_DECODE_MANY_GPU_EVENT_TIMING", "0")
+    assert engine._decode_gpu_event_timing_enabled("decode_many") is False
+
+
 def test_continuous_batch_engine_decode_many_async_readback_defaults_off(monkeypatch) -> None:
     monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY_ASYNC_READBACK", raising=False)
     engine = ContinuousBatchEngine(
