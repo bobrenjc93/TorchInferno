@@ -17765,6 +17765,15 @@ def test_openai_tensor_parallel_online_batcher_profile_snapshots(
     assert final_record["request_first_token_prefill_shape_queue_to_first_counts"] == {
         prefill_shape: 1,
     }
+    assert final_record["request_first_token_prefill_shape_queue_to_submit_counts"] == {
+        prefill_shape: 1,
+    }
+    assert (
+        final_record["request_first_token_prefill_shape_queue_to_submit_p50_ms"][
+            prefill_shape
+        ]
+        == final_record["request_queue_to_submit_p50_ms"]
+    )
     assert (
         final_record["request_first_token_prefill_shape_queue_to_first_p50_ms"][
             prefill_shape

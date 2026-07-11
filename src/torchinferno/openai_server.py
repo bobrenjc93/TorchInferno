@@ -6174,6 +6174,7 @@ class OpenAICompletionEngine:
             queue_to_finish_ms: list[float] = []
             first_token_source_counts: dict[str, int] = {}
             first_token_prefill_shape_counts: dict[str, int] = {}
+            first_token_shape_queue_to_submit_ms: dict[str, list[float]] = {}
             first_token_shape_queue_to_first_ms: dict[str, list[float]] = {}
             first_token_shape_submit_to_first_ms: dict[str, list[float]] = {}
             stream_prequeue_wait_ms: list[float] = []
@@ -6192,8 +6193,10 @@ class OpenAICompletionEngine:
                 submitted_at_s = request.submitted_at_s
                 first_token_at_s = request.first_token_at_s
                 finished_at_s = request.finished_at_s
+                queue_to_submit = None
                 if submitted_at_s > 0.0:
-                    queue_to_submit_ms.append((submitted_at_s - queued_at_s) * 1000.0)
+                    queue_to_submit = (submitted_at_s - queued_at_s) * 1000.0
+                    queue_to_submit_ms.append(queue_to_submit)
                 if first_token_at_s > 0.0:
                     queue_to_first = (first_token_at_s - queued_at_s) * 1000.0
                     queue_to_first_ms.append(queue_to_first)
@@ -6216,6 +6219,11 @@ class OpenAICompletionEngine:
                             first_token_shape,
                             [],
                         ).append(queue_to_first)
+                        if queue_to_submit is not None:
+                            first_token_shape_queue_to_submit_ms.setdefault(
+                                first_token_shape,
+                                [],
+                            ).append(queue_to_submit)
                         if submit_to_first is not None:
                             first_token_shape_submit_to_first_ms.setdefault(
                                 first_token_shape,
@@ -6283,6 +6291,10 @@ class OpenAICompletionEngine:
             add_count_map(
                 "request_first_token_prefill_shape_counts",
                 first_token_prefill_shape_counts,
+            )
+            add_latency_maps(
+                "request_first_token_prefill_shape_queue_to_submit",
+                first_token_shape_queue_to_submit_ms,
             )
             add_latency_maps(
                 "request_first_token_prefill_shape_queue_to_first",

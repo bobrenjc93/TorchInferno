@@ -108,6 +108,15 @@ def _write_inference_bench_run(tmp_path) -> None:
         "request_queue_to_first_token_p50_ms": 11.0,
         "request_queue_to_submit_p50_ms": 4.0,
         "request_submit_to_first_token_p50_ms": 7.0,
+        "request_first_token_prefill_shape_counts": {"shape_a": 2},
+        "request_first_token_prefill_shape_queue_to_submit_counts": {"shape_a": 2},
+        "request_first_token_prefill_shape_queue_to_submit_p50_ms": {"shape_a": 4.0},
+        "request_first_token_prefill_shape_queue_to_first_counts": {"shape_a": 2},
+        "request_first_token_prefill_shape_queue_to_first_p50_ms": {"shape_a": 11.0},
+        "request_first_token_prefill_shape_queue_to_first_p90_ms": {"shape_a": 13.0},
+        "request_first_token_prefill_shape_queue_to_first_p99_ms": {"shape_a": 15.0},
+        "request_first_token_prefill_shape_submit_to_first_counts": {"shape_a": 2},
+        "request_first_token_prefill_shape_submit_to_first_p50_ms": {"shape_a": 7.0},
         "initial_wait_ms": 1.0,
         "idle_batch_wait_ms": 2.0,
         "active_ready_wait_ms": 0.5,
@@ -742,6 +751,15 @@ def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) ->
     assert summary.torchinferno_queue_profiles[0].max_tokens == 96
     assert summary.torchinferno_queue_profiles[0].fields["runtime_cache_backend"] == "dense"
     assert summary.torchinferno_queue_profiles[0].fields["runtime_max_active_requests"] == 96
+    assert summary.torchinferno_queue_profiles[0].fields[
+        "request_first_token_prefill_shape_queue_to_submit_p50_ms"
+    ] == {"shape_a": 4.0}
+    assert summary.torchinferno_queue_profiles[0].fields[
+        "request_first_token_prefill_shape_queue_to_first_p50_ms"
+    ] == {"shape_a": 11.0}
+    assert summary.torchinferno_queue_profiles[0].fields[
+        "request_first_token_prefill_shape_submit_to_first_p50_ms"
+    ] == {"shape_a": 7.0}
     assert summary.torchinferno_queue_profiles[0].fields["runtime_prefix_cache_capacity"] == 128
     assert summary.torchinferno_queue_profiles[0].fields["runtime_prefill_batches"] == 1
     assert summary.torchinferno_queue_profiles[0].fields["runtime_prefill_graph_misses"] == 9
@@ -967,6 +985,11 @@ def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) ->
     assert "min_active_pct" in text
     assert "min_active_skips" in text
     assert "overgen" in text
+    assert "[torchinferno first-token prefill shapes]" in text
+    assert "q2submit_p50" in text
+    assert "submit2first_p50" in text
+    assert "q2first_p99" in text
+    assert "shape_a" in text
     assert "[torchinferno hot prefill shapes]" in text
     assert "prefix_graph:b8:s16:p45-45:src1:mixed0" in text
     assert "prefix_graph:b4:s16:p45-45:src1:mixed0" in text

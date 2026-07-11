@@ -65,6 +65,23 @@ _QUEUE_PROFILE_FIELDS = (
     "request_queue_to_first_token_p50_ms",
     "request_queue_to_submit_p50_ms",
     "request_submit_to_first_token_p50_ms",
+    "request_first_token_source_counts",
+    "request_first_token_prefill_shape_counts",
+    "request_first_token_prefill_shape_queue_to_submit_counts",
+    "request_first_token_prefill_shape_queue_to_submit_p50_ms",
+    "request_first_token_prefill_shape_queue_to_submit_p90_ms",
+    "request_first_token_prefill_shape_queue_to_submit_p99_ms",
+    "request_first_token_prefill_shape_queue_to_submit_max_ms",
+    "request_first_token_prefill_shape_queue_to_first_counts",
+    "request_first_token_prefill_shape_queue_to_first_p50_ms",
+    "request_first_token_prefill_shape_queue_to_first_p90_ms",
+    "request_first_token_prefill_shape_queue_to_first_p99_ms",
+    "request_first_token_prefill_shape_queue_to_first_max_ms",
+    "request_first_token_prefill_shape_submit_to_first_counts",
+    "request_first_token_prefill_shape_submit_to_first_p50_ms",
+    "request_first_token_prefill_shape_submit_to_first_p90_ms",
+    "request_first_token_prefill_shape_submit_to_first_p99_ms",
+    "request_first_token_prefill_shape_submit_to_first_max_ms",
     "request_stream_prequeue_wait_count",
     "request_stream_prequeue_wait_p50_ms",
     "request_stream_prequeue_wait_configured_p50_ms",
@@ -885,6 +902,31 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
                         "misses",
                     ),
                     decode_miss_shape_rows,
+                )
+            )
+            lines.append("")
+
+        first_token_shape_rows = _first_token_prefill_shape_rows(queue_profiles)
+        if first_token_shape_rows:
+            lines.append("[torchinferno first-token prefill shapes]")
+            lines.extend(
+                _format_table(
+                    (
+                        "temp",
+                        "max_tokens",
+                        "shape",
+                        "requests",
+                        "q2submit_p50",
+                        "submit2first_p50",
+                        "q2first_p50",
+                        "q2first_p90",
+                        "q2first_p99",
+                        "active_tokens",
+                        "model_tokens",
+                        "padding_tokens",
+                        "pad_pct",
+                    ),
+                    first_token_shape_rows,
                 )
             )
             lines.append("")
@@ -2418,6 +2460,96 @@ def _int_if_whole(value: float | int) -> float | int:
     if isinstance(value, float) and value.is_integer():
         return int(value)
     return value
+
+
+def _first_token_prefill_shape_rows(
+    profiles: Sequence[QueueProfileSummary],
+    *,
+    limit: int = 5,
+) -> list[tuple[str, ...]]:
+    rows: list[tuple[str, ...]] = []
+    for profile in profiles:
+        fields = profile.fields
+        shape_counts = _numeric_mapping(
+            fields.get("request_first_token_prefill_shape_counts")
+        )
+        if not shape_counts:
+            continue
+        entries = sorted(
+            shape_counts.items(),
+            key=lambda item: (-int(item[1]), str(item[0])),
+        )[:limit]
+        for shape, raw_count in entries:
+            active_tokens = _mapping_value(
+                fields.get("runtime_prefill_shape_active_tokens"),
+                shape,
+            )
+            model_tokens = _mapping_value(
+                fields.get("runtime_prefill_shape_model_tokens"),
+                shape,
+            )
+            padding_tokens = _mapping_value(
+                fields.get("runtime_prefill_shape_padding_tokens"),
+                shape,
+            )
+            if padding_tokens is None and isinstance(
+                active_tokens,
+                (int, float),
+            ) and isinstance(model_tokens, (int, float)):
+                padding_tokens = max(0, model_tokens - active_tokens)
+            rows.append(
+                (
+                    _fmt_value(profile.temperature),
+                    _fmt_value(profile.max_tokens),
+                    str(shape),
+                    _fmt_value(_int_if_whole(raw_count)),
+                    _fmt_value(
+                        _mapping_value(
+                            fields.get(
+                                "request_first_token_prefill_shape_queue_to_submit_p50_ms"
+                            ),
+                            shape,
+                        )
+                    ),
+                    _fmt_value(
+                        _mapping_value(
+                            fields.get(
+                                "request_first_token_prefill_shape_submit_to_first_p50_ms"
+                            ),
+                            shape,
+                        )
+                    ),
+                    _fmt_value(
+                        _mapping_value(
+                            fields.get(
+                                "request_first_token_prefill_shape_queue_to_first_p50_ms"
+                            ),
+                            shape,
+                        )
+                    ),
+                    _fmt_value(
+                        _mapping_value(
+                            fields.get(
+                                "request_first_token_prefill_shape_queue_to_first_p90_ms"
+                            ),
+                            shape,
+                        )
+                    ),
+                    _fmt_value(
+                        _mapping_value(
+                            fields.get(
+                                "request_first_token_prefill_shape_queue_to_first_p99_ms"
+                            ),
+                            shape,
+                        )
+                    ),
+                    _fmt_value(active_tokens),
+                    _fmt_value(model_tokens),
+                    _fmt_value(padding_tokens),
+                    _fmt_pct(float(padding_tokens or 0), float(model_tokens or 0)),
+                )
+            )
+    return rows
 
 
 def _hot_prefill_shape_rows(
