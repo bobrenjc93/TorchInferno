@@ -101,6 +101,20 @@ session (`submitted_requests=992`), with `q2first_p50=47.7ms`,
 `q2first_p99=345.2ms`, `q2submit_p50=16.2ms`, and
 `submit2first_p50=31.6ms`, no request-path graph misses.
 
+A current-head paired recheck keeps sampled-medium submit-step commands on by
+default. The no-env control on `9bc5189` wrote
+`/tmp/inference-bench-tree-default-9bc5189-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-tree-default-9bc5189/runs/20260711_075721`
+and landed at `52.1 / 35.6 / 73.7ms`, with `956/992` correct. Disabling only
+`TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_SUBMIT_STEP_COMMAND` wrote
+`/tmp/inference-bench-tree-submitstep0-9bc5189-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-tree-submitstep0-9bc5189/runs/20260711_075046`
+and regressed to `54.5 / 37.0 / 78.1ms`, with `963/992` correct. Queue
+profiles show the mechanism: the disabled run roughly doubled prefill batches
+(`196 -> 404`) and decode batches (`156 -> 340`) while leaving median
+queue-to-submit flat (`16.8 -> 17.1ms`). Keep the sampled-medium submit-step
+default enabled; the remaining tree gap is still the sampled `s12`
+prefix-suffix body and sampled decode cost, not the combined submit/step
+control command.
+
 ## Current fa15dc6 long-output refresh and wait rejections
 
 The latest pushed head `fa15dc6` keeps `long_output` complete and graph-clean
