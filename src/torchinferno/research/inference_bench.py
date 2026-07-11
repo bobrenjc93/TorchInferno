@@ -57,6 +57,21 @@ _TORCHINFERNO_RAGGED_PREFILL_PROFILE_RE = re.compile(
     r"src_rows=(?P<src_rows>[0-9]+) "
     r"prefix_copy_len=(?P<prefix_copy_len>\S+)"
 )
+_TORCHINFERNO_RAGGED_DECODE_MANY_PROFILE_RE = re.compile(
+    r"\[(?P<kind>RAGGED_DECODE_MANY_REPLAY_PROF)\] "
+    r"batch=(?P<batch>[0-9]+) "
+    r"steps=(?P<steps>[0-9]+) "
+    r"match=(?P<matches>[0-9]+) "
+    r"cache_bucket=(?P<cache_bucket>\S+) "
+    r"rows=(?P<rows>[0-9]+)"
+)
+_TORCHINFERNO_RAGGED_DECODE_PROFILE_RE = re.compile(
+    r"\[(?P<kind>RAGGED_DECODE_REPLAY_PROF)\] "
+    r"batch=(?P<batch>[0-9]+) "
+    r"match=(?P<matches>[0-9]+) "
+    r"cache_bucket=(?P<cache_bucket>\S+) "
+    r"rows=(?P<rows>[0-9]+)"
+)
 _PROFILER_TIME_RE = re.compile(r"(?P<value>[0-9]+(?:\.[0-9]+)?)(?P<unit>us|ms|s)\b")
 _PROFILER_SELF_CUDA_TOTAL_RE = re.compile(
     r"Self CUDA time total:\s*(?P<value>[0-9]+(?:\.[0-9]+)?)(?P<unit>us|ms|s)\b"
@@ -389,11 +404,14 @@ class ProviderServerLogSummary:
 class TorchInfernoProfilerSummary:
     kind: str
     batch: int
-    suffix: int
+    suffix: int | None
     matches: int
-    context_len: str
-    src_rows: int
-    prefix_copy_len: str
+    context_len: str | None
+    src_rows: int | None
+    prefix_copy_len: str | None
+    cache_bucket: str | None = None
+    rows: int | None = None
+    steps: int | None = None
     self_cuda_ms: float | None = None
     allreduce_ms: float = 0.0
     gemm_ms: float = 0.0
@@ -1324,13 +1342,16 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
         summary.torchinferno_profiler_events
     )
     if profiler_rows:
-        lines.append("[torchinferno ragged prefill profiler]")
+        lines.append("[torchinferno ragged replay profiler]")
         lines.extend(
             _format_table(
                 (
                     "kind",
                     "batch",
                     "suffix",
+                    "cache",
+                    "rows",
+                    "steps",
                     "match",
                     "context",
                     "src_rows",
@@ -1841,18 +1862,11 @@ def _parse_torchinferno_profiler_events(
     events: list[TorchInfernoProfilerSummary] = []
     current: dict[str, Any] | None = None
     for line in text.splitlines():
-        profile_match = _TORCHINFERNO_RAGGED_PREFILL_PROFILE_RE.search(line)
-        if profile_match is not None:
+        profile_fields = _torchinferno_profiler_marker_fields(line)
+        if profile_fields is not None:
             if current is not None:
                 events.append(_torchinferno_profiler_event_from_fields(current))
-            current = {
-                "kind": profile_match.group("kind"),
-                "batch": int(profile_match.group("batch")),
-                "suffix": int(profile_match.group("suffix")),
-                "matches": int(profile_match.group("matches")),
-                "context_len": profile_match.group("context_len"),
-                "src_rows": int(profile_match.group("src_rows")),
-                "prefix_copy_len": profile_match.group("prefix_copy_len"),
+            current = profile_fields | {
                 "self_cuda_ms": None,
                 "allreduce_ms": 0.0,
                 "gemm_ms": 0.0,
@@ -1885,17 +1899,79 @@ def _parse_torchinferno_profiler_events(
     return tuple(events)
 
 
+def _torchinferno_profiler_marker_fields(line: str) -> dict[str, Any] | None:
+    prefill_match = _TORCHINFERNO_RAGGED_PREFILL_PROFILE_RE.search(line)
+    if prefill_match is not None:
+        return {
+            "kind": prefill_match.group("kind"),
+            "batch": int(prefill_match.group("batch")),
+            "suffix": int(prefill_match.group("suffix")),
+            "matches": int(prefill_match.group("matches")),
+            "context_len": prefill_match.group("context_len"),
+            "src_rows": int(prefill_match.group("src_rows")),
+            "prefix_copy_len": prefill_match.group("prefix_copy_len"),
+            "cache_bucket": None,
+            "rows": None,
+            "steps": None,
+        }
+
+    decode_many_match = _TORCHINFERNO_RAGGED_DECODE_MANY_PROFILE_RE.search(line)
+    if decode_many_match is not None:
+        return {
+            "kind": decode_many_match.group("kind"),
+            "batch": int(decode_many_match.group("batch")),
+            "suffix": None,
+            "matches": int(decode_many_match.group("matches")),
+            "context_len": None,
+            "src_rows": None,
+            "prefix_copy_len": None,
+            "cache_bucket": decode_many_match.group("cache_bucket"),
+            "rows": int(decode_many_match.group("rows")),
+            "steps": int(decode_many_match.group("steps")),
+        }
+
+    decode_match = _TORCHINFERNO_RAGGED_DECODE_PROFILE_RE.search(line)
+    if decode_match is not None:
+        return {
+            "kind": decode_match.group("kind"),
+            "batch": int(decode_match.group("batch")),
+            "suffix": None,
+            "matches": int(decode_match.group("matches")),
+            "context_len": None,
+            "src_rows": None,
+            "prefix_copy_len": None,
+            "cache_bucket": decode_match.group("cache_bucket"),
+            "rows": int(decode_match.group("rows")),
+            "steps": None,
+        }
+
+    return None
+
+
 def _torchinferno_profiler_event_from_fields(
     fields: dict[str, Any],
 ) -> TorchInfernoProfilerSummary:
     return TorchInfernoProfilerSummary(
         kind=str(fields["kind"]),
         batch=int(fields["batch"]),
-        suffix=int(fields["suffix"]),
+        suffix=fields["suffix"] if isinstance(fields.get("suffix"), int) else None,
         matches=int(fields["matches"]),
-        context_len=str(fields["context_len"]),
-        src_rows=int(fields["src_rows"]),
-        prefix_copy_len=str(fields["prefix_copy_len"]),
+        context_len=(
+            str(fields["context_len"]) if fields.get("context_len") is not None else None
+        ),
+        src_rows=fields["src_rows"] if isinstance(fields.get("src_rows"), int) else None,
+        prefix_copy_len=(
+            str(fields["prefix_copy_len"])
+            if fields.get("prefix_copy_len") is not None
+            else None
+        ),
+        cache_bucket=(
+            str(fields["cache_bucket"])
+            if fields.get("cache_bucket") is not None
+            else None
+        ),
+        rows=fields["rows"] if isinstance(fields.get("rows"), int) else None,
+        steps=fields["steps"] if isinstance(fields.get("steps"), int) else None,
         self_cuda_ms=(
             float(fields["self_cuda_ms"])
             if isinstance(fields.get("self_cuda_ms"), (int, float))
@@ -2040,10 +2116,13 @@ def _torchinferno_profiler_event_rows(
                 _short_torchinferno_profiler_kind(event.kind),
                 _fmt_value(event.batch),
                 _fmt_value(event.suffix),
+                _fmt_value(event.cache_bucket),
+                _fmt_value(event.rows),
+                _fmt_value(event.steps),
                 _fmt_value(event.matches),
-                event.context_len,
+                _fmt_value(event.context_len),
                 _fmt_value(event.src_rows),
-                event.prefix_copy_len,
+                _fmt_value(event.prefix_copy_len),
                 _fmt_value(event.self_cuda_ms),
                 _fmt_value(event.allreduce_ms),
                 _fmt_pct(event.allreduce_ms, event.self_cuda_ms or 0.0),
@@ -2058,9 +2137,13 @@ def _torchinferno_profiler_event_rows(
 
 def _short_torchinferno_profiler_kind(kind: str) -> str:
     if kind == "RAGGED_PREFILL_REPLAY_PROF":
-        return "replay"
+        return "prefill_replay"
     if kind == "RAGGED_PREFILL_PROF":
-        return "capture"
+        return "prefill_capture"
+    if kind == "RAGGED_DECODE_REPLAY_PROF":
+        return "decode_replay"
+    if kind == "RAGGED_DECODE_MANY_REPLAY_PROF":
+        return "decode_many_replay"
     return kind
 
 

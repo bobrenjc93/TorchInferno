@@ -446,6 +446,27 @@ def _write_inference_bench_run(tmp_path) -> None:
                 "0.000us 0.00% 0.000us 0.000us 654.337us 0.78% "
                 "654.337us 8.179us 80",
                 "Self CUDA time total: 83.400ms",
+                "[RAGGED_DECODE_MANY_REPLAY_PROF] batch=64 steps=8 match=3 "
+                "cache_bucket=1024 rows=64",
+                "ncclDevKernel_AllReduce_Sum_bf16_RING_LL         0.00% "
+                "0.000us 0.00% 0.000us 0.000us 12.000ms 30.00% "
+                "12.000ms 75.000us 160",
+                "cutlass_gemm_kernel                             0.00% "
+                "0.000us 0.00% 0.000us 0.000us 5.000ms 12.50% "
+                "5.000ms 62.500us 80",
+                "_add_rms_norm_kernel                            0.00% "
+                "0.000us 0.00% 0.000us 0.000us 2.000ms 5.00% "
+                "2.000ms 12.500us 160",
+                "Self CUDA time total: 40.000ms",
+                "[RAGGED_DECODE_REPLAY_PROF] batch=48 match=2 "
+                "cache_bucket=512 rows=32",
+                "ncclDevKernel_AllReduce_Sum_bf16_RING_LL         0.00% "
+                "0.000us 0.00% 0.000us 0.000us 3.000ms 15.00% "
+                "3.000ms 18.750us 160",
+                "aten::_scaled_mm                                0.00% "
+                "0.000us 0.00% 0.000us 0.000us 4.000ms 20.00% "
+                "4.000ms 50.000us 80",
+                "Self CUDA time total: 20.000ms",
             ]
         )
         + "\n"
@@ -825,7 +846,7 @@ def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) ->
     assert sglang_log.prefill_cached_tokens == 16
     assert sglang_log.decode_batches == 1
     assert sglang_log.decode_logged_tokens == 64
-    assert len(summary.torchinferno_profiler_events) == 1
+    assert len(summary.torchinferno_profiler_events) == 3
     profiler_event = summary.torchinferno_profiler_events[0]
     assert profiler_event.kind == "RAGGED_PREFILL_REPLAY_PROF"
     assert profiler_event.batch == 24
@@ -839,15 +860,47 @@ def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) ->
     assert round(profiler_event.gemm_ms, 3) == 10.669
     assert round(profiler_event.add_rms_ms, 3) == 7.138
     assert round(profiler_event.softmax_ms, 3) == 0.654
+    decode_profiler_event = summary.torchinferno_profiler_events[1]
+    assert decode_profiler_event.kind == "RAGGED_DECODE_MANY_REPLAY_PROF"
+    assert decode_profiler_event.batch == 64
+    assert decode_profiler_event.suffix is None
+    assert decode_profiler_event.cache_bucket == "1024"
+    assert decode_profiler_event.rows == 64
+    assert decode_profiler_event.steps == 8
+    assert decode_profiler_event.matches == 3
+    assert decode_profiler_event.context_len is None
+    assert decode_profiler_event.src_rows is None
+    assert decode_profiler_event.prefix_copy_len is None
+    assert decode_profiler_event.self_cuda_ms == 40.0
+    assert decode_profiler_event.allreduce_ms == 12.0
+    assert decode_profiler_event.gemm_ms == 5.0
+    assert decode_profiler_event.add_rms_ms == 2.0
+    single_decode_profiler_event = summary.torchinferno_profiler_events[2]
+    assert single_decode_profiler_event.kind == "RAGGED_DECODE_REPLAY_PROF"
+    assert single_decode_profiler_event.batch == 48
+    assert single_decode_profiler_event.suffix is None
+    assert single_decode_profiler_event.cache_bucket == "512"
+    assert single_decode_profiler_event.rows == 32
+    assert single_decode_profiler_event.steps is None
+    assert single_decode_profiler_event.matches == 2
+    assert single_decode_profiler_event.self_cuda_ms == 20.0
+    assert single_decode_profiler_event.allreduce_ms == 3.0
+    assert single_decode_profiler_event.gemm_ms == 4.0
 
     text = format_inference_bench_summary(summary)
     assert "[long_output]" in text
+    assert "[torchinferno ragged replay profiler]" in text
     assert "commit" in text
     assert "abcdef1" in text
     assert "123456a" in text
     assert "score_tpot" in text
     assert "4.0" in text
     assert "torchinferno" in text
+    assert "decode_many_replay" in text
+    assert "decode_replay" in text
+    assert "cache" in text
+    assert "1024" in text
+    assert "512" in text
     assert "[long_output raw request waves]" in text
     assert "ttft_p90" in text
     assert "0-63" in text
@@ -1068,7 +1121,7 @@ def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) ->
     assert "materialize_ms" in text
     assert "total_ms" in text
     assert "12.7" in text
-    assert "[torchinferno ragged prefill profiler]" in text
+    assert "[torchinferno ragged replay profiler]" in text
     assert "replay" in text
     assert "self_cuda_ms" in text
     assert "allreduce_pct" in text
