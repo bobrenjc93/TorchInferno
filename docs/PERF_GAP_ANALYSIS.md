@@ -14979,6 +14979,24 @@ at the same place: a faster cached-prefix suffix prefill body plus lower
 high-active decode replay cost, not another cache shortcut or harness-specific
 route.
 
+A follow-up current-head warm-row prefix-copy skip probe on `a8874cd` is
+rejected as a default despite hitting a real KV-copy-elision mechanism. The run
+enabled `TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SKIP_WARM_PREFIX_COPY=1` and
+wrote
+`/tmp/inference-bench-long-warmcopy-results/.../runs/20260711_205948`.
+It stayed `1000/1000` correct and integrity-clean with zero logits-cache
+warnings and zero generated-prefix/prompt-lookup/repeated-sample shortcut
+counters. The skip fired (`55` skipped prefix-copy batches, `101K` skipped
+prefix tokens), cutting prefix-copy batches from `58` to `5` and prefill graph
+GPU from `4.63s` to `3.62s`. Overall latency regressed to
+`224.1 / 25.0 / 1310.2ms`, throughput `22.4 tok/s`: queue-to-first rose to
+`215.7ms`, queue-to-finish rose to `1301.0ms`, skipped decode-many tokens grew
+from `1156` to `1483`, and the hot `decode_many:b64/64` bucket expanded from
+`143` to `217` steps (`1.83s` to `2.78s` GPU). Keep warm-row copy skip opt-in;
+it confirms physical prefix copies are meaningful, but the default fix still
+needs a non-fragmenting cached-prefix suffix body that does not perturb the
+decode schedule.
+
 ## Priority for a focused (non-loop) session
 
 1. Prefill MFU (Issue 1) — biggest TTFT lever, ~2x, affects 3/5 benchmarks.
