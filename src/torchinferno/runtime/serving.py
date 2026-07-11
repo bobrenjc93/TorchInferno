@@ -3012,6 +3012,7 @@ class ContinuousBatchEngine:
                         file=_fpm.stderr, flush=True,
                     )
                 active.extend(fi_active)
+                self._set_gpu_decode_state_for_active(active)
                 if self.profile_timings:
                     self.stats.prefill_wall_ms += (time.perf_counter() - timing_start_s) * 1000.0
                 return indexed_results, active
@@ -3058,6 +3059,7 @@ class ContinuousBatchEngine:
                         )
                     else:
                         active.extend(self._prefill_batch(group, step, events=events))
+        self._set_gpu_decode_state_for_active(active)
         if self.profile_timings:
             self.stats.prefill_wall_ms += (time.perf_counter() - timing_start_s) * 1000.0
         return indexed_results, active
@@ -6618,6 +6620,18 @@ class ContinuousBatchEngine:
         )
         self._ensure_gpu_token_buf().index_copy_(0, row_indices, token_values)
         self._ensure_gpu_seq_lens_buf().index_copy_(0, row_indices, seq_len_values)
+
+    def _set_gpu_decode_state_for_active(self, states: Sequence[_ActiveRequest]) -> None:
+        if not states:
+            return
+        self._set_gpu_decode_state(
+            [state.row for state in states],
+            [state.last_token for state in states],
+            [state.seq_len for state in states],
+        )
+        self._decode_many_gpu_state_signature = self._make_decode_many_gpu_state_signature(
+            list(states)
+        )
 
     def _decode_input_ids_from_gpu_state(
         self,

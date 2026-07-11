@@ -8161,8 +8161,8 @@ def test_continuous_batch_engine_online_many_skips_redundant_gpu_state_sync(
     ]
     assert engine.stats.decode_many_calls == 3
     assert engine.stats.decode_many_steps == 5
-    assert engine.stats.decode_many_state_syncs == 1
-    assert engine.stats.decode_many_state_sync_skips == 2
+    assert engine.stats.decode_many_state_syncs == 0
+    assert engine.stats.decode_many_state_sync_skips == 3
     assert not engine.has_online_work()
     assert model.ragged_logits_graph_calls == 5
 
@@ -8291,6 +8291,53 @@ def test_continuous_batch_engine_reuses_gpu_decode_state_for_ragged_baseline() -
     assert engine._decode_many_gpu_state_signature == engine._make_decode_many_gpu_state_signature(
         [state for state in decoded if isinstance(state, serving_mod._ActiveRequest)]
     )
+
+
+def test_continuous_batch_engine_online_prefill_seeds_gpu_decode_state(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_UNIFORM_RAGGED_DECODE", "1")
+
+    class _InputPointerToyModel(_RaggedGraphToyModel):
+        def __init__(self) -> None:
+            super().__init__(vocab_size=128)
+            self.decode_input_ptrs: list[int] = []
+
+        def try_decode_ragged_logits_graph(self, input_ids, cache, *, seq_lens, row_indices):
+            del seq_lens
+            self.decode_input_ptrs.append(input_ids.data_ptr())
+            cache.advance_rows(_toy_decode_rows(input_ids, row_indices), 1)
+            return self._logits(input_ids[:, -1] + 1)
+
+    model = _InputPointerToyModel()
+    engine = ContinuousBatchEngine(
+        model,
+        device=torch.device("cpu"),
+        max_active_requests=2,
+        prefix_cache_capacity=0,
+        enable_ragged_decode=True,
+        store_reusable_prefixes=False,
+    )
+    engine.start_online(max_seq_len=16)
+    engine.submit_online(ServingRequest("a", (1, 2, 3), 2, arrival_step=0))
+    engine.submit_online(ServingRequest("b", (3, 4, 5), 2, arrival_step=0))
+
+    first = engine.step_online()
+    assert engine._decode_many_gpu_state_signature == engine._make_decode_many_gpu_state_signature(
+        engine._online_active
+    )
+    second = engine.step_online()
+
+    assert [(event.request_id, event.token, event.generated, event.finished) for event in first] == [
+        ("a", 4, 1, False),
+        ("b", 6, 1, False),
+    ]
+    assert [(event.request_id, event.token, event.generated, event.finished) for event in second] == [
+        ("a", 5, 2, True),
+        ("b", 7, 2, True),
+    ]
+    assert model.decode_input_ptrs == [engine._ensure_gpu_token_buf().data_ptr()]
+    assert not engine.has_online_work()
 
 
 def test_continuous_batch_engine_ragged_decode_omits_row_indices_for_contiguous_greedy_decode(

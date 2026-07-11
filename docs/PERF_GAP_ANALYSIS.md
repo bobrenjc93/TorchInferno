@@ -14107,16 +14107,18 @@ telemetry only; it does not change prefix lookup, prefill grouping, or serving
 behavior.
 
 Regular ragged decode baseline now reuses the GPU-resident last-token/seq-len
-state when the existing decode-many state signature proves it is current. Prefix
-graph prefill seeds that state for prefix-reuse rows, regular ragged decode
-updates it after each token, and stale or reused rows fall back to the old
-CPU-built input tensor path. This removes repeated CPU token tensor construction
-on steady ragged decode handoff paths without changing sampling, prefix lookup,
-or row-bucket policy. Focused CPU tests cover dense row-index omission,
-contiguous row reordering, decode-many state-sync behavior, and the direct
-GPU-buffer reuse path; a full current `tests/test_serving_engine.py` run still
-has two pre-existing clean-head counter assertion failures unrelated to this
-change.
+state when the existing decode-many state signature proves it is current. The
+`_prefill_many` boundary seeds that state for ordinary, prefix, padded, ragged,
+and FlashInfer prefill outputs; regular ragged decode updates it after each
+token, and stale or reused rows fall back to the old CPU-built input tensor path.
+This removes repeated CPU token tensor construction on steady ragged decode
+handoff paths and lets decode-many skip its initial state sync immediately after
+ordinary prefill, without changing sampling, prefix lookup, or row-bucket
+policy. Focused CPU tests cover dense row-index omission, contiguous row
+reordering, decode-many state-sync behavior, online prefill seeding, and the
+direct GPU-buffer reuse path; a full current `tests/test_serving_engine.py` run
+still has two pre-existing clean-head counter assertion failures unrelated to
+this change.
 
 ## Priority for a focused (non-loop) session
 
