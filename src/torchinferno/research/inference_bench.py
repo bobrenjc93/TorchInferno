@@ -415,6 +415,7 @@ class TorchInfernoProfilerSummary:
     self_cuda_ms: float | None = None
     allreduce_ms: float = 0.0
     gemm_ms: float = 0.0
+    attention_ms: float = 0.0
     add_rms_ms: float = 0.0
     softmax_ms: float = 0.0
 
@@ -1361,6 +1362,8 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
                     "allreduce_pct",
                     "gemm_ms",
                     "gemm_pct",
+                    "attention_ms",
+                    "attention_pct",
                     "add_rms_ms",
                     "softmax_ms",
                 ),
@@ -1870,6 +1873,7 @@ def _parse_torchinferno_profiler_events(
                 "self_cuda_ms": None,
                 "allreduce_ms": 0.0,
                 "gemm_ms": 0.0,
+                "attention_ms": 0.0,
                 "add_rms_ms": 0.0,
                 "softmax_ms": 0.0,
             }
@@ -1979,6 +1983,7 @@ def _torchinferno_profiler_event_from_fields(
         ),
         allreduce_ms=float(fields["allreduce_ms"]),
         gemm_ms=float(fields["gemm_ms"]),
+        attention_ms=float(fields["attention_ms"]),
         add_rms_ms=float(fields["add_rms_ms"]),
         softmax_ms=float(fields["softmax_ms"]),
     )
@@ -2012,6 +2017,13 @@ def _profiler_row_category(line: str) -> str | None:
         return "add_rms_ms"
     if "softmax" in lowered or "scaled_dot_product" in lowered:
         return "softmax_ms"
+    if (
+        "attention" in lowered
+        or "flashinfer" in lowered
+        or "flash_fwd" in lowered
+        or "gqa_decode" in lowered
+    ):
+        return "attention_ms"
     return None
 
 
@@ -2128,6 +2140,8 @@ def _torchinferno_profiler_event_rows(
                 _fmt_pct(event.allreduce_ms, event.self_cuda_ms or 0.0),
                 _fmt_value(event.gemm_ms),
                 _fmt_pct(event.gemm_ms, event.self_cuda_ms or 0.0),
+                _fmt_value(event.attention_ms),
+                _fmt_pct(event.attention_ms, event.self_cuda_ms or 0.0),
                 _fmt_value(event.add_rms_ms),
                 _fmt_value(event.softmax_ms),
             )

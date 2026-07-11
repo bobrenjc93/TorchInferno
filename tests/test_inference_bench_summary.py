@@ -454,6 +454,9 @@ def _write_inference_bench_run(tmp_path) -> None:
                 "cutlass_gemm_kernel                             0.00% "
                 "0.000us 0.00% 0.000us 0.000us 5.000ms 12.50% "
                 "5.000ms 62.500us 80",
+                "_grouped_gqa_decode_attention_streaming_kernel  0.00% "
+                "0.000us 0.00% 0.000us 0.000us 1.500ms 3.75% "
+                "1.500ms 18.750us 80",
                 "_add_rms_norm_kernel                            0.00% "
                 "0.000us 0.00% 0.000us 0.000us 2.000ms 5.00% "
                 "2.000ms 12.500us 160",
@@ -466,6 +469,9 @@ def _write_inference_bench_run(tmp_path) -> None:
                 "aten::_scaled_mm                                0.00% "
                 "0.000us 0.00% 0.000us 0.000us 4.000ms 20.00% "
                 "4.000ms 50.000us 80",
+                "_grouped_gqa_decode_attention_streaming_kernel  0.00% "
+                "0.000us 0.00% 0.000us 0.000us 1.000ms 5.00% "
+                "1.000ms 12.500us 80",
                 "Self CUDA time total: 20.000ms",
             ]
         )
@@ -874,6 +880,7 @@ def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) ->
     assert decode_profiler_event.self_cuda_ms == 40.0
     assert decode_profiler_event.allreduce_ms == 12.0
     assert decode_profiler_event.gemm_ms == 5.0
+    assert decode_profiler_event.attention_ms == 1.5
     assert decode_profiler_event.add_rms_ms == 2.0
     single_decode_profiler_event = summary.torchinferno_profiler_events[2]
     assert single_decode_profiler_event.kind == "RAGGED_DECODE_REPLAY_PROF"
@@ -886,6 +893,7 @@ def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) ->
     assert single_decode_profiler_event.self_cuda_ms == 20.0
     assert single_decode_profiler_event.allreduce_ms == 3.0
     assert single_decode_profiler_event.gemm_ms == 4.0
+    assert single_decode_profiler_event.attention_ms == 1.0
 
     text = format_inference_bench_summary(summary)
     assert "[long_output]" in text
@@ -1125,6 +1133,8 @@ def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) ->
     assert "replay" in text
     assert "self_cuda_ms" in text
     assert "allreduce_pct" in text
+    assert "attention_ms" in text
+    assert "attention_pct" in text
     assert "gemm_pct" in text
     assert "83.4" in text
     assert "24.6" in text

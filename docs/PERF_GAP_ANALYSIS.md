@@ -60,8 +60,9 @@ padded suffix rows, not a graph-cache miss or attention-mask bottleneck.
 The inference-bench research summary now parses `RAGGED_PREFILL_PROF`,
 `RAGGED_PREFILL_REPLAY_PROF`, `RAGGED_DECODE_REPLAY_PROF`, and
 `RAGGED_DECODE_MANY_REPLAY_PROF` blocks from `provider_logs/torchinferno.log`
-or `torchinferno_server.log` and prints a compact profiler table. Re-running
-the summary on the exact-filter artifact surfaces the same evidence directly:
+or `torchinferno_server.log` and prints a compact profiler table, including
+GEMM, all-reduce, attention, add/RMS, and softmax buckets. Re-running the
+summary on the exact-filter artifact surfaces the same evidence directly:
 `prefill_replay b24/s64`, `83.4ms` self CUDA, `24.6ms` allreduce (`29.5%`),
 `27.4ms` GEMM/NVJET buckets (`32.9%`), `7.1ms` add/RMS, and `0.7ms` softmax.
 
