@@ -343,9 +343,16 @@ _QUEUE_PROFILE_FIELDS = (
     "runtime_decode_many_step_window_cpu_tokens_ms",
     "runtime_decode_many_step_window_token_wait_ms",
     "runtime_decode_many_step_window_token_materialize_ms",
+    "runtime_prompt_lookup_batches",
+    "runtime_prompt_lookup_requests",
+    "runtime_prompt_lookup_proposed_tokens",
+    "runtime_prompt_lookup_accepted_tokens",
     "runtime_generated_prefix_store_requests",
     "runtime_generated_prefix_reuse_requests",
     "runtime_generated_prefix_reuse_tokens",
+    "runtime_repeated_sample_state_prepares",
+    "runtime_repeated_sample_state_hits",
+    "runtime_repeated_sample_state_tokens",
 )
 
 
@@ -952,6 +959,30 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
             )
         lines.extend(_format_table(header, body))
         lines.append("")
+
+        cache_integrity_rows = _cache_integrity_rows(queue_profiles)
+        if cache_integrity_rows:
+            lines.append("[torchinferno cache integrity]")
+            lines.extend(
+                _format_table(
+                    (
+                        "temp",
+                        "max_tokens",
+                        "submitted",
+                        "gen_store",
+                        "gen_reuse",
+                        "gen_tokens",
+                        "prompt_lookup_req",
+                        "prompt_lookup_prop",
+                        "prompt_lookup_accept",
+                        "repeat_hits",
+                        "repeat_tokens",
+                        "status",
+                    ),
+                    cache_integrity_rows,
+                )
+            )
+            lines.append("")
 
         prefill_miss_shape_rows = _graph_miss_shape_rows(
             queue_profiles,
@@ -2690,6 +2721,81 @@ def _provider_gap_value(
         if higher_is_better
         else torchinferno_value - best_value
     )
+
+
+def _cache_integrity_rows(
+    queue_profiles: Sequence[QueueProfileSummary],
+) -> list[tuple[str, ...]]:
+    rows: list[tuple[str, ...]] = []
+    for profile in queue_profiles:
+        fields = profile.fields
+        gen_store = _cache_integrity_counter(
+            fields,
+            "runtime_generated_prefix_store_requests",
+        )
+        gen_reuse = _cache_integrity_counter(
+            fields,
+            "runtime_generated_prefix_reuse_requests",
+        )
+        gen_tokens = _cache_integrity_counter(
+            fields,
+            "runtime_generated_prefix_reuse_tokens",
+        )
+        prompt_requests = _cache_integrity_counter(
+            fields,
+            "runtime_prompt_lookup_requests",
+        )
+        prompt_proposed = _cache_integrity_counter(
+            fields,
+            "runtime_prompt_lookup_proposed_tokens",
+        )
+        prompt_accepted = _cache_integrity_counter(
+            fields,
+            "runtime_prompt_lookup_accepted_tokens",
+        )
+        repeated_hits = _cache_integrity_counter(
+            fields,
+            "runtime_repeated_sample_state_hits",
+        )
+        repeated_tokens = _cache_integrity_counter(
+            fields,
+            "runtime_repeated_sample_state_tokens",
+        )
+        review_values = (
+            gen_store,
+            gen_reuse,
+            gen_tokens,
+            prompt_requests,
+            prompt_proposed,
+            prompt_accepted,
+            repeated_hits,
+            repeated_tokens,
+        )
+        rows.append(
+            (
+                _fmt_value(profile.temperature),
+                _fmt_value(profile.max_tokens),
+                _fmt_value(profile.submitted_requests),
+                _fmt_cache_integrity_counter(gen_store),
+                _fmt_cache_integrity_counter(gen_reuse),
+                _fmt_cache_integrity_counter(gen_tokens),
+                _fmt_cache_integrity_counter(prompt_requests),
+                _fmt_cache_integrity_counter(prompt_proposed),
+                _fmt_cache_integrity_counter(prompt_accepted),
+                _fmt_cache_integrity_counter(repeated_hits),
+                _fmt_cache_integrity_counter(repeated_tokens),
+                "review" if any(value > 0 for value in review_values) else "clean",
+            )
+        )
+    return rows
+
+
+def _cache_integrity_counter(fields: Mapping[str, Any], name: str) -> float:
+    return _numeric_field(fields, name) or 0.0
+
+
+def _fmt_cache_integrity_counter(value: float) -> str:
+    return _fmt_value(_int_if_whole(value))
 
 
 def _phase_target(

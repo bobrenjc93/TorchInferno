@@ -424,9 +424,16 @@ def _write_inference_bench_run(tmp_path) -> None:
         "runtime_decode_many_step_window_token_materialize_ms": {
             "decode_many:b8/8:g1-16": 0.2,
         },
+        "runtime_prompt_lookup_batches": 2,
+        "runtime_prompt_lookup_requests": 3,
+        "runtime_prompt_lookup_proposed_tokens": 10,
+        "runtime_prompt_lookup_accepted_tokens": 4,
         "runtime_generated_prefix_store_requests": 12,
         "runtime_generated_prefix_reuse_requests": 3,
         "runtime_generated_prefix_reuse_tokens": 33,
+        "runtime_repeated_sample_state_prepares": 5,
+        "runtime_repeated_sample_state_hits": 1,
+        "runtime_repeated_sample_state_tokens": 7,
     }
     (logs / "torchinferno_queue_profile.jsonl").write_text(json.dumps(queue_record) + "\n")
     (logs / "torchinferno.log").write_text(
@@ -865,6 +872,18 @@ def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) ->
         == 33
     )
     assert (
+        summary.torchinferno_queue_profiles[0].fields[
+            "runtime_prompt_lookup_accepted_tokens"
+        ]
+        == 4
+    )
+    assert (
+        summary.torchinferno_queue_profiles[0].fields[
+            "runtime_repeated_sample_state_tokens"
+        ]
+        == 7
+    )
+    assert (
         summary.torchinferno_queue_profiles[0].fields["runtime_prefill_shape_forward_ms"][
             "prefix_graph:b8:s16:p45-45:src1:mixed0"
         ]
@@ -1087,6 +1106,11 @@ def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) ->
     assert "prefill_graph_suffix" in text
     assert "s12=14,s96=2" in text
     assert "decode_graph_miss" in text
+    assert "[torchinferno cache integrity]" in text
+    assert "prompt_lookup_req" in text
+    assert "prompt_lookup_accept" in text
+    assert "repeat_hits" in text
+    assert "review" in text
     assert "[long_output provider gaps vs torchinferno]" in text
     assert "best_provider" in text
     assert "+8.0" in text
