@@ -2431,7 +2431,10 @@ class ContinuousBatchEngine:
                 del prefix_logits
             self._refresh_row_seq_len_from_cache(prefix_row, prefix_tokens)
             self._record_model_call("prefill", 1, tokens=prefix_ids.numel())
-            self._record_shape_count(self.stats.prefill_shape_counts, f"common_prefix:b1:t{prefix_tokens}")
+            self._record_queue_profile_shape_count(
+                self.stats.prefill_shape_counts,
+                f"common_prefix:b1:t{prefix_tokens}",
+            )
             self.stats.prefill_common_prefix_batches += 1
             prefix_row_adopted = self._store_reusable_prefix_tokens_in_row(
                 common_route,
@@ -2560,7 +2563,7 @@ class ContinuousBatchEngine:
             f"b{batch_bucket}:s{chunk_bucket}:p{cursor}:"
             f"logits{int(any(chunk_completes_prompt))}"
         )
-        self._record_shape_count(self.stats.prefill_shape_counts, shape_key)
+        self._record_queue_profile_shape_count(self.stats.prefill_shape_counts, shape_key)
         try:
             if not any(chunk_completes_prompt):
                 cache_filled = self._try_ragged_prefill_cache(
@@ -3190,7 +3193,10 @@ class ContinuousBatchEngine:
                 prefix_logits, _ = self._prefill_logits(prefix_ids, cache=self._cache_view([prefix_row]))
             self._refresh_row_seq_len_from_cache(prefix_row, prefix_tokens)
             self._record_model_call("prefill", 1, tokens=prefix_ids.numel())
-            self._record_shape_count(self.stats.prefill_shape_counts, f"common_prefix:b1:t{prefix_tokens}")
+            self._record_queue_profile_shape_count(
+                self.stats.prefill_shape_counts,
+                f"common_prefix:b1:t{prefix_tokens}",
+            )
             self.stats.prefill_common_prefix_batches += 1
             prefix_tuple = tuple(group[0][1].prompt[:prefix_tokens])
             common_route = ("common_prefix", prefix_tuple)
@@ -3690,7 +3696,10 @@ class ContinuousBatchEngine:
                 f"src{len(source_prefix_rows)}:"
                 f"mixed{int(mixed_prefixes)}"
             )
-            self._record_shape_count(self.stats.prefill_shape_counts, shape_key)
+            self._record_queue_profile_shape_count(
+                self.stats.prefill_shape_counts,
+                shape_key,
+            )
             self._record_prefill_shape_batch_details(
                 shape_key,
                 real_batch=count,
@@ -3876,22 +3885,22 @@ class ContinuousBatchEngine:
                     self._release_active_row(row)
                 return None
             self._record_model_call("prefill", count, tokens=count * max(suffix_lengths))
-            self._record_shape_total(
+            self._record_queue_profile_shape_total(
                 self.stats.prefill_shape_active_requests,
                 shape_key,
                 count,
             )
-            self._record_shape_total(
+            self._record_queue_profile_shape_total(
                 self.stats.prefill_shape_model_rows,
                 shape_key,
                 model_rows_for_stats,
             )
-            self._record_shape_total(
+            self._record_queue_profile_shape_total(
                 self.stats.prefill_shape_active_tokens,
                 shape_key,
                 sum(output_suffix_lengths),
             )
-            self._record_shape_total(
+            self._record_queue_profile_shape_total(
                 self.stats.prefill_shape_model_tokens,
                 shape_key,
                 model_tokens_for_stats,
@@ -5685,7 +5694,10 @@ class ContinuousBatchEngine:
         self.stats.prefill_plain_batches += 1
         rows = [self._acquire_active_row() for _ in group]
         prompts = torch.tensor([request.prompt for _, request, _ in group], device=self.device, dtype=torch.long)
-        self._record_shape_count(self.stats.prefill_shape_counts, f"plain:b{len(group)}:t{prompts.size(1)}")
+        self._record_queue_profile_shape_count(
+            self.stats.prefill_shape_counts,
+            f"plain:b{len(group)}:t{prompts.size(1)}",
+        )
         cache_view = self._cache_view(rows)
         logits, _ = self._prefill_logits(prompts, cache=cache_view)
         self._record_model_call("prefill", len(group), tokens=prompts.numel())
@@ -5747,7 +5759,7 @@ class ContinuousBatchEngine:
         max_len = max(lengths)
         suffix_bucket = self._suffix_bucket(max_len)
         batch_bucket = self._prefill_batch_bucket(len(group))
-        self._record_shape_count(
+        self._record_queue_profile_shape_count(
             self.stats.prefill_shape_counts,
             f"ragged_graph:b{batch_bucket}:t{suffix_bucket}",
         )
@@ -5843,7 +5855,7 @@ class ContinuousBatchEngine:
         rows = [self._acquire_active_row() for _ in group]
         lengths = [len(request.prompt) for _, request, _ in group]
         max_len = max(lengths)
-        self._record_shape_count(
+        self._record_queue_profile_shape_count(
             self.stats.prefill_shape_counts,
             f"padded_plain:b{len(group)}:t{min(lengths)}-{max_len}",
         )
@@ -5928,7 +5940,10 @@ class ContinuousBatchEngine:
 
         if suffix:
             input_ids = torch.tensor([suffix], device=self.device, dtype=torch.long)
-            self._record_shape_count(self.stats.prefill_shape_counts, f"single:b1:t{input_ids.size(1)}")
+            self._record_queue_profile_shape_count(
+                self.stats.prefill_shape_counts,
+                f"single:b1:t{input_ids.size(1)}",
+            )
             logits, _ = self._prefill_logits(input_ids, cache=self._cache_view([row]))
             self._record_model_call("prefill", 1, tokens=input_ids.numel())
         elif reusable is not None and reusable.logits is not None:
@@ -8794,6 +8809,11 @@ class ContinuousBatchEngine:
             return
         counts[key] = counts.get(key, 0) + 1
 
+    def _record_queue_profile_shape_total(self, counts: dict[str, int], key: str, amount: int) -> None:
+        if not (self.profile_timings or _queue_profile_counts_enabled()):
+            return
+        counts[key] = counts.get(key, 0) + int(amount)
+
     def _record_shape_total(self, counts: dict[str, int], key: str, amount: int) -> None:
         if not self.profile_timings:
             return
@@ -8810,11 +8830,11 @@ class ContinuousBatchEngine:
         if omitted:
             self.stats.prefill_row_indices_omitted_batches += 1
             self.stats.prefill_row_indices_omitted_rows += rows
-            self._record_shape_count(
+            self._record_queue_profile_shape_count(
                 self.stats.prefill_shape_row_indices_omitted_batches,
                 shape_key,
             )
-            self._record_shape_total(
+            self._record_queue_profile_shape_total(
                 self.stats.prefill_shape_row_indices_omitted_rows,
                 shape_key,
                 rows,
@@ -8822,11 +8842,11 @@ class ContinuousBatchEngine:
             return
         self.stats.prefill_row_indices_indexed_batches += 1
         self.stats.prefill_row_indices_indexed_rows += rows
-        self._record_shape_count(
+        self._record_queue_profile_shape_count(
             self.stats.prefill_shape_row_indices_indexed_batches,
             shape_key,
         )
-        self._record_shape_total(
+        self._record_queue_profile_shape_total(
             self.stats.prefill_shape_row_indices_indexed_rows,
             shape_key,
             rows,
@@ -8849,9 +8869,9 @@ class ContinuousBatchEngine:
         real_batch: int,
         suffix_lengths: Sequence[int],
     ) -> None:
-        if not self.profile_timings:
+        if not (self.profile_timings or _queue_profile_counts_enabled()):
             return
-        self._record_shape_count(
+        self._record_queue_profile_shape_count(
             self.stats.prefill_shape_real_batch_counts,
             f"{shape_key}|real_b{max(0, int(real_batch))}",
         )
@@ -8859,7 +8879,7 @@ class ContinuousBatchEngine:
         for suffix_len in suffix_lengths:
             suffix_counts[max(0, int(suffix_len))] += 1
         for suffix_len, count in suffix_counts.items():
-            self._record_shape_total(
+            self._record_queue_profile_shape_total(
                 self.stats.prefill_shape_suffix_length_counts,
                 f"{shape_key}|suffix{suffix_len}",
                 count,
@@ -9028,7 +9048,7 @@ class ContinuousBatchEngine:
     ) -> None:
         route_kind = (
             self._prefix_reuse_route_kind(reusable.route_id if reusable is not None else None)
-            if self.profile_timings
+            if self.profile_timings or _queue_profile_counts_enabled()
             else None
         )
         self._record_prefix_reuse_total(prefix_hit_tokens, route_kind=route_kind, count=1)
@@ -9039,7 +9059,11 @@ class ContinuousBatchEngine:
     ) -> None:
         request_count = 0
         token_count = 0
-        grouped_counts: dict[tuple[int, str], int] | None = defaultdict(int) if self.profile_timings else None
+        grouped_counts: dict[tuple[int, str], int] | None = (
+            defaultdict(int)
+            if self.profile_timings or _queue_profile_counts_enabled()
+            else None
+        )
         for prefix_hit_tokens, reusable in entries:
             hit_tokens = int(prefix_hit_tokens)
             request_count += 1
@@ -9071,7 +9095,7 @@ class ContinuousBatchEngine:
         hit_tokens = int(prefix_hit_tokens)
         self.stats.prefix_reuse_requests += count
         self.stats.prefix_reuse_tokens += hit_tokens * count
-        if not self.profile_timings:
+        if not (self.profile_timings or _queue_profile_counts_enabled()):
             return
         self._record_prefix_reuse_profile_counts(
             hit_tokens,
@@ -9086,12 +9110,12 @@ class ContinuousBatchEngine:
         route_kind: str,
         count: int,
     ) -> None:
-        self._record_shape_total(
+        self._record_queue_profile_shape_total(
             self.stats.prefix_reuse_route_counts,
             route_kind,
             count,
         )
-        self._record_shape_total(
+        self._record_queue_profile_shape_total(
             self.stats.prefix_reuse_hit_token_counts,
             str(int(prefix_hit_tokens)),
             count,
@@ -9103,7 +9127,7 @@ class ContinuousBatchEngine:
         group: Sequence[tuple[int, ServingRequest, int, _ReusablePrefix]],
         suffix_lengths: Sequence[int],
     ) -> None:
-        if not self.profile_timings:
+        if not (self.profile_timings or _queue_profile_counts_enabled()):
             return
         route_totals: dict[str, list[int]] = defaultdict(lambda: [0, 0, 0])
         for (_index, _request, prefix_hit_tokens, reusable), suffix_len in zip(
@@ -9117,13 +9141,17 @@ class ContinuousBatchEngine:
             totals[2] += max(0, int(prefix_hit_tokens))
         for route_kind, (count, active_tokens, reuse_tokens) in route_totals.items():
             route_key = f"{shape_key}|route={route_kind}"
-            self._record_shape_total(self.stats.prefill_shape_route_counts, route_key, count)
-            self._record_shape_total(
+            self._record_queue_profile_shape_total(
+                self.stats.prefill_shape_route_counts,
+                route_key,
+                count,
+            )
+            self._record_queue_profile_shape_total(
                 self.stats.prefill_shape_route_active_tokens,
                 route_key,
                 active_tokens,
             )
-            self._record_shape_total(
+            self._record_queue_profile_shape_total(
                 self.stats.prefill_shape_route_reuse_tokens,
                 route_key,
                 reuse_tokens,

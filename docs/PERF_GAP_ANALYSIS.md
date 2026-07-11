@@ -132,6 +132,31 @@ and regressed to `223.0 / 22.2 / 1014.9ms`, with
 ordinary cached-prefix suffix prefill body plus high-active decode-many replay,
 not more admission collection tuning.
 
+## Current no-sync prefill-shape telemetry
+
+A dirty-tree telemetry validation after `be39510` wrote
+`/tmp/inference-bench-prefill-shape-count-long-be39510-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-prefill-shape-count-be39510/runs/20260711_063547`.
+It reached server readiness in `286.2s`, completed `long_output` at
+`215.3 / 22.1 / 1003.8ms`, p99 `525.8 / 37.2 / 1821.2ms`, and stayed
+`1000/1000` correct. This is not a perf win over the clean `fa15dc6` control;
+the useful result is that no-sync queue profiles now populate
+`runtime_prefill_shape_counts`, active/model token maps, real-batch and suffix
+maps, route maps, and prefix-reuse maps while leaving
+`runtime_prefill_shape_forward_ms` and `runtime_prefill_shape_wall_ms` empty.
+
+The new no-sync maps expose the remaining padding directly. The hottest cached
+prefix suffix shape, `prefix_graph:b24:s64:p111-111:src1:mixed0`, ran `18`
+calls for `405` active requests and `17.8K/27.6K` active/model tokens.
+`prefix_graph:b16:s96:p111-111:src1:mixed0` ran `11` calls for `144` requests
+and `9.1K/16.9K` tokens, while
+`prefix_graph:b24:s96:p111-111:src1:mixed0` ran `6` calls for `117` requests
+and `5.8K/13.8K` tokens. Prefix reuse was healthy:
+`runtime_prefix_reuse_route_counts={"common_prefix": 1000}` and
+`runtime_prefix_reuse_hit_token_counts={"111": 1000}`. Future public profiles
+can now quantify ordinary cached-prefix suffix-prefill padding without enabling
+sync timings; the target remains non-fragmenting cached-prefix packed prefill
+and high-active decode replay.
+
 ## Public 20260710_170747 startup failure and symm-mem warmup fix
 
 The latest public pointer advanced to

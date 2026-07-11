@@ -4364,6 +4364,47 @@ def test_continuous_batch_engine_records_profile_shape_counts() -> None:
     assert any(key.startswith("ragged:b3/") for key in engine.stats.decode_shape_counts)
 
 
+def test_continuous_batch_engine_records_queue_profile_shape_counts_without_sync(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_QUEUE_PROFILE_JSONL", "queue.jsonl")
+    shared = tuple(range(16))
+    model = _SelectedLogitsToyModel()
+    engine = ContinuousBatchEngine(
+        model,
+        device=torch.device("cpu"),
+        max_active_requests=4,
+        prefix_cache_capacity=4,
+        graph_prefill=True,
+        profile_timings=False,
+    )
+    requests = [
+        ServingRequest("a", (*shared, 21), 2, arrival_step=0),
+        ServingRequest("b", (*shared, 22, 23, 24), 2, arrival_step=0),
+        ServingRequest("c", (*shared, 25, 26), 2, arrival_step=0),
+    ]
+
+    results = engine.run(requests)
+
+    assert len(results) == 3
+    prefix_shape = "prefix_graph:b4:s4:p16-16:src1:mixed0"
+    assert engine.stats.prefill_shape_counts["common_prefix:b1:t16"] == 1
+    assert engine.stats.prefill_shape_counts[prefix_shape] == 1
+    assert engine.stats.prefill_shape_active_requests[prefix_shape] == 3
+    assert engine.stats.prefill_shape_model_rows[prefix_shape] == 4
+    assert engine.stats.prefill_shape_active_tokens[prefix_shape] == 6
+    assert engine.stats.prefill_shape_model_tokens[prefix_shape] == 16
+    assert engine.stats.prefill_shape_real_batch_counts[f"{prefix_shape}|real_b3"] == 1
+    assert engine.stats.prefill_shape_suffix_length_counts[f"{prefix_shape}|suffix1"] == 1
+    assert engine.stats.prefill_shape_suffix_length_counts[f"{prefix_shape}|suffix2"] == 1
+    assert engine.stats.prefill_shape_suffix_length_counts[f"{prefix_shape}|suffix3"] == 1
+    assert engine.stats.prefill_shape_route_counts[f"{prefix_shape}|route=common_prefix"] == 3
+    assert engine.stats.prefix_reuse_route_counts["common_prefix"] == 3
+    assert engine.stats.prefix_reuse_hit_token_counts["16"] == 3
+    assert engine.stats.prefill_shape_forward_ms == {}
+    assert engine.stats.prefill_shape_wall_ms == {}
+
+
 def test_continuous_batch_engine_tags_prefill_first_token_events_with_shape() -> None:
     shared = tuple(range(16))
     model = _SelectedLogitsToyModel()
