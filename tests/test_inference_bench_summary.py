@@ -10,6 +10,7 @@ from torchinferno.research.inference_bench import (
     _decode_many_phase_rows,
     _hot_prefill_shape_rows,
     _phase_target,
+    _prefill_graph_phase_rows,
     _prefill_packed_dynamic_target_rows,
     _prefill_packed_fixed_capacity_reject_rows,
     _prefill_shape_call_count,
@@ -1047,6 +1048,8 @@ def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) ->
     assert "hot_prefill" in text
     assert "b8:s16:p45-45:src1:mixed0" in text
     assert "hot_decode" in text
+    assert "[torchinferno prefill graph phase]" in text
+    assert "active_tok_s" in text
     assert "[torchinferno decode-many phase]" in text
     assert "emit_tok_s" in text
     assert "overgen_pct" in text
@@ -1531,6 +1534,54 @@ def test_inference_bench_summary_derives_decode_graph_cache_counts_from_shapes()
             "runtime_decode_graph_cache_live_cache_bucket_counts": {"cache256": 4},
         }
     ) == {"cache256": 4}
+
+
+def test_prefill_graph_phase_rows_summarize_padding_and_throughput() -> None:
+    rows = _prefill_graph_phase_rows(
+        [
+            QueueProfileSummary(
+                event="online_batcher_quiescent",
+                temperature=0.0,
+                max_tokens=96,
+                submitted_requests=8,
+                finished_events=8,
+                fields={
+                    "runtime_prefill_graph_replays": 2,
+                    "runtime_prefill_graph_replay_gpu_ms": 10.0,
+                    "runtime_prefill_shape_active_tokens": {
+                        "prefix_graph:b8:s16:p45-45:src1:mixed0": 20,
+                    },
+                    "runtime_prefill_shape_model_tokens": {
+                        "prefix_graph:b8:s16:p45-45:src1:mixed0": 30,
+                    },
+                    "runtime_prefill_shape_padding_tokens": {
+                        "prefix_graph:b8:s16:p45-45:src1:mixed0": 10,
+                    },
+                    "runtime_prefill_row_padding_tokens": 3,
+                    "runtime_prefill_suffix_padding_tokens": 7,
+                },
+            )
+        ]
+    )
+
+    assert rows == [
+        (
+            "0.0",
+            "96",
+            "2",
+            "10.0",
+            "20",
+            "30",
+            "10",
+            "3",
+            "7",
+            "33.3%",
+            "2000.0",
+            "3000.0",
+            "500.0",
+            "333.3",
+        )
+    ]
 
 
 def test_decode_many_phase_rows_summarize_throughput_and_overgeneration() -> None:

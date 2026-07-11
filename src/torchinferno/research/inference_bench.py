@@ -1332,6 +1332,32 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
             )
             lines.append("")
 
+        prefill_phase_rows = _prefill_graph_phase_rows(queue_profiles)
+        if prefill_phase_rows:
+            lines.append("[torchinferno prefill graph phase]")
+            lines.extend(
+                _format_table(
+                    (
+                        "temp",
+                        "max_tokens",
+                        "replays",
+                        "gpu_ms",
+                        "active_tokens",
+                        "model_tokens",
+                        "padding",
+                        "row_pad",
+                        "sfx_pad",
+                        "pad_pct",
+                        "active_tok_s",
+                        "model_tok_s",
+                        "us_active",
+                        "us_model",
+                    ),
+                    prefill_phase_rows,
+                )
+            )
+            lines.append("")
+
         prefill_graph_rows = _hot_prefill_graph_shape_rows(queue_profiles)
         if prefill_graph_rows:
             lines.append("[torchinferno hot prefill graph shapes]")
@@ -4392,6 +4418,92 @@ def _hot_decode_shape_rows(
                 ),
                 _fmt_value(decode_many_overgen_tokens),
                 _fmt_value(fields.get("runtime_decode_graph_cache_live_entries")),
+            )
+        )
+    return rows
+
+
+def _prefill_graph_phase_rows(
+    profiles: Sequence[QueueProfileSummary],
+) -> list[tuple[str, ...]]:
+    rows: list[tuple[str, ...]] = []
+    for profile in profiles:
+        fields = profile.fields
+        replays = _numeric_field(fields, "runtime_prefill_graph_replays")
+        if replays is None:
+            shape_counts = _numeric_mapping(fields.get("runtime_prefill_shape_counts"))
+            replay_counts = [
+                count
+                for shape, count in shape_counts.items()
+                if shape.startswith("prefix_graph:")
+            ]
+            replays = sum(replay_counts) if replay_counts else None
+        gpu_ms = _numeric_field(fields, "runtime_prefill_graph_replay_gpu_ms")
+        if gpu_ms is None:
+            gpu_ms = _sum_numeric_mapping(
+                fields.get("runtime_prefill_shape_graph_replay_gpu_ms")
+            )
+        if gpu_ms is None:
+            gpu_ms = _sum_numeric_mapping(
+                fields.get("runtime_prefill_graph_replay_shape_gpu_ms")
+            )
+        active_tokens, model_tokens, padding_tokens = _prefill_token_totals(fields)
+        if active_tokens is None:
+            active_tokens = _numeric_field(fields, "runtime_prefill_active_tokens")
+        if model_tokens is None:
+            model_tokens = _numeric_field(fields, "runtime_prefill_model_tokens")
+        if padding_tokens is None:
+            padding_tokens = _numeric_field(fields, "runtime_prefill_padding_tokens")
+        if (
+            padding_tokens is None
+            and active_tokens is not None
+            and model_tokens is not None
+        ):
+            padding_tokens = max(0.0, model_tokens - active_tokens)
+        row_padding_tokens, suffix_padding_tokens = _prefill_padding_split_totals(fields)
+        if not any(
+            isinstance(value, (int, float)) and float(value) > 0.0
+            for value in (
+                replays,
+                gpu_ms,
+                active_tokens,
+                model_tokens,
+                padding_tokens,
+                row_padding_tokens,
+                suffix_padding_tokens,
+            )
+        ):
+            continue
+        rows.append(
+            (
+                _fmt_value(profile.temperature),
+                _fmt_value(profile.max_tokens),
+                _fmt_value(_int_if_whole(replays) if replays is not None else None),
+                _fmt_value(gpu_ms),
+                _fmt_value(
+                    _int_if_whole(active_tokens) if active_tokens is not None else None
+                ),
+                _fmt_value(
+                    _int_if_whole(model_tokens) if model_tokens is not None else None
+                ),
+                _fmt_value(
+                    _int_if_whole(padding_tokens) if padding_tokens is not None else None
+                ),
+                _fmt_value(
+                    _int_if_whole(row_padding_tokens)
+                    if row_padding_tokens is not None
+                    else None
+                ),
+                _fmt_value(
+                    _int_if_whole(suffix_padding_tokens)
+                    if suffix_padding_tokens is not None
+                    else None
+                ),
+                _fmt_pct(float(padding_tokens or 0.0), float(model_tokens or 0.0)),
+                _fmt_value(_ratio_or_none(active_tokens, gpu_ms, scale=1000.0)),
+                _fmt_value(_ratio_or_none(model_tokens, gpu_ms, scale=1000.0)),
+                _fmt_value(_ratio_or_none(gpu_ms, active_tokens, scale=1000.0)),
+                _fmt_value(_ratio_or_none(gpu_ms, model_tokens, scale=1000.0)),
             )
         )
     return rows
