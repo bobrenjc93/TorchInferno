@@ -1,5 +1,33 @@
 # TorchInferno vs vLLM/sglang — Performance Gap Analysis (Llama-3.1-70B, 8xH100)
 
+## Current 20260711 greedy suffix graph warmup split
+
+Promote a startup-only warmup split: keep the `max_tokens=512` policy target for
+mixed-prefix warmup, but make the generic greedy common-prefix suffix graph
+warmup short-only by default. The new helper
+`_online_greedy_common_prefix_suffix_prefill_graph_warmup_max_token_values()`
+defaults to `(128,)`, while the existing
+`TORCHINFERNO_OPENAI_WARMUP_ONLINE_GREEDY_COMMON_PREFIX_MAX_TOKENS` legacy env
+still expands the graph warmup when explicitly set. A new
+`TORCHINFERNO_OPENAI_WARMUP_ONLINE_GREEDY_COMMON_PREFIX_GRAPH_MAX_TOKENS` env can
+override only the generic graph warmup.
+
+The dirty-default long_output validation wrote
+`/tmp/inference-bench-greedy-graph128-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-greedy-graph128/runs/20260711_113921`.
+It removed the `43.1s` greedy `max_tokens=512` suffix sweep seen in the prior
+`821193a` run: tensor-parallel startup warmup fell from `219.9s` to `177.5s`,
+with server readiness at `241.1s`. Score stayed in family at
+`207.8 / 21.8 / 1046.9ms`, `36.5 tok/s`, and `1000/1000` correct.
+
+The matching multi_turn validation wrote
+`/tmp/inference-bench-greedy-graph128-multi-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-greedy-graph128-multi/runs/20260711_114517`.
+It also skipped the generic greedy `512` suffix sweep, reached tensor-parallel
+startup warmup done at `179.7s` with server readiness at `246.1s`, and stayed in
+the current score family at `224.7 / 37.2 / 256.0ms` with `982/1000` correct.
+The queue profile still shows `mixed_prefix=True` for multi_turn, so this change
+reduces startup graph budget without disabling the larger mixed-prefix runtime
+path.
+
 ## Current 20260711 pushed-head long_output refresh and startup warmup attribution
 
 A pushed-head TorchInferno long_output refresh on `821193a` wrote

@@ -1637,6 +1637,22 @@ def _online_greedy_common_prefix_suffix_prefill_warmup_max_token_values() -> tup
     return values or (512,)
 
 
+def _online_greedy_common_prefix_suffix_prefill_graph_warmup_max_token_values() -> tuple[int, ...]:
+    configured = os.environ.get(
+        "TORCHINFERNO_OPENAI_WARMUP_ONLINE_GREEDY_COMMON_PREFIX_GRAPH_MAX_TOKENS"
+    )
+    if configured is not None:
+        values = _parse_positive_int_csv(configured)
+        return values or (128,)
+    legacy_configured = os.environ.get(
+        "TORCHINFERNO_OPENAI_WARMUP_ONLINE_GREEDY_COMMON_PREFIX_MAX_TOKENS"
+    )
+    if legacy_configured is not None:
+        values = _parse_positive_int_csv(legacy_configured)
+        return values or (512,)
+    return (128,)
+
+
 def _online_greedy_common_prefix_suffix_prefill_warmup_max_tokens() -> int:
     return _online_greedy_common_prefix_suffix_prefill_warmup_max_token_values()[-1]
 
@@ -4161,7 +4177,7 @@ class OpenAICompletionEngine:
                                         )
                         _reset_generation_cache(cache)
                 for greedy_suffix_warmup_max_tokens in (
-                    _online_greedy_common_prefix_suffix_prefill_warmup_max_token_values()
+                    _online_greedy_common_prefix_suffix_prefill_graph_warmup_max_token_values()
                 ):
                     with _tensor_parallel_symm_mem_allreduce_scope(
                         self.model,
