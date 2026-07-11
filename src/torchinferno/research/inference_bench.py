@@ -3375,7 +3375,7 @@ def _prefill_packed_per_batch_target_rows(
         )
         if not shape_saved:
             continue
-        total_prefill_ms = _numeric_field(fields, "runtime_prefill_forward_ms")
+        total_prefill_ms = _prefill_total_dense_forward_ms(fields)
         shape_model_tokens = _numeric_mapping(
             fields.get("runtime_prefill_packed_candidate_shape_model_tokens")
         )
@@ -3597,7 +3597,7 @@ def _prefill_packed_fixed_capacity_plan_rows(
             pattern_signature_calls,
         ) = _prefill_packed_pattern_slot_summary(fields, pattern_calls)
         plan_items: list[tuple[float, tuple[str, ...]]] = []
-        total_prefill_ms = _numeric_field(fields, "runtime_prefill_forward_ms")
+        total_prefill_ms = _prefill_total_dense_forward_ms(fields)
         for pattern, calls in pattern_calls.items():
             max_slots = pattern_max_slots.get(pattern)
             if not max_slots:
@@ -3766,12 +3766,29 @@ def _prefill_shape_dense_forward_ms(
 ) -> float | None:
     shape_ms = _mapping_value(fields.get("runtime_prefill_shape_forward_ms"), shape_key)
     if shape_ms is None:
+        shape_ms = _mapping_value(
+            fields.get("runtime_prefill_shape_graph_replay_gpu_ms"),
+            shape_key,
+        )
+    if shape_ms is None:
+        shape_ms = _mapping_value(
+            fields.get("runtime_prefill_graph_replay_shape_gpu_ms"),
+            shape_key,
+        )
+    if shape_ms is None:
         return None
     dense_ms = max(0.0, float(shape_ms))
     packed_ms = _prefill_shape_observed_packed_ms(fields, shape_key)
     if packed_ms is not None:
         dense_ms = max(0.0, dense_ms - packed_ms)
     return dense_ms
+
+
+def _prefill_total_dense_forward_ms(fields: dict[str, Any]) -> float | None:
+    total_ms = _numeric_field(fields, "runtime_prefill_forward_ms")
+    if total_ms is None or total_ms <= 0.0:
+        total_ms = _numeric_field(fields, "runtime_prefill_graph_replay_gpu_ms")
+    return total_ms
 
 
 def _prefill_packed_implementation_target_rows(
@@ -3790,7 +3807,7 @@ def _prefill_packed_implementation_target_rows(
         pattern_saved = _numeric_mapping(
             fields.get("runtime_prefill_packed_candidate_pattern_saved_tokens")
         )
-        total_prefill_ms = _numeric_field(fields, "runtime_prefill_forward_ms")
+        total_prefill_ms = _prefill_total_dense_forward_ms(fields)
         pattern_max_slots: dict[str, dict[tuple[int, int], int]] = {}
         pattern_signature_calls: dict[str, float] = {}
         for slot_key, slot_count in _numeric_mapping(
@@ -3966,7 +3983,7 @@ def _prefill_packed_dynamic_target_rows(
         pattern_max_slots, _runtime_slot_patterns, _pattern_signature_calls = (
             _prefill_packed_pattern_slot_summary(fields, pattern_calls)
         )
-        total_prefill_ms = _numeric_field(fields, "runtime_prefill_forward_ms")
+        total_prefill_ms = _prefill_total_dense_forward_ms(fields)
         for pattern, dynamic_saved in pattern_saved.items():
             call_count = max(0.0, float(pattern_calls.get(pattern, 0.0)))
             dynamic_saved = max(0.0, float(dynamic_saved))

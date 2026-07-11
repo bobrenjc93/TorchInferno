@@ -14997,6 +14997,17 @@ it confirms physical prefix copies are meaningful, but the default fix still
 needs a non-fragmenting cached-prefix suffix body that does not perturb the
 decode schedule.
 
+The inference-bench summary now uses no-sync CUDA-event prefill graph replay
+timing to estimate packed-prefill target value when full
+`runtime_prefill_shape_forward_ms` sync timing is absent. Re-rendering the
+current local long_output all-provider artifact now gives dynamic-count target
+rows with concrete GPU estimates from the default queue profile: the top
+`p111` dynamic packed target estimates `153.7ms` (`3.3%` of prefill replay GPU),
+followed by `109.4ms`, `83.3ms`, and `59.4ms`. This does not change runtime
+behavior, but it makes future public-style artifacts rank the real
+non-fragmenting packed-prefix implementation targets without enabling expensive
+sync profiling.
+
 ## Priority for a focused (non-loop) session
 
 1. Prefill MFU (Issue 1) — biggest TTFT lever, ~2x, affects 3/5 benchmarks.
