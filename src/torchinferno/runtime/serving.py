@@ -4146,30 +4146,32 @@ class ContinuousBatchEngine:
         self.stats.prefill_packed_eager_tokens += int(real_tokens)
         self.stats.prefill_packed_eager_model_tokens += int(model_tokens)
         self.stats.prefill_packed_eager_saved_tokens += saved_tokens
-        if elapsed_ms is None:
-            return
-        self.stats.prefill_packed_eager_ms += elapsed_ms
         if profile_shape_key is None:
+            if elapsed_ms is not None:
+                self.stats.prefill_packed_eager_ms += elapsed_ms
             return
-        self._record_shape_count(
+        self._record_queue_profile_shape_count(
             self.stats.prefill_packed_eager_shape_counts,
             profile_shape_key,
         )
-        self._record_shape_total(
+        self._record_queue_profile_shape_total(
             self.stats.prefill_packed_eager_shape_tokens,
             profile_shape_key,
             int(real_tokens),
         )
-        self._record_shape_total(
+        self._record_queue_profile_shape_total(
             self.stats.prefill_packed_eager_shape_model_tokens,
             profile_shape_key,
             int(model_tokens),
         )
-        self._record_shape_total(
+        self._record_queue_profile_shape_total(
             self.stats.prefill_packed_eager_shape_saved_tokens,
             profile_shape_key,
             saved_tokens,
         )
+        if elapsed_ms is None:
+            return
+        self.stats.prefill_packed_eager_ms += elapsed_ms
         self._record_shape_time(
             self.stats.prefill_packed_eager_shape_ms,
             profile_shape_key,

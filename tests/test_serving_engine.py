@@ -3836,6 +3836,45 @@ def test_continuous_batch_engine_can_target_packed_ragged_prefill_eager_pattern(
     assert engine.stats.prefill_packed_eager_shape_saved_tokens == {shape_key: 2}
 
 
+def test_continuous_batch_engine_profiles_packed_eager_shapes_without_timing(
+    monkeypatch,
+) -> None:
+    shape_key = "prefix_graph:b2:s4:p0-0:src0:mixed0"
+    pattern_key = f"{shape_key}|p0:s2/p0:s4"
+    monkeypatch.setenv(
+        "TORCHINFERNO_CONTINUOUS_PACKED_RAGGED_PREFILL_EAGER_PATTERN",
+        pattern_key,
+    )
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_QUEUE_PROFILE_JSONL", "/tmp/queue.jsonl")
+    model = _SelectedLogitsToyModel()
+    engine = ContinuousBatchEngine(
+        model,
+        device=torch.device("cpu"),
+        max_active_requests=2,
+        prefix_cache_capacity=0,
+        profile_timings=False,
+    )
+    engine.start_online(max_seq_len=8)
+
+    logits = engine._try_ragged_prefill_logits(
+        torch.tensor([[1, 2, 0, 0], [3, 4, 5, 6]], dtype=torch.long),
+        torch.zeros(2, dtype=torch.long),
+        torch.tensor([0, 1], dtype=torch.long),
+        torch.tensor([1, 3], dtype=torch.long),
+        profile_shape_key=shape_key,
+        packed_prefill_pattern_key=pattern_key,
+    )
+
+    assert logits is not None
+    assert engine.stats.prefill_packed_eager_calls == 1
+    assert engine.stats.prefill_packed_eager_shape_counts == {shape_key: 1}
+    assert engine.stats.prefill_packed_eager_shape_tokens == {shape_key: 6}
+    assert engine.stats.prefill_packed_eager_shape_model_tokens == {shape_key: 8}
+    assert engine.stats.prefill_packed_eager_shape_saved_tokens == {shape_key: 2}
+    assert engine.stats.prefill_packed_eager_ms == 0.0
+    assert engine.stats.prefill_packed_eager_shape_ms == {}
+
+
 def test_continuous_batch_engine_can_opt_into_packed_ragged_prefill_eager_graph(
     monkeypatch,
 ) -> None:

@@ -90,6 +90,33 @@ reuse for this workload and reinforces that the remaining lever is a true
 dynamic packed cached-prefix prefill body or a non-fragmenting scheduler policy,
 not logits reuse or exact-prompt replay.
 
+## Current 20260711 targeted packed-prefill rejection
+
+A shape-targeted multi_turn A/B on pushed `d5c3c19` enabled packed ragged eager
+prefill only for the three hottest profiled shapes:
+`prefix_graph:b32:s32:p55-105:src32:mixed1`,
+`prefix_graph:b32:s32:p45-159:src32:mixed1`, and
+`prefix_graph:b32:s32:p45-88:src32:mixed1`. It wrote
+`/tmp/inference-bench-multi-d5c-packedtop3-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-multi-d5c-packedtop3/runs/20260711_201735`.
+The run stayed clean on shortcut counters and integrity checks, but regressed
+the fair row to `229.7 / 35.9 / 258.6ms`, `4.2 tok/s`, with p99
+TTFT/E2E at `1731.5/1767.3ms`.
+
+The targeted path fired only twice:
+`runtime_prefill_packed_eager_calls=2`,
+`runtime_prefill_packed_eager_tokens=1049`,
+`runtime_prefill_packed_eager_model_tokens=2048`, and
+`runtime_prefill_packed_eager_saved_tokens=999`. That is useful confirmation
+that packed eager can remove padding, but the eager fallback is too sparse and
+too tail-heavy to promote. Keep it diagnostic only until there is a compiled
+dynamic packed cached-prefix body or a scheduler change that avoids fragmented
+mixed-prefix batches.
+
+Queue-profile-only runs now record packed-eager shape counts/tokens/model
+tokens/saved tokens even when CUDA timing is disabled. The timing maps remain
+empty unless timing is enabled, but the non-timing shape maps are enough to
+attribute future packed-eager A/Bs without adding event timing overhead.
+
 ## Current 20260711 decode-many timing default
 
 A current-head TorchInferno-only `long_output` timing run on `2cbbabc`, with
