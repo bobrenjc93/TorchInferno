@@ -11,8 +11,10 @@ The `e887422` generated-prefix chain extension has been reverted, and prompt
 logits are no longer persisted in the reusable-prefix cache by default. OpenAI
 sampled-short serving also no longer auto-enables generated-prefix caching.
 Logits persistence remains available only as an explicit diagnostic opt-in via
-`TORCHINFERNO_CONTINUOUS_PREFIX_CACHE_STORE_LOGITS=1` and should not be used
-for score-facing benchmark runs.
+`TORCHINFERNO_CONTINUOUS_PREFIX_CACHE_STORE_LOGITS=1`. The separate OpenAI
+server exact-prompt logits cache is also opt-in only via
+`TORCHINFERNO_OPENAI_PROMPT_LOGITS_CACHE=1`. Neither path should be used for
+score-facing benchmark runs.
 
 ## Current 20260711 fair sampled-short decode cap
 

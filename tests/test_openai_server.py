@@ -170,6 +170,7 @@ from torchinferno.openai_server import (
     _prefill_repeated_prefix_next_token,
     _prefer_shared_prefix_padded_suffix_prefill,
     _prefers_exact_generation_cache,
+    _prompt_logits_cache_enabled,
     _prompt_list_tensor_payload,
     _queue_profile_sync_timings_enabled,
     _runtime_ragged_decode_graph_capture_allowed_for_request,
@@ -1940,7 +1941,7 @@ def test_tensor_parallel_worker_loop_handles_online_runtime_commands(monkeypatch
         False,
         False,
         0,
-        True,
+        None,
         6,
     )
     assert [
@@ -2422,7 +2423,7 @@ def test_tensor_parallel_worker_loop_receives_online_tensor_commands(monkeypatch
         False,
         False,
         0,
-        True,
+        None,
         6,
     )
     assert [
@@ -4205,7 +4206,8 @@ def test_openai_prefill_repeated_prefix_uses_repeated_sampler() -> None:
     assert model.sample_calls == [((1, 12), 4, 0.7)]
 
 
-def test_openai_identical_prompt_batch_reuses_exact_prompt_logits_cache() -> None:
+def test_openai_identical_prompt_batch_reuses_exact_prompt_logits_cache(monkeypatch) -> None:
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_PROMPT_LOGITS_CACHE", "1")
     model = _PrefixRecordingModel()
     engine = _cache_only_engine()
     engine.model = model
@@ -4235,7 +4237,37 @@ def test_openai_identical_prompt_batch_reuses_exact_prompt_logits_cache() -> Non
     assert model.forward_inputs == [[10, 11]]
 
 
-def test_openai_identical_prompt_logits_cache_defers_kv_restore_until_decode() -> None:
+def test_openai_identical_prompt_batch_does_not_reuse_logits_cache_by_default(monkeypatch) -> None:
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_PROMPT_LOGITS_CACHE", raising=False)
+    model = _PrefixRecordingModel()
+    engine = _cache_only_engine()
+    engine.model = model
+    engine.tokenizer = _PrefixTokenizer()
+    engine.stop_token_ids = frozenset()
+    input_ids = torch.tensor([[10, 11]], dtype=torch.long)
+
+    list(
+        engine._generate_identical_prompt_batch_steps(
+            input_ids,
+            batch_size=3,
+            max_tokens=1,
+            temperature=0.0,
+        )
+    )
+    list(
+        engine._generate_identical_prompt_batch_steps(
+            input_ids,
+            batch_size=3,
+            max_tokens=1,
+            temperature=0.0,
+        )
+    )
+
+    assert model.forward_inputs == [[10, 11], [10, 11]]
+
+
+def test_openai_identical_prompt_logits_cache_defers_kv_restore_until_decode(monkeypatch) -> None:
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_PROMPT_LOGITS_CACHE", "1")
     model = _PrefixRecordingModel()
     engine = _cache_only_engine()
     engine.model = model
@@ -4267,6 +4299,7 @@ def test_openai_identical_prompt_logits_cache_defers_kv_restore_until_decode() -
 
 
 def test_openai_identical_prompt_logits_cache_resamples_temperature_rows(monkeypatch) -> None:
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_PROMPT_LOGITS_CACHE", "1")
     monkeypatch.setenv("TORCHINFERNO_OPENAI_PREFIX_CACHE_SHARED_SAMPLE", "0")
 
     class _RepeatedSamplerModel(_PrefixRecordingModel):
@@ -4389,7 +4422,8 @@ def test_openai_identical_prompt_batch_decodes_uniform_rows_once() -> None:
     assert model.forward_shapes == [(1, 2), (1, 1)]
 
 
-def test_openai_identical_prompt_batch_reuses_uniform_decode_logits_cache() -> None:
+def test_openai_identical_prompt_batch_reuses_uniform_decode_logits_cache(monkeypatch) -> None:
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_PROMPT_LOGITS_CACHE", "1")
     model = _PrefixRecordingModel()
     engine = _cache_only_engine()
     engine.model = model
@@ -4419,7 +4453,8 @@ def test_openai_identical_prompt_batch_reuses_uniform_decode_logits_cache() -> N
     assert model.forward_inputs == [[10, 11], [2]]
 
 
-def test_openai_identical_prompt_uniform_logits_cache_defers_kv_restore() -> None:
+def test_openai_identical_prompt_uniform_logits_cache_defers_kv_restore(monkeypatch) -> None:
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_PROMPT_LOGITS_CACHE", "1")
     model = _PrefixRecordingModel()
     engine = _cache_only_engine()
     engine.model = model
@@ -10337,6 +10372,17 @@ def test_openai_online_decode_quantum_uses_greedy_mid_cap_default(monkeypatch) -
     assert _online_decode_quantum(temperature=0.0, max_tokens=512) == 16
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_DECODE_MANY", "0")
     assert _online_decode_quantum(temperature=0.0, max_tokens=64) == 8
+
+
+def test_openai_prompt_logits_cache_is_opt_in(monkeypatch) -> None:
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_PROMPT_LOGITS_CACHE", raising=False)
+    assert not _prompt_logits_cache_enabled()
+
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_PROMPT_LOGITS_CACHE", "1")
+    assert _prompt_logits_cache_enabled()
+
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_PROMPT_LOGITS_CACHE", "0")
+    assert not _prompt_logits_cache_enabled()
 
 
 def test_openai_online_decode_drain_quantum_scopes_to_short_greedy_decode_many(monkeypatch) -> None:

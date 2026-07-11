@@ -17286,7 +17286,7 @@ def _identical_prompt_cache_pool_enabled(model: object, temperature: float) -> b
 
 
 def _prompt_logits_cache_enabled() -> bool:
-    return env_flag("TORCHINFERNO_OPENAI_PROMPT_LOGITS_CACHE", True)
+    return env_flag("TORCHINFERNO_OPENAI_PROMPT_LOGITS_CACHE", False)
 
 
 def _prefer_shared_prefix_padded_suffix_prefill(

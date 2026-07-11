@@ -5457,7 +5457,8 @@ def test_continuous_batch_engine_suffix_bucket_split_default_scope(monkeypatch) 
     assert sampled_short._prefix_prefill_split_suffix_buckets_enabled()
 
 
-def test_continuous_batch_engine_reuses_exact_common_prompt_without_suffix_prefill() -> None:
+def test_continuous_batch_engine_reuses_exact_common_prompt_without_suffix_prefill(monkeypatch) -> None:
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PREFIX_CACHE_STORE_LOGITS", "1")
     prompt = tuple(range(1, 18))
     model = _SelectedLogitsToyModel()
     engine = ContinuousBatchEngine(
@@ -5490,7 +5491,10 @@ def test_continuous_batch_engine_reuses_exact_common_prompt_without_suffix_prefi
     assert engine.stats.prefix_reuse_tokens == 2 * len(prompt)
 
 
-def test_continuous_batch_engine_chunked_online_reuses_exact_prompt_from_cached_logits() -> None:
+def test_continuous_batch_engine_chunked_online_reuses_exact_prompt_from_cached_logits(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PREFIX_CACHE_STORE_LOGITS", "1")
     prompt = tuple(range(1, 18))
     model = _SelectedLogitsToyModel()
     engine = ContinuousBatchEngine(
@@ -5530,7 +5534,8 @@ def test_continuous_batch_engine_chunked_online_reuses_exact_prompt_from_cached_
     assert engine.stats.prefix_reuse_tokens == reuse_tokens + len(prompt)
 
 
-def test_continuous_batch_engine_exact_prompt_finishes_without_kv_copy() -> None:
+def test_continuous_batch_engine_exact_prompt_finishes_without_kv_copy(monkeypatch) -> None:
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PREFIX_CACHE_STORE_LOGITS", "1")
     prompt = tuple(range(1, 18))
     model = _SelectedLogitsToyModel()
     engine = ContinuousBatchEngine(
@@ -5583,7 +5588,8 @@ def test_continuous_batch_engine_exact_prompt_finishes_without_kv_copy() -> None
     assert not engine.has_online_work()
 
 
-def test_continuous_batch_engine_exact_prompt_uses_repeated_sampler() -> None:
+def test_continuous_batch_engine_exact_prompt_uses_repeated_sampler(monkeypatch) -> None:
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PREFIX_CACHE_STORE_LOGITS", "1")
     prompt = tuple(range(1, 18))
     model = _SelectedLogitsToyModel()
     repeated_calls: list[tuple[int, float]] = []
