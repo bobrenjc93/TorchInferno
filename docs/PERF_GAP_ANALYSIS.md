@@ -26,6 +26,46 @@ that also have `0.0%` fixed coverage. The matching multi_turn artifact has
 gap is not solved by an exact-pattern packed graph; it needs either a broader
 dynamic mixed-prefix body or cheaper model-side common-prefix replay.
 
+## Current 20260711 same-host vLLM 0.23 multi_turn target
+
+A fresh same-host vLLM-only `multi_turn` run was built from the public
+`vllm-project/vllm` checkout at commit `19069bcbd5be` and wrote
+`/tmp/inference-bench-vllm-multi-current-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-vllm-multi-current/runs/20260711_132449`.
+The row landed at `83.6 / 38.3 / 110.7ms`, p99
+`313.9 / 286.0 / 332.7ms`, throughput `11.9 tok/s`, and `982/1000` raw
+correct. The server log used vLLM V1 with prefix caching, chunked prefill
+(`max_num_batched_tokens=8192`), CUDA graph capture sizes through `512`, and
+reported `75.7%` prefix-cache hit rate during the benchmark.
+
+The directly comparable current TorchInferno rows remain in the
+`218-225 / 36-37 / 248-256ms` band with `981-983/1000` raw correct. TPOT is
+therefore already roughly tied with the same-host vLLM build; the score gap is
+median TTFT and E2E. Current queue profiles split that gap into roughly
+`118-125ms` queue-to-submit plus `88-90ms` submit-to-first-token, while vLLM's
+entire median TTFT is `83.6ms`. Treat decode changes as secondary for this
+workload unless they also reduce first-token scheduling or mixed-prefix
+prefill cost.
+
+A scoped recheck of greedy-large initial request collection is rejected.
+Forcing `TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_INITIAL_BATCH_WAIT_MS=1`
+on current `9af4c72` wrote
+`/tmp/inference-bench-ti-multi-initwait1-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-ti-multi-initwait1-9af4c72/runs/20260711_133315`
+and regressed multi_turn to `238.0 / 37.5 / 268.6ms`, `981/1000` raw correct.
+The profile increased p50 queue-to-submit to `130.1ms` and introduced a slow
+`prefix_graph:b32:s16:p45-45:src1:mixed0` group with `534.9ms`
+queue-to-submit. Keep the current zero-wait greedy-large initial policy; the
+remaining gap is not fixed by collecting the first wave.
+
+The model-side packed graph key also keeps fixed-capacity packing out of the
+current score path. `try_prefill_ragged_logits_packed_eager_graph` keys on the
+exact `q_lens` tuple, exact `start_positions`, source-row count, and
+`prefix_copy_len`; the packed attention groups are built at capture time from
+those exact lengths and starts. The current multi_turn profile has zero
+signature/pattern reuse, so fixed-slot or exact-pattern replay is not the right
+promotion target. The next runtime implementation target remains a dynamic-count
+packed mixed-prefix prefill body, or an equivalently cheap common-prefix replay
+path that can vary per-request starts/counts without fragmenting graph captures.
+
 ## Current 20260711 same-host global-vLLM refresh
 
 A same-host vLLM refresh used the globally installed Python at
