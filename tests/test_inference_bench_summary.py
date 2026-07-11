@@ -165,6 +165,10 @@ def _write_inference_bench_run(tmp_path) -> None:
             "static_prefill:logits:b1:t56": 3,
         },
         "runtime_prefill_graph_cache_live_entries": 3,
+        "runtime_prefill_graph_cache_max_entries": 64,
+        "runtime_prefill_graph_cache_evictions": 2,
+        "runtime_prefill_graph_cache_evicted_entries": 4,
+        "runtime_prefill_graph_cache_live_suffix_counts": {"s12": 14, "s96": 2},
         "runtime_prefill_shape_counts": {
             "prefix_graph:b8:s16:p45-45:src1:mixed0": 2,
             "prefix_graph:b4:s16:p45-45:src1:mixed0": 1,
@@ -845,6 +849,12 @@ def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) ->
     assert "prefill_graph_miss" in text
     assert "prefill_miss_kind" in text
     assert "ragged=6,static_logits=3" in text
+    assert "prefill_graph_cache" in text
+    assert "prefill_graph_cache_cap" in text
+    assert "prefill_graph_evictions" in text
+    assert "prefill_graph_evicted" in text
+    assert "prefill_graph_suffix" in text
+    assert "s12=14,s96=2" in text
     assert "decode_graph_miss" in text
     assert "[long_output provider gaps vs torchinferno]" in text
     assert "best_provider" in text

@@ -186,6 +186,10 @@ already `0.0ms` in the control, while the token-only run still executed `59`
 padded prefix graph replays and reported `31.6K` avoidable packed-candidate
 tokens. Keep token-only prefix prefill diagnostic-only; it does not replace the
 needed non-fragmenting cached-prefix prefill body.
+The inference-bench analyzer now prints prefill graph-cache live/capacity,
+eviction, evicted-entry, and live suffix-bucket columns in the compact
+TorchInferno queue table, so future token-only and bucket probes do not require
+manual queue-profile JSON extraction for cache pressure.
 
 ## Current no-sync prefill-shape telemetry
 
