@@ -14118,7 +14118,9 @@ policy. Focused CPU tests cover dense row-index omission, contiguous row
 reordering, decode-many state-sync behavior, online prefill seeding, and the
 direct GPU-buffer reuse path; a full current `tests/test_serving_engine.py` run
 still has two pre-existing clean-head counter assertion failures unrelated to
-this change.
+this change. The research summary now keeps and prints `many_syncs` and
+`many_sync_skips` so public no-sync queue profiles can confirm whether prefill
+seeding eliminated decode-many state uploads.
 
 ## Priority for a focused (non-loop) session
 

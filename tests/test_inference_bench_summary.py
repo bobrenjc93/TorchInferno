@@ -357,6 +357,8 @@ def _write_inference_bench_run(tmp_path) -> None:
         "runtime_decode_many_steps": 6,
         "runtime_decode_many_model_tokens": 24,
         "runtime_decode_many_emitted_tokens": 15,
+        "runtime_decode_many_state_syncs": 1,
+        "runtime_decode_many_state_sync_skips": 3,
         "decode_many_stop_tail_max_steps": 4,
         "decode_many_min_active_pct": 25,
         "decode_many_sync_stops": True,
@@ -835,6 +837,8 @@ def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) ->
     assert "gpu_us_tok" in text
     assert "decode_many_wait_ms" in text
     assert "decode_many_materialize_ms" in text
+    assert "many_syncs" in text
+    assert "many_sync_skips" in text
     assert "pad_call" in text
     assert "2.4" in text
     assert "100.0" in text
