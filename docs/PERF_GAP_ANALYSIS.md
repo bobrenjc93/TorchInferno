@@ -14096,6 +14096,16 @@ pass. This keeps deterministic request-path capture avoidance while avoiding
 the broad `s64/s128` startup cost; the long_output row still needs cheaper
 prefill/decode bodies for a score-facing closure.
 
+No-sync queue profiles now keep prefix-reuse route and hit-length histograms
+populated even when CUDA-synchronized timing is off. The existing compact
+profile already reported `runtime_prefix_reuse_requests/tokens`, but the route
+maps could be empty in public-style runs, hiding whether a multi_turn or
+few_shot row was using common-prefix rows, request-prompt rows, or generated
+prefixes. The research summary now prints `prefix_reuse`, `prefix_reuse_tok`,
+`prefix_routes`, and `prefix_hits` beside the generated-prefix counters. This is
+telemetry only; it does not change prefix lookup, prefill grouping, or serving
+behavior.
+
 ## Priority for a focused (non-loop) session
 
 1. Prefill MFU (Issue 1) — biggest TTFT lever, ~2x, affects 3/5 benchmarks.

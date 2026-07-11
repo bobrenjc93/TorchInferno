@@ -9046,10 +9046,8 @@ class ContinuousBatchEngine:
         prefix_hit_tokens: int,
         reusable: _ReusablePrefix | None,
     ) -> None:
-        route_kind = (
-            self._prefix_reuse_route_kind(reusable.route_id if reusable is not None else None)
-            if self.profile_timings or _queue_profile_counts_enabled()
-            else None
+        route_kind = self._prefix_reuse_route_kind(
+            reusable.route_id if reusable is not None else None
         )
         self._record_prefix_reuse_total(prefix_hit_tokens, route_kind=route_kind, count=1)
 
@@ -9059,26 +9057,19 @@ class ContinuousBatchEngine:
     ) -> None:
         request_count = 0
         token_count = 0
-        grouped_counts: dict[tuple[int, str], int] | None = (
-            defaultdict(int)
-            if self.profile_timings or _queue_profile_counts_enabled()
-            else None
-        )
+        grouped_counts: dict[tuple[int, str], int] = defaultdict(int)
         for prefix_hit_tokens, reusable in entries:
             hit_tokens = int(prefix_hit_tokens)
             request_count += 1
             token_count += hit_tokens
-            if grouped_counts is not None:
-                route_kind = self._prefix_reuse_route_kind(
-                    reusable.route_id if reusable is not None else None
-                )
-                grouped_counts[(hit_tokens, route_kind)] += 1
+            route_kind = self._prefix_reuse_route_kind(
+                reusable.route_id if reusable is not None else None
+            )
+            grouped_counts[(hit_tokens, route_kind)] += 1
         if request_count <= 0:
             return
         self.stats.prefix_reuse_requests += request_count
         self.stats.prefix_reuse_tokens += token_count
-        if grouped_counts is None:
-            return
         for (hit_tokens, route_kind), count in grouped_counts.items():
             self._record_prefix_reuse_profile_counts(hit_tokens, route_kind=route_kind, count=count)
 
@@ -9095,8 +9086,6 @@ class ContinuousBatchEngine:
         hit_tokens = int(prefix_hit_tokens)
         self.stats.prefix_reuse_requests += count
         self.stats.prefix_reuse_tokens += hit_tokens * count
-        if not (self.profile_timings or _queue_profile_counts_enabled()):
-            return
         self._record_prefix_reuse_profile_counts(
             hit_tokens,
             route_kind=route_kind or "none",
@@ -9110,15 +9099,12 @@ class ContinuousBatchEngine:
         route_kind: str,
         count: int,
     ) -> None:
-        self._record_queue_profile_shape_total(
-            self.stats.prefix_reuse_route_counts,
-            route_kind,
-            count,
+        self.stats.prefix_reuse_route_counts[route_kind] = (
+            self.stats.prefix_reuse_route_counts.get(route_kind, 0) + int(count)
         )
-        self._record_queue_profile_shape_total(
-            self.stats.prefix_reuse_hit_token_counts,
-            str(int(prefix_hit_tokens)),
-            count,
+        hit_key = str(int(prefix_hit_tokens))
+        self.stats.prefix_reuse_hit_token_counts[hit_key] = (
+            self.stats.prefix_reuse_hit_token_counts.get(hit_key, 0) + int(count)
         )
 
     def _record_prefix_graph_route_totals(

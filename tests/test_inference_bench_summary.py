@@ -146,6 +146,13 @@ def _write_inference_bench_run(tmp_path) -> None:
         "runtime_prefill_packed_candidate_calls": 4,
         "runtime_prefill_packed_candidate_saved_tokens": 20,
         "runtime_prefill_packed_candidate_groups": 11,
+        "runtime_prefix_reuse_requests": 5,
+        "runtime_prefix_reuse_tokens": 64,
+        "runtime_prefix_reuse_route_counts": {
+            "common_prefix": 3,
+            "request_prompt": 2,
+        },
+        "runtime_prefix_reuse_hit_token_counts": {"16": 3, "8": 2},
         "runtime_prefill_suffix_split_candidate_calls": 3,
         "runtime_prefill_suffix_split_candidate_saved_tokens": 42,
         "runtime_prefill_suffix_split_accepted_calls": 2,
@@ -805,6 +812,12 @@ def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) ->
     assert "packed_eager_ms" in text
     assert "packed_eager_saved" in text
     assert "packed_cand_saved" in text
+    assert "prefix_reuse" in text
+    assert "prefix_reuse_tok" in text
+    assert "prefix_routes" in text
+    assert "common_prefix=3,request_prompt=2" in text
+    assert "prefix_hits" in text
+    assert "16=3,8=2" in text
     assert "prefill_setup_ms" in text
     assert "prefill_copy_ms" in text
     assert "prefill_sample_ms" in text

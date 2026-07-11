@@ -1297,6 +1297,8 @@ def test_continuous_batch_engine_runs_requests_with_prefix_hits() -> None:
     assert results[2].prefix_hit_tokens == 0
     assert engine.stats.prefix_reuse_tokens == 3
     assert engine.stats.prefix_reuse_requests == 1
+    assert engine.stats.prefix_reuse_route_counts == {"request_prompt": 1}
+    assert engine.stats.prefix_reuse_hit_token_counts == {"3": 1}
     assert engine.stats.max_model_batch_size == 2
     assert engine.stats.decode_model_calls < 3
     assert engine.stats.persistent_cache_rows == 4
