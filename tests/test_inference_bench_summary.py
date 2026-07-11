@@ -1399,6 +1399,16 @@ def test_packed_prefill_estimate_excludes_observed_packed_cost() -> None:
     assert (
         _prefill_shape_dense_forward_ms(
             {
+                "runtime_prefill_graph_replay_gpu_ms": 50.0,
+                "runtime_prefill_shape_model_tokens": {"shape": 64, "other": 36},
+            },
+            "shape",
+        )
+        == 32.0
+    )
+    assert (
+        _prefill_shape_dense_forward_ms(
+            {
                 "runtime_prefill_shape_graph_replay_gpu_ms": {"shape": 5.0},
                 "runtime_prefill_packed_eager_shape_ms": {"shape": 1.25},
             },
@@ -1444,6 +1454,38 @@ def test_dynamic_packed_prefill_targets_use_gpu_replay_timing_without_sync() -> 
 
     assert rows == [
         ("0.0", "512", pattern, "2", "16", "0", "0.0%", "8", "20.0%", "-")
+    ]
+
+
+def test_dynamic_packed_prefill_targets_estimate_older_runs_from_total_replay() -> None:
+    shape = "prefix_graph:b4:s8:p10-10:src1:mixed0"
+    other_shape = "prefix_graph:b4:s8:p11-11:src1:mixed0"
+    pattern = f"{shape}|p10:s6/p10:s8"
+    rows = _prefill_packed_dynamic_target_rows(
+        [
+            QueueProfileSummary(
+                event="online_batcher_quiescent",
+                temperature=0.0,
+                max_tokens=512,
+                submitted_requests=8,
+                finished_events=8,
+                fields={
+                    "runtime_prefill_forward_ms": 0.0,
+                    "runtime_prefill_graph_replay_gpu_ms": 40.0,
+                    "runtime_prefill_shape_model_tokens": {
+                        shape: 64,
+                        other_shape: 64,
+                    },
+                    "runtime_prefill_packed_candidate_pattern_counts": {pattern: 2},
+                    "runtime_prefill_packed_candidate_pattern_model_tokens": {pattern: 64},
+                    "runtime_prefill_packed_candidate_pattern_saved_tokens": {pattern: 16},
+                },
+            )
+        ]
+    )
+
+    assert rows == [
+        ("0.0", "512", pattern, "2", "16", "0", "0.0%", "5", "12.5%", "-")
     ]
 
 

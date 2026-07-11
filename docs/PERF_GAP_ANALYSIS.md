@@ -15016,6 +15016,16 @@ rate, while SGLang exposed `429` prefill batches with `71.5%` cached tokens.
 That keeps the cross-provider evidence focused on normal prefix-cache and
 prefill scheduling behavior rather than benchmark-specific shortcuts.
 
+For older public queue profiles that lack per-shape no-sync GPU replay timing,
+the packed-prefill target tables now estimate shape milliseconds by allocating
+total prefill graph replay GPU time across `runtime_prefill_shape_model_tokens`.
+Re-rendering the latest public long_output run (`20260711_190237`) now assigns
+concrete value to the padded `p111` cached-prefix suffix bodies: the largest
+per-batch targets estimate `455.1ms`, `430.5ms`, `398.0ms`, and `346.7ms` of
+prefill replay GPU time. The estimate is intentionally proportional and
+analysis-only, but it keeps old public artifacts useful for ranking the same
+non-fragmenting packed-prefix implementation target.
+
 ## Priority for a focused (non-loop) session
 
 1. Prefill MFU (Issue 1) — biggest TTFT lever, ~2x, affects 3/5 benchmarks.

@@ -3798,12 +3798,33 @@ def _prefill_shape_dense_forward_ms(
             shape_key,
         )
     if shape_ms is None:
+        shape_ms = _prefill_shape_forward_ms_from_total_gpu_replay(fields, shape_key)
+    if shape_ms is None:
         return None
     dense_ms = max(0.0, float(shape_ms))
     packed_ms = _prefill_shape_observed_packed_ms(fields, shape_key)
     if packed_ms is not None:
         dense_ms = max(0.0, dense_ms - packed_ms)
     return dense_ms
+
+
+def _prefill_shape_forward_ms_from_total_gpu_replay(
+    fields: dict[str, Any],
+    shape_key: str,
+) -> float | None:
+    total_ms = _prefill_total_dense_forward_ms(fields)
+    if total_ms is None or total_ms <= 0.0:
+        return None
+    shape_model_tokens = _mapping_value(
+        fields.get("runtime_prefill_shape_model_tokens"),
+        shape_key,
+    )
+    if shape_model_tokens is None or shape_model_tokens <= 0:
+        return None
+    total_model_tokens = _sum_numeric_mapping(fields.get("runtime_prefill_shape_model_tokens"))
+    if total_model_tokens is None or total_model_tokens <= 0.0:
+        return None
+    return float(total_ms) * float(shape_model_tokens) / float(total_model_tokens)
 
 
 def _prefill_total_dense_forward_ms(fields: dict[str, Any]) -> float | None:
