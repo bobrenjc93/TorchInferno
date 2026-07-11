@@ -455,7 +455,20 @@ def _online_kv_bounded_concurrency_enabled(*, temperature: float, max_tokens: in
 def _online_kv_bounded_max_active_cap(*, temperature: float, base_cap: int) -> int:
     cap = max(1, int(base_cap))
     if temperature > 0.0:
-        return cap
+        sampled_cap_env = "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_KV_MAX_ACTIVE_CAP"
+        if sampled_cap_env in os.environ:
+            return min(cap, env_int(sampled_cap_env, cap, minimum=1))
+        if "TORCHINFERNO_OPENAI_TP_ONLINE_KV_MAX_ACTIVE_CAP" in os.environ:
+            return cap
+        # Sampled short bursts still need a logits decode for stop/EOS. Keep the
+        # boosted active cap inside the CUDA-graph decode envelope by default;
+        # larger non-graphed batches fall back to eager decode and raise latency.
+        decode_graph_cap = env_int(
+            "TORCHINFERNO_CUDAGRAPH_DECODE_STEP_MAX_BATCH",
+            64,
+            minimum=1,
+        )
+        return min(cap, decode_graph_cap)
     greedy_cap_env = "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_KV_MAX_ACTIVE_CAP"
     if greedy_cap_env in os.environ:
         return min(cap, env_int(greedy_cap_env, cap, minimum=1))

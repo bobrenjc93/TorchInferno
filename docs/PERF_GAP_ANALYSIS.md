@@ -14,6 +14,24 @@ Logits persistence remains available only as an explicit diagnostic opt-in via
 `TORCHINFERNO_CONTINUOUS_PREFIX_CACHE_STORE_LOGITS=1` and should not be used
 for score-facing benchmark runs.
 
+## Current 20260711 fair sampled-short decode cap
+
+After the logits-cache reset, self_consistency fell back to normal model
+execution and exposed a scheduler mismatch: sampled-short KV-bounded admission
+raised `max_active` to `105`, but Llama3 ragged decode CUDA graphs are capped
+at `TORCHINFERNO_CUDAGRAPH_DECODE_STEP_MAX_BATCH=64` by default. The stop/EOS
+decode therefore ran eager at `ragged_decode:logits:b105`, producing a fair but
+slow local row: `267.7 / 0.0 / 353.4ms`, `2.8 tok/s`, `1000/1000` correct.
+
+An A/B that capped sampled-short active rows at `64` kept all generated-prefix
+and prefix-logits reuse counters at zero, moved the decode path to `52/52`
+graph hits with no decode graph misses, and improved the local fair row to
+`94.2 / 0.0 / 118.8ms`, `8.4 tok/s`, `1000/1000` correct. The default sampled
+KV max-active cap now follows the configured decode graph max batch, with
+explicit sampled/global cap env vars still taking precedence. The patched
+default reproduced the result at `93.0 / 0.0 / 117.0ms`, `8.5 tok/s`, with
+`50/50` decode graph hits and no logits-reuse counters.
+
 ## Current 20260711 prefix-copy volume refresh
 
 The latest public run remains `20260711_132252`. A current-head TorchInferno

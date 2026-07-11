@@ -10965,13 +10965,23 @@ def test_online_kv_bounded_concurrency_defaults_to_short_outputs(monkeypatch) ->
 
 def test_online_kv_bounded_max_active_cap_targets_greedy(monkeypatch) -> None:
     monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_KV_MAX_ACTIVE_CAP", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_KV_MAX_ACTIVE_CAP", raising=False)
     monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_KV_MAX_ACTIVE_CAP", raising=False)
     monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_TOTAL_ROWS_BUDGET", raising=False)
     monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_KV_MIN_PREFIX_ROWS", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_CUDAGRAPH_DECODE_STEP_MAX_BATCH", raising=False)
 
     assert _online_kv_bounded_max_active_cap(temperature=0.0, base_cap=128) == 64
-    assert _online_kv_bounded_max_active_cap(temperature=0.7, base_cap=128) == 128
+    assert _online_kv_bounded_max_active_cap(temperature=0.7, base_cap=128) == 64
     assert _online_kv_bounded_max_active_cap(temperature=0.0, base_cap=80) == 64
+
+    monkeypatch.setenv("TORCHINFERNO_CUDAGRAPH_DECODE_STEP_MAX_BATCH", "96")
+    assert _online_kv_bounded_max_active_cap(temperature=0.7, base_cap=128) == 96
+    monkeypatch.delenv("TORCHINFERNO_CUDAGRAPH_DECODE_STEP_MAX_BATCH", raising=False)
+
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_KV_MAX_ACTIVE_CAP", "112")
+    assert _online_kv_bounded_max_active_cap(temperature=0.7, base_cap=128) == 112
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_KV_MAX_ACTIVE_CAP", raising=False)
 
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_KV_MAX_ACTIVE_CAP", "112")
     assert _online_kv_bounded_max_active_cap(temperature=0.0, base_cap=128) == 112
@@ -10979,6 +10989,7 @@ def test_online_kv_bounded_max_active_cap_targets_greedy(monkeypatch) -> None:
     monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_KV_MAX_ACTIVE_CAP", raising=False)
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_KV_MAX_ACTIVE_CAP", "128")
     assert _online_kv_bounded_max_active_cap(temperature=0.0, base_cap=128) == 128
+    assert _online_kv_bounded_max_active_cap(temperature=0.7, base_cap=128) == 128
 
     monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_KV_MAX_ACTIVE_CAP", raising=False)
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_TOTAL_ROWS_BUDGET", "0")
