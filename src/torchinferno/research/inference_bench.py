@@ -337,6 +337,7 @@ class PercentileSummary:
 class ProviderBenchmarkSummary:
     provider: str
     benchmark: str
+    commit_hash: str
     metrics: dict[str, float]
     request_percentiles: dict[str, PercentileSummary]
     request_waves: tuple["RawRequestWaveSummary", ...] = ()
@@ -437,6 +438,7 @@ def summarize_inference_bench_run(
     provider_benchmarks: list[ProviderBenchmarkSummary] = []
     for provider in selected_providers:
         provider_data = provider_map.get(provider, {})
+        commit_hash = str(provider_data.get("commit_hash") or "")
         benchmark_map = provider_data.get("benchmarks", {})
         for benchmark in selected_benchmarks:
             benchmark_data = benchmark_map.get(benchmark)
@@ -447,6 +449,7 @@ def summarize_inference_bench_run(
                 ProviderBenchmarkSummary(
                     provider=provider,
                     benchmark=benchmark,
+                    commit_hash=commit_hash,
                     metrics=_numeric_dict(benchmark_data.get("metrics", {})),
                     request_percentiles=_summarize_raw_requests(raw_requests),
                     request_waves=_summarize_raw_request_waves(raw_requests),
@@ -481,6 +484,7 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
         lines.append(f"[{benchmark}]")
         header = (
             "provider",
+            "commit",
             "score_ttft",
             "score_tpot",
             "score_e2e",
@@ -494,6 +498,7 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
             body.append(
                 (
                     row.provider,
+                    _fmt_commit(row.commit_hash),
                     _fmt_metric(row, "ttft_median_ms", fallback_metric="ttft_ms"),
                     _fmt_metric(row, "tpot_median_ms", fallback_metric="tpot_ms"),
                     _fmt_metric(row, "e2e_median_ms", fallback_metric="e2e_latency_ms"),
@@ -2632,6 +2637,10 @@ def _fmt_ratio(value: float | None) -> str:
     if value is None:
         return "-"
     return f"{value:.2f}x"
+
+
+def _fmt_commit(value: str) -> str:
+    return value[:7] if value else "-"
 
 
 def _fmt_rate(value: Any) -> str:

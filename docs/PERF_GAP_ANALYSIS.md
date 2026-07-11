@@ -96,6 +96,9 @@ self_consistency (`23.9 / 0.0 / 24.5ms`), then timed out in multi_turn. The
 server log shows a rank-0 CUDA launch failure and NCCL watchdog termination;
 tree_of_thought and long_output were connection-refused aftermath, not
 score-facing measurements of the current runtime.
+The inference-bench research summary now prints the provider commit beside each
+score row, so this stale-public-run condition is visible directly in the table
+instead of requiring a manual `results.json` inspection.
 
 The first current-head same-host `long_output` comparison on pushed `88df304`
 identified the actionable gap:

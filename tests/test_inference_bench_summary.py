@@ -24,6 +24,7 @@ def _write_inference_bench_run(tmp_path) -> None:
         "hardware": "8xH100",
         "providers": {
             "torchinferno": {
+                "commit_hash": "abcdef1234567890",
                 "benchmarks": {
                     "long_output": {
                         "metrics": {
@@ -55,6 +56,7 @@ def _write_inference_bench_run(tmp_path) -> None:
                 }
             },
             "vllm": {
+                "commit_hash": "123456abcdef0000",
                 "benchmarks": {
                     "long_output": {
                         "metrics": {"ttft_median_ms": 12.0},
@@ -761,6 +763,7 @@ def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) ->
     assert summary.providers == ("torchinferno", "vllm")
     assert summary.benchmarks == ("long_output",)
     torch_row = next(row for row in summary.provider_benchmarks if row.provider == "torchinferno")
+    assert torch_row.commit_hash == "abcdef1234567890"
     assert torch_row.request_percentiles["ttft_ms"].p50 == 10.0
     assert torch_row.request_percentiles["ttft_ms"].p90 == 10.0
     assert torch_row.request_percentiles["output_tokens"].maximum == 6.0
@@ -839,6 +842,9 @@ def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) ->
 
     text = format_inference_bench_summary(summary)
     assert "[long_output]" in text
+    assert "commit" in text
+    assert "abcdef1" in text
+    assert "123456a" in text
     assert "score_tpot" in text
     assert "4.0" in text
     assert "torchinferno" in text
