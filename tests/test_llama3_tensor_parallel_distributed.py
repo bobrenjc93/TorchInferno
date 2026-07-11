@@ -2222,10 +2222,36 @@ def test_llama3_tensor_parallel_packed_ragged_prefill_graph_waits_for_reuse(
         prefix_copy_len=4,
         capture_on_miss=True,
     )
+    changed_q_lens = torch.tensor([1, 3], dtype=torch.long)
+    changed_logit_positions = changed_q_lens - 1
+    first_changed = model._run_packed_ragged_prefill_logits_graph(
+        input_ids,
+        cache,
+        seq_lens=seq_lens,
+        q_lens=changed_q_lens,
+        row_indices=row_indices,
+        logit_positions=changed_logit_positions,
+        src_prefix_row=None,
+        prefix_copy_len=4,
+        capture_on_miss=True,
+    )
+    second_changed = model._run_packed_ragged_prefill_logits_graph(
+        input_ids,
+        cache,
+        seq_lens=seq_lens,
+        q_lens=changed_q_lens,
+        row_indices=row_indices,
+        logit_positions=changed_logit_positions,
+        src_prefix_row=None,
+        prefix_copy_len=4,
+        capture_on_miss=True,
+    )
 
     assert first is None
     assert second is logits
-    assert capture_calls == [((2, 3), (0, 0))]
+    assert first_changed is None
+    assert second_changed is logits
+    assert capture_calls == [((2, 3), (0, 0)), ((1, 3), (0, 0))]
 
 
 def test_llama3_tensor_parallel_packed_ragged_prefill_matches_padded_oracle(tmp_path, monkeypatch) -> None:
