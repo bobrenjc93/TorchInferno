@@ -275,6 +275,34 @@ exact-filter artifact surfaces the same evidence directly:
 `prefill_replay b24/s64`, `83.4ms` self CUDA, `24.6ms` allreduce (`29.5%`),
 `27.4ms` GEMM/NVJET buckets (`32.9%`), `7.1ms` add/RMS, and `0.7ms` softmax.
 
+## Public 20260711_132252 multi_turn fixed-capacity rejection
+
+The public pointer advanced to
+`results/v1/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100/runs/20260711_132252`.
+TorchInferno was still built from `9af4c72`, but it completed the full suite:
+`5/20` score cells versus vLLM `13/20` and SGLang `1/20`. The score-facing
+multi_turn row improved to `189.6 / 35.4 / 218.2ms`; vLLM remained ahead on
+TTFT/E2E at `90.6 / 54.9 / 126.4ms`.
+
+The TorchInferno queue profile keeps fixed-capacity packed prefill rejected for
+this multi_turn gap. It had `35` prefill model calls, `34` graph hits, zero
+prefill graph misses, `33` mixed-prefix candidate waves, and `15.9K` avoidable
+packed-candidate tokens (`16.1K` real suffix tokens over `32.0K` dense model
+tokens). However, `runtime_prefill_packed_candidate_pattern_keys=33` and
+`runtime_prefill_packed_candidate_pattern_repeated_keys=0`, so a fixed-capacity
+graph keyed by the observed `(prefix_start, suffix_len)` pattern would not
+replay. The repeated unit is the broad `b32:s32:src32:mixed1` dense shape, not
+the exact packed pattern.
+
+A dirty local probe with
+`TORCHINFERNO_CONTINUOUS_PACKED_RAGGED_PREFILL_FIXED_CAPACITY_GRAPH=1` and
+one-call packed graph capture was interrupted before benchmark traffic. It had
+already expanded startup common-prefix suffix warmup to `100.1s`, while the
+public no-env run reported `37.6s` for the same stage. Even if mixed-source
+dummy slots were made legal, this does not solve the current multi_turn shape:
+the profile needs a dynamic packed prefill body, fewer first-token prefill
+waves, or a queueing change that avoids increasing graph-shape warmup.
+
 ## Current 20260711 greedy-short batch-bucket rejection
 
 After the decode-many state-sync fix (`829b227`/`1369e8f`), the remaining
