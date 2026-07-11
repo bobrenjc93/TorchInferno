@@ -132,6 +132,19 @@ and regressed to `223.0 / 22.2 / 1014.9ms`, with
 ordinary cached-prefix suffix prefill body plus high-active decode-many replay,
 not more admission collection tuning.
 
+A current-head greedy-short admission-cap sweep also keeps the default at `24`.
+Lowering `TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_ADMIT_PER_STEP_CAP` to
+`16` on `e4b6fa8` wrote
+`/tmp/inference-bench-long-output-admit16-e4b6fa8-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-long-output-admit16-e4b6fa8/runs/20260711_072240`
+and improved first token to `203.9ms`, p99 `456.1ms`, by replacing `b24` waves
+with `b16` waves (`q2submit=88.9ms`, `submit2first=89.1ms`). It still
+regressed TPOT/E2E to `22.6 / 971.9ms` because prefill batches rose to `74`.
+The midpoint cap `20` wrote
+`/tmp/inference-bench-long-output-admit20-e4b6fa8-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-long-output-admit20-e4b6fa8/runs/20260711_072924`
+and regressed harder to `217.0 / 22.8 / 1020.2ms` with `65` prefill batches,
+`132` decode-many calls, and `582` decode-many steps. Do not lower the default
+below `24` without a non-fragmenting cached-prefix prefill body.
+
 ## Current no-sync prefill-shape telemetry
 
 A dirty-tree telemetry validation after `be39510` wrote
