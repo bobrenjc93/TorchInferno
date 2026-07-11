@@ -14412,6 +14412,54 @@ path. This does not close the score-facing long_output gap, but it reduces
 public-run timeout risk and removes startup graph work that greedy serving does
 not use.
 
+Fixed-capacity packed prefill now accepts multi-source mixed-prefix batches
+when no dummy slots are required. The runtime reorders source prefix rows into
+fixed-capacity slot order and rejects only the unsafe multi-source dummy-slot
+case. Focused CPU coverage checks both the accepted no-dummy path and the
+dummy-slot rejection, and the patch was pushed as `a50cbaf`. This is an
+enabling correctness cleanup, not a current multi_turn score mover: current
+`a50cbaf` profiles still show `34-35` packed candidate calls with zero repeated
+pattern/signature reuse, so the fixed-capacity graph path does not naturally
+replay on the benchmark's mixed-prefix sequence.
+
+Lowering the 512-token greedy decode quantum is rejected for current
+multi_turn. A first probe with
+`TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_MID_GEN_DECODE_QUANTUM=8` did not apply
+to the 512-token class and behaved like the `decode_q=16` control:
+`/tmp/inference-bench-ti-multi-dq8-results/.../runs/20260711_124509` landed at
+`225.3 / 38.5 / 258.6ms`, `981/1000` correct. The correctly scoped global
+`TORCHINFERNO_OPENAI_TP_ONLINE_DECODE_QUANTUM=8` probe
+`/tmp/inference-bench-ti-multi-globaldq8-results/.../runs/20260711_125023`
+reported `decode_q=8`, but landed worse at `229.6 / 37.2 / 260.0ms`,
+`983/1000` correct, with `q2submit_p50=127.5ms`. Keep the 512-token greedy
+default at `decode_q=16`.
+
+Current-head suffix-bucket split profiling keeps the split default closed for
+multi_turn. A no-behavior profile on `a50cbaf`
+`/tmp/inference-bench-ti-multi-split-candidates-results/.../runs/20260711_130140`
+landed at `218.2 / 36.7 / 247.7ms`, `979/1000` correct. It found only `33`
+split candidates: `25` had no model-token savings, and the positive candidates
+could save just `2.7K` model tokens under the existing `min_group=2` guard.
+Enabling exactly that constrained split policy
+(`TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SPLIT_SUFFIX_BUCKETS=1`,
+`MIN_GROUP=2`, `MIN_FILL_PCT=75`) wrote
+`/tmp/inference-bench-ti-multi-split-enabled-results/.../runs/20260711_130651`
+and regressed to `235.3 / 37.9 / 269.6ms`, `983/1000` correct, with p99
+TTFT/E2E around `972/1004ms`. The queue profile accepted only `5` splits,
+saved `1.5K` model tokens, but introduced `7` request-path ragged-prefill graph
+misses across new `b16`, `b32:s16`, and tiny `b2/b3` mixed-prefix shapes.
+Token savings do not compensate for graph fragmentation; do not promote
+suffix-bucket splitting for greedy-large mixed-prefix traffic.
+
+Disabling prefill-ready-before-decode for the same 512-token greedy class is
+also rejected on current head. The scoped run
+`/tmp/inference-bench-ti-multi-prbd0-results/.../runs/20260711_131204` landed
+at `224.8 / 36.6 / 254.2ms`, `981/1000` correct. Runtime telemetry was
+essentially the same as the current default band (`q2first_p50=215.3ms`,
+`q2submit_p50=125.0ms`, `submit2first_p50=88.4ms`, one small
+`ragged_prefill:b2:s16:rows0:ctx-64:src1` miss), so the current
+prefill-ready cap-8 policy remains the better default tradeoff.
+
 ## Priority for a focused (non-loop) session
 
 1. Prefill MFU (Issue 1) — biggest TTFT lever, ~2x, affects 3/5 benchmarks.
