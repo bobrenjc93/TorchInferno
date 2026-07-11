@@ -1,5 +1,26 @@
 # TorchInferno vs vLLM/sglang — Performance Gap Analysis (Llama-3.1-70B, 8xH100)
 
+## Current 20260711 greedy-short batch-bucket rejection
+
+After the decode-many state-sync fix (`829b227`/`1369e8f`), the remaining
+long_output prefill profile showed hot `b24:s64` and `b24:s96` common-prefix
+waves with `8.1K` row-padding tokens and `21.3K` suffix-padding tokens. A
+mechanical replay of the observed real-batch counts suggested that adding
+greedy-short batch buckets `18,20,22` would reduce prefix-graph model tokens
+from `74,048` to about `68,480`, saving `5,568` slots.
+
+The default-bucket A/B is rejected. The local run
+`/tmp/inference-bench-local-greedy-buckets-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-greedy-buckets/runs/20260711_091525`
+used `1,2,4,8,16,18,20,22,24,32` for greedy-short prefill. Startup warmed the
+new shapes (`90` greedy-short common-prefix suffix shapes) and spent `168.9s`
+in that warmup stage, then aborted before serving traffic while entering the
+existing greedy-large warmup. The launcher reported worker SIGABRTs with a
+symmetric-memory allocator traceback. Keep the greedy-short default at
+`1,2,4,8,16,24,32`; the extra buckets trade a modest row-padding reduction for
+more startup graph and memory pressure. The next prefill target should remove
+padding without multiplying warmed graph shapes, for example a robust packed
+prefill body or a lower-fragmentation admission policy.
+
 ## Public 20260711_030227 stale TorchInferno failure and first-token shape attribution
 
 The latest public pointer advanced to
