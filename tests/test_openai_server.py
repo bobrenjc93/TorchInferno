@@ -170,7 +170,6 @@ from torchinferno.openai_server import (
     _prefill_repeated_prefix_next_token,
     _prefer_shared_prefix_padded_suffix_prefill,
     _prefers_exact_generation_cache,
-    _prompt_logits_cache_enabled,
     _prompt_list_tensor_payload,
     _queue_profile_sync_timings_enabled,
     _runtime_ragged_decode_graph_capture_allowed_for_request,
@@ -10372,17 +10371,6 @@ def test_openai_online_decode_quantum_uses_greedy_mid_cap_default(monkeypatch) -
     assert _online_decode_quantum(temperature=0.0, max_tokens=512) == 16
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_DECODE_MANY", "0")
     assert _online_decode_quantum(temperature=0.0, max_tokens=64) == 8
-
-
-def test_openai_prompt_logits_cache_flag_is_inert(monkeypatch) -> None:
-    monkeypatch.delenv("TORCHINFERNO_OPENAI_PROMPT_LOGITS_CACHE", raising=False)
-    assert not _prompt_logits_cache_enabled()
-
-    monkeypatch.setenv("TORCHINFERNO_OPENAI_PROMPT_LOGITS_CACHE", "1")
-    assert not _prompt_logits_cache_enabled()
-
-    monkeypatch.setenv("TORCHINFERNO_OPENAI_PROMPT_LOGITS_CACHE", "0")
-    assert not _prompt_logits_cache_enabled()
 
 
 def test_openai_online_decode_drain_quantum_scopes_to_short_greedy_decode_many(monkeypatch) -> None:

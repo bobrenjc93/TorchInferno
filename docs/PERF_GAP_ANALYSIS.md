@@ -12,8 +12,9 @@ runtime reusable-prefix cache no longer stores or samples prompt/generated
 logits. Full-prompt KV hits are capped to `len(prompt) - 1` so the final prompt
 token is replayed through the model before sampling. OpenAI sampled-short
 serving also no longer auto-enables generated-prefix caching. The separate
-legacy OpenAI server exact-prompt logits cache flag
-`TORCHINFERNO_OPENAI_PROMPT_LOGITS_CACHE=1` is now inert as well.
+legacy OpenAI server exact-prompt logits cache implementation has been removed;
+`TORCHINFERNO_OPENAI_PROMPT_LOGITS_CACHE=1` is ignored rather than being a
+hidden opt-in.
 
 The benchmark harness now also forces those score-facing caches off for
 TorchInferno provider runs. inference-bench `034494c0` sets
@@ -31,8 +32,11 @@ A follow-up hardening pass makes the runtime generated-prefix cache gate itself
 inert. The old constructor/env flags can no longer disable decode-many or
 decode graph capture after the cached-logits implementation has been removed;
 ordinary KV prefix reuse and finished-prefix KV diagnostics remain separate.
+The OpenAI prompt-logits cache code path has also been deleted, leaving only
+ordinary KV prefix cache materialization plus fresh prompt/decode logits
+sampling.
 
-The latest public post-reset run,
+An earlier public post-reset run,
 `results/.../runs/20260711_170752`, built TorchInferno at `0ba2517` and no
 longer shows the suspicious single-token throughput band. Self_consistency is a
 fair narrow TorchInferno win at `70.4 / 0.0 / 89.1ms`, `11.2 tok/s`, versus
@@ -44,6 +48,47 @@ gap at TorchInferno `193.7 / 19.0 / 845.2ms`, `40.7 tok/s`, versus vLLM
 `runtime_generated_prefix_reuse_tokens=0`, and
 `runtime_prompt_lookup_accepted_tokens=0`; remaining reuse is ordinary
 `common_prefix` KV reuse.
+
+The latest public run,
+`results/.../runs/20260711_190237`, built TorchInferno at `49107ad` and
+reported TorchInferno `4/20`, vLLM `15/20`, SGLang `0/20`. The fair gaps are
+now multi_turn (`191.1 / 36.0 / 221.6ms`, `5.1 tok/s` versus vLLM
+`75.6 / 34.2 / 102.5ms`, `13.0 tok/s`), tree_of_thought
+(`53.5 / 35.2 / 74.9ms` versus vLLM `34.0 / 22.7 / 51.4ms`), and long_output
+(`185.3 / 19.0 / 843.1ms`, `41.2 tok/s` versus vLLM
+`46.1 / 15.2 / 572.4ms`, `61.6 tok/s`). The inference-bench integrity checker
+found zero TorchInferno logits-cache warnings on this run, and all generated
+prefix, prompt lookup, and repeated-sample-state counters were zero.
+
+## Current 20260711 multi-turn prefill profile
+
+A current-head TorchInferno-only `multi_turn` profile on `a95aa93` wrote
+`/tmp/inference-bench-multi-a95-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-multi-a95/runs/20260711_200146`.
+It landed at `222.5 / 38.0 / 251.8ms`, `4.4 tok/s`, `983/1000` correct. The
+profile is still clean on shortcut counters:
+`runtime_generated_prefix_store_requests=0`,
+`runtime_generated_prefix_reuse_requests=0`,
+`runtime_prompt_lookup_accepted_tokens=0`, and
+`runtime_repeated_sample_state_hits=0`.
+
+Disabling CUDA-event GPU attribution with
+`TORCHINFERNO_CONTINUOUS_PREFILL_GRAPH_GPU_EVENT_TIMING=0` and
+`TORCHINFERNO_CONTINUOUS_DECODE_MANY_GPU_EVENT_TIMING=0` wrote
+`/tmp/inference-bench-multi-a95-notiming-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-multi-a95-notiming/runs/20260711_200702`
+and barely moved the row: `219.8 / 37.5 / 249.0ms`, `4.5 tok/s`,
+`981/1000` correct. Keep GPU-event timing available for attribution; it is not
+the score-facing multi_turn bottleneck.
+
+The dominant profile is the same mixed-prefix prefill body as prior runs:
+`35` prefill model calls, `18.6K` real prefill tokens, `15.4K` padding tokens,
+`2.23s` prefill graph GPU time, and no decode-many. Hot graph keys are
+`ragged_prefill:b32:s32:rows1:ctx-256:src32` (`1.80s`) and
+`ragged_prefill:b32:s32:rows1:ctx-128:src32` (`0.32s`). Packed-candidate
+telemetry found `34` calls and about `14.9K` removable suffix-padding tokens,
+but zero repeated pattern/signature keys. That rejects fixed-capacity graph
+reuse for this workload and reinforces that the remaining lever is a true
+dynamic packed cached-prefix prefill body or a non-fragmenting scheduler policy,
+not logits reuse or exact-prompt replay.
 
 ## Current 20260711 decode-many timing default
 
