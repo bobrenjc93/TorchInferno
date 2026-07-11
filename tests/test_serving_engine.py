@@ -2397,6 +2397,52 @@ def test_continuous_batch_engine_profiles_pinned_full_prompt_store_skips(
     }
 
 
+def test_continuous_batch_engine_profiles_full_prompt_store_skips_without_sync(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_QUEUE_PROFILE_JSONL", "queue.jsonl")
+    monkeypatch.delenv(
+        "TORCHINFERNO_CONTINUOUS_PINNED_FULL_PROMPT_STORE_MIN_MAX_TOKENS",
+        raising=False,
+    )
+    monkeypatch.delenv(
+        "TORCHINFERNO_CONTINUOUS_GREEDY_LARGE_MIXED_PREFIX_REUSE",
+        raising=False,
+    )
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_NON_COMMON_PREFIX_GRAPH_PREFILL", "1")
+    shared = tuple(range(1, 17))
+    engine = ContinuousBatchEngine(
+        _SelectedLogitsToyModel(),
+        device=torch.device("cpu"),
+        max_active_requests=2,
+        prefix_cache_capacity=2,
+        pin_shared_prefix=True,
+        graph_prefill=True,
+        profile_timings=False,
+    )
+
+    results = engine.run(
+        [
+            ServingRequest("turn0-a", (*shared, 21), 1, arrival_step=0),
+            ServingRequest("turn0-b", (*shared, 22), 1, arrival_step=0),
+        ]
+    )
+
+    assert [result.prefix_hit_tokens for result in results] == [len(shared), len(shared)]
+    assert engine.stats.full_prompt_store_requests == 2
+    assert engine.stats.full_prompt_store_stored_requests == 0
+    assert engine.stats.full_prompt_store_skipped_requests == 2
+    assert engine.stats.full_prompt_store_skipped_tokens == 2 * (len(shared) + 1)
+    assert engine.stats.full_prompt_store_skip_reason_counts == {
+        "pinned_without_allowance": 2,
+    }
+    assert engine.stats.full_prompt_store_skip_reason_tokens == {
+        "pinned_without_allowance": 2 * (len(shared) + 1),
+    }
+    assert engine.stats.prefill_shape_forward_ms == {}
+    assert engine.stats.prefill_shape_wall_ms == {}
+
+
 def test_continuous_batch_engine_profiles_pinned_full_prompt_reuse_candidates(
     monkeypatch,
 ) -> None:

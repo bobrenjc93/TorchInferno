@@ -170,6 +170,19 @@ shape maps such as `base_b24:s96->b16:s32+b8:s96` now appear while
 empty. This keeps public no-sync profiles able to explain why suffix splitting
 is not promoted without paying sync-timing overhead.
 
+A second no-sync telemetry validation on the same head added full-prompt store
+skip reasons to the lightweight profile path. The dirty run wrote
+`/tmp/inference-bench-fullprompt-skip-nosync-a6baa6d-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-fullprompt-skip-nosync-a6baa6d-dirty/runs/20260711_065709`
+and landed at `219.4 / 21.8 / 973.6ms`, p99 `640.0 / 34.2 / 2136.3ms`,
+with `1000/1000` correct. Its final queue record now reports
+`runtime_full_prompt_store_skip_reason_counts={"pinned_without_allowance": 1000}`
+and `runtime_full_prompt_store_skip_reason_tokens={"pinned_without_allowance":
+155715}`, while `runtime_prefill_shape_forward_ms` and
+`runtime_prefill_shape_wall_ms` remain empty. This makes public no-sync profiles
+show that long-output full-prompt stores are intentionally skipped under pinned
+shared-prefix policy rather than silently failing for capacity or store-disable
+reasons.
+
 ## Public 20260710_170747 startup failure and symm-mem warmup fix
 
 The latest public pointer advanced to

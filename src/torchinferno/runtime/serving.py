@@ -7446,13 +7446,13 @@ class ContinuousBatchEngine:
     def _record_full_prompt_store_skip(self, reason: str, tokens: tuple[int, ...]) -> None:
         self.stats.full_prompt_store_skipped_requests += 1
         self.stats.full_prompt_store_skipped_tokens += len(tokens)
-        if not self.profile_timings:
+        if not (self.profile_timings or _queue_profile_counts_enabled()):
             return
-        self._record_shape_count(
+        self._record_queue_profile_shape_count(
             self.stats.full_prompt_store_skip_reason_counts,
             reason,
         )
-        self._record_shape_total(
+        self._record_queue_profile_shape_total(
             self.stats.full_prompt_store_skip_reason_tokens,
             reason,
             len(tokens),
