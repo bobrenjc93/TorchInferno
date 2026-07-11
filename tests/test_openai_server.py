@@ -252,6 +252,11 @@ def test_openai_server_cache_backend_env_defaults(monkeypatch: pytest.MonkeyPatc
     assert config.cache_backend == "paged"
     assert config.page_size == 32
 
+    args = build_parser().parse_args(["--model", "tiny", "--cache-backend", "flashinfer"])
+    config = config_from_args(args)
+
+    assert config.cache_backend == "flashinfer"
+
 
 def test_openai_startup_warmup_skips_non_dense_cache_by_default(
     monkeypatch: pytest.MonkeyPatch,

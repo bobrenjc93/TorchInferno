@@ -19192,7 +19192,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cache-dir", default=None)
     parser.add_argument(
         "--cache-backend",
-        choices=["dense", "paged"],
+        choices=["dense", "paged", "flashinfer"],
         default=os.environ.get("TORCHINFERNO_OPENAI_CACHE_BACKEND", "dense"),
     )
     parser.add_argument(
