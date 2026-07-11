@@ -15050,7 +15050,7 @@ high-active replay cost or padding/overgeneration in normal decode-many
 execution, not via exact prompt, prompt-logits, generated-prefix-logits, or
 repeat-state shortcuts.
 
-The latest public run remains `20260711_210242` on TorchInferno `a8874cd`.
+The public run `20260711_210242` on TorchInferno `a8874cd` remained clean.
 Cache integrity is clean on the existing shortcut counters: generated-prefix
 store/reuse, prompt lookup, and repeated-sample hits are all zero. The earlier
 exact-prompt logits reuse commit `e887422` is already reverted by `c11dcaf`,
@@ -15071,6 +15071,20 @@ decode label from old no-sync profiles. Long_output remains decode-led
 (`5921.9ms` decode-many GPU) with a large `4098.8ms` prefill component, so the
 fair targets stay normal prefill body efficiency, cached-prefix suffix prefill,
 and high-active decode-many replay cost.
+
+The latest public run has advanced to `20260711_230213` on TorchInferno
+`312e29e`, vLLM `1ef1c7e`, and SGLang `4884f6f`. The score shape is unchanged:
+long_output is `183.0 / 19.2 / 879.1ms`, `41.3 tok/s` versus vLLM
+`49.9 / 15.2 / 581.2ms`, `61.3 tok/s`; multi_turn is
+`193.5 / 36.0 / 222.6ms`, `5.0 tok/s` versus SGLang TTFT `82.2ms` and vLLM
+E2E `133.2ms`; few_shot regressed against vLLM to a `+73.4ms` TTFT and
+`+71.2ms` E2E gap. Cache integrity remains clean on every TorchInferno row:
+generated-prefix store/reuse, prompt lookup, reusable-prefix logits, sample-state
+payloads, precomputed greedy-token payloads, and repeated-sample hits are all
+zero. The new packed-FI gate table still infers `cache_backend_dense` for all
+rows, with candidate saved tokens of `32661` for long_output, `14921` for
+multi_turn, `3557` for few_shot, `2529` for tree_of_thought, and `366` for
+self_consistency.
 
 The cache-integrity guardrail now also records the risky cache configuration
 state, not just observed shortcut counters. Queue profiles expose whether the
