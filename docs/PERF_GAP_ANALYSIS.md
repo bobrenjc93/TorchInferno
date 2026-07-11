@@ -12,9 +12,8 @@ runtime reusable-prefix cache no longer stores or samples prompt/generated
 logits. Full-prompt KV hits are capped to `len(prompt) - 1` so the final prompt
 token is replayed through the model before sampling. OpenAI sampled-short
 serving also no longer auto-enables generated-prefix caching. The separate
-OpenAI server exact-prompt logits cache remains opt-in only via
-`TORCHINFERNO_OPENAI_PROMPT_LOGITS_CACHE=1` and should not be used for
-score-facing benchmark runs.
+legacy OpenAI server exact-prompt logits cache flag
+`TORCHINFERNO_OPENAI_PROMPT_LOGITS_CACHE=1` is now inert as well.
 
 The benchmark harness now also forces those score-facing caches off for
 TorchInferno provider runs. inference-bench `034494c0` sets

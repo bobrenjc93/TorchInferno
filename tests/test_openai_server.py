@@ -4206,7 +4206,7 @@ def test_openai_prefill_repeated_prefix_uses_repeated_sampler() -> None:
     assert model.sample_calls == [((1, 12), 4, 0.7)]
 
 
-def test_openai_identical_prompt_batch_reuses_exact_prompt_logits_cache(monkeypatch) -> None:
+def test_openai_identical_prompt_batch_logits_cache_env_is_inert(monkeypatch) -> None:
     monkeypatch.setenv("TORCHINFERNO_OPENAI_PROMPT_LOGITS_CACHE", "1")
     model = _PrefixRecordingModel()
     engine = _cache_only_engine()
@@ -4234,7 +4234,7 @@ def test_openai_identical_prompt_batch_reuses_exact_prompt_logits_cache(monkeypa
 
     assert first == [[2, 2, 2]]
     assert second == [[2, 2, 2]]
-    assert model.forward_inputs == [[10, 11]]
+    assert model.forward_inputs == [[10, 11], [10, 11]]
 
 
 def test_openai_identical_prompt_batch_does_not_reuse_logits_cache_by_default(monkeypatch) -> None:
@@ -4266,7 +4266,7 @@ def test_openai_identical_prompt_batch_does_not_reuse_logits_cache_by_default(mo
     assert model.forward_inputs == [[10, 11], [10, 11]]
 
 
-def test_openai_identical_prompt_logits_cache_defers_kv_restore_until_decode(monkeypatch) -> None:
+def test_openai_identical_prompt_logits_cache_env_keeps_prompt_forward(monkeypatch) -> None:
     monkeypatch.setenv("TORCHINFERNO_OPENAI_PROMPT_LOGITS_CACHE", "1")
     model = _PrefixRecordingModel()
     engine = _cache_only_engine()
@@ -4293,12 +4293,12 @@ def test_openai_identical_prompt_logits_cache_defers_kv_restore_until_decode(mon
     )
 
     assert next(steps) == [2, 2, 2]
-    assert model.forward_inputs == []
+    assert model.forward_inputs == [[10, 11]]
     assert next(steps) == [2, 2, 2]
-    assert model.forward_inputs == [[2]]
+    assert model.forward_inputs == [[10, 11], [2]]
 
 
-def test_openai_identical_prompt_logits_cache_resamples_temperature_rows(monkeypatch) -> None:
+def test_openai_identical_prompt_logits_cache_env_resamples_after_forward(monkeypatch) -> None:
     monkeypatch.setenv("TORCHINFERNO_OPENAI_PROMPT_LOGITS_CACHE", "1")
     monkeypatch.setenv("TORCHINFERNO_OPENAI_PREFIX_CACHE_SHARED_SAMPLE", "0")
 
@@ -4343,7 +4343,7 @@ def test_openai_identical_prompt_logits_cache_resamples_temperature_rows(monkeyp
 
     assert first == [[4, 5, 6]]
     assert second == [[5, 6, 7]]
-    assert model.forward_inputs == [[10, 11]]
+    assert model.forward_inputs == [[10, 11], [10, 11]]
     assert model.sample_calls == [((1, 16), 3, 0.7), ((1, 16), 3, 0.7)]
 
 
@@ -4422,7 +4422,7 @@ def test_openai_identical_prompt_batch_decodes_uniform_rows_once() -> None:
     assert model.forward_shapes == [(1, 2), (1, 1)]
 
 
-def test_openai_identical_prompt_batch_reuses_uniform_decode_logits_cache(monkeypatch) -> None:
+def test_openai_identical_prompt_uniform_decode_logits_cache_env_is_inert(monkeypatch) -> None:
     monkeypatch.setenv("TORCHINFERNO_OPENAI_PROMPT_LOGITS_CACHE", "1")
     model = _PrefixRecordingModel()
     engine = _cache_only_engine()
@@ -4450,10 +4450,10 @@ def test_openai_identical_prompt_batch_reuses_uniform_decode_logits_cache(monkey
 
     assert first == [[2, 2, 2], [2, 2, 2]]
     assert second == [[2, 2, 2], [2, 2, 2]]
-    assert model.forward_inputs == [[10, 11], [2]]
+    assert model.forward_inputs == [[10, 11], [2], [10, 11], [2]]
 
 
-def test_openai_identical_prompt_uniform_logits_cache_defers_kv_restore(monkeypatch) -> None:
+def test_openai_identical_prompt_uniform_logits_cache_env_keeps_forward(monkeypatch) -> None:
     monkeypatch.setenv("TORCHINFERNO_OPENAI_PROMPT_LOGITS_CACHE", "1")
     model = _PrefixRecordingModel()
     engine = _cache_only_engine()
@@ -4491,7 +4491,7 @@ def test_openai_identical_prompt_uniform_logits_cache_defers_kv_restore(monkeypa
     )
 
     assert steps == [[2, 2, 2], [2, 2, 2]]
-    assert model.forward_inputs == []
+    assert model.forward_inputs == [[10, 11], [2]]
     assert restore_calls == []
 
 
@@ -10374,12 +10374,12 @@ def test_openai_online_decode_quantum_uses_greedy_mid_cap_default(monkeypatch) -
     assert _online_decode_quantum(temperature=0.0, max_tokens=64) == 8
 
 
-def test_openai_prompt_logits_cache_is_opt_in(monkeypatch) -> None:
+def test_openai_prompt_logits_cache_flag_is_inert(monkeypatch) -> None:
     monkeypatch.delenv("TORCHINFERNO_OPENAI_PROMPT_LOGITS_CACHE", raising=False)
     assert not _prompt_logits_cache_enabled()
 
     monkeypatch.setenv("TORCHINFERNO_OPENAI_PROMPT_LOGITS_CACHE", "1")
-    assert _prompt_logits_cache_enabled()
+    assert not _prompt_logits_cache_enabled()
 
     monkeypatch.setenv("TORCHINFERNO_OPENAI_PROMPT_LOGITS_CACHE", "0")
     assert not _prompt_logits_cache_enabled()

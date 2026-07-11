@@ -17286,7 +17286,9 @@ def _identical_prompt_cache_pool_enabled(model: object, temperature: float) -> b
 
 
 def _prompt_logits_cache_enabled() -> bool:
-    return env_flag("TORCHINFERNO_OPENAI_PROMPT_LOGITS_CACHE", False)
+    # Exact-prompt logits reuse is intentionally inert. KV prefix reuse remains
+    # available, but logits must come from normal prompt/decode execution.
+    return False
 
 
 def _prefer_shared_prefix_padded_suffix_prefill(
