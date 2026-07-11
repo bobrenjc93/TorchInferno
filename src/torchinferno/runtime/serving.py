@@ -1078,6 +1078,10 @@ class ContinuousBatchEngine:
         self._row_seq_lens: list[int] = []
         self._row_cached_prefixes: list[tuple[int, ...] | None] = []
         self._device_index_tensors: dict[tuple[int, ...], Tensor] = {}
+        self._decode_many_seq_increment_tensors: dict[
+            tuple[tuple[int, ...], int, torch.dtype],
+            Tensor,
+        ] = {}
         self._graph_capture_on_miss_support: dict[object, bool] = {}
         self._prefix_order: list[Hashable] = []
         self._online_waiting: ServingQueue | None = None
@@ -6742,8 +6746,17 @@ class ContinuousBatchEngine:
         buf = getattr(self, "_gpu_seq_lens", None)
         if buf is None or rows.numel() == 0:
             return
-        increment = torch.full_like(rows, max(1, int(amount)), dtype=torch.long)
+        increment = self._decode_many_seq_increment_tensor(rows, amount=amount)
         buf.index_add_(0, rows, increment)
+
+    def _decode_many_seq_increment_tensor(self, rows: Tensor, *, amount: int = 1) -> Tensor:
+        value = max(1, int(amount))
+        key = (tuple(int(dim) for dim in rows.shape), value, rows.dtype)
+        cached = self._decode_many_seq_increment_tensors.get(key)
+        if cached is None or cached.device != rows.device:
+            cached = torch.full(rows.shape, value, dtype=rows.dtype, device=rows.device)
+            self._decode_many_seq_increment_tensors[key] = cached
+        return cached
 
     def _decode_ragged_batch(
         self,

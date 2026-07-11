@@ -8194,6 +8194,29 @@ def test_continuous_batch_engine_records_decode_many_shapes_for_queue_profile_wi
     assert engine.stats.decode_many_step_window_cpu_tokens_ms == {}
 
 
+def test_continuous_batch_engine_reuses_decode_many_seq_increment_tensor() -> None:
+    engine = ContinuousBatchEngine(
+        object(),
+        device=torch.device("cpu"),
+        max_active_requests=4,
+        enable_decode_many=True,
+    )
+    engine._row_seq_lens = [0, 0, 0, 0]
+    engine._ensure_gpu_seq_lens_buf()
+    rows = torch.tensor([1, 3], dtype=torch.long)
+
+    engine._advance_gpu_seq_lens(rows)
+    cached = engine._decode_many_seq_increment_tensors[((2,), 1, torch.long)]
+    first_ptr = cached.data_ptr()
+    engine._advance_gpu_seq_lens(rows)
+
+    assert engine._gpu_seq_lens.tolist() == [0, 2, 0, 2]
+    assert (
+        engine._decode_many_seq_increment_tensors[((2,), 1, torch.long)].data_ptr()
+        == first_ptr
+    )
+
+
 def test_continuous_batch_engine_decode_many_gpu_timers_populate_step_windows() -> None:
     class _FakeCudaStartEvent:
         def elapsed_time(self, _end_event) -> float:

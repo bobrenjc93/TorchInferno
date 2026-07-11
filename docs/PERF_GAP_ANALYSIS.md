@@ -13748,6 +13748,24 @@ confirmation then regressed to `243.1 / 20.9 / 975.1ms`, p99
 observed instability points back to model-side prefill/decode work rather than
 another queue-floor default.
 
+A current-head greedy-short suffix-split recheck on `2ea0535` keeps suffix
+splitting rejected as a default. The env run
+`/tmp/inference-bench-long-suffixsplit-results/.../runs/20260711_013226`
+enabled
+`TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SPLIT_SUFFIX_BUCKETS_GREEDY_SHORT=1`
+and stayed correct (`1000/1000`), but landed at
+`237.5 / 21.2 / 983.2ms` with p99 `1565.0 / 50.9 / 2683.5ms`.
+Queue telemetry showed the familiar tradeoff: `4` accepted suffix splits saved
+`4160` predicted prefill model tokens, but phase time rose to `17.96s`,
+queue-to-first p99 rose to `1549ms`, and the score-facing row was worse than
+the no-split same-host baseline. The runtime now only removes a per-step
+allocation from row-indexed decode-many seq-len updates by caching the small
+device increment tensor. Its no-env validation wrote
+`/tmp/inference-bench-long-decode-increment-results/.../runs/20260711_014022`
+and stayed correct (`1000/1000`) but did not produce a score-facing win
+(`234.5 / 21.2 / 1015.0ms`, p99 `1503.1 / 50.1 / 2614.0ms`). Keep treating
+this as decode housekeeping; it does not change the main prefill-body target.
+
 ## Priority for a focused (non-loop) session
 
 1. Prefill MFU (Issue 1) — biggest TTFT lever, ~2x, affects 3/5 benchmarks.
