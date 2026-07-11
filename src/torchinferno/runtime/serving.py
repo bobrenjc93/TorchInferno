@@ -6107,10 +6107,13 @@ class ContinuousBatchEngine:
                     reuse_logits = getattr(self, "_last_ragged_decode_logits", None)
                     self.stats.decode_graph_hits += 1
                 else:
-                    cache_view = self._cache_view(rows)
-                    logits = self._static_decode_logits(input_ids, cache_view)
+                    if self._supports_ragged_decode_logits():
+                        logits = self._ragged_decode_logits_for_states(states, input_ids)
+                    else:
+                        cache_view = self._cache_view(rows)
+                        logits = self._static_decode_logits(input_ids, cache_view)
                     reuse_logits = logits[:, -1, :]
-                    next_token_tensor = self._sample_logits_for_states(logits[:, -1, :], states)
+                    next_token_tensor = self._sample_logits_for_states(reuse_logits, states)
         else:
             ragged_decode = self._try_ragged_decode_states(
                 states,
@@ -6182,16 +6185,11 @@ class ContinuousBatchEngine:
         row_indices = torch.tensor(rows, dtype=torch.long, device=self.device)
         seq_lens = self._seq_lens_tensor(states, rows=rows)
         if need_logits:
-            if not (
-                hasattr(self.model, "try_decode_ragged_logits_graph")
-                or hasattr(self.model, "decode_ragged_logits")
-            ):
+            if not self._supports_ragged_decode_logits():
                 return None
-            logits = self._ragged_decode_logits(input_ids, seq_lens, row_indices)
+            logits = self._ragged_decode_logits_for_states(states, input_ids)
             return self._sample_logits_for_states(logits[:, -1, :], states), logits[:, -1, :]
-        if temperature is None:
-            return None
-        if temperature <= 0.0:
+        if temperature is not None and temperature <= 0.0:
             token = self._try_ragged_token_graph(
                 input_ids,
                 seq_lens,
@@ -6201,13 +6199,34 @@ class ContinuousBatchEngine:
             if token is not None:
                 self.stats.decode_graph_hits += 1
                 return token.to(self.device), getattr(self, "_last_ragged_decode_logits", None)
-        if not (
-            hasattr(self.model, "try_decode_ragged_logits_graph")
-            or hasattr(self.model, "decode_ragged_logits")
-        ):
+        if not self._supports_ragged_decode_logits():
             return None
-        logits = self._ragged_decode_logits(input_ids, seq_lens, row_indices)
+        logits = self._ragged_decode_logits_for_states(states, input_ids)
         return self._sample_logits_for_states(logits[:, -1, :], states), logits[:, -1, :]
+
+    def _supports_ragged_decode_logits(self) -> bool:
+        return hasattr(self.model, "try_decode_ragged_logits_graph") or hasattr(
+            self.model,
+            "decode_ragged_logits",
+        )
+
+    def _ragged_decode_logits_for_states(
+        self,
+        states: list[_ActiveRequest],
+        input_ids: Tensor,
+    ) -> Tensor:
+        rows = [state.row for state in states]
+        decode_rows = self._ragged_decode_bucket_rows(rows)
+        decode_input_ids = input_ids
+        if len(decode_rows) > len(rows):
+            pad_token = int(states[0].last_token)
+            pad_shape = (len(decode_rows) - len(rows), input_ids.size(1))
+            pad_ids = input_ids.new_full(pad_shape, pad_token)
+            decode_input_ids = torch.cat((input_ids, pad_ids), dim=0)
+        row_indices = torch.tensor(decode_rows, dtype=torch.long, device=self.device)
+        seq_lens = self._seq_lens_tensor(states, rows=decode_rows)
+        logits = self._ragged_decode_logits(decode_input_ids, seq_lens, row_indices)
+        return logits[: len(states)]
 
     def _finalize_decode(
         self,
@@ -6263,10 +6282,13 @@ class ContinuousBatchEngine:
                     reuse_logits = getattr(self, "_last_ragged_decode_logits", None)
                     self.stats.decode_graph_hits += 1
                 else:
-                    cache_view = self._cache_view([state.row])
-                    logits = self._static_decode_logits(input_ids, cache_view)
+                    if self._supports_ragged_decode_logits():
+                        logits = self._ragged_decode_logits_for_states([state], input_ids)
+                    else:
+                        cache_view = self._cache_view([state.row])
+                        logits = self._static_decode_logits(input_ids, cache_view)
                     reuse_logits = logits[:, -1, :]
-                    next_token_tensor = self._sample_logits_for_states(logits[:, -1, :], [state])
+                    next_token_tensor = self._sample_logits_for_states(reuse_logits, [state])
         else:
             ragged_decode = self._try_ragged_decode_states(
                 [state],

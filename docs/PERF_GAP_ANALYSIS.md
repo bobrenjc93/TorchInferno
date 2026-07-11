@@ -13659,6 +13659,25 @@ row's `17` static sampled logits misses. Long_output remained clean on decode
 graphs (`759` hits/replays, `0` misses), so the remaining long gap is still
 decode throughput and tail policy, not graph coverage.
 
+A follow-up dirty patch closed the remaining sampled tree static decode miss
+routes by applying the ragged-logits fallback to the FI decode branch, allowing
+mixed-temperature groups to use ragged logits, and padding odd fallback batches
+to the existing ragged decode buckets. The first focused tree validation
+(`/tmp/inference-bench-tree-fi-ragged-logits-results/.../runs/20260710_235535`)
+landed at `53.9 / 35.1 / 76.6ms`, correctness `953/992`, but still had `4`
+static logits misses. After mixed-temperature groups used ragged logits, the
+second validation
+(`/tmp/inference-bench-tree-fi-mixed-ragged-logits-results/.../runs/20260711_000249`)
+landed at `54.4 / 36.1 / 79.4ms`, correctness `959/992`, and shifted the
+remaining misses to ragged odd batches (`b5/b6`). The final bucketed run
+(`/tmp/inference-bench-tree-bucketed-ragged-logits-results/.../runs/20260711_001101`)
+landed at `54.3 / 37.9 / 79.0ms`, correctness `956/992`, with
+`runtime_decode_graph_hits=347`, `runtime_decode_graph_replays=347`, and
+`runtime_decode_graph_misses=0`. This is a graph-coverage cleanup and modest
+tree median improvement versus the pushed `8ff3638` full-suite tree row
+(`57.9 / 38.0 / 80.5ms`), but it does not change the larger sampled-prefix and
+decode-throughput priorities.
+
 ## Priority for a focused (non-loop) session
 
 1. Prefill MFU (Issue 1) — biggest TTFT lever, ~2x, affects 3/5 benchmarks.

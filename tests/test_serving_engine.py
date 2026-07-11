@@ -6416,6 +6416,94 @@ def test_continuous_batch_engine_uses_ragged_logits_for_sampled_single_active_ro
     assert engine.stats.decode_graph_hits == 2
 
 
+def test_continuous_batch_engine_uses_ragged_logits_for_mixed_temperature_rows() -> None:
+    class _MixedTemperatureRaggedLogitsToyModel(_RaggedGraphToyModel):
+        def __init__(self) -> None:
+            super().__init__()
+            self.static_token_graph_calls = 0
+            self.static_logits_graph_calls = 0
+
+        def try_decode_one_token_graph(self, input_ids, cache, *, temperature=0.0):  # noqa: ANN001
+            del input_ids, cache, temperature
+            self.static_token_graph_calls += 1
+            return None
+
+        def try_decode_one_token_logits_graph(self, input_ids, cache):  # noqa: ANN001
+            del input_ids, cache
+            self.static_logits_graph_calls += 1
+            return None
+
+    def active(index: int, request: ServingRequest, row: int) -> serving_mod._ActiveRequest:
+        return serving_mod._ActiveRequest(
+            original_index=index,
+            request=request,
+            tokens=list(request.prompt),
+            generated=1,
+            row=row,
+            last_token=request.prompt[-1],
+            seq_len=len(request.prompt),
+            prefix_hit_tokens=0,
+            started_step=0,
+        )
+
+    model = _MixedTemperatureRaggedLogitsToyModel()
+    engine = ContinuousBatchEngine(
+        model,
+        device=torch.device("cpu"),
+        max_active_requests=2,
+        prefix_cache_capacity=0,
+        enable_ragged_decode=True,
+    )
+    engine._cache = engine._allocate_cache(2, 16)
+    states = [
+        active(0, ServingRequest("greedy", (1, 2), 3, temperature=0.0), 0),
+        active(1, ServingRequest("sampled", (3, 4), 3, temperature=0.7), 1),
+    ]
+
+    decoded = engine._decode_batch(states, step=1)
+
+    assert len(decoded) == 2
+    assert model.ragged_logits_graph_calls == 1
+    assert model.static_token_graph_calls == 0
+    assert model.static_logits_graph_calls == 0
+    assert engine.stats.decode_graph_hits == 1
+
+
+def test_continuous_batch_engine_buckets_ragged_logits_fallback_rows() -> None:
+    def active(index: int, row: int) -> serving_mod._ActiveRequest:
+        request = ServingRequest(f"req-{index}", (index + 1, index + 2), 3, temperature=0.7)
+        return serving_mod._ActiveRequest(
+            original_index=index,
+            request=request,
+            tokens=list(request.prompt),
+            generated=1,
+            row=row,
+            last_token=request.prompt[-1],
+            seq_len=len(request.prompt),
+            prefix_hit_tokens=0,
+            started_step=0,
+        )
+
+    model = _RaggedDecodeShapeRecordingToyModel()
+    engine = ContinuousBatchEngine(
+        model,
+        device=torch.device("cpu"),
+        max_active_requests=8,
+        prefix_cache_capacity=0,
+        enable_ragged_decode=True,
+        temperature=0.7,
+    )
+    engine._cache = engine._allocate_cache(8, 16)
+    engine._free_active_rows = [7, 6, 5]
+    states = [active(index, index) for index in range(5)]
+
+    decoded = engine._decode_batch(states, step=1)
+
+    assert len(decoded) == 5
+    assert model.decode_shapes == [(8, [0, 1, 2, 3, 4, 5, 6, 7])]
+    assert engine.stats.decode_graph_hits == 1
+
+
 def test_continuous_batch_engine_records_ragged_decode_graph_captures() -> None:
     model = _CaptureReportingRaggedGraphToyModel()
     engine = ContinuousBatchEngine(
@@ -7052,6 +7140,88 @@ def test_continuous_batch_engine_skips_flashinfer_decode_for_sampled_medium_defa
     assert model.ragged_logits_graph_calls == 2
     assert engine.stats.decode_graph_misses == 0
     assert engine.stats.decode_graph_hits == 2
+
+
+def test_continuous_decode_fi_branch_uses_ragged_logits_for_sampled_medium(
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv("TORCHINFERNO_FI_DECODE_GRAPH", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_FI_DECODE_SAMPLED_MAX_TOKENS", raising=False)
+
+    class _FiBranchFallbackToyModel(_FiDecodeGraphToyModel):
+        def __init__(self) -> None:
+            super().__init__()
+            self.static_logits_graph_calls = 0
+            self.forward_calls = 0
+
+        def try_decode_one_token_logits_graph(self, input_ids, cache):  # noqa: ANN001
+            del input_ids, cache
+            self.static_logits_graph_calls += 1
+            return None
+
+        def forward(self, input_ids, *, cache, use_cache=False):  # noqa: ANN001
+            self.forward_calls += 1
+            return super().forward(input_ids, cache=cache, use_cache=use_cache)
+
+    def active(index: int, request: ServingRequest, row: int) -> serving_mod._ActiveRequest:
+        return serving_mod._ActiveRequest(
+            original_index=index,
+            request=request,
+            tokens=list(request.prompt),
+            generated=1,
+            row=row,
+            last_token=request.prompt[-1],
+            seq_len=len(request.prompt),
+            prefix_hit_tokens=0,
+            started_step=0,
+        )
+
+    model = _FiBranchFallbackToyModel()
+    engine = ContinuousBatchEngine(
+        model,
+        device=torch.device("cpu"),
+        max_active_requests=2,
+        prefix_cache_capacity=0,
+        temperature=0.7,
+        max_generation_tokens=300,
+    )
+    engine._cache = engine._allocate_cache(2, 16)
+    states = [
+        active(0, ServingRequest("a", (1, 2), 3, temperature=0.7), 0),
+        active(1, ServingRequest("b", (3, 4), 3, temperature=0.7), 1),
+    ]
+
+    decoded = engine._decode_batch(states, step=1)
+
+    assert len(decoded) == 2
+    assert model.fi_graph.replay_calls == 0
+    assert model.ragged_token_graph_calls == 0
+    assert model.ragged_logits_graph_calls == 1
+    assert model.static_logits_graph_calls == 0
+    assert model.forward_calls == 0
+    assert engine.stats.decode_graph_hits == 1
+
+    single_model = _FiBranchFallbackToyModel()
+    single_engine = ContinuousBatchEngine(
+        single_model,
+        device=torch.device("cpu"),
+        max_active_requests=1,
+        prefix_cache_capacity=0,
+        temperature=0.7,
+        max_generation_tokens=300,
+    )
+    single_engine._cache = single_engine._allocate_cache(1, 16)
+    single = active(0, ServingRequest("single", (5, 6), 3, temperature=0.7), 0)
+
+    decoded_single = single_engine._decode_one(single, step=1)
+
+    assert isinstance(decoded_single, serving_mod._ActiveRequest)
+    assert single_model.fi_graph.replay_calls == 0
+    assert single_model.ragged_token_graph_calls == 0
+    assert single_model.ragged_logits_graph_calls == 1
+    assert single_model.static_logits_graph_calls == 0
+    assert single_model.forward_calls == 0
+    assert single_engine.stats.decode_graph_hits == 1
 
 
 def test_continuous_batch_engine_can_allow_flashinfer_decode_for_sampled_medium(
