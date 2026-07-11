@@ -338,9 +338,13 @@ def _online_refill_min_ready_requests(*, temperature: float, max_tokens: int) ->
         300,
         minimum=1,
     ):
+        # Multi-turn-style greedy large streams arrive in staggered conversation
+        # waves. A 32-request refill floor inflated admission wait; local TP8
+        # 70B A/B on multi_turn improved 246.8/37.7/279.8ms ->
+        # 217.8/37.5/248.5ms at essentially unchanged correctness.
         default_min_ready = env_int(
             "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_REFILL_MIN_READY_REQUESTS",
-            32,
+            8,
             minimum=1,
         )
     return env_int(min_ready_env, default_min_ready, minimum=1)

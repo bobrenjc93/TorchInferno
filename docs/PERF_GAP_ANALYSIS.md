@@ -53,6 +53,23 @@ improved `125.7 -> 110.8ms`, and decode-many model tokens fell
 `31.1K -> 27.8K`. few_shot remains outside this policy because it uses
 `max_tokens=256` and stays on the greedy-mid cap.
 
+The current pushed head `397871a` also resolves the stale public multi_turn
+timeout locally: TorchInferno completed
+`/tmp/inference-bench-multi-turn-current-397871a-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-multi-turn-current-397871a/runs/20260711_045857`
+at `246.8 / 37.7 / 279.8ms`, p99 `868.5 / 266.9 / 885.9ms`, with
+`982/1000` correct. Its queue profile showed the greedy-large
+`admit_min_ready_requests=32` refill floor dominating median first-token
+latency: `138.6ms` queue-to-submit versus `91.3ms` submit-to-first. Lowering
+the greedy-large refill floor to `8` with
+`TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_REFILL_MIN_READY_REQUESTS=8` wrote
+`/tmp/inference-bench-multi-turn-refill8-397871a-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-multi-turn-refill8-397871a/runs/20260711_050553`
+and improved multi_turn to `217.8 / 37.5 / 248.5ms`, p99
+`679.8 / 226.4 / 714.1ms`, with `981/1000` correct. The queue profile confirms
+the mechanism: queue-to-submit improved `138.6 -> 119.2ms`,
+submit-to-first improved `91.3 -> 85.7ms`, and p99 submit-to-first improved
+`164.5 -> 100.4ms`, so greedy-large now uses the same `8` refill floor by
+default.
+
 ## Public 20260710_170747 startup failure and symm-mem warmup fix
 
 The latest public pointer advanced to

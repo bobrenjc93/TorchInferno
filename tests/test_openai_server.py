@@ -10224,8 +10224,8 @@ def test_openai_refill_min_ready_requests_defaults_for_short_greedy_caps(monkeyp
     assert _online_refill_min_ready_requests(temperature=0.0, max_tokens=128) == 8
     assert _online_refill_min_ready_requests(temperature=0.0, max_tokens=256) == 8
     assert _online_refill_min_ready_requests(temperature=0.0, max_tokens=300) == 8
-    assert _online_refill_min_ready_requests(temperature=0.0, max_tokens=301) == 32
-    assert _online_refill_min_ready_requests(temperature=0.0, max_tokens=512) == 32
+    assert _online_refill_min_ready_requests(temperature=0.0, max_tokens=301) == 8
+    assert _online_refill_min_ready_requests(temperature=0.0, max_tokens=512) == 8
     assert _online_refill_min_ready_requests(temperature=0.0, max_tokens=1024) is None
 
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_REFILL_MIN_READY_REQUESTS", "16")
