@@ -66,6 +66,23 @@ promotion target. The next runtime implementation target remains a dynamic-count
 packed mixed-prefix prefill body, or an equivalently cheap common-prefix replay
 path that can vary per-request starts/counts without fragmenting graph captures.
 
+Mixed-source chunked prefill is also rejected for this multi_turn target. A
+dirty prototype grouped chunked prefilling states across source rows with
+`TORCHINFERNO_OPENAI_TP_ONLINE_PREFILL_CHUNK=16` and
+`TORCHINFERNO_CONTINUOUS_CHUNKED_MIXED_PREFIX_PREFILL=1`. The first run wrote
+`/tmp/inference-bench-ti-multi-chunkmixed-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-ti-multi-chunkmixed-e5f7735-dirty/runs/20260711_135154`
+and regressed to `1852.9 / 36.4 / 2211.0ms`; the queue profile showed only
+`2` ragged-prefill graph replays, `62` misses, and a hot failed
+`ragged_prefill:b32:s16:rows1:ctx-1:src32` source-copy shape. A revised
+dynamic-context version removed the misses (`64` hits, `0` misses, `44`
+replays) but still regressed to `1528.6 / 35.4 / 1887.0ms` in
+`/tmp/inference-bench-ti-multi-chunkmixed-dynctx-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-ti-multi-chunkmixed-dynctx-e5f7735-dirty/runs/20260711_135926`.
+It doubled the prefill schedule instead of shortening it: `65` prefill model
+calls and `182` online steps versus the current no-chunk baseline's `34` calls
+and `113` steps. Keep chunked mixed-prefix prefill out of the default
+multi_turn path; chunking can fix long-prompt residency, but this workload needs
+fewer first-token prefill submissions, not more smaller ones.
+
 ## Current 20260711 same-host global-vLLM refresh
 
 A same-host vLLM refresh used the globally installed Python at
