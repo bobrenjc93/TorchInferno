@@ -14960,6 +14960,25 @@ pattern-targeted packed-ragged prefill opt-in; the useful target remains a
 dynamic non-fragmenting packed prefix-suffix body that handles the recurring
 long_output `p111` waves without request-path graph churn.
 
+A current-head same-host all-provider long_output refresh on `55d6924` wrote
+`/tmp/inference-bench-long-55d-allproviders-results/.../runs/20260711_204529`.
+TorchInferno stayed correct at `1000/1000` and landed at
+`208.0 / 21.4 / 997.8ms`, throughput `36.3 tok/s`. vLLM landed at
+`49.6 / 16.9 / 652.6ms`, throughput `55.1 tok/s`, and SGLang landed at
+`45.2 / 25.9 / 980.7ms`, throughput `37.6 tok/s`, all with `1000/1000`
+correctness. The TorchInferno queue profile markers bracketed the benchmark,
+and integrity stayed clean: zero logits-cache warnings, zero generated-prefix
+store/reuse, zero prompt-lookup accepted tokens, and zero repeated-sample hits.
+Runtime shape is unchanged from the post-cache controls: `4.63s` prefill graph
+GPU, `6.47s` decode-many GPU, `29.9K` padded prefill tokens, and `122`
+decode-many calls over `519` internal steps. The hot prefill replays were
+ordinary `p111` common-prefix suffix waves (`b24:s64=1.72s`,
+`b24:s96=0.87s`, `b16:s64=0.73s`, `b16:s96=0.53s`), and the decode hot spot
+remained `decode_many:b64/64=1.83s`. This keeps the next fair long_output lever
+at the same place: a faster cached-prefix suffix prefill body plus lower
+high-active decode replay cost, not another cache shortcut or harness-specific
+route.
+
 ## Priority for a focused (non-loop) session
 
 1. Prefill MFU (Issue 1) — biggest TTFT lever, ~2x, affects 3/5 benchmarks.
