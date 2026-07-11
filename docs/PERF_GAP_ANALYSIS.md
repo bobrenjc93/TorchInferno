@@ -1,5 +1,28 @@
 # TorchInferno vs vLLM/sglang — Performance Gap Analysis (Llama-3.1-70B, 8xH100)
 
+## Current 20260711 first-token admission split
+
+Queue-profile diagnostics now export per-prefill-shape queue-to-submit maps
+beside the existing queue-to-first and submit-to-first maps, and the research
+summary prints a compact first-token prefill-shape table. A pushed-head
+long_output validation on `d7a33fd` wrote
+`/tmp/inference-bench-local-d7a33fd-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-d7a33fd/runs/20260711_093420`.
+It landed at `221.4 / 21.7 / 1040.7ms`, p99
+`644.0 / 29.8 / 1737.8ms`, throughput `36.2 tok/s`, and `1000/1000`
+correct. Startup was in family (`286.3s` ready), and the queue profile stayed
+graph-clean with `59` prefill batches, `0` request-path prefill graph misses,
+`127` decode-many calls, and `559` decode-many internal steps.
+
+The new split shows the hot first-token shapes are not uniquely blocked on
+admission. Median queue-to-submit is broadly similar for the high-volume rows:
+`b24:s64` at `88.5ms`, `b16:s64` at `84.1ms`, `b24:s96` at `96.2ms`,
+`b24:s32` at `95.6ms`, and `b16:s96` at `96.1ms`. The after-submit prefill
+cost is the differentiator: `b24:s96` reports `149.1ms` submit-to-first,
+`b24:s64` `113.1ms`, `b16:s96` `110.6ms`, `b16:s64` `96.5ms`, and `b24:s32`
+`83.3ms`. This keeps the next long_output target on the cached-prefix
+prefix-suffix prefill body and high-active decode replay, not another simple
+admission wait sweep.
+
 ## Current 20260711 greedy-short batch-bucket rejection
 
 After the decode-many state-sync fix (`829b227`/`1369e8f`), the remaining
