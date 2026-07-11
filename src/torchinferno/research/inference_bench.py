@@ -346,6 +346,12 @@ _QUEUE_PROFILE_FIELDS = (
     "runtime_decode_many_step_window_cpu_tokens_ms",
     "runtime_decode_many_step_window_token_wait_ms",
     "runtime_decode_many_step_window_token_materialize_ms",
+    "runtime_generated_prefix_cache_requested",
+    "runtime_generated_prefix_cache_base_enabled",
+    "runtime_generated_prefix_cache_effective_enabled",
+    "runtime_prompt_lookup_decode_effective_enabled",
+    "runtime_prefix_cache_store_logits_enabled",
+    "runtime_pinned_prefix_cache_store_logits_enabled",
     "runtime_prompt_lookup_batches",
     "runtime_prompt_lookup_requests",
     "runtime_prompt_lookup_proposed_tokens",
@@ -984,6 +990,12 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
                         "gen_store",
                         "gen_reuse",
                         "gen_tokens",
+                        "gen_req",
+                        "gen_base",
+                        "gen_on",
+                        "prompt_lookup_on",
+                        "store_logits",
+                        "pin_logits",
                         "prompt_lookup_req",
                         "prompt_lookup_prop",
                         "prompt_lookup_accept",
@@ -1962,6 +1974,12 @@ def _queue_profile_field_is_additive(name: str) -> bool:
         "runtime_cache_backend",
         "runtime_max_active_requests",
         "runtime_prefix_cache_capacity",
+        "runtime_generated_prefix_cache_requested",
+        "runtime_generated_prefix_cache_base_enabled",
+        "runtime_generated_prefix_cache_effective_enabled",
+        "runtime_prompt_lookup_decode_effective_enabled",
+        "runtime_prefix_cache_store_logits_enabled",
+        "runtime_pinned_prefix_cache_store_logits_enabled",
         "runtime_prefill_graph_cache_live_entries",
         "runtime_prefill_graph_cache_max_entries",
         "runtime_decode_graph_cache_live_entries",
@@ -2889,6 +2907,30 @@ def _cache_integrity_rows(
             fields,
             "runtime_reusable_prefix_greedy_token_entries",
         )
+        gen_requested = _cache_integrity_flag(
+            fields,
+            "runtime_generated_prefix_cache_requested",
+        )
+        gen_base_enabled = _cache_integrity_flag(
+            fields,
+            "runtime_generated_prefix_cache_base_enabled",
+        )
+        gen_effective_enabled = _cache_integrity_flag(
+            fields,
+            "runtime_generated_prefix_cache_effective_enabled",
+        )
+        prompt_lookup_enabled = _cache_integrity_flag(
+            fields,
+            "runtime_prompt_lookup_decode_effective_enabled",
+        )
+        store_logits_enabled = _cache_integrity_flag(
+            fields,
+            "runtime_prefix_cache_store_logits_enabled",
+        )
+        pinned_store_logits_enabled = _cache_integrity_flag(
+            fields,
+            "runtime_pinned_prefix_cache_store_logits_enabled",
+        )
         review_values = (
             gen_store,
             gen_reuse,
@@ -2903,6 +2945,13 @@ def _cache_integrity_rows(
             repeated_hits,
             repeated_tokens,
         )
+        review_flags = (
+            gen_requested,
+            gen_effective_enabled,
+            prompt_lookup_enabled,
+            store_logits_enabled,
+            pinned_store_logits_enabled,
+        )
         rows.append(
             (
                 _fmt_value(profile.temperature),
@@ -2911,6 +2960,12 @@ def _cache_integrity_rows(
                 _fmt_cache_integrity_counter(gen_store),
                 _fmt_cache_integrity_counter(gen_reuse),
                 _fmt_cache_integrity_counter(gen_tokens),
+                _fmt_cache_integrity_flag(gen_requested),
+                _fmt_cache_integrity_flag(gen_base_enabled),
+                _fmt_cache_integrity_flag(gen_effective_enabled),
+                _fmt_cache_integrity_flag(prompt_lookup_enabled),
+                _fmt_cache_integrity_flag(store_logits_enabled),
+                _fmt_cache_integrity_flag(pinned_store_logits_enabled),
                 _fmt_cache_integrity_counter(prompt_requests),
                 _fmt_cache_integrity_counter(prompt_proposed),
                 _fmt_cache_integrity_counter(prompt_accepted),
@@ -2920,7 +2975,12 @@ def _cache_integrity_rows(
                 _fmt_cache_integrity_counter(prefix_greedy),
                 _fmt_cache_integrity_counter(repeated_hits),
                 _fmt_cache_integrity_counter(repeated_tokens),
-                "review" if any(value > 0 for value in review_values) else "clean",
+                (
+                    "review"
+                    if any(value > 0 for value in review_values)
+                    or any(value is True for value in review_flags)
+                    else "clean"
+                ),
             )
         )
     return rows
@@ -2930,8 +2990,23 @@ def _cache_integrity_counter(fields: Mapping[str, Any], name: str) -> float:
     return _numeric_field(fields, name) or 0.0
 
 
+def _cache_integrity_flag(fields: Mapping[str, Any], name: str) -> bool | None:
+    raw = fields.get(name)
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, (int, float)):
+        return bool(raw)
+    return None
+
+
 def _fmt_cache_integrity_counter(value: float) -> str:
     return _fmt_value(_int_if_whole(value))
+
+
+def _fmt_cache_integrity_flag(value: bool | None) -> str:
+    if value is None:
+        return "-"
+    return "on" if value else "off"
 
 
 def _prefill_target_ms(fields: Mapping[str, Any]) -> float | None:

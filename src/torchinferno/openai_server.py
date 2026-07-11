@@ -7262,6 +7262,44 @@ class OpenAICompletionEngine:
             value = getattr(runtime_engine, attr_name, None)
             if isinstance(value, bool):
                 record[record_name] = value
+        generated_prefix_cache = getattr(runtime_engine, "generated_prefix_cache", None)
+        if generated_prefix_cache is None or isinstance(generated_prefix_cache, bool):
+            record["runtime_generated_prefix_cache_requested"] = generated_prefix_cache
+        for method_name, record_name in (
+            (
+                "_generated_prefix_cache_base_enabled",
+                "runtime_generated_prefix_cache_base_enabled",
+            ),
+            (
+                "_generated_prefix_cache_enabled",
+                "runtime_generated_prefix_cache_effective_enabled",
+            ),
+            (
+                "_prompt_lookup_decode_enabled",
+                "runtime_prompt_lookup_decode_effective_enabled",
+            ),
+        ):
+            method = getattr(runtime_engine, method_name, None)
+            if callable(method):
+                try:
+                    record[record_name] = bool(method())
+                except Exception as exc:
+                    warn_optional_failure(f"openai.queue_profile.{method_name}", exc)
+        store_logits = getattr(runtime_engine, "_prefix_cache_store_logits_enabled", None)
+        if callable(store_logits):
+            for allow_pinned, record_name in (
+                (False, "runtime_prefix_cache_store_logits_enabled"),
+                (True, "runtime_pinned_prefix_cache_store_logits_enabled"),
+            ):
+                try:
+                    record[record_name] = bool(store_logits(allow_pinned=allow_pinned))
+                except TypeError:
+                    try:
+                        record[record_name] = bool(store_logits())
+                    except Exception as exc:
+                        warn_optional_failure(f"openai.queue_profile.{record_name}", exc)
+                except Exception as exc:
+                    warn_optional_failure(f"openai.queue_profile.{record_name}", exc)
         decode_capture_on_miss = getattr(runtime_engine, "_decode_capture_on_miss", None)
         if callable(decode_capture_on_miss):
             try:

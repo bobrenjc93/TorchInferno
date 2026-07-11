@@ -5,6 +5,7 @@ import sys
 
 from torchinferno.research.inference_bench import (
     QueueProfileSummary,
+    _cache_integrity_rows,
     _decode_graph_cache_counts,
     _decode_graph_symm_counts,
     _decode_many_phase_rows,
@@ -438,6 +439,12 @@ def _write_inference_bench_run(tmp_path) -> None:
         "runtime_prompt_lookup_requests": 3,
         "runtime_prompt_lookup_proposed_tokens": 10,
         "runtime_prompt_lookup_accepted_tokens": 4,
+        "runtime_generated_prefix_cache_requested": True,
+        "runtime_generated_prefix_cache_base_enabled": True,
+        "runtime_generated_prefix_cache_effective_enabled": False,
+        "runtime_prompt_lookup_decode_effective_enabled": True,
+        "runtime_prefix_cache_store_logits_enabled": True,
+        "runtime_pinned_prefix_cache_store_logits_enabled": False,
         "runtime_reusable_prefix_entries": 5,
         "runtime_reusable_prefix_logits_entries": 2,
         "runtime_reusable_prefix_logits_tokens": 34,
@@ -1122,6 +1129,12 @@ def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) ->
     assert "gen_store" in text
     assert "gen_reuse" in text
     assert "gen_tokens" in text
+    assert "gen_req" in text
+    assert "gen_base" in text
+    assert "gen_on" in text
+    assert "prompt_lookup_on" in text
+    assert "store_logits" in text
+    assert "pin_logits" in text
     assert "prefill_graph_miss" in text
     assert "prefill_miss_kind" in text
     assert "ragged=6,static_logits=3" in text
@@ -1829,6 +1842,63 @@ def test_prefill_fixed_capacity_runtime_rows_show_acceptance_and_rejects() -> No
             "0",
             "0.0",
             "28117",
+        )
+    ]
+
+
+def test_cache_integrity_rows_flag_enabled_shortcut_config() -> None:
+    profile = QueueProfileSummary(
+        event="online_batcher_quiescent",
+        temperature=0.7,
+        max_tokens=256,
+        submitted_requests=64,
+        finished_events=64,
+        fields={
+            "runtime_generated_prefix_cache_requested": True,
+            "runtime_generated_prefix_cache_base_enabled": True,
+            "runtime_generated_prefix_cache_effective_enabled": False,
+            "runtime_prompt_lookup_decode_effective_enabled": True,
+            "runtime_prefix_cache_store_logits_enabled": False,
+            "runtime_pinned_prefix_cache_store_logits_enabled": True,
+            "runtime_generated_prefix_store_requests": 0,
+            "runtime_generated_prefix_reuse_requests": 0,
+            "runtime_generated_prefix_reuse_tokens": 0,
+            "runtime_prompt_lookup_requests": 0,
+            "runtime_prompt_lookup_proposed_tokens": 0,
+            "runtime_prompt_lookup_accepted_tokens": 0,
+            "runtime_reusable_prefix_logits_entries": 0,
+            "runtime_reusable_prefix_logits_tokens": 0,
+            "runtime_reusable_prefix_sample_state_entries": 0,
+            "runtime_reusable_prefix_greedy_token_entries": 0,
+            "runtime_repeated_sample_state_hits": 0,
+            "runtime_repeated_sample_state_tokens": 0,
+        },
+    )
+
+    assert _cache_integrity_rows([profile]) == [
+        (
+            "0.7",
+            "256",
+            "64",
+            "0",
+            "0",
+            "0",
+            "on",
+            "on",
+            "off",
+            "on",
+            "off",
+            "on",
+            "0",
+            "0",
+            "0",
+            "0",
+            "0",
+            "0",
+            "0",
+            "0",
+            "0",
+            "review",
         )
     ]
 

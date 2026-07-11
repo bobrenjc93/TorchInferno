@@ -15060,6 +15060,27 @@ decode label from old no-sync profiles. Long_output remains decode-led
 fair targets stay normal prefill body efficiency, cached-prefix suffix prefill,
 and high-active decode-many replay cost.
 
+The cache-integrity guardrail now also records the risky cache configuration
+state, not just observed shortcut counters. Queue profiles expose whether the
+runtime requested generated-prefix caching, whether generated-prefix caching is
+effectively enabled, whether prompt-lookup decode is effectively enabled, and
+whether reusable-prefix stores would retain logits for normal or pinned
+prefixes. The inference-bench summary renders these as `gen_req`, `gen_on`,
+`prompt_lookup_on`, `store_logits`, and `pin_logits`, and marks a row `review`
+when any risky mode is on even if no request happened to hit it. Older public
+artifacts render `-` for the new fields and keep the current clean verdict.
+
+A focused few_shot token-prefill max-token expansion probe remains rejected.
+Forcing token suffix graphs for both `128` and `256` max-token greedy rows plus
+the public hot `122:16` pair wrote
+`/tmp/inference-bench-few-token256b-results/.../runs/20260711_223457`. It
+stayed correct at `977/1000` and integrity-clean, but scored only
+`169.6 / 33.2 / 196.3ms`, `5.9 tok/s`, while startup rose to `246.1s` with an
+extra `29.9s` 256-token suffix warmup pass. The queue profile still spent
+`1756.9ms` of prefill graph GPU time on the same `b32:s16:p122-122` body, so
+this is not a default lever. The few_shot target remains the cached-prefix
+prefill body and padding, not token selection or logits materialization.
+
 The fixed-capacity packed-prefix probe is also rejected on current evidence.
 The long_output run with
 `TORCHINFERNO_CONTINUOUS_PACKED_RAGGED_PREFILL_FIXED_CAPACITY_GRAPH=1` accepted

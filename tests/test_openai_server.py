@@ -16302,6 +16302,7 @@ def test_openai_queue_profile_records_reusable_prefix_payloads(
     engine = _cache_only_engine()
 
     class RuntimeEngine:
+        generated_prefix_cache = True
         reusable_prefixes = {
             "kv-only": types.SimpleNamespace(
                 tokens=(1, 2, 3),
@@ -16323,9 +16324,27 @@ def test_openai_queue_profile_records_reusable_prefix_payloads(
             ),
         }
 
+        def _generated_prefix_cache_base_enabled(self) -> bool:
+            return True
+
+        def _generated_prefix_cache_enabled(self) -> bool:
+            return False
+
+        def _prompt_lookup_decode_enabled(self) -> bool:
+            return True
+
+        def _prefix_cache_store_logits_enabled(self, *, allow_pinned: bool) -> bool:
+            return allow_pinned
+
     engine._record_runtime_engine_queue_profile("online_batcher", RuntimeEngine())
 
     record = json.loads(profile_path.read_text().splitlines()[0])
+    assert record["runtime_generated_prefix_cache_requested"] is True
+    assert record["runtime_generated_prefix_cache_base_enabled"] is True
+    assert record["runtime_generated_prefix_cache_effective_enabled"] is False
+    assert record["runtime_prompt_lookup_decode_effective_enabled"] is True
+    assert record["runtime_prefix_cache_store_logits_enabled"] is False
+    assert record["runtime_pinned_prefix_cache_store_logits_enabled"] is True
     assert record["runtime_reusable_prefix_entries"] == 3
     assert record["runtime_reusable_prefix_logits_entries"] == 1
     assert record["runtime_reusable_prefix_logits_tokens"] == 2
