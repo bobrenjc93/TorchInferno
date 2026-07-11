@@ -415,6 +415,7 @@ class TorchInfernoProfilerSummary:
     self_cuda_ms: float | None = None
     allreduce_ms: float = 0.0
     gemm_ms: float = 0.0
+    marlin_ms: float = 0.0
     attention_ms: float = 0.0
     add_rms_ms: float = 0.0
     softmax_ms: float = 0.0
@@ -1362,6 +1363,8 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
                     "allreduce_pct",
                     "gemm_ms",
                     "gemm_pct",
+                    "marlin_ms",
+                    "marlin_pct",
                     "attention_ms",
                     "attention_pct",
                     "add_rms_ms",
@@ -1873,6 +1876,7 @@ def _parse_torchinferno_profiler_events(
                 "self_cuda_ms": None,
                 "allreduce_ms": 0.0,
                 "gemm_ms": 0.0,
+                "marlin_ms": 0.0,
                 "attention_ms": 0.0,
                 "add_rms_ms": 0.0,
                 "softmax_ms": 0.0,
@@ -1983,6 +1987,7 @@ def _torchinferno_profiler_event_from_fields(
         ),
         allreduce_ms=float(fields["allreduce_ms"]),
         gemm_ms=float(fields["gemm_ms"]),
+        marlin_ms=float(fields["marlin_ms"]),
         attention_ms=float(fields["attention_ms"]),
         add_rms_ms=float(fields["add_rms_ms"]),
         softmax_ms=float(fields["softmax_ms"]),
@@ -2011,6 +2016,8 @@ def _profiler_row_category(line: str) -> str | None:
     lowered = line.lower()
     if "allreduce" in lowered or "all_reduce" in lowered or "all-reduce" in lowered:
         return "allreduce_ms"
+    if "marlin" in lowered:
+        return "marlin_ms"
     if "gemm" in lowered or "nvjet" in lowered or "_scaled_mm" in lowered:
         return "gemm_ms"
     if "add_rms_norm" in lowered or "rms_norm" in lowered:
@@ -2140,6 +2147,8 @@ def _torchinferno_profiler_event_rows(
                 _fmt_pct(event.allreduce_ms, event.self_cuda_ms or 0.0),
                 _fmt_value(event.gemm_ms),
                 _fmt_pct(event.gemm_ms, event.self_cuda_ms or 0.0),
+                _fmt_value(event.marlin_ms),
+                _fmt_pct(event.marlin_ms, event.self_cuda_ms or 0.0),
                 _fmt_value(event.attention_ms),
                 _fmt_pct(event.attention_ms, event.self_cuda_ms or 0.0),
                 _fmt_value(event.add_rms_ms),
