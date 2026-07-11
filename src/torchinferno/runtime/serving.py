@@ -149,7 +149,7 @@ def _decode_many_queue_profile_gpu_timing_enabled() -> bool:
     env_name = "TORCHINFERNO_CONTINUOUS_DECODE_MANY_GPU_EVENT_TIMING"
     if env_name in os.environ:
         return env_flag(env_name, False)
-    return False
+    return _queue_profile_counts_enabled()
 
 
 def _packed_prefill_eager_pattern_matches(

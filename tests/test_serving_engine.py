@@ -8440,7 +8440,7 @@ def test_continuous_batch_engine_decode_many_queue_profile_gpu_timing_gate(
     assert engine._decode_gpu_event_timing_enabled("decode_many") is False
 
     monkeypatch.setenv("TORCHINFERNO_OPENAI_QUEUE_PROFILE_JSONL", "/tmp/queue.jsonl")
-    assert engine._decode_gpu_event_timing_enabled("decode_many") is False
+    assert engine._decode_gpu_event_timing_enabled("decode_many") is True
 
     monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_DECODE_MANY_GPU_EVENT_TIMING", "1")
     assert engine._decode_gpu_event_timing_enabled("decode_many") is True

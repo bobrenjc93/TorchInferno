@@ -45,6 +45,22 @@ gap at TorchInferno `193.7 / 19.0 / 845.2ms`, `40.7 tok/s`, versus vLLM
 `runtime_prompt_lookup_accepted_tokens=0`; remaining reuse is ordinary
 `common_prefix` KV reuse.
 
+## Current 20260711 decode-many timing default
+
+A current-head TorchInferno-only `long_output` timing run on `2cbbabc`, with
+`TORCHINFERNO_CONTINUOUS_DECODE_MANY_GPU_EVENT_TIMING=1`, wrote
+`/tmp/inference-bench-ti-long-timed-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local/runs/20260711_183553`.
+It stayed `1000/1000` correct and scored `205.8 / 21.5 / 1034.0ms`,
+`36.8 tok/s`. The useful evidence is the decode attribution:
+`runtime_decode_many_model_gpu_ms=6551.2ms` over `120` decode-many calls,
+`524` internal steps, and `26.7K` model tokens. The hot window was again
+`decode_many:b64/64:g1-16`, at `2023.7ms` for `10.1K` model tokens.
+
+Queue-profile runs now collect this decode-many CUDA-event timing by default;
+`TORCHINFERNO_CONTINUOUS_DECODE_MANY_GPU_EVENT_TIMING=0` remains an explicit
+opt-out. This keeps public profiles attributable without enabling full sync
+timing or changing scheduling/model behavior.
+
 ## Current 20260711 guarded long-output baseline
 
 A current-head TorchInferno-only `long_output` run on pushed `8b8cc67`, through
