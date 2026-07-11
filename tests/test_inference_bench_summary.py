@@ -1547,6 +1547,32 @@ def test_inference_bench_summary_cli_filters_benchmarks(tmp_path) -> None:
     assert "torchinferno" not in result.stdout.split("[long_output]", maxsplit=1)[1].splitlines()[2]
 
 
+def test_inference_bench_summary_cli_accepts_results_json_path(tmp_path) -> None:
+    _write_inference_bench_run(tmp_path)
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "torchinferno.cli",
+            "inference-bench-summary",
+            str(tmp_path / "results.json"),
+            "--benchmark",
+            "long_output",
+            "--provider",
+            "torchinferno",
+        ],
+        check=True,
+        env={**os.environ, "PYTHONPATH": "src"},
+        text=True,
+        capture_output=True,
+    )
+
+    assert "TorchInferno inference-bench summary" in result.stdout
+    assert "[long_output]" in result.stdout
+    assert "torchinferno" in result.stdout
+
+
 def test_inference_bench_summary_module_cli(tmp_path) -> None:
     _write_inference_bench_run(tmp_path)
 

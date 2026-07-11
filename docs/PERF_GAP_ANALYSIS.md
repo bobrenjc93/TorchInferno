@@ -1,5 +1,31 @@
 # TorchInferno vs vLLM/sglang — Performance Gap Analysis (Llama-3.1-70B, 8xH100)
 
+## Current 20260711 prefix-copy volume refresh
+
+The latest public run remains `20260711_132252`. A current-head TorchInferno
+long_output refresh on pushed `f37f38e` wrote
+`/tmp/inference-bench-prefixcopy-f37f38e-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-prefixcopy-f37f38e/runs/20260711_150438`
+and completed `1000/1000` correct at `213.3 / 21.7 / 985.7ms`, `36.2 tok/s`.
+This is in the same band as the accepted startup cleanup and the earlier
+decode-many timing refresh, so it does not change the score-facing diagnosis.
+
+The new prefix-copy counters show `60` prefix-copy batches and `209024`
+copied prefix cells, all marked shared: `runtime_prefill_prefix_copy_tokens =
+runtime_prefill_prefix_copy_shared_tokens = 209024`, with
+`runtime_prefill_prefix_copy_masked_tail_tokens=0` and no skipped batches. That
+rules out a mixed-prefix masked-tail split as a long_output fix. The copied
+volume is real, but it is uniform common-prefix replay (`p111`, `src1`) and the
+existing warm-row skip remains rejected because it shifts traffic onto `src0`
+graph shapes and has already regressed measured runs.
+
+The useful prefill target is still the padded suffix body, not the prefix copy:
+the same run reports `51129` prefill model tokens, `29653` padding tokens
+(`39.9%`), and `60` packed candidates saving exactly those `29653` tokens, but
+only `6/60` packed pattern repeats (`10.0%`) and `2/60` exact signature
+repeats (`3.3%`). That keeps fixed-capacity/exact-replay packing rejected for
+long_output and points back to a dynamic-count packed cached-prefix prefill
+body, alongside the separate high-active decode replay target.
+
 ## Current 20260711 long-output decode-many timing refresh
 
 The latest public run is still `20260711_132252`; re-rendering it through

@@ -1745,9 +1745,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     inference_bench_summary = subparsers.add_parser(
         "inference-bench-summary",
-        help="Summarize an inference-bench run directory across providers and TorchInferno queue profiles.",
+        help="Summarize an inference-bench run across providers and TorchInferno queue profiles.",
     )
-    inference_bench_summary.add_argument("run_dir", help="Path to an inference-bench run directory containing results.json.")
+    inference_bench_summary.add_argument(
+        "run_dir",
+        help="Path to an inference-bench run directory or results.json file.",
+    )
     inference_bench_summary.add_argument(
         "--benchmark",
         action="append",

@@ -463,7 +463,7 @@ def summarize_inference_bench_run(
     benchmarks: Sequence[str] | None = None,
     providers: Sequence[str] | None = None,
 ) -> InferenceBenchRunSummary:
-    """Summarize an inference-bench run directory.
+    """Summarize an inference-bench run directory or its results.json file.
 
     The public inference-bench artifact stores comparable provider metrics in
     results.json and TorchInferno's internal phase counters in provider_logs.
@@ -471,6 +471,8 @@ def summarize_inference_bench_run(
     """
 
     root = Path(run_dir)
+    if root.is_file():
+        root = root.parent
     data_path = root / "results.json"
     data = json.loads(data_path.read_text())
     provider_map = data.get("providers", {})
@@ -4453,7 +4455,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         prog="python -m torchinferno.research.inference_bench",
         description="Summarize an inference-bench run directory.",
     )
-    parser.add_argument("run_dir", help="Path to an inference-bench run directory containing results.json.")
+    parser.add_argument("run_dir", help="Path to an inference-bench run directory or results.json file.")
     parser.add_argument(
         "--benchmark",
         action="append",
