@@ -7788,19 +7788,10 @@ class ContinuousBatchEngine:
         )
 
     def _generated_prefix_cache_enabled(self) -> bool:
-        if not self._generated_prefix_cache_base_enabled():
-            return False
-        configured = self.generated_prefix_cache
-        if configured is not None:
-            return bool(configured)
-        if env_flag("TORCHINFERNO_CONTINUOUS_GENERATED_PREFIX_CACHE", False):
-            return True
-        if not env_flag("TORCHINFERNO_CONTINUOUS_ADAPTIVE_GENERATED_PREFIX_CACHE", False):
-            return False
-        return any(
-            isinstance(route_id, tuple) and route_id[:1] == ("generated_prefix",)
-            for route_id in self.reusable_prefixes
-        )
+        # Cached generated-prefix logits are intentionally inert. Normal KV
+        # prefix reuse remains available, but stale constructor/env flags must
+        # not change scheduling now that the logits cache path is removed.
+        return False
 
     def _should_collect_generated_prefix_logits(self, states: list[_ActiveRequest]) -> bool:
         del states

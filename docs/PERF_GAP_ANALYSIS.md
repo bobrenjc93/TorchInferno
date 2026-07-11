@@ -27,6 +27,11 @@ override `INFERENCE_BENCH_TORCHINFERNO_ALLOW_LOGITS_CACHES=1` is set. This
 protects public comparisons even when the runner happens to build an older
 TorchInferno commit.
 
+A follow-up hardening pass makes the runtime generated-prefix cache gate itself
+inert. The old constructor/env flags can no longer disable decode-many or
+decode graph capture after the cached-logits implementation has been removed;
+ordinary KV prefix reuse and finished-prefix KV diagnostics remain separate.
+
 ## Current 20260711 guarded long-output baseline
 
 A current-head TorchInferno-only `long_output` run on pushed `8b8cc67`, through

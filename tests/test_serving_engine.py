@@ -6838,7 +6838,7 @@ def test_continuous_batch_engine_dispatches_bucketed_decode_graphs() -> None:
     assert engine.stats.decode_model_calls == 2
 
 
-def test_continuous_batch_engine_skips_decode_capture_for_generated_prefix_cache(
+def test_continuous_batch_engine_generated_prefix_cache_flag_does_not_block_decode_capture(
     monkeypatch,
 ) -> None:
     monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_DECODE_CAPTURE", raising=False)
@@ -6861,17 +6861,11 @@ def test_continuous_batch_engine_skips_decode_capture_for_generated_prefix_cache
     )
 
     assert [len(result.tokens) for result in results] == [5, 5]
-    assert model.capture_flags == [False, False, False, False]
-    assert model.static_token_graph_calls == 0
+    assert model.capture_flags == [True, True]
+    assert model.static_token_graph_calls == 2
     assert model.static_logits_graph_calls == 0
-    assert engine.stats.decode_graph_hits == 0
-    assert engine.stats.decode_graph_misses == 4
-    assert engine.stats.decode_graph_miss_shape_counts == {
-        "static_decode:token:b2:s2": 1,
-        "static_decode:logits:b2:s2": 1,
-        "static_decode:token:b2:s3": 1,
-        "static_decode:logits:b2:s3": 1,
-    }
+    assert engine.stats.decode_graph_hits == 2
+    assert engine.stats.decode_graph_misses == 0
     assert engine.stats.decode_model_calls == 2
 
 
