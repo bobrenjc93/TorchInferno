@@ -1188,9 +1188,14 @@ class ContinuousBatchEngine:
 
             admitted = self._admit_ready_requests(waiting, step, len(active))
             if admitted:
+                active_gpu_state_current = self._active_gpu_decode_state_is_current(active)
                 admitted_results, admitted_active = self._prefill_many(admitted, step, events=events)
                 indexed_results.extend(admitted_results)
                 active.extend(admitted_active)
+                self._mark_gpu_decode_state_current_for_active(
+                    active,
+                    previous_active_current=active_gpu_state_current,
+                )
 
             if not self.decode_first and active:
                 decoded_results, active = self._decode_active(active, step + 1, events=events)
@@ -1218,8 +1223,13 @@ class ContinuousBatchEngine:
 
                 admitted = self._admit_ready_requests(waiting, step, len(active))
                 if admitted:
+                    active_gpu_state_current = self._active_gpu_decode_state_is_current(active)
                     _admitted_results, admitted_active = self._prefill_many(admitted, step, events=step_events)
                     active.extend(admitted_active)
+                    self._mark_gpu_decode_state_current_for_active(
+                        active,
+                        previous_active_current=active_gpu_state_current,
+                    )
 
                 if not self.decode_first and active:
                     _decoded_results, active = self._decode_active(active, step + 1, events=step_events)
@@ -2101,11 +2111,18 @@ class ContinuousBatchEngine:
         if self.profile_timings:
             self.stats._admit_ms = getattr(self.stats, '_admit_ms', 0.0) + (time.perf_counter() - _admit_start) * 1000.0
         if admitted:
+            active_gpu_state_current = self._active_gpu_decode_state_is_current(active)
             if self.prefill_chunk_size:
-                active.extend(self._admit_to_prefilling(admitted, step, events=events))
+                admitted_active = self._admit_to_prefilling(admitted, step, events=events)
+                self._set_gpu_decode_state_for_active(admitted_active)
+                active.extend(admitted_active)
             else:
                 _admitted_results, admitted_active = self._prefill_many(admitted, step, events=events)
                 active.extend(admitted_active)
+            self._mark_gpu_decode_state_current_for_active(
+                active,
+                previous_active_current=active_gpu_state_current,
+            )
 
         if active and decode_after_admit:
             _decoded_results, active = self._decode_active(active, step + 1, events=events)
@@ -6629,6 +6646,25 @@ class ContinuousBatchEngine:
             [state.last_token for state in states],
             [state.seq_len for state in states],
         )
+        self._decode_many_gpu_state_signature = self._make_decode_many_gpu_state_signature(
+            list(states)
+        )
+
+    def _active_gpu_decode_state_is_current(self, states: Sequence[_ActiveRequest]) -> bool:
+        if not states:
+            return True
+        return self._decode_many_gpu_state_is_current(
+            self._make_decode_many_gpu_state_signature(list(states))
+        )
+
+    def _mark_gpu_decode_state_current_for_active(
+        self,
+        states: Sequence[_ActiveRequest],
+        *,
+        previous_active_current: bool,
+    ) -> None:
+        if not previous_active_current or not states:
+            return
         self._decode_many_gpu_state_signature = self._make_decode_many_gpu_state_signature(
             list(states)
         )

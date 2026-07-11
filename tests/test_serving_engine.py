@@ -8167,6 +8167,55 @@ def test_continuous_batch_engine_online_many_skips_redundant_gpu_state_sync(
     assert model.ragged_logits_graph_calls == 5
 
 
+def test_continuous_batch_engine_online_refill_preserves_decode_many_gpu_state(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY", "1")
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_UNIFORM_RAGGED_DECODE", "1")
+    model = _RaggedGraphToyModel(vocab_size=128)
+    engine = ContinuousBatchEngine(
+        model,
+        device=torch.device("cpu"),
+        max_active_requests=3,
+        prefix_cache_capacity=0,
+        enable_ragged_decode=True,
+        store_reusable_prefixes=False,
+    )
+    engine.start_online(max_seq_len=16)
+    engine.submit_online(ServingRequest("a", (1, 2, 3), 5, arrival_step=0))
+    engine.submit_online(ServingRequest("b", (3, 4, 5), 5, arrival_step=0))
+
+    first = engine.step_online()
+    engine.submit_online(ServingRequest("c", (10, 11, 12), 5, arrival_step=0))
+    refill = engine.step_online()
+    many_events, many_steps = engine.step_online_many(2)
+
+    assert [(event.request_id, event.token, event.generated, event.finished) for event in first] == [
+        ("a", 4, 1, False),
+        ("b", 6, 1, False),
+    ]
+    assert [(event.request_id, event.token, event.generated, event.finished) for event in refill] == [
+        ("a", 5, 2, False),
+        ("b", 7, 2, False),
+        ("c", 13, 1, False),
+    ]
+    assert many_steps == 2
+    assert [(event.request_id, event.token, event.generated, event.finished) for event in many_events] == [
+        ("a", 6, 3, False),
+        ("b", 8, 3, False),
+        ("c", 14, 2, False),
+        ("a", 7, 4, False),
+        ("b", 9, 4, False),
+        ("c", 15, 3, False),
+    ]
+    assert engine.stats.decode_many_calls == 1
+    assert engine.stats.decode_many_state_syncs == 0
+    assert engine.stats.decode_many_state_sync_skips == 1
+    assert engine._decode_many_gpu_state_signature == engine._make_decode_many_gpu_state_signature(
+        engine._online_active
+    )
+
+
 def test_continuous_batch_engine_online_many_omits_row_indices_for_contiguous_greedy_decode(
     monkeypatch,
 ) -> None:

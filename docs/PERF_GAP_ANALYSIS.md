@@ -14122,6 +14122,21 @@ this change. The research summary now keeps and prints `many_syncs` and
 `many_sync_skips` so public no-sync queue profiles can confirm whether prefill
 seeding eliminated decode-many state uploads.
 
+The first local 8xH100 focused run after that push, on `9eabb34`, completed
+both previously failing public rows:
+`/tmp/inference-bench-local-9eabb34-results/.../runs/20260711_085121`.
+TorchInferno landed at `219.7 / 36.7 / 248.3ms`, `982/1000` correct on
+multi_turn, and `214.0 / 21.4 / 959.4ms`, `1000/1000` correct on long_output.
+The public pointer was still stale at `20260711_030227` on TorchInferno
+`54cb558`, so this is the current-head signal. The new `many_syncs` counters
+showed the prefill seeding only partially removed state uploads: long_output
+had `124` decode-many calls with `77` state-sync skips but still `47` full
+state syncs, because refill prefill waves seeded only the newly admitted rows
+and left the combined active-list signature stale. The runtime now preserves
+the combined GPU decode-state signature when an already-current active set is
+extended by a prefilled refill wave, with a focused CPU regression covering the
+mid-session refill -> decode-many path.
+
 ## Priority for a focused (non-loop) session
 
 1. Prefill MFU (Issue 1) — biggest TTFT lever, ~2x, affects 3/5 benchmarks.
