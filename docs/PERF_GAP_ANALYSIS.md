@@ -15298,6 +15298,18 @@ the current public long_output artifact shows high-active `g1-16` windows as
 the dominant decode cost, but old artifacts cannot prove which of those
 windows contain the stop finishes versus ordinary full-batch decode work.
 
+A current-head long_output refresh on `1ff0015` wrote
+`/tmp/inference-bench-ti-long-window-1ff-20260711_181131-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-window-1ff/runs/20260712_011131`.
+It stayed correct (`1000/1000`) and cache-integrity clean, scoring
+`209.9 / 21.7 / 940.5ms`, `36.5 tok/s`. Exact window finish counters show the
+hot `decode_many:b64/64:g1-16` row at `2682.9ms`, `13376` model tokens,
+`12563` emitted tokens, `813` skipped tokens, and `329` stop finishes. The
+whole decode-many phase spent `6710.9ms` for `28703` model tokens and `27200`
+emitted tokens, with `1503` skipped/overgenerated tokens (`5.2%`). This rules
+out stop-tail policy as the main long_output closure lever on the default
+request flow: even perfect stop handling would leave the dominant high-active
+decode replay and `4546.6ms` cached-prefix prefill body.
+
 ## Priority for a focused (non-loop) session
 
 1. Prefill MFU (Issue 1) — biggest TTFT lever, ~2x, affects 3/5 benchmarks.

@@ -1696,6 +1696,9 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
                         "stop_fin",
                         "limit_fin",
                         "fin_src",
+                        "skip_ms_est",
+                        "skip_ms_share",
+                        "skip_stop",
                         "gpu_ms",
                         "gpu_src",
                         "cpu_ms",
@@ -5579,6 +5582,12 @@ def _decode_many_step_window_target_rows(
                 stop_finishes = None
                 limit_finishes = None
                 finish_source = "-"
+            skip_ms: float | None = None
+            if gpu_ms is not None and model_tokens > 0.0:
+                skip_ms = gpu_ms * max(0.0, skipped) / model_tokens
+            skip_per_stop: float | None = None
+            if stop_finishes is not None and stop_finishes > 0.0:
+                skip_per_stop = skipped / stop_finishes
             score_ms = total_ms if total_ms is not None else -1.0
             items.append(
                 (
@@ -5606,6 +5615,16 @@ def _decode_many_step_window_target_rows(
                             else _int_if_whole(limit_finishes)
                         ),
                         finish_source,
+                        _fmt_value(None if skip_ms is None else _int_if_whole(skip_ms)),
+                        _fmt_pct(
+                            float(skip_ms or 0.0),
+                            float(total_decode_many_ms or 0.0),
+                        ),
+                        _fmt_value(
+                            None
+                            if skip_per_stop is None
+                            else _int_if_whole(skip_per_stop)
+                        ),
                         _fmt_value(None if gpu_ms is None else _int_if_whole(gpu_ms)),
                         gpu_src if gpu_ms is not None else "-",
                         _fmt_value(

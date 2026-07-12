@@ -1320,6 +1320,9 @@ def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) ->
     assert "stop_fin" in text
     assert "limit_fin" in text
     assert "fin_src" in text
+    assert "skip_ms_est" in text
+    assert "skip_ms_share" in text
+    assert "skip_stop" in text
     assert "window" in text
     assert "605.3" in text
     assert "77.0%" in text
