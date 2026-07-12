@@ -1311,6 +1311,8 @@ def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) ->
     assert "tok_share" in text
     assert "total_share" in text
     assert "us_tok" in text
+    assert "shape_stop_fin" in text
+    assert "shape_limit_fin" in text
     assert "605.3" in text
     assert "77.0%" in text
     assert "decode_many:b8/8:g1-16" in text

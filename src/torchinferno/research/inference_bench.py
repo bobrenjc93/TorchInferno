@@ -1689,6 +1689,8 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
                         "emitted",
                         "skipped",
                         "skip_pct",
+                        "shape_stop_fin",
+                        "shape_limit_fin",
                         "gpu_ms",
                         "gpu_src",
                         "cpu_ms",
@@ -5504,6 +5506,12 @@ def _decode_many_step_window_target_rows(
         shape_gpu_ms = _numeric_mapping(
             fields.get("runtime_decode_many_shape_gpu_ms")
         )
+        shape_stop_finishes = _numeric_mapping(
+            fields.get("runtime_decode_many_shape_stop_finishes")
+        )
+        shape_limit_finishes = _numeric_mapping(
+            fields.get("runtime_decode_many_shape_limit_finishes")
+        )
         window_model_ms = _numeric_mapping(
             fields.get("runtime_decode_many_step_window_model_ms")
         )
@@ -5554,6 +5562,12 @@ def _decode_many_step_window_target_rows(
                         _fmt_value(_int_if_whole(window_emitted.get(window, 0.0))),
                         _fmt_value(_int_if_whole(skipped)),
                         _fmt_pct(skipped, model_tokens),
+                        _fmt_value(
+                            _int_if_whole(shape_stop_finishes.get(shape, 0.0))
+                        ),
+                        _fmt_value(
+                            _int_if_whole(shape_limit_finishes.get(shape, 0.0))
+                        ),
                         _fmt_value(None if gpu_ms is None else _int_if_whole(gpu_ms)),
                         gpu_src if gpu_ms is not None else "-",
                         _fmt_value(
