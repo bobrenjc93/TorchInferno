@@ -1599,6 +1599,8 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
                         "dynamic_saved",
                         "row_saved",
                         "suffix_saved",
+                        "exact_saved",
+                        "exact_cover",
                         "fixed_saved",
                         "fixed_cover",
                         "target",
@@ -6265,6 +6267,7 @@ def _prefill_packed_dynamic_target_rows(
         pattern_max_slots, _runtime_slot_patterns, _pattern_signature_calls = (
             _prefill_packed_pattern_slot_summary(fields, pattern_calls)
         )
+        pattern_exact_saved = _prefill_packed_pattern_exact_repeat_saved(fields)
         total_prefill_ms = _prefill_total_dense_forward_ms(fields)
         for pattern, dynamic_saved in pattern_saved.items():
             call_count = max(0.0, float(pattern_calls.get(pattern, 0.0)))
@@ -6281,8 +6284,13 @@ def _prefill_packed_dynamic_target_rows(
                 ),
             )
             fixed_saved_value = min(dynamic_saved, max(0.0, float(fixed_saved or 0.0)))
+            exact_saved_value = min(
+                dynamic_saved,
+                max(0.0, float(pattern_exact_saved.get(pattern, 0.0))),
+            )
             target = _prefill_packed_dynamic_target_label(
                 dynamic_saved=dynamic_saved,
+                exact_saved=exact_saved_value,
                 fixed_saved=fixed_saved_value,
             )
             est_saved_ms = _prefill_packed_fixed_capacity_saved_ms(
@@ -6338,6 +6346,8 @@ def _prefill_packed_dynamic_target_rows(
                             if suffix_saved is None
                             else _int_if_whole(suffix_saved)
                         ),
+                        _fmt_value(_int_if_whole(exact_saved_value)),
+                        _fmt_pct(exact_saved_value, dynamic_saved),
                         _fmt_value(_int_if_whole(fixed_saved_value)),
                         _fmt_pct(fixed_saved_value, dynamic_saved),
                         target,
@@ -6375,16 +6385,46 @@ def _prefill_packed_dynamic_target_rows(
 def _prefill_packed_dynamic_target_label(
     *,
     dynamic_saved: float,
+    exact_saved: float,
     fixed_saved: float,
 ) -> str:
     if dynamic_saved <= 0.0:
         return "inspect"
+    exact_cover = float(exact_saved) / float(dynamic_saved)
+    if exact_cover >= 0.9:
+        return "exact_replay"
     fixed_cover = float(fixed_saved) / float(dynamic_saved)
     if fixed_cover >= 0.9:
         return "fixed_replay"
     if fixed_saved <= 0.0:
         return "dynamic_count"
     return "partial_fixed"
+
+
+def _prefill_packed_pattern_exact_repeat_saved(
+    fields: dict[str, Any],
+) -> dict[str, float]:
+    exact_saved: dict[str, float] = {}
+    signature_counts = _numeric_mapping(
+        fields.get("runtime_prefill_packed_candidate_signature_counts")
+    )
+    signature_saved = _numeric_mapping(
+        fields.get("runtime_prefill_packed_candidate_signature_saved_tokens")
+    )
+    if not signature_counts or not signature_saved:
+        return exact_saved
+    for signature, count in signature_counts.items():
+        if count <= 1.0:
+            continue
+        parsed = _parse_packed_prefill_signature_key(signature)
+        if parsed is None:
+            continue
+        pattern, _group_counts = parsed
+        exact_saved[pattern] = exact_saved.get(pattern, 0.0) + max(
+            0.0,
+            float(signature_saved.get(signature, 0.0)),
+        )
+    return exact_saved
 
 
 def _prefill_non_fragmenting_target_rows(

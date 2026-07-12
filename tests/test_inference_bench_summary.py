@@ -1416,6 +1416,7 @@ def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) ->
     assert "fixed_saved_pct" in text
     assert "dynamic_saved" in text
     assert "fixed_cover" in text
+    assert "exact_cover" in text
     assert "dynamic_count" in text
     assert "repeat_saved" in text
     assert "sig_cov" in text
@@ -1855,6 +1856,8 @@ def test_dynamic_packed_prefill_targets_use_gpu_replay_timing_without_sync() -> 
             "12",
             "0",
             "0.0%",
+            "0",
+            "0.0%",
             "dynamic_count",
             "8",
             "2",
@@ -1901,6 +1904,8 @@ def test_dynamic_packed_prefill_targets_estimate_older_runs_from_total_replay() 
             "16",
             "-",
             "-",
+            "0",
+            "0.0%",
             "0",
             "0.0%",
             "dynamic_count",
@@ -1956,7 +1961,9 @@ def test_dynamic_packed_prefill_targets_infer_saved_sources_from_signatures() ->
             "8",
             "24",
             "100.0%",
-            "fixed_replay",
+            "24",
+            "100.0%",
+            "exact_replay",
             "12",
             "8",
             "4",
@@ -2319,6 +2326,8 @@ def test_prefill_fixed_capacity_reject_rows_show_over_dense_patterns() -> None:
             "5088",
             "-",
             "-",
+            "0",
+            "0.0%",
             "0",
             "0.0%",
             "dynamic_count",

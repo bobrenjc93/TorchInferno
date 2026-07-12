@@ -21,15 +21,16 @@ saved tokens, hot prefill `b24:s64:p111-111:src1:mixed0`, and hot decode
 the next non-gaming work on real decode-body and cached-prefix suffix-prefill
 costs rather than prompt/logits reuse.
 
-The analyzer now labels packed dynamic target rows as `fixed_replay`,
-`dynamic_count`, or `partial_fixed` based on fixed-capacity coverage. Re-rendering
-`20260712_090215` shows the public few_shot `p122:s12/s13/s14` row as
-`dynamic_count` (`0.0%` fixed cover, `3131` saved suffix tokens), and the
-long_output `p111:s32-39` row as `dynamic_count` (`0.0%` fixed cover, `2226`
-saved tokens in that pattern). The sampled tree rows with exact fixed cover are
-now visibly `fixed_replay`. This keeps the implementation target precise:
+The analyzer now labels packed dynamic target rows as `exact_replay`,
+`fixed_replay`, `dynamic_count`, or `partial_fixed` based on exact-signature
+and fixed-capacity coverage. Re-rendering `20260712_090215` shows the public
+few_shot `p122:s12/s13/s14` row as `dynamic_count` (`36.0%` exact cover,
+`0.0%` fixed cover, `3131` saved suffix tokens), and the long_output
+`p111:s32-39` row as `dynamic_count` (`0.0%` exact/fixed cover, `2226` saved
+tokens in that pattern). The sampled tree rows with repeated exact signatures
+are now visibly `exact_replay`. This keeps the implementation target precise:
 greedy cached-prefix rows need a dynamic q-lens/count packed body, not another
-fixed-capacity graph promotion.
+exact-signature or fixed-capacity graph promotion.
 
 A current-head long_output prefill-replay profiler run on `c71ec5f` wrote
 `/tmp/inference-bench-long-prefill-replay-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-long-prefill-replay-c71ec5f/runs/20260712_085647`.
