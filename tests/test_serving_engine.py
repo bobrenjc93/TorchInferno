@@ -3741,6 +3741,25 @@ def test_continuous_batch_engine_flushes_packed_eager_gpu_shape_times_without_pr
     assert engine._pending_packed_prefill_eager_events == []
 
 
+def test_continuous_batch_engine_start_online_clears_pending_gpu_timers() -> None:
+    engine = ContinuousBatchEngine(
+        _SelectedLogitsToyModel(),
+        device=torch.device("cpu"),
+        max_active_requests=2,
+        prefix_cache_capacity=0,
+        profile_timings=False,
+    )
+    engine._pending_prefill_graph_events = [(object(),)]
+    engine._pending_packed_prefill_eager_events = [(object(),)]
+    engine._pending_decode_ragged_model_events = [(object(),)]
+
+    engine.start_online(max_seq_len=8)
+
+    assert engine._pending_prefill_graph_events == []
+    assert engine._pending_packed_prefill_eager_events == []
+    assert engine._pending_decode_ragged_model_events == []
+
+
 def test_continuous_batch_engine_counts_ragged_prefill_miss_shapes() -> None:
     model = _SelectedRaggedGraphMissToyModel()
     engine = ContinuousBatchEngine(

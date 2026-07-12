@@ -2770,6 +2770,7 @@ class ContinuousBatchEngine:
         self._online_step = 0
         self._online_next_index = 0
         self._pending_prefill_graph_events = []
+        self._pending_packed_prefill_eager_events = []
         self._pending_decode_ragged_model_events = []
 
     def _admit_ready_requests(
