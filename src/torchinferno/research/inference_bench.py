@@ -1601,6 +1601,7 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
                         "suffix_saved",
                         "fixed_saved",
                         "fixed_cover",
+                        "target",
                         "est_saved_ms",
                         "row_ms_est",
                         "suffix_ms_est",
@@ -6280,6 +6281,10 @@ def _prefill_packed_dynamic_target_rows(
                 ),
             )
             fixed_saved_value = min(dynamic_saved, max(0.0, float(fixed_saved or 0.0)))
+            target = _prefill_packed_dynamic_target_label(
+                dynamic_saved=dynamic_saved,
+                fixed_saved=fixed_saved_value,
+            )
             est_saved_ms = _prefill_packed_fixed_capacity_saved_ms(
                 fields,
                 pattern,
@@ -6335,6 +6340,7 @@ def _prefill_packed_dynamic_target_rows(
                         ),
                         _fmt_value(_int_if_whole(fixed_saved_value)),
                         _fmt_pct(fixed_saved_value, dynamic_saved),
+                        target,
                         _fmt_value(
                             None
                             if est_saved_ms is None
@@ -6364,6 +6370,21 @@ def _prefill_packed_dynamic_target_rows(
             )
     items.sort(key=lambda item: (-item[0], -item[1], item[2]))
     return [item[3] for item in items[:limit]]
+
+
+def _prefill_packed_dynamic_target_label(
+    *,
+    dynamic_saved: float,
+    fixed_saved: float,
+) -> str:
+    if dynamic_saved <= 0.0:
+        return "inspect"
+    fixed_cover = float(fixed_saved) / float(dynamic_saved)
+    if fixed_cover >= 0.9:
+        return "fixed_replay"
+    if fixed_saved <= 0.0:
+        return "dynamic_count"
+    return "partial_fixed"
 
 
 def _prefill_non_fragmenting_target_rows(
