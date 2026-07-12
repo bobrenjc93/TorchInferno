@@ -5,8 +5,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 SCORE_FACING_PATHS = (
     "src/torchinferno/runtime/serving.py",
+    "src/torchinferno/runtime/paged_serving.py",
     "src/torchinferno/openai_server.py",
     "src/torchinferno/openai_http.py",
+    "src/torchinferno/server/openai_server.py",
     "src/torchinferno/models/llama3/tensor_parallel.py",
 )
 
@@ -57,10 +59,7 @@ def _docstring_value_nodes(module: ast.Module) -> set[int]:
 
 
 def test_score_facing_serving_has_no_exact_prompt_logits_cache_symbols() -> None:
-    source_by_path = {
-        "src/torchinferno/runtime/serving.py": _source("src/torchinferno/runtime/serving.py"),
-        "src/torchinferno/openai_server.py": _source("src/torchinferno/openai_server.py"),
-    }
+    source_by_path = {path: _source(path) for path in SCORE_FACING_PATHS}
     prohibited = (
         "_prompt_logits_cache",
         "_prompt_logits_cache_map",
