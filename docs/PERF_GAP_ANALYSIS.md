@@ -64,6 +64,21 @@ allocator/reorder hypothesis for the current long_output gap; the remaining
 target is still a non-fragmenting cached-prefix suffix body or a cheaper
 high-active decode body.
 
+A greedy-short suffix-bucket refinement probe is also rejected. Running
+current `bcef67b` with
+`TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SUFFIX_BUCKETS=16,32,48,64,80,96,128,256`
+wrote
+`/tmp/inference-bench-long-suffix-buckets-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-long-suffix-buckets48-80-bcef67b/runs/20260712_093917`.
+It stayed correct (`1000/1000`) and cache-integrity clean: generated-prefix
+store/reuse/tokens, prompt lookup, reusable-prefix logits, and repeated-sample
+hits were all zero. The finer buckets lowered prefill replay GPU
+(`3.89s` versus `4.84s` in the nearby profiled control) and reduced packed
+candidate savings (`16.4K` versus `26.3K`), but fragmented the schedule:
+decode-many rose to `581` steps, `30.7K` model tokens, `36.0K` padded tokens,
+and `7.36s` GPU. The score regressed to `220.8 / 23.2 / 1326.5ms`,
+`27.3 tok/s`. Do not add `48/80` to the default greedy-short suffix buckets;
+the prefix target needs a non-fragmenting body, not more bucket fragmentation.
+
 A local TorchInferno-only long_output probe on current `831eb65` forced
 fixed-capacity packed prefill with the new shape counters:
 `/tmp/inference-bench-long-fixedcap-shapes-831-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-long-fixedcap-shapes-831eb65/runs/20260712_075855`.
