@@ -15428,6 +15428,8 @@ def test_openai_queue_profile_records_runtime_engine_stats(
         decode_many_step_window_padded_tokens = {"decode_many:b8/8:g1-16": 24}
         decode_many_step_window_emitted_tokens = {"decode_many:b8/8:g1-16": 15}
         decode_many_step_window_skipped_tokens = {"decode_many:b8/8:g1-16": 4}
+        decode_many_step_window_stop_finishes = {"decode_many:b8/8:g1-16": 3}
+        decode_many_step_window_limit_finishes = {"decode_many:b8/8:g1-16": 2}
         decode_many_step_window_model_ms = {"decode_many:b8/8:g1-16": 14.25}
         decode_many_step_window_token_wait_ms = {"decode_many:b8/8:g1-16": 2.25}
         decode_many_step_window_token_materialize_ms = {
@@ -15841,6 +15843,12 @@ def test_openai_queue_profile_records_runtime_engine_stats(
             },
             "runtime_decode_many_step_window_skipped_tokens": {
                 "decode_many:b8/8:g1-16": 4,
+            },
+            "runtime_decode_many_step_window_stop_finishes": {
+                "decode_many:b8/8:g1-16": 3,
+            },
+            "runtime_decode_many_step_window_limit_finishes": {
+                "decode_many:b8/8:g1-16": 2,
             },
             "runtime_decode_many_step_window_token_wait_ms": {
                 "decode_many:b8/8:g1-16": 2.25,

@@ -535,6 +535,8 @@ class ServingStats:
     decode_many_step_window_padded_tokens: dict[str, int] = field(default_factory=dict)
     decode_many_step_window_emitted_tokens: dict[str, int] = field(default_factory=dict)
     decode_many_step_window_skipped_tokens: dict[str, int] = field(default_factory=dict)
+    decode_many_step_window_stop_finishes: dict[str, int] = field(default_factory=dict)
+    decode_many_step_window_limit_finishes: dict[str, int] = field(default_factory=dict)
     decode_many_step_window_model_ms: dict[str, float] = field(default_factory=dict)
     decode_many_step_window_cpu_tokens_ms: dict[str, float] = field(default_factory=dict)
     decode_many_step_window_token_wait_ms: dict[str, float] = field(default_factory=dict)
@@ -1845,6 +1847,16 @@ class ContinuousBatchEngine:
                     step_window_key,
                     record_skipped_tokens,
                 )
+                record_total(
+                    self.stats.decode_many_step_window_stop_finishes,
+                    step_window_key,
+                    record_stop_finishes,
+                )
+                record_total(
+                    self.stats.decode_many_step_window_limit_finishes,
+                    step_window_key,
+                    record_limit_finishes,
+                )
 
         self.stats.decode_many_calls += 1
         self.stats.decode_many_steps += steps_run
@@ -2004,6 +2016,16 @@ class ContinuousBatchEngine:
                     self.stats.decode_many_step_window_skipped_tokens,
                     step_window_key,
                     0,
+                )
+                record_total(
+                    self.stats.decode_many_step_window_stop_finishes,
+                    step_window_key,
+                    record_stop_finishes,
+                )
+                record_total(
+                    self.stats.decode_many_step_window_limit_finishes,
+                    step_window_key,
+                    record_limit_finishes,
                 )
                 if self.profile_timings:
                     if record_sync_model_timing:

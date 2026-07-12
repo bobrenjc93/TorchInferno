@@ -7838,6 +7838,8 @@ class OpenAICompletionEngine:
                 "decode_many_step_window_padded_tokens",
                 "decode_many_step_window_emitted_tokens",
                 "decode_many_step_window_skipped_tokens",
+                "decode_many_step_window_stop_finishes",
+                "decode_many_step_window_limit_finishes",
                 "persistent_full_prompt_reuse_candidate_token_counts",
                 "persistent_full_prompt_reuse_candidate_extra_token_counts",
                 "persistent_full_prompt_reuse_candidate_suffix_token_counts",

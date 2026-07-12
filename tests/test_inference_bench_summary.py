@@ -432,6 +432,12 @@ def _write_inference_bench_run(tmp_path) -> None:
         "runtime_decode_many_step_window_skipped_tokens": {
             "decode_many:b8/8:g1-16": 4,
         },
+        "runtime_decode_many_step_window_stop_finishes": {
+            "decode_many:b8/8:g1-16": 3,
+        },
+        "runtime_decode_many_step_window_limit_finishes": {
+            "decode_many:b8/8:g1-16": 2,
+        },
         "runtime_decode_many_step_window_model_ms": {
             "decode_many:b8/8:g1-16": 11.5,
         },
@@ -1311,8 +1317,10 @@ def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) ->
     assert "tok_share" in text
     assert "total_share" in text
     assert "us_tok" in text
-    assert "shape_stop_fin" in text
-    assert "shape_limit_fin" in text
+    assert "stop_fin" in text
+    assert "limit_fin" in text
+    assert "fin_src" in text
+    assert "window" in text
     assert "605.3" in text
     assert "77.0%" in text
     assert "decode_many:b8/8:g1-16" in text

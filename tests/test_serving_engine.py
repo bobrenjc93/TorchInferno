@@ -8342,6 +8342,12 @@ def test_continuous_batch_engine_online_many_shape_model_tokens_include_padding(
     assert engine.stats.decode_many_step_window_padded_tokens == {"decode_many:b3/4:g1-16": 8}
     assert engine.stats.decode_many_step_window_emitted_tokens == {"decode_many:b3/4:g1-16": 6}
     assert engine.stats.decode_many_step_window_skipped_tokens == {"decode_many:b3/4:g1-16": 0}
+    assert engine.stats.decode_many_step_window_stop_finishes == {
+        "decode_many:b3/4:g1-16": 0,
+    }
+    assert engine.stats.decode_many_step_window_limit_finishes == {
+        "decode_many:b3/4:g1-16": 3,
+    }
     assert engine.stats.decode_many_step_window_model_ms["decode_many:b3/4:g1-16"] >= 0.0
     assert (
         engine.stats.decode_many_step_window_cpu_tokens_ms["decode_many:b3/4:g1-16"]
@@ -8421,6 +8427,12 @@ def test_continuous_batch_engine_records_decode_many_shapes_for_queue_profile_wi
     }
     assert engine.stats.decode_many_step_window_skipped_tokens == {
         "decode_many:b3/4:g1-16": 0,
+    }
+    assert engine.stats.decode_many_step_window_stop_finishes == {
+        "decode_many:b3/4:g1-16": 0,
+    }
+    assert engine.stats.decode_many_step_window_limit_finishes == {
+        "decode_many:b3/4:g1-16": 3,
     }
     assert engine.stats.decode_many_shape_model_ms == {}
     assert engine.stats.decode_many_step_window_model_ms == {}
@@ -8878,6 +8890,12 @@ def test_continuous_batch_engine_online_many_can_overcompute_stop_tokens(monkeyp
     assert engine.stats.decode_many_step_window_counts == {"decode_many:b2/2:g1-16": 3}
     assert engine.stats.decode_many_step_window_emitted_tokens == {"decode_many:b2/2:g1-16": 4}
     assert engine.stats.decode_many_step_window_skipped_tokens == {"decode_many:b2/2:g1-16": 2}
+    assert engine.stats.decode_many_step_window_stop_finishes == {
+        "decode_many:b2/2:g1-16": 1,
+    }
+    assert engine.stats.decode_many_step_window_limit_finishes == {
+        "decode_many:b2/2:g1-16": 1,
+    }
     assert engine.stats.ragged_decode_active_tokens == 6
     assert engine.stats.ragged_decode_padding_tokens == 0
     assert not engine.has_online_work()
@@ -8952,6 +8970,14 @@ def test_continuous_batch_engine_online_many_can_sync_stop_tokens(monkeypatch) -
     assert engine.stats.decode_many_shape_limit_finishes == {
         "decode_many:b2/2": 2,
         "decode_many:b3/3": 0,
+    }
+    assert engine.stats.decode_many_step_window_stop_finishes == {
+        "decode_many:b2/2:g1-16": 0,
+        "decode_many:b3/3:g1-16": 1,
+    }
+    assert engine.stats.decode_many_step_window_limit_finishes == {
+        "decode_many:b2/2:g1-16": 2,
+        "decode_many:b3/3:g1-16": 0,
     }
     assert set(engine.stats.decode_many_step_window_cpu_tokens_ms) == {
         "decode_many:b2/2:g1-16",

@@ -356,6 +356,8 @@ _QUEUE_PROFILE_FIELDS = (
     "runtime_decode_many_step_window_padded_tokens",
     "runtime_decode_many_step_window_emitted_tokens",
     "runtime_decode_many_step_window_skipped_tokens",
+    "runtime_decode_many_step_window_stop_finishes",
+    "runtime_decode_many_step_window_limit_finishes",
     "runtime_decode_many_step_window_model_ms",
     "runtime_decode_many_step_window_cpu_tokens_ms",
     "runtime_decode_many_step_window_token_wait_ms",
@@ -1661,6 +1663,8 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
                         "padded_tokens",
                         "emitted",
                         "skipped",
+                        "stop_fin",
+                        "limit_fin",
                         "skip_pct",
                         "model_ms",
                         "cpu_ms",
@@ -1689,8 +1693,9 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
                         "emitted",
                         "skipped",
                         "skip_pct",
-                        "shape_stop_fin",
-                        "shape_limit_fin",
+                        "stop_fin",
+                        "limit_fin",
+                        "fin_src",
                         "gpu_ms",
                         "gpu_src",
                         "cpu_ms",
@@ -5436,6 +5441,14 @@ def _decode_many_step_window_rows(
                 fields.get("runtime_decode_many_step_window_skipped_tokens"),
                 key,
             )
+            stop_finishes = _mapping_value(
+                fields.get("runtime_decode_many_step_window_stop_finishes"),
+                key,
+            )
+            limit_finishes = _mapping_value(
+                fields.get("runtime_decode_many_step_window_limit_finishes"),
+                key,
+            )
             cpu_ms = _mapping_value(
                 fields.get("runtime_decode_many_step_window_cpu_tokens_ms"),
                 key,
@@ -5463,6 +5476,8 @@ def _decode_many_step_window_rows(
                     _fmt_value(padded_tokens),
                     _fmt_value(emitted_tokens),
                     _fmt_value(skipped_tokens),
+                    _fmt_value(stop_finishes),
+                    _fmt_value(limit_finishes),
                     _fmt_pct(
                         float(skipped_tokens or 0),
                         float(model_tokens or 0),
@@ -5524,6 +5539,12 @@ def _decode_many_step_window_target_rows(
         window_skipped = _numeric_mapping(
             fields.get("runtime_decode_many_step_window_skipped_tokens")
         )
+        window_stop_finishes = _numeric_mapping(
+            fields.get("runtime_decode_many_step_window_stop_finishes")
+        )
+        window_limit_finishes = _numeric_mapping(
+            fields.get("runtime_decode_many_step_window_limit_finishes")
+        )
         window_cpu_ms = _numeric_mapping(
             fields.get("runtime_decode_many_step_window_cpu_tokens_ms")
         )
@@ -5546,6 +5567,18 @@ def _decode_many_step_window_target_rows(
             if gpu_ms is not None or cpu_ms is not None:
                 total_ms = (gpu_ms or 0.0) + (cpu_ms or 0.0)
             skipped = float(window_skipped.get(window, 0.0))
+            if window in window_stop_finishes or window in window_limit_finishes:
+                stop_finishes = window_stop_finishes.get(window, 0.0)
+                limit_finishes = window_limit_finishes.get(window, 0.0)
+                finish_source = "window"
+            elif shape in shape_stop_finishes or shape in shape_limit_finishes:
+                stop_finishes = shape_stop_finishes.get(shape, 0.0)
+                limit_finishes = shape_limit_finishes.get(shape, 0.0)
+                finish_source = "shape"
+            else:
+                stop_finishes = None
+                limit_finishes = None
+                finish_source = "-"
             score_ms = total_ms if total_ms is not None else -1.0
             items.append(
                 (
@@ -5563,11 +5596,16 @@ def _decode_many_step_window_target_rows(
                         _fmt_value(_int_if_whole(skipped)),
                         _fmt_pct(skipped, model_tokens),
                         _fmt_value(
-                            _int_if_whole(shape_stop_finishes.get(shape, 0.0))
+                            None
+                            if stop_finishes is None
+                            else _int_if_whole(stop_finishes)
                         ),
                         _fmt_value(
-                            _int_if_whole(shape_limit_finishes.get(shape, 0.0))
+                            None
+                            if limit_finishes is None
+                            else _int_if_whole(limit_finishes)
                         ),
+                        finish_source,
                         _fmt_value(None if gpu_ms is None else _int_if_whole(gpu_ms)),
                         gpu_src if gpu_ms is not None else "-",
                         _fmt_value(

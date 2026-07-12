@@ -15289,6 +15289,15 @@ regressed to `481.0 / 39.1 / 2088.1ms`, `18.4 tok/s`. Startup also rose to
 scheduler warmup. Keep FlashInfer cache/packed prefill as an experiment-only
 path until it beats dense on the same public request flow.
 
+Decode-many profiles now record stop-token and max-token finishes at the same
+step-window grain as the timing rows. Existing public artifacts only have
+shape-level finish counters, so the implementation-target table labels those
+rows with `fin_src=shape`; future queue profiles will label exact window
+counters as `fin_src=window`. Use this before changing stop-tail policy again:
+the current public long_output artifact shows high-active `g1-16` windows as
+the dominant decode cost, but old artifacts cannot prove which of those
+windows contain the stop finishes versus ordinary full-batch decode work.
+
 ## Priority for a focused (non-loop) session
 
 1. Prefill MFU (Issue 1) — biggest TTFT lever, ~2x, affects 3/5 benchmarks.
