@@ -15310,6 +15310,19 @@ out stop-tail policy as the main long_output closure lever on the default
 request flow: even perfect stop handling would leave the dominant high-active
 decode replay and `4546.6ms` cached-prefix prefill body.
 
+The analyzer now also splits prefill padding cost by source. It reports
+proportional `row_ms_est` and `suffix_ms_est` columns in the hot prefill-shape
+table, `row_saved_ms` and `suffix_saved_ms` in packed per-batch targets, and
+phase-level `row_ms_est` / `sfx_ms_est` for prefill graph replay. Re-rendering
+the same current-head long_output artifact estimates the `4546.6ms` prefill
+graph phase as `463.7ms` row padding and `1349.2ms` suffix padding. The hot
+`prefix_graph:b24:s64:p111-111:src1:mixed0` shape is similarly
+suffix-dominant: `128.3ms` row padding versus `505.5ms` suffix padding. On the
+latest public `20260711_230213` long_output row, the phase estimate is
+`523.9ms` row padding and `1195.4ms` suffix padding. This keeps the next fair
+prefill target focused on a non-fragmenting cached-prefix suffix body rather
+than another row-packing or stop-tail policy change.
+
 ## Priority for a focused (non-loop) session
 
 1. Prefill MFU (Issue 1) — biggest TTFT lever, ~2x, affects 3/5 benchmarks.

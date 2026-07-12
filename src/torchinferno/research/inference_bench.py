@@ -1194,6 +1194,8 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
                         "pad_call",
                         "row_pad",
                         "suffix_pad",
+                        "row_ms_est",
+                        "suffix_ms_est",
                         "graphs",
                     ),
                     prefill_rows,
@@ -1242,6 +1244,8 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
                         "max_call_pct",
                         "max_call_groups",
                         "est_saved_ms",
+                        "row_saved_ms",
+                        "suffix_saved_ms",
                         "est_share",
                         "obs_packed_ms",
                         "groups",
@@ -1539,6 +1543,8 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
                         "padding",
                         "row_pad",
                         "sfx_pad",
+                        "row_ms_est",
+                        "sfx_ms_est",
                         "pad_pct",
                         "active_tok_s",
                         "model_tok_s",
@@ -3625,6 +3631,21 @@ def _ratio_or_none(
     return float(numerator) * float(scale) / float(denominator)
 
 
+def _proportional_token_ms(
+    total_ms: Any,
+    tokens: Any,
+    model_tokens: Any,
+) -> float | None:
+    if not all(
+        isinstance(value, (int, float))
+        for value in (total_ms, tokens, model_tokens)
+    ):
+        return None
+    if float(total_ms) <= 0.0 or float(model_tokens) <= 0.0:
+        return None
+    return float(total_ms) * max(0.0, float(tokens)) / float(model_tokens)
+
+
 def _int_if_whole(value: float | int) -> float | int:
     if isinstance(value, float) and value.is_integer():
         return int(value)
@@ -3773,6 +3794,17 @@ def _hot_prefill_shape_rows(
                 fields.get("runtime_prefill_shape_suffix_padding_tokens"),
                 shape,
             )
+            dense_ms = _prefill_shape_dense_forward_ms(fields, shape)
+            row_padding_ms = _proportional_token_ms(
+                dense_ms,
+                row_padding_tokens,
+                model_tokens,
+            )
+            suffix_padding_ms = _proportional_token_ms(
+                dense_ms,
+                suffix_padding_tokens,
+                model_tokens,
+            )
             rows.append(
                 (
                     _fmt_value(profile.temperature),
@@ -3820,6 +3852,16 @@ def _hot_prefill_shape_rows(
                     _fmt_value(_ratio_or_none(padding_tokens, calls)),
                     _fmt_value(row_padding_tokens),
                     _fmt_value(suffix_padding_tokens),
+                    _fmt_value(
+                        None
+                        if row_padding_ms is None
+                        else _int_if_whole(row_padding_ms)
+                    ),
+                    _fmt_value(
+                        None
+                        if suffix_padding_ms is None
+                        else _int_if_whole(suffix_padding_ms)
+                    ),
                     _fmt_value(fields.get("runtime_prefill_graph_cache_live_entries")),
                 )
             )
@@ -3959,6 +4001,16 @@ def _prefill_packed_per_batch_target_rows(
             has_split = shape in shape_row_saved or shape in shape_suffix_saved
             row_saved = shape_row_saved.get(shape, 0.0) if has_split else None
             suffix_saved = shape_suffix_saved.get(shape, 0.0) if has_split else None
+            row_saved_ms = _proportional_token_ms(
+                forward_ms,
+                row_saved,
+                model_tokens,
+            )
+            suffix_saved_ms = _proportional_token_ms(
+                forward_ms,
+                suffix_saved,
+                model_tokens,
+            )
             items.append(
                 (
                     score_ms,
@@ -4003,6 +4055,16 @@ def _prefill_packed_per_batch_target_rows(
                             None
                             if est_saved_ms is None
                             else _int_if_whole(est_saved_ms)
+                        ),
+                        _fmt_value(
+                            None
+                            if row_saved_ms is None
+                            else _int_if_whole(row_saved_ms)
+                        ),
+                        _fmt_value(
+                            None
+                            if suffix_saved_ms is None
+                            else _int_if_whole(suffix_saved_ms)
                         ),
                         _fmt_pct(
                             float(est_saved_ms or 0.0),
@@ -5194,6 +5256,16 @@ def _prefill_graph_phase_rows(
         ):
             padding_tokens = max(0.0, model_tokens - active_tokens)
         row_padding_tokens, suffix_padding_tokens = _prefill_padding_split_totals(fields)
+        row_padding_ms = _proportional_token_ms(
+            gpu_ms,
+            row_padding_tokens,
+            model_tokens,
+        )
+        suffix_padding_ms = _proportional_token_ms(
+            gpu_ms,
+            suffix_padding_tokens,
+            model_tokens,
+        )
         if not any(
             isinstance(value, (int, float)) and float(value) > 0.0
             for value in (
@@ -5230,6 +5302,16 @@ def _prefill_graph_phase_rows(
                 _fmt_value(
                     _int_if_whole(suffix_padding_tokens)
                     if suffix_padding_tokens is not None
+                    else None
+                ),
+                _fmt_value(
+                    _int_if_whole(row_padding_ms)
+                    if row_padding_ms is not None
+                    else None
+                ),
+                _fmt_value(
+                    _int_if_whole(suffix_padding_ms)
+                    if suffix_padding_ms is not None
                     else None
                 ),
                 _fmt_pct(float(padding_tokens or 0.0), float(model_tokens or 0.0)),

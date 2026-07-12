@@ -1116,6 +1116,7 @@ def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) ->
     assert "hot_decode" in text
     assert "[torchinferno prefill graph phase]" in text
     assert "active_tok_s" in text
+    assert "sfx_ms_est" in text
     assert "[torchinferno decode-many phase]" in text
     assert "emit_tok_s" in text
     assert "overgen_pct" in text
@@ -1236,6 +1237,8 @@ def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) ->
     assert "slot_src" in text
     assert "runtime" in text
     assert "est_saved_ms" in text
+    assert "row_saved_ms" in text
+    assert "suffix_saved_ms" in text
     assert "fixed_saved_pct" in text
     assert "dynamic_saved" in text
     assert "fixed_cover" in text
@@ -1300,6 +1303,8 @@ def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) ->
     assert "35.4%" in text
     assert "row_pad" in text
     assert "suffix_pad" in text
+    assert "row_ms_est" in text
+    assert "suffix_ms_est" in text
     assert "graph_gpu_ms" in text
     assert "[torchinferno hot prefill graph shapes]" in text
     assert "capture_gpu_ms" in text
@@ -1750,6 +1755,8 @@ def test_prefill_graph_phase_rows_summarize_padding_and_throughput() -> None:
             "10",
             "3",
             "7",
+            "1",
+            "2.3",
             "33.3%",
             "2000.0",
             "3000.0",
