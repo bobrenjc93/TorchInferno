@@ -3956,6 +3956,114 @@ def test_continuous_batch_engine_can_opt_into_packed_ragged_prefill_eager_graph(
     assert engine.stats.prefill_packed_eager_saved_tokens == 2
 
 
+def test_continuous_batch_engine_auto_packed_ragged_prefill_graph_reuses_signature(
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_PACKED_RAGGED_PREFILL_EAGER", raising=False)
+    monkeypatch.delenv(
+        "TORCHINFERNO_CONTINUOUS_PACKED_RAGGED_PREFILL_EAGER_PATTERN",
+        raising=False,
+    )
+    monkeypatch.setenv(
+        "TORCHINFERNO_CONTINUOUS_PACKED_RAGGED_PREFILL_AUTO_GRAPH",
+        "1",
+    )
+    monkeypatch.setenv(
+        "TORCHINFERNO_CONTINUOUS_PACKED_RAGGED_PREFILL_AUTO_GRAPH_MIN_CALLS",
+        "2",
+    )
+    model = _SelectedLogitsToyModel()
+    engine = ContinuousBatchEngine(
+        model,
+        device=torch.device("cpu"),
+        max_active_requests=2,
+        prefix_cache_capacity=0,
+        profile_timings=True,
+    )
+    engine.start_online(max_seq_len=8)
+    shape_key = "prefix_graph:b2:s4:p0-0:src0:mixed0"
+    auto_signature = (shape_key, (0, 0), (2, 4), 0, -1)
+    input_ids = torch.tensor([[1, 2, 0, 0], [3, 4, 5, 6]], dtype=torch.long)
+    seq_lens = torch.zeros(2, dtype=torch.long)
+    row_indices = torch.tensor([0, 1], dtype=torch.long)
+    logit_positions = torch.tensor([1, 3], dtype=torch.long)
+
+    first = engine._try_ragged_prefill_logits(
+        input_ids,
+        seq_lens,
+        row_indices,
+        logit_positions,
+        capture_on_miss=False,
+        profile_shape_key=shape_key,
+        packed_prefill_auto_signature=auto_signature,
+    )
+    second = engine._try_ragged_prefill_logits(
+        input_ids,
+        seq_lens,
+        row_indices,
+        logit_positions,
+        capture_on_miss=False,
+        profile_shape_key=shape_key,
+        packed_prefill_auto_signature=auto_signature,
+    )
+
+    assert first is not None
+    assert second is not None
+    assert model.packed_prefill_graph_q_lens == [[2, 4]]
+    assert model.packed_prefill_q_lens == []
+    assert model.prefill_capture_flags == [False, False]
+    assert engine.stats.prefill_packed_auto_graph_candidates == 2
+    assert engine.stats.prefill_packed_auto_graph_attempts == 1
+    assert engine.stats.prefill_packed_auto_graph_hits == 1
+    assert engine.stats.prefill_packed_auto_graph_misses == 0
+    assert engine.stats.prefill_packed_auto_graph_saved_tokens == 4
+    assert engine.stats.prefill_packed_auto_graph_shape_candidates == {shape_key: 2}
+    assert engine.stats.prefill_packed_auto_graph_shape_attempts == {shape_key: 1}
+    assert engine.stats.prefill_packed_auto_graph_shape_hits == {shape_key: 1}
+    assert engine.stats.prefill_packed_eager_calls == 1
+    assert engine.stats.prefill_packed_eager_tokens == 6
+    assert engine.stats.prefill_packed_eager_model_tokens == 8
+    assert engine.stats.prefill_packed_eager_saved_tokens == 2
+
+
+def test_continuous_batch_engine_auto_packed_ragged_prefill_graph_defaults_off(
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv(
+        "TORCHINFERNO_CONTINUOUS_PACKED_RAGGED_PREFILL_AUTO_GRAPH",
+        raising=False,
+    )
+    model = _SelectedLogitsToyModel()
+    engine = ContinuousBatchEngine(
+        model,
+        device=torch.device("cpu"),
+        max_active_requests=2,
+        prefix_cache_capacity=0,
+    )
+    engine.start_online(max_seq_len=8)
+    shape_key = "prefix_graph:b2:s4:p0-0:src0:mixed0"
+    auto_signature = (shape_key, (0, 0), (2, 4), 0, -1)
+
+    for _ in range(2):
+        logits = engine._try_ragged_prefill_logits(
+            torch.tensor([[1, 2, 0, 0], [3, 4, 5, 6]], dtype=torch.long),
+            torch.zeros(2, dtype=torch.long),
+            torch.tensor([0, 1], dtype=torch.long),
+            torch.tensor([1, 3], dtype=torch.long),
+            capture_on_miss=False,
+            profile_shape_key=shape_key,
+            packed_prefill_auto_signature=auto_signature,
+        )
+        assert logits is not None
+
+    assert model.packed_prefill_graph_q_lens == []
+    assert model.packed_prefill_q_lens == []
+    assert model.prefill_capture_flags == [False, False]
+    assert engine.stats.prefill_packed_auto_graph_candidates == 0
+    assert engine.stats.prefill_packed_auto_graph_attempts == 0
+    assert engine.stats.prefill_packed_eager_calls == 0
+
+
 def test_continuous_batch_engine_packed_ragged_prefill_graph_only_falls_back_to_dense_graph(
     monkeypatch,
 ) -> None:

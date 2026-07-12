@@ -15814,6 +15814,19 @@ warming or growing for this exact shape" from "the shape accepted but residual
 padding dominated," which is the evidence needed before replacing the current
 long_output dynamic-body gap with a real non-fragmenting packed prefill body.
 
+A local tree_of_thought probe with graph-only packed-prefill auto attempts
+enabled wrote
+`/tmp/inference-bench-tree-auto-packed-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-tree-auto-packed-c05238b-dirty/runs/20260712_081939`.
+It stayed cache-integrity clean, but regressed badly (`225.9 / 50.5 /
+301.3ms`, `4.9 tok/s`) while recording `122` auto candidates, `51` packed
+graph attempts, and `0` hits. The attempted shapes were the normal sampled
+tree suffix-prefill shapes (`b1/b2/b4/b8:s12:p45-45`) and did not involve
+prompt or benchmark identity, but the miss cost is enough to reject auto packed
+graphs as a default. The gate remains opt-in through
+`TORCHINFERNO_CONTINUOUS_PACKED_RAGGED_PREFILL_AUTO_GRAPH=1`; default serving
+continues to use the dense ragged graph until a non-fragmenting packed body or
+a repeatedly hitting graph policy is measured.
+
 ## Priority for a focused (non-loop) session
 
 1. Prefill MFU (Issue 1) — biggest TTFT lever, ~2x, affects 3/5 benchmarks.

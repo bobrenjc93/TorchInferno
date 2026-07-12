@@ -193,6 +193,10 @@ def _packed_prefill_fixed_capacity_enabled(
     )
 
 
+def _packed_prefill_auto_graph_enabled() -> bool:
+    return env_flag("TORCHINFERNO_CONTINUOUS_PACKED_RAGGED_PREFILL_AUTO_GRAPH", False)
+
+
 _PERSISTENT_FULL_PROMPT_REUSE_CANDIDATE_CACHE = PrefixCacheIndex()
 _PERSISTENT_FULL_PROMPT_REUSE_CANDIDATE_ORDER: list[Hashable] = []
 _PERSISTENT_FULL_PROMPT_REUSE_CANDIDATE_SEQUENCE = 0
@@ -558,6 +562,11 @@ class ServingStats:
     prefill_packed_eager_model_tokens: int = 0
     prefill_packed_eager_saved_tokens: int = 0
     prefill_packed_eager_ms: float = 0.0
+    prefill_packed_auto_graph_candidates: int = 0
+    prefill_packed_auto_graph_attempts: int = 0
+    prefill_packed_auto_graph_hits: int = 0
+    prefill_packed_auto_graph_misses: int = 0
+    prefill_packed_auto_graph_saved_tokens: int = 0
     prefill_packed_flashinfer_calls: int = 0
     prefill_packed_flashinfer_tokens: int = 0
     prefill_packed_flashinfer_model_tokens: int = 0
@@ -642,6 +651,11 @@ class ServingStats:
     prefill_packed_eager_shape_model_tokens: dict[str, int] = field(default_factory=dict)
     prefill_packed_eager_shape_saved_tokens: dict[str, int] = field(default_factory=dict)
     prefill_packed_eager_shape_ms: dict[str, float] = field(default_factory=dict)
+    prefill_packed_auto_graph_shape_candidates: dict[str, int] = field(default_factory=dict)
+    prefill_packed_auto_graph_shape_attempts: dict[str, int] = field(default_factory=dict)
+    prefill_packed_auto_graph_shape_hits: dict[str, int] = field(default_factory=dict)
+    prefill_packed_auto_graph_shape_misses: dict[str, int] = field(default_factory=dict)
+    prefill_packed_auto_graph_shape_saved_tokens: dict[str, int] = field(default_factory=dict)
     prefill_packed_candidate_shape_counts: dict[str, int] = field(default_factory=dict)
     prefill_packed_candidate_shape_tokens: dict[str, int] = field(default_factory=dict)
     prefill_packed_candidate_shape_model_tokens: dict[str, int] = field(default_factory=dict)
@@ -1107,6 +1121,8 @@ class ContinuousBatchEngine:
         self._packed_prefill_fixed_capacity_graph_none_keys: set[
             tuple[str, tuple[tuple[int, int], ...], int]
         ] = set()
+        self._packed_prefill_auto_graph_signature_seen: dict[tuple[object, ...], int] = {}
+        self._packed_prefill_auto_graph_none_signatures: set[tuple[object, ...]] = set()
         self._prefill_token_graph_miss_keys: set[str] = set()
         self._free_active_rows: list[int] = []
         self._free_prefix_rows: list[int] = []
@@ -2761,6 +2777,8 @@ class ContinuousBatchEngine:
         self._packed_prefill_fixed_capacity_seen = {}
         self._packed_prefill_fixed_capacity_stable_seen = {}
         self._packed_prefill_fixed_capacity_graph_none_keys = set()
+        self._packed_prefill_auto_graph_signature_seen = {}
+        self._packed_prefill_auto_graph_none_signatures = set()
         total_rows = self.max_active_requests + self.prefix_cache_capacity
         if external_cache is not None:
             self._cache = external_cache
@@ -3870,6 +3888,16 @@ class ContinuousBatchEngine:
             logits = None
             next_token_tensor: Tensor | None = None
             prefix_copy_len = max(prefix_hits) if mixed_prefixes and context_len is None else None
+            packed_prefill_auto_signature = (
+                shape_key,
+                tuple(start_lens),
+                tuple(
+                    [int(length) for length in suffix_lengths]
+                    + [1] * (len(start_lens) - len(suffix_lengths))
+                ),
+                len(source_prefix_rows),
+                prefix_copy_len if prefix_copy_len is not None else -1,
+            )
             output_group = group
             output_rows = rows
             output_suffix_lengths = suffix_lengths
@@ -3956,6 +3984,7 @@ class ContinuousBatchEngine:
                             capture_on_miss=self._prefix_prefill_capture_on_miss(batch_bucket),
                             profile_shape_key=shape_key,
                             packed_prefill_pattern_key=packed_prefill_pattern_key,
+                            packed_prefill_auto_signature=packed_prefill_auto_signature,
                         )
             if logits is None and next_token_tensor is None:
                 logits = self._ragged_prefill_logits_eager(
@@ -4249,6 +4278,87 @@ class ContinuousBatchEngine:
             profile_shape_key,
             elapsed_ms,
         )
+
+    def _should_try_packed_prefill_auto_graph(
+        self,
+        *,
+        graph: object,
+        packed_prefill_auto_signature: tuple[object, ...] | None,
+        profile_shape_key: str | None,
+        saved_tokens: int,
+        model_tokens: int,
+        capture_on_miss: bool,
+    ) -> bool:
+        if (
+            not _packed_prefill_auto_graph_enabled()
+            or not callable(graph)
+            or packed_prefill_auto_signature is None
+        ):
+            return False
+        min_saved_tokens = env_int(
+            "TORCHINFERNO_CONTINUOUS_PACKED_RAGGED_PREFILL_AUTO_GRAPH_MIN_SAVED_TOKENS",
+            2,
+            minimum=1,
+        )
+        if saved_tokens < min_saved_tokens:
+            return False
+        min_saved_pct = env_int(
+            "TORCHINFERNO_CONTINUOUS_PACKED_RAGGED_PREFILL_AUTO_GRAPH_MIN_SAVED_PCT",
+            5,
+            minimum=0,
+        )
+        if model_tokens > 0 and saved_tokens * 100 < model_tokens * min_saved_pct:
+            return False
+        signature = packed_prefill_auto_signature
+        if not capture_on_miss and signature in self._packed_prefill_auto_graph_none_signatures:
+            return False
+        seen = self._packed_prefill_auto_graph_signature_seen.get(signature, 0) + 1
+        self._packed_prefill_auto_graph_signature_seen[signature] = seen
+        self.stats.prefill_packed_auto_graph_candidates += 1
+        self.stats.prefill_packed_auto_graph_saved_tokens += int(saved_tokens)
+        if profile_shape_key is not None:
+            self._record_queue_profile_shape_count(
+                self.stats.prefill_packed_auto_graph_shape_candidates,
+                profile_shape_key,
+            )
+            self._record_queue_profile_shape_total(
+                self.stats.prefill_packed_auto_graph_shape_saved_tokens,
+                profile_shape_key,
+                int(saved_tokens),
+            )
+        min_calls = env_int(
+            "TORCHINFERNO_CONTINUOUS_PACKED_RAGGED_PREFILL_AUTO_GRAPH_MIN_CALLS",
+            2,
+            minimum=1,
+        )
+        return seen >= min_calls
+
+    def _record_packed_prefill_auto_graph_attempt(
+        self,
+        *,
+        profile_shape_key: str | None,
+    ) -> None:
+        self.stats.prefill_packed_auto_graph_attempts += 1
+        if profile_shape_key is not None:
+            self._record_queue_profile_shape_count(
+                self.stats.prefill_packed_auto_graph_shape_attempts,
+                profile_shape_key,
+            )
+
+    def _record_packed_prefill_auto_graph_result(
+        self,
+        *,
+        profile_shape_key: str | None,
+        hit: bool,
+    ) -> None:
+        if hit:
+            self.stats.prefill_packed_auto_graph_hits += 1
+            shape_counts = self.stats.prefill_packed_auto_graph_shape_hits
+        else:
+            self.stats.prefill_packed_auto_graph_misses += 1
+            shape_counts = self.stats.prefill_packed_auto_graph_shape_misses
+        if profile_shape_key is not None:
+            self._record_queue_profile_shape_count(shape_counts, profile_shape_key)
 
     def _record_prefix_copy_volume(
         self,
@@ -4677,6 +4787,7 @@ class ContinuousBatchEngine:
         capture_on_miss: bool = True,
         profile_shape_key: str | None = None,
         packed_prefill_pattern_key: str | None = None,
+        packed_prefill_auto_signature: tuple[object, ...] | None = None,
     ) -> Tensor | None:
         if not self._cache_supports_tensor_ragged_prefill():
             return None
@@ -4689,70 +4800,115 @@ class ContinuousBatchEngine:
                 profile_shape_key=profile_shape_key,
                 packed_prefill_pattern_key=packed_prefill_pattern_key,
             )
-        if packed_eager_enabled:
-            q_lens = logit_positions + 1
-            if bool(torch.any(q_lens < input_ids.size(1))):
-                packed_start_s = time.perf_counter() if self.profile_timings else 0.0
-                packed_gpu_events = self._start_packed_prefill_eager_gpu_timer()
-                logits = None
-                packed_graph_enabled = env_flag(
-                    "TORCHINFERNO_CONTINUOUS_PACKED_RAGGED_PREFILL_EAGER_GRAPH",
-                    False,
+        q_lens = logit_positions + 1
+        packed_graph = getattr(
+            self.model,
+            "try_prefill_ragged_logits_packed_eager_graph",
+            None,
+        )
+        model_tokens = int(input_ids.size(0) * input_ids.size(1))
+        auto_real_tokens = 0
+        if (
+            packed_prefill_auto_signature is not None
+            and len(packed_prefill_auto_signature) >= 3
+            and isinstance(packed_prefill_auto_signature[2], tuple)
+        ):
+            try:
+                auto_real_tokens = sum(
+                    int(value) for value in packed_prefill_auto_signature[2]
                 )
-                if packed_graph_enabled:
-                    packed_graph = getattr(
-                        self.model,
-                        "try_prefill_ragged_logits_packed_eager_graph",
-                        None,
-                    )
-                    if packed_graph is not None:
-                        logits = packed_graph(
-                            input_ids,
-                            self._require_cache(),
-                            seq_lens=seq_lens,
-                            q_lens=q_lens,
-                            row_indices=row_indices,
-                            logit_positions=logit_positions,
-                            src_prefix_row=src_prefix_row,
-                            prefix_copy_len=prefix_copy_len,
-                            capture_on_miss=capture_on_miss,
-                        )
-                packed_graph_only = packed_graph_enabled and env_flag(
-                    "TORCHINFERNO_CONTINUOUS_PACKED_RAGGED_PREFILL_EAGER_GRAPH_ONLY",
-                    False,
-                )
-                if logits is None and not packed_graph_only:
-                    packed_eager = getattr(self.model, "prefill_ragged_logits_packed_eager", None)
-                    if packed_eager is not None:
-                        logits = packed_eager(
-                            input_ids,
-                            self._require_cache(),
-                            seq_lens=seq_lens,
-                            q_lens=q_lens,
-                            row_indices=row_indices,
-                            logit_positions=logit_positions,
-                            src_prefix_row=src_prefix_row,
-                            prefix_copy_len=prefix_copy_len,
-                        )
-                if logits is not None:
-                    self._stop_packed_prefill_eager_gpu_timer(
-                        packed_gpu_events,
+            except (TypeError, ValueError):
+                auto_real_tokens = 0
+        auto_saved_tokens = max(0, model_tokens - auto_real_tokens)
+        auto_graph_enabled = (
+            not packed_eager_enabled
+            and auto_saved_tokens > 0
+            and self._should_try_packed_prefill_auto_graph(
+                graph=packed_graph,
+                packed_prefill_auto_signature=packed_prefill_auto_signature,
+                profile_shape_key=profile_shape_key,
+                saved_tokens=auto_saved_tokens,
+                model_tokens=model_tokens,
+                capture_on_miss=capture_on_miss,
+            )
+        )
+        has_packed_savings = (
+            True
+            if auto_graph_enabled
+            else bool(torch.any(q_lens < input_ids.size(1)))
+            if packed_eager_enabled
+            else False
+        )
+        if (packed_eager_enabled or auto_graph_enabled) and has_packed_savings:
+            packed_start_s = time.perf_counter() if self.profile_timings else 0.0
+            packed_gpu_events = self._start_packed_prefill_eager_gpu_timer()
+            logits = None
+            packed_graph_enabled = auto_graph_enabled or env_flag(
+                "TORCHINFERNO_CONTINUOUS_PACKED_RAGGED_PREFILL_EAGER_GRAPH",
+                False,
+            )
+            if packed_graph_enabled and packed_graph is not None:
+                if auto_graph_enabled:
+                    self._record_packed_prefill_auto_graph_attempt(
                         profile_shape_key=profile_shape_key,
                     )
-                    real_tokens = int(q_lens.sum().item())
-                    model_tokens = int(input_ids.size(0) * input_ids.size(1))
-                    elapsed_ms = (
-                        (time.perf_counter() - packed_start_s) * 1000.0
-                        if self.profile_timings
-                        else None
-                    )
-                    self._record_packed_prefill_eager_result(
+                logits = packed_graph(
+                    input_ids,
+                    self._require_cache(),
+                    seq_lens=seq_lens,
+                    q_lens=q_lens,
+                    row_indices=row_indices,
+                    logit_positions=logit_positions,
+                    src_prefix_row=src_prefix_row,
+                    prefix_copy_len=prefix_copy_len,
+                    capture_on_miss=capture_on_miss,
+                )
+                if auto_graph_enabled:
+                    self._record_packed_prefill_auto_graph_result(
                         profile_shape_key=profile_shape_key,
-                        real_tokens=real_tokens,
-                        model_tokens=model_tokens,
-                        elapsed_ms=elapsed_ms,
+                        hit=logits is not None,
                     )
-                    return logits
+                    if logits is None and not capture_on_miss:
+                        self._packed_prefill_auto_graph_none_signatures.add(
+                            packed_prefill_auto_signature
+                        )
+            packed_graph_only = packed_graph_enabled and env_flag(
+                "TORCHINFERNO_CONTINUOUS_PACKED_RAGGED_PREFILL_EAGER_GRAPH_ONLY",
+                False,
+            )
+            if auto_graph_enabled:
+                packed_graph_only = True
+            if logits is None and not packed_graph_only:
+                packed_eager = getattr(self.model, "prefill_ragged_logits_packed_eager", None)
+                if packed_eager is not None:
+                    logits = packed_eager(
+                        input_ids,
+                        self._require_cache(),
+                        seq_lens=seq_lens,
+                        q_lens=q_lens,
+                        row_indices=row_indices,
+                        logit_positions=logit_positions,
+                        src_prefix_row=src_prefix_row,
+                        prefix_copy_len=prefix_copy_len,
+                    )
+            if logits is not None:
+                self._stop_packed_prefill_eager_gpu_timer(
+                    packed_gpu_events,
+                    profile_shape_key=profile_shape_key,
+                )
+                real_tokens = int(q_lens.sum().item())
+                elapsed_ms = (
+                    (time.perf_counter() - packed_start_s) * 1000.0
+                    if self.profile_timings
+                    else None
+                )
+                self._record_packed_prefill_eager_result(
+                    profile_shape_key=profile_shape_key,
+                    real_tokens=real_tokens,
+                    model_tokens=model_tokens,
+                    elapsed_ms=elapsed_ms,
+                )
+                return logits
         graph = getattr(self.model, "try_prefill_ragged_logits_graph", None)
         if graph is None:
             return None
