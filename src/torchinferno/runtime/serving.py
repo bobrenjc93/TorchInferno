@@ -1435,7 +1435,16 @@ class ContinuousBatchEngine:
             ):
                 return None
             row_indices = self._device_index_tensor(tuple(decode_rows))
-            input_ids = self._ensure_gpu_token_buf().index_select(0, row_indices).view(n_padded, 1)
+            input_scratch = self._ensure_decode_input_scratch(n_padded)[:n_padded]
+            torch.index_select(
+                self._ensure_gpu_token_buf(),
+                0,
+                row_indices,
+                out=input_scratch,
+            )
+            if n_padded > n_active:
+                input_scratch[n_active:n_padded].zero_()
+            input_ids = input_scratch.view(n_padded, 1)
         seq_lens = self._decode_many_seq_lens_tensor(states, decode_rows)
         shape_key = (
             f"decode_many:b{n_active}/{n_padded}"

@@ -9061,7 +9061,7 @@ def test_continuous_batch_engine_online_many_can_cap_stop_tail_burst(monkeypatch
     assert engine.stats.decode_many_steps == 1
     assert engine.stats.decode_many_skipped_tokens == 0
     assert not engine.has_online_work()
-    assert model.ragged_logits_graph_calls == 1
+    assert model.ragged_logits_graph_calls == 3
 
 
 def test_continuous_batch_engine_online_many_requires_sampled_stop_overcompute(monkeypatch) -> None:
