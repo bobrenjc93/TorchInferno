@@ -52,6 +52,18 @@ source-level simplification for padded decode graph replay, but it does not
 change the priority order: the larger gap remains cached-prefix suffix-prefill
 padding and the high-active decode body itself, not prompt/logits reuse.
 
+A follow-up source experiment tried to extend the same no-row-indices idea to
+dense-but-unordered cached-prefix prefill rows. The local long_output probe
+`/tmp/inference-bench-long-prefix-dense-prefill-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-long-prefix-dense-prefill-cc40416-dirty/runs/20260712_093011`
+stayed correct (`1000/1000`) and cache-integrity clean: generated-prefix
+store/reuse/tokens and reusable-prefix logits were all zero. It did not justify
+promotion. The run landed at `215.3 / 22.1 / 993.7ms`, `35.1 tok/s`, and the
+new omission would have affected only `4` prefill batches / `74` rows while
+`64` batches / `1084` rows still needed indexed prefill. This rejects the
+allocator/reorder hypothesis for the current long_output gap; the remaining
+target is still a non-fragmenting cached-prefix suffix body or a cheaper
+high-active decode body.
+
 A local TorchInferno-only long_output probe on current `831eb65` forced
 fixed-capacity packed prefill with the new shape counters:
 `/tmp/inference-bench-long-fixedcap-shapes-831-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-long-fixedcap-shapes-831eb65/runs/20260712_075855`.
