@@ -67,6 +67,9 @@ def test_score_facing_serving_has_no_exact_prompt_logits_cache_symbols() -> None
         "_restore_exact_prompt_logits",
         "TORCHINFERNO_OPENAI_PROMPT_LOGITS_CACHE",
         "_lookup_exact_reusable_prefix",
+        "_store_generated_reusable_prefix",
+        "_sample_exact_prefix_group",
+        "_sample_repeated_logits",
         "_sample_reusable_prefix_next_token",
         "_sample_reusable_prefix_next_token_list",
     )

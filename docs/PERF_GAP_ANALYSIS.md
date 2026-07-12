@@ -2,22 +2,22 @@
 
 ## Current 20260712 public refresh
 
-The latest public run advanced to `20260712_070224`, built from TorchInferno
-`59e0e13`. Re-rendering it with the current analyzer keeps the score-facing
-cache-integrity counters clean: generated-prefix stores/reuses/tokens,
-reusable-prefix logits, reusable-prefix sample states, reusable-prefix greedy
-tokens, and repeated-sample-state hits are all zero. `self_consistency` is no
-longer a fair gap (`-3.2ms` E2E versus vLLM), so it should stay out of the
-optimization queue unless future evidence changes.
+The latest public run advanced to `20260712_090215`, built from TorchInferno
+`c71ec5f`. Re-rendering it with the current analyzer keeps the score-facing
+cache-integrity counters clean: generated-prefix stores/reuses/tokens, prompt
+lookup accepted tokens, reusable-prefix logits, reusable-prefix sample states,
+reusable-prefix greedy tokens, and repeated-sample-state hits are all zero.
+`self_consistency` is no longer a fair gap (`-13.0ms` E2E versus vLLM), so it
+should stay out of the optimization queue unless future evidence changes.
 
 The remaining fair priority order is unchanged. `long_output` is first:
-`+309.7ms` E2E, `+142.8ms` TTFT, `+4.1ms` TPOT, `4108.8ms` prefill GPU,
-`6726.1ms` decode-many GPU, `38.6%` prefill padding, `28134` packed-candidate
+`+254.8ms` E2E, `+143.2ms` TTFT, `+3.4ms` TPOT, `4070.8ms` prefill GPU,
+`6768.2ms` decode-many GPU, `39.6%` prefill padding, `29286` packed-candidate
 saved tokens, hot prefill `b24:s64:p111-111:src1:mixed0`, and hot decode
-`decode_many:b64/64`. Next are `multi_turn` (`+112.1ms` E2E,
-`49.7%` prefill padding, hot `b32:s32:p55-73:src32:mixed1`), `few_shot`
-(`+69.0ms` E2E, hot `b32:s16:p122-122:src1:mixed0`), and
-`tree_of_thought` (`+19.9ms` E2E, hot `b2:s12:p45-45:src1:mixed0`). This keeps
+`decode_many:b64/64`. Next are `multi_turn` (`+109.5ms` E2E,
+`49.7%` prefill padding, hot `b32:s32:p103-123:src32:mixed1`), `few_shot`
+(`+43.0ms` E2E, hot `b32:s16:p122-122:src1:mixed0`), and
+`tree_of_thought` (`+17.5ms` E2E, hot `b2:s12:p45-45:src1:mixed0`). This keeps
 the next non-gaming work on real decode-body and cached-prefix suffix-prefill
 costs rather than prompt/logits reuse.
 
