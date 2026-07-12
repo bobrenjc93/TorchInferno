@@ -21,6 +21,23 @@ saved tokens, hot prefill `b24:s64:p111-111:src1:mixed0`, and hot decode
 the next non-gaming work on real decode-body and cached-prefix suffix-prefill
 costs rather than prompt/logits reuse.
 
+A current-head long_output prefill-replay profiler run on `c71ec5f` wrote
+`/tmp/inference-bench-long-prefill-replay-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-long-prefill-replay-c71ec5f/runs/20260712_085647`.
+It stayed correct (`1000/1000`) and cache-integrity clean: generated-prefix
+store/reuse, prompt lookup accepted tokens, reusable-prefix logits, and repeated
+sample hits were all zero. The score row was profiler-perturbed
+(`215.1 / 21.7 / 1081.9ms`, p99 TTFT `1879.7ms`), so use it for attribution
+only. The hot prefill replay profiler again matched
+`batch=24,suffix=64,context=-256,src_rows=1` and reported `83.2ms` rank-0 self
+CUDA: `27.4ms` GEMM/NVJET (`32.9%`), `24.5ms` NCCL all-reduce (`29.4%`),
+`7.1ms` add/RMS norm, and no symmetric-memory all-reduce. Queue telemetry kept
+the same real target shape: `70` prefill graph replays, `6.13s` profiled
+prefill replay GPU, `23.8K` avoidable packed-prefill tokens, and
+`decode_many:b64/64` at `6.64s` GPU. This confirms the earlier conclusion:
+do not promote prefill symm-mem graph capture, singleton suffix splits, or eager
+packed prefill. The useful work is still a graphable non-fragmenting packed
+cached-prefix suffix body, plus a cheaper high-active decode replay body.
+
 A local TorchInferno-only long_output probe on current `831eb65` forced
 fixed-capacity packed prefill with the new shape counters:
 `/tmp/inference-bench-long-fixedcap-shapes-831-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-long-fixedcap-shapes-831eb65/runs/20260712_075855`.
