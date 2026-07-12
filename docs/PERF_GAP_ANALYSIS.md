@@ -255,6 +255,25 @@ split into many high-active but small-step decode-many windows. The target
 remains lower model-side decode replay cost or real decode/readback pipelining,
 not a prompt/logits cache.
 
+## Current 20260712 provider graph-envelope visibility
+
+The public-provider summary now also parses CUDA-graph batch-size envelopes from
+vLLM and SGLang logs. On `20260711_230213`, vLLM reports `51` decode graph
+sizes spanning batch `1-512`; SGLang reports `52` decode graph sizes spanning
+`1-512` and `58` prefill graph sizes spanning `4-8192`. TorchInferno's same
+long_output artifact remains on warmed single-step ragged decode graph buckets
+through batch `64` and padded cached-prefix prefill graph buckets such as
+`b24:s64` and `b24:s96`.
+
+This is instrumentation only. It does not change request handling, sampling, KV
+reuse, or model execution, and the cache-integrity counters for generated-prefix
+store/reuse, prompt lookup, reusable-prefix logits, and repeated sample hits
+remain zero. The new table makes the fair engine gap easier to inspect in future
+public runs: vLLM/SGLang carry much broader graph-backed serving envelopes, while
+TorchInferno still needs either a cheaper high-active single-step decode replay
+body or a defaultable packed cached-prefix suffix-prefill body. It does not
+justify reintroducing exact-prompt logits reuse.
+
 ## Current 20260711 multi-turn prefill profile
 
 A current-head TorchInferno-only `multi_turn` profile on `a95aa93` wrote

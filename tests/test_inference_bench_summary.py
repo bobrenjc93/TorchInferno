@@ -604,7 +604,8 @@ def _write_inference_bench_run(tmp_path) -> None:
                 "INFO Chunked prefill is enabled with max_num_batched_tokens=8,192.",
                 "INFO Asynchronous scheduling is enabled.",
                 "INFO config enable_prefix_caching=True enable_chunked_prefill=True "
-                "'max_cudagraph_capture_size': 512",
+                "'max_cudagraph_capture_size': 512, "
+                "'cudagraph_capture_sizes': [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]",
                 "INFO GPU KV cache size: 1,451,760 tokens",
                 "INFO Engine 000: Avg prompt throughput: 100.0 tokens/s, "
                 "Avg generation throughput: 20.0 tokens/s, Running: 2 reqs, "
@@ -1415,9 +1416,13 @@ def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) ->
     assert "prefix_cache" in text
     assert "chunk_tokens" in text
     assert "decode_max_bs" in text
+    assert "decode_sizes" in text
     assert "prefill_max_bs" in text
+    assert "prefill_sizes" in text
     assert "kv_tokens" in text
     assert "1451760" in text
+    assert "10@1-512" in text
+    assert "2@4-8" in text
     assert "fa3" in text
     assert "flashinfer" in text
     assert "[provider server log phases]" in text

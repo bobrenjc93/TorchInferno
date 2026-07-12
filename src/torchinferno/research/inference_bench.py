@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 import re
 import shlex
@@ -39,6 +40,9 @@ _VLLM_CHUNKED_PREFILL_RE = re.compile(
     r"Chunked prefill is enabled with max_num_batched_tokens=(?P<tokens>[0-9,]+)"
 )
 _VLLM_KV_CACHE_RE = re.compile(r"GPU KV cache size: (?P<tokens>[0-9,]+) tokens")
+_VLLM_CUDAGRAPH_CAPTURE_SIZES_RE = re.compile(
+    r"cudagraph_capture_sizes(?:'|\b)?\s*[:=]\s*(?P<sizes>\[[^\]]*\])"
+)
 _SGLANG_PREFILL_RE = re.compile(
     r"Prefill batch, #new-seq: (?P<new_seq>[0-9]+), "
     r"#new-token: (?P<new_tokens>[0-9]+), "
@@ -53,10 +57,12 @@ _SGLANG_DECODE_RE = re.compile(
     r"gen throughput \(token/s\): (?P<generation_tps>[0-9.]+)"
 )
 _SGLANG_DECODE_GRAPH_RE = re.compile(
-    r"decode=PhaseConfig\(backend='(?P<backend>[^']+)', max_bs=(?P<max_bs>[0-9]+)"
+    r"decode=PhaseConfig\(backend='(?P<backend>[^']+)', "
+    r"max_bs=(?P<max_bs>[0-9]+)(?:, bs=(?P<sizes>\[[^\]]*\]))?"
 )
 _SGLANG_PREFILL_GRAPH_RE = re.compile(
-    r"prefill=PhaseConfig\(backend='(?P<backend>[^']+)', max_bs=(?P<max_bs>[0-9]+)"
+    r"prefill=PhaseConfig\(backend='(?P<backend>[^']+)', "
+    r"max_bs=(?P<max_bs>[0-9]+)(?:, bs=(?P<sizes>\[[^\]]*\]))?"
 )
 _TORCHINFERNO_RAGGED_PREFILL_PROFILE_RE = re.compile(
     r"\[(?P<kind>RAGGED_PREFILL(?:_REPLAY)?_PROF)\] "
@@ -473,8 +479,10 @@ class ProviderServerLogSummary:
     async_scheduling: bool | None = None
     decode_cuda_graph: bool | None = None
     decode_cuda_graph_max_bs: int | None = None
+    decode_cuda_graph_sizes: tuple[int, ...] = ()
     prefill_cuda_graph: bool | None = None
     prefill_cuda_graph_max_bs: int | None = None
+    prefill_cuda_graph_sizes: tuple[int, ...] = ()
     continuous_decode_steps: int | None = None
     kv_cache_tokens: int | None = None
     attention_backend: str | None = None
@@ -1850,8 +1858,10 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
                     "async_sched",
                     "decode_graph",
                     "decode_max_bs",
+                    "decode_sizes",
                     "prefill_graph",
                     "prefill_max_bs",
+                    "prefill_sizes",
                     "decode_steps",
                     "kv_tokens",
                     "attention",
@@ -2639,6 +2649,33 @@ def _provider_log_str_field(text: str, name: str) -> str | None:
     return value if value else None
 
 
+def _provider_log_int_list(raw: str | None) -> tuple[int, ...]:
+    if raw is None:
+        return ()
+    try:
+        parsed = ast.literal_eval(raw)
+    except (SyntaxError, ValueError):
+        return ()
+    if not isinstance(parsed, list):
+        return ()
+    values: list[int] = []
+    for item in parsed:
+        if isinstance(item, bool):
+            continue
+        if isinstance(item, int):
+            values.append(item)
+    return tuple(values)
+
+
+def _fmt_int_list_envelope(values: Sequence[int]) -> str:
+    if not values:
+        return "-"
+    unique = tuple(sorted(set(int(value) for value in values)))
+    if len(unique) == 1:
+        return f"1@{unique[0]}"
+    return f"{len(unique)}@{unique[0]}-{unique[-1]}"
+
+
 def _combine_enabled_flags(
     global_disabled: bool | None,
     feature_disabled: bool | None,
@@ -2702,7 +2739,12 @@ def _summarize_vllm_server_log(path: Path) -> ProviderServerLogSummary:
     prefix_hit_pct: list[float] = []
     chunked_prefill_tokens: int | None = None
     kv_cache_tokens: int | None = None
+    cudagraph_sizes: tuple[int, ...] = ()
     for line in text.splitlines():
+        if not cudagraph_sizes:
+            sizes_match = _VLLM_CUDAGRAPH_CAPTURE_SIZES_RE.search(line)
+            if sizes_match is not None:
+                cudagraph_sizes = _provider_log_int_list(sizes_match.group("sizes"))
         chunked_match = _VLLM_CHUNKED_PREFILL_RE.search(line)
         if chunked_match is not None:
             chunked_prefill_tokens = _int_with_commas(chunked_match.group("tokens"))
@@ -2734,6 +2776,7 @@ def _summarize_vllm_server_log(path: Path) -> ProviderServerLogSummary:
             True if _provider_log_int_field(text, "max_cudagraph_capture_size") is not None else None
         ),
         decode_cuda_graph_max_bs=_provider_log_int_field(text, "max_cudagraph_capture_size"),
+        decode_cuda_graph_sizes=cudagraph_sizes,
         kv_cache_tokens=kv_cache_tokens,
         prompt_events=len(prompt_tps),
         prompt_tps_avg=_avg(prompt_tps),
@@ -2819,6 +2862,16 @@ def _summarize_sglang_server_log(path: Path) -> ProviderServerLogSummary:
     disable_prefill_cuda_graph = _provider_log_bool_field(text, "disable_prefill_cuda_graph")
     decode_graph_match = _SGLANG_DECODE_GRAPH_RE.search(text)
     prefill_graph_match = _SGLANG_PREFILL_GRAPH_RE.search(text)
+    decode_graph_sizes = (
+        _provider_log_int_list(decode_graph_match.group("sizes"))
+        if decode_graph_match is not None
+        else ()
+    )
+    prefill_graph_sizes = (
+        _provider_log_int_list(prefill_graph_match.group("sizes"))
+        if prefill_graph_match is not None
+        else ()
+    )
     chunked_prefill_tokens = _provider_log_int_field(text, "chunked_prefill_size")
     return ProviderServerLogSummary(
         provider="sglang",
@@ -2840,6 +2893,7 @@ def _summarize_sglang_server_log(path: Path) -> ProviderServerLogSummary:
             if decode_graph_match is not None
             else None
         ),
+        decode_cuda_graph_sizes=decode_graph_sizes,
         prefill_cuda_graph=_combine_enabled_flags(
             disable_cuda_graph,
             disable_prefill_cuda_graph,
@@ -2850,6 +2904,7 @@ def _summarize_sglang_server_log(path: Path) -> ProviderServerLogSummary:
             if prefill_graph_match is not None
             else None
         ),
+        prefill_cuda_graph_sizes=prefill_graph_sizes,
         continuous_decode_steps=_provider_log_int_field(text, "num_continuous_decode_steps"),
         attention_backend=_provider_log_str_field(text, "attention_backend"),
         sampling_backend=_provider_log_str_field(text, "sampling_backend"),
@@ -2947,14 +3002,16 @@ def _provider_server_config_rows(
             summary.async_scheduling,
             summary.decode_cuda_graph,
             summary.decode_cuda_graph_max_bs,
+            summary.decode_cuda_graph_sizes,
             summary.prefill_cuda_graph,
             summary.prefill_cuda_graph_max_bs,
+            summary.prefill_cuda_graph_sizes,
             summary.continuous_decode_steps,
             summary.kv_cache_tokens,
             summary.attention_backend,
             summary.sampling_backend,
         )
-        if all(value is None for value in values):
+        if all(value is None or value == () for value in values):
             continue
         rows.append(
             (
@@ -2965,8 +3022,10 @@ def _provider_server_config_rows(
                 _fmt_value(summary.async_scheduling),
                 _fmt_value(summary.decode_cuda_graph),
                 _fmt_value(summary.decode_cuda_graph_max_bs),
+                _fmt_int_list_envelope(summary.decode_cuda_graph_sizes),
                 _fmt_value(summary.prefill_cuda_graph),
                 _fmt_value(summary.prefill_cuda_graph_max_bs),
+                _fmt_int_list_envelope(summary.prefill_cuda_graph_sizes),
                 _fmt_value(summary.continuous_decode_steps),
                 _fmt_value(summary.kv_cache_tokens),
                 _fmt_value(summary.attention_backend),
