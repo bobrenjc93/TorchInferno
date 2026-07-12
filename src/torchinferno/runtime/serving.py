@@ -6692,6 +6692,7 @@ class ContinuousBatchEngine:
         *,
         shape_key: str | None = None,
         profile_source: str | None = None,
+        exclude_from_totals: bool = False,
     ) -> None:
         if events is None:
             return
@@ -6701,18 +6702,19 @@ class ContinuousBatchEngine:
         except Exception:
             return
         self._pending_decode_ragged_model_events.append(
-            (start, end, shape_key, profile_source, None)
+            (start, end, shape_key, profile_source, None, bool(exclude_from_totals))
         )
 
     def _decode_gpu_timer_event_fields(
         self,
         item: tuple[object, ...],
-    ) -> tuple[object, object, str | None, str | None, dict[str, float] | None]:
+    ) -> tuple[object, object, str | None, str | None, dict[str, float] | None, bool]:
         start, end = item[0], item[1]
         shape_key = item[2] if len(item) >= 3 and isinstance(item[2], str) else None
         profile_source = item[3] if len(item) >= 4 and isinstance(item[3], str) else None
         window_weights = item[4] if len(item) >= 5 and isinstance(item[4], dict) else None
-        return start, end, shape_key, profile_source, window_weights
+        exclude_from_totals = bool(item[5]) if len(item) >= 6 else False
+        return start, end, shape_key, profile_source, window_weights, exclude_from_totals
 
     def _attach_latest_decode_many_gpu_window(
         self,
@@ -6726,7 +6728,7 @@ class ContinuousBatchEngine:
         pending = getattr(self, "_pending_decode_ragged_model_events", [])
         if not pending:
             return
-        start, end, pending_shape_key, profile_source, window_weights = (
+        start, end, pending_shape_key, profile_source, window_weights, exclude_from_totals = (
             self._decode_gpu_timer_event_fields(pending[-1])
         )
         if profile_source != "decode_many":
@@ -6735,7 +6737,14 @@ class ContinuousBatchEngine:
             return
         weights = dict(window_weights or {})
         weights[step_window_key] = weights.get(step_window_key, 0.0) + float(model_tokens)
-        pending[-1] = (start, end, pending_shape_key, profile_source, weights)
+        pending[-1] = (
+            start,
+            end,
+            pending_shape_key,
+            profile_source,
+            weights,
+            exclude_from_totals,
+        )
 
     def _flush_decode_ragged_model_gpu_timers(self) -> None:
         pending = getattr(self, "_pending_decode_ragged_model_events", [])
@@ -6743,11 +6752,13 @@ class ContinuousBatchEngine:
             return
         remaining: list[tuple[object, ...]] = []
         for item in pending:
-            start, end, shape_key, profile_source, window_weights = (
+            start, end, shape_key, profile_source, window_weights, exclude_from_totals = (
                 self._decode_gpu_timer_event_fields(item)
             )
             try:
                 elapsed_ms = float(start.elapsed_time(end))
+                if exclude_from_totals:
+                    continue
                 self.stats.decode_ragged_model_gpu_ms += elapsed_ms
                 if shape_key is not None:
                     self._record_gpu_event_shape_time(
@@ -6778,7 +6789,16 @@ class ContinuousBatchEngine:
                                     elapsed_ms * share,
                                 )
             except RuntimeError:
-                remaining.append((start, end, shape_key, profile_source, window_weights))
+                remaining.append(
+                    (
+                        start,
+                        end,
+                        shape_key,
+                        profile_source,
+                        window_weights,
+                        exclude_from_totals,
+                    )
+                )
             except Exception:
                 continue
         self._pending_decode_ragged_model_events = remaining
@@ -7554,6 +7574,7 @@ class ContinuousBatchEngine:
         n_active: int,
         n_padded: int,
     ) -> Tensor:
+        self._last_decode_many_eager_profile_applied = False
         if not self._should_profile_decode_many_eager_once(
             profile_source=profile_source,
             n_active=n_active,
@@ -7578,6 +7599,7 @@ class ContinuousBatchEngine:
             warn_optional_failure("continuous.decode_many_eager_profile_import", exc)
             return run_decode_model()
 
+        self._last_decode_many_eager_profile_applied = True
         torch.cuda.synchronize(self.device)
         with _tprof(activities=[_PA.CPU, _PA.CUDA]) as prof:
             result = run_decode_model()
@@ -7797,7 +7819,11 @@ class ContinuousBatchEngine:
             gpu_model_events,
             shape_key=shape_key,
             profile_source=profile_source,
+            exclude_from_totals=bool(
+                getattr(self, "_last_decode_many_eager_profile_applied", False)
+            ),
         )
+        self._last_decode_many_eager_profile_applied = False
         self._record_model_call("decode", n_padded, tokens=n_padded, ragged=True, active_tokens=n_active)
         if row_indices is None:
             next_token_tensor = self._record_gpu_decode_tokens(

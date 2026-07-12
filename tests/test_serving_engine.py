@@ -8963,6 +8963,41 @@ def test_continuous_batch_engine_decode_many_gpu_timers_work_without_profile_tim
     }
 
 
+def test_continuous_batch_engine_decode_many_gpu_timers_exclude_profiler_events() -> None:
+    class _FakeCudaStartEvent:
+        def elapsed_time(self, _end_event) -> float:
+            return 123.0
+
+    engine = ContinuousBatchEngine(
+        _RaggedGraphToyModel(vocab_size=128),
+        device=torch.device("cpu"),
+        max_active_requests=8,
+        prefix_cache_capacity=0,
+        enable_ragged_decode=True,
+        store_reusable_prefixes=False,
+        profile_timings=True,
+    )
+    engine._pending_decode_ragged_model_events = [
+        (
+            _FakeCudaStartEvent(),
+            object(),
+            "decode_many:b8/8",
+            "decode_many",
+            None,
+            True,
+        )
+    ]
+
+    engine._attach_latest_decode_many_gpu_window("decode_many:b8/8:g1-16", 8)
+    engine._flush_decode_ragged_model_gpu_timers()
+
+    assert engine.stats.decode_ragged_model_gpu_ms == 0.0
+    assert engine.stats.decode_shape_gpu_ms == {}
+    assert engine.stats.decode_many_model_gpu_ms == 0.0
+    assert engine.stats.decode_many_shape_gpu_ms == {}
+    assert engine.stats.decode_many_step_window_model_ms == {}
+
+
 def test_continuous_batch_engine_decode_many_queue_profile_gpu_timing_gate(
     monkeypatch,
 ) -> None:
