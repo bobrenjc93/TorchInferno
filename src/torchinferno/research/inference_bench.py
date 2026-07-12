@@ -88,6 +88,12 @@ _TORCHINFERNO_RAGGED_DECODE_PROFILE_RE = re.compile(
     r"cache_bucket=(?P<cache_bucket>\S+) "
     r"rows=(?P<rows>[0-9]+)"
 )
+_TORCHINFERNO_DECODE_MANY_SHAPE_RE = re.compile(
+    r"(?:^|:)decode_many:b(?P<active>[0-9]+)/(?P<padded>[0-9]+)(?:$|:)"
+)
+_TORCHINFERNO_DECODE_SHAPE_RE = re.compile(
+    r"(?:^|:)ragged:b(?P<active>[0-9]+)/(?P<padded>[0-9]+)(?:$|:)"
+)
 _TORCHINFERNO_WARMUP_START_RE = re.compile(
     r"^\[WARMUP\] (?P<label>.+?) start(?: (?P<detail>.*))?$"
 )
@@ -764,6 +770,24 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
                         "hot_decode",
                     ),
                     fair_gap_rows,
+                )
+            )
+            lines.append("")
+
+        probe_rows = _torchinferno_profiler_probe_rows(summary)
+        if probe_rows:
+            lines.append("[torchinferno next profiler probes]")
+            lines.extend(
+                _format_table(
+                    (
+                        "benchmark",
+                        "priority",
+                        "probe",
+                        "coverage",
+                        "shape",
+                        "env",
+                    ),
+                    probe_rows,
                 )
             )
             lines.append("")
@@ -3000,6 +3024,365 @@ def _torchinferno_profiler_event_rows(
             )
         )
     return rows
+
+
+def _torchinferno_profiler_probe_rows(
+    summary: InferenceBenchRunSummary,
+) -> list[tuple[str, ...]]:
+    rows: list[tuple[float, float, int, tuple[str, ...]]] = []
+    profiles_by_key = {
+        (profile.temperature, profile.max_tokens): profile
+        for profile in summary.torchinferno_queue_profiles
+        if profile.temperature is not None and profile.max_tokens is not None
+    }
+    for benchmark in summary.benchmarks:
+        provider_rows = [
+            row for row in summary.provider_benchmarks if row.benchmark == benchmark
+        ]
+        torchinferno_row = next(
+            (row for row in provider_rows if row.provider == "torchinferno"),
+            None,
+        )
+        competitors = [row for row in provider_rows if row.provider != "torchinferno"]
+        profile = profiles_by_key.get(_BENCHMARK_QUEUE_PROFILE_KEYS.get(benchmark))
+        if torchinferno_row is None or not competitors or profile is None:
+            continue
+        ttft_gap = _provider_gap_value(
+            torchinferno_row,
+            competitors,
+            "ttft_median_ms",
+            "ttft_ms",
+            higher_is_better=False,
+        )
+        tpot_gap = _provider_gap_value(
+            torchinferno_row,
+            competitors,
+            "tpot_median_ms",
+            "tpot_ms",
+            higher_is_better=False,
+        )
+        e2e_gap = _provider_gap_value(
+            torchinferno_row,
+            competitors,
+            "e2e_median_ms",
+            "e2e_latency_ms",
+            higher_is_better=False,
+        )
+        if max((ttft_gap or 0.0), (tpot_gap or 0.0), (e2e_gap or 0.0)) <= 0.0:
+            continue
+
+        fields = profile.fields
+        prefill_ms = _prefill_target_ms(fields)
+        _prefill_active_tokens, prefill_model_tokens, prefill_padding_tokens = (
+            _prefill_token_totals(fields)
+        )
+        prefill_row_padding_tokens, prefill_suffix_padding_tokens = (
+            _prefill_padding_split_totals(fields)
+        )
+        decode_many_ms = _numeric_field(fields, "runtime_decode_many_model_gpu_ms")
+        if decode_many_ms is None:
+            decode_many_ms = _sum_numeric_mapping(
+                fields.get("runtime_decode_many_shape_gpu_ms")
+            )
+        decode_ms = _numeric_field(fields, "runtime_decode_ragged_model_gpu_ms")
+        decode_target_ms = (
+            max(value for value in (decode_ms, decode_many_ms) if value is not None)
+            if decode_ms is not None or decode_many_ms is not None
+            else None
+        )
+        phase_target = _phase_target(
+            prefill_ms=prefill_ms,
+            decode_ms=decode_target_ms,
+            sample_ms=_numeric_field(fields, "runtime_prefill_sample_ms"),
+            capture_ms=(
+                (_numeric_field(fields, "runtime_prefill_graph_capture_ms") or 0.0)
+                + (_numeric_field(fields, "runtime_decode_graph_capture_ms") or 0.0)
+            ),
+        )
+        hot_prefill, _hot_prefill_ms = _top_prefill_target_entry(fields)
+        priority = _fair_gap_priority_label(
+            fields=fields,
+            cache_status=_cache_integrity_status(fields),
+            phase_target=phase_target,
+            prefill_ms=prefill_ms,
+            decode_many_ms=decode_many_ms,
+            prefill_model_tokens=prefill_model_tokens,
+            prefill_padding_tokens=prefill_padding_tokens,
+            prefill_row_padding_tokens=prefill_row_padding_tokens,
+            prefill_suffix_padding_tokens=prefill_suffix_padding_tokens,
+            hot_prefill=hot_prefill,
+        )
+        prefill_probe = _prefill_profiler_probe(hot_prefill)
+        if prefill_probe is not None:
+            batch, suffix, env = prefill_probe
+            rows.append(
+                (
+                    float(e2e_gap or 0.0),
+                    float(ttft_gap or 0.0),
+                    0,
+                    (
+                        benchmark,
+                        priority,
+                        "prefill_replay",
+                        _prefill_probe_coverage(
+                            summary.torchinferno_profiler_events,
+                            batch=batch,
+                            suffix=suffix,
+                        ),
+                        _short_shape(hot_prefill),
+                        env,
+                    ),
+                )
+            )
+
+        hot_decode, _hot_decode_ms = _top_mapping_entry(
+            fields.get("runtime_decode_many_shape_gpu_ms")
+        )
+        if hot_decode is not None:
+            decode_shape = _decode_many_profiler_shape(hot_decode)
+            if decode_shape is not None:
+                active, padded = decode_shape
+                rows.append(
+                    (
+                        float(e2e_gap or 0.0),
+                        float(ttft_gap or 0.0),
+                        1,
+                        (
+                            benchmark,
+                            priority,
+                            "decode_many_eager",
+                            _decode_many_eager_probe_coverage(
+                                summary.torchinferno_profiler_events,
+                                active=active,
+                                padded=padded,
+                            ),
+                            _short_shape(hot_decode),
+                            _decode_many_eager_profiler_env(active, padded),
+                        ),
+                    )
+                )
+                cache_bucket = _top_decode_cache_bucket(fields)
+                rows.append(
+                    (
+                        float(e2e_gap or 0.0),
+                        float(ttft_gap or 0.0),
+                        2,
+                        (
+                            benchmark,
+                            priority,
+                            "decode_replay",
+                            _decode_replay_probe_coverage(
+                                summary.torchinferno_profiler_events,
+                                active=active,
+                                padded=padded,
+                                cache_bucket=cache_bucket,
+                            ),
+                            _short_shape(hot_decode),
+                            _decode_replay_profiler_env(padded, cache_bucket),
+                        ),
+                    )
+                )
+                if (_numeric_field(fields, "runtime_decode_many_graph_calls") or 0.0) > 0.0:
+                    rows.append(
+                        (
+                            float(e2e_gap or 0.0),
+                            float(ttft_gap or 0.0),
+                            3,
+                            (
+                                benchmark,
+                                priority,
+                                "decode_many_replay",
+                                _decode_many_replay_probe_coverage(
+                                    summary.torchinferno_profiler_events,
+                                    active=active,
+                                    padded=padded,
+                                    cache_bucket=cache_bucket,
+                                ),
+                                _short_shape(hot_decode),
+                                _decode_many_replay_profiler_env(padded, cache_bucket),
+                            ),
+                        )
+                    )
+                continue
+
+        hot_decode, _hot_decode_ms = _top_mapping_entry(
+            fields.get("runtime_decode_shape_gpu_ms")
+        )
+        decode_shape = _decode_profiler_shape(hot_decode)
+        if decode_shape is not None:
+            active, padded = decode_shape
+            cache_bucket = _top_decode_cache_bucket(fields)
+            rows.append(
+                (
+                    float(e2e_gap or 0.0),
+                    float(ttft_gap or 0.0),
+                    1,
+                    (
+                        benchmark,
+                        priority,
+                        "decode_replay",
+                        _decode_replay_probe_coverage(
+                            summary.torchinferno_profiler_events,
+                            active=active,
+                            padded=padded,
+                            cache_bucket=cache_bucket,
+                        ),
+                        _short_shape(hot_decode),
+                        _decode_replay_profiler_env(padded, cache_bucket),
+                    ),
+                )
+            )
+    rows.sort(key=lambda row: (-row[0], -row[1], row[2], row[3][0], row[3][2]))
+    return [row[3] for row in rows]
+
+
+def _prefill_profiler_probe(shape: str | None) -> tuple[int, int, str] | None:
+    if shape is None:
+        return None
+    parsed = _packed_prefill_shape_batch_suffix(shape)
+    if parsed is None:
+        return None
+    batch, suffix = parsed
+    env = _probe_env(
+        (
+            ("TORCHINFERNO_PROFILE_RAGGED_PREFILL_REPLAY_ONCE", "1"),
+            ("TORCHINFERNO_PROFILE_RAGGED_PREFILL_BATCH", str(batch)),
+            ("TORCHINFERNO_PROFILE_RAGGED_PREFILL_SUFFIX", str(suffix)),
+            ("TORCHINFERNO_PROFILE_RAGGED_PREFILL_MIN_BATCH", str(batch)),
+            ("TORCHINFERNO_PROFILE_RAGGED_PREFILL_MIN_SUFFIX", str(suffix)),
+        )
+    )
+    return batch, suffix, env
+
+
+def _decode_many_profiler_shape(shape: str | None) -> tuple[int, int] | None:
+    if shape is None:
+        return None
+    match = _TORCHINFERNO_DECODE_MANY_SHAPE_RE.search(shape)
+    if match is None:
+        return None
+    return int(match.group("active")), int(match.group("padded"))
+
+
+def _decode_profiler_shape(shape: str | None) -> tuple[int, int] | None:
+    if shape is None:
+        return None
+    match = _TORCHINFERNO_DECODE_SHAPE_RE.search(shape)
+    if match is None:
+        return None
+    return int(match.group("active")), int(match.group("padded"))
+
+
+def _top_decode_cache_bucket(fields: dict[str, Any]) -> str | None:
+    cache_key, _count = _top_mapping_entry(_decode_graph_cache_counts(fields))
+    if cache_key is None:
+        return None
+    if cache_key.startswith("cache"):
+        return cache_key.removeprefix("cache")
+    return cache_key
+
+
+def _decode_many_eager_profiler_env(active: int, padded: int) -> str:
+    return _probe_env(
+        (
+            ("TORCHINFERNO_PROFILE_RAGGED_DECODE_MANY_EAGER_ONCE", "1"),
+            ("TORCHINFERNO_PROFILE_RAGGED_DECODE_MANY_EAGER_ACTIVE", str(active)),
+            ("TORCHINFERNO_PROFILE_RAGGED_DECODE_MANY_EAGER_PADDED", str(padded)),
+            ("TORCHINFERNO_PROFILE_RAGGED_DECODE_MANY_EAGER_MIN_BATCH", str(padded)),
+        )
+    )
+
+
+def _decode_replay_profiler_env(padded: int, cache_bucket: str | None) -> str:
+    env = [
+        ("TORCHINFERNO_PROFILE_RAGGED_DECODE_REPLAY_ONCE", "1"),
+        ("TORCHINFERNO_PROFILE_RAGGED_DECODE_MIN_BATCH", str(padded)),
+    ]
+    if cache_bucket:
+        env.append(("TORCHINFERNO_PROFILE_RAGGED_DECODE_CACHE_BUCKET", cache_bucket))
+    return _probe_env(env)
+
+
+def _decode_many_replay_profiler_env(padded: int, cache_bucket: str | None) -> str:
+    env = [
+        ("TORCHINFERNO_PROFILE_RAGGED_DECODE_MANY_REPLAY_ONCE", "1"),
+        ("TORCHINFERNO_PROFILE_RAGGED_DECODE_MANY_MIN_BATCH", str(padded)),
+    ]
+    if cache_bucket:
+        env.append(("TORCHINFERNO_PROFILE_RAGGED_DECODE_MANY_CACHE_BUCKET", cache_bucket))
+    return _probe_env(env)
+
+
+def _probe_env(pairs: Iterable[tuple[str, str]]) -> str:
+    return shlex.join([f"{name}={value}" for name, value in pairs])
+
+
+def _prefill_probe_coverage(
+    events: Sequence[TorchInfernoProfilerSummary],
+    *,
+    batch: int,
+    suffix: int,
+) -> str:
+    for event in events:
+        if (
+            event.kind == "RAGGED_PREFILL_REPLAY_PROF"
+            and event.batch == batch
+            and event.suffix == suffix
+        ):
+            return "covered"
+    return "missing"
+
+
+def _decode_many_eager_probe_coverage(
+    events: Sequence[TorchInfernoProfilerSummary],
+    *,
+    active: int,
+    padded: int,
+) -> str:
+    for event in events:
+        if (
+            event.kind == "RAGGED_DECODE_MANY_EAGER_PROF"
+            and event.batch == padded
+            and (event.rows is None or event.rows == active)
+        ):
+            return "covered"
+    return "missing"
+
+
+def _decode_replay_probe_coverage(
+    events: Sequence[TorchInfernoProfilerSummary],
+    *,
+    active: int,
+    padded: int,
+    cache_bucket: str | None,
+) -> str:
+    for event in events:
+        if event.kind != "RAGGED_DECODE_REPLAY_PROF":
+            continue
+        if event.batch != padded or (event.rows is not None and event.rows != active):
+            continue
+        if cache_bucket is not None and event.cache_bucket != cache_bucket:
+            continue
+        return "covered"
+    return "missing"
+
+
+def _decode_many_replay_probe_coverage(
+    events: Sequence[TorchInfernoProfilerSummary],
+    *,
+    active: int,
+    padded: int,
+    cache_bucket: str | None,
+) -> str:
+    for event in events:
+        if event.kind != "RAGGED_DECODE_MANY_REPLAY_PROF":
+            continue
+        if event.batch != padded or (event.rows is not None and event.rows != active):
+            continue
+        if cache_bucket is not None and event.cache_bucket != cache_bucket:
+            continue
+        return "covered"
+    return "missing"
 
 
 def _short_torchinferno_profiler_kind(kind: str) -> str:

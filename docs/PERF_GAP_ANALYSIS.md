@@ -1,5 +1,51 @@
 # TorchInferno vs vLLM/sglang — Performance Gap Analysis (Llama-3.1-70B, 8xH100)
 
+## Current 20260712 profiler-probe routing
+
+Re-rendering the latest public run,
+`results/.../runs/20260712_030805`, after the explicit
+`e887422` revert leaves the score picture unchanged because the public artifact
+was already built at `9808f42`. TorchInferno remains `5/20` metric wins with
+all score-facing cache-integrity counters clean: generated-prefix stores,
+generated-prefix reuses, generated-prefix tokens, prompt-lookup accepted tokens,
+reusable-prefix logits, reusable-prefix sample states, reusable-prefix greedy
+tokens, and repeated-sample-state hits are all zero.
+
+The fair gap order is still long_output first (`+258.6ms` E2E, `+141.8ms`
+TTFT, `+3.6ms` TPOT), then multi_turn (`+110.0ms` E2E/TTFT), few_shot
+(`+68.0ms` E2E), and tree_of_thought (`+17.7ms` E2E). Long_output is the only
+row with a decode-body target: `6975.6ms` decode-many GPU plus `4058.6ms`
+prefill GPU and `41.0%` prefill padding. The current hot shapes are
+`decode_many:b64/64` and `prefix_graph:b24:s64:p111-111:src1:mixed0`.
+
+The inference-bench summary now renders `[torchinferno next profiler probes]`
+from those hot shapes. On the public run, the next probes are all marked
+`missing`, which is the useful signal: the artifact has queue-level GPU timings
+but no matching rank-level torch.profiler block for the current hot replay
+body. The top long_output commands are:
+
+```bash
+TORCHINFERNO_PROFILE_RAGGED_PREFILL_REPLAY_ONCE=1 \
+TORCHINFERNO_PROFILE_RAGGED_PREFILL_BATCH=24 \
+TORCHINFERNO_PROFILE_RAGGED_PREFILL_SUFFIX=64 \
+TORCHINFERNO_PROFILE_RAGGED_PREFILL_MIN_BATCH=24 \
+TORCHINFERNO_PROFILE_RAGGED_PREFILL_MIN_SUFFIX=64
+
+TORCHINFERNO_PROFILE_RAGGED_DECODE_MANY_EAGER_ONCE=1 \
+TORCHINFERNO_PROFILE_RAGGED_DECODE_MANY_EAGER_ACTIVE=64 \
+TORCHINFERNO_PROFILE_RAGGED_DECODE_MANY_EAGER_PADDED=64 \
+TORCHINFERNO_PROFILE_RAGGED_DECODE_MANY_EAGER_MIN_BATCH=64
+
+TORCHINFERNO_PROFILE_RAGGED_DECODE_REPLAY_ONCE=1 \
+TORCHINFERNO_PROFILE_RAGGED_DECODE_MIN_BATCH=64 \
+TORCHINFERNO_PROFILE_RAGGED_DECODE_CACHE_BUCKET=1024
+```
+
+This keeps the next gap-closing work pointed at normal model-body evidence:
+cached-prefix suffix prefill and high-active decode replay. It also avoids the
+previous failure mode where repeated prompts could look like a serving win while
+only exercising cached logits.
+
 ## Current 20260711 logits-cache integrity reset
 
 Exact-prompt logits reuse is not a valid benchmark optimization. Reusing a

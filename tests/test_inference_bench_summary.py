@@ -24,6 +24,7 @@ from torchinferno.research.inference_bench import (
     _prefill_target_ms,
     _top_prefill_target_entry,
     _torchinferno_fair_gap_priority_rows,
+    _torchinferno_profiler_probe_rows,
     format_inference_bench_summary,
     summarize_inference_bench_run,
 )
@@ -1107,9 +1108,59 @@ def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) ->
     assert fair_gap_rows[0][4] == "+8.0"
     assert fair_gap_rows[0][5] == "+2.0"
 
+    probe_rows = _torchinferno_profiler_probe_rows(summary)
+    assert probe_rows == [
+        (
+            "long_output",
+            "integrity_review",
+            "prefill_replay",
+            "missing",
+            "b8:s16:p45-45:src1:mixed0",
+            "TORCHINFERNO_PROFILE_RAGGED_PREFILL_REPLAY_ONCE=1 "
+            "TORCHINFERNO_PROFILE_RAGGED_PREFILL_BATCH=8 "
+            "TORCHINFERNO_PROFILE_RAGGED_PREFILL_SUFFIX=16 "
+            "TORCHINFERNO_PROFILE_RAGGED_PREFILL_MIN_BATCH=8 "
+            "TORCHINFERNO_PROFILE_RAGGED_PREFILL_MIN_SUFFIX=16",
+        ),
+        (
+            "long_output",
+            "integrity_review",
+            "decode_many_eager",
+            "missing",
+            "decode_many:b8/8",
+            "TORCHINFERNO_PROFILE_RAGGED_DECODE_MANY_EAGER_ONCE=1 "
+            "TORCHINFERNO_PROFILE_RAGGED_DECODE_MANY_EAGER_ACTIVE=8 "
+            "TORCHINFERNO_PROFILE_RAGGED_DECODE_MANY_EAGER_PADDED=8 "
+            "TORCHINFERNO_PROFILE_RAGGED_DECODE_MANY_EAGER_MIN_BATCH=8",
+        ),
+        (
+            "long_output",
+            "integrity_review",
+            "decode_replay",
+            "missing",
+            "decode_many:b8/8",
+            "TORCHINFERNO_PROFILE_RAGGED_DECODE_REPLAY_ONCE=1 "
+            "TORCHINFERNO_PROFILE_RAGGED_DECODE_MIN_BATCH=8 "
+            "TORCHINFERNO_PROFILE_RAGGED_DECODE_CACHE_BUCKET=1024",
+        ),
+        (
+            "long_output",
+            "integrity_review",
+            "decode_many_replay",
+            "missing",
+            "decode_many:b8/8",
+            "TORCHINFERNO_PROFILE_RAGGED_DECODE_MANY_REPLAY_ONCE=1 "
+            "TORCHINFERNO_PROFILE_RAGGED_DECODE_MANY_MIN_BATCH=8 "
+            "TORCHINFERNO_PROFILE_RAGGED_DECODE_MANY_CACHE_BUCKET=1024",
+        ),
+    ]
+
     text = format_inference_bench_summary(summary)
     assert "[long_output]" in text
     assert "[torchinferno ragged replay profiler]" in text
+    assert "[torchinferno next profiler probes]" in text
+    assert "TORCHINFERNO_PROFILE_RAGGED_PREFILL_BATCH=8" in text
+    assert "TORCHINFERNO_PROFILE_RAGGED_DECODE_MANY_EAGER_ACTIVE=8" in text
     assert "[torchinferno startup warmup]" in text
     assert "online decode graph warmup" in text
     assert "greedy common-prefix suffix warmup" in text
