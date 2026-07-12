@@ -15,6 +15,7 @@ from torchinferno.research.inference_bench import (
     _prefill_graph_phase_rows,
     _prefill_packed_dynamic_target_rows,
     _prefill_packed_flashinfer_gate_rows,
+    _prefill_packed_fragmentation_rows,
     _prefill_packed_fixed_capacity_runtime_rows,
     _prefill_packed_fixed_capacity_reject_rows,
     _prefill_non_fragmenting_target_rows,
@@ -1275,6 +1276,7 @@ def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) ->
     assert "1.60x" in text
     assert "[torchinferno packed prefill candidates]" in text
     assert "[torchinferno packed prefill per-batch targets]" in text
+    assert "[torchinferno packed prefill fragmentation targets]" in text
     assert "[torchinferno packed prefill signatures]" in text
     assert "[torchinferno packed prefill patterns]" in text
     assert "[torchinferno packed prefill fixed-capacity plans]" in text
@@ -1300,6 +1302,9 @@ def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) ->
     assert "75.8%" in text
     assert "prefix_graph:b2:s4:p0-0:src0:mixed0|p0:s4" not in text
     assert "saved_pct" in text
+    assert "groups_call" in text
+    assert "saved_group" in text
+    assert "fuse_groups" in text
     assert "pattern_keys" in text
     assert "repeat_call_pct" in text
     assert "100.0%" in text
@@ -2285,6 +2290,49 @@ def test_prefill_non_fragmenting_target_rows_rank_packed_over_fragmented_split()
             "1.8",
             "1.8%",
             "packed_body",
+        )
+    ]
+
+
+def test_prefill_packed_fragmentation_rows_rank_launch_fragmented_body() -> None:
+    shape = "prefix_graph:b8:s16:p45-45:src1:mixed0"
+    profile = QueueProfileSummary(
+        event="online_batcher_quiescent",
+        temperature=0.0,
+        max_tokens=512,
+        submitted_requests=8,
+        finished_events=8,
+        fields={
+            "runtime_prefill_forward_ms": 20.0,
+            "runtime_prefill_shape_forward_ms": {shape: 12.0},
+            "runtime_prefill_shape_model_tokens": {shape: 128},
+            "runtime_prefill_packed_eager_shape_ms": {shape: 4.0},
+            "runtime_prefill_packed_candidate_shape_counts": {shape: 4},
+            "runtime_prefill_packed_candidate_shape_tokens": {shape: 96},
+            "runtime_prefill_packed_candidate_shape_model_tokens": {shape: 128},
+            "runtime_prefill_packed_candidate_shape_saved_tokens": {shape: 32},
+            "runtime_prefill_packed_candidate_shape_groups": {shape: 12},
+            "runtime_prefill_packed_candidate_shape_max_groups": {shape: 4},
+        },
+    )
+
+    assert _prefill_packed_fragmentation_rows([profile]) == [
+        (
+            "0.0",
+            "512",
+            shape,
+            "4",
+            "12",
+            "3.0",
+            "4",
+            "96",
+            "128",
+            "32",
+            "2.7",
+            "2",
+            "10.0%",
+            "4",
+            "replace_body",
         )
     ]
 

@@ -1283,6 +1283,35 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
             )
             lines.append("")
 
+        packed_fragmentation_rows = _prefill_packed_fragmentation_rows(
+            queue_profiles
+        )
+        if packed_fragmentation_rows:
+            lines.append("[torchinferno packed prefill fragmentation targets]")
+            lines.extend(
+                _format_table(
+                    (
+                        "temp",
+                        "max_tokens",
+                        "candidate_shape",
+                        "calls",
+                        "groups",
+                        "groups_call",
+                        "max_call_groups",
+                        "real_tokens",
+                        "model_tokens",
+                        "saved_tokens",
+                        "saved_group",
+                        "est_saved_ms",
+                        "est_share",
+                        "obs_packed_ms",
+                        "target",
+                    ),
+                    packed_fragmentation_rows,
+                )
+            )
+            lines.append("")
+
         packed_signature_rows = _hot_prefill_packed_signature_rows(queue_profiles)
         if packed_signature_rows:
             lines.append("[torchinferno packed prefill signatures]")
@@ -4302,6 +4331,118 @@ def _prefill_packed_per_batch_target_rows(
             )
     items.sort(key=lambda item: (-item[0], -item[1], item[2]))
     return [item[3] for item in items[:limit]]
+
+
+def _prefill_packed_fragmentation_rows(
+    profiles: Sequence[QueueProfileSummary],
+    *,
+    limit: int = 8,
+) -> list[tuple[str, ...]]:
+    items: list[tuple[float, float, float, str, tuple[str, ...]]] = []
+    for profile in profiles:
+        fields = profile.fields
+        shape_groups = _numeric_mapping(
+            fields.get("runtime_prefill_packed_candidate_shape_groups")
+        )
+        shape_saved = _numeric_mapping(
+            fields.get("runtime_prefill_packed_candidate_shape_saved_tokens")
+        )
+        if not shape_groups or not shape_saved:
+            continue
+        shape_counts = _numeric_mapping(
+            fields.get("runtime_prefill_packed_candidate_shape_counts")
+        )
+        if not shape_counts:
+            shape_counts = _numeric_mapping(fields.get("runtime_prefill_shape_counts"))
+        shape_real_tokens = _numeric_mapping(
+            fields.get("runtime_prefill_packed_candidate_shape_tokens")
+        )
+        shape_model_tokens = _numeric_mapping(
+            fields.get("runtime_prefill_packed_candidate_shape_model_tokens")
+        )
+        shape_max_groups = _numeric_mapping(
+            fields.get("runtime_prefill_packed_candidate_shape_max_groups")
+        )
+        total_prefill_ms = _prefill_total_dense_forward_ms(fields)
+
+        for shape, raw_groups in shape_groups.items():
+            calls = max(0.0, float(shape_counts.get(shape, 0.0)))
+            groups = max(0.0, float(raw_groups))
+            saved = max(0.0, float(shape_saved.get(shape, 0.0)))
+            model_tokens = max(0.0, float(shape_model_tokens.get(shape, 0.0)))
+            if calls <= 0.0 or groups <= 0.0 or saved <= 0.0:
+                continue
+            groups_per_call = groups / calls
+            saved_per_group = saved / groups
+            max_call_groups = max(0.0, float(shape_max_groups.get(shape, 0.0)))
+            max_call_groups_display = (
+                max_call_groups if max_call_groups >= groups_per_call else None
+            )
+            forward_ms = _prefill_shape_dense_forward_ms(fields, shape)
+            est_saved_ms = (
+                forward_ms * saved / model_tokens
+                if forward_ms is not None and model_tokens > 0.0
+                else None
+            )
+            observed_packed_ms = _prefill_shape_observed_packed_ms(fields, shape)
+            if (
+                observed_packed_ms is not None
+                and est_saved_ms is not None
+                and observed_packed_ms >= est_saved_ms
+            ):
+                target = "replace_body"
+            elif groups_per_call > 1.0 or max_call_groups > 1.0:
+                target = "fuse_groups"
+            else:
+                target = "inspect"
+
+            score_ms = float(est_saved_ms or 0.0)
+            items.append(
+                (
+                    score_ms,
+                    groups_per_call,
+                    saved,
+                    shape,
+                    (
+                        _fmt_value(profile.temperature),
+                        _fmt_value(profile.max_tokens),
+                        shape,
+                        _fmt_value(_int_if_whole(calls)),
+                        _fmt_value(_int_if_whole(groups)),
+                        _fmt_value(groups_per_call),
+                        _fmt_value(
+                            None
+                            if max_call_groups_display is None
+                            else _int_if_whole(max_call_groups_display)
+                        ),
+                        _fmt_value(
+                            _int_if_whole(
+                                max(0.0, float(shape_real_tokens.get(shape, 0.0)))
+                            )
+                        ),
+                        _fmt_value(_int_if_whole(model_tokens)),
+                        _fmt_value(_int_if_whole(saved)),
+                        _fmt_value(saved_per_group),
+                        _fmt_value(
+                            None
+                            if est_saved_ms is None
+                            else _int_if_whole(est_saved_ms)
+                        ),
+                        _fmt_pct(
+                            float(est_saved_ms or 0.0),
+                            float(total_prefill_ms or 0.0),
+                        ),
+                        _fmt_value(
+                            None
+                            if observed_packed_ms is None
+                            else _int_if_whole(observed_packed_ms)
+                        ),
+                        target,
+                    ),
+                )
+            )
+    items.sort(key=lambda item: (-item[0], -item[1], -item[2], item[3]))
+    return [item[4] for item in items[:limit]]
 
 
 def _hot_prefill_packed_signature_rows(
