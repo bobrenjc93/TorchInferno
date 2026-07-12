@@ -109,6 +109,31 @@ low (`6.8%`/`3.4%` repeat calls). This keeps fixed-capacity/exact-pattern packed
 graphs rejected and narrows the fair implementation target to a dynamic packed
 cached-prefix suffix body plus lower high-active decode replay cost.
 
+A current-head same-host long_output refresh on pushed `c29e8c8` wrote
+`/tmp/inference-bench-long-c29e8c8-tv-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-long-c29e8c8-tv/runs/20260712_020909`.
+TorchInferno stayed correct at `1000/1000` and landed at
+`209.8 / 21.8 / 964.8ms`, `36.2 tok/s`; vLLM on `19069bc` landed at
+`49.9 / 16.9 / 650.0ms`, `55.3 tok/s`. The queue profile again kept all
+score-facing shortcut counters at zero. The remaining local gap split across
+ordinary work: `4.70s` prefill graph GPU with `31.4K` padded suffix tokens and
+`5.44s` decode-many GPU. vLLM's server log reports the same fair serving
+envelope as the public refresh, with prefix caching and chunked prefill enabled,
+async scheduling, a `512` decode graph envelope, and `1,828,528` GPU KV-cache
+tokens.
+
+An isolated greedy-short prefill-ready cap probe on the same commit set
+`TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_PREFILL_READY_ACTIVE_CAP=8` and
+wrote
+`/tmp/inference-bench-ti-long-c29e8c8-prbd8-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-long-c29e8c8-prbd8/runs/20260712_021708`.
+It stayed correct and improved median E2E in this single run
+(`964.8ms -> 939.8ms`) but worsened TTFT/TPOT (`209.8 / 21.8ms` ->
+`214.4 / 21.9ms`) and inflated decode-many GPU from `5.44s` to `6.61s`.
+The changed cap also raised decode-many model tokens from `23.4K` to `28.4K`
+and overgenerated/skipped tokens from `1.1K` to `1.5K`. Keep the greedy-short
+prefill-ready cap at the current default `6`; the next useful long_output work
+is still a cheaper packed cached-prefix suffix body and faster high-active
+decode-many replay, not a broader prefill/decode ordering toggle.
+
 ## Current 20260712 fixed-capacity packed prefill rejection
 
 A fresh long_output probe on `3f2aa90` with
