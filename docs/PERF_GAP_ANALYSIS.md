@@ -15475,6 +15475,16 @@ behavior, but it makes future runs fail closed: any row with active generated
 prefix, prompt lookup, prefix logits/sample/greedy payloads, or repeated-sample
 state is labeled `integrity_review` instead of a normal optimization target.
 
+A fresh adversarial AST scan of the score-facing runtime path
+(`runtime/serving.py`, `openai_server.py`, `openai_http.py`, and
+`models/llama3/tensor_parallel.py`) found no executable string, identifier, or
+attribute references to the public benchmark identities (`few_shot`,
+`self_consistency`, `multi_turn`, `tree_of_thought`, `long_output`), the
+`inference-bench` name, the `8xH100` hardware label, or the
+`Meta-Llama-3.1-70B` model label. This is now covered by
+`tests/test_benchmark_integrity.py`, with docstrings ignored so explanatory
+comments remain possible while runtime branches on benchmark identity fail.
+
 ## Priority for a focused (non-loop) session
 
 1. Prefill MFU (Issue 1) — biggest TTFT lever, ~2x, affects 3/5 benchmarks.
