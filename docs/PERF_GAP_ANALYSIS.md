@@ -1,5 +1,22 @@
 # TorchInferno vs vLLM/sglang — Performance Gap Analysis (Llama-3.1-70B, 8xH100)
 
+## Current 20260712 packed graph-fit triage
+
+The latest public run is still `20260712_050229`. Re-rendering the new
+`[torchinferno packed prefill graph fit]` table shows why the visible
+`29.5K` packed-prefill candidate tokens should not be read as a defaultable
+exact-pattern graph win: the top shape
+`prefix_graph:b24:s64:p111-111:src1:mixed0` accounts for `11.2K` saved tokens
+(`37.8%` of packed candidates), but exact signature reuse covers `0.0%` of
+saved tokens and coarse pattern reuse covers only `20.4%`. The analyzer now
+classifies that row as `dynamic_body`, matching the model-side constraint that
+current packed prefill graphs key on exact `q_lens` and start-position tuples.
+
+This is a diagnostic change only. It keeps the next fair optimization target on
+a shape-level or dynamic-count packed cached-prefix suffix body rather than
+re-enabling the previously rejected broad packed eager or fixed-capacity graph
+paths, and it does not alter runtime serving behavior.
+
 ## Current 20260712 packed-fragmentation visibility
 
 The latest public run is still `20260712_050229`, built from older

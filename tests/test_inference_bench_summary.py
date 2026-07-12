@@ -16,6 +16,7 @@ from torchinferno.research.inference_bench import (
     _prefill_packed_dynamic_target_rows,
     _prefill_packed_flashinfer_gate_rows,
     _prefill_packed_fragmentation_rows,
+    _prefill_packed_graph_fit_rows,
     _prefill_packed_fixed_capacity_runtime_rows,
     _prefill_packed_fixed_capacity_reject_rows,
     _prefill_non_fragmenting_target_rows,
@@ -1355,6 +1356,7 @@ def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) ->
     assert "[torchinferno packed prefill implementation targets]" in text
     assert "[torchinferno packed prefill signature reuse]" in text
     assert "[torchinferno packed prefill pattern reuse]" in text
+    assert "[torchinferno packed prefill graph fit]" in text
     assert "p45:s10:n2/p45:s11:n1" in text
     assert "p45:s10/p45:s11" in text
     assert "slot_src" in text
@@ -2493,6 +2495,48 @@ def test_prefill_packed_fragmentation_rows_use_observed_packed_time_without_esti
             "-",
             "6926.5",
             "replace_body",
+        )
+    ]
+
+
+def test_prefill_packed_graph_fit_rows_classify_dynamic_body_target() -> None:
+    shape = "prefix_graph:b24:s64:p111-111:src1:mixed0"
+    profile = QueueProfileSummary(
+        event="online_batcher_quiescent",
+        temperature=0.0,
+        max_tokens=96,
+        submitted_requests=64,
+        finished_events=64,
+        fields={
+            "runtime_prefill_packed_candidate_calls": 10,
+            "runtime_prefill_packed_candidate_saved_tokens": 100,
+            "runtime_prefill_packed_candidate_shape_counts": {shape: 4},
+            "runtime_prefill_packed_candidate_shape_saved_tokens": {shape: 80},
+            "runtime_prefill_packed_candidate_signature_keys": 9,
+            "runtime_prefill_packed_candidate_signature_calls": 10,
+            "runtime_prefill_packed_candidate_signature_repeated_calls": 1,
+            "runtime_prefill_packed_candidate_signature_repeated_saved_tokens": 5,
+            "runtime_prefill_packed_candidate_pattern_keys": 7,
+            "runtime_prefill_packed_candidate_pattern_calls": 10,
+            "runtime_prefill_packed_candidate_pattern_repeated_calls": 2,
+            "runtime_prefill_packed_candidate_pattern_repeated_saved_tokens": 20,
+        },
+    )
+
+    assert _prefill_packed_graph_fit_rows([profile]) == [
+        (
+            "0.0",
+            "96",
+            "100",
+            "10",
+            shape,
+            "80",
+            "80.0%",
+            "9",
+            "5.0%",
+            "7",
+            "20.0%",
+            "dynamic_body",
         )
     ]
 

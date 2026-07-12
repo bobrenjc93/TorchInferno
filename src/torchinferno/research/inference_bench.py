@@ -1653,6 +1653,30 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
             )
             lines.append("")
 
+        packed_graph_fit_rows = _prefill_packed_graph_fit_rows(queue_profiles)
+        if packed_graph_fit_rows:
+            lines.append("[torchinferno packed prefill graph fit]")
+            lines.extend(
+                _format_table(
+                    (
+                        "temp",
+                        "max_tokens",
+                        "candidate_saved",
+                        "candidate_calls",
+                        "top_shape",
+                        "top_shape_saved",
+                        "top_shape_share",
+                        "sig_keys",
+                        "sig_repeat_saved_pct",
+                        "pattern_keys",
+                        "pattern_repeat_saved_pct",
+                        "target",
+                    ),
+                    packed_graph_fit_rows,
+                )
+            )
+            lines.append("")
+
         prefill_phase_rows = _prefill_graph_phase_rows(queue_profiles)
         if prefill_phase_rows:
             lines.append("[torchinferno prefill graph phase]")
@@ -6263,6 +6287,73 @@ def _prefill_packed_signature_reuse_rows(
     return _prefill_packed_key_reuse_rows(profiles, kind="signature")
 
 
+def _prefill_packed_key_reuse_summary(
+    fields: dict[str, Any],
+    *,
+    kind: str,
+) -> dict[str, float | None] | None:
+    counts = _numeric_mapping(
+        fields.get(f"runtime_prefill_packed_candidate_{kind}_counts")
+    )
+    keys_scalar = _numeric_field(
+        fields, f"runtime_prefill_packed_candidate_{kind}_keys"
+    )
+    if not counts and keys_scalar is None:
+        return None
+    calls_scalar = _numeric_field(
+        fields, f"runtime_prefill_packed_candidate_{kind}_calls"
+    )
+    repeated_calls_scalar = _numeric_field(
+        fields, f"runtime_prefill_packed_candidate_{kind}_repeated_calls"
+    )
+    repeated_saved_scalar = _numeric_field(
+        fields, f"runtime_prefill_packed_candidate_{kind}_repeated_saved_tokens"
+    )
+    saved = _numeric_mapping(
+        fields.get(f"runtime_prefill_packed_candidate_{kind}_saved_tokens")
+    )
+    total_calls = float(
+        calls_scalar
+        if calls_scalar is not None
+        else sum(counts.values())
+    )
+    total_saved_raw = fields.get("runtime_prefill_packed_candidate_saved_tokens")
+    total_saved = (
+        float(total_saved_raw)
+        if isinstance(total_saved_raw, (int, float))
+        else float(sum(saved.values()))
+    )
+    candidate_calls_raw = fields.get("runtime_prefill_packed_candidate_calls")
+    candidate_calls = (
+        float(candidate_calls_raw)
+        if isinstance(candidate_calls_raw, (int, float)) and candidate_calls_raw > 0
+        else float(total_calls)
+    )
+    repeated_calls = float(
+        repeated_calls_scalar
+        if repeated_calls_scalar is not None
+        else sum(value for value in counts.values() if value > 1)
+    )
+    if repeated_saved_scalar is not None:
+        repeated_saved: float | None = float(repeated_saved_scalar)
+    else:
+        repeated_keys = [key for key, count in counts.items() if count > 1]
+        if not repeated_keys:
+            repeated_saved = 0.0
+        elif saved and all(key in saved for key in repeated_keys):
+            repeated_saved = float(sum(saved[key] for key in repeated_keys))
+        else:
+            repeated_saved = None
+    return {
+        "keys": float(keys_scalar if keys_scalar is not None else len(counts)),
+        "total_calls": total_calls,
+        "candidate_calls": candidate_calls,
+        "repeated_calls": repeated_calls,
+        "repeated_saved": repeated_saved,
+        "total_saved": total_saved,
+    }
+
+
 def _prefill_packed_key_reuse_rows(
     profiles: Sequence[QueueProfileSummary],
     *,
@@ -6271,79 +6362,108 @@ def _prefill_packed_key_reuse_rows(
     rows: list[tuple[str, ...]] = []
     for profile in profiles:
         fields = profile.fields
-        counts = _numeric_mapping(
-            fields.get(f"runtime_prefill_packed_candidate_{kind}_counts")
-        )
-        keys_scalar = _numeric_field(
-            fields, f"runtime_prefill_packed_candidate_{kind}_keys"
-        )
-        if not counts and keys_scalar is None:
+        summary = _prefill_packed_key_reuse_summary(fields, kind=kind)
+        if summary is None:
             continue
-        calls_scalar = _numeric_field(
-            fields, f"runtime_prefill_packed_candidate_{kind}_calls"
-        )
-        repeated_calls_scalar = _numeric_field(
-            fields, f"runtime_prefill_packed_candidate_{kind}_repeated_calls"
-        )
-        repeated_saved_scalar = _numeric_field(
-            fields, f"runtime_prefill_packed_candidate_{kind}_repeated_saved_tokens"
-        )
-        saved = _numeric_mapping(
-            fields.get(f"runtime_prefill_packed_candidate_{kind}_saved_tokens")
-        )
-        total_calls = int(
-            calls_scalar
-            if calls_scalar is not None
-            else sum(counts.values())
-        )
-        total_saved_raw = fields.get("runtime_prefill_packed_candidate_saved_tokens")
-        total_saved = (
-            float(total_saved_raw)
-            if isinstance(total_saved_raw, (int, float))
-            else sum(saved.values())
-        )
-        candidate_calls_raw = fields.get("runtime_prefill_packed_candidate_calls")
-        candidate_calls = (
-            float(candidate_calls_raw)
-            if isinstance(candidate_calls_raw, (int, float)) and candidate_calls_raw > 0
-            else float(total_calls)
-        )
-        repeated_calls = int(
-            repeated_calls_scalar
-            if repeated_calls_scalar is not None
-            else sum(value for value in counts.values() if value > 1)
-        )
-        if repeated_saved_scalar is not None:
-            repeated_saved: float | None = repeated_saved_scalar
-        else:
-            repeated_keys = [
-                signature for signature, count in counts.items() if count > 1
-            ]
-            if not repeated_keys:
-                repeated_saved = 0.0
-            elif saved and all(signature in saved for signature in repeated_keys):
-                repeated_saved = sum(saved[signature] for signature in repeated_keys)
-            else:
-                repeated_saved = None
+        repeated_saved = summary["repeated_saved"]
         rows.append(
             (
                 _fmt_value(profile.temperature),
                 _fmt_value(profile.max_tokens),
-                _fmt_value(
-                    _int_if_whole(
-                        keys_scalar
-                        if keys_scalar is not None
-                        else len(counts)
-                    )
+                _fmt_value(_int_if_whole(summary["keys"] or 0.0)),
+                _fmt_value(_int_if_whole(summary["total_calls"] or 0.0)),
+                _fmt_value(_int_if_whole(summary["candidate_calls"] or 0.0)),
+                _fmt_value(_int_if_whole(summary["repeated_calls"] or 0.0)),
+                _fmt_pct(
+                    float(summary["repeated_calls"] or 0.0),
+                    float(summary["candidate_calls"] or 0.0),
                 ),
-                _fmt_value(total_calls),
-                _fmt_value(_int_if_whole(candidate_calls)),
-                _fmt_value(repeated_calls),
-                _fmt_pct(repeated_calls, candidate_calls),
                 _fmt_value(
                     None if repeated_saved is None else _int_if_whole(repeated_saved)
                 ),
-                "-" if repeated_saved is None else _fmt_pct(repeated_saved, total_saved),
+                "-"
+                if repeated_saved is None
+                else _fmt_pct(repeated_saved, float(summary["total_saved"] or 0.0)),
+            )
+        )
+    return rows
+
+
+def _prefill_packed_graph_fit_rows(
+    profiles: Sequence[QueueProfileSummary],
+) -> list[tuple[str, ...]]:
+    rows: list[tuple[str, ...]] = []
+    for profile in profiles:
+        fields = profile.fields
+        shape, shape_saved = _top_mapping_entry(
+            fields.get("runtime_prefill_packed_candidate_shape_saved_tokens")
+        )
+        if shape is None or shape_saved is None or shape_saved <= 0:
+            continue
+        total_saved = _numeric_field(
+            fields,
+            "runtime_prefill_packed_candidate_saved_tokens",
+        )
+        if total_saved is None:
+            total_saved = _sum_numeric_mapping(
+                fields.get("runtime_prefill_packed_candidate_shape_saved_tokens")
+            )
+        candidate_calls = _numeric_field(
+            fields,
+            "runtime_prefill_packed_candidate_calls",
+        )
+        if candidate_calls is None:
+            candidate_calls = _sum_numeric_mapping(
+                fields.get("runtime_prefill_packed_candidate_shape_counts")
+            )
+        signature = _prefill_packed_key_reuse_summary(fields, kind="signature")
+        pattern = _prefill_packed_key_reuse_summary(fields, kind="pattern")
+        signature_repeated_saved = (
+            None if signature is None else signature["repeated_saved"]
+        )
+        pattern_repeated_saved = None if pattern is None else pattern["repeated_saved"]
+        signature_repeat_pct = (
+            None
+            if signature_repeated_saved is None
+            else _ratio_or_none(signature_repeated_saved, total_saved or 0.0, scale=100.0)
+        )
+        pattern_repeat_pct = (
+            None
+            if pattern_repeated_saved is None
+            else _ratio_or_none(pattern_repeated_saved, total_saved or 0.0, scale=100.0)
+        )
+        if signature_repeat_pct is not None and signature_repeat_pct >= 50.0:
+            target = "exact_replay"
+        elif pattern_repeat_pct is not None and pattern_repeat_pct >= 50.0:
+            target = "fixed_capacity"
+        else:
+            target = "dynamic_body"
+        rows.append(
+            (
+                _fmt_value(profile.temperature),
+                _fmt_value(profile.max_tokens),
+                _fmt_value(_int_if_whole(total_saved or 0.0)),
+                _fmt_value(_int_if_whole(candidate_calls or 0.0)),
+                shape,
+                _fmt_value(_int_if_whole(shape_saved)),
+                _fmt_pct(float(shape_saved), float(total_saved or 0.0)),
+                _fmt_value(
+                    None
+                    if signature is None
+                    else _int_if_whole(signature["keys"] or 0.0)
+                ),
+                _fmt_pct_value(
+                    None
+                    if signature_repeat_pct is None
+                    else float(signature_repeat_pct)
+                ),
+                _fmt_value(
+                    None if pattern is None else _int_if_whole(pattern["keys"] or 0.0)
+                ),
+                _fmt_pct_value(
+                    None if pattern_repeat_pct is None else float(pattern_repeat_pct)
+                ),
+                target,
             )
         )
     return rows
