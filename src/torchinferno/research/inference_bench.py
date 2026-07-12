@@ -3335,6 +3335,8 @@ def _top_decode_cache_bucket(fields: dict[str, Any]) -> str | None:
 def _decode_many_eager_profiler_env(active: int, padded: int) -> str:
     return _probe_env(
         (
+            ("TORCHINFERNO_CUDAGRAPH_RAGGED_DECODE_STEP", "0"),
+            ("TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY_GRAPH", "0"),
             ("TORCHINFERNO_PROFILE_RAGGED_DECODE_MANY_EAGER_ONCE", "1"),
             ("TORCHINFERNO_PROFILE_RAGGED_DECODE_MANY_EAGER_ACTIVE", str(active)),
             ("TORCHINFERNO_PROFILE_RAGGED_DECODE_MANY_EAGER_PADDED", str(padded)),

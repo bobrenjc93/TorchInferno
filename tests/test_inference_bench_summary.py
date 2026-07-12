@@ -1135,6 +1135,8 @@ def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) ->
             "decode_many_eager",
             "missing",
             "decode_many:b8/8",
+            "TORCHINFERNO_CUDAGRAPH_RAGGED_DECODE_STEP=0 "
+            "TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY_GRAPH=0 "
             "TORCHINFERNO_PROFILE_RAGGED_DECODE_MANY_EAGER_ONCE=1 "
             "TORCHINFERNO_PROFILE_RAGGED_DECODE_MANY_EAGER_ACTIVE=8 "
             "TORCHINFERNO_PROFILE_RAGGED_DECODE_MANY_EAGER_PADDED=8 "
@@ -1167,6 +1169,8 @@ def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) ->
     assert "[torchinferno ragged replay profiler]" in text
     assert "[torchinferno next profiler probes]" in text
     assert "TORCHINFERNO_PROFILE_RAGGED_PREFILL_BATCH=8" in text
+    assert "TORCHINFERNO_CUDAGRAPH_RAGGED_DECODE_STEP=0" in text
+    assert "TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY_GRAPH=0" in text
     assert "TORCHINFERNO_PROFILE_RAGGED_DECODE_MANY_EAGER_ACTIVE=8" in text
     assert "[torchinferno startup warmup]" in text
     assert "online decode graph warmup" in text

@@ -15732,6 +15732,25 @@ attribute references to the public benchmark identities (`few_shot`,
 `tests/test_benchmark_integrity.py`, with docstrings ignored so explanatory
 comments remain possible while runtime branches on benchmark identity fail.
 
+The current-head long_output probe on `7b040aa` wrote
+`/tmp/inference-bench-ti-long-prof-probes-7b040aa-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100/runs/20260712_071743`.
+It stayed correct (`1000/1000`) and cache-integrity clean, with generated
+prefix, prompt lookup, reusable-prefix logits/sample/greedy, and repeated-hit
+counters all zero. The run was profiling-heavy (`222.6 / 21.6 / 1047.8ms`,
+`35.7 tok/s`), so do not use it as a tuning result. Its replay profilers did
+capture the hot bodies: `prefill_replay b24:s64` used `82.8ms` self CUDA,
+split across `24.5ms` NCCL all-reduce (`29.6%`), `27.6ms` GEMM (`33.3%`),
+`7.1ms` add/RMS, and `0.7ms` softmax; `decode_replay b64 cache1024` used
+`12.3ms` self CUDA, split across `4.5ms` GEMM (`36.7%`), `3.3ms` Marlin
+(`26.6%`), `2.1ms` symmetric all-reduce (`17.2%`), and `1.5ms` attention
+(`11.8%`). The requested decode-many eager profiler did not fire because the
+default same-temperature decode-many path uses the single-step ragged token
+graph before it can reach the eager fallback. The analyzer's
+`decode_many_eager` probe now emits
+`TORCHINFERNO_CUDAGRAPH_RAGGED_DECODE_STEP=0` and
+`TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY_GRAPH=0` so the eager body can be
+measured separately from the `decode_replay` graph body.
+
 ## Priority for a focused (non-loop) session
 
 1. Prefill MFU (Issue 1) — biggest TTFT lever, ~2x, affects 3/5 benchmarks.
