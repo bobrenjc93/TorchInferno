@@ -81,6 +81,17 @@ to normal runtime work: `4.07s` prefill graph GPU with `32.7K` padded suffix
 tokens, plus `6.69s` decode-many GPU. Generated-prefix store/reuse, prompt
 lookup, repeated-sample-state hits, and reusable-prefix logits all remain zero.
 
+The analyzer now surfaces comparable provider serving-envelope fields from the
+same public logs. On `20260711_230213`, vLLM reports prefix caching on, chunked
+prefill at `8192` tokens, async scheduling, a `512` decode CUDA-graph envelope,
+and `1,451,760` GPU KV-cache tokens. SGLang reports radix cache on, chunked
+prefill at `8192`, overlap scheduling, `512` decode graph max batch,
+`8192` prefill graph max batch, FA3 attention, and FlashInfer sampling. This is
+ordinary engine configuration rather than benchmark-specific branching, and it
+keeps the remaining fair TorchInferno targets concrete: a non-fragmenting packed
+cached-prefix prefill body for the recurring suffix waves and a faster
+single-step high-active decode replay body, not exact-prompt logits reuse.
+
 A same-host long_output comparison on pushed `83fd986` wrote
 `/tmp/inference-bench-long-ti-vllm-83fd986-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-long-ti-vllm-83fd986/runs/20260712_004813`.
 TorchInferno stayed correct at `1000/1000` and landed at

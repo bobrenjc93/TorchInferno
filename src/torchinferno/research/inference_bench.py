@@ -35,6 +35,10 @@ _VLLM_RUNTIME_RE = re.compile(
     r"GPU KV cache usage: (?P<kv_cache_pct>[0-9.]+)%, "
     r"Prefix cache hit rate: (?P<prefix_hit_pct>[0-9.]+)%"
 )
+_VLLM_CHUNKED_PREFILL_RE = re.compile(
+    r"Chunked prefill is enabled with max_num_batched_tokens=(?P<tokens>[0-9,]+)"
+)
+_VLLM_KV_CACHE_RE = re.compile(r"GPU KV cache size: (?P<tokens>[0-9,]+) tokens")
 _SGLANG_PREFILL_RE = re.compile(
     r"Prefill batch, #new-seq: (?P<new_seq>[0-9]+), "
     r"#new-token: (?P<new_tokens>[0-9]+), "
@@ -47,6 +51,12 @@ _SGLANG_DECODE_RE = re.compile(
     r"#token: (?P<tokens>[0-9]+).*?"
     r"cuda graph: (?P<cuda_graph>True|False), "
     r"gen throughput \(token/s\): (?P<generation_tps>[0-9.]+)"
+)
+_SGLANG_DECODE_GRAPH_RE = re.compile(
+    r"decode=PhaseConfig\(backend='(?P<backend>[^']+)', max_bs=(?P<max_bs>[0-9]+)"
+)
+_SGLANG_PREFILL_GRAPH_RE = re.compile(
+    r"prefill=PhaseConfig\(backend='(?P<backend>[^']+)', max_bs=(?P<max_bs>[0-9]+)"
 )
 _TORCHINFERNO_RAGGED_PREFILL_PROFILE_RE = re.compile(
     r"\[(?P<kind>RAGGED_PREFILL(?:_REPLAY)?_PROF)\] "
@@ -457,6 +467,18 @@ class QueueProfileSummary:
 @dataclass(frozen=True)
 class ProviderServerLogSummary:
     provider: str
+    prefix_cache: bool | None = None
+    chunked_prefill: bool | None = None
+    chunked_prefill_tokens: int | None = None
+    async_scheduling: bool | None = None
+    decode_cuda_graph: bool | None = None
+    decode_cuda_graph_max_bs: int | None = None
+    prefill_cuda_graph: bool | None = None
+    prefill_cuda_graph_max_bs: int | None = None
+    continuous_decode_steps: int | None = None
+    kv_cache_tokens: int | None = None
+    attention_backend: str | None = None
+    sampling_backend: str | None = None
     prompt_events: int = 0
     prompt_tps_avg: float | None = None
     prompt_tps_max: float | None = None
@@ -1786,6 +1808,31 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
         )
         lines.append("")
 
+    provider_config_rows = _provider_server_config_rows(summary.provider_server_logs)
+    if provider_config_rows:
+        lines.append("[provider serving config]")
+        lines.extend(
+            _format_table(
+                (
+                    "provider",
+                    "prefix_cache",
+                    "chunked_prefill",
+                    "chunk_tokens",
+                    "async_sched",
+                    "decode_graph",
+                    "decode_max_bs",
+                    "prefill_graph",
+                    "prefill_max_bs",
+                    "decode_steps",
+                    "kv_tokens",
+                    "attention",
+                    "sampling",
+                ),
+                provider_config_rows,
+            )
+        )
+        lines.append("")
+
     provider_phase_rows = _provider_server_log_rows(summary.provider_server_logs)
     if provider_phase_rows:
         lines.append("[provider server log phases]")
@@ -2520,6 +2567,62 @@ def _torchinferno_profiler_event_from_fields(
     )
 
 
+def _int_with_commas(value: str) -> int | None:
+    try:
+        return int(value.replace(",", ""))
+    except ValueError:
+        return None
+
+
+def _provider_log_bool_field(text: str, name: str) -> bool | None:
+    match = re.search(
+        rf"(?:'|\b){re.escape(name)}(?:'|\b)\s*[:=]\s*(?P<value>True|False)",
+        text,
+    )
+    if match is None:
+        return None
+    return match.group("value") == "True"
+
+
+def _inverted_provider_log_bool_field(text: str, name: str) -> bool | None:
+    value = _provider_log_bool_field(text, name)
+    return None if value is None else not value
+
+
+def _provider_log_int_field(text: str, name: str) -> int | None:
+    match = re.search(
+        rf"(?:'|\b){re.escape(name)}(?:'|\b)\s*[:=]\s*(?P<value>[0-9,]+)",
+        text,
+    )
+    if match is None:
+        return None
+    return _int_with_commas(match.group("value"))
+
+
+def _provider_log_str_field(text: str, name: str) -> str | None:
+    match = re.search(
+        rf"(?:'|\b){re.escape(name)}(?:'|\b)\s*[:=]\s*'(?P<value>[^']*)'",
+        text,
+    )
+    if match is None:
+        return None
+    value = match.group("value")
+    return value if value else None
+
+
+def _combine_enabled_flags(
+    global_disabled: bool | None,
+    feature_disabled: bool | None,
+    *,
+    default: bool | None,
+) -> bool | None:
+    if global_disabled is True or feature_disabled is True:
+        return False
+    if global_disabled is False or feature_disabled is False:
+        return True
+    return default
+
+
 def _profiler_row_self_cuda_ms(line: str) -> float | None:
     # torch.profiler's text table puts Self CUDA as the fourth time-valued column.
     matches = list(_PROFILER_TIME_RE.finditer(line))
@@ -2561,13 +2664,22 @@ def _profiler_row_category(line: str) -> str | None:
 
 
 def _summarize_vllm_server_log(path: Path) -> ProviderServerLogSummary:
+    text = path.read_text(errors="replace")
     prompt_tps: list[float] = []
     generation_tps: list[float] = []
     running_values: list[int] = []
     waiting_values: list[int] = []
     kv_cache_pct: list[float] = []
     prefix_hit_pct: list[float] = []
-    for line in path.read_text(errors="replace").splitlines():
+    chunked_prefill_tokens: int | None = None
+    kv_cache_tokens: int | None = None
+    for line in text.splitlines():
+        chunked_match = _VLLM_CHUNKED_PREFILL_RE.search(line)
+        if chunked_match is not None:
+            chunked_prefill_tokens = _int_with_commas(chunked_match.group("tokens"))
+        kv_cache_match = _VLLM_KV_CACHE_RE.search(line)
+        if kv_cache_match is not None:
+            kv_cache_tokens = _int_with_commas(kv_cache_match.group("tokens"))
         match = _VLLM_RUNTIME_RE.search(line)
         if match is None:
             continue
@@ -2579,6 +2691,21 @@ def _summarize_vllm_server_log(path: Path) -> ProviderServerLogSummary:
         prefix_hit_pct.append(float(match.group("prefix_hit_pct")))
     return ProviderServerLogSummary(
         provider="vllm",
+        prefix_cache=_provider_log_bool_field(text, "enable_prefix_caching"),
+        chunked_prefill=(
+            _provider_log_bool_field(text, "enable_chunked_prefill")
+            if _provider_log_bool_field(text, "enable_chunked_prefill") is not None
+            else (True if chunked_prefill_tokens is not None else None)
+        ),
+        chunked_prefill_tokens=chunked_prefill_tokens,
+        async_scheduling=(
+            True if "Asynchronous scheduling is enabled" in text else None
+        ),
+        decode_cuda_graph=(
+            True if _provider_log_int_field(text, "max_cudagraph_capture_size") is not None else None
+        ),
+        decode_cuda_graph_max_bs=_provider_log_int_field(text, "max_cudagraph_capture_size"),
+        kv_cache_tokens=kv_cache_tokens,
         prompt_events=len(prompt_tps),
         prompt_tps_avg=_avg(prompt_tps),
         prompt_tps_max=max(prompt_tps) if prompt_tps else None,
@@ -2595,6 +2722,7 @@ def _summarize_vllm_server_log(path: Path) -> ProviderServerLogSummary:
 
 
 def _summarize_sglang_server_log(path: Path) -> ProviderServerLogSummary:
+    text = path.read_text(errors="replace")
     prompt_tps: list[float] = []
     generation_tps: list[float] = []
     prefill_batches = 0
@@ -2611,7 +2739,7 @@ def _summarize_sglang_server_log(path: Path) -> ProviderServerLogSummary:
     decode_running_counts: dict[str, int] = {}
     decode_token_bucket_counts: dict[str, int] = {}
 
-    for line in path.read_text(errors="replace").splitlines():
+    for line in text.splitlines():
         prefill_match = _SGLANG_PREFILL_RE.search(line)
         if prefill_match is not None:
             prefill_batches += 1
@@ -2656,8 +2784,46 @@ def _summarize_sglang_server_log(path: Path) -> ProviderServerLogSummary:
             decode_cuda_graph_batches += 1
         generation_tps.append(float(decode_match.group("generation_tps")))
 
+    disable_radix_cache = _provider_log_bool_field(text, "disable_radix_cache")
+    disable_cuda_graph = _provider_log_bool_field(text, "disable_cuda_graph")
+    disable_decode_cuda_graph = _provider_log_bool_field(text, "disable_decode_cuda_graph")
+    disable_prefill_cuda_graph = _provider_log_bool_field(text, "disable_prefill_cuda_graph")
+    decode_graph_match = _SGLANG_DECODE_GRAPH_RE.search(text)
+    prefill_graph_match = _SGLANG_PREFILL_GRAPH_RE.search(text)
+    chunked_prefill_tokens = _provider_log_int_field(text, "chunked_prefill_size")
     return ProviderServerLogSummary(
         provider="sglang",
+        prefix_cache=(None if disable_radix_cache is None else not disable_radix_cache),
+        chunked_prefill=(
+            None
+            if chunked_prefill_tokens is None
+            else chunked_prefill_tokens > 0
+        ),
+        chunked_prefill_tokens=chunked_prefill_tokens,
+        async_scheduling=_inverted_provider_log_bool_field(text, "disable_overlap_schedule"),
+        decode_cuda_graph=_combine_enabled_flags(
+            disable_cuda_graph,
+            disable_decode_cuda_graph,
+            default=True if decode_graph_match is not None else None,
+        ),
+        decode_cuda_graph_max_bs=(
+            int(decode_graph_match.group("max_bs"))
+            if decode_graph_match is not None
+            else None
+        ),
+        prefill_cuda_graph=_combine_enabled_flags(
+            disable_cuda_graph,
+            disable_prefill_cuda_graph,
+            default=True if prefill_graph_match is not None else None,
+        ),
+        prefill_cuda_graph_max_bs=(
+            int(prefill_graph_match.group("max_bs"))
+            if prefill_graph_match is not None
+            else None
+        ),
+        continuous_decode_steps=_provider_log_int_field(text, "num_continuous_decode_steps"),
+        attention_backend=_provider_log_str_field(text, "attention_backend"),
+        sampling_backend=_provider_log_str_field(text, "sampling_backend"),
         prompt_events=len(prompt_tps),
         prompt_tps_avg=_avg(prompt_tps),
         prompt_tps_max=max(prompt_tps) if prompt_tps else None,
@@ -2738,6 +2904,47 @@ def _short_torchinferno_profiler_kind(kind: str) -> str:
     if kind == "RAGGED_DECODE_MANY_EAGER_PROF":
         return "decode_many_eager"
     return kind
+
+
+def _provider_server_config_rows(
+    summaries: Sequence[ProviderServerLogSummary],
+) -> list[tuple[str, ...]]:
+    rows: list[tuple[str, ...]] = []
+    for summary in summaries:
+        values = (
+            summary.prefix_cache,
+            summary.chunked_prefill,
+            summary.chunked_prefill_tokens,
+            summary.async_scheduling,
+            summary.decode_cuda_graph,
+            summary.decode_cuda_graph_max_bs,
+            summary.prefill_cuda_graph,
+            summary.prefill_cuda_graph_max_bs,
+            summary.continuous_decode_steps,
+            summary.kv_cache_tokens,
+            summary.attention_backend,
+            summary.sampling_backend,
+        )
+        if all(value is None for value in values):
+            continue
+        rows.append(
+            (
+                summary.provider,
+                _fmt_value(summary.prefix_cache),
+                _fmt_value(summary.chunked_prefill),
+                _fmt_value(summary.chunked_prefill_tokens),
+                _fmt_value(summary.async_scheduling),
+                _fmt_value(summary.decode_cuda_graph),
+                _fmt_value(summary.decode_cuda_graph_max_bs),
+                _fmt_value(summary.prefill_cuda_graph),
+                _fmt_value(summary.prefill_cuda_graph_max_bs),
+                _fmt_value(summary.continuous_decode_steps),
+                _fmt_value(summary.kv_cache_tokens),
+                _fmt_value(summary.attention_backend),
+                _fmt_value(summary.sampling_backend),
+            )
+        )
+    return rows
 
 
 def _provider_server_log_rows(

@@ -600,6 +600,11 @@ def _write_inference_bench_run(tmp_path) -> None:
     (logs / "vllm_server.log").write_text(
         "\n".join(
             [
+                "INFO Chunked prefill is enabled with max_num_batched_tokens=8,192.",
+                "INFO Asynchronous scheduling is enabled.",
+                "INFO config enable_prefix_caching=True enable_chunked_prefill=True "
+                "'max_cudagraph_capture_size': 512",
+                "INFO GPU KV cache size: 1,451,760 tokens",
                 "INFO Engine 000: Avg prompt throughput: 100.0 tokens/s, "
                 "Avg generation throughput: 20.0 tokens/s, Running: 2 reqs, "
                 "Waiting: 0 reqs, GPU KV cache usage: 0.1%, Prefix cache hit rate: 80.0%",
@@ -613,6 +618,14 @@ def _write_inference_bench_run(tmp_path) -> None:
     (logs / "sglang_server.log").write_text(
         "\n".join(
             [
+                "server_args=ServerArgs(disable_radix_cache=False, "
+                "chunked_prefill_size=8192, disable_overlap_schedule=False, "
+                "num_continuous_decode_steps=1, attention_backend='fa3', "
+                "sampling_backend='flashinfer', disable_cuda_graph=False, "
+                "disable_decode_cuda_graph=False, disable_prefill_cuda_graph=False, "
+                "cuda_graph_config=CudaGraphConfig("
+                "decode=PhaseConfig(backend='full', max_bs=512, bs=[1, 2]), "
+                "prefill=PhaseConfig(backend='breakable', max_bs=8192, bs=[4, 8])))",
                 "TP0] Prefill batch, #new-seq: 3, #new-token: 48, #cached-token: 12, "
                 "token usage: 0.00, #running-req: 0, #queue-req: 0, #pending-token: 0, "
                 "cuda graph: True, input throughput (token/s): 1200.0",
@@ -976,6 +989,13 @@ def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) ->
     )
     assert len(summary.provider_server_logs) == 2
     vllm_log = next(row for row in summary.provider_server_logs if row.provider == "vllm")
+    assert vllm_log.prefix_cache is True
+    assert vllm_log.chunked_prefill is True
+    assert vllm_log.chunked_prefill_tokens == 8192
+    assert vllm_log.async_scheduling is True
+    assert vllm_log.decode_cuda_graph is True
+    assert vllm_log.decode_cuda_graph_max_bs == 512
+    assert vllm_log.kv_cache_tokens == 1451760
     assert vllm_log.prompt_events == 2
     assert vllm_log.prompt_tps_avg == 200.0
     assert vllm_log.generation_tps_max == 40.0
@@ -985,6 +1005,17 @@ def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) ->
     assert vllm_log.kv_cache_pct_max == 0.2
     assert vllm_log.prefix_hit_pct_avg == 85.0
     sglang_log = next(row for row in summary.provider_server_logs if row.provider == "sglang")
+    assert sglang_log.prefix_cache is True
+    assert sglang_log.chunked_prefill is True
+    assert sglang_log.chunked_prefill_tokens == 8192
+    assert sglang_log.async_scheduling is True
+    assert sglang_log.decode_cuda_graph is True
+    assert sglang_log.decode_cuda_graph_max_bs == 512
+    assert sglang_log.prefill_cuda_graph is True
+    assert sglang_log.prefill_cuda_graph_max_bs == 8192
+    assert sglang_log.continuous_decode_steps == 1
+    assert sglang_log.attention_backend == "fa3"
+    assert sglang_log.sampling_backend == "flashinfer"
     assert sglang_log.prefill_batches == 2
     assert sglang_log.prefill_new_tokens == 56
     assert sglang_log.prefill_cached_tokens == 16
@@ -1375,6 +1406,15 @@ def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) ->
     assert "12.8%" in text
     assert "7.1" in text
     assert "0.7" in text
+    assert "[provider serving config]" in text
+    assert "prefix_cache" in text
+    assert "chunk_tokens" in text
+    assert "decode_max_bs" in text
+    assert "prefill_max_bs" in text
+    assert "kv_tokens" in text
+    assert "1451760" in text
+    assert "fa3" in text
+    assert "flashinfer" in text
     assert "[provider server log phases]" in text
     assert "running_max" in text
     assert "kv_cache_avg" in text
@@ -1490,6 +1530,9 @@ def test_inference_bench_summary_reads_current_provider_log_names(tmp_path) -> N
 
     text = format_inference_bench_summary(summarize_inference_bench_run(tmp_path))
 
+    assert "[provider serving config]" in text
+    assert "chunk_tokens" in text
+    assert "decode_max_bs" in text
     assert "[provider server log phases]" in text
     assert "vllm" in text
     assert "sglang" in text
