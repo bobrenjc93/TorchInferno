@@ -1116,6 +1116,7 @@ class ContinuousBatchEngine:
         self._online_step = 0
         self._online_next_index = 0
         self._pending_prefill_graph_events: list[tuple[object, ...]] = []
+        self._pending_packed_prefill_eager_events: list[tuple[object, ...]] = []
         self._pending_decode_ragged_model_events: list[tuple[object, ...]] = []
 
     def _dynamic_prefix_prefill_context_len(
@@ -4499,6 +4500,7 @@ class ContinuousBatchEngine:
                 tuple(fixed_logit_positions_values)
             )
             packed_start_s = time.perf_counter() if self.profile_timings else 0.0
+            packed_gpu_events = self._start_packed_prefill_eager_gpu_timer()
             logits = packed_graph(
                 fixed_input_ids,
                 self._require_cache(),
@@ -4515,6 +4517,10 @@ class ContinuousBatchEngine:
                 if cache_graph_none:
                     self._packed_prefill_fixed_capacity_graph_none_keys.add(graph_none_key)
                 return None
+            self._stop_packed_prefill_eager_gpu_timer(
+                packed_gpu_events,
+                profile_shape_key=profile_shape_key,
+            )
             real_index_tensor = self._device_index_tensor(tuple(real_slot_indices)).to(
                 device=logits.device
             )
@@ -4590,6 +4596,7 @@ class ContinuousBatchEngine:
             q_lens = logit_positions + 1
             if bool(torch.any(q_lens < input_ids.size(1))):
                 packed_start_s = time.perf_counter() if self.profile_timings else 0.0
+                packed_gpu_events = self._start_packed_prefill_eager_gpu_timer()
                 logits = None
                 packed_graph_enabled = env_flag(
                     "TORCHINFERNO_CONTINUOUS_PACKED_RAGGED_PREFILL_EAGER_GRAPH",
@@ -4631,6 +4638,10 @@ class ContinuousBatchEngine:
                             prefix_copy_len=prefix_copy_len,
                         )
                 if logits is not None:
+                    self._stop_packed_prefill_eager_gpu_timer(
+                        packed_gpu_events,
+                        profile_shape_key=profile_shape_key,
+                    )
                     real_tokens = int(q_lens.sum().item())
                     model_tokens = int(input_ids.size(0) * input_ids.size(1))
                     elapsed_ms = (
@@ -6240,6 +6251,62 @@ class ContinuousBatchEngine:
         if env_name in os.environ:
             return env_flag(env_name, False)
         return _queue_profile_counts_enabled()
+
+    def _packed_prefill_eager_gpu_timing_enabled(self) -> bool:
+        if self.profile_timings:
+            return False
+        return self._prefill_graph_gpu_timing_enabled()
+
+    def _start_packed_prefill_eager_gpu_timer(self) -> tuple[object, object] | None:
+        if not self._packed_prefill_eager_gpu_timing_enabled():
+            return None
+        try:
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record(torch.cuda.current_stream(self.device))
+            return start, end
+        except Exception:
+            return None
+
+    def _stop_packed_prefill_eager_gpu_timer(
+        self,
+        events: tuple[object, object] | None,
+        *,
+        profile_shape_key: str | None = None,
+    ) -> None:
+        if events is None:
+            return
+        try:
+            start, end = events
+            end.record(torch.cuda.current_stream(self.device))
+        except Exception:
+            return
+        self._pending_packed_prefill_eager_events.append(
+            (start, end, profile_shape_key)
+        )
+
+    def _flush_packed_prefill_eager_gpu_timers(self) -> None:
+        pending = getattr(self, "_pending_packed_prefill_eager_events", [])
+        if not pending:
+            return
+        remaining: list[tuple[object, ...]] = []
+        for item in pending:
+            start, end, profile_shape_key = item
+            try:
+                elapsed_ms = float(start.elapsed_time(end))
+            except RuntimeError:
+                remaining.append(item)
+                continue
+            except Exception:
+                continue
+            self.stats.prefill_packed_eager_ms += elapsed_ms
+            if profile_shape_key is not None:
+                self._record_gpu_event_shape_time(
+                    self.stats.prefill_packed_eager_shape_ms,
+                    str(profile_shape_key),
+                    elapsed_ms,
+                )
+        self._pending_packed_prefill_eager_events = remaining
 
     def _stop_prefill_graph_gpu_timer(
         self,

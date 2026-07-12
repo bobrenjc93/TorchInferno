@@ -7234,6 +7234,7 @@ class OpenAICompletionEngine:
             return
         for flush_name in (
             "_flush_prefill_graph_gpu_timers",
+            "_flush_packed_prefill_eager_gpu_timers",
             "_flush_decode_ragged_model_gpu_timers",
         ):
             flush = getattr(runtime_engine, flush_name, None)

@@ -150,6 +150,24 @@ default public serving path by itself because packed eager remains opt-in or
 pattern-gated; it reduces the cost of the fair packed suffix body we need to
 make defaultable later.
 
+An end-to-end long_output probe on `a434acd` forced broad packed eager with
+`TORCHINFERNO_CONTINUOUS_PACKED_RAGGED_PREFILL_EAGER=1` and same-start
+coalescing enabled. It wrote
+`/tmp/ti-long-packedcoalesce-a434acd-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-long-packedcoalesce-a434acd/runs/20260712_024604`.
+The run stayed correct (`1000/1000`) and kept generated-prefix store/reuse,
+prompt lookup, reusable-prefix logits, and repeated sample hits at zero, but it
+regressed hard to `830.7 / 53.7 / 3052.0ms`, `12.5 tok/s`. The queue profile
+shows why this is a rejection: broad packed eager bypassed prefill graph replay
+(`runtime_prefill_graph_replays=0`) while the exact packed signatures/patterns
+did not repeat (`54` keys for `54` calls). Packed eager removed dense padding
+tokens, but as a broad eager fallback it traded the graphable dense body for many
+small dynamic launches. Keep broad packed eager off by default; the useful target
+is still a graphable dynamic packed body or varlen kernel, not an eager detour.
+The runtime now also records packed-eager CUDA event time in queue-profile runs
+so future probes fill `runtime_prefill_packed_eager_ms` and per-shape
+`runtime_prefill_packed_eager_shape_ms` instead of showing `0.0` for a path that
+ran.
+
 ## Current 20260712 fixed-capacity packed prefill rejection
 
 A fresh long_output probe on `3f2aa90` with
