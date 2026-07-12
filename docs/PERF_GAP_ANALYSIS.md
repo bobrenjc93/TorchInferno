@@ -772,6 +772,27 @@ attention was `1.5ms` (`12.1%`), and add/RMS was `0.4ms`. This reinforces the
 current decode target: cheaper full-batch projection/Marlin/all-reduce replay
 or real overlap, not eager fallback tuning.
 
+A current-main refresh on `af183eb` reproduced the same diagnosis. The default
+long_output control wrote
+`/tmp/ti-long-current-af183eb-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-long-current-af183eb/runs/20260712_031202`
+and landed at `210.6 / 22.2 / 969.4ms`, `35.6 tok/s`, with clean cache
+integrity. A filtered eager fallback probe
+(`TORCHINFERNO_PROFILE_RAGGED_DECODE_MANY_EAGER_ONCE=1`,
+`ACTIVE=64`, `PADDED=64`) wrote
+`/tmp/ti-long-decodemany-eager-prof-af183eb-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-long-decodemany-eager-prof-af183eb/runs/20260712_031856`
+and did not emit an eager profile block because the hot path hit warmed
+single-step ragged decode graphs (`decode_many_graph=false`, but
+`decode_graph_cache=cache1024=16`). The corrected replay-profile run wrote
+`/tmp/ti-long-decode-replay-prof-af183eb-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-long-decode-replay-prof-af183eb/runs/20260712_032412`.
+It profiled `decode_replay b64/cache1024/rows64` at `12.4ms` self CUDA:
+GEMM/NVJET buckets were `4.5ms` (`36.6%`), Marlin was `3.3ms` (`26.9%`),
+symmetric-memory all-reduce was `2.1ms` (`16.8%`), decode attention was
+`1.5ms` (`12.1%`), and add/RMS was `0.4ms`. The current fair code target is
+therefore still a lower-cost single-step decode replay body or real
+decode/readback overlap, alongside the separate packed cached-prefix prefill
+body. It is not an eager fallback, multi-step graph, stop-tail, prompt-lookup,
+or logits-cache lever.
+
 ## Current 20260711 ragged-prefill replay profiler targeting
 
 A pushed-head `e1e3c2b` replay-profile run used
