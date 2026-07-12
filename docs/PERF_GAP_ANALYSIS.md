@@ -111,6 +111,21 @@ This recovers part of the fair post-reset regression; it does not close the
 remaining long_output gap, which is still the high-active decode-many body plus
 the larger non-fragmenting cached-prefix prefill body.
 
+A current-head 8ae paired recheck lowers only the greedy-short suffix-split
+minimum fill gate from `75%` to `50%`. The no-env control at
+`/tmp/inference-bench-ti-long-control-8ae31e4-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-long-control-8ae31e4/runs/20260712_055519`
+landed at `218.5 / 22.0 / 1007.1ms`, `35.4 tok/s`, with `1000/1000` correct
+and all prompt/logits cache counters zero. It accepted `6` suffix splits,
+saved `3776` padded model slots, and spent `4891.6ms` in prefill graph replay.
+The `MIN_FILL_PCT=50` run at
+`/tmp/inference-bench-ti-long-splitfill50-8ae31e4-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-long-splitfill50-8ae31e4/runs/20260712_060035`
+landed at `216.6 / 21.7 / 961.9ms`, `36.0 tok/s`, also `1000/1000` correct
+and cache-integrity clean. It accepted `10` suffix splits, saved `5888` padded
+model slots, reduced prefill padding `26.8K -> 23.7K`, and reduced prefill
+graph replay `4891.6ms -> 4527.6ms`. Keep the existing no-savings and
+minimum-group gates; the lower fill threshold is a narrow fair prefill padding
+reduction, not a prompt/logits reuse path.
+
 ## Current 20260712 sampled-short self rechecks
 
 After the no-logits reset, a full local TorchInferno-only run at pushed

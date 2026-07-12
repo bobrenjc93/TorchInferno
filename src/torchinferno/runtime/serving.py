@@ -5405,7 +5405,7 @@ class ContinuousBatchEngine:
             default_min_group_size,
             minimum=1,
         )
-        default_min_fill_pct = 75 if policy_enabled else 0
+        default_min_fill_pct = 50 if policy_enabled else 0
         min_fill_pct = env_int(
             "TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SPLIT_SUFFIX_BUCKETS_MIN_FILL_PCT",
             default_min_fill_pct,

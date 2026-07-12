@@ -5553,6 +5553,61 @@ def test_continuous_batch_engine_suffix_bucket_split_requires_model_token_saving
     assert split_groups is None
 
 
+def test_continuous_batch_engine_suffix_bucket_split_default_fill_is_fifty_pct(
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SPLIT_SUFFIX_BUCKETS", raising=False)
+    monkeypatch.delenv(
+        "TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SPLIT_SUFFIX_BUCKETS_MIN_FILL_PCT",
+        raising=False,
+    )
+    monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_BATCH_BUCKETS", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_BATCH_BUCKETS_GREEDY_SHORT", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SUFFIX_BUCKETS", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SUFFIX_BUCKETS_GREEDY_SHORT", raising=False)
+    engine = ContinuousBatchEngine(
+        object(),
+        device=torch.device("cpu"),
+        temperature=0.0,
+        max_generation_tokens=128,
+        graph_prefill=True,
+    )
+    group = [
+        (index, ServingRequest(str(index), tuple(range(16 + suffix_len)), 1), 16, object())
+        for index, suffix_len in enumerate([32] * 9 + [65] * 8)
+    ]
+    suffix_lengths = [
+        len(request.prompt) - prefix_tokens
+        for _index, request, prefix_tokens, _reusable in group
+    ]
+
+    split_groups = engine._prefix_prefill_suffix_bucket_split_groups(group, suffix_lengths)
+
+    assert split_groups is not None
+    assert sorted(len(items) for items in split_groups) == [8, 9]
+    assert engine.stats.prefill_suffix_split_accepted_calls == 1
+    expected_saved_tokens = engine._prefill_batch_bucket(len(group)) * engine._suffix_bucket(
+        max(suffix_lengths)
+    ) - (
+        engine._prefill_batch_bucket(9) * engine._suffix_bucket(32)
+        + engine._prefill_batch_bucket(8) * engine._suffix_bucket(65)
+    )
+    assert expected_saved_tokens > 0
+    assert engine.stats.prefill_suffix_split_accepted_saved_tokens == expected_saved_tokens
+
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SPLIT_SUFFIX_BUCKETS_MIN_FILL_PCT", "75")
+    strict_engine = ContinuousBatchEngine(
+        object(),
+        device=torch.device("cpu"),
+        temperature=0.0,
+        max_generation_tokens=128,
+        graph_prefill=True,
+    )
+
+    assert strict_engine._prefix_prefill_suffix_bucket_split_groups(group, suffix_lengths) is None
+    assert strict_engine.stats.prefill_suffix_split_reject_reason_counts == {"min_fill": 1}
+
+
 def test_continuous_batch_engine_opt_in_suffix_bucket_split_rejects_singletons(
     monkeypatch,
 ) -> None:
