@@ -23,6 +23,7 @@ from torchinferno.research.inference_bench import (
     _prefill_shape_dense_forward_ms,
     _prefill_target_ms,
     _top_prefill_target_entry,
+    _torchinferno_fair_gap_priority_rows,
     format_inference_bench_summary,
     summarize_inference_bench_run,
 )
@@ -1097,6 +1098,15 @@ def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) ->
     assert eager_decode_many_event.marlin_ms == 3.25
     assert eager_decode_many_event.attention_ms == 1.25
 
+    fair_gap_rows = _torchinferno_fair_gap_priority_rows(summary)
+    assert len(fair_gap_rows) == 1
+    assert fair_gap_rows[0][0] == "long_output"
+    assert fair_gap_rows[0][1] == "integrity_review"
+    assert fair_gap_rows[0][2] == "review"
+    assert fair_gap_rows[0][3] == "+30.0"
+    assert fair_gap_rows[0][4] == "+8.0"
+    assert fair_gap_rows[0][5] == "+2.0"
+
     text = format_inference_bench_summary(summary)
     assert "[long_output]" in text
     assert "[torchinferno ragged replay profiler]" in text
@@ -1142,6 +1152,8 @@ def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) ->
     assert "coverage" in text
     assert "2/2" in text
     assert "[torchinferno score targets]" in text
+    assert "[torchinferno fair gap priorities]" in text
+    assert "integrity_review" in text
     assert "phase_target" in text
     assert "capture" in text
     assert "[torchinferno prefill graph miss shapes]" in text

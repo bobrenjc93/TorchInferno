@@ -15458,6 +15458,23 @@ suffix tokens. The same render keeps the sampled tree rows mixed
 still useful for small sampled waves, but the large fair prefill gap remains a
 cached-prefix suffix-body problem.
 
+Re-rendering the latest public run, `20260712_030805`, with the new
+fair-priority table keeps the score work ordered by clean, score-moving
+evidence instead of cache shortcuts. All TorchInferno rows are integrity-clean
+on generated-prefix, prompt-lookup, reusable-prefix logits/sample/greedy, and
+repeated-sample counters. The table ranks the remaining public gaps as:
+`long_output` -> `decode_body+suffix_prefill` (`+258.6ms` E2E, `+141.8ms`
+TTFT, `6975.6ms` decode-many GPU, `4058.6ms` prefill GPU, `41.0%` prefill
+padding, `31125` packed-candidate saved tokens); `multi_turn` ->
+`mixed_prefix_prefill` (`+110.0ms` E2E/TTFT, hot
+`b32:s32:p45-56:src32:mixed1`, `49.7%` padding); `few_shot` ->
+`cached_suffix_prefill` (`+68.0ms` E2E, hot `b32:s16:p122-122`, `3525`
+suffix padding tokens); and `tree_of_thought` -> `cached_suffix_prefill`
+(`+17.7ms` E2E, sampled hot `b2:s12:p45-45`). This does not change runtime
+behavior, but it makes future runs fail closed: any row with active generated
+prefix, prompt lookup, prefix logits/sample/greedy payloads, or repeated-sample
+state is labeled `integrity_review` instead of a normal optimization target.
+
 ## Priority for a focused (non-loop) session
 
 1. Prefill MFU (Issue 1) — biggest TTFT lever, ~2x, affects 3/5 benchmarks.

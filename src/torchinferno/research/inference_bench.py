@@ -742,6 +742,32 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
             )
             lines.append("")
 
+        fair_gap_rows = _torchinferno_fair_gap_priority_rows(summary)
+        if fair_gap_rows:
+            lines.append("[torchinferno fair gap priorities]")
+            lines.extend(
+                _format_table(
+                    (
+                        "benchmark",
+                        "priority",
+                        "cache",
+                        "e2e_gap",
+                        "ttft_gap",
+                        "tpot_gap",
+                        "phase",
+                        "prefill_ms",
+                        "decode_many_ms",
+                        "pad_pct",
+                        "sfx_pad",
+                        "packed_saved",
+                        "hot_prefill",
+                        "hot_decode",
+                    ),
+                    fair_gap_rows,
+                )
+            )
+            lines.append("")
+
         lines.append("[torchinferno queue profiles]")
         header = (
             "temp",
@@ -3351,6 +3377,187 @@ def _torchinferno_score_target_rows(
     return rows
 
 
+def _torchinferno_fair_gap_priority_rows(
+    summary: InferenceBenchRunSummary,
+) -> list[tuple[str, ...]]:
+    rows: list[tuple[str, ...]] = []
+    profiles_by_key = {
+        (profile.temperature, profile.max_tokens): profile
+        for profile in summary.torchinferno_queue_profiles
+        if profile.temperature is not None and profile.max_tokens is not None
+    }
+    for benchmark in summary.benchmarks:
+        provider_rows = [
+            row for row in summary.provider_benchmarks if row.benchmark == benchmark
+        ]
+        torchinferno_row = next(
+            (row for row in provider_rows if row.provider == "torchinferno"),
+            None,
+        )
+        competitors = [row for row in provider_rows if row.provider != "torchinferno"]
+        profile = profiles_by_key.get(_BENCHMARK_QUEUE_PROFILE_KEYS.get(benchmark))
+        if torchinferno_row is None or not competitors or profile is None:
+            continue
+        ttft_gap = _provider_gap_value(
+            torchinferno_row,
+            competitors,
+            "ttft_median_ms",
+            "ttft_ms",
+            higher_is_better=False,
+        )
+        tpot_gap = _provider_gap_value(
+            torchinferno_row,
+            competitors,
+            "tpot_median_ms",
+            "tpot_ms",
+            higher_is_better=False,
+        )
+        e2e_gap = _provider_gap_value(
+            torchinferno_row,
+            competitors,
+            "e2e_median_ms",
+            "e2e_latency_ms",
+            higher_is_better=False,
+        )
+        if max((ttft_gap or 0.0), (tpot_gap or 0.0), (e2e_gap or 0.0)) <= 0.0:
+            continue
+
+        fields = profile.fields
+        prefill_ms = _prefill_target_ms(fields)
+        prefill_sample_ms = _numeric_field(fields, "runtime_prefill_sample_ms")
+        _prefill_active_tokens, prefill_model_tokens, prefill_padding_tokens = (
+            _prefill_token_totals(fields)
+        )
+        prefill_row_padding_tokens, prefill_suffix_padding_tokens = (
+            _prefill_padding_split_totals(fields)
+        )
+        decode_ms = _numeric_field(fields, "runtime_decode_ragged_model_gpu_ms")
+        decode_many_ms = _numeric_field(fields, "runtime_decode_many_model_gpu_ms")
+        if decode_many_ms is None:
+            decode_many_ms = _sum_numeric_mapping(
+                fields.get("runtime_decode_many_shape_gpu_ms")
+            )
+        decode_target_ms = max(
+            value for value in (decode_ms, decode_many_ms) if value is not None
+        ) if decode_ms is not None or decode_many_ms is not None else None
+        capture_ms = (_numeric_field(fields, "runtime_prefill_graph_capture_ms") or 0.0) + (
+            _numeric_field(fields, "runtime_decode_graph_capture_ms") or 0.0
+        )
+        phase_target = _phase_target(
+            prefill_ms=prefill_ms,
+            decode_ms=decode_target_ms,
+            sample_ms=prefill_sample_ms,
+            capture_ms=capture_ms,
+        )
+        hot_prefill, _hot_prefill_ms = _top_prefill_target_entry(fields)
+        hot_decode, _hot_decode_ms = _top_mapping_entry(
+            fields.get("runtime_decode_many_shape_gpu_ms")
+        )
+        if hot_decode is None:
+            hot_decode, _hot_decode_ms = _top_mapping_entry(
+                fields.get("runtime_decode_shape_gpu_ms")
+            )
+        cache_status = _cache_integrity_status(fields)
+        priority = _fair_gap_priority_label(
+            fields=fields,
+            cache_status=cache_status,
+            phase_target=phase_target,
+            prefill_ms=prefill_ms,
+            decode_many_ms=decode_many_ms,
+            prefill_model_tokens=prefill_model_tokens,
+            prefill_padding_tokens=prefill_padding_tokens,
+            prefill_row_padding_tokens=prefill_row_padding_tokens,
+            prefill_suffix_padding_tokens=prefill_suffix_padding_tokens,
+            hot_prefill=hot_prefill,
+        )
+        rows.append(
+            (
+                benchmark,
+                priority,
+                cache_status,
+                _fmt_signed_or_dash(e2e_gap),
+                _fmt_signed_or_dash(ttft_gap),
+                _fmt_signed_or_dash(tpot_gap),
+                phase_target,
+                _fmt_value(prefill_ms),
+                _fmt_value(decode_many_ms),
+                _fmt_pct(prefill_padding_tokens or 0.0, prefill_model_tokens or 0.0),
+                _fmt_value(
+                    None
+                    if prefill_suffix_padding_tokens is None
+                    else _int_if_whole(prefill_suffix_padding_tokens)
+                ),
+                _fmt_value(fields.get("runtime_prefill_packed_candidate_saved_tokens")),
+                _short_shape(hot_prefill),
+                _short_shape(hot_decode),
+            )
+        )
+    rows.sort(
+        key=lambda row: (
+            -_signed_row_value(row[3]),
+            -_signed_row_value(row[4]),
+            row[0],
+        )
+    )
+    return rows
+
+
+def _fair_gap_priority_label(
+    *,
+    fields: Mapping[str, Any],
+    cache_status: str,
+    phase_target: str,
+    prefill_ms: float | None,
+    decode_many_ms: float | None,
+    prefill_model_tokens: float | None,
+    prefill_padding_tokens: float | None,
+    prefill_row_padding_tokens: float | None,
+    prefill_suffix_padding_tokens: float | None,
+    hot_prefill: str | None,
+) -> str:
+    if cache_status != "clean":
+        return "integrity_review"
+    packed_saved = _numeric_field(fields, "runtime_prefill_packed_candidate_saved_tokens") or 0.0
+    decode_many_calls = _numeric_field(fields, "runtime_decode_many_calls") or 0.0
+    padding_pct = (
+        float(prefill_padding_tokens) / float(prefill_model_tokens)
+        if prefill_padding_tokens is not None
+        and prefill_model_tokens is not None
+        and prefill_model_tokens > 0.0
+        else 0.0
+    )
+    suffix_dominant = (
+        prefill_suffix_padding_tokens is not None
+        and prefill_suffix_padding_tokens
+        > (prefill_row_padding_tokens or 0.0)
+    )
+    prefill_big = prefill_ms is not None and prefill_ms > 0.0
+    decode_many_big = (
+        decode_many_ms is not None
+        and decode_many_ms > 0.0
+        and decode_many_calls > 0.0
+    )
+    mixed_prefix = bool(hot_prefill and ":mixed1" in hot_prefill)
+
+    if decode_many_big and phase_target in {"decode", "prefill+decode"}:
+        if prefill_big and packed_saved > 0.0 and suffix_dominant:
+            return "decode_body+suffix_prefill"
+        return "decode_body"
+    if phase_target in {"prefill", "prefill+decode"}:
+        if mixed_prefix:
+            return "mixed_prefix_prefill"
+        if packed_saved > 0.0 and suffix_dominant:
+            return "cached_suffix_prefill"
+        if packed_saved > 0.0 or padding_pct >= 0.10:
+            return "packed_prefill_body"
+        return "prefill_body"
+    if phase_target == "sample":
+        return "sampling_body"
+    if phase_target == "capture":
+        return "graph_capture"
+    return f"{phase_target}_body"
+
+
 def _provider_gap_value(
     torchinferno_row: ProviderBenchmarkSummary,
     competitors: Sequence[ProviderBenchmarkSummary],
@@ -3482,6 +3689,7 @@ def _cache_integrity_rows(
             store_logits_enabled,
             pinned_store_logits_enabled,
         )
+        status = _cache_integrity_status_from_values(review_values, review_flags)
         rows.append(
             (
                 _fmt_value(profile.temperature),
@@ -3505,15 +3713,46 @@ def _cache_integrity_rows(
                 _fmt_cache_integrity_counter(prefix_greedy),
                 _fmt_cache_integrity_counter(repeated_hits),
                 _fmt_cache_integrity_counter(repeated_tokens),
-                (
-                    "review"
-                    if any(value > 0 for value in review_values)
-                    or any(value is True for value in review_flags)
-                    else "clean"
-                ),
+                status,
             )
         )
     return rows
+
+
+def _cache_integrity_status(fields: Mapping[str, Any]) -> str:
+    review_values = (
+        _cache_integrity_counter(fields, "runtime_generated_prefix_store_requests"),
+        _cache_integrity_counter(fields, "runtime_generated_prefix_reuse_requests"),
+        _cache_integrity_counter(fields, "runtime_generated_prefix_reuse_tokens"),
+        _cache_integrity_counter(fields, "runtime_prompt_lookup_requests"),
+        _cache_integrity_counter(fields, "runtime_prompt_lookup_proposed_tokens"),
+        _cache_integrity_counter(fields, "runtime_prompt_lookup_accepted_tokens"),
+        _cache_integrity_counter(fields, "runtime_reusable_prefix_logits_entries"),
+        _cache_integrity_counter(fields, "runtime_reusable_prefix_logits_tokens"),
+        _cache_integrity_counter(fields, "runtime_reusable_prefix_sample_state_entries"),
+        _cache_integrity_counter(fields, "runtime_reusable_prefix_greedy_token_entries"),
+        _cache_integrity_counter(fields, "runtime_repeated_sample_state_hits"),
+        _cache_integrity_counter(fields, "runtime_repeated_sample_state_tokens"),
+    )
+    review_flags = (
+        _cache_integrity_flag(fields, "runtime_generated_prefix_cache_requested"),
+        _cache_integrity_flag(fields, "runtime_generated_prefix_cache_effective_enabled"),
+        _cache_integrity_flag(fields, "runtime_prompt_lookup_decode_effective_enabled"),
+        _cache_integrity_flag(fields, "runtime_prefix_cache_store_logits_enabled"),
+        _cache_integrity_flag(fields, "runtime_pinned_prefix_cache_store_logits_enabled"),
+    )
+    return _cache_integrity_status_from_values(review_values, review_flags)
+
+
+def _cache_integrity_status_from_values(
+    review_values: Sequence[float],
+    review_flags: Sequence[bool | None],
+) -> str:
+    if any(value > 0 for value in review_values) or any(
+        value is True for value in review_flags
+    ):
+        return "review"
+    return "clean"
 
 
 def _cache_integrity_counter(fields: Mapping[str, Any], name: str) -> float:
