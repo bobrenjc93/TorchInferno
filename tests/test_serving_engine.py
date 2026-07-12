@@ -168,6 +168,35 @@ def test_greedy_large_mixed_prefix_reuse_policy_is_explicit_opt_in(monkeypatch) 
     assert engine._prefix_prefill_capture_on_miss(32)
 
 
+def test_continuous_batch_engine_ragged_decode_bucket_sizes(monkeypatch) -> None:
+    monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_BUCKET_SIZES", raising=False)
+    default_engine = ContinuousBatchEngine(
+        object(),
+        device=torch.device("cpu"),
+        max_active_requests=64,
+    )
+    default_engine._free_active_rows = list(reversed(range(64)))
+    default_rows = default_engine._ragged_decode_bucket_rows(list(range(47)))
+    assert len(default_rows) == 64
+
+    monkeypatch.setenv(
+        "TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_BUCKET_SIZES",
+        "8,16,24,32,40,48,56,64",
+    )
+    bucketed_engine = ContinuousBatchEngine(
+        object(),
+        device=torch.device("cpu"),
+        max_active_requests=64,
+    )
+    bucketed_engine._free_active_rows = list(reversed(range(64)))
+    rows = list(range(47))
+    bucketed_rows = bucketed_engine._ragged_decode_bucket_rows(rows)
+
+    assert len(bucketed_rows) == 48
+    assert bucketed_rows[: len(rows)] == rows
+    assert len(set(bucketed_rows)) == len(bucketed_rows)
+
+
 def test_continuous_batch_engine_accepts_explicit_mixed_prefix_policy(monkeypatch) -> None:
     for env_name in (
         "TORCHINFERNO_CONTINUOUS_GREEDY_LARGE_MIXED_PREFIX_REUSE",

@@ -15827,6 +15827,22 @@ graphs as a default. The gate remains opt-in through
 continues to use the dense ragged graph until a non-fragmenting packed body or
 a repeatedly hitting graph policy is measured.
 
+A fresh long_output A/B on `5ce69fa` confirms that finer continuous ragged
+decode buckets are useful evidence but not a defaultable policy. The control
+run
+`/tmp/inference-bench-long-default-dirty-results/.../runs/20260712_084701`
+used the default power-of-two buckets and landed at `214.3 / 22.6 / 979.2ms`
+with `35.4 tok/s`, `7.34s` decode-many GPU, `34,592` padded decode-many model
+tokens, and `4,511` decode-many padding tokens. The opt-in
+`TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_BUCKET_SIZES=8,16,24,32,40,48,56,64`
+run
+`/tmp/inference-bench-long-buckets8-results/.../runs/20260712_084151`
+stayed correct and cache-integrity clean, warmed the extra decode sizes, and
+landed at `203.7 / 21.6 / 1006.7ms` with `36.3 tok/s`, `6.14s` decode-many
+GPU, `27,312` padded decode-many model tokens, and `1,045` decode-many padding
+tokens. Keep the finer bucket lattice explicit because it reduces decode work
+but did not improve median finish latency in this run.
+
 ## Priority for a focused (non-loop) session
 
 1. Prefill MFU (Issue 1) — biggest TTFT lever, ~2x, affects 3/5 benchmarks.

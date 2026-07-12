@@ -978,6 +978,17 @@ class ContinuousBatchEngine:
             max_active_requests,
             minimum=1,
         )
+        self._ragged_decode_bucket_sizes = tuple(
+            sorted(
+                {
+                    int(bucket)
+                    for bucket in _parse_positive_int_csv(
+                        os.environ.get("TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_BUCKET_SIZES")
+                    )
+                    if int(bucket) <= max_active_requests
+                }
+            )
+        )
         self.store_reusable_prefixes = store_reusable_prefixes
         self.store_full_prompt_prefixes = store_full_prompt_prefixes
         self._cached_repeated_sample_state_enabled = env_flag(
@@ -7830,7 +7841,10 @@ class ContinuousBatchEngine:
         capacity = min(self.max_active_requests, max(1, int(self._ragged_decode_bucket_capacity)))
         if active_count >= capacity:
             return rows
-        bucket_size = min(capacity, 1 << (active_count - 1).bit_length())
+        bucket_size = _bucket_from_values(active_count, self._ragged_decode_bucket_sizes)
+        if bucket_size is None:
+            bucket_size = 1 << (active_count - 1).bit_length()
+        bucket_size = min(capacity, int(bucket_size))
         if bucket_size <= active_count:
             return rows
         row_set = set(rows)

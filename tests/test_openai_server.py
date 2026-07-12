@@ -971,6 +971,34 @@ def test_openai_decode_warmup_excludes_prefix_cache_rows() -> None:
     assert _online_decode_warmup_batch_sizes(max_active=3, cache_batch=3) == (1, 2, 3)
 
 
+def test_openai_decode_warmup_includes_runtime_decode_bucket_sizes(monkeypatch) -> None:
+    monkeypatch.setenv(
+        "TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_BUCKET_SIZES",
+        "8,16,24,32,40,48,56,64",
+    )
+
+    assert _online_decode_warmup_batch_sizes(max_active=64, cache_batch=80) == (
+        1,
+        2,
+        3,
+        4,
+        8,
+        16,
+        24,
+        32,
+        40,
+        48,
+        56,
+        64,
+    )
+
+
+def test_openai_decode_warmup_batch_sizes_can_be_overridden(monkeypatch) -> None:
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_WARMUP_ONLINE_DECODE_BATCH_SIZES", "24,56,256")
+
+    assert _online_decode_warmup_batch_sizes(max_active=64, cache_batch=80) == (24, 56, 64)
+
+
 def test_openai_decode_warmup_runtime_symm_mem_default_and_overrides(monkeypatch) -> None:
     monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE", raising=False)
     monkeypatch.delenv("TORCHINFERNO_SYMM_MEM_ALLREDUCE", raising=False)

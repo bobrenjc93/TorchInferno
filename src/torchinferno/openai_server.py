@@ -177,6 +177,21 @@ def _flashinfer_prefill_warmup_batch_sizes(batch_sizes: Sequence[int]) -> tuple[
 def _online_decode_warmup_batch_sizes(*, max_active: int, cache_batch: int) -> tuple[int, ...]:
     active_limit = min(max(1, int(max_active)), max(1, int(cache_batch)))
     batch_sizes = {active_limit}
+    configured = os.environ.get("TORCHINFERNO_OPENAI_WARMUP_ONLINE_DECODE_BATCH_SIZES")
+    if configured is not None:
+        batch_sizes.update(
+            batch
+            for batch in _parse_positive_int_csv(configured)
+            if 1 <= int(batch) <= active_limit
+        )
+        return tuple(sorted(batch_sizes))
+    runtime_bucket_sizes = os.environ.get("TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_BUCKET_SIZES")
+    if runtime_bucket_sizes is not None:
+        batch_sizes.update(
+            batch
+            for batch in _parse_positive_int_csv(runtime_bucket_sizes)
+            if 1 <= int(batch) <= active_limit
+        )
     if active_limit >= 3:
         batch_sizes.add(3)
     bucket = 1
