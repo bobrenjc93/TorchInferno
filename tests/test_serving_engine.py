@@ -4622,6 +4622,24 @@ def test_continuous_batch_engine_direct_prefix_store_discards_logits() -> None:
     assert engine.reusable_prefixes[("direct",)].logits is None
 
 
+def test_continuous_batch_engine_does_not_slice_logits_for_inert_prefix_store() -> None:
+    class _UnindexableLogits:
+        def __getitem__(self, key):  # noqa: ANN001
+            raise AssertionError(f"logits should not be sliced: {key!r}")
+
+    model = _SelectedLogitsToyModel()
+    engine = ContinuousBatchEngine(
+        model,
+        device=torch.device("cpu"),
+        max_active_requests=2,
+        prefix_cache_capacity=2,
+        pin_shared_prefix=False,
+    )
+    request = ServingRequest("req", (1, 2, 3), 1, arrival_step=0)
+
+    assert engine._reusable_prefix_logits_for_store(request, _UnindexableLogits(), 0) is None
+
+
 def test_continuous_batch_engine_does_not_keep_common_prefix_logits_for_exact_prompt(
     monkeypatch,
 ) -> None:

@@ -2377,7 +2377,12 @@ class ContinuousBatchEngine:
                         state._prefill_suffix = None
                         self._store_reusable_prefix(
                             state.request.request_id, state.request.prompt,
-                            state.row, logits[i:i+1],
+                            state.row,
+                            self._reusable_prefix_logits_for_store(
+                                state.request,
+                                logits,
+                                i,
+                            ),
                             allow_pinned=self._allow_pinned_full_prompt_store(state.request),
                         )
                         finished = self._should_finish_after_decode(state)
@@ -3359,7 +3364,11 @@ class ContinuousBatchEngine:
                         request.request_id,
                         request.prompt,
                         row,
-                        logits[row_index : row_index + 1],
+                        self._reusable_prefix_logits_for_store(
+                            request,
+                            logits,
+                            row_index,
+                        ),
                         allow_pinned=self._allow_pinned_full_prompt_store(request),
                     )
                     next_token = int(next_tokens[row_index])
@@ -3503,7 +3512,7 @@ class ContinuousBatchEngine:
                     request.request_id,
                     request.prompt,
                     row,
-                    logits[row_index : row_index + 1],
+                    self._reusable_prefix_logits_for_store(request, logits, row_index),
                     allow_pinned=self._allow_pinned_full_prompt_store(request),
                 )
                 next_token = int(next_tokens[row_index])
@@ -4060,7 +4069,11 @@ class ContinuousBatchEngine:
                         request.request_id,
                         request.prompt,
                         row,
-                        None if logits is None else logits[row_index : row_index + 1],
+                        self._reusable_prefix_logits_for_store(
+                            request,
+                            logits,
+                            row_index,
+                        ),
                         allow_pinned=self._allow_pinned_full_prompt_store(request),
                     )
                 state_store_ms = (time.perf_counter() - state_store_start_s) * 1000.0
@@ -4134,7 +4147,11 @@ class ContinuousBatchEngine:
                         request.request_id,
                         request.prompt,
                         row,
-                        None if logits is None else logits[row_index : row_index + 1],
+                        self._reusable_prefix_logits_for_store(
+                            request,
+                            logits,
+                            row_index,
+                        ),
                         allow_pinned=self._allow_pinned_full_prompt_store(request),
                     )
                     next_token = int(next_tokens[row_index])
@@ -5194,7 +5211,7 @@ class ContinuousBatchEngine:
                 request.request_id,
                 request.prompt,
                 row,
-                logits[row_index : row_index + 1],
+                self._reusable_prefix_logits_for_store(request, logits, row_index),
                 allow_pinned=self._allow_pinned_full_prompt_store(request),
             )
             next_token = int(next_tokens[row_index])
@@ -5502,7 +5519,7 @@ class ContinuousBatchEngine:
                     request.request_id,
                     request.prompt,
                     row,
-                    logits[row_index : row_index + 1],
+                    self._reusable_prefix_logits_for_store(request, logits, row_index),
                     allow_pinned=self._allow_pinned_full_prompt_store(request),
                 )
                 next_token = int(next_tokens[row_index])
@@ -5569,7 +5586,7 @@ class ContinuousBatchEngine:
                 request.request_id,
                 request.prompt,
                 row,
-                logits[row_index : row_index + 1],
+                self._reusable_prefix_logits_for_store(request, logits, row_index),
                 allow_pinned=self._allow_pinned_full_prompt_store(request),
             )
             next_token = int(next_tokens[row_index])
@@ -5665,7 +5682,7 @@ class ContinuousBatchEngine:
                 request.request_id,
                 request.prompt,
                 row,
-                logits[i:i+1],
+                self._reusable_prefix_logits_for_store(request, logits, i),
                 allow_pinned=self._allow_pinned_full_prompt_store(request),
             )
             next_token = int(next_tokens[i])
@@ -5755,7 +5772,7 @@ class ContinuousBatchEngine:
                 request.request_id,
                 request.prompt,
                 row,
-                logits[row_index : row_index + 1],
+                self._reusable_prefix_logits_for_store(request, logits, row_index),
                 allow_pinned=self._allow_pinned_full_prompt_store(request),
             )
             next_token = int(next_tokens[row_index])
@@ -5819,7 +5836,7 @@ class ContinuousBatchEngine:
             request.request_id,
             request.prompt,
             row,
-            logits,
+            self._reusable_prefix_logits_for_store(request, logits, 0),
             allow_pinned=self._allow_pinned_full_prompt_store(request),
         )
         state = _ActiveRequest(
@@ -7689,6 +7706,16 @@ class ContinuousBatchEngine:
             return False
         return self._prefix_cache_store_logits_enabled(allow_pinned=allow_pinned)
 
+    def _reusable_prefix_logits_for_store(
+        self,
+        request: ServingRequest,
+        logits: Tensor | None,
+        row_index: int,
+    ) -> Tensor | None:
+        if logits is None or not self._full_prompt_store_needs_logits(request):
+            return None
+        return logits[row_index : row_index + 1]
+
     def _prefix_prefill_group_can_omit_logits(
         self,
         group: Sequence[tuple[int, ServingRequest, int, _ReusablePrefix]],
@@ -8632,7 +8659,7 @@ class ContinuousBatchEngine:
                 request.request_id,
                 request.prompt,
                 row,
-                logits[i:i+1],
+                self._reusable_prefix_logits_for_store(request, logits, i),
                 allow_pinned=self._allow_pinned_full_prompt_store(request),
             )
             state = _ActiveRequest(
@@ -8759,7 +8786,11 @@ class ContinuousBatchEngine:
                 ).detach().cpu().tolist()
                 for k, i in enumerate(suffix_idx):
                     next_tokens[i] = int(toks[k])
-                    out_logits[i] = logits[k:k + 1]
+                    out_logits[i] = self._reusable_prefix_logits_for_store(
+                        group[i][1],
+                        logits,
+                        k,
+                    )
         except Exception:
             for row in rows:
                 self._release_active_row(row)
@@ -8772,14 +8803,13 @@ class ContinuousBatchEngine:
             self._set_cache_row_seq_len(row, len(request.prompt))
             self._remember_row_seq_len(row, len(request.prompt))
             next_token = int(next_tokens[i])
-            if out_logits[i] is not None:
-                self._store_reusable_prefix(
-                    request.request_id,
-                    request.prompt,
-                    row,
-                    out_logits[i],
-                    allow_pinned=self._allow_pinned_full_prompt_store(request),
-                )
+            self._store_reusable_prefix(
+                request.request_id,
+                request.prompt,
+                row,
+                out_logits[i],
+                allow_pinned=self._allow_pinned_full_prompt_store(request),
+            )
             state = _ActiveRequest(
                 original_index=original_index,
                 request=request,
