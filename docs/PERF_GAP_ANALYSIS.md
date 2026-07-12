@@ -1,8 +1,29 @@
 # TorchInferno vs vLLM/sglang — Performance Gap Analysis (Llama-3.1-70B, 8xH100)
 
+## Current 20260712 public refresh
+
+The latest public run advanced to `20260712_070224`, built from TorchInferno
+`59e0e13`. Re-rendering it with the current analyzer keeps the score-facing
+cache-integrity counters clean: generated-prefix stores/reuses/tokens,
+reusable-prefix logits, reusable-prefix sample states, reusable-prefix greedy
+tokens, and repeated-sample-state hits are all zero. `self_consistency` is no
+longer a fair gap (`-3.2ms` E2E versus vLLM), so it should stay out of the
+optimization queue unless future evidence changes.
+
+The remaining fair priority order is unchanged. `long_output` is first:
+`+309.7ms` E2E, `+142.8ms` TTFT, `+4.1ms` TPOT, `4108.8ms` prefill GPU,
+`6726.1ms` decode-many GPU, `38.6%` prefill padding, `28134` packed-candidate
+saved tokens, hot prefill `b24:s64:p111-111:src1:mixed0`, and hot decode
+`decode_many:b64/64`. Next are `multi_turn` (`+112.1ms` E2E,
+`49.7%` prefill padding, hot `b32:s32:p55-73:src32:mixed1`), `few_shot`
+(`+69.0ms` E2E, hot `b32:s16:p122-122:src1:mixed0`), and
+`tree_of_thought` (`+19.9ms` E2E, hot `b2:s12:p45-45:src1:mixed0`). This keeps
+the next non-gaming work on real decode-body and cached-prefix suffix-prefill
+costs rather than prompt/logits reuse.
+
 ## Current 20260712 packed graph-fit triage
 
-The latest public run is still `20260712_050229`. Re-rendering the new
+The earlier public run `20260712_050229` re-rendered with the new
 `[torchinferno packed prefill graph fit]` table shows why the visible
 `29.5K` packed-prefill candidate tokens should not be read as a defaultable
 exact-pattern graph win: the top shape
@@ -25,7 +46,7 @@ paths, and it does not alter runtime serving behavior.
 
 ## Current 20260712 packed-fragmentation visibility
 
-The latest public run is still `20260712_050229`, built from older
+The earlier public run `20260712_050229`, built from older
 TorchInferno `7e3d6f9`, so a focused current-head TorchInferno-only
 long_output run was taken at `59e0e13`:
 `/tmp/inference-bench-ti-long-current-59e0e13-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100/runs/20260712_065458`.
@@ -15766,6 +15787,17 @@ for this run it reports `self_cuda_min=12.4ms`, `self_cuda_p50=258.9ms`,
 `self_cuda_max=475.2ms`, `spread=38.29x`, and `rank_skew`. Treat the fastest
 row as the useful eager-body lower-bound and the spread as profiler skew, not a
 new runtime bottleneck.
+
+The queue profile now records fixed-capacity packed-prefill runtime outcome by
+prefill shape: attempts, accepts, rejects, reject reasons, dense/fixed/real
+token totals, dense saved tokens, and residual packed padding. The analyzer
+prints this as `[torchinferno packed prefill fixed-capacity shape runtime]`.
+This is intentionally diagnostic. It does not enable packed prefill by default
+and does not inspect prompt text, token ids, logits, benchmark names, fixture
+positions, or dataset identity. The goal is to distinguish "fixed capacity is
+warming or growing for this exact shape" from "the shape accepted but residual
+padding dominated," which is the evidence needed before replacing the current
+long_output dynamic-body gap with a real non-fragmenting packed prefill body.
 
 ## Priority for a focused (non-loop) session
 

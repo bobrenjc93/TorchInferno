@@ -4089,6 +4089,13 @@ def test_continuous_batch_engine_can_use_fixed_capacity_packed_prefill_graph(
     assert engine.stats.prefill_packed_fixed_capacity_saved_tokens == 2
     assert engine.stats.prefill_packed_fixed_capacity_padding_tokens == 2
     assert engine.stats.prefill_packed_fixed_capacity_reject_reason_counts == {}
+    assert engine.stats.prefill_packed_fixed_capacity_shape_attempts == {shape_key: 1}
+    assert engine.stats.prefill_packed_fixed_capacity_shape_accepts == {shape_key: 1}
+    assert engine.stats.prefill_packed_fixed_capacity_shape_dense_tokens == {shape_key: 10}
+    assert engine.stats.prefill_packed_fixed_capacity_shape_fixed_tokens == {shape_key: 8}
+    assert engine.stats.prefill_packed_fixed_capacity_shape_real_tokens == {shape_key: 6}
+    assert engine.stats.prefill_packed_fixed_capacity_shape_saved_tokens == {shape_key: 2}
+    assert engine.stats.prefill_packed_fixed_capacity_shape_padding_tokens == {shape_key: 2}
     assert pad_rows == [2]
     for row in pad_rows:
         engine._release_active_row(row)
@@ -4357,6 +4364,11 @@ def test_continuous_batch_engine_records_fixed_capacity_packed_prefill_rejects(
     assert engine.stats.prefill_packed_fixed_capacity_accepts == 0
     assert engine.stats.prefill_packed_fixed_capacity_reject_reason_counts == {
         "capacity_grew": 1,
+    }
+    assert engine.stats.prefill_packed_fixed_capacity_shape_attempts == {shape_key: 1}
+    assert engine.stats.prefill_packed_fixed_capacity_shape_rejects == {shape_key: 1}
+    assert engine.stats.prefill_packed_fixed_capacity_shape_reject_reason_counts == {
+        f"{shape_key}|capacity_grew": 1,
     }
     for row in real_rows:
         engine._release_active_row(row)

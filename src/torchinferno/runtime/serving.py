@@ -669,6 +669,15 @@ class ServingStats:
     prefill_packed_candidate_pattern_groups: dict[str, int] = field(default_factory=dict)
     prefill_packed_candidate_pattern_slot_counts: dict[str, int] = field(default_factory=dict)
     prefill_packed_fixed_capacity_reject_reason_counts: dict[str, int] = field(default_factory=dict)
+    prefill_packed_fixed_capacity_shape_attempts: dict[str, int] = field(default_factory=dict)
+    prefill_packed_fixed_capacity_shape_accepts: dict[str, int] = field(default_factory=dict)
+    prefill_packed_fixed_capacity_shape_rejects: dict[str, int] = field(default_factory=dict)
+    prefill_packed_fixed_capacity_shape_reject_reason_counts: dict[str, int] = field(default_factory=dict)
+    prefill_packed_fixed_capacity_shape_dense_tokens: dict[str, int] = field(default_factory=dict)
+    prefill_packed_fixed_capacity_shape_fixed_tokens: dict[str, int] = field(default_factory=dict)
+    prefill_packed_fixed_capacity_shape_real_tokens: dict[str, int] = field(default_factory=dict)
+    prefill_packed_fixed_capacity_shape_saved_tokens: dict[str, int] = field(default_factory=dict)
+    prefill_packed_fixed_capacity_shape_padding_tokens: dict[str, int] = field(default_factory=dict)
     prefill_suffix_split_candidate_calls: int = 0
     prefill_suffix_split_accepted_calls: int = 0
     prefill_suffix_split_rejected_calls: int = 0
@@ -4271,9 +4280,71 @@ class ContinuousBatchEngine:
         self.stats.prefill_prefix_copy_shared_tokens += int(shared_tokens)
         self.stats.prefill_prefix_copy_masked_tail_tokens += int(masked_tail_tokens)
 
+    def _record_fixed_capacity_packed_prefill_attempt(self, shape_key: str) -> None:
+        self.stats.prefill_packed_fixed_capacity_attempts += 1
+        self._record_queue_profile_shape_count(
+            self.stats.prefill_packed_fixed_capacity_shape_attempts,
+            shape_key,
+        )
+
     def _record_fixed_capacity_packed_prefill_reject(self, reason: str) -> None:
         counts = self.stats.prefill_packed_fixed_capacity_reject_reason_counts
         counts[reason] = int(counts.get(reason, 0)) + 1
+        shape_key = getattr(
+            self,
+            "_packed_prefill_fixed_capacity_current_shape",
+            None,
+        )
+        if not isinstance(shape_key, str) or not shape_key:
+            return
+        self._record_queue_profile_shape_count(
+            self.stats.prefill_packed_fixed_capacity_shape_rejects,
+            shape_key,
+        )
+        self._record_queue_profile_shape_count(
+            self.stats.prefill_packed_fixed_capacity_shape_reject_reason_counts,
+            f"{shape_key}|{reason}",
+        )
+
+    def _record_fixed_capacity_packed_prefill_accept(
+        self,
+        shape_key: str,
+        *,
+        dense_tokens: int,
+        fixed_tokens: int,
+        real_tokens: int,
+        dense_saved_tokens: int,
+        packed_padding_tokens: int,
+    ) -> None:
+        self._record_queue_profile_shape_count(
+            self.stats.prefill_packed_fixed_capacity_shape_accepts,
+            shape_key,
+        )
+        self._record_queue_profile_shape_total(
+            self.stats.prefill_packed_fixed_capacity_shape_dense_tokens,
+            shape_key,
+            int(dense_tokens),
+        )
+        self._record_queue_profile_shape_total(
+            self.stats.prefill_packed_fixed_capacity_shape_fixed_tokens,
+            shape_key,
+            int(fixed_tokens),
+        )
+        self._record_queue_profile_shape_total(
+            self.stats.prefill_packed_fixed_capacity_shape_real_tokens,
+            shape_key,
+            int(real_tokens),
+        )
+        self._record_queue_profile_shape_total(
+            self.stats.prefill_packed_fixed_capacity_shape_saved_tokens,
+            shape_key,
+            int(dense_saved_tokens),
+        )
+        self._record_queue_profile_shape_total(
+            self.stats.prefill_packed_fixed_capacity_shape_padding_tokens,
+            shape_key,
+            int(packed_padding_tokens),
+        )
 
     def _try_fixed_capacity_packed_prefill_logits(
         self,
@@ -4306,14 +4377,14 @@ class ContinuousBatchEngine:
             False,
         ):
             return None
+        self._packed_prefill_fixed_capacity_current_shape = profile_shape_key
+        self._record_fixed_capacity_packed_prefill_attempt(profile_shape_key)
         if not _packed_prefill_fixed_capacity_enabled(
             profile_shape_key=profile_shape_key,
             packed_prefill_pattern_key=packed_prefill_pattern_key,
         ):
-            self.stats.prefill_packed_fixed_capacity_attempts += 1
             self._record_fixed_capacity_packed_prefill_reject("pattern_disabled")
             return None
-        self.stats.prefill_packed_fixed_capacity_attempts += 1
         packed_graph = getattr(
             self.model,
             "try_prefill_ragged_logits_packed_eager_graph",
@@ -4557,6 +4628,14 @@ class ContinuousBatchEngine:
             self.stats.prefill_packed_fixed_capacity_real_tokens += int(real_tokens)
             self.stats.prefill_packed_fixed_capacity_saved_tokens += int(dense_saved_tokens)
             self.stats.prefill_packed_fixed_capacity_padding_tokens += int(packed_padding_tokens)
+            self._record_fixed_capacity_packed_prefill_accept(
+                profile_shape_key,
+                dense_tokens=dense_tokens,
+                fixed_tokens=fixed_tokens,
+                real_tokens=real_tokens,
+                dense_saved_tokens=dense_saved_tokens,
+                packed_padding_tokens=packed_padding_tokens,
+            )
             self._record_packed_prefill_eager_result(
                 profile_shape_key=profile_shape_key,
                 real_tokens=real_tokens,

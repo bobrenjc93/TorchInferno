@@ -17,6 +17,7 @@ from torchinferno.research.inference_bench import (
     _prefill_packed_flashinfer_gate_rows,
     _prefill_packed_fragmentation_rows,
     _prefill_packed_graph_fit_rows,
+    _prefill_packed_fixed_capacity_shape_runtime_rows,
     _prefill_packed_fixed_capacity_runtime_rows,
     _prefill_packed_fixed_capacity_reject_rows,
     _prefill_non_fragmenting_target_rows,
@@ -178,6 +179,33 @@ def _write_inference_bench_run(tmp_path) -> None:
         "runtime_prefill_packed_fixed_capacity_accepts": 1,
         "runtime_prefill_packed_fixed_capacity_reject_reason_counts": {
             "capacity_grew": 3,
+        },
+        "runtime_prefill_packed_fixed_capacity_shape_attempts": {
+            "prefix_graph:b8:s16:p45-45:src1:mixed0": 4,
+        },
+        "runtime_prefill_packed_fixed_capacity_shape_accepts": {
+            "prefix_graph:b8:s16:p45-45:src1:mixed0": 1,
+        },
+        "runtime_prefill_packed_fixed_capacity_shape_rejects": {
+            "prefix_graph:b8:s16:p45-45:src1:mixed0": 3,
+        },
+        "runtime_prefill_packed_fixed_capacity_shape_reject_reason_counts": {
+            "prefix_graph:b8:s16:p45-45:src1:mixed0|capacity_grew": 3,
+        },
+        "runtime_prefill_packed_fixed_capacity_shape_dense_tokens": {
+            "prefix_graph:b8:s16:p45-45:src1:mixed0": 48,
+        },
+        "runtime_prefill_packed_fixed_capacity_shape_fixed_tokens": {
+            "prefix_graph:b8:s16:p45-45:src1:mixed0": 40,
+        },
+        "runtime_prefill_packed_fixed_capacity_shape_real_tokens": {
+            "prefix_graph:b8:s16:p45-45:src1:mixed0": 31,
+        },
+        "runtime_prefill_packed_fixed_capacity_shape_saved_tokens": {
+            "prefix_graph:b8:s16:p45-45:src1:mixed0": 8,
+        },
+        "runtime_prefill_packed_fixed_capacity_shape_padding_tokens": {
+            "prefix_graph:b8:s16:p45-45:src1:mixed0": 9,
         },
         "runtime_prefix_reuse_requests": 5,
         "runtime_prefix_reuse_tokens": 64,
@@ -1271,7 +1299,10 @@ def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) ->
     assert "packed_eager_saved" in text
     assert "packed_cand_saved" in text
     assert "[torchinferno packed prefill fixed-capacity runtime]" in text
+    assert "[torchinferno packed prefill fixed-capacity shape runtime]" in text
     assert "capacity_grew=3" in text
+    assert "25.0%" in text
+    assert "resid_pad" in text
     assert "prefix_reuse" in text
     assert "prefix_reuse_tok" in text
     assert "prefix_routes" in text
@@ -2338,6 +2369,69 @@ def test_prefill_fixed_capacity_runtime_rows_show_acceptance_and_rejects() -> No
             "50.0%",
             "0.0",
             "28117",
+        )
+    ]
+
+
+def test_prefill_fixed_capacity_shape_runtime_rows_show_shape_rejects() -> None:
+    shape = "prefix_graph:b24:s64:p111-111:src1:mixed0"
+    profile = QueueProfileSummary(
+        event="online_batcher_quiescent",
+        temperature=0.0,
+        max_tokens=96,
+        submitted_requests=1000,
+        finished_events=1000,
+        fields={
+            "runtime_prefill_packed_fixed_capacity_shape_attempts": {
+                shape: 10,
+            },
+            "runtime_prefill_packed_fixed_capacity_shape_accepts": {
+                shape: 2,
+            },
+            "runtime_prefill_packed_fixed_capacity_shape_rejects": {
+                shape: 8,
+            },
+            "runtime_prefill_packed_fixed_capacity_shape_reject_reason_counts": {
+                f"{shape}|capacity_grew": 5,
+                f"{shape}|warming": 3,
+            },
+            "runtime_prefill_packed_fixed_capacity_shape_dense_tokens": {
+                shape: 4096,
+            },
+            "runtime_prefill_packed_fixed_capacity_shape_fixed_tokens": {
+                shape: 3072,
+            },
+            "runtime_prefill_packed_fixed_capacity_shape_real_tokens": {
+                shape: 2800,
+            },
+            "runtime_prefill_packed_fixed_capacity_shape_saved_tokens": {
+                shape: 1024,
+            },
+            "runtime_prefill_packed_fixed_capacity_shape_padding_tokens": {
+                shape: 272,
+            },
+            "runtime_prefill_packed_candidate_shape_saved_tokens": {
+                shape: 11175,
+            },
+        },
+    )
+
+    assert _prefill_packed_fixed_capacity_shape_runtime_rows([profile]) == [
+        (
+            "0.0",
+            "96",
+            shape,
+            "10",
+            "2",
+            "20.0%",
+            "8",
+            "capacity_grew=5,warming=3",
+            "4096",
+            "3072",
+            "2800",
+            "1024",
+            "272",
+            "11175",
         )
     ]
 

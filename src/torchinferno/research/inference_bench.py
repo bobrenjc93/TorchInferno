@@ -253,6 +253,15 @@ _QUEUE_PROFILE_FIELDS = (
     "runtime_prefill_packed_fixed_capacity_saved_tokens",
     "runtime_prefill_packed_fixed_capacity_padding_tokens",
     "runtime_prefill_packed_fixed_capacity_reject_reason_counts",
+    "runtime_prefill_packed_fixed_capacity_shape_attempts",
+    "runtime_prefill_packed_fixed_capacity_shape_accepts",
+    "runtime_prefill_packed_fixed_capacity_shape_rejects",
+    "runtime_prefill_packed_fixed_capacity_shape_reject_reason_counts",
+    "runtime_prefill_packed_fixed_capacity_shape_dense_tokens",
+    "runtime_prefill_packed_fixed_capacity_shape_fixed_tokens",
+    "runtime_prefill_packed_fixed_capacity_shape_real_tokens",
+    "runtime_prefill_packed_fixed_capacity_shape_saved_tokens",
+    "runtime_prefill_packed_fixed_capacity_shape_padding_tokens",
     "runtime_prefill_prefix_copy_batches",
     "runtime_prefill_prefix_copy_tokens",
     "runtime_prefill_prefix_copy_shared_tokens",
@@ -1496,6 +1505,34 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
                         "candidate_saved",
                     ),
                     packed_fixed_capacity_runtime_rows,
+                )
+            )
+            lines.append("")
+
+        packed_fixed_capacity_shape_rows = (
+            _prefill_packed_fixed_capacity_shape_runtime_rows(queue_profiles)
+        )
+        if packed_fixed_capacity_shape_rows:
+            lines.append("[torchinferno packed prefill fixed-capacity shape runtime]")
+            lines.extend(
+                _format_table(
+                    (
+                        "temp",
+                        "max_tokens",
+                        "shape",
+                        "attempts",
+                        "accepts",
+                        "accept_pct",
+                        "rejects",
+                        "reject_reasons",
+                        "dense_tokens",
+                        "fixed_tokens",
+                        "real_tokens",
+                        "dense_saved",
+                        "resid_pad",
+                        "candidate_saved",
+                    ),
+                    packed_fixed_capacity_shape_rows,
                 )
             )
             lines.append("")
@@ -5694,6 +5731,80 @@ def _prefill_packed_fixed_capacity_runtime_rows(
             )
         )
     return rows
+
+
+def _prefill_packed_fixed_capacity_shape_runtime_rows(
+    profiles: Sequence[QueueProfileSummary],
+    *,
+    limit: int = 8,
+) -> list[tuple[str, ...]]:
+    items: list[tuple[float, float, str, tuple[str, ...]]] = []
+    for profile in profiles:
+        fields = profile.fields
+        attempts_by_shape = _numeric_mapping(
+            fields.get("runtime_prefill_packed_fixed_capacity_shape_attempts")
+        )
+        accepts_by_shape = _numeric_mapping(
+            fields.get("runtime_prefill_packed_fixed_capacity_shape_accepts")
+        )
+        rejects_by_shape = _numeric_mapping(
+            fields.get("runtime_prefill_packed_fixed_capacity_shape_rejects")
+        )
+        dense_tokens_by_shape = _numeric_mapping(
+            fields.get("runtime_prefill_packed_fixed_capacity_shape_dense_tokens")
+        )
+        fixed_tokens_by_shape = _numeric_mapping(
+            fields.get("runtime_prefill_packed_fixed_capacity_shape_fixed_tokens")
+        )
+        real_tokens_by_shape = _numeric_mapping(
+            fields.get("runtime_prefill_packed_fixed_capacity_shape_real_tokens")
+        )
+        dense_saved_by_shape = _numeric_mapping(
+            fields.get("runtime_prefill_packed_fixed_capacity_shape_saved_tokens")
+        )
+        padding_by_shape = _numeric_mapping(
+            fields.get("runtime_prefill_packed_fixed_capacity_shape_padding_tokens")
+        )
+        candidate_saved_by_shape = _numeric_mapping(
+            fields.get("runtime_prefill_packed_candidate_shape_saved_tokens")
+        )
+        reason_counts: dict[str, dict[str, float | int]] = {}
+        for key, count in _numeric_mapping_preserving_type(
+            fields.get("runtime_prefill_packed_fixed_capacity_shape_reject_reason_counts")
+        ).items():
+            shape, sep, reason = key.rpartition("|")
+            if not sep or not shape or not reason:
+                continue
+            reasons = reason_counts.setdefault(shape, {})
+            reasons[reason] = reasons.get(reason, 0) + count
+
+        shapes = set(attempts_by_shape) | set(accepts_by_shape) | set(rejects_by_shape)
+        for shape in shapes:
+            attempts = attempts_by_shape.get(shape, 0.0)
+            accepts = accepts_by_shape.get(shape, 0.0)
+            rejects = rejects_by_shape.get(shape, 0.0)
+            if max(attempts, accepts, rejects) <= 0.0:
+                continue
+            candidate_saved = candidate_saved_by_shape.get(shape, 0.0)
+            row = (
+                _fmt_value(profile.temperature),
+                _fmt_value(profile.max_tokens),
+                shape,
+                _fmt_value(_int_if_whole(attempts)),
+                _fmt_value(_int_if_whole(accepts)),
+                _fmt_pct(accepts, attempts),
+                _fmt_value(_int_if_whole(rejects)),
+                _fmt_mapping_summary(reason_counts.get(shape, {})),
+                _fmt_value(_int_if_whole(dense_tokens_by_shape.get(shape, 0.0))),
+                _fmt_value(_int_if_whole(fixed_tokens_by_shape.get(shape, 0.0))),
+                _fmt_value(_int_if_whole(real_tokens_by_shape.get(shape, 0.0))),
+                _fmt_value(_int_if_whole(dense_saved_by_shape.get(shape, 0.0))),
+                _fmt_value(_int_if_whole(padding_by_shape.get(shape, 0.0))),
+                _fmt_value(_int_if_whole(candidate_saved)),
+            )
+            items.append((candidate_saved, attempts, shape, row))
+    items.sort(key=lambda item: (-item[0], -item[1], item[2]))
+    return [item[3] for item in items[:limit]]
 
 
 def _prefill_packed_flashinfer_gate_rows(
