@@ -2536,7 +2536,56 @@ def test_prefill_packed_graph_fit_rows_classify_dynamic_body_target() -> None:
             "5.0%",
             "7",
             "20.0%",
+            "-",
             "dynamic_body",
+        )
+    ]
+
+
+def test_prefill_packed_graph_fit_rows_classify_dynamic_count_target() -> None:
+    shape = "prefix_graph:b32:s16:p122-122:src1:mixed0"
+    pattern = f"{shape}|p122:s12/p122:s13/p122:s14"
+    profile = QueueProfileSummary(
+        event="online_batcher_quiescent",
+        temperature=0.0,
+        max_tokens=256,
+        submitted_requests=64,
+        finished_events=64,
+        fields={
+            "runtime_prefill_packed_candidate_calls": 28,
+            "runtime_prefill_packed_candidate_saved_tokens": 3131,
+            "runtime_prefill_packed_candidate_shape_counts": {shape: 28},
+            "runtime_prefill_packed_candidate_shape_saved_tokens": {shape: 3131},
+            "runtime_prefill_packed_candidate_pattern_keys": 1,
+            "runtime_prefill_packed_candidate_pattern_calls": 28,
+            "runtime_prefill_packed_candidate_pattern_repeated_calls": 28,
+            "runtime_prefill_packed_candidate_pattern_repeated_saved_tokens": 3131,
+            "runtime_prefill_packed_candidate_pattern_counts": {pattern: 28},
+            "runtime_prefill_packed_candidate_pattern_model_tokens": {pattern: 14336},
+            "runtime_prefill_packed_candidate_pattern_saved_tokens": {pattern: 3131},
+            "runtime_prefill_packed_candidate_pattern_slot_counts": {
+                f"{pattern}#p122:s12": 30,
+                f"{pattern}#p122:s13": 10,
+                f"{pattern}#p122:s14": 2,
+            },
+        },
+    )
+
+    assert _prefill_packed_graph_fit_rows([profile]) == [
+        (
+            "0.0",
+            "256",
+            "3131",
+            "28",
+            shape,
+            "3131",
+            "100.0%",
+            "-",
+            "-",
+            "1",
+            "100.0%",
+            "0.0%",
+            "dynamic_count",
         )
     ]
 

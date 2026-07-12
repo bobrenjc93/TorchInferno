@@ -1670,6 +1670,7 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
                         "sig_repeat_saved_pct",
                         "pattern_keys",
                         "pattern_repeat_saved_pct",
+                        "top_pattern_fixed_cover",
                         "target",
                     ),
                     packed_graph_fit_rows,
@@ -6432,10 +6433,47 @@ def _prefill_packed_graph_fit_rows(
             if pattern_repeated_saved is None
             else _ratio_or_none(pattern_repeated_saved, total_saved or 0.0, scale=100.0)
         )
+        top_pattern, top_pattern_saved = _top_mapping_entry(
+            fields.get("runtime_prefill_packed_candidate_pattern_saved_tokens")
+        )
+        fixed_cover_pct: float | None = None
+        if (
+            top_pattern is not None
+            and top_pattern_saved is not None
+            and top_pattern_saved > 0
+        ):
+            pattern_calls = _numeric_mapping(
+                fields.get("runtime_prefill_packed_candidate_pattern_counts")
+            )
+            pattern_max_slots, _runtime_slot_patterns, _pattern_signature_calls = (
+                _prefill_packed_pattern_slot_summary(fields, pattern_calls)
+            )
+            fixed_saved = _prefill_packed_fixed_capacity_saved_tokens(
+                top_pattern,
+                call_count=pattern_calls.get(top_pattern, 0.0),
+                max_slots=pattern_max_slots.get(top_pattern),
+                dense_tokens=_mapping_value(
+                    fields.get("runtime_prefill_packed_candidate_pattern_model_tokens"),
+                    top_pattern,
+                ),
+            )
+            if fixed_saved is not None:
+                fixed_cover_pct = _ratio_or_none(
+                    fixed_saved,
+                    top_pattern_saved,
+                    scale=100.0,
+                )
         if signature_repeat_pct is not None and signature_repeat_pct >= 50.0:
             target = "exact_replay"
-        elif pattern_repeat_pct is not None and pattern_repeat_pct >= 50.0:
+        elif (
+            pattern_repeat_pct is not None
+            and pattern_repeat_pct >= 50.0
+            and fixed_cover_pct is not None
+            and fixed_cover_pct >= 50.0
+        ):
             target = "fixed_capacity"
+        elif pattern_repeat_pct is not None and pattern_repeat_pct >= 50.0:
+            target = "dynamic_count"
         else:
             target = "dynamic_body"
         rows.append(
@@ -6462,6 +6500,9 @@ def _prefill_packed_graph_fit_rows(
                 ),
                 _fmt_pct_value(
                     None if pattern_repeat_pct is None else float(pattern_repeat_pct)
+                ),
+                _fmt_pct_value(
+                    None if fixed_cover_pct is None else float(fixed_cover_pct)
                 ),
                 target,
             )

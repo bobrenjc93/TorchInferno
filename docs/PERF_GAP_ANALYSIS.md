@@ -12,6 +12,12 @@ saved tokens and coarse pattern reuse covers only `20.4%`. The analyzer now
 classifies that row as `dynamic_body`, matching the model-side constraint that
 current packed prefill graphs key on exact `q_lens` and start-position tuples.
 
+The same table now distinguishes high pattern reuse from a real fixed-capacity
+fit. Public few_shot has `98.2%` pattern-repeated saved tokens, but the
+dominant pattern's max slot envelope covers `0.0%` of its dynamic savings
+because max counts across calls over-pad beyond the dense batch. It is therefore
+classified as `dynamic_count`, not `fixed_capacity`.
+
 This is a diagnostic change only. It keeps the next fair optimization target on
 a shape-level or dynamic-count packed cached-prefix suffix body rather than
 re-enabling the previously rejected broad packed eager or fixed-capacity graph
