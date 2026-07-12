@@ -131,6 +131,20 @@ capture state, graph calls/steps, graph step coverage, and a status such as
 decode-many graph policy did not run or ran and lost, instead of requiring
 manual queue-profile inspection.
 
+## Current 20260712 provider decode-batch visibility
+
+The provider-log summary now retains SGLang decode-token bucket counts as
+`decode_tok_top`, beside the existing decode running-request histogram. On the
+latest public run (`20260711_230213`), SGLang reports `21` decode log events,
+`74.2K` logged decode tokens, and `decode_tok_top=>1024=17,<=1=2,<=128=1`.
+TorchInferno's same artifact has the hot decode-many implementation row at
+`decode_many:b64/64:g1-16`, `170` calls, `10.9K` model tokens, and `2.03s`
+GPU. This makes the cross-provider shape contrast explicit in the analyzer:
+SGLang is reporting large graph-backed decode waves, while TorchInferno remains
+split into many high-active but small-step decode-many windows. The target
+remains lower model-side decode replay cost or real decode/readback pipelining,
+not a prompt/logits cache.
+
 ## Current 20260711 multi-turn prefill profile
 
 A current-head TorchInferno-only `multi_turn` profile on `a95aa93` wrote

@@ -473,6 +473,7 @@ class ProviderServerLogSummary:
     decode_cuda_graph_batches: int = 0
     decode_running_max: int | None = None
     decode_running_counts: dict[str, int] = field(default_factory=dict)
+    decode_token_bucket_counts: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -1786,6 +1787,7 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
                     "decode_batches",
                     "decode_tokens",
                     "decode_tok_batch",
+                    "decode_tok_top",
                     "decode_graph_pct",
                     "decode_running_max",
                     "decode_running_top",
@@ -2577,6 +2579,7 @@ def _summarize_sglang_server_log(path: Path) -> ProviderServerLogSummary:
     decode_cuda_graph_batches = 0
     decode_running_max: int | None = None
     decode_running_counts: dict[str, int] = {}
+    decode_token_bucket_counts: dict[str, int] = {}
 
     for line in path.read_text(errors="replace").splitlines():
         prefill_match = _SGLANG_PREFILL_RE.search(line)
@@ -2607,13 +2610,18 @@ def _summarize_sglang_server_log(path: Path) -> ProviderServerLogSummary:
             continue
         decode_batches += 1
         running = int(decode_match.group("running"))
-        decode_logged_tokens += int(decode_match.group("tokens"))
+        decode_tokens = int(decode_match.group("tokens"))
+        decode_logged_tokens += decode_tokens
         decode_running_max = (
             running
             if decode_running_max is None
             else max(decode_running_max, running)
         )
         _increment_count(decode_running_counts, str(running))
+        _increment_count(
+            decode_token_bucket_counts,
+            _provider_log_token_bucket(decode_tokens),
+        )
         if decode_match.group("cuda_graph") == "True":
             decode_cuda_graph_batches += 1
         generation_tps.append(float(decode_match.group("generation_tps")))
@@ -2638,6 +2646,7 @@ def _summarize_sglang_server_log(path: Path) -> ProviderServerLogSummary:
         decode_cuda_graph_batches=decode_cuda_graph_batches,
         decode_running_max=decode_running_max,
         decode_running_counts=decode_running_counts,
+        decode_token_bucket_counts=decode_token_bucket_counts,
     )
 
 
@@ -2744,6 +2753,7 @@ def _provider_server_log_rows(
                     if summary.decode_batches
                     else None
                 ),
+                _fmt_mapping_summary(summary.decode_token_bucket_counts),
                 _fmt_pct(summary.decode_cuda_graph_batches, summary.decode_batches),
                 _fmt_value(summary.decode_running_max),
                 _fmt_mapping_summary(summary.decode_running_counts),

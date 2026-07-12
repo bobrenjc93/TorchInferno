@@ -1347,6 +1347,7 @@ def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) ->
     assert "prefill_tok_top" in text
     assert "cached_pct" in text
     assert "decode_tok_batch" in text
+    assert "decode_tok_top" in text
     assert "decode_graph_pct" in text
     assert "decode_running_top" in text
     assert "sglang" in text
@@ -1357,6 +1358,7 @@ def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) ->
     assert "22.2%" in text
     assert "3=1" in text
     assert "<=64=1" in text
+    assert "<=8=1" in text
     assert "4=1" in text
     assert "36.0" in text
 
@@ -1460,6 +1462,7 @@ def test_inference_bench_summary_reads_current_provider_log_names(tmp_path) -> N
     assert "prefill_tok_top" in text
     assert "cached_pct" in text
     assert "decode_tok_batch" in text
+    assert "decode_tok_top" in text
     assert "decode_graph_pct" in text
     assert "decode_running_top" in text
 
