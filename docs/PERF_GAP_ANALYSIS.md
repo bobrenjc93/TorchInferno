@@ -15957,6 +15957,25 @@ long_output work stays on normal suffix-prefill body efficiency and high-active
 decode cost, not exact-prompt, prompt-logits, generated-prefix-logits, or
 repeat-state shortcuts.
 
+A current-main long_output replay-profile refresh on `ff3916c` wrote
+`/tmp/inference-bench-ti-long-decode-replay-ff3916c-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-long-decode-replay-ff3916c/runs/20260712_111156`.
+It stayed correct (`1000/1000`) and cache-integrity clean: generated-prefix
+store/reuse/tokens, prompt lookup, reusable-prefix logits/sample/greedy
+payloads, and repeated-sample hits were all zero. The score row landed at
+`216.8 / 21.9 / 980.0ms`, `36.2 tok/s`; use it as a profiler refresh rather
+than a promotion candidate. The one-shot ragged decode replay profiler fired
+on the hot steady shape (`batch=64`, `cache_bucket=1024`, `rows=64`) and
+reported `12.2ms` self CUDA: GEMM/NVJET `4.5ms` (`37.0%`), Marlin `3.3ms`
+(`26.8%`), symmetric-memory all-reduce `2.1ms` (`17.2%`), grouped GQA decode
+attention `1.4ms` (`11.3%`), and add/RMS `0.4ms`. Queue telemetry agreed with
+the profiler: `114` decode-many calls, `494` internal steps, `6.17s`
+decode-many GPU, and the hottest `decode_many:b64/64:g1-16` window consumed
+`1.92s` over `150` single-step replays. Prefill remains the parallel target:
+`65` graph replays spent `4.80s` GPU with `27.3K` padded tokens. This confirms
+the remaining long_output work is a lower-cost full-width decode body and a
+non-fragmenting packed suffix-prefill body, not more stop/readback/cache
+shortcuts.
+
 ## Priority for a focused (non-loop) session
 
 1. Prefill MFU (Issue 1) — biggest TTFT lever, ~2x, affects 3/5 benchmarks.
