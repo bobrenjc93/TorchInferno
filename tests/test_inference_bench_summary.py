@@ -597,6 +597,15 @@ def _write_inference_bench_run(tmp_path) -> None:
                 "0.000us 0.00% 0.000us 0.000us 1.250ms 10.42% "
                 "1.250ms 15.625us 80",
                 "Self CUDA time total: 12.000ms",
+                "[RAGGED_DECODE_MANY_EAGER_PROF] batch=64 steps=1 match=4 "
+                "cache_bucket=1024 rows=64 active=64 padded=64",
+                "symm_mem::multimem_all_reduce_                  0.00% "
+                "0.000us 0.00% 0.000us 0.000us 48.000ms 80.00% "
+                "48.000ms 300.000us 160",
+                "nvjet_tst_64x64_64x13_2x1_v_bz_NNT            0.00% "
+                "0.000us 0.00% 0.000us 0.000us 3.500ms 5.83% "
+                "3.500ms 21.875us 160",
+                "Self CUDA time total: 60.000ms",
             ]
         )
         + "\n"
@@ -1044,7 +1053,7 @@ def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) ->
     total_warmup = summary.torchinferno_startup_warmups[2]
     assert total_warmup.label == "tensor-parallel startup warmup"
     assert total_warmup.seconds == 219.9
-    assert len(summary.torchinferno_profiler_events) == 4
+    assert len(summary.torchinferno_profiler_events) == 5
     profiler_event = summary.torchinferno_profiler_events[0]
     assert profiler_event.kind == "RAGGED_PREFILL_REPLAY_PROF"
     assert profiler_event.batch == 24
@@ -1105,6 +1114,10 @@ def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) ->
     assert eager_decode_many_event.gemm_ms == 3.5
     assert eager_decode_many_event.marlin_ms == 3.25
     assert eager_decode_many_event.attention_ms == 1.25
+    skewed_eager_decode_many_event = summary.torchinferno_profiler_events[4]
+    assert skewed_eager_decode_many_event.kind == "RAGGED_DECODE_MANY_EAGER_PROF"
+    assert skewed_eager_decode_many_event.self_cuda_ms == 60.0
+    assert skewed_eager_decode_many_event.symm_allreduce_ms == 48.0
 
     fair_gap_rows = _torchinferno_fair_gap_priority_rows(summary)
     assert len(fair_gap_rows) == 1
@@ -1472,6 +1485,9 @@ def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) ->
     assert "total_ms" in text
     assert "12.7" in text
     assert "[torchinferno ragged replay profiler]" in text
+    assert "[torchinferno ragged replay profiler rank spread]" in text
+    assert "rank_skew" in text
+    assert "5.00x" in text
     assert "replay" in text
     assert "self_cuda_ms" in text
     assert "allreduce_pct" in text

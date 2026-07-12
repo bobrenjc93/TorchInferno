@@ -1903,6 +1903,34 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
             )
         )
         lines.append("")
+        profiler_group_rows = _torchinferno_profiler_event_group_rows(
+            summary.torchinferno_profiler_events
+        )
+        if profiler_group_rows:
+            lines.append("[torchinferno ragged replay profiler rank spread]")
+            lines.extend(
+                _format_table(
+                    (
+                        "kind",
+                        "batch",
+                        "suffix",
+                        "cache",
+                        "rows",
+                        "steps",
+                        "events",
+                        "self_cuda_min",
+                        "self_cuda_p50",
+                        "self_cuda_max",
+                        "allreduce_min",
+                        "allreduce_p50",
+                        "allreduce_max",
+                        "spread",
+                        "note",
+                    ),
+                    profiler_group_rows,
+                )
+            )
+            lines.append("")
 
     startup_rows = _torchinferno_startup_warmup_rows(
         summary.torchinferno_startup_warmups
@@ -3074,6 +3102,97 @@ def _torchinferno_profiler_event_rows(
             )
         )
     return rows
+
+
+def _torchinferno_profiler_event_group_rows(
+    events: Sequence[TorchInfernoProfilerSummary],
+) -> list[tuple[str, ...]]:
+    grouped: dict[tuple[object, ...], list[TorchInfernoProfilerSummary]] = {}
+    for event in events:
+        key = (
+            event.kind,
+            event.batch,
+            event.suffix,
+            event.cache_bucket,
+            event.rows,
+            event.steps,
+            event.context_len,
+            event.src_rows,
+            event.prefix_copy_len,
+        )
+        grouped.setdefault(key, []).append(event)
+
+    rows: list[tuple[str, ...]] = []
+    for key, group in grouped.items():
+        if len(group) <= 1:
+            continue
+        self_cuda_values = sorted(
+            event.self_cuda_ms
+            for event in group
+            if isinstance(event.self_cuda_ms, (int, float))
+        )
+        allreduce_values = sorted(float(event.allreduce_ms) for event in group)
+        self_cuda_min = self_cuda_values[0] if self_cuda_values else None
+        self_cuda_max = self_cuda_values[-1] if self_cuda_values else None
+        allreduce_min = allreduce_values[0] if allreduce_values else None
+        allreduce_max = allreduce_values[-1] if allreduce_values else None
+        spread = (
+            (float(self_cuda_max) / float(self_cuda_min))
+            if self_cuda_min and self_cuda_max is not None
+            else None
+        )
+        allreduce_spread = (
+            (float(allreduce_max) / float(allreduce_min))
+            if allreduce_min and allreduce_max is not None
+            else None
+        )
+        note = (
+            "rank_skew"
+            if (spread is not None and spread >= 4.0)
+            or (allreduce_spread is not None and allreduce_spread >= 4.0)
+            else "-"
+        )
+        (
+            kind,
+            batch,
+            suffix,
+            cache_bucket,
+            rows_value,
+            steps,
+            _context_len,
+            _src_rows,
+            _prefix_copy_len,
+        ) = key
+        rows.append(
+            (
+                _short_torchinferno_profiler_kind(str(kind)),
+                _fmt_value(batch),
+                _fmt_value(suffix),
+                _fmt_value(cache_bucket),
+                _fmt_value(rows_value),
+                _fmt_value(steps),
+                _fmt_value(len(group)),
+                _fmt_value(self_cuda_min),
+                _fmt_value(_median_sorted(self_cuda_values)),
+                _fmt_value(self_cuda_max),
+                _fmt_value(allreduce_min),
+                _fmt_value(_median_sorted(allreduce_values)),
+                _fmt_value(allreduce_max),
+                _fmt_ratio(spread),
+                note,
+            )
+        )
+    rows.sort(key=lambda row: (row[0], row[1], row[3], row[4], row[5]))
+    return rows
+
+
+def _median_sorted(values: Sequence[float]) -> float | None:
+    if not values:
+        return None
+    mid = len(values) // 2
+    if len(values) % 2:
+        return float(values[mid])
+    return (float(values[mid - 1]) + float(values[mid])) / 2.0
 
 
 def _torchinferno_profiler_probe_rows(

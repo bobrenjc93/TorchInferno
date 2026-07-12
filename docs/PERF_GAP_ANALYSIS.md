@@ -15751,6 +15751,22 @@ graph before it can reach the eager fallback. The analyzer's
 `TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY_GRAPH=0` so the eager body can be
 measured separately from the `decode_replay` graph body.
 
+The corrected eager probe on `72a542f` wrote
+`/tmp/inference-bench-ti-long-eager-prof-72a542f-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100/runs/20260712_072938`.
+It also stayed correct (`1000/1000`) and cache-integrity clean. Because it
+intentionally disabled decode graphs, it regressed to
+`1160.2 / 134.0 / 6099.2ms`, `6.1 tok/s`; use it only as profiler evidence.
+The eager hook fired on all tensor-parallel workers. One worker showed the
+expected non-graphed eager body at `12.4ms` self CUDA, with `4.5ms` GEMM,
+`6.5ms` Marlin/NVJET, `2.1ms` symmetric all-reduce, and `1.6ms` attention.
+The other workers reported `188-475ms` self CUDA almost entirely in symmetric
+all-reduce waits caused by profiling all ranks around a collective. The
+analyzer now emits a `[torchinferno ragged replay profiler rank spread]` table;
+for this run it reports `self_cuda_min=12.4ms`, `self_cuda_p50=258.9ms`,
+`self_cuda_max=475.2ms`, `spread=38.29x`, and `rank_skew`. Treat the fastest
+row as the useful eager-body lower-bound and the spread as profiler skew, not a
+new runtime bottleneck.
+
 ## Priority for a focused (non-loop) session
 
 1. Prefill MFU (Issue 1) — biggest TTFT lever, ~2x, affects 3/5 benchmarks.
