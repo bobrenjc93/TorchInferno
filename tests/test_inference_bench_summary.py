@@ -2413,6 +2413,48 @@ def test_prefill_packed_fragmentation_rows_rank_launch_fragmented_body() -> None
     ]
 
 
+def test_prefill_packed_fragmentation_rows_show_recorded_max_groups() -> None:
+    shape = "prefix_graph:b24:s64:p111-111:src1:mixed0"
+    profile = QueueProfileSummary(
+        event="online_batcher_quiescent",
+        temperature=0.0,
+        max_tokens=96,
+        submitted_requests=8,
+        finished_events=8,
+        fields={
+            "runtime_prefill_forward_ms": 20.0,
+            "runtime_prefill_shape_forward_ms": {shape: 10.0},
+            "runtime_prefill_shape_model_tokens": {shape: 256},
+            "runtime_prefill_packed_candidate_shape_counts": {shape: 2},
+            "runtime_prefill_packed_candidate_shape_tokens": {shape: 160},
+            "runtime_prefill_packed_candidate_shape_model_tokens": {shape: 256},
+            "runtime_prefill_packed_candidate_shape_saved_tokens": {shape: 96},
+            "runtime_prefill_packed_candidate_shape_groups": {shape: 10},
+            "runtime_prefill_packed_candidate_shape_max_groups": {shape: 3},
+        },
+    )
+
+    assert _prefill_packed_fragmentation_rows([profile]) == [
+        (
+            "0.0",
+            "96",
+            shape,
+            "2",
+            "10",
+            "5.0",
+            "3",
+            "160",
+            "256",
+            "96",
+            "9.6",
+            "3.8",
+            "18.8%",
+            "-",
+            "fuse_groups",
+        )
+    ]
+
+
 def test_prefill_packed_fragmentation_rows_use_observed_packed_time_without_estimate() -> None:
     shape = "prefix_graph:b24:s96:p111-111:src1:mixed0"
     profile = QueueProfileSummary(

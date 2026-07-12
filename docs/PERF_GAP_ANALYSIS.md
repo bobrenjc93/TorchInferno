@@ -1,5 +1,35 @@
 # TorchInferno vs vLLM/sglang — Performance Gap Analysis (Llama-3.1-70B, 8xH100)
 
+## Current 20260712 packed-fragmentation visibility
+
+The latest public run is still `20260712_050229`, built from older
+TorchInferno `7e3d6f9`, so a focused current-head TorchInferno-only
+long_output run was taken at `59e0e13`:
+`/tmp/inference-bench-ti-long-current-59e0e13-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100/runs/20260712_065458`.
+It stayed `1000/1000` correct and cache-integrity clean: generated-prefix
+stores/reuses, prompt lookup, reusable-prefix logits, reusable-prefix sample
+state, reusable-prefix greedy-token payloads, and repeated-sample hits were all
+zero. The score was `219.6 / 21.6 / 1023.7ms`, `35.5 tok/s`.
+
+The profile remains in the same fair long_output band rather than exposing a
+new defaultable scheduler knob: `runtime_prefill_graph_replay_gpu_ms=4711.2`,
+`runtime_decode_many_model_gpu_ms=6701.0`, `119` decode-many calls, `529`
+decode-many internal steps, `0` decode graph misses, and `0` prefill graph
+misses. The largest cached-prefix suffix body is still
+`prefix_graph:b24:s64:p111-111:src1:mixed0`, with `18` calls, `147` suffix
+groups, `27.6K` model tokens, and `9.96K` avoidable packed-prefill tokens.
+The top decode body remains `decode_many:b64/64`, with `2.30s` GPU over
+`11.5K` model tokens.
+
+While reviewing the analyzer output, the packed-fragmentation table was hiding
+`max_call_groups` whenever the averaged group count exceeded the recorded
+per-call maximum, which happens in real queue profiles because the two counters
+are aggregated differently. The report now prints the recorded max whenever it
+exists. Re-rendering this artifact shows the useful triage values directly:
+`b24:s64` has `groups_call=8.2` and `max_call_groups=8`, while the `b16:s96`
+and `b16:s64` rows show `3` and `4`. This is telemetry only; it does not alter
+runtime behavior or introduce any prompt/logits reuse path.
+
 ## Current 20260712 profiler-probe routing
 
 Re-rendering the latest public run,

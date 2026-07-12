@@ -5080,10 +5080,8 @@ def _prefill_packed_fragmentation_rows(
                 continue
             groups_per_call = groups / calls
             saved_per_group = saved / groups
+            has_max_call_groups = shape in shape_max_groups
             max_call_groups = max(0.0, float(shape_max_groups.get(shape, 0.0)))
-            max_call_groups_display = (
-                max_call_groups if max_call_groups >= groups_per_call else None
-            )
             forward_ms = _prefill_shape_dense_forward_ms(fields, shape)
             est_saved_ms = (
                 forward_ms * saved / model_tokens
@@ -5118,8 +5116,8 @@ def _prefill_packed_fragmentation_rows(
                         _fmt_value(groups_per_call),
                         _fmt_value(
                             None
-                            if max_call_groups_display is None
-                            else _int_if_whole(max_call_groups_display)
+                            if not has_max_call_groups
+                            else _int_if_whole(max_call_groups)
                         ),
                         _fmt_value(
                             _int_if_whole(
