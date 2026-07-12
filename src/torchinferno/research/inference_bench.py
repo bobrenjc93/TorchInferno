@@ -519,6 +519,8 @@ class ProviderServerLogSummary:
     generation_tps_avg: float | None = None
     generation_tps_max: float | None = None
     running_max: int | None = None
+    running_counts: dict[str, int] = field(default_factory=dict)
+    generation_tps_at_running_max: float | None = None
     waiting_max: int | None = None
     kv_cache_pct_avg: float | None = None
     kv_cache_pct_max: float | None = None
@@ -2054,6 +2056,8 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
                     "gen_tps_avg",
                     "gen_tps_max",
                     "running_max",
+                    "running_top",
+                    "gen_tps_at_runmax",
                     "waiting_max",
                     "kv_cache_avg",
                     "kv_cache_max",
@@ -2921,6 +2925,8 @@ def _summarize_vllm_server_log(path: Path) -> ProviderServerLogSummary:
     prompt_tps: list[float] = []
     generation_tps: list[float] = []
     running_values: list[int] = []
+    generation_tps_by_running: list[tuple[int, float]] = []
+    running_counts: dict[str, int] = {}
     waiting_values: list[int] = []
     kv_cache_pct: list[float] = []
     prefix_hit_pct: list[float] = []
@@ -2942,8 +2948,12 @@ def _summarize_vllm_server_log(path: Path) -> ProviderServerLogSummary:
         if match is None:
             continue
         prompt_tps.append(float(match.group("prompt_tps")))
-        generation_tps.append(float(match.group("generation_tps")))
-        running_values.append(int(match.group("running")))
+        generation_tps_value = float(match.group("generation_tps"))
+        running_value = int(match.group("running"))
+        generation_tps.append(generation_tps_value)
+        running_values.append(running_value)
+        generation_tps_by_running.append((running_value, generation_tps_value))
+        _increment_count(running_counts, str(running_value))
         waiting_values.append(int(match.group("waiting")))
         kv_cache_pct.append(float(match.group("kv_cache_pct")))
         prefix_hit_pct.append(float(match.group("prefix_hit_pct")))
@@ -2972,6 +2982,16 @@ def _summarize_vllm_server_log(path: Path) -> ProviderServerLogSummary:
         generation_tps_avg=_avg(generation_tps),
         generation_tps_max=max(generation_tps) if generation_tps else None,
         running_max=max(running_values) if running_values else None,
+        running_counts=running_counts,
+        generation_tps_at_running_max=(
+            max(
+                tps
+                for running, tps in generation_tps_by_running
+                if running == max(running_values)
+            )
+            if running_values
+            else None
+        ),
         waiting_max=max(waiting_values) if waiting_values else None,
         kv_cache_pct_avg=_avg(kv_cache_pct),
         kv_cache_pct_max=max(kv_cache_pct) if kv_cache_pct else None,
@@ -3691,6 +3711,8 @@ def _provider_server_log_rows(
                 _fmt_value(summary.generation_tps_avg),
                 _fmt_value(summary.generation_tps_max),
                 _fmt_value(summary.running_max),
+                _fmt_mapping_summary(summary.running_counts),
+                _fmt_value(summary.generation_tps_at_running_max),
                 _fmt_value(summary.waiting_max),
                 _fmt_pct_value(summary.kv_cache_pct_avg),
                 _fmt_pct_value(summary.kv_cache_pct_max),

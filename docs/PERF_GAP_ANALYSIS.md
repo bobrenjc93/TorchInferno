@@ -15945,6 +15945,18 @@ Do not promote the eager oracle. The fair prefill target remains a fused or
 graphable non-fragmenting packed suffix body that keeps the dense graph replay
 launch/collective shape, rather than Python/eager per-layer packed attention.
 
+Re-rendering the latest public run (`20260712_090215`) with the provider-log
+runtime snapshot enhancement shows vLLM's sparse log peak clearly:
+`running_top=0=4,2=1,57=1` and `gen_tps_at_runmax=2192.0`. SGLang still gives
+the richer per-batch evidence (`1474` prefill batches, `83.8%` cached tokens,
+`21` decode batches, decode running top `64=10,60=2,61=2`). The vLLM row is
+therefore useful for coarse active-vs-idle context only; it does not expose a
+per-batch decode shape comparable to TorchInferno's `decode_many:b64/64`.
+Cache-integrity counters on the same public run remain clean, so the next fair
+long_output work stays on normal suffix-prefill body efficiency and high-active
+decode cost, not exact-prompt, prompt-logits, generated-prefix-logits, or
+repeat-state shortcuts.
+
 ## Priority for a focused (non-loop) session
 
 1. Prefill MFU (Issue 1) — biggest TTFT lever, ~2x, affects 3/5 benchmarks.

@@ -1042,6 +1042,8 @@ def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) ->
     assert vllm_log.prompt_tps_avg == 200.0
     assert vllm_log.generation_tps_max == 40.0
     assert vllm_log.running_max == 2
+    assert vllm_log.running_counts == {"2": 1, "1": 1}
+    assert vllm_log.generation_tps_at_running_max == 20.0
     assert vllm_log.waiting_max == 0
     assert vllm_log.kv_cache_pct_avg == 0.15000000000000002
     assert vllm_log.kv_cache_pct_max == 0.2
@@ -1554,6 +1556,8 @@ def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) ->
     assert "flashinfer" in text
     assert "[provider server log phases]" in text
     assert "running_max" in text
+    assert "running_top" in text
+    assert "gen_tps_at_runmax" in text
     assert "kv_cache_avg" in text
     assert "prefix_hit_avg" in text
     assert "prefill_graph_pct" in text
@@ -1568,6 +1572,7 @@ def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) ->
     assert "sglang" in text
     assert "0.2%" in text
     assert "85.0%" in text
+    assert "1=1,2=1" in text
     assert "50.0%" in text
     assert "28.0" in text
     assert "22.2%" in text
