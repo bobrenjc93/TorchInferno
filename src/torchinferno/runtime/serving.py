@@ -568,6 +568,11 @@ class ServingStats:
     prefill_packed_candidate_groups: int = 0
     prefill_packed_fixed_capacity_attempts: int = 0
     prefill_packed_fixed_capacity_accepts: int = 0
+    prefill_packed_fixed_capacity_dense_tokens: int = 0
+    prefill_packed_fixed_capacity_fixed_tokens: int = 0
+    prefill_packed_fixed_capacity_real_tokens: int = 0
+    prefill_packed_fixed_capacity_saved_tokens: int = 0
+    prefill_packed_fixed_capacity_padding_tokens: int = 0
     prefill_prefix_copy_batches: int = 0
     prefill_prefix_copy_tokens: int = 0
     prefill_prefix_copy_shared_tokens: int = 0
@@ -4480,10 +4485,18 @@ class ContinuousBatchEngine:
                 if self.profile_timings
                 else None
             )
+            real_tokens = sum(suffix_lengths)
+            dense_saved_tokens = max(0, dense_tokens - fixed_tokens)
+            packed_padding_tokens = max(0, fixed_tokens - real_tokens)
             self.stats.prefill_packed_fixed_capacity_accepts += 1
+            self.stats.prefill_packed_fixed_capacity_dense_tokens += int(dense_tokens)
+            self.stats.prefill_packed_fixed_capacity_fixed_tokens += int(fixed_tokens)
+            self.stats.prefill_packed_fixed_capacity_real_tokens += int(real_tokens)
+            self.stats.prefill_packed_fixed_capacity_saved_tokens += int(dense_saved_tokens)
+            self.stats.prefill_packed_fixed_capacity_padding_tokens += int(packed_padding_tokens)
             self._record_packed_prefill_eager_result(
                 profile_shape_key=profile_shape_key,
-                real_tokens=sum(suffix_lengths),
+                real_tokens=real_tokens,
                 model_tokens=fixed_tokens,
                 elapsed_ms=elapsed_ms,
             )

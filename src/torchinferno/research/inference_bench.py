@@ -217,6 +217,11 @@ _QUEUE_PROFILE_FIELDS = (
     "runtime_prefill_packed_candidate_pattern_slot_counts",
     "runtime_prefill_packed_fixed_capacity_attempts",
     "runtime_prefill_packed_fixed_capacity_accepts",
+    "runtime_prefill_packed_fixed_capacity_dense_tokens",
+    "runtime_prefill_packed_fixed_capacity_fixed_tokens",
+    "runtime_prefill_packed_fixed_capacity_real_tokens",
+    "runtime_prefill_packed_fixed_capacity_saved_tokens",
+    "runtime_prefill_packed_fixed_capacity_padding_tokens",
     "runtime_prefill_packed_fixed_capacity_reject_reason_counts",
     "runtime_prefill_prefix_copy_batches",
     "runtime_prefill_prefix_copy_tokens",
@@ -1351,6 +1356,12 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
                         "reject_reasons",
                         "packed_calls",
                         "packed_saved",
+                        "dense_tokens",
+                        "fixed_tokens",
+                        "real_tokens",
+                        "dense_saved",
+                        "resid_pad",
+                        "dense_saved_pct",
                         "packed_ms",
                         "candidate_saved",
                     ),
@@ -4251,6 +4262,26 @@ def _prefill_packed_fixed_capacity_runtime_rows(
             fields,
             "runtime_prefill_packed_eager_saved_tokens",
         )
+        dense_tokens = _numeric_field(
+            fields,
+            "runtime_prefill_packed_fixed_capacity_dense_tokens",
+        )
+        fixed_tokens = _numeric_field(
+            fields,
+            "runtime_prefill_packed_fixed_capacity_fixed_tokens",
+        )
+        real_tokens = _numeric_field(
+            fields,
+            "runtime_prefill_packed_fixed_capacity_real_tokens",
+        )
+        dense_saved = _numeric_field(
+            fields,
+            "runtime_prefill_packed_fixed_capacity_saved_tokens",
+        )
+        residual_padding = _numeric_field(
+            fields,
+            "runtime_prefill_packed_fixed_capacity_padding_tokens",
+        )
         packed_ms = _numeric_field(fields, "runtime_prefill_packed_eager_ms")
         candidate_saved = _numeric_field(
             fields,
@@ -4278,6 +4309,24 @@ def _prefill_packed_fixed_capacity_runtime_rows(
                 _fmt_value(
                     _int_if_whole(packed_saved) if packed_saved is not None else None
                 ),
+                _fmt_value(
+                    _int_if_whole(dense_tokens) if dense_tokens is not None else None
+                ),
+                _fmt_value(
+                    _int_if_whole(fixed_tokens) if fixed_tokens is not None else None
+                ),
+                _fmt_value(
+                    _int_if_whole(real_tokens) if real_tokens is not None else None
+                ),
+                _fmt_value(
+                    _int_if_whole(dense_saved) if dense_saved is not None else None
+                ),
+                _fmt_value(
+                    _int_if_whole(residual_padding)
+                    if residual_padding is not None
+                    else None
+                ),
+                _fmt_pct(float(dense_saved or 0.0), float(dense_tokens or 0.0)),
                 _fmt_value(packed_ms),
                 _fmt_value(
                     _int_if_whole(candidate_saved)

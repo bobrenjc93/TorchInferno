@@ -4036,6 +4036,11 @@ def test_continuous_batch_engine_can_use_fixed_capacity_packed_prefill_graph(
     assert engine.stats.prefill_packed_eager_saved_tokens == 2
     assert engine.stats.prefill_packed_fixed_capacity_attempts == 1
     assert engine.stats.prefill_packed_fixed_capacity_accepts == 1
+    assert engine.stats.prefill_packed_fixed_capacity_dense_tokens == 10
+    assert engine.stats.prefill_packed_fixed_capacity_fixed_tokens == 8
+    assert engine.stats.prefill_packed_fixed_capacity_real_tokens == 6
+    assert engine.stats.prefill_packed_fixed_capacity_saved_tokens == 2
+    assert engine.stats.prefill_packed_fixed_capacity_padding_tokens == 2
     assert engine.stats.prefill_packed_fixed_capacity_reject_reason_counts == {}
     assert pad_rows == [2]
     for row in pad_rows:

@@ -68,6 +68,35 @@ now multi_turn (`191.1 / 36.0 / 221.6ms`, `5.1 tok/s` versus vLLM
 found zero TorchInferno logits-cache warnings on this run, and all generated
 prefix, prompt lookup, and repeated-sample-state counters were zero.
 
+## Current 20260712 fixed-capacity packed prefill rejection
+
+A fresh long_output probe on `3f2aa90` with
+`TORCHINFERNO_CONTINUOUS_PACKED_RAGGED_PREFILL_FIXED_CAPACITY_GRAPH=1`,
+`TORCHINFERNO_CONTINUOUS_PACKED_RAGGED_PREFILL_FIXED_CAPACITY_MIN_CALLS=1`,
+and first-call packed graph capture wrote
+`/tmp/inference-bench-long-fixedpacked-probe-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-long-fixedpacked-probe/runs/20260712_000940`.
+It stayed correct (`1000/1000`) but regressed to `212.9 / 21.8 / 989.5ms`,
+`35.0 tok/s`, with p99 E2E `3458.6ms`. Cache-integrity counters stayed clean:
+generated-prefix store/reuse, prompt lookup accepted tokens, reusable-prefix
+logits, and repeated-sample hits were all zero.
+
+The queue profile explains why this remains opt-in. Fixed-capacity packed
+prefill made `60` attempts but accepted only `2`; `58` attempts rejected with
+`capacity_grew`. Those accepted calls recorded only `68` residual packed-padding
+tokens in the old overloaded `runtime_prefill_packed_eager_saved_tokens` field,
+while the broader packed candidate surface still had `29653` avoidable dense
+padding tokens. This rejects the current static-capacity graph wrapper as a
+default long_output fix. The next fair prefill target is still a dynamic
+non-fragmenting cached-prefix suffix body, not exact-prompt logits reuse or a
+static graph key that only accepts rare repeated shapes.
+
+Runtime queue profiles now separate fixed-capacity accounting into dense
+baseline tokens, fixed-slot tokens, real suffix tokens, dense tokens avoided,
+and residual packed padding. Older artifacts render these as `-`, but future
+profiles can distinguish "accepted and actually saved dense compute" from
+"accepted with small residual-padding movement" without relying on the
+overloaded packed-eager fields.
+
 ## Current 20260711 multi-turn prefill profile
 
 A current-head TorchInferno-only `multi_turn` profile on `a95aa93` wrote

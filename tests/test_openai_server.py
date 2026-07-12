@@ -15526,6 +15526,11 @@ def test_openai_queue_profile_records_runtime_engine_stats(
         }
         prefill_packed_fixed_capacity_attempts = 4
         prefill_packed_fixed_capacity_accepts = 1
+        prefill_packed_fixed_capacity_dense_tokens = 64
+        prefill_packed_fixed_capacity_fixed_tokens = 48
+        prefill_packed_fixed_capacity_real_tokens = 31
+        prefill_packed_fixed_capacity_saved_tokens = 16
+        prefill_packed_fixed_capacity_padding_tokens = 17
         prefill_prefix_copy_batches = 2
         prefill_prefix_copy_tokens = 147
         prefill_prefix_copy_shared_tokens = 136
@@ -15779,6 +15784,7 @@ def test_openai_queue_profile_records_runtime_engine_stats(
         {
             "decode_quantum": 4,
             "event": "online_batcher",
+            "runtime_generated_prefix_cache_requested": None,
             "runtime_decode_active_tokens": 27,
             "runtime_decode_batches": 5,
             "runtime_decode_graph_hits": 3,
@@ -15871,6 +15877,11 @@ def test_openai_queue_profile_records_runtime_engine_stats(
             "runtime_prefill_packed_candidate_tokens": 31,
             "runtime_prefill_packed_fixed_capacity_attempts": 4,
             "runtime_prefill_packed_fixed_capacity_accepts": 1,
+            "runtime_prefill_packed_fixed_capacity_dense_tokens": 64,
+            "runtime_prefill_packed_fixed_capacity_fixed_tokens": 48,
+            "runtime_prefill_packed_fixed_capacity_real_tokens": 31,
+            "runtime_prefill_packed_fixed_capacity_saved_tokens": 16,
+            "runtime_prefill_packed_fixed_capacity_padding_tokens": 17,
             "runtime_prefill_prefix_copy_batches": 2,
             "runtime_prefill_prefix_copy_tokens": 147,
             "runtime_prefill_prefix_copy_shared_tokens": 136,
