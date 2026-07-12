@@ -553,7 +553,7 @@ def _write_inference_bench_run(tmp_path) -> None:
                 "Self CUDA time total: 83.400ms",
                 "[RAGGED_DECODE_MANY_REPLAY_PROF] batch=64 steps=8 match=3 "
                 "cache_bucket=1024 rows=64",
-                "ncclDevKernel_AllReduce_Sum_bf16_RING_LL         0.00% "
+                "multimem_all_reduce                              0.00% "
                 "0.000us 0.00% 0.000us 0.000us 12.000ms 30.00% "
                 "12.000ms 75.000us 160",
                 "cutlass_gemm_kernel                             0.00% "
@@ -1054,6 +1054,8 @@ def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) ->
     assert profiler_event.prefix_copy_len == "none"
     assert profiler_event.self_cuda_ms == 83.4
     assert round(profiler_event.allreduce_ms, 3) == 24.592
+    assert round(profiler_event.nccl_allreduce_ms, 3) == 24.592
+    assert profiler_event.symm_allreduce_ms == 0.0
     assert round(profiler_event.gemm_ms, 3) == 10.669
     assert round(profiler_event.add_rms_ms, 3) == 7.138
     assert round(profiler_event.softmax_ms, 3) == 0.654
@@ -1070,6 +1072,8 @@ def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) ->
     assert decode_profiler_event.prefix_copy_len is None
     assert decode_profiler_event.self_cuda_ms == 40.0
     assert decode_profiler_event.allreduce_ms == 12.0
+    assert decode_profiler_event.nccl_allreduce_ms == 0.0
+    assert decode_profiler_event.symm_allreduce_ms == 12.0
     assert decode_profiler_event.gemm_ms == 5.0
     assert decode_profiler_event.marlin_ms == 6.0
     assert decode_profiler_event.attention_ms == 1.5
@@ -1084,6 +1088,8 @@ def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) ->
     assert single_decode_profiler_event.matches == 2
     assert single_decode_profiler_event.self_cuda_ms == 20.0
     assert single_decode_profiler_event.allreduce_ms == 3.0
+    assert single_decode_profiler_event.nccl_allreduce_ms == 3.0
+    assert single_decode_profiler_event.symm_allreduce_ms == 0.0
     assert single_decode_profiler_event.gemm_ms == 4.0
     assert single_decode_profiler_event.marlin_ms == 2.0
     assert single_decode_profiler_event.attention_ms == 1.0
@@ -1463,6 +1469,8 @@ def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) ->
     assert "replay" in text
     assert "self_cuda_ms" in text
     assert "allreduce_pct" in text
+    assert "nccl_allreduce_ms" in text
+    assert "symm_allreduce_ms" in text
     assert "marlin_ms" in text
     assert "marlin_pct" in text
     assert "attention_ms" in text

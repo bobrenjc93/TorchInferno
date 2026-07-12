@@ -534,6 +534,8 @@ class TorchInfernoProfilerSummary:
     steps: int | None = None
     self_cuda_ms: float | None = None
     allreduce_ms: float = 0.0
+    nccl_allreduce_ms: float = 0.0
+    symm_allreduce_ms: float = 0.0
     gemm_ms: float = 0.0
     marlin_ms: float = 0.0
     attention_ms: float = 0.0
@@ -1861,6 +1863,8 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
                     "self_cuda_ms",
                     "allreduce_ms",
                     "allreduce_pct",
+                    "nccl_allreduce_ms",
+                    "symm_allreduce_ms",
                     "gemm_ms",
                     "gemm_pct",
                     "marlin_ms",
@@ -2537,6 +2541,8 @@ def _parse_torchinferno_profiler_events(
             current = profile_fields | {
                 "self_cuda_ms": None,
                 "allreduce_ms": 0.0,
+                "nccl_allreduce_ms": 0.0,
+                "symm_allreduce_ms": 0.0,
                 "gemm_ms": 0.0,
                 "marlin_ms": 0.0,
                 "attention_ms": 0.0,
@@ -2563,6 +2569,12 @@ def _parse_torchinferno_profiler_events(
         category = _profiler_row_category(line)
         if category is not None:
             current[category] = float(current[category]) + row_self_cuda_ms
+            if category == "allreduce_ms":
+                backend_category = _profiler_row_allreduce_backend_category(line)
+                if backend_category is not None:
+                    current[backend_category] = (
+                        float(current[backend_category]) + row_self_cuda_ms
+                    )
 
     if current is not None:
         events.append(_torchinferno_profiler_event_from_fields(current))
@@ -2648,6 +2660,8 @@ def _torchinferno_profiler_event_from_fields(
             else None
         ),
         allreduce_ms=float(fields["allreduce_ms"]),
+        nccl_allreduce_ms=float(fields["nccl_allreduce_ms"]),
+        symm_allreduce_ms=float(fields["symm_allreduce_ms"]),
         gemm_ms=float(fields["gemm_ms"]),
         marlin_ms=float(fields["marlin_ms"]),
         attention_ms=float(fields["attention_ms"]),
@@ -2776,6 +2790,15 @@ def _profiler_row_category(line: str) -> str | None:
         or "gqa_decode" in lowered
     ):
         return "attention_ms"
+    return None
+
+
+def _profiler_row_allreduce_backend_category(line: str) -> str | None:
+    lowered = line.lower()
+    if "nccl" in lowered:
+        return "nccl_allreduce_ms"
+    if "multimem" in lowered or "symm" in lowered or "symmetric" in lowered:
+        return "symm_allreduce_ms"
     return None
 
 
@@ -3013,6 +3036,8 @@ def _torchinferno_profiler_event_rows(
                 _fmt_value(event.self_cuda_ms),
                 _fmt_value(event.allreduce_ms),
                 _fmt_pct(event.allreduce_ms, event.self_cuda_ms or 0.0),
+                _fmt_value(event.nccl_allreduce_ms),
+                _fmt_value(event.symm_allreduce_ms),
                 _fmt_value(event.gemm_ms),
                 _fmt_pct(event.gemm_ms, event.self_cuda_ms or 0.0),
                 _fmt_value(event.marlin_ms),
