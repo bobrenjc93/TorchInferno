@@ -16,6 +16,7 @@ from torchinferno.research.inference_bench import (
     _prefill_packed_flashinfer_gate_rows,
     _prefill_packed_fixed_capacity_runtime_rows,
     _prefill_packed_fixed_capacity_reject_rows,
+    _prefill_non_fragmenting_target_rows,
     _prefill_shape_call_count,
     _prefill_shape_dense_forward_ms,
     _prefill_target_ms,
@@ -1210,6 +1211,7 @@ def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) ->
     assert "[torchinferno packed prefill patterns]" in text
     assert "[torchinferno packed prefill fixed-capacity plans]" in text
     assert "[torchinferno packed prefill dynamic-count targets]" in text
+    assert "[torchinferno non-fragmenting prefill targets]" in text
     assert "[torchinferno packed prefill implementation targets]" in text
     assert "[torchinferno packed prefill signature reuse]" in text
     assert "[torchinferno packed prefill pattern reuse]" in text
@@ -1223,6 +1225,8 @@ def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) ->
     assert "fixed_cover" in text
     assert "repeat_saved" in text
     assert "sig_cov" in text
+    assert "suffix_cand_saved" in text
+    assert "packed_body" in text
     assert "75.8%" in text
     assert "prefix_graph:b2:s4:p0-0:src0:mixed0|p0:s4" not in text
     assert "saved_pct" in text
@@ -1927,6 +1931,56 @@ def test_prefill_fixed_capacity_runtime_rows_show_acceptance_and_rejects() -> No
             "0",
             "0.0",
             "28117",
+        )
+    ]
+
+
+def test_prefill_non_fragmenting_target_rows_rank_packed_over_fragmented_split() -> None:
+    profile = QueueProfileSummary(
+        event="online_batcher_quiescent",
+        temperature=0.0,
+        max_tokens=96,
+        submitted_requests=1000,
+        finished_events=1000,
+        fields={
+            "runtime_prefill_forward_ms": 100.0,
+            "runtime_prefill_shape_forward_ms": {
+                "prefix_graph:b24:s96:p111-111:src1:mixed0": 40.0,
+            },
+            "runtime_prefill_shape_model_tokens": {
+                "prefix_graph:b24:s96:p111-111:src1:mixed0": 23040,
+            },
+            "runtime_prefill_packed_candidate_calls": 15,
+            "runtime_prefill_packed_candidate_saved_tokens": 5440,
+            "runtime_prefill_packed_candidate_shape_saved_tokens": {
+                "prefix_graph:b24:s96:p111-111:src1:mixed0": 1024,
+            },
+            "runtime_prefill_suffix_split_candidate_saved_tokens": 5440,
+            "runtime_prefill_suffix_split_accepted_saved_tokens": 0,
+            "runtime_prefill_suffix_split_rejected_calls": 15,
+            "runtime_prefill_suffix_split_reject_reason_counts": {
+                "disabled": 4,
+                "min_fill": 5,
+                "no_savings": 6,
+            },
+        },
+    )
+
+    assert _prefill_non_fragmenting_target_rows([profile]) == [
+        (
+            "0.0",
+            "96",
+            "5440",
+            "15",
+            "5440",
+            "0",
+            "15",
+            "no_savings=6,min_fill=5,disabled=4",
+            "prefix_graph:b24:s96:p111-111:src1:mixed0",
+            "1024",
+            "1.8",
+            "1.8%",
+            "packed_body",
         )
     ]
 

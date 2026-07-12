@@ -1409,6 +1409,33 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
             )
             lines.append("")
 
+        non_fragmenting_target_rows = _prefill_non_fragmenting_target_rows(
+            queue_profiles
+        )
+        if non_fragmenting_target_rows:
+            lines.append("[torchinferno non-fragmenting prefill targets]")
+            lines.extend(
+                _format_table(
+                    (
+                        "temp",
+                        "max_tokens",
+                        "packed_saved",
+                        "packed_calls",
+                        "suffix_cand_saved",
+                        "suffix_ok_saved",
+                        "suffix_rej",
+                        "suffix_reasons",
+                        "top_shape",
+                        "top_shape_saved",
+                        "est_saved_ms",
+                        "est_share",
+                        "target",
+                    ),
+                    non_fragmenting_target_rows,
+                )
+            )
+            lines.append("")
+
         packed_target_rows = _prefill_packed_implementation_target_rows(
             queue_profiles
         )
@@ -4647,6 +4674,107 @@ def _prefill_packed_dynamic_target_rows(
                     ),
                 )
             )
+    items.sort(key=lambda item: (-item[0], -item[1], item[2]))
+    return [item[3] for item in items[:limit]]
+
+
+def _prefill_non_fragmenting_target_rows(
+    profiles: Sequence[QueueProfileSummary],
+    *,
+    limit: int = 8,
+) -> list[tuple[str, ...]]:
+    items: list[tuple[float, float, str, tuple[str, ...]]] = []
+    for profile in profiles:
+        fields = profile.fields
+        packed_saved = _numeric_field(
+            fields,
+            "runtime_prefill_packed_candidate_saved_tokens",
+        )
+        suffix_candidate_saved = _numeric_field(
+            fields,
+            "runtime_prefill_suffix_split_candidate_saved_tokens",
+        )
+        suffix_accepted_saved = _numeric_field(
+            fields,
+            "runtime_prefill_suffix_split_accepted_saved_tokens",
+        )
+        packed_saved_value = max(0.0, float(packed_saved or 0.0))
+        suffix_candidate_value = max(0.0, float(suffix_candidate_saved or 0.0))
+        suffix_accepted_value = max(0.0, float(suffix_accepted_saved or 0.0))
+        if packed_saved_value <= 0.0 and suffix_candidate_value <= 0.0:
+            continue
+
+        top_shape, top_shape_saved = _top_mapping_entry(
+            fields.get("runtime_prefill_packed_candidate_shape_saved_tokens")
+        )
+        top_shape_saved_value = max(0.0, float(top_shape_saved or 0.0))
+        est_saved_ms = (
+            _prefill_packed_fixed_capacity_saved_ms(
+                fields,
+                top_shape,
+                top_shape_saved_value,
+            )
+            if top_shape is not None and top_shape_saved_value > 0.0
+            else None
+        )
+        total_prefill_ms = _prefill_total_dense_forward_ms(fields)
+        suffix_rejected = _numeric_field(
+            fields,
+            "runtime_prefill_suffix_split_rejected_calls",
+        )
+        suffix_rejected_value = max(0.0, float(suffix_rejected or 0.0))
+        packed_calls = _numeric_field(
+            fields,
+            "runtime_prefill_packed_candidate_calls",
+        )
+
+        if (
+            packed_saved_value > suffix_accepted_value
+            and suffix_rejected_value > 0.0
+        ):
+            target = "packed_body"
+        elif (
+            suffix_accepted_value > 0.0
+            and packed_saved_value > 0.0
+            and suffix_accepted_value >= 0.75 * packed_saved_value
+        ):
+            target = "measure_split"
+        elif suffix_candidate_value > 0.0 and suffix_accepted_value <= 0.0:
+            target = "avoid_fragment"
+        else:
+            target = "inspect"
+
+        score = float(est_saved_ms) if est_saved_ms is not None else packed_saved_value
+        key = f"{profile.temperature}:{profile.max_tokens}:{top_shape or ''}"
+        items.append(
+            (
+                score,
+                max(packed_saved_value, suffix_candidate_value),
+                key,
+                (
+                    _fmt_value(profile.temperature),
+                    _fmt_value(profile.max_tokens),
+                    _fmt_value(_int_if_whole(packed_saved_value)),
+                    _fmt_value(_int_if_whole(packed_calls) if packed_calls is not None else None),
+                    _fmt_value(_int_if_whole(suffix_candidate_value)),
+                    _fmt_value(_int_if_whole(suffix_accepted_value)),
+                    _fmt_value(_int_if_whole(suffix_rejected_value)),
+                    _fmt_mapping_summary(
+                        fields.get("runtime_prefill_suffix_split_reject_reason_counts")
+                    ),
+                    _fmt_value(top_shape),
+                    _fmt_value(_int_if_whole(top_shape_saved_value)),
+                    _fmt_value(
+                        None if est_saved_ms is None else _int_if_whole(est_saved_ms)
+                    ),
+                    _fmt_pct(
+                        float(est_saved_ms or 0.0),
+                        float(total_prefill_ms or 0.0),
+                    ),
+                    target,
+                ),
+            )
+        )
     items.sort(key=lambda item: (-item[0], -item[1], item[2]))
     return [item[3] for item in items[:limit]]
 
