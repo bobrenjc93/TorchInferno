@@ -126,6 +126,24 @@ graph replay `4891.6ms -> 4527.6ms`. Keep the existing no-savings and
 minimum-group gates; the lower fill threshold is a narrow fair prefill padding
 reduction, not a prompt/logits reuse path.
 
+A follow-up decode-many high-active gate probe on `806d56c` is rejected. The
+default run at
+`/tmp/inference-bench-ti-long-default-806d56c-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-long-default-806d56c/runs/20260712_061403`
+landed at `215.9 / 21.4 / 992.6ms`, `36.3 tok/s`, with `1000/1000`
+correct. Forcing
+`TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY_MIN_ACTIVE_PCT=90` wrote
+`/tmp/inference-bench-ti-long-decodemany-minactive90-806d56c-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-long-decodemany-minactive90-806d56c/runs/20260712_062100`
+and landed at `214.4 / 21.8 / 973.2ms`, `36.1 tok/s`, also correct and
+cache-integrity clean. It cut decode-many GPU `7.35s -> 3.70s` and
+overgenerated tokens `1625 -> 879`, but total runtime phase grew
+`16.33s -> 16.95s`, prefill padding rose `23.7K -> 27.5K`, and accepted suffix
+splits fell `10 -> 7`. The less aggressive `75%` gate at
+`/tmp/inference-bench-ti-long-decodemany-minactive75-806d56c-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-long-decodemany-minactive75-806d56c/runs/20260712_062619`
+landed at `214.2 / 22.1 / 975.8ms`, but throughput dropped to `34.9 tok/s` and
+p99 E2E regressed to `2478.3ms`. Keep the gate opt-in until the scheduler can
+avoid low-active decode-many without perturbing prefill fragmentation and tail
+latency.
+
 ## Current 20260712 sampled-short self rechecks
 
 After the no-logits reset, a full local TorchInferno-only run at pushed
