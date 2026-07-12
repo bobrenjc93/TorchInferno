@@ -15931,6 +15931,20 @@ shape/run variance. Forcing
 gap is packed/fused suffix prefill and decode-body cost, not another
 decode-many graph default.
 
+A current-main dynamic packed-eager long_output probe on `e286ddf` rejects the
+existing eager packed-prefill oracle as a default implementation body. The run
+set `TORCHINFERNO_CONTINUOUS_PACKED_RAGGED_PREFILL_EAGER=1` without packed
+graph capture and wrote
+`/tmp/inference-bench-ti-long-packed-eager-e286ddf-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-long-packed-eager-e286ddf/runs/20260712_105656`.
+It stayed correct (`1000/1000`) and cache-integrity clean, with generated
+prefix, prompt lookup, reusable-prefix logits/sample/greedy, and repeated-hit
+counters all zero. The mechanism removed real padding (`68` packed calls,
+`23.1K` saved model tokens), but regressed the row to
+`781.9 / 61.3 / 3058.7ms`, `12.0 tok/s`; packed eager alone spent `37.97s`.
+Do not promote the eager oracle. The fair prefill target remains a fused or
+graphable non-fragmenting packed suffix body that keeps the dense graph replay
+launch/collective shape, rather than Python/eager per-layer packed attention.
+
 ## Priority for a focused (non-loop) session
 
 1. Prefill MFU (Issue 1) — biggest TTFT lever, ~2x, affects 3/5 benchmarks.
