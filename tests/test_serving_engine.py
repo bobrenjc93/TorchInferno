@@ -4953,6 +4953,8 @@ def test_continuous_batch_engine_records_packed_prefill_candidate_shapes_for_que
         suffix_lengths=[1, 2, 3],
         start_lens=[16, 16, 16],
         model_tokens=16,
+        model_rows=4,
+        suffix_bucket=4,
         packed_prefill_pattern_key=pattern,
     )
 
@@ -4972,6 +4974,8 @@ def test_continuous_batch_engine_records_packed_prefill_candidate_shapes_for_que
         suffix_lengths=[1, 2, 3],
         start_lens=[16, 16, 16],
         model_tokens=16,
+        model_rows=4,
+        suffix_bucket=4,
         packed_prefill_pattern_key=pattern,
     )
 
@@ -4983,6 +4987,12 @@ def test_continuous_batch_engine_records_packed_prefill_candidate_shapes_for_que
     }
     assert profiled_engine.stats.prefill_packed_candidate_shape_saved_tokens == {
         shape_key: 10,
+    }
+    assert profiled_engine.stats.prefill_packed_candidate_shape_row_saved_tokens == {
+        shape_key: 4,
+    }
+    assert profiled_engine.stats.prefill_packed_candidate_shape_suffix_saved_tokens == {
+        shape_key: 6,
     }
     assert profiled_engine.stats.prefill_packed_candidate_shape_groups == {shape_key: 3}
     assert profiled_engine.stats.prefill_packed_candidate_shape_max_tokens == {shape_key: 6}
@@ -4997,8 +5007,20 @@ def test_continuous_batch_engine_records_packed_prefill_candidate_shapes_for_que
     assert profiled_engine.stats.prefill_packed_candidate_signature_counts == {
         signature: 1,
     }
+    assert profiled_engine.stats.prefill_packed_candidate_signature_row_saved_tokens == {
+        signature: 4,
+    }
+    assert profiled_engine.stats.prefill_packed_candidate_signature_suffix_saved_tokens == {
+        signature: 6,
+    }
     assert profiled_engine.stats.prefill_packed_candidate_pattern_counts == {
         pattern: 1,
+    }
+    assert profiled_engine.stats.prefill_packed_candidate_pattern_row_saved_tokens == {
+        pattern: 4,
+    }
+    assert profiled_engine.stats.prefill_packed_candidate_pattern_suffix_saved_tokens == {
+        pattern: 6,
     }
     assert profiled_engine.stats.prefill_shape_forward_ms == {}
 

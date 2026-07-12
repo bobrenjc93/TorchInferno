@@ -191,6 +191,8 @@ _QUEUE_PROFILE_FIELDS = (
     "runtime_prefill_packed_candidate_shape_tokens",
     "runtime_prefill_packed_candidate_shape_model_tokens",
     "runtime_prefill_packed_candidate_shape_saved_tokens",
+    "runtime_prefill_packed_candidate_shape_row_saved_tokens",
+    "runtime_prefill_packed_candidate_shape_suffix_saved_tokens",
     "runtime_prefill_packed_candidate_shape_groups",
     "runtime_prefill_packed_candidate_shape_max_tokens",
     "runtime_prefill_packed_candidate_shape_max_model_tokens",
@@ -205,6 +207,8 @@ _QUEUE_PROFILE_FIELDS = (
     "runtime_prefill_packed_candidate_signature_tokens",
     "runtime_prefill_packed_candidate_signature_model_tokens",
     "runtime_prefill_packed_candidate_signature_saved_tokens",
+    "runtime_prefill_packed_candidate_signature_row_saved_tokens",
+    "runtime_prefill_packed_candidate_signature_suffix_saved_tokens",
     "runtime_prefill_packed_candidate_signature_groups",
     "runtime_prefill_packed_candidate_pattern_keys",
     "runtime_prefill_packed_candidate_pattern_calls",
@@ -215,6 +219,8 @@ _QUEUE_PROFILE_FIELDS = (
     "runtime_prefill_packed_candidate_pattern_tokens",
     "runtime_prefill_packed_candidate_pattern_model_tokens",
     "runtime_prefill_packed_candidate_pattern_saved_tokens",
+    "runtime_prefill_packed_candidate_pattern_row_saved_tokens",
+    "runtime_prefill_packed_candidate_pattern_suffix_saved_tokens",
     "runtime_prefill_packed_candidate_pattern_groups",
     "runtime_prefill_packed_candidate_pattern_slot_counts",
     "runtime_prefill_packed_fixed_capacity_attempts",
@@ -1268,6 +1274,8 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
                         "real_tokens",
                         "model_tokens",
                         "saved_tokens",
+                        "row_saved",
+                        "suffix_saved",
                         "groups",
                     ),
                     packed_signature_rows,
@@ -1288,6 +1296,8 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
                         "real_tokens",
                         "model_tokens",
                         "saved_tokens",
+                        "row_saved",
+                        "suffix_saved",
                         "saved_pct",
                         "groups",
                     ),
@@ -1418,9 +1428,13 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
                         "pattern",
                         "calls",
                         "dynamic_saved",
+                        "row_saved",
+                        "suffix_saved",
                         "fixed_saved",
                         "fixed_cover",
                         "est_saved_ms",
+                        "row_ms_est",
+                        "suffix_ms_est",
                         "est_share",
                         "obs_packed_ms",
                     ),
@@ -4120,6 +4134,22 @@ def _hot_prefill_packed_signature_rows(
                 _fmt_value(saved_tokens),
                 _fmt_value(
                     _mapping_value(
+                        fields.get(
+                            "runtime_prefill_packed_candidate_signature_row_saved_tokens"
+                        ),
+                        signature,
+                    )
+                ),
+                _fmt_value(
+                    _mapping_value(
+                        fields.get(
+                            "runtime_prefill_packed_candidate_signature_suffix_saved_tokens"
+                        ),
+                        signature,
+                    )
+                ),
+                _fmt_value(
+                    _mapping_value(
                         fields.get("runtime_prefill_packed_candidate_signature_groups"),
                         signature,
                     )
@@ -4169,6 +4199,22 @@ def _hot_prefill_packed_pattern_rows(
                         )
                     ),
                     _fmt_value(saved_tokens),
+                    _fmt_value(
+                        _mapping_value(
+                            fields.get(
+                                "runtime_prefill_packed_candidate_pattern_row_saved_tokens"
+                            ),
+                            pattern,
+                        )
+                    ),
+                    _fmt_value(
+                        _mapping_value(
+                            fields.get(
+                                "runtime_prefill_packed_candidate_pattern_suffix_saved_tokens"
+                            ),
+                            pattern,
+                        )
+                    ),
                     _fmt_pct(float(saved_tokens), total_saved),
                     _fmt_value(
                         _mapping_value(
@@ -4770,6 +4816,12 @@ def _prefill_packed_dynamic_target_rows(
         pattern_saved = _numeric_mapping(
             fields.get("runtime_prefill_packed_candidate_pattern_saved_tokens")
         )
+        pattern_row_saved = _numeric_mapping(
+            fields.get("runtime_prefill_packed_candidate_pattern_row_saved_tokens")
+        )
+        pattern_suffix_saved = _numeric_mapping(
+            fields.get("runtime_prefill_packed_candidate_pattern_suffix_saved_tokens")
+        )
         if not pattern_calls or not pattern_saved:
             continue
         pattern_max_slots, _runtime_slot_patterns, _pattern_signature_calls = (
@@ -4796,6 +4848,26 @@ def _prefill_packed_dynamic_target_rows(
                 pattern,
                 dynamic_saved,
             )
+            row_saved = (
+                pattern_row_saved.get(pattern)
+                if pattern in pattern_row_saved
+                else None
+            )
+            suffix_saved = (
+                pattern_suffix_saved.get(pattern)
+                if pattern in pattern_suffix_saved
+                else None
+            )
+            row_saved_ms = _proportional_token_ms(
+                est_saved_ms,
+                row_saved,
+                dynamic_saved,
+            )
+            suffix_saved_ms = _proportional_token_ms(
+                est_saved_ms,
+                suffix_saved,
+                dynamic_saved,
+            )
             observed_packed_ms = _prefill_shape_observed_packed_ms(
                 fields,
                 pattern.split("|", 1)[0],
@@ -4812,12 +4884,30 @@ def _prefill_packed_dynamic_target_rows(
                         pattern,
                         _fmt_value(_int_if_whole(call_count)),
                         _fmt_value(_int_if_whole(dynamic_saved)),
+                        _fmt_value(
+                            None if row_saved is None else _int_if_whole(row_saved)
+                        ),
+                        _fmt_value(
+                            None
+                            if suffix_saved is None
+                            else _int_if_whole(suffix_saved)
+                        ),
                         _fmt_value(_int_if_whole(fixed_saved_value)),
                         _fmt_pct(fixed_saved_value, dynamic_saved),
                         _fmt_value(
                             None
                             if est_saved_ms is None
                             else _int_if_whole(est_saved_ms)
+                        ),
+                        _fmt_value(
+                            None
+                            if row_saved_ms is None
+                            else _int_if_whole(row_saved_ms)
+                        ),
+                        _fmt_value(
+                            None
+                            if suffix_saved_ms is None
+                            else _int_if_whole(suffix_saved_ms)
                         ),
                         _fmt_pct(
                             float(est_saved_ms or 0.0),

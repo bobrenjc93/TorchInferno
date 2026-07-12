@@ -303,6 +303,12 @@ def _write_inference_bench_run(tmp_path) -> None:
         "runtime_prefill_packed_candidate_shape_saved_tokens": {
             "prefix_graph:b8:s16:p45-45:src1:mixed0": 17,
         },
+        "runtime_prefill_packed_candidate_shape_row_saved_tokens": {
+            "prefix_graph:b8:s16:p45-45:src1:mixed0": 4,
+        },
+        "runtime_prefill_packed_candidate_shape_suffix_saved_tokens": {
+            "prefix_graph:b8:s16:p45-45:src1:mixed0": 13,
+        },
         "runtime_prefill_packed_candidate_shape_groups": {
             "prefix_graph:b8:s16:p45-45:src1:mixed0": 2,
         },
@@ -339,6 +345,14 @@ def _write_inference_bench_run(tmp_path) -> None:
             "prefix_graph:b8:s16:p45-45:src1:mixed0|p45:s10:n2/p45:s11:n1": 16,
             "prefix_graph:b4:s16:p45-45:src1:mixed0|p45:s12:n1": 4,
         },
+        "runtime_prefill_packed_candidate_signature_row_saved_tokens": {
+            "prefix_graph:b8:s16:p45-45:src1:mixed0|p45:s10:n2/p45:s11:n1": 4,
+            "prefix_graph:b4:s16:p45-45:src1:mixed0|p45:s12:n1": 2,
+        },
+        "runtime_prefill_packed_candidate_signature_suffix_saved_tokens": {
+            "prefix_graph:b8:s16:p45-45:src1:mixed0|p45:s10:n2/p45:s11:n1": 12,
+            "prefix_graph:b4:s16:p45-45:src1:mixed0|p45:s12:n1": 2,
+        },
         "runtime_prefill_packed_candidate_signature_groups": {
             "prefix_graph:b8:s16:p45-45:src1:mixed0|p45:s10:n2/p45:s11:n1": 2,
             "prefix_graph:b4:s16:p45-45:src1:mixed0|p45:s12:n1": 1,
@@ -360,6 +374,12 @@ def _write_inference_bench_run(tmp_path) -> None:
         },
         "runtime_prefill_packed_candidate_pattern_saved_tokens": {
             "prefix_graph:b8:s16:p45-45:src1:mixed0|p45:s10/p45:s11": 20,
+        },
+        "runtime_prefill_packed_candidate_pattern_row_saved_tokens": {
+            "prefix_graph:b8:s16:p45-45:src1:mixed0|p45:s10/p45:s11": 4,
+        },
+        "runtime_prefill_packed_candidate_pattern_suffix_saved_tokens": {
+            "prefix_graph:b8:s16:p45-45:src1:mixed0|p45:s10/p45:s11": 16,
         },
         "runtime_prefill_packed_candidate_pattern_groups": {
             "prefix_graph:b8:s16:p45-45:src1:mixed0|p45:s10/p45:s11": 2,
@@ -1634,13 +1654,34 @@ def test_dynamic_packed_prefill_targets_use_gpu_replay_timing_without_sync() -> 
                     "runtime_prefill_packed_candidate_pattern_counts": {pattern: 2},
                     "runtime_prefill_packed_candidate_pattern_model_tokens": {pattern: 64},
                     "runtime_prefill_packed_candidate_pattern_saved_tokens": {pattern: 16},
+                    "runtime_prefill_packed_candidate_pattern_row_saved_tokens": {
+                        pattern: 4,
+                    },
+                    "runtime_prefill_packed_candidate_pattern_suffix_saved_tokens": {
+                        pattern: 12,
+                    },
                 },
             )
         ]
     )
 
     assert rows == [
-        ("0.0", "512", pattern, "2", "16", "0", "0.0%", "8", "20.0%", "-")
+        (
+            "0.0",
+            "512",
+            pattern,
+            "2",
+            "16",
+            "4",
+            "12",
+            "0",
+            "0.0%",
+            "8",
+            "2",
+            "6",
+            "20.0%",
+            "-",
+        )
     ]
 
 
@@ -1672,7 +1713,22 @@ def test_dynamic_packed_prefill_targets_estimate_older_runs_from_total_replay() 
     )
 
     assert rows == [
-        ("0.0", "512", pattern, "2", "16", "0", "0.0%", "5", "12.5%", "-")
+        (
+            "0.0",
+            "512",
+            pattern,
+            "2",
+            "16",
+            "-",
+            "-",
+            "0",
+            "0.0%",
+            "5",
+            "-",
+            "-",
+            "12.5%",
+            "-",
+        )
     ]
 
 
@@ -2027,9 +2083,13 @@ def test_prefill_fixed_capacity_reject_rows_show_over_dense_patterns() -> None:
             "prefix_graph:b32:s16:p122-122:src1:mixed0|p122:s12/p122:s13/p122:s14",
             "33",
             "5088",
+            "-",
+            "-",
             "0",
             "0.0%",
             "18.1",
+            "-",
+            "-",
             "15.1%",
             "-",
         ),

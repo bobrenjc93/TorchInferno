@@ -646,6 +646,8 @@ class ServingStats:
     prefill_packed_candidate_shape_tokens: dict[str, int] = field(default_factory=dict)
     prefill_packed_candidate_shape_model_tokens: dict[str, int] = field(default_factory=dict)
     prefill_packed_candidate_shape_saved_tokens: dict[str, int] = field(default_factory=dict)
+    prefill_packed_candidate_shape_row_saved_tokens: dict[str, int] = field(default_factory=dict)
+    prefill_packed_candidate_shape_suffix_saved_tokens: dict[str, int] = field(default_factory=dict)
     prefill_packed_candidate_shape_groups: dict[str, int] = field(default_factory=dict)
     prefill_packed_candidate_shape_max_tokens: dict[str, int] = field(default_factory=dict)
     prefill_packed_candidate_shape_max_model_tokens: dict[str, int] = field(default_factory=dict)
@@ -655,11 +657,15 @@ class ServingStats:
     prefill_packed_candidate_signature_tokens: dict[str, int] = field(default_factory=dict)
     prefill_packed_candidate_signature_model_tokens: dict[str, int] = field(default_factory=dict)
     prefill_packed_candidate_signature_saved_tokens: dict[str, int] = field(default_factory=dict)
+    prefill_packed_candidate_signature_row_saved_tokens: dict[str, int] = field(default_factory=dict)
+    prefill_packed_candidate_signature_suffix_saved_tokens: dict[str, int] = field(default_factory=dict)
     prefill_packed_candidate_signature_groups: dict[str, int] = field(default_factory=dict)
     prefill_packed_candidate_pattern_counts: dict[str, int] = field(default_factory=dict)
     prefill_packed_candidate_pattern_tokens: dict[str, int] = field(default_factory=dict)
     prefill_packed_candidate_pattern_model_tokens: dict[str, int] = field(default_factory=dict)
     prefill_packed_candidate_pattern_saved_tokens: dict[str, int] = field(default_factory=dict)
+    prefill_packed_candidate_pattern_row_saved_tokens: dict[str, int] = field(default_factory=dict)
+    prefill_packed_candidate_pattern_suffix_saved_tokens: dict[str, int] = field(default_factory=dict)
     prefill_packed_candidate_pattern_groups: dict[str, int] = field(default_factory=dict)
     prefill_packed_candidate_pattern_slot_counts: dict[str, int] = field(default_factory=dict)
     prefill_packed_fixed_capacity_reject_reason_counts: dict[str, int] = field(default_factory=dict)
@@ -3819,6 +3825,8 @@ class ContinuousBatchEngine:
                 suffix_lengths=suffix_lengths,
                 start_lens=start_lens[:count],
                 model_tokens=int(input_ids.numel()),
+                model_rows=int(input_ids.size(0)),
+                suffix_bucket=int(suffix_bucket),
                 packed_prefill_pattern_key=packed_prefill_pattern_key,
             )
             if self.profile_timings:
@@ -8945,6 +8953,8 @@ class ContinuousBatchEngine:
         suffix_lengths: Sequence[int],
         start_lens: Sequence[int],
         model_tokens: int,
+        model_rows: int,
+        suffix_bucket: int,
         packed_prefill_pattern_key: str | None = None,
     ) -> None:
         group_counts: dict[tuple[int, int], int] = defaultdict(int)
@@ -8957,6 +8967,13 @@ class ContinuousBatchEngine:
         saved_tokens = max(0, int(model_tokens) - real_tokens)
         if saved_tokens <= 0:
             return
+        active_rows = len(suffix_lengths)
+        row_saved_tokens = max(0, int(model_rows) - active_rows) * max(
+            0,
+            int(suffix_bucket),
+        )
+        row_saved_tokens = min(saved_tokens, row_saved_tokens)
+        suffix_saved_tokens = max(0, saved_tokens - row_saved_tokens)
         groups = len(group_counts)
         self.stats.prefill_packed_candidate_calls += 1
         self.stats.prefill_packed_candidate_tokens += real_tokens
@@ -8989,6 +9006,16 @@ class ContinuousBatchEngine:
             self.stats.prefill_packed_candidate_shape_saved_tokens,
             shape_key,
             saved_tokens,
+        )
+        record_total(
+            self.stats.prefill_packed_candidate_shape_row_saved_tokens,
+            shape_key,
+            row_saved_tokens,
+        )
+        record_total(
+            self.stats.prefill_packed_candidate_shape_suffix_saved_tokens,
+            shape_key,
+            suffix_saved_tokens,
         )
         record_total(
             self.stats.prefill_packed_candidate_shape_groups,
@@ -9035,6 +9062,16 @@ class ContinuousBatchEngine:
             saved_tokens,
         )
         record_total(
+            self.stats.prefill_packed_candidate_signature_row_saved_tokens,
+            signature_key,
+            row_saved_tokens,
+        )
+        record_total(
+            self.stats.prefill_packed_candidate_signature_suffix_saved_tokens,
+            signature_key,
+            suffix_saved_tokens,
+        )
+        record_total(
             self.stats.prefill_packed_candidate_signature_groups,
             signature_key,
             groups,
@@ -9061,6 +9098,16 @@ class ContinuousBatchEngine:
             self.stats.prefill_packed_candidate_pattern_saved_tokens,
             pattern_key,
             saved_tokens,
+        )
+        record_total(
+            self.stats.prefill_packed_candidate_pattern_row_saved_tokens,
+            pattern_key,
+            row_saved_tokens,
+        )
+        record_total(
+            self.stats.prefill_packed_candidate_pattern_suffix_saved_tokens,
+            pattern_key,
+            suffix_saved_tokens,
         )
         record_total(
             self.stats.prefill_packed_candidate_pattern_groups,

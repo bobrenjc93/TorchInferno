@@ -127,6 +127,13 @@ profiles can distinguish "accepted and actually saved dense compute" from
 "accepted with small residual-padding movement" without relying on the
 overloaded packed-eager fields.
 
+Future queue profiles also split packed-prefill candidate savings into
+`row_saved` and `suffix_saved` tokens at the shape, signature, and pattern
+levels. The split is derived from ordinary batch geometry (`model_rows`, active
+suffix rows, and suffix bucket size), so it keeps the dynamic-count target table
+focused on whether the next packed body should remove empty padded rows or
+in-row suffix padding without introducing any prompt/logits cache behavior.
+
 ## Current 20260712 decode-many graph and sync-stop rejection
 
 Two fresh long_output probes keep decode-many policy changes diagnostic-only.
