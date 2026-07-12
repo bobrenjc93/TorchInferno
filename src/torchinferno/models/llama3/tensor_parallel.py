@@ -45,6 +45,7 @@ _DEFAULT_PREFILL_GRAPH_MAX_GRAPHS = 192
 # all free memory on tight 70B tensor-parallel hosts before the next prefill.
 _DEFAULT_PREFILL_GRAPH_MIN_FREE_MB = 1024
 _PackedPrefillAttentionGroup = tuple[int, int, Tensor, tuple[int, ...], tuple[int, ...]]
+_PackedPrefillAttentionStartGroup = tuple[int, tuple[_PackedPrefillAttentionGroup, ...]]
 
 
 @contextmanager
@@ -8920,6 +8921,155 @@ def _build_packed_prefill_attention_groups(
     )
 
 
+def _packed_prefill_attention_groups_by_start(
+    groups: tuple[_PackedPrefillAttentionGroup, ...],
+) -> tuple[_PackedPrefillAttentionStartGroup, ...]:
+    by_start: dict[int, list[_PackedPrefillAttentionGroup]] = {}
+    for group in groups:
+        by_start.setdefault(int(group[1]), []).append(group)
+    return tuple((start, tuple(start_groups)) for start, start_groups in by_start.items())
+
+
+def _packed_prefill_attention_single_group(
+    q: Tensor,
+    cache_keys: Tensor,
+    cache_values: Tensor,
+    row_indices: Tensor,
+    *,
+    q_len: int,
+    start: int,
+    group_indices: Tensor,
+    request_indices: tuple[int, ...],
+    offsets: tuple[int, ...],
+    causal_lower_right: object | None,
+    enable_gqa: bool,
+) -> list[tuple[int, Tensor]]:
+    context = start + q_len
+    if context > cache_keys.size(2):
+        raise ValueError("KV cache capacity exceeded")
+    rows = row_indices.index_select(0, group_indices)
+    qi = torch.cat([q[:, :, offset : offset + q_len, :] for offset in offsets], dim=0)
+    ki = cache_keys.index_select(0, rows)[:, :, :context, :]
+    vi = cache_values.index_select(0, rows)[:, :, :context, :]
+    if causal_lower_right is not None:
+        out_group = F.scaled_dot_product_attention(
+            qi,
+            ki,
+            vi,
+            attn_mask=causal_lower_right(q_len, context),
+            dropout_p=0.0,
+            is_causal=False,
+            enable_gqa=enable_gqa,
+        )
+    else:
+        key_positions = torch.arange(context, device=q.device)
+        query_positions = start + torch.arange(q_len, device=q.device)
+        mask = key_positions[None, :] <= query_positions[:, None]
+        out_group = F.scaled_dot_product_attention(
+            qi,
+            ki,
+            vi,
+            attn_mask=mask[None, None, :, :],
+            dropout_p=0.0,
+            is_causal=False,
+            enable_gqa=enable_gqa,
+        )
+    return [
+        (int(request_idx), out_group[group_pos : group_pos + 1])
+        for group_pos, request_idx in enumerate(request_indices)
+    ]
+
+
+def _packed_prefill_attention_same_start_group(
+    q: Tensor,
+    cache_keys: Tensor,
+    cache_values: Tensor,
+    row_indices: Tensor,
+    *,
+    start: int,
+    groups: tuple[_PackedPrefillAttentionGroup, ...],
+    q_lens: Tensor,
+    causal_lower_right: object | None,
+    enable_gqa: bool,
+) -> list[tuple[int, Tensor]]:
+    if len(groups) == 1:
+        q_len, _start, group_indices, request_indices, offsets = groups[0]
+        return _packed_prefill_attention_single_group(
+            q,
+            cache_keys,
+            cache_values,
+            row_indices,
+            q_len=q_len,
+            start=start,
+            group_indices=group_indices,
+            request_indices=request_indices,
+            offsets=offsets,
+            causal_lower_right=causal_lower_right,
+            enable_gqa=enable_gqa,
+        )
+
+    max_q_len = max(int(group[0]) for group in groups)
+    context = start + max_q_len
+    if context > cache_keys.size(2):
+        raise ValueError("KV cache capacity exceeded")
+    all_group_indices = torch.cat([group[2] for group in groups], dim=0)
+    rows = row_indices.index_select(0, all_group_indices)
+    grouped_q_lens = q_lens.index_select(0, all_group_indices)
+
+    qi = q.new_zeros((int(rows.numel()), q.size(1), max_q_len, q.size(3)))
+    request_indices: list[int] = []
+    request_q_lens: list[int] = []
+    cursor = 0
+    for q_len, _start, _group_indices, group_request_indices, offsets in groups:
+        for request_idx, offset in zip(group_request_indices, offsets):
+            qi[cursor : cursor + 1, :, :q_len, :].copy_(
+                q[:, :, offset : offset + q_len, :]
+            )
+            request_indices.append(int(request_idx))
+            request_q_lens.append(int(q_len))
+            cursor += 1
+
+    ki = cache_keys.index_select(0, rows)[:, :, :context, :]
+    vi = cache_values.index_select(0, rows)[:, :, :context, :]
+    key_positions = torch.arange(context, device=q.device)
+    written = key_positions[None, :] < (start + grouped_q_lens[:, None])
+    zero = torch.zeros((), dtype=ki.dtype, device=ki.device)
+    ki = torch.where(written[:, None, :, None], ki, zero)
+    vi = torch.where(written[:, None, :, None], vi, zero)
+
+    if causal_lower_right is not None:
+        out_group = F.scaled_dot_product_attention(
+            qi,
+            ki,
+            vi,
+            attn_mask=causal_lower_right(max_q_len, context),
+            dropout_p=0.0,
+            is_causal=False,
+            enable_gqa=enable_gqa,
+        )
+    else:
+        query_offsets = torch.arange(max_q_len, device=q.device)
+        safe_offsets = torch.minimum(query_offsets[None, :], grouped_q_lens[:, None] - 1)
+        query_positions = start + safe_offsets
+        mask = key_positions[None, None, :] <= query_positions[:, :, None]
+        out_group = F.scaled_dot_product_attention(
+            qi,
+            ki,
+            vi,
+            attn_mask=mask[:, None, :, :],
+            dropout_p=0.0,
+            is_causal=False,
+            enable_gqa=enable_gqa,
+        )
+    return [
+        (
+            request_idx,
+            out_group[group_pos : group_pos + 1, :, : request_q_lens[group_pos], :],
+        )
+        for group_pos, request_idx in enumerate(request_indices)
+    ]
+
+
 def _packed_prefill_scaled_dot_product_attention(
     q: Tensor,
     cache_keys: Tensor,
@@ -8960,39 +9110,41 @@ def _packed_prefill_scaled_dot_product_attention(
         causal_lower_right = _causal_lower_right
     except Exception as exc:
         warn_optional_failure("llama3_tensor_parallel.packed_causal_lower_right", exc)
-    for q_len, start, group_indices, request_indices, offsets in packed_attention_groups:
-        context = start + q_len
-        if context > cache_keys.size(2):
-            raise ValueError("KV cache capacity exceeded")
-        rows = row_indices.index_select(0, group_indices)
-        qi = torch.cat([q[:, :, offset : offset + q_len, :] for offset in offsets], dim=0)
-        ki = cache_keys.index_select(0, rows)[:, :, :context, :]
-        vi = cache_values.index_select(0, rows)[:, :, :context, :]
-        if causal_lower_right is not None:
-            out_group = F.scaled_dot_product_attention(
-                qi,
-                ki,
-                vi,
-                attn_mask=causal_lower_right(q_len, context),
-                dropout_p=0.0,
-                is_causal=False,
+    coalesce_same_start = _tp_flag(
+        "TORCHINFERNO_PACKED_PREFILL_COALESCE_SAME_START_ATTENTION",
+        True,
+    )
+    if coalesce_same_start:
+        start_groups = _packed_prefill_attention_groups_by_start(packed_attention_groups)
+        for start, groups in start_groups:
+            for request_idx, out in _packed_prefill_attention_same_start_group(
+                q,
+                cache_keys,
+                cache_values,
+                row_indices,
+                start=start,
+                groups=groups,
+                q_lens=q_lens,
+                causal_lower_right=causal_lower_right,
                 enable_gqa=enable_gqa,
-            )
-        else:
-            key_positions = torch.arange(context, device=q.device)
-            query_positions = start + torch.arange(q_len, device=q.device)
-            mask = key_positions[None, :] <= query_positions[:, None]
-            out_group = F.scaled_dot_product_attention(
-                qi,
-                ki,
-                vi,
-                attn_mask=mask[None, None, :, :],
-                dropout_p=0.0,
-                is_causal=False,
+            ):
+                outs[int(request_idx)] = out
+    else:
+        for q_len, start, group_indices, request_indices, offsets in packed_attention_groups:
+            for request_idx, out in _packed_prefill_attention_single_group(
+                q,
+                cache_keys,
+                cache_values,
+                row_indices,
+                q_len=q_len,
+                start=start,
+                group_indices=group_indices,
+                request_indices=request_indices,
+                offsets=offsets,
+                causal_lower_right=causal_lower_right,
                 enable_gqa=enable_gqa,
-            )
-        for group_pos, request_idx in enumerate(request_indices):
-            outs[int(request_idx)] = out_group[group_pos : group_pos + 1]
+            ):
+                outs[int(request_idx)] = out
     if any(out is None for out in outs):
         raise RuntimeError("packed prefill attention did not produce every request output")
     return torch.cat([out for out in outs if out is not None], dim=2)

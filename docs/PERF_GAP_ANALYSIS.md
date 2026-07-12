@@ -134,6 +134,22 @@ prefill-ready cap at the current default `6`; the next useful long_output work
 is still a cheaper packed cached-prefix suffix body and faster high-active
 decode-many replay, not a broader prefill/decode ordering toggle.
 
+The packed-prefill fragmentation analyzer added after `736e6b1` shows that the
+hot long_output packed candidates have one shared prefix start but many suffix
+length groups: for example `b24:s96:p111` has `62` attention groups over `8`
+candidate calls (`7.8` groups/call), and `b24:s64:p111` has `116` groups over
+`14` calls (`8.3` groups/call). A model-side packed-eager change now coalesces
+same-start attention groups before SDPA. It pads only the attention query block
+to the largest real suffix in that start group, zeros unwritten K/V columns for
+shorter rows, and still samples from freshly computed model logits. A synthetic
+H100 helper check for a long_output-like shape (`24` rows, start `111`, `936`
+real suffix tokens, `9` legacy length groups, bf16, GQA) measured the legacy
+per-length path at `5.95ms` and the coalesced path at `3.93ms`, with
+`max_diff=0.0039`. This is not a score-facing shortcut and does not change the
+default public serving path by itself because packed eager remains opt-in or
+pattern-gated; it reduces the cost of the fair packed suffix body we need to
+make defaultable later.
+
 ## Current 20260712 fixed-capacity packed prefill rejection
 
 A fresh long_output probe on `3f2aa90` with

@@ -2254,6 +2254,81 @@ def test_llama3_tensor_parallel_packed_ragged_prefill_graph_waits_for_reuse(
     assert capture_calls == [((2, 3), (0, 0)), ((1, 3), (0, 0))]
 
 
+def test_llama3_tensor_parallel_packed_prefill_groups_coalesce_same_start() -> None:
+    groups = tensor_parallel_module._build_packed_prefill_attention_groups(
+        (2, 4, 3, 1),
+        (5, 5, 7, 5),
+        (0, 2, 6, 9),
+        device=torch.device("cpu"),
+    )
+
+    start_groups = tensor_parallel_module._packed_prefill_attention_groups_by_start(groups)
+
+    assert [
+        (
+            start,
+            [group[0] for group in grouped],
+            [tuple(int(index) for index in group[2].tolist()) for group in grouped],
+            [group[3] for group in grouped],
+            [group[4] for group in grouped],
+        )
+        for start, grouped in start_groups
+    ] == [
+        (5, [2, 4, 1], [(0,), (1,), (3,)], [(0,), (1,), (3,)], [(0,), (2,), (9,)]),
+        (7, [3], [(2,)], [(2,)], [(6,)]),
+    ]
+
+
+def test_llama3_tensor_parallel_packed_prefill_attention_coalesced_matches_legacy(
+    monkeypatch,
+) -> None:
+    torch.manual_seed(9117)
+    q_lens = torch.tensor([2, 4, 1], dtype=torch.long)
+    request_offsets = tensor_parallel_module._packed_prefill_offsets_from_q_lens(
+        tuple(int(value) for value in q_lens.tolist())
+    )
+    groups = tensor_parallel_module._build_packed_prefill_attention_groups(
+        tuple(int(value) for value in q_lens.tolist()),
+        (3, 3, 3),
+        request_offsets,
+        device=torch.device("cpu"),
+    )
+    q = torch.randn(1, 2, int(q_lens.sum().item()), 4)
+    cache_keys = torch.randn(3, 2, 8, 4)
+    cache_values = torch.randn(3, 2, 8, 4)
+    start_positions = torch.tensor([3, 3, 3], dtype=torch.long)
+    row_indices = torch.tensor([0, 1, 2], dtype=torch.long)
+    request_offsets_t = torch.tensor(request_offsets, dtype=torch.long)
+
+    monkeypatch.setenv("TORCHINFERNO_PACKED_PREFILL_COALESCE_SAME_START_ATTENTION", "0")
+    reference = tensor_parallel_module._packed_prefill_scaled_dot_product_attention(
+        q,
+        cache_keys,
+        cache_values,
+        start_positions,
+        q_lens=q_lens,
+        row_indices=row_indices,
+        request_offsets=request_offsets_t,
+        packed_attention_groups=groups,
+        enable_gqa=False,
+    )
+
+    monkeypatch.setenv("TORCHINFERNO_PACKED_PREFILL_COALESCE_SAME_START_ATTENTION", "1")
+    coalesced = tensor_parallel_module._packed_prefill_scaled_dot_product_attention(
+        q,
+        cache_keys,
+        cache_values,
+        start_positions,
+        q_lens=q_lens,
+        row_indices=row_indices,
+        request_offsets=request_offsets_t,
+        packed_attention_groups=groups,
+        enable_gqa=False,
+    )
+
+    torch.testing.assert_close(coalesced, reference)
+
+
 def test_llama3_tensor_parallel_packed_ragged_prefill_matches_padded_oracle(tmp_path, monkeypatch) -> None:
     torch.manual_seed(9104)
     config = tiny_llama3_config(vocab_size=32, max_position_embeddings=32)
