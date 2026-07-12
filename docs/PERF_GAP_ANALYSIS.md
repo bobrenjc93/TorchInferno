@@ -21,6 +21,21 @@ saved tokens, hot prefill `b24:s64:p111-111:src1:mixed0`, and hot decode
 the next non-gaming work on real decode-body and cached-prefix suffix-prefill
 costs rather than prompt/logits reuse.
 
+A local TorchInferno-only long_output probe on current `831eb65` forced
+fixed-capacity packed prefill with the new shape counters:
+`/tmp/inference-bench-long-fixedcap-shapes-831-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-long-fixedcap-shapes-831eb65/runs/20260712_075855`.
+It stayed correct (`1000/1000`) and cache-integrity clean, but regressed to
+`214.5 / 22.0 / 957.5ms`, `35.2 tok/s`. Fixed capacity attempted `70` shapes
+and accepted only `1`; the hot public target
+`prefix_graph:b24:s64:p111-111:src1:mixed0` rejected `16/16` times
+(`capacity_grew=15,warming=1`) while carrying `8450` candidate-saved tokens.
+The only accepted shape, `b8:s96`, saved `177` dense tokens with zero residual
+padding but spent `1118.1ms` in packed eager work. The analyzer now joins
+per-shape packed eager timing into
+`[torchinferno packed prefill fixed-capacity shape runtime]`, which makes this
+rejection visible: current fixed capacity is not the long_output answer. The
+target remains a real dynamic packed body or varlen prefill kernel.
+
 ## Current 20260712 packed graph-fit triage
 
 The earlier public run `20260712_050229` re-rendered with the new

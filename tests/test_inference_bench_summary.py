@@ -1303,6 +1303,7 @@ def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) ->
     assert "capacity_grew=3" in text
     assert "25.0%" in text
     assert "resid_pad" in text
+    assert "packed_ms" in text
     assert "prefix_reuse" in text
     assert "prefix_reuse_tok" in text
     assert "prefix_routes" in text
@@ -2410,6 +2411,9 @@ def test_prefill_fixed_capacity_shape_runtime_rows_show_shape_rejects() -> None:
             "runtime_prefill_packed_fixed_capacity_shape_padding_tokens": {
                 shape: 272,
             },
+            "runtime_prefill_packed_eager_shape_ms": {
+                shape: 12.5,
+            },
             "runtime_prefill_packed_candidate_shape_saved_tokens": {
                 shape: 11175,
             },
@@ -2431,6 +2435,7 @@ def test_prefill_fixed_capacity_shape_runtime_rows_show_shape_rejects() -> None:
             "2800",
             "1024",
             "272",
+            "12.5",
             "11175",
         )
     ]

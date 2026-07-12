@@ -1530,6 +1530,7 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
                         "real_tokens",
                         "dense_saved",
                         "resid_pad",
+                        "packed_ms",
                         "candidate_saved",
                     ),
                     packed_fixed_capacity_shape_rows,
@@ -5765,6 +5766,9 @@ def _prefill_packed_fixed_capacity_shape_runtime_rows(
         padding_by_shape = _numeric_mapping(
             fields.get("runtime_prefill_packed_fixed_capacity_shape_padding_tokens")
         )
+        packed_ms_by_shape = _numeric_mapping(
+            fields.get("runtime_prefill_packed_eager_shape_ms")
+        )
         candidate_saved_by_shape = _numeric_mapping(
             fields.get("runtime_prefill_packed_candidate_shape_saved_tokens")
         )
@@ -5800,6 +5804,7 @@ def _prefill_packed_fixed_capacity_shape_runtime_rows(
                 _fmt_value(_int_if_whole(real_tokens_by_shape.get(shape, 0.0))),
                 _fmt_value(_int_if_whole(dense_saved_by_shape.get(shape, 0.0))),
                 _fmt_value(_int_if_whole(padding_by_shape.get(shape, 0.0))),
+                _fmt_value(packed_ms_by_shape.get(shape, 0.0)),
                 _fmt_value(_int_if_whole(candidate_saved)),
             )
             items.append((candidate_saved, attempts, shape, row))
