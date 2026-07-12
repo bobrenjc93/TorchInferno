@@ -1442,7 +1442,7 @@ class ContinuousBatchEngine:
         max_steps: int,
         *,
         profile_source: str | None,
-    ) -> tuple[Tensor, int, str | None, float] | None:
+    ) -> tuple[Tensor, int, str | None, float, int] | None:
         step_count = self._decode_many_graph_step_count(states, max_steps)
         if step_count <= 0:
             return None
@@ -1453,11 +1453,7 @@ class ContinuousBatchEngine:
         n_active = len(states)
         decode_rows = self._ragged_decode_bucket_rows(rows)
         n_padded = len(decode_rows)
-        dense_row_set, dense_row_ordered = (
-            self._dense_prefix_row_info(decode_rows)
-            if n_active == n_padded
-            else (False, False)
-        )
+        dense_row_set, dense_row_ordered = self._dense_prefix_row_info(decode_rows)
         contiguous_row_set = dense_row_set
         state_order_indices: Tensor | None = None
         if contiguous_row_set:
@@ -1517,15 +1513,28 @@ class ContinuousBatchEngine:
         if token_matrix.ndim != 2 or token_matrix.shape != (step_count, n_padded):
             return None
         token_matrix = token_matrix.to(self.device)
-        last_tokens = token_matrix[step_count - 1, :n_active]
         if row_indices is None:
-            self._ensure_gpu_token_buf()[:n_active].copy_(last_tokens)
-            seq_lens_buf = getattr(self, "_gpu_seq_lens", None)
-            if seq_lens_buf is not None:
-                seq_lens_buf[:n_active].add_(step_count)
             if state_order_indices is not None:
+                active_row_indices = state_order_indices.to(dtype=torch.long)
+                last_tokens = token_matrix[step_count - 1].index_select(
+                    0,
+                    active_row_indices,
+                )
+                self._ensure_gpu_token_buf().index_copy_(
+                    0,
+                    active_row_indices,
+                    last_tokens,
+                )
+                self._advance_gpu_seq_lens(active_row_indices, amount=step_count)
                 token_matrix = token_matrix.index_select(1, state_order_indices)
+            else:
+                last_tokens = token_matrix[step_count - 1, :n_active]
+                self._ensure_gpu_token_buf()[:n_active].copy_(last_tokens)
+                seq_lens_buf = getattr(self, "_gpu_seq_lens", None)
+                if seq_lens_buf is not None:
+                    seq_lens_buf[:n_active].add_(step_count)
         else:
+            last_tokens = token_matrix[step_count - 1, :n_active]
             active_row_indices = row_indices[:n_active]
             self._ensure_gpu_token_buf().index_copy_(0, active_row_indices, last_tokens)
             self._advance_gpu_seq_lens(active_row_indices, amount=step_count)
@@ -1565,7 +1574,7 @@ class ContinuousBatchEngine:
                     shape_key,
                     model_elapsed_ms,
                 )
-        return token_matrix, step_count, shape_key, model_elapsed_ms
+        return token_matrix, step_count, shape_key, model_elapsed_ms, n_padded
 
     def _step_decode_only_many(self, max_steps: int) -> tuple[list[ServingTokenEvent], int]:
         active = list(self._online_active)
@@ -1615,7 +1624,10 @@ class ContinuousBatchEngine:
                     if self.profile_timings and record_sync_model_timing
                     else 0.0
                 )
-                next_token_tensor = self._decode_ragged_batch_token_tensor(
+                (
+                    next_token_tensor,
+                    graph_shape_model_tokens,
+                ) = self._decode_ragged_batch_token_tensor(
                     states,
                     profile_source="decode_many",
                 )
@@ -1627,12 +1639,16 @@ class ContinuousBatchEngine:
                     else 0.0
                 )
                 graph_shape_key: str | None = None
-                graph_shape_model_tokens = int(next_token_tensor.numel())
                 record_model_call_for_steps = False
                 record_model_timing_for_steps = record_sync_model_timing
             else:
-                token_matrix, graph_steps, graph_shape_key, graph_model_elapsed_ms = many_graph
-                graph_shape_model_tokens = int(token_matrix.size(1))
+                (
+                    token_matrix,
+                    graph_steps,
+                    graph_shape_key,
+                    graph_model_elapsed_ms,
+                    graph_shape_model_tokens,
+                ) = many_graph
                 record_model_call_for_steps = True
                 record_model_timing_for_steps = True
 
@@ -1962,12 +1978,13 @@ class ContinuousBatchEngine:
                 if self.profile_timings and record_sync_model_timing
                 else 0.0
             )
-            next_token_tensor = self._decode_ragged_batch_token_tensor(
-                states,
-                profile_source="decode_many",
+            next_token_tensor, shape_model_tokens = (
+                self._decode_ragged_batch_token_tensor(
+                    states,
+                    profile_source="decode_many",
+                )
             )
             active_tokens = len(states)
-            shape_model_tokens = int(next_token_tensor.numel())
             shape_key: str | None = None
             step_window_key: str | None = None
             model_elapsed_ms = 0.0
@@ -6896,12 +6913,20 @@ class ContinuousBatchEngine:
         if n_active <= 0:
             return next_token_tensor
         if row_indices is None:
+            if state_order_indices is not None:
+                active_row_indices = state_order_indices.to(dtype=torch.long)
+                active_tokens = next_token_tensor.index_select(0, active_row_indices)
+                self._ensure_gpu_token_buf().index_copy_(
+                    0,
+                    active_row_indices,
+                    active_tokens,
+                )
+                self._advance_gpu_seq_lens(active_row_indices)
+                return active_tokens
             self._ensure_gpu_token_buf()[:n_active].copy_(next_token_tensor[:n_active])
             seq_lens_buf = getattr(self, "_gpu_seq_lens", None)
             if seq_lens_buf is not None:
                 seq_lens_buf[:n_active].add_(1)
-            if state_order_indices is not None:
-                return next_token_tensor.index_select(0, state_order_indices)
             return next_token_tensor
         active_row_indices = row_indices[:n_active].to(dtype=torch.long)
         self._ensure_gpu_token_buf().index_copy_(
@@ -7424,7 +7449,7 @@ class ContinuousBatchEngine:
         # token/logit outputs are reordered back to active-state order below.
         dense_row_set, dense_row_ordered = (
             self._dense_prefix_row_info(decode_rows)
-            if shared_temperature is not None and n_active == n_padded
+            if shared_temperature is not None
             else (False, False)
         )
         contiguous_row_set = dense_row_set
@@ -7688,7 +7713,7 @@ class ContinuousBatchEngine:
         states: list[_ActiveRequest],
         *,
         profile_source: str | None = None,
-    ) -> Tensor:
+    ) -> tuple[Tensor, int]:
         prepare_start_s = time.perf_counter() if self.profile_timings else 0.0
         record_sync_model_timing = (
             profile_source != "decode_many"
@@ -7710,7 +7735,7 @@ class ContinuousBatchEngine:
         # token outputs are reordered back to active-state order below.
         dense_row_set, dense_row_ordered = (
             self._dense_prefix_row_info(decode_rows)
-            if shared_temperature is not None and n_active == n_padded
+            if shared_temperature is not None
             else (False, False)
         )
         contiguous_row_set = dense_row_set
@@ -7798,7 +7823,7 @@ class ContinuousBatchEngine:
                     shape_key,
                     model_elapsed_ms,
                 )
-        return next_token_tensor
+        return next_token_tensor, n_padded
 
     def _apply_decoded_tokens(
         self,

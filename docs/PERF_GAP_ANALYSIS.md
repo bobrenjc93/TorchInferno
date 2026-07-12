@@ -38,6 +38,20 @@ do not promote prefill symm-mem graph capture, singleton suffix splits, or eager
 packed prefill. The useful work is still a graphable non-fragmenting packed
 cached-prefix suffix body, plus a cheaper high-active decode replay body.
 
+A follow-up dirty-head long_output run after padded dense-prefix decode started
+using the contiguous no-row-indices path wrote
+`/tmp/inference-bench-long-dense-decode-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-long-dense-decode-368c7b1-dirty/runs/20260712_091406`.
+It stayed correct (`1000/1000`) and cache-integrity clean: generated-prefix
+store/reuse/tokens, prompt lookup accepted tokens, reusable-prefix logits, and
+repeated-sample hits were all zero. The profiler-perturbed score was
+`216.8 / 21.7 / 944.4ms`, `36.2 tok/s`; queue telemetry reported `65` prefill
+graph replays, `4.71s` prefill replay GPU, `25.9K` packed-prefill candidate
+saved tokens, and `114` decode-many calls with `6.61s` decode GPU
+(`27.0K` active model tokens, `30.6K` padded tokens). This is a safe
+source-level simplification for padded decode graph replay, but it does not
+change the priority order: the larger gap remains cached-prefix suffix-prefill
+padding and the high-active decode body itself, not prompt/logits reuse.
+
 A local TorchInferno-only long_output probe on current `831eb65` forced
 fixed-capacity packed prefill with the new shape counters:
 `/tmp/inference-bench-long-fixedcap-shapes-831-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-long-fixedcap-shapes-831eb65/runs/20260712_075855`.
