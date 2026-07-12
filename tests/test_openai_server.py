@@ -10052,6 +10052,20 @@ def test_openai_prefill_graph_runtime_key_scope_disables_prefill_symm(monkeypatc
     assert captured == [(128, True)]
     assert prefill_captured == [False]
 
+    captured.clear()
+    prefill_captured.clear()
+    monkeypatch.setenv("TORCHINFERNO_SYMM_MEM_PREFILL_GRAPH_ALLREDUCE", "1")
+
+    with _tensor_parallel_prefill_graph_runtime_key_scope(
+        model,
+        torch.device("cuda"),
+        max_tokens=512,
+    ):
+        pass
+
+    assert captured == [(128, True)]
+    assert prefill_captured == [True]
+
 
 def test_openai_symm_mem_scope_enables_sampled_and_disables_long_generations(monkeypatch) -> None:
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE", "1")

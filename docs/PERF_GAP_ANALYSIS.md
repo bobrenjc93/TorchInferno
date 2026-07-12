@@ -75,6 +75,22 @@ capture/replay slice, that a ready-buffer prefill graph actually records
 `multimem_all_reduce` and reduces the collective slice without increasing graph
 capture or memory pressure.
 
+A current-head b297 local recheck confirms that this is still not a defaultable
+lever. The default long_output profiler probe at
+`/tmp/inference-bench-ti-long-prof-b297-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-long-prof-b297/runs/20260712_053749`
+stayed `1000/1000` correct and integrity-clean, with `5663.8ms` prefill graph
+replay GPU, `6780.8ms` decode-many GPU, and zero prompt/logits cache counters.
+The hot prefill profiler row was still NCCL-dominated. An opt-in server recheck
+with `TORCHINFERNO_SYMM_MEM_PREFILL_GRAPH_ALLREDUCE=1` wrote
+`/tmp/inference-bench-ti-long-prefill-symmgraph-b297-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-long-prefill-symmgraph-b297/runs/20260712_054448`
+and also stayed correct/integrity-clean, but did not capture the desired
+backend: the prefill profiler still reported
+`ncclDevKernel_AllReduce_Sum_bf16_RING_LL` at `24.555ms` across `160` calls and
+no `multimem_all_reduce`. The queue profile also moved the wrong way
+(`phase_total_ms 17617.3 -> 18525.4`, `prefill_graph_replay_gpu_ms 5663.8 ->
+6327.7`), so keep prefill symm-mem graph capture off by default; the opt-in is
+only a diagnostic gate for future controlled capture experiments.
+
 ## Current 20260712 greedy-short suffix split recheck
 
 After the exact-prompt logits-cache reset, current-head long_output on

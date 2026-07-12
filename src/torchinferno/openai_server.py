@@ -14397,7 +14397,10 @@ def _tensor_parallel_prefill_graph_runtime_key_scope(
     ):
         return nullcontext()
     # Match runtime graph keys without enabling prefill symm-mem rendezvous during
-    # startup graph capture; the captured graph still uses regular NCCL allreduce.
+    # startup graph capture by default; the captured graph still uses regular
+    # NCCL allreduce. The opt-in exists only for focused profiling: it lets a
+    # run prove whether prepared prefill symm-mem buffers actually capture as
+    # multimem_all_reduce before any default policy changes.
     max_tokens_limit = env_int("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_MAX_TOKENS", 1024, minimum=1)
     if max_tokens > max_tokens_limit or not _openai_tp_symm_mem_allreduce_enabled(startup=False):
         return _tensor_parallel_symm_mem_allreduce_context(
@@ -14406,10 +14409,18 @@ def _tensor_parallel_prefill_graph_runtime_key_scope(
             prefill_enabled=False,
         )
     max_batch = env_int("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_MAX_BATCH", 128, minimum=1)
+    prefill_enabled = (
+        env_flag("TORCHINFERNO_SYMM_MEM_PREFILL_GRAPH_ALLREDUCE", False)
+        and _openai_tp_symm_mem_prefill_allreduce_enabled(
+            max_tokens=max_tokens,
+            temperature=0.0,
+            startup=False,
+        )
+    )
     return _tensor_parallel_symm_mem_allreduce_context(
         max_batch,
         enabled=True,
-        prefill_enabled=False,
+        prefill_enabled=prefill_enabled,
     )
 
 
