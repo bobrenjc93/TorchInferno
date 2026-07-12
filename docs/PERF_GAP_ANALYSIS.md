@@ -95,6 +95,41 @@ This recovers part of the fair post-reset regression; it does not close the
 remaining long_output gap, which is still the high-active decode-many body plus
 the larger non-fragmenting cached-prefix prefill body.
 
+## Current 20260712 sampled-short self rechecks
+
+After the no-logits reset, a full local TorchInferno-only run at pushed
+`7e3d6f9` reported self_consistency at `132.8 / 0.0 / 153.2ms`,
+`6.5 tok/s`, `1000/1000` correct. A same-head standalone default control later
+wrote
+`/tmp/inference-bench-ti-self-default-7e3d6f9-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-self-default-7e3d6f9/runs/20260712_052206`
+and landed at `91.2 / 0.0 / 113.7ms`, `8.8 tok/s`, `1000/1000` correct.
+This row stayed integrity-clean: generated-prefix store/reuse, prompt lookup,
+reusable-prefix logits, and repeated-sample hits were all zero. The faster
+standalone run had `27` prefill and decode model calls versus `31` in the full
+suite row, so the observed difference is batch formation/run variance rather
+than a new cache or decode shortcut.
+
+Two sampled-short probes should not be promoted. First,
+`TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_KV_MAX_ACTIVE_CAP=128` with 128-row
+decode/prefill graph caps wrote
+`/tmp/inference-bench-ti-self-b128-7e3d6f9-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-self-b128-7e3d6f9/runs/20260712_051151`
+and regressed to `153.3 / 0.0 / 170.7ms`, `5.9 tok/s`, even though correctness
+and integrity stayed clean. The runtime reached only `max_active=105`, reduced
+prefix rows to `39`, and still ran about the same number of real prefill/decode
+waves (`30`), so larger sampled active caps are not a fair default win.
+
+Second, sampled decode-many was tested because it looked like a possible way to
+reduce one-token sampled round trips without caching logits. The plain opt-in
+run
+`/tmp/inference-bench-ti-self-sampled-decodemany-7e3d6f9-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-self-sampled-decodemany-7e3d6f9/runs/20260712_051706`
+scored `84.3 / 0.0 / 110.0ms`, but the queue counters showed
+`runtime_decode_many_calls=0`; this was not actually a decode-many win. Allowing
+decode-many while requests were waiting wrote
+`/tmp/inference-bench-ti-self-sampled-decodemany-waiting-7e3d6f9-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-self-sampled-decodemany-waiting-7e3d6f9/runs/20260712_052702`
+and regressed to `94.9 / 0.0 / 118.2ms`, also with
+`runtime_decode_many_calls=0`. Keep sampled decode-many opt-in until there is a
+runtime path that actually exercises it and beats the default control.
+
 ## Current 20260711 logits-cache integrity reset
 
 Exact-prompt logits reuse is not a valid benchmark optimization. Reusing a
