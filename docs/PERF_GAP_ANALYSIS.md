@@ -68,6 +68,36 @@ now multi_turn (`191.1 / 36.0 / 221.6ms`, `5.1 tok/s` versus vLLM
 found zero TorchInferno logits-cache warnings on this run, and all generated
 prefix, prompt lookup, and repeated-sample-state counters were zero.
 
+The latest public refresh,
+`results/.../runs/20260711_230213`, built TorchInferno at `312e29e` and keeps
+the post-reset picture unchanged. TorchInferno is close on self_consistency
+(`72.9 / 0.0 / 91.5ms`, `10.9 tok/s` versus vLLM `69.8 / 0.0 / 87.7ms`,
+`11.4 tok/s`) with all shortcut counters clean. The largest fair rows are still
+long_output (`183.0 / 19.2 / 879.1ms`, `41.3 tok/s` versus vLLM
+`49.9 / 15.2 / 581.2ms`, `61.3 tok/s`) and multi_turn
+(`193.5 / 36.0 / 222.6ms`, `5.0 tok/s` versus vLLM `94.8 / 58.6 / 133.2ms`,
+`10.1 tok/s`). The long_output queue profile attributes the TorchInferno gap
+to normal runtime work: `4.07s` prefill graph GPU with `32.7K` padded suffix
+tokens, plus `6.69s` decode-many GPU. Generated-prefix store/reuse, prompt
+lookup, repeated-sample-state hits, and reusable-prefix logits all remain zero.
+
+A same-host long_output comparison on pushed `83fd986` wrote
+`/tmp/inference-bench-long-ti-vllm-83fd986-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-long-ti-vllm-83fd986/runs/20260712_004813`.
+TorchInferno stayed correct at `1000/1000` and landed at
+`230.4 / 22.0 / 1054.0ms`, `34.9 tok/s`; vLLM landed at
+`50.0 / 16.9 / 644.4ms`, `55.1 tok/s`. Cache integrity stayed clean: generated
+prefix store/reuse, prompt lookup, reusable-prefix logits, and repeated sample
+hits were all zero. The dominant TorchInferno counters were `4.95s` prefill
+graph GPU with `29.1K` padded suffix tokens and `6.77s` decode-many GPU. The
+hot first-token prefill shapes are the ordinary shared-prefix `p111` waves
+(`b24:s64`, `b16:s96`, `b16:s64`, `b24:s96`), and the hot decode window is
+`decode_many:b64/64:g1-16` at `2.78s` for `13.9K` model tokens. Candidate
+accounting estimates that a real non-fragmenting packed suffix body could save
+about `603ms` on `b24:s64` alone, but exact pattern/signature reuse remained
+low (`6.8%`/`3.4%` repeat calls). This keeps fixed-capacity/exact-pattern packed
+graphs rejected and narrows the fair implementation target to a dynamic packed
+cached-prefix suffix body plus lower high-active decode replay cost.
+
 ## Current 20260712 fixed-capacity packed prefill rejection
 
 A fresh long_output probe on `3f2aa90` with
