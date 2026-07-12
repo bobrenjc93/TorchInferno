@@ -1732,6 +1732,58 @@ def test_dynamic_packed_prefill_targets_estimate_older_runs_from_total_replay() 
     ]
 
 
+def test_dynamic_packed_prefill_targets_infer_saved_sources_from_signatures() -> None:
+    shape = "prefix_graph:b4:s8:p10-10:src1:mixed0"
+    pattern = f"{shape}|p10:s6/p10:s8"
+    signature = f"{shape}|p10:s6:n2/p10:s8:n1"
+    rows = _prefill_packed_dynamic_target_rows(
+        [
+            QueueProfileSummary(
+                event="online_batcher_quiescent",
+                temperature=0.0,
+                max_tokens=512,
+                submitted_requests=8,
+                finished_events=8,
+                fields={
+                    "runtime_prefill_forward_ms": 0.0,
+                    "runtime_prefill_graph_replay_gpu_ms": 40.0,
+                    "runtime_prefill_shape_graph_replay_gpu_ms": {shape: 32.0},
+                    "runtime_prefill_shape_model_tokens": {shape: 64},
+                    "runtime_prefill_packed_candidate_pattern_counts": {pattern: 2},
+                    "runtime_prefill_packed_candidate_pattern_model_tokens": {pattern: 64},
+                    "runtime_prefill_packed_candidate_pattern_saved_tokens": {pattern: 24},
+                    "runtime_prefill_packed_candidate_signature_counts": {signature: 2},
+                    "runtime_prefill_packed_candidate_signature_model_tokens": {
+                        signature: 64,
+                    },
+                    "runtime_prefill_packed_candidate_signature_saved_tokens": {
+                        signature: 24,
+                    },
+                },
+            )
+        ]
+    )
+
+    assert rows == [
+        (
+            "0.0",
+            "512",
+            pattern,
+            "2",
+            "24",
+            "16",
+            "8",
+            "24",
+            "100.0%",
+            "12",
+            "8",
+            "4",
+            "30.0%",
+            "-",
+        )
+    ]
+
+
 def test_inference_bench_summary_derives_decode_graph_symm_counts_from_shapes() -> None:
     assert _decode_graph_symm_counts(
         {

@@ -15330,6 +15330,21 @@ latest public `20260711_230213` long_output row, the phase estimate is
 prefill target focused on a non-fragmenting cached-prefix suffix body rather
 than another row-packing or stop-tail policy change.
 
+The analyzer now backfills packed-prefill row/suffix saved-token splits for
+older queue profiles that have signature saved-token maps but not the newer
+explicit split maps. It derives the split from the packed signature shape,
+active suffix-row counts, and model-token totals; it does not inspect prompt
+text, token ids, logits, fixture names, or benchmark positions. Re-rendering
+the latest public `20260711_230213` artifact now shows the older dynamic-count
+targets as mostly suffix-padding work: the few_shot `b32:s16:p122-122`
+pattern saves `3131` tokens, all suffix; the long_output `b24:s64:p111-111`
+dynamic row saves `1416` tokens, all suffix; and the hottest long_output
+signature saves `1720` tokens split as only `96` row tokens versus `1624`
+suffix tokens. The same render keeps the sampled tree rows mixed
+(`b4:s12:p45-45` saves `360` row and `141` suffix tokens), so row packing is
+still useful for small sampled waves, but the large fair prefill gap remains a
+cached-prefix suffix-body problem.
+
 ## Priority for a focused (non-loop) session
 
 1. Prefill MFU (Issue 1) — biggest TTFT lever, ~2x, affects 3/5 benchmarks.

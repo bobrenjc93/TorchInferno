@@ -4108,6 +4108,21 @@ def _hot_prefill_packed_signature_rows(
         )
         if signature is None:
             continue
+        row_saved = _mapping_value(
+            fields.get("runtime_prefill_packed_candidate_signature_row_saved_tokens"),
+            signature,
+        )
+        suffix_saved = _mapping_value(
+            fields.get("runtime_prefill_packed_candidate_signature_suffix_saved_tokens"),
+            signature,
+        )
+        if row_saved is None and suffix_saved is None:
+            inferred_split = _infer_packed_prefill_signature_saved_split(
+                fields,
+                signature,
+            )
+            if inferred_split is not None:
+                _pattern, row_saved, suffix_saved = inferred_split
         rows.append(
             (
                 _fmt_value(profile.temperature),
@@ -4132,21 +4147,9 @@ def _hot_prefill_packed_signature_rows(
                     )
                 ),
                 _fmt_value(saved_tokens),
+                _fmt_value(None if row_saved is None else _int_if_whole(row_saved)),
                 _fmt_value(
-                    _mapping_value(
-                        fields.get(
-                            "runtime_prefill_packed_candidate_signature_row_saved_tokens"
-                        ),
-                        signature,
-                    )
-                ),
-                _fmt_value(
-                    _mapping_value(
-                        fields.get(
-                            "runtime_prefill_packed_candidate_signature_suffix_saved_tokens"
-                        ),
-                        signature,
-                    )
+                    None if suffix_saved is None else _int_if_whole(suffix_saved)
                 ),
                 _fmt_value(
                     _mapping_value(
@@ -4171,10 +4174,25 @@ def _hot_prefill_packed_pattern_rows(
             if isinstance(total_saved_raw, (int, float))
             else 0.0
         )
+        inferred_splits = _infer_packed_prefill_pattern_saved_splits(fields)
         for pattern, saved_tokens in _top_mapping_entries(
             fields.get("runtime_prefill_packed_candidate_pattern_saved_tokens"),
             limit=3,
         ):
+            row_saved = _mapping_value(
+                fields.get("runtime_prefill_packed_candidate_pattern_row_saved_tokens"),
+                pattern,
+            )
+            suffix_saved = _mapping_value(
+                fields.get(
+                    "runtime_prefill_packed_candidate_pattern_suffix_saved_tokens"
+                ),
+                pattern,
+            )
+            if row_saved is None and suffix_saved is None:
+                inferred_split = inferred_splits.get(pattern)
+                if inferred_split is not None:
+                    row_saved, suffix_saved = inferred_split
             rows.append(
                 (
                     _fmt_value(profile.temperature),
@@ -4199,21 +4217,9 @@ def _hot_prefill_packed_pattern_rows(
                         )
                     ),
                     _fmt_value(saved_tokens),
+                    _fmt_value(None if row_saved is None else _int_if_whole(row_saved)),
                     _fmt_value(
-                        _mapping_value(
-                            fields.get(
-                                "runtime_prefill_packed_candidate_pattern_row_saved_tokens"
-                            ),
-                            pattern,
-                        )
-                    ),
-                    _fmt_value(
-                        _mapping_value(
-                            fields.get(
-                                "runtime_prefill_packed_candidate_pattern_suffix_saved_tokens"
-                            ),
-                            pattern,
-                        )
+                        None if suffix_saved is None else _int_if_whole(suffix_saved)
                     ),
                     _fmt_pct(float(saved_tokens), total_saved),
                     _fmt_value(
@@ -4802,6 +4808,102 @@ def _prefill_packed_fixed_capacity_saved_tokens(
     return max(0.0, dense_tokens - fixed_tokens)
 
 
+def _packed_prefill_signature_call_count(
+    fields: dict[str, Any],
+    signature: str,
+    pattern: str,
+    group_counts: Mapping[tuple[int, int], int],
+    saved_tokens: float,
+) -> float | None:
+    explicit_calls = _mapping_value(
+        fields.get("runtime_prefill_packed_candidate_signature_counts"),
+        signature,
+    )
+    if explicit_calls is not None and float(explicit_calls) > 0.0:
+        return float(explicit_calls)
+
+    dense_per_call = _packed_prefill_dense_tokens_per_call(pattern)
+    model_tokens = _mapping_value(
+        fields.get("runtime_prefill_packed_candidate_signature_model_tokens"),
+        signature,
+    )
+    if (
+        dense_per_call is not None
+        and dense_per_call > 0
+        and model_tokens is not None
+        and float(model_tokens) > 0.0
+    ):
+        return float(model_tokens) / float(dense_per_call)
+
+    real_per_call = sum(
+        max(0, int(count)) * max(0, int(suffix_len))
+        for (_start_len, suffix_len), count in group_counts.items()
+    )
+    real_tokens = _mapping_value(
+        fields.get("runtime_prefill_packed_candidate_signature_tokens"),
+        signature,
+    )
+    if real_per_call > 0 and real_tokens is not None and float(real_tokens) > 0.0:
+        return float(real_tokens) / float(real_per_call)
+
+    if dense_per_call is None or dense_per_call <= 0:
+        return None
+    saved_per_call = max(0.0, float(dense_per_call - real_per_call))
+    if saved_per_call <= 0.0 or saved_tokens <= 0.0:
+        return None
+    return saved_tokens / saved_per_call
+
+
+def _infer_packed_prefill_signature_saved_split(
+    fields: dict[str, Any],
+    signature: str,
+) -> tuple[str, float, float] | None:
+    parsed = _parse_packed_prefill_signature_key(signature)
+    if parsed is None:
+        return None
+    pattern, group_counts = parsed
+    saved_tokens = _mapping_value(
+        fields.get("runtime_prefill_packed_candidate_signature_saved_tokens"),
+        signature,
+    )
+    if saved_tokens is None or float(saved_tokens) <= 0.0:
+        return None
+    shape = _packed_prefill_shape_batch_suffix(pattern)
+    if shape is None:
+        return None
+    batch, suffix_bucket = shape
+    active_rows = sum(max(0, int(count)) for count in group_counts.values())
+    row_saved_per_call = max(0, batch - active_rows) * suffix_bucket
+    calls = _packed_prefill_signature_call_count(
+        fields,
+        signature,
+        pattern,
+        group_counts,
+        float(saved_tokens),
+    )
+    if calls is None or calls <= 0.0:
+        return None
+    row_saved = min(float(saved_tokens), max(0.0, float(row_saved_per_call) * calls))
+    suffix_saved = max(0.0, float(saved_tokens) - row_saved)
+    return pattern, row_saved, suffix_saved
+
+
+def _infer_packed_prefill_pattern_saved_splits(
+    fields: dict[str, Any],
+) -> dict[str, tuple[float, float]]:
+    splits: dict[str, tuple[float, float]] = {}
+    for signature in _numeric_mapping(
+        fields.get("runtime_prefill_packed_candidate_signature_saved_tokens")
+    ):
+        inferred = _infer_packed_prefill_signature_saved_split(fields, signature)
+        if inferred is None:
+            continue
+        pattern, row_saved, suffix_saved = inferred
+        prior_row, prior_suffix = splits.get(pattern, (0.0, 0.0))
+        splits[pattern] = (prior_row + row_saved, prior_suffix + suffix_saved)
+    return splits
+
+
 def _prefill_packed_dynamic_target_rows(
     profiles: Sequence[QueueProfileSummary],
     *,
@@ -4824,6 +4926,7 @@ def _prefill_packed_dynamic_target_rows(
         )
         if not pattern_calls or not pattern_saved:
             continue
+        inferred_splits = _infer_packed_prefill_pattern_saved_splits(fields)
         pattern_max_slots, _runtime_slot_patterns, _pattern_signature_calls = (
             _prefill_packed_pattern_slot_summary(fields, pattern_calls)
         )
@@ -4858,6 +4961,10 @@ def _prefill_packed_dynamic_target_rows(
                 if pattern in pattern_suffix_saved
                 else None
             )
+            if row_saved is None and suffix_saved is None:
+                inferred_split = inferred_splits.get(pattern)
+                if inferred_split is not None:
+                    row_saved, suffix_saved = inferred_split
             row_saved_ms = _proportional_token_ms(
                 est_saved_ms,
                 row_saved,
@@ -5074,7 +5181,7 @@ def _parse_packed_prefill_pattern_slot_key(
     return pattern, (max(0, start_len), max(0, suffix_len))
 
 
-def _packed_prefill_dense_tokens_per_call(pattern: str) -> int | None:
+def _packed_prefill_shape_batch_suffix(pattern: str) -> tuple[int, int] | None:
     shape_key = pattern.split("|", 1)[0]
     batch: int | None = None
     suffix_bucket: int | None = None
@@ -5087,6 +5194,14 @@ def _packed_prefill_dense_tokens_per_call(pattern: str) -> int | None:
             suffix_bucket = int(part[1:])
     if batch is None or suffix_bucket is None:
         return None
+    return batch, suffix_bucket
+
+
+def _packed_prefill_dense_tokens_per_call(pattern: str) -> int | None:
+    shape = _packed_prefill_shape_batch_suffix(pattern)
+    if shape is None:
+        return None
+    batch, suffix_bucket = shape
     return batch * suffix_bucket
 
 
