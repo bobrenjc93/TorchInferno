@@ -150,23 +150,26 @@ default public serving path by itself because packed eager remains opt-in or
 pattern-gated; it reduces the cost of the fair packed suffix body we need to
 make defaultable later.
 
-An end-to-end long_output probe on `a434acd` forced broad packed eager with
-`TORCHINFERNO_CONTINUOUS_PACKED_RAGGED_PREFILL_EAGER=1` and same-start
-coalescing enabled. It wrote
-`/tmp/ti-long-packedcoalesce-a434acd-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-long-packedcoalesce-a434acd/runs/20260712_024604`.
+An end-to-end long_output probe on `9808f42` forced broad packed eager with
+`TORCHINFERNO_CONTINUOUS_PACKED_RAGGED_PREFILL_EAGER=1`,
+`TORCHINFERNO_PACKED_PREFILL_COALESCE_SAME_START_ATTENTION=1`, and CUDA event
+timing enabled. It wrote
+`/tmp/ti-long-packedcoalesce-9808f42-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-long-packedcoalesce-9808f42/runs/20260712_030100`.
 The run stayed correct (`1000/1000`) and kept generated-prefix store/reuse,
 prompt lookup, reusable-prefix logits, and repeated sample hits at zero, but it
-regressed hard to `830.7 / 53.7 / 3052.0ms`, `12.5 tok/s`. The queue profile
+regressed hard to `758.3 / 50.2 / 2875.9ms`, `13.4 tok/s`. The queue profile
 shows why this is a rejection: broad packed eager bypassed prefill graph replay
-(`runtime_prefill_graph_replays=0`) while the exact packed signatures/patterns
-did not repeat (`54` keys for `54` calls). Packed eager removed dense padding
-tokens, but as a broad eager fallback it traded the graphable dense body for many
-small dynamic launches. Keep broad packed eager off by default; the useful target
-is still a graphable dynamic packed body or varlen kernel, not an eager detour.
-The runtime now also records packed-eager CUDA event time in queue-profile runs
-so future probes fill `runtime_prefill_packed_eager_ms` and per-shape
-`runtime_prefill_packed_eager_shape_ms` instead of showing `0.0` for a path that
-ran.
+(`runtime_prefill_graph_replays=0`) and spent
+`runtime_prefill_packed_eager_ms=31700.7` across `54` calls to save `31235`
+dense padding tokens. The hottest observed shapes were
+`prefix_graph:b24:s64:p111-111:src1:mixed0` at `11185.1ms` and
+`prefix_graph:b24:s96:p111-111:src1:mixed0` at `6926.5ms`. Packed eager removed
+dense padding tokens, but as a broad eager fallback it traded the graphable dense
+body for a much slower dynamic body. The analyzer now treats positive observed
+packed-eager shape time as a `replace_body` target when dense replay estimates
+are unavailable because the eager path bypassed graph replay. Keep broad packed
+eager off by default; the useful target is still a graphable dynamic packed body
+or varlen kernel, not an eager detour.
 
 ## Current 20260712 fixed-capacity packed prefill rejection
 

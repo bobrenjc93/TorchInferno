@@ -2337,6 +2337,48 @@ def test_prefill_packed_fragmentation_rows_rank_launch_fragmented_body() -> None
     ]
 
 
+def test_prefill_packed_fragmentation_rows_use_observed_packed_time_without_estimate() -> None:
+    shape = "prefix_graph:b24:s96:p111-111:src1:mixed0"
+    profile = QueueProfileSummary(
+        event="online_batcher_quiescent",
+        temperature=0.0,
+        max_tokens=96,
+        submitted_requests=8,
+        finished_events=8,
+        fields={
+            "runtime_prefill_forward_ms": 0.0,
+            "runtime_prefill_graph_replay_gpu_ms": 0.0,
+            "runtime_prefill_packed_eager_shape_ms": {shape: 6926.5},
+            "runtime_prefill_packed_candidate_shape_counts": {shape: 11},
+            "runtime_prefill_packed_candidate_shape_tokens": {shape: 13504},
+            "runtime_prefill_packed_candidate_shape_model_tokens": {shape: 25344},
+            "runtime_prefill_packed_candidate_shape_saved_tokens": {shape: 11840},
+            "runtime_prefill_packed_candidate_shape_groups": {shape: 85},
+            "runtime_prefill_packed_candidate_shape_max_groups": {shape: 8},
+        },
+    )
+
+    assert _prefill_packed_fragmentation_rows([profile]) == [
+        (
+            "0.0",
+            "96",
+            shape,
+            "11",
+            "85",
+            "7.7",
+            "8",
+            "13504",
+            "25344",
+            "11840",
+            "139.3",
+            "-",
+            "-",
+            "6926.5",
+            "replace_body",
+        )
+    ]
+
+
 def test_cache_integrity_rows_flag_enabled_shortcut_config() -> None:
     profile = QueueProfileSummary(
         event="online_batcher_quiescent",

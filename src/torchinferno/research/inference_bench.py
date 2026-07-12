@@ -4387,8 +4387,8 @@ def _prefill_packed_fragmentation_rows(
             observed_packed_ms = _prefill_shape_observed_packed_ms(fields, shape)
             if (
                 observed_packed_ms is not None
-                and est_saved_ms is not None
-                and observed_packed_ms >= est_saved_ms
+                and observed_packed_ms > 0.0
+                and (est_saved_ms is None or observed_packed_ms >= est_saved_ms)
             ):
                 target = "replace_body"
             elif groups_per_call > 1.0 or max_call_groups > 1.0:
