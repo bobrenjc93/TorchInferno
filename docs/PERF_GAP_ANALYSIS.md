@@ -144,6 +144,21 @@ p99 E2E regressed to `2478.3ms`. Keep the gate opt-in until the scheduler can
 avoid low-active decode-many without perturbing prefill fragmentation and tail
 latency.
 
+A current-head suffix-split control keeps the same conclusion. Forcing the old
+`TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SPLIT_SUFFIX_BUCKETS_MIN_FILL_PCT=75`
+on `0615ad6` wrote
+`/tmp/inference-bench-ti-long-suffixfill75-0615ad6-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-long-suffixfill75-0615ad6/runs/20260712_063655`
+and stayed `1000/1000` correct with cache-integrity counters at zero. It moved
+the score to `215.4 / 21.4 / 969.3ms`, `36.0 tok/s`, but total runtime phase
+grew `16.33s -> 17.08s`, prefill padding rose `23.7K -> 28.1K`, and accepted
+suffix splits fell `10 -> 5`. Disabling suffix splitting entirely wrote
+`/tmp/inference-bench-ti-long-suffixsplitoff-0615ad6-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-long-suffixsplitoff-0615ad6/runs/20260712_064206`
+and landed at `210.1 / 22.2 / 959.5ms`, `35.8 tok/s`, also correct and
+integrity-clean, but increased prefill padding to `31.4K` and prefill replay to
+`4.74s`. The 50% fill default remains the best measured TPOT/throughput tradeoff
+in this noisy set; the fair long_output target is still a non-fragmenting
+cached-prefix suffix body rather than more split scheduling.
+
 ## Current 20260712 sampled-short self rechecks
 
 After the no-logits reset, a full local TorchInferno-only run at pushed
