@@ -75,6 +75,26 @@ capture/replay slice, that a ready-buffer prefill graph actually records
 `multimem_all_reduce` and reduces the collective slice without increasing graph
 capture or memory pressure.
 
+## Current 20260712 greedy-short suffix split recheck
+
+After the exact-prompt logits-cache reset, current-head long_output on
+`d094433` regressed to a slower fair baseline:
+`/tmp/inference-bench-ti-current-long-d094-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-long-d094/runs/20260712_044540`
+scored `223.2 / 22.4 / 1036.8ms`, `35.0 tok/s`, `1000/1000` correct. Cache
+integrity was clean, but first-token prefix replay now has to compute fresh
+logits, and prefill replay rose to `5019.9ms` with `42.2%` padding.
+
+Re-enabling the existing suffix-bucket split default only for greedy short
+requests keeps sampled and large-greedy rows out of scope and still applies the
+normal no-savings, minimum-fill, and minimum-group gates. The local A/B at
+`/tmp/inference-bench-ti-current-long-d094-split-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-long-d094-split/runs/20260712_045208`
+stayed `1000/1000` correct and cache-integrity clean, accepted `4` split calls,
+saved `2304` suffix model slots, and reduced prefill replay to `4741.6ms` with
+`38.8%` padding. The score moved to `222.9 / 22.1 / 955.6ms`, `35.3 tok/s`.
+This recovers part of the fair post-reset regression; it does not close the
+remaining long_output gap, which is still the high-active decode-many body plus
+the larger non-fragmenting cached-prefix prefill body.
+
 ## Current 20260711 logits-cache integrity reset
 
 Exact-prompt logits reuse is not a valid benchmark optimization. Reusing a

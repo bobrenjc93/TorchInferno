@@ -5434,9 +5434,9 @@ def test_continuous_batch_engine_profiles_disabled_suffix_bucket_split(
     monkeypatch,
 ) -> None:
     monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SPLIT_SUFFIX_BUCKETS", raising=False)
-    monkeypatch.delenv(
+    monkeypatch.setenv(
         "TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SPLIT_SUFFIX_BUCKETS_GREEDY_SHORT",
-        raising=False,
+        "0",
     )
     monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SUFFIX_BUCKETS", "4,8")
     monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SPLIT_SUFFIX_BUCKETS_MIN_GROUP", "1")
@@ -5484,9 +5484,9 @@ def test_continuous_batch_engine_profiles_suffix_split_candidates_without_sync(
 ) -> None:
     monkeypatch.setenv("TORCHINFERNO_OPENAI_QUEUE_PROFILE_JSONL", "queue.jsonl")
     monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SPLIT_SUFFIX_BUCKETS", raising=False)
-    monkeypatch.delenv(
+    monkeypatch.setenv(
         "TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SPLIT_SUFFIX_BUCKETS_GREEDY_SHORT",
-        raising=False,
+        "0",
     )
     monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SUFFIX_BUCKETS", "4,8")
     monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SPLIT_SUFFIX_BUCKETS_MIN_GROUP", "1")
@@ -5668,7 +5668,7 @@ def test_continuous_batch_engine_suffix_bucket_split_default_scope(monkeypatch) 
         max_generation_tokens=128,
     )
 
-    assert not greedy_short._prefix_prefill_split_suffix_buckets_enabled()
+    assert greedy_short._prefix_prefill_split_suffix_buckets_enabled()
     assert not greedy_mid._prefix_prefill_split_suffix_buckets_enabled()
     assert not sampled_short._prefix_prefill_split_suffix_buckets_enabled()
 

@@ -5250,7 +5250,7 @@ class ContinuousBatchEngine:
             return False
         return env_flag(
             "TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SPLIT_SUFFIX_BUCKETS_GREEDY_SHORT",
-            False,
+            True,
         )
 
     def _prefix_prefill_split_suffix_buckets_profile_candidates_enabled(self) -> bool:
