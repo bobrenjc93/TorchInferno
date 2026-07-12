@@ -15912,6 +15912,25 @@ GPU, `27,312` padded decode-many model tokens, and `1,045` decode-many padding
 tokens. Keep the finer bucket lattice explicit because it reduces decode work
 but did not improve median finish latency in this run.
 
+A current-main long_output A/B on `c724e9a` keeps decode-many graph capture
+rejected as a default. The clean baseline wrote
+`/tmp/inference-bench-ti-long-output-clean-20260712_033521/results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100/runs/20260712_103521`
+and stayed correct/cache-integrity clean at `220.0 / 22.5 / 1002.5ms`,
+`35.1 tok/s`, with `4.98s` prefill graph replay GPU and `7.49s`
+decode-many model GPU. Setting
+`TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY_GRAPH=1` without capture wrote
+`/tmp/inference-bench-ti-long-output-decodemany-graph-20260712_034045/results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100/runs/20260712_104045`
+and stayed correct/cache-clean at `212.5 / 21.8 / 960.8ms`, `36.4 tok/s`, but
+reported `graph_calls=0` and `capture_off`; treat the small metric movement as
+shape/run variance. Forcing
+`TORCHINFERNO_CONTINUOUS_DECODE_CAPTURE=1` made the graph path run in
+`/tmp/inference-bench-ti-long-output-decodemany-capture-20260712_034632/results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100/runs/20260712_104632`
+(`105` graph calls, `479` steps, `30,656` model tokens), but regressed to
+`224.8 / 22.3 / 1179.9ms`, `34.0 tok/s`, while decode-many model GPU rose to
+`13.71s`. Keep TP online decode capture disabled; the remaining long_output
+gap is packed/fused suffix prefill and decode-body cost, not another
+decode-many graph default.
+
 ## Priority for a focused (non-loop) session
 
 1. Prefill MFU (Issue 1) — biggest TTFT lever, ~2x, affects 3/5 benchmarks.
