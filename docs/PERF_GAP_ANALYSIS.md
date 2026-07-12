@@ -46,6 +46,35 @@ cached-prefix suffix prefill and high-active decode replay. It also avoids the
 previous failure mode where repeated prompts could look like a serving win while
 only exercising cached logits.
 
+## Current 20260712 allreduce backend profile
+
+The focused long_output profiler run at
+`/tmp/inference-bench-ti-long-prof-0e6b1ac-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-long-prof-0e6b1ac/runs/20260712_042448`
+is score-perturbed by torch.profiler, so use it for kernel attribution only.
+Correctness stayed `1000/1000`, and cache integrity stayed clean: generated
+prefix store/reuse/tokens, prompt lookup accepts, reusable-prefix logits,
+reusable-prefix sampling, and repeated-sample hits were all zero.
+
+Re-rendering that run after `91798d6` splits profiler allreduce time by
+backend. The hot `decode_replay` row (`batch=64, cache1024`) reports
+`12.3ms` self CUDA with `2.1ms` allreduce, all of it in
+`symm_allreduce_ms`. The hot `prefill_replay` row
+(`batch=24, suffix=64, context=-256`) reports `83.3ms` self CUDA with
+`24.3ms` allreduce, all of it in `nccl_allreduce_ms`. This is the current
+highest-signal prefill-vs-decode difference: decode replay is already using
+symmetric-memory allreduce, while the startup-captured prefill replay body is
+still regular NCCL.
+
+Do not address this by simply enabling graph-captured prefill symm-mem in the
+OpenAI startup warmup. The current `_tensor_parallel_prefill_graph_runtime_key_scope`
+intentionally matches runtime graph keys while forcing prefill symm-mem off, and
+prior rechecks below rejected prefill symmetric-memory defaulting or in-graph
+capture due regressions, OOM/multicast warnings, or captured bodies that still
+replayed NCCL. The next fair experiment should first prove, in a standalone
+capture/replay slice, that a ready-buffer prefill graph actually records
+`multimem_all_reduce` and reduces the collective slice without increasing graph
+capture or memory pressure.
+
 ## Current 20260711 logits-cache integrity reset
 
 Exact-prompt logits reuse is not a valid benchmark optimization. Reusing a
