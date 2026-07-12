@@ -97,6 +97,40 @@ profiles can distinguish "accepted and actually saved dense compute" from
 "accepted with small residual-padding movement" without relying on the
 overloaded packed-eager fields.
 
+## Current 20260712 decode-many graph and sync-stop rejection
+
+Two fresh long_output probes keep decode-many policy changes diagnostic-only.
+Forcing multi-step decode-many graphs and tensor-parallel capture with
+`TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY_GRAPH=1` and
+`TORCHINFERNO_CONTINUOUS_DECODE_CAPTURE=1` wrote
+`/tmp/inference-bench-long-decodemany-graph-probe-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-long-decodemany-graph-probe/runs/20260712_002405`.
+It stayed correct (`1000/1000`) and cache-integrity counters were clean, but it
+regressed to `216.3 / 22.9 / 1027.4ms`, `32.8 tok/s`. The queue profile showed
+the graph path did run (`decode_many_graph=true`,
+`decode_capture_on_miss=true`, `runtime_decode_many_graph_calls=16`,
+`runtime_decode_many_graph_steps=114`), but total decode-many model GPU time
+rose to `9.76s`. The hot `decode_many:b64/64:g1-16` shape was about
+`704us/model-token`, far above the graph-off control band near `200us/model-token`.
+
+Forcing synchronized decode-many stops with
+`TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY_SYNC_STOPS=1` wrote
+`/tmp/inference-bench-long-decodemany-syncstops-probe-results/meta-llama--Meta-Llama-3.1-70B-Instruct/8xH100-local-long-decodemany-syncstops-probe/runs/20260712_002940`.
+It also stayed correct and avoided overgeneration
+(`runtime_decode_many_model_tokens=29697`,
+`runtime_decode_many_emitted_tokens=29697`), but regressed to
+`216.5 / 22.1 / 1029.5ms`, `35.1 tok/s`. The extra synchronized stopping work
+raised decode-many steps to `594` and model GPU time to `7.61s`, versus the
+graph-off control's `524` steps and `6.57s` model GPU time. Keep sync-stops
+off by default unless a workload is dominated by overgeneration rather than
+step count.
+
+The inference-bench analyzer now emits a
+`[torchinferno decode-many graph policy]` table with graph enablement,
+capture state, graph calls/steps, graph step coverage, and a status such as
+`capture_off`, `no_hits`, or `ran`. Future public runs can now show whether a
+decode-many graph policy did not run or ran and lost, instead of requiring
+manual queue-profile inspection.
+
 ## Current 20260711 multi-turn prefill profile
 
 A current-head TorchInferno-only `multi_turn` profile on `a95aa93` wrote

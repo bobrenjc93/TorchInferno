@@ -8,6 +8,7 @@ from torchinferno.research.inference_bench import (
     _cache_integrity_rows,
     _decode_graph_cache_counts,
     _decode_graph_symm_counts,
+    _decode_many_graph_policy_rows,
     _decode_many_phase_rows,
     _hot_prefill_shape_rows,
     _phase_target,
@@ -109,6 +110,8 @@ def _write_inference_bench_run(tmp_path) -> None:
         "fp8_prefill_min_m": 512,
         "marlin_int4_decode_enabled": True,
         "use_decode_many": True,
+        "decode_many_graph": True,
+        "decode_many_graph_min_steps": 2,
         "decode_quantum": 8,
         "drain_decode_quantum": 8,
         "admit_per_step_cap": 64,
@@ -383,6 +386,10 @@ def _write_inference_bench_run(tmp_path) -> None:
         "runtime_decode_many_steps": 6,
         "runtime_decode_many_model_tokens": 24,
         "runtime_decode_many_emitted_tokens": 15,
+        "runtime_decode_many_graph_calls": 1,
+        "runtime_decode_many_graph_steps": 3,
+        "runtime_decode_many_graph_model_tokens": 12,
+        "runtime_decode_many_graph_ms": 4.5,
         "runtime_decode_many_state_syncs": 1,
         "runtime_decode_many_state_sync_skips": 3,
         "decode_many_stop_tail_max_steps": 4,
@@ -1106,6 +1113,9 @@ def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) ->
     assert "[torchinferno decode-many phase]" in text
     assert "emit_tok_s" in text
     assert "overgen_pct" in text
+    assert "[torchinferno decode-many graph policy]" in text
+    assert "graph_step_pct" in text
+    assert "graph_model_tok" in text
     assert "packed_fi_ms" in text
     assert "packed_fi_saved" in text
     assert "[torchinferno packed FlashInfer prefill gate]" in text
@@ -1256,6 +1266,7 @@ def test_inference_bench_summary_parses_provider_and_queue_profiles(tmp_path) ->
     assert "decode_many_tok_call" in text
     assert "decode_many_steps_call" in text
     assert "decode_many_graph_ms" in text
+    assert "50.0%" in text
     assert "12.0" in text
     assert "3.0" in text
     assert "1.2" in text
@@ -1777,6 +1788,110 @@ def test_decode_many_phase_rows_summarize_throughput_and_overgeneration() -> Non
             "1000.0",
             "625.0",
         )
+    ]
+
+
+def test_decode_many_graph_policy_rows_classify_runtime_state() -> None:
+    rows = _decode_many_graph_policy_rows(
+        [
+            QueueProfileSummary(
+                event="online_batcher_quiescent",
+                temperature=0.0,
+                max_tokens=96,
+                submitted_requests=8,
+                finished_events=8,
+                fields={
+                    "use_decode_many": False,
+                    "decode_many_graph": True,
+                    "decode_capture_on_miss": True,
+                    "runtime_decode_many_graph_calls": 0,
+                    "runtime_decode_many_graph_steps": 0,
+                    "runtime_decode_many_graph_model_tokens": 0,
+                    "runtime_decode_many_steps": 6,
+                    "runtime_decode_many_model_gpu_ms": 15.0,
+                },
+            ),
+            QueueProfileSummary(
+                event="online_batcher_quiescent",
+                temperature=0.0,
+                max_tokens=96,
+                submitted_requests=8,
+                finished_events=8,
+                fields={
+                    "use_decode_many": True,
+                    "decode_many_graph": True,
+                    "decode_capture_on_miss": False,
+                    "runtime_decode_many_graph_calls": 0,
+                    "runtime_decode_many_graph_steps": 0,
+                    "runtime_decode_many_graph_model_tokens": 0,
+                    "runtime_decode_many_steps": 6,
+                    "runtime_decode_many_model_gpu_ms": 15.0,
+                },
+            ),
+            QueueProfileSummary(
+                event="online_batcher_quiescent",
+                temperature=0.0,
+                max_tokens=96,
+                submitted_requests=8,
+                finished_events=8,
+                fields={
+                    "use_decode_many": True,
+                    "decode_many_graph": True,
+                    "decode_capture_on_miss": True,
+                    "runtime_decode_many_graph_calls": 2,
+                    "runtime_decode_many_graph_steps": 4,
+                    "runtime_decode_many_graph_model_tokens": 32,
+                    "runtime_decode_many_graph_ms": 7.5,
+                    "runtime_decode_many_steps": 8,
+                    "runtime_decode_many_model_gpu_ms": 20.0,
+                },
+            ),
+        ]
+    )
+
+    assert rows == [
+        (
+            "0.0",
+            "96",
+            "True",
+            "True",
+            "0",
+            "0",
+            "0.0%",
+            "0",
+            "-",
+            "15.0",
+            "6",
+            "decode_many_off",
+        ),
+        (
+            "0.0",
+            "96",
+            "True",
+            "False",
+            "0",
+            "0",
+            "0.0%",
+            "0",
+            "-",
+            "15.0",
+            "6",
+            "capture_off",
+        ),
+        (
+            "0.0",
+            "96",
+            "True",
+            "True",
+            "2",
+            "4",
+            "50.0%",
+            "32",
+            "7.5",
+            "20.0",
+            "8",
+            "ran",
+        ),
     ]
 
 

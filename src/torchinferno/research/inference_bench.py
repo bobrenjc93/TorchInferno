@@ -89,6 +89,8 @@ _QUEUE_PROFILE_FIELDS = (
     "fp8_prefill_min_m",
     "marlin_int4_decode_enabled",
     "use_decode_many",
+    "decode_many_graph",
+    "decode_many_graph_min_steps",
     "decode_many_async_readback",
     "decode_quantum",
     "drain_decode_quantum",
@@ -1616,6 +1618,30 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
                         "us_model",
                     ),
                     decode_phase_rows,
+                )
+            )
+            lines.append("")
+
+        decode_graph_policy_rows = _decode_many_graph_policy_rows(queue_profiles)
+        if decode_graph_policy_rows:
+            lines.append("[torchinferno decode-many graph policy]")
+            lines.extend(
+                _format_table(
+                    (
+                        "temp",
+                        "max_tokens",
+                        "enabled",
+                        "capture",
+                        "graph_calls",
+                        "graph_steps",
+                        "graph_step_pct",
+                        "graph_model_tok",
+                        "graph_ms",
+                        "total_gpu_ms",
+                        "total_steps",
+                        "status",
+                    ),
+                    decode_graph_policy_rows,
                 )
             )
             lines.append("")
@@ -5286,6 +5312,78 @@ def _decode_many_phase_rows(
                 _fmt_value(_ratio_or_none(model_tokens, gpu_ms, scale=1000.0)),
                 _fmt_value(_ratio_or_none(gpu_ms, emitted_tokens, scale=1000.0)),
                 _fmt_value(_ratio_or_none(gpu_ms, model_tokens, scale=1000.0)),
+            )
+        )
+    return rows
+
+
+def _decode_many_graph_policy_rows(
+    profiles: Sequence[QueueProfileSummary],
+) -> list[tuple[str, ...]]:
+    rows: list[tuple[str, ...]] = []
+    for profile in profiles:
+        fields = profile.fields
+        use_decode_many = fields.get("use_decode_many")
+        enabled = fields.get("decode_many_graph")
+        capture = fields.get("decode_capture_on_miss")
+        graph_calls = _numeric_field(fields, "runtime_decode_many_graph_calls")
+        graph_steps = _numeric_field(fields, "runtime_decode_many_graph_steps")
+        graph_model_tokens = _numeric_field(
+            fields,
+            "runtime_decode_many_graph_model_tokens",
+        )
+        graph_ms = _numeric_field(fields, "runtime_decode_many_graph_ms")
+        total_steps = _numeric_field(fields, "runtime_decode_many_steps")
+        total_gpu_ms = _numeric_field(fields, "runtime_decode_many_model_gpu_ms")
+        if not any(
+            value is not None
+            for value in (
+                use_decode_many,
+                enabled,
+                capture,
+                graph_calls,
+                graph_steps,
+                graph_model_tokens,
+                graph_ms,
+            )
+        ):
+            continue
+        graph_call_count = float(graph_calls or 0.0)
+        graph_step_count = float(graph_steps or 0.0)
+        if use_decode_many is False:
+            status = "decode_many_off"
+        elif enabled is False:
+            status = "off"
+        elif graph_call_count <= 0.0 and capture is False:
+            status = "capture_off"
+        elif graph_call_count <= 0.0:
+            status = "no_hits"
+        else:
+            status = "ran"
+        rows.append(
+            (
+                _fmt_value(profile.temperature),
+                _fmt_value(profile.max_tokens),
+                _fmt_value(enabled),
+                _fmt_value(capture),
+                _fmt_value(
+                    _int_if_whole(graph_calls) if graph_calls is not None else None
+                ),
+                _fmt_value(
+                    _int_if_whole(graph_steps) if graph_steps is not None else None
+                ),
+                _fmt_pct(graph_step_count, float(total_steps or 0.0)),
+                _fmt_value(
+                    _int_if_whole(graph_model_tokens)
+                    if graph_model_tokens is not None
+                    else None
+                ),
+                _fmt_value(graph_ms),
+                _fmt_value(total_gpu_ms),
+                _fmt_value(
+                    _int_if_whole(total_steps) if total_steps is not None else None
+                ),
+                status,
             )
         )
     return rows
