@@ -22,22 +22,11 @@ error; real integration needs GPTQ/AWQ calibration to hold the 98% bench bar).
 """
 
 import functools
-import sys
 
 import torch
 
-sys.path.insert(0, "/data/users/bobren/d/vllm")
-import vllm  # noqa: F401  (registers torch.ops._C.marlin_gemm)
-from vllm import _custom_ops as ops
-from vllm.scalar_type import scalar_types
-from vllm.model_executor.layers.quantization.utils.marlin_utils import (
-    marlin_make_workspace_new,
-)
-from vllm.model_executor.layers.quantization.utils.marlin_utils_test import (
-    marlin_quantize,
-)
+from torchinferno.kernels import marlin as marlin_ops
 
-QT = scalar_types.uint4b8
 GROUP = 128
 
 
@@ -77,20 +66,28 @@ def gbench(fn, it=300):
 
 def make(M, N, K, dev):
     # weight is [K, N] (the GEMM is a[M,K] @ w[K,N]); marlin_quantize packs it.
-    w = torch.randn(K, N, device=dev, dtype=torch.float16) * 0.02
-    a = torch.randn(M, K, device=dev, dtype=torch.float16)
-    _w_ref, q_w, s, g_idx, srt, _ = marlin_quantize(w, QT, GROUP, False)
-    wsp = marlin_make_workspace_new(dev)
-    out = torch.empty((M, N), dtype=torch.float16, device=dev)
+    w = torch.randn(K, N, device=dev, dtype=torch.bfloat16) * 0.02
+    a = torch.randn(M, K, device=dev, dtype=torch.bfloat16)
+    q_w, s = marlin_ops.quantize_to_marlin_int4(w, GROUP)
+    wsp = marlin_ops.make_workspace(N, dev)
+    out = torch.empty((M, N), dtype=torch.bfloat16, device=dev)
     marlin = functools.partial(
-        ops.marlin_gemm, a, out, q_w, None, s, None, None, None, g_idx, srt, wsp,
-        QT, M, N, K, is_k_full=True,
+        marlin_ops.marlin_int4_mm,
+        a,
+        q_w,
+        s,
+        wsp,
+        N,
+        K,
+        out=out,
     )
     fp16 = functools.partial(torch.mm, a, w)
     return fp16, marlin
 
 
 def main():
+    if not marlin_ops.load_marlin_ops():
+        raise RuntimeError("Marlin operator is unavailable")
     dev = torch.device("cuda:0")
     torch.manual_seed(0)
     # marlin needs N % 64 == 0; lm_head (N=16032) does NOT qualify -> stays bf16.
@@ -98,7 +95,7 @@ def main():
               "gate_up": (7168, 8192), "down": (8192, 3584)}
     for use_graph, label in ((False, "eager"), (True, "CUDA-graph floor")):
         b = gbench if use_graph else bench
-        for M in (16, 48, 64):
+        for M in (16, 48, 64, 128, 256, 384, 512, 1024):
             print(f"=== M={M} ({label}) ===")
             tb = tm = 0.0
             for nm, (N, K) in shapes.items():

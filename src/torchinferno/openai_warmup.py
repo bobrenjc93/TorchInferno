@@ -12,30 +12,25 @@ def warmup_prompt_token_counts(default_prompt_tokens: int) -> tuple[int, ...]:
 
 
 def warmup_temperature_prompt_token_counts() -> tuple[int, ...]:
-    return parse_positive_int_csv(
-        os.environ.get("TORCHINFERNO_OPENAI_WARMUP_TEMPERATURE_PROMPT_TOKEN_BUCKETS", "32,55,64")
-    )
+    configured = os.environ.get("TORCHINFERNO_OPENAI_WARMUP_TEMPERATURE_PROMPT_TOKEN_BUCKETS")
+    return parse_positive_int_csv(configured) if configured is not None else _power_of_two_buckets(64, minimum=16)
 
 
 def warmup_temperature_batch_sizes() -> tuple[int, ...]:
-    return parse_positive_int_csv(
-        os.environ.get("TORCHINFERNO_OPENAI_WARMUP_TEMPERATURE_BATCH_SIZES", "1,4,8,15,16,56,64")
-    )
+    configured = os.environ.get("TORCHINFERNO_OPENAI_WARMUP_TEMPERATURE_BATCH_SIZES")
+    return parse_positive_int_csv(configured) if configured is not None else _power_of_two_buckets(64)
 
 
 def warmup_ragged_decode_batch_sizes() -> tuple[int, ...]:
-    return parse_positive_int_csv(
-        os.environ.get("TORCHINFERNO_OPENAI_WARMUP_RAGGED_DECODE_BATCH_SIZES", "64,8")
-    )
+    configured = os.environ.get("TORCHINFERNO_OPENAI_WARMUP_RAGGED_DECODE_BATCH_SIZES")
+    return parse_positive_int_csv(configured) if configured is not None else _power_of_two_buckets(64)
 
 
 def warmup_ragged_decode_row_counts() -> tuple[int, ...]:
-    return parse_positive_int_csv(
-        os.environ.get(
-            "TORCHINFERNO_OPENAI_WARMUP_RAGGED_DECODE_ROW_COUNTS",
-            "64,56,48,40,32,24,16,8,7,6,5,4,3,2,1",
-        )
-    )
+    configured = os.environ.get("TORCHINFERNO_OPENAI_WARMUP_RAGGED_DECODE_ROW_COUNTS")
+    if configured is not None:
+        return parse_positive_int_csv(configured)
+    return tuple(range(1, 9)) + tuple(range(16, 65, 8))
 
 
 def warmup_ragged_decode_cache_token_counts() -> tuple[int, ...]:
@@ -98,3 +93,18 @@ def parse_nonnegative_positive_int_pair_csv(raw: str) -> tuple[tuple[int, int], 
 def _dedupe_positive(counts: Iterable[int]) -> tuple[int, ...]:
     values = [max(1, int(count)) for count in counts]
     return tuple(dict.fromkeys(values))
+
+
+def _power_of_two_buckets(maximum: int, *, minimum: int = 1) -> tuple[int, ...]:
+    maximum = max(1, int(maximum))
+    minimum = max(1, int(minimum))
+    values: list[int] = []
+    bucket = 1
+    while bucket < minimum:
+        bucket *= 2
+    while bucket <= maximum:
+        values.append(bucket)
+        bucket *= 2
+    if not values or values[-1] != maximum:
+        values.append(maximum)
+    return tuple(values)

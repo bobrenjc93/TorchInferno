@@ -24,7 +24,7 @@ from torchinferno.models.llama3.pipeline import (
     _rms_norm as _torch_rms_norm,
     resolve_llama3_checkpoint,
 )
-from torchinferno.runtime.options import env_flag, env_int, warn_optional_failure
+from torchinferno.runtime.options import env_flag, env_float, env_int, warn_optional_failure
 from torchinferno.runtime.sampling import sample_next_token
 
 
@@ -33,8 +33,6 @@ _COMPILED_ROTATE_LLAMA_CHECKED = False
 _COMPILED_ROTATE_LLAMA_FAILED = False
 _SYMM_REDUCE_BUFFERS: dict[tuple[str, int, str, str, tuple[int, ...]], Tensor] = {}
 _SYMM_REDUCE_PROBED: set[tuple[str, int, str, str, tuple[int, ...]]] = set()
-# Distinct eager-prefill symm-mem allreduce shapes seen, to bound buffer memory.
-_SYMM_PREFILL_SHAPES: set[tuple[str, tuple[int, ...], int]] = set()
 _SYMM_REDUCE_DISABLED = False
 _SYMM_MEM_ALLREDUCE_MAX_BATCH_OVERRIDE: list[int | None] = [None]
 _SYMM_MEM_ALLREDUCE_ENABLED_OVERRIDE: list[bool | None] = [None]
@@ -46,6 +44,13 @@ _DEFAULT_PREFILL_GRAPH_MAX_GRAPHS = 192
 _DEFAULT_PREFILL_GRAPH_MIN_FREE_MB = 1024
 _PackedPrefillAttentionGroup = tuple[int, int, Tensor, tuple[int, ...], tuple[int, ...]]
 _PackedPrefillAttentionStartGroup = tuple[int, tuple[_PackedPrefillAttentionGroup, ...]]
+_FA3_FLASH_ATTN_WITH_KVCACHE = None
+
+
+@dataclass(frozen=True)
+class _FP8PerTokenActivation:
+    values: Tensor
+    scales: Tensor
 
 
 @contextmanager
@@ -79,6 +84,19 @@ def _tp_flag(name: str, default: bool = True) -> bool:
 
 def _tp_int(name: str, default: int, *, minimum: int | None = None) -> int:
     return env_int(name, default, minimum=minimum)
+
+
+def _tp_float(name: str, default: float, *, minimum: float | None = None) -> float:
+    return env_float(name, default, minimum=minimum)
+
+
+def _fa3_flash_attn_with_kvcache():
+    global _FA3_FLASH_ATTN_WITH_KVCACHE
+    if _FA3_FLASH_ATTN_WITH_KVCACHE is None:
+        from sgl_kernel.flash_attn import flash_attn_with_kvcache
+
+        _FA3_FLASH_ATTN_WITH_KVCACHE = flash_attn_with_kvcache
+    return _FA3_FLASH_ATTN_WITH_KVCACHE
 
 
 def _prefill_graph_max_graphs() -> int:
@@ -215,10 +233,24 @@ class Llama3TensorParallelLayerKVCache:
         *,
         device: torch.device,
         dtype: torch.dtype,
+        keys: Tensor | None = None,
+        values: Tensor | None = None,
     ) -> None:
         shape = (batch_size, local_key_value_heads, max_seq_len, head_dim)
-        self.keys = torch.empty(shape, device=device, dtype=dtype)
-        self.values = torch.empty(shape, device=device, dtype=dtype)
+        if (keys is None) != (values is None):
+            raise ValueError("keys and values storage must be provided together")
+        if keys is not None and (
+            keys.shape != shape
+            or values is None
+            or values.shape != shape
+            or keys.device != device
+            or values.device != device
+            or keys.dtype != dtype
+            or values.dtype != dtype
+        ):
+            raise ValueError("provided KV storage does not match the cache shape, device, and dtype")
+        self.keys = torch.empty(shape, device=device, dtype=dtype) if keys is None else keys
+        self.values = torch.empty(shape, device=device, dtype=dtype) if values is None else values
         self.max_seq_len = max_seq_len
         self.batch_size = batch_size
         self._seq_lens = [0 for _ in range(batch_size)]
@@ -426,6 +458,20 @@ class Llama3TensorParallelLayerKVCache:
             seq_len,
             updated_rows=len(rows),
             prior_uniform=prior_uniform,
+        )
+
+    def _set_rows_seq_lens(
+        self,
+        rows: tuple[int, ...],
+        seq_lens: tuple[int, ...],
+    ) -> None:
+        if len(rows) != len(seq_lens):
+            raise ValueError("rows and seq_lens must have the same length")
+        for row, seq_len in zip(rows, seq_lens):
+            self._seq_lens[row] = int(seq_len)
+        first = self._seq_lens[0] if self._seq_lens else 0
+        self._uniform_seq_len[0] = (
+            first if all(value == first for value in self._seq_lens) else None
         )
 
     def _partial_update_uniform_seq_len(
@@ -980,9 +1026,15 @@ class Llama3TensorParallelCache:
         layers: list[Llama3TensorParallelLayerKVCache | PagedLlama3TensorParallelLayerKVCache],
         *,
         cache_backend: str = "dense",
+        stacked_keys: Tensor | None = None,
+        stacked_values: Tensor | None = None,
     ) -> None:
+        if (stacked_keys is None) != (stacked_values is None):
+            raise ValueError("stacked keys and values storage must be provided together")
         self.layers = layers
         self.cache_backend = cache_backend
+        self._stacked_keys = stacked_keys
+        self._stacked_values = stacked_values
         self._graph_cache_id = id(self)
 
     @property
@@ -1005,6 +1057,8 @@ class Llama3TensorParallelCache:
         view = Llama3TensorParallelCache(
             [layer.for_rows(rows) for layer in self.layers],
             cache_backend=self.cache_backend,
+            stacked_keys=self._stacked_keys,
+            stacked_values=self._stacked_values,
         )
         view._graph_cache_id = self._graph_cache_id
         view._parent_cache = self
@@ -1419,6 +1473,36 @@ class _StaticPackedRaggedPrefillLogitsGraphCall:
 
 
 @dataclass
+class _StaticTokenBucketPrefillGraphCall:
+    graph: torch.cuda.CUDAGraph
+    static_input_ids: Tensor
+    static_start_positions: Tensor
+    static_q_lens: Tensor
+    static_row_indices: Tensor
+    static_write_positions: Tensor
+    static_flat_rows: Tensor
+    static_logit_positions: Tensor
+    static_src_prefix_rows: Tensor | None
+    output_logits: Tensor
+    cache: Llama3TensorParallelCache
+    max_seq_len: int
+    batch_capacity: int
+    token_capacity: int
+    prefix_copy_capacity: int
+
+
+@dataclass
+class _StaticTokenBucketPrefixCopyGraphCall:
+    graph: torch.cuda.CUDAGraph
+    static_start_positions: Tensor
+    static_row_indices: Tensor
+    static_src_prefix_rows: Tensor
+    cache: Llama3TensorParallelCache
+    batch_capacity: int
+    prefix_copy_capacity: int
+
+
+@dataclass
 class _RepeatedTemperatureSampleState:
     temperature: float
     cumulative_local: Tensor
@@ -1718,7 +1802,7 @@ class _Llama3TensorParallelLayer:
     def forward_decode_static(
         self,
         hidden: Tensor,
-        attn_in: Tensor | None,
+        attn_in: Tensor | _FP8PerTokenActivation | None,
         rotary: tuple[Tensor, Tensor],
         cache: Llama3TensorParallelLayerKVCache,
         cache_position: Tensor,
@@ -1727,7 +1811,8 @@ class _Llama3TensorParallelLayer:
         attention_length: Tensor,
         attention_block_size: int | None,
         next_norm_weight: Tensor,
-    ) -> tuple[Tensor, Tensor]:
+        next_layer: _Llama3TensorParallelLayer | None = None,
+    ) -> tuple[Tensor, Tensor | _FP8PerTokenActivation]:
         residual = hidden
         attention = self._attention_decode_static(
             hidden,
@@ -1740,20 +1825,27 @@ class _Llama3TensorParallelLayer:
             attention_length,
             attention_block_size,
         )
-        hidden, mlp_in = _tp_decode_add_rms_norm(
+        hidden, mlp_in = self._decode_add_rms_projection_input(
             attention,
             residual,
             self.post_attention_layernorm_weight,
-            self.config.rms_norm_eps,
+            "gu",
         )
         residual = hidden
         projected = self._mlp_project_decode_reduce(mlp_in)
+        if next_layer is not None:
+            return next_layer._decode_add_rms_projection_input(
+                projected,
+                residual,
+                next_norm_weight,
+                "qkv",
+            )
         return _tp_decode_add_rms_norm(projected, residual, next_norm_weight, self.config.rms_norm_eps)
 
     def forward_decode_ragged(
         self,
         hidden: Tensor,
-        attn_in: Tensor | None,
+        attn_in: Tensor | _FP8PerTokenActivation | None,
         rotary: tuple[Tensor, Tensor],
         cache: Llama3TensorParallelLayerKVCache,
         cache_positions: Tensor,
@@ -1761,7 +1853,8 @@ class _Llama3TensorParallelLayer:
         next_norm_weight: Tensor,
         attention_cache_tokens: int | None = None,
         attention_lengths: Tensor | None = None,
-    ) -> tuple[Tensor, Tensor]:
+        next_layer: _Llama3TensorParallelLayer | None = None,
+    ) -> tuple[Tensor, Tensor | _FP8PerTokenActivation]:
         residual = hidden
         attention = self._attention_decode_ragged(
             hidden,
@@ -1773,20 +1866,27 @@ class _Llama3TensorParallelLayer:
             attention_cache_tokens=attention_cache_tokens,
             attention_lengths=attention_lengths,
         )
-        hidden, mlp_in = _tp_decode_add_rms_norm(
+        hidden, mlp_in = self._decode_add_rms_projection_input(
             attention,
             residual,
             self.post_attention_layernorm_weight,
-            self.config.rms_norm_eps,
+            "gu",
         )
         residual = hidden
         projected = self._mlp_project_decode_reduce(mlp_in)
+        if next_layer is not None:
+            return next_layer._decode_add_rms_projection_input(
+                projected,
+                residual,
+                next_norm_weight,
+                "qkv",
+            )
         return _tp_decode_add_rms_norm(projected, residual, next_norm_weight, self.config.rms_norm_eps)
 
     def _attention_decode_static(
         self,
         hidden: Tensor,
-        attn_in: Tensor | None,
+        attn_in: Tensor | _FP8PerTokenActivation | None,
         rotary: tuple[Tensor, Tensor],
         cache: Llama3TensorParallelLayerKVCache,
         cache_position: Tensor,
@@ -1822,7 +1922,11 @@ class _Llama3TensorParallelLayer:
         else:
             cache_keys, cache_values = storage
         if attn_in is None:
-            attn_in = _tp_decode_rms_norm(hidden, self.input_layernorm_weight, self.config.rms_norm_eps)
+            attn_in = self._decode_rms_projection_input(
+                hidden,
+                self.input_layernorm_weight,
+                "qkv",
+            )
         if _tp_flag("TORCHINFERNO_TRITON_DECODE_ROTARY_APPEND"):
             q, k, v = self._qkv(attn_in, batch, tokens, self.config.head_dim)
             if indexed_rows:
@@ -1884,12 +1988,17 @@ class _Llama3TensorParallelLayer:
         else:
             out = triton_dense_gqa_decode_attention(q, attention_keys, attention_values, seq_len=attention_length)
         out = out.transpose(1, 2).contiguous().view(batch, tokens, self.local_hidden_size)
-        return self._decode_linear_all_reduce(out, self.o_proj_weight, "attention", self.o_proj_weight_decode)
+        return self._decode_linear_all_reduce(
+            out,
+            self.o_proj_weight,
+            "attention",
+            self.o_proj_weight_decode,
+        )
 
     def _attention_decode_ragged(
         self,
         hidden: Tensor,
-        attn_in: Tensor | None,
+        attn_in: Tensor | _FP8PerTokenActivation | None,
         rotary: tuple[Tensor, Tensor],
         cache: Llama3TensorParallelLayerKVCache,
         cache_positions: Tensor,
@@ -1902,7 +2011,11 @@ class _Llama3TensorParallelLayer:
         if tokens != 1:
             raise ValueError("ragged decode expects exactly one token")
         if attn_in is None:
-            attn_in = _tp_decode_rms_norm(hidden, self.input_layernorm_weight, self.config.rms_norm_eps)
+            attn_in = self._decode_rms_projection_input(
+                hidden,
+                self.input_layernorm_weight,
+                "qkv",
+            )
         q, k, v = self._qkv(attn_in, batch, tokens, self.config.head_dim)
         enable_gqa = self.local_attention_heads != self.local_key_value_heads
         append_and_attend_ragged = getattr(cache, "append_and_attend_ragged", None)
@@ -1917,7 +2030,12 @@ class _Llama3TensorParallelLayer:
                 enable_gqa=enable_gqa,
             )
             out = out.transpose(1, 2).contiguous().view(batch, tokens, self.local_hidden_size)
-            return self._decode_linear_all_reduce(out, self.o_proj_weight, "attention", self.o_proj_weight_decode)
+            return self._decode_linear_all_reduce(
+                out,
+                self.o_proj_weight,
+                "attention",
+                self.o_proj_weight_decode,
+            )
         if (
             q.is_cuda
             and k.is_cuda
@@ -1947,6 +2065,57 @@ class _Llama3TensorParallelLayer:
             _append_ragged_kv_cache(cache, k, v, cache_positions, row_indices)
         if attention_lengths is None:
             attention_lengths = cache_positions + 1
+        if (
+            q.is_cuda
+            and _tp_flag("TORCHINFERNO_FA3_RAGGED_DECODE", False)
+        ):
+            try:
+                if row_indices is None:
+                    cache_batch_idx = getattr(
+                        self,
+                        "_fa3_dense_cache_batch_idx",
+                        None,
+                    )
+                    if (
+                        cache_batch_idx is None
+                        or cache_batch_idx.device != q.device
+                        or cache_batch_idx.numel() < batch
+                    ):
+                        cache_batch_idx = torch.arange(
+                            cache.keys.size(0),
+                            device=q.device,
+                            dtype=torch.int32,
+                        )
+                        self._fa3_dense_cache_batch_idx = cache_batch_idx
+                    cache_batch_idx = cache_batch_idx[:batch]
+                else:
+                    cache_batch_idx = row_indices.to(
+                        device=q.device,
+                        dtype=torch.int32,
+                    )
+                output = _fa3_flash_attn_with_kvcache()(
+                    q=q.transpose(1, 2).contiguous(),
+                    k_cache=cache.keys.permute(0, 2, 1, 3),
+                    v_cache=cache.values.permute(0, 2, 1, 3),
+                    cache_seqlens=attention_lengths.to(dtype=torch.int32),
+                    cache_batch_idx=cache_batch_idx,
+                    softmax_scale=self.config.head_dim**-0.5,
+                    causal=True,
+                    num_splits=_tp_int(
+                        "TORCHINFERNO_FA3_RAGGED_DECODE_NUM_SPLITS",
+                        1,
+                        minimum=0,
+                    ),
+                )
+                output = output.reshape(batch, tokens, self.local_hidden_size)
+                return self._decode_linear_all_reduce(
+                    output,
+                    self.o_proj_weight,
+                    "attention",
+                    self.o_proj_weight_decode,
+                )
+            except Exception as exc:
+                warn_optional_failure("llama3_tensor_parallel.fa3_ragged_decode", exc)
         if row_indices is None:
             attention_keys = cache.keys[:batch]
             attention_values = cache.values[:batch]
@@ -1969,7 +2138,12 @@ class _Llama3TensorParallelLayer:
             enable_gqa=enable_gqa,
         )
         out = out.transpose(1, 2).contiguous().view(batch, tokens, self.local_hidden_size)
-        return self._decode_linear_all_reduce(out, self.o_proj_weight, "attention", self.o_proj_weight_decode)
+        return self._decode_linear_all_reduce(
+            out,
+            self.o_proj_weight,
+            "attention",
+            self.o_proj_weight_decode,
+        )
 
     def forward_prefill_ragged(
         self,
@@ -2036,7 +2210,12 @@ class _Llama3TensorParallelLayer:
             context_len=context_len,
         )
         out = out.transpose(1, 2).contiguous().view(batch, tokens, self.local_hidden_size)
-        return self._decode_linear_all_reduce(out, self.o_proj_weight, "attention", self.o_proj_weight_decode)
+        return self._decode_linear_all_reduce(
+            out,
+            self.o_proj_weight,
+            "attention",
+            self.o_proj_weight_decode,
+        )
 
     def forward_prefill_packed_eager(
         self,
@@ -2076,6 +2255,50 @@ class _Llama3TensorParallelLayer:
         residual = hidden
         projected = self._mlp_project_decode_reduce(mlp_in)
         return _tp_decode_add_rms_norm(projected, residual, next_norm_weight, self.config.rms_norm_eps)
+
+    def forward_prefill_packed_fa3(
+        self,
+        hidden: Tensor,
+        attn_in: Tensor | None,
+        rotary: tuple[Tensor, Tensor],
+        cache: Llama3TensorParallelLayerKVCache,
+        write_positions: Tensor,
+        flat_rows: Tensor,
+        row_indices: Tensor,
+        q_lens: Tensor,
+        cu_seqlens_q: Tensor,
+        cache_seqlens: Tensor,
+        max_seqlen_q: int,
+        next_norm_weight: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        residual = hidden
+        attention = self._attention_prefill_packed_fa3(
+            hidden,
+            attn_in,
+            rotary,
+            cache,
+            write_positions,
+            flat_rows,
+            row_indices,
+            q_lens,
+            cu_seqlens_q,
+            cache_seqlens,
+            max_seqlen_q,
+        )
+        hidden, mlp_in = self._decode_add_rms_projection_input(
+            attention,
+            residual,
+            self.post_attention_layernorm_weight,
+            "gu",
+        )
+        residual = hidden
+        projected = self._mlp_project_decode_reduce(mlp_in)
+        return _tp_decode_add_rms_norm(
+            projected,
+            residual,
+            next_norm_weight,
+            self.config.rms_norm_eps,
+        )
 
     def forward_prefill_packed_flashinfer(
         self,
@@ -2152,7 +2375,90 @@ class _Llama3TensorParallelLayer:
             enable_gqa=enable_gqa,
         )
         out = out.transpose(1, 2).contiguous().view(batch, tokens, self.local_hidden_size)
-        return self._decode_linear_all_reduce(out, self.o_proj_weight, "attention", self.o_proj_weight_decode)
+        return self._decode_linear_all_reduce(
+            out,
+            self.o_proj_weight,
+            "attention",
+            self.o_proj_weight_decode,
+        )
+
+    def _attention_prefill_packed_fa3(
+        self,
+        hidden: Tensor,
+        attn_in: Tensor | None,
+        rotary: tuple[Tensor, Tensor],
+        cache: Llama3TensorParallelLayerKVCache,
+        write_positions: Tensor,
+        flat_rows: Tensor,
+        row_indices: Tensor,
+        q_lens: Tensor,
+        cu_seqlens_q: Tensor,
+        cache_seqlens: Tensor,
+        max_seqlen_q: int,
+    ) -> Tensor:
+        batch, tokens, _ = hidden.shape
+        if batch != 1:
+            raise ValueError("packed FA3 prefill expects a single flattened token row")
+        if attn_in is None:
+            attn_in = _tp_decode_rms_norm(
+                hidden,
+                self.input_layernorm_weight,
+                self.config.rms_norm_eps,
+            )
+        q, k, v = self._qkv(attn_in, batch, tokens, self.config.head_dim)
+        fused_rotary_append = False
+        if q.is_cuda and _tp_flag("TORCHINFERNO_TRITON_PACKED_ROTARY_APPEND", True):
+            try:
+                from torchinferno.kernels.triton_ops import triton_apply_rotary_append_kv_packed
+
+                q = triton_apply_rotary_append_kv_packed(
+                    q,
+                    k,
+                    v,
+                    cache.keys,
+                    cache.values,
+                    write_positions,
+                    flat_rows,
+                    rotary[0],
+                    rotary[1],
+                )
+                fused_rotary_append = True
+            except Exception as exc:
+                warn_optional_failure("llama3_tensor_parallel.packed_rotary_append", exc)
+        if not fused_rotary_append:
+            q, k = _apply_rotary_ragged_prefill(q, k, rotary)
+            _append_ragged_kv_prefill(
+                cache,
+                k.permute(2, 1, 0, 3).contiguous(),
+                v.permute(2, 1, 0, 3).contiguous(),
+                write_positions.view(tokens, 1),
+                flat_rows,
+            )
+        q_packed = q.permute(0, 2, 1, 3).reshape(
+            tokens,
+            self.local_attention_heads,
+            self.config.head_dim,
+        )
+        output = _fa3_flash_attn_with_kvcache()(
+            q=q_packed,
+            k_cache=cache.keys.permute(0, 2, 1, 3),
+            v_cache=cache.values.permute(0, 2, 1, 3),
+            cache_seqlens=cache_seqlens,
+            cache_batch_idx=row_indices.to(dtype=torch.int32),
+            cu_seqlens_q=cu_seqlens_q,
+            max_seqlen_q=max_seqlen_q,
+            softmax_scale=self.config.head_dim**-0.5,
+            causal=True,
+            num_splits=1,
+        )
+        del q_lens
+        output = output.reshape(1, tokens, self.local_hidden_size)
+        return self._decode_linear_all_reduce(
+            output,
+            self.o_proj_weight,
+            "attention",
+            self.o_proj_weight_decode,
+        )
 
     def _attention_prefill_packed_flashinfer(
         self,
@@ -2191,12 +2497,17 @@ class _Llama3TensorParallelLayer:
         )
         out_packed = flashinfer_wrapper.run(q_packed, paged_kv)
         out = out_packed.reshape(1, tokens, self.local_hidden_size)
-        return self._decode_linear_all_reduce(out, self.o_proj_weight, "attention", self.o_proj_weight_decode)
+        return self._decode_linear_all_reduce(
+            out,
+            self.o_proj_weight,
+            "attention",
+            self.o_proj_weight_decode,
+        )
 
     def forward_flashinfer(
         self,
         hidden: Tensor,
-        attn_in: Tensor | None,
+        attn_in: Tensor | _FP8PerTokenActivation | None,
         rotary: tuple[Tensor, Tensor],
         cache: FlashInferLayerKVCache,
         write_positions: Tensor,
@@ -2205,14 +2516,37 @@ class _Llama3TensorParallelLayer:
         *,
         row_indices: Tensor | None = None,
         q_lens: Tensor | None = None,
-    ) -> tuple[Tensor, Tensor]:
+        next_layer: _Llama3TensorParallelLayer | None = None,
+    ) -> tuple[Tensor, Tensor | _FP8PerTokenActivation]:
         residual = hidden
         batch, tokens, _ = hidden.shape
         if attn_in is None:
-            attn_in = _tp_decode_rms_norm(hidden, self.input_layernorm_weight, self.config.rms_norm_eps)
-        q, k, v = self._qkv(attn_in, batch, tokens, self.config.head_dim)
-        q, k = _apply_rotary_ragged_prefill(q, k, rotary)
-        _append_ragged_kv_prefill(cache, k, v, write_positions, row_indices)
+            attn_in = self._profile_block(
+                "flashinfer.input_norm",
+                lambda: self._decode_rms_projection_input(
+                    hidden,
+                    self.input_layernorm_weight,
+                    "qkv",
+                ),
+            )
+        q, k, v = self._profile_block(
+            "flashinfer.qkv",
+            lambda: self._qkv(attn_in, batch, tokens, self.config.head_dim),
+        )
+        q, k = self._profile_block(
+            "flashinfer.rotary",
+            lambda: _apply_rotary_ragged_prefill(q, k, rotary),
+        )
+        self._profile_block(
+            "flashinfer.kv_append",
+            lambda: _append_ragged_kv_prefill(
+                cache,
+                k,
+                v,
+                write_positions,
+                row_indices,
+            ),
+        )
         if hasattr(cache, 'paged_kv'):
             paged_kv = cache.paged_kv
         else:
@@ -2231,23 +2565,61 @@ class _Llama3TensorParallelLayer:
         if q_lens is not None and not (q_lens == tokens).all():
             valid_mask = torch.arange(tokens, device=q.device).unsqueeze(0) < q_lens.unsqueeze(1)
             q_packed = q_permuted[valid_mask]
-            out_packed = flashinfer_wrapper.run(q_packed, paged_kv)
+            out_packed = self._profile_block(
+                "flashinfer.attention",
+                lambda: flashinfer_wrapper.run(q_packed, paged_kv),
+            )
             out = torch.zeros(batch, tokens, self.local_hidden_size, device=q.device, dtype=q.dtype)
             out[valid_mask] = out_packed.view(-1, self.local_hidden_size)
         else:
             q_packed = q_permuted.reshape(-1, self.local_attention_heads, self.config.head_dim)
-            out_packed = flashinfer_wrapper.run(q_packed, paged_kv)
+            out_packed = self._profile_block(
+                "flashinfer.attention",
+                lambda: flashinfer_wrapper.run(q_packed, paged_kv),
+            )
             out = out_packed.view(batch, tokens, self.local_hidden_size)
-        attention = self._decode_linear_all_reduce(
-            out, self.o_proj_weight, "attention", self.o_proj_weight_decode
+        attention = self._profile_block(
+            "flashinfer.o_project_reduce",
+            lambda: self._decode_linear_all_reduce(
+                out,
+                self.o_proj_weight,
+                "attention",
+                self.o_proj_weight_decode,
+            ),
         )
-        hidden, mlp_in = _tp_decode_add_rms_norm(
-            attention, residual,
-            self.post_attention_layernorm_weight, self.config.rms_norm_eps,
+        hidden, mlp_in = self._profile_block(
+            "flashinfer.post_attention_add_norm",
+            lambda: self._decode_add_rms_projection_input(
+                attention,
+                residual,
+                self.post_attention_layernorm_weight,
+                "gu",
+            ),
         )
         residual = hidden
-        projected = self._mlp_project_decode_reduce(mlp_in)
-        return _tp_decode_add_rms_norm(projected, residual, next_norm_weight, self.config.rms_norm_eps)
+        projected = self._profile_block(
+            "flashinfer.mlp_project_reduce",
+            lambda: self._mlp_project_decode_reduce(mlp_in),
+        )
+        if next_layer is not None:
+            return self._profile_block(
+                "flashinfer.post_mlp_add_norm_fp8",
+                lambda: next_layer._decode_add_rms_projection_input(
+                    projected,
+                    residual,
+                    next_norm_weight,
+                    "qkv",
+                ),
+            )
+        return self._profile_block(
+            "flashinfer.post_mlp_add_norm",
+            lambda: _tp_decode_add_rms_norm(
+                projected,
+                residual,
+                next_norm_weight,
+                self.config.rms_norm_eps,
+            ),
+        )
 
     def _marlin_proj(
         self,
@@ -2268,13 +2640,11 @@ class _Llama3TensorParallelLayer:
         # TORCHINFERNO_MARLIN_INT4_DECODE=0 when comparing pure bf16 paths.
         # marlin int4 is a WEIGHT-ONLY-quant kernel (int4 dequant + bf16 compute): it
         # WINS at SMALL M (decode, weight-read/memory-bound: 1.52x at M=48, ~2ms/step)
-        # but LOSES at LARGE M (prefill, compute-bound -- bf16 tensor cores run
-        # full-throughput, dequant is pure overhead; measured real 70B: marlin-prefill
-        # REGRESSED few_shot TTFT 1080->1404ms, and MARLIN_INT4_DECODE=1 without the
-        # M-gate slowed multi_turn-shaped wall 22.9->25.8s via the shared prefill GEMM
-        # path _mlp_project_decode_reduce). So it MUST be M-CONDITIONAL: engage only at
+        # but loses at large M (prefill, compute-bound, where dequantization is
+        # pure overhead). It must therefore be M-conditional: engage only at
         # small M (decode); skip large M (prefill) -> bf16. Decode M = rows (<=~128);
-        # prefill M = rows*prompt (thousands), so MAX_M=256 cleanly separates them.
+        # local H100 crossover measurements put M=128 at 1.23x over bf16 while M=256
+        # is already 0.77x, so the default stops at the last measured winning shape.
         # gate_up int4 is greedy-EXACT vs bf16 (5/5 short + 4/4 long-ctx paged). The
         # large-M prefill GEMM lever is separately FP8 _scaled_mm (no infra yet).
         if not _tp_flag("TORCHINFERNO_MARLIN_INT4_DECODE", True):
@@ -2283,7 +2653,7 @@ class _Llama3TensorParallelLayer:
             return None
         if not hidden.is_cuda:  # marlin_gemm is CUDA-only; CPU falls back to bf16
             return None
-        if hidden.numel() // hidden.size(-1) > _tp_int("TORCHINFERNO_MARLIN_INT4_MAX_M", 256, minimum=1):
+        if hidden.numel() // hidden.size(-1) > _tp_int("TORCHINFERNO_MARLIN_INT4_MAX_M", 128, minimum=1):
             return None  # large-M (prefill): marlin loses -> stay bf16
         if getattr(self, f"_marlin_{key}_failed", False):
             return None
@@ -2315,44 +2685,54 @@ class _Llama3TensorParallelLayer:
         )
         return out.reshape(*hidden.shape[:-1], n)
 
-    def _fp8_proj(self, hidden: Tensor, key: str, weight: Tensor) -> Tensor | None:
-        # FP8 e4m3 W8A8 GEMM for COMPUTE-bound PREFILL (LARGE M). The complement of
-        # _marlin_proj: marlin (int4, weight-read-bound) wins SMALL-M decode; fp8 (tensor
-        # cores) wins LARGE-M prefill. M-gated to M > FP8_PREFILL_MIN_M (256) so it ONLY
-        # touches prefill -- decode (small M) stays bf16/marlin (fp8 there is slower AND
-        # fp8 decode is lossy). FP8 prefill is greedy-EXACT vs bf16
+    def _fp8_proj(
+        self,
+        hidden: Tensor,
+        key: str,
+        weight: Tensor,
+        *,
+        out: Tensor | None = None,
+    ) -> Tensor | None:
+        # FP8 e4m3 W8A8 GEMM. Prefill uses the existing lower M gate with dynamic or
+        # opt-in static scaling. Decode is a separate opt-in and always uses a cached
+        # activation scale, avoiding the reduction that made small-M FP8 uncompetitive.
+        # FP8 prefill is greedy-EXACT vs bf16
         # (validate_fp8_prefill_correctness.py); the fused-quant kernel gives 1.4-2x on
         # the big GEMMs (bench_fp8_prefill.py). Lazily tensorwise-quantizes the weight to
         # fp8 (one-time, in EAGER context only -- guarded vs graph capture so the alloc
         # never lands inside a CUDA graph; callers run fp8 prefill eager). Returns [..,N]
-        # or None (caller falls back to bf16). DEFAULT OFF -- REVERTED after a measured
-        # benchmark REGRESSION: cron run 20260608_121124 (built 0c65c8b, fp8 on) showed
-        # few_shot TTFT 288.9->515.4ms (+78%), E2E 384->600, tput 3.0->2.4; other cells
-        # within noise. CAUSE: fp8 adds ~44ms/forward of LAUNCH-BOUND quant overhead
-        # (abs+amax fixed ~235us x 160 calls); at few_shot's HIGH-CONCURRENCY SMALL
-        # prefills that overhead EXCEEDS the GEMM savings -> net slower. My local A/B that
-        # justified default-on used 400-tok prompts (larger M, where fp8 wins) and MISSED
-        # few_shot's small-prefill regime. The broad env flag stays default-off. The
-        # online server may opt in for deterministic 401-512 token sessions with a
-        # higher runtime M-gate after live few_shot and multi_turn guards.
+        # or None (caller falls back to bf16). The broad model flag stays off by
+        # default because tensorwise activation quantization has fixed reduction
+        # overhead at small M. The server enables the per-token path on supported
+        # GPUs and the runtime M gate selects it by actual matrix shape.
+        if key == "gu" and not _tp_flag("TORCHINFERNO_FP8_GATE_UP", True):
+            return None
+        if key == "down" and not _tp_flag("TORCHINFERNO_FP8_DOWN", True):
+            return None
+        decode_enabled = self._fp8_decode_shape_enabled(hidden)
         env_configured = _tp_env_set("TORCHINFERNO_FP8_PREFILL")
         env_enabled = _tp_flag("TORCHINFERNO_FP8_PREFILL", False) if env_configured else False
         runtime_enabled = bool(getattr(self, "_runtime_fp8_prefill_enabled", False))
         if env_configured and not env_enabled:
             runtime_enabled = False
-        if not env_enabled and not runtime_enabled:
+        if not decode_enabled and not env_enabled and not runtime_enabled:
             return None
         if not hidden.is_cuda:
             return None
         m = hidden.numel() // hidden.size(-1)
-        if _tp_env_set("TORCHINFERNO_FP8_PREFILL_MIN_M"):
-            min_m = _tp_int("TORCHINFERNO_FP8_PREFILL_MIN_M", 256, minimum=1)
-        elif runtime_enabled and not env_enabled:
-            min_m = int(getattr(self, "_runtime_fp8_prefill_min_m", 2048))
-        else:
-            min_m = 256
-        if m <= max(1, min_m):
-            return None  # small-M (decode): fp8 loses + is lossy -> bf16/marlin
+        if not decode_enabled:
+            if _tp_env_set("TORCHINFERNO_FP8_PREFILL_MIN_M"):
+                min_m = _tp_int("TORCHINFERNO_FP8_PREFILL_MIN_M", 256, minimum=1)
+            elif runtime_enabled and not env_enabled:
+                min_m = int(getattr(self, "_runtime_fp8_prefill_min_m", 2048))
+            else:
+                min_m = 256
+            if m <= max(1, min_m):
+                return None
+        if _tp_flag("TORCHINFERNO_FP8_PER_TOKEN_SCALE", False):
+            return self._fp8_per_token_proj(hidden, key, weight, out=out)
+        if out is not None:
+            return None
         if getattr(self, f"_fp8_{key}_failed", False):
             return None
         if getattr(self, f"_fp8_{key}_wq", None) is None:
@@ -2371,35 +2751,335 @@ class _Llama3TensorParallelLayer:
                 setattr(self, f"_fp8_{key}_failed", True)
                 return None
         from torchinferno.kernels import fp8 as _fp8
+
+        activation_scale = None
+        activation_inverse_scale = None
+        static_scale = decode_enabled or _tp_flag(
+            "TORCHINFERNO_FP8_PREFILL_STATIC_ACTIVATION_SCALE",
+            False,
+        )
+        if static_scale:
+            mode = "decode" if decode_enabled else "prefill"
+            scale_name = f"_fp8_{key}_{mode}_activation_scale"
+            inverse_name = f"_fp8_{key}_{mode}_activation_inverse_scale"
+            activation_scale = getattr(self, scale_name, None)
+            activation_inverse_scale = getattr(self, inverse_name, None)
+            if activation_scale is None:
+                if _cuda_stream_is_capturing(hidden.device):
+                    return None
+                margin_name = (
+                    "TORCHINFERNO_FP8_DECODE_SCALE_MARGIN"
+                    if decode_enabled
+                    else "TORCHINFERNO_FP8_PREFILL_STATIC_SCALE_MARGIN"
+                )
+                margin = _tp_float(margin_name, 4.0, minimum=1.0)
+                activation_scale = (
+                    hidden.abs().amax() / float(_fp8.FP8_E4M3_MAX)
+                ).clamp(min=1e-6).to(torch.float32) * margin
+                activation_inverse_scale = activation_scale.reciprocal()
+                setattr(self, scale_name, activation_scale)
+                setattr(self, inverse_name, activation_inverse_scale)
         return _fp8.fp8_prefill_linear(
-            hidden, getattr(self, f"_fp8_{key}_wq"), getattr(self, f"_fp8_{key}_sb")
+            hidden,
+            getattr(self, f"_fp8_{key}_wq"),
+            getattr(self, f"_fp8_{key}_sb"),
+            activation_scale=activation_scale,
+            activation_inverse_scale=activation_inverse_scale,
         )
 
-    def _mlp_project_decode_reduce(self, hidden: Tensor) -> Tensor:
+    def _fp8_per_token_proj(
+        self,
+        hidden: Tensor | _FP8PerTokenActivation,
+        key: str,
+        weight: Tensor,
+        *,
+        out: Tensor | None = None,
+    ) -> Tensor | None:
+        if getattr(self, f"_fp8_per_token_{key}_failed", False):
+            return None
+        weight_q = getattr(self, f"_fp8_per_token_{key}_wq", None)
+        weight_scale = getattr(self, f"_fp8_per_token_{key}_ws", None)
+        if weight_q is None or weight_scale is None:
+            if _cuda_stream_is_capturing(hidden.device):
+                return None
+            try:
+                from torchinferno.kernels.fp8 import quantize_weight_fp8_per_channel
+
+                weight_q, weight_scale = quantize_weight_fp8_per_channel(weight)
+                setattr(self, f"_fp8_per_token_{key}_wq", weight_q)
+                setattr(self, f"_fp8_per_token_{key}_ws", weight_scale)
+            except Exception as exc:
+                warn_optional_failure(f"llama3_tensor_parallel.fp8_per_token_{key}", exc)
+                setattr(self, f"_fp8_per_token_{key}_failed", True)
+                return None
+        try:
+            activation = (
+                hidden.values
+                if isinstance(hidden, _FP8PerTokenActivation)
+                else hidden
+            )
+            rows = activation.numel() // activation.size(-1)
+            use_fast_accum = (
+                rows >= _tp_int(
+                    "TORCHINFERNO_FP8_PREFILL_FAST_ACCUM_MIN_ROWS",
+                    129,
+                    minimum=1,
+                )
+                and _tp_flag(
+                    "TORCHINFERNO_FP8_PREFILL_FAST_ACCUM",
+                    False,
+                )
+            )
+            if isinstance(hidden, _FP8PerTokenActivation):
+                from torchinferno.kernels.fp8 import fp8_per_token_linear_quantized
+
+                return fp8_per_token_linear_quantized(
+                    hidden.values,
+                    hidden.scales,
+                    weight_q,
+                    weight_scale,
+                    out_dtype=weight.dtype,
+                    out=out,
+                    use_fast_accum=use_fast_accum,
+                )
+            from torchinferno.kernels.fp8 import fp8_per_token_linear
+
+            return fp8_per_token_linear(
+                hidden,
+                weight_q,
+                weight_scale,
+                out=out,
+                use_fast_accum=use_fast_accum,
+            )
+        except Exception as exc:
+            warn_optional_failure(f"llama3_tensor_parallel.fp8_per_token_{key}", exc)
+            setattr(self, f"_fp8_per_token_{key}_failed", True)
+            return None
+
+    def _can_fuse_fp8_projection_input(self, hidden: Tensor, key: str) -> bool:
+        if not _tp_flag("TORCHINFERNO_FP8_FUSED_ACTIVATIONS", False):
+            return False
+        if not _tp_flag("TORCHINFERNO_FP8_PER_TOKEN_SCALE", False):
+            return False
+        decode_enabled = self._fp8_decode_shape_enabled(hidden)
+        prefill_enabled = False
+        if not decode_enabled and hidden.is_cuda:
+            env_configured = _tp_env_set("TORCHINFERNO_FP8_PREFILL")
+            env_enabled = (
+                _tp_flag("TORCHINFERNO_FP8_PREFILL", False)
+                if env_configured
+                else False
+            )
+            runtime_enabled = bool(getattr(self, "_runtime_fp8_prefill_enabled", False))
+            if env_configured and not env_enabled:
+                runtime_enabled = False
+            if env_enabled or runtime_enabled:
+                if _tp_env_set("TORCHINFERNO_FP8_PREFILL_MIN_M"):
+                    min_m = _tp_int("TORCHINFERNO_FP8_PREFILL_MIN_M", 256, minimum=1)
+                elif runtime_enabled and not env_enabled:
+                    min_m = int(getattr(self, "_runtime_fp8_prefill_min_m", 2048))
+                else:
+                    min_m = 256
+                rows = hidden.numel() // hidden.size(-1)
+                prefill_enabled = rows > max(1, min_m)
+        if not decode_enabled and not prefill_enabled:
+            return False
+        if decode_enabled and not _tp_flag(
+            "TORCHINFERNO_FP8_FUSED_ACTIVATIONS_DECODE",
+            True,
+        ):
+            return False
+        if (
+            decode_enabled
+            and key == "down"
+            and not _tp_flag("TORCHINFERNO_FP8_FUSED_SWIGLU_DECODE", True)
+        ):
+            return False
+        if (
+            decode_enabled
+            and key == "qkv"
+            and not _tp_flag("TORCHINFERNO_FP8_FUSED_QKV_DECODE", True)
+        ):
+            return False
+        if (
+            decode_enabled
+            and key == "gu"
+            and not _tp_flag("TORCHINFERNO_FP8_FUSED_GATE_UP_DECODE", True)
+        ):
+            return False
+        if key == "qkv" and not _tp_flag("TORCHINFERNO_FP8_QKV", False):
+            return False
+        if (
+            key == "qkv"
+            and prefill_enabled
+            and not _tp_flag("TORCHINFERNO_FP8_QKV_PREFILL", False)
+        ):
+            return False
+        if (
+            key == "down"
+            and prefill_enabled
+            and not _tp_flag("TORCHINFERNO_FP8_FUSED_SWIGLU_PREFILL", False)
+        ):
+            return False
+        if key == "gu" and not _tp_flag("TORCHINFERNO_FP8_GATE_UP", True):
+            return False
+        if key == "down" and not _tp_flag("TORCHINFERNO_FP8_DOWN", True):
+            return False
+        enabled = (
+            not getattr(self, f"_fp8_per_token_{key}_failed", False)
+            and getattr(self, f"_fp8_per_token_{key}_wq", None) is not None
+            and getattr(self, f"_fp8_per_token_{key}_ws", None) is not None
+        )
+        if enabled:
+            self._fp8_fused_activation_eligible_calls = int(
+                getattr(self, "_fp8_fused_activation_eligible_calls", 0)
+            ) + 1
+        return enabled
+
+    def _decode_rms_projection_input(
+        self,
+        hidden: Tensor,
+        weight: Tensor,
+        key: str,
+    ) -> Tensor | _FP8PerTokenActivation:
+        if self._can_fuse_fp8_projection_input(hidden, key):
+            try:
+                from torchinferno.kernels.triton_ops import triton_rms_norm_fp8_per_token
+
+                values, scales = triton_rms_norm_fp8_per_token(
+                    hidden,
+                    weight,
+                    self.config.rms_norm_eps,
+                )
+                self._fp8_fused_activation_success_calls = int(
+                    getattr(self, "_fp8_fused_activation_success_calls", 0)
+                ) + 1
+                return _FP8PerTokenActivation(values, scales)
+            except Exception as exc:
+                warn_optional_failure("llama3_tensor_parallel.rms_norm_fp8", exc)
+        return _tp_decode_rms_norm(hidden, weight, self.config.rms_norm_eps)
+
+    def _decode_add_rms_projection_input(
+        self,
+        hidden: Tensor,
+        residual: Tensor,
+        weight: Tensor,
+        key: str,
+    ) -> tuple[Tensor, Tensor | _FP8PerTokenActivation]:
+        if self._can_fuse_fp8_projection_input(hidden, key):
+            try:
+                from torchinferno.kernels.triton_ops import triton_add_rms_norm_fp8_per_token
+
+                summed, values, scales = triton_add_rms_norm_fp8_per_token(
+                    hidden,
+                    residual,
+                    weight,
+                    self.config.rms_norm_eps,
+                )
+                self._fp8_fused_activation_success_calls = int(
+                    getattr(self, "_fp8_fused_activation_success_calls", 0)
+                ) + 1
+                return summed, _FP8PerTokenActivation(values, scales)
+            except Exception as exc:
+                warn_optional_failure("llama3_tensor_parallel.add_rms_norm_fp8", exc)
+        return _tp_decode_add_rms_norm(
+            hidden,
+            residual,
+            weight,
+            self.config.rms_norm_eps,
+        )
+
+    @staticmethod
+    def _fp8_decode_shape_enabled(hidden: Tensor) -> bool:
+        if not _tp_flag("TORCHINFERNO_FP8_DECODE", False):
+            return False
+        if hidden.ndim != 3 or hidden.size(1) != 1:
+            return False
+        rows = hidden.numel() // hidden.size(-1)
+        max_rows = _tp_int("TORCHINFERNO_FP8_DECODE_MAX_M", 128, minimum=1)
+        return rows <= max_rows
+
+    def _mlp_project_decode_reduce(
+        self,
+        hidden: Tensor | _FP8PerTokenActivation,
+    ) -> Tensor:
         # This path serves BOTH decode (small M) and paged PREFILL (large M, via
         # forward_prefill_paged). marlin wins small-M; fp8 wins large-M (M-gates are
         # complementary, so at most one fires).
-        gu_buffer = self._decode_scratch_buffer(
-            "mlp-gate-up",
-            hidden,
-            self.gate_up_proj_weight.size(0),
+        reference = hidden.values if isinstance(hidden, _FP8PerTokenActivation) else hidden
+        gu_buffer = (
+            None
+            if isinstance(hidden, _FP8PerTokenActivation)
+            else self._decode_scratch_buffer(
+                "mlp-gate-up",
+                hidden,
+                self.gate_up_proj_weight.size(0),
+            )
         )
-        gu = self._marlin_proj(hidden, "gu", self.gate_up_proj_weight, out=gu_buffer)
-        if gu is None:
-            gu = self._fp8_proj(hidden, "gu", self.gate_up_proj_weight)
+        fp8_decode = self._fp8_decode_shape_enabled(reference)
+        if isinstance(hidden, _FP8PerTokenActivation):
+            gu = self._profile_block(
+                "flashinfer.mlp.gate_up_fp8",
+                lambda: self._fp8_per_token_proj(hidden, "gu", self.gate_up_proj_weight),
+            )
+            if gu is None:
+                raise RuntimeError("fused FP8 MLP input requires the per-token FP8 gate projection")
+        else:
+            gu = (
+                self._profile_block(
+                    "flashinfer.mlp.gate_up_fp8",
+                    lambda: self._fp8_proj(hidden, "gu", self.gate_up_proj_weight),
+                )
+                if fp8_decode
+                else None
+            )
+        if gu is None and not isinstance(hidden, _FP8PerTokenActivation):
+            gu = self._marlin_proj(hidden, "gu", self.gate_up_proj_weight, out=gu_buffer)
+        if gu is None and not isinstance(hidden, _FP8PerTokenActivation):
+            gu = self._profile_block(
+                "flashinfer.mlp.gate_up_fp8",
+                lambda: self._fp8_proj(hidden, "gu", self.gate_up_proj_weight),
+            )
         if gu is not None:
             gate, up = gu.split((self.local_intermediate_size, self.local_intermediate_size), dim=-1)
         else:
-            gate, up = _decode_linear(hidden, self.gate_up_proj_weight, self.gate_up_proj_weight_decode).split(
-                (self.local_intermediate_size, self.local_intermediate_size),
-                dim=-1,
+            gate, up = self._profile_block(
+                "flashinfer.mlp.gate_up_bf16",
+                lambda: _decode_linear(
+                    hidden,
+                    self.gate_up_proj_weight,
+                    self.gate_up_proj_weight_decode,
+                ),
+            ).split((self.local_intermediate_size, self.local_intermediate_size), dim=-1)
+        fp8_activated: _FP8PerTokenActivation | None = None
+        if self._can_fuse_fp8_projection_input(gate, "down"):
+            try:
+                from torchinferno.kernels.triton_ops import triton_swiglu_fp8_per_token
+
+                values, scales = self._profile_block(
+                    "flashinfer.mlp.swiglu_fp8",
+                    lambda: triton_swiglu_fp8_per_token(gate, up),
+                )
+                self._fp8_fused_activation_success_calls = int(
+                    getattr(self, "_fp8_fused_activation_success_calls", 0)
+                ) + 1
+                fp8_activated = _FP8PerTokenActivation(values, scales)
+            except Exception as exc:
+                warn_optional_failure("llama3_tensor_parallel.swiglu_fp8", exc)
+        if fp8_activated is None:
+            activation_buffer = self._decode_scratch_buffer(
+                "mlp-activation",
+                gate,
+                self.local_intermediate_size,
             )
-        activation_buffer = self._decode_scratch_buffer(
-            "mlp-activation",
-            hidden,
-            self.local_intermediate_size,
-        )
-        activated = _tp_decode_swiglu(gate, up, out=activation_buffer)
+            activated = self._profile_block(
+                "flashinfer.mlp.swiglu",
+                lambda: _tp_decode_swiglu(gate, up, out=activation_buffer),
+            )
+        else:
+            # Shape/dtype carrier for the reduce buffer; the projection consumes
+            # fp8_activated and never reads this tensor as its matrix input.
+            activated = gate
         # down_proj is the OTHER big MLP GEMM (N=hidden 8192, K=local_intermediate);
         # at decode M it is weight-read/memory-bound where marlin int4 wins the GEMM
         # (~1.44x, bench_marlin_int4). BUT default-OFF: unlike gate_up (greedy-EXACT vs
@@ -2407,12 +3087,31 @@ class _Llama3TensorParallelLayer:
         # across 80 layers and FLIPS the greedy argmax from the FIRST decode token
         # (validate_marlin_down: down=0 -> 128009..., down=1 -> 27... both coherent but
         # divergent) -- too lossy for the tight 98-100% bench correctness bar. And its
-        # ~1ms TPOT saving cannot flip a cell anyway (long_output/multi_turn TPOT gaps
-        # are 7-9ms). Wiring kept behind the flag for future calibrated (GPTQ/AWQ) quant.
+        # Wiring remains behind the flag for future calibrated (GPTQ/AWQ) weights.
         down_key = "down" if _tp_flag("TORCHINFERNO_MARLIN_INT4_DOWN", False) else None
-        return self._decode_linear_all_reduce(
-            activated, self.down_proj_weight, "mlp", self.down_proj_weight_decode,
-            marlin_key=down_key, fp8_key="down",
+        if fp8_activated is not None:
+            return self._profile_block(
+                "flashinfer.mlp.down_project_reduce",
+                lambda: self._decode_linear_all_reduce(
+                    activated,
+                    self.down_proj_weight,
+                    "mlp",
+                    self.down_proj_weight_decode,
+                    marlin_key=down_key,
+                    fp8_key="down",
+                    fp8_activation=fp8_activated,
+                ),
+            )
+        return self._profile_block(
+            "flashinfer.mlp.down_project_reduce",
+            lambda: self._decode_linear_all_reduce(
+                activated,
+                self.down_proj_weight,
+                "mlp",
+                self.down_proj_weight_decode,
+                marlin_key=down_key,
+                fp8_key="down",
+            ),
         )
 
     def _decode_scratch_buffer(self, name: str, hidden: Tensor, width: int) -> Tensor | None:
@@ -2518,59 +3217,115 @@ class _Llama3TensorParallelLayer:
         weight_t: Tensor | None = None,
         marlin_key: str | None = None,
         fp8_key: str | None = None,
+        fp8_activation: _FP8PerTokenActivation | None = None,
     ) -> Tensor:
         # marlin_key/fp8_key set => try a quantized GEMM for this row-parallel proj
         # (down_proj). Both kernels are reduce-agnostic; we all-reduce the output after.
         # marlin (int4) wins small-M decode; fp8 wins large-M prefill (M-gates are
         # complementary). In the symm-mem path, let Marlin write directly into the
         # reduce buffer so decode does not allocate an intermediate and copy it.
+        def project_fp8(*, out: Tensor | None = None) -> Tensor | None:
+            if fp8_key is None:
+                return None
+            if fp8_activation is None:
+                return self._fp8_proj(hidden, fp8_key, weight, out=out)
+            output = self._fp8_per_token_proj(
+                fp8_activation,
+                fp8_key,
+                weight,
+                out=out,
+            )
+            if output is None:
+                raise RuntimeError("fused FP8 activation requires a per-token FP8 projection")
+            return output
+
         use_sm = _should_use_symm_mem_all_reduce(hidden, weight, self.world_size)
         sm_name = buffer_name
         if not use_sm and _should_use_symm_mem_prefill_all_reduce(hidden, weight, self.world_size):
-            # Eager prefill: bound distinct prefill shapes so per-shape ~0.5GB
-            # symm-mem buffers cannot churn into OOM; new shapes past the cap fall
-            # back to NCCL. During CUDA graph capture, only reuse a buffer that an
-            # eager warmup already allocated and probed; rendezvous/allocation inside
-            # capture is not legal.
+            # Every prefill graph slices the same fixed-capacity allocation. This
+            # keeps graph coverage independent of how many batch/suffix buckets are
+            # warmed and avoids one multicast registration per concrete shape.
             sm_name = f"{buffer_name}-pf"
-            cap = _tp_int("TORCHINFERNO_SYMM_MEM_PREFILL_MAX_BUFFERS", 6, minimum=1)
-            shape_key = (sm_name, tuple(hidden.shape[:-1]), int(weight.size(0)))
-            if shape_key in _SYMM_PREFILL_SHAPES or len(_SYMM_PREFILL_SHAPES) < cap:
-                expected_shape = (*hidden.shape[:-1], weight.size(0))
-                use_sm = (
-                    not _cuda_stream_is_capturing(hidden.device)
-                    or self._symm_reduce_buffer_ready(sm_name, hidden, expected_shape)
-                )
+            expected_shape = (*hidden.shape[:-1], weight.size(0))
+            use_sm = (
+                not _cuda_stream_is_capturing(hidden.device)
+                or self._symm_reduce_buffer_ready(sm_name, hidden, expected_shape)
+            )
         if use_sm and not self._symm_reduce_failed:
             try:
                 expected_shape = (*hidden.shape[:-1], weight.size(0))
                 buffer, group_name = self._symm_reduce_buffer(sm_name, hidden, expected_shape)
-                if sm_name != buffer_name:
-                    _SYMM_PREFILL_SHAPES.add((sm_name, tuple(hidden.shape[:-1]), int(weight.size(0))))
                 hidden_2d = hidden.reshape(-1, hidden.size(-1))
                 output_2d = buffer.reshape(-1, weight.size(0))
                 wrote_output = False
-                if marlin_key is not None:
+                fp8_decode = fp8_activation is not None or self._fp8_decode_shape_enabled(hidden)
+                if fp8_decode and fp8_key is not None:
+                    fp8_out = self._profile_block(
+                        f"flashinfer.{buffer_name}.fp8_project",
+                        project_fp8,
+                    )
+                    if fp8_out is not None:
+                        self._profile_block(
+                            f"flashinfer.{buffer_name}.copy_to_reduce",
+                            lambda: output_2d.copy_(
+                                fp8_out.reshape(-1, weight.size(0))
+                            ),
+                        )
+                        wrote_output = True
+                if not wrote_output and marlin_key is not None and fp8_activation is None:
                     wrote_output = self._marlin_proj(hidden, marlin_key, weight, out=output_2d) is not None
                 if not wrote_output:
-                    fp8_out = self._fp8_proj(hidden, fp8_key, weight) if fp8_key is not None else None
+                    fp8_direct_out = _tp_flag(
+                        "TORCHINFERNO_FP8_PER_TOKEN_SCALE",
+                        False,
+                    )
+                    fp8_out = (
+                        self._profile_block(
+                            f"flashinfer.{buffer_name}.fp8_project",
+                            lambda: project_fp8(
+                                out=buffer if fp8_direct_out else None,
+                            ),
+                        )
+                        if fp8_key is not None
+                        else None
+                    )
                     if fp8_out is not None:
-                        output_2d.copy_(fp8_out.reshape(-1, weight.size(0)))
+                        if not fp8_direct_out:
+                            self._profile_block(
+                                f"flashinfer.{buffer_name}.copy_to_reduce",
+                                lambda: output_2d.copy_(
+                                    fp8_out.reshape(-1, weight.size(0))
+                                ),
+                            )
                     elif weight_t is not None:
-                        torch.mm(hidden_2d, weight_t, out=output_2d)
+                        self._profile_block(
+                            f"flashinfer.{buffer_name}.bf16_project",
+                            lambda: torch.mm(hidden_2d, weight_t, out=output_2d),
+                        )
                     else:
-                        torch.mm(hidden_2d, weight.t(), out=output_2d)
-                torch.ops.symm_mem.multimem_all_reduce_(buffer, "sum", group_name)
+                        self._profile_block(
+                            f"flashinfer.{buffer_name}.bf16_project",
+                            lambda: torch.mm(hidden_2d, weight.t(), out=output_2d),
+                        )
+                self._profile_block(
+                    f"flashinfer.{buffer_name}.all_reduce",
+                    lambda: torch.ops.symm_mem.multimem_all_reduce_(buffer, "sum", group_name),
+                )
                 return buffer
             except Exception:
                 self._symm_reduce_failed = True
                 _disable_symm_reduce()
-        marlin_out = self._marlin_proj(hidden, marlin_key, weight) if marlin_key is not None else None
+        fp8_decode = fp8_activation is not None or self._fp8_decode_shape_enabled(hidden)
+        marlin_out = project_fp8() if fp8_decode and fp8_key is not None else None
+        if marlin_out is None and marlin_key is not None and fp8_activation is None:
+            marlin_out = self._marlin_proj(hidden, marlin_key, weight)
         if marlin_out is None and fp8_key is not None:
-            marlin_out = self._fp8_proj(hidden, fp8_key, weight)
+            marlin_out = project_fp8()
         if marlin_out is not None:
             _all_reduce(marlin_out)
             return marlin_out
+        if fp8_activation is not None:
+            raise RuntimeError("fused FP8 activation cannot fall back to a BF16 projection")
         projected = _decode_linear(hidden, weight, weight_t)
         _all_reduce(projected)
         return projected
@@ -2613,7 +3368,13 @@ class _Llama3TensorParallelLayer:
             return False
         group_name = dist.group.WORLD.group_name
         device_index = hidden.device.index if hidden.device.index is not None else torch.cuda.current_device()
-        key = (group_name, device_index, name, str(hidden.dtype), expected_shape)
+        key, _storage_shape = self._symm_reduce_buffer_spec(
+            group_name,
+            device_index,
+            name,
+            hidden,
+            expected_shape,
+        )
         return key in _SYMM_REDUCE_BUFFERS and key in _SYMM_REDUCE_PROBED
 
     def _symm_reduce_buffer(self, name: str, hidden: Tensor, expected_shape: tuple[int, ...]) -> tuple[Tensor, str]:
@@ -2621,17 +3382,63 @@ class _Llama3TensorParallelLayer:
             raise RuntimeError("symmetric-memory allreduce requires an initialized process group")
         group_name = dist.group.WORLD.group_name
         device_index = hidden.device.index if hidden.device.index is not None else torch.cuda.current_device()
-        key = (group_name, device_index, name, str(hidden.dtype), expected_shape)
+        key, storage_shape = self._symm_reduce_buffer_spec(
+            group_name,
+            device_index,
+            name,
+            hidden,
+            expected_shape,
+        )
         buffer = _SYMM_REDUCE_BUFFERS.get(key)
         if buffer is None:
             import torch.distributed._symmetric_memory as symm_mem
 
-            buffer = symm_mem.empty(expected_shape, device=hidden.device, dtype=hidden.dtype)
+            buffer = symm_mem.empty(storage_shape, device=hidden.device, dtype=hidden.dtype)
             symm_mem.rendezvous(buffer, group_name)
             _SYMM_REDUCE_BUFFERS[key] = buffer
         if key not in _SYMM_REDUCE_PROBED:
             self._probe_symm_reduce_buffer(key, buffer, group_name)
-        return buffer, group_name
+        if storage_shape == expected_shape:
+            return buffer, group_name
+        tokens = 1
+        for size in expected_shape[:-1]:
+            tokens *= int(size)
+        return buffer[:tokens].view(expected_shape), group_name
+
+    @staticmethod
+    def _symm_reduce_buffer_spec(
+        group_name: str,
+        device_index: int,
+        name: str,
+        hidden: Tensor,
+        expected_shape: tuple[int, ...],
+    ) -> tuple[tuple[str, int, str, str, tuple[int, ...]], tuple[int, ...]]:
+        if name.endswith("-prefill"):
+            family = name[: -len("-prefill")]
+        elif name.endswith("-pf"):
+            family = name[: -len("-pf")]
+        else:
+            key = (group_name, device_index, name, str(hidden.dtype), expected_shape)
+            return key, expected_shape
+
+        if len(expected_shape) < 2:
+            raise ValueError("prefill symmetric-memory buffers require a feature dimension")
+        tokens = 1
+        for size in expected_shape[:-1]:
+            tokens *= int(size)
+        capacity = _tp_int(
+            "TORCHINFERNO_SYMM_MEM_PREFILL_BUFFER_TOKENS",
+            4096,
+            minimum=1,
+        )
+        if tokens > capacity:
+            raise ValueError(
+                f"prefill symmetric-memory buffer capacity exceeded: {tokens} > {capacity}"
+            )
+        storage_shape = (capacity, int(expected_shape[-1]))
+        storage_name = f"{family}-prefill-capacity"
+        key = (group_name, device_index, storage_name, str(hidden.dtype), storage_shape)
+        return key, storage_shape
 
     def _probe_symm_reduce_buffer(
         self,
@@ -2833,11 +3640,34 @@ class _Llama3TensorParallelLayer:
         captured.graph.replay()
         return captured.output
 
-    def _qkv(self, hidden: Tensor, batch: int, tokens: int, head_dim: int) -> tuple[Tensor, Tensor, Tensor]:
-        # qkv stays bf16: it is a SMALL GEMM (N=local_qkv ~1280) where marlin's fixed
-        # overhead loses (measured: marlin qkv 0.43x, and end-to-end it REGRESSED the
-        # decode step). marlin only wins the big GEMMs (gate_up, down).
-        qkv = _decode_linear(hidden, self.qkv_proj_weight, self.qkv_proj_weight_decode)
+    def _qkv(
+        self,
+        hidden: Tensor | _FP8PerTokenActivation,
+        batch: int,
+        tokens: int,
+        head_dim: int,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        fp8_qkv_enabled = _tp_flag("TORCHINFERNO_FP8_QKV", False)
+        if isinstance(hidden, _FP8PerTokenActivation):
+            qkv = (
+                self._fp8_per_token_proj(hidden, "qkv", self.qkv_proj_weight)
+                if fp8_qkv_enabled
+                else None
+            )
+            if qkv is None:
+                raise RuntimeError("fused FP8 QKV input requires the per-token FP8 QKV projection")
+        else:
+            fp8_qkv_shape_enabled = self._fp8_decode_shape_enabled(hidden) or _tp_flag(
+                "TORCHINFERNO_FP8_QKV_PREFILL",
+                False,
+            )
+            qkv = (
+                self._fp8_proj(hidden, "qkv", self.qkv_proj_weight)
+                if fp8_qkv_enabled and fp8_qkv_shape_enabled
+                else None
+            )
+        if qkv is None:
+            qkv = _decode_linear(hidden, self.qkv_proj_weight, self.qkv_proj_weight_decode)
         q, k, v = qkv.split(
             (self.local_hidden_size, self.local_key_value_size, self.local_key_value_size),
             dim=-1,
@@ -3064,7 +3894,7 @@ class _Llama3TensorParallelLayer:
         )
 
     def _profile_block(self, name: str, fn):
-        if self.profile_seconds is None or self.profile_counts is None:
+        if getattr(self, "profile_seconds", None) is None or getattr(self, "profile_counts", None) is None:
             return fn()
         if self.device.type == "cuda":
             torch.cuda.synchronize(self.device)
@@ -3104,6 +3934,9 @@ class Llama3TensorParallelForCausalLM:
         self.norm_weight = norm_weight
         self.lm_head_weight = lm_head_weight
         self.lm_head_weight_decode = _maybe_decode_weight_t(lm_head_weight)
+        self._fp8_lm_head_weight: Tensor | None = None
+        self._fp8_lm_head_scale: Tensor | None = None
+        self._fp8_lm_head_failed = False
         self.layers = layers
         self.rank = rank
         self.local_rank = local_rank
@@ -3161,6 +3994,14 @@ class Llama3TensorParallelForCausalLM:
         self._packed_ragged_prefill_logits_graphs: dict[
             tuple[object, ...],
             _StaticPackedRaggedPrefillLogitsGraphCall,
+        ] = {}
+        self._token_bucket_prefill_graphs: dict[
+            tuple[object, ...],
+            _StaticTokenBucketPrefillGraphCall,
+        ] = {}
+        self._token_bucket_prefix_copy_graphs: dict[
+            tuple[object, ...],
+            _StaticTokenBucketPrefixCopyGraphCall,
         ] = {}
         self._packed_ragged_prefill_logits_graph_seen: dict[tuple[object, ...], int] = {}
         self._ragged_prefill_logits_graph_evictions = 0
@@ -3601,20 +4442,82 @@ class Llama3TensorParallelForCausalLM:
             layer_cls = PagedLlama3TensorParallelLayerKVCache
         else:
             layer_cls = Llama3TensorParallelLayerKVCache
-        def _make_layer_cache():
+        stacked_keys: Tensor | None = None
+        stacked_values: Tensor | None = None
+        if (
+            layer_cls is Llama3TensorParallelLayerKVCache
+            and _tp_flag("TORCHINFERNO_STACKED_DENSE_KV_STORAGE", False)
+        ):
+            stacked_shape = (
+                len(self.layers),
+                batch_size,
+                local_kv_heads,
+                max_seq_len,
+                self.config.head_dim,
+            )
+            stacked_keys = torch.empty(stacked_shape, device=self.device, dtype=self.dtype)
+            stacked_values = torch.empty(stacked_shape, device=self.device, dtype=self.dtype)
+
+        def _make_layer_cache(layer_id: int):
             if layer_cls is PagedLlama3TensorParallelLayerKVCache:
                 return layer_cls(
                     batch_size, max_seq_len, local_kv_heads, self.config.head_dim,
                     page_size=page_size, device=self.device, dtype=self.dtype,
+                )
+            if stacked_keys is not None and stacked_values is not None:
+                return layer_cls(
+                    batch_size,
+                    max_seq_len,
+                    local_kv_heads,
+                    self.config.head_dim,
+                    device=self.device,
+                    dtype=self.dtype,
+                    keys=stacked_keys[layer_id],
+                    values=stacked_values[layer_id],
                 )
             return layer_cls(
                 batch_size, max_seq_len, local_kv_heads, self.config.head_dim,
                 device=self.device, dtype=self.dtype,
             )
         return Llama3TensorParallelCache(
-            [_make_layer_cache() for _ in self.layers],
+            [_make_layer_cache(layer_id) for layer_id, _ in enumerate(self.layers)],
             cache_backend=cache_backend,
+            stacked_keys=stacked_keys,
+            stacked_values=stacked_values,
         )
+
+    def _lm_head_linear(self, hidden: Tensor) -> Tensor:
+        if (
+            not _tp_flag("TORCHINFERNO_FP8_LM_HEAD", False)
+            or not hidden.is_cuda
+            or self._fp8_lm_head_failed
+        ):
+            return _decode_linear(hidden, self.lm_head_weight, self.lm_head_weight_decode)
+        if self._fp8_lm_head_weight is None or self._fp8_lm_head_scale is None:
+            if _cuda_stream_is_capturing(hidden.device):
+                return _decode_linear(hidden, self.lm_head_weight, self.lm_head_weight_decode)
+            try:
+                from torchinferno.kernels.fp8 import quantize_weight_fp8_per_channel
+
+                weight, scale = quantize_weight_fp8_per_channel(self.lm_head_weight)
+                self._fp8_lm_head_weight = weight
+                self._fp8_lm_head_scale = scale
+            except Exception as exc:
+                warn_optional_failure("llama3_tensor_parallel.fp8_lm_head_weight", exc)
+                self._fp8_lm_head_failed = True
+                return _decode_linear(hidden, self.lm_head_weight, self.lm_head_weight_decode)
+        try:
+            from torchinferno.kernels.fp8 import fp8_per_token_linear
+
+            return fp8_per_token_linear(
+                hidden,
+                self._fp8_lm_head_weight,
+                self._fp8_lm_head_scale,
+            )
+        except Exception as exc:
+            warn_optional_failure("llama3_tensor_parallel.fp8_lm_head", exc)
+            self._fp8_lm_head_failed = True
+            return _decode_linear(hidden, self.lm_head_weight, self.lm_head_weight_decode)
 
     @torch.inference_mode()
     def forward(
@@ -3683,7 +4586,7 @@ class Llama3TensorParallelForCausalLM:
         elif return_last_logits_only:
             hidden = hidden[:, -1:, :]
         hidden = _tp_rms_norm(hidden, self.norm_weight, self.config.rms_norm_eps)
-        logits = F.linear(hidden, self.lm_head_weight)
+        logits = self._lm_head_linear(hidden)
         if return_sharded_logits:
             return logits, active_cache
         logits = self._gather_logits(logits)
@@ -3711,7 +4614,7 @@ class Llama3TensorParallelForCausalLM:
         rotary: tuple[Tensor, Tensor],
         cache: "Llama3TensorParallelCache",
     ) -> Tensor:
-        attn_in: Tensor | None = None
+        attn_in: Tensor | _FP8PerTokenActivation | None = None
         for layer_id, layer in enumerate(self.layers):
             layer_cache = cache.layers[layer_id]
             next_norm_weight = (
@@ -5043,6 +5946,19 @@ class Llama3TensorParallelForCausalLM:
                     captured.cache_token_bucket,
                 )
                 self._sample_next_token(logits[:, -1, :], 0.0)
+                if _tp_flag("TORCHINFERNO_FP8_FUSED_ACTIVATIONS", False):
+                    # The first eager call initializes lazy FP8 weights. Run once
+                    # more so the fused Triton producers are JIT-compiled before
+                    # CUDA capture rather than falling back inside capture.
+                    logits = self._forward_decode_ragged_static(
+                        captured.static_input_ids,
+                        cache,
+                        captured.static_cache_positions,
+                        captured.static_row_indices,
+                        self._ragged_decode_graph_rotary(captured),
+                        captured.cache_token_bucket,
+                    )
+                    self._sample_next_token(logits[:, -1, :], 0.0)
             torch.cuda.current_stream(self.device).wait_stream(stream)
             with torch.cuda.graph(captured.graph):
                 logits = self._forward_decode_ragged_static(
@@ -5344,7 +6260,7 @@ class Llama3TensorParallelForCausalLM:
         attention_block_size: int | None = None,
     ) -> Tensor:
         hidden = F.embedding(input_ids.to(self.device, non_blocking=True), self.embed_tokens_weight)
-        attn_in: Tensor | None = None
+        attn_in: Tensor | _FP8PerTokenActivation | None = None
         for layer_id, layer in enumerate(self.layers):
             next_norm_weight = (
                 self.layers[layer_id + 1].input_layernorm_weight
@@ -5362,10 +6278,11 @@ class Llama3TensorParallelForCausalLM:
                 attention_length,
                 attention_block_size,
                 next_norm_weight,
+                next_layer=(self.layers[layer_id + 1] if layer_id + 1 < len(self.layers) else None),
             )
         if attn_in is None:
             attn_in = _tp_decode_rms_norm(hidden, self.norm_weight, self.config.rms_norm_eps)
-        return _decode_linear(attn_in, self.lm_head_weight, self.lm_head_weight_decode)
+        return self._lm_head_linear(attn_in)
 
     def _forward_decode_ragged_static(
         self,
@@ -5377,7 +6294,7 @@ class Llama3TensorParallelForCausalLM:
         attention_cache_tokens: int | None = None,
     ) -> Tensor:
         hidden = F.embedding(input_ids.to(self.device, non_blocking=True), self.embed_tokens_weight)
-        attn_in: Tensor | None = None
+        attn_in: Tensor | _FP8PerTokenActivation | None = None
         attention_lengths = (
             None
             if callable(getattr(cache.layers[0], "append_and_attend_ragged", None))
@@ -5407,13 +6324,14 @@ class Llama3TensorParallelForCausalLM:
                     next_norm_weight,
                     attention_cache_tokens=attention_cache_tokens,
                     attention_lengths=attention_lengths,
+                    next_layer=(self.layers[layer_id + 1] if layer_id + 1 < len(self.layers) else None),
                 )
         finally:
             if context_set:
                 _clear_paged_ragged_decode_context(cache)
         if attn_in is None:
             attn_in = _tp_decode_rms_norm(hidden, self.norm_weight, self.config.rms_norm_eps)
-        return _decode_linear(attn_in, self.lm_head_weight, self.lm_head_weight_decode)
+        return self._lm_head_linear(attn_in)
 
     @torch.inference_mode()
     def decode_ragged_logits(
@@ -5455,7 +6373,7 @@ class Llama3TensorParallelForCausalLM:
             self.rotary_sin_cache.index_select(0, cache_positions),
         )
         hidden = F.embedding(input_ids, self.embed_tokens_weight)
-        attn_in: Tensor | None = None
+        attn_in: Tensor | _FP8PerTokenActivation | None = None
         attention_lengths = (
             None
             if callable(getattr(cache.layers[0], "append_and_attend_ragged", None))
@@ -5485,13 +6403,14 @@ class Llama3TensorParallelForCausalLM:
                     next_norm_weight,
                     attention_cache_tokens=attention_cache_tokens,
                     attention_lengths=attention_lengths,
+                    next_layer=(self.layers[layer_id + 1] if layer_id + 1 < len(self.layers) else None),
                 )
         finally:
             if context_set:
                 _clear_paged_ragged_decode_context(cache)
         if attn_in is None:
             attn_in = _tp_decode_rms_norm(hidden, self.norm_weight, self.config.rms_norm_eps)
-        return _decode_linear(attn_in, self.lm_head_weight, self.lm_head_weight_decode)
+        return self._lm_head_linear(attn_in)
 
     def _copy_ragged_prefill_prefix(
         self,
@@ -5612,7 +6531,7 @@ class Llama3TensorParallelForCausalLM:
             raise ValueError("logit_positions are required when emit_logits is true")
         gather_positions = logit_positions.view(batch, 1, 1).expand(-1, 1, attn_in.size(-1))
         gathered = torch.gather(attn_in, 1, gather_positions)
-        return _decode_linear(gathered, self.lm_head_weight, self.lm_head_weight_decode)
+        return self._lm_head_linear(gathered)
 
     @torch.inference_mode()
     def forward_step_flashinfer(
@@ -5780,12 +6699,13 @@ class Llama3TensorParallelForCausalLM:
                 next_norm_weight,
                 row_indices=row_indices,
                 q_lens=q_lens,
+                next_layer=(self.layers[layer_id + 1] if layer_id + 1 < len(self.layers) else None),
             )
         if attn_in is None:
             attn_in = _tp_decode_rms_norm(hidden, self.norm_weight, self.config.rms_norm_eps)
         gather_positions = logit_positions.view(batch, 1, 1).expand(-1, 1, attn_in.size(-1))
         gathered = torch.gather(attn_in, 1, gather_positions)
-        return _decode_linear(gathered, self.lm_head_weight, self.lm_head_weight_decode)
+        return self._lm_head_linear(gathered)
 
     def _forward_step_flashinfer_body(
         self,
@@ -5905,7 +6825,8 @@ class Llama3TensorParallelForCausalLM:
                 )
         except Exception as _cap_exc:
             if getattr(self, "rank", 0) == 0:
-                import sys as _cs, traceback as _ct
+                import sys as _cs
+                import traceback as _ct
                 print(f"[FI_PREFILL_GRAPH] capture bs={batch} q={q_len} failed: {_cap_exc!r}", file=_cs.stderr, flush=True)
                 _ct.print_exc(file=_cs.stderr)
             return False
@@ -6030,7 +6951,7 @@ class Llama3TensorParallelForCausalLM:
         rotary = (cos, sin)
 
         hidden = F.embedding(input_ids, self.embed_tokens_weight)
-        attn_in: Tensor | None = None
+        attn_in: Tensor | _FP8PerTokenActivation | None = None
 
         for layer_id, layer in enumerate(self.layers):
             next_norm_weight = (
@@ -6045,11 +6966,12 @@ class Llama3TensorParallelForCausalLM:
                 decode_wrapper,
                 next_norm_weight,
                 row_indices=row_indices,
+                next_layer=(self.layers[layer_id + 1] if layer_id + 1 < len(self.layers) else None),
             )
 
         if attn_in is None:
             attn_in = _tp_decode_rms_norm(hidden, self.norm_weight, self.config.rms_norm_eps)
-        return _decode_linear(attn_in, self.lm_head_weight, self.lm_head_weight_decode)
+        return self._lm_head_linear(attn_in)
 
     @torch.inference_mode()
     def forward_decode_paged(
@@ -6066,9 +6988,8 @@ class Llama3TensorParallelForCausalLM:
         # _forward_decode_flashinfer_body, but the KV write goes to a small-page
         # pool via slot_mapping()+scatter_write() and attention reads the pool via
         # layer_kv() -- instead of the dense [rows, 2, max_seq, ...] cache. This is
-        # the model-side half of the paged-KV migration (the lever for the
-        # queueing-bound multi_turn/long_output/TTFT/throughput cells); the serving
-        # loop owns admission-by-pages + the decode_wrapper plan (built once per
+        # the model-side half of the paged-KV migration. The serving loop owns
+        # admission-by-pages and the decode_wrapper plan (built once per
         # step from paged_cache.flashinfer_page_table(request_ids), shared by all
         # layers). input_ids: [batch, 1]; positions: [batch] absolute position of
         # each decoded token (its pages must already be reserved).
@@ -6119,7 +7040,10 @@ class Llama3TensorParallelForCausalLM:
             out_packed = decode_wrapper.run(q_packed, paged_cache.layer_kv(layer_id))
             out = out_packed.view(batch, 1, layer.local_hidden_size)
             attention = layer._decode_linear_all_reduce(
-                out, layer.o_proj_weight, "attention", layer.o_proj_weight_decode
+                out,
+                layer.o_proj_weight,
+                "attention",
+                layer.o_proj_weight_decode,
             )
             hidden, mlp_in = _tp_decode_add_rms_norm(
                 attention, residual, layer.post_attention_layernorm_weight, rms_eps
@@ -6130,7 +7054,7 @@ class Llama3TensorParallelForCausalLM:
 
         if attn_in is None:
             attn_in = _tp_decode_rms_norm(hidden, self.norm_weight, rms_eps)
-        return _decode_linear(attn_in, self.lm_head_weight, self.lm_head_weight_decode)
+        return self._lm_head_linear(attn_in)
 
     @torch.inference_mode()
     def forward_prefill_paged(
@@ -6227,7 +7151,10 @@ class Llama3TensorParallelForCausalLM:
             out_packed = prefill_wrapper.run(q_packed, paged_cache.layer_kv(layer_id))
             out = out_packed.view(batch, tokens, layer.local_hidden_size)
             attention = layer._decode_linear_all_reduce(
-                out, layer.o_proj_weight, "attention", layer.o_proj_weight_decode
+                out,
+                layer.o_proj_weight,
+                "attention",
+                layer.o_proj_weight_decode,
             )
             hidden, mlp_in = _tp_decode_add_rms_norm(
                 attention, residual, layer.post_attention_layernorm_weight, rms_eps
@@ -6238,7 +7165,7 @@ class Llama3TensorParallelForCausalLM:
 
         if attn_in is None:
             attn_in = _tp_decode_rms_norm(hidden, self.norm_weight, rms_eps)
-        return _decode_linear(attn_in, self.lm_head_weight, self.lm_head_weight_decode)
+        return self._lm_head_linear(attn_in)
 
     @torch.inference_mode()
     def prefill_ragged_logits(
@@ -6423,7 +7350,662 @@ class Llama3TensorParallelForCausalLM:
             attn_in = _tp_decode_rms_norm(hidden, self.norm_weight, self.config.rms_norm_eps)
         flat_logit_positions = request_offsets + logit_positions
         gathered = attn_in.squeeze(0).index_select(0, flat_logit_positions).view(batch, 1, -1)
-        return _decode_linear(gathered, self.lm_head_weight, self.lm_head_weight_decode)
+        return self._lm_head_linear(gathered)
+
+    def _prefill_ragged_logits_packed_fa3_compute(
+        self,
+        input_ids: Tensor,
+        cache: Llama3TensorParallelCache,
+        *,
+        start_positions: Tensor,
+        q_lens: Tensor,
+        row_indices: Tensor,
+        logit_positions: Tensor,
+        src_prefix_row: Tensor | None,
+        prefix_copy_len: int | None,
+        request_offsets: Tensor,
+        flat_token_indices: Tensor,
+        flat_request_indices: Tensor,
+        packed_attention_groups: tuple[_PackedPrefillAttentionGroup, ...],
+    ) -> Tensor:
+        batch, suffix_bucket = input_ids.shape
+        flat_input_ids = input_ids.reshape(-1).index_select(
+            0,
+            flat_token_indices,
+        ).view(1, -1)
+        total_tokens = flat_input_ids.size(1)
+        if total_tokens <= 0:
+            raise ValueError("packed FA3 prefill requires at least one token")
+        query_offsets = torch.arange(suffix_bucket, device=self.device)
+        bucket_write_positions = start_positions[:, None] + query_offsets[None, :]
+        flat_write_positions = bucket_write_positions.reshape(-1).index_select(
+            0,
+            flat_token_indices,
+        )
+        flat_rows = row_indices.index_select(0, flat_request_indices)
+
+        self._copy_ragged_prefill_prefix(
+            cache,
+            input_tokens=suffix_bucket,
+            start_positions=start_positions,
+            row_indices=row_indices,
+            context_len=None,
+            src_prefix_row=src_prefix_row,
+            prefix_copy_len=prefix_copy_len,
+        )
+        rotary = (
+            self.rotary_cos_cache.index_select(0, flat_write_positions).view(
+                1,
+                total_tokens,
+                -1,
+            ),
+            self.rotary_sin_cache.index_select(0, flat_write_positions).view(
+                1,
+                total_tokens,
+                -1,
+            ),
+        )
+        cu_seqlens_q = torch.cat(
+            (
+                torch.zeros(1, dtype=torch.int32, device=self.device),
+                q_lens.to(dtype=torch.int32).cumsum(0, dtype=torch.int32),
+            )
+        )
+        cache_seqlens = (start_positions + q_lens).to(dtype=torch.int32)
+        hidden = F.embedding(flat_input_ids, self.embed_tokens_weight)
+        attn_in: Tensor | None = None
+        for layer_id, layer in enumerate(self.layers):
+            next_norm_weight = (
+                self.layers[layer_id + 1].input_layernorm_weight
+                if layer_id + 1 < len(self.layers)
+                else self.norm_weight
+            )
+            hidden, attn_in = layer.forward_prefill_packed_fa3(
+                hidden,
+                attn_in,
+                rotary,
+                cache.layers[layer_id],
+                flat_write_positions,
+                flat_rows,
+                row_indices,
+                q_lens,
+                cu_seqlens_q,
+                cache_seqlens,
+                suffix_bucket,
+                next_norm_weight,
+            )
+        if attn_in is None:
+            attn_in = _tp_decode_rms_norm(
+                hidden,
+                self.norm_weight,
+                self.config.rms_norm_eps,
+            )
+        flat_logit_positions = request_offsets + logit_positions
+        gathered = attn_in.squeeze(0).index_select(0, flat_logit_positions).view(
+            batch,
+            1,
+            -1,
+        )
+        del packed_attention_groups
+        return self._lm_head_linear(gathered)
+
+    def _copy_token_bucket_prefix_compute(
+        self,
+        cache: Llama3TensorParallelCache,
+        *,
+        start_positions: Tensor,
+        row_indices: Tensor,
+        src_prefix_rows: Tensor,
+        prefix_copy_capacity: int,
+    ) -> None:
+        if self.device.type == "cuda" and _tp_flag(
+            "TORCHINFERNO_TRITON_TOKEN_PREFIX_COPY",
+            True,
+        ):
+            try:
+                from torchinferno.kernels.triton_ops import (
+                    triton_copy_ragged_prefix_kv,
+                    triton_copy_ragged_prefix_kv_layers,
+                )
+
+                if (
+                    _tp_flag("TORCHINFERNO_TRITON_TOKEN_PREFIX_COPY_LAYERS", True)
+                    and cache._stacked_keys is not None
+                    and cache._stacked_values is not None
+                ):
+                    triton_copy_ragged_prefix_kv_layers(
+                        cache._stacked_keys,
+                        cache._stacked_values,
+                        start_positions,
+                        row_indices,
+                        src_prefix_rows,
+                        prefix_capacity=prefix_copy_capacity,
+                    )
+                else:
+                    for layer_cache in cache.layers:
+                        triton_copy_ragged_prefix_kv(
+                            layer_cache.keys,
+                            layer_cache.values,
+                            start_positions,
+                            row_indices,
+                            src_prefix_rows,
+                            prefix_capacity=prefix_copy_capacity,
+                        )
+                return
+            except Exception as exc:
+                warn_optional_failure("llama3_tensor_parallel.token_prefix_copy", exc)
+        prefix_mask = (
+            torch.arange(prefix_copy_capacity, device=self.device)[None, :]
+            < start_positions[:, None]
+        )
+        for layer_cache in cache.layers:
+            source_keys = layer_cache.keys.index_select(0, src_prefix_rows)[
+                :, :, :prefix_copy_capacity, :
+            ]
+            source_values = layer_cache.values.index_select(0, src_prefix_rows)[
+                :, :, :prefix_copy_capacity, :
+            ]
+            dest_keys = layer_cache.keys.index_select(0, row_indices)[
+                :, :, :prefix_copy_capacity, :
+            ]
+            dest_values = layer_cache.values.index_select(0, row_indices)[
+                :, :, :prefix_copy_capacity, :
+            ]
+            layer_cache.keys[row_indices, :, :prefix_copy_capacity, :] = torch.where(
+                prefix_mask[:, None, :, None],
+                source_keys,
+                dest_keys,
+            )
+            layer_cache.values[row_indices, :, :prefix_copy_capacity, :] = torch.where(
+                prefix_mask[:, None, :, None],
+                source_values,
+                dest_values,
+            )
+
+    @torch.inference_mode()
+    def try_copy_token_bucket_prefix_graph(
+        self,
+        cache: Llama3TensorParallelCache,
+        *,
+        start_positions: Tensor,
+        row_indices: Tensor,
+        src_prefix_rows: Tensor,
+        prefix_copy_capacity: int,
+        capture_on_miss: bool = True,
+    ) -> bool:
+        batch_capacity = int(start_positions.numel())
+        prefix_copy_capacity = max(0, int(prefix_copy_capacity))
+        if prefix_copy_capacity == 0:
+            return True
+        if (
+            self.device.type != "cuda"
+            or not cache.layers
+            or batch_capacity <= 0
+            or row_indices.shape != (batch_capacity,)
+            or src_prefix_rows.shape != (batch_capacity,)
+            or prefix_copy_capacity > cache.layers[0].max_seq_len
+        ):
+            return False
+        key = (id(cache), batch_capacity, prefix_copy_capacity)
+        captured = self._token_bucket_prefix_copy_graphs.get(key)
+        needs_capture = captured is None or captured.cache is not cache
+        if capture_on_miss:
+            needs_capture = _capture_needed_on_any_rank(needs_capture, self.device)
+        if needs_capture:
+            if not capture_on_miss:
+                return False
+            succeeded = True
+            new_captured: _StaticTokenBucketPrefixCopyGraphCall | None = None
+            try:
+                new_captured = _StaticTokenBucketPrefixCopyGraphCall(
+                    graph=torch.cuda.CUDAGraph(),
+                    static_start_positions=torch.empty_like(start_positions),
+                    static_row_indices=torch.empty_like(row_indices),
+                    static_src_prefix_rows=torch.empty_like(src_prefix_rows),
+                    cache=cache,
+                    batch_capacity=batch_capacity,
+                    prefix_copy_capacity=prefix_copy_capacity,
+                )
+                new_captured.static_start_positions.copy_(start_positions)
+                new_captured.static_row_indices.copy_(row_indices)
+                new_captured.static_src_prefix_rows.copy_(src_prefix_rows)
+                stream = torch.cuda.Stream(device=self.device)
+                stream.wait_stream(torch.cuda.current_stream(self.device))
+                with torch.cuda.stream(stream):
+                    self._copy_token_bucket_prefix_compute(
+                        cache,
+                        start_positions=new_captured.static_start_positions,
+                        row_indices=new_captured.static_row_indices,
+                        src_prefix_rows=new_captured.static_src_prefix_rows,
+                        prefix_copy_capacity=prefix_copy_capacity,
+                    )
+                torch.cuda.current_stream(self.device).wait_stream(stream)
+                with torch.cuda.graph(new_captured.graph):
+                    self._copy_token_bucket_prefix_compute(
+                        cache,
+                        start_positions=new_captured.static_start_positions,
+                        row_indices=new_captured.static_row_indices,
+                        src_prefix_rows=new_captured.static_src_prefix_rows,
+                        prefix_copy_capacity=prefix_copy_capacity,
+                    )
+                new_captured.graph.replay()
+            except Exception as exc:
+                succeeded = False
+                if _tp_flag("TORCHINFERNO_CUDAGRAPH_PREFILL_DEBUG", False):
+                    print(
+                        f"rank={self.rank} token_bucket_prefix_copy_capture_failed={exc!r}",
+                        flush=True,
+                    )
+            succeeded = _capture_succeeded_on_all_ranks(succeeded, self.device)
+            if not succeeded or new_captured is None:
+                return False
+            captured = new_captured
+            self._token_bucket_prefix_copy_graphs[key] = captured
+            if _tp_flag("TORCHINFERNO_CUDAGRAPH_PREFILL_DEBUG", False):
+                print(
+                    f"rank={self.rank} token_bucket_prefix_copy_captured "
+                    f"batch={batch_capacity} prefix={prefix_copy_capacity}",
+                    flush=True,
+                )
+        else:
+            captured.static_start_positions.copy_(start_positions)
+            captured.static_row_indices.copy_(row_indices)
+            captured.static_src_prefix_rows.copy_(src_prefix_rows)
+            captured.graph.replay()
+        return True
+
+    def _prefill_token_bucket_fa3_compute(
+        self,
+        input_ids: Tensor,
+        cache: Llama3TensorParallelCache,
+        *,
+        start_positions: Tensor,
+        q_lens: Tensor,
+        row_indices: Tensor,
+        write_positions: Tensor,
+        flat_rows: Tensor,
+        logit_positions: Tensor,
+        src_prefix_rows: Tensor | None,
+        prefix_copy_capacity: int,
+    ) -> Tensor:
+        if input_ids.ndim != 2 or input_ids.size(0) != 1:
+            raise ValueError("token-bucket prefill expects input_ids [1, token_capacity]")
+        batch_capacity = q_lens.numel()
+        token_capacity = input_ids.size(1)
+        cu_seqlens_q = torch.cat(
+            (
+                torch.zeros(1, dtype=torch.int32, device=self.device),
+                q_lens.to(dtype=torch.int32).cumsum(0, dtype=torch.int32),
+            )
+        )
+        cache_seqlens = (start_positions + q_lens).to(dtype=torch.int32)
+        if src_prefix_rows is not None and prefix_copy_capacity > 0:
+            self._copy_token_bucket_prefix_compute(
+                cache,
+                start_positions=start_positions,
+                row_indices=row_indices,
+                src_prefix_rows=src_prefix_rows,
+                prefix_copy_capacity=prefix_copy_capacity,
+            )
+        rotary = (
+            self.rotary_cos_cache.index_select(0, write_positions).view(
+                1,
+                token_capacity,
+                -1,
+            ),
+            self.rotary_sin_cache.index_select(0, write_positions).view(
+                1,
+                token_capacity,
+                -1,
+            ),
+        )
+        hidden = F.embedding(input_ids, self.embed_tokens_weight)
+        attn_in: Tensor | None = None
+        for layer_id, layer in enumerate(self.layers):
+            next_norm_weight = (
+                self.layers[layer_id + 1].input_layernorm_weight
+                if layer_id + 1 < len(self.layers)
+                else self.norm_weight
+            )
+            hidden, attn_in = layer.forward_prefill_packed_fa3(
+                hidden,
+                attn_in,
+                rotary,
+                cache.layers[layer_id],
+                write_positions,
+                flat_rows,
+                row_indices,
+                q_lens,
+                cu_seqlens_q,
+                cache_seqlens,
+                token_capacity,
+                next_norm_weight,
+            )
+        if attn_in is None:
+            attn_in = _tp_decode_rms_norm(
+                hidden,
+                self.norm_weight,
+                self.config.rms_norm_eps,
+            )
+        gathered = attn_in.squeeze(0).index_select(0, logit_positions).view(
+            batch_capacity,
+            1,
+            -1,
+        )
+        return self._lm_head_linear(gathered)
+
+    @torch.inference_mode()
+    def try_prefill_token_bucket_fa3_graph(
+        self,
+        input_ids: Tensor,
+        cache: Llama3TensorParallelCache,
+        *,
+        start_positions: Tensor,
+        q_lens: Tensor,
+        row_indices: Tensor,
+        write_positions: Tensor,
+        flat_rows: Tensor,
+        logit_positions: Tensor,
+        src_prefix_rows: Tensor | None = None,
+        prefix_copy_capacity: int = 0,
+        capture_on_miss: bool = True,
+    ) -> Tensor | None:
+        if (
+            input_ids.device.type != "cuda"
+            or input_ids.ndim != 2
+            or input_ids.size(0) != 1
+            or not cache.layers
+        ):
+            return None
+        batch_capacity = int(q_lens.numel())
+        token_capacity = int(input_ids.size(1))
+        if batch_capacity <= 0 or token_capacity <= 0:
+            return None
+        if (
+            start_positions.shape != (batch_capacity,)
+            or row_indices.shape != (batch_capacity,)
+            or logit_positions.shape != (batch_capacity,)
+            or write_positions.shape != (token_capacity,)
+            or flat_rows.shape != (token_capacity,)
+        ):
+            return None
+        max_seq_len = cache.layers[0].max_seq_len
+        prefix_copy_capacity = max(0, int(prefix_copy_capacity))
+        if prefix_copy_capacity > max_seq_len:
+            return None
+        if src_prefix_rows is None:
+            if prefix_copy_capacity > 0:
+                return None
+        elif src_prefix_rows.shape != (batch_capacity,):
+            return None
+        precision_key = _ragged_prefill_precision_graph_key(
+            token_capacity,
+            is_cuda=True,
+            layers=self.layers,
+        )
+        key = (
+            id(cache),
+            batch_capacity,
+            token_capacity,
+            max_seq_len,
+            prefix_copy_capacity,
+            src_prefix_rows is not None,
+            precision_key,
+            _symm_mem_allreduce_graph_key(1, _model_world_size(self)),
+        )
+        captured = self._token_bucket_prefill_graphs.get(key)
+        needs_capture = captured is None or captured.cache is not cache
+        if capture_on_miss:
+            needs_capture = _capture_needed_on_any_rank(needs_capture, self.device)
+        if needs_capture:
+            if not capture_on_miss:
+                return None
+            succeeded = True
+            new_captured: _StaticTokenBucketPrefillGraphCall | None = None
+            try:
+                new_captured = self._capture_token_bucket_prefill_graph(
+                    input_ids,
+                    cache,
+                    start_positions=start_positions,
+                    q_lens=q_lens,
+                    row_indices=row_indices,
+                    write_positions=write_positions,
+                    flat_rows=flat_rows,
+                    logit_positions=logit_positions,
+                    src_prefix_rows=src_prefix_rows,
+                    prefix_copy_capacity=prefix_copy_capacity,
+                )
+            except Exception as exc:
+                succeeded = False
+                if _tp_flag("TORCHINFERNO_CUDAGRAPH_PREFILL_DEBUG", False):
+                    import traceback
+
+                    print(
+                        f"rank={self.rank} token_bucket_prefill_capture_failed={exc!r}",
+                        flush=True,
+                    )
+                    traceback.print_exc()
+            succeeded = _capture_succeeded_on_all_ranks(succeeded, self.device)
+            if not succeeded or new_captured is None:
+                return None
+            captured = new_captured
+            self._token_bucket_prefill_graphs[key] = captured
+            if _tp_flag("TORCHINFERNO_CUDAGRAPH_PREFILL_DEBUG", False):
+                print(
+                    f"rank={self.rank} token_bucket_prefill_captured "
+                    f"batch={batch_capacity} tokens={token_capacity} "
+                    f"prefix={prefix_copy_capacity}",
+                    flush=True,
+                )
+        else:
+            self._copy_token_bucket_prefill_graph_inputs(
+                captured,
+                input_ids,
+                start_positions=start_positions,
+                q_lens=q_lens,
+                row_indices=row_indices,
+                write_positions=write_positions,
+                flat_rows=flat_rows,
+                logit_positions=logit_positions,
+                src_prefix_rows=src_prefix_rows,
+            )
+            if self._maybe_profile_token_bucket_prefill_graph_replay_once(captured):
+                return captured.output_logits
+            captured.graph.replay()
+        return captured.output_logits
+
+    def _maybe_profile_token_bucket_prefill_graph_replay_once(
+        self,
+        captured: _StaticTokenBucketPrefillGraphCall,
+    ) -> bool:
+        if (
+            not env_flag("TORCHINFERNO_PROFILE_TOKEN_BUCKET_PREFILL_REPLAY_ONCE", False)
+            or getattr(self, "_token_bucket_prefill_replay_profiled", False)
+            or self.device.type != "cuda"
+        ):
+            return False
+        configured_batch = os.environ.get("TORCHINFERNO_PROFILE_TOKEN_BUCKET_PREFILL_BATCH")
+        if configured_batch and int(configured_batch) != captured.batch_capacity:
+            return False
+        configured_tokens = os.environ.get("TORCHINFERNO_PROFILE_TOKEN_BUCKET_PREFILL_TOKENS")
+        if configured_tokens and int(configured_tokens) != captured.token_capacity:
+            return False
+        configured_prefix = os.environ.get("TORCHINFERNO_PROFILE_TOKEN_BUCKET_PREFILL_PREFIX")
+        if configured_prefix and int(configured_prefix) != captured.prefix_copy_capacity:
+            return False
+
+        self._token_bucket_prefill_replay_profiled = True
+        if self.rank != 0:
+            captured.graph.replay()
+            return True
+
+        replayed = False
+        try:
+            import sys as _tbpp
+            from torch.profiler import ProfilerActivity as _PA
+            from torch.profiler import profile as _tprof
+
+            torch.cuda.synchronize(self.device)
+            with _tprof(activities=[_PA.CPU, _PA.CUDA]) as prof:
+                captured.graph.replay()
+                replayed = True
+                torch.cuda.synchronize(self.device)
+            row_limit = env_int(
+                "TORCHINFERNO_PROFILE_TOKEN_BUCKET_PREFILL_ROW_LIMIT",
+                40,
+                minimum=1,
+            )
+            print(
+                "[TOKEN_BUCKET_PREFILL_REPLAY_PROF] "
+                f"batch={captured.batch_capacity} "
+                f"tokens={captured.token_capacity} "
+                f"prefix={captured.prefix_copy_capacity}\n"
+                + prof.key_averages().table(sort_by="cuda_time_total", row_limit=row_limit),
+                file=_tbpp.stderr,
+                flush=True,
+            )
+        except Exception as exc:
+            warn_optional_failure("llama3_tensor_parallel.token_bucket_prefill_replay_profile", exc)
+            if not replayed:
+                captured.graph.replay()
+        return True
+
+    def _capture_token_bucket_prefill_graph(
+        self,
+        input_ids: Tensor,
+        cache: Llama3TensorParallelCache,
+        *,
+        start_positions: Tensor,
+        q_lens: Tensor,
+        row_indices: Tensor,
+        write_positions: Tensor,
+        flat_rows: Tensor,
+        logit_positions: Tensor,
+        src_prefix_rows: Tensor | None,
+        prefix_copy_capacity: int,
+    ) -> _StaticTokenBucketPrefillGraphCall:
+        batch_capacity = q_lens.numel()
+        token_capacity = input_ids.size(1)
+        captured = _StaticTokenBucketPrefillGraphCall(
+            graph=torch.cuda.CUDAGraph(),
+            static_input_ids=torch.empty_like(input_ids),
+            static_start_positions=torch.empty_like(start_positions),
+            static_q_lens=torch.empty_like(q_lens),
+            static_row_indices=torch.empty_like(row_indices),
+            static_write_positions=torch.empty_like(write_positions),
+            static_flat_rows=torch.empty_like(flat_rows),
+            static_logit_positions=torch.empty_like(logit_positions),
+            static_src_prefix_rows=(
+                torch.empty_like(src_prefix_rows) if src_prefix_rows is not None else None
+            ),
+            output_logits=torch.empty(
+                (batch_capacity, 1, self.local_vocab_size),
+                device=self.device,
+                dtype=self.dtype,
+            ),
+            cache=cache,
+            max_seq_len=cache.layers[0].max_seq_len,
+            batch_capacity=batch_capacity,
+            token_capacity=token_capacity,
+            prefix_copy_capacity=prefix_copy_capacity,
+        )
+        self._copy_token_bucket_prefill_graph_inputs(
+            captured,
+            input_ids,
+            start_positions=start_positions,
+            q_lens=q_lens,
+            row_indices=row_indices,
+            write_positions=write_positions,
+            flat_rows=flat_rows,
+            logit_positions=logit_positions,
+            src_prefix_rows=src_prefix_rows,
+        )
+        stream = torch.cuda.Stream(device=self.device)
+        stream.wait_stream(torch.cuda.current_stream(self.device))
+        with torch.cuda.stream(stream):
+            self._prefill_token_bucket_fa3_compute(
+                captured.static_input_ids,
+                cache,
+                start_positions=captured.static_start_positions,
+                q_lens=captured.static_q_lens,
+                row_indices=captured.static_row_indices,
+                write_positions=captured.static_write_positions,
+                flat_rows=captured.static_flat_rows,
+                logit_positions=captured.static_logit_positions,
+                src_prefix_rows=captured.static_src_prefix_rows,
+                prefix_copy_capacity=captured.prefix_copy_capacity,
+            )
+        torch.cuda.current_stream(self.device).wait_stream(stream)
+        with torch.cuda.graph(captured.graph):
+            captured.output_logits = self._prefill_token_bucket_fa3_compute(
+                captured.static_input_ids,
+                cache,
+                start_positions=captured.static_start_positions,
+                q_lens=captured.static_q_lens,
+                row_indices=captured.static_row_indices,
+                write_positions=captured.static_write_positions,
+                flat_rows=captured.static_flat_rows,
+                logit_positions=captured.static_logit_positions,
+                src_prefix_rows=captured.static_src_prefix_rows,
+                prefix_copy_capacity=captured.prefix_copy_capacity,
+            )
+        captured.graph.replay()
+        return captured
+
+    def _copy_token_bucket_prefill_graph_inputs(
+        self,
+        captured: _StaticTokenBucketPrefillGraphCall,
+        input_ids: Tensor,
+        *,
+        start_positions: Tensor,
+        q_lens: Tensor,
+        row_indices: Tensor,
+        write_positions: Tensor,
+        flat_rows: Tensor,
+        logit_positions: Tensor,
+        src_prefix_rows: Tensor | None,
+    ) -> None:
+        captured.static_input_ids.copy_(input_ids.to(self.device, non_blocking=True))
+        captured.static_start_positions.copy_(
+            start_positions.to(self.device, non_blocking=True)
+        )
+        captured.static_q_lens.copy_(q_lens.to(self.device, non_blocking=True))
+        captured.static_row_indices.copy_(row_indices.to(self.device, non_blocking=True))
+        captured.static_write_positions.copy_(
+            write_positions.to(self.device, non_blocking=True)
+        )
+        captured.static_flat_rows.copy_(flat_rows.to(self.device, non_blocking=True))
+        captured.static_logit_positions.copy_(
+            logit_positions.to(self.device, non_blocking=True)
+        )
+        if captured.static_src_prefix_rows is not None:
+            if src_prefix_rows is None:
+                raise ValueError("captured token-bucket prefill requires prefix source rows")
+            captured.static_src_prefix_rows.copy_(
+                src_prefix_rows.to(self.device, non_blocking=True)
+            )
+
+    def _prefill_ragged_logits_packed_graph_compute(
+        self,
+        input_ids: Tensor,
+        cache: Llama3TensorParallelCache,
+        **kwargs: object,
+    ) -> Tensor:
+        backend = os.environ.get(
+            "TORCHINFERNO_PACKED_PREFILL_ATTENTION_BACKEND",
+            "sdpa",
+        ).strip().lower()
+        if backend == "fa3":
+            return self._prefill_ragged_logits_packed_fa3_compute(
+                input_ids,
+                cache,
+                **kwargs,
+            )
+        return self._prefill_ragged_logits_packed_eager_compute(
+            input_ids,
+            cache,
+            **kwargs,
+        )
 
     @torch.inference_mode()
     def try_prefill_ragged_logits_packed_eager_graph(
@@ -6524,6 +8106,9 @@ class Llama3TensorParallelForCausalLM:
             prefix_copy_len if prefix_copy_len is not None else -1,
             precision_key,
             _symm_mem_allreduce_graph_key(1, _model_world_size(self)),
+            os.environ.get("TORCHINFERNO_PACKED_PREFILL_ATTENTION_BACKEND", "sdpa")
+            .strip()
+            .lower(),
         )
         captured = self._packed_ragged_prefill_logits_graphs.get(key)
         needs_capture = (
@@ -6565,8 +8150,13 @@ class Llama3TensorParallelForCausalLM:
                     q_lens_key=q_lens_key,
                     start_positions_key=start_positions_key,
                 )
-            except Exception:
+            except Exception as exc:
                 succeeded = False
+                if _tp_flag("TORCHINFERNO_CUDAGRAPH_PREFILL_DEBUG", False):
+                    print(
+                        f"rank={self.rank} packed_ragged_prefill_capture_failed={exc!r}",
+                        flush=True,
+                    )
             succeeded = _capture_succeeded_on_all_ranks(succeeded, self.device)
             if not succeeded or new_captured is None:
                 return None
@@ -6654,7 +8244,7 @@ class Llama3TensorParallelForCausalLM:
         stream = torch.cuda.Stream(device=self.device)
         stream.wait_stream(torch.cuda.current_stream(self.device))
         with torch.cuda.stream(stream):
-            self._prefill_ragged_logits_packed_eager_compute(
+            self._prefill_ragged_logits_packed_graph_compute(
                 captured.static_input_ids,
                 cache,
                 start_positions=captured.static_start_positions,
@@ -6670,7 +8260,7 @@ class Llama3TensorParallelForCausalLM:
             )
         torch.cuda.current_stream(self.device).wait_stream(stream)
         with torch.cuda.graph(captured.graph):
-            captured.output_logits = self._prefill_ragged_logits_packed_eager_compute(
+            captured.output_logits = self._prefill_ragged_logits_packed_graph_compute(
                 captured.static_input_ids,
                 cache,
                 start_positions=captured.static_start_positions,
@@ -6819,7 +8409,7 @@ class Llama3TensorParallelForCausalLM:
             attn_in = _tp_decode_rms_norm(hidden, self.norm_weight, self.config.rms_norm_eps)
         flat_logit_positions = request_offsets + logit_positions
         gathered = attn_in.squeeze(0).index_select(0, flat_logit_positions).view(batch, 1, -1)
-        return _decode_linear(gathered, self.lm_head_weight, self.lm_head_weight_decode)
+        return self._lm_head_linear(gathered)
 
     @torch.inference_mode()
     def prefill_ragged_cache(
@@ -8245,7 +9835,7 @@ def _rank0_replicated_checkpoint_broadcast_enabled(
             return True
     if "TORCHINFERNO_TP_RANK0_REPLICATED_CHECKPOINT_BROADCAST" in os.environ:
         return _tp_flag("TORCHINFERNO_TP_RANK0_REPLICATED_CHECKPOINT_BROADCAST", True)
-    # Public CUDA 13 benchmark hosts have repeatedly made large startup NCCL
+    # Some CUDA 13 deployments make large startup NCCL
     # checkpoint collectives much slower than direct per-rank safetensor reads.
     # Keep the portable path as the default; operators can still opt in where
     # rank-0 loading is known to be healthy.
@@ -9561,11 +11151,8 @@ def _symm_mem_allreduce_enabled() -> bool:
     # multimem -> mismatched collectives -> 1800s warmup timeout = the e211b4b dash
     # cause). The warmup handshake now votes COLLECTIVELY: any rank that cannot init
     # multicast (a clean exception) makes ALL ranks disable symm-mem together, so there
-    # is no divergence. Good hosts keep the measured allreduce wins (same-session full
-    # bench A/B 2026-06-09: few_shot ttft -20% / tpot -7%, self_consistency ttft -6%,
-    # multi_turn tpot -7%, all correct -- the earlier "symm-mem breaks few_shot" was the
-    # SEPARATE cross-benchmark cache bug, fixed in e9d8299). Force off with the env flag
-    # set to 0 if a host HANGS (rather than cleanly errors) in symm_mem.rendezvous.
+    # is no divergence. Healthy hosts retain the faster multicast reduction.
+    # Force it off if a host hangs rather than cleanly errors in rendezvous.
     return _tp_flag("TORCHINFERNO_SYMM_MEM_ALLREDUCE", True)
 
 
@@ -9586,7 +11173,10 @@ def _should_use_symm_mem_prefill_all_reduce(hidden: Tensor, weight: Tensor, worl
     # is ~31% of prefill (profiled), so this is the top prefill lever. Callers must
     # avoid allocating/probing the per-shape symm-mem buffer during CUDA graph
     # capture; captured prefill may reuse only buffers prepared by eager warmup.
-    max_tokens = _tp_int("TORCHINFERNO_SYMM_MEM_PREFILL_ALLREDUCE_MAX_TOKENS", 40960, minimum=1)
+    max_tokens = min(
+        _tp_int("TORCHINFERNO_SYMM_MEM_PREFILL_ALLREDUCE_MAX_TOKENS", 40960, minimum=1),
+        _tp_int("TORCHINFERNO_SYMM_MEM_PREFILL_BUFFER_TOKENS", 4096, minimum=1),
+    )
     override = _SYMM_MEM_PREFILL_ALLREDUCE_ENABLED_OVERRIDE[0]
     prefill_enabled = (
         override
@@ -9615,9 +11205,8 @@ def validate_symm_mem_allreduce_collective(model: object, device: object) -> Non
     # warmup, then NCCL-vote so that if ANY rank cannot init multicast (the observed
     # "init_multicast_for_block: CUDA driver error" on a fresh remote host, a clean
     # exception), ALL ranks disable symm-mem together and fall back to NCCL. This
-    # makes symm-mem safe to default-ON: good hosts get the measured allreduce wins
-    # (few_shot ttft -20%), bad hosts fall back collectively with no mismatched-
-    # collective deadlock (the e211b4b dash cause). No-op if symm-mem is off / TP=1.
+    # makes symm-mem safe to default on: unhealthy hosts fall back collectively
+    # without a mismatched-collective deadlock. No-op if symm-mem is off or TP=1.
     import torch.distributed as dist
 
     world = _model_world_size(model)

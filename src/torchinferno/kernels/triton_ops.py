@@ -69,6 +69,230 @@ def triton_swiglu_activation(gate: Tensor, up: Tensor, *, out: Tensor | None = N
 
 
 @triton.jit
+def _copy_ragged_prefix_kv_kernel(
+    keys_ptr,
+    values_ptr,
+    lengths_ptr,
+    dest_rows_ptr,
+    source_rows_ptr,
+    key_stride_row,
+    key_stride_head,
+    key_stride_token,
+    value_stride_row,
+    value_stride_head,
+    value_stride_token,
+    total_elements,
+    kv_heads: tl.constexpr,
+    prefix_capacity: tl.constexpr,
+    head_dim: tl.constexpr,
+    block_size: tl.constexpr,
+) -> None:
+    offsets = tl.program_id(0) * block_size + tl.arange(0, block_size)
+    in_bounds = offsets < total_elements
+    dim = offsets % head_dim
+    logical = offsets // head_dim
+    token = logical % prefix_capacity
+    logical //= prefix_capacity
+    head = logical % kv_heads
+    batch = logical // kv_heads
+    length = tl.load(lengths_ptr + batch, mask=in_bounds, other=0)
+    mask = in_bounds & (token < length)
+    dest_row = tl.load(dest_rows_ptr + batch, mask=mask, other=0)
+    source_row = tl.load(source_rows_ptr + batch, mask=mask, other=0)
+    key_source = (
+        source_row * key_stride_row
+        + head * key_stride_head
+        + token * key_stride_token
+        + dim
+    )
+    key_dest = (
+        dest_row * key_stride_row
+        + head * key_stride_head
+        + token * key_stride_token
+        + dim
+    )
+    value_source = (
+        source_row * value_stride_row
+        + head * value_stride_head
+        + token * value_stride_token
+        + dim
+    )
+    value_dest = (
+        dest_row * value_stride_row
+        + head * value_stride_head
+        + token * value_stride_token
+        + dim
+    )
+    tl.store(keys_ptr + key_dest, tl.load(keys_ptr + key_source, mask=mask), mask=mask)
+    tl.store(
+        values_ptr + value_dest,
+        tl.load(values_ptr + value_source, mask=mask),
+        mask=mask,
+    )
+
+
+def triton_copy_ragged_prefix_kv(
+    keys: Tensor,
+    values: Tensor,
+    lengths: Tensor,
+    dest_rows: Tensor,
+    source_rows: Tensor,
+    *,
+    prefix_capacity: int,
+) -> None:
+    """Copy per-row dense KV prefixes without materializing indexed tensors."""
+
+    if keys.shape != values.shape or keys.ndim != 4:
+        raise ValueError("keys and values must have matching [rows, heads, tokens, dim] shapes")
+    if not keys.is_cuda or not values.is_cuda:
+        raise ValueError("ragged prefix KV copy requires CUDA tensors")
+    if keys.device != values.device or keys.dtype != values.dtype:
+        raise ValueError("keys and values must have matching devices and dtypes")
+    batch = int(lengths.numel())
+    if lengths.ndim != 1 or dest_rows.shape != (batch,) or source_rows.shape != (batch,):
+        raise ValueError("lengths, dest_rows, and source_rows must be equal-length vectors")
+    if any(tensor.device != keys.device for tensor in (lengths, dest_rows, source_rows)):
+        raise ValueError("prefix metadata must be on the KV cache device")
+    capacity = int(prefix_capacity)
+    if capacity < 0 or capacity > keys.size(2):
+        raise ValueError("prefix capacity exceeds the KV cache")
+    if capacity == 0 or batch == 0:
+        return
+    if keys.stride(-1) != 1 or values.stride(-1) != 1:
+        raise ValueError("KV cache head dimensions must be contiguous")
+    total = batch * keys.size(1) * capacity * keys.size(3)
+    block_size = 256
+    _copy_ragged_prefix_kv_kernel[(triton.cdiv(total, block_size),)](
+        keys,
+        values,
+        lengths,
+        dest_rows,
+        source_rows,
+        keys.stride(0),
+        keys.stride(1),
+        keys.stride(2),
+        values.stride(0),
+        values.stride(1),
+        values.stride(2),
+        total,
+        keys.size(1),
+        capacity,
+        keys.size(3),
+        block_size,
+        num_warps=4,
+    )
+
+
+@triton.jit
+def _copy_ragged_prefix_kv_layers_kernel(
+    keys_ptr,
+    values_ptr,
+    lengths_ptr,
+    dest_rows_ptr,
+    source_rows_ptr,
+    key_stride_layer,
+    key_stride_row,
+    key_stride_head,
+    key_stride_token,
+    value_stride_layer,
+    value_stride_row,
+    value_stride_head,
+    value_stride_token,
+    total_elements,
+    batch: tl.constexpr,
+    kv_heads: tl.constexpr,
+    prefix_capacity: tl.constexpr,
+    head_dim: tl.constexpr,
+    block_size: tl.constexpr,
+) -> None:
+    offsets = tl.program_id(0) * block_size + tl.arange(0, block_size)
+    in_bounds = offsets < total_elements
+    dim = offsets % head_dim
+    logical = offsets // head_dim
+    token = logical % prefix_capacity
+    logical //= prefix_capacity
+    head = logical % kv_heads
+    logical //= kv_heads
+    row = logical % batch
+    layer = logical // batch
+    length = tl.load(lengths_ptr + row, mask=in_bounds, other=0)
+    mask = in_bounds & (token < length)
+    dest_row = tl.load(dest_rows_ptr + row, mask=mask, other=0)
+    source_row = tl.load(source_rows_ptr + row, mask=mask, other=0)
+    key_base = layer * key_stride_layer + head * key_stride_head + token * key_stride_token + dim
+    value_base = (
+        layer * value_stride_layer + head * value_stride_head + token * value_stride_token + dim
+    )
+    key_source = key_base + source_row * key_stride_row
+    key_dest = key_base + dest_row * key_stride_row
+    value_source = value_base + source_row * value_stride_row
+    value_dest = value_base + dest_row * value_stride_row
+    tl.store(keys_ptr + key_dest, tl.load(keys_ptr + key_source, mask=mask), mask=mask)
+    tl.store(
+        values_ptr + value_dest,
+        tl.load(values_ptr + value_source, mask=mask),
+        mask=mask,
+    )
+
+
+def triton_copy_ragged_prefix_kv_layers(
+    keys: Tensor,
+    values: Tensor,
+    lengths: Tensor,
+    dest_rows: Tensor,
+    source_rows: Tensor,
+    *,
+    prefix_capacity: int,
+) -> None:
+    """Copy per-row dense KV prefixes across all layers in one launch."""
+
+    if keys.shape != values.shape or keys.ndim != 5:
+        raise ValueError(
+            "keys and values must have matching [layers, rows, heads, tokens, dim] shapes"
+        )
+    if not keys.is_cuda or not values.is_cuda:
+        raise ValueError("layered ragged prefix KV copy requires CUDA tensors")
+    if keys.device != values.device or keys.dtype != values.dtype:
+        raise ValueError("keys and values must have matching devices and dtypes")
+    batch = int(lengths.numel())
+    if lengths.ndim != 1 or dest_rows.shape != (batch,) or source_rows.shape != (batch,):
+        raise ValueError("lengths, dest_rows, and source_rows must be equal-length vectors")
+    if any(tensor.device != keys.device for tensor in (lengths, dest_rows, source_rows)):
+        raise ValueError("prefix metadata must be on the KV cache device")
+    capacity = int(prefix_capacity)
+    if capacity < 0 or capacity > keys.size(3):
+        raise ValueError("prefix capacity exceeds the KV cache")
+    if capacity == 0 or batch == 0 or keys.size(0) == 0:
+        return
+    if keys.stride(-1) != 1 or values.stride(-1) != 1:
+        raise ValueError("KV cache head dimensions must be contiguous")
+    total = keys.size(0) * batch * keys.size(2) * capacity * keys.size(4)
+    block_size = 256
+    _copy_ragged_prefix_kv_layers_kernel[(triton.cdiv(total, block_size),)](
+        keys,
+        values,
+        lengths,
+        dest_rows,
+        source_rows,
+        keys.stride(0),
+        keys.stride(1),
+        keys.stride(2),
+        keys.stride(3),
+        values.stride(0),
+        values.stride(1),
+        values.stride(2),
+        values.stride(3),
+        total,
+        batch,
+        keys.size(2),
+        capacity,
+        keys.size(4),
+        block_size,
+        num_warps=4,
+    )
+
+
+@triton.jit
 def _rotary_interleaved_inplace_kernel(
     x_ptr,
     cos_ptr,
@@ -764,6 +988,199 @@ def triton_apply_rotary_append_kv_ragged_decode(
         k.stride(3),
         v.stride(0),
         v.stride(1),
+        v.stride(3),
+        cache_keys.stride(0),
+        cache_keys.stride(1),
+        cache_keys.stride(2),
+        cache_keys.stride(3),
+        block_size,
+        num_warps=4,
+    )
+    return q
+
+
+@triton.jit
+def _rotary_llama_append_kv_packed_kernel(
+    q_ptr,
+    k_ptr,
+    v_ptr,
+    cache_key_ptr,
+    cache_value_ptr,
+    positions_ptr,
+    rows_ptr,
+    cos_ptr,
+    sin_ptr,
+    total_elements,
+    q_pairs,
+    k_pairs,
+    v_elements,
+    q_heads: tl.constexpr,
+    kv_heads: tl.constexpr,
+    tokens: tl.constexpr,
+    head_dim: tl.constexpr,
+    half_dim: tl.constexpr,
+    cache_dim: tl.constexpr,
+    q_stride_head: tl.constexpr,
+    q_stride_token: tl.constexpr,
+    q_stride_dim: tl.constexpr,
+    k_stride_head: tl.constexpr,
+    k_stride_token: tl.constexpr,
+    k_stride_dim: tl.constexpr,
+    v_stride_head: tl.constexpr,
+    v_stride_token: tl.constexpr,
+    v_stride_dim: tl.constexpr,
+    cache_stride_batch: tl.constexpr,
+    cache_stride_head: tl.constexpr,
+    cache_stride_token: tl.constexpr,
+    cache_stride_dim: tl.constexpr,
+    block_size: tl.constexpr,
+) -> None:
+    offsets = tl.program_id(0) * block_size + tl.arange(0, block_size)
+    mask = offsets < total_elements
+
+    q_dim = offsets % half_dim
+    q_logical = offsets // half_dim
+    q_token = q_logical % tokens
+    q_head = (q_logical // tokens) % q_heads
+    q_mask = mask & (offsets < q_pairs)
+    q_offset = q_head * q_stride_head + q_token * q_stride_token + q_dim * q_stride_dim
+    q_first = tl.load(q_ptr + q_offset, mask=q_mask, other=0.0).to(tl.float32)
+    q_second = tl.load(
+        q_ptr + q_offset + half_dim * q_stride_dim,
+        mask=q_mask,
+        other=0.0,
+    ).to(tl.float32)
+    q_cos = tl.load(cos_ptr + q_token * cache_dim + q_dim, mask=q_mask, other=1.0).to(tl.float32)
+    q_sin = tl.load(sin_ptr + q_token * cache_dim + q_dim, mask=q_mask, other=0.0).to(tl.float32)
+    tl.store(q_ptr + q_offset, q_first * q_cos - q_second * q_sin, mask=q_mask)
+    tl.store(
+        q_ptr + q_offset + half_dim * q_stride_dim,
+        q_second * q_cos + q_first * q_sin,
+        mask=q_mask,
+    )
+
+    k_dim = offsets % half_dim
+    k_logical = offsets // half_dim
+    k_token = k_logical % tokens
+    k_head = (k_logical // tokens) % kv_heads
+    k_mask = mask & (offsets < k_pairs)
+    k_offset = k_head * k_stride_head + k_token * k_stride_token + k_dim * k_stride_dim
+    k_row = tl.load(rows_ptr + k_token, mask=k_mask, other=0)
+    k_pos = tl.load(positions_ptr + k_token, mask=k_mask, other=0)
+    cache_k_offset = (
+        k_row * cache_stride_batch
+        + k_head * cache_stride_head
+        + k_pos * cache_stride_token
+        + k_dim * cache_stride_dim
+    )
+    k_first = tl.load(k_ptr + k_offset, mask=k_mask, other=0.0).to(tl.float32)
+    k_second = tl.load(
+        k_ptr + k_offset + half_dim * k_stride_dim,
+        mask=k_mask,
+        other=0.0,
+    ).to(tl.float32)
+    k_cos = tl.load(cos_ptr + k_token * cache_dim + k_dim, mask=k_mask, other=1.0).to(tl.float32)
+    k_sin = tl.load(sin_ptr + k_token * cache_dim + k_dim, mask=k_mask, other=0.0).to(tl.float32)
+    tl.store(cache_key_ptr + cache_k_offset, k_first * k_cos - k_second * k_sin, mask=k_mask)
+    tl.store(
+        cache_key_ptr + cache_k_offset + half_dim * cache_stride_dim,
+        k_second * k_cos + k_first * k_sin,
+        mask=k_mask,
+    )
+
+    v_dim = offsets % head_dim
+    v_logical = offsets // head_dim
+    v_token = v_logical % tokens
+    v_head = (v_logical // tokens) % kv_heads
+    v_mask = mask & (offsets < v_elements)
+    v_offset = v_head * v_stride_head + v_token * v_stride_token + v_dim * v_stride_dim
+    v_row = tl.load(rows_ptr + v_token, mask=v_mask, other=0)
+    v_pos = tl.load(positions_ptr + v_token, mask=v_mask, other=0)
+    cache_v_offset = (
+        v_row * cache_stride_batch
+        + v_head * cache_stride_head
+        + v_pos * cache_stride_token
+        + v_dim * cache_stride_dim
+    )
+    tl.store(cache_value_ptr + cache_v_offset, tl.load(v_ptr + v_offset, mask=v_mask), mask=v_mask)
+
+
+def triton_apply_rotary_append_kv_packed(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    cache_keys: Tensor,
+    cache_values: Tensor,
+    positions: Tensor,
+    rows: Tensor,
+    cos: Tensor,
+    sin: Tensor,
+) -> Tensor:
+    """Apply Llama RoPE and append a packed token stream to arbitrary cache rows."""
+
+    if q.ndim != 4 or k.ndim != 4 or v.ndim != 4 or q.size(0) != 1:
+        raise ValueError("packed q, k, and v must have shape [1, heads, tokens, dim]")
+    if k.size(0) != 1 or v.size(0) != 1 or k.size(1) != v.size(1):
+        raise ValueError("packed k and v shapes must match")
+    if q.size(-2) != k.size(-2) or k.size(-2) != v.size(-2):
+        raise ValueError("packed q, k, and v token counts must match")
+    if q.size(-1) != k.size(-1) or k.size(-1) != v.size(-1) or q.size(-1) % 2:
+        raise ValueError("packed q, k, and v require matching even head dimensions")
+    if cache_keys.shape != cache_values.shape:
+        raise ValueError("cache keys and values must have matching shapes")
+    tokens = q.size(-2)
+    if positions.shape != (tokens,) or rows.shape != (tokens,):
+        raise ValueError("packed positions and rows must have shape [tokens]")
+    if k.size(1) != cache_keys.size(1) or k.size(-1) != cache_keys.size(-1):
+        raise ValueError("cache shape is incompatible with packed k/v")
+    if any(tensor.device != cache_keys.device for tensor in (q, k, v, positions, rows, cos, sin)):
+        raise ValueError("packed rotary append tensors must share one device")
+    half_dim = q.size(-1) // 2
+    if cos.shape != sin.shape or cos.numel() != tokens * half_dim:
+        raise ValueError("packed rotary cache must have shape [tokens, head_dim / 2]")
+    if any(tensor.stride(-1) != 1 for tensor in (q, k, v, cache_keys, cache_values)):
+        raise ValueError("packed rotary append requires contiguous head dimensions")
+
+    cos = cos.reshape(tokens, half_dim).contiguous()
+    sin = sin.reshape(tokens, half_dim).contiguous()
+    positions = positions.contiguous()
+    rows = rows.contiguous()
+    q_heads = q.size(1)
+    kv_heads = k.size(1)
+    head_dim = q.size(-1)
+    q_pairs = tokens * q_heads * half_dim
+    k_pairs = tokens * kv_heads * half_dim
+    v_elements = tokens * kv_heads * head_dim
+    total_elements = max(q_pairs, k_pairs, v_elements)
+    block_size = 256
+    _rotary_llama_append_kv_packed_kernel[(triton.cdiv(total_elements, block_size),)](
+        q,
+        k,
+        v,
+        cache_keys,
+        cache_values,
+        positions,
+        rows,
+        cos,
+        sin,
+        total_elements,
+        q_pairs,
+        k_pairs,
+        v_elements,
+        q_heads,
+        kv_heads,
+        tokens,
+        head_dim,
+        half_dim,
+        half_dim,
+        q.stride(1),
+        q.stride(2),
+        q.stride(3),
+        k.stride(1),
+        k.stride(2),
+        k.stride(3),
+        v.stride(1),
+        v.stride(2),
         v.stride(3),
         cache_keys.stride(0),
         cache_keys.stride(1),
@@ -1650,6 +2067,167 @@ def triton_add_rms_norm(x: Tensor, residual: Tensor, weight: Tensor, eps: float)
         num_warps=8,
     )
     return hidden_out.view_as(x), norm_out.view_as(x)
+
+
+@triton.jit
+def _rms_norm_fp8_per_token_kernel(
+    x_ptr,
+    weight_ptr,
+    output_ptr,
+    scale_ptr,
+    n_cols: tl.constexpr,
+    eps: tl.constexpr,
+    block_size: tl.constexpr,
+) -> None:
+    row = tl.program_id(0)
+    offsets = tl.arange(0, block_size)
+    mask = offsets < n_cols
+    row_offsets = row * n_cols + offsets
+    x = tl.load(x_ptr + row_offsets, mask=mask, other=0.0).to(tl.float32)
+    weight = tl.load(weight_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+    variance = tl.sum(x * x, axis=0) / n_cols
+    normed = x * tl.rsqrt(variance + eps) * weight
+    scale = tl.maximum(tl.max(tl.abs(normed), axis=0) / 448.0, 1e-10)
+    tl.store(output_ptr + row_offsets, normed / scale, mask=mask)
+    tl.store(scale_ptr + row, scale)
+
+
+@triton.jit
+def _add_rms_norm_fp8_per_token_kernel(
+    x_ptr,
+    residual_ptr,
+    weight_ptr,
+    hidden_out_ptr,
+    output_ptr,
+    scale_ptr,
+    n_cols: tl.constexpr,
+    eps: tl.constexpr,
+    block_size: tl.constexpr,
+) -> None:
+    row = tl.program_id(0)
+    offsets = tl.arange(0, block_size)
+    mask = offsets < n_cols
+    row_offsets = row * n_cols + offsets
+    hidden = (
+        tl.load(x_ptr + row_offsets, mask=mask, other=0.0).to(tl.float32)
+        + tl.load(residual_ptr + row_offsets, mask=mask, other=0.0).to(tl.float32)
+    )
+    weight = tl.load(weight_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+    variance = tl.sum(hidden * hidden, axis=0) / n_cols
+    normed = hidden * tl.rsqrt(variance + eps) * weight
+    scale = tl.maximum(tl.max(tl.abs(normed), axis=0) / 448.0, 1e-10)
+    tl.store(hidden_out_ptr + row_offsets, hidden, mask=mask)
+    tl.store(output_ptr + row_offsets, normed / scale, mask=mask)
+    tl.store(scale_ptr + row, scale)
+
+
+@triton.jit
+def _swiglu_fp8_per_token_kernel(
+    gate_ptr,
+    up_ptr,
+    output_ptr,
+    scale_ptr,
+    n_cols: tl.constexpr,
+    block_size: tl.constexpr,
+) -> None:
+    row = tl.program_id(0)
+    offsets = tl.arange(0, block_size)
+    mask = offsets < n_cols
+    row_offsets = row * n_cols + offsets
+    gate = tl.load(gate_ptr + row_offsets, mask=mask, other=0.0).to(tl.float32)
+    up = tl.load(up_ptr + row_offsets, mask=mask, other=0.0).to(tl.float32)
+    activated = gate * tl.sigmoid(gate) * up
+    scale = tl.maximum(tl.max(tl.abs(activated), axis=0) / 448.0, 1e-10)
+    tl.store(output_ptr + row_offsets, activated / scale, mask=mask)
+    tl.store(scale_ptr + row, scale)
+
+
+def _fp8_per_token_outputs(x: Tensor) -> tuple[Tensor, Tensor, int, int]:
+    if not x.is_cuda or x.ndim < 2:
+        raise ValueError("per-token FP8 fusion requires a CUDA activation matrix")
+    x_2d = x.contiguous().view(-1, x.size(-1))
+    n_cols = x_2d.size(1)
+    block_size = triton.next_power_of_2(n_cols)
+    if block_size > 8192:
+        raise ValueError("per-token FP8 fusion supports hidden sizes up to 8192")
+    output = torch.empty_like(x_2d, dtype=torch.float8_e4m3fn)
+    scale = torch.empty((x_2d.size(0), 1), dtype=torch.float32, device=x.device)
+    return output, scale, n_cols, block_size
+
+
+def triton_rms_norm_fp8_per_token(
+    x: Tensor,
+    weight: Tensor,
+    eps: float,
+) -> tuple[Tensor, Tensor]:
+    """RMS-normalize and dynamically quantize each row to e4m3 in one pass."""
+
+    if x.size(-1) != weight.numel() or weight.device != x.device:
+        raise ValueError("RMSNorm weight must match the activation width and device")
+    output, scale, n_cols, block_size = _fp8_per_token_outputs(x)
+    x_2d = x.contiguous().view(-1, n_cols)
+    _rms_norm_fp8_per_token_kernel[(x_2d.size(0),)](
+        x_2d,
+        weight.contiguous(),
+        output,
+        scale,
+        n_cols,
+        eps,
+        block_size,
+        num_warps=8,
+    )
+    return output.view_as(x), scale
+
+
+def triton_add_rms_norm_fp8_per_token(
+    x: Tensor,
+    residual: Tensor,
+    weight: Tensor,
+    eps: float,
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Add residual, RMS-normalize, and quantize the normalized rows in one pass."""
+
+    if x.shape != residual.shape or x.device != residual.device:
+        raise ValueError("x and residual tensors must have matching shapes and devices")
+    if x.size(-1) != weight.numel() or weight.device != x.device:
+        raise ValueError("RMSNorm weight must match the activation width and device")
+    output, scale, n_cols, block_size = _fp8_per_token_outputs(x)
+    x_2d = x.contiguous().view(-1, n_cols)
+    residual_2d = residual.contiguous().view(-1, n_cols)
+    hidden = torch.empty_like(x_2d)
+    _add_rms_norm_fp8_per_token_kernel[(x_2d.size(0),)](
+        x_2d,
+        residual_2d,
+        weight.contiguous(),
+        hidden,
+        output,
+        scale,
+        n_cols,
+        eps,
+        block_size,
+        num_warps=8,
+    )
+    return hidden.view_as(x), output.view_as(x), scale
+
+
+def triton_swiglu_fp8_per_token(gate: Tensor, up: Tensor) -> tuple[Tensor, Tensor]:
+    """Apply SwiGLU and dynamically quantize each output row to e4m3 in one pass."""
+
+    if gate.shape != up.shape or gate.device != up.device:
+        raise ValueError("gate and up tensors must have matching shapes and devices")
+    output, scale, n_cols, block_size = _fp8_per_token_outputs(gate)
+    gate_2d = gate.contiguous().view(-1, n_cols)
+    up_2d = up.contiguous().view(-1, n_cols)
+    _swiglu_fp8_per_token_kernel[(gate_2d.size(0),)](
+        gate_2d,
+        up_2d,
+        output,
+        scale,
+        n_cols,
+        block_size,
+        num_warps=8,
+    )
+    return output.view_as(gate), scale
 
 
 @triton.jit

@@ -78,11 +78,13 @@ from torchinferno.runtime.scheduler import (
 from torchinferno.runtime.serving import (
     ContinuousBatchEngine as _RuntimeContinuousBatchEngine,
     ServingRequest as _RuntimeServingRequest,
+    _decode_batch_buckets,
     _default_prefix_prefill_batch_buckets,
     _default_prefix_prefill_suffix_buckets,
     _dynamic_prefix_prefill_context_len,
     _dynamic_prefix_prefill_max_suffix_for_policy,
-    _greedy_large_mixed_prefix_reuse_policy_enabled,
+    _piecewise_token_bucket,
+    _token_bucket_fa3_batch_capacities,
 )
 
 
@@ -176,15 +178,16 @@ def _flashinfer_prefill_warmup_batch_sizes(batch_sizes: Sequence[int]) -> tuple[
 
 def _online_decode_warmup_batch_sizes(*, max_active: int, cache_batch: int) -> tuple[int, ...]:
     active_limit = min(max(1, int(max_active)), max(1, int(cache_batch)))
-    batch_sizes = {active_limit}
     configured = os.environ.get("TORCHINFERNO_OPENAI_WARMUP_ONLINE_DECODE_BATCH_SIZES")
     if configured is not None:
-        batch_sizes.update(
+        batch_sizes = {
             batch
             for batch in _parse_positive_int_csv(configured)
             if 1 <= int(batch) <= active_limit
-        )
+        }
+        batch_sizes.add(active_limit)
         return tuple(sorted(batch_sizes))
+    batch_sizes = set(_decode_batch_buckets(active_limit))
     runtime_bucket_sizes = os.environ.get("TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_BUCKET_SIZES")
     if runtime_bucket_sizes is not None:
         batch_sizes.update(
@@ -192,12 +195,6 @@ def _online_decode_warmup_batch_sizes(*, max_active: int, cache_batch: int) -> t
             for batch in _parse_positive_int_csv(runtime_bucket_sizes)
             if 1 <= int(batch) <= active_limit
         )
-    if active_limit >= 3:
-        batch_sizes.add(3)
-    bucket = 1
-    while bucket <= active_limit:
-        batch_sizes.add(bucket)
-        bucket *= 2
     return tuple(sorted(batch_sizes))
 
 
@@ -222,73 +219,71 @@ def _online_decode_warmup_policy_specs() -> tuple[tuple[float, int], ...]:
     )
     sampled_max_tokens = env_int(
         "TORCHINFERNO_OPENAI_WARMUP_ONLINE_DECODE_SAMPLED_MAX_TOKENS",
-        env_int(
-            "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_INITIAL_BATCH_WAIT_MAX_TOKENS",
-            300,
-            minimum=1,
-        ),
+        1,
         minimum=1,
     )
-    symm_max_temperature = env_float(
-        "TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_MAX_TEMPERATURE",
-        0.0,
-        minimum=0.0,
-    )
-    symm_max_tokens = env_int(
-        "TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_MAX_TOKENS",
-        1024,
-        minimum=1,
-    )
-    if sampled_temperature > symm_max_temperature or sampled_max_tokens > symm_max_tokens:
+    if sampled_temperature != 0.0:
         specs.append((sampled_temperature, sampled_max_tokens))
     return tuple(dict.fromkeys(specs))
 
 
-def _online_short_greedy_ragged_decode_cache_token_limit(
+def _online_ragged_decode_cache_token_limit(
     *,
     temperature: float,
     max_tokens: int,
     max_seq_len: int,
 ) -> int | None:
-    if temperature > 0.0 or max_tokens <= 0 or max_seq_len <= 0:
+    del temperature, max_tokens
+    if max_seq_len <= 0:
         return None
-    if max_tokens > env_int(
-        "TORCHINFERNO_OPENAI_TP_ONLINE_SHORT_GREEDY_RAGGED_DECODE_CACHE_MAX_TOKENS",
-        128,
+    configured = env_int(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_RAGGED_DECODE_CACHE_TOKENS",
+        0,
+        minimum=0,
+    )
+    if configured > 0:
+        return configured if configured >= int(max_seq_len) else None
+    # Attention graph work is a cache-capacity concern, not an output-length
+    # policy. Round the logical session capacity to an FA3-friendly tile so a
+    # larger persistent cache does not force every decode through its full span.
+    tile = env_int(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_RAGGED_DECODE_CACHE_TILE",
+        64,
         minimum=1,
-    ):
-        return None
+    )
+    return ((int(max_seq_len) + tile - 1) // tile) * tile
+
+
+def _online_ragged_decode_warmup_cache_token_limit(max_seq_len: int) -> int | None:
     configured = env_int(
-        "TORCHINFERNO_OPENAI_TP_ONLINE_SHORT_GREEDY_RAGGED_DECODE_CACHE_TOKENS",
+        "TORCHINFERNO_OPENAI_TP_ONLINE_RAGGED_DECODE_CACHE_TOKENS",
         0,
         minimum=0,
     )
-    if configured <= 0:
+    if max_seq_len <= 0:
         return None
-    session_bucket = 1 << (max(1, int(max_seq_len)) - 1).bit_length()
-    limit = min(int(configured), session_bucket)
-    if limit < int(max_seq_len):
-        return None
-    return limit
-
-
-def _online_short_greedy_ragged_decode_warmup_cache_token_limit(max_seq_len: int) -> int | None:
-    configured = env_int(
-        "TORCHINFERNO_OPENAI_TP_ONLINE_SHORT_GREEDY_RAGGED_DECODE_CACHE_TOKENS",
-        0,
-        minimum=0,
-    )
-    if configured <= 0 or max_seq_len <= 0:
-        return None
-    limit = min(int(configured), int(max_seq_len))
-    if limit >= int(max_seq_len):
+    if configured > 0:
+        limit = min(int(configured), int(max_seq_len))
+    else:
+        tile = env_int(
+            "TORCHINFERNO_OPENAI_TP_ONLINE_RAGGED_DECODE_CACHE_TILE",
+            64,
+            minimum=1,
+        )
+        logical = env_int(
+            "TORCHINFERNO_OPENAI_TP_ONLINE_WARMUP_LOGICAL_SEQ_LEN",
+            min(5 * tile, int(max_seq_len)),
+            minimum=1,
+        )
+        limit = min(((logical + tile - 1) // tile) * tile, int(max_seq_len))
+    if limit <= 0 or limit >= int(max_seq_len):
         return None
     return max(1, limit)
 
 
-def _online_short_greedy_ragged_decode_cache_token_min_batch() -> int:
+def _online_ragged_decode_cache_token_min_batch() -> int:
     return env_int(
-        "TORCHINFERNO_OPENAI_TP_ONLINE_SHORT_GREEDY_RAGGED_DECODE_CACHE_MIN_BATCH",
+        "TORCHINFERNO_OPENAI_TP_ONLINE_RAGGED_DECODE_CACHE_MIN_BATCH",
         64,
         minimum=1,
     )
@@ -301,10 +296,10 @@ def _online_decode_warmup_cache_token_limits(
     max_seq_len: int,
 ) -> tuple[int | None, ...]:
     limits: list[int | None] = [None]
-    short_limit = _online_short_greedy_ragged_decode_warmup_cache_token_limit(max_seq_len)
+    short_limit = _online_ragged_decode_warmup_cache_token_limit(max_seq_len)
     if (
         short_limit is not None
-        and _online_short_greedy_ragged_decode_cache_token_limit(
+        and _online_ragged_decode_cache_token_limit(
             temperature=warmup_temperature,
             max_tokens=warmup_max_tokens,
             max_seq_len=short_limit,
@@ -320,422 +315,128 @@ def _flashinfer_prefill_runtime_enabled() -> bool:
 
 
 def _online_refill_min_ready_requests(*, temperature: float, max_tokens: int) -> int | None:
+    del temperature, max_tokens
     if "TORCHINFERNO_CONTINUOUS_ADMIT_MIN_READY_REQUESTS" in os.environ:
         return None
-    min_ready_env = "TORCHINFERNO_OPENAI_TP_ONLINE_REFILL_MIN_READY_REQUESTS"
-    if max_tokens < 1:
-        return None
-    if temperature > 0.0:
-        return None
-    refill_max_tokens = env_int(
-        "TORCHINFERNO_OPENAI_TP_ONLINE_REFILL_BATCH_MAX_TOKENS",
-        512,
+    return env_int(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_REFILL_MIN_READY_REQUESTS",
+        4,
         minimum=1,
     )
-    if max_tokens > refill_max_tokens:
-        return None
-    default_min_ready = 8
-    if max_tokens <= env_int(
-        "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_REFILL_MAX_TOKENS",
-        128,
-        minimum=1,
-    ):
-        # Long-output-style short greedy streams are suffix-prefill fragmented
-        # after the small first client wave. An 8-request refill floor keeps
-        # first-token queueing low without changing the 256-token few-shot path.
-        default_min_ready = env_int(
-            "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_REFILL_MIN_READY_REQUESTS",
-            8,
-            minimum=1,
-        )
-    if max_tokens > env_int(
-        "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_REFILL_MIN_TOKENS",
-        300,
-        minimum=1,
-    ):
-        # Multi-turn-style greedy large streams arrive in staggered conversation
-        # waves. A 32-request refill floor inflated admission wait; local TP8
-        # 70B A/B on multi_turn improved 246.8/37.7/279.8ms ->
-        # 217.8/37.5/248.5ms at essentially unchanged correctness.
-        default_min_ready = env_int(
-            "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_REFILL_MIN_READY_REQUESTS",
-            8,
-            minimum=1,
-        )
-    return env_int(min_ready_env, default_min_ready, minimum=1)
 
 
 def _online_admit_per_step_cap(*, temperature: float, max_tokens: int) -> int | None:
+    del temperature, max_tokens
     runtime_env = "TORCHINFERNO_CONTINUOUS_ADMIT_PER_STEP_CAP"
     if runtime_env in os.environ:
         return env_int(runtime_env, 48, minimum=0)
-    default_cap = 48
-    if temperature > 0.0 and 0 < max_tokens <= env_int(
-        "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_SHORT_ADMIT_MAX_TOKENS",
-        256,
-        minimum=1,
-    ):
-        # Self-consistency-style sampled bursts already use the KV-bounded
-        # 128-row cache, but a 48/request admission cap still fragments decode
-        # into small waves. Local TP8 A/B on 70B with a 128 cap improved median
-        # TTFT 319.8 -> 248.9ms with 100% correctness.
-        default_cap = env_int(
-            "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_SHORT_ADMIT_PER_STEP_CAP",
-            128,
-            minimum=0,
-        )
-    if temperature <= 0.0 and 0 < max_tokens <= env_int(
-        "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_ADMIT_MAX_TOKENS",
-        128,
-        minimum=1,
-    ):
-        # Long-output-style greedy short streams are prefill/admission sensitive
-        # but still decode with the same active-row cap. Current TP8 70B
-        # first-token attribution showed b32 prefix-prefill waves own the slow
-        # submit-to-first tail; capping new admissions at 24 keeps those waves on
-        # the warmed b24 bucket and improved long_output 229.6/21.7/993.3ms ->
-        # 207.4/21.5/938.1ms with 100% correctness.
-        default_cap = env_int(
-            "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_ADMIT_PER_STEP_CAP",
-            24,
-            minimum=0,
-        )
-    if temperature <= 0.0 and max_tokens > env_int(
-        "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_MID_ADMIT_MIN_TOKENS",
-        128,
-        minimum=1,
-    ) and max_tokens <= env_int(
-        "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_MID_ADMIT_MAX_TOKENS",
-        300,
-        minimum=1,
-    ):
-        default_cap = env_int(
-            "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_MID_ADMIT_PER_STEP_CAP",
-            64,
-            minimum=0,
-        )
     return env_int(
         "TORCHINFERNO_OPENAI_TP_ONLINE_ADMIT_PER_STEP_CAP",
-        default_cap,
+        48,
         minimum=0,
     )
 
 
 def _online_admit_min_free_rows(*, temperature: float, max_tokens: int) -> int | None:
+    del temperature, max_tokens
     if "TORCHINFERNO_CONTINUOUS_ADMIT_MIN_FREE_ROWS" in os.environ:
         return None
-    if max_tokens < 1:
-        return None
-    if temperature > 0.0:
-        return None
-    greedy_short_max_tokens = env_int(
-        "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_ADMIT_MAX_TOKENS",
-        128,
-        minimum=1,
-    )
-    if max_tokens > greedy_short_max_tokens:
-        return None
-    # Long-output-style short greedy streams are decode-stall sensitive. Waiting
-    # for a small refill window batches suffix-prefill work without the larger
-    # TTFT hit seen from high refill floors.
     return env_int(
-        "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_ADMIT_MIN_FREE_ROWS",
-        4,
+        "TORCHINFERNO_OPENAI_TP_ONLINE_ADMIT_MIN_FREE_ROWS",
+        2,
         minimum=1,
     )
 
 
 def _online_kv_bounded_concurrency_enabled(*, temperature: float, max_tokens: int) -> bool:
-    if not env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_KV_BOUNDED_CONCURRENCY", True):
-        return False
-    if max_tokens < 1:
-        return False
-    if temperature > 0.0:
-        if not env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_KV_BOUNDED_ALLOW_SAMPLED", True):
-            return False
-        sampled_max_tokens = env_int(
-            "TORCHINFERNO_OPENAI_TP_ONLINE_KV_BOUNDED_SAMPLED_MAX_TOKENS",
-            256,
-            minimum=1,
-        )
-        return max_tokens <= sampled_max_tokens
-    greedy_max_tokens = env_int(
-        "TORCHINFERNO_OPENAI_TP_ONLINE_KV_BOUNDED_GREEDY_MAX_TOKENS",
-        128,
-        minimum=1,
-    )
-    return max_tokens <= greedy_max_tokens
+    del temperature, max_tokens
+    return env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_KV_BOUNDED_CONCURRENCY", True)
 
 
 def _online_kv_bounded_max_active_cap(*, temperature: float, base_cap: int) -> int:
+    del temperature
     cap = max(1, int(base_cap))
-    if temperature > 0.0:
-        sampled_cap_env = "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_KV_MAX_ACTIVE_CAP"
-        if sampled_cap_env in os.environ:
-            return min(cap, env_int(sampled_cap_env, cap, minimum=1))
-        if "TORCHINFERNO_OPENAI_TP_ONLINE_KV_MAX_ACTIVE_CAP" in os.environ:
-            return cap
-        # Sampled short bursts still need a logits decode for stop/EOS. Keep the
-        # boosted active cap inside the CUDA-graph decode envelope by default;
-        # larger non-graphed batches fall back to eager decode and raise latency.
-        decode_graph_cap = env_int(
-            "TORCHINFERNO_CUDAGRAPH_DECODE_STEP_MAX_BATCH",
-            64,
-            minimum=1,
-        )
-        return min(cap, decode_graph_cap)
-    greedy_cap_env = "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_KV_MAX_ACTIVE_CAP"
-    if greedy_cap_env in os.environ:
-        return min(cap, env_int(greedy_cap_env, cap, minimum=1))
-    if "TORCHINFERNO_OPENAI_TP_ONLINE_KV_MAX_ACTIVE_CAP" in os.environ:
-        return cap
-    # Short greedy long_output requests are decode-throughput bound, but the
-    # previous 123-row active cap still decoded in 64-row model buckets while
-    # cutting the prefix cache down to 21 rows. That inflated prefill/refill work
-    # without increasing effective decode batch size. Keep the active cap at the
-    # 64-row decode bucket and preserve the 64-row prefix cache under the 144-row
-    # dense cache envelope.
-    total_budget = env_int("TORCHINFERNO_OPENAI_TP_ONLINE_TOTAL_ROWS_BUDGET", 144, minimum=0)
-    min_prefix_rows = env_int(
-        "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_KV_MIN_PREFIX_ROWS",
-        80,
-        minimum=0,
+    configured = env_int(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_KV_MAX_ACTIVE_CAP",
+        64,
+        minimum=1,
     )
-    default_greedy_cap = cap
-    if total_budget > min_prefix_rows:
-        default_greedy_cap = min(cap, max(1, total_budget - min_prefix_rows))
-    return min(cap, env_int(greedy_cap_env, default_greedy_cap, minimum=1))
+    return min(cap, configured)
 
 
 def _online_kv_token_budget(*, temperature: float, max_tokens: int) -> int:
-    if "TORCHINFERNO_OPENAI_TP_ONLINE_KV_TOKEN_BUDGET" in os.environ:
-        return env_int("TORCHINFERNO_OPENAI_TP_ONLINE_KV_TOKEN_BUDGET", 64 * 512, minimum=1)
-    if temperature > 0.0 and max_tokens > 0:
-        sampled_max_tokens = env_int(
-            "TORCHINFERNO_OPENAI_TP_ONLINE_KV_BOUNDED_SAMPLED_MAX_TOKENS",
-            256,
-            minimum=1,
-        )
-        if max_tokens <= sampled_max_tokens:
-            # Self-consistency-style sampled bursts are wave-scheduling bound.
-            # A 32K token budget keeps more prefix rows than the full 128-row
-            # active cap while still admitting large sampled-short waves. Local
-            # TP8 70B rechecks: 32K improved self-consistency median E2E/p99
-            # from 284.4/1578.9ms to 227.7/1303.4ms, while 24K regressed to
-            # 295.4/1552.1ms. Greedy long-output policy is handled separately.
-            return env_int(
-                "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_KV_TOKEN_BUDGET",
-                64 * 512,
-                minimum=1,
-            )
-        return env_int("TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_LONG_KV_TOKEN_BUDGET", 64 * 512, minimum=1)
-    # Greedy short-output bursts benefit from a KV-token cap above the base
-    # 48-row policy, but local TP8 rechecks showed the full 128-row cap adds
-    # decode pressure without a stable prefill win. Keep the steadier 32K budget
-    # as the default and leave larger caps as explicit env overrides.
-    return env_int("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_KV_TOKEN_BUDGET", 64 * 512, minimum=1)
+    del temperature, max_tokens
+    return env_int(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_KV_TOKEN_BUDGET",
+        64 * 320,
+        minimum=1,
+    )
 
 
 def _online_decode_quantum(*, temperature: float, max_tokens: int) -> int:
-    decode_quantum = env_int("TORCHINFERNO_OPENAI_TP_ONLINE_DECODE_QUANTUM", 16, minimum=1)
-    if max_tokens < 1:
-        return decode_quantum
-    short_gen_max_tokens = env_int(
-        "TORCHINFERNO_OPENAI_TP_ONLINE_SHORT_GEN_MAX_TOKENS",
-        400,
-        minimum=1,
-    )
-    if max_tokens > short_gen_max_tokens:
-        return decode_quantum
-    default_short_quantum = min(decode_quantum, 4)
-    if temperature > 0.0:
-        sampled_short_max_tokens = env_int(
-            "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_SHORT_GEN_DECODE_QUANTUM_MAX_TOKENS",
-            256,
-            minimum=1,
-        )
-        sampled_medium_max_tokens = env_int(
-            "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_GEN_DECODE_QUANTUM_MAX_TOKENS",
-            300,
-            minimum=sampled_short_max_tokens,
-        )
-        if sampled_short_max_tokens < max_tokens <= sampled_medium_max_tokens:
-            # Tree-style sampled medium bursts are E2E/TTFT-bound more than
-            # steady TPOT-bound. A one-step command quantum lets one-token
-            # branch/eval completions surface immediately while staying scoped
-            # away from sampled-short self-consistency and greedy decode-many
-            # traffic.
-            default_short_quantum = min(
-                decode_quantum,
-                env_int(
-                    "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_GEN_DECODE_QUANTUM",
-                    1,
-                    minimum=1,
-                ),
-            )
-    elif temperature <= 0.0:
-        greedy_short_max_tokens = env_int(
-            "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_GEN_MAX_TOKENS",
-            128,
-            minimum=1,
-        )
-        if max_tokens <= greedy_short_max_tokens:
-            # Decode-many already batches several token steps before surfacing
-            # events. A full 8-token command quantum cuts command/sync churn for
-            # long-output-style short greedy streams; local TP8 70B rechecks cut
-            # long_output median TPOT 22.9 -> 21.1ms and p99 E2E 2234 -> 1783ms.
-            decode_many_quantum = 8
-            default_short_quantum = min(
-                decode_quantum,
-                env_int(
-                    "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_GEN_DECODE_QUANTUM",
-                    decode_many_quantum,
-                    minimum=1,
-                ),
-            )
-        greedy_mid_min_tokens = env_int(
-            "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_MID_GEN_MIN_TOKENS",
-            128,
-            minimum=1,
-        )
-        if max_tokens > greedy_mid_min_tokens:
-            default_short_quantum = min(
-                decode_quantum,
-                env_int(
-                    "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_MID_GEN_DECODE_QUANTUM",
-                    16,
-                    minimum=1,
-                ),
-            )
-    return env_int(
-        "TORCHINFERNO_OPENAI_TP_ONLINE_SHORT_GEN_DECODE_QUANTUM",
-        default_short_quantum,
-        minimum=1,
-    )
+    del temperature, max_tokens
+    return env_int("TORCHINFERNO_OPENAI_TP_ONLINE_DECODE_QUANTUM", 1, minimum=1)
 
 
 def _online_decode_drain_quantum(*, temperature: float, max_tokens: int, base_quantum: int) -> int:
+    del temperature, max_tokens
     base = max(1, int(base_quantum))
-    global_env = "TORCHINFERNO_OPENAI_TP_ONLINE_DRAIN_DECODE_QUANTUM"
-    if global_env in os.environ:
-        return env_int(global_env, base, minimum=1)
-    if max_tokens < 1 or temperature > 0.0:
-        return base
-    greedy_short_max_tokens = env_int(
-        "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_GEN_MAX_TOKENS",
-        128,
-        minimum=1,
-    )
-    if max_tokens > greedy_short_max_tokens:
-        return base
-    if not _online_decode_many_enabled(temperature=temperature, max_tokens=max_tokens):
-        return base
-    return max(
+    return env_int(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_DRAIN_DECODE_QUANTUM",
         base,
-        env_int(
-            "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_DRAIN_DECODE_QUANTUM",
-            8,
-            minimum=1,
-        ),
+        minimum=1,
     )
 
 
 def _online_decode_drain_min_generated(*, temperature: float, max_tokens: int) -> int:
-    global_env = "TORCHINFERNO_OPENAI_TP_ONLINE_DRAIN_DECODE_MIN_GENERATED"
-    if global_env in os.environ:
-        return env_int(global_env, 0, minimum=0)
-    if max_tokens < 1 or temperature > 0.0:
-        return 0
-    greedy_short_max_tokens = env_int(
-        "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_GEN_MAX_TOKENS",
-        128,
-        minimum=1,
-    )
-    if max_tokens > greedy_short_max_tokens:
-        return 0
+    del temperature, max_tokens
     return env_int(
-        "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_DRAIN_DECODE_MIN_GENERATED",
+        "TORCHINFERNO_OPENAI_TP_ONLINE_DRAIN_DECODE_MIN_GENERATED",
         0,
         minimum=0,
     )
 
 
+def _online_decode_drain_min_active(max_active: int) -> int:
+    configured = env_int(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_DRAIN_DECODE_MIN_ACTIVE",
+        0,
+        minimum=0,
+    )
+    return min(max(0, int(max_active)), configured)
+
+
 def _online_decode_many_stop_tail_max_steps(*, temperature: float, max_tokens: int) -> int:
+    del temperature, max_tokens
     runtime_env = "TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY_STOP_TAIL_MAX_STEPS"
     if runtime_env in os.environ:
         return env_int(runtime_env, 0, minimum=0)
-    global_env = "TORCHINFERNO_OPENAI_TP_ONLINE_DECODE_MANY_STOP_TAIL_MAX_STEPS"
-    if global_env in os.environ:
-        return env_int(global_env, 0, minimum=0)
-    if max_tokens < 1:
-        return 0
-    if not _online_decode_many_enabled(temperature=temperature, max_tokens=max_tokens):
-        return 0
-    if not _online_decode_many_allow_stop_enabled(temperature=temperature, max_tokens=max_tokens):
-        return 0
-    if temperature > 0.0:
-        return 0
-    greedy_short_max_tokens = env_int(
-        "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_GEN_MAX_TOKENS",
-        128,
-        minimum=1,
-    )
-    if max_tokens > greedy_short_max_tokens:
-        return 0
     return env_int(
-        "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_DECODE_MANY_STOP_TAIL_MAX_STEPS",
-        4,
+        "TORCHINFERNO_OPENAI_TP_ONLINE_DECODE_MANY_STOP_TAIL_MAX_STEPS",
+        0,
         minimum=0,
     )
 
 
 def _online_decode_many_enabled(*, temperature: float, max_tokens: int) -> bool:
+    del temperature, max_tokens
     if "TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY" in os.environ:
         return env_flag("TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY", False)
-    if max_tokens < 1:
-        return False
-    if temperature > 0.0:
-        sampled_max_tokens = env_int(
-            "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_DECODE_MANY_MAX_TOKENS",
-            400,
-            minimum=1,
-        )
-        if max_tokens > sampled_max_tokens:
-            return False
-        return env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_DECODE_MANY", False)
-    greedy_short_max_tokens = env_int(
-        "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_GEN_MAX_TOKENS",
-        128,
-        minimum=1,
-    )
-    if max_tokens > greedy_short_max_tokens:
-        return False
-    return env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_DECODE_MANY", True)
+    return env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_DECODE_MANY", False)
 
 
 def _online_decode_many_allow_stop_enabled(*, temperature: float, max_tokens: int) -> bool:
+    del temperature, max_tokens
     if "TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY_ALLOW_STOP" in os.environ:
         return env_flag("TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY_ALLOW_STOP", False)
-    if not _online_decode_many_enabled(temperature=temperature, max_tokens=max_tokens):
-        return False
-    if temperature > 0.0:
-        return env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_DECODE_MANY_ALLOW_STOP", True)
-    greedy_short_max_tokens = env_int(
-        "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_GEN_MAX_TOKENS",
-        128,
-        minimum=1,
-    )
-    if temperature > 0.0 or max_tokens > greedy_short_max_tokens:
-        return False
-    return env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_DECODE_MANY_ALLOW_STOP", True)
+    return env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_DECODE_MANY_ALLOW_STOP", False)
 
 
 def _online_decode_many_with_waiting_enabled(*, temperature: float, max_tokens: int) -> bool:
+    del temperature, max_tokens
     if "TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY_WITH_WAITING" in os.environ:
         return env_flag("TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY_WITH_WAITING", False)
-    if not _online_decode_many_enabled(temperature=temperature, max_tokens=max_tokens):
-        return False
-    return False
+    return env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_DECODE_MANY_WITH_WAITING", False)
 
 
 def _online_decode_first_enabled(*, temperature: float, max_tokens: int) -> bool:
@@ -743,87 +444,17 @@ def _online_decode_first_enabled(*, temperature: float, max_tokens: int) -> bool
     return env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_DECODE_FIRST", True)
 
 
-def _online_greedy_large_mixed_prefix_reuse_enabled(*, temperature: float, max_tokens: int) -> bool:
-    continuous_env = "TORCHINFERNO_CONTINUOUS_GREEDY_LARGE_MIXED_PREFIX_REUSE"
-    if continuous_env in os.environ:
-        return _greedy_large_mixed_prefix_reuse_policy_enabled(temperature, max_tokens)
-    env_name = "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_MIXED_PREFIX_REUSE"
-    if not env_flag(env_name, True):
-        return False
-    if temperature > 0.0 or max_tokens < 1:
-        return False
-    target_tokens = env_int(
-        "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_MIXED_PREFIX_REUSE_MAX_TOKENS",
-        env_int(
-            "TORCHINFERNO_CONTINUOUS_GREEDY_LARGE_MIXED_PREFIX_REUSE_MAX_TOKENS",
-            512,
-            minimum=1,
-        ),
-        minimum=1,
+def _online_mixed_prefix_reuse_enabled(*, temperature: float, max_tokens: int) -> bool:
+    del temperature, max_tokens
+    return env_flag(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_MIXED_PREFIX_REUSE",
+        True,
     )
-    return int(max_tokens) == target_tokens
 
 
 def _online_prefill_ready_before_decode_enabled(*, temperature: float, max_tokens: int) -> bool:
-    global_env = "TORCHINFERNO_OPENAI_TP_ONLINE_PREFILL_READY_BEFORE_DECODE"
-    if global_env in os.environ:
-        return env_flag(global_env, False)
-    if max_tokens < 1:
-        return False
-    if temperature <= 0.0:
-        greedy_short_max_tokens = env_int(
-            "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_GEN_MAX_TOKENS",
-            128,
-            minimum=1,
-        )
-        if max_tokens <= greedy_short_max_tokens:
-            # Long-output-style short greedy streams need bounded prefill
-            # interleaving to avoid queue tail spikes while decode-many remains
-            # the hot path.
-            return env_flag(
-                "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_PREFILL_READY_BEFORE_DECODE",
-                True,
-            )
-        greedy_large_min_tokens = env_int(
-            "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_PREFILL_READY_MIN_TOKENS",
-            400,
-            minimum=greedy_short_max_tokens,
-        )
-        greedy_large_max_tokens = env_int(
-            "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_PREFILL_READY_MAX_TOKENS",
-            512,
-            minimum=greedy_large_min_tokens,
-        )
-        if greedy_large_min_tokens < max_tokens <= greedy_large_max_tokens:
-            # Multi-turn 512-token greedy traffic is prefill/admission bound.
-            # This also applies to mixed-prefix reuse: local TP8 70B A/B showed
-            # the 8-row tail cap cuts queue-to-submit latency without the p99
-            # regression seen from a larger cap.
-            return env_flag(
-                "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_PREFILL_READY_BEFORE_DECODE",
-                True,
-            )
-        return False
-    sampled_medium_min_tokens = env_int(
-        "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_PREFILL_READY_MIN_TOKENS",
-        256,
-        minimum=1,
-    )
-    sampled_medium_max_tokens = env_int(
-        "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_PREFILL_READY_MAX_TOKENS",
-        300,
-        minimum=sampled_medium_min_tokens,
-    )
-    if sampled_medium_min_tokens < max_tokens <= sampled_medium_max_tokens:
-        # Tree-style sampled medium bursts are first-token bound when a decode
-        # wave has drained to a small tail and the next worker wave is ready.
-        # Let that next wave prefill first, but keep greedy/eval and
-        # sampled-short defaults unchanged.
-        return env_flag(
-            "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_PREFILL_READY_BEFORE_DECODE",
-            True,
-        )
-    return False
+    del temperature, max_tokens
+    return env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_PREFILL_READY_BEFORE_DECODE", True)
 
 
 def _online_prefill_ready_before_decode_active_cap(
@@ -831,65 +462,18 @@ def _online_prefill_ready_before_decode_active_cap(
     temperature: float,
     max_tokens: int,
 ) -> int | None:
+    del temperature, max_tokens
     if not _online_prefill_ready_before_decode_enabled(
-        temperature=temperature,
-        max_tokens=max_tokens,
+        temperature=0.0,
+        max_tokens=0,
     ):
         return None
-    global_env = "TORCHINFERNO_OPENAI_TP_ONLINE_PREFILL_READY_ACTIVE_CAP"
-    if global_env in os.environ:
-        configured = env_int(global_env, 0, minimum=0)
-        return None if configured <= 0 else configured
-    if "TORCHINFERNO_OPENAI_TP_ONLINE_PREFILL_READY_BEFORE_DECODE" in os.environ:
-        return None
-    sampled_medium_min_tokens = env_int(
-        "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_PREFILL_READY_MIN_TOKENS",
-        256,
-        minimum=1,
+    configured = env_int(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_PREFILL_READY_ACTIVE_CAP",
+        8,
+        minimum=0,
     )
-    sampled_medium_max_tokens = env_int(
-        "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_PREFILL_READY_MAX_TOKENS",
-        300,
-        minimum=sampled_medium_min_tokens,
-    )
-    if temperature <= 0.0:
-        greedy_short_max_tokens = env_int(
-            "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_GEN_MAX_TOKENS",
-            128,
-            minimum=1,
-        )
-        if max_tokens <= greedy_short_max_tokens:
-            configured = env_int(
-                "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_PREFILL_READY_ACTIVE_CAP",
-                6,
-                minimum=0,
-            )
-            return None if configured <= 0 else configured
-        greedy_large_min_tokens = env_int(
-            "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_PREFILL_READY_MIN_TOKENS",
-            400,
-            minimum=greedy_short_max_tokens,
-        )
-        greedy_large_max_tokens = env_int(
-            "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_PREFILL_READY_MAX_TOKENS",
-            512,
-            minimum=greedy_large_min_tokens,
-        )
-        if greedy_large_min_tokens < max_tokens <= greedy_large_max_tokens:
-            configured = env_int(
-                "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_PREFILL_READY_ACTIVE_CAP",
-                8,
-                minimum=0,
-            )
-            return None if configured <= 0 else configured
-    if temperature > 0.0 and sampled_medium_min_tokens < max_tokens <= sampled_medium_max_tokens:
-        configured = env_int(
-            "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_PREFILL_READY_ACTIVE_CAP",
-            32,
-            minimum=0,
-        )
-        return None if configured <= 0 else configured
-    return None
+    return None if configured <= 0 else configured
 
 
 def _stream_token_batch_max() -> int:
@@ -911,31 +495,8 @@ def _online_generated_prefix_cache_enabled(*, temperature: float, max_tokens: in
 
 
 def _online_step_sync_enabled(*, temperature: float | None = None, max_tokens: int | None = None) -> bool:
-    if "TORCHINFERNO_OPENAI_TP_ONLINE_STEP_SYNC" in os.environ:
-        return env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_STEP_SYNC", True)
-    if temperature is None or max_tokens is None:
-        return True
-    if temperature > 0.0 and max_tokens > 0:
-        sampled_short_max_tokens = env_int(
-            "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_SHORT_STEP_SYNC_MAX_TOKENS",
-            256,
-            minimum=1,
-        )
-        if max_tokens <= sampled_short_max_tokens:
-            return False
-        sampled_medium_min_tokens = env_int(
-            "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_STEP_SYNC_MIN_TOKENS",
-            256,
-            minimum=1,
-        )
-        sampled_medium_max_tokens = env_int(
-            "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_STEP_SYNC_MAX_TOKENS",
-            300,
-            minimum=sampled_medium_min_tokens,
-        )
-        if sampled_medium_min_tokens < max_tokens <= sampled_medium_max_tokens:
-            return env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_STEP_SYNC", False)
-    return True
+    del temperature, max_tokens
+    return env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_STEP_SYNC", False)
 
 
 def _online_close_cuda_sync_enabled(*, temperature: float | None = None, max_tokens: int | None = None) -> bool:
@@ -944,50 +505,8 @@ def _online_close_cuda_sync_enabled(*, temperature: float | None = None, max_tok
 
 
 def _online_submit_step_command_enabled(*, temperature: float, max_tokens: int) -> bool:
-    global_env = "TORCHINFERNO_OPENAI_TP_ONLINE_SUBMIT_STEP_COMMAND"
-    if global_env in os.environ:
-        return env_flag(global_env, False)
-    if max_tokens < 1:
-        return False
-    if temperature <= 0.0:
-        greedy_large_min_tokens = env_int(
-            "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_SUBMIT_STEP_MIN_TOKENS",
-            400,
-            minimum=1,
-        )
-        greedy_large_max_tokens = env_int(
-            "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_SUBMIT_STEP_MAX_TOKENS",
-            512,
-            minimum=greedy_large_min_tokens,
-        )
-        if not (greedy_large_min_tokens < max_tokens <= greedy_large_max_tokens):
-            return False
-        return env_flag(
-            "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_SUBMIT_STEP_COMMAND",
-            True,
-        )
-    if _online_step_sync_enabled(temperature=temperature, max_tokens=max_tokens):
-        return False
-    sampled_short_max_tokens = env_int(
-        "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_SHORT_SUBMIT_STEP_MAX_TOKENS",
-        256,
-        minimum=1,
-    )
-    if max_tokens <= sampled_short_max_tokens:
-        return True
-    sampled_medium_min_tokens = env_int(
-        "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_SUBMIT_STEP_MIN_TOKENS",
-        256,
-        minimum=1,
-    )
-    sampled_medium_max_tokens = env_int(
-        "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_SUBMIT_STEP_MAX_TOKENS",
-        300,
-        minimum=sampled_medium_min_tokens,
-    )
-    if sampled_medium_min_tokens < max_tokens <= sampled_medium_max_tokens:
-        return env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_SUBMIT_STEP_COMMAND", True)
-    return False
+    del temperature, max_tokens
+    return env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_SUBMIT_STEP_COMMAND", True)
 
 
 def _startup_graph_warmup_enabled() -> bool:
@@ -1025,6 +544,13 @@ def _startup_online_common_prefix_prefill_warmup_enabled() -> bool:
     return env_flag("TORCHINFERNO_OPENAI_STARTUP_ONLINE_COMMON_PREFIX_PREFILL_WARMUP", True)
 
 
+def _token_bucket_fa3_prefill_warmup_enabled() -> bool:
+    return env_flag("TORCHINFERNO_CONTINUOUS_TOKEN_BUCKET_FA3_PREFILL", False) or env_flag(
+        "TORCHINFERNO_CONTINUOUS_TOKEN_BUCKET_FA3_UNIFIED",
+        False,
+    )
+
+
 def _startup_online_common_prefix_prefill_warmup_rows(
     cache_rows: int,
     max_active: int,
@@ -1046,106 +572,13 @@ def _startup_online_common_prefix_prefill_warmup_tokens(max_seq_len: int) -> tup
 
 
 def _online_fp8_prefill_enabled(*, temperature: float, max_tokens: int) -> bool:
-    global_env = "TORCHINFERNO_OPENAI_TP_ONLINE_FP8_PREFILL"
-    if global_env in os.environ:
-        return env_flag(global_env, False)
-    if "TORCHINFERNO_FP8_PREFILL" in os.environ:
-        # The model-level flag is an explicit broad override; do not layer an
-        # online auto policy on top of it.
-        return False
-    if max_tokens < 1:
-        return False
-    if _online_sampled_medium_fp8_prefill_enabled(temperature=temperature, max_tokens=max_tokens):
-        return True
-    if temperature > 0.0:
-        return False
-    greedy_short_min_tokens = env_int(
-        "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_FP8_PREFILL_MIN_TOKENS",
-        16,
-        minimum=1,
-    )
-    greedy_short_max_tokens = env_int(
-        "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_FP8_PREFILL_MAX_TOKENS",
-        128,
-        minimum=greedy_short_min_tokens,
-    )
-    if greedy_short_min_tokens <= max_tokens <= greedy_short_max_tokens:
-        return True
-    min_tokens = env_int(
-        "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_FP8_PREFILL_MIN_TOKENS",
-        400,
-        minimum=1,
-    )
-    max_tokens_limit = env_int(
-        "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_FP8_PREFILL_MAX_TOKENS",
-        512,
-        minimum=min_tokens,
-    )
-    return min_tokens < max_tokens <= max_tokens_limit
-
-
-def _online_sampled_medium_fp8_prefill_enabled(*, temperature: float, max_tokens: int) -> bool:
-    if temperature <= 0.0 or max_tokens < 1:
-        return False
-    min_tokens = env_int(
-        "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_FP8_PREFILL_MIN_TOKENS",
-        256,
-        minimum=1,
-    )
-    max_tokens_limit = env_int(
-        "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_FP8_PREFILL_MAX_TOKENS",
-        300,
-        minimum=min_tokens,
-    )
-    return min_tokens < max_tokens <= max_tokens_limit
+    del temperature, max_tokens
+    return env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_FP8_PREFILL", True)
 
 
 def _online_fp8_prefill_min_m(*, temperature: float, max_tokens: int) -> int:
-    global_env = "TORCHINFERNO_OPENAI_TP_ONLINE_FP8_PREFILL_MIN_M"
-    if global_env in os.environ:
-        return env_int(global_env, 2048, minimum=1)
-    if _online_sampled_medium_fp8_prefill_enabled(temperature=temperature, max_tokens=max_tokens):
-        return env_int(
-            "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_FP8_PREFILL_MIN_M",
-            256,
-            minimum=1,
-        )
-    greedy_short_min_tokens = env_int(
-        "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_FP8_PREFILL_MIN_TOKENS",
-        16,
-        minimum=1,
-    )
-    greedy_short_max_tokens = env_int(
-        "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_FP8_PREFILL_MAX_TOKENS",
-        128,
-        minimum=greedy_short_min_tokens,
-    )
-    if temperature <= 0.0 and greedy_short_min_tokens <= max_tokens <= greedy_short_max_tokens:
-        # Long-output suffix-prefill waves are mostly 512-1536 rows. The model
-        # gate is strict (`m > min_m`), so the 512 default intentionally keeps
-        # exact-512 waves on bf16 unless an experiment opts into a lower gate.
-        return env_int(
-            "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_FP8_PREFILL_MIN_M",
-            512,
-            minimum=1,
-        )
-    greedy_large_min_tokens = env_int(
-        "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_FP8_PREFILL_MIN_TOKENS",
-        400,
-        minimum=1,
-    )
-    greedy_large_max_tokens = env_int(
-        "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_FP8_PREFILL_MAX_TOKENS",
-        512,
-        minimum=greedy_large_min_tokens,
-    )
-    if temperature <= 0.0 and greedy_large_min_tokens < max_tokens <= greedy_large_max_tokens:
-        return env_int(
-            "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_FP8_PREFILL_MIN_M",
-            512,
-            minimum=1,
-        )
-    return 2048
+    del temperature, max_tokens
+    return env_int("TORCHINFERNO_OPENAI_TP_ONLINE_FP8_PREFILL_MIN_M", 1, minimum=1)
 
 
 def _set_tensor_parallel_runtime_fp8_prefill(model: object, *, enabled: bool, min_m: int) -> None:
@@ -1159,20 +592,8 @@ def _set_tensor_parallel_runtime_fp8_prefill(model: object, *, enabled: bool, mi
 
 
 def _online_marlin_int4_decode_enabled(*, temperature: float, max_tokens: int) -> bool:
-    global_env = "TORCHINFERNO_OPENAI_TP_ONLINE_MARLIN_INT4_DECODE"
-    if global_env in os.environ:
-        return env_flag(global_env, True)
-    sampled_short_env = "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_SHORT_MARLIN_INT4_DECODE"
-    if (
-        temperature > 0.0
-        and 0 < max_tokens <= env_int(
-            "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_SHORT_MARLIN_INT4_MAX_TOKENS",
-            256,
-            minimum=1,
-        )
-    ):
-        return env_flag(sampled_short_env, False)
-    return True
+    del temperature, max_tokens
+    return env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_MARLIN_INT4_DECODE", True)
 
 
 def _set_tensor_parallel_runtime_marlin_int4_decode(model: object, *, enabled: bool) -> None:
@@ -1185,124 +606,26 @@ def _set_tensor_parallel_runtime_marlin_int4_decode(model: object, *, enabled: b
 
 
 def _online_persistent_idle_ms(*, temperature: float, max_tokens: int) -> float:
-    global_env = "TORCHINFERNO_OPENAI_TP_ONLINE_PERSISTENT_IDLE_MS"
-    if global_env in os.environ:
-        return env_float(global_env, 10.0, minimum=0.0)
-
-    default_idle_ms = 10.0
-    sampled_short_max_tokens = env_int(
-        "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_SHORT_IDLE_MAX_TOKENS",
-        256,
-        minimum=1,
+    del temperature, max_tokens
+    return env_float(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_PERSISTENT_IDLE_MS",
+        1000.0,
+        minimum=0.0,
     )
-    if temperature > 0.0 and 0 < max_tokens <= sampled_short_max_tokens:
-        # Short sampled bursts often arrive in small waves from client worker
-        # pools. Keeping the online session open across those gaps preserves the
-        # prefix cache and avoids restarting the online batcher for each wave.
-        # Local TP8 70B few-shot+self run after the online graph fixes:
-        # 2000ms cut self-consistency median TTFT/E2E from 324.7/347.9ms to
-        # 227.0/244.4ms and p99 E2E from 2680.1ms to 1321.0ms, while few-shot
-        # stayed flat and correctness stayed at 1.0.
-        default_idle_ms = env_float(
-            "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_SHORT_IDLE_MS",
-            2000.0,
-            minimum=0.0,
-        )
-    elif temperature > 0.0 and max_tokens > 0:
-        sampled_medium_max_tokens = env_int(
-            "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_IDLE_MAX_TOKENS",
-            300,
-            minimum=sampled_short_max_tokens,
-        )
-        if sampled_short_max_tokens < max_tokens <= sampled_medium_max_tokens:
-            # Tree-style sampled medium bursts can arrive as separate worker
-            # waves with the same short common prefix. A modest idle window lets
-            # the online batcher keep the prefix cache warm across those gaps
-            # without applying the long sampled-short self-consistency window.
-            default_idle_ms = env_float(
-                "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_IDLE_MS",
-                100.0,
-                minimum=0.0,
-            )
-    elif temperature <= 0.0 and max_tokens > 0:
-        greedy_short_max_tokens = env_int(
-            "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_IDLE_MAX_TOKENS",
-            128,
-            minimum=1,
-        )
-        if max_tokens <= greedy_short_max_tokens:
-            # Short greedy client workers can trickle in just after a drained
-            # online session. Keep the session open long enough to avoid
-            # fragmenting long-output bursts into slow early micro-sessions.
-            default_idle_ms = env_float(
-                "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_IDLE_MS",
-                1000.0,
-                minimum=0.0,
-            )
-            return default_idle_ms
-        greedy_mid_min_tokens = env_int(
-            "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_MID_IDLE_MIN_TOKENS",
-            128,
-            minimum=1,
-        )
-        greedy_mid_max_tokens = env_int(
-            "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_MID_IDLE_MAX_TOKENS",
-            300,
-            minimum=greedy_mid_min_tokens,
-        )
-        if greedy_mid_min_tokens < max_tokens <= greedy_mid_max_tokens:
-            # Few-shot-style deterministic mid-length bursts can arrive in two
-            # client waves. Keeping the drained online session briefly open lets
-            # the second wave reuse the common-prefix cache without changing the
-            # first-token collection window or decode policy.
-            default_idle_ms = env_float(
-                "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_MID_IDLE_MS",
-                100.0,
-                minimum=0.0,
-            )
-    return default_idle_ms
-
-
-def _online_greedy_session_buckets() -> tuple[tuple[int, int], ...]:
-    greedy_session_tokens = env_int(
-        "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_SESSION_MAX_TOKENS",
-        128,
-        minimum=0,
-    )
-    if greedy_session_tokens <= 0:
-        return ()
-    greedy_min_tokens = env_int(
-        "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_SESSION_MIN_TOKENS",
-        16,
-        minimum=1,
-    )
-    small_session_tokens = min(
-        greedy_session_tokens,
-        env_int(
-            "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SMALL_SESSION_MAX_TOKENS",
-            96,
-            minimum=0,
-        ),
-    )
-    buckets: list[tuple[int, int]] = []
-    if small_session_tokens > 0 and greedy_min_tokens <= small_session_tokens:
-        buckets.append((greedy_min_tokens, small_session_tokens))
-    if greedy_session_tokens > small_session_tokens:
-        buckets.append((
-            max(greedy_min_tokens, small_session_tokens + 1),
-            greedy_session_tokens,
-        ))
-    return tuple(buckets)
 
 
 def _online_session_max_tokens(*, temperature: float, max_tokens: int) -> int:
+    del temperature
     max_tokens = max(0, int(max_tokens))
-    if max_tokens < 1 or temperature > 0.0:
+    if max_tokens < 1:
         return max_tokens
-    for min_tokens, bucket_tokens in _online_greedy_session_buckets():
-        if min_tokens <= max_tokens <= bucket_tokens:
-            return bucket_tokens
-    return max_tokens
+    minimum = env_int(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_MIN_GENERATION_CAPACITY",
+        1,
+        minimum=1,
+    )
+    capacity = max(minimum, max_tokens)
+    return 1 << (capacity - 1).bit_length()
 
 
 def _online_session_policy_key(*, temperature: float, max_tokens: int) -> tuple[bool, int]:
@@ -1312,290 +635,105 @@ def _online_session_policy_key(*, temperature: float, max_tokens: int) -> tuple[
     )
 
 
-def _online_sampled_medium_mixed_followup_compatible(
-    *,
-    session_temperature: float,
-    session_max_tokens: int,
-    request_temperature: float,
-    request_max_tokens: int,
-) -> bool:
-    if session_temperature <= 0.0:
-        return False
-    sampled_medium_min_tokens = env_int(
-        "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_PREFILL_READY_MIN_TOKENS",
-        256,
-        minimum=1,
-    )
-    sampled_medium_max_tokens = env_int(
-        "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_PREFILL_READY_MAX_TOKENS",
-        300,
-        minimum=sampled_medium_min_tokens,
-    )
-    if not (sampled_medium_min_tokens < session_max_tokens <= sampled_medium_max_tokens):
-        return False
-    if request_temperature > 0.0:
-        return False
-    verifier_max_tokens = env_int(
-        "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_MIXED_GREEDY_MAX_TOKENS",
-        400,
-        minimum=sampled_medium_max_tokens,
-    )
-    return sampled_medium_max_tokens < request_max_tokens <= verifier_max_tokens
-
-
 def _online_session_prompt_headroom_tokens(*, temperature: float, max_tokens: int) -> int:
-    if max_tokens < 1 or temperature > 0.0:
+    del temperature
+    if max_tokens < 1:
         return 0
-    for min_tokens, bucket_tokens in _online_greedy_session_buckets():
-        if min_tokens <= max_tokens <= bucket_tokens:
-            # Long-output prompts grow across the request set; a 32-token
-            # headroom under-sized the first 96-token greedy session and split a
-            # 1000-request run into 49+951 sessions. Local TP8 70B A/B with 64
-            # kept one session and cut TTFT/E2E p99 from 3574/4022ms to
-            # 712/1745ms.
-            return env_int(
-                "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_SESSION_PROMPT_HEADROOM_TOKENS",
-                64,
-                minimum=0,
-            )
-    greedy_large_min_tokens = env_int(
-        "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_SESSION_HEADROOM_MIN_TOKENS",
-        400,
-        minimum=1,
+    return env_int(
+        "TORCHINFERNO_OPENAI_TP_ONLINE_SESSION_PROMPT_HEADROOM_TOKENS",
+        0,
+        minimum=0,
     )
-    greedy_large_max_tokens = env_int(
-        "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_SESSION_HEADROOM_MAX_TOKENS",
-        512,
-        minimum=greedy_large_min_tokens,
-    )
-    if greedy_large_min_tokens < max_tokens <= greedy_large_max_tokens:
-        return env_int(
-            "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_SESSION_PROMPT_HEADROOM_TOKENS",
-            64,
-            minimum=0,
-        )
-    return 0
 
 
 def _online_idle_batch_wait_ms(*, temperature: float, max_tokens: int) -> float:
-    global_env = "TORCHINFERNO_OPENAI_TP_ONLINE_IDLE_BATCH_WAIT_MS"
-    if global_env in os.environ:
-        return env_float(global_env, 2.0, minimum=0.0)
-    default_wait_ms = 2.0
-    if temperature > 0.0 and 0 < max_tokens <= env_int(
-        "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_SHORT_IDLE_BATCH_WAIT_MAX_TOKENS",
-        256,
-        minimum=1,
-    ):
-        # Self-consistency-style sampled bursts arrive from a 128-worker client
-        # pool in waves. A short idle drain window batches those follow-on
-        # requests instead of running dozens of tiny exact-prefix/decode waves.
-        # TP8 70B A/B after the persistent sampled-short idle fix: 15ms cut
-        # self-consistency p99 E2E 4094 -> 1683ms and median E2E 302 -> 285ms
-        # while preserving correctness; the knob is scoped away from greedy and
-        # sampled-medium traffic.
-        default_wait_ms = env_float(
-            "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_SHORT_IDLE_BATCH_WAIT_MS",
-            15.0,
-            minimum=0.0,
-        )
-    return default_wait_ms
+    del temperature, max_tokens
+    return env_float("TORCHINFERNO_OPENAI_TP_ONLINE_IDLE_BATCH_WAIT_MS", 2.0, minimum=0.0)
 
 
 def _online_collect_idle_arrivals_enabled(*, temperature: float, max_tokens: int) -> bool:
-    global_env = "TORCHINFERNO_OPENAI_TP_ONLINE_COLLECT_IDLE_ARRIVALS"
-    if global_env in os.environ:
-        return env_flag(global_env, False)
-    return temperature > 0.0 and 0 < max_tokens <= env_int(
-        "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_SHORT_IDLE_BATCH_WAIT_MAX_TOKENS",
-        256,
-        minimum=1,
-    )
+    del temperature, max_tokens
+    return env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_COLLECT_IDLE_ARRIVALS", False)
 
 
 def _online_active_ready_wait_ms(*, temperature: float, max_tokens: int) -> float:
-    global_env = "TORCHINFERNO_OPENAI_TP_ONLINE_ACTIVE_READY_WAIT_MS"
-    if global_env in os.environ:
-        return env_float(global_env, 0.0, minimum=0.0)
-    if temperature > 0.0 and max_tokens > 0:
-        sampled_short_max_tokens = env_int(
-            "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_SHORT_INITIAL_BATCH_WAIT_MAX_TOKENS",
-            256,
-            minimum=1,
-        )
-        if max_tokens <= sampled_short_max_tokens:
-            # Self-consistency-style sampled-short bursts should start their seed
-            # immediately, then briefly collect ready arrivals while active work
-            # exists. Local TP8 70B A/B: a 1ms active-ready wait improved median
-            # TTFT/E2E 288.8/311.3ms -> 175.3/189.0ms and p99 E2E
-            # 1562.3ms -> 1246.3ms without changing startup or correctness.
-            return env_float(
-                "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_SHORT_ACTIVE_READY_WAIT_MS",
-                1.0,
-                minimum=0.0,
-            )
-        sampled_medium_max_tokens = env_int(
-            "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_INITIAL_BATCH_WAIT_MAX_TOKENS",
-            300,
-            minimum=sampled_short_max_tokens,
-        )
-        if sampled_short_max_tokens < max_tokens <= sampled_medium_max_tokens:
-            return env_float(
-                "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_ACTIVE_READY_WAIT_MS",
-                0.0,
-                minimum=0.0,
-            )
-    return 0.0
+    del temperature, max_tokens
+    return env_float("TORCHINFERNO_OPENAI_TP_ONLINE_ACTIVE_READY_WAIT_MS", 0.0, minimum=0.0)
 
 
 def _online_initial_batch_wait_ms(*, temperature: float, max_tokens: int) -> float:
-    global_env = "TORCHINFERNO_OPENAI_TP_ONLINE_INITIAL_BATCH_WAIT_MS"
-    if global_env in os.environ:
-        return env_float(global_env, 1.0, minimum=0.0)
-    default_wait_ms = 1.0
-    if temperature > 0.0 and 0 < max_tokens <= env_int(
-        "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_SHORT_INITIAL_BATCH_WAIT_MAX_TOKENS",
-        256,
-        minimum=1,
-    ):
-        sampled_wait_env = "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_SHORT_INITIAL_BATCH_WAIT_MS"
-        if sampled_wait_env in os.environ:
-            default_wait_ms = env_float(sampled_wait_env, 5.0, minimum=0.0)
-        else:
-            # Self-consistency-style sampled short bursts are dominated by the
-            # first exact-prefix seed. Letting that seed start immediately was
-            # better on current TP8 70B than holding the first wave for 10ms:
-            # local A/B improved median TTFT/E2E 211.7/326.4 -> 196.8/301.0ms
-            # and cut queue p99 453 -> 378ms while preserving correctness.
-            default_wait_ms = 0.0
-    elif temperature > 0.0 and max_tokens > 0:
-        sampled_short_max_tokens = env_int(
-            "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_SHORT_INITIAL_BATCH_WAIT_MAX_TOKENS",
-            256,
-            minimum=1,
-        )
-        sampled_medium_min_tokens = env_int(
-            "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_INITIAL_BATCH_WAIT_MIN_TOKENS",
-            sampled_short_max_tokens + 1,
-            minimum=1,
-        )
-        sampled_medium_max_tokens = env_int(
-            "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_INITIAL_BATCH_WAIT_MAX_TOKENS",
-            300,
-            minimum=sampled_medium_min_tokens,
-        )
-        if sampled_medium_min_tokens <= max_tokens <= sampled_medium_max_tokens:
-            # Current tree-style sampled-medium traffic is served best by
-            # immediate admission. Local TP8 70B A/B on pushed 1443e18 zeroed
-            # sampled-medium initial, active-ready, and prequeue waits, keeping
-            # TTFT/TPOT flat while improving tree median E2E 76.1 -> 73.9ms and
-            # p99 E2E 658.9 -> 402.1ms with correctness in band.
-            default_wait_ms = env_float(
-                "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_INITIAL_BATCH_WAIT_MS",
-                0.0,
-                minimum=0.0,
-            )
-    elif temperature <= 0.0 and 0 < max_tokens <= env_int(
-        "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_INITIAL_BATCH_WAIT_MAX_TOKENS",
-        128,
-        minimum=1,
-    ):
-        # Long-output-style short greedy bursts can arrive just after the first
-        # request starts. A tiny first-wave collection window keeps steady TPOT
-        # flat while cutting first-wave TTFT and median E2E on local TP8 70B.
-        default_wait_ms = env_float(
-            "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_SHORT_INITIAL_BATCH_WAIT_MS",
-            2.0,
-            minimum=0.0,
-        )
-    elif temperature <= 0.0 and max_tokens > 0:
-        greedy_large_min_tokens = env_int(
-            "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_INITIAL_BATCH_WAIT_MIN_TOKENS",
-            400,
-            minimum=1,
-        )
-        greedy_large_max_tokens = env_int(
-            "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_INITIAL_BATCH_WAIT_MAX_TOKENS",
-            512,
-            minimum=greedy_large_min_tokens,
-        )
-        if greedy_large_min_tokens < max_tokens <= greedy_large_max_tokens:
-            # Multi-turn 512-token greedy traffic is dominated by prefix/suffix
-            # prefill waves. Mixed-prefix reuse keeps batching healthy without a
-            # first-wave collection delay on current TP8 70B A/B: wait0 improved
-            # median TTFT/E2E/TPOT over wait5 while preserving correctness. The
-            # no-env path keeps the larger common-prefix collection window.
-            default_greedy_large_wait_ms = (
-                0.0
-                if _online_greedy_large_mixed_prefix_reuse_enabled(
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                )
-                else 10.0
-            )
-            default_wait_ms = env_float(
-                "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_INITIAL_BATCH_WAIT_MS",
-                default_greedy_large_wait_ms,
-                minimum=0.0,
-            )
-    return default_wait_ms
+    del temperature, max_tokens
+    return env_float("TORCHINFERNO_OPENAI_TP_ONLINE_INITIAL_BATCH_WAIT_MS", 1.0, minimum=0.0)
 
 
 def _tp_stream_prequeue_admission_wait_ms(*, temperature: float, max_tokens: int) -> float:
-    if "TORCHINFERNO_OPENAI_TP_STREAM_PREQUEUE_ADMISSION_WAIT_MS" in os.environ:
-        return env_float("TORCHINFERNO_OPENAI_TP_STREAM_PREQUEUE_ADMISSION_WAIT_MS", 0.0, minimum=0.0)
-    if _online_greedy_large_mixed_prefix_reuse_enabled(
-        temperature=temperature,
-        max_tokens=max_tokens,
-    ):
-        # Current TP8 multi-turn A/B favors immediate admission for the
-        # mixed-prefix path. Keep the scoped env hook for diagnostics.
-        return env_float(
-            "TORCHINFERNO_OPENAI_TP_GREEDY_LARGE_MIXED_PREFIX_STREAM_PREQUEUE_ADMISSION_WAIT_MS",
-            0.0,
-            minimum=0.0,
-        )
-    if temperature > 0.0 and max_tokens > 0:
-        sampled_short_max_tokens = env_int(
-            "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_SHORT_INITIAL_BATCH_WAIT_MAX_TOKENS",
-            256,
-            minimum=1,
-        )
-        sampled_medium_max_tokens = env_int(
-            "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_INITIAL_BATCH_WAIT_MAX_TOKENS",
-            300,
-            minimum=sampled_short_max_tokens,
-        )
-        if sampled_short_max_tokens < max_tokens <= sampled_medium_max_tokens:
-            # Sampled-medium tree-style bursts now favor immediate queuing; the
-            # scoped env hook remains for diagnostics if a future worker-wave
-            # shape needs a collection window again.
-            return env_float(
-                "TORCHINFERNO_OPENAI_TP_SAMPLED_MEDIUM_STREAM_PREQUEUE_ADMISSION_WAIT_MS",
-                0.0,
-                minimum=0.0,
-            )
-    return 0.0
+    del temperature, max_tokens
+    return env_float(
+        "TORCHINFERNO_OPENAI_TP_STREAM_PREQUEUE_ADMISSION_WAIT_MS",
+        0.0,
+        minimum=0.0,
+    )
 
 
 def _online_common_prefix_prefill_warmup_rows(cache_rows: int, max_active: int | None = None) -> tuple[int, ...]:
     if cache_rows <= 0:
         return ()
     configured = os.environ.get("TORCHINFERNO_OPENAI_WARMUP_ONLINE_COMMON_PREFIX_ROWS")
-    rows = _parse_positive_int_csv(
-        configured if configured is not None else "48,53,68,69,105"
-    )
-    if configured is None and max_active is not None and 0 < max_active < cache_rows:
-        rows = tuple(sorted({*rows, int(max_active)}))
+    if configured is not None:
+        rows = _parse_positive_int_csv(configured)
+    else:
+        limit = min(cache_rows - 1, max_active if max_active is not None else cache_rows - 1)
+        rows = _decode_batch_buckets(max(1, limit))
     return tuple(row for row in rows if row < cache_rows)
+
+
+def _online_token_bucket_fa3_warmup_capacities() -> tuple[int, ...]:
+    configured = os.environ.get("TORCHINFERNO_OPENAI_WARMUP_TOKEN_BUCKET_FA3_CAPACITIES")
+    if configured is not None:
+        return _parse_positive_int_csv(configured)
+    maximum = env_int(
+        "TORCHINFERNO_OPENAI_WARMUP_TOKEN_BUCKET_FA3_MAX_TOKENS",
+        4096,
+        minimum=1,
+    )
+    return tuple(sorted({_piecewise_token_bucket(tokens) for tokens in range(1, maximum + 1)}))
+
+
+def _online_token_bucket_prefix_copy_warmup_capacities(max_seq_len: int) -> tuple[int, ...]:
+    configured = os.environ.get(
+        "TORCHINFERNO_OPENAI_WARMUP_TOKEN_BUCKET_PREFIX_COPY_CAPACITIES"
+    )
+    if configured is not None:
+        capacities = _parse_positive_int_csv(configured)
+    else:
+        capacities_list: list[int] = []
+        capacity = 64
+        while capacity <= max_seq_len:
+            capacities_list.append(capacity)
+            capacity *= 2
+        capacities = tuple(capacities_list)
+    return tuple(capacity for capacity in dict.fromkeys(capacities) if capacity <= max_seq_len)
 
 
 def _online_common_prefix_prefill_warmup_tokens(max_seq_len: int) -> tuple[int, ...]:
     if max_seq_len <= 0:
         return ()
-    tokens = _parse_positive_int_csv(
-        os.environ.get("TORCHINFERNO_OPENAI_WARMUP_ONLINE_COMMON_PREFIX_TOKENS", "45,55,64,128")
-    )
+    configured = os.environ.get("TORCHINFERNO_OPENAI_WARMUP_ONLINE_COMMON_PREFIX_TOKENS")
+    if configured is not None:
+        tokens = _parse_positive_int_csv(configured)
+    else:
+        maximum = min(
+            max_seq_len,
+            env_int(
+                "TORCHINFERNO_OPENAI_WARMUP_ONLINE_COMMON_PREFIX_MAX_TOKENS",
+                256,
+                minimum=1,
+            ),
+        )
+        if maximum < 64:
+            tokens = (maximum,)
+        else:
+            tokens = tuple(capacity for capacity in (64, 128, 256) if capacity <= maximum)
     return tuple(token_count for token_count in tokens if token_count <= max_seq_len)
 
 
@@ -1626,55 +764,47 @@ def _online_common_prefix_suffix_prefill_warmup_batches(cache_rows: int, max_act
 
 
 def _online_common_prefix_suffix_prefill_warmup_enabled() -> bool:
-    # Long-output measurements show this captures many startup-only suffix
-    # graphs without improving steady-state median latency. Keep it available
-    # for targeted experiments, but do not spend public-run startup budget on it.
+    # This can capture many startup-only suffix graphs, so keep it opt-in.
     return env_flag("TORCHINFERNO_OPENAI_WARMUP_ONLINE_COMMON_PREFIX_SUFFIX_PREFILL", False)
 
 
-def _online_greedy_common_prefix_suffix_prefill_warmup_enabled() -> bool:
-    return env_flag("TORCHINFERNO_OPENAI_WARMUP_ONLINE_GREEDY_COMMON_PREFIX_SUFFIX_PREFILL", True)
+def _online_deterministic_common_prefix_suffix_prefill_warmup_enabled() -> bool:
+    return env_flag("TORCHINFERNO_OPENAI_WARMUP_ONLINE_DETERMINISTIC_COMMON_PREFIX_SUFFIX_PREFILL", True)
 
 
-def _online_greedy_common_prefix_token_suffix_prefill_warmup_enabled() -> bool:
+def _online_deterministic_common_prefix_token_suffix_prefill_warmup_enabled() -> bool:
     return env_flag(
-        "TORCHINFERNO_OPENAI_WARMUP_ONLINE_GREEDY_COMMON_PREFIX_TOKEN_SUFFIX_PREFILL",
+        "TORCHINFERNO_OPENAI_WARMUP_ONLINE_DETERMINISTIC_COMMON_PREFIX_TOKEN_SUFFIX_PREFILL",
         True,
     )
 
 
-def _online_greedy_common_prefix_token_suffix_prefill_warmup_max_token_values() -> tuple[int, ...]:
+def _online_deterministic_common_prefix_token_suffix_prefill_warmup_max_token_values() -> tuple[int, ...]:
     configured = os.environ.get(
-        "TORCHINFERNO_OPENAI_WARMUP_ONLINE_GREEDY_COMMON_PREFIX_TOKEN_SUFFIX_MAX_TOKENS"
+        "TORCHINFERNO_OPENAI_WARMUP_ONLINE_DETERMINISTIC_COMMON_PREFIX_TOKEN_SUFFIX_MAX_TOKENS"
     )
-    values = _parse_positive_int_csv(configured if configured is not None else "128")
-    return values or (128,)
+    values = _parse_positive_int_csv(configured if configured is not None else "1")
+    return values or (1,)
 
 
-def _online_greedy_common_prefix_suffix_prefill_warmup_max_token_values() -> tuple[int, ...]:
-    configured = os.environ.get("TORCHINFERNO_OPENAI_WARMUP_ONLINE_GREEDY_COMMON_PREFIX_MAX_TOKENS")
-    values = _parse_positive_int_csv(configured if configured is not None else "128,512")
-    return values or (512,)
+def _online_deterministic_common_prefix_suffix_prefill_warmup_max_token_values() -> tuple[int, ...]:
+    configured = os.environ.get("TORCHINFERNO_OPENAI_WARMUP_ONLINE_DETERMINISTIC_COMMON_PREFIX_MAX_TOKENS")
+    values = _parse_positive_int_csv(configured if configured is not None else "1")
+    return values or (1,)
 
 
-def _online_greedy_common_prefix_suffix_prefill_graph_warmup_max_token_values() -> tuple[int, ...]:
+def _online_deterministic_common_prefix_suffix_prefill_graph_warmup_max_token_values() -> tuple[int, ...]:
     configured = os.environ.get(
-        "TORCHINFERNO_OPENAI_WARMUP_ONLINE_GREEDY_COMMON_PREFIX_GRAPH_MAX_TOKENS"
+        "TORCHINFERNO_OPENAI_WARMUP_ONLINE_DETERMINISTIC_COMMON_PREFIX_GRAPH_MAX_TOKENS"
     )
     if configured is not None:
         values = _parse_positive_int_csv(configured)
-        return values or (128,)
-    legacy_configured = os.environ.get(
-        "TORCHINFERNO_OPENAI_WARMUP_ONLINE_GREEDY_COMMON_PREFIX_MAX_TOKENS"
-    )
-    if legacy_configured is not None:
-        values = _parse_positive_int_csv(legacy_configured)
-        return values or (512,)
-    return (128,)
+        return values or (1,)
+    return _online_deterministic_common_prefix_suffix_prefill_warmup_max_token_values()
 
 
-def _online_greedy_common_prefix_suffix_prefill_warmup_max_tokens() -> int:
-    return _online_greedy_common_prefix_suffix_prefill_warmup_max_token_values()[-1]
+def _online_deterministic_common_prefix_suffix_prefill_warmup_max_tokens() -> int:
+    return _online_deterministic_common_prefix_suffix_prefill_warmup_max_token_values()[-1]
 
 
 def _online_sampled_common_prefix_suffix_prefill_warmup_enabled() -> bool:
@@ -1687,13 +817,8 @@ def _online_sampled_common_prefix_suffix_prefill_warmup_temperature() -> float:
 
 def _online_sampled_common_prefix_suffix_prefill_warmup_max_token_values() -> tuple[int, ...]:
     configured = os.environ.get("TORCHINFERNO_OPENAI_WARMUP_ONLINE_SAMPLED_COMMON_PREFIX_MAX_TOKENS")
-    default_max = env_int(
-        "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_FP8_PREFILL_MAX_TOKENS",
-        300,
-        minimum=1,
-    )
-    values = _parse_positive_int_csv(configured if configured is not None else str(default_max))
-    return values or (default_max,)
+    values = _parse_positive_int_csv(configured if configured is not None else "1")
+    return values or (1,)
 
 
 def _online_sampled_common_prefix_suffix_prefill_warmup_suffix_tokens(max_seq_len: int) -> tuple[int, ...]:
@@ -1716,16 +841,22 @@ def _online_sampled_common_prefix_suffix_prefill_warmup_suffix_tokens(max_seq_le
     return tuple(token_count for token_count in tokens if token_count <= max_seq_len)
 
 
-def _online_greedy_common_prefix_suffix_prefill_warmup_prefix_tokens(max_seq_len: int) -> tuple[int, ...]:
+def _online_deterministic_common_prefix_suffix_prefill_warmup_prefix_tokens(max_seq_len: int) -> tuple[int, ...]:
     if max_seq_len <= 0:
         return ()
-    tokens = _parse_positive_int_csv(
-        os.environ.get("TORCHINFERNO_OPENAI_WARMUP_ONLINE_GREEDY_COMMON_PREFIX_TOKENS", "45")
+    configured = os.environ.get(
+        "TORCHINFERNO_OPENAI_WARMUP_ONLINE_DETERMINISTIC_COMMON_PREFIX_TOKENS"
     )
-    return tuple(token_count for token_count in tokens if token_count <= max_seq_len)
+    if configured is not None:
+        return tuple(
+            token_count
+            for token_count in _parse_positive_int_csv(configured)
+            if token_count <= max_seq_len
+        )
+    return _online_common_prefix_prefill_warmup_tokens(max_seq_len)
 
 
-def _online_greedy_common_prefix_suffix_prefill_warmup_suffix_tokens(
+def _online_deterministic_common_prefix_suffix_prefill_warmup_suffix_tokens(
     max_seq_len: int,
     *,
     warmup_temperature: float = 0.0,
@@ -1733,7 +864,7 @@ def _online_greedy_common_prefix_suffix_prefill_warmup_suffix_tokens(
 ) -> tuple[int, ...]:
     if max_seq_len <= 0:
         return ()
-    configured = os.environ.get("TORCHINFERNO_OPENAI_WARMUP_ONLINE_GREEDY_COMMON_PREFIX_SUFFIX_TOKENS")
+    configured = os.environ.get("TORCHINFERNO_OPENAI_WARMUP_ONLINE_DETERMINISTIC_COMMON_PREFIX_SUFFIX_TOKENS")
     runtime_buckets = os.environ.get("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SUFFIX_BUCKETS")
     if configured is not None:
         tokens = _parse_positive_int_csv(configured)
@@ -1747,7 +878,7 @@ def _online_greedy_common_prefix_suffix_prefill_warmup_suffix_tokens(
     return tuple(token_count for token_count in tokens if token_count <= max_seq_len)
 
 
-def _online_greedy_common_prefix_suffix_prefill_warmup_extra_pairs(
+def _online_deterministic_common_prefix_suffix_prefill_warmup_extra_pairs(
     max_seq_len: int,
     *,
     warmup_temperature: float = 0.0,
@@ -1756,29 +887,12 @@ def _online_greedy_common_prefix_suffix_prefill_warmup_extra_pairs(
     if max_seq_len <= 0 or warmup_temperature > 0.0:
         return ()
     configured = os.environ.get(
-        "TORCHINFERNO_OPENAI_WARMUP_ONLINE_GREEDY_COMMON_PREFIX_EXTRA_PAIRS"
+        "TORCHINFERNO_OPENAI_WARMUP_ONLINE_DETERMINISTIC_COMMON_PREFIX_EXTRA_PAIRS"
     )
     if configured is not None:
         pairs = _parse_nonnegative_positive_int_pair_csv(configured)
     else:
-        short_max_tokens = env_int(
-            "TORCHINFERNO_CONTINUOUS_DYNAMIC_PREFIX_PREFILL_GREEDY_SHORT_MAX_TOKENS",
-            128,
-            minimum=1,
-        )
-        dynamic_max_suffix = _dynamic_prefix_prefill_max_suffix_for_policy(
-            warmup_temperature,
-            warmup_max_tokens,
-        )
-        short_dynamic_warmup = (
-            dynamic_max_suffix is not None
-            and warmup_max_tokens is not None
-            and 0 < int(warmup_max_tokens) <= short_max_tokens
-        )
-        if short_dynamic_warmup:
-            pairs = _parse_nonnegative_positive_int_pair_csv("111:32,111:64,122:16")
-        else:
-            pairs = ()
+        pairs = ()
     return tuple(
         (prefix_count, suffix_count)
         for prefix_count, suffix_count in pairs
@@ -1789,7 +903,7 @@ def _online_greedy_common_prefix_suffix_prefill_warmup_extra_pairs(
     )
 
 
-def _online_greedy_common_prefix_suffix_prefill_warmup_batches(
+def _online_deterministic_common_prefix_suffix_prefill_warmup_batches(
     cache_rows: int,
     max_active: int,
     *,
@@ -1799,7 +913,7 @@ def _online_greedy_common_prefix_suffix_prefill_warmup_batches(
     if cache_rows <= 0 or max_active <= 0:
         return ()
     limit = min(cache_rows, max_active)
-    configured = os.environ.get("TORCHINFERNO_OPENAI_WARMUP_ONLINE_GREEDY_COMMON_PREFIX_SUFFIX_BATCHES")
+    configured = os.environ.get("TORCHINFERNO_OPENAI_WARMUP_ONLINE_DETERMINISTIC_COMMON_PREFIX_SUFFIX_BATCHES")
     if configured is not None:
         batches = _parse_positive_int_csv(configured)
     elif "TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_BATCH_BUCKETS" in os.environ:
@@ -1815,7 +929,7 @@ def _online_greedy_common_prefix_suffix_prefill_warmup_batches(
     return tuple(batch for batch in batches if 0 < batch <= limit)
 
 
-def _online_greedy_common_prefix_token_suffix_prefill_warmup_suffix_tokens(
+def _online_deterministic_common_prefix_token_suffix_prefill_warmup_suffix_tokens(
     max_seq_len: int,
     *,
     warmup_temperature: float = 0.0,
@@ -1824,23 +938,23 @@ def _online_greedy_common_prefix_token_suffix_prefill_warmup_suffix_tokens(
     if max_seq_len <= 0 or warmup_temperature > 0.0:
         return ()
     configured = os.environ.get(
-        "TORCHINFERNO_OPENAI_WARMUP_ONLINE_GREEDY_COMMON_PREFIX_TOKEN_SUFFIX_TOKENS"
+        "TORCHINFERNO_OPENAI_WARMUP_ONLINE_DETERMINISTIC_COMMON_PREFIX_TOKEN_SUFFIX_TOKENS"
     )
     if configured is not None:
         tokens = _parse_positive_int_csv(configured)
     else:
-        tokens = _online_greedy_common_prefix_suffix_prefill_warmup_suffix_tokens(
+        tokens = _online_deterministic_common_prefix_suffix_prefill_warmup_suffix_tokens(
             max_seq_len,
             warmup_temperature=warmup_temperature,
             warmup_max_tokens=warmup_max_tokens,
         )
         min_suffix = env_int(
-            "TORCHINFERNO_OPENAI_WARMUP_ONLINE_GREEDY_COMMON_PREFIX_TOKEN_SUFFIX_MIN_TOKENS",
+            "TORCHINFERNO_OPENAI_WARMUP_ONLINE_DETERMINISTIC_COMMON_PREFIX_TOKEN_SUFFIX_MIN_TOKENS",
             32,
             minimum=1,
         )
         max_suffix = env_int(
-            "TORCHINFERNO_OPENAI_WARMUP_ONLINE_GREEDY_COMMON_PREFIX_TOKEN_SUFFIX_MAX_SUFFIX_TOKENS",
+            "TORCHINFERNO_OPENAI_WARMUP_ONLINE_DETERMINISTIC_COMMON_PREFIX_TOKEN_SUFFIX_MAX_SUFFIX_TOKENS",
             96,
             minimum=min_suffix,
         )
@@ -1848,7 +962,7 @@ def _online_greedy_common_prefix_token_suffix_prefill_warmup_suffix_tokens(
     return tuple(token_count for token_count in tokens if token_count <= max_seq_len)
 
 
-def _online_greedy_common_prefix_token_suffix_prefill_warmup_batches(
+def _online_deterministic_common_prefix_token_suffix_prefill_warmup_batches(
     cache_rows: int,
     max_active: int,
     *,
@@ -1859,19 +973,19 @@ def _online_greedy_common_prefix_token_suffix_prefill_warmup_batches(
         return ()
     limit = min(cache_rows, max_active)
     configured = os.environ.get(
-        "TORCHINFERNO_OPENAI_WARMUP_ONLINE_GREEDY_COMMON_PREFIX_TOKEN_SUFFIX_BATCHES"
+        "TORCHINFERNO_OPENAI_WARMUP_ONLINE_DETERMINISTIC_COMMON_PREFIX_TOKEN_SUFFIX_BATCHES"
     )
     if configured is not None:
         batches = _parse_positive_int_csv(configured)
     else:
-        batches = _online_greedy_common_prefix_suffix_prefill_warmup_batches(
+        batches = _online_deterministic_common_prefix_suffix_prefill_warmup_batches(
             cache_rows,
             max_active,
             warmup_temperature=warmup_temperature,
             warmup_max_tokens=warmup_max_tokens,
         )
         min_batch = env_int(
-            "TORCHINFERNO_OPENAI_WARMUP_ONLINE_GREEDY_COMMON_PREFIX_TOKEN_SUFFIX_MIN_BATCH",
+            "TORCHINFERNO_OPENAI_WARMUP_ONLINE_DETERMINISTIC_COMMON_PREFIX_TOKEN_SUFFIX_MIN_BATCH",
             16,
             minimum=1,
         )
@@ -1881,8 +995,8 @@ def _online_greedy_common_prefix_token_suffix_prefill_warmup_batches(
 
 def _online_chunked_prefill_warmup_max_token_values() -> tuple[int, ...]:
     configured = os.environ.get("TORCHINFERNO_OPENAI_WARMUP_ONLINE_CHUNKED_PREFILL_MAX_TOKENS")
-    values = _parse_positive_int_csv(configured if configured is not None else "128")
-    return values or (128,)
+    values = _parse_positive_int_csv(configured if configured is not None else "1")
+    return values or (1,)
 
 
 def _online_chunked_prefill_warmup_batches(
@@ -1996,9 +1110,9 @@ def _online_mixed_prefix_suffix_prefill_warmup_enabled() -> bool:
     env_name = "TORCHINFERNO_OPENAI_WARMUP_ONLINE_MIXED_PREFIX_SUFFIX_PREFILL"
     if env_name in os.environ:
         return env_flag(env_name, False)
-    return _online_greedy_large_mixed_prefix_reuse_enabled(
+    return _online_mixed_prefix_reuse_enabled(
         temperature=0.0,
-        max_tokens=_online_greedy_common_prefix_suffix_prefill_warmup_max_tokens(),
+        max_tokens=_online_deterministic_common_prefix_suffix_prefill_warmup_max_tokens(),
     )
 
 
@@ -2010,10 +1124,29 @@ def _online_mixed_prefix_suffix_prefill_warmup_specs(
 ) -> tuple[tuple[int, int, int], ...]:
     if max_seq_len <= 0 or cache_rows <= 0 or max_active <= 0:
         return ()
-    raw = os.environ.get(
-        "TORCHINFERNO_OPENAI_WARMUP_ONLINE_MIXED_PREFIX_SUFFIX_SPECS",
-        "32:32:128,32:32:256,16:32:128,16:32:256,16:16:256,8:32:256,4:32:256,2:32:256,4:16:256",
-    )
+    raw = os.environ.get("TORCHINFERNO_OPENAI_WARMUP_ONLINE_MIXED_PREFIX_SUFFIX_SPECS")
+    if raw is None:
+        batch_limit = min(cache_rows, max_active, 32)
+        batch_sizes = tuple(
+            batch for batch in _decode_batch_buckets(batch_limit) if batch & (batch - 1) == 0
+        )
+        suffix_sizes = tuple(
+            suffix
+            for suffix in _default_prefix_prefill_suffix_buckets(0.0, None)
+            if 16 <= suffix <= 32 and suffix < max_seq_len
+        )
+        context_limit = min(max_seq_len, 256)
+        generated: list[tuple[int, int, int]] = []
+        for suffix_tokens in suffix_sizes:
+            context_bucket = 64
+            while context_bucket <= context_limit:
+                if context_bucket > suffix_tokens:
+                    generated.extend(
+                        (batch_size, suffix_tokens, context_bucket)
+                        for batch_size in batch_sizes
+                    )
+                context_bucket *= 2
+        return tuple(generated)
     specs: list[tuple[int, int, int]] = []
     for part in raw.split(","):
         fields = [field.strip() for field in part.split(":")]
@@ -3150,7 +2283,6 @@ _TENSOR_PARALLEL_SHM_WRITER: object | None = None
 _TENSOR_PARALLEL_SHM_READER_BUFFER: object | None = None
 _TENSOR_PARALLEL_SHM_READER: object | None = None
 _TENSOR_PARALLEL_SHM_READER_SETUP_DONE = False
-_TENSOR_PARALLEL_SHM_ONLINE_STEP_ACTIVE = False
 _TP_SHM_SETUP_OP = "__torchinferno_tp_shm_setup__"
 _TP_SHM_FALLBACK_OP = "__torchinferno_tp_shm_fallback__"
 
@@ -3854,19 +2986,18 @@ class OpenAICompletionEngine:
                     self._completed_queue_batches += 1
 
     def _kv_bounded_concurrency_cap(self) -> int:
-        # Upper bound on KV-token-bounded concurrency boosting. The persistent
-        # serving cache is sized for this many rows so SHORT-context workloads
-        # (self_consistency/tree: tiny prompts + early EOS, run at 128 client
-        # concurrency against a 48-row cap = pure queueing) can be admitted at
-        # higher concurrency without per-run reallocation. Long-context workloads
-        # exceed the warmup max_seq_len and keep the base 48-row cap. Returns the
-        # base when the feature is disabled.
+        # Warm exactly the row envelope the online scheduler can admit. Capturing
+        # larger decode graphs consumes the same CUDA graph pool needed by mixed
+        # prefill shapes, while those extra rows can never become active.
         base = self._online_serving_max_active()
         if not env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_KV_BOUNDED_CONCURRENCY", True):
             return base
-        cap = env_int("TORCHINFERNO_OPENAI_TP_ONLINE_KV_MAX_ACTIVE_CAP", 128, minimum=1)
         effective = _effective_openai_max_batch_size(self.model, self.device, self.max_batch_size)
-        return max(base, min(cap, effective))
+        bounded = _online_kv_bounded_max_active_cap(
+            temperature=0.0,
+            base_cap=effective,
+        )
+        return max(1, min(base, bounded, effective))
 
     def _allocate_online_serving_warmup_cache(self) -> tuple[object, int, int, int]:
         max_active = self._kv_bounded_concurrency_cap()
@@ -3886,12 +3017,8 @@ class OpenAICompletionEngine:
             paged_cache_fallback_candidate=paged_cache_fallback_candidate,
             use_paged_engine=_paged_online_engine_class_for(self.model, max_seq_len) is not None,
         )
-        # Auto-selecting the flashinfer FORWARD backend for the dense short-context
-        # engine REGRESSES at 64-conc (TI's flashinfer forward wrapper is naive:
-        # few_shot TPOT 81->206). It is SEPARATE from the long-context graphed paged
-        # decode (PagedEngine), which is the validated win. Gate it (default on for
-        # back-compat) so flashinfer can be installed FOR the paged decode while the
-        # dense forward stays dense. Only override an explicitly-dense backend.
+        # Keep the dense forward backend unless FlashInfer forward is explicitly
+        # requested. Paged decode is selected independently.
         if (
             unified_cache_backend == "dense"
             and env_flag("TORCHINFERNO_OPENAI_FLASHINFER_FORWARD", False)
@@ -4012,6 +3139,14 @@ class OpenAICompletionEngine:
             cache_batch=cache_batch,
         ))
         decode_policy_specs = _online_decode_warmup_policy_specs()
+        decode_many_batches = set(
+            _parse_positive_int_csv(
+                os.environ.get("TORCHINFERNO_OPENAI_WARMUP_DECODE_MANY_BATCHES", "")
+            )
+        )
+        decode_many_steps = _parse_positive_int_csv(
+            os.environ.get("TORCHINFERNO_OPENAI_WARMUP_DECODE_MANY_STEPS", "")
+        )
         _startup_warmup_log(
             self.model,
             "unified scheduler cache prepared "
@@ -4044,7 +3179,7 @@ class OpenAICompletionEngine:
                         _set_generation_cache_ragged_decode_cache_token_limit(
                             cache,
                             cache_token_limit,
-                            min_batch=_online_short_greedy_ragged_decode_cache_token_min_batch(),
+                            min_batch=_online_ragged_decode_cache_token_min_batch(),
                         )
                         for bs in batch_sizes:
                             _set_generation_cache_seq_len(cache, prompt_tokens)
@@ -4082,6 +3217,28 @@ class OpenAICompletionEngine:
                                     cache,
                                     allow_capture=True,
                                 )
+                                decode_many_graph = getattr(
+                                    self.model,
+                                    "try_decode_ragged_token_graph_many",
+                                    None,
+                                )
+                                if (
+                                    callable(decode_many_graph)
+                                    and warmup_temperature <= 0.0
+                                    and bs in decode_many_batches
+                                ):
+                                    for steps in decode_many_steps:
+                                        _reset_generation_cache(cache)
+                                        _set_generation_cache_seq_len(cache, prompt_tokens)
+                                        decode_many_graph(
+                                            decode_input_ids,
+                                            cache,
+                                            seq_lens=seq_lens_tensor,
+                                            row_indices=None,
+                                            steps=steps,
+                                            temperature=0.0,
+                                            capture_on_miss=True,
+                                        )
                             except Exception as _warmup_exc:
                                 import sys as _wsys
                                 print(f"[WARMUP] graph capture failed bs={bs}: {_warmup_exc}", file=_wsys.stderr, flush=True)
@@ -4096,7 +3253,10 @@ class OpenAICompletionEngine:
             )
             if (warmup_temperature, warmup_max_tokens) != (0.0, 1):
                 continue
-            if env_flag("TORCHINFERNO_OPENAI_WARMUP_ONLINE_COMMON_PREFIX_PREFILL", True):
+            if (
+                env_flag("TORCHINFERNO_OPENAI_WARMUP_ONLINE_COMMON_PREFIX_PREFILL", True)
+                and not _token_bucket_fa3_prefill_warmup_enabled()
+            ):
                 common_prefix_started_s = time.perf_counter()
                 common_prefix_rows = _online_common_prefix_prefill_warmup_rows(cache_batch, max_active)
                 common_prefix_tokens = _online_common_prefix_prefill_warmup_tokens(max_seq_len)
@@ -4196,7 +3356,7 @@ class OpenAICompletionEngine:
                                         )
                         _reset_generation_cache(cache)
                 for greedy_suffix_warmup_max_tokens in (
-                    _online_greedy_common_prefix_suffix_prefill_graph_warmup_max_token_values()
+                    _online_deterministic_common_prefix_suffix_prefill_graph_warmup_max_token_values()
                 ):
                     with _tensor_parallel_symm_mem_allreduce_scope(
                         self.model,
@@ -4204,7 +3364,7 @@ class OpenAICompletionEngine:
                         max_tokens=greedy_suffix_warmup_max_tokens,
                         temperature=0.0,
                     ):
-                        self._warmup_online_greedy_common_prefix_suffix_prefill_graphs(
+                        self._warmup_online_deterministic_common_prefix_suffix_prefill_graphs(
                             cache,
                             vocab_size,
                             cache_rows=cache_batch,
@@ -4229,7 +3389,7 @@ class OpenAICompletionEngine:
                                 max_tokens=sampled_suffix_warmup_max_tokens,
                                 temperature=sampled_warmup_temperature,
                             ):
-                                self._warmup_online_greedy_common_prefix_suffix_prefill_graphs(
+                                self._warmup_online_deterministic_common_prefix_suffix_prefill_graphs(
                                     cache,
                                     vocab_size,
                                     cache_rows=cache_batch,
@@ -4245,8 +3405,22 @@ class OpenAICompletionEngine:
                     "online common-prefix prefill warmup done "
                     f"in {time.perf_counter() - common_prefix_started_s:.1f}s",
                 )
+            if _token_bucket_fa3_prefill_warmup_enabled():
+                with _tensor_parallel_symm_mem_allreduce_scope(
+                    self.model,
+                    self.device,
+                    max_tokens=1,
+                    temperature=0.0,
+                    startup=False,
+                ):
+                    self._warmup_token_bucket_fa3_prefill_graphs(
+                        cache,
+                        vocab_size,
+                        cache_rows=cache_batch,
+                        max_seq_len=max_seq_len,
+                    )
             if _online_mixed_prefix_suffix_prefill_warmup_enabled():
-                mixed_warmup_max_tokens = _online_greedy_common_prefix_suffix_prefill_warmup_max_tokens()
+                mixed_warmup_max_tokens = _online_deterministic_common_prefix_suffix_prefill_warmup_max_tokens()
                 with _tensor_parallel_prefill_graph_runtime_key_scope(
                     self.model,
                     self.device,
@@ -4360,6 +3534,138 @@ class OpenAICompletionEngine:
             pass
         self._persistent_serving_cache = cache
 
+    def _warmup_token_bucket_fa3_prefill_graphs(
+        self,
+        cache: object,
+        vocab_size: int,
+        *,
+        cache_rows: int,
+        max_seq_len: int,
+    ) -> None:
+        if not _token_bucket_fa3_prefill_warmup_enabled():
+            return
+        graph = getattr(self.model, "try_prefill_token_bucket_fa3_graph", None)
+        copy_graph = getattr(self.model, "try_copy_token_bucket_prefix_graph", None)
+        if not callable(graph) or not callable(copy_graph):
+            return
+        batch_capacities = tuple(
+            capacity
+            for capacity in _token_bucket_fa3_batch_capacities()
+            if capacity < cache_rows
+        )
+        if not batch_capacities:
+            return
+        capacities = tuple(
+            capacity
+            for capacity in _online_token_bucket_fa3_warmup_capacities()
+            if capacity > 0 and capacity <= max(batch_capacities) * max_seq_len
+        )
+        prefix_capacities = _online_token_bucket_prefix_copy_warmup_capacities(max_seq_len)
+        if not capacities:
+            return
+        started_s = time.perf_counter()
+        _startup_warmup_log(
+            self.model,
+            "token-bucket FA3 prefill warmup start "
+            f"batch_capacities={batch_capacities} token_capacities={capacities} "
+            f"prefix_capacities={prefix_capacities}",
+        )
+        captured = 0
+        capture_targets = 0
+        try:
+            for layer in getattr(cache, "layers", ()):
+                layer.keys.zero_()
+                layer.values.zero_()
+            fp8_min_m = env_int(
+                "TORCHINFERNO_CONTINUOUS_TOKEN_BUCKET_FA3_FP8_MIN_M",
+                512,
+                minimum=1,
+            )
+            _set_tensor_parallel_runtime_fp8_prefill(
+                self.model,
+                enabled=True,
+                min_m=fp8_min_m,
+            )
+            for batch_capacity in batch_capacities:
+                rows = torch.arange(batch_capacity, dtype=torch.long, device=self.device)
+                starts = torch.zeros(batch_capacity, dtype=torch.long, device=self.device)
+                source_row = batch_capacity
+                sources = torch.full(
+                    (batch_capacity,),
+                    source_row,
+                    dtype=torch.long,
+                    device=self.device,
+                )
+                for prefix_capacity in prefix_capacities:
+                    copy_graph(
+                        cache,
+                        start_positions=torch.full_like(starts, prefix_capacity),
+                        row_indices=rows,
+                        src_prefix_rows=sources,
+                        prefix_copy_capacity=prefix_capacity,
+                        capture_on_miss=True,
+                    )
+                for token_capacity in capacities:
+                    base, remainder = divmod(token_capacity, batch_capacity)
+                    q_lens_values = [
+                        base + (1 if row < remainder else 0)
+                        for row in range(batch_capacity)
+                    ]
+                    if max(q_lens_values) > max_seq_len:
+                        continue
+                    capture_targets += 1
+                    write_positions: list[int] = []
+                    flat_rows: list[int] = []
+                    logit_positions: list[int] = []
+                    offset = 0
+                    for row, q_len in enumerate(q_lens_values):
+                        logit_positions.append(offset + q_len - 1 if q_len > 0 else 0)
+                        write_positions.extend(range(q_len))
+                        flat_rows.extend([row] * q_len)
+                        offset += q_len
+                    output = graph(
+                        torch.arange(
+                            token_capacity,
+                            device=self.device,
+                            dtype=torch.long,
+                        ).remainder(max(1, int(vocab_size)))[None, :],
+                        cache,
+                        start_positions=starts,
+                        q_lens=torch.tensor(q_lens_values, device=self.device, dtype=torch.long),
+                        row_indices=rows,
+                        write_positions=torch.tensor(
+                            write_positions,
+                            device=self.device,
+                            dtype=torch.long,
+                        ),
+                        flat_rows=torch.tensor(flat_rows, device=self.device, dtype=torch.long),
+                        logit_positions=torch.tensor(
+                            logit_positions,
+                            device=self.device,
+                            dtype=torch.long,
+                        ),
+                        capture_on_miss=True,
+                    )
+                    if output is not None:
+                        captured += 1
+        except Exception as exc:
+            import sys as _tbsys
+
+            print(
+                f"[WARMUP] token-bucket FA3 prefill warmup failed: {exc}",
+                file=_tbsys.stderr,
+                flush=True,
+            )
+        finally:
+            _set_tensor_parallel_runtime_fp8_prefill(self.model, enabled=False, min_m=2048)
+            _reset_generation_cache(cache)
+            _startup_warmup_log(
+                self.model,
+                "token-bucket FA3 prefill warmup done "
+                f"captured={captured}/{capture_targets} "
+                f"in {time.perf_counter() - started_s:.1f}s",
+            )
+
     def _warmup_tensor_parallel_runtime_fp8_prefill(
         self,
         cache: object,
@@ -4407,7 +3713,7 @@ class OpenAICompletionEngine:
             _set_tensor_parallel_runtime_fp8_prefill(self.model, enabled=False, min_m=2048)
             _reset_generation_cache(cache)
 
-    def _warmup_online_greedy_common_prefix_suffix_prefill_graphs(
+    def _warmup_online_deterministic_common_prefix_suffix_prefill_graphs(
         self,
         cache: object,
         vocab_size: int,
@@ -4420,19 +3726,19 @@ class OpenAICompletionEngine:
         warmup_label: str = "greedy",
         suffix_tokens_override: tuple[int, ...] | None = None,
     ) -> None:
-        if not _online_greedy_common_prefix_suffix_prefill_warmup_enabled():
+        if not _online_deterministic_common_prefix_suffix_prefill_warmup_enabled():
             return
         ragged_prefill_graph = getattr(self.model, "try_prefill_ragged_logits_graph", None)
         if ragged_prefill_graph is None:
             return
         token_suffix_warmup_enabled = (
             warmup_temperature <= 0.0
-            and _online_greedy_common_prefix_token_suffix_prefill_warmup_enabled()
+            and _online_deterministic_common_prefix_token_suffix_prefill_warmup_enabled()
         )
         token_only_suffix_warmup_enabled = (
             warmup_temperature <= 0.0
             and env_flag(
-                "TORCHINFERNO_OPENAI_WARMUP_ONLINE_GREEDY_COMMON_PREFIX_TOKEN_ONLY_SUFFIX_PREFILL",
+                "TORCHINFERNO_OPENAI_WARMUP_ONLINE_DETERMINISTIC_COMMON_PREFIX_TOKEN_ONLY_SUFFIX_PREFILL",
                 False,
             )
         )
@@ -4450,19 +3756,19 @@ class OpenAICompletionEngine:
         prefix_graph = getattr(self.model, "try_prefill_logits_graph", None)
         if prefix_graph is None:
             return
-        prefix_tokens = _online_greedy_common_prefix_suffix_prefill_warmup_prefix_tokens(max_seq_len)
+        prefix_tokens = _online_deterministic_common_prefix_suffix_prefill_warmup_prefix_tokens(max_seq_len)
         suffix_tokens = (
             suffix_tokens_override
             if suffix_tokens_override is not None
-            else _online_greedy_common_prefix_suffix_prefill_warmup_suffix_tokens(
+            else _online_deterministic_common_prefix_suffix_prefill_warmup_suffix_tokens(
                 max_seq_len,
                 warmup_temperature=warmup_temperature,
                 warmup_max_tokens=warmup_max_tokens,
             )
         )
         if warmup_max_tokens is None:
-            warmup_max_tokens = _online_greedy_common_prefix_suffix_prefill_warmup_max_tokens()
-        batch_sizes = _online_greedy_common_prefix_suffix_prefill_warmup_batches(
+            warmup_max_tokens = _online_deterministic_common_prefix_suffix_prefill_warmup_max_tokens()
+        batch_sizes = _online_deterministic_common_prefix_suffix_prefill_warmup_batches(
             cache_rows,
             max_active,
             warmup_temperature=warmup_temperature,
@@ -4471,16 +3777,16 @@ class OpenAICompletionEngine:
         token_warmup_max_tokens = (
             warmup_max_tokens
             if warmup_max_tokens is not None
-            else _online_greedy_common_prefix_suffix_prefill_warmup_max_tokens()
+            else _online_deterministic_common_prefix_suffix_prefill_warmup_max_tokens()
         )
         token_warmup_enabled = bool(
             (callable(ragged_token_prefill_graph) or callable(ragged_token_only_prefill_graph))
             and token_warmup_max_tokens
-            in _online_greedy_common_prefix_token_suffix_prefill_warmup_max_token_values()
+            in _online_deterministic_common_prefix_token_suffix_prefill_warmup_max_token_values()
         )
         token_suffix_tokens = (
             set(
-                _online_greedy_common_prefix_token_suffix_prefill_warmup_suffix_tokens(
+                _online_deterministic_common_prefix_token_suffix_prefill_warmup_suffix_tokens(
                     max_seq_len,
                     warmup_temperature=warmup_temperature,
                     warmup_max_tokens=token_warmup_max_tokens,
@@ -4491,7 +3797,7 @@ class OpenAICompletionEngine:
         )
         token_batch_sizes = (
             set(
-                _online_greedy_common_prefix_token_suffix_prefill_warmup_batches(
+                _online_deterministic_common_prefix_token_suffix_prefill_warmup_batches(
                     cache_rows,
                     max_active,
                     warmup_temperature=warmup_temperature,
@@ -4501,14 +3807,14 @@ class OpenAICompletionEngine:
             if token_warmup_enabled
             else set()
         )
-        extra_pairs = _online_greedy_common_prefix_suffix_prefill_warmup_extra_pairs(
+        extra_pairs = _online_deterministic_common_prefix_suffix_prefill_warmup_extra_pairs(
             max_seq_len,
             warmup_temperature=warmup_temperature,
             warmup_max_tokens=warmup_max_tokens,
         )
         extra_pair_set = set(extra_pairs)
         warm_dense_extra_pairs = env_flag(
-            "TORCHINFERNO_OPENAI_WARMUP_ONLINE_GREEDY_COMMON_PREFIX_DENSE_EXTRA_PAIRS",
+            "TORCHINFERNO_OPENAI_WARMUP_ONLINE_DETERMINISTIC_COMMON_PREFIX_DENSE_EXTRA_PAIRS",
             True,
         )
         # Sampled online waves often start with contiguous active rows, so the
@@ -4523,32 +3829,32 @@ class OpenAICompletionEngine:
         warm_greedy_dense_dynamic_row_indices = (
             warmup_temperature <= 0.0
             and env_flag(
-                "TORCHINFERNO_OPENAI_WARMUP_ONLINE_GREEDY_COMMON_PREFIX_DENSE_DYNAMIC_ROW_INDICES",
+                "TORCHINFERNO_OPENAI_WARMUP_ONLINE_DETERMINISTIC_COMMON_PREFIX_DENSE_DYNAMIC_ROW_INDICES",
                 True,
             )
         )
         greedy_dense_dynamic_min_batch = env_int(
-            "TORCHINFERNO_OPENAI_WARMUP_ONLINE_GREEDY_COMMON_PREFIX_DENSE_DYNAMIC_MIN_BATCH",
+            "TORCHINFERNO_OPENAI_WARMUP_ONLINE_DETERMINISTIC_COMMON_PREFIX_DENSE_DYNAMIC_MIN_BATCH",
             16,
             minimum=1,
         )
         greedy_dense_dynamic_max_batch = env_int(
-            "TORCHINFERNO_OPENAI_WARMUP_ONLINE_GREEDY_COMMON_PREFIX_DENSE_DYNAMIC_MAX_BATCH",
+            "TORCHINFERNO_OPENAI_WARMUP_ONLINE_DETERMINISTIC_COMMON_PREFIX_DENSE_DYNAMIC_MAX_BATCH",
             32,
             minimum=1,
         )
         greedy_dense_dynamic_min_suffix = env_int(
-            "TORCHINFERNO_OPENAI_WARMUP_ONLINE_GREEDY_COMMON_PREFIX_DENSE_DYNAMIC_MIN_SUFFIX",
+            "TORCHINFERNO_OPENAI_WARMUP_ONLINE_DETERMINISTIC_COMMON_PREFIX_DENSE_DYNAMIC_MIN_SUFFIX",
             96,
             minimum=1,
         )
         greedy_dense_dynamic_max_suffix = env_int(
-            "TORCHINFERNO_OPENAI_WARMUP_ONLINE_GREEDY_COMMON_PREFIX_DENSE_DYNAMIC_MAX_SUFFIX",
+            "TORCHINFERNO_OPENAI_WARMUP_ONLINE_DETERMINISTIC_COMMON_PREFIX_DENSE_DYNAMIC_MAX_SUFFIX",
             96,
             minimum=1,
         )
         warm_logits_with_token_suffix = env_flag(
-            "TORCHINFERNO_OPENAI_WARMUP_ONLINE_GREEDY_COMMON_PREFIX_TOKEN_SUFFIX_LOGITS_PREFILL",
+            "TORCHINFERNO_OPENAI_WARMUP_ONLINE_DETERMINISTIC_COMMON_PREFIX_TOKEN_SUFFIX_LOGITS_PREFILL",
             False,
         )
         suffixes_by_prefix: dict[int, list[int]] = {}
@@ -4593,7 +3899,7 @@ class OpenAICompletionEngine:
         fp8_min_m_env = (
             "TORCHINFERNO_OPENAI_WARMUP_ONLINE_SAMPLED_COMMON_PREFIX_FP8_MIN_M"
             if warmup_temperature > 0.0
-            else "TORCHINFERNO_OPENAI_WARMUP_ONLINE_GREEDY_COMMON_PREFIX_FP8_MIN_M"
+            else "TORCHINFERNO_OPENAI_WARMUP_ONLINE_DETERMINISTIC_COMMON_PREFIX_FP8_MIN_M"
         )
         fp8_prefill_min_m = env_int(
             fp8_min_m_env,
@@ -4940,20 +4246,36 @@ class OpenAICompletionEngine:
         if not prefix_rows:
             return
         max_batch = min(max_active, cache_rows)
-        batch_sizes = _parse_positive_int_csv(
-            os.environ.get(
-                "TORCHINFERNO_OPENAI_STARTUP_RUNTIME_FP8_RAGGED_PREFILL_BATCHES",
-                "1,2,4,8,16,32",
-            )
+        configured_batches = os.environ.get(
+            "TORCHINFERNO_OPENAI_STARTUP_RUNTIME_FP8_RAGGED_PREFILL_BATCHES"
+        )
+        batch_sizes = (
+            _parse_positive_int_csv(configured_batches)
+            if configured_batches is not None
+            else _decode_batch_buckets(min(max_batch, 32))
         )
         batch_sizes = tuple(batch for batch in batch_sizes if 0 < batch <= max_batch)
         if not batch_sizes:
             return
-        prefix_tokens = _parse_positive_int_csv(
-            os.environ.get("TORCHINFERNO_OPENAI_STARTUP_RUNTIME_FP8_RAGGED_PREFILL_PREFIX_TOKENS", "45")
+        configured_prefix_tokens = os.environ.get(
+            "TORCHINFERNO_OPENAI_STARTUP_RUNTIME_FP8_RAGGED_PREFILL_PREFIX_TOKENS"
         )
-        suffix_tokens = _parse_positive_int_csv(
-            os.environ.get("TORCHINFERNO_OPENAI_STARTUP_RUNTIME_FP8_RAGGED_PREFILL_SUFFIX_TOKENS", "16")
+        prefix_tokens = (
+            _parse_positive_int_csv(configured_prefix_tokens)
+            if configured_prefix_tokens is not None
+            else _online_common_prefix_prefill_warmup_tokens(max_seq_len)
+        )
+        configured_suffix_tokens = os.environ.get(
+            "TORCHINFERNO_OPENAI_STARTUP_RUNTIME_FP8_RAGGED_PREFILL_SUFFIX_TOKENS"
+        )
+        suffix_tokens = (
+            _parse_positive_int_csv(configured_suffix_tokens)
+            if configured_suffix_tokens is not None
+            else tuple(
+                suffix
+                for suffix in _default_prefix_prefill_suffix_buckets(0.0, None)
+                if 16 <= suffix <= 32
+            )
         )
         prefix_tokens = tuple(token_count for token_count in prefix_tokens if 0 < token_count <= max_seq_len)
         suffix_tokens = tuple(token_count for token_count in suffix_tokens if 0 < token_count <= max_seq_len)
@@ -4961,7 +4283,7 @@ class OpenAICompletionEngine:
             return
         min_m = env_int(
             "TORCHINFERNO_OPENAI_STARTUP_RUNTIME_FP8_RAGGED_PREFILL_MIN_M",
-            _online_fp8_prefill_min_m(temperature=0.7, max_tokens=300),
+            _online_fp8_prefill_min_m(temperature=1.0, max_tokens=1),
             minimum=1,
         )
         warmup_temperature = env_float(
@@ -4971,7 +4293,7 @@ class OpenAICompletionEngine:
         )
         warmup_max_tokens = env_int(
             "TORCHINFERNO_OPENAI_STARTUP_RUNTIME_FP8_RAGGED_PREFILL_MAX_TOKENS",
-            300,
+            1,
             minimum=1,
         )
         row = next((candidate for candidate in prefix_rows if candidate >= max(batch_sizes)), None)
@@ -5077,7 +4399,7 @@ class OpenAICompletionEngine:
         if not specs:
             return
         if warmup_max_tokens is None:
-            warmup_max_tokens = _online_greedy_common_prefix_suffix_prefill_warmup_max_tokens()
+            warmup_max_tokens = _online_deterministic_common_prefix_suffix_prefill_warmup_max_tokens()
         fp8_prefill_enabled = _online_fp8_prefill_enabled(
             temperature=0.0,
             max_tokens=warmup_max_tokens,
@@ -5335,9 +4657,8 @@ class OpenAICompletionEngine:
             n_rows = max_active
         # Joint (batch, q) bucketing under a token budget. A full-forward prefill
         # graph's cost is ~ batch*q tokens, so the useful graphs live on the
-        # hyperbola batch*q <= budget: LARGE batch + SMALL q (tiny prompts at high
-        # concurrency, e.g. long_output's 64x ~20-token requests) and SMALL batch
-        # + LARGE q (long prompts at lower per-prefill concurrency, e.g. few_shot).
+        # hyperbola batch*q <= budget: large batch + small q and small batch +
+        # large q.
         # The explosive corner (large batch AND large q, e.g. 48x768=36864 tokens)
         # is excluded -- it neither fits memory nor finishes fast. Replay picks
         # the minimal-area captured (b,q) covering the request; misses fall back
@@ -5645,79 +4966,8 @@ class OpenAICompletionEngine:
         temperature: float | None = None,
         max_tokens: int | None = None,
     ) -> int:
-        # 48, restored after a benchmark regression. max_active=128 was tried
-        # (commit 28f62c1) on the theory that memory-bound decode throughput
-        # scales with concurrent rows. inference-bench run 20260606_220710
-        # (commit e2056aa) showed it is a NET LOSS: TPOT 36.6 -> 59.8 ms and the
-        # score dropped 1/20 -> 0/20. A 128-row decode step is KV-read-bound for
-        # long-context workloads (multi_turn/few_shot/tree TPOT ~doubled); only
-        # short-context long_output improved (30.7 -> 23.4). 48 is the better
-        # default. Deterministic medium/large max-token streams are the exception:
-        # they are prefill/queue dominated, and lower row caps reduce row
-        # contention without changing short-output long_output or sampled burst
-        # policy. Local TP8 A/B on 70B few-shot showed a 32-row cap is the knee
-        # for greedy 129-300 token streams: it cuts median TTFT/E2E versus 28
-        # rows while 36 rows regresses latency. 400-token greedy bursts are
-        # latency-regressed by a lower cap. For the 512-token multi-turn path,
-        # local TP8 70B rechecks on the current startup/probe stack showed 32
-        # rows cut TTFT/E2E from the 594-614ms / 631-659ms band to 465ms /
-        # 531ms while keeping TPOT at 64.6ms, still around the same-node vLLM
-        # TPOT band. Sampled medium bursts such as tree-of-thought are also
-        # latency-sensitive. Current-stack TP8 tree A/Bs on 20260710 showed
-        # a 32-row cap edges out 16 rows on median E2E and correctness
-        # (85.5ms/0.968 vs 88.4ms/0.962) without touching sampled-short
-        # self-consistency or greedy traffic.
-        default_cap = 48
-        if temperature is not None and max_tokens is not None:
-            sampled_medium_min_tokens = env_int(
-                "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_MAX_ACTIVE_MIN_TOKENS",
-                256,
-                minimum=1,
-            )
-            sampled_medium_max_tokens = env_int(
-                "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_MAX_ACTIVE_MAX_TOKENS",
-                300,
-                minimum=sampled_medium_min_tokens,
-            )
-            if temperature > 0.0 and sampled_medium_min_tokens < max_tokens <= sampled_medium_max_tokens:
-                default_cap = env_int(
-                    "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_MEDIUM_MAX_ACTIVE",
-                    32,
-                    minimum=1,
-                )
-            greedy_mid_min_tokens = env_int(
-                "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_MID_MAX_ACTIVE_MIN_TOKENS",
-                128,
-                minimum=1,
-            )
-            greedy_mid_max_tokens = env_int(
-                "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_MID_MAX_ACTIVE_MAX_TOKENS",
-                300,
-                minimum=greedy_mid_min_tokens,
-            )
-            if temperature <= 0.0 and greedy_mid_min_tokens < max_tokens <= greedy_mid_max_tokens:
-                default_cap = env_int(
-                    "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_MID_MAX_ACTIVE",
-                    32,
-                    minimum=1,
-                )
-            greedy_large_min_tokens = env_int(
-                "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_MAX_ACTIVE_MIN_TOKENS",
-                400,
-                minimum=greedy_mid_max_tokens,
-            )
-            greedy_large_max_tokens = env_int(
-                "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_MAX_ACTIVE_MAX_TOKENS",
-                512,
-                minimum=greedy_large_min_tokens,
-            )
-            if temperature <= 0.0 and greedy_large_min_tokens < max_tokens <= greedy_large_max_tokens:
-                default_cap = env_int(
-                    "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_MAX_ACTIVE",
-                    32,
-                    minimum=1,
-                )
-        cap = env_int("TORCHINFERNO_OPENAI_TP_ONLINE_MAX_ACTIVE", default_cap, minimum=1)
+        del temperature, max_tokens
+        cap = env_int("TORCHINFERNO_OPENAI_TP_ONLINE_MAX_ACTIVE", 64, minimum=1)
         effective = _effective_openai_max_batch_size(self.model, self.device, self.max_batch_size)
         return max(1, min(cap, effective))
 
@@ -5727,28 +4977,8 @@ class OpenAICompletionEngine:
         temperature: float | None = None,
         max_tokens: int | None = None,
     ) -> int:
-        # 64, raised from 16. MEASURED 2026-06-12 (local 70B TP8 inference-bench
-        # A/B): multi_turn keeps many active conversation prefixes. 16 rows still
-        # thrashed and spent ~17.6s in prefill wall time over 1000 requests; 64
-        # rows cut that to ~10.4s and improved median e2e 1008->692ms and ttft
-        # 924->605ms. Other workloads mostly reuse one in-burst common prefix, so
-        # this adds reusable prefill KV capacity without changing decode policy.
-        if "TORCHINFERNO_OPENAI_TP_ONLINE_PREFIX_ROWS" in os.environ:
-            return env_int("TORCHINFERNO_OPENAI_TP_ONLINE_PREFIX_ROWS", 64, minimum=0)
-        if (
-            temperature is not None
-            and max_tokens is not None
-            and _online_greedy_large_mixed_prefix_reuse_enabled(
-                temperature=temperature,
-                max_tokens=max_tokens,
-            )
-        ):
-            return env_int(
-                "TORCHINFERNO_OPENAI_TP_ONLINE_GREEDY_LARGE_MIXED_PREFIX_ROWS",
-                112,
-                minimum=0,
-            )
-        return 64
+        del temperature, max_tokens
+        return env_int("TORCHINFERNO_OPENAI_TP_ONLINE_PREFIX_ROWS", 80, minimum=0)
 
     def _online_serving_effective_prefix_rows(
         self,
@@ -5761,12 +4991,8 @@ class OpenAICompletionEngine:
             temperature=temperature,
             max_tokens=max_tokens,
         )
-        # Keep startup/runtime dense KV under the older, known-good 144-row memory
-        # envelope by default. KV-bounded long_output can raise max_active to 128;
-        # carrying 64 prefix rows on top pushes the 70B TP8 server close to H100
-        # memory limits during startup graph warmup. The cap only trims prefix rows
-        # when high active-row concurrency needs the memory; few/self/tree/multi
-        # still keep the 64-row prefix cache under their lower active caps.
+        # Keep active and prefix rows under one explicit memory envelope. Higher
+        # active-row concurrency automatically leaves fewer rows for prefixes.
         total_budget = env_int(
             "TORCHINFERNO_OPENAI_TP_ONLINE_TOTAL_ROWS_BUDGET",
             144,
@@ -5811,9 +5037,8 @@ class OpenAICompletionEngine:
         # wedges paged serving. When flashinfer is absent, return None so the online
         # batcher falls back to the dense _RuntimeContinuousBatchEngine.
         page_size = int(getattr(self, "page_size", 16) or 16)
-        # COW prefix caching needs the engine (its paged pool + PagedPrefixCache +
-        # retained pages) to PERSIST across batcher sessions, so multi_turn's per-turn
-        # requests -- which arrive in separate bursts -- reuse the conversation's KV.
+        # COW prefix caching needs the engine, paged pool, and prefix cache to
+        # persist across request bursts so later prompts can reuse retained KV.
         # The TP WORKER already persists its engine (online_runtime_engine, reused if
         # not None), so the primary MUST persist too or the two ranks' prefix caches
         # diverge -> different share decisions -> collective mismatch. Both build at the
@@ -5919,28 +5144,19 @@ class OpenAICompletionEngine:
         def same_online_policy(request: _QueuedGeneration) -> bool:
             if not request.stream:
                 return False
-            if allow_mixed_temperatures:
-                if (request.temperature > 0.0) != (first.temperature > 0.0):
-                    return False
-            elif request.temperature != first.temperature:
+            if not allow_mixed_temperatures and request.temperature != first.temperature:
                 return False
-            return (
-                _online_session_policy_key(
-                    temperature=request.temperature,
-                    max_tokens=request.max_tokens,
-                )
-                == session_policy_key
+            request_policy_key = _online_session_policy_key(
+                temperature=request.temperature,
+                max_tokens=request.max_tokens,
+            )
+            same_sampling_mode = request_policy_key[0] == session_policy_key[0]
+            return request_policy_key[1] == session_policy_key[1] and (
+                allow_mixed_temperatures or same_sampling_mode
             )
 
         def same_online_class(request: _QueuedGeneration) -> bool:
-            if same_online_policy(request):
-                return True
-            return allow_mixed_temperatures and _online_sampled_medium_mixed_followup_compatible(
-                session_temperature=first.temperature,
-                session_max_tokens=first.max_tokens,
-                request_temperature=request.temperature,
-                request_max_tokens=request.max_tokens,
-            )
+            return same_online_policy(request)
 
         initial_batch = [first]
         initial_batch_start_s = time.perf_counter()
@@ -6026,10 +5242,10 @@ class OpenAICompletionEngine:
                 deferred.extend(initial_batch[max_active:])
                 initial_batch = initial_batch[:max_active]
                 run_max_tokens = max(request.max_tokens for request in initial_batch)
-        # KV-token-bounded concurrency boost: raise the admission cap for short
-        # greedy/self-style sampled workloads, where extra rows cut queueing
-        # without forcing larger few-shot/tree decode batches. Keep longer
-        # generations on the base cap unless explicitly opted in.
+        # Bound active rows by the logical KV footprint. This is deliberately
+        # based on the allocated session capacity rather than request labels or
+        # output-length bands: short contexts fill the efficient decode bucket,
+        # while longer contexts reserve proportionally fewer concurrent rows.
         if _online_kv_bounded_concurrency_enabled(
             temperature=first.temperature,
             max_tokens=run_max_tokens,
@@ -6042,14 +5258,18 @@ class OpenAICompletionEngine:
                 temperature=first.temperature,
                 base_cap=self._kv_bounded_concurrency_cap(),
             )
-            max_active = max(max_active, min(kv_max_active_cap, kv_token_budget // max_seq_len))
+            max_active = min(
+                max_active,
+                kv_max_active_cap,
+                max(1, kv_token_budget // max_seq_len),
+            )
         prefix_rows = self._online_serving_effective_prefix_rows(
             max_active,
             temperature=first.temperature,
             max_tokens=run_max_tokens,
         )
         total_online_rows = max_active + prefix_rows
-        ragged_decode_cache_token_limit = _online_short_greedy_ragged_decode_cache_token_limit(
+        ragged_decode_cache_token_limit = _online_ragged_decode_cache_token_limit(
             temperature=first.temperature,
             max_tokens=run_max_tokens,
             max_seq_len=max_seq_len,
@@ -6066,13 +5286,6 @@ class OpenAICompletionEngine:
                 compat_max_seq_len = max(max_seq_len, persistent_max_seq_len)
         stop_token_ids = getattr(self, "stop_token_ids", frozenset())
         eos_token_id = _runtime_eos_token_id(getattr(self, "tokenizer", None), stop_token_ids)
-        # Test-only: force every request to generate exactly max_tokens (ignore EOS),
-        # so scripts/test_stream.py can reproduce the real long_output benchmark's
-        # "huge output -> rows stay occupied -> arrivals queue" dynamics that drive
-        # the TTFT/throughput gaps. Off by default; no production effect.
-        if env_flag("TORCHINFERNO_OPENAI_IGNORE_EOS", False):
-            stop_token_ids = frozenset()
-            eos_token_id = None
         profile_queue = bool(self._queue_profile_path_value())
         profile_runtime_timings = profile_queue and _queue_profile_sync_timings_enabled()
         use_decode_many = _online_decode_many_enabled(
@@ -6133,7 +5346,7 @@ class OpenAICompletionEngine:
             temperature=first.temperature,
             max_tokens=run_max_tokens,
         )
-        greedy_large_mixed_prefix_reuse = _online_greedy_large_mixed_prefix_reuse_enabled(
+        mixed_prefix_reuse = _online_mixed_prefix_reuse_enabled(
             temperature=first.temperature,
             max_tokens=run_max_tokens,
         )
@@ -6191,7 +5404,7 @@ class OpenAICompletionEngine:
                     temperature=first.temperature,
                     max_tokens=run_max_tokens,
                 ),
-                greedy_large_mixed_prefix_reuse=greedy_large_mixed_prefix_reuse,
+                mixed_prefix_reuse=mixed_prefix_reuse,
                 max_generation_tokens=run_max_tokens,
             )
         decode_runner = getattr(self, "_decode_graph_runner", None)
@@ -6211,6 +5424,7 @@ class OpenAICompletionEngine:
             temperature=first.temperature,
             max_tokens=run_max_tokens,
         )
+        drain_decode_min_active = _online_decode_drain_min_active(max_active)
         collect_idle_arrivals = _online_collect_idle_arrivals_enabled(
             temperature=first.temperature,
             max_tokens=run_max_tokens,
@@ -6446,6 +5660,7 @@ class OpenAICompletionEngine:
                 decode_quantum=decode_quantum,
                 drain_decode_quantum=drain_decode_quantum,
                 drain_decode_min_generated=drain_decode_min_generated,
+                drain_decode_min_active=drain_decode_min_active,
                 submit_step_command_enabled=submit_step_command_enabled,
                 requested_max_batch=requested_max_batch,
                 initial_wait_ms=round(initial_wait_s * 1000.0, 3),
@@ -6501,7 +5716,7 @@ class OpenAICompletionEngine:
                 pin_shared_prefix=pin_shared_prefix,
                 store_reusable_prefixes=store_reusable_prefixes,
                 store_full_prompt_prefixes=store_full_prompt_prefixes,
-                greedy_large_mixed_prefix_reuse=greedy_large_mixed_prefix_reuse,
+                mixed_prefix_reuse=mixed_prefix_reuse,
                 fp8_prefill_enabled=fp8_prefill_enabled,
                 fp8_prefill_min_m=fp8_prefill_min_m,
                 marlin_int4_decode_enabled=marlin_int4_decode_enabled,
@@ -6730,18 +5945,13 @@ class OpenAICompletionEngine:
                         except Exception:
                             shared_cache = None
                     elif shared_cache is not None:
-                        # REUSED persistent cache: it still holds the PREVIOUS benchmark's
-                        # seq_len/KV. start_online -> _reset_capacity zeroes the engine's
-                        # row-seq-len tracking but NOT the external cache's content, so the
-                        # first batch of the next benchmark reads stale rows -> garbage
-                        # (observed: first few_shot run after long_output = 0/1000 correct,
-                        # subsequent runs fine). Reset the reused cache to match the engine's
-                        # fresh state. TP-symmetric: the worker does the same on its cache.
+                        # Reset reused KV alongside the engine's fresh row-length
+                        # state. The worker performs the same reset symmetrically.
                         _reset_generation_cache(shared_cache)
                     _set_generation_cache_ragged_decode_cache_token_limit(
                         shared_cache,
                         ragged_decode_cache_token_limit,
-                        min_batch=_online_short_greedy_ragged_decode_cache_token_min_batch(),
+                        min_batch=_online_ragged_decode_cache_token_min_batch(),
                     )
                 runtime_engine.start_online(max_seq_len=max_seq_len, external_cache=shared_cache)
                 started = True
@@ -6761,6 +5971,44 @@ class OpenAICompletionEngine:
                         and had_work_before_drain
                         else 0
                     )
+                    if (
+                        steps_after_submit > 0
+                        and decode_many_with_waiting
+                        and drain_decode_quantum > decode_quantum
+                    ):
+                        active_count_fn = getattr(
+                            runtime_engine,
+                            "online_active_request_count",
+                            None,
+                        )
+                        active_request_count = (
+                            int(active_count_fn())
+                            if callable(active_count_fn)
+                            else 0
+                        )
+                        min_generated_fn = getattr(
+                            runtime_engine,
+                            "online_active_min_generated",
+                            None,
+                        )
+                        active_min_generated = (
+                            min_generated_fn()
+                            if callable(min_generated_fn)
+                            else None
+                        )
+                        drain_generated_ready = (
+                            drain_decode_min_generated <= 0
+                            or (
+                                active_min_generated is not None
+                                and active_min_generated >= drain_decode_min_generated
+                            )
+                        )
+                        drain_active_ready = (
+                            drain_decode_min_active <= 0
+                            or active_request_count >= drain_decode_min_active
+                        )
+                        if drain_generated_ready and drain_active_ready:
+                            steps_after_submit = drain_decode_quantum
                     ready_count = drain_ready(
                         step,
                         steps_after_submit=steps_after_submit,
@@ -6859,13 +6107,29 @@ class OpenAICompletionEngine:
                             and active_min_generated >= drain_decode_min_generated
                         )
                     )
-                    command_decode_quantum = decode_quantum
+                    active_count_fn = getattr(runtime_engine, "online_active_request_count", None)
+                    active_request_count = (
+                        int(active_count_fn())
+                        if callable(active_count_fn)
+                        else 0
+                    )
+                    drain_active_ready = (
+                        drain_decode_min_active <= 0
+                        or active_request_count >= drain_decode_min_active
+                    )
+                    command_decode_quantum = (
+                        steps_after_submit
+                        if ran_combined_step_command
+                        else decode_quantum
+                    )
                     if (
-                        drain_decode_quantum > decode_quantum
+                        not ran_combined_step_command
+                        and drain_decode_quantum > decode_quantum
                         and ready_count == 0
                         and callable(step_many)
-                        and not has_runtime_waiting
+                        and (not has_runtime_waiting or decode_many_with_waiting)
                         and drain_generated_ready
+                        and drain_active_ready
                     ):
                         command_decode_quantum = drain_decode_quantum
                     if not ran_combined_step_command:
@@ -7641,6 +6905,13 @@ class OpenAICompletionEngine:
             "decode_many_tail_limited_calls",
             "decode_many_tail_limited_steps",
             "decode_many_min_active_skips",
+            "unified_steps",
+            "unified_prepare_ms",
+            "unified_model_submit_ms",
+            "unified_sample_select_ms",
+            "unified_sample_readback_ms",
+            "unified_state_ms",
+            "unified_total_ms",
             "prefix_reuse_requests",
             "prefix_reuse_tokens",
             "queued_requests",
@@ -7729,6 +7000,18 @@ class OpenAICompletionEngine:
             "decode_ragged_model_gpu_ms",
             "decode_ragged_cpu_tokens_ms",
             "decode_ragged_state_update_ms",
+            "decode_ragged_wall_steps",
+            "decode_ragged_wall_prepare_ms",
+            "decode_ragged_wall_prepare_rows_ms",
+            "decode_ragged_wall_prepare_policy_ms",
+            "decode_ragged_wall_prepare_inputs_ms",
+            "decode_ragged_wall_prepare_seq_lens_ms",
+            "decode_ragged_wall_gpu_state_hits",
+            "decode_ragged_wall_gpu_state_misses",
+            "decode_ragged_wall_model_submit_ms",
+            "decode_ragged_wall_readback_ms",
+            "decode_ragged_wall_state_ms",
+            "decode_ragged_wall_total_ms",
             "prompt_lookup_batches",
             "prompt_lookup_requests",
             "prompt_lookup_proposed_tokens",
@@ -7740,6 +7023,8 @@ class OpenAICompletionEngine:
             "prefix_reuse_page_aligned_tokens",
             "prefix_reuse_alignment_loss_tokens",
             "prefix_reuse_forced_suffix_tokens",
+            "prefix_row_move_requests",
+            "prefix_row_move_tokens",
             "full_prompt_store_requests",
             "full_prompt_store_stored_requests",
             "full_prompt_store_deferred_requests",
@@ -7808,6 +7093,7 @@ class OpenAICompletionEngine:
                 "prefill_shape_route_reuse_tokens",
                 "prefill_shape_graph_capture_counts",
                 "prefill_shape_graph_replay_counts",
+                "prefill_graph_replay_shape_counts",
                 "prefill_shape_graph_miss_counts",
                 "prefill_shape_row_indices_omitted_batches",
                 "prefill_shape_row_indices_omitted_rows",
@@ -8116,9 +7402,8 @@ class OpenAICompletionEngine:
         )
 
     def _temperature_single_request_admission_wait_s(self, temperature: float) -> float:
-        if temperature <= 0.0:
-            return 0.0
-        return env_float("TORCHINFERNO_OPENAI_TEMPERATURE_ADMISSION_WAIT_MS", 0.5, minimum=0.0) / 1000.0
+        del temperature
+        return env_float("TORCHINFERNO_OPENAI_ADMISSION_WAIT_MS", 0.5, minimum=0.0) / 1000.0
 
     def _has_multiple_live_requests(self) -> bool:
         with self._live_request_condition:
@@ -8136,52 +7421,12 @@ class OpenAICompletionEngine:
             and _is_tensor_parallel_model(self.model)
             and self.device.type == "cuda"
         ):
-            short_max_tokens = env_int("TORCHINFERNO_OPENAI_SHORT_STREAM_MAX_TOKENS", 256, minimum=1)
-            long_prompt_short_max_tokens = env_int(
-                "TORCHINFERNO_OPENAI_TP_LONG_PROMPT_SHORT_STREAM_MAX_TOKENS",
-                128,
+            stream_limit = env_int(
+                "TORCHINFERNO_OPENAI_TP_STREAM_MAX_BATCH_SIZE",
+                min(limit, 64),
                 minimum=1,
             )
-            long_prompt_min_tokens = env_int(
-                "TORCHINFERNO_OPENAI_TP_LONG_PROMPT_SHORT_STREAM_MIN_PROMPT_TOKENS",
-                96,
-                minimum=1,
-            )
-            if (
-                first.temperature <= 0.0
-                and first.max_tokens <= long_prompt_short_max_tokens
-                and len(first.prompt) >= long_prompt_min_tokens
-                and env_flag("TORCHINFERNO_OPENAI_TP_LONG_PROMPT_SHORT_STREAM_BATCH_CAP", False)
-            ):
-                long_prompt_limit = env_int(
-                    "TORCHINFERNO_OPENAI_TP_LONG_PROMPT_SHORT_STREAM_MAX_BATCH_SIZE",
-                    min(limit, 56),
-                    minimum=1,
-                )
-                return min(limit, long_prompt_limit)
-            if first.max_tokens <= short_max_tokens:
-                if first.temperature > 0.0:
-                    default_short_limit = env_int(
-                        "TORCHINFERNO_OPENAI_TP_SAMPLED_SHORT_STREAM_MAX_BATCH_SIZE",
-                        min(limit, 64),
-                        minimum=1,
-                    )
-                else:
-                    default_short_limit = 64
-                short_limit = env_int(
-                    "TORCHINFERNO_OPENAI_TP_SHORT_STREAM_MAX_BATCH_SIZE",
-                    min(limit, default_short_limit),
-                    minimum=1,
-                )
-                return min(limit, short_limit)
-            large_min_tokens = env_int("TORCHINFERNO_OPENAI_LARGE_STREAM_MIN_TOKENS", 512, minimum=1)
-            if first.temperature <= 0.0 and first.max_tokens >= large_min_tokens:
-                large_limit = env_int(
-                    "TORCHINFERNO_OPENAI_TP_LARGE_STREAM_MAX_BATCH_SIZE",
-                    min(limit, 32),
-                    minimum=1,
-                )
-                return min(limit, large_limit)
+            return min(limit, stream_limit)
         return limit
 
     def _drain_ready_requests(self, batch: list[_QueuedGeneration], *, limit: int | None = None) -> None:
@@ -8234,42 +7479,12 @@ class OpenAICompletionEngine:
                 deadline = time.perf_counter() + batch_wait_s
 
     def _queued_batch_wait_s(self, first: _QueuedGeneration) -> float:
-        if first.temperature <= 0.0:
-            deterministic_wait_s = self._queued_deterministic_stream_batch_wait_s(first)
-            if deterministic_wait_s is not None:
-                return deterministic_wait_s
-            return self.batch_wait_s
-        max_tokens = env_int("TORCHINFERNO_OPENAI_TEMPERATURE_BATCH_WAIT_MAX_TOKENS", 512, minimum=1)
-        if first.max_tokens > max_tokens:
-            return self.batch_wait_s
-        short_max_tokens = env_int("TORCHINFERNO_OPENAI_SHORT_STREAM_MAX_TOKENS", 256, minimum=1)
-        default_wait_ms = 1.0 if first.max_tokens <= short_max_tokens else 2.0
-        temperature_wait_s = (
-            env_float("TORCHINFERNO_OPENAI_TEMPERATURE_BATCH_WAIT_MS", default_wait_ms, minimum=0.0)
-            / 1000.0
+        del first
+        wait_ms = env_float(
+            "TORCHINFERNO_OPENAI_STREAM_BATCH_WAIT_MS",
+            0.0,
+            minimum=0.0,
         )
-        return max(self.batch_wait_s, temperature_wait_s)
-
-    def _queued_deterministic_stream_batch_wait_s(self, first: _QueuedGeneration) -> float | None:
-        if not (
-            first.stream
-            and _is_tensor_parallel_model(getattr(self, "model", None))
-            and getattr(self, "device", torch.device("cpu")).type == "cuda"
-        ):
-            return None
-        min_tokens = env_int(
-            "TORCHINFERNO_OPENAI_TP_GREEDY_LOW_LATENCY_MIN_TOKENS",
-            1,
-            minimum=1,
-        )
-        max_tokens = env_int(
-            "TORCHINFERNO_OPENAI_TP_GREEDY_LOW_LATENCY_MAX_TOKENS",
-            400,
-            minimum=min_tokens,
-        )
-        if not (min_tokens <= first.max_tokens <= max_tokens):
-            return None
-        wait_ms = env_float("TORCHINFERNO_OPENAI_TP_GREEDY_LOW_LATENCY_BATCH_WAIT_MS", 0.0, minimum=0.0)
         return wait_ms / 1000.0
 
     def _queued_initial_batch_wait_s(self, first: _QueuedGeneration) -> float:
@@ -8280,52 +7495,12 @@ class OpenAICompletionEngine:
             and self.device.type == "cuda"
         ):
             return 0.0
-        if first.temperature <= 0.0:
-            min_tokens = env_int(
-                "TORCHINFERNO_OPENAI_TP_GREEDY_LOW_LATENCY_MIN_TOKENS",
-                1,
-                minimum=1,
-            )
-            max_tokens = env_int(
-                "TORCHINFERNO_OPENAI_TP_GREEDY_LOW_LATENCY_MAX_TOKENS",
-                400,
-                minimum=min_tokens,
-            )
-            if not (min_tokens <= first.max_tokens <= max_tokens):
-                return 0.0
-            short_output_max_tokens = env_int(
-                "TORCHINFERNO_OPENAI_TP_GREEDY_SHORT_OUTPUT_INITIAL_BATCH_MAX_TOKENS",
-                128,
-                minimum=1,
-            )
-            default_wait_ms = (
-                env_float(
-                    "TORCHINFERNO_OPENAI_TP_GREEDY_SHORT_OUTPUT_INITIAL_BATCH_WAIT_MS",
-                    5.0,
-                    minimum=0.0,
-                )
-                if first.max_tokens <= short_output_max_tokens
-                else 5.0
-            )
-            wait_ms = env_float(
-                "TORCHINFERNO_OPENAI_TP_GREEDY_INITIAL_BATCH_WAIT_MS",
-                default_wait_ms,
-                minimum=0.0,
-            )
-            return min(self.batch_wait_s, wait_ms / 1000.0)
-        max_temperature_tokens = env_int("TORCHINFERNO_OPENAI_TEMPERATURE_BATCH_WAIT_MAX_TOKENS", 512, minimum=1)
-        if first.max_tokens > max_temperature_tokens:
-            return 0.0
-        short_max_tokens = env_int("TORCHINFERNO_OPENAI_SHORT_STREAM_MAX_TOKENS", 256, minimum=1)
-        if first.max_tokens <= short_max_tokens:
-            wait_ms = env_float(
-                "TORCHINFERNO_OPENAI_TP_SHORT_SAMPLED_INITIAL_BATCH_WAIT_MS",
-                1.0,
-                minimum=0.0,
-            )
-        else:
-            wait_ms = env_float("TORCHINFERNO_OPENAI_TP_SAMPLED_INITIAL_BATCH_WAIT_MS", 1.0, minimum=0.0)
-        return min(self._queued_batch_wait_s(first), wait_ms / 1000.0)
+        wait_ms = env_float(
+            "TORCHINFERNO_OPENAI_TP_INITIAL_BATCH_WAIT_MS",
+            1.0,
+            minimum=0.0,
+        )
+        return min(self.batch_wait_s, wait_ms / 1000.0)
 
     def _run_queued_batch(self, batch: list[_QueuedGeneration]) -> None:
         groups: dict[tuple[float, bool], list[_QueuedGeneration]] = {}
@@ -9722,9 +8897,6 @@ class OpenAICompletionEngine:
         if logits.size(0) == batch_size:
             next_token = _sample(self.model, logits[:, -1, :], 0.7).to(self.device)
             decode_input = next_token[:, None]
-        elif _shared_prefix_sample_enabled(0.7):
-            next_token = _sample(self.model, logits[:, -1, :], 0.7).to(self.device)
-            decode_input = next_token[:1, None]
         else:
             sample_logits = logits[:, -1, :].expand(batch_size, logits.size(-1)).contiguous()
             next_token = _sample(self.model, sample_logits, 0.7).to(self.device)
@@ -10034,14 +9206,6 @@ class OpenAICompletionEngine:
             return _runtime_prefill_graph_capture_enabled(model, temperature, max_tokens=max_tokens)
         if not env_flag("TORCHINFERNO_OPENAI_TP_SINGLE_RUNTIME_PREFILL_CAPTURE", False):
             return False
-        if temperature > 0.0 and not env_flag(
-            "TORCHINFERNO_OPENAI_TP_RUNTIME_TEMPERATURE_PREFILL_CAPTURE",
-            True,
-        ):
-            return False
-        token_limit = env_int("TORCHINFERNO_OPENAI_TP_RUNTIME_PREFILL_CAPTURE_MAX_TOKENS", 1024, minimum=1)
-        if max_tokens > token_limit:
-            return False
         layers = tuple(getattr(cache, "layers", ()) or ())
         max_seq_len = int(getattr(layers[0], "max_seq_len", 0)) if layers else 0
         key = (
@@ -10088,13 +9252,6 @@ class OpenAICompletionEngine:
                 if not env_flag("TORCHINFERNO_OPENAI_TP_SELECTED_LOGITS_PREFILL_CAPTURE", False):
                     return False
             else:
-                skip_max_tokens = env_int(
-                    "TORCHINFERNO_OPENAI_TP_SELECTED_LOGITS_PREFILL_CAPTURE_SKIP_MAX_TOKENS",
-                    128,
-                    minimum=0,
-                )
-                if max_tokens <= skip_max_tokens:
-                    return False
                 min_selected_batch = env_int(
                     "TORCHINFERNO_OPENAI_TP_SELECTED_LOGITS_PREFILL_CAPTURE_MIN_BATCH",
                     48,
@@ -10111,14 +9268,12 @@ class OpenAICompletionEngine:
             return False
         if input_ids.ndim != 2 or input_ids.size(0) <= 1 or input_ids.size(1) <= 1:
             return False
-        if temperature > 0.0 and not env_flag(
-            "TORCHINFERNO_OPENAI_TP_RUNTIME_TEMPERATURE_PREFILL_CAPTURE",
-            True,
-        ):
-            return False
-        token_limit = env_int("TORCHINFERNO_OPENAI_TP_RUNTIME_PREFILL_CAPTURE_MAX_TOKENS", 1024, minimum=1)
-        if max_tokens > token_limit:
-            return False
+        del max_tokens
+        seq_len_limit = env_int(
+            "TORCHINFERNO_OPENAI_TP_RUNTIME_PREFILL_CAPTURE_MAX_SEQ_LEN",
+            4096,
+            minimum=1,
+        )
         layers = tuple(getattr(cache, "layers", ()) or ())
         cache_seq_len = _generation_cache_seq_len_if_uniform(cache)
         if cache_seq_len is None:
@@ -10131,14 +9286,13 @@ class OpenAICompletionEngine:
                 return False
             layers = tuple(getattr(cache, "layers", ()) or ())
         max_seq_len = int(getattr(layers[0], "max_seq_len", 0)) if layers else 0
-        if max_seq_len <= 0 or max_seq_len > token_limit:
+        if max_seq_len <= 0 or max_seq_len > seq_len_limit:
             return False
         key = (
             int(input_ids.size(0)),
             int(input_ids.size(1)),
             cache_seq_len,
             max_seq_len,
-            temperature > 0.0,
             bool(selected_logits),
             str(self.device),
         )
@@ -10359,7 +9513,6 @@ class OpenAICompletionEngine:
         next_token = next_token.to(self.device)
         if cache_materialized:
             _repeat_generation_cache_first_batch(cache, decode_batch_size)
-        shared_sample = _shared_prefix_sample_enabled(temperature)
         per_row_limits = _normalize_row_max_tokens(row_max_tokens, batch_size, max_tokens)
         decode_row_limits = [*per_row_limits, *([0] * (decode_batch_size - batch_size))]
         active = [limit > 0 for limit in decode_row_limits]
@@ -10380,29 +9533,22 @@ class OpenAICompletionEngine:
             should_continue = _sync_tensor_parallel_continue(model, should_continue, next_token.device)
             if not should_continue:
                 break
-            if shared_sample:
+            uniform_token = _uniform_active_token_id(token_ids, active, batch_size)
+            if rows_share_state and uniform_token is not None:
                 ensure_cache_materialized()
-                next_token, cache = _decode_next_token(model, next_token[:1, None], cache, temperature)
-                next_token = next_token.expand(decode_batch_size).contiguous()
+                decode_input = next_token.new_tensor([[uniform_token]])
+                next_token, cache = _decode_repeated_prefix_next_token(
+                    model,
+                    decode_input,
+                    cache,
+                    decode_batch_size,
+                    temperature,
+                )
                 _repeat_generation_cache_first_batch(cache, decode_batch_size)
-                rows_share_state = True
             else:
-                uniform_token = _uniform_active_token_id(token_ids, active, batch_size)
-                if rows_share_state and uniform_token is not None:
-                    ensure_cache_materialized()
-                    decode_input = next_token.new_tensor([[uniform_token]])
-                    next_token, cache = _decode_repeated_prefix_next_token(
-                        model,
-                        decode_input,
-                        cache,
-                        decode_batch_size,
-                        temperature,
-                    )
-                    _repeat_generation_cache_first_batch(cache, decode_batch_size)
-                else:
-                    ensure_cache_materialized()
-                    next_token, cache = _decode_next_token(model, next_token[:, None], cache, temperature)
-                    rows_share_state = False
+                ensure_cache_materialized()
+                next_token, cache = _decode_next_token(model, next_token[:, None], cache, temperature)
+                rows_share_state = False
             next_token = next_token.to(self.device)
 
     def _stream_microbatch_size(self, batch_size: int) -> int:
@@ -14227,7 +13373,7 @@ def _openai_tp_symm_mem_prefill_allreduce_enabled(
     temperature: float,
     startup: bool = False,
 ) -> bool:
-    del temperature
+    del max_tokens, temperature
     global_env = "TORCHINFERNO_SYMM_MEM_ALLREDUCE"
     if global_env in os.environ and not env_flag(global_env, False):
         return False
@@ -14238,9 +13384,6 @@ def _openai_tp_symm_mem_prefill_allreduce_enabled(
     if openai_prefill_env in os.environ:
         return env_flag(openai_prefill_env, False)
     if not _openai_tp_symm_mem_allreduce_enabled(startup=startup):
-        return False
-    max_tokens_limit = env_int("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_MAX_TOKENS", 1024, minimum=1)
-    if max_tokens > max_tokens_limit:
         return False
     return env_flag("TORCHINFERNO_OPENAI_TP_SYMM_MEM_PREFILL_ALLREDUCE_DEFAULT", True)
 
@@ -14392,18 +13535,11 @@ def _tensor_parallel_symm_mem_allreduce_scope(
         or device.type != "cuda"
     ):
         return nullcontext()
-    max_tokens_limit = env_int("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_MAX_TOKENS", 1024, minimum=1)
     prefill_enabled = _openai_tp_symm_mem_prefill_allreduce_enabled(
         max_tokens=max_tokens,
         temperature=temperature,
         startup=startup,
     )
-    if max_tokens > max_tokens_limit:
-        return _tensor_parallel_symm_mem_allreduce_context(
-            None,
-            enabled=False,
-            prefill_enabled=prefill_enabled,
-        )
     if not _openai_tp_symm_mem_allreduce_enabled(startup=startup):
         return _tensor_parallel_symm_mem_allreduce_context(
             None,
@@ -14435,8 +13571,7 @@ def _tensor_parallel_prefill_graph_runtime_key_scope(
     # NCCL allreduce. The opt-in exists only for focused profiling: it lets a
     # run prove whether prepared prefill symm-mem buffers actually capture as
     # multimem_all_reduce before any default policy changes.
-    max_tokens_limit = env_int("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_MAX_TOKENS", 1024, minimum=1)
-    if max_tokens > max_tokens_limit or not _openai_tp_symm_mem_allreduce_enabled(startup=False):
+    if not _openai_tp_symm_mem_allreduce_enabled(startup=False):
         return _tensor_parallel_symm_mem_allreduce_context(
             None,
             enabled=False,
@@ -14504,13 +13639,9 @@ def _is_tensor_parallel_worker_model(model: object) -> bool:
 
 def _paged_kv_active_for(model: object, max_seq_len: int) -> bool:
     # Shared paged-KV decision (primary + TP worker MUST agree, so both call this
-    # with the same broadcast max_seq_len). Gated by the flag, the model having the
-    # paged forward, AND a LONG-CONTEXT threshold: paged decode only beats dense
-    # giant-page decode at long ctx (kernel bench: tie at <=1024, 1.5-3x at >=2048),
-    # while the dense path is the optimized one for short ctx (prefill graphs, prefix
-    # cache). So restrict paged to long-ctx workloads (multi_turn) -> short-ctx cells
-    # (few_shot/self_consistency/tree) stay on the unchanged dense path = zero
-    # regression risk; long-ctx gets the validated paged win. Default threshold 1024.
+    # with the same broadcast max_seq_len). Paged decode wins once the allocated
+    # context is large enough to offset its page-table overhead; dense KV remains
+    # cheaper below that capability threshold.
     if not env_flag("TORCHINFERNO_OPENAI_PAGED_KV", True):
         return False
     if not hasattr(model, "forward_decode_paged"):
@@ -14634,49 +13765,9 @@ def _runtime_prefill_graph_capture_enabled(
     *,
     max_tokens: int | None = None,
 ) -> bool:
+    del temperature, max_tokens
     if _is_tensor_parallel_model(model) and _tensor_parallel_world_size(model) > 1:
-        capture_env_set = "TORCHINFERNO_OPENAI_TP_RUNTIME_PREFILL_CAPTURE" in os.environ
-        if not env_flag("TORCHINFERNO_OPENAI_TP_RUNTIME_PREFILL_CAPTURE", True):
-            return False
-        if not capture_env_set and temperature > 0.0 and not env_flag(
-            "TORCHINFERNO_OPENAI_TP_RUNTIME_TEMPERATURE_PREFILL_CAPTURE",
-            True,
-        ):
-            return False
-        if max_tokens is not None:
-            short_max_tokens = env_int("TORCHINFERNO_OPENAI_SHORT_STREAM_MAX_TOKENS", 256, minimum=1)
-            sampled_skip_max_tokens = env_int(
-                "TORCHINFERNO_OPENAI_TP_TEMPERATURE_PREFILL_CAPTURE_SKIP_MAX_TOKENS",
-                max(short_max_tokens, 320),
-                minimum=1,
-            )
-            if (
-                not capture_env_set
-                and temperature > 0.0
-                and max_tokens <= sampled_skip_max_tokens
-                and not env_flag("TORCHINFERNO_OPENAI_TP_SHORT_TEMPERATURE_PREFILL_CAPTURE", False)
-            ):
-                return False
-            if not capture_env_set and temperature <= 0.0:
-                skip_min_tokens = env_int(
-                    "TORCHINFERNO_OPENAI_TP_DETERMINISTIC_PREFILL_CAPTURE_SKIP_MIN_TOKENS",
-                    1,
-                    minimum=1,
-                )
-                skip_max_tokens = env_int(
-                    "TORCHINFERNO_OPENAI_TP_DETERMINISTIC_PREFILL_CAPTURE_SKIP_MAX_TOKENS",
-                    256,
-                    minimum=skip_min_tokens,
-                )
-                if (
-                    skip_min_tokens <= max_tokens <= skip_max_tokens
-                    and not env_flag("TORCHINFERNO_OPENAI_TP_DETERMINISTIC_PREFILL_CAPTURE_IN_SKIP_WINDOW", False)
-                ):
-                    return False
-            token_limit = env_int("TORCHINFERNO_OPENAI_TP_RUNTIME_PREFILL_CAPTURE_MAX_TOKENS", 1024, minimum=1)
-            if max_tokens > token_limit:
-                return False
-        return True
+        return env_flag("TORCHINFERNO_OPENAI_TP_RUNTIME_PREFILL_CAPTURE", True)
     return True
 
 
@@ -14688,12 +13779,8 @@ def _identical_prompt_prefill_graph_capture_enabled(
 ) -> bool:
     if not _runtime_prefill_graph_capture_enabled(model, temperature, max_tokens=max_tokens):
         return False
-    if (
-        temperature > 0.0
-        and _is_tensor_parallel_model(model)
-        and _tensor_parallel_world_size(model) > 1
-    ):
-        return env_flag("TORCHINFERNO_OPENAI_TP_IDENTICAL_TEMPERATURE_PREFILL_CAPTURE", False)
+    if _is_tensor_parallel_model(model) and _tensor_parallel_world_size(model) > 1:
+        return env_flag("TORCHINFERNO_OPENAI_TP_IDENTICAL_PREFILL_CAPTURE", True)
     return True
 
 
@@ -14842,29 +13929,11 @@ def _tensor_parallel_shm_max_chunks() -> int:
 
 
 def _tensor_parallel_shm_command_mode() -> str:
-    return os.environ.get("TORCHINFERNO_OPENAI_TP_SHM_COMMAND_MODE", "sampled_online_step").strip().lower()
+    return os.environ.get("TORCHINFERNO_OPENAI_TP_SHM_COMMAND_MODE", "online").strip().lower()
 
 
 def _tensor_parallel_shm_note_payload(payload: Mapping[str, object]) -> None:
-    global _TENSOR_PARALLEL_SHM_ONLINE_STEP_ACTIVE
-
-    if str(payload.get("op", "")) != "online_start":
-        return
-    mode = _tensor_parallel_shm_command_mode()
-    if mode not in {"sampled_online_step", "sampled_step", "sampled_steps"}:
-        return
-    try:
-        temperature = float(payload.get("temperature", 0.0))
-        max_tokens = int(payload.get("max_tokens", 0))
-    except (TypeError, ValueError):
-        _TENSOR_PARALLEL_SHM_ONLINE_STEP_ACTIVE = False
-        return
-    sampled_max_tokens = env_int(
-        "TORCHINFERNO_OPENAI_TP_SHM_SAMPLED_STEP_MAX_TOKENS",
-        300,
-        minimum=1,
-    )
-    _TENSOR_PARALLEL_SHM_ONLINE_STEP_ACTIVE = temperature > 0.0 and 0 < max_tokens <= sampled_max_tokens
+    del payload
 
 
 def _tensor_parallel_shm_payload_allowed(payload: Mapping[str, object]) -> bool:
@@ -14872,16 +13941,10 @@ def _tensor_parallel_shm_payload_allowed(payload: Mapping[str, object]) -> bool:
     if mode in {"", "1", "true", "yes", "all"}:
         return True
     op = str(payload.get("op", ""))
-    if mode in {"online_step", "step", "steps"}:
+    if mode in {"online_step", "step", "steps", "sampled_online_step", "sampled_step", "sampled_steps"}:
         return op in {"online_step", "online_close", "stop", "cleanup"}
     if mode in {"online"}:
         return op.startswith("online_") or op in {"stop", "cleanup"}
-    if mode in {"sampled_online_step", "sampled_step", "sampled_steps"}:
-        if op == "online_start":
-            return _TENSOR_PARALLEL_SHM_ONLINE_STEP_ACTIVE
-        if op in {"online_step", "online_close"}:
-            return _TENSOR_PARALLEL_SHM_ONLINE_STEP_ACTIVE
-        return op in {"stop", "cleanup"}
     if mode in {"decode"}:
         return op in {
             "online_step",
@@ -16217,7 +15280,7 @@ def _tensor_parallel_worker_loop(engine: OpenAICompletionEngine) -> None:
                     temperature=temperature,
                     max_tokens=max_tokens,
                 )
-                greedy_large_mixed_prefix_reuse = _online_greedy_large_mixed_prefix_reuse_enabled(
+                mixed_prefix_reuse = _online_mixed_prefix_reuse_enabled(
                     temperature=temperature,
                     max_tokens=max_tokens,
                 )
@@ -16329,14 +15392,14 @@ def _tensor_parallel_worker_loop(engine: OpenAICompletionEngine) -> None:
                             temperature=temperature,
                             max_tokens=max_tokens,
                         ),
-                        greedy_large_mixed_prefix_reuse=greedy_large_mixed_prefix_reuse,
+                        mixed_prefix_reuse=mixed_prefix_reuse,
                         max_generation_tokens=max_tokens,
                     )
                 if worker_use_paged:
                     worker_shared_cache = None  # PagedEngine owns its own paged KV pool
                 else:
                     total_rows = max_active + prefix_rows
-                    worker_ragged_decode_cache_token_limit = _online_short_greedy_ragged_decode_cache_token_limit(
+                    worker_ragged_decode_cache_token_limit = _online_ragged_decode_cache_token_limit(
                         temperature=temperature,
                         max_tokens=max_tokens,
                         max_seq_len=max_seq_len,
@@ -16364,13 +15427,13 @@ def _tensor_parallel_worker_loop(engine: OpenAICompletionEngine) -> None:
                             worker_shared_cache = None
                     elif worker_shared_cache is not None:
                         # Mirror the primary: reset the REUSED persistent cache so its
-                        # stale (previous-benchmark) seq_len/KV does not corrupt the next
-                        # benchmark's first batch. Must match the primary exactly (TP).
+                        # stale seq_len/KV does not corrupt the next session's first
+                        # batch. This must match the primary exactly across TP ranks.
                         _reset_generation_cache(worker_shared_cache)
                     _set_generation_cache_ragged_decode_cache_token_limit(
                         worker_shared_cache,
                         worker_ragged_decode_cache_token_limit,
-                        min_batch=_online_short_greedy_ragged_decode_cache_token_min_batch(),
+                        min_batch=_online_ragged_decode_cache_token_min_batch(),
                     )
                 if worker_use_paged:
                     online_runtime_engine.start_online(
@@ -16978,9 +16041,6 @@ def _prefill_repeated_prefix_next_token(
     prefill_logits = _try_prefill_logits_graph(model, input_ids, cache, allow_capture=allow_capture)
     if prefill_logits is None:
         prefill_logits, cache = _forward(model, input_ids, cache)
-    if _shared_prefix_sample_enabled(temperature):
-        token = _sample(model, prefill_logits[:, -1, :], temperature)
-        return token.expand(batch_size).contiguous(), cache
     sample_repeated = getattr(model, "sample_repeated_next_token", None)
     if callable(sample_repeated):
         return sample_repeated(prefill_logits[:, -1, :], batch_size, temperature), cache
@@ -17008,9 +16068,6 @@ def _sample_repeated_prefix_logits(
     batch_size: int,
     temperature: float,
 ) -> Tensor:
-    if _shared_prefix_sample_enabled(temperature):
-        token = _sample(model, logits, temperature)
-        return token.expand(batch_size).contiguous()
     sample_repeated = getattr(model, "sample_repeated_next_token", None)
     if callable(sample_repeated):
         return sample_repeated(logits, batch_size, temperature)
@@ -17219,11 +16276,8 @@ def _record_openai_decode_profile(
         warn_optional_failure("openai.decode_profile", exc)
 
 
-_DECODE_GRAPH_BUCKETS = (1, 2, 4, 8, 16, 32, 48, 64)
-
-
 def _decode_graph_padded_batch(actual: int, max_batch: int) -> int:
-    for bucket in _DECODE_GRAPH_BUCKETS:
+    for bucket in _decode_batch_buckets(max_batch):
         if bucket >= actual:
             return min(bucket, max_batch)
     return min(actual, max_batch)
@@ -17308,6 +16362,7 @@ def _prefer_shared_prefix_padded_suffix_prefill(
     prompt_lengths: Sequence[int],
     max_tokens: int | None = None,
 ) -> bool:
+    del max_tokens
     if not env_flag("TORCHINFERNO_OPENAI_SHARED_PREFIX_PADDED_SUFFIX_PREFILL", True):
         return False
     min_groups = env_int("TORCHINFERNO_OPENAI_SHARED_PREFIX_PADDED_SUFFIX_MIN_GROUPS", 2, minimum=2)
@@ -17324,39 +16379,28 @@ def _prefer_shared_prefix_padded_suffix_prefill(
     return _shared_prefix_padded_suffix_padding_allowed(
         suffix_lengths,
         prefix_tokens=prefix_tokens,
-    ) or _short_output_shared_prefix_padded_suffix_padding_allowed(
+    ) or _large_batch_shared_prefix_padded_suffix_padding_allowed(
         suffix_lengths,
         prefix_tokens=prefix_tokens,
-        max_tokens=max_tokens,
     )
 
 
-def _short_output_shared_prefix_padded_suffix_padding_allowed(
+def _large_batch_shared_prefix_padded_suffix_padding_allowed(
     suffix_lengths: Sequence[int],
     *,
     prefix_tokens: int,
-    max_tokens: int | None,
 ) -> bool:
-    if not env_flag("TORCHINFERNO_OPENAI_SHORT_OUTPUT_PADDED_SUFFIX_PREFILL", True):
-        return False
-    if max_tokens is None:
-        return False
-    max_output_tokens = env_int(
-        "TORCHINFERNO_OPENAI_SHORT_OUTPUT_PADDED_SUFFIX_MAX_TOKENS",
-        128,
-        minimum=1,
-    )
-    if max_tokens > max_output_tokens:
+    if not env_flag("TORCHINFERNO_OPENAI_LARGE_BATCH_PADDED_SUFFIX_PREFILL", True):
         return False
     min_rows = env_int(
-        "TORCHINFERNO_OPENAI_SHORT_OUTPUT_PADDED_SUFFIX_MIN_ROWS",
+        "TORCHINFERNO_OPENAI_LARGE_BATCH_PADDED_SUFFIX_MIN_ROWS",
         48,
         minimum=1,
     )
     if len(suffix_lengths) < min_rows:
         return False
     min_prefix_tokens = env_int(
-        "TORCHINFERNO_OPENAI_SHORT_OUTPUT_PADDED_SUFFIX_MIN_PREFIX_TOKENS",
+        "TORCHINFERNO_OPENAI_LARGE_BATCH_PADDED_SUFFIX_MIN_PREFIX_TOKENS",
         64,
         minimum=0,
     )
@@ -17365,7 +16409,7 @@ def _short_output_shared_prefix_padded_suffix_padding_allowed(
     if not suffix_lengths or min(suffix_lengths) <= 0:
         return False
     max_suffix_tokens = env_int(
-        "TORCHINFERNO_OPENAI_SHORT_OUTPUT_PADDED_SUFFIX_MAX_SUFFIX_TOKENS",
+        "TORCHINFERNO_OPENAI_LARGE_BATCH_PADDED_SUFFIX_MAX_SUFFIX_TOKENS",
         96,
         minimum=1,
     )
@@ -17375,14 +16419,14 @@ def _short_output_shared_prefix_padded_suffix_padding_allowed(
     padded_suffix_tokens = len(suffix_lengths) * max(suffix_lengths)
     padding_tokens = padded_suffix_tokens - real_suffix_tokens
     max_padding_tokens = env_int(
-        "TORCHINFERNO_OPENAI_SHORT_OUTPUT_PADDED_SUFFIX_MAX_PADDING_TOKENS",
+        "TORCHINFERNO_OPENAI_LARGE_BATCH_PADDED_SUFFIX_MAX_PADDING_TOKENS",
         4096,
         minimum=0,
     )
     if padding_tokens > max_padding_tokens:
         return False
     max_padding_ratio = env_float(
-        "TORCHINFERNO_OPENAI_SHORT_OUTPUT_PADDED_SUFFIX_MAX_PADDING_RATIO",
+        "TORCHINFERNO_OPENAI_LARGE_BATCH_PADDED_SUFFIX_MAX_PADDING_RATIO",
         1.75,
         minimum=1.0,
     )
@@ -17967,13 +17011,6 @@ def _model_cache_only_prefill_min_tokens(model: object) -> int:
     return env_int("TORCHINFERNO_OPENAI_CACHE_ONLY_PREFILL_MIN_TOKENS", 1, minimum=1)
 
 
-def _shared_prefix_sample_enabled(temperature: float) -> bool:
-    return (
-        temperature > 0.0
-        and env_flag("TORCHINFERNO_OPENAI_PREFIX_CACHE_SHARED_SAMPLE")
-    )
-
-
 def _sampled_batch_shape_bucket_size(
     model: object,
     device: torch.device,
@@ -18158,7 +17195,9 @@ def _flashinfer_step_loop(
             next_token = int(next_tokens_cpu[i])
             new_sl = sl + step_q_lens[i]
             new_gen = gen + 1
-            max_tok = row_max_tokens[pidx] if pidx < len(row_max_tokens) else 256
+            if pidx >= len(row_max_tokens):
+                raise ValueError("row_max_tokens must match prompts")
+            max_tok = row_max_tokens[pidx]
 
             if next_token in stop_token_ids or new_gen >= max_tok:
                 if req is not None and not req.done:
@@ -18548,17 +17587,11 @@ def _copy_generation_cache_row(
 
 
 def _shared_prefix_ragged_cache_bulk_copy_allowed(prompt_count: int, *, max_tokens: int) -> bool:
+    del max_tokens
     if not env_flag("TORCHINFERNO_OPENAI_SHARED_PREFIX_RAGGED_CACHE_BULK_COPY", True):
         return False
     min_rows = env_int("TORCHINFERNO_OPENAI_SHARED_PREFIX_RAGGED_CACHE_BULK_MIN_ROWS", 48, minimum=1)
-    if prompt_count < min_rows:
-        return False
-    max_copy_tokens = env_int(
-        "TORCHINFERNO_OPENAI_SHARED_PREFIX_RAGGED_CACHE_BULK_MAX_TOKENS",
-        128,
-        minimum=0,
-    )
-    return max_copy_tokens <= 0 or max_tokens <= max_copy_tokens
+    return prompt_count >= min_rows
 
 
 def _copy_generation_cache_state_rows_padded(
@@ -18850,56 +17883,21 @@ def _try_decode_ragged_logits_graph(
 
 
 def _disable_tp_shared_prefix_ragged_decode_graph(model: object, *, max_tokens: int | None = None) -> bool:
+    del max_tokens
     if not (_is_tensor_parallel_model(model) and _tensor_parallel_world_size(model) > 1):
         return False
     if "TORCHINFERNO_OPENAI_TP_SHARED_PREFIX_RAGGED_CUDAGRAPH" in os.environ:
         return not env_flag("TORCHINFERNO_OPENAI_TP_SHARED_PREFIX_RAGGED_CUDAGRAPH", True)
-    if max_tokens is None:
-        return False
-    if "TORCHINFERNO_OPENAI_TP_SHARED_PREFIX_RAGGED_CUDAGRAPH_MAX_TOKENS" in os.environ:
-        max_graph_tokens = env_int(
-            "TORCHINFERNO_OPENAI_TP_SHARED_PREFIX_RAGGED_CUDAGRAPH_MAX_TOKENS",
-            128,
-            minimum=1,
-        )
-        return max_tokens > max_graph_tokens
-    disable_min_tokens = env_int(
-        "TORCHINFERNO_OPENAI_TP_SHARED_PREFIX_RAGGED_CUDAGRAPH_DISABLE_MIN_TOKENS",
-        0,
-        minimum=0,
-    )
-    return disable_min_tokens > 0 and max_tokens >= disable_min_tokens
+    return False
 
 
 def _disable_tp_shared_prefix_ragged_static_buckets(model: object, *, max_tokens: int | None = None) -> bool:
+    del max_tokens
     if not (_is_tensor_parallel_model(model) and _tensor_parallel_world_size(model) > 1):
         return False
     if "TORCHINFERNO_OPENAI_TP_SHARED_PREFIX_RAGGED_STATIC_BUCKETS" in os.environ:
         return not env_flag("TORCHINFERNO_OPENAI_TP_SHARED_PREFIX_RAGGED_STATIC_BUCKETS", True)
-    if max_tokens is None:
-        return False
-    if "TORCHINFERNO_OPENAI_TP_SHARED_PREFIX_RAGGED_STATIC_BUCKET_MAX_TOKENS" in os.environ:
-        max_bucket_tokens = env_int(
-            "TORCHINFERNO_OPENAI_TP_SHARED_PREFIX_RAGGED_STATIC_BUCKET_MAX_TOKENS",
-            128,
-            minimum=1,
-        )
-        return max_tokens > max_bucket_tokens
-    disable_min_tokens = env_int(
-        "TORCHINFERNO_OPENAI_TP_SHARED_PREFIX_RAGGED_STATIC_BUCKET_DISABLE_MIN_TOKENS",
-        80,
-        minimum=0,
-    )
-    disable_max_tokens = env_int(
-        "TORCHINFERNO_OPENAI_TP_SHARED_PREFIX_RAGGED_STATIC_BUCKET_DISABLE_MAX_TOKENS",
-        128,
-        minimum=0,
-    )
-    return (
-        disable_min_tokens > 0
-        and max_tokens >= disable_min_tokens
-        and (disable_max_tokens <= 0 or max_tokens <= disable_max_tokens)
-    )
+    return False
 
 
 def _set_shared_prefix_ragged_static_graph_bucket_mode(
@@ -19085,21 +18083,13 @@ def _runtime_ragged_decode_graph_capture_enabled(model: object, cache: object) -
 
 
 def _runtime_ragged_decode_graph_capture_allowed_for_request(model: object, *, max_tokens: int) -> bool:
+    del max_tokens
     if not (_is_tensor_parallel_model(model) and _tensor_parallel_world_size(model) > 1):
         return True
-    max_capture_tokens = env_int(
-        "TORCHINFERNO_OPENAI_RUNTIME_RAGGED_DECODE_CAPTURE_MAX_TOKENS",
-        128,
-        minimum=0,
+    return env_flag(
+        "TORCHINFERNO_OPENAI_RUNTIME_RAGGED_DECODE_CAPTURE_FOR_REQUESTS",
+        True,
     )
-    if max_capture_tokens > 0 and max_tokens <= max_capture_tokens:
-        return True
-    min_capture_tokens = env_int(
-        "TORCHINFERNO_OPENAI_RUNTIME_RAGGED_DECODE_CAPTURE_MIN_TOKENS",
-        512,
-        minimum=0,
-    )
-    return min_capture_tokens > 0 and max_tokens >= min_capture_tokens
 
 
 def _set_runtime_ragged_decode_graph_capture(cache: object, allow_capture: bool) -> None:
@@ -19310,6 +18300,201 @@ def config_from_args(args: argparse.Namespace) -> OpenAIServerConfig:
     )
 
 
+def _apply_tensor_parallel_serving_defaults(config: OpenAIServerConfig) -> None:
+    """Enable the validated CUDA TP path without classifying request shapes."""
+
+    if int(config.tensor_parallel_size) <= 1:
+        return
+    if str(config.llama_parallelism).lower() == "pipeline":
+        return
+    if _infer_model_kind(config) != "llama3" or not torch.cuda.is_available():
+        return
+
+    defaults = {
+        # One scheduler and graph path handles both prefill and decode. All
+        # choices below remain explicit env overrides for portability/debugging.
+        "TORCHINFERNO_CONTINUOUS_UNIFIED_FORWARD": "1",
+        "TORCHINFERNO_CONTINUOUS_TOKEN_BUCKET_FA3_UNIFIED": "1",
+        "TORCHINFERNO_CONTINUOUS_TOKEN_BUCKET_FA3_PREFILL": "1",
+        "TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SKIP_WARM_PREFIX_COPY": "1",
+        # Bound refill work and avoid interrupting an established decode wave on
+        # every arrival. The decision uses ready rows and generated progress.
+        "TORCHINFERNO_OPENAI_TP_ONLINE_PREFILL_TOKEN_BUDGET": "1024",
+        "TORCHINFERNO_OPENAI_TP_ONLINE_MIN_GENERATION_CAPACITY": "128",
+        "TORCHINFERNO_OPENAI_TP_ONLINE_SESSION_PROMPT_HEADROOM_TOKENS": "64",
+        "TORCHINFERNO_CONTINUOUS_ADMIT_PER_STEP_CAP": "48",
+        "TORCHINFERNO_CONTINUOUS_ADMIT_MIN_READY_REQUESTS": "4",
+        "TORCHINFERNO_CONTINUOUS_ADMIT_MIN_FREE_ROWS": "2",
+        "TORCHINFERNO_CONTINUOUS_ADMIT_PREFILL_COST_PRIORITY": "1",
+        "TORCHINFERNO_CONTINUOUS_ADMIT_SUSTAINED_MIN_GENERATED": "3",
+        "TORCHINFERNO_CONTINUOUS_ADMIT_SUSTAINED_MIN_ACTIVE_PCT": "50",
+        "TORCHINFERNO_CONTINUOUS_ADMIT_SUSTAINED_MIN_STEP_INTERVAL": "2",
+        "TORCHINFERNO_OPENAI_TP_ONLINE_INITIAL_BATCH_WAIT_MS": "1",
+        "TORCHINFERNO_OPENAI_TP_ONLINE_IDLE_BATCH_WAIT_MS": "2",
+        "TORCHINFERNO_OPENAI_TP_ONLINE_ACTIVE_READY_WAIT_MS": "0",
+        "TORCHINFERNO_OPENAI_TP_ONLINE_COLLECT_IDLE_ARRIVALS": "0",
+        "TORCHINFERNO_OPENAI_TP_ONLINE_PERSISTENT_IDLE_MS": "1000",
+        "TORCHINFERNO_OPENAI_TP_ONLINE_PREFILL_READY_BEFORE_DECODE": "1",
+        "TORCHINFERNO_OPENAI_TP_ONLINE_PREFILL_READY_ACTIVE_CAP": "8",
+        # A one-step command keeps streaming latency visible while persistent GPU
+        # state and combined submit/step commands remove the old host overhead.
+        "TORCHINFERNO_OPENAI_TP_ONLINE_DECODE_QUANTUM": "1",
+        "TORCHINFERNO_OPENAI_TP_ONLINE_DRAIN_DECODE_QUANTUM": "1",
+        "TORCHINFERNO_OPENAI_TP_ONLINE_STEP_SYNC": "0",
+        "TORCHINFERNO_OPENAI_TP_ONLINE_SUBMIT_STEP_COMMAND": "1",
+        "TORCHINFERNO_OPENAI_TP_SHM_COMMAND_MODE": "online",
+        "TORCHINFERNO_SHM_POLL_YIELD_INTERVAL": "100000",
+        # Hopper's FP8 tensor-core path is applied uniformly by tensor shape;
+        # QKV prefill remains disabled by its separate model-side default.
+        "TORCHINFERNO_OPENAI_TP_ONLINE_FP8_PREFILL": "1",
+        "TORCHINFERNO_OPENAI_TP_ONLINE_FP8_PREFILL_MIN_M": "1",
+        "TORCHINFERNO_CONTINUOUS_TOKEN_BUCKET_FA3_FP8_MIN_M": "1",
+        "TORCHINFERNO_FP8_DECODE": "1",
+        "TORCHINFERNO_FP8_PER_TOKEN_SCALE": "1",
+        "TORCHINFERNO_FP8_QKV": "1",
+        "TORCHINFERNO_FP8_LM_HEAD": "1",
+        # Fuse prefill RMSNorm with per-token quantization for the gate/up
+        # projection. The analogous SwiGLU fusion is slower at Llama-70B's
+        # tensor-parallel intermediate width and remains independently gated.
+        "TORCHINFERNO_FP8_FUSED_ACTIVATIONS": "1",
+        "TORCHINFERNO_FP8_FUSED_ACTIVATIONS_DECODE": "1",
+        "TORCHINFERNO_FP8_FUSED_SWIGLU_DECODE": "0",
+        # The H100 streaming decode kernel is launch-bound at the short and
+        # medium contexts used by online traffic. A 128-token tile wins over
+        # 64 at both 128- and 512-token measured contexts; 256 spills enough
+        # work to regress sharply.
+        "TORCHINFERNO_TRITON_STREAMING_DECODE_ATTENTION_BLOCK_S": "128",
+        "TORCHINFERNO_FP8_FUSED_SWIGLU_PREFILL": "0",
+        # Hopper's fast FP8 accumulator is measurably faster once a mixed
+        # prefill reaches 129 rows. Smaller decode-shaped GEMMs retain the
+        # more accurate accumulator and the faster SGLang kernel path.
+        "TORCHINFERNO_FP8_PREFILL_FAST_ACCUM": "1",
+        "TORCHINFERNO_FP8_PREFILL_FAST_ACCUM_MIN_ROWS": "129",
+        "TORCHINFERNO_SYMM_MEM_PREFILL_GRAPH_ALLREDUCE": "1",
+        # The multi-step graph has not beaten the persistent one-step path.
+        "TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY": "0",
+        "TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY_GRAPH": "0",
+    }
+    for name, value in defaults.items():
+        os.environ.setdefault(name, value)
+
+
+def _parse_cpu_set(spec: str) -> set[int]:
+    cpus: set[int] = set()
+    for part in spec.split(","):
+        bounds = part.strip().split("-", 1)
+        if not bounds or not bounds[0]:
+            continue
+        start = int(bounds[0])
+        end = int(bounds[-1])
+        if start < 0 or end < start:
+            raise ValueError("invalid CPU range")
+        cpus.update(range(start, end + 1))
+    return cpus
+
+
+def _read_int_file(path: str) -> int:
+    with open(path, encoding="ascii") as handle:
+        return int(handle.read().strip())
+
+
+def _cuda_device_numa_node(device_index: int) -> int | None:
+    try:
+        props = torch.cuda.get_device_properties(device_index)
+        domain = int(getattr(props, "pci_domain_id"))
+        bus = int(getattr(props, "pci_bus_id"))
+        device = int(getattr(props, "pci_device_id"))
+        path = f"/sys/bus/pci/devices/{domain:04x}:{bus:02x}:{device:02x}.0/numa_node"
+        node = _read_int_file(path)
+        return node if node >= 0 else None
+    except (AttributeError, OSError, TypeError, ValueError):
+        return None
+
+
+def _automatic_tensor_parallel_cpu_set(
+    local_rank: int,
+    local_world_size: int,
+    allowed: set[int],
+) -> set[int]:
+    rank_nodes = [_cuda_device_numa_node(rank) for rank in range(local_world_size)]
+    node = rank_nodes[local_rank]
+    if node is None:
+        return set()
+    ranks_on_node = [rank for rank, rank_node in enumerate(rank_nodes) if rank_node == node]
+    rank_position = ranks_on_node.index(local_rank)
+    try:
+        with open(f"/sys/devices/system/node/node{node}/cpulist", encoding="ascii") as handle:
+            node_cpus = _parse_cpu_set(handle.read().strip()) & allowed
+    except (OSError, ValueError):
+        return set()
+    if not node_cpus:
+        return set()
+
+    sibling_groups: dict[tuple[int, int], set[int]] = {}
+    for cpu in sorted(node_cpus):
+        try:
+            package = _read_int_file(
+                f"/sys/devices/system/cpu/cpu{cpu}/topology/physical_package_id"
+            )
+            core = _read_int_file(f"/sys/devices/system/cpu/cpu{cpu}/topology/core_id")
+        except (OSError, ValueError):
+            continue
+        sibling_groups.setdefault((package, core), set()).add(cpu)
+    groups = sorted(sibling_groups.values(), key=lambda group: min(group))
+    if not groups:
+        return set()
+
+    requested = env_int(
+        "TORCHINFERNO_OPENAI_TP_CPU_CORES_PER_RANK",
+        8,
+        minimum=1,
+    )
+    cores_per_rank = min(requested, max(1, len(groups) // len(ranks_on_node)))
+    start = rank_position * cores_per_rank
+    selected_groups = groups[start : start + cores_per_rank]
+    if len(selected_groups) < cores_per_rank:
+        return set()
+    return set().union(*selected_groups)
+
+
+def _apply_tensor_parallel_cpu_affinity() -> None:
+    """Bind each local TP rank to a compact, NUMA-local set of physical cores."""
+
+    local_rank_raw = os.environ.get("LOCAL_RANK")
+    local_world_size_raw = os.environ.get("LOCAL_WORLD_SIZE")
+    if (
+        local_rank_raw is None
+        or local_world_size_raw is None
+        or not hasattr(os, "sched_setaffinity")
+    ):
+        return
+    try:
+        local_rank = int(local_rank_raw)
+        local_world_size = int(local_world_size_raw)
+        if local_world_size <= 1 or local_rank < 0 or local_rank >= local_world_size:
+            return
+        allowed = set(os.sched_getaffinity(0))
+        spec = os.environ.get("TORCHINFERNO_OPENAI_TP_CPU_AFFINITY", "").strip()
+        if spec:
+            rank_specs = [part.strip() for part in spec.split(";")]
+            if local_rank >= len(rank_specs):
+                raise ValueError("affinity map does not include the local rank")
+            selected = _parse_cpu_set(rank_specs[local_rank]) & allowed
+        elif env_flag("TORCHINFERNO_OPENAI_TP_AUTO_CPU_AFFINITY", True):
+            selected = _automatic_tensor_parallel_cpu_set(
+                local_rank,
+                local_world_size,
+                allowed,
+            )
+        else:
+            return
+        if not selected:
+            raise ValueError("CPU set does not intersect the process affinity")
+        os.sched_setaffinity(0, selected)
+    except (OSError, TypeError, ValueError) as exc:
+        warn_optional_failure("tensor-parallel CPU affinity", exc)
+
+
 def _tensor_parallel_symm_mem_allreduce_probe_batches(max_batch: int) -> tuple[int, ...]:
     configured = os.environ.get("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_PROBE_BATCHES")
     if configured is not None:
@@ -19376,9 +18561,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     config = config_from_args(args)
+    _apply_tensor_parallel_serving_defaults(config)
     original_argv = tuple(sys.argv[1:] if argv is None else argv)
     if _should_reexec_distributed_server(config):
         _reexec_distributed_server(config, original_argv)
+    _apply_tensor_parallel_cpu_affinity()
     serve(config)
     return 0
 

@@ -110,7 +110,7 @@ def _write_inference_bench_run(tmp_path) -> None:
         "runtime_cache_backend": "dense",
         "runtime_max_active_requests": 96,
         "runtime_prefix_cache_capacity": 128,
-        "greedy_large_mixed_prefix_reuse": True,
+        "mixed_prefix_reuse": True,
         "fp8_prefill_enabled": True,
         "fp8_prefill_min_m": 512,
         "marlin_int4_decode_enabled": True,

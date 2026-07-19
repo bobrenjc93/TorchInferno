@@ -14,7 +14,10 @@ from torchinferno.runtime.serving import (
     _ReusablePrefix,
     _dynamic_prefix_prefill_context_len,
     _dynamic_prefix_prefill_max_suffix_for_policy,
-    _greedy_large_mixed_prefix_reuse_policy_enabled,
+    _mixed_prefix_reuse_policy_enabled,
+    _packed_token_capacity_with_savings,
+    _token_bucket_fa3_batch_capacities,
+    _token_bucket_fa3_batch_capacity,
 )
 
 
@@ -35,6 +38,33 @@ def _next_online_events(engine: ContinuousBatchEngine, *, limit: int = 100) -> l
     raise AssertionError("online engine did not emit events")
 
 
+def test_packed_token_capacity_requires_less_work_than_dense_prefill() -> None:
+    assert _packed_token_capacity_with_savings(54, 64) == 56
+    assert _packed_token_capacity_with_savings(64, 64) is None
+    assert _packed_token_capacity_with_savings(100, 128) is None
+    assert _packed_token_capacity_with_savings(96, 128) == 96
+
+
+def test_token_bucket_fa3_batch_capacity_tracks_runtime_occupancy(monkeypatch) -> None:
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_TOKEN_BUCKET_FA3_BATCH_CAPACITY", "64")
+    monkeypatch.delenv(
+        "TORCHINFERNO_CONTINUOUS_TOKEN_BUCKET_FA3_BATCH_CAPACITIES",
+        raising=False,
+    )
+
+    assert _token_bucket_fa3_batch_capacities() == (32, 64)
+    assert _token_bucket_fa3_batch_capacity(1) == 32
+    assert _token_bucket_fa3_batch_capacity(32) == 32
+    assert _token_bucket_fa3_batch_capacity(33) == 64
+    assert _token_bucket_fa3_batch_capacity(65) is None
+
+    monkeypatch.setenv(
+        "TORCHINFERNO_CONTINUOUS_TOKEN_BUCKET_FA3_BATCH_CAPACITIES",
+        "8,24",
+    )
+    assert _token_bucket_fa3_batch_capacities() == (8, 24, 64)
+
+
 def test_dynamic_prefix_prefill_context_len_buckets_when_enabled(monkeypatch) -> None:
     monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_DYNAMIC_PREFIX_PREFILL_GRAPH", raising=False)
     monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_DYNAMIC_PREFIX_PREFILL_MIN_CONTEXT", raising=False)
@@ -53,64 +83,41 @@ def test_dynamic_prefix_prefill_context_len_buckets_when_enabled(monkeypatch) ->
     assert _dynamic_prefix_prefill_context_len(250, 16, max_seq_len=260) == 266
 
 
-def test_dynamic_prefix_prefill_policy_extends_short_greedy_suffixes(monkeypatch) -> None:
+def test_dynamic_prefix_prefill_policy_is_request_agnostic(monkeypatch) -> None:
     monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_DYNAMIC_PREFIX_PREFILL_GRAPH", raising=False)
     monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_DYNAMIC_PREFIX_PREFILL_MAX_SUFFIX", raising=False)
-    monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_DYNAMIC_PREFIX_PREFILL_GREEDY_SHORT_MAX_TOKENS", raising=False)
-    monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_DYNAMIC_PREFIX_PREFILL_GREEDY_SHORT_MAX_SUFFIX", raising=False)
-    monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_DYNAMIC_PREFIX_PREFILL_GREEDY_LARGE_MIN_TOKENS", raising=False)
-    monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_DYNAMIC_PREFIX_PREFILL_GREEDY_LARGE_MAX_TOKENS", raising=False)
-    monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_DYNAMIC_PREFIX_PREFILL_GREEDY_LARGE_MAX_SUFFIX", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_DYNAMIC_PREFIX_PREFILL_DEFAULT_MAX_SUFFIX", raising=False)
 
-    short_suffix = _dynamic_prefix_prefill_max_suffix_for_policy(0.0, 82)
-    assert short_suffix == 128
-    assert (
-        _dynamic_prefix_prefill_context_len(
-            111,
-            128,
-            max_seq_len=512,
-            max_dynamic_suffix=short_suffix,
-        )
-        == -256
-    )
-
-    large_suffix = _dynamic_prefix_prefill_max_suffix_for_policy(0.0, 512)
-    assert large_suffix == 32
+    assert _dynamic_prefix_prefill_max_suffix_for_policy(0.0, 1) == 32
+    assert _dynamic_prefix_prefill_max_suffix_for_policy(0.7, 997) == 32
     assert (
         _dynamic_prefix_prefill_context_len(
             111,
             32,
             max_seq_len=512,
-            max_dynamic_suffix=large_suffix,
+            max_dynamic_suffix=32,
         )
         == -256
     )
     assert _dynamic_prefix_prefill_context_len(111, 128, max_seq_len=512) == 239
-    assert _dynamic_prefix_prefill_max_suffix_for_policy(0.0, 256) is None
-    sampled_suffix = _dynamic_prefix_prefill_max_suffix_for_policy(0.7, 82)
-    assert sampled_suffix == 0
-    assert (
-        _dynamic_prefix_prefill_context_len(
-            45,
-            16,
-            max_seq_len=512,
-            max_dynamic_suffix=sampled_suffix,
-        )
-        == 61
-    )
+
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_DYNAMIC_PREFIX_PREFILL_DEFAULT_MAX_SUFFIX", "64")
+    assert _dynamic_prefix_prefill_max_suffix_for_policy(0.0, 1) == 64
+    assert _dynamic_prefix_prefill_max_suffix_for_policy(0.7, 997) == 64
 
     monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_DYNAMIC_PREFIX_PREFILL_MAX_SUFFIX", "64")
-    assert _dynamic_prefix_prefill_max_suffix_for_policy(0.0, 82) is None
-    assert _dynamic_prefix_prefill_max_suffix_for_policy(0.7, 82) is None
+    assert _dynamic_prefix_prefill_max_suffix_for_policy(0.0, 1) is None
+    assert _dynamic_prefix_prefill_max_suffix_for_policy(0.7, 997) is None
     assert _dynamic_prefix_prefill_context_len(111, 64, max_seq_len=512) == -256
     assert _dynamic_prefix_prefill_context_len(111, 128, max_seq_len=512) == 239
 
 
-def test_greedy_large_mixed_prefix_reuse_policy_is_explicit_opt_in(monkeypatch) -> None:
+def test_mixed_prefix_reuse_policy_is_explicit_opt_in(monkeypatch) -> None:
     for env_name in (
+        "TORCHINFERNO_CONTINUOUS_MIXED_PREFIX_REUSE",
         "TORCHINFERNO_CONTINUOUS_GREEDY_LARGE_MIXED_PREFIX_REUSE",
         "TORCHINFERNO_CONTINUOUS_GREEDY_LARGE_MIXED_PREFIX_REUSE_MAX_TOKENS",
-        "TORCHINFERNO_CONTINUOUS_PINNED_FULL_PROMPT_STORE_MIN_MAX_TOKENS",
+        "TORCHINFERNO_CONTINUOUS_PINNED_FULL_PROMPT_STORE",
         "TORCHINFERNO_CONTINUOUS_MIXED_PREFIX_PREFILL",
         "TORCHINFERNO_CONTINUOUS_MIXED_PREFIX_DYNAMIC_CONTEXT",
         "TORCHINFERNO_CONTINUOUS_MIXED_PREFIX_LONG_SUFFIX_COMMON_FALLBACK",
@@ -121,15 +128,15 @@ def test_greedy_large_mixed_prefix_reuse_policy_is_explicit_opt_in(monkeypatch) 
     ):
         monkeypatch.delenv(env_name, raising=False)
 
-    assert not _greedy_large_mixed_prefix_reuse_policy_enabled(0.0, 512)
-    assert not _greedy_large_mixed_prefix_reuse_policy_enabled(0.0, 256)
-    assert not _greedy_large_mixed_prefix_reuse_policy_enabled(0.7, 512)
-    assert not _greedy_large_mixed_prefix_reuse_policy_enabled(0.0, None)
+    assert not _mixed_prefix_reuse_policy_enabled(0.0, 512)
+    assert not _mixed_prefix_reuse_policy_enabled(0.0, 256)
+    assert not _mixed_prefix_reuse_policy_enabled(0.7, 512)
+    assert not _mixed_prefix_reuse_policy_enabled(0.0, None)
 
-    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_GREEDY_LARGE_MIXED_PREFIX_REUSE", "1")
-    assert _greedy_large_mixed_prefix_reuse_policy_enabled(0.0, 512)
-    assert not _greedy_large_mixed_prefix_reuse_policy_enabled(0.0, 256)
-    assert not _greedy_large_mixed_prefix_reuse_policy_enabled(0.7, 512)
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_MIXED_PREFIX_REUSE", "1")
+    assert _mixed_prefix_reuse_policy_enabled(0.0, 512)
+    assert _mixed_prefix_reuse_policy_enabled(0.0, 256)
+    assert _mixed_prefix_reuse_policy_enabled(0.7, 512)
 
     engine = ContinuousBatchEngine(
         _RaggedGraphToyModel(),
@@ -147,7 +154,7 @@ def test_greedy_large_mixed_prefix_reuse_policy_is_explicit_opt_in(monkeypatch) 
     assert engine._non_common_prefix_graph_prefill_enabled()
     assert engine._mixed_prefix_prefill_graph_enabled()
     assert engine._allow_pinned_full_prompt_store(ServingRequest("large", (1,), 512))
-    assert not engine._allow_pinned_full_prompt_store(ServingRequest("short", (1,), 256))
+    assert engine._allow_pinned_full_prompt_store(ServingRequest("short", (1,), 256))
     assert not engine._prefix_prefill_capture_on_miss(32)
 
     sampled = ContinuousBatchEngine(
@@ -158,12 +165,12 @@ def test_greedy_large_mixed_prefix_reuse_policy_is_explicit_opt_in(monkeypatch) 
         max_active_requests=2,
         prefix_cache_capacity=2,
     )
-    assert not sampled._mixed_prefix_prefill_enabled()
+    assert sampled._mixed_prefix_prefill_enabled()
 
     monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_MIXED_PREFIX_PREFILL", "0")
     assert not engine._mixed_prefix_prefill_enabled()
-    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_GREEDY_LARGE_MIXED_PREFIX_REUSE", "0")
-    assert not _greedy_large_mixed_prefix_reuse_policy_enabled(0.0, 512)
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_MIXED_PREFIX_REUSE", "0")
+    assert not _mixed_prefix_reuse_policy_enabled(0.0, 512)
     monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_CAPTURE_ON_MISS", "1")
     assert engine._prefix_prefill_capture_on_miss(32)
 
@@ -177,7 +184,7 @@ def test_continuous_batch_engine_ragged_decode_bucket_sizes(monkeypatch) -> None
     )
     default_engine._free_active_rows = list(reversed(range(64)))
     default_rows = default_engine._ragged_decode_bucket_rows(list(range(47)))
-    assert len(default_rows) == 64
+    assert len(default_rows) == 48
 
     monkeypatch.setenv(
         "TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_BUCKET_SIZES",
@@ -200,7 +207,7 @@ def test_continuous_batch_engine_ragged_decode_bucket_sizes(monkeypatch) -> None
 def test_continuous_batch_engine_accepts_explicit_mixed_prefix_policy(monkeypatch) -> None:
     for env_name in (
         "TORCHINFERNO_CONTINUOUS_GREEDY_LARGE_MIXED_PREFIX_REUSE",
-        "TORCHINFERNO_CONTINUOUS_PINNED_FULL_PROMPT_STORE_MIN_MAX_TOKENS",
+        "TORCHINFERNO_CONTINUOUS_PINNED_FULL_PROMPT_STORE",
         "TORCHINFERNO_CONTINUOUS_MIXED_PREFIX_PREFILL",
         "TORCHINFERNO_CONTINUOUS_MIXED_PREFIX_DYNAMIC_CONTEXT",
         "TORCHINFERNO_CONTINUOUS_MIXED_PREFIX_LONG_SUFFIX_COMMON_FALLBACK",
@@ -218,7 +225,7 @@ def test_continuous_batch_engine_accepts_explicit_mixed_prefix_policy(monkeypatc
         max_active_requests=2,
         prefix_cache_capacity=2,
         pin_shared_prefix=True,
-        greedy_large_mixed_prefix_reuse=True,
+        mixed_prefix_reuse=True,
     )
 
     assert engine._mixed_prefix_prefill_enabled()
@@ -231,143 +238,67 @@ def test_continuous_batch_engine_accepts_explicit_mixed_prefix_policy(monkeypatc
 
 def test_continuous_prefix_prefill_suffix_buckets_can_be_configured(monkeypatch) -> None:
     monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SUFFIX_BUCKETS", raising=False)
-    monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SUFFIX_BUCKETS_GREEDY_LARGE", raising=False)
-    monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SUFFIX_BUCKETS_SAMPLED_MEDIUM", raising=False)
-    monkeypatch.delenv(
-        "TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SUFFIX_BUCKETS_GREEDY_LARGE_MIN_TOKENS",
-        raising=False,
-    )
-    monkeypatch.delenv(
-        "TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SUFFIX_BUCKETS_GREEDY_LARGE_MAX_TOKENS",
-        raising=False,
-    )
-    monkeypatch.delenv(
-        "TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SUFFIX_BUCKETS_SAMPLED_MEDIUM_MIN_TOKENS",
-        raising=False,
-    )
-    monkeypatch.delenv(
-        "TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SUFFIX_BUCKETS_SAMPLED_MEDIUM_MAX_TOKENS",
-        raising=False,
-    )
-    engine = ContinuousBatchEngine(object(), device=torch.device("cpu"))
-
-    assert engine._suffix_bucket(65) == 128
-
-    large_greedy_engine = ContinuousBatchEngine(
-        object(),
-        device=torch.device("cpu"),
-        temperature=0.0,
-        max_generation_tokens=512,
-    )
-    assert large_greedy_engine._suffix_bucket(65) == 80
-    assert large_greedy_engine._suffix_bucket(97) == 112
-    assert large_greedy_engine._suffix_bucket(129) == 144
-    assert large_greedy_engine._suffix_bucket(145) == 160
-    assert large_greedy_engine._suffix_bucket(225) == 256
-    assert large_greedy_engine._suffix_bucket(257) == 512
-
-    short_greedy_engine = ContinuousBatchEngine(
-        object(),
-        device=torch.device("cpu"),
-        temperature=0.0,
-        max_generation_tokens=128,
-    )
-    assert short_greedy_engine._suffix_bucket(65) == 96
-
-    sampled_engine = ContinuousBatchEngine(
-        object(),
-        device=torch.device("cpu"),
-        temperature=0.7,
-        max_generation_tokens=512,
-    )
-    assert sampled_engine._suffix_bucket(65) == 128
-    sampled_medium_engine = ContinuousBatchEngine(
-        object(),
-        device=torch.device("cpu"),
-        temperature=0.7,
-        max_generation_tokens=300,
-    )
-    assert sampled_medium_engine._suffix_bucket(10) == 12
-    assert sampled_medium_engine._suffix_bucket(12) == 12
-    assert sampled_medium_engine._suffix_bucket(13) == 16
-    assert sampled_medium_engine._suffix_bucket(17) == 32
+    monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_DEFAULT_SUFFIX_BUCKETS", raising=False)
+    engines = [
+        ContinuousBatchEngine(object(), device=torch.device("cpu")),
+        ContinuousBatchEngine(
+            object(),
+            device=torch.device("cpu"),
+            temperature=0.0,
+            max_generation_tokens=1,
+        ),
+        ContinuousBatchEngine(
+            object(),
+            device=torch.device("cpu"),
+            temperature=0.7,
+            max_generation_tokens=997,
+        ),
+    ]
+    for engine in engines:
+        assert engine._suffix_bucket(10) == 12
+        assert engine._suffix_bucket(65) == 96
+        assert engine._suffix_bucket(97) == 128
+        assert engine._suffix_bucket(129) == 256
+        assert engine._suffix_bucket(257) == 512
 
     monkeypatch.setenv(
         "TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SUFFIX_BUCKETS",
         "16,32,64,96,128,160",
     )
-    assert engine._suffix_bucket(65) == 96
-    assert engine._suffix_bucket(129) == 160
-    assert engine._suffix_bucket(161) == 256
+    assert engines[0]._suffix_bucket(65) == 96
+    assert engines[0]._suffix_bucket(129) == 160
+    assert engines[0]._suffix_bucket(161) == 256
 
 
 def test_continuous_prefix_prefill_batch_buckets_can_be_configured(monkeypatch) -> None:
     monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_BATCH_BUCKETS", raising=False)
-    monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_BATCH_BUCKETS_GREEDY_SHORT", raising=False)
-    monkeypatch.delenv(
-        "TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_BATCH_BUCKETS_GREEDY_SHORT_MIN_TOKENS",
-        raising=False,
-    )
-    monkeypatch.delenv(
-        "TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_BATCH_BUCKETS_GREEDY_SHORT_MAX_TOKENS",
-        raising=False,
-    )
-    monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_BATCH_BUCKETS_SAMPLED_MEDIUM", raising=False)
-    monkeypatch.delenv(
-        "TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_BATCH_BUCKETS_SAMPLED_MEDIUM_MIN_TOKENS",
-        raising=False,
-    )
-    monkeypatch.delenv(
-        "TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_BATCH_BUCKETS_SAMPLED_MEDIUM_MAX_TOKENS",
-        raising=False,
-    )
-    engine = ContinuousBatchEngine(object(), device=torch.device("cpu"), max_active_requests=64)
-
-    assert engine._prefill_batch_bucket(17) == 32
-
-    greedy_short_engine = ContinuousBatchEngine(
-        object(),
-        device=torch.device("cpu"),
-        temperature=0.0,
-        max_generation_tokens=96,
-        max_active_requests=64,
-    )
-    assert greedy_short_engine._prefill_batch_bucket(17) == 24
-    assert greedy_short_engine._prefill_batch_bucket(25) == 32
-
-    greedy_mid_engine = ContinuousBatchEngine(
-        object(),
-        device=torch.device("cpu"),
-        temperature=0.0,
-        max_generation_tokens=256,
-        max_active_requests=64,
-    )
-    assert greedy_mid_engine._prefill_batch_bucket(17) == 32
-
-    sampled_medium_engine = ContinuousBatchEngine(
-        object(),
-        device=torch.device("cpu"),
-        temperature=0.7,
-        max_generation_tokens=300,
-        max_active_requests=32,
-    )
-    assert sampled_medium_engine._prefill_batch_bucket(17) == 24
-    assert sampled_medium_engine._prefill_batch_bucket(25) == 32
-
-    sampled_short_engine = ContinuousBatchEngine(
-        object(),
-        device=torch.device("cpu"),
-        temperature=0.7,
-        max_generation_tokens=256,
-        max_active_requests=32,
-    )
-    assert sampled_short_engine._prefill_batch_bucket(17) == 32
+    monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_DEFAULT_BATCH_BUCKETS", raising=False)
+    engines = [
+        ContinuousBatchEngine(object(), device=torch.device("cpu"), max_active_requests=64),
+        ContinuousBatchEngine(
+            object(),
+            device=torch.device("cpu"),
+            temperature=0.0,
+            max_generation_tokens=1,
+            max_active_requests=64,
+        ),
+        ContinuousBatchEngine(
+            object(),
+            device=torch.device("cpu"),
+            temperature=0.7,
+            max_generation_tokens=997,
+            max_active_requests=64,
+        ),
+    ]
+    for engine in engines:
+        assert engine._prefill_batch_bucket(17) == 32
+        assert engine._prefill_batch_bucket(25) == 32
 
     monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_BATCH_BUCKETS", "8,16,24,32")
 
-    assert engine._prefill_batch_bucket(17) == 24
-    assert engine._prefill_batch_bucket(25) == 32
-    assert engine._prefill_batch_bucket(33) == 64
+    assert engines[0]._prefill_batch_bucket(17) == 24
+    assert engines[0]._prefill_batch_bucket(25) == 32
+    assert engines[0]._prefill_batch_bucket(33) == 64
 
     capped_engine = ContinuousBatchEngine(object(), device=torch.device("cpu"), max_active_requests=24)
     assert capped_engine._prefill_batch_bucket(17) == 24
@@ -1127,6 +1058,7 @@ class _UnifiedStepToyModel(_SelectedLogitsToyModel):
     def __init__(self, vocab_size: int = 64) -> None:
         super().__init__(vocab_size)
         self.unified_calls = 0
+        self.unified_write_positions: list[list[list[int]]] = []
 
     def forward_step_flashinfer(
         self,
@@ -1139,8 +1071,8 @@ class _UnifiedStepToyModel(_SelectedLogitsToyModel):
         logit_positions,
         row_indices,
     ):
-        del write_positions
         self.unified_calls += 1
+        self.unified_write_positions.append(write_positions.detach().cpu().tolist())
         rows = row_indices.detach().cpu().tolist()
         starts = seq_lens.detach().cpu().tolist()
         lengths = q_lens.detach().cpu().tolist()
@@ -1150,6 +1082,42 @@ class _UnifiedStepToyModel(_SelectedLogitsToyModel):
         self.selected_positions.append(positions.detach().cpu().tolist())
         row_indices = torch.arange(input_ids.size(0), device=input_ids.device)
         return self._logits(input_ids[row_indices, positions] + 1)
+
+
+class _UnifiedTokenBucketToyModel(_UnifiedStepToyModel):
+    def __init__(self, vocab_size: int = 64) -> None:
+        super().__init__(vocab_size)
+        self.token_bucket_q_lens: list[list[int]] = []
+        self.token_bucket_rows: list[list[int]] = []
+        self.token_bucket_flat_rows: list[list[int]] = []
+        self.token_bucket_prefix_copy_lens: list[list[int]] = []
+
+    def try_copy_token_bucket_prefix_graph(self, *args, **kwargs):
+        del args
+        self.token_bucket_prefix_copy_lens.append(
+            kwargs["start_positions"].detach().cpu().tolist()
+        )
+        return True
+
+    def try_prefill_token_bucket_fa3_graph(
+        self,
+        input_ids,
+        cache,
+        *,
+        start_positions,
+        q_lens,
+        row_indices,
+        write_positions,
+        flat_rows,
+        logit_positions,
+        capture_on_miss=True,
+    ):
+        del cache, start_positions, write_positions, capture_on_miss
+        self.token_bucket_q_lens.append(q_lens.detach().cpu().tolist())
+        self.token_bucket_rows.append(row_indices.detach().cpu().tolist())
+        self.token_bucket_flat_rows.append(flat_rows.detach().cpu().tolist())
+        selected = input_ids[0].index_select(0, logit_positions)
+        return self._logits(selected + 1)
 
 
 class _DeviceResidentToyWrapper:
@@ -2236,8 +2204,7 @@ def test_continuous_batch_engine_can_skip_warm_row_prefix_copy(
     assert engine.stats.prefill_prefix_copy_skipped_tokens == len(shared) * 2
 
 
-def test_continuous_batch_engine_prefers_warmed_prefix_rows(monkeypatch) -> None:
-    monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_PREFERRED_PREFIX_ROWS", raising=False)
+def test_continuous_batch_engine_allocates_lowest_available_prefix_row() -> None:
     engine = ContinuousBatchEngine(
         _RaggedGraphToyModel(),
         device=torch.device("cpu"),
@@ -2246,11 +2213,10 @@ def test_continuous_batch_engine_prefers_warmed_prefix_rows(monkeypatch) -> None
     )
     engine.start_online(max_seq_len=8)
 
-    assert engine._acquire_prefix_row() == 128
+    assert engine._acquire_prefix_row() == 105
 
 
-def test_continuous_batch_engine_preferred_prefix_rows_can_be_overridden(monkeypatch) -> None:
-    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PREFERRED_PREFIX_ROWS", "12,7,12,bad")
+def test_continuous_batch_engine_prefix_rows_remain_dense() -> None:
     engine = ContinuousBatchEngine(
         _RaggedGraphToyModel(),
         device=torch.device("cpu"),
@@ -2259,8 +2225,8 @@ def test_continuous_batch_engine_preferred_prefix_rows_can_be_overridden(monkeyp
     )
     engine.start_online(max_seq_len=8)
 
-    assert engine._acquire_prefix_row() == 12
     assert engine._acquire_prefix_row() == 10
+    assert engine._acquire_prefix_row() == 11
 
 
 def test_continuous_batch_engine_evicts_prefix_row_without_clear(monkeypatch) -> None:
@@ -2296,7 +2262,7 @@ def test_continuous_batch_engine_evicts_prefix_row_without_clear(monkeypatch) ->
     assert route_id not in engine.reusable_prefixes
     assert engine.prefix_cache.lookup(tokens)[1] is None
     assert engine._row_seq_lens[prefix_row] == 0
-    assert engine._row_cached_prefixes[prefix_row] is None
+    assert engine._row_cached_prefixes[prefix_row] == tokens
 
 
 def test_continuous_batch_engine_can_skip_active_row_clear_on_acquire(monkeypatch) -> None:
@@ -2360,6 +2326,28 @@ def test_continuous_batch_engine_prefers_low_free_active_rows() -> None:
     assert [engine._acquire_active_row() for _ in range(3)] == [0, 1, 2]
 
 
+def test_continuous_batch_engine_release_preserves_other_gpu_decode_rows() -> None:
+    engine = ContinuousBatchEngine(
+        _RaggedGraphToyModel(),
+        device=torch.device("cpu"),
+        max_active_requests=3,
+        prefix_cache_capacity=0,
+    )
+    engine.start_online(max_seq_len=8)
+    engine._decode_many_gpu_state_signature = (
+        (0, 11, 4),
+        (1, 12, 5),
+        (2, 13, 6),
+    )
+
+    engine._release_active_row(1)
+
+    assert engine._decode_many_gpu_state_signature == (
+        (0, 11, 4),
+        (2, 13, 6),
+    )
+
+
 def test_continuous_batch_engine_decode_bucket_uses_low_padding_rows() -> None:
     engine = ContinuousBatchEngine(
         _RaggedGraphToyModel(),
@@ -2375,7 +2363,7 @@ def test_continuous_batch_engine_decode_bucket_uses_low_padding_rows() -> None:
 
 
 def test_continuous_batch_engine_can_opt_in_full_prompt_store_while_pinned(monkeypatch) -> None:
-    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PINNED_FULL_PROMPT_STORE_MIN_MAX_TOKENS", "2")
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PINNED_FULL_PROMPT_STORE", "2")
     monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_NON_COMMON_PREFIX_GRAPH_PREFILL", "1")
     shared = tuple(range(1, 17))
     model = _SelectedLogitsToyModel()
@@ -2417,7 +2405,7 @@ def test_continuous_batch_engine_profiles_pinned_full_prompt_store_skips(
     monkeypatch,
 ) -> None:
     monkeypatch.delenv(
-        "TORCHINFERNO_CONTINUOUS_PINNED_FULL_PROMPT_STORE_MIN_MAX_TOKENS",
+        "TORCHINFERNO_CONTINUOUS_PINNED_FULL_PROMPT_STORE",
         raising=False,
     )
     monkeypatch.delenv(
@@ -2461,7 +2449,7 @@ def test_continuous_batch_engine_profiles_full_prompt_store_skips_without_sync(
 ) -> None:
     monkeypatch.setenv("TORCHINFERNO_OPENAI_QUEUE_PROFILE_JSONL", "queue.jsonl")
     monkeypatch.delenv(
-        "TORCHINFERNO_CONTINUOUS_PINNED_FULL_PROMPT_STORE_MIN_MAX_TOKENS",
+        "TORCHINFERNO_CONTINUOUS_PINNED_FULL_PROMPT_STORE",
         raising=False,
     )
     monkeypatch.delenv(
@@ -2507,7 +2495,7 @@ def test_continuous_batch_engine_profiles_pinned_full_prompt_reuse_candidates(
 ) -> None:
     monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_FULL_PROMPT_REUSE_CANDIDATE_PROFILE", "1")
     monkeypatch.delenv(
-        "TORCHINFERNO_CONTINUOUS_PINNED_FULL_PROMPT_STORE_MIN_MAX_TOKENS",
+        "TORCHINFERNO_CONTINUOUS_PINNED_FULL_PROMPT_STORE",
         raising=False,
     )
     monkeypatch.delenv(
@@ -2553,7 +2541,7 @@ def test_continuous_batch_engine_profiles_full_prompt_reuse_candidates_without_s
     monkeypatch.setenv("TORCHINFERNO_OPENAI_QUEUE_PROFILE_JSONL", "queue.jsonl")
     monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_FULL_PROMPT_REUSE_CANDIDATE_PROFILE", "1")
     monkeypatch.delenv(
-        "TORCHINFERNO_CONTINUOUS_PINNED_FULL_PROMPT_STORE_MIN_MAX_TOKENS",
+        "TORCHINFERNO_CONTINUOUS_PINNED_FULL_PROMPT_STORE",
         raising=False,
     )
     monkeypatch.delenv(
@@ -2607,7 +2595,7 @@ def test_continuous_batch_engine_skips_full_prompt_reuse_candidates_by_default(
         raising=False,
     )
     monkeypatch.delenv(
-        "TORCHINFERNO_CONTINUOUS_PINNED_FULL_PROMPT_STORE_MIN_MAX_TOKENS",
+        "TORCHINFERNO_CONTINUOUS_PINNED_FULL_PROMPT_STORE",
         raising=False,
     )
     monkeypatch.delenv(
@@ -2644,7 +2632,7 @@ def test_continuous_batch_engine_profiles_persistent_full_prompt_reuse_candidate
     monkeypatch,
 ) -> None:
     monkeypatch.delenv(
-        "TORCHINFERNO_CONTINUOUS_PINNED_FULL_PROMPT_STORE_MIN_MAX_TOKENS",
+        "TORCHINFERNO_CONTINUOUS_PINNED_FULL_PROMPT_STORE",
         raising=False,
     )
     monkeypatch.delenv(
@@ -2704,7 +2692,7 @@ def test_continuous_batch_engine_profiles_persistent_full_prompt_reuse_candidate
 
 
 def test_continuous_batch_engine_keeps_non_common_prefix_graph_opt_in(monkeypatch) -> None:
-    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PINNED_FULL_PROMPT_STORE_MIN_MAX_TOKENS", "2")
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PINNED_FULL_PROMPT_STORE", "2")
     shared = tuple(range(1, 17))
     model = _SelectedLogitsToyModel()
     engine = ContinuousBatchEngine(
@@ -2735,7 +2723,7 @@ def test_continuous_batch_engine_keeps_non_common_prefix_graph_opt_in(monkeypatc
 
 
 def test_continuous_batch_engine_can_batch_mixed_prefix_hits(monkeypatch) -> None:
-    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PINNED_FULL_PROMPT_STORE_MIN_MAX_TOKENS", "2")
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PINNED_FULL_PROMPT_STORE", "2")
     monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_MIXED_PREFIX_PREFILL", "1")
     monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_NON_COMMON_PREFIX_GRAPH_PREFILL", "1")
     shared = tuple(range(1, 17))
@@ -2775,7 +2763,7 @@ def test_continuous_batch_engine_can_batch_mixed_prefix_hits(monkeypatch) -> Non
 
 
 def test_continuous_batch_engine_can_bucket_mixed_prefix_context(monkeypatch) -> None:
-    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PINNED_FULL_PROMPT_STORE_MIN_MAX_TOKENS", "2")
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PINNED_FULL_PROMPT_STORE", "2")
     monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_MIXED_PREFIX_PREFILL", "1")
     monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_MIXED_PREFIX_DYNAMIC_CONTEXT", "1")
     monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_NON_COMMON_PREFIX_GRAPH_PREFILL", "1")
@@ -2812,7 +2800,7 @@ def test_continuous_batch_engine_can_bucket_mixed_prefix_context(monkeypatch) ->
 
 
 def test_continuous_batch_engine_can_bound_mixed_prefix_extra_tokens(monkeypatch) -> None:
-    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PINNED_FULL_PROMPT_STORE_MIN_MAX_TOKENS", "2")
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PINNED_FULL_PROMPT_STORE", "2")
     monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_MIXED_PREFIX_PREFILL", "1")
     monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_MIXED_PREFIX_MAX_EXTRA_TOKENS", "2")
     monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_NON_COMMON_PREFIX_GRAPH_PREFILL", "1")
@@ -2853,7 +2841,7 @@ def test_continuous_batch_engine_can_bound_mixed_prefix_extra_tokens(monkeypatch
 
 
 def test_continuous_batch_engine_splits_overlong_mixed_prefix_suffixes(monkeypatch) -> None:
-    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PINNED_FULL_PROMPT_STORE_MIN_MAX_TOKENS", "2")
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PINNED_FULL_PROMPT_STORE", "2")
     monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_MIXED_PREFIX_PREFILL", "1")
     monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_MIXED_PREFIX_DYNAMIC_CONTEXT", "1")
     monkeypatch.setenv(
@@ -2898,7 +2886,7 @@ def test_continuous_batch_engine_splits_overlong_mixed_prefix_suffixes(monkeypat
         for shape in engine.stats.prefill_shape_counts
     )
     assert any(
-        shape.startswith("prefix_graph:b1:s128:") and shape.endswith("mixed0")
+        shape.startswith("prefix_graph:b1:s96:") and shape.endswith("mixed0")
         for shape in engine.stats.prefill_shape_counts
     )
     assert not any(
@@ -2910,7 +2898,7 @@ def test_continuous_batch_engine_splits_overlong_mixed_prefix_suffixes(monkeypat
 def test_continuous_batch_engine_can_demote_long_mixed_prefix_suffix_to_common_prefix(
     monkeypatch,
 ) -> None:
-    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PINNED_FULL_PROMPT_STORE_MIN_MAX_TOKENS", "2")
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PINNED_FULL_PROMPT_STORE", "2")
     monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_MIXED_PREFIX_PREFILL", "1")
     monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_MIXED_PREFIX_DYNAMIC_CONTEXT", "1")
     monkeypatch.setenv(
@@ -2951,7 +2939,7 @@ def test_continuous_batch_engine_can_demote_long_mixed_prefix_suffix_to_common_p
     assert engine.stats.prefix_reuse_route_counts.get("request_prompt", 0) == 0
     assert engine.stats.prefix_reuse_hit_token_counts[str(len(shared))] == 6
     assert any(
-        shape.startswith("prefix_graph:b4:s128:p16-16:src1:mixed0")
+        shape.startswith("prefix_graph:b4:s96:p16-16:src1:mixed0")
         for shape in engine.stats.prefill_shape_counts
     )
 
@@ -2959,7 +2947,7 @@ def test_continuous_batch_engine_can_demote_long_mixed_prefix_suffix_to_common_p
 def test_continuous_batch_engine_delays_pinned_full_prompt_store_by_default(
     monkeypatch,
 ) -> None:
-    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PINNED_FULL_PROMPT_STORE_MIN_MAX_TOKENS", "1")
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PINNED_FULL_PROMPT_STORE", "1")
     monkeypatch.delenv(
         "TORCHINFERNO_CONTINUOUS_PINNED_FULL_PROMPT_STORE_ADOPT_ON_FINISH",
         raising=False,
@@ -2982,7 +2970,7 @@ def test_continuous_batch_engine_delays_pinned_full_prompt_store_by_default(
 def test_continuous_batch_engine_can_delay_pinned_full_prompt_store_until_finish(
     monkeypatch,
 ) -> None:
-    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PINNED_FULL_PROMPT_STORE_MIN_MAX_TOKENS", "1")
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PINNED_FULL_PROMPT_STORE", "1")
     monkeypatch.delenv(
         "TORCHINFERNO_CONTINUOUS_PINNED_FULL_PROMPT_STORE_ADOPT_ON_FINISH",
         raising=False,
@@ -3138,8 +3126,8 @@ def test_continuous_batch_engine_prefers_ready_prefix_hits() -> None:
     assert engine.stats.prefix_reuse_tokens == 3
 
 
-def test_continuous_batch_engine_prioritizes_short_prefill_cost_for_greedy_short(monkeypatch) -> None:
-    monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_ADMIT_PREFILL_COST_PRIORITY", raising=False)
+def test_continuous_batch_engine_can_prioritize_short_prefill_cost(monkeypatch) -> None:
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_ADMIT_PREFILL_COST_PRIORITY", "1")
     model = _RaggedGraphToyModel()
     engine = ContinuousBatchEngine(
         model,
@@ -3170,7 +3158,7 @@ def test_continuous_batch_engine_keeps_arrival_order_for_larger_greedy_admission
         device=torch.device("cpu"),
         max_active_requests=1,
         max_generation_tokens=512,
-        greedy_large_mixed_prefix_reuse=True,
+        mixed_prefix_reuse=True,
     )
 
     results = engine.run(
@@ -3186,11 +3174,7 @@ def test_continuous_batch_engine_keeps_arrival_order_for_larger_greedy_admission
 
 
 def test_continuous_batch_engine_can_prioritize_large_greedy_refill_prefill_cost(monkeypatch) -> None:
-    monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_ADMIT_PREFILL_COST_PRIORITY", raising=False)
-    monkeypatch.setenv(
-        "TORCHINFERNO_CONTINUOUS_ADMIT_PREFILL_COST_PRIORITY_GREEDY_LARGE_REFILL",
-        "1",
-    )
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_ADMIT_PREFILL_COST_PRIORITY", "1")
     model = _RaggedGraphToyModel()
     engine = ContinuousBatchEngine(
         model,
@@ -3198,7 +3182,7 @@ def test_continuous_batch_engine_can_prioritize_large_greedy_refill_prefill_cost
         max_active_requests=2,
         admit_per_step_cap=1,
         max_generation_tokens=512,
-        greedy_large_mixed_prefix_reuse=True,
+        mixed_prefix_reuse=True,
     )
 
     results = engine.run(
@@ -3210,17 +3194,13 @@ def test_continuous_batch_engine_can_prioritize_large_greedy_refill_prefill_cost
     )
     by_id = {result.request_id: result for result in results}
 
-    assert by_id["active"].started_step == 0
-    assert by_id["short"].started_step == 1
-    assert by_id["long"].started_step == 2
+    assert by_id["short"].started_step == 0
+    assert by_id["long"].started_step == 1
+    assert by_id["active"].started_step == 2
 
 
 def test_continuous_batch_engine_keeps_large_greedy_refill_arrival_order_by_default(monkeypatch) -> None:
     monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_ADMIT_PREFILL_COST_PRIORITY", raising=False)
-    monkeypatch.delenv(
-        "TORCHINFERNO_CONTINUOUS_ADMIT_PREFILL_COST_PRIORITY_GREEDY_LARGE_REFILL",
-        raising=False,
-    )
     model = _RaggedGraphToyModel()
     engine = ContinuousBatchEngine(
         model,
@@ -3228,7 +3208,7 @@ def test_continuous_batch_engine_keeps_large_greedy_refill_arrival_order_by_defa
         max_active_requests=2,
         admit_per_step_cap=1,
         max_generation_tokens=512,
-        greedy_large_mixed_prefix_reuse=True,
+        mixed_prefix_reuse=True,
     )
 
     results = engine.run(
@@ -3265,6 +3245,27 @@ def test_continuous_batch_engine_can_wait_for_refill_batch() -> None:
 
     assert by_id["first-refill"].started_step == 2
     assert by_id["second-refill"].started_step == 3
+
+
+def test_continuous_batch_engine_bounds_refill_batch_wait() -> None:
+    model = _RaggedGraphToyModel()
+    engine = ContinuousBatchEngine(
+        model,
+        device=torch.device("cpu"),
+        max_active_requests=2,
+        admit_min_ready_requests=3,
+        admit_max_wait_steps=1,
+    )
+
+    results = engine.run(
+        [
+            ServingRequest("active", (1,), 4, arrival_step=0),
+            ServingRequest("refill", (2,), 1, arrival_step=1),
+        ]
+    )
+    by_id = {result.request_id: result for result in results}
+
+    assert by_id["refill"].started_step == 2
 
 
 def test_continuous_batch_engine_respects_admit_per_step_cap() -> None:
@@ -4850,11 +4851,7 @@ def test_continuous_batch_engine_uses_prefix_graph_greedy_tokens(monkeypatch) ->
 
 def test_continuous_batch_engine_uses_warmed_prefix_token_graph_by_default(monkeypatch) -> None:
     monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_TOKEN_GRAPH_CAPTURE_ON_MISS", raising=False)
-    monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_TOKEN_GRAPH", raising=False)
-    monkeypatch.delenv(
-        "TORCHINFERNO_OPENAI_WARMUP_ONLINE_GREEDY_COMMON_PREFIX_TOKEN_SUFFIX_PREFILL",
-        raising=False,
-    )
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_TOKEN_GRAPH", "1")
     shared = tuple(range(16))
     model = _TokenLogitsGraphToyModel()
     model.prefill_token_logits_graph_available = True
@@ -4885,7 +4882,7 @@ def test_continuous_batch_engine_uses_warmed_prefix_token_graph_by_default(monke
 
 
 def test_continuous_batch_engine_skips_disabled_prefix_token_graph(monkeypatch) -> None:
-    monkeypatch.setenv("TORCHINFERNO_OPENAI_WARMUP_ONLINE_GREEDY_COMMON_PREFIX_TOKEN_SUFFIX_PREFILL", "0")
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_TOKEN_GRAPH", "0")
     shared = tuple(range(16))
     model = _TokenLogitsGraphToyModel()
     engine = ContinuousBatchEngine(
@@ -5760,9 +5757,8 @@ def test_continuous_batch_engine_suffix_bucket_split_default_fill_is_fifty_pct(
 def test_continuous_batch_engine_opt_in_suffix_bucket_split_rejects_singletons(
     monkeypatch,
 ) -> None:
-    monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SPLIT_SUFFIX_BUCKETS", raising=False)
-    monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SPLIT_SUFFIX_BUCKETS_MIN_GROUP", raising=False)
-    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SPLIT_SUFFIX_BUCKETS_GREEDY_SHORT", "1")
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SPLIT_SUFFIX_BUCKETS", "1")
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SPLIT_SUFFIX_BUCKETS_MIN_GROUP", "2")
     monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SUFFIX_BUCKETS", "4,8")
     engine = ContinuousBatchEngine(
         object(),
@@ -5849,10 +5845,6 @@ def test_continuous_batch_engine_records_disabled_suffix_bucket_split_candidate(
 
 def test_continuous_batch_engine_suffix_bucket_split_default_scope(monkeypatch) -> None:
     monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SPLIT_SUFFIX_BUCKETS", raising=False)
-    monkeypatch.delenv(
-        "TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SPLIT_SUFFIX_BUCKETS_GREEDY_SHORT",
-        raising=False,
-    )
     greedy_short = ContinuousBatchEngine(
         object(),
         device=torch.device("cpu"),
@@ -5872,7 +5864,7 @@ def test_continuous_batch_engine_suffix_bucket_split_default_scope(monkeypatch) 
         max_generation_tokens=128,
     )
 
-    assert greedy_short._prefix_prefill_split_suffix_buckets_enabled()
+    assert not greedy_short._prefix_prefill_split_suffix_buckets_enabled()
     assert not greedy_mid._prefix_prefill_split_suffix_buckets_enabled()
     assert not sampled_short._prefix_prefill_split_suffix_buckets_enabled()
 
@@ -5891,12 +5883,12 @@ def test_continuous_batch_engine_suffix_bucket_split_default_scope(monkeypatch) 
         profile_timings=True,
     )
     assert profiled_greedy_short._prefix_prefill_split_suffix_buckets_profile_candidates_enabled()
-    assert not profiled_greedy_mid._prefix_prefill_split_suffix_buckets_profile_candidates_enabled()
+    assert profiled_greedy_mid._prefix_prefill_split_suffix_buckets_profile_candidates_enabled()
 
-    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SPLIT_SUFFIX_BUCKETS_GREEDY_SHORT", "1")
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SPLIT_SUFFIX_BUCKETS", "1")
     assert greedy_short._prefix_prefill_split_suffix_buckets_enabled()
-    assert not greedy_mid._prefix_prefill_split_suffix_buckets_enabled()
-    assert not sampled_short._prefix_prefill_split_suffix_buckets_enabled()
+    assert greedy_mid._prefix_prefill_split_suffix_buckets_enabled()
+    assert sampled_short._prefix_prefill_split_suffix_buckets_enabled()
     monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SPLIT_SUFFIX_BUCKETS", "1")
     assert sampled_short._prefix_prefill_split_suffix_buckets_enabled()
 
@@ -6058,6 +6050,171 @@ def test_continuous_batch_engine_unified_online_replays_one_token_for_exact_prom
     assert engine.stats.prefill_model_calls == prefill_calls + 1
     assert engine.stats.decode_model_calls == decode_calls + 1
     assert engine.stats.prefix_reuse_tokens == reuse_tokens + len(prompt) - 1
+
+
+def test_continuous_batch_engine_unified_mixed_padding_uses_future_kv_positions(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_UNIFIED_FORWARD", "1")
+    model = _UnifiedStepToyModel()
+    engine = ContinuousBatchEngine(
+        model,
+        device=torch.device("cpu"),
+        max_active_requests=2,
+        prefix_cache_capacity=0,
+        store_reusable_prefixes=False,
+    )
+    engine.start_online(max_seq_len=16)
+    engine.submit_online(ServingRequest("decode", (1, 2, 3, 4), 3, arrival_step=0))
+    engine.step_online()
+    engine.submit_online(ServingRequest("prefill", (7, 8, 9), 1, arrival_step=1))
+
+    engine.step_online()
+
+    assert model.unified_write_positions[-1] == [[4, 5, 6], [0, 1, 2]]
+    assert engine._decode_many_gpu_state_signature == engine._make_decode_many_gpu_state_signature(
+        engine._online_active
+    )
+
+
+def test_continuous_batch_engine_unified_token_graph_pads_tokens_without_live_row_shift(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_TOKEN_BUCKET_FA3_UNIFIED", "1")
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_TOKEN_BUCKET_FA3_BATCH_CAPACITY", "4")
+    model = _UnifiedTokenBucketToyModel()
+    engine = ContinuousBatchEngine(
+        model,
+        device=torch.device("cpu"),
+        max_active_requests=4,
+        prefix_cache_capacity=0,
+        store_reusable_prefixes=False,
+    )
+    engine.start_online(max_seq_len=16)
+
+    logits = engine._try_unified_token_bucket_fa3_logits(
+        input_sequences=[[7], [8, 9]],
+        q_lens=[1, 2],
+        start_lens=[4, 0],
+        rows=[0, 1],
+        source_rows=[0, 1],
+        copy_lens=[0, 0],
+    )
+
+    assert logits is not None
+    assert torch.argmax(logits[:, -1, :], dim=-1).tolist() == [8, 10]
+    assert model.token_bucket_q_lens[-1] == [1, 7, 0, 0]
+    assert model.token_bucket_rows[-1] == [0, 1, 0, 0]
+    assert model.token_bucket_flat_rows[-1] == [0, 1, 1, 1, 1, 1, 1, 1]
+
+
+def test_continuous_batch_engine_unified_identical_prompts_recompute_final_token(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_UNIFIED_FORWARD", "1")
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_TOKEN_BUCKET_FA3_UNIFIED", "1")
+    prompt = tuple(range(1, 18))
+    model = _UnifiedTokenBucketToyModel()
+    engine = ContinuousBatchEngine(
+        model,
+        device=torch.device("cpu"),
+        max_active_requests=3,
+        prefix_cache_capacity=2,
+        pin_shared_prefix=True,
+        graph_prefill=True,
+    )
+    engine.start_online(max_seq_len=64)
+    for index in range(3):
+        engine.submit_online(ServingRequest(f"req-{index}", prompt, 1, arrival_step=0))
+
+    events = engine.step_online()
+
+    assert [(event.request_id, event.token, event.finished) for event in events] == [
+        ("req-0", 18, True),
+        ("req-1", 18, True),
+        ("req-2", 18, True),
+    ]
+    cached = prompt[:-1]
+    reusable = engine.reusable_prefixes[("common_prefix", cached)]
+    assert reusable.tokens == cached
+    assert reusable.logits is None
+    assert engine.stats.prefill_tokens == len(cached) + 3
+    assert engine.stats.prefill_common_prefix_batches == 1
+    assert engine.stats.prefix_reuse_tokens == 3 * len(cached)
+
+
+def test_continuous_batch_engine_unified_moves_continuation_prefix_row(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_UNIFIED_FORWARD", "1")
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_TOKEN_BUCKET_FA3_UNIFIED", "1")
+    monkeypatch.setenv(
+        "TORCHINFERNO_CONTINUOUS_PINNED_FULL_PROMPT_STORE",
+        "1",
+    )
+    prompt = tuple(range(1, 18))
+    model = _UnifiedTokenBucketToyModel(vocab_size=256)
+    engine = ContinuousBatchEngine(
+        model,
+        device=torch.device("cpu"),
+        max_active_requests=2,
+        prefix_cache_capacity=2,
+        pin_shared_prefix=True,
+        graph_prefill=True,
+    )
+    engine.start_online(max_seq_len=64)
+    engine.submit_online(ServingRequest("turn-1", prompt, 1, arrival_step=0))
+    assert [(event.request_id, event.token, event.finished) for event in engine.step_online()] == [
+        ("turn-1", 18, True)
+    ]
+
+    continued_prompt = (*prompt, 99)
+    engine.submit_online(ServingRequest("turn-2", continued_prompt, 1, arrival_step=0))
+    assert [(event.request_id, event.token, event.finished) for event in engine.step_online()] == [
+        ("turn-2", 100, True)
+    ]
+
+    assert model.token_bucket_prefix_copy_lens == []
+    assert engine.stats.prefix_row_move_requests == 1
+    assert engine.stats.prefix_row_move_tokens == len(prompt)
+    assert all(prefix.logits is None for prefix in engine.reusable_prefixes.values())
+
+
+def test_continuous_batch_engine_unified_token_graph_skips_valid_warm_prefix_copy(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_UNIFIED_FORWARD", "1")
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_TOKEN_BUCKET_FA3_UNIFIED", "1")
+    monkeypatch.setenv(
+        "TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SKIP_WARM_PREFIX_COPY",
+        "1",
+    )
+    prompt = tuple(range(1, 18))
+    model = _UnifiedTokenBucketToyModel()
+    engine = ContinuousBatchEngine(
+        model,
+        device=torch.device("cpu"),
+        max_active_requests=1,
+        prefix_cache_capacity=2,
+        graph_prefill=True,
+    )
+    engine.start_online(max_seq_len=64)
+    engine.submit_online(ServingRequest("warm", prompt, 1, arrival_step=0))
+    assert [(event.request_id, event.token, event.finished) for event in engine.step_online()] == [
+        ("warm", 18, True)
+    ]
+    assert model.token_bucket_prefix_copy_lens == []
+
+    engine.submit_online(ServingRequest("late", prompt, 1, arrival_step=0))
+    events = engine.step_online()
+
+    assert [(event.request_id, event.token, event.finished) for event in events] == [
+        ("late", 18, True)
+    ]
+    assert model.token_bucket_prefix_copy_lens == []
+    assert engine.stats.prefix_reuse_tokens == len(prompt) - 1
+    assert engine.stats.prefill_prefix_copy_skipped_batches == 1
+    assert engine.stats.prefill_prefix_copy_skipped_tokens == len(prompt) - 1
 
 
 def test_continuous_batch_engine_chunked_online_continues_after_exact_prompt_replay() -> None:
@@ -6532,10 +6689,10 @@ def test_continuous_batch_engine_prefix_prefill_capture_on_miss_policy(
 
     assert engine._prefix_prefill_capture_on_miss(32)
     assert not engine._prefix_prefill_capture_on_miss(64)
-    assert sampled_engine._prefix_prefill_capture_on_miss(64)
+    assert not sampled_engine._prefix_prefill_capture_on_miss(64)
     assert engine._prefix_prefill_split_on_capture_skip_batch(32) == 0
     assert engine._prefix_prefill_split_on_capture_skip_batch(64) == 32
-    assert sampled_engine._prefix_prefill_split_on_capture_skip_batch(64) == 0
+    assert sampled_engine._prefix_prefill_split_on_capture_skip_batch(64) == 32
 
     monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_CAPTURE_ON_MISS", "1")
     assert engine._prefix_prefill_capture_on_miss(64)
@@ -7479,11 +7636,10 @@ def test_continuous_batch_engine_uses_flashinfer_decode_graphs_for_sampled_defau
     assert engine.stats.decode_graph_hits == 2
 
 
-def test_continuous_batch_engine_skips_flashinfer_decode_for_sampled_medium_default(
+def test_continuous_batch_engine_flashinfer_decode_is_output_length_invariant(
     monkeypatch,
 ) -> None:
     monkeypatch.delenv("TORCHINFERNO_FI_DECODE_GRAPH", raising=False)
-    monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_FI_DECODE_SAMPLED_MAX_TOKENS", raising=False)
     model = _FiDecodeGraphToyModel()
     engine = ContinuousBatchEngine(
         model,
@@ -7502,19 +7658,18 @@ def test_continuous_batch_engine_skips_flashinfer_decode_for_sampled_medium_defa
     )
 
     assert [len(result.tokens) for result in results] == [5, 6]
-    assert model.fi_graph.replay_calls == 0
-    assert model.fi_wrapper.plan_calls == 0
+    assert model.fi_graph.replay_calls == 2
+    assert model.fi_wrapper.plan_calls == 2
     assert model.ragged_token_graph_calls == 0
-    assert model.ragged_logits_graph_calls == 2
+    assert model.ragged_logits_graph_calls == 0
     assert engine.stats.decode_graph_misses == 0
     assert engine.stats.decode_graph_hits == 2
 
 
-def test_continuous_decode_fi_branch_uses_ragged_logits_for_sampled_medium(
+def test_continuous_decode_fi_branch_uses_flashinfer_for_sampled_requests(
     monkeypatch,
 ) -> None:
     monkeypatch.delenv("TORCHINFERNO_FI_DECODE_GRAPH", raising=False)
-    monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_FI_DECODE_SAMPLED_MAX_TOKENS", raising=False)
 
     class _FiBranchFallbackToyModel(_FiDecodeGraphToyModel):
         def __init__(self) -> None:
@@ -7562,9 +7717,9 @@ def test_continuous_decode_fi_branch_uses_ragged_logits_for_sampled_medium(
     decoded = engine._decode_batch(states, step=1)
 
     assert len(decoded) == 2
-    assert model.fi_graph.replay_calls == 0
+    assert model.fi_graph.replay_calls == 1
     assert model.ragged_token_graph_calls == 0
-    assert model.ragged_logits_graph_calls == 1
+    assert model.ragged_logits_graph_calls == 0
     assert model.static_logits_graph_calls == 0
     assert model.forward_calls == 0
     assert engine.stats.decode_graph_hits == 1
@@ -7592,11 +7747,10 @@ def test_continuous_decode_fi_branch_uses_ragged_logits_for_sampled_medium(
     assert single_engine.stats.decode_graph_hits == 1
 
 
-def test_continuous_batch_engine_can_allow_flashinfer_decode_for_sampled_medium(
+def test_continuous_batch_engine_sampled_flashinfer_needs_no_length_override(
     monkeypatch,
 ) -> None:
     monkeypatch.delenv("TORCHINFERNO_FI_DECODE_GRAPH", raising=False)
-    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_FI_DECODE_SAMPLED_MAX_TOKENS", "400")
     model = _FiDecodeGraphToyModel()
     engine = ContinuousBatchEngine(
         model,
@@ -7823,6 +7977,7 @@ def test_continuous_batch_engine_online_many_keeps_decode_tokens_ordered(monkeyp
 
     first = engine.step_online()
     assert engine.online_active_min_generated() == 1
+    assert engine.online_active_request_count() == 2
     events, steps = engine.step_online_many(8)
 
     assert [(event.request_id, event.token, event.generated, event.finished) for event in first] == [
@@ -7848,6 +8003,7 @@ def test_continuous_batch_engine_online_many_keeps_decode_tokens_ordered(monkeyp
     assert engine.stats.ragged_decode_active_tokens == 6
     assert engine.stats.ragged_decode_padding_tokens == 0
     assert engine.online_active_min_generated() is None
+    assert engine.online_active_request_count() == 0
     assert not engine.has_online_work()
     assert model.ragged_logits_graph_calls == 3
 
@@ -8376,11 +8532,12 @@ def test_continuous_batch_engine_reuses_gpu_decode_state_for_ragged_baseline() -
         def __init__(self) -> None:
             super().__init__(vocab_size=128)
             self.input_ptrs: list[int] = []
+            self.seq_lens_ptrs: list[int] = []
             self.row_indices_were_none: list[bool] = []
 
         def try_decode_ragged_logits_graph(self, input_ids, cache, *, seq_lens, row_indices):
-            del seq_lens
             self.input_ptrs.append(input_ids.data_ptr())
+            self.seq_lens_ptrs.append(seq_lens.data_ptr())
             self.row_indices_were_none.append(row_indices is None)
             cache.advance_rows(_toy_decode_rows(input_ids, row_indices), 1)
             return self._logits(input_ids[:, -1] + 1)
@@ -8424,6 +8581,7 @@ def test_continuous_batch_engine_reuses_gpu_decode_state_for_ragged_baseline() -
         21,
     ]
     assert model.input_ptrs == [engine._ensure_gpu_token_buf().data_ptr()]
+    assert model.seq_lens_ptrs == [engine._ensure_gpu_seq_lens_buf().data_ptr()]
     assert model.row_indices_were_none == [True]
     assert engine._decode_many_gpu_state_signature == engine._make_decode_many_gpu_state_signature(
         [state for state in decoded if isinstance(state, serving_mod._ActiveRequest)]
@@ -9638,6 +9796,64 @@ def test_continuous_batch_engine_online_refill_can_wait_for_ready_requests(monke
     assert [event.finished for event in second_step] == [False, False]
     assert [event.request_id for event in third_step] == ["a", "b", "late-1", "late-2"]
     assert [event.finished for event in third_step] == [False, False, True, True]
+
+
+def test_continuous_batch_engine_online_refill_can_wait_between_admissions(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_ADMIT_MIN_STEP_INTERVAL", "2")
+    engine = ContinuousBatchEngine(
+        _RaggedGraphToyModel(),
+        device=torch.device("cpu"),
+        max_active_requests=4,
+        prefix_cache_capacity=0,
+    )
+    engine.start_online(max_seq_len=8)
+    engine.submit_online(ServingRequest("active", (1, 2), 4, arrival_step=0))
+
+    first_step = engine.step_online()
+    engine.submit_online(ServingRequest("late", (10, 11), 1, arrival_step=1))
+    second_step = engine.step_online()
+    third_step = engine.step_online()
+
+    assert [event.request_id for event in first_step] == ["active"]
+    assert [event.request_id for event in second_step] == ["active"]
+    assert [event.request_id for event in third_step] == ["active", "late"]
+    assert [event.finished for event in third_step] == [False, True]
+
+
+def test_continuous_batch_engine_online_refill_extends_interval_for_sustained_decode(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_ADMIT_SUSTAINED_MIN_GENERATED", "2")
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_ADMIT_SUSTAINED_MIN_ACTIVE_PCT", "75")
+    monkeypatch.setenv(
+        "TORCHINFERNO_CONTINUOUS_ADMIT_SUSTAINED_MIN_STEP_INTERVAL",
+        "2",
+    )
+    engine = ContinuousBatchEngine(
+        _RaggedGraphToyModel(),
+        device=torch.device("cpu"),
+        max_active_requests=4,
+        prefix_cache_capacity=0,
+    )
+    engine.start_online(max_seq_len=8)
+    for index in range(3):
+        engine.submit_online(
+            ServingRequest(f"active-{index}", (index + 1, index + 2), 5, arrival_step=0)
+        )
+
+    engine.step_online()
+    for state in engine._online_active:
+        state.generated = 2
+    engine._last_admit_step = 1
+    engine.submit_online(ServingRequest("late", (10, 11), 1, arrival_step=2))
+    waiting = engine._require_online_waiting()
+
+    assert engine._admit_ready_requests(waiting, 2, 3) == []
+    admitted = engine._admit_ready_requests(waiting, 3, 3)
+
+    assert [request.request_id for _index, request in admitted] == ["late"]
 
 
 def test_continuous_batch_engine_prefill_token_budget_limits_admission() -> None:

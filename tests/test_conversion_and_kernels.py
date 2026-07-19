@@ -183,6 +183,117 @@ def test_triton_cuda_kernels_match_torch_reference() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available() or not triton_available(), reason="CUDA Triton kernels unavailable")
+def test_fp8_activation_quantization_accepts_reusable_static_scale() -> None:
+    from torchinferno.kernels.fp8 import FP8_E4M3_MAX, quantize_activation_fp8
+
+    torch.manual_seed(15)
+    values = torch.randn((32, 128), device="cuda", dtype=torch.bfloat16)
+    scale = (values.abs().amax() / FP8_E4M3_MAX).clamp(min=1e-6).float() * 4.0
+    inverse_scale = scale.reciprocal()
+    output = torch.empty_like(values, dtype=torch.float8_e4m3fn)
+
+    quantized, returned_scale = quantize_activation_fp8(
+        values,
+        scale=scale,
+        inverse_scale=inverse_scale,
+        out=output,
+    )
+
+    assert quantized is output
+    assert returned_scale.data_ptr() == scale.data_ptr()
+    restored = quantized.to(torch.bfloat16) * scale
+    torch.testing.assert_close(restored, values, atol=6e-2, rtol=1.3e-1)
+
+
+def test_fp8_per_channel_weight_quantization_uses_one_scale_per_output() -> None:
+    from torchinferno.kernels.fp8 import quantize_weight_fp8_per_channel
+
+    torch.manual_seed(16)
+    weight = torch.randn((7, 13), dtype=torch.bfloat16)
+
+    quantized, scale = quantize_weight_fp8_per_channel(weight)
+
+    assert quantized.shape == weight.shape
+    assert quantized.dtype == torch.float8_e4m3fn
+    assert scale.shape == (1, weight.size(0))
+    restored = quantized.float() * scale.t()
+    torch.testing.assert_close(restored, weight.float(), atol=1.2e-1, rtol=1.3e-1)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or not triton_available(), reason="CUDA Triton kernels unavailable")
+def test_fp8_per_token_linear_writes_to_caller_output() -> None:
+    from torchinferno.kernels.fp8 import (
+        fp8_per_token_linear,
+        quantize_weight_fp8_per_channel,
+    )
+
+    torch.manual_seed(19)
+    values = torch.randn((17, 64), device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn((32, 64), device="cuda", dtype=torch.bfloat16)
+    weight_q, weight_scale = quantize_weight_fp8_per_channel(weight)
+    output = torch.empty((17, 32), device="cuda", dtype=torch.bfloat16)
+
+    projected = fp8_per_token_linear(
+        values,
+        weight_q,
+        weight_scale,
+        out=output,
+        use_fast_accum=True,
+    )
+
+    assert projected is output
+    reference = torch.nn.functional.linear(values, weight)
+    torch.testing.assert_close(projected, reference, atol=1.0, rtol=0.15)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or not triton_available(), reason="CUDA Triton kernels unavailable")
+def test_fused_fp8_projection_inputs_match_unfused_references() -> None:
+    from torchinferno.kernels.triton_ops import (
+        triton_add_rms_norm_fp8_per_token,
+        triton_rms_norm_fp8_per_token,
+        triton_swiglu_fp8_per_token,
+    )
+
+    torch.manual_seed(17)
+    x = torch.randn((7, 1, 64), device="cuda", dtype=torch.bfloat16)
+    residual = torch.randn_like(x)
+    weight = torch.randn((64,), device="cuda", dtype=torch.bfloat16)
+    eps = 1e-5
+
+    expected_norm = (
+        x.float()
+        * torch.rsqrt(x.float().square().mean(dim=-1, keepdim=True) + eps)
+        * weight.float()
+    )
+    norm_q, norm_scale = triton_rms_norm_fp8_per_token(x, weight, eps)
+    restored_norm = norm_q.float() * norm_scale.view(7, 1, 1)
+    torch.testing.assert_close(restored_norm, expected_norm, atol=1.2e-1, rtol=1.3e-1)
+
+    expected_hidden = x + residual
+    expected_add_norm = (
+        expected_hidden.float()
+        * torch.rsqrt(expected_hidden.float().square().mean(dim=-1, keepdim=True) + eps)
+        * weight.float()
+    )
+    hidden, add_q, add_scale = triton_add_rms_norm_fp8_per_token(
+        x,
+        residual,
+        weight,
+        eps,
+    )
+    torch.testing.assert_close(hidden, expected_hidden, atol=2e-2, rtol=2e-2)
+    restored_add_norm = add_q.float() * add_scale.view(7, 1, 1)
+    torch.testing.assert_close(restored_add_norm, expected_add_norm, atol=1.2e-1, rtol=1.3e-1)
+
+    gate = torch.randn_like(x)
+    up = torch.randn_like(x)
+    expected_swiglu = torch.nn.functional.silu(gate.float()) * up.float()
+    swiglu_q, swiglu_scale = triton_swiglu_fp8_per_token(gate, up)
+    restored_swiglu = swiglu_q.float() * swiglu_scale.view(7, 1, 1)
+    torch.testing.assert_close(restored_swiglu, expected_swiglu, atol=1.2e-1, rtol=1.3e-1)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or not triton_available(), reason="CUDA Triton kernels unavailable")
 def test_triton_rotary_interleaved_inplace_matches_torch_reference() -> None:
     from torchinferno.kernels.triton_ops import triton_apply_rotary_interleaved_inplace
     from torchinferno.models.llama3.tensor_parallel import _rotate_interleaved_eager
@@ -302,6 +413,117 @@ def test_triton_kv_cache_append_matches_torch_reference() -> None:
     triton_append_kv_cache(keys, values, cache_keys, cache_values, dynamic_seq_start)
     torch.testing.assert_close(cache_keys, expected_keys)
     torch.testing.assert_close(cache_values, expected_values)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or not triton_available(), reason="CUDA Triton kernels unavailable")
+def test_triton_ragged_prefix_copy_matches_torch_reference() -> None:
+    from torchinferno.kernels.triton_ops import triton_copy_ragged_prefix_kv
+
+    torch.manual_seed(0)
+    keys = torch.randn((8, 2, 17, 8), device="cuda", dtype=torch.bfloat16)
+    values = torch.randn_like(keys)
+    expected_keys = keys.clone()
+    expected_values = values.clone()
+    lengths = torch.tensor([0, 3, 7, 11], device="cuda")
+    dest_rows = torch.tensor([0, 4, 5, 6], device="cuda")
+    source_rows = torch.tensor([0, 1, 2, 3], device="cuda")
+    for length, dest, source in zip(
+        lengths.tolist(),
+        dest_rows.tolist(),
+        source_rows.tolist(),
+    ):
+        expected_keys[dest, :, :length].copy_(keys[source, :, :length])
+        expected_values[dest, :, :length].copy_(values[source, :, :length])
+
+    triton_copy_ragged_prefix_kv(
+        keys,
+        values,
+        lengths,
+        dest_rows,
+        source_rows,
+        prefix_capacity=16,
+    )
+
+    torch.testing.assert_close(keys, expected_keys)
+    torch.testing.assert_close(values, expected_values)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or not triton_available(), reason="CUDA Triton kernels unavailable")
+def test_triton_layered_ragged_prefix_copy_matches_torch_reference() -> None:
+    from torchinferno.kernels.triton_ops import triton_copy_ragged_prefix_kv_layers
+
+    torch.manual_seed(3)
+    keys = torch.randn((3, 8, 2, 17, 8), device="cuda", dtype=torch.bfloat16)
+    values = torch.randn_like(keys)
+    expected_keys = keys.clone()
+    expected_values = values.clone()
+    lengths = torch.tensor([0, 3, 7, 11], device="cuda")
+    dest_rows = torch.tensor([0, 4, 5, 6], device="cuda")
+    source_rows = torch.tensor([0, 1, 2, 3], device="cuda")
+    for length, dest, source in zip(
+        lengths.tolist(),
+        dest_rows.tolist(),
+        source_rows.tolist(),
+    ):
+        expected_keys[:, dest, :, :length].copy_(keys[:, source, :, :length])
+        expected_values[:, dest, :, :length].copy_(values[:, source, :, :length])
+
+    triton_copy_ragged_prefix_kv_layers(
+        keys,
+        values,
+        lengths,
+        dest_rows,
+        source_rows,
+        prefix_capacity=16,
+    )
+
+    torch.testing.assert_close(keys, expected_keys)
+    torch.testing.assert_close(values, expected_values)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or not triton_available(), reason="CUDA Triton kernels unavailable")
+def test_triton_packed_rotary_append_matches_torch_reference() -> None:
+    from torchinferno.kernels.triton_ops import triton_apply_rotary_append_kv_packed
+    from torchinferno.models.llama3.tensor_parallel import _rotate_llama_eager
+
+    torch.manual_seed(18)
+    tokens, q_heads, kv_heads, head_dim = 7, 4, 2, 16
+    q = torch.randn(1, q_heads, tokens, head_dim, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(1, kv_heads, tokens, head_dim, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    rows = torch.tensor([1, 1, 1, 3, 3, 5, 5], device="cuda")
+    positions = torch.tensor([2, 3, 4, 1, 2, 0, 1], device="cuda")
+    frequencies = torch.randn(tokens, head_dim // 2, device="cuda")
+    cos = frequencies.cos().to(torch.bfloat16)
+    sin = frequencies.sin().to(torch.bfloat16)
+    expected_q = _rotate_llama_eager(q, cos[None, None], sin[None, None])
+    expected_k = _rotate_llama_eager(k, cos[None, None], sin[None, None])
+    expected_cache_keys = torch.zeros(
+        8, kv_heads, 10, head_dim, device="cuda", dtype=torch.bfloat16
+    )
+    expected_cache_values = torch.zeros_like(expected_cache_keys)
+    for token, (row, position) in enumerate(zip(rows.tolist(), positions.tolist())):
+        expected_cache_keys[row, :, position].copy_(expected_k[0, :, token])
+        expected_cache_values[row, :, position].copy_(v[0, :, token])
+
+    actual_q = q.clone()
+    actual_cache_keys = torch.zeros_like(expected_cache_keys)
+    actual_cache_values = torch.zeros_like(expected_cache_values)
+    triton_apply_rotary_append_kv_packed(
+        actual_q,
+        k,
+        v,
+        actual_cache_keys,
+        actual_cache_values,
+        positions,
+        rows,
+        cos,
+        sin,
+    )
+
+    torch.testing.assert_close(actual_q, expected_q, atol=4e-2, rtol=4e-2)
+    torch.testing.assert_close(actual_cache_keys, expected_cache_keys, atol=4e-2, rtol=4e-2)
+    torch.testing.assert_close(actual_cache_values, expected_cache_values)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available() or not triton_available(), reason="CUDA Triton kernels unavailable")

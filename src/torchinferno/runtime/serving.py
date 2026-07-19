@@ -41,11 +41,6 @@ def _ragged_decode_graph_key_cache_suffix(graph_key: object) -> str | None:
     return f"cache{str(raw).replace(' ', '')}"
 
 
-def _preferred_prefix_rows() -> tuple[int, ...]:
-    raw = os.environ.get("TORCHINFERNO_CONTINUOUS_PREFERRED_PREFIX_ROWS", "48,53,68,69,128")
-    return _parse_positive_int_csv(raw, minimum=0)
-
-
 def _parse_positive_int_csv(raw: str | None, *, minimum: int = 1) -> tuple[int, ...]:
     rows: list[int] = []
     seen: set[int] = set()
@@ -69,6 +64,82 @@ def _bucket_from_values(length: int, buckets: tuple[int, ...]) -> int | None:
         if length <= bucket:
             return bucket
     return None
+
+
+def _piecewise_token_bucket(length: int) -> int:
+    """Round token work into generic graph capacities without request signatures."""
+    length = max(1, int(length))
+    if length <= 64:
+        quantum = 8
+    elif length <= 512:
+        quantum = 32
+    elif length <= 2048:
+        quantum = 64
+    elif length <= 8192:
+        quantum = 128
+    else:
+        quantum = 256
+    return ((length + quantum - 1) // quantum) * quantum
+
+
+def _packed_token_capacity_with_savings(real_tokens: int, dense_tokens: int) -> int | None:
+    """Return a graph capacity only when packing reduces model token work."""
+    real_tokens = max(0, int(real_tokens))
+    dense_tokens = max(0, int(dense_tokens))
+    if real_tokens <= 0 or dense_tokens <= 0 or real_tokens > dense_tokens:
+        return None
+    capacity = min(_piecewise_token_bucket(real_tokens), dense_tokens)
+    return capacity if capacity < dense_tokens else None
+
+
+def _prefix_copy_bucket(length: int) -> int:
+    length = max(1, int(length))
+    bucket = 64
+    while bucket < length:
+        bucket *= 2
+    return bucket
+
+
+def _decode_batch_buckets(capacity: int) -> tuple[int, ...]:
+    capacity = max(1, int(capacity))
+    buckets = {1, capacity}
+    for bucket in (2, 4):
+        if bucket <= capacity:
+            buckets.add(bucket)
+    buckets.update(range(8, capacity + 1, 8))
+    return tuple(sorted(buckets))
+
+
+def _token_bucket_fa3_batch_capacities() -> tuple[int, ...]:
+    maximum = env_int(
+        "TORCHINFERNO_CONTINUOUS_TOKEN_BUCKET_FA3_BATCH_CAPACITY",
+        64,
+        minimum=1,
+    )
+    configured = os.environ.get(
+        "TORCHINFERNO_CONTINUOUS_TOKEN_BUCKET_FA3_BATCH_CAPACITIES"
+    )
+    if configured is not None:
+        capacities = {
+            capacity
+            for capacity in _parse_positive_int_csv(configured)
+            if capacity <= maximum
+        }
+    else:
+        capacities = set()
+        capacity = min(32, maximum)
+        while capacity < maximum:
+            capacities.add(capacity)
+            capacity *= 2
+    capacities.add(maximum)
+    return tuple(sorted(capacities))
+
+
+def _token_bucket_fa3_batch_capacity(real_batch: int) -> int | None:
+    return _bucket_from_values(
+        max(1, int(real_batch)),
+        _token_bucket_fa3_batch_capacities(),
+    )
 
 
 def _packed_prefill_candidate_signature(
@@ -230,55 +301,11 @@ def _default_prefix_prefill_suffix_buckets(
     temperature: float,
     max_generation_tokens: int | None,
 ) -> tuple[int, ...]:
-    if max_generation_tokens is None:
-        return ()
-    if temperature > 0.0:
-        sampled_medium_min_tokens = env_int(
-            "TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SUFFIX_BUCKETS_SAMPLED_MEDIUM_MIN_TOKENS",
-            256,
-            minimum=0,
-        )
-        sampled_medium_max_tokens = env_int(
-            "TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SUFFIX_BUCKETS_SAMPLED_MEDIUM_MAX_TOKENS",
-            384,
-            minimum=sampled_medium_min_tokens,
-        )
-        if not (sampled_medium_min_tokens < int(max_generation_tokens) <= sampled_medium_max_tokens):
-            return ()
-        return _parse_positive_int_csv(
-            os.environ.get(
-                "TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SUFFIX_BUCKETS_SAMPLED_MEDIUM",
-                "12,16",
-            )
-        )
-    short_max_tokens = env_int(
-        "TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SUFFIX_BUCKETS_GREEDY_SHORT_MAX_TOKENS",
-        128,
-        minimum=1,
-    )
-    if 0 < max_generation_tokens <= short_max_tokens:
-        return _parse_positive_int_csv(
-            os.environ.get(
-                "TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SUFFIX_BUCKETS_GREEDY_SHORT",
-                "16,32,64,96,128,256",
-            )
-        )
-    min_tokens = env_int(
-        "TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SUFFIX_BUCKETS_GREEDY_LARGE_MIN_TOKENS",
-        400,
-        minimum=0,
-    )
-    max_tokens = env_int(
-        "TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SUFFIX_BUCKETS_GREEDY_LARGE_MAX_TOKENS",
-        512,
-        minimum=1,
-    )
-    if not (min_tokens < max_generation_tokens <= max_tokens):
-        return ()
+    del temperature, max_generation_tokens
     return _parse_positive_int_csv(
         os.environ.get(
-            "TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SUFFIX_BUCKETS_GREEDY_LARGE",
-            "16,32,64,80,96,112,128,144,160,192,224,256",
+            "TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_DEFAULT_SUFFIX_BUCKETS",
+            "1,2,4,8,12,16,32,64,96,128,256",
         )
     )
 
@@ -288,44 +315,13 @@ def _default_prefix_prefill_batch_buckets(
     max_generation_tokens: int | None,
     max_active_requests: int,
 ) -> tuple[int, ...]:
-    if max_generation_tokens is None or max_active_requests <= 0:
-        return ()
-    if temperature <= 0.0:
-        greedy_short_min_tokens = env_int(
-            "TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_BATCH_BUCKETS_GREEDY_SHORT_MIN_TOKENS",
-            1,
-            minimum=0,
-        )
-        greedy_short_max_tokens = env_int(
-            "TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_BATCH_BUCKETS_GREEDY_SHORT_MAX_TOKENS",
-            128,
-            minimum=greedy_short_min_tokens,
-        )
-        if not (greedy_short_min_tokens <= int(max_generation_tokens) <= greedy_short_max_tokens):
-            return ()
-        buckets = _parse_positive_int_csv(
-            os.environ.get(
-                "TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_BATCH_BUCKETS_GREEDY_SHORT",
-                "1,2,4,8,16,24,32",
-            )
-        )
-        return tuple(bucket for bucket in buckets if bucket <= int(max_active_requests))
-    sampled_medium_min_tokens = env_int(
-        "TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_BATCH_BUCKETS_SAMPLED_MEDIUM_MIN_TOKENS",
-        256,
-        minimum=0,
-    )
-    sampled_medium_max_tokens = env_int(
-        "TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_BATCH_BUCKETS_SAMPLED_MEDIUM_MAX_TOKENS",
-        384,
-        minimum=sampled_medium_min_tokens,
-    )
-    if not (sampled_medium_min_tokens < int(max_generation_tokens) <= sampled_medium_max_tokens):
+    del temperature, max_generation_tokens
+    if max_active_requests <= 0:
         return ()
     buckets = _parse_positive_int_csv(
         os.environ.get(
-            "TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_BATCH_BUCKETS_SAMPLED_MEDIUM",
-            "1,2,4,8,16,24,32",
+            "TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_DEFAULT_BATCH_BUCKETS",
+            "1,2,4,8,16,32",
         )
     )
     return tuple(bucket for bucket in buckets if bucket <= int(max_active_requests))
@@ -381,57 +377,22 @@ def _dynamic_prefix_prefill_max_suffix_for_policy(
     temperature: float,
     max_tokens: int | None,
 ) -> int | None:
+    del temperature, max_tokens
     if "TORCHINFERNO_CONTINUOUS_DYNAMIC_PREFIX_PREFILL_MAX_SUFFIX" in os.environ:
         return None
-    if temperature > 0.0:
-        return 0
-    if max_tokens is None or int(max_tokens) <= 0:
-        return None
-    short_max_tokens = env_int(
-        "TORCHINFERNO_CONTINUOUS_DYNAMIC_PREFIX_PREFILL_GREEDY_SHORT_MAX_TOKENS",
-        128,
-        minimum=1,
-    )
-    if int(max_tokens) <= short_max_tokens:
-        return env_int(
-            "TORCHINFERNO_CONTINUOUS_DYNAMIC_PREFIX_PREFILL_GREEDY_SHORT_MAX_SUFFIX",
-            128,
-            minimum=1,
-        )
-    large_min_tokens = env_int(
-        "TORCHINFERNO_CONTINUOUS_DYNAMIC_PREFIX_PREFILL_GREEDY_LARGE_MIN_TOKENS",
-        400,
+    return env_int(
+        "TORCHINFERNO_CONTINUOUS_DYNAMIC_PREFIX_PREFILL_DEFAULT_MAX_SUFFIX",
+        32,
         minimum=0,
     )
-    large_max_tokens = env_int(
-        "TORCHINFERNO_CONTINUOUS_DYNAMIC_PREFIX_PREFILL_GREEDY_LARGE_MAX_TOKENS",
-        512,
-        minimum=1,
-    )
-    if large_min_tokens < int(max_tokens) <= large_max_tokens:
-        return env_int(
-            "TORCHINFERNO_CONTINUOUS_DYNAMIC_PREFIX_PREFILL_GREEDY_LARGE_MAX_SUFFIX",
-            32,
-            minimum=0,
-        )
-    return None
 
 
-def _greedy_large_mixed_prefix_reuse_policy_enabled(
+def _mixed_prefix_reuse_policy_enabled(
     temperature: float,
     max_tokens: int | None,
 ) -> bool:
-    env_name = "TORCHINFERNO_CONTINUOUS_GREEDY_LARGE_MIXED_PREFIX_REUSE"
-    if not env_flag(env_name, False):
-        return False
-    if temperature > 0.0 or max_tokens is None:
-        return False
-    target_tokens = env_int(
-        "TORCHINFERNO_CONTINUOUS_GREEDY_LARGE_MIXED_PREFIX_REUSE_MAX_TOKENS",
-        512,
-        minimum=1,
-    )
-    return int(max_tokens) == target_tokens
+    del temperature, max_tokens
+    return env_flag("TORCHINFERNO_CONTINUOUS_MIXED_PREFIX_REUSE", False)
 
 
 @dataclass(frozen=True)
@@ -547,6 +508,8 @@ class ServingStats:
     decode_many_step_window_token_materialize_ms: dict[str, float] = field(default_factory=dict)
     prefix_reuse_requests: int = 0
     prefix_reuse_tokens: int = 0
+    prefix_row_move_requests: int = 0
+    prefix_row_move_tokens: int = 0
     queued_requests: int = 0
     scheduler_steps: int = 0
     max_model_batch_size: int = 0
@@ -642,6 +605,7 @@ class ServingStats:
     prefill_shape_graph_replay_gpu_ms: dict[str, float] = field(default_factory=dict)
     prefill_graph_capture_shape_gpu_ms: dict[str, float] = field(default_factory=dict)
     prefill_graph_replay_shape_gpu_ms: dict[str, float] = field(default_factory=dict)
+    prefill_graph_replay_shape_counts: dict[str, int] = field(default_factory=dict)
     prefill_shape_row_indices_omitted_batches: dict[str, int] = field(default_factory=dict)
     prefill_shape_row_indices_omitted_rows: dict[str, int] = field(default_factory=dict)
     prefill_shape_row_indices_indexed_batches: dict[str, int] = field(default_factory=dict)
@@ -713,9 +677,28 @@ class ServingStats:
     decode_ragged_model_gpu_ms: float = 0.0
     decode_ragged_cpu_tokens_ms: float = 0.0
     decode_ragged_state_update_ms: float = 0.0
+    decode_ragged_wall_steps: int = 0
+    decode_ragged_wall_prepare_ms: float = 0.0
+    decode_ragged_wall_prepare_rows_ms: float = 0.0
+    decode_ragged_wall_prepare_policy_ms: float = 0.0
+    decode_ragged_wall_prepare_inputs_ms: float = 0.0
+    decode_ragged_wall_prepare_seq_lens_ms: float = 0.0
+    decode_ragged_wall_gpu_state_hits: int = 0
+    decode_ragged_wall_gpu_state_misses: int = 0
+    decode_ragged_wall_model_submit_ms: float = 0.0
+    decode_ragged_wall_readback_ms: float = 0.0
+    decode_ragged_wall_state_ms: float = 0.0
+    decode_ragged_wall_total_ms: float = 0.0
     decode_shape_model_ms: dict[str, float] = field(default_factory=dict)
     decode_shape_gpu_ms: dict[str, float] = field(default_factory=dict)
     decode_shape_cpu_tokens_ms: dict[str, float] = field(default_factory=dict)
+    unified_steps: int = 0
+    unified_prepare_ms: float = 0.0
+    unified_model_submit_ms: float = 0.0
+    unified_sample_select_ms: float = 0.0
+    unified_sample_readback_ms: float = 0.0
+    unified_state_ms: float = 0.0
+    unified_total_ms: float = 0.0
     prompt_lookup_batches: int = 0
     prompt_lookup_requests: int = 0
     prompt_lookup_proposed_tokens: int = 0
@@ -921,6 +904,8 @@ class ContinuousBatchEngine:
         profile_timings: bool = False,
         admit_min_free_rows: int | None = None,
         admit_min_ready_requests: int | None = None,
+        admit_max_wait_steps: int | None = None,
+        admit_min_step_interval: int | None = None,
         admit_per_step_cap: int | None = None,
         enable_decode_many: bool | None = None,
         decode_many_allow_stop: bool | None = None,
@@ -930,7 +915,7 @@ class ContinuousBatchEngine:
         decode_many_min_active_pct: int | None = None,
         decode_many_sync_stops: bool | None = None,
         generated_prefix_cache: bool | None = None,
-        greedy_large_mixed_prefix_reuse: bool | None = None,
+        mixed_prefix_reuse: bool | None = None,
         max_generation_tokens: int | None = None,
     ) -> None:
         if max_active_requests < 1:
@@ -978,31 +963,24 @@ class ContinuousBatchEngine:
             max_active_requests,
             minimum=1,
         )
-        self._ragged_decode_bucket_sizes = tuple(
-            sorted(
-                {
-                    int(bucket)
-                    for bucket in _parse_positive_int_csv(
-                        os.environ.get("TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_BUCKET_SIZES")
-                    )
-                    if int(bucket) <= max_active_requests
-                }
+        configured_decode_buckets = os.environ.get(
+            "TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_BUCKET_SIZES"
+        )
+        self._ragged_decode_bucket_sizes = (
+            tuple(
+                sorted(
+                    {
+                        int(bucket)
+                        for bucket in _parse_positive_int_csv(configured_decode_buckets)
+                        if int(bucket) <= max_active_requests
+                    }
+                )
             )
+            if configured_decode_buckets is not None
+            else _decode_batch_buckets(max_active_requests)
         )
         self.store_reusable_prefixes = store_reusable_prefixes
         self.store_full_prompt_prefixes = store_full_prompt_prefixes
-        self._cached_repeated_sample_state_enabled = env_flag(
-            "TORCHINFERNO_CONTINUOUS_CACHED_REPEATED_SAMPLE_STATE",
-            True,
-        )
-        prepare_repeated_sample_state = getattr(model, "prepare_repeated_next_token_state", None)
-        self._prepare_repeated_sample_state = (
-            prepare_repeated_sample_state if callable(prepare_repeated_sample_state) else None
-        )
-        sample_repeated_from_state = getattr(model, "sample_repeated_next_token_from_state", None)
-        self._sample_repeated_from_state = (
-            sample_repeated_from_state if callable(sample_repeated_from_state) else None
-        )
         prefill_token_logits_graph = getattr(model, "try_prefill_ragged_token_logits_graph", None)
         self._prefill_ragged_token_logits_graph = (
             prefill_token_logits_graph if callable(prefill_token_logits_graph) else None
@@ -1028,10 +1006,20 @@ class ContinuousBatchEngine:
             None if admit_min_free_rows is None else max(1, int(admit_min_free_rows))
         )
         self.admit_min_ready_requests = admit_min_ready_requests
+        self.admit_max_wait_steps = (
+            None
+            if admit_max_wait_steps is None
+            else max(0, int(admit_max_wait_steps))
+        )
+        self.admit_min_step_interval = (
+            None
+            if admit_min_step_interval is None
+            else max(1, int(admit_min_step_interval))
+        )
         self.admit_per_step_cap = admit_per_step_cap
         self.generated_prefix_cache = generated_prefix_cache
-        self.greedy_large_mixed_prefix_reuse = (
-            None if greedy_large_mixed_prefix_reuse is None else bool(greedy_large_mixed_prefix_reuse)
+        self.mixed_prefix_reuse = (
+            None if mixed_prefix_reuse is None else bool(mixed_prefix_reuse)
         )
         self.enable_decode_many = (
             env_flag("TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY", False)
@@ -1097,11 +1085,6 @@ class ContinuousBatchEngine:
             False,
         )
         self._fi_decode_graph_mode = _fi_decode_graph_mode()
-        self._sampled_fi_decode_max_tokens = env_int(
-            "TORCHINFERNO_CONTINUOUS_FI_DECODE_SAMPLED_MAX_TOKENS",
-            256,
-            minimum=0,
-        )
         self._decode_capture_on_miss_override = (
             env_flag("TORCHINFERNO_CONTINUOUS_DECODE_CAPTURE", False)
             if "TORCHINFERNO_CONTINUOUS_DECODE_CAPTURE" in os.environ
@@ -1109,7 +1092,10 @@ class ContinuousBatchEngine:
         )
         self.unified_forward = bool(
             env_flag("TORCHINFERNO_CONTINUOUS_UNIFIED_FORWARD", False)
-            and hasattr(model, "forward_step_flashinfer")
+            and (
+                hasattr(model, "forward_step_flashinfer")
+                or hasattr(model, "try_prefill_token_bucket_fa3_graph")
+            )
         )
         self.prefix_cache = PrefixCacheIndex()
         self.reusable_prefixes: dict[Hashable, _ReusablePrefix] = {}
@@ -1150,7 +1136,9 @@ class ContinuousBatchEngine:
         self._online_active: list[_ActiveRequest] = []
         self._online_prefilling: list[_ActiveRequest] = []
         self._online_step = 0
+        self._last_admit_step: int | None = None
         self._online_next_index = 0
+        self._pending_online_finish_states: list[_ActiveRequest] = []
         self._pending_prefill_graph_events: list[tuple[object, ...]] = []
         self._pending_packed_prefill_eager_events: list[tuple[object, ...]] = []
         self._pending_decode_ragged_model_events: list[tuple[object, ...]] = []
@@ -1172,10 +1160,10 @@ class ContinuousBatchEngine:
             ),
         )
 
-    def _greedy_large_mixed_prefix_reuse_enabled(self) -> bool:
-        if self.greedy_large_mixed_prefix_reuse is not None:
-            return self.greedy_large_mixed_prefix_reuse
-        return _greedy_large_mixed_prefix_reuse_policy_enabled(
+    def _mixed_prefix_reuse_enabled(self) -> bool:
+        if self.mixed_prefix_reuse is not None:
+            return self.mixed_prefix_reuse
+        return _mixed_prefix_reuse_policy_enabled(
             self.temperature,
             self.max_generation_tokens,
         )
@@ -1183,7 +1171,7 @@ class ContinuousBatchEngine:
     def _policy_or_env_flag(self, env_name: str) -> bool:
         if env_name in os.environ:
             return env_flag(env_name, False)
-        return self._greedy_large_mixed_prefix_reuse_enabled()
+        return self._mixed_prefix_reuse_enabled()
 
     def _mixed_prefix_prefill_enabled(self) -> bool:
         return self._policy_or_env_flag("TORCHINFERNO_CONTINUOUS_MIXED_PREFIX_PREFILL")
@@ -1314,6 +1302,7 @@ class ContinuousBatchEngine:
         self._online_waiting = ServingQueue()
         self._online_active = []
         self._online_step = 0
+        self._last_admit_step = None
         self._online_next_index = 0
 
     def submit_online(self, request: ServingRequest) -> None:
@@ -1324,6 +1313,7 @@ class ContinuousBatchEngine:
 
     @torch.inference_mode()
     def step_decode_only(self) -> list[ServingTokenEvent]:
+        self._flush_pending_online_finishes()
         if not self._online_active:
             return []
         events: list[ServingTokenEvent] = []
@@ -1383,7 +1373,7 @@ class ContinuousBatchEngine:
             return False
         if self._online_prefilling or not self._online_active:
             return False
-        if self.unified_forward or not self.decode_first:
+        if not self.decode_first:
             return False
         if (
             any(self._state_temperature(state) > 0.0 for state in self._online_active)
@@ -2189,8 +2179,13 @@ class ContinuousBatchEngine:
         return events, steps_run
 
     def has_online_work(self) -> bool:
+        self._flush_pending_online_finishes()
         waiting = self._online_waiting
-        return bool(waiting) or bool(self._online_active) or bool(self._online_prefilling)
+        return (
+            bool(waiting)
+            or bool(self._online_active)
+            or bool(self._online_prefilling)
+        )
 
     def has_online_waiting_requests(self) -> bool:
         return bool(self._online_waiting)
@@ -2200,10 +2195,23 @@ class ContinuousBatchEngine:
             return None
         return min(state.generated for state in self._online_active)
 
+    def online_active_request_count(self) -> int:
+        return len(self._online_active)
+
     @torch.inference_mode()
     def step_online(self) -> list[ServingTokenEvent]:
+        self._flush_pending_online_finishes()
         if self.unified_forward:
             return self._step_online_unified()
+        if (
+            env_flag("TORCHINFERNO_CONTINUOUS_OVERLAP_PREFILL_DECODE", False)
+            and self.device.type == "cuda"
+            and self.decode_first
+            and self._online_active
+            and self._online_waiting
+            and not self._online_prefilling
+        ):
+            return self._step_online_overlapped()
         waiting = self._require_online_waiting()
         if not waiting and not self._online_active and not self._online_prefilling:
             return []
@@ -2263,7 +2271,68 @@ class ContinuousBatchEngine:
         return events
 
     @torch.inference_mode()
+    def _step_online_overlapped(self) -> list[ServingTokenEvent]:
+        waiting = self._require_online_waiting()
+        events: list[ServingTokenEvent] = []
+        step = self._online_step
+        self.stats.scheduler_steps += 1
+
+        live: list[_ActiveRequest] = []
+        for state in self._online_active:
+            state.seq_len = self._cache_row_seq_len(state.row, state.seq_len)
+            if self._should_finish_before_decode(state):
+                self._finish_and_release(state, step)
+            else:
+                live.append(state)
+
+        admitted = self._admit_ready_requests(waiting, step, len(live))
+        if not live:
+            _results, active = self._prefill_many(admitted, step, events=events)
+        elif not admitted or not self._can_decode_ragged(live):
+            _results, active = self._decode_active(live, step, events=events)
+            if admitted:
+                _prefill_results, admitted_active = self._prefill_many(
+                    admitted,
+                    step,
+                    events=events,
+                )
+                active.extend(admitted_active)
+        else:
+            if not self._active_gpu_decode_state_is_current(live):
+                self._set_gpu_decode_state_for_active(live)
+            next_tokens, _model_tokens = self._decode_ragged_batch_token_tensor(live)
+
+            stream = getattr(self, "_overlap_prefill_stream", None)
+            if stream is None:
+                stream = torch.cuda.Stream(device=self.device)
+                self._overlap_prefill_stream = stream
+            prefill_events: list[ServingTokenEvent] = []
+            with torch.cuda.stream(stream):
+                _prefill_results, admitted_active = self._prefill_many(
+                    admitted,
+                    step,
+                    events=prefill_events,
+                )
+            torch.cuda.current_stream(self.device).wait_stream(stream)
+
+            decoded_tokens = next_tokens[: len(live)].detach().cpu().tolist()
+            self._finalize_decode(decoded_tokens, live, step, events)
+            events.extend(prefill_events)
+            active = [state for state in live if not self._should_finish_before_decode(state)]
+            active.extend(admitted_active)
+
+        self._online_active = active
+        self._set_gpu_decode_state_for_active(active)
+        self._online_step = step + 1
+        next_arrival_step = waiting.next_arrival_step()
+        if next_arrival_step is not None and not active and next_arrival_step > self._online_step:
+            self._online_step = next_arrival_step
+        return events
+
+    @torch.inference_mode()
     def _step_online_unified(self) -> list[ServingTokenEvent]:
+        profile_wall = self.profile_timings or _queue_profile_counts_enabled()
+        profile_start_s = time.perf_counter() if profile_wall else 0.0
         waiting = self._require_online_waiting()
         if not waiting and not self._online_active and not self._online_prefilling:
             return []
@@ -2271,6 +2340,11 @@ class ContinuousBatchEngine:
         step = self._online_step
         self.stats.scheduler_steps += 1
         cache = self._require_cache()
+        token_bucket_unified = bool(
+            env_flag("TORCHINFERNO_CONTINUOUS_TOKEN_BUCKET_FA3_UNIFIED", False)
+            and hasattr(self.model, "try_prefill_token_bucket_fa3_graph")
+            and hasattr(self.model, "try_copy_token_bucket_prefix_graph")
+        )
 
         decode_states: list[_ActiveRequest] = []
         for state in self._online_active:
@@ -2285,6 +2359,8 @@ class ContinuousBatchEngine:
         admitted = self._admit_ready_requests(waiting, step, occupied)
 
         prefill_states: list[_ActiveRequest] = []
+        skipped_prefix_copy_tokens = 0
+        self._prepare_chunked_common_prefix_for_admission(admitted)
         for original_index, request in admitted:
             match, entry = self.prefix_cache.lookup(request.prompt)
             reusable = self.reusable_prefixes.get(entry.route_id) if entry is not None else None
@@ -2294,10 +2370,38 @@ class ContinuousBatchEngine:
                 reusable = None
                 prefix_hit = 0
             self._record_full_prompt_reuse_candidate_lookup(request.prompt, prefix_hit)
-            row = self._acquire_active_row()
+            preserve_warm_prefix = self._warm_row_prefix_copy_skip_enabled()
+            moved_prefix_row = None
             if reusable is not None and prefix_hit > 0:
-                self._copy_prefix(reusable.row, row, prefix_hit)
+                moved_prefix_row = self._take_reusable_prefix_row(
+                    reusable,
+                    prompt=request.prompt,
+                    prefix_hit_tokens=prefix_hit,
+                )
+            row = (
+                moved_prefix_row
+                if moved_prefix_row is not None
+                else self._acquire_active_row(clear_cache=not preserve_warm_prefix)
+            )
+            if reusable is not None and prefix_hit > 0:
+                warm_prefix_hit = (
+                    moved_prefix_row is not None
+                    or (
+                        preserve_warm_prefix
+                        and self._rows_have_cached_prefix(
+                            (row,),
+                            request.prompt,
+                            prefix_hit,
+                        )
+                    )
+                )
+                if not token_bucket_unified and not warm_prefix_hit:
+                    self._copy_prefix(reusable.row, row, prefix_hit)
+                if warm_prefix_hit:
+                    skipped_prefix_copy_tokens += prefix_hit
                 self._record_prefix_reuse(prefix_hit, reusable)
+            else:
+                warm_prefix_hit = False
             suffix = request.prompt[prefix_hit:]
             state = _ActiveRequest(
                 original_index=original_index,
@@ -2311,8 +2415,15 @@ class ContinuousBatchEngine:
                 started_step=step,
             )
             state._prefill_suffix = suffix
+            state._prefill_source_row = reusable.row if reusable is not None else row
+            state._prefill_copy_len = (
+                prefix_hit if token_bucket_unified and not warm_prefix_hit else 0
+            )
             prefill_states.append(state)
         self.stats.prefill_admitted_requests += len(prefill_states)
+        if skipped_prefix_copy_tokens:
+            self.stats.prefill_prefix_copy_skipped_batches += 1
+            self.stats.prefill_prefix_copy_skipped_tokens += skipped_prefix_copy_tokens
 
         if not decode_states and not prefill_states and not self._online_prefilling:
             self._online_active = []
@@ -2327,6 +2438,8 @@ class ContinuousBatchEngine:
             batch_write_pos: list[list[int]] = []
             batch_logit_pos = []
             batch_seq_lens = []
+            batch_source_rows: list[int] = []
+            batch_copy_lens: list[int] = []
             max_q = 1
             batch_is_decode: list[bool] = []
             batch_states: list[_ActiveRequest] = []
@@ -2338,6 +2451,8 @@ class ContinuousBatchEngine:
                 batch_write_pos.append([state.seq_len])
                 batch_logit_pos.append(0)
                 batch_seq_lens.append(state.seq_len)
+                batch_source_rows.append(state.row)
+                batch_copy_lens.append(0)
                 batch_is_decode.append(True)
                 batch_states.append(state)
 
@@ -2350,7 +2465,6 @@ class ContinuousBatchEngine:
                 if chunk and len(suffix) > chunk:
                     cur_suffix = suffix[:chunk]
                     state._prefill_suffix = suffix[chunk:]
-                    still_prefilling.append(state)
                 else:
                     cur_suffix = suffix
                     state._prefill_suffix = None
@@ -2364,6 +2478,10 @@ class ContinuousBatchEngine:
                 batch_write_pos.append(list(range(cursor, cursor + q_len)))
                 batch_logit_pos.append(q_len - 1)
                 batch_seq_lens.append(cursor)
+                batch_source_rows.append(
+                    int(getattr(state, "_prefill_source_row", state.row))
+                )
+                batch_copy_lens.append(int(getattr(state, "_prefill_copy_len", 0)))
                 batch_is_decode.append(False)
                 batch_states.append(state)
                 max_q = max(max_q, q_len)
@@ -2375,34 +2493,78 @@ class ContinuousBatchEngine:
                 return events
 
             n = len(batch_rows)
-            for i in range(n):
-                last_wp = batch_write_pos[i][-1] if batch_write_pos[i] else 0
-                while len(batch_input_ids[i]) < max_q:
-                    batch_input_ids[i].append(0)
-                while len(batch_write_pos[i]) < max_q:
-                    batch_write_pos[i].append(last_wp)
-
-            input_ids = torch.tensor(batch_input_ids, device=self.device, dtype=torch.long)
-            q_lens_t = torch.tensor(batch_q_lens, device=self.device, dtype=torch.long)
-            write_positions = torch.tensor(batch_write_pos, device=self.device, dtype=torch.long)
-            logit_positions = torch.tensor(batch_logit_pos, device=self.device, dtype=torch.long)
-            seq_lens_t = torch.tensor(batch_seq_lens, device=self.device, dtype=torch.long)
-            row_indices = torch.tensor(batch_rows, device=self.device, dtype=torch.long)
-
-            logits = self.model.forward_step_flashinfer(
-                input_ids, cache,
-                seq_lens=seq_lens_t, q_lens=q_lens_t,
-                write_positions=write_positions,
-                logit_positions=logit_positions,
-                row_indices=row_indices,
+            if profile_wall:
+                self.stats.unified_prepare_ms += (
+                    time.perf_counter() - profile_start_s
+                ) * 1000.0
+            model_start_s = time.perf_counter() if profile_wall else 0.0
+            logits = self._try_unified_token_bucket_fa3_logits(
+                input_sequences=batch_input_ids,
+                q_lens=batch_q_lens,
+                start_lens=batch_seq_lens,
+                rows=batch_rows,
+                source_rows=batch_source_rows,
+                copy_lens=batch_copy_lens,
+                capture_on_miss=self._decode_capture_on_miss(),
             )
-            self._record_model_call("unified", n, tokens=int(q_lens_t.sum().item()))
-            next_tokens_cpu = self._sample_logits_for_states(
+            if logits is None:
+                if token_bucket_unified:
+                    for state, source_row, copy_len, is_decode in zip(
+                        batch_states,
+                        batch_source_rows,
+                        batch_copy_lens,
+                        batch_is_decode,
+                    ):
+                        if not is_decode and copy_len > 0:
+                            self._copy_prefix(source_row, state.row, copy_len)
+                for i in range(n):
+                    last_wp = batch_write_pos[i][-1] if batch_write_pos[i] else 0
+                    while len(batch_input_ids[i]) < max_q:
+                        batch_input_ids[i].append(0)
+                    while len(batch_write_pos[i]) < max_q:
+                        last_wp += 1
+                        batch_write_pos[i].append(last_wp)
+
+                input_ids = torch.tensor(batch_input_ids, device=self.device, dtype=torch.long)
+                q_lens_t = torch.tensor(batch_q_lens, device=self.device, dtype=torch.long)
+                write_positions = torch.tensor(batch_write_pos, device=self.device, dtype=torch.long)
+                logit_positions = torch.tensor(batch_logit_pos, device=self.device, dtype=torch.long)
+                seq_lens_t = torch.tensor(batch_seq_lens, device=self.device, dtype=torch.long)
+                row_indices = torch.tensor(batch_rows, device=self.device, dtype=torch.long)
+                logits = self.model.forward_step_flashinfer(
+                    input_ids, cache,
+                    seq_lens=seq_lens_t, q_lens=q_lens_t,
+                    write_positions=write_positions,
+                    logit_positions=logit_positions,
+                    row_indices=row_indices,
+                )
+            if profile_wall:
+                self.stats.unified_model_submit_ms += (
+                    time.perf_counter() - model_start_s
+                ) * 1000.0
+            self._record_model_call("unified", n, tokens=sum(batch_q_lens))
+            sample_select_start_s = time.perf_counter() if profile_wall else 0.0
+            next_tokens = self._sample_logits_for_states(
                 logits[:, -1, :],
                 batch_states,
-            ).detach().cpu().tolist()
+            ).detach()
+            if profile_wall:
+                self.stats.unified_sample_select_ms += (
+                    time.perf_counter() - sample_select_start_s
+                ) * 1000.0
+            sample_readback_start_s = time.perf_counter() if profile_wall else 0.0
+            next_tokens_cpu = next_tokens.cpu().tolist()
+            if profile_wall:
+                self.stats.unified_sample_readback_ms += (
+                    time.perf_counter() - sample_readback_start_s
+                ) * 1000.0
 
+            state_start_s = time.perf_counter() if profile_wall else 0.0
             next_active: list[_ActiveRequest] = []
+            next_active_batch_indices: list[int] = []
+            prefill_rows_to_update: list[int] = []
+            prefill_seq_lens_to_update: list[int] = []
+            completed_prefills: list[tuple[int, _ActiveRequest, int]] = []
             for i, state in enumerate(batch_states):
                 tok = int(next_tokens_cpu[i])
                 if batch_is_decode[i]:
@@ -2417,38 +2579,68 @@ class ContinuousBatchEngine:
                         self._finish_and_release(state, step)
                     else:
                         next_active.append(state)
+                        next_active_batch_indices.append(i)
                 else:
                     q_len = batch_q_lens[i]
                     new_seq_len = batch_seq_lens[i] + q_len
-                    self._set_cache_row_seq_len(state.row, new_seq_len)
-                    self._remember_row_seq_len(state.row, new_seq_len)
                     state.seq_len = new_seq_len
+                    state._prefill_source_row = state.row
+                    state._prefill_copy_len = 0
+                    prefill_rows_to_update.append(state.row)
+                    prefill_seq_lens_to_update.append(new_seq_len)
                     if state._prefill_suffix is None or len(state._prefill_suffix) == 0:
                         state.tokens.append(tok)
                         state.generated = 1
                         state.last_token = tok
                         state._prefill_suffix = None
-                        self._store_reusable_prefix(
-                            state.request.request_id, state.request.prompt,
-                            state.row,
-                            self._reusable_prefix_logits_for_store(
-                                state.request,
-                                logits,
-                                i,
-                            ),
-                            allow_pinned=self._allow_pinned_full_prompt_store(state.request),
-                        )
-                        finished = self._should_finish_after_decode(state)
-                        self._record_token_event(events, state, tok, step, finished=finished)
-                        if finished:
-                            self._finish_and_release(state, step)
-                        else:
-                            next_active.append(state)
+                        completed_prefills.append((i, state, tok))
                     else:
                         still_prefilling.append(state)
 
+            self._set_cache_row_seq_lens(
+                prefill_rows_to_update,
+                prefill_seq_lens_to_update,
+            )
+            for i, state, tok in completed_prefills:
+                self._store_reusable_prefix(
+                    state.request.request_id,
+                    state.request.prompt,
+                    state.row,
+                    self._reusable_prefix_logits_for_store(
+                        state.request,
+                        logits,
+                        i,
+                    ),
+                    allow_pinned=self._allow_pinned_full_prompt_store(state.request),
+                )
+                finished = self._should_finish_after_decode(state)
+                self._record_token_event(events, state, tok, step, finished=finished)
+                if finished:
+                    self._finish_and_release(state, step)
+                else:
+                    next_active.append(state)
+                    next_active_batch_indices.append(i)
+
             self._online_active = next_active
             self._online_prefilling = still_prefilling
+            if next_active:
+                token_indices = self._device_index_tensor(
+                    tuple(next_active_batch_indices)
+                )
+                self._set_gpu_decode_state(
+                    [state.row for state in next_active],
+                    next_tokens.index_select(0, token_indices),
+                    [state.seq_len for state in next_active],
+                )
+                self._decode_many_gpu_state_signature = (
+                    self._make_decode_many_gpu_state_signature(next_active)
+                )
+            else:
+                self._decode_many_gpu_state_signature = ()
+            if profile_wall:
+                self.stats.unified_state_ms += (
+                    time.perf_counter() - state_start_s
+                ) * 1000.0
         else:
             decoded = (
                 self._decode_ragged_batch(decode_states, step, events=events)
@@ -2472,6 +2664,11 @@ class ContinuousBatchEngine:
         idle = not self._online_active and not self._online_prefilling
         if next_arrival_step is not None and idle and next_arrival_step > self._online_step:
             self._online_step = next_arrival_step
+        if profile_wall:
+            self.stats.unified_steps += 1
+            self.stats.unified_total_ms += (
+                time.perf_counter() - profile_start_s
+            ) * 1000.0
         return events
 
 
@@ -2534,7 +2731,14 @@ class ContinuousBatchEngine:
         if len(requests) <= 1:
             return
         prefix_tokens = _common_prefix_token_count([request.prompt for request in requests])
-        if prefix_tokens < 16 or not all(len(request.prompt) > prefix_tokens for request in requests):
+        # A prefix hit still needs fresh logits for the next token. Keep the
+        # final prompt token in every request's suffix so identical prompts can
+        # share KV without caching logits or sampling state.
+        prefix_tokens = min(
+            prefix_tokens,
+            min(len(request.prompt) - 1 for request in requests),
+        )
+        if prefix_tokens < 16:
             return
         prefix_tuple = tuple(requests[0].prompt[:prefix_tokens])
         common_route = ("common_prefix", prefix_tuple)
@@ -2818,6 +3022,7 @@ class ContinuousBatchEngine:
         self._row_seq_lens = [0 for _ in range(total_rows)]
         self._row_cached_prefixes = [None for _ in range(total_rows)]
         self._gpu_seq_lens = None
+        self._gpu_seq_lens_initialized_rows: set[int] = set()
         self._decode_many_gpu_state_signature = None
         self._device_index_tensors = {}
         self._free_active_rows = list(reversed(range(self.max_active_requests)))
@@ -2828,7 +3033,9 @@ class ContinuousBatchEngine:
         self._online_active = []
         self._online_prefilling = []
         self._online_step = 0
+        self._last_admit_step = None
         self._online_next_index = 0
+        self._pending_online_finish_states = []
         self._pending_prefill_graph_events = []
         self._pending_packed_prefill_eager_events = []
         self._pending_decode_ragged_model_events = []
@@ -2840,6 +3047,47 @@ class ContinuousBatchEngine:
         active_count: int,
     ) -> list[tuple[int, ServingRequest]]:
         capacity = self.max_active_requests - active_count
+        default_min_step_interval = (
+            1
+            if self.admit_min_step_interval is None
+            else int(self.admit_min_step_interval)
+        )
+        min_step_interval = env_int(
+            "TORCHINFERNO_CONTINUOUS_ADMIT_MIN_STEP_INTERVAL",
+            default_min_step_interval,
+            minimum=1,
+        )
+        sustained_min_generated = env_int(
+            "TORCHINFERNO_CONTINUOUS_ADMIT_SUSTAINED_MIN_GENERATED",
+            0,
+            minimum=0,
+        )
+        if sustained_min_generated > 0 and active_count > 0:
+            sustained_states = sum(
+                state.generated >= sustained_min_generated
+                and not self._should_finish_before_decode(state)
+                for state in self._online_active
+            )
+            sustained_min_pct = env_int(
+                "TORCHINFERNO_CONTINUOUS_ADMIT_SUSTAINED_MIN_ACTIVE_PCT",
+                50,
+                minimum=1,
+            )
+            if sustained_states * 100 >= active_count * sustained_min_pct:
+                min_step_interval = max(
+                    min_step_interval,
+                    env_int(
+                        "TORCHINFERNO_CONTINUOUS_ADMIT_SUSTAINED_MIN_STEP_INTERVAL",
+                        2,
+                        minimum=1,
+                    ),
+                )
+        if (
+            active_count > 0
+            and self._last_admit_step is not None
+            and step - self._last_admit_step < min_step_interval
+        ):
+            return []
         default_min_free_rows = (
             1 if self.admit_min_free_rows is None else int(self.admit_min_free_rows)
         )
@@ -2869,9 +3117,27 @@ class ContinuousBatchEngine:
             minimum=1,
         )
         if active_count > 0 and min_ready_requests > 1:
-            if waiting.ready_count(step=step) < min_ready_requests:
-                return []
-        return waiting.pop_admissible(
+            ready_count = waiting.ready_count(step=step)
+            if ready_count < min_ready_requests:
+                default_max_wait_steps = (
+                    0
+                    if self.admit_max_wait_steps is None
+                    else int(self.admit_max_wait_steps)
+                )
+                max_wait_steps = env_int(
+                    "TORCHINFERNO_CONTINUOUS_ADMIT_MAX_WAIT_STEPS",
+                    default_max_wait_steps,
+                    minimum=0,
+                )
+                oldest_ready_step = waiting.next_arrival_step()
+                waited_steps = (
+                    0
+                    if oldest_ready_step is None
+                    else max(0, int(step) - int(oldest_ready_step))
+                )
+                if max_wait_steps <= 0 or waited_steps < max_wait_steps:
+                    return []
+        admitted = waiting.pop_admissible(
             step=step,
             capacity=capacity,
             token_budget=self.prefill_token_budget,
@@ -2881,6 +3147,9 @@ class ContinuousBatchEngine:
                 active_count=active_count,
             ),
         )
+        if admitted:
+            self._last_admit_step = step
+        return admitted
 
     def _prefill_token_cost(self, request: ServingRequest) -> int:
         prefix_hit_tokens = self._reusable_prefix_hit_tokens(request.prompt)
@@ -2909,23 +3178,8 @@ class ContinuousBatchEngine:
         return env_flag("TORCHINFERNO_CONTINUOUS_ADMIT_PREFIX_HIT_PRIORITY", True)
 
     def _admit_prefill_cost_priority_enabled(self, *, active_count: int = 0) -> bool:
-        if "TORCHINFERNO_CONTINUOUS_ADMIT_PREFILL_COST_PRIORITY" in os.environ:
-            return env_flag("TORCHINFERNO_CONTINUOUS_ADMIT_PREFILL_COST_PRIORITY", False)
-        if self.temperature > 0.0 or self.max_generation_tokens is None:
-            return False
-        short_max = env_int(
-            "TORCHINFERNO_CONTINUOUS_ADMIT_PREFILL_COST_PRIORITY_GREEDY_SHORT_MAX_TOKENS",
-            128,
-            minimum=1,
-        )
-        if 0 < int(self.max_generation_tokens) <= short_max:
-            return True
-        if active_count <= 0:
-            return False
-        large_refill_env = "TORCHINFERNO_CONTINUOUS_ADMIT_PREFILL_COST_PRIORITY_GREEDY_LARGE_REFILL"
-        if large_refill_env in os.environ:
-            return env_flag(large_refill_env, False)
-        return False
+        del active_count
+        return env_flag("TORCHINFERNO_CONTINUOUS_ADMIT_PREFILL_COST_PRIORITY", False)
 
     def _prefill_many(
         self,
@@ -3034,13 +3288,12 @@ class ContinuousBatchEngine:
         # 8-GPU session, not incremental loop runs. Enable via the env flag +
         # pin_shared_prefix=False once that divergence is found.
         #
-        # IMPORTANT value caveat (8-GPU REUSE_DEBUG trace): with persistent=False
+        # With persistent=False,
         # every request burst starts a fresh online session and start_online ->
         # _reset_capacity WIPES reusable_prefixes/prefix_cache. So cross-burst
         # reuse never triggers (each _prefill_many logs cached_prefixes=0 at
-        # step=0) -- e.g. multi_turn's per-turn requests are separate bursts and
-        # get no reuse. Only WITHIN-session reuse fires (and that is the case that
-        # hangs on TP). Making reuse actually pay off therefore ALSO needs a
+        # step=0). Only within-session reuse fires (and that is the case that
+        # hangs on TP). Cross-burst reuse therefore also needs a
         # persistent engine whose prefix cache survives across bursts -- a larger
         # change than the reuse path itself.
         _reuse_dbg = env_flag("TORCHINFERNO_REUSE_DEBUG", False)
@@ -3066,19 +3319,14 @@ class ContinuousBatchEngine:
                 file=_rdbg.stderr, flush=True,
             )
 
-        # Common-prefix fast path: prefill a shared prefix ONCE then per-request
-        # suffixes. DISABLED by default -- live A/B on the real 70B (TP8) showed it
-        # is a regression in EVERY regime, including the identical-prompt
-        # self_consistency case it was built for. Cause: it routes the burst through
-        # the EAGER _prefill_logits path (launch-overhead bound, ~245ms/call on TP8
-        # because per-layer allreduces are not graph-amortized), bypassing the
+        # Common-prefix fast path: prefill a shared prefix once, then per-request
+        # suffixes. It remains opt-in because it routes the burst through the eager
+        # _prefill_logits path, where per-layer collectives are not graph-amortized,
+        # bypassing the
         # graph-backed _try_flashinfer_prefill below (try_prefill_flashinfer_graph,
-        # the warmup-captured _fi_prefill_graphs). Worse, the online batcher admits
-        # in waves (initial_batch_size=1), so each wave pays its own ~245ms eager
-        # prefix prefill. Measured TTFT (identical / distinct), ON vs OFF: N=8
-        # 603/737 -> 122/124; N=64 1549/2378 -> 999/949 (3-7x at low N, ~2x at high
-        # N, ~2x throughput). The graph-FI path handles identical and distinct
-        # equally fast, so this path only wins if eager prefill is ever fixed.
+        # the warmup-captured _fi_prefill_graphs). Wave-based admission can also
+        # repeat that eager prefix work. Re-evaluate this default when the shared
+        # prefix path uses the same graph-backed implementation.
         if (
             env_flag("TORCHINFERNO_CONTINUOUS_COMMON_PREFIX_PREFILL", False)
             and len(plain_group) > 1
@@ -3094,20 +3342,13 @@ class ContinuousBatchEngine:
                     plain_group = []
 
         all_fi_requests: list[tuple[int, ServingRequest, int, _ReusablePrefix | None]] = []
-        # FlashInfer prefill defaults OFF. MEASURED 2026-06-10 on the real 70B TP8
-        # local full bench at 64-conc: FI-prefill ON regressed few_shot ttft
-        # 216->759ms (3.5x), tpot 73->247ms, tput 4.1->1.1 vs identical config with
-        # FI-prefill OFF. The bench's prefills are small, so FlashInfer's varlen
-        # advantage does not apply and its per-wave plan/launch overhead dominates;
-        # TI's graphed ragged prefill is already GEMM-bound and faster here. The
-        # gate was default-ON, a footgun: it auto-enables whenever flashinfer is
-        # importable, so installing flashinfer (e.g. for paged decode) would
-        # silently regress serving 3.5x. Set the flag to 0 to opt back in.
+        # FlashInfer prefill defaults off for dense KV because its per-wave plan
+        # and launch overhead can dominate small prefills. Paged KV still requires
+        # it; dense deployments can opt in explicitly.
         paged_kv_cache = self._cache_uses_paged_kv()
         if paged_kv_cache or not env_flag("TORCHINFERNO_CONTINUOUS_FLASHINFER_PREFILL_DISABLE", True):
             # Do not let full-prompt FI prefill steal cached-prefix groups. The
-            # 20260704 tree packed-FI probe saved only 1.4K padded tokens but
-            # disabled all common-prefix reuse, pushing prefill wall to 17s.
+            # Packed full-prompt prefill must not disable common-prefix reuse.
             # Prefix-hit FI handling stays behind the separate FI_REUSE gate on
             # dense caches. With a paged FlashInfer cache, dense fallback is
             # unsafe, so route prefix-hit requests as full prompts instead of
@@ -3449,45 +3690,12 @@ class ContinuousBatchEngine:
         self,
         group: list[tuple[int, ServingRequest, int]],
     ) -> int:
-        configured = os.environ.get(
-            "TORCHINFERNO_CONTINUOUS_COMMON_PREFIX_RAGGED_SUFFIX_MAX_PREFIX_TOKENS"
+        del group
+        return env_int(
+            "TORCHINFERNO_CONTINUOUS_COMMON_PREFIX_RAGGED_SUFFIX_MAX_PREFIX_TOKENS",
+            128,
+            minimum=0,
         )
-        if configured is not None:
-            return env_int(
-                "TORCHINFERNO_CONTINUOUS_COMMON_PREFIX_RAGGED_SUFFIX_MAX_PREFIX_TOKENS",
-                64,
-                minimum=0,
-            )
-        if self.temperature <= 0.0 and group:
-            max_new_tokens = max(request.max_new_tokens for _index, request, _hit in group)
-            greedy_short_max = env_int(
-                "TORCHINFERNO_CONTINUOUS_COMMON_PREFIX_RAGGED_SUFFIX_GREEDY_SHORT_MAX_TOKENS",
-                128,
-                minimum=1,
-            )
-            if 0 < max_new_tokens <= greedy_short_max:
-                return env_int(
-                    "TORCHINFERNO_CONTINUOUS_COMMON_PREFIX_RAGGED_SUFFIX_GREEDY_SHORT_PREFIX_TOKENS",
-                    128,
-                    minimum=0,
-                )
-            greedy_mid_min = env_int(
-                "TORCHINFERNO_CONTINUOUS_COMMON_PREFIX_RAGGED_SUFFIX_GREEDY_MID_MIN_TOKENS",
-                greedy_short_max + 1,
-                minimum=1,
-            )
-            greedy_mid_max = env_int(
-                "TORCHINFERNO_CONTINUOUS_COMMON_PREFIX_RAGGED_SUFFIX_GREEDY_MID_MAX_TOKENS",
-                300,
-                minimum=greedy_mid_min,
-            )
-            if greedy_mid_min <= max_new_tokens <= greedy_mid_max:
-                return env_int(
-                    "TORCHINFERNO_CONTINUOUS_COMMON_PREFIX_RAGGED_SUFFIX_GREEDY_MID_PREFIX_TOKENS",
-                    128,
-                    minimum=0,
-                )
-        return 64
 
     def _prefill_common_prefix_padded_suffix_batch(
         self,
@@ -3624,23 +3832,14 @@ class ContinuousBatchEngine:
         env_name = "TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_CAPTURE_ON_MISS"
         if env_name in os.environ:
             return env_flag(env_name, True)
-        if self._greedy_large_mixed_prefix_reuse_enabled():
+        if self._mixed_prefix_reuse_enabled():
             return False
-        max_tokens = self.max_generation_tokens
-        if self.temperature <= 0.0 and max_tokens is not None:
-            greedy_short_max_tokens = env_int(
-                "TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_CAPTURE_GREEDY_SHORT_MAX_TOKENS",
-                128,
-                minimum=1,
-            )
-            if 0 < int(max_tokens) <= greedy_short_max_tokens:
-                max_capture_batch = env_int(
-                    "TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_CAPTURE_GREEDY_SHORT_MAX_BATCH",
-                    32,
-                    minimum=0,
-                )
-                return int(batch_bucket) <= max_capture_batch
-        return True
+        max_capture_batch = env_int(
+            "TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_CAPTURE_MAX_BATCH",
+            32,
+            minimum=0,
+        )
+        return int(batch_bucket) <= max_capture_batch
 
     def _prefix_prefill_token_graph_capture_on_miss(self) -> bool:
         return env_flag(
@@ -3649,20 +3848,9 @@ class ContinuousBatchEngine:
         )
 
     def _prefix_prefill_token_graph_enabled(self) -> bool:
-        warmup_env = "TORCHINFERNO_OPENAI_WARMUP_ONLINE_GREEDY_COMMON_PREFIX_TOKEN_SUFFIX_PREFILL"
-        warmup_default_enabled = False
-        max_tokens = self.max_generation_tokens
-        if self.temperature <= 0.0 and max_tokens is not None:
-            greedy_short_max_tokens = env_int(
-                "TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SUFFIX_BUCKETS_GREEDY_SHORT_MAX_TOKENS",
-                128,
-                minimum=1,
-            )
-            warmup_default_enabled = 0 < int(max_tokens) <= greedy_short_max_tokens
         return bool(
             self._prefix_prefill_token_graph_capture_on_miss()
             or env_flag("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_TOKEN_GRAPH", False)
-            or env_flag(warmup_env, warmup_default_enabled)
         )
 
     def _prefix_prefill_token_only_graph_enabled(self) -> bool:
@@ -3677,20 +3865,11 @@ class ContinuousBatchEngine:
             return env_int(env_name, 0, minimum=0)
         if self._prefix_prefill_capture_on_miss(batch_bucket):
             return 0
-        max_tokens = self.max_generation_tokens
-        if self.temperature <= 0.0 and max_tokens is not None:
-            greedy_short_max_tokens = env_int(
-                "TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_CAPTURE_GREEDY_SHORT_MAX_TOKENS",
-                128,
-                minimum=1,
-            )
-            if 0 < int(max_tokens) <= greedy_short_max_tokens:
-                return env_int(
-                    "TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_CAPTURE_GREEDY_SHORT_MAX_BATCH",
-                    32,
-                    minimum=0,
-                )
-        return 0
+        return env_int(
+            "TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_CAPTURE_MAX_BATCH",
+            32,
+            minimum=0,
+        )
 
     def _suffix_bucket(self, length: int) -> int:
         configured_buckets = _parse_positive_int_csv(
@@ -3931,23 +4110,36 @@ class ContinuousBatchEngine:
             output_suffix_lengths = suffix_lengths
             model_rows_for_stats = int(input_ids.size(0))
             model_tokens_for_stats = int(input_ids.numel())
-            fixed_packed = self._try_fixed_capacity_packed_prefill_logits(
-                input_ids=input_ids,
-                group=group,
-                rows=rows,
-                suffixes=suffixes,
+            token_bucket_result = self._try_token_bucket_fa3_prefill_logits(
+                padded_suffixes=padded_suffixes,
                 suffix_lengths=suffix_lengths,
                 suffix_bucket=suffix_bucket,
+                start_lens=start_lens,
+                all_rows=all_rows,
                 source_prefix_rows=source_prefix_rows,
-                src_prefix_row=src_prefix_row,
-                prefix_copy_len=prefix_copy_len,
-                pad_rows=pad_rows,
-                pad_prefix_rows=pad_prefix_rows,
                 capture_on_miss=self._prefix_prefill_capture_on_miss(batch_bucket),
-                profile_shape_key=shape_key,
-                packed_prefill_pattern_key=packed_prefill_pattern_key,
-                skip_active_row_clear=skip_active_row_clear,
             )
+            fixed_packed = None
+            if token_bucket_result is not None:
+                logits, model_tokens_for_stats = token_bucket_result
+            else:
+                fixed_packed = self._try_fixed_capacity_packed_prefill_logits(
+                    input_ids=input_ids,
+                    group=group,
+                    rows=rows,
+                    suffixes=suffixes,
+                    suffix_lengths=suffix_lengths,
+                    suffix_bucket=suffix_bucket,
+                    source_prefix_rows=source_prefix_rows,
+                    src_prefix_row=src_prefix_row,
+                    prefix_copy_len=prefix_copy_len,
+                    pad_rows=pad_rows,
+                    pad_prefix_rows=pad_prefix_rows,
+                    capture_on_miss=self._prefix_prefill_capture_on_miss(batch_bucket),
+                    profile_shape_key=shape_key,
+                    packed_prefill_pattern_key=packed_prefill_pattern_key,
+                    skip_active_row_clear=skip_active_row_clear,
+                )
             if fixed_packed is not None:
                 (
                     logits,
@@ -3957,7 +4149,7 @@ class ContinuousBatchEngine:
                     model_rows_for_stats,
                     model_tokens_for_stats,
                 ) = fixed_packed
-            else:
+            elif token_bucket_result is None:
                 self._record_prefill_row_index_mode(
                     shape_key,
                     omitted=model_row_indices is None,
@@ -4802,6 +4994,285 @@ class ContinuousBatchEngine:
                 for row in extra_prefix_rows:
                     self._release_prefix_row(row)
 
+    def _try_unified_token_bucket_fa3_logits(
+        self,
+        *,
+        input_sequences: Sequence[Sequence[int]],
+        q_lens: Sequence[int],
+        start_lens: Sequence[int],
+        rows: Sequence[int],
+        source_rows: Sequence[int],
+        copy_lens: Sequence[int],
+        capture_on_miss: bool = True,
+    ) -> Tensor | None:
+        if not env_flag("TORCHINFERNO_CONTINUOUS_TOKEN_BUCKET_FA3_UNIFIED", False):
+            return None
+        graph = getattr(self.model, "try_prefill_token_bucket_fa3_graph", None)
+        copy_graph = getattr(self.model, "try_copy_token_bucket_prefix_graph", None)
+        if not callable(graph) or not callable(copy_graph):
+            return None
+        real_batch = len(q_lens)
+        batch_capacity = _token_bucket_fa3_batch_capacity(real_batch)
+        if (
+            real_batch <= 0
+            or batch_capacity is None
+            or real_batch > batch_capacity
+            or any(len(values) != real_batch for values in (
+                input_sequences,
+                start_lens,
+                rows,
+                source_rows,
+                copy_lens,
+            ))
+        ):
+            return None
+        real_q_lens = [int(length) for length in q_lens]
+        if min(real_q_lens) <= 0:
+            return None
+        token_capacity = _piecewise_token_bucket(sum(real_q_lens))
+        maximum_tokens = env_int(
+            "TORCHINFERNO_CONTINUOUS_TOKEN_BUCKET_FA3_MAX_TOKENS",
+            4096,
+            minimum=1,
+        )
+        if token_capacity > maximum_tokens:
+            return None
+        max_seq_len = self._cache_max_seq_len_or_default()
+        bucket_q_lens = list(real_q_lens)
+        remaining_padding = token_capacity - sum(real_q_lens)
+        for row in range(real_batch - 1, -1, -1):
+            available = max_seq_len - int(start_lens[row]) - bucket_q_lens[row]
+            added = min(remaining_padding, max(0, available))
+            bucket_q_lens[row] += added
+            remaining_padding -= added
+        if remaining_padding:
+            return None
+
+        packed_tokens: list[int] = []
+        write_positions: list[int] = []
+        flat_rows: list[int] = []
+        logit_positions: list[int] = []
+        for sequence, real_q_len, bucket_q_len, start_len, row in zip(
+            input_sequences,
+            real_q_lens,
+            bucket_q_lens,
+            start_lens,
+            rows,
+        ):
+            if len(sequence) != real_q_len:
+                return None
+            logit_positions.append(len(packed_tokens) + real_q_len - 1)
+            packed_tokens.extend(int(token) for token in sequence)
+            packed_tokens.extend([0] * (bucket_q_len - real_q_len))
+            write_positions.extend(range(int(start_len), int(start_len) + bucket_q_len))
+            flat_rows.extend([int(row)] * bucket_q_len)
+
+        dummy_row = int(source_rows[0])
+        pad_rows = batch_capacity - real_batch
+        graph_starts = [int(length) for length in start_lens] + [0] * pad_rows
+        graph_rows = [int(row) for row in rows] + [dummy_row] * pad_rows
+        graph_sources = [int(row) for row in source_rows] + [dummy_row] * pad_rows
+        graph_copy_lens = [int(length) for length in copy_lens] + [0] * pad_rows
+        graph_q_lens = [*bucket_q_lens, *([0] * pad_rows)]
+        graph_logit_positions = [*logit_positions, *([0] * pad_rows)]
+        start_positions = self._device_index_tensor(tuple(graph_starts))
+        row_indices = self._device_index_tensor(tuple(graph_rows))
+
+        prefix_copy_capacity = 0
+        max_copy_len = max(graph_copy_lens)
+        gpu_events = self._start_prefill_graph_gpu_timer()
+        if max_copy_len > 0:
+            prefix_copy_capacity = min(_prefix_copy_bucket(max_copy_len), max_seq_len)
+            copied = copy_graph(
+                self._require_cache(),
+                start_positions=self._device_index_tensor(tuple(graph_copy_lens)),
+                row_indices=row_indices,
+                src_prefix_rows=self._device_index_tensor(tuple(graph_sources)),
+                prefix_copy_capacity=prefix_copy_capacity,
+                capture_on_miss=capture_on_miss,
+            )
+            if not copied:
+                return None
+        try:
+            logits = graph(
+                torch.tensor([packed_tokens], device=self.device, dtype=torch.long),
+                self._require_cache(),
+                start_positions=start_positions,
+                q_lens=self._device_index_tensor(tuple(graph_q_lens)),
+                row_indices=row_indices,
+                write_positions=torch.tensor(
+                    write_positions,
+                    device=self.device,
+                    dtype=torch.long,
+                ),
+                flat_rows=torch.tensor(flat_rows, device=self.device, dtype=torch.long),
+                logit_positions=self._device_index_tensor(tuple(graph_logit_positions)),
+                capture_on_miss=capture_on_miss,
+            )
+        except Exception as exc:
+            warn_optional_failure("continuous.unified_token_bucket_fa3", exc)
+            return None
+        if logits is None:
+            return None
+        graph_shape_key = (
+            f"unified_token_bucket_fa3:b{batch_capacity}:t{token_capacity}:"
+            f"p{prefix_copy_capacity}"
+        )
+        self._record_queue_profile_shape_count(
+            self.stats.prefill_graph_replay_shape_counts,
+            graph_shape_key,
+        )
+        self._stop_prefill_graph_gpu_timer(
+            gpu_events,
+            captured=False,
+            graph_shape_key=graph_shape_key,
+        )
+        return logits[:real_batch]
+
+    def _try_token_bucket_fa3_prefill_logits(
+        self,
+        *,
+        padded_suffixes: Sequence[Sequence[int]],
+        suffix_lengths: Sequence[int],
+        suffix_bucket: int,
+        start_lens: Sequence[int],
+        all_rows: Sequence[int],
+        source_prefix_rows: Sequence[int],
+        capture_on_miss: bool,
+    ) -> tuple[Tensor, int] | None:
+        if not env_flag("TORCHINFERNO_CONTINUOUS_TOKEN_BUCKET_FA3_PREFILL", False):
+            return None
+        graph = getattr(self.model, "try_prefill_token_bucket_fa3_graph", None)
+        if not callable(graph) or not self._cache_supports_tensor_ragged_prefill():
+            return None
+        real_batch = len(suffix_lengths)
+        available_rows = len(all_rows)
+        batch_capacity = _token_bucket_fa3_batch_capacity(real_batch)
+        if (
+            real_batch <= 0
+            or batch_capacity is None
+            or real_batch > available_rows
+            or available_rows > len(padded_suffixes)
+            or available_rows > len(start_lens)
+            or real_batch > batch_capacity
+        ):
+            return None
+        real_q_lens = [int(length) for length in suffix_lengths]
+        if not real_q_lens or min(real_q_lens) <= 0:
+            return None
+        q_lens = list(real_q_lens)
+        total_tokens = sum(real_q_lens)
+        available_tokens = real_batch * int(suffix_bucket)
+        token_capacity = _packed_token_capacity_with_savings(
+            total_tokens,
+            available_tokens,
+        )
+        if token_capacity is None:
+            return None
+        remaining_padding = token_capacity - total_tokens
+        for row in range(real_batch - 1, -1, -1):
+            available = int(suffix_bucket) - q_lens[row]
+            added = min(remaining_padding, available)
+            q_lens[row] += added
+            remaining_padding -= added
+        if remaining_padding:
+            return None
+
+        packed_tokens: list[int] = []
+        write_positions: list[int] = []
+        flat_rows: list[int] = []
+        logit_positions: list[int] = []
+        for row, (tokens, q_len, start_len) in enumerate(
+            zip(padded_suffixes[:real_batch], q_lens, start_lens[:real_batch])
+        ):
+            real_len = real_q_lens[row]
+            if q_len > len(tokens) or int(start_len) + q_len > self._cache_max_seq_len_or_default():
+                return None
+            logit_positions.append(len(packed_tokens) + real_len - 1)
+            packed_tokens.extend(int(token) for token in tokens[:q_len])
+            write_positions.extend(range(int(start_len), int(start_len) + q_len))
+            flat_rows.extend([int(all_rows[row])] * q_len)
+        if len(packed_tokens) != token_capacity:
+            return None
+
+        dummy_row = int(source_prefix_rows[0]) if source_prefix_rows else int(all_rows[0])
+        graph_start_lens = [int(length) for length in start_lens[:real_batch]] + [0] * (
+            batch_capacity - real_batch
+        )
+        graph_rows = [int(row) for row in all_rows[:real_batch]] + [dummy_row] * (
+            batch_capacity - real_batch
+        )
+        graph_start_positions = self._device_index_tensor(tuple(graph_start_lens))
+        graph_row_indices = self._device_index_tensor(tuple(graph_rows))
+        graph_q_lens = self._device_index_tensor(
+            tuple([*q_lens, *([0] * (batch_capacity - real_batch))])
+        )
+        graph_logit_positions = self._device_index_tensor(
+            tuple([*logit_positions, *([0] * (batch_capacity - real_batch))])
+        )
+
+        prefix_copy_capacity = 0
+        gpu_events = self._start_prefill_graph_gpu_timer()
+        if source_prefix_rows:
+            if len(source_prefix_rows) == 1:
+                real_sources = [int(source_prefix_rows[0])] * real_batch
+            elif len(source_prefix_rows) >= real_batch:
+                real_sources = [int(row) for row in source_prefix_rows[:real_batch]]
+            else:
+                return None
+            prefix_copy_capacity = min(
+                _prefix_copy_bucket(max(graph_start_lens)),
+                self._cache_max_seq_len_or_default(),
+            )
+            src_prefix_rows_tensor = self._device_index_tensor(
+                tuple([*real_sources, *([dummy_row] * (batch_capacity - real_batch))])
+            )
+            copy_graph = getattr(self.model, "try_copy_token_bucket_prefix_graph", None)
+            if not callable(copy_graph) or not copy_graph(
+                self._require_cache(),
+                start_positions=graph_start_positions,
+                row_indices=graph_row_indices,
+                src_prefix_rows=src_prefix_rows_tensor,
+                prefix_copy_capacity=prefix_copy_capacity,
+                capture_on_miss=capture_on_miss,
+            ):
+                return None
+
+        try:
+            logits = graph(
+                torch.tensor([packed_tokens], device=self.device, dtype=torch.long),
+                self._require_cache(),
+                start_positions=graph_start_positions,
+                q_lens=graph_q_lens,
+                row_indices=graph_row_indices,
+                write_positions=torch.tensor(
+                    write_positions,
+                    device=self.device,
+                    dtype=torch.long,
+                ),
+                flat_rows=torch.tensor(flat_rows, device=self.device, dtype=torch.long),
+                logit_positions=graph_logit_positions,
+                capture_on_miss=capture_on_miss,
+            )
+        except Exception as exc:
+            warn_optional_failure("continuous.token_bucket_fa3_prefill", exc)
+            return None
+        if logits is None:
+            return None
+        self._stop_prefill_graph_gpu_timer(
+            gpu_events,
+            captured=False,
+            graph_shape_key=(
+                f"token_bucket_fa3:b{batch_capacity}:t{token_capacity}:"
+                f"p{prefix_copy_capacity}"
+            ),
+        )
+        return logits, token_capacity
+
+    def _cache_max_seq_len_or_default(self) -> int:
+        max_seq_len = self._cache_max_seq_len()
+        return int(max_seq_len) if max_seq_len is not None else 1 << 30
+
     def _try_ragged_prefill_logits(
         self,
         input_ids: Tensor,
@@ -5506,34 +5977,13 @@ class ContinuousBatchEngine:
         return normalized if changed else group
 
     def _prefix_prefill_split_suffix_buckets_enabled(self) -> bool:
-        env_name = "TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SPLIT_SUFFIX_BUCKETS"
-        if env_name in os.environ:
-            return env_flag(env_name, False)
-        if not self._prefix_prefill_split_suffix_buckets_greedy_short_scope():
-            return False
-        return env_flag(
-            "TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SPLIT_SUFFIX_BUCKETS_GREEDY_SHORT",
-            True,
-        )
+        return env_flag("TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SPLIT_SUFFIX_BUCKETS", False)
 
     def _prefix_prefill_split_suffix_buckets_profile_candidates_enabled(self) -> bool:
         env_name = "TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SPLIT_SUFFIX_BUCKETS_PROFILE_CANDIDATES"
         if env_name in os.environ:
             return env_flag(env_name, False)
-        return bool(
-            (self.profile_timings or _queue_profile_counts_enabled())
-            and self._prefix_prefill_split_suffix_buckets_greedy_short_scope()
-        )
-
-    def _prefix_prefill_split_suffix_buckets_greedy_short_scope(self) -> bool:
-        if self.temperature > 0.0 or self.max_generation_tokens is None:
-            return False
-        greedy_short_max_tokens = env_int(
-            "TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SPLIT_SUFFIX_BUCKETS_GREEDY_SHORT_MAX_TOKENS",
-            128,
-            minimum=1,
-        )
-        return 0 < int(self.max_generation_tokens) <= greedy_short_max_tokens
+        return bool(self.profile_timings or _queue_profile_counts_enabled())
 
     def _record_prefix_prefill_suffix_split_candidate(
         self,
@@ -5913,7 +6363,7 @@ class ContinuousBatchEngine:
         row_indices = torch.tensor(row_indices_list, device=self.device, dtype=torch.long)
         seq_lens_list = [0] * (max(row_indices_list) + 1)
         seq_lens = torch.tensor(seq_lens_list, device=self.device, dtype=torch.long)
-        logit_pos = [l - 1 for l in lengths]
+        logit_pos = [length - 1 for length in lengths]
         while len(logit_pos) < batch_bucket:
             logit_pos.append(0)
         logit_positions = torch.tensor(logit_pos, device=self.device, dtype=torch.long)
@@ -6139,9 +6589,9 @@ class ContinuousBatchEngine:
         # is bit-identical to the baseline path on 8-rank TP -- sampling collectives already
         # sync the token across ranks, so the GPU->GPU feed is TP-safe). The path is still
         # SYNCHRONOUS (get_cpu_tokens harvests immediately after step), so it does NOT yet
-        # win: shape-dependent in A/B -- helps prefill-heavy few_shot (TPOT 68->29) but
-        # hurts decode-bound long_output (24->30) and tree (57->68). The actual win needs
-        # PIPELINING (double-buffer the readback + lagged harvest so decode replays run
+        # consistently win: synchronous readback helps prefill-heavy mixes but
+        # hurts decode-heavy mixes. The path needs pipelining (double-buffer the
+        # readback and lag harvest so decode replays run
         # back-to-back and the .cpu() sync overlaps GPU compute); see docs/PERF_GAP_ANALYSIS.
         runner = getattr(self, "_decode_runner", None)
         if runner is not None and active:
@@ -6655,6 +7105,8 @@ class ContinuousBatchEngine:
             return False
         if self.profile_timings:
             return True
+        if "TORCHINFERNO_CONTINUOUS_DECODE_GPU_EVENT_TIMING" in os.environ:
+            return env_flag("TORCHINFERNO_CONTINUOUS_DECODE_GPU_EVENT_TIMING", False)
         return (
             profile_source == "decode_many"
             and _decode_many_queue_profile_gpu_timing_enabled()
@@ -6859,6 +7311,7 @@ class ContinuousBatchEngine:
         )
         self._ensure_gpu_token_buf().index_copy_(0, row_indices, token_values)
         self._ensure_gpu_seq_lens_buf().index_copy_(0, row_indices, seq_len_values)
+        self._gpu_seq_lens_initialized_rows.update(row_tuple)
 
     def _set_gpu_decode_state_for_active(self, states: Sequence[_ActiveRequest]) -> None:
         if not states:
@@ -6898,6 +7351,7 @@ class ContinuousBatchEngine:
         *,
         dense_row_set: bool,
         dense_row_ordered: bool,
+        reorder_dense_output_on_cpu: bool = False,
     ) -> tuple[Tensor, Tensor | None, Tensor | None] | None:
         if not states:
             return None
@@ -6908,7 +7362,7 @@ class ContinuousBatchEngine:
             input_ids = self._ensure_gpu_token_buf()[: len(decode_rows)].view(len(decode_rows), 1)
             state_order_indices = (
                 None
-                if dense_row_ordered
+                if dense_row_ordered or reorder_dense_output_on_cpu
                 else self._device_index_tensor(tuple(state.row for state in states))
             )
             return input_ids, None, state_order_indices
@@ -7103,6 +7557,7 @@ class ContinuousBatchEngine:
         if buf is None or buf.numel() < total:
             buf = torch.zeros(total, dtype=torch.long, device=self.device)
             self._gpu_seq_lens = buf
+            self._gpu_seq_lens_initialized_rows = set()
         return buf
 
     def _sync_gpu_seq_lens_from_states(self, states: list[_ActiveRequest]) -> None:
@@ -7112,6 +7567,7 @@ class ContinuousBatchEngine:
         rows = self._device_index_tensor(tuple(state.row for state in states))
         seq_lens = torch.tensor([state.seq_len for state in states], device=self.device, dtype=torch.long)
         buf.index_copy_(0, rows, seq_lens)
+        self._gpu_seq_lens_initialized_rows.update(state.row for state in states)
 
     @staticmethod
     def _make_decode_many_gpu_state_signature(
@@ -7130,7 +7586,7 @@ class ContinuousBatchEngine:
         max_row = max(row for row, _last_token, _seq_len in signature)
         last_tokens = getattr(self, "_gpu_last_tokens", None)
         seq_lens = getattr(self, "_gpu_seq_lens", None)
-        return (
+        structurally_current = (
             last_tokens is not None
             and seq_lens is not None
             and last_tokens.device == self.device
@@ -7138,6 +7594,44 @@ class ContinuousBatchEngine:
             and last_tokens.numel() > max_row
             and seq_lens.numel() > max_row
         )
+        if not structurally_current:
+            return False
+        if not env_flag("TORCHINFERNO_CONTINUOUS_VERIFY_GPU_DECODE_STATE", False):
+            return True
+        rows = self._device_index_tensor(tuple(row for row, _token, _seq_len in signature))
+        observed_tokens = last_tokens.index_select(0, rows).detach().cpu().tolist()
+        observed_seq_lens = seq_lens.index_select(0, rows).detach().cpu().tolist()
+        expected_tokens = [token for _row, token, _seq_len in signature]
+        expected_seq_lens = [seq_len for _row, _token, seq_len in signature]
+        matches = (
+            observed_tokens == expected_tokens
+            and observed_seq_lens == expected_seq_lens
+        )
+        if not matches and getattr(self.model, "rank", 0) == 0:
+            token_mismatches = sum(
+                observed != expected
+                for observed, expected in zip(observed_tokens, expected_tokens)
+            )
+            seq_len_mismatches = sum(
+                observed != expected
+                for observed, expected in zip(observed_seq_lens, expected_seq_lens)
+            )
+            seq_examples = [
+                (row, observed, expected)
+                for (row, _token, expected), observed in zip(
+                    signature,
+                    observed_seq_lens,
+                )
+                if observed != expected
+            ][:4]
+            print(
+                "continuous_decode_many_gpu_state_mismatch "
+                f"rows={len(signature)} token_mismatches={token_mismatches} "
+                f"seq_len_mismatches={seq_len_mismatches} "
+                f"seq_examples={seq_examples}",
+                flush=True,
+            )
+        return matches
 
     @staticmethod
     def _dense_prefix_row_info(rows: list[int]) -> tuple[bool, bool]:
@@ -7169,13 +7663,20 @@ class ContinuousBatchEngine:
             return buf
         active_rows = {state.row for state in states}
         pad_seq_len = max(state.seq_len for state in states)
+        initialized_rows = self._gpu_seq_lens_initialized_rows
         pad_rows = tuple(
             row
             for row in rows
-            if row not in active_rows and 0 <= row < len(self._row_seq_lens) and self._row_seq_lens[row] <= 0
+            if (
+                row not in active_rows
+                and row not in initialized_rows
+                and 0 <= row < len(self._row_seq_lens)
+                and self._row_seq_lens[row] <= 0
+            )
         )
         if pad_rows:
             buf.index_fill_(0, self._device_index_tensor(pad_rows), int(pad_seq_len))
+            initialized_rows.update(pad_rows)
         return buf
 
     def _decode_many_step_window_key(self, generated_after: list[int], shape_key: str) -> str:
@@ -7455,11 +7956,19 @@ class ContinuousBatchEngine:
         *,
         events: list[ServingTokenEvent] | None,
     ) -> list[_ActiveRequest | ServingResult]:
+        profile_wall = _queue_profile_counts_enabled() and not self.profile_timings
+        wall_total_start_s = time.perf_counter() if profile_wall else 0.0
+        wall_prepare_start_s = wall_total_start_s
         prepare_start_s = time.perf_counter() if self.profile_timings else 0.0
         rows = [state.row for state in states]
         decode_rows = self._ragged_decode_bucket_rows(rows)
         n_active = len(states)
         n_padded = len(decode_rows)
+        wall_prepare_policy_start_s = time.perf_counter() if profile_wall else 0.0
+        if profile_wall:
+            self.stats.decode_ragged_wall_prepare_rows_ms += (
+                wall_prepare_policy_start_s - wall_prepare_start_s
+            ) * 1000.0
         shape_key = f"ragged:b{n_active}/{n_padded}" if self.profile_timings else None
         if shape_key is not None:
             self._record_shape_count(self.stats.decode_shape_counts, shape_key)
@@ -7473,25 +7982,44 @@ class ContinuousBatchEngine:
             else (False, False)
         )
         contiguous_row_set = dense_row_set
+        dense_output_row_order = contiguous_row_set and not dense_row_ordered
         state_order_indices: Tensor | None = None
         row_indices: Tensor | None
+        wall_prepare_inputs_start_s = time.perf_counter() if profile_wall else 0.0
+        if profile_wall:
+            self.stats.decode_ragged_wall_prepare_policy_ms += (
+                wall_prepare_inputs_start_s - wall_prepare_policy_start_s
+            ) * 1000.0
         gpu_inputs = self._decode_input_ids_from_gpu_state(
             states,
             decode_rows,
             dense_row_set=contiguous_row_set,
             dense_row_ordered=dense_row_ordered,
+            reorder_dense_output_on_cpu=dense_output_row_order,
         )
         if gpu_inputs is not None:
+            if profile_wall:
+                self.stats.decode_ragged_wall_gpu_state_hits += 1
             input_ids, row_indices, state_order_indices = gpu_inputs
         elif contiguous_row_set:
+            if profile_wall:
+                self.stats.decode_ragged_wall_gpu_state_misses += 1
+            # _record_gpu_decode_tokens advances this persistent buffer and
+            # _apply_decoded_tokens subsequently marks it current. Seed it
+            # from request state before that transition when device inputs were
+            # unavailable.
+            self._sync_gpu_seq_lens_from_states(states)
             input_tokens = [0 for _ in range(n_padded)]
             for state in states:
                 input_tokens[state.row] = state.last_token
             input_ids = torch.tensor([[token] for token in input_tokens], device=self.device, dtype=torch.long)
             row_indices = None
-            if not dense_row_ordered:
+            if not dense_row_ordered and not dense_output_row_order:
                 state_order_indices = self._device_index_tensor(tuple(rows))
         else:
+            if profile_wall:
+                self.stats.decode_ragged_wall_gpu_state_misses += 1
+            self._sync_gpu_seq_lens_from_states(states)
             pad_token = states[0].last_token
             input_tokens = [
                 states[index].last_token if index < n_active else pad_token
@@ -7499,9 +8027,27 @@ class ContinuousBatchEngine:
             ]
             input_ids = torch.tensor([[token] for token in input_tokens], device=self.device, dtype=torch.long)
             row_indices = self._device_index_tensor(tuple(decode_rows))
-        seq_lens = self._seq_lens_tensor(states, rows=decode_rows)
+        wall_prepare_seq_lens_start_s = time.perf_counter() if profile_wall else 0.0
+        if profile_wall:
+            self.stats.decode_ragged_wall_prepare_inputs_ms += (
+                wall_prepare_seq_lens_start_s - wall_prepare_inputs_start_s
+            ) * 1000.0
+        # Every input construction path above either reused current persistent
+        # decode state or synchronized it from the request states. Reuse that
+        # device buffer instead of rebuilding the full row-length vector in
+        # Python and copying it host-to-device for every generated token.
+        seq_lens = self._decode_many_seq_lens_tensor(states, decode_rows)
+        if profile_wall:
+            wall_prepare_end_s = time.perf_counter()
+            self.stats.decode_ragged_wall_prepare_seq_lens_ms += (
+                wall_prepare_end_s - wall_prepare_seq_lens_start_s
+            ) * 1000.0
+            self.stats.decode_ragged_wall_prepare_ms += (
+                wall_prepare_end_s - wall_prepare_start_s
+            ) * 1000.0
         if self.profile_timings:
             self.stats.decode_ragged_prepare_ms += (time.perf_counter() - prepare_start_s) * 1000.0
+        wall_model_start_s = time.perf_counter() if profile_wall else 0.0
         model_start_s = time.perf_counter() if self.profile_timings else 0.0
         gpu_model_events = self._start_decode_ragged_model_gpu_timer()
         self._last_ragged_decode_logits = None
@@ -7524,16 +8070,25 @@ class ContinuousBatchEngine:
             logits = self._ragged_decode_logits(input_ids, seq_lens, row_indices)
             reuse_logits = logits[:, -1, :]
             next_token_tensor = self._sample_logits_for_states(logits[:, -1, :], states)
-        next_token_tensor = self._record_gpu_decode_tokens(
-            next_token_tensor,
-            row_indices=row_indices,
-            n_active=n_active,
-            state_order_indices=state_order_indices,
-        )
+        if dense_output_row_order:
+            self._ensure_gpu_token_buf()[:n_padded].copy_(next_token_tensor[:n_padded])
+            self._ensure_gpu_seq_lens_buf()[:n_padded].add_(1)
+            self._gpu_seq_lens_initialized_rows.update(range(n_padded))
+        else:
+            next_token_tensor = self._record_gpu_decode_tokens(
+                next_token_tensor,
+                row_indices=row_indices,
+                n_active=n_active,
+                state_order_indices=state_order_indices,
+            )
         if row_indices is None and state_order_indices is not None and reuse_logits is not None:
             reuse_logits = reuse_logits.index_select(0, state_order_indices)
         self._stop_decode_ragged_model_gpu_timer(gpu_model_events, shape_key=shape_key)
         self._record_model_call("decode", n_padded, tokens=n_padded, ragged=True, active_tokens=n_active)
+        if profile_wall:
+            self.stats.decode_ragged_wall_model_submit_ms += (
+                time.perf_counter() - wall_model_start_s
+            ) * 1000.0
         if self.profile_timings:
             if self.device.type == "cuda":
                 torch.cuda.synchronize(self.device)
@@ -7545,8 +8100,16 @@ class ContinuousBatchEngine:
                     shape_key,
                     model_elapsed_ms,
                 )
+        wall_readback_start_s = time.perf_counter() if profile_wall else 0.0
         cpu_tokens_start_s = time.perf_counter() if self.profile_timings else 0.0
-        next_tokens = next_token_tensor[:n_active].detach().cpu().tolist()
+        readback_count = n_padded if dense_output_row_order else n_active
+        next_tokens = next_token_tensor[:readback_count].detach().cpu().tolist()
+        if dense_output_row_order:
+            next_tokens = [next_tokens[state.row] for state in states]
+        if profile_wall:
+            self.stats.decode_ragged_wall_readback_ms += (
+                time.perf_counter() - wall_readback_start_s
+            ) * 1000.0
         if self.profile_timings:
             cpu_elapsed_ms = (time.perf_counter() - cpu_tokens_start_s) * 1000.0
             self.stats.decode_ragged_cpu_tokens_ms += cpu_elapsed_ms
@@ -7557,11 +8120,22 @@ class ContinuousBatchEngine:
                     cpu_elapsed_ms,
                 )
             self._flush_decode_ragged_model_gpu_timers()
+        wall_state_start_s = time.perf_counter() if profile_wall else 0.0
         self._store_decoded_reusable_prefixes(
             states,
             None if reuse_logits is None else reuse_logits[:n_active],
         )
-        return self._apply_decoded_tokens(states, next_tokens, step, events)
+        decoded = self._apply_decoded_tokens(states, next_tokens, step, events)
+        if profile_wall:
+            now_s = time.perf_counter()
+            self.stats.decode_ragged_wall_steps += 1
+            self.stats.decode_ragged_wall_state_ms += (
+                now_s - wall_state_start_s
+            ) * 1000.0
+            self.stats.decode_ragged_wall_total_ms += (
+                now_s - wall_total_start_s
+            ) * 1000.0
+        return decoded
 
     def _maybe_profile_decode_many_eager_once(
         self,
@@ -7859,7 +8433,8 @@ class ContinuousBatchEngine:
         events: list[ServingTokenEvent] | None,
     ) -> list[_ActiveRequest | ServingResult]:
         state_update_start_s = time.perf_counter() if self.profile_timings else 0.0
-        decoded: list[_ActiveRequest | ServingResult] = []
+        decoded_states: list[tuple[_ActiveRequest, bool]] = []
+        finished_states: list[_ActiveRequest] = []
         active_states: list[_ActiveRequest] = []
         for row_index, state in enumerate(states):
             next_token = int(next_tokens[row_index])
@@ -7872,10 +8447,22 @@ class ContinuousBatchEngine:
             finished = self._should_finish_after_decode(state)
             self._record_token_event(events, state, next_token, step, finished=finished)
             if finished:
-                decoded.append(self._finish_and_release(state, step))
+                finished_states.append(state)
             else:
-                decoded.append(state)
                 active_states.append(state)
+            decoded_states.append((state, finished))
+        if self._should_defer_online_finish_cleanup(events) and finished_states:
+            finished_results = iter(
+                self._serving_result_for_state(state, step)
+                for state in finished_states
+            )
+            self._pending_online_finish_states.extend(finished_states)
+        else:
+            finished_results = iter(self._finish_and_release_many(finished_states, step))
+        decoded = [
+            next(finished_results) if finished else state
+            for state, finished in decoded_states
+        ]
         self._decode_many_gpu_state_signature = self._make_decode_many_gpu_state_signature(
             active_states
         )
@@ -7909,10 +8496,14 @@ class ContinuousBatchEngine:
         return rows
 
     def _finish_and_release(self, state: _ActiveRequest, step: int) -> ServingResult:
-        row_adopted = self._store_finished_reusable_prefix(state)
-        if not row_adopted:
-            row_adopted = self._store_delayed_pinned_full_prompt_prefix(state)
-        result = ServingResult(
+        return self._finish_and_release_many([state], step)[0]
+
+    @staticmethod
+    def _serving_result_for_state(
+        state: _ActiveRequest,
+        step: int,
+    ) -> ServingResult:
+        return ServingResult(
             state.request.request_id,
             tuple(state.tokens),
             state.prefix_hit_tokens,
@@ -7920,22 +8511,62 @@ class ContinuousBatchEngine:
             state.started_step,
             step,
         )
-        if not row_adopted:
-            if self._warm_row_prefix_copy_skip_enabled():
-                self._remember_row_cached_prefix(state.row, state.tokens)
-            self._release_active_row(state.row)
-        return result
+
+    def _should_defer_online_finish_cleanup(
+        self,
+        events: list[ServingTokenEvent] | None,
+    ) -> bool:
+        return (
+            events is not None
+            and self._online_waiting is not None
+            and env_flag("TORCHINFERNO_CONTINUOUS_DEFER_ONLINE_FINISH_CLEANUP", True)
+        )
+
+    def _flush_pending_online_finishes(self) -> None:
+        pending = self._pending_online_finish_states
+        if not pending:
+            return
+        self._pending_online_finish_states = []
+        self._cleanup_finished_states(pending)
+
+    def _finish_and_release_many(
+        self,
+        states: Sequence[_ActiveRequest],
+        step: int,
+    ) -> list[ServingResult]:
+        results = [self._serving_result_for_state(state, step) for state in states]
+        self._cleanup_finished_states(states)
+        return results
+
+    def _cleanup_finished_states(
+        self,
+        states: Sequence[_ActiveRequest],
+    ) -> None:
+        adopted_rows: list[int] = []
+        adopted_seq_lens: list[int] = []
+        for state in states:
+            row_adopted = self._store_finished_reusable_prefix(state)
+            if not row_adopted:
+                row_adopted = self._store_delayed_pinned_full_prompt_prefix(
+                    state,
+                    sync_cache_seq_len=False,
+                )
+                if row_adopted:
+                    adopted_rows.append(state.row)
+                    adopted_seq_lens.append(len(state.request.prompt))
+            if not row_adopted:
+                if self._warm_row_prefix_copy_skip_enabled():
+                    self._remember_row_cached_prefix(state.row, state.tokens)
+                self._release_active_row(state.row)
+        if adopted_rows:
+            self._set_cache_row_seq_lens(adopted_rows, adopted_seq_lens)
 
     def _allow_pinned_full_prompt_store(self, request: ServingRequest) -> bool:
-        env_name = "TORCHINFERNO_CONTINUOUS_PINNED_FULL_PROMPT_STORE_MIN_MAX_TOKENS"
-        if env_name not in os.environ and self._greedy_large_mixed_prefix_reuse_enabled():
-            return request.max_new_tokens >= int(self.max_generation_tokens or 0)
-        threshold = env_int(
-            env_name,
-            0,
-            minimum=0,
-        )
-        return threshold > 0 and request.max_new_tokens >= threshold
+        del request
+        env_name = "TORCHINFERNO_CONTINUOUS_PINNED_FULL_PROMPT_STORE"
+        if env_name in os.environ:
+            return env_flag(env_name, False)
+        return self._mixed_prefix_reuse_enabled()
 
     def _delayed_pinned_full_prompt_store_enabled(self, request: ServingRequest) -> bool:
         if not self._delayed_pinned_full_prompt_store_allowed(
@@ -7968,9 +8599,8 @@ class ContinuousBatchEngine:
             # Per-request full-prompt stores would starve the prefix-row pool.
             # Keep only pinned shared prefixes in this mode; unpinned modes
             # remove evicted routes from the radix index so shorter live prefixes
-            # can still match. A long-output opt-in below enables this for
-            # multi-turn style workloads where one full-prompt row can save a
-            # much larger next-turn suffix prefill.
+            # can still match. An explicit opt-in below allows one full-prompt
+            # row when it can save a much larger future suffix prefill.
             self._record_full_prompt_store_skip("pinned_without_allowance", tokens)
             self._record_full_prompt_reuse_candidate_store(request_id, tokens)
             return
@@ -8214,7 +8844,12 @@ class ContinuousBatchEngine:
             str(suffix_tokens),
         )
 
-    def _store_delayed_pinned_full_prompt_prefix(self, state: _ActiveRequest) -> bool:
+    def _store_delayed_pinned_full_prompt_prefix(
+        self,
+        state: _ActiveRequest,
+        *,
+        sync_cache_seq_len: bool = True,
+    ) -> bool:
         if not self._delayed_pinned_full_prompt_store_enabled(state.request):
             return False
         prompt = state.request.prompt
@@ -8229,6 +8864,7 @@ class ContinuousBatchEngine:
                 state.request.request_id,
                 prompt,
                 state.row,
+                sync_cache_seq_len=sync_cache_seq_len,
             )
             if adopted:
                 self.stats.full_prompt_store_adopted_requests += 1
@@ -8425,6 +9061,8 @@ class ContinuousBatchEngine:
         request_id: str,
         tokens: tuple[int, ...],
         source_row: int,
+        *,
+        sync_cache_seq_len: bool = True,
     ) -> bool:
         if not self.store_reusable_prefixes or not env_flag("TORCHINFERNO_CONTINUOUS_PREFIX_CACHE_STORE", True):
             return False
@@ -8435,7 +9073,10 @@ class ContinuousBatchEngine:
             return False
         self.prefix_cache.remove(route_id)
         entry = self.prefix_cache.add(request_id, tokens, route_id=route_id)
-        self._set_cache_row_seq_len(source_row, len(tokens))
+        if sync_cache_seq_len:
+            self._set_cache_row_seq_len(source_row, len(tokens))
+        else:
+            self._remember_row_seq_len(source_row, len(tokens))
         self.reusable_prefixes[entry.route_id] = _ReusablePrefix(
             entry.route_id,
             tokens,
@@ -8457,6 +9098,46 @@ class ContinuousBatchEngine:
         cache = self._require_cache()
         cache.copy_prefix_from(cache, tokens, source_row=source_row, dest_row=dest_row)  # type: ignore[attr-defined]
         self._remember_row_seq_len(dest_row, tokens)
+
+    def _take_reusable_prefix_row(
+        self,
+        reusable: _ReusablePrefix,
+        *,
+        prompt: tuple[int, ...],
+        prefix_hit_tokens: int,
+    ) -> int | None:
+        if not env_flag("TORCHINFERNO_CONTINUOUS_MOVE_REUSABLE_PREFIX_TO_ACTIVE", True):
+            return None
+        route_id = reusable.route_id
+        if route_id in self._pinned_prefix_routes:
+            return None
+        if self.reusable_prefixes.get(route_id) is not reusable:
+            return None
+        # Move only a complete cached prefix into a strict continuation. Exact
+        # prompt fan-out must retain the shared source row for other requests.
+        if prefix_hit_tokens != len(reusable.tokens) or len(prompt) <= prefix_hit_tokens:
+            return None
+        if not self._free_active_rows:
+            return None
+
+        replacement_prefix_row = self._free_active_rows.pop()
+        self._decode_many_gpu_state_signature = None
+        self._remember_row_seq_len(replacement_prefix_row, 0)
+        self._forget_row_cached_prefix(replacement_prefix_row)
+
+        self.reusable_prefixes.pop(route_id, None)
+        self.prefix_cache.remove(route_id)
+        if route_id in self._prefix_order:
+            self._prefix_order.remove(route_id)
+        self._pinned_prefix_routes.discard(route_id)
+        if replacement_prefix_row not in self._free_prefix_rows:
+            self._free_prefix_rows.append(replacement_prefix_row)
+            self._free_prefix_rows.sort()
+
+        self._remember_row_seq_len(reusable.row, prefix_hit_tokens)
+        self.stats.prefix_row_move_requests += 1
+        self.stats.prefix_row_move_tokens += prefix_hit_tokens
+        return reusable.row
 
     def _copy_prefix_to_rows(self, source_row: int, dest_rows: list[int], tokens: int) -> None:
         if not dest_rows:
@@ -8533,6 +9214,7 @@ class ContinuousBatchEngine:
 
     def _reset_active_row_for_acquire(self, row: int, *, clear_cache: bool = True) -> None:
         self._decode_many_gpu_state_signature = None
+        self._gpu_seq_lens_initialized_rows.discard(row)
         if not clear_cache or env_flag("TORCHINFERNO_CONTINUOUS_SKIP_ACTIVE_ROW_CLEAR", False):
             self._set_cache_row_seq_len(row, 0)
             return
@@ -8545,10 +9227,6 @@ class ContinuousBatchEngine:
     def _acquire_free_prefix_row_or_none(self) -> int | None:
         if self.prefix_cache_capacity == 0 or not self._free_prefix_rows:
             return None
-        for row in _preferred_prefix_rows():
-            if row in self._free_prefix_rows:
-                self._free_prefix_rows.remove(row)
-                return row
         return self._free_prefix_rows.pop()
 
     def _release_active_row(self, row: int) -> None:
@@ -8558,7 +9236,11 @@ class ContinuousBatchEngine:
         # request). Only the seq_len reset is needed for correctness -- a free
         # row reused as decode-bucket padding has seq_len 0 so attention never
         # reads its stale KV, and its bucket output is discarded regardless.
-        self._decode_many_gpu_state_signature = None
+        signature = getattr(self, "_decode_many_gpu_state_signature", None)
+        if signature is not None:
+            self._decode_many_gpu_state_signature = tuple(
+                item for item in signature if item[0] != row
+            )
         self._remember_row_seq_len(row, 0)
         self._mark_active_row_free(row)
 
@@ -8584,10 +9266,6 @@ class ContinuousBatchEngine:
         if self.prefix_cache_capacity == 0:
             return None
         if self._free_prefix_rows:
-            for row in _preferred_prefix_rows():
-                if row in self._free_prefix_rows:
-                    self._free_prefix_rows.remove(row)
-                    return row
             return self._free_prefix_rows.pop()
         # Evict the oldest UNPINNED reusable prefix. Pinned routes (the active
         # shared prefix) are skipped so their KV stays a valid copy source.
@@ -8599,7 +9277,10 @@ class ContinuousBatchEngine:
             self.prefix_cache.remove(route_id)
             if prefix is not None:
                 self._remember_row_seq_len(prefix.row, 0)
-                self._forget_row_cached_prefix(prefix.row)
+                # The row is logically free, but its KV storage still contains
+                # this prefix. If row adoption turns it into an active row, the
+                # next compatible request can reuse that data without a copy.
+                self._remember_row_cached_prefix(prefix.row, prefix.tokens)
                 return prefix.row
             return self._acquire_prefix_row()
         return None
@@ -9903,9 +10584,54 @@ class ContinuousBatchEngine:
             raise ValueError("rows and seq_lens must have the same length")
         if not rows:
             return
+        row_seq_lens = tuple(
+            (int(row), int(seq_len))
+            for row, seq_len in zip(rows, seq_lens)
+        )
+        for row, seq_len in row_seq_lens:
+            self._remember_row_seq_len(row, seq_len)
+        cache = self._require_cache()
+        layers = tuple(getattr(cache, "layers", ()) or ())
+        changed = False
+        row_tuple = tuple(row for row, _seq_len in row_seq_lens)
+        seq_len_tuple = tuple(seq_len for _row, seq_len in row_seq_lens)
+        for layer in layers:
+            bulk_setter = getattr(layer, "_set_rows_seq_lens", None)
+            if callable(bulk_setter):
+                try:
+                    bulk_setter(row_tuple, seq_len_tuple)
+                    changed = True
+                    continue
+                except Exception:
+                    pass
+            setter = getattr(layer, "_set_rows_seq_len", None)
+            if callable(setter):
+                try:
+                    grouped_rows: dict[int, list[int]] = defaultdict(list)
+                    for row, seq_len in row_seq_lens:
+                        grouped_rows[seq_len].append(row)
+                    for seq_len, group_rows in grouped_rows.items():
+                        setter(tuple(group_rows), seq_len)
+                    changed = True
+                    continue
+                except Exception:
+                    pass
+            layer_seq_lens = getattr(layer, "_seq_lens", None)
+            if not isinstance(layer_seq_lens, list):
+                continue
+            for row, seq_len in row_seq_lens:
+                if 0 <= row < len(layer_seq_lens):
+                    layer_seq_lens[row] = seq_len
+                    changed = True
+            uniform = getattr(layer, "_uniform_seq_len", None)
+            if isinstance(uniform, list) and uniform:
+                first = layer_seq_lens[0] if layer_seq_lens else 0
+                uniform[0] = first if all(value == first for value in layer_seq_lens) else None
+        if changed:
+            return
         grouped_rows: dict[int, list[int]] = defaultdict(list)
-        for row, seq_len in zip(rows, seq_lens):
-            grouped_rows[int(seq_len)].append(int(row))
+        for row, seq_len in row_seq_lens:
+            grouped_rows[seq_len].append(row)
         for seq_len, group_rows in grouped_rows.items():
             self._set_cache_rows_seq_len(group_rows, seq_len)
 
@@ -9922,7 +10648,6 @@ class ContinuousBatchEngine:
         use_fi_decode = fi_decode_mode == "always" or (
             fi_decode_mode == "sampled"
             and sampling_temperature > 0.0
-            and self._sampled_fi_decode_enabled_for_request()
         )
         fi_graphs = (
             getattr(self.model, "_fi_decode_graphs", None)
@@ -10069,13 +10794,6 @@ class ContinuousBatchEngine:
         if symm_suffix is not None:
             key = f"{key}:{symm_suffix}"
         return key
-
-    def _sampled_fi_decode_enabled_for_request(self) -> bool:
-        max_tokens = self.max_generation_tokens
-        if max_tokens is None:
-            return True
-        limit = max(0, int(self._sampled_fi_decode_max_tokens))
-        return limit > 0 and int(max_tokens) <= limit
 
     def _try_static_token_graph(
         self,

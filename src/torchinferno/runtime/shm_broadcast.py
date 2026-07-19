@@ -21,6 +21,7 @@ GIL further serializes Python-level access within a process.
 
 from __future__ import annotations
 
+import os
 import pickle
 import struct
 import time
@@ -174,15 +175,26 @@ class ShmReader:
     def dequeue(self, timeout: float | None = None) -> bytes:
         start = time.monotonic()
         flag_byte = 1 + self.reader_id
+        try:
+            yield_interval = max(
+                1,
+                int(os.environ.get("TORCHINFERNO_SHM_POLL_YIELD_INTERVAL", "1")),
+            )
+        except ValueError:
+            yield_interval = 1
+        empty_polls = 0
         while True:
             meta = self.buffer._meta_slice(self._idx)
             written = meta[0]
             already_read = meta[flag_byte]
             if (not written) or already_read:
                 meta.release()
-                if timeout is not None and time.monotonic() - start > timeout:
-                    raise TimeoutError("shm ring buffer read timed out")
-                time.sleep(0)
+                empty_polls += 1
+                if empty_polls >= yield_interval:
+                    if timeout is not None and time.monotonic() - start > timeout:
+                        raise TimeoutError("shm ring buffer read timed out")
+                    time.sleep(0)
+                    empty_polls = 0
                 continue
             data = self.buffer._data_slice(self._idx)
             (length,) = _LEN_STRUCT.unpack_from(data, 0)

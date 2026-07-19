@@ -26,6 +26,8 @@ DECISIVE FINDINGS (real 70B TP8 shapes, H100):
 """
 import torch
 
+from torchinferno.kernels.fp8 import quantize_activation_fp8
+
 FP8 = torch.float8_e4m3fn
 SHAPES = [("qkv", 8192, 1280), ("o_proj", 1024, 8192),
           ("gate_up", 8192, 7168), ("down", 3584, 8192)]
@@ -54,10 +56,12 @@ def gbench(fn, it=100):
 def main():
     dev = torch.device("cuda:0")
     torch.manual_seed(0)
-    print(f"{'shape':10s} {'M':>5s} {'bf16':>8s} {'fp8+q':>8s} {'fp8-q':>8s} "
-          f"{'incl':>6s} {'excl':>6s}  (graphed, tensorwise)")
-    for M in (256, 512, 1024, 2048):
-        tb = ti = te = 0.0
+    print(
+        f"{'shape':10s} {'M':>5s} {'bf16':>8s} {'dynamic':>8s} {'static':>8s} "
+        f"{'fp8-q':>8s} {'dyn':>6s} {'stat':>6s} {'excl':>6s}  (graphed, tensorwise)"
+    )
+    for M in (1, 8, 16, 32, 48, 64, 96, 128, 256, 512, 1024, 2048):
+        tb = td = ts = te = 0.0
         for nm, K, N in SHAPES:
             a = torch.randn(M, K, device=dev, dtype=torch.bfloat16)
             w = torch.randn(K, N, device=dev, dtype=torch.bfloat16) * 0.02
@@ -65,30 +69,54 @@ def main():
             wq = (w.t() / sb).to(FP8).contiguous().t()  # [K,N] col-major
             sa0 = (a.abs().amax() / 448.0).to(torch.float32)
             aq0 = (a / sa0).to(FP8)
+            static_scale = sa0 * 4.0
+            static_inverse_scale = static_scale.reciprocal()
 
             def f_bf16(a=a, w=w):
                 return torch.mm(a, w)
 
-            def f_incl(a=a, wq=wq, sb=sb):
+            def f_dynamic(a=a, wq=wq, sb=sb):
                 sa = (a.abs().amax() / 448.0).to(torch.float32)
                 aq = (a / sa).to(FP8)
+                return torch._scaled_mm(aq, wq, scale_a=sa, scale_b=sb, out_dtype=torch.bfloat16)
+
+            def f_static(
+                a=a,
+                wq=wq,
+                sb=sb,
+                static_scale=static_scale,
+                static_inverse_scale=static_inverse_scale,
+            ):
+                aq, sa = quantize_activation_fp8(
+                    a,
+                    scale=static_scale,
+                    inverse_scale=static_inverse_scale,
+                )
                 return torch._scaled_mm(aq, wq, scale_a=sa, scale_b=sb, out_dtype=torch.bfloat16)
 
             def f_excl(aq0=aq0, sa0=sa0, wq=wq, sb=sb):
                 return torch._scaled_mm(aq0, wq, scale_a=sa0, scale_b=sb, out_dtype=torch.bfloat16)
 
             try:
-                t_b, t_i, t_e = gbench(f_bf16), gbench(f_incl), gbench(f_excl)
+                t_b = gbench(f_bf16)
+                t_d = gbench(f_dynamic)
+                t_s = gbench(f_static)
+                t_e = gbench(f_excl)
             except Exception as exc:
                 print(f"  {nm}: _scaled_mm failed: {exc}")
                 return
             tb += t_b
-            ti += t_i
+            td += t_d
+            ts += t_s
             te += t_e
-            print(f"{nm:10s} {M:5d} {t_b:7.1f}u {t_i:7.1f}u {t_e:7.1f}u "
-                  f"{t_b / t_i:5.2f}x {t_b / t_e:5.2f}x")
-        print(f"{'TOTAL':10s} {M:5d} {tb:7.1f}u {ti:7.1f}u {te:7.1f}u "
-              f"{tb / ti:5.2f}x {tb / te:5.2f}x   <-- M={M}\n")
+            print(
+                f"{nm:10s} {M:5d} {t_b:7.1f}u {t_d:7.1f}u {t_s:7.1f}u {t_e:7.1f}u "
+                f"{t_b / t_d:5.2f}x {t_b / t_s:5.2f}x {t_b / t_e:5.2f}x"
+            )
+        print(
+            f"{'TOTAL':10s} {M:5d} {tb:7.1f}u {td:7.1f}u {ts:7.1f}u {te:7.1f}u "
+            f"{tb / td:5.2f}x {tb / ts:5.2f}x {tb / te:5.2f}x   <-- M={M}\n"
+        )
 
 
 if __name__ == "__main__":

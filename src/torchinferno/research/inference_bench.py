@@ -106,7 +106,7 @@ _PROFILER_SELF_CUDA_TOTAL_RE = re.compile(
     r"Self CUDA time total:\s*(?P<value>[0-9]+(?:\.[0-9]+)?)(?P<unit>us|ms|s)\b"
 )
 _QUEUE_PROFILE_FIELDS = (
-    "greedy_large_mixed_prefix_reuse",
+    "mixed_prefix_reuse",
     "fp8_prefill_enabled",
     "fp8_prefill_min_m",
     "marlin_int4_decode_enabled",
@@ -970,7 +970,7 @@ def format_inference_bench_summary(summary: InferenceBenchRunSummary) -> str:
                     _fmt_value(fields.get("runtime_cache_backend")),
                     _fmt_value(fields.get("runtime_max_active_requests")),
                     _fmt_value(fields.get("runtime_prefix_cache_capacity")),
-                    _fmt_value(fields.get("greedy_large_mixed_prefix_reuse")),
+                    _fmt_value(fields.get("mixed_prefix_reuse")),
                     _fmt_value(fields.get("fp8_prefill_enabled")),
                     _fmt_value(fields.get("fp8_prefill_min_m")),
                     _fmt_value(fields.get("marlin_int4_decode_enabled")),

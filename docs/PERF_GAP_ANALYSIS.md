@@ -1,5 +1,61 @@
 # TorchInferno vs vLLM/sglang — Performance Gap Analysis (Llama-3.1-70B, 8xH100)
 
+## 20260719 gap closure
+
+The final TorchInferno-only five-workload run (`20260719_045502`) beats the
+latest public vLLM and SGLang run (`20260718_130242`) on median per-request
+throughput for every individual workload:
+
+| workload | TorchInferno | vLLM public | SGLang public | correctness |
+| --- | ---: | ---: | ---: | ---: |
+| few_shot | 16.482 tok/s | 13.528 | 8.134 | 0.980 |
+| self_consistency | 21.229 tok/s | 11.742 | 4.333 | 1.000 |
+| multi_turn | 18.727 tok/s | 11.961 | 7.772 | 0.979 |
+| tree_of_thought | 33.083 tok/s | 24.638 | 2.742 | 0.973 |
+| long_output | 60.906 tok/s | 60.852 | 35.075 | 1.000 |
+
+The narrow long-output result is repeatable in isolated runs at 61.356 and
+61.385 tok/s, both with 1000/1000 correct responses. A local SGLang rerun
+reached 37.1 tok/s. The locally installed vLLM build (`4236514`) reached 55.1
+tok/s with both its upstream all-reduce/RMS fusion default and the public
+benchmark override; the stronger public vLLM commit (`c7ce03b`) remains the
+comparison target above.
+
+The long-output profile identified two independent bodies. Decode-only batch
+64 initially took about 11.06 ms. Mixed refill steps, which account for roughly
+190 of 666 model calls, took about 18.4 ms at the common 320-token bucket.
+The promoted changes are shape-general:
+
+- Per-token FP8 projection can write directly into the symmetric-memory reduce
+  buffer, removing a full output copy from prefill.
+- Hopper fast accumulation is used for FP8 prefill GEMMs from 129 rows upward;
+  held-out WikiText predictions and NLL were byte-for-byte identical with the
+  accurate accumulator on a 256-token context check.
+- RMSNorm and per-token FP8 quantization are fused for QKV/gate-up inputs.
+  SwiGLU-to-FP8 stays disabled because it regressed both decode and prefill.
+- The streaming GQA decode attention tile is 128 tokens in the optimized
+  OpenAI defaults. It reduced batch-64 replay from 10.19 to 9.90 ms at a
+  128-token context and also won at a 512-token context; a 256-token tile was
+  rejected at 14.40 ms.
+- Recycled active rows retain only their physical KV-prefix metadata, allowing
+  a later matching prefix to skip a redundant KV copy. No logits or sampled
+  tokens are stored with that metadata.
+
+Rejected experiments include QKV FP8 prefill, O-projection FP8, tensorwise FP8
+prefill, Marlin gate/up in the mixed FP8 decode stack, eight-request refill
+grouping, a three-step admission interval, multi-step decode, and prefix-row
+decode padding. They either increased model time or moved work into queueing.
+
+The score-facing inference-bench provider forces generated-prefix, prompt
+logits, prefix-logits, prompt-lookup, repeated-sample-state, and cached greedy
+token paths off. Final queue profiles report zero generated-prefix stores and
+reuses, zero prompt-lookup accepted tokens, and zero reusable logits, sampled
+states, or greedy-token payloads. The source scan also found no benchmark-name,
+prompt-string, token-id, fixture, dataset, or request-length fingerprint in the
+runtime path. Identical live rows may share a single forward within the same
+batch, but sampling is performed independently and no result is retained for a
+later request.
+
 ## Current 20260712 public refresh
 
 The latest public run advanced to `20260712_090215`, built from TorchInferno
