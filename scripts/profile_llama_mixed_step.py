@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import time
 from contextlib import nullcontext
 
@@ -31,6 +32,7 @@ def _args() -> argparse.Namespace:
     parser.add_argument("--token-bucket", action="store_true")
     parser.add_argument("--ragged-decode", action="store_true")
     parser.add_argument("--ragged-decode-sweep", action="store_true")
+    parser.add_argument("--attention-block-s-sweep", action="store_true")
     parser.add_argument("--indexed-rows", action="store_true")
     parser.add_argument("--online-engine", action="store_true")
     parser.add_argument("--profile", action="store_true")
@@ -378,6 +380,72 @@ def _profile_ragged_decode_sweep(
         print(json.dumps(results, indent=2, sort_keys=True), flush=True)
 
 
+def _profile_attention_block_s_sweep(
+    model: Llama3TensorParallelForCausalLM,
+    args: argparse.Namespace,
+) -> None:
+    device = model.device
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    cache = model.allocate_cache(
+        args.batch_capacity,
+        max(args.prefix_tokens + 16, args.cache_tokens),
+    )
+    for layer in cache.layers:
+        layer.keys.zero_()
+        layer.values.zero_()
+    input_ids = torch.ones((args.rows, 1), dtype=torch.long, device=device)
+    seq_lens = torch.full(
+        (args.batch_capacity,),
+        args.prefix_tokens,
+        dtype=torch.long,
+        device=device,
+    )
+    results: list[dict[str, float | int]] = []
+    with torch.inference_mode():
+        for block_s in (64, 96, 128, 160, 192, 256):
+            os.environ["TORCHINFERNO_TRITON_STREAMING_DECODE_ATTENTION_BLOCK_S"] = str(block_s)
+            model.release_decode_graphs_for_cache(cache)
+            output = model.try_decode_ragged_token_graph(
+                input_ids,
+                cache,
+                seq_lens=seq_lens,
+                row_indices=None,
+                temperature=0.0,
+                capture_on_miss=True,
+            )
+            if output is None:
+                raise RuntimeError(f"ragged decode graph is unavailable for block_s={block_s}")
+            torch.cuda.synchronize(device)
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            wall_start_s = time.perf_counter()
+            start.record()
+            for _ in range(40):
+                output = model.try_decode_ragged_token_graph(
+                    input_ids,
+                    cache,
+                    seq_lens=seq_lens,
+                    row_indices=None,
+                    temperature=0.0,
+                    capture_on_miss=False,
+                )
+                if output is None:
+                    raise RuntimeError(f"ragged decode replay failed for block_s={block_s}")
+            end.record()
+            torch.cuda.synchronize(device)
+            results.append(
+                {
+                    "block_s": block_s,
+                    "rows": args.rows,
+                    "prefix_tokens": args.prefix_tokens,
+                    "replay_ms": start.elapsed_time(end) / 40.0,
+                    "replay_wall_ms": (time.perf_counter() - wall_start_s) * 1000.0 / 40.0,
+                }
+            )
+    if rank == 0:
+        print(json.dumps(results, indent=2, sort_keys=True), flush=True)
+
+
 def _profile_online_engine(
     model: Llama3TensorParallelForCausalLM,
     args: argparse.Namespace,
@@ -463,6 +531,9 @@ def main() -> None:
     device = model.device
     rank = dist.get_rank() if dist.is_initialized() else 0
     validate_symm_mem_allreduce_collective(model, device)
+    if args.attention_block_s_sweep:
+        _profile_attention_block_s_sweep(model, args)
+        return
     if args.ragged_decode_sweep:
         _profile_ragged_decode_sweep(model, args)
         return

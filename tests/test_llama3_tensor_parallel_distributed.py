@@ -230,6 +230,43 @@ def test_llama3_tensor_parallel_prefill_symm_capture_requires_ready_buffer(monke
     assert all_reduce_calls == [result]
 
 
+def test_llama3_tensor_parallel_symm_failure_does_not_switch_collectives(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(tensor_parallel_module, "_SYMM_REDUCE_DISABLED", False)
+    layer = object.__new__(tensor_parallel_module._Llama3TensorParallelLayer)
+    layer.world_size = 2
+    layer._symm_reduce_failed = False
+    hidden = torch.ones((2, 1, 4), dtype=torch.bfloat16)
+    weight = torch.ones((8, 4), dtype=torch.bfloat16)
+
+    monkeypatch.setattr(
+        layer,
+        "_symm_reduce_buffer",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("rank-local failure")),
+    )
+    monkeypatch.setattr(
+        tensor_parallel_module,
+        "_should_use_symm_mem_all_reduce",
+        lambda *args, **kwargs: True,
+    )
+    monkeypatch.setattr(
+        tensor_parallel_module,
+        "_should_use_symm_mem_prefill_all_reduce",
+        lambda *args, **kwargs: False,
+    )
+    monkeypatch.setattr(
+        tensor_parallel_module,
+        "_all_reduce",
+        lambda *args, **kwargs: pytest.fail("must not enter NCCL after symm selection"),
+    )
+
+    with pytest.raises(RuntimeError, match="rank-local failure"):
+        layer._decode_linear_all_reduce(hidden, weight, "attention")
+
+    assert layer._symm_reduce_failed
+
+
 def test_llama3_tensor_parallel_decode_mlp_reuses_scratch_buffers(monkeypatch) -> None:
     layer = object.__new__(tensor_parallel_module._Llama3TensorParallelLayer)
     layer.world_size = 1

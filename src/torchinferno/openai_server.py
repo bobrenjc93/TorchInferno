@@ -17986,6 +17986,9 @@ _PREFILL_GRAPH_CACHE_ATTRS = (
     "_prefill_logits_graphs",
     "_prefill_selected_logits_graphs",
     "_ragged_prefill_logits_graphs",
+    "_packed_ragged_prefill_logits_graphs",
+    "_token_bucket_prefill_graphs",
+    "_token_bucket_prefix_copy_graphs",
 )
 
 _GRAPH_CACHE_ATTRS = _PREFILL_GRAPH_CACHE_ATTRS + (
@@ -18300,6 +18303,20 @@ def config_from_args(args: argparse.Namespace) -> OpenAIServerConfig:
     )
 
 
+@lru_cache(maxsize=1)
+def _sglang_fa3_backend_status() -> tuple[bool, str]:
+    try:
+        from importlib.metadata import version
+
+        from sgl_kernel.flash_attn import flash_attn_with_kvcache
+
+        if not callable(flash_attn_with_kvcache):
+            return False, "flash_attn_with_kvcache is not callable"
+        return True, version("sglang-kernel")
+    except Exception as exc:
+        return False, f"{type(exc).__name__}: {exc}"
+
+
 def _apply_tensor_parallel_serving_defaults(config: OpenAIServerConfig) -> None:
     """Enable the validated CUDA TP path without classifying request shapes."""
 
@@ -18310,12 +18327,21 @@ def _apply_tensor_parallel_serving_defaults(config: OpenAIServerConfig) -> None:
     if _infer_model_kind(config) != "llama3" or not torch.cuda.is_available():
         return
 
+    fa3_available, fa3_status = _sglang_fa3_backend_status()
+    if (
+        os.environ.get("LOCAL_RANK") in (None, "0")
+        and "TORCHINFERNO_SGLANG_FA3_STATUS_LOGGED" not in os.environ
+    ):
+        state = "available" if fa3_available else "unavailable"
+        print(f"TorchInferno SGLang FA3 backend {state}: {fa3_status}", flush=True)
+    os.environ["TORCHINFERNO_SGLANG_FA3_STATUS_LOGGED"] = "1"
+
     defaults = {
         # One scheduler and graph path handles both prefill and decode. All
         # choices below remain explicit env overrides for portability/debugging.
-        "TORCHINFERNO_CONTINUOUS_UNIFIED_FORWARD": "1",
-        "TORCHINFERNO_CONTINUOUS_TOKEN_BUCKET_FA3_UNIFIED": "1",
-        "TORCHINFERNO_CONTINUOUS_TOKEN_BUCKET_FA3_PREFILL": "1",
+        "TORCHINFERNO_CONTINUOUS_UNIFIED_FORWARD": "1" if fa3_available else "0",
+        "TORCHINFERNO_CONTINUOUS_TOKEN_BUCKET_FA3_UNIFIED": "1" if fa3_available else "0",
+        "TORCHINFERNO_CONTINUOUS_TOKEN_BUCKET_FA3_PREFILL": "1" if fa3_available else "0",
         "TORCHINFERNO_CONTINUOUS_PREFIX_PREFILL_SKIP_WARM_PREFIX_COPY": "1",
         # Bound refill work and avoid interrupting an established decode wave on
         # every arrival. The decision uses ready rows and generated progress.
@@ -18323,7 +18349,7 @@ def _apply_tensor_parallel_serving_defaults(config: OpenAIServerConfig) -> None:
         "TORCHINFERNO_OPENAI_TP_ONLINE_MIN_GENERATION_CAPACITY": "128",
         "TORCHINFERNO_OPENAI_TP_ONLINE_SESSION_PROMPT_HEADROOM_TOKENS": "64",
         "TORCHINFERNO_CONTINUOUS_ADMIT_PER_STEP_CAP": "48",
-        "TORCHINFERNO_CONTINUOUS_ADMIT_MIN_READY_REQUESTS": "4",
+        "TORCHINFERNO_CONTINUOUS_ADMIT_MIN_READY_REQUESTS": "6",
         "TORCHINFERNO_CONTINUOUS_ADMIT_MIN_FREE_ROWS": "2",
         "TORCHINFERNO_CONTINUOUS_ADMIT_PREFILL_COST_PRIORITY": "1",
         "TORCHINFERNO_CONTINUOUS_ADMIT_SUSTAINED_MIN_GENERATED": "3",

@@ -2358,6 +2358,16 @@ class ContinuousBatchEngine:
         occupied = len(decode_states) + len(self._online_prefilling)
         admitted = self._admit_ready_requests(waiting, step, occupied)
 
+        self.stats.prefill_admitted_requests += len(admitted)
+        for _original_index, request in admitted:
+            if not request.prompt:
+                raise ValueError("request prompt must contain at least one token")
+        admitted = [
+            (original_index, request)
+            for original_index, request in admitted
+            if request.max_new_tokens > 0
+        ]
+
         prefill_states: list[_ActiveRequest] = []
         skipped_prefix_copy_tokens = 0
         self._prepare_chunked_common_prefix_for_admission(admitted)
@@ -2402,6 +2412,10 @@ class ContinuousBatchEngine:
                 self._record_prefix_reuse(prefix_hit, reusable)
             else:
                 warm_prefix_hit = False
+            # The request is about to write this row. Any warm-prefix identity
+            # describes the previous contents and must not survive a different
+            # suffix (or a partial graph failure).
+            self._forget_row_cached_prefix(row)
             suffix = request.prompt[prefix_hit:]
             state = _ActiveRequest(
                 original_index=original_index,
@@ -2420,7 +2434,6 @@ class ContinuousBatchEngine:
                 prefix_hit if token_bucket_unified and not warm_prefix_hit else 0
             )
             prefill_states.append(state)
-        self.stats.prefill_admitted_requests += len(prefill_states)
         if skipped_prefix_copy_tokens:
             self.stats.prefill_prefix_copy_skipped_batches += 1
             self.stats.prefill_prefix_copy_skipped_tokens += skipped_prefix_copy_tokens
@@ -3145,6 +3158,7 @@ class ContinuousBatchEngine:
             priority_key=lambda item: self._admission_priority(
                 item,
                 active_count=active_count,
+                step=step,
             ),
         )
         if admitted:
@@ -3160,19 +3174,33 @@ class ContinuousBatchEngine:
         item: _QueuedRequest,
         *,
         active_count: int = 0,
+        step: int | None = None,
     ) -> tuple[object, ...]:
+        max_priority_wait_steps = env_int(
+            "TORCHINFERNO_CONTINUOUS_ADMIT_PRIORITY_MAX_WAIT_STEPS",
+            8,
+            minimum=0,
+        )
+        waited_steps = (
+            0
+            if step is None
+            else max(0, int(step) - int(item.request.arrival_step))
+        )
+        if max_priority_wait_steps > 0 and waited_steps >= max_priority_wait_steps:
+            return (0, item.request.arrival_step, item.sequence)
         prefix_hit_tokens = self._reusable_prefix_hit_tokens(item.request.prompt)
         prefix_priority = -prefix_hit_tokens if self._admit_prefix_hit_priority_enabled() else 0
         if self._admit_prefill_cost_priority_enabled(active_count=active_count):
             prefill_cost = max(1, len(item.request.prompt) - prefix_hit_tokens)
             return (
+                1,
                 prefix_priority,
                 prefill_cost,
                 item.request.max_new_tokens,
                 item.request.arrival_step,
                 item.sequence,
             )
-        return (prefix_priority, item.request.arrival_step, item.sequence)
+        return (1, prefix_priority, item.request.arrival_step, item.sequence)
 
     def _admit_prefix_hit_priority_enabled(self) -> bool:
         return env_flag("TORCHINFERNO_CONTINUOUS_ADMIT_PREFIX_HIT_PRIORITY", True)
@@ -3986,6 +4014,8 @@ class ContinuousBatchEngine:
                 source_prefix_rows = []
                 self.stats.prefill_prefix_copy_skipped_batches += 1
                 self.stats.prefill_prefix_copy_skipped_tokens += prefix_hits[0] * len(rows)
+            for row in rows:
+                self._forget_row_cached_prefix(row)
             padded_suffixes = [
                 [*suffix, *([0] * (suffix_bucket - len(suffix)))]
                 for suffix in suffixes
@@ -4003,6 +4033,7 @@ class ContinuousBatchEngine:
                         pad_row = prefix_pad_row
                     else:
                         pad_rows.append(pad_row)
+                    self._forget_row_cached_prefix(pad_row)
                     padded_suffixes.append(list(dummy_suffix))
                     start_lens.append(prefix_hits[0])
                     if source_prefix_rows:
@@ -4848,6 +4879,7 @@ class ContinuousBatchEngine:
                 if pad_row is not None:
                     extra_active_rows.append(pad_row)
                     dummy_pool.append(pad_row)
+                    self._forget_row_cached_prefix(pad_row)
                     continue
                 prefix_pad_row = self._acquire_free_prefix_row_or_none()
                 if prefix_pad_row is None:
@@ -4855,6 +4887,7 @@ class ContinuousBatchEngine:
                     return None
                 extra_prefix_rows.append(prefix_pad_row)
                 dummy_pool.append(prefix_pad_row)
+                self._forget_row_cached_prefix(prefix_pad_row)
 
             dummy_iter = iter(dummy_pool)
             fixed_suffixes: list[list[int]] = []
@@ -6358,6 +6391,8 @@ class ContinuousBatchEngine:
         input_ids = torch.tensor(padded, device=self.device, dtype=torch.long)
         row_indices_list = list(rows)
         pad_row = self._free_active_rows[-1] if self._free_active_rows else rows[0]
+        if pad_row not in rows:
+            self._forget_row_cached_prefix(pad_row)
         while len(row_indices_list) < batch_bucket:
             row_indices_list.append(pad_row)
         row_indices = torch.tensor(row_indices_list, device=self.device, dtype=torch.long)
@@ -8490,6 +8525,7 @@ class ContinuousBatchEngine:
         for row in reversed(self._free_active_rows):
             if row in row_set:
                 continue
+            self._forget_row_cached_prefix(row)
             bucketed.append(row)
             if len(bucketed) >= bucket_size:
                 return bucketed
@@ -9096,6 +9132,7 @@ class ContinuousBatchEngine:
 
     def _copy_prefix(self, source_row: int, dest_row: int, tokens: int) -> None:
         cache = self._require_cache()
+        self._forget_row_cached_prefix(dest_row)
         cache.copy_prefix_from(cache, tokens, source_row=source_row, dest_row=dest_row)  # type: ignore[attr-defined]
         self._remember_row_seq_len(dest_row, tokens)
 
@@ -9148,6 +9185,8 @@ class ContinuousBatchEngine:
             self._copy_prefix(source_row, row, tokens)
 
     def _copy_prefix_to_rows_dense(self, source_row: int, dest_rows: list[int], tokens: int) -> bool:
+        for row in dest_rows:
+            self._forget_row_cached_prefix(row)
         if tokens <= 0:
             for row in dest_rows:
                 self._remember_row_seq_len(row, 0)

@@ -3315,6 +3315,11 @@ class _Llama3TensorParallelLayer:
             except Exception:
                 self._symm_reduce_failed = True
                 _disable_symm_reduce()
+                # A rank-local NCCL fallback here can deadlock against peers
+                # that already entered the symmetric-memory collective. The
+                # warmup probe is the only safe place to disable this path
+                # collectively; failures after selection must abort the step.
+                raise
         fp8_decode = fp8_activation is not None or self._fp8_decode_shape_enabled(hidden)
         marlin_out = project_fp8() if fp8_decode and fp8_key is not None else None
         if marlin_out is None and marlin_key is not None and fp8_activation is None:
@@ -3361,7 +3366,7 @@ class _Llama3TensorParallelLayer:
             return buffer
         except Exception:
             _disable_symm_reduce()
-            return None
+            raise
 
     def _symm_reduce_buffer_ready(self, name: str, hidden: Tensor, expected_shape: tuple[int, ...]) -> bool:
         if not dist.is_available() or not dist.is_initialized():
@@ -5263,6 +5268,9 @@ class Llama3TensorParallelForCausalLM:
             self._prefill_logits_graphs,
             getattr(self, "_prefill_selected_logits_graphs", {}),
             getattr(self, "_ragged_prefill_logits_graphs", {}),
+            getattr(self, "_packed_ragged_prefill_logits_graphs", {}),
+            getattr(self, "_token_bucket_prefill_graphs", {}),
+            getattr(self, "_token_bucket_prefix_copy_graphs", {}),
             self._decode_graphs,
             self._decode_logits_graphs,
             getattr(self, "_ragged_decode_graphs", {}),

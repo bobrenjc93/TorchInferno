@@ -39,6 +39,7 @@ from torchinferno.openai_server import (
     _GenerationDone,
     OpenAICompletionEngine,
     OpenAIServerConfig,
+    _apply_tensor_parallel_serving_defaults,
     _ByteFallbackTokenizer,
     _PersistentPromptListStepResult,
     _PersistentPromptListStepState,
@@ -6055,6 +6056,15 @@ def test_llama_tp_cache_release_clears_prefill_and_decode_graphs() -> None:
     model._ragged_prefill_logits_graphs = {
         (id(cache), 2, 4, 16, True): types.SimpleNamespace(cache=cache),
     }
+    model._packed_ragged_prefill_logits_graphs = {
+        (id(cache), 2, 4, 16): types.SimpleNamespace(cache=cache),
+    }
+    model._token_bucket_prefill_graphs = {
+        (id(cache), 2, 128): types.SimpleNamespace(cache=cache),
+    }
+    model._token_bucket_prefix_copy_graphs = {
+        (id(cache), 2, 64): types.SimpleNamespace(cache=cache),
+    }
     model._decode_graphs = {
         (id(cache), 1, 8): types.SimpleNamespace(cache=cache),
     }
@@ -6073,6 +6083,9 @@ def test_llama_tp_cache_release_clears_prefill_and_decode_graphs() -> None:
     assert list(model._prefill_graphs.values()) == [types.SimpleNamespace(cache=other_cache)]
     assert model._prefill_logits_graphs == {}
     assert model._ragged_prefill_logits_graphs == {}
+    assert model._packed_ragged_prefill_logits_graphs == {}
+    assert model._token_bucket_prefill_graphs == {}
+    assert model._token_bucket_prefix_copy_graphs == {}
     assert model._decode_graphs == {}
     assert model._decode_logits_graphs == {}
     assert model._ragged_decode_logits_graphs == {}
@@ -6085,6 +6098,9 @@ def test_clear_model_graph_caches_includes_ragged_prefill_and_decode_many() -> N
         _prefill_logits_graphs={"prefill_logits": object()},
         _prefill_selected_logits_graphs={"selected": object()},
         _ragged_prefill_logits_graphs={"ragged_prefill": object()},
+        _packed_ragged_prefill_logits_graphs={"packed_prefill": object()},
+        _token_bucket_prefill_graphs={"token_bucket": object()},
+        _token_bucket_prefix_copy_graphs={"prefix_copy": object()},
         _decode_graphs={"decode": object()},
         _decode_logits_graphs={"decode_logits": object()},
         _ragged_decode_graphs={"ragged_decode": object()},
@@ -6099,6 +6115,9 @@ def test_clear_model_graph_caches_includes_ragged_prefill_and_decode_many() -> N
         model._prefill_logits_graphs,
         model._prefill_selected_logits_graphs,
         model._ragged_prefill_logits_graphs,
+        model._packed_ragged_prefill_logits_graphs,
+        model._token_bucket_prefill_graphs,
+        model._token_bucket_prefix_copy_graphs,
         model._decode_graphs,
         model._decode_logits_graphs,
         model._ragged_decode_graphs,
@@ -6114,6 +6133,9 @@ def test_clear_model_prefill_graph_caches_keeps_decode_graphs() -> None:
         _prefill_logits_graphs={"prefill_logits": object()},
         _prefill_selected_logits_graphs={"selected": object()},
         _ragged_prefill_logits_graphs={"ragged_prefill": object()},
+        _packed_ragged_prefill_logits_graphs={"packed_prefill": object()},
+        _token_bucket_prefill_graphs={"token_bucket": object()},
+        _token_bucket_prefix_copy_graphs={"prefix_copy": object()},
         _decode_graphs={"decode": object()},
         _decode_logits_graphs={"decode_logits": object()},
         _ragged_decode_graphs={"ragged_decode": object()},
@@ -6128,6 +6150,9 @@ def test_clear_model_prefill_graph_caches_keeps_decode_graphs() -> None:
         model._prefill_logits_graphs,
         model._prefill_selected_logits_graphs,
         model._ragged_prefill_logits_graphs,
+        model._packed_ragged_prefill_logits_graphs,
+        model._token_bucket_prefill_graphs,
+        model._token_bucket_prefix_copy_graphs,
     ):
         assert graph_map == {}
     assert model._decode_graphs
@@ -9706,6 +9731,83 @@ def test_openai_symm_mem_auto_probe_sets_worker_env_on_success(monkeypatch) -> N
 
     assert calls == [8]
     assert os.environ["TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE"] == "runtime"
+
+
+@pytest.fixture
+def preserve_torchinferno_environment():
+    snapshot = {
+        name: value
+        for name, value in os.environ.items()
+        if name.startswith("TORCHINFERNO_")
+    }
+    yield
+    for name in tuple(os.environ):
+        if name.startswith("TORCHINFERNO_"):
+            os.environ.pop(name, None)
+    os.environ.update(snapshot)
+
+
+@pytest.mark.parametrize(("available", "expected"), [(True, "1"), (False, "0")])
+def test_tensor_parallel_serving_defaults_gate_fa3_backend(
+    monkeypatch: pytest.MonkeyPatch,
+    preserve_torchinferno_environment,
+    available: bool,
+    expected: str,
+) -> None:
+    del preserve_torchinferno_environment
+    for name in (
+        "TORCHINFERNO_CONTINUOUS_UNIFIED_FORWARD",
+        "TORCHINFERNO_CONTINUOUS_TOKEN_BUCKET_FA3_UNIFIED",
+        "TORCHINFERNO_CONTINUOUS_TOKEN_BUCKET_FA3_PREFILL",
+        "TORCHINFERNO_CONTINUOUS_ADMIT_MIN_READY_REQUESTS",
+        "TORCHINFERNO_SGLANG_FA3_STATUS_LOGGED",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr("torch.cuda.is_available", lambda: True)
+    monkeypatch.setattr(
+        "torchinferno.openai_server._sglang_fa3_backend_status",
+        lambda: (available, "test-backend"),
+    )
+
+    _apply_tensor_parallel_serving_defaults(
+        OpenAIServerConfig(
+            model="meta-llama/Llama-3.1",
+            model_kind="llama3",
+            tensor_parallel_size=8,
+        )
+    )
+
+    assert os.environ["TORCHINFERNO_CONTINUOUS_UNIFIED_FORWARD"] == expected
+    assert os.environ["TORCHINFERNO_CONTINUOUS_TOKEN_BUCKET_FA3_UNIFIED"] == expected
+    assert os.environ["TORCHINFERNO_CONTINUOUS_TOKEN_BUCKET_FA3_PREFILL"] == expected
+    assert os.environ["TORCHINFERNO_CONTINUOUS_ADMIT_MIN_READY_REQUESTS"] == "6"
+
+
+def test_tensor_parallel_serving_defaults_preserve_explicit_fa3_override(
+    monkeypatch: pytest.MonkeyPatch,
+    preserve_torchinferno_environment,
+) -> None:
+    del preserve_torchinferno_environment
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_UNIFIED_FORWARD", "1")
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_TOKEN_BUCKET_FA3_UNIFIED", "1")
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_TOKEN_BUCKET_FA3_PREFILL", "1")
+    monkeypatch.setattr("torch.cuda.is_available", lambda: True)
+    monkeypatch.setattr(
+        "torchinferno.openai_server._sglang_fa3_backend_status",
+        lambda: (False, "missing"),
+    )
+
+    _apply_tensor_parallel_serving_defaults(
+        OpenAIServerConfig(
+            model="meta-llama/Llama-3.1",
+            model_kind="llama3",
+            tensor_parallel_size=8,
+        )
+    )
+
+    assert os.environ["TORCHINFERNO_CONTINUOUS_UNIFIED_FORWARD"] == "1"
+    assert os.environ["TORCHINFERNO_CONTINUOUS_TOKEN_BUCKET_FA3_UNIFIED"] == "1"
+    assert os.environ["TORCHINFERNO_CONTINUOUS_TOKEN_BUCKET_FA3_PREFILL"] == "1"
 
 
 def test_openai_symm_mem_auto_probe_sets_worker_env_on_failure(monkeypatch) -> None:

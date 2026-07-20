@@ -204,6 +204,39 @@ def test_continuous_batch_engine_ragged_decode_bucket_sizes(monkeypatch) -> None
     assert len(set(bucketed_rows)) == len(bucketed_rows)
 
 
+def test_ragged_decode_padding_invalidates_warm_prefix_identity(monkeypatch) -> None:
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_BUCKET_SIZES", "4")
+    engine = ContinuousBatchEngine(
+        _RaggedGraphToyModel(),
+        device=torch.device("cpu"),
+        max_active_requests=4,
+    )
+    engine.start_online(max_seq_len=16)
+    cached_tokens = (1, 2, 3, 4)
+    engine._free_active_rows = [3]
+    engine._remember_row_cached_prefix(3, cached_tokens)
+
+    assert engine._rows_have_cached_prefix((3,), cached_tokens, len(cached_tokens))
+    assert engine._ragged_decode_bucket_rows([0, 1, 2]) == [0, 1, 2, 3]
+    assert not engine._rows_have_cached_prefix((3,), cached_tokens, len(cached_tokens))
+
+
+def test_prefix_copy_invalidates_destination_warm_prefix_identity() -> None:
+    engine = ContinuousBatchEngine(
+        _RaggedGraphToyModel(),
+        device=torch.device("cpu"),
+        max_active_requests=2,
+    )
+    engine.start_online(max_seq_len=16)
+    old_tokens = (8, 9)
+    engine._remember_row_cached_prefix(1, old_tokens)
+    engine._set_cache_row_seq_len(0, 2)
+
+    engine._copy_prefix(0, 1, 2)
+
+    assert not engine._rows_have_cached_prefix((1,), old_tokens, len(old_tokens))
+
+
 def test_continuous_batch_engine_accepts_explicit_mixed_prefix_policy(monkeypatch) -> None:
     for env_name in (
         "TORCHINFERNO_CONTINUOUS_GREEDY_LARGE_MIXED_PREFIX_REUSE",
@@ -3148,6 +3181,28 @@ def test_continuous_batch_engine_can_prioritize_short_prefill_cost(monkeypatch) 
     assert by_id["short"].started_step == 0
     assert by_id["mid"].started_step == 1
     assert by_id["long"].started_step == 2
+
+
+def test_continuous_batch_engine_priority_aging_bounds_short_request_bypass(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_ADMIT_PREFILL_COST_PRIORITY", "1")
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_ADMIT_PRIORITY_MAX_WAIT_STEPS", "4")
+    engine = ContinuousBatchEngine(
+        _RaggedGraphToyModel(),
+        device=torch.device("cpu"),
+        max_active_requests=1,
+    )
+    waiting = serving_mod.ServingQueue(
+        [
+            (0, ServingRequest("old-long", tuple(range(16)), 1, arrival_step=0)),
+            (1, ServingRequest("new-short", (31,), 1, arrival_step=4)),
+        ]
+    )
+
+    admitted = engine._admit_ready_requests(waiting, step=4, active_count=0)
+
+    assert [request.request_id for _index, request in admitted] == ["old-long"]
 
 
 def test_continuous_batch_engine_keeps_arrival_order_for_larger_greedy_admission(monkeypatch) -> None:
@@ -6215,6 +6270,47 @@ def test_continuous_batch_engine_unified_token_graph_skips_valid_warm_prefix_cop
     assert engine.stats.prefix_reuse_tokens == len(prompt) - 1
     assert engine.stats.prefill_prefix_copy_skipped_batches == 1
     assert engine.stats.prefill_prefix_copy_skipped_tokens == len(prompt) - 1
+
+
+def test_continuous_batch_engine_unified_zero_token_request_uses_no_row(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_UNIFIED_FORWARD", "1")
+    model = _UnifiedStepToyModel()
+    engine = ContinuousBatchEngine(
+        model,
+        device=torch.device("cpu"),
+        max_active_requests=1,
+    )
+    engine.start_online(max_seq_len=16)
+    free_rows = list(engine._free_active_rows)
+    engine.submit_online(ServingRequest("zero", (1, 2, 3), 0, arrival_step=0))
+
+    assert engine.step_online() == []
+    assert engine._free_active_rows == free_rows
+    assert model.unified_calls == 0
+    assert engine.stats.prefill_admitted_requests == 1
+
+
+def test_continuous_batch_engine_unified_rejects_empty_prompt_before_row_acquire(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_UNIFIED_FORWARD", "1")
+    model = _UnifiedStepToyModel()
+    engine = ContinuousBatchEngine(
+        model,
+        device=torch.device("cpu"),
+        max_active_requests=1,
+    )
+    engine.start_online(max_seq_len=16)
+    free_rows = list(engine._free_active_rows)
+    engine.submit_online(ServingRequest("empty", (), 1, arrival_step=0))
+
+    with pytest.raises(ValueError, match="prompt must contain"):
+        engine.step_online()
+
+    assert engine._free_active_rows == free_rows
+    assert model.unified_calls == 0
 
 
 def test_continuous_batch_engine_chunked_online_continues_after_exact_prompt_replay() -> None:

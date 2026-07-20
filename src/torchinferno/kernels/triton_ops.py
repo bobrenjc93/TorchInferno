@@ -1902,7 +1902,7 @@ def triton_grouped_gqa_decode_attention(
             block_s,
             block_d,
             block_v,
-            num_warps=4,
+            num_warps=_streaming_decode_attention_num_warps(),
         )
         return out
     num_warps = int(os.environ.get("TORCHINFERNO_TRITON_GROUPED_DECODE_ATTENTION_WARPS", "4"))
@@ -1949,6 +1949,10 @@ def triton_grouped_gqa_decode_attention(
 def _streaming_decode_attention_block_s(batch: int) -> int:
     del batch
     return int(os.environ.get("TORCHINFERNO_TRITON_STREAMING_DECODE_ATTENTION_BLOCK_S", "64"))
+
+
+def _streaming_decode_attention_num_warps() -> int:
+    return int(os.environ.get("TORCHINFERNO_TRITON_STREAMING_DECODE_ATTENTION_WARPS", "4"))
 
 
 def _triton_rotate_one_interleaved_inplace(x: Tensor, cos: Tensor, sin: Tensor) -> None:
@@ -2590,7 +2594,7 @@ def triton_batched_paged_gqa_decode_attention_with_table(
         block_s,
         block_d,
         block_v,
-        num_warps=4,
+        num_warps=_streaming_decode_attention_num_warps(),
     )
     return out
 
