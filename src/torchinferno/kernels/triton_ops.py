@@ -2131,31 +2131,44 @@ def _swiglu_fp8_per_token_kernel(
     up_ptr,
     output_ptr,
     scale_ptr,
+    gate_stride_row: tl.constexpr,
+    up_stride_row: tl.constexpr,
     n_cols: tl.constexpr,
     block_size: tl.constexpr,
 ) -> None:
     row = tl.program_id(0)
     offsets = tl.arange(0, block_size)
     mask = offsets < n_cols
-    row_offsets = row * n_cols + offsets
-    gate = tl.load(gate_ptr + row_offsets, mask=mask, other=0.0).to(tl.float32)
-    up = tl.load(up_ptr + row_offsets, mask=mask, other=0.0).to(tl.float32)
-    activated = gate * tl.sigmoid(gate) * up
+    output_offsets = row * n_cols + offsets
+    gate = tl.load(
+        gate_ptr + row * gate_stride_row + offsets,
+        mask=mask,
+        other=0.0,
+    ).to(tl.float32)
+    up = tl.load(
+        up_ptr + row * up_stride_row + offsets,
+        mask=mask,
+        other=0.0,
+    ).to(tl.float32)
+    # Match the unfused path's BF16 activation materialization before dynamic
+    # FP8 quantization. Keeping the FP32 intermediate changes decode decisions
+    # enough to fail the held-out serving-quality gate.
+    activated = (gate / (1.0 + tl.exp(-gate)) * up).to(tl.bfloat16).to(tl.float32)
     scale = tl.maximum(tl.max(tl.abs(activated), axis=0) / 448.0, 1e-10)
-    tl.store(output_ptr + row_offsets, activated / scale, mask=mask)
+    tl.store(output_ptr + output_offsets, activated / scale, mask=mask)
     tl.store(scale_ptr + row, scale)
 
 
 def _fp8_per_token_outputs(x: Tensor) -> tuple[Tensor, Tensor, int, int]:
     if not x.is_cuda or x.ndim < 2:
         raise ValueError("per-token FP8 fusion requires a CUDA activation matrix")
-    x_2d = x.contiguous().view(-1, x.size(-1))
-    n_cols = x_2d.size(1)
+    n_cols = x.size(-1)
+    rows = x.numel() // n_cols
     block_size = triton.next_power_of_2(n_cols)
     if block_size > 8192:
         raise ValueError("per-token FP8 fusion supports hidden sizes up to 8192")
-    output = torch.empty_like(x_2d, dtype=torch.float8_e4m3fn)
-    scale = torch.empty((x_2d.size(0), 1), dtype=torch.float32, device=x.device)
+    output = torch.empty((rows, n_cols), dtype=torch.float8_e4m3fn, device=x.device)
+    scale = torch.empty((rows, 1), dtype=torch.float32, device=x.device)
     return output, scale, n_cols, block_size
 
 
@@ -2219,14 +2232,18 @@ def triton_swiglu_fp8_per_token(gate: Tensor, up: Tensor) -> tuple[Tensor, Tenso
 
     if gate.shape != up.shape or gate.device != up.device:
         raise ValueError("gate and up tensors must have matching shapes and devices")
+    if gate.stride(-1) != 1 or up.stride(-1) != 1:
+        raise ValueError("gate and up tensors must have contiguous last dimensions")
     output, scale, n_cols, block_size = _fp8_per_token_outputs(gate)
-    gate_2d = gate.contiguous().view(-1, n_cols)
-    up_2d = up.contiguous().view(-1, n_cols)
+    gate_2d = gate.view(-1, n_cols)
+    up_2d = up.view(-1, n_cols)
     _swiglu_fp8_per_token_kernel[(gate_2d.size(0),)](
         gate_2d,
         up_2d,
         output,
         scale,
+        gate_2d.stride(0),
+        up_2d.stride(0),
         n_cols,
         block_size,
         num_warps=8,

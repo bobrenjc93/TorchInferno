@@ -205,6 +205,7 @@ def _profile_token_bucket(
                 profiler.key_averages().table(
                     sort_by="self_cuda_time_total",
                     row_limit=40,
+                    max_name_column_width=160,
                 ),
                 flush=True,
             )
@@ -298,13 +299,18 @@ def _profile_ragged_decode(
             raise RuntimeError("ragged decode profiling requires a captured graph")
         captured = next(reversed(captured_graphs.values()))
         profile_context = (
-            torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA])
+            torch.profiler.profile(
+                activities=[
+                    torch.profiler.ProfilerActivity.CPU,
+                    torch.profiler.ProfilerActivity.CUDA,
+                ]
+            )
             if rank == 0
             else nullcontext()
         )
+        if dist.is_initialized():
+            dist.barrier()
         with profile_context as profiler:
-            if dist.is_initialized():
-                dist.barrier()
             captured.graph.replay()
             torch.cuda.synchronize(device)
         if rank == 0:
@@ -312,6 +318,7 @@ def _profile_ragged_decode(
                 profiler.key_averages().table(
                     sort_by="self_cuda_time_total",
                     row_limit=40,
+                    max_name_column_width=160,
                 ),
                 flush=True,
             )

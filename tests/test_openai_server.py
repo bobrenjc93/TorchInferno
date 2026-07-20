@@ -9781,6 +9781,7 @@ def test_tensor_parallel_serving_defaults_gate_fa3_backend(
     assert os.environ["TORCHINFERNO_CONTINUOUS_TOKEN_BUCKET_FA3_UNIFIED"] == expected
     assert os.environ["TORCHINFERNO_CONTINUOUS_TOKEN_BUCKET_FA3_PREFILL"] == expected
     assert os.environ["TORCHINFERNO_CONTINUOUS_ADMIT_MIN_READY_REQUESTS"] == "6"
+    assert os.environ["TORCHINFERNO_FP8_FUSED_SWIGLU_DECODE"] == "1"
 
 
 def test_tensor_parallel_serving_defaults_preserve_explicit_fa3_override(

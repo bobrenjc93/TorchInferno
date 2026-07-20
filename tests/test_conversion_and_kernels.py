@@ -285,8 +285,13 @@ def test_fused_fp8_projection_inputs_match_unfused_references() -> None:
     restored_add_norm = add_q.float() * add_scale.view(7, 1, 1)
     torch.testing.assert_close(restored_add_norm, expected_add_norm, atol=1.2e-1, rtol=1.3e-1)
 
-    gate = torch.randn_like(x)
-    up = torch.randn_like(x)
+    gate, up = torch.randn(
+        (7, 1, 128),
+        device="cuda",
+        dtype=torch.bfloat16,
+    ).split(64, dim=-1)
+    assert not gate.is_contiguous()
+    assert not up.is_contiguous()
     expected_swiglu = torch.nn.functional.silu(gate.float()) * up.float()
     swiglu_q, swiglu_scale = triton_swiglu_fp8_per_token(gate, up)
     restored_swiglu = swiglu_q.float() * swiglu_scale.view(7, 1, 1)

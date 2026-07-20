@@ -18380,11 +18380,12 @@ def _apply_tensor_parallel_serving_defaults(config: OpenAIServerConfig) -> None:
         "TORCHINFERNO_FP8_QKV": "1",
         "TORCHINFERNO_FP8_LM_HEAD": "1",
         # Fuse prefill RMSNorm with per-token quantization for the gate/up
-        # projection. The analogous SwiGLU fusion is slower at Llama-70B's
-        # tensor-parallel intermediate width and remains independently gated.
+        # projection. The SwiGLU fusion consumes the strided gate/up halves
+        # directly, avoiding three contiguous copies per layer before the down
+        # projection. Prefill remains independently gated below.
         "TORCHINFERNO_FP8_FUSED_ACTIVATIONS": "1",
         "TORCHINFERNO_FP8_FUSED_ACTIVATIONS_DECODE": "1",
-        "TORCHINFERNO_FP8_FUSED_SWIGLU_DECODE": "0",
+        "TORCHINFERNO_FP8_FUSED_SWIGLU_DECODE": "1",
         # The H100 streaming decode kernel is launch-bound at the short and
         # medium contexts used by online traffic. A 128-token tile wins over
         # 64 at both 128- and 512-token measured contexts; 256 spills enough
