@@ -31,7 +31,6 @@ from torchinferno.openai_http import (
     _new_fast_http_stream_profile,
     _record_fast_http_profile,
     _stream_fast_chat,
-    _stream_defer_role_enabled,
     _stream_inline_enabled,
     enable_tcp_nodelay,
 )
@@ -468,33 +467,65 @@ def test_openai_handler_writes_chunked_sse_frame() -> None:
 def test_openai_fast_stream_end_bytes_coalesce_final_frames() -> None:
     prefix = _chat_completion_chunk_prefix("chatcmpl-test", "test-model", 123)
 
-    plain = _fast_stream_end_bytes(prefix, include_role=False, chunked=False)
+    plain = _fast_stream_end_bytes(prefix, chunked=False)
     assert plain.endswith(b'data: [DONE]\n\n')
     assert b'"finish_reason":"stop"' in plain
     assert b'0\r\n\r\n' not in plain
 
-    chunked = _fast_stream_end_bytes(prefix, include_role=True, chunked=True)
+    chunked = _fast_stream_end_bytes(prefix, chunked=True)
     assert chunked.endswith(b'0\r\n\r\n')
-    assert b'{"role":"assistant"}' in chunked
+    assert b'{"role":"assistant"}' not in chunked
     assert b'data: [DONE]\n\n' in chunked
 
 
-def test_openai_fast_stream_coalesces_ready_token_batches() -> None:
+@pytest.mark.parametrize("max_tokens", [256, 400, 512, 513, 1024])
+def test_openai_fast_stream_sends_role_before_ready_token_batches(max_tokens: int) -> None:
     connection = _RecordingConnection()
 
     _stream_fast_chat(
         connection,  # type: ignore[arg-type]
         _BatchStreamEngine(),
         [{"role": "user", "content": "hello"}],
-        max_tokens=3,
+        max_tokens=max_tokens,
         temperature=0.0,
     )
 
-    assert len(connection.payloads) == 3
-    content_payload = connection.payloads[1]
+    assert len(connection.payloads) == 4
+    assert b'{"role":"assistant"}' in connection.payloads[1]
+    assert b'"content"' not in connection.payloads[1]
+    content_payload = connection.payloads[2]
     assert content_payload.count(b"chat.completion.chunk") == 3
     assert content_payload.count(b'"content"') == 3
-    assert connection.payloads[2].endswith(b"data: [DONE]\n\n")
+    assert b'"role"' not in content_payload
+    assert connection.payloads[3].endswith(b"data: [DONE]\n\n")
+
+
+@pytest.mark.parametrize("max_tokens", [256, 400, 512, 513, 1024])
+def test_openai_stream_sends_role_before_content_for_every_request_shape(
+    max_tokens: int,
+) -> None:
+    handler = object.__new__(OpenAIHandler)
+    handler.server = type("Server", (), {"engine": _SlowStreamEngine(delay_s=0.0)})()
+    handler.wfile = _CountingWriter()
+    handler.close_connection = False
+    handler.send_response = lambda status: None
+    handler.send_header = lambda key, value: None
+    handler.end_headers = lambda: None
+
+    handler._stream_chat(
+        [{"role": "user", "content": "hello"}],
+        max_tokens=max_tokens,
+        temperature=0.0,
+    )
+
+    events = [
+        json.loads(frame)
+        for frame in handler.wfile.payload.decode("utf-8").split("data: ")[1:]
+        if frame.strip() != "[DONE]"
+    ]
+    assert events[0]["choices"][0]["delta"] == {"role": "assistant"}
+    assert events[1]["choices"][0]["delta"].get("content")
+    assert "role" not in events[1]["choices"][0]["delta"]
 
 
 def test_openai_fast_http_profile_writes_jsonl(monkeypatch, tmp_path) -> None:
@@ -3482,22 +3513,6 @@ def test_openai_stream_inline_defaults_on(monkeypatch) -> None:
 
     monkeypatch.setenv("TORCHINFERNO_OPENAI_STREAM_INLINE", "1")
     assert _stream_inline_enabled(max_tokens=1024, temperature=0.0)
-
-
-def test_openai_stream_defer_role_defaults_to_bounded_streams(monkeypatch) -> None:
-    monkeypatch.delenv("TORCHINFERNO_OPENAI_STREAM_DEFER_ROLE", raising=False)
-    monkeypatch.delenv("TORCHINFERNO_OPENAI_STREAM_DEFER_ROLE_MAX_TOKENS", raising=False)
-
-    assert _stream_defer_role_enabled(max_tokens=256, temperature=0.0)
-    assert _stream_defer_role_enabled(max_tokens=400, temperature=0.7)
-    assert _stream_defer_role_enabled(max_tokens=512, temperature=0.0)
-    assert not _stream_defer_role_enabled(max_tokens=513, temperature=0.0)
-
-    monkeypatch.setenv("TORCHINFERNO_OPENAI_STREAM_DEFER_ROLE_MAX_TOKENS", "640")
-    assert _stream_defer_role_enabled(max_tokens=640, temperature=0.0)
-
-    monkeypatch.setenv("TORCHINFERNO_OPENAI_STREAM_DEFER_ROLE", "0")
-    assert not _stream_defer_role_enabled(max_tokens=256, temperature=0.0)
 
 
 def test_openai_engine_microbatches_same_shape_requests(monkeypatch) -> None:

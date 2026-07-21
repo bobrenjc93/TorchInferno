@@ -105,15 +105,10 @@ class OpenAIHandler(BaseHTTPRequestHandler):
         except OSError:
             self.close_connection = True
             return
-        defer_role = _stream_defer_role_enabled(max_tokens=max_tokens, temperature=temperature)
-        client_open = True
-        role_sent = False
-        if not defer_role:
-            client_open = self._try_write_chat_completion_chunk(
-                chunk_prefix,
-                _CHAT_DELTA_ROLE,
-            )
-            role_sent = client_open
+        client_open = self._try_write_chat_completion_chunk(
+            chunk_prefix,
+            _CHAT_DELTA_ROLE,
+        )
         if _stream_inline_enabled(max_tokens=max_tokens, temperature=temperature):
             for token_id in engine.generate_chat_tokens(
                 messages,
@@ -125,22 +120,10 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                 content = engine.tokenizer.decode_token(int(token_id))
                 if not content:
                     continue
-                delta = (
-                    _chat_delta_role_content(content)
-                    if not role_sent
-                    else _chat_delta_content(content)
-                )
-                role_sent = True
                 client_open = self._try_write_chat_completion_chunk(
                     chunk_prefix,
-                    delta,
+                    _chat_delta_content(content),
                 )
-            if client_open:
-                if not role_sent:
-                    client_open = self._try_write_chat_completion_chunk(
-                        chunk_prefix,
-                        _CHAT_DELTA_ROLE,
-                    )
             if client_open:
                 client_open = self._try_write_chat_completion_chunk(
                     chunk_prefix,
@@ -187,22 +170,10 @@ class OpenAIHandler(BaseHTTPRequestHandler):
             content = engine.tokenizer.decode_token(int(item))
             if not content:
                 continue
-            delta = (
-                _chat_delta_role_content(content)
-                if not role_sent
-                else _chat_delta_content(content)
-            )
-            role_sent = True
             client_open = self._try_write_chat_completion_chunk(
                 chunk_prefix,
-                delta,
+                _chat_delta_content(content),
             )
-        if client_open:
-            if not role_sent:
-                client_open = self._try_write_chat_completion_chunk(
-                    chunk_prefix,
-                    _CHAT_DELTA_ROLE,
-                )
         if client_open:
             client_open = self._try_write_chat_completion_chunk(
                 chunk_prefix,
@@ -594,7 +565,6 @@ def _stream_fast_chat(
     )
     _mark_fast_http_elapsed(profile, "headers_ms", header_start_s)
     _mark_fast_http_since_start(profile, "headers_sent_ms")
-    defer_role = _stream_defer_role_enabled(max_tokens=max_tokens, temperature=temperature)
     client_open = True
     role_sent = False
     content_chunks = 0
@@ -602,11 +572,15 @@ def _stream_fast_chat(
     engine_tokens = 0
     empty_tokens = 0
     try:
-        if not defer_role:
-            role_start_s = time.perf_counter()
-            client_open = _try_send_fast_chat_chunk(connection, chunk_prefix, _CHAT_DELTA_ROLE, chunked=keep_alive)
-            role_sent = client_open
-            _mark_fast_http_elapsed(profile, "role_send_ms", role_start_s)
+        role_start_s = time.perf_counter()
+        client_open = _try_send_fast_chat_chunk(
+            connection,
+            chunk_prefix,
+            _CHAT_DELTA_ROLE,
+            chunked=keep_alive,
+        )
+        role_sent = client_open
+        _mark_fast_http_elapsed(profile, "role_send_ms", role_start_s)
         generate_start_s = time.perf_counter()
         for token_batch in _iter_engine_chat_token_batches(
             engine,
@@ -631,9 +605,13 @@ def _stream_fast_chat(
                 if not content:
                     empty_tokens += 1
                     continue
-                delta = _chat_delta_role_content(content) if not role_sent else _chat_delta_content(content)
-                role_sent = True
-                content_payloads.append(_chat_completion_chunk_bytes(chunk_prefix, delta, None))
+                content_payloads.append(
+                    _chat_completion_chunk_bytes(
+                        chunk_prefix,
+                        _chat_delta_content(content),
+                        None,
+                    )
+                )
                 content_chunks += 1
             if not content_payloads:
                 continue
@@ -653,7 +631,6 @@ def _stream_fast_chat(
                 connection.sendall(
                     _fast_stream_end_bytes(
                         chunk_prefix,
-                        include_role=not role_sent,
                         chunked=keep_alive,
                     )
                 )
@@ -888,23 +865,14 @@ def _fast_sse_bytes(payload: bytes, *, chunked: bool) -> bytes:
 def _fast_stream_end_bytes(
     chunk_prefix: bytes,
     *,
-    include_role: bool,
     chunked: bool,
 ) -> bytes:
-    chunks: list[bytes] = []
-    if include_role:
-        chunks.append(
-            _fast_sse_bytes(
-                _chat_completion_chunk_bytes(chunk_prefix, _CHAT_DELTA_ROLE, None),
-                chunked=chunked,
-            )
-        )
-    chunks.append(
+    chunks = [
         _fast_sse_bytes(
             _chat_completion_chunk_bytes(chunk_prefix, _CHAT_DELTA_EMPTY, "stop"),
             chunked=chunked,
         )
-    )
+    ]
     chunks.append(_fast_sse_bytes(b"data: [DONE]\n\n", chunked=chunked))
     if chunked:
         chunks.append(b"0\r\n\r\n")
@@ -954,11 +922,6 @@ def _chat_delta_content(content: str) -> bytes:
     return b'{"content":' + json.dumps(content, separators=(",", ":")).encode("utf-8") + b"}"
 
 
-@lru_cache(maxsize=8192)
-def _chat_delta_role_content(content: str) -> bytes:
-    return b'{"role":"assistant","content":' + json.dumps(content, separators=(",", ":")).encode("utf-8") + b"}"
-
-
 def _chat_completion_chunk_bytes(
     chunk_prefix: bytes,
     delta_json: bytes,
@@ -975,14 +938,6 @@ def _chat_completion_chunk_bytes(
 def _stream_inline_enabled(*, max_tokens: int, temperature: float) -> bool:
     del max_tokens, temperature
     return env_flag("TORCHINFERNO_OPENAI_STREAM_INLINE", True)
-
-
-def _stream_defer_role_enabled(*, max_tokens: int, temperature: float) -> bool:
-    del temperature
-    if not env_flag("TORCHINFERNO_OPENAI_STREAM_DEFER_ROLE", True):
-        return False
-    max_defer_tokens = env_int("TORCHINFERNO_OPENAI_STREAM_DEFER_ROLE_MAX_TOKENS", 512, minimum=1)
-    return max_tokens <= max_defer_tokens
 
 
 def _chunked_stream_enabled(request_version: str) -> bool:
