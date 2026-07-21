@@ -56,7 +56,7 @@ provider search, and promotion happen offline as described in
 | Benchmark suites | integrated | `vllm-bench-suite`, `vllm-bench-plot`, `llama-bench-suite`, `openai-microbench`, and `openai-server-microbench` write repeatable commands, JSON summaries, and plots for vLLM-compatible comparisons. |
 | Time-sliced virtual GPU profiling | integrated | Representative generation profiles can be scaled and replayed across virtual ranks on one physical device. |
 | CPU offload profiling | bridge | Module-at-a-time CPU/device staging records movement overhead separately from compute; decode-cache offload and mmap streaming remain open. |
-| Disaggregated prefill/decode | simulated | Planner models rank assignment and transfer latency. |
+| Disaggregated prefill/decode | bridge | Llama can split one single-node CUDA launch into equal TP prefill/decode replicas with live NCCL KV handoff and a Gloo control plane. The serving path is synchronous and does not yet overlap work across roles; paged KV and DeepSeek remain unsupported. The simulator still covers policy experiments. |
 | Offline graph replacement | bridge | Leaf target swaps plus a multi-node symbolic/make_fx fused-op example exist for candidate generation before promotion. |
 | Backend candidate providers | optional | Helion search is the first optional provider; future providers can include CuteDSL/CUTLASS, Triton, custom CUDA/C++, PyTorch custom ops, or pure PyTorch rewrites under the same promotion flow. |
 | NVFP4 graph passes | reference | Quantized tensor contract and graph hook exist; production fused kernel remains open. |

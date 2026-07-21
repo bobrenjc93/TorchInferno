@@ -820,6 +820,119 @@ def test_openai_server_auto_launches_tensor_parallel_for_vanilla_provider(monkey
     assert command[command.index("torchinferno.openai_server") - 1] == "-m"
 
 
+def test_openai_server_auto_launches_two_tensor_parallel_disaggregated_roles(monkeypatch) -> None:
+    monkeypatch.delenv("RANK", raising=False)
+    monkeypatch.delenv("WORLD_SIZE", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_AUTO_TORCHRUN", raising=False)
+    config = OpenAIServerConfig(
+        model="meta-llama/Meta-Llama-3.1-70B-Instruct",
+        tensor_parallel_size=4,
+        disaggregation_mode="prefill-decode",
+    )
+
+    assert _should_reexec_distributed_server(config)
+    command = _distributed_server_command(
+        config,
+        (
+            "--model",
+            config.model,
+            "--tensor-parallel-size",
+            "4",
+            "--disaggregation-mode",
+            "prefill-decode",
+        ),
+    )
+
+    assert command[command.index("--nproc-per-node") + 1] == "8"
+    assert command[-2:] == ["--disaggregation-mode", "prefill-decode"]
+
+
+def test_disaggregated_decode_warmup_allocates_largest_batch_without_bucketing(
+    monkeypatch,
+) -> None:
+    import torchinferno.openai_server as openai_server
+
+    engine = object.__new__(OpenAICompletionEngine)
+    engine.model = types.SimpleNamespace(
+        config=types.SimpleNamespace(vocab_size=32),
+        reset_disaggregation_stats=lambda: None,
+    )
+    engine.device = torch.device("cpu")
+    engine.cache_backend = "dense"
+    engine.max_batch_size = 4
+    engine.max_model_len = 32
+    allocations: list[tuple[int, int]] = []
+    prefill_shapes: list[tuple[int, ...]] = []
+    cache = types.SimpleNamespace()
+
+    def generation_cache(batch_size, max_seq_len, *, model):  # noqa: ANN001
+        assert model is engine.model
+        allocations.append((batch_size, max_seq_len))
+        return cache
+
+    def prefill(model, input_ids, active_cache, temperature, *, allow_capture=False):  # noqa: ANN001
+        assert model is engine.model
+        assert active_cache is cache
+        assert temperature == 0.0
+        assert not allow_capture
+        prefill_shapes.append(tuple(input_ids.shape))
+        return torch.zeros(input_ids.size(0), dtype=torch.long), active_cache
+
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_CACHE_BATCH_BUCKETING", "0")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_DISAGG_WARMUP_BATCHES", "1,2,4")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_DISAGG_WARMUP_CONTEXTS", "2")
+    monkeypatch.setattr(engine, "_generation_cache", generation_cache)
+    monkeypatch.setattr(openai_server, "_reset_generation_cache", lambda _cache: True)
+    monkeypatch.setattr(openai_server, "_prefill_next_token", prefill)
+    monkeypatch.setattr(
+        openai_server,
+        "_decode_next_token",
+        lambda model, input_ids, active_cache, temperature: (input_ids[:, 0], active_cache),
+    )
+
+    engine._warmup_disaggregated_decode_graphs(prompt_tokens=2)
+
+    assert allocations == [(4, 32)]
+    assert prefill_shapes == [(1, 2), (2, 2), (4, 2)]
+
+
+def test_disaggregated_generation_cache_reuses_fixed_model_capacity(monkeypatch) -> None:
+    engine = _cache_only_engine()
+    engine.max_batch_size = 8
+    engine.max_model_len = 512
+    model = _BatchRecordingModel()
+    monkeypatch.setattr(
+        "torchinferno.openai_server._is_disaggregated_prefill_decode_model",
+        lambda candidate: candidate is model,
+    )
+
+    first = engine._generation_cache(1, 47, model=model)
+    second = engine._generation_cache(4, 193, model=model)
+
+    assert first is second
+    assert model.allocated_shapes == [(8, 512)]
+    assert list(engine._cache_pool) == [(8, 512, "dense", 16, "cpu")]
+
+
+def test_disaggregated_generation_cache_uses_warmup_capacity_without_model_limit(
+    monkeypatch,
+) -> None:
+    engine = _cache_only_engine()
+    engine.max_batch_size = 8
+    engine.max_model_len = None
+    model = _BatchRecordingModel()
+    monkeypatch.setattr(
+        "torchinferno.openai_server._is_disaggregated_prefill_decode_model",
+        lambda candidate: candidate is model,
+    )
+
+    warm_sized = engine._generation_cache(2, 73, model=model)
+    larger = engine._generation_cache(2, 700, model=model)
+
+    assert warm_sized is not larger
+    assert model.allocated_shapes == [(8, 512), (8, 1024)]
+
+
 def test_openai_server_auto_launch_honors_configured_rendezvous(monkeypatch) -> None:
     monkeypatch.delenv("RANK", raising=False)
     monkeypatch.delenv("WORLD_SIZE", raising=False)

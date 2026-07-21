@@ -147,7 +147,11 @@ def build_audit_report() -> TorchInfernoAudit:
                 "integrated",
                 "Auto loading, tokenizer-backed generation, capture-logits, and validate-logits cover checkpoint bringup without a server.",
             ),
-            FeatureAudit("disaggregated prefill/decode", "simulated", "Planner models rank assignment and network latency."),
+            FeatureAudit(
+                "disaggregated prefill/decode",
+                "bridge",
+                "Llama OpenAI serving can split one CUDA launch into TP prefill/decode roles with live NCCL KV handoff; cross-request overlap and DeepSeek support remain open.",
+            ),
             FeatureAudit("NVFP4 graph passes", "reference", "NVFP4 tensor contract and pass hook exist; production fused kernel remains open."),
             FeatureAudit("research harness", "minimal", "Named experiments and metric comparison are available."),
             FeatureAudit(

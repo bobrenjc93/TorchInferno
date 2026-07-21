@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import asyncio
 
+import pytest
+
+from torchinferno.engine import loader as loader_module
 from torchinferno.engine import (
     AsyncInferenceEngine,
     CacheConfig,
@@ -17,6 +20,7 @@ from torchinferno.server import (
     model_list_response,
     parse_chat_completion_request,
 )
+from torchinferno.engine.loader import load_model_for_engine
 
 
 def _tiny_engine_config() -> EngineConfig:
@@ -47,6 +51,50 @@ def test_engine_config_groups_model_cache_and_scheduler_options() -> None:
     assert legacy.host == "127.0.0.1"
     assert legacy.port == 8123
     assert legacy.model_kind == "tiny-deepseek"
+
+
+def test_disaggregation_rejects_unsupported_model_family_without_fallback() -> None:
+    config = EngineConfig(
+        model="tiny",
+        model_kind="tiny-deepseek",
+        disaggregation_mode="prefill-decode",
+    )
+
+    with pytest.raises(ValueError, match="not implemented for model kind 'tiny-deepseek'"):
+        load_model_for_engine(config)
+
+
+def test_disaggregation_rejects_paged_cache_before_cuda_topology(monkeypatch) -> None:
+    config = EngineConfig(
+        model="meta-llama/Meta-Llama-3.1-70B-Instruct",
+        model_kind="llama3",
+        cache_backend="paged",
+        disaggregation_mode="prefill-decode",
+    )
+    monkeypatch.setattr(
+        loader_module,
+        "initialize_disaggregated_topology",
+        lambda *_args, **_kwargs: pytest.fail("topology initialized before cache validation"),
+    )
+
+    with pytest.raises(ValueError, match="supports dense or flashinfer KV cache"):
+        load_model_for_engine(config)
+
+
+@pytest.mark.parametrize(
+    "selection",
+    ({"device": "cuda:0"}, {"devices": ("cuda:2", "cuda:3")}),
+)
+def test_disaggregation_requires_cuda_visible_devices_for_gpu_selection(selection) -> None:
+    config = EngineConfig(
+        model="meta-llama/Meta-Llama-3.1-70B-Instruct",
+        model_kind="llama3",
+        disaggregation_mode="prefill-decode",
+        **selection,
+    )
+
+    with pytest.raises(ValueError, match="CUDA_VISIBLE_DEVICES"):
+        load_model_for_engine(config)
 
 
 def test_inference_engine_generates_from_raw_prompt() -> None:

@@ -110,6 +110,8 @@ class OpenAIServerConfig:
     batch_wait_ms: float = 2.0
     single_request_admission_wait_ms: float | None = None
     llama_parallelism: str = "auto"
+    disaggregation_mode: str = "none"
+    disaggregation_profile: bool = False
 
 
 @dataclass(frozen=True)
@@ -2651,7 +2653,10 @@ class OpenAICompletionEngine:
         # Tensor-parallel workers consume one command stream from rank 0. Keep
         # rank 0 on the queued path so direct requests cannot interleave with
         # batched requests in a different order from the worker ranks.
-        self.single_request_fast_path = not _is_tensor_parallel_primary_model(model)
+        self.single_request_fast_path = not (
+            _is_tensor_parallel_primary_model(model)
+            or _is_disaggregated_prefill_decode_model(model)
+        )
         self._generation_queue: "queue.Queue[_QueuedGeneration | None]" = queue.Queue()
         self._model_lock = threading.Lock()
         self._live_request_condition = threading.Condition()
@@ -2683,7 +2688,10 @@ class OpenAICompletionEngine:
         self._warmup_tokenizer()
         self._warmup_tensor_parallel_control_group()
         self._warmup_tensor_parallel_model()
-        if not _is_tensor_parallel_worker_model(model):
+        if not (
+            _is_tensor_parallel_worker_model(model)
+            or _is_disaggregated_prefill_decode_worker_model(model)
+        ):
             worker_fn = self._unified_scheduler_worker if self._should_use_unified_scheduler() else self._batch_worker
             self._worker = threading.Thread(target=worker_fn, name="torchinferno-openai-batcher", daemon=True)
             self._worker.start()
@@ -2696,6 +2704,9 @@ class OpenAICompletionEngine:
             self._generation_queue.put(None)
             self._worker.join(timeout=10)
         _broadcast_tensor_parallel_stop(self.model)
+        shutdown_disaggregated = getattr(self.model, "shutdown_workers", None)
+        if callable(shutdown_disaggregated):
+            shutdown_disaggregated()
 
     def generate_chat_tokens(
         self,
@@ -7931,6 +7942,8 @@ class OpenAICompletionEngine:
             )
 
     def _should_use_runtime_continuous_stream_group(self, group: Sequence[_QueuedGeneration]) -> bool:
+        if _is_disaggregated_prefill_decode_model(self.model):
+            return False
         if not env_flag("TORCHINFERNO_OPENAI_RUNTIME_CONTINUOUS_STREAM", False):
             return False
         if not group or any(not request.stream for request in group):
@@ -8085,6 +8098,8 @@ class OpenAICompletionEngine:
         self._record_queue_profile(record)
 
     def _should_use_prompt_list_stream_group(self, prompts: Sequence[Sequence[int]]) -> bool:
+        if _is_disaggregated_prefill_decode_model(self.model):
+            return False
         if self._shared_prefix_prompt_list_tokens(prompts) > 0:
             return True
         return (
@@ -8203,7 +8218,20 @@ class OpenAICompletionEngine:
     ) -> object:
         backend = self.cache_backend if cache_backend is None else str(cache_backend)
         cache_batch_size = max(batch_size, int(batch_capacity)) if batch_capacity is not None else batch_size
+        if _is_disaggregated_prefill_decode_model(model):
+            bucketed_batch_size = _generation_cache_batch_capacity(model, cache_batch_size)
+            cache_batch_size = max(
+                cache_batch_size,
+                min(bucketed_batch_size, self.max_batch_size),
+            )
         cache_capacity = _generation_cache_capacity(model, max_seq_len)
+        if _is_disaggregated_prefill_decode_model(model):
+            # One role-local cache is reused across ordered disaggregated batches.
+            # Decode graphs are tied to its storage address, so varying capacity
+            # would recapture identical graphs and retain redundant KV pools.
+            pooled_capacity = int(self.max_model_len or 512)
+            if max_seq_len <= pooled_capacity:
+                cache_capacity = pooled_capacity
         if not pool:
             cache = _allocate_cache(
                 model,
@@ -8713,6 +8741,25 @@ class OpenAICompletionEngine:
     def _warmup_tensor_parallel_model(self) -> None:
         if not env_flag("TORCHINFERNO_OPENAI_STARTUP_WARMUP", True):
             return
+        if _is_disaggregated_prefill_decode_model(self.model):
+            if self.device.type != "cuda":
+                raise RuntimeError("disaggregated prefill/decode warmup requires CUDA")
+            prompt_tokens = env_int("TORCHINFERNO_OPENAI_WARMUP_PROMPT_TOKENS", 32, minimum=1)
+            new_tokens = max(2, env_int("TORCHINFERNO_OPENAI_WARMUP_NEW_TOKENS", 2, minimum=1))
+            _startup_warmup_log(
+                self.model,
+                "disaggregated startup warmup start "
+                f"prompt_tokens={prompt_tokens} new_tokens={new_tokens}",
+            )
+            started = time.perf_counter()
+            self.model.startup_warmup(prompt_tokens=prompt_tokens, new_tokens=new_tokens)
+            if bool(getattr(self.model, "is_coordinator", False)):
+                self._warmup_disaggregated_decode_graphs(prompt_tokens=prompt_tokens)
+            _startup_warmup_log(
+                self.model,
+                f"disaggregated startup warmup done in {time.perf_counter() - started:.1f}s",
+            )
+            return
         if not _is_tensor_parallel_model(self.model) or self.device.type != "cuda":
             return
         if _openai_tp_symm_mem_allreduce_enabled(startup=True):
@@ -9050,6 +9097,59 @@ class OpenAICompletionEngine:
                 _release_decode_graphs_for_cache(self.model, cache)
                 _reset_generation_cache(cache)
 
+    def _warmup_disaggregated_decode_graphs(self, *, prompt_tokens: int) -> None:
+        if not env_flag("TORCHINFERNO_OPENAI_DISAGG_DECODE_GRAPH_WARMUP", True):
+            return
+        if self.cache_backend != "dense":
+            return
+        max_batch = min(
+            self.max_batch_size,
+            env_int("TORCHINFERNO_CUDAGRAPH_DECODE_STEP_MAX_BATCH", 64, minimum=1),
+        )
+        batch_sizes = tuple(
+            batch
+            for batch in _parse_positive_int_csv(
+                os.environ.get("TORCHINFERNO_OPENAI_DISAGG_WARMUP_BATCHES", "1,2,4,8")
+            )
+            if batch <= max_batch
+        )
+        if not batch_sizes:
+            return
+        max_seq_len = int(self.max_model_len or 512)
+        context_candidates = set(
+            _parse_positive_int_csv(
+                os.environ.get("TORCHINFERNO_OPENAI_DISAGG_WARMUP_CONTEXTS", "32,128")
+            )
+        )
+        context_candidates.add(int(prompt_tokens))
+        context_lengths = tuple(
+            sorted(context for context in context_candidates if context + 1 < max_seq_len)
+        )
+        if not context_lengths:
+            return
+        vocab_size = max(
+            1,
+            int(getattr(getattr(self.model, "config", object()), "vocab_size", 1)),
+        )
+        cache = self._generation_cache(max(batch_sizes), max_seq_len, model=self.model)
+        for context_len in context_lengths:
+            base = torch.arange(context_len, device=self.device, dtype=torch.long) % vocab_size
+            for batch_size in batch_sizes:
+                _reset_generation_cache(cache)
+                input_ids = base[None, :].expand(batch_size, -1).contiguous()
+                next_token, cache = _prefill_next_token(
+                    self.model,
+                    input_ids,
+                    cache,
+                    0.0,
+                    allow_capture=False,
+                )
+                _decode_next_token(self.model, next_token[:, None], cache, 0.0)
+        _reset_generation_cache(cache)
+        reset_stats = getattr(self.model, "reset_disaggregation_stats", None)
+        if callable(reset_stats):
+            reset_stats()
+
     def _generate_prompt_token_list(self, prompt: list[int], *, max_tokens: int, temperature: float) -> list[int]:
         input_ids = torch.tensor([prompt], dtype=torch.long, device=self.device)
         rows = self._generate_batch_tokens(input_ids, max_tokens=max_tokens, temperature=temperature)
@@ -9330,7 +9430,11 @@ class OpenAICompletionEngine:
                 stream=True,
                 row_max_tokens=row_max_tokens,
             )
-        if input_ids.size(0) > 1 and _tensor_rows_are_identical(input_ids):
+        if (
+            not _is_disaggregated_prefill_decode_model(self.model)
+            and input_ids.size(0) > 1
+            and _tensor_rows_are_identical(input_ids)
+        ):
             yield from self._generate_identical_prompt_batch_steps(
                 input_ids[:1],
                 batch_size=input_ids.size(0),
@@ -9341,7 +9445,7 @@ class OpenAICompletionEngine:
             return
         microbatch_size = self._stream_microbatch_size(input_ids.size(0))
         shared_prefix_tokens = self._shared_prefix_batch_tokens(input_ids)
-        if shared_prefix_tokens > 0:
+        if shared_prefix_tokens > 0 and not _is_disaggregated_prefill_decode_model(self.model):
             yield from self._generate_shared_prefix_batch_steps(
                 input_ids,
                 prefix_tokens=shared_prefix_tokens,
@@ -9352,7 +9456,10 @@ class OpenAICompletionEngine:
                 prefix_cache_prompts=prefix_cache_prompts,
             )
             return
-        if 0 < microbatch_size < input_ids.size(0):
+        if (
+            0 < microbatch_size < input_ids.size(0)
+            and not _is_disaggregated_prefill_decode_model(self.model)
+        ):
             yield from self._generate_batch_steps_microbatched(
                 input_ids,
                 max_tokens=max_tokens,
@@ -9376,6 +9483,28 @@ class OpenAICompletionEngine:
             )
             yield from _iter_generated_steps(rows, max_tokens, stop_token_ids)
             return
+
+        visible_batch_size = int(input_ids.size(0))
+        if _is_disaggregated_prefill_decode_model(model):
+            padded_batch_size = _decode_graph_padded_batch(
+                visible_batch_size,
+                min(
+                    self.max_batch_size,
+                    env_int("TORCHINFERNO_CUDAGRAPH_DECODE_STEP_MAX_BATCH", 64, minimum=1),
+                ),
+            )
+            if padded_batch_size > visible_batch_size:
+                visible_limits = _normalize_row_max_tokens(
+                    row_max_tokens,
+                    visible_batch_size,
+                    max_tokens,
+                )
+                padding = input_ids[-1:].expand(padded_batch_size - visible_batch_size, -1)
+                input_ids = torch.cat((input_ids, padding), dim=0).contiguous()
+                row_max_tokens = [
+                    *visible_limits,
+                    *([0] * (padded_batch_size - visible_batch_size)),
+                ]
 
         cache = self._generation_cache(
             input_ids.size(0),
@@ -9410,7 +9539,7 @@ class OpenAICompletionEngine:
                 step_tokens.append(token_id)
                 if token_id in stop_token_ids or step + 1 >= per_row_limits[row]:
                     active[row] = False
-            yield step_tokens
+            yield step_tokens[:visible_batch_size]
             if step == 0 and prefix_cache_prompts is not None:
                 self._save_prompt_prefix_cache_rows(prefix_cache_prompts, cache)
             should_continue = step + 1 < max_tokens and any(active)
@@ -13199,7 +13328,10 @@ def build_engine(config: OpenAIServerConfig) -> OpenAICompletionEngine:
     vocab_size = int(getattr(getattr(model, "config", object()), "vocab_size", 256))
     tokenizer = (
         _ByteFallbackTokenizer(vocab_size)
-        if _is_tensor_parallel_worker_model(model)
+        if (
+            _is_tensor_parallel_worker_model(model)
+            or _is_disaggregated_prefill_decode_worker_model(model)
+        )
         else load_chat_tokenizer(config, vocab_size)
     )
     return OpenAICompletionEngine(
@@ -13218,6 +13350,9 @@ def build_engine(config: OpenAIServerConfig) -> OpenAICompletionEngine:
 
 def serve(config: OpenAIServerConfig) -> None:
     engine = build_engine(config)
+    if _is_disaggregated_prefill_decode_worker_model(engine.model):
+        engine.model.run_worker_loop()
+        return
     if _is_tensor_parallel_worker_model(engine.model):
         _tensor_parallel_worker_loop(engine)
         return
@@ -13285,6 +13420,17 @@ def _resolve_dtype(dtype: str) -> torch.dtype | None:
 
 def _is_tensor_parallel_model(model: object) -> bool:
     return isinstance(model, Llama3TensorParallelForCausalLM)
+
+
+def _is_disaggregated_prefill_decode_model(model: object) -> bool:
+    return bool(getattr(model, "is_disaggregated_prefill_decode", False))
+
+
+def _is_disaggregated_prefill_decode_worker_model(model: object) -> bool:
+    return (
+        _is_disaggregated_prefill_decode_model(model)
+        and not bool(getattr(model, "is_coordinator", False))
+    )
 
 
 def _tensor_parallel_world_size(model: object) -> int:
@@ -13396,6 +13542,7 @@ def _prepare_tensor_parallel_symm_mem_allreduce_auto(config: OpenAIServerConfig)
     if raw_global is not None and raw_global.strip().lower() not in {"auto", "probe"}:
         return
     if raw_openai is not None and raw_openai.strip().lower() not in {"auto", "probe"}:
+        os.environ[global_env] = "1" if _openai_tp_symm_mem_allreduce_mode() == "all" else "0"
         return
     # Symmetric-memory allreduce is a measurable TP decode win on 8xH100, but
     # public runs have shown hosts can pass the probe and then hang before
@@ -13404,6 +13551,7 @@ def _prepare_tensor_parallel_symm_mem_allreduce_auto(config: OpenAIServerConfig)
     # startup symm-mem too.
     if not env_flag("TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_AUTO_PROBE", True):
         os.environ[openai_env] = "0"
+        os.environ[global_env] = "0"
         return
     if int(getattr(config, "tensor_parallel_size", 1)) <= 1:
         return
@@ -13413,6 +13561,7 @@ def _prepare_tensor_parallel_symm_mem_allreduce_auto(config: OpenAIServerConfig)
         return
     if not torch.cuda.is_available():
         os.environ[openai_env] = "0"
+        os.environ[global_env] = "0"
         return
     print(
         "TorchInferno OpenAI server probing tensor-parallel symmetric-memory allreduce",
@@ -13427,6 +13576,7 @@ def _prepare_tensor_parallel_symm_mem_allreduce_auto(config: OpenAIServerConfig)
         os.environ[openai_env] = "1" if auto_scope in {"all", "both", "startup"} else "runtime"
     else:
         os.environ[openai_env] = "0"
+    os.environ[global_env] = "1" if os.environ.get(openai_env) == "1" else "0"
     enabled_scope = "all" if os.environ.get(openai_env) == "1" else os.environ.get(openai_env, "0")
     print(
         "TorchInferno OpenAI server symmetric-memory allreduce "
@@ -13606,6 +13756,13 @@ def _fi_decode_graph_mode() -> str:
 
 def _effective_openai_max_batch_size(model: object, device: torch.device, requested: int) -> int:
     max_batch_size = max(1, requested)
+    if _is_disaggregated_prefill_decode_model(model) and device.type == "cuda":
+        disaggregated_default = env_int(
+            "TORCHINFERNO_OPENAI_DISAGG_MAX_BATCH_SIZE",
+            8,
+            minimum=1,
+        )
+        return min(max_batch_size, disaggregated_default)
     if _is_tensor_parallel_model(model) and device.type == "cuda":
         tp_default = env_int("TORCHINFERNO_OPENAI_TP_MAX_BATCH_SIZE", 128, minimum=1)
         return min(max_batch_size, tp_default)
@@ -13711,12 +13868,16 @@ def _packed_flashinfer_prefill_profile_fields(
 
 
 def _prefix_cache_enabled_for_model(model: object) -> bool:
+    if _is_disaggregated_prefill_decode_model(model):
+        return False
     if _is_tensor_parallel_model(model) and _tensor_parallel_world_size(model) > 1:
         return env_flag("TORCHINFERNO_OPENAI_TP_PREFIX_CACHE", True)
     return True
 
 
 def _shared_prefix_batch_enabled_for_model(model: object) -> bool:
+    if _is_disaggregated_prefill_decode_model(model):
+        return False
     if _is_tensor_parallel_model(model) and _tensor_parallel_world_size(model) > 1:
         return env_flag("TORCHINFERNO_OPENAI_TP_SHARED_PREFIX_BATCH", True)
     return True
@@ -15869,7 +16030,7 @@ def _set_generation_cache_rows_seq_lens(cache: object, rows: Iterable[int], seq_
 
 def _prefers_exact_generation_cache(model: object) -> bool:
     return (
-        _is_tensor_parallel_model(model)
+        (_is_tensor_parallel_model(model) or _is_disaggregated_prefill_decode_model(model))
         and _openai_decode_graph_enabled(model)
     )
 
@@ -18272,6 +18433,20 @@ def build_parser() -> argparse.ArgumentParser:
             "workers when needed; use pipeline to force single-process placement."
         ),
     )
+    parser.add_argument(
+        "--disaggregation-mode",
+        choices=["none", "prefill-decode"],
+        default="none",
+        help=(
+            "Split one CUDA launch into equal tensor-parallel prefill and decode replicas. "
+            "--tensor-parallel-size is the size of each replica."
+        ),
+    )
+    parser.add_argument(
+        "--disaggregation-profile",
+        action="store_true",
+        help="Synchronize and record NCCL KV handoff latency for profiling runs.",
+    )
     return parser
 
 
@@ -18300,6 +18475,8 @@ def config_from_args(args: argparse.Namespace) -> OpenAIServerConfig:
         batch_wait_ms=args.batch_wait_ms,
         single_request_admission_wait_ms=args.single_request_admission_wait_ms,
         llama_parallelism=args.llama_parallelism,
+        disaggregation_mode=args.disaggregation_mode,
+        disaggregation_profile=args.disaggregation_profile,
     )
 
 

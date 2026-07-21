@@ -31,6 +31,7 @@ from torchinferno.runtime.sampling import sample_next_token
 _COMPILED_ROTATE_LLAMA = None
 _COMPILED_ROTATE_LLAMA_CHECKED = False
 _COMPILED_ROTATE_LLAMA_FAILED = False
+_TENSOR_PARALLEL_PROCESS_GROUP: dist.ProcessGroup | None = None
 _SYMM_REDUCE_BUFFERS: dict[tuple[str, int, str, str, tuple[int, ...]], Tensor] = {}
 _SYMM_REDUCE_PROBED: set[tuple[str, int, str, str, tuple[int, ...]]] = set()
 _SYMM_REDUCE_DISABLED = False
@@ -45,6 +46,74 @@ _DEFAULT_PREFILL_GRAPH_MIN_FREE_MB = 1024
 _PackedPrefillAttentionGroup = tuple[int, int, Tensor, tuple[int, ...], tuple[int, ...]]
 _PackedPrefillAttentionStartGroup = tuple[int, tuple[_PackedPrefillAttentionGroup, ...]]
 _FA3_FLASH_ATTN_WITH_KVCACHE = None
+
+
+def set_tensor_parallel_process_group(group: dist.ProcessGroup | None) -> None:
+    """Select the process group used by this process's tensor-parallel model.
+
+    ``None`` preserves the historical behavior and uses ``dist.group.WORLD``.
+    A process may select one subgroup before model construction, which lets a
+    larger launch host independent prefill and decode replicas without changing
+    the model's tensor-sharding contract.
+    """
+
+    global _TENSOR_PARALLEL_PROCESS_GROUP
+    if group is not None:
+        if not dist.is_available() or not dist.is_initialized():
+            raise RuntimeError("a tensor-parallel subgroup requires initialized torch.distributed")
+        if dist.get_rank(group=group) < 0:
+            raise ValueError("the current process is not a member of the tensor-parallel subgroup")
+    _TENSOR_PARALLEL_PROCESS_GROUP = group
+
+
+def tensor_parallel_process_group() -> dist.ProcessGroup | None:
+    return _TENSOR_PARALLEL_PROCESS_GROUP
+
+
+def _tp_group() -> dist.ProcessGroup | None:
+    return _TENSOR_PARALLEL_PROCESS_GROUP
+
+
+def _tp_group_kwargs() -> dict[str, object]:
+    group = _tp_group()
+    return {} if group is None else {"group": group}
+
+
+def _tp_world_size() -> int:
+    if not dist.is_available() or not dist.is_initialized():
+        return 1
+    group = _tp_group()
+    return dist.get_world_size() if group is None else dist.get_world_size(group=group)
+
+
+def _tp_rank() -> int:
+    if not dist.is_available() or not dist.is_initialized():
+        return 0
+    group = _tp_group()
+    return dist.get_rank() if group is None else dist.get_rank(group=group)
+
+
+def _tp_global_rank(local_rank: int) -> int:
+    group = _tp_group()
+    if group is None or group is dist.group.WORLD:
+        return int(local_rank)
+    get_global_rank = getattr(dist, "get_global_rank", None)
+    if callable(get_global_rank):
+        return int(get_global_rank(group, int(local_rank)))
+    get_process_group_ranks = getattr(dist, "get_process_group_ranks", None)
+    if callable(get_process_group_ranks):
+        return int(get_process_group_ranks(group)[int(local_rank)])
+    raise RuntimeError("this PyTorch version cannot map subgroup-local ranks")
+
+
+def _tp_group_name() -> str:
+    group = _tp_group()
+    if group is None:
+        group = dist.group.WORLD
+    group_name = getattr(group, "group_name", None)
+    if not isinstance(group_name, str):
+        raise RuntimeError("tensor-parallel process group does not expose a group name")
+    return group_name
 
 
 @dataclass(frozen=True)
@@ -158,10 +227,10 @@ def _ragged_prefill_precision_graph_key(
 
 
 def _capture_needed_on_any_rank(needs_capture: bool, device: torch.device) -> bool:
-    if not dist.is_available() or not dist.is_initialized() or dist.get_world_size() <= 1:
+    if not dist.is_available() or not dist.is_initialized() or _tp_world_size() <= 1:
         return needs_capture
     flag = torch.tensor([1 if needs_capture else 0], dtype=torch.int32, device=device)
-    dist.all_reduce(flag, op=dist.ReduceOp.MAX)
+    dist.all_reduce(flag, op=dist.ReduceOp.MAX, **_tp_group_kwargs())
     return bool(flag.item())
 
 
@@ -171,10 +240,10 @@ def _capture_succeeded_on_all_ranks(succeeded: bool, device: torch.device) -> bo
     # the others replay, and the next collective (allreduce / sampler broadcast)
     # mismatches and the run hangs. MIN-reduce the success flag so a single
     # failure forces every rank to abandon the graph and run eager together.
-    if not dist.is_available() or not dist.is_initialized() or dist.get_world_size() <= 1:
+    if not dist.is_available() or not dist.is_initialized() or _tp_world_size() <= 1:
         return succeeded
     flag = torch.tensor([1 if succeeded else 0], dtype=torch.int32, device=device)
-    dist.all_reduce(flag, op=dist.ReduceOp.MIN)
+    dist.all_reduce(flag, op=dist.ReduceOp.MIN, **_tp_group_kwargs())
     return bool(flag.item())
 
 
@@ -3371,7 +3440,7 @@ class _Llama3TensorParallelLayer:
     def _symm_reduce_buffer_ready(self, name: str, hidden: Tensor, expected_shape: tuple[int, ...]) -> bool:
         if not dist.is_available() or not dist.is_initialized():
             return False
-        group_name = dist.group.WORLD.group_name
+        group_name = _tp_group_name()
         device_index = hidden.device.index if hidden.device.index is not None else torch.cuda.current_device()
         key, _storage_shape = self._symm_reduce_buffer_spec(
             group_name,
@@ -3385,7 +3454,7 @@ class _Llama3TensorParallelLayer:
     def _symm_reduce_buffer(self, name: str, hidden: Tensor, expected_shape: tuple[int, ...]) -> tuple[Tensor, str]:
         if not dist.is_available() or not dist.is_initialized():
             raise RuntimeError("symmetric-memory allreduce requires an initialized process group")
-        group_name = dist.group.WORLD.group_name
+        group_name = _tp_group_name()
         device_index = hidden.device.index if hidden.device.index is not None else torch.cuda.current_device()
         key, storage_shape = self._symm_reduce_buffer_spec(
             group_name,
@@ -4050,8 +4119,8 @@ class Llama3TensorParallelForCausalLM:
         if device.type == "cuda":
             torch.cuda.set_device(device)
         _init_distributed_if_needed()
-        rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
-        world_size = dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
+        rank = _tp_rank()
+        world_size = _tp_world_size()
 
         root = _resolve_tensor_parallel_checkpoint(
             checkpoint,
@@ -4435,6 +4504,7 @@ class Llama3TensorParallelForCausalLM:
         cache_backend: str = "dense",
         page_size: int = 16,
         device: torch.device | None = None,
+        stacked_storage: bool | None = None,
     ) -> Llama3TensorParallelCache:
         if cache_backend not in {"dense", "paged", "flashinfer"}:
             raise ValueError("cache_backend must be 'dense', 'paged', or 'flashinfer'")
@@ -4449,9 +4519,14 @@ class Llama3TensorParallelForCausalLM:
             layer_cls = Llama3TensorParallelLayerKVCache
         stacked_keys: Tensor | None = None
         stacked_values: Tensor | None = None
+        use_stacked_storage = (
+            _tp_flag("TORCHINFERNO_STACKED_DENSE_KV_STORAGE", False)
+            if stacked_storage is None
+            else bool(stacked_storage)
+        )
         if (
             layer_cls is Llama3TensorParallelLayerKVCache
-            and _tp_flag("TORCHINFERNO_STACKED_DENSE_KV_STORAGE", False)
+            and use_stacked_storage
         ):
             stacked_shape = (
                 len(self.layers),
@@ -9393,7 +9468,7 @@ class Llama3TensorParallelForCausalLM:
         local_max = torch.max(logits_float, dim=-1).values
         if dist.is_available() and dist.is_initialized():
             global_max = local_max.clone()
-            dist.all_reduce(global_max, op=dist.ReduceOp.MAX)
+            dist.all_reduce(global_max, op=dist.ReduceOp.MAX, **_tp_group_kwargs())
             weights = torch.exp(logits_float - global_max[:, None])
             local_sum = weights.sum(dim=-1)
             gathered_sums = torch.empty(
@@ -9401,7 +9476,7 @@ class Llama3TensorParallelForCausalLM:
                 dtype=local_sum.dtype,
                 device=logits.device,
             )
-            dist.all_gather_into_tensor(gathered_sums, local_sum.contiguous())
+            dist.all_gather_into_tensor(gathered_sums, local_sum.contiguous(), **_tp_group_kwargs())
             rank_cumulative = torch.cumsum(gathered_sums[:, 0], dim=0).contiguous()
         else:
             weights = torch.exp(logits_float - local_max[:, None])
@@ -9469,7 +9544,7 @@ class Llama3TensorParallelForCausalLM:
             previous[has_previous] = rank_cumulative[selected_rank[has_previous] - 1]
             sample_payload[0].copy_(selected_rank.to(sample_payload.dtype))
             sample_payload[1].copy_(target - previous)
-        dist.broadcast(sample_payload, src=0)
+        dist.broadcast(sample_payload, src=_tp_global_rank(0), **_tp_group_kwargs())
         selected_rank = sample_payload[0].to(torch.long)
         local_threshold = sample_payload[1].to(cumulative_local.dtype)
         local_threshold = torch.minimum(local_threshold, cumulative_local[-1].expand_as(local_threshold))
@@ -9481,7 +9556,7 @@ class Llama3TensorParallelForCausalLM:
             local_index + self.vocab_start,
             torch.zeros_like(local_index),
         )
-        dist.all_reduce(local_token, op=dist.ReduceOp.SUM)
+        dist.all_reduce(local_token, op=dist.ReduceOp.SUM, **_tp_group_kwargs())
         if sample_count > batch_size:
             state.cached_tokens = local_token
             state.cached_offset = batch_size
@@ -9496,12 +9571,12 @@ class Llama3TensorParallelForCausalLM:
                 warn_optional_failure("llama3_tensor_parallel.greedy_sample_gather", exc)
         local_values, local_indices = torch.max(logits.float(), dim=-1)
         global_values = local_values.clone()
-        dist.all_reduce(global_values, op=dist.ReduceOp.MAX)
+        dist.all_reduce(global_values, op=dist.ReduceOp.MAX, **_tp_group_kwargs())
         local_tokens = local_indices + self.vocab_start
         next_token = torch.where(
             local_values == global_values, local_tokens, self.config.vocab_size
         )
-        dist.all_reduce(next_token, op=dist.ReduceOp.MIN)
+        dist.all_reduce(next_token, op=dist.ReduceOp.MIN, **_tp_group_kwargs())
         return next_token
 
     def _sample_next_token_greedy_gather(self, logits: Tensor) -> Tensor:
@@ -9513,7 +9588,7 @@ class Llama3TensorParallelForCausalLM:
             dtype=torch.float32,
             device=self.device,
         )
-        dist.all_gather_into_tensor(gathered, local_pairs)
+        dist.all_gather_into_tensor(gathered, local_pairs, **_tp_group_kwargs())
         values = gathered[..., 0]
         tokens = gathered[..., 1].to(torch.long)
         global_values = values.max(dim=0).values
@@ -9529,13 +9604,13 @@ class Llama3TensorParallelForCausalLM:
             dtype=local_logits.dtype,
             device=self.device,
         )
-        dist.all_gather_into_tensor(gathered, local_logits)
+        dist.all_gather_into_tensor(gathered, local_logits, **_tp_group_kwargs())
         next_token = torch.empty(logits.size(0), dtype=torch.long, device=self.device)
         if self.is_primary:
             full_logits = gathered.permute(1, 0, 2).reshape(logits.size(0), self.world_size * logits.size(1))
             probs = torch.softmax(full_logits.float() / temperature, dim=-1)
             next_token.copy_(torch.multinomial(probs, num_samples=1).squeeze(-1))
-        dist.broadcast(next_token, src=0)
+        dist.broadcast(next_token, src=_tp_global_rank(0), **_tp_group_kwargs())
         return next_token
 
     def _sample_next_token_temperature_gumbel(self, logits: Tensor, temperature: float) -> Tensor:
@@ -9549,14 +9624,14 @@ class Llama3TensorParallelForCausalLM:
         phase_start_s = time.perf_counter() if profile_sample else 0.0
         local_values, local_indices = torch.max(logits_float + gumbel, dim=-1)
         global_values = local_values.clone()
-        dist.all_reduce(global_values, op=dist.ReduceOp.MAX)
+        dist.all_reduce(global_values, op=dist.ReduceOp.MAX, **_tp_group_kwargs())
         max_ms = (time.perf_counter() - phase_start_s) * 1000.0 if profile_sample else 0.0
         local_tokens = local_indices + self.vocab_start
         next_token = torch.where(
             local_values == global_values, local_tokens, self.config.vocab_size
         )
         phase_start_s = time.perf_counter() if profile_sample else 0.0
-        dist.all_reduce(next_token, op=dist.ReduceOp.MIN)
+        dist.all_reduce(next_token, op=dist.ReduceOp.MIN, **_tp_group_kwargs())
         if count_sample:
             reduce_ms = (time.perf_counter() - phase_start_s) * 1000.0 if profile_sample else 0.0
             self._record_temperature_sample_gumbel_profile(
@@ -9613,7 +9688,7 @@ class Llama3TensorParallelForCausalLM:
         logits_float = logits.float() / temperature
         local_max = torch.max(logits_float, dim=-1).values
         global_max = local_max.clone()
-        dist.all_reduce(global_max, op=dist.ReduceOp.MAX)
+        dist.all_reduce(global_max, op=dist.ReduceOp.MAX, **_tp_group_kwargs())
         max_ms = (time.perf_counter() - phase_start_s) * 1000.0 if profile_sample else 0.0
         phase_start_s = time.perf_counter() if profile_sample else 0.0
         weights = torch.exp(logits_float - global_max[:, None])
@@ -9625,7 +9700,7 @@ class Llama3TensorParallelForCausalLM:
             dtype=local_sum.dtype,
             device=self.device,
         )
-        dist.all_gather_into_tensor(gathered_sums, local_sum.contiguous())
+        dist.all_gather_into_tensor(gathered_sums, local_sum.contiguous(), **_tp_group_kwargs())
 
         sample_payload = torch.empty((2, logits.size(0)), dtype=torch.float32, device=self.device)
         if self.is_primary:
@@ -9639,7 +9714,7 @@ class Llama3TensorParallelForCausalLM:
             previous[has_previous] = cumulative[selected_rank[has_previous] - 1, row[has_previous]]
             sample_payload[0].copy_(selected_rank.to(sample_payload.dtype))
             sample_payload[1].copy_(target - previous)
-        dist.broadcast(sample_payload, src=0)
+        dist.broadcast(sample_payload, src=_tp_global_rank(0), **_tp_group_kwargs())
         selected_rank = sample_payload[0].to(torch.long)
         local_threshold = sample_payload[1]
         rank_ms = (time.perf_counter() - phase_start_s) * 1000.0 if profile_sample else 0.0
@@ -9657,7 +9732,7 @@ class Llama3TensorParallelForCausalLM:
         )
         cdf_ms = (time.perf_counter() - phase_start_s) * 1000.0 if profile_sample else 0.0
         phase_start_s = time.perf_counter() if profile_sample else 0.0
-        dist.all_reduce(local_token, op=dist.ReduceOp.SUM)
+        dist.all_reduce(local_token, op=dist.ReduceOp.SUM, **_tp_group_kwargs())
         if count_sample:
             reduce_ms = (time.perf_counter() - phase_start_s) * 1000.0 if profile_sample else 0.0
             self._record_temperature_sample_profile(
@@ -9681,7 +9756,7 @@ class Llama3TensorParallelForCausalLM:
         logits_float = logits.float() / temperature
         local_max = torch.max(logits_float, dim=-1).values
         global_max = local_max.clone()
-        dist.all_reduce(global_max, op=dist.ReduceOp.MAX)
+        dist.all_reduce(global_max, op=dist.ReduceOp.MAX, **_tp_group_kwargs())
         weights = torch.exp(logits_float - global_max[:, None])
         local_sum = weights.sum(dim=-1)
         gathered_sums = torch.empty(
@@ -9689,7 +9764,7 @@ class Llama3TensorParallelForCausalLM:
             dtype=local_sum.dtype,
             device=self.device,
         )
-        dist.all_gather_into_tensor(gathered_sums, local_sum.contiguous())
+        dist.all_gather_into_tensor(gathered_sums, local_sum.contiguous(), **_tp_group_kwargs())
 
         sample_payload = torch.empty((2, batch_size), dtype=torch.float32, device=self.device)
         if self.is_primary:
@@ -9702,7 +9777,7 @@ class Llama3TensorParallelForCausalLM:
             previous[has_previous] = cumulative[selected_rank[has_previous] - 1]
             sample_payload[0].copy_(selected_rank.to(sample_payload.dtype))
             sample_payload[1].copy_(target - previous)
-        dist.broadcast(sample_payload, src=0)
+        dist.broadcast(sample_payload, src=_tp_global_rank(0), **_tp_group_kwargs())
         selected_rank = sample_payload[0].to(torch.long)
         local_threshold = sample_payload[1]
 
@@ -9716,7 +9791,7 @@ class Llama3TensorParallelForCausalLM:
             local_index + self.vocab_start,
             torch.zeros_like(local_index),
         )
-        dist.all_reduce(local_token, op=dist.ReduceOp.SUM)
+        dist.all_reduce(local_token, op=dist.ReduceOp.SUM, **_tp_group_kwargs())
         return local_token
 
     def _sample_next_token_temperature_repeated_gumbel(
@@ -9737,19 +9812,19 @@ class Llama3TensorParallelForCausalLM:
         ).exponential_(generator=self._temperature_gumbel_generator(logits.device)).log()
         local_values, local_indices = torch.max(logits_float.expand_as(gumbel) + gumbel, dim=-1)
         global_values = local_values.clone()
-        dist.all_reduce(global_values, op=dist.ReduceOp.MAX)
+        dist.all_reduce(global_values, op=dist.ReduceOp.MAX, **_tp_group_kwargs())
         local_tokens = local_indices + self.vocab_start
         next_token = torch.where(
             local_values == global_values, local_tokens, self.config.vocab_size
         )
-        dist.all_reduce(next_token, op=dist.ReduceOp.MIN)
+        dist.all_reduce(next_token, op=dist.ReduceOp.MIN, **_tp_group_kwargs())
         return next_token
 
     def _gather_logits(self, logits: Tensor) -> Tensor:
         if not dist.is_available() or not dist.is_initialized():
             return logits
         gathered = [torch.empty_like(logits) for _ in range(self.world_size)]
-        dist.all_gather(gathered, logits)
+        dist.all_gather(gathered, logits, **_tp_group_kwargs())
         return torch.cat(gathered, dim=-1)
 
     def _rotary_cache(self, start: int, tokens: int) -> tuple[Tensor, Tensor]:
@@ -9785,10 +9860,10 @@ def _resolve_tensor_parallel_checkpoint(
     candidate = Path(checkpoint).expanduser()
     if candidate.exists():
         return candidate
-    if not dist.is_available() or not dist.is_initialized() or dist.get_world_size() <= 1:
+    if not dist.is_available() or not dist.is_initialized() or _tp_world_size() <= 1:
         return resolve_llama3_checkpoint(checkpoint, token=token, revision=revision, cache_dir=cache_dir)
 
-    rank = dist.get_rank()
+    rank = _tp_rank()
     resolved = [""]
     if rank == 0:
         print(f"[Llama3TP] resolving checkpoint {checkpoint}", flush=True)
@@ -9945,11 +10020,15 @@ def _broadcast_tensor_in_chunks(tensor: Tensor, *, src: int) -> Tensor:
     max_chunk_bytes = _checkpoint_broadcast_chunk_bytes()
     elems_per_chunk = max(1, max_chunk_bytes // tensor.element_size())
     if flat.numel() <= elems_per_chunk:
-        dist.broadcast(flat, src=src)
+        dist.broadcast(flat, src=_tp_global_rank(src), **_tp_group_kwargs())
         return tensor
     for start in range(0, flat.numel(), elems_per_chunk):
         length = min(elems_per_chunk, flat.numel() - start)
-        dist.broadcast(flat.narrow(0, start, length), src=src)
+        dist.broadcast(
+            flat.narrow(0, start, length),
+            src=_tp_global_rank(src),
+            **_tp_group_kwargs(),
+        )
     return tensor
 
 
@@ -10051,7 +10130,7 @@ def _load_checkpoint_tensor_shard(
         tensor = loader.get_tensor(name, device=device, dtype=dtype)
     else:
         tensor = torch.empty(shape, device=device, dtype=dtype)
-    dist.broadcast(tensor, src=0)
+    dist.broadcast(tensor, src=_tp_global_rank(0), **_tp_group_kwargs())
     shard = shape[dim] // world_size
     start = rank * shard
     return tensor.narrow(dim, start, shard).clone(memory_format=torch.contiguous_format)
@@ -10082,7 +10161,12 @@ def _load_checkpoint_tensor_shard_scatter(
                 for chunk in tensor.split(shard, dim=dim)
             ]
             del tensor
-        dist.scatter(output, scatter_list=scatter_list, src=0)
+        dist.scatter(
+            output,
+            scatter_list=scatter_list,
+            src=_tp_global_rank(0),
+            **_tp_group_kwargs(),
+        )
         return output if output.is_contiguous() else output.contiguous()
 
     if rank == 0:
@@ -10098,23 +10182,34 @@ def _load_checkpoint_tensor_shard_scatter(
             input_shape[0] *= world_size
             input_shape[dim] = shard
         scatter_input = torch.zeros(tuple(input_shape), device=device, dtype=dtype)
-    dist.reduce_scatter_tensor(output, scatter_input, op=dist.ReduceOp.SUM)
+    dist.reduce_scatter_tensor(
+        output,
+        scatter_input,
+        op=dist.ReduceOp.SUM,
+        **_tp_group_kwargs(),
+    )
     return output if output.is_contiguous() else output.contiguous()
 
 
 def _broadcast_object_list(objects: list[object], *, src: int, device: torch.device) -> None:
+    global_src = _tp_global_rank(src)
     if device.type == "cuda":
         try:
-            dist.broadcast_object_list(objects, src=src, device=device)
+            dist.broadcast_object_list(
+                objects,
+                src=global_src,
+                device=device,
+                **_tp_group_kwargs(),
+            )
             return
         except TypeError:
             pass
-    dist.broadcast_object_list(objects, src=src)
+    dist.broadcast_object_list(objects, src=global_src, **_tp_group_kwargs())
 
 
 def _all_reduce(tensor: Tensor) -> None:
     if dist.is_available() and dist.is_initialized():
-        dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+        dist.all_reduce(tensor, op=dist.ReduceOp.SUM, **_tp_group_kwargs())
 
 
 def _build_llama_rotary_cache(
@@ -11226,7 +11321,7 @@ def validate_symm_mem_allreduce_collective(model: object, device: object) -> Non
     try:
         import torch.distributed._symmetric_memory as symm_mem
 
-        group_name = dist.group.WORLD.group_name
+        group_name = _tp_group_name()
         hidden = int(getattr(getattr(model, "config", object()), "hidden_size", 0)) or 8192
         buffer = symm_mem.empty((1, hidden), device=device, dtype=torch.bfloat16)
         symm_mem.rendezvous(buffer, group_name)
@@ -11236,7 +11331,7 @@ def validate_symm_mem_allreduce_collective(model: object, device: object) -> Non
     except Exception:
         ok = 0
     flag = torch.tensor([ok], device=device, dtype=torch.int32)
-    dist.all_reduce(flag, op=dist.ReduceOp.MIN)
+    dist.all_reduce(flag, op=dist.ReduceOp.MIN, **_tp_group_kwargs())
     if int(flag.item()) == 0:
         _disable_symm_reduce()
 
@@ -11253,6 +11348,9 @@ def _rotate_interleaved_eager(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
 def _barrier() -> None:
     if dist.is_available() and dist.is_initialized():
         if torch.cuda.is_available():
-            dist.barrier(device_ids=[int(os.environ.get("LOCAL_RANK", "0"))])
+            dist.barrier(
+                device_ids=[int(os.environ.get("LOCAL_RANK", "0"))],
+                **_tp_group_kwargs(),
+            )
         else:
-            dist.barrier()
+            dist.barrier(**_tp_group_kwargs())

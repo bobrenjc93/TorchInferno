@@ -43,10 +43,12 @@ from torchinferno.openai_server import (
     OpenAIServerConfig,
     _ByteFallbackTokenizer,
     _is_tensor_parallel_worker_model,
+    _reexec_distributed_server,
     _tensor_parallel_worker_loop,
     build_engine as build_openai_engine,
     serve as serve_openai_api,
 )
+from torchinferno.engine.loader import should_reexec_distributed_server
 from torchinferno.kernels import KernelBackend, KernelConfig, paged_decode_attention
 from torchinferno.profiling import (
     PatternProfileConfig,
@@ -1188,7 +1190,13 @@ def run_serve_smoke(args: argparse.Namespace) -> int:
 
 
 def run_openai_server(args: argparse.Namespace) -> int:
-    serve_openai_api(openai_config_from_args(args))
+    config = openai_config_from_args(args)
+    if should_reexec_distributed_server(config):
+        original_argv = list(sys.argv[1:])
+        if original_argv and original_argv[0] == "openai-server":
+            original_argv = original_argv[1:]
+        _reexec_distributed_server(config, original_argv)
+    serve_openai_api(config)
     return 0
 
 
@@ -2113,7 +2121,7 @@ def build_parser() -> argparse.ArgumentParser:
     openai_serve.add_argument("--token", default=None)
     openai_serve.add_argument("--revision", default=None)
     openai_serve.add_argument("--cache-dir", default=None)
-    openai_serve.add_argument("--cache-backend", choices=["dense", "paged"], default="dense")
+    openai_serve.add_argument("--cache-backend", choices=["dense", "paged", "flashinfer"], default="dense")
     openai_serve.add_argument("--page-size", type=int, default=16)
     openai_serve.add_argument("--max-batch-size", type=int, default=64)
     openai_serve.add_argument("--batch-wait-ms", type=float, default=10.0)
@@ -2130,6 +2138,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--llama-parallelism",
         choices=["auto", "pipeline", "tensor"],
         default="auto",
+    )
+    openai_serve.add_argument(
+        "--disaggregation-mode",
+        choices=["none", "prefill-decode"],
+        default="none",
+        help="Split CUDA workers into equal tensor-parallel prefill and decode replicas.",
+    )
+    openai_serve.add_argument(
+        "--disaggregation-profile",
+        action="store_true",
+        help="Synchronize and record NCCL KV handoff latency.",
     )
     openai_serve.set_defaults(func=run_openai_server)
 

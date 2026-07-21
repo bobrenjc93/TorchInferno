@@ -3256,6 +3256,185 @@ def test_llama3_tensor_parallel_matches_reference_under_torchrun(tmp_path) -> No
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+@pytest.mark.skipif(torch.cuda.device_count() < 4, reason="requires at least four CUDA devices")
+def test_llama3_disaggregated_prefill_decode_matches_reference_under_torchrun(tmp_path) -> None:
+    torch.manual_seed(1701)
+    config = tiny_llama3_config(vocab_size=32, max_position_embeddings=32)
+    reference = Llama3V0ForCausalLM(config).eval()
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    _write_hf_checkpoint(reference, config, checkpoint)
+
+    prompts = (
+        torch.tensor([[1, 2, 3, 4]], dtype=torch.long),
+        torch.tensor([[5, 6, 7], [8, 9, 10]], dtype=torch.long),
+    )
+    expected = (
+        reference.generate(prompts[0], max_new_tokens=1),
+        reference.generate(prompts[0], max_new_tokens=3),
+        reference.generate(prompts[1], max_new_tokens=3),
+    )
+    torch.save(prompts, tmp_path / "prompts.pt")
+    torch.save(expected, tmp_path / "expected.pt")
+
+    script = tmp_path / "check_disaggregated.py"
+    script.write_text(
+        textwrap.dedent(
+            """
+            from __future__ import annotations
+
+            import sys
+
+            import torch
+            import torch.distributed as dist
+
+            from torchinferno.models.llama3 import Llama3TensorParallelForCausalLM
+            from torchinferno.models.llama3.tensor_parallel import set_tensor_parallel_process_group
+            from torchinferno.runtime.disaggregated import (
+                DisaggregatedPrefillDecodeModel,
+                initialize_disaggregated_topology,
+            )
+
+
+            checkpoint, artifact_dir = sys.argv[1], sys.argv[2]
+            topology = initialize_disaggregated_topology(2)
+            set_tensor_parallel_process_group(topology.role_group)
+            role_model = Llama3TensorParallelForCausalLM.from_pretrained(
+                checkpoint,
+                dtype="float32",
+            ).eval()
+            model = DisaggregatedPrefillDecodeModel(
+                role_model,
+                topology,
+                profile_transfer=True,
+            ).eval()
+            model.startup_warmup(prompt_tokens=2, new_tokens=2)
+
+            try:
+                if model.is_coordinator:
+                    prompts = torch.load(f"{artifact_dir}/prompts.pt", weights_only=True)
+                    expected = torch.load(f"{artifact_dir}/expected.pt", weights_only=True)
+                    actual = (
+                        model.generate(prompts[0].to(model.device), max_new_tokens=1),
+                        model.generate(prompts[0].to(model.device), max_new_tokens=3),
+                        model.generate(prompts[1].to(model.device), max_new_tokens=3),
+                    )
+                    for got, want in zip(actual, expected):
+                        if not torch.equal(got.cpu(), want):
+                            raise AssertionError(f"generated={got.cpu().tolist()} expected={want.tolist()}")
+
+                    cache = model.allocate_cache(2, 8)
+                    logits, cache = model.forward(
+                        prompts[0].to(model.device),
+                        cache=cache,
+                        return_last_logits_only=True,
+                    )
+                    if cache.phase != "decode" or cache.seq_len != prompts[0].size(1):
+                        raise AssertionError("prefill did not complete the KV handoff")
+                    try:
+                        model.forward(
+                            prompts[0][:, -1:].expand(2, 1).to(model.device),
+                            cache=cache,
+                            return_last_logits_only=True,
+                        )
+                    except ValueError as exc:
+                        if "batch used for prefill" not in str(exc):
+                            raise
+                    else:
+                        raise AssertionError("decode accepted rows without transferred prefix KV")
+                    token = logits[:, -1, :].argmax(dim=-1)
+                    seq_len_before_fallback = cache.seq_len
+                    unavailable_graph = model.try_decode_one_token_graph(
+                        token[:, None],
+                        cache,
+                        temperature=1.0,
+                    )
+                    if unavailable_graph is not None or cache.seq_len != seq_len_before_fallback:
+                        raise AssertionError("unavailable decode graph advanced the distributed cache")
+                    graphed_token = model.try_decode_one_token_graph(
+                        token[:, None],
+                        cache,
+                        temperature=0.0,
+                    )
+                    if graphed_token is None:
+                        raise AssertionError("dense decode token graph was not available")
+                    if not torch.equal(graphed_token.cpu(), expected[1][:, prompts[0].size(1) + 1]):
+                        raise AssertionError("dense decode token graph diverged from the reference")
+                    if cache.seq_len != prompts[0].size(1) + 1:
+                        raise AssertionError("decode did not advance the distributed cache")
+                    model.release_decode_graphs_for_cache(cache)
+                    if cache.cache_id in model._cache_states:
+                        raise AssertionError("cache release retained coordinator state")
+
+                    flashinfer_cache = model.allocate_cache(2, 8, cache_backend="flashinfer")
+                    flashinfer_logits, flashinfer_cache = model.forward(
+                        prompts[0].to(model.device),
+                        cache=flashinfer_cache,
+                        return_last_logits_only=True,
+                    )
+                    flashinfer_token = flashinfer_logits[:, -1, :].argmax(dim=-1)
+                    if not torch.equal(flashinfer_token.cpu(), expected[1][:, prompts[0].size(1)]):
+                        raise AssertionError("FlashInfer prefill handoff diverged from the reference")
+                    flashinfer_next = model.try_decode_one_token_graph(
+                        flashinfer_token[:, None],
+                        flashinfer_cache,
+                        temperature=0.0,
+                    )
+                    if flashinfer_next is not None:
+                        raise AssertionError("FlashInfer unexpectedly used the dense decode graph")
+                    flashinfer_next_logits, flashinfer_cache = model.forward(
+                        flashinfer_token[:, None],
+                        cache=flashinfer_cache,
+                        return_last_logits_only=True,
+                    )
+                    flashinfer_next = flashinfer_next_logits[:, -1, :].argmax(dim=-1)
+                    if not torch.equal(flashinfer_next.cpu(), expected[1][:, prompts[0].size(1) + 1]):
+                        raise AssertionError("FlashInfer eager decode diverged from the reference")
+                    model.release_decode_graphs_for_cache(flashinfer_cache)
+                    stats = model.disaggregation_stats()
+                    if int(stats["transfer_count"]) < 5 or int(stats["transfer_bytes"]) <= 0:
+                        raise AssertionError(f"invalid transfer stats: {stats}")
+                    if not isinstance(stats["profiled_average_transfer_ms"], float):
+                        raise AssertionError(f"missing profiled transfer latency: {stats}")
+                    model.shutdown_workers()
+                else:
+                    model.run_worker_loop()
+                    if model._cache_states:
+                        raise AssertionError("released worker cache state was retained")
+            finally:
+                set_tensor_parallel_process_group(None)
+            dist.barrier()
+            dist.destroy_process_group()
+            """
+        )
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "torch.distributed.run",
+            "--standalone",
+            "--nproc-per-node",
+            "4",
+            str(script),
+            str(checkpoint),
+            str(tmp_path),
+        ],
+        cwd=tmp_path,
+        env={
+            **os.environ,
+            "PYTHONPATH": str(_repo_root() / "src"),
+            "TORCHINFERNO_SYMM_MEM_ALLREDUCE": "0",
+        },
+        text=True,
+        capture_output=True,
+        timeout=180,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 def _write_hf_checkpoint(reference: Llama3V0ForCausalLM, config, checkpoint) -> None:
     state = reference.state_dict()
     hf_state = {

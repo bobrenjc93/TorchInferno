@@ -217,9 +217,10 @@ PYTHONPATH=src python3 -m torchinferno.cli deepseek-smoke --device cuda
 
 ## DSv4 Model Family
 
-The compact model lives in `src/torchinferno/models/dsv4/model.py`. It is the fast
-CPU-friendly model family for compiler, cache, serving, and graph-pass
-experiments.
+The compact model lives in `src/torchinferno/models/dsv4/model.py`. `DSv4` is a
+local family name, not an implementation of the `deepseek_v4` architecture or
+its public checkpoints. It is the fast CPU-friendly model family for compiler,
+cache, serving, and graph-pass experiments.
 
 ```python
 import torch
@@ -841,6 +842,47 @@ Pattern directories contain `reference_graph.json`, `optimized_graph.json`,
 `pass_report.json`, `reference_profile.json`, `optimized_profile.json`,
 Chrome traces for both paths, `comparison.json`, and `pattern_repro.py`.
 
+## CUDA Prefill/Decode Mode
+
+The OpenAI server can load two independent Llama tensor-parallel replicas and
+run prefill on one replica, transfer live KV shards over NCCL, and run later
+decode steps on the other replica. `--tensor-parallel-size` is the size of
+*each* role, so this example auto-launches eight processes and uses GPUs 0-3
+for prefill and 4-7 for decode:
+
+```bash
+PYTHONPATH=src python3 -m torchinferno.openai_server \
+  --model meta-llama/Meta-Llama-3.1-70B-Instruct \
+  --tensor-parallel-size 4 \
+  --disaggregation-mode prefill-decode \
+  --dtype bfloat16 \
+  --cache-backend dense
+```
+
+The current mode is single-node CUDA/NCCL only. It supports Llama with dense
+or FlashInfer KV storage; paged KV and DeepSeek model families are rejected
+rather than silently falling back to ordinary serving. A Gloo control group
+keeps idle workers off the GPU, while role-local NCCL groups handle model
+collectives and matching two-rank NCCL groups transfer only live KV tokens.
+Select and order GPUs with `CUDA_VISIBLE_DEVICES`; `--device` and `--devices`
+are rejected because each process binds its visible `LOCAL_RANK` directly.
+The initial scheduler caps active batches at 8 by default to bound duplicate
+70B KV storage; set `TORCHINFERNO_OPENAI_DISAGG_MAX_BATCH_SIZE` to tune that
+general capacity limit. Symmetric-memory allreduce remains off unless its
+OpenAI auto-probe is explicitly promoted to all-scope operation.
+
+This initial executable CUDA mode is synchronous: one ordered batch performs
+prefill, handoff, and decode, without overlapping the next batch's prefill with
+the current batch's decode. It provides real device isolation and KV handoff,
+but it is not yet an independently scalable vLLM/SGLang-style PD router and is
+not expected to increase aggregate throughput per eight GPUs. Prefix reuse,
+continuous admission, and cross-request role overlap are disabled for this
+mode until their distributed cache ownership contracts are implemented.
+
+Add `--disaggregation-profile` for synchronized pack/P2P/unpack timing. That
+flag deliberately inserts synchronization and should be used for profiling,
+not production latency measurements.
+
 ## Disaggregated Rank Files
 
 `disagg-init` generates one standalone Python file per rank. Each file owns one
@@ -886,6 +928,8 @@ The runtime package is where simulation-first serving work belongs:
 - `runtime.scheduler`: disaggregated prefill/decode planning.
 - `runtime.disagg`: agent-editable rank files and local RPC wrappers for
   executable prefill/decode experiments.
+- `runtime.disaggregated`: CUDA TP role topology, ordered control protocol, and
+  live GPU KV handoff used by the OpenAI server mode.
 - `runtime.fake_dist`: fake process groups and collectives.
 - `runtime.offload`: CPU/device module staging and transfer-overhead summaries.
 - `runtime.paged`: page-table-shaped KV cache allocation and materialization.

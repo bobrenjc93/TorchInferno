@@ -20,6 +20,8 @@ class ModelConfig:
     revision: str | None = None
     cache_dir: str | Path | None = None
     llama_parallelism: str = "auto"
+    disaggregation_mode: str = "none"
+    disaggregation_profile: bool = False
 
 
 @dataclass(frozen=True)
@@ -55,6 +57,8 @@ class EngineConfig:
     batch_wait_ms: float = 10.0
     single_request_admission_wait_ms: float | None = None
     llama_parallelism: str = "auto"
+    disaggregation_mode: str = "none"
+    disaggregation_profile: bool = False
 
     @classmethod
     def from_parts(
@@ -85,6 +89,8 @@ class EngineConfig:
             batch_wait_ms=scheduler.batch_wait_ms,
             single_request_admission_wait_ms=scheduler.single_request_admission_wait_ms,
             llama_parallelism=model.llama_parallelism,
+            disaggregation_mode=model.disaggregation_mode,
+            disaggregation_profile=model.disaggregation_profile,
         )
 
     @classmethod
@@ -108,6 +114,8 @@ class EngineConfig:
             batch_wait_ms=float(getattr(config, "batch_wait_ms", 10.0)),
             single_request_admission_wait_ms=getattr(config, "single_request_admission_wait_ms", None),
             llama_parallelism=str(getattr(config, "llama_parallelism", "auto")),
+            disaggregation_mode=str(getattr(config, "disaggregation_mode", "none")),
+            disaggregation_profile=bool(getattr(config, "disaggregation_profile", False)),
         )
 
     @classmethod
@@ -135,6 +143,8 @@ class EngineConfig:
             batch_wait_ms=float(getattr(args, "batch_wait_ms", 10.0)),
             single_request_admission_wait_ms=getattr(args, "single_request_admission_wait_ms", None),
             llama_parallelism=str(getattr(args, "llama_parallelism", "auto")),
+            disaggregation_mode=str(getattr(args, "disaggregation_mode", "none")),
+            disaggregation_profile=bool(getattr(args, "disaggregation_profile", False)),
         )
 
     def to_legacy_openai_config(self, *, host: str = "0.0.0.0", port: int = 8000) -> object:
@@ -161,4 +171,6 @@ class EngineConfig:
             batch_wait_ms=self.batch_wait_ms,
             single_request_admission_wait_ms=self.single_request_admission_wait_ms,
             llama_parallelism=self.llama_parallelism,
+            disaggregation_mode=self.disaggregation_mode,
+            disaggregation_profile=self.disaggregation_profile,
         )
