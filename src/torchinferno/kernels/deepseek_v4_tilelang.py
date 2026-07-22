@@ -223,6 +223,139 @@ def fp8_gemm(
     return output
 
 
+def q_norm_rope(
+    q: torch.Tensor,
+    freqs: torch.Tensor,
+    eps: float,
+    *,
+    output: torch.Tensor | None = None,
+) -> torch.Tensor:
+    if q.ndim != 3 or q.dtype != torch.bfloat16:
+        raise ValueError("V4 Q norm/RoPE expects [tokens, heads, head_dim] BF16 input")
+    if freqs.shape != (64,) or freqs.dtype != torch.float32 or not freqs.is_contiguous():
+        raise ValueError("V4 Q norm/RoPE expects one contiguous 64-wide FP32 frequency row")
+    if q.size(2) < freqs.size(0):
+        raise ValueError("V4 Q norm/RoPE requires a 64-wide rotary tail")
+    if freqs.device != q.device:
+        raise ValueError("V4 Q norm/RoPE inputs must be on the same device")
+    value = q.contiguous()
+    if output is None:
+        output = torch.empty_like(value)
+    elif (
+        output.shape != value.shape
+        or output.dtype != value.dtype
+        or output.device != value.device
+        or not output.is_contiguous()
+    ):
+        raise ValueError("V4 Q norm/RoPE output must be contiguous and match the input")
+    kernel = _kernel(
+        "q_norm_rope",
+        value.size(1),
+        value.size(2),
+        freqs.size(0),
+        eps,
+    )
+    kernel(value, freqs, output)
+    return output
+
+
+def rope_inplace(
+    value: torch.Tensor,
+    freqs: torch.Tensor,
+    *,
+    inverse: bool = False,
+) -> torch.Tensor:
+    if value.ndim != 3 or value.dtype != torch.bfloat16 or not value.is_contiguous():
+        raise ValueError("V4 RoPE expects contiguous [tokens, heads, head_dim] BF16 input")
+    if freqs.shape != (64,) or freqs.dtype != torch.float32 or not freqs.is_contiguous():
+        raise ValueError("V4 RoPE expects one contiguous 64-wide FP32 frequency row")
+    if value.size(2) < freqs.size(0):
+        raise ValueError("V4 RoPE requires a 64-wide rotary tail")
+    if freqs.device != value.device:
+        raise ValueError("V4 RoPE inputs must be on the same device")
+    kernel = _kernel(
+        "rope_inplace",
+        value.size(1),
+        value.size(2),
+        freqs.size(0),
+        inverse,
+    )
+    kernel(value, freqs)
+    return value
+
+
+def hc_post(
+    value: torch.Tensor,
+    residual: torch.Tensor,
+    post: torch.Tensor,
+    comb: torch.Tensor,
+) -> torch.Tensor:
+    if value.ndim < 2 or residual.ndim != value.ndim + 1:
+        raise ValueError("V4 mHC post inputs have incompatible ranks")
+    if value.dtype != torch.bfloat16 or residual.dtype != torch.bfloat16:
+        raise ValueError("V4 mHC post values and residual must be BF16")
+    if post.dtype != torch.float32 or comb.dtype != torch.float32:
+        raise ValueError("V4 mHC post mixing tensors must be FP32")
+    if any(tensor.device != value.device for tensor in (residual, post, comb)):
+        raise ValueError("V4 mHC post inputs must be on the same device")
+    hidden = value.size(-1)
+    hc = residual.size(-2)
+    if residual.shape[:-2] != value.shape[:-1] or residual.size(-1) != hidden:
+        raise ValueError("V4 mHC residual shape does not match the layer output")
+    if post.shape != (*value.shape[:-1], hc) or comb.shape != (
+        *value.shape[:-1],
+        hc,
+        hc,
+    ):
+        raise ValueError("V4 mHC mixing tensors do not match the residual shape")
+    tokens = value.numel() // hidden
+    output = torch.empty_like(residual)
+    kernel = _kernel("hc_post", hc, hidden)
+    kernel(
+        value.contiguous().view(tokens, hidden),
+        residual.contiguous().view(tokens, hc, hidden),
+        post.contiguous().view(tokens, hc),
+        comb.contiguous().view(tokens, hc, hc),
+        output.view(tokens, hc, hidden),
+    )
+    return output
+
+
+def hc_prenorm_gemm(
+    value: torch.Tensor,
+    weight: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if value.ndim < 3 or value.dtype != torch.bfloat16:
+        raise ValueError("V4 mHC pre-norm expects [..., hc, hidden] BF16 input")
+    if weight.ndim != 2 or weight.dtype != torch.float32:
+        raise ValueError("V4 mHC pre-norm projection weight must be FP32")
+    if weight.device != value.device:
+        raise ValueError("V4 mHC pre-norm inputs must be on the same device")
+    hc = value.size(-2)
+    hidden = value.size(-1)
+    width = hc * hidden
+    if weight.size(1) != width:
+        raise ValueError("V4 mHC pre-norm projection width does not match the input")
+    if width % 1024:
+        raise ValueError("V4 mHC pre-norm projection width must be divisible by 1024")
+    tokens = value.numel() // width
+    output_shape = (*value.shape[:-2], weight.size(0))
+    output = torch.empty(output_shape, dtype=torch.float32, device=value.device)
+    square_sum = torch.empty(
+        (*value.shape[:-2], 1),
+        dtype=torch.float32,
+        device=value.device,
+    )
+    kernel = _kernel("hc_prenorm_gemm", hidden, hc, weight.size(0))
+    kernel(
+        value.contiguous().view(tokens, width),
+        weight.contiguous(),
+        output.view(tokens, weight.size(0)),
+        square_sum.view(tokens),
+    )
+    return output, square_sum
+
+
 def sparse_attn(
     q: torch.Tensor,
     kv: torch.Tensor,

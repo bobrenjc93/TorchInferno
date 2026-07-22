@@ -5,6 +5,8 @@ commit 60d8d70770c6776ff598c94bb586a859a38244f1. The upstream implementation is
 MIT licensed; see ``THIRD_PARTY_NOTICES.md``.
 """
 
+import math
+
 import torch
 import tilelang
 import tilelang.language as T
@@ -24,6 +26,230 @@ FE8M0 = "float8_e8m0fnu"
 BF16 = "bfloat16"
 FP32 = "float32"
 INT32 = "int32"
+
+
+@tilelang.jit(pass_configs=pass_configs)
+def q_norm_rope_kernel(
+    heads: int,
+    head_dim: int,
+    rope_dim: int,
+    eps: float = 1e-6,
+):
+    """Fuse self-RMSNorm and interleaved RoPE for one-token Q decode."""
+    tokens = T.symbolic("tokens")
+    nope_dim = head_dim - rope_dim
+
+    @T.prim_func
+    def q_norm_rope_kernel_(
+        q: T.Tensor[(tokens, heads, head_dim), BF16],
+        freqs: T.Tensor[(rope_dim,), FP32],
+        output: T.Tensor[(tokens, heads, head_dim), BF16],
+    ):
+        with T.Kernel(tokens * heads, threads=256) as row:
+            token = row // heads
+            head = row % heads
+            values = T.alloc_fragment((head_dim,), FP32)
+            T.copy(q[token, head, 0], values)
+
+            square_sum = T.alloc_reducer((1,), FP32, replication="all")
+            T.fill(square_sum, 0.0)
+            for index in T.Parallel(head_dim):
+                square_sum[0] += values[index] * values[index]
+            T.finalize_reducer(square_sum)
+            inverse_rms = T.rsqrt(square_sum[0] / head_dim + eps)
+
+            for index in T.Parallel(nope_dim):
+                output[token, head, index] = values[index] * inverse_rms
+
+            thread = T.get_thread_binding()
+            if thread < rope_dim // 2:
+                index = nope_dim + thread * 2
+                # Match the reference's in-place BF16 normalization before
+                # its FP32 complex multiply.
+                real = T.Cast(
+                    FP32,
+                    T.Cast(BF16, T.Cast(FP32, q[token, head, index]) * inverse_rms),
+                )
+                imag = T.Cast(
+                    FP32,
+                    T.Cast(
+                        BF16,
+                        T.Cast(FP32, q[token, head, index + 1]) * inverse_rms,
+                    ),
+                )
+                cosine = freqs[thread * 2]
+                sine = freqs[thread * 2 + 1]
+                output[token, head, index] = real * cosine - imag * sine
+                output[token, head, index + 1] = imag * cosine + real * sine
+
+    return q_norm_rope_kernel_
+
+
+@tilelang.jit(pass_configs=pass_configs)
+def rope_inplace_kernel(
+    heads: int,
+    head_dim: int,
+    rope_dim: int,
+    inverse: bool = False,
+):
+    """Apply interleaved RoPE to the tail of a full-stride Q/K tensor."""
+    tokens = T.symbolic("tokens")
+    nope_dim = head_dim - rope_dim
+
+    @T.prim_func
+    def rope_inplace_kernel_(
+        value: T.Tensor[(tokens, heads, head_dim), BF16],
+        freqs: T.Tensor[(rope_dim,), FP32],
+    ):
+        with T.Kernel(tokens * heads, threads=32) as row:
+            token = row // heads
+            head = row % heads
+            thread = T.get_thread_binding()
+            index = nope_dim + thread * 2
+            real = T.Cast(FP32, value[token, head, index])
+            imag = T.Cast(FP32, value[token, head, index + 1])
+            cosine = freqs[thread * 2]
+            sine = (
+                -freqs[thread * 2 + 1]
+                if inverse
+                else freqs[thread * 2 + 1]
+            )
+            value[token, head, index] = real * cosine - imag * sine
+            value[token, head, index + 1] = imag * cosine + real * sine
+
+    return rope_inplace_kernel_
+
+
+@tilelang.jit(pass_configs=pass_configs)
+def hc_post_kernel(
+    hc: int,
+    hidden: int,
+    threads: int = 128,
+    block: int = 1024,
+):
+    """Fuse mHC post-mapping into one BF16 output kernel.
+
+    The block layout is adapted from vLLM's Apache-2.0 TileLang mHC kernel.
+    """
+    tokens = T.symbolic("tokens")
+    block = math.gcd(hidden, block)
+
+    @T.prim_func
+    def hc_post_kernel_(
+        value: T.Tensor[(tokens, hidden), BF16],
+        residual: T.Tensor[(tokens, hc, hidden), BF16],
+        post: T.Tensor[(tokens, hc), FP32],
+        comb: T.Tensor[(tokens, hc, hc), FP32],
+        output: T.Tensor[(tokens, hc, hidden), BF16],
+    ):
+        with T.Kernel(tokens, threads=threads) as token:
+            residual_shared = T.alloc_shared((hc, block), BF16)
+            value_shared = T.alloc_shared((block,), BF16)
+            result = T.alloc_fragment((hc, block), FP32)
+            residual_local = T.alloc_fragment((hc, block), FP32)
+            value_local = T.alloc_fragment((block,), FP32)
+            comb_local = T.alloc_fragment((hc, hc), FP32)
+            post_local = T.alloc_fragment((hc,), FP32)
+            T.copy(comb[token, 0, 0], comb_local)
+            T.copy(post[token, 0], post_local)
+            for block_index in T.Serial(T.ceildiv(hidden, block)):
+                T.copy(
+                    residual[token, 0, block_index * block],
+                    residual_shared,
+                )
+                T.copy(value[token, block_index * block], value_shared)
+                T.copy(residual_shared, residual_local)
+                T.copy(value_shared, value_local)
+                for channel, index in T.Parallel(hc, block):
+                    result[channel, index] = (
+                        post_local[channel] * value_local[index]
+                    )
+                    for source in T.vectorized(hc):
+                        result[channel, index] += (
+                            comb_local[source, channel]
+                            * residual_local[source, index]
+                        )
+                T.copy(
+                    result,
+                    output[token, 0, block_index * block],
+                )
+
+    return hc_post_kernel_
+
+
+@tilelang.jit(pass_configs=pass_configs)
+def hc_prenorm_gemm_kernel(
+    hidden: int,
+    hc: int = 4,
+    outputs: int = 24,
+    threads: int = 1024,
+    output_tile: int = 4,
+):
+    """Compute the mHC projection and residual squared norm together.
+
+    Adapted from vLLM's Apache-2.0 TileLang mHC pre-norm GEMV.
+    """
+    tokens = T.symbolic("tokens")
+    width = hc * hidden
+    iterations = width // threads
+    output_tiles = T.ceildiv(outputs, output_tile)
+
+    @T.prim_func
+    def hc_prenorm_gemm_kernel_(
+        value: T.Tensor[(tokens, width), BF16],
+        weight: T.Tensor[(outputs, width), FP32],
+        output: T.Tensor[(tokens, outputs), FP32],
+        square_sum: T.Tensor[(tokens,), FP32],
+    ):
+        with T.Kernel(tokens, output_tiles, threads=threads) as (token, tile):
+            thread = T.get_thread_binding()
+            accumulator = T.alloc_local((output_tile,), FP32)
+            square = T.alloc_local((1,), FP32)
+            T.clear(accumulator)
+            T.clear(square)
+            for iteration in T.serial(iterations):
+                index = iteration * threads + thread
+                input_value = value[token, index]
+                for inner in T.unroll(output_tile):
+                    output_index = tile * output_tile + inner
+                    if output_index < outputs:
+                        accumulator[inner] += (
+                            input_value * weight[output_index, index]
+                        )
+                if tile == 0:
+                    square[0] += input_value * input_value
+
+            for inner in T.unroll(output_tile):
+                accumulator[inner] = T.warp_reduce_sum(accumulator[inner])
+            if tile == 0:
+                square[0] = T.warp_reduce_sum(square[0])
+
+            lane = thread % 32
+            warp = thread // 32
+            warps = threads // 32
+            warp_output = T.alloc_shared((warps, output_tile), FP32)
+            warp_square = T.alloc_shared((warps,), FP32)
+            if lane == 0:
+                for inner in T.unroll(output_tile):
+                    warp_output[warp, inner] = accumulator[inner]
+                if tile == 0:
+                    warp_square[warp] = square[0]
+            T.sync_threads()
+            if warp == 0:
+                if lane < output_tile:
+                    reduced = T.alloc_var(FP32, init=0.0)
+                    for source_warp in T.unroll(warps):
+                        reduced += warp_output[source_warp, lane]
+                    output_index = tile * output_tile + lane
+                    if output_index < outputs:
+                        output[token, output_index] = reduced
+                if lane == 0 and tile == 0:
+                    reduced_square = T.alloc_var(FP32, init=0.0)
+                    for source_warp in T.unroll(warps):
+                        reduced_square += warp_square[source_warp]
+                    square_sum[token] = reduced_square
+
+    return hc_prenorm_gemm_kernel_
 
 
 def fast_log2_ceil(x):

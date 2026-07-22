@@ -7,6 +7,7 @@ and validation around this implementation. See ``THIRD_PARTY_NOTICES.md``.
 """
 
 import math
+import os
 import threading
 from pathlib import Path
 from dataclasses import dataclass
@@ -80,6 +81,31 @@ def sparse_attn(*args, **kwargs):
 
 def hc_split_sinkhorn(*args, **kwargs):
     return _v4_kernel("hc_split_sinkhorn")(*args, **kwargs)
+
+
+def q_norm_rope(*args, **kwargs):
+    return _v4_kernel("q_norm_rope")(*args, **kwargs)
+
+
+def rope_inplace(*args, **kwargs):
+    return _v4_kernel("rope_inplace")(*args, **kwargs)
+
+
+def fused_hc_post(*args, **kwargs):
+    return _v4_kernel("hc_post")(*args, **kwargs)
+
+
+def fused_hc_prenorm_gemm(*args, **kwargs):
+    return _v4_kernel("hc_prenorm_gemm")(*args, **kwargs)
+
+
+@lru_cache(1)
+def _precompiled_rmsnorm_op():
+    try:
+        __import__("sgl_kernel")
+        return torch.ops.sgl_kernel.rmsnorm.default
+    except (ImportError, AttributeError):
+        return None
 
 
 @contextmanager
@@ -250,10 +276,21 @@ class RMSNorm(nn.Module):
         super().__init__()
         self.dim = dim
         self.eps = eps
-        # rmsnorm in the checkpoint is stored in bf16, while the parameter here is stored in fp32 for convenient.
-        self.weight = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+        self.weight = nn.Parameter(torch.ones(dim, dtype=torch.bfloat16))
 
     def forward(self, x: torch.Tensor):
+        fused = os.environ.get(
+            "TORCHINFERNO_V4_FUSED_RMSNORM",
+            "1",
+        ).strip().lower() not in {"0", "false", "no", "off"}
+        if fused and x.is_cuda and x.dtype == self.weight.dtype and x.is_contiguous():
+            op = _precompiled_rmsnorm_op()
+            if op is not None:
+                shape = x.shape
+                x = x.view(-1, shape[-1])
+                output = torch.empty_like(x)
+                op(output, x, self.weight, self.eps, True)
+                return output.view(shape)
         dtype = x.dtype
         x = x.float()
         var = x.square().mean(-1, keepdim=True)
@@ -586,13 +623,41 @@ class Attention(nn.Module):
         freqs_cis = precompute_freqs_cis(self.rope_head_dim, args.max_seq_len, original_seq_len,
                                          rope_theta, args.rope_factor, args.beta_fast, args.beta_slow)
         self.register_buffer("freqs_cis", freqs_cis, persistent=False)
+        self.register_buffer(
+            "_freqs_cis_real",
+            torch.view_as_real(freqs_cis).flatten(-2).contiguous(),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_q_norm_rope_output",
+            torch.empty(
+                args.max_batch_size,
+                self.n_local_heads,
+                self.head_dim,
+                dtype=torch.bfloat16,
+            ),
+            persistent=False,
+        )
 
-    def forward(self, x: torch.Tensor, start_pos: int, row_indices: torch.Tensor):
+    def forward(
+        self,
+        x: torch.Tensor,
+        start_pos: int,
+        row_indices: torch.Tensor,
+    ):
         bsz, seqlen, _ = x.size()
         freqs_cis = self.freqs_cis[start_pos:start_pos+seqlen]
         win = self.window_size
         ratio = self.compress_ratio
         rd = self.rope_head_dim
+        fused_rope = os.environ.get(
+            "TORCHINFERNO_V4_FUSED_ROPE",
+            "1",
+        ).strip().lower() not in {"0", "false", "no", "off"}
+        fused_q_norm_rope = os.environ.get(
+            "TORCHINFERNO_V4_FUSED_Q_NORM_ROPE",
+            "1",
+        ).strip().lower() not in {"0", "false", "no", "off"}
         if self.compress_ratio and self.compressor.kv_cache is None:
             self.compressor.kv_cache = self.kv_cache[:, win:]
             self.compressor.freqs_cis = self.freqs_cis
@@ -601,13 +666,27 @@ class Attention(nn.Module):
         # q
         qr = q = self.q_norm(self.wq_a(x))
         q = self.wq_b(q).unflatten(-1, (self.n_local_heads, self.head_dim))
-        q *= torch.rsqrt(q.square().mean(-1, keepdim=True) + self.eps)
-        apply_rotary_emb(q[..., -rd:], freqs_cis)
+        if q.is_cuda and seqlen == 1 and fused_q_norm_rope:
+            q = q_norm_rope(
+                q[:, 0],
+                self._freqs_cis_real[start_pos],
+                self.eps,
+                output=self._q_norm_rope_output[:bsz],
+            ).unsqueeze(1)
+        else:
+            q *= torch.rsqrt(q.square().mean(-1, keepdim=True) + self.eps)
+            apply_rotary_emb(q[..., -rd:], freqs_cis)
 
         # win kv & topk_idxs
         kv = self.wkv(x)
         kv = self.kv_norm(kv)
-        apply_rotary_emb(kv[..., -rd:], freqs_cis)
+        if kv.is_cuda and seqlen == 1 and fused_rope:
+            rope_inplace(
+                kv[:, 0].unsqueeze(1),
+                self._freqs_cis_real[start_pos],
+            )
+        else:
+            apply_rotary_emb(kv[..., -rd:], freqs_cis)
         # FP8-simulate non-rope dims to match QAT; rope dims stay bf16 for positional precision
         act_quant(kv[..., :-rd], 64, scale_fmt, scale_dtype, True)
         topk_idxs = get_window_topk_idxs(win, bsz, seqlen, start_pos, x.device)
@@ -641,7 +720,14 @@ class Attention(nn.Module):
             if self.compress_ratio:
                 self.compressor(x, start_pos, row_indices)
             o = sparse_attn(q, self.kv_cache[row_indices], self.attn_sink, topk_idxs, self.softmax_scale)
-        apply_rotary_emb(o[..., -rd:], freqs_cis, True)
+        if o.is_cuda and seqlen == 1 and fused_rope:
+            rope_inplace(
+                o[:, 0],
+                self._freqs_cis_real[start_pos],
+                inverse=True,
+            )
+        else:
+            apply_rotary_emb(o[..., -rd:], freqs_cis, True)
 
         # o
         o = o.view(bsz, seqlen, self.n_local_groups, -1)
@@ -857,15 +943,36 @@ class Block(nn.Module):
     def hc_pre(self, x: torch.Tensor, hc_fn: torch.Tensor, hc_scale: torch.Tensor, hc_base: torch.Tensor):
         # x: [b,s,hc,d], hc_fn: [mix_hc,hc*d], hc_scale: [3], hc_base: [mix_hc], y: [b,s,hc,d]
         shape, dtype = x.size(), x.dtype
-        x = x.flatten(2).float()
-        rsqrt = torch.rsqrt(x.square().mean(-1, keepdim=True) + self.norm_eps)
-        mixes = F.linear(x, hc_fn) * rsqrt
+        fused = os.environ.get(
+            "TORCHINFERNO_V4_FUSED_HC_PRE_GEMM",
+            "1",
+        ).strip().lower() not in {"0", "false", "no", "off"}
+        if x.is_cuda and x.size(1) == 1 and fused:
+            mixes, square_sum = fused_hc_prenorm_gemm(x, hc_fn)
+            rsqrt = torch.rsqrt(
+                square_sum / (self.hc_mult * shape[-1]) + self.norm_eps
+            )
+            mixes *= rsqrt
+            mix_input = x
+        else:
+            flat = x.flatten(2).float()
+            rsqrt = torch.rsqrt(
+                flat.square().mean(-1, keepdim=True) + self.norm_eps
+            )
+            mixes = F.linear(flat, hc_fn) * rsqrt
+            mix_input = flat.view(shape)
         pre, post, comb = hc_split_sinkhorn(mixes, hc_scale, hc_base, self.hc_mult, self.hc_sinkhorn_iters, self.hc_eps)
-        y = torch.sum(pre.unsqueeze(-1) * x.view(shape), dim=2)
+        y = torch.sum(pre.unsqueeze(-1) * mix_input, dim=2)
         return y.to(dtype), post, comb
 
     def hc_post(self, x: torch.Tensor, residual: torch.Tensor, post: torch.Tensor, comb: torch.Tensor):
         # x: [b,s,d], residual: [b,s,hc,d], post: [b,s,hc], comb: [b,s,hc,hc], y: [b,s,hc,d]
+        fused = os.environ.get(
+            "TORCHINFERNO_V4_FUSED_HC_POST",
+            "1",
+        ).strip().lower() not in {"0", "false", "no", "off"}
+        if x.is_cuda and x.size(1) == 1 and fused:
+            return fused_hc_post(x, residual, post, comb)
         y = post.unsqueeze(-1) * x.unsqueeze(-2) + torch.sum(comb.unsqueeze(-1) * residual.unsqueeze(-2), dim=2)
         return y.type_as(x)
 
@@ -1269,6 +1376,20 @@ class DeepSeekV4TensorParallelForCausalLM(nn.Module):
     def _sample_next_token(self, logits: torch.Tensor, temperature: float) -> torch.Tensor:
         from torchinferno.runtime.sampling import sample_next_token
 
+        if (
+            temperature <= 0
+            and logits.size(-1) == self.head.part_vocab_size
+            and world_size > 1
+        ):
+            local_values, local_indices = logits.max(dim=-1)
+            global_indices = local_indices + self.tensor_parallel_rank * self.head.part_vocab_size
+            candidate = torch.stack((local_values.float(), global_indices.float()), dim=-1)
+            candidates = [torch.empty_like(candidate) for _ in range(world_size)]
+            _all_gather(candidates, candidate)
+            candidates = torch.stack(candidates)
+            winner_rank = candidates[..., 0].argmax(dim=0)
+            batch_indices = torch.arange(logits.size(0), device=logits.device)
+            return candidates[winner_rank, batch_indices, 1].long()
         if logits.size(-1) == self.args.vocab_size:
             full_logits = logits
         elif logits.size(-1) == self.head.part_vocab_size and world_size > 1:

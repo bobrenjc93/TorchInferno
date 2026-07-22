@@ -175,6 +175,7 @@ from torchinferno.openai_server import (
     _prefers_exact_generation_cache,
     _prompt_list_tensor_payload,
     _queue_profile_sync_timings_enabled,
+    _release_row_owned_serving_caches,
     _runtime_ragged_decode_graph_capture_allowed_for_request,
     _replace_persistent_serving_cache,
     _runtime_prefill_graph_capture_enabled,
@@ -2551,6 +2552,93 @@ def test_tensor_parallel_worker_loop_rebuilds_incompatible_online_cache(monkeypa
     assert model.allocated_backends == ["dense"]
     assert started_caches == [engine._persistent_serving_cache]
     assert engine._persistent_serving_cache is not stale_cache
+
+
+def test_tensor_parallel_worker_online_start_reclaims_standard_row_owned_cache(
+    monkeypatch,
+) -> None:
+    import torch.distributed as dist
+
+    commands: list[dict[str, object]] = [
+        {
+            "op": "online_start",
+            "max_seq_len": 16,
+            "max_active_requests": 4,
+            "prefix_cache_capacity": 2,
+            "temperature": 0.0,
+            "max_tokens": 6,
+        },
+        {"op": "stop"},
+    ]
+    released: list[object] = []
+    started_caches: list[object | None] = []
+
+    class Cache:
+        max_seq_len = 16
+        batch_size = 6
+
+        def reset(self) -> None:
+            return None
+
+    class Model:
+        owns_cache_rows = True
+
+        def __init__(self) -> None:
+            self.available_rows = 0
+
+        def allocate_cache(self, *args: object, **kwargs: object) -> Cache:
+            del args, kwargs
+            if self.available_rows == 0:
+                raise RuntimeError("cache row capacity is exhausted")
+            self.available_rows -= 1
+            return Cache()
+
+        def release_cache(self, cache: object) -> None:
+            released.append(cache)
+            self.available_rows += 1
+
+    class RuntimeEngine:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            del args, kwargs
+
+        def start_online(self, *, max_seq_len: int, external_cache: object | None = None) -> None:
+            del max_seq_len
+            started_caches.append(external_cache)
+
+    def broadcast_object_list(payload: list[object], *, src: int) -> None:
+        del src
+        payload[0] = commands.pop(0)
+
+    monkeypatch.setattr(dist, "is_available", lambda: True)
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(dist, "broadcast_object_list", broadcast_object_list)
+    monkeypatch.setattr("torchinferno.openai_server._RuntimeContinuousBatchEngine", RuntimeEngine)
+    monkeypatch.setattr(
+        "torchinferno.openai_server._tensor_parallel_symm_mem_allreduce_scope",
+        lambda *args, **kwargs: nullcontext(),
+    )
+
+    model = Model()
+    standard_cache = Cache()
+    engine = _WorkerLoopRecordingEngine()
+    engine.model = model
+    engine.cache_backend = "dense"
+    engine.page_size = 16
+    engine._cache_pool = {"standard": standard_cache}
+    engine._microbatch_cache_pool = {"alias": standard_cache}
+    engine._persistent_serving_cache = None
+
+    _tensor_parallel_worker_loop(engine)
+
+    assert commands == []
+    assert released == [standard_cache]
+    assert model.available_rows == 0
+    assert len(started_caches) == 1
+    assert isinstance(started_caches[0], Cache)
+    assert started_caches[0] is not standard_cache
+    assert engine._persistent_serving_cache is started_caches[0]
+    assert engine._cache_pool == {}
+    assert engine._microbatch_cache_pool == {}
 
 
 def test_tensor_parallel_worker_loop_skips_sampled_short_online_step_barrier(monkeypatch) -> None:
@@ -10753,13 +10841,103 @@ def test_openai_serving_warmup_releases_model_owned_cache_rows() -> None:
         def release_cache(self, cache: object) -> None:
             released.append(cache)
 
-    engine = types.SimpleNamespace(model=Model(), _persistent_serving_cache=None)
     cache = object()
+    engine = types.SimpleNamespace(
+        model=Model(),
+        _persistent_serving_cache=cache,
+        _cache_pool={"primary": cache},
+        _microbatch_cache_pool={"microbatch": cache},
+    )
 
     _finish_serving_cache_warmup(engine, cache)
 
     assert released == [cache]
     assert engine._persistent_serving_cache is None
+    assert engine._cache_pool == {}
+    assert engine._microbatch_cache_pool == {}
+
+
+def test_openai_row_owned_cache_handoff_syncs_before_graph_release(monkeypatch) -> None:
+    events: list[tuple[str, object]] = []
+    cache = object()
+
+    class Model:
+        owns_cache_rows = True
+        device = torch.device("cuda")
+
+        def __init__(self) -> None:
+            self._decode_graphs = {
+                (id(cache), 1, 1, 0): types.SimpleNamespace(cache=cache)
+            }
+
+        def release_decode_graphs_for_cache(self, value: object) -> None:
+            events.append(("graphs", value))
+
+        def release_cache(self, value: object) -> None:
+            events.append(("cache", value))
+
+    monkeypatch.setattr(
+        torch.cuda,
+        "synchronize",
+        lambda device=None: events.append(("sync", torch.device(device))),
+    )
+    engine = types.SimpleNamespace(
+        model=Model(),
+        device=torch.device("cuda"),
+        _persistent_serving_cache=cache,
+        _cache_pool={"primary": cache},
+        _microbatch_cache_pool={"alias": cache},
+    )
+
+    _release_row_owned_serving_caches(engine, cache)
+
+    assert events == [
+        ("sync", torch.device("cuda")),
+        ("graphs", cache),
+        ("cache", cache),
+    ]
+
+
+def test_openai_standard_generation_releases_persistent_row_owned_cache() -> None:
+    released: list[object] = []
+
+    class Cache:
+        def reset(self) -> None:
+            return None
+
+    class Model:
+        owns_cache_rows = True
+
+        def __init__(self) -> None:
+            self.available_rows = 0
+
+        def allocate_cache(self, *args, **kwargs) -> Cache:
+            del args, kwargs
+            if self.available_rows == 0:
+                raise RuntimeError("cache row capacity is exhausted")
+            self.available_rows -= 1
+            return Cache()
+
+        def release_cache(self, cache: object) -> None:
+            released.append(cache)
+            self.available_rows += 1
+
+    model = Model()
+    old_cache = Cache()
+    engine = _cache_only_engine()
+    engine.model = model
+    engine._persistent_serving_cache = old_cache
+    engine._cache_pool["primary"] = old_cache
+    engine._microbatch_cache_pool["microbatch"] = old_cache
+
+    cache = engine._generation_cache(1, 16, model=model)
+
+    assert cache is not old_cache
+    assert released == [old_cache]
+    assert model.available_rows == 0
+    assert engine._persistent_serving_cache is None
+    assert engine._microbatch_cache_pool == {}
+    assert tuple(engine._cache_pool.values()) == (cache,)
 
 
 def test_openai_v4_startup_releases_pooled_rows_before_ephemeral_warmup(
@@ -11290,15 +11468,15 @@ def test_openai_online_collect_idle_arrivals_is_request_agnostic(monkeypatch) ->
         raising=False,
     )
 
-    assert not _online_collect_idle_arrivals_enabled(temperature=0.7, max_tokens=256)
-    assert not _online_collect_idle_arrivals_enabled(temperature=0.7, max_tokens=257)
-    assert not _online_collect_idle_arrivals_enabled(temperature=0.0, max_tokens=256)
+    assert _online_collect_idle_arrivals_enabled(temperature=0.7, max_tokens=256)
+    assert _online_collect_idle_arrivals_enabled(temperature=0.7, max_tokens=257)
+    assert _online_collect_idle_arrivals_enabled(temperature=0.0, max_tokens=256)
 
     monkeypatch.setenv(
         "TORCHINFERNO_OPENAI_TP_ONLINE_SAMPLED_SHORT_IDLE_BATCH_WAIT_MAX_TOKENS",
         "300",
     )
-    assert not _online_collect_idle_arrivals_enabled(temperature=0.7, max_tokens=300)
+    assert _online_collect_idle_arrivals_enabled(temperature=0.7, max_tokens=300)
 
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_COLLECT_IDLE_ARRIVALS", "0")
     assert not _online_collect_idle_arrivals_enabled(temperature=0.7, max_tokens=256)
@@ -17948,7 +18126,7 @@ def test_openai_tensor_parallel_online_batcher_profile_snapshots(
     assert final_record["drain_decode_quantum"] == 1
     assert final_record["initial_wait_ms"] == 0.0
     assert final_record["idle_batch_wait_ms"] == 5.0
-    assert final_record["collect_idle_arrivals"] is False
+    assert final_record["collect_idle_arrivals"] is True
     assert final_record["admit_min_free_rows"] == 2
     assert final_record["admit_min_ready_requests"] == 4
     assert final_record["admit_per_step_cap"] == 48

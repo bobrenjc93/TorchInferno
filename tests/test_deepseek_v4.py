@@ -10,6 +10,7 @@ import pytest
 import torch
 import torchinferno.models.deepseek_v4.tensor_parallel as v4_tp
 
+from torchinferno.kernels import deepseek_v4_tilelang as v4_kernels
 from torchinferno.models.auto import load_model_auto
 from torchinferno.models.checkpoint_io import CheckpointTensorLoader
 from torchinferno.models.deepseek_v32 import DeepSeekV32Config
@@ -53,6 +54,54 @@ def test_v4_tp_collectives_use_the_configured_replica_group(monkeypatch) -> None
         v4_tp.set_tensor_parallel_process_group(None)
 
     assert calls == [("reduce", group), ("gather", group)]
+
+
+def test_v4_tp_rmsnorm_keeps_checkpoint_precision_on_cpu() -> None:
+    norm = v4_tp.RMSNorm(16)
+    x = torch.randn(3, 16, dtype=torch.bfloat16)
+    weight = torch.randn(16, dtype=torch.bfloat16)
+    with torch.no_grad():
+        norm.weight.copy_(weight)
+
+    x_float = x.float()
+    expected = (
+        weight * x_float * torch.rsqrt(x_float.square().mean(-1, keepdim=True) + norm.eps)
+    ).to(x.dtype)
+
+    assert norm.weight.dtype == torch.bfloat16
+    torch.testing.assert_close(norm(x), expected, rtol=0, atol=0)
+
+
+def test_v4_tp_greedy_sampling_gathers_only_shard_candidates(monkeypatch) -> None:
+    monkeypatch.setattr(v4_tp, "world_size", 2)
+    monkeypatch.setattr(v4_tp, "rank", 0)
+    gathered_shapes = []
+
+    def all_gather(outputs, candidate):
+        gathered_shapes.append(tuple(candidate.shape))
+        outputs[0].copy_(candidate)
+        outputs[1].copy_(torch.tensor([[4.0, 4.0], [5.0, 3.0]]))
+
+    monkeypatch.setattr(v4_tp, "_all_gather", all_gather)
+    model = type(
+        "FakeV4Sampler",
+        (),
+        {
+            "args": type("Args", (), {"vocab_size": 6})(),
+            "head": type("Head", (), {"part_vocab_size": 3})(),
+            "tensor_parallel_rank": 0,
+        },
+    )()
+    logits = torch.tensor([[1.0, 3.0, 2.0], [5.0, 2.0, 1.0]])
+
+    token = v4_tp.DeepSeekV4TensorParallelForCausalLM._sample_next_token(
+        model,
+        logits,
+        0.0,
+    )
+
+    assert gathered_shapes == [(2, 2)]
+    assert token.tolist() == [4, 0]
 
 
 @pytest.mark.parametrize(
@@ -115,6 +164,65 @@ def test_v4_runtime_tilelang_loader_does_not_import_compiler_modules() -> None:
     )
 
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_v4_fused_decode_kernel_wrappers_dispatch_general_shapes(monkeypatch) -> None:
+    calls: list[tuple[str, tuple[object, ...]]] = []
+
+    def kernel(name: str, *specialization: object):
+        calls.append((name, specialization))
+
+        def run(*args: torch.Tensor) -> None:
+            if name == "q_norm_rope":
+                args[2].copy_(args[0])
+            elif name == "rope_inplace":
+                args[0].add_(1)
+            elif name == "hc_post":
+                value, residual, post, comb, output = args
+                expected = post[..., None] * value[:, None, :]
+                expected += torch.einsum("tsc,tsh->tch", comb, residual.float())
+                output.copy_(expected)
+            elif name == "hc_prenorm_gemm":
+                value, weight, output, square_sum = args
+                output.copy_(value.float() @ weight.T)
+                square_sum.copy_(value.float().square().sum(-1))
+
+        return run
+
+    monkeypatch.setattr(v4_kernels, "_kernel", kernel)
+    q = torch.randn(3, 2, 512, dtype=torch.bfloat16)
+    freqs = torch.randn(64)
+    q_output = torch.empty_like(q)
+    assert v4_kernels.q_norm_rope(q, freqs, 1e-6, output=q_output) is q_output
+    assert torch.equal(q_output, q)
+
+    rope_value = q.clone()
+    assert v4_kernels.rope_inplace(rope_value, freqs, inverse=True) is rope_value
+    torch.testing.assert_close(rope_value, q + 1)
+
+    value = torch.randn(3, 1024, dtype=torch.bfloat16)
+    residual = torch.randn(3, 4, 1024, dtype=torch.bfloat16)
+    post = torch.randn(3, 4)
+    comb = torch.randn(3, 4, 4)
+    post_output = v4_kernels.hc_post(value, residual, post, comb)
+    expected_post = post[..., None] * value[:, None, :]
+    expected_post += torch.einsum("tsc,tsh->tch", comb, residual.float())
+    torch.testing.assert_close(post_output, expected_post.to(torch.bfloat16))
+
+    hc_value = torch.randn(3, 4, 1024, dtype=torch.bfloat16)
+    weight = torch.randn(24, 4096)
+    projection, square_sum = v4_kernels.hc_prenorm_gemm(hc_value, weight)
+    torch.testing.assert_close(projection, hc_value.flatten(1).float() @ weight.T)
+    torch.testing.assert_close(
+        square_sum,
+        hc_value.flatten(1).float().square().sum(-1, keepdim=True),
+    )
+    assert calls == [
+        ("q_norm_rope", (2, 512, 64, 1e-6)),
+        ("rope_inplace", (2, 512, 64, True)),
+        ("hc_post", (4, 1024)),
+        ("hc_prenorm_gemm", (1024, 4, 24)),
+    ]
 
 
 def test_v4_marlin_alignment_keeps_nonlocal_routes_filtered(monkeypatch) -> None:

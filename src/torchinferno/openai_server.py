@@ -676,7 +676,7 @@ def _online_idle_batch_wait_ms(*, temperature: float, max_tokens: int) -> float:
 
 def _online_collect_idle_arrivals_enabled(*, temperature: float, max_tokens: int) -> bool:
     del temperature, max_tokens
-    return env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_COLLECT_IDLE_ARRIVALS", False)
+    return env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_COLLECT_IDLE_ARRIVALS", True)
 
 
 def _online_active_ready_wait_ms(*, temperature: float, max_tokens: int) -> float:
@@ -6004,9 +6004,18 @@ class OpenAICompletionEngine:
                         max_seq_len=max_seq_len,
                         total_rows=total_online_rows,
                     ):
-                        _replace_persistent_serving_cache(self, None)
+                        if bool(getattr(self.model, "owns_cache_rows", False)):
+                            _release_row_owned_serving_caches(self)
+                        else:
+                            _replace_persistent_serving_cache(self, None)
                         shared_cache = None
                     if shared_cache is None:
+                        if bool(getattr(self.model, "owns_cache_rows", False)):
+                            # A preceding standard generation can leave the
+                            # finite physical rows owned by its cache pool.
+                            # Online serving needs the whole row set and owns
+                            # its cache persistently across bursts.
+                            _release_row_owned_serving_caches(self)
                         try:
                             shared_cache = self._generation_cache(
                                 total_online_rows,
@@ -6290,8 +6299,6 @@ class OpenAICompletionEngine:
                 close_online = getattr(runtime_engine, "close_online", None)
                 if callable(close_online):
                     close_online()
-                if bool(getattr(self.model, "owns_cache_rows", False)):
-                    _replace_persistent_serving_cache(self, None)
             for request in deferred:
                 self._generation_queue.put(request)
 
@@ -8291,6 +8298,15 @@ class OpenAICompletionEngine:
         batch_capacity: int | None = None,
         cache_backend: str | None = None,
     ) -> object:
+        # Row-owning models preallocate a finite physical row set. An online
+        # session can retain all rows in its persistent cache, so transition
+        # ownership before a standard generate/completion path allocates from
+        # the same model pool. Workers execute this path symmetrically.
+        if (
+            bool(getattr(model, "owns_cache_rows", False))
+            and getattr(self, "_persistent_serving_cache", None) is not None
+        ):
+            _release_row_owned_serving_caches(self)
         backend = self.cache_backend if cache_backend is None else str(cache_backend)
         cache_batch_size = max(batch_size, int(batch_capacity)) if batch_capacity is not None else batch_size
         if _is_disaggregated_prefill_decode_model(model):
@@ -15731,9 +15747,14 @@ def _tensor_parallel_worker_loop(engine: OpenAICompletionEngine) -> None:
                         max_seq_len=max_seq_len,
                         total_rows=total_rows,
                     ):
-                        _replace_persistent_serving_cache(engine, None)
+                        if bool(getattr(worker_model, "owns_cache_rows", False)):
+                            _release_row_owned_serving_caches(engine)
+                        else:
+                            _replace_persistent_serving_cache(engine, None)
                         worker_shared_cache = None
                     if worker_shared_cache is None:
+                        if bool(getattr(worker_model, "owns_cache_rows", False)):
+                            _release_row_owned_serving_caches(engine)
                         try:
                             worker_shared_cache = _allocate_cache(
                                 worker_model, total_rows,
@@ -15872,8 +15893,6 @@ def _tensor_parallel_worker_loop(engine: OpenAICompletionEngine) -> None:
                     if callable(close_online):
                         close_online()
                     online_runtime_engine = None
-                if bool(getattr(getattr(engine, "model", None), "owns_cache_rows", False)):
-                    _replace_persistent_serving_cache(engine, None)
                 if online_symm_scope is not None:
                     online_symm_scope.__exit__(None, None, None)
                     online_symm_scope = None
@@ -16061,11 +16080,41 @@ def _engine_cache_is_pooled(engine: object, cache: object) -> bool:
     return False
 
 
+def _release_row_owned_serving_caches(engine: object, *extra_caches: object) -> None:
+    """Release every alias that can reserve rows in a model-owned cache."""
+
+    model = getattr(engine, "model", None)
+    released_cache_ids: set[int] = set()
+
+    def release(cache: object | None) -> None:
+        if cache is None or id(cache) in released_cache_ids:
+            return
+        _sync_before_decode_graph_release(
+            model,
+            cache,
+            device=getattr(engine, "device", None),
+            label="openai.row_owned_cache_handoff_graph_sync",
+        )
+        _release_owned_generation_cache_once(model, cache, released_cache_ids)
+
+    for name in ("_cache_pool", "_microbatch_cache_pool"):
+        pool = getattr(engine, name, None)
+        if not isinstance(pool, dict):
+            continue
+        for cache in tuple(pool.values()):
+            release(cache)
+        pool.clear()
+    persistent = getattr(engine, "_persistent_serving_cache", None)
+    setattr(engine, "_persistent_serving_cache", None)
+    release(persistent)
+    for cache in extra_caches:
+        release(cache)
+
+
 def _finish_serving_cache_warmup(engine: object, cache: object) -> None:
     model = getattr(engine, "model", None)
     if bool(getattr(model, "owns_cache_rows", False)):
-        _replace_persistent_serving_cache(engine, None)
-        _release_owned_generation_cache(model, cache)
+        _release_row_owned_serving_caches(engine, cache)
         return
     _replace_persistent_serving_cache(engine, cache)
 

@@ -60,12 +60,21 @@ def build_kernel(
             )
             with (temporary / "params.pkl").open("wb") as handle:
                 cloudpickle.dump(adapter.params, handle)
-            compiled_library = Path(adapter.libpath)
-            if not compiled_library.is_file():
-                raise RuntimeError(
-                    f"TileLang did not emit a loadable library for DeepSeek V4: {compiled_library}"
-                )
-            shutil.copy2(compiled_library, temporary / "kernel_lib.so")
+            artifact_library = temporary / "kernel_lib.so"
+            compiled_library_value = getattr(adapter, "libpath", None)
+            compiled_library = (
+                Path(compiled_library_value) if compiled_library_value else None
+            )
+            if compiled_library is not None and compiled_library.is_file():
+                shutil.copy2(compiled_library, artifact_library)
+            else:
+                executable = getattr(adapter, "executable", None)
+                export_library = getattr(executable, "export_library", None)
+                if not callable(export_library):
+                    raise RuntimeError(
+                        "TileLang did not expose a loadable DeepSeek V4 kernel library"
+                    )
+                export_library(str(artifact_library))
             metadata = {
                 "key": key,
                 "name": name,
