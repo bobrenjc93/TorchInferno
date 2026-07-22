@@ -107,7 +107,7 @@ class OpenAIServerConfig:
     cache_backend: str = "dense"
     page_size: int = 16
     max_batch_size: int = 128
-    batch_wait_ms: float = 2.0
+    batch_wait_ms: float = 10.0
     single_request_admission_wait_ms: float | None = None
     llama_parallelism: str = "auto"
     disaggregation_mode: str = "none"
@@ -131,6 +131,27 @@ def _startup_warmup_enabled_for_cache_backend(cache_backend: str) -> bool:
     if cache_backend.lower() == "dense":
         return True
     return env_flag("TORCHINFERNO_OPENAI_STARTUP_WARMUP_NON_DENSE_CACHE", True)
+
+
+def _bounded_startup_warmup_shapes(
+    prompt_token_counts: Sequence[int],
+    new_tokens: int,
+    max_model_len: int | None,
+) -> tuple[tuple[int, ...], int]:
+    """Keep startup generation shapes within the configured context capacity."""
+
+    counts = tuple(int(count) for count in prompt_token_counts if int(count) > 0)
+    if max_model_len is None:
+        return counts, int(new_tokens)
+    capacity = int(max_model_len)
+    if capacity < 2:
+        return (), 0
+    bounded_new_tokens = min(max(1, int(new_tokens)), capacity - 1)
+    max_prompt_tokens = capacity - bounded_new_tokens
+    bounded_counts = tuple(count for count in counts if count <= max_prompt_tokens)
+    if not bounded_counts:
+        bounded_counts = (max_prompt_tokens,)
+    return bounded_counts, bounded_new_tokens
 
 
 def _startup_warmup_log_should_emit(model: object) -> bool:
@@ -2357,7 +2378,8 @@ class _TransformersChatTokenizer:
 
     def encode_messages(self, messages: list[dict[str, object]]) -> list[int]:
         apply_chat_template = getattr(self.tokenizer, "apply_chat_template", None)
-        if apply_chat_template is not None:
+        chat_template = getattr(self.tokenizer, "chat_template", None)
+        if callable(apply_chat_template) and chat_template:
             encoded = apply_chat_template(
                 messages,
                 tokenize=True,
@@ -2697,12 +2719,45 @@ class OpenAICompletionEngine:
             self._worker.start()
 
     def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
+        with self._live_request_condition:
+            if self._closed:
+                return
+            self._closed = True
+            self._live_request_condition.notify_all()
+        with self._live_request_condition:
+            while self._live_requests > 0:
+                self._live_request_condition.wait()
         if self._worker is not None:
             self._generation_queue.put(None)
-            self._worker.join(timeout=10)
+            self._worker.join()
+        # Disaggregated cache release is a worker command. Drain every owned
+        # cache while the role workers are still alive, then stop them.
+        released_cache_ids: set[int] = set()
+        self._clear_cache_pool(
+            self._cache_pool,
+            model=self.model,
+            released_cache_ids=released_cache_ids,
+        )
+        self._clear_cache_pool(
+            self._microbatch_cache_pool,
+            model=self.model,
+            released_cache_ids=released_cache_ids,
+        )
+        self._close_persistent_prompt_list_step_state(
+            released_cache_ids=released_cache_ids,
+        )
+        self._handle_token_budget_close_payload(
+            {},
+            released_cache_ids=released_cache_ids,
+        )
+        persistent_cache = getattr(self, "_persistent_serving_cache", None)
+        self._persistent_serving_cache = None
+        _release_owned_generation_cache_once(
+            self.model,
+            persistent_cache,
+            released_cache_ids,
+        )
+        self._clear_prefix_cache()
         _broadcast_tensor_parallel_stop(self.model)
         shutdown_disaggregated = getattr(self.model, "shutdown_workers", None)
         if callable(shutdown_disaggregated):
@@ -3094,7 +3149,7 @@ class OpenAICompletionEngine:
                 delattr(cache, "_skip_capture_sync")
             except Exception:
                 pass
-            self._persistent_serving_cache = cache
+            _finish_serving_cache_warmup(self, cache)
 
     def _warmup_online_single_prefill_logits_graphs(
         self,
@@ -3543,7 +3598,7 @@ class OpenAICompletionEngine:
             delattr(cache, "_skip_capture_sync")
         except Exception:
             pass
-        self._persistent_serving_cache = cache
+        _finish_serving_cache_warmup(self, cache)
 
     def _warmup_token_bucket_fa3_prefill_graphs(
         self,
@@ -4998,6 +5053,9 @@ class OpenAICompletionEngine:
         temperature: float | None = None,
         max_tokens: int | None = None,
     ) -> int:
+        model = getattr(self, "model", None)
+        if not bool(getattr(model, "supports_prefix_cache", True)):
+            return 0
         prefix_rows = self._online_serving_prefix_rows(
             temperature=temperature,
             max_tokens=max_tokens,
@@ -5009,9 +5067,15 @@ class OpenAICompletionEngine:
             144,
             minimum=0,
         )
-        if total_budget <= 0:
-            return prefix_rows
-        return min(prefix_rows, max(0, total_budget - int(max_active)))
+        if total_budget > 0:
+            prefix_rows = min(prefix_rows, max(0, total_budget - int(max_active)))
+        cache_row_capacity = int(getattr(model, "cache_row_capacity", 0) or 0)
+        if cache_row_capacity > 0:
+            prefix_rows = min(
+                prefix_rows,
+                max(0, cache_row_capacity - int(max_active)),
+            )
+        return prefix_rows
 
     def _should_use_tensor_parallel_online_batcher(self, first: _QueuedGeneration) -> bool:
         explicit = "TORCHINFERNO_OPENAI_TP_ONLINE_CONTINUOUS_BATCHER" in os.environ
@@ -5940,7 +6004,7 @@ class OpenAICompletionEngine:
                         max_seq_len=max_seq_len,
                         total_rows=total_online_rows,
                     ):
-                        self._persistent_serving_cache = None
+                        _replace_persistent_serving_cache(self, None)
                         shared_cache = None
                     if shared_cache is None:
                         try:
@@ -5952,7 +6016,7 @@ class OpenAICompletionEngine:
                                 cache_backend=online_cache_backend,
                             )
                             _reset_generation_cache(shared_cache)
-                            self._persistent_serving_cache = shared_cache
+                            _replace_persistent_serving_cache(self, shared_cache)
                         except Exception:
                             shared_cache = None
                     elif shared_cache is not None:
@@ -6223,6 +6287,11 @@ class OpenAICompletionEngine:
                     self.device,
                     cuda_sync=close_cuda_sync,
                 )
+                close_online = getattr(runtime_engine, "close_online", None)
+                if callable(close_online):
+                    close_online()
+                if bool(getattr(self.model, "owns_cache_rows", False)):
+                    _replace_persistent_serving_cache(self, None)
             for request in deferred:
                 self._generation_queue.put(request)
 
@@ -6240,6 +6309,8 @@ class OpenAICompletionEngine:
 
     def _enter_live_request(self) -> None:
         with self._live_request_condition:
+            if self._closed:
+                raise RuntimeError("OpenAI completion engine is closed")
             if self._live_requests == 0 and self._completed_queue_batches > 0:
                 idle_s = time.perf_counter() - self._idle_since_s
                 min_idle_s = env_float("TORCHINFERNO_OPENAI_IDLE_CLEANUP_MIN_IDLE_MS", 250.0, minimum=0.0) / 1000.0
@@ -7499,16 +7570,20 @@ class OpenAICompletionEngine:
         return wait_ms / 1000.0
 
     def _queued_initial_batch_wait_s(self, first: _QueuedGeneration) -> float:
-        if not first.stream or self.max_batch_size <= 1:
+        del first
+        if self.max_batch_size <= 1:
             return 0.0
         if not (
-            _is_tensor_parallel_model(self.model)
+            (
+                _is_tensor_parallel_model(self.model)
+                or _is_disaggregated_prefill_decode_model(self.model)
+            )
             and self.device.type == "cuda"
         ):
             return 0.0
         wait_ms = env_float(
             "TORCHINFERNO_OPENAI_TP_INITIAL_BATCH_WAIT_MS",
-            1.0,
+            10.0,
             minimum=0.0,
         )
         return min(self.batch_wait_s, wait_ms / 1000.0)
@@ -8375,6 +8450,8 @@ class OpenAICompletionEngine:
         model: object,
     ) -> None:
         self._evict_cache_pool_key(pool, key, model=model)
+        if bool(getattr(model, "owns_cache_rows", False)) and pool is self._cache_pool:
+            self._clear_cache_pool(pool, model=model)
         if max_entries <= 0:
             self._clear_cache_pool(pool, model=model)
             return
@@ -8394,25 +8471,49 @@ class OpenAICompletionEngine:
             return
         existing = pool.pop(key, None)
         if existing is not None and existing is not cache:
-            _release_decode_graphs_for_cache(model, existing)
+            _release_owned_generation_cache(model, existing)
         pool[key] = cache
         while len(pool) > max_entries:
             self._evict_cache_pool_key(pool, _cache_pool_eviction_key(pool, model=model), model=model)
 
-    def _evict_cache_pool_key(self, pool: dict[object, object], key: object, *, model: object) -> None:
+    def _evict_cache_pool_key(
+        self,
+        pool: dict[object, object],
+        key: object,
+        *,
+        model: object,
+        released_cache_ids: set[int] | None = None,
+    ) -> None:
         cache = pool.pop(key, None)
         if cache is not None:
+            if getattr(self, "_persistent_serving_cache", None) is cache:
+                self._persistent_serving_cache = None
+            if released_cache_ids is not None and id(cache) in released_cache_ids:
+                return
             _sync_before_decode_graph_release(
                 model,
                 cache,
                 device=self.device,
                 label="openai.cache_pool.evict_graph_cache_sync",
             )
-            _release_decode_graphs_for_cache(model, cache)
+            _release_owned_generation_cache(model, cache)
+            if released_cache_ids is not None:
+                released_cache_ids.add(id(cache))
 
-    def _clear_cache_pool(self, pool: dict[object, object], *, model: object) -> None:
+    def _clear_cache_pool(
+        self,
+        pool: dict[object, object],
+        *,
+        model: object,
+        released_cache_ids: set[int] | None = None,
+    ) -> None:
         for key in list(pool):
-            self._evict_cache_pool_key(pool, key, model=model)
+            self._evict_cache_pool_key(
+                pool,
+                key,
+                model=model,
+                released_cache_ids=released_cache_ids,
+            )
 
     def _restore_prefix_cache(self, input_ids: Tensor, cache: object) -> int:
         if not env_flag("TORCHINFERNO_OPENAI_PREFIX_CACHE", True):
@@ -8781,6 +8882,13 @@ class OpenAICompletionEngine:
         prompt_tokens = env_int("TORCHINFERNO_OPENAI_WARMUP_PROMPT_TOKENS", 32, minimum=1)
         prompt_token_counts = _warmup_prompt_token_counts(prompt_tokens)
         new_tokens = env_int("TORCHINFERNO_OPENAI_WARMUP_NEW_TOKENS", 2, minimum=1)
+        prompt_token_counts, new_tokens = _bounded_startup_warmup_shapes(
+            prompt_token_counts,
+            new_tokens,
+            getattr(self, "max_model_len", None),
+        )
+        if not prompt_token_counts:
+            return
         vocab_size = max(1, int(getattr(getattr(self.model, "config", object()), "vocab_size", 1)))
         startup_started_s = time.perf_counter()
         _startup_warmup_log(
@@ -8812,7 +8920,9 @@ class OpenAICompletionEngine:
                             update_prefix_cache=False,
                         ):
                             pass
-                if _startup_graph_warmup_enabled():
+                if _startup_graph_warmup_enabled() and bool(
+                    getattr(self.model, "supports_runtime_graphs", True)
+                ):
                     with _startup_warmup_span(self.model, "startup graph warmup"):
                         self._warmup_tensor_parallel_prefill_graphs(prompt_token_counts, vocab_size)
                         self._warmup_tensor_parallel_prefix_suffix_graphs(vocab_size)
@@ -8830,6 +8940,9 @@ class OpenAICompletionEngine:
                                 ):
                                     self._warmup_tensor_parallel_ragged_decode_graphs(vocab_size)
                         self._warmup_tensor_parallel_batched_prefix_suffix_graphs(vocab_size)
+                if bool(getattr(self.model, "owns_cache_rows", False)):
+                    self._clear_cache_pool(self._cache_pool, model=self.model)
+                    self._clear_cache_pool(self._microbatch_cache_pool, model=self.model)
                 warmup_cache_tokens = max(
                     max(prompt_token_counts) + new_tokens,
                     env_int("TORCHINFERNO_OPENAI_WARMUP_CACHE_TOKENS", 256, minimum=1),
@@ -8838,8 +8951,16 @@ class OpenAICompletionEngine:
                     self.model,
                     f"generation-cache/decode-attention warmup cache_tokens={warmup_cache_tokens}",
                 ):
-                    self._generation_cache(1, warmup_cache_tokens, model=self.model, pool=False)
-                    _warmup_tensor_parallel_decode_attention(self.model)
+                    warmup_cache = self._generation_cache(
+                        1,
+                        warmup_cache_tokens,
+                        model=self.model,
+                        pool=False,
+                    )
+                    try:
+                        _warmup_tensor_parallel_decode_attention(self.model)
+                    finally:
+                        _release_owned_generation_cache(self.model, warmup_cache)
                 if (
                     _startup_online_common_prefix_prefill_warmup_enabled()
                     and not _startup_scheduler_warmup_enabled()
@@ -8847,6 +8968,7 @@ class OpenAICompletionEngine:
                         env_flag("TORCHINFERNO_OPENAI_UNIFIED_SCHEDULER", False)
                         or env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_CONTINUOUS_BATCHER", True)
                     )
+                    and bool(getattr(self.model, "supports_prefix_cache", True))
                     and hasattr(self.model, "allocate_cache")
                 ):
                     with _startup_warmup_span(self.model, "online common-prefix prefill cache warmup"):
@@ -9094,7 +9216,7 @@ class OpenAICompletionEngine:
                     device=self.device,
                     label="openai.warmup_ragged_decode.release_graphs",
                 )
-                _release_decode_graphs_for_cache(self.model, cache)
+                _release_owned_generation_cache(self.model, cache)
                 _reset_generation_cache(cache)
 
     def _warmup_disaggregated_decode_graphs(self, *, prompt_tokens: int) -> None:
@@ -9682,6 +9804,8 @@ class OpenAICompletionEngine:
 
     def _stream_microbatch_size(self, batch_size: int) -> int:
         if batch_size <= 1:
+            return batch_size
+        if bool(getattr(self.model, "owns_cache_rows", False)):
             return batch_size
         if "TORCHINFERNO_OPENAI_STREAM_MICROBATCH_SIZE" in os.environ:
             return min(batch_size, env_int("TORCHINFERNO_OPENAI_STREAM_MICROBATCH_SIZE", batch_size, minimum=1))
@@ -11314,14 +11438,22 @@ class OpenAICompletionEngine:
         self._persistent_prompt_list_step_last_result = None
         return state
 
-    def _close_persistent_prompt_list_step_state(self) -> None:
+    def _close_persistent_prompt_list_step_state(
+        self,
+        *,
+        released_cache_ids: set[int] | None = None,
+    ) -> None:
         state = self._persistent_prompt_list_step_state
-        if state is not None and state.ephemeral_graph_scope:
-            try:
-                setattr(state.cache, "_torchinferno_ephemeral_ragged_graph_scope", False)
-            except Exception:
-                pass
-            _release_decode_graphs_for_cache(self.model, state.cache)
+        if state is not None:
+            if state.ephemeral_graph_scope:
+                try:
+                    setattr(state.cache, "_torchinferno_ephemeral_ragged_graph_scope", False)
+                except Exception:
+                    pass
+            released = released_cache_ids if released_cache_ids is not None else set()
+            _release_owned_generation_cache_once(self.model, state.cache, released)
+            for prefix_cache in state.prefix_caches.values():
+                _release_owned_generation_cache_once(self.model, prefix_cache, released)
         self._persistent_prompt_list_step_state = None
         self._persistent_prompt_list_step_last_result = None
 
@@ -12430,8 +12562,20 @@ class OpenAICompletionEngine:
         self._token_budget_step_last_result = result.step_results[-1]
         return result
 
-    def _handle_token_budget_close_payload(self, payload: Mapping[str, object]) -> None:
+    def _handle_token_budget_close_payload(
+        self,
+        payload: Mapping[str, object],
+        *,
+        released_cache_ids: set[int] | None = None,
+    ) -> None:
         del payload
+        state = self._token_budget_step_state
+        if state is not None:
+            released = released_cache_ids if released_cache_ids is not None else set()
+            if bool(getattr(state.cache, "_torchinferno_ephemeral_cache", False)):
+                _release_owned_generation_cache_once(self.model, state.cache, released)
+            for prefix_cache in state.prefix_caches.values():
+                _release_owned_generation_cache_once(self.model, prefix_cache, released)
         self._token_budget_step_state = None
         self._token_budget_step_last_result = None
 
@@ -13419,7 +13563,10 @@ def _resolve_dtype(dtype: str) -> torch.dtype | None:
 
 
 def _is_tensor_parallel_model(model: object) -> bool:
-    return isinstance(model, Llama3TensorParallelForCausalLM)
+    return isinstance(model, Llama3TensorParallelForCausalLM) or bool(
+        getattr(model, "is_tensor_parallel", False)
+        and hasattr(model, "tensor_parallel_size")
+    )
 
 
 def _is_disaggregated_prefill_decode_model(model: object) -> bool:
@@ -13440,9 +13587,13 @@ def _tensor_parallel_world_size(model: object) -> int:
 def _prepare_tensor_parallel_nccl_runtime_env(config: OpenAIServerConfig) -> None:
     if int(getattr(config, "tensor_parallel_size", 1)) <= 1:
         return
-    if _infer_model_kind(config) != "llama3":
+    model_kind = _infer_model_kind(config)
+    if model_kind not in {"llama3", "deepseek-v4"}:
         return
-    if str(getattr(config, "llama_parallelism", "auto")).lower() == "pipeline":
+    if (
+        model_kind == "llama3"
+        and str(getattr(config, "llama_parallelism", "auto")).lower() == "pipeline"
+    ):
         return
     if (
         env_flag("TORCHINFERNO_OPENAI_TP_NCCL_CUMEM_DISABLE", True)
@@ -13756,6 +13907,9 @@ def _fi_decode_graph_mode() -> str:
 
 def _effective_openai_max_batch_size(model: object, device: torch.device, requested: int) -> int:
     max_batch_size = max(1, requested)
+    cache_row_capacity = int(getattr(model, "cache_row_capacity", 0) or 0)
+    if cache_row_capacity > 0:
+        max_batch_size = min(max_batch_size, cache_row_capacity)
     if _is_disaggregated_prefill_decode_model(model) and device.type == "cuda":
         disaggregated_default = env_int(
             "TORCHINFERNO_OPENAI_DISAGG_MAX_BATCH_SIZE",
@@ -13868,6 +14022,8 @@ def _packed_flashinfer_prefill_profile_fields(
 
 
 def _prefix_cache_enabled_for_model(model: object) -> bool:
+    if not bool(getattr(model, "supports_prefix_cache", True)):
+        return False
     if _is_disaggregated_prefill_decode_model(model):
         return False
     if _is_tensor_parallel_model(model) and _tensor_parallel_world_size(model) > 1:
@@ -13876,6 +14032,8 @@ def _prefix_cache_enabled_for_model(model: object) -> bool:
 
 
 def _shared_prefix_batch_enabled_for_model(model: object) -> bool:
+    if not bool(getattr(model, "supports_prefix_cache", True)):
+        return False
     if _is_disaggregated_prefill_decode_model(model):
         return False
     if _is_tensor_parallel_model(model) and _tensor_parallel_world_size(model) > 1:
@@ -13946,6 +14104,8 @@ def _identical_prompt_prefill_graph_capture_enabled(
 
 
 def _openai_cuda_graph_enabled_for_model(model: object) -> bool:
+    if not bool(getattr(model, "supports_runtime_graphs", True)):
+        return False
     if _is_tensor_parallel_model(model) and _tensor_parallel_world_size(model) > 1:
         return env_flag("TORCHINFERNO_OPENAI_TP_CUDAGRAPH", True)
     return True
@@ -15571,7 +15731,7 @@ def _tensor_parallel_worker_loop(engine: OpenAICompletionEngine) -> None:
                         max_seq_len=max_seq_len,
                         total_rows=total_rows,
                     ):
-                        engine._persistent_serving_cache = None
+                        _replace_persistent_serving_cache(engine, None)
                         worker_shared_cache = None
                     if worker_shared_cache is None:
                         try:
@@ -15583,7 +15743,7 @@ def _tensor_parallel_worker_loop(engine: OpenAICompletionEngine) -> None:
                                 page_size=int(getattr(engine, "page_size", 16)),
                             )
                             _reset_generation_cache(worker_shared_cache)
-                            engine._persistent_serving_cache = worker_shared_cache
+                            _replace_persistent_serving_cache(engine, worker_shared_cache)
                         except Exception:
                             worker_shared_cache = None
                     elif worker_shared_cache is not None:
@@ -15700,14 +15860,20 @@ def _tensor_parallel_worker_loop(engine: OpenAICompletionEngine) -> None:
                 # rebuild a FRESH (empty-cache) engine each session while the primary
                 # kept its populated one -> divergent share decisions -> collective
                 # deadlock (the high-conc COW hang). The symm scope is still per-session.
-                if (
+                drop_online_runtime = (
                     not env_flag("TORCHINFERNO_PAGED_PREFIX_CACHE", False)
                     or (
                         online_runtime_engine is not None
                         and not hasattr(online_runtime_engine, "max_seq")
                     )
-                ):
+                )
+                if drop_online_runtime:
+                    close_online = getattr(online_runtime_engine, "close_online", None)
+                    if callable(close_online):
+                        close_online()
                     online_runtime_engine = None
+                if bool(getattr(getattr(engine, "model", None), "owns_cache_rows", False)):
+                    _replace_persistent_serving_cache(engine, None)
                 if online_symm_scope is not None:
                     online_symm_scope.__exit__(None, None, None)
                     online_symm_scope = None
@@ -15828,32 +15994,80 @@ def _generation_cache_batch_capacity(model: object, requested_batch: int) -> int
 
 
 def _generation_cache_shape_limits(cache: object) -> tuple[int | None, int | None]:
-    layers = getattr(cache, "layers", ()) or ()
-    try:
-        layer = layers[0]
-    except (IndexError, TypeError):
-        return None, None
+    max_seq_len_value = getattr(cache, "max_seq_len", None)
+    rows_value = getattr(cache, "batch_size", None)
+    selected_rows = getattr(cache, "selected_rows", None)
+    if selected_rows is not None:
+        try:
+            rows_value = len(selected_rows)
+        except TypeError:
+            pass
 
-    max_seq_len_value = getattr(layer, "max_seq_len", None)
     try:
         max_seq_len = None if max_seq_len_value is None else int(max_seq_len_value)
     except (TypeError, ValueError):
         max_seq_len = None
-
-    rows_value = getattr(layer, "batch_size", None)
-    if rows_value is None:
-        keys = getattr(layer, "keys", None)
-        size = getattr(keys, "size", None)
-        if callable(size):
-            try:
-                rows_value = size(0)
-            except Exception:
-                rows_value = None
     try:
         rows = None if rows_value is None else int(rows_value)
     except (TypeError, ValueError):
         rows = None
+
+    layers = getattr(cache, "layers", ()) or ()
+    try:
+        layer = layers[0]
+    except (IndexError, TypeError):
+        return max_seq_len, rows
+
+    if max_seq_len is None:
+        max_seq_len_value = getattr(layer, "max_seq_len", None)
+        try:
+            max_seq_len = None if max_seq_len_value is None else int(max_seq_len_value)
+        except (TypeError, ValueError):
+            max_seq_len = None
+
+    if rows is None:
+        rows_value = getattr(layer, "batch_size", None)
+        keys = getattr(layer, "keys", None)
+        if rows_value is None:
+            size = getattr(keys, "size", None)
+        else:
+            size = None
+        if callable(size) and rows_value is None:
+            try:
+                rows_value = size(0)
+            except Exception:
+                rows_value = None
+        try:
+            rows = None if rows_value is None else int(rows_value)
+        except (TypeError, ValueError):
+            rows = None
     return max_seq_len, rows
+
+
+def _replace_persistent_serving_cache(engine: object, cache: object | None) -> None:
+    previous = getattr(engine, "_persistent_serving_cache", None)
+    if previous is cache:
+        return
+    if previous is not None and not _engine_cache_is_pooled(engine, previous):
+        _release_owned_generation_cache(getattr(engine, "model", None), previous)
+    setattr(engine, "_persistent_serving_cache", cache)
+
+
+def _engine_cache_is_pooled(engine: object, cache: object) -> bool:
+    for name in ("_cache_pool", "_microbatch_cache_pool"):
+        pool = getattr(engine, name, None)
+        if isinstance(pool, dict) and any(candidate is cache for candidate in pool.values()):
+            return True
+    return False
+
+
+def _finish_serving_cache_warmup(engine: object, cache: object) -> None:
+    model = getattr(engine, "model", None)
+    if bool(getattr(model, "owns_cache_rows", False)):
+        _replace_persistent_serving_cache(engine, None)
+        _release_owned_generation_cache(model, cache)
+        return
+    _replace_persistent_serving_cache(engine, cache)
 
 
 def _ragged_prefill_graph_cache_live_shape_counts(
@@ -18108,6 +18322,24 @@ def _release_decode_graphs_for_cache(model: object, cache: object) -> None:
         release(cache)
 
 
+def _release_owned_generation_cache(model: object, cache: object) -> None:
+    _release_decode_graphs_for_cache(model, cache)
+    release = getattr(model, "release_cache", None)
+    if callable(release):
+        release(cache)
+
+
+def _release_owned_generation_cache_once(
+    model: object,
+    cache: object | None,
+    released_cache_ids: set[int],
+) -> None:
+    if cache is None or id(cache) in released_cache_ids:
+        return
+    released_cache_ids.add(id(cache))
+    _release_owned_generation_cache(model, cache)
+
+
 def _sync_before_decode_graph_release(
     model: object,
     cache: object,
@@ -18388,7 +18620,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model", required=True, help="Model id or local checkpoint path.")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)
-    parser.add_argument("--model-kind", default="auto", help="auto, llama3, deepseek, dsv4, or tiny-* for smoke tests.")
+    parser.add_argument(
+        "--model-kind",
+        default="auto",
+        help="auto, llama3, deepseek-v4, deepseek, dsv4, or tiny-* for smoke tests.",
+    )
     parser.add_argument("--tokenizer", default=None, help="Tokenizer id/path. Use 'byte' for smoke tests.")
     parser.add_argument("--tensor-parallel-size", type=int, default=1)
     parser.add_argument("--devices", default=None, help="Comma-separated device list. Defaults to cuda:0..tp-1.")
@@ -18414,7 +18650,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=env_int("TORCHINFERNO_OPENAI_PAGE_SIZE", 16, minimum=1),
     )
     parser.add_argument("--max-batch-size", type=int, default=128)
-    parser.add_argument("--batch-wait-ms", type=float, default=2.0)
+    parser.add_argument("--batch-wait-ms", type=float, default=10.0)
     parser.add_argument(
         "--single-request-admission-wait-ms",
         type=float,

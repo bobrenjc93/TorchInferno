@@ -69,6 +69,11 @@ def build_audit_report() -> TorchInfernoAudit:
                 "Native config/model/cache/checkpoint path mirrors production tensor contracts.",
             ),
             FeatureAudit(
+                "DeepSeek-V4 model family",
+                "integrated",
+                "Native reference, public FP8/MXFP4 checkpoint audit, prepared CUDA kernels, TP serving, and heterogeneous KV cache are integrated.",
+            ),
+            FeatureAudit(
                 "Llama3 model family",
                 "reference",
                 "Torch-native config plus make_fx v0 and fused v1 variants cover tiny/full planning and logit validation.",
@@ -150,7 +155,7 @@ def build_audit_report() -> TorchInfernoAudit:
             FeatureAudit(
                 "disaggregated prefill/decode",
                 "bridge",
-                "Llama OpenAI serving can split one CUDA launch into TP prefill/decode roles with live NCCL KV handoff; cross-request overlap and DeepSeek support remain open.",
+                "Llama and DeepSeek-V4 OpenAI serving split TP prefill/decode roles with live NCCL KV handoff; cross-node transport and cross-request role overlap remain open.",
             ),
             FeatureAudit("NVFP4 graph passes", "reference", "NVFP4 tensor contract and pass hook exist; production fused kernel remains open."),
             FeatureAudit("research harness", "minimal", "Named experiments and metric comparison are available."),

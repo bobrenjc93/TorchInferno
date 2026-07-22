@@ -47,9 +47,10 @@ from torchinferno.variant_validation import run_variant_logit_validation
 def test_model_family_catalog_uses_canonical_packages() -> None:
     families = {family.name: family for family in list_model_families()}
 
-    assert set(families) == {"dsv4", "deepseek-v3.2", "llama3"}
+    assert set(families) == {"dsv4", "deepseek-v3.2", "deepseek-v4", "llama3"}
     assert families["dsv4"].package == "torchinferno.models.dsv4"
     assert families["deepseek-v3.2"].package == "torchinferno.models.deepseek_v32"
+    assert families["deepseek-v4"].package == "torchinferno.models.deepseek_v4"
     assert families["llama3"].package == "torchinferno.models.llama3"
     assert families["llama3"].model_module == "torchinferno.models.llama3.model"
     assert get_model_family("deepseek_v32").name == "deepseek-v3.2"
@@ -131,7 +132,16 @@ def test_model_variant_registry_tracks_families_and_ops_modules() -> None:
     specs = list_model_variants()
     ids = {spec.id for spec in specs}
 
-    assert {"dsv4:v0", "dsv4:v1", "deepseek-v3.2:v0", "deepseek-v3.2:v1", "llama3:v0", "llama3:v1"} <= ids
+    assert {
+        "dsv4:v0",
+        "dsv4:v1",
+        "deepseek-v3.2:v0",
+        "deepseek-v3.2:v1",
+        "deepseek-v4:v0",
+        "deepseek-v4:tp-v0",
+        "llama3:v0",
+        "llama3:v1",
+    } <= ids
     assert [spec.variant for spec in model_variant_lineage("llama3", "v1")] == ["v0", "v1"]
     assert [spec.variant for spec in model_variant_lineage("dsv3.2", "v1")] == ["v0", "v1"]
     assert get_model_variant("dsv4", "v1").parents == ("v0",)

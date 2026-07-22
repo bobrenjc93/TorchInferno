@@ -8,6 +8,10 @@ import torch
 import torchinferno.models.deepseek_v32.model as deepseek_mod
 import torchinferno.runtime.serving as serving_mod
 from torchinferno.models.deepseek_v32 import DeepSeekV32ForCausalLM, tiny_deepseek_v32_config
+from torchinferno.models.deepseek_v4 import (
+    DeepSeekV4ForCausalLM,
+    tiny_deepseek_v4_config,
+)
 from torchinferno.runtime.serving import (
     ContinuousBatchEngine,
     ServingRequest,
@@ -500,6 +504,51 @@ class _RaggedGraphToyModel(torch.nn.Module):
         logits = torch.zeros((next_ids.numel(), 1, self.vocab_size), device=next_ids.device)
         logits[torch.arange(next_ids.numel(), device=next_ids.device), 0, next_ids] = 1.0
         return logits
+
+
+class _OwnedCacheRaggedGraphToyModel(_RaggedGraphToyModel):
+    def __init__(self) -> None:
+        super().__init__()
+        self.released_caches: list[_ToyCache] = []
+
+    def release_cache(self, cache: _ToyCache) -> None:
+        self.released_caches.append(cache)
+
+
+def test_continuous_batch_engine_releases_owned_cache_between_online_sessions() -> None:
+    model = _OwnedCacheRaggedGraphToyModel()
+    engine = ContinuousBatchEngine(
+        model,
+        device=torch.device("cpu"),
+        max_active_requests=2,
+        prefix_cache_capacity=0,
+    )
+
+    engine.start_online(max_seq_len=16)
+    first_cache = engine._cache
+    engine.start_online(max_seq_len=16)
+
+    assert model.released_caches == [first_cache]
+    second_cache = engine._cache
+    engine.close_online()
+    assert model.released_caches == [first_cache, second_cache]
+    assert engine._cache is None
+
+
+def test_continuous_batch_engine_does_not_release_external_online_cache() -> None:
+    model = _OwnedCacheRaggedGraphToyModel()
+    engine = ContinuousBatchEngine(
+        model,
+        device=torch.device("cpu"),
+        max_active_requests=2,
+        prefix_cache_capacity=0,
+    )
+    external_cache = _ToyCache(2, 16)
+
+    engine.start_online(max_seq_len=16, external_cache=external_cache)
+    engine.close_online()
+
+    assert model.released_caches == []
 
 
 class _CaptureReportingRaggedGraphToyModel(_RaggedGraphToyModel):
@@ -1195,6 +1244,25 @@ class _ShardedForwardToyWrapper(_DeviceResidentToyWrapper):
         return self.model._sample_next_token(logits, temperature)
 
 
+class _LastLogitsForwardToyWrapper(_DeviceResidentToyWrapper):
+    world_size = 8
+
+    def __init__(self, model: _RaggedGraphToyModel) -> None:
+        super().__init__(model)
+        self.return_last_logits_only_values: list[bool] = []
+
+    def forward(
+        self,
+        input_ids,
+        *,
+        cache,
+        use_cache=False,
+        return_last_logits_only=False,
+    ):
+        self.return_last_logits_only_values.append(bool(return_last_logits_only))
+        return self.model(input_ids, cache=cache, use_cache=use_cache)
+
+
 def test_native_deepseek_paged_cache_matches_dense_cache_decode() -> None:
     torch.manual_seed(50)
     config = tiny_deepseek_v32_config(vocab_size=64, max_position_embeddings=16)
@@ -1349,6 +1417,69 @@ def test_continuous_batch_engine_runs_requests_with_prefix_hits() -> None:
     assert engine.stats.max_model_batch_size == 2
     assert engine.stats.decode_model_calls < 3
     assert engine.stats.persistent_cache_rows == 4
+
+
+def test_deepseek_v4_continuous_mixed_prefill_matches_exact_length_groups() -> None:
+    torch.manual_seed(521)
+    model = DeepSeekV4ForCausalLM(
+        tiny_deepseek_v4_config(vocab_size=32, max_position_embeddings=16)
+    ).eval()
+    requests = [
+        ServingRequest("short", (1, 2, 3), 2, arrival_step=0),
+        ServingRequest("long", (7, 8, 9, 10, 11), 2, arrival_step=0),
+    ]
+    batched = ContinuousBatchEngine(
+        model,
+        device=torch.device("cpu"),
+        max_active_requests=2,
+        prefix_cache_capacity=2,
+    )
+    baseline = ContinuousBatchEngine(
+        model,
+        device=torch.device("cpu"),
+        max_active_requests=1,
+        prefix_cache_capacity=0,
+    )
+
+    batched_results = batched.run(requests)
+    baseline_results = [
+        baseline.run(
+            [ServingRequest(request.request_id, request.prompt, 2, arrival_step=0)]
+        )[0]
+        for request in requests
+    ]
+
+    assert [result.tokens for result in batched_results] == [
+        result.tokens for result in baseline_results
+    ]
+    assert batched.prefix_cache_capacity == 0
+    assert not batched._can_padded_batch_prefill(
+        [(index, request, 0) for index, request in enumerate(requests)]
+    )
+
+
+def test_deepseek_v4_continuous_disables_unsafe_prefix_reuse() -> None:
+    torch.manual_seed(522)
+    model = DeepSeekV4ForCausalLM(
+        tiny_deepseek_v4_config(vocab_size=32, max_position_embeddings=16)
+    ).eval()
+    requests = [
+        ServingRequest("warm", (1, 2, 3, 4), 1, arrival_step=0),
+        ServingRequest("exact", (1, 2, 3, 4), 1, arrival_step=1),
+        ServingRequest("partial", (1, 2, 3, 5), 1, arrival_step=2),
+    ]
+    engine = ContinuousBatchEngine(
+        model,
+        device=torch.device("cpu"),
+        max_active_requests=1,
+        prefix_cache_capacity=3,
+    )
+
+    results = engine.run(requests)
+
+    assert [result.prefix_hit_tokens for result in results] == [0, 0, 0]
+    assert engine.prefix_cache_capacity == 0
+    assert engine.reusable_prefixes == {}
 
 
 def test_continuous_batch_engine_prefix_reuse_matches_full_prefill() -> None:
@@ -7926,6 +8057,21 @@ def test_continuous_batch_engine_requests_sharded_logits_for_tp_sampler() -> Non
 
     assert len(results[0].tokens) == 4
     assert wrapper.return_sharded_logits_values == [True, True]
+    assert wrapper.return_last_logits_only_values == [True, True]
+
+
+def test_continuous_batch_engine_requests_last_logits_without_sharded_sampler() -> None:
+    wrapper = _LastLogitsForwardToyWrapper(_RaggedGraphToyModel())
+    engine = ContinuousBatchEngine(
+        wrapper,
+        device=torch.device("cpu"),
+        max_active_requests=1,
+        prefix_cache_capacity=0,
+    )
+
+    results = engine.run([ServingRequest("req", (1, 2), 2, arrival_step=0)])
+
+    assert len(results[0].tokens) == 4
     assert wrapper.return_last_logits_only_values == [True, True]
 
 

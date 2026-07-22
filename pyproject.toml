@@ -16,11 +16,21 @@ flashinfer = ["flashinfer-python>=0.6.8,<0.7"]
 helion = ["helion"]
 h100 = ["torch==2.11.0", "torchvision==0.26.0", "sglang-kernel==0.4.4"]
 kernels = ["triton"]
+deepseek-v4 = [
+  "tilelang==0.1.11",
+  "apache-tvm-ffi==0.1.11",
+  "torch-c-dlpack-ext==0.1.5",
+  "sglang==0.5.15",
+  "sglang-kernel==0.4.4",
+]
 serve = ["tokenizers", "transformers"]
 text = ["tokenizers", "transformers"]
 
 [project.scripts]
 torchinferno = "torchinferno.cli:main"
+
+[tool.setuptools]
+license-files = ["THIRD_PARTY_NOTICES.md", "licenses/*.txt"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

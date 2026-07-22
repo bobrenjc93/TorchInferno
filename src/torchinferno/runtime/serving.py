@@ -939,6 +939,11 @@ class ContinuousBatchEngine:
             None if max_generation_tokens is None else max(0, int(max_generation_tokens))
         )
         self.max_active_requests = max_active_requests
+        if not bool(getattr(model, "supports_prefix_cache", True)):
+            prefix_cache_capacity = 0
+            store_reusable_prefixes = False
+            store_full_prompt_prefixes = False
+            pin_shared_prefix = False
         self.prefix_cache_capacity = max_active_requests if prefix_cache_capacity is None else prefix_cache_capacity
         self.prefill_token_budget = prefill_token_budget
         # Chunked prefill: when set, an admitted request prefills its suffix in
@@ -1107,6 +1112,7 @@ class ContinuousBatchEngine:
         self._pinned_prefix_routes: set[Hashable] = set()
         self.stats = ServingStats()
         self._cache: object | None = None
+        self._cache_owned_by_engine = False
         self._cache_views: dict[tuple[int, ...], object] = {}
         self._reported_static_graph_miss = False
         self._packed_prefill_fixed_capacity_counts: dict[
@@ -1304,6 +1310,14 @@ class ContinuousBatchEngine:
         self._online_step = 0
         self._last_admit_step = None
         self._online_next_index = 0
+
+    def close_online(self) -> None:
+        """Drop online state and release cache storage allocated by this engine."""
+        self._online_waiting = None
+        self._online_active = []
+        self._online_prefilling = []
+        self._pending_online_finish_states = []
+        self._discard_cache_reference()
 
     def submit_online(self, request: ServingRequest) -> None:
         waiting = self._require_online_waiting()
@@ -3006,6 +3020,7 @@ class ContinuousBatchEngine:
         queued_requests: int,
         external_cache: object | None = None,
     ) -> None:
+        self._discard_cache_reference()
         self.stats = ServingStats()
         self.prefix_cache = PrefixCacheIndex()
         self.reusable_prefixes = {}
@@ -3027,9 +3042,11 @@ class ContinuousBatchEngine:
         total_rows = self.max_active_requests + self.prefix_cache_capacity
         if external_cache is not None:
             self._cache = external_cache
+            self._cache_owned_by_engine = False
             _enable_runtime_cache_capture_sync(self._cache)
         else:
             self._cache = self._allocate_cache(max(1, total_rows), max_seq_len)
+            self._cache_owned_by_engine = True
         if not hasattr(self._cache, "for_rows"):
             raise ValueError("model cache must support row views for persistent serving")
         self._row_seq_lens = [0 for _ in range(total_rows)]
@@ -3052,6 +3069,21 @@ class ContinuousBatchEngine:
         self._pending_prefill_graph_events = []
         self._pending_packed_prefill_eager_events = []
         self._pending_decode_ragged_model_events = []
+
+    def _discard_cache_reference(self) -> None:
+        cache = self._cache
+        owned = self._cache_owned_by_engine
+        self._cache = None
+        self._cache_owned_by_engine = False
+        self._cache_views = {}
+        if cache is None or not owned:
+            return
+        release_graphs = getattr(self.model, "release_decode_graphs_for_cache", None)
+        if callable(release_graphs):
+            release_graphs(cache)
+        release_cache = getattr(self.model, "release_cache", None)
+        if callable(release_cache):
+            release_cache(cache)
 
     def _admit_ready_requests(
         self,
@@ -6457,6 +6489,8 @@ class ContinuousBatchEngine:
         # workload has no shared prefix but similar suffix lengths.
         if not env_flag("TORCHINFERNO_CONTINUOUS_PADDED_BATCH_PREFILL", True):
             return False
+        if not bool(getattr(self.model, "supports_padded_batch_prefill", True)):
+            return False
         if not callable(getattr(self.model, "forward", None)):
             return False
         lengths = [len(request.prompt) for _, request, _ in group]
@@ -9411,17 +9445,17 @@ class ContinuousBatchEngine:
     def _forward_model(self, input_ids: Tensor, *, cache: object, use_cache: bool) -> tuple[Tensor, object | None]:
         forward = self.model if callable(self.model) else getattr(self.model, "forward", None)
         if callable(forward):
+            kwargs: dict[str, object] = {
+                "cache": cache,
+                "use_cache": use_cache,
+                "return_last_logits_only": True,
+            }
             if self._prefer_sharded_logits():
-                try:
-                    return forward(
-                        input_ids,
-                        cache=cache,
-                        use_cache=use_cache,
-                        return_last_logits_only=True,
-                        return_sharded_logits=True,
-                    )
-                except TypeError:
-                    pass
+                kwargs["return_sharded_logits"] = True
+            try:
+                return forward(input_ids, **kwargs)
+            except TypeError:
+                pass
             return forward(input_ids, cache=cache, use_cache=use_cache)
         raise TypeError("serving model must be callable or expose forward()")
 

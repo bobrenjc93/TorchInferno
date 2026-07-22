@@ -79,6 +79,7 @@ from torchinferno.openai_server import (
     _broadcast_tensor_parallel_online_start,
     _broadcast_tensor_parallel_online_step,
     _broadcast_tensor_parallel_online_submit_prompt_lists,
+    _bounded_startup_warmup_shapes,
     _cache_row_slice,
     _clear_model_graph_caches,
     _clear_model_prefill_graph_caches,
@@ -92,8 +93,10 @@ from torchinferno.openai_server import (
     _emit_stream_token,
     _flashinfer_prefill_runtime_enabled,
     _flashinfer_prefill_warmup_batch_sizes,
+    _finish_serving_cache_warmup,
     _generation_cache_batch_capacity,
     _generation_cache_fits_shape,
+    _generation_cache_shape_limits,
     _identical_prompt_cache_pool_enabled,
     _identical_prompt_prefill_graph_capture_enabled,
     _mark_generation_cache_prefix,
@@ -173,6 +176,7 @@ from torchinferno.openai_server import (
     _prompt_list_tensor_payload,
     _queue_profile_sync_timings_enabled,
     _runtime_ragged_decode_graph_capture_allowed_for_request,
+    _replace_persistent_serving_cache,
     _runtime_prefill_graph_capture_enabled,
     _runtime_eos_token_id,
     _repeat_generation_cache_first_batch,
@@ -264,6 +268,20 @@ def test_openai_startup_warmup_skips_non_dense_cache_by_default(
     monkeypatch.delenv("TORCHINFERNO_OPENAI_STARTUP_WARMUP_NON_DENSE_CACHE", raising=False)
 
     assert _startup_warmup_enabled_for_cache_backend("dense")
+
+
+def test_openai_cuda_graph_capability_disables_unsupported_model(monkeypatch) -> None:
+    model = types.SimpleNamespace(supports_runtime_graphs=False)
+    monkeypatch.setattr(
+        "torchinferno.openai_server._is_tensor_parallel_model",
+        lambda candidate: candidate is model,
+    )
+    monkeypatch.setattr(
+        "torchinferno.openai_server._tensor_parallel_world_size",
+        lambda candidate: 8,
+    )
+
+    assert not _openai_cuda_graph_enabled_for_model(model)
     assert _startup_warmup_enabled_for_cache_backend("paged")
 
     monkeypatch.setenv("TORCHINFERNO_OPENAI_STARTUP_WARMUP_NON_DENSE_CACHE", "0")
@@ -845,6 +863,25 @@ def test_openai_server_auto_launches_two_tensor_parallel_disaggregated_roles(mon
 
     assert command[command.index("--nproc-per-node") + 1] == "8"
     assert command[-2:] == ["--disaggregation-mode", "prefill-decode"]
+
+
+def test_openai_server_auto_launches_deepseek_v4_tensor_parallel(monkeypatch) -> None:
+    monkeypatch.delenv("RANK", raising=False)
+    monkeypatch.delenv("WORLD_SIZE", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_AUTO_TORCHRUN", raising=False)
+    config = OpenAIServerConfig(
+        model="deepseek-ai/DeepSeek-V4-Flash",
+        model_kind="deepseek-v4",
+        tensor_parallel_size=4,
+        disaggregation_mode="prefill-decode",
+    )
+
+    assert _should_reexec_distributed_server(config)
+    command = _distributed_server_command(
+        config,
+        ("--model", config.model, "--tensor-parallel-size", "4"),
+    )
+    assert command[command.index("--nproc-per-node") + 1] == "8"
 
 
 def test_disaggregated_decode_warmup_allocates_largest_batch_without_bucketing(
@@ -1746,6 +1783,26 @@ def test_chat_template_batch_encoding_input_ids_are_extracted() -> None:
     assert encoded == [7, 8, 9]
 
 
+def test_transformers_chat_tokenizer_falls_back_when_template_is_unset() -> None:
+    class NoTemplateTokenizer:
+        eos_token_id = 0
+        chat_template = None
+
+        def apply_chat_template(self, *args: object, **kwargs: object) -> object:
+            raise AssertionError("an unset chat template must not be invoked")
+
+        def encode(self, text: str, *, add_special_tokens: bool) -> list[int]:
+            assert text == "user: hello\nassistant:"
+            assert not add_special_tokens
+            return [4, 5, 6]
+
+    tokenizer = _TransformersChatTokenizer(NoTemplateTokenizer())
+
+    encoded = tokenizer.encode_messages([{"role": "user", "content": "hello"}])
+
+    assert encoded == [4, 5, 6]
+
+
 def test_transformers_chat_tokenizer_disables_bpe_cleanup_on_decode() -> None:
     class RecordingTokenizer(_BatchEncodingTokenizer):
         def __init__(self) -> None:
@@ -1796,6 +1853,142 @@ def test_openai_engine_stops_generation_on_chat_terminator() -> None:
 
     assert tokens == [2, 9]
     assert len(model.calls) == 2
+
+
+def test_openai_engine_close_releases_owned_caches_before_worker_shutdown() -> None:
+    events: list[tuple[str, object | None]] = []
+
+    class Model(_BatchRecordingModel):
+        def release_cache(self, cache: object) -> None:
+            events.append(("release", cache))
+
+        def shutdown_workers(self) -> None:
+            events.append(("shutdown", None))
+
+    model = Model()
+    engine = OpenAICompletionEngine(
+        model,
+        _ByteFallbackTokenizer(vocab_size=8),
+        model_id="tiny",
+        device=torch.device("cpu"),
+        max_batch_size=1,
+        batch_wait_ms=0.0,
+    )
+    pooled_cache = object()
+    engine._cache_pool[(1, 8, "dense", 16, "cpu")] = pooled_cache
+    engine._microbatch_cache_pool[(0, 1, 8, "dense", 16, "cpu")] = pooled_cache
+    engine._persistent_serving_cache = pooled_cache
+
+    engine.close()
+    engine.close()
+
+    assert events == [
+        ("release", pooled_cache),
+        ("shutdown", None),
+    ]
+
+
+def test_openai_engine_close_waits_for_live_direct_request() -> None:
+    started = threading.Event()
+    proceed = threading.Event()
+    closed = threading.Event()
+    released: list[object] = []
+
+    class Model(_BatchRecordingModel):
+        def forward(self, *args: object, **kwargs: object):
+            started.set()
+            assert proceed.wait(timeout=5)
+            return super().forward(*args, **kwargs)
+
+        def release_cache(self, cache: object) -> None:
+            released.append(cache)
+
+    engine = OpenAICompletionEngine(
+        Model(),
+        _ByteFallbackTokenizer(vocab_size=8),
+        model_id="tiny",
+        device=torch.device("cpu"),
+        max_batch_size=1,
+        batch_wait_ms=0.0,
+    )
+    request = threading.Thread(
+        target=lambda: list(
+            engine.generate_chat_tokens(
+                [{"role": "user", "content": "slow"}],
+                max_tokens=1,
+                temperature=0.0,
+            )
+        )
+    )
+    request.start()
+    assert started.wait(timeout=5)
+
+    closer = threading.Thread(target=lambda: (engine.close(), closed.set()))
+    closer.start()
+    assert not closed.wait(timeout=0.05)
+    assert released == []
+
+    proceed.set()
+    request.join(timeout=5)
+    closer.join(timeout=5)
+
+    assert not request.is_alive()
+    assert not closer.is_alive()
+    assert closed.is_set()
+    assert len(released) == 1
+
+
+def test_openai_engine_close_keeps_worker_alive_for_admitted_queue_race(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    base_queue = queue.Queue
+    enqueue_started = threading.Event()
+    allow_enqueue = threading.Event()
+
+    class BlockingQueue(base_queue):
+        def put(self, item: object, block: bool = True, timeout: float | None = None) -> None:
+            if isinstance(item, _QueuedGeneration) and not enqueue_started.is_set():
+                enqueue_started.set()
+                assert allow_enqueue.wait(timeout=5)
+            super().put(item, block=block, timeout=timeout)
+
+    monkeypatch.setattr("torchinferno.openai_server.queue.Queue", BlockingQueue)
+    engine = OpenAICompletionEngine(
+        _BatchRecordingModel(),
+        _ByteFallbackTokenizer(vocab_size=8),
+        model_id="tiny",
+        device=torch.device("cpu"),
+        max_batch_size=1,
+        batch_wait_ms=0.0,
+    )
+    engine.single_request_fast_path = False
+    result: list[int] = []
+    request = threading.Thread(
+        target=lambda: result.extend(
+            engine.generate_chat_tokens(
+                [{"role": "user", "content": "queued"}],
+                max_tokens=1,
+                temperature=0.0,
+            )
+        )
+    )
+    request.start()
+    assert enqueue_started.wait(timeout=5)
+
+    closed = threading.Event()
+    closer = threading.Thread(target=lambda: (engine.close(), closed.set()))
+    closer.start()
+    assert not closed.wait(timeout=0.05)
+    assert engine._worker is not None and engine._worker.is_alive()
+
+    allow_enqueue.set()
+    request.join(timeout=5)
+    closer.join(timeout=5)
+
+    assert result == [2]
+    assert not request.is_alive()
+    assert not closer.is_alive()
+    assert closed.is_set()
 
 
 def test_openai_engine_drains_tensor_parallel_direct_generator_on_close(monkeypatch) -> None:
@@ -9782,6 +9975,78 @@ def test_openai_effective_max_batch_size_uses_tp_env_override(monkeypatch) -> No
     assert _effective_openai_max_batch_size(model, torch.device("cuda"), 16) == 16
 
 
+def test_openai_effective_max_batch_size_respects_model_cache_rows(monkeypatch) -> None:
+    model = types.SimpleNamespace(cache_row_capacity=24)
+    monkeypatch.setattr(
+        "torchinferno.openai_server._is_tensor_parallel_model",
+        lambda candidate: candidate is model,
+    )
+
+    assert _effective_openai_max_batch_size(model, torch.device("cuda"), 128) == 24
+    assert _effective_openai_max_batch_size(model, torch.device("cpu"), 128) == 24
+
+
+def test_openai_generation_cache_shape_reads_direct_v4_contract() -> None:
+    cache = types.SimpleNamespace(max_seq_len=16, selected_rows=(3, 4))
+
+    assert _generation_cache_shape_limits(cache) == (16, 2)
+    assert _generation_cache_fits_shape(cache, max_seq_len=16, total_rows=2)
+    assert not _generation_cache_fits_shape(cache, max_seq_len=17, total_rows=2)
+    assert not _generation_cache_fits_shape(cache, max_seq_len=16, total_rows=3)
+
+
+def test_openai_persistent_cache_replacement_releases_owned_rows() -> None:
+    released = []
+    old_cache = object()
+    new_cache = object()
+    engine = types.SimpleNamespace(
+        model=types.SimpleNamespace(
+            release_decode_graphs_for_cache=lambda cache: released.append(cache)
+        ),
+        _persistent_serving_cache=old_cache,
+    )
+
+    _replace_persistent_serving_cache(engine, new_cache)
+
+    assert released == [old_cache]
+    assert engine._persistent_serving_cache is new_cache
+
+
+def test_openai_persistent_cache_replacement_leaves_pool_owned_alias_alive() -> None:
+    released: list[object] = []
+    cache = object()
+    engine = types.SimpleNamespace(
+        model=types.SimpleNamespace(release_cache=lambda value: released.append(value)),
+        _persistent_serving_cache=cache,
+        _cache_pool={"shared": cache},
+        _microbatch_cache_pool={},
+    )
+
+    _replace_persistent_serving_cache(engine, None)
+
+    assert released == []
+    assert engine._persistent_serving_cache is None
+    assert engine._cache_pool == {"shared": cache}
+
+
+def test_openai_row_owned_cache_pool_evicts_storage_without_microbatch_uaf() -> None:
+    released = []
+    model = types.SimpleNamespace(
+        owns_cache_rows=True,
+        release_cache=lambda cache: released.append(cache),
+    )
+    engine = _cache_only_engine()
+    engine.model = model
+    old_cache = object()
+    engine._cache_pool["old"] = old_cache
+
+    engine._prepare_cache_pool_insert(engine._cache_pool, "new", 5, model=model)
+
+    assert engine._cache_pool == {}
+    assert released == [old_cache]
+    assert engine._stream_microbatch_size(128) == 128
+
+
 def test_openai_tp_stream_queue_batch_limit_is_request_agnostic(monkeypatch) -> None:
     monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_STREAM_MAX_BATCH_SIZE", raising=False)
     model = object()
@@ -10381,6 +10646,8 @@ def test_openai_startup_warmup_syncs_tp_ranks_after_cuda_warmup(monkeypatch) -> 
         lambda: False,
     )
 
+    released_caches: list[object] = []
+
     class FakeConfig:
         vocab_size = 128
 
@@ -10390,6 +10657,9 @@ def test_openai_startup_warmup_syncs_tp_ranks_after_cuda_warmup(monkeypatch) -> 
 
         def generate(self) -> None:
             return None
+
+        def release_decode_graphs_for_cache(self, cache: object) -> None:
+            released_caches.append(cache)
 
     model = FakeTPModel()
     calls: list[tuple[str, object, object | None]] = []
@@ -10435,6 +10705,10 @@ def test_openai_startup_warmup_syncs_tp_ranks_after_cuda_warmup(monkeypatch) -> 
         lambda candidate: None,
     )
     monkeypatch.setattr(
+        "torchinferno.openai_server._startup_scheduler_warmup_enabled",
+        lambda: False,
+    )
+    monkeypatch.setattr(
         "torchinferno.openai_server._sync_tensor_parallel_command",
         fake_sync_tensor_parallel_command,
     )
@@ -10446,7 +10720,8 @@ def test_openai_startup_warmup_syncs_tp_ranks_after_cuda_warmup(monkeypatch) -> 
     engine.device = torch.device("cuda")
     engine.cache_backend = "dense"
     engine._generate_single_tokens = fake_generate_single_tokens  # type: ignore[method-assign]
-    engine._generation_cache = lambda *args, **kwargs: object()  # type: ignore[method-assign]
+    warmup_cache = object()
+    engine._generation_cache = lambda *args, **kwargs: warmup_cache  # type: ignore[method-assign]
 
     OpenAICompletionEngine._warmup_tensor_parallel_model(engine)
 
@@ -10454,6 +10729,125 @@ def test_openai_startup_warmup_syncs_tp_ranks_after_cuda_warmup(monkeypatch) -> 
         ("cuda_sync", torch.device("cuda"), None),
         ("tp_sync", torch.device("cuda"), False),
     ]
+    assert released_caches == [warmup_cache]
+
+
+def test_openai_startup_warmup_shapes_respect_model_capacity() -> None:
+    counts, new_tokens = _bounded_startup_warmup_shapes(
+        (32, 16, 64, 128, 256),
+        2,
+        256,
+    )
+
+    assert counts == (32, 16, 64, 128)
+    assert new_tokens == 2
+    assert max(counts) + new_tokens <= 256
+
+
+def test_openai_serving_warmup_releases_model_owned_cache_rows() -> None:
+    released: list[object] = []
+
+    class Model:
+        owns_cache_rows = True
+
+        def release_cache(self, cache: object) -> None:
+            released.append(cache)
+
+    engine = types.SimpleNamespace(model=Model(), _persistent_serving_cache=None)
+    cache = object()
+
+    _finish_serving_cache_warmup(engine, cache)
+
+    assert released == [cache]
+    assert engine._persistent_serving_cache is None
+
+
+def test_openai_v4_startup_releases_pooled_rows_before_ephemeral_warmup(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        "torchinferno.openai_server._startup_scheduler_warmup_enabled",
+        lambda: False,
+    )
+
+    class Cache:
+        max_seq_len = 256
+        selected_rows = (0,)
+
+        def reset(self) -> None:
+            return None
+
+    class Model:
+        world_size = 2
+        config = types.SimpleNamespace(vocab_size=32)
+        owns_cache_rows = True
+        supports_runtime_graphs = False
+        supports_prefix_cache = False
+
+        def __init__(self) -> None:
+            self.available = 1
+
+        def generate(self) -> None:
+            return None
+
+        def allocate_cache(self, *args, **kwargs):
+            del args, kwargs
+            if self.available < 1:
+                raise RuntimeError("cache row capacity is exhausted")
+            self.available -= 1
+            return Cache()
+
+        def release_cache(self, cache) -> None:
+            del cache
+            self.available += 1
+
+    model = Model()
+    engine = _cache_only_engine()
+    engine.model = model
+    engine.device = torch.device("cuda")
+    engine.cache_backend = "dense"
+    engine.max_batch_size = 1
+    engine.max_model_len = 256
+    engine.tokenizer = types.SimpleNamespace(eos_token_id=None)
+    engine.stop_token_ids = frozenset()
+
+    def generate_single(*args, **kwargs):
+        del args, kwargs
+        engine._generation_cache(1, 16, model=model)
+        return iter(())
+
+    engine._generate_single_tokens = generate_single  # type: ignore[method-assign]
+    original_arange = torch.arange
+    monkeypatch.setattr(
+        torch,
+        "arange",
+        lambda *args, **kwargs: original_arange(
+            *args,
+            **{key: value for key, value in kwargs.items() if key != "device"},
+        ),
+    )
+    monkeypatch.setattr(
+        "torchinferno.openai_server._is_tensor_parallel_model",
+        lambda candidate: candidate is model,
+    )
+    monkeypatch.setattr(
+        "torchinferno.openai_server._tensor_parallel_symm_mem_allreduce_scope",
+        lambda *args, **kwargs: nullcontext(),
+    )
+    monkeypatch.setattr(
+        "torchinferno.openai_server._warmup_tensor_parallel_decode_attention",
+        lambda candidate: None,
+    )
+    monkeypatch.setattr(
+        "torchinferno.openai_server._sync_tensor_parallel_command",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda *args, **kwargs: None)
+
+    engine._warmup_tensor_parallel_model()
+
+    assert model.available == 1
+    assert engine._cache_pool == {}
 
 
 def test_online_mixed_temperature_batching_defaults_on_with_opt_out(monkeypatch) -> None:
@@ -12446,18 +12840,29 @@ def test_openai_tp_initial_queue_wait_is_request_agnostic(monkeypatch) -> None:
     completion = _QueuedGeneration([1, 2], 300, 0.7, False, queue.Queue())
     long_sampled = _QueuedGeneration([1, 2], 600, 0.7, True, queue.Queue())
 
-    assert engine._queued_initial_batch_wait_s(short_sampled) == 0.001
-    assert engine._queued_initial_batch_wait_s(sampled) == 0.001
-    assert engine._queued_initial_batch_wait_s(short_greedy) == 0.001
-    assert engine._queued_initial_batch_wait_s(greedy) == 0.001
-    assert engine._queued_initial_batch_wait_s(completion) == 0.0
-    assert engine._queued_initial_batch_wait_s(long_sampled) == 0.001
+    assert engine._queued_initial_batch_wait_s(short_sampled) == 0.010
+    assert engine._queued_initial_batch_wait_s(sampled) == 0.010
+    assert engine._queued_initial_batch_wait_s(short_greedy) == 0.010
+    assert engine._queued_initial_batch_wait_s(greedy) == 0.010
+    assert engine._queued_initial_batch_wait_s(completion) == 0.010
+    assert engine._queued_initial_batch_wait_s(long_sampled) == 0.010
 
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_INITIAL_BATCH_WAIT_MS", "3")
     assert engine._queued_initial_batch_wait_s(short_sampled) == 0.003
     assert engine._queued_initial_batch_wait_s(sampled) == 0.003
     assert engine._queued_initial_batch_wait_s(short_greedy) == 0.003
     assert engine._queued_initial_batch_wait_s(greedy) == 0.003
+    assert engine._queued_initial_batch_wait_s(completion) == 0.003
+
+    monkeypatch.setattr(
+        "torchinferno.openai_server._is_tensor_parallel_model",
+        lambda candidate: False,
+    )
+    monkeypatch.setattr(
+        "torchinferno.openai_server._is_disaggregated_prefill_decode_model",
+        lambda candidate: candidate is model,
+    )
+    assert engine._queued_initial_batch_wait_s(completion) == 0.003
 
 
 def test_openai_sampled_batch_shape_bucket_uses_warmed_temperature_shapes(monkeypatch) -> None:
@@ -14110,11 +14515,12 @@ def test_openai_persistent_prompt_list_decode_step_sets_ephemeral_graph_scope(
 
     assert state.ephemeral_graph_scope is True
     assert getattr(cache, "_torchinferno_ephemeral_ragged_graph_scope") is True
+    prefix_cache = next(iter(state.prefix_caches.values()))
 
     engine._close_persistent_prompt_list_step_state()
 
     assert getattr(cache, "_torchinferno_ephemeral_ragged_graph_scope") is False
-    assert released == [(model, cache)]
+    assert released == [(model, cache), (model, prefix_cache)]
 
 
 def test_openai_token_budget_step_handlers_manage_state_lifecycle() -> None:
@@ -17921,6 +18327,21 @@ def test_openai_tensor_parallel_online_default_prefix_rows(monkeypatch: pytest.M
     assert engine._online_serving_effective_prefix_rows(140) == 7
 
 
+def test_openai_tensor_parallel_online_prefix_rows_respect_model_cache_capacity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = _cache_only_engine()
+    engine.model = types.SimpleNamespace(cache_row_capacity=128)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_PREFIX_ROWS", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_TOTAL_ROWS_BUDGET", raising=False)
+
+    assert engine._online_serving_effective_prefix_rows(64) == 64
+    assert engine._online_serving_effective_prefix_rows(128) == 0
+
+    engine.model.supports_prefix_cache = False
+    assert engine._online_serving_effective_prefix_rows(64) == 0
+
+
 def test_openai_tensor_parallel_online_max_active_is_request_agnostic(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -18979,6 +19400,7 @@ def test_openai_microbench_cases_preserve_tensor_parallel_default() -> None:
 
 class _BatchEncodingTokenizer:
     eos_token_id = 0
+    chat_template = "{{ messages }}"
 
     def apply_chat_template(self, messages, *, tokenize: bool, add_generation_prompt: bool):
         assert tokenize

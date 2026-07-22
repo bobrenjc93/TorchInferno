@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+from datetime import timedelta
 from pathlib import Path
 from typing import Sequence
 
@@ -10,6 +11,11 @@ import torch
 
 from torchinferno.models.auto import load_model_auto
 from torchinferno.models.deepseek_v32 import DeepSeekV32ForCausalLM, tiny_deepseek_v32_config
+from torchinferno.models.deepseek_v4 import DeepSeekV4ForCausalLM, tiny_deepseek_v4_config
+from torchinferno.models.deepseek_v4.tensor_parallel import (
+    DeepSeekV4TensorParallelForCausalLM,
+    set_tensor_parallel_process_group as set_deepseek_v4_process_group,
+)
 from torchinferno.models.dsv4 import DSv4ForCausalLM, tiny_dsv4_config
 from torchinferno.models.llama3 import Llama3V0ForCausalLM, tiny_llama3_v0_config
 from torchinferno.models.llama3.pipeline import Llama3PipelineForCausalLM
@@ -18,21 +24,64 @@ from torchinferno.models.llama3.tensor_parallel import (
     set_tensor_parallel_process_group,
     validate_symm_mem_allreduce_collective,
 )
+from torchinferno.models.identity import detect_model_identity
 from torchinferno.runtime.disaggregated import (
     DisaggregatedPrefillDecodeModel,
     initialize_disaggregated_topology,
 )
 
 
+def initialize_standard_tensor_parallel_runtime(
+    expected_world_size: int,
+) -> torch.device:
+    """Bind the local device and join WORLD before constructing a TP model."""
+
+    if not distributed_env_requested():
+        raise RuntimeError("tensor-parallel runtime requires RANK and WORLD_SIZE")
+    if not torch.distributed.is_available():
+        raise RuntimeError("torch.distributed is unavailable")
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    if torch.cuda.is_available():
+        if local_rank < 0 or local_rank >= torch.cuda.device_count():
+            raise RuntimeError(f"LOCAL_RANK={local_rank} does not address a visible CUDA device")
+        torch.cuda.set_device(local_rank)
+        device = torch.device("cuda", local_rank)
+        backend = "nccl"
+    else:
+        device = torch.device("cpu")
+        backend = "gloo"
+    if not torch.distributed.is_initialized():
+        timeout_s = max(
+            1,
+            int(os.environ.get("TORCHINFERNO_TP_PROCESS_GROUP_TIMEOUT_S", "1800")),
+        )
+        torch.distributed.init_process_group(
+            backend=backend,
+            timeout=timedelta(seconds=timeout_s),
+        )
+    actual_world_size = torch.distributed.get_world_size()
+    if actual_world_size != expected_world_size:
+        raise RuntimeError(
+            "tensor-parallel process-group size does not match configuration: "
+            f"expected {expected_world_size}, got {actual_world_size}"
+        )
+    return device
+
+
 def load_model_for_engine(config: object) -> tuple[object, torch.device]:
     kind = infer_model_kind(config)
     configured_disaggregation = disaggregation_mode(config)
-    if configured_disaggregation != "none" and kind != "llama3":
+    if configured_disaggregation != "none" and kind not in {"llama3", "deepseek-v4"}:
         raise ValueError(
             f"disaggregated prefill/decode is not implemented for model kind {kind!r}"
         )
     if configured_disaggregation == "prefill-decode":
         cache_backend = str(getattr(config, "cache_backend", "dense")).strip().lower()
+        if kind == "deepseek-v4" and cache_backend != "dense":
+            raise ValueError(
+                "DeepSeek V4 disaggregation uses its heterogeneous cache and "
+                "requires --cache-backend dense"
+            )
         if cache_backend not in {"dense", "flashinfer"}:
             raise ValueError(
                 "disaggregated prefill/decode supports dense or flashinfer KV cache"
@@ -42,6 +91,12 @@ def load_model_for_engine(config: object) -> tuple[object, torch.device]:
         device = primary_device(config)
         model = DeepSeekV32ForCausalLM(tiny_deepseek_v32_config(max_position_embeddings=_max_model_len(config) or 128))
         return model.to(device=device, dtype=dtype or torch.float32).eval(), device
+    if kind == "tiny-deepseek-v4":
+        device = primary_device(config)
+        model = DeepSeekV4ForCausalLM(
+            tiny_deepseek_v4_config(max_position_embeddings=_max_model_len(config) or 128)
+        )
+        return model.to(device=device, dtype=dtype or torch.float32).eval(), device
     if kind == "tiny-dsv4":
         device = primary_device(config)
         model = DSv4ForCausalLM(tiny_dsv4_config(max_seq_len=_max_model_len(config) or 128))
@@ -50,6 +105,67 @@ def load_model_for_engine(config: object) -> tuple[object, torch.device]:
         device = primary_device(config)
         model = Llama3V0ForCausalLM(tiny_llama3_v0_config(max_position_embeddings=_max_model_len(config) or 128))
         return model.to(device=device, dtype=dtype or torch.float32).eval(), device
+    if kind == "deepseek-v4":
+        max_seq_len = _max_model_len(config) or 4096
+        max_batch_size = int(getattr(config, "max_batch_size", 1))
+        tensor_parallel_size = int(getattr(config, "tensor_parallel_size", 1))
+        if configured_disaggregation == "prefill-decode":
+            max_batch_size = min(
+                max_batch_size,
+                max(
+                    1,
+                    int(os.environ.get("TORCHINFERNO_OPENAI_DISAGG_MAX_BATCH_SIZE", "8")),
+                ),
+            )
+            topology = initialize_disaggregated_topology(tensor_parallel_size)
+            set_deepseek_v4_process_group(topology.role_group)
+            try:
+                role_model = DeepSeekV4TensorParallelForCausalLM.from_pretrained(
+                    str(getattr(config, "model")),
+                    max_batch_size=max_batch_size,
+                    max_seq_len=max_seq_len,
+                    device=topology.device,
+                    token=getattr(config, "token", None),
+                    revision=getattr(config, "revision", None),
+                    cache_dir=getattr(config, "cache_dir", None),
+                ).eval()
+                model = DisaggregatedPrefillDecodeModel(
+                    role_model,
+                    topology,
+                    cache_backend="v4-heterogeneous",
+                    page_size=int(getattr(config, "page_size", 16)),
+                    profile_transfer=bool(getattr(config, "disaggregation_profile", False)),
+                ).eval()
+            except BaseException:
+                set_deepseek_v4_process_group(None)
+                raise
+            return model, topology.device
+        if tensor_parallel_size > 1 and not distributed_env_requested():
+            raise RuntimeError(
+                "DeepSeek V4 tensor-parallel serving requires a distributed launch. "
+                "Use torchrun, or start torchinferno.openai_server normally with "
+                "--tensor-parallel-size > 1 so it can auto-launch workers."
+            )
+        target_device = (
+            initialize_standard_tensor_parallel_runtime(tensor_parallel_size)
+            if tensor_parallel_size > 1
+            else primary_device(config)
+        )
+        set_deepseek_v4_process_group(None)
+        model = DeepSeekV4TensorParallelForCausalLM.from_pretrained(
+            str(getattr(config, "model")),
+            max_batch_size=max_batch_size,
+            max_seq_len=max_seq_len,
+            device=target_device,
+            token=getattr(config, "token", None),
+            revision=getattr(config, "revision", None),
+            cache_dir=getattr(config, "cache_dir", None),
+        ).eval()
+        if model.tensor_parallel_size != tensor_parallel_size:
+            raise RuntimeError(
+                "DeepSeek V4 tensor-parallel size does not match the distributed world"
+            )
+        return model, model.device
     if kind == "llama3":
         if configured_disaggregation == "prefill-decode":
             if str(getattr(config, "llama_parallelism", "auto")).lower() == "pipeline":
@@ -128,13 +244,9 @@ def infer_model_kind(config: object) -> str:
     config_path = path / "config.json"
     if config_path.exists():
         data = json.loads(config_path.read_text())
-        model_type = str(data.get("model_type", "")).lower()
-        if "llama" in model_type:
-            return "llama3"
-        if "deepseek" in model_type:
-            return "deepseek"
-        if model_type == "dsv4":
-            return "dsv4"
+        family = detect_model_identity(data, required=False)
+        if family is not None:
+            return family
     return "auto"
 
 
@@ -195,7 +307,7 @@ def should_reexec_distributed_server(config: object) -> bool:
         return False
     if distributed_env_requested():
         return False
-    if infer_model_kind(config) != "llama3":
+    if infer_model_kind(config) not in {"llama3", "deepseek-v4"}:
         return False
     if disaggregation_mode(config) == "prefill-decode":
         return True

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from torchinferno.models.deepseek_v32.registry import VARIANTS as DEEPSEEK_V32_VARIANTS
+from torchinferno.models.deepseek_v4.registry import VARIANTS as DEEPSEEK_V4_VARIANTS
 from torchinferno.models.dsv4.registry import VARIANTS as DSV4_VARIANTS
 from torchinferno.models.llama3.registry import VARIANTS as LLAMA3_VARIANTS
 from torchinferno.models.provenance import ModelVariantRegistry, ModelVariantSpec
@@ -9,6 +10,7 @@ from torchinferno.models.provenance import ModelVariantRegistry, ModelVariantSpe
 MODEL_VARIANTS: tuple[ModelVariantSpec, ...] = (
     *DSV4_VARIANTS,
     *DEEPSEEK_V32_VARIANTS,
+    *DEEPSEEK_V4_VARIANTS,
     *LLAMA3_VARIANTS,
 )
 
@@ -17,6 +19,7 @@ FAMILY_ALIASES = {
     "dsv3.2": "deepseek-v3.2",
     "deepseek-v32": "deepseek-v3.2",
     "deepseek_v32": "deepseek-v3.2",
+    "deepseek_v4": "deepseek-v4",
 }
 
 

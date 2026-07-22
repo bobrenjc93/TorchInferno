@@ -171,6 +171,7 @@ Optional extras are declared in [`pyproject.toml`](pyproject.toml):
 | `serve` / `text` | `transformers`, `tokenizers` | Loading Hub tokenizers or running the OpenAI-compatible server against real checkpoints. |
 | `flashinfer` | `flashinfer-python` | Optional FlashInfer CUDA serving kernels. |
 | `kernels` | [Triton](https://triton-lang.org/main/index.html) | Exercising CUDA kernel specializations instead of torch fallbacks. |
+| `deepseek-v4` | TileLang and SGLang's JIT kernel provider | Loading DeepSeek-V4-Flash with native FP8/MXFP4 CUDA kernels. |
 | `helion` | [Helion](https://github.com/pytorch-labs/helion) | Trying one optional generated-kernel provider in the offline promotion flow. |
 
 Without installing the package:
@@ -214,6 +215,43 @@ on GPU:
 PYTHONPATH=src python3 -m torchinferno.cli dsv4-smoke --device cuda
 PYTHONPATH=src python3 -m torchinferno.cli deepseek-smoke --device cuda
 ```
+
+## DeepSeek V4 Flash
+
+DeepSeek V4 is a separate model family with its own mHC residual path,
+heterogeneous sliding/C4/C128 cache, hash-routed layers, and public FP8/MXFP4
+checkpoint contract. Install the CUDA provider, build its fixed CUDA
+specializations offline, and then run the full public model on eight GPUs:
+
+```bash
+python3 -m pip install -e ".[deepseek-v4,serve]"
+CUDA_HOME=/usr/local/cuda-13.0 PYTHONPATH=src \
+  python3 scripts/prepare_deepseek_v4_kernels.py \
+  /path/to/DeepSeek-V4-Flash /path/to/v4-kernels \
+  --tensor-parallel-sizes 4,8
+
+TORCHINFERNO_V4_KERNEL_ARTIFACT_DIR=/path/to/v4-kernels/tilelang \
+TVM_FFI_CACHE_DIR=/path/to/v4-kernels/marlin \
+PYTHONPATH=src \
+  torchrun --standalone --nproc-per-node 8 \
+  scripts/smoke_deepseek_v4_tp.py /path/to/DeepSeek-V4-Flash \
+  --prompt-tokens 128 --new-tokens 16 --max-seq-len 256
+```
+
+Preparation is the only path that imports the checked-in TileLang definitions
+or invokes CUDA code generation. Model loading and serving fail with an
+actionable error when a required TileLang specialization is absent. If Marlin
+is unavailable, they select the prepared TileLang expert fallback and report
+that backend; they never compile on a request path.
+
+The readable `DeepSeekV4ForCausalLM` remains the reference implementation.
+`DeepSeekV4TensorParallelForCausalLM` streams only each rank's checkpoint
+shards and promotes native MXFP4 experts to grouped Marlin tensors after load.
+The fused provider is request-agnostic and falls back to the checked-in
+TileLang implementation when unavailable.
+
+See [the V4 validation note](docs/DEEPSEEK_V4_VALIDATION.md) for the initial
+8xH100 correctness, disaggregation, and SGLang/vLLM comparison methodology.
 
 ## DSv4 Model Family
 
@@ -297,6 +335,7 @@ Current families:
 
 - `dsv4`: compact DeepSeek-style DSv4 model family.
 - `deepseek-v3.2` / `dsv3.2`: native DeepSeek-V3.2 tensor-contract path.
+- `deepseek-v4`: native V4 reference plus public-checkpoint TP/EP CUDA path.
 - `llama3`: torch-native Llama3 model family.
 
 <details>
@@ -308,6 +347,8 @@ Current families:
 | `dsv4` | `v1` | integrated | Fused/cached DSv4 child used by local smoke and profile loops. |
 | `deepseek-v3.2` | `v0` | reference | Raw native DeepSeek-V3.2 tensor-contract baseline. |
 | `deepseek-v3.2` | `v1` | integrated | Fused/cached native DeepSeek child for paged-cache and serving work. |
+| `deepseek-v4` | `v0` | reference | Torch-native mHC, heterogeneous-cache, compressed-attention reference. |
+| `deepseek-v4` | `tp-v0` | experimental | Public FP8/MXFP4 checkpoint loader with TP/EP CUDA execution and disaggregated handoff. |
 | `llama3` | `v0` | reference | Torch-native Llama3 reference model. |
 | `llama3` | `v1` | reference | Fused-op Llama3 variant with the same public contract as `v0`. |
 | `llama3` | `pipeline-v0` | experimental | Safetensor loader/generate path that places whole decoder layers on devices. |
@@ -844,7 +885,7 @@ Chrome traces for both paths, `comparison.json`, and `pattern_repro.py`.
 
 ## CUDA Prefill/Decode Mode
 
-The OpenAI server can load two independent Llama tensor-parallel replicas and
+The OpenAI server can load two independent Llama or DeepSeek V4 tensor-parallel replicas and
 run prefill on one replica, transfer live KV shards over NCCL, and run later
 decode steps on the other replica. `--tensor-parallel-size` is the size of
 *each* role, so this example auto-launches eight processes and uses GPUs 0-3
@@ -859,9 +900,23 @@ PYTHONPATH=src python3 -m torchinferno.openai_server \
   --cache-backend dense
 ```
 
-The current mode is single-node CUDA/NCCL only. It supports Llama with dense
-or FlashInfer KV storage; paged KV and DeepSeek model families are rejected
-rather than silently falling back to ordinary serving. A Gloo control group
+For DeepSeek V4, use the public checkpoint with the same eight-GPU topology:
+
+```bash
+TORCHINFERNO_V4_KERNEL_ARTIFACT_DIR=/path/to/v4-kernels/tilelang \
+TVM_FFI_CACHE_DIR=/path/to/v4-kernels/marlin \
+PYTHONPATH=src python3 -m torchinferno.openai_server \
+  --model /path/to/DeepSeek-V4-Flash \
+  --model-kind deepseek-v4 \
+  --tensor-parallel-size 4 \
+  --disaggregation-mode prefill-decode \
+  --max-model-len 4096
+```
+
+The current mode is single-node CUDA/NCCL only. Llama supports dense or
+FlashInfer KV storage. DeepSeek V4 transfers its model-owned heterogeneous
+sliding, compressed, indexer, and partial compressor state; paged KV is
+rejected rather than silently falling back to ordinary serving. A Gloo control group
 keeps idle workers off the GPU, while role-local NCCL groups handle model
 collectives and matching two-rank NCCL groups transfer only live KV tokens.
 Select and order GPUs with `CUDA_VISIBLE_DEVICES`; `--device` and `--devices`
@@ -1145,6 +1200,7 @@ src/torchinferno/
   kernels/paged_attention.py
                            Paged decode attention kernel API.
   kernels/nvfp4.py        NVFP4 quantized-linear reference contract.
+  kernels/deepseek_v4_*   V4 TileLang reference and grouped MXFP4 CUDA provider.
   kernels/passes.py       Graph-pass registration for kernel replacements.
   models/*_family/        Backward-compatible import shims.
   models/provenance.py    Variant registry dataclasses and lineage helper.
@@ -1155,6 +1211,7 @@ src/torchinferno/
   models/auto.py          Config-driven model loader.
   models/deepseek.py      Compatibility alias for the native DeepSeek package.
   models/deepseek_v32/    Native DeepSeek-V3.2-style architecture.
+  models/deepseek_v4/     DeepSeek V4 reference, checkpoint, cache, and TP path.
   models/conversion.py    DeepSeek-style checkpoint audit and conversion.
   models/hf.py            Hugging Face-style config and weights IO.
   graph/export.py         make_fx and FakeTensor tracing helper.

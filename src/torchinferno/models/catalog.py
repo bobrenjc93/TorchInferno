@@ -33,6 +33,14 @@ MODEL_FAMILIES: tuple[ModelFamilySpec, ...] = (
         notes="Native DeepSeek-V3.2 tensor-contract family.",
     ),
     ModelFamilySpec(
+        name="deepseek-v4",
+        package="torchinferno.models.deepseek_v4",
+        model_module="torchinferno.models.deepseek_v4.model",
+        registry_module="torchinferno.models.deepseek_v4.registry",
+        checkpoint_adapter_module="torchinferno.models.deepseek_v4.checkpoint",
+        notes="Native DeepSeek-V4 mHC, heterogeneous compressed-attention, and hash-MoE family.",
+    ),
+    ModelFamilySpec(
         name="llama3",
         package="torchinferno.models.llama3",
         model_module="torchinferno.models.llama3.model",
@@ -47,6 +55,8 @@ FAMILY_ALIASES = {
     "deepseek-v32": "deepseek-v3.2",
     "deepseek_v32": "deepseek-v3.2",
     "dsv3.2": "deepseek-v3.2",
+    "deepseek_v4": "deepseek-v4",
+    "dsv4-flash": "deepseek-v4",
 }
 
 

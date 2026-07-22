@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import socket
 
 import pytest
+import torch
 
 from torchinferno.engine import loader as loader_module
 from torchinferno.engine import (
@@ -20,7 +23,73 @@ from torchinferno.server import (
     model_list_response,
     parse_chat_completion_request,
 )
-from torchinferno.engine.loader import load_model_for_engine
+from torchinferno.engine.loader import (
+    initialize_standard_tensor_parallel_runtime,
+    load_model_for_engine,
+)
+
+
+def _standard_tp_runtime_worker(
+    rank: int,
+    world_size: int,
+    port: int,
+    results: object,
+) -> None:
+    os.environ.update(
+        {
+            "MASTER_ADDR": "127.0.0.1",
+            "MASTER_PORT": str(port),
+            "RANK": str(rank),
+            "WORLD_SIZE": str(world_size),
+            "LOCAL_RANK": str(rank),
+        }
+    )
+    torch.cuda.is_available = lambda: False  # type: ignore[method-assign]
+    try:
+        device = initialize_standard_tensor_parallel_runtime(world_size)
+        import torchinferno.models.deepseek_v4.tensor_parallel as v4_tp
+        import torchinferno.runtime.sampling as sampling
+
+        v4_tp.world_size = world_size
+        v4_tp.rank = rank
+        v4_tp.set_tensor_parallel_process_group(None)
+        sampling.sample_next_token = lambda logits, temperature: torch.full(  # type: ignore[assignment]
+            (logits.size(0),),
+            rank + 7,
+            dtype=torch.long,
+            device=logits.device,
+        )
+        fake_model = type(
+            "FakeV4Sampler",
+            (),
+            {
+                "args": type("Args", (), {"vocab_size": 4})(),
+                "head": type("Head", (), {"part_vocab_size": 2})(),
+                "tensor_parallel_rank": rank,
+            },
+        )()
+        token = v4_tp.DeepSeekV4TensorParallelForCausalLM._sample_next_token(
+            fake_model,
+            torch.tensor([[float(rank), float(rank + 1)]]),
+            0.7,
+        )
+        results.put(
+            (
+                rank,
+                str(device),
+                torch.distributed.get_world_size(),
+                int(token.item()),
+            )
+        )
+    finally:
+        if torch.distributed.is_initialized():
+            torch.distributed.destroy_process_group()
+
+
+def _unused_tcp_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.bind(("127.0.0.1", 0))
+        return int(listener.getsockname()[1])
 
 
 def _tiny_engine_config() -> EngineConfig:
@@ -81,6 +150,68 @@ def test_disaggregation_rejects_paged_cache_before_cuda_topology(monkeypatch) ->
         load_model_for_engine(config)
 
 
+def test_deepseek_v4_disaggregation_rejects_misreported_flashinfer_cache(
+    monkeypatch,
+) -> None:
+    config = EngineConfig(
+        model="deepseek-ai/DeepSeek-V4-Flash",
+        model_kind="deepseek-v4",
+        cache_backend="flashinfer",
+        disaggregation_mode="prefill-decode",
+    )
+    monkeypatch.setattr(
+        loader_module,
+        "initialize_disaggregated_topology",
+        lambda *_args, **_kwargs: pytest.fail("topology initialized before cache validation"),
+    )
+
+    with pytest.raises(ValueError, match="requires --cache-backend dense"):
+        load_model_for_engine(config)
+
+
+def test_deepseek_v4_disaggregation_caps_model_cache_rows_before_load(monkeypatch) -> None:
+    captured = {}
+    config = EngineConfig(
+        model="deepseek-ai/DeepSeek-V4-Flash",
+        model_kind="deepseek-v4",
+        max_batch_size=128,
+        tensor_parallel_size=1,
+        disaggregation_mode="prefill-decode",
+    )
+    topology = type(
+        "Topology",
+        (),
+        {"role_group": object(), "device": torch.device("cpu")},
+    )()
+
+    class Evaluated:
+        def eval(self):
+            return self
+
+    def from_pretrained(*args, **kwargs):
+        del args
+        captured["max_batch_size"] = kwargs["max_batch_size"]
+        return Evaluated()
+
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_DISAGG_MAX_BATCH_SIZE", raising=False)
+    monkeypatch.setattr(loader_module, "initialize_disaggregated_topology", lambda size: topology)
+    monkeypatch.setattr(loader_module, "set_deepseek_v4_process_group", lambda group: None)
+    monkeypatch.setattr(
+        loader_module.DeepSeekV4TensorParallelForCausalLM,
+        "from_pretrained",
+        from_pretrained,
+    )
+    monkeypatch.setattr(
+        loader_module,
+        "DisaggregatedPrefillDecodeModel",
+        lambda *args, **kwargs: Evaluated(),
+    )
+
+    load_model_for_engine(config)
+
+    assert captured["max_batch_size"] == 8
+
+
 @pytest.mark.parametrize(
     "selection",
     ({"device": "cuda:0"}, {"devices": ("cuda:2", "cuda:3")}),
@@ -95,6 +226,41 @@ def test_disaggregation_requires_cuda_visible_devices_for_gpu_selection(selectio
 
     with pytest.raises(ValueError, match="CUDA_VISIBLE_DEVICES"):
         load_model_for_engine(config)
+
+
+def test_deepseek_v4_tensor_parallel_requires_distributed_launch(monkeypatch) -> None:
+    monkeypatch.delenv("RANK", raising=False)
+    monkeypatch.delenv("WORLD_SIZE", raising=False)
+    config = EngineConfig(
+        model="deepseek-ai/DeepSeek-V4-Flash",
+        model_kind="deepseek-v4",
+        tensor_parallel_size=8,
+    )
+
+    with pytest.raises(RuntimeError, match="DeepSeek V4 tensor-parallel serving"):
+        load_model_for_engine(config)
+
+
+def test_standard_tensor_parallel_runtime_joins_all_ranks_and_broadcasts_sampling() -> None:
+    context = torch.multiprocessing.get_context("spawn")
+    results = context.Queue()
+    world_size = 2
+    port = _unused_tcp_port()
+    processes = [
+        context.Process(
+            target=_standard_tp_runtime_worker,
+            args=(rank, world_size, port, results),
+        )
+        for rank in range(world_size)
+    ]
+    for process in processes:
+        process.start()
+    for process in processes:
+        process.join(timeout=30)
+        assert process.exitcode == 0
+
+    observed = sorted(results.get(timeout=2) for _ in range(world_size))
+    assert observed == [(0, "cpu", 2, 7), (1, "cpu", 2, 7)]
 
 
 def test_inference_engine_generates_from_raw_prompt() -> None:

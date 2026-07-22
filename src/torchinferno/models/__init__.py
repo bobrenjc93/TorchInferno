@@ -2,6 +2,7 @@ from torchinferno.models.auto import load_model_auto
 from torchinferno.models.catalog import ModelFamilySpec, get_model_family, list_model_families
 from torchinferno.models.dsv4 import DSv4Config, DSv4ForCausalLM, tiny_dsv4_config
 from torchinferno.models.deepseek_v32 import DeepSeekV32Config, DeepSeekV32ForCausalLM, tiny_deepseek_v32_config
+from torchinferno.models.deepseek_v4 import DeepSeekV4Config, DeepSeekV4ForCausalLM, tiny_deepseek_v4_config
 from torchinferno.models.llama3 import (
     LLAMA3_70B_REPO_ID,
     Llama3Config,
@@ -32,6 +33,8 @@ __all__ = [
     "DSv4ForCausalLM",
     "DeepSeekV32Config",
     "DeepSeekV32ForCausalLM",
+    "DeepSeekV4Config",
+    "DeepSeekV4ForCausalLM",
     "IncompatibleCheckpointError",
     "LLAMA3_70B_REPO_ID",
     "Llama3Config",
@@ -56,6 +59,7 @@ __all__ = [
     "list_model_variants",
     "model_variant_lineage",
     "tiny_deepseek_v32_config",
+    "tiny_deepseek_v4_config",
     "tiny_dsv4_config",
     "tiny_llama3_config",
 ]

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import timedelta
 import os
 import threading
@@ -134,9 +134,13 @@ class _LocalCacheState:
     page_size: int
     phase: DisaggregatedRole = "prefill"
     seq_len: int = 0
+    active_batch_size: int | None = None
     prefill_cache: object | None = None
     decode_cache: object | None = None
+    prefill_cache_batch_size: int | None = None
+    decode_cache_batch_size: int | None = None
     transfer_buffer: Tensor | None = None
+    transfer_buffers: dict[str, Tensor] = field(default_factory=dict)
 
 
 class DisaggregatedCacheHandle:
@@ -179,7 +183,7 @@ class DisaggregatedPrefillDecodeModel:
     forwards run only on the decode group and return full logits to rank 0.
     """
 
-    provenance_variant = "llama3:tp-disaggregated-v1"
+    provenance_variant = "unknown:tp-disaggregated-v1"
     is_disaggregated_prefill_decode = True
 
     def __init__(
@@ -191,19 +195,38 @@ class DisaggregatedPrefillDecodeModel:
         page_size: int = 16,
         profile_transfer: bool = False,
     ) -> None:
-        if cache_backend not in {"dense", "flashinfer"}:
-            raise ValueError("disaggregated prefill/decode supports dense or flashinfer KV cache")
+        if cache_backend not in {"dense", "flashinfer", "v4-heterogeneous"}:
+            raise ValueError(
+                "disaggregated prefill/decode supports dense, flashinfer, or V4 heterogeneous cache"
+            )
         self.role_model = role_model
+        role_variant = str(getattr(role_model, "provenance_variant", "unknown:v0"))
+        self.provenance_variant = f"{role_variant.split(':', 1)[0]}:tp-disaggregated-v1"
         self.topology = topology
         self.config = getattr(role_model, "config")
         self.device = topology.device
         self.devices = (topology.device,)
         self.dtype = getattr(role_model, "dtype")
+        self.logits_dtype = getattr(role_model, "logits_dtype", self.dtype)
         self.rank = topology.global_rank
         self.world_size = topology.world_size
         self.role = topology.role
         self.role_rank = topology.role_rank
         self.cache_backend = cache_backend
+        self.supports_padded_batch_prefill = bool(
+            getattr(role_model, "supports_padded_batch_prefill", True)
+        )
+        self.supports_prefix_cache = bool(
+            getattr(role_model, "supports_prefix_cache", True)
+        )
+        self.supports_runtime_graphs = bool(
+            getattr(role_model, "supports_runtime_graphs", True)
+        )
+        self.owns_cache_rows = True
+        self.cache_row_capacity = int(
+            getattr(role_model, "cache_row_capacity", getattr(role_model, "max_batch_size", 0))
+            or 0
+        )
         self.page_size = page_size
         self.profile_transfer = profile_transfer
         self.training = False
@@ -255,8 +278,10 @@ class DisaggregatedPrefillDecodeModel:
             raise ValueError("disaggregated coordinator cache must use the coordinator CUDA device")
         backend = self.cache_backend if cache_backend is None else str(cache_backend)
         configured_page_size = self.page_size if page_size is None else int(page_size)
-        if backend not in {"dense", "flashinfer"}:
-            raise ValueError("disaggregated prefill/decode supports dense or flashinfer KV cache")
+        if backend not in {"dense", "flashinfer", "v4-heterogeneous"}:
+            raise ValueError(
+                "disaggregated prefill/decode supports dense, flashinfer, or V4 heterogeneous cache"
+            )
         with self._command_lock:
             cache_id = self._next_cache_id
             self._next_cache_id += 1
@@ -425,7 +450,7 @@ class DisaggregatedPrefillDecodeModel:
                 output.append(next_token[:, None])
             return torch.cat(output, dim=1)
         finally:
-            self.release_decode_graphs_for_cache(cache)
+            self.release_cache(cache)
 
     def run_worker_loop(self) -> None:
         if self.is_coordinator:
@@ -466,6 +491,12 @@ class DisaggregatedPrefillDecodeModel:
             self._workers_stopped = True
 
     def release_decode_graphs_for_cache(self, cache: object) -> None:
+        # This method predates ``release_cache`` and is a terminal-release API
+        # for existing disaggregated callers. ``release_cache`` is idempotent,
+        # so generic runtimes may safely invoke both hooks.
+        self.release_cache(cache)
+
+    def release_cache(self, cache: object) -> None:
         if not isinstance(cache, DisaggregatedCacheHandle) or cache._owner is not self:
             return
         if cache.cache_id not in self._cache_states:
@@ -591,6 +622,7 @@ class DisaggregatedPrefillDecodeModel:
             raise ValueError("unknown disaggregated cache")
         state.phase = "prefill"
         state.seq_len = 0
+        state.active_batch_size = None
         if state.prefill_cache is not None:
             state.prefill_cache.reset()
         if state.decode_cache is not None:
@@ -600,37 +632,68 @@ class DisaggregatedPrefillDecodeModel:
         state = self._cache_states.pop(cache_id, None)
         if state is None:
             return
-        release_graphs = getattr(self.role_model, "release_decode_graphs_for_cache", None)
-        if not callable(release_graphs):
-            return
         role_cache = state.prefill_cache if self.role == "prefill" else state.decode_cache
         if role_cache is not None:
-            release_graphs(role_cache)
+            self._release_role_cache(role_cache)
 
-    def _ensure_role_cache(self, state: _LocalCacheState, input_tokens: int) -> object:
+    def _release_role_cache(self, cache: object | None) -> None:
+        if cache is None:
+            return
+        release_graphs = getattr(self.role_model, "release_decode_graphs_for_cache", None)
+        if callable(release_graphs):
+            release_graphs(cache)
+        release_cache = getattr(self.role_model, "release_cache", None)
+        if callable(release_cache):
+            release_cache(cache)
+
+    def _ensure_role_cache(
+        self,
+        state: _LocalCacheState,
+        input_tokens: int,
+        batch_size: int,
+    ) -> object:
+        if batch_size < 1 or batch_size > state.batch_size:
+            raise ValueError("active batch exceeds disaggregated cache capacity")
+        if state.active_batch_size is None:
+            state.active_batch_size = batch_size
+        elif state.active_batch_size != batch_size:
+            raise ValueError("decode batch size must match the batch used for prefill")
         allocate_cache = getattr(self.role_model, "allocate_cache")
         if self.role == "prefill":
             layers = tuple(getattr(state.prefill_cache, "layers", ()) or ())
-            capacity = int(getattr(layers[0], "max_seq_len", 0)) if layers else 0
-            if state.prefill_cache is None or capacity != input_tokens:
+            capacity = int(getattr(state.prefill_cache, "max_seq_len", 0))
+            if not capacity and layers:
+                capacity = int(getattr(layers[0], "max_seq_len", 0))
+            if (
+                state.prefill_cache is None
+                or capacity != input_tokens
+                or state.prefill_cache_batch_size != batch_size
+            ):
+                self._release_role_cache(state.prefill_cache)
                 state.prefill_cache = allocate_cache(
-                    state.batch_size,
+                    batch_size,
                     input_tokens,
                     cache_backend=state.cache_backend,
                     page_size=state.page_size,
                     stacked_storage=state.cache_backend == "dense",
                 )
+                state.prefill_cache_batch_size = batch_size
             else:
                 state.prefill_cache.reset()
             return state.prefill_cache
-        if state.decode_cache is None:
+        if (
+            state.decode_cache is None
+            or state.decode_cache_batch_size != batch_size
+        ):
+            self._release_role_cache(state.decode_cache)
             state.decode_cache = allocate_cache(
-                state.batch_size,
+                batch_size,
                 state.max_seq_len,
                 cache_backend=state.cache_backend,
                 page_size=state.page_size,
                 stacked_storage=state.cache_backend == "dense",
             )
+            state.decode_cache_batch_size = batch_size
         return state.decode_cache
 
     def _run_local_forward(
@@ -643,10 +706,15 @@ class DisaggregatedPrefillDecodeModel:
         if state is None:
             raise ValueError("unknown disaggregated cache")
         return_last = bool(command.get("return_last_logits_only", False))
+        batch_size = int(input_ids.size(0))
         if state.phase == "prefill":
             logits: Tensor | None = None
             if self.role == "prefill":
-                role_cache = self._ensure_role_cache(state, int(input_ids.size(1)))
+                role_cache = self._ensure_role_cache(
+                    state,
+                    int(input_ids.size(1)),
+                    batch_size,
+                )
                 logits, role_cache = self.role_model.forward(
                     input_ids,
                     cache=role_cache,
@@ -656,10 +724,10 @@ class DisaggregatedPrefillDecodeModel:
                 )
                 state.prefill_cache = role_cache
             else:
-                self._ensure_role_cache(state, int(input_ids.size(1)))
+                self._ensure_role_cache(state, int(input_ids.size(1)), batch_size)
             transfer_bytes, transfer_ms = self._transfer_cache(
                 state,
-                batch_size=int(input_ids.size(0)),
+                batch_size=batch_size,
                 tokens=int(input_ids.size(1)),
             )
             state.phase = "decode"
@@ -673,7 +741,11 @@ class DisaggregatedPrefillDecodeModel:
 
         logits = None
         if self.role == "decode":
-            role_cache = self._ensure_role_cache(state, int(input_ids.size(1)))
+            role_cache = self._ensure_role_cache(
+                state,
+                int(input_ids.size(1)),
+                batch_size,
+            )
             logits, role_cache = self.role_model.forward(
                 input_ids,
                 cache=role_cache,
@@ -685,7 +757,7 @@ class DisaggregatedPrefillDecodeModel:
         state.seq_len += int(input_ids.size(1))
         coordinator_logits = self._return_decode_logits(
             logits,
-            batch_size=int(input_ids.size(0)),
+            batch_size=batch_size,
             output_tokens=1 if return_last else int(input_ids.size(1)),
         )
         return coordinator_logits, 0, None
@@ -700,6 +772,8 @@ class DisaggregatedPrefillDecodeModel:
             raise ValueError("unknown disaggregated cache")
         if state.phase != "decode":
             raise ValueError("decode token graph requires a completed KV handoff")
+        if state.active_batch_size != int(input_ids.size(0)):
+            raise ValueError("decode batch size must match the batch used for prefill")
 
         token: Tensor | None = None
         if self.role == "decode":
@@ -733,6 +807,16 @@ class DisaggregatedPrefillDecodeModel:
         batch_size: int,
         tokens: int,
     ) -> tuple[int, float | None]:
+        heterogeneous_layout = getattr(
+            self.role_model, "disaggregated_cache_tensors", None
+        )
+        if callable(heterogeneous_layout):
+            return self._transfer_heterogeneous_cache(
+                state,
+                batch_size=batch_size,
+                tokens=tokens,
+                layout=heterogeneous_layout,
+            )
         layer_count = int(getattr(self.config, "num_hidden_layers"))
         local_heads = int(getattr(self.config, "num_key_value_heads")) // self.topology.tensor_parallel_size
         head_dim = int(getattr(self.config, "head_dim"))
@@ -804,6 +888,106 @@ class DisaggregatedPrefillDecodeModel:
                 )
         return transfer_bytes * self.topology.tensor_parallel_size, transfer_ms
 
+    def _transfer_heterogeneous_cache(
+        self,
+        state: _LocalCacheState,
+        *,
+        batch_size: int,
+        tokens: int,
+        layout: object,
+    ) -> tuple[int, float | None]:
+        role_cache = state.prefill_cache if self.role == "prefill" else state.decode_cache
+        if role_cache is None:
+            raise RuntimeError(f"{self.role} cache is missing before handoff")
+        views = tuple(layout(role_cache, batch_size=batch_size, tokens=tokens))
+        if not views or any(not isinstance(view, Tensor) for view in views):
+            raise ValueError("heterogeneous cache layout must return tensors")
+
+        grouped: dict[str, list[Tensor]] = {}
+        for view in views:
+            if view.device != self.device:
+                raise ValueError("heterogeneous cache tensor is on the wrong device")
+            grouped.setdefault(str(view.dtype), []).append(view)
+        buffers: list[Tensor] = []
+        for key, tensors in grouped.items():
+            elements = sum(tensor.numel() for tensor in tensors)
+            buffer = state.transfer_buffers.get(key)
+            if (
+                buffer is None
+                or buffer.numel() != elements
+                or buffer.dtype != tensors[0].dtype
+            ):
+                buffer = torch.empty(elements, device=self.device, dtype=tensors[0].dtype)
+                state.transfer_buffers[key] = buffer
+            buffers.append(buffer)
+        transfer_bytes = sum(buffer.numel() * buffer.element_size() for buffer in buffers)
+
+        if self.profile_transfer:
+            dist.barrier(
+                group=self.topology.transfer_group,
+                device_ids=[self.device.index if self.device.index is not None else 0],
+            )
+            torch.cuda.synchronize(self.device)
+            started = time.perf_counter()
+        pack_ms = 0.0
+        p2p_ms = 0.0
+        unpack_ms = 0.0
+        if self.role == "prefill":
+            for tensors, buffer in zip(grouped.values(), buffers):
+                _pack_tensor_views(tensors, buffer)
+            if self.profile_transfer:
+                torch.cuda.synchronize(self.device)
+                packed = time.perf_counter()
+                pack_ms = (packed - started) * 1000.0
+            _send_tensors(buffers, self.topology.peer_rank, self.topology.transfer_group)
+            if self.profile_transfer:
+                torch.cuda.synchronize(self.device)
+                p2p_ms = (time.perf_counter() - packed) * 1000.0
+        else:
+            _receive_tensors(buffers, self.topology.peer_rank, self.topology.transfer_group)
+            if self.profile_transfer:
+                torch.cuda.synchronize(self.device)
+                received = time.perf_counter()
+                p2p_ms = (received - started) * 1000.0
+            for tensors, buffer in zip(grouped.values(), buffers):
+                _unpack_tensor_views(tensors, buffer)
+            finalize = getattr(
+                self.role_model, "finalize_disaggregated_cache_import", None
+            )
+            if callable(finalize):
+                finalize(role_cache, tokens=tokens)
+            else:
+                role_cache.set_seq_len(tokens)
+            if self.profile_transfer:
+                torch.cuda.synchronize(self.device)
+                unpack_ms = (time.perf_counter() - received) * 1000.0
+
+        transfer_ms: float | None = None
+        if self.profile_transfer:
+            torch.cuda.synchronize(self.device)
+            local_ms = (time.perf_counter() - started) * 1000.0
+            elapsed = torch.tensor(
+                [local_ms, pack_ms, p2p_ms, unpack_ms],
+                device=self.device,
+                dtype=torch.float64,
+            )
+            dist.all_reduce(elapsed, op=dist.ReduceOp.MAX, group=dist.group.WORLD)
+            transfer_ms = float(elapsed[0].item())
+            if self.is_coordinator:
+                aggregate_bytes = transfer_bytes * self.topology.tensor_parallel_size
+                bandwidth_gbps = aggregate_bytes / (transfer_ms * 1_000_000.0)
+                print(
+                    "[TorchInferno disaggregated] "
+                    f"kv_handoff_bytes={aggregate_bytes} "
+                    f"kv_handoff_ms={transfer_ms:.3f} "
+                    f"pack_ms={float(elapsed[1].item()):.3f} "
+                    f"p2p_ms={float(elapsed[2].item()):.3f} "
+                    f"unpack_ms={float(elapsed[3].item()):.3f} "
+                    f"aggregate_bandwidth_GBps={bandwidth_gbps:.3f}",
+                    flush=True,
+                )
+        return transfer_bytes * self.topology.tensor_parallel_size, transfer_ms
+
     def _return_decode_logits(
         self,
         logits: Tensor | None,
@@ -818,7 +1002,7 @@ class DisaggregatedPrefillDecodeModel:
             _send_tensor(logits.contiguous(), 0, self.topology.transfer_group)
             return None
         if self.is_coordinator:
-            received = torch.empty(shape, device=self.device, dtype=self.dtype)
+            received = torch.empty(shape, device=self.device, dtype=self.logits_dtype)
             _receive_tensor(received, self.topology.decode_root, self.topology.transfer_group)
             return received
         return None
@@ -964,13 +1148,45 @@ def _stacked_cache_storage(cache: object) -> tuple[Tensor, Tensor] | None:
     return None
 
 
+def _pack_tensor_views(views: list[Tensor], buffer: Tensor) -> None:
+    offset = 0
+    for view in views:
+        count = view.numel()
+        buffer[offset : offset + count].view(view.shape).copy_(view)
+        offset += count
+    if offset != buffer.numel():
+        raise ValueError("heterogeneous cache shape does not match the transfer buffer")
+
+
+def _unpack_tensor_views(views: list[Tensor], buffer: Tensor) -> None:
+    offset = 0
+    for view in views:
+        count = view.numel()
+        view.copy_(buffer[offset : offset + count].view(view.shape))
+        offset += count
+    if offset != buffer.numel():
+        raise ValueError("heterogeneous cache shape does not match the transfer buffer")
+
+
 def _send_tensor(tensor: Tensor, peer: int, group: dist.ProcessGroup) -> None:
     operations = [dist.P2POp(dist.isend, tensor, peer, group=group)]
     for work in dist.batch_isend_irecv(operations):
         work.wait()
 
 
+def _send_tensors(tensors: list[Tensor], peer: int, group: dist.ProcessGroup) -> None:
+    operations = [dist.P2POp(dist.isend, tensor, peer, group=group) for tensor in tensors]
+    for work in dist.batch_isend_irecv(operations):
+        work.wait()
+
+
 def _receive_tensor(tensor: Tensor, peer: int, group: dist.ProcessGroup) -> None:
     operations = [dist.P2POp(dist.irecv, tensor, peer, group=group)]
+    for work in dist.batch_isend_irecv(operations):
+        work.wait()
+
+
+def _receive_tensors(tensors: list[Tensor], peer: int, group: dist.ProcessGroup) -> None:
+    operations = [dist.P2POp(dist.irecv, tensor, peer, group=group) for tensor in tensors]
     for work in dist.batch_isend_irecv(operations):
         work.wait()

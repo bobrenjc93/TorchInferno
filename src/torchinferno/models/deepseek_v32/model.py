@@ -97,6 +97,12 @@ class DeepSeekV32Config:
 
     @classmethod
     def from_dict(cls, data: dict[str, object]) -> "DeepSeekV32Config":
+        model_type = str(data.get("model_type", "")).lower()
+        architectures = {str(value).lower() for value in data.get("architectures", [])}
+        if model_type and model_type != "deepseek_v32":
+            raise ValueError(f"expected model_type='deepseek_v32', got {model_type!r}")
+        if architectures and "deepseekv32forcausallm" not in architectures:
+            raise ValueError(f"checkpoint architectures do not identify DeepSeek V3.2: {sorted(architectures)}")
         aliases = {
             "num_layers": "num_hidden_layers",
             "n_layers": "num_hidden_layers",

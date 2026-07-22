@@ -6,8 +6,10 @@ from typing import Optional
 import torch
 
 from torchinferno.models.deepseek_v32 import DeepSeekV32ForCausalLM
+from torchinferno.models.deepseek_v4 import DeepSeekV4ForCausalLM
 from torchinferno.models.dsv4 import DSv4ForCausalLM
 from torchinferno.models.hf import load_config, resolve_pretrained_path
+from torchinferno.models.identity import detect_model_identity
 
 
 def load_model_auto(
@@ -28,10 +30,11 @@ def load_model_auto(
         cache_dir=cache_dir,
     )
     config = load_config(path)
-    model_type = str(config.get("model_type", "")).lower()
-    architectures = {str(name).lower() for name in config.get("architectures", [])}
-    if model_type == "deepseek_v32" or "deepseekv32forcausallm" in architectures:
+    family = detect_model_identity(config)
+    if family == "deepseek-v3.2":
         return DeepSeekV32ForCausalLM.from_pretrained(path, map_location=map_location, strict=strict)
-    if model_type == "dsv4" or "dsv4forcausallm" in architectures:
+    if family == "deepseek-v4":
+        return DeepSeekV4ForCausalLM.from_pretrained(path, map_location=map_location, strict=strict)
+    if family == "dsv4":
         return DSv4ForCausalLM.from_pretrained(path, map_location=map_location, strict=strict)
-    raise ValueError(f"unsupported TorchInferno model type in {path}: {model_type}, {architectures}")
+    raise ValueError(f"unsupported TorchInferno model family in {path}: {family}")
