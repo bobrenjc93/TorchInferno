@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from contextlib import ExitStack
 from pathlib import Path
 
@@ -19,19 +20,25 @@ class CheckpointTensorLoader:
         index_path = self.root / SAFETENSORS_INDEX_NAME
         single_path = self.root / SAFETENSORS_NAME
         if index_path.exists():
-            if not index_path.resolve().is_relative_to(self.root):
-                raise ValueError("checkpoint index escapes checkpoint root")
+            index_path = _resolve_checkpoint_file(
+                self.root,
+                index_path,
+                error="checkpoint index escapes checkpoint root",
+            )
             payload = json.loads(index_path.read_text())
             weight_map = payload.get("weight_map")
             if not isinstance(weight_map, dict) or not weight_map:
                 raise ValueError(f"invalid safetensors weight_map in {index_path}")
             self.weight_map = {}
+            validated_shards: set[str] = set()
             for name, filename in weight_map.items():
                 if not isinstance(name, str) or not name:
                     raise ValueError(f"invalid tensor name in {index_path}")
                 if not isinstance(filename, str):
                     raise ValueError(f"invalid checkpoint shard for {name!r} in {index_path}")
-                self._shard_path(filename)
+                if filename not in validated_shards:
+                    self._shard_path(filename)
+                    validated_shards.add(filename)
                 self.weight_map[name] = filename
         elif single_path.exists():
             single_path = self._shard_path(single_path.name)
@@ -73,10 +80,11 @@ class CheckpointTensorLoader:
             or relative.suffix != ".safetensors"
         ):
             raise ValueError(f"unsafe checkpoint shard filename: {filename!r}")
-        path = (self.root / relative).resolve()
-        if not path.is_relative_to(self.root):
-            raise ValueError(f"checkpoint shard escapes checkpoint root: {filename!r}")
-        return path
+        return _resolve_checkpoint_file(
+            self.root,
+            self.root / relative,
+            error=f"checkpoint shard escapes checkpoint root: {filename!r}",
+        )
 
     def names(self) -> tuple[str, ...]:
         return tuple(self.weight_map)
@@ -135,3 +143,28 @@ def _finish_tensor(tensor: Tensor, *, device: torch.device, dtype: torch.dtype |
         tensor = tensor.to(dtype=dtype)
     tensor = tensor.to(device=device, non_blocking=True)
     return tensor if tensor.is_contiguous() else tensor.contiguous()
+
+
+def _resolve_checkpoint_file(root: Path, path: Path, *, error: str) -> Path:
+    resolved = path.resolve()
+    if resolved.is_relative_to(root):
+        return resolved
+
+    # Hugging Face snapshots are symlink farms whose immutable file contents
+    # live in the model cache's sibling blobs directory.
+    snapshots_dir = root.parent
+    model_cache = snapshots_dir.parent
+    blob_path = model_cache / "blobs"
+    blob_dir = blob_path.resolve()
+    is_hf_snapshot = (
+        snapshots_dir.name == "snapshots"
+        and model_cache.name.startswith("models--")
+        and re.fullmatch(r"[0-9a-fA-F]{40}", root.name) is not None
+        and blob_path.is_dir()
+        and not blob_path.is_symlink()
+        and blob_dir == blob_path.absolute()
+    )
+    is_hf_blob = re.fullmatch(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})", resolved.name)
+    if is_hf_snapshot and is_hf_blob and resolved.parent == blob_dir:
+        return resolved
+    raise ValueError(error)

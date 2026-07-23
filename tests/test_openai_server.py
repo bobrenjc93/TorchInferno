@@ -1804,6 +1804,80 @@ def test_transformers_chat_tokenizer_falls_back_when_template_is_unset() -> None
     assert encoded == [4, 5, 6]
 
 
+@pytest.mark.parametrize(
+    ("messages", "expected"),
+    [
+        (
+            [
+                {"role": "system", "content": "sys"},
+                {"role": "user", "content": "question"},
+            ],
+            "<｜begin▁of▁sentence｜>sys<｜User｜>question<｜Assistant｜></think>",
+        ),
+        (
+            [
+                {"role": "system", "content": "sys"},
+                {"role": "user", "content": "u1"},
+                {"role": "assistant", "content": "a1"},
+                {"role": "user", "content": "u2"},
+            ],
+            "<｜begin▁of▁sentence｜>sys<｜User｜>u1<｜Assistant｜></think>"
+            "a1<｜end▁of▁sentence｜><｜User｜>u2<｜Assistant｜></think>",
+        ),
+        (
+            [
+                {"role": "user", "content": "u0"},
+                {"role": "user", "content": "u1"},
+            ],
+            "<｜begin▁of▁sentence｜><｜User｜>u0\n\nu1"
+            "<｜Assistant｜></think>",
+        ),
+    ],
+)
+def test_deepseek_v4_chat_encoding_matches_released_text_contract(
+    messages: list[dict[str, object]],
+    expected: str,
+) -> None:
+    class RecordingTokenizer:
+        eos_token_id = 0
+
+        def encode(self, text: str, *, add_special_tokens: bool) -> list[int]:
+            assert text == expected
+            assert not add_special_tokens
+            return [11, 12]
+
+    tokenizer = _TransformersChatTokenizer(
+        RecordingTokenizer(),
+        chat_format="deepseek-v4",
+    )
+
+    assert tokenizer.encode_messages(messages) == [11, 12]
+
+
+def test_load_chat_tokenizer_selects_deepseek_v4_contract(monkeypatch) -> None:
+    class FakePreTrainedTokenizerFast:
+        @classmethod
+        def from_pretrained(cls, _name: str, **_kwargs: object) -> object:
+            return _BatchEncodingTokenizer()
+
+    monkeypatch.setitem(
+        sys.modules,
+        "transformers",
+        types.SimpleNamespace(
+            PreTrainedTokenizerFast=FakePreTrainedTokenizerFast,
+        ),
+    )
+    config = OpenAIServerConfig(
+        model="deepseek-ai/DeepSeek-V4-Flash",
+        model_kind="deepseek-v4",
+    )
+
+    tokenizer = load_chat_tokenizer(config, vocab_size=32)
+
+    assert isinstance(tokenizer, _TransformersChatTokenizer)
+    assert tokenizer.chat_format == "deepseek-v4"
+
+
 def test_transformers_chat_tokenizer_disables_bpe_cleanup_on_decode() -> None:
     class RecordingTokenizer(_BatchEncodingTokenizer):
         def __init__(self) -> None:
@@ -15562,6 +15636,106 @@ def test_openai_queue_profile_records_stream_group(tmp_path: Path, monkeypatch: 
     assert record["queue_wait_ms"] >= 0.0
     assert record["run_to_first_emit_ms"] is not None
     assert record["stream_emit_ms"] >= 0.0
+
+
+def test_openai_queue_profile_records_disaggregated_transfer_deltas(
+    tmp_path: Path,
+) -> None:
+    profile_path = tmp_path / "queue-profile.jsonl"
+    stats = iter(
+        [
+            {
+                "mode": "prefill-decode",
+                "transport": "nccl-p2p",
+                "tensor_parallel_size_per_role": 4,
+                "world_size": 8,
+                "transfer_count": 1,
+                "transfer_bytes": 1024,
+            },
+            {
+                "mode": "prefill-decode",
+                "transport": "nccl-p2p",
+                "tensor_parallel_size_per_role": 4,
+                "world_size": 8,
+                "transfer_count": 3,
+                "transfer_bytes": 4096,
+            },
+        ]
+    )
+    engine = _cache_only_engine()
+    engine._queue_profile_path = str(profile_path)
+    engine._queue_profile_lock = threading.Lock()
+    engine.model = types.SimpleNamespace(
+        is_disaggregated_prefill_decode=True,
+        disaggregation_stats=lambda: next(stats),
+    )
+
+    engine._record_disaggregated_runtime_integrity(
+        group_sequence=7,
+        batch_size=2,
+        emitted_tokens=4,
+    )
+    engine._record_disaggregated_runtime_integrity(
+        group_sequence=8,
+        batch_size=3,
+        emitted_tokens=6,
+    )
+
+    records = [json.loads(line) for line in profile_path.read_text().splitlines()]
+    assert [record["transfer_count_delta"] for record in records] == [1, 2]
+    assert [record["transfer_bytes_delta"] for record in records] == [1024, 3072]
+    assert [record["stream_group_sequence"] for record in records] == [7, 8]
+    assert all(record["runtime_generated_prefix_reuse_requests"] == 0 for record in records)
+    assert all(record["runtime_identical_prompt_batch_groups"] == 0 for record in records)
+
+
+def test_openai_stream_group_pairs_disaggregated_runtime_evidence(
+    tmp_path: Path,
+) -> None:
+    profile_path = tmp_path / "queue-profile.jsonl"
+    engine = _cache_only_engine()
+    engine._queue_profile_path = str(profile_path)
+    engine._queue_profile_lock = threading.Lock()
+    engine._shared_prefix_prompt_list_tokens = lambda _prompts: 0  # type: ignore[method-assign]
+    engine.model = types.SimpleNamespace(
+        is_disaggregated_prefill_decode=True,
+        disaggregation_stats=lambda: {
+            "mode": "prefill-decode",
+            "transport": "nccl-p2p",
+            "tensor_parallel_size_per_role": 4,
+            "world_size": 8,
+            "transfer_count": 1,
+            "transfer_bytes": 1024,
+        },
+    )
+    request = _QueuedGeneration(
+        [1, 2],
+        2,
+        0.0,
+        True,
+        queue.Queue(),
+        queued_at_s=time.perf_counter(),
+        queue_sequence=3,
+    )
+
+    engine._record_stream_group_queue_profile(
+        [request],
+        group_start_s=time.perf_counter(),
+        first_emit_s=time.perf_counter(),
+        completed_steps=2,
+        emitted_tokens=2,
+        use_prompt_list_batch=False,
+        group_kind="padded",
+    )
+
+    stream, handoff = [
+        json.loads(line) for line in profile_path.read_text().splitlines()
+    ]
+    assert stream["event"] == "stream_group"
+    assert handoff["event"] == "disaggregated_runtime_integrity"
+    assert stream["stream_group_sequence"] == handoff["stream_group_sequence"]
+    assert stream["batch_size"] == handoff["batch_size"] == 1
+    assert stream["emitted_tokens"] == handoff["emitted_tokens"] == 2
 
 
 def test_openai_queue_profile_creates_parent_directories(

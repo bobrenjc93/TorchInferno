@@ -133,6 +133,79 @@ def test_checkpoint_tensor_loader_rejects_shard_symlink_escape(tmp_path) -> None
         CheckpointTensorLoader(checkpoint)
 
 
+def test_checkpoint_tensor_loader_accepts_huggingface_snapshot_blob_symlinks(
+    tmp_path,
+) -> None:
+    from safetensors.torch import save_file
+
+    model_cache = tmp_path / "models--org--model"
+    checkpoint = model_cache / "snapshots" / ("a" * 40)
+    blobs = model_cache / "blobs"
+    checkpoint.mkdir(parents=True)
+    blobs.mkdir()
+    shard_blob = blobs / ("b" * 64)
+    save_file({"weight": torch.arange(4)}, shard_blob)
+    (checkpoint / "model-00001-of-00001.safetensors").symlink_to(
+        Path("../../blobs") / shard_blob.name
+    )
+    index_blob = blobs / ("c" * 40)
+    index_blob.write_text(
+        json.dumps(
+            {"weight_map": {"weight": "model-00001-of-00001.safetensors"}}
+        )
+    )
+    (checkpoint / "model.safetensors.index.json").symlink_to(
+        Path("../../blobs") / index_blob.name
+    )
+
+    with CheckpointTensorLoader(checkpoint) as loader:
+        tensor = loader.tensor("weight", device=torch.device("cpu"))
+
+    torch.testing.assert_close(tensor, torch.arange(4))
+
+
+def test_checkpoint_tensor_loader_rejects_non_huggingface_sibling_blob_symlink(
+    tmp_path,
+) -> None:
+    checkpoint = tmp_path / "checkpoint" / "snapshots" / ("a" * 40)
+    blobs = tmp_path / "checkpoint" / "blobs"
+    checkpoint.mkdir(parents=True)
+    blobs.mkdir()
+    outside = blobs / ("b" * 64)
+    outside.touch()
+    (checkpoint / "escape.safetensors").symlink_to(
+        Path("../../blobs") / outside.name
+    )
+    (checkpoint / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {"weight": "escape.safetensors"}})
+    )
+
+    with pytest.raises(ValueError, match="escapes checkpoint root"):
+        CheckpointTensorLoader(checkpoint)
+
+
+def test_checkpoint_tensor_loader_rejects_huggingface_blob_directory_symlink(
+    tmp_path,
+) -> None:
+    model_cache = tmp_path / "models--evil--model"
+    checkpoint = model_cache / "snapshots" / ("a" * 40)
+    outside = tmp_path / "outside"
+    checkpoint.mkdir(parents=True)
+    outside.mkdir()
+    blob = outside / ("b" * 64)
+    blob.touch()
+    (model_cache / "blobs").symlink_to(outside, target_is_directory=True)
+    (checkpoint / "escape.safetensors").symlink_to(
+        Path("../../blobs") / blob.name
+    )
+    (checkpoint / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {"weight": "escape.safetensors"}})
+    )
+
+    with pytest.raises(ValueError, match="escapes checkpoint root"):
+        CheckpointTensorLoader(checkpoint)
+
+
 def test_v4_runtime_tilelang_loader_does_not_import_compiler_modules() -> None:
     script = textwrap.dedent(
         """

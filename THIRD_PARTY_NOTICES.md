@@ -28,6 +28,10 @@ The DeepSeek V4 CUDA path in
 `src/torchinferno/models/deepseek_v4/tensor_parallel.py` invokes SGLang's
 precompiled RMSNorm operator when it is available.
 
+The ordinary text-conversation framing in
+`src/torchinferno/openai_server.py` follows vLLM's DeepSeek V4 encoding
+contract for system, developer, user, and assistant messages.
+
 Copyright contributors to the SGLang and vLLM projects
 
 Licensed under the Apache License, Version 2.0. The complete license text is

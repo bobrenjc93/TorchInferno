@@ -4,8 +4,10 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+import torchinferno.models.deepseek_v4.tensor_parallel as v4_tp
 import torchinferno.runtime.disaggregated as disaggregated_runtime
 
+from torchinferno.models.deepseek_v4 import ops as v4_ops
 from torchinferno.models.deepseek_v4.tensor_parallel import (
     DeepSeekV4TensorParallelForCausalLM,
     ModelArgs,
@@ -327,3 +329,135 @@ def test_deepseek_v4_heterogeneous_handoff_includes_partial_compressor_state() -
         torch.testing.assert_close(target, source)
     target_model.finalize_disaggregated_cache_import(target_cache, tokens=129)
     assert target_cache.seq_len == 129
+
+
+def test_deepseek_v4_heterogeneous_handoff_preserves_next_logits(monkeypatch) -> None:
+    def act_quant(
+        x: torch.Tensor,
+        block_size: int = 128,
+        scale_fmt: object = None,
+        scale_dtype: torch.dtype = torch.float32,
+        inplace: bool = False,
+    ) -> torch.Tensor:
+        del scale_fmt, scale_dtype
+        quantized = v4_ops.fake_quant_fp8(x, block_size)
+        if not inplace:
+            raise AssertionError("unexpected non-inplace act_quant")
+        x.copy_(quantized)
+        return x
+
+    def fp4_act_quant(
+        x: torch.Tensor,
+        block_size: int = 32,
+        inplace: bool = False,
+    ) -> torch.Tensor:
+        quantized = v4_ops.fake_quant_fp4(x, block_size)
+        if not inplace:
+            raise AssertionError("unexpected non-inplace fp4_act_quant")
+        x.copy_(quantized)
+        return x
+
+    def sparse_attn(
+        q: torch.Tensor,
+        kv: torch.Tensor,
+        sink: torch.Tensor,
+        topk_idxs: torch.Tensor,
+        scale: float,
+    ) -> torch.Tensor:
+        batch_size, seq_len, _, _ = q.shape
+        output = torch.empty_like(q)
+        for batch in range(batch_size):
+            for token in range(seq_len):
+                indices = topk_idxs[batch, token]
+                selected = kv[batch, indices[indices >= 0].long()]
+                output[batch, token] = v4_ops.attention_with_sink(
+                    q[batch, token].unsqueeze(0),
+                    selected.unsqueeze(0),
+                    sink,
+                    scale,
+                )[0]
+        return output
+
+    monkeypatch.setattr(v4_tp, "hc_split_sinkhorn", v4_ops.hc_split_sinkhorn)
+    monkeypatch.setattr(v4_tp, "act_quant", act_quant)
+    monkeypatch.setattr(v4_tp, "fp4_act_quant", fp4_act_quant)
+    monkeypatch.setattr(v4_tp, "sparse_attn", sparse_attn)
+    args = ModelArgs(
+        max_batch_size=2,
+        max_seq_len=140,
+        dtype="bf16",
+        expert_dtype=None,
+        vocab_size=32,
+        dim=32,
+        moe_inter_dim=16,
+        n_layers=4,
+        n_hash_layers=1,
+        n_mtp_layers=0,
+        n_heads=2,
+        n_routed_experts=4,
+        n_activated_experts=2,
+        q_lora_rank=16,
+        head_dim=68,
+        rope_head_dim=4,
+        o_groups=1,
+        o_lora_rank=8,
+        window_size=8,
+        compress_ratios=(0, 4, 128, 0),
+        index_n_heads=2,
+        index_head_dim=64,
+        index_topk=8,
+    )
+    torch.manual_seed(123)
+    with v4_tp.set_dtype(torch.bfloat16):
+        source = DeepSeekV4TensorParallelForCausalLM(args).eval()
+        target = DeepSeekV4TensorParallelForCausalLM(args).eval()
+    with torch.no_grad():
+        for name, parameter in source.named_parameters():
+            if parameter.is_floating_point():
+                parameter.normal_(0, 0.02)
+            elif name.endswith("tid2eid"):
+                parameter.copy_(
+                    torch.randint(
+                        0,
+                        args.n_routed_experts,
+                        parameter.shape,
+                        dtype=parameter.dtype,
+                    )
+                )
+    target.load_state_dict(source.state_dict())
+
+    for tokens in (1, 3, 4, 5, 7, 8, 9, 127, 128, 129):
+        source_cache = source.allocate_cache(2, 140)
+        target_cache = target.allocate_cache(2, 140)
+        input_ids = torch.arange(tokens * 2).reshape(2, tokens).remainder(
+            args.vocab_size
+        )
+        with torch.inference_mode():
+            source(input_ids, cache=source_cache)
+        source_views = source.disaggregated_cache_tensors(
+            source_cache,
+            batch_size=2,
+            tokens=tokens,
+        )
+        target_views = target.disaggregated_cache_tensors(
+            target_cache,
+            batch_size=2,
+            tokens=tokens,
+        )
+        for dtype in sorted({view.dtype for view in source_views}, key=str):
+            source_group = [view for view in source_views if view.dtype == dtype]
+            target_group = [view for view in target_views if view.dtype == dtype]
+            buffer = torch.empty(
+                sum(view.numel() for view in source_group),
+                dtype=dtype,
+            )
+            _pack_tensor_views(source_group, buffer)
+            _unpack_tensor_views(target_group, buffer)
+        target.finalize_disaggregated_cache_import(target_cache, tokens=tokens)
+        next_ids = torch.tensor([[3], [17]])
+        with torch.inference_mode():
+            expected, _ = source(next_ids, cache=source_cache)
+            actual, _ = target(next_ids, cache=target_cache)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0, equal_nan=True)
+        source.release_cache(source_cache)
+        target.release_cache(target_cache)

@@ -938,6 +938,13 @@ Add `--disaggregation-profile` for synchronized pack/P2P/unpack timing. That
 flag deliberately inserts synchronization and should be used for profiling,
 not production latency measurements.
 
+When `TORCHINFERNO_OPENAI_QUEUE_PROFILE_JSONL` is set, each completed stream
+group is followed by a `disaggregated_runtime_integrity` record. It contains
+the stream-group sequence, positive cumulative and per-group KV-transfer
+counts/bytes, actual role topology and transport, and runtime-owned prompt or
+logits shortcut counters. This record is sync-free and is intended for external
+evaluation integrity checks; synchronized transfer timings remain opt-in.
+
 ## Disaggregated Rank Files
 
 `disagg-init` generates one standalone Python file per rank. Each file owns one

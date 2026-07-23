@@ -2371,12 +2371,15 @@ class _ByteFallbackTokenizer:
 
 
 class _TransformersChatTokenizer:
-    def __init__(self, tokenizer: object) -> None:
+    def __init__(self, tokenizer: object, *, chat_format: str = "auto") -> None:
         self.tokenizer = tokenizer
+        self.chat_format = chat_format
         self.eos_token_id = getattr(tokenizer, "eos_token_id", None)
         self.stop_token_ids = _chat_stop_token_ids(tokenizer)
 
     def encode_messages(self, messages: list[dict[str, object]]) -> list[int]:
+        if self.chat_format == "deepseek-v4":
+            return self.encode(_format_deepseek_v4_messages(messages))
         apply_chat_template = getattr(self.tokenizer, "apply_chat_template", None)
         chat_template = getattr(self.tokenizer, "chat_template", None)
         if callable(apply_chat_template) and chat_template:
@@ -2428,21 +2431,83 @@ def load_chat_tokenizer(
         config.tokenizer is None and config.model_kind.startswith("tiny")
     ):
         return _ByteFallbackTokenizer(vocab_size)
+    chat_format = (
+        "deepseek-v4"
+        if _engine_infer_model_kind(config) == "deepseek-v4"
+        else "auto"
+    )
     try:
-        from transformers import AutoTokenizer
+        if chat_format == "deepseek-v4":
+            from transformers import PreTrainedTokenizerFast as TokenizerLoader
+        else:
+            from transformers import AutoTokenizer as TokenizerLoader
     except Exception as exc:  # pragma: no cover - depends on optional dependency
         raise RuntimeError(
             "transformers is required for OpenAI-compatible text serving. "
             "Install TorchInferno with the 'serve' extra or pass --tokenizer byte for smoke tests."
         ) from exc
-    tokenizer = AutoTokenizer.from_pretrained(
+    tokenizer = TokenizerLoader.from_pretrained(
         tokenizer_name,
         trust_remote_code=config.trust_remote_code,
         token=config.token,
         revision=config.revision,
         cache_dir=config.cache_dir,
     )
-    return _TransformersChatTokenizer(tokenizer)
+    return _TransformersChatTokenizer(tokenizer, chat_format=chat_format)
+
+
+_DEEPSEEK_V4_BOS = "<｜begin▁of▁sentence｜>"
+_DEEPSEEK_V4_EOS = "<｜end▁of▁sentence｜>"
+_DEEPSEEK_V4_USER = "<｜User｜>"
+_DEEPSEEK_V4_ASSISTANT = "<｜Assistant｜>"
+_DEEPSEEK_V4_THINKING_END = "</think>"
+
+
+def _format_deepseek_v4_messages(messages: list[dict[str, object]]) -> str:
+    """Render the released V4 chat contract for ordinary text conversations."""
+
+    prompt = _DEEPSEEK_V4_BOS
+    for index, message in enumerate(messages):
+        unsupported = {
+            key
+            for key in ("content_blocks", "response_format", "task", "tool_calls", "tools")
+            if message.get(key)
+        }
+        if unsupported:
+            raise ValueError(
+                "DeepSeek V4 text serving does not support chat fields: "
+                + ", ".join(sorted(unsupported))
+            )
+        role = str(message.get("role", ""))
+        content_value = message.get("content", "")
+        if content_value is None:
+            content = ""
+        elif isinstance(content_value, str):
+            content = content_value
+        else:
+            raise TypeError("DeepSeek V4 chat message content must be text")
+        if role == "system":
+            prompt += content
+        elif role == "developer":
+            prompt += _DEEPSEEK_V4_USER + content
+        elif role == "user":
+            if index > 0 and messages[index - 1].get("role") == "user":
+                prompt += "\n\n" + content
+            else:
+                prompt += _DEEPSEEK_V4_USER + content
+        elif role == "assistant":
+            prompt += content + _DEEPSEEK_V4_EOS
+        else:
+            raise ValueError(f"Unsupported DeepSeek V4 chat role: {role!r}")
+
+        next_role = (
+            str(messages[index + 1].get("role", ""))
+            if index + 1 < len(messages)
+            else ""
+        )
+        if role in {"developer", "user"} and next_role in {"", "assistant"}:
+            prompt += _DEEPSEEK_V4_ASSISTANT + _DEEPSEEK_V4_THINKING_END
+    return prompt
 
 
 def _chat_stop_token_ids(tokenizer: object) -> frozenset[int]:
@@ -2634,6 +2699,30 @@ def _iter_generated_steps(
         yield step_tokens
 
 
+_DISAGGREGATED_INTEGRITY_SHORTCUT_COUNTERS = (
+    "runtime_generated_prefix_store_requests",
+    "runtime_generated_prefix_reuse_requests",
+    "runtime_generated_prefix_reuse_tokens",
+    "runtime_prompt_lookup_requests",
+    "runtime_prompt_lookup_accepted_tokens",
+    "runtime_repeated_sample_state_hits",
+    "runtime_repeated_sample_state_tokens",
+    "runtime_reusable_prefix_logits_entries",
+    "runtime_reusable_prefix_logits_tokens",
+    "runtime_reusable_prefix_sample_state_entries",
+    "runtime_reusable_prefix_greedy_token_entries",
+    "runtime_continuous_stream_groups",
+    "runtime_identical_prompt_batch_groups",
+    "runtime_identical_prompt_batch_requests",
+)
+
+
+def _nonnegative_runtime_integer(value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise RuntimeError(f"invalid disaggregated runtime counter: {value!r}")
+    return value
+
+
 class OpenAICompletionEngine:
     def __init__(
         self,
@@ -2707,6 +2796,12 @@ class OpenAICompletionEngine:
         self._persistent_prompt_list_step_last_result: _PersistentPromptListStepResult | None = None
         self._token_budget_step_state: _TokenBudgetStepState | None = None
         self._token_budget_step_last_result: _TokenBudgetStepResult | None = None
+        self._disaggregated_integrity_shortcut_counters = {
+            name: 0 for name in _DISAGGREGATED_INTEGRITY_SHORTCUT_COUNTERS
+        }
+        self._disaggregated_integrity_group_sequence = 0
+        self._disaggregated_integrity_previous_transfer_count = 0
+        self._disaggregated_integrity_previous_transfer_bytes = 0
         self._warmup_tokenizer()
         self._warmup_tensor_parallel_control_group()
         self._warmup_tensor_parallel_model()
@@ -7387,6 +7482,79 @@ class OpenAICompletionEngine:
                     record[f"runtime_{name}"] = {
                         str(key): float(elapsed_ms) for key, elapsed_ms in top_timings
                     }
+        self._update_disaggregated_integrity_shortcut_counters(record)
+        self._record_queue_profile(record)
+
+    def _increment_disaggregated_integrity_counter(
+        self,
+        name: str,
+        value: int = 1,
+    ) -> None:
+        counters = getattr(self, "_disaggregated_integrity_shortcut_counters", None)
+        if not isinstance(counters, dict):
+            counters = {key: 0 for key in _DISAGGREGATED_INTEGRITY_SHORTCUT_COUNTERS}
+            self._disaggregated_integrity_shortcut_counters = counters
+        counters[name] = int(counters.get(name, 0)) + max(0, int(value))
+
+    def _update_disaggregated_integrity_shortcut_counters(
+        self,
+        record: Mapping[str, object],
+    ) -> None:
+        counters = getattr(self, "_disaggregated_integrity_shortcut_counters", None)
+        if not isinstance(counters, dict):
+            return
+        for name in _DISAGGREGATED_INTEGRITY_SHORTCUT_COUNTERS:
+            value = record.get(name)
+            if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                counters[name] = max(int(counters.get(name, 0)), value)
+
+    def _record_disaggregated_runtime_integrity(
+        self,
+        *,
+        group_sequence: int,
+        batch_size: int,
+        emitted_tokens: int,
+    ) -> None:
+        if not _is_disaggregated_prefill_decode_model(self.model):
+            return
+        stats_fn = getattr(self.model, "disaggregation_stats", None)
+        if not callable(stats_fn):
+            raise RuntimeError("disaggregated model does not expose runtime transfer stats")
+        stats = stats_fn()
+        if not isinstance(stats, Mapping):
+            raise RuntimeError("disaggregated model returned invalid runtime transfer stats")
+        transfer_count = _nonnegative_runtime_integer(stats.get("transfer_count"))
+        transfer_bytes = _nonnegative_runtime_integer(stats.get("transfer_bytes"))
+        previous_count = int(
+            getattr(self, "_disaggregated_integrity_previous_transfer_count", 0)
+        )
+        previous_bytes = int(
+            getattr(self, "_disaggregated_integrity_previous_transfer_bytes", 0)
+        )
+        self._disaggregated_integrity_previous_transfer_count = transfer_count
+        self._disaggregated_integrity_previous_transfer_bytes = transfer_bytes
+        counters = getattr(self, "_disaggregated_integrity_shortcut_counters", None)
+        if not isinstance(counters, dict):
+            counters = {name: 0 for name in _DISAGGREGATED_INTEGRITY_SHORTCUT_COUNTERS}
+        record: dict[str, object] = {
+            "event": "disaggregated_runtime_integrity",
+            "stream_group_sequence": group_sequence,
+            "batch_size": batch_size,
+            "emitted_tokens": emitted_tokens,
+            "mode": stats.get("mode"),
+            "transport": stats.get("transport"),
+            "tensor_parallel_size_per_role": stats.get(
+                "tensor_parallel_size_per_role"
+            ),
+            "world_size": stats.get("world_size"),
+            "transfer_count": transfer_count,
+            "transfer_bytes": transfer_bytes,
+            "transfer_count_delta": transfer_count - previous_count,
+            "transfer_bytes_delta": transfer_bytes - previous_bytes,
+        }
+        record.update(
+            {name: int(counters.get(name, 0)) for name in _DISAGGREGATED_INTEGRITY_SHORTCUT_COUNTERS}
+        )
         self._record_queue_profile(record)
 
     def _reset_stream_group_profile_extra(self) -> None:
@@ -8037,6 +8205,9 @@ class OpenAICompletionEngine:
         return hasattr(self.model, "allocate_cache")
 
     def _run_queued_stream_group_runtime_continuous(self, group: Sequence[_QueuedGeneration]) -> None:
+        self._increment_disaggregated_integrity_counter(
+            "runtime_continuous_stream_groups"
+        )
         max_active = env_int(
             "TORCHINFERNO_OPENAI_RUNTIME_CONTINUOUS_MAX_ACTIVE",
             min(max(1, len(group)), int(getattr(self, "max_batch_size", max(1, len(group))))),
@@ -8177,7 +8348,17 @@ class OpenAICompletionEngine:
             record.update(extra)
         record.update(_model_graph_cache_profile_fields(self.model, "graph_after_"))
         self._stream_group_profile_extra = {}
+        group_sequence = int(
+            getattr(self, "_disaggregated_integrity_group_sequence", 0)
+        )
+        self._disaggregated_integrity_group_sequence = group_sequence + 1
+        record["stream_group_sequence"] = group_sequence
         self._record_queue_profile(record)
+        self._record_disaggregated_runtime_integrity(
+            group_sequence=group_sequence,
+            batch_size=len(group),
+            emitted_tokens=emitted_tokens,
+        )
 
     def _should_use_prompt_list_stream_group(self, prompts: Sequence[Sequence[int]]) -> bool:
         if _is_disaggregated_prefill_decode_model(self.model):
@@ -9715,6 +9896,13 @@ class OpenAICompletionEngine:
         temperature: float,
         row_max_tokens: Sequence[int] | None = None,
     ) -> Iterator[list[int | None]]:
+        self._increment_disaggregated_integrity_counter(
+            "runtime_identical_prompt_batch_groups"
+        )
+        self._increment_disaggregated_integrity_counter(
+            "runtime_identical_prompt_batch_requests",
+            batch_size,
+        )
         eos_token_id = self.tokenizer.eos_token_id
         stop_token_ids = self.stop_token_ids
         model = self.model
