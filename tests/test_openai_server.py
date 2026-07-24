@@ -15636,6 +15636,20 @@ def test_openai_queue_profile_records_stream_group(tmp_path: Path, monkeypatch: 
     assert record["queue_wait_ms"] >= 0.0
     assert record["run_to_first_emit_ms"] is not None
     assert record["stream_emit_ms"] >= 0.0
+    for counter in (
+        "runtime_generated_prefix_store_requests",
+        "runtime_generated_prefix_reuse_requests",
+        "runtime_generated_prefix_reuse_tokens",
+        "runtime_prompt_lookup_requests",
+        "runtime_prompt_lookup_accepted_tokens",
+        "runtime_repeated_sample_state_hits",
+        "runtime_repeated_sample_state_tokens",
+        "runtime_reusable_prefix_logits_entries",
+        "runtime_reusable_prefix_logits_tokens",
+        "runtime_reusable_prefix_sample_state_entries",
+        "runtime_reusable_prefix_greedy_token_entries",
+    ):
+        assert record[counter] == 0
 
 
 def test_openai_queue_profile_records_disaggregated_transfer_deltas(

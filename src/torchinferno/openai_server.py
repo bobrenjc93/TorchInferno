@@ -7508,6 +7508,18 @@ class OpenAICompletionEngine:
             if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
                 counters[name] = max(int(counters.get(name, 0)), value)
 
+    def _runtime_integrity_shortcut_counter_snapshot(self) -> dict[str, int]:
+        counters = getattr(self, "_disaggregated_integrity_shortcut_counters", None)
+        if not isinstance(counters, dict):
+            counters = {
+                name: 0 for name in _DISAGGREGATED_INTEGRITY_SHORTCUT_COUNTERS
+            }
+            self._disaggregated_integrity_shortcut_counters = counters
+        return {
+            name: _nonnegative_runtime_integer(counters.get(name, 0))
+            for name in _DISAGGREGATED_INTEGRITY_SHORTCUT_COUNTERS
+        }
+
     def _record_disaggregated_runtime_integrity(
         self,
         *,
@@ -7533,9 +7545,6 @@ class OpenAICompletionEngine:
         )
         self._disaggregated_integrity_previous_transfer_count = transfer_count
         self._disaggregated_integrity_previous_transfer_bytes = transfer_bytes
-        counters = getattr(self, "_disaggregated_integrity_shortcut_counters", None)
-        if not isinstance(counters, dict):
-            counters = {name: 0 for name in _DISAGGREGATED_INTEGRITY_SHORTCUT_COUNTERS}
         record: dict[str, object] = {
             "event": "disaggregated_runtime_integrity",
             "stream_group_sequence": group_sequence,
@@ -7552,9 +7561,7 @@ class OpenAICompletionEngine:
             "transfer_count_delta": transfer_count - previous_count,
             "transfer_bytes_delta": transfer_bytes - previous_bytes,
         }
-        record.update(
-            {name: int(counters.get(name, 0)) for name in _DISAGGREGATED_INTEGRITY_SHORTCUT_COUNTERS}
-        )
+        record.update(self._runtime_integrity_shortcut_counter_snapshot())
         self._record_queue_profile(record)
 
     def _reset_stream_group_profile_extra(self) -> None:
@@ -8347,6 +8354,7 @@ class OpenAICompletionEngine:
         if isinstance(extra, dict):
             record.update(extra)
         record.update(_model_graph_cache_profile_fields(self.model, "graph_after_"))
+        record.update(self._runtime_integrity_shortcut_counter_snapshot())
         self._stream_group_profile_extra = {}
         group_sequence = int(
             getattr(self, "_disaggregated_integrity_group_sequence", 0)
