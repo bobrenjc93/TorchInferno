@@ -100,6 +100,7 @@ from torchinferno.openai_server import (
     _identical_prompt_cache_pool_enabled,
     _identical_prompt_prefill_graph_capture_enabled,
     _mark_generation_cache_prefix,
+    _memory_bounded_online_cache_shape,
     _online_common_prefix_prefill_warmup_rows,
     _online_common_prefix_prefill_warmup_tokens,
     _online_common_prefix_suffix_prefill_warmup_enabled,
@@ -201,6 +202,7 @@ from torchinferno.openai_server import (
     _set_shared_prefix_ragged_static_graph_bucket_mode,
     _shared_prefix_padded_suffix_bucketed_length,
     _shared_prefix_ragged_decode_row_plan,
+    _tensor_parallel_cache_bytes_per_row,
     _tensor_parallel_prefill_graph_runtime_key_scope,
     _tensor_parallel_symm_mem_allreduce_scope,
     _tensor_parallel_symm_mem_allreduce_probe_batches,
@@ -326,6 +328,71 @@ def test_online_serving_warmup_cache_falls_back_to_dense_without_flashinfer(
 
     assert allocated_backends == ["dense"]
     assert getattr(cache, "cache_backend", None) == "dense"
+
+
+def test_memory_bounded_online_cache_shape_preserves_runtime_headroom() -> None:
+    gib = 1024**3
+    row_bytes = 80 * 1024**2
+
+    assert _memory_bounded_online_cache_shape(
+        max_active=64,
+        prefix_rows=80,
+        free_bytes=64 * gib,
+        row_bytes=row_bytes,
+    ) == (64, 80)
+    assert _memory_bounded_online_cache_shape(
+        max_active=64,
+        prefix_rows=80,
+        free_bytes=10 * gib,
+        row_bytes=row_bytes,
+    ) == (48, 16)
+
+
+def test_tensor_parallel_cache_bytes_per_row_uses_local_kv_heads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = types.SimpleNamespace(
+        config=types.SimpleNamespace(num_key_value_heads=8, head_dim=128),
+        layers=[object() for _ in range(80)],
+        dtype=torch.bfloat16,
+    )
+    monkeypatch.setattr(
+        "torchinferno.openai_server._tensor_parallel_world_size",
+        lambda candidate: 4 if candidate is model else 1,
+    )
+
+    assert _tensor_parallel_cache_bytes_per_row(model, 1024) == 80 * 1024**2
+
+
+def test_online_cache_memory_bound_persists_runtime_row_limits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = _cache_only_engine()
+    engine.device = torch.device("cuda")
+    engine.model = types.SimpleNamespace()
+    monkeypatch.setattr(
+        "torchinferno.openai_server._is_tensor_parallel_model",
+        lambda candidate: candidate is engine.model,
+    )
+    monkeypatch.setattr(
+        "torchinferno.openai_server._tensor_parallel_cache_bytes_per_row",
+        lambda model, max_seq_len: 80 * 1024**2,
+    )
+    monkeypatch.setattr(
+        "torchinferno.openai_server._tensor_parallel_min_cuda_free_bytes",
+        lambda model, device: 10 * 1024**3,
+    )
+
+    assert engine._bounded_online_cache_shape_for_memory(
+        max_active=64,
+        prefix_rows=80,
+        max_seq_len=768,
+    ) == (48, 16)
+    assert engine.model.cache_row_capacity == 64
+    assert engine.model._online_cache_max_active_capacity == 48
+    engine.max_batch_size = 128
+    assert engine._online_serving_max_active() == 48
+    assert engine._online_serving_effective_prefix_rows(48) == 16
 
 
 def test_flashinfer_prefill_warmup_batches_are_capped(

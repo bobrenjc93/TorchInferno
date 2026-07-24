@@ -221,6 +221,65 @@ def _online_decode_warmup_batch_sizes(*, max_active: int, cache_batch: int) -> t
     return tuple(sorted(batch_sizes))
 
 
+def _memory_bounded_online_cache_shape(
+    *,
+    max_active: int,
+    prefix_rows: int,
+    free_bytes: int,
+    row_bytes: int,
+) -> tuple[int, int]:
+    """Fit active and prefix rows while retaining runtime activation headroom."""
+    max_active = max(1, int(max_active))
+    prefix_rows = max(0, int(prefix_rows))
+    if free_bytes <= 0 or row_bytes <= 0:
+        return max_active, prefix_rows
+
+    half_free = int(free_bytes) // 2
+    after_reserve = max(0, int(free_bytes) - 4 * 1024**3)
+    usable_bytes = min(half_free, after_reserve)
+    row_capacity = max(1, usable_bytes // int(row_bytes))
+    if row_capacity >= max_active + prefix_rows:
+        return max_active, prefix_rows
+
+    if prefix_rows <= 0:
+        return min(max_active, row_capacity), 0
+    bounded_active = min(max_active, max(1, row_capacity * 3 // 4))
+    bounded_prefix = min(prefix_rows, max(0, row_capacity - bounded_active))
+    return bounded_active, bounded_prefix
+
+
+def _tensor_parallel_cache_bytes_per_row(model: object, max_seq_len: int) -> int:
+    try:
+        config = getattr(model, "config")
+        layers = getattr(model, "layers")
+        world_size = _tensor_parallel_world_size(model)
+        key_value_heads = int(getattr(config, "num_key_value_heads"))
+        head_dim = int(getattr(config, "head_dim"))
+        dtype = getattr(model, "dtype")
+        layer_count = len(layers)
+        if (
+            world_size <= 0
+            or key_value_heads <= 0
+            or key_value_heads % world_size != 0
+            or head_dim <= 0
+            or layer_count <= 0
+            or max_seq_len <= 0
+        ):
+            return 0
+        element_size = torch.empty((), dtype=dtype).element_size()
+    except (AttributeError, TypeError, ValueError):
+        return 0
+    local_key_value_heads = key_value_heads // world_size
+    return (
+        layer_count
+        * 2
+        * local_key_value_heads
+        * int(max_seq_len)
+        * head_dim
+        * element_size
+    )
+
+
 def _online_decode_warmup_runtime_symm_mem_allreduce_enabled() -> bool:
     env_name = "TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE_DECODE_WARMUP"
     if env_name in os.environ:
@@ -3160,17 +3219,62 @@ class OpenAICompletionEngine:
         )
         return max(1, min(base, bounded, effective))
 
+    def _bounded_online_cache_shape_for_memory(
+        self,
+        *,
+        max_active: int,
+        prefix_rows: int,
+        max_seq_len: int,
+    ) -> tuple[int, int]:
+        model = self.model
+        if self.device.type != "cuda" or not _is_tensor_parallel_model(model):
+            return max_active, prefix_rows
+        if int(getattr(model, "cache_row_capacity", 0) or 0) > 0:
+            return max_active, prefix_rows
+        cache_tokens = _generation_cache_capacity(model, max_seq_len)
+        row_bytes = _tensor_parallel_cache_bytes_per_row(model, cache_tokens)
+        if row_bytes <= 0:
+            return max_active, prefix_rows
+        try:
+            free_bytes = _tensor_parallel_min_cuda_free_bytes(model, self.device)
+        except Exception as exc:
+            warn_optional_failure("openai.online_cache_memory_capacity", exc)
+            return max_active, prefix_rows
+        bounded_active, bounded_prefix = _memory_bounded_online_cache_shape(
+            max_active=max_active,
+            prefix_rows=prefix_rows,
+            free_bytes=free_bytes,
+            row_bytes=row_bytes,
+        )
+        if (bounded_active, bounded_prefix) == (max_active, prefix_rows):
+            return max_active, prefix_rows
+        row_capacity = bounded_active + bounded_prefix
+        setattr(model, "cache_row_capacity", row_capacity)
+        setattr(model, "_online_cache_max_active_capacity", bounded_active)
+        _startup_warmup_log(
+            model,
+            "memory-bounded online cache "
+            f"rows={row_capacity} active={bounded_active} prefix={bounded_prefix} "
+            f"row_mib={row_bytes / 1024**2:.1f} free_gib={free_bytes / 1024**3:.1f}",
+        )
+        return bounded_active, bounded_prefix
+
     def _allocate_online_serving_warmup_cache(self) -> tuple[object, int, int, int]:
         max_active = self._kv_bounded_concurrency_cap()
-        # Persistent cache holds active rows plus extra rows for shared prompt
-        # prefixes, so the continuous batcher can prefill only suffixes.
-        total_rows = max_active + self._online_serving_effective_prefix_rows(max_active)
-        cache_batch = total_rows
+        prefix_rows = self._online_serving_effective_prefix_rows(max_active)
         max_seq_len = env_int(
             "TORCHINFERNO_OPENAI_UNIFIED_MAX_SEQ_LEN",
             getattr(self, "max_model_len", None) or 768,
             minimum=64,
         )
+        max_active, prefix_rows = self._bounded_online_cache_shape_for_memory(
+            max_active=max_active,
+            prefix_rows=prefix_rows,
+            max_seq_len=max_seq_len,
+        )
+        # Persistent cache holds active rows plus extra rows for shared prompt
+        # prefixes, so the continuous batcher can prefill only suffixes.
+        cache_batch = max_active + prefix_rows
         paged_kv_requested = _paged_kv_active_for(self.model, max_seq_len)
         paged_cache_fallback_candidate = paged_kv_requested or hasattr(self.model, "forward_decode_paged")
         unified_cache_backend = _online_continuous_cache_backend(
@@ -5130,6 +5234,11 @@ class OpenAICompletionEngine:
         del temperature, max_tokens
         cap = env_int("TORCHINFERNO_OPENAI_TP_ONLINE_MAX_ACTIVE", 64, minimum=1)
         effective = _effective_openai_max_batch_size(self.model, self.device, self.max_batch_size)
+        memory_capacity = int(
+            getattr(self.model, "_online_cache_max_active_capacity", 0) or 0
+        )
+        if memory_capacity > 0:
+            cap = min(cap, memory_capacity)
         return max(1, min(cap, effective))
 
     def _online_serving_prefix_rows(
@@ -14396,6 +14505,24 @@ def _tensor_parallel_all_ranks_true(model: object, value: bool, device: torch.de
     flag = torch.tensor([1 if value else 0], dtype=torch.int32, device=device)
     dist.all_reduce(flag, op=dist.ReduceOp.MIN)
     return bool(flag.item())
+
+
+def _tensor_parallel_min_cuda_free_bytes(model: object, device: torch.device) -> int:
+    free_bytes, _total_bytes = torch.cuda.mem_get_info(device)
+    if not _is_tensor_parallel_model(model) or _tensor_parallel_world_size(model) <= 1:
+        return int(free_bytes)
+    import torch.distributed as dist
+
+    if not dist.is_available() or not dist.is_initialized():
+        return int(free_bytes)
+    control_group = _tensor_parallel_control_group(dist)
+    if control_group is not None:
+        value = torch.tensor([int(free_bytes)], dtype=torch.int64)
+        dist.all_reduce(value, op=dist.ReduceOp.MIN, group=control_group)
+        return int(value.item())
+    value = torch.tensor([int(free_bytes)], dtype=torch.int64, device=device)
+    dist.all_reduce(value, op=dist.ReduceOp.MIN)
+    return int(value.item())
 
 
 def _tensor_parallel_all_ranks_same_int(model: object, value: int, device: torch.device) -> bool:
