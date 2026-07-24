@@ -394,13 +394,19 @@ def test_memory_bounded_online_cache_shape_preserves_runtime_headroom() -> None:
         free_bytes=10 * gib,
         row_bytes=row_bytes,
     ) == (48, 16)
+    assert _memory_bounded_online_cache_shape(
+        max_active=64,
+        prefix_rows=80,
+        free_bytes=int(6.4 * gib),
+        row_bytes=row_bytes,
+    ) == (12, 5)
 
 
-def test_memory_bounded_online_graph_warmup_requires_five_gib_headroom() -> None:
+def test_memory_bounded_online_graph_warmup_requires_six_gib_headroom() -> None:
     gib = 1024**3
 
-    assert not _memory_bounded_online_graph_warmup_allowed(5 * gib - 1)
-    assert _memory_bounded_online_graph_warmup_allowed(5 * gib)
+    assert not _memory_bounded_online_graph_warmup_allowed(6 * gib - 1)
+    assert _memory_bounded_online_graph_warmup_allowed(6 * gib)
 
 
 def test_tensor_parallel_cache_bytes_per_row_uses_local_kv_heads(

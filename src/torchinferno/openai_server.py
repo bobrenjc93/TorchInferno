@@ -235,7 +235,7 @@ def _memory_bounded_online_cache_shape(
         return max_active, prefix_rows
 
     half_free = int(free_bytes) // 2
-    after_reserve = max(0, int(free_bytes) - 4 * 1024**3)
+    after_reserve = max(0, int(free_bytes) - 5 * 1024**3)
     usable_bytes = min(half_free, after_reserve)
     row_capacity = max(1, usable_bytes // int(row_bytes))
     if row_capacity >= max_active + prefix_rows:
@@ -250,7 +250,7 @@ def _memory_bounded_online_cache_shape(
 
 def _memory_bounded_online_graph_warmup_allowed(post_cache_free_bytes: int) -> bool:
     """Require enough headroom for the private pools created by CUDA graphs."""
-    return int(post_cache_free_bytes) >= 5 * 1024**3
+    return int(post_cache_free_bytes) >= 6 * 1024**3
 
 
 def _tensor_parallel_cache_bytes_per_row(model: object, max_seq_len: int) -> int:
