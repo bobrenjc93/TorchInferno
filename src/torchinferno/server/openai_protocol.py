@@ -11,6 +11,7 @@ class OpenAIChatCompletionRequest:
     messages: list[dict[str, object]]
     max_tokens: int = 256
     temperature: float = 0.0
+    top_p: float = 1.0
     stream: bool = False
     model: str | None = None
 
@@ -30,11 +31,17 @@ def parse_chat_completion_request(payload: Mapping[str, object]) -> OpenAIChatCo
     temperature = float(payload.get("temperature", 0.0))
     if temperature < 0:
         raise ValueError("temperature must be non-negative")
+    top_p = float(payload.get("top_p", 1.0))
+    if not 0.0 < top_p <= 1.0:
+        raise ValueError("top_p must be greater than 0 and at most 1")
+    if top_p != 1.0:
+        raise ValueError("TorchInferno currently supports only top_p=1.0")
     model = payload.get("model")
     return OpenAIChatCompletionRequest(
         messages=normalized_messages,
         max_tokens=max_tokens,
         temperature=temperature,
+        top_p=top_p,
         stream=bool(payload.get("stream", False)),
         model=str(model) if model is not None else None,
     )

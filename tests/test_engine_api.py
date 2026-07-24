@@ -335,6 +335,7 @@ def test_openai_protocol_helpers_are_engine_neutral() -> None:
             "messages": [{"role": "user", "content": "hi"}],
             "max_tokens": 3,
             "temperature": 0.0,
+            "top_p": 1.0,
             "stream": True,
         }
     )
@@ -350,5 +351,27 @@ def test_openai_protocol_helpers_are_engine_neutral() -> None:
 
     assert request.stream is True
     assert request.max_tokens == 3
+    assert request.top_p == 1.0
     assert models["data"][0]["id"] == "tiny"  # type: ignore[index]
     assert response["usage"]["total_tokens"] == 6  # type: ignore[index]
+
+
+def test_openai_protocol_rejects_unsupported_top_p() -> None:
+    with pytest.raises(ValueError, match="only top_p=1.0"):
+        parse_chat_completion_request(
+            {
+                "messages": [{"role": "user", "content": "hi"}],
+                "top_p": 0.9,
+            }
+        )
+
+
+@pytest.mark.parametrize("top_p", [0.0, -0.1, 1.1])
+def test_openai_protocol_rejects_invalid_top_p(top_p: float) -> None:
+    with pytest.raises(ValueError, match="top_p must be"):
+        parse_chat_completion_request(
+            {
+                "messages": [{"role": "user", "content": "hi"}],
+                "top_p": top_p,
+            }
+        )
