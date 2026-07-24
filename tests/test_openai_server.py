@@ -101,6 +101,7 @@ from torchinferno.openai_server import (
     _identical_prompt_prefill_graph_capture_enabled,
     _mark_generation_cache_prefix,
     _memory_bounded_online_cache_shape,
+    _memory_bounded_online_graph_warmup_allowed,
     _online_common_prefix_prefill_warmup_rows,
     _online_common_prefix_prefill_warmup_tokens,
     _online_common_prefix_suffix_prefill_warmup_enabled,
@@ -348,6 +349,13 @@ def test_memory_bounded_online_cache_shape_preserves_runtime_headroom() -> None:
     ) == (48, 16)
 
 
+def test_memory_bounded_online_graph_warmup_requires_five_gib_headroom() -> None:
+    gib = 1024**3
+
+    assert not _memory_bounded_online_graph_warmup_allowed(5 * gib - 1)
+    assert _memory_bounded_online_graph_warmup_allowed(5 * gib)
+
+
 def test_tensor_parallel_cache_bytes_per_row_uses_local_kv_heads(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -390,6 +398,7 @@ def test_online_cache_memory_bound_persists_runtime_row_limits(
     ) == (48, 16)
     assert engine.model.cache_row_capacity == 64
     assert engine.model._online_cache_max_active_capacity == 48
+    assert engine.model._online_cache_post_allocation_free_bytes == 5 * 1024**3
     engine.max_batch_size = 128
     assert engine._online_serving_max_active() == 48
     assert engine._online_serving_effective_prefix_rows(48) == 16
@@ -1420,6 +1429,25 @@ def test_openai_unified_scheduler_decode_warmup_uses_runtime_symm_scope(monkeypa
         (0.0, 1),
         (1.0, 1),
     ]
+
+
+def test_openai_memory_bounded_scheduler_cache_skips_optional_graph_capture() -> None:
+    cache = _WarmupShapeCache()
+    model = _WarmupShapeModel()
+    model._online_cache_post_allocation_free_bytes = 4 * 1024**3
+    engine = object.__new__(OpenAICompletionEngine)
+    engine.model = model
+    engine.device = torch.device("cpu")
+    engine._persistent_serving_cache = None
+    engine._allocate_online_serving_warmup_cache = lambda: (cache, 4, 4, 16)  # type: ignore[method-assign]
+
+    engine._warmup_unified_scheduler_cache(vocab_size=16)
+
+    assert cache._block_decode_graph_captures is True
+    assert cache._torchinferno_disable_ragged_decode_graph is True
+    assert model.ragged_shapes == []
+    assert model.decode_shapes == []
+    assert engine._persistent_serving_cache is cache
 
 
 def test_openai_unified_scheduler_mixed_prefix_warmup_uses_runtime_key_prefill_scope(

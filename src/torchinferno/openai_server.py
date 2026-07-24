@@ -248,6 +248,11 @@ def _memory_bounded_online_cache_shape(
     return bounded_active, bounded_prefix
 
 
+def _memory_bounded_online_graph_warmup_allowed(post_cache_free_bytes: int) -> bool:
+    """Require enough headroom for the private pools created by CUDA graphs."""
+    return int(post_cache_free_bytes) >= 5 * 1024**3
+
+
 def _tensor_parallel_cache_bytes_per_row(model: object, max_seq_len: int) -> int:
     try:
         config = getattr(model, "config")
@@ -3251,11 +3256,18 @@ class OpenAICompletionEngine:
         row_capacity = bounded_active + bounded_prefix
         setattr(model, "cache_row_capacity", row_capacity)
         setattr(model, "_online_cache_max_active_capacity", bounded_active)
+        post_cache_free_bytes = max(0, free_bytes - row_capacity * row_bytes)
+        setattr(
+            model,
+            "_online_cache_post_allocation_free_bytes",
+            post_cache_free_bytes,
+        )
         _startup_warmup_log(
             model,
             "memory-bounded online cache "
             f"rows={row_capacity} active={bounded_active} prefix={bounded_prefix} "
-            f"row_mib={row_bytes / 1024**2:.1f} free_gib={free_bytes / 1024**3:.1f}",
+            f"row_mib={row_bytes / 1024**2:.1f} free_gib={free_bytes / 1024**3:.1f} "
+            f"post_cache_free_gib={post_cache_free_bytes / 1024**3:.1f}",
         )
         return bounded_active, bounded_prefix
 
@@ -3299,6 +3311,15 @@ class OpenAICompletionEngine:
             device=self.device, cache_backend=unified_cache_backend, page_size=self.page_size,
         )
         _reset_generation_cache(cache)
+        if hasattr(self.model, "_online_cache_post_allocation_free_bytes"):
+            try:
+                setattr(
+                    self.model,
+                    "_online_cache_post_allocation_free_bytes",
+                    _tensor_parallel_min_cuda_free_bytes(self.model, self.device),
+                )
+            except Exception as exc:
+                warn_optional_failure("openai.online_cache_post_allocation_memory", exc)
         try:
             cache._skip_capture_sync = True
         except Exception:
@@ -3419,6 +3440,35 @@ class OpenAICompletionEngine:
             f"prompt_tokens={prompt_tokens} decode_batches={tuple(batch_sizes)} "
             f"decode_policies={decode_policy_specs}",
         )
+        post_cache_free_value = getattr(
+            self.model,
+            "_online_cache_post_allocation_free_bytes",
+            None,
+        )
+        post_cache_free_bytes = (
+            None if post_cache_free_value is None else int(post_cache_free_value)
+        )
+        if (
+            post_cache_free_bytes is not None
+            and not _memory_bounded_online_graph_warmup_allowed(post_cache_free_bytes)
+        ):
+            try:
+                cache._block_decode_graph_captures = True
+                cache._torchinferno_disable_ragged_decode_graph = True
+            except Exception:
+                pass
+            _startup_warmup_log(
+                self.model,
+                "memory-bounded online CUDA graph warmup skipped "
+                f"post_cache_free_gib={post_cache_free_bytes / 1024**3:.1f}",
+            )
+            _reset_generation_cache(cache)
+            try:
+                delattr(cache, "_skip_capture_sync")
+            except Exception:
+                pass
+            _finish_serving_cache_warmup(self, cache)
+            return
         decode_warmup_runtime_symm = _online_decode_warmup_runtime_symm_mem_allreduce_enabled()
         for warmup_temperature, warmup_max_tokens in decode_policy_specs:
             decode_started_s = time.perf_counter()
