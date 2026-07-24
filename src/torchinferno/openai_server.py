@@ -3294,16 +3294,30 @@ class OpenAICompletionEngine:
             paged_cache_fallback_candidate=paged_cache_fallback_candidate,
             use_paged_engine=_paged_online_engine_class_for(self.model, max_seq_len) is not None,
         )
-        # Keep the dense forward backend unless FlashInfer forward is explicitly
-        # requested. Paged decode is selected independently.
+        # A dense cache needs a second, equally large KV layout the first time
+        # the unified FlashInfer path runs. Use its native layout when memory
+        # bounding is active so that deferred mirror cannot invalidate the row
+        # capacity decision made above.
+        memory_bounded_native_flashinfer = hasattr(
+            self.model,
+            "_online_cache_post_allocation_free_bytes",
+        )
         if (
             unified_cache_backend == "dense"
-            and env_flag("TORCHINFERNO_OPENAI_FLASHINFER_FORWARD", False)
+            and (
+                env_flag("TORCHINFERNO_OPENAI_FLASHINFER_FORWARD", False)
+                or memory_bounded_native_flashinfer
+            )
             and hasattr(self.model, "forward_step_flashinfer")
         ):
             try:
                 __import__("flashinfer")
                 unified_cache_backend = "flashinfer"
+                if memory_bounded_native_flashinfer:
+                    _startup_warmup_log(
+                        self.model,
+                        "memory-bounded online cache using native FlashInfer storage",
+                    )
             except ImportError:
                 pass
         cache = _allocate_cache(

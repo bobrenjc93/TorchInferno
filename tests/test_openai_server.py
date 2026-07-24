@@ -331,6 +331,53 @@ def test_online_serving_warmup_cache_falls_back_to_dense_without_flashinfer(
     assert getattr(cache, "cache_backend", None) == "dense"
 
 
+def test_memory_bounded_online_cache_uses_native_flashinfer_storage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(sys.modules, "flashinfer", types.ModuleType("flashinfer"))
+    monkeypatch.setattr(
+        "torchinferno.openai_server._tensor_parallel_min_cuda_free_bytes",
+        lambda model, device: 4 * 1024**3,
+    )
+    allocated_backends: list[str] = []
+
+    class Model:
+        supports_prefix_cache = False
+        _online_cache_post_allocation_free_bytes = 4 * 1024**3
+
+        def forward_step_flashinfer(self) -> None:
+            raise AssertionError("cache allocation must not run model forward")
+
+        def allocate_cache(
+            self,
+            batch_size: int,
+            max_seq_len: int,
+            *,
+            device: torch.device | None = None,
+            cache_backend: str = "dense",
+            page_size: int = 16,
+        ) -> object:
+            del device, page_size
+            allocated_backends.append(cache_backend)
+            layer = types.SimpleNamespace(max_seq_len=max_seq_len, batch_size=batch_size, seq_len=0)
+            return types.SimpleNamespace(
+                cache_backend=cache_backend,
+                layers=[layer],
+                seq_len=0,
+                reset=lambda: None,
+            )
+
+    engine = _cache_only_engine()
+    engine.model = Model()
+    engine.max_batch_size = 4
+    engine.max_model_len = 128
+
+    cache, _max_active, _cache_batch, _max_seq_len = engine._allocate_online_serving_warmup_cache()
+
+    assert allocated_backends == ["flashinfer"]
+    assert getattr(cache, "cache_backend", None) == "flashinfer"
+
+
 def test_memory_bounded_online_cache_shape_preserves_runtime_headroom() -> None:
     gib = 1024**3
     row_bytes = 80 * 1024**2
