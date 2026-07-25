@@ -19555,7 +19555,10 @@ def _apply_tensor_parallel_serving_defaults(config: OpenAIServerConfig) -> None:
         "TORCHINFERNO_OPENAI_TP_ONLINE_PREFILL_TOKEN_BUDGET": "1024",
         "TORCHINFERNO_OPENAI_TP_ONLINE_MIN_GENERATION_CAPACITY": "128",
         "TORCHINFERNO_OPENAI_TP_ONLINE_SESSION_PROMPT_HEADROOM_TOKENS": "64",
-        "TORCHINFERNO_CONTINUOUS_ADMIT_PER_STEP_CAP": "48",
+        # Keep a cold arrival burst from forcing the first decode wave directly
+        # to the cache limit. Decode occupancy may still grow to max_active as
+        # later waves are admitted.
+        "TORCHINFERNO_CONTINUOUS_ADMIT_PER_STEP_CAP": "24",
         "TORCHINFERNO_CONTINUOUS_ADMIT_MIN_READY_REQUESTS": "6",
         "TORCHINFERNO_CONTINUOUS_ADMIT_MAX_WAIT_STEPS": "2",
         "TORCHINFERNO_CONTINUOUS_ADMIT_PRIORITY_MAX_WAIT_STEPS": "2",

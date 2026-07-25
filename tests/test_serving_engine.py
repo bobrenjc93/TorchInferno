@@ -3477,6 +3477,27 @@ def test_continuous_batch_engine_respects_admit_per_step_cap() -> None:
     assert by_id["third"].started_step == 2
 
 
+def test_continuous_batch_engine_admission_cap_does_not_cap_decode_occupancy() -> None:
+    model = _RaggedGraphToyModel()
+    engine = ContinuousBatchEngine(
+        model,
+        device=torch.device("cpu"),
+        max_active_requests=3,
+        admit_per_step_cap=1,
+    )
+
+    results = engine.run(
+        [
+            ServingRequest("first", (1,), 4, arrival_step=0),
+            ServingRequest("second", (2,), 4, arrival_step=0),
+            ServingRequest("third", (3,), 4, arrival_step=0),
+        ]
+    )
+
+    assert [result.started_step for result in results] == [0, 1, 2]
+    assert engine.stats.max_model_batch_size == 3
+
+
 def test_continuous_batch_engine_can_disable_prefix_hit_admission_priority(
     monkeypatch,
 ) -> None:

@@ -10723,6 +10723,7 @@ def test_tensor_parallel_serving_defaults_gate_fa3_backend(
         "TORCHINFERNO_CONTINUOUS_UNIFIED_FORWARD",
         "TORCHINFERNO_CONTINUOUS_TOKEN_BUCKET_FA3_UNIFIED",
         "TORCHINFERNO_CONTINUOUS_TOKEN_BUCKET_FA3_PREFILL",
+        "TORCHINFERNO_CONTINUOUS_ADMIT_PER_STEP_CAP",
         "TORCHINFERNO_CONTINUOUS_ADMIT_MIN_READY_REQUESTS",
         "TORCHINFERNO_CONTINUOUS_ADMIT_MAX_WAIT_STEPS",
         "TORCHINFERNO_CONTINUOUS_ADMIT_PRIORITY_MAX_WAIT_STEPS",
@@ -10746,6 +10747,7 @@ def test_tensor_parallel_serving_defaults_gate_fa3_backend(
     assert os.environ["TORCHINFERNO_CONTINUOUS_UNIFIED_FORWARD"] == expected
     assert os.environ["TORCHINFERNO_CONTINUOUS_TOKEN_BUCKET_FA3_UNIFIED"] == expected
     assert os.environ["TORCHINFERNO_CONTINUOUS_TOKEN_BUCKET_FA3_PREFILL"] == expected
+    assert os.environ["TORCHINFERNO_CONTINUOUS_ADMIT_PER_STEP_CAP"] == "24"
     assert os.environ["TORCHINFERNO_CONTINUOUS_ADMIT_MIN_READY_REQUESTS"] == "6"
     assert os.environ["TORCHINFERNO_CONTINUOUS_ADMIT_MAX_WAIT_STEPS"] == "2"
     assert os.environ["TORCHINFERNO_CONTINUOUS_ADMIT_PRIORITY_MAX_WAIT_STEPS"] == "2"
@@ -10760,6 +10762,7 @@ def test_tensor_parallel_serving_defaults_preserve_explicit_fa3_override(
     monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_UNIFIED_FORWARD", "1")
     monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_TOKEN_BUCKET_FA3_UNIFIED", "1")
     monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_TOKEN_BUCKET_FA3_PREFILL", "1")
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_ADMIT_PER_STEP_CAP", "17")
     monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_ADMIT_MAX_WAIT_STEPS", "5")
     monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_ADMIT_PRIORITY_MAX_WAIT_STEPS", "7")
     monkeypatch.setattr("torch.cuda.is_available", lambda: True)
@@ -10779,6 +10782,7 @@ def test_tensor_parallel_serving_defaults_preserve_explicit_fa3_override(
     assert os.environ["TORCHINFERNO_CONTINUOUS_UNIFIED_FORWARD"] == "1"
     assert os.environ["TORCHINFERNO_CONTINUOUS_TOKEN_BUCKET_FA3_UNIFIED"] == "1"
     assert os.environ["TORCHINFERNO_CONTINUOUS_TOKEN_BUCKET_FA3_PREFILL"] == "1"
+    assert os.environ["TORCHINFERNO_CONTINUOUS_ADMIT_PER_STEP_CAP"] == "17"
     assert os.environ["TORCHINFERNO_CONTINUOUS_ADMIT_MAX_WAIT_STEPS"] == "5"
     assert os.environ["TORCHINFERNO_CONTINUOUS_ADMIT_PRIORITY_MAX_WAIT_STEPS"] == "7"
 
