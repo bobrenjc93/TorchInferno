@@ -253,6 +253,16 @@ def _memory_bounded_online_graph_warmup_allowed(post_cache_free_bytes: int) -> b
     return int(post_cache_free_bytes) >= 6 * 1024**3
 
 
+def _online_prefill_graph_warmup_allowed(free_bytes: int) -> bool:
+    """Keep a shared activation reserve while optional prefill graphs accumulate."""
+    min_free_mb = env_int(
+        "TORCHINFERNO_OPENAI_PREFILL_GRAPH_WARMUP_MIN_FREE_MB",
+        8 * 1024,
+        minimum=0,
+    )
+    return int(free_bytes) >= min_free_mb * 1024 * 1024
+
+
 def _tensor_parallel_cache_bytes_per_row(model: object, max_seq_len: int) -> int:
     try:
         config = getattr(model, "config")
@@ -3902,6 +3912,23 @@ class OpenAICompletionEngine:
         )
         captured = 0
         capture_targets = 0
+        stopped_free_bytes: int | None = None
+
+        def has_capture_headroom() -> bool:
+            nonlocal stopped_free_bytes
+            try:
+                free_bytes = _tensor_parallel_min_cuda_free_bytes(
+                    self.model,
+                    self.device,
+                )
+            except Exception as exc:
+                warn_optional_failure("openai.token_bucket_warmup_memory", exc)
+                return True
+            if _online_prefill_graph_warmup_allowed(free_bytes):
+                return True
+            stopped_free_bytes = free_bytes
+            return False
+
         try:
             for layer in getattr(cache, "layers", ()):
                 layer.keys.zero_()
@@ -3927,6 +3954,8 @@ class OpenAICompletionEngine:
                     device=self.device,
                 )
                 for prefix_capacity in prefix_capacities:
+                    if not has_capture_headroom():
+                        break
                     copy_graph(
                         cache,
                         start_positions=torch.full_like(starts, prefix_capacity),
@@ -3935,7 +3964,11 @@ class OpenAICompletionEngine:
                         prefix_copy_capacity=prefix_capacity,
                         capture_on_miss=True,
                     )
+                if stopped_free_bytes is not None:
+                    break
                 for token_capacity in capacities:
+                    if not has_capture_headroom():
+                        break
                     base, remainder = divmod(token_capacity, batch_capacity)
                     q_lens_values = [
                         base + (1 if row < remainder else 0)
@@ -3989,10 +4022,16 @@ class OpenAICompletionEngine:
         finally:
             _set_tensor_parallel_runtime_fp8_prefill(self.model, enabled=False, min_m=2048)
             _reset_generation_cache(cache)
+            memory_note = (
+                ""
+                if stopped_free_bytes is None
+                else f"stopped_free_mib={stopped_free_bytes / 1024**2:.1f} "
+            )
             _startup_warmup_log(
                 self.model,
                 "token-bucket FA3 prefill warmup done "
                 f"captured={captured}/{capture_targets} "
+                f"{memory_note}"
                 f"in {time.perf_counter() - started_s:.1f}s",
             )
 
@@ -4566,6 +4605,21 @@ class OpenAICompletionEngine:
             return
         if not hasattr(self.model, "set_runtime_fp8_prefill"):
             return
+        try:
+            free_bytes = _tensor_parallel_min_cuda_free_bytes(
+                self.model,
+                self.device,
+            )
+        except Exception as exc:
+            warn_optional_failure("openai.fp8_ragged_warmup_memory", exc)
+        else:
+            if not _online_prefill_graph_warmup_allowed(free_bytes):
+                _startup_warmup_log(
+                    self.model,
+                    "runtime FP8 ragged prefill warmup skipped "
+                    f"free_mib={free_bytes / 1024**2:.1f}",
+                )
+                return
         ragged_prefill_graph = getattr(self.model, "try_prefill_ragged_logits_graph", None)
         if ragged_prefill_graph is None:
             return

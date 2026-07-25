@@ -102,6 +102,7 @@ from torchinferno.openai_server import (
     _mark_generation_cache_prefix,
     _memory_bounded_online_cache_shape,
     _memory_bounded_online_graph_warmup_allowed,
+    _online_prefill_graph_warmup_allowed,
     _online_common_prefix_prefill_warmup_rows,
     _online_common_prefix_prefill_warmup_tokens,
     _online_common_prefix_suffix_prefill_warmup_enabled,
@@ -453,6 +454,89 @@ def test_memory_bounded_online_graph_warmup_requires_six_gib_headroom() -> None:
 
     assert not _memory_bounded_online_graph_warmup_allowed(6 * gib - 1)
     assert _memory_bounded_online_graph_warmup_allowed(6 * gib)
+
+
+def test_online_prefill_graph_warmup_preserves_eight_gib_headroom(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gib = 1024**3
+    monkeypatch.delenv(
+        "TORCHINFERNO_OPENAI_PREFILL_GRAPH_WARMUP_MIN_FREE_MB",
+        raising=False,
+    )
+
+    assert not _online_prefill_graph_warmup_allowed(8 * gib - 1)
+    assert _online_prefill_graph_warmup_allowed(8 * gib)
+
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_PREFILL_GRAPH_WARMUP_MIN_FREE_MB", "0")
+    assert _online_prefill_graph_warmup_allowed(0)
+
+
+def test_token_bucket_warmup_stops_before_cross_rank_memory_floor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gib = 1024**3
+    graph_tokens: list[int] = []
+    warmup_logs: list[str] = []
+    free_bytes = iter((9 * gib, 7 * gib))
+
+    class Model:
+        def try_prefill_token_bucket_fa3_graph(self, input_ids, cache, **kwargs):
+            del cache, kwargs
+            graph_tokens.append(int(input_ids.numel()))
+            return torch.zeros((1,))
+
+        def try_copy_token_bucket_prefix_graph(self, *args, **kwargs):
+            del args, kwargs
+            return None
+
+    engine = _cache_only_engine()
+    engine.model = Model()
+    engine.device = torch.device("cpu")
+    cache = types.SimpleNamespace(layers=[])
+    monkeypatch.setattr(
+        "torchinferno.openai_server._token_bucket_fa3_prefill_warmup_enabled",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        "torchinferno.openai_server._token_bucket_fa3_batch_capacities",
+        lambda: (2,),
+    )
+    monkeypatch.setattr(
+        "torchinferno.openai_server._online_token_bucket_fa3_warmup_capacities",
+        lambda: (4, 8, 12),
+    )
+    monkeypatch.setattr(
+        "torchinferno.openai_server._online_token_bucket_prefix_copy_warmup_capacities",
+        lambda max_seq_len: (),
+    )
+    monkeypatch.setattr(
+        "torchinferno.openai_server._tensor_parallel_min_cuda_free_bytes",
+        lambda model, device: next(free_bytes),
+    )
+    monkeypatch.setattr(
+        "torchinferno.openai_server._set_tensor_parallel_runtime_fp8_prefill",
+        lambda model, enabled, min_m: None,
+    )
+    monkeypatch.setattr(
+        "torchinferno.openai_server._reset_generation_cache",
+        lambda candidate: None,
+    )
+    monkeypatch.setattr(
+        "torchinferno.openai_server._startup_warmup_log",
+        lambda model, message: warmup_logs.append(message),
+    )
+
+    engine._warmup_token_bucket_fa3_prefill_graphs(
+        cache,
+        vocab_size=32,
+        cache_rows=4,
+        max_seq_len=8,
+    )
+
+    assert graph_tokens == [4]
+    assert "captured=1/1" in warmup_logs[-1]
+    assert "stopped_free_mib=7168.0" in warmup_logs[-1]
 
 
 def test_tensor_parallel_cache_bytes_per_row_uses_local_kv_heads(
