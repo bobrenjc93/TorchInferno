@@ -539,6 +539,126 @@ def test_token_bucket_warmup_stops_before_cross_rank_memory_floor(
     assert "stopped_free_mib=7168.0" in warmup_logs[-1]
 
 
+def test_token_bucket_warmup_interleaves_reachable_batch_capacities(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gib = 1024**3
+    graph_shapes: list[tuple[int, int]] = []
+    free_bytes = iter((9 * gib, 9 * gib, 9 * gib, 7 * gib))
+
+    class Model:
+        def try_prefill_token_bucket_fa3_graph(self, input_ids, cache, **kwargs):
+            del cache
+            graph_shapes.append((int(kwargs["q_lens"].numel()), int(input_ids.numel())))
+            return torch.zeros((1,))
+
+        def try_copy_token_bucket_prefix_graph(self, *args, **kwargs):
+            del args, kwargs
+            return None
+
+    engine = _cache_only_engine()
+    engine.model = Model()
+    engine.device = torch.device("cpu")
+    cache = types.SimpleNamespace(layers=[])
+    monkeypatch.setattr(
+        "torchinferno.openai_server._token_bucket_fa3_prefill_warmup_enabled",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        "torchinferno.openai_server._token_bucket_fa3_batch_capacities",
+        lambda: (2, 4),
+    )
+    monkeypatch.setattr(
+        "torchinferno.openai_server._online_token_bucket_fa3_warmup_capacities",
+        lambda: (2, 4, 8),
+    )
+    monkeypatch.setattr(
+        "torchinferno.openai_server._online_token_bucket_prefix_copy_warmup_capacities",
+        lambda max_seq_len: (),
+    )
+    monkeypatch.setattr(
+        "torchinferno.openai_server._tensor_parallel_min_cuda_free_bytes",
+        lambda model, device: next(free_bytes),
+    )
+    monkeypatch.setattr(
+        "torchinferno.openai_server._set_tensor_parallel_runtime_fp8_prefill",
+        lambda model, enabled, min_m: None,
+    )
+    monkeypatch.setattr(
+        "torchinferno.openai_server._reset_generation_cache",
+        lambda candidate: None,
+    )
+
+    engine._warmup_token_bucket_fa3_prefill_graphs(
+        cache,
+        vocab_size=32,
+        cache_rows=6,
+        max_seq_len=8,
+    )
+
+    assert graph_shapes == [(2, 2), (4, 4), (2, 4)]
+
+
+def test_token_bucket_prefix_warmup_interleaves_batch_capacities(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    copy_shapes: list[tuple[int, int]] = []
+
+    class Model:
+        def try_prefill_token_bucket_fa3_graph(self, input_ids, cache, **kwargs):
+            del input_ids, cache, kwargs
+            return torch.zeros((1,))
+
+        def try_copy_token_bucket_prefix_graph(self, cache, **kwargs):
+            del cache
+            copy_shapes.append(
+                (int(kwargs["start_positions"].numel()), int(kwargs["prefix_copy_capacity"]))
+            )
+            return True
+
+    engine = _cache_only_engine()
+    engine.model = Model()
+    engine.device = torch.device("cpu")
+    cache = types.SimpleNamespace(layers=[])
+    monkeypatch.setattr(
+        "torchinferno.openai_server._token_bucket_fa3_prefill_warmup_enabled",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        "torchinferno.openai_server._token_bucket_fa3_batch_capacities",
+        lambda: (2, 4),
+    )
+    monkeypatch.setattr(
+        "torchinferno.openai_server._online_token_bucket_fa3_warmup_capacities",
+        lambda: (2,),
+    )
+    monkeypatch.setattr(
+        "torchinferno.openai_server._online_token_bucket_prefix_copy_warmup_capacities",
+        lambda max_seq_len: (4, 8),
+    )
+    monkeypatch.setattr(
+        "torchinferno.openai_server._tensor_parallel_min_cuda_free_bytes",
+        lambda model, device: 9 * 1024**3,
+    )
+    monkeypatch.setattr(
+        "torchinferno.openai_server._set_tensor_parallel_runtime_fp8_prefill",
+        lambda model, enabled, min_m: None,
+    )
+    monkeypatch.setattr(
+        "torchinferno.openai_server._reset_generation_cache",
+        lambda candidate: None,
+    )
+
+    engine._warmup_token_bucket_fa3_prefill_graphs(
+        cache,
+        vocab_size=32,
+        cache_rows=6,
+        max_seq_len=8,
+    )
+
+    assert copy_shapes == [(4, 4), (2, 4), (4, 8), (2, 8)]
+
+
 def test_tensor_parallel_cache_bytes_per_row_uses_local_kv_heads(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

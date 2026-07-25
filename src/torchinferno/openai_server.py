@@ -796,6 +796,27 @@ def _online_token_bucket_fa3_warmup_capacities() -> tuple[int, ...]:
     return tuple(sorted({_piecewise_token_bucket(tokens) for tokens in range(1, maximum + 1)}))
 
 
+def _online_token_bucket_fa3_warmup_targets(
+    batch_capacities: Sequence[int],
+    token_capacities: Sequence[int],
+) -> tuple[tuple[int, int], ...]:
+    """Cover every reachable batch class before refining token capacities."""
+    batch_ranges: list[tuple[int, int]] = []
+    minimum_batch = 1
+    for batch_capacity in sorted({int(value) for value in batch_capacities if int(value) > 0}):
+        batch_ranges.append((batch_capacity, minimum_batch))
+        minimum_batch = batch_capacity + 1
+
+    targets: list[tuple[int, int]] = []
+    for token_capacity in sorted({int(value) for value in token_capacities if int(value) > 0}):
+        for batch_capacity, minimum_real_batch in reversed(batch_ranges):
+            # Each real row contributes at least one query token. Smaller token
+            # capacities cannot be selected for this batch-capacity range.
+            if token_capacity >= minimum_real_batch:
+                targets.append((batch_capacity, token_capacity))
+    return tuple(targets)
+
+
 def _online_token_bucket_prefix_copy_warmup_capacities(max_seq_len: int) -> tuple[int, ...]:
     configured = os.environ.get(
         "TORCHINFERNO_OPENAI_WARMUP_TOKEN_BUCKET_PREFIX_COPY_CAPACITIES"
@@ -3943,19 +3964,27 @@ class OpenAICompletionEngine:
                 enabled=True,
                 min_m=fp8_min_m,
             )
+            batch_inputs: dict[int, tuple[Tensor, Tensor, Tensor]] = {}
             for batch_capacity in batch_capacities:
-                rows = torch.arange(batch_capacity, dtype=torch.long, device=self.device)
-                starts = torch.zeros(batch_capacity, dtype=torch.long, device=self.device)
-                source_row = batch_capacity
-                sources = torch.full(
-                    (batch_capacity,),
-                    source_row,
-                    dtype=torch.long,
-                    device=self.device,
+                batch_inputs[batch_capacity] = (
+                    torch.arange(batch_capacity, dtype=torch.long, device=self.device),
+                    torch.zeros(batch_capacity, dtype=torch.long, device=self.device),
+                    torch.full(
+                        (batch_capacity,),
+                        batch_capacity,
+                        dtype=torch.long,
+                        device=self.device,
+                    ),
                 )
-                for prefix_capacity in prefix_capacities:
+
+            # Prefix-copy graphs are required before a token graph can replay a
+            # prefix hit. Interleave batch classes so a memory cutoff cannot
+            # strand every larger batch on the eager fallback.
+            for prefix_capacity in prefix_capacities:
+                for batch_capacity in reversed(batch_capacities):
                     if not has_capture_headroom():
                         break
+                    rows, starts, sources = batch_inputs[batch_capacity]
                     copy_graph(
                         cache,
                         start_positions=torch.full_like(starts, prefix_capacity),
@@ -3966,51 +3995,55 @@ class OpenAICompletionEngine:
                     )
                 if stopped_free_bytes is not None:
                     break
-                for token_capacity in capacities:
-                    if not has_capture_headroom():
-                        break
-                    base, remainder = divmod(token_capacity, batch_capacity)
-                    q_lens_values = [
-                        base + (1 if row < remainder else 0)
-                        for row in range(batch_capacity)
-                    ]
-                    if max(q_lens_values) > max_seq_len:
-                        continue
-                    capture_targets += 1
-                    write_positions: list[int] = []
-                    flat_rows: list[int] = []
-                    logit_positions: list[int] = []
-                    offset = 0
-                    for row, q_len in enumerate(q_lens_values):
-                        logit_positions.append(offset + q_len - 1 if q_len > 0 else 0)
-                        write_positions.extend(range(q_len))
-                        flat_rows.extend([row] * q_len)
-                        offset += q_len
-                    output = graph(
-                        torch.arange(
-                            token_capacity,
-                            device=self.device,
-                            dtype=torch.long,
-                        ).remainder(max(1, int(vocab_size)))[None, :],
-                        cache,
-                        start_positions=starts,
-                        q_lens=torch.tensor(q_lens_values, device=self.device, dtype=torch.long),
-                        row_indices=rows,
-                        write_positions=torch.tensor(
-                            write_positions,
-                            device=self.device,
-                            dtype=torch.long,
-                        ),
-                        flat_rows=torch.tensor(flat_rows, device=self.device, dtype=torch.long),
-                        logit_positions=torch.tensor(
-                            logit_positions,
-                            device=self.device,
-                            dtype=torch.long,
-                        ),
-                        capture_on_miss=True,
-                    )
-                    if output is not None:
-                        captured += 1
+            for batch_capacity, token_capacity in _online_token_bucket_fa3_warmup_targets(
+                batch_capacities,
+                capacities,
+            ):
+                if stopped_free_bytes is not None or not has_capture_headroom():
+                    break
+                rows, starts, _sources = batch_inputs[batch_capacity]
+                base, remainder = divmod(token_capacity, batch_capacity)
+                q_lens_values = [
+                    base + (1 if row < remainder else 0)
+                    for row in range(batch_capacity)
+                ]
+                if max(q_lens_values) > max_seq_len:
+                    continue
+                capture_targets += 1
+                write_positions: list[int] = []
+                flat_rows: list[int] = []
+                logit_positions: list[int] = []
+                offset = 0
+                for row, q_len in enumerate(q_lens_values):
+                    logit_positions.append(offset + q_len - 1 if q_len > 0 else 0)
+                    write_positions.extend(range(q_len))
+                    flat_rows.extend([row] * q_len)
+                    offset += q_len
+                output = graph(
+                    torch.arange(
+                        token_capacity,
+                        device=self.device,
+                        dtype=torch.long,
+                    ).remainder(max(1, int(vocab_size)))[None, :],
+                    cache,
+                    start_positions=starts,
+                    q_lens=torch.tensor(q_lens_values, device=self.device, dtype=torch.long),
+                    row_indices=rows,
+                    write_positions=torch.tensor(
+                        write_positions,
+                        device=self.device,
+                        dtype=torch.long,
+                    ),
+                    flat_rows=torch.tensor(flat_rows, device=self.device, dtype=torch.long),
+                    logit_positions=torch.tensor(
+                        logit_positions,
+                        device=self.device,
+                        dtype=torch.long,
+                    ),
+                    capture_on_miss=True,
+                )
+                if output is not None:
+                    captured += 1
         except Exception as exc:
             import sys as _tbsys
 
@@ -4672,7 +4705,7 @@ class OpenAICompletionEngine:
         )
         warmup_temperature = env_float(
             "TORCHINFERNO_OPENAI_STARTUP_RUNTIME_FP8_RAGGED_PREFILL_TEMPERATURE",
-            0.7,
+            1.0,
             minimum=0.0,
         )
         warmup_max_tokens = env_int(
@@ -9498,11 +9531,11 @@ class OpenAICompletionEngine:
         if logits is None:
             return
         if logits.size(0) == batch_size:
-            next_token = _sample(self.model, logits[:, -1, :], 0.7).to(self.device)
+            next_token = _sample(self.model, logits[:, -1, :], 1.0).to(self.device)
             decode_input = next_token[:, None]
         else:
             sample_logits = logits[:, -1, :].expand(batch_size, logits.size(-1)).contiguous()
-            next_token = _sample(self.model, sample_logits, 0.7).to(self.device)
+            next_token = _sample(self.model, sample_logits, 1.0).to(self.device)
             decode_input = next_token[:, None]
         _repeat_generation_cache_first_batch(cache, batch_size)
         _try_decode_one_token_logits_graph(self.model, decode_input, cache)
