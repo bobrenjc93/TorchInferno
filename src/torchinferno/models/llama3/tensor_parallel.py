@@ -10869,7 +10869,7 @@ def _decode_linear(x: Tensor, weight: Tensor, weight_t: Tensor | None = None) ->
 def _maybe_decode_weight_t(weight: Tensor) -> Tensor | None:
     if (
         not weight.is_cuda
-        or not _tp_flag("TORCHINFERNO_DECODE_TRANSPOSED_WEIGHTS")
+        or not _tp_flag("TORCHINFERNO_DECODE_TRANSPOSED_WEIGHTS", False)
         or weight.ndim != 2
     ):
         return None

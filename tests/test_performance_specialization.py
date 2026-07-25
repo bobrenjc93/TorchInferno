@@ -26,6 +26,7 @@ from torchinferno.models.llama3.tensor_parallel import (
     PagedLlama3TensorParallelLayerKVCache,
     _decode_attention_block_size,
     _decode_linear,
+    _maybe_decode_weight_t,
     _prefill_graph_cache_storage,
     _prepare_paged_ragged_decode_graph_state,
     _ragged_decode_cache_token_bucket,
@@ -66,6 +67,26 @@ def _reference_rmsnorm_swiglu_region(
     gate = normed * gate_weight
     up = normed * up_weight
     return F.silu(gate) * up
+
+
+def test_decode_transposed_weights_are_opt_in(monkeypatch: pytest.MonkeyPatch) -> None:
+    class FakeCudaWeight:
+        is_cuda = True
+        ndim = 2
+
+        def t(self):
+            return self
+
+        def contiguous(self):
+            return self
+
+    weight = FakeCudaWeight()
+    monkeypatch.delenv("TORCHINFERNO_DECODE_TRANSPOSED_WEIGHTS", raising=False)
+
+    assert _maybe_decode_weight_t(weight) is None
+
+    monkeypatch.setenv("TORCHINFERNO_DECODE_TRANSPOSED_WEIGHTS", "1")
+    assert _maybe_decode_weight_t(weight) is weight
 
 
 def test_nvfp4_quantization_and_linear_reference() -> None:

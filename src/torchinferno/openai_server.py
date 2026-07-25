@@ -3291,6 +3291,7 @@ class OpenAICompletionEngine:
         paged_cache_fallback_candidate = paged_kv_requested or hasattr(self.model, "forward_decode_paged")
         unified_cache_backend = _online_continuous_cache_backend(
             self.cache_backend,
+            model=self.model,
             paged_cache_fallback_candidate=paged_cache_fallback_candidate,
             use_paged_engine=_paged_online_engine_class_for(self.model, max_seq_len) is not None,
         )
@@ -5700,6 +5701,7 @@ class OpenAICompletionEngine:
         paged_cache_fallback_candidate = paged_kv_requested or hasattr(self.model, "forward_decode_paged")
         online_cache_backend = _online_continuous_cache_backend(
             self.cache_backend,
+            model=self.model,
             paged_cache_fallback_candidate=paged_cache_fallback_candidate,
             use_paged_engine=use_paged_engine,
         )
@@ -14362,6 +14364,7 @@ def _paged_online_engine_class_for(model: object, max_seq_len: int) -> object | 
 def _online_continuous_cache_backend(
     cache_backend: object,
     *,
+    model: object,
     paged_cache_fallback_candidate: bool,
     use_paged_engine: bool,
 ) -> str:
@@ -14372,7 +14375,14 @@ def _online_continuous_cache_backend(
         and not use_paged_engine
         and env_flag("TORCHINFERNO_OPENAI_PAGED_KV_DENSE_FALLBACK", True)
     ):
-        return "dense"
+        backend = "dense"
+    if (
+        backend.lower() == "dense"
+        and env_flag("TORCHINFERNO_CONTINUOUS_UNIFIED_FORWARD", False)
+        and hasattr(model, "forward_step_flashinfer")
+        and importlib.util.find_spec("flashinfer") is not None
+    ):
+        return "flashinfer"
     return backend
 
 
@@ -16055,6 +16065,7 @@ def _tensor_parallel_worker_loop(engine: OpenAICompletionEngine) -> None:
                 )
                 worker_cache_backend = _online_continuous_cache_backend(
                     getattr(engine, "cache_backend", "dense"),
+                    model=worker_model,
                     paged_cache_fallback_candidate=worker_paged_cache_fallback_candidate,
                     use_paged_engine=worker_use_paged,
                 )
