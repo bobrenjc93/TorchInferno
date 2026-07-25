@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import json
 import os
 import queue
@@ -36,13 +37,16 @@ from torchinferno.openai_http import (
 )
 from torchinferno.openai_server import (
     _GenerationDone,
+    _GenerationFinalToken,
     OpenAICompletionEngine,
     OpenAIServerConfig,
     _apply_tensor_parallel_serving_defaults,
+    _automatic_tensor_parallel_cpu_set,
     _ByteFallbackTokenizer,
     _PersistentPromptListStepResult,
     _PersistentPromptListStepState,
     _QueuedGeneration,
+    _StreamResponseQueue,
     _TP_COMMAND_GENERATE_PROMPT_LISTS,
     _TP_COMMAND_GENERATE_TENSOR,
     _TP_COMMAND_CLEANUP,
@@ -147,6 +151,9 @@ from torchinferno.openai_server import (
     _online_kv_bounded_concurrency_enabled,
     _online_kv_bounded_max_active_cap,
     _online_kv_token_budget,
+    _online_session_active_capacity,
+    _online_session_cache_row_capacity,
+    _online_session_cache_shape,
     _online_close_cuda_sync_enabled,
     _online_marlin_int4_decode_enabled,
     _online_mixed_temperature_batching_enabled,
@@ -163,10 +170,13 @@ from torchinferno.openai_server import (
     _openai_cuda_graph_enabled_for_model,
     _openai_decode_graph_enabled,
     _openai_ragged_decode_graph_enabled,
+    _paged_online_engine_class_for,
     _prepare_tensor_parallel_nccl_runtime_env,
     _prepare_tensor_parallel_symm_mem_allreduce_auto,
     _run_tensor_parallel_symm_mem_allreduce_probe,
     _prefill_cache_only,
+    _flashinfer_step_loop,
+    _finish_stream_request_with_token,
     _persistent_prompt_list_scheduler_for_group,
     _persistent_prompt_list_decode_run_payload_from_tensor_payload,
     _persistent_prompt_list_decode_run_tensor_payload,
@@ -377,6 +387,7 @@ def test_memory_bounded_online_cache_uses_native_flashinfer_storage(
 
     assert allocated_backends == ["flashinfer"]
     assert getattr(cache, "cache_backend", None) == "flashinfer"
+    assert engine.model._online_cache_token_capacity == 4 * 128
 
 
 def test_unified_online_cache_uses_native_flashinfer_storage(
@@ -10713,6 +10724,8 @@ def test_tensor_parallel_serving_defaults_gate_fa3_backend(
         "TORCHINFERNO_CONTINUOUS_TOKEN_BUCKET_FA3_UNIFIED",
         "TORCHINFERNO_CONTINUOUS_TOKEN_BUCKET_FA3_PREFILL",
         "TORCHINFERNO_CONTINUOUS_ADMIT_MIN_READY_REQUESTS",
+        "TORCHINFERNO_CONTINUOUS_ADMIT_MAX_WAIT_STEPS",
+        "TORCHINFERNO_CONTINUOUS_ADMIT_PRIORITY_MAX_WAIT_STEPS",
         "TORCHINFERNO_SGLANG_FA3_STATUS_LOGGED",
     ):
         monkeypatch.delenv(name, raising=False)
@@ -10734,6 +10747,8 @@ def test_tensor_parallel_serving_defaults_gate_fa3_backend(
     assert os.environ["TORCHINFERNO_CONTINUOUS_TOKEN_BUCKET_FA3_UNIFIED"] == expected
     assert os.environ["TORCHINFERNO_CONTINUOUS_TOKEN_BUCKET_FA3_PREFILL"] == expected
     assert os.environ["TORCHINFERNO_CONTINUOUS_ADMIT_MIN_READY_REQUESTS"] == "6"
+    assert os.environ["TORCHINFERNO_CONTINUOUS_ADMIT_MAX_WAIT_STEPS"] == "2"
+    assert os.environ["TORCHINFERNO_CONTINUOUS_ADMIT_PRIORITY_MAX_WAIT_STEPS"] == "2"
     assert os.environ["TORCHINFERNO_FP8_FUSED_SWIGLU_DECODE"] == "1"
 
 
@@ -10745,6 +10760,8 @@ def test_tensor_parallel_serving_defaults_preserve_explicit_fa3_override(
     monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_UNIFIED_FORWARD", "1")
     monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_TOKEN_BUCKET_FA3_UNIFIED", "1")
     monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_TOKEN_BUCKET_FA3_PREFILL", "1")
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_ADMIT_MAX_WAIT_STEPS", "5")
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_ADMIT_PRIORITY_MAX_WAIT_STEPS", "7")
     monkeypatch.setattr("torch.cuda.is_available", lambda: True)
     monkeypatch.setattr(
         "torchinferno.openai_server._sglang_fa3_backend_status",
@@ -10762,6 +10779,39 @@ def test_tensor_parallel_serving_defaults_preserve_explicit_fa3_override(
     assert os.environ["TORCHINFERNO_CONTINUOUS_UNIFIED_FORWARD"] == "1"
     assert os.environ["TORCHINFERNO_CONTINUOUS_TOKEN_BUCKET_FA3_UNIFIED"] == "1"
     assert os.environ["TORCHINFERNO_CONTINUOUS_TOKEN_BUCKET_FA3_PREFILL"] == "1"
+    assert os.environ["TORCHINFERNO_CONTINUOUS_ADMIT_MAX_WAIT_STEPS"] == "5"
+    assert os.environ["TORCHINFERNO_CONTINUOUS_ADMIT_PRIORITY_MAX_WAIT_STEPS"] == "7"
+
+
+def test_tensor_parallel_cpu_affinity_uses_available_numa_cores_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_CPU_CORES_PER_RANK", raising=False)
+    monkeypatch.setattr(
+        "torchinferno.openai_server._cuda_device_numa_node",
+        lambda rank: 0,
+    )
+    monkeypatch.setattr(
+        "torchinferno.openai_server._read_int_file",
+        lambda path: (
+            0
+            if path.endswith("physical_package_id")
+            else int(path.rsplit("cpu", 1)[1].split("/", 1)[0])
+        ),
+    )
+
+    def fake_open(path: str, *args, **kwargs):  # noqa: ANN002, ANN003
+        del args, kwargs
+        assert path.endswith("/node0/cpulist")
+        return io.StringIO("0-63")
+
+    monkeypatch.setattr("builtins.open", fake_open)
+
+    assert _automatic_tensor_parallel_cpu_set(0, 2, set(range(64))) == set(range(32))
+    assert _automatic_tensor_parallel_cpu_set(1, 2, set(range(64))) == set(range(32, 64))
+
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_CPU_CORES_PER_RANK", "8")
+    assert _automatic_tensor_parallel_cpu_set(1, 2, set(range(64))) == set(range(8, 16))
 
 
 def test_openai_symm_mem_auto_probe_sets_worker_env_on_failure(monkeypatch) -> None:
@@ -11820,6 +11870,229 @@ def test_online_kv_token_budget_is_request_agnostic(monkeypatch) -> None:
 
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_KV_TOKEN_BUDGET", "32768")
     assert _online_kv_token_budget(temperature=0.7, max_tokens=256) == 32768
+
+
+def test_online_session_cache_row_capacity_preserves_validated_token_envelope() -> None:
+    model = types.SimpleNamespace(_online_cache_token_capacity=144 * 768)
+
+    assert _online_session_cache_row_capacity(model, 256) == 432
+    assert _online_session_cache_row_capacity(model, 768) == 144
+    assert _online_session_cache_row_capacity(model, 1024) == 108
+    assert _online_session_cache_row_capacity(model, 64 * 1024) == 1
+    assert _online_session_cache_row_capacity(model, 128 * 1024) == 0
+    assert _online_session_cache_row_capacity(model, 256 * 1024) == 0
+    assert _online_session_cache_row_capacity(object(), 1024) is None
+    assert _online_session_cache_row_capacity(model, 0) is None
+
+
+def test_paged_online_engine_does_not_double_allocate_validated_tp_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_PAGED_KV", "1")
+    model = types.SimpleNamespace(
+        _online_cache_token_capacity=144 * 1024,
+        forward_decode_paged=lambda: None,
+    )
+
+    assert _paged_online_engine_class_for(model, 2048) is None
+
+
+def test_online_session_cache_shape_preserves_padding_rows_within_envelope() -> None:
+    model = types.SimpleNamespace(_online_cache_token_capacity=144 * 1024)
+
+    assert _online_session_cache_shape(
+        model,
+        cache_seq_len=1024,
+        max_active=64,
+        prefix_rows=80,
+    ) == (64, 80, 144)
+    assert _online_session_cache_shape(
+        model,
+        cache_seq_len=4096,
+        max_active=64,
+        prefix_rows=80,
+    ) == (27, 9, 36)
+    assert _online_session_cache_shape(
+        model,
+        cache_seq_len=4096,
+        max_active=64,
+        prefix_rows=0,
+    ) == (36, 0, 36)
+    assert _online_session_cache_shape(
+        object(),
+        cache_seq_len=4096,
+        max_active=64,
+        prefix_rows=80,
+    ) == (64, 80, None)
+    assert _online_session_cache_shape(
+        model,
+        cache_seq_len=256 * 1024,
+        max_active=64,
+        prefix_rows=80,
+    ) == (0, 0, 0)
+
+
+def test_online_session_active_capacity_uses_physical_cache_tokens_and_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_KV_TOKEN_BUDGET", raising=False)
+    validated = types.SimpleNamespace(_online_cache_token_capacity=144 * 1024)
+
+    assert _online_session_active_capacity(
+        validated,
+        cache_seq_len=1024,
+        max_active=64,
+        temperature=0.0,
+        max_tokens=512,
+    ) == 64
+    assert _online_session_active_capacity(
+        object(),
+        cache_seq_len=1024,
+        max_active=64,
+        temperature=0.0,
+        max_tokens=512,
+    ) == 20
+
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_KV_TOKEN_BUDGET", "20480")
+    assert _online_session_active_capacity(
+        validated,
+        cache_seq_len=1024,
+        max_active=64,
+        temperature=0.0,
+        max_tokens=512,
+    ) == 20
+    assert _online_session_active_capacity(
+        validated,
+        cache_seq_len=32768,
+        max_active=64,
+        temperature=0.0,
+        max_tokens=512,
+    ) == 0
+
+
+def test_online_batch_worker_rejects_unallocatable_session_without_hanging(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_KV_TOKEN_BUDGET", "1")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_INITIAL_BATCH_WAIT_MS", "0")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_PERSISTENT", "0")
+    model = type(
+        "FakeTPModel",
+        (),
+        {
+            "world_size": 2,
+            "rank": 0,
+            "allocate_cache": lambda self: None,
+            "_online_cache_token_capacity": 144 * 512,
+        },
+    )()
+    engine = _cache_only_engine()
+    engine.model = model
+    engine.max_batch_size = 4
+    engine.max_model_len = None
+    engine.stop_token_ids = frozenset()
+    engine._completed_queue_batches = 0
+    engine._generation_queue = queue.Queue()
+    engine._maybe_cleanup_runtime_after_idle = lambda: None  # type: ignore[method-assign]
+    engine._should_use_tensor_parallel_online_batcher = lambda request: True  # type: ignore[method-assign]
+    responses: queue.Queue[object] = queue.Queue()
+    request = _QueuedGeneration([1, 2], 1, 0.0, True, responses)
+    engine._generation_queue.put(request)
+    engine._generation_queue.put(None)
+
+    engine._batch_worker()
+
+    items = _queue_items(responses)
+    assert isinstance(items[0], RuntimeError)
+    assert "cannot hold one physical cache row" in str(items[0])
+    assert isinstance(items[1], _GenerationDone)
+    assert request.done
+    assert engine._completed_queue_batches == 1
+
+
+def test_online_batch_worker_contains_failure_and_serves_next_request() -> None:
+    engine = _cache_only_engine()
+    engine._completed_queue_batches = 0
+    engine._generation_queue = queue.Queue()
+    engine._maybe_cleanup_runtime_after_idle = lambda: None  # type: ignore[method-assign]
+    engine._should_use_tensor_parallel_online_batcher = lambda request: True  # type: ignore[method-assign]
+
+    first_responses: queue.Queue[object] = queue.Queue()
+    drained_responses: queue.Queue[object] = queue.Queue()
+    next_responses: queue.Queue[object] = queue.Queue()
+    first = _QueuedGeneration([1], 1, 0.0, True, first_responses)
+    drained = _QueuedGeneration([2], 1, 0.0, True, drained_responses)
+    next_request = _QueuedGeneration([3], 1, 0.0, True, next_responses)
+
+    def run_impl(
+        request: _QueuedGeneration,
+        tracked_requests: list[_QueuedGeneration],
+    ) -> None:
+        if request is first:
+            tracked_requests.append(engine._generation_queue.get_nowait())
+            raise RuntimeError("injected online failure")
+        _finish_stream_request_with_token(request, 99)
+
+    engine._run_tensor_parallel_online_batcher_impl = run_impl  # type: ignore[method-assign]
+    for item in (first, drained, next_request, None):
+        engine._generation_queue.put(item)
+
+    engine._batch_worker()
+
+    for responses in (first_responses, drained_responses):
+        items = _queue_items(responses)
+        assert isinstance(items[0], RuntimeError)
+        assert str(items[0]) == "injected online failure"
+        assert isinstance(items[1], _GenerationDone)
+    assert _queue_items(next_responses) == [99, _GenerationDone()]
+    assert engine._completed_queue_batches == 1
+
+
+def test_stream_response_queue_publishes_terminal_token_atomically() -> None:
+    responses = _StreamResponseQueue()
+    request = _QueuedGeneration([1], 1, 0.0, True, responses)
+
+    _finish_stream_request_with_token(request, 17)
+
+    assert responses.get() == _GenerationFinalToken(17)
+    with pytest.raises(queue.Empty):
+        responses.get_nowait()
+    assert request.done
+
+    legacy_responses: queue.Queue[object] = queue.Queue()
+    legacy_request = _QueuedGeneration([1], 1, 0.0, True, legacy_responses)
+    _finish_stream_request_with_token(legacy_request, 19)
+    assert _queue_items(legacy_responses) == [19, _GenerationDone()]
+
+
+def test_flashinfer_step_loop_emits_the_max_token_limit_token() -> None:
+    class Model:
+        def forward_step_flashinfer(self, input_ids, cache, **kwargs):  # noqa: ANN001, ANN003
+            del cache, kwargs
+            return torch.zeros(input_ids.size(0), 1, 2)
+
+        def _sample_next_token(self, logits, temperature):  # noqa: ANN001
+            del temperature
+            return torch.full((logits.size(0),), 7, dtype=torch.long)
+
+    responses = _StreamResponseQueue()
+    request = _QueuedGeneration([1, 2], 1, 0.0, True, responses)
+
+    _flashinfer_step_loop(
+        Model(),
+        object(),
+        [[1, 2]],
+        [1],
+        1,
+        0.0,
+        frozenset(),
+        torch.device("cpu"),
+        requests=[request],
+    )
+
+    assert responses.get() == _GenerationFinalToken(7)
+    with pytest.raises(queue.Empty):
+        responses.get_nowait()
 
 
 def test_online_session_capacity_uses_power_of_two_buckets(monkeypatch) -> None:
@@ -15795,6 +16068,13 @@ def test_openai_emit_stream_token_uses_request_generated_count() -> None:
     assert _queue_items(response_queue) == [10, 11, _GenerationDone()]
     assert request.done
 
+    atomic_responses = _StreamResponseQueue()
+    atomic_request = _QueuedGeneration([1, 2], 1, 0.0, True, atomic_responses)
+    _emit_stream_token(atomic_request, 12, generated_tokens=1)
+    assert atomic_responses.get() == _GenerationFinalToken(12)
+    with pytest.raises(queue.Empty):
+        atomic_responses.get_nowait()
+
 
 def test_openai_emit_stream_token_finishes_on_none_or_over_limit() -> None:
     response_queue: queue.Queue[object] = queue.Queue()
@@ -18265,7 +18545,16 @@ def test_openai_tensor_parallel_online_batcher_bounds_rows_by_session_capacity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_PERSISTENT", "0")
-    model = type("FakeTPModel", (), {"world_size": 8, "rank": 0, "allocate_cache": lambda self: None})()
+    model = type(
+        "FakeTPModel",
+        (),
+        {
+            "world_size": 8,
+            "rank": 0,
+            "allocate_cache": lambda self: None,
+            "_online_cache_token_capacity": 144 * 512,
+        },
+    )()
     commands: list[tuple[str, object]] = []
 
     class RuntimeEngine:

@@ -470,6 +470,59 @@ def _online_kv_token_budget(*, temperature: float, max_tokens: int) -> int:
     )
 
 
+def _online_session_cache_row_capacity(model: object, cache_seq_len: int) -> int | None:
+    """Scale the startup-validated KV envelope to a session's row length."""
+    if cache_seq_len <= 0:
+        return None
+    token_capacity = int(getattr(model, "_online_cache_token_capacity", 0) or 0)
+    if token_capacity <= 0:
+        return None
+    return token_capacity // int(cache_seq_len)
+
+
+def _online_session_cache_shape(
+    model: object,
+    *,
+    cache_seq_len: int,
+    max_active: int,
+    prefix_rows: int,
+) -> tuple[int, int, int | None]:
+    """Fit exact active/prefix rows inside the startup-proven KV allocation."""
+    max_active = max(1, int(max_active))
+    prefix_rows = max(0, int(prefix_rows))
+    row_capacity = _online_session_cache_row_capacity(model, cache_seq_len)
+    if row_capacity == 0:
+        return 0, 0, 0
+    if row_capacity is None or row_capacity >= max_active + prefix_rows:
+        return max_active, prefix_rows, row_capacity
+    if prefix_rows <= 0:
+        return min(max_active, row_capacity), 0, row_capacity
+    bounded_active = min(max_active, max(1, row_capacity * 3 // 4))
+    bounded_prefix = min(prefix_rows, max(0, row_capacity - bounded_active))
+    return bounded_active, bounded_prefix, row_capacity
+
+
+def _online_session_active_capacity(
+    model: object,
+    *,
+    cache_seq_len: int,
+    max_active: int,
+    temperature: float,
+    max_tokens: int,
+) -> int:
+    """Apply explicit or legacy active-token limits to physical cache rows."""
+    max_active = max(1, int(max_active))
+    validated_rows = _online_session_cache_row_capacity(model, cache_seq_len)
+    explicit_budget = "TORCHINFERNO_OPENAI_TP_ONLINE_KV_TOKEN_BUDGET" in os.environ
+    if validated_rows is not None and not explicit_budget:
+        return max_active
+    token_budget = _online_kv_token_budget(
+        temperature=temperature,
+        max_tokens=max_tokens,
+    )
+    return min(max_active, token_budget // max(1, int(cache_seq_len)))
+
+
 def _online_decode_quantum(*, temperature: float, max_tokens: int) -> int:
     del temperature, max_tokens
     return env_int("TORCHINFERNO_OPENAI_TP_ONLINE_DECODE_QUANTUM", 1, minimum=1)
@@ -1307,7 +1360,7 @@ class _QueuedGeneration:
     max_tokens: int
     temperature: float
     stream: bool
-    responses: "queue.Queue[object] | queue.SimpleQueue[object]"
+    responses: "queue.Queue[object] | queue.SimpleQueue[object] | _StreamResponseQueue"
     queued_at_s: float = 0.0
     submitted_at_s: float = 0.0
     first_token_at_s: float = 0.0
@@ -2411,6 +2464,30 @@ class _GenerationDone:
 
 
 @dataclass(frozen=True)
+class _GenerationFinalToken:
+    token: int
+
+
+class _StreamResponseQueue:
+    """Single-consumer queue with a one-item terminal-token representation."""
+
+    def __init__(self) -> None:
+        self._queue: "queue.SimpleQueue[object]" = queue.SimpleQueue()
+
+    def put(self, item: object) -> None:
+        self._queue.put(item)
+
+    def put_final_token(self, token: int) -> None:
+        self._queue.put(_GenerationFinalToken(int(token)))
+
+    def get(self) -> object:
+        return self._queue.get()
+
+    def get_nowait(self) -> object:
+        return self._queue.get_nowait()
+
+
+@dataclass(frozen=True)
 class _GenerationResult:
     tokens: list[int]
 
@@ -3103,7 +3180,7 @@ class OpenAICompletionEngine:
     ) -> Iterator[list[int]]:
         if self._closed:
             raise RuntimeError("OpenAI completion engine is closed")
-        responses: "queue.SimpleQueue[object]" = queue.SimpleQueue()
+        responses = _StreamResponseQueue()
         profile_queue = bool(self._queue_profile_path_value())
         queued_at_s = time.perf_counter() if profile_queue else 0.0
         queue_sequence = self._next_queue_profile_sequence() if profile_queue else -1
@@ -3134,6 +3211,9 @@ class OpenAICompletionEngine:
                 break
             if isinstance(item, BaseException):
                 raise item
+            if isinstance(item, _GenerationFinalToken):
+                yield [item.token]
+                break
             batch = [int(item)]
             terminal: object | None = None
             while len(batch) < max_batch:
@@ -3144,12 +3224,16 @@ class OpenAICompletionEngine:
                 if isinstance(next_item, _GenerationDone):
                     terminal = next_item
                     break
+                if isinstance(next_item, _GenerationFinalToken):
+                    batch.append(next_item.token)
+                    terminal = next_item
+                    break
                 if isinstance(next_item, BaseException):
                     terminal = next_item
                     break
                 batch.append(int(next_item))
             yield batch
-            if isinstance(terminal, _GenerationDone):
+            if isinstance(terminal, (_GenerationDone, _GenerationFinalToken)):
                 break
             if isinstance(terminal, BaseException):
                 raise terminal
@@ -3184,11 +3268,18 @@ class OpenAICompletionEngine:
             first = self._generation_queue.get()
             if first is None:
                 return
+            if first.done:
+                continue
             if self._should_use_tensor_parallel_online_batcher(first):
-                with self._model_lock:
-                    self._maybe_cleanup_runtime_after_idle()
-                    self._run_tensor_parallel_online_batcher(first)
-                    self._completed_queue_batches += 1
+                try:
+                    with self._model_lock:
+                        self._maybe_cleanup_runtime_after_idle()
+                        self._run_tensor_parallel_online_batcher(first)
+                        self._completed_queue_batches += 1
+                except Exception as exc:
+                    if not first.done:
+                        _fail_stream_request(first, exc)
+                    warn_optional_failure("openai.online_batcher", exc)
                 continue
             batch = [first]
             batch_limit = self._queued_batch_limit(first)
@@ -3355,6 +3446,21 @@ class OpenAICompletionEngine:
         cache = _allocate_cache(
             self.model, cache_batch, _generation_cache_capacity(self.model, max_seq_len),
             device=self.device, cache_backend=unified_cache_backend, page_size=self.page_size,
+        )
+        cache_max_seq_len, cache_rows = _generation_cache_shape_limits(cache)
+        validated_seq_len = cache_max_seq_len or max_seq_len
+        validated_rows = cache_rows or cache_batch
+        token_capacity = int(validated_rows) * int(validated_seq_len)
+        if not _tensor_parallel_all_ranks_same_int(
+            self.model,
+            token_capacity,
+            self.device,
+        ):
+            raise RuntimeError("tensor-parallel ranks disagree on online KV capacity")
+        setattr(
+            self.model,
+            "_online_cache_token_capacity",
+            token_capacity,
         )
         _reset_generation_cache(cache)
         if hasattr(self.model, "_online_cache_post_allocation_free_bytes"):
@@ -5504,6 +5610,27 @@ class OpenAICompletionEngine:
         )
 
     def _run_tensor_parallel_online_batcher(self, first: _QueuedGeneration) -> None:
+        tracked_requests = [first]
+        try:
+            self._run_tensor_parallel_online_batcher_impl(first, tracked_requests)
+        except Exception as exc:
+            seen: set[int] = set()
+            for request in tracked_requests:
+                if id(request) in seen:
+                    continue
+                seen.add(id(request))
+                if not request.done:
+                    _fail_stream_request(request, exc)
+            raise
+
+    def _run_tensor_parallel_online_batcher_impl(
+        self,
+        first: _QueuedGeneration,
+        tracked_requests: list[_QueuedGeneration],
+    ) -> None:
+        def track_request(request: _QueuedGeneration) -> None:
+            tracked_requests.append(request)
+
         requested_max_batch = int(getattr(self, "max_batch_size", 1))
         enable_ragged_decode = env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_RAGGED_DECODE", True)
         store_reusable_prefixes = env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_PREFIX_CACHE_STORE", True)
@@ -5592,6 +5719,18 @@ class OpenAICompletionEngine:
         initial_batch = [first]
         initial_batch_start_s = time.perf_counter()
 
+        def reject_initial_batch(message: str) -> None:
+            exc = RuntimeError(message)
+            seen: set[int] = set()
+            for request in initial_batch:
+                if id(request) in seen:
+                    continue
+                seen.add(id(request))
+                _fail_stream_request(request, exc)
+            for request in deferred:
+                if id(request) not in seen and not request.done:
+                    self._generation_queue.put(request)
+
         def drain_initial_ready() -> int:
             admitted = 0
             while len(initial_batch) < max_active:
@@ -5602,6 +5741,7 @@ class OpenAICompletionEngine:
                 if item is None:
                     self._generation_queue.put(None)
                     break
+                track_request(item)
                 if same_online_policy(item):
                     initial_batch.append(item)
                     admitted += 1
@@ -5623,6 +5763,7 @@ class OpenAICompletionEngine:
                 if item is None:
                     self._generation_queue.put(None)
                     break
+                track_request(item)
                 if same_online_policy(item):
                     initial_batch.append(item)
                 else:
@@ -5672,33 +5813,77 @@ class OpenAICompletionEngine:
             if len(initial_batch) > max_active:
                 deferred.extend(initial_batch[max_active:])
                 initial_batch = initial_batch[:max_active]
-                run_max_tokens = max(request.max_tokens for request in initial_batch)
-        # Bound active rows by the logical KV footprint. This is deliberately
-        # based on the allocated session capacity rather than request labels or
-        # output-length bands: short contexts fill the efficient decode bucket,
-        # while longer contexts reserve proportionally fewer concurrent rows.
-        if _online_kv_bounded_concurrency_enabled(
-            temperature=first.temperature,
-            max_tokens=run_max_tokens,
-        ):
-            kv_token_budget = _online_kv_token_budget(
+                run_max_tokens = _online_session_max_tokens(
+                    temperature=first.temperature,
+                    max_tokens=max(request.max_tokens for request in initial_batch),
+                )
+        # Bound active rows by physical KV storage rather than request labels or
+        # output-length bands. Dense rows use the model's allocation bucket;
+        # paged rows use page-rounded sequence capacity.
+        session_uses_paged_engine = (
+            _paged_online_engine_class_for(self.model, max_seq_len) is not None
+        )
+        session_cache_row_capacity = None
+        if session_uses_paged_engine:
+            session_cache_seq_len = (
+                (max_seq_len + self.page_size - 1) // self.page_size
+            ) * self.page_size
+        else:
+            session_cache_seq_len = _generation_cache_capacity(self.model, max_seq_len)
+        explicit_kv_token_budget = (
+            "TORCHINFERNO_OPENAI_TP_ONLINE_KV_TOKEN_BUDGET" in os.environ
+        )
+        kv_bounded_concurrency = (
+            explicit_kv_token_budget
+            or _online_kv_bounded_concurrency_enabled(
                 temperature=first.temperature,
                 max_tokens=run_max_tokens,
             )
+        )
+        if kv_bounded_concurrency:
             kv_max_active_cap = _online_kv_bounded_max_active_cap(
                 temperature=first.temperature,
                 base_cap=self._kv_bounded_concurrency_cap(),
             )
-            max_active = min(
-                max_active,
-                kv_max_active_cap,
-                max(1, kv_token_budget // max_seq_len),
+            max_active = min(max_active, kv_max_active_cap)
+            max_active = _online_session_active_capacity(
+                self.model,
+                cache_seq_len=session_cache_seq_len,
+                max_active=max_active,
+                temperature=first.temperature,
+                max_tokens=run_max_tokens,
             )
+            if max_active <= 0:
+                reject_initial_batch(
+                    "online KV token budget cannot hold one physical cache row"
+                )
+                return
         prefix_rows = self._online_serving_effective_prefix_rows(
             max_active,
             temperature=first.temperature,
             max_tokens=run_max_tokens,
         )
+        if not session_uses_paged_engine:
+            max_active, prefix_rows, session_cache_row_capacity = (
+                _online_session_cache_shape(
+                    self.model,
+                    cache_seq_len=session_cache_seq_len,
+                    max_active=max_active,
+                    prefix_rows=prefix_rows,
+                )
+            )
+            if session_cache_row_capacity == 0:
+                reject_initial_batch(
+                    "online session exceeds the startup-validated KV cache envelope"
+                )
+                return
+        if len(initial_batch) > max_active:
+            deferred.extend(initial_batch[max_active:])
+            initial_batch = initial_batch[:max_active]
+            run_max_tokens = _online_session_max_tokens(
+                temperature=first.temperature,
+                max_tokens=max(request.max_tokens for request in initial_batch),
+            )
         total_online_rows = max_active + prefix_rows
         ragged_decode_cache_token_limit = _online_ragged_decode_cache_token_limit(
             temperature=first.temperature,
@@ -6089,6 +6274,11 @@ class OpenAICompletionEngine:
                 temperature=first.temperature,
                 max_active=max_active,
                 prefix_rows=prefix_rows,
+                online_cache_token_capacity=int(
+                    getattr(self.model, "_online_cache_token_capacity", 0) or 0
+                ),
+                session_cache_seq_len=session_cache_seq_len,
+                session_cache_row_capacity=session_cache_row_capacity or 0,
                 decode_quantum=decode_quantum,
                 drain_decode_quantum=drain_decode_quantum,
                 drain_decode_min_generated=drain_decode_min_generated,
@@ -6099,9 +6289,44 @@ class OpenAICompletionEngine:
                 idle_batch_wait_ms=round(idle_wait_s * 1000.0, 3),
                 active_ready_wait_ms=round(active_ready_wait_s * 1000.0, 3),
                 collect_idle_arrivals=collect_idle_arrivals,
-                admit_min_free_rows=admit_min_free_rows,
-                admit_min_ready_requests=admit_min_ready_requests,
-                admit_per_step_cap=admit_per_step_cap,
+                admission_policy_active=not use_paged_engine,
+                admit_min_free_rows=(
+                    0
+                    if use_paged_engine
+                    else env_int(
+                        "TORCHINFERNO_CONTINUOUS_ADMIT_MIN_FREE_ROWS",
+                        admit_min_free_rows or 1,
+                        minimum=1,
+                    )
+                ),
+                admit_min_ready_requests=(
+                    0
+                    if use_paged_engine
+                    else env_int(
+                        "TORCHINFERNO_CONTINUOUS_ADMIT_MIN_READY_REQUESTS",
+                        admit_min_ready_requests or 1,
+                        minimum=1,
+                    )
+                ),
+                admit_max_wait_steps=(
+                    0
+                    if use_paged_engine
+                    else env_int(
+                        "TORCHINFERNO_CONTINUOUS_ADMIT_MAX_WAIT_STEPS",
+                        0,
+                        minimum=0,
+                    )
+                ),
+                admit_priority_max_wait_steps=(
+                    0
+                    if use_paged_engine
+                    else env_int(
+                        "TORCHINFERNO_CONTINUOUS_ADMIT_PRIORITY_MAX_WAIT_STEPS",
+                        8,
+                        minimum=0,
+                    )
+                ),
+                admit_per_step_cap=0 if use_paged_engine else admit_per_step_cap,
                 prefill_token_budget=normalized_prefill_budget or 0,
                 enable_ragged_decode=enable_ragged_decode,
                 use_decode_many=use_decode_many,
@@ -6268,6 +6493,7 @@ class OpenAICompletionEngine:
                     self._generation_queue.put(None)
                     saw_sentinel = True
                     return False
+                track_request(item)
                 if compatible(item):
                     ready.append(item)
                 else:
@@ -6378,7 +6604,7 @@ class OpenAICompletionEngine:
                                 total_online_rows,
                                 max_seq_len,
                                 model=self.model,
-                                batch_capacity=_generation_cache_batch_capacity(self.model, total_online_rows),
+                                batch_capacity=total_online_rows,
                                 cache_backend=online_cache_backend,
                             )
                             _reset_generation_cache(shared_cache)
@@ -6494,6 +6720,7 @@ class OpenAICompletionEngine:
                                     break
                             if next_item is None:
                                 break
+                            track_request(next_item)
                             if not compatible(next_item):
                                 deferred.append(next_item)
                                 break
@@ -6508,6 +6735,7 @@ class OpenAICompletionEngine:
                                     if more is None:
                                         self._generation_queue.put(None)
                                         break
+                                    track_request(more)
                                     if compatible(more):
                                         idle_batch.append(more)
                                     else:
@@ -6525,6 +6753,7 @@ class OpenAICompletionEngine:
                                     if more is None:
                                         self._generation_queue.put(None)
                                         break
+                                    track_request(more)
                                     if compatible(more):
                                         idle_batch.append(more)
                                     else:
@@ -6611,10 +6840,11 @@ class OpenAICompletionEngine:
                                 request.first_token_prefill_shape = str(
                                     getattr(event, "prefill_shape", "") or ""
                                 )
-                            request.responses.put(event.token)
                             if event.finished:
-                                _finish_stream_request(request)
+                                _finish_stream_request_with_token(request, event.token)
                                 finished_events += 1
+                            else:
+                                request.responses.put(event.token)
                         add_phase("event_emit_ms", event_emit_start_s)
                         step += ran_steps
                         remaining_steps -= ran_steps
@@ -7040,6 +7270,8 @@ class OpenAICompletionEngine:
             except Exception as exc:
                 warn_optional_failure("openai.queue_profile.decode_capture_on_miss", exc)
         cache = getattr(runtime_engine, "_cache", None)
+        if cache is None:
+            cache = getattr(runtime_engine, "cache", None)
         if cache is not None:
             cache_max_seq_len, cache_rows = _generation_cache_shape_limits(cache)
             if cache_max_seq_len is not None:
@@ -8354,10 +8586,11 @@ class OpenAICompletionEngine:
                                 _finish_stream_request(request)
                                 finished_events += 1
                                 continue
-                            request.responses.put(event.token)
                             if event.finished:
-                                _finish_stream_request(request)
+                                _finish_stream_request_with_token(request, event.token)
                                 finished_events += 1
+                            else:
+                                request.responses.put(event.token)
                         online_steps += ran_steps
                         remaining_steps -= ran_steps
                     if _online_step_sync_enabled(temperature=group[0].temperature, max_tokens=max_tokens):
@@ -8560,9 +8793,10 @@ class OpenAICompletionEngine:
             if event.token in stop_token_ids:
                 _finish_stream_request(request)
                 continue
-            request.responses.put(event.token)
             if event.finished:
-                _finish_stream_request(request)
+                _finish_stream_request_with_token(request, event.token)
+            else:
+                request.responses.put(event.token)
 
     def _record_stream_group_queue_profile(
         self,
@@ -14438,6 +14672,12 @@ def _paged_kv_active_for(model: object, max_seq_len: int) -> bool:
 def _paged_online_engine_class_for(model: object, max_seq_len: int) -> object | None:
     if not _paged_kv_active_for(model, max_seq_len):
         return None
+    # TP startup retains a fully allocated dense/FlashInfer cache and graphs
+    # that reference it. A separate PagedEngine pool would double-reserve KV
+    # storage. Keep TP OpenAI serving on that validated cache until both engines
+    # share one storage owner; standalone paged-serving APIs remain available.
+    if int(getattr(model, "_online_cache_token_capacity", 0) or 0) > 0:
+        return None
     if importlib.util.find_spec("flashinfer") is None:
         return None
     try:
@@ -18015,9 +18255,11 @@ def _emit_stream_token(
     if token in stop_token_ids:
         _finish_stream_request(request)
         return
-    request.responses.put(token)
     if generated_tokens >= request.max_tokens:
-        _finish_stream_request(request)
+        _finish_stream_request_with_token(request, token)
+    else:
+        request.responses.put(token)
+
 
 def _flashinfer_step_loop(
     model: object,
@@ -18108,9 +18350,13 @@ def _flashinfer_step_loop(
                 raise ValueError("row_max_tokens must match prompts")
             max_tok = row_max_tokens[pidx]
 
-            if next_token in stop_token_ids or new_gen >= max_tok:
+            if next_token in stop_token_ids:
                 if req is not None and not req.done:
                     _finish_stream_request(req)
+                finished_rows.append(row)
+            elif new_gen >= max_tok:
+                if req is not None and not req.done:
+                    _finish_stream_request_with_token(req, next_token)
                 finished_rows.append(row)
             else:
                 if req is not None and not req.done:
@@ -18137,6 +18383,20 @@ def _finish_stream_request(request: _QueuedGeneration) -> None:
     if request.queued_at_s > 0.0 and request.finished_at_s <= 0.0:
         request.finished_at_s = time.perf_counter()
     request.responses.put(_GenerationDone())
+    request.done = True
+
+
+def _finish_stream_request_with_token(request: _QueuedGeneration, token: int) -> None:
+    if request.done:
+        return
+    if request.queued_at_s > 0.0 and request.finished_at_s <= 0.0:
+        request.finished_at_s = time.perf_counter()
+    put_final_token = getattr(request.responses, "put_final_token", None)
+    if callable(put_final_token):
+        put_final_token(int(token))
+    else:
+        request.responses.put(int(token))
+        request.responses.put(_GenerationDone())
     request.done = True
 
 
@@ -19297,6 +19557,8 @@ def _apply_tensor_parallel_serving_defaults(config: OpenAIServerConfig) -> None:
         "TORCHINFERNO_OPENAI_TP_ONLINE_SESSION_PROMPT_HEADROOM_TOKENS": "64",
         "TORCHINFERNO_CONTINUOUS_ADMIT_PER_STEP_CAP": "48",
         "TORCHINFERNO_CONTINUOUS_ADMIT_MIN_READY_REQUESTS": "6",
+        "TORCHINFERNO_CONTINUOUS_ADMIT_MAX_WAIT_STEPS": "2",
+        "TORCHINFERNO_CONTINUOUS_ADMIT_PRIORITY_MAX_WAIT_STEPS": "2",
         "TORCHINFERNO_CONTINUOUS_ADMIT_MIN_FREE_ROWS": "2",
         "TORCHINFERNO_CONTINUOUS_ADMIT_PREFILL_COST_PRIORITY": "1",
         "TORCHINFERNO_CONTINUOUS_ADMIT_SUSTAINED_MIN_GENERATED": "3",
@@ -19418,12 +19680,13 @@ def _automatic_tensor_parallel_cpu_set(
     if not groups:
         return set()
 
+    available_per_rank = max(1, len(groups) // len(ranks_on_node))
     requested = env_int(
         "TORCHINFERNO_OPENAI_TP_CPU_CORES_PER_RANK",
-        8,
+        available_per_rank,
         minimum=1,
     )
-    cores_per_rank = min(requested, max(1, len(groups) // len(ranks_on_node)))
+    cores_per_rank = min(requested, available_per_rank)
     start = rank_position * cores_per_rank
     selected_groups = groups[start : start + cores_per_rank]
     if len(selected_groups) < cores_per_rank:

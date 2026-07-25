@@ -366,6 +366,17 @@ def test_openai_protocol_rejects_unsupported_top_p() -> None:
         )
 
 
+@pytest.mark.parametrize("max_tokens", [0, -1])
+def test_openai_protocol_rejects_non_positive_max_tokens(max_tokens: int) -> None:
+    with pytest.raises(ValueError, match="max_tokens must be positive"):
+        parse_chat_completion_request(
+            {
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": max_tokens,
+            }
+        )
+
+
 @pytest.mark.parametrize("top_p", [0.0, -0.1, 1.1])
 def test_openai_protocol_rejects_invalid_top_p(top_p: float) -> None:
     with pytest.raises(ValueError, match="top_p must be"):

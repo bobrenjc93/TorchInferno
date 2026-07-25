@@ -26,8 +26,8 @@ def parse_chat_completion_request(payload: Mapping[str, object]) -> OpenAIChatCo
             raise ValueError("messages entries must be objects")
         normalized_messages.append(dict(message))
     max_tokens = int(payload.get("max_tokens", 256))
-    if max_tokens < 0:
-        raise ValueError("max_tokens must be non-negative")
+    if max_tokens < 1:
+        raise ValueError("max_tokens must be positive")
     temperature = float(payload.get("temperature", 0.0))
     if temperature < 0:
         raise ValueError("temperature must be non-negative")
