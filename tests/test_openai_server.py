@@ -12842,6 +12842,135 @@ def test_openai_startup_common_prefix_warmup_installs_persistent_cache(monkeypat
     assert not hasattr(engine._persistent_serving_cache, "_skip_capture_sync")
 
 
+def test_openai_cache_only_common_prefix_warmup_uses_uniform_runtime_path(monkeypatch) -> None:
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_STARTUP_ONLINE_COMMON_PREFIX_PREFILL_ROWS", "2")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_STARTUP_ONLINE_COMMON_PREFIX_PREFILL_TOKENS", "4,8")
+    calls: list[tuple[tuple[int, int], int, tuple[int, ...], int]] = []
+    fp8_calls: list[tuple[bool, int]] = []
+
+    class Cache:
+        def __init__(self) -> None:
+            self.seq_len = 99
+            self.reset_calls = 0
+
+        def reset(self) -> None:
+            self.seq_len = 0
+            self.reset_calls += 1
+
+    class Model:
+        def __init__(self) -> None:
+            self.layers = [
+                types.SimpleNamespace(
+                    _runtime_fp8_prefill_enabled=True,
+                    _runtime_fp8_prefill_min_m=128,
+                )
+            ]
+
+        def set_runtime_fp8_prefill(self, enabled: bool, *, min_m: int) -> None:
+            fp8_calls.append((enabled, min_m))
+            self.layers[0]._runtime_fp8_prefill_enabled = enabled
+            self.layers[0]._runtime_fp8_prefill_min_m = min_m
+
+        def prefill_ragged_cache(
+            self,
+            input_ids: torch.Tensor,
+            cache: object,
+            *,
+            seq_lens: torch.Tensor,
+            row_indices: torch.Tensor,
+            context_len: int,
+        ) -> bool:
+            assert cache.seq_len == 0
+            cache.seq_len = context_len
+            calls.append(
+                (
+                    (input_ids.size(0), input_ids.size(1)),
+                    int(seq_lens.numel()),
+                    tuple(row_indices.tolist()),
+                    context_len,
+                )
+            )
+            return True
+
+    engine = object.__new__(OpenAICompletionEngine)
+    engine.model = Model()
+    engine.device = torch.device("cpu")
+    cache = Cache()
+
+    engine._warmup_online_cache_only_common_prefix_prefill(
+        cache,
+        vocab_size=32,
+        max_active=2,
+        cache_rows=4,
+        max_seq_len=16,
+    )
+
+    assert calls == [((1, 4), 3, (2,), 4), ((1, 8), 3, (2,), 8)]
+    assert fp8_calls == [(True, 1), (True, 128)]
+    assert cache.seq_len == 0
+    assert cache.reset_calls == 3
+
+
+def test_openai_cache_only_common_prefix_warmup_skips_paged_cache() -> None:
+    class Model:
+        def prefill_ragged_cache(self, *args: object, **kwargs: object) -> bool:
+            del args, kwargs
+            raise AssertionError("native paged cache must not enter dense ragged prefill")
+
+    engine = object.__new__(OpenAICompletionEngine)
+    engine.model = Model()
+    engine.device = torch.device("cpu")
+    cache = types.SimpleNamespace(cache_backend="paged")
+
+    engine._warmup_online_cache_only_common_prefix_prefill(
+        cache,
+        vocab_size=32,
+        max_active=2,
+        cache_rows=4,
+        max_seq_len=16,
+    )
+
+
+def test_openai_cache_only_common_prefix_warmup_resets_after_failure(monkeypatch) -> None:
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_STARTUP_ONLINE_COMMON_PREFIX_PREFILL_ROWS", "2")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_STARTUP_ONLINE_COMMON_PREFIX_PREFILL_TOKENS", "4")
+    fp8_calls: list[tuple[bool, int]] = []
+
+    class Cache:
+        cache_backend = "dense"
+
+        def __init__(self) -> None:
+            self.seq_len = 7
+
+        def reset(self) -> None:
+            self.seq_len = 0
+
+    class Model:
+        def set_runtime_fp8_prefill(self, enabled: bool, *, min_m: int) -> None:
+            fp8_calls.append((enabled, min_m))
+
+        def prefill_ragged_cache(self, *args: object, **kwargs: object) -> bool:
+            del args, kwargs
+            raise RuntimeError("warmup failure")
+
+    engine = object.__new__(OpenAICompletionEngine)
+    engine.model = Model()
+    engine.device = torch.device("cpu")
+    cache = Cache()
+
+    with pytest.raises(RuntimeError, match="warmup failure"):
+        engine._warmup_online_cache_only_common_prefix_prefill(
+            cache,
+            vocab_size=32,
+            max_active=2,
+            cache_rows=4,
+            max_seq_len=16,
+        )
+
+    assert cache.seq_len == 0
+    assert fp8_calls == [(True, 1), (False, 2048)]
+
+
 def test_openai_deterministic_common_prefix_suffix_warmup_captures_target_shapes(monkeypatch) -> None:
     monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_DYNAMIC_PREFIX_PREFILL_GRAPH", raising=False)
     monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_DYNAMIC_PREFIX_PREFILL_MIN_CONTEXT", raising=False)

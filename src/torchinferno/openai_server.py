@@ -3523,6 +3523,70 @@ class OpenAICompletionEngine:
                 pass
             _finish_serving_cache_warmup(self, cache)
 
+    def _warmup_online_cache_only_common_prefix_prefill(
+        self,
+        cache: object,
+        vocab_size: int,
+        *,
+        max_active: int,
+        cache_rows: int,
+        max_seq_len: int,
+    ) -> None:
+        prefill_cache = getattr(self.model, "prefill_ragged_cache", None)
+        if not callable(prefill_cache):
+            return
+        if str(getattr(cache, "cache_backend", "dense")).lower() == "paged":
+            return
+        rows = _startup_online_common_prefix_prefill_warmup_rows(cache_rows, max_active)
+        token_counts = _startup_online_common_prefix_prefill_warmup_tokens(max_seq_len)
+        if not rows or not token_counts:
+            return
+        fp8_min_m = _online_fp8_prefill_min_m(temperature=0.0, max_tokens=1)
+        model_layers = tuple(getattr(self.model, "layers", ()) or ())
+        if model_layers:
+            restore_fp8_enabled = bool(
+                getattr(model_layers[0], "_runtime_fp8_prefill_enabled", False)
+            )
+            restore_fp8_min_m = int(
+                getattr(model_layers[0], "_runtime_fp8_prefill_min_m", 2048)
+            )
+        else:
+            restore_fp8_enabled = False
+            restore_fp8_min_m = 2048
+        try:
+            _set_tensor_parallel_runtime_fp8_prefill(
+                self.model,
+                enabled=_online_fp8_prefill_enabled(temperature=0.0, max_tokens=1),
+                min_m=fp8_min_m,
+            )
+            for row in rows:
+                for token_count in token_counts:
+                    _reset_generation_cache(cache)
+                    input_ids = (
+                        torch.arange(token_count, device=self.device, dtype=torch.long)
+                        % vocab_size
+                    )[None, :]
+                    seq_lens = torch.zeros(row + 1, device=self.device, dtype=torch.long)
+                    row_indices = torch.tensor([row], device=self.device, dtype=torch.long)
+                    prefill_cache(
+                        input_ids,
+                        cache,
+                        seq_lens=seq_lens,
+                        row_indices=row_indices,
+                        context_len=token_count,
+                    )
+            try:
+                cache._compiled_prefill_ready = True
+            except Exception:
+                pass
+        finally:
+            _set_tensor_parallel_runtime_fp8_prefill(
+                self.model,
+                enabled=restore_fp8_enabled,
+                min_m=restore_fp8_min_m,
+            )
+            _reset_generation_cache(cache)
+
     def _warmup_online_single_prefill_logits_graphs(
         self,
         cache: object,
@@ -3883,6 +3947,24 @@ class OpenAICompletionEngine:
                     self._warmup_token_bucket_fa3_prefill_graphs(
                         cache,
                         vocab_size,
+                        cache_rows=cache_batch,
+                        max_seq_len=max_seq_len,
+                    )
+            if (
+                _startup_online_common_prefix_prefill_warmup_enabled()
+                and env_flag("TORCHINFERNO_OPENAI_WARMUP_ONLINE_COMMON_PREFIX_PREFILL", True)
+            ):
+                with _tensor_parallel_symm_mem_allreduce_scope(
+                    self.model,
+                    self.device,
+                    max_tokens=1,
+                    temperature=0.0,
+                    startup=False,
+                ):
+                    self._warmup_online_cache_only_common_prefix_prefill(
+                        cache,
+                        vocab_size,
+                        max_active=max_active,
                         cache_rows=cache_batch,
                         max_seq_len=max_seq_len,
                     )

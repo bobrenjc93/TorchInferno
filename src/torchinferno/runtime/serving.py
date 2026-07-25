@@ -9556,6 +9556,10 @@ class ContinuousBatchEngine:
             seq_lens_list[row] = self._cache_row_seq_len(row, 0)
         seq_lens = torch.tensor(seq_lens_list, device=input_ids.device, dtype=torch.long)
         row_indices = torch.tensor(rows, device=input_ids.device, dtype=torch.long)
+        row_seq_lens = [seq_lens_list[row] for row in rows]
+        context_len = None
+        if row_seq_lens and all(seq_len == row_seq_lens[0] for seq_len in row_seq_lens):
+            context_len = row_seq_lens[0] + int(input_ids.size(1))
         graph = getattr(self.model, "try_prefill_ragged_cache_graph", None)
         if callable(graph):
             try:
@@ -9564,6 +9568,7 @@ class ContinuousBatchEngine:
                     cache,
                     seq_lens=seq_lens,
                     row_indices=row_indices,
+                    context_len=context_len,
                     capture_on_miss=False,
                 )
                 if filled:
@@ -9581,6 +9586,7 @@ class ContinuousBatchEngine:
                     cache,
                     seq_lens=seq_lens,
                     row_indices=row_indices,
+                    context_len=context_len,
                 )
             )
         except Exception as exc:

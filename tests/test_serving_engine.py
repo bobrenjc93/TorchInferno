@@ -3701,7 +3701,31 @@ def test_continuous_batch_engine_cache_only_common_prefix_skips_logits_when_not_
     reusable = engine.reusable_prefixes[common_route]
     assert reusable.logits is None
     assert model.prefill_cache_graph_calls == 1
+    assert model.prefill_context_lens[0] == len(shared)
     assert engine.stats.prefill_common_prefix_batches == 1
+
+
+def test_continuous_batch_engine_cache_only_prefill_uses_uniform_context_only() -> None:
+    model = _SelectedLogitsToyModel()
+    engine = ContinuousBatchEngine(
+        model,
+        device=torch.device("cpu"),
+        max_active_requests=2,
+        prefix_cache_capacity=0,
+    )
+    engine.start_online(max_seq_len=16)
+    cache = engine._require_cache()
+    input_ids = torch.tensor([[7, 8], [9, 10]], dtype=torch.long)
+
+    cache._seq_lens[:2] = [3, 3]
+    engine._row_seq_lens[:2] = [3, 3]
+    assert engine._prefill_cache_only(input_ids, rows=[0, 1])
+    assert model.prefill_context_lens[-1] == 5
+
+    cache._seq_lens[:2] = [1, 3]
+    engine._row_seq_lens[:2] = [1, 3]
+    assert engine._prefill_cache_only(input_ids, rows=[0, 1])
+    assert model.prefill_context_lens[-1] is None
 
 
 def test_continuous_batch_engine_counts_ragged_prefill_captures() -> None:
@@ -6819,6 +6843,7 @@ def test_continuous_batch_engine_chunked_prefill_prepares_common_prefix() -> Non
     assert model.prefill_cache_eager_calls == 0
     assert [shape[0] for shape in model.prefill_input_shapes] == [1, 4, 4]
     assert model.prefill_row_indices[0] == [common_prefix_row]
+    assert model.prefill_context_lens[0] == len(shared)
     assert model.prefill_src_prefix_rows[0] is None
     assert model.prefill_src_prefix_rows[1] == [common_prefix_row]
 
