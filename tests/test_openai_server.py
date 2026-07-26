@@ -167,6 +167,8 @@ from torchinferno.openai_server import (
     _online_ragged_decode_cache_token_min_batch,
     _online_step_sync_enabled,
     _online_submit_step_command_enabled,
+    _openai_tp_symm_mem_allreduce_enabled,
+    _openai_tp_symm_mem_prefill_allreduce_enabled,
     _openai_cuda_graph_enabled_for_model,
     _openai_decode_graph_enabled,
     _openai_ragged_decode_graph_enabled,
@@ -188,6 +190,8 @@ from torchinferno.openai_server import (
     _prefers_exact_generation_cache,
     _prompt_list_tensor_payload,
     _queue_profile_sync_timings_enabled,
+    _ragged_decode_graph_cache_live_shape_key,
+    _ragged_prefill_graph_cache_live_shape_key,
     _release_row_owned_serving_caches,
     _runtime_ragged_decode_graph_capture_allowed_for_request,
     _replace_persistent_serving_cache,
@@ -275,6 +279,35 @@ def test_openai_server_cache_backend_env_defaults(monkeypatch: pytest.MonkeyPatc
     config = config_from_args(args)
 
     assert config.cache_backend == "flashinfer"
+
+
+def test_freeze_long_lived_server_objects_preserves_request_time_gc(monkeypatch) -> None:
+    import torchinferno.openai_server as openai_server
+
+    calls: list[str] = []
+    monkeypatch.delenv("TORCHINFERNO_OPENAI_FREEZE_LONG_LIVED_GC", raising=False)
+    monkeypatch.setattr(openai_server.gc, "get_freeze_count", lambda: 0)
+    monkeypatch.setattr(openai_server.gc, "collect", lambda: calls.append("collect"))
+    monkeypatch.setattr(openai_server.gc, "freeze", lambda: calls.append("freeze"))
+    monkeypatch.setattr(openai_server.gc, "unfreeze", lambda: calls.append("unfreeze"))
+
+    with openai_server._freeze_long_lived_server_objects(torch.device("cuda")):
+        calls.append("serve")
+
+    assert calls == ["collect", "freeze", "serve", "unfreeze"]
+
+
+def test_freeze_long_lived_server_objects_skips_cpu(monkeypatch) -> None:
+    import torchinferno.openai_server as openai_server
+
+    calls: list[str] = []
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_FREEZE_LONG_LIVED_GC", "1")
+    monkeypatch.setattr(openai_server.gc, "freeze", lambda: calls.append("freeze"))
+
+    with openai_server._freeze_long_lived_server_objects(torch.device("cpu")):
+        calls.append("serve")
+
+    assert calls == ["serve"]
 
 
 def test_openai_startup_warmup_skips_non_dense_cache_by_default(
@@ -888,7 +921,9 @@ def test_openai_fast_stream_end_bytes_coalesce_final_frames() -> None:
 
 
 @pytest.mark.parametrize("max_tokens", [256, 400, 512, 513, 1024])
-def test_openai_fast_stream_sends_role_before_ready_token_batches(max_tokens: int) -> None:
+def test_openai_fast_stream_coalesces_headers_and_role_before_ready_token_batches(
+    max_tokens: int,
+) -> None:
     connection = _RecordingConnection()
 
     _stream_fast_chat(
@@ -899,14 +934,15 @@ def test_openai_fast_stream_sends_role_before_ready_token_batches(max_tokens: in
         temperature=0.0,
     )
 
-    assert len(connection.payloads) == 4
-    assert b'{"role":"assistant"}' in connection.payloads[1]
-    assert b'"content"' not in connection.payloads[1]
-    content_payload = connection.payloads[2]
+    assert len(connection.payloads) == 3
+    assert connection.payloads[0].startswith(b"HTTP/1.1 200 OK\r\n")
+    assert b'{"role":"assistant"}' in connection.payloads[0]
+    assert b'"content"' not in connection.payloads[0]
+    content_payload = connection.payloads[1]
     assert content_payload.count(b"chat.completion.chunk") == 3
     assert content_payload.count(b'"content"') == 3
     assert b'"role"' not in content_payload
-    assert connection.payloads[3].endswith(b"data: [DONE]\n\n")
+    assert connection.payloads[2].endswith(b"data: [DONE]\n\n")
 
 
 @pytest.mark.parametrize("max_tokens", [256, 400, 512, 513, 1024])
@@ -1029,7 +1065,7 @@ def test_openai_fast_http_profile_can_record_detailed_token_timing(
     record = json.loads(profile_path.read_text())
     assert record["decode_token_ms"] >= 0.0
     assert record["content_send_ms"] >= 0.0
-    assert record["headers_ms"] >= 0.0
+    assert record["stream_start_send_ms"] >= 0.0
     assert record["finish_send_ms"] >= 0.0
 
 
@@ -1525,9 +1561,13 @@ def test_openai_decode_warmup_excludes_prefix_cache_rows() -> None:
         80,
         88,
         96,
+        100,
         104,
+        108,
         112,
+        116,
         120,
+        124,
         128,
     )
     assert _online_decode_warmup_batch_sizes(max_active=48, cache_batch=112) == (
@@ -1551,7 +1591,13 @@ def test_openai_decode_warmup_excludes_prefix_cache_rows() -> None:
         32,
         40,
         48,
+        50,
+        52,
+        54,
         56,
+        58,
+        60,
+        62,
         64,
     )
     assert _online_decode_warmup_batch_sizes(max_active=7, cache_batch=7) == (1, 2, 4, 7)
@@ -1574,7 +1620,13 @@ def test_openai_decode_warmup_includes_runtime_decode_bucket_sizes(monkeypatch) 
         32,
         40,
         48,
+        50,
+        52,
+        54,
         56,
+        58,
+        60,
+        62,
         64,
     )
 
@@ -1628,9 +1680,10 @@ def test_openai_ragged_decode_cache_token_limit_uses_context_tiles(monkeypatch) 
     monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_RAGGED_DECODE_CACHE_TILE", raising=False)
     monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_RAGGED_DECODE_CACHE_MIN_BATCH", raising=False)
 
-    assert _online_ragged_decode_cache_token_min_batch() == 64
+    assert _online_ragged_decode_cache_token_min_batch(64) == 56
+    assert _online_ragged_decode_cache_token_min_batch(80) == 70
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_RAGGED_DECODE_CACHE_MIN_BATCH", "32")
-    assert _online_ragged_decode_cache_token_min_batch() == 32
+    assert _online_ragged_decode_cache_token_min_batch(80) == 32
     monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_RAGGED_DECODE_CACHE_MIN_BATCH", raising=False)
 
     assert _online_ragged_decode_cache_token_limit(
@@ -2191,6 +2244,27 @@ def test_chat_template_batch_encoding_input_ids_are_extracted() -> None:
     encoded = tokenizer.encode_messages([{"role": "user", "content": "hello"}])
 
     assert encoded == [7, 8, 9]
+
+
+def test_chat_template_encodes_multiple_conversations_in_one_batch() -> None:
+    class BatchTokenizer(_BatchEncodingTokenizer):
+        def apply_chat_template(self, messages, *, tokenize: bool, add_generation_prompt: bool):
+            assert tokenize
+            assert add_generation_prompt
+            assert len(messages) == 2
+            assert all(isinstance(conversation, list) for conversation in messages)
+            return {"input_ids": [[7, 8], [9, 10, 11]]}
+
+    tokenizer = _TransformersChatTokenizer(BatchTokenizer())
+
+    encoded = tokenizer.encode_messages_batch(
+        [
+            [{"role": "user", "content": "first"}],
+            [{"role": "user", "content": "second"}],
+        ]
+    )
+
+    assert encoded == [[7, 8], [9, 10, 11]]
 
 
 def test_transformers_chat_tokenizer_falls_back_when_template_is_unset() -> None:
@@ -4777,6 +4851,49 @@ def test_openai_engine_prompt_token_cache_can_be_disabled(monkeypatch) -> None:
     assert engine._encode_chat_prompt(messages, max_tokens=1) == [4, 1]
     assert engine._encode_chat_prompt(messages, max_tokens=1) == [4, 2]
     assert tokenizer.calls == 2
+
+
+def test_openai_engine_batches_concurrent_unique_prompt_encodes(monkeypatch) -> None:
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_PROMPT_TOKEN_CACHE_MAX_ENTRIES", "8")
+
+    class BatchTokenizer:
+        def __init__(self) -> None:
+            self.batches: list[list[str]] = []
+
+        def encode_messages_batch(self, conversations) -> list[list[int]]:
+            contents = [str(messages[-1]["content"]) for messages in conversations]
+            self.batches.append(contents)
+            return [[len(content)] for content in contents]
+
+        def encode_messages(self, messages) -> list[int]:
+            raise AssertionError("concurrent requests should use batch encoding")
+
+    tokenizer = BatchTokenizer()
+    engine = _cache_only_engine()
+    engine.tokenizer = tokenizer
+    engine.max_model_len = None
+    engine._prompt_encode_batch_max_size = 8
+    engine._prompt_encode_batch_wait_s = 0.05
+    contents = ["a", "bb", "ccc", "dddd"]
+    barrier = threading.Barrier(len(contents))
+    results: list[list[int] | None] = [None] * len(contents)
+
+    def run(index: int) -> None:
+        barrier.wait(timeout=5)
+        results[index] = engine._encode_chat_prompt(
+            [{"role": "user", "content": contents[index]}],
+            max_tokens=1,
+        )
+
+    threads = [threading.Thread(target=run, args=(index,)) for index in range(len(contents))]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert results == [[1], [2], [3], [4]]
+    assert len(tokenizer.batches) == 1
+    assert sorted(tokenizer.batches[0]) == sorted(contents)
 
 
 def test_openai_engine_keeps_multiple_prefix_cache_entries(monkeypatch) -> None:
@@ -10695,6 +10812,18 @@ def test_openai_symm_mem_auto_probe_sets_worker_env_on_success(monkeypatch) -> N
 
     assert calls == [8]
     assert os.environ["TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE"] == "runtime"
+    assert os.environ["TORCHINFERNO_SYMM_MEM_ALLREDUCE"] == "0"
+    assert _openai_tp_symm_mem_allreduce_enabled()
+    assert not _openai_tp_symm_mem_allreduce_enabled(startup=True)
+    assert _openai_tp_symm_mem_prefill_allreduce_enabled(
+        max_tokens=32,
+        temperature=0.0,
+    )
+    assert not _openai_tp_symm_mem_prefill_allreduce_enabled(
+        max_tokens=32,
+        temperature=0.0,
+        startup=True,
+    )
 
 
 @pytest.fixture
@@ -10727,6 +10856,10 @@ def test_tensor_parallel_serving_defaults_gate_fa3_backend(
         "TORCHINFERNO_CONTINUOUS_ADMIT_MIN_READY_REQUESTS",
         "TORCHINFERNO_CONTINUOUS_ADMIT_MAX_WAIT_STEPS",
         "TORCHINFERNO_CONTINUOUS_ADMIT_PRIORITY_MAX_WAIT_STEPS",
+        "TORCHINFERNO_CONTINUOUS_ADMIT_SUSTAINED_MAX_CONSECUTIVE_STEPS",
+        "TORCHINFERNO_OPENAI_TOKENIZER_BATCH_MAX_SIZE",
+        "TORCHINFERNO_OPENAI_TOKENIZER_BATCH_WAIT_MS",
+        "TORCHINFERNO_MARLIN_INT4_DECODE",
         "TORCHINFERNO_SGLANG_FA3_STATUS_LOGGED",
     ):
         monkeypatch.delenv(name, raising=False)
@@ -10747,11 +10880,24 @@ def test_tensor_parallel_serving_defaults_gate_fa3_backend(
     assert os.environ["TORCHINFERNO_CONTINUOUS_UNIFIED_FORWARD"] == expected
     assert os.environ["TORCHINFERNO_CONTINUOUS_TOKEN_BUCKET_FA3_UNIFIED"] == expected
     assert os.environ["TORCHINFERNO_CONTINUOUS_TOKEN_BUCKET_FA3_PREFILL"] == expected
-    assert os.environ["TORCHINFERNO_CONTINUOUS_ADMIT_PER_STEP_CAP"] == "24"
-    assert os.environ["TORCHINFERNO_CONTINUOUS_ADMIT_MIN_READY_REQUESTS"] == "6"
+    assert os.environ["TORCHINFERNO_CONTINUOUS_ADMIT_PER_STEP_CAP"] == "32"
+    assert os.environ["TORCHINFERNO_CONTINUOUS_ADMIT_MIN_READY_REQUESTS"] == "4"
     assert os.environ["TORCHINFERNO_CONTINUOUS_ADMIT_MAX_WAIT_STEPS"] == "2"
     assert os.environ["TORCHINFERNO_CONTINUOUS_ADMIT_PRIORITY_MAX_WAIT_STEPS"] == "2"
+    assert os.environ["TORCHINFERNO_CONTINUOUS_ADMIT_SUSTAINED_MIN_GENERATED"] == "1"
+    assert os.environ["TORCHINFERNO_CONTINUOUS_ADMIT_SUSTAINED_MAX_CONSECUTIVE_STEPS"] == "2"
+    assert "TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_BUCKET_SIZES" not in os.environ
+    assert os.environ["TORCHINFERNO_OPENAI_TOKENIZER_BATCH_MAX_SIZE"] == "16"
+    assert os.environ["TORCHINFERNO_OPENAI_TOKENIZER_BATCH_WAIT_MS"] == "0.2"
     assert os.environ["TORCHINFERNO_FP8_FUSED_SWIGLU_DECODE"] == "1"
+    assert os.environ["TORCHINFERNO_FP8_QKV_PREFILL"] == "1"
+    assert os.environ["TORCHINFERNO_TRITON_STREAMING_DECODE_ATTENTION_BLOCK_S"] == "64"
+    assert os.environ["TORCHINFERNO_CONTINUOUS_PINNED_DECODE_INPUTS"] == "1"
+    assert os.environ["TORCHINFERNO_CUDAGRAPH_RAGGED_DECODE_HOST_INPUTS"] == "1"
+    assert os.environ["TORCHINFERNO_MARLIN_INT4_DECODE"] == "0"
+    assert "TORCHINFERNO_FP8_O_PROJ" not in os.environ
+    assert "TORCHINFERNO_FP8_LM_HEAD" not in os.environ
+    assert "TORCHINFERNO_MARLIN_INT4_GATE_UP" not in os.environ
 
 
 def test_tensor_parallel_serving_defaults_preserve_explicit_fa3_override(
@@ -11790,8 +11936,8 @@ def test_set_tensor_parallel_runtime_fp8_prefill_updates_layers() -> None:
 
 def test_online_marlin_int4_decode_is_request_agnostic(monkeypatch) -> None:
     monkeypatch.delenv("TORCHINFERNO_OPENAI_TP_ONLINE_MARLIN_INT4_DECODE", raising=False)
-    assert _online_marlin_int4_decode_enabled(temperature=0.0, max_tokens=1)
-    assert _online_marlin_int4_decode_enabled(temperature=0.7, max_tokens=997)
+    assert not _online_marlin_int4_decode_enabled(temperature=0.0, max_tokens=1)
+    assert not _online_marlin_int4_decode_enabled(temperature=0.7, max_tokens=997)
 
     monkeypatch.setenv("TORCHINFERNO_OPENAI_TP_ONLINE_MARLIN_INT4_DECODE", "0")
     assert not _online_marlin_int4_decode_enabled(temperature=0.0, max_tokens=1)
@@ -16606,6 +16752,18 @@ def test_openai_queue_profile_sync_timings_default_off(monkeypatch: pytest.Monke
     assert _queue_profile_sync_timings_enabled() is True
 
 
+def test_openai_graph_cache_profile_keys_name_runtime_dimensions() -> None:
+    assert _ragged_prefill_graph_cache_live_shape_key(
+        (101, 8, 16, 4096, True, -1, -1, 1, (False,), 64, 32, 1, 1, 1, 0)
+    ) == (
+        "ragged_prefill:b8:s16:rows1:ctx-1:copy-1:src1:max4096:"
+        "fp80:ar64:prefill_ar32:logits1:tokens1:rotary1:writepos0"
+    )
+    assert _ragged_decode_graph_cache_live_shape_key(
+        (201, 8, 4096, 1024, True, (64, 8), True, True)
+    ) == "ragged_decode:b8:ctx4096:cache1024:rows1:symm(64,8):advance1:host1"
+
+
 def test_openai_queue_profile_records_runtime_engine_stats(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -17471,6 +17629,53 @@ def test_openai_queue_profile_records_runtime_engine_stats(
             "temperature": 0.7,
         }
     ]
+
+
+def test_openai_queue_profile_subtracts_model_counter_baseline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile_path = tmp_path / "queue-profile.jsonl"
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_QUEUE_PROFILE_JSONL", str(profile_path))
+    engine = _cache_only_engine()
+
+    class Model:
+        _ragged_prefill_logits_graph_evictions = 5
+        _ragged_prefill_logits_graph_evicted_entries = 130
+        _ragged_prefill_logits_graph_max_entries = 64
+
+        def temperature_sample_profile_summary(self) -> dict[str, float | int]:
+            return {
+                "temperature_sample_calls": 8,
+                "temperature_sample_rows": 30,
+                "temperature_sample_total_ms": 4.0,
+            }
+
+    class RuntimeEngine:
+        model = Model()
+        stats = object()
+
+    engine._record_runtime_engine_queue_profile(
+        "online_batcher",
+        RuntimeEngine(),
+        submitted_requests=4,
+        _model_counter_baseline={
+            "runtime_prefill_graph_cache_evictions": 2,
+            "runtime_prefill_graph_cache_evicted_entries": 100,
+            "runtime_temperature_sample_calls": 3,
+            "runtime_temperature_sample_rows": 10,
+            "runtime_temperature_sample_total_ms": 1.5,
+        },
+    )
+
+    record = json.loads(profile_path.read_text())
+    assert record["runtime_prefill_graph_cache_evictions"] == 3
+    assert record["runtime_prefill_graph_cache_evicted_entries"] == 30
+    assert record["runtime_prefill_graph_cache_max_entries"] == 64
+    assert record["runtime_temperature_sample_calls"] == 5
+    assert record["runtime_temperature_sample_rows"] == 20
+    assert record["runtime_temperature_sample_total_ms"] == 2.5
+    assert "_model_counter_baseline" not in record
 
 
 def test_openai_queue_profile_progress_skips_shape_details_by_default(
@@ -19135,6 +19340,8 @@ def test_openai_tensor_parallel_online_batcher_profile_snapshots(
     assert final_record["initial_wait_ms"] == 0.0
     assert final_record["idle_batch_wait_ms"] == 5.0
     assert final_record["collect_idle_arrivals"] is True
+    assert final_record["python_gc_enabled"] is True
+    assert isinstance(final_record["python_gc_frozen_objects"], int)
     assert final_record["admit_min_free_rows"] == 2
     assert final_record["admit_min_ready_requests"] == 4
     assert final_record["admit_per_step_cap"] == 48
@@ -19174,6 +19381,7 @@ def test_openai_tensor_parallel_online_batcher_profile_snapshots(
     assert final_record["request_prompt_tokens_max"] == 2
     assert final_record["request_max_tokens_min"] == 3
     assert final_record["request_max_tokens_max"] == 3
+    assert final_record["request_policy_counts"] == {"0:4": 1}
     assert final_record["queue_sequence_min"] == 11
     assert final_record["queue_sequence_max"] == 11
     assert final_record["queue_sequence_count"] == 1

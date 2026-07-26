@@ -21,6 +21,30 @@ from torchinferno.models.llama3 import (
 from torchinferno.models.llama3 import tensor_parallel as tensor_parallel_module
 
 
+def test_llama3_runtime_graph_pool_is_lazy_shared_and_optional(monkeypatch) -> None:
+    model = object.__new__(Llama3TensorParallelForCausalLM)
+    model.device = torch.device("cuda")
+    model._runtime_cuda_graph_pool = None
+    pool = object()
+    calls: list[None] = []
+    monkeypatch.delenv("TORCHINFERNO_CUDAGRAPH_SHARED_RUNTIME_POOL", raising=False)
+    monkeypatch.setattr(
+        torch.cuda,
+        "graph_pool_handle",
+        lambda: calls.append(None) or pool,
+    )
+
+    assert model._runtime_graph_pool() is pool
+    assert model._runtime_graph_pool() is pool
+    assert calls == [None]
+
+    monkeypatch.setenv("TORCHINFERNO_CUDAGRAPH_SHARED_RUNTIME_POOL", "0")
+    assert model._runtime_graph_pool() is None
+    monkeypatch.setenv("TORCHINFERNO_CUDAGRAPH_SHARED_RUNTIME_POOL", "1")
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_OVERLAP_PREFILL_DECODE", "1")
+    assert model._runtime_graph_pool() is None
+
+
 def test_llama3_ragged_prefill_profile_shape_filter_accepts_exact_targets(
     monkeypatch,
 ) -> None:
@@ -193,6 +217,62 @@ def test_llama3_tensor_parallel_decode_marlin_writes_into_symm_buffer(monkeypatc
     torch.testing.assert_close(reduce_buffer, torch.full_like(reduce_buffer, 7))
 
 
+def test_llama3_tensor_parallel_decode_fp8_writes_into_symm_buffer(monkeypatch) -> None:
+    layer = object.__new__(tensor_parallel_module._Llama3TensorParallelLayer)
+    layer.world_size = 2
+    layer._symm_reduce_failed = False
+    hidden = torch.ones((2, 1, 4), dtype=torch.bfloat16)
+    weight = torch.ones((8, 4), dtype=torch.bfloat16)
+    reduce_buffer = torch.empty((2, 1, 8), dtype=torch.bfloat16)
+    reduce_calls = []
+
+    def fp8_proj(hidden_arg, key, weight_arg, *, out=None):
+        assert hidden_arg is hidden
+        assert key == "down"
+        assert weight_arg is weight
+        assert out is reduce_buffer
+        out.fill_(5)
+        return out
+
+    monkeypatch.setenv("TORCHINFERNO_FP8_PER_TOKEN_SCALE", "1")
+    monkeypatch.setattr(
+        layer,
+        "_symm_reduce_buffer",
+        lambda name, hidden_arg, shape: (reduce_buffer, "world"),
+    )
+    monkeypatch.setattr(layer, "_fp8_decode_shape_enabled", lambda hidden_arg: True)
+    monkeypatch.setattr(layer, "_fp8_proj", fp8_proj)
+    monkeypatch.setattr(layer, "_profile_block", lambda name, function: function())
+    monkeypatch.setattr(layer, "_marlin_proj", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        tensor_parallel_module,
+        "_should_use_symm_mem_all_reduce",
+        lambda hidden_arg, weight_arg, world_size: True,
+    )
+    monkeypatch.setattr(
+        tensor_parallel_module,
+        "_should_use_symm_mem_prefill_all_reduce",
+        lambda hidden_arg, weight_arg, world_size: False,
+    )
+    monkeypatch.setattr(
+        torch.ops.symm_mem,
+        "multimem_all_reduce_",
+        lambda tensor, op, group: reduce_calls.append((tensor, op, group)),
+        raising=False,
+    )
+
+    result = layer._decode_linear_all_reduce(
+        hidden,
+        weight,
+        "mlp",
+        fp8_key="down",
+    )
+
+    assert result is reduce_buffer
+    assert reduce_calls == [(reduce_buffer, "sum", "world")]
+    torch.testing.assert_close(reduce_buffer, torch.full_like(reduce_buffer, 5))
+
+
 def test_llama3_tensor_parallel_prefill_symm_capture_requires_ready_buffer(monkeypatch) -> None:
     layer = object.__new__(tensor_parallel_module._Llama3TensorParallelLayer)
     layer.world_size = 2
@@ -228,6 +308,19 @@ def test_llama3_tensor_parallel_prefill_symm_capture_requires_ready_buffer(monke
 
     assert result.shape == (2, 3, 8)
     assert all_reduce_calls == [result]
+
+
+def test_llama3_tensor_parallel_prefill_symm_graph_key_tracks_collective(monkeypatch) -> None:
+    monkeypatch.delenv("TORCHINFERNO_SYMM_MEM_PREFILL_ALLREDUCE", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_SYMM_MEM_PREFILL_ALLREDUCE_MAX_TOKENS", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_SYMM_MEM_PREFILL_BUFFER_TOKENS", raising=False)
+
+    assert tensor_parallel_module._symm_mem_prefill_allreduce_graph_key(128, 4) == 0
+    with tensor_parallel_module.symm_mem_prefill_allreduce(True):
+        assert tensor_parallel_module._symm_mem_prefill_allreduce_graph_key(1, 4) == 0
+        assert tensor_parallel_module._symm_mem_prefill_allreduce_graph_key(128, 1) == 0
+        assert tensor_parallel_module._symm_mem_prefill_allreduce_graph_key(128, 4) == 1
+        assert tensor_parallel_module._symm_mem_prefill_allreduce_graph_key(4097, 4) == 0
 
 
 def test_llama3_tensor_parallel_symm_failure_does_not_switch_collectives(
@@ -724,6 +817,104 @@ def test_llama3_tensor_parallel_ragged_decode_many_graph_copies_step_rotary() ->
     )
 
 
+def test_llama3_tensor_parallel_advancing_graph_requires_persistent_input_aliases() -> None:
+    model = object.__new__(Llama3TensorParallelForCausalLM)
+    model.device = torch.device("cpu")
+    model.rotary_cos_cache = torch.arange(80, dtype=torch.float32).view(20, 4)
+    model.rotary_sin_cache = model.rotary_cos_cache + 1000
+    input_ids = torch.tensor([[10], [20]], dtype=torch.long)
+    seq_lens = torch.tensor([3, 7, 11, 13], dtype=torch.long)
+    captured = types.SimpleNamespace(
+        cache=types.SimpleNamespace(cache_backend="dense", layers=[types.SimpleNamespace(max_seq_len=20)]),
+        cache_token_bucket=20,
+        static_input_ids=input_ids,
+        static_cache_positions=seq_lens[:2],
+        static_row_indices=None,
+        static_rotary_cos=torch.empty((2, 4), dtype=torch.float32),
+        static_rotary_sin=torch.empty((2, 4), dtype=torch.float32),
+        static_paged_decode_page_tables=None,
+        static_paged_decode_seq_lens=None,
+        steps=1,
+        rotary_in_graph=True,
+        advance_inputs=True,
+    )
+
+    model._copy_ragged_decode_graph_inputs(captured, input_ids, seq_lens, None)
+
+    assert captured.static_input_ids.data_ptr() == input_ids.data_ptr()
+    assert captured.static_cache_positions.data_ptr() == seq_lens.data_ptr()
+    with pytest.raises(ValueError, match="alias persistent serving state"):
+        model._copy_ragged_decode_graph_inputs(
+            captured,
+            input_ids.clone(),
+            seq_lens.clone(),
+            None,
+        )
+
+
+def test_llama3_tensor_parallel_host_graph_copies_one_persistent_state() -> None:
+    host_state = torch.tensor(
+        [[10, 20, 30], [2, 0, 1], [5, 7, 9]],
+        dtype=torch.long,
+    )
+    device_state = torch.full_like(host_state, -1)
+    captured = types.SimpleNamespace(
+        host_input_state=host_state,
+        host_device_state=device_state,
+        static_row_indices=device_state[1],
+    )
+
+    Llama3TensorParallelForCausalLM._copy_ragged_decode_graph_host_inputs(captured)
+
+    torch.testing.assert_close(device_state, host_state)
+
+
+def test_llama3_tensor_parallel_host_graph_requires_placeholder_aliases(
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv("TORCHINFERNO_CUDAGRAPH_RAGGED_DECODE_HOST_INPUTS", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_CUDAGRAPH_RAGGED_DECODE_ROTARY_IN_GRAPH", raising=False)
+    monkeypatch.setattr(torch.Tensor, "is_pinned", lambda self: True)
+    model = object.__new__(Llama3TensorParallelForCausalLM)
+    model._torchinferno_online_decode_host_state = torch.zeros((3, 4), dtype=torch.long)
+    placeholders = torch.zeros((3, 4), dtype=torch.long)
+    model._torchinferno_online_decode_host_placeholders = placeholders
+    cache = types.SimpleNamespace(cache_backend="dense")
+    input_ids = placeholders[0, :2].view(2, 1)
+    row_indices = placeholders[1, :2]
+
+    assert (
+        model._ragged_decode_host_input_state(input_ids, cache, row_indices)
+        is model._torchinferno_online_decode_host_state
+    )
+    assert model._ragged_decode_host_input_state(input_ids.clone(), cache, row_indices) is None
+    assert model._ragged_decode_host_input_state(input_ids, cache, row_indices.clone()) is None
+    monkeypatch.setenv("TORCHINFERNO_CUDAGRAPH_RAGGED_DECODE_CACHE_TOKEN_BUCKETS", "1")
+    assert model._ragged_decode_host_input_state(input_ids, cache, row_indices) is None
+    monkeypatch.delenv("TORCHINFERNO_CUDAGRAPH_RAGGED_DECODE_CACHE_TOKEN_BUCKETS")
+    monkeypatch.setenv("TORCHINFERNO_CUDAGRAPH_RAGGED_DECODE_ROTARY_IN_GRAPH", "0")
+    assert model._ragged_decode_host_input_state(input_ids, cache, row_indices) is None
+
+
+def test_llama3_tensor_parallel_restores_advancing_inputs_before_first_replay() -> None:
+    captured = types.SimpleNamespace(
+        advance_inputs=True,
+        static_input_ids=torch.tensor([[99], [98]], dtype=torch.long),
+        static_cache_positions=torch.tensor([11, 12], dtype=torch.long),
+    )
+    original_inputs = torch.tensor([[10], [20]], dtype=torch.long)
+    original_positions = torch.tensor([3, 7], dtype=torch.long)
+
+    Llama3TensorParallelForCausalLM._restore_ragged_decode_graph_advancing_inputs(
+        captured,
+        original_inputs,
+        original_positions,
+    )
+
+    torch.testing.assert_close(captured.static_input_ids, original_inputs)
+    torch.testing.assert_close(captured.static_cache_positions, original_positions)
+
+
 def test_llama3_tensor_parallel_ragged_decode_many_graph_accepts_paged_cache(
     monkeypatch,
 ) -> None:
@@ -1119,6 +1310,7 @@ def test_llama3_tensor_parallel_mixed_prefill_capture_failure_keeps_uniform_repl
         1,
         (False,),
         0,
+        0,
         1,
         0,
         1,
@@ -1463,6 +1655,7 @@ def test_llama3_tensor_parallel_ragged_prefill_graph_replay_refreshes_eviction_o
             -1,
             1,
             (False,),
+            0,
             0,
             1,
             0,

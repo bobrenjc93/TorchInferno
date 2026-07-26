@@ -25,8 +25,12 @@ _BENCHMARK_QUEUE_PROFILE_KEYS = {
     "few_shot": (0.0, 256),
     "self_consistency": (0.7, 256),
     "multi_turn": (0.0, 512),
-    "tree_of_thought": (0.7, 300),
-    "long_output": (0.0, 96),
+    "tree_of_thought": (0.7, 512),
+    "long_output": (0.0, 128),
+}
+_BENCHMARK_QUEUE_PROFILE_LEGACY_KEYS = {
+    "tree_of_thought": ((0.7, 300),),
+    "long_output": ((0.0, 96),),
 }
 _VLLM_RUNTIME_RE = re.compile(
     r"Avg prompt throughput: (?P<prompt_tps>[0-9.]+) tokens/s, "
@@ -106,6 +110,8 @@ _PROFILER_SELF_CUDA_TOTAL_RE = re.compile(
     r"Self CUDA time total:\s*(?P<value>[0-9]+(?:\.[0-9]+)?)(?P<unit>us|ms|s)\b"
 )
 _QUEUE_PROFILE_FIELDS = (
+    "profile_snapshot_semantics",
+    "profile_terminal",
     "mixed_prefix_reuse",
     "fp8_prefill_enabled",
     "fp8_prefill_min_m",
@@ -141,6 +147,7 @@ _QUEUE_PROFILE_FIELDS = (
     "request_first_token_prefill_shape_submit_to_first_p90_ms",
     "request_first_token_prefill_shape_submit_to_first_p99_ms",
     "request_first_token_prefill_shape_submit_to_first_max_ms",
+    "request_policy_counts",
     "request_stream_prequeue_wait_count",
     "request_stream_prequeue_wait_p50_ms",
     "request_stream_prequeue_wait_configured_p50_ms",
@@ -155,7 +162,11 @@ _QUEUE_PROFILE_FIELDS = (
     "packed_flashinfer_prefill_cache_enabled",
     "packed_flashinfer_prefill_status",
     "runtime_cache_backend",
+    "runtime_cache_max_seq_len",
+    "runtime_cache_rows",
     "runtime_max_active_requests",
+    "runtime_max_model_batch_size",
+    "runtime_persistent_cache_rows",
     "runtime_prefix_cache_capacity",
     "runtime_prefix_reuse_requests",
     "runtime_prefix_reuse_tokens",
@@ -492,6 +503,7 @@ class QueueProfileSummary:
     submitted_requests: int | None
     finished_events: int | None
     fields: dict[str, Any] = field(default_factory=dict)
+    profile_session_id: str | None = None
     segments: int = 1
 
 
@@ -2207,8 +2219,8 @@ def _expected_requests_for_queue_profile(
     benchmark = next(
         (
             name
-            for name, expected_key in _BENCHMARK_QUEUE_PROFILE_KEYS.items()
-            if expected_key == key
+            for name in _BENCHMARK_QUEUE_PROFILE_KEYS
+            if key in _queue_profile_keys_for_benchmark(name)
         ),
         None,
     )
@@ -2237,9 +2249,10 @@ def _queue_profiles_for_selected_benchmarks(
 ) -> tuple[QueueProfileSummary, ...]:
     profiles = summary.torchinferno_queue_profiles
     expected_keys = {
-        _BENCHMARK_QUEUE_PROFILE_KEYS[benchmark]
+        key
         for benchmark in summary.benchmarks
         if benchmark in _BENCHMARK_QUEUE_PROFILE_KEYS
+        for key in _queue_profile_keys_for_benchmark(benchmark)
     }
     if not expected_keys:
         return profiles
@@ -2249,6 +2262,29 @@ def _queue_profiles_for_selected_benchmarks(
         if (profile.temperature, profile.max_tokens) in expected_keys
     )
     return selected or profiles
+
+
+def _queue_profile_keys_for_benchmark(
+    benchmark: str,
+) -> tuple[tuple[float, int], ...]:
+    key = _BENCHMARK_QUEUE_PROFILE_KEYS.get(benchmark)
+    if key is None:
+        return ()
+    return (key, *_BENCHMARK_QUEUE_PROFILE_LEGACY_KEYS.get(benchmark, ()))
+
+
+def _queue_profile_for_benchmark(
+    profiles_by_key: Mapping[tuple[float | None, int | None], QueueProfileSummary],
+    benchmark: str,
+) -> QueueProfileSummary | None:
+    return next(
+        (
+            profiles_by_key[key]
+            for key in _queue_profile_keys_for_benchmark(benchmark)
+            if key in profiles_by_key
+        ),
+        None,
+    )
 
 
 def _fmt_queue_profile_coverage(
@@ -2305,6 +2341,7 @@ def _summarize_torchinferno_queue(root: Path) -> tuple[QueueProfileSummary, ...]
         return ()
     inferred_cache_backend = _infer_torchinferno_cache_backend(root)
     segments_by_key: dict[tuple[float | None, int | None], list[QueueProfileSummary]] = {}
+    records: list[Mapping[str, Any]] = []
     for line in path.read_text().splitlines():
         if not line.strip():
             continue
@@ -2312,7 +2349,20 @@ def _summarize_torchinferno_queue(root: Path) -> tuple[QueueProfileSummary, ...]
         event = str(record.get("event", ""))
         if event not in {"online_batcher", "online_batcher_quiescent"}:
             continue
-        key = (_maybe_float(record.get("temperature")), _maybe_int(record.get("run_max_tokens")))
+        records.append(record)
+    session_keys: dict[str, tuple[float | None, int | None]] = {}
+    for record in records:
+        session_id = record.get("profile_session_id")
+        if session_id is not None:
+            session_keys[str(session_id)] = _queue_profile_record_key(record)
+    for record in records:
+        event = str(record.get("event", ""))
+        session_id = record.get("profile_session_id")
+        key = (
+            session_keys.get(str(session_id), _queue_profile_record_key(record))
+            if session_id is not None
+            else _queue_profile_record_key(record)
+        )
         fields = {name: record.get(name) for name in _QUEUE_PROFILE_FIELDS if name in record}
         if inferred_cache_backend is not None and "runtime_cache_backend" not in fields:
             fields["runtime_cache_backend"] = inferred_cache_backend
@@ -2323,6 +2373,11 @@ def _summarize_torchinferno_queue(root: Path) -> tuple[QueueProfileSummary, ...]
             submitted_requests=_maybe_int(record.get("submitted_requests")),
             finished_events=_maybe_int(record.get("finished_events")),
             fields=fields,
+            profile_session_id=(
+                str(record["profile_session_id"])
+                if record.get("profile_session_id") is not None
+                else None
+            ),
         )
         segments = segments_by_key.setdefault(key, [])
         if segments:
@@ -2347,10 +2402,36 @@ def _summarize_torchinferno_queue(root: Path) -> tuple[QueueProfileSummary, ...]
     )
 
 
+def _queue_profile_record_key(
+    record: Mapping[str, Any],
+) -> tuple[float | None, int | None]:
+    key = (
+        _maybe_float(record.get("temperature")),
+        _maybe_int(record.get("run_max_tokens")),
+    )
+    request_policy_counts = record.get("request_policy_counts")
+    if not isinstance(request_policy_counts, Mapping):
+        return key
+    active_policies = sum(
+        1
+        for value in request_policy_counts.values()
+        if isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and value > 0
+    )
+    return (None, None) if active_policies > 1 else key
+
+
 def _queue_profile_starts_new_segment(
     previous: QueueProfileSummary,
     current: QueueProfileSummary,
 ) -> bool:
+    if (
+        previous.profile_session_id is not None
+        and current.profile_session_id is not None
+        and previous.profile_session_id != current.profile_session_id
+    ):
+        return True
     if _queue_profile_restarts(previous, current):
         return True
     return previous.event == "online_batcher" and not _queue_profile_same_position(
@@ -2403,6 +2484,7 @@ def _merge_queue_profile_segments(
         submitted_requests=_sum_optional_int(segment.submitted_requests for segment in segments),
         finished_events=_sum_optional_int(segment.finished_events for segment in segments),
         fields=fields,
+        profile_session_id=latest.profile_session_id,
         segments=len(segments),
     )
 
@@ -2410,6 +2492,8 @@ def _merge_queue_profile_segments(
 def _merge_queue_profile_field(name: str, values: Sequence[Any]) -> Any:
     if not values:
         return None
+    if all(isinstance(value, bool) for value in values):
+        return values[-1]
     if all(isinstance(value, dict) for value in values):
         if _queue_profile_field_is_additive(name):
             return _sum_numeric_mappings(values)
@@ -2429,7 +2513,11 @@ def _merge_queue_profile_field(name: str, values: Sequence[Any]) -> Any:
 def _queue_profile_field_is_additive(name: str) -> bool:
     if name in {
         "runtime_cache_backend",
+        "runtime_cache_max_seq_len",
+        "runtime_cache_rows",
         "runtime_max_active_requests",
+        "runtime_max_model_batch_size",
+        "runtime_persistent_cache_rows",
         "runtime_prefix_cache_capacity",
         "runtime_generated_prefix_cache_requested",
         "runtime_generated_prefix_cache_base_enabled",
@@ -2448,8 +2536,14 @@ def _queue_profile_field_is_additive(name: str) -> bool:
         return False
     if "cache_live" in name:
         return False
+    if name.startswith("runtime_reusable_prefix_") and (
+        name.endswith("_entries") or name.endswith("_tokens")
+    ):
+        return False
+    if "_shape_max_" in name or name.endswith("_max_events"):
+        return False
     if name.startswith("request_"):
-        return name.endswith("_count")
+        return name.endswith(("_count", "_counts"))
     if name.startswith("runtime_"):
         return True
     return name in {"request_stream_prequeue_wait_applied_count"}
@@ -3294,7 +3388,7 @@ def _torchinferno_profiler_probe_rows(
             None,
         )
         competitors = [row for row in provider_rows if row.provider != "torchinferno"]
-        profile = profiles_by_key.get(_BENCHMARK_QUEUE_PROFILE_KEYS.get(benchmark))
+        profile = _queue_profile_for_benchmark(profiles_by_key, benchmark)
         if torchinferno_row is None or not competitors or profile is None:
             continue
         ttft_gap = _provider_gap_value(
@@ -3895,7 +3989,7 @@ def _torchinferno_score_target_rows(
             None,
         )
         competitors = [row for row in provider_rows if row.provider != "torchinferno"]
-        profile = profiles_by_key.get(_BENCHMARK_QUEUE_PROFILE_KEYS.get(benchmark))
+        profile = _queue_profile_for_benchmark(profiles_by_key, benchmark)
         if torchinferno_row is None or not competitors or profile is None:
             continue
         ttft_gap = _provider_gap_value(
@@ -4032,7 +4126,7 @@ def _torchinferno_fair_gap_priority_rows(
             None,
         )
         competitors = [row for row in provider_rows if row.provider != "torchinferno"]
-        profile = profiles_by_key.get(_BENCHMARK_QUEUE_PROFILE_KEYS.get(benchmark))
+        profile = _queue_profile_for_benchmark(profiles_by_key, benchmark)
         if torchinferno_row is None or not competitors or profile is None:
             continue
         ttft_gap = _provider_gap_value(

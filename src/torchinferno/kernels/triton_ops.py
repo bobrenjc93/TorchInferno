@@ -2192,6 +2192,7 @@ def triton_rms_norm_fp8_per_token(
         eps,
         block_size,
         num_warps=8,
+        num_stages=1,
     )
     return output.view_as(x), scale
 
@@ -2223,6 +2224,7 @@ def triton_add_rms_norm_fp8_per_token(
         eps,
         block_size,
         num_warps=8,
+        num_stages=1,
     )
     return hidden.view_as(x), output.view_as(x), scale
 
@@ -2247,6 +2249,7 @@ def triton_swiglu_fp8_per_token(gate: Tensor, up: Tensor) -> tuple[Tensor, Tenso
         n_cols,
         block_size,
         num_warps=8,
+        num_stages=1,
     )
     return output.view_as(gate), scale
 

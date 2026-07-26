@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import gc
 import importlib.util
 import inspect
 import json
@@ -378,10 +379,12 @@ def _online_ragged_decode_warmup_cache_token_limit(max_seq_len: int) -> int | No
     return max(1, limit)
 
 
-def _online_ragged_decode_cache_token_min_batch() -> int:
+def _online_ragged_decode_cache_token_min_batch(max_active: int) -> int:
+    max_active = max(1, int(max_active))
+    default = max(1, (7 * max_active + 7) // 8)
     return env_int(
         "TORCHINFERNO_OPENAI_TP_ONLINE_RAGGED_DECODE_CACHE_MIN_BATCH",
-        64,
+        default,
         minimum=1,
     )
 
@@ -743,7 +746,36 @@ def _set_tensor_parallel_runtime_fp8_prefill(model: object, *, enabled: bool, mi
 
 def _online_marlin_int4_decode_enabled(*, temperature: float, max_tokens: int) -> bool:
     del temperature, max_tokens
-    return env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_MARLIN_INT4_DECODE", True)
+    return env_flag("TORCHINFERNO_OPENAI_TP_ONLINE_MARLIN_INT4_DECODE", False)
+
+
+def _model_queue_profile_additive_counters(model: object) -> dict[str, float | int]:
+    counters: dict[str, float | int] = {}
+    for attr_name, record_name in (
+        (
+            "_ragged_prefill_logits_graph_evictions",
+            "runtime_prefill_graph_cache_evictions",
+        ),
+        (
+            "_ragged_prefill_logits_graph_evicted_entries",
+            "runtime_prefill_graph_cache_evicted_entries",
+        ),
+    ):
+        value = getattr(model, attr_name, None)
+        if isinstance(value, int) and not isinstance(value, bool):
+            counters[record_name] = value
+    sample_profile_summary = getattr(model, "temperature_sample_profile_summary", None)
+    if callable(sample_profile_summary):
+        try:
+            sample_profile = sample_profile_summary()
+        except Exception as exc:
+            warn_optional_failure("openai.queue_profile.temperature_sample_profile", exc)
+            sample_profile = None
+        if isinstance(sample_profile, Mapping):
+            for name, value in sample_profile.items():
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    counters[f"runtime_{name}"] = value
+    return counters
 
 
 def _set_tensor_parallel_runtime_marlin_int4_decode(model: object, *, enabled: bool) -> None:
@@ -2492,6 +2524,14 @@ class _GenerationResult:
     tokens: list[int]
 
 
+class _ChatPromptEncodeJob:
+    def __init__(self, messages: list[dict[str, object]]) -> None:
+        self.messages = messages
+        self.completed = threading.Event()
+        self.tokens: list[int] | None = None
+        self.error: BaseException | None = None
+
+
 @dataclass(frozen=True)
 class _PrefixCachedPrompt:
     index: int
@@ -2562,6 +2602,25 @@ class _TransformersChatTokenizer:
             )
             return _coerce_token_ids(encoded)
         return self.encode(_format_messages(messages))
+
+    def encode_messages_batch(
+        self,
+        conversations: Sequence[list[dict[str, object]]],
+    ) -> list[list[int]]:
+        if not conversations:
+            return []
+        if self.chat_format == "deepseek-v4":
+            return [self.encode(_format_deepseek_v4_messages(messages)) for messages in conversations]
+        apply_chat_template = getattr(self.tokenizer, "apply_chat_template", None)
+        chat_template = getattr(self.tokenizer, "chat_template", None)
+        if callable(apply_chat_template) and chat_template:
+            encoded = apply_chat_template(
+                list(conversations),
+                tokenize=True,
+                add_generation_prompt=True,
+            )
+            return _coerce_token_id_rows(encoded, expected_rows=len(conversations))
+        return [self.encode_messages(messages) for messages in conversations]
 
     def encode(self, text: str) -> list[int]:
         encoded = self.tokenizer.encode(text, add_special_tokens=False)  # type: ignore[attr-defined]
@@ -2796,6 +2855,30 @@ def _coerce_token_ids(encoded: object) -> list[int]:
     return [int(token_id) for token_id in encoded]  # type: ignore[union-attr]
 
 
+def _coerce_token_id_rows(encoded: object, *, expected_rows: int) -> list[list[int]]:
+    input_ids = getattr(encoded, "input_ids", None)
+    if input_ids is None and isinstance(encoded, Mapping):
+        input_ids = encoded.get("input_ids")
+    if input_ids is not None:
+        encoded = input_ids
+    if isinstance(encoded, Tensor):
+        encoded = encoded.detach().cpu().tolist()
+    elif hasattr(encoded, "tolist") and not isinstance(encoded, (list, tuple, str, bytes)):
+        encoded = encoded.tolist()  # type: ignore[assignment]
+    if not isinstance(encoded, (list, tuple)):
+        raise TypeError("batched tokenizer output must be a sequence")
+    rows: Sequence[object]
+    if expected_rows == 1 and not (len(encoded) == 1 and _is_token_sequence(encoded[0])):
+        rows = [encoded]
+    else:
+        rows = encoded
+    if len(rows) != expected_rows:
+        raise ValueError(
+            f"batched tokenizer returned {len(rows)} rows for {expected_rows} conversations"
+        )
+    return [_coerce_token_ids(row) for row in rows]
+
+
 def _is_token_sequence(value: object) -> bool:
     if isinstance(value, Tensor):
         return value.ndim == 1
@@ -2958,6 +3041,22 @@ class OpenAICompletionEngine:
         self._prompt_token_cache: dict[tuple[tuple[str, Hashable], ...], list[int]] = {}
         self._prompt_token_cache_inflight: dict[tuple[tuple[str, Hashable], ...], threading.Event] = {}
         self._prompt_token_cache_lock = threading.Lock()
+        self._prompt_encode_batch_condition = threading.Condition()
+        self._prompt_encode_batch_pending: list[_ChatPromptEncodeJob] = []
+        self._prompt_encode_batch_leader = False
+        self._prompt_encode_batch_max_size = env_int(
+            "TORCHINFERNO_OPENAI_TOKENIZER_BATCH_MAX_SIZE",
+            128,
+            minimum=1,
+        )
+        self._prompt_encode_batch_wait_s = (
+            env_float(
+                "TORCHINFERNO_OPENAI_TOKENIZER_BATCH_WAIT_MS",
+                0.5,
+                minimum=0.0,
+            )
+            / 1000.0
+        )
         self._phase_timing_enabled = env_flag("TORCHINFERNO_OPENAI_PHASE_TIMINGS")
         self._phase_records: list[dict[str, float]] = []
         self._phase_records_lock = threading.Lock()
@@ -3116,7 +3215,7 @@ class OpenAICompletionEngine:
     def _cached_encode_chat_prompt(self, messages: list[dict[str, object]]) -> list[int]:
         max_entries = env_int("TORCHINFERNO_OPENAI_PROMPT_TOKEN_CACHE_MAX_ENTRIES", 4096, minimum=0)
         if max_entries <= 0:
-            return self.tokenizer.encode_messages(messages)
+            return self._encode_chat_messages(messages)
         cache_key = _chat_prompt_cache_key(messages)
         cache = self._prompt_token_cache_map()
         owner_event: threading.Event | None = None
@@ -3136,7 +3235,7 @@ class OpenAICompletionEngine:
                     break
             inflight.wait()
         try:
-            prompt = self.tokenizer.encode_messages(messages)
+            prompt = self._encode_chat_messages(messages)
         except BaseException:
             with self._prompt_token_cache_lock:
                 if self._prompt_token_cache_inflight.get(cache_key) is owner_event:
@@ -3152,6 +3251,74 @@ class OpenAICompletionEngine:
                 self._prompt_token_cache_inflight.pop(cache_key, None)
                 owner_event.set()
         return prompt
+
+    def _encode_chat_messages(self, messages: list[dict[str, object]]) -> list[int]:
+        encode_batch = getattr(self.tokenizer, "encode_messages_batch", None)
+        max_batch_size = int(getattr(self, "_prompt_encode_batch_max_size", 1))
+        if not callable(encode_batch) or max_batch_size <= 1:
+            return self.tokenizer.encode_messages(messages)
+        condition = self._prompt_encode_batch_condition_value()
+        job = _ChatPromptEncodeJob(messages)
+        run_leader = False
+        with condition:
+            self._prompt_encode_batch_pending.append(job)
+            if not self._prompt_encode_batch_leader:
+                self._prompt_encode_batch_leader = True
+                run_leader = True
+            condition.notify_all()
+        if run_leader:
+            self._drain_chat_prompt_encode_batches()
+        job.completed.wait()
+        if job.error is not None:
+            raise job.error
+        if job.tokens is None:
+            raise RuntimeError("batched tokenizer completed without tokens")
+        return job.tokens
+
+    def _drain_chat_prompt_encode_batches(self) -> None:
+        condition = self._prompt_encode_batch_condition_value()
+        max_batch_size = max(1, int(getattr(self, "_prompt_encode_batch_max_size", 1)))
+        wait_s = max(0.0, float(getattr(self, "_prompt_encode_batch_wait_s", 0.0)))
+        while True:
+            with condition:
+                deadline = time.perf_counter() + wait_s
+                while len(self._prompt_encode_batch_pending) < max_batch_size:
+                    remaining = deadline - time.perf_counter()
+                    if remaining <= 0.0:
+                        break
+                    condition.wait(timeout=remaining)
+                batch = self._prompt_encode_batch_pending[:max_batch_size]
+                del self._prompt_encode_batch_pending[: len(batch)]
+            try:
+                encoded_rows = self.tokenizer.encode_messages_batch(
+                    [job.messages for job in batch]
+                )
+                if len(encoded_rows) != len(batch):
+                    raise ValueError(
+                        f"batched tokenizer returned {len(encoded_rows)} rows for {len(batch)} requests"
+                    )
+                for job, tokens in zip(batch, encoded_rows):
+                    job.tokens = [int(token_id) for token_id in tokens]
+            except BaseException as exc:
+                for job in batch:
+                    job.error = exc
+            finally:
+                for job in batch:
+                    job.completed.set()
+            with condition:
+                if not self._prompt_encode_batch_pending:
+                    self._prompt_encode_batch_leader = False
+                    return
+
+    def _prompt_encode_batch_condition_value(self) -> threading.Condition:
+        condition = getattr(self, "_prompt_encode_batch_condition", None)
+        if condition is not None:
+            return condition
+        condition = threading.Condition()
+        self._prompt_encode_batch_condition = condition
+        self._prompt_encode_batch_pending = []
+        self._prompt_encode_batch_leader = False
+        return condition
 
     def _prompt_token_cache_map(self) -> dict[tuple[tuple[str, Hashable], ...], list[int]]:
         cache = getattr(self, "_prompt_token_cache", None)
@@ -3649,6 +3816,88 @@ class OpenAICompletionEngine:
         decode_many_steps = _parse_positive_int_csv(
             os.environ.get("TORCHINFERNO_OPENAI_WARMUP_DECODE_MANY_STEPS", "")
         )
+        decode_token_state = getattr(
+            self.model,
+            "_torchinferno_online_decode_token_state",
+            None,
+        )
+        if (
+            not isinstance(decode_token_state, Tensor)
+            or decode_token_state.device != self.device
+            or decode_token_state.dtype != torch.long
+            or decode_token_state.ndim != 1
+            or decode_token_state.numel() < cache_batch + 2
+        ):
+            decode_token_state = torch.zeros(
+                cache_batch + 2,
+                dtype=torch.long,
+                device=self.device,
+            )
+            self.model._torchinferno_online_decode_token_state = decode_token_state
+        decode_seq_len_state = getattr(
+            self.model,
+            "_torchinferno_online_decode_seq_len_state",
+            None,
+        )
+        if (
+            not isinstance(decode_seq_len_state, Tensor)
+            or decode_seq_len_state.device != self.device
+            or decode_seq_len_state.dtype != torch.long
+            or decode_seq_len_state.ndim != 1
+            or decode_seq_len_state.numel() < cache_batch
+        ):
+            decode_seq_len_state = torch.zeros(
+                cache_batch,
+                dtype=torch.long,
+                device=self.device,
+            )
+            self.model._torchinferno_online_decode_seq_len_state = decode_seq_len_state
+        host_decode_state = getattr(
+            self.model,
+            "_torchinferno_online_decode_host_state",
+            None,
+        )
+        host_capacity = cache_batch + 2
+        if (
+            not isinstance(host_decode_state, Tensor)
+            or host_decode_state.device.type != "cpu"
+            or not host_decode_state.is_pinned()
+            or host_decode_state.dtype != torch.long
+            or host_decode_state.ndim != 2
+            or host_decode_state.size(0) < 3
+            or host_decode_state.size(1) < host_capacity
+        ):
+            host_decode_state = torch.zeros(
+                (3, host_capacity),
+                dtype=torch.long,
+                device="cpu",
+                pin_memory=True,
+            )
+            host_decode_state[1].copy_(torch.arange(host_capacity, dtype=torch.long))
+            host_decode_state[2].fill_(prompt_tokens)
+            self.model._torchinferno_online_decode_host_state = host_decode_state
+        host_decode_placeholders = getattr(
+            self.model,
+            "_torchinferno_online_decode_host_placeholders",
+            None,
+        )
+        if (
+            not isinstance(host_decode_placeholders, Tensor)
+            or host_decode_placeholders.device != self.device
+            or host_decode_placeholders.dtype != torch.long
+            or host_decode_placeholders.ndim != 2
+            or host_decode_placeholders.size(0) < 3
+            or host_decode_placeholders.size(1) < host_capacity
+        ):
+            host_decode_placeholders = torch.zeros(
+                (3, host_capacity),
+                dtype=torch.long,
+                device=self.device,
+            )
+            self.model._torchinferno_online_decode_host_placeholders = (
+                host_decode_placeholders
+            )
+        host_decode_placeholders.copy_(host_decode_state, non_blocking=True)
         _startup_warmup_log(
             self.model,
             "unified scheduler cache prepared "
@@ -3710,18 +3959,25 @@ class OpenAICompletionEngine:
                         _set_generation_cache_ragged_decode_cache_token_limit(
                             cache,
                             cache_token_limit,
-                            min_batch=_online_ragged_decode_cache_token_min_batch(),
+                            min_batch=_online_ragged_decode_cache_token_min_batch(
+                                max(batch_sizes)
+                            ),
                         )
                         for bs in batch_sizes:
                             _set_generation_cache_seq_len(cache, prompt_tokens)
-                            decode_input_ids = torch.zeros(bs, 1, dtype=torch.long, device=self.device)
+                            decode_token_state.zero_()
+                            decode_seq_len_state.fill_(prompt_tokens)
+                            decode_input_ids = decode_token_state[:bs].view(bs, 1)
                             row_indices = torch.arange(bs, dtype=torch.long, device=self.device)
-                            seq_lens_tensor = torch.full((bs,), prompt_tokens, dtype=torch.long, device=self.device)
+                            seq_lens_tensor = decode_seq_len_state
                             try:
                                 _try_decode_ragged_token_graph(
                                     self.model, decode_input_ids, cache, seq_lens=seq_lens_tensor,
                                     row_indices=None, temperature=0.0, allow_capture=True,
+                                    advance_inputs=True,
                                 )
+                                decode_token_state.zero_()
+                                decode_seq_len_state.fill_(prompt_tokens)
                                 _try_decode_ragged_logits_graph(
                                     self.model,
                                     decode_input_ids,
@@ -3730,9 +3986,16 @@ class OpenAICompletionEngine:
                                     row_indices=None,
                                     allow_capture=True,
                                 )
+                                decode_token_state.zero_()
+                                decode_seq_len_state.fill_(prompt_tokens)
                                 _try_decode_ragged_token_graph(
-                                    self.model, decode_input_ids, cache, seq_lens=seq_lens_tensor,
-                                    row_indices=row_indices, temperature=0.0, allow_capture=True,
+                                    self.model,
+                                    host_decode_placeholders[0, :bs].view(bs, 1),
+                                    cache,
+                                    seq_lens=seq_lens_tensor,
+                                    row_indices=host_decode_placeholders[1, :bs],
+                                    temperature=0.0,
+                                    allow_capture=True,
                                 )
                                 _try_decode_ragged_logits_graph(
                                     self.model,
@@ -5770,6 +6033,7 @@ class OpenAICompletionEngine:
             / 1000.0
         )
         profile_start_s = time.perf_counter()
+        profile_session_id = f"{os.getpid()}:{time.monotonic_ns()}"
         phase_ms: dict[str, float] = {}
 
         def add_phase(name: str, started_at_s: float) -> None:
@@ -5986,6 +6250,11 @@ class OpenAICompletionEngine:
         eos_token_id = _runtime_eos_token_id(getattr(self, "tokenizer", None), stop_token_ids)
         profile_queue = bool(self._queue_profile_path_value())
         profile_runtime_timings = profile_queue and _queue_profile_sync_timings_enabled()
+        profile_model_counter_baseline = (
+            _model_queue_profile_additive_counters(self.model)
+            if profile_queue
+            else {}
+        )
         use_decode_many = _online_decode_many_enabled(
             temperature=first.temperature,
             max_tokens=run_max_tokens,
@@ -6296,17 +6565,29 @@ class OpenAICompletionEngine:
                 fields["request_stream_prequeue_wait_applied_count"] = stream_prequeue_wait_applied
             return fields
 
-        def request_shape_profile_fields() -> dict[str, int]:
+        def request_shape_profile_fields() -> dict[str, object]:
             requests = list(request_by_id.values())
             if not requests:
                 return {}
             prompt_lengths = [len(request.prompt) for request in requests]
             row_max_tokens = [request.max_tokens for request in requests]
-            fields = {
+            policy_counts: dict[str, int] = {}
+            for request in requests:
+                policy_capacity = _online_session_max_tokens(
+                    temperature=request.temperature,
+                    max_tokens=request.max_tokens,
+                )
+                policy_key = (
+                    f"{float(request.temperature):.17g}:"
+                    f"{policy_capacity}"
+                )
+                policy_counts[policy_key] = policy_counts.get(policy_key, 0) + 1
+            fields: dict[str, object] = {
                 "request_prompt_tokens_min": min(prompt_lengths),
                 "request_prompt_tokens_max": max(prompt_lengths),
                 "request_max_tokens_min": min(row_max_tokens),
                 "request_max_tokens_max": max(row_max_tokens),
+                "request_policy_counts": policy_counts,
             }
             queue_sequences = [
                 request.queue_sequence for request in requests if request.queue_sequence >= 0
@@ -6326,6 +6607,10 @@ class OpenAICompletionEngine:
                 profile_snapshots += 1
             phase_fields = {f"phase_{name}": round(value, 3) for name, value in phase_ms.items()}
             extra_fields: dict[str, object] = dict(profile_fields)
+            extra_fields["profile_session_id"] = profile_session_id
+            extra_fields["profile_snapshot_semantics"] = "cumulative_session"
+            extra_fields["profile_terminal"] = event == "online_batcher"
+            extra_fields["_model_counter_baseline"] = profile_model_counter_baseline
             all_submitted_finished = bool(request_by_id) and finished_events >= len(request_by_id)
             if is_progress:
                 extra_fields["profile_snapshot_index"] = profile_snapshots
@@ -6371,6 +6656,10 @@ class OpenAICompletionEngine:
                 idle_batch_wait_ms=round(idle_wait_s * 1000.0, 3),
                 active_ready_wait_ms=round(active_ready_wait_s * 1000.0, 3),
                 collect_idle_arrivals=collect_idle_arrivals,
+                python_gc_enabled=gc.isenabled(),
+                python_gc_frozen_objects=int(
+                    getattr(gc, "get_freeze_count", lambda: 0)()
+                ),
                 admission_policy_active=not use_paged_engine,
                 admit_min_free_rows=(
                     0
@@ -6409,6 +6698,21 @@ class OpenAICompletionEngine:
                     )
                 ),
                 admit_per_step_cap=0 if use_paged_engine else admit_per_step_cap,
+                admit_sustained_min_generated=env_int(
+                    "TORCHINFERNO_CONTINUOUS_ADMIT_SUSTAINED_MIN_GENERATED",
+                    0,
+                    minimum=0,
+                ),
+                admit_sustained_min_step_interval=env_int(
+                    "TORCHINFERNO_CONTINUOUS_ADMIT_SUSTAINED_MIN_STEP_INTERVAL",
+                    1,
+                    minimum=1,
+                ),
+                admit_sustained_max_consecutive_steps=env_int(
+                    "TORCHINFERNO_CONTINUOUS_ADMIT_SUSTAINED_MAX_CONSECUTIVE_STEPS",
+                    0,
+                    minimum=0,
+                ),
                 prefill_token_budget=normalized_prefill_budget or 0,
                 enable_ragged_decode=enable_ragged_decode,
                 use_decode_many=use_decode_many,
@@ -6584,7 +6888,7 @@ class OpenAICompletionEngine:
 
             while len(ready) < max_active and drain_one():
                 pass
-            if 0 < wait_s and 0 < len(ready) < max_active and not saw_sentinel:
+            if 0 < wait_s and len(ready) < max_active and not saw_sentinel:
                 deadline = time.perf_counter() + wait_s
                 while len(ready) < max_active:
                     remaining = deadline - time.perf_counter()
@@ -6700,7 +7004,7 @@ class OpenAICompletionEngine:
                     _set_generation_cache_ragged_decode_cache_token_limit(
                         shared_cache,
                         ragged_decode_cache_token_limit,
-                        min_batch=_online_ragged_decode_cache_token_min_batch(),
+                        min_batch=_online_ragged_decode_cache_token_min_batch(max_active),
                     )
                 runtime_engine.start_online(max_seq_len=max_seq_len, external_cache=shared_cache)
                 started = True
@@ -7282,6 +7586,12 @@ class OpenAICompletionEngine:
                     warn_optional_failure(f"openai.queue_profile.{flush_name}", exc)
         stats = getattr(runtime_engine, "stats", None)
         force_shape_details = bool(fields.pop("profile_include_shape_details", False))
+        raw_model_counter_baseline = fields.pop("_model_counter_baseline", {})
+        model_counter_baseline = (
+            raw_model_counter_baseline
+            if isinstance(raw_model_counter_baseline, Mapping)
+            else {}
+        )
         record: dict[str, object] = {"event": event, **fields}
         include_shape_details = (
             force_shape_details
@@ -7478,34 +7788,16 @@ class OpenAICompletionEngine:
                     record["runtime_decode_graph_cache_live_symm_counts"] = (
                         live_symm_counts
                     )
-        for attr_name, record_name in (
-            (
-                "_ragged_prefill_logits_graph_evictions",
-                "runtime_prefill_graph_cache_evictions",
-            ),
-            (
-                "_ragged_prefill_logits_graph_evicted_entries",
-                "runtime_prefill_graph_cache_evicted_entries",
-            ),
-            (
-                "_ragged_prefill_logits_graph_max_entries",
-                "runtime_prefill_graph_cache_max_entries",
-            ),
-        ):
-            value = getattr(model, attr_name, None)
-            if isinstance(value, int):
-                record[record_name] = value
-        sample_profile_summary = getattr(model, "temperature_sample_profile_summary", None)
-        if callable(sample_profile_summary):
-            try:
-                sample_profile = sample_profile_summary()
-            except Exception as exc:
-                warn_optional_failure("openai.queue_profile.temperature_sample_profile", exc)
-                sample_profile = None
-            if isinstance(sample_profile, Mapping):
-                for name, value in sample_profile.items():
-                    if isinstance(value, (int, float)) and not isinstance(value, bool):
-                        record[f"runtime_{name}"] = value
+        max_entries = getattr(model, "_ragged_prefill_logits_graph_max_entries", None)
+        if isinstance(max_entries, int) and not isinstance(max_entries, bool):
+            record["runtime_prefill_graph_cache_max_entries"] = max_entries
+        for name, value in _model_queue_profile_additive_counters(model).items():
+            baseline = model_counter_baseline.get(name, 0)
+            if isinstance(baseline, (int, float)) and not isinstance(baseline, bool):
+                delta = value - baseline
+                record[name] = delta if delta >= 0 else value
+            else:
+                record[name] = value
 
         def _positive_shape_token_deltas(
             model_tokens_name: str,
@@ -7765,6 +8057,10 @@ class OpenAICompletionEngine:
             "decode_ragged_wall_prepare_rows_ms",
             "decode_ragged_wall_prepare_policy_ms",
             "decode_ragged_wall_prepare_inputs_ms",
+            "decode_ragged_wall_prepare_signature_ms",
+            "decode_ragged_wall_prepare_state_check_ms",
+            "decode_ragged_wall_prepare_row_indices_ms",
+            "decode_ragged_wall_prepare_index_select_ms",
             "decode_ragged_wall_prepare_seq_lens_ms",
             "decode_ragged_wall_gpu_state_hits",
             "decode_ragged_wall_gpu_state_misses",
@@ -7910,6 +8206,9 @@ class OpenAICompletionEngine:
                 "prefill_suffix_split_accepted_shape_counts",
                 "prefill_suffix_split_accepted_shape_saved_tokens",
                 "prefill_suffix_split_accepted_fragment_counts",
+                "unified_batch_size_counts",
+                "unified_decode_size_counts",
+                "unified_prefill_size_counts",
                 "decode_many_shape_steps",
                 "decode_many_shape_model_tokens",
                 "decode_many_shape_padded_tokens",
@@ -14282,26 +14581,51 @@ def build_engine(config: OpenAIServerConfig) -> OpenAICompletionEngine:
     )
 
 
+@contextmanager
+def _freeze_long_lived_server_objects(device: torch.device) -> Iterator[None]:
+    enabled = bool(
+        device.type == "cuda"
+        and env_flag("TORCHINFERNO_OPENAI_FREEZE_LONG_LIVED_GC", True)
+        and hasattr(gc, "freeze")
+        and hasattr(gc, "unfreeze")
+        and getattr(gc, "get_freeze_count", lambda: 0)() == 0
+    )
+    if not enabled:
+        yield
+        return
+    gc.collect()
+    gc.freeze()
+    try:
+        yield
+    finally:
+        gc.unfreeze()
+
+
 def serve(config: OpenAIServerConfig) -> None:
     engine = build_engine(config)
-    if _is_disaggregated_prefill_decode_worker_model(engine.model):
-        engine.model.run_worker_loop()
-        return
-    if _is_tensor_parallel_worker_model(engine.model):
-        _tensor_parallel_worker_loop(engine)
-        return
-    server_cls = _FastOpenAIServer if env_flag("TORCHINFERNO_OPENAI_FAST_HTTP", True) else _OpenAIServer
-    server = server_cls((config.host, config.port), engine)
-    print(
-        f"TorchInferno OpenAI server listening on http://{config.host}:{server.server_port}/v1 "
-        f"model={config.model}",
-        flush=True,
-    )
-    try:
-        server.serve_forever()
-    finally:
-        server.server_close()
-        engine.close()
+    with _freeze_long_lived_server_objects(engine.device):
+        if _is_disaggregated_prefill_decode_worker_model(engine.model):
+            engine.model.run_worker_loop()
+            return
+        if _is_tensor_parallel_worker_model(engine.model):
+            _tensor_parallel_worker_loop(engine)
+            return
+        server_cls = (
+            _FastOpenAIServer
+            if env_flag("TORCHINFERNO_OPENAI_FAST_HTTP", True)
+            else _OpenAIServer
+        )
+        server = server_cls((config.host, config.port), engine)
+        print(
+            f"TorchInferno OpenAI server listening on http://{config.host}:{server.server_port}/v1 "
+            f"model={config.model}",
+            flush=True,
+        )
+        try:
+            server.serve_forever()
+        finally:
+            server.server_close()
+            engine.close()
 
 
 def _load_model(config: OpenAIServerConfig) -> tuple[object, torch.device]:
@@ -14421,9 +14745,6 @@ def _prepare_tensor_parallel_nccl_runtime_env(config: OpenAIServerConfig) -> Non
 
 
 def _openai_tp_symm_mem_allreduce_mode() -> str:
-    global_env = "TORCHINFERNO_SYMM_MEM_ALLREDUCE"
-    if global_env in os.environ and not env_flag(global_env, False):
-        return "off"
     openai_env = "TORCHINFERNO_OPENAI_TP_SYMM_MEM_ALLREDUCE"
     if openai_env in os.environ:
         raw = os.environ[openai_env].strip().lower()
@@ -14432,6 +14753,7 @@ def _openai_tp_symm_mem_allreduce_mode() -> str:
         if raw in {"runtime", "runtime-only", "online", "decode"}:
             return "runtime"
         return "all" if env_flag(openai_env, False) else "off"
+    global_env = "TORCHINFERNO_SYMM_MEM_ALLREDUCE"
     if global_env in os.environ:
         raw = os.environ[global_env].strip().lower()
         if raw in {"auto", "probe"}:
@@ -14461,9 +14783,6 @@ def _openai_tp_symm_mem_prefill_allreduce_enabled(
     startup: bool = False,
 ) -> bool:
     del max_tokens, temperature
-    global_env = "TORCHINFERNO_SYMM_MEM_ALLREDUCE"
-    if global_env in os.environ and not env_flag(global_env, False):
-        return False
     model_prefill_env = "TORCHINFERNO_SYMM_MEM_PREFILL_ALLREDUCE"
     if model_prefill_env in os.environ:
         return env_flag(model_prefill_env, False)
@@ -16582,7 +16901,7 @@ def _tensor_parallel_worker_loop(engine: OpenAICompletionEngine) -> None:
                     _set_generation_cache_ragged_decode_cache_token_limit(
                         worker_shared_cache,
                         worker_ragged_decode_cache_token_limit,
-                        min_batch=_online_ragged_decode_cache_token_min_batch(),
+                        min_batch=_online_ragged_decode_cache_token_min_batch(max_active),
                     )
                 if worker_use_paged:
                     online_runtime_engine.start_online(
@@ -16985,15 +17304,22 @@ def _ragged_prefill_graph_cache_live_shape_key(key: object) -> str:
         f"fp8{_ragged_prefill_precision_profile_key(key[8])}:"
         f"ar{_profile_key_part(key[9])}"
     )
-    if len(key) > 10:
-        shape_key = f"{shape_key}:logits{_profile_key_part(key[10])}"
+    for index, label in (
+        (10, "prefill_ar"),
+        (11, "logits"),
+        (12, "tokens"),
+        (13, "rotary"),
+        (14, "writepos"),
+    ):
+        if len(key) > index:
+            shape_key = f"{shape_key}:{label}{_profile_key_part(key[index])}"
     return shape_key
 
 
 def _ragged_decode_graph_cache_live_shape_key(key: object) -> str:
     if not isinstance(key, tuple) or len(key) < 6:
         return "ragged_decode:unknown"
-    return (
+    shape_key = (
         "ragged_decode:"
         f"b{_profile_key_part(key[1])}:"
         f"ctx{_profile_key_part(key[2])}:"
@@ -17001,6 +17327,11 @@ def _ragged_decode_graph_cache_live_shape_key(key: object) -> str:
         f"rows{1 if bool(key[4]) else 0}:"
         f"symm{_profile_key_part(key[5])}"
     )
+    if len(key) > 6:
+        shape_key = f"{shape_key}:advance{1 if bool(key[6]) else 0}"
+    if len(key) > 7:
+        shape_key = f"{shape_key}:host{1 if bool(key[7]) else 0}"
+    return shape_key
 
 
 def _ragged_prefill_precision_profile_key(value: object) -> str:
@@ -17523,6 +17854,7 @@ def _try_decode_ragged_token_graph(
     row_indices: Tensor | None,
     temperature: float,
     allow_capture: bool = True,
+    advance_inputs: bool = False,
 ) -> Tensor | None:
     if getattr(cache, "_torchinferno_disable_ragged_decode_graph", False):
         return None
@@ -17539,16 +17871,16 @@ def _try_decode_ragged_token_graph(
     decode_graph = getattr(model, "try_decode_ragged_token_graph", None)
     if decode_graph is None:
         return None
+    kwargs: dict[str, object] = {
+        "seq_lens": seq_lens,
+        "row_indices": row_indices,
+        "temperature": temperature,
+    }
     if _callable_accepts_keyword(decode_graph, "capture_on_miss"):
-        return decode_graph(
-            input_ids,
-            cache,
-            seq_lens=seq_lens,
-            row_indices=row_indices,
-            temperature=temperature,
-            capture_on_miss=allow_capture,
-        )
-    return decode_graph(input_ids, cache, seq_lens=seq_lens, row_indices=row_indices, temperature=temperature)
+        kwargs["capture_on_miss"] = allow_capture
+    if advance_inputs and _callable_accepts_keyword(decode_graph, "advance_inputs"):
+        kwargs["advance_inputs"] = True
+    return decode_graph(input_ids, cache, **kwargs)
 
 
 def _ragged_decode_enabled_for_model(model: object) -> bool:
@@ -19640,15 +19972,20 @@ def _apply_tensor_parallel_serving_defaults(config: OpenAIServerConfig) -> None:
         # Keep a cold arrival burst from forcing the first decode wave directly
         # to the cache limit. Decode occupancy may still grow to max_active as
         # later waves are admitted.
-        "TORCHINFERNO_CONTINUOUS_ADMIT_PER_STEP_CAP": "24",
-        "TORCHINFERNO_CONTINUOUS_ADMIT_MIN_READY_REQUESTS": "6",
+        "TORCHINFERNO_CONTINUOUS_ADMIT_PER_STEP_CAP": "32",
+        "TORCHINFERNO_CONTINUOUS_ADMIT_MIN_READY_REQUESTS": "4",
         "TORCHINFERNO_CONTINUOUS_ADMIT_MAX_WAIT_STEPS": "2",
         "TORCHINFERNO_CONTINUOUS_ADMIT_PRIORITY_MAX_WAIT_STEPS": "2",
         "TORCHINFERNO_CONTINUOUS_ADMIT_MIN_FREE_ROWS": "2",
         "TORCHINFERNO_CONTINUOUS_ADMIT_PREFILL_COST_PRIORITY": "1",
-        "TORCHINFERNO_CONTINUOUS_ADMIT_SUSTAINED_MIN_GENERATED": "3",
+        "TORCHINFERNO_CONTINUOUS_ADMIT_SUSTAINED_MIN_GENERATED": "1",
         "TORCHINFERNO_CONTINUOUS_ADMIT_SUSTAINED_MIN_ACTIVE_PCT": "50",
         "TORCHINFERNO_CONTINUOUS_ADMIT_SUSTAINED_MIN_STEP_INTERVAL": "2",
+        # Once a decode wave is established, bound consecutive admission work
+        # so arrivals make progress without continuously interrupting decode.
+        "TORCHINFERNO_CONTINUOUS_ADMIT_SUSTAINED_MAX_CONSECUTIVE_STEPS": "2",
+        "TORCHINFERNO_OPENAI_TOKENIZER_BATCH_MAX_SIZE": "16",
+        "TORCHINFERNO_OPENAI_TOKENIZER_BATCH_WAIT_MS": "0.2",
         "TORCHINFERNO_OPENAI_TP_ONLINE_INITIAL_BATCH_WAIT_MS": "1",
         "TORCHINFERNO_OPENAI_TP_ONLINE_IDLE_BATCH_WAIT_MS": "2",
         "TORCHINFERNO_OPENAI_TP_ONLINE_ACTIVE_READY_WAIT_MS": "0",
@@ -19664,15 +20001,18 @@ def _apply_tensor_parallel_serving_defaults(config: OpenAIServerConfig) -> None:
         "TORCHINFERNO_OPENAI_TP_ONLINE_SUBMIT_STEP_COMMAND": "1",
         "TORCHINFERNO_OPENAI_TP_SHM_COMMAND_MODE": "online",
         "TORCHINFERNO_SHM_POLL_YIELD_INTERVAL": "100000",
-        # Hopper's FP8 tensor-core path is applied uniformly by tensor shape;
-        # QKV prefill remains disabled by its separate model-side default.
+        # Hopper's FP8 tensor-core path is applied uniformly by tensor shape,
+        # including QKV prefill after held-out quality validation.
         "TORCHINFERNO_OPENAI_TP_ONLINE_FP8_PREFILL": "1",
         "TORCHINFERNO_OPENAI_TP_ONLINE_FP8_PREFILL_MIN_M": "1",
         "TORCHINFERNO_CONTINUOUS_TOKEN_BUCKET_FA3_FP8_MIN_M": "1",
         "TORCHINFERNO_FP8_DECODE": "1",
         "TORCHINFERNO_FP8_PER_TOKEN_SCALE": "1",
         "TORCHINFERNO_FP8_QKV": "1",
-        "TORCHINFERNO_FP8_LM_HEAD": "1",
+        "TORCHINFERNO_FP8_QKV_PREFILL": "1",
+        # Keep the uncalibrated RTN INT4 fallback out of serving and startup
+        # graph capture. Explicit experimental launches may still override it.
+        "TORCHINFERNO_MARLIN_INT4_DECODE": "0",
         # Fuse prefill RMSNorm with per-token quantization for the gate/up
         # projection. The SwiGLU fusion consumes the strided gate/up halves
         # directly, avoiding three contiguous copies per layer before the down
@@ -19680,11 +20020,13 @@ def _apply_tensor_parallel_serving_defaults(config: OpenAIServerConfig) -> None:
         "TORCHINFERNO_FP8_FUSED_ACTIVATIONS": "1",
         "TORCHINFERNO_FP8_FUSED_ACTIVATIONS_DECODE": "1",
         "TORCHINFERNO_FP8_FUSED_SWIGLU_DECODE": "1",
-        # The H100 streaming decode kernel is launch-bound at the short and
-        # medium contexts used by online traffic. A 128-token tile wins over
-        # 64 at both 128- and 512-token measured contexts; 256 spills enough
-        # work to regress sharply.
-        "TORCHINFERNO_TRITON_STREAMING_DECODE_ATTENTION_BLOCK_S": "128",
+        # A 64-token tile wins at the mixed 128-320-token contexts exercised by
+        # online decode; 256 spills enough work to regress sharply.
+        "TORCHINFERNO_TRITON_STREAMING_DECODE_ATTENTION_BLOCK_S": "64",
+        # Capture stable pinned-host token, row, and position copies as graph
+        # nodes so changing scheduler metadata does not require a CUDA launch.
+        "TORCHINFERNO_CONTINUOUS_PINNED_DECODE_INPUTS": "1",
+        "TORCHINFERNO_CUDAGRAPH_RAGGED_DECODE_HOST_INPUTS": "1",
         "TORCHINFERNO_FP8_FUSED_SWIGLU_PREFILL": "0",
         # Hopper's fast FP8 accumulator is measurably faster once a mixed
         # prefill reaches 129 rows. Smaller decode-shaped GEMMs retain the

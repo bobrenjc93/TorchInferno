@@ -1474,6 +1474,9 @@ class _StaticRaggedDecodeGraphCall:
     static_paged_decode_page_tables: tuple[Tensor, ...] | None = None
     static_paged_decode_seq_lens: tuple[Tensor, ...] | None = None
     rotary_in_graph: bool = False
+    advance_inputs: bool = False
+    host_input_state: Tensor | None = None
+    host_device_state: Tensor | None = None
 
 
 @dataclass
@@ -3329,17 +3332,24 @@ class _Llama3TensorParallelLayer:
                 wrote_output = False
                 fp8_decode = fp8_activation is not None or self._fp8_decode_shape_enabled(hidden)
                 if fp8_decode and fp8_key is not None:
+                    fp8_direct_out = _tp_flag(
+                        "TORCHINFERNO_FP8_PER_TOKEN_SCALE",
+                        False,
+                    )
                     fp8_out = self._profile_block(
                         f"flashinfer.{buffer_name}.fp8_project",
-                        project_fp8,
+                        lambda: project_fp8(
+                            out=buffer if fp8_direct_out else None,
+                        ),
                     )
                     if fp8_out is not None:
-                        self._profile_block(
-                            f"flashinfer.{buffer_name}.copy_to_reduce",
-                            lambda: output_2d.copy_(
-                                fp8_out.reshape(-1, weight.size(0))
-                            ),
-                        )
+                        if not fp8_direct_out:
+                            self._profile_block(
+                                f"flashinfer.{buffer_name}.copy_to_reduce",
+                                lambda: output_2d.copy_(
+                                    fp8_out.reshape(-1, weight.size(0))
+                                ),
+                            )
                         wrote_output = True
                 if not wrote_output and marlin_key is not None and fp8_activation is None:
                     wrote_output = self._marlin_proj(hidden, marlin_key, weight, out=output_2d) is not None
@@ -4033,6 +4043,7 @@ class Llama3TensorParallelForCausalLM:
         self.profile_seconds: dict[str, float] = {}
         self.profile_counts: dict[str, int] = {}
         self.training = False
+        self._runtime_cuda_graph_pool: object | None = None
         self._prefill_graphs: dict[tuple[object, ...], _StaticPrefillGraphCall] = {}
         self._prefill_logits_graphs: dict[tuple[object, ...], _StaticPrefillLogitsGraphCall] = {}
         self._prefill_selected_logits_graphs: dict[
@@ -4093,6 +4104,19 @@ class Llama3TensorParallelForCausalLM:
         self._temperature_sample_profile_rows = 0
         self._temperature_sample_gumbel_profile_calls = 0
         self._temperature_sample_gumbel_profile_rows = 0
+
+    def _runtime_graph_pool(self) -> object | None:
+        """Share storage across top-level graphs that never replay concurrently."""
+        if self.device.type != "cuda" or not _tp_flag(
+            "TORCHINFERNO_CUDAGRAPH_SHARED_RUNTIME_POOL",
+            True,
+        ) or _tp_flag("TORCHINFERNO_CONTINUOUS_OVERLAP_PREFILL_DECODE", False):
+            return None
+        pool = self._runtime_cuda_graph_pool
+        if pool is None:
+            pool = torch.cuda.graph_pool_handle()
+            self._runtime_cuda_graph_pool = pool
+        return pool
 
     def set_runtime_fp8_prefill(self, enabled: bool, *, min_m: int = 2048) -> None:
         min_m = max(1, int(min_m))
@@ -4902,7 +4926,7 @@ class Llama3TensorParallelForCausalLM:
             self._sample_next_token(logits[:, -1, :], 0.0)
         torch.cuda.current_stream(self.device).wait_stream(stream)
         self._set_cache_seq_len(cache, initial_seq_len)
-        with torch.cuda.graph(captured.graph):
+        with torch.cuda.graph(captured.graph, pool=self._runtime_graph_pool()):
             logits = self._forward_prefill_static(captured.static_input_ids, cache)
             captured.output_token = self._sample_next_token(logits[:, -1, :], 0.0)
         captured.graph.replay()
@@ -5022,7 +5046,7 @@ class Llama3TensorParallelForCausalLM:
             )
         torch.cuda.current_stream(self.device).wait_stream(stream)
         self._set_cache_seq_len(cache, initial_seq_len)
-        with torch.cuda.graph(captured.graph):
+        with torch.cuda.graph(captured.graph, pool=self._runtime_graph_pool()):
             captured.output_logits = self._forward_prefill_selected_static(
                 captured.static_input_ids,
                 cache,
@@ -5143,7 +5167,7 @@ class Llama3TensorParallelForCausalLM:
             )
         torch.cuda.current_stream(self.device).wait_stream(stream)
         self._set_cache_seq_len(cache, initial_seq_len)
-        with torch.cuda.graph(captured.graph):
+        with torch.cuda.graph(captured.graph, pool=self._runtime_graph_pool()):
             captured.output_logits = self._forward_prefill_selected_static(
                 captured.static_input_ids,
                 cache,
@@ -5262,9 +5286,11 @@ class Llama3TensorParallelForCausalLM:
         row_indices: Tensor | None = None,
         temperature: float = 0.0,
         capture_on_miss: bool = True,
+        advance_inputs: bool = False,
     ) -> Tensor | None:
         self._last_ragged_decode_graph_captured = None
         self._last_ragged_decode_graph_key = None
+        self._last_ragged_decode_graph_advanced_inputs = False
         if getattr(cache, "_block_decode_graph_captures", False):
             capture_on_miss = False
         if self._ragged_decode_graph_failed or not _should_use_ragged_decode_token_graph(
@@ -5282,6 +5308,7 @@ class Llama3TensorParallelForCausalLM:
                 seq_lens=seq_lens,
                 row_indices=row_indices,
                 capture_on_miss=capture_on_miss,
+                advance_inputs=advance_inputs,
             )
         except Exception as exc:
             warn_optional_failure("llama3_tensor_parallel.ragged_decode_token_graph", exc)
@@ -5290,6 +5317,7 @@ class Llama3TensorParallelForCausalLM:
             self._ragged_decode_graph_failed = True
             self._last_ragged_decode_graph_captured = None
             self._last_ragged_decode_graph_key = None
+            self._last_ragged_decode_graph_advanced_inputs = False
             return None
 
     def try_decode_ragged_token_graph_many(
@@ -5488,7 +5516,7 @@ class Llama3TensorParallelForCausalLM:
             )
             self._sample_next_token(logits[:, -1, :], 0.0)
         torch.cuda.current_stream(self.device).wait_stream(stream)
-        with torch.cuda.graph(captured.graph):
+        with torch.cuda.graph(captured.graph, pool=self._runtime_graph_pool()):
             logits = self._forward_decode_static(
                 captured.static_input_ids,
                 cache,
@@ -5549,9 +5577,20 @@ class Llama3TensorParallelForCausalLM:
         seq_lens: Tensor,
         row_indices: Tensor | None,
         capture_on_miss: bool = True,
+        advance_inputs: bool = False,
     ) -> Tensor | None:
         if not cache.layers:
             raise ValueError("ragged decode requires a non-empty KV cache")
+        advance_inputs = bool(
+            advance_inputs
+            and row_indices is None
+            and getattr(cache, "cache_backend", "dense") != "paged"
+        )
+        host_input_state = self._ragged_decode_host_input_state(
+            input_ids,
+            cache,
+            row_indices,
+        )
         cache_token_bucket = _ragged_decode_cache_token_bucket(
             cache,
             seq_lens,
@@ -5565,6 +5604,8 @@ class Llama3TensorParallelForCausalLM:
             cache_token_bucket,
             row_indices is not None,
             _symm_mem_allreduce_graph_key(input_ids.size(0), _model_world_size(self)),
+            advance_inputs,
+            host_input_state is not None,
         )
         captured = self._ragged_decode_graphs.get(key)
         self._last_ragged_decode_graph_key = key
@@ -5575,6 +5616,20 @@ class Llama3TensorParallelForCausalLM:
             or captured.cache_token_bucket != cache_token_bucket
             or captured.static_input_ids.shape != input_ids.shape
             or (captured.static_row_indices is None) != (row_indices is None)
+            or captured.advance_inputs != advance_inputs
+            or (captured.host_input_state is None) != (host_input_state is None)
+            or (
+                captured.host_input_state is not None
+                and host_input_state is not None
+                and captured.host_input_state.data_ptr() != host_input_state.data_ptr()
+            )
+            or (
+                advance_inputs
+                and (
+                    captured.static_input_ids.data_ptr() != input_ids.data_ptr()
+                    or captured.static_cache_positions.data_ptr() != seq_lens.data_ptr()
+                )
+            )
         )
         if needs_capture and not capture_on_miss:
             self._last_ragged_decode_graph_captured = None
@@ -5589,9 +5644,17 @@ class Llama3TensorParallelForCausalLM:
                 seq_lens,
                 row_indices,
                 cache_token_bucket=cache_token_bucket,
+                advance_inputs=advance_inputs,
+                host_input_state=host_input_state,
             )
         else:
-            self._copy_ragged_decode_graph_inputs(captured, input_ids, seq_lens, row_indices)
+            if captured.host_input_state is None:
+                self._copy_ragged_decode_graph_inputs(
+                    captured,
+                    input_ids,
+                    seq_lens,
+                    row_indices,
+                )
             if not self._maybe_profile_ragged_decode_graph_replay_once(
                 captured,
                 input_ids,
@@ -5600,6 +5663,7 @@ class Llama3TensorParallelForCausalLM:
             ):
                 captured.graph.replay()
         self._last_ragged_decode_graph_captured = bool(needs_capture)
+        self._last_ragged_decode_graph_advanced_inputs = bool(captured.advance_inputs)
         _advance_paged_ragged_decode_cache_lengths(
             cache,
             batch=input_ids.size(0),
@@ -5607,6 +5671,46 @@ class Llama3TensorParallelForCausalLM:
             row_indices=captured.static_row_indices,
         )
         return captured.output_token
+
+    def _ragged_decode_host_input_state(
+        self,
+        input_ids: Tensor,
+        cache: Llama3TensorParallelCache,
+        row_indices: Tensor | None,
+    ) -> Tensor | None:
+        if (
+            row_indices is None
+            or getattr(cache, "cache_backend", "dense") == "paged"
+            or not _tp_flag("TORCHINFERNO_CUDAGRAPH_RAGGED_DECODE_HOST_INPUTS", True)
+            or not _tp_flag("TORCHINFERNO_CUDAGRAPH_RAGGED_DECODE_ROTARY_IN_GRAPH", True)
+            or _tp_flag("TORCHINFERNO_CUDAGRAPH_RAGGED_DECODE_CACHE_TOKEN_BUCKETS", False)
+        ):
+            return None
+        host_state = getattr(self, "_torchinferno_online_decode_host_state", None)
+        device_state = getattr(
+            self,
+            "_torchinferno_online_decode_host_placeholders",
+            None,
+        )
+        if (
+            not isinstance(host_state, Tensor)
+            or host_state.device.type != "cpu"
+            or not host_state.is_pinned()
+            or host_state.dtype != torch.long
+            or host_state.ndim != 2
+            or host_state.size(0) < 3
+            or host_state.size(1) < input_ids.size(0)
+            or not isinstance(device_state, Tensor)
+            or device_state.device != input_ids.device
+            or device_state.dtype != torch.long
+            or device_state.ndim != 2
+            or device_state.size(0) < 3
+            or device_state.size(1) < input_ids.size(0)
+            or input_ids.data_ptr() != device_state[0].data_ptr()
+            or row_indices.data_ptr() != device_state[1].data_ptr()
+        ):
+            return None
+        return host_state
 
     def _run_ragged_decode_many_graph(
         self,
@@ -5724,7 +5828,7 @@ class Llama3TensorParallelForCausalLM:
             with torch.cuda.stream(stream):
                 self._forward_decode_ragged_many_static(captured)
             torch.cuda.current_stream(self.device).wait_stream(stream)
-            with torch.cuda.graph(captured.graph):
+            with torch.cuda.graph(captured.graph, pool=self._runtime_graph_pool()):
                 self._forward_decode_ragged_many_static(captured)
             captured.graph.replay()
         finally:
@@ -5997,14 +6101,43 @@ class Llama3TensorParallelForCausalLM:
         row_indices: Tensor | None,
         *,
         cache_token_bucket: int,
+        advance_inputs: bool = False,
+        host_input_state: Tensor | None = None,
     ) -> _StaticRaggedDecodeGraphCall:
         batch = input_ids.size(0)
         rotary_cache_dim = self.rotary_cos_cache.size(1)
-        static_row_indices = torch.empty_like(row_indices) if row_indices is not None else None
+        aliases_persistent_state = bool(advance_inputs and row_indices is None)
+        host_device_state = None
+        if host_input_state is not None:
+            host_device_state = getattr(
+                self,
+                "_torchinferno_online_decode_host_placeholders",
+                None,
+            )
+            if (
+                not isinstance(host_device_state, Tensor)
+                or host_device_state.device != self.device
+                or host_device_state.dtype != torch.long
+                or host_device_state.ndim != 2
+                or host_device_state.size(0) < 3
+                or host_device_state.size(1) < batch
+            ):
+                raise RuntimeError("host decode graphs require a persistent device state buffer")
+            static_input_ids = host_device_state[0, :batch].view(batch, 1)
+            static_row_indices = host_device_state[1, :batch]
+            static_cache_positions = host_device_state[2, :batch]
+        else:
+            static_input_ids = input_ids if aliases_persistent_state else torch.empty_like(input_ids)
+            static_row_indices = torch.empty_like(row_indices) if row_indices is not None else None
+            static_cache_positions = (
+                seq_lens[:batch]
+                if aliases_persistent_state
+                else torch.empty((batch,), device=self.device, dtype=torch.int64)
+            )
         captured = _StaticRaggedDecodeGraphCall(
             graph=torch.cuda.CUDAGraph(),
-            static_input_ids=torch.empty_like(input_ids),
-            static_cache_positions=torch.empty((batch,), device=self.device, dtype=torch.int64),
+            static_input_ids=static_input_ids,
+            static_cache_positions=static_cache_positions,
             static_row_indices=static_row_indices,
             static_rotary_cos=torch.empty((batch, rotary_cache_dim), device=self.device, dtype=self.dtype),
             static_rotary_sin=torch.empty((batch, rotary_cache_dim), device=self.device, dtype=self.dtype),
@@ -6012,9 +6145,25 @@ class Llama3TensorParallelForCausalLM:
             cache=cache,
             max_seq_len=cache.layers[0].max_seq_len,
             cache_token_bucket=cache_token_bucket,
-            rotary_in_graph=_tp_flag("TORCHINFERNO_CUDAGRAPH_RAGGED_DECODE_ROTARY_IN_GRAPH", True),
+            rotary_in_graph=(
+                True
+                if advance_inputs
+                else _tp_flag("TORCHINFERNO_CUDAGRAPH_RAGGED_DECODE_ROTARY_IN_GRAPH", True)
+            ),
+            advance_inputs=bool(advance_inputs),
+            host_input_state=host_input_state,
+            host_device_state=host_device_state,
         )
-        self._copy_ragged_decode_graph_inputs(captured, input_ids, seq_lens, row_indices)
+        if host_input_state is None:
+            self._copy_ragged_decode_graph_inputs(captured, input_ids, seq_lens, row_indices)
+        else:
+            self._copy_ragged_decode_graph_host_inputs(captured)
+        advance_input_snapshot = (
+            captured.static_input_ids.clone() if captured.advance_inputs else None
+        )
+        advance_position_snapshot = (
+            captured.static_cache_positions.clone() if captured.advance_inputs else None
+        )
         stream = torch.cuda.Stream(device=self.device)
         stream.wait_stream(torch.cuda.current_stream(self.device))
         _set_paged_ragged_decode_graph_active(cache, True)
@@ -6043,7 +6192,9 @@ class Llama3TensorParallelForCausalLM:
                     )
                     self._sample_next_token(logits[:, -1, :], 0.0)
             torch.cuda.current_stream(self.device).wait_stream(stream)
-            with torch.cuda.graph(captured.graph):
+            with torch.cuda.graph(captured.graph, pool=self._runtime_graph_pool()):
+                if captured.host_input_state is not None:
+                    self._copy_ragged_decode_graph_host_inputs(captured)
                 logits = self._forward_decode_ragged_static(
                     captured.static_input_ids,
                     cache,
@@ -6053,6 +6204,15 @@ class Llama3TensorParallelForCausalLM:
                     captured.cache_token_bucket,
                 )
                 captured.output_token = self._sample_next_token(logits[:, -1, :], 0.0)
+                if captured.advance_inputs:
+                    captured.static_input_ids.copy_(captured.output_token.view(batch, 1))
+                    captured.static_cache_positions.add_(1)
+            if advance_input_snapshot is not None and advance_position_snapshot is not None:
+                self._restore_ragged_decode_graph_advancing_inputs(
+                    captured,
+                    advance_input_snapshot,
+                    advance_position_snapshot,
+                )
             captured.graph.replay()
         finally:
             _set_paged_ragged_decode_graph_active(cache, False)
@@ -6063,12 +6223,35 @@ class Llama3TensorParallelForCausalLM:
             cache_token_bucket,
             row_indices is not None,
             _symm_mem_allreduce_graph_key(input_ids.size(0), _model_world_size(self)),
+            bool(advance_inputs),
+            host_input_state is not None,
         )
         max_graphs = _tp_int("TORCHINFERNO_CUDAGRAPH_DECODE_STEP_MAX_GRAPHS", 4096, minimum=1)
         if key not in self._ragged_decode_graphs and len(self._ragged_decode_graphs) >= max_graphs:
             self._ragged_decode_graphs.clear()
         self._ragged_decode_graphs[key] = captured
         return captured
+
+    @staticmethod
+    def _copy_ragged_decode_graph_host_inputs(
+        captured: _StaticRaggedDecodeGraphCall,
+    ) -> None:
+        host_state = captured.host_input_state
+        device_state = captured.host_device_state
+        if host_state is None or device_state is None or captured.static_row_indices is None:
+            raise RuntimeError("captured host decode inputs require sparse row indices")
+        device_state.copy_(host_state, non_blocking=True)
+
+    @staticmethod
+    def _restore_ragged_decode_graph_advancing_inputs(
+        captured: _StaticRaggedDecodeGraphCall,
+        input_ids: Tensor,
+        cache_positions: Tensor,
+    ) -> None:
+        if not captured.advance_inputs:
+            return
+        captured.static_input_ids.copy_(input_ids)
+        captured.static_cache_positions.copy_(cache_positions)
 
     def _capture_ragged_decode_logits_graph(
         self,
@@ -6114,7 +6297,7 @@ class Llama3TensorParallelForCausalLM:
                     captured.cache_token_bucket,
                 )
             torch.cuda.current_stream(self.device).wait_stream(stream)
-            with torch.cuda.graph(captured.graph):
+            with torch.cuda.graph(captured.graph, pool=self._runtime_graph_pool()):
                 captured.output_logits = self._forward_decode_ragged_static(
                     captured.static_input_ids,
                     cache,
@@ -6153,7 +6336,15 @@ class Llama3TensorParallelForCausalLM:
     ) -> None:
         input_ids = input_ids.to(self.device, non_blocking=True)
         seq_lens = seq_lens.to(self.device, non_blocking=True)
-        if row_indices is None:
+        advance_inputs = bool(getattr(captured, "advance_inputs", False))
+        if advance_inputs and row_indices is None:
+            if (
+                captured.static_input_ids.data_ptr() != input_ids.data_ptr()
+                or captured.static_cache_positions.data_ptr() != seq_lens.data_ptr()
+            ):
+                raise ValueError("advancing decode graph inputs must alias persistent serving state")
+            cache_positions = captured.static_cache_positions
+        elif row_indices is None:
             cache_positions = seq_lens[: input_ids.size(0)]
         else:
             row_indices = row_indices.to(self.device, non_blocking=True)
@@ -6161,8 +6352,9 @@ class Llama3TensorParallelForCausalLM:
                 raise RuntimeError("captured ragged decode graph does not accept row indices")
             captured.static_row_indices.copy_(row_indices)
             cache_positions = seq_lens.index_select(0, row_indices)
-        captured.static_input_ids.copy_(input_ids)
-        captured.static_cache_positions.copy_(cache_positions)
+        if not advance_inputs:
+            captured.static_input_ids.copy_(input_ids)
+            captured.static_cache_positions.copy_(cache_positions)
         if not getattr(captured, "rotary_in_graph", False):
             steps = int(getattr(captured, "steps", 1))
             if steps > 1:
@@ -6265,7 +6457,7 @@ class Llama3TensorParallelForCausalLM:
                 attention_block_size,
             )
         torch.cuda.current_stream(self.device).wait_stream(stream)
-        with torch.cuda.graph(captured.graph):
+        with torch.cuda.graph(captured.graph, pool=self._runtime_graph_pool()):
             captured.output_logits = self._forward_decode_static(
                 captured.static_input_ids,
                 cache,
@@ -7663,7 +7855,10 @@ class Llama3TensorParallelForCausalLM:
                         prefix_copy_capacity=prefix_copy_capacity,
                     )
                 torch.cuda.current_stream(self.device).wait_stream(stream)
-                with torch.cuda.graph(new_captured.graph):
+                with torch.cuda.graph(
+                    new_captured.graph,
+                    pool=self._runtime_graph_pool(),
+                ):
                     self._copy_token_bucket_prefix_compute(
                         cache,
                         start_positions=new_captured.static_start_positions,
@@ -7793,6 +7988,7 @@ class Llama3TensorParallelForCausalLM:
         prefix_copy_capacity: int = 0,
         capture_on_miss: bool = True,
     ) -> Tensor | None:
+        self._last_ragged_prefill_graph_captured = False
         if (
             input_ids.device.type != "cuda"
             or input_ids.ndim != 2
@@ -7835,6 +8031,7 @@ class Llama3TensorParallelForCausalLM:
             src_prefix_rows is not None,
             precision_key,
             _symm_mem_allreduce_graph_key(1, _model_world_size(self)),
+            _symm_mem_prefill_allreduce_graph_key(token_capacity, _model_world_size(self)),
         )
         captured = self._token_bucket_prefill_graphs.get(key)
         needs_capture = captured is None or captured.cache is not cache
@@ -7873,6 +8070,7 @@ class Llama3TensorParallelForCausalLM:
                 return None
             captured = new_captured
             self._token_bucket_prefill_graphs[key] = captured
+            self._last_ragged_prefill_graph_captured = True
             if _tp_flag("TORCHINFERNO_CUDAGRAPH_PREFILL_DEBUG", False):
                 print(
                     f"rank={self.rank} token_bucket_prefill_captured "
@@ -8019,7 +8217,7 @@ class Llama3TensorParallelForCausalLM:
                 prefix_copy_capacity=captured.prefix_copy_capacity,
             )
         torch.cuda.current_stream(self.device).wait_stream(stream)
-        with torch.cuda.graph(captured.graph):
+        with torch.cuda.graph(captured.graph, pool=self._runtime_graph_pool()):
             captured.output_logits = self._prefill_token_bucket_fa3_compute(
                 captured.static_input_ids,
                 cache,
@@ -8189,6 +8387,7 @@ class Llama3TensorParallelForCausalLM:
             prefix_copy_len if prefix_copy_len is not None else -1,
             precision_key,
             _symm_mem_allreduce_graph_key(1, _model_world_size(self)),
+            _symm_mem_prefill_allreduce_graph_key(input_ids.numel(), _model_world_size(self)),
             os.environ.get("TORCHINFERNO_PACKED_PREFILL_ATTENTION_BACKEND", "sdpa")
             .strip()
             .lower(),
@@ -8342,7 +8541,7 @@ class Llama3TensorParallelForCausalLM:
                 packed_attention_groups=captured.packed_attention_groups,
             )
         torch.cuda.current_stream(self.device).wait_stream(stream)
-        with torch.cuda.graph(captured.graph):
+        with torch.cuda.graph(captured.graph, pool=self._runtime_graph_pool()):
             captured.output_logits = self._prefill_ragged_logits_packed_graph_compute(
                 captured.static_input_ids,
                 cache,
@@ -8886,6 +9085,7 @@ class Llama3TensorParallelForCausalLM:
             src_prefix_rows,
             precision_key,
             _symm_mem_allreduce_graph_key(input_ids.size(0), _model_world_size(self)),
+            _symm_mem_prefill_allreduce_graph_key(input_ids.numel(), _model_world_size(self)),
             int(bool(emit_logits)),
             int(bool(emit_tokens)),
             int(bool(rotary_in_graph)),
@@ -9155,7 +9355,7 @@ class Llama3TensorParallelForCausalLM:
             if emit_tokens:
                 self._sample_next_token(logits[:, -1, :], 0.0)
         torch.cuda.current_stream(self.device).wait_stream(stream)
-        with torch.cuda.graph(captured.graph):
+        with torch.cuda.graph(captured.graph, pool=self._runtime_graph_pool()):
             write_positions = self._ragged_prefill_graph_write_positions(captured)
             logits = self._forward_prefill_ragged_static(
                 captured.static_input_ids,
@@ -11266,6 +11466,31 @@ def _symm_mem_allreduce_graph_key(batch_size: int, world_size: int) -> int:
     return max_batch if batch_size <= max_batch else 0
 
 
+def _symm_mem_prefill_allreduce_token_limit() -> int:
+    return min(
+        _tp_int("TORCHINFERNO_SYMM_MEM_PREFILL_ALLREDUCE_MAX_TOKENS", 40960, minimum=1),
+        _tp_int("TORCHINFERNO_SYMM_MEM_PREFILL_BUFFER_TOKENS", 4096, minimum=1),
+    )
+
+
+def _symm_mem_prefill_allreduce_enabled() -> bool:
+    override = _SYMM_MEM_PREFILL_ALLREDUCE_ENABLED_OVERRIDE[0]
+    return (
+        override
+        if override is not None
+        else _tp_flag("TORCHINFERNO_SYMM_MEM_PREFILL_ALLREDUCE", False)
+    )
+
+
+def _symm_mem_prefill_allreduce_graph_key(token_count: int, world_size: int) -> int:
+    return int(
+        world_size > 1
+        and not _SYMM_REDUCE_DISABLED
+        and _symm_mem_prefill_allreduce_enabled()
+        and 1 < int(token_count) <= _symm_mem_prefill_allreduce_token_limit()
+    )
+
+
 def _model_world_size(model: object) -> int:
     return int(getattr(model, "world_size", 1))
 
@@ -11276,25 +11501,15 @@ def _should_use_symm_mem_prefill_all_reduce(hidden: Tensor, weight: Tensor, worl
     # is ~31% of prefill (profiled), so this is the top prefill lever. Callers must
     # avoid allocating/probing the per-shape symm-mem buffer during CUDA graph
     # capture; captured prefill may reuse only buffers prepared by eager warmup.
-    max_tokens = min(
-        _tp_int("TORCHINFERNO_SYMM_MEM_PREFILL_ALLREDUCE_MAX_TOKENS", 40960, minimum=1),
-        _tp_int("TORCHINFERNO_SYMM_MEM_PREFILL_BUFFER_TOKENS", 4096, minimum=1),
-    )
-    override = _SYMM_MEM_PREFILL_ALLREDUCE_ENABLED_OVERRIDE[0]
-    prefill_enabled = (
-        override
-        if override is not None
-        else _tp_flag("TORCHINFERNO_SYMM_MEM_PREFILL_ALLREDUCE", False)
-    )
     return (
         world_size > 1
         and not _SYMM_REDUCE_DISABLED
-        and prefill_enabled
+        and _symm_mem_prefill_allreduce_enabled()
         and hidden.is_cuda
         and weight.is_cuda
         and hidden.ndim == 3
         and hidden.size(1) > 1
-        and hidden.size(0) * hidden.size(1) <= max_tokens
+        and hidden.size(0) * hidden.size(1) <= _symm_mem_prefill_allreduce_token_limit()
     )
 
 

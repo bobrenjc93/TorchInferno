@@ -189,6 +189,8 @@ def test_continuous_batch_engine_ragged_decode_bucket_sizes(monkeypatch) -> None
     default_engine._free_active_rows = list(reversed(range(64)))
     default_rows = default_engine._ragged_decode_bucket_rows(list(range(47)))
     assert len(default_rows) == 48
+    saturated_rows = default_engine._ragged_decode_bucket_rows(list(range(49)))
+    assert len(saturated_rows) == 50
 
     monkeypatch.setenv(
         "TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_BUCKET_SIZES",
@@ -223,6 +225,22 @@ def test_ragged_decode_padding_invalidates_warm_prefix_identity(monkeypatch) -> 
     assert engine._rows_have_cached_prefix((3,), cached_tokens, len(cached_tokens))
     assert engine._ragged_decode_bucket_rows([0, 1, 2]) == [0, 1, 2, 3]
     assert not engine._rows_have_cached_prefix((3,), cached_tokens, len(cached_tokens))
+
+
+def test_ragged_decode_padding_prefers_cold_free_rows(monkeypatch) -> None:
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_BUCKET_SIZES", "4")
+    engine = ContinuousBatchEngine(
+        _RaggedGraphToyModel(),
+        device=torch.device("cpu"),
+        max_active_requests=5,
+    )
+    engine.start_online(max_seq_len=16)
+    cached_tokens = (1, 2, 3, 4)
+    engine._free_active_rows = [4, 3]
+    engine._remember_row_cached_prefix(3, cached_tokens)
+
+    assert engine._ragged_decode_bucket_rows([0, 1, 2]) == [0, 1, 2, 4]
+    assert engine._rows_have_cached_prefix((3,), cached_tokens, len(cached_tokens))
 
 
 def test_prefix_copy_invalidates_destination_warm_prefix_identity() -> None:
@@ -1173,6 +1191,7 @@ class _UnifiedTokenBucketToyModel(_UnifiedStepToyModel):
         self.token_bucket_rows: list[list[int]] = []
         self.token_bucket_flat_rows: list[list[int]] = []
         self.token_bucket_prefix_copy_lens: list[list[int]] = []
+        self.token_bucket_graph_shapes: set[tuple[int, int]] = set()
 
     def try_copy_token_bucket_prefix_graph(self, *args, **kwargs):
         del args
@@ -1194,7 +1213,12 @@ class _UnifiedTokenBucketToyModel(_UnifiedStepToyModel):
         logit_positions,
         capture_on_miss=True,
     ):
-        del cache, start_positions, write_positions, capture_on_miss
+        del cache, start_positions, write_positions
+        shape = (int(q_lens.numel()), int(input_ids.numel()))
+        self._last_ragged_prefill_graph_captured = bool(
+            capture_on_miss and shape not in self.token_bucket_graph_shapes
+        )
+        self.token_bucket_graph_shapes.add(shape)
         self.token_bucket_q_lens.append(q_lens.detach().cpu().tolist())
         self.token_bucket_rows.append(row_indices.detach().cpu().tolist())
         self.token_bucket_flat_rows.append(flat_rows.detach().cpu().tolist())
@@ -2366,6 +2390,25 @@ def test_continuous_batch_engine_can_skip_warm_row_prefix_copy(
     assert engine.stats.prefill_prefix_copy_masked_tail_tokens == 0
     assert engine.stats.prefill_prefix_copy_skipped_batches == 1
     assert engine.stats.prefill_prefix_copy_skipped_tokens == len(shared) * 2
+
+
+def test_continuous_batch_engine_acquires_matching_warm_prefix_row() -> None:
+    engine = ContinuousBatchEngine(
+        _RaggedGraphToyModel(),
+        device=torch.device("cpu"),
+        max_active_requests=3,
+    )
+    engine.start_online(max_seq_len=16)
+    target = (1, 2, 3, 4)
+    engine._free_active_rows = [2, 1]
+    engine._remember_row_cached_prefix(2, target)
+    engine._remember_row_cached_prefix(1, (9, 8, 7))
+
+    row = engine._acquire_active_row_for_cached_prefix((*target, 5), len(target))
+
+    assert row == 2
+    assert engine._free_active_rows == [1]
+    assert engine._rows_have_cached_prefix((2,), target, len(target))
 
 
 def test_continuous_batch_engine_allocates_lowest_available_prefix_row() -> None:
@@ -6279,7 +6322,7 @@ def test_continuous_batch_engine_unified_online_replays_one_token_for_exact_prom
     assert model.unified_calls >= 1
     assert not engine.has_online_work()
     assert engine.stats.prefill_model_calls == prefill_calls + 1
-    assert engine.stats.decode_model_calls == decode_calls + 1
+    assert engine.stats.decode_model_calls == decode_calls
     assert engine.stats.prefix_reuse_tokens == reuse_tokens + len(prompt) - 1
 
 
@@ -6299,10 +6342,20 @@ def test_continuous_batch_engine_unified_mixed_padding_uses_future_kv_positions(
     engine.submit_online(ServingRequest("decode", (1, 2, 3, 4), 3, arrival_step=0))
     engine.step_online()
     engine.submit_online(ServingRequest("prefill", (7, 8, 9), 1, arrival_step=1))
+    prefill_tokens = engine.stats.prefill_tokens
+    decode_tokens = engine.stats.decode_tokens
+    decode_active_tokens = engine.stats.decode_active_tokens
+    prefill_calls = engine.stats.prefill_model_calls
+    decode_calls = engine.stats.decode_model_calls
 
     engine.step_online()
 
     assert model.unified_write_positions[-1] == [[4, 5, 6], [0, 1, 2]]
+    assert engine.stats.prefill_tokens == prefill_tokens + 3
+    assert engine.stats.decode_tokens == decode_tokens + 1
+    assert engine.stats.decode_active_tokens == decode_active_tokens + 1
+    assert engine.stats.prefill_model_calls == prefill_calls + 1
+    assert engine.stats.decode_model_calls == decode_calls + 1
     assert engine._decode_many_gpu_state_signature == engine._make_decode_many_gpu_state_signature(
         engine._online_active
     )
@@ -6313,6 +6366,7 @@ def test_continuous_batch_engine_unified_token_graph_pads_tokens_without_live_ro
 ) -> None:
     monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_TOKEN_BUCKET_FA3_UNIFIED", "1")
     monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_TOKEN_BUCKET_FA3_BATCH_CAPACITY", "4")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_QUEUE_PROFILE_JSONL", "/tmp/queue.jsonl")
     model = _UnifiedTokenBucketToyModel()
     engine = ContinuousBatchEngine(
         model,
@@ -6337,6 +6391,194 @@ def test_continuous_batch_engine_unified_token_graph_pads_tokens_without_live_ro
     assert model.token_bucket_q_lens[-1] == [1, 7, 0, 0]
     assert model.token_bucket_rows[-1] == [0, 1, 0, 0]
     assert model.token_bucket_flat_rows[-1] == [0, 1, 1, 1, 1, 1, 1, 1]
+    assert engine.stats.prefill_graph_hits == 1
+    assert engine.stats.prefill_graph_captures == 1
+    assert engine.stats.prefill_graph_capture_shape_counts == {
+        "unified_token_bucket_fa3:b4:t8:p0": 1,
+    }
+
+    replay = engine._try_unified_token_bucket_fa3_logits(
+        input_sequences=[[11], [12, 13]],
+        q_lens=[1, 2],
+        start_lens=[5, 0],
+        rows=[0, 1],
+        source_rows=[0, 1],
+        copy_lens=[0, 0],
+    )
+
+    assert replay is not None
+    assert engine.stats.prefill_graph_hits == 2
+    assert engine.stats.prefill_graph_replays == 1
+    assert engine.stats.prefill_graph_replay_shape_counts == {
+        "unified_token_bucket_fa3:b4:t8:p0": 1,
+    }
+
+
+def test_continuous_batch_engine_token_bucket_prefill_records_capture_and_replay(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_TOKEN_BUCKET_FA3_PREFILL", "1")
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_TOKEN_BUCKET_FA3_BATCH_CAPACITY", "4")
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_QUEUE_PROFILE_JSONL", "/tmp/queue.jsonl")
+    model = _UnifiedTokenBucketToyModel()
+    engine = ContinuousBatchEngine(
+        model,
+        device=torch.device("cpu"),
+        max_active_requests=4,
+        prefix_cache_capacity=0,
+        store_reusable_prefixes=False,
+    )
+    engine.start_online(max_seq_len=16)
+    engine._cache_supports_tensor_ragged_prefill = lambda: True
+
+    def run(tokens: tuple[int, int, int]):
+        return engine._try_token_bucket_fa3_prefill_logits(
+            padded_suffixes=(
+                (tokens[0], 0, 0, 0, 0, 0, 0, 0),
+                (tokens[1], tokens[2], 0, 0, 0, 0, 0, 0),
+            ),
+            suffix_lengths=(1, 2),
+            suffix_bucket=8,
+            start_lens=(4, 0),
+            all_rows=(0, 1),
+            source_prefix_rows=(),
+            capture_on_miss=True,
+        )
+
+    assert run((7, 8, 9)) is not None
+    assert run((11, 12, 13)) is not None
+    assert engine.stats.prefill_graph_hits == 2
+    assert engine.stats.prefill_graph_captures == 1
+    assert engine.stats.prefill_graph_replays == 1
+    assert sum(engine.stats.prefill_graph_capture_shape_counts.values()) == 1
+    assert sum(engine.stats.prefill_graph_replay_shape_counts.values()) == 1
+
+
+def test_continuous_batch_engine_cache_prefill_records_capture_and_replay(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("TORCHINFERNO_OPENAI_QUEUE_PROFILE_JSONL", "/tmp/queue.jsonl")
+    model = _SelectedLogitsToyModel()
+    engine = ContinuousBatchEngine(
+        model,
+        device=torch.device("cpu"),
+        max_active_requests=2,
+        prefix_cache_capacity=0,
+        store_reusable_prefixes=False,
+    )
+    engine.start_online(max_seq_len=16)
+    engine._cache_supports_tensor_ragged_prefill = lambda: True
+    input_ids = torch.tensor([[1, 2]], dtype=torch.long)
+    row_indices = torch.tensor([0], dtype=torch.long)
+
+    for _ in range(2):
+        assert engine._try_ragged_prefill_cache(
+            input_ids,
+            torch.tensor([0], dtype=torch.long),
+            row_indices,
+        )
+
+    assert engine.stats.prefill_graph_hits == 2
+    assert engine.stats.prefill_graph_captures == 1
+    assert engine.stats.prefill_graph_replays == 1
+    assert sum(engine.stats.prefill_graph_capture_shape_counts.values()) == 1
+    assert sum(engine.stats.prefill_graph_replay_shape_counts.values()) == 1
+
+
+def test_continuous_batch_engine_unified_model_stats_split_prefill_and_decode() -> None:
+    engine = ContinuousBatchEngine(
+        _RaggedGraphToyModel(),
+        device=torch.device("cpu"),
+        max_active_requests=4,
+    )
+
+    engine._record_model_call(
+        "unified",
+        4,
+        tokens=10,
+        prefill_tokens=8,
+        decode_tokens=2,
+    )
+    engine._record_model_call(
+        "unified",
+        3,
+        tokens=5,
+        prefill_tokens=5,
+        decode_tokens=0,
+    )
+
+    assert engine.stats.prefill_model_calls == 2
+    assert engine.stats.prefill_tokens == 13
+    assert engine.stats.decode_model_calls == 1
+    assert engine.stats.decode_tokens == 2
+    assert engine.stats.decode_active_tokens == 2
+    assert engine.stats.max_model_batch_size == 4
+
+
+def test_continuous_batch_engine_reuses_shape_keyed_device_long_staging() -> None:
+    engine = ContinuousBatchEngine(
+        _UnifiedTokenBucketToyModel(),
+        device=torch.device("cpu"),
+        max_active_requests=4,
+        prefix_cache_capacity=0,
+        store_reusable_prefixes=False,
+    )
+
+    first = engine._stage_device_long_tensor("metadata", [1, 2, 3])
+    first_pointer = first.data_ptr()
+    second = engine._stage_device_long_tensor("metadata", [7, 8, 9])
+
+    assert second.data_ptr() == first_pointer
+    assert second.tolist() == [7, 8, 9]
+    assert len(engine._device_long_staging) == 1
+    assert len(engine._host_long_staging) == 1
+
+    matrix = engine._stage_device_long_tensor("metadata", [4, 5, 6], shape=(1, 3))
+    assert matrix.tolist() == [[4, 5, 6]]
+    assert len(engine._device_long_staging) == 2
+    assert len(engine._host_long_staging) == 2
+
+
+def test_continuous_batch_engine_stages_decode_host_graph_state(monkeypatch) -> None:
+    from types import SimpleNamespace
+
+    monkeypatch.setenv("TORCHINFERNO_CUDAGRAPH_RAGGED_DECODE_HOST_INPUTS", "1")
+    model = _UnifiedTokenBucketToyModel()
+    model._torchinferno_online_decode_host_state = torch.zeros((3, 4), dtype=torch.long)
+    model._torchinferno_online_decode_host_placeholders = torch.full(
+        (3, 4),
+        -1,
+        dtype=torch.long,
+    )
+    engine = ContinuousBatchEngine(
+        model,
+        device=torch.device("cpu"),
+        max_active_requests=4,
+        prefix_cache_capacity=0,
+        store_reusable_prefixes=False,
+    )
+    engine._row_seq_lens = [6, 10, 5, 12]
+    states = [
+        SimpleNamespace(row=2, last_token=20, seq_len=5),
+        SimpleNamespace(row=0, last_token=10, seq_len=6),
+    ]
+    decode_rows = [0, 1, 2, 3]
+
+    input_ids, row_indices = engine._stage_decode_inputs_from_cpu_state(
+        states,
+        decode_rows,
+    )
+
+    assert decode_rows == [2, 0, 1, 3]
+    assert model._torchinferno_online_decode_host_state.tolist() == [
+        [20, 10, 20, 20],
+        [2, 0, 1, 3],
+        [5, 6, 10, 12],
+    ]
+    assert input_ids.data_ptr() == model._torchinferno_online_decode_host_placeholders.data_ptr()
+    assert row_indices.data_ptr() == model._torchinferno_online_decode_host_placeholders[1].data_ptr()
+    assert model._torchinferno_online_decode_host_placeholders.tolist() == [[-1] * 4] * 3
+    assert engine._decode_inputs_use_host_graph is True
 
 
 def test_continuous_batch_engine_unified_identical_prompts_recompute_final_token(
@@ -6693,7 +6935,7 @@ def test_continuous_batch_engine_unified_online_continues_exact_prompt_on_second
     assert model.unified_calls >= 1
     assert not engine.has_online_work()
     assert engine.stats.prefill_model_calls == prefill_calls + 1
-    assert engine.stats.decode_model_calls == decode_calls + 2
+    assert engine.stats.decode_model_calls == decode_calls + 1
     assert engine.stats.prefix_reuse_tokens == reuse_tokens + len(prompt) - 1
 
 
@@ -8808,6 +9050,58 @@ def test_continuous_batch_engine_online_many_omits_row_indices_for_contiguous_gr
     assert not engine.has_online_work()
 
 
+def test_continuous_batch_engine_allows_graph_to_advance_persistent_inputs() -> None:
+    class AdvancingTokenGraphToyModel(_RaggedGraphToyModel):
+        def __init__(self) -> None:
+            super().__init__(vocab_size=128)
+            self.advance_flags: list[bool] = []
+            self.positions: list[list[int]] = []
+
+        def try_decode_ragged_token_graph(
+            self,
+            input_ids,
+            cache,
+            *,
+            seq_lens,
+            row_indices,
+            temperature=0.0,
+            capture_on_miss=True,
+            advance_inputs=False,
+        ):
+            del temperature, capture_on_miss
+            self.advance_flags.append(bool(advance_inputs))
+            self.positions.append(seq_lens[: input_ids.size(0)].tolist())
+            next_tokens = (input_ids[:, -1] + 1).remainder(self.vocab_size)
+            cache.advance_rows(_toy_decode_rows(input_ids, row_indices), 1)
+            self._last_ragged_decode_graph_advanced_inputs = bool(advance_inputs)
+            if advance_inputs:
+                input_ids.copy_(next_tokens[:, None])
+                seq_lens[: input_ids.size(0)].add_(1)
+            return next_tokens
+
+    model = AdvancingTokenGraphToyModel()
+    engine = ContinuousBatchEngine(
+        model,
+        device=torch.device("cpu"),
+        max_active_requests=2,
+        prefix_cache_capacity=0,
+        enable_ragged_decode=True,
+        store_reusable_prefixes=False,
+    )
+
+    engine.start_online(max_seq_len=16)
+    engine.submit_online(ServingRequest("a", (1, 2, 3), 4, arrival_step=0))
+    engine.submit_online(ServingRequest("b", (3, 4, 5, 6), 4, arrival_step=0))
+    generated = {"a": [], "b": []}
+    while engine.has_online_work():
+        for event in engine.step_online():
+            generated[event.request_id].append(event.token)
+
+    assert {request_id: len(tokens) for request_id, tokens in generated.items()} == {"a": 4, "b": 4}
+    assert model.advance_flags == [True, True, True]
+    assert model.positions == [[3, 4], [4, 5], [5, 6]]
+
+
 def test_continuous_batch_engine_dense_prefix_row_check_matches_sorted_semantics() -> None:
     assert ContinuousBatchEngine._dense_prefix_row_info([0, 1, 2, 3]) == (True, True)
     assert ContinuousBatchEngine._dense_prefix_row_info([2, 0, 3, 1]) == (True, False)
@@ -10142,6 +10436,33 @@ def test_continuous_batch_engine_online_refill_extends_interval_for_sustained_de
     admitted = engine._admit_ready_requests(waiting, 3, 3)
 
     assert [request.request_id for _index, request in admitted] == ["late"]
+
+
+def test_continuous_batch_engine_online_refill_bounds_sustained_admission_burst(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_ADMIT_SUSTAINED_MIN_GENERATED", "1")
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_ADMIT_SUSTAINED_MIN_STEP_INTERVAL", "2")
+    monkeypatch.setenv("TORCHINFERNO_CONTINUOUS_ADMIT_SUSTAINED_MAX_CONSECUTIVE_STEPS", "2")
+    engine = ContinuousBatchEngine(
+        _RaggedGraphToyModel(),
+        device=torch.device("cpu"),
+        max_active_requests=8,
+        prefix_cache_capacity=0,
+    )
+    engine.start_online(max_seq_len=8)
+    engine.submit_online(ServingRequest("active", (1, 2), 5, arrival_step=0))
+    engine.step_online()
+    engine._online_active[0].generated = 1
+    engine.submit_online(ServingRequest("first", (3, 4), 1, arrival_step=1))
+    first = engine._admit_ready_requests(engine._require_online_waiting(), 1, 1)
+    engine.submit_online(ServingRequest("blocked", (5, 6), 1, arrival_step=2))
+    blocked = engine._admit_ready_requests(engine._require_online_waiting(), 2, 1)
+    resumed = engine._admit_ready_requests(engine._require_online_waiting(), 3, 1)
+
+    assert [request.request_id for _index, request in first] == ["first"]
+    assert blocked == []
+    assert [request.request_id for _index, request in resumed] == ["blocked"]
 
 
 def test_continuous_batch_engine_prefill_token_budget_limits_admission() -> None:

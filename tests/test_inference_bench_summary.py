@@ -841,6 +841,122 @@ def test_queue_profile_merges_final_marker_segments_without_counter_drop(tmp_pat
     assert "1000/1000 2seg" in text
 
 
+def test_queue_profile_session_id_splits_identical_final_counters(tmp_path) -> None:
+    results = {
+        "model": "meta-llama/test",
+        "tensor_parallel_size": 4,
+        "hardware": "4xH100",
+        "providers": {
+            "torchinferno": {
+                "benchmarks": {
+                    "long_output": {
+                        "metrics": {
+                            "num_requests": 10,
+                            "ttft_median_ms": 20.0,
+                        }
+                    }
+                }
+            }
+        },
+    }
+    (tmp_path / "results.json").write_text(json.dumps(results))
+    logs = tmp_path / "provider_logs"
+    logs.mkdir()
+    records = [
+        {
+            "event": "online_batcher",
+            "profile_session_id": session_id,
+            "profile_snapshot_semantics": "cumulative_session",
+            "profile_terminal": True,
+            "temperature": 0.0,
+            "run_max_tokens": 96,
+            "submitted_requests": 5,
+            "finished_events": 5,
+            "runtime_prefill_batches": batches,
+            "runtime_cache_rows": 144,
+            "runtime_generated_prefix_cache_effective_enabled": False,
+            "runtime_reusable_prefix_logits_entries": entries,
+            "runtime_temperature_sample_calls": batches,
+        }
+        for session_id, batches, entries in (
+            ("server-a:1", 2, 7),
+            ("server-b:1", 3, 9),
+        )
+    ]
+    (logs / "torchinferno_queue_profile.jsonl").write_text(
+        "\n".join(json.dumps(record) for record in records) + "\n"
+    )
+
+    summary = summarize_inference_bench_run(tmp_path)
+
+    profile = summary.torchinferno_queue_profiles[0]
+    assert profile.segments == 2
+    assert profile.submitted_requests == 10
+    assert profile.finished_events == 10
+    assert profile.fields["runtime_prefill_batches"] == 5
+    assert profile.fields["runtime_temperature_sample_calls"] == 5
+    assert profile.fields["runtime_cache_rows"] == 144
+    assert profile.fields["runtime_reusable_prefix_logits_entries"] == 9
+    assert profile.fields["runtime_generated_prefix_cache_effective_enabled"] is False
+    assert profile.fields["profile_snapshot_semantics"] == "cumulative_session"
+    assert profile.profile_session_id == "server-b:1"
+
+
+def test_queue_profile_marks_mixed_request_policies_as_aggregate_only(tmp_path) -> None:
+    _write_inference_bench_run(tmp_path)
+    queue_path = tmp_path / "provider_logs" / "torchinferno_queue_profile.jsonl"
+    records = [
+        {
+            "event": "online_batcher_quiescent",
+            "profile_session_id": "server-a:1",
+            "temperature": 0.0,
+            "run_max_tokens": 256,
+            "submitted_requests": 500,
+            "finished_events": 500,
+            "request_policy_counts": {"0:256": 500},
+            "runtime_prefill_batches": 5,
+        },
+        {
+            "event": "online_batcher",
+            "profile_session_id": "server-a:1",
+            "temperature": 0.0,
+            "run_max_tokens": 256,
+            "submitted_requests": 2000,
+            "finished_events": 2000,
+            "request_policy_counts": {"0:256": 1000, "0.7:256": 1000},
+            "runtime_prefill_batches": 20,
+        },
+        {
+            "event": "online_batcher",
+            "profile_session_id": "server-a:2",
+            "temperature": 0.0,
+            "run_max_tokens": 512,
+            "submitted_requests": 1992,
+            "finished_events": 1992,
+            "request_policy_counts": {"0:512": 1000, "0.7:512": 992},
+            "runtime_prefill_batches": 30,
+        },
+    ]
+    queue_path.write_text(
+        "\n".join(json.dumps(record) for record in records) + "\n"
+    )
+
+    summary = summarize_inference_bench_run(tmp_path)
+
+    assert len(summary.torchinferno_queue_profiles) == 1
+    profile = summary.torchinferno_queue_profiles[0]
+    assert profile.temperature is None
+    assert profile.max_tokens is None
+    assert profile.segments == 2
+    assert profile.submitted_requests == 3992
+    assert profile.fields["request_policy_counts"] == {
+        "0:256": 1000,
+        "0.7:256": 1000,
+        "0:512": 1000,
+        "0.7:512": 992,
+    }
+
+
 def test_benchmark_filter_limits_queue_profile_tables(tmp_path) -> None:
     results = {
         "model": "meta-llama/test",

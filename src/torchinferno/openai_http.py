@@ -553,34 +553,23 @@ def _stream_fast_chat(
     completion_id = f"chatcmpl-{uuid.uuid4().hex}"
     created = int(time.time())
     chunk_prefix = _chat_completion_chunk_prefix(completion_id, engine.model_id, created)
-    header_start_s = time.perf_counter()
+    initial_send_start_s = time.perf_counter()
     connection.sendall(
-        _fast_response_headers(
-            200,
-            "text/event-stream",
+        _fast_stream_start_bytes(
+            chunk_prefix,
             chunked=keep_alive,
-            extra_headers=((b"Cache-Control", b"no-cache"),),
             connection_close=not keep_alive,
         )
     )
-    _mark_fast_http_elapsed(profile, "headers_ms", header_start_s)
+    _mark_fast_http_elapsed(profile, "stream_start_send_ms", initial_send_start_s)
     _mark_fast_http_since_start(profile, "headers_sent_ms")
     client_open = True
-    role_sent = False
+    role_sent = True
     content_chunks = 0
     content_send_calls = 0
     engine_tokens = 0
     empty_tokens = 0
     try:
-        role_start_s = time.perf_counter()
-        client_open = _try_send_fast_chat_chunk(
-            connection,
-            chunk_prefix,
-            _CHAT_DELTA_ROLE,
-            chunked=keep_alive,
-        )
-        role_sent = client_open
-        _mark_fast_http_elapsed(profile, "role_send_ms", role_start_s)
         generate_start_s = time.perf_counter()
         for token_batch in _iter_engine_chat_token_batches(
             engine,
@@ -877,6 +866,26 @@ def _fast_stream_end_bytes(
     if chunked:
         chunks.append(b"0\r\n\r\n")
     return b"".join(chunks)
+
+
+def _fast_stream_start_bytes(
+    chunk_prefix: bytes,
+    *,
+    chunked: bool,
+    connection_close: bool,
+) -> bytes:
+    headers = _fast_response_headers(
+        200,
+        "text/event-stream",
+        chunked=chunked,
+        extra_headers=((b"Cache-Control", b"no-cache"),),
+        connection_close=connection_close,
+    )
+    role = _fast_sse_bytes(
+        _chat_completion_chunk_bytes(chunk_prefix, _CHAT_DELTA_ROLE, None),
+        chunked=chunked,
+    )
+    return headers + role
 
 
 def _fast_response_headers(
