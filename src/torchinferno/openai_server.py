@@ -20020,9 +20020,10 @@ def _apply_tensor_parallel_serving_defaults(config: OpenAIServerConfig) -> None:
         "TORCHINFERNO_FP8_FUSED_ACTIVATIONS": "1",
         "TORCHINFERNO_FP8_FUSED_ACTIVATIONS_DECODE": "1",
         "TORCHINFERNO_FP8_FUSED_SWIGLU_DECODE": "1",
-        # A 64-token tile wins at the mixed 128-320-token contexts exercised by
-        # online decode; 256 spills enough work to regress sharply.
-        "TORCHINFERNO_TRITON_STREAMING_DECODE_ATTENTION_BLOCK_S": "64",
+        # The H100 streaming decode kernel is launch-bound at short and medium
+        # contexts. A 128-token tile improves decode TPOT across mixed online
+        # workloads; 256 spills enough work to regress sharply.
+        "TORCHINFERNO_TRITON_STREAMING_DECODE_ATTENTION_BLOCK_S": "128",
         # Capture stable pinned-host token, row, and position copies as graph
         # nodes so changing scheduler metadata does not require a CUDA launch.
         "TORCHINFERNO_CONTINUOUS_PINNED_DECODE_INPUTS": "1",

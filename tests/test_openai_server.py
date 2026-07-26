@@ -10891,7 +10891,7 @@ def test_tensor_parallel_serving_defaults_gate_fa3_backend(
     assert os.environ["TORCHINFERNO_OPENAI_TOKENIZER_BATCH_WAIT_MS"] == "0.2"
     assert os.environ["TORCHINFERNO_FP8_FUSED_SWIGLU_DECODE"] == "1"
     assert os.environ["TORCHINFERNO_FP8_QKV_PREFILL"] == "1"
-    assert os.environ["TORCHINFERNO_TRITON_STREAMING_DECODE_ATTENTION_BLOCK_S"] == "64"
+    assert os.environ["TORCHINFERNO_TRITON_STREAMING_DECODE_ATTENTION_BLOCK_S"] == "128"
     assert os.environ["TORCHINFERNO_CONTINUOUS_PINNED_DECODE_INPUTS"] == "1"
     assert os.environ["TORCHINFERNO_CUDAGRAPH_RAGGED_DECODE_HOST_INPUTS"] == "1"
     assert os.environ["TORCHINFERNO_MARLIN_INT4_DECODE"] == "0"
