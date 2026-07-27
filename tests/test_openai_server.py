@@ -97,6 +97,7 @@ from torchinferno.openai_server import (
     _emit_stream_token,
     _flashinfer_prefill_runtime_enabled,
     _flashinfer_prefill_warmup_batch_sizes,
+    _fi_decode_graph_mode,
     _finish_serving_cache_warmup,
     _generation_cache_batch_capacity,
     _generation_cache_fits_shape,
@@ -10840,6 +10841,14 @@ def preserve_torchinferno_environment():
     os.environ.update(snapshot)
 
 
+def test_flashinfer_nested_decode_graphs_are_opt_in(monkeypatch) -> None:
+    monkeypatch.delenv("TORCHINFERNO_FI_DECODE_GRAPH", raising=False)
+    assert _fi_decode_graph_mode() == "off"
+
+    monkeypatch.setenv("TORCHINFERNO_FI_DECODE_GRAPH", "sampled")
+    assert _fi_decode_graph_mode() == "sampled"
+
+
 @pytest.mark.parametrize(("available", "expected"), [(True, "1"), (False, "0")])
 def test_tensor_parallel_serving_defaults_gate_fa3_backend(
     monkeypatch: pytest.MonkeyPatch,
@@ -10890,12 +10899,21 @@ def test_tensor_parallel_serving_defaults_gate_fa3_backend(
     assert os.environ["TORCHINFERNO_OPENAI_TOKENIZER_BATCH_MAX_SIZE"] == "16"
     assert os.environ["TORCHINFERNO_OPENAI_TOKENIZER_BATCH_WAIT_MS"] == "0.2"
     assert os.environ["TORCHINFERNO_FP8_FUSED_SWIGLU_DECODE"] == "1"
+    assert os.environ["TORCHINFERNO_FP8_FUSED_SWIGLU_PREFILL"] == "1"
     assert os.environ["TORCHINFERNO_FP8_QKV_PREFILL"] == "1"
+    assert os.environ["TORCHINFERNO_LM_HEAD_TRANSPOSED_WEIGHT"] == "1"
+    assert os.environ["TORCHINFERNO_LM_HEAD_OUTPUT_ALIGNMENT"] == "256"
+    assert "TORCHINFERNO_O_PROJ_TRANSPOSED_WEIGHT" not in os.environ
+    assert os.environ["TORCHINFERNO_TRITON_GREEDY_ARGMAX"] == "1"
+    assert "TORCHINFERNO_TRITON_ADD_RMS_FP8_WARPS" not in os.environ
+    assert "TORCHINFERNO_TRITON_SWIGLU_FP8_WARPS" not in os.environ
+    assert os.environ["TORCHINFERNO_FP8_PREFILL_FAST_ACCUM_MIN_ROWS"] == "1"
     assert os.environ["TORCHINFERNO_TRITON_STREAMING_DECODE_ATTENTION_BLOCK_S"] == "128"
     assert os.environ["TORCHINFERNO_CONTINUOUS_PINNED_DECODE_INPUTS"] == "1"
     assert os.environ["TORCHINFERNO_CUDAGRAPH_RAGGED_DECODE_HOST_INPUTS"] == "1"
     assert os.environ["TORCHINFERNO_MARLIN_INT4_DECODE"] == "0"
-    assert "TORCHINFERNO_FP8_O_PROJ" not in os.environ
+    assert os.environ["TORCHINFERNO_FP8_O_PROJ"] == "1"
+    assert os.environ["TORCHINFERNO_FP8_O_PROJ_GREEDY_ONLY"] == "1"
     assert "TORCHINFERNO_FP8_LM_HEAD" not in os.environ
     assert "TORCHINFERNO_MARLIN_INT4_GATE_UP" not in os.environ
 

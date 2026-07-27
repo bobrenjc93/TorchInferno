@@ -277,19 +277,35 @@ def fp8_per_token_linear_quantized(
         if out.shape != expected_shape or out.device != x_q.device or out.dtype != out_dtype:
             raise ValueError("FP8 output buffer must match the projected output")
         out_2d = out.reshape(rows, weight_q.size(0))
-    sgl_ops = _load_sgl_per_token_ops()
+    sgl_ops = (
+        _load_sgl_per_token_ops()
+        if use_fast_accum and out_2d is None
+        else None
+    )
     if out_2d is not None:
-        torch.ops.aten._scaled_mm.out(
-            x_2d,
-            weight_q.t(),
-            x_scale,
-            weight_scale,
-            out_dtype=out_dtype,
-            use_fast_accum=use_fast_accum,
-            out=out_2d,
-        )
+        projected = None
+        if use_fast_accum:
+            from torchinferno.kernels.sgl_fp8_out import scaled_mm_out
+
+            projected = scaled_mm_out(
+                out_2d,
+                x_2d,
+                weight_q.t(),
+                x_scale,
+                weight_scale,
+            )
+        if projected is None:
+            torch.ops.aten._scaled_mm.out(
+                x_2d,
+                weight_q.t(),
+                x_scale,
+                weight_scale,
+                out_dtype=out_dtype,
+                use_fast_accum=use_fast_accum,
+                out=out_2d,
+            )
         projected = out_2d
-    elif use_fast_accum or sgl_ops is None:
+    elif not use_fast_accum or sgl_ops is None:
         projected = torch._scaled_mm(
             x_2d,
             weight_q.t(),

@@ -170,9 +170,24 @@ Optional extras are declared in [`pyproject.toml`](pyproject.toml):
 | `dev` | `pytest`, `ruff`, `pyflakes`, `vulture` | Running the local test and lint loop. |
 | `serve` / `text` | `transformers`, `tokenizers` | Loading Hub tokenizers or running the OpenAI-compatible server against real checkpoints. |
 | `flashinfer` | `flashinfer-python` | Optional FlashInfer CUDA serving kernels. |
+| `h100` | PyTorch, Ninja, and the version-pinned SGLang SM90 provider | Production Llama serving on Hopper GPUs. |
 | `kernels` | [Triton](https://triton-lang.org/main/index.html) | Exercising CUDA kernel specializations instead of torch fallbacks. |
 | `deepseek-v4` | TileLang and SGLang's JIT kernel provider | Loading DeepSeek-V4-Flash with native FP8/MXFP4 CUDA kernels. |
 | `helion` | [Helion](https://github.com/pytorch-labs/helion) | Trying one optional generated-kernel provider in the offline promotion flow. |
+
+Prepare the caller-owned SM90 FP8 output adapter before H100 serving. This is
+an explicit build step; serving only loads the content-addressed artifact and
+falls back to PyTorch when it is unavailable:
+
+```bash
+python3 -m pip install -e ".[serve,h100]"
+torchinferno-prepare-sgl-fp8-out
+```
+
+TorchInferno model graphs remain enabled by default. FlashInfer decode
+graphs are disabled because bucket-padding a dynamic sampled batch can alias a
+dummy slot to a live KV row. `TORCHINFERNO_FI_DECODE_GRAPH=sampled` is an
+experimental opt-in that replays exact-size captures only.
 
 Without installing the package:
 

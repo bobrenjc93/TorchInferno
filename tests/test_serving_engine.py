@@ -695,9 +695,8 @@ class _FakeFiDecodeGraph:
 
 
 class _FiDecodeGraphToyModel(_RaggedGraphToyModel):
-    def __init__(self, vocab_size: int = 64) -> None:
+    def __init__(self, vocab_size: int = 64, *, bucket: int = 2) -> None:
         super().__init__(vocab_size)
-        bucket = 2
         static_input_ids = torch.zeros((bucket, 1), dtype=torch.long)
         static_workspace = torch.zeros((bucket, 1), dtype=torch.int32)
         static_row_indices = torch.zeros((bucket,), dtype=torch.long)
@@ -8125,7 +8124,7 @@ def test_continuous_batch_engine_uses_dense_token_graph_for_greedy_sampled_defau
     assert engine.stats.decode_graph_hits == 2
 
 
-def test_continuous_batch_engine_uses_flashinfer_decode_graphs_for_sampled_default(monkeypatch) -> None:
+def test_continuous_batch_engine_defaults_sampled_decode_to_model_graph(monkeypatch) -> None:
     monkeypatch.delenv("TORCHINFERNO_FI_DECODE_GRAPH", raising=False)
     monkeypatch.delenv("TORCHINFERNO_CONTINUOUS_FI_DECODE_SAMPLED_MAX_TOKENS", raising=False)
     model = _FiDecodeGraphToyModel()
@@ -8145,16 +8144,17 @@ def test_continuous_batch_engine_uses_flashinfer_decode_graphs_for_sampled_defau
     )
 
     assert [len(result.tokens) for result in results] == [5, 6]
-    assert model.fi_graph.replay_calls == 2
-    assert model.fi_wrapper.plan_calls == 2
+    assert model.fi_graph.replay_calls == 0
+    assert model.fi_wrapper.plan_calls == 0
     assert model.ragged_token_graph_calls == 0
+    assert model.ragged_logits_graph_calls == 2
     assert engine.stats.decode_graph_hits == 2
 
 
 def test_continuous_batch_engine_flashinfer_decode_is_output_length_invariant(
     monkeypatch,
 ) -> None:
-    monkeypatch.delenv("TORCHINFERNO_FI_DECODE_GRAPH", raising=False)
+    monkeypatch.setenv("TORCHINFERNO_FI_DECODE_GRAPH", "sampled")
     model = _FiDecodeGraphToyModel()
     engine = ContinuousBatchEngine(
         model,
@@ -8181,10 +8181,39 @@ def test_continuous_batch_engine_flashinfer_decode_is_output_length_invariant(
     assert engine.stats.decode_graph_hits == 2
 
 
+def test_continuous_batch_engine_flashinfer_decode_does_not_pad_into_larger_graph(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("TORCHINFERNO_FI_DECODE_GRAPH", "sampled")
+    model = _FiDecodeGraphToyModel(bucket=4)
+    engine = ContinuousBatchEngine(
+        model,
+        device=torch.device("cpu"),
+        max_active_requests=3,
+        prefix_cache_capacity=0,
+        temperature=0.7,
+    )
+
+    results = engine.run(
+        [
+            ServingRequest("a", (1, 2), 3, arrival_step=0),
+            ServingRequest("b", (3, 4), 3, arrival_step=0),
+            ServingRequest("c", (5, 6), 3, arrival_step=0),
+        ]
+    )
+
+    assert [len(result.tokens) for result in results] == [5, 5, 5]
+    assert model.fi_graph.replay_calls == 0
+    assert model.fi_wrapper.plan_calls == 0
+    assert model.ragged_token_graph_calls == 0
+    assert model.ragged_logits_graph_calls == 2
+    assert engine.stats.decode_graph_hits == 2
+
+
 def test_continuous_decode_fi_branch_uses_flashinfer_for_sampled_requests(
     monkeypatch,
 ) -> None:
-    monkeypatch.delenv("TORCHINFERNO_FI_DECODE_GRAPH", raising=False)
+    monkeypatch.setenv("TORCHINFERNO_FI_DECODE_GRAPH", "sampled")
 
     class _FiBranchFallbackToyModel(_FiDecodeGraphToyModel):
         def __init__(self) -> None:
@@ -8265,7 +8294,7 @@ def test_continuous_decode_fi_branch_uses_flashinfer_for_sampled_requests(
 def test_continuous_batch_engine_sampled_flashinfer_needs_no_length_override(
     monkeypatch,
 ) -> None:
-    monkeypatch.delenv("TORCHINFERNO_FI_DECODE_GRAPH", raising=False)
+    monkeypatch.setenv("TORCHINFERNO_FI_DECODE_GRAPH", "sampled")
     model = _FiDecodeGraphToyModel()
     engine = ContinuousBatchEngine(
         model,

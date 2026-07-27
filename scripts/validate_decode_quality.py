@@ -9,6 +9,8 @@ import json
 import math
 import os
 import subprocess
+from contextlib import nullcontext
+from functools import partial
 from pathlib import Path
 
 import torch
@@ -131,6 +133,32 @@ def _compare_with_reference(
         raise ValueError("reference quality artifact was not produced by the reference profile")
     if result.get("runtime_profile") != "serving":
         raise ValueError("quality comparisons require the serving runtime profile")
+    serving_validation = result.get("serving_validation")
+    if not isinstance(serving_validation, dict):
+        raise ValueError("serving quality artifact is missing validation metadata")
+    if serving_validation.get("fp8_o_projection_scope") is not True:
+        raise ValueError("serving quality artifact did not exercise FP8 O projection")
+    if int(serving_validation.get("prepared_fp8_o_layers", 0)) < 1:
+        raise ValueError("serving quality artifact prepared no FP8 O weights")
+    if serving_validation.get("failed_fp8_o_layers") != 0:
+        raise ValueError("serving quality artifact observed FP8 O failures")
+    if serving_validation.get("successful_fp8_o_layers") != serving_validation.get(
+        "prepared_fp8_o_layers"
+    ):
+        raise ValueError("serving quality artifact did not exercise every FP8 O layer")
+    if int(serving_validation.get("successful_fp8_o_calls", 0)) < int(
+        serving_validation["prepared_fp8_o_layers"]
+    ):
+        raise ValueError("serving quality artifact observed no successful FP8 O pass")
+    environment = result.get("torchinferno_environment")
+    if not isinstance(environment, dict):
+        raise ValueError("serving quality artifact is missing runtime environment")
+    for name in (
+        "TORCHINFERNO_FP8_O_PROJ",
+        "TORCHINFERNO_FP8_O_PROJ_GREEDY_ONLY",
+    ):
+        if environment.get(name) != "1":
+            raise ValueError(f"serving quality artifact did not enable {name}")
     reference_nll = float(reference["mean_nll"])
     serving_nll = float(result["mean_nll"])
     if not math.isfinite(reference_nll) or reference_nll <= 0.0:
@@ -161,6 +189,24 @@ def _compare_with_reference(
     }
 
 
+def _validate_reference_args(reference_path: Path, args: argparse.Namespace) -> None:
+    reference = json.loads(reference_path.read_text())
+    if not isinstance(reference, dict):
+        raise ValueError("reference quality artifact must contain a JSON object")
+    expected = {
+        "checkpoint": args.checkpoint,
+        "dataset": args.dataset,
+        "dataset_config": args.dataset_config,
+        "split": args.split,
+        "sequences": args.sequences,
+        "context_tokens": args.context_tokens,
+        "scored_tokens": args.scored_tokens,
+    }
+    for field, value in expected.items():
+        if reference.get(field) != value:
+            raise ValueError(f"reference quality artifact has mismatched {field}")
+
+
 def _held_out_tokens(args: argparse.Namespace) -> list[int]:
     dataset = load_dataset(args.dataset, args.dataset_config, split=args.split)
     text = "\n\n".join(row["text"] for row in dataset if row["text"].strip())
@@ -184,6 +230,8 @@ def main() -> None:
         raise ValueError("sequence, context, and score sizes must be positive")
     if args.max_relative_nll_increase < 0.0 or args.max_top1_accuracy_drop < 0.0:
         raise ValueError("quality regression limits must be nonnegative")
+    if args.reference_output is not None:
+        _validate_reference_args(args.reference_output, args)
 
     _configure_runtime_profile(args)
 
@@ -191,12 +239,31 @@ def main() -> None:
         args.checkpoint,
         dtype="bfloat16",
     ).eval()
+    prepared_fp8_o_layers = 0
+    fp8_o_projection_scope = False
+    fp8_o_scope = nullcontext
+    fp8_o_observer_scope = nullcontext({})
     if args.runtime_profile == "serving":
         from torchinferno.models.llama3.tensor_parallel import (
+            _fp8_o_projection,
+            _observe_fp8_o_projection_successes,
             validate_symm_mem_allreduce_collective,
         )
 
         validate_symm_mem_allreduce_collective(model, model.device)
+        if os.environ.get("TORCHINFERNO_FP8_O_PROJ") != "1":
+            raise RuntimeError("serving quality validation requires FP8 O projection")
+        if os.environ.get("TORCHINFERNO_FP8_O_PROJ_GREEDY_ONLY") != "1":
+            raise RuntimeError(
+                "serving quality validation requires the greedy-only FP8 O policy"
+            )
+        prepared_fp8_o_layers = model.prepare_fp8_o_projection_weights()
+        if prepared_fp8_o_layers < 1:
+            raise RuntimeError("serving quality validation prepared no FP8 O weights")
+        fp8_o_projection_scope = True
+
+        fp8_o_scope = partial(_fp8_o_projection, True)
+        fp8_o_observer_scope = _observe_fp8_o_projection_successes()
     rank = dist.get_rank() if dist.is_initialized() else 0
     tokens = _held_out_tokens(args)
     window = args.context_tokens + args.scored_tokens
@@ -208,7 +275,7 @@ def main() -> None:
     predictions: list[list[int]] = []
     targets: list[list[int]] = []
 
-    with torch.inference_mode():
+    with fp8_o_observer_scope as fp8_o_successes, torch.inference_mode():
         for sequence_index, offset in enumerate(offsets):
             sample = tokens[offset : offset + window]
             cache = model.allocate_cache(1, window + 1)
@@ -217,13 +284,14 @@ def main() -> None:
                 dtype=torch.long,
                 device=model.device,
             )
-            local_logits, _ = model.forward(
-                prompt,
-                cache=cache,
-                use_cache=True,
-                return_last_logits_only=True,
-                return_sharded_logits=True,
-            )
+            with fp8_o_scope():
+                local_logits, _ = model.forward(
+                    prompt,
+                    cache=cache,
+                    use_cache=True,
+                    return_last_logits_only=True,
+                    return_sharded_logits=True,
+                )
 
             sequence_predictions: list[int] = []
             sequence_targets = sample[args.context_tokens :]
@@ -239,11 +307,16 @@ def main() -> None:
 
                 if score_index + 1 < len(sequence_targets):
                     seq_len = args.context_tokens + score_index
-                    local_logits = model.decode_ragged_logits(
-                        torch.tensor([[target]], dtype=torch.long, device=model.device),
-                        cache,
-                        seq_lens=torch.tensor([seq_len], dtype=torch.long, device=model.device),
-                    )
+                    with fp8_o_scope():
+                        local_logits = model.decode_ragged_logits(
+                            torch.tensor([[target]], dtype=torch.long, device=model.device),
+                            cache,
+                            seq_lens=torch.tensor(
+                                [seq_len],
+                                dtype=torch.long,
+                                device=model.device,
+                            ),
+                        )
 
             predictions.append(sequence_predictions)
             targets.append(sequence_targets)
@@ -252,6 +325,25 @@ def main() -> None:
                     f"quality sequence {sequence_index + 1}/{len(offsets)} complete",
                     flush=True,
                 )
+
+    eligible_fp8_o_layer_ids = {
+        id(layer)
+        for layer in model.layers
+        if getattr(layer, "_fp8_per_token_o_wq", None) is not None
+        and getattr(layer, "_fp8_per_token_o_ws", None) is not None
+    }
+    failed_fp8_o_layers = sum(
+        bool(getattr(layer, "_fp8_per_token_o_failed", False))
+        for layer in model.layers
+    )
+    successful_fp8_o_layer_ids = set(fp8_o_successes)
+    if fp8_o_projection_scope:
+        if failed_fp8_o_layers:
+            raise RuntimeError("serving quality validation observed FP8 O failures")
+        if successful_fp8_o_layer_ids != eligible_fp8_o_layer_ids:
+            raise RuntimeError(
+                "serving quality validation did not execute every prepared FP8 O layer"
+            )
 
     if rank == 0:
         mean_nll = total_nll / total_scored
@@ -270,6 +362,13 @@ def main() -> None:
                 name: value
                 for name, value in sorted(os.environ.items())
                 if name.startswith("TORCHINFERNO_")
+            },
+            "serving_validation": {
+                "failed_fp8_o_layers": failed_fp8_o_layers,
+                "fp8_o_projection_scope": fp8_o_projection_scope,
+                "prepared_fp8_o_layers": prepared_fp8_o_layers,
+                "successful_fp8_o_calls": sum(fp8_o_successes.values()),
+                "successful_fp8_o_layers": len(successful_fp8_o_layer_ids),
             },
             "sequences": args.sequences,
             "context_tokens": args.context_tokens,

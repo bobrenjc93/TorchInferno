@@ -220,6 +220,146 @@ def test_fp8_per_channel_weight_quantization_uses_one_scale_per_output() -> None
     torch.testing.assert_close(restored, weight.float(), atol=1.2e-1, rtol=1.3e-1)
 
 
+def test_sgl_fp8_output_provider_uses_only_validated_small_row_region(monkeypatch) -> None:
+    from torchinferno.kernels import sgl_fp8_out
+
+    monkeypatch.setattr(sgl_fp8_out, "_compatible_sm90_device", lambda device: True)
+    monkeypatch.setattr(sgl_fp8_out, "_loaded_op", lambda *args: args[0])
+    scale_a = torch.ones((64, 1))
+    scale_b = torch.ones((1, 32))
+    weight = torch.empty((32, 16), dtype=torch.float8_e4m3fn).t()
+
+    small = torch.empty((64, 16), dtype=torch.float8_e4m3fn)
+    small_out = torch.empty((64, 32), dtype=torch.bfloat16)
+    assert sgl_fp8_out.scaled_mm_out(small_out, small, weight, scale_a, scale_b) is small_out
+
+    large = torch.empty((65, 16), dtype=torch.float8_e4m3fn)
+    large_out = torch.empty((65, 32), dtype=torch.bfloat16)
+    assert sgl_fp8_out.scaled_mm_out(
+        large_out,
+        large,
+        weight,
+        torch.ones((65, 1)),
+        scale_b,
+    ) is None
+
+    invalid_layout = torch.empty((16, 32), dtype=torch.float8_e4m3fn)
+    assert sgl_fp8_out.scaled_mm_out(
+        small_out,
+        small,
+        invalid_layout,
+        scale_a,
+        scale_b,
+    ) is None
+
+    odd_weight = torch.empty((31, 16), dtype=torch.float8_e4m3fn).t()
+    assert sgl_fp8_out.scaled_mm_out(
+        torch.empty((64, 31), dtype=torch.bfloat16),
+        small,
+        odd_weight,
+        scale_a,
+        torch.ones((1, 31)),
+    ) is None
+
+
+def test_sgl_fp8_output_artifact_identity_includes_provider_path_and_content(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    from torchinferno.kernels import sgl_fp8_out
+
+    first = tmp_path / "first.so"
+    second = tmp_path / "second.so"
+    first.write_bytes(b"provider-a")
+    second.write_bytes(b"provider-a")
+
+    monkeypatch.setattr(sgl_fp8_out, "provider_library_path", lambda: first)
+    first_key = sgl_fp8_out.artifact_key()
+    monkeypatch.setattr(sgl_fp8_out, "provider_library_path", lambda: second)
+    assert sgl_fp8_out.artifact_key() != first_key
+
+    second.write_bytes(b"provider-b")
+    changed_key = sgl_fp8_out.artifact_key()
+    second.write_bytes(b"provider-c")
+    assert sgl_fp8_out.artifact_key() != changed_key
+
+
+def test_sgl_fp8_provider_accepts_pinned_local_cuda_wheel_version() -> None:
+    from torchinferno.kernels.sgl_fp8_out import compatible_provider_version
+
+    assert compatible_provider_version("0.4.4")
+    assert compatible_provider_version("0.4.4+cu129")
+    assert not compatible_provider_version("0.4.4.post1")
+    assert not compatible_provider_version("0.4.5")
+
+
+def test_fp8_per_token_provider_respects_fast_accumulation_contract(monkeypatch) -> None:
+    from torchinferno.kernels import fp8, sgl_fp8_out
+
+    x_q = torch.empty((3, 16), dtype=torch.float8_e4m3fn)
+    x_scale = torch.ones((3, 1))
+    weight_q = torch.empty((32, 16), dtype=torch.float8_e4m3fn)
+    weight_scale = torch.ones((1, 32))
+    provider_calls: list[str] = []
+    aten_calls: list[bool] = []
+
+    def provider(*args, **kwargs):
+        del args, kwargs
+        provider_calls.append("provider")
+        return torch.empty((3, 32), dtype=torch.bfloat16)
+
+    def aten(*args, **kwargs):
+        del args
+        aten_calls.append(bool(kwargs["use_fast_accum"]))
+        return torch.empty((3, 32), dtype=torch.bfloat16)
+
+    monkeypatch.setattr(fp8, "_load_sgl_per_token_ops", lambda: (object(), provider))
+    monkeypatch.setattr(torch, "_scaled_mm", aten)
+    monkeypatch.setattr(sgl_fp8_out, "scaled_mm_out", lambda *args: args[0])
+
+    fp8.fp8_per_token_linear_quantized(
+        x_q,
+        x_scale,
+        weight_q,
+        weight_scale,
+        out_dtype=torch.bfloat16,
+        use_fast_accum=False,
+    )
+    assert aten_calls == [False]
+    assert provider_calls == []
+
+    fp8.fp8_per_token_linear_quantized(
+        x_q,
+        x_scale,
+        weight_q,
+        weight_scale,
+        out_dtype=torch.bfloat16,
+        use_fast_accum=True,
+    )
+    assert provider_calls == ["provider"]
+
+    out = torch.empty((3, 32), dtype=torch.bfloat16)
+    assert fp8.fp8_per_token_linear_quantized(
+        x_q,
+        x_scale,
+        weight_q,
+        weight_scale,
+        out_dtype=torch.bfloat16,
+        out=out,
+        use_fast_accum=True,
+    ) is out
+
+
+def test_sgl_fp8_output_provider_requires_prepared_artifact(monkeypatch, tmp_path) -> None:
+    from torchinferno.kernels import sgl_fp8_out
+
+    monkeypatch.setattr(sgl_fp8_out, "_loaded_op", None)
+    monkeypatch.setattr(sgl_fp8_out, "prepared_library_path", lambda: tmp_path / "missing.so")
+
+    assert sgl_fp8_out.load_prepared_op() is None
+    assert sgl_fp8_out._loaded_op is False
+
+
 @pytest.mark.skipif(not torch.cuda.is_available() or not triton_available(), reason="CUDA Triton kernels unavailable")
 def test_fp8_per_token_linear_writes_to_caller_output() -> None:
     from torchinferno.kernels.fp8 import (
@@ -296,6 +436,88 @@ def test_fused_fp8_projection_inputs_match_unfused_references() -> None:
     swiglu_q, swiglu_scale = triton_swiglu_fp8_per_token(gate, up)
     restored_swiglu = swiglu_q.float() * swiglu_scale.view(7, 1, 1)
     torch.testing.assert_close(restored_swiglu, expected_swiglu, atol=1.2e-1, rtol=1.3e-1)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.skipif(not torch.cuda.is_available() or not triton_available(), reason="CUDA Triton kernels unavailable")
+def test_fused_fp8_projection_inputs_match_unfused_materialization(
+    dtype: torch.dtype,
+) -> None:
+    from torchinferno.kernels.fp8 import _quantize_activation_fp8_per_token
+    from torchinferno.kernels.triton_ops import (
+        triton_add_rms_norm,
+        triton_add_rms_norm_fp8_per_token,
+        triton_swiglu_activation,
+        triton_swiglu_fp8_per_token,
+    )
+
+    torch.manual_seed(29)
+    x = torch.randn((5, 1, 64), device="cuda", dtype=dtype)
+    residual = torch.randn_like(x)
+    weight = torch.randn((64,), device="cuda", dtype=dtype)
+    expected_hidden, expected_norm = triton_add_rms_norm(
+        x,
+        residual,
+        weight,
+        1e-5,
+    )
+    hidden, norm_q, norm_scale = triton_add_rms_norm_fp8_per_token(
+        x,
+        residual,
+        weight,
+        1e-5,
+    )
+    expected_norm_q = torch.empty_like(norm_q).view(-1, 64)
+    expected_norm_scale = torch.empty_like(norm_scale)
+    _quantize_activation_fp8_per_token(
+        expected_norm.view(-1, 64),
+        expected_norm_q,
+        expected_norm_scale,
+    )
+
+    gate_up = torch.randn((5, 1, 128), device="cuda", dtype=dtype)
+    gate, up = gate_up.split(64, dim=-1)
+    expected_swiglu = triton_swiglu_activation(gate, up)
+    swiglu_q, swiglu_scale = triton_swiglu_fp8_per_token(gate, up)
+    expected_swiglu_q = torch.empty_like(swiglu_q).view(-1, 64)
+    expected_swiglu_scale = torch.empty_like(swiglu_scale)
+    _quantize_activation_fp8_per_token(
+        expected_swiglu.view(-1, 64),
+        expected_swiglu_q,
+        expected_swiglu_scale,
+    )
+
+    assert torch.equal(hidden, expected_hidden)
+    assert torch.equal(norm_q, expected_norm_q.view_as(norm_q))
+    assert torch.equal(norm_scale, expected_norm_scale)
+    assert torch.equal(swiglu_q, expected_swiglu_q.view_as(swiglu_q))
+    assert torch.equal(swiglu_scale, expected_swiglu_scale)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or not triton_available(), reason="CUDA Triton kernels unavailable")
+def test_triton_rowwise_max_matches_torch_for_padded_rows_and_ties() -> None:
+    from torchinferno.kernels.triton_ops import triton_rowwise_max
+
+    torch.manual_seed(23)
+    storage = torch.randn((7, 384), device="cuda", dtype=torch.bfloat16)
+    values = storage[:, :321]
+    values[0, 17] = 100
+    values[0, 91] = 100
+    values[1, 13] = float("nan")
+    values[1, 97] = float("nan")
+
+    expected = torch.max(values.float(), dim=-1)
+    actual_values, actual_indices = triton_rowwise_max(values)
+
+    assert values.stride(0) == 384
+    torch.testing.assert_close(
+        actual_values,
+        expected.values,
+        atol=0.0,
+        rtol=0.0,
+        equal_nan=True,
+    )
+    torch.testing.assert_close(actual_indices, expected.indices, atol=0, rtol=0)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available() or not triton_available(), reason="CUDA Triton kernels unavailable")

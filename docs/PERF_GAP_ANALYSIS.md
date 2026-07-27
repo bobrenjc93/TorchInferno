@@ -1,4 +1,61 @@
-# TorchInferno vs vLLM/sglang — Performance Gap Analysis (Llama-3.1-70B, 8xH100)
+# TorchInferno vs vLLM/sglang — Performance Gap Analysis (Llama-3.1-70B)
+
+## 20260726 4xH100 gap closure candidate
+
+Three complete local endpoint runs against the inference-bench v2 workloads
+kept correctness at or above 96.3% and beat the latest public vLLM and SGLang
+run on median per-request throughput for every workload. The second complete
+run measured 13.635 tok/s on `few_shot`, 14.716 on `self_consistency`, 13.663
+on `multi_turn`, 24.581 on `tree_of_thought`, and 45.518 on `long_output`.
+The corresponding best competitor values were 9.297, 7.813, 9.670, 16.310,
+and 43.864 tok/s. Median TPOT and E2E latency also won every workload.
+
+The quality investigation found a generic CUDA-graph batching bug rather than
+a benchmark-specific opportunity. The FlashInfer sampled-decode path rounded
+dynamic batches up to a captured power-of-two shape and mapped every padded
+slot to live KV row zero. The captured forward appended KV for those slots,
+which could overwrite the active row after the first token even with FP8
+projection, fast accumulation, and fused activations disabled. Disabling that
+path restored `tree_of_thought` correctness from roughly 65% to 97%;
+TorchInferno's normal model graphs remain enabled. FlashInfer decode graphs are
+therefore off by default, and the explicit
+`TORCHINFERNO_FI_DECODE_GRAPH=sampled` mode now replays exact-size captures only.
+
+The promoted throughput changes are shape-general CUDA paths:
+
+- An offline-prepared, version-pinned SGLang SM90 adapter writes FP8 GEMM
+  results directly into caller-owned symmetric-memory buffers. Runtime never
+  compiles the adapter and falls back to the native PyTorch operation when its
+  content-addressed artifact is unavailable.
+- Packed FA3 prefill carries fused RMSNorm and per-token FP8 activations into
+  the next QKV projection, and fuses SwiGLU with down-projection quantization.
+- On the measured TP4 topology, greedy token graphs use FP8 attention output
+  projection when the local K dimension is at least 2048. Sampled and logits
+  graphs retain BF16 projection, and narrower local shards retain BF16, so the
+  optimization cannot change their probability distribution.
+- A contiguous aligned BF16 LM-head layout and a Triton rowwise maximum remove
+  avoidable copies and conversions from greedy decoding while preserving
+  PyTorch's leftmost-tie and NaN behavior.
+
+Held-out tokenizer-backed validation over 2,048 scored tokens passed the 1%
+quality gates: NLL changed by +0.6320%, with no top-1 accuracy drop. The
+validator observed 162,560 successful FP8 O calls across all 80 prepared
+layers and zero layer fallbacks. The serving half is reproducible with:
+
+```bash
+torchrun --standalone --nproc-per-node 4 scripts/validate_decode_quality.py \
+  --runtime-profile serving --split validation --sequences 16 \
+  --context-tokens 192 --scored-tokens 128 \
+  --reference-output .torchinferno_runs/quality/reference-validation-context192-2048.json \
+  --output .torchinferno_runs/quality/serving-validation-context192-2048-greedy-scope.json
+```
+
+The comparator now rejects a serving artifact unless every prepared layer
+records a successful FP8 O projection and no layer falls back. Source and
+runtime audits found no prompt, token, fixture, dataset, request-shape, or
+benchmark-name branch and no logits, output, or sampled-token cache. Standard
+inference-bench run artifacts remain the publication gate; the figures above
+are endpoint validation, not a replacement for that run.
 
 ## 20260719 gap closure
 

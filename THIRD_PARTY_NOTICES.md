@@ -14,6 +14,12 @@ notice-retention, and warranty-disclaimer text is included in
 
 ## SGLang/vLLM CUDA utilities
 
+`src/torchinferno/kernels/csrc/sgl_fp8_out.cpp` is a host adapter that invokes
+the version-pinned SGLang SM90 FP8 scaled-matrix-multiply provider with a
+caller-owned output tensor. The SGLang kernel remains in its separately
+installed Apache-2.0 package and is prepared for TorchInferno by an explicit
+offline build step.
+
 `src/torchinferno/kernels/deepseek_v4_marlin.py` adapts Marlin weight-layout
 and scale-layout algorithms from the SGLang and vLLM projects and invokes a
 version-pinned internal SGLang Marlin provider. TorchInferno requires its

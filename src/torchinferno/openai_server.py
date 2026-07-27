@@ -3934,6 +3934,13 @@ class OpenAICompletionEngine:
                 pass
             _finish_serving_cache_warmup(self, cache)
             return
+        prepare_fp8_o = getattr(self.model, "prepare_fp8_o_projection_weights", None)
+        if callable(prepare_fp8_o) and env_flag("TORCHINFERNO_FP8_O_PROJ", False):
+            prepared_layers = int(prepare_fp8_o())
+            _startup_warmup_log(
+                self.model,
+                f"prepared FP8 attention output weights layers={prepared_layers}",
+            )
         decode_warmup_runtime_symm = _online_decode_warmup_runtime_symm_mem_allreduce_enabled()
         for warmup_temperature, warmup_max_tokens in decode_policy_specs:
             decode_started_s = time.perf_counter()
@@ -15004,7 +15011,7 @@ def _tensor_parallel_prefill_graph_runtime_key_scope(
 
 
 def _fi_decode_graph_mode() -> str:
-    raw = os.environ.get("TORCHINFERNO_FI_DECODE_GRAPH", "sampled").strip().lower()
+    raw = os.environ.get("TORCHINFERNO_FI_DECODE_GRAPH", "off").strip().lower()
     if raw in {"1", "true", "yes", "on", "always"}:
         return "always"
     if raw in {"0", "false", "no", "off", "never", ""}:
@@ -20010,6 +20017,17 @@ def _apply_tensor_parallel_serving_defaults(config: OpenAIServerConfig) -> None:
         "TORCHINFERNO_FP8_PER_TOKEN_SCALE": "1",
         "TORCHINFERNO_FP8_QKV": "1",
         "TORCHINFERNO_FP8_QKV_PREFILL": "1",
+        # Optimize only greedy decode. Sampled logits retain the BF16 output
+        # projection so this throughput path cannot perturb their distribution.
+        "TORCHINFERNO_FP8_O_PROJ": "1",
+        "TORCHINFERNO_FP8_O_PROJ_GREEDY_ONLY": "1",
+        # A contiguous, 256-column-aligned local LM-head matrix selects a faster
+        # Hopper BF16 GEMM without changing the represented checkpoint weights.
+        "TORCHINFERNO_LM_HEAD_TRANSPOSED_WEIGHT": "1",
+        "TORCHINFERNO_LM_HEAD_OUTPUT_ALIGNMENT": "256",
+        # Greedy serving needs only each vocabulary shard's maximum. Fuse the
+        # BF16-to-FP32 conversion and row reduction before the rank all-gather.
+        "TORCHINFERNO_TRITON_GREEDY_ARGMAX": "1",
         # Keep the uncalibrated RTN INT4 fallback out of serving and startup
         # graph capture. Explicit experimental launches may still override it.
         "TORCHINFERNO_MARLIN_INT4_DECODE": "0",
@@ -20028,12 +20046,14 @@ def _apply_tensor_parallel_serving_defaults(config: OpenAIServerConfig) -> None:
         # nodes so changing scheduler metadata does not require a CUDA launch.
         "TORCHINFERNO_CONTINUOUS_PINNED_DECODE_INPUTS": "1",
         "TORCHINFERNO_CUDAGRAPH_RAGGED_DECODE_HOST_INPUTS": "1",
-        "TORCHINFERNO_FP8_FUSED_SWIGLU_PREFILL": "0",
-        # Hopper's fast FP8 accumulator is measurably faster once a mixed
-        # prefill reaches 129 rows. Smaller decode-shaped GEMMs retain the
-        # more accurate accumulator and the faster SGLang kernel path.
+        # Keep the compact prefill activation in FP8 for the down projection;
+        # this removes separate SwiGLU and quantization launches on Hopper.
+        "TORCHINFERNO_FP8_FUSED_SWIGLU_PREFILL": "1",
+        # The pinned SGLang provider implements CUTLASS fast accumulation.
+        # Enable that mode explicitly for every serving shape; the held-out
+        # quality gate covers the resulting end-to-end numerical tradeoff.
         "TORCHINFERNO_FP8_PREFILL_FAST_ACCUM": "1",
-        "TORCHINFERNO_FP8_PREFILL_FAST_ACCUM_MIN_ROWS": "129",
+        "TORCHINFERNO_FP8_PREFILL_FAST_ACCUM_MIN_ROWS": "1",
         "TORCHINFERNO_SYMM_MEM_PREFILL_GRAPH_ALLREDUCE": "1",
         # The multi-step graph has not beaten the persistent one-step path.
         "TORCHINFERNO_CONTINUOUS_RAGGED_DECODE_MANY": "0",

@@ -5,6 +5,7 @@ import os
 import subprocess
 import sys
 import textwrap
+import threading
 import types
 from datetime import timedelta
 from pathlib import Path
@@ -482,6 +483,256 @@ def test_llama3_tensor_parallel_prefill_fusion_gates_components_independently(
     assert layer._can_fuse_fp8_projection_input(hidden, "gu")
     monkeypatch.setenv("TORCHINFERNO_FP8_FUSED_SWIGLU_DECODE", "0")
     assert not layer._can_fuse_fp8_projection_input(hidden, "down")
+
+
+def test_llama3_packed_fa3_prefill_fuses_next_layer_qkv_input(monkeypatch) -> None:
+    layer = object.__new__(tensor_parallel_module._Llama3TensorParallelLayer)
+    next_layer = object.__new__(tensor_parallel_module._Llama3TensorParallelLayer)
+    hidden = torch.ones((1, 3, 4))
+    attention = torch.full_like(hidden, 2.0)
+    summed = torch.full_like(hidden, 3.0)
+    mlp_input = torch.full_like(hidden, 4.0)
+    projected = torch.full_like(hidden, 5.0)
+    layer.post_attention_layernorm_weight = torch.ones(4)
+    next_activation = tensor_parallel_module._FP8PerTokenActivation(
+        torch.empty_like(hidden, dtype=torch.float8_e4m3fn),
+        torch.ones((3, 1)),
+    )
+    seen: list[tuple[torch.Tensor, torch.Tensor, str]] = []
+
+    monkeypatch.setattr(
+        layer,
+        "_attention_prefill_packed_fa3",
+        lambda *args, **kwargs: attention,
+    )
+    monkeypatch.setattr(
+        layer,
+        "_decode_add_rms_projection_input",
+        lambda *args, **kwargs: (summed, mlp_input),
+    )
+    monkeypatch.setattr(
+        layer,
+        "_mlp_project_decode_reduce",
+        lambda value: projected if value is mlp_input else None,
+    )
+
+    def fuse_next(
+        value: torch.Tensor,
+        residual: torch.Tensor,
+        weight: torch.Tensor,
+        key: str,
+    ) -> tuple[torch.Tensor, tensor_parallel_module._FP8PerTokenActivation]:
+        del weight
+        seen.append((value, residual, key))
+        return summed, next_activation
+
+    monkeypatch.setattr(next_layer, "_decode_add_rms_projection_input", fuse_next)
+
+    output_hidden, output_activation = layer.forward_prefill_packed_fa3(
+        hidden,
+        None,
+        (torch.empty(0), torch.empty(0)),
+        object(),
+        torch.empty(0, dtype=torch.long),
+        torch.empty(0, dtype=torch.long),
+        torch.empty(0, dtype=torch.long),
+        torch.empty(0, dtype=torch.long),
+        torch.empty(0, dtype=torch.int32),
+        torch.empty(0, dtype=torch.int32),
+        3,
+        torch.ones(4),
+        next_layer,
+    )
+
+    assert output_hidden is summed
+    assert output_activation is next_activation
+    assert seen == [(projected, summed, "qkv")]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
+def test_llama3_padded_transposed_lm_head_matches_linear(monkeypatch) -> None:
+    monkeypatch.setenv("TORCHINFERNO_LM_HEAD_TRANSPOSED_WEIGHT", "1")
+    monkeypatch.setenv("TORCHINFERNO_LM_HEAD_OUTPUT_ALIGNMENT", "256")
+    torch.manual_seed(24)
+    weight = torch.randn((31, 16), device="cuda", dtype=torch.bfloat16)
+    hidden = torch.randn((5, 1, 16), device="cuda", dtype=torch.bfloat16)
+
+    weight_t = tensor_parallel_module._maybe_lm_head_weight_t(weight)
+    assert weight_t is not None
+    assert weight_t.shape == (16, 256)
+    assert torch.count_nonzero(weight_t[:, 31:]) == 0
+
+    actual = tensor_parallel_module._decode_linear(hidden, weight, weight_t)
+    expected = torch.nn.functional.linear(hidden, weight)
+    torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
+def test_llama3_fp8_o_preserves_transposed_bf16_fallback(monkeypatch) -> None:
+    monkeypatch.setenv("TORCHINFERNO_DECODE_TRANSPOSED_WEIGHTS", "1")
+    monkeypatch.setenv("TORCHINFERNO_FP8_O_PROJ", "1")
+    torch.manual_seed(25)
+    weight = torch.randn((96, 32), device="cuda", dtype=torch.bfloat16)
+    hidden = torch.randn((7, 1, 32), device="cuda", dtype=torch.bfloat16)
+
+    weight_t = tensor_parallel_module._maybe_decode_weight_t(weight)
+    assert weight_t is not None
+    assert weight_t.shape == (32, 96)
+    assert weight_t.is_contiguous()
+
+    actual = tensor_parallel_module._decode_linear(hidden, weight, weight_t)
+    expected = torch.nn.functional.linear(hidden, weight)
+    torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+
+
+def test_llama3_attention_o_projection_can_select_fp8_decode(monkeypatch) -> None:
+    layer = object.__new__(tensor_parallel_module._Llama3TensorParallelLayer)
+    hidden = torch.randn((4, 1, 8))
+    projected = torch.randn((4, 1, 16))
+    layer.o_proj_weight = torch.randn((16, 8))
+
+    monkeypatch.setenv("TORCHINFERNO_FP8_O_PROJ", "1")
+    monkeypatch.setenv("TORCHINFERNO_FP8_O_PROJ_MIN_K", "1")
+    monkeypatch.setattr(layer, "_fp8_decode_shape_enabled", lambda value: True)
+    monkeypatch.setattr(
+        layer,
+        "_fp8_proj",
+        lambda value, key, weight: (
+            projected
+            if value is hidden and key == "o" and weight is layer.o_proj_weight
+            else None
+        ),
+    )
+
+    assert layer._attention_o_project(hidden) is projected
+
+
+def test_llama3_attention_o_projection_greedy_only_requires_scope(monkeypatch) -> None:
+    layer = object.__new__(tensor_parallel_module._Llama3TensorParallelLayer)
+    hidden = torch.randn((4, 1, 8))
+
+    monkeypatch.setenv("TORCHINFERNO_FP8_O_PROJ", "1")
+    monkeypatch.setenv("TORCHINFERNO_FP8_O_PROJ_MIN_K", "1")
+    monkeypatch.setenv("TORCHINFERNO_FP8_O_PROJ_GREEDY_ONLY", "1")
+    monkeypatch.setattr(layer, "_fp8_decode_shape_enabled", lambda value: value is hidden)
+
+    assert not layer._attention_o_fp8_enabled(hidden)
+    with tensor_parallel_module._fp8_o_projection(True):
+        assert layer._attention_o_fp8_enabled(hidden)
+    assert not layer._attention_o_fp8_enabled(hidden)
+
+
+def test_llama3_attention_o_projection_scope_is_thread_local(monkeypatch) -> None:
+    layer = object.__new__(tensor_parallel_module._Llama3TensorParallelLayer)
+    hidden = torch.randn((4, 1, 8))
+    observed: list[bool] = []
+
+    monkeypatch.setenv("TORCHINFERNO_FP8_O_PROJ", "1")
+    monkeypatch.setenv("TORCHINFERNO_FP8_O_PROJ_MIN_K", "1")
+    monkeypatch.setenv("TORCHINFERNO_FP8_O_PROJ_GREEDY_ONLY", "1")
+    monkeypatch.setattr(layer, "_fp8_decode_shape_enabled", lambda value: value is hidden)
+
+    with tensor_parallel_module._fp8_o_projection(True):
+        assert layer._attention_o_fp8_enabled(hidden)
+        worker = threading.Thread(
+            target=lambda: observed.append(layer._attention_o_fp8_enabled(hidden))
+        )
+        worker.start()
+        worker.join()
+
+    assert observed == [False]
+
+
+def test_llama3_attention_o_validation_observer_records_success(monkeypatch) -> None:
+    from torchinferno.kernels import fp8
+
+    layer = object.__new__(tensor_parallel_module._Llama3TensorParallelLayer)
+    hidden = torch.randn((2, 1, 8), dtype=torch.bfloat16)
+    weight = torch.randn((16, 8), dtype=torch.bfloat16)
+    weight_q = torch.empty_like(weight, dtype=torch.float8_e4m3fn)
+    weight_scale = torch.ones((1, 16), dtype=torch.float32)
+    projected = torch.randn((2, 1, 16), dtype=torch.bfloat16)
+
+    monkeypatch.setattr(
+        layer,
+        "_prepare_fp8_per_token_weight",
+        lambda key, value: (weight_q, weight_scale),
+    )
+    monkeypatch.setattr(fp8, "fp8_per_token_linear", lambda *args, **kwargs: projected)
+
+    with tensor_parallel_module._observe_fp8_o_projection_successes() as successes:
+        assert layer._fp8_per_token_proj(hidden, "o", weight) is projected
+
+    assert successes == {id(layer): 1}
+
+
+def test_llama3_attention_o_projection_default_k_gate_is_shape_based(monkeypatch) -> None:
+    layer = object.__new__(tensor_parallel_module._Llama3TensorParallelLayer)
+    hidden = torch.randn((4, 1, 2048))
+
+    monkeypatch.setenv("TORCHINFERNO_FP8_O_PROJ", "1")
+    monkeypatch.delenv("TORCHINFERNO_FP8_O_PROJ_MIN_K", raising=False)
+    monkeypatch.delenv("TORCHINFERNO_FP8_O_PROJ_GREEDY_ONLY", raising=False)
+    monkeypatch.setattr(layer, "_fp8_decode_shape_enabled", lambda value: True)
+
+    assert layer._attention_o_fp8_enabled(hidden)
+    assert not layer._attention_o_fp8_enabled(hidden[..., :1024])
+
+
+def test_llama3_attention_o_fp8_selection_reaches_direct_reduce(monkeypatch) -> None:
+    layer = object.__new__(tensor_parallel_module._Llama3TensorParallelLayer)
+    layer.world_size = 2
+    layer._symm_reduce_failed = False
+    hidden = torch.ones((2, 1, 8), dtype=torch.bfloat16)
+    layer.o_proj_weight = torch.ones((16, 8), dtype=torch.bfloat16)
+    layer.o_proj_weight_decode = None
+    reduced = torch.empty((2, 1, 16), dtype=torch.bfloat16)
+    fp8_calls = []
+
+    monkeypatch.setenv("TORCHINFERNO_FP8_O_PROJ", "1")
+    monkeypatch.setenv("TORCHINFERNO_FP8_O_PROJ_MIN_K", "1")
+    monkeypatch.setenv("TORCHINFERNO_FP8_PER_TOKEN_SCALE", "1")
+    monkeypatch.setattr(layer, "_fp8_decode_shape_enabled", lambda value: value is hidden)
+    monkeypatch.setattr(
+        layer,
+        "_symm_reduce_buffer",
+        lambda name, value, shape: (reduced, "world"),
+    )
+    monkeypatch.setattr(layer, "_profile_block", lambda name, function: function())
+    monkeypatch.setattr(layer, "_marlin_proj", lambda *args, **kwargs: None)
+
+    def fp8_proj(value, key, weight, *, out=None):
+        fp8_calls.append((value, key, weight, out))
+        assert out is reduced
+        out.fill_(3)
+        return out
+
+    monkeypatch.setattr(layer, "_fp8_proj", fp8_proj)
+    monkeypatch.setattr(
+        tensor_parallel_module,
+        "_should_use_symm_mem_all_reduce",
+        lambda *args: True,
+    )
+    monkeypatch.setattr(
+        tensor_parallel_module,
+        "_should_use_symm_mem_prefill_all_reduce",
+        lambda *args: False,
+    )
+    monkeypatch.setattr(
+        torch.ops.symm_mem,
+        "multimem_all_reduce_",
+        lambda *args: None,
+        raising=False,
+    )
+
+    actual = layer._decode_linear_all_reduce(
+        hidden,
+        layer.o_proj_weight,
+        "attention",
+    )
+
+    assert actual is reduced
+    assert fp8_calls == [(hidden, "o", layer.o_proj_weight, reduced)]
 
 
 def test_llama3_tensor_parallel_prefill_symm_buffers_share_capacity(monkeypatch) -> None:

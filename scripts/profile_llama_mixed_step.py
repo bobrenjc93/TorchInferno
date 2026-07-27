@@ -30,7 +30,9 @@ def _args() -> argparse.Namespace:
     parser.add_argument("--cache-tokens", type=int, default=0)
     parser.add_argument("--query-tokens", type=int, default=16)
     parser.add_argument("--token-bucket", action="store_true")
+    parser.add_argument("--token-bucket-parity", action="store_true")
     parser.add_argument("--ragged-decode", action="store_true")
+    parser.add_argument("--ragged-decode-logits-parity", action="store_true")
     parser.add_argument("--ragged-decode-sweep", action="store_true")
     parser.add_argument("--attention-block-s-sweep", action="store_true")
     parser.add_argument("--indexed-rows", action="store_true")
@@ -39,6 +41,334 @@ def _args() -> argparse.Namespace:
     parser.add_argument("--profile-sampling", action="store_true")
     parser.add_argument("--replay-only", action="store_true")
     return parser.parse_args()
+
+
+def _profile_ragged_decode_logits_parity(
+    model: Llama3TensorParallelForCausalLM,
+    args: argparse.Namespace,
+) -> None:
+    device = model.device
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    max_seq_len = max(args.prefix_tokens + 16, args.cache_tokens)
+    graph_cache = model.allocate_cache(args.batch_capacity, max_seq_len, cache_backend="flashinfer")
+    eager_cache = model.allocate_cache(args.batch_capacity, max_seq_len, cache_backend="flashinfer")
+    seq_lens = torch.full(
+        (args.batch_capacity,),
+        args.prefix_tokens,
+        dtype=torch.long,
+        device=device,
+    )
+    row_indices = (
+        (torch.arange(args.rows, device=device, dtype=torch.long) * 5) % args.batch_capacity
+        if args.indexed_rows
+        else None
+    )
+
+    def reset(cache) -> None:
+        for layer in cache.layers:
+            layer.keys.zero_()
+            layer.values.zero_()
+        cache.set_seq_len(args.prefix_tokens)
+
+    generator = torch.Generator(device=device).manual_seed(1701)
+    capture_ids = torch.randint(
+        0,
+        model.config.vocab_size,
+        (args.rows, 1),
+        generator=generator,
+        device=device,
+    )
+    replay_ids = torch.randint(
+        0,
+        model.config.vocab_size,
+        (args.rows, 1),
+        generator=generator,
+        device=device,
+    )
+    with torch.inference_mode():
+        reset(graph_cache)
+        token_output = model.try_decode_ragged_token_graph(
+            capture_ids,
+            graph_cache,
+            seq_lens=seq_lens,
+            row_indices=row_indices,
+            temperature=0.0,
+            capture_on_miss=True,
+        )
+        if token_output is None:
+            raise RuntimeError("ragged token graph capture failed")
+        logits_output = model.try_decode_ragged_logits_graph(
+            capture_ids,
+            graph_cache,
+            seq_lens=seq_lens,
+            row_indices=row_indices,
+            capture_on_miss=True,
+        )
+        if logits_output is None:
+            raise RuntimeError("ragged logits graph capture failed")
+        torch.cuda.synchronize(device)
+
+        reset(graph_cache)
+        reset(eager_cache)
+        actual = model.try_decode_ragged_logits_graph(
+            replay_ids,
+            graph_cache,
+            seq_lens=seq_lens,
+            row_indices=row_indices,
+            capture_on_miss=False,
+        )
+        if actual is None:
+            raise RuntimeError("ragged logits graph replay failed")
+        actual = actual.clone()
+        torch.cuda.synchronize(device)
+        expected = model.decode_ragged_logits(
+            replay_ids,
+            eager_cache,
+            seq_lens=seq_lens,
+            row_indices=row_indices,
+        )
+        torch.cuda.synchronize(device)
+
+    difference = (actual.float() - expected.float()).abs()
+    max_difference = difference.max()
+    mean_difference = difference.mean()
+    exact_fraction = actual.eq(expected).float().mean()
+    top1_matches = actual.argmax(dim=-1).eq(expected.argmax(dim=-1)).float().mean()
+    if dist.is_initialized():
+        dist.all_reduce(max_difference, op=dist.ReduceOp.MAX)
+        dist.all_reduce(mean_difference, op=dist.ReduceOp.SUM)
+        mean_difference /= dist.get_world_size()
+        dist.all_reduce(exact_fraction, op=dist.ReduceOp.SUM)
+        exact_fraction /= dist.get_world_size()
+        dist.all_reduce(top1_matches, op=dist.ReduceOp.SUM)
+        top1_matches /= dist.get_world_size()
+    if rank == 0:
+        print(
+            json.dumps(
+                {
+                    "batch_capacity": args.batch_capacity,
+                    "exact_fraction": float(exact_fraction.item()),
+                    "indexed_rows": args.indexed_rows,
+                    "max_abs_difference": float(max_difference.item()),
+                    "mean_abs_difference": float(mean_difference.item()),
+                    "prefix_tokens": args.prefix_tokens,
+                    "rows": args.rows,
+                    "top1_match_fraction": float(top1_matches.item()),
+                },
+                indent=2,
+                sort_keys=True,
+            ),
+            flush=True,
+        )
+
+
+def _profile_token_bucket_parity(
+    model: Llama3TensorParallelForCausalLM,
+    args: argparse.Namespace,
+) -> None:
+    device = model.device
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    if args.rows > args.batch_capacity:
+        raise ValueError("rows cannot exceed batch capacity")
+    prompt_tokens = args.query_tokens
+    token_capacity = args.rows * prompt_tokens
+    graph_cache = model.allocate_cache(args.batch_capacity, prompt_tokens + 16)
+    packed_eager_cache = model.allocate_cache(args.batch_capacity, prompt_tokens + 16)
+    dense_reference_cache = model.allocate_cache(args.batch_capacity, prompt_tokens + 16)
+    caches = (graph_cache, packed_eager_cache, dense_reference_cache)
+    for cache in caches:
+        for layer in cache.layers:
+            layer.keys.zero_()
+            layer.values.zero_()
+    generator = torch.Generator(device=device).manual_seed(1701)
+    capture_dense_ids = torch.randint(
+        0,
+        model.config.vocab_size,
+        (args.rows, prompt_tokens),
+        generator=generator,
+        device=device,
+    )
+    replay_dense_ids = torch.randint(
+        0,
+        model.config.vocab_size,
+        (args.rows, prompt_tokens),
+        generator=generator,
+        device=device,
+    )
+    capture_flat_ids = capture_dense_ids.reshape(1, token_capacity)
+    replay_flat_ids = replay_dense_ids.reshape(1, token_capacity)
+    q_lens = torch.tensor(
+        [*([prompt_tokens] * args.rows), *([0] * (args.batch_capacity - args.rows))],
+        dtype=torch.long,
+        device=device,
+    )
+    start_positions = torch.zeros(args.batch_capacity, dtype=torch.long, device=device)
+    row_indices = torch.arange(args.batch_capacity, dtype=torch.long, device=device)
+    write_positions = torch.arange(
+        prompt_tokens,
+        dtype=torch.long,
+        device=device,
+    ).repeat(args.rows)
+    flat_rows = torch.arange(args.rows, device=device, dtype=torch.long).repeat_interleave(
+        prompt_tokens
+    )
+    logit_positions = torch.tensor(
+        [
+            *[(index + 1) * prompt_tokens - 1 for index in range(args.rows)],
+            *([0] * (args.batch_capacity - args.rows)),
+        ],
+        dtype=torch.long,
+        device=device,
+    )
+    model.set_runtime_fp8_prefill(True, min_m=1)
+    with torch.inference_mode():
+        captured_logits = model.try_prefill_token_bucket_fa3_graph(
+            capture_flat_ids,
+            graph_cache,
+            start_positions=start_positions,
+            q_lens=q_lens,
+            row_indices=row_indices,
+            write_positions=write_positions,
+            flat_rows=flat_rows,
+            logit_positions=logit_positions,
+            capture_on_miss=True,
+        )
+        if captured_logits is None:
+            raise RuntimeError("token-bucket FA3 graph capture failed")
+        torch.cuda.synchronize(device)
+        for cache in caches:
+            for layer in cache.layers:
+                layer.keys.zero_()
+                layer.values.zero_()
+
+        graph_logits = model.try_prefill_token_bucket_fa3_graph(
+            replay_flat_ids,
+            graph_cache,
+            start_positions=start_positions,
+            q_lens=q_lens,
+            row_indices=row_indices,
+            write_positions=write_positions,
+            flat_rows=flat_rows,
+            logit_positions=logit_positions,
+            capture_on_miss=False,
+        )
+        if graph_logits is None:
+            raise RuntimeError("token-bucket FA3 graph replay failed")
+        graph_logits = graph_logits[: args.rows].clone()
+        torch.cuda.synchronize(device)
+        packed_eager_logits = model._prefill_token_bucket_fa3_compute(
+            replay_flat_ids,
+            packed_eager_cache,
+            start_positions=start_positions,
+            q_lens=q_lens,
+            row_indices=row_indices,
+            write_positions=write_positions,
+            flat_rows=flat_rows,
+            logit_positions=logit_positions,
+            src_prefix_rows=None,
+            prefix_copy_capacity=0,
+        )
+        dense_reference_logits, _ = model.forward(
+            replay_dense_ids,
+            cache=dense_reference_cache,
+            use_cache=True,
+            return_last_logits_only=True,
+            return_sharded_logits=True,
+        )
+        torch.cuda.synchronize(device)
+
+        teacher_tokens = torch.ones((args.rows, 1), dtype=torch.long, device=device)
+        seq_lens = torch.full(
+            (args.batch_capacity,),
+            prompt_tokens,
+            dtype=torch.long,
+            device=device,
+        )
+        graph_cache_decode = model.decode_ragged_logits(
+            teacher_tokens, graph_cache, seq_lens=seq_lens
+        ).clone()
+        packed_eager_cache_decode = model.decode_ragged_logits(
+            teacher_tokens, packed_eager_cache, seq_lens=seq_lens
+        ).clone()
+        dense_reference_cache_decode = model.decode_ragged_logits(
+            teacher_tokens, dense_reference_cache, seq_lens=seq_lens
+        ).clone()
+        torch.cuda.synchronize(device)
+
+    def comparison(actual: torch.Tensor, expected: torch.Tensor) -> dict[str, float]:
+        difference = (actual.float() - expected.float()).abs()
+        return {
+            "exact_fraction": float(actual.eq(expected).float().mean().item()),
+            "max_abs_difference": float(difference.max().item()),
+            "mean_abs_difference": float(difference.mean().item()),
+            "top1_match_fraction": float(
+                actual.argmax(dim=-1).eq(expected.argmax(dim=-1)).float().mean().item()
+            ),
+        }
+
+    def cache_comparison(expected_cache) -> dict[str, float]:
+        key_max = torch.zeros((), dtype=torch.float32, device=device)
+        value_max = torch.zeros((), dtype=torch.float32, device=device)
+        for graph_layer, expected_layer in zip(graph_cache.layers, expected_cache.layers):
+            key_max = torch.maximum(
+                key_max,
+                (
+                    graph_layer.keys[: args.rows, :, :prompt_tokens]
+                    - expected_layer.keys[: args.rows, :, :prompt_tokens]
+                ).float().abs().max(),
+            )
+            value_max = torch.maximum(
+                value_max,
+                (
+                    graph_layer.values[: args.rows, :, :prompt_tokens]
+                    - expected_layer.values[: args.rows, :, :prompt_tokens]
+                ).float().abs().max(),
+            )
+        if dist.is_initialized():
+            dist.all_reduce(key_max, op=dist.ReduceOp.MAX)
+            dist.all_reduce(value_max, op=dist.ReduceOp.MAX)
+        return {
+            "key_max_abs_difference": float(key_max.item()),
+            "value_max_abs_difference": float(value_max.item()),
+        }
+
+    packed_eager_cache_comparison = cache_comparison(packed_eager_cache)
+    dense_reference_cache_comparison = cache_comparison(dense_reference_cache)
+    if rank == 0:
+        print(
+            json.dumps(
+                {
+                    "batch_capacity": args.batch_capacity,
+                    "graph_vs_dense_reference": {
+                        "cache": dense_reference_cache_comparison,
+                        "decode_logits": comparison(
+                            graph_cache_decode,
+                            dense_reference_cache_decode,
+                        ),
+                        "prefill_logits": comparison(
+                            graph_logits,
+                            dense_reference_logits,
+                        ),
+                    },
+                    "graph_vs_packed_eager": {
+                        "cache": packed_eager_cache_comparison,
+                        "decode_logits": comparison(
+                            graph_cache_decode,
+                            packed_eager_cache_decode,
+                        ),
+                        "prefill_logits": comparison(
+                            graph_logits,
+                            packed_eager_logits,
+                        ),
+                    },
+                    "prompt_tokens": prompt_tokens,
+                    "rows": args.rows,
+                },
+                indent=2,
+                sort_keys=True,
+            ),
+            flush=True,
+        )
 
 
 def _profile_token_bucket(
@@ -147,6 +477,10 @@ def _profile_token_bucket(
                     ),
                     "fp8_qkv_cached_layers": sum(
                         getattr(layer, "_fp8_per_token_qkv_wq", None) is not None
+                        for layer in model.layers
+                    ),
+                    "fp8_o_cached_layers": sum(
+                        getattr(layer, "_fp8_per_token_o_wq", None) is not None
                         for layer in model.layers
                     ),
                     "rows": args.rows,
@@ -281,6 +615,10 @@ def _profile_ragged_decode(
                     ),
                     "fp8_qkv_cached_layers": sum(
                         getattr(layer, "_fp8_per_token_qkv_wq", None) is not None
+                        for layer in model.layers
+                    ),
+                    "fp8_o_cached_layers": sum(
+                        getattr(layer, "_fp8_per_token_o_wq", None) is not None
                         for layer in model.layers
                     ),
                     "rows": args.rows,
@@ -538,14 +876,23 @@ def main() -> None:
     device = model.device
     rank = dist.get_rank() if dist.is_initialized() else 0
     validate_symm_mem_allreduce_collective(model, device)
+    prepare_fp8_o = getattr(model, "prepare_fp8_o_projection_weights", None)
+    if callable(prepare_fp8_o) and os.environ.get("TORCHINFERNO_FP8_O_PROJ") == "1":
+        prepare_fp8_o()
     if args.attention_block_s_sweep:
         _profile_attention_block_s_sweep(model, args)
         return
     if args.ragged_decode_sweep:
         _profile_ragged_decode_sweep(model, args)
         return
+    if args.ragged_decode_logits_parity:
+        _profile_ragged_decode_logits_parity(model, args)
+        return
     if args.token_bucket:
         _profile_token_bucket(model, args)
+        return
+    if args.token_bucket_parity:
+        _profile_token_bucket_parity(model, args)
         return
     if args.ragged_decode:
         _profile_ragged_decode(model, args)

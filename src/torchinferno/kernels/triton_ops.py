@@ -69,6 +69,57 @@ def triton_swiglu_activation(gate: Tensor, up: Tensor, *, out: Tensor | None = N
 
 
 @triton.jit
+def _rowwise_max_kernel(
+    input_ptr,
+    values_ptr,
+    indices_ptr,
+    input_stride_row,
+    cols: tl.constexpr,
+    block_size: tl.constexpr,
+) -> None:
+    row = tl.program_id(0)
+    offsets = tl.arange(0, block_size)
+    values = tl.load(
+        input_ptr + row * input_stride_row + offsets,
+        mask=offsets < cols,
+        other=-float("inf"),
+    ).to(tl.float32)
+    nan_flags = (values != values).to(tl.int32)  # noqa: PLR0124
+    has_nan = tl.max(nan_flags, axis=0)
+    nan_index = tl.argmax(nan_flags, axis=0, tie_break_left=True)
+    maximum = tl.max(values, axis=0)
+    index = tl.argmax(values, axis=0, tie_break_left=True)
+    maximum = tl.where(has_nan != 0, float("nan"), maximum)
+    index = tl.where(has_nan != 0, nan_index, index)
+    tl.store(values_ptr + row, maximum)
+    tl.store(indices_ptr + row, index)
+
+
+def triton_rowwise_max(x: Tensor) -> tuple[Tensor, Tensor]:
+    """Return FP32 maxima and leftmost indices for a CUDA matrix."""
+
+    if not x.is_cuda or x.ndim != 2:
+        raise ValueError("rowwise max expects a two-dimensional CUDA tensor")
+    if x.stride(1) != 1:
+        raise ValueError("rowwise max requires a contiguous last dimension")
+    block_size = triton.next_power_of_2(x.size(1))
+    if block_size > 65536:
+        raise ValueError("rowwise max supports at most 65536 columns")
+    values = torch.empty(x.size(0), dtype=torch.float32, device=x.device)
+    indices = torch.empty(x.size(0), dtype=torch.long, device=x.device)
+    _rowwise_max_kernel[(x.size(0),)](
+        x,
+        values,
+        indices,
+        x.stride(0),
+        x.size(1),
+        block_size,
+        num_warps=8,
+    )
+    return values, indices
+
+
+@triton.jit
 def _copy_ragged_prefix_kv_kernel(
     keys_ptr,
     values_ptr,
@@ -2082,6 +2133,7 @@ def _rms_norm_fp8_per_token_kernel(
     n_cols: tl.constexpr,
     eps: tl.constexpr,
     block_size: tl.constexpr,
+    input_is_bf16: tl.constexpr,
 ) -> None:
     row = tl.program_id(0)
     offsets = tl.arange(0, block_size)
@@ -2091,6 +2143,10 @@ def _rms_norm_fp8_per_token_kernel(
     weight = tl.load(weight_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
     variance = tl.sum(x * x, axis=0) / n_cols
     normed = x * tl.rsqrt(variance + eps) * weight
+    if input_is_bf16:
+        normed = normed.to(tl.bfloat16).to(tl.float32)
+    else:
+        normed = normed.to(tl.float16).to(tl.float32)
     scale = tl.maximum(tl.max(tl.abs(normed), axis=0) / 448.0, 1e-10)
     tl.store(output_ptr + row_offsets, normed / scale, mask=mask)
     tl.store(scale_ptr + row, scale)
@@ -2107,6 +2163,7 @@ def _add_rms_norm_fp8_per_token_kernel(
     n_cols: tl.constexpr,
     eps: tl.constexpr,
     block_size: tl.constexpr,
+    input_is_bf16: tl.constexpr,
 ) -> None:
     row = tl.program_id(0)
     offsets = tl.arange(0, block_size)
@@ -2119,6 +2176,10 @@ def _add_rms_norm_fp8_per_token_kernel(
     weight = tl.load(weight_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
     variance = tl.sum(hidden * hidden, axis=0) / n_cols
     normed = hidden * tl.rsqrt(variance + eps) * weight
+    if input_is_bf16:
+        normed = normed.to(tl.bfloat16).to(tl.float32)
+    else:
+        normed = normed.to(tl.float16).to(tl.float32)
     scale = tl.maximum(tl.max(tl.abs(normed), axis=0) / 448.0, 1e-10)
     tl.store(hidden_out_ptr + row_offsets, hidden, mask=mask)
     tl.store(output_ptr + row_offsets, normed / scale, mask=mask)
@@ -2135,6 +2196,7 @@ def _swiglu_fp8_per_token_kernel(
     up_stride_row: tl.constexpr,
     n_cols: tl.constexpr,
     block_size: tl.constexpr,
+    input_is_bf16: tl.constexpr,
 ) -> None:
     row = tl.program_id(0)
     offsets = tl.arange(0, block_size)
@@ -2150,10 +2212,13 @@ def _swiglu_fp8_per_token_kernel(
         mask=mask,
         other=0.0,
     ).to(tl.float32)
-    # Match the unfused path's BF16 activation materialization before dynamic
-    # FP8 quantization. Keeping the FP32 intermediate changes decode decisions
-    # enough to fail the held-out serving-quality gate.
-    activated = (gate / (1.0 + tl.exp(-gate)) * up).to(tl.bfloat16).to(tl.float32)
+    # Match the unfused path's activation-dtype materialization before dynamic
+    # FP8 quantization. Keeping the FP32 intermediate changes decode decisions.
+    activated = gate / (1.0 + tl.exp(-gate)) * up
+    if input_is_bf16:
+        activated = activated.to(tl.bfloat16).to(tl.float32)
+    else:
+        activated = activated.to(tl.float16).to(tl.float32)
     scale = tl.maximum(tl.max(tl.abs(activated), axis=0) / 448.0, 1e-10)
     tl.store(output_ptr + output_offsets, activated / scale, mask=mask)
     tl.store(scale_ptr + row, scale)
@@ -2179,6 +2244,8 @@ def triton_rms_norm_fp8_per_token(
 ) -> tuple[Tensor, Tensor]:
     """RMS-normalize and dynamically quantize each row to e4m3 in one pass."""
 
+    if x.dtype not in (torch.bfloat16, torch.float16):
+        raise ValueError("fused RMSNorm FP8 quantization requires BF16 or FP16")
     if x.size(-1) != weight.numel() or weight.device != x.device:
         raise ValueError("RMSNorm weight must match the activation width and device")
     output, scale, n_cols, block_size = _fp8_per_token_outputs(x)
@@ -2191,6 +2258,7 @@ def triton_rms_norm_fp8_per_token(
         n_cols,
         eps,
         block_size,
+        x.dtype == torch.bfloat16,
         num_warps=8,
         num_stages=1,
     )
@@ -2205,7 +2273,13 @@ def triton_add_rms_norm_fp8_per_token(
 ) -> tuple[Tensor, Tensor, Tensor]:
     """Add residual, RMS-normalize, and quantize the normalized rows in one pass."""
 
-    if x.shape != residual.shape or x.device != residual.device:
+    if x.dtype not in (torch.bfloat16, torch.float16):
+        raise ValueError("fused add+RMSNorm FP8 quantization requires BF16 or FP16")
+    if (
+        x.shape != residual.shape
+        or x.device != residual.device
+        or x.dtype != residual.dtype
+    ):
         raise ValueError("x and residual tensors must have matching shapes and devices")
     if x.size(-1) != weight.numel() or weight.device != x.device:
         raise ValueError("RMSNorm weight must match the activation width and device")
@@ -2223,7 +2297,8 @@ def triton_add_rms_norm_fp8_per_token(
         n_cols,
         eps,
         block_size,
-        num_warps=8,
+        x.dtype == torch.bfloat16,
+        num_warps=int(os.environ.get("TORCHINFERNO_TRITON_ADD_RMS_FP8_WARPS", "8")),
         num_stages=1,
     )
     return hidden.view_as(x), output.view_as(x), scale
@@ -2232,7 +2307,9 @@ def triton_add_rms_norm_fp8_per_token(
 def triton_swiglu_fp8_per_token(gate: Tensor, up: Tensor) -> tuple[Tensor, Tensor]:
     """Apply SwiGLU and dynamically quantize each output row to e4m3 in one pass."""
 
-    if gate.shape != up.shape or gate.device != up.device:
+    if gate.dtype not in (torch.bfloat16, torch.float16):
+        raise ValueError("fused SwiGLU FP8 quantization requires BF16 or FP16")
+    if gate.shape != up.shape or gate.device != up.device or gate.dtype != up.dtype:
         raise ValueError("gate and up tensors must have matching shapes and devices")
     if gate.stride(-1) != 1 or up.stride(-1) != 1:
         raise ValueError("gate and up tensors must have contiguous last dimensions")
@@ -2248,7 +2325,8 @@ def triton_swiglu_fp8_per_token(gate: Tensor, up: Tensor) -> tuple[Tensor, Tenso
         up_2d.stride(0),
         n_cols,
         block_size,
-        num_warps=8,
+        gate.dtype == torch.bfloat16,
+        num_warps=int(os.environ.get("TORCHINFERNO_TRITON_SWIGLU_FP8_WARPS", "8")),
         num_stages=1,
     )
     return output.view_as(gate), scale

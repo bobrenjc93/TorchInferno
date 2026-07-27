@@ -14,7 +14,7 @@ dependencies = ["huggingface-hub", "safetensors", "torch"]
 dev = ["pyflakes", "pytest", "ruff", "vulture"]
 flashinfer = ["flashinfer-python>=0.6.8,<0.7"]
 helion = ["helion"]
-h100 = ["torch==2.11.0", "torchvision==0.26.0", "sglang-kernel==0.4.4"]
+h100 = ["ninja", "torch==2.11.0", "torchvision==0.26.0", "sglang-kernel==0.4.4"]
 kernels = ["triton"]
 deepseek-v4 = [
   "tilelang==0.1.11",
@@ -28,12 +28,16 @@ text = ["tokenizers", "transformers"]
 
 [project.scripts]
 torchinferno = "torchinferno.cli:main"
+torchinferno-prepare-sgl-fp8-out = "torchinferno.kernels.sgl_fp8_out_builder:main"
 
 [tool.setuptools]
 license-files = ["THIRD_PARTY_NOTICES.md", "licenses/*.txt"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+"torchinferno.kernels" = ["csrc/*.cpp"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

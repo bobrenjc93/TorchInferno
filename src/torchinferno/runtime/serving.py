@@ -17,7 +17,7 @@ from torchinferno.runtime.sampling import sample_next_token
 
 
 def _fi_decode_graph_mode() -> str:
-    raw = os.environ.get("TORCHINFERNO_FI_DECODE_GRAPH", "sampled").strip().lower()
+    raw = os.environ.get("TORCHINFERNO_FI_DECODE_GRAPH", "off").strip().lower()
     if raw in {"1", "true", "yes", "on", "always"}:
         return "always"
     if raw in {"0", "false", "no", "off", "never", ""}:
@@ -11075,34 +11075,31 @@ class ContinuousBatchEngine:
             batch = input_ids.size(0)
             if row_indices is None:
                 row_indices = self._device_index_tensor(tuple(range(batch)))
-            bucket = 1 << (batch - 1).bit_length() if batch > 1 else 1
-            entry = fi_graphs.get(bucket)
+            # FlashInfer graph captures append KV for every static slot. Never
+            # pad a dynamic batch into a larger capture by aliasing dummy slots
+            # to a live cache row; only an exact-size capture is replay-safe.
+            entry = fi_graphs.get(batch)
             if entry is not None:
                 graph, dw, s_ids, s_wp, s_ri, s_logits, nqo, nkv, hd, ms, qd = entry
-                s_ids[:batch].copy_(input_ids)
-                s_ri[:batch].copy_(row_indices)
-                if batch < bucket:
-                    s_ids[batch:] = 0
-                    s_ri[batch:] = 0
+                s_ids.copy_(input_ids)
+                s_ri.copy_(row_indices)
                 fi_bufs = getattr(self, "_fi_bufs", {})
-                if bucket not in fi_bufs:
-                    fi_bufs[bucket] = (
-                        torch.arange(bucket + 1, dtype=torch.int32, device=self.device),
-                        torch.ones(bucket, dtype=torch.int32, device=self.device),
+                if batch not in fi_bufs:
+                    fi_bufs[batch] = (
+                        torch.arange(batch + 1, dtype=torch.int32, device=self.device),
+                        torch.ones(batch, dtype=torch.int32, device=self.device),
                     )
                     self._fi_bufs = fi_bufs
-                indptr, lpl = fi_bufs[bucket]
+                indptr, lpl = fi_bufs[batch]
                 lpl.fill_(1)
                 indices = s_ri.to(dtype=torch.int32)
-                row_sl = seq_lens[row_indices[:batch].long()]
-                s_wp[:batch, 0].copy_(row_sl)
-                lpl[:batch] = (row_sl + 1).to(torch.int32)
-                if batch < bucket:
-                    s_wp[batch:] = 0
+                row_sl = seq_lens[row_indices.long()]
+                s_wp[:, 0].copy_(row_sl)
+                lpl.copy_((row_sl + 1).to(torch.int32))
                 dw.plan(indptr=indptr, indices=indices, last_page_len=lpl,
                         num_qo_heads=nqo, num_kv_heads=nkv, head_dim=hd, page_size=ms, q_data_type=qd)
                 graph.replay()
-                last_logits = s_logits[:batch, -1, :]
+                last_logits = s_logits[:, -1, :]
                 self._last_ragged_decode_logits = last_logits
                 return self._sample_logits_with_temperature(last_logits, sampling_temperature)
         if sampling_temperature > 0.0:
