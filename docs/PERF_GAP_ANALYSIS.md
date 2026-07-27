@@ -1,14 +1,23 @@
 # TorchInferno vs vLLM/sglang — Performance Gap Analysis (Llama-3.1-70B)
 
-## 20260726 4xH100 gap closure candidate
+## 20260727 4xH100 gap closure
 
-Three complete local endpoint runs against the inference-bench v2 workloads
-kept correctness at or above 96.3% and beat the latest public vLLM and SGLang
-run on median per-request throughput for every workload. The second complete
-run measured 13.635 tok/s on `few_shot`, 14.716 on `self_consistency`, 13.663
-on `multi_turn`, 24.581 on `tree_of_thought`, and 45.518 on `long_output`.
-The corresponding best competitor values were 9.297, 7.813, 9.670, 16.310,
-and 43.864 tok/s. Median TPOT and E2E latency also won every workload.
+Two consecutive clean inference-bench v2 runs, `20260727_000441` and
+`20260727_003354`, are published with finalized provenance and comparable
+results for all providers. TorchInferno won all 19 scored latency and
+throughput metrics in both runs. The repeated median throughput results were:
+
+| workload | TorchInferno run 1 | TorchInferno run 2 | best run-2 competitor | run-2 correctness |
+| --- | ---: | ---: | ---: | ---: |
+| few_shot | 13.300 tok/s | 13.485 tok/s | 8.176 | 0.976 |
+| self_consistency | 14.678 tok/s | 14.716 tok/s | 9.912 | 1.000 |
+| multi_turn | 13.817 tok/s | 13.736 tok/s | 9.191 | 0.979 |
+| tree_of_thought | 23.286 tok/s | 23.180 tok/s | 13.372 | 0.968 |
+| long_output | 44.795 tok/s | 45.239 tok/s | 35.694 | 1.000 |
+
+Every meaningful nonzero median TTFT, TPOT, and E2E latency also won in both
+runs. Both TorchInferno artifacts report clean source provenance, four observed
+H100s, a passed cache-integrity check, and zero runtime shortcut counters.
 
 The quality investigation found a generic CUDA-graph batching bug rather than
 a benchmark-specific opportunity. The FlashInfer sampled-decode path rounded
@@ -53,9 +62,9 @@ torchrun --standalone --nproc-per-node 4 scripts/validate_decode_quality.py \
 The comparator now rejects a serving artifact unless every prepared layer
 records a successful FP8 O projection and no layer falls back. Source and
 runtime audits found no prompt, token, fixture, dataset, request-shape, or
-benchmark-name branch and no logits, output, or sampled-token cache. Standard
-inference-bench run artifacts remain the publication gate; the figures above
-are endpoint validation, not a replacement for that run.
+benchmark-name branch and no logits, output, or sampled-token cache. The two
+published standard inference-bench runs above are the score-facing evidence;
+the quality artifact is a separate numerical validation gate.
 
 ## 20260719 gap closure
 
